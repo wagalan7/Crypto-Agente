@@ -185,7 +185,6 @@ export default function App() {
       const top = tickers
         .filter(t => t.symbol.endsWith('USDT'))
         .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-        .slice(0, 100)
 
       const initial: ScannerAsset[] = top.map(t => {
         const base = t.symbol.replace('USDT', '')
@@ -237,7 +236,7 @@ export default function App() {
       // Binance unavailable: fall back to backend symbols + signals
       try {
         const { symbols: backendSyms } = await api.getSymbols()
-        const initial: ScannerAsset[] = backendSyms.slice(0, 100).map(sym => {
+        const initial: ScannerAsset[] = backendSyms.map(sym => {
           const base = sym.split('/')[0]
           return {
             symbol: sym, baseAsset: base, binanceSymbol: `${base}USDT`,
