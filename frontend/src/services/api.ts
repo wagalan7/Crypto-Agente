@@ -1,8 +1,8 @@
 import type { TradeSignal, OHLCVCandle, Ticker, WatchlistItem } from '../types'
 
-// Em produção (Vercel), VITE_API_URL aponta para o backend no Railway.
-// Em desenvolvimento local, usa o proxy do Vite (/api → localhost:8000).
-const BACKEND = import.meta.env.VITE_API_URL ?? ''
+// Em desenvolvimento local (sem variável definida), usa proxy do Vite (/api → localhost:8000).
+// Em produção, aponta direto para o Railway.
+const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
 const BASE = `${BACKEND}/api`
 
 async function get<T>(path: string, params?: Record<string, string | number | boolean>): Promise<T> {
