@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Search } from 'lucide-react'
 import TickerBar from './components/TickerBar'
-import ChartModal from './components/ChartModal'
+import ChartPanel from './components/ChartPanel'
 import { api } from './services/api'
 import type { SignalDirection, TradeType } from './types'
 
@@ -311,43 +311,40 @@ export default function App() {
     { key: 'az',       label: 'A-Z'      },
   ]
 
-  return (
-    <div className="min-h-screen bg-[#0a0e1a] text-white flex flex-col">
-      {/* Scrolling ticker */}
-      <TickerBar />
-
+  // ─── Scanner panel (left column) ──────────────────────────────────────────
+  const ScannerPanel = (
+    <div className="flex flex-col h-full overflow-hidden bg-[#0a0e1a]">
       {/* Sub-header */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-slate-800/50 flex-shrink-0">
-        <div className="flex items-center gap-2">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800/50 flex-shrink-0">
+        <div className="flex items-center gap-1.5">
           <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-          <span className="text-xs sm:text-sm text-slate-300 font-medium">Binance Futures – Tempo Real</span>
+          <span className="text-xs text-slate-300 font-medium">Binance Futures – Tempo Real</span>
         </div>
-        <span className="text-slate-400 text-sm">{assets.length} pares</span>
-        <span className="text-slate-500 text-sm font-mono tabular-nums">
+        <span className="text-slate-500 text-xs">{assets.length} pares</span>
+        <span className="text-slate-600 text-xs font-mono tabular-nums">
           {clock.toLocaleTimeString('pt-BR')}
         </span>
       </div>
 
       {/* Trade type cards */}
-      <div className="grid grid-cols-3 gap-2 px-3 py-3 flex-shrink-0">
+      <div className="grid grid-cols-3 gap-1.5 px-2 py-2 flex-shrink-0">
         {(Object.entries(TRADE_MODES) as [TradeMode, typeof TRADE_MODES[TradeMode]][]).map(([key, cfg]) => (
           <button
             key={key}
             onClick={() => setTradeMode(key)}
-            className={`relative rounded-xl p-3 border transition-all text-left shadow-lg ${
+            className={`relative rounded-lg p-2 border transition-all text-left ${
               tradeMode === key
-                ? `${cfg.bg} ${cfg.border} ${cfg.glow}`
+                ? `${cfg.bg} ${cfg.border}`
                 : 'bg-slate-800/30 border-slate-700/30 hover:bg-slate-800/50'
             }`}
           >
-            <div className="text-xl mb-1 leading-none">{cfg.icon}</div>
-            <div className={`text-xs font-bold tracking-widest ${tradeMode === key ? cfg.color : 'text-slate-400'}`}>
+            <div className="text-base mb-0.5 leading-none">{cfg.icon}</div>
+            <div className={`text-xs font-bold tracking-wider ${tradeMode === key ? cfg.color : 'text-slate-400'}`}>
               {cfg.label}
             </div>
-            <div className="text-xs text-slate-500 mt-0.5 leading-tight">{cfg.tfs}</div>
-            <div className="text-xs text-slate-600">Gráf: {cfg.chartTf}</div>
+            <div className="text-[10px] text-slate-500 leading-tight">{cfg.tfs}</div>
             {tradeMode === key && (
-              <div className="absolute bottom-0 left-0 right-0 h-0.5 rounded-b-xl overflow-hidden bg-slate-800">
+              <div className="absolute bottom-0 left-0 right-0 h-0.5 rounded-b-lg overflow-hidden bg-slate-800">
                 <div
                   className="h-full bg-green-500 transition-all duration-500"
                   style={{ width: loadingSignals ? `${loadingProgress}%` : '100%' }}
@@ -359,29 +356,29 @@ export default function App() {
       </div>
 
       {/* Search */}
-      <div className="px-3 pb-2 flex-shrink-0">
+      <div className="px-2 pb-1.5 flex-shrink-0">
         <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500" />
           <input
             type="text"
             placeholder="Buscar par... BTC, SOL, PEPE"
             value={search}
             onChange={e => setSearch(e.target.value)}
-            className="w-full bg-slate-800/50 border border-slate-700/50 rounded-lg pl-9 pr-4 py-2.5 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-slate-500 transition-colors"
+            className="w-full bg-slate-800/50 border border-slate-700/50 rounded-lg pl-8 pr-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-slate-500 transition-colors"
           />
         </div>
       </div>
 
       {/* Filters */}
-      <div className="flex items-center gap-1.5 px-3 pb-2 overflow-x-auto scrollbar-hide flex-shrink-0">
+      <div className="flex items-center gap-1 px-2 pb-1.5 overflow-x-auto scrollbar-hide flex-shrink-0">
         {FILTERS.map(f => (
           <button
             key={f.key}
             onClick={() => setFilter(f.key)}
-            className={`whitespace-nowrap px-3 py-1 rounded-full text-xs font-semibold transition-colors border flex-shrink-0 ${
+            className={`whitespace-nowrap px-2 py-0.5 rounded-full text-xs font-semibold transition-colors border flex-shrink-0 ${
               filter === f.key
                 ? 'bg-white/10 border-slate-500 text-white'
-                : 'border-slate-700/50 text-slate-400 hover:text-slate-200 hover:border-slate-600'
+                : 'border-slate-700/50 text-slate-500 hover:text-slate-300 hover:border-slate-600'
             }`}
           >
             {f.label}
@@ -390,15 +387,15 @@ export default function App() {
       </div>
 
       {/* Sort */}
-      <div className="flex items-center gap-1 px-3 pb-2 overflow-x-auto scrollbar-hide flex-shrink-0">
+      <div className="flex items-center gap-1 px-2 pb-1.5 overflow-x-auto scrollbar-hide flex-shrink-0">
         {SORTS.map(s => (
           <button
             key={s.key}
             onClick={() => setSort(s.key)}
-            className={`whitespace-nowrap px-2.5 py-1 rounded text-xs font-medium transition-colors border flex-shrink-0 ${
+            className={`whitespace-nowrap px-2 py-0.5 rounded text-xs font-medium transition-colors border flex-shrink-0 ${
               sort === s.key
                 ? 'bg-white/10 border-slate-500 text-white'
-                : 'border-slate-700/40 text-slate-500 hover:text-slate-300 hover:border-slate-600'
+                : 'border-slate-700/40 text-slate-600 hover:text-slate-300 hover:border-slate-600'
             }`}
           >
             {s.label}
@@ -409,14 +406,14 @@ export default function App() {
       {/* Stats bar */}
       <div className="grid grid-cols-4 divide-x divide-slate-800/80 border-y border-slate-800/80 flex-shrink-0">
         {[
-          { val: statsLong,           label: 'COMPRA', cls: 'text-green-400'  },
-          { val: statsShort,          label: 'VENDA',  cls: 'text-red-400'    },
-          { val: statsNeutral,        label: 'NEUTRO', cls: 'text-yellow-400' },
-          { val: assets.length,       label: 'TOTAL',  cls: 'text-white'      },
+          { val: statsLong,    label: 'COMPRA', cls: 'text-green-400'  },
+          { val: statsShort,   label: 'VENDA',  cls: 'text-red-400'    },
+          { val: statsNeutral, label: 'NEUTRO', cls: 'text-yellow-400' },
+          { val: assets.length,label: 'TOTAL',  cls: 'text-white'      },
         ].map(({ val, label, cls }) => (
-          <div key={label} className="py-2 text-center">
-            <div className={`text-xl font-bold ${cls}`}>{val}</div>
-            <div className="text-xs text-slate-600 uppercase tracking-wider">{label}</div>
+          <div key={label} className="py-1.5 text-center">
+            <div className={`text-base font-bold ${cls}`}>{val}</div>
+            <div className="text-[10px] text-slate-600 uppercase tracking-wider">{label}</div>
           </div>
         ))}
       </div>
@@ -444,15 +441,34 @@ export default function App() {
           </div>
         )}
       </div>
+    </div>
+  )
 
-      {/* Chart Modal */}
-      {selectedSymbol && (
-        <ChartModal
-          symbol={selectedSymbol}
-          timeframe={TRADE_MODES[tradeMode].timeframe}
-          onClose={() => setSelectedSymbol(null)}
-        />
-      )}
+  return (
+    <div className="h-screen bg-[#0a0e1a] text-white flex flex-col overflow-hidden">
+      {/* Scrolling ticker — full width at top */}
+      <TickerBar />
+
+      {/* Body: split left/right */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Left: scanner list */}
+        <div className={`flex-shrink-0 overflow-hidden transition-all duration-300 ${
+          selectedSymbol ? 'w-[340px] xl:w-[380px]' : 'w-full'
+        }`}>
+          {ScannerPanel}
+        </div>
+
+        {/* Right: chart panel (only when symbol selected) */}
+        {selectedSymbol && (
+          <div className="flex-1 overflow-hidden">
+            <ChartPanel
+              symbol={selectedSymbol}
+              timeframe={TRADE_MODES[tradeMode].timeframe}
+              onClose={() => setSelectedSymbol(null)}
+            />
+          </div>
+        )}
+      </div>
     </div>
   )
 }
