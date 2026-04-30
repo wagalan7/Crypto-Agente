@@ -36,7 +36,7 @@ const PATTERN_COLORS: Record<string, string> = {
   bear_flag: '#ef4444',
 }
 
-export function CandleChart({ candles, signal, height = 480 }: Props) {
+export function CandleChart({ candles, signal, height }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
@@ -47,7 +47,11 @@ export function CandleChart({ candles, signal, height = 480 }: Props) {
   useEffect(() => {
     if (!containerRef.current) return
 
-    const chart = createChart(containerRef.current, {
+    const el = containerRef.current
+    const w = el.clientWidth || 600
+    const h = height ?? el.clientHeight || 480
+
+    const chart = createChart(el, {
       layout: {
         background: { type: ColorType.Solid, color: '#0f172a' },
         textColor: '#94a3b8',
@@ -56,19 +60,11 @@ export function CandleChart({ candles, signal, height = 480 }: Props) {
         vertLines: { color: '#1e293b' },
         horzLines: { color: '#1e293b' },
       },
-      crosshair: {
-        mode: 1,
-      },
-      rightPriceScale: {
-        borderColor: '#334155',
-      },
-      timeScale: {
-        borderColor: '#334155',
-        timeVisible: true,
-        secondsVisible: false,
-      },
-      width: containerRef.current.clientWidth,
-      height,
+      crosshair: { mode: 1 },
+      rightPriceScale: { borderColor: '#334155' },
+      timeScale: { borderColor: '#334155', timeVisible: true, secondsVisible: false },
+      width: w,
+      height: h,
     })
     chartRef.current = chart
 
@@ -92,15 +88,19 @@ export function CandleChart({ candles, signal, height = 480 }: Props) {
     })
     volumeSeriesRef.current = volumeSeries
 
-    const handleResize = () => {
-      if (containerRef.current) {
-        chart.applyOptions({ width: containerRef.current.clientWidth })
-      }
-    }
-    window.addEventListener('resize', handleResize)
+    // ResizeObserver keeps chart filling the container when layout changes
+    const ro = new ResizeObserver(() => {
+      if (!containerRef.current || !chartRef.current) return
+      const { clientWidth, clientHeight } = containerRef.current
+      chartRef.current.applyOptions({
+        width: clientWidth,
+        height: height ?? clientHeight,
+      })
+    })
+    ro.observe(el)
 
     return () => {
-      window.removeEventListener('resize', handleResize)
+      ro.disconnect()
       chart.remove()
       chartRef.current = null
     }
@@ -226,7 +226,7 @@ export function CandleChart({ candles, signal, height = 480 }: Props) {
     <div
       ref={containerRef}
       className="w-full rounded-lg overflow-hidden"
-      style={{ height }}
+      style={{ height: height ?? '100%' }}
     />
   )
 }
