@@ -4,10 +4,11 @@ import time
 import traceback
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 logging.basicConfig(level=logging.INFO)
 
+import pandas as pd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -104,6 +105,48 @@ async def analyze(
         raise HTTPException(500, f"Erro na análise: {e}")
 
     if with_ai:
+        signal.ai_analysis = await generate_ai_analysis(signal)
+
+    return signal
+
+
+class CandleData(BaseModel):
+    timestamp: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+class AnalyzeDataRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    candles: List[CandleData]
+    with_ai: bool = True
+
+
+@app.post("/api/analyze-data")
+async def analyze_data(body: AnalyzeDataRequest):
+    """Recebe OHLCV direto do frontend (Binance browser) e retorna análise."""
+    if len(body.candles) < 50:
+        raise HTTPException(400, "Not enough data for analysis")
+
+    df = pd.DataFrame([c.model_dump() for c in body.candles])
+    df = df.astype({
+        "timestamp": int, "open": float, "high": float,
+        "low": float, "close": float, "volume": float,
+    })
+
+    try:
+        indicators = calculate_indicators(df)
+        patterns = detect_all_patterns(df)
+        signal = build_trade_signal(body.symbol, body.timeframe, df, indicators, patterns)
+    except Exception as e:
+        logging.error(f"analyze_data error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro na análise: {e}")
+
+    if body.with_ai:
         signal.ai_analysis = await generate_ai_analysis(signal)
 
     return signal
