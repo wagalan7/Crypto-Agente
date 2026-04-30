@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { X, RefreshCw, Layers, BarChart2 } from 'lucide-react'
+import { X, RefreshCw, Layers, BarChart2, ArrowLeft } from 'lucide-react'
 import { CandleChart } from './Chart/CandleChart'
 import { SignalPanel } from './SignalPanel/SignalPanel'
 import { useAnalysis } from '../hooks/useAnalysis'
@@ -11,6 +11,7 @@ interface Props {
   symbol: string
   timeframe: string
   onClose: () => void
+  isMobile?: boolean
 }
 
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -69,7 +70,7 @@ function MultiTFPanel({ symbol }: { symbol: string }) {
   )
 }
 
-export default function ChartPanel({ symbol, timeframe: initialTf, onClose }: Props) {
+export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMobile }: Props) {
   const [tf, setTf] = useState(initialTf)
   const [withAi, setWithAi] = useState(false)
   const [activeTab, setActiveTab] = useState<'signal' | 'mtf'>('signal')
@@ -87,6 +88,11 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose }: Pr
       {/* Panel header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800 flex-shrink-0 gap-2">
         <div className="flex items-center gap-2 min-w-0">
+          {isMobile && (
+            <button onClick={onClose} className="p-1 bg-slate-800 hover:bg-slate-700 rounded transition-colors flex-shrink-0">
+              <ArrowLeft className="w-3.5 h-3.5" />
+            </button>
+          )}
           <span className="font-bold text-white text-sm truncate">{cleanName(symbol)}</span>
           {ticker && (
             <>

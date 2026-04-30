@@ -166,10 +166,17 @@ export default function App() {
   const [loadingProgress, setLoadingProgress] = useState(0)
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null)
   const [clock, setClock] = useState(new Date())
+  const [isMobile, setIsMobile] = useState(window.innerWidth < 768)
 
   useEffect(() => {
     const id = setInterval(() => setClock(new Date()), 1000)
     return () => clearInterval(id)
+  }, [])
+
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < 768)
+    window.addEventListener('resize', handler)
+    return () => window.removeEventListener('resize', handler)
   }, [])
 
   const loadData = useCallback(async (mode: TradeMode) => {
@@ -449,11 +456,13 @@ export default function App() {
       {/* Scrolling ticker — full width at top */}
       <TickerBar />
 
-      {/* Body: split left/right */}
+      {/* Body */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left: scanner list */}
+        {/* Left: scanner list — hidden on mobile when chart is open */}
         <div className={`flex-shrink-0 overflow-hidden transition-all duration-300 ${
-          selectedSymbol ? 'w-[340px] xl:w-[380px]' : 'w-full'
+          selectedSymbol
+            ? isMobile ? 'w-0' : 'w-[340px] xl:w-[380px]'
+            : 'w-full'
         }`}>
           {ScannerPanel}
         </div>
@@ -465,6 +474,7 @@ export default function App() {
               symbol={selectedSymbol}
               timeframe={TRADE_MODES[tradeMode].timeframe}
               onClose={() => setSelectedSymbol(null)}
+              isMobile={isMobile}
             />
           </div>
         )}
