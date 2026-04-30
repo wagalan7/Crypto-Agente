@@ -1,8 +1,12 @@
 import asyncio
 import json
 import time
+import traceback
+import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
+
+logging.basicConfig(level=logging.INFO)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -82,13 +86,22 @@ async def analyze(
     if timeframe not in TIMEFRAMES:
         raise HTTPException(400, f"Timeframe must be one of {TIMEFRAMES}")
 
-    df = await fetch_ohlcv(symbol, timeframe, DEFAULT_LIMIT)
+    try:
+        df = await fetch_ohlcv(symbol, timeframe, DEFAULT_LIMIT)
+    except Exception as e:
+        logging.error(f"fetch_ohlcv error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao buscar dados: {e}")
+
     if df.empty or len(df) < 50:
         raise HTTPException(400, "Not enough data for analysis")
 
-    indicators = calculate_indicators(df)
-    patterns = detect_all_patterns(df)
-    signal = build_trade_signal(symbol, timeframe, df, indicators, patterns)
+    try:
+        indicators = calculate_indicators(df)
+        patterns = detect_all_patterns(df)
+        signal = build_trade_signal(symbol, timeframe, df, indicators, patterns)
+    except Exception as e:
+        logging.error(f"analysis error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro na análise: {e}")
 
     if with_ai:
         signal.ai_analysis = await generate_ai_analysis(signal)
