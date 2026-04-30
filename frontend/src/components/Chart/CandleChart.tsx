@@ -49,7 +49,7 @@ export function CandleChart({ candles, signal, height }: Props) {
 
     const el = containerRef.current
     const w = el.clientWidth || 600
-    const h = height ?? el.clientHeight || 480
+    const h = height ?? (el.clientHeight || 480)
 
     const chart = createChart(el, {
       layout: {
