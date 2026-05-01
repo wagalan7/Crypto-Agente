@@ -14,6 +14,7 @@ TIMEFRAME_TRADE_TYPE = {
     "15m": TradeType.DAY_TRADE,
     "1h":  TradeType.DAY_TRADE,
     "4h":  TradeType.SWING,
+    "12h": TradeType.SWING,
     "1d":  TradeType.HODL,
 }
 

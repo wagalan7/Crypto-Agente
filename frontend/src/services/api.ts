@@ -6,7 +6,7 @@ const BASE = `${BACKEND}/api`
 // Binance Futures public API — requests come from the user's browser IP, no geo-blocking
 const BINANCE_FAPI = 'https://fapi.binance.com/fapi/v1'
 const BINANCE_INTERVAL: Record<string, string> = {
-  '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d',
+  '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '4h': '4h', '12h': '12h', '1d': '1d',
 }
 
 function toBinance(symbol: string): string {

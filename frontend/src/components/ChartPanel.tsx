@@ -14,7 +14,7 @@ interface Props {
   isMobile?: boolean
 }
 
-const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
+const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '12h', '1d']
 
 function cleanName(s: string) {
   return s.replace('/USDT:USDT', '/USDT').replace(':USDT', '')
@@ -75,13 +75,23 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
   const [withAi, setWithAi] = useState(false)
   const [activeTab, setActiveTab] = useState<'signal' | 'mtf'>('signal')
   const { signal, candles, loading, error, analyze } = useAnalysis()
+  // displaySignal is cleared immediately on TF/symbol change so old patterns never
+  // appear on mismatched candles while the new analysis is loading
+  const [displaySignal, setDisplaySignal] = useState<typeof signal>(null)
   const ticker = useLivePrice(symbol)
 
   const runAnalysis = useCallback(() => {
     analyze(symbol, tf, withAi)
   }, [analyze, symbol, tf, withAi])
 
-  useEffect(() => { runAnalysis() }, [symbol, tf])
+  useEffect(() => {
+    setDisplaySignal(null)  // clear patterns immediately when TF or symbol changes
+    runAnalysis()
+  }, [symbol, tf])
+
+  useEffect(() => {
+    if (signal) setDisplaySignal(signal)
+  }, [signal])
 
   return (
     <div className="flex flex-col h-full bg-[#0d1320] border-l border-slate-800">
@@ -175,7 +185,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
               {error}
             </div>
           )}
-          <CandleChart candles={candles} signal={signal} />
+          <CandleChart candles={candles} signal={displaySignal} />
         </div>
 
         {/* Signal / MTF panel */}
@@ -199,9 +209,9 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
             </button>
           </div>
           <div className="flex-1 overflow-y-auto p-2">
-            {activeTab === 'signal' && signal ? (
-              <SignalPanel signal={signal} livePrice={ticker?.last} />
-            ) : activeTab === 'signal' && !signal && !loading ? (
+            {activeTab === 'signal' && displaySignal ? (
+              <SignalPanel signal={displaySignal} livePrice={ticker?.last} />
+            ) : activeTab === 'signal' && !displaySignal && !loading ? (
               <div className="flex flex-col items-center justify-center h-full text-slate-600 text-sm gap-2">
                 <BarChart2 className="w-7 h-7" />
                 <p className="text-xs">Clique em Analisar</p>

@@ -41,7 +41,7 @@ const TRADE_MODES: Record<TradeMode, {
     color: 'text-blue-400', border: 'border-blue-500/50', bg: 'bg-blue-500/10', glow: 'shadow-blue-500/10',
   },
   swing: {
-    label: 'SWING', icon: '📈', tfs: '4h·12h·1D', chartTf: '4h/1D', timeframe: '4h',
+    label: 'SWING', icon: '📈', tfs: '4h·12h·1D', chartTf: '12h/1D', timeframe: '1d',
     color: 'text-purple-400', border: 'border-purple-500/50', bg: 'bg-purple-500/10', glow: 'shadow-purple-500/10',
   },
 }
@@ -157,7 +157,7 @@ function AssetRow({ asset, rank, tradeMode, onClick }: {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [tradeMode, setTradeMode] = useState<TradeMode>('scalp')
+  const [tradeMode, setTradeMode] = useState<TradeMode>('swing')
   const [filter, setFilter] = useState<Filter>('all')
   const [sort, setSort] = useState<Sort>('volume')
   const [search, setSearch] = useState('')

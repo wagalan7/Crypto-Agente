@@ -7,8 +7,8 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
-DEFAULT_TIMEFRAME = "1h"
+TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "12h", "1d"]
+DEFAULT_TIMEFRAME = "1d"
 DEFAULT_LIMIT = 300
 
 TRADE_TYPE_THRESHOLDS = {
