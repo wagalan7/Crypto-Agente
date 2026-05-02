@@ -168,6 +168,17 @@ export function SignalPanel({ signal, livePrice }: Props) {
         <span className={`text-xs font-semibold px-2 py-1 rounded border ${tt.color}`}>{tt.label}</span>
       </div>
 
+      {/* Low confidence warning */}
+      {signal.confidence < 0.80 && (
+        <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 flex items-center gap-2">
+          <span className="text-yellow-400 text-lg">⚠️</span>
+          <div>
+            <p className="text-xs font-bold text-yellow-400">AGUARDAR CONFLUÊNCIA</p>
+            <p className="text-xs text-yellow-300/70">Probabilidade {(signal.confidence * 100).toFixed(0)}% abaixo do mínimo de 80% para operar</p>
+          </div>
+        </div>
+      )}
+
       {/* Confidence */}
       <div className="bg-slate-800/60 rounded-lg p-3">
         <div className="flex justify-between mb-1">
@@ -254,7 +265,7 @@ export function SignalPanel({ signal, livePrice }: Props) {
           )}
           {signal.indicators.ema9 != null && (
             <>
-              <span className="text-xs text-slate-500">EMA 9/21/50</span>
+              <span className="text-xs text-slate-500">EMA 12/26/50</span>
               <span className={`text-xs font-mono font-semibold ${
                 signal.indicators.ema9 > (signal.indicators.ema21 ?? 0) ? 'text-green-400' : 'text-red-400'
               }`}>

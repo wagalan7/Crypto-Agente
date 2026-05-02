@@ -37,8 +37,8 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
     bb_lower  = _safe(bb.bollinger_lband())
 
     # ── EMAs ─────────────────────────────────────────────
-    ema9   = _safe(ta.trend.EMAIndicator(close, window=9).ema_indicator())
-    ema21  = _safe(ta.trend.EMAIndicator(close, window=21).ema_indicator())
+    ema9   = _safe(ta.trend.EMAIndicator(close, window=12).ema_indicator())
+    ema21  = _safe(ta.trend.EMAIndicator(close, window=26).ema_indicator())
     ema50  = _safe(ta.trend.EMAIndicator(close, window=50).ema_indicator())
     ema200 = _safe(ta.trend.EMAIndicator(close, window=200).ema_indicator()) if len(df) >= 200 else None
 

@@ -11,11 +11,15 @@ from services.indicator_service import get_indicator_signals
 TIMEFRAME_TRADE_TYPE = {
     "1m":  TradeType.SCALP,
     "5m":  TradeType.SCALP,
-    "15m": TradeType.DAY_TRADE,
+    "15m": TradeType.SCALP,
+    "30m": TradeType.DAY_TRADE,
     "1h":  TradeType.DAY_TRADE,
     "4h":  TradeType.SWING,
+    "6h":  TradeType.SWING,
+    "8h":  TradeType.SWING,
     "12h": TradeType.SWING,
     "1d":  TradeType.HODL,
+    "3d":  TradeType.HODL,
 }
 
 TRADE_TYPE_LABELS = {
@@ -155,9 +159,9 @@ def calculate_levels(
 
 
 def signal_strength_label(confidence: float) -> str:
-    if confidence >= 0.75:
+    if confidence >= 0.80:
         return "Forte"
-    elif confidence >= 0.55:
+    elif confidence >= 0.60:
         return "Moderado"
     else:
         return "Fraco"

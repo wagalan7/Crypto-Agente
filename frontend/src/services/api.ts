@@ -6,7 +6,9 @@ const BASE = `${BACKEND}/api`
 // Binance Futures public API — requests come from the user's browser IP, no geo-blocking
 const BINANCE_FAPI = 'https://fapi.binance.com/fapi/v1'
 const BINANCE_INTERVAL: Record<string, string> = {
-  '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1h', '4h': '4h', '12h': '12h', '1d': '1d',
+  '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
+  '1h': '1h', '4h': '4h', '6h': '6h', '8h': '8h', '12h': '12h',
+  '1d': '1d', '3d': '3d',
 }
 
 function toBinance(symbol: string): string {
@@ -120,6 +122,20 @@ export const api = {
 
   getTickers: (symbols: string[]) =>
     get<{ tickers: Ticker[] }>('/tickers', { symbols: symbols.join(',') }),
+
+  macro: (symbol: string) =>
+    get<{
+      btc_direction: string
+      btc_rsi: number | null
+      btc_adx: number | null
+      btc_dominance: number | null
+      context_text: string
+    }>('/macro', { symbol }),
+
+  bestTimeframe: (symbol: string) =>
+    get<{ best_timeframe: string; score: number; signal: TradeSignal; all_scores: Record<string, number> }>(
+      '/best-timeframe', { symbol }
+    ),
 }
 
 export function createPriceWebSocket(symbol: string, onMessage: (data: unknown) => void): WebSocket {

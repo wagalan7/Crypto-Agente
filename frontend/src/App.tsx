@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { Search } from 'lucide-react'
 import TickerBar from './components/TickerBar'
 import ChartPanel from './components/ChartPanel'
+import TradeManager from './components/TradeManager'
 import { api } from './services/api'
 import type { SignalDirection, TradeType } from './types'
 
@@ -33,7 +34,7 @@ const TRADE_MODES: Record<TradeMode, {
   color: string; border: string; bg: string; glow: string
 }> = {
   scalp: {
-    label: 'SCALP', icon: '⚡', tfs: '1m·5m·15m', chartTf: '1m/5m', timeframe: '5m',
+    label: 'SCALP', icon: '⚡', tfs: '5m·15m·30m', chartTf: '5m/15m', timeframe: '5m',
     color: 'text-yellow-400', border: 'border-yellow-500/50', bg: 'bg-yellow-500/10', glow: 'shadow-yellow-500/10',
   },
   day: {
@@ -157,6 +158,7 @@ function AssetRow({ asset, rank, tradeMode, onClick }: {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [showTradeManager, setShowTradeManager] = useState(false)
   const [tradeMode, setTradeMode] = useState<TradeMode>('swing')
   const [filter, setFilter] = useState<Filter>('all')
   const [sort, setSort] = useState<Sort>('volume')
@@ -328,9 +330,18 @@ export default function App() {
           <span className="text-xs text-slate-300 font-medium">Binance Futures – Tempo Real</span>
         </div>
         <span className="text-slate-500 text-xs">{assets.length} pares</span>
-        <span className="text-slate-600 text-xs font-mono tabular-nums">
-          {clock.toLocaleTimeString('pt-BR')}
-        </span>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => setShowTradeManager(v => !v)}
+            className="flex items-center gap-1 px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-xs font-semibold text-slate-300"
+          >
+            <span>📋</span>
+            <span className="hidden sm:block">Trades</span>
+          </button>
+          <span className="text-slate-600 text-xs font-mono tabular-nums">
+            {clock.toLocaleTimeString('pt-BR')}
+          </span>
+        </div>
       </div>
 
       {/* Trade type cards */}
@@ -479,6 +490,16 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {showTradeManager && (
+        <TradeManager
+          onClose={() => setShowTradeManager(false)}
+          onSelectSymbol={(sym) => {
+            setSelectedSymbol(sym)
+            setShowTradeManager(false)
+          }}
+        />
+      )}
     </div>
   )
 }
