@@ -73,8 +73,8 @@ function generateAnalysis(signal: TradeSignal): string {
   // EMAs
   if (ind.ema9 != null && ind.ema21 != null && ind.ema50 != null) {
     const [e9, e21, e50] = [ind.ema9, ind.ema21, ind.ema50]
-    if (e9 > e21 && e21 > e50) lines.push(`EMAs alinhadas em alta (9 > 21 > 50) — tendência bullish confirmada.`)
-    else if (e9 < e21 && e21 < e50) lines.push(`EMAs alinhadas em baixa (9 < 21 < 50) — tendência bearish confirmada.`)
+    if (e9 > e21 && e21 > e50) lines.push(`EMAs alinhadas em alta (12 > 26 > 50) — tendência bullish confirmada.`)
+    else if (e9 < e21 && e21 < e50) lines.push(`EMAs alinhadas em baixa (12 < 26 < 50) — tendência bearish confirmada.`)
     else lines.push(`EMAs sem alinhamento claro — mercado em transição ou lateral.`)
   }
 
