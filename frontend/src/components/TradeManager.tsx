@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { X, Plus, TrendingUp, TrendingDown, Bell, Trash2 } from 'lucide-react'
+import { api } from '../services/api'
+import type { TradeSignal } from '../types'
 
 interface Trade {
   id: string
@@ -26,6 +28,16 @@ interface Alert {
 }
 
 const STORAGE_KEY = 'crypto_agent_trades'
+const USER_ID_KEY = 'crypto_agent_uid'
+
+function getUserId(): string {
+  let uid = localStorage.getItem(USER_ID_KEY)
+  if (!uid) {
+    uid = Math.random().toString(36).slice(2) + Date.now().toString(36)
+    localStorage.setItem(USER_ID_KEY, uid)
+  }
+  return uid
+}
 
 function loadTrades(): Trade[] {
   try {
@@ -54,12 +66,15 @@ function fmtPrice(p: number): string {
 interface Props {
   onClose: () => void
   onSelectSymbol?: (symbol: string) => void
+  initialSignal?: TradeSignal | null
 }
 
-export default function TradeManager({ onClose, onSelectSymbol }: Props) {
+export default function TradeManager({ onClose, onSelectSymbol, initialSignal }: Props) {
   const [trades, setTrades] = useState<Trade[]>(loadTrades)
   const [alerts, setAlerts] = useState<Alert[]>([])
   const [showAddForm, setShowAddForm] = useState(false)
+  const userId = getUserId()
+  const [syncing, setSyncing] = useState(false)
 
   // Form state
   const [form, setForm] = useState({
@@ -139,6 +154,49 @@ export default function TradeManager({ onClose, onSelectSymbol }: Props) {
   // Persist trades
   useEffect(() => { saveTrades(trades) }, [trades])
 
+  // Sync to backend whenever trades change
+  useEffect(() => {
+    const sync = async () => {
+      try {
+        setSyncing(true)
+        await api.syncTrades(userId, trades)
+      } catch { /* offline — localStorage still works */ }
+      finally { setSyncing(false) }
+    }
+    if (trades.length > 0) sync()
+  }, [trades, userId])
+
+  // Load from backend on mount (cross-device sync)
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const { trades: remoteTrades } = await api.loadTrades(userId)
+        if (remoteTrades && remoteTrades.length > 0) {
+          setTrades(remoteTrades as Trade[])
+        }
+      } catch { /* offline — use localStorage */ }
+    }
+    load()
+  }, [userId])
+
+  // Auto-fill form when signal is passed from chart
+  useEffect(() => {
+    if (!initialSignal) return
+    const base = initialSignal.symbol.split('/')[0]
+    setForm({
+      symbol: initialSignal.symbol,
+      timeframe: initialSignal.timeframe,
+      direction: initialSignal.direction === 'long' ? 'long' : 'short',
+      entry: initialSignal.entry.toString(),
+      stopLoss: initialSignal.stop_loss.toString(),
+      tp1: initialSignal.tp1.toString(),
+      tp2: initialSignal.tp2.toString(),
+      tp3: initialSignal.tp3.toString(),
+    })
+    setShowAddForm(true)
+    addAlert('import', `📥 Níveis importados de ${base} — confirme para adicionar`, 'info')
+  }, [initialSignal, addAlert])
+
   const addTrade = () => {
     const base = form.symbol.split('/')[0]
     const trade: Trade = {
@@ -198,6 +256,7 @@ export default function TradeManager({ onClose, onSelectSymbol }: Props) {
             <span className="text-xs bg-slate-700 text-slate-300 px-1.5 py-0.5 rounded">
               {trades.filter(t => t.status === 'open').length} abertos
             </span>
+            {syncing && <span className="text-xs text-slate-500">↑ sync</span>}
           </div>
           <div className="flex items-center gap-2">
             <button

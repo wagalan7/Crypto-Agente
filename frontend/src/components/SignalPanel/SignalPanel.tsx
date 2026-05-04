@@ -4,6 +4,7 @@ import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, 
 interface Props {
   signal: TradeSignal
   livePrice?: number
+  onAddToManager?: () => void
 }
 
 const DIRECTION_CONFIG: Record<SignalDirection, { icon: typeof TrendingUp; color: string; bg: string; label: string }> = {
@@ -151,7 +152,7 @@ function LevelRow({ label, price, entry, color }: { label: string; price: number
   )
 }
 
-export function SignalPanel({ signal, livePrice }: Props) {
+export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
   const dir = DIRECTION_CONFIG[signal.direction]
   const DirIcon = dir.icon
   const tt = TRADE_TYPE_CONFIG[signal.trade_type]
@@ -169,12 +170,12 @@ export function SignalPanel({ signal, livePrice }: Props) {
       </div>
 
       {/* Low confidence warning */}
-      {signal.confidence < 0.80 && (
+      {signal.confidence < 0.75 && (
         <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 flex items-center gap-2">
           <span className="text-yellow-400 text-lg">⚠️</span>
           <div>
             <p className="text-xs font-bold text-yellow-400">AGUARDAR CONFLUÊNCIA</p>
-            <p className="text-xs text-yellow-300/70">Probabilidade {(signal.confidence * 100).toFixed(0)}% abaixo do mínimo de 80% para operar</p>
+            <p className="text-xs text-yellow-300/70">Probabilidade {(signal.confidence * 100).toFixed(0)}% abaixo do mínimo de 75% para operar</p>
           </div>
         </div>
       )}
@@ -198,6 +199,16 @@ export function SignalPanel({ signal, livePrice }: Props) {
           {generateAnalysis(signal)}
         </p>
       </div>
+
+      {/* Add to trade manager */}
+      {onAddToManager && signal.confidence >= 0.75 && (
+        <button
+          onClick={onAddToManager}
+          className="w-full py-2 bg-green-600/20 hover:bg-green-600/40 border border-green-500/40 rounded-lg text-xs font-bold text-green-400 transition-colors flex items-center justify-center gap-1.5"
+        >
+          📋 Adicionar ao Gestor de Trades
+        </button>
+      )}
 
       {/* Live price */}
       {livePrice && (

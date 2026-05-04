@@ -129,6 +129,7 @@ export const api = {
       btc_rsi: number | null
       btc_adx: number | null
       btc_dominance: number | null
+      market_data: { dxy?: { price: number; change: number }; sp500?: { price: number; change: number }; nasdaq?: { price: number; change: number } }
       context_text: string
     }>('/macro', { symbol }),
 
@@ -136,6 +137,19 @@ export const api = {
     get<{ best_timeframe: string; score: number; signal: TradeSignal; all_scores: Record<string, number> }>(
       '/best-timeframe', { symbol }
     ),
+
+  loadTrades: (userId: string) =>
+    get<{ trades: unknown[] }>(`/trades/${userId}`),
+
+  syncTrades: async (userId: string, trades: unknown[]) => {
+    const res = await fetch(BASE + `/trades/${userId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trades }),
+    })
+    if (!res.ok) throw new Error(`API error ${res.status}`)
+    return res.json()
+  },
 }
 
 export function createPriceWebSocket(symbol: string, onMessage: (data: unknown) => void): WebSocket {

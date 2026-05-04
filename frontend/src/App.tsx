@@ -159,6 +159,7 @@ function AssetRow({ asset, rank, tradeMode, onClick }: {
 
 export default function App() {
   const [showTradeManager, setShowTradeManager] = useState(false)
+  const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const [tradeMode, setTradeMode] = useState<TradeMode>('swing')
   const [filter, setFilter] = useState<Filter>('all')
   const [sort, setSort] = useState<Sort>('volume')
@@ -275,7 +276,7 @@ export default function App() {
     if (filter === 'long') return a.direction === 'long'
     if (filter === 'short') return a.direction === 'short'
     if (filter === 'neutral') return a.direction === 'neutral'
-    if (filter === 'forte') return a.signal_strength?.toLowerCase().includes('fort') || a.signal_strength?.toLowerCase().includes('strong') || a.confidence >= 0.70
+    if (filter === 'forte') return a.signal_strength?.toLowerCase().includes('fort') || a.signal_strength?.toLowerCase().includes('strong') || a.confidence >= 0.75
     if (filter === 'rsi70') return (a.rsi ?? 0) > 70
     if (filter === 'rsi30') return (a.rsi ?? 100) < 30
     return true
@@ -486,6 +487,10 @@ export default function App() {
               timeframe={TRADE_MODES[tradeMode].timeframe}
               onClose={() => setSelectedSymbol(null)}
               isMobile={isMobile}
+              onAddSignalToManager={(sig) => {
+                setPendingSignal(sig)
+                setShowTradeManager(true)
+              }}
             />
           </div>
         )}
@@ -493,11 +498,12 @@ export default function App() {
 
       {showTradeManager && (
         <TradeManager
-          onClose={() => setShowTradeManager(false)}
+          onClose={() => { setShowTradeManager(false); setPendingSignal(null) }}
           onSelectSymbol={(sym) => {
             setSelectedSymbol(sym)
             setShowTradeManager(false)
           }}
+          initialSignal={pendingSignal}
         />
       )}
     </div>

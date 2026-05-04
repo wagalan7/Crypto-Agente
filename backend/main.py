@@ -27,7 +27,8 @@ from services.indicator_service import calculate_indicators
 from services.pattern_service import detect_all_patterns
 from services.signal_service import build_trade_signal
 from services.ai_service import generate_ai_analysis
-from services.macro_service import get_btc_dominance, build_macro_context
+from services.trade_service import get_trades, save_trades
+from services.macro_service import get_btc_dominance, build_macro_context, get_global_market_data
 from models.trade_signal import TradeSignal
 
 
@@ -153,22 +154,29 @@ async def analyze_data(body: AnalyzeDataRequest):
         raise HTTPException(500, f"Erro na análise: {e}")
 
     if body.with_ai:
-        signal.ai_analysis = await generate_ai_analysis(signal)
+        try:
+            macro = await macro_context(body.symbol)
+            mc_text = macro.get("context_text", "")
+        except Exception:
+            mc_text = ""
+        signal.ai_analysis = await generate_ai_analysis(signal, mc_text)
 
     return signal
 
 
 @app.get("/api/macro")
 async def macro_context(symbol: str = "BTC/USDT:USDT"):
-    """Retorna contexto macro: análise BTC + dominância."""
+    """Retorna contexto macro: BTC + dominância + DXY + S&P500 + Nasdaq."""
     try:
-        btc_dominance, btc_df = await asyncio.gather(
+        btc_dominance, btc_df, market_data = await asyncio.gather(
             get_btc_dominance(),
             fetch_ohlcv("BTC/USDT:USDT", "1d", 100),
+            get_global_market_data(),
             return_exceptions=True,
         )
         dominance = btc_dominance if not isinstance(btc_dominance, Exception) else None
         btc_data = btc_df if not isinstance(btc_df, Exception) else None
+        mdata = market_data if not isinstance(market_data, Exception) else {}
 
         btc_direction = "neutro"
         btc_rsi = btc_adx = btc_st = None
@@ -182,18 +190,19 @@ async def macro_context(symbol: str = "BTC/USDT:USDT"):
             dir_val = determine_direction(btc_ind, [], current)
             btc_direction = dir_val.value
 
-        context = build_macro_context(btc_direction, btc_rsi, btc_adx, btc_st, dominance, symbol)
+        context = build_macro_context(btc_direction, btc_rsi, btc_adx, btc_st, dominance, symbol, mdata)
         return {
             "btc_direction": btc_direction,
             "btc_rsi": btc_rsi,
             "btc_adx": btc_adx,
             "btc_supertrend": btc_st,
             "btc_dominance": dominance,
+            "market_data": mdata,
             "context_text": context,
         }
     except Exception as e:
         logging.error(f"macro_context error: {e}")
-        return {"btc_direction": "neutro", "btc_dominance": None, "context_text": ""}
+        return {"btc_direction": "neutro", "btc_dominance": None, "market_data": {}, "context_text": ""}
 
 
 @app.get("/api/best-timeframe")
@@ -250,6 +259,20 @@ async def multi_timeframe_analysis(symbol: str, with_ai: bool = False):
         except Exception:
             pass
     return results
+
+
+@app.get("/api/trades/{user_id}")
+async def load_trades(user_id: str):
+    """Carrega trades sincronizados do usuário."""
+    return {"trades": get_trades(user_id)}
+
+
+@app.post("/api/trades/{user_id}")
+async def sync_trades(user_id: str, body: dict):
+    """Sincroniza (sobrescreve) todos os trades do usuário."""
+    trades = body.get("trades", [])
+    save_trades(user_id, trades)
+    return {"ok": True, "count": len(trades)}
 
 
 @app.get("/api/market-data")

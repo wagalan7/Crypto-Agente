@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { X, RefreshCw, Layers, BarChart2, ArrowLeft } from 'lucide-react'
+import { X, RefreshCw, Layers, BarChart2, ArrowLeft, Maximize2, Minimize2 } from 'lucide-react'
 import { CandleChart } from './Chart/CandleChart'
 import { SignalPanel } from './SignalPanel/SignalPanel'
 import { useAnalysis } from '../hooks/useAnalysis'
@@ -12,6 +12,7 @@ interface Props {
   timeframe: string
   onClose: () => void
   isMobile?: boolean
+  onAddSignalToManager?: (signal: TradeSignal) => void
 }
 
 const TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '4h', '6h', '8h', '12h', '1d', '3d']
@@ -70,10 +71,11 @@ function MultiTFPanel({ symbol }: { symbol: string }) {
   )
 }
 
-export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMobile }: Props) {
+export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMobile, onAddSignalToManager }: Props) {
   const [tf, setTf] = useState(initialTf)
   const [withAi, setWithAi] = useState(false)
   const [activeTab, setActiveTab] = useState<'signal' | 'mtf'>('signal')
+  const [isFullscreen, setIsFullscreen] = useState(false)
   const { signal, candles, loading, error, analyze } = useAnalysis()
   // displaySignal is cleared immediately on TF/symbol change so old patterns never
   // appear on mismatched candles while the new analysis is loading
@@ -94,7 +96,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
   }, [signal])
 
   return (
-    <div className="flex flex-col h-full bg-[#0d1320] border-l border-slate-800">
+    <div className={`flex flex-col bg-[#0d1320] border-l border-slate-800 ${isFullscreen ? 'fixed inset-0 z-50' : 'h-full'}`}>
       {/* Panel header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800 flex-shrink-0 gap-2">
         <div className="flex items-center gap-2 min-w-0">
@@ -146,6 +148,15 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
           >
             <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
             <span className="hidden sm:block">Analisar</span>
+          </button>
+          <button
+            onClick={() => setIsFullscreen(v => !v)}
+            className="p-1 bg-slate-800 hover:bg-slate-700 rounded transition-colors"
+            title={isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}
+          >
+            {isFullscreen
+              ? <Minimize2 className="w-3.5 h-3.5" />
+              : <Maximize2 className="w-3.5 h-3.5" />}
           </button>
           <button
             onClick={onClose}
@@ -210,7 +221,13 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
           </div>
           <div className="flex-1 overflow-y-auto p-2">
             {activeTab === 'signal' && displaySignal ? (
-              <SignalPanel signal={displaySignal} livePrice={ticker?.last} />
+              <SignalPanel
+                signal={displaySignal}
+                livePrice={ticker?.last}
+                onAddToManager={() => {
+                  if (displaySignal) onAddSignalToManager?.(displaySignal)
+                }}
+              />
             ) : activeTab === 'signal' && !displaySignal && !loading ? (
               <div className="flex flex-col items-center justify-center h-full text-slate-600 text-sm gap-2">
                 <BarChart2 className="w-7 h-7" />

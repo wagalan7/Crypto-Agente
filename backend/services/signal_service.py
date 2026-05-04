@@ -159,7 +159,7 @@ def calculate_levels(
 
 
 def signal_strength_label(confidence: float) -> str:
-    if confidence >= 0.80:
+    if confidence >= 0.75:
         return "Forte"
     elif confidence >= 0.60:
         return "Moderado"
