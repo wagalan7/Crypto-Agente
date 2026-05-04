@@ -73,6 +73,18 @@ async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
     return {"status": "queued"}
 
 
+@app.post("/webhook/{slug}/zapi")
+async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
+    tenant = _get_tenant(slug)
+    payload = await request.json()
+    result = wa.extract_message_zapi(payload)
+    if not result:
+        return {"status": "ignored"}
+    phone, text = result
+    bg.add_task(_handle_message, tenant, phone, text)
+    return {"status": "queued"}
+
+
 @app.post("/webhook/{slug}/twilio")
 async def webhook_twilio(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
@@ -154,6 +166,24 @@ def configure_whatsapp(slug: str, body: WhatsAppConfig):
     _get_tenant(slug)
     updated = ts.configure_whatsapp(slug, body.provider, **body.model_dump(exclude={"provider"}, exclude_none=True))
     return {"status": "updated", "provider": updated["whatsapp_provider"]}
+
+
+class ZAPIConfig(BaseModel):
+    instance_id: str
+    token: str
+    client_token: Optional[str] = ""
+
+
+@app.patch("/admin/tenants/{slug}/zapi")
+def configure_zapi(slug: str, body: ZAPIConfig):
+    """Configura Z-API para o consultório."""
+    _get_tenant(slug)
+    ts.configure_zapi(slug, body.instance_id, body.token, body.client_token or "")
+    return {
+        "status": "configured",
+        "provider": "zapi",
+        "webhook_url": f"https://agente-atendimento-production.up.railway.app/webhook/{slug}/zapi",
+    }
 
 
 # ── Admin — Agenda ─────────────────────────────────────────────────────────────

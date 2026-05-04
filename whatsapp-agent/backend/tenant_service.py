@@ -46,8 +46,19 @@ def get_tenant_or_404(slug: str) -> dict:
 
 
 def configure_whatsapp(slug: str, provider: str, **kwargs) -> dict:
-    allowed_providers = {"evolution", "twilio", "mock"}
+    allowed_providers = {"evolution", "zapi", "twilio", "mock"}
     if provider not in allowed_providers:
         raise ValueError(f"Provider inválido. Use: {allowed_providers}")
     db.update_tenant(slug, whatsapp_provider=provider, **kwargs)
     return db.get_tenant(slug)
+
+
+def configure_zapi(slug: str, instance_id: str, token: str, client_token: str = "") -> dict:
+    """Atalho para configurar Z-API reutilizando os campos evolution_*."""
+    return configure_whatsapp(
+        slug,
+        provider="zapi",
+        evolution_instance=instance_id,
+        evolution_key=token,
+        evolution_url=client_token,
+    )
