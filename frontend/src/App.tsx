@@ -289,33 +289,38 @@ export default function App() {
     let lastMsgAt = 0
     let restFallbackId: ReturnType<typeof setInterval> | null = null
 
-    // Accumulate updates between React renders
+    // Accumulate raw updates — flushed to React state every 2 s
+    // Key: binanceSymbol (e.g. "BTCUSDT"), Value: { price, change }
     const priceMap = new Map<string, { price: number; change: number }>()
 
-    const applyPriceMap = () => {
+    // ⚠️ FIX: snapshot the map BEFORE clearing so the React callback (which runs
+    // in the render phase, AFTER this tick) still has the data it needs.
+    const flush = () => {
       if (priceMap.size === 0) return
+      const snapshot = new Map(priceMap) // capture before clear
+      priceMap.clear()                   // free memory immediately
       setAssets(prev => {
         if (prev.length === 0) return prev
         let changed = false
         const next = prev.map(a => {
-          const u = priceMap.get(a.binanceSymbol)
+          const u = snapshot.get(a.binanceSymbol)
           if (!u) return a
           changed = true
           return { ...a, price: u.price, change24h: u.change }
         })
         return changed ? next : prev
       })
-      priceMap.clear()
     }
 
-    // REST polling fallback: re-fetch all tickers and update state
+    // REST polling fallback (activates if WS is silent for 8+ s)
     const startRestFallback = () => {
-      if (restFallbackId) return // already running
+      if (restFallbackId) return
       restFallbackId = setInterval(async () => {
         if (destroyed) return
-        // If WebSocket recovered, stop REST fallback
         if (Date.now() - lastMsgAt < 8000) {
-          if (restFallbackId) { clearInterval(restFallbackId); restFallbackId = null }
+          // WS recovered — stop polling
+          clearInterval(restFallbackId!)
+          restFallbackId = null
           return
         }
         try {
@@ -328,15 +333,18 @@ export default function App() {
               })
             }
           })
-          applyPriceMap()
-        } catch { /* REST also unavailable, try again next tick */ }
+          flush()
+        } catch { /* retry next tick */ }
       }, 15000)
     }
 
     const connect = () => {
       if (destroyed) return
       try {
-        ws = new WebSocket('wss://fstream.binance.com/ws/!miniTicker@arr')
+        // !ticker@arr = full 24 h ticker for ALL futures symbols, pushed every ~1 s
+        // Fields used: s (symbol), c (last price), P (price change %)
+        // (miniTicker does NOT have the P field — that's why change% was NaN before)
+        ws = new WebSocket('wss://fstream.binance.com/ws/!ticker@arr')
         ws.onmessage = (ev) => {
           try {
             const data = JSON.parse(ev.data as string)
@@ -345,35 +353,34 @@ export default function App() {
             ;(data as Array<{ s: string; c: string; P: string }>).forEach(t => {
               priceMap.set(t.s, { price: parseFloat(t.c), change: parseFloat(t.P) })
             })
-          } catch { /* ignore parse errors */ }
+          } catch { /* ignore malformed frames */ }
         }
         ws.onerror = () => {}
         ws.onclose = () => { if (!destroyed) setTimeout(connect, 5000) }
-      } catch { /* WebSocket unavailable */ }
+      } catch { /* WebSocket not available */ }
     }
 
     connect()
 
-    // Apply batched WS updates every 2 seconds; detect WS stall → REST fallback
+    // Flush accumulated updates to React state every 2 s
     const interval = setInterval(() => {
-      applyPriceMap()
-      // If WS was working but went silent for 8+ seconds, activate REST fallback
+      flush()
       if (lastMsgAt > 0 && Date.now() - lastMsgAt > 8000) startRestFallback()
     }, 2000)
 
-    // Trigger REST fallback if WebSocket never delivers after 8 seconds
-    const initialFallbackTimer = setTimeout(() => {
+    // If WS never delivers within 8 s (e.g. blocked network), start REST fallback
+    const initialTimer = setTimeout(() => {
       if (!destroyed && lastMsgAt === 0) startRestFallback()
     }, 8000)
 
     return () => {
       destroyed = true
       clearInterval(interval)
-      clearTimeout(initialFallbackTimer)
+      clearTimeout(initialTimer)
       if (restFallbackId) clearInterval(restFallbackId)
       ws?.close()
     }
-  }, []) // Connect once on mount — WebSocket handles all symbols
+  }, [])
 
   // Filters
   const filtered = assets.filter(a => {
