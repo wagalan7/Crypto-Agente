@@ -155,25 +155,35 @@ function AssetRow({ asset, rank, tradeMode, onClick }: {
   )
 }
 
-// ─── Ticker cache ─────────────────────────────────────────────────────────────
+// ─── Symbol-only cache (preços NUNCA ficam em cache) ─────────────────────────
 
-const TICKER_CACHE_KEY = 'crypto_ticker_cache'
-const CACHE_MAX_AGE_MS = 23 * 60 * 60 * 1000
+const SYMBOLS_CACHE_KEY = 'crypto_symbols_v3'
+const SYMBOLS_CACHE_TTL = 23 * 60 * 60 * 1000
 
-function getTickerCache(): Array<{ symbol: string; lastPrice: string; priceChangePercent: string; quoteVolume: string }> | null {
+function getCachedSymbolVolumes(): Array<{ symbol: string; quoteVolume: string }> | null {
   try {
-    const raw = localStorage.getItem(TICKER_CACHE_KEY)
+    const raw = localStorage.getItem(SYMBOLS_CACHE_KEY)
     if (!raw) return null
     const { data, ts } = JSON.parse(raw)
-    if (Date.now() - ts > CACHE_MAX_AGE_MS) return null
+    if (Date.now() - ts > SYMBOLS_CACHE_TTL) return null
     return data
   } catch { return null }
 }
 
-function setTickerCache(data: unknown[]) {
+function setSymbolsCache(data: Array<{ symbol: string; quoteVolume: string }>) {
   try {
-    localStorage.setItem(TICKER_CACHE_KEY, JSON.stringify({ data, ts: Date.now() }))
+    localStorage.setItem(SYMBOLS_CACHE_KEY, JSON.stringify({ data, ts: Date.now() }))
   } catch {}
+}
+
+type BinanceTicker = { symbol: string; lastPrice: string; priceChangePercent: string; quoteVolume: string }
+
+async function fetchFreshTickers(): Promise<BinanceTicker[]> {
+  const res = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr', {
+    signal: AbortSignal.timeout(10000),
+  })
+  if (!res.ok) throw new Error(`Binance ${res.status}`)
+  return res.json()
 }
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
@@ -208,15 +218,26 @@ export default function App() {
     setLoadingProgress(5)
 
     try {
-      // 1. Load Binance 24hr tickers directly from browser (with 23h cache)
-      let tickers = getTickerCache()
-      if (!tickers) {
-        const tickerRes = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr')
-        tickers = await tickerRes.json()
-        setTickerCache(tickers!)
+      // 1. Always fetch FRESH prices — never cache prices (stale prices = wrong display)
+      //    Symbol volumes are cached 23h for ordering; prices always come from live fetch.
+      let rawTickers: BinanceTicker[]
+      try {
+        rawTickers = await fetchFreshTickers()
+        // Update the symbol+volume cache for ordering
+        const symbolVols = rawTickers
+          .filter(t => t.symbol.endsWith('USDT'))
+          .map(t => ({ symbol: t.symbol, quoteVolume: t.quoteVolume }))
+        setSymbolsCache(symbolVols)
+      } catch {
+        // Binance unreachable — use cached symbol order but prices will be 0 until WS
+        const cached = getCachedSymbolVolumes() ?? []
+        rawTickers = cached.map(c => ({
+          symbol: c.symbol, lastPrice: '0',
+          priceChangePercent: '0', quoteVolume: c.quoteVolume,
+        }))
       }
 
-      const top = (tickers ?? [])
+      const top = rawTickers
         .filter(t => t.symbol.endsWith('USDT'))
         .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
 
@@ -291,33 +312,17 @@ export default function App() {
     loadData(tradeMode)
   }, [tradeMode, loadData])
 
-  // ── Real-time prices via Binance Futures WebSocket ─────────────────────────
+  // ── Real-time prices via Binance Futures WebSocket (REST fallback) ──────────
   useEffect(() => {
     let ws: WebSocket | null = null
+    let destroyed = false
+    let lastMsgAt = 0
+    let restFallbackId: ReturnType<typeof setInterval> | null = null
+
     // Accumulate updates between React renders
     const priceMap = new Map<string, { price: number; change: number }>()
 
-    const connect = () => {
-      try {
-        ws = new WebSocket('wss://fstream.binance.com/ws/!miniTicker@arr')
-        ws.onmessage = (ev) => {
-          try {
-            const data = JSON.parse(ev.data as string)
-            if (!Array.isArray(data)) return
-            ;(data as Array<{ s: string; c: string; P: string }>).forEach(t => {
-              priceMap.set(t.s, { price: parseFloat(t.c), change: parseFloat(t.P) })
-            })
-          } catch { /* ignore parse errors */ }
-        }
-        ws.onerror = () => {}
-        ws.onclose = () => { setTimeout(connect, 5000) }
-      } catch { /* WebSocket unavailable */ }
-    }
-
-    connect()
-
-    // Apply batched updates to state every 2 seconds
-    const interval = setInterval(() => {
+    const applyPriceMap = () => {
       if (priceMap.size === 0) return
       setAssets(prev => {
         if (prev.length === 0) return prev
@@ -331,10 +336,71 @@ export default function App() {
         return changed ? next : prev
       })
       priceMap.clear()
+    }
+
+    // REST polling fallback: re-fetch all tickers and update state
+    const startRestFallback = () => {
+      if (restFallbackId) return // already running
+      restFallbackId = setInterval(async () => {
+        if (destroyed) return
+        // If WebSocket recovered, stop REST fallback
+        if (Date.now() - lastMsgAt < 8000) {
+          if (restFallbackId) { clearInterval(restFallbackId); restFallbackId = null }
+          return
+        }
+        try {
+          const tickers = await fetchFreshTickers()
+          tickers.forEach(t => {
+            if (t.symbol.endsWith('USDT')) {
+              priceMap.set(t.symbol, {
+                price: parseFloat(t.lastPrice),
+                change: parseFloat(t.priceChangePercent),
+              })
+            }
+          })
+          applyPriceMap()
+        } catch { /* REST also unavailable, try again next tick */ }
+      }, 15000)
+    }
+
+    const connect = () => {
+      if (destroyed) return
+      try {
+        ws = new WebSocket('wss://fstream.binance.com/ws/!miniTicker@arr')
+        ws.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data as string)
+            if (!Array.isArray(data)) return
+            lastMsgAt = Date.now()
+            ;(data as Array<{ s: string; c: string; P: string }>).forEach(t => {
+              priceMap.set(t.s, { price: parseFloat(t.c), change: parseFloat(t.P) })
+            })
+          } catch { /* ignore parse errors */ }
+        }
+        ws.onerror = () => {}
+        ws.onclose = () => { if (!destroyed) setTimeout(connect, 5000) }
+      } catch { /* WebSocket unavailable */ }
+    }
+
+    connect()
+
+    // Apply batched WS updates every 2 seconds; detect WS stall → REST fallback
+    const interval = setInterval(() => {
+      applyPriceMap()
+      // If WS was working but went silent for 8+ seconds, activate REST fallback
+      if (lastMsgAt > 0 && Date.now() - lastMsgAt > 8000) startRestFallback()
     }, 2000)
 
+    // Trigger REST fallback if WebSocket never delivers after 8 seconds
+    const initialFallbackTimer = setTimeout(() => {
+      if (!destroyed && lastMsgAt === 0) startRestFallback()
+    }, 8000)
+
     return () => {
+      destroyed = true
       clearInterval(interval)
+      clearTimeout(initialFallbackTimer)
+      if (restFallbackId) clearInterval(restFallbackId)
       ws?.close()
     }
   }, []) // Connect once on mount — WebSocket handles all symbols
