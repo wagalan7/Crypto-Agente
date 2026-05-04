@@ -6,7 +6,7 @@ import { useAnalysis } from '../hooks/useAnalysis'
 import { useLivePrice } from '../hooks/useLivePrice'
 import { api } from '../services/api'
 import DrawingToolbar from './DrawingToolbar'
-import type { TradeSignal, UserDrawing, DrawingTool } from '../types'
+import type { TradeSignal, UserDrawing, DrawingTool, HLineDrawing, TrendLineDrawing } from '../types'
 
 interface Props {
   symbol: string
@@ -14,6 +14,14 @@ interface Props {
   onClose: () => void
   isMobile?: boolean
   onAddSignalToManager?: (signal: TradeSignal) => void
+}
+
+interface DragState {
+  drawingId: string
+  grabPoint: 'body' | 'p1' | 'p2'
+  startClientX: number
+  startClientY: number
+  snapshot: UserDrawing
 }
 
 const TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '4h', '6h', '8h', '12h', '1d', '3d']
@@ -78,28 +86,37 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
   const [activeTab, setActiveTab] = useState<'signal' | 'mtf'>('signal')
   const [isFullscreen, setIsFullscreen] = useState(false)
   const { signal, candles, loading, error, analyze } = useAnalysis()
-  // displaySignal is cleared immediately on TF/symbol change so old patterns never
-  // appear on mismatched candles while the new analysis is loading
   const [displaySignal, setDisplaySignal] = useState<typeof signal>(null)
   const ticker = useLivePrice(symbol)
 
-  // Drawing tools state
+  // ── Drawing tools ─────────────────────────────────────────────────────────
   const chartHandleRef = useRef<CandleChartHandle>(null)
+  const svgRef = useRef<SVGSVGElement>(null)
+
   const [drawingTool, setDrawingTool] = useState<DrawingTool>('cursor')
   const [userDrawings, setUserDrawings] = useState<UserDrawing[]>([])
   const [drawStart, setDrawStart] = useState<{ x: number; y: number; price: number; time: number } | null>(null)
   const [previewLine, setPreviewLine] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null)
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null)
+
+  // Drag state (cursor mode)
+  const [dragging, setDragging] = useState<DragState | null>(null)
+  const [dragPreview, setDragPreview] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null)
+
+  // Bump to re-render SVG when chart viewport changes
+  const [viewportTick, setViewportTick] = useState(0)
+
+  // AI validation
   const [aiDrawingAnalysis, setAiDrawingAnalysis] = useState<string>('')
   const [validating, setValidating] = useState(false)
-  const svgRef = useRef<SVGSVGElement>(null)
 
+  // ── Analysis ──────────────────────────────────────────────────────────────
   const runAnalysis = useCallback(() => {
     analyze(symbol, tf, withAi)
   }, [analyze, symbol, tf, withAi])
 
   useEffect(() => {
-    setDisplaySignal(null)  // clear patterns immediately when TF or symbol changes
+    setDisplaySignal(null)
     runAnalysis()
   }, [symbol, tf])
 
@@ -107,21 +124,55 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
     if (signal) setDisplaySignal(signal)
   }, [signal])
 
-  const getRelativePos = (e: React.MouseEvent<SVGSVGElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect()
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top }
+  // Subscribe to chart viewport changes so SVG re-renders correctly on zoom/pan
+  useEffect(() => {
+    if (!candles.length) return
+    // Small delay to ensure chart is ready
+    const t = setTimeout(() => {
+      const unsub = chartHandleRef.current?.subscribeToViewport(() => {
+        setViewportTick(v => v + 1)
+      })
+      return () => unsub?.()
+    }, 300)
+    return () => clearTimeout(t)
+  }, [candles.length])
+
+  // ── Coordinate helpers (called during render, uses viewportTick) ──────────
+  const getDrawingCoords = (drawing: UserDrawing): { x1: number; y1: number; x2: number; y2: number } | null => {
+    const h = chartHandleRef.current
+    if (!h) return null
+    if (drawing.type === 'hline') {
+      const y = h.priceToY(drawing.price)
+      return y != null ? { x1: 0, y1: y, x2: 9999, y2: y } : null
+    } else {
+      const x1 = h.timeToX(drawing.p1.time)
+      const y1 = h.priceToY(drawing.p1.price)
+      const x2 = h.timeToX(drawing.p2.time)
+      const y2 = h.priceToY(drawing.p2.price)
+      return (x1 != null && y1 != null && x2 != null && y2 != null) ? { x1, y1, x2, y2 } : null
+    }
   }
 
+  const getSvgPos = (clientX: number, clientY: number) => {
+    const rect = svgRef.current?.getBoundingClientRect()
+    if (!rect) return null
+    return { x: clientX - rect.left, y: clientY - rect.top }
+  }
+
+  // ── Drawing (hline / trendline) ───────────────────────────────────────────
   const handleSvgMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
-    const { x, y } = getRelativePos(e)
-    const price = chartHandleRef.current?.yToPrice(y) ?? null
-    const time = chartHandleRef.current?.xToTime(x) ?? null
+    const rect = e.currentTarget.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    const h = chartHandleRef.current
+    const price = h?.yToPrice(y) ?? null
+    const time = h?.xToTime(x) ?? null
     if (price == null || time == null) return
 
     if (drawingTool === 'hline') {
       const id = Date.now().toString()
       const color = '#4ade80'
-      chartHandleRef.current?.addHLine(price, color, `HL ${id.slice(-4)}`)
+      chartHandleRef.current?.addHLine(id, price, color, `HL ${id.slice(-4)}`)
       setUserDrawings(prev => [...prev, { id, type: 'hline', price, color, label: `HL ${id.slice(-4)}` }])
     } else if (drawingTool === 'trendline') {
       if (!drawStart) {
@@ -130,6 +181,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
         const id = Date.now().toString()
         const color = '#f59e0b'
         chartHandleRef.current?.addTrendLine(
+          id,
           { time: drawStart.time, price: drawStart.price },
           { time, price },
           color
@@ -147,7 +199,9 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
   }
 
   const handleSvgMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    const { x, y } = getRelativePos(e)
+    const rect = e.currentTarget.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
     setMousePos({ x, y })
     if (drawingTool === 'trendline' && drawStart) {
       setPreviewLine({ x1: drawStart.x, y1: drawStart.y, x2: x, y2: y })
@@ -156,14 +210,118 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
 
   const handleSvgMouseLeave = () => {
     setMousePos(null)
-    if (drawingTool === 'trendline' && !drawStart) setPreviewLine(null)
+    if (!drawStart) setPreviewLine(null)
   }
 
+  // ── Drag handlers (attached to individual drawing SVG elements) ───────────
+  const startHLineDrag = (e: React.MouseEvent, drawing: HLineDrawing) => {
+    e.stopPropagation()
+    e.preventDefault()
+    chartHandleRef.current?.removeDrawingById(drawing.id)
+    setDragging({ drawingId: drawing.id, grabPoint: 'body', startClientX: e.clientX, startClientY: e.clientY, snapshot: drawing })
+  }
+
+  const startTrendLineDrag = (e: React.MouseEvent, drawing: TrendLineDrawing, grabPoint: 'p1' | 'p2' | 'body') => {
+    e.stopPropagation()
+    e.preventDefault()
+    chartHandleRef.current?.removeDrawingById(drawing.id)
+    setDragging({ drawingId: drawing.id, grabPoint, startClientX: e.clientX, startClientY: e.clientY, snapshot: drawing })
+  }
+
+  // Document-level drag events (fires while dragging, outside SVG too)
+  useEffect(() => {
+    if (!dragging) return
+
+    const onMove = (e: MouseEvent) => {
+      const pos = getSvgPos(e.clientX, e.clientY)
+      if (!pos) return
+      const h = chartHandleRef.current
+      if (!h) return
+      const { grabPoint, snapshot } = dragging
+      const dx = e.clientX - dragging.startClientX
+      const dy = e.clientY - dragging.startClientY
+
+      if (snapshot.type === 'hline') {
+        setDragPreview({ x1: 0, y1: pos.y, x2: 9999, y2: pos.y })
+      } else {
+        const origCoords = getDrawingCoords(snapshot)
+        if (!origCoords) return
+        if (grabPoint === 'p1') {
+          setDragPreview({ x1: origCoords.x1 + dx, y1: origCoords.y1 + dy, x2: origCoords.x2, y2: origCoords.y2 })
+        } else if (grabPoint === 'p2') {
+          setDragPreview({ x1: origCoords.x1, y1: origCoords.y1, x2: origCoords.x2 + dx, y2: origCoords.y2 + dy })
+        } else {
+          setDragPreview({ x1: origCoords.x1 + dx, y1: origCoords.y1 + dy, x2: origCoords.x2 + dx, y2: origCoords.y2 + dy })
+        }
+      }
+    }
+
+    const onUp = (e: MouseEvent) => {
+      const pos = getSvgPos(e.clientX, e.clientY)
+      const h = chartHandleRef.current
+      const { drawingId, grabPoint, snapshot } = dragging
+      const dx = e.clientX - dragging.startClientX
+      const dy = e.clientY - dragging.startClientY
+
+      let newDrawing: UserDrawing
+
+      if (snapshot.type === 'hline') {
+        const newPrice = (h && pos) ? (h.yToPrice(pos.y) ?? snapshot.price) : snapshot.price
+        newDrawing = { ...snapshot, price: newPrice }
+        h?.addHLine(drawingId, newPrice, snapshot.color, snapshot.label)
+      } else {
+        const origCoords = getDrawingCoords(snapshot)
+        let newP1 = { ...snapshot.p1 }
+        let newP2 = { ...snapshot.p2 }
+
+        if (h && pos) {
+          if (grabPoint === 'p1') {
+            newP1 = {
+              price: h.yToPrice(pos.y) ?? snapshot.p1.price,
+              time: h.xToTime(pos.x) ?? snapshot.p1.time,
+            }
+          } else if (grabPoint === 'p2') {
+            newP2 = {
+              price: h.yToPrice(pos.y) ?? snapshot.p2.price,
+              time: h.xToTime(pos.x) ?? snapshot.p2.time,
+            }
+          } else if (origCoords) {
+            newP1 = {
+              price: h.yToPrice(origCoords.y1 + dy) ?? snapshot.p1.price,
+              time: h.xToTime(origCoords.x1 + dx) ?? snapshot.p1.time,
+            }
+            newP2 = {
+              price: h.yToPrice(origCoords.y2 + dy) ?? snapshot.p2.price,
+              time: h.xToTime(origCoords.x2 + dx) ?? snapshot.p2.time,
+            }
+          }
+        }
+        newDrawing = { ...snapshot, p1: newP1, p2: newP2 }
+        h?.addTrendLine(drawingId, newP1, newP2, snapshot.color)
+      }
+
+      setUserDrawings(prev => prev.map(d => d.id === drawingId ? newDrawing : d))
+      setDragging(null)
+      setDragPreview(null)
+    }
+
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    return () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dragging])
+
+  // ── Clear & validate ──────────────────────────────────────────────────────
   const clearDrawings = () => {
     chartHandleRef.current?.clearDrawings()
     setUserDrawings([])
     setDrawStart(null)
     setPreviewLine(null)
+    setDragging(null)
+    setDragPreview(null)
     setAiDrawingAnalysis('')
   }
 
@@ -180,6 +338,18 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
       setValidating(false)
     }
   }
+
+  // ── SVG pointer events ────────────────────────────────────────────────────
+  // In drawing mode: SVG blocks events (for drawing). In cursor mode: SVG is
+  // transparent to events except on interactive drawing elements.
+  const svgPointerEvents = drawingTool !== 'cursor' ? 'all' : 'none'
+  const svgCursor =
+    dragging ? 'grabbing' :
+    drawingTool === 'hline' ? 'crosshair' :
+    drawingTool === 'trendline' ? 'crosshair' : 'default'
+
+  // Used by getDrawingCoords to trigger re-render on zoom/pan (viewportTick is read)
+  void viewportTick
 
   return (
     <div className={`flex flex-col bg-[#0d1320] border-l border-slate-800 ${isFullscreen ? 'fixed inset-0 z-50' : 'h-full'}`}>
@@ -206,48 +376,27 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
         <div className="flex items-center gap-1 flex-shrink-0">
           <div className="hidden sm:flex gap-0.5">
             {TIMEFRAMES.map(t => (
-              <button
-                key={t}
-                onClick={() => setTf(t)}
-                className={`px-1.5 py-0.5 text-xs font-semibold rounded transition-colors ${
-                  tf === t ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
-                }`}
-              >
+              <button key={t} onClick={() => setTf(t)}
+                className={`px-1.5 py-0.5 text-xs font-semibold rounded transition-colors ${tf === t ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}`}>
                 {t}
               </button>
             ))}
           </div>
           <button
             onClick={() => { setWithAi(v => !v); setTimeout(runAnalysis, 50) }}
-            className={`px-1.5 py-0.5 text-xs rounded font-semibold border transition-colors ${
-              withAi
-                ? 'bg-violet-600/30 text-violet-300 border-violet-500/40'
-                : 'bg-slate-800 text-slate-500 border-slate-700'
-            }`}
-          >
-            IA
-          </button>
-          <button
-            onClick={runAnalysis}
-            disabled={loading}
-            className="flex items-center gap-1 px-2 py-0.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded text-xs font-semibold transition-colors"
-          >
+            className={`px-1.5 py-0.5 text-xs rounded font-semibold border transition-colors ${withAi ? 'bg-violet-600/30 text-violet-300 border-violet-500/40' : 'bg-slate-800 text-slate-500 border-slate-700'}`}
+          >IA</button>
+          <button onClick={runAnalysis} disabled={loading}
+            className="flex items-center gap-1 px-2 py-0.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded text-xs font-semibold transition-colors">
             <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
             <span className="hidden sm:block">Analisar</span>
           </button>
-          <button
-            onClick={() => setIsFullscreen(v => !v)}
+          <button onClick={() => setIsFullscreen(v => !v)}
             className="p-1 bg-slate-800 hover:bg-slate-700 rounded transition-colors"
-            title={isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}
-          >
-            {isFullscreen
-              ? <Minimize2 className="w-3.5 h-3.5" />
-              : <Maximize2 className="w-3.5 h-3.5" />}
+            title={isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}>
+            {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
           </button>
-          <button
-            onClick={onClose}
-            className="p-1 bg-slate-800 hover:bg-slate-700 rounded transition-colors"
-          >
+          <button onClick={onClose} className="p-1 bg-slate-800 hover:bg-slate-700 rounded transition-colors">
             <X className="w-3.5 h-3.5" />
           </button>
         </div>
@@ -256,21 +405,16 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
       {/* Mobile timeframe row */}
       <div className="sm:hidden flex gap-0.5 px-2 py-1.5 border-b border-slate-800 flex-shrink-0">
         {TIMEFRAMES.map(t => (
-          <button
-            key={t}
-            onClick={() => setTf(t)}
-            className={`px-2 py-1 text-xs font-semibold rounded flex-1 ${
-              tf === t ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'
-            }`}
-          >
+          <button key={t} onClick={() => setTf(t)}
+            className={`px-2 py-1 text-xs font-semibold rounded flex-1 ${tf === t ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'}`}>
             {t}
           </button>
         ))}
       </div>
 
-      {/* Body: chart + right panel */}
+      {/* Body */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Chart */}
+        {/* Chart area */}
         <div className="flex-1 relative min-w-0">
           {loading && (
             <div className="absolute inset-0 flex items-center justify-center bg-slate-900/60 z-10">
@@ -282,39 +426,119 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
               {error}
             </div>
           )}
+
           <CandleChart ref={chartHandleRef} candles={candles} signal={displaySignal} />
 
-          {/* Drawing SVG overlay */}
+          {/* SVG overlay — interactive drawing elements */}
           <svg
             ref={svgRef}
             className="absolute inset-0 w-full h-full"
-            style={{
-              pointerEvents: drawingTool !== 'cursor' ? 'all' : 'none',
-              zIndex: 5,
-              cursor: drawingTool === 'hline' ? 'crosshair' : drawingTool === 'trendline' ? 'crosshair' : 'default',
-            }}
-            onMouseDown={handleSvgMouseDown}
+            style={{ pointerEvents: svgPointerEvents, zIndex: 5, cursor: svgCursor }}
+            onMouseDown={drawingTool !== 'cursor' ? handleSvgMouseDown : undefined}
             onMouseMove={handleSvgMouseMove}
             onMouseLeave={handleSvgMouseLeave}
           >
-            {/* Ghost H-line preview */}
+            {/* ── Existing drawings (interactive in cursor mode) ──────────── */}
+            {userDrawings
+              .filter(d => !dragging || d.id !== dragging.drawingId)
+              .map(drawing => {
+                const coords = getDrawingCoords(drawing)
+                if (!coords) return null
+
+                if (drawing.type === 'hline') {
+                  return (
+                    <g key={drawing.id}>
+                      {/* Visible ghost line (dim in cursor mode since chart has the real one) */}
+                      <line x1="0" y1={coords.y1} x2="100%" y2={coords.y1}
+                        stroke={drawing.color} strokeWidth="1" strokeDasharray="6,4" opacity="0.3"
+                        style={{ pointerEvents: 'none' }} />
+                      {/* Wide invisible hitbox — cursor mode: pointer events enabled */}
+                      <line x1="0" y1={coords.y1} x2="100%" y2={coords.y1}
+                        stroke="transparent" strokeWidth="18"
+                        style={{
+                          cursor: 'ns-resize',
+                          pointerEvents: drawingTool === 'cursor' ? 'stroke' : 'none',
+                        }}
+                        onMouseDown={(e) => startHLineDrag(e, drawing as HLineDrawing)}
+                      />
+                    </g>
+                  )
+                }
+
+                if (drawing.type === 'trendline') {
+                  const td = drawing as TrendLineDrawing
+                  return (
+                    <g key={drawing.id}>
+                      {/* Line body (dim ghost) */}
+                      <line x1={coords.x1} y1={coords.y1} x2={coords.x2} y2={coords.y2}
+                        stroke={drawing.color} strokeWidth="1" opacity="0.3"
+                        style={{ pointerEvents: 'none' }} />
+                      {/* Body hitbox */}
+                      <line x1={coords.x1} y1={coords.y1} x2={coords.x2} y2={coords.y2}
+                        stroke="transparent" strokeWidth="18"
+                        style={{
+                          cursor: 'move',
+                          pointerEvents: drawingTool === 'cursor' ? 'stroke' : 'none',
+                        }}
+                        onMouseDown={(e) => startTrendLineDrag(e, td, 'body')}
+                      />
+                      {/* Endpoint P1 */}
+                      <circle cx={coords.x1} cy={coords.y1} r="6"
+                        fill={drawing.color} opacity="0.7"
+                        style={{
+                          cursor: 'crosshair',
+                          pointerEvents: drawingTool === 'cursor' ? 'all' : 'none',
+                        }}
+                        onMouseDown={(e) => startTrendLineDrag(e, td, 'p1')}
+                      />
+                      {/* Endpoint P2 */}
+                      <circle cx={coords.x2} cy={coords.y2} r="6"
+                        fill={drawing.color} opacity="0.7"
+                        style={{
+                          cursor: 'crosshair',
+                          pointerEvents: drawingTool === 'cursor' ? 'all' : 'none',
+                        }}
+                        onMouseDown={(e) => startTrendLineDrag(e, td, 'p2')}
+                      />
+                    </g>
+                  )
+                }
+                return null
+              })
+            }
+
+            {/* ── Drawing mode previews ───────────────────────────────────── */}
+            {/* H-line ghost while hovering */}
             {drawingTool === 'hline' && mousePos && (
               <line x1="0" y1={mousePos.y} x2="100%" y2={mousePos.y}
                 stroke="#4ade80" strokeWidth="1" strokeDasharray="6,4" opacity="0.5" />
             )}
-            {/* Ghost trend line preview */}
-            {drawingTool === 'trendline' && previewLine && (
-              <line
-                x1={previewLine.x1} y1={previewLine.y1}
-                x2={previewLine.x2} y2={previewLine.y2}
-                stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7"
-              />
-            )}
-            {/* First point indicator */}
+            {/* Trend line first-point dot */}
             {drawingTool === 'trendline' && drawStart && (
-              <circle cx={drawStart.x} cy={drawStart.y} r="4"
-                fill="#f59e0b" opacity="0.8" />
+              <circle cx={drawStart.x} cy={drawStart.y} r="4" fill="#f59e0b" opacity="0.9" />
             )}
+            {/* Trend line ghost line */}
+            {drawingTool === 'trendline' && previewLine && (
+              <line x1={previewLine.x1} y1={previewLine.y1} x2={previewLine.x2} y2={previewLine.y2}
+                stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7" />
+            )}
+
+            {/* ── Drag preview ───────────────────────────────────────────── */}
+            {dragging && dragPreview && (() => {
+              const snap = dragging.snapshot
+              const isHLine = snap.type === 'hline'
+              return isHLine ? (
+                <line x1="0" y1={dragPreview.y1} x2="100%" y2={dragPreview.y1}
+                  stroke={(snap as HLineDrawing).color} strokeWidth="1.5" strokeDasharray="6,4" opacity="0.8" />
+              ) : (
+                <>
+                  <line x1={dragPreview.x1} y1={dragPreview.y1} x2={dragPreview.x2} y2={dragPreview.y2}
+                    stroke={(snap as TrendLineDrawing).color} strokeWidth="1.5" opacity="0.8" />
+                  <circle cx={dragPreview.x1} cy={dragPreview.y1} r="5" fill={(snap as TrendLineDrawing).color} opacity="0.8" />
+                  <circle cx={dragPreview.x2} cy={dragPreview.y2} r="5" fill={(snap as TrendLineDrawing).color} opacity="0.8" />
+                </>
+              )
+            })()}
           </svg>
 
           {/* Drawing toolbar */}
@@ -345,20 +569,12 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
         {/* Signal / MTF panel */}
         <div className="w-64 xl:w-72 flex-shrink-0 border-l border-slate-800 flex flex-col">
           <div className="flex border-b border-slate-800 flex-shrink-0">
-            <button
-              onClick={() => setActiveTab('signal')}
-              className={`flex-1 py-1.5 text-xs font-semibold flex items-center justify-center gap-1 transition-colors ${
-                activeTab === 'signal' ? 'text-white border-b-2 border-blue-500' : 'text-slate-500 hover:text-slate-300'
-              }`}
-            >
+            <button onClick={() => setActiveTab('signal')}
+              className={`flex-1 py-1.5 text-xs font-semibold flex items-center justify-center gap-1 transition-colors ${activeTab === 'signal' ? 'text-white border-b-2 border-blue-500' : 'text-slate-500 hover:text-slate-300'}`}>
               <Layers className="w-3 h-3" /> Análise
             </button>
-            <button
-              onClick={() => setActiveTab('mtf')}
-              className={`flex-1 py-1.5 text-xs font-semibold flex items-center justify-center gap-1 transition-colors ${
-                activeTab === 'mtf' ? 'text-white border-b-2 border-blue-500' : 'text-slate-500 hover:text-slate-300'
-              }`}
-            >
+            <button onClick={() => setActiveTab('mtf')}
+              className={`flex-1 py-1.5 text-xs font-semibold flex items-center justify-center gap-1 transition-colors ${activeTab === 'mtf' ? 'text-white border-b-2 border-blue-500' : 'text-slate-500 hover:text-slate-300'}`}>
               <BarChart2 className="w-3 h-3" /> Multi-TF
             </button>
           </div>
@@ -367,9 +583,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
               <SignalPanel
                 signal={displaySignal}
                 livePrice={ticker?.last}
-                onAddToManager={() => {
-                  if (displaySignal) onAddSignalToManager?.(displaySignal)
-                }}
+                onAddToManager={() => { if (displaySignal) onAddSignalToManager?.(displaySignal) }}
               />
             ) : activeTab === 'signal' && !displaySignal && !loading ? (
               <div className="flex flex-col items-center justify-center h-full text-slate-600 text-sm gap-2">

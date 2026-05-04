@@ -291,6 +291,54 @@ export default function App() {
     loadData(tradeMode)
   }, [tradeMode, loadData])
 
+  // ── Real-time prices via Binance Futures WebSocket ─────────────────────────
+  useEffect(() => {
+    let ws: WebSocket | null = null
+    // Accumulate updates between React renders
+    const priceMap = new Map<string, { price: number; change: number }>()
+
+    const connect = () => {
+      try {
+        ws = new WebSocket('wss://fstream.binance.com/ws/!miniTicker@arr')
+        ws.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data as string)
+            if (!Array.isArray(data)) return
+            ;(data as Array<{ s: string; c: string; P: string }>).forEach(t => {
+              priceMap.set(t.s, { price: parseFloat(t.c), change: parseFloat(t.P) })
+            })
+          } catch { /* ignore parse errors */ }
+        }
+        ws.onerror = () => {}
+        ws.onclose = () => { setTimeout(connect, 5000) }
+      } catch { /* WebSocket unavailable */ }
+    }
+
+    connect()
+
+    // Apply batched updates to state every 2 seconds
+    const interval = setInterval(() => {
+      if (priceMap.size === 0) return
+      setAssets(prev => {
+        if (prev.length === 0) return prev
+        let changed = false
+        const next = prev.map(a => {
+          const u = priceMap.get(a.binanceSymbol)
+          if (!u) return a
+          changed = true
+          return { ...a, price: u.price, change24h: u.change }
+        })
+        return changed ? next : prev
+      })
+      priceMap.clear()
+    }, 2000)
+
+    return () => {
+      clearInterval(interval)
+      ws?.close()
+    }
+  }, []) // Connect once on mount — WebSocket handles all symbols
+
   // Filters
   const filtered = assets.filter(a => {
     if (search) {

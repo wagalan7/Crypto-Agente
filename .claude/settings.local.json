@@ -24,7 +24,9 @@
       "Bash(ngrok version *)",
       "Bash(cloudflared version *)",
       "Bash(brew install *)",
-      "Bash(chmod +x \"/Users/alanmalta/Downloads/Agente de IA Crypto/tunnel.sh\")"
+      "Bash(chmod +x \"/Users/alanmalta/Downloads/Agente de IA Crypto/tunnel.sh\")",
+      "Bash(python3 -m pip show httpx)",
+      "Bash('/Users/alanmalta/Downloads/Agente de IA Crypto/backend/.venv/bin/python' -c ' *)"
     ]
   }
 }

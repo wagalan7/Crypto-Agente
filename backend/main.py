@@ -13,7 +13,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Quer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import TIMEFRAMES, DEFAULT_TIMEFRAME, DEFAULT_LIMIT
+from config import TIMEFRAMES, DEFAULT_TIMEFRAME, DEFAULT_LIMIT, ANTHROPIC_API_KEY
 from services.binance_service import (
     get_perpetual_symbols,
     fetch_ohlcv,
@@ -305,47 +305,54 @@ async def validate_drawing(body: dict):
 
     drawings_desc = "\n".join(desc_lines)
 
+    if not ANTHROPIC_API_KEY:
+        return {
+            "analysis": (
+                f"Desenhos detectados em {symbol} ({timeframe}):\n\n{drawings_desc}\n\n"
+                "⚠️ ANTHROPIC_API_KEY não configurada no Railway. "
+                "Vá em Railway → seu serviço → Variables → adicione ANTHROPIC_API_KEY."
+            )
+        }
+
     prompt = f"""O usuário desenhou os seguintes níveis/linhas no gráfico de {symbol} (timeframe {timeframe}):
 
 {drawings_desc}
 
-Analise estes desenhos como um analista técnico sênior e responda em linguagem simples (português):
+Analise estes desenhos como analista técnico sênior, em português simples (nível iniciante):
 
-1. **IDENTIFICAÇÃO**: Que estrutura/padrão esses desenhos representam? (suporte, resistência, tendência, canal, triângulo etc.)
+1. **IDENTIFICAÇÃO**: Que estrutura/padrão esses desenhos representam? (suporte, resistência, tendência, canal, triângulo etc.) Explique em 1-2 frases simples.
 
-2. **VALIDAÇÃO**: Esses níveis fazem sentido técnico? São relevantes?
+2. **VALIDAÇÃO**: Esses níveis fazem sentido técnico? Por quê?
 
-3. **SE VÁLIDO — SETUP**:
-   - Tipo de operação: Scalp / Day Trade / Swing
-   - Entrada sugerida: [valor]
-   - Stop Loss: [valor] — por quê? (estrutura, liquidez)
-   - Alvo 1: [valor] — probabilidade ~X%
-   - Alvo 2: [valor] — probabilidade ~X%
-   - Risco/Retorno estimado: 1:X
+3. **SE VÁLIDO — SETUP COMPLETO**:
+   - Tipo: Scalp / Day Trade / Swing
+   - Entrada: [valor]
+   - Stop Loss: [valor] — justificativa (estrutura/liquidez/S-R)
+   - Alvo 1: [valor] — prob. ~X%
+   - Alvo 2: [valor] — prob. ~X%
+   - RR estimado: 1:X
 
-4. **RECOMENDAÇÃO**: OPERAR agora, AGUARDAR confirmação, ou NÃO OPERAR? Por quê?
+4. **RECOMENDAÇÃO FINAL**: OPERAR / AGUARDAR / NÃO OPERAR — por quê?
 
-5. **CONFLUÊNCIAS**: Cite 1-2 indicadores que confirmariam ou negariam este setup.
+5. **CONFLUÊNCIAS**: 1-2 indicadores que confirmariam ou invalidariam.
 
-Seja direto e use linguagem de fácil entendimento."""
+Linguagem simples, máximo 5 parágrafos."""
 
     try:
         from services.ai_service import get_client
         client = get_client()
         message = await client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-4-5",
             max_tokens=700,
             messages=[{"role": "user", "content": prompt}]
         )
         return {"analysis": message.content[0].text}
     except Exception as e:
         logging.error(f"validate_drawing error: {e}")
-        # Fallback: basic description
         return {
             "analysis": (
-                f"Análise dos desenhos em {symbol} ({timeframe}):\n\n"
-                f"{drawings_desc}\n\n"
-                "Para validação completa com IA, verifique se a chave ANTHROPIC_API_KEY está configurada."
+                f"Desenhos em {symbol} ({timeframe}):\n\n{drawings_desc}\n\n"
+                f"Erro ao chamar IA: {str(e)[:200]}"
             )
         }
 
