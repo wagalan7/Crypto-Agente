@@ -15,7 +15,7 @@ interface Trade {
   tp2: number
   tp3: number
   openedAt: number
-  status: 'open' | 'tp1' | 'tp2' | 'tp3' | 'stop' | 'exited'
+  status: 'open' | 'tp1' | 'tp2' | 'tp3' | 'stop'
   currentPrice: number
 }
 
@@ -107,7 +107,8 @@ export default function TradeManager({ onClose, onSelectSymbol, initialSignal }:
             if (t.status === 'open') {
               if (t.direction === 'long') {
                 if (price >= t.tp3 && t.status === 'open') {
-                  addAlert(t.id, `🎯 ${t.baseAsset} atingiu ALVO 3 (${fmtPrice(t.tp3)})`, 'target')
+                  addAlert(t.id, `🎯 ${t.baseAsset} atingiu ALVO 3 (${fmtPrice(t.tp3)}) — trade encerrado`, 'target')
+                  setTimeout(() => setTrades(prev => prev.filter(x => x.id !== t.id)), 4000)
                   return { ...updated, status: 'tp3' as const }
                 }
                 if (price >= t.tp2) {
@@ -119,12 +120,14 @@ export default function TradeManager({ onClose, onSelectSymbol, initialSignal }:
                   return { ...updated, status: 'tp1' as const }
                 }
                 if (price <= t.stopLoss) {
-                  addAlert(t.id, `🛑 ${t.baseAsset} STOP atingido (${fmtPrice(t.stopLoss)})`, 'stop')
+                  addAlert(t.id, `🛑 ${t.baseAsset} STOP atingido (${fmtPrice(t.stopLoss)}) — trade encerrado`, 'stop')
+                  setTimeout(() => setTrades(prev => prev.filter(x => x.id !== t.id)), 4000)
                   return { ...updated, status: 'stop' as const }
                 }
               } else {
                 if (price <= t.tp3 && t.status === 'open') {
-                  addAlert(t.id, `🎯 ${t.baseAsset} atingiu ALVO 3 (${fmtPrice(t.tp3)})`, 'target')
+                  addAlert(t.id, `🎯 ${t.baseAsset} atingiu ALVO 3 (${fmtPrice(t.tp3)}) — trade encerrado`, 'target')
+                  setTimeout(() => setTrades(prev => prev.filter(x => x.id !== t.id)), 4000)
                   return { ...updated, status: 'tp3' as const }
                 }
                 if (price <= t.tp2) {
@@ -136,7 +139,8 @@ export default function TradeManager({ onClose, onSelectSymbol, initialSignal }:
                   return { ...updated, status: 'tp1' as const }
                 }
                 if (price >= t.stopLoss) {
-                  addAlert(t.id, `🛑 ${t.baseAsset} STOP atingido (${fmtPrice(t.stopLoss)})`, 'stop')
+                  addAlert(t.id, `🛑 ${t.baseAsset} STOP atingido (${fmtPrice(t.stopLoss)}) — trade encerrado`, 'stop')
+                  setTimeout(() => setTrades(prev => prev.filter(x => x.id !== t.id)), 4000)
                   return { ...updated, status: 'stop' as const }
                 }
               }
@@ -225,11 +229,9 @@ export default function TradeManager({ onClose, onSelectSymbol, initialSignal }:
   }
 
   const exitTrade = (id: string) => {
-    setTrades(prev => prev.map(t =>
-      t.id === id ? { ...t, status: 'exited' as const } : t
-    ))
     const trade = trades.find(t => t.id === id)
-    if (trade) addAlert(id, `🚪 ${trade.baseAsset} saiu a mercado`, 'info')
+    if (trade) addAlert(id, `🚪 ${trade.baseAsset} saiu a mercado — trade encerrado`, 'info')
+    setTrades(prev => prev.filter(t => t.id !== id))
   }
 
   const statusBadge = (status: Trade['status']) => {
@@ -239,7 +241,6 @@ export default function TradeManager({ onClose, onSelectSymbol, initialSignal }:
       tp2:    { label: '🎯 ALVO 2',  cls: 'bg-blue-500/30 text-blue-300 border-blue-500/50' },
       tp3:    { label: '🎯 ALVO 3',  cls: 'bg-violet-500/20 text-violet-400 border-violet-500/40' },
       stop:   { label: '🛑 STOP',    cls: 'bg-red-500/20 text-red-400 border-red-500/40' },
-      exited: { label: '⬜ SAIU',    cls: 'bg-slate-700 text-slate-400 border-slate-600' },
     }
     const cfg = map[status] ?? map.open
     return <span className={`text-xs px-2 py-0.5 rounded border font-semibold ${cfg.cls}`}>{cfg.label}</span>

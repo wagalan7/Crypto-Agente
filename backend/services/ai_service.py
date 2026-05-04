@@ -97,8 +97,9 @@ SIGA ESTA ORDEM OBRIGATÓRIA NA ANÁLISE:
    - Há algum padrão gráfico detectado? Descreva em linguagem simples.
 
 7. OPERAÇÃO RECOMENDADA
-   - Tipo: Scalp / Day Trade / Swing
-   - TF utilizado na decisão
+   - Tipo: Scalp / Day Trade / Swing — explicar qual é mais adequado para este setup
+   - TF utilizado na decisão: mencionar explicitamente (ex: "Analisando no TF 4H")
+   - Por que este TF? Justifique em uma frase simples
    - SE probabilidade ≥ 75%: mostrar entrada, stop, TP1/TP2/TP3 com JUSTIFICATIVA DETALHADA para cada nível:
        * Por que aquele stop? (estrutura, suporte/resistência, liquidez)
        * Por que aqueles alvos? (resistência, projeção, probabilidade de cada um)

@@ -97,3 +97,22 @@ export interface WatchlistItem {
   rsi?: number
   patterns_count?: number
 }
+
+export interface HLineDrawing {
+  id: string
+  type: 'hline'
+  price: number
+  color: string
+  label: string
+}
+
+export interface TrendLineDrawing {
+  id: string
+  type: 'trendline'
+  p1: { price: number; time: number }
+  p2: { price: number; time: number }
+  color: string
+}
+
+export type UserDrawing = HLineDrawing | TrendLineDrawing
+export type DrawingTool = 'cursor' | 'hline' | 'trendline' | 'rectangle'

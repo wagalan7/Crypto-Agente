@@ -155,6 +155,27 @@ function AssetRow({ asset, rank, tradeMode, onClick }: {
   )
 }
 
+// ─── Ticker cache ─────────────────────────────────────────────────────────────
+
+const TICKER_CACHE_KEY = 'crypto_ticker_cache'
+const CACHE_MAX_AGE_MS = 23 * 60 * 60 * 1000
+
+function getTickerCache(): Array<{ symbol: string; lastPrice: string; priceChangePercent: string; quoteVolume: string }> | null {
+  try {
+    const raw = localStorage.getItem(TICKER_CACHE_KEY)
+    if (!raw) return null
+    const { data, ts } = JSON.parse(raw)
+    if (Date.now() - ts > CACHE_MAX_AGE_MS) return null
+    return data
+  } catch { return null }
+}
+
+function setTickerCache(data: unknown[]) {
+  try {
+    localStorage.setItem(TICKER_CACHE_KEY, JSON.stringify({ data, ts: Date.now() }))
+  } catch {}
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -162,7 +183,7 @@ export default function App() {
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const [tradeMode, setTradeMode] = useState<TradeMode>('swing')
   const [filter, setFilter] = useState<Filter>('all')
-  const [sort, setSort] = useState<Sort>('volume')
+  const [sort, setSort] = useState<Sort>('az')
   const [search, setSearch] = useState('')
   const [assets, setAssets] = useState<ScannerAsset[]>([])
   const [loadingSignals, setLoadingSignals] = useState(false)
@@ -187,12 +208,15 @@ export default function App() {
     setLoadingProgress(5)
 
     try {
-      // 1. Load Binance 24hr tickers directly from browser
-      const tickerRes = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr')
-      const tickers: Array<{ symbol: string; lastPrice: string; priceChangePercent: string; quoteVolume: string }> =
-        await tickerRes.json()
+      // 1. Load Binance 24hr tickers directly from browser (with 23h cache)
+      let tickers = getTickerCache()
+      if (!tickers) {
+        const tickerRes = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr')
+        tickers = await tickerRes.json()
+        setTickerCache(tickers!)
+      }
 
-      const top = tickers
+      const top = (tickers ?? [])
         .filter(t => t.symbol.endsWith('USDT'))
         .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
 

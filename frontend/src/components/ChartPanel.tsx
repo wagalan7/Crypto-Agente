@@ -1,11 +1,12 @@
-import { useState, useEffect, useCallback } from 'react'
-import { X, RefreshCw, Layers, BarChart2, ArrowLeft, Maximize2, Minimize2 } from 'lucide-react'
-import { CandleChart } from './Chart/CandleChart'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { X, RefreshCw, Layers, BarChart2, ArrowLeft, Maximize2, Minimize2, Bot } from 'lucide-react'
+import { CandleChart, type CandleChartHandle } from './Chart/CandleChart'
 import { SignalPanel } from './SignalPanel/SignalPanel'
 import { useAnalysis } from '../hooks/useAnalysis'
 import { useLivePrice } from '../hooks/useLivePrice'
 import { api } from '../services/api'
-import type { TradeSignal } from '../types'
+import DrawingToolbar from './DrawingToolbar'
+import type { TradeSignal, UserDrawing, DrawingTool } from '../types'
 
 interface Props {
   symbol: string
@@ -82,6 +83,17 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
   const [displaySignal, setDisplaySignal] = useState<typeof signal>(null)
   const ticker = useLivePrice(symbol)
 
+  // Drawing tools state
+  const chartHandleRef = useRef<CandleChartHandle>(null)
+  const [drawingTool, setDrawingTool] = useState<DrawingTool>('cursor')
+  const [userDrawings, setUserDrawings] = useState<UserDrawing[]>([])
+  const [drawStart, setDrawStart] = useState<{ x: number; y: number; price: number; time: number } | null>(null)
+  const [previewLine, setPreviewLine] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null)
+  const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null)
+  const [aiDrawingAnalysis, setAiDrawingAnalysis] = useState<string>('')
+  const [validating, setValidating] = useState(false)
+  const svgRef = useRef<SVGSVGElement>(null)
+
   const runAnalysis = useCallback(() => {
     analyze(symbol, tf, withAi)
   }, [analyze, symbol, tf, withAi])
@@ -94,6 +106,80 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
   useEffect(() => {
     if (signal) setDisplaySignal(signal)
   }, [signal])
+
+  const getRelativePos = (e: React.MouseEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top }
+  }
+
+  const handleSvgMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
+    const { x, y } = getRelativePos(e)
+    const price = chartHandleRef.current?.yToPrice(y) ?? null
+    const time = chartHandleRef.current?.xToTime(x) ?? null
+    if (price == null || time == null) return
+
+    if (drawingTool === 'hline') {
+      const id = Date.now().toString()
+      const color = '#4ade80'
+      chartHandleRef.current?.addHLine(price, color, `HL ${id.slice(-4)}`)
+      setUserDrawings(prev => [...prev, { id, type: 'hline', price, color, label: `HL ${id.slice(-4)}` }])
+    } else if (drawingTool === 'trendline') {
+      if (!drawStart) {
+        setDrawStart({ x, y, price, time })
+      } else {
+        const id = Date.now().toString()
+        const color = '#f59e0b'
+        chartHandleRef.current?.addTrendLine(
+          { time: drawStart.time, price: drawStart.price },
+          { time, price },
+          color
+        )
+        setUserDrawings(prev => [...prev, {
+          id, type: 'trendline',
+          p1: { price: drawStart.price, time: drawStart.time },
+          p2: { price, time },
+          color,
+        }])
+        setDrawStart(null)
+        setPreviewLine(null)
+      }
+    }
+  }
+
+  const handleSvgMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const { x, y } = getRelativePos(e)
+    setMousePos({ x, y })
+    if (drawingTool === 'trendline' && drawStart) {
+      setPreviewLine({ x1: drawStart.x, y1: drawStart.y, x2: x, y2: y })
+    }
+  }
+
+  const handleSvgMouseLeave = () => {
+    setMousePos(null)
+    if (drawingTool === 'trendline' && !drawStart) setPreviewLine(null)
+  }
+
+  const clearDrawings = () => {
+    chartHandleRef.current?.clearDrawings()
+    setUserDrawings([])
+    setDrawStart(null)
+    setPreviewLine(null)
+    setAiDrawingAnalysis('')
+  }
+
+  const validateDrawingWithAI = async () => {
+    if (userDrawings.length === 0) return
+    setValidating(true)
+    setAiDrawingAnalysis('')
+    try {
+      const result = await api.validateDrawing(symbol, tf, userDrawings)
+      setAiDrawingAnalysis(result.analysis)
+    } catch {
+      setAiDrawingAnalysis('Erro ao validar com IA. Tente novamente.')
+    } finally {
+      setValidating(false)
+    }
+  }
 
   return (
     <div className={`flex flex-col bg-[#0d1320] border-l border-slate-800 ${isFullscreen ? 'fixed inset-0 z-50' : 'h-full'}`}>
@@ -196,7 +282,64 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
               {error}
             </div>
           )}
-          <CandleChart candles={candles} signal={displaySignal} />
+          <CandleChart ref={chartHandleRef} candles={candles} signal={displaySignal} />
+
+          {/* Drawing SVG overlay */}
+          <svg
+            ref={svgRef}
+            className="absolute inset-0 w-full h-full"
+            style={{
+              pointerEvents: drawingTool !== 'cursor' ? 'all' : 'none',
+              zIndex: 5,
+              cursor: drawingTool === 'hline' ? 'crosshair' : drawingTool === 'trendline' ? 'crosshair' : 'default',
+            }}
+            onMouseDown={handleSvgMouseDown}
+            onMouseMove={handleSvgMouseMove}
+            onMouseLeave={handleSvgMouseLeave}
+          >
+            {/* Ghost H-line preview */}
+            {drawingTool === 'hline' && mousePos && (
+              <line x1="0" y1={mousePos.y} x2="100%" y2={mousePos.y}
+                stroke="#4ade80" strokeWidth="1" strokeDasharray="6,4" opacity="0.5" />
+            )}
+            {/* Ghost trend line preview */}
+            {drawingTool === 'trendline' && previewLine && (
+              <line
+                x1={previewLine.x1} y1={previewLine.y1}
+                x2={previewLine.x2} y2={previewLine.y2}
+                stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7"
+              />
+            )}
+            {/* First point indicator */}
+            {drawingTool === 'trendline' && drawStart && (
+              <circle cx={drawStart.x} cy={drawStart.y} r="4"
+                fill="#f59e0b" opacity="0.8" />
+            )}
+          </svg>
+
+          {/* Drawing toolbar */}
+          <DrawingToolbar
+            activeTool={drawingTool}
+            onToolChange={(t) => { setDrawingTool(t); setDrawStart(null); setPreviewLine(null) }}
+            onClear={clearDrawings}
+            onValidate={validateDrawingWithAI}
+            hasDrawings={userDrawings.length > 0}
+            validating={validating}
+          />
+
+          {/* AI drawing validation result */}
+          {aiDrawingAnalysis && (
+            <div className="absolute bottom-2 left-2 right-2 z-10 bg-slate-900/95 border border-violet-500/40 rounded-lg p-3 max-h-48 overflow-y-auto backdrop-blur-sm">
+              <div className="flex items-center justify-between mb-1">
+                <div className="flex items-center gap-1">
+                  <Bot className="w-3.5 h-3.5 text-violet-400" />
+                  <span className="text-xs font-semibold text-violet-400">Validação IA do Padrão</span>
+                </div>
+                <button onClick={() => setAiDrawingAnalysis('')} className="text-slate-500 hover:text-white text-xs">✕</button>
+              </div>
+              <p className="text-xs text-slate-300 whitespace-pre-line leading-relaxed">{aiDrawingAnalysis}</p>
+            </div>
+          )}
         </div>
 
         {/* Signal / MTF panel */}

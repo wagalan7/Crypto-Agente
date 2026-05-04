@@ -150,6 +150,16 @@ export const api = {
     if (!res.ok) throw new Error(`API error ${res.status}`)
     return res.json()
   },
+
+  validateDrawing: async (symbol: string, timeframe: string, drawings: unknown[]) => {
+    const res = await fetch(BASE + '/validate-drawing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol, timeframe, drawings }),
+    })
+    if (!res.ok) throw new Error(`API error ${res.status}`)
+    return res.json() as Promise<{ analysis: string }>
+  },
 }
 
 export function createPriceWebSocket(symbol: string, onMessage: (data: unknown) => void): WebSocket {

@@ -275,6 +275,81 @@ async def sync_trades(user_id: str, body: dict):
     return {"ok": True, "count": len(trades)}
 
 
+@app.post("/api/validate-drawing")
+async def validate_drawing(body: dict):
+    """IA valida padrões desenhados pelo usuário no gráfico."""
+    symbol = body.get("symbol", "UNKNOWN")
+    timeframe = body.get("timeframe", "1h")
+    drawings = body.get("drawings", [])
+
+    if not drawings:
+        return {"analysis": "Nenhum desenho encontrado. Desenhe linhas no gráfico e tente novamente."}
+
+    # Describe drawings in natural language
+    desc_lines = []
+    for d in drawings:
+        dtype = d.get("type", "")
+        if dtype == "hline":
+            price = d.get("price", 0)
+            label = d.get("label", "")
+            desc_lines.append(f"• Linha horizontal em {price:.6g} ({label})")
+        elif dtype == "trendline":
+            p1 = d.get("p1", {})
+            p2 = d.get("p2", {})
+            price1 = p1.get("price", 0)
+            price2 = p2.get("price", 0)
+            direction = "ascendente" if price2 > price1 else "descendente"
+            desc_lines.append(
+                f"• Linha de tendência {direction}: de {price1:.6g} para {price2:.6g}"
+            )
+
+    drawings_desc = "\n".join(desc_lines)
+
+    prompt = f"""O usuário desenhou os seguintes níveis/linhas no gráfico de {symbol} (timeframe {timeframe}):
+
+{drawings_desc}
+
+Analise estes desenhos como um analista técnico sênior e responda em linguagem simples (português):
+
+1. **IDENTIFICAÇÃO**: Que estrutura/padrão esses desenhos representam? (suporte, resistência, tendência, canal, triângulo etc.)
+
+2. **VALIDAÇÃO**: Esses níveis fazem sentido técnico? São relevantes?
+
+3. **SE VÁLIDO — SETUP**:
+   - Tipo de operação: Scalp / Day Trade / Swing
+   - Entrada sugerida: [valor]
+   - Stop Loss: [valor] — por quê? (estrutura, liquidez)
+   - Alvo 1: [valor] — probabilidade ~X%
+   - Alvo 2: [valor] — probabilidade ~X%
+   - Risco/Retorno estimado: 1:X
+
+4. **RECOMENDAÇÃO**: OPERAR agora, AGUARDAR confirmação, ou NÃO OPERAR? Por quê?
+
+5. **CONFLUÊNCIAS**: Cite 1-2 indicadores que confirmariam ou negariam este setup.
+
+Seja direto e use linguagem de fácil entendimento."""
+
+    try:
+        from services.ai_service import get_client
+        client = get_client()
+        message = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=700,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return {"analysis": message.content[0].text}
+    except Exception as e:
+        logging.error(f"validate_drawing error: {e}")
+        # Fallback: basic description
+        return {
+            "analysis": (
+                f"Análise dos desenhos em {symbol} ({timeframe}):\n\n"
+                f"{drawings_desc}\n\n"
+                "Para validação completa com IA, verifique se a chave ANTHROPIC_API_KEY está configurada."
+            )
+        }
+
+
 @app.get("/api/market-data")
 async def market_data(symbol: str):
     ticker, funding, oi = await asyncio.gather(
