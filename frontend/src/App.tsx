@@ -155,26 +155,12 @@ function AssetRow({ asset, rank, tradeMode, onClick }: {
   )
 }
 
-// ─── Symbol-only cache (preços NUNCA ficam em cache) ─────────────────────────
+// ─── Binance Futures REST (sem cache — sempre ao vivo) ───────────────────────
 
-const SYMBOLS_CACHE_KEY = 'crypto_symbols_v3'
-const SYMBOLS_CACHE_TTL = 23 * 60 * 60 * 1000
-
-function getCachedSymbolVolumes(): Array<{ symbol: string; quoteVolume: string }> | null {
-  try {
-    const raw = localStorage.getItem(SYMBOLS_CACHE_KEY)
-    if (!raw) return null
-    const { data, ts } = JSON.parse(raw)
-    if (Date.now() - ts > SYMBOLS_CACHE_TTL) return null
-    return data
-  } catch { return null }
-}
-
-function setSymbolsCache(data: Array<{ symbol: string; quoteVolume: string }>) {
-  try {
-    localStorage.setItem(SYMBOLS_CACHE_KEY, JSON.stringify({ data, ts: Date.now() }))
-  } catch {}
-}
+// Remove caches antigos caso existam no localStorage
+;['crypto_ticker_cache', 'crypto_symbols_v2', 'crypto_symbols_v3'].forEach(k => {
+  try { localStorage.removeItem(k) } catch {}
+})
 
 type BinanceTicker = { symbol: string; lastPrice: string; priceChangePercent: string; quoteVolume: string }
 
@@ -218,24 +204,8 @@ export default function App() {
     setLoadingProgress(5)
 
     try {
-      // 1. Always fetch FRESH prices — never cache prices (stale prices = wrong display)
-      //    Symbol volumes are cached 23h for ordering; prices always come from live fetch.
-      let rawTickers: BinanceTicker[]
-      try {
-        rawTickers = await fetchFreshTickers()
-        // Update the symbol+volume cache for ordering
-        const symbolVols = rawTickers
-          .filter(t => t.symbol.endsWith('USDT'))
-          .map(t => ({ symbol: t.symbol, quoteVolume: t.quoteVolume }))
-        setSymbolsCache(symbolVols)
-      } catch {
-        // Binance unreachable — use cached symbol order but prices will be 0 until WS
-        const cached = getCachedSymbolVolumes() ?? []
-        rawTickers = cached.map(c => ({
-          symbol: c.symbol, lastPrice: '0',
-          priceChangePercent: '0', quoteVolume: c.quoteVolume,
-        }))
-      }
+      // 1. Busca preços SEMPRE ao vivo — sem nenhum cache
+      const rawTickers = await fetchFreshTickers()
 
       const top = rawTickers
         .filter(t => t.symbol.endsWith('USDT'))
