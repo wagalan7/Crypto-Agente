@@ -1,0 +1,12 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:///./data/consultorio.db
+    restart: unless-stopped
