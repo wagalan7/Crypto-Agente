@@ -14,9 +14,11 @@ const TF_MAP: Record<string, string> = {
 }
 
 function toTVSymbol(symbol: string): string {
-  // "BTC/USDT:USDT" -> "BINANCE:BTCUSDT"
+  // "BTC/USDT:USDT" -> "BINANCE:BTCUSDT.P"  (perp futures)
+  // "BTC/USDT"      -> "BINANCE:BTCUSDT"    (spot)
+  const isPerp = symbol.includes(':')
   const base = symbol.split(':')[0].replace('/', '')
-  return `BINANCE:${base}`
+  return `BINANCE:${base}${isPerp ? '.P' : ''}`
 }
 
 let tvScriptLoaded = false

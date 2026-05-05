@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { X, RefreshCw, Layers, BarChart2, ArrowLeft, Maximize2, Minimize2 } from 'lucide-react'
 import { TradingViewWidget } from './Chart/TradingViewWidget'
+import { DrawingPanel } from './Chart/DrawingPanel'
 import { SignalPanel } from './SignalPanel/SignalPanel'
 import { useAnalysis } from '../hooks/useAnalysis'
 import { useLivePrice } from '../hooks/useLivePrice'
@@ -164,6 +165,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
             </div>
           )}
           <TradingViewWidget symbol={symbol} interval={tf} />
+          <DrawingPanel symbol={symbol} timeframe={tf} />
         </div>
 
         {/* Signal / MTF panel */}
