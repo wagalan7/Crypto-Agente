@@ -57,6 +57,15 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_conversations_tenant ON conversations(tenant_id);
             CREATE INDEX IF NOT EXISTS idx_conversations_phone  ON conversations(phone);
         """)
+        # Migrações incrementais — seguro rodar múltiplas vezes
+        migrations = [
+            "ALTER TABLE tenants ADD COLUMN dashboard_token TEXT DEFAULT ''",
+        ]
+        for sql in migrations:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass  # coluna já existe
 
 
 @contextmanager
