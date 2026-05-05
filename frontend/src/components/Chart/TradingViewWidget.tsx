@@ -13,33 +13,22 @@ const TF_MAP: Record<string, string> = {
   '12h': '720', '1d': 'D', '3d': '3D',
 }
 
-// Symbols that are confirmed NOT on BYBIT and must use BINANCE
-const BINANCE_ONLY = new Set(['BTCUSDT', 'ETHUSDT', 'BNBUSDT'])
-
 function toTVSymbol(symbol: string): string {
-  // "BTC/USDT:USDT" -> "BYBIT:BTCUSDT"  (perp — BYBIT tem cobertura mais ampla no TradingView)
+  // "BTC/USDT:USDT" -> "BYBIT:BTCUSDT"  (BYBIT tem cobertura mais ampla no TradingView)
   // "BTC/USDT"      -> "BINANCE:BTCUSDT" (spot)
   const isPerp = symbol.includes(':')
-  const base = symbol.split(':')[0].replace('/', '') // "BTCUSDT"
-  if (!isPerp) return `BINANCE:${base}`
-  const exchange = BINANCE_ONLY.has(base) ? 'BINANCE' : 'BYBIT'
-  return `${exchange}:${base}`
+  const base = symbol.split(':')[0].replace('/', '')
+  return isPerp ? `BYBIT:${base}` : `BINANCE:${base}`
 }
 
-// EMAs e indicadores padrão a carregar no gráfico
 const DEFAULT_STUDIES = [
-  // EMAs
-  { id: 'MAExp@tv-basicstudies', inputs: { length: 9 },  version: 60 },
-  { id: 'MAExp@tv-basicstudies', inputs: { length: 21 }, version: 60 },
-  { id: 'MAExp@tv-basicstudies', inputs: { length: 50 }, version: 60 },
-  { id: 'MAExp@tv-basicstudies', inputs: { length: 200 }, version: 60 },
-  // RSI com níveis (30/70)
-  { id: 'RSI@tv-basicstudies', inputs: { length: 14 }, version: 60 },
-  // MACD
-  { id: 'MACD@tv-basicstudies', version: 60 },
-  // Bollinger Bands
-  { id: 'BB@tv-basicstudies', version: 60 },
-  // Volume Profile
+  { id: 'MAExp@tv-basicstudies', inputs: { length: 9 } },
+  { id: 'MAExp@tv-basicstudies', inputs: { length: 21 } },
+  { id: 'MAExp@tv-basicstudies', inputs: { length: 50 } },
+  { id: 'MAExp@tv-basicstudies', inputs: { length: 200 } },
+  { id: 'RSI@tv-basicstudies', inputs: { length: 14 } },
+  { id: 'MACD@tv-basicstudies' },
+  { id: 'BB@tv-basicstudies' },
   'Volume@tv-basicstudies',
 ]
 
@@ -65,17 +54,23 @@ function loadTVScript(cb: () => void) {
 interface Props {
   symbol: string
   interval: string
+  /** Chamado se o símbolo não for encontrado no TradingView após 10s */
+  onSymbolNotFound?: () => void
 }
 
-export function TradingViewWidget({ symbol, interval }: Props) {
+export function TradingViewWidget({ symbol, interval, onSymbolNotFound }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const widgetRef = useRef<any>(null)
   const idRef = useRef(`tv_${Math.random().toString(36).slice(2)}`)
+  const fallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
+
+    // Cancela fallback timer anterior
+    if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current)
 
     el.innerHTML = ''
     const inner = document.createElement('div')
@@ -89,6 +84,12 @@ export function TradingViewWidget({ symbol, interval }: Props) {
         try { widgetRef.current.remove() } catch { /* ignore */ }
         widgetRef.current = null
       }
+
+      // Timer de fallback: se onChartReady não disparar em 10s → símbolo não existe
+      fallbackTimerRef.current = setTimeout(() => {
+        onSymbolNotFound?.()
+      }, 10_000)
+
       widgetRef.current = new window.TradingView.widget({
         container_id: idRef.current,
         autosize: true,
@@ -107,7 +108,6 @@ export function TradingViewWidget({ symbol, interval }: Props) {
         save_image: true,
         studies: DEFAULT_STUDIES,
         overrides: {
-          // Cores de vela padrão TradingView
           'mainSeriesProperties.candleStyle.upColor': '#26a69a',
           'mainSeriesProperties.candleStyle.downColor': '#ef5350',
           'mainSeriesProperties.candleStyle.borderUpColor': '#26a69a',
@@ -115,19 +115,27 @@ export function TradingViewWidget({ symbol, interval }: Props) {
           'mainSeriesProperties.candleStyle.wickUpColor': '#26a69a',
           'mainSeriesProperties.candleStyle.wickDownColor': '#ef5350',
         },
+        onChartReady: () => {
+          // Símbolo carregou com sucesso — cancela fallback
+          if (fallbackTimerRef.current) {
+            clearTimeout(fallbackTimerRef.current)
+            fallbackTimerRef.current = null
+          }
+        },
       })
     }
 
     loadTVScript(createWidget)
 
     return () => {
+      if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current)
       if (widgetRef.current) {
         try { widgetRef.current.remove() } catch { /* ignore */ }
         widgetRef.current = null
       }
       if (el) el.innerHTML = ''
     }
-  }, [symbol, interval])
+  }, [symbol, interval]) // onSymbolNotFound não entra pois é callback estável
 
   return (
     <div
