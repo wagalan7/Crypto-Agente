@@ -116,6 +116,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "name", "psychologist_name", "working_hours_start", "working_hours_end",
         "session_minutes", "whatsapp_provider", "evolution_url", "evolution_key",
         "evolution_instance", "twilio_sid", "twilio_token", "twilio_from", "active",
+        "dashboard_token",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
