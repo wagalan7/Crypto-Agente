@@ -13,13 +13,35 @@ const TF_MAP: Record<string, string> = {
   '12h': '720', '1d': 'D', '3d': '3D',
 }
 
+// Symbols that are confirmed NOT on BYBIT and must use BINANCE
+const BINANCE_ONLY = new Set(['BTCUSDT', 'ETHUSDT', 'BNBUSDT'])
+
 function toTVSymbol(symbol: string): string {
-  // "BTC/USDT:USDT" -> "BINANCE:BTCUSDT.P"  (perp futures)
-  // "BTC/USDT"      -> "BINANCE:BTCUSDT"    (spot)
+  // "BTC/USDT:USDT" -> "BYBIT:BTCUSDT"  (perp — BYBIT tem cobertura mais ampla no TradingView)
+  // "BTC/USDT"      -> "BINANCE:BTCUSDT" (spot)
   const isPerp = symbol.includes(':')
-  const base = symbol.split(':')[0].replace('/', '')
-  return `BINANCE:${base}${isPerp ? '.P' : ''}`
+  const base = symbol.split(':')[0].replace('/', '') // "BTCUSDT"
+  if (!isPerp) return `BINANCE:${base}`
+  const exchange = BINANCE_ONLY.has(base) ? 'BINANCE' : 'BYBIT'
+  return `${exchange}:${base}`
 }
+
+// EMAs e indicadores padrão a carregar no gráfico
+const DEFAULT_STUDIES = [
+  // EMAs
+  { id: 'MAExp@tv-basicstudies', inputs: { length: 9 },  version: 60 },
+  { id: 'MAExp@tv-basicstudies', inputs: { length: 21 }, version: 60 },
+  { id: 'MAExp@tv-basicstudies', inputs: { length: 50 }, version: 60 },
+  { id: 'MAExp@tv-basicstudies', inputs: { length: 200 }, version: 60 },
+  // RSI com níveis (30/70)
+  { id: 'RSI@tv-basicstudies', inputs: { length: 14 }, version: 60 },
+  // MACD
+  { id: 'MACD@tv-basicstudies', version: 60 },
+  // Bollinger Bands
+  { id: 'BB@tv-basicstudies', version: 60 },
+  // Volume Profile
+  'Volume@tv-basicstudies',
+]
 
 let tvScriptLoaded = false
 const tvReadyCallbacks: (() => void)[] = []
@@ -27,7 +49,7 @@ const tvReadyCallbacks: (() => void)[] = []
 function loadTVScript(cb: () => void) {
   if (tvScriptLoaded) { cb(); return }
   tvReadyCallbacks.push(cb)
-  if (tvReadyCallbacks.length > 1) return // already loading
+  if (tvReadyCallbacks.length > 1) return
 
   const script = document.createElement('script')
   script.src = 'https://s3.tradingview.com/tv.js'
@@ -55,7 +77,6 @@ export function TradingViewWidget({ symbol, interval }: Props) {
     const el = containerRef.current
     if (!el) return
 
-    // Clear and recreate inner div with stable id
     el.innerHTML = ''
     const inner = document.createElement('div')
     inner.id = idRef.current
@@ -77,18 +98,23 @@ export function TradingViewWidget({ symbol, interval }: Props) {
         theme: 'dark',
         style: '1',
         locale: 'pt',
-        toolbar_bg: '#0d1320',
+        toolbar_bg: '#131722',
         enable_publishing: false,
         allow_symbol_change: false,
         hide_side_toolbar: false,
         hide_top_toolbar: false,
         withdateranges: true,
         save_image: true,
-        studies: [
-          'STD;RSI',
-          'STD;MACD',
-          'STD;Bollinger_Bands',
-        ],
+        studies: DEFAULT_STUDIES,
+        overrides: {
+          // Cores de vela padrão TradingView
+          'mainSeriesProperties.candleStyle.upColor': '#26a69a',
+          'mainSeriesProperties.candleStyle.downColor': '#ef5350',
+          'mainSeriesProperties.candleStyle.borderUpColor': '#26a69a',
+          'mainSeriesProperties.candleStyle.borderDownColor': '#ef5350',
+          'mainSeriesProperties.candleStyle.wickUpColor': '#26a69a',
+          'mainSeriesProperties.candleStyle.wickDownColor': '#ef5350',
+        },
       })
     }
 
