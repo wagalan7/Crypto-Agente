@@ -27,6 +27,7 @@ def init_db():
                 twilio_token        TEXT DEFAULT '',
                 twilio_from         TEXT DEFAULT '',
                 active      INTEGER NOT NULL DEFAULT 1,
+                dashboard_token TEXT DEFAULT '',
                 created_at  TEXT DEFAULT (datetime('now'))
             );
 
@@ -93,6 +94,14 @@ def get_tenant(slug: str) -> dict | None:
 def get_tenant_by_id(tenant_id: int) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM tenants WHERE id = ?", (tenant_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_tenant_by_token(token: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM tenants WHERE dashboard_token = ? AND active = 1", (token,)
+        ).fetchone()
     return dict(row) if row else None
 
 

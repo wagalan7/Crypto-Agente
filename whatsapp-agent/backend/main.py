@@ -1,11 +1,14 @@
 from __future__ import annotations
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from typing import Optional
 
@@ -30,6 +33,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agente de Atendimento — Multi-Consultório", lifespan=lifespan)
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -234,6 +238,104 @@ def clear_conversation(slug: str, phone: str):
     tenant = _get_tenant(slug)
     db.clear_conversation(tenant["id"], phone)
     return {"status": "cleared"}
+
+
+# ── Dashboard ──────────────────────────────────────────────────────────────────
+
+def _get_tenant_by_token(token: str) -> dict:
+    tenant = db.get_tenant_by_token(token)
+    if not tenant:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+    return tenant
+
+
+@app.get("/dashboard/{slug}", response_class=HTMLResponse)
+def dashboard(slug: str, request: Request, token: str = ""):
+    tenant = _get_tenant(slug)
+    if not tenant.get("dashboard_token") or tenant["dashboard_token"] != token:
+        raise HTTPException(status_code=403, detail="Token inválido.")
+    return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token})
+
+
+@app.get("/dashboard/api/appointments")
+def dash_appointments(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    now = datetime.now().isoformat()
+    far = datetime.now().replace(year=datetime.now().year + 1).isoformat()
+    appts = db.get_appointments_in_range(tenant["id"], now, far)
+    return {"appointments": appts}
+
+
+@app.post("/dashboard/api/appointments/{appt_id}/confirm")
+def dash_confirm(appt_id: int, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    db.confirm_appointment(tenant["id"], appt_id)
+    return {"status": "confirmed"}
+
+
+@app.delete("/dashboard/api/appointments/{appt_id}/cancel")
+def dash_cancel(appt_id: int, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    with db.get_conn() as conn:
+        conn.execute("DELETE FROM appointments WHERE id = ? AND tenant_id = ?", (appt_id, tenant["id"]))
+    return {"status": "cancelled"}
+
+
+@app.get("/dashboard/api/slots")
+def dash_slots(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    slots = cal.get_available_slots(tenant, days_ahead=7, limit=20)
+    return {"slots": cal.format_slots(slots)}
+
+
+@app.get("/dashboard/api/patients")
+def dash_patients(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT c.phone,
+               (SELECT a.patient_name FROM appointments a
+                WHERE a.phone = c.phone AND a.tenant_id = c.tenant_id LIMIT 1) as name
+               FROM conversations c WHERE c.tenant_id = ? ORDER BY c.created_at DESC""",
+            (tenant["id"],)
+        ).fetchall()
+    return {"patients": [dict(r) for r in rows]}
+
+
+@app.get("/dashboard/api/conversation/{phone}")
+def dash_conversation(phone: str, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    history = db.get_conversation_history(tenant["id"], phone, limit=50)
+    return {"history": history}
+
+
+@app.patch("/dashboard/api/config")
+def dash_config(request: Request, body: TenantUpdate):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    fields = body.model_dump(exclude_none=True)
+    if fields:
+        db.update_tenant(tenant["slug"], **fields)
+    return {"status": "updated"}
+
+
+@app.post("/admin/tenants/{slug}/dashboard-token")
+def generate_dashboard_token(slug: str):
+    """Gera ou regenera o token de acesso ao painel."""
+    _get_tenant(slug)
+    token = secrets.token_urlsafe(24)
+    db.update_tenant(slug, dashboard_token=token)
+    base = "https://agente-atendimento-production.up.railway.app"
+    return {
+        "token": token,
+        "url": f"{base}/dashboard/{slug}?token={token}",
+    }
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

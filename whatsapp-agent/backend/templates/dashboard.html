@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>{{ tenant.name }} — Painel</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: '#7C3AED' } } } }</script>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+<!-- Header -->
+<header class="bg-brand shadow">
+  <div class="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
+    <div>
+      <h1 class="text-white text-xl font-bold">{{ tenant.name }}</h1>
+      <p class="text-purple-200 text-sm">{{ tenant.psychologist_name }} · Seg–Sex {{ '%02d'|format(tenant.working_hours_start) }}:00–{{ '%02d'|format(tenant.working_hours_end) }}:00</p>
+    </div>
+    <span class="bg-green-400 text-green-900 text-xs font-semibold px-3 py-1 rounded-full">● Online</span>
+  </div>
+</header>
+
+<!-- Tabs -->
+<div class="max-w-5xl mx-auto px-4 mt-6">
+  <div class="flex gap-2 border-b border-gray-200 mb-6">
+    <button onclick="showTab('agenda')" id="tab-agenda"
+      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-brand text-brand">
+      📅 Agenda
+    </button>
+    <button onclick="showTab('slots')" id="tab-slots"
+      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
+      🕐 Horários Livres
+    </button>
+    <button onclick="showTab('conversas')" id="tab-conversas"
+      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
+      💬 Conversas
+    </button>
+    <button onclick="showTab('config')" id="tab-config"
+      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
+      ⚙️ Configurações
+    </button>
+  </div>
+
+  <!-- Agenda -->
+  <div id="pane-agenda">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold text-gray-800">Próximas consultas</h2>
+      <button onclick="loadAgenda()" class="text-sm text-brand hover:underline">↻ Atualizar</button>
+    </div>
+    <div id="agenda-list" class="space-y-3">
+      <div class="text-gray-400 text-sm">Carregando...</div>
+    </div>
+  </div>
+
+  <!-- Slots -->
+  <div id="pane-slots" class="hidden">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold text-gray-800">Horários disponíveis (próximos 7 dias)</h2>
+      <button onclick="loadSlots()" class="text-sm text-brand hover:underline">↻ Atualizar</button>
+    </div>
+    <div id="slots-list" class="grid grid-cols-2 md:grid-cols-3 gap-3">
+      <div class="text-gray-400 text-sm">Carregando...</div>
+    </div>
+  </div>
+
+  <!-- Conversas -->
+  <div id="pane-conversas" class="hidden">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold text-gray-800">Histórico de conversas</h2>
+    </div>
+    <div class="grid md:grid-cols-3 gap-4">
+      <div id="conv-list" class="space-y-2 md:col-span-1">
+        <div class="text-gray-400 text-sm">Carregando...</div>
+      </div>
+      <div id="conv-detail" class="md:col-span-2 bg-white rounded-xl border border-gray-200 p-4 min-h-64">
+        <p class="text-gray-400 text-sm">Selecione uma conversa</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Config -->
+  <div id="pane-config" class="hidden">
+    <h2 class="text-lg font-semibold text-gray-800 mb-4">Configurações do consultório</h2>
+    <div class="bg-white rounded-xl border border-gray-200 p-6 max-w-lg space-y-4">
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Nome do consultório</label>
+        <input id="cfg-name" type="text" value="{{ tenant.name }}"
+          class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Nome da psicóloga</label>
+        <input id="cfg-psy" type="text" value="{{ tenant.psychologist_name }}"
+          class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Início (hora)</label>
+          <input id="cfg-start" type="number" min="0" max="23" value="{{ tenant.working_hours_start }}"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Fim (hora)</label>
+          <input id="cfg-end" type="number" min="0" max="23" value="{{ tenant.working_hours_end }}"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Duração da sessão (minutos)</label>
+        <input id="cfg-min" type="number" min="30" max="120" value="{{ tenant.session_minutes }}"
+          class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+      </div>
+      <button onclick="saveConfig()"
+        class="w-full bg-brand text-white py-2 rounded-lg text-sm font-semibold hover:bg-purple-700 transition">
+        Salvar configurações
+      </button>
+      <div id="cfg-msg" class="text-sm text-center hidden"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const SLUG  = "{{ tenant.slug }}";
+const TOKEN = "{{ token }}";
+const API   = "";
+
+function api(path, opts={}) {
+  return fetch(API + path, {
+    headers: {"Content-Type":"application/json", "X-Dashboard-Token": TOKEN},
+    ...opts
+  }).then(r => r.json());
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function showTab(name) {
+  ["agenda","slots","conversas","config"].forEach(t => {
+    document.getElementById("pane-"+t).classList.add("hidden");
+    const btn = document.getElementById("tab-"+t);
+    btn.classList.remove("border-brand","text-brand");
+    btn.classList.add("border-transparent","text-gray-500");
+  });
+  document.getElementById("pane-"+name).classList.remove("hidden");
+  const active = document.getElementById("tab-"+name);
+  active.classList.add("border-brand","text-brand");
+  active.classList.remove("border-transparent","text-gray-500");
+  if (name==="agenda")    loadAgenda();
+  if (name==="slots")     loadSlots();
+  if (name==="conversas") loadConversas();
+}
+
+// ── Agenda ────────────────────────────────────────────────────────────────────
+function loadAgenda() {
+  api(`/dashboard/api/appointments`).then(data => {
+    const el = document.getElementById("agenda-list");
+    if (!data.appointments || data.appointments.length === 0) {
+      el.innerHTML = '<div class="text-gray-400 text-sm py-8 text-center">Nenhuma consulta agendada.</div>';
+      return;
+    }
+    el.innerHTML = data.appointments.map(a => {
+      const dt = new Date(a.scheduled_at);
+      const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+      const label = `${days[dt.getDay()]}, ${String(dt.getDate()).padStart(2,"0")}/${String(dt.getMonth()+1).padStart(2,"0")} às ${String(dt.getHours()).padStart(2,"0")}:${String(dt.getMinutes()).padStart(2,"0")}`;
+      const confirmed = a.confirmed;
+      return `
+        <div class="bg-white rounded-xl border border-gray-200 p-4 flex items-center justify-between">
+          <div>
+            <p class="font-semibold text-gray-800">${a.patient_name}</p>
+            <p class="text-sm text-gray-500">${label}</p>
+            <p class="text-xs mt-1 font-medium ${confirmed ? 'text-green-600' : 'text-yellow-600'}">
+              ${confirmed ? '✓ Confirmado' : '⏳ Aguardando confirmação'}
+            </p>
+          </div>
+          <div class="flex gap-2">
+            ${!confirmed ? `<button onclick="confirmAppt(${a.id})" class="text-xs bg-green-100 text-green-700 px-3 py-1 rounded-full hover:bg-green-200">Confirmar</button>` : ''}
+            <button onclick="cancelAppt(${a.id})" class="text-xs bg-red-100 text-red-600 px-3 py-1 rounded-full hover:bg-red-200">Cancelar</button>
+          </div>
+        </div>`;
+    }).join("");
+  });
+}
+
+function confirmAppt(id) {
+  api(`/dashboard/api/appointments/${id}/confirm`, {method:"POST"}).then(() => loadAgenda());
+}
+
+function cancelAppt(id) {
+  if (!confirm("Cancelar esta consulta?")) return;
+  api(`/dashboard/api/appointments/${id}/cancel`, {method:"DELETE"}).then(() => loadAgenda());
+}
+
+// ── Slots ─────────────────────────────────────────────────────────────────────
+function loadSlots() {
+  api(`/dashboard/api/slots`).then(data => {
+    const el = document.getElementById("slots-list");
+    if (!data.slots || data.slots.length === 0) {
+      el.innerHTML = '<div class="text-gray-400 text-sm">Nenhum horário disponível.</div>';
+      return;
+    }
+    el.innerHTML = data.slots.map(s =>
+      `<div class="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-700 text-center">${s}</div>`
+    ).join("");
+  });
+}
+
+// ── Conversas ─────────────────────────────────────────────────────────────────
+let _phones = [];
+function loadConversas() {
+  api(`/dashboard/api/patients`).then(data => {
+    _phones = data.patients || [];
+    const el = document.getElementById("conv-list");
+    if (_phones.length === 0) {
+      el.innerHTML = '<div class="text-gray-400 text-sm">Nenhuma conversa ainda.</div>';
+      return;
+    }
+    el.innerHTML = _phones.map(p =>
+      `<button onclick="loadConv('${p.phone}')"
+        class="w-full text-left bg-white border border-gray-200 rounded-xl px-4 py-3 hover:border-brand transition">
+        <p class="text-sm font-medium text-gray-800">${p.name || p.phone}</p>
+        <p class="text-xs text-gray-400">${p.phone}</p>
+      </button>`
+    ).join("");
+  });
+}
+
+function loadConv(phone) {
+  api(`/dashboard/api/conversation/${phone}`).then(data => {
+    const el = document.getElementById("conv-detail");
+    const msgs = data.history || [];
+    if (msgs.length === 0) {
+      el.innerHTML = '<p class="text-gray-400 text-sm">Sem mensagens.</p>';
+      return;
+    }
+    el.innerHTML = `<div class="space-y-3 overflow-y-auto max-h-96">` +
+      msgs.map(m => {
+        const isUser = m.role === "user";
+        return `<div class="flex ${isUser ? 'justify-start' : 'justify-end'}">
+          <div class="max-w-xs px-4 py-2 rounded-2xl text-sm ${isUser
+            ? 'bg-gray-100 text-gray-800'
+            : 'bg-brand text-white'}">
+            ${m.content}
+          </div>
+        </div>`;
+      }).join("") + `</div>`;
+  });
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
+function saveConfig() {
+  const body = {
+    name: document.getElementById("cfg-name").value,
+    psychologist_name: document.getElementById("cfg-psy").value,
+    working_hours_start: parseInt(document.getElementById("cfg-start").value),
+    working_hours_end: parseInt(document.getElementById("cfg-end").value),
+    session_minutes: parseInt(document.getElementById("cfg-min").value),
+  };
+  api(`/dashboard/api/config`, {method:"PATCH", body: JSON.stringify(body)}).then(r => {
+    const msg = document.getElementById("cfg-msg");
+    msg.classList.remove("hidden","text-red-500");
+    msg.classList.add("text-green-600");
+    msg.textContent = "✓ Salvo com sucesso!";
+    setTimeout(() => msg.classList.add("hidden"), 3000);
+  });
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadAgenda();
+</script>
+</body>
+</html>
