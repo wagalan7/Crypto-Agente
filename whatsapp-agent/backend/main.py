@@ -152,6 +152,16 @@ def create_tenant(body: TenantCreate):
         raise HTTPException(status_code=409, detail=str(e))
 
 
+@app.patch("/admin/tenants/{slug}/rename")
+def rename_tenant(slug: str, new_slug: str):
+    _get_tenant(slug)
+    if db.get_tenant(new_slug):
+        raise HTTPException(status_code=409, detail=f"Slug '{new_slug}' já está em uso.")
+    with db.get_conn() as conn:
+        conn.execute("UPDATE tenants SET slug = ? WHERE slug = ?", (new_slug, slug))
+    return {"status": "renamed", "old_slug": slug, "new_slug": new_slug}
+
+
 @app.get("/admin/tenants")
 def list_tenants():
     tenants = db.list_tenants()
