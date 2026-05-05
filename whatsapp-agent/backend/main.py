@@ -168,6 +168,24 @@ def configure_whatsapp(slug: str, body: WhatsAppConfig):
     return {"status": "updated", "provider": updated["whatsapp_provider"]}
 
 
+class TenantUpdate(BaseModel):
+    name: Optional[str] = None
+    psychologist_name: Optional[str] = None
+    working_hours_start: Optional[int] = None
+    working_hours_end: Optional[int] = None
+    session_minutes: Optional[int] = None
+
+
+@app.patch("/admin/tenants/{slug}")
+def update_tenant(slug: str, body: TenantUpdate):
+    _get_tenant(slug)
+    fields = body.model_dump(exclude_none=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar.")
+    db.update_tenant(slug, **fields)
+    return db.get_tenant(slug)
+
+
 class ZAPIConfig(BaseModel):
     instance_id: str
     token: str
