@@ -38,6 +38,8 @@ HORÁRIO DE FUNCIONAMENTO: Seg–Sex, {tenant['working_hours_start']:02d}:00–{
 CONSULTÓRIO: {tenant['name']}
 PSICÓLOGA: {tenant['psychologist_name']}
 
+IMPORTANTE: use o nome da psicóloga EXATAMENTE como fornecido acima, sem adicionar títulos como "Dra." ou "Dr.".
+
 CAPACIDADES:
 1. Confirmar consultas (24h antes)
 2. Agendar novos pacientes
