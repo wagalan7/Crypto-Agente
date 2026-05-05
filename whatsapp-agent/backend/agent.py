@@ -8,6 +8,7 @@ import anthropic
 import config
 import database as db
 import calendar_service as cal
+import events
 from models import AgentResponse, Action
 
 _client = None
@@ -138,9 +139,23 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     parsed = _extract_json(raw)
     agent_resp = AgentResponse(**parsed)
 
-    reply = _execute_action(tenant_id, agent_resp, offered_slots)
+    reply = _execute_action(tenant_id, agent_resp, offered_slots, phone)
     db.save_message(tenant_id, phone, "assistant", reply)
+
+    # Notifica painel em tempo real — nova mensagem recebida
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(events.publish(tenant_id, "new_message", {
+            "phone": phone, "intent": agent_resp.intent, "action": agent_resp.action
+        }))
+    except RuntimeError:
+        pass
+
     return reply, agent_resp
+
+
+def _execute_action(tenant_id: int, resp: AgentResponse, offered_slots: list, phone: str = "") -> str:
 
 
 def _execute_action(tenant_id: int, resp: AgentResponse, offered_slots: list) -> str:
@@ -157,8 +172,16 @@ def _execute_action(tenant_id: int, resp: AgentResponse, offered_slots: list) ->
         if 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
             if not db.is_slot_taken(tenant_id, slot):
-                db.create_appointment(tenant_id, name, "", slot)
+                db.create_appointment(tenant_id, name, phone, slot)
                 formatted = cal.format_slots([slot])[0]
+                # Notifica painel — novo agendamento
+                import asyncio
+                try:
+                    asyncio.get_event_loop().create_task(events.publish(tenant_id, "new_appointment", {
+                        "patient_name": name, "slot": formatted, "phone": phone
+                    }))
+                except RuntimeError:
+                    pass
                 return text.replace("[slot]", formatted).replace("[hora]", formatted)
         return "Desculpe, não consegui realizar o agendamento. Pode escolher outro horário? 😊"
 

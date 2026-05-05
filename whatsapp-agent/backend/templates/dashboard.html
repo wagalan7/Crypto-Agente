@@ -6,82 +6,99 @@
   <title>{{ tenant.name }} — Painel</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C' } } } }</script>
+  <style>
+    body { padding-bottom: 70px; }
+    @media (min-width: 768px) { body { padding-bottom: 0; } }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .toast { animation: slideIn .3s ease; }
+    @keyframes slideIn { from { transform: translateY(-20px); opacity:0; } to { transform: translateY(0); opacity:1; } }
+    .badge { display:none; }
+    .badge.show { display:flex; }
+  </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
 
+<!-- Toast container -->
+<div id="toasts" class="fixed top-4 right-4 z-50 space-y-2 max-w-xs"></div>
+
 <!-- Header -->
-<header class="bg-brand shadow">
-  <div class="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
+<header class="bg-brand shadow sticky top-0 z-40">
+  <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
     <div>
-      <h1 class="text-white text-xl font-bold">{{ tenant.name }}</h1>
-      <p class="text-purple-200 text-sm">{{ tenant.psychologist_name }} · Seg–Sex {{ '%02d'|format(tenant.working_hours_start) }}:00–{{ '%02d'|format(tenant.working_hours_end) }}:00</p>
+      <h1 class="text-white text-base md:text-xl font-bold leading-tight">{{ tenant.name }}</h1>
+      <p class="text-pink-200 text-xs md:text-sm">{{ tenant.psychologist_name }} · {{ '%02d'|format(tenant.working_hours_start) }}:00–{{ '%02d'|format(tenant.working_hours_end) }}:00</p>
     </div>
-    <span class="bg-green-400 text-green-900 text-xs font-semibold px-3 py-1 rounded-full">● Online</span>
+    <div class="flex items-center gap-2">
+      <span id="status-dot" class="bg-green-400 text-green-900 text-xs font-semibold px-2 py-1 rounded-full">● Online</span>
+    </div>
   </div>
 </header>
 
-<!-- Tabs -->
-<div class="max-w-5xl mx-auto px-4 mt-6">
-  <div class="flex gap-2 border-b border-gray-200 mb-6">
-    <button onclick="showTab('agenda')" id="tab-agenda"
-      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-brand text-brand">
+<!-- Desktop tabs -->
+<div class="hidden md:block max-w-5xl mx-auto px-4 mt-4">
+  <div class="flex gap-1 border-b border-gray-200 mb-6">
+    <button onclick="showTab('agenda')" id="dtab-agenda"
+      class="dtab flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 border-brand text-brand">
       📅 Agenda
+      <span id="badge-agenda" class="badge bg-brand text-white text-xs rounded-full w-5 h-5 items-center justify-center">0</span>
     </button>
-    <button onclick="showTab('slots')" id="tab-slots"
-      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
+    <button onclick="showTab('slots')" id="dtab-slots"
+      class="dtab px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
       🕐 Horários Livres
     </button>
-    <button onclick="showTab('conversas')" id="tab-conversas"
-      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
+    <button onclick="showTab('conversas')" id="dtab-conversas"
+      class="dtab flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
       💬 Conversas
+      <span id="badge-msg" class="badge bg-brand text-white text-xs rounded-full w-5 h-5 items-center justify-center">0</span>
     </button>
-    <button onclick="showTab('config')" id="tab-config"
-      class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
-      ⚙️ Configurações
+    <button onclick="showTab('config')" id="dtab-config"
+      class="dtab px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
+      ⚙️ Config
     </button>
   </div>
+</div>
+
+<!-- Content -->
+<div class="max-w-5xl mx-auto px-4">
 
   <!-- Agenda -->
-  <div id="pane-agenda">
-    <div class="flex items-center justify-between mb-4">
-      <h2 class="text-lg font-semibold text-gray-800">Próximas consultas</h2>
-      <button onclick="loadAgenda()" class="text-sm text-brand hover:underline">↻ Atualizar</button>
+  <div id="pane-agenda" class="tab-content active">
+    <div class="flex items-center justify-between mb-4 mt-4 md:mt-0">
+      <h2 class="text-base font-semibold text-gray-800">Próximas consultas</h2>
+      <button onclick="loadAgenda()" class="text-sm text-brand">↻ Atualizar</button>
     </div>
     <div id="agenda-list" class="space-y-3">
-      <div class="text-gray-400 text-sm">Carregando...</div>
+      <div class="text-gray-400 text-sm text-center py-8">Carregando...</div>
     </div>
   </div>
 
   <!-- Slots -->
-  <div id="pane-slots" class="hidden">
-    <div class="flex items-center justify-between mb-4">
-      <h2 class="text-lg font-semibold text-gray-800">Horários disponíveis (próximos 7 dias)</h2>
-      <button onclick="loadSlots()" class="text-sm text-brand hover:underline">↻ Atualizar</button>
+  <div id="pane-slots" class="tab-content">
+    <div class="flex items-center justify-between mb-4 mt-4 md:mt-0">
+      <h2 class="text-base font-semibold text-gray-800">Horários disponíveis</h2>
+      <button onclick="loadSlots()" class="text-sm text-brand">↻ Atualizar</button>
     </div>
-    <div id="slots-list" class="grid grid-cols-2 md:grid-cols-3 gap-3">
-      <div class="text-gray-400 text-sm">Carregando...</div>
-    </div>
+    <div id="slots-list" class="grid grid-cols-2 md:grid-cols-3 gap-3"></div>
   </div>
 
   <!-- Conversas -->
-  <div id="pane-conversas" class="hidden">
-    <div class="flex items-center justify-between mb-4">
-      <h2 class="text-lg font-semibold text-gray-800">Histórico de conversas</h2>
+  <div id="pane-conversas" class="tab-content">
+    <div class="flex items-center justify-between mb-4 mt-4 md:mt-0">
+      <h2 class="text-base font-semibold text-gray-800">Conversas</h2>
     </div>
-    <div class="grid md:grid-cols-3 gap-4">
-      <div id="conv-list" class="space-y-2 md:col-span-1">
-        <div class="text-gray-400 text-sm">Carregando...</div>
-      </div>
-      <div id="conv-detail" class="md:col-span-2 bg-white rounded-xl border border-gray-200 p-4 min-h-64">
+    <div class="grid md:grid-cols-3 gap-3">
+      <div id="conv-list" class="space-y-2 md:col-span-1"></div>
+      <div id="conv-detail" class="md:col-span-2 bg-white rounded-xl border border-gray-200 p-4 min-h-48">
         <p class="text-gray-400 text-sm">Selecione uma conversa</p>
       </div>
     </div>
   </div>
 
   <!-- Config -->
-  <div id="pane-config" class="hidden">
-    <h2 class="text-lg font-semibold text-gray-800 mb-4">Configurações do consultório</h2>
-    <div class="bg-white rounded-xl border border-gray-200 p-6 max-w-lg space-y-4">
+  <div id="pane-config" class="tab-content">
+    <h2 class="text-base font-semibold text-gray-800 mb-4 mt-4 md:mt-0">Configurações</h2>
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg space-y-4">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Nome do consultório</label>
         <input id="cfg-name" type="text" value="{{ tenant.name }}"
@@ -94,84 +111,169 @@
       </div>
       <div class="grid grid-cols-2 gap-3">
         <div>
-          <label class="block text-sm font-medium text-gray-700 mb-1">Início (hora)</label>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Início</label>
           <input id="cfg-start" type="number" min="0" max="23" value="{{ tenant.working_hours_start }}"
             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
         </div>
         <div>
-          <label class="block text-sm font-medium text-gray-700 mb-1">Fim (hora)</label>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Fim</label>
           <input id="cfg-end" type="number" min="0" max="23" value="{{ tenant.working_hours_end }}"
             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
         </div>
       </div>
       <div>
-        <label class="block text-sm font-medium text-gray-700 mb-1">Duração da sessão (minutos)</label>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Duração da sessão (min)</label>
         <input id="cfg-min" type="number" min="30" max="120" value="{{ tenant.session_minutes }}"
           class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
       </div>
       <button onclick="saveConfig()"
-        class="w-full bg-brand text-white py-2 rounded-lg text-sm font-semibold hover:bg-purple-700 transition">
-        Salvar configurações
+        class="w-full bg-brand text-white py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition">
+        Salvar
       </button>
-      <div id="cfg-msg" class="text-sm text-center hidden"></div>
+      <div id="cfg-msg" class="text-sm text-center hidden text-green-600"></div>
     </div>
   </div>
+
 </div>
 
-<script>
-const SLUG  = "{{ tenant.slug }}";
-const TOKEN = "{{ token }}";
-const API   = "";
+<!-- Mobile bottom nav -->
+<nav class="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 z-40">
+  <div class="grid grid-cols-4">
+    <button onclick="showTab('agenda')" id="mtab-agenda"
+      class="mtab flex flex-col items-center py-2 text-brand">
+      <span class="text-xl relative">📅
+        <span id="mbadge-agenda" class="badge absolute -top-1 -right-2 bg-brand text-white text-xs rounded-full w-4 h-4 items-center justify-center text-[10px]">0</span>
+      </span>
+      <span class="text-xs font-medium">Agenda</span>
+    </button>
+    <button onclick="showTab('slots')" id="mtab-slots"
+      class="mtab flex flex-col items-center py-2 text-gray-400">
+      <span class="text-xl">🕐</span>
+      <span class="text-xs">Horários</span>
+    </button>
+    <button onclick="showTab('conversas')" id="mtab-conversas"
+      class="mtab flex flex-col items-center py-2 text-gray-400">
+      <span class="text-xl relative">💬
+        <span id="mbadge-msg" class="badge absolute -top-1 -right-2 bg-brand text-white text-xs rounded-full w-4 h-4 items-center justify-center text-[10px]">0</span>
+      </span>
+      <span class="text-xs">Conversas</span>
+    </button>
+    <button onclick="showTab('config')" id="mtab-config"
+      class="mtab flex flex-col items-center py-2 text-gray-400">
+      <span class="text-xl">⚙️</span>
+      <span class="text-xs">Config</span>
+    </button>
+  </div>
+</nav>
 
-function api(path, opts={}) {
-  return fetch(API + path, {
-    headers: {"Content-Type":"application/json", "X-Dashboard-Token": TOKEN},
-    ...opts
-  }).then(r => r.json());
+<script>
+const TOKEN = "{{ token }}";
+const SLUG  = "{{ tenant.slug }}";
+
+// ── Contadores de notificação ─────────────────────────────────────────────────
+let newAppointments = 0, newMessages = 0;
+
+function updateBadge(type, count) {
+  const show = count > 0;
+  ["badge-"+type, "mbadge-"+type].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = count;
+    show ? el.classList.add("show") : el.classList.remove("show");
+  });
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function showToast(msg, type="info") {
+  const colors = { info:"bg-gray-800", success:"bg-green-600", warning:"bg-brand" };
+  const el = document.createElement("div");
+  el.className = `toast ${colors[type]||colors.info} text-white text-sm px-4 py-3 rounded-xl shadow-lg`;
+  el.textContent = msg;
+  document.getElementById("toasts").appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+// ── SSE — eventos em tempo real ───────────────────────────────────────────────
+function connectSSE() {
+  const es = new EventSource(`/dashboard/stream/${SLUG}?token=${TOKEN}`);
+  es.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === "connected") return;
+    if (ev.type === "new_appointment") {
+      newAppointments++;
+      updateBadge("agenda", newAppointments);
+      showToast(`📅 Novo agendamento: ${ev.data.patient_name} — ${ev.data.slot}`, "success");
+      if (document.getElementById("pane-agenda").classList.contains("active")) {
+        loadAgenda();
+        newAppointments = 0;
+        updateBadge("agenda", 0);
+      }
+    }
+    if (ev.type === "new_message") {
+      newMessages++;
+      updateBadge("msg", newMessages);
+      showToast(`💬 Nova mensagem recebida (${ev.data.phone})`, "warning");
+      if (document.getElementById("pane-conversas").classList.contains("active")) {
+        loadConversas();
+        newMessages = 0;
+        updateBadge("msg", 0);
+      }
+    }
+  };
+  es.onerror = () => setTimeout(connectSSE, 5000);
 }
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function showTab(name) {
-  ["agenda","slots","conversas","config"].forEach(t => {
-    document.getElementById("pane-"+t).classList.add("hidden");
-    const btn = document.getElementById("tab-"+t);
-    btn.classList.remove("border-brand","text-brand");
-    btn.classList.add("border-transparent","text-gray-500");
+  document.querySelectorAll(".tab-content").forEach(p => p.classList.remove("active"));
+  document.getElementById("pane-"+name).classList.add("active");
+
+  document.querySelectorAll(".dtab").forEach(b => {
+    b.classList.remove("border-brand","text-brand");
+    b.classList.add("border-transparent","text-gray-500");
   });
-  document.getElementById("pane-"+name).classList.remove("hidden");
-  const active = document.getElementById("tab-"+name);
-  active.classList.add("border-brand","text-brand");
-  active.classList.remove("border-transparent","text-gray-500");
-  if (name==="agenda")    loadAgenda();
+  const dtab = document.getElementById("dtab-"+name);
+  if (dtab) { dtab.classList.add("border-brand","text-brand"); dtab.classList.remove("border-transparent","text-gray-500"); }
+
+  document.querySelectorAll(".mtab").forEach(b => b.classList.replace("text-brand","text-gray-400"));
+  const mtab = document.getElementById("mtab-"+name);
+  if (mtab) mtab.classList.replace("text-gray-400","text-brand");
+
+  if (name==="agenda")    { loadAgenda();    newAppointments=0; updateBadge("agenda",0); }
   if (name==="slots")     loadSlots();
-  if (name==="conversas") loadConversas();
+  if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
+}
+
+function api(path, opts={}) {
+  return fetch(path, { headers:{"Content-Type":"application/json","X-Dashboard-Token":TOKEN}, ...opts }).then(r=>r.json());
 }
 
 // ── Agenda ────────────────────────────────────────────────────────────────────
 function loadAgenda() {
-  api(`/dashboard/api/appointments`).then(data => {
+  api("/dashboard/api/appointments").then(data => {
     const el = document.getElementById("agenda-list");
-    if (!data.appointments || data.appointments.length === 0) {
-      el.innerHTML = '<div class="text-gray-400 text-sm py-8 text-center">Nenhuma consulta agendada.</div>';
+    if (!data.appointments?.length) {
+      el.innerHTML = '<div class="text-gray-400 text-sm text-center py-10">Nenhuma consulta agendada.</div>';
       return;
     }
+    const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
     el.innerHTML = data.appointments.map(a => {
       const dt = new Date(a.scheduled_at);
-      const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
       const label = `${days[dt.getDay()]}, ${String(dt.getDate()).padStart(2,"0")}/${String(dt.getMonth()+1).padStart(2,"0")} às ${String(dt.getHours()).padStart(2,"0")}:${String(dt.getMinutes()).padStart(2,"0")}`;
-      const confirmed = a.confirmed;
       return `
-        <div class="bg-white rounded-xl border border-gray-200 p-4 flex items-center justify-between">
-          <div>
-            <p class="font-semibold text-gray-800">${a.patient_name}</p>
-            <p class="text-sm text-gray-500">${label}</p>
-            <p class="text-xs mt-1 font-medium ${confirmed ? 'text-green-600' : 'text-yellow-600'}">
-              ${confirmed ? '✓ Confirmado' : '⏳ Aguardando confirmação'}
-            </p>
-          </div>
-          <div class="flex gap-2">
-            ${!confirmed ? `<button onclick="confirmAppt(${a.id})" class="text-xs bg-green-100 text-green-700 px-3 py-1 rounded-full hover:bg-green-200">Confirmar</button>` : ''}
-            <button onclick="cancelAppt(${a.id})" class="text-xs bg-red-100 text-red-600 px-3 py-1 rounded-full hover:bg-red-200">Cancelar</button>
+        <div class="bg-white rounded-xl border border-gray-200 p-4">
+          <div class="flex items-start justify-between gap-2">
+            <div>
+              <p class="font-semibold text-gray-800">${a.patient_name}</p>
+              <p class="text-sm text-gray-500 mt-0.5">${label}</p>
+              <span class="inline-block text-xs mt-1 font-medium px-2 py-0.5 rounded-full ${a.confirmed ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'}">
+                ${a.confirmed ? '✓ Confirmado' : '⏳ Pendente'}
+              </span>
+            </div>
+            <div class="flex gap-2 flex-shrink-0">
+              ${!a.confirmed ? `<button onclick="confirmAppt(${a.id})" class="text-xs bg-green-100 text-green-700 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">Confirmar</button>` : ''}
+              <button onclick="cancelAppt(${a.id})" class="text-xs bg-red-100 text-red-600 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">Cancelar</button>
+            </div>
           </div>
         </div>`;
     }).join("");
@@ -179,42 +281,33 @@ function loadAgenda() {
 }
 
 function confirmAppt(id) {
-  api(`/dashboard/api/appointments/${id}/confirm`, {method:"POST"}).then(() => loadAgenda());
+  api(`/dashboard/api/appointments/${id}/confirm`,{method:"POST"}).then(()=>{loadAgenda();showToast("✓ Consulta confirmada","success");});
 }
-
 function cancelAppt(id) {
-  if (!confirm("Cancelar esta consulta?")) return;
-  api(`/dashboard/api/appointments/${id}/cancel`, {method:"DELETE"}).then(() => loadAgenda());
+  if(!confirm("Cancelar esta consulta?")) return;
+  api(`/dashboard/api/appointments/${id}/cancel`,{method:"DELETE"}).then(()=>{loadAgenda();showToast("Consulta cancelada");});
 }
 
 // ── Slots ─────────────────────────────────────────────────────────────────────
 function loadSlots() {
-  api(`/dashboard/api/slots`).then(data => {
+  api("/dashboard/api/slots").then(data => {
     const el = document.getElementById("slots-list");
-    if (!data.slots || data.slots.length === 0) {
-      el.innerHTML = '<div class="text-gray-400 text-sm">Nenhum horário disponível.</div>';
-      return;
-    }
+    if (!data.slots?.length) { el.innerHTML='<div class="text-gray-400 text-sm col-span-2">Nenhum horário.</div>'; return; }
     el.innerHTML = data.slots.map(s =>
-      `<div class="bg-white border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-700 text-center">${s}</div>`
+      `<div class="bg-white border border-gray-200 rounded-xl px-3 py-3 text-sm text-gray-700 text-center">${s}</div>`
     ).join("");
   });
 }
 
 // ── Conversas ─────────────────────────────────────────────────────────────────
-let _phones = [];
 function loadConversas() {
-  api(`/dashboard/api/patients`).then(data => {
-    _phones = data.patients || [];
+  api("/dashboard/api/patients").then(data => {
     const el = document.getElementById("conv-list");
-    if (_phones.length === 0) {
-      el.innerHTML = '<div class="text-gray-400 text-sm">Nenhuma conversa ainda.</div>';
-      return;
-    }
-    el.innerHTML = _phones.map(p =>
+    if (!data.patients?.length) { el.innerHTML='<div class="text-gray-400 text-sm">Sem conversas.</div>'; return; }
+    el.innerHTML = data.patients.map(p =>
       `<button onclick="loadConv('${p.phone}')"
-        class="w-full text-left bg-white border border-gray-200 rounded-xl px-4 py-3 hover:border-brand transition">
-        <p class="text-sm font-medium text-gray-800">${p.name || p.phone}</p>
+        class="w-full text-left bg-white border border-gray-200 rounded-xl px-4 py-3 hover:border-brand transition active:scale-95">
+        <p class="text-sm font-medium text-gray-800">${p.name||p.phone}</p>
         <p class="text-xs text-gray-400">${p.phone}</p>
       </button>`
     ).join("");
@@ -224,44 +317,37 @@ function loadConversas() {
 function loadConv(phone) {
   api(`/dashboard/api/conversation/${phone}`).then(data => {
     const el = document.getElementById("conv-detail");
-    const msgs = data.history || [];
-    if (msgs.length === 0) {
-      el.innerHTML = '<p class="text-gray-400 text-sm">Sem mensagens.</p>';
-      return;
-    }
-    el.innerHTML = `<div class="space-y-3 overflow-y-auto max-h-96">` +
+    const msgs = data.history||[];
+    if (!msgs.length) { el.innerHTML='<p class="text-gray-400 text-sm">Sem mensagens.</p>'; return; }
+    el.innerHTML = `<div class="space-y-3 overflow-y-auto max-h-96 pr-1">` +
       msgs.map(m => {
-        const isUser = m.role === "user";
-        return `<div class="flex ${isUser ? 'justify-start' : 'justify-end'}">
-          <div class="max-w-xs px-4 py-2 rounded-2xl text-sm ${isUser
-            ? 'bg-gray-100 text-gray-800'
-            : 'bg-brand text-white'}">
-            ${m.content}
-          </div>
+        const isUser = m.role==="user";
+        return `<div class="flex ${isUser?'justify-start':'justify-end'}">
+          <div class="max-w-[80%] px-4 py-2 rounded-2xl text-sm ${isUser?'bg-gray-100 text-gray-800':'bg-brand text-white'}">${m.content}</div>
         </div>`;
       }).join("") + `</div>`;
+    el.querySelector("div").scrollTop = 99999;
   });
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
 function saveConfig() {
-  const body = {
+  api("/dashboard/api/config", {method:"PATCH", body:JSON.stringify({
     name: document.getElementById("cfg-name").value,
     psychologist_name: document.getElementById("cfg-psy").value,
-    working_hours_start: parseInt(document.getElementById("cfg-start").value),
-    working_hours_end: parseInt(document.getElementById("cfg-end").value),
-    session_minutes: parseInt(document.getElementById("cfg-min").value),
-  };
-  api(`/dashboard/api/config`, {method:"PATCH", body: JSON.stringify(body)}).then(r => {
-    const msg = document.getElementById("cfg-msg");
-    msg.classList.remove("hidden","text-red-500");
-    msg.classList.add("text-green-600");
-    msg.textContent = "✓ Salvo com sucesso!";
-    setTimeout(() => msg.classList.add("hidden"), 3000);
+    working_hours_start: +document.getElementById("cfg-start").value,
+    working_hours_end: +document.getElementById("cfg-end").value,
+    session_minutes: +document.getElementById("cfg-min").value,
+  })}).then(() => {
+    showToast("✓ Configurações salvas","success");
+    const m = document.getElementById("cfg-msg");
+    m.textContent="✓ Salvo!"; m.classList.remove("hidden");
+    setTimeout(()=>m.classList.add("hidden"),3000);
   });
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+connectSSE();
 loadAgenda();
 </script>
 </body>

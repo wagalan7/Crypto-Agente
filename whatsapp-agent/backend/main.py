@@ -7,11 +7,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from typing import Optional
 
+import events
 import config
 import database as db
 import agent
@@ -257,6 +258,18 @@ def _get_tenant_by_token(token: str) -> dict:
     if not tenant:
         raise HTTPException(status_code=403, detail="Acesso negado.")
     return tenant
+
+
+@app.get("/dashboard/stream/{slug}")
+async def dashboard_stream(slug: str, token: str = ""):
+    tenant = _get_tenant(slug)
+    if not tenant.get("dashboard_token") or tenant["dashboard_token"] != token:
+        raise HTTPException(status_code=403, detail="Token inválido.")
+    return StreamingResponse(
+        events.subscribe(tenant["id"]),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/dashboard/{slug}", response_class=HTMLResponse)
