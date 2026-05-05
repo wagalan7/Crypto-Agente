@@ -1,0 +1,1652 @@
+PROJETO DE EVOLUÇÃO
+
+Agente de Atendimento +
+Assistente Inteligente
+Escopo executivo e técnico · prioridades · cronograma · critérios de aceite
+
+Versão 1.0
+Planejamento acelerado: 10 semanas · execução com Claude Code · entregas
+incrementais
+05 de agosto de 2026
+
+1. Resumo executivo
+Este projeto transforma o produto atual em uma plataforma com duas inteligências integradas: um agente que
+atende pacientes e clientes e um assistente inteligente que ajuda o profissional a administrar o negócio. A
+estratégia não é competir apenas por respostas com IA; é resolver a rotina operacional, organizar decisões e
+demonstrar resultado.
+
+Tese do produto
+
+O agente deve resolver, não apenas responder. O assistente deve analisar,
+recomendar e executar com autorização. Ambos compartilham dados confiáveis,
+políticas e auditoria.
+
+Objetivos do programa
+•
+
+Eliminar as principais fontes de erros intermitentes: duplicidade, mensagens fora de ordem, conflitos de agenda,
+falhas silenciosas e divergência com calendários externos.
+
+•
+
+Criar uma experiência diferenciada: memória útil, fila de espera, recorrência, central de pendências,
+transferência com resumo e autonomia progressiva.
+
+•
+
+Entregar um assistente do profissional capaz de responder perguntas sobre o negócio, produzir briefings,
+identificar riscos e executar comandos autorizados.
+
+•
+
+Demonstrar valor financeiro: faltas evitadas, vagas recuperadas, tempo poupado, cobranças acompanhadas e
+receita preservada.
+
+•
+
+Preparar o SaaS para crescer com segurança, observabilidade, testes e arquitetura compatível com múltiplos
+clientes.
+
+Marcos previstos
+Marco
+
+Prazo
+
+Resultado esperado
+
+M1 - Operação estabilizada
+
+Semana 3
+
+Conversas ordenadas, agenda protegida, erros rastreáveis e fluxo crítico testado.
+
+M2 - Assistente inteligente
+
+Semana 4
+
+Consultas em linguagem natural, briefing, ações com aprovação e handoff.
+
+M3 - Diferenciação operacional
+
+Semana 6
+
+Fila de espera, recorrência, memória e central de pendências.
+
+M4 - Produto orientado a
+resultado
+
+Semana 7
+
+Prevenção de faltas, recomendações e métricas financeiras.
+
+M5 - V1 validada
+
+Semana 10
+
+Segurança, piloto, documentação e operação comercial padronizada.
+
+Premissa de planejamento
+Cronograma estimado para um desenvolvedor principal usando Claude Code de forma intensiva, com validação
+semanal do responsável pelo produto e acesso a um cliente-piloto. A IA acelera implementação, testes, refatoração
+e documentação. Observação em produção, validação humana e janela de piloto não devem ser eliminadas, pois
+protegem agenda, pagamentos e experiência de clientes reais.
+
+Agente de Atendimento - Escopo do Projeto
+
+2 / 17
+
+2. Situação atual e decisão inicial
+O produto já possui agenda, confirmação, remarcação, cancelamento, cobrança, contratos, áudio, imagem,
+dashboard, integrações e rotinas administrativas. Isso é uma vantagem relevante: o projeto parte de uma base
+funcional e de uso real, não de uma ideia inicial.
+
+Atenção antes de
+desenvolver
+
+A documentação descreve a versão avançada de aproximadamente 1.706 linhas
+no agente, enquanto a área de trabalho aberta contém uma versão antiga de
+aproximadamente 190 linhas. A primeira atividade obrigatória é definir a branch
+canônica, confirmar a build realmente implantada e impedir que melhorias sejam
+feitas sobre uma cópia desatualizada.
+
+Forças atuais
+•
+
+Produto multi-tenant já em uso e com cliente real.
+
+•
+
+Conhecimento acumulado sobre psicologia e outros negócios com agenda.
+
+•
+
+Ações determinísticas para fluxos críticos e proteções contra algumas alucinações.
+
+•
+
+Cobrança, contratos e calendário dentro do mesmo produto.
+
+•
+
+Dashboard administrativo e dados suficientes para evoluir para inteligência operacional.
+
+Fragilidades prioritárias
+Risco
+
+Efeito percebido
+
+Tratamento planejado
+
+Mensagem atual duplicada no
+contexto
+
+IA interpreta repetição e responde fora de
+contexto
+
+Correção do histórico e teste automatizado.
+
+Mensagens paralelas do mesmo
+telefone
+
+Respostas fora de ordem e ações
+concorrentes
+
+Fila por tenant+telefone e agrupamento curto.
+
+Reserva não atômica
+
+Dois clientes podem disputar o mesmo
+horário
+
+Transação e proteção no banco.
+
+Slots atravessam dias pela
+duração
+
+Horários com minutos estranhos ou fora do
+expediente
+
+Gerador diário determinístico.
+
+IA síncrona no fluxo principal
+
+Lentidão, timeout e retries
+
+Worker/fila e limites de tempo.
+
+Jobs dentro da aplicação
+
+Duplicidade em deploy ou múltiplas réplicas
+
+Reserva idempotente e worker dedicado.
+
+Calendário externo sem
+reconciliação
+
+Sistema e Google/CalDAV divergem
+
+Outbox, retry e status de sincronização.
+
+SQLite sob concorrência
+crescente
+
+Locks e falhas intermitentes
+
+WAL no curto prazo e migração planejada.
+
+Princípios de execução
+•
+
+Não ampliar funcionalidades antes de estabilizar os fluxos que alteram agenda, contrato e pagamento.
+
+•
+
+Toda ação crítica deve ser validada pelo código, idempotente, auditável e testável.
+
+•
+
+Entregas pequenas em piloto; ativação gradual por tenant e por funcionalidade.
+
+•
+
+A IA interpreta e redige; o sistema determina o que é verdade e o que foi executado.
+
+Agente de Atendimento - Escopo do Projeto
+
+3 / 17
+
+3. Arquitetura de produto desejada
+O desenho-alvo separa conversação de execução. Essa separação reduz alucinações e permite trocar modelos de
+IA sem comprometer a agenda ou o financeiro.
+Camada
+
+Responsabilidade
+
+Exemplo
+
+Entrada e fila
+
+Normalizar, deduplicar, agrupar e ordenar mensagens
+
+Três mensagens curtas viram uma única interação.
+
+Estado da conversa
+
+Registrar intenção, dados coletados, pendências e
+próximo passo
+
+Aguardando escolha de horário; não pede nome
+novamente.
+
+IA de compreensão
+
+Classificar intenção e extrair informações com confiança
+
+Data desejada, período, serviço, motivo de handoff.
+
+Motor de políticas
+
+Decidir o que pode ser feito e quando exige humano
+
+Pagamento nunca é confirmado apenas por
+imagem.
+
+Ferramentas operacionais
+
+Consultar/reservar agenda, contrato, cobrança e
+calendário
+
+Reserva atômica usando token de slot.
+
+IA de redação
+
+Produzir mensagem natural usando apenas dados
+validados
+
+Confirma o horário retornado pela agenda.
+
+Entrega e outbox
+
+Enviar, repetir com segurança e registrar entrega
+
+Mensagem com status pendente, enviada ou
+falhou.
+
+Auditoria e qualidade
+
+Explicar decisões, medir erros e criar regressões
+
+Correção do cliente vira teste permanente.
+
+Contrato estruturado de decisão
+A resposta interna da IA deve conter intenção, confiança, dados coletados, dados faltantes, operação solicitada e
+necessidade de handoff. Ela não deve afirmar que uma consulta foi marcada antes da ferramenta confirmar.
+Horários devem ser selecionados por token temporário, não por índice numérico frágil.
+
+Regra de ouro
+
+Uma mensagem elegante nunca pode esconder uma operação que falhou.
+Primeiro o sistema executa e confirma; depois a IA comunica.
+
+Estados mínimos da conversa
+Estado
+
+Entrada esperada
+
+Saída segura
+
+Identificação
+
+Nome ou reconhecimento pelo telefone
+
+Cliente identificado ou handoff.
+
+Coleta de preferência
+
+Dia, período, serviço ou profissional
+
+Consulta de agenda filtrada.
+
+Oferta de horários
+
+Escolha entre tokens válidos
+
+Reserva temporária/validação.
+
+Confirmação da ação
+
+Aceite explícito quando necessário
+
+Criação ou remarcação atômica.
+
+Pendência humana
+
+Assunto sensível, negociação ou baixa
+confiança
+
+Resumo e transferência.
+
+Concluído
+
+Operação confirmada
+
+Mensagem final + próximo lembrete.
+
+Agente de Atendimento - Escopo do Projeto
+
+4 / 17
+
+4. Produto com duas inteligências integradas
+A experiência será dividida por público e responsabilidade. O Agente de Atendimento conversa com pacientes e
+clientes. O Assistente Inteligente conversa com o profissional, interpreta os dados do negócio e o ajuda a decidir e
+agir. Eles compartilham a mesma fonte de verdade, mas usam permissões, políticas e prompts separados.
+Dimensão
+
+Agente de Atendimento
+
+Assistente Inteligente
+
+Usuário
+
+Paciente ou cliente no WhatsApp
+
+Profissional, gestor ou equipe autorizada
+
+Missão
+
+Atender, orientar e concluir jornadas
+
+Organizar, analisar, recomendar e executar
+
+Exemplos
+
+Agendar, remarcar, confirmar, cancelar, contrato e
+cobrança
+
+Briefing, pendências, ocupação, previsão, bloqueios e
+ações
+
+Autonomia
+
+Definida por fluxo e risco
+
+Consulta livre; alterações com política de aprovação
+
+Memória
+
+Preferências e contexto do relacionamento
+
+Preferências operacionais e decisões do profissional
+
+Saída segura
+
+Mensagem baseada em operação confirmada
+
+Resposta com evidência, recomendação e impacto
+
+Capacidades do Assistente Inteligente
+Capacidade
+
+Exemplos de uso
+
+Perguntas sobre o negócio
+
+Como está minha agenda amanhã? Quem ainda não confirmou? Quanto tenho previsto para
+receber?
+
+Briefing proativo
+
+Atendimentos do dia, riscos, vagas, pagamentos, contratos e conversas aguardando humano.
+
+Recomendações
+
+Preencher uma vaga, contatar paciente sem retorno, abrir faixa extra ou revisar aumento de faltas.
+
+Comandos operacionais
+
+Bloquear período, preparar mensagens, oferecer vaga, pausar agente e criar lembrete.
+
+Aprovação inteligente
+
+Executar consultas automaticamente; pedir confirmação para envio, alteração de agenda ou ação
+financeira.
+
+Explicação
+
+Mostrar dados usados, regra aplicada, impacto previsto e resultado da execução.
+
+Resumo de handoff
+
+Entregar ao profissional contexto, intenção, tentativas anteriores e decisão necessária.
+
+Exemplos de interação
+•
+
+'Quais pacientes estão sem próxima sessão e costumavam vir semanalmente?'
+
+•
+
+'Bloqueie sexta à tarde. Antes de avisar os pacientes afetados, mostre a mensagem para eu aprovar.'
+
+•
+
+'Encontrei uma vaga amanhã às 17h. Quem da fila é compatível e quanto de receita podemos recuperar?'
+
+•
+
+'Faça um fechamento do dia e separe apenas o que precisa da minha decisão.'
+
+Diferencial central
+
+Um agente cuida dos clientes; um assistente ajuda o profissional a cuidar do
+negócio. A integração entre os dois transforma conversas em operação, decisão
+e resultado.
+
+Agente de Atendimento - Escopo do Projeto
+
+5 / 17
+
+5. Cronograma mestre - 10 semanas
+As fases são sequenciais onde existe dependência crítica, mas pesquisa, design e preparação de testes podem
+ocorrer em paralelo. Cada marco deve ser colocado em produção apenas após piloto e validação dos critérios de
+aceite.
+Frente
+
+1
+
+F0 Alinhamento
+
+●
+
+F1 Confiabilidade
+
+●
+
+F2 Qualidade/controle
+
+2-3
+
+4
+
+5-6
+
+7
+
+8
+
+9-10
+
+●
+●
+
+F3 Diferenciação
+
+●
+
+F4 Inteligência
+
+●
+
+F5 Escala/segurança
+
+●
+
+F6 Rollout
+
+●
+
+Semanas
+
+Fase
+
+Entrega de negócio
+
+1
+
+F0 - Alinhamento
+
+Versão canônica, baseline, métricas e plano de rollout.
+
+2-3
+
+F1 - Confiabilidade
+
+Fluxos críticos ordenados, atômicos e observáveis.
+
+4
+
+F2 - Assistente e controle
+
+Assistente inteligente, autonomia, handoff e aprendizado.
+
+5-6
+
+F3 - Diferenciação
+
+Espera, recorrência, memória e central de pendências.
+
+7
+
+F4 - Inteligência
+
+Prevenção, recomendações e resultado financeiro mensurável.
+
+8
+
+F5 - Escala
+
+Banco/filas/segurança/onboarding e operação preparada para crescimento.
+
+9-10
+
+F6 - Rollout
+
+Piloto ampliado, documentação, treinamento e lançamento da V1.
+
+Cadência recomendada
+•
+
+Segunda: planejamento e escolha das histórias da semana.
+
+•
+
+Quarta: demonstração interna com conversas sintéticas e regressões.
+
+•
+
+Sexta: piloto controlado, revisão de métricas, erros e decisão de liberação.
+
+•
+
+Toda alteração de fluxo crítico exige feature flag, rollback e teste de regressão.
+
+Agente de Atendimento - Escopo do Projeto
+
+6 / 17
+
+6. Fase 0 - Alinhamento e linha de base
+F0 Fundação do projeto
+
+Semana 1
+
+Objetivo. Definir exatamente qual versão será evoluída, como medir qualidade e como implantar sem
+interromper o cliente atual.
+
+Entregas
+•
+
+Confirmar repositório, branch canônica, commit e build em produção.
+
+•
+
+Inventariar configurações do cliente atual sem copiar dados pessoais para ambientes de teste.
+
+•
+
+Criar staging isolado, dados sintéticos e feature flags por tenant.
+
+•
+
+Extrair 30 a 50 jornadas anonimizadas: saudação, novo cliente, agenda, confirmação, remarcação,
+cancelamento, pagamento, áudio e imagem.
+
+•
+
+Definir painel mínimo de observabilidade: latência, fallback, erros, duplicidades, falha de envio e falha de
+sincronização.
+
+•
+
+Registrar baseline de sete dias para comparar antes/depois.
+
+Critérios de aceite
+•
+
+Existe uma única referência documentada para produção e desenvolvimento.
+
+•
+
+Staging recebe webhooks de teste sem atingir pacientes reais.
+
+•
+
+Suite inicial reproduz ao menos os erros históricos conhecidos.
+
+•
+
+É possível desativar qualquer funcionalidade nova por tenant sem novo deploy.
+
+Métricas-base
+Métrica
+
+Definição
+
+Meta após F1
+
+Taxa de erro técnico
+
+Interações que terminam em fallback por exceção
+
+< 0,5%
+
+Ação incorreta
+
+Agenda/confirm./cancel. diferente da intenção validada
+
+0 em fluxos críticos testados
+
+Resposta duplicada
+
+Duas respostas para a mesma mensagem/evento
+
+< 0,1%
+
+Latência P95
+
+95% das respostas abaixo do limite
+
+< 8 s texto simples
+
+Entrega rastreável
+
+Mensagens com status final conhecido
+
+> 99%
+
+Agente de Atendimento - Escopo do Projeto
+
+7 / 17
+
+7. Fase 1 - Confiabilidade operacional
+F1 Estável para operar
+
+Semanas 2-3
+
+Objetivo. Eliminar as falhas intermitentes que prejudicam confiança e criar garantias técnicas para agenda e
+mensagens.
+
+Backlog P0 - ordem de execução
+#
+
+Implementação
+
+Dependência
+
+Aceite resumido
+
+1
+
+Corrigir duplicação da mensagem atual no histórico
+
+F0
+
+Cada mensagem aparece uma vez no contexto.
+
+2
+
+Fila e trava por tenant+telefone
+
+1
+
+Mensagens do mesmo contato processadas em
+ordem.
+
+3
+
+Agrupamento de mensagens por 2-4 segundos
+
+2
+
+Mensagens consecutivas formam uma intenção.
+
+4
+
+Idempotência uniforme em todos os webhooks
+
+2
+
+Mesmo evento nunca gera duas ações.
+
+5
+
+Gerador diário de slots + término no expediente
+
+F0
+
+Slots começam na grade configurada e não
+extrapolam.
+
+6
+
+Reserva atômica e token temporário de slot
+
+5
+
+Concorrência não cria choque de agenda.
+
+7
+
+Worker para IA e timeouts controlados
+
+2
+
+Webhook responde rápido e trabalho continua na fila.
+
+8
+
+Outbox de envio e status de entrega
+
+4
+
+Falha não é registrada como mensagem entregue.
+
+9
+
+Outbox de Google/CalDAV + reconciliação
+
+6
+
+Divergência aparece e é retentada.
+
+10
+
+Jobs com claim atômico e idempotência
+
+8
+
+Deploy/múltipla instância não duplica disparos.
+
+11
+
+SQLite WAL, busy timeout e retry curto
+
+F0
+
+Locks transitórios não derrubam o fluxo.
+
+12
+
+Logs correlacionados e alerta por severidade
+
+2
+
+Uma interação é rastreável de ponta a ponta.
+
+Testes obrigatórios
+•
+
+Paciente envia três mensagens rápidas; recebe uma resposta coerente.
+
+•
+
+Dois pacientes tentam o último horário simultaneamente; apenas um agenda.
+
+•
+
+Webhook é reenviado após timeout; nenhuma resposta ou ação é duplicada.
+
+•
+
+Modelo demora/falha; webhook não trava e o usuário recebe fallback controlado.
+
+•
+
+Google Calendar falha; agenda interna permanece consistente e a pendência fica visível.
+
+•
+
+Deploy ocorre durante janela de confirmação; nenhuma mensagem é enviada duas vezes.
+
+Saída da fase
+
+Ao final da semana 3, o produto deve ser seguro para operar com o cliente atual,
+mesmo antes das novas funcionalidades de diferenciação.
+
+Agente de Atendimento - Escopo do Projeto
+
+8 / 17
+
+8. Fase 2 - Assistente inteligente, qualidade e
+controle
+F2 Assistente e qualidade controlável
+
+Semana 4
+
+Objetivo. Entregar o núcleo do assistente do profissional e transformar regras dispersas em estados, políticas,
+aprovações e testes.
+
+Escopo P1
+Frente
+
+Entrega
+
+Valor
+
+Estado conversacional
+
+Estados explícitos, campos coletados, faltantes e próximo
+passo
+
+Menos repetição e menos dependência
+do histórico textual.
+
+Decisão estruturada
+
+Intenção, confiança, operação solicitada e handoff
+
+A IA não afirma ação antes da
+ferramenta.
+
+Chat do profissional
+
+Perguntas naturais sobre agenda, pacientes, financeiro e
+pendências
+
+Acesso rápido sem navegar por várias
+telas.
+
+Ferramentas do assistente
+
+Consultas seguras e comandos operacionais com aprovação
+
+Ajuda prática, não apenas respostas.
+
+Briefing inicial
+
+Resumo do dia e itens que exigem decisão
+
+Profissional começa o dia orientado.
+
+Autonomia progressiva
+
+Sugestão, assistido, autônomo e proativo por assunto
+
+Adoção gradual e confiança.
+
+Handoff inteligente
+
+Detecção de sensibilidade/frustração/baixa confiança +
+resumo
+
+Humano assume com contexto.
+
+Feedback de resposta
+
+Correta, poderia melhorar, errada + motivo
+
+Aprendizado operacional.
+
+Regressões automáticas
+
+Correção aprovada vira caso de teste
+
+Erro corrigido não retorna.
+
+Linha do tempo
+
+Decisão, ação, sincronização e entrega
+
+Transparência e suporte rápido.
+
+Modo sombra inicial
+
+IA sugere sem enviar e compara com humano
+
+Onboarding seguro.
+
+Critérios de aceite
+•
+
+Toda ação crítica registra confiança, política aplicada, resultado e mensagem enviada.
+
+•
+
+O profissional consulta agenda, confirmações, pendências e previsão sem comandos técnicos.
+
+•
+
+Comandos de alteração mostram impacto e pedem aprovação conforme a política configurada.
+
+•
+
+O cliente configura autonomia por categoria sem suporte técnico.
+
+•
+
+Transferências chegam com resumo, intenção, dados relevantes e pendência exata.
+
+•
+
+Feedback negativo cria item revisável e pode gerar teste permanente.
+
+•
+
+Modo sombra produz relatório de cobertura e divergência antes da ativação.
+
+Agente de Atendimento - Escopo do Projeto
+
+9 / 17
+
+9. Fase 3 - Diferenciação operacional
+F3 Operação inteligente vertical
+
+Semanas 5-6
+
+Objetivo. Resolver tarefas que plataformas genéricas normalmente exigem configurar manualmente e tornar o
+produto parte da rotina diária.
+
+Escopo P1
+Módulo
+
+Comportamento principal
+
+Métrica de sucesso
+
+Fila de espera
+
+Registra preferência, encontra vaga compatível, oferece e reserva
+por prazo
+
+% de cancelamentos preenchidos.
+
+Recorrência
+
+Cria séries semanais/quinzenais, identifica conflitos e trata exceções
+
+% de séries sem ajuste manual.
+
+Memória útil
+
+Preferência de período, modalidade, frequência e nome preferido
+
+Redução de mensagens até
+conclusão.
+
+Central de pendências
+
+Transforma conversas em tarefas priorizadas com ação rápida
+
+Pendências resolvidas e tempo
+poupado.
+
+Serviços e durações
+
+Catálogo por tenant, preço informativo, duração e profissional
+
+% de agendamentos autônomos.
+
+Exceções de agenda
+
+Feriados, férias, horários especiais e antecedência mínima
+
+Zero oferta fora das regras.
+
+Múltiplos profissionais
+
+Agenda, serviço, regras e disponibilidade por profissional
+
+Tenants aptos a ampliar equipe.
+
+Resumo diário inicial
+
+Agenda, não confirmados, vagas, pagamentos e contratos
+
+Abertura/uso do briefing.
+
+Fluxo de fila de espera - aceite mínimo
+•
+
+Paciente registra interesse por dia, período, profissional e modalidade.
+
+•
+
+Cancelamento dispara correspondência apenas para candidatos compatíveis e autorizados.
+
+•
+
+Oferta usa reserva temporária; a vaga não é prometida simultaneamente a várias pessoas sem regra explícita.
+
+•
+
+Ao aceitar, agenda e calendário são atualizados atomicamente; demais interessados recebem tratamento
+configurável.
+
+•
+
+Profissional visualiza receita potencial recuperada.
+
+Diferencial
+percebido
+
+O cliente deixa de comprar um chatbot e passa a contratar uma operação
+administrativa especializada, pronta para funcionar sem desenhar fluxos técnicos.
+
+Agente de Atendimento - Escopo do Projeto
+
+10 / 17
+
+10. Fase 4 - Inteligência e resultado
+F4 Produto orientado a resultado
+
+Semana 7
+
+Objetivo. Usar dados operacionais para prevenir problemas, recomendar ações, recuperar receita e demonstrar
+retorno sobre o investimento.
+
+Escopo P2
+•
+
+Briefing diário completo: agenda, confirmações, vagas, fila de espera, contratos, comprovantes e exceções.
+
+•
+
+Assistente responde perguntas comparativas e explica os dados usados em cada conclusão.
+
+•
+
+Recomendações proativas priorizadas por urgência, impacto e confiança, sempre com ação sugerida.
+
+•
+
+Prevenção de faltas baseada em sinais operacionais, nunca em diagnóstico sensível.
+
+•
+
+Sugestão de preenchimento de buracos e melhor ordem de oferta de horários.
+
+•
+
+Reativação assistida de clientes inativos, sempre com consentimento, frequência limitada e aprovação
+configurável.
+
+•
+
+Cobrança conversacional: promessa de pagamento, divergência, pedido de total e encaminhamento humano.
+
+•
+
+Painel de resultado com tempo poupado, faltas evitadas, vagas recuperadas e receita preservada.
+
+•
+
+Experimentos controlados de mensagens para confirmação e preenchimento de vagas.
+
+Indicadores principais
+Indicador
+
+Cálculo
+
+Uso
+
+Resolução autônoma segura
+
+Conversas concluídas sem humano e sem correção /
+elegíveis
+
+Qualidade da automação.
+
+Mensagens até conclusão
+
+Média por jornada concluída
+
+Eficiência e naturalidade.
+
+Taxa de confirmação
+
+Consultas confirmadas / confirmações enviadas
+
+Efetividade dos lembretes.
+
+Taxa de falta
+
+Faltas / consultas realizadas no período
+
+Impacto preventivo.
+
+Vagas recuperadas
+
+Cancelamentos preenchidos pela fila
+
+Receita recuperada.
+
+Tempo administrativo poupado
+
+Ações autônomas x tempo médio validado
+
+ROI para o cliente.
+
+Correções por 100 conversas
+
+Feedbacks negativos / conversas x 100
+
+Saúde do agente.
+
+Handoff útil
+
+Transferências resolvidas sem pedir contexto novamente
+
+Qualidade da colaboração humano-IA.
+
+Agente de Atendimento - Escopo do Projeto
+
+11 / 17
+
+11. Fase 5 - Escala, segurança e produto SaaS
+F5 Pronto para crescer
+
+Semana 8
+
+Objetivo. Reduzir risco operacional e transformar implantação, suporte e governança em processos repetíveis.
+
+Escopo técnico e operacional
+Frente
+
+Implementações
+
+Banco e concorrência
+
+Plano de migração para PostgreSQL; migrações testadas; rollback; índices e isolamento por tenant.
+
+Filas e workers
+
+Mensagens, jobs, sincronização e mídia fora do processo web, com retry e dead-letter queue.
+
+Segurança de webhook
+
+Token obrigatório para legados, validação oficial por provedor, rotação e alerta de rejeição.
+
+Acesso
+
+Evitar token persistente em URL, sessões seguras, expiração, revogação e perfis de permissão.
+
+LGPD
+
+Inventário de dados, retenção, exportação, exclusão, base legal, minimização e trilha de acesso.
+
+Observabilidade
+
+SLOs, alertas acionáveis, correlação, custos de IA e painel de saúde por tenant.
+
+Onboarding
+
+Assistente de configuração, modo sombra, checklist, teste de número e validação da agenda.
+
+Suporte
+
+Diagnóstico automático, pacote de evidências sem dados sensíveis e playbooks de incidente.
+
+SLOs sugeridos para V1
+Compromisso
+
+Objetivo
+
+Disponibilidade mensal
+
+99,5% na V1; evoluir para 99,9% conforme receita e arquitetura.
+
+Perda de mensagem aceita
+
+0; toda entrada válida possui estado final rastreável.
+
+Duplicidade de ação crítica
+
+0; idempotência verificada por teste e métrica.
+
+Resposta de texto P95
+
+Até 8 segundos em condição normal.
+
+Recuperação de job
+
+Retry automático; alerta após limite; retomada manual segura.
+
+RPO / RTO
+
+RPO até 24h inicialmente; RTO até 4h, com evolução planejada.
+
+Agente de Atendimento - Escopo do Projeto
+
+12 / 17
+
+12. Fase 6 - Piloto ampliado e lançamento
+F6 Rollout da V1
+
+Semanas 9-10
+
+Objetivo. Validar o produto com uso real, concluir documentação e liberar comercialmente sem colocar todos os
+clientes em risco ao mesmo tempo.
+
+Estratégia de liberação
+Etapa
+
+Público
+
+Critério para avançar
+
+Interna
+
+Dados sintéticos e equipe
+
+100% dos testes P0; nenhuma falha crítica aberta.
+
+Sombra
+
+Cliente atual, sem envio automático novo
+
+Divergência conhecida e autonomia recomendada.
+
+Canário
+
+10-20% das conversas elegíveis
+
+7 dias sem ação crítica incorreta.
+
+Piloto
+
+Cliente atual completo + 1 ou 2 convidados
+
+14 dias dentro das metas operacionais.
+
+V1
+
+Novos clientes do segmento prioritário
+
+Onboarding, suporte e rollback documentados.
+
+Materiais de lançamento
+•
+
+Manual curto de configuração e operação diária.
+
+•
+
+Guia de autonomia e quando o humano assume.
+
+•
+
+Checklist de onboarding e teste de agenda/WhatsApp.
+
+•
+
+Política de privacidade, retenção e uso responsável de IA.
+
+•
+
+Painel de resultado e relatório mensal compartilhável.
+
+•
+
+Playbook de suporte, incidentes e rollback.
+
+Definição de pronto da V1
+•
+
+Nenhuma ação crítica incorreta no piloto de 14 dias.
+
+•
+
+Erros técnicos abaixo de 0,5% e duplicidade abaixo de 0,1%.
+
+•
+
+Cliente consegue configurar agenda, autonomia e handoff sem alteração de código.
+
+•
+
+Resultado operacional é mensurável e compreensível no painel.
+
+•
+
+Suporte consegue diagnosticar uma interação sem acessar conteúdo desnecessário.
+
+Agente de Atendimento - Escopo do Projeto
+
+13 / 17
+
+13. Backlog consolidado por prioridade
+A classificação usa: P0 bloqueia confiabilidade; P1 cria o núcleo do produto; P2 aumenta diferenciação/resultado;
+P3 é expansão posterior.
+Pri.
+
+Itens
+
+P0
+
+Branch/build canônica; histórico sem duplicação; fila por contato; agrupamento; dedup; slots corretos; reserva atômica; worker de
+IA; outbox; jobs idempotentes; logs; testes críticos.
+
+P1
+
+Estados; assistente do profissional; consultas naturais; ferramentas com aprovação; briefing; autonomia progressiva; handoff;
+feedback; regressões; fila de espera; recorrência; memória; pendências.
+
+P2
+
+Recomendações proativas; explicações; múltiplos profissionais; prevenção de faltas; otimização de agenda; cobrança
+conversacional; métricas de ROI; PostgreSQL; filas duráveis; onboarding.
+
+P3
+
+Multicanal; white-label; marketplace de integrações; voz/ligação; campanhas avançadas; expansão ampla de segmentos;
+recomendações preditivas sofisticadas.
+
+Fora do escopo inicial
+•
+
+Diagnóstico, aconselhamento clínico ou decisão médica.
+
+•
+
+Confirmação automática de pagamento baseada apenas em imagem/comprovante.
+
+•
+
+Campanhas massivas sem consentimento, governança e templates oficiais.
+
+•
+
+Expansão simultânea e profunda para todos os 13 segmentos.
+
+•
+
+Aplicativo móvel nativo antes de validar a experiência web responsiva.
+
+•
+
+Substituição completa do atendimento humano em situações sensíveis ou ambíguas.
+
+Segmentos recomendados
+Priorizar inicialmente psicologia, nutrição e fisioterapia, que compartilham agenda recorrente, confirmação, faltas,
+cobrança por sessão e necessidade de comunicação cuidadosa. A expansão deve ocorrer por pacotes verticais
+validados, não apenas por troca de rótulos no prompt.
+
+Agente de Atendimento - Escopo do Projeto
+
+14 / 17
+
+14. Governança e papéis
+Papel
+
+Responsabilidades
+
+Responsável pelo produto
+
+Prioridade, regras de negócio, validação semanal, aprovação de piloto e decisão de rollout.
+
+Desenvolvimento
+
+Arquitetura, implementação, testes, observabilidade, migração e documentação técnica.
+
+Cliente-piloto
+
+Validar linguagem, regras, exceções, feedback de respostas e impacto na rotina.
+
+Suporte/operação
+
+Monitorar alertas, diagnosticar falhas, executar playbooks e registrar padrões recorrentes.
+
+Privacidade/segurança
+
+Revisar LGPD, acessos, retenção, fornecedores, contratos e resposta a incidentes.
+
+Ritos de governança
+•
+
+Revisão semanal de produto: métricas, feedbacks, decisões e riscos.
+
+•
+
+Revisão quinzenal de qualidade: amostra anonimizada de conversas e regressões.
+
+•
+
+Revisão mensal de segurança, custos de IA e saúde das integrações.
+
+•
+
+Go/no-go formal antes de aumentar a autonomia ou adicionar tenants ao piloto.
+
+Definition of Done para cada história
+•
+
+Regra de negócio e comportamento de falha documentados.
+
+•
+
+Teste unitário e teste de jornada relevante.
+
+•
+
+Log e métrica suficientes para diagnóstico.
+
+•
+
+Feature flag e rollback quando houver impacto em produção.
+
+•
+
+Interface revisada em desktop e celular quando aplicável.
+
+•
+
+Validação em staging e piloto antes da liberação ampla.
+
+Agente de Atendimento - Escopo do Projeto
+
+15 / 17
+
+15. Riscos e mitigação
+Risco
+
+Prob.
+
+Impacto
+
+Mitigação
+
+Construir na branch errada
+
+Alta
+
+Crítico
+
+F0 obrigatória; branch protegida e build identificável.
+
+Adicionar funções antes de estabilizar
+
+Alta
+
+Alto
+
+Congelar P2/P3 até critérios da F1.
+
+Velocidade da IA reduzir revisão
+
+Média
+
+Crítico
+
+Pull requests pequenos, testes, feature flags e go/no-go
+humano.
+
+Cliente-piloto pouco disponível
+
+Média
+
+Alto
+
+Rito semanal curto; dados anonimizados; decisões registradas.
+
+Mudança de modelo altera
+comportamento
+
+Alta
+
+Alto
+
+Contrato estruturado, regressões e avaliação antes do deploy.
+
+Custos crescem com contexto/áudio
+
+Média
+
+Médio
+
+Roteamento de modelos, cache, atalhos e orçamento por
+tenant.
+
+Migração de banco interrompe operação
+
+Média
+
+Alto
+
+Ensaio, dupla leitura quando necessário, backup e rollback.
+
+Automação proativa gera rejeição
+
+Média
+
+Alto
+
+Consentimento, frequência, horário, opt-out e piloto.
+
+Escopo se espalha por 13 segmentos
+
+Alta
+
+Alto
+
+Três verticais prioritárias e critérios de expansão.
+
+Dependência de provedor WhatsApp
+
+Média
+
+Alto
+
+Abstração, monitor, retry e plano de contingência.
+
+Gatilhos para replanejamento
+•
+
+Mais de 20% da capacidade semanal consumida por incidentes durante duas semanas.
+
+•
+
+Falha crítica de agenda ou privacidade no piloto.
+
+•
+
+Mudança de provedor/WhatsApp que afete templates ou webhooks.
+
+•
+
+Necessidade de múltiplos profissionais confirmada antes da fila de espera.
+
+•
+
+Ausência de baseline suficiente para medir benefício.
+
+Agente de Atendimento - Escopo do Projeto
+
+16 / 17
+
+16. Próximos passos imediatos
+Decisão
+recomendada
+
+Iniciar a Fase 0 e não desenvolver novas funções na branch atual até confirmar a
+versão canônica e a build efetivamente implantada.
+
+Primeiros 10 dias úteis
+Dia
+
+Ação
+
+Resultado
+
+1
+
+Confirmar branch, commit, build e ambiente
+
+Fonte única de verdade.
+
+2
+
+Mapear jornada do cliente atual e incidentes
+
+Lista real de falhas e prioridades.
+
+3
+
+Criar staging e dados sintéticos
+
+Ambiente seguro de validação.
+
+4-5
+
+Montar regressões de conversas
+
+Baseline automatizado.
+
+6
+
+Corrigir mensagem duplicada e correlação
+
+Contexto limpo e rastreável.
+
+7-8
+
+Implementar fila por contato e agrupamento
+
+Conversas ordenadas e naturais.
+
+9
+
+Implementar dedup uniforme e testes
+
+Retries não duplicam ações.
+
+10
+
+Piloto interno + revisão de métricas
+
+Decisão de avançar para agenda atômica.
+
+Decisões que o responsável pelo produto deverá validar
+•
+
+Quais três segmentos serão priorizados na primeira versão comercial.
+
+•
+
+Qual nível de autonomia será padrão para novos clientes.
+
+•
+
+Se a fila de espera oferece a vaga para uma pessoa por vez ou para um grupo com regra de prioridade.
+
+•
+
+Quais indicadores serão mostrados no relatório mensal de valor.
+
+•
+
+Em que momento a migração para PostgreSQL será obrigatória por volume ou receita.
+
+Resultado esperado
+Ao final do programa, o produto deverá operar com duas inteligências integradas: um agente atende clientes com
+naturalidade e garantias técnicas; um assistente organiza o negócio, responde perguntas, recomenda ações e
+executa comandos autorizados. Ambos aprendem com correções e provam o impacto financeiro gerado. Esse
+conjunto - confiabilidade, especialização vertical, inteligência administrativa e resultado mensurável - constitui o
+diferencial competitivo central.
+
+Documento elaborado a partir da documentação técnica e da auditoria do código disponível. Estimativas devem ser recalibradas após a
+Fase 0.
+
+Agente de Atendimento - Escopo do Projeto
+
+17 / 17
+
+
