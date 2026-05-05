@@ -57,6 +57,8 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
     const chartRef = useRef<IChartApi | null>(null)
     const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
     const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null)
+    const ema12Ref = useRef<ISeriesApi<'Line'> | null>(null)
+    const ema26Ref = useRef<ISeriesApi<'Line'> | null>(null)
     const patternLinesRef = useRef<ISeriesApi<'Line'>[]>([])
     const levelLinesRef = useRef<ISeriesApi<'Line'>[]>([])
     // Map: drawing id → cleanup function
@@ -161,6 +163,20 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
       chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } })
       volumeSeriesRef.current = volumeSeries
 
+      const ema12Series = chart.addLineSeries({
+        color: '#3b82f6', lineWidth: 1, lineStyle: LineStyle.Solid,
+        priceLineVisible: false, lastValueVisible: false,
+        crosshairMarkerVisible: false, title: 'EMA12',
+      })
+      ema12Ref.current = ema12Series
+
+      const ema26Series = chart.addLineSeries({
+        color: '#f97316', lineWidth: 1, lineStyle: LineStyle.Solid,
+        priceLineVisible: false, lastValueVisible: false,
+        crosshairMarkerVisible: false, title: 'EMA26',
+      })
+      ema26Ref.current = ema26Series
+
       const ro = new ResizeObserver(() => {
         if (!containerRef.current || !chartRef.current) return
         const { clientWidth, clientHeight } = containerRef.current
@@ -176,6 +192,8 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
         chartRef.current = null
         candleSeriesRef.current = null
         volumeSeriesRef.current = null
+        ema12Ref.current = null
+        ema26Ref.current = null
       }
     }, [height])
 
@@ -196,6 +214,20 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
         })) as HistogramData[]
       )
       chartRef.current?.timeScale().fitContent()
+
+      // EMA calculation
+      function calcEMA(values: number[], period: number): number[] {
+        const k = 2 / (period + 1)
+        const out = [values[0]]
+        for (let i = 1; i < values.length; i++) out.push(values[i] * k + out[i-1] * (1-k))
+        return out
+      }
+      const closes = candles.map(c => c.close)
+      const times = candles.map(c => Math.floor(c.timestamp / 1000) as Time)
+      const ema12Data = calcEMA(closes, 12)
+      const ema26Data = calcEMA(closes, 26)
+      ema12Ref.current?.setData(times.map((t, i) => ({ time: t, value: ema12Data[i] })))
+      ema26Ref.current?.setData(times.map((t, i) => ({ time: t, value: ema26Data[i] })))
     }, [candles])
 
     // Draw pattern overlays and signal levels

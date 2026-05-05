@@ -302,6 +302,22 @@ async def validate_drawing(body: dict):
             desc_lines.append(
                 f"• Linha de tendência {direction}: de {price1:.6g} para {price2:.6g}"
             )
+        elif dtype == "fibonacci":
+            p1 = d.get("p1", {})
+            p2 = d.get("p2", {})
+            high_price = max(p1.get("price", 0), p2.get("price", 0))
+            low_price = min(p1.get("price", 0), p2.get("price", 0))
+            desc_lines.append(
+                f"• Fibonacci: de {low_price:.6g} até {high_price:.6g} (range: {(high_price-low_price):.6g})"
+            )
+        elif dtype == "rectangle":
+            p1 = d.get("p1", {})
+            p2 = d.get("p2", {})
+            high_price = max(p1.get("price", 0), p2.get("price", 0))
+            low_price = min(p1.get("price", 0), p2.get("price", 0))
+            desc_lines.append(
+                f"• Retângulo entre {low_price:.6g} e {high_price:.6g}"
+            )
 
     drawings_desc = "\n".join(desc_lines)
 

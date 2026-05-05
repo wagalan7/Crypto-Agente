@@ -6,7 +6,7 @@ import { useAnalysis } from '../hooks/useAnalysis'
 import { useLivePrice } from '../hooks/useLivePrice'
 import { api } from '../services/api'
 import DrawingToolbar from './DrawingToolbar'
-import type { TradeSignal, UserDrawing, DrawingTool, HLineDrawing, TrendLineDrawing } from '../types'
+import type { TradeSignal, UserDrawing, DrawingTool, HLineDrawing, TrendLineDrawing, FibonacciDrawing, RectangleDrawing } from '../types'
 
 interface Props {
   symbol: string
@@ -25,6 +25,16 @@ interface DragState {
 }
 
 const TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '4h', '6h', '8h', '12h', '1d', '3d']
+
+const FIB_LEVELS = [
+  { r: 0,     color: '#94a3b8', label: '0%'    },
+  { r: 0.236, color: '#60a5fa', label: '23.6%' },
+  { r: 0.382, color: '#4ade80', label: '38.2%' },
+  { r: 0.5,   color: '#fbbf24', label: '50%'   },
+  { r: 0.618, color: '#f97316', label: '61.8%' },
+  { r: 0.786, color: '#f87171', label: '78.6%' },
+  { r: 1,     color: '#94a3b8', label: '100%'  },
+]
 
 function cleanName(s: string) {
   return s.replace('/USDT:USDT', '/USDT').replace(':USDT', '')
@@ -195,6 +205,34 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
         setDrawStart(null)
         setPreviewLine(null)
       }
+    } else if (drawingTool === 'fibonacci') {
+      if (!drawStart) {
+        setDrawStart({ x, y, price, time })
+      } else {
+        const id = Date.now().toString()
+        setUserDrawings(prev => [...prev, {
+          id, type: 'fibonacci' as const,
+          p1: { price: drawStart.price, time: drawStart.time },
+          p2: { price, time },
+          color: '#f59e0b',
+        }])
+        setDrawStart(null)
+        setPreviewLine(null)
+      }
+    } else if (drawingTool === 'rectangle') {
+      if (!drawStart) {
+        setDrawStart({ x, y, price, time })
+      } else {
+        const id = Date.now().toString()
+        setUserDrawings(prev => [...prev, {
+          id, type: 'rectangle' as const,
+          p1: { price: drawStart.price, time: drawStart.time },
+          p2: { price, time },
+          color: '#3b82f6',
+        }])
+        setDrawStart(null)
+        setPreviewLine(null)
+      }
     }
   }
 
@@ -203,7 +241,10 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
     setMousePos({ x, y })
-    if (drawingTool === 'trendline' && drawStart) {
+    if ((drawingTool === 'trendline' || drawingTool === 'fibonacci') && drawStart) {
+      setPreviewLine({ x1: drawStart.x, y1: drawStart.y, x2: x, y2: y })
+    }
+    if (drawingTool === 'rectangle' && drawStart) {
       setPreviewLine({ x1: drawStart.x, y1: drawStart.y, x2: x, y2: y })
     }
   }
@@ -225,6 +266,17 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
     e.stopPropagation()
     e.preventDefault()
     chartHandleRef.current?.removeDrawingById(drawing.id)
+    setDragging({ drawingId: drawing.id, grabPoint, startClientX: e.clientX, startClientY: e.clientY, snapshot: drawing })
+  }
+
+  const startFibonacciDrag = (e: React.MouseEvent, drawing: FibonacciDrawing, grabPoint: 'p1' | 'p2' | 'body') => {
+    e.stopPropagation(); e.preventDefault()
+    // Fibonacci is SVG-only — no chart series to remove
+    setDragging({ drawingId: drawing.id, grabPoint, startClientX: e.clientX, startClientY: e.clientY, snapshot: drawing })
+  }
+
+  const startRectangleDrag = (e: React.MouseEvent, drawing: RectangleDrawing, grabPoint: 'p1' | 'p2' | 'body') => {
+    e.stopPropagation(); e.preventDefault()
     setDragging({ drawingId: drawing.id, grabPoint, startClientX: e.clientX, startClientY: e.clientY, snapshot: drawing })
   }
 
@@ -269,35 +321,39 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
         const newPrice = (h && pos) ? (h.yToPrice(pos.y) ?? snapshot.price) : snapshot.price
         newDrawing = { ...snapshot, price: newPrice }
         h?.addHLine(drawingId, newPrice, snapshot.color, snapshot.label)
-      } else {
+      } else if (snapshot.type === 'trendline') {
         const origCoords = getDrawingCoords(snapshot)
         let newP1 = { ...snapshot.p1 }
         let newP2 = { ...snapshot.p2 }
-
         if (h && pos) {
           if (grabPoint === 'p1') {
-            newP1 = {
-              price: h.yToPrice(pos.y) ?? snapshot.p1.price,
-              time: h.xToTime(pos.x) ?? snapshot.p1.time,
-            }
+            newP1 = { price: h.yToPrice(pos.y) ?? snapshot.p1.price, time: h.xToTime(pos.x) ?? snapshot.p1.time }
           } else if (grabPoint === 'p2') {
-            newP2 = {
-              price: h.yToPrice(pos.y) ?? snapshot.p2.price,
-              time: h.xToTime(pos.x) ?? snapshot.p2.time,
-            }
+            newP2 = { price: h.yToPrice(pos.y) ?? snapshot.p2.price, time: h.xToTime(pos.x) ?? snapshot.p2.time }
           } else if (origCoords) {
-            newP1 = {
-              price: h.yToPrice(origCoords.y1 + dy) ?? snapshot.p1.price,
-              time: h.xToTime(origCoords.x1 + dx) ?? snapshot.p1.time,
-            }
-            newP2 = {
-              price: h.yToPrice(origCoords.y2 + dy) ?? snapshot.p2.price,
-              time: h.xToTime(origCoords.x2 + dx) ?? snapshot.p2.time,
-            }
+            newP1 = { price: h.yToPrice(origCoords.y1 + dy) ?? snapshot.p1.price, time: h.xToTime(origCoords.x1 + dx) ?? snapshot.p1.time }
+            newP2 = { price: h.yToPrice(origCoords.y2 + dy) ?? snapshot.p2.price, time: h.xToTime(origCoords.x2 + dx) ?? snapshot.p2.time }
           }
         }
         newDrawing = { ...snapshot, p1: newP1, p2: newP2 }
         h?.addTrendLine(drawingId, newP1, newP2, snapshot.color)
+      } else {
+        // fibonacci | rectangle — SVG only, no chart series
+        const snap = snapshot as FibonacciDrawing | RectangleDrawing
+        const origCoords = getDrawingCoords(snap)
+        let newP1 = { ...snap.p1 }
+        let newP2 = { ...snap.p2 }
+        if (h && pos) {
+          if (grabPoint === 'p1') {
+            newP1 = { price: h.yToPrice(pos.y) ?? snap.p1.price, time: h.xToTime(pos.x) ?? snap.p1.time }
+          } else if (grabPoint === 'p2') {
+            newP2 = { price: h.yToPrice(pos.y) ?? snap.p2.price, time: h.xToTime(pos.x) ?? snap.p2.time }
+          } else if (origCoords) {
+            newP1 = { price: h.yToPrice(origCoords.y1 + dy) ?? snap.p1.price, time: h.xToTime(origCoords.x1 + dx) ?? snap.p1.time }
+            newP2 = { price: h.yToPrice(origCoords.y2 + dy) ?? snap.p2.price, time: h.xToTime(origCoords.x2 + dx) ?? snap.p2.time }
+          }
+        }
+        newDrawing = { ...snap, p1: newP1, p2: newP2 }
       }
 
       setUserDrawings(prev => prev.map(d => d.id === drawingId ? newDrawing : d))
@@ -345,8 +401,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
   const svgPointerEvents = drawingTool !== 'cursor' ? 'all' : 'none'
   const svgCursor =
     dragging ? 'grabbing' :
-    drawingTool === 'hline' ? 'crosshair' :
-    drawingTool === 'trendline' ? 'crosshair' : 'default'
+    drawingTool !== 'cursor' ? 'crosshair' : 'default'
 
   // Used by getDrawingCoords to trigger re-render on zoom/pan (viewportTick is read)
   void viewportTick
@@ -503,6 +558,84 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
                     </g>
                   )
                 }
+                if (drawing.type === 'fibonacci') {
+                  const fd = drawing as FibonacciDrawing
+                  const h = chartHandleRef.current
+                  if (!h) return null
+                  const cy1 = h.priceToY(fd.p1.price)
+                  const cx1 = h.timeToX(fd.p1.time)
+                  const cy2 = h.priceToY(fd.p2.price)
+                  const cx2 = h.timeToX(fd.p2.time)
+                  return (
+                    <g key={drawing.id}>
+                      {FIB_LEVELS.map(({ r, color, label }) => {
+                        const price = fd.p1.price + r * (fd.p2.price - fd.p1.price)
+                        const y = h.priceToY(price)
+                        if (y == null) return null
+                        return (
+                          <g key={r}>
+                            <line x1="0" y1={y} x2="100%" y2={y}
+                              stroke={color} strokeWidth="0.8" strokeDasharray="5,3" opacity="0.7"
+                              style={{ pointerEvents: 'none' }} />
+                            <text x="4" y={y - 2} fill={color} fontSize="8.5" fontFamily="monospace" opacity="0.85"
+                              style={{ pointerEvents: 'none' }}>
+                              {label}
+                            </text>
+                            <text x="99%" y={y - 2} textAnchor="end" fill={color} fontSize="8.5" fontFamily="monospace" opacity="0.85"
+                              style={{ pointerEvents: 'none' }}>
+                              {price < 1 ? price.toFixed(6) : price < 100 ? price.toFixed(3) : price.toFixed(2)}
+                            </text>
+                          </g>
+                        )
+                      })}
+                      {drawingTool === 'cursor' && cx1 != null && cy1 != null && (
+                        <circle cx={cx1} cy={cy1} r="6" fill="#f59e0b" opacity="0.7"
+                          style={{ cursor: 'crosshair', pointerEvents: 'all' }}
+                          onMouseDown={(e) => startFibonacciDrag(e, fd, 'p1')} />
+                      )}
+                      {drawingTool === 'cursor' && cx2 != null && cy2 != null && (
+                        <circle cx={cx2} cy={cy2} r="6" fill="#f59e0b" opacity="0.7"
+                          style={{ cursor: 'crosshair', pointerEvents: 'all' }}
+                          onMouseDown={(e) => startFibonacciDrag(e, fd, 'p2')} />
+                      )}
+                    </g>
+                  )
+                }
+
+                if (drawing.type === 'rectangle') {
+                  const rd = drawing as RectangleDrawing
+                  const h = chartHandleRef.current
+                  if (!h) return null
+                  const rx1 = h.timeToX(rd.p1.time)
+                  const ry1 = h.priceToY(rd.p1.price)
+                  const rx2 = h.timeToX(rd.p2.time)
+                  const ry2 = h.priceToY(rd.p2.price)
+                  if (rx1 == null || ry1 == null || rx2 == null || ry2 == null) return null
+                  const rxx = Math.min(rx1, rx2), ryy = Math.min(ry1, ry2)
+                  const rw = Math.abs(rx2 - rx1), rh = Math.abs(ry2 - ry1)
+                  return (
+                    <g key={drawing.id}>
+                      <rect x={rxx} y={ryy} width={rw} height={rh}
+                        fill={`${rd.color}18`} stroke={rd.color} strokeWidth="1" strokeDasharray="5,3"
+                        style={{ pointerEvents: 'none' }} />
+                      {drawingTool === 'cursor' && (
+                        <>
+                          <rect x={rxx} y={ryy} width={rw} height={rh}
+                            fill="transparent" stroke="transparent" strokeWidth="12"
+                            style={{ cursor: 'move', pointerEvents: 'stroke' }}
+                            onMouseDown={(e) => startRectangleDrag(e, rd, 'body')} />
+                          <circle cx={rx1} cy={ry1} r="6" fill={rd.color} opacity="0.7"
+                            style={{ cursor: 'crosshair', pointerEvents: 'all' }}
+                            onMouseDown={(e) => startRectangleDrag(e, rd, 'p1')} />
+                          <circle cx={rx2} cy={ry2} r="6" fill={rd.color} opacity="0.7"
+                            style={{ cursor: 'crosshair', pointerEvents: 'all' }}
+                            onMouseDown={(e) => startRectangleDrag(e, rd, 'p2')} />
+                        </>
+                      )}
+                    </g>
+                  )
+                }
+
                 return null
               })
             }
@@ -513,31 +646,80 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
               <line x1="0" y1={mousePos.y} x2="100%" y2={mousePos.y}
                 stroke="#4ade80" strokeWidth="1" strokeDasharray="6,4" opacity="0.5" />
             )}
-            {/* Trend line first-point dot */}
-            {drawingTool === 'trendline' && drawStart && (
+            {/* Trend/Fibonacci line first-point dot */}
+            {(drawingTool === 'trendline' || drawingTool === 'fibonacci') && drawStart && (
               <circle cx={drawStart.x} cy={drawStart.y} r="4" fill="#f59e0b" opacity="0.9" />
             )}
-            {/* Trend line ghost line */}
-            {drawingTool === 'trendline' && previewLine && (
+            {/* Trend/Fibonacci line ghost line */}
+            {(drawingTool === 'trendline' || drawingTool === 'fibonacci') && previewLine && (
               <line x1={previewLine.x1} y1={previewLine.y1} x2={previewLine.x2} y2={previewLine.y2}
                 stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7" />
+            )}
+            {/* Rectangle preview */}
+            {drawingTool === 'rectangle' && drawStart && mousePos && (
+              <rect
+                x={Math.min(drawStart.x, mousePos.x)}
+                y={Math.min(drawStart.y, mousePos.y)}
+                width={Math.abs(mousePos.x - drawStart.x)}
+                height={Math.abs(mousePos.y - drawStart.y)}
+                fill="#3b82f618" stroke="#3b82f6" strokeWidth="1" strokeDasharray="4,3" opacity="0.7"
+              />
             )}
 
             {/* ── Drag preview ───────────────────────────────────────────── */}
             {dragging && dragPreview && (() => {
               const snap = dragging.snapshot
-              const isHLine = snap.type === 'hline'
-              return isHLine ? (
-                <line x1="0" y1={dragPreview.y1} x2="100%" y2={dragPreview.y1}
-                  stroke={(snap as HLineDrawing).color} strokeWidth="1.5" strokeDasharray="6,4" opacity="0.8" />
-              ) : (
-                <>
-                  <line x1={dragPreview.x1} y1={dragPreview.y1} x2={dragPreview.x2} y2={dragPreview.y2}
-                    stroke={(snap as TrendLineDrawing).color} strokeWidth="1.5" opacity="0.8" />
-                  <circle cx={dragPreview.x1} cy={dragPreview.y1} r="5" fill={(snap as TrendLineDrawing).color} opacity="0.8" />
-                  <circle cx={dragPreview.x2} cy={dragPreview.y2} r="5" fill={(snap as TrendLineDrawing).color} opacity="0.8" />
-                </>
-              )
+              if (snap.type === 'hline') {
+                return (
+                  <line x1="0" y1={dragPreview.y1} x2="100%" y2={dragPreview.y1}
+                    stroke={(snap as HLineDrawing).color} strokeWidth="1.5" strokeDasharray="6,4" opacity="0.8" />
+                )
+              }
+              if (snap.type === 'trendline') {
+                return (
+                  <>
+                    <line x1={dragPreview.x1} y1={dragPreview.y1} x2={dragPreview.x2} y2={dragPreview.y2}
+                      stroke={(snap as TrendLineDrawing).color} strokeWidth="1.5" opacity="0.8" />
+                    <circle cx={dragPreview.x1} cy={dragPreview.y1} r="5" fill={(snap as TrendLineDrawing).color} opacity="0.8" />
+                    <circle cx={dragPreview.x2} cy={dragPreview.y2} r="5" fill={(snap as TrendLineDrawing).color} opacity="0.8" />
+                  </>
+                )
+              }
+              if (snap.type === 'fibonacci') {
+                const fd = snap as FibonacciDrawing
+                const h = chartHandleRef.current
+                const { grabPoint } = dragging
+                let preP1price = fd.p1.price, preP2price = fd.p2.price
+                if (h) {
+                  if (grabPoint === 'p1') { preP1price = h.yToPrice(dragPreview.y1) ?? fd.p1.price }
+                  else if (grabPoint === 'p2') { preP2price = h.yToPrice(dragPreview.y2) ?? fd.p2.price }
+                  else { preP1price = h.yToPrice(dragPreview.y1) ?? fd.p1.price; preP2price = h.yToPrice(dragPreview.y2) ?? fd.p2.price }
+                }
+                return (
+                  <>
+                    {FIB_LEVELS.map(({ r, color }) => {
+                      const price = preP1price + r * (preP2price - preP1price)
+                      const y = h?.priceToY(price)
+                      if (y == null) return null
+                      return <line key={r} x1="0" y1={y} x2="100%" y2={y} stroke={color} strokeWidth="0.8" strokeDasharray="5,3" opacity="0.4" />
+                    })}
+                    <circle cx={dragPreview.x1} cy={dragPreview.y1} r="5" fill="#f59e0b" opacity="0.8" />
+                    <circle cx={dragPreview.x2} cy={dragPreview.y2} r="5" fill="#f59e0b" opacity="0.8" />
+                  </>
+                )
+              }
+              if (snap.type === 'rectangle') {
+                const rd = snap as RectangleDrawing
+                const rxx = Math.min(dragPreview.x1, dragPreview.x2)
+                const ryy = Math.min(dragPreview.y1, dragPreview.y2)
+                const rw = Math.abs(dragPreview.x2 - dragPreview.x1)
+                const rh = Math.abs(dragPreview.y2 - dragPreview.y1)
+                return (
+                  <rect x={rxx} y={ryy} width={rw} height={rh}
+                    fill={`${rd.color}20`} stroke={rd.color} strokeWidth="1.5" strokeDasharray="4,3" opacity="0.7" />
+                )
+              }
+              return null
             })()}
           </svg>
 

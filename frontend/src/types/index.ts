@@ -114,5 +114,21 @@ export interface TrendLineDrawing {
   color: string
 }
 
-export type UserDrawing = HLineDrawing | TrendLineDrawing
-export type DrawingTool = 'cursor' | 'hline' | 'trendline' | 'rectangle'
+export interface FibonacciDrawing {
+  id: string
+  type: 'fibonacci'
+  p1: { price: number; time: number }
+  p2: { price: number; time: number }
+  color: string
+}
+
+export interface RectangleDrawing {
+  id: string
+  type: 'rectangle'
+  p1: { price: number; time: number }
+  p2: { price: number; time: number }
+  color: string
+}
+
+export type UserDrawing = HLineDrawing | TrendLineDrawing | FibonacciDrawing | RectangleDrawing
+export type DrawingTool = 'cursor' | 'hline' | 'trendline' | 'fibonacci' | 'rectangle'
