@@ -55,9 +55,11 @@ def _get_tenant(slug: str) -> dict:
 
 async def _handle_message(tenant: dict, phone: str, text: str):
     try:
-        reply, resp = agent.process_message(tenant, phone, text)
+        reply, resp, event = agent.process_message(tenant, phone, text)
         await wa.send_message(tenant, phone, reply)
         logger.info(f"[{tenant['slug']}][{phone}] intent={resp.intent} action={resp.action}")
+        if event:
+            await events.publish(tenant["id"], event["type"], event["data"])
     except Exception as e:
         logger.exception(f"[{tenant['slug']}] Erro ao processar {phone}: {e}")
         await wa.send_message(tenant, phone,

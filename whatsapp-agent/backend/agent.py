@@ -8,7 +8,6 @@ import anthropic
 import config
 import database as db
 import calendar_service as cal
-import events
 from models import AgentResponse, Action
 
 _client = None
@@ -117,6 +116,10 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
 
 
 def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResponse]:
+    """
+    Processa uma mensagem e retorna (reply, agent_response).
+    A publicação de eventos SSE é feita pelo chamador (main.py) no contexto async.
+    """
     tenant_id = tenant["id"]
     db.save_message(tenant_id, phone, "user", text)
 
@@ -139,32 +142,20 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     parsed = _extract_json(raw)
     agent_resp = AgentResponse(**parsed)
 
-    reply = _execute_action(tenant_id, agent_resp, offered_slots, phone)
+    reply, event = _execute_action(tenant_id, agent_resp, offered_slots, phone)
     db.save_message(tenant_id, phone, "assistant", reply)
-
-    # Notifica painel em tempo real — nova mensagem recebida
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(events.publish(tenant_id, "new_message", {
-            "phone": phone, "intent": agent_resp.intent, "action": agent_resp.action
-        }))
-    except RuntimeError:
-        pass
-
-    return reply, agent_resp
+    return reply, agent_resp, event
 
 
-def _execute_action(tenant_id: int, resp: AgentResponse, offered_slots: list, phone: str = "") -> str:
-
-
-def _execute_action(tenant_id: int, resp: AgentResponse, offered_slots: list) -> str:
+def _execute_action(tenant_id: int, resp: AgentResponse,
+                    offered_slots: list, phone: str = "") -> tuple[str, dict | None]:
+    """Executa a ação e retorna (reply_text, evento_opcional)."""
     action = resp.action
     data = resp.data
     text = resp.response_text
 
     if action == Action.list_slots:
-        return text
+        return text, {"type": "new_message", "data": {"phone": phone, "intent": resp.intent}}
 
     if action == Action.create:
         idx = data.get("slot_index", 0)
@@ -174,16 +165,10 @@ def _execute_action(tenant_id: int, resp: AgentResponse, offered_slots: list) ->
             if not db.is_slot_taken(tenant_id, slot):
                 db.create_appointment(tenant_id, name, phone, slot)
                 formatted = cal.format_slots([slot])[0]
-                # Notifica painel — novo agendamento
-                import asyncio
-                try:
-                    asyncio.get_event_loop().create_task(events.publish(tenant_id, "new_appointment", {
-                        "patient_name": name, "slot": formatted, "phone": phone
-                    }))
-                except RuntimeError:
-                    pass
-                return text.replace("[slot]", formatted).replace("[hora]", formatted)
-        return "Desculpe, não consegui realizar o agendamento. Pode escolher outro horário? 😊"
+                reply = text.replace("[slot]", formatted).replace("[hora]", formatted)
+                event = {"type": "new_appointment", "data": {"patient_name": name, "slot": formatted, "phone": phone}}
+                return reply, event
+        return "Desculpe, não consegui realizar o agendamento. Pode escolher outro horário? 😊", None
 
     if action == Action.update:
         appt_id = data.get("appointment_id")
@@ -193,12 +178,13 @@ def _execute_action(tenant_id: int, resp: AgentResponse, offered_slots: list) ->
             if not db.is_slot_taken(tenant_id, slot):
                 db.update_appointment(tenant_id, appt_id, slot)
                 formatted = cal.format_slots([slot])[0]
-                return text.replace("[slot]", formatted).replace("[hora]", formatted)
-        return "Não consegui remarcar. Pode escolher outro horário? 😊"
+                reply = text.replace("[slot]", formatted).replace("[hora]", formatted)
+                return reply, {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}
+        return "Não consegui remarcar. Pode escolher outro horário? 😊", None
 
     if action == Action.confirm:
         appt_id = data.get("appointment_id")
         if appt_id:
             db.confirm_appointment(tenant_id, appt_id)
 
-    return text
+    return text, {"type": "new_message", "data": {"phone": phone, "intent": resp.intent}}
