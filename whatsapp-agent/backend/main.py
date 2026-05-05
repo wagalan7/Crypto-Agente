@@ -115,7 +115,9 @@ class TestMessage(BaseModel):
 async def test_message(slug: str, msg: TestMessage):
     """Simula uma mensagem sem WhatsApp real — para desenvolvimento."""
     tenant = _get_tenant(slug)
-    reply, resp = agent.process_message(tenant, msg.phone, msg.text)
+    reply, resp, event = agent.process_message(tenant, msg.phone, msg.text)
+    if event:
+        await events.publish(tenant["id"], event["type"], event["data"])
     return {
         "tenant": slug,
         "reply": reply,
