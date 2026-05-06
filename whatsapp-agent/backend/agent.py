@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import logging
 import re
 from datetime import datetime
 
@@ -8,7 +9,10 @@ import anthropic
 import config
 import database as db
 import calendar_service as cal
+import google_calendar_service as gcal
 from models import AgentResponse, Action
+
+logger = logging.getLogger(__name__)
 
 _client = None
 
@@ -40,7 +44,11 @@ PSICÓLOGA: {tenant['psychologist_name']}
 
 IMPORTANTE: use o nome da psicóloga EXATAMENTE como fornecido acima, sem adicionar títulos como "Dra." ou "Dr.".
 
-CAPACIDADES:
+{f"""PIX PARA PAGAMENTO:
+- Chave PIX: {tenant['pix_key']}
+- Titular: {tenant['pix_name']}
+- Quando perguntarem sobre pagamento ou PIX, forneça essas informações exatas.
+""" if tenant.get('pix_key') else ""}CAPACIDADES:
 1. Confirmar consultas (24h antes)
 2. Agendar novos pacientes
 3. Remarcar consultas
@@ -142,14 +150,15 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     parsed = _extract_json(raw)
     agent_resp = AgentResponse(**parsed)
 
-    reply, event = _execute_action(tenant_id, agent_resp, offered_slots, phone)
+    reply, event = _execute_action(tenant, agent_resp, offered_slots, phone)
     db.save_message(tenant_id, phone, "assistant", reply)
     return reply, agent_resp, event
 
 
-def _execute_action(tenant_id: int, resp: AgentResponse,
+def _execute_action(tenant: dict, resp: AgentResponse,
                     offered_slots: list, phone: str = "") -> tuple[str, dict | None]:
     """Executa a ação e retorna (reply_text, evento_opcional)."""
+    tenant_id = tenant["id"]
     action = resp.action
     data = resp.data
     text = resp.response_text
@@ -163,7 +172,14 @@ def _execute_action(tenant_id: int, resp: AgentResponse,
         if 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
             if not db.is_slot_taken(tenant_id, slot):
-                db.create_appointment(tenant_id, name, phone, slot)
+                appt_id = db.create_appointment(tenant_id, name, phone, slot)
+                # Sincronizar com Google Calendar
+                try:
+                    event_id = gcal.create_event(tenant, name, slot.isoformat(), tenant.get("session_minutes", 50))
+                    if event_id:
+                        db.set_appointment_google_event_id(appt_id, event_id)
+                except Exception as e:
+                    logger.warning(f"[gcal] create_event falhou: {e}")
                 formatted = cal.format_slots([slot])[0]
                 reply = text.replace("[slot]", formatted).replace("[hora]", formatted)
                 event = {"type": "new_appointment", "data": {"patient_name": name, "slot": formatted, "phone": phone}}
@@ -176,7 +192,17 @@ def _execute_action(tenant_id: int, resp: AgentResponse,
         if appt_id and 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
             if not db.is_slot_taken(tenant_id, slot):
+                # Buscar google_event_id antes de atualizar
+                appt = db.get_appointment_by_id(tenant_id, appt_id)
                 db.update_appointment(tenant_id, appt_id, slot)
+                # Sincronizar com Google Calendar
+                try:
+                    if appt and appt.get("google_event_id"):
+                        gcal.update_event(tenant, appt["google_event_id"],
+                                          appt.get("patient_name", "Paciente"),
+                                          slot.isoformat(), tenant.get("session_minutes", 50))
+                except Exception as e:
+                    logger.warning(f"[gcal] update_event falhou: {e}")
                 formatted = cal.format_slots([slot])[0]
                 reply = text.replace("[slot]", formatted).replace("[hora]", formatted)
                 return reply, {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}

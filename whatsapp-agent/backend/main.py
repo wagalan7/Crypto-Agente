@@ -225,6 +225,8 @@ class TenantUpdate(BaseModel):
     working_hours_start: Optional[int] = None
     working_hours_end: Optional[int] = None
     session_minutes: Optional[int] = None
+    pix_key: Optional[str] = None
+    pix_name: Optional[str] = None
 
 
 @app.patch("/admin/tenants/{slug}")

@@ -77,6 +77,8 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN stripe_subscription_id TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN mp_subscription_id TEXT DEFAULT ''",
             "ALTER TABLE appointments ADD COLUMN confirmation_sent INTEGER DEFAULT 0",
+            "ALTER TABLE tenants ADD COLUMN pix_key TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN pix_name TEXT DEFAULT ''",
         ]
         for sql in migrations:
             try:
@@ -152,6 +154,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "evolution_instance", "twilio_sid", "twilio_token", "twilio_from", "active",
         "dashboard_token", "setup_token", "google_refresh_token", "google_calendar_id",
         "email", "status", "stripe_customer_id", "stripe_subscription_id", "mp_subscription_id",
+        "pix_key", "pix_name",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
