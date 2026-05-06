@@ -95,11 +95,13 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     # ── Mensagem da própria psicóloga (fromMe) → pausar/retomar agente ──────────
     self_result = wa.extract_selfmessage_zapi(payload)
     if self_result:
-        phone, text = self_result
+        phone, text, msg_id = self_result
         cmd = text.strip().lower()
         if cmd in ("retomar", "!retomar", "/retomar"):
             db.resume_agent(tenant["id"], phone)
             logger.info(f"[{tenant['slug']}] Agente retomado para {phone} via WhatsApp")
+            # Deletar "retomar" do chat para não aparecer ao paciente
+            bg.add_task(wa.delete_message_zapi, tenant, phone, msg_id)
         else:
             db.pause_agent(tenant["id"], phone)
             logger.info(f"[{tenant['slug']}] Agente pausado para {phone} — resposta manual detectada")

@@ -83,21 +83,51 @@ async def _send_zapi(tenant: dict, phone: str, text: str) -> bool:
         return False
 
 
-def extract_selfmessage_zapi(payload: dict) -> tuple[str, str] | None:
+def extract_selfmessage_zapi(payload: dict) -> tuple[str, str, str] | None:
     """
     Detecta mensagens enviadas PELA psicóloga (fromMe: true) via Z-API.
-    Usado para pausar/retomar o agente de forma invisível ao paciente.
+    Retorna (phone, text, message_id) para poder deletar a mensagem.
+    Funciona com: ReceivedCallback, SentCallback, DeliveryCallback.
     """
     try:
         if not payload.get("fromMe"):
             return None
         phone = payload.get("phone", "").replace("+", "").replace("-", "")
         text = (payload.get("text") or {}).get("message", "")
+        # Z-API usa zaapId ou messageId para identificar mensagens
+        msg_id = (
+            payload.get("zaapId")
+            or payload.get("messageId")
+            or payload.get("id")
+            or ""
+        )
         if phone and text:
-            return phone, text
+            return phone, text, msg_id
     except Exception:
         pass
     return None
+
+
+async def delete_message_zapi(tenant: dict, phone: str, msg_id: str) -> bool:
+    """Deleta uma mensagem enviada via Z-API (para todos)."""
+    if not msg_id:
+        return False
+    instance_id = tenant.get("evolution_instance", "")
+    token = tenant.get("evolution_key", "")
+    client_token = tenant.get("evolution_url", "")
+
+    url = f"https://api.z-api.io/instances/{instance_id}/token/{token}/messages/{msg_id}"
+    headers = {"Content-Type": "application/json"}
+    if client_token:
+        headers["Client-Token"] = client_token
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.delete(url, headers=headers)
+            return r.status_code < 300
+    except Exception as e:
+        logger.warning(f"[{tenant['slug']}] Não foi possível deletar mensagem {msg_id}: {e}")
+        return False
 
 
 def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
