@@ -513,6 +513,13 @@ def dash_config(request: Request, body: TenantUpdate):
     return {"status": "updated"}
 
 
+@app.post("/admin/confirmacoes/disparar")
+async def disparar_confirmacoes():
+    """Dispara confirmações de amanhã agora mesmo (ignora restrição de horário)."""
+    results = await scheduler.run_confirmations_now()
+    return {"enviados": len([r for r in results if r["sent"]]), "detalhes": results}
+
+
 @app.post("/admin/tenants/{slug}/dashboard-token")
 def generate_dashboard_token(slug: str):
     """Gera ou regenera o token de acesso ao painel."""

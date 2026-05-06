@@ -56,10 +56,27 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_appointments_date    ON appointments(scheduled_at);
             CREATE INDEX IF NOT EXISTS idx_conversations_tenant ON conversations(tenant_id);
             CREATE INDEX IF NOT EXISTS idx_conversations_phone  ON conversations(phone);
+
+            CREATE TABLE IF NOT EXISTS agent_paused (
+                tenant_id INTEGER NOT NULL,
+                phone     TEXT NOT NULL,
+                paused_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (tenant_id, phone)
+            );
         """)
         # Migrações incrementais — seguro rodar múltiplas vezes
         migrations = [
             "ALTER TABLE tenants ADD COLUMN dashboard_token TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN setup_token TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN google_refresh_token TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN google_calendar_id TEXT DEFAULT 'primary'",
+            "ALTER TABLE appointments ADD COLUMN google_event_id TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN email TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN status TEXT DEFAULT 'active'",
+            "ALTER TABLE tenants ADD COLUMN stripe_customer_id TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN stripe_subscription_id TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN mp_subscription_id TEXT DEFAULT ''",
+            "ALTER TABLE appointments ADD COLUMN confirmation_sent INTEGER DEFAULT 0",
         ]
         for sql in migrations:
             try:
@@ -114,6 +131,14 @@ def get_tenant_by_token(token: str) -> dict | None:
     return dict(row) if row else None
 
 
+def get_tenant_by_setup_token(token: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM tenants WHERE setup_token = ? AND active = 1", (token,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def list_tenants() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM tenants WHERE active = 1 ORDER BY name").fetchall()
@@ -125,7 +150,8 @@ def update_tenant(slug: str, **fields) -> bool:
         "name", "psychologist_name", "working_hours_start", "working_hours_end",
         "session_minutes", "whatsapp_provider", "evolution_url", "evolution_key",
         "evolution_instance", "twilio_sid", "twilio_token", "twilio_from", "active",
-        "dashboard_token",
+        "dashboard_token", "setup_token", "google_refresh_token", "google_calendar_id",
+        "email", "status", "stripe_customer_id", "stripe_subscription_id", "mp_subscription_id",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -156,6 +182,39 @@ def save_message(tenant_id: int, phone: str, role: str, content: str):
             "INSERT INTO conversations (tenant_id, phone, role, content) VALUES (?, ?, ?, ?)",
             (tenant_id, phone, role, content),
         )
+
+
+def is_agent_paused(tenant_id: int, phone: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM agent_paused WHERE tenant_id = ? AND phone = ?",
+            (tenant_id, phone)
+        ).fetchone()
+    return row is not None
+
+
+def pause_agent(tenant_id: int, phone: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO agent_paused (tenant_id, phone) VALUES (?, ?)",
+            (tenant_id, phone)
+        )
+
+
+def resume_agent(tenant_id: int, phone: str):
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM agent_paused WHERE tenant_id = ? AND phone = ?",
+            (tenant_id, phone)
+        )
+
+
+def list_paused_phones(tenant_id: int) -> list[str]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT phone FROM agent_paused WHERE tenant_id = ?", (tenant_id,)
+        ).fetchall()
+    return [r["phone"] for r in rows]
 
 
 def clear_conversation(tenant_id: int, phone: str):
@@ -214,6 +273,45 @@ def confirm_appointment(tenant_id: int, appointment_id: int) -> bool:
             (appointment_id, tenant_id),
         )
         return cur.rowcount > 0
+
+
+def get_appointment_by_id(tenant_id: int, appointment_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE id = ? AND tenant_id = ?",
+            (appointment_id, tenant_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_appointment_google_event_id(appointment_id: int, event_id: str):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE appointments SET google_event_id = ? WHERE id = ?",
+            (event_id, appointment_id),
+        )
+
+
+def mark_confirmation_sent(appointment_id: int):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE appointments SET confirmation_sent = 1 WHERE id = ?",
+            (appointment_id,),
+        )
+
+
+def get_appointments_for_tomorrow(tenant_id: int) -> list[dict]:
+    """Retorna consultas de amanhã (dia todo) que ainda não receberam confirmação."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM appointments
+               WHERE tenant_id = ?
+                 AND date(scheduled_at) = date('now', '+1 day', 'localtime')
+                 AND confirmation_sent = 0
+               ORDER BY scheduled_at""",
+            (tenant_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def is_slot_taken(tenant_id: int, dt: datetime) -> bool:
