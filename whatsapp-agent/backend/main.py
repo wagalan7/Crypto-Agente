@@ -227,6 +227,9 @@ class TenantUpdate(BaseModel):
     session_minutes: Optional[int] = None
     pix_key: Optional[str] = None
     pix_name: Optional[str] = None
+    working_days: Optional[str] = None
+    blocked_hours: Optional[str] = None
+    confirmation_hour: Optional[int] = None
 
 
 @app.patch("/admin/tenants/{slug}")

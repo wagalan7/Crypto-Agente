@@ -2,7 +2,24 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import database as db
 
-WORKING_DAYS = [0, 1, 2, 3, 4]  # Seg–Sex
+_DEFAULT_WORKING_DAYS = [0, 1, 2, 3, 4]   # Seg–Sex
+_DEFAULT_BLOCKED_HOURS = [12, 13, 14]      # Almoço
+
+
+def _working_days(tenant: dict) -> list[int]:
+    raw = tenant.get("working_days", "") or ""
+    try:
+        return [int(d) for d in raw.split(",") if d.strip().isdigit()]
+    except Exception:
+        return _DEFAULT_WORKING_DAYS
+
+
+def _blocked_hours(tenant: dict) -> list[int]:
+    raw = tenant.get("blocked_hours", "") or ""
+    try:
+        return [int(h) for h in raw.split(",") if h.strip().isdigit()]
+    except Exception:
+        return _DEFAULT_BLOCKED_HOURS
 
 
 def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> list[datetime]:
@@ -10,6 +27,8 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
     start_h = tenant["working_hours_start"]
     end_h = tenant["working_hours_end"]
     duration = tenant["session_minutes"]
+    working_days = _working_days(tenant)
+    blocked_hours = _blocked_hours(tenant)
 
     now = datetime.now()
     check = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -21,8 +40,9 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
     slots = []
     while check <= end_date and len(slots) < limit:
         if (
-            check.weekday() in WORKING_DAYS
+            check.weekday() in working_days
             and start_h <= check.hour < end_h
+            and check.hour not in blocked_hours
             and check.isoformat()[:16] not in booked_times
         ):
             slots.append(check)

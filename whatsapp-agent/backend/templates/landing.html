@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Agente de Atendimento WhatsApp — Para Psicólogas</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C', dark: '#1a0a12' } } } }</script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+    * { font-family: 'Inter', sans-serif; }
+    .gradient-hero { background: linear-gradient(135deg, #1a0a12 0%, #2d0a1f 50%, #1a0a12 100%); }
+    .gradient-brand { background: linear-gradient(135deg, #E91E8C, #c2185b); }
+    .card-glow { box-shadow: 0 0 40px rgba(233,30,140,0.15); }
+    .chat-bubble-in  { border-radius: 4px 18px 18px 18px; }
+    .chat-bubble-out { border-radius: 18px 4px 18px 18px; }
+    @keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-8px)} }
+    .float { animation: float 3s ease-in-out infinite; }
+    @keyframes fadein { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
+    .fadein { animation: fadein .6s ease both; }
+  </style>
+</head>
+<body class="bg-white text-gray-900 overflow-x-hidden">
+
+<!-- ── NAV ── -->
+<nav class="sticky top-0 z-50 bg-white/90 backdrop-blur border-b border-gray-100 px-4 py-3">
+  <div class="max-w-5xl mx-auto flex items-center justify-between">
+    <div class="flex items-center gap-2">
+      <span class="text-2xl">🤖</span>
+      <span class="font-bold text-gray-900 text-sm md:text-base">Agente de Atendimento</span>
+    </div>
+    <a href="/onboarding"
+      class="gradient-brand text-white text-sm font-semibold px-4 py-2 rounded-xl hover:opacity-90 transition shadow-sm">
+      Começar agora →
+    </a>
+  </div>
+</nav>
+
+<!-- ── HERO ── -->
+<section class="gradient-hero text-white px-4 py-20 md:py-32">
+  <div class="max-w-5xl mx-auto grid md:grid-cols-2 gap-12 items-center">
+
+    <div class="fadein">
+      <div class="inline-flex items-center gap-2 bg-white/10 border border-white/20 rounded-full px-4 py-1.5 text-sm mb-6">
+        <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
+        Powered by Claude AI · Anthropic
+      </div>
+      <h1 class="text-4xl md:text-5xl font-black leading-tight mb-5">
+        Seu consultório<br/>
+        atendendo no<br/>
+        <span class="text-brand">WhatsApp 24h</span>
+      </h1>
+      <p class="text-gray-300 text-lg mb-8 leading-relaxed">
+        Um agente inteligente que agenda, confirma e remarca consultas automaticamente —
+        enquanto você foca no que realmente importa: seus pacientes.
+      </p>
+      <div class="flex flex-col sm:flex-row gap-3">
+        <a href="/onboarding"
+          class="gradient-brand text-white font-bold px-8 py-4 rounded-2xl text-base hover:opacity-90 transition text-center shadow-lg">
+          Quero meu agente →
+        </a>
+        <a href="#como-funciona"
+          class="border border-white/30 text-white font-medium px-8 py-4 rounded-2xl text-base hover:bg-white/10 transition text-center">
+          Ver como funciona
+        </a>
+      </div>
+      <p class="text-gray-400 text-sm mt-4">✓ Configuração em 2 minutos · ✓ Sem contrato</p>
+    </div>
+
+    <!-- Chat mockup -->
+    <div class="float hidden md:block">
+      <div class="bg-gray-900 rounded-3xl p-4 card-glow max-w-sm mx-auto">
+        <div class="bg-brand rounded-2xl px-4 py-2 flex items-center gap-3 mb-4">
+          <div class="w-8 h-8 bg-white/20 rounded-full flex items-center justify-center text-sm">🤖</div>
+          <div>
+            <p class="text-white font-semibold text-sm">Consultório Psicologia</p>
+            <p class="text-pink-200 text-xs">● Online agora</p>
+          </div>
+        </div>
+        <div class="space-y-3 px-2">
+          <div class="flex justify-start">
+            <div class="chat-bubble-in bg-gray-700 text-gray-100 text-sm px-4 py-2.5 max-w-[80%]">
+              Oi, queria marcar uma consulta 😊
+            </div>
+          </div>
+          <div class="flex justify-end">
+            <div class="chat-bubble-out gradient-brand text-white text-sm px-4 py-2.5 max-w-[80%]">
+              Olá! Seja bem-vinda! 😊 Qual é o seu nome completo?
+            </div>
+          </div>
+          <div class="flex justify-start">
+            <div class="chat-bubble-in bg-gray-700 text-gray-100 text-sm px-4 py-2.5 max-w-[80%]">
+              Maria Silva
+            </div>
+          </div>
+          <div class="flex justify-end">
+            <div class="chat-bubble-out gradient-brand text-white text-sm px-4 py-2.5 max-w-[80%]">
+              Ótimo, Maria! Tenho estes horários disponíveis:<br/>
+              - Ter, 13/05 às 10:00<br/>
+              - Qua, 14/05 às 14:00<br/>
+              - Sex, 16/05 às 09:00<br/><br/>
+              Qual prefere? 🗓️
+            </div>
+          </div>
+          <div class="flex justify-start">
+            <div class="chat-bubble-in bg-gray-700 text-gray-100 text-sm px-4 py-2.5 max-w-[80%]">
+              Quarta às 14h!
+            </div>
+          </div>
+          <div class="flex justify-end">
+            <div class="chat-bubble-out gradient-brand text-white text-sm px-4 py-2.5 max-w-[80%]">
+              ✅ Agendado! Qua, 14/05 às 14:00.<br/>Até lá, Maria! 😊
+            </div>
+          </div>
+        </div>
+        <p class="text-center text-gray-500 text-xs mt-4">Tudo isso acontece automaticamente</p>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ── NÚMEROS ── -->
+<section class="bg-gray-50 border-y border-gray-100 py-12 px-4">
+  <div class="max-w-4xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-6 text-center">
+    <div>
+      <p class="text-3xl font-black text-brand">24h</p>
+      <p class="text-gray-500 text-sm mt-1">Disponível para pacientes</p>
+    </div>
+    <div>
+      <p class="text-3xl font-black text-brand">&lt; 2min</p>
+      <p class="text-gray-500 text-sm mt-1">Para configurar</p>
+    </div>
+    <div>
+      <p class="text-3xl font-black text-brand">0</p>
+      <p class="text-gray-500 text-sm mt-1">Agendamentos perdidos</p>
+    </div>
+    <div>
+      <p class="text-3xl font-black text-brand">100%</p>
+      <p class="text-gray-500 text-sm mt-1">Automático</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── COMO FUNCIONA ── -->
+<section id="como-funciona" class="py-20 px-4">
+  <div class="max-w-4xl mx-auto">
+    <div class="text-center mb-14">
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Como funciona?</h2>
+      <p class="text-gray-500 text-lg">Simples assim — sem técnica, sem complicação</p>
+    </div>
+    <div class="grid md:grid-cols-3 gap-8">
+      <div class="text-center">
+        <div class="w-16 h-16 gradient-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4 shadow-lg">⚡</div>
+        <div class="text-brand font-bold text-sm mb-2">PASSO 1</div>
+        <h3 class="font-bold text-gray-900 text-lg mb-2">Configure em 2 minutos</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Preencha o nome do consultório, seu nome e os horários de atendimento. Pronto.</p>
+      </div>
+      <div class="text-center">
+        <div class="w-16 h-16 gradient-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4 shadow-lg">📱</div>
+        <div class="text-brand font-bold text-sm mb-2">PASSO 2</div>
+        <h3 class="font-bold text-gray-900 text-lg mb-2">Conecte seu WhatsApp</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Integre com seu número via Z-API em poucos cliques. Seu número, sua identidade.</p>
+      </div>
+      <div class="text-center">
+        <div class="w-16 h-16 gradient-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4 shadow-lg">🎉</div>
+        <div class="text-brand font-bold text-sm mb-2">PASSO 3</div>
+        <h3 class="font-bold text-gray-900 text-lg mb-2">Relaxe e atenda</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">O agente cuida de tudo: agendamentos, confirmações e remarcações — 24 horas por dia.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── BENEFÍCIOS ── -->
+<section class="bg-gray-50 py-20 px-4">
+  <div class="max-w-4xl mx-auto">
+    <div class="text-center mb-14">
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Tudo que você precisa</h2>
+      <p class="text-gray-500 text-lg">Uma ferramenta completa para sua gestão de agenda</p>
+    </div>
+    <div class="grid md:grid-cols-2 gap-5">
+
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
+        <span class="text-3xl mb-3 block">🤖</span>
+        <h3 class="font-bold text-gray-900 mb-2">Agente inteligente com IA</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Conversa natural com pacientes, entende o contexto e toma as decisões certas — sem respostas robóticas.</p>
+      </div>
+
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
+        <span class="text-3xl mb-3 block">📅</span>
+        <h3 class="font-bold text-gray-900 mb-2">Agenda integrada ao Google</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Cada agendamento aparece automaticamente no seu Google Calendar. Sem copiar, sem duplicar.</p>
+      </div>
+
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
+        <span class="text-3xl mb-3 block">✅</span>
+        <h3 class="font-bold text-gray-900 mb-2">Confirmação automática 24h antes</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">O agente contata os pacientes no dia anterior e registra a confirmação automaticamente no painel.</p>
+      </div>
+
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
+        <span class="text-3xl mb-3 block">📊</span>
+        <h3 class="font-bold text-gray-900 mb-2">Painel de controle completo</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Visualize agenda, conversas e histórico de pacientes em tempo real — no celular ou computador.</p>
+      </div>
+
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
+        <span class="text-3xl mb-3 block">🔄</span>
+        <h3 class="font-bold text-gray-900 mb-2">Remarcação sem dor de cabeça</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Paciente pediu para remarcar? O agente oferece novos horários disponíveis e atualiza a agenda sozinho.</p>
+      </div>
+
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
+        <span class="text-3xl mb-3 block">🔒</span>
+        <h3 class="font-bold text-gray-900 mb-2">Seguro e privado</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Cada consultório tem acesso exclusivo aos seus dados. Nenhuma informação é compartilhada entre clientes.</p>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ── PREÇO ── -->
+<section class="py-20 px-4">
+  <div class="max-w-md mx-auto text-center">
+    <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Investimento simples</h2>
+    <p class="text-gray-500 mb-10">Sem contrato. Cancele quando quiser.</p>
+
+    <div class="bg-white rounded-3xl border-2 border-brand p-8 shadow-xl card-glow">
+      <div class="gradient-brand text-white text-xs font-bold px-3 py-1 rounded-full inline-block mb-5">
+        PLANO COMPLETO
+      </div>
+      <div class="mb-2">
+        <span class="text-gray-400 text-base line-through">R$ 400/mês</span>
+      </div>
+      <div class="flex items-end justify-center gap-1 mb-1">
+        <span class="text-gray-500 text-lg font-medium">R$</span>
+        <span class="text-6xl font-black text-gray-900">200</span>
+        <span class="text-gray-500 text-lg font-medium mb-2">/mês</span>
+      </div>
+      <p class="text-gray-400 text-sm mb-8">Oferta de lançamento</p>
+
+      <ul class="text-left space-y-3 mb-8">
+        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Agente WhatsApp com IA ilimitado</li>
+        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Painel de controle completo</li>
+        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Integração Google Calendar</li>
+        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Confirmações automáticas 24h antes</li>
+        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Suporte via WhatsApp</li>
+        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Configuração assistida</li>
+      </ul>
+
+      <a href="/onboarding"
+        class="block w-full gradient-brand text-white font-bold py-4 rounded-2xl text-base hover:opacity-90 transition shadow-lg">
+        Começar agora →
+      </a>
+      <p class="text-gray-400 text-xs mt-3">Configuração em menos de 2 minutos</p>
+    </div>
+  </div>
+</section>
+
+<!-- ── FAQ ── -->
+<section class="bg-gray-50 py-20 px-4">
+  <div class="max-w-2xl mx-auto">
+    <h2 class="text-3xl font-black text-gray-900 text-center mb-12">Perguntas frequentes</h2>
+    <div class="space-y-4" id="faq">
+
+      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">Preciso saber de tecnologia para configurar?</span>
+          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
+        </button>
+        <div class="faq-answer hidden px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">Não. A configuração é feita em um formulário simples — nome do consultório, seu nome e horários de atendimento. Em menos de 2 minutos está pronto.</p>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">O agente usa o meu número de WhatsApp?</span>
+          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
+        </button>
+        <div class="faq-answer hidden px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">Sim! Você conecta o seu próprio número via Z-API (plataforma brasileira de integração WhatsApp). Os pacientes conversam diretamente com o seu número, como se fosse você.</p>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">O agente responde a qualquer hora, mesmo de madrugada?</span>
+          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
+        </button>
+        <div class="faq-answer hidden px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">Sim, o agente está sempre disponível para receber mensagens. Para agendamentos, ele só oferece horários dentro do seu horário de funcionamento configurado.</p>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">E se o paciente perguntar algo clínico?</span>
+          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
+        </button>
+        <div class="faq-answer hidden px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">O agente é treinado para nunca dar orientações clínicas ou diagnósticos. Em situações sensíveis, ele encaminha para você de forma acolhedora.</p>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">Posso cancelar a qualquer momento?</span>
+          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
+        </button>
+        <div class="faq-answer hidden px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">Sim. Não há contrato de fidelidade. Você pode cancelar quando quiser, sem multa.</p>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ── CTA FINAL ── -->
+<section class="gradient-hero text-white py-20 px-4 text-center">
+  <div class="max-w-2xl mx-auto">
+    <div class="text-5xl mb-6">🤖</div>
+    <h2 class="text-3xl md:text-4xl font-black mb-4">Pronta para ter mais tempo<br/>para seus pacientes?</h2>
+    <p class="text-gray-300 text-lg mb-8">Configure seu agente agora e comece a atender no automático ainda hoje.</p>
+    <a href="/onboarding"
+      class="inline-block gradient-brand text-white font-bold px-10 py-4 rounded-2xl text-lg hover:opacity-90 transition shadow-xl">
+      Quero meu agente → R$ 200/mês
+    </a>
+    <p class="text-gray-400 text-sm mt-4">Sem contrato · Suporte incluso · Configuração em 2 minutos</p>
+  </div>
+</section>
+
+<!-- ── FOOTER ── -->
+<footer class="bg-gray-900 text-gray-400 py-8 px-4 text-center text-sm">
+  <p>© 2025 Agente de Atendimento WhatsApp · Powered by Claude AI</p>
+</footer>
+
+<script>
+function toggleFaq(btn) {
+  const answer = btn.nextElementSibling;
+  const icon = btn.querySelector("span:last-child");
+  const isOpen = !answer.classList.contains("hidden");
+  // Fechar todos
+  document.querySelectorAll(".faq-answer").forEach(a => a.classList.add("hidden"));
+  document.querySelectorAll("#faq button span:last-child").forEach(s => s.textContent = "+");
+  // Abrir o clicado se estava fechado
+  if (!isOpen) {
+    answer.classList.remove("hidden");
+    icon.textContent = "−";
+  }
+}
+</script>
+</body>
+</html>

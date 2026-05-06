@@ -79,6 +79,9 @@ def init_db():
             "ALTER TABLE appointments ADD COLUMN confirmation_sent INTEGER DEFAULT 0",
             "ALTER TABLE tenants ADD COLUMN pix_key TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN pix_name TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN working_days TEXT DEFAULT '0,1,2,3,4'",
+            "ALTER TABLE tenants ADD COLUMN blocked_hours TEXT DEFAULT '12,13,14'",
+            "ALTER TABLE tenants ADD COLUMN confirmation_hour INTEGER DEFAULT 17",
         ]
         for sql in migrations:
             try:
@@ -155,6 +158,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "dashboard_token", "setup_token", "google_refresh_token", "google_calendar_id",
         "email", "status", "stripe_customer_id", "stripe_subscription_id", "mp_subscription_id",
         "pix_key", "pix_name",
+        "working_days", "blocked_hours", "confirmation_hour",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:

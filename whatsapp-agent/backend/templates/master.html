@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Painel Master — Agente Atendimento</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C' } } } }</script>
+</head>
+<body class="bg-gray-950 min-h-screen text-white">
+
+<header class="bg-gray-900 border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+  <div>
+    <h1 class="text-lg font-bold text-white">🤖 Painel Master</h1>
+    <p class="text-xs text-gray-400">Todos os consultórios ativos</p>
+  </div>
+  <a href="/onboarding" target="_blank"
+    class="bg-brand text-white text-sm px-4 py-2 rounded-xl font-medium hover:opacity-90 transition">
+    + Novo consultório
+  </a>
+</header>
+
+<div class="max-w-4xl mx-auto px-4 py-8">
+
+  <!-- Stats -->
+  <div id="stats" class="grid grid-cols-2 md:grid-cols-3 gap-4 mb-8">
+    <div class="bg-gray-900 rounded-2xl p-5 border border-gray-800">
+      <p class="text-gray-400 text-xs mb-1">Consultórios ativos</p>
+      <p id="stat-total" class="text-3xl font-bold text-white">—</p>
+    </div>
+    <div class="bg-gray-900 rounded-2xl p-5 border border-gray-800">
+      <p class="text-gray-400 text-xs mb-1">Com WhatsApp</p>
+      <p id="stat-connected" class="text-3xl font-bold text-green-400">—</p>
+    </div>
+    <div class="bg-gray-900 rounded-2xl p-5 border border-gray-800 col-span-2 md:col-span-1">
+      <p class="text-gray-400 text-xs mb-1">Aguardando config</p>
+      <p id="stat-pending" class="text-3xl font-bold text-yellow-400">—</p>
+    </div>
+  </div>
+
+  <!-- Lista -->
+  <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-4">Consultórios</h2>
+  <div id="tenants-list" class="space-y-3">
+    <div class="text-gray-500 text-sm">Carregando...</div>
+  </div>
+
+</div>
+
+<script>
+const MASTER_KEY = "{{ master_key }}";
+
+async function load() {
+  const r = await fetch(`/master/tenants?key=${MASTER_KEY}`);
+  const data = await r.json();
+  const tenants = data.tenants || [];
+
+  document.getElementById("stat-total").textContent = tenants.length;
+  const connected = tenants.filter(t => t.whatsapp_provider !== "mock").length;
+  document.getElementById("stat-connected").textContent = connected;
+  document.getElementById("stat-pending").textContent = tenants.length - connected;
+
+  const el = document.getElementById("tenants-list");
+  if (!tenants.length) {
+    el.innerHTML = '<div class="text-gray-500 text-sm text-center py-10">Nenhum consultório cadastrado ainda.</div>';
+    return;
+  }
+
+  el.innerHTML = tenants.map(t => {
+    const connected = t.whatsapp_provider !== "mock";
+    const dashUrl = t.dashboard_url || "#";
+    return `
+    <div class="bg-gray-900 rounded-2xl border border-gray-800 p-5">
+      <div class="flex items-start justify-between gap-4">
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 mb-1">
+            <p class="font-semibold text-white truncate">${t.name}</p>
+            <span class="flex-shrink-0 text-xs px-2 py-0.5 rounded-full font-medium ${connected ? 'bg-green-900 text-green-300' : 'bg-yellow-900 text-yellow-300'}">
+              ${connected ? '● WhatsApp' : '○ Sem WhatsApp'}
+            </span>
+          </div>
+          <p class="text-sm text-gray-400">${t.psychologist_name} · Seg–Sex ${String(t.working_hours_start).padStart(2,'0')}:00–${String(t.working_hours_end).padStart(2,'0')}:00 · ${t.session_minutes}min</p>
+          <p class="text-xs text-gray-600 mt-1">slug: ${t.slug}</p>
+        </div>
+        <div class="flex gap-2 flex-shrink-0">
+          ${dashUrl !== '#' ? `<a href="${dashUrl}" target="_blank" class="text-xs bg-brand text-white px-3 py-1.5 rounded-lg font-medium hover:opacity-90">Painel</a>` : ''}
+          <button onclick="copyOnboarding('${t.slug}')" class="text-xs bg-gray-700 text-gray-200 px-3 py-1.5 rounded-lg font-medium hover:bg-gray-600">Link setup</button>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function copyOnboarding(slug) {
+  const r = await fetch(`/master/onboarding-link/${slug}?key=${MASTER_KEY}`);
+  const data = await r.json();
+  await navigator.clipboard.writeText(data.url);
+  alert("Link de configuração copiado!\n\n" + data.url);
+}
+
+load();
+</script>
+</body>
+</html>

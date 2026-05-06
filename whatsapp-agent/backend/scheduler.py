@@ -37,14 +37,12 @@ def _confirmation_message(tenant: dict, appt: dict) -> str:
 
 async def _run_confirmations():
     now = datetime.now()
-
-    # Só envia a partir das 17h
-    if now.hour < _SEND_AFTER_HOUR:
-        logger.debug(f"Scheduler: ainda não são {_SEND_AFTER_HOUR}h, aguardando.")
-        return
-
     tenants = db.list_tenants()
     for tenant in tenants:
+        # Horário de disparo configurável por tenant (padrão: 17h)
+        send_after = int(tenant.get("confirmation_hour") or _SEND_AFTER_HOUR)
+        if now.hour < send_after:
+            continue
         appts = db.get_appointments_for_tomorrow(tenant["id"])
         if not appts:
             continue
