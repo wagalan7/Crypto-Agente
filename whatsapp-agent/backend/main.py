@@ -7,15 +7,29 @@ from datetime import datetime
 from pathlib import Path
 
 # ── Cache de envios do agente (evita auto-pause por eco do Z-API) ──────────────
-_agent_sent_at: dict[str, float] = {}  # phone -> timestamp do último envio
-_ECHO_WINDOW_SECS = 15  # segundos para considerar como eco
+# phone -> (primeiros 80 chars do texto enviado, timestamp)
+_agent_sent_cache: dict[str, tuple[str, float]] = {}
 
-def _mark_agent_sent(phone: str):
-    _agent_sent_at[phone] = time.time()
+def _mark_agent_sent(phone: str, text: str = ""):
+    _agent_sent_cache[phone] = (text[:80], time.time())
 
-def _is_agent_echo(phone: str) -> bool:
-    ts = _agent_sent_at.get(phone)
-    return ts is not None and (time.time() - ts) < _ECHO_WINDOW_SECS
+def _is_agent_echo(phone: str, incoming_text: str = "") -> bool:
+    entry = _agent_sent_cache.get(phone)
+    if not entry:
+        return False
+    cached_text, ts = entry
+    elapsed = time.time() - ts
+    if elapsed > 120:  # mais de 2 minutos: não é eco
+        return False
+    # Dentro de 30s: considerar eco (cobre delays do Z-API)
+    if elapsed <= 30:
+        return True
+    # Entre 30-120s: só considera eco se o texto bate (parcialmente)
+    if cached_text and incoming_text:
+        t = incoming_text[:80]
+        if cached_text[:40] in t or t[:40] in cached_text:
+            return True
+    return False
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -92,7 +106,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
     try:
         reply, resp, event = agent.process_message(tenant, phone, text)
         await wa.send_message(tenant, phone, reply)
-        _mark_agent_sent(phone)  # marca para ignorar eco do Z-API nos próximos 15s
+        _mark_agent_sent(phone, reply)  # marca para ignorar eco do Z-API
         logger.info(f"[{tenant['slug']}][{phone}] intent={resp.intent} action={resp.action}")
         if event:
             await events.publish(tenant["id"], event["type"], event["data"])
@@ -130,8 +144,8 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
         phone, text, msg_id = self_result
 
         # Ignorar se for eco do próprio agente (Z-API reflete mensagens enviadas via API)
-        if _is_agent_echo(phone):
-            logger.debug(f"[{tenant['slug']}] Eco do agente ignorado para {phone}")
+        if _is_agent_echo(phone, text):
+            logger.info(f"[{tenant['slug']}] Eco do agente ignorado para {phone}: {text[:40]}")
             return {"status": "agent_echo"}
 
         cmd = text.strip().lower()
