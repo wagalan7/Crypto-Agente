@@ -458,6 +458,43 @@ def dash_paused(request: Request):
     return {"paused": db.list_paused_phones(tenant["id"])}
 
 
+# ── Painel Mobile de Controle ──────────────────────────────────────────────────
+
+@app.get("/controle/{token}", response_class=HTMLResponse)
+def controle_mobile(token: str, request: Request):
+    """Painel leve para pausar/retomar o agente direto do celular."""
+    tenant = _get_tenant_by_token(token)
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT phone, patient_name FROM appointments
+               WHERE tenant_id = ? ORDER BY patient_name""",
+            (tenant["id"],)
+        ).fetchall()
+    patients = [dict(r) for r in rows]
+    paused = set(db.list_paused_phones(tenant["id"]))
+    return templates.TemplateResponse("controle.html", {
+        "request": request,
+        "tenant": tenant,
+        "token": token,
+        "patients": patients,
+        "paused": paused,
+    })
+
+
+@app.post("/controle/{token}/pausar/{phone}", response_class=HTMLResponse)
+def controle_pausar(token: str, phone: str):
+    tenant = _get_tenant_by_token(token)
+    db.pause_agent(tenant["id"], phone)
+    return RedirectResponse(f"/controle/{token}", status_code=303)
+
+
+@app.post("/controle/{token}/retomar/{phone}", response_class=HTMLResponse)
+def controle_retomar(token: str, phone: str):
+    tenant = _get_tenant_by_token(token)
+    db.resume_agent(tenant["id"], phone)
+    return RedirectResponse(f"/controle/{token}", status_code=303)
+
+
 @app.get("/dashboard/api/conversation/{phone}")
 def dash_conversation(phone: str, request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
@@ -482,10 +519,11 @@ def generate_dashboard_token(slug: str):
     _get_tenant(slug)
     token = secrets.token_urlsafe(24)
     db.update_tenant(slug, dashboard_token=token)
-    base = "https://agente-atendimento-production.up.railway.app"
+    base = config.BASE_URL
     return {
         "token": token,
-        "url": f"{base}/dashboard/{slug}?token={token}",
+        "dashboard_url": f"{base}/dashboard/{slug}?token={token}",
+        "controle_url": f"{base}/controle/{token}",
     }
 
 
@@ -546,6 +584,7 @@ def onboarding_info(setup_token: str):
         "name": tenant["name"],
         "slug": slug,
         "dashboard_url": f"{base}/dashboard/{slug}?token={dash_token}" if dash_token else "",
+        "controle_url": f"{base}/controle/{dash_token}" if dash_token else "",
         "webhook_url": f"{base}/webhook/{slug}/zapi",
     }
 
