@@ -1,35 +1,9 @@
 from __future__ import annotations
 import logging
 import secrets
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-
-# ── Cache de envios do agente (evita auto-pause por eco do Z-API) ──────────────
-# phone -> (primeiros 80 chars do texto enviado, timestamp)
-_agent_sent_cache: dict[str, tuple[str, float]] = {}
-
-def _mark_agent_sent(phone: str, text: str = ""):
-    _agent_sent_cache[phone] = (text[:80], time.time())
-
-def _is_agent_echo(phone: str, incoming_text: str = "") -> bool:
-    entry = _agent_sent_cache.get(phone)
-    if not entry:
-        return False
-    cached_text, ts = entry
-    elapsed = time.time() - ts
-    if elapsed > 120:  # mais de 2 minutos: não é eco
-        return False
-    # Dentro de 30s: considerar eco (cobre delays do Z-API)
-    if elapsed <= 30:
-        return True
-    # Entre 30-120s: só considera eco se o texto bate (parcialmente)
-    if cached_text and incoming_text:
-        t = incoming_text[:80]
-        if cached_text[:40] in t or t[:40] in cached_text:
-            return True
-    return False
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -106,7 +80,6 @@ async def _handle_message(tenant: dict, phone: str, text: str):
     try:
         reply, resp, event = agent.process_message(tenant, phone, text)
         await wa.send_message(tenant, phone, reply)
-        _mark_agent_sent(phone, reply)  # marca para ignorar eco do Z-API
         logger.info(f"[{tenant['slug']}][{phone}] intent={resp.intent} action={resp.action}")
         if event:
             await events.publish(tenant["id"], event["type"], event["data"])
@@ -134,31 +107,9 @@ async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
 async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
     payload = await request.json()
-
-    # ── LOG COMPLETO para debug (remover depois) ─────────────────────────────────
-    logger.info(f"[{slug}] ZAPI RAW payload: fromMe={payload.get('fromMe')} type={payload.get('type')} phone={payload.get('phone')} text={payload.get('text')} keys={list(payload.keys())}")
-
-    # ── Mensagem da própria psicóloga (fromMe) → pausar/retomar agente ──────────
-    self_result = wa.extract_selfmessage_zapi(payload)
-    if self_result:
-        phone, text, msg_id = self_result
-
-        # Ignorar se for eco do próprio agente (Z-API reflete mensagens enviadas via API)
-        if _is_agent_echo(phone, text):
-            logger.info(f"[{tenant['slug']}] Eco do agente ignorado para {phone}: {text[:40]}")
-            return {"status": "agent_echo"}
-
-        cmd = text.strip().lower()
-        if cmd in ("retomar", "!retomar", "/retomar"):
-            db.resume_agent(tenant["id"], phone)
-            logger.info(f"[{tenant['slug']}] Agente retomado para {phone} via WhatsApp")
-            bg.add_task(wa.delete_message_zapi, tenant, phone, msg_id)
-        else:
-            db.pause_agent(tenant["id"], phone)
-            logger.info(f"[{tenant['slug']}] Agente pausado para {phone} — resposta manual da Bruna")
-        return {"status": "self_message"}
-
-    # ── Mensagem do paciente → processar normalmente ─────────────────────────────
+    # Ignorar mensagens enviadas pelo próprio número (ecos, status, etc.)
+    if payload.get("fromMe"):
+        return {"status": "ignored"}
     result = wa.extract_message_zapi(payload)
     if not result:
         return {"status": "ignored"}
@@ -168,37 +119,9 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
 
 
 @app.post("/webhook/{slug}/zapi/sent")
-async def webhook_zapi_sent(slug: str, request: Request, bg: BackgroundTasks):
-    """
-    Endpoint exclusivo para o webhook 'Ao enviar' do Z-API.
-    Qualquer mensagem aqui é enviada pela psicóloga — pausar o agente.
-    """
-    try:
-        tenant = _get_tenant(slug)
-        payload = await request.json()
-        logger.info(f"[{slug}] ZAPI SENT payload: {payload}")
-
-        phone = payload.get("phone", "").replace("+", "").replace("-", "")
-        text = (payload.get("text") or {}).get("message", "") or ""
-        msg_id = payload.get("zaapId") or payload.get("messageId") or payload.get("id") or ""
-
-        if not phone:
-            return {"status": "ignored"}
-
-        cmd = text.strip().lower()
-        if cmd in ("retomar", "!retomar", "/retomar"):
-            db.resume_agent(tenant["id"], phone)
-            logger.info(f"[{slug}] Agente retomado para {phone} via /sent")
-            if msg_id:
-                bg.add_task(wa.delete_message_zapi, tenant, phone, msg_id)
-        else:
-            db.pause_agent(tenant["id"], phone)
-            logger.info(f"[{slug}] Agente pausado para {phone} via /sent — mensagem manual: {text[:50]}")
-
-        return {"status": "self_message"}
-    except Exception as e:
-        logger.error(f"[{slug}] Erro em webhook_zapi_sent: {e}")
-        return {"status": "error"}
+async def webhook_zapi_sent(slug: str, request: Request):
+    """Endpoint do 'Ao enviar' do Z-API — ignorado (pausa feita pelo Painel Mobile)."""
+    return {"status": "ignored"}
 
 
 @app.post("/webhook/{slug}/twilio")
