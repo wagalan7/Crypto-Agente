@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, StreamingResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from typing import Optional
@@ -20,6 +20,9 @@ import calendar_service as cal
 import whatsapp_service as wa
 import scheduler
 import tenant_service as ts
+import google_calendar_service as gcal
+import stripe_service as stripe_svc
+import mp_service as mp_svc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -54,6 +57,10 @@ def _get_tenant(slug: str) -> dict:
 
 
 async def _handle_message(tenant: dict, phone: str, text: str):
+    # Verificar se o agente está pausado para este contato
+    if db.is_agent_paused(tenant["id"], phone):
+        logger.info(f"[{tenant['slug']}][{phone}] Agente pausado — mensagem ignorada")
+        return
     try:
         reply, resp, event = agent.process_message(tenant, phone, text)
         await wa.send_message(tenant, phone, reply)
@@ -84,6 +91,21 @@ async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
 async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
     payload = await request.json()
+
+    # ── Mensagem da própria psicóloga (fromMe) → pausar/retomar agente ──────────
+    self_result = wa.extract_selfmessage_zapi(payload)
+    if self_result:
+        phone, text = self_result
+        cmd = text.strip().lower()
+        if cmd in ("retomar", "!retomar", "/retomar"):
+            db.resume_agent(tenant["id"], phone)
+            logger.info(f"[{tenant['slug']}] Agente retomado para {phone} via WhatsApp")
+        else:
+            db.pause_agent(tenant["id"], phone)
+            logger.info(f"[{tenant['slug']}] Agente pausado para {phone} — resposta manual detectada")
+        return {"status": "self_message"}
+
+    # ── Mensagem do paciente → processar normalmente ─────────────────────────────
     result = wa.extract_message_zapi(payload)
     if not result:
         return {"status": "ignored"}
@@ -294,6 +316,39 @@ def dash_appointments(request: Request):
     return {"appointments": appts}
 
 
+class ManualAppointment(BaseModel):
+    patient_name: str
+    phone: str
+    scheduled_at: str  # ISO: "2025-05-10T14:00:00"
+
+
+@app.post("/dashboard/api/appointments", status_code=201)
+def dash_create_appointment(body: ManualAppointment, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    try:
+        from datetime import datetime as dt
+        scheduled = dt.fromisoformat(body.scheduled_at)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Data/hora inválida. Use formato ISO: 2025-05-10T14:00:00")
+
+    if db.is_slot_taken(tenant["id"], scheduled):
+        raise HTTPException(status_code=409, detail="Já existe uma consulta neste horário.")
+
+    phone = body.phone.strip().replace(" ", "").replace("-", "")
+    appt_id = db.create_appointment(tenant["id"], body.patient_name, phone, scheduled)
+
+    # Sincronizar com Google Calendar
+    try:
+        event_id = gcal.create_event(tenant, body.patient_name, scheduled.isoformat(), tenant.get("session_minutes", 50))
+        if event_id:
+            db.set_appointment_google_event_id(appt_id, event_id)
+    except Exception:
+        pass
+
+    return {"status": "created", "id": appt_id}
+
+
 @app.post("/dashboard/api/appointments/{appt_id}/confirm")
 def dash_confirm(appt_id: int, request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
@@ -306,6 +361,13 @@ def dash_confirm(appt_id: int, request: Request):
 def dash_cancel(appt_id: int, request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
+    # Remover do Google Calendar antes de deletar do banco
+    appt = db.get_appointment_by_id(tenant["id"], appt_id)
+    if appt and appt.get("google_event_id"):
+        try:
+            gcal.delete_event(tenant, appt["google_event_id"])
+        except Exception:
+            pass
     with db.get_conn() as conn:
         conn.execute("DELETE FROM appointments WHERE id = ? AND tenant_id = ?", (appt_id, tenant["id"]))
     return {"status": "cancelled"}
@@ -332,6 +394,29 @@ def dash_patients(request: Request):
             (tenant["id"],)
         ).fetchall()
     return {"patients": [dict(r) for r in rows]}
+
+
+@app.post("/dashboard/api/conversation/{phone}/pause")
+def dash_pause(phone: str, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    db.pause_agent(tenant["id"], phone)
+    return {"status": "paused", "phone": phone}
+
+
+@app.post("/dashboard/api/conversation/{phone}/resume")
+def dash_resume(phone: str, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    db.resume_agent(tenant["id"], phone)
+    return {"status": "resumed", "phone": phone}
+
+
+@app.get("/dashboard/api/paused")
+def dash_paused(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    return {"paused": db.list_paused_phones(tenant["id"])}
 
 
 @app.get("/dashboard/api/conversation/{phone}")
@@ -363,6 +448,253 @@ def generate_dashboard_token(slug: str):
         "token": token,
         "url": f"{base}/dashboard/{slug}?token={token}",
     }
+
+
+# ── Onboarding público ─────────────────────────────────────────────────────────
+
+@app.get("/onboarding", response_class=HTMLResponse)
+def onboarding_form(request: Request):
+    return templates.TemplateResponse("onboarding.html", {"request": request})
+
+
+class OnboardingCreate(BaseModel):
+    name: str
+    psychologist_name: str = "Psicóloga"
+    email: str = ""
+    working_hours_start: int = 8
+    working_hours_end: int = 18
+    session_minutes: int = 50
+
+
+@app.post("/onboarding/create", status_code=201)
+def onboarding_create(body: OnboardingCreate):
+    try:
+        tenant = ts.create_tenant(
+            name=body.name,
+            psychologist_name=body.psychologist_name,
+            working_hours_start=body.working_hours_start,
+            working_hours_end=body.working_hours_end,
+            session_minutes=body.session_minutes,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    slug = tenant["slug"]
+
+    # Gerar tokens e salvar email
+    dash_token = secrets.token_urlsafe(24)
+    setup_token = secrets.token_urlsafe(24)
+    db.update_tenant(slug, dashboard_token=dash_token, setup_token=setup_token,
+                     email=body.email, status="pending_payment")
+
+    return {"slug": slug, "setup_token": setup_token}
+
+
+@app.get("/onboarding/sucesso", response_class=HTMLResponse)
+def onboarding_sucesso(request: Request):
+    return templates.TemplateResponse("onboarding_success.html", {"request": request})
+
+
+@app.get("/onboarding/info")
+def onboarding_info(setup_token: str):
+    tenant = db.get_tenant_by_setup_token(setup_token)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Token inválido.")
+    slug = tenant["slug"]
+    dash_token = tenant.get("dashboard_token", "")
+    base = config.BASE_URL
+    return {
+        "name": tenant["name"],
+        "slug": slug,
+        "dashboard_url": f"{base}/dashboard/{slug}?token={dash_token}" if dash_token else "",
+        "webhook_url": f"{base}/webhook/{slug}/zapi",
+    }
+
+
+# ── Painel Master ──────────────────────────────────────────────────────────────
+
+def _check_master_key(key: str):
+    if not config.MASTER_KEY or key != config.MASTER_KEY:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+
+
+@app.get("/master", response_class=HTMLResponse)
+def master_panel(request: Request, key: str = ""):
+    _check_master_key(key)
+    return templates.TemplateResponse("master.html", {"request": request, "master_key": key})
+
+
+@app.get("/master/tenants")
+def master_list_tenants(key: str = ""):
+    _check_master_key(key)
+    tenants = db.list_tenants()
+    base = config.BASE_URL
+    result = []
+    for t in tenants:
+        dash_token = t.get("dashboard_token", "")
+        result.append({
+            "id": t["id"],
+            "slug": t["slug"],
+            "name": t["name"],
+            "psychologist_name": t["psychologist_name"],
+            "working_hours_start": t["working_hours_start"],
+            "working_hours_end": t["working_hours_end"],
+            "session_minutes": t["session_minutes"],
+            "whatsapp_provider": t["whatsapp_provider"],
+            "dashboard_url": f"{base}/dashboard/{t['slug']}?token={dash_token}" if dash_token else "",
+        })
+    return {"tenants": result}
+
+
+@app.get("/master/onboarding-link/{slug}")
+def master_onboarding_link(slug: str, key: str = ""):
+    _check_master_key(key)
+    tenant = _get_tenant(slug)
+    setup_token = tenant.get("setup_token", "")
+    if not setup_token:
+        # Gerar se não existir
+        setup_token = secrets.token_urlsafe(24)
+        db.update_tenant(slug, setup_token=setup_token)
+    base = config.BASE_URL
+    return {"url": f"{base}/onboarding/sucesso?token={setup_token}"}
+
+
+# ── Google Calendar OAuth ──────────────────────────────────────────────────────
+
+@app.get("/google/auth/{slug}")
+def google_auth(slug: str, token: str = ""):
+    """Inicia o fluxo OAuth2 do Google Calendar para o consultório."""
+    tenant = _get_tenant(slug)
+    if not tenant.get("dashboard_token") or tenant["dashboard_token"] != token:
+        raise HTTPException(status_code=403, detail="Token inválido.")
+    redirect_uri = f"{config.BASE_URL}/google/callback"
+    url = gcal.get_auth_url(slug, redirect_uri)
+    return RedirectResponse(url)
+
+
+@app.get("/google/callback", response_class=HTMLResponse)
+def google_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    """Recebe o callback do Google e salva o refresh_token."""
+    if error:
+        return HTMLResponse(f"""
+        <html><body style="font-family:sans-serif;text-align:center;padding:60px">
+        <h2>❌ Erro ao conectar Google Calendar</h2>
+        <p style="color:#666">{error}</p>
+        <a href="/" style="color:#E91E8C">Voltar</a>
+        </body></html>""")
+
+    redirect_uri = f"{config.BASE_URL}/google/callback"
+    success = gcal.exchange_code(state, code, redirect_uri)
+
+    if not success:
+        return HTMLResponse("""
+        <html><body style="font-family:sans-serif;text-align:center;padding:60px">
+        <h2>⚠️ Não foi possível obter o token de atualização</h2>
+        <p style="color:#666">Tente desconectar e reconectar sua conta Google.</p>
+        </body></html>""")
+
+    tenant = db.get_tenant(state)
+    dash_token = tenant.get("dashboard_token", "") if tenant else ""
+    dash_url = f"{config.BASE_URL}/dashboard/{state}?token={dash_token}" if tenant else "/"
+
+    return HTMLResponse(f"""
+    <html><head><meta http-equiv="refresh" content="3;url={dash_url}"></head>
+    <body style="font-family:sans-serif;text-align:center;padding:60px">
+    <div style="font-size:48px">📅</div>
+    <h2 style="color:#111">Google Calendar conectado!</h2>
+    <p style="color:#666">Os agendamentos serão sincronizados automaticamente.<br>
+    Redirecionando para o painel...</p>
+    </body></html>""")
+
+
+@app.post("/dashboard/api/google/disconnect")
+def google_disconnect(request: Request):
+    """Remove a conexão com o Google Calendar."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    db.update_tenant(tenant["slug"], google_refresh_token="")
+    return {"status": "disconnected"}
+
+
+# ── Pagamento ──────────────────────────────────────────────────────────────────
+
+@app.get("/onboarding/pagamento", response_class=HTMLResponse)
+def payment_page(request: Request, token: str = "", cancelled: int = 0):
+    tenant = db.get_tenant_by_setup_token(token)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Link inválido.")
+    return templates.TemplateResponse("payment.html", {
+        "request": request,
+        "setup_token": token,
+        "tenant": tenant,
+        "cancelled": bool(cancelled),
+    })
+
+
+@app.post("/checkout/stripe")
+async def checkout_stripe(request: Request):
+    form = await request.form()
+    setup_token = form.get("setup_token", "")
+    tenant = db.get_tenant_by_setup_token(setup_token)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Token inválido.")
+    try:
+        url = stripe_svc.create_checkout_session(tenant)
+        return RedirectResponse(url, status_code=303)
+    except Exception as e:
+        logger.exception(f"Stripe checkout error: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao iniciar pagamento. Tente novamente.")
+
+
+@app.post("/webhooks/stripe")
+async def webhook_stripe(request: Request):
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    try:
+        result = stripe_svc.handle_webhook(payload, sig)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/dashboard/api/billing-portal")
+def billing_portal(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    # Tentar Stripe primeiro, depois Mercado Pago
+    url = stripe_svc.get_billing_portal_url(tenant) or mp_svc.get_manage_url(tenant)
+    if not url:
+        raise HTTPException(status_code=404, detail="Sem assinatura vinculada.")
+    return {"url": url}
+
+
+@app.post("/checkout/mercadopago")
+async def checkout_mercadopago(request: Request):
+    form = await request.form()
+    setup_token = form.get("setup_token", "")
+    tenant = db.get_tenant_by_setup_token(setup_token)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Token inválido.")
+    try:
+        url = mp_svc.create_subscription(tenant)
+        return RedirectResponse(url, status_code=303)
+    except Exception as e:
+        logger.exception(f"MP checkout error: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao iniciar pagamento. Tente novamente.")
+
+
+@app.post("/webhooks/mercadopago")
+async def webhook_mercadopago(request: Request):
+    data = await request.json()
+    result = mp_svc.handle_webhook(data)
+    return result
+
+
+# ── Landing page ───────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+def landing(request: Request):
+    return templates.TemplateResponse("landing.html", {"request": request})
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

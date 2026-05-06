@@ -83,6 +83,23 @@ async def _send_zapi(tenant: dict, phone: str, text: str) -> bool:
         return False
 
 
+def extract_selfmessage_zapi(payload: dict) -> tuple[str, str] | None:
+    """
+    Detecta mensagens enviadas PELA psicóloga (fromMe: true) via Z-API.
+    Usado para pausar/retomar o agente de forma invisível ao paciente.
+    """
+    try:
+        if not payload.get("fromMe"):
+            return None
+        phone = payload.get("phone", "").replace("+", "").replace("-", "")
+        text = (payload.get("text") or {}).get("message", "")
+        if phone and text:
+            return phone, text
+    except Exception:
+        pass
+    return None
+
+
 def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
     """
     Z-API webhook payload (ReceivedCallback):
