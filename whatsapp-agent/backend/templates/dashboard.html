@@ -66,7 +66,13 @@
   <div id="pane-agenda" class="tab-content active">
     <div class="flex items-center justify-between mb-4 mt-4 md:mt-0">
       <h2 class="text-base font-semibold text-gray-800">Próximas consultas</h2>
-      <button onclick="loadAgenda()" class="text-sm text-brand">↻ Atualizar</button>
+      <div class="flex gap-2">
+        <button onclick="loadAgenda()" class="text-sm text-brand">↻ Atualizar</button>
+        <button onclick="openNewAppt()"
+          class="text-sm bg-brand text-white px-3 py-1.5 rounded-lg font-medium hover:opacity-90 transition">
+          + Nova consulta
+        </button>
+      </div>
     </div>
     <div id="agenda-list" class="space-y-3">
       <div class="text-gray-400 text-sm text-center py-8">Carregando...</div>
@@ -132,8 +138,147 @@
       </button>
       <div id="cfg-msg" class="text-sm text-center hidden text-green-600"></div>
     </div>
+
+    <!-- Assinatura -->
+    {% if tenant.stripe_subscription_id or tenant.mp_subscription_id %}
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-2xl">💳</span>
+        <div>
+          <h3 class="font-semibold text-gray-800 text-sm">Assinatura</h3>
+          <p class="text-xs text-gray-500">Plano Mensal · R$ 200/mês
+            {% if tenant.stripe_subscription_id %}· Stripe{% endif %}
+            {% if tenant.mp_subscription_id %}· Mercado Pago{% endif %}
+          </p>
+        </div>
+        <span class="ml-auto text-xs px-2 py-1 rounded-full font-medium
+          {{ 'bg-green-100 text-green-700' if tenant.status == 'active' else 'bg-red-100 text-red-700' }}">
+          {{ '● Ativa' if tenant.status == 'active' else '○ Suspensa' }}
+        </span>
+      </div>
+      <button onclick="openBillingPortal()"
+        class="w-full border border-gray-300 text-gray-700 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 transition">
+        Gerenciar assinatura →
+      </button>
+    </div>
+    {% endif %}
+
+    <!-- Painel Mobile -->
+    <div class="bg-white rounded-xl border border-brand/30 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-2xl">📱</span>
+        <div>
+          <h3 class="font-semibold text-gray-800 text-sm">Painel de Controle Mobile</h3>
+          <p class="text-xs text-gray-500">Pause ou retome o agente direto do seu celular</p>
+        </div>
+      </div>
+      <a href="/controle/{{ token }}" target="_blank"
+        class="block w-full text-center bg-brand text-white py-2.5 rounded-lg text-sm font-semibold hover:opacity-90 transition mb-2">
+        Abrir Painel Mobile →
+      </a>
+      <p class="text-xs text-gray-400 text-center">Salve como atalho na tela inicial do celular para acesso rápido</p>
+      <div class="mt-3 bg-gray-50 rounded-lg px-3 py-2 flex items-center gap-2">
+        <span class="text-xs text-gray-500 truncate flex-1" id="controle-url">/controle/{{ token }}</span>
+        <button onclick="navigator.clipboard.writeText(window.location.origin+'/controle/{{ token }}');showToast('Link copiado!','success')"
+          class="text-xs text-brand font-medium flex-shrink-0">Copiar</button>
+      </div>
+    </div>
+
+    <!-- Google Calendar -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-2xl">📅</span>
+        <div>
+          <h3 class="font-semibold text-gray-800 text-sm">Google Calendar</h3>
+          <p class="text-xs text-gray-500">Sincroniza agendamentos automaticamente</p>
+        </div>
+        <span id="gcal-badge" class="ml-auto text-xs px-2 py-1 rounded-full font-medium
+          {{ 'bg-green-100 text-green-700' if tenant.google_refresh_token else 'bg-gray-100 text-gray-500' }}">
+          {{ '● Conectado' if tenant.google_refresh_token else '○ Desconectado' }}
+        </span>
+      </div>
+      {% if tenant.google_refresh_token %}
+      <button onclick="gcalDisconnect()"
+        class="w-full border border-red-300 text-red-600 py-2 rounded-lg text-sm font-medium hover:bg-red-50 transition">
+        Desconectar Google Calendar
+      </button>
+      {% else %}
+      <a href="/google/auth/{{ tenant.slug }}?token={{ token }}"
+        class="block w-full text-center bg-white border border-gray-300 py-2 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50 transition">
+        <span class="inline-flex items-center gap-2">
+          <svg width="16" height="16" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.2l6.8-6.8C35.6 2.3 30.1 0 24 0 14.6 0 6.6 5.4 2.6 13.3l7.9 6.1C12.5 12.7 17.8 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h12.7c-.5 2.9-2.2 5.4-4.7 7.1l7.4 5.7c4.3-4 6.8-9.9 7.1-16.8z"/><path fill="#FBBC05" d="M10.5 28.5c-.5-1.5-.8-3.2-.8-4.9s.3-3.4.8-4.9L2.6 13.3C.9 17 0 21 0 25.3c0 4.1.9 8 2.6 11.5l7.9-8.3z"/><path fill="#34A853" d="M24 48c5.9 0 10.9-2 14.5-5.4l-7.4-5.7c-2 1.4-4.6 2.2-7.1 2.2-6.2 0-11.4-4.2-13.3-9.8l-7.9 6.1C6.6 42.6 14.6 48 24 48z"/></svg>
+          Conectar com Google
+        </span>
+      </a>
+      <p class="text-xs text-gray-400 mt-2 text-center">Você será redirecionado para autorizar o acesso à sua agenda</p>
+      {% endif %}
+    </div>
   </div>
 
+</div>
+
+<!-- Modal: Nova Consulta -->
+<div id="modal-appt" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4">
+  <div class="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
+    <div class="flex items-center justify-between mb-5">
+      <h3 class="text-base font-semibold text-gray-800">Nova consulta</h3>
+      <button onclick="closeNewAppt()" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+    </div>
+    <div class="space-y-4">
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Nome do paciente <span class="text-red-500">*</span></label>
+        <input id="na-name" type="text" placeholder="Nome completo"
+          class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">WhatsApp <span class="text-red-500">*</span></label>
+        <input id="na-phone" type="tel" placeholder="55 11 99999-9999"
+          class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        <p class="text-xs text-gray-400 mt-1">Com DDI e DDD: 55 11 99999-9999</p>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Data <span class="text-red-500">*</span></label>
+          <input id="na-date" type="date"
+            class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Horário <span class="text-red-500">*</span></label>
+          <input id="na-time" type="time"
+            class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+      </div>
+      <!-- Recorrência -->
+      <div class="border border-gray-200 rounded-xl p-4 space-y-3">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" id="na-repeat" onchange="toggleRepeat()" class="accent-brand w-4 h-4"/>
+          <span class="text-sm font-medium text-gray-700">Repetir consulta</span>
+        </label>
+        <div id="na-repeat-opts" class="hidden grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Frequência</label>
+            <select id="na-freq" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+              <option value="7">Semanal</option>
+              <option value="14" selected>Quinzenal</option>
+              <option value="21">A cada 3 semanas</option>
+              <option value="28">Mensal</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-500 mb-1">Nº de sessões</label>
+            <input id="na-sessions" type="number" min="2" max="52" value="10"
+              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+        </div>
+      </div>
+
+      <div id="na-error" class="hidden text-sm text-red-600 bg-red-50 rounded-xl px-4 py-2.5"></div>
+      <button onclick="submitNewAppt()" id="na-btn"
+        class="w-full bg-brand text-white py-3 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        Agendar consulta
+      </button>
+    </div>
+  </div>
 </div>
 
 <!-- Mobile bottom nav -->
@@ -300,34 +445,81 @@ function loadSlots() {
 }
 
 // ── Conversas ─────────────────────────────────────────────────────────────────
+let pausedPhones = new Set();
+let currentPhone = null;
+
 function loadConversas() {
-  api("/dashboard/api/patients").then(data => {
+  // Carregar lista de pausados e pacientes em paralelo
+  Promise.all([
+    api("/dashboard/api/paused"),
+    api("/dashboard/api/patients")
+  ]).then(([pausedData, patientsData]) => {
+    pausedPhones = new Set(pausedData.paused || []);
     const el = document.getElementById("conv-list");
-    if (!data.patients?.length) { el.innerHTML='<div class="text-gray-400 text-sm">Sem conversas.</div>'; return; }
-    el.innerHTML = data.patients.map(p =>
-      `<button onclick="loadConv('${p.phone}')"
-        class="w-full text-left bg-white border border-gray-200 rounded-xl px-4 py-3 hover:border-brand transition active:scale-95">
-        <p class="text-sm font-medium text-gray-800">${p.name||p.phone}</p>
-        <p class="text-xs text-gray-400">${p.phone}</p>
-      </button>`
-    ).join("");
+    const patients = patientsData.patients || [];
+    if (!patients.length) { el.innerHTML='<div class="text-gray-400 text-sm">Sem conversas.</div>'; return; }
+    el.innerHTML = patients.map(p => {
+      const paused = pausedPhones.has(p.phone);
+      return `<button onclick="loadConv('${p.phone}')"
+        class="w-full text-left bg-white border ${paused ? 'border-yellow-300 bg-yellow-50' : 'border-gray-200'} rounded-xl px-4 py-3 hover:border-brand transition active:scale-95">
+        <div class="flex items-center justify-between">
+          <div>
+            <p class="text-sm font-medium text-gray-800">${p.name||p.phone}</p>
+            <p class="text-xs text-gray-400">${p.phone}</p>
+          </div>
+          ${paused ? '<span class="text-xs bg-yellow-200 text-yellow-800 px-2 py-0.5 rounded-full font-medium">⏸ Pausado</span>' : ''}
+        </div>
+      </button>`;
+    }).join("");
   });
 }
 
 function loadConv(phone) {
+  currentPhone = phone;
   api(`/dashboard/api/conversation/${phone}`).then(data => {
     const el = document.getElementById("conv-detail");
     const msgs = data.history||[];
-    if (!msgs.length) { el.innerHTML='<p class="text-gray-400 text-sm">Sem mensagens.</p>'; return; }
-    el.innerHTML = `<div class="space-y-3 overflow-y-auto max-h-96 pr-1">` +
+    const isPaused = pausedPhones.has(phone);
+
+    const pauseBtn = `
+      <div class="flex items-center justify-between mb-3 pb-3 border-b border-gray-100">
+        <p class="text-xs text-gray-500 font-medium">${phone}</p>
+        <button onclick="togglePause('${phone}')" id="pause-btn-${phone}"
+          class="text-xs font-semibold px-3 py-1.5 rounded-lg transition ${isPaused
+            ? 'bg-green-100 text-green-700 hover:bg-green-200'
+            : 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200'}">
+          ${isPaused ? '▶ Retomar agente' : '⏸ Pausar agente'}
+        </button>
+      </div>`;
+
+    if (!msgs.length) {
+      el.innerHTML = pauseBtn + '<p class="text-gray-400 text-sm">Sem mensagens.</p>';
+      return;
+    }
+    el.innerHTML = pauseBtn + `<div class="space-y-3 overflow-y-auto max-h-80 pr-1">` +
       msgs.map(m => {
         const isUser = m.role==="user";
         return `<div class="flex ${isUser?'justify-start':'justify-end'}">
           <div class="max-w-[80%] px-4 py-2 rounded-2xl text-sm ${isUser?'bg-gray-100 text-gray-800':'bg-brand text-white'}">${m.content}</div>
         </div>`;
       }).join("") + `</div>`;
-    el.querySelector("div").scrollTop = 99999;
+    el.querySelector("div:last-child").scrollTop = 99999;
   });
+}
+
+async function togglePause(phone) {
+  const isPaused = pausedPhones.has(phone);
+  const endpoint = isPaused ? "resume" : "pause";
+  await api(`/dashboard/api/conversation/${phone}/${endpoint}`, {method:"POST"});
+  if (isPaused) {
+    pausedPhones.delete(phone);
+    showToast(`▶ Agente retomado para ${phone}`, "success");
+  } else {
+    pausedPhones.add(phone);
+    showToast(`⏸ Agente pausado para ${phone}`, "warning");
+  }
+  loadConversas();
+  loadConv(phone);
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -343,6 +535,118 @@ function saveConfig() {
     const m = document.getElementById("cfg-msg");
     m.textContent="✓ Salvo!"; m.classList.remove("hidden");
     setTimeout(()=>m.classList.add("hidden"),3000);
+  });
+}
+
+// ── Nova Consulta (manual) ────────────────────────────────────────────────────
+function openNewAppt() {
+  const today = new Date().toISOString().split("T")[0];
+  document.getElementById("na-date").value = today;
+  document.getElementById("na-time").value = "";
+  document.getElementById("na-name").value = "";
+  document.getElementById("na-phone").value = "";
+  document.getElementById("na-repeat").checked = false;
+  document.getElementById("na-repeat-opts").classList.add("hidden");
+  document.getElementById("na-error").classList.add("hidden");
+  document.getElementById("na-btn").textContent = "Agendar consulta";
+  document.getElementById("na-btn").disabled = false;
+  document.getElementById("modal-appt").classList.remove("hidden");
+}
+
+function toggleRepeat() {
+  const on = document.getElementById("na-repeat").checked;
+  document.getElementById("na-repeat-opts").classList.toggle("hidden", !on);
+  document.getElementById("na-btn").textContent = on ? "Agendar sessões" : "Agendar consulta";
+}
+
+function closeNewAppt() {
+  document.getElementById("modal-appt").classList.add("hidden");
+}
+
+function normalizePhone(raw) {
+  return raw.replace(/\D/g, "");
+}
+
+async function submitNewAppt() {
+  const name    = document.getElementById("na-name").value.trim();
+  const phone   = normalizePhone(document.getElementById("na-phone").value);
+  const date    = document.getElementById("na-date").value;
+  const time    = document.getElementById("na-time").value;
+  const repeat  = document.getElementById("na-repeat").checked;
+  const freq    = parseInt(document.getElementById("na-freq").value);
+  const sessions= parseInt(document.getElementById("na-sessions").value) || 1;
+  const errEl   = document.getElementById("na-error");
+  const btn     = document.getElementById("na-btn");
+
+  errEl.classList.add("hidden");
+
+  if (!name || !phone || !date || !time) {
+    errEl.textContent = "Preencha todos os campos.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+  if (phone.length < 10) {
+    errEl.textContent = "Telefone inválido. Use o formato: 55 11 99999-9999";
+    errEl.classList.remove("hidden");
+    return;
+  }
+
+  btn.textContent = "Agendando...";
+  btn.disabled = true;
+
+  // Gerar lista de datas
+  const dates = [];
+  let current = new Date(`${date}T${time}:00`);
+  const count = repeat ? sessions : 1;
+  for (let i = 0; i < count; i++) {
+    dates.push(new Date(current));
+    current.setDate(current.getDate() + freq);
+  }
+
+  try {
+    let created = 0, conflicts = 0;
+    for (const d of dates) {
+      const iso = d.toISOString().slice(0,19); // sem timezone
+      // Ajustar para horário local
+      const localIso = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}T${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:00`;
+      const r = await api("/dashboard/api/appointments", {
+        method: "POST",
+        body: JSON.stringify({ patient_name: name, phone, scheduled_at: localIso })
+      });
+      if (r.status === "created") created++;
+      else conflicts++;
+    }
+    closeNewAppt();
+    loadAgenda();
+    const msg = repeat
+      ? `✅ ${created} sessão(ões) de ${name} agendada(s)${conflicts ? ` · ${conflicts} conflito(s) ignorado(s)` : ""}!`
+      : `✅ ${name} agendado(a) com sucesso!`;
+    showToast(msg, "success");
+  } catch(e) {
+    errEl.textContent = e.message || "Erro ao agendar.";
+    errEl.classList.remove("hidden");
+    btn.textContent = repeat ? "Agendar sessões" : "Agendar consulta";
+    btn.disabled = false;
+  }
+}
+
+// Fechar modal clicando fora
+document.getElementById("modal-appt").addEventListener("click", function(e) {
+  if (e.target === this) closeNewAppt();
+});
+
+// ── Billing ───────────────────────────────────────────────────────────────────
+async function openBillingPortal() {
+  const r = await api("/dashboard/api/billing-portal");
+  if (r.url) window.open(r.url, "_blank");
+}
+
+// ── Google Calendar ───────────────────────────────────────────────────────────
+function gcalDisconnect() {
+  if (!confirm("Desconectar o Google Calendar? Os agendamentos futuros não serão mais sincronizados.")) return;
+  api("/dashboard/api/google/disconnect", {method:"POST"}).then(() => {
+    showToast("Google Calendar desconectado");
+    setTimeout(() => location.reload(), 1500);
   });
 }
 

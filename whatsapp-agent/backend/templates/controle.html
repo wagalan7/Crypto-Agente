@@ -3,12 +3,12 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Controle do Agente</title>
+  <title>Controle — {{ tenant.psychologist_name }}</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C' } } } }</script>
   <style>
     body { -webkit-tap-highlight-color: transparent; }
-    .btn-tap:active { transform: scale(0.96); }
+    button:active { transform: scale(0.96); }
   </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -16,24 +16,28 @@
   <!-- Header -->
   <div class="bg-white border-b border-gray-200 sticky top-0 z-10 px-4 py-3 flex items-center gap-3">
     <div class="w-9 h-9 rounded-full bg-brand flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
-      {{ tenant.psychologist_name[0] | upper }}
+      {{ tenant.psychologist_name[:1] | upper if tenant.psychologist_name else 'P' }}
     </div>
     <div class="flex-1 min-w-0">
       <p class="font-semibold text-gray-900 text-sm leading-tight">Controle do Agente</p>
       <p class="text-xs text-gray-400 truncate">{{ tenant.psychologist_name }}</p>
     </div>
-    <button onclick="location.reload()"
-      class="text-xs text-brand font-medium px-3 py-1.5 rounded-full border border-brand btn-tap">
+    <a href="/controle/{{ token }}"
+      class="text-xs text-brand font-medium px-3 py-1.5 rounded-full border border-brand">
       ↻ Atualizar
-    </button>
+    </a>
   </div>
 
   <div class="px-4 py-4 max-w-lg mx-auto">
 
     <!-- Legenda -->
     <div class="flex gap-4 mb-4 text-xs text-gray-500">
-      <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-green-400 inline-block"></span> Agente ativo</span>
-      <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-yellow-400 inline-block"></span> Agente pausado</span>
+      <span class="flex items-center gap-1.5">
+        <span class="w-2.5 h-2.5 rounded-full bg-green-400 inline-block"></span> Agente ativo
+      </span>
+      <span class="flex items-center gap-1.5">
+        <span class="w-2.5 h-2.5 rounded-full bg-yellow-400 inline-block"></span> Agente pausado
+      </span>
     </div>
 
     {% if not patients %}
@@ -41,37 +45,39 @@
       <div class="text-4xl mb-3">📋</div>
       <p class="text-sm">Nenhum paciente cadastrado ainda.</p>
     </div>
-    {% endif %}
-
+    {% else %}
     <div class="space-y-2">
     {% for p in patients %}
       {% set is_paused = p.phone in paused %}
-      <div class="bg-white rounded-2xl border {{ 'border-yellow-200 bg-yellow-50' if is_paused else 'border-gray-100' }} p-4 flex items-center gap-3">
+      <div class="bg-white rounded-2xl border p-4 flex items-center gap-3
+        {{ 'border-yellow-200' if is_paused else 'border-gray-100' }}">
+
         <!-- Avatar -->
-        <div class="w-10 h-10 rounded-full {{ 'bg-yellow-200 text-yellow-800' if is_paused else 'bg-gray-100 text-gray-600' }} flex items-center justify-center font-bold text-sm flex-shrink-0">
-          {{ p.patient_name[0] | upper }}
+        <div class="w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0
+          {{ 'bg-yellow-100 text-yellow-700' if is_paused else 'bg-gray-100 text-gray-600' }}">
+          {{ p.patient_name[:1] | upper if p.patient_name else '?' }}
         </div>
 
         <!-- Nome + status -->
         <div class="flex-1 min-w-0">
-          <p class="font-medium text-gray-900 text-sm truncate">{{ p.patient_name }}</p>
+          <p class="font-medium text-gray-900 text-sm truncate">{{ p.patient_name or p.phone }}</p>
           <p class="text-xs {{ 'text-yellow-600 font-medium' if is_paused else 'text-gray-400' }}">
-            {{ '⏸ Pausado — você está no controle' if is_paused else '🤖 Agente respondendo' }}
+            {% if is_paused %}⏸ Pausado{% else %}🤖 Agente ativo{% endif %}
           </p>
         </div>
 
-        <!-- Botão ação -->
+        <!-- Botão -->
         {% if is_paused %}
         <form method="POST" action="/controle/{{ token }}/retomar/{{ p.phone }}">
           <button type="submit"
-            class="btn-tap bg-green-500 text-white text-xs font-semibold px-4 py-2 rounded-xl whitespace-nowrap transition-colors active:bg-green-600">
+            class="bg-green-500 text-white text-xs font-semibold px-4 py-2.5 rounded-xl whitespace-nowrap">
             ▶ Retomar
           </button>
         </form>
         {% else %}
         <form method="POST" action="/controle/{{ token }}/pausar/{{ p.phone }}">
           <button type="submit"
-            class="btn-tap bg-yellow-400 text-yellow-900 text-xs font-semibold px-4 py-2 rounded-xl whitespace-nowrap transition-colors active:bg-yellow-500">
+            class="bg-yellow-400 text-yellow-900 text-xs font-semibold px-4 py-2.5 rounded-xl whitespace-nowrap">
             ⏸ Pausar
           </button>
         </form>
@@ -79,12 +85,14 @@
       </div>
     {% endfor %}
     </div>
+    {% endif %}
 
     <!-- Dica -->
     <div class="mt-6 bg-blue-50 border border-blue-100 rounded-2xl p-4 text-xs text-blue-700">
       <p class="font-semibold mb-1">💡 Como usar</p>
-      <p>Quando você for responder um paciente diretamente, <strong>pause o agente</strong> antes. Quando terminar, toque em <strong>Retomar</strong>.</p>
-      <p class="mt-2 text-blue-500">Adicione esta página à tela inicial do seu celular para acesso rápido.</p>
+      <p>Antes de responder um paciente diretamente, toque em <strong>Pausar</strong>.<br/>
+         Quando terminar, toque em <strong>Retomar</strong> para o agente voltar.</p>
+      <p class="mt-2 text-blue-500">Salve este link na tela inicial do celular para acesso rápido.</p>
     </div>
 
   </div>
