@@ -184,6 +184,22 @@
       </div>
     </div>
 
+    <!-- Confirmações -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-2xl">📨</span>
+        <div>
+          <h3 class="font-semibold text-gray-800 text-sm">Confirmações de Amanhã</h3>
+          <p class="text-xs text-gray-500">Envia mensagem de confirmação para todos os pacientes de amanhã</p>
+        </div>
+      </div>
+      <button onclick="dispararConfirmacoes()" id="btn-confirmar"
+        class="w-full bg-green-600 text-white py-2.5 rounded-lg text-sm font-semibold hover:bg-green-700 transition">
+        📨 Enviar confirmações agora
+      </button>
+      <p id="confirmar-status" class="text-xs text-gray-400 text-center mt-2 hidden"></p>
+    </div>
+
     <!-- Google Calendar -->
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
       <div class="flex items-center gap-3 mb-3">
@@ -634,6 +650,28 @@ async function submitNewAppt() {
 document.getElementById("modal-appt").addEventListener("click", function(e) {
   if (e.target === this) closeNewAppt();
 });
+
+// ── Confirmações ──────────────────────────────────────────────────────────────
+async function dispararConfirmacoes() {
+  const btn = document.getElementById('btn-confirmar');
+  const status = document.getElementById('confirmar-status');
+  btn.disabled = true;
+  btn.textContent = '⏳ Enviando...';
+  status.classList.add('hidden');
+  try {
+    const r = await fetch('/admin/confirmacoes/disparar', {method:'POST'});
+    const data = await r.json();
+    const n = data.enviados || 0;
+    btn.textContent = `✓ ${n} mensagem(ns) enviada(s)`;
+    btn.classList.replace('bg-green-600','bg-green-500');
+    status.textContent = n === 0 ? 'Nenhuma consulta pendente para amanhã.' : `Confirmações enviadas com sucesso!`;
+    status.classList.remove('hidden');
+  } catch(e) {
+    btn.textContent = '📨 Enviar confirmações agora';
+    btn.disabled = false;
+    showToast('Erro ao enviar confirmações','error');
+  }
+}
 
 // ── Billing ───────────────────────────────────────────────────────────────────
 async function openBillingPortal() {
