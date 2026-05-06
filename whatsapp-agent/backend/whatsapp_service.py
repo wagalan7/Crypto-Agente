@@ -158,16 +158,26 @@ def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
         if not text:
             text = (payload.get("image") or {}).get("caption", "")
 
-        # Áudio → retorna URL para transcrição assíncrona
+        # Áudio → tenta vários campos que o Z-API pode usar
         if not text:
-            audio_url = (payload.get("audio") or {}).get("audioUrl", "")
+            audio = payload.get("audio") or {}
+            audio_url = (
+                audio.get("audioUrl")
+                or audio.get("url")
+                or audio.get("link")
+                or audio.get("base64")  # alguns retornam base64
+                or ""
+            )
             if audio_url:
+                logger.info(f"[ZAPI] Áudio detectado para {phone}: {audio_url[:60]}")
                 return phone, f"__AUDIO__:{audio_url}"
+            # Log para debug: mostrar todo o payload quando não tem texto nem áudio
+            logger.info(f"[ZAPI] Payload sem texto/áudio para {phone}: keys={list(payload.keys())} audio_raw={audio}")
 
         if phone and text:
             return phone, text
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"[ZAPI] Erro ao extrair mensagem: {e}")
     return None
 
 
