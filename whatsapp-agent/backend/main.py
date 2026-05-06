@@ -1,9 +1,21 @@
 from __future__ import annotations
 import logging
 import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+
+# ── Cache de envios do agente (evita auto-pause por eco do Z-API) ──────────────
+_agent_sent_at: dict[str, float] = {}  # phone -> timestamp do último envio
+_ECHO_WINDOW_SECS = 15  # segundos para considerar como eco
+
+def _mark_agent_sent(phone: str):
+    _agent_sent_at[phone] = time.time()
+
+def _is_agent_echo(phone: str) -> bool:
+    ts = _agent_sent_at.get(phone)
+    return ts is not None and (time.time() - ts) < _ECHO_WINDOW_SECS
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -80,6 +92,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
     try:
         reply, resp, event = agent.process_message(tenant, phone, text)
         await wa.send_message(tenant, phone, reply)
+        _mark_agent_sent(phone)  # marca para ignorar eco do Z-API nos próximos 15s
         logger.info(f"[{tenant['slug']}][{phone}] intent={resp.intent} action={resp.action}")
         if event:
             await events.publish(tenant["id"], event["type"], event["data"])
@@ -115,15 +128,20 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     self_result = wa.extract_selfmessage_zapi(payload)
     if self_result:
         phone, text, msg_id = self_result
+
+        # Ignorar se for eco do próprio agente (Z-API reflete mensagens enviadas via API)
+        if _is_agent_echo(phone):
+            logger.debug(f"[{tenant['slug']}] Eco do agente ignorado para {phone}")
+            return {"status": "agent_echo"}
+
         cmd = text.strip().lower()
         if cmd in ("retomar", "!retomar", "/retomar"):
             db.resume_agent(tenant["id"], phone)
             logger.info(f"[{tenant['slug']}] Agente retomado para {phone} via WhatsApp")
-            # Deletar "retomar" do chat para não aparecer ao paciente
             bg.add_task(wa.delete_message_zapi, tenant, phone, msg_id)
         else:
             db.pause_agent(tenant["id"], phone)
-            logger.info(f"[{tenant['slug']}] Agente pausado para {phone} — resposta manual detectada")
+            logger.info(f"[{tenant['slug']}] Agente pausado para {phone} — resposta manual da Bruna")
         return {"status": "self_message"}
 
     # ── Mensagem do paciente → processar normalmente ─────────────────────────────
