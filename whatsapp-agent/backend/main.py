@@ -92,6 +92,9 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
     payload = await request.json()
 
+    # ── LOG COMPLETO para debug (remover depois) ─────────────────────────────────
+    logger.info(f"[{slug}] ZAPI RAW payload: fromMe={payload.get('fromMe')} type={payload.get('type')} phone={payload.get('phone')} text={payload.get('text')} keys={list(payload.keys())}")
+
     # ── Mensagem da própria psicóloga (fromMe) → pausar/retomar agente ──────────
     self_result = wa.extract_selfmessage_zapi(payload)
     if self_result:
@@ -114,6 +117,40 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     phone, text = result
     bg.add_task(_handle_message, tenant, phone, text)
     return {"status": "queued"}
+
+
+@app.post("/webhook/{slug}/zapi/sent")
+async def webhook_zapi_sent(slug: str, request: Request, bg: BackgroundTasks):
+    """
+    Endpoint exclusivo para o webhook 'Ao enviar' do Z-API.
+    Qualquer mensagem aqui é enviada pela psicóloga — pausar o agente.
+    """
+    try:
+        tenant = _get_tenant(slug)
+        payload = await request.json()
+        logger.info(f"[{slug}] ZAPI SENT payload: {payload}")
+
+        phone = payload.get("phone", "").replace("+", "").replace("-", "")
+        text = (payload.get("text") or {}).get("message", "") or ""
+        msg_id = payload.get("zaapId") or payload.get("messageId") or payload.get("id") or ""
+
+        if not phone:
+            return {"status": "ignored"}
+
+        cmd = text.strip().lower()
+        if cmd in ("retomar", "!retomar", "/retomar"):
+            db.resume_agent(tenant["id"], phone)
+            logger.info(f"[{slug}] Agente retomado para {phone} via /sent")
+            if msg_id:
+                bg.add_task(wa.delete_message_zapi, tenant, phone, msg_id)
+        else:
+            db.pause_agent(tenant["id"], phone)
+            logger.info(f"[{slug}] Agente pausado para {phone} via /sent — mensagem manual: {text[:50]}")
+
+        return {"status": "self_message"}
+    except Exception as e:
+        logger.error(f"[{slug}] Erro em webhook_zapi_sent: {e}")
+        return {"status": "error"}
 
 
 @app.post("/webhook/{slug}/twilio")
