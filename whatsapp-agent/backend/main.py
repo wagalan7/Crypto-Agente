@@ -61,6 +61,22 @@ async def _handle_message(tenant: dict, phone: str, text: str):
     if db.is_agent_paused(tenant["id"], phone):
         logger.info(f"[{tenant['slug']}][{phone}] Agente pausado — mensagem ignorada")
         return
+
+    # ── Áudio: transcrever antes de processar ────────────────────────────────────
+    if text.startswith("__AUDIO__:"):
+        audio_url = text[len("__AUDIO__:"):]
+        logger.info(f"[{tenant['slug']}][{phone}] Áudio recebido — transcrevendo...")
+        transcribed = await wa.transcribe_audio_groq(audio_url)
+        if transcribed:
+            text = transcribed
+            logger.info(f"[{tenant['slug']}][{phone}] Transcrição: {text[:80]}")
+        else:
+            # Sem Groq configurado ou falha — pedir para o paciente digitar
+            await wa.send_message(tenant, phone,
+                "Recebi seu áudio! 🎙️ Mas ainda não consigo ouvir mensagens de voz. "
+                "Pode me enviar a mesma mensagem em texto? Assim posso te ajudar melhor 😊")
+            return
+
     try:
         reply, resp, event = agent.process_message(tenant, phone, text)
         await wa.send_message(tenant, phone, reply)

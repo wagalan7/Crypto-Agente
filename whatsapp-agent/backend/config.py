@@ -28,3 +28,17 @@ SESSION_DURATION_MINUTES = int(os.getenv("SESSION_DURATION_MINUTES", "50"))
 WORKING_DAYS = [0, 1, 2, 3, 4]  # Seg=0 ... Sex=4
 WORKING_HOURS_START = int(os.getenv("WORKING_HOURS_START", "7"))
 WORKING_HOURS_END = int(os.getenv("WORKING_HOURS_END", "21"))
+
+MASTER_KEY = os.getenv("MASTER_KEY", "")
+BASE_URL = os.getenv("BASE_URL", "https://agente-atendimento-production.up.railway.app")
+
+GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID        = os.getenv("STRIPE_PRICE_ID", "")
+
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")

@@ -139,24 +139,71 @@ def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
       "type": "ReceivedCallback",
       "text": {"message": "Olá"}
     }
+    Retorna (phone, text) onde text pode ser transcrito de áudio.
     """
     try:
         if payload.get("fromMe"):
             return None
         if payload.get("type") not in ("ReceivedCallback", None):
-            # ignore delivery receipts etc.
             if payload.get("type") and "Received" not in payload.get("type", ""):
                 return None
         phone = payload.get("phone", "").replace("+", "").replace("-", "")
+        if not phone:
+            return None
+
+        # Texto direto
         text = (payload.get("text") or {}).get("message", "")
+
+        # Caption de imagem
         if not text:
-            # image caption fallback
             text = (payload.get("image") or {}).get("caption", "")
+
+        # Áudio → retorna URL para transcrição assíncrona
+        if not text:
+            audio_url = (payload.get("audio") or {}).get("audioUrl", "")
+            if audio_url:
+                return phone, f"__AUDIO__:{audio_url}"
+
         if phone and text:
             return phone, text
     except Exception:
         pass
     return None
+
+
+async def transcribe_audio_groq(audio_url: str) -> str | None:
+    """
+    Baixa o áudio do Z-API e transcreve usando Groq Whisper (gratuito).
+    Retorna o texto transcrito ou None se falhar.
+    """
+    import config as cfg
+    if not cfg.GROQ_API_KEY:
+        return None
+    try:
+        # Baixar o arquivo de áudio
+        async with httpx.AsyncClient(timeout=30) as client:
+            audio_resp = await client.get(audio_url)
+            audio_resp.raise_for_status()
+            audio_bytes = audio_resp.content
+
+        # Enviar para Groq Whisper
+        import io
+        files = {"file": ("audio.ogg", io.BytesIO(audio_bytes), "audio/ogg")}
+        data = {"model": "whisper-large-v3-turbo", "language": "pt"}
+        headers = {"Authorization": f"Bearer {cfg.GROQ_API_KEY}"}
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers=headers,
+                files=files,
+                data=data,
+            )
+            r.raise_for_status()
+            return r.json().get("text", "").strip()
+    except Exception as e:
+        logger.warning(f"Transcrição de áudio falhou: {e}")
+        return None
 
 
 # ── Twilio ─────────────────────────────────────────────────────────────────────
