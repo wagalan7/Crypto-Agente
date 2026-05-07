@@ -3,6 +3,7 @@ import { Search } from 'lucide-react'
 import TickerBar from './components/TickerBar'
 import ChartPanel from './components/ChartPanel'
 import TradeManager from './components/TradeManager'
+import NLPPanel from './components/NLPPanel'
 import { api } from './services/api'
 import type { SignalDirection, TradeType } from './types'
 
@@ -176,6 +177,7 @@ async function fetchFreshTickers(): Promise<BinanceTicker[]> {
 
 export default function App() {
   const [showTradeManager, setShowTradeManager] = useState(false)
+  const [showNLP, setShowNLP] = useState(false)
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const [tradeMode, setTradeMode] = useState<TradeMode>('swing')
   const [filter, setFilter] = useState<Filter>('all')
@@ -448,6 +450,18 @@ export default function App() {
         <span className="text-slate-500 text-xs">{assets.length} pares</span>
         <div className="flex items-center gap-1.5">
           <button
+            onClick={() => setShowNLP(v => !v)}
+            className={`flex items-center gap-1 px-2 py-1 border rounded text-xs font-semibold transition-colors ${
+              showNLP
+                ? 'bg-violet-700/40 border-violet-500/60 text-violet-300'
+                : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
+            }`}
+            title="Coach PNL – Gestão Emocional"
+          >
+            <span>🧠</span>
+            <span className="hidden sm:block">PNL</span>
+          </button>
+          <button
             onClick={() => setShowTradeManager(v => !v)}
             className="flex items-center gap-1 px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-xs font-semibold text-slate-300"
           >
@@ -620,6 +634,10 @@ export default function App() {
           }}
           initialSignal={pendingSignal}
         />
+      )}
+
+      {showNLP && (
+        <NLPPanel onClose={() => setShowNLP(false)} />
       )}
     </div>
   )
