@@ -16,6 +16,8 @@ const TF_MAP: Record<string, string> = {
 function toTVSymbol(symbol: string): string {
   const isPerp = symbol.includes(':')
   const base = symbol.split(':')[0].replace('/', '')
+  // Perps: tenta BYBIT primeiro (melhor cobertura de altcoins)
+  // Spots: usa BINANCE
   return isPerp ? `BYBIT:${base}` : `BINANCE:${base}`
 }
 
@@ -52,22 +54,18 @@ function loadTVScript(cb: () => void) {
 interface Props {
   symbol: string
   interval: string
-  /** Chamado se o símbolo não for carregado após 30s */
   onSymbolNotFound?: () => void
 }
 
-export function TradingViewWidget({ symbol, interval, onSymbolNotFound }: Props) {
+export function TradingViewWidget({ symbol, interval }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const widgetRef = useRef<any>(null)
   const idRef = useRef(`tv_${Math.random().toString(36).slice(2)}`)
-  const fallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
-
-    if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current)
 
     el.innerHTML = ''
     const inner = document.createElement('div')
@@ -82,11 +80,6 @@ export function TradingViewWidget({ symbol, interval, onSymbolNotFound }: Props)
         widgetRef.current = null
       }
 
-      // Timer de 30s — cancela se onChartReady disparar
-      fallbackTimerRef.current = setTimeout(() => {
-        onSymbolNotFound?.()
-      }, 30_000)
-
       widgetRef.current = new window.TradingView.widget({
         container_id: idRef.current,
         autosize: true,
@@ -98,7 +91,7 @@ export function TradingViewWidget({ symbol, interval, onSymbolNotFound }: Props)
         locale: 'pt',
         toolbar_bg: '#131722',
         enable_publishing: false,
-        allow_symbol_change: false,
+        allow_symbol_change: true,   // permite buscar exchange alternativa
         hide_side_toolbar: false,
         hide_top_toolbar: false,
         withdateranges: true,
@@ -113,22 +106,11 @@ export function TradingViewWidget({ symbol, interval, onSymbolNotFound }: Props)
           'mainSeriesProperties.candleStyle.wickDownColor': '#ef5350',
         },
       })
-
-      // onChartReady é MÉTODO no widget, não propriedade de config
-      if (typeof widgetRef.current?.onChartReady === 'function') {
-        widgetRef.current.onChartReady(() => {
-          if (fallbackTimerRef.current) {
-            clearTimeout(fallbackTimerRef.current)
-            fallbackTimerRef.current = null
-          }
-        })
-      }
     }
 
     loadTVScript(createWidget)
 
     return () => {
-      if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current)
       if (widgetRef.current) {
         try { widgetRef.current.remove() } catch { /* ignore */ }
         widgetRef.current = null

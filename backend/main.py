@@ -416,6 +416,85 @@ Seja direto, objetivo e sempre justifique cada nível com estrutura de mercado r
         }
 
 
+@app.post("/api/nlp-coach")
+async def nlp_coach(body: dict):
+    """Coach de PNL em tempo real para gestão emocional do trader."""
+    estado = body.get("estado", "calmo")
+    intensidade = body.get("intensidade", 3)
+    contexto = body.get("contexto", "")
+    historico = body.get("historico", [])
+
+    historico_txt = ""
+    if historico:
+        historico_txt = "\n\nHistórico emocional desta sessão:\n" + "\n".join(
+            f"• {h.get('hora', '')} — {h.get('estado', '')} (intensidade {h.get('intensidade', '')})"
+            for h in historico[-5:]
+        )
+
+    prompt = f"""Você é um coach especialista em Programação Neurolinguística (PNL) aplicada ao trading. Seu papel é ajudar o trader a gerenciar seu estado emocional em tempo real, usando técnicas de PNL comprovadas.
+
+ESTADO ATUAL DO TRADER:
+• Emoção: {estado}
+• Intensidade: {intensidade}/5
+• Contexto: {contexto if contexto else "Não informado"}{historico_txt}
+
+Responda em português com esta estrutura OBRIGATÓRIA:
+
+---
+🧠 DIAGNÓSTICO DO ESTADO
+Em 1-2 frases, identifique o que está acontecendo neurologicamente e como isso afeta as decisões de trading agora. Seja direto e empático.
+
+---
+⚡ TÉCNICA DE PNL IMEDIATA
+Nome da técnica (ex: Ancoragem, Reencadramento, Dissociação, Rapport Interno, Swish Pattern, etc.)
+
+Passo a passo (máx 4 passos curtos):
+1. [ação física ou mental específica — 10-30 segundos]
+2. ...
+3. ...
+4. [resultado esperado]
+
+---
+💡 REENCADRAMENTO PARA TRADING
+Uma frase poderosa que muda a perspectiva agora. Exemplos de estrutura:
+• "Em vez de ver [problema], veja [oportunidade]"
+• "Traders profissionais usam [este estado] como sinal para [ação]"
+• "Este momento de [emoção] é exatamente quando [insight]"
+
+---
+🎯 AÇÃO PRÁTICA AGORA
+O que fazer com o trading nos próximos 5-15 minutos:
+• OPERAR / PAUSAR / REDUZIR TAMANHO / FECHAR POSIÇÕES
+• Justificativa curta baseada no estado emocional atual
+
+---
+🔋 AFIRMAÇÃO DE ESTADO
+Uma afirmação em 1ª pessoa, presente, positiva e específica para trading. (máx 2 linhas)
+
+Linguagem direta, calorosa e profissional. Máximo 300 palavras."""
+
+    if not ANTHROPIC_API_KEY:
+        return {
+            "coaching": (
+                f"Estado: {estado} (intensidade {intensidade}/5)\n\n"
+                "ℹ️ Coaching IA não disponível. Configure ANTHROPIC_API_KEY para habilitar o coach de PNL."
+            )
+        }
+
+    try:
+        from services.ai_service import get_client
+        client = get_client()
+        message = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return {"coaching": message.content[0].text}
+    except Exception as e:
+        logging.error(f"nlp_coach error: {e}")
+        return {"coaching": f"Erro ao gerar coaching: {str(e)[:200]}"}
+
+
 @app.get("/api/market-data")
 async def market_data(symbol: str):
     ticker, funding, oi = await asyncio.gather(

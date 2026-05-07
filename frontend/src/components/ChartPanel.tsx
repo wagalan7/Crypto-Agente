@@ -194,11 +194,10 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
               <CandleChart ref={chartHandleRef} candles={candles} signal={displaySignal} />
             </>
           ) : (
-            /* TradingView widget — com fallback automático após 10s */
+            /* TradingView widget — permanece até o usuário trocar manualmente */
             <TradingViewWidget
               symbol={symbol}
               interval={tf}
-              onSymbolNotFound={() => setUseFallback(true)}
             />
           )}
 
