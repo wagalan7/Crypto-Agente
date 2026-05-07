@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-gray-950 text-gray-100 font-sans;
+  }
+}
+
+@layer components {
+  .section-card {
+    @apply bg-gray-900 border border-gray-800 rounded-xl p-5;
+  }
+
+  .section-label {
+    @apply text-xs font-bold tracking-widest uppercase mb-3 px-2 py-1 rounded inline-block;
+  }
+
+  .agent-output {
+    @apply whitespace-pre-wrap text-sm text-gray-300 font-mono leading-relaxed;
+  }
+
+  .input-field {
+    @apply w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2.5 text-sm text-gray-100
+           placeholder-gray-500 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500
+           transition-colors;
+  }
+
+  .btn-primary {
+    @apply bg-brand-600 hover:bg-brand-700 disabled:bg-gray-700 disabled:text-gray-500
+           text-white font-semibold px-6 py-3 rounded-xl transition-colors w-full text-sm;
+  }
+}
+
+.blinking-cursor::after {
+  content: '▋';
+  animation: blink 1s step-end infinite;
+  color: #4f6ef7;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
