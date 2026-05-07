@@ -325,41 +325,84 @@ async def validate_drawing(body: dict):
         return {
             "analysis": (
                 f"Desenhos detectados em {symbol} ({timeframe}):\n\n{drawings_desc}\n\n"
-                "⚠️ ANTHROPIC_API_KEY não configurada no Railway. "
-                "Vá em Railway → seu serviço → Variables → adicione ANTHROPIC_API_KEY."
+                "ℹ️ Análise IA não disponível. Configure a variável ANTHROPIC_API_KEY para habilitar a validação inteligente de padrões."
             )
         }
 
-    prompt = f"""O usuário desenhou os seguintes níveis/linhas no gráfico de {symbol} (timeframe {timeframe}):
+    prompt = f"""Você é um analista técnico sênior. O trader marcou os seguintes níveis/estruturas no gráfico de {symbol} (timeframe {timeframe}):
 
 {drawings_desc}
 
-Analise estes desenhos como analista técnico sênior, em português simples (nível iniciante):
+Analise com precisão e siga esta estrutura OBRIGATÓRIA em português claro:
 
-1. **IDENTIFICAÇÃO**: Que estrutura/padrão esses desenhos representam? (suporte, resistência, tendência, canal, triângulo etc.) Explique em 1-2 frases simples.
+---
+🔍 IDENTIFICAÇÃO DO PADRÃO
+Diga exatamente o que esses desenhos representam: suporte/resistência, linha de tendência, canal, triângulo, topo/fundo duplo, range, retração de Fibonacci, etc. Seja específico — indique se é bullish ou bearish e por quê.
 
-2. **VALIDAÇÃO**: Esses níveis fazem sentido técnico? Por quê?
+---
+✅ CONCORDO / ❌ NÃO CONCORDO / ⏳ AGUARDAR
+Declare claramente se concorda com o setup desenhado.
+- Se CONCORDO: explique a consistência técnica (quantas vezes o nível foi testado, força da estrutura).
+- Se NÃO CONCORDO: explique o erro técnico e NÃO gere o setup.
+- Se AGUARDAR: diga exatamente o que precisa acontecer (ex: "aguardar fechamento acima de X").
 
-3. **SE VÁLIDO — SETUP COMPLETO**:
-   - Tipo: Scalp / Day Trade / Swing
-   - Entrada: [valor]
-   - Stop Loss: [valor] — justificativa (estrutura/liquidez/S-R)
-   - Alvo 1: [valor] — prob. ~X%
-   - Alvo 2: [valor] — prob. ~X%
-   - RR estimado: 1:X
+---
+📊 CONFLUÊNCIAS (somente se concordar)
+Liste 2–4 fatores que CONFIRMAM o setup. Use estruturas reais dos preços fornecidos, como:
+• "O nível X.XX coincide com retração 61.8% de Fibonacci do movimento anterior"
+• "Zona de suporte testada múltiplas vezes → alta probabilidade de reação"
+• "Linha de tendência ascendente intacta há N candles"
+• "Nível confluente com média móvel de 50/200 períodos"
+• "RSI em sobrevenda → pressão compradora provável"
 
-4. **RECOMENDAÇÃO FINAL**: OPERAR / AGUARDAR / NÃO OPERAR — por quê?
+---
+🎯 SETUP COMPLETO (somente se concordar)
 
-5. **CONFLUÊNCIAS**: 1-2 indicadores que confirmariam ou invalidariam.
+Direção: LONG / SHORT
+Tipo: Scalp / Day Trade / Swing
 
-Linguagem simples, máximo 5 parágrafos."""
+📍 Entrada: [preço exato]
+Motivo: [ex: rompimento confirmado de X.XX com fechamento acima / teste de suporte em X.XX / pullback para linha de tendência]
+
+🛑 Stop Loss: [preço exato]
+Motivo OBRIGATÓRIO — escolha o mais adequado:
+• "Abaixo do fundo anterior em [X.XX]" — invalida a estrutura de alta
+• "Abaixo da linha de suporte/tendência que serviu de base"
+• "Abaixo do nível 61.8% de Fibonacci em [X.XX]" — invalidação da retração
+• "Abaixo da zona de suporte/resistência histórica em [X.XX]"
+• "Acima do topo anterior em [X.XX]" (para SHORT)
+Risco em %: [X.XX%] do capital na posição
+
+🎯 Alvo 1: [preço exato] — probabilidade ~X%
+Motivo OBRIGATÓRIO:
+• "Resistência anterior testada em [X.XX]"
+• "Extensão 127.2% de Fibonacci em [X.XX]"
+• "Topo anterior / zona de supply em [X.XX]"
+• "Primeira resistência significativa em [X.XX]"
+
+🎯 Alvo 2: [preço exato] — probabilidade ~X%
+Motivo: [estrutura técnica que justifica — resistência, Fibonacci 161.8%, topo histórico, etc.]
+
+🎯 Alvo 3: [preço exato] — probabilidade ~X% (se o setup tiver potencial estendido)
+Motivo: [extensão máxima do movimento baseada em estrutura]
+
+📐 Risco/Retorno: 1:[X] — [aceitável ≥ 1:2 / excelente ≥ 1:3]
+
+---
+🚦 RECOMENDAÇÃO FINAL
+OPERAR AGORA / AGUARDAR CONFIRMAÇÃO / NÃO OPERAR
+
+Se aguardar: "Aguardar [evento específico] em [timeframe] antes de entrar."
+Se não operar: "Risco principal: [motivo concreto]."
+
+Seja direto, objetivo e sempre justifique cada nível com estrutura de mercado real."""
 
     try:
         from services.ai_service import get_client
         client = get_client()
         message = await client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=700,
+            model="claude-sonnet-4-6",
+            max_tokens=1200,
             messages=[{"role": "user", "content": prompt}]
         )
         return {"analysis": message.content[0].text}

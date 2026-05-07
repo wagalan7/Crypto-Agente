@@ -122,11 +122,17 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
               </span>
             </>
           )}
-          {useFallback && (
-            <span className="text-[10px] text-slate-500 bg-slate-800 rounded px-1.5 py-0.5 flex-shrink-0">
-              gráfico local
-            </span>
-          )}
+          <button
+            onClick={() => setUseFallback(v => !v)}
+            title={useFallback ? 'Voltar para TradingView' : 'Usar gráfico local (se TradingView não carregar)'}
+            className={`text-[10px] rounded px-1.5 py-0.5 flex-shrink-0 border transition-colors ${
+              useFallback
+                ? 'bg-amber-800/40 text-amber-400 border-amber-700/50 hover:bg-amber-800/60'
+                : 'bg-slate-800 text-slate-500 border-slate-700 hover:text-slate-300'
+            }`}
+          >
+            {useFallback ? '📊 local' : 'TV'}
+          </button>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
           <div className="hidden sm:flex gap-0.5">
