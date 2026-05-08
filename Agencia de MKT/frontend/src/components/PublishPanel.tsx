@@ -199,7 +199,7 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHe
             <textarea
               className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs text-gray-200
                          placeholder-gray-600 focus:outline-none focus:border-violet-500 resize-none"
-              rows={12}
+              style={{ height: '10cm' }}
               placeholder="Texto gerado pela agência aparece aqui automaticamente..."
               value={text}
               onChange={e => setText(e.target.value)}
