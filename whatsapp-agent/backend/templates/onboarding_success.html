@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Consultório criado! — Agente WhatsApp</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C' } } } }</script>
+</head>
+<body class="bg-gray-50 min-h-screen px-4 py-10">
+<div class="max-w-lg mx-auto">
+
+  <div class="text-center mb-8">
+    <div class="text-5xl mb-3">🎉</div>
+    <h1 class="text-2xl font-bold text-gray-900">Consultório criado com sucesso!</h1>
+    <p class="text-gray-500 mt-2">Guarde as informações abaixo com cuidado</p>
+  </div>
+
+  <div id="loading" class="text-center text-gray-400 py-10">Carregando...</div>
+  <div id="content" class="hidden space-y-4">
+
+    <!-- Painel -->
+    <div class="bg-white rounded-2xl border border-gray-200 p-6">
+      <div class="flex items-center gap-3 mb-4">
+        <span class="text-2xl">📊</span>
+        <h2 class="font-semibold text-gray-800">Seu painel de controle</h2>
+      </div>
+      <p class="text-sm text-gray-500 mb-3">Aqui você gerencia sua agenda, confirma consultas e vê conversas:</p>
+      <a id="dashboard-link" href="#" target="_blank"
+        class="block w-full text-center bg-brand text-white py-2.5 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        Abrir painel →
+      </a>
+      <p class="text-xs text-gray-400 mt-2 text-center">Salve este link — ele é exclusivo do seu consultório</p>
+    </div>
+
+    <!-- Webhook -->
+    <div class="bg-white rounded-2xl border border-gray-200 p-6">
+      <div class="flex items-center gap-3 mb-4">
+        <span class="text-2xl">📱</span>
+        <h2 class="font-semibold text-gray-800">Conectar WhatsApp (Z-API)</h2>
+      </div>
+      <ol class="text-sm text-gray-600 space-y-2 mb-4">
+        <li><span class="font-medium text-gray-800">1.</span> Crie sua conta em <a href="https://z-api.io" target="_blank" class="text-brand underline">z-api.io</a></li>
+        <li><span class="font-medium text-gray-800">2.</span> Crie uma instância e escaneie o QR Code</li>
+        <li><span class="font-medium text-gray-800">3.</span> Configure o webhook abaixo na aba <b>Webhooks → Ao receber</b></li>
+      </ol>
+      <div class="bg-gray-50 rounded-xl px-4 py-3 flex items-center justify-between gap-2">
+        <code id="webhook-url" class="text-xs text-gray-700 break-all"></code>
+        <button onclick="copy('webhook-url')" class="text-brand text-xs font-medium flex-shrink-0 hover:underline">Copiar</button>
+      </div>
+    </div>
+
+    <!-- Próximos passos -->
+    <div class="bg-white rounded-2xl border border-gray-200 p-6">
+      <div class="flex items-center gap-3 mb-4">
+        <span class="text-2xl">✅</span>
+        <h2 class="font-semibold text-gray-800">Próximos passos</h2>
+      </div>
+      <ul class="text-sm text-gray-600 space-y-2">
+        <li class="flex gap-2"><span class="text-green-500 font-bold">✓</span> Agente criado e funcionando</li>
+        <li class="flex gap-2"><span class="text-yellow-500">○</span> Conectar seu número no Z-API</li>
+        <li class="flex gap-2"><span class="text-yellow-500">○</span> Configurar o webhook acima</li>
+        <li class="flex gap-2"><span class="text-yellow-500">○</span> Testar enviando uma mensagem para o número</li>
+      </ul>
+    </div>
+
+    <!-- Manual -->
+    <div class="bg-white rounded-2xl border border-gray-200 p-6">
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-2xl">📖</span>
+        <h2 class="font-semibold text-gray-800">Manual do Sistema</h2>
+      </div>
+      <p class="text-sm text-gray-500 mb-4">Leia antes de configurar — o manual explica tudo que você precisa saber para usar o sistema corretamente.</p>
+      <a href="/static/manual.pdf" download="Manual_Consultorio_Inteligente.pdf"
+        class="flex items-center justify-center gap-2 w-full bg-brand text-white py-3 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        📥 Baixar Manual em PDF
+      </a>
+    </div>
+
+    <!-- Suporte -->
+    <div class="bg-pink-50 rounded-2xl border border-pink-200 p-5 text-center">
+      <p class="text-sm text-pink-800 font-semibold mb-1">Precisa de ajuda? 😊</p>
+      <p class="text-sm text-pink-700">Fale comigo no WhatsApp — te ajudo a configurar tudo:</p>
+      <a href="https://wa.me/5511968439527" target="_blank"
+        class="inline-block mt-3 bg-green-500 text-white text-sm font-semibold px-5 py-2.5 rounded-xl hover:bg-green-600 transition">
+        💬 (11) 96843-9527
+      </a>
+    </div>
+
+  </div>
+</div>
+
+<script>
+function copy(id) {
+  const text = document.getElementById(id).textContent;
+  navigator.clipboard.writeText(text).then(() => alert("Copiado!"));
+}
+
+async function load() {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("token");
+  if (!token) { document.getElementById("loading").textContent = "Link inválido."; return; }
+
+  const r = await fetch(`/onboarding/info?setup_token=${token}`);
+  if (!r.ok) { document.getElementById("loading").textContent = "Não encontrado."; return; }
+  const data = await r.json();
+
+  document.getElementById("dashboard-link").href = data.dashboard_url;
+  document.getElementById("dashboard-link").textContent = "Abrir painel → " + data.name;
+  document.getElementById("webhook-url").textContent = data.webhook_url;
+  document.getElementById("loading").classList.add("hidden");
+  document.getElementById("content").classList.remove("hidden");
+}
+
+load();
+</script>
+</body>
+</html>

@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Ativar seu agente — Agente de Atendimento</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C' } } } }</script>
+</head>
+<body class="bg-gray-50 min-h-screen flex items-center justify-center px-4 py-10">
+<div class="w-full max-w-lg">
+
+  <div class="text-center mb-8">
+    <div class="text-5xl mb-3">🎉</div>
+    <h1 class="text-2xl font-bold text-gray-900">Consultório criado!</h1>
+    <p class="text-gray-500 mt-2">Agora ative sua assinatura para começar a usar</p>
+  </div>
+
+  {% if cancelled %}
+  <div class="bg-yellow-50 border border-yellow-200 rounded-2xl p-4 mb-6 text-center">
+    <p class="text-yellow-800 text-sm">⚠️ Pagamento cancelado. Tente novamente quando quiser.</p>
+  </div>
+  {% endif %}
+
+  <!-- Resumo do plano -->
+  <div class="bg-white rounded-2xl border border-gray-200 p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="font-semibold text-gray-800">Plano Mensal</h2>
+      <span class="text-2xl font-black text-gray-900">R$ 200<span class="text-sm font-normal text-gray-400">/mês</span></span>
+    </div>
+    <ul class="space-y-2">
+      <li class="flex gap-2 text-sm text-gray-600"><span class="text-brand font-bold">✓</span> Agente WhatsApp com IA ilimitado</li>
+      <li class="flex gap-2 text-sm text-gray-600"><span class="text-brand font-bold">✓</span> Painel de controle completo</li>
+      <li class="flex gap-2 text-sm text-gray-600"><span class="text-brand font-bold">✓</span> Integração Google Calendar</li>
+      <li class="flex gap-2 text-sm text-gray-600"><span class="text-brand font-bold">✓</span> Confirmações automáticas</li>
+      <li class="flex gap-2 text-sm text-gray-600"><span class="text-brand font-bold">✓</span> Suporte via WhatsApp</li>
+    </ul>
+  </div>
+
+  <!-- Botões de pagamento -->
+  <div class="space-y-3">
+
+    <!-- Stripe -->
+    <form action="/checkout/stripe" method="POST">
+      <input type="hidden" name="setup_token" value="{{ setup_token }}"/>
+      <button type="submit"
+        class="w-full bg-gray-900 text-white py-4 rounded-2xl font-semibold text-sm hover:bg-gray-800 transition flex items-center justify-center gap-3">
+        <svg width="20" height="20" viewBox="0 0 60 25" fill="none">
+          <path d="M27.6 6.9c0-1.1.9-1.5 2.4-1.5 2.1 0 4.8.6 6.9 1.8V2.1C34.8.8 32.4.2 30 .2c-5.5 0-9.2 2.9-9.2 7.7 0 7.5 10.3 6.3 10.3 9.6 0 1.3-1.1 1.7-2.7 1.7-2.4 0-5.4-.9-7.8-2.3v5.2c2.7 1.1 5.4 1.6 7.8 1.6 5.9 0 10-2.9 10-7.8-.1-8.1-10.8-6.6-10.8-9" fill="white"/>
+        </svg>
+        Pagar com Cartão de Crédito
+        <span class="text-gray-400 text-xs">(Stripe)</span>
+      </button>
+    </form>
+
+    <div class="flex items-center gap-3">
+      <div class="flex-1 h-px bg-gray-200"></div>
+      <span class="text-gray-400 text-xs">ou pague com</span>
+      <div class="flex-1 h-px bg-gray-200"></div>
+    </div>
+
+    <!-- Mercado Pago -->
+    <form action="/checkout/mercadopago" method="POST">
+      <input type="hidden" name="setup_token" value="{{ setup_token }}"/>
+      <button type="submit"
+        class="w-full bg-[#009EE3] text-white py-4 rounded-2xl font-semibold text-sm hover:bg-[#0082c0] transition flex items-center justify-center gap-3">
+        <svg width="24" height="24" viewBox="0 0 48 48" fill="none">
+          <circle cx="24" cy="24" r="24" fill="#009EE3"/>
+          <path d="M8 24C8 15.163 15.163 8 24 8s16 7.163 16 16" stroke="white" stroke-width="3" stroke-linecap="round"/>
+          <path d="M14 24c0-5.523 4.477-10 10-10s10 4.477 10 10" stroke="white" stroke-width="3" stroke-linecap="round"/>
+          <circle cx="24" cy="24" r="3" fill="white"/>
+        </svg>
+        Pagar com PIX, Boleto ou Cartão
+        <span class="text-blue-200 text-xs">(Mercado Pago)</span>
+      </button>
+    </form>
+
+  </div>
+
+  <p class="text-center text-xs text-gray-400 mt-6">
+    🔒 Pagamento seguro · Cancele quando quiser · Sem contrato
+  </p>
+
+</div>
+</body>
+</html>

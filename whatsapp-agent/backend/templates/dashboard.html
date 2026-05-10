@@ -132,6 +132,66 @@
         <input id="cfg-min" type="number" min="30" max="120" value="{{ tenant.session_minutes }}"
           class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
       </div>
+      <div class="border-t border-gray-100 pt-4">
+        <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">📅 Dias de atendimento</p>
+        <div class="flex flex-wrap gap-2" id="cfg-days-wrap">
+          {% set wd = (tenant.working_days or '0,1,2,3,4').split(',') %}
+          {% for d, label in [('0','Seg'),('1','Ter'),('2','Qua'),('3','Qui'),('4','Sex'),('5','Sáb'),('6','Dom')] %}
+          <label class="flex items-center gap-1.5 cursor-pointer">
+            <input type="checkbox" class="cfg-day-cb" value="{{ d }}"
+              {{ 'checked' if d in wd else '' }}>
+            <span class="text-sm text-gray-700">{{ label }}</span>
+          </label>
+          {% endfor %}
+        </div>
+        <div class="mt-3 grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Intervalo bloqueado (ex: 12,13,14)</label>
+            <input id="cfg-blocked" type="text" placeholder="12,13,14"
+              value="{{ tenant.blocked_hours or '12,13,14' }}"
+              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Enviar confirmações a partir de</label>
+            <div class="flex items-center gap-2">
+              <input id="cfg-conf-hour" type="number" min="0" max="23"
+                value="{{ tenant.confirmation_hour or 17 }}"
+                class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+              <span class="text-sm text-gray-500 whitespace-nowrap">h</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="border-t border-gray-100 pt-4">
+        <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">💳 PIX para pagamento</p>
+        <div class="space-y-3">
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Chave PIX</label>
+            <input id="cfg-pix-key" type="text" placeholder="email, CPF, telefone ou chave aleatória"
+              value="{{ tenant.pix_key or '' }}"
+              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Nome do titular</label>
+            <input id="cfg-pix-name" type="text" placeholder="Nome completo ou razão social"
+              value="{{ tenant.pix_name or '' }}"
+              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+        </div>
+      </div>
+
+      <div class="border-t border-gray-100 pt-4">
+        <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">🔔 Notificações de novos pacientes</p>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Seu número de WhatsApp</label>
+          <input id="cfg-psy-phone" type="text" placeholder="5511999999999 (com código do país)"
+            value="{{ tenant.psychologist_phone or '' }}"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          <p class="text-xs text-gray-400 mt-1">Você receberá uma mensagem no WhatsApp quando um novo paciente entrar em contato.</p>
+        </div>
+      </div>
+
       <button onclick="saveConfig()"
         class="w-full bg-brand text-white py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition">
         Salvar
@@ -182,6 +242,22 @@
         <button onclick="navigator.clipboard.writeText(window.location.origin+'/controle/{{ token }}');showToast('Link copiado!','success')"
           class="text-xs text-brand font-medium flex-shrink-0">Copiar</button>
       </div>
+    </div>
+
+    <!-- Confirmações -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-2xl">📨</span>
+        <div>
+          <h3 class="font-semibold text-gray-800 text-sm">Confirmações de Amanhã</h3>
+          <p class="text-xs text-gray-500">Envia mensagem de confirmação para todos os pacientes de amanhã</p>
+        </div>
+      </div>
+      <button onclick="dispararConfirmacoes()" id="btn-confirmar"
+        class="w-full bg-green-600 text-white py-2.5 rounded-lg text-sm font-semibold hover:bg-green-700 transition">
+        📨 Enviar confirmações agora
+      </button>
+      <p id="confirmar-status" class="text-xs text-gray-400 text-center mt-2 hidden"></p>
     </div>
 
     <!-- Google Calendar -->
@@ -276,6 +352,40 @@
       <button onclick="submitNewAppt()" id="na-btn"
         class="w-full bg-brand text-white py-3 rounded-xl text-sm font-semibold hover:opacity-90 transition">
         Agendar consulta
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Reagendar -->
+<div id="modal-reschedule" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4">
+  <div class="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
+    <div class="flex items-center justify-between mb-5">
+      <h3 class="text-base font-semibold text-gray-800">🔄 Reagendar consulta</h3>
+      <button onclick="closeReschedule()" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+    </div>
+    <input type="hidden" id="rs-appt-id"/>
+    <div class="space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Nova data <span class="text-red-500">*</span></label>
+          <input id="rs-date" type="date"
+            class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Novo horário <span class="text-red-500">*</span></label>
+          <input id="rs-time" type="time"
+            class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+      </div>
+      <label class="flex items-center gap-2 cursor-pointer">
+        <input type="checkbox" id="rs-notify" checked class="accent-brand w-4 h-4"/>
+        <span class="text-sm text-gray-700">Notificar paciente via WhatsApp</span>
+      </label>
+      <div id="rs-error" class="hidden text-sm text-red-600 bg-red-50 rounded-xl px-4 py-2.5"></div>
+      <button onclick="submitReschedule()" id="rs-btn"
+        class="w-full bg-brand text-white py-3 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        Confirmar reagendamento
       </button>
     </div>
   </div>
@@ -415,8 +525,9 @@ function loadAgenda() {
                 ${a.confirmed ? '✓ Confirmado' : '⏳ Pendente'}
               </span>
             </div>
-            <div class="flex gap-2 flex-shrink-0">
+            <div class="flex gap-2 flex-shrink-0 flex-wrap justify-end">
               ${!a.confirmed ? `<button onclick="confirmAppt(${a.id})" class="text-xs bg-green-100 text-green-700 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">Confirmar</button>` : ''}
+              <button onclick="openReschedule(${a.id}, '${a.scheduled_at}')" class="text-xs bg-blue-100 text-blue-700 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">🔄 Reagendar</button>
               <button onclick="cancelAppt(${a.id})" class="text-xs bg-red-100 text-red-600 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">Cancelar</button>
             </div>
           </div>
@@ -530,6 +641,12 @@ function saveConfig() {
     working_hours_start: +document.getElementById("cfg-start").value,
     working_hours_end: +document.getElementById("cfg-end").value,
     session_minutes: +document.getElementById("cfg-min").value,
+    pix_key: document.getElementById("cfg-pix-key").value,
+    pix_name: document.getElementById("cfg-pix-name").value,
+    working_days: [...document.querySelectorAll('.cfg-day-cb:checked')].map(c=>c.value).join(','),
+    blocked_hours: document.getElementById("cfg-blocked").value,
+    confirmation_hour: +document.getElementById("cfg-conf-hour").value,
+    psychologist_phone: document.getElementById("cfg-psy-phone").value,
   })}).then(() => {
     showToast("✓ Configurações salvas","success");
     const m = document.getElementById("cfg-msg");
@@ -635,6 +752,28 @@ document.getElementById("modal-appt").addEventListener("click", function(e) {
   if (e.target === this) closeNewAppt();
 });
 
+// ── Confirmações ──────────────────────────────────────────────────────────────
+async function dispararConfirmacoes() {
+  const btn = document.getElementById('btn-confirmar');
+  const status = document.getElementById('confirmar-status');
+  btn.disabled = true;
+  btn.textContent = '⏳ Enviando...';
+  status.classList.add('hidden');
+  try {
+    const r = await fetch('/admin/confirmacoes/disparar', {method:'POST'});
+    const data = await r.json();
+    const n = data.enviados || 0;
+    btn.textContent = `✓ ${n} mensagem(ns) enviada(s)`;
+    btn.classList.replace('bg-green-600','bg-green-500');
+    status.textContent = n === 0 ? 'Nenhuma consulta pendente para amanhã.' : `Confirmações enviadas com sucesso!`;
+    status.classList.remove('hidden');
+  } catch(e) {
+    btn.textContent = '📨 Enviar confirmações agora';
+    btn.disabled = false;
+    showToast('Erro ao enviar confirmações','error');
+  }
+}
+
 // ── Billing ───────────────────────────────────────────────────────────────────
 async function openBillingPortal() {
   const r = await api("/dashboard/api/billing-portal");
@@ -649,6 +788,76 @@ function gcalDisconnect() {
     setTimeout(() => location.reload(), 1500);
   });
 }
+
+// ── Reagendar ─────────────────────────────────────────────────────────────────
+function openReschedule(id, scheduledAt) {
+  document.getElementById("rs-appt-id").value = id;
+  document.getElementById("rs-error").classList.add("hidden");
+  document.getElementById("rs-btn").textContent = "Confirmar reagendamento";
+  document.getElementById("rs-btn").disabled = false;
+  document.getElementById("rs-notify").checked = true;
+
+  // Preencher data/hora atual do agendamento
+  const dt = new Date(scheduledAt);
+  const y = dt.getFullYear();
+  const mo = String(dt.getMonth()+1).padStart(2,"0");
+  const d  = String(dt.getDate()).padStart(2,"0");
+  const h  = String(dt.getHours()).padStart(2,"0");
+  const mi = String(dt.getMinutes()).padStart(2,"0");
+  document.getElementById("rs-date").value = `${y}-${mo}-${d}`;
+  document.getElementById("rs-time").value = `${h}:${mi}`;
+
+  document.getElementById("modal-reschedule").classList.remove("hidden");
+}
+
+function closeReschedule() {
+  document.getElementById("modal-reschedule").classList.add("hidden");
+}
+
+async function submitReschedule() {
+  const id   = document.getElementById("rs-appt-id").value;
+  const date = document.getElementById("rs-date").value;
+  const time = document.getElementById("rs-time").value;
+  const notify = document.getElementById("rs-notify").checked;
+  const errEl  = document.getElementById("rs-error");
+  const btn    = document.getElementById("rs-btn");
+
+  errEl.classList.add("hidden");
+  if (!date || !time) {
+    errEl.textContent = "Preencha a data e o horário.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+
+  const dt = new Date(`${date}T${time}:00`);
+  const localIso = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}-${String(dt.getDate()).padStart(2,"0")}T${String(dt.getHours()).padStart(2,"0")}:${String(dt.getMinutes()).padStart(2,"0")}:00`;
+
+  btn.textContent = "Reagendando...";
+  btn.disabled = true;
+
+  try {
+    const r = await api(`/dashboard/api/appointments/${id}/reschedule`, {
+      method: "PATCH",
+      body: JSON.stringify({ scheduled_at: localIso, notify_patient: notify })
+    });
+    if (r.status === "rescheduled") {
+      closeReschedule();
+      loadAgenda();
+      showToast("🔄 Consulta reagendada com sucesso!", "success");
+    } else {
+      throw new Error(r.detail || "Erro ao reagendar");
+    }
+  } catch(e) {
+    errEl.textContent = e.message || "Erro ao reagendar.";
+    errEl.classList.remove("hidden");
+    btn.textContent = "Confirmar reagendamento";
+    btn.disabled = false;
+  }
+}
+
+document.getElementById("modal-reschedule").addEventListener("click", function(e) {
+  if (e.target === this) closeReschedule();
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 connectSSE();

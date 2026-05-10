@@ -35,9 +35,12 @@ BASE_URL = os.getenv("BASE_URL", "https://agente-atendimento-production.up.railw
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
-STRIPE_SECRET_KEY      = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_PRICE_ID        = os.getenv("STRIPE_PRICE_ID", "")
+STRIPE_SECRET_KEY          = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET      = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID            = os.getenv("STRIPE_PRICE_ID", "")           # legado
+STRIPE_PRICE_MENSAL        = os.getenv("STRIPE_PRICE_MENSAL", "")       # R$199/mês
+STRIPE_PRICE_SEMESTRAL     = os.getenv("STRIPE_PRICE_SEMESTRAL", "")    # R$1.014 a cada 6m
+STRIPE_PRICE_ANUAL         = os.getenv("STRIPE_PRICE_ANUAL", "")
 
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
 

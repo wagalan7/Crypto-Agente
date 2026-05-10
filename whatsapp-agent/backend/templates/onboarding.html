@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Configurar meu consultório — Agente WhatsApp</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C' } } } }</script>
+</head>
+<body class="bg-gray-50 min-h-screen flex items-center justify-center px-4 py-10">
+
+<div class="w-full max-w-lg">
+
+  <!-- Logo / título -->
+  <div class="text-center mb-8">
+    <div class="text-5xl mb-3">🤖</div>
+    <h1 class="text-2xl font-bold text-gray-900">Agente de Atendimento WhatsApp</h1>
+    <p class="text-gray-500 mt-2">Configure seu consultório em menos de 2 minutos</p>
+  </div>
+
+  <!-- Card -->
+  <div class="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 md:p-8">
+
+    <div id="form-section">
+      <h2 class="text-lg font-semibold text-gray-800 mb-5">Dados do consultório</h2>
+
+      <div class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Nome do consultório <span class="text-red-500">*</span></label>
+          <input id="name" type="text" placeholder="Ex: Consultório Psicologia Bem Estar"
+            class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Nome do(a) psicólogo(a) <span class="text-red-500">*</span></label>
+          <input id="psy" type="text" placeholder="Ex: Ana Lima"
+            class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">E-mail <span class="text-red-500">*</span></label>
+          <input id="email" type="email" placeholder="seu@email.com"
+            class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Atendimento início</label>
+            <select id="start" class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+              {% for h in range(6, 21) %}
+              <option value="{{ h }}" {% if h == 8 %}selected{% endif %}>{{ '%02d'|format(h) }}:00</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Atendimento fim</label>
+            <select id="end" class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+              {% for h in range(10, 23) %}
+              <option value="{{ h }}" {% if h == 18 %}selected{% endif %}>{{ '%02d'|format(h) }}:00</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Duração de cada sessão</label>
+          <select id="minutes" class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+            <option value="45">45 minutos</option>
+            <option value="50" selected>50 minutos</option>
+            <option value="60">60 minutos (1 hora)</option>
+            <option value="90">90 minutos</option>
+          </select>
+        </div>
+
+        <div id="error-msg" class="hidden text-sm text-red-600 bg-red-50 rounded-xl px-4 py-2.5"></div>
+
+        <button onclick="submit()" id="btn"
+          class="w-full bg-brand text-white py-3 rounded-xl text-sm font-semibold hover:opacity-90 active:scale-95 transition mt-2">
+          Criar meu agente →
+        </button>
+      </div>
+    </div>
+
+  </div>
+
+  <p class="text-center text-xs text-gray-400 mt-6">Powered by Claude AI · Agente de Atendimento</p>
+</div>
+
+<script>
+async function submit() {
+  const name    = document.getElementById("name").value.trim();
+  const psy     = document.getElementById("psy").value.trim();
+  const email   = document.getElementById("email").value.trim();
+  const start   = +document.getElementById("start").value;
+  const end     = +document.getElementById("end").value;
+  const minutes = +document.getElementById("minutes").value;
+  const errEl   = document.getElementById("error-msg");
+  const btn     = document.getElementById("btn");
+
+  errEl.classList.add("hidden");
+
+  if (!name || !psy || !email) {
+    errEl.textContent = "Preencha todos os campos obrigatórios.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+  if (end <= start) {
+    errEl.textContent = "O horário de fim deve ser depois do início.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+
+  btn.textContent = "Criando...";
+  btn.disabled = true;
+
+  try {
+    const r = await fetch("/onboarding/create", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ name, psychologist_name: psy, email, working_hours_start: start, working_hours_end: end, session_minutes: minutes })
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || "Erro ao criar consultório.");
+    window.location.href = `/onboarding/pagamento?token=${data.setup_token}`;
+  } catch(e) {
+    errEl.textContent = e.message;
+    errEl.classList.remove("hidden");
+    btn.textContent = "Criar meu agente →";
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
