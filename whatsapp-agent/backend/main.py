@@ -5,9 +5,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, HTMLResponse, StreamingResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from typing import Optional
@@ -39,6 +40,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Agente de Atendimento — Multi-Consultório", lifespan=lifespan)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
+_STATIC_DIR = Path(__file__).parent / "static"
+_STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -57,10 +62,37 @@ def _get_tenant(slug: str) -> dict:
 
 
 async def _handle_message(tenant: dict, phone: str, text: str):
+    phone = "".join(c for c in phone if c.isdigit())  # normaliza sempre
     # Verificar se o agente está pausado para este contato
     if db.is_agent_paused(tenant["id"], phone):
         logger.info(f"[{tenant['slug']}][{phone}] Agente pausado — mensagem ignorada")
         return
+
+    # ── Imagem / documento → responder direto, sem passar pelo agente ───────────
+    if text == "__IMAGEM__":
+        logger.info(f"[{tenant['slug']}][{phone}] Imagem/doc recebido — respondendo como comprovante")
+        await wa.send_message(tenant, phone,
+            "Obrigada pelo pagamento! 😊 Recebi o comprovante. Em breve enviarei a nota fiscal. Até a sessão!")
+        db.save_message(tenant["id"], phone, "user", "[comprovante de pagamento enviado]")
+        db.save_message(tenant["id"], phone, "assistant",
+            "Obrigada pelo pagamento! 😊 Recebi o comprovante. Em breve enviarei a nota fiscal. Até a sessão!")
+        return
+
+    # ── Urgência / crise → notificar psicóloga imediatamente ────────────────────
+    _URGENCY_KEYWORDS = ("preciso de ajuda", "socorro", "não aguento", "nao aguento",
+                         "me machucar", "suicídio", "suicidio", "desistir de tudo",
+                         "não quero mais", "nao quero mais", "crise", "emergência", "emergencia")
+    if any(kw in text.lower() for kw in _URGENCY_KEYWORDS):
+        psy_phone = tenant.get("psychologist_phone", "")
+        if psy_phone:
+            urgency_notif = (
+                f"🚨 *Mensagem urgente de paciente!*\n"
+                f"Número: {phone}\n\n"
+                f"Mensagem: _{text}_\n\n"
+                f"Recomendo entrar em contato o quanto antes."
+            )
+            await wa.send_message(tenant, psy_phone, urgency_notif)
+            logger.info(f"[{tenant['slug']}] ⚠️ Notificação de urgência enviada para psicóloga")
 
     # ── Áudio: transcrever antes de processar ────────────────────────────────────
     if text.startswith("__AUDIO__:"):
@@ -71,18 +103,52 @@ async def _handle_message(tenant: dict, phone: str, text: str):
             text = transcribed
             logger.info(f"[{tenant['slug']}][{phone}] Transcrição: {text[:80]}")
         else:
-            # Sem Groq configurado ou falha — pedir para o paciente digitar
             await wa.send_message(tenant, phone,
                 "Recebi seu áudio! 🎙️ Mas ainda não consigo ouvir mensagens de voz. "
                 "Pode me enviar a mesma mensagem em texto? Assim posso te ajudar melhor 😊")
             return
 
+    # Detectar se é primeira mensagem de um novo contato (antes de salvar)
+    is_first_message = len(db.get_conversation_history(tenant["id"], phone, limit=1)) == 0
+
     try:
         reply, resp, event = agent.process_message(tenant, phone, text)
         await wa.send_message(tenant, phone, reply)
         logger.info(f"[{tenant['slug']}][{phone}] intent={resp.intent} action={resp.action}")
-        if event:
+
+        # ── Notificar psicóloga quando novo paciente entrar em contato ───────────
+        if resp.intent == "new_patient":
+            patient_name = resp.data.get("patient_name", "") if resp.data else ""
+            psy_phone = tenant.get("psychologist_phone", "")
+            if psy_phone and is_first_message:
+                nome_display = patient_name if patient_name else "novo contato"
+                notif = (
+                    f"🔔 *Novo paciente!*\n"
+                    f"*{nome_display}* entrou em contato pelo WhatsApp.\n"
+                    f"Número: {phone}\n\n"
+                    f"Ele(a) está aguardando seu retorno para conhecer o processo. 😊"
+                )
+                await wa.send_message(tenant, psy_phone, notif)
+                logger.info(f"[{tenant['slug']}] Notificação enviada para psicóloga ({psy_phone})")
+
+            # ── Auto-registrar novo paciente na agenda (placeholder) ──────────
+            if patient_name:
+                already = db.get_appointments_by_phone(tenant["id"], phone)
+                if not already:
+                    from datetime import datetime as _dt
+                    placeholder = _dt(2099, 1, 1, 9, 0)
+                    db.create_appointment(tenant["id"], patient_name, phone,
+                                          placeholder, "Novo paciente — aguardando agendamento")
+                    logger.info(f"[{tenant['slug']}] Auto-registrado: {patient_name} ({phone})")
+
+            # Publicar evento no dashboard mesmo sem nome ainda
+            await events.publish(tenant["id"], "new_patient", {
+                "phone": phone,
+                "patient_name": patient_name or phone,
+            })
+        elif event:
             await events.publish(tenant["id"], event["type"], event["data"])
+
     except Exception as e:
         logger.exception(f"[{tenant['slug']}] Erro ao processar {phone}: {e}")
         await wa.send_message(tenant, phone,
@@ -230,6 +296,8 @@ class TenantUpdate(BaseModel):
     working_days: Optional[str] = None
     blocked_hours: Optional[str] = None
     confirmation_hour: Optional[int] = None
+    psychologist_phone: Optional[str] = None
+    free_until: Optional[str] = None  # data ISO (YYYY-MM-DD) de acesso gratuito
 
 
 @app.patch("/admin/tenants/{slug}")
@@ -290,6 +358,19 @@ def clear_conversation(slug: str, phone: str):
     tenant = _get_tenant(slug)
     db.clear_conversation(tenant["id"], phone)
     return {"status": "cleared"}
+
+
+@app.delete("/admin/{slug}/conversations/all")
+def clear_all_conversations(slug: str):
+    """Limpa TODO o histórico de conversas e pausa do tenant."""
+    tenant = _get_tenant(slug)
+    with db.get_conn() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE tenant_id = ?", (tenant["id"],)
+        ).fetchone()[0]
+        conn.execute("DELETE FROM conversations WHERE tenant_id = ?", (tenant["id"],))
+        conn.execute("DELETE FROM agent_paused WHERE tenant_id = ?", (tenant["id"],))
+    return {"status": "cleared", "deleted_messages": total}
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
@@ -372,6 +453,53 @@ def dash_confirm(appt_id: int, request: Request):
     return {"status": "confirmed"}
 
 
+class RescheduleBody(BaseModel):
+    scheduled_at: str  # ISO datetime, ex: "2026-05-13T14:00:00"
+    notify_patient: bool = True
+
+
+@app.patch("/dashboard/api/appointments/{appt_id}/reschedule")
+async def dash_reschedule(appt_id: int, body: RescheduleBody, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    appt = db.get_appointment_by_id(tenant["id"], appt_id)
+    if not appt:
+        raise HTTPException(status_code=404, detail="Consulta não encontrada.")
+    try:
+        new_dt = datetime.fromisoformat(body.scheduled_at)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Data/hora inválida.")
+
+    # Atualiza no banco
+    db.update_appointment(tenant["id"], appt_id, new_dt)
+    # Resetar confirmação (nova data = pendente)
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE appointments SET confirmed=0, confirmation_sent=0, followup_sent=0 WHERE id=? AND tenant_id=?",
+            (appt_id, tenant["id"])
+        )
+
+    # Atualiza no Google Calendar
+    if appt.get("google_event_id"):
+        try:
+            gcal.update_event(tenant, appt["google_event_id"],
+                              appt["patient_name"], new_dt.isoformat(),
+                              tenant.get("session_minutes", 50))
+        except Exception as e:
+            logger.warning(f"[gcal] reagendamento falhou: {e}")
+
+    # Notifica paciente via WhatsApp
+    if body.notify_patient and appt.get("phone"):
+        import calendar_service as cal_svc
+        formatted = cal_svc.format_slots([new_dt])[0]
+        msg = (f"Olá, {appt['patient_name']}! 😊 "
+               f"Sua sessão foi reagendada para *{formatted}*. "
+               f"Qualquer dúvida é só responder aqui. Até lá! 🌸")
+        await wa.send_message(tenant, appt["phone"], msg)
+
+    return {"status": "rescheduled", "scheduled_at": new_dt.isoformat()}
+
+
 @app.delete("/dashboard/api/appointments/{appt_id}/cancel")
 def dash_cancel(appt_id: int, request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
@@ -436,18 +564,56 @@ def dash_paused(request: Request):
 
 # ── Painel Mobile de Controle ──────────────────────────────────────────────────
 
+def _norm_phone(phone: str) -> str:
+    """Normaliza número removendo tudo que não é dígito."""
+    return "".join(c for c in phone if c.isdigit())
+
+
 @app.get("/controle/{token}", response_class=HTMLResponse)
 def controle_mobile(token: str, request: Request):
     """Painel leve para pausar/retomar o agente direto do celular."""
     tenant = _get_tenant_by_token(token)
     with db.get_conn() as conn:
-        rows = conn.execute(
+        # Contatos de agendamentos (com nome)
+        appt_rows = conn.execute(
             """SELECT DISTINCT phone, patient_name FROM appointments
-               WHERE tenant_id = ? ORDER BY patient_name""",
+               WHERE tenant_id = ? AND phone != ''""",
             (tenant["id"],)
         ).fetchall()
-    patients = [dict(r) for r in rows]
-    paused = set(db.list_paused_phones(tenant["id"]))
+        # Contatos de conversas (podem não ter agendamento)
+        conv_rows = conn.execute(
+            """SELECT DISTINCT phone FROM conversations
+               WHERE tenant_id = ? AND phone != '' AND role = 'user'""",
+            (tenant["id"],)
+        ).fetchall()
+
+    # Monta dicionário phone → nome(s) — agrupa múltiplos pacientes no mesmo número
+    names_by_phone: dict[str, list[str]] = {}
+    for r in appt_rows:
+        p = _norm_phone(r["phone"])
+        if p and r["patient_name"]:
+            if p not in names_by_phone:
+                names_by_phone[p] = []
+            if r["patient_name"] not in names_by_phone[p]:
+                names_by_phone[p].append(r["patient_name"])
+
+    seen: dict[str, str] = {
+        p: " / ".join(names) for p, names in names_by_phone.items()
+    }
+    # Adiciona contatos de conversas que não estão na agenda
+    for r in conv_rows:
+        p = _norm_phone(r["phone"])
+        if p and p not in seen:
+            seen[p] = ""  # sem nome — mostra só o número
+
+    patients = sorted(
+        [{"phone": p, "patient_name": name} for p, name in seen.items()],
+        key=lambda x: x["patient_name"].lower() if x["patient_name"] else x["phone"]
+    )
+
+    # Normaliza os phones pausados também
+    paused = set(_norm_phone(ph) for ph in db.list_paused_phones(tenant["id"]))
+
     return templates.TemplateResponse("controle.html", {
         "request": request,
         "tenant": tenant,
@@ -460,14 +626,50 @@ def controle_mobile(token: str, request: Request):
 @app.post("/controle/{token}/pausar/{phone}", response_class=HTMLResponse)
 def controle_pausar(token: str, phone: str):
     tenant = _get_tenant_by_token(token)
-    db.pause_agent(tenant["id"], phone)
+    db.pause_agent(tenant["id"], _norm_phone(phone))
     return RedirectResponse(f"/controle/{token}", status_code=303)
 
 
 @app.post("/controle/{token}/retomar/{phone}", response_class=HTMLResponse)
 def controle_retomar(token: str, phone: str):
     tenant = _get_tenant_by_token(token)
-    db.resume_agent(tenant["id"], phone)
+    db.resume_agent(tenant["id"], _norm_phone(phone))
+    return RedirectResponse(f"/controle/{token}", status_code=303)
+
+
+@app.post("/controle/{token}/excluir/{phone}", response_class=HTMLResponse)
+def controle_excluir(token: str, phone: str):
+    """Remove completamente um contato: conversas, agendamentos e pausa."""
+    tenant = _get_tenant_by_token(token)
+    p = _norm_phone(phone)
+    db.clear_conversation(tenant["id"], p)
+    db.resume_agent(tenant["id"], p)
+    # Remove também da tabela de agendamentos
+    with db.get_conn() as conn:
+        conn.execute(
+            "DELETE FROM appointments WHERE tenant_id = ? AND replace(replace(replace(phone,'+',''),'-',''),' ','') = ?",
+            (tenant["id"], p)
+        )
+    return RedirectResponse(f"/controle/{token}", status_code=303)
+
+
+@app.post("/controle/{token}/novo-paciente", response_class=HTMLResponse)
+def controle_novo_paciente(token: str, request: Request,
+                           patient_name: str = Form(...),
+                           phone: str = Form(...)):
+    """Cadastra um novo paciente manualmente com placeholder na agenda."""
+    tenant = _get_tenant_by_token(token)
+    p = _norm_phone(phone)
+    if not p:
+        return RedirectResponse(f"/controle/{token}", status_code=303)
+    from datetime import datetime as _dt
+    # Verifica se já existe
+    existing = db.get_appointments_by_phone(tenant["id"], p)
+    if not existing:
+        placeholder = _dt(2099, 1, 1, 9, 0)
+        db.create_appointment(tenant["id"], patient_name.strip(), p,
+                              placeholder, "Cadastrado manualmente — aguardando agendamento")
+        logger.info(f"[{tenant['slug']}] Novo paciente manual: {patient_name} ({p})")
     return RedirectResponse(f"/controle/{token}", status_code=303)
 
 
@@ -696,11 +898,12 @@ def payment_page(request: Request, token: str = "", cancelled: int = 0):
 async def checkout_stripe(request: Request):
     form = await request.form()
     setup_token = form.get("setup_token", "")
+    plan = form.get("plan", "mensal")
     tenant = db.get_tenant_by_setup_token(setup_token)
     if not tenant:
         raise HTTPException(status_code=404, detail="Token inválido.")
     try:
-        url = stripe_svc.create_checkout_session(tenant)
+        url = stripe_svc.create_checkout_session(tenant, plan=plan)
         return RedirectResponse(url, status_code=303)
     except Exception as e:
         logger.exception(f"Stripe checkout error: {e}")
@@ -733,11 +936,12 @@ def billing_portal(request: Request):
 async def checkout_mercadopago(request: Request):
     form = await request.form()
     setup_token = form.get("setup_token", "")
+    plan = form.get("plan", "mensal")
     tenant = db.get_tenant_by_setup_token(setup_token)
     if not tenant:
         raise HTTPException(status_code=404, detail="Token inválido.")
     try:
-        url = mp_svc.create_subscription(tenant)
+        url = mp_svc.create_subscription(tenant, plan=plan)
         return RedirectResponse(url, status_code=303)
     except Exception as e:
         logger.exception(f"MP checkout error: {e}")

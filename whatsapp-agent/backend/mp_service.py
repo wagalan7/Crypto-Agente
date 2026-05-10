@@ -21,23 +21,33 @@ def _configured() -> bool:
     return bool(config.MP_ACCESS_TOKEN)
 
 
-def create_subscription(tenant: dict) -> str:
+MP_PLANS = {
+    "mensal":    {"label": "Mensal",    "frequency": 1,  "amount": 199.00},
+    "semestral": {"label": "Semestral", "frequency": 6,  "amount": 1014.00},
+    "anual":     {"label": "Anual",     "frequency": 12, "amount": 1788.00},
+}
+
+
+def create_subscription(tenant: dict, plan: str = "mensal") -> str:
     """Cria uma assinatura no Mercado Pago e retorna a URL de pagamento (init_point)."""
     base = config.BASE_URL
     setup_token = tenant.get("setup_token", "")
+    p = MP_PLANS.get(plan, MP_PLANS["mensal"])
 
     payload = {
-        "reason": "Agente de Atendimento WhatsApp — Plano Mensal",
+        "reason": f"Consultório Inteligente — Plano {p['label']}",
         "external_reference": setup_token,
         "auto_recurring": {
-            "frequency": 1,
+            "frequency": p["frequency"],
             "frequency_type": "months",
-            "transaction_amount": 200,
+            "transaction_amount": p["amount"],
             "currency_id": "BRL",
         },
         "back_url": f"{base}/onboarding/sucesso?token={setup_token}&paid=1",
         "status": "pending",
     }
+    db.update_tenant(tenant["slug"], plan=plan)
+    logger.info(f"[mp] Criando assinatura para {tenant['slug']} — plano {p['label']} R${p['amount']}")
 
     # Adicionar e-mail do pagador se disponível
     if tenant.get("email"):
@@ -105,8 +115,11 @@ def handle_webhook(data: dict) -> dict:
         db.update_tenant(tenant["slug"], status="active", mp_subscription_id=sub_id)
         logger.info(f"[mp] Tenant {tenant['slug']} ativado via MP")
     elif status in ("cancelled", "paused"):
-        db.update_tenant(tenant["slug"], status="suspended")
-        logger.info(f"[mp] Tenant {tenant['slug']} suspenso via MP (status={status})")
+        if db.is_tenant_exempt(tenant):
+            logger.info(f"[mp] Tenant {tenant['slug']} isento (free_until) — suspensão ignorada")
+        else:
+            db.update_tenant(tenant["slug"], status="suspended")
+            logger.info(f"[mp] Tenant {tenant['slug']} suspenso via MP (status={status})")
 
     return {"received": True}
 

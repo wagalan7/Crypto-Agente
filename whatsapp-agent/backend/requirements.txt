@@ -10,3 +10,5 @@ google-auth==2.29.0
 google-auth-oauthlib==1.2.0
 google-api-python-client==2.127.0
 stripe==10.5.0
+python-multipart==0.0.9
+groq==0.11.0

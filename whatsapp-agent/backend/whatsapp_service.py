@@ -141,11 +141,19 @@ def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
     }
     Retorna (phone, text) onde text pode ser transcrito de áudio.
     """
+    # Tipos de mensagem que o Z-API pode enviar para mídias recebidas
+    _MEDIA_TYPES = {
+        "documentmessage", "imagemessage", "audiomessage",
+        "document", "image", "audio", "file", "pdf",
+    }
+
     try:
         if payload.get("fromMe"):
             return None
-        if payload.get("type") not in ("ReceivedCallback", None):
-            if payload.get("type") and "Received" not in payload.get("type", ""):
+        _t = (payload.get("type") or "").lower()
+        if _t and _t not in ("receivedcallback",) and "received" not in _t:
+            # Permite passar tipos de mídia mesmo sem "Received" no nome
+            if _t not in _MEDIA_TYPES:
                 return None
         phone = payload.get("phone", "").replace("+", "").replace("-", "")
         if not phone:
@@ -154,9 +162,31 @@ def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
         # Texto direto
         text = (payload.get("text") or {}).get("message", "")
 
-        # Caption de imagem
+        # Imagem → usa caption se tiver, senão trata como comprovante
         if not text:
-            text = (payload.get("image") or {}).get("caption", "")
+            image = payload.get("image") or {}
+            if image:
+                caption = image.get("caption", "").strip()
+                text = caption if caption else "__IMAGEM__"
+                logger.info(f"[ZAPI] Imagem recebida de {phone} — caption={caption!r}")
+
+        # Documento / PDF → tenta vários campos que o Z-API pode usar
+        if not text:
+            doc = (
+                payload.get("document")
+                or payload.get("file")
+                or payload.get("pdf")
+                or {}
+            )
+            if doc:
+                caption = (doc.get("caption") or doc.get("fileName") or "").strip()
+                text = caption if caption else "__IMAGEM__"
+                logger.info(f"[ZAPI] Documento recebido de {phone} — caption={caption!r}")
+
+        # Qualquer outro tipo de mídia não reconhecida → trata como comprovante
+        if not text and _t in _MEDIA_TYPES:
+            text = "__IMAGEM__"
+            logger.info(f"[ZAPI] Mídia genérica de {phone} — type={payload.get('type')} keys={list(payload.keys())}")
 
         # Áudio → tenta vários campos que o Z-API pode usar
         if not text:
@@ -165,14 +195,13 @@ def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
                 audio.get("audioUrl")
                 or audio.get("url")
                 or audio.get("link")
-                or audio.get("base64")  # alguns retornam base64
+                or audio.get("base64")
                 or ""
             )
             if audio_url:
                 logger.info(f"[ZAPI] Áudio detectado para {phone}: {audio_url[:60]}")
                 return phone, f"__AUDIO__:{audio_url}"
-            # Log para debug: mostrar todo o payload quando não tem texto nem áudio
-            logger.info(f"[ZAPI] Payload sem texto/áudio para {phone}: keys={list(payload.keys())} audio_raw={audio}")
+            logger.info(f"[ZAPI] Payload sem texto/áudio/imagem para {phone}: keys={list(payload.keys())}")
 
         if phone and text:
             return phone, text

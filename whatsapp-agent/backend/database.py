@@ -77,11 +77,15 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN stripe_subscription_id TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN mp_subscription_id TEXT DEFAULT ''",
             "ALTER TABLE appointments ADD COLUMN confirmation_sent INTEGER DEFAULT 0",
+            "ALTER TABLE appointments ADD COLUMN followup_sent INTEGER DEFAULT 0",
             "ALTER TABLE tenants ADD COLUMN pix_key TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN pix_name TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN working_days TEXT DEFAULT '0,1,2,3,4'",
             "ALTER TABLE tenants ADD COLUMN blocked_hours TEXT DEFAULT '12,13,14'",
             "ALTER TABLE tenants ADD COLUMN confirmation_hour INTEGER DEFAULT 17",
+            "ALTER TABLE tenants ADD COLUMN psychologist_phone TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN plan TEXT DEFAULT 'mensal'",
+            "ALTER TABLE tenants ADD COLUMN free_until TEXT DEFAULT NULL",
         ]
         for sql in migrations:
             try:
@@ -144,6 +148,18 @@ def get_tenant_by_setup_token(token: str) -> dict | None:
     return dict(row) if row else None
 
 
+def is_tenant_exempt(tenant: dict) -> bool:
+    """Retorna True se o tenant tem acesso gratuito ativo (free_until no futuro)."""
+    free_until = tenant.get("free_until")
+    if not free_until:
+        return False
+    from datetime import date
+    try:
+        return date.fromisoformat(free_until[:10]) >= date.today()
+    except ValueError:
+        return False
+
+
 def list_tenants() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM tenants WHERE active = 1 ORDER BY name").fetchall()
@@ -158,7 +174,8 @@ def update_tenant(slug: str, **fields) -> bool:
         "dashboard_token", "setup_token", "google_refresh_token", "google_calendar_id",
         "email", "status", "stripe_customer_id", "stripe_subscription_id", "mp_subscription_id",
         "pix_key", "pix_name",
-        "working_days", "blocked_hours", "confirmation_hour",
+        "working_days", "blocked_hours", "confirmation_hour", "psychologist_phone", "plan",
+        "free_until",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -307,16 +324,61 @@ def mark_confirmation_sent(appointment_id: int):
         )
 
 
-def get_appointments_for_tomorrow(tenant_id: int) -> list[dict]:
-    """Retorna consultas de amanhã (dia todo) que ainda não receberam confirmação."""
+def mark_followup_sent(appointment_id: int):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE appointments SET followup_sent = 1 WHERE id = ?",
+            (appointment_id,),
+        )
+
+
+def get_appointments_for_confirmation(tenant_id: int) -> list[dict]:
+    """Retorna consultas que estão entre 23h e 25h no futuro e ainda não receberam confirmação.
+    O scheduler roda a cada 30 min — a janela de 2h garante que nenhuma consulta seja perdida.
+    Usa horário de Brasília passado pelo Python (evita bug de UTC vs localtime no SQLite)."""
+    from datetime import datetime as _dt, timedelta as _td
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo("America/Sao_Paulo")
+    now_br = _dt.now(_TZ).replace(tzinfo=None)  # naive, mesmo formato do scheduled_at
+    window_start = (now_br + _td(hours=23)).isoformat(timespec="seconds")
+    window_end   = (now_br + _td(hours=25)).isoformat(timespec="seconds")
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM appointments
                WHERE tenant_id = ?
-                 AND date(scheduled_at) = date('now', '+1 day', 'localtime')
                  AND confirmation_sent = 0
+                 AND scheduled_at > ?
+                 AND scheduled_at <= ?
                ORDER BY scheduled_at""",
-            (tenant_id,),
+            (tenant_id, window_start, window_end),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_appointments_for_tomorrow(tenant_id: int) -> list[dict]:
+    """Alias de compatibilidade — retorna consultas nas próximas 24-25h sem confirmação."""
+    return get_appointments_for_confirmation(tenant_id)
+
+
+def get_appointments_today_unconfirmed(tenant_id: int) -> list[dict]:
+    """Retorna consultas de hoje que ainda não foram confirmadas e o followup não foi enviado.
+    Usa horário de Brasília passado pelo Python."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo("America/Sao_Paulo")
+    now_br = _dt.now(_TZ).replace(tzinfo=None)
+    today_str = now_br.date().isoformat()          # 'YYYY-MM-DD'
+    now_str   = now_br.isoformat(timespec="seconds")
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM appointments
+               WHERE tenant_id = ?
+                 AND date(scheduled_at) = ?
+                 AND confirmed = 0
+                 AND followup_sent = 0
+                 AND scheduled_at > ?
+               ORDER BY scheduled_at""",
+            (tenant_id, today_str, now_str),
         ).fetchall()
     return [dict(r) for r in rows]
 

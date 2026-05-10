@@ -7,28 +7,47 @@ import database as db
 logger = logging.getLogger(__name__)
 
 
+PLANS = {
+    "mensal":    {"label": "Mensal",    "price_env": "STRIPE_PRICE_MENSAL",    "mode": "subscription"},
+    "semestral": {"label": "Semestral", "price_env": "STRIPE_PRICE_SEMESTRAL", "mode": "subscription"},
+    "anual":     {"label": "Anual",     "price_env": "STRIPE_PRICE_ANUAL",     "mode": "subscription"},
+}
+
+
+def _get_price_id(plan: str) -> str:
+    env_key = PLANS.get(plan, PLANS["mensal"])["price_env"]
+    price_id = getattr(config, env_key, "") or config.STRIPE_PRICE_ID
+    return price_id
+
+
 def _configured() -> bool:
-    return bool(config.STRIPE_SECRET_KEY and config.STRIPE_PRICE_ID)
+    return bool(config.STRIPE_SECRET_KEY and (
+        config.STRIPE_PRICE_MENSAL or config.STRIPE_PRICE_ID
+    ))
 
 
-def create_checkout_session(tenant: dict) -> str:
-    """Cria uma Stripe Checkout Session e retorna a URL de pagamento."""
+def create_checkout_session(tenant: dict, plan: str = "mensal") -> str:
+    """Cria uma Stripe Checkout Session para o plano selecionado."""
     stripe.api_key = config.STRIPE_SECRET_KEY
     base = config.BASE_URL
     setup_token = tenant.get("setup_token", "")
+    price_id = _get_price_id(plan)
+    plan_label = PLANS.get(plan, PLANS["mensal"])["label"]
 
     session = stripe.checkout.Session.create(
         mode="subscription",
-        line_items=[{"price": config.STRIPE_PRICE_ID, "quantity": 1}],
+        line_items=[{"price": price_id, "quantity": 1}],
         customer_email=tenant.get("email") or None,
         client_reference_id=setup_token,
         success_url=f"{base}/onboarding/sucesso?token={setup_token}&paid=1",
         cancel_url=f"{base}/onboarding/pagamento?token={setup_token}&cancelled=1",
-        metadata={"setup_token": setup_token, "slug": tenant["slug"]},
-        subscription_data={"metadata": {"setup_token": setup_token, "slug": tenant["slug"]}},
+        metadata={"setup_token": setup_token, "slug": tenant["slug"], "plan": plan},
+        subscription_data={"metadata": {"setup_token": setup_token, "slug": tenant["slug"], "plan": plan}},
         locale="pt-BR",
         currency="brl",
     )
+    db.update_tenant(tenant["slug"], plan=plan)
+    logger.info(f"[stripe] Checkout criado para {tenant['slug']} — plano {plan_label}")
     return session.url
 
 
@@ -66,8 +85,11 @@ def handle_webhook(payload: bytes, sig_header: str) -> dict:
         # Buscar tenant pelo subscription_id
         tenant = _get_tenant_by_stripe_sub(sub_id)
         if tenant:
-            db.update_tenant(tenant["slug"], status="suspended")
-            logger.info(f"[stripe] Tenant {tenant['slug']} suspenso — sub={sub_id}")
+            if db.is_tenant_exempt(tenant):
+                logger.info(f"[stripe] Tenant {tenant['slug']} isento (free_until) — suspensão ignorada")
+            else:
+                db.update_tenant(tenant["slug"], status="suspended")
+                logger.info(f"[stripe] Tenant {tenant['slug']} suspenso — sub={sub_id}")
 
     elif event_type == "customer.subscription.resumed":
         subscription = event["data"]["object"]
