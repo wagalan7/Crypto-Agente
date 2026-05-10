@@ -798,14 +798,16 @@ function openReschedule(id, scheduledAt) {
   document.getElementById("rs-notify").checked = true;
 
   // Preencher data/hora atual do agendamento
-  const dt = new Date(scheduledAt);
-  const y = dt.getFullYear();
-  const mo = String(dt.getMonth()+1).padStart(2,"0");
-  const d  = String(dt.getDate()).padStart(2,"0");
-  const h  = String(dt.getHours()).padStart(2,"0");
-  const mi = String(dt.getMinutes()).padStart(2,"0");
-  document.getElementById("rs-date").value = `${y}-${mo}-${d}`;
-  document.getElementById("rs-time").value = `${h}:${mi}`;
+  // SQLite pode retornar "2026-05-13 14:00:00" (espaço) — normalizar para ISO
+  const iso = String(scheduledAt).replace(" ", "T");
+  const dt = new Date(iso);
+  const y  = isNaN(dt) ? "" : dt.getFullYear();
+  const mo = isNaN(dt) ? "" : String(dt.getMonth()+1).padStart(2,"0");
+  const d  = isNaN(dt) ? "" : String(dt.getDate()).padStart(2,"0");
+  const h  = isNaN(dt) ? "" : String(dt.getHours()).padStart(2,"0");
+  const mi = isNaN(dt) ? "" : String(dt.getMinutes()).padStart(2,"0");
+  document.getElementById("rs-date").value = y ? `${y}-${mo}-${d}` : "";
+  document.getElementById("rs-time").value = y ? `${h}:${mi}` : "";
 
   document.getElementById("modal-reschedule").classList.remove("hidden");
 }
