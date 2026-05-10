@@ -4,11 +4,14 @@ import os
 import re
 from typing import AsyncIterator
 import httpx
-from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 from models import ProductInput
 
-client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-MODEL = "claude-sonnet-4-6"
+client = AsyncOpenAI(
+    api_key=os.getenv("GROQ_API_KEY"),
+    base_url="https://api.groq.com/openai/v1",
+)
+MODEL = "llama-3.3-70b-versatile"
 
 AGENT_LOGS = {
     "ESTRATEGIA": ["Definindo ICP", "Mapeando dores", "Construindo funil", "Finalizando posicionamento"],
@@ -67,26 +70,34 @@ async def run_agent(name: str, user_msg: str, queue: asyncio.Queue) -> str:
 
     result = ""
     try:
-        async with client.messages.stream(
-            model=MODEL, max_tokens=900, system=system,
-            messages=[{"role": "user", "content": user_msg}],
-        ) as stream:
-            await queue.put(_ev({"type": "agent_event", "payload": {
-                "agent": name, "status": "generating", "task": logs[1] if len(logs) > 1 else logs[0],
-                "progress": 20, "logs": logs[:1],
-            }}))
-            chunk_count = 0
-            async for text in stream.text_stream:
-                result += text
-                await queue.put(_ev({"type": "chunk", "payload": {"agent": name, "text": text}}))
-                chunk_count += 1
-                if chunk_count % 25 == 0:
-                    pct = min(25 + (chunk_count // 25) * 12, 90)
-                    li = min(chunk_count // 35, len(logs) - 1)
-                    await queue.put(_ev({"type": "agent_event", "payload": {
-                        "agent": name, "status": "generating", "task": logs[li],
-                        "progress": pct, "logs": logs[:li + 1],
-                    }}))
+        stream = await client.chat.completions.create(
+            model=MODEL,
+            max_tokens=900,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user_msg},
+            ],
+            stream=True,
+        )
+        await queue.put(_ev({"type": "agent_event", "payload": {
+            "agent": name, "status": "generating", "task": logs[1] if len(logs) > 1 else logs[0],
+            "progress": 20, "logs": logs[:1],
+        }}))
+        chunk_count = 0
+        async for chunk in stream:
+            text = chunk.choices[0].delta.content or ""
+            if not text:
+                continue
+            result += text
+            await queue.put(_ev({"type": "chunk", "payload": {"agent": name, "text": text}}))
+            chunk_count += 1
+            if chunk_count % 25 == 0:
+                pct = min(25 + (chunk_count // 25) * 12, 90)
+                li = min(chunk_count // 35, len(logs) - 1)
+                await queue.put(_ev({"type": "agent_event", "payload": {
+                    "agent": name, "status": "generating", "task": logs[li],
+                    "progress": pct, "logs": logs[:li + 1],
+                }}))
     except Exception as e:
         await queue.put(_ev({"type": "agent_event", "payload": {
             "agent": name, "status": "error", "task": str(e), "progress": 0, "logs": [],
