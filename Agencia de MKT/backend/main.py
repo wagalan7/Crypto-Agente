@@ -9,7 +9,7 @@ from typing import Optional
 from models import ProductInput
 from orchestrator import run_agency
 from auth import (authenticate, require_auth, require_admin,
-                   list_users, add_user, delete_user, update_password, get_user_role)
+                   list_users, add_user, delete_user, update_password, update_user, get_user_role)
 from db import (init_db, save_campaign, list_campaigns, get_campaign,
                 grant_access, revoke_access, get_campaign_grants)
 from services.social_publisher import (
@@ -55,11 +55,24 @@ class AddUserRequest(BaseModel):
     username: str
     password: str
     role: str = "user"
+    name: str = ""
 
 @app.post("/auth/users")
 async def create_user(req: AddUserRequest, user: str = Depends(require_auth)):
     require_admin(user)
-    return add_user(req.username, req.password, req.role)
+    return add_user(req.username, req.password, req.role, req.name)
+
+class UpdateUserRequest(BaseModel):
+    new_username: Optional[str] = None
+    new_password: Optional[str] = None
+    name: Optional[str] = None
+
+@app.patch("/auth/users/{username}")
+async def patch_user(username: str, req: UpdateUserRequest, user: str = Depends(require_auth)):
+    return update_user(username, requester=user,
+                       new_username=req.new_username,
+                       new_password=req.new_password,
+                       new_name=req.name)
 
 @app.delete("/auth/users/{username}")
 async def remove_user(username: str, user: str = Depends(require_auth)):
