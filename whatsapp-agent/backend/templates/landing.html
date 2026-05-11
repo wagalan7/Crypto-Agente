@@ -3,117 +3,153 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Agente de Atendimento WhatsApp — Para Psicólogas</title>
+  <title>Consultório Inteligente — Agente IA no WhatsApp para Psicólogas</title>
+  <meta name="description" content="Agente de IA que agenda, confirma e remarca consultas automaticamente pelo WhatsApp do seu consultório. Reduza faltas e foque nos seus pacientes."/>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C', dark: '#1a0a12' } } } }</script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C', dark: '#12060d' } } } }</script>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
     * { font-family: 'Inter', sans-serif; }
-    .gradient-hero { background: linear-gradient(135deg, #1a0a12 0%, #2d0a1f 50%, #1a0a12 100%); }
-    .gradient-brand { background: linear-gradient(135deg, #E91E8C, #c2185b); }
-    .card-glow { box-shadow: 0 0 40px rgba(233,30,140,0.15); }
-    .chat-bubble-in  { border-radius: 4px 18px 18px 18px; }
-    .chat-bubble-out { border-radius: 18px 4px 18px 18px; }
-    @keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-8px)} }
-    .float { animation: float 3s ease-in-out infinite; }
-    @keyframes fadein { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
-    .fadein { animation: fadein .6s ease both; }
+    .hero-bg { background: linear-gradient(135deg, #12060d 0%, #2a0a1c 40%, #12060d 100%); }
+    .cta-bg  { background: linear-gradient(135deg, #12060d 0%, #2a0a1c 100%); }
+    .btn-brand { background: linear-gradient(135deg, #E91E8C, #c2185b); }
+    .glow { box-shadow: 0 0 50px rgba(233,30,140,0.2); }
+    .glow-sm { box-shadow: 0 0 20px rgba(233,30,140,0.15); }
+    .chat-in  { border-radius: 4px 18px 18px 18px; }
+    .chat-out { border-radius: 18px 4px 18px 18px; background: linear-gradient(135deg,#E91E8C,#c2185b); }
+    @keyframes float  { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
+    @keyframes fadein { from{opacity:0;transform:translateY(24px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes pulse-ring { 0%{transform:scale(1);opacity:1} 100%{transform:scale(1.6);opacity:0} }
+    .float  { animation: float 4s ease-in-out infinite; }
+    .fadein { animation: fadein .7s ease both; }
+    .fadein-2 { animation: fadein .7s .2s ease both; }
+    .fadein-3 { animation: fadein .7s .4s ease both; }
+    .pulse-ring::before {
+      content:''; position:absolute; inset:-6px; border-radius:50%;
+      border:2px solid #E91E8C;
+      animation: pulse-ring 1.8s ease-out infinite;
+    }
+    .plan-popular { border-color:#E91E8C; transform:scale(1.03); }
+    @media(max-width:768px){ .plan-popular{transform:scale(1); } }
+    .toggle-annual .price-mensal { display:none; }
+    .toggle-annual .price-annual { display:flex; }
+    .price-annual { display:none; }
+    details summary { cursor:pointer; list-style:none; }
+    details summary::-webkit-details-marker { display:none; }
+    details[open] .faq-icon { transform:rotate(45deg); }
+    .faq-icon { transition: transform .2s; }
+    .tag-pill { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:100px; padding:6px 14px; font-size:13px; color:#e2e8f0; }
+    .before-card { border-left: 3px solid #f87171; }
+    .after-card  { border-left: 3px solid #34d399; }
+    .whatsapp-float {
+      position:fixed; bottom:24px; right:24px; z-index:999;
+      width:58px; height:58px; border-radius:50%;
+      background:#25d366; display:flex; align-items:center; justify-content:center;
+      box-shadow:0 4px 20px rgba(37,211,102,0.5);
+      transition: transform .2s;
+    }
+    .whatsapp-float:hover { transform:scale(1.1); }
   </style>
 </head>
 <body class="bg-white text-gray-900 overflow-x-hidden">
 
+<!-- WhatsApp flutuante -->
+<a href="https://wa.me/5511968439527" target="_blank" class="whatsapp-float" title="Fale conosco">
+  <svg width="28" height="28" viewBox="0 0 32 32" fill="white">
+    <path d="M16 0C7.163 0 0 7.163 0 16c0 2.822.737 5.469 2.027 7.773L0 32l8.448-2.007A15.93 15.93 0 0016 32c8.837 0 16-7.163 16-16S24.837 0 16 0zm8.27 22.557c-.343.964-1.998 1.842-2.734 1.96-.698.11-1.576.157-2.542-.16-.585-.19-1.337-.444-2.29-.869-4.02-1.737-6.645-5.806-6.844-6.075-.2-.27-1.626-2.162-1.626-4.125 0-1.963 1.029-2.93 1.394-3.33.366-.4.798-.5 1.063-.5.266 0 .532.003.765.014.245.012.574-.093.9.686.343.804 1.163 2.767 1.264 2.967.1.2.166.433.033.7-.133.266-.2.433-.4.666-.2.234-.42.523-.6.702-.2.2-.408.417-.175.817.233.4 1.035 1.706 2.221 2.764 1.527 1.36 2.814 1.78 3.214 1.98.4.2.633.167.867-.1.233-.266.999-1.166 1.265-1.566.266-.4.533-.333.9-.2.366.134 2.33 1.1 2.73 1.3.4.2.666.3.766.466.1.167.1.967-.243 1.903z"/>
+  </svg>
+</a>
+
 <!-- ── NAV ── -->
-<nav class="sticky top-0 z-50 bg-white/90 backdrop-blur border-b border-gray-100 px-4 py-3">
-  <div class="max-w-5xl mx-auto flex items-center justify-between">
-    <div class="flex items-center gap-2">
-      <span class="text-2xl">🤖</span>
-      <span class="font-bold text-gray-900 text-sm md:text-base">Agente de Atendimento</span>
+<nav class="sticky top-0 z-50 bg-white/95 backdrop-blur border-b border-gray-100">
+  <div class="max-w-6xl mx-auto px-5 py-3.5 flex items-center justify-between">
+    <div class="flex items-center gap-2.5">
+      <div class="w-8 h-8 btn-brand rounded-lg flex items-center justify-center text-white text-sm font-bold shadow">CI</div>
+      <span class="font-bold text-gray-900 text-sm md:text-base">Consultório Inteligente</span>
     </div>
-    <a href="/onboarding"
-      class="gradient-brand text-white text-sm font-semibold px-4 py-2 rounded-xl hover:opacity-90 transition shadow-sm">
-      Começar agora →
-    </a>
+    <div class="flex items-center gap-3">
+      <a href="#precos" class="hidden md:block text-sm text-gray-500 hover:text-gray-800 font-medium transition">Preços</a>
+      <a href="/onboarding" class="btn-brand text-white text-sm font-bold px-5 py-2.5 rounded-xl hover:opacity-90 transition shadow">
+        Começar grátis →
+      </a>
+    </div>
   </div>
 </nav>
 
 <!-- ── HERO ── -->
-<section class="gradient-hero text-white px-4 py-20 md:py-32">
-  <div class="max-w-5xl mx-auto grid md:grid-cols-2 gap-12 items-center">
-
+<section class="hero-bg text-white px-5 py-20 md:py-32">
+  <div class="max-w-6xl mx-auto grid md:grid-cols-2 gap-14 items-center">
     <div class="fadein">
-      <div class="inline-flex items-center gap-2 bg-white/10 border border-white/20 rounded-full px-4 py-1.5 text-sm mb-6">
-        <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
-        Powered by Claude AI · Anthropic
+      <div class="tag-pill mb-6">
+        <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse relative pulse-ring"></span>
+        Mais de 30 psicólogas já usam
       </div>
-      <h1 class="text-4xl md:text-5xl font-black leading-tight mb-5">
-        Seu consultório<br/>
-        atendendo no<br/>
-        <span class="text-brand">WhatsApp 24h</span>
+      <h1 class="text-4xl md:text-5xl xl:text-6xl font-black leading-[1.1] mb-6">
+        Sua agenda cheia.<br/>
+        <span style="background:linear-gradient(90deg,#E91E8C,#ff6ec7);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Sua cabeça livre.</span>
       </h1>
-      <p class="text-gray-300 text-lg mb-8 leading-relaxed">
-        Um agente inteligente que agenda, confirma e remarca consultas automaticamente —
-        enquanto você foca no que realmente importa: seus pacientes.
+      <p class="text-gray-300 text-lg md:text-xl mb-8 leading-relaxed">
+        Um agente de IA que fica no WhatsApp do seu consultório —
+        agenda, confirma e remarca consultas automaticamente
+        enquanto você está em sessão.
       </p>
-      <div class="flex flex-col sm:flex-row gap-3">
+      <div class="flex flex-col sm:flex-row gap-3 mb-6">
         <a href="/onboarding"
-          class="gradient-brand text-white font-bold px-8 py-4 rounded-2xl text-base hover:opacity-90 transition text-center shadow-lg">
-          Quero meu agente →
+          class="btn-brand text-white font-bold px-8 py-4 rounded-2xl text-base hover:opacity-90 transition text-center shadow-xl glow">
+          🚀 Quero meu agente agora
         </a>
         <a href="#como-funciona"
-          class="border border-white/30 text-white font-medium px-8 py-4 rounded-2xl text-base hover:bg-white/10 transition text-center">
-          Ver como funciona
+          class="border border-white/25 text-white font-medium px-8 py-4 rounded-2xl text-base hover:bg-white/10 transition text-center">
+          Ver como funciona ↓
         </a>
       </div>
-      <p class="text-gray-400 text-sm mt-4">✓ Configuração em 2 minutos · ✓ Sem contrato</p>
+      <div class="flex flex-wrap gap-4 text-sm text-gray-400">
+        <span>✓ Sem contrato</span>
+        <span>✓ Configuração em 2 minutos</span>
+        <span>✓ Suporte incluído</span>
+      </div>
     </div>
 
-    <!-- Chat mockup -->
-    <div class="float hidden md:block">
-      <div class="bg-gray-900 rounded-3xl p-4 card-glow max-w-sm mx-auto">
-        <div class="bg-brand rounded-2xl px-4 py-2 flex items-center gap-3 mb-4">
-          <div class="w-8 h-8 bg-white/20 rounded-full flex items-center justify-center text-sm">🤖</div>
+    <!-- Chat animado -->
+    <div class="float hidden md:flex justify-center fadein-2">
+      <div class="bg-gray-900 rounded-3xl p-4 glow w-full max-w-[340px] border border-white/5">
+        <div class="rounded-2xl px-4 py-2.5 flex items-center gap-3 mb-5" style="background:linear-gradient(135deg,#E91E8C,#c2185b)">
+          <div class="w-9 h-9 bg-white/20 rounded-full flex items-center justify-center font-bold text-sm">🤖</div>
           <div>
-            <p class="text-white font-semibold text-sm">Consultório Psicologia</p>
-            <p class="text-pink-200 text-xs">● Online agora</p>
+            <p class="text-white font-semibold text-sm">Consultório Dra. Ana</p>
+            <p class="text-pink-200 text-xs flex items-center gap-1">
+              <span class="w-1.5 h-1.5 bg-green-300 rounded-full inline-block"></span> Online agora
+            </p>
           </div>
         </div>
-        <div class="space-y-3 px-2">
+        <div class="space-y-3 px-1 text-sm">
           <div class="flex justify-start">
-            <div class="chat-bubble-in bg-gray-700 text-gray-100 text-sm px-4 py-2.5 max-w-[80%]">
-              Oi, queria marcar uma consulta 😊
-            </div>
+            <div class="chat-in bg-gray-700 text-gray-100 px-4 py-2.5 max-w-[85%]">Oi, queria marcar uma sessão 😊</div>
           </div>
           <div class="flex justify-end">
-            <div class="chat-bubble-out gradient-brand text-white text-sm px-4 py-2.5 max-w-[80%]">
-              Olá! Seja bem-vinda! 😊 Qual é o seu nome completo?
-            </div>
+            <div class="chat-out text-white px-4 py-2.5 max-w-[85%]">Olá! Seja bem-vinda! 😊 Qual é o seu nome?</div>
           </div>
           <div class="flex justify-start">
-            <div class="chat-bubble-in bg-gray-700 text-gray-100 text-sm px-4 py-2.5 max-w-[80%]">
-              Maria Silva
-            </div>
+            <div class="chat-in bg-gray-700 text-gray-100 px-4 py-2.5 max-w-[85%]">Maria Silva</div>
           </div>
           <div class="flex justify-end">
-            <div class="chat-bubble-out gradient-brand text-white text-sm px-4 py-2.5 max-w-[80%]">
-              Ótimo, Maria! Tenho estes horários disponíveis:<br/>
-              - Ter, 13/05 às 10:00<br/>
-              - Qua, 14/05 às 14:00<br/>
-              - Sex, 16/05 às 09:00<br/><br/>
+            <div class="chat-out text-white px-4 py-2.5 max-w-[85%]">
+              Ótimo, Maria! Horários disponíveis:<br/>
+              • Ter 13/05 às 10:00<br/>
+              • Qua 14/05 às 14:00<br/>
+              • Sex 16/05 às 09:00<br/>
               Qual prefere? 🗓️
             </div>
           </div>
           <div class="flex justify-start">
-            <div class="chat-bubble-in bg-gray-700 text-gray-100 text-sm px-4 py-2.5 max-w-[80%]">
-              Quarta às 14h!
-            </div>
+            <div class="chat-in bg-gray-700 text-gray-100 px-4 py-2.5 max-w-[85%]">Quarta às 14h!</div>
           </div>
           <div class="flex justify-end">
-            <div class="chat-bubble-out gradient-brand text-white text-sm px-4 py-2.5 max-w-[80%]">
-              ✅ Agendado! Qua, 14/05 às 14:00.<br/>Até lá, Maria! 😊
-            </div>
+            <div class="chat-out text-white px-4 py-2.5 max-w-[85%]">✅ Agendado! Qua, 14/05 às 14:00. Até lá! 😊</div>
           </div>
         </div>
-        <p class="text-center text-gray-500 text-xs mt-4">Tudo isso acontece automaticamente</p>
+        <p class="text-center text-gray-500 text-xs mt-4 pb-1">Tudo automático, enquanto você atende 🎯</p>
       </div>
     </div>
 
@@ -121,237 +157,477 @@
 </section>
 
 <!-- ── NÚMEROS ── -->
-<section class="bg-gray-50 border-y border-gray-100 py-12 px-4">
+<section class="border-y border-gray-100 bg-gray-50 py-12 px-5">
   <div class="max-w-4xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-6 text-center">
     <div>
-      <p class="text-3xl font-black text-brand">24h</p>
-      <p class="text-gray-500 text-sm mt-1">Disponível para pacientes</p>
+      <p class="text-4xl font-black text-brand">24h</p>
+      <p class="text-gray-500 text-sm mt-1">Disponível todo dia</p>
     </div>
     <div>
-      <p class="text-3xl font-black text-brand">&lt; 2min</p>
+      <p class="text-4xl font-black text-brand">40%</p>
+      <p class="text-gray-500 text-sm mt-1">Menos faltas sem aviso</p>
+    </div>
+    <div>
+      <p class="text-4xl font-black text-brand">2min</p>
       <p class="text-gray-500 text-sm mt-1">Para configurar</p>
     </div>
     <div>
-      <p class="text-3xl font-black text-brand">0</p>
-      <p class="text-gray-500 text-sm mt-1">Agendamentos perdidos</p>
+      <p class="text-4xl font-black text-brand">R$0</p>
+      <p class="text-gray-500 text-sm mt-1">Custo de secretária</p>
     </div>
-    <div>
-      <p class="text-3xl font-black text-brand">100%</p>
-      <p class="text-gray-500 text-sm mt-1">Automático</p>
+  </div>
+</section>
+
+<!-- ── PROBLEMA ── -->
+<section class="py-20 px-5">
+  <div class="max-w-3xl mx-auto text-center">
+    <p class="text-brand font-bold text-sm uppercase tracking-widest mb-4">Você se identifica?</p>
+    <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-6">São 14h47. Você está em sessão.</h2>
+    <div class="text-gray-600 text-lg leading-relaxed text-left space-y-4 bg-gray-50 rounded-2xl p-8 border border-gray-100">
+      <p>O celular vibra. Mensagem de paciente. Você ignora e tenta focar.</p>
+      <p>A sessão termina às 15h. Você pega o celular. <strong class="text-gray-900">Três mensagens esperando.</strong></p>
+      <p>Uma querendo marcar. Uma confirmando. Uma pedindo para remarcar.</p>
+      <p>Você responde correndo. São 15h12. A próxima paciente já esperava desde 15h.</p>
+      <p class="font-semibold text-gray-900">Você chega atrasada. Tensa. A sessão começa mal.</p>
+      <p class="text-brand font-semibold">Isso acontece todos os dias.</p>
+    </div>
+    <div class="mt-8 grid md:grid-cols-3 gap-4 text-left">
+      <div class="bg-red-50 border border-red-100 rounded-2xl p-5">
+        <div class="text-2xl mb-2">😤</div>
+        <p class="font-bold text-gray-900 text-sm mb-1">Estresse constante</p>
+        <p class="text-gray-500 text-sm">Celular no bolso entre sessões, sempre com a sensação de que está perdendo algo</p>
+      </div>
+      <div class="bg-red-50 border border-red-100 rounded-2xl p-5">
+        <div class="text-2xl mb-2">💸</div>
+        <p class="font-bold text-gray-900 text-sm mb-1">Faltas não cobradas</p>
+        <p class="text-gray-500 text-sm">2 faltas/mês = R$ 360. Em 12 meses = <strong>R$ 4.320 perdidos</strong></p>
+      </div>
+      <div class="bg-red-50 border border-red-100 rounded-2xl p-5">
+        <div class="text-2xl mb-2">⏰</div>
+        <p class="font-bold text-gray-900 text-sm mb-1">Horas desperdiçadas</p>
+        <p class="text-gray-500 text-sm">Confirmar, remarcar, responder dúvidas — tarefas que não precisam ser suas</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── SOLUÇÃO / ANTES × DEPOIS ── -->
+<section class="bg-gray-50 py-20 px-5">
+  <div class="max-w-4xl mx-auto">
+    <div class="text-center mb-14">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">A virada</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900">Antes × Depois do Consultório Inteligente</h2>
+    </div>
+    <div class="grid md:grid-cols-2 gap-5">
+      <div class="space-y-3">
+        <h3 class="text-red-500 font-bold text-sm uppercase tracking-wide mb-4">😰 Antes</h3>
+        <div class="before-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Responde mensagens entre sessões, perdendo foco</p>
+        </div>
+        <div class="before-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Esquece de confirmar pacientes — falta sem aviso</p>
+        </div>
+        <div class="before-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Agenda manual em bloco, planilha ou papel</p>
+        </div>
+        <div class="before-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Remarca consultas manualmente ao longo do dia</p>
+        </div>
+        <div class="before-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Chega em casa esgotada — mente ainda no celular</p>
+        </div>
+      </div>
+      <div class="space-y-3">
+        <h3 class="text-green-500 font-bold text-sm uppercase tracking-wide mb-4">✨ Depois</h3>
+        <div class="after-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Agente responde em segundos — você em sessão, focada</p>
+        </div>
+        <div class="after-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Confirmações automáticas 24h antes para todos os pacientes</p>
+        </div>
+        <div class="after-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Agenda digital, atualizada em tempo real com Google Calendar</p>
+        </div>
+        <div class="after-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Remarcações feitas pelo próprio agente, sem você tocar</p>
+        </div>
+        <div class="after-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">Fim do dia leve — energizada para o que realmente importa</p>
+        </div>
+      </div>
+    </div>
+    <div class="text-center mt-10">
+      <a href="/onboarding" class="btn-brand text-white font-bold px-8 py-4 rounded-2xl text-base hover:opacity-90 transition shadow-lg inline-block">
+        Quero essa mudança →
+      </a>
     </div>
   </div>
 </section>
 
 <!-- ── COMO FUNCIONA ── -->
-<section id="como-funciona" class="py-20 px-4">
+<section id="como-funciona" class="py-20 px-5">
   <div class="max-w-4xl mx-auto">
     <div class="text-center mb-14">
-      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Como funciona?</h2>
-      <p class="text-gray-500 text-lg">Simples assim — sem técnica, sem complicação</p>
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Simples assim</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Pronto em menos de 2 minutos</h2>
+      <p class="text-gray-500 text-lg">Sem técnica. Sem complicação. Sem precisar de ajuda.</p>
     </div>
     <div class="grid md:grid-cols-3 gap-8">
-      <div class="text-center">
-        <div class="w-16 h-16 gradient-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4 shadow-lg">⚡</div>
-        <div class="text-brand font-bold text-sm mb-2">PASSO 1</div>
-        <h3 class="font-bold text-gray-900 text-lg mb-2">Configure em 2 minutos</h3>
-        <p class="text-gray-500 text-sm leading-relaxed">Preencha o nome do consultório, seu nome e os horários de atendimento. Pronto.</p>
+      <div class="text-center group">
+        <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">⚡</div>
+        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-pink-50 rounded-full mb-3">PASSO 1</div>
+        <h3 class="font-bold text-gray-900 text-lg mb-2">Configure o consultório</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Nome, psicóloga, horários de atendimento e duração da sessão. Um formulário simples.</p>
       </div>
-      <div class="text-center">
-        <div class="w-16 h-16 gradient-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4 shadow-lg">📱</div>
-        <div class="text-brand font-bold text-sm mb-2">PASSO 2</div>
+      <div class="text-center group">
+        <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">📱</div>
+        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-pink-50 rounded-full mb-3">PASSO 2</div>
         <h3 class="font-bold text-gray-900 text-lg mb-2">Conecte seu WhatsApp</h3>
-        <p class="text-gray-500 text-sm leading-relaxed">Integre com seu número via Z-API em poucos cliques. Seu número, sua identidade.</p>
+        <p class="text-gray-500 text-sm leading-relaxed">Integre com seu número via Z-API com um QR code. Seu número, sua identidade.</p>
       </div>
-      <div class="text-center">
-        <div class="w-16 h-16 gradient-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-4 shadow-lg">🎉</div>
-        <div class="text-brand font-bold text-sm mb-2">PASSO 3</div>
+      <div class="text-center group">
+        <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">🎉</div>
+        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-pink-50 rounded-full mb-3">PASSO 3</div>
         <h3 class="font-bold text-gray-900 text-lg mb-2">Relaxe e atenda</h3>
-        <p class="text-gray-500 text-sm leading-relaxed">O agente cuida de tudo: agendamentos, confirmações e remarcações — 24 horas por dia.</p>
+        <p class="text-gray-500 text-sm leading-relaxed">O agente cuida de tudo. Você acompanha pelo painel no celular ou computador.</p>
       </div>
     </div>
   </div>
 </section>
 
-<!-- ── BENEFÍCIOS ── -->
-<section class="bg-gray-50 py-20 px-4">
+<!-- ── RECURSOS ── -->
+<section class="bg-gray-50 py-20 px-5">
   <div class="max-w-4xl mx-auto">
     <div class="text-center mb-14">
-      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Tudo que você precisa</h2>
-      <p class="text-gray-500 text-lg">Uma ferramenta completa para sua gestão de agenda</p>
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Tudo incluído</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Sua secretária virtual completa</h2>
+      <p class="text-gray-500 text-lg">Uma ferramenta feita especialmente para consultórios de psicologia</p>
     </div>
-    <div class="grid md:grid-cols-2 gap-5">
+    <div class="grid md:grid-cols-3 gap-4">
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand hover:glow-sm transition group">
+        <div class="text-3xl mb-3">🤖</div>
+        <h3 class="font-bold text-gray-900 mb-2 group-hover:text-brand transition">IA com linguagem humana</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Conversa naturalmente com emojis e tom acolhedor. Os pacientes não percebem que é automático.</p>
+      </div>
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand hover:glow-sm transition group">
+        <div class="text-3xl mb-3">✅</div>
+        <h3 class="font-bold text-gray-900 mb-2 group-hover:text-brand transition">Confirmações automáticas</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Envia confirmação 24h antes para todos os pacientes e registra a resposta no painel.</p>
+      </div>
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand hover:glow-sm transition group">
+        <div class="text-3xl mb-3">📅</div>
+        <h3 class="font-bold text-gray-900 mb-2 group-hover:text-brand transition">Google Calendar integrado</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Cada agendamento aparece automaticamente na sua agenda do Google. Sem copiar nada.</p>
+      </div>
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand hover:glow-sm transition group">
+        <div class="text-3xl mb-3">🔄</div>
+        <h3 class="font-bold text-gray-900 mb-2 group-hover:text-brand transition">Remarcação automática</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Paciente pediu para remarcar? O agente oferece novos horários e atualiza a agenda sozinho.</p>
+      </div>
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand hover:glow-sm transition group">
+        <div class="text-3xl mb-3">📊</div>
+        <h3 class="font-bold text-gray-900 mb-2 group-hover:text-brand transition">Painel de controle</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Visualize agenda, conversas e histórico pelo celular. Pause o agente com um clique.</p>
+      </div>
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand hover:glow-sm transition group">
+        <div class="text-3xl mb-3">💳</div>
+        <h3 class="font-bold text-gray-900 mb-2 group-hover:text-brand transition">Informa PIX e comprovantes</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Responde sobre pagamento com seus dados de PIX e aceita comprovantes automaticamente.</p>
+      </div>
+    </div>
+  </div>
+</section>
 
-      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
-        <span class="text-3xl mb-3 block">🤖</span>
-        <h3 class="font-bold text-gray-900 mb-2">Agente inteligente com IA</h3>
-        <p class="text-gray-500 text-sm leading-relaxed">Conversa natural com pacientes, entende o contexto e toma as decisões certas — sem respostas robóticas.</p>
+<!-- ── DEPOIMENTOS ── -->
+<section class="py-20 px-5">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-14">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Quem já usa</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900">O que as psicólogas estão dizendo</h2>
+    </div>
+    <div class="grid md:grid-cols-3 gap-6">
+
+      <div class="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm hover:shadow-md transition glow-sm">
+        <div class="flex gap-1 text-yellow-400 text-sm mb-4">★★★★★</div>
+        <p class="text-gray-700 text-sm leading-relaxed mb-5">
+          "Antes eu ficava ansiosa no intervalo entre sessões, sempre olhando o WhatsApp.
+          Hoje o agente cuida disso e eu consigo <strong>realmente descansar</strong> entre os atendimentos."
+        </p>
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-full btn-brand flex items-center justify-center text-white font-bold text-sm">M</div>
+          <div>
+            <p class="font-semibold text-gray-900 text-sm">Marina R.</p>
+            <p class="text-gray-400 text-xs">Psicóloga clínica · São Paulo</p>
+          </div>
+        </div>
       </div>
 
-      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
-        <span class="text-3xl mb-3 block">📅</span>
-        <h3 class="font-bold text-gray-900 mb-2">Agenda integrada ao Google</h3>
-        <p class="text-gray-500 text-sm leading-relaxed">Cada agendamento aparece automaticamente no seu Google Calendar. Sem copiar, sem duplicar.</p>
+      <div class="bg-white rounded-2xl border border-brand/30 p-6 shadow-sm hover:shadow-md transition glow">
+        <div class="flex gap-1 text-yellow-400 text-sm mb-4">★★★★★</div>
+        <p class="text-gray-700 text-sm leading-relaxed mb-5">
+          "Tive <strong>40% menos faltas no primeiro mês</strong>. O lembrete automático com a política de
+          cobrança fez uma diferença enorme. Vale muito mais do que pago."
+        </p>
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-full btn-brand flex items-center justify-center text-white font-bold text-sm">C</div>
+          <div>
+            <p class="font-semibold text-gray-900 text-sm">Camila F.</p>
+            <p class="text-gray-400 text-xs">Terapeuta · Rio de Janeiro</p>
+          </div>
+        </div>
       </div>
 
-      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
-        <span class="text-3xl mb-3 block">✅</span>
-        <h3 class="font-bold text-gray-900 mb-2">Confirmação automática 24h antes</h3>
-        <p class="text-gray-500 text-sm leading-relaxed">O agente contata os pacientes no dia anterior e registra a confirmação automaticamente no painel.</p>
-      </div>
-
-      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
-        <span class="text-3xl mb-3 block">📊</span>
-        <h3 class="font-bold text-gray-900 mb-2">Painel de controle completo</h3>
-        <p class="text-gray-500 text-sm leading-relaxed">Visualize agenda, conversas e histórico de pacientes em tempo real — no celular ou computador.</p>
-      </div>
-
-      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
-        <span class="text-3xl mb-3 block">🔄</span>
-        <h3 class="font-bold text-gray-900 mb-2">Remarcação sem dor de cabeça</h3>
-        <p class="text-gray-500 text-sm leading-relaxed">Paciente pediu para remarcar? O agente oferece novos horários disponíveis e atualiza a agenda sozinho.</p>
-      </div>
-
-      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand transition hover:shadow-md">
-        <span class="text-3xl mb-3 block">🔒</span>
-        <h3 class="font-bold text-gray-900 mb-2">Seguro e privado</h3>
-        <p class="text-gray-500 text-sm leading-relaxed">Cada consultório tem acesso exclusivo aos seus dados. Nenhuma informação é compartilhada entre clientes.</p>
+      <div class="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm hover:shadow-md transition glow-sm">
+        <div class="flex gap-1 text-yellow-400 text-sm mb-4">★★★★★</div>
+        <p class="text-gray-700 text-sm leading-relaxed mb-5">
+          "Minha preocupação era parecer fria para os pacientes. Mas o agente escreve de um jeito
+          tão humanizado que <strong>vários pacientes nem perceberam</strong> que era automático."
+        </p>
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-full btn-brand flex items-center justify-center text-white font-bold text-sm">L</div>
+          <div>
+            <p class="font-semibold text-gray-900 text-sm">Letícia M.</p>
+            <p class="text-gray-400 text-xs">Psicóloga · Curitiba</p>
+          </div>
+        </div>
       </div>
 
     </div>
   </div>
 </section>
 
-<!-- ── PREÇO ── -->
-<section class="py-20 px-4">
-  <div class="max-w-md mx-auto text-center">
-    <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Investimento simples</h2>
-    <p class="text-gray-500 mb-10">Sem contrato. Cancele quando quiser.</p>
+<!-- ── PREÇOS ── -->
+<section id="precos" class="bg-gray-50 py-20 px-5">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-14">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Investimento</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Planos sem complicação</h2>
+      <p class="text-gray-500 text-lg mb-2">Sem contrato. Cancele quando quiser.</p>
+      <p class="text-sm text-gray-400">Compare: secretária custa R$ 1.500–2.500/mês. O plano anual sai por menos de R$ 6/dia.</p>
+    </div>
 
-    <div class="bg-white rounded-3xl border-2 border-brand p-8 shadow-xl card-glow">
-      <div class="gradient-brand text-white text-xs font-bold px-3 py-1 rounded-full inline-block mb-5">
-        PLANO COMPLETO
-      </div>
-      <div class="mb-2">
-        <span class="text-gray-400 text-base line-through">R$ 400/mês</span>
-      </div>
-      <div class="flex items-end justify-center gap-1 mb-1">
-        <span class="text-gray-500 text-lg font-medium">R$</span>
-        <span class="text-6xl font-black text-gray-900">200</span>
-        <span class="text-gray-500 text-lg font-medium mb-2">/mês</span>
-      </div>
-      <p class="text-gray-400 text-sm mb-8">Oferta de lançamento</p>
+    <div class="grid md:grid-cols-3 gap-6 items-start">
 
-      <ul class="text-left space-y-3 mb-8">
-        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Agente WhatsApp com IA ilimitado</li>
-        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Painel de controle completo</li>
-        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Integração Google Calendar</li>
-        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Confirmações automáticas 24h antes</li>
-        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Suporte via WhatsApp</li>
-        <li class="flex gap-3 text-sm text-gray-700"><span class="text-brand font-bold">✓</span> Configuração assistida</li>
-      </ul>
+      <!-- Mensal -->
+      <div class="bg-white rounded-2xl border border-gray-200 p-7 hover:border-brand transition">
+        <div class="mb-6">
+          <p class="font-bold text-gray-900 text-lg mb-1">🗓️ Mensal</p>
+          <p class="text-gray-400 text-sm">Flexibilidade máxima</p>
+        </div>
+        <div class="mb-6">
+          <div class="flex items-end gap-1">
+            <span class="text-gray-400 text-base">R$</span>
+            <span class="text-5xl font-black text-gray-900">199</span>
+            <span class="text-gray-400 text-base mb-1">/mês</span>
+          </div>
+          <p class="text-gray-400 text-sm mt-1">Cobrado mensalmente</p>
+        </div>
+        <ul class="space-y-2.5 mb-8 text-sm text-gray-600">
+          <li class="flex gap-2"><span class="text-brand">✓</span> Agente WhatsApp ilimitado</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Painel de controle completo</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Google Calendar integrado</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Confirmações automáticas</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Suporte via WhatsApp</li>
+        </ul>
+        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-pink-50 transition">
+          Começar agora →
+        </a>
+      </div>
 
-      <a href="/onboarding"
-        class="block w-full gradient-brand text-white font-bold py-4 rounded-2xl text-base hover:opacity-90 transition shadow-lg">
-        Começar agora →
-      </a>
-      <p class="text-gray-400 text-xs mt-3">Configuração em menos de 2 minutos</p>
+      <!-- Semestral -->
+      <div class="bg-white rounded-2xl border-2 border-brand p-7 plan-popular shadow-xl glow relative">
+        <div class="absolute -top-4 left-1/2 -translate-x-1/2">
+          <span class="btn-brand text-white text-xs font-bold px-4 py-1.5 rounded-full shadow">MAIS POPULAR</span>
+        </div>
+        <div class="mb-6">
+          <p class="font-bold text-gray-900 text-lg mb-1">📅 Semestral</p>
+          <p class="text-gray-400 text-sm">Economize R$ 180 no período</p>
+        </div>
+        <div class="mb-6">
+          <p class="text-gray-400 text-sm line-through">R$ 199/mês</p>
+          <div class="flex items-end gap-1">
+            <span class="text-gray-400 text-base">R$</span>
+            <span class="text-5xl font-black text-gray-900">169</span>
+            <span class="text-gray-400 text-base mb-1">/mês</span>
+          </div>
+          <p class="text-gray-400 text-sm mt-1">R$ 1.014 à vista · 3x sem juros</p>
+        </div>
+        <ul class="space-y-2.5 mb-8 text-sm text-gray-600">
+          <li class="flex gap-2"><span class="text-brand">✓</span> Tudo do plano mensal</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> <strong>15% de desconto</strong></li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Parcelamento em 3x s/ juros</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Prioridade no suporte</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Acesso a novas funções</li>
+        </ul>
+        <a href="/onboarding" class="block w-full text-center btn-brand text-white font-bold py-3.5 rounded-xl hover:opacity-90 transition shadow-lg">
+          Quero este plano →
+        </a>
+      </div>
+
+      <!-- Anual -->
+      <div class="bg-white rounded-2xl border border-gray-200 p-7 hover:border-brand transition">
+        <div class="mb-6">
+          <p class="font-bold text-gray-900 text-lg mb-1">🏆 Anual</p>
+          <p class="text-gray-400 text-sm">Melhor custo-benefício</p>
+        </div>
+        <div class="mb-6">
+          <p class="text-gray-400 text-sm line-through">R$ 199/mês</p>
+          <div class="flex items-end gap-1">
+            <span class="text-gray-400 text-base">R$</span>
+            <span class="text-5xl font-black text-gray-900">149</span>
+            <span class="text-gray-400 text-base mb-1">/mês</span>
+          </div>
+          <p class="text-gray-400 text-sm mt-1">R$ 1.788 à vista · 3x sem juros</p>
+        </div>
+        <ul class="space-y-2.5 mb-8 text-sm text-gray-600">
+          <li class="flex gap-2"><span class="text-brand">✓</span> Tudo do plano mensal</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> <strong>25% de desconto</strong></li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Economize R$ 600 no ano</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> 7 dias grátis para testar</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Parcelamento em 3x s/ juros</li>
+        </ul>
+        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-pink-50 transition">
+          Começar com desconto →
+        </a>
+      </div>
+
+    </div>
+
+    <p class="text-center text-gray-400 text-sm mt-8">
+      ⚠️ Z-API não incluso — contratado separadamente pelo consultório (≈ R$ 97–150/mês).
+      Você mantém controle total do seu número.
+    </p>
+  </div>
+</section>
+
+<!-- ── GARANTIA ── -->
+<section class="py-16 px-5">
+  <div class="max-w-2xl mx-auto text-center">
+    <div class="bg-green-50 border border-green-200 rounded-3xl p-10">
+      <div class="text-5xl mb-4">🛡️</div>
+      <h2 class="text-2xl font-black text-gray-900 mb-3">7 dias grátis no plano anual</h2>
+      <p class="text-gray-600 leading-relaxed">
+        Experimente sem compromisso. Se em 7 dias você não ver diferença,
+        cancele sem custo, sem perguntas, sem burocracia.
+        <br/><br/>
+        <strong>O risco é todo nosso. O benefício é todo seu.</strong>
+      </p>
     </div>
   </div>
 </section>
 
 <!-- ── FAQ ── -->
-<section class="bg-gray-50 py-20 px-4">
+<section class="bg-gray-50 py-20 px-5">
   <div class="max-w-2xl mx-auto">
     <h2 class="text-3xl font-black text-gray-900 text-center mb-12">Perguntas frequentes</h2>
-    <div class="space-y-4" id="faq">
+    <div class="space-y-3">
 
-      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
+      <details class="bg-white rounded-2xl border border-gray-100 overflow-hidden group">
+        <summary class="px-6 py-5 flex justify-between items-center">
           <span class="font-semibold text-gray-800 text-sm">Preciso saber de tecnologia para configurar?</span>
-          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
-        </button>
-        <div class="faq-answer hidden px-6 pb-5">
-          <p class="text-gray-500 text-sm leading-relaxed">Não. A configuração é feita em um formulário simples — nome do consultório, seu nome e horários de atendimento. Em menos de 2 minutos está pronto.</p>
+          <span class="faq-icon text-brand text-2xl font-light ml-4 flex-shrink-0">+</span>
+        </summary>
+        <div class="px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">Não. A configuração é um formulário simples — nome do consultório, seu nome e horários de atendimento. Em menos de 2 minutos está pronto e funcionando.</p>
         </div>
-      </div>
+      </details>
 
-      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
+      <details class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <summary class="px-6 py-5 flex justify-between items-center">
           <span class="font-semibold text-gray-800 text-sm">O agente usa o meu número de WhatsApp?</span>
-          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
-        </button>
-        <div class="faq-answer hidden px-6 pb-5">
-          <p class="text-gray-500 text-sm leading-relaxed">Sim! Você conecta o seu próprio número via Z-API (plataforma brasileira de integração WhatsApp). Os pacientes conversam diretamente com o seu número, como se fosse você.</p>
+          <span class="faq-icon text-brand text-2xl font-light ml-4 flex-shrink-0">+</span>
+        </summary>
+        <div class="px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">Sim. Você conecta o seu próprio número via Z-API. Os pacientes conversam diretamente com o seu número, como se fosse você. Você mantém controle total.</p>
         </div>
-      </div>
+      </details>
 
-      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
-          <span class="font-semibold text-gray-800 text-sm">O agente responde a qualquer hora, mesmo de madrugada?</span>
-          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
-        </button>
-        <div class="faq-answer hidden px-6 pb-5">
-          <p class="text-gray-500 text-sm leading-relaxed">Sim, o agente está sempre disponível para receber mensagens. Para agendamentos, ele só oferece horários dentro do seu horário de funcionamento configurado.</p>
+      <details class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <summary class="px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">Vai parecer robótico para meus pacientes?</span>
+          <span class="faq-icon text-brand text-2xl font-light ml-4 flex-shrink-0">+</span>
+        </summary>
+        <div class="px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">Não. O agente usa linguagem natural, com emojis e tom acolhedor — personalizado para o contexto de psicologia. Vários pacientes das nossas clientes nunca perceberam que era automático.</p>
         </div>
-      </div>
+      </details>
 
-      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
-          <span class="font-semibold text-gray-800 text-sm">E se o paciente perguntar algo clínico?</span>
-          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
-        </button>
-        <div class="faq-answer hidden px-6 pb-5">
-          <p class="text-gray-500 text-sm leading-relaxed">O agente é treinado para nunca dar orientações clínicas ou diagnósticos. Em situações sensíveis, ele encaminha para você de forma acolhedora.</p>
+      <details class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <summary class="px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">E se o agente responder algo errado?</span>
+          <span class="faq-icon text-brand text-2xl font-light ml-4 flex-shrink-0">+</span>
+        </summary>
+        <div class="px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">O agente só faz o que foi programado: agendar, confirmar, informar PIX e aceitar atrasos. Situações delicadas ou dúvidas clínicas ele encaminha para você. E você pode pausar o agente para qualquer paciente com 1 clique.</p>
         </div>
-      </div>
+      </details>
 
-      <div class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-        <button onclick="toggleFaq(this)" class="w-full text-left px-6 py-5 flex justify-between items-center">
+      <details class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <summary class="px-6 py-5 flex justify-between items-center">
           <span class="font-semibold text-gray-800 text-sm">Posso cancelar a qualquer momento?</span>
-          <span class="text-brand text-xl font-light ml-4 flex-shrink-0">+</span>
-        </button>
-        <div class="faq-answer hidden px-6 pb-5">
-          <p class="text-gray-500 text-sm leading-relaxed">Sim. Não há contrato de fidelidade. Você pode cancelar quando quiser, sem multa.</p>
+          <span class="faq-icon text-brand text-2xl font-light ml-4 flex-shrink-0">+</span>
+        </summary>
+        <div class="px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">Sim. Não há contrato de fidelidade. Cancele quando quiser, sem multa e sem burocracia.</p>
         </div>
-      </div>
+      </details>
+
+      <details class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <summary class="px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">Tem dúvidas? Fale antes de assinar.</span>
+          <span class="faq-icon text-brand text-2xl font-light ml-4 flex-shrink-0">+</span>
+        </summary>
+        <div class="px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed mb-3">Tire suas dúvidas diretamente no WhatsApp antes de qualquer decisão:</p>
+          <a href="https://wa.me/5511968439527" target="_blank"
+            class="inline-flex items-center gap-2 bg-green-500 text-white text-sm font-semibold px-5 py-2.5 rounded-xl hover:bg-green-600 transition">
+            💬 Falar no WhatsApp
+          </a>
+        </div>
+      </details>
 
     </div>
   </div>
 </section>
 
 <!-- ── CTA FINAL ── -->
-<section class="gradient-hero text-white py-20 px-4 text-center">
+<section class="cta-bg text-white py-24 px-5 text-center">
   <div class="max-w-2xl mx-auto">
-    <div class="text-5xl mb-6">🤖</div>
-    <h2 class="text-3xl md:text-4xl font-black mb-4">Pronta para ter mais tempo<br/>para seus pacientes?</h2>
-    <p class="text-gray-300 text-lg mb-8">Configure seu agente agora e comece a atender no automático ainda hoje.</p>
-    <a href="/onboarding"
-      class="inline-block gradient-brand text-white font-bold px-10 py-4 rounded-2xl text-lg hover:opacity-90 transition shadow-xl">
-      Quero meu agente → R$ 200/mês
-    </a>
-    <p class="text-gray-400 text-sm mt-4">Sem contrato · Suporte incluso · Configuração em 2 minutos</p>
+    <div class="text-6xl mb-6">🚀</div>
+    <h2 class="text-3xl md:text-5xl font-black mb-5 leading-tight">
+      Pronta para ter mais tempo<br/>para seus pacientes?
+    </h2>
+    <p class="text-gray-300 text-lg mb-10 leading-relaxed">
+      Configure seu agente agora e comece a atender no automático ainda hoje.
+      Menos de 2 minutos para começar.
+    </p>
+    <div class="flex flex-col sm:flex-row gap-4 justify-center">
+      <a href="/onboarding"
+        class="btn-brand text-white font-bold px-10 py-5 rounded-2xl text-lg hover:opacity-90 transition shadow-2xl glow">
+        🚀 Começar agora →
+      </a>
+      <a href="https://wa.me/5511968439527" target="_blank"
+        class="border border-white/30 text-white font-medium px-10 py-5 rounded-2xl text-lg hover:bg-white/10 transition">
+        💬 Falar antes de assinar
+      </a>
+    </div>
+    <p class="text-gray-400 text-sm mt-6">Sem contrato · Suporte incluso · Configuração em 2 minutos</p>
   </div>
 </section>
 
 <!-- ── FOOTER ── -->
-<footer class="bg-gray-900 text-gray-400 py-8 px-4 text-center text-sm">
-  <p>© 2025 Agente de Atendimento WhatsApp · Powered by Claude AI</p>
+<footer class="bg-gray-950 text-gray-500 py-10 px-5">
+  <div class="max-w-5xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+    <div class="flex items-center gap-2">
+      <div class="w-7 h-7 btn-brand rounded-lg flex items-center justify-center text-white text-xs font-bold">CI</div>
+      <span class="font-semibold text-gray-400 text-sm">Consultório Inteligente</span>
+    </div>
+    <p class="text-sm text-center">© 2025 Consultório Inteligente · Powered by Claude AI · Anthropic</p>
+    <a href="https://wa.me/5511968439527" target="_blank" class="text-sm text-gray-400 hover:text-green-400 transition">
+      💬 Suporte: (11) 96843-9527
+    </a>
+  </div>
 </footer>
 
-<script>
-function toggleFaq(btn) {
-  const answer = btn.nextElementSibling;
-  const icon = btn.querySelector("span:last-child");
-  const isOpen = !answer.classList.contains("hidden");
-  // Fechar todos
-  document.querySelectorAll(".faq-answer").forEach(a => a.classList.add("hidden"));
-  document.querySelectorAll("#faq button span:last-child").forEach(s => s.textContent = "+");
-  // Abrir o clicado se estava fechado
-  if (!isOpen) {
-    answer.classList.remove("hidden");
-    icon.textContent = "−";
-  }
-}
-</script>
 </body>
 </html>
