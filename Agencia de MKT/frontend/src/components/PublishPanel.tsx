@@ -1,44 +1,33 @@
 import { useState, useEffect } from 'react'
 
 interface Credentials {
-  fb_page_id: string
-  fb_token: string
-  ig_user_id: string
-  ig_token: string
-  tw_api_key: string
-  tw_api_secret: string
-  tw_access_token: string
-  tw_access_secret: string
-  webhook_url: string
-  image_url: string
-  google_developer_token: string
-  google_customer_id: string
-  google_refresh_token: string
-  tiktok_access_token: string
-  tiktok_advertiser_id: string
+  fb_page_id: string; fb_token: string
+  ig_user_id: string; ig_token: string
+  tw_api_key: string; tw_api_secret: string; tw_access_token: string; tw_access_secret: string
+  webhook_url: string; image_url: string
+  google_developer_token: string; google_customer_id: string; google_refresh_token: string
+  tiktok_access_token: string; tiktok_advertiser_id: string
 }
 
 interface PublishResult {
-  platform: string
-  success: boolean
-  url?: string
-  error?: string
+  platform: string; success: boolean; url?: string; error?: string
 }
 
 interface Props {
   publisherOutput: string
   copyOutput: string
   designOutput: string
+  adsOutput: string
   authHeaders: Record<string, string>
 }
 
 const PLATFORMS = [
-  { id: 'facebook',  label: 'Facebook',    icon: '𝕗', color: 'text-blue-400'   },
-  { id: 'instagram', label: 'Instagram',   icon: '◉',  color: 'text-pink-400'   },
-  { id: 'twitter',   label: 'Twitter/X',   icon: '✕',  color: 'text-sky-400'    },
-  { id: 'google',    label: 'Google Ads',  icon: 'G',  color: 'text-yellow-400' },
-  { id: 'tiktok',    label: 'TikTok',      icon: '♪',  color: 'text-rose-400'   },
-  { id: 'webhook',   label: 'Webhook',     icon: '⚡',  color: 'text-violet-400' },
+  { id: 'facebook',  label: 'Facebook',   icon: '𝕗', color: 'text-blue-400'   },
+  { id: 'instagram', label: 'Instagram',  icon: '◉',  color: 'text-pink-400'   },
+  { id: 'twitter',   label: 'Twitter/X',  icon: '✕',  color: 'text-sky-400'    },
+  { id: 'google',    label: 'Google Ads', icon: 'G',  color: 'text-yellow-400' },
+  { id: 'tiktok',    label: 'TikTok',     icon: '♪',  color: 'text-rose-400'   },
+  { id: 'webhook',   label: 'Webhook',    icon: '⚡',  color: 'text-violet-400' },
 ]
 
 const CRED_GUIDES: Record<string, { steps: string[]; link: string }> = {
@@ -46,47 +35,55 @@ const CRED_GUIDES: Record<string, { steps: string[]; link: string }> = {
     steps: [
       '1. Acesse developers.facebook.com → Meus Apps → Criar App',
       '2. Adicione o produto "Páginas"',
-      '3. Em Ferramentas → Graph API Explorer → gere token com pages_manage_posts',
-      '4. Copie seu Page ID em: facebook.com/[nome-da-pagina]/about',
+      '3. Graph API Explorer → gere token com pages_manage_posts',
+      '4. Page ID: facebook.com/[nome-pagina]/about',
     ],
     link: 'https://developers.facebook.com/apps',
   },
   instagram: {
     steps: [
-      '1. Conta deve ser Business ou Creator no Instagram',
-      '2. Conecte ao Facebook Page em Configurações → Conta → Página vinculada',
-      '3. No Graph API Explorer: GET /me/accounts → pegue o access_token da página',
-      '4. GET /{page-id}?fields=instagram_business_account → pegue o ig_user_id',
-      '5. Imagem: precisa ser URL pública acessível (CDN, S3, Cloudinary etc.)',
+      '1. Conta deve ser Business/Creator no Instagram',
+      '2. Conecte ao Facebook Page em Configurações → Conta',
+      '3. Graph API Explorer: GET /me/accounts → pegue access_token da página',
+      '4. GET /{page-id}?fields=instagram_business_account → ig_user_id',
+      '5. Imagem: precisa ser URL pública (Cloudinary, S3, etc.)',
     ],
     link: 'https://developers.facebook.com/docs/instagram-api/getting-started',
   },
   twitter: {
     steps: [
-      '1. Acesse developer.twitter.com → Projects → Create App',
-      '2. Em "Keys and Tokens": copie API Key + API Secret',
-      '3. Gere Access Token + Access Token Secret (permissão Read+Write)',
+      '1. developer.twitter.com → Projects → Create App',
+      '2. Keys and Tokens: copie API Key + API Secret',
+      '3. Gere Access Token + Access Secret (permissão Read+Write)',
     ],
     link: 'https://developer.twitter.com/en/portal/dashboard',
   },
   google: {
     steps: [
-      '1. Acesse ads.google.com → Ferramentas → Centro da API',
-      '2. Solicite Developer Token (aprovação pode levar dias)',
-      '3. Google Cloud Console → OAuth2 → gere Refresh Token com escopo adwords',
-      '4. Customer ID: número de 10 dígitos no topo da conta Google Ads',
+      '1. ads.google.com → Ferramentas → Centro da API → solicite Developer Token',
+      '2. Google Cloud Console → OAuth2 → gere Refresh Token (escopo adwords)',
+      '3. Customer ID: número 10 dígitos no topo da conta Google Ads',
     ],
     link: 'https://developers.google.com/google-ads/api/docs/get-started/introduction',
   },
   tiktok: {
     steps: [
-      '1. Acesse business.tiktok.com → Developer → Create App',
+      '1. business.tiktok.com → Developer → Create App',
       '2. Solicite permissão de "Ad Management"',
-      '3. Gere Access Token com escopo de advertising',
-      '4. Advertiser ID: encontrado em ads.tiktok.com na URL do painel',
+      '3. Gere Access Token com escopo advertising',
+      '4. Advertiser ID: encontrado na URL do painel ads.tiktok.com',
     ],
     link: 'https://ads.tiktok.com/marketing_api/docs',
   },
+}
+
+// Budget ranges per platform (R$/day) shown as guidance
+const BUDGET_DEFAULTS: Record<string, { min: number; max: number; currency: string }> = {
+  facebook:  { min: 15,  max: 150,  currency: 'R$/dia' },
+  instagram: { min: 15,  max: 150,  currency: 'R$/dia' },
+  twitter:   { min: 20,  max: 200,  currency: 'R$/dia' },
+  google:    { min: 30,  max: 500,  currency: 'R$/dia' },
+  tiktok:    { min: 50,  max: 300,  currency: 'R$/dia' },
 }
 
 const EMPTY: Credentials = {
@@ -97,23 +94,47 @@ const EMPTY: Credentials = {
   tiktok_access_token: '', tiktok_advertiser_id: '',
 }
 
-/** Extract the AI image prompt from the DESIGN agent output */
 function extractImagePrompt(designOutput: string): string {
   if (!designOutput) return ''
-  // Look for lines containing PROMPT IA or PROMPT IMAGEM
   const lines = designOutput.split('\n')
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].toUpperCase()
-    if (line.includes('PROMPT IA') || line.includes('PROMPT IMAGEM') || line.includes('PROMPT FEED')) {
-      // Return this line + next 2 lines as the prompt
+    const up = lines[i].toUpperCase()
+    if (up.includes('PROMPT IA') || up.includes('PROMPT IMAGEM') || up.includes('PROMPT FEED')) {
       return lines.slice(i, i + 3).join(' ').replace(/PROMPT IA [A-ZÁÉÍÓÚ]*\s*[:|]?\s*/i, '').trim()
     }
   }
   return ''
 }
 
-export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHeaders }: Props) {
-  const [open, setOpen]             = useState(true)   // auto-open when panel mounts
+function extractBudgetFromAds(adsOutput: string): Record<string, string> {
+  if (!adsOutput) return {}
+  const result: Record<string, string> = {}
+  const lines = adsOutput.toLowerCase().split('\n')
+  const platformMap: Record<string, string[]> = {
+    facebook:  ['facebook', 'meta', 'fb'],
+    instagram: ['instagram', 'ig', 'insta'],
+    twitter:   ['twitter', 'x.com', 'tweet'],
+    google:    ['google', 'google ads', 'adwords', 'search'],
+    tiktok:    ['tiktok', 'tik tok'],
+  }
+  for (const line of lines) {
+    if (!line.includes('r$') && !line.includes('budget') && !line.includes('orçamento') && !line.includes('verba')) continue
+    for (const [platform, keywords] of Object.entries(platformMap)) {
+      if (keywords.some(k => line.includes(k))) {
+        const match = line.match(/r\$\s*[\d.,]+(?:\s*[-–]\s*r\$\s*[\d.,]+)?/i)
+        if (match) {
+          result[platform] = match[0].replace(/r\$/gi, 'R$').trim()
+          break
+        }
+      }
+    }
+  }
+  return result
+}
+
+export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOutput, authHeaders }: Props) {
+  const [open, setOpen]             = useState(true)
+  const [budgetConfirmed, setBudget] = useState(false)
   const [creds, setCreds]           = useState<Credentials>(() => {
     try { return { ...EMPTY, ...JSON.parse(localStorage.getItem('mkt_creds') || '{}') } }
     catch { return EMPTY }
@@ -124,19 +145,16 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHe
   const [text, setText]             = useState('')
   const [showGuide, setShowGuide]   = useState<string | null>(null)
 
-  // Auto-fill text when agency output arrives
   useEffect(() => {
     const output = publisherOutput || copyOutput
     if (output && !text) setText(output)
   }, [publisherOutput, copyOutput])
 
-  // Auto-fill image prompt from design output
-  const imagePrompt = extractImagePrompt(designOutput)
+  const imagePrompt  = extractImagePrompt(designOutput)
+  const budgetFromAI = extractBudgetFromAds(adsOutput)
 
   const toggle = (id: string) => setSelected(s => {
-    const n = new Set(s)
-    n.has(id) ? n.delete(id) : n.add(id)
-    return n
+    const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n
   })
 
   const saveCreds = (patch: Partial<Credentials>) => {
@@ -146,7 +164,7 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHe
   }
 
   const handlePublish = async () => {
-    if (selected.size === 0) return
+    if (selected.size === 0 || !budgetConfirmed) return
     setPublishing(true)
     setResults([])
     try {
@@ -176,9 +194,10 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHe
     setPublishing(false)
   }
 
+  const selectedPlatformsWithBudget = [...selected].filter(p => p in BUDGET_DEFAULTS)
+
   return (
     <div className="bg-gray-900/60 border border-gray-800 rounded-xl overflow-hidden">
-      {/* Header */}
       <button
         onClick={() => setOpen(o => !o)}
         className="w-full flex items-center justify-between px-5 py-4 hover:bg-gray-800/40 transition-colors"
@@ -186,14 +205,17 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHe
         <div className="flex items-center gap-2">
           <span className="text-lg">↑</span>
           <span className="text-sm font-bold text-gray-200 tracking-wide">PUBLICAR NAS REDES</span>
-          <span className="text-[10px] text-emerald-500 bg-emerald-900/20 border border-emerald-800 px-2 py-0.5 rounded-full">pronto para publicar</span>
+          <span className="text-[10px] text-emerald-500 bg-emerald-900/20 border border-emerald-800 px-2 py-0.5 rounded-full">
+            pronto para publicar
+          </span>
         </div>
         <span className="text-gray-500 text-sm">{open ? '▲' : '▼'}</span>
       </button>
 
       {open && (
-        <div className="px-5 pb-5 space-y-4 border-t border-gray-800">
-          {/* Text to publish */}
+        <div className="px-5 pb-5 space-y-5 border-t border-gray-800">
+
+          {/* ── Texto ── */}
           <div className="mt-4">
             <label className="block text-[10px] text-gray-500 mb-1 tracking-widest uppercase">Texto para publicar</label>
             <textarea
@@ -204,25 +226,15 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHe
               value={text}
               onChange={e => setText(e.target.value)}
             />
-            {!text && (publisherOutput || copyOutput) && (
-              <button
-                onClick={() => setText(publisherOutput || copyOutput)}
-                className="mt-1 text-[10px] text-violet-400 hover:text-violet-300"
-              >
-                ← usar texto da agência
-              </button>
-            )}
             {text && (
-              <button
-                onClick={() => setText(publisherOutput || copyOutput || '')}
-                className="mt-1 text-[10px] text-gray-600 hover:text-gray-400"
-              >
+              <button onClick={() => setText(publisherOutput || copyOutput || '')}
+                className="mt-1 text-[10px] text-gray-600 hover:text-gray-400">
                 ↺ restaurar texto da agência
               </button>
             )}
           </div>
 
-          {/* Image URL (for Instagram) */}
+          {/* ── Imagem ── */}
           <div>
             <label className="block text-[10px] text-gray-500 mb-1 tracking-widest uppercase">
               URL da Imagem <span className="text-pink-500">· obrigatório para Instagram</span>
@@ -245,25 +257,22 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHe
                   <a href="https://openai.com/dall-e-3" target="_blank" rel="noopener noreferrer" className="text-violet-400 hover:underline">DALL-E</a>
                   {' ou '}
                   <a href="https://stability.ai" target="_blank" rel="noopener noreferrer" className="text-violet-400 hover:underline">Stable Diffusion</a>
-                  {' → cole a URL da imagem gerada acima'}
+                  {' → cole a URL acima'}
                 </p>
               </div>
             )}
           </div>
 
-          {/* Platform selection */}
+          {/* ── Plataformas ── */}
           <div>
             <p className="text-[10px] text-gray-500 mb-2 tracking-widest uppercase">Plataformas</p>
             <div className="grid grid-cols-3 gap-2">
               {PLATFORMS.map(p => (
-                <button
-                  key={p.id}
-                  onClick={() => toggle(p.id)}
+                <button key={p.id} onClick={() => toggle(p.id)}
                   className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-all
                     ${selected.has(p.id)
                       ? 'border-violet-500 bg-violet-900/30 text-white'
-                      : 'border-gray-700 bg-gray-800/50 text-gray-400 hover:border-gray-600'}`}
-                >
+                      : 'border-gray-700 bg-gray-800/50 text-gray-400 hover:border-gray-600'}`}>
                   <span className={p.color}>{p.icon}</span>
                   {p.label}
                   {selected.has(p.id) && <span className="ml-auto text-[8px] text-violet-400">✓</span>}
@@ -272,81 +281,115 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHe
             </div>
           </div>
 
-          {/* Credentials accordion per platform */}
+          {/* ── Credenciais por plataforma ── */}
           {selected.has('facebook') && (
-            <CredentialSection title="Facebook" platformId="facebook"
-              showGuide={showGuide} onToggleGuide={setShowGuide}>
-              <Field label="Page ID" value={creds.fb_page_id} onChange={v => saveCreds({ fb_page_id: v })} />
-              <Field label="Access Token" value={creds.fb_token} onChange={v => saveCreds({ fb_token: v })} secret />
+            <CredentialSection title="Facebook" platformId="facebook" showGuide={showGuide} onToggleGuide={setShowGuide}>
+              <Field label="Page ID"      value={creds.fb_page_id} onChange={v => saveCreds({ fb_page_id: v })} />
+              <Field label="Access Token" value={creds.fb_token}   onChange={v => saveCreds({ fb_token: v })} secret />
             </CredentialSection>
           )}
-
           {selected.has('instagram') && (
-            <CredentialSection title="Instagram" platformId="instagram"
-              showGuide={showGuide} onToggleGuide={setShowGuide}>
+            <CredentialSection title="Instagram" platformId="instagram" showGuide={showGuide} onToggleGuide={setShowGuide}>
               <Field label="IG Business User ID" value={creds.ig_user_id} onChange={v => saveCreds({ ig_user_id: v })} />
-              <Field label="Access Token (Page)" value={creds.ig_token} onChange={v => saveCreds({ ig_token: v })} secret />
-              <p className="text-[9px] text-yellow-600 mt-1">⚠ Instagram só aceita imagens via URL pública (campo acima)</p>
+              <Field label="Access Token (Page)" value={creds.ig_token}   onChange={v => saveCreds({ ig_token: v })} secret />
+              <p className="text-[9px] text-yellow-600 mt-1">⚠ Requer URL pública de imagem (campo acima)</p>
             </CredentialSection>
           )}
-
           {selected.has('twitter') && (
-            <CredentialSection title="Twitter/X" platformId="twitter"
-              showGuide={showGuide} onToggleGuide={setShowGuide}>
-              <Field label="API Key"        value={creds.tw_api_key}       onChange={v => saveCreds({ tw_api_key: v })} />
-              <Field label="API Secret"     value={creds.tw_api_secret}    onChange={v => saveCreds({ tw_api_secret: v })} secret />
-              <Field label="Access Token"   value={creds.tw_access_token}  onChange={v => saveCreds({ tw_access_token: v })} secret />
-              <Field label="Access Secret"  value={creds.tw_access_secret} onChange={v => saveCreds({ tw_access_secret: v })} secret />
+            <CredentialSection title="Twitter/X" platformId="twitter" showGuide={showGuide} onToggleGuide={setShowGuide}>
+              <Field label="API Key"       value={creds.tw_api_key}       onChange={v => saveCreds({ tw_api_key: v })} />
+              <Field label="API Secret"    value={creds.tw_api_secret}    onChange={v => saveCreds({ tw_api_secret: v })} secret />
+              <Field label="Access Token"  value={creds.tw_access_token}  onChange={v => saveCreds({ tw_access_token: v })} secret />
+              <Field label="Access Secret" value={creds.tw_access_secret} onChange={v => saveCreds({ tw_access_secret: v })} secret />
             </CredentialSection>
           )}
-
           {selected.has('google') && (
-            <CredentialSection title="Google Ads" platformId="google"
-              showGuide={showGuide} onToggleGuide={setShowGuide}>
-              <Field label="Developer Token"  value={creds.google_developer_token} onChange={v => saveCreds({ google_developer_token: v })} secret />
-              <Field label="Customer ID"      value={creds.google_customer_id}      onChange={v => saveCreds({ google_customer_id: v })} />
-              <Field label="Refresh Token"    value={creds.google_refresh_token}    onChange={v => saveCreds({ google_refresh_token: v })} secret />
+            <CredentialSection title="Google Ads" platformId="google" showGuide={showGuide} onToggleGuide={setShowGuide}>
+              <Field label="Developer Token" value={creds.google_developer_token} onChange={v => saveCreds({ google_developer_token: v })} secret />
+              <Field label="Customer ID"     value={creds.google_customer_id}      onChange={v => saveCreds({ google_customer_id: v })} />
+              <Field label="Refresh Token"   value={creds.google_refresh_token}    onChange={v => saveCreds({ google_refresh_token: v })} secret />
             </CredentialSection>
           )}
-
           {selected.has('tiktok') && (
-            <CredentialSection title="TikTok" platformId="tiktok"
-              showGuide={showGuide} onToggleGuide={setShowGuide}>
-              <Field label="Access Token"    value={creds.tiktok_access_token}  onChange={v => saveCreds({ tiktok_access_token: v })} secret />
-              <Field label="Advertiser ID"   value={creds.tiktok_advertiser_id} onChange={v => saveCreds({ tiktok_advertiser_id: v })} />
+            <CredentialSection title="TikTok" platformId="tiktok" showGuide={showGuide} onToggleGuide={setShowGuide}>
+              <Field label="Access Token"  value={creds.tiktok_access_token}  onChange={v => saveCreds({ tiktok_access_token: v })} secret />
+              <Field label="Advertiser ID" value={creds.tiktok_advertiser_id} onChange={v => saveCreds({ tiktok_advertiser_id: v })} />
             </CredentialSection>
           )}
-
           {selected.has('webhook') && (
-            <CredentialSection title="Webhook" platformId="webhook"
-              showGuide={showGuide} onToggleGuide={setShowGuide}>
+            <CredentialSection title="Webhook" platformId="webhook" showGuide={showGuide} onToggleGuide={setShowGuide}>
               <Field label="URL" value={creds.webhook_url} onChange={v => saveCreds({ webhook_url: v })} />
               <p className="text-[9px] text-gray-600 mt-1">Envia POST JSON com {`{text, image_url}`} para qualquer endpoint</p>
             </CredentialSection>
           )}
 
-          {/* Publish button */}
+          {/* ── Resumo de Orçamento ── */}
+          {selectedPlatformsWithBudget.length > 0 && (
+            <div className="bg-amber-950/30 border border-amber-800/50 rounded-xl p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="text-amber-400 text-base">💰</span>
+                <p className="text-xs font-bold text-amber-300 tracking-wide uppercase">
+                  Resumo de Orçamento — Estimativa por Mídia
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {selectedPlatformsWithBudget.map(pid => {
+                  const def  = BUDGET_DEFAULTS[pid]
+                  const ai   = budgetFromAI[pid]
+                  const label = PLATFORMS.find(p => p.id === pid)?.label || pid
+                  return (
+                    <div key={pid} className="bg-gray-900/60 border border-gray-800 rounded-lg px-3 py-2.5">
+                      <p className="text-[10px] text-gray-500 uppercase tracking-widest">{label}</p>
+                      {ai ? (
+                        <p className="text-sm font-bold text-amber-300 mt-0.5">{ai}</p>
+                      ) : (
+                        <p className="text-sm font-bold text-amber-300 mt-0.5">
+                          R$ {def.min}–{def.max} <span className="text-[9px] font-normal text-gray-500">{def.currency}</span>
+                        </p>
+                      )}
+                      <p className="text-[9px] text-gray-600 mt-0.5">
+                        {ai ? 'sugerido pelo Agente Ads' : 'estimativa de mercado'}
+                      </p>
+                    </div>
+                  )
+                })}
+              </div>
+              <div className="flex items-start gap-2 mt-1">
+                <input
+                  type="checkbox"
+                  id="budget-confirm"
+                  checked={budgetConfirmed}
+                  onChange={e => setBudget(e.target.checked)}
+                  className="mt-0.5 accent-violet-500"
+                />
+                <label htmlFor="budget-confirm" className="text-[11px] text-gray-400 cursor-pointer leading-relaxed">
+                  Confirmo que estou ciente do orçamento estimado acima e autorizo a publicação da campanha.
+                </label>
+              </div>
+            </div>
+          )}
+
+          {/* ── Publicar ── */}
           <button
             onClick={handlePublish}
-            disabled={publishing || selected.size === 0 || !text}
+            disabled={publishing || selected.size === 0 || !text || (selectedPlatformsWithBudget.length > 0 && !budgetConfirmed)}
             className="w-full py-2.5 rounded-xl text-sm font-semibold transition-all
               bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500
               disabled:from-gray-800 disabled:to-gray-800 disabled:text-gray-600 disabled:cursor-not-allowed
               text-white shadow-lg shadow-emerald-500/20"
           >
-            {publishing
-              ? <span className="flex items-center justify-center gap-2">
-                  <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  Publicando...
-                </span>
-              : selected.size === 0
-                ? 'Selecione ao menos uma plataforma'
-                : !text
-                  ? 'Aguardando texto da agência...'
-                  : `↑ Publicar em ${selected.size} plataforma${selected.size !== 1 ? 's' : ''}`}
+            {publishing ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                Publicando...
+              </span>
+            ) : selected.size === 0 ? 'Selecione ao menos uma plataforma'
+              : !text ? 'Aguardando texto da agência...'
+              : (selectedPlatformsWithBudget.length > 0 && !budgetConfirmed) ? '⚠ Confirme o orçamento para publicar'
+              : `↑ Publicar em ${selected.size} plataforma${selected.size !== 1 ? 's' : ''}`}
           </button>
 
-          {/* Results */}
+          {/* ── Resultados ── */}
           {results.length > 0 && (
             <div className="space-y-2">
               {results.map((r, i) => (
@@ -368,27 +411,20 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, authHe
   )
 }
 
-function CredentialSection({
-  title, platformId, showGuide, onToggleGuide, children,
-}: {
-  title: string
-  platformId: string
-  showGuide: string | null
-  onToggleGuide: (id: string | null) => void
-  children: React.ReactNode
+function CredentialSection({ title, platformId, showGuide, onToggleGuide, children }: {
+  title: string; platformId: string; showGuide: string | null
+  onToggleGuide: (id: string | null) => void; children: React.ReactNode
 }) {
-  const guide = CRED_GUIDES[platformId]
+  const guide  = CRED_GUIDES[platformId]
   const isOpen = showGuide === platformId
   return (
     <div className="bg-gray-800/40 border border-gray-700 rounded-lg p-3 space-y-2">
       <div className="flex items-center justify-between">
         <p className="text-[10px] text-gray-400 font-bold tracking-widest uppercase">{title} — Credenciais</p>
         {guide && (
-          <button
-            onClick={() => onToggleGuide(isOpen ? null : platformId)}
-            className="text-[9px] text-violet-400 hover:text-violet-300 transition-colors"
-          >
-            {isOpen ? '▲ fechar guia' : '? como obter'}
+          <button onClick={() => onToggleGuide(isOpen ? null : platformId)}
+            className="text-[9px] text-violet-400 hover:text-violet-300 transition-colors">
+            {isOpen ? '▲ fechar' : '? como obter'}
           </button>
         )}
       </div>
@@ -399,7 +435,7 @@ function CredentialSection({
           ))}
           <a href={guide.link} target="_blank" rel="noopener noreferrer"
             className="inline-block mt-1 text-[9px] text-violet-400 hover:underline">
-            Abrir painel de developer ↗
+            Abrir painel developer ↗
           </a>
         </div>
       )}
