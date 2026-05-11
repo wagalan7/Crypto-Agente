@@ -30,7 +30,7 @@ WORKING_HOURS_START = int(os.getenv("WORKING_HOURS_START", "7"))
 WORKING_HOURS_END = int(os.getenv("WORKING_HOURS_END", "21"))
 
 MASTER_KEY = os.getenv("MASTER_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "https://agente-atendimento-production.up.railway.app")
+BASE_URL = os.getenv("BASE_URL", "https://agenteconsultorio.com.br")
 
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")

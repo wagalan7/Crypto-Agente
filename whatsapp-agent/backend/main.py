@@ -324,7 +324,7 @@ def configure_zapi(slug: str, body: ZAPIConfig):
     return {
         "status": "configured",
         "provider": "zapi",
-        "webhook_url": f"https://agente-atendimento-production.up.railway.app/webhook/{slug}/zapi",
+        "webhook_url": f"{config.BASE_URL}/webhook/{slug}/zapi",
     }
 
 
