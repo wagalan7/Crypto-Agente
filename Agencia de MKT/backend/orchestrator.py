@@ -8,10 +8,10 @@ from openai import AsyncOpenAI, RateLimitError
 from models import ProductInput
 
 client = AsyncOpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
+    api_key=os.getenv("GEMINI_API_KEY"),
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
 )
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "gemini-2.0-flash"
 
 AGENT_LOGS = {
     "ESTRATEGIA": ["Definindo ICP", "Mapeando dores", "Construindo funil", "Finalizando posicionamento"],
