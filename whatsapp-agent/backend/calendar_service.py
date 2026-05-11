@@ -35,7 +35,19 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
     end_date = now + timedelta(days=days_ahead)
 
     booked = db.get_appointments_in_range(tenant_id, now.isoformat(), end_date.isoformat())
-    booked_times = {r["scheduled_at"][:16] for r in booked}
+    booked_dts = []
+    for r in booked:
+        try:
+            booked_dts.append(datetime.fromisoformat(r["scheduled_at"]))
+        except Exception:
+            pass
+
+    def _conflicts(slot: datetime) -> bool:
+        """Slot conflita se está a menos de `duration` minutos de qualquer consulta existente."""
+        for b in booked_dts:
+            if abs((slot - b).total_seconds()) < duration * 60:
+                return True
+        return False
 
     slots = []
     while check <= end_date and len(slots) < limit:
@@ -43,7 +55,7 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
             check.weekday() in working_days
             and start_h <= check.hour < end_h
             and check.hour not in blocked_hours
-            and check.isoformat()[:16] not in booked_times
+            and not _conflicts(check)
         ):
             slots.append(check)
         check += timedelta(minutes=duration)
