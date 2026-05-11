@@ -5,7 +5,8 @@ load_dotenv()
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # mantido por compatibilidade
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "6h", "8h", "12h", "1d", "3d"]
 DEFAULT_TIMEFRAME = "1d"

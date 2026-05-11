@@ -1,18 +1,74 @@
 from __future__ import annotations
 from typing import Optional
-import anthropic
 from models.trade_signal import TradeSignal, SignalDirection, TradeType
-from config import ANTHROPIC_API_KEY
+from config import GROQ_API_KEY, ANTHROPIC_API_KEY
 
-_client: Optional[anthropic.AsyncAnthropic] = None
+# ─── Groq client (principal — gratuito) ───────────────────────────────────────
+try:
+    from groq import AsyncGroq
+    _groq_client: Optional[AsyncGroq] = None
+
+    def get_groq_client() -> AsyncGroq:
+        global _groq_client
+        if _groq_client is None:
+            _groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+        return _groq_client
+except ImportError:
+    AsyncGroq = None  # type: ignore
+    def get_groq_client():  # type: ignore
+        raise RuntimeError("groq package not installed")
+
+# ─── Anthropic client (fallback legado) ───────────────────────────────────────
+try:
+    import anthropic
+    _anthropic_client: Optional[anthropic.AsyncAnthropic] = None
+
+    def get_client() -> anthropic.AsyncAnthropic:
+        global _anthropic_client
+        if _anthropic_client is None:
+            _anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        return _anthropic_client
+except ImportError:
+    def get_client():  # type: ignore
+        raise RuntimeError("anthropic package not installed")
 
 
-def get_client() -> anthropic.AsyncAnthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    return _client
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def has_ai() -> bool:
+    return bool(GROQ_API_KEY) or bool(ANTHROPIC_API_KEY)
+
+
+async def call_ai(system: str, user: str, max_tokens: int = 1000) -> str:
+    """Chama Groq (preferencial) ou Anthropic (fallback)."""
+    if GROQ_API_KEY:
+        client = get_groq_client()
+        response = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+        )
+        return response.choices[0].message.content or ""
+
+    if ANTHROPIC_API_KEY:
+        client = get_client()
+        message = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        return message.content[0].text
+
+    raise RuntimeError("Nenhuma chave de IA configurada (GROQ_API_KEY ou ANTHROPIC_API_KEY).")
+
+
+# ─── Formatação de sinal ───────────────────────────────────────────────────────
 
 def _format_signal_for_prompt(signal: TradeSignal, macro_context: str = "") -> str:
     direction_map = {
@@ -116,25 +172,16 @@ REGRAS:
 
 
 async def generate_ai_analysis(signal: TradeSignal, macro_context: str = "") -> str:
-    if not ANTHROPIC_API_KEY:
+    if not has_ai():
         return _fallback_analysis(signal)
 
-    client = get_client()
     prompt_data = _format_signal_for_prompt(signal, macro_context)
-
     try:
-        message = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1000,
+        return await call_ai(
             system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Analise este setup seguindo a ordem obrigatória:\n{prompt_data}",
-                }
-            ],
+            user=f"Analise este setup seguindo a ordem obrigatória:\n{prompt_data}",
+            max_tokens=1000,
         )
-        return message.content[0].text
     except Exception:
         return _fallback_analysis(signal)
 
@@ -146,56 +193,38 @@ def _fallback_analysis(signal: TradeSignal) -> str:
     risk_pct = abs(signal.entry - signal.stop_loss) / signal.entry * 100 if signal.entry else 0
 
     parts = []
-
-    # 1. Direção
     parts.append(
         f"1. DIREÇÃO: {signal.symbol} apresenta viés de {direction_text} no timeframe {signal.timeframe} "
         f"com {signal.confidence:.0%} de probabilidade. "
         f"{'Sinal acionável.' if is_actionable else 'Probabilidade abaixo do mínimo de 75% — aguardar.'}"
     )
-
-    # 2. BTC estrutura (contexto limitado sem macro)
     parts.append(
         "2. BTC: Contexto macro completo disponível apenas com análise IA ativada. "
         "Recomenda-se verificar manualmente o viés do BTC no TF diário antes de operar."
     )
-
-    # 3–5. Macro
     parts.append(
         "3–5. MACRO (DXY/SP500/Nasdaq): Ative a análise IA para contexto macro completo com dados em tempo real."
     )
-
-    # 6. Par + indicadores
     ind_text = f"EMA12={ind.ema9} | EMA26={ind.ema21} | RSI={ind.rsi} | ADX={ind.adx} | Supertrend={'Alta' if ind.supertrend_direction == 1 else 'Baixa' if ind.supertrend_direction == -1 else 'N/D'}"
     pat_text = "; ".join(p.description for p in signal.patterns[:2]) if signal.patterns else "Nenhum padrão detectado"
     parts.append(f"6. PAR BTC: {ind_text}. Padrões ({signal.timeframe}): {pat_text}.")
-
-    # 7. Operação
     type_map = {TradeType.SCALP: "Scalp", TradeType.DAY_TRADE: "Day Trade",
                 TradeType.SWING: "Swing Trade", TradeType.HODL: "HODL"}
     if is_actionable:
         parts.append(
             f"7. OPERAÇÃO ({type_map.get(signal.trade_type, '')} — TF {signal.timeframe}): "
             f"{signal.direction.value.upper()} em {signal.entry:.6g}. "
-            f"Stop: {signal.stop_loss:.6g} (risco {risk_pct:.1f}% — posicionado abaixo/acima de estrutura de suporte/resistência). "
-            f"TP1: {signal.tp1:.6g} (resistência imediata, probabilidade ~60%). "
-            f"TP2: {signal.tp2:.6g} (próximo nível de liquidez, ~35%). "
-            f"TP3: {signal.tp3:.6g} (extensão de movimento, ~15%). RR 1:{signal.risk_reward}."
+            f"Stop: {signal.stop_loss:.6g} (risco {risk_pct:.1f}%). "
+            f"TP1: {signal.tp1:.6g} | TP2: {signal.tp2:.6g} | TP3: {signal.tp3:.6g}. RR 1:{signal.risk_reward}."
         )
     else:
         parts.append(
-            f"7. AGUARDAR: Probabilidade {signal.confidence:.0%} < 75%. "
-            f"Falta confirmar: {'ADX > 25 para tendência mais forte' if (ind.adx or 0) < 25 else ''}"
-            f"{', RSI saindo de zona extrema' if ind.rsi and 30 <= ind.rsi <= 70 else ''}"
-            f". Reanalisar após próximo fechamento de candle."
+            f"7. AGUARDAR: Probabilidade {signal.confidence:.0%} < 75%. Reanalisar após próximo fechamento de candle."
         )
-
-    # 8. Alertas
     if is_actionable:
         parts.append(
-            f"8. ALERTAS SIMULADOS: 🎯 TP1 {signal.tp1:.6g} | 🎯 TP2 {signal.tp2:.6g} | "
+            f"8. ALERTAS: 🎯 TP1 {signal.tp1:.6g} | 🎯 TP2 {signal.tp2:.6g} | "
             f"🎯 TP3 {signal.tp3:.6g} | 🛑 Stop {signal.stop_loss:.6g} | "
-            f"⚠️ Invalidação: fechamento além do stop | 🚪 Saída a mercado se estrutura romper."
+            f"⚠️ Invalidação: fechamento além do stop."
         )
-
     return "\n\n".join(parts)

@@ -13,7 +13,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Quer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import TIMEFRAMES, DEFAULT_TIMEFRAME, DEFAULT_LIMIT, ANTHROPIC_API_KEY
+from config import TIMEFRAMES, DEFAULT_TIMEFRAME, DEFAULT_LIMIT, ANTHROPIC_API_KEY, GROQ_API_KEY
 from services.binance_service import (
     get_perpetual_symbols,
     fetch_ohlcv,
@@ -321,11 +321,11 @@ async def validate_drawing(body: dict):
 
     drawings_desc = "\n".join(desc_lines)
 
-    if not ANTHROPIC_API_KEY:
+    if not GROQ_API_KEY and not ANTHROPIC_API_KEY:
         return {
             "analysis": (
                 f"Desenhos detectados em {symbol} ({timeframe}):\n\n{drawings_desc}\n\n"
-                "ℹ️ Análise IA não disponível. Configure a variável ANTHROPIC_API_KEY para habilitar a validação inteligente de padrões."
+                "ℹ️ Análise IA não disponível. Configure a variável GROQ_API_KEY para habilitar a validação inteligente de padrões."
             )
         }
 
@@ -398,14 +398,9 @@ Se não operar: "Risco principal: [motivo concreto]."
 Seja direto, objetivo e sempre justifique cada nível com estrutura de mercado real."""
 
     try:
-        from services.ai_service import get_client
-        client = get_client()
-        message = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1200,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return {"analysis": message.content[0].text}
+        from services.ai_service import call_ai
+        result = await call_ai(system="Você é um analista técnico sênior de criptomoedas.", user=prompt, max_tokens=1200)
+        return {"analysis": result}
     except Exception as e:
         logging.error(f"validate_drawing error: {e}")
         return {
@@ -473,23 +468,22 @@ Uma afirmação em 1ª pessoa, presente, positiva e específica para trading. (m
 
 Linguagem direta, calorosa e profissional. Máximo 300 palavras."""
 
-    if not ANTHROPIC_API_KEY:
+    if not GROQ_API_KEY and not ANTHROPIC_API_KEY:
         return {
             "coaching": (
                 f"Estado: {estado} (intensidade {intensidade}/5)\n\n"
-                "ℹ️ Coaching IA não disponível. Configure ANTHROPIC_API_KEY para habilitar o coach de PNL."
+                "ℹ️ Coaching IA não disponível. Configure GROQ_API_KEY para habilitar o coach de PNL."
             )
         }
 
     try:
-        from services.ai_service import get_client
-        client = get_client()
-        message = await client.messages.create(
-            model="claude-sonnet-4-6",
+        from services.ai_service import call_ai
+        result = await call_ai(
+            system="Você é um coach especialista em Programação Neurolinguística (PNL) aplicada ao trading.",
+            user=prompt,
             max_tokens=800,
-            messages=[{"role": "user", "content": prompt}]
         )
-        return {"coaching": message.content[0].text}
+        return {"coaching": result}
     except Exception as e:
         logging.error(f"nlp_coach error: {e}")
         return {"coaching": f"Erro ao gerar coaching: {str(e)[:200]}"}
