@@ -260,6 +260,40 @@
       <p id="confirmar-status" class="text-xs text-gray-400 text-center mt-2 hidden"></p>
     </div>
 
+    <!-- Cobrança Mensal -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-2xl">💰</span>
+        <div>
+          <h3 class="font-semibold text-gray-800 text-sm">Cobrança Mensal</h3>
+          <p class="text-xs text-gray-500">Envia resumo de sessões e valor para cada paciente cadastrado com preço</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-3 mb-3">
+        <div class="flex-1">
+          <label class="block text-xs text-gray-500 mb-1">Mês de referência</label>
+          <input type="month" id="billing-month"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <button onclick="dispararCobrancas()" id="btn-cobrar"
+          class="mt-5 bg-brand text-white px-4 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition flex-shrink-0">
+          Enviar cobranças
+        </button>
+      </div>
+      <p id="cobrar-status" class="text-xs text-gray-400 text-center mb-3 hidden"></p>
+
+      <!-- Billing logs table -->
+      <div class="border-t border-gray-100 pt-3">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide">Histórico de cobranças</p>
+          <button onclick="loadBillingLogs()" class="text-xs text-brand">↻ Atualizar</button>
+        </div>
+        <div id="billing-logs" class="overflow-x-auto">
+          <p class="text-xs text-gray-400 text-center py-3">Carregando...</p>
+        </div>
+      </div>
+    </div>
+
     <!-- Google Calendar -->
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
       <div class="flex items-center gap-3 mb-3">
@@ -497,6 +531,7 @@ function showTab(name) {
   if (name==="agenda")    { loadAgenda();    newAppointments=0; updateBadge("agenda",0); }
   if (name==="slots")     loadSlots();
   if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
+  if (name==="config")    loadBillingLogs();
 }
 
 function api(path, opts={}) {
@@ -601,21 +636,46 @@ function loadConv(phone) {
             : 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200'}">
           ${isPaused ? '▶ Retomar agente' : '⏸ Pausar agente'}
         </button>
+      </div>
+      <div class="mt-3 pt-3 border-t border-gray-100 flex items-center gap-3">
+        <label class="text-xs text-gray-500 font-medium whitespace-nowrap">💰 Valor da sessão:</label>
+        <div class="flex items-center gap-2 flex-1">
+          <span class="text-xs text-gray-400">R$</span>
+          <input type="number" id="price-input-${phone}" min="0" step="0.01" placeholder="0,00"
+            class="border border-gray-200 rounded-lg px-2 py-1 text-sm w-24 focus:outline-none focus:ring-2 focus:ring-brand"
+            onchange="savePatientPrice('${phone}', this.value)"/>
+          <span id="price-saved-${phone}" class="text-xs text-green-600 hidden">✓ Salvo</span>
+        </div>
       </div>`;
 
     if (!msgs.length) {
-      el.innerHTML = pauseBtn + '<p class="text-gray-400 text-sm">Sem mensagens.</p>';
-      return;
+      el.innerHTML = pauseBtn + '<p class="text-gray-400 text-sm mt-3">Sem mensagens.</p>';
+    } else {
+      el.innerHTML = pauseBtn + `<div class="space-y-3 overflow-y-auto max-h-80 pr-1 mt-3">` +
+        msgs.map(m => {
+          const isUser = m.role==="user";
+          return `<div class="flex ${isUser?'justify-start':'justify-end'}">
+            <div class="max-w-[80%] px-4 py-2 rounded-2xl text-sm ${isUser?'bg-gray-100 text-gray-800':'bg-brand text-white'}">${m.content}</div>
+          </div>`;
+        }).join("") + `</div>`;
+      el.querySelector("div:last-child").scrollTop = 99999;
     }
-    el.innerHTML = pauseBtn + `<div class="space-y-3 overflow-y-auto max-h-80 pr-1">` +
-      msgs.map(m => {
-        const isUser = m.role==="user";
-        return `<div class="flex ${isUser?'justify-start':'justify-end'}">
-          <div class="max-w-[80%] px-4 py-2 rounded-2xl text-sm ${isUser?'bg-gray-100 text-gray-800':'bg-brand text-white'}">${m.content}</div>
-        </div>`;
-      }).join("") + `</div>`;
-    el.querySelector("div:last-child").scrollTop = 99999;
+
+    // Load current session price asynchronously
+    api(`/dashboard/api/patients/${phone}/billing-info`).then(info => {
+      const inp = document.getElementById(`price-input-${phone}`);
+      if (inp && info.session_price) inp.value = info.session_price;
+    }).catch(() => {});
   });
+}
+
+async function savePatientPrice(phone, value) {
+  await api(`/dashboard/api/patients/${phone}/price`, {
+    method: "PATCH",
+    body: JSON.stringify({ session_price: parseFloat(value) || 0 })
+  });
+  const el = document.getElementById(`price-saved-${phone}`);
+  if (el) { el.classList.remove("hidden"); setTimeout(() => el.classList.add("hidden"), 2000); }
 }
 
 async function togglePause(phone) {
@@ -861,9 +921,86 @@ document.getElementById("modal-reschedule").addEventListener("click", function(e
   if (e.target === this) closeReschedule();
 });
 
+// ── Cobrança mensal ───────────────────────────────────────────────────────────
+function initBillingMonth() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth()+1).padStart(2,"0");
+  const el = document.getElementById("billing-month");
+  if (el) el.value = `${y}-${m}`;
+}
+
+async function dispararCobrancas() {
+  const btn = document.getElementById("btn-cobrar");
+  const status = document.getElementById("cobrar-status");
+  const monthEl = document.getElementById("billing-month");
+  const month = monthEl ? monthEl.value : null;
+  btn.disabled = true;
+  btn.textContent = "⏳ Enviando...";
+  status.classList.add("hidden");
+  try {
+    const r = await api("/dashboard/api/billing/run", {
+      method: "POST",
+      body: JSON.stringify({ month: month || null })
+    });
+    const n = r.total_sent || 0;
+    const total = (r.results || []).length;
+    btn.textContent = `✓ ${n}/${total} enviada(s)`;
+    status.textContent = n === 0
+      ? "Nenhuma cobrança enviada (sem sessões confirmadas ou valores cadastrados)."
+      : `${n} cobrança(s) enviada(s) com sucesso!`;
+    status.classList.remove("hidden");
+    loadBillingLogs();
+  } catch(e) {
+    btn.textContent = "Enviar cobranças";
+    btn.disabled = false;
+    showToast("Erro ao enviar cobranças", "warning");
+  }
+}
+
+function loadBillingLogs() {
+  api("/dashboard/api/billing/logs").then(data => {
+    const el = document.getElementById("billing-logs");
+    if (!el) return;
+    const logs = data.logs || [];
+    if (!logs.length) {
+      el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Nenhuma cobrança enviada ainda.</p>';
+      return;
+    }
+    el.innerHTML = `<table class="w-full text-xs">
+      <thead>
+        <tr class="text-gray-400 border-b border-gray-100">
+          <th class="text-left py-1 pr-2">Paciente</th>
+          <th class="text-left py-1 pr-2">Mês</th>
+          <th class="text-center py-1 pr-2">Sessões</th>
+          <th class="text-right py-1 pr-2">Total</th>
+          <th class="text-right py-1">Enviado em</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${logs.map(l => {
+          const sentAt = l.sent_at ? l.sent_at.replace("T"," ").slice(0,16) : "-";
+          const total = `R$ ${parseFloat(l.total_amount).toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+          return `<tr class="border-b border-gray-50 hover:bg-gray-50">
+            <td class="py-1.5 pr-2 font-medium text-gray-700">${l.patient_name}</td>
+            <td class="py-1.5 pr-2 text-gray-500">${l.month}</td>
+            <td class="py-1.5 pr-2 text-center text-gray-600">${l.sessions_count}</td>
+            <td class="py-1.5 pr-2 text-right text-gray-700">${total}</td>
+            <td class="py-1.5 text-right text-gray-400">${sentAt}</td>
+          </tr>`;
+        }).join("")}
+      </tbody>
+    </table>`;
+  }).catch(() => {
+    const el = document.getElementById("billing-logs");
+    if (el) el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Erro ao carregar histórico.</p>';
+  });
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 connectSSE();
 loadAgenda();
+initBillingMonth();
 </script>
 </body>
 </html>

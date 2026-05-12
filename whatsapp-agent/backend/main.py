@@ -691,6 +691,48 @@ def dash_config(request: Request, body: TenantUpdate):
     return {"status": "updated"}
 
 
+# ── Cobrança ────────────────────────────────────────────────────────────────────
+
+class PatientPriceBody(BaseModel):
+    session_price: float
+    email: str = ""
+
+@app.patch("/dashboard/api/patients/{phone}/price")
+def dash_set_patient_price(phone: str, body: PatientPriceBody, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(phone)
+    db.upsert_patient(tenant["id"], phone, session_price=body.session_price, email=body.email)
+    return {"status": "ok"}
+
+@app.get("/dashboard/api/patients/{phone}/billing-info")
+def dash_patient_billing_info(phone: str, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(phone)
+    patient = db.get_patient(tenant["id"], phone)
+    return {
+        "session_price": patient["session_price"] if patient else 0,
+        "email": patient["email"] if patient else "",
+    }
+
+@app.get("/dashboard/api/billing/logs")
+def dash_billing_logs(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    logs = db.get_billing_logs(tenant["id"])
+    return {"logs": logs}
+
+@app.post("/dashboard/api/billing/run")
+async def dash_billing_run(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    body = await request.json()
+    month_str = body.get("month")  # "2026-05" or None for current
+    results = await scheduler.run_billing_now(tenant["id"], month_str)
+    return {"results": results, "total_sent": sum(1 for r in results if r["sent"])}
+
+
 @app.post("/admin/confirmacoes/disparar")
 async def disparar_confirmacoes():
     """Dispara confirmações de amanhã agora mesmo (ignora restrição de horário)."""
