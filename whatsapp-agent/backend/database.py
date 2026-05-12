@@ -63,6 +63,28 @@ def init_db():
                 paused_at TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (tenant_id, phone)
             );
+
+            CREATE TABLE IF NOT EXISTS patients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER NOT NULL,
+                phone TEXT NOT NULL,
+                name TEXT DEFAULT '',
+                session_price REAL DEFAULT 0,
+                email TEXT DEFAULT '',
+                UNIQUE(tenant_id, phone)
+            );
+
+            CREATE TABLE IF NOT EXISTS billing_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER NOT NULL,
+                phone TEXT NOT NULL,
+                patient_name TEXT NOT NULL,
+                month TEXT NOT NULL,
+                sessions_count INTEGER DEFAULT 0,
+                total_amount REAL DEFAULT 0,
+                sent_at TEXT DEFAULT (datetime('now')),
+                channel TEXT DEFAULT 'whatsapp'
+            );
         """)
         # Migrações incrementais — seguro rodar múltiplas vezes
         migrations = [
@@ -86,6 +108,7 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN psychologist_phone TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN plan TEXT DEFAULT 'mensal'",
             "ALTER TABLE tenants ADD COLUMN free_until TEXT DEFAULT NULL",
+            "ALTER TABLE appointments ADD COLUMN cancelled INTEGER DEFAULT 0",
         ]
         for sql in migrations:
             try:
@@ -390,3 +413,78 @@ def is_slot_taken(tenant_id: int, dt: datetime) -> bool:
             (tenant_id, dt.isoformat()),
         ).fetchone()
     return row is not None
+
+
+# ── Patients ───────────────────────────────────────────────────────────────────
+
+def upsert_patient(tenant_id: int, phone: str, name: str = "", session_price: float = 0.0, email: str = "") -> None:
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO patients (tenant_id, phone, name, session_price, email)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, phone) DO UPDATE SET
+                name = COALESCE(NULLIF(excluded.name,''), patients.name),
+                session_price = excluded.session_price,
+                email = COALESCE(NULLIF(excluded.email,''), patients.email)
+        """, (tenant_id, phone, name, session_price, email))
+
+
+def get_patient(tenant_id: int, phone: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM patients WHERE tenant_id = ? AND phone = ?",
+            (tenant_id, phone)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_patients_with_price(tenant_id: int) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM patients WHERE tenant_id = ? AND session_price > 0 ORDER BY name",
+            (tenant_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_valid_sessions_for_month(tenant_id: int, phone: str, month_start: str, month_end: str, now_str: str) -> list[dict]:
+    """Sessions that are confirmed AND already occurred (date passed) within the month."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM appointments
+            WHERE tenant_id = ? AND phone = ?
+              AND confirmed = 1
+              AND scheduled_at >= ? AND scheduled_at < ?
+              AND scheduled_at <= ?
+            ORDER BY scheduled_at
+        """, (tenant_id, phone, month_start, month_end, now_str)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Billing logs ───────────────────────────────────────────────────────────────
+
+def billing_already_sent(tenant_id: int, phone: str, month: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM billing_logs WHERE tenant_id = ? AND phone = ? AND month = ?",
+            (tenant_id, phone, month)
+        ).fetchone()
+    return row is not None
+
+
+def save_billing_log(tenant_id: int, phone: str, patient_name: str, month: str,
+                     sessions_count: int, total_amount: float, channel: str = "whatsapp"):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO billing_logs (tenant_id, phone, patient_name, month, sessions_count, total_amount, channel)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (tenant_id, phone, patient_name, month, sessions_count, total_amount, channel))
+
+
+def get_billing_logs(tenant_id: int, limit: int = 50) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM billing_logs WHERE tenant_id = ?
+            ORDER BY sent_at DESC LIMIT ?
+        """, (tenant_id, limit)).fetchall()
+    return [dict(r) for r in rows]

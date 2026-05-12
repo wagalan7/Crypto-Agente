@@ -14,6 +14,7 @@ import asyncio
 import logging
 import threading
 import time
+from calendar import monthrange
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -87,6 +88,93 @@ async def _run_confirmations():
                     logger.warning(f"[{tenant['slug']}] ✗ Falha followup → {appt['phone']}")
 
 
+def _billing_message(patient_name: str, total: float, sessions_count: int) -> str:
+    first_name = patient_name.split()[0] if patient_name else "paciente"
+    total_fmt = f"{total:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return (
+        f"Boa tardeee {first_name} 🌷\n"
+        f"Espero que esteja tudo bem.\n\n"
+        f"Gostaria de informar o valor das sessões do último mês.\n\n"
+        f"Fechamos em R$ {total_fmt} 🩷\n\n"
+        f"Qualquer dúvida estou à disposição."
+    )
+
+
+async def _run_billing():
+    """Executa no último dia do mês às 20h."""
+    now = datetime.now(_TZ)
+    last_day = monthrange(now.year, now.month)[1]
+    if now.day != last_day or now.hour != 20:
+        return
+
+    # Mês de referência = mês atual
+    month_str = now.strftime("%Y-%m")
+    month_start = f"{now.year}-{now.month:02d}-01T00:00:00"
+    last_day_dt = now.replace(day=last_day, hour=23, minute=59, second=59)
+    month_end = last_day_dt.strftime("%Y-%m-%dT23:59:59")
+    now_str = now.replace(tzinfo=None).isoformat(timespec="seconds")
+
+    tenants = db.list_tenants()
+    for tenant in tenants:
+        patients = db.get_patients_with_price(tenant["id"])
+        for patient in patients:
+            phone = patient["phone"]
+            if db.billing_already_sent(tenant["id"], phone, month_str):
+                logger.info(f"[{tenant['slug']}] Cobrança {month_str} já enviada para {phone}")
+                continue
+            if not phone:
+                continue
+            sessions = db.get_valid_sessions_for_month(
+                tenant["id"], phone, month_start, month_end, now_str
+            )
+            if not sessions:
+                logger.info(f"[{tenant['slug']}] Sem sessões válidas para {patient['name']} em {month_str}")
+                continue
+            count = len(sessions)
+            total = count * patient["session_price"]
+            patient_name = sessions[0]["patient_name"] if sessions else patient.get("name", "Paciente")
+            msg = _billing_message(patient_name, total, count)
+            sent = await wa.send_message(tenant, phone, msg)
+            if sent:
+                db.save_billing_log(tenant["id"], phone, patient_name, month_str, count, total, "whatsapp")
+                logger.info(f"[{tenant['slug']}] ✓ Cobrança {month_str} → {patient_name} R${total:.2f} ({count} sessões)")
+            else:
+                logger.warning(f"[{tenant['slug']}] ✗ Falha cobrança → {phone}")
+
+
+async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[dict]:
+    """Disparo manual de cobrança."""
+    now = datetime.now(_TZ).replace(tzinfo=None)
+    if not month_str:
+        month_str = now.strftime("%Y-%m")
+    year, month = int(month_str[:4]), int(month_str[5:7])
+    month_start = f"{year}-{month:02d}-01T00:00:00"
+    last_day = monthrange(year, month)[1]
+    month_end = f"{year}-{month:02d}-{last_day:02d}T23:59:59"
+    now_str = now.isoformat(timespec="seconds")
+    tenant = db.get_tenant_by_id(tenant_id)
+    if not tenant:
+        return []
+    patients = db.get_patients_with_price(tenant_id)
+    results = []
+    for patient in patients:
+        phone = patient["phone"]
+        if not phone:
+            continue
+        sessions = db.get_valid_sessions_for_month(tenant_id, phone, month_start, month_end, now_str)
+        if not sessions:
+            continue
+        count = len(sessions)
+        total = count * patient["session_price"]
+        patient_name = sessions[0]["patient_name"] if sessions else patient.get("name", "Paciente")
+        msg = _billing_message(patient_name, total, count)
+        sent = await wa.send_message(tenant, phone, msg)
+        if sent:
+            db.save_billing_log(tenant_id, phone, patient_name, month_str, count, total, "whatsapp")
+        results.append({"phone": phone, "patient_name": patient_name, "sessions": count, "total": total, "sent": sent})
+    return results
+
+
 async def run_confirmations_now():
     """Disparo manual (endpoint admin). Usa a mesma janela de 24h."""
     tenants = db.list_tenants()
@@ -123,12 +211,17 @@ async def run_confirmations_now():
     return results
 
 
+async def _run_all():
+    await _run_confirmations()
+    await _run_billing()
+
+
 def _scheduler_loop():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     while True:
         try:
-            loop.run_until_complete(_run_confirmations())
+            loop.run_until_complete(_run_all())
         except Exception as e:
             logger.exception(f"Erro no scheduler: {e}")
         time.sleep(_INTERVAL_SECONDS)
