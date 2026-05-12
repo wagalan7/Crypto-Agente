@@ -151,8 +151,9 @@ async def _handle_message(tenant: dict, phone: str, text: str):
 
     except Exception as e:
         logger.exception(f"[{tenant['slug']}] Erro ao processar {phone}: {e}")
-        await wa.send_message(tenant, phone,
-            "Desculpe, tive um problema técnico. Tente novamente em instantes 😊")
+        if not db.is_agent_paused(tenant["id"], phone):
+            await wa.send_message(tenant, phone,
+                "Desculpe, tive um problema técnico. Tente novamente em instantes 😊")
 
 
 # ── Webhooks (por tenant via slug na URL) ──────────────────────────────────────
