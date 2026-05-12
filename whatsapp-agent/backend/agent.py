@@ -122,6 +122,13 @@ MENSAGENS CASUAIS — REGRA CRÍTICA:
 - NUNCA envie proativamente mensagem de confirmação em resposta a uma mensagem casual
 - Exemplos de mensagens casuais: "Obrigada!", "Até mais!", "Foi ótimo!", "Bom dia!", "Tô bem", "Até logo" → responda brevemente e com calor, NÃO pergunte sobre confirmação
 
+SESSÃO PRÓXIMA (quando=EM BREVE ou HOJE):
+- Se o contexto mostrar "quando=EM BREVE — em X minutos (HOJE)" ou "quando=HOJE", a sessão é hoje
+- Se o paciente mandar qualquer mensagem (ex: "to disponivel", "cheguei", "a caminho") e a sessão for HOJE → entenda como check-in pré-sessão
+- Responda acolhendo: "Ótimo! Te esperamos daqui a pouco 😊" ou "Perfeito, a {psychologist_name} já está te aguardando!"
+- NUNCA diga "Até amanhã" se quando=HOJE ou quando=EM BREVE
+- Se quando=JÁ PASSOU → sessão já ocorreu, trate mensagem como pós-sessão normalmente
+
 IMPORTANTE:
 - NUNCA inventar horários — use apenas os horários fornecidos no contexto
 - Sempre usar dados reais da agenda fornecidos no contexto
@@ -204,14 +211,33 @@ def _extract_json(text: str) -> dict:
 
 
 def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo("America/Sao_Paulo")
     tenant_id = tenant["id"]
     lines = []
 
     appt = cal.get_next_appointment(tenant_id, phone)
     if appt:
+        appt_dt = datetime.fromisoformat(appt["scheduled_at"])
+        now_br = datetime.now(_TZ).replace(tzinfo=None)
+        diff_min = (appt_dt - now_br).total_seconds() / 60
+
+        if diff_min < 0:
+            timing = "JÁ PASSOU (sessão já ocorreu hoje)"
+        elif diff_min <= 30:
+            timing = f"EM BREVE — em {int(diff_min)} minutos (HOJE)"
+        elif diff_min <= 120:
+            timing = f"HOJE — em {int(diff_min/60)}h{int(diff_min%60)}min"
+        elif diff_min <= 1440:
+            timing = "HOJE"
+        elif diff_min <= 2880:
+            timing = "AMANHÃ"
+        else:
+            timing = f"em {int(diff_min/1440)} dias"
+
         lines.append(
             f"CONSULTA AGENDADA: {cal.format_appointment(appt)} "
-            f"(id={appt['id']}, confirmado={'Sim' if appt['confirmed'] else 'Não'})"
+            f"(id={appt['id']}, confirmado={'Sim' if appt['confirmed'] else 'Não'}, quando={timing})"
         )
     else:
         lines.append("CONSULTA AGENDADA: nenhuma")
