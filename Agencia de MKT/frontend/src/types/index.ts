@@ -6,6 +6,7 @@ export interface ProductInput {
   plataforma: string
   tom_de_voz: string
   pagina_vendas?: string
+  orcamento?: string  // orçamento total disponível para mídia paga
 }
 
 export type AgentStatus = 'idle' | 'thinking' | 'generating' | 'publishing' | 'completed' | 'error'
@@ -81,4 +82,9 @@ export interface SSEDoneEvent {
   payload: string
 }
 
-export type SSEEvent = SSEAgentEvent | SSEChunkEvent | SSEStatusEvent | SSEDoneEvent
+export interface SSEKeepaliveEvent {
+  type: 'keepalive'
+  payload: string
+}
+
+export type SSEEvent = SSEAgentEvent | SSEChunkEvent | SSEStatusEvent | SSEDoneEvent | SSEKeepaliveEvent

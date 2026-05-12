@@ -8,10 +8,10 @@ from openai import AsyncOpenAI, RateLimitError
 from models import ProductInput
 
 client = AsyncOpenAI(
-    api_key=os.getenv("GEMINI_API_KEY"),
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    api_key=os.getenv("GROQ_API_KEY"),
+    base_url="https://api.groq.com/openai/v1",
 )
-MODEL = "gemini-2.0-flash"
+MODEL = "llama-3.1-8b-instant"
 
 AGENT_LOGS = {
     "ESTRATEGIA": ["Definindo ICP", "Mapeando dores", "Construindo funil", "Finalizando posicionamento"],
@@ -66,54 +66,71 @@ async def run_agent(name: str, user_msg: str, queue: asyncio.Queue) -> str:
         "agent": name, "status": "thinking", "task": logs[0], "progress": 5, "logs": [],
     }}))
 
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user_msg},
+    ]
+
     result = ""
-    for attempt in range(4):          # até 4 tentativas com backoff
+    for attempt in range(4):
         try:
-            stream = await client.chat.completions.create(
-                model=MODEL,
-                max_tokens=800,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user_msg},
-                ],
-                stream=True,
-            )
             await queue.put(_ev({"type": "agent_event", "payload": {
                 "agent": name, "status": "generating",
                 "task": logs[1] if len(logs) > 1 else logs[0],
                 "progress": 20, "logs": logs[:1],
             }}))
-            chunk_count = 0
-            async for chunk in stream:
-                text = chunk.choices[0].delta.content or ""
-                if not text:
-                    continue
-                result += text
-                await queue.put(_ev({"type": "chunk", "payload": {"agent": name, "text": text}}))
-                chunk_count += 1
-                if chunk_count % 25 == 0:
-                    pct = min(25 + (chunk_count // 25) * 12, 90)
-                    li  = min(chunk_count // 35, len(logs) - 1)
-                    await queue.put(_ev({"type": "agent_event", "payload": {
-                        "agent": name, "status": "generating", "task": logs[li],
-                        "progress": pct, "logs": logs[:li + 1],
-                    }}))
-            break   # sucesso — sai do loop de tentativas
+
+            # ── Non-streaming call ──────────────────────────────────────
+            response = await client.chat.completions.create(
+                model=MODEL,
+                max_tokens=600,
+                messages=messages,
+                stream=False,
+            )
+            print(f"[{name}] response: finish={response.choices[0].finish_reason} "
+                  f"content_len={len(response.choices[0].message.content or '')}", flush=True)
+
+            result = response.choices[0].message.content or ""
+
+            if not result:
+                diag = f"Resposta vazia do Gemini (finish={response.choices[0].finish_reason}) — tentativa {attempt+1}/4"
+                print(f"[{name}] {diag}", flush=True)
+                await queue.put(_ev({"type": "agent_event", "payload": {
+                    "agent": name, "status": "thinking",
+                    "task": diag, "progress": 10, "logs": [],
+                }}))
+                await asyncio.sleep(5 * (attempt + 1))
+                continue
+
+            # Emit full text as single chunk so UI shows it
+            await queue.put(_ev({"type": "chunk", "payload": {"agent": name, "text": result}}))
+            break
 
         except RateLimitError:
-            wait = 8 * (attempt + 1)   # 8s, 16s, 24s
-            await queue.put(_ev({"type": "agent_event", "payload": {
-                "agent": name, "status": "thinking",
-                "task": f"Limite de requisições — aguardando {wait}s...",
-                "progress": 10, "logs": [],
-            }}))
-            await asyncio.sleep(wait)
+            wait = 10 * (attempt + 1)
+            for elapsed in range(wait):
+                await queue.put(_ev({"type": "agent_event", "payload": {
+                    "agent": name, "status": "thinking",
+                    "task": f"Limite de requisições — aguardando {wait - elapsed}s...",
+                    "progress": 10, "logs": [],
+                }}))
+                await asyncio.sleep(1)
 
         except Exception as e:
+            err_msg = str(e)
+            print(f"[{name}] Exception: {err_msg}", flush=True)
             await queue.put(_ev({"type": "agent_event", "payload": {
-                "agent": name, "status": "error", "task": str(e), "progress": 0, "logs": [],
+                "agent": name, "status": "error", "task": err_msg, "progress": 0, "logs": [],
             }}))
             return ""
+
+    if not result:
+        await queue.put(_ev({"type": "agent_event", "payload": {
+            "agent": name, "status": "error",
+            "task": "Gemini não retornou conteúdo após 4 tentativas",
+            "progress": 0, "logs": [],
+        }}))
+        return ""
 
     await queue.put(_ev({"type": "agent_event", "payload": {
         "agent": name, "status": "completed", "task": "Concluído", "progress": 100, "logs": logs,
@@ -128,6 +145,15 @@ def ctx(memory: dict, keys: list) -> str:
 async def run_agency(data: ProductInput) -> AsyncIterator[str]:
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     memory: dict[str, str] = {}
+
+    async def heartbeat():
+        """Send SSE keepalive every 8s to prevent proxy/mobile timeouts."""
+        try:
+            while True:
+                await asyncio.sleep(8)
+                await queue.put(_ev({"type": "keepalive", "payload": ""}))
+        except asyncio.CancelledError:
+            pass
 
     async def fill():
         # Fetch sales page if provided
@@ -144,35 +170,28 @@ async def run_agency(data: ProductInput) -> AsyncIterator[str]:
             f"OBJETIVO: {data.objetivo}\nPLATAFORMA: {data.plataforma}\nTOM: {data.tom_de_voz}"
             f"{page_section}\nGere estratégia completa.")
 
-        # Phase 2 — Copy + Design + Video (escalonado para evitar rate limit)
-        await queue.put(_ev({"type": "status", "payload": "Fase 2 — Copy, Design e Vídeo (paralelo)"}))
+        # Phase 2 — Copy → Design → Video (sequencial para evitar rate limit)
+        await queue.put(_ev({"type": "status", "payload": "Fase 2 — Copy · Design · Vídeo"}))
+        memory["COPY"] = await run_agent("COPY", queue=queue,
+            user_msg=f"PRODUTO: {data.produto}\nPREÇO: {data.preco}\nTOM: {data.tom_de_voz}\n{ctx(memory,['ESTRATEGIA'])}{page_section}\nCrie copies de alto impacto.")
+        await asyncio.sleep(4)
+        memory["DESIGN"] = await run_agent("DESIGN", queue=queue,
+            user_msg=f"PRODUTO: {data.produto}\nTOM: {data.tom_de_voz}\nPÚBLICO: {data.publico}\n{ctx(memory,['ESTRATEGIA'])}{page_section}\nCrie briefing visual. Inclua PROMPT IA IMAGEM detalhado em inglês.")
+        await asyncio.sleep(4)
+        memory["VIDEO"] = await run_agent("VIDEO", queue=queue,
+            user_msg=f"PRODUTO: {data.produto}\nTOM: {data.tom_de_voz}\n{ctx(memory,['ESTRATEGIA'])}{page_section}\nCrie roteiro e prompts de vídeo.")
 
-        async def run_copy():
-            return await run_agent("COPY", queue=queue, user_msg=f"PRODUTO: {data.produto}\nPREÇO: {data.preco}\nTOM: {data.tom_de_voz}\n{ctx(memory,['ESTRATEGIA'])}{page_section}\nCrie copies de alto impacto.")
-        async def run_design():
-            await asyncio.sleep(3)
-            return await run_agent("DESIGN", queue=queue, user_msg=f"PRODUTO: {data.produto}\nTOM: {data.tom_de_voz}\nPÚBLICO: {data.publico}\n{ctx(memory,['ESTRATEGIA'])}{page_section}\nCrie briefing visual. Inclua PROMPT IA IMAGEM detalhado em inglês.")
-        async def run_video():
-            await asyncio.sleep(6)
-            return await run_agent("VIDEO", queue=queue, user_msg=f"PRODUTO: {data.produto}\nTOM: {data.tom_de_voz}\n{ctx(memory,['ESTRATEGIA'])}{page_section}\nCrie roteiro e prompts de vídeo.")
-
-        r = await asyncio.gather(run_copy(), run_design(), run_video())
-        memory["COPY"], memory["DESIGN"], memory["VIDEO"] = r
-
-        # Phase 3 — Social + Ads + Automação (escalonado)
-        await queue.put(_ev({"type": "status", "payload": "Fase 3 — Social, Ads e Automação (paralelo)"}))
-
-        async def run_social():
-            return await run_agent("SOCIAL", queue=queue, user_msg=f"PRODUTO: {data.produto}\nPLATAFORMA: {data.plataforma}\n{ctx(memory,['ESTRATEGIA','COPY'])}\nCrie calendário 7 posts.")
-        async def run_ads():
-            await asyncio.sleep(3)
-            return await run_agent("ADS", queue=queue, user_msg=f"PRODUTO: {data.produto}\nPREÇO: {data.preco}\nPÚBLICO: {data.publico}\nPLATAFORMA: {data.plataforma}\nOBJETIVO: {data.objetivo}\n{ctx(memory,['ESTRATEGIA','COPY'])}\nCrie campanha ads com orçamento por plataforma.")
-        async def run_automacao():
-            await asyncio.sleep(6)
-            return await run_agent("AUTOMACAO", queue=queue, user_msg=f"PRODUTO: {data.produto}\nPREÇO: {data.preco}\n{ctx(memory,['ESTRATEGIA','COPY'])}\nCrie fluxo de automação.")
-
-        r = await asyncio.gather(run_social(), run_ads(), run_automacao())
-        memory["SOCIAL"], memory["ADS"], memory["AUTOMACAO"] = r
+        # Phase 3 — Social → Ads → Automação (sequencial)
+        await queue.put(_ev({"type": "status", "payload": "Fase 3 — Social · Ads · Automação"}))
+        memory["SOCIAL"] = await run_agent("SOCIAL", queue=queue,
+            user_msg=f"PRODUTO: {data.produto}\nPLATAFORMA: {data.plataforma}\n{ctx(memory,['ESTRATEGIA','COPY'])}\nCrie calendário 7 posts.")
+        await asyncio.sleep(4)
+        budget_line = f"\nORÇAMENTO DISPONÍVEL: {data.orcamento}" if data.orcamento else ""
+        memory["ADS"] = await run_agent("ADS", queue=queue,
+            user_msg=f"PRODUTO: {data.produto}\nPREÇO: {data.preco}\nPÚBLICO: {data.publico}\nPLATAFORMA: {data.plataforma}\nOBJETIVO: {data.objetivo}{budget_line}\n{ctx(memory,['ESTRATEGIA','COPY'])}\nCrie campanha ads com orçamento por plataforma.")
+        await asyncio.sleep(4)
+        memory["AUTOMACAO"] = await run_agent("AUTOMACAO", queue=queue,
+            user_msg=f"PRODUTO: {data.produto}\nPREÇO: {data.preco}\n{ctx(memory,['ESTRATEGIA','COPY'])}\nCrie fluxo de automação.")
 
         # Phase 4 — Publicador
         await queue.put(_ev({"type": "status", "payload": "Fase 4 — Publicador"}))
@@ -192,9 +211,13 @@ async def run_agency(data: ProductInput) -> AsyncIterator[str]:
         await queue.put(_ev({"type": "done", "payload": "Maga One concluiu todas as fases."}))
         await queue.put(None)
 
+    hb_task = asyncio.create_task(heartbeat())
     asyncio.create_task(fill())
-    while True:
-        item = await queue.get()
-        if item is None:
-            break
-        yield item
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+    finally:
+        hb_task.cancel()

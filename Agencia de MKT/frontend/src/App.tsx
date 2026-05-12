@@ -7,6 +7,8 @@ import { LoginPage } from './components/LoginPage'
 import { UsersPanel } from './components/UsersPanel'
 import { CampaignHistory } from './components/CampaignHistory'
 import { MagaLogo } from './components/MagaLogo'
+import { CredentialsPanel } from './components/CredentialsPanel'
+import type { AllCreds } from './components/CredentialsPanel'
 import { useAuth } from './hooks/useAuth'
 import type { ProductInput, AgentState, AgentName, SSEEvent } from './types'
 import { AGENTS } from './types'
@@ -32,6 +34,8 @@ export default function App() {
   const [isAdmin, setIsAdmin]           = useState(false)
   const [showUsers, setShowUsers]       = useState(false)
   const [showHistory, setShowHistory]   = useState(false)
+  const [showConfig, setShowConfig]     = useState(false)
+  const [savedCreds, setSavedCreds]     = useState<AllCreds>({})
   const [allUsers, setAllUsers]         = useState<{ user: string; role: string }[]>([])
   const [loading, setLoading]           = useState(false)
   const [agents, setAgents]             = useState(emptyAgents())
@@ -52,6 +56,15 @@ export default function App() {
           setIsAdmin(d.role === 'admin')
         }
       })
+      .catch(() => {})
+  }, [isLoggedIn, token])
+
+  // Load credentials on login so PublishPanel always has them
+  useEffect(() => {
+    if (!isLoggedIn || !token) return
+    fetch('/credentials', { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.ok ? r.json() : {})
+      .then(setSavedCreds)
       .catch(() => {})
   }, [isLoggedIn, token])
 
@@ -117,7 +130,9 @@ export default function App() {
           if (!part.startsWith('data: ')) continue
           const ev: SSEEvent = JSON.parse(part.slice(6))
 
-          if (ev.type === 'status') {
+          if (ev.type === 'keepalive') {
+            // ignore — just keeps connection alive
+          } else if (ev.type === 'status') {
             setStatus(ev.payload)
             const ph = Object.entries(PHASE_MAP).find(([k]) => ev.payload.startsWith(k))
             if (ph) setPhase(ph[1])
@@ -135,6 +150,14 @@ export default function App() {
             setDone(true)
             setLoading(false)
             setPhase(6)
+            // Debug: log agent output lengths to browser console
+            setAgents(prev => {
+              const names = Object.keys(prev) as AgentName[]
+              console.log('[MagaOne] Agent outputs on done:', Object.fromEntries(
+                names.map(n => [n, prev[n].output.length])
+              ))
+              return prev
+            })
           }
         }
       }
@@ -181,14 +204,20 @@ export default function App() {
               </span>
             )}
             <button
-              onClick={() => { setShowHistory(h => !h); setShowUsers(false) }}
+              onClick={() => { setShowHistory(h => !h); setShowUsers(false); setShowConfig(false) }}
               className={`transition-colors ${showHistory ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
             >
               histórico
             </button>
+            <button
+              onClick={() => { setShowConfig(c => !c); setShowHistory(false); setShowUsers(false) }}
+              className={`transition-colors ${showConfig ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
+            >
+              credenciais
+            </button>
             {isAdmin && (
               <button
-                onClick={() => { setShowUsers(s => !s); setShowHistory(false) }}
+                onClick={() => { setShowUsers(s => !s); setShowHistory(false); setShowConfig(false) }}
                 className={`transition-colors ${showUsers ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
               >
                 usuários
@@ -223,6 +252,13 @@ export default function App() {
         )}
         {started && <PixelOffice agents={agents} />}
 
+        {showConfig && (
+          <CredentialsPanel
+            authHeaders={authHeaders}
+            onLoaded={setSavedCreds}
+          />
+        )}
+
         {showHistory && (
           <CampaignHistory
             authHeaders={authHeaders}
@@ -239,8 +275,11 @@ export default function App() {
           <PublishPanel
             publisherOutput={agents.PUBLICADOR.output}
             copyOutput={agents.COPY.output}
+            socialOutput={agents.SOCIAL.output}
             designOutput={agents.DESIGN.output}
             adsOutput={agents.ADS.output}
+            userBudget={lastInput?.orcamento ?? ''}
+            savedCreds={savedCreds}
             authHeaders={authHeaders}
           />
         )}
