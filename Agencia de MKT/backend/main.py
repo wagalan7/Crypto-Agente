@@ -180,6 +180,90 @@ async def list_google_ads_accounts(user: str = Depends(require_auth)):
     return {"customers": customers}
 
 
+@app.get("/auth/google-ads/diagnose")
+async def diagnose_google_ads(user: str = Depends(require_auth)):
+    """Diagnóstico passo a passo das credenciais Google Ads."""
+    creds        = get_credentials(user)
+    gc           = creds.get("google", {})
+    refresh_token = gc.get("google_refresh_token", "")
+    dev_token    = gc.get("google_developer_token", "")
+    customer_id  = gc.get("google_customer_id", "").replace("-", "").replace(" ", "")
+    mcc_id       = gc.get("google_mcc_id", "").replace("-", "").replace(" ", "")
+
+    result = {
+        "customer_id": customer_id,
+        "mcc_id": mcc_id,
+        "has_dev_token": bool(dev_token),
+        "has_refresh_token": bool(refresh_token),
+        "steps": []
+    }
+
+    # Step 1: Get access token
+    async with httpx.AsyncClient(timeout=20) as c:
+        tr = await c.post(GOOGLE_TOKEN_URL, data={
+            "client_id":     os.getenv("GOOGLE_CLIENT_ID", ""),
+            "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
+            "refresh_token": refresh_token,
+            "grant_type":    "refresh_token",
+        })
+        tokens = tr.json()
+    access_token = tokens.get("access_token", "")
+    result["steps"].append({
+        "step": "1_access_token",
+        "ok": bool(access_token),
+        "detail": "OK" if access_token else tokens.get("error_description", tokens.get("error", str(tokens)))
+    })
+    if not access_token:
+        return result
+
+    base_headers = {
+        "Authorization":   f"Bearer {access_token}",
+        "developer-token": dev_token,
+        "Content-Type":    "application/json",
+    }
+    if mcc_id:
+        base_headers["login-customer-id"] = mcc_id
+
+    # Step 2: List accessible customers
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(
+            "https://googleads.googleapis.com/v19/customers:listAccessibleCustomers",
+            headers=base_headers,
+        )
+        try:
+            d = r.json()
+        except Exception:
+            d = {"raw": r.text[:300]}
+    customers = [n.split("/")[-1] for n in d.get("resourceNames", [])]
+    result["steps"].append({
+        "step": "2_list_customers",
+        "ok": bool(customers),
+        "customers": customers,
+        "detail": d.get("error", {}).get("message", "OK") if "error" in d else f"{len(customers)} contas encontradas"
+    })
+
+    # Step 3: Get customer resource
+    if customer_id:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(
+                f"https://googleads.googleapis.com/v19/customers/{customer_id}",
+                headers=base_headers,
+            )
+            try:
+                d = r.json()
+            except Exception:
+                d = {"raw": r.text[:300]}
+        result["steps"].append({
+            "step": "3_get_customer",
+            "http_status": r.status_code,
+            "ok": r.status_code == 200,
+            "detail": d.get("error", {}).get("message", "OK") if r.status_code != 200 else
+                      f"status={d.get('status','?')} descriptiveName={d.get('descriptiveName','?')}"
+        })
+
+    return result
+
+
 # ── Google Ads OAuth ──────────────────────────────────────────
 
 # In-memory state store (maps random state → username)
