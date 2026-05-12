@@ -530,11 +530,20 @@ def dash_patients(request: Request):
     tenant = _get_tenant_by_token(token)
     with db.get_conn() as conn:
         rows = conn.execute(
-            """SELECT DISTINCT c.phone,
-               (SELECT a.patient_name FROM appointments a
-                WHERE a.phone = c.phone AND a.tenant_id = c.tenant_id LIMIT 1) as name
-               FROM conversations c WHERE c.tenant_id = ? ORDER BY c.created_at DESC""",
-            (tenant["id"],)
+            """SELECT phone, name FROM (
+               SELECT c.phone,
+                 (SELECT a.patient_name FROM appointments a
+                  WHERE a.phone = c.phone AND a.tenant_id = c.tenant_id LIMIT 1) as name,
+                 c.created_at as sort_key
+               FROM conversations c WHERE c.tenant_id = ?
+               UNION
+               SELECT p.phone,
+                 (SELECT a.patient_name FROM appointments a
+                  WHERE a.phone = p.phone AND a.tenant_id = p.tenant_id LIMIT 1) as name,
+                 p.created_at as sort_key
+               FROM patients p WHERE p.tenant_id = ?
+            ) GROUP BY phone ORDER BY sort_key DESC""",
+            (tenant["id"], tenant["id"])
         ).fetchall()
     return {"patients": [dict(r) for r in rows]}
 
