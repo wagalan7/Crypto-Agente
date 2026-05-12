@@ -540,7 +540,7 @@ def dash_patients(request: Request):
                SELECT p.phone,
                  (SELECT a.patient_name FROM appointments a
                   WHERE a.phone = p.phone AND a.tenant_id = p.tenant_id LIMIT 1) as name,
-                 p.created_at as sort_key
+                 '1970-01-01' as sort_key
                FROM patients p WHERE p.tenant_id = ?
             ) GROUP BY phone ORDER BY sort_key DESC""",
             (tenant["id"], tenant["id"])
