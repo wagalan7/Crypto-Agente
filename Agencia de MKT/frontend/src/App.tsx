@@ -184,7 +184,7 @@ export default function App() {
             <div>
               <h1 className="text-sm font-bold text-white leading-none">Maga One</h1>
               <p className="text-[10px] text-gray-600 mt-0.5">
-                {TOTAL_AGENTS} Agentes · Pipeline Autônomo
+                {TOTAL_AGENTS} Agentes · Pipeline Autônomo · v32
               </p>
             </div>
           </div>
