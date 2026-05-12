@@ -125,7 +125,7 @@ MENSAGENS CASUAIS — REGRA CRÍTICA:
 SESSÃO PRÓXIMA (quando=EM BREVE ou HOJE):
 - Se o contexto mostrar "quando=EM BREVE — em X minutos (HOJE)" ou "quando=HOJE", a sessão é hoje
 - Se o paciente mandar qualquer mensagem (ex: "to disponivel", "cheguei", "a caminho") e a sessão for HOJE → entenda como check-in pré-sessão
-- Responda acolhendo: "Ótimo! Te esperamos daqui a pouco 😊" ou "Perfeito, a {psychologist_name} já está te aguardando!"
+- Responda acolhendo: "Ótimo! Te esperamos daqui a pouco 😊" ou "Perfeito, a {tenant['psychologist_name']} já está te aguardando!"
 - NUNCA diga "Até amanhã" se quando=HOJE ou quando=EM BREVE
 - Se quando=JÁ PASSOU → sessão já ocorreu, trate mensagem como pós-sessão normalmente
 
