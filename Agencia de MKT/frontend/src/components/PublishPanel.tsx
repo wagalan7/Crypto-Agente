@@ -1,4 +1,6 @@
 import { useState, useEffect } from 'react'
+import type { AllCreds } from './CredentialsPanel'
+import { MetricsPanel } from './MetricsPanel'
 
 interface Credentials {
   fb_page_id: string; fb_token: string
@@ -6,18 +8,22 @@ interface Credentials {
   tw_api_key: string; tw_api_secret: string; tw_access_token: string; tw_access_secret: string
   webhook_url: string; image_url: string
   google_developer_token: string; google_customer_id: string; google_refresh_token: string
+  google_mcc_id: string; google_final_url: string
   tiktok_access_token: string; tiktok_advertiser_id: string
 }
 
 interface PublishResult {
-  platform: string; success: boolean; url?: string; error?: string
+  platform: string; success: boolean; post_id?: string; url?: string; error?: string
 }
 
 interface Props {
   publisherOutput: string
   copyOutput: string
+  socialOutput: string
   designOutput: string
   adsOutput: string
+  userBudget: string
+  savedCreds: AllCreds
   authHeaders: Record<string, string>
 }
 
@@ -91,6 +97,7 @@ const EMPTY: Credentials = {
   tw_api_key: '', tw_api_secret: '', tw_access_token: '', tw_access_secret: '',
   webhook_url: '', image_url: '',
   google_developer_token: '', google_customer_id: '', google_refresh_token: '',
+  google_mcc_id: '', google_final_url: '',
   tiktok_access_token: '', tiktok_advertiser_id: '',
 }
 
@@ -132,23 +139,41 @@ function extractBudgetFromAds(adsOutput: string): Record<string, string> {
   return result
 }
 
-export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOutput, authHeaders }: Props) {
+export function PublishPanel({ publisherOutput, copyOutput, socialOutput, designOutput, adsOutput, userBudget, savedCreds, authHeaders }: Props) {
   const [open, setOpen]             = useState(true)
   const [budgetConfirmed, setBudget] = useState(false)
-  const [creds, setCreds]           = useState<Credentials>(() => {
-    try { return { ...EMPTY, ...JSON.parse(localStorage.getItem('mkt_creds') || '{}') } }
-    catch { return EMPTY }
-  })
-  const [selected, setSelected]     = useState<Set<string>>(new Set())
-  const [publishing, setPublishing] = useState(false)
-  const [results, setResults]       = useState<PublishResult[]>([])
-  const [text, setText]             = useState('')
-  const [showGuide, setShowGuide]   = useState<string | null>(null)
+  const [creds, setCreds]           = useState<Credentials>(EMPTY)
 
+  // Pre-fill credentials from server when savedCreds loads
   useEffect(() => {
-    const output = publisherOutput || copyOutput
-    if (output && !text) setText(output)
-  }, [publisherOutput, copyOutput])
+    const merged: Partial<Credentials> = {}
+    Object.values(savedCreds).forEach(platformCreds => {
+      Object.assign(merged, platformCreds)
+    })
+    if (Object.keys(merged).length > 0) {
+      setCreds(prev => ({ ...prev, ...merged }))
+    }
+  }, [savedCreds])
+  const [selected, setSelected]         = useState<Set<string>>(new Set())
+  const [publishing, setPublishing]     = useState(false)
+  const [results, setResults]           = useState<PublishResult[]>([])
+  const [validationErrors, setValidationErrors] = useState<string[]>([])
+  const [customText, setCustomText]     = useState<string | null>(null)
+  const [showGuide, setShowGuide]       = useState<string | null>(null)
+  const [customBudgets, setCustomBudgets] = useState<Record<string, string>>(() => {
+    // Pre-fill all platform budgets with the form value
+    if (!userBudget) return {}
+    return Object.fromEntries(PLATFORMS.map(p => [p.id, userBudget]))
+  })
+  const [publishedPosts, setPublishedPosts] = useState<{
+    platform: string; post_id: string; token: string; bearer_token?: string; url?: string
+  }[]>([])
+
+  // Derived: show customText if user typed something, else fall back to agent output
+  // Use || (not ??) so empty strings "" also fall through to the next option
+  const agentText = publisherOutput || copyOutput || socialOutput || ''
+  const agentSource = publisherOutput ? 'Publicador' : copyOutput ? 'Copy' : socialOutput ? 'Social' : null
+  const text = customText !== null ? customText : agentText
 
   const imagePrompt  = extractImagePrompt(designOutput)
   const budgetFromAI = extractBudgetFromAds(adsOutput)
@@ -163,10 +188,50 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOut
     localStorage.setItem('mkt_creds', JSON.stringify(updated))
   }
 
+  const validateCredentials = (): string[] => {
+    const errors: string[] = []
+    if (selected.has('facebook')) {
+      if (!creds.fb_page_id) errors.push('Facebook: Page ID não preenchido')
+      if (!creds.fb_token)   errors.push('Facebook: Access Token não preenchido')
+    }
+    if (selected.has('instagram')) {
+      if (!creds.ig_user_id) errors.push('Instagram: IG Business User ID não preenchido')
+      if (!creds.ig_token)   errors.push('Instagram: Access Token não preenchido')
+      if (!creds.image_url)  errors.push('Instagram: URL da imagem é obrigatória')
+    }
+    if (selected.has('twitter')) {
+      if (!creds.tw_api_key)       errors.push('Twitter/X: API Key não preenchida')
+      if (!creds.tw_api_secret)    errors.push('Twitter/X: API Secret não preenchido')
+      if (!creds.tw_access_token)  errors.push('Twitter/X: Access Token não preenchido')
+      if (!creds.tw_access_secret) errors.push('Twitter/X: Access Secret não preenchido')
+    }
+    if (selected.has('google')) {
+      if (!creds.google_developer_token) errors.push('Google Ads: Developer Token não preenchido')
+      if (!creds.google_customer_id)     errors.push('Google Ads: Customer ID não preenchido')
+      if (!creds.google_refresh_token)   errors.push('Google Ads: Refresh Token não preenchido (conecte via OAuth)')
+      if (!creds.google_final_url)       errors.push('Google Ads: URL de destino do anúncio não preenchida')
+    }
+    if (selected.has('tiktok')) {
+      if (!creds.tiktok_access_token)  errors.push('TikTok: Access Token não preenchido')
+      if (!creds.tiktok_advertiser_id) errors.push('TikTok: Advertiser ID não preenchido')
+    }
+    if (selected.has('webhook')) {
+      if (!creds.webhook_url) errors.push('Webhook: URL não preenchida')
+    }
+    return errors
+  }
+
   const handlePublish = async () => {
+    const errors = validateCredentials()
+    if (errors.length > 0) {
+      setValidationErrors(errors)
+      return
+    }
+    setValidationErrors([])
     if (selected.size === 0 || !budgetConfirmed) return
     setPublishing(true)
     setResults([])
+    setPublishedPosts([])
     try {
       const body = {
         text: text || publisherOutput || copyOutput,
@@ -180,6 +245,9 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOut
         google_developer_token: creds.google_developer_token,
         google_customer_id: creds.google_customer_id,
         google_refresh_token: creds.google_refresh_token,
+        google_mcc_id: creds.google_mcc_id,
+        google_final_url: creds.google_final_url,
+        google_budget: customBudgets['google'] || userBudget || '20',
         tiktok_access_token: creds.tiktok_access_token,
         tiktok_advertiser_id: creds.tiktok_advertiser_id,
       }
@@ -187,7 +255,23 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOut
         method: 'POST', headers: authHeaders, body: JSON.stringify(body),
       })
       const data = await res.json()
-      setResults(data.results || [])
+      const apiResults: PublishResult[] = data.results || []
+      setResults(apiResults)
+
+      // Build posts list for metrics tracking (successful posts with IDs)
+      const postsForMetrics = apiResults
+        .filter(r => r.success && r.post_id)
+        .map(r => ({
+          platform: r.platform,
+          post_id: r.post_id!,
+          token: r.platform === 'facebook' ? creds.fb_token
+               : r.platform === 'instagram' ? creds.ig_token
+               : r.platform === 'twitter'   ? creds.tw_api_key
+               : '',
+          bearer_token: r.platform === 'twitter' ? creds.tw_api_key : undefined,
+          url: r.url,
+        }))
+      if (postsForMetrics.length > 0) setPublishedPosts(postsForMetrics)
     } catch (e) {
       setResults([{ platform: 'erro', success: false, error: String(e) }])
     }
@@ -217,17 +301,23 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOut
 
           {/* ── Texto ── */}
           <div className="mt-4">
-            <label className="block text-[10px] text-gray-500 mb-1 tracking-widest uppercase">Texto para publicar</label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="block text-[10px] text-gray-500 tracking-widest uppercase">Texto para publicar</label>
+              {agentSource
+                ? <span className="text-[9px] text-emerald-500">✓ Agente {agentSource} · {agentText.length} chars</span>
+                : <span className="text-[9px] text-amber-500">⚠ aguardando agência…</span>
+              }
+            </div>
             <textarea
               className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs text-gray-200
                          placeholder-gray-600 focus:outline-none focus:border-violet-500 resize-none"
               style={{ height: '10cm' }}
               placeholder="Texto gerado pela agência aparece aqui automaticamente..."
               value={text}
-              onChange={e => setText(e.target.value)}
+              onChange={e => setCustomText(e.target.value)}
             />
-            {text && (
-              <button onClick={() => setText(publisherOutput || copyOutput || '')}
+            {customText !== null && (
+              <button onClick={() => setCustomText(null)}
                 className="mt-1 text-[10px] text-gray-600 hover:text-gray-400">
                 ↺ restaurar texto da agência
               </button>
@@ -262,6 +352,18 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOut
               </div>
             )}
           </div>
+
+          {/* ── Aviso credenciais ── */}
+          {Object.keys(savedCreds).length === 0 && (
+            <div className="flex items-center gap-2 bg-gray-800/40 border border-gray-700 rounded-lg px-3 py-2">
+              <span className="text-amber-500 text-xs">⚠</span>
+              <p className="text-[11px] text-gray-400">
+                Nenhuma credencial salva. Acesse{' '}
+                <span className="text-violet-400 font-semibold">credenciais</span>{' '}
+                no menu para salvar suas chaves de plataforma.
+              </p>
+            </div>
+          )}
 
           {/* ── Plataformas ── */}
           <div>
@@ -306,8 +408,11 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOut
           {selected.has('google') && (
             <CredentialSection title="Google Ads" platformId="google" showGuide={showGuide} onToggleGuide={setShowGuide}>
               <Field label="Developer Token" value={creds.google_developer_token} onChange={v => saveCreds({ google_developer_token: v })} secret />
-              <Field label="Customer ID"     value={creds.google_customer_id}      onChange={v => saveCreds({ google_customer_id: v })} />
+              <Field label="Customer ID (conta de anúncios, sem hífens)" value={creds.google_customer_id} onChange={v => saveCreds({ google_customer_id: v })} />
+              <Field label="ID da Conta MCC / Gerenciadora (sem hífens, se aplicável)" value={creds.google_mcc_id} onChange={v => saveCreds({ google_mcc_id: v })} />
               <Field label="Refresh Token"   value={creds.google_refresh_token}    onChange={v => saveCreds({ google_refresh_token: v })} secret />
+              <Field label="URL de destino do anúncio (site do produto)" value={creds.google_final_url} onChange={v => saveCreds({ google_final_url: v })} />
+              <p className="text-[9px] text-amber-600 mt-1">⚠ Campanha criada em status PAUSADA — ative manualmente no Google Ads após revisar.</p>
             </CredentialSection>
           )}
           {selected.has('tiktok') && (
@@ -326,30 +431,70 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOut
           {/* ── Resumo de Orçamento ── */}
           {selectedPlatformsWithBudget.length > 0 && (
             <div className="bg-amber-950/30 border border-amber-800/50 rounded-xl p-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <span className="text-amber-400 text-base">💰</span>
-                <p className="text-xs font-bold text-amber-300 tracking-wide uppercase">
-                  Resumo de Orçamento — Estimativa por Mídia
-                </p>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-amber-400 text-base">💰</span>
+                  <p className="text-xs font-bold text-amber-300 tracking-wide uppercase">
+                    Orçamento por Plataforma
+                  </p>
+                </div>
+                {userBudget && (
+                  <span className="text-[10px] text-amber-500 bg-amber-900/30 border border-amber-800/50 px-2 py-0.5 rounded-full">
+                    Total disponível: {userBudget}
+                  </span>
+                )}
               </div>
               <div className="grid grid-cols-2 gap-2">
                 {selectedPlatformsWithBudget.map(pid => {
-                  const def  = BUDGET_DEFAULTS[pid]
-                  const ai   = budgetFromAI[pid]
+                  const def   = BUDGET_DEFAULTS[pid]
+                  const ai    = budgetFromAI[pid]
                   const label = PLATFORMS.find(p => p.id === pid)?.label || pid
+                  const suggestion = ai || `R$ ${def.min}–${def.max}`
+                  const customVal = customBudgets[pid] ?? ''
                   return (
-                    <div key={pid} className="bg-gray-900/60 border border-gray-800 rounded-lg px-3 py-2.5">
+                    <div key={pid} className="bg-gray-900/60 border border-gray-800 rounded-lg px-3 py-2.5 space-y-1.5">
                       <p className="text-[10px] text-gray-500 uppercase tracking-widest">{label}</p>
-                      {ai ? (
-                        <p className="text-sm font-bold text-amber-300 mt-0.5">{ai}</p>
-                      ) : (
-                        <p className="text-sm font-bold text-amber-300 mt-0.5">
-                          R$ {def.min}–{def.max} <span className="text-[9px] font-normal text-gray-500">{def.currency}</span>
+                      <input
+                        className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-xs text-amber-300
+                                   font-semibold placeholder-gray-600 focus:outline-none focus:border-amber-600"
+                        placeholder={suggestion}
+                        value={customVal}
+                        onChange={e => setCustomBudgets(b => ({ ...b, [pid]: e.target.value }))}
+                      />
+                      <p className="text-[9px] text-gray-600">
+                        {customVal === userBudget && userBudget ? 'do formulário · edite se quiser'
+                          : customVal && customVal !== userBudget ? 'valor personalizado'
+                          : ai ? 'sugerido pelo Agente Ads'
+                          : 'estimativa de mercado'}
+                      </p>
+                      {ai && (
+                        <p className="text-[9px] text-blue-500">
+                          Agente sugere: {ai}
+                          {ai !== customVal && (
+                            <button
+                              onClick={() => setCustomBudgets(b => ({ ...b, [pid]: ai }))}
+                              className="ml-2 underline hover:text-blue-400">usar</button>
+                          )}
                         </p>
                       )}
-                      <p className="text-[9px] text-gray-600 mt-0.5">
-                        {ai ? 'sugerido pelo Agente Ads' : 'estimativa de mercado'}
-                      </p>
+                      {/* URL de destino exclusivo para Google Ads */}
+                      {pid === 'google' && (
+                        <div className="pt-1 border-t border-gray-700/50 mt-1">
+                          <label className="block text-[9px] text-gray-500 mb-1 uppercase tracking-wider">
+                            URL de destino do anúncio <span className="text-red-500">*</span>
+                          </label>
+                          <input
+                            type="text"
+                            className="w-full bg-gray-900 border border-gray-700 rounded-md px-2.5 py-1.5
+                                       text-[11px] text-gray-200 placeholder-gray-600
+                                       focus:outline-none focus:border-violet-500"
+                            placeholder="https://seusite.com.br/produto"
+                            value={creds.google_final_url}
+                            onChange={e => saveCreds({ google_final_url: e.target.value })}
+                          />
+                          <p className="text-[9px] text-gray-600 mt-0.5">Site para onde o anúncio vai direcionar</p>
+                        </div>
+                      )}
                     </div>
                   )
                 })}
@@ -363,7 +508,7 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOut
                   className="mt-0.5 accent-violet-500"
                 />
                 <label htmlFor="budget-confirm" className="text-[11px] text-gray-400 cursor-pointer leading-relaxed">
-                  Confirmo que estou ciente do orçamento estimado acima e autorizo a publicação da campanha.
+                  Confirmo que estou ciente do orçamento acima e autorizo a publicação da campanha.
                 </label>
               </div>
             </div>
@@ -389,21 +534,50 @@ export function PublishPanel({ publisherOutput, copyOutput, designOutput, adsOut
               : `↑ Publicar em ${selected.size} plataforma${selected.size !== 1 ? 's' : ''}`}
           </button>
 
-          {/* ── Resultados ── */}
+          {/* ── Erros de validação ── */}
+          {validationErrors.length > 0 && (
+            <div className="bg-red-950/30 border border-red-800/60 rounded-xl p-4 space-y-1.5">
+              <p className="text-xs font-bold text-red-400 flex items-center gap-1.5">
+                <span>🚨</span> Corrija as credenciais antes de publicar:
+              </p>
+              {validationErrors.map((e, i) => (
+                <p key={i} className="text-[11px] text-red-300 flex items-center gap-1.5">
+                  <span className="text-red-600">▸</span> {e}
+                </p>
+              ))}
+              <p className="text-[10px] text-gray-600 pt-1">
+                Acesse <span className="text-violet-400">credenciais</span> no menu para preencher.
+              </p>
+            </div>
+          )}
+
+          {/* ── Resultados de publicação ── */}
           {results.length > 0 && (
             <div className="space-y-2">
               {results.map((r, i) => (
                 <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-lg text-xs
                   ${r.success ? 'bg-emerald-900/20 border border-emerald-800' : 'bg-red-900/20 border border-red-800'}`}>
-                  <span className="capitalize font-medium">{r.platform}</span>
-                  {r.success
-                    ? r.url
-                      ? <a href={r.url} target="_blank" rel="noopener noreferrer" className="text-emerald-400 hover:underline">ver post ↗</a>
-                      : <span className="text-emerald-400">publicado ✓</span>
-                    : <span className="text-red-400 truncate max-w-52">{r.error}</span>}
+                  <div className="flex items-center gap-2">
+                    <span className={r.success ? 'text-emerald-400' : 'text-red-400'}>
+                      {r.success ? '✓' : '✗'}
+                    </span>
+                    <span className="capitalize font-medium">{r.platform}</span>
+                    {!r.success && (
+                      <span className="text-red-400 truncate max-w-64">{r.error}</span>
+                    )}
+                  </div>
+                  {r.success && r.url && (
+                    <a href={r.url} target="_blank" rel="noopener noreferrer"
+                      className="text-emerald-400 hover:underline">ver post ↗</a>
+                  )}
                 </div>
               ))}
             </div>
+          )}
+
+          {/* ── Métricas em tempo real ── */}
+          {publishedPosts.length > 0 && (
+            <MetricsPanel posts={publishedPosts} authHeaders={authHeaders} />
           )}
         </div>
       )}
