@@ -21,7 +21,8 @@ from services.social_publisher import (
     publish_facebook, publish_instagram, publish_twitter, publish_webhook, publish_google_ads
 )
 from services.metrics_fetcher import (
-    fetch_facebook_metrics, fetch_instagram_metrics, fetch_twitter_metrics
+    fetch_facebook_metrics, fetch_instagram_metrics, fetch_twitter_metrics,
+    fetch_google_ads_campaigns, fetch_facebook_ad_insights,
 )
 
 app = FastAPI(title="Maga One Marketing")
@@ -438,6 +439,50 @@ async def publish(req: PublishRequest, user: str = Depends(require_auth)):
         return {"results": [], "error": "Nenhuma plataforma configurada."}
     results = await asyncio.gather(*tasks)
     return {"results": [r.__dict__ for r in results]}
+
+
+# ── Reports ───────────────────────────────────────────────────
+
+@app.get("/reports/google-ads")
+async def report_google_ads(
+    date_range: str = "LAST_30_DAYS",
+    user: str = Depends(require_auth),
+):
+    """Fetch campaign performance from Google Ads API for the authenticated user."""
+    creds = get_credentials(user)
+    gc = creds.get("google", {})
+    dev_token    = gc.get("google_developer_token", "")
+    customer_id  = gc.get("google_customer_id", "")
+    refresh_token = gc.get("google_refresh_token", "")
+    mcc_id       = gc.get("google_mcc_id", "")
+    if not all([dev_token, customer_id, refresh_token]):
+        raise HTTPException(400, detail="Credenciais Google Ads incompletas.")
+    results = await fetch_google_ads_campaigns(
+        developer_token=dev_token,
+        customer_id=customer_id,
+        refresh_token=refresh_token,
+        client_id=os.getenv("GOOGLE_CLIENT_ID", ""),
+        client_secret=os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        mcc_id=mcc_id,
+        date_range=date_range,
+    )
+    return {"campaigns": [r.__dict__ for r in results]}
+
+
+@app.get("/reports/facebook")
+async def report_facebook(
+    date_preset: str = "last_30d",
+    user: str = Depends(require_auth),
+):
+    """Fetch Facebook Page insights for the authenticated user."""
+    creds = get_credentials(user)
+    fc = creds.get("facebook", {})
+    page_id = fc.get("fb_page_id", "")
+    token   = fc.get("fb_token", "")
+    if not page_id or not token:
+        raise HTTPException(400, detail="Credenciais Facebook incompletas.")
+    results = await fetch_facebook_ad_insights(page_id, token, date_preset)
+    return {"insights": results}
 
 
 # ── Metrics ───────────────────────────────────────────────────

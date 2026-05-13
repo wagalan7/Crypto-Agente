@@ -8,6 +8,7 @@ import { UsersPanel } from './components/UsersPanel'
 import { CampaignHistory } from './components/CampaignHistory'
 import { MagaLogo } from './components/MagaLogo'
 import { CredentialsPanel } from './components/CredentialsPanel'
+import { ReportsPanel } from './components/ReportsPanel'
 import type { AllCreds } from './components/CredentialsPanel'
 import { useAuth } from './hooks/useAuth'
 import type { ProductInput, AgentState, AgentName, SSEEvent } from './types'
@@ -35,6 +36,7 @@ export default function App() {
   const [showUsers, setShowUsers]       = useState(false)
   const [showHistory, setShowHistory]   = useState(false)
   const [showConfig, setShowConfig]     = useState(false)
+  const [showReports, setShowReports]   = useState(false)
   const [savedCreds, setSavedCreds]     = useState<AllCreds>({})
   const [allUsers, setAllUsers]         = useState<{ user: string; role: string }[]>([])
   const [loading, setLoading]           = useState(false)
@@ -204,13 +206,19 @@ export default function App() {
               </span>
             )}
             <button
-              onClick={() => { setShowHistory(h => !h); setShowUsers(false); setShowConfig(false) }}
+              onClick={() => { setShowReports(r => !r); setShowHistory(false); setShowConfig(false); setShowUsers(false) }}
+              className={`transition-colors ${showReports ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
+            >
+              relatórios
+            </button>
+            <button
+              onClick={() => { setShowHistory(h => !h); setShowUsers(false); setShowConfig(false); setShowReports(false) }}
               className={`transition-colors ${showHistory ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
             >
               histórico
             </button>
             <button
-              onClick={() => { setShowConfig(c => !c); setShowHistory(false); setShowUsers(false) }}
+              onClick={() => { setShowConfig(c => !c); setShowHistory(false); setShowUsers(false); setShowReports(false) }}
               className={`transition-colors ${showConfig ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
             >
               credenciais
@@ -251,6 +259,10 @@ export default function App() {
           <PipelineHeader status={status} phase={phase} totalPhases={6} loading={loading} done={done} />
         )}
         {started && <PixelOffice agents={agents} />}
+
+        {showReports && (
+          <ReportsPanel authHeaders={authHeaders} />
+        )}
 
         {showConfig && (
           <CredentialsPanel
