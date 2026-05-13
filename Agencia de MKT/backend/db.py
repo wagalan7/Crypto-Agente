@@ -93,8 +93,51 @@ def init_db():
             created_at   TEXT DEFAULT (datetime('now','localtime'))
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS _migrations (
+            name   TEXT PRIMARY KEY,
+            run_at TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
     con.commit()
+
+    # One-time migrations
+    _migrate_cleanup_unpublished(con)
+
     con.close()
+
+
+def _migrate_cleanup_unpublished(con):
+    """
+    One-time migration: delete every campaign that was auto-saved by the old
+    pipeline-done trigger but was never actually published to any platform.
+    Campaigns saved after the fix already have _published_platforms in result_json.
+    """
+    done = con.execute(
+        "SELECT 1 FROM _migrations WHERE name='cleanup_unpublished_v1'"
+    ).fetchone()
+    if done:
+        return
+
+    rows = con.execute("SELECT id, result_json FROM campaigns").fetchall()
+    to_delete = []
+    for cid, rj in rows:
+        try:
+            d = json.loads(rj or "{}")
+            raw = d.get("_published_platforms", "[]")
+            platforms = json.loads(raw) if isinstance(raw, str) else raw
+            if not platforms:          # empty list = never published
+                to_delete.append(cid)
+        except Exception:
+            to_delete.append(cid)      # unparseable = treat as unpublished
+
+    if to_delete:
+        ph = ",".join("?" for _ in to_delete)
+        con.execute(f"DELETE FROM campaigns WHERE id IN ({ph})", to_delete)
+        con.execute(f"DELETE FROM campaign_grants WHERE campaign_id IN ({ph})", to_delete)
+
+    con.execute("INSERT INTO _migrations (name) VALUES ('cleanup_unpublished_v1')")
+    con.commit()
 
 
 # ── Users ─────────────────────────────────────────────────────────────────────
