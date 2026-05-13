@@ -111,6 +111,56 @@ async def publish_webhook(payload: dict, webhook_url: str) -> PublishResult:
         return PublishResult(platform="webhook", success=False, error=str(e))
 
 
+async def toggle_google_ads_campaign(
+    campaign_id: str,
+    new_status: str,           # "ENABLED" or "PAUSED"
+    developer_token: str,
+    customer_id: str,
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+    mcc_id: str = "",
+) -> dict:
+    """Pause or activate a Google Ads campaign by ID."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            tr = await c.post("https://oauth2.googleapis.com/token", data={
+                "client_id": client_id, "client_secret": client_secret,
+                "refresh_token": refresh_token, "grant_type": "refresh_token",
+            })
+            tokens = tr.json()
+        access_token = tokens.get("access_token", "")
+        if not access_token:
+            return {"success": False, "error": tokens.get("error_description", "Token inválido")}
+
+        cid = customer_id.replace("-", "").replace(" ", "")
+        headers = {
+            "Authorization":   f"Bearer {access_token}",
+            "developer-token": developer_token,
+            "Content-Type":    "application/json",
+        }
+        clean_mcc = mcc_id.replace("-", "").replace(" ", "")
+        if clean_mcc:
+            headers["login-customer-id"] = clean_mcc
+
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                f"https://googleads.googleapis.com/v19/customers/{cid}/campaigns:mutate",
+                headers=headers,
+                json={"operations": [{"update": {
+                    "resourceName": f"customers/{cid}/campaigns/{campaign_id}",
+                    "status": new_status,
+                }, "updateMask": "status"}]},
+            )
+            data = r.json()
+
+        if "error" in data:
+            return {"success": False, "error": data["error"].get("message", str(data["error"]))}
+        return {"success": True, "status": new_status}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def publish_google_ads(
     text: str,
     developer_token: str,
@@ -119,6 +169,8 @@ async def publish_google_ads(
     final_url: str,
     budget_amount: str = "20",
     mcc_id: str = "",
+    keywords: list = [],
+    location_id: str = "2076",
 ) -> PublishResult:
     """
     Cria uma campanha de pesquisa no Google Ads com Responsive Search Ad.
@@ -296,6 +348,31 @@ async def publish_google_ads(
             if not ad_resource:
                 return PublishResult(platform="google", success=False,
                                      error=f"Erro ao criar anúncio: {rd.get('error', {}).get('message', str(rd))}")
+
+            # ── 7. Geo targeting ──────────────────────────────────
+            loc_id = location_id.strip() if location_id else "2076"
+            await http.post(f"{base}/campaignCriteria:mutate", headers=headers, json={
+                "operations": [{"create": {
+                    "campaign": campaign_resource,
+                    "location": {"geoTargetConstant": f"geoTargetConstants/{loc_id}"},
+                }}]
+            })
+
+            # ── 8. Keywords ────────────────────────────────────────
+            kws = [k.strip() for k in (keywords or []) if k.strip()]
+            if kws:
+                kw_ops = []
+                for kw in kws[:20]:   # max 20 keywords
+                    match = "EXACT" if kw.startswith("[") and kw.endswith("]") else \
+                            "PHRASE" if kw.startswith('"') and kw.endswith('"') else "BROAD"
+                    clean_kw = kw.strip('[]"')
+                    kw_ops.append({"create": {
+                        "adGroup": adgroup_resource,
+                        "status":  "ENABLED",
+                        "keyword": {"text": clean_kw[:80], "matchType": match},
+                    }})
+                await http.post(f"{base}/adGroupCriteria:mutate", headers=headers,
+                                json={"operations": kw_ops})
 
         return PublishResult(
             platform="google",

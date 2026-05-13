@@ -251,6 +251,8 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
         google_mcc_id: creds.google_mcc_id,
         google_final_url: creds.google_final_url,
         google_budget: customBudgets['google'] || userBudget || '20',
+        google_keywords: googleKeywords || undefined,
+        google_location_id: googleLocation || '2076',
         tiktok_access_token: creds.tiktok_access_token,
         tiktok_advertiser_id: creds.tiktok_advertiser_id,
       }
@@ -302,10 +304,12 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
     setPublishing(false)
   }
 
-  const [scheduleAt, setScheduleAt]     = useState('')
-  const [scheduling, setScheduling]     = useState(false)
+  const [scheduleAt, setScheduleAt]       = useState('')
+  const [scheduling, setScheduling]       = useState(false)
   const [scheduleResult, setScheduleResult] = useState<string | null>(null)
   const [savedToHistory, setSavedToHistory] = useState(false)
+  const [googleKeywords, setGoogleKeywords] = useState('')
+  const [googleLocation, setGoogleLocation] = useState('2076')
 
   const handleSchedule = async () => {
     const errors = validateCredentials()
@@ -474,7 +478,58 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
               <Field label="ID da Conta MCC / Gerenciadora (sem hífens, se aplicável)" value={creds.google_mcc_id} onChange={v => saveCreds({ google_mcc_id: v })} />
               <Field label="Refresh Token"   value={creds.google_refresh_token}    onChange={v => saveCreds({ google_refresh_token: v })} secret />
               <Field label="URL de destino do anúncio (site do produto)" value={creds.google_final_url} onChange={v => saveCreds({ google_final_url: v })} />
-              <p className="text-[9px] text-amber-600 mt-1">⚠ Campanha criada em status PAUSADA — ative manualmente no Google Ads após revisar.</p>
+
+              {/* ── Segmentação ── */}
+              <div className="border-t border-gray-700/50 mt-2 pt-3 space-y-2">
+                <p className="text-[9px] text-violet-400 font-bold uppercase tracking-widest">◈ Segmentação de Público</p>
+
+                <div>
+                  <label className="block text-[9px] text-gray-500 mb-0.5 uppercase tracking-wider">Localização</label>
+                  <select
+                    value={googleLocation}
+                    onChange={e => setGoogleLocation(e.target.value)}
+                    className="w-full bg-gray-900 border border-gray-700 rounded-md px-2.5 py-1.5 text-[11px] text-gray-200
+                               focus:outline-none focus:border-violet-500">
+                    <optgroup label="Brasil">
+                      <option value="2076">🇧🇷 Brasil (país inteiro)</option>
+                      <option value="1012669">São Paulo (cidade)</option>
+                      <option value="1012666">Rio de Janeiro (cidade)</option>
+                      <option value="1012668">Belo Horizonte</option>
+                      <option value="1005432">Brasília</option>
+                      <option value="1012661">Fortaleza</option>
+                      <option value="1012665">Salvador</option>
+                      <option value="1012663">Curitiba</option>
+                      <option value="1012664">Manaus</option>
+                      <option value="1012660">Recife</option>
+                    </optgroup>
+                    <optgroup label="Internacional">
+                      <option value="2840">🇺🇸 Estados Unidos</option>
+                      <option value="2620">🇵🇹 Portugal</option>
+                      <option value="2032">🇦🇷 Argentina</option>
+                      <option value="2484">🇲🇽 México</option>
+                      <option value="2170">🇨🇴 Colômbia</option>
+                      <option value="2152">🇨🇱 Chile</option>
+                    </optgroup>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[9px] text-gray-500 mb-0.5 uppercase tracking-wider">
+                    Palavras-chave <span className="normal-case text-gray-600">(separadas por vírgula · use "aspas" para frase · [colchetes] para exata)</span>
+                  </label>
+                  <textarea
+                    rows={2}
+                    className="w-full bg-gray-900 border border-gray-700 rounded-md px-2.5 py-1.5 text-[11px] text-gray-200
+                               placeholder:text-gray-600 focus:outline-none focus:border-violet-500 resize-none"
+                    placeholder='tênis masculino, "comprar tênis", [tênis nike tamanho 42]'
+                    value={googleKeywords}
+                    onChange={e => setGoogleKeywords(e.target.value)}
+                  />
+                  <p className="text-[9px] text-gray-600 mt-0.5">Sem prefixo = ampla · "aspas" = frase · [colchetes] = exata</p>
+                </div>
+              </div>
+
+              <p className="text-[9px] text-amber-600 mt-1">⚠ Campanha criada em status PAUSADA — ative no relatório após revisar.</p>
             </CredentialSection>
           )}
           {selected.has('tiktok') && (

@@ -24,7 +24,8 @@ from db import (init_db, db_seed_users, save_campaign, list_campaigns, get_campa
                 list_notifications, mark_notifications_read, count_unread,
                 get_client_stats)
 from services.social_publisher import (
-    publish_facebook, publish_instagram, publish_twitter, publish_webhook, publish_google_ads
+    publish_facebook, publish_instagram, publish_twitter, publish_webhook,
+    publish_google_ads, toggle_google_ads_campaign,
 )
 from services.metrics_fetcher import (
     fetch_facebook_metrics, fetch_instagram_metrics, fetch_twitter_metrics,
@@ -613,6 +614,8 @@ class PublishRequest(BaseModel):
     google_final_url: Optional[str] = None
     google_budget: Optional[str] = None
     google_mcc_id: Optional[str] = None
+    google_keywords: Optional[str] = None   # comma-separated keywords
+    google_location_id: Optional[str] = "2076"  # default: Brazil
 
 @app.post("/agency/publish")
 async def publish(req: PublishRequest, user: str = Depends(require_auth)):
@@ -628,6 +631,7 @@ async def publish(req: PublishRequest, user: str = Depends(require_auth)):
         tasks.append(publish_webhook({"text": req.text, "image_url": req.image_url}, req.webhook_url))
     if ("google" in req.platforms and req.google_developer_token
             and req.google_customer_id and req.google_refresh_token):
+        kws = [k.strip() for k in (req.google_keywords or "").split(",") if k.strip()]
         tasks.append(publish_google_ads(
             req.text,
             req.google_developer_token,
@@ -636,6 +640,8 @@ async def publish(req: PublishRequest, user: str = Depends(require_auth)):
             req.google_final_url or "",
             req.google_budget or "20",
             req.google_mcc_id or "",
+            keywords=kws,
+            location_id=req.google_location_id or "2076",
         ))
     if not tasks:
         return {"results": [], "error": "Nenhuma plataforma configurada."}
@@ -691,6 +697,36 @@ async def optimize_campaigns(req: OptimizeRequest, user: str = Depends(require_a
     suggestions = resp.choices[0].message.content or "Sem sugestões geradas."
     return {"suggestions": suggestions, "tokens_used": resp.usage.total_tokens if resp.usage else 0}
 
+
+
+class CampaignStatusRequest(BaseModel):
+    campaign_id: str
+    new_status:  str   # "ENABLED" or "PAUSED"
+
+@app.post("/reports/google-ads/toggle")
+async def toggle_google_campaign(req: CampaignStatusRequest, user: str = Depends(require_auth)):
+    """Pause or activate a Google Ads campaign."""
+    creds = get_credentials(user)
+    gc = creds.get("google", {})
+    dev_token     = gc.get("google_developer_token", "")
+    customer_id   = gc.get("google_customer_id", "")
+    refresh_token = gc.get("google_refresh_token", "")
+    mcc_id        = gc.get("google_mcc_id", "")
+    if not all([dev_token, customer_id, refresh_token]):
+        raise HTTPException(400, detail="Credenciais Google Ads incompletas.")
+    result = await toggle_google_ads_campaign(
+        campaign_id=req.campaign_id,
+        new_status=req.new_status,
+        developer_token=dev_token,
+        customer_id=customer_id,
+        refresh_token=refresh_token,
+        client_id=os.getenv("GOOGLE_CLIENT_ID", ""),
+        client_secret=os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        mcc_id=mcc_id,
+    )
+    if not result.get("success"):
+        raise HTTPException(400, detail=result.get("error", "Erro ao alterar status"))
+    return result
 
 
 @app.get("/reports/google-ads")
