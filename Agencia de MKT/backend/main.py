@@ -3,7 +3,7 @@ import asyncio
 import secrets
 import urllib.parse
 import httpx
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -162,8 +162,10 @@ if not _seed:
               "role": "admin", "name": ""}]
 db_seed_users(_seed)
 
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-ASSETS_DIR = os.path.join(STATIC_DIR, "assets")
+STATIC_DIR  = os.path.join(os.path.dirname(__file__), "static")
+ASSETS_DIR  = os.path.join(STATIC_DIR, "assets")
+UPLOADS_DIR = os.environ.get("UPLOADS_DIR", "/data/uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
 
 # ── Auth ──────────────────────────────────────────────────────
@@ -811,7 +813,36 @@ async def fetch_campaign_metrics(req: MetricsFetchRequest, user: str = Depends(r
     return {"metrics": [r.__dict__ for r in results]}
 
 
+# ── Image Upload ──────────────────────────────────────────────
+
+ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+MAX_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+@app.post("/upload/image")
+async def upload_image(request: Request, file: UploadFile = File(...), user: str = Depends(require_auth)):
+    """Upload an image and return its public URL."""
+    if file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(400, detail=f"Tipo não permitido: {file.content_type}. Use JPG, PNG, WebP ou GIF.")
+    data = await file.read()
+    if len(data) > MAX_SIZE_BYTES:
+        raise HTTPException(400, detail="Arquivo muito grande. Máximo: 10 MB.")
+    # Generate a unique filename preserving extension
+    ext = (file.filename or "image.jpg").rsplit(".", 1)[-1].lower()
+    if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
+        ext = "jpg"
+    fname = f"{secrets.token_hex(16)}.{ext}"
+    fpath = os.path.join(UPLOADS_DIR, fname)
+    with open(fpath, "wb") as f:
+        f.write(data)
+    # Build public URL from request base
+    base = str(request.base_url).rstrip("/")
+    public_url = f"{base}/uploads/{fname}"
+    return {"url": public_url, "filename": fname, "size": len(data)}
+
+
 # ── Static SPA ────────────────────────────────────────────────
+
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 if os.path.isdir(ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")

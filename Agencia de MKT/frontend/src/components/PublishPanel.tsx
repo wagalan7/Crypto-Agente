@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import type { AllCreds } from './CredentialsPanel'
 import { MetricsPanel } from './MetricsPanel'
 import type { ProductInput } from '../types/index'
@@ -171,6 +171,35 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
   const [publishedPosts, setPublishedPosts] = useState<{
     platform: string; post_id: string; token: string; bearer_token?: string; url?: string
   }[]>([])
+  const [uploading, setUploading]     = useState(false)
+  const [uploadError, setUploadError] = useState('')
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setUploading(true)
+    setUploadError('')
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      // Strip Content-Type so browser sets multipart/form-data boundary automatically
+      const { 'Content-Type': _ct, ...uploadHeaders } = authHeaders as Record<string, string>
+      const res = await fetch('/upload/image', { method: 'POST', headers: uploadHeaders, body: fd })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Erro no upload' }))
+        setUploadError(err.detail || 'Erro no upload')
+      } else {
+        const { url } = await res.json()
+        saveCreds({ image_url: url })
+      }
+    } catch {
+      setUploadError('Falha na conexão ao fazer upload.')
+    } finally {
+      setUploading(false)
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
+  }
 
   // Derived: show customText if user typed something, else fall back to agent output
   // Use || (not ??) so empty strings "" also fall through to the next option
@@ -395,13 +424,51 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
             <label className="block text-[10px] text-gray-500 mb-1 tracking-widest uppercase">
               URL da Imagem <span className="text-pink-500">· obrigatório para Instagram</span>
             </label>
-            <input
-              className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs text-gray-200
-                         placeholder-gray-600 focus:outline-none focus:border-violet-500"
-              placeholder="https://meusite.com/imagem.jpg"
-              value={creds.image_url}
-              onChange={e => saveCreds({ image_url: e.target.value })}
-            />
+            <div className="flex gap-2">
+              <input
+                className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs text-gray-200
+                           placeholder-gray-600 focus:outline-none focus:border-violet-500"
+                placeholder="https://meusite.com/imagem.jpg"
+                value={creds.image_url}
+                onChange={e => saveCreds({ image_url: e.target.value })}
+              />
+              {/* Hidden file input */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/gif"
+                className="hidden"
+                onChange={handleImageUpload}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className="flex items-center gap-1.5 px-3 py-2 bg-gray-700 hover:bg-gray-600
+                           border border-gray-600 hover:border-violet-500 rounded-lg text-xs text-gray-300
+                           hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+              >
+                {uploading ? (
+                  <><span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />Enviando...</>
+                ) : (
+                  <>📎 Upload</>
+                )}
+              </button>
+            </div>
+            {uploadError && (
+              <p className="text-[10px] text-red-400 mt-1">⚠ {uploadError}</p>
+            )}
+            {creds.image_url && creds.image_url.startsWith('http') && !uploading && (
+              <div className="mt-2 flex items-center gap-2">
+                <img
+                  src={creds.image_url}
+                  alt="preview"
+                  className="w-16 h-16 object-cover rounded-lg border border-gray-700"
+                  onError={e => { (e.target as HTMLImageElement).style.display = 'none' }}
+                />
+                <p className="text-[9px] text-gray-500 break-all">{creds.image_url}</p>
+              </div>
+            )}
             {imagePrompt && (
               <div className="mt-2 bg-gray-800/60 border border-gray-700 rounded-lg p-2.5">
                 <p className="text-[9px] text-gray-500 uppercase tracking-widest mb-1">Prompt IA gerado pelo Agente Design</p>
