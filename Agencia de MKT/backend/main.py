@@ -18,7 +18,11 @@ from db import (init_db, db_seed_users, save_campaign, list_campaigns, get_campa
                 grant_access, revoke_access, get_campaign_grants,
                 save_credential, get_credentials, delete_platform_credentials,
                 create_scheduled_post, list_scheduled_posts,
-                get_pending_posts, update_post_status, cancel_scheduled_post)
+                get_pending_posts, update_post_status, cancel_scheduled_post,
+                list_alert_rules, create_alert_rule, delete_alert_rule,
+                get_all_active_alert_rules, create_notification,
+                list_notifications, mark_notifications_read, count_unread,
+                get_client_stats)
 from services.social_publisher import (
     publish_facebook, publish_instagram, publish_twitter, publish_webhook, publish_google_ads
 )
@@ -78,9 +82,68 @@ async def _scheduled_worker():
         await asyncio.sleep(60)
 
 
+async def _alert_worker():
+    """Runs every hour, checks alert rules against live Google Ads data."""
+    import smtplib, email.mime.text as _emt
+    await asyncio.sleep(300)   # 5 min after startup
+    while True:
+        try:
+            rules = get_all_active_alert_rules()
+            # Group by owner to batch API calls per user
+            owners: dict[str, list] = {}
+            for r in rules:
+                owners.setdefault(r["owner"], []).append(r)
+
+            for owner, owner_rules in owners.items():
+                creds = get_credentials(owner)
+                gc = creds.get("google", {})
+                if not all([gc.get("google_developer_token"), gc.get("google_customer_id"), gc.get("google_refresh_token")]):
+                    continue
+                campaigns = await fetch_google_ads_campaigns(
+                    gc["google_developer_token"], gc["google_customer_id"],
+                    gc["google_refresh_token"],
+                    os.getenv("GOOGLE_CLIENT_ID", ""), os.getenv("GOOGLE_CLIENT_SECRET", ""),
+                    gc.get("google_mcc_id", ""), "LAST_7_DAYS",
+                )
+                if not campaigns or (len(campaigns) == 1 and campaigns[0].error):
+                    continue
+
+                for rule in owner_rules:
+                    metric = rule["metric"]
+                    cond   = rule["condition"]
+                    thresh = float(rule["threshold"])
+                    triggered = []
+                    for c in campaigns:
+                        val = getattr(c, metric, None)
+                        if val is None: continue
+                        if (cond == "<" and float(val) < thresh) or (cond == ">" and float(val) > thresh):
+                            triggered.append(f"{c.campaign_name}: {metric}={val}")
+                    if triggered:
+                        label = rule.get("label") or metric
+                        msg = f"⚠ Alerta '{label}': {'; '.join(triggered[:3])}"
+                        create_notification(owner, msg, "warning")
+                        # Optional email
+                        smtp_host = os.getenv("SMTP_HOST", "")
+                        smtp_user = os.getenv("SMTP_USER", "")
+                        smtp_pass = os.getenv("SMTP_PASS", "")
+                        if smtp_host and smtp_user and owner and "@" in owner:
+                            try:
+                                m = _emt.MIMEText(msg)
+                                m["Subject"] = f"[Maga One] Alerta de Performance"
+                                m["From"] = smtp_user; m["To"] = owner
+                                with smtplib.SMTP_SSL(smtp_host, int(os.getenv("SMTP_PORT", "465"))) as s:
+                                    s.login(smtp_user, smtp_pass); s.send_message(m)
+                            except Exception as e:
+                                print(f"[alerts] email error: {e}", flush=True)
+        except Exception as e:
+            print(f"[alert_worker] erro: {e}", flush=True)
+        await asyncio.sleep(3600)   # check every hour
+
+
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(_scheduled_worker())
+    asyncio.create_task(_alert_worker())
 
 
 # Seed users from USERS_JSON env var or admin defaults (only if DB is empty)
@@ -433,6 +496,53 @@ async def revoke_campaign(campaign_id: int, username: str, user: str = Depends(r
 async def list_grants(campaign_id: int, user: str = Depends(require_auth)):
     require_admin(user)
     return get_campaign_grants(campaign_id)
+
+
+# ── Alerts ───────────────────────────────────────────────────
+
+class AlertRuleRequest(BaseModel):
+    platform:  str   = "google"
+    metric:    str
+    condition: str
+    threshold: float
+    label:     str   = ""
+
+@app.get("/alerts")
+async def get_alerts(user: str = Depends(require_auth)):
+    return list_alert_rules(user)
+
+@app.post("/alerts")
+async def add_alert(req: AlertRuleRequest, user: str = Depends(require_auth)):
+    rid = create_alert_rule(user, req.platform, req.metric, req.condition, req.threshold, req.label)
+    return {"id": rid}
+
+@app.delete("/alerts/{rule_id}")
+async def remove_alert(rule_id: int, user: str = Depends(require_auth)):
+    delete_alert_rule(rule_id, user)
+    return {"ok": True}
+
+
+# ── Notifications ─────────────────────────────────────────────
+
+@app.get("/notifications")
+async def get_notifications(unread_only: bool = False, user: str = Depends(require_auth)):
+    return {
+        "notifications": list_notifications(user, unread_only),
+        "unread": count_unread(user),
+    }
+
+@app.post("/notifications/read")
+async def read_notifications(user: str = Depends(require_auth)):
+    mark_notifications_read(user)
+    return {"ok": True}
+
+
+# ── Client Stats (admin) ──────────────────────────────────────
+
+@app.get("/admin/clients")
+async def admin_clients(user: str = Depends(require_auth)):
+    require_admin(user)
+    return get_client_stats()
 
 
 # ── Schedule ─────────────────────────────────────────────────

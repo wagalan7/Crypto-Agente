@@ -10,6 +10,8 @@ import { MagaLogo } from './components/MagaLogo'
 import { CredentialsPanel } from './components/CredentialsPanel'
 import { ReportsPanel } from './components/ReportsPanel'
 import { SchedulePanel } from './components/SchedulePanel'
+import { AlertsPanel } from './components/AlertsPanel'
+import { ClientsPanel } from './components/ClientsPanel'
 import type { AllCreds } from './components/CredentialsPanel'
 import { useAuth } from './hooks/useAuth'
 import type { ProductInput, AgentState, AgentName, SSEEvent } from './types'
@@ -39,6 +41,9 @@ export default function App() {
   const [showConfig, setShowConfig]     = useState(false)
   const [showReports, setShowReports]     = useState(false)
   const [showSchedule, setShowSchedule]   = useState(false)
+  const [showAlerts, setShowAlerts]       = useState(false)
+  const [showClients, setShowClients]     = useState(false)
+  const [unreadCount, setUnreadCount]     = useState(0)
   const [savedCreds, setSavedCreds]     = useState<AllCreds>({})
   const [allUsers, setAllUsers]         = useState<{ user: string; role: string }[]>([])
   const [loading, setLoading]           = useState(false)
@@ -70,6 +75,20 @@ export default function App() {
       .then(r => r.ok ? r.json() : {})
       .then(setSavedCreds)
       .catch(() => {})
+  }, [isLoggedIn, token])
+
+  // Poll unread notification count every 2 minutes
+  useEffect(() => {
+    if (!isLoggedIn || !token) return
+    const poll = () => {
+      fetch('/notifications', { headers: { Authorization: `Bearer ${token}` } })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d) setUnreadCount(d.unread || 0) })
+        .catch(() => {})
+    }
+    poll()
+    const id = setInterval(poll, 120000)
+    return () => clearInterval(id)
   }, [isLoggedIn, token])
 
   // Load all users for the grants dropdown (admin only)
@@ -188,7 +207,7 @@ export default function App() {
             <div>
               <h1 className="text-sm font-bold text-white leading-none">Maga One</h1>
               <p className="text-[10px] text-gray-600 mt-0.5">
-                {TOTAL_AGENTS} Agentes · Pipeline Autônomo · v32
+                {TOTAL_AGENTS} Agentes · Pipeline Autônomo · v33
               </p>
             </div>
           </div>
@@ -208,36 +227,55 @@ export default function App() {
               </span>
             )}
             <button
-              onClick={() => { setShowSchedule(s => !s); setShowReports(false); setShowHistory(false); setShowConfig(false); setShowUsers(false) }}
+              onClick={() => { setShowSchedule(s => !s); setShowReports(false); setShowHistory(false); setShowConfig(false); setShowUsers(false); setShowAlerts(false); setShowClients(false) }}
               className={`transition-colors ${showSchedule ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
             >
               agendamentos
             </button>
             <button
-              onClick={() => { setShowReports(r => !r); setShowHistory(false); setShowConfig(false); setShowUsers(false); setShowSchedule(false) }}
+              onClick={() => { setShowReports(r => !r); setShowHistory(false); setShowConfig(false); setShowUsers(false); setShowSchedule(false); setShowAlerts(false); setShowClients(false) }}
               className={`transition-colors ${showReports ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
             >
               relatórios
             </button>
             <button
-              onClick={() => { setShowHistory(h => !h); setShowUsers(false); setShowConfig(false); setShowReports(false) }}
+              onClick={() => { setShowAlerts(a => !a); setShowReports(false); setShowHistory(false); setShowConfig(false); setShowUsers(false); setShowSchedule(false); setShowClients(false); if (!showAlerts) setUnreadCount(0) }}
+              className={`relative transition-colors ${showAlerts ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
+            >
+              alertas
+              {unreadCount > 0 && (
+                <span className="absolute -top-1.5 -right-2.5 w-3.5 h-3.5 rounded-full bg-red-500 text-[8px] text-white flex items-center justify-center leading-none">
+                  {unreadCount > 9 ? '9+' : unreadCount}
+                </span>
+              )}
+            </button>
+            <button
+              onClick={() => { setShowHistory(h => !h); setShowUsers(false); setShowConfig(false); setShowReports(false); setShowAlerts(false); setShowClients(false) }}
               className={`transition-colors ${showHistory ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
             >
               histórico
             </button>
             <button
-              onClick={() => { setShowConfig(c => !c); setShowHistory(false); setShowUsers(false); setShowReports(false) }}
+              onClick={() => { setShowConfig(c => !c); setShowHistory(false); setShowUsers(false); setShowReports(false); setShowAlerts(false); setShowClients(false) }}
               className={`transition-colors ${showConfig ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
             >
               credenciais
             </button>
             {isAdmin && (
-              <button
-                onClick={() => { setShowUsers(s => !s); setShowHistory(false); setShowConfig(false) }}
-                className={`transition-colors ${showUsers ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
-              >
-                usuários
-              </button>
+              <>
+                <button
+                  onClick={() => { setShowClients(c => !c); setShowUsers(false); setShowHistory(false); setShowConfig(false); setShowAlerts(false) }}
+                  className={`transition-colors ${showClients ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
+                >
+                  clientes
+                </button>
+                <button
+                  onClick={() => { setShowUsers(s => !s); setShowHistory(false); setShowConfig(false); setShowClients(false) }}
+                  className={`transition-colors ${showUsers ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
+                >
+                  usuários
+                </button>
+              </>
             )}
             <button onClick={logout} className="text-gray-600 hover:text-gray-400 transition-colors">
               sair
@@ -283,6 +321,10 @@ export default function App() {
           />
         )}
 
+        {showAlerts && (
+          <AlertsPanel authHeaders={authHeaders} />
+        )}
+
         {showHistory && (
           <CampaignHistory
             authHeaders={authHeaders}
@@ -290,6 +332,9 @@ export default function App() {
             currentUser={currentUser}
             allUsers={allUsers}
           />
+        )}
+        {showClients && isAdmin && (
+          <ClientsPanel authHeaders={authHeaders} />
         )}
         {showUsers && isAdmin && (
           <UsersPanel authHeaders={authHeaders} currentUser={currentUser} />

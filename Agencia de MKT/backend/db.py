@@ -57,6 +57,29 @@ def init_db():
         )
     """)
     con.execute("""
+        CREATE TABLE IF NOT EXISTS alert_rules (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner      TEXT NOT NULL,
+            platform   TEXT NOT NULL DEFAULT 'google',
+            metric     TEXT NOT NULL,
+            condition  TEXT NOT NULL,
+            threshold  REAL NOT NULL,
+            label      TEXT,
+            active     INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner      TEXT NOT NULL,
+            message    TEXT NOT NULL,
+            level      TEXT NOT NULL DEFAULT 'warning',
+            read       INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    con.execute("""
         CREATE TABLE IF NOT EXISTS scheduled_posts (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             owner        TEXT NOT NULL,
@@ -245,6 +268,84 @@ def revoke_access(campaign_id: int, granted_to: str):
     )
     con.commit()
     con.close()
+
+
+# ── Alert Rules ──────────────────────────────────────────────────────────────
+
+def list_alert_rules(owner: str) -> list[dict]:
+    con = _con(); con.row_factory = sqlite3.Row
+    rows = con.execute("SELECT * FROM alert_rules WHERE owner=? ORDER BY created_at DESC", (owner,)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+def create_alert_rule(owner: str, platform: str, metric: str, condition: str,
+                      threshold: float, label: str = "") -> int:
+    con = _con()
+    cur = con.execute(
+        "INSERT INTO alert_rules (owner, platform, metric, condition, threshold, label) VALUES (?,?,?,?,?,?)",
+        (owner, platform, metric, condition, threshold, label),
+    )
+    rid = cur.lastrowid; con.commit(); con.close()
+    return rid
+
+def delete_alert_rule(rule_id: int, owner: str):
+    con = _con()
+    con.execute("DELETE FROM alert_rules WHERE id=? AND owner=?", (rule_id, owner))
+    con.commit(); con.close()
+
+def get_all_active_alert_rules() -> list[dict]:
+    con = _con(); con.row_factory = sqlite3.Row
+    rows = con.execute("SELECT * FROM alert_rules WHERE active=1").fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+def create_notification(owner: str, message: str, level: str = "warning") -> int:
+    con = _con()
+    cur = con.execute(
+        "INSERT INTO notifications (owner, message, level) VALUES (?,?,?)",
+        (owner, message, level),
+    )
+    nid = cur.lastrowid; con.commit(); con.close()
+    return nid
+
+def list_notifications(owner: str, unread_only: bool = False) -> list[dict]:
+    con = _con(); con.row_factory = sqlite3.Row
+    q = "SELECT * FROM notifications WHERE owner=?"
+    if unread_only: q += " AND read=0"
+    q += " ORDER BY created_at DESC LIMIT 50"
+    rows = con.execute(q, (owner,)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+def mark_notifications_read(owner: str):
+    con = _con()
+    con.execute("UPDATE notifications SET read=1 WHERE owner=?", (owner,))
+    con.commit(); con.close()
+
+def count_unread(owner: str) -> int:
+    con = _con()
+    n = con.execute("SELECT COUNT(*) FROM notifications WHERE owner=? AND read=0", (owner,)).fetchone()[0]
+    con.close()
+    return n
+
+# ── Client Stats (admin) ──────────────────────────────────────────────────────
+
+def get_client_stats() -> list[dict]:
+    """Returns campaign count and last activity per user."""
+    con = _con(); con.row_factory = sqlite3.Row
+    rows = con.execute("""
+        SELECT u.username, u.name, u.role,
+               COUNT(c.id) as campaign_count,
+               MAX(c.created_at) as last_activity
+        FROM users u
+        LEFT JOIN campaigns c ON c.owner = u.username
+        GROUP BY u.username
+        ORDER BY last_activity DESC NULLS LAST
+    """).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
 
 
 # ── Scheduled Posts ───────────────────────────────────────────────────────────
