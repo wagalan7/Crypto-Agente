@@ -28,7 +28,7 @@ from services.social_publisher import (
 )
 from services.metrics_fetcher import (
     fetch_facebook_metrics, fetch_instagram_metrics, fetch_twitter_metrics,
-    fetch_google_ads_campaigns, fetch_facebook_ad_insights,
+    fetch_google_ads_campaigns, fetch_facebook_ad_insights, fetch_tiktok_insights,
 )
 
 app = FastAPI(title="Maga One Marketing")
@@ -733,6 +733,22 @@ async def report_facebook(
         raise HTTPException(400, detail="Credenciais Facebook incompletas.")
     results = await fetch_facebook_ad_insights(page_id, token, date_preset)
     return {"insights": results}
+
+
+@app.get("/reports/tiktok")
+async def report_tiktok(
+    date_range: str = "LAST_30_DAYS",
+    user: str = Depends(require_auth),
+):
+    """Fetch TikTok Ads campaign performance for the authenticated user."""
+    creds = get_credentials(user)
+    tc = creds.get("tiktok", {})
+    access_token  = tc.get("tiktok_access_token", "")
+    advertiser_id = tc.get("tiktok_advertiser_id", "")
+    if not access_token or not advertiser_id:
+        raise HTTPException(400, detail="Credenciais TikTok incompletas. Configure em Credenciais → TikTok.")
+    results = await fetch_tiktok_insights(access_token, advertiser_id, date_range)
+    return {"campaigns": results}
 
 
 # ── Metrics ───────────────────────────────────────────────────

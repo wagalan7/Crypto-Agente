@@ -226,6 +226,75 @@ async def fetch_google_ads_campaigns(
         return [CampaignReport("", "", "", error=str(e))]
 
 
+async def fetch_tiktok_insights(
+    access_token: str,
+    advertiser_id: str,
+    date_range: str = "LAST_30_DAYS",
+) -> list[dict]:
+    """Fetch TikTok Ads campaign performance via Marketing API v1.3."""
+    import json as _json
+    from datetime import datetime, timedelta
+
+    today = datetime.today()
+    if date_range == "LAST_7_DAYS":
+        start = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    elif date_range == "LAST_90_DAYS":
+        start = (today - timedelta(days=90)).strftime("%Y-%m-%d")
+    elif date_range == "THIS_MONTH":
+        start = today.replace(day=1).strftime("%Y-%m-%d")
+    elif date_range == "LAST_MONTH":
+        first_this = today.replace(day=1)
+        last_prev  = first_this - timedelta(days=1)
+        start = last_prev.replace(day=1).strftime("%Y-%m-%d")
+        today = last_prev
+    else:
+        start = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(
+                "https://business-api.tiktok.com/open_api/v1.3/report/integrated/get/",
+                headers={"Access-Token": access_token},
+                params={
+                    "advertiser_id":  advertiser_id,
+                    "report_type":    "BASIC",
+                    "dimensions":     _json.dumps(["campaign_id", "campaign_name"]),
+                    "data_level":     "AUCTION_CAMPAIGN",
+                    "metrics":        _json.dumps(["impressions", "clicks", "ctr", "cpc", "spend", "conversion"]),
+                    "start_date":     start,
+                    "end_date":       end,
+                    "page_size":      50,
+                },
+            )
+            data = r.json()
+
+        if data.get("code") != 0:
+            return [{"error": data.get("message", "Erro desconhecido na API TikTok")}]
+
+        results = []
+        for item in data.get("data", {}).get("list", []):
+            dims    = item.get("dimensions", {})
+            metrics = item.get("metrics", {})
+            results.append({
+                "campaign_id":   dims.get("campaign_id", ""),
+                "campaign_name": dims.get("campaign_name", "—"),
+                "impressions":   int(float(metrics.get("impressions", 0))),
+                "clicks":        int(float(metrics.get("clicks", 0))),
+                "ctr":           round(float(metrics.get("ctr", 0)), 2),
+                "cpc":           round(float(metrics.get("cpc", 0)), 2),
+                "spend":         round(float(metrics.get("spend", 0)), 2),
+                "conversions":   round(float(metrics.get("conversion", 0)), 1),
+            })
+
+        if not results:
+            return [{"error": "Nenhuma campanha encontrada no período."}]
+        return results
+
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
 async def fetch_facebook_ad_insights(page_id: str, token: str, date_preset: str = "last_30d") -> list[dict]:
     """Fetch Facebook Page post insights summary."""
     try:
