@@ -387,18 +387,30 @@ def count_unread(owner: str) -> int:
 
 # ── Client Stats (admin) ──────────────────────────────────────────────────────
 
-def get_client_stats() -> list[dict]:
-    """Returns campaign count and last activity per user."""
+def get_client_stats(username: str | None = None) -> list[dict]:
+    """Returns campaign count and last activity per user.
+    If username is provided, returns stats for that user only."""
     con = _con(); con.row_factory = sqlite3.Row
-    rows = con.execute("""
-        SELECT u.username, u.name, u.role,
-               COUNT(c.id) as campaign_count,
-               MAX(c.created_at) as last_activity
-        FROM users u
-        LEFT JOIN campaigns c ON c.owner = u.username
-        GROUP BY u.username
-        ORDER BY last_activity DESC NULLS LAST
-    """).fetchall()
+    if username:
+        rows = con.execute("""
+            SELECT u.username, u.name, u.role,
+                   COUNT(c.id) as campaign_count,
+                   MAX(c.created_at) as last_activity
+            FROM users u
+            LEFT JOIN campaigns c ON c.owner = u.username
+            WHERE u.username = ?
+            GROUP BY u.username
+        """, (username,)).fetchall()
+    else:
+        rows = con.execute("""
+            SELECT u.username, u.name, u.role,
+                   COUNT(c.id) as campaign_count,
+                   MAX(c.created_at) as last_activity
+            FROM users u
+            LEFT JOIN campaigns c ON c.owner = u.username
+            GROUP BY u.username
+            ORDER BY last_activity DESC NULLS LAST
+        """).fetchall()
     con.close()
     return [dict(r) for r in rows]
 

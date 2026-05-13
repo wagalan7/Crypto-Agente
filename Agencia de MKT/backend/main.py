@@ -538,12 +538,15 @@ async def read_notifications(user: str = Depends(require_auth)):
     return {"ok": True}
 
 
-# ── Client Stats (admin) ──────────────────────────────────────
+# ── Client Stats ──────────────────────────────────────────────
 
-@app.get("/admin/clients")
-async def admin_clients(user: str = Depends(require_auth)):
-    require_admin(user)
-    return get_client_stats()
+@app.get("/clients")
+async def clients_stats(user: str = Depends(require_auth)):
+    """Admin sees all users; regular users see only their own stats."""
+    role = get_user_role(user)
+    if role == "admin":
+        return get_client_stats()
+    return get_client_stats(username=user)
 
 
 # ── Schedule ─────────────────────────────────────────────────

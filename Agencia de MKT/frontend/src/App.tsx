@@ -247,21 +247,19 @@ export default function App() {
             >
               credenciais
             </button>
+            <button
+              onClick={() => { setShowClients(c => !c); setShowUsers(false); setShowHistory(false); setShowConfig(false); setShowAlerts(false) }}
+              className={`transition-colors ${showClients ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
+            >
+              clientes
+            </button>
             {isAdmin && (
-              <>
-                <button
-                  onClick={() => { setShowClients(c => !c); setShowUsers(false); setShowHistory(false); setShowConfig(false); setShowAlerts(false) }}
-                  className={`transition-colors ${showClients ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
-                >
-                  clientes
-                </button>
-                <button
-                  onClick={() => { setShowUsers(s => !s); setShowHistory(false); setShowConfig(false); setShowClients(false) }}
-                  className={`transition-colors ${showUsers ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
-                >
-                  usuários
-                </button>
-              </>
+              <button
+                onClick={() => { setShowUsers(s => !s); setShowHistory(false); setShowConfig(false); setShowClients(false) }}
+                className={`transition-colors ${showUsers ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
+              >
+                usuários
+              </button>
             )}
             <button onClick={logout} className="text-gray-600 hover:text-gray-400 transition-colors">
               sair
@@ -319,8 +317,8 @@ export default function App() {
             allUsers={allUsers}
           />
         )}
-        {showClients && isAdmin && (
-          <ClientsPanel authHeaders={authHeaders} />
+        {showClients && (
+          <ClientsPanel authHeaders={authHeaders} isAdmin={isAdmin} currentUser={currentUser} />
         )}
         {showUsers && isAdmin && (
           <UsersPanel authHeaders={authHeaders} currentUser={currentUser} />
