@@ -278,6 +278,43 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
     setPublishing(false)
   }
 
+  const [scheduleAt, setScheduleAt]     = useState('')
+  const [scheduling, setScheduling]     = useState(false)
+  const [scheduleResult, setScheduleResult] = useState<string | null>(null)
+
+  const handleSchedule = async () => {
+    const errors = validateCredentials()
+    if (errors.length > 0) { setValidationErrors(errors); return }
+    if (!scheduleAt) return
+    setValidationErrors([])
+    setScheduling(true)
+    setScheduleResult(null)
+    try {
+      const body = {
+        text: text || publisherOutput || copyOutput,
+        image_url: creds.image_url || undefined,
+        platforms: [...selected].filter(p => p !== 'google'),
+        scheduled_at: scheduleAt,
+        fb_page_id: creds.fb_page_id, fb_token: creds.fb_token,
+        ig_user_id: creds.ig_user_id, ig_token: creds.ig_token,
+        tw_api_key: creds.tw_api_key, tw_api_secret: creds.tw_api_secret,
+        tw_access_token: creds.tw_access_token, tw_access_secret: creds.tw_access_secret,
+        webhook_url: creds.webhook_url,
+      }
+      const res = await fetch('/schedule', { method: 'POST', headers: authHeaders, body: JSON.stringify(body) })
+      const data = await res.json()
+      if (res.ok) {
+        setScheduleResult(`✓ Agendado para ${new Date(scheduleAt).toLocaleString('pt-BR')}`)
+        setScheduleAt('')
+      } else {
+        setScheduleResult(`✗ ${data.detail || 'Erro ao agendar'}`)
+      }
+    } catch (e) {
+      setScheduleResult(`✗ ${String(e)}`)
+    }
+    setScheduling(false)
+  }
+
   const selectedPlatformsWithBudget = [...selected].filter(p => p in BUDGET_DEFAULTS)
 
   return (
@@ -513,6 +550,34 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
               </div>
             </div>
           )}
+
+          {/* ── Agendar ── */}
+          <div className="bg-gray-800/40 border border-gray-700 rounded-xl p-3 space-y-2">
+            <p className="text-[10px] text-gray-400 font-bold tracking-widest uppercase">📅 Agendar para depois</p>
+            <p className="text-[9px] text-gray-600">Publica automaticamente na data e hora escolhidas. Google Ads não suporta agendamento.</p>
+            <div className="flex gap-2">
+              <input
+                type="datetime-local"
+                value={scheduleAt}
+                onChange={e => setScheduleAt(e.target.value)}
+                className="flex-1 bg-gray-900 border border-gray-700 rounded-lg px-3 py-1.5 text-xs text-gray-200
+                           focus:outline-none focus:border-violet-500"
+              />
+              <button
+                onClick={handleSchedule}
+                disabled={scheduling || !scheduleAt || selected.size === 0 || !text}
+                className="px-4 py-1.5 rounded-lg text-xs font-semibold text-white
+                  bg-gradient-to-r from-blue-700 to-violet-700 hover:from-blue-600 hover:to-violet-600
+                  disabled:opacity-40 disabled:cursor-not-allowed transition-all">
+                {scheduling ? '...' : 'Agendar'}
+              </button>
+            </div>
+            {scheduleResult && (
+              <p className={`text-[11px] ${scheduleResult.startsWith('✓') ? 'text-emerald-400' : 'text-red-400'}`}>
+                {scheduleResult}
+              </p>
+            )}
+          </div>
 
           {/* ── Publicar ── */}
           <button

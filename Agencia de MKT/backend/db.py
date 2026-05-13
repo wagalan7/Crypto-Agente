@@ -56,6 +56,20 @@ def init_db():
             PRIMARY KEY (campaign_id, granted_to)
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_posts (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner        TEXT NOT NULL,
+            text         TEXT NOT NULL,
+            image_url    TEXT,
+            platforms    TEXT NOT NULL,
+            creds_json   TEXT NOT NULL,
+            scheduled_at TEXT NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'pending',
+            result_json  TEXT,
+            created_at   TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
     con.commit()
     con.close()
 
@@ -231,6 +245,78 @@ def revoke_access(campaign_id: int, granted_to: str):
     )
     con.commit()
     con.close()
+
+
+# ── Scheduled Posts ───────────────────────────────────────────────────────────
+
+def create_scheduled_post(owner: str, text: str, image_url: str,
+                          platforms: list, creds: dict, scheduled_at: str) -> int:
+    con = _con()
+    cur = con.execute(
+        "INSERT INTO scheduled_posts (owner, text, image_url, platforms, creds_json, scheduled_at) VALUES (?,?,?,?,?,?)",
+        (owner, text, image_url or "", json.dumps(platforms), json.dumps(creds), scheduled_at),
+    )
+    pid = cur.lastrowid
+    con.commit(); con.close()
+    return pid
+
+
+def list_scheduled_posts(owner: str, is_admin: bool) -> list[dict]:
+    con = _con(); con.row_factory = sqlite3.Row
+    if is_admin:
+        rows = con.execute(
+            "SELECT id,owner,text,platforms,scheduled_at,status,result_json,created_at FROM scheduled_posts ORDER BY scheduled_at DESC"
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT id,owner,text,platforms,scheduled_at,status,result_json,created_at FROM scheduled_posts WHERE owner=? ORDER BY scheduled_at DESC",
+            (owner,),
+        ).fetchall()
+    con.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["platforms"] = json.loads(d["platforms"] or "[]")
+        d["result"] = json.loads(d["result_json"] or "null")
+        del d["result_json"]
+        result.append(d)
+    return result
+
+
+def get_pending_posts(now_iso: str) -> list[dict]:
+    """Return pending posts whose scheduled_at <= now."""
+    con = _con(); con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT * FROM scheduled_posts WHERE status='pending' AND scheduled_at <= ?", (now_iso,)
+    ).fetchall()
+    con.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["platforms"] = json.loads(d["platforms"] or "[]")
+        d["creds"]     = json.loads(d["creds_json"] or "{}")
+        result.append(d)
+    return result
+
+
+def update_post_status(post_id: int, status: str, result: dict | None = None):
+    con = _con()
+    con.execute(
+        "UPDATE scheduled_posts SET status=?, result_json=? WHERE id=?",
+        (status, json.dumps(result) if result else None, post_id),
+    )
+    con.commit(); con.close()
+
+
+def cancel_scheduled_post(post_id: int, owner: str, is_admin: bool) -> bool:
+    con = _con()
+    if is_admin:
+        cur = con.execute("UPDATE scheduled_posts SET status='cancelled' WHERE id=? AND status='pending'", (post_id,))
+    else:
+        cur = con.execute("UPDATE scheduled_posts SET status='cancelled' WHERE id=? AND owner=? AND status='pending'", (post_id, owner))
+    changed = cur.rowcount > 0
+    con.commit(); con.close()
+    return changed
 
 
 def get_campaign_grants(campaign_id: int) -> list[dict]:

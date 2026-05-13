@@ -9,6 +9,7 @@ import { CampaignHistory } from './components/CampaignHistory'
 import { MagaLogo } from './components/MagaLogo'
 import { CredentialsPanel } from './components/CredentialsPanel'
 import { ReportsPanel } from './components/ReportsPanel'
+import { SchedulePanel } from './components/SchedulePanel'
 import type { AllCreds } from './components/CredentialsPanel'
 import { useAuth } from './hooks/useAuth'
 import type { ProductInput, AgentState, AgentName, SSEEvent } from './types'
@@ -36,7 +37,8 @@ export default function App() {
   const [showUsers, setShowUsers]       = useState(false)
   const [showHistory, setShowHistory]   = useState(false)
   const [showConfig, setShowConfig]     = useState(false)
-  const [showReports, setShowReports]   = useState(false)
+  const [showReports, setShowReports]     = useState(false)
+  const [showSchedule, setShowSchedule]   = useState(false)
   const [savedCreds, setSavedCreds]     = useState<AllCreds>({})
   const [allUsers, setAllUsers]         = useState<{ user: string; role: string }[]>([])
   const [loading, setLoading]           = useState(false)
@@ -206,7 +208,13 @@ export default function App() {
               </span>
             )}
             <button
-              onClick={() => { setShowReports(r => !r); setShowHistory(false); setShowConfig(false); setShowUsers(false) }}
+              onClick={() => { setShowSchedule(s => !s); setShowReports(false); setShowHistory(false); setShowConfig(false); setShowUsers(false) }}
+              className={`transition-colors ${showSchedule ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
+            >
+              agendamentos
+            </button>
+            <button
+              onClick={() => { setShowReports(r => !r); setShowHistory(false); setShowConfig(false); setShowUsers(false); setShowSchedule(false) }}
               className={`transition-colors ${showReports ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
             >
               relatórios
@@ -259,6 +267,10 @@ export default function App() {
           <PipelineHeader status={status} phase={phase} totalPhases={6} loading={loading} done={done} />
         )}
         {started && <PixelOffice agents={agents} />}
+
+        {showSchedule && (
+          <SchedulePanel authHeaders={authHeaders} />
+        )}
 
         {showReports && (
           <ReportsPanel authHeaders={authHeaders} />

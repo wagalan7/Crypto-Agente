@@ -16,7 +16,9 @@ from auth import (authenticate, require_auth, require_admin,
                    verify_token)
 from db import (init_db, db_seed_users, save_campaign, list_campaigns, get_campaign,
                 grant_access, revoke_access, get_campaign_grants,
-                save_credential, get_credentials, delete_platform_credentials)
+                save_credential, get_credentials, delete_platform_credentials,
+                create_scheduled_post, list_scheduled_posts,
+                get_pending_posts, update_post_status, cancel_scheduled_post)
 from services.social_publisher import (
     publish_facebook, publish_instagram, publish_twitter, publish_webhook, publish_google_ads
 )
@@ -35,6 +37,51 @@ app.add_middleware(
 )
 
 init_db()
+
+
+# ── Scheduled Posts Background Worker ────────────────────────
+async def _scheduled_worker():
+    """Runs every 60s, publishes posts whose scheduled_at has passed."""
+    from datetime import datetime, timezone
+    await asyncio.sleep(10)   # brief startup delay
+    while True:
+        try:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+            posts = get_pending_posts(now)
+            for post in posts:
+                update_post_status(post["id"], "publishing")
+                tasks = []
+                creds = post["creds"]
+                platforms = post["platforms"]
+                text  = post["text"]
+                img   = post.get("image_url", "")
+                if "facebook" in platforms and creds.get("fb_page_id") and creds.get("fb_token"):
+                    tasks.append(publish_facebook(text, creds["fb_page_id"], creds["fb_token"]))
+                if "instagram" in platforms and creds.get("ig_user_id") and creds.get("ig_token") and img:
+                    tasks.append(publish_instagram(text, img, creds["ig_user_id"], creds["ig_token"]))
+                if "twitter" in platforms and creds.get("tw_api_key"):
+                    tasks.append(publish_twitter(text, "", creds["tw_api_key"],
+                                                  creds.get("tw_api_secret",""),
+                                                  creds.get("tw_access_token",""),
+                                                  creds.get("tw_access_secret","")))
+                if "webhook" in platforms and creds.get("webhook_url"):
+                    tasks.append(publish_webhook({"text": text, "image_url": img}, creds["webhook_url"]))
+                if tasks:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    result_data = [r.__dict__ if hasattr(r, "__dict__") else {"error": str(r)} for r in results]
+                    all_ok = all(r.get("success") for r in result_data if isinstance(r, dict))
+                    update_post_status(post["id"], "published" if all_ok else "failed", {"results": result_data})
+                else:
+                    update_post_status(post["id"], "failed", {"error": "Nenhuma plataforma configurada"})
+        except Exception as e:
+            print(f"[scheduler] erro: {e}", flush=True)
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(_scheduled_worker())
+
 
 # Seed users from USERS_JSON env var or admin defaults (only if DB is empty)
 _seed: list[dict] = []
@@ -386,6 +433,51 @@ async def revoke_campaign(campaign_id: int, username: str, user: str = Depends(r
 async def list_grants(campaign_id: int, user: str = Depends(require_auth)):
     require_admin(user)
     return get_campaign_grants(campaign_id)
+
+
+# ── Schedule ─────────────────────────────────────────────────
+
+class ScheduleRequest(BaseModel):
+    text: str
+    image_url: Optional[str] = None
+    platforms: list[str]
+    scheduled_at: str          # ISO datetime, e.g. "2025-05-13T14:30"
+    # credentials snapshot
+    fb_page_id: Optional[str] = None
+    fb_token: Optional[str] = None
+    ig_user_id: Optional[str] = None
+    ig_token: Optional[str] = None
+    tw_api_key: Optional[str] = None
+    tw_api_secret: Optional[str] = None
+    tw_access_token: Optional[str] = None
+    tw_access_secret: Optional[str] = None
+    webhook_url: Optional[str] = None
+
+@app.post("/schedule")
+async def create_schedule(req: ScheduleRequest, user: str = Depends(require_auth)):
+    creds = {
+        "fb_page_id": req.fb_page_id, "fb_token": req.fb_token,
+        "ig_user_id": req.ig_user_id, "ig_token": req.ig_token,
+        "tw_api_key": req.tw_api_key, "tw_api_secret": req.tw_api_secret,
+        "tw_access_token": req.tw_access_token, "tw_access_secret": req.tw_access_secret,
+        "webhook_url": req.webhook_url,
+    }
+    pid = create_scheduled_post(user, req.text, req.image_url or "",
+                                req.platforms, creds, req.scheduled_at)
+    return {"id": pid, "scheduled_at": req.scheduled_at}
+
+@app.get("/schedule")
+async def get_schedule(user: str = Depends(require_auth)):
+    is_admin = get_user_role(user) == "admin"
+    return list_scheduled_posts(user, is_admin)
+
+@app.delete("/schedule/{post_id}")
+async def delete_schedule(post_id: int, user: str = Depends(require_auth)):
+    is_admin = get_user_role(user) == "admin"
+    ok = cancel_scheduled_post(post_id, user, is_admin)
+    if not ok:
+        raise HTTPException(404, detail="Post não encontrado ou já publicado.")
+    return {"ok": True}
 
 
 # ── Publish ───────────────────────────────────────────────────
