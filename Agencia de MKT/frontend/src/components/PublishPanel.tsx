@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import type { AllCreds } from './CredentialsPanel'
 import { MetricsPanel } from './MetricsPanel'
+import type { ProductInput } from '../types/index'
 
 interface Credentials {
   fb_page_id: string; fb_token: string
@@ -25,6 +26,8 @@ interface Props {
   userBudget: string
   savedCreds: AllCreds
   authHeaders: Record<string, string>
+  productInput: ProductInput | null
+  allAgentOutputs: Record<string, string>
 }
 
 const PLATFORMS = [
@@ -139,7 +142,7 @@ function extractBudgetFromAds(adsOutput: string): Record<string, string> {
   return result
 }
 
-export function PublishPanel({ publisherOutput, copyOutput, socialOutput, designOutput, adsOutput, userBudget, savedCreds, authHeaders }: Props) {
+export function PublishPanel({ publisherOutput, copyOutput, socialOutput, designOutput, adsOutput, userBudget, savedCreds, authHeaders, productInput, allAgentOutputs }: Props) {
   const [open, setOpen]             = useState(true)
   const [budgetConfirmed, setBudget] = useState(false)
   const [creds, setCreds]           = useState<Credentials>(EMPTY)
@@ -272,6 +275,27 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
           url: r.url,
         }))
       if (postsForMetrics.length > 0) setPublishedPosts(postsForMetrics)
+
+      // Save to campaign history only if at least one platform succeeded
+      const successfulPlatforms = apiResults.filter(r => r.success).map(r => r.platform)
+      if (successfulPlatforms.length > 0 && productInput) {
+        const resultData: Record<string, string> = {
+          ...allAgentOutputs,
+          _published_platforms: JSON.stringify(successfulPlatforms),
+          _publish_results: JSON.stringify(apiResults),
+        }
+        fetch('/campaigns', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({
+            produto: productInput.produto,
+            input_data: productInput,
+            result_data: resultData,
+          }),
+        })
+          .then(r => { if (r.ok) setSavedToHistory(true) })
+          .catch(() => {})
+      }
     } catch (e) {
       setResults([{ platform: 'erro', success: false, error: String(e) }])
     }
@@ -281,6 +305,7 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
   const [scheduleAt, setScheduleAt]     = useState('')
   const [scheduling, setScheduling]     = useState(false)
   const [scheduleResult, setScheduleResult] = useState<string | null>(null)
+  const [savedToHistory, setSavedToHistory] = useState(false)
 
   const handleSchedule = async () => {
     const errors = validateCredentials()
@@ -637,6 +662,13 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
                   )}
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* ── Salvo no histórico ── */}
+          {savedToHistory && (
+            <div className="flex items-center gap-2 px-3 py-2 bg-violet-900/20 border border-violet-800/50 rounded-lg text-[11px] text-violet-300">
+              <span>✓</span> Campanha salva no histórico com as plataformas publicadas.
             </div>
           )}
 

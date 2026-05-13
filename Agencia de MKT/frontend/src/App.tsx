@@ -100,21 +100,7 @@ export default function App() {
       .catch(() => {})
   }, [isAdmin, token])
 
-  // Auto-save campaign when done
-  useEffect(() => {
-    if (!done || !lastInput || !currentUser) return
-    const result: Record<string, string> = {}
-    AGENT_NAMES.forEach(n => { if (agents[n].output) result[n] = agents[n].output })
-    fetch('/campaigns', {
-      method: 'POST',
-      headers: authHeaders,
-      body: JSON.stringify({
-        produto: lastInput.produto,
-        input_data: lastInput,
-        result_data: result,
-      }),
-    }).catch(() => {})
-  }, [done])   // intentionally only trigger on done change
+  // Campaigns are saved only when published — see PublishPanel
 
   const updateAgent = useCallback((name: AgentName, patch: Partial<AgentState>) =>
     setAgents(prev => ({ ...prev, [name]: { ...prev[name], ...patch } })), [])
@@ -350,6 +336,10 @@ export default function App() {
             userBudget={lastInput?.orcamento ?? ''}
             savedCreds={savedCreds}
             authHeaders={authHeaders}
+            productInput={lastInput}
+            allAgentOutputs={Object.fromEntries(
+              AGENT_NAMES.map(n => [n, agents[n].output]).filter(([, v]) => v)
+            )}
           />
         )}
       </main>

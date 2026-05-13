@@ -214,18 +214,30 @@ def list_campaigns(user: str, is_admin: bool) -> list[dict]:
     con.row_factory = sqlite3.Row
     if is_admin:
         rows = con.execute(
-            "SELECT id, owner, produto, created_at FROM campaigns ORDER BY created_at DESC"
+            "SELECT id, owner, produto, created_at, result_json FROM campaigns ORDER BY created_at DESC"
         ).fetchall()
     else:
         rows = con.execute("""
-            SELECT DISTINCT c.id, c.owner, c.produto, c.created_at
+            SELECT DISTINCT c.id, c.owner, c.produto, c.created_at, c.result_json
             FROM campaigns c
             LEFT JOIN campaign_grants g ON g.campaign_id = c.id AND g.granted_to = ?
             WHERE c.owner = ? OR g.granted_to IS NOT NULL
             ORDER BY c.created_at DESC
         """, (user, user)).fetchall()
     con.close()
-    return [dict(r) for r in rows]
+    result = []
+    for r in rows:
+        d = dict(r)
+        # Parse published_platforms from result_json without loading full content
+        try:
+            rj = json.loads(d.get("result_json") or "{}")
+            raw = rj.get("_published_platforms", "[]")
+            d["published_platforms"] = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            d["published_platforms"] = []
+        del d["result_json"]
+        result.append(d)
+    return result
 
 
 def get_campaign(campaign_id: int, user: str, is_admin: bool) -> dict | None:
