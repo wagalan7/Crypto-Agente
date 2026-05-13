@@ -443,6 +443,54 @@ async def publish(req: PublishRequest, user: str = Depends(require_auth)):
 
 # ── Reports ───────────────────────────────────────────────────
 
+class OptimizeRequest(BaseModel):
+    campaigns: list[dict]   # campaign rows from /reports/google-ads
+    platform:  str = "google"
+
+@app.post("/reports/optimize")
+async def optimize_campaigns(req: OptimizeRequest, user: str = Depends(require_auth)):
+    """Single lightweight AI call to generate optimization suggestions from campaign data."""
+    from openai import AsyncOpenAI
+    if not req.campaigns:
+        raise HTTPException(400, detail="Nenhuma campanha para analisar.")
+
+    # Build compact summary — avoid sending full raw data
+    lines = []
+    for c in req.campaigns[:10]:   # max 10 campaigns
+        if c.get("error"):
+            continue
+        lines.append(
+            f"- {c.get('campaign_name','?')[:40]} | status={c.get('status','?')} "
+            f"| impressões={c.get('impressions',0)} | cliques={c.get('clicks',0)} "
+            f"| CTR={c.get('ctr',0)}% | CPC=R${c.get('avg_cpc',0)} "
+            f"| gasto=R${c.get('cost',0)} | conversões={c.get('conversions',0)}"
+        )
+    if not lines:
+        raise HTTPException(400, detail="Sem dados válidos para analisar.")
+
+    summary = "\n".join(lines)
+    prompt = (
+        f"Analise estas campanhas Google Ads e dê 5 sugestões práticas de otimização em PT-BR. "
+        f"Seja direto, uma linha por sugestão com emoji. Dados:\n{summary}"
+    )
+
+    groq = AsyncOpenAI(
+        api_key=os.getenv("GROQ_API_KEY", ""),
+        base_url="https://api.groq.com/openai/v1",
+    )
+    resp = await groq.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        max_tokens=300,
+        messages=[
+            {"role": "system", "content": "Você é um especialista em Google Ads. Responda em PT-BR, conciso."},
+            {"role": "user",   "content": prompt},
+        ],
+    )
+    suggestions = resp.choices[0].message.content or "Sem sugestões geradas."
+    return {"suggestions": suggestions, "tokens_used": resp.usage.total_tokens if resp.usage else 0}
+
+
+
 @app.get("/reports/google-ads")
 async def report_google_ads(
     date_range: str = "LAST_30_DAYS",

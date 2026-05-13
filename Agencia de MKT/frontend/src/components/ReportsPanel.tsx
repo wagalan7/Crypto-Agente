@@ -51,11 +51,14 @@ function fmtBRL(n: number) {
 export function ReportsPanel({ authHeaders }: Props) {
   const [tab, setTab]               = useState<'google' | 'facebook'>('google')
   const [dateRange, setDateRange]   = useState('LAST_30_DAYS')
-  const [loading, setLoading]       = useState(false)
-  const [campaigns, setCampaigns]   = useState<CampaignRow[]>([])
-  const [fbInsights, setFbInsights] = useState<FbInsights | null>(null)
-  const [error, setError]           = useState('')
-  const [fetched, setFetched]       = useState(false)
+  const [loading, setLoading]           = useState(false)
+  const [campaigns, setCampaigns]       = useState<CampaignRow[]>([])
+  const [fbInsights, setFbInsights]     = useState<FbInsights | null>(null)
+  const [error, setError]               = useState('')
+  const [fetched, setFetched]           = useState(false)
+  const [optimizing, setOptimizing]     = useState(false)
+  const [suggestions, setSuggestions]   = useState('')
+  const [tokensUsed, setTokensUsed]     = useState(0)
 
   const fetchGoogle = useCallback(async (range: string) => {
     setLoading(true)
@@ -97,6 +100,26 @@ export function ReportsPanel({ authHeaders }: Props) {
     if (tab === 'google') fetchGoogle(dateRange)
     else fetchFacebook()
   }
+
+  const handleOptimize = useCallback(async () => {
+    if (!campaigns.length) return
+    setOptimizing(true)
+    setSuggestions('')
+    try {
+      const r = await fetch('/reports/optimize', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ campaigns, platform: 'google' }),
+      })
+      const d = await r.json()
+      if (!r.ok) { setError(d.detail || 'Erro ao otimizar'); return }
+      setSuggestions(d.suggestions || '')
+      setTokensUsed(d.tokens_used || 0)
+    } catch (e) {
+      setError(String(e))
+    }
+    setOptimizing(false)
+  }, [campaigns, authHeaders])
 
   // Totals
   const totals = campaigns.reduce((acc, c) => ({
@@ -216,9 +239,38 @@ export function ReportsPanel({ authHeaders }: Props) {
                 </tbody>
               </table>
             </div>
-            <p className="text-[9px] text-gray-600">
-              Período: {DATE_RANGES.find(d => d.value === dateRange)?.label} · {campaigns.length} campanha{campaigns.length !== 1 ? 's' : ''}
-            </p>
+            <div className="flex items-center justify-between">
+              <p className="text-[9px] text-gray-600">
+                Período: {DATE_RANGES.find(d => d.value === dateRange)?.label} · {campaigns.length} campanha{campaigns.length !== 1 ? 's' : ''}
+              </p>
+              <button
+                onClick={handleOptimize}
+                disabled={optimizing}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold
+                  bg-gradient-to-r from-violet-700 to-blue-700 hover:from-violet-600 hover:to-blue-600
+                  disabled:opacity-50 text-white transition-all">
+                {optimizing
+                  ? <><span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin"/>Analisando...</>
+                  : '✦ Otimizar com IA'}
+              </button>
+            </div>
+
+            {/* AI Suggestions */}
+            {suggestions && (
+              <div className="bg-violet-950/30 border border-violet-800/50 rounded-xl p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs font-bold text-violet-300 flex items-center gap-1.5">
+                    <span>✦</span> Sugestões de Otimização
+                  </p>
+                  <span className="text-[9px] text-gray-600">{tokensUsed} tokens usados</span>
+                </div>
+                <div className="space-y-1.5">
+                  {suggestions.split('\n').filter(l => l.trim()).map((line, i) => (
+                    <p key={i} className="text-[11px] text-gray-300 leading-relaxed">{line}</p>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
