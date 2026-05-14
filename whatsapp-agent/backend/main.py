@@ -361,6 +361,19 @@ def clear_conversation(slug: str, phone: str):
     return {"status": "cleared"}
 
 
+@app.patch("/admin/{slug}/fix-phone")
+def fix_phone(slug: str, old_phone: str, new_phone: str):
+    """Corrige número de telefone em appointments, conversations e agent_paused."""
+    tenant = _get_tenant(slug)
+    tid = tenant["id"]
+    with db.get_conn() as conn:
+        a = conn.execute("UPDATE appointments SET phone=? WHERE tenant_id=? AND phone=?", (new_phone, tid, old_phone)).rowcount
+        c = conn.execute("UPDATE conversations SET phone=? WHERE tenant_id=? AND phone=?", (new_phone, tid, old_phone)).rowcount
+        p = conn.execute("UPDATE agent_paused SET phone=? WHERE tenant_id=? AND phone=?", (new_phone, tid, old_phone)).rowcount
+        pt = conn.execute("UPDATE patients SET phone=? WHERE tenant_id=? AND phone=?", (new_phone, tid, old_phone)).rowcount
+    return {"appointments": a, "conversations": c, "paused": p, "patients": pt}
+
+
 @app.delete("/admin/{slug}/conversations/all")
 def clear_all_conversations(slug: str):
     """Limpa TODO o histórico de conversas e pausa do tenant."""
