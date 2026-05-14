@@ -22,6 +22,52 @@
 <!-- Toast container -->
 <div id="toasts" class="fixed top-4 right-4 z-50 space-y-2 max-w-xs"></div>
 
+<!-- Modal Boas-vindas (primeiro acesso) -->
+<div id="modal-welcome" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden">
+    <div class="bg-brand px-6 py-5 text-white text-center">
+      <div class="text-4xl mb-2">🎉</div>
+      <h2 class="text-xl font-bold">Bem-vinda ao Consultório Inteligente!</h2>
+      <p class="text-pink-100 text-sm mt-1">Seu assistente de IA está pronto para começar</p>
+    </div>
+    <div class="p-6 space-y-4">
+      <p class="text-gray-700 text-sm text-center">Antes de usar o sistema, configure sua conta em <strong>~20 minutos</strong> seguindo o guia de primeiros passos.</p>
+      <div class="space-y-3">
+        <a href="/static/primeiros_passos.pdf" target="_blank"
+          class="flex items-center gap-3 w-full bg-brand text-white px-4 py-3 rounded-xl font-semibold text-sm hover:opacity-90 transition">
+          <span class="text-2xl">🚀</span>
+          <div class="text-left">
+            <div>Guia de Primeiros Passos</div>
+            <div class="text-pink-200 text-xs font-normal">Z-API, agenda, configuração — comece aqui</div>
+          </div>
+          <span class="ml-auto">↓</span>
+        </a>
+        <a href="/static/manual.pdf" target="_blank"
+          class="flex items-center gap-3 w-full bg-gray-50 border border-gray-200 text-gray-700 px-4 py-3 rounded-xl font-semibold text-sm hover:bg-gray-100 transition">
+          <span class="text-2xl">📖</span>
+          <div class="text-left">
+            <div>Manual do Sistema</div>
+            <div class="text-gray-400 text-xs font-normal">Todas as funcionalidades em detalhes</div>
+          </div>
+          <span class="ml-auto text-gray-400">↓</span>
+        </a>
+      </div>
+      <div class="pt-2 border-t border-gray-100">
+        <p class="text-xs text-gray-400 text-center mb-3">Dúvidas? Fale com o suporte:</p>
+        <a href="https://wa.me/5511968439527" target="_blank"
+          class="flex items-center justify-center gap-2 text-sm text-green-600 font-medium hover:underline">
+          <svg viewBox="0 0 24 24" class="w-4 h-4 fill-current"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347z"/><path d="M12 0C5.373 0 0 5.373 0 12c0 2.124.558 4.118 1.532 5.849L.057 23.486a.5.5 0 0 0 .614.614l5.637-1.475A11.95 11.95 0 0 0 12 24c6.627 0 12-5.373 12-12S18.627 0 12 0zm0 22c-1.932 0-3.742-.518-5.295-1.424l-.38-.222-3.944 1.033 1.033-3.944-.222-.38A9.956 9.956 0 0 1 2 12C2 6.477 6.477 2 12 2s10 4.477 10 10-4.477 10-10 10z"/></svg>
+          (11) 96843-9527
+        </a>
+      </div>
+      <button onclick="closeWelcome()"
+        class="w-full text-gray-400 text-xs hover:text-gray-600 transition mt-1">
+        Já configurei, ir para o painel →
+      </button>
+    </div>
+  </div>
+</div>
+
 <!-- Header -->
 <header class="bg-brand shadow sticky top-0 z-40">
   <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
@@ -291,6 +337,37 @@
         <div id="billing-logs" class="overflow-x-auto">
           <p class="text-xs text-gray-400 text-center py-3">Carregando...</p>
         </div>
+      </div>
+    </div>
+
+    <!-- Documentação -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-3 mb-4">
+        <span class="text-2xl">📚</span>
+        <div>
+          <h3 class="font-semibold text-gray-800 text-sm">Documentação</h3>
+          <p class="text-xs text-gray-500">Guias e manuais do sistema</p>
+        </div>
+      </div>
+      <div class="space-y-2">
+        <a href="/static/primeiros_passos.pdf" target="_blank"
+          class="flex items-center gap-3 w-full border border-brand/30 bg-pink-50 text-brand px-4 py-3 rounded-xl text-sm font-medium hover:bg-pink-100 transition">
+          <span class="text-xl">🚀</span>
+          <div class="text-left flex-1">
+            <div class="font-semibold">Guia de Primeiros Passos</div>
+            <div class="text-xs text-pink-400 font-normal">Z-API, agenda, configuração inicial</div>
+          </div>
+          <span class="text-xs text-brand font-semibold">Baixar PDF</span>
+        </a>
+        <a href="/static/manual.pdf" target="_blank"
+          class="flex items-center gap-3 w-full border border-gray-200 bg-gray-50 text-gray-700 px-4 py-3 rounded-xl text-sm font-medium hover:bg-gray-100 transition">
+          <span class="text-xl">📖</span>
+          <div class="text-left flex-1">
+            <div class="font-semibold">Manual do Sistema</div>
+            <div class="text-xs text-gray-400 font-normal">Todas as funcionalidades em detalhes</div>
+          </div>
+          <span class="text-xs text-gray-500 font-semibold">Baixar PDF</span>
+        </a>
       </div>
     </div>
 
@@ -997,10 +1074,23 @@ function loadBillingLogs() {
   });
 }
 
+// ── Boas-vindas (primeiro acesso) ─────────────────────────────────────────────
+const WELCOME_KEY = "ci_welcome_done_{{ tenant.slug }}";
+function closeWelcome() {
+  document.getElementById("modal-welcome").classList.add("hidden");
+  localStorage.setItem(WELCOME_KEY, "1");
+}
+function checkWelcome() {
+  if (!localStorage.getItem(WELCOME_KEY)) {
+    document.getElementById("modal-welcome").classList.remove("hidden");
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 connectSSE();
 loadAgenda();
 initBillingMonth();
+checkWelcome();
 </script>
 </body>
 </html>
