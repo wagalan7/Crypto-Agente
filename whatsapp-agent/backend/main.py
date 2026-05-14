@@ -63,6 +63,13 @@ def _get_tenant(slug: str) -> dict:
 
 async def _handle_message(tenant: dict, phone: str, text: str):
     phone = "".join(c for c in phone if c.isdigit())  # normaliza sempre
+
+    # ── Verificar se o consultório está ativo (assinatura em dia) ────────────────
+    status = tenant.get("status", "active")
+    if status == "suspended" and not db.is_tenant_exempt(tenant):
+        logger.warning(f"[{tenant['slug']}] Consultório suspenso — mensagem de {phone} ignorada")
+        return
+
     # Verificar se o agente está pausado para este contato
     if db.is_agent_paused(tenant["id"], phone):
         logger.info(f"[{tenant['slug']}][{phone}] Agente pausado — mensagem ignorada")
@@ -413,6 +420,11 @@ def dashboard(slug: str, request: Request, token: str = ""):
     tenant = _get_tenant(slug)
     if not tenant.get("dashboard_token") or tenant["dashboard_token"] != token:
         raise HTTPException(status_code=403, detail="Token inválido.")
+    # Redirecionar consultório suspenso para página de reativação
+    status = tenant.get("status", "active")
+    if status == "suspended" and not db.is_tenant_exempt(tenant):
+        setup_token = tenant.get("setup_token", "")
+        return RedirectResponse(f"/onboarding/pagamento?token={setup_token}&suspended=1", status_code=303)
     return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token})
 
 
@@ -947,7 +959,7 @@ def google_disconnect(request: Request):
 # ── Pagamento ──────────────────────────────────────────────────────────────────
 
 @app.get("/onboarding/pagamento", response_class=HTMLResponse)
-def payment_page(request: Request, token: str = "", cancelled: int = 0):
+def payment_page(request: Request, token: str = "", cancelled: int = 0, suspended: int = 0):
     tenant = db.get_tenant_by_setup_token(token)
     if not tenant:
         raise HTTPException(status_code=404, detail="Link inválido.")
@@ -956,6 +968,7 @@ def payment_page(request: Request, token: str = "", cancelled: int = 0):
         "setup_token": token,
         "tenant": tenant,
         "cancelled": bool(cancelled),
+        "suspended": bool(suspended),
     })
 
 

@@ -82,7 +82,6 @@ def handle_webhook(payload: bytes, sig_header: str) -> dict:
     elif event_type in ("customer.subscription.deleted", "customer.subscription.paused"):
         subscription = event["data"]["object"]
         sub_id = subscription["id"]
-        # Buscar tenant pelo subscription_id
         tenant = _get_tenant_by_stripe_sub(sub_id)
         if tenant:
             if db.is_tenant_exempt(tenant):
@@ -90,6 +89,7 @@ def handle_webhook(payload: bytes, sig_header: str) -> dict:
             else:
                 db.update_tenant(tenant["slug"], status="suspended")
                 logger.info(f"[stripe] Tenant {tenant['slug']} suspenso — sub={sub_id}")
+                _notify_suspended(tenant)
 
     elif event_type == "customer.subscription.resumed":
         subscription = event["data"]["object"]
@@ -98,8 +98,54 @@ def handle_webhook(payload: bytes, sig_header: str) -> dict:
         if tenant:
             db.update_tenant(tenant["slug"], status="active")
             logger.info(f"[stripe] Tenant {tenant['slug']} reativado — sub={sub_id}")
+            _notify_reactivated(tenant)
 
     return {"received": True}
+
+
+def _notify_suspended(tenant: dict):
+    """Envia WhatsApp para a psicóloga avisando que o acesso foi suspenso."""
+    import asyncio, config as _cfg
+    psy_phone = tenant.get("psychologist_phone", "")
+    setup_token = tenant.get("setup_token", "")
+    if not psy_phone:
+        return
+    msg = (
+        f"⚠️ *Consultório Inteligente — Acesso suspenso*\n\n"
+        f"Olá! O acesso do consultório *{tenant['name']}* foi suspenso por falta de pagamento.\n\n"
+        f"O agente está pausado e não responderá seus pacientes até a assinatura ser renovada.\n\n"
+        f"Para reativar, acesse:\n"
+        f"{_cfg.BASE_URL}/onboarding/pagamento?token={setup_token}\n\n"
+        f"Dúvidas? Fale com o suporte: wa.me/5511968439527"
+    )
+    try:
+        import whatsapp_service as wa_svc
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(wa_svc.send_message(tenant, psy_phone, msg))
+        loop.close()
+    except Exception as e:
+        logger.warning(f"[stripe] Falha ao notificar suspensão para {psy_phone}: {e}")
+
+
+def _notify_reactivated(tenant: dict):
+    """Envia WhatsApp para a psicóloga avisando que o acesso foi reativado."""
+    import asyncio, config as _cfg
+    psy_phone = tenant.get("psychologist_phone", "")
+    if not psy_phone:
+        return
+    msg = (
+        f"✅ *Consultório Inteligente — Acesso reativado!*\n\n"
+        f"Ótimas notícias! O acesso do consultório *{tenant['name']}* foi reativado com sucesso.\n\n"
+        f"O agente já está respondendo seus pacientes normalmente. 🎉\n\n"
+        f"Acesse seu painel: {_cfg.BASE_URL}/dashboard/{tenant['slug']}?token={tenant.get('dashboard_token','')}"
+    )
+    try:
+        import whatsapp_service as wa_svc
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(wa_svc.send_message(tenant, psy_phone, msg))
+        loop.close()
+    except Exception as e:
+        logger.warning(f"[stripe] Falha ao notificar reativação para {psy_phone}: {e}")
 
 
 def _get_tenant_by_stripe_sub(subscription_id: str) -> dict | None:
