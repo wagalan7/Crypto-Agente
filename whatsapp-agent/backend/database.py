@@ -370,6 +370,7 @@ def get_appointments_for_confirmation(tenant_id: int) -> list[dict]:
             """SELECT * FROM appointments
                WHERE tenant_id = ?
                  AND confirmation_sent = 0
+                 AND cancelled = 0
                  AND scheduled_at > ?
                  AND scheduled_at <= ?
                ORDER BY scheduled_at""",
@@ -399,6 +400,7 @@ def get_appointments_today_unconfirmed(tenant_id: int) -> list[dict]:
                  AND date(scheduled_at) = ?
                  AND confirmed = 0
                  AND followup_sent = 0
+                 AND cancelled = 0
                  AND scheduled_at > ?
                ORDER BY scheduled_at""",
             (tenant_id, today_str, now_str),
