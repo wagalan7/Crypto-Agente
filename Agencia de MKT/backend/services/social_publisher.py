@@ -14,7 +14,17 @@ class PublishResult:
     error: Optional[str] = None
 
 
+def _sanitize_text(text: str) -> str:
+    """Remove non-printable/invisible characters that Meta API rejects."""
+    import unicodedata
+    cleaned = "".join(
+        c for c in text
+        if unicodedata.category(c) not in ("Cc", "Cf") or c in ("\n", "\t")
+    )
+    return cleaned.strip()
+
 async def publish_facebook(text: str, page_id: str, token: str) -> PublishResult:
+    text = _sanitize_text(text)
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
@@ -36,6 +46,8 @@ async def publish_facebook(text: str, page_id: str, token: str) -> PublishResult
 
 
 async def publish_instagram(caption: str, image_url: str, ig_user_id: str, token: str) -> PublishResult:
+    caption = _sanitize_text(caption)
+    image_url = image_url.strip()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             container = await client.post(
