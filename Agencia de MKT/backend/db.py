@@ -99,6 +99,16 @@ def init_db():
             run_at TEXT DEFAULT (datetime('now','localtime'))
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS client_profiles (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner        TEXT NOT NULL,
+            client_name  TEXT NOT NULL,
+            credentials  TEXT NOT NULL DEFAULT '{}',
+            created_at   TEXT DEFAULT (datetime('now','localtime')),
+            updated_at   TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
     con.commit()
 
     # One-time migrations
@@ -496,3 +506,66 @@ def get_campaign_grants(campaign_id: int) -> list[dict]:
     ).fetchall()
     con.close()
     return [dict(r) for r in rows]
+
+
+# ── Client Profiles ───────────────────────────────────────────────────────────
+
+def list_client_profiles(owner: str, is_admin: bool) -> list[dict]:
+    con = _con(); con.row_factory = sqlite3.Row
+    if is_admin:
+        rows = con.execute(
+            "SELECT * FROM client_profiles ORDER BY client_name"
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT * FROM client_profiles WHERE owner=? ORDER BY client_name",
+            (owner,)
+        ).fetchall()
+    con.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d['credentials'] = json.loads(d.get('credentials') or '{}')
+        result.append(d)
+    return result
+
+
+def create_client_profile(owner: str, client_name: str, credentials: dict) -> dict:
+    con = _con()
+    cur = con.execute(
+        "INSERT INTO client_profiles (owner, client_name, credentials) VALUES (?,?,?)",
+        (owner, client_name, json.dumps(credentials))
+    )
+    pid = cur.lastrowid
+    con.commit(); con.close()
+    return {"id": pid, "owner": owner, "client_name": client_name, "credentials": credentials}
+
+
+def update_client_profile(profile_id: int, owner: str, is_admin: bool,
+                          client_name: str | None = None,
+                          credentials: dict | None = None) -> bool:
+    con = _con()
+    profile = con.execute("SELECT * FROM client_profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile:
+        con.close(); return False
+    if not is_admin and profile[1] != owner:   # owner column
+        con.close(); return False
+    name  = client_name  if client_name  is not None else profile[2]
+    creds = json.dumps(credentials) if credentials is not None else profile[3]
+    con.execute(
+        "UPDATE client_profiles SET client_name=?, credentials=?, updated_at=datetime('now','localtime') WHERE id=?",
+        (name, creds, profile_id)
+    )
+    con.commit(); con.close()
+    return True
+
+
+def delete_client_profile(profile_id: int, owner: str, is_admin: bool) -> bool:
+    con = _con()
+    if is_admin:
+        cur = con.execute("DELETE FROM client_profiles WHERE id=?", (profile_id,))
+    else:
+        cur = con.execute("DELETE FROM client_profiles WHERE id=? AND owner=?", (profile_id, owner))
+    changed = cur.rowcount > 0
+    con.commit(); con.close()
+    return changed

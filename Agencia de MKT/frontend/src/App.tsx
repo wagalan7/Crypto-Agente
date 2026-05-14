@@ -12,6 +12,7 @@ import { ReportsPanel } from './components/ReportsPanel'
 import { SchedulePanel } from './components/SchedulePanel'
 import { AlertsPanel } from './components/AlertsPanel'
 import { ClientsPanel } from './components/ClientsPanel'
+import { ClientProfilesPanel } from './components/ClientProfilesPanel'
 import type { AllCreds } from './components/CredentialsPanel'
 import { useAuth } from './hooks/useAuth'
 import type { ProductInput, AgentState, AgentName, SSEEvent } from './types'
@@ -43,6 +44,7 @@ export default function App() {
   const [showSchedule, setShowSchedule]   = useState(false)
   const [showAlerts, setShowAlerts]       = useState(false)
   const [showClients, setShowClients]     = useState(false)
+  const [showProfiles, setShowProfiles]   = useState(false)
   const [unreadCount, setUnreadCount]     = useState(0)
   const [savedCreds, setSavedCreds]     = useState<AllCreds>({})
   const [allUsers, setAllUsers]         = useState<{ user: string; role: string }[]>([])
@@ -248,10 +250,16 @@ export default function App() {
               credenciais
             </button>
             <button
-              onClick={() => { setShowClients(c => !c); setShowUsers(false); setShowHistory(false); setShowConfig(false); setShowAlerts(false) }}
+              onClick={() => { setShowClients(c => !c); setShowUsers(false); setShowHistory(false); setShowConfig(false); setShowAlerts(false); setShowProfiles(false) }}
               className={`transition-colors ${showClients ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
             >
               clientes
+            </button>
+            <button
+              onClick={() => { setShowProfiles(p => !p); setShowClients(false); setShowUsers(false); setShowHistory(false); setShowConfig(false); setShowAlerts(false) }}
+              className={`transition-colors ${showProfiles ? 'text-violet-400' : 'text-gray-600 hover:text-gray-400'}`}
+            >
+              perfis
             </button>
             {isAdmin && (
               <button
@@ -319,6 +327,9 @@ export default function App() {
         )}
         {showClients && (
           <ClientsPanel authHeaders={authHeaders} isAdmin={isAdmin} currentUser={currentUser} />
+        )}
+        {showProfiles && (
+          <ClientProfilesPanel authHeaders={authHeaders} />
         )}
         {showUsers && isAdmin && (
           <UsersPanel authHeaders={authHeaders} currentUser={currentUser} />

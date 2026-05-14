@@ -1,7 +1,14 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import type { AllCreds } from './CredentialsPanel'
 import { MetricsPanel } from './MetricsPanel'
 import type { ProductInput } from '../types/index'
+
+interface ClientProfile {
+  id: number
+  owner: string
+  client_name: string
+  credentials: Record<string, string>
+}
 
 interface Credentials {
   fb_page_id: string; fb_token: string
@@ -184,6 +191,31 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
   const [fbAdsObjective, setFbAdsObjective] = useState('LINK_CLICKS')
   const [fbAdsFinalUrl, setFbAdsFinalUrl]   = useState('')
   const [uploading, setUploading]     = useState(false)
+  const [profiles, setProfiles]       = useState<ClientProfile[]>([])
+  const [selectedProfile, setSelectedProfile] = useState<number | null>(null)  // null = minha conta
+
+  const loadProfiles = useCallback(async () => {
+    try {
+      const r = await fetch('/client-profiles', { headers: authHeaders })
+      if (r.ok) setProfiles(await r.json())
+    } catch { /* ignore */ }
+  }, [authHeaders])
+
+  useEffect(() => { loadProfiles() }, [loadProfiles])
+
+  const applyProfile = (profileId: number | null) => {
+    setSelectedProfile(profileId)
+    if (profileId === null) {
+      // Reset to own saved creds
+      const merged: Partial<Credentials> = {}
+      Object.values(savedCreds).forEach(pc => Object.assign(merged, pc))
+      setCreds(prev => ({ ...EMPTY, ...merged }))
+      return
+    }
+    const profile = profiles.find(p => p.id === profileId)
+    if (!profile) return
+    setCreds(prev => ({ ...prev, ...profile.credentials }))
+  }
   const [uploadError, setUploadError] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -415,6 +447,42 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
 
       {open && (
         <div className="px-5 pb-5 space-y-5 border-t border-gray-800">
+
+          {/* ── Publicar como ── */}
+          {profiles.length > 0 && (
+            <div className="mt-4 bg-gray-800/40 border border-gray-700 rounded-xl p-3">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-sm">🗂</span>
+                <span className="text-[10px] font-semibold text-gray-300 uppercase tracking-widest">Publicar como</span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => applyProfile(null)}
+                  className={`px-3 py-1.5 rounded-lg text-[11px] border transition-all
+                    ${selectedProfile === null
+                      ? 'border-violet-600 bg-violet-900/30 text-violet-300 font-semibold'
+                      : 'border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-600'}`}>
+                  👤 Minha conta
+                </button>
+                {profiles.map(p => (
+                  <button
+                    key={p.id}
+                    onClick={() => applyProfile(p.id)}
+                    className={`px-3 py-1.5 rounded-lg text-[11px] border transition-all
+                      ${selectedProfile === p.id
+                        ? 'border-emerald-600 bg-emerald-900/30 text-emerald-300 font-semibold'
+                        : 'border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-600'}`}>
+                    {p.client_name.charAt(0).toUpperCase()} {p.client_name}
+                  </button>
+                ))}
+              </div>
+              {selectedProfile !== null && (
+                <p className="text-[9px] text-emerald-500 mt-2">
+                  ✓ Credenciais de <strong>{profiles.find(p => p.id === selectedProfile)?.client_name}</strong> carregadas automaticamente
+                </p>
+              )}
+            </div>
+          )}
 
           {/* ── Texto ── */}
           <div className="mt-4">

@@ -22,7 +22,9 @@ from db import (init_db, db_seed_users, save_campaign, list_campaigns, get_campa
                 list_alert_rules, create_alert_rule, delete_alert_rule,
                 get_all_active_alert_rules, create_notification,
                 list_notifications, mark_notifications_read, count_unread,
-                get_client_stats)
+                get_client_stats,
+                list_client_profiles, create_client_profile,
+                update_client_profile, delete_client_profile)
 from services.social_publisher import (
     publish_facebook, publish_instagram, publish_twitter, publish_webhook,
     publish_google_ads, toggle_google_ads_campaign,
@@ -899,6 +901,42 @@ async def fetch_campaign_metrics(req: MetricsFetchRequest, user: str = Depends(r
             tasks.append(fetch_twitter_metrics(post_id, p.get("bearer_token", p.get("token", ""))))
     results = await asyncio.gather(*tasks)
     return {"metrics": [r.__dict__ for r in results]}
+
+
+# ── Client Profiles ───────────────────────────────────────────
+
+class ClientProfileRequest(BaseModel):
+    client_name: str
+    credentials: dict = {}
+
+class ClientProfileUpdateRequest(BaseModel):
+    client_name: Optional[str] = None
+    credentials: Optional[dict] = None
+
+@app.get("/client-profiles")
+async def get_client_profiles(user: str = Depends(require_auth)):
+    is_admin = get_user_role(user) == "admin"
+    return list_client_profiles(user, is_admin)
+
+@app.post("/client-profiles")
+async def add_client_profile(req: ClientProfileRequest, user: str = Depends(require_auth)):
+    return create_client_profile(user, req.client_name, req.credentials)
+
+@app.put("/client-profiles/{profile_id}")
+async def edit_client_profile(profile_id: int, req: ClientProfileUpdateRequest, user: str = Depends(require_auth)):
+    is_admin = get_user_role(user) == "admin"
+    ok = update_client_profile(profile_id, user, is_admin, req.client_name, req.credentials)
+    if not ok:
+        raise HTTPException(404, detail="Perfil não encontrado ou sem permissão.")
+    return {"ok": True}
+
+@app.delete("/client-profiles/{profile_id}")
+async def remove_client_profile(profile_id: int, user: str = Depends(require_auth)):
+    is_admin = get_user_role(user) == "admin"
+    ok = delete_client_profile(profile_id, user, is_admin)
+    if not ok:
+        raise HTTPException(404, detail="Perfil não encontrado ou sem permissão.")
+    return {"ok": True}
 
 
 # ── Image Upload ──────────────────────────────────────────────
