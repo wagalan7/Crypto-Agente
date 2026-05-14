@@ -24,6 +24,7 @@ import tenant_service as ts
 import google_calendar_service as gcal
 import stripe_service as stripe_svc
 import mp_service as mp_svc
+import caldav_service as caldav_svc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -306,6 +307,10 @@ class TenantUpdate(BaseModel):
     confirmation_hour: Optional[int] = None
     psychologist_phone: Optional[str] = None
     free_until: Optional[str] = None  # data ISO (YYYY-MM-DD) de acesso gratuito
+    # CalDAV
+    caldav_url: Optional[str] = None
+    caldav_username: Optional[str] = None
+    caldav_password: Optional[str] = None
 
 
 @app.patch("/admin/tenants/{slug}")
@@ -506,13 +511,21 @@ async def dash_reschedule(appt_id: int, body: RescheduleBody, request: Request):
         )
 
     # Atualiza no Google Calendar
-    if appt.get("google_event_id"):
+    if appt.get("google_event_id") and tenant.get("google_refresh_token"):
         try:
             gcal.update_event(tenant, appt["google_event_id"],
                               appt["patient_name"], new_dt.isoformat(),
                               tenant.get("session_minutes", 50))
         except Exception as e:
             logger.warning(f"[gcal] reagendamento falhou: {e}")
+    # Atualiza no CalDAV (se Google não estiver conectado)
+    elif appt.get("google_event_id") and not tenant.get("google_refresh_token"):
+        try:
+            caldav_svc.update_event(tenant, appt["google_event_id"],
+                                    appt["patient_name"], new_dt.isoformat(),
+                                    tenant.get("session_minutes", 50))
+        except Exception as e:
+            logger.warning(f"[caldav] reagendamento falhou: {e}")
 
     # Notifica paciente via WhatsApp
     if body.notify_patient and appt.get("phone"):
@@ -533,13 +546,27 @@ def dash_cancel(appt_id: int, request: Request):
     # Remover do Google Calendar antes de deletar do banco
     appt = db.get_appointment_by_id(tenant["id"], appt_id)
     if appt and appt.get("google_event_id"):
-        try:
-            gcal.delete_event(tenant, appt["google_event_id"])
-        except Exception:
-            pass
+        if tenant.get("google_refresh_token"):
+            try:
+                gcal.delete_event(tenant, appt["google_event_id"])
+            except Exception:
+                pass
+        else:
+            try:
+                caldav_svc.delete_event(tenant, appt["google_event_id"])
+            except Exception:
+                pass
     with db.get_conn() as conn:
         conn.execute("DELETE FROM appointments WHERE id = ? AND tenant_id = ?", (appt_id, tenant["id"]))
     return {"status": "cancelled"}
+
+
+@app.post("/dashboard/api/caldav/test")
+def dash_caldav_test(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    result = caldav_svc.test_connection(tenant)
+    return result
 
 
 @app.get("/dashboard/api/slots")
