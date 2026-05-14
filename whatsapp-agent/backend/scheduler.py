@@ -61,10 +61,12 @@ async def _run_confirmations():
     now = datetime.now(_TZ)  # sempre no horário de Brasília
     tenants = db.list_tenants()
     for tenant in tenants:
+        # ── Pular consultórios suspensos ───────────────────────────────────────
+        if tenant.get("status") == "suspended" and not db.is_tenant_exempt(tenant):
+            logger.info(f"[{tenant['slug']}] Suspenso — confirmações e followups ignorados")
+            continue
+
         # ── Confirmações com 24h de antecedência ──────────────────────────────
-        # A query retorna consultas que estão entre 23h e 25h no futuro.
-        # Não há restrição de horário fixo: se a sessão é às 10h, a mensagem
-        # sai às 10h do dia anterior (quando o scheduler bater nessa janela).
         appts = db.get_appointments_for_confirmation(tenant["id"])
         for appt in appts:
             msg = _confirmation_message(tenant, appt)
@@ -116,6 +118,8 @@ async def _run_billing():
 
     tenants = db.list_tenants()
     for tenant in tenants:
+        if tenant.get("status") == "suspended" and not db.is_tenant_exempt(tenant):
+            continue
         patients = db.get_patients_with_price(tenant["id"])
         for patient in patients:
             phone = patient["phone"]
