@@ -371,9 +371,12 @@ def get_appointments_for_confirmation(tenant_id: int) -> list[dict]:
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo("America/Sao_Paulo")
     now_br = _dt.now(_TZ).replace(tzinfo=None)  # naive, mesmo formato do scheduled_at
-    # Mínimo de 1h no futuro para não enviar confirmação em cima da hora
+    # Janela: de 1h até 36h no futuro.
+    # 36h garante que consultas de "amanhã" são sempre capturadas independentemente
+    # do horário atual (ex: consulta às 10:50 com 25h15min de distância não fica fora).
+    # O flag confirmation_sent=0 evita envios duplicados.
     window_start = (now_br + _td(hours=1)).isoformat(timespec="seconds")
-    window_end   = (now_br + _td(hours=25)).isoformat(timespec="seconds")
+    window_end   = (now_br + _td(hours=36)).isoformat(timespec="seconds")
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM appointments
