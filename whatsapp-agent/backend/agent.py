@@ -178,10 +178,15 @@ FORMATO DE RESPOSTA (OBRIGATÓRIO — responda APENAS com JSON válido, sem mark
 
 CAMPOS data ESPERADOS POR AÇÃO:
 - list_slots: {{}}
-- create: {{"patient_name": "...", "slot_index": 0}}
-- update: {{"appointment_id": 1, "slot_index": 0}}
+- create: {{"patient_name": "...", "slot_index": 1}}   ← número exibido ao paciente (1 = primeiro, 2 = segundo, etc.)
+- update: {{"appointment_id": 1, "slot_index": 1}}     ← mesmo padrão: número do item na lista
 - confirm: {{"appointment_id": 1}}
 - none: {{}}
+
+REGRA CRÍTICA — slot_index:
+Use EXATAMENTE o número que aparece na lista de horários (1, 2, 3...).
+Se o paciente escolheu "o 5" ou "o horário 5", use slot_index: 5.
+NUNCA subtraia 1 ou faça qualquer conversão — use o número exato do display.
 
 SITUAÇÕES ESPECIAIS:
 
@@ -320,7 +325,10 @@ def _execute_action(tenant: dict, resp: AgentResponse,
         return text, {"type": "new_message", "data": {"phone": phone, "intent": resp.intent}}
 
     if action == Action.create:
-        idx = data.get("slot_index", 0)
+        # slot_index vem do LLM como número do display (1-based).
+        # Converter para 0-based antes de indexar offered_slots.
+        idx_raw = data.get("slot_index", 1)
+        idx = int(idx_raw) - 1  # 1-based → 0-based
         name = data.get("patient_name", "Paciente")
         if 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
@@ -334,14 +342,20 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 except Exception as e:
                     logger.warning(f"[gcal] create_event falhou: {e}")
                 formatted = cal.format_slots([slot])[0]
+                # Forçar o horário correto na resposta — o LLM pode ter escrito
+                # um horário diferente no texto. Substituímos qualquer menção
+                # ao slot pelo horário real armazenado.
                 reply = text.replace("[slot]", formatted).replace("[hora]", formatted)
+                logger.info(f"[{tenant['slug']}] Agendamento criado: {name} | slot_index={idx_raw}(raw)→{idx}(0based) | slot={formatted}")
                 event = {"type": "new_appointment", "data": {"patient_name": name, "slot": formatted, "phone": phone}}
                 return reply, event
+        logger.warning(f"[{tenant['slug']}] slot_index inválido: {idx_raw}(raw)→{idx}(0based) | total slots={len(offered_slots)}")
         return "Desculpe, não consegui realizar o agendamento. Pode escolher outro horário? 😊", None
 
     if action == Action.update:
         appt_id = data.get("appointment_id")
-        idx = data.get("slot_index", 0)
+        idx_raw = data.get("slot_index", 1)
+        idx = int(idx_raw) - 1  # 1-based (display) → 0-based
         if appt_id and 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
             if not db.is_slot_taken(tenant_id, slot):
