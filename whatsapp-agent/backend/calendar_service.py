@@ -1,6 +1,9 @@
 from __future__ import annotations
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import database as db
+
+_TZ = ZoneInfo("America/Sao_Paulo")
 
 _DEFAULT_WORKING_DAYS = [0, 1, 2, 3, 4]   # Seg–Sex
 _DEFAULT_BLOCKED_HOURS = [12, 13, 14]      # Almoço
@@ -30,7 +33,7 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
     working_days = _working_days(tenant)
     blocked_hours = _blocked_hours(tenant)
 
-    now = datetime.now()
+    now = datetime.now(_TZ).replace(tzinfo=None)  # naive, horário de Brasília
     check = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     end_date = now + timedelta(days=days_ahead)
 

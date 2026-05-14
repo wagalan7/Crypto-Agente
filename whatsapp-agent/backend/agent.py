@@ -256,7 +256,7 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
         for i, s in enumerate(cal.format_slots(offered_slots), 1):
             lines.append(f"  {i}. {s}")
 
-    lines.append(f"DATA/HORA ATUAL: {datetime.now().strftime('%A, %d/%m/%Y %H:%M')}")
+    lines.append(f"DATA/HORA ATUAL: {datetime.now(_TZ).strftime('%A, %d/%m/%Y %H:%M')}")
     return "\n".join(lines)
 
 
