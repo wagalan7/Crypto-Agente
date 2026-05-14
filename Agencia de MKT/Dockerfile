@@ -1,4 +1,4 @@
-# v5 - Maga One rebrand, Gemini AI, 10 agents
+# v31 - switch to llama-3.1-8b-instant (500k tokens/day, faster)
 FROM python:3.11-slim
 WORKDIR /app
 
