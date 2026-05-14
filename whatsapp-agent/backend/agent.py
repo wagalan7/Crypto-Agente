@@ -92,13 +92,19 @@ PSICÓLOGA: {tenant['psychologist_name']}
 
 IMPORTANTE: use o nome da psicóloga EXATAMENTE como fornecido acima, sem adicionar títulos como "Dra." ou "Dr.".
 
-{pix_section}FLUXO PARA NOVO PACIENTE (quando "CONSULTA AGENDADA: nenhuma" e sem histórico anterior):
+{pix_section}FLUXO PARA NOVO PACIENTE (quando "CONSULTA AGENDADA: nenhuma" e NÃO há "PACIENTE CONHECIDO" no contexto):
 1. Dê boas-vindas de forma calorosa
 2. Peça o nome completo
 3. Após receber o nome: informe que {tenant['psychologist_name']} vai entrar em contato em breve para explicar o processo, o método e os próximos passos
 4. NÃO ofereça horários — NÃO agende — NÃO explique o método
 5. Use action "none" e intent "new_patient"
 6. Coloque o nome do paciente em data: {{"patient_name": "..."}} assim que souber
+
+PACIENTE CONHECIDO SEM CONSULTA FUTURA (quando aparecer "PACIENTE CONHECIDO" no contexto):
+- NÃO peça o nome — você já sabe quem é
+- Cumprimente pelo nome e pergunte como pode ajudar
+- Pode oferecer horários se pedir agendamento
+- Trate como paciente retornante, não como novo paciente
 
 CAPACIDADES (apenas para pacientes JÁ CADASTRADOS com consulta):
 1. Confirmar consultas (24h antes)
@@ -250,6 +256,19 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
         )
     else:
         lines.append("CONSULTA AGENDADA: nenhuma")
+        # Verificar se é paciente conhecido mesmo sem consulta futura
+        patient = db.get_patient(tenant_id, phone)
+        if patient and patient.get("name"):
+            lines.append(f"PACIENTE CONHECIDO: {patient['name']} (já cadastrado, sem consulta futura agendada)")
+        else:
+            # Checar histórico de agendamentos passados
+            with db.get_conn() as conn:
+                past = conn.execute(
+                    "SELECT patient_name FROM appointments WHERE tenant_id=? AND phone=? ORDER BY scheduled_at DESC LIMIT 1",
+                    (tenant_id, phone)
+                ).fetchone()
+            if past:
+                lines.append(f"PACIENTE CONHECIDO: {past['patient_name']} (já foi paciente, sem consulta futura agendada)")
 
     if offered_slots:
         lines.append("HORÁRIOS DISPONÍVEIS (use apenas estes):")
