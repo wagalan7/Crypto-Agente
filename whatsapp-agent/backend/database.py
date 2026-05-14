@@ -363,14 +363,16 @@ def mark_followup_sent(appointment_id: int):
 
 
 def get_appointments_for_confirmation(tenant_id: int) -> list[dict]:
-    """Retorna consultas que estão entre 23h e 25h no futuro e ainda não receberam confirmação.
-    O scheduler roda a cada 30 min — a janela de 2h garante que nenhuma consulta seja perdida.
+    """Retorna consultas nas próximas 25h que ainda não receberam confirmação.
+    Cobre tanto o fluxo normal (24h antes) quanto agendamentos de última hora
+    (feitos com menos de 23h de antecedência — antes ignorados pela janela fixa).
     Usa horário de Brasília passado pelo Python (evita bug de UTC vs localtime no SQLite)."""
     from datetime import datetime as _dt, timedelta as _td
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo("America/Sao_Paulo")
     now_br = _dt.now(_TZ).replace(tzinfo=None)  # naive, mesmo formato do scheduled_at
-    window_start = (now_br + _td(hours=23)).isoformat(timespec="seconds")
+    # Mínimo de 1h no futuro para não enviar confirmação em cima da hora
+    window_start = (now_br + _td(hours=1)).isoformat(timespec="seconds")
     window_end   = (now_br + _td(hours=25)).isoformat(timespec="seconds")
     with get_conn() as conn:
         rows = conn.execute(
