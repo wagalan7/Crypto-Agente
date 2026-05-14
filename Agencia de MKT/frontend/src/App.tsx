@@ -56,6 +56,25 @@ export default function App() {
   const [started, setStarted]           = useState(false)
   const [lastInput, setLastInput]       = useState<ProductInput | null>(null)
 
+  // Reset pipeline state on every new login (token change)
+  useEffect(() => {
+    if (!isLoggedIn || !token) return
+    setAgents(emptyAgents())
+    setStarted(false)
+    setDone(false)
+    setPhase(0)
+    setStatus('')
+    setLastInput(null)
+    setShowUsers(false)
+    setShowHistory(false)
+    setShowConfig(false)
+    setShowReports(false)
+    setShowSchedule(false)
+    setShowAlerts(false)
+    setShowClients(false)
+    setShowProfiles(false)
+  }, [token]) // token muda a cada novo login
+
   // Fetch user info when logged in
   useEffect(() => {
     if (!isLoggedIn || !token) return
