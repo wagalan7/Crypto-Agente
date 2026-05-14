@@ -960,8 +960,8 @@ async def upload_image(request: Request, file: UploadFile = File(...), user: str
     fpath = os.path.join(UPLOADS_DIR, fname)
     with open(fpath, "wb") as f:
         f.write(data)
-    # Build public URL from request base
-    base = str(request.base_url).rstrip("/")
+    # Build public URL — always HTTPS (Railway runs behind a TLS proxy)
+    base = str(request.base_url).rstrip("/").replace("http://", "https://")
     public_url = f"{base}/uploads/{fname}"
     return {"url": public_url, "filename": fname, "size": len(data)}
 
