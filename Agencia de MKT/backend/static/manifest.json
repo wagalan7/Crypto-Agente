@@ -1,0 +1,17 @@
+{
+  "name": "Maga One",
+  "short_name": "Maga",
+  "description": "Agência de Marketing com IA — 10 Agentes Autônomos",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#3A3591",
+  "theme_color": "#3A3591",
+  "icons": [
+    {
+      "src": "/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

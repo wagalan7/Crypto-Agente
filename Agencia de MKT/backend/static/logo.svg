@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Fredoka+One&amp;display=swap');
+    </style>
+  </defs>
+  <!-- Background -->
+  <rect width="512" height="512" rx="80" fill="#3A3591"/>
+  <!-- MA -->
+  <text
+    x="256" y="230"
+    font-family="Fredoka One, Arial Rounded MT Bold, Arial, sans-serif"
+    font-size="210"
+    font-weight="900"
+    fill="#F0EFF8"
+    text-anchor="middle"
+    dominant-baseline="middle"
+    letter-spacing="-4"
+  >MA</text>
+  <!-- GA -->
+  <text
+    x="256" y="400"
+    font-family="Fredoka One, Arial Rounded MT Bold, Arial, sans-serif"
+    font-size="210"
+    font-weight="900"
+    fill="#F0EFF8"
+    text-anchor="middle"
+    dominant-baseline="middle"
+    letter-spacing="-4"
+  >GA</text>
+</svg>
