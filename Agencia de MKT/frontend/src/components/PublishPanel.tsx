@@ -214,7 +214,8 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
     }
     const profile = profiles.find(p => p.id === profileId)
     if (!profile) return
-    setCreds(prev => ({ ...prev, ...profile.credentials }))
+    // Substitui completamente pelas credenciais do perfil (sem mesclar com conta própria)
+    setCreds({ ...EMPTY, ...profile.credentials })
   }
   const [uploadError, setUploadError] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
