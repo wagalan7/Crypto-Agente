@@ -271,13 +271,19 @@ def clear_conversation(tenant_id: int, phone: str):
 
 # ── Appointments ───────────────────────────────────────────────────────────────
 
-def get_appointments_by_phone(tenant_id: int, phone: str) -> list[dict]:
+def get_appointments_by_phone(tenant_id: int, phone: str, now_iso: str | None = None) -> list[dict]:
+    # Appointments are stored in Brasília time (naive). Use now_iso passed from caller
+    # to avoid comparing against SQLite's datetime('now') which is UTC.
+    if now_iso is None:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        now_iso = datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None).isoformat()
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM appointments
-               WHERE tenant_id = ? AND phone = ? AND scheduled_at >= datetime('now')
+               WHERE tenant_id = ? AND phone = ? AND scheduled_at >= ?
                ORDER BY scheduled_at""",
-            (tenant_id, phone),
+            (tenant_id, phone, now_iso),
         ).fetchall()
     return [dict(r) for r in rows]
 
