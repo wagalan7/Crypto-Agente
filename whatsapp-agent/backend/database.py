@@ -110,6 +110,9 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN free_until TEXT DEFAULT NULL",
             "ALTER TABLE appointments ADD COLUMN cancelled INTEGER DEFAULT 0",
             "ALTER TABLE tenants ADD COLUMN plan_expires_at TEXT DEFAULT NULL",
+            "ALTER TABLE tenants ADD COLUMN caldav_url TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN caldav_username TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN caldav_password TEXT DEFAULT ''",
         ]
         for sql in migrations:
             try:
@@ -200,6 +203,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "pix_key", "pix_name",
         "working_days", "blocked_hours", "confirmation_hour", "psychologist_phone", "plan",
         "free_until", "plan_expires_at",
+        "caldav_url", "caldav_username", "caldav_password",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:

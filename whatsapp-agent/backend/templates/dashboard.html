@@ -421,6 +421,60 @@
       <p class="text-xs text-gray-400 mt-2 text-center">Você será redirecionado para autorizar o acesso à sua agenda</p>
       {% endif %}
     </div>
+
+    <!-- CalDAV (Apple iCloud, Outlook, Nextcloud...) -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-2xl">🗓️</span>
+        <div>
+          <h3 class="font-semibold text-gray-800 text-sm">Outros Calendários (CalDAV)</h3>
+          <p class="text-xs text-gray-500">Apple iCloud, Outlook.com, Nextcloud, Yahoo, Fastmail</p>
+        </div>
+        <span id="caldav-badge" class="ml-auto text-xs px-2 py-1 rounded-full font-medium
+          {{ 'bg-green-100 text-green-700' if tenant.caldav_url else 'bg-gray-100 text-gray-500' }}">
+          {{ '● Configurado' if tenant.caldav_url else '○ Não configurado' }}
+        </span>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">Use se não utilizar Google Calendar. Insira a URL do seu calendário CalDAV, e-mail e senha de app.</p>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">URL do Calendário CalDAV</label>
+          <input id="caldav-url" type="url" placeholder="https://caldav.icloud.com/123/calendars/Consultório/"
+            value="{{ tenant.caldav_url or '' }}"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          <p class="text-xs text-gray-400 mt-1">iCloud: Settings → Passwords → App Passwords → gere a URL</p>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">Usuário (e-mail)</label>
+          <input id="caldav-username" type="email" placeholder="usuario@icloud.com"
+            value="{{ tenant.caldav_username or '' }}"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">Senha de App</label>
+          <input id="caldav-password" type="password" placeholder="xxxx-xxxx-xxxx-xxxx"
+            value="{{ tenant.caldav_password or '' }}"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          <p class="text-xs text-gray-400 mt-1">Nunca use sua senha principal — gere uma senha de app nas configurações da sua conta</p>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="caldavSave()"
+            class="flex-1 bg-brand text-white py-2 rounded-lg text-sm font-medium hover:opacity-90 transition">
+            Salvar
+          </button>
+          <button onclick="caldavTest()"
+            class="flex-1 border border-gray-300 text-gray-700 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 transition">
+            Testar Conexão
+          </button>
+        </div>
+        {% if tenant.caldav_url %}
+        <button onclick="caldavClear()"
+          class="w-full border border-red-300 text-red-600 py-2 rounded-lg text-sm font-medium hover:bg-red-50 transition">
+          Remover integração CalDAV
+        </button>
+        {% endif %}
+      </div>
+    </div>
   </div>
 
 </div>
@@ -945,6 +999,50 @@ function gcalDisconnect() {
     showToast("Google Calendar desconectado");
     setTimeout(() => location.reload(), 1500);
   });
+}
+
+// ── CalDAV ────────────────────────────────────────────────────────────────────
+function caldavSave() {
+  const url      = document.getElementById("caldav-url")?.value.trim() || "";
+  const username = document.getElementById("caldav-username")?.value.trim() || "";
+  const password = document.getElementById("caldav-password")?.value.trim() || "";
+  api("/dashboard/api/config", {
+    method: "PATCH",
+    body: JSON.stringify({ caldav_url: url, caldav_username: username, caldav_password: password })
+  }).then(() => {
+    showToast("Configuração CalDAV salva!");
+    setTimeout(() => location.reload(), 1200);
+  }).catch(() => showToast("Erro ao salvar", "error"));
+}
+
+function caldavTest() {
+  const url      = document.getElementById("caldav-url")?.value.trim() || "";
+  const username = document.getElementById("caldav-username")?.value.trim() || "";
+  const password = document.getElementById("caldav-password")?.value.trim() || "";
+  if (!url || !username || !password) {
+    showToast("Preencha URL, usuário e senha antes de testar", "error");
+    return;
+  }
+  // Salvar primeiro, depois testar
+  api("/dashboard/api/config", {
+    method: "PATCH",
+    body: JSON.stringify({ caldav_url: url, caldav_username: username, caldav_password: password })
+  }).then(() => api("/dashboard/api/caldav/test", {method:"POST"}))
+    .then(r => {
+      if (r.ok) showToast("✅ " + r.message);
+      else showToast("❌ " + r.message, "error");
+    }).catch(() => showToast("Erro ao testar conexão", "error"));
+}
+
+function caldavClear() {
+  if (!confirm("Remover integração CalDAV? Os eventos no calendário não serão afetados.")) return;
+  api("/dashboard/api/config", {
+    method: "PATCH",
+    body: JSON.stringify({ caldav_url: "", caldav_username: "", caldav_password: "" })
+  }).then(() => {
+    showToast("CalDAV removido");
+    setTimeout(() => location.reload(), 1200);
+  }).catch(() => showToast("Erro ao remover", "error"));
 }
 
 // ── Reagendar ─────────────────────────────────────────────────────────────────

@@ -8,6 +8,7 @@ import config
 import database as db
 import calendar_service as cal
 import google_calendar_service as gcal
+import caldav_service as caldav_svc
 from models import AgentResponse, Action
 
 logger = logging.getLogger(__name__)
@@ -334,13 +335,23 @@ def _execute_action(tenant: dict, resp: AgentResponse,
             slot = offered_slots[idx]
             if not db.is_slot_taken(tenant_id, slot):
                 appt_id = db.create_appointment(tenant_id, name, phone, slot)
-                # Sincronizar com Google Calendar
+                duration = tenant.get("session_minutes", 50)
+                # Sincronizar com Google Calendar (se conectado)
                 try:
-                    event_id = gcal.create_event(tenant, name, slot.isoformat(), tenant.get("session_minutes", 50))
+                    event_id = gcal.create_event(tenant, name, slot.isoformat(), duration)
                     if event_id:
                         db.set_appointment_google_event_id(appt_id, event_id)
                 except Exception as e:
                     logger.warning(f"[gcal] create_event falhou: {e}")
+                # Sincronizar com CalDAV (se configurado)
+                try:
+                    caldav_uid = caldav_svc.create_event(tenant, name, slot.isoformat(), duration)
+                    if caldav_uid:
+                        # Reutilizamos google_event_id para CalDAV quando Google não está conectado
+                        if not tenant.get("google_refresh_token"):
+                            db.set_appointment_google_event_id(appt_id, caldav_uid)
+                except Exception as e:
+                    logger.warning(f"[caldav] create_event falhou: {e}")
                 formatted = cal.format_slots([slot])[0]
                 # Forçar o horário correto na resposta — o LLM pode ter escrito
                 # um horário diferente no texto. Substituímos qualquer menção
@@ -364,12 +375,20 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 db.update_appointment(tenant_id, appt_id, slot)
                 # Sincronizar com Google Calendar
                 try:
-                    if appt and appt.get("google_event_id"):
+                    if appt and appt.get("google_event_id") and tenant.get("google_refresh_token"):
                         gcal.update_event(tenant, appt["google_event_id"],
                                           appt.get("patient_name", "Paciente"),
                                           slot.isoformat(), tenant.get("session_minutes", 50))
                 except Exception as e:
                     logger.warning(f"[gcal] update_event falhou: {e}")
+                # Sincronizar com CalDAV (se configurado e Google não estiver ativo)
+                try:
+                    if appt and appt.get("google_event_id") and not tenant.get("google_refresh_token"):
+                        caldav_svc.update_event(tenant, appt["google_event_id"],
+                                                appt.get("patient_name", "Paciente"),
+                                                slot.isoformat(), tenant.get("session_minutes", 50))
+                except Exception as e:
+                    logger.warning(f"[caldav] update_event falhou: {e}")
                 formatted = cal.format_slots([slot])[0]
                 reply = text.replace("[slot]", formatted).replace("[hora]", formatted)
                 return reply, {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}
