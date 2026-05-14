@@ -26,10 +26,12 @@ from db import (init_db, db_seed_users, save_campaign, list_campaigns, get_campa
 from services.social_publisher import (
     publish_facebook, publish_instagram, publish_twitter, publish_webhook,
     publish_google_ads, toggle_google_ads_campaign,
+    publish_facebook_ads, toggle_facebook_ads_campaign,
 )
 from services.metrics_fetcher import (
     fetch_facebook_metrics, fetch_instagram_metrics, fetch_twitter_metrics,
     fetch_google_ads_campaigns, fetch_facebook_ad_insights, fetch_tiktok_insights,
+    fetch_facebook_ads_campaigns,
 )
 
 app = FastAPI(title="Maga One Marketing")
@@ -621,12 +623,26 @@ class PublishRequest(BaseModel):
     google_mcc_id: Optional[str] = None
     google_keywords: Optional[str] = None   # comma-separated keywords
     google_location_id: Optional[str] = "2076"  # default: Brazil
+    fb_ad_account_id: Optional[str] = None
+    fb_ads_objective: Optional[str] = "LINK_CLICKS"
+    fb_ads_budget: Optional[str] = None
+    fb_ads_final_url: Optional[str] = None
 
 @app.post("/agency/publish")
 async def publish(req: PublishRequest, user: str = Depends(require_auth)):
     tasks = []
     if "facebook" in req.platforms and req.fb_page_id and req.fb_token:
         tasks.append(publish_facebook(req.text, req.fb_page_id, req.fb_token))
+    if "facebook_ads" in req.platforms and req.fb_token and req.fb_ad_account_id and req.fb_page_id:
+        tasks.append(publish_facebook_ads(
+            req.text,
+            req.fb_page_id,
+            req.fb_token,
+            req.fb_ad_account_id,
+            req.fb_ads_final_url or req.google_final_url or "",
+            req.fb_ads_budget or "20",
+            req.fb_ads_objective or "LINK_CLICKS",
+        ))
     if "instagram" in req.platforms and req.ig_user_id and req.ig_token and req.image_url:
         tasks.append(publish_instagram(req.text, req.image_url, req.ig_user_id, req.ig_token))
     if "twitter" in req.platforms and req.tw_api_key:
@@ -774,6 +790,78 @@ async def report_facebook(
         raise HTTPException(400, detail="Credenciais Facebook incompletas.")
     results = await fetch_facebook_ad_insights(page_id, token, date_preset)
     return {"insights": results}
+
+
+@app.get("/reports/facebook-ads")
+async def report_facebook_ads(
+    date_preset: str = "last_30d",
+    user: str = Depends(require_auth),
+):
+    """Fetch Facebook Ads campaign performance via Marketing API."""
+    creds = get_credentials(user)
+    fc = creds.get("facebook", {})
+    token         = fc.get("fb_token", "")
+    ad_account_id = fc.get("fb_ad_account_id", "")
+    if not token or not ad_account_id:
+        raise HTTPException(400, detail="Configure a ID da Conta de Anúncios e o Access Token do Facebook nas credenciais.")
+    results = await fetch_facebook_ads_campaigns(ad_account_id, token, date_preset)
+    return {"campaigns": results}
+
+
+class FbToggleRequest(BaseModel):
+    campaign_id: str
+    new_status:  str   # "ACTIVE" or "PAUSED"
+
+@app.post("/reports/facebook-ads/toggle")
+async def toggle_facebook_campaign(req: FbToggleRequest, user: str = Depends(require_auth)):
+    """Pause or activate a Facebook Ads campaign."""
+    creds = get_credentials(user)
+    fc    = creds.get("facebook", {})
+    token = fc.get("fb_token", "")
+    if not token:
+        raise HTTPException(400, detail="Token do Facebook não configurado.")
+    result = await toggle_facebook_ads_campaign(req.campaign_id, req.new_status, token)
+    if not result.get("success"):
+        raise HTTPException(400, detail=result.get("error", "Erro ao alterar status"))
+    return result
+
+
+# ── Instagram long-lived token exchange ──────────────────────
+
+class IgTokenRequest(BaseModel):
+    short_token: str
+
+@app.post("/auth/instagram/exchange-token")
+async def exchange_instagram_token(req: IgTokenRequest, user: str = Depends(require_auth)):
+    """Exchange a short-lived Instagram/Facebook token for a 60-day long-lived token."""
+    app_id     = os.getenv("FACEBOOK_APP_ID", "")
+    app_secret = os.getenv("FACEBOOK_APP_SECRET", "")
+    if not app_id or not app_secret:
+        raise HTTPException(400, detail="FACEBOOK_APP_ID e FACEBOOK_APP_SECRET não configurados no servidor. Adicione no Railway.")
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                "https://graph.facebook.com/v19.0/oauth/access_token",
+                params={
+                    "grant_type":        "fb_exchange_token",
+                    "client_id":         app_id,
+                    "client_secret":     app_secret,
+                    "fb_exchange_token": req.short_token,
+                },
+            )
+            data = r.json()
+        if "error" in data:
+            raise HTTPException(400, detail=data["error"].get("message", str(data["error"])))
+        long_token  = data.get("access_token", "")
+        expires_in  = data.get("expires_in", 0)
+        if not long_token:
+            raise HTTPException(400, detail="Token não retornado pela Meta.")
+        expires_days = round(expires_in / 86400) if expires_in else 60
+        return {"access_token": long_token, "expires_in": expires_in, "expires_days": expires_days}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
 
 
 @app.get("/reports/tiktok")

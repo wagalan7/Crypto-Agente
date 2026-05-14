@@ -295,6 +295,79 @@ async def fetch_tiktok_insights(
         return [{"error": str(e)}]
 
 
+async def fetch_facebook_ads_campaigns(
+    ad_account_id: str,
+    token: str,
+    date_preset: str = "last_30d",
+) -> list[dict]:
+    """Fetch Facebook Ads campaign performance via Marketing API v19.0."""
+    act = f"act_{ad_account_id.lstrip('act_')}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(
+                f"https://graph.facebook.com/v19.0/{act}/insights",
+                params={
+                    "level":       "campaign",
+                    "fields":      "campaign_id,campaign_name,impressions,clicks,ctr,cpc,spend,actions",
+                    "date_preset": date_preset,
+                    "access_token": token,
+                },
+            )
+            data = r.json()
+        if "error" in data:
+            return [{"error": data["error"].get("message", str(data["error"]))}]
+
+        results = []
+        for row in data.get("data", []):
+            actions = {a["action_type"]: int(float(a["value"])) for a in row.get("actions", [])}
+            conversions = (
+                actions.get("offsite_conversion.fb_pixel_purchase", 0) +
+                actions.get("offsite_conversion.fb_pixel_lead", 0) +
+                actions.get("lead", 0)
+            )
+            results.append({
+                "campaign_id":   row.get("campaign_id", ""),
+                "campaign_name": row.get("campaign_name", "—"),
+                "status":        "ACTIVE",   # status comes from campaign object, not insights
+                "impressions":   int(row.get("impressions", 0)),
+                "clicks":        int(row.get("clicks", 0)),
+                "ctr":           round(float(row.get("ctr", 0)), 2),
+                "cpc":           round(float(row.get("cpc", 0)), 2),
+                "spend":         round(float(row.get("spend", 0)), 2),
+                "conversions":   conversions,
+            })
+
+        if not results:
+            return [{"error": "Nenhuma campanha encontrada no período."}]
+
+        # Fetch campaign statuses in a second call
+        rs = await _fetch_fb_campaign_statuses(act, token, [r["campaign_id"] for r in results])
+        for row in results:
+            row["status"] = rs.get(row["campaign_id"], "UNKNOWN")
+
+        return results
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+async def _fetch_fb_campaign_statuses(act: str, token: str, campaign_ids: list[str]) -> dict[str, str]:
+    """Returns {campaign_id: status} map."""
+    if not campaign_ids:
+        return {}
+    try:
+        ids_param = ",".join(campaign_ids[:20])
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                f"https://graph.facebook.com/v19.0/{act}/campaigns",
+                params={"fields": "id,status", "filtering": f'[{{"field":"id","operator":"IN","value":[{ids_param}]}}]',
+                        "access_token": token},
+            )
+            data = r.json()
+        return {d["id"]: d.get("status", "UNKNOWN") for d in data.get("data", [])}
+    except Exception:
+        return {}
+
+
 async def fetch_facebook_ad_insights(page_id: str, token: str, date_preset: str = "last_30d") -> list[dict]:
     """Fetch Facebook Page post insights summary."""
     try:

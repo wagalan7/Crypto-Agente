@@ -40,6 +40,19 @@ interface FbInsights {
   error?: string
 }
 
+interface FbAdRow {
+  campaign_id: string
+  campaign_name: string
+  status: string
+  impressions: number
+  clicks: number
+  ctr: number
+  cpc: number
+  spend: number
+  conversions: number
+  error?: string
+}
+
 type TabType = 'google' | 'facebook' | 'tiktok'
 
 const DATE_RANGES = [
@@ -77,6 +90,7 @@ function exportPDF(
   tiktokRows: TikTokRow[],
   fbInsights: FbInsights | null,
   suggestions: string,
+  fbAdRows: FbAdRow[] = [],
 ) {
   const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' })
   const platformName = tab === 'google' ? 'Google Ads' : tab === 'tiktok' ? 'TikTok Ads' : 'Facebook'
@@ -159,7 +173,21 @@ function exportPDF(
     y = (doc as any).lastAutoTable.finalY + 6
   }
 
-  if (tab === 'facebook' && fbInsights) {
+  if (tab === 'facebook' && fbAdRows.length > 0) {
+    autoTable(doc, {
+      startY: y,
+      head: [['Campanha', 'Status', 'Impressões', 'Cliques', 'CTR', 'CPC (R$)', 'Gasto (R$)', 'Conversões']],
+      body: fbAdRows.map(c => [
+        c.campaign_name || '—',
+        c.status === 'ACTIVE' ? 'Ativa' : 'Pausada',
+        fmt(c.impressions), fmt(c.clicks), c.ctr + '%', fmtBRL(c.cpc), fmtBRL(c.spend), c.conversions,
+      ]),
+      theme: 'striped',
+      headStyles: { fillColor: [30, 80, 180] },
+      styles: { fontSize: 8 },
+    })
+    y = (doc as any).lastAutoTable.finalY + 6
+  } else if (tab === 'facebook' && fbInsights) {
     autoTable(doc, {
       startY: y,
       head: [['Alcance', 'Impressões', 'Engajamentos', 'Novos Seguidores']],
@@ -201,6 +229,7 @@ function exportExcel(
   campaigns: CampaignRow[],
   tiktokRows: TikTokRow[],
   fbInsights: FbInsights | null,
+  fbAdRows: FbAdRow[] = [],
 ) {
   const wb = XLSX.utils.book_new()
 
@@ -233,7 +262,20 @@ function exportExcel(
     XLSX.utils.book_append_sheet(wb, ws, 'TikTok Ads')
   }
 
-  if (tab === 'facebook' && fbInsights) {
+  if (tab === 'facebook' && fbAdRows.length > 0) {
+    const rows = fbAdRows.map(c => ({
+      Campanha:    c.campaign_name || '—',
+      Status:      c.status,
+      Impressões:  c.impressions,
+      Cliques:     c.clicks,
+      'CTR (%)':   c.ctr,
+      'CPC (R$)':  c.cpc,
+      'Gasto (R$)': c.spend,
+      Conversões:  c.conversions,
+    }))
+    const ws = XLSX.utils.json_to_sheet(rows)
+    XLSX.utils.book_append_sheet(wb, ws, 'Facebook Ads')
+  } else if (tab === 'facebook' && fbInsights) {
     const rows = [{
       Período:          dateLabel,
       Alcance:          fbInsights.page_reach ?? 0,
@@ -257,6 +299,9 @@ export function ReportsPanel({ authHeaders }: Props) {
   const [campaigns, setCampaigns]       = useState<CampaignRow[]>([])
   const [tiktokRows, setTiktokRows]     = useState<TikTokRow[]>([])
   const [fbInsights, setFbInsights]     = useState<FbInsights | null>(null)
+  const [fbAdRows, setFbAdRows]         = useState<FbAdRow[]>([])
+  const [fbToggling, setFbToggling]     = useState<Set<string>>(new Set())
+  const [fbToggleMsg, setFbToggleMsg]   = useState('')
   const [error, setError]               = useState('')
   const [fetched, setFetched]           = useState(false)
   const [optimizing, setOptimizing]     = useState(false)
@@ -278,17 +323,49 @@ export function ReportsPanel({ authHeaders }: Props) {
     setLoading(false)
   }, [authHeaders])
 
-  const fetchFacebook = useCallback(async () => {
-    setLoading(true); setError(''); setFbInsights(null)
+  const fetchFacebook = useCallback(async (range: string) => {
+    setLoading(true); setError(''); setFbInsights(null); setFbAdRows([])
     try {
-      const r = await fetch('/reports/facebook?date_preset=last_30d', { headers: authHeaders })
-      const d = await r.json()
-      if (!r.ok) { setError(d.detail || 'Erro ao buscar dados'); return }
-      const ins = d.insights?.[0] || {}
-      if (ins.error) { setError(ins.error); return }
-      setFbInsights(ins); setFetched(true)
+      // Fetch paid campaigns first
+      const r1 = await fetch(`/reports/facebook-ads?date_preset=${fbDatePreset(range)}`, { headers: authHeaders })
+      const d1 = await r1.json()
+      if (r1.ok) {
+        const rows: FbAdRow[] = d1.campaigns || []
+        if (rows.length > 0 && !rows[0].error) { setFbAdRows(rows); setFetched(true) }
+        else if (rows[0]?.error) setError(rows[0].error)
+      }
+      // Also fetch page insights as secondary
+      const r2 = await fetch('/reports/facebook?date_preset=last_30d', { headers: authHeaders })
+      const d2 = await r2.json()
+      if (r2.ok) {
+        const ins = d2.insights?.[0] || {}
+        if (!ins.error) setFbInsights(ins)
+      }
     } catch (e) { setError(String(e)) }
     setLoading(false)
+  }, [authHeaders])
+
+  const handleFbToggle = useCallback(async (campaignId: string, currentStatus: string) => {
+    const newStatus = currentStatus === 'ACTIVE' ? 'PAUSED' : 'ACTIVE'
+    setFbToggling(t => new Set(t).add(campaignId))
+    setFbToggleMsg('')
+    try {
+      const r = await fetch('/reports/facebook-ads/toggle', {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify({ campaign_id: campaignId, new_status: newStatus }),
+      })
+      const d = await r.json()
+      if (r.ok) {
+        setFbAdRows(prev => prev.map(c =>
+          c.campaign_id === campaignId ? { ...c, status: newStatus } : c
+        ))
+        setFbToggleMsg(`✓ Campanha ${newStatus === 'PAUSED' ? 'pausada' : 'ativada'} com sucesso`)
+        setTimeout(() => setFbToggleMsg(''), 3000)
+      } else {
+        setFbToggleMsg(`✗ ${d.detail || 'Erro ao alterar status'}`)
+      }
+    } catch (e) { setFbToggleMsg(`✗ ${String(e)}`) }
+    setFbToggling(t => { const n = new Set(t); n.delete(campaignId); return n })
   }, [authHeaders])
 
   const fetchTikTok = useCallback(async (range: string) => {
@@ -304,17 +381,28 @@ export function ReportsPanel({ authHeaders }: Props) {
     setLoading(false)
   }, [authHeaders])
 
+  // Convert GAQL date_range → Facebook date_preset
+  const fbDatePreset = (range: string) => {
+    const MAP: Record<string, string> = {
+      LAST_7_DAYS: 'last_7d', LAST_30_DAYS: 'last_30d',
+      LAST_90_DAYS: 'last_90d', THIS_MONTH: 'this_month', LAST_MONTH: 'last_month',
+    }
+    return MAP[range] || 'last_30d'
+  }
+
   const handleFetch = () => {
     setSuggestions(''); setTokensUsed(0)
     if (tab === 'google')   fetchGoogle(dateRange)
     else if (tab === 'tiktok') fetchTikTok(dateRange)
-    else fetchFacebook()
+    else fetchFacebook(dateRange)
   }
 
   const handleOptimize = useCallback(async () => {
     const data = tab === 'tiktok'
       ? tiktokRows.map(r => ({ ...r, status: 'ENABLED', avg_cpc: r.cpc, cost: r.spend }))
-      : campaigns
+      : tab === 'facebook'
+        ? fbAdRows.map(r => ({ ...r, avg_cpc: r.cpc, cost: r.spend }))
+        : campaigns
     if (!data.length) return
     setOptimizing(true); setSuggestions('')
     try {
@@ -355,17 +443,18 @@ export function ReportsPanel({ authHeaders }: Props) {
 
   const handleExportPDF = () => {
     const label = DATE_RANGES.find(d => d.value === dateRange)?.label ?? dateRange
-    exportPDF(tab, label, campaigns, tiktokRows, fbInsights, suggestions)
+    exportPDF(tab, label, campaigns, tiktokRows, fbInsights, suggestions, fbAdRows)
   }
 
   const handleExportExcel = () => {
     const label = DATE_RANGES.find(d => d.value === dateRange)?.label ?? dateRange
-    exportExcel(tab, label, campaigns, tiktokRows, fbInsights)
+    exportExcel(tab, label, campaigns, tiktokRows, fbInsights, fbAdRows)
   }
 
   const switchTab = (t: TabType) => {
     setTab(t); setFetched(false); setCampaigns([]); setTiktokRows([])
-    setFbInsights(null); setError(''); setSuggestions('')
+    setFbInsights(null); setFbAdRows([]); setError(''); setSuggestions('')
+    setFbToggleMsg(''); setToggleMsg('')
   }
 
   // Google/TikTok totals
@@ -387,7 +476,7 @@ export function ReportsPanel({ authHeaders }: Props) {
   const tAvgCtr = tTotals.impressions > 0
     ? ((tTotals.clicks / tTotals.impressions) * 100).toFixed(2) : '0.00'
 
-  const hasData = fetched && !error && (campaigns.length > 0 || tiktokRows.length > 0 || !!fbInsights)
+  const hasData = fetched && !error && (campaigns.length > 0 || tiktokRows.length > 0 || !!fbInsights || fbAdRows.length > 0)
 
   return (
     <div className="bg-gray-900/60 border border-gray-800 rounded-xl overflow-hidden">
@@ -609,21 +698,138 @@ export function ReportsPanel({ authHeaders }: Props) {
           </div>
         )}
 
-        {/* Facebook Results */}
-        {tab === 'facebook' && fetched && fbInsights && !fbInsights.error && (
-          <div className="grid grid-cols-2 gap-3">
-            {[
-              { label: 'Alcance da Página',  value: fbInsights.page_reach ?? 0,            color: 'text-blue-400' },
-              { label: 'Impressões',         value: fbInsights.page_impressions ?? 0,      color: 'text-violet-400' },
-              { label: 'Engajamentos',       value: fbInsights.page_post_engagements ?? 0, color: 'text-emerald-400' },
-              { label: 'Novos Seguidores',   value: fbInsights.page_fan_adds ?? 0,         color: 'text-pink-400' },
-            ].map(k => (
-              <div key={k.label} className="bg-gray-800/60 border border-gray-700 rounded-xl px-4 py-3">
-                <p className={`text-2xl font-bold ${k.color}`}>{fmt(k.value)}</p>
-                <p className="text-[10px] text-gray-500 mt-1">{k.label}</p>
-                <p className="text-[9px] text-gray-600">Últimos 30 dias</p>
+        {/* Facebook Results — Paid campaigns */}
+        {tab === 'facebook' && fetched && fbAdRows.length > 0 && (() => {
+          const fbTotals = fbAdRows.reduce((a, c) => ({
+            impressions: a.impressions + c.impressions,
+            clicks:      a.clicks + c.clicks,
+            spend:       a.spend + c.spend,
+            conversions: a.conversions + c.conversions,
+          }), { impressions: 0, clicks: 0, spend: 0, conversions: 0 })
+          const fbAvgCtr = fbTotals.impressions > 0
+            ? ((fbTotals.clicks / fbTotals.impressions) * 100).toFixed(2) : '0.00'
+          return (
+            <div className="space-y-3">
+              <div className="grid grid-cols-4 gap-2">
+                {[
+                  { label: 'Impressões', value: fmt(fbTotals.impressions), color: 'text-blue-400' },
+                  { label: 'Cliques',    value: fmt(fbTotals.clicks),      color: 'text-violet-400' },
+                  { label: 'CTR médio',  value: fbAvgCtr + '%',            color: 'text-emerald-400' },
+                  { label: 'Gasto total',value: fmtBRL(fbTotals.spend),    color: 'text-amber-400' },
+                ].map(k => (
+                  <div key={k.label} className="bg-gray-800/60 border border-gray-700 rounded-lg px-3 py-2.5 text-center">
+                    <p className={`text-base font-bold ${k.color}`}>{k.value}</p>
+                    <p className="text-[9px] text-gray-500 mt-0.5 uppercase tracking-wider">{k.label}</p>
+                  </div>
+                ))}
               </div>
-            ))}
+
+              {fbToggleMsg && (
+                <p className={`text-[11px] px-3 py-1.5 rounded-lg border ${fbToggleMsg.startsWith('✓')
+                  ? 'text-emerald-400 border-emerald-800 bg-emerald-900/20'
+                  : 'text-red-400 border-red-800 bg-red-900/20'}`}>
+                  {fbToggleMsg}
+                </p>
+              )}
+
+              <div className="overflow-x-auto rounded-lg border border-gray-700">
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr className="bg-gray-800/80 text-gray-400 uppercase tracking-wider">
+                      {['Campanha', 'Status', 'Impressões', 'Cliques', 'CTR', 'CPC', 'Gasto', 'Conversões', ''].map(h => (
+                        <th key={h} className="px-3 py-2 text-left font-medium">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {fbAdRows.map((c, i) => {
+                      const isToggling = fbToggling.has(c.campaign_id)
+                      return (
+                        <tr key={i} className={`border-t border-gray-800 ${i % 2 === 0 ? 'bg-gray-900/40' : ''}`}>
+                          <td className="px-3 py-2 text-gray-200 max-w-[150px] truncate font-medium">{c.campaign_name || '—'}</td>
+                          <td className="px-3 py-2">
+                            <span className={`text-[10px] font-semibold ${c.status === 'ACTIVE' ? 'text-emerald-400' : c.status === 'PAUSED' ? 'text-amber-400' : 'text-gray-400'}`}>
+                              {c.status === 'ACTIVE' ? '● Ativa' : c.status === 'PAUSED' ? '⏸ Pausada' : c.status}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2 text-gray-300">{fmt(c.impressions)}</td>
+                          <td className="px-3 py-2 text-gray-300">{fmt(c.clicks)}</td>
+                          <td className="px-3 py-2 text-gray-300">{c.ctr}%</td>
+                          <td className="px-3 py-2 text-gray-300">{fmtBRL(c.cpc)}</td>
+                          <td className="px-3 py-2 text-amber-400 font-semibold">{fmtBRL(c.spend)}</td>
+                          <td className="px-3 py-2 text-emerald-400">{c.conversions}</td>
+                          <td className="px-3 py-2">
+                            {c.campaign_id && (
+                              <button
+                                onClick={() => handleFbToggle(c.campaign_id, c.status)}
+                                disabled={isToggling}
+                                className={`text-[9px] px-2 py-1 rounded border font-medium transition-all disabled:opacity-40
+                                  ${c.status === 'ACTIVE'
+                                    ? 'border-amber-700 text-amber-400 hover:bg-amber-900/20'
+                                    : 'border-emerald-700 text-emerald-400 hover:bg-emerald-900/20'}`}>
+                                {isToggling ? '...' : c.status === 'ACTIVE' ? '⏸ Pausar' : '▶ Ativar'}
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Page organic insights below */}
+              {fbInsights && !fbInsights.error && (
+                <div className="border-t border-gray-800 pt-3">
+                  <p className="text-[9px] text-gray-600 uppercase tracking-widest mb-2">Página orgânica</p>
+                  <div className="grid grid-cols-4 gap-2">
+                    {[
+                      { label: 'Alcance',       value: fbInsights.page_reach ?? 0 },
+                      { label: 'Impressões',    value: fbInsights.page_impressions ?? 0 },
+                      { label: 'Engajamentos',  value: fbInsights.page_post_engagements ?? 0 },
+                      { label: 'Novos seguid.', value: fbInsights.page_fan_adds ?? 0 },
+                    ].map(k => (
+                      <div key={k.label} className="bg-gray-800/40 border border-gray-700 rounded-lg px-2 py-2 text-center">
+                        <p className="text-sm font-bold text-blue-400">{fmt(k.value)}</p>
+                        <p className="text-[8px] text-gray-600 mt-0.5">{k.label}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between">
+                <p className="text-[9px] text-gray-600">{fbAdRows.length} campanha{fbAdRows.length !== 1 ? 's' : ''}</p>
+                <button onClick={handleOptimize} disabled={optimizing}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold
+                    bg-gradient-to-r from-blue-700 to-violet-700 hover:from-blue-600 hover:to-violet-600
+                    disabled:opacity-50 text-white transition-all">
+                  {optimizing
+                    ? <><span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin"/>Analisando...</>
+                    : '✦ Otimizar com IA'}
+                </button>
+              </div>
+            </div>
+          )
+        })()}
+
+        {/* Facebook — no paid campaigns yet */}
+        {tab === 'facebook' && fetched && fbAdRows.length === 0 && fbInsights && !fbInsights.error && (
+          <div className="space-y-3">
+            <p className="text-[10px] text-gray-500">Nenhuma campanha paga encontrada. Dados da página orgânica:</p>
+            <div className="grid grid-cols-2 gap-3">
+              {[
+                { label: 'Alcance da Página',  value: fbInsights.page_reach ?? 0,            color: 'text-blue-400' },
+                { label: 'Impressões',         value: fbInsights.page_impressions ?? 0,      color: 'text-violet-400' },
+                { label: 'Engajamentos',       value: fbInsights.page_post_engagements ?? 0, color: 'text-emerald-400' },
+                { label: 'Novos Seguidores',   value: fbInsights.page_fan_adds ?? 0,         color: 'text-pink-400' },
+              ].map(k => (
+                <div key={k.label} className="bg-gray-800/60 border border-gray-700 rounded-xl px-4 py-3">
+                  <p className={`text-2xl font-bold ${k.color}`}>{fmt(k.value)}</p>
+                  <p className="text-[10px] text-gray-500 mt-1">{k.label}</p>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 

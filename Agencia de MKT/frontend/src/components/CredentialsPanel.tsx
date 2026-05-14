@@ -13,10 +13,11 @@ const PLATFORMS: {
   oauth?: boolean
 }[] = [
   {
-    id: 'facebook', label: 'Facebook', icon: '𝕗', color: 'text-blue-400',
+    id: 'facebook', label: 'Facebook / Facebook Ads', icon: '𝕗', color: 'text-blue-400',
     fields: [
-      { key: 'fb_page_id', label: 'Page ID' },
-      { key: 'fb_token',   label: 'Access Token', secret: true },
+      { key: 'fb_page_id',       label: 'Page ID (ID da Página)' },
+      { key: 'fb_token',         label: 'Access Token (precisa de permissão ads_management)', secret: true },
+      { key: 'fb_ad_account_id', label: 'Ad Account ID — encontrado em business.facebook.com → Contas de anúncios (ex: 123456789)' },
     ],
   },
   {
@@ -70,6 +71,8 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
   const [googleStatus, setGoogleStatus]     = useState<string | null>(null)
   const [fetchingAccounts, setFetchingAccounts]   = useState(false)
   const [googleAccounts, setGoogleAccounts]       = useState<string[]>([])
+  const [igRefreshing, setIgRefreshing]   = useState(false)
+  const [igRefreshMsg, setIgRefreshMsg]   = useState<string | null>(null)
 
   // Check URL params for Google OAuth result
   useEffect(() => {
@@ -157,6 +160,24 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
       flashErr(e instanceof Error ? e.message : 'Erro ao buscar contas')
     }
     setFetchingAccounts(false)
+  }
+
+  const refreshInstagramToken = async () => {
+    const currentToken = (drafts['instagram'] || creds['instagram'] || {})['ig_token'] || ''
+    if (!currentToken) { flashErr('Cole o token atual no campo antes de renovar.'); return }
+    setIgRefreshing(true); setIgRefreshMsg(null)
+    try {
+      const res = await fetch('/auth/instagram/exchange-token', {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify({ short_token: currentToken }),
+      })
+      const data = await res.json()
+      if (!res.ok) { flashErr(data.detail || 'Erro ao renovar token'); setIgRefreshing(false); return }
+      const newToken = data.access_token
+      setDraftField('instagram', 'ig_token', newToken)
+      setIgRefreshMsg(`✓ Token renovado! Válido por ~${data.expires_days ?? 60} dias. Clique em Salvar.`)
+    } catch (e) { flashErr(String(e)) }
+    setIgRefreshing(false)
   }
 
   const startGoogleOAuth = () => {
@@ -263,10 +284,28 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
                     {p.oauth ? 'Ou preencha manualmente:' : 'Credenciais:'}
                   </p>
 
+                  {/* Instagram token refresh message */}
+                  {p.id === 'instagram' && igRefreshMsg && (
+                    <div className="px-3 py-2 bg-emerald-900/30 border border-emerald-800 rounded-lg text-[10px] text-emerald-400">
+                      {igRefreshMsg}
+                    </div>
+                  )}
+
                   {p.fields.map(f => (
                     <div key={f.key}>
                       <div className="flex items-center justify-between mb-0.5">
                         <label className="text-[9px] text-gray-500 uppercase tracking-wider">{f.label}</label>
+                        {/* Instagram token: renovar para 60 dias */}
+                        {p.id === 'instagram' && f.key === 'ig_token' && (
+                          <button
+                            onClick={refreshInstagramToken}
+                            disabled={igRefreshing}
+                            className="text-[9px] text-pink-400 hover:text-pink-300 disabled:text-gray-600 transition-colors flex items-center gap-1">
+                            {igRefreshing
+                              ? <><span className="w-2 h-2 border border-pink-400/30 border-t-pink-400 rounded-full animate-spin inline-block"/>renovando...</>
+                              : '🔄 renovar para 60 dias'}
+                          </button>
+                        )}
                         {/* Customer ID: botão buscar automático */}
                         {p.id === 'google' && f.key === 'google_customer_id' && (
                           <button

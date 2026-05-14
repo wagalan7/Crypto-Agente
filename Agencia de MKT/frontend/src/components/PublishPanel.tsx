@@ -31,12 +31,13 @@ interface Props {
 }
 
 const PLATFORMS = [
-  { id: 'facebook',  label: 'Facebook',   icon: '𝕗', color: 'text-blue-400'   },
-  { id: 'instagram', label: 'Instagram',  icon: '◉',  color: 'text-pink-400'   },
-  { id: 'twitter',   label: 'Twitter/X',  icon: '✕',  color: 'text-sky-400'    },
-  { id: 'google',    label: 'Google Ads', icon: 'G',  color: 'text-yellow-400' },
-  { id: 'tiktok',    label: 'TikTok',     icon: '♪',  color: 'text-rose-400'   },
-  { id: 'webhook',   label: 'Webhook',    icon: '⚡',  color: 'text-violet-400' },
+  { id: 'facebook',     label: 'Facebook',      icon: '𝕗', color: 'text-blue-400'   },
+  { id: 'facebook_ads', label: 'Facebook Ads',  icon: '📢', color: 'text-blue-300'   },
+  { id: 'instagram',    label: 'Instagram',     icon: '◉',  color: 'text-pink-400'   },
+  { id: 'twitter',      label: 'Twitter/X',     icon: '✕',  color: 'text-sky-400'    },
+  { id: 'google',       label: 'Google Ads',    icon: 'G',  color: 'text-yellow-400' },
+  { id: 'tiktok',       label: 'TikTok',        icon: '♪',  color: 'text-rose-400'   },
+  { id: 'webhook',      label: 'Webhook',        icon: '⚡',  color: 'text-violet-400' },
 ]
 
 const CRED_GUIDES: Record<string, { steps: string[]; link: string }> = {
@@ -88,12 +89,21 @@ const CRED_GUIDES: Record<string, { steps: string[]; link: string }> = {
 
 // Budget ranges per platform (R$/day) shown as guidance
 const BUDGET_DEFAULTS: Record<string, { min: number; max: number; currency: string }> = {
-  facebook:  { min: 15,  max: 150,  currency: 'R$/dia' },
-  instagram: { min: 15,  max: 150,  currency: 'R$/dia' },
-  twitter:   { min: 20,  max: 200,  currency: 'R$/dia' },
-  google:    { min: 30,  max: 500,  currency: 'R$/dia' },
-  tiktok:    { min: 50,  max: 300,  currency: 'R$/dia' },
+  facebook:     { min: 15,  max: 150,  currency: 'R$/dia' },
+  facebook_ads: { min: 15,  max: 500,  currency: 'R$/dia' },
+  instagram:    { min: 15,  max: 150,  currency: 'R$/dia' },
+  twitter:      { min: 20,  max: 200,  currency: 'R$/dia' },
+  google:       { min: 30,  max: 500,  currency: 'R$/dia' },
+  tiktok:       { min: 50,  max: 300,  currency: 'R$/dia' },
 }
+
+const FB_ADS_OBJECTIVES = [
+  { value: 'LINK_CLICKS',     label: 'Tráfego (cliques no link)' },
+  { value: 'CONVERSIONS',     label: 'Conversões' },
+  { value: 'REACH',           label: 'Alcance' },
+  { value: 'ENGAGEMENT',      label: 'Engajamento' },
+  { value: 'BRAND_AWARENESS', label: 'Reconhecimento de marca' },
+]
 
 const EMPTY: Credentials = {
   fb_page_id: '', fb_token: '', ig_user_id: '', ig_token: '',
@@ -171,6 +181,8 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
   const [publishedPosts, setPublishedPosts] = useState<{
     platform: string; post_id: string; token: string; bearer_token?: string; url?: string
   }[]>([])
+  const [fbAdsObjective, setFbAdsObjective] = useState('LINK_CLICKS')
+  const [fbAdsFinalUrl, setFbAdsFinalUrl]   = useState('')
   const [uploading, setUploading]     = useState(false)
   const [uploadError, setUploadError] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -225,6 +237,12 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
     if (selected.has('facebook')) {
       if (!creds.fb_page_id) errors.push('Facebook: Page ID não preenchido')
       if (!creds.fb_token)   errors.push('Facebook: Access Token não preenchido')
+    }
+    if (selected.has('facebook_ads')) {
+      if (!creds.fb_token)        errors.push('Facebook Ads: Access Token não preenchido')
+      if (!creds.fb_page_id)      errors.push('Facebook Ads: Page ID não preenchido')
+      if (!(creds as any).fb_ad_account_id) errors.push('Facebook Ads: Ad Account ID não preenchido')
+      if (!fbAdsFinalUrl)         errors.push('Facebook Ads: URL de destino do anúncio é obrigatória')
     }
     if (selected.has('instagram')) {
       if (!creds.ig_user_id) errors.push('Instagram: IG Business User ID não preenchido')
@@ -284,6 +302,10 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
         google_location_id: googleLocation || '2076',
         tiktok_access_token: creds.tiktok_access_token,
         tiktok_advertiser_id: creds.tiktok_advertiser_id,
+        fb_ad_account_id: (creds as any).fb_ad_account_id || undefined,
+        fb_ads_objective: fbAdsObjective,
+        fb_ads_budget: customBudgets['facebook_ads'] || userBudget || '20',
+        fb_ads_final_url: fbAdsFinalUrl || undefined,
       }
       const res = await fetch('/agency/publish', {
         method: 'POST', headers: authHeaders, body: JSON.stringify(body),
@@ -597,6 +619,28 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
               </div>
 
               <p className="text-[9px] text-amber-600 mt-1">⚠ Campanha criada em status PAUSADA — ative no relatório após revisar.</p>
+            </CredentialSection>
+          )}
+          {selected.has('facebook_ads') && (
+            <CredentialSection title="Facebook Ads" platformId="facebook_ads" showGuide={showGuide} onToggleGuide={setShowGuide}>
+              <Field label="Page ID (mesma da seção Facebook)" value={creds.fb_page_id} onChange={v => saveCreds({ fb_page_id: v })} />
+              <Field label="Access Token (com permissão ads_management)" value={creds.fb_token} onChange={v => saveCreds({ fb_token: v })} secret />
+              <Field label="Ad Account ID (ex: 123456789 — sem 'act_')" value={(creds as any).fb_ad_account_id || ''} onChange={v => saveCreds({ ...creds, fb_ad_account_id: v } as any)} />
+              <Field label="URL de destino do anúncio" value={fbAdsFinalUrl} onChange={setFbAdsFinalUrl} />
+              <div>
+                <label className="block text-[9px] text-gray-500 uppercase tracking-wider mb-1">Objetivo da campanha</label>
+                <select
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-xs text-gray-200
+                             focus:outline-none focus:border-violet-500"
+                  value={fbAdsObjective}
+                  onChange={e => setFbAdsObjective(e.target.value)}>
+                  {FB_ADS_OBJECTIVES.map(o => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+              </div>
+              <p className="text-[9px] text-amber-600 mt-1">⚠ Campanha criada em status PAUSADA — ative no relatório após revisar.</p>
+              <p className="text-[9px] text-gray-600">O token precisa das permissões: <code className="text-gray-400">ads_management, ads_read, pages_manage_ads</code></p>
             </CredentialSection>
           )}
           {selected.has('tiktok') && (

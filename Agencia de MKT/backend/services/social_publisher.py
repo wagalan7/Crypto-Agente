@@ -111,6 +111,151 @@ async def publish_webhook(payload: dict, webhook_url: str) -> PublishResult:
         return PublishResult(platform="webhook", success=False, error=str(e))
 
 
+async def publish_facebook_ads(
+    text: str,
+    page_id: str,
+    token: str,
+    ad_account_id: str,
+    final_url: str,
+    budget_amount: str = "20",
+    objective: str = "LINK_CLICKS",
+) -> PublishResult:
+    """
+    Cria uma campanha paga no Facebook Ads (Marketing API v19.0).
+    Criada em status PAUSED para revisão antes de ativar.
+    """
+    try:
+        # Parse budget (R$ → cents in BRL)
+        try:
+            amount = float(
+                budget_amount.replace("R$", "").replace("r$", "")
+                             .replace(",", ".").split("/")[0].strip()
+            )
+        except Exception:
+            amount = 20.0
+        daily_budget_cents = int(amount * 100)   # Facebook uses local currency * 100
+
+        ts = int(time.time())
+        act = f"act_{ad_account_id.lstrip('act_')}"
+        base = f"https://graph.facebook.com/v19.0"
+
+        # Map objective to billing/optimization
+        OBJ_MAP = {
+            "LINK_CLICKS":   ("LINK_CLICKS", "LINK_CLICKS", "IMPRESSIONS"),
+            "CONVERSIONS":   ("OFFSITE_CONVERSIONS", "OFFSITE_CONVERSIONS", "IMPRESSIONS"),
+            "REACH":         ("REACH", "REACH", "IMPRESSIONS"),
+            "BRAND_AWARENESS": ("BRAND_AWARENESS", "REACH", "IMPRESSIONS"),
+            "ENGAGEMENT":    ("POST_ENGAGEMENT", "POST_ENGAGEMENT", "IMPRESSIONS"),
+        }
+        obj_key = objective if objective in OBJ_MAP else "LINK_CLICKS"
+        fb_objective, opt_goal, billing_event = OBJ_MAP[obj_key]
+
+        if not final_url or not final_url.startswith("http"):
+            final_url = "https://example.com"
+
+        async with httpx.AsyncClient(timeout=30) as http:
+
+            # 1. Create Campaign
+            r = await http.post(f"{base}/{act}/campaigns", data={
+                "name":      f"Campanha MagaOne {ts}",
+                "objective": fb_objective,
+                "status":    "PAUSED",
+                "access_token": token,
+            })
+            rd = r.json()
+            campaign_id = rd.get("id", "")
+            if not campaign_id:
+                return PublishResult(platform="facebook_ads", success=False,
+                    error=f"Erro ao criar campanha: {rd.get('error', {}).get('message', str(rd))}")
+
+            # 2. Create Ad Set
+            r = await http.post(f"{base}/{act}/adsets", data={
+                "name":              f"AdSet MagaOne {ts}",
+                "campaign_id":       campaign_id,
+                "daily_budget":      str(daily_budget_cents),
+                "billing_event":     billing_event,
+                "optimization_goal": opt_goal,
+                "targeting":         '{"geo_locations":{"countries":["BR"]},"age_min":18,"age_max":65}',
+                "status":            "PAUSED",
+                "access_token":      token,
+            })
+            rd = r.json()
+            adset_id = rd.get("id", "")
+            if not adset_id:
+                return PublishResult(platform="facebook_ads", success=False,
+                    error=f"Erro ao criar conjunto: {rd.get('error', {}).get('message', str(rd))}")
+
+            # 3. Create Ad Creative (link ad)
+            lines  = [l.strip() for l in text.split("\n") if l.strip()]
+            title  = lines[0][:40] if lines else "Conheça agora"
+            body   = " ".join(lines[1:3])[:90] if len(lines) > 1 else text[:90]
+            story  = {
+                "page_id": page_id,
+                "link_data": {
+                    "message":     text[:600],
+                    "link":        final_url,
+                    "name":        title,
+                    "description": body,
+                    "call_to_action": {"type": "LEARN_MORE", "value": {"link": final_url}},
+                },
+            }
+            import json as _json
+            r = await http.post(f"{base}/{act}/adcreatives", data={
+                "name":                f"Creative MagaOne {ts}",
+                "object_story_spec":   _json.dumps(story),
+                "access_token":        token,
+            })
+            rd = r.json()
+            creative_id = rd.get("id", "")
+            if not creative_id:
+                return PublishResult(platform="facebook_ads", success=False,
+                    error=f"Erro ao criar criativo: {rd.get('error', {}).get('message', str(rd))}")
+
+            # 4. Create Ad
+            r = await http.post(f"{base}/{act}/ads", data={
+                "name":      f"Anúncio MagaOne {ts}",
+                "adset_id":  adset_id,
+                "creative":  _json.dumps({"creative_id": creative_id}),
+                "status":    "PAUSED",
+                "access_token": token,
+            })
+            rd = r.json()
+            ad_id = rd.get("id", "")
+            if not ad_id:
+                return PublishResult(platform="facebook_ads", success=False,
+                    error=f"Erro ao criar anúncio: {rd.get('error', {}).get('message', str(rd))}")
+
+        return PublishResult(
+            platform="facebook_ads",
+            success=True,
+            post_id=campaign_id,
+            url=f"https://www.facebook.com/adsmanager/manage/campaigns?act={act}&selected_campaign_ids={campaign_id}",
+        )
+
+    except Exception as e:
+        return PublishResult(platform="facebook_ads", success=False, error=str(e))
+
+
+async def toggle_facebook_ads_campaign(
+    campaign_id: str,
+    new_status: str,    # "ACTIVE" or "PAUSED"
+    token: str,
+) -> dict:
+    """Pause or activate a Facebook Ads campaign."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                f"https://graph.facebook.com/v19.0/{campaign_id}",
+                data={"status": new_status, "access_token": token},
+            )
+            data = r.json()
+        if data.get("success"):
+            return {"success": True, "status": new_status}
+        return {"success": False, "error": data.get("error", {}).get("message", str(data))}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def toggle_google_ads_campaign(
     campaign_id: str,
     new_status: str,           # "ENABLED" or "PAUSED"
