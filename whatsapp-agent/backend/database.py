@@ -109,6 +109,7 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN plan TEXT DEFAULT 'mensal'",
             "ALTER TABLE tenants ADD COLUMN free_until TEXT DEFAULT NULL",
             "ALTER TABLE appointments ADD COLUMN cancelled INTEGER DEFAULT 0",
+            "ALTER TABLE tenants ADD COLUMN plan_expires_at TEXT DEFAULT NULL",
         ]
         for sql in migrations:
             try:
@@ -198,7 +199,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "email", "status", "stripe_customer_id", "stripe_subscription_id", "mp_subscription_id",
         "pix_key", "pix_name",
         "working_days", "blocked_hours", "confirmation_hour", "psychologist_phone", "plan",
-        "free_until",
+        "free_until", "plan_expires_at",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:

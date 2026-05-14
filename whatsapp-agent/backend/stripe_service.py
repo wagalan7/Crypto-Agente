@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+from datetime import datetime, timezone
 import stripe
 import config
 import database as db
@@ -7,10 +8,29 @@ import database as db
 logger = logging.getLogger(__name__)
 
 
+# Metadados de cada plano: label, variável de ambiente do price_id, valor total cobrado
 PLANS = {
-    "mensal":    {"label": "Mensal",    "price_env": "STRIPE_PRICE_MENSAL",    "mode": "subscription"},
-    "semestral": {"label": "Semestral", "price_env": "STRIPE_PRICE_SEMESTRAL", "mode": "subscription"},
-    "anual":     {"label": "Anual",     "price_env": "STRIPE_PRICE_ANUAL",     "mode": "subscription"},
+    "mensal": {
+        "label":     "Mensal",
+        "price_env": "STRIPE_PRICE_MENSAL",
+        "mode":      "subscription",
+        "valor":     "R$ 199/mês",
+        "resumo":    "cobrado mensalmente",
+    },
+    "semestral": {
+        "label":     "Semestral",
+        "price_env": "STRIPE_PRICE_SEMESTRAL",
+        "mode":      "subscription",
+        "valor":     "R$ 1.014 a cada 6 meses",
+        "resumo":    "cobrado semestralmente",
+    },
+    "anual": {
+        "label":     "Anual",
+        "price_env": "STRIPE_PRICE_ANUAL",
+        "mode":      "subscription",
+        "valor":     "R$ 1.788/ano",
+        "resumo":    "cobrado anualmente",
+    },
 }
 
 
@@ -24,6 +44,16 @@ def _configured() -> bool:
     return bool(config.STRIPE_SECRET_KEY and (
         config.STRIPE_PRICE_MENSAL or config.STRIPE_PRICE_ID
     ))
+
+
+def _iso_from_timestamp(ts) -> str | None:
+    """Converte Unix timestamp do Stripe para ISO date string (YYYY-MM-DD)."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return None
 
 
 def create_checkout_session(tenant: dict, plan: str = "mensal") -> str:
@@ -64,21 +94,73 @@ def handle_webhook(payload: bytes, sig_header: str) -> dict:
     event_type = event["type"]
     logger.info(f"[stripe] Evento recebido: {event_type}")
 
+    # ── Pagamento inicial concluído ────────────────────────────────────────────
     if event_type == "checkout.session.completed":
         session = event["data"]["object"]
-        setup_token = session.get("client_reference_id") or session.get("metadata", {}).get("setup_token")
+        setup_token = (
+            session.get("client_reference_id")
+            or session.get("metadata", {}).get("setup_token")
+        )
         subscription_id = session.get("subscription", "")
         customer_id = session.get("customer", "")
 
         if setup_token:
             tenant = db.get_tenant_by_setup_token(setup_token)
             if tenant:
+                # Buscar subscription para pegar current_period_end
+                expires_at = None
+                if subscription_id:
+                    try:
+                        sub = stripe.Subscription.retrieve(subscription_id)
+                        expires_at = _iso_from_timestamp(sub.get("current_period_end"))
+                    except Exception as e:
+                        logger.warning(f"[stripe] Não foi possível buscar sub {subscription_id}: {e}")
+
                 db.update_tenant(tenant["slug"],
                                  status="active",
                                  stripe_customer_id=customer_id,
-                                 stripe_subscription_id=subscription_id)
-                logger.info(f"[stripe] Tenant {tenant['slug']} ativado — sub={subscription_id}")
+                                 stripe_subscription_id=subscription_id,
+                                 plan_expires_at=expires_at)
+                logger.info(
+                    f"[stripe] Tenant {tenant['slug']} ativado — sub={subscription_id} "
+                    f"expira={expires_at}"
+                )
 
+    # ── Assinatura renovada (cobrança recorrente bem-sucedida) ─────────────────
+    elif event_type == "customer.subscription.updated":
+        subscription = event["data"]["object"]
+        sub_id = subscription["id"]
+        tenant = _get_tenant_by_stripe_sub(sub_id)
+        if tenant:
+            expires_at = _iso_from_timestamp(subscription.get("current_period_end"))
+            # Atualizar data de expiração e garantir status active se estava suspenso
+            updates = {"plan_expires_at": expires_at}
+            if subscription.get("status") == "active":
+                updates["status"] = "active"
+            db.update_tenant(tenant["slug"], **updates)
+            logger.info(
+                f"[stripe] Sub atualizada — tenant={tenant['slug']} "
+                f"status={subscription.get('status')} expira={expires_at}"
+            )
+
+    # ── Renovação paga com sucesso (invoice) ───────────────────────────────────
+    elif event_type == "invoice.payment_succeeded":
+        invoice = event["data"]["object"]
+        sub_id = invoice.get("subscription", "")
+        if sub_id:
+            tenant = _get_tenant_by_stripe_sub(sub_id)
+            if tenant and tenant.get("status") != "active":
+                # Pode ocorrer quando pagamento atrasado é quitado
+                try:
+                    sub = stripe.Subscription.retrieve(sub_id)
+                    expires_at = _iso_from_timestamp(sub.get("current_period_end"))
+                    db.update_tenant(tenant["slug"], status="active", plan_expires_at=expires_at)
+                    logger.info(f"[stripe] Tenant {tenant['slug']} reativado via invoice — expira={expires_at}")
+                    _notify_reactivated(tenant)
+                except Exception as e:
+                    logger.warning(f"[stripe] Erro ao processar invoice.payment_succeeded: {e}")
+
+    # ── Assinatura cancelada ou pausada ────────────────────────────────────────
     elif event_type in ("customer.subscription.deleted", "customer.subscription.paused"):
         subscription = event["data"]["object"]
         sub_id = subscription["id"]
@@ -91,32 +173,53 @@ def handle_webhook(payload: bytes, sig_header: str) -> dict:
                 logger.info(f"[stripe] Tenant {tenant['slug']} suspenso — sub={sub_id}")
                 _notify_suspended(tenant)
 
+    # ── Assinatura retomada ────────────────────────────────────────────────────
     elif event_type == "customer.subscription.resumed":
         subscription = event["data"]["object"]
         sub_id = subscription["id"]
         tenant = _get_tenant_by_stripe_sub(sub_id)
         if tenant:
-            db.update_tenant(tenant["slug"], status="active")
-            logger.info(f"[stripe] Tenant {tenant['slug']} reativado — sub={sub_id}")
+            expires_at = _iso_from_timestamp(subscription.get("current_period_end"))
+            db.update_tenant(tenant["slug"], status="active", plan_expires_at=expires_at)
+            logger.info(f"[stripe] Tenant {tenant['slug']} reativado — sub={sub_id} expira={expires_at}")
             _notify_reactivated(tenant)
 
     return {"received": True}
 
 
+def _plan_info(tenant: dict) -> dict:
+    """Retorna metadados do plano atual do tenant."""
+    plan_key = tenant.get("plan") or "mensal"
+    return PLANS.get(plan_key, PLANS["mensal"])
+
+
 def _notify_suspended(tenant: dict):
     """Envia WhatsApp para a psicóloga avisando que o acesso foi suspenso."""
-    import asyncio, config as _cfg
+    import asyncio
     psy_phone = tenant.get("psychologist_phone", "")
     setup_token = tenant.get("setup_token", "")
     if not psy_phone:
         return
+
+    plan = _plan_info(tenant)
+    expires_at = tenant.get("plan_expires_at", "")
+    expires_str = ""
+    if expires_at:
+        try:
+            d = datetime.fromisoformat(expires_at)
+            expires_str = f"\nSeu plano venceu em *{d.strftime('%d/%m/%Y')}*."
+        except Exception:
+            pass
+
     msg = (
         f"⚠️ *Consultório Inteligente — Acesso suspenso*\n\n"
-        f"Olá! O acesso do consultório *{tenant['name']}* foi suspenso por falta de pagamento.\n\n"
-        f"O agente está pausado e não responderá seus pacientes até a assinatura ser renovada.\n\n"
-        f"Para reativar, acesse:\n"
-        f"{_cfg.BASE_URL}/onboarding/pagamento?token={setup_token}\n\n"
-        f"Dúvidas? Fale com o suporte: wa.me/5511968439527"
+        f"Olá! O acesso do consultório *{tenant['name']}* foi suspenso.\n"
+        f"{expires_str}\n\n"
+        f"📋 *Plano anterior:* {plan['label']} ({plan['valor']})\n\n"
+        f"O agente está *pausado* e não responderá seus pacientes até a assinatura ser renovada.\n\n"
+        f"Para reativar agora, acesse:\n"
+        f"{config.BASE_URL}/onboarding/pagamento?token={setup_token}&suspended=1\n\n"
+        f"Dúvidas? Fale com o suporte:\nwa.me/5511968439527"
     )
     try:
         import whatsapp_service as wa_svc
@@ -129,15 +232,29 @@ def _notify_suspended(tenant: dict):
 
 def _notify_reactivated(tenant: dict):
     """Envia WhatsApp para a psicóloga avisando que o acesso foi reativado."""
-    import asyncio, config as _cfg
+    import asyncio
     psy_phone = tenant.get("psychologist_phone", "")
     if not psy_phone:
         return
+
+    plan = _plan_info(tenant)
+    expires_at = tenant.get("plan_expires_at", "")
+    expires_str = ""
+    if expires_at:
+        try:
+            d = datetime.fromisoformat(expires_at)
+            expires_str = f"\n📅 Próxima cobrança: *{d.strftime('%d/%m/%Y')}*"
+        except Exception:
+            pass
+
     msg = (
         f"✅ *Consultório Inteligente — Acesso reativado!*\n\n"
-        f"Ótimas notícias! O acesso do consultório *{tenant['name']}* foi reativado com sucesso.\n\n"
+        f"Ótimas notícias! O acesso do consultório *{tenant['name']}* foi reativado.\n\n"
+        f"📋 *Plano:* {plan['label']} ({plan['valor']}, {plan['resumo']})"
+        f"{expires_str}\n\n"
         f"O agente já está respondendo seus pacientes normalmente. 🎉\n\n"
-        f"Acesse seu painel: {_cfg.BASE_URL}/dashboard/{tenant['slug']}?token={tenant.get('dashboard_token','')}"
+        f"Acesse seu painel:\n"
+        f"{config.BASE_URL}/dashboard/{tenant['slug']}?token={tenant.get('dashboard_token','')}"
     )
     try:
         import whatsapp_service as wa_svc
