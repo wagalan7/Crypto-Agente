@@ -1,12 +1,12 @@
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from models import ProductInput
-from orchestrator import run_agency
+from database import init_db
+from routers import clients, agents, content, analytics, calendar
 
-app = FastAPI(title="Marketing Agency AI")
+app = FastAPI(title="Content Agency AI", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,22 +15,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.include_router(clients.router)
+app.include_router(agents.router)
+app.include_router(content.router)
+app.include_router(analytics.router)
+app.include_router(calendar.router)
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
-@app.post("/agency/run")
-async def run(data: ProductInput):
-    return StreamingResponse(
-        run_agency(data),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+@app.on_event("startup")
+async def startup():
+    init_db()
 
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 if os.path.isdir(STATIC_DIR):
     app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")

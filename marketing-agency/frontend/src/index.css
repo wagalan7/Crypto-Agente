@@ -9,37 +9,65 @@
 }
 
 @layer components {
-  .section-card {
+  .card {
     @apply bg-gray-900 border border-gray-800 rounded-xl p-5;
-  }
-
-  .section-label {
-    @apply text-xs font-bold tracking-widest uppercase mb-3 px-2 py-1 rounded inline-block;
-  }
-
-  .agent-output {
-    @apply whitespace-pre-wrap text-sm text-gray-300 font-mono leading-relaxed;
   }
 
   .input-field {
     @apply w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2.5 text-sm text-gray-100
-           placeholder-gray-500 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500
+           placeholder-gray-500 focus:outline-none focus:border-violet-500 focus:ring-1 focus:ring-violet-500
            transition-colors;
   }
 
   .btn-primary {
-    @apply bg-brand-600 hover:bg-brand-700 disabled:bg-gray-700 disabled:text-gray-500
-           text-white font-semibold px-6 py-3 rounded-xl transition-colors w-full text-sm;
+    @apply bg-violet-600 hover:bg-violet-700 disabled:bg-gray-700 disabled:text-gray-500
+           text-white font-semibold px-5 py-2.5 rounded-lg transition-colors text-sm;
+  }
+
+  .btn-secondary {
+    @apply bg-gray-800 hover:bg-gray-700 border border-gray-700
+           text-gray-300 font-medium px-4 py-2 rounded-lg transition-colors text-sm;
+  }
+
+  .badge {
+    @apply text-xs font-semibold px-2.5 py-0.5 rounded-full;
+  }
+
+  .agent-output {
+    @apply whitespace-pre-wrap text-sm text-gray-300 leading-relaxed;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium transition-colors;
+  }
+
+  .nav-link-active {
+    @apply bg-violet-600/20 text-violet-300;
+  }
+
+  .nav-link-inactive {
+    @apply text-gray-400 hover:text-gray-200 hover:bg-gray-800;
   }
 }
 
 .blinking-cursor::after {
   content: '▋';
   animation: blink 1s step-end infinite;
-  color: #4f6ef7;
+  color: #7c3aed;
 }
 
 @keyframes blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #374151;
+  border-radius: 3px;
 }

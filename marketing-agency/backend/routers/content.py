@@ -1,0 +1,108 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime
+from database import get_db
+from models import ContentPiece
+
+router = APIRouter(prefix="/content", tags=["content"])
+
+
+class ContentCreate(BaseModel):
+    client_id: int
+    title: str
+    format: str
+    platform: str
+    objective: str
+    hook: Optional[str] = None
+    script: Optional[str] = None
+    copy: Optional[str] = None
+    design_brief: Optional[str] = None
+    trend_context: Optional[str] = None
+    strategic_note: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+
+
+class ContentUpdate(BaseModel):
+    title: Optional[str] = None
+    hook: Optional[str] = None
+    script: Optional[str] = None
+    copy: Optional[str] = None
+    design_brief: Optional[str] = None
+    status: Optional[str] = None
+    strategic_note: Optional[str] = None
+
+
+def _serialize(c: ContentPiece) -> dict:
+    return {
+        "id": c.id,
+        "client_id": c.client_id,
+        "title": c.title,
+        "format": c.format,
+        "platform": c.platform,
+        "objective": c.objective,
+        "hook": c.hook,
+        "script": c.script,
+        "copy": c.copy,
+        "design_brief": c.design_brief,
+        "status": c.status,
+        "trend_context": c.trend_context,
+        "strategic_note": c.strategic_note,
+        "scheduled_at": c.scheduled_at.isoformat() if c.scheduled_at else None,
+        "published_at": c.published_at.isoformat() if c.published_at else None,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+@router.get("/client/{client_id}")
+def list_content(
+    client_id: int,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    q = db.query(ContentPiece).filter(ContentPiece.client_id == client_id)
+    if status:
+        q = q.filter(ContentPiece.status == status)
+    return [_serialize(c) for c in q.order_by(ContentPiece.created_at.desc()).all()]
+
+
+@router.post("/")
+def create_content(data: ContentCreate, db: Session = Depends(get_db)):
+    content = ContentPiece(**data.model_dump())
+    db.add(content)
+    db.commit()
+    db.refresh(content)
+    return _serialize(content)
+
+
+@router.get("/{content_id}")
+def get_content(content_id: int, db: Session = Depends(get_db)):
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    return _serialize(c)
+
+
+@router.patch("/{content_id}")
+def update_content(content_id: int, data: ContentUpdate, db: Session = Depends(get_db)):
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    for field, value in data.model_dump(exclude_none=True).items():
+        setattr(c, field, value)
+    if data.status == "published" and not c.published_at:
+        c.published_at = datetime.utcnow()
+    db.commit()
+    db.refresh(c)
+    return _serialize(c)
+
+
+@router.post("/{content_id}/approve")
+def approve_content(content_id: int, db: Session = Depends(get_db)):
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    c.status = "approved"
+    db.commit()
+    return _serialize(c)

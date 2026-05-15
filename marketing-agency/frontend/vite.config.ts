@@ -6,10 +6,11 @@ export default defineConfig({
   server: {
     port: 5174,
     proxy: {
-      '/agency': {
-        target: 'http://localhost:8001',
-        changeOrigin: true,
-      },
+      '/clients': { target: 'http://localhost:8001', changeOrigin: true },
+      '/agents': { target: 'http://localhost:8001', changeOrigin: true },
+      '/content': { target: 'http://localhost:8001', changeOrigin: true },
+      '/calendar': { target: 'http://localhost:8001', changeOrigin: true },
+      '/analytics': { target: 'http://localhost:8001', changeOrigin: true },
     },
   },
   build: {

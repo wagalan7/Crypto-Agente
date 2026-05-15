@@ -1,35 +1,127 @@
-export interface ProductInput {
-  produto: string
-  preco: string
-  publico: string
-  objetivo: string
-  plataforma: string
-  tom_de_voz: string
+export interface Client {
+  id: number
+  name: string
+  niche: string | null
+  target_audience: string | null
+  tone: string | null
+  personality: string | null
+  positioning: string | null
+  goals: string[]
+  platforms: string[]
+  authority_score: number
+  created_at: string | null
 }
 
-export type SectionKey = 'estrategia' | 'copy' | 'conteudo' | 'criativos' | 'ads' | 'automacao' | 'publicacao'
-
-export interface AgencyState {
-  estrategia: string
-  copy: string
-  conteudo: string
-  criativos: string
-  ads: string
-  automacao: string
-  publicacao: string
+export interface ContentPiece {
+  id: number
+  client_id: number
+  title: string
+  format: string
+  platform: string
+  objective: string
+  hook: string | null
+  script: string | null
+  copy: string | null
+  design_brief: string | null
+  status: 'pending' | 'approved' | 'recorded' | 'published'
+  trend_context: string | null
+  strategic_note: string | null
+  scheduled_at: string | null
+  published_at: string | null
+  created_at: string | null
 }
+
+export interface CalendarSlot {
+  id: number
+  client_id: number
+  content_id: number | null
+  scheduled_at: string
+  platform: string
+  format: string
+  objective: string
+  status: 'planned' | 'ready' | 'published'
+}
+
+export interface MetricsSummary {
+  client_id: number
+  period_days: number
+  content_count: number
+  totals: {
+    views: number
+    likes: number
+    comments: number
+    shares: number
+    saves: number
+    reach: number
+  }
+  averages: {
+    retention_rate: number
+    ctr: number
+    conversion_rate: number
+  }
+}
+
+export interface MetricsSnapshot {
+  id: number
+  client_id: number
+  content_id: number | null
+  platform: string
+  views: number
+  likes: number
+  comments: number
+  shares: number
+  saves: number
+  reach: number
+  retention_rate: number
+  ctr: number
+  conversion_rate: number
+  recorded_at: string
+}
+
+export type AgentType = 'strategy' | 'analytics' | 'script' | 'trend' | 'design' | 'amplifier'
 
 export interface SSEEvent {
-  type: 'status' | 'chunk' | 'section_done' | 'done'
-  payload: string | { section: SectionKey; text: string }
+  type: 'status' | 'chunk' | 'done'
+  payload: string
 }
 
-export const SECTION_META: Record<SectionKey, { label: string; color: string; agent: string }> = {
-  estrategia: { label: 'ESTRATÉGIA', color: 'text-violet-400 bg-violet-900/40 border-violet-700', agent: 'Agente 1 — Estrategista' },
-  copy:        { label: 'COPY',       color: 'text-blue-400 bg-blue-900/40 border-blue-700',     agent: 'Agente 2 — Copywriter' },
-  conteudo:    { label: 'CONTEÚDO',   color: 'text-cyan-400 bg-cyan-900/40 border-cyan-700',     agent: 'Agente 3 — Social Media' },
-  criativos:   { label: 'CRIATIVOS',  color: 'text-emerald-400 bg-emerald-900/40 border-emerald-700', agent: 'Agente 4 — Design Diretor' },
-  ads:         { label: 'ADS',        color: 'text-amber-400 bg-amber-900/40 border-amber-700',  agent: 'Agente 5 — Tráfego Pago' },
-  automacao:   { label: 'AUTOMAÇÃO',  color: 'text-orange-400 bg-orange-900/40 border-orange-700', agent: 'Agente 6 — Automação' },
-  publicacao:  { label: 'PUBLICAÇÃO', color: 'text-rose-400 bg-rose-900/40 border-rose-700',     agent: 'Agente 7 — Publicador' },
+export const OBJECTIVE_LABELS: Record<string, string> = {
+  attract: 'Atrair',
+  connect: 'Conectar',
+  authority: 'Autoridade',
+  sell: 'Vender',
+  break_objection: 'Quebrar Objeção',
+  retention: 'Retenção',
+}
+
+export const OBJECTIVE_COLORS: Record<string, string> = {
+  attract: 'bg-blue-900/40 text-blue-300 border-blue-700',
+  connect: 'bg-green-900/40 text-green-300 border-green-700',
+  authority: 'bg-violet-900/40 text-violet-300 border-violet-700',
+  sell: 'bg-orange-900/40 text-orange-300 border-orange-700',
+  break_objection: 'bg-red-900/40 text-red-300 border-red-700',
+  retention: 'bg-cyan-900/40 text-cyan-300 border-cyan-700',
+}
+
+export const FORMAT_LABELS: Record<string, string> = {
+  reels: 'Reels',
+  shorts: 'Shorts',
+  story: 'Story',
+  carousel: 'Carrossel',
+  post: 'Post',
+  youtube: 'YouTube',
+}
+
+export const STATUS_LABELS: Record<string, string> = {
+  pending: 'Pendente',
+  approved: 'Aprovado',
+  recorded: 'Gravado',
+  published: 'Publicado',
+}
+
+export const STATUS_COLORS: Record<string, string> = {
+  pending: 'bg-gray-700 text-gray-300',
+  approved: 'bg-green-900/40 text-green-300',
+  recorded: 'bg-blue-900/40 text-blue-300',
+  published: 'bg-violet-900/40 text-violet-300',
 }
