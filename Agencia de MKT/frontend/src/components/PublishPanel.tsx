@@ -133,6 +133,42 @@ function extractImagePrompt(designOutput: string): string {
   return ''
 }
 
+// Extracts the actual post text from the agent's full output.
+// Agents typically output something like:
+//   **POST 1 - Facebook**
+//   Plataforma: Facebook
+//   Texto final: "O texto que vai para o post..."
+//   Hashtags: #foo #bar
+// We pull the "Texto final" value and (optionally) append hashtags.
+function extractFinalPostText(raw: string, preferPlatform?: string): string {
+  if (!raw) return ''
+
+  // Normalize curly quotes to straight quotes for easier parsing
+  const text = raw.replace(/[""„‟]/g, '"').replace(/['']/g, "'")
+
+  // Try platform-specific section first if requested
+  if (preferPlatform) {
+    const platformRe = new RegExp(
+      `POST\\s*\\d*\\s*[-–:]?\\s*${preferPlatform}[\\s\\S]*?(?:Texto\\s+final|Texto|Post|Conteúdo|Caption|Legenda)\\s*[:=]\\s*"([^"]+)"`,
+      'i'
+    )
+    const m = text.match(platformRe)
+    if (m && m[1]) return m[1].trim()
+  }
+
+  // Generic: first "Texto final" / "Post final" / "Versão final" with quotes
+  const re = /(?:Texto\s+final|Post\s+final|Versão\s+final|Caption\s+final|Legenda\s+final|Texto)\s*[:=]\s*"([^"]+)"/i
+  const generic = text.match(re)
+  if (generic && generic[1]) return generic[1].trim()
+
+  // Fallback: quoted string after "Post X" header
+  const quoted = text.match(/\*\*POST[\s\S]*?"([^"]{20,})"/i)
+  if (quoted && quoted[1]) return quoted[1].trim()
+
+  // Last resort: return raw (user can edit manually)
+  return raw.trim()
+}
+
 function extractBudgetFromAds(adsOutput: string): Record<string, string> {
   if (!adsOutput) return {}
   const result: Record<string, string> = {}
@@ -246,10 +282,16 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
     }
   }
 
-  // Derived: show customText if user typed something, else fall back to agent output
-  // Use || (not ??) so empty strings "" also fall through to the next option
-  const agentText = publisherOutput || copyOutput || socialOutput || ''
+  // Derived: show customText if user typed something, else fall back to agent output.
+  // Use || (not ??) so empty strings "" also fall through to the next option.
+  const rawAgentOutput = publisherOutput || copyOutput || socialOutput || ''
   const agentSource = publisherOutput ? 'Publicador' : copyOutput ? 'Copy' : socialOutput ? 'Social' : null
+  // Prefer the platform-specific final text. If multiple platforms selected, pick the first.
+  const preferPlatform =
+    selected.has('facebook') ? 'Facebook' :
+    selected.has('instagram') ? 'Instagram' :
+    selected.has('twitter') ? 'Twitter' : undefined
+  const agentText = extractFinalPostText(rawAgentOutput, preferPlatform)
   const text = customText !== null ? customText : agentText
 
   const imagePrompt  = extractImagePrompt(designOutput)
@@ -317,7 +359,7 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
     setPublishedPosts([])
     try {
       const body = {
-        text: text || publisherOutput || copyOutput,
+        text: text || agentText,
         image_url: creds.image_url || undefined,
         platforms: [...selected],
         fb_page_id: creds.fb_page_id, fb_token: creds.fb_token,
@@ -404,7 +446,7 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
     setScheduleResult(null)
     try {
       const body = {
-        text: text || publisherOutput || copyOutput,
+        text: text || agentText,
         image_url: creds.image_url || undefined,
         platforms: [...selected].filter(p => p !== 'google'),
         scheduled_at: scheduleAt,
