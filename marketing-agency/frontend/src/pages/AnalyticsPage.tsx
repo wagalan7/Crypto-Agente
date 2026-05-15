@@ -2,19 +2,12 @@ import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { api } from '../services/api'
 import type { MetricsSummary, MetricsSnapshot } from '../types'
-import { AuthorityScore } from '../components/AuthorityScore'
 
-function StatRow({ label, value, max, unit = '' }: { label: string; value: number; max: number; unit?: string }) {
+function Bar({ value, max }: { value: number; max: number }) {
   const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0
   return (
-    <div className="space-y-1">
-      <div className="flex justify-between text-xs">
-        <span className="text-gray-400">{label}</span>
-        <span className="text-white font-medium">{value.toLocaleString('pt-BR')}{unit}</span>
-      </div>
-      <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
-        <div className="h-full bg-violet-500 rounded-full transition-all duration-500" style={{ width: `${pct}%` }} />
-      </div>
+    <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+      <div className="h-full bg-violet-500 rounded-full transition-all duration-500" style={{ width: `${pct}%` }} />
     </div>
   )
 }
@@ -25,11 +18,11 @@ export function AnalyticsPage() {
   const [summary, setSummary] = useState<MetricsSummary | null>(null)
   const [metrics, setMetrics] = useState<MetricsSnapshot[]>([])
   const [days, setDays] = useState(30)
-  const [addForm, setAddForm] = useState({
-    platform: 'instagram', views: '', likes: '', comments: '', shares: '', saves: '',
-    reach: '', retention_rate: '', ctr: '', content_id: '',
-  })
   const [adding, setAdding] = useState(false)
+  const [addForm, setAddForm] = useState({
+    platform: 'instagram', views: '', likes: '', comments: '',
+    shares: '', saves: '', reach: '', retention_rate: '', ctr: '',
+  })
 
   async function load() {
     const [s, m] = await Promise.all([
@@ -54,7 +47,6 @@ export function AnalyticsPage() {
       reach: Number(addForm.reach) || 0,
       retention_rate: Number(addForm.retention_rate) || 0,
       ctr: Number(addForm.ctr) || 0,
-      content_id: addForm.content_id ? Number(addForm.content_id) : undefined,
     })
     setAdding(false)
     await load()
@@ -63,41 +55,42 @@ export function AnalyticsPage() {
   const maxViews = Math.max(...metrics.map(m => m.views), 1)
 
   return (
-    <div className="p-6 space-y-5 max-w-5xl">
+    <div className="p-4 md:p-6 space-y-4 max-w-5xl">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-bold text-white">Analytics</h1>
-        <div className="flex gap-2">
-          {[7, 14, 30, 90].map(d => (
+        <div className="flex gap-1.5">
+          {[7, 14, 30].map(d => (
             <button key={d} onClick={() => setDays(d)}
-              className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${
+              className={`text-xs px-2.5 py-1.5 rounded-lg border transition-colors ${
                 days === d ? 'bg-violet-600/20 border-violet-500 text-violet-300' : 'bg-gray-800 border-gray-700 text-gray-400'
               }`}>
               {d}d
             </button>
           ))}
-          <button onClick={() => setAdding(true)} className="btn-primary w-auto px-4 text-xs">
-            + Adicionar Métricas
-          </button>
         </div>
       </div>
 
+      <button onClick={() => setAdding(v => !v)} className="btn-secondary w-full text-sm">
+        {adding ? '− Fechar' : '+ Adicionar Métricas'}
+      </button>
+
       {adding && (
         <div className="card space-y-3">
-          <h2 className="text-sm font-semibold text-white">Registrar métricas de conteúdo</h2>
-          <div className="grid grid-cols-4 gap-3">
+          <h2 className="text-sm font-semibold text-white">Registrar métricas</h2>
+          <div className="grid grid-cols-2 gap-2">
             {[
               { key: 'views', label: 'Views' },
               { key: 'likes', label: 'Curtidas' },
               { key: 'comments', label: 'Comentários' },
-              { key: 'shares', label: 'Compartilhamentos' },
+              { key: 'shares', label: 'Shares' },
               { key: 'saves', label: 'Salvamentos' },
               { key: 'reach', label: 'Alcance' },
               { key: 'retention_rate', label: 'Retenção (%)' },
               { key: 'ctr', label: 'CTR (%)' },
             ].map(({ key, label }) => (
               <div key={key}>
-                <label className="text-xs text-gray-400 mb-1 block">{label}</label>
-                <input type="number" className="input-field" placeholder="0"
+                <label className="text-xs text-gray-400 mb-0.5 block">{label}</label>
+                <input type="number" className="input-field py-2 text-sm" placeholder="0"
                   value={(addForm as any)[key]}
                   onChange={e => setAddForm(p => ({ ...p, [key]: e.target.value }))} />
               </div>
@@ -112,95 +105,88 @@ export function AnalyticsPage() {
 
       {summary && summary.content_count > 0 ? (
         <>
-          <div className="grid grid-cols-3 gap-4">
-            <div className="card col-span-1 flex justify-center">
-              <AuthorityScore score={0} />
-            </div>
-            <div className="card col-span-2 grid grid-cols-3 gap-3">
-              {[
-                { label: 'Views totais', value: summary.totals.views.toLocaleString('pt-BR') },
-                { label: 'Compartilhamentos', value: summary.totals.shares.toLocaleString('pt-BR') },
-                { label: 'Salvamentos', value: summary.totals.saves.toLocaleString('pt-BR') },
-                { label: 'Comentários', value: summary.totals.comments.toLocaleString('pt-BR') },
-                { label: 'Alcance total', value: summary.totals.reach.toLocaleString('pt-BR') },
-                { label: 'Conteúdos', value: String(summary.content_count) },
-              ].map(({ label, value }) => (
-                <div key={label}>
-                  <p className="text-xs text-gray-400">{label}</p>
-                  <p className="text-xl font-bold text-white">{value}</p>
-                </div>
-              ))}
-            </div>
+          {/* Totals grid */}
+          <div className="grid grid-cols-3 gap-2">
+            {[
+              { label: 'Views', value: summary.totals.views },
+              { label: 'Shares', value: summary.totals.shares },
+              { label: 'Salvamentos', value: summary.totals.saves },
+              { label: 'Curtidas', value: summary.totals.likes },
+              { label: 'Comentários', value: summary.totals.comments },
+              { label: 'Conteúdos', value: summary.content_count },
+            ].map(({ label, value }) => (
+              <div key={label} className="card p-3">
+                <p className="text-[10px] text-gray-400 mb-0.5">{label}</p>
+                <p className="text-lg font-bold text-white">
+                  {value >= 1000 ? `${(value / 1000).toFixed(1)}k` : value}
+                </p>
+              </div>
+            ))}
           </div>
 
-          <div className="grid grid-cols-3 gap-4">
-            <div className="card space-y-3">
-              <h2 className="text-sm font-semibold text-white">Médias</h2>
-              <div className="space-y-4">
-                <div>
-                  <p className="text-xs text-gray-400 mb-1">Retenção média</p>
-                  <div className="flex items-end gap-1">
-                    <p className="text-2xl font-bold text-white">{summary.averages.retention_rate}</p>
-                    <p className="text-sm text-gray-400 mb-1">%</p>
-                  </div>
+          {/* Averages */}
+          <div className="card space-y-3">
+            <h2 className="text-sm font-semibold text-white">Médias</h2>
+            {[
+              { label: 'Retenção média', value: `${summary.averages.retention_rate}%` },
+              { label: 'CTR médio', value: `${summary.averages.ctr}%` },
+              { label: 'Conversão', value: `${summary.averages.conversion_rate}%` },
+            ].map(({ label, value }) => (
+              <div key={label} className="flex justify-between items-center">
+                <span className="text-xs text-gray-400">{label}</span>
+                <span className="text-sm font-bold text-white">{value}</span>
+              </div>
+            ))}
+          </div>
+
+          {/* Engagement bars */}
+          <div className="card space-y-3">
+            <h2 className="text-sm font-semibold text-white">Engajamento</h2>
+            {[
+              { label: 'Views', value: summary.totals.views },
+              { label: 'Curtidas', value: summary.totals.likes },
+              { label: 'Comentários', value: summary.totals.comments },
+              { label: 'Shares', value: summary.totals.shares },
+              { label: 'Salvamentos', value: summary.totals.saves },
+            ].map(({ label, value }) => (
+              <div key={label} className="space-y-1">
+                <div className="flex justify-between text-xs">
+                  <span className="text-gray-400">{label}</span>
+                  <span className="text-white">{value.toLocaleString('pt-BR')}</span>
                 </div>
-                <div>
-                  <p className="text-xs text-gray-400 mb-1">CTR médio</p>
-                  <div className="flex items-end gap-1">
-                    <p className="text-2xl font-bold text-white">{summary.averages.ctr}</p>
-                    <p className="text-sm text-gray-400 mb-1">%</p>
+                <Bar value={value} max={summary.totals.views} />
+              </div>
+            ))}
+          </div>
+
+          {/* History */}
+          {metrics.length > 0 && (
+            <div className="card">
+              <h2 className="text-sm font-semibold text-white mb-3">Histórico</h2>
+              <div className="space-y-2 max-h-64 overflow-y-auto">
+                {metrics.map(m => (
+                  <div key={m.id} className="flex items-center gap-2 py-1.5 border-b border-gray-800 last:border-0">
+                    <div className="w-10 h-4 bg-gray-800 rounded overflow-hidden shrink-0">
+                      <div className="h-full bg-violet-600 rounded" style={{ width: `${(m.views / maxViews) * 100}%` }} />
+                    </div>
+                    <span className="text-xs text-gray-400 shrink-0">{m.platform}</span>
+                    <span className="text-xs text-white font-medium">
+                      {m.views >= 1000 ? `${(m.views / 1000).toFixed(1)}k` : m.views}v
+                    </span>
+                    <span className="text-xs text-gray-500">{m.retention_rate}% ret</span>
+                    <span className="ml-auto text-xs text-gray-600">
+                      {new Date(m.recorded_at).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}
+                    </span>
                   </div>
-                </div>
-                <div>
-                  <p className="text-xs text-gray-400 mb-1">Conversão</p>
-                  <div className="flex items-end gap-1">
-                    <p className="text-2xl font-bold text-white">{summary.averages.conversion_rate}</p>
-                    <p className="text-sm text-gray-400 mb-1">%</p>
-                  </div>
-                </div>
+                ))}
               </div>
             </div>
-
-            <div className="card col-span-2 space-y-3">
-              <h2 className="text-sm font-semibold text-white">Distribuição de engajamento</h2>
-              <StatRow label="Views" value={summary.totals.views} max={summary.totals.views} />
-              <StatRow label="Curtidas" value={summary.totals.likes} max={summary.totals.views} />
-              <StatRow label="Comentários" value={summary.totals.comments} max={summary.totals.views} />
-              <StatRow label="Compartilhamentos" value={summary.totals.shares} max={summary.totals.views} />
-              <StatRow label="Salvamentos" value={summary.totals.saves} max={summary.totals.views} />
-            </div>
-          </div>
-
-          <div className="card">
-            <h2 className="text-sm font-semibold text-white mb-4">Histórico de métricas</h2>
-            <div className="space-y-2 max-h-72 overflow-y-auto">
-              {metrics.map(m => (
-                <div key={m.id} className="flex items-center gap-4 py-2 border-b border-gray-800 last:border-0 text-xs">
-                  <div className="w-12">
-                    <div className="h-6 bg-gray-800 rounded overflow-hidden">
-                      <div
-                        className="h-full bg-violet-600 rounded"
-                        style={{ width: `${(m.views / maxViews) * 100}%` }}
-                      />
-                    </div>
-                  </div>
-                  <span className="text-gray-400">{m.platform}</span>
-                  <span className="text-white font-medium">{m.views.toLocaleString('pt-BR')} views</span>
-                  <span className="text-gray-400">{m.retention_rate}% ret.</span>
-                  <span className="text-gray-400">{m.shares} comp.</span>
-                  <span className="text-gray-400">{m.saves} salv.</span>
-                  <span className="ml-auto text-gray-600">
-                    {new Date(m.recorded_at).toLocaleDateString('pt-BR')}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
+          )}
         </>
       ) : (
-        <div className="card text-center py-16">
-          <p className="text-gray-500 mb-2">Nenhuma métrica registrada</p>
-          <p className="text-gray-600 text-xs">Adicione métricas de seus conteúdos para ver análises</p>
+        <div className="card text-center py-12">
+          <p className="text-gray-500 mb-1 text-sm">Nenhuma métrica registrada</p>
+          <p className="text-gray-600 text-xs">Adicione métricas para ver análises</p>
         </div>
       )}
     </div>

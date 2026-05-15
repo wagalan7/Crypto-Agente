@@ -22,7 +22,8 @@ function ClientLayout() {
   return (
     <div className="flex min-h-screen">
       <Sidebar clientName={clientName} />
-      <main className="flex-1 overflow-auto">
+      {/* pt-12 on mobile for top header, pb-16 for bottom nav */}
+      <main className="flex-1 overflow-auto pt-12 pb-20 md:pt-0 md:pb-0">
         <Outlet />
       </main>
     </div>

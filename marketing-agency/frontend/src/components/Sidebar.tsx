@@ -1,56 +1,79 @@
-import { NavLink, useParams } from 'react-router-dom'
+import { NavLink, useParams, useNavigate } from 'react-router-dom'
 
 const NAV = [
   { to: '', label: 'Dashboard', icon: '⬡' },
   { to: 'calendar', label: 'Calendário', icon: '◫' },
   { to: 'content', label: 'Conteúdo', icon: '◈' },
-  { to: 'agents', label: 'Agentes IA', icon: '◉' },
+  { to: 'agents', label: 'Agentes', icon: '◉' },
   { to: 'analytics', label: 'Analytics', icon: '◎' },
 ]
 
 export function Sidebar({ clientName }: { clientName?: string }) {
   const { clientId } = useParams<{ clientId: string }>()
+  const navigate = useNavigate()
   const base = `/client/${clientId}`
 
   return (
-    <aside className="w-52 shrink-0 border-r border-gray-800 flex flex-col min-h-screen bg-gray-950">
-      <div className="px-4 py-5 border-b border-gray-800">
-        <div className="flex items-center gap-2 mb-1">
-          <div className="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center text-white font-bold text-xs">
-            A
+    <>
+      {/* Desktop sidebar */}
+      <aside className="hidden md:flex w-52 shrink-0 border-r border-gray-800 flex-col min-h-screen bg-gray-950">
+        <div className="px-4 py-5 border-b border-gray-800">
+          <div className="flex items-center gap-2 mb-1">
+            <div className="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center text-white font-bold text-xs">A</div>
+            <span className="text-sm font-bold text-white">ContentAI</span>
           </div>
-          <span className="text-sm font-bold text-white">ContentAI</span>
+          {clientName && <p className="text-xs text-gray-500 truncate mt-1">{clientName}</p>}
         </div>
-        {clientName && (
-          <p className="text-xs text-gray-500 truncate mt-1">{clientName}</p>
-        )}
-      </div>
+        <nav className="flex-1 p-2 space-y-0.5">
+          {NAV.map(({ to, label, icon }) => (
+            <NavLink
+              key={to}
+              to={to ? `${base}/${to}` : base}
+              end={!to}
+              className={({ isActive }) => `nav-link ${isActive ? 'nav-link-active' : 'nav-link-inactive'}`}
+            >
+              <span className="text-base leading-none">{icon}</span>
+              <span>{label}</span>
+            </NavLink>
+          ))}
+        </nav>
+        <div className="p-3 border-t border-gray-800">
+          <NavLink to="/" className="nav-link nav-link-inactive text-xs">
+            <span>←</span>
+            <span>Trocar cliente</span>
+          </NavLink>
+        </div>
+      </aside>
 
-      <nav className="flex-1 p-2 space-y-0.5">
+      {/* Mobile top header */}
+      <header className="md:hidden fixed top-0 inset-x-0 z-40 bg-gray-950 border-b border-gray-800 flex items-center justify-between px-4 h-12">
+        <div className="flex items-center gap-2">
+          <div className="w-6 h-6 rounded-md bg-violet-600 flex items-center justify-center text-white font-bold text-xs">A</div>
+          <span className="text-sm font-semibold text-white truncate max-w-[180px]">{clientName || 'ContentAI'}</span>
+        </div>
+        <button onClick={() => navigate('/')} className="text-xs text-gray-400 border border-gray-700 rounded-md px-2 py-1">
+          Trocar
+        </button>
+      </header>
+
+      {/* Mobile bottom nav */}
+      <nav className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-gray-950 border-t border-gray-800 flex">
         {NAV.map(({ to, label, icon }) => (
           <NavLink
             key={to}
             to={to ? `${base}/${to}` : base}
             end={!to}
             className={({ isActive }) =>
-              `nav-link ${isActive ? 'nav-link-active' : 'nav-link-inactive'}`
+              `flex-1 flex flex-col items-center justify-center py-2 gap-0.5 text-[10px] font-medium transition-colors ${
+                isActive ? 'text-violet-400' : 'text-gray-500'
+              }`
             }
           >
-            <span className="text-base leading-none">{icon}</span>
+            <span className="text-lg leading-none">{icon}</span>
             <span>{label}</span>
           </NavLink>
         ))}
       </nav>
-
-      <div className="p-3 border-t border-gray-800">
-        <NavLink
-          to="/"
-          className="nav-link nav-link-inactive text-xs"
-        >
-          <span>←</span>
-          <span>Trocar cliente</span>
-        </NavLink>
-      </div>
-    </aside>
+    </>
   )
 }

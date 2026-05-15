@@ -7,9 +7,9 @@ import { OBJECTIVE_LABELS, OBJECTIVE_COLORS, FORMAT_LABELS } from '../types'
 
 function MetricCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
   return (
-    <div className="card">
-      <p className="text-xs text-gray-400 mb-1">{label}</p>
-      <p className="text-2xl font-bold text-white">{value}</p>
+    <div className="card p-3">
+      <p className="text-xs text-gray-400 mb-0.5">{label}</p>
+      <p className="text-xl font-bold text-white">{value}</p>
       {sub && <p className="text-xs text-gray-500 mt-0.5">{sub}</p>}
     </div>
   )
@@ -33,89 +33,89 @@ export function DashboardPage() {
     setClient(prev => prev ? { ...prev, authority_score: res.authority_score } : prev)
   }
 
-  if (!client) return <div className="p-8 text-gray-400">Carregando...</div>
+  if (!client) return <div className="p-6 text-gray-400 text-sm">Carregando...</div>
 
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 
   return (
-    <div className="p-6 space-y-6 max-w-5xl">
+    <div className="p-4 md:p-6 space-y-4 max-w-5xl">
+      {/* Header */}
       <div className="flex items-start justify-between">
-        <div>
-          <h1 className="text-xl font-bold text-white">{client.name}</h1>
-          <p className="text-sm text-gray-400 mt-0.5">{client.niche} · {client.platforms.join(', ')}</p>
+        <div className="min-w-0">
+          <h1 className="text-lg md:text-xl font-bold text-white truncate">{client.name}</h1>
+          <p className="text-xs text-gray-400 mt-0.5 truncate">{client.niche} · {client.platforms.join(', ')}</p>
         </div>
-        <button onClick={refreshScore} className="btn-secondary text-xs">
-          Atualizar Score
-        </button>
+        <button onClick={refreshScore} className="btn-secondary text-xs shrink-0 ml-2">Score</button>
       </div>
 
-      <div className="flex items-start gap-6">
+      {/* Authority + metrics */}
+      <div className="flex items-center gap-4">
         <AuthorityScore score={client.authority_score} />
-        <div className="flex-1 grid grid-cols-4 gap-3">
+        <div className="flex-1 grid grid-cols-2 gap-2">
           <MetricCard label="Views (30d)" value={summary ? fmt(summary.totals.views) : '—'} />
-          <MetricCard label="Compartilhamentos" value={summary ? fmt(summary.totals.shares) : '—'} />
+          <MetricCard label="Shares" value={summary ? fmt(summary.totals.shares) : '—'} />
           <MetricCard label="Salvamentos" value={summary ? fmt(summary.totals.saves) : '—'} />
           <MetricCard
-            label="Retenção média"
+            label="Retenção"
             value={summary ? `${summary.averages.retention_rate}%` : '—'}
             sub={summary ? `${summary.content_count} conteúdos` : undefined}
           />
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-6">
-        <div className="card">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-sm font-semibold text-white">Próximos 7 dias</h2>
-            <Link to={`/client/${id}/calendar`} className="text-xs text-violet-400 hover:text-violet-300">
-              Ver calendário →
-            </Link>
-          </div>
-          {slots.length === 0 ? (
-            <p className="text-xs text-gray-500">Nenhum slot planejado</p>
-          ) : (
-            <div className="space-y-2">
-              {slots.slice(0, 5).map(slot => {
-                const date = new Date(slot.scheduled_at)
-                return (
-                  <div key={slot.id} className="flex items-center gap-3">
-                    <div className="text-center w-10">
-                      <p className="text-xs text-gray-400">{date.toLocaleDateString('pt-BR', { weekday: 'short' })}</p>
-                      <p className="text-sm font-bold text-white">{date.getDate()}</p>
-                    </div>
-                    <div className="flex-1 flex items-center gap-2">
-                      <span className={`badge border text-xs ${OBJECTIVE_COLORS[slot.objective] || 'bg-gray-700 text-gray-300 border-gray-600'}`}>
-                        {OBJECTIVE_LABELS[slot.objective] || slot.objective}
-                      </span>
-                      <span className="text-xs text-gray-400">{FORMAT_LABELS[slot.format] || slot.format}</span>
-                    </div>
-                    <span className={`text-xs ${slot.status === 'ready' ? 'text-green-400' : 'text-gray-500'}`}>
-                      {slot.status === 'ready' ? 'Pronto' : 'Planejado'}
-                    </span>
-                  </div>
-                )
-              })}
-            </div>
-          )}
+      {/* Next 7 days */}
+      <div className="card">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-white">Próximos 7 dias</h2>
+          <Link to={`/client/${id}/calendar`} className="text-xs text-violet-400">Ver →</Link>
         </div>
-
-        <div className="card space-y-3">
-          <h2 className="text-sm font-semibold text-white">Atalhos rápidos</h2>
+        {slots.length === 0 ? (
+          <p className="text-xs text-gray-500">Nenhum slot planejado</p>
+        ) : (
           <div className="space-y-2">
-            {[
-              { to: `calendar`, label: 'Gerar calendário semanal', color: 'text-violet-400' },
-              { to: `agents`, label: 'Criar roteiro de conteúdo', color: 'text-blue-400' },
-              { to: `agents`, label: 'Amplificar ideia', color: 'text-green-400' },
-              { to: `content`, label: 'Aprovar conteúdo pendente', color: 'text-orange-400' },
-              { to: `analytics`, label: 'Ver análise de métricas', color: 'text-cyan-400' },
-            ].map(({ to, label, color }) => (
-              <Link key={label} to={`/client/${id}/${to}`}
-                className="flex items-center gap-2 text-sm text-gray-300 hover:text-white transition-colors group">
-                <span className={`text-lg ${color}`}>→</span>
-                <span className="group-hover:underline">{label}</span>
-              </Link>
-            ))}
+            {slots.slice(0, 5).map(slot => {
+              const date = new Date(slot.scheduled_at)
+              return (
+                <div key={slot.id} className="flex items-center gap-3">
+                  <div className="text-center w-9 shrink-0">
+                    <p className="text-[10px] text-gray-400">{date.toLocaleDateString('pt-BR', { weekday: 'short' })}</p>
+                    <p className="text-sm font-bold text-white">{date.getDate()}</p>
+                  </div>
+                  <div className="flex-1 flex items-center gap-1.5 min-w-0">
+                    <span className={`badge border text-[10px] shrink-0 ${OBJECTIVE_COLORS[slot.objective] || 'bg-gray-700 text-gray-300 border-gray-600'}`}>
+                      {OBJECTIVE_LABELS[slot.objective] || slot.objective}
+                    </span>
+                    <span className="text-xs text-gray-400 truncate">{FORMAT_LABELS[slot.format] || slot.format}</span>
+                  </div>
+                  <span className={`text-[10px] shrink-0 ${slot.status === 'ready' ? 'text-green-400' : 'text-gray-600'}`}>
+                    {slot.status === 'ready' ? '✓' : '○'}
+                  </span>
+                </div>
+              )
+            })}
           </div>
+        )}
+      </div>
+
+      {/* Quick actions */}
+      <div className="card">
+        <h2 className="text-sm font-semibold text-white mb-3">Ações rápidas</h2>
+        <div className="grid grid-cols-1 gap-2">
+          {[
+            { to: 'calendar', label: 'Gerar calendário semanal', color: 'text-violet-400', bg: 'bg-violet-900/20 border-violet-800/50' },
+            { to: 'agents', label: 'Criar roteiro com IA', color: 'text-blue-400', bg: 'bg-blue-900/20 border-blue-800/50' },
+            { to: 'agents', label: 'Amplificar ideia', color: 'text-green-400', bg: 'bg-green-900/20 border-green-800/50' },
+            { to: 'content', label: 'Aprovar conteúdo pendente', color: 'text-orange-400', bg: 'bg-orange-900/20 border-orange-800/50' },
+          ].map(({ to, label, color, bg }) => (
+            <Link
+              key={label}
+              to={`/client/${id}/${to}`}
+              className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border transition-colors ${bg}`}
+            >
+              <span className={`text-base ${color}`}>→</span>
+              <span className="text-sm text-gray-200">{label}</span>
+            </Link>
+          ))}
         </div>
       </div>
 
