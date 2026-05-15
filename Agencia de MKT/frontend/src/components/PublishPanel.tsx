@@ -95,11 +95,11 @@ const CRED_GUIDES: Record<string, { steps: string[]; link: string }> = {
 }
 
 // Budget ranges per platform (R$/day) shown as guidance
+// Only paid-ads platforms have a budget. Organic posts (facebook, instagram, twitter)
+// are FREE — showing a budget field for them was misleading users into thinking
+// the post would be sponsored.
 const BUDGET_DEFAULTS: Record<string, { min: number; max: number; currency: string }> = {
-  facebook:     { min: 15,  max: 150,  currency: 'R$/dia' },
   facebook_ads: { min: 15,  max: 500,  currency: 'R$/dia' },
-  instagram:    { min: 15,  max: 150,  currency: 'R$/dia' },
-  twitter:      { min: 20,  max: 200,  currency: 'R$/dia' },
   google:       { min: 30,  max: 500,  currency: 'R$/dia' },
   tiktok:       { min: 50,  max: 300,  currency: 'R$/dia' },
 }
@@ -134,36 +134,40 @@ function extractImagePrompt(designOutput: string): string {
 }
 
 // Extracts the actual post text from the agent's full output.
-// Agents typically output something like:
-//   **POST 1 - Facebook**
-//   Plataforma: Facebook
-//   Texto final: "O texto que vai para o post..."
-//   Hashtags: #foo #bar
-// We pull the "Texto final" value and (optionally) append hashtags.
+// Handles multiple formats agents use:
+//   "Texto final: \"...\""           (inline)
+//   "**Texto Final:**\n\"...\""      (markdown bold + newline)
+//   "**Peça 1:** ... \"...\""        (no explicit label)
 function extractFinalPostText(raw: string, preferPlatform?: string): string {
   if (!raw) return ''
 
   // Normalize curly quotes to straight quotes for easier parsing
   const text = raw.replace(/[""„‟]/g, '"').replace(/['']/g, "'")
 
+  // Label patterns: any of these (case-insensitive). Allow markdown chars (*, _, :, \n, space) before the opening quote.
+  const labelPattern = '(?:Texto\\s+final|Post\\s+final|Versão\\s+final|Caption\\s+final|Legenda\\s+final|Caption|Legenda)'
+  const sepPattern   = '[*_:\\s\\-–\\.]*'  // markdown + whitespace + punctuation
+
   // Try platform-specific section first if requested
   if (preferPlatform) {
     const platformRe = new RegExp(
-      `POST\\s*\\d*\\s*[-–:]?\\s*${preferPlatform}[\\s\\S]*?(?:Texto\\s+final|Texto|Post|Conteúdo|Caption|Legenda)\\s*[:=]\\s*"([^"]+)"`,
+      `(?:POST|Peça|Post|Versão)\\s*\\d*[\\s\\S]{0,200}?${preferPlatform}[\\s\\S]*?${labelPattern}${sepPattern}"([^"]+)"`,
       'i'
     )
     const m = text.match(platformRe)
     if (m && m[1]) return m[1].trim()
   }
 
-  // Generic: first "Texto final" / "Post final" / "Versão final" with quotes
-  const re = /(?:Texto\s+final|Post\s+final|Versão\s+final|Caption\s+final|Legenda\s+final|Texto)\s*[:=]\s*"([^"]+)"/i
+  // Generic: first labelled quoted block
+  const re = new RegExp(`${labelPattern}${sepPattern}"([^"]+)"`, 'i')
   const generic = text.match(re)
   if (generic && generic[1]) return generic[1].trim()
 
-  // Fallback: quoted string after "Post X" header
-  const quoted = text.match(/\*\*POST[\s\S]*?"([^"]{20,})"/i)
-  if (quoted && quoted[1]) return quoted[1].trim()
+  // Fallback: longest quoted string of reasonable length
+  const allQuoted = [...text.matchAll(/"([^"]{30,})"/g)].map(m => m[1])
+  if (allQuoted.length > 0) {
+    return allQuoted.sort((a, b) => b.length - a.length)[0].trim()
+  }
 
   // Last resort: return raw (user can edit manually)
   return raw.trim()
@@ -353,7 +357,10 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
       return
     }
     setValidationErrors([])
-    if (selected.size === 0 || !budgetConfirmed) return
+    if (selected.size === 0) return
+    // Budget confirmation only required when paid-ads platforms are selected
+    const hasPaidPlatform = [...selected].some(p => p in BUDGET_DEFAULTS)
+    if (hasPaidPlatform && !budgetConfirmed) return
     setPublishing(true)
     setResults([])
     setPublishedPosts([])
