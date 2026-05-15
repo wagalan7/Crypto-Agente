@@ -880,21 +880,23 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
           {results.length > 0 && (
             <div className="space-y-2">
               {results.map((r, i) => (
-                <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-lg text-xs
+                <div key={i} className={`px-3 py-2 rounded-lg text-xs
                   ${r.success ? 'bg-emerald-900/20 border border-emerald-800' : 'bg-red-900/20 border border-red-800'}`}>
-                  <div className="flex items-center gap-2">
-                    <span className={r.success ? 'text-emerald-400' : 'text-red-400'}>
-                      {r.success ? '✓' : '✗'}
-                    </span>
-                    <span className="capitalize font-medium">{r.platform}</span>
-                    {!r.success && (
-                      <span className="text-red-400 truncate max-w-64">{r.error}</span>
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-2 flex-1 min-w-0">
+                      <span className={r.success ? 'text-emerald-400' : 'text-red-400'}>
+                        {r.success ? '✓' : '✗'}
+                      </span>
+                      <span className="capitalize font-medium">{r.platform}</span>
+                      {!r.success && (
+                        <span className="text-red-400 break-all whitespace-pre-wrap flex-1">{r.error}</span>
+                      )}
+                    </div>
+                    {r.success && r.url && (
+                      <a href={r.url} target="_blank" rel="noopener noreferrer"
+                        className="text-emerald-400 hover:underline shrink-0">ver post ↗</a>
                     )}
                   </div>
-                  {r.success && r.url && (
-                    <a href={r.url} target="_blank" rel="noopener noreferrer"
-                      className="text-emerald-400 hover:underline">ver post ↗</a>
-                  )}
                 </div>
               ))}
             </div>
