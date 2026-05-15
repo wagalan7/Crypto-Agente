@@ -1,53 +1,45 @@
 import os
-import anthropic
 from typing import AsyncIterator, Optional
+from groq import AsyncGroq
 
 
 class BaseAgent:
-    model = "claude-sonnet-4-6"
+    model = "llama-3.3-70b-versatile"
     max_tokens = 2048
 
     def __init__(self, system_prompt: str, agent_type: str):
-        self.client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self.client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
         self.system_prompt = system_prompt
         self.agent_type = agent_type
 
-    def _system_with_cache(self) -> list:
-        return [{"type": "text", "text": self.system_prompt, "cache_control": {"type": "ephemeral"}}]
-
     async def run(self, prompt: str, context: Optional[str] = None) -> str:
-        messages = []
+        messages = [{"role": "system", "content": self.system_prompt}]
         if context:
-            messages.append({"role": "user", "content": [
-                {"type": "text", "text": context, "cache_control": {"type": "ephemeral"}},
-            ]})
+            messages.append({"role": "user", "content": context})
             messages.append({"role": "assistant", "content": "Contexto recebido. Aguardando instrução."})
         messages.append({"role": "user", "content": prompt})
 
-        response = await self.client.messages.create(
+        response = await self.client.chat.completions.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            system=self._system_with_cache(),
             messages=messages,
-            betas=["prompt-caching-2024-07-31"],
         )
-        return response.content[0].text
+        return response.choices[0].message.content
 
     async def stream(self, prompt: str, context: Optional[str] = None) -> AsyncIterator[str]:
-        messages = []
+        messages = [{"role": "system", "content": self.system_prompt}]
         if context:
-            messages.append({"role": "user", "content": [
-                {"type": "text", "text": context, "cache_control": {"type": "ephemeral"}},
-            ]})
+            messages.append({"role": "user", "content": context})
             messages.append({"role": "assistant", "content": "Contexto recebido. Aguardando instrução."})
         messages.append({"role": "user", "content": prompt})
 
-        async with self.client.messages.stream(
+        stream = await self.client.chat.completions.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            system=self._system_with_cache(),
             messages=messages,
-            betas=["prompt-caching-2024-07-31"],
-        ) as s:
-            async for text in s.text_stream:
-                yield text
+            stream=True,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
