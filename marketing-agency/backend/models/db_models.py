@@ -1,13 +1,36 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, Float, DateTime, ForeignKey, JSON, Boolean
+from sqlalchemy import Column, Integer, String, Text, Float, DateTime, ForeignKey, JSON, Boolean, Enum
 from sqlalchemy.orm import relationship
 from database import Base
+import enum
+
+
+class UserRole(str, enum.Enum):
+    master = "master"
+    admin = "admin"
+    user = "user"
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(200), unique=True, nullable=False, index=True)
+    password_hash = Column(String(200), nullable=False)
+    name = Column(String(200))
+    role = Column(String(20), default="user")  # master / admin / user
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    clients = relationship("Client", back_populates="owner", foreign_keys="Client.owner_id")
+    granted_access = relationship("ClientAccess", back_populates="user", foreign_keys="ClientAccess.user_id")
 
 
 class Client(Base):
     __tablename__ = "clients"
 
     id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     name = Column(String(200), nullable=False)
     niche = Column(String(200))
     target_audience = Column(Text)
@@ -20,10 +43,26 @@ class Client(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    owner = relationship("User", back_populates="clients", foreign_keys=[owner_id])
+    access_grants = relationship("ClientAccess", back_populates="client")
     contents = relationship("ContentPiece", back_populates="client")
     calendar_slots = relationship("CalendarSlot", back_populates="client")
     metrics = relationship("MetricsSnapshot", back_populates="client")
     memories = relationship("AgentMemory", back_populates="client")
+
+
+class ClientAccess(Base):
+    """Grants a non-owner user access to a client."""
+    __tablename__ = "client_access"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    granted_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    client = relationship("Client", back_populates="access_grants")
+    user = relationship("User", back_populates="granted_access", foreign_keys=[user_id])
 
 
 class ContentPiece(Base):
@@ -32,14 +71,14 @@ class ContentPiece(Base):
     id = Column(Integer, primary_key=True, index=True)
     client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
     title = Column(String(500))
-    format = Column(String(50))  # reels, carousel, story, post, short, youtube
+    format = Column(String(50))
     platform = Column(String(50))
-    objective = Column(String(100))  # attract, connect, position, sell, break_objection, authority
+    objective = Column(String(100))
     hook = Column(Text)
     script = Column(Text)
     copy = Column(Text)
     design_brief = Column(Text)
-    status = Column(String(50), default="pending")  # pending, approved, recorded, published
+    status = Column(String(50), default="pending")
     scheduled_at = Column(DateTime)
     published_at = Column(DateTime)
     trend_context = Column(Text)
@@ -60,7 +99,7 @@ class CalendarSlot(Base):
     platform = Column(String(50))
     format = Column(String(50))
     objective = Column(String(100))
-    status = Column(String(50), default="planned")  # planned, ready, published
+    status = Column(String(50), default="planned")
 
     client = relationship("Client", back_populates="calendar_slots")
     content = relationship("ContentPiece")
@@ -94,7 +133,7 @@ class AgentMemory(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
-    agent_type = Column(String(50))  # strategy, analytics, script, trend, design, amplifier
+    agent_type = Column(String(50))
     memory_key = Column(String(200))
     memory_value = Column(Text)
     is_active = Column(Boolean, default=True)

@@ -4,7 +4,8 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 from database import get_db
-from models import ContentPiece
+from models import ContentPiece, User
+from auth import get_current_user, assert_client_access
 
 router = APIRouter(prefix="/content", tags=["content"])
 
@@ -59,8 +60,10 @@ def _serialize(c: ContentPiece) -> dict:
 def list_content(
     client_id: int,
     status: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    assert_client_access(client_id, current_user, db)
     q = db.query(ContentPiece).filter(ContentPiece.client_id == client_id)
     if status:
         q = q.filter(ContentPiece.status == status)
@@ -68,7 +71,8 @@ def list_content(
 
 
 @router.post("/")
-def create_content(data: ContentCreate, db: Session = Depends(get_db)):
+def create_content(data: ContentCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(data.client_id, current_user, db)
     content = ContentPiece(**data.model_dump())
     db.add(content)
     db.commit()
@@ -77,7 +81,7 @@ def create_content(data: ContentCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/{content_id}")
-def get_content(content_id: int, db: Session = Depends(get_db)):
+def get_content(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not c:
         raise HTTPException(404, "Content not found")
@@ -85,7 +89,7 @@ def get_content(content_id: int, db: Session = Depends(get_db)):
 
 
 @router.patch("/{content_id}")
-def update_content(content_id: int, data: ContentUpdate, db: Session = Depends(get_db)):
+def update_content(content_id: int, data: ContentUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not c:
         raise HTTPException(404, "Content not found")
@@ -99,7 +103,7 @@ def update_content(content_id: int, data: ContentUpdate, db: Session = Depends(g
 
 
 @router.post("/{content_id}/approve")
-def approve_content(content_id: int, db: Session = Depends(get_db)):
+def approve_content(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not c:
         raise HTTPException(404, "Content not found")

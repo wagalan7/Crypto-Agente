@@ -3,7 +3,8 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, List
 from database import get_db
-from models import Client
+from models import User, Client, ClientAccess
+from auth import get_current_user, assert_client_access
 from services import AuthorityScorer
 
 router = APIRouter(prefix="/clients", tags=["clients"])
@@ -34,6 +35,7 @@ class ClientUpdate(BaseModel):
 def _serialize(c: Client) -> dict:
     return {
         "id": c.id,
+        "owner_id": c.owner_id,
         "name": c.name,
         "niche": c.niche,
         "target_audience": c.target_audience,
@@ -47,15 +49,23 @@ def _serialize(c: Client) -> dict:
     }
 
 
+def _accessible_client_ids(user: User, db: Session) -> list:
+    """Returns list of client IDs this user can see."""
+    owned = [c.id for c in db.query(Client.id).filter(Client.owner_id == user.id).all()]
+    granted = [a.client_id for a in db.query(ClientAccess.client_id).filter(ClientAccess.user_id == user.id).all()]
+    return list(set(owned + granted))
+
+
 @router.get("/")
-def list_clients(db: Session = Depends(get_db)):
-    clients = db.query(Client).order_by(Client.created_at.desc()).all()
+def list_clients(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ids = _accessible_client_ids(current_user, db)
+    clients = db.query(Client).filter(Client.id.in_(ids)).order_by(Client.created_at.desc()).all()
     return [_serialize(c) for c in clients]
 
 
 @router.post("/")
-def create_client(data: ClientCreate, db: Session = Depends(get_db)):
-    client = Client(**data.model_dump())
+def create_client(data: ClientCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    client = Client(**data.model_dump(), owner_id=current_user.id)
     db.add(client)
     db.commit()
     db.refresh(client)
@@ -63,18 +73,16 @@ def create_client(data: ClientCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/{client_id}")
-def get_client(client_id: int, db: Session = Depends(get_db)):
+def get_client(client_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(client_id, current_user, db)
     client = db.query(Client).filter(Client.id == client_id).first()
-    if not client:
-        raise HTTPException(404, "Client not found")
     return _serialize(client)
 
 
 @router.patch("/{client_id}")
-def update_client(client_id: int, data: ClientUpdate, db: Session = Depends(get_db)):
+def update_client(client_id: int, data: ClientUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(client_id, current_user, db)
     client = db.query(Client).filter(Client.id == client_id).first()
-    if not client:
-        raise HTTPException(404, "Client not found")
     for field, value in data.model_dump(exclude_none=True).items():
         setattr(client, field, value)
     db.commit()
@@ -83,7 +91,8 @@ def update_client(client_id: int, data: ClientUpdate, db: Session = Depends(get_
 
 
 @router.post("/{client_id}/refresh-score")
-def refresh_score(client_id: int, db: Session = Depends(get_db)):
+def refresh_score(client_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(client_id, current_user, db)
     scorer = AuthorityScorer(db)
     score = scorer.update(client_id)
     return {"authority_score": score}

@@ -5,9 +5,10 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
 from database import get_db
-from models import Client
+from models import Client, User
 from agents import StrategyAgent, AnalyticsAgent, ScriptAgent, TrendAgent, DesignAgent, AmplifierAgent
 from services import MemoryService
+from auth import get_current_user, assert_client_access
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -60,16 +61,9 @@ class AnalyticsRequest(BaseModel):
     metrics_data: str
 
 
-def _require_client(client_id: int, db: Session) -> Client:
-    client = db.query(Client).filter(Client.id == client_id).first()
-    if not client:
-        raise HTTPException(404, "Client not found")
-    return client
-
-
 @router.post("/strategy/stream")
-async def strategy_stream(req: StrategyRequest, db: Session = Depends(get_db)):
-    _require_client(req.client_id, db)
+async def strategy_stream(req: StrategyRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(req.client_id, current_user, db)
     mem = MemoryService(db)
     context = mem.build_client_context(req.client_id)
     agent = StrategyAgent()
@@ -88,8 +82,8 @@ async def strategy_stream(req: StrategyRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/analytics/stream")
-async def analytics_stream(req: AnalyticsRequest, db: Session = Depends(get_db)):
-    _require_client(req.client_id, db)
+async def analytics_stream(req: AnalyticsRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(req.client_id, current_user, db)
     mem = MemoryService(db)
     context = mem.build_client_context(req.client_id)
     history = mem.get(req.client_id, "analytics", "last_insights") or ""
@@ -109,8 +103,8 @@ async def analytics_stream(req: AnalyticsRequest, db: Session = Depends(get_db))
 
 
 @router.post("/script/stream")
-async def script_stream(req: ScriptRequest, db: Session = Depends(get_db)):
-    _require_client(req.client_id, db)
+async def script_stream(req: ScriptRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(req.client_id, current_user, db)
     mem = MemoryService(db)
     context = mem.build_client_context(req.client_id)
     patterns = mem.build_winning_patterns(req.client_id)
@@ -127,8 +121,8 @@ async def script_stream(req: ScriptRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/trend/stream")
-async def trend_stream(req: TrendRequest, db: Session = Depends(get_db)):
-    _require_client(req.client_id, db)
+async def trend_stream(req: TrendRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(req.client_id, current_user, db)
     mem = MemoryService(db)
     context = mem.build_client_context(req.client_id)
     agent = TrendAgent()
@@ -144,8 +138,8 @@ async def trend_stream(req: TrendRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/design/stream")
-async def design_stream(req: DesignRequest, db: Session = Depends(get_db)):
-    _require_client(req.client_id, db)
+async def design_stream(req: DesignRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(req.client_id, current_user, db)
     mem = MemoryService(db)
     context = mem.build_client_context(req.client_id)
     agent = DesignAgent()
@@ -161,8 +155,8 @@ async def design_stream(req: DesignRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/amplifier/stream")
-async def amplifier_stream(req: AmplifierRequest, db: Session = Depends(get_db)):
-    _require_client(req.client_id, db)
+async def amplifier_stream(req: AmplifierRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(req.client_id, current_user, db)
     mem = MemoryService(db)
     context = mem.build_client_context(req.client_id)
     agent = AmplifierAgent()

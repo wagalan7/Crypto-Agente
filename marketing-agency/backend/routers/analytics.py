@@ -4,8 +4,9 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 from database import get_db
-from models import MetricsSnapshot
+from models import MetricsSnapshot, User
 from services import AuthorityScorer
+from auth import get_current_user, assert_client_access
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -45,7 +46,8 @@ def _serialize(m: MetricsSnapshot) -> dict:
 
 
 @router.post("/metrics")
-def add_metrics(data: MetricsCreate, db: Session = Depends(get_db)):
+def add_metrics(data: MetricsCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(data.client_id, current_user, db)
     m = MetricsSnapshot(**data.model_dump())
     db.add(m)
     db.commit()
@@ -56,7 +58,8 @@ def add_metrics(data: MetricsCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/client/{client_id}/summary")
-def get_summary(client_id: int, days: int = 30, db: Session = Depends(get_db)):
+def get_summary(client_id: int, days: int = 30, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(client_id, current_user, db)
     from datetime import timedelta
     since = datetime.utcnow() - timedelta(days=days)
     metrics = (
@@ -89,7 +92,8 @@ def get_summary(client_id: int, days: int = 30, db: Session = Depends(get_db)):
 
 
 @router.get("/client/{client_id}/metrics")
-def list_metrics(client_id: int, limit: int = 50, db: Session = Depends(get_db)):
+def list_metrics(client_id: int, limit: int = 50, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_client_access(client_id, current_user, db)
     metrics = (
         db.query(MetricsSnapshot)
         .filter(MetricsSnapshot.client_id == client_id)

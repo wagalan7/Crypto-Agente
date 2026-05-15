@@ -1,3 +1,3 @@
-from . import clients, agents, content, analytics, calendar
+from . import auth, clients, agents, content, analytics, calendar
 
-__all__ = ["clients", "agents", "content", "analytics", "calendar"]
+__all__ = ["auth", "clients", "agents", "content", "analytics", "calendar"]

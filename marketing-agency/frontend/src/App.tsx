@@ -1,5 +1,7 @@
-import { Routes, Route, useParams, Outlet } from 'react-router-dom'
+import { Routes, Route, Navigate, useParams, Outlet } from 'react-router-dom'
 import { useState, useEffect } from 'react'
+import { useAuth } from './context/AuthContext'
+import { LoginPage } from './pages/LoginPage'
 import { ClientsPage } from './pages/ClientsPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { CalendarPage } from './pages/CalendarPage'
@@ -9,20 +11,25 @@ import { AnalyticsPage } from './pages/AnalyticsPage'
 import { Sidebar } from './components/Sidebar'
 import { api } from './services/api'
 
+function RequireAuth({ children }: { children: JSX.Element }) {
+  const { user, loading } = useAuth()
+  if (loading) return <div className="min-h-screen bg-gray-950 flex items-center justify-center text-gray-400 text-sm">Carregando...</div>
+  return user ? children : <Navigate to="/login" replace />
+}
+
 function ClientLayout() {
   const { clientId } = useParams<{ clientId: string }>()
   const [clientName, setClientName] = useState<string>()
 
   useEffect(() => {
     if (clientId) {
-      api.clients.get(Number(clientId)).then((c: any) => setClientName(c.name))
+      api.clients.get(Number(clientId)).then((c: any) => setClientName(c.name)).catch(() => {})
     }
   }, [clientId])
 
   return (
     <div className="flex min-h-screen">
       <Sidebar clientName={clientName} />
-      {/* pt-12 on mobile for top header, pb-16 for bottom nav */}
       <main className="flex-1 overflow-auto pt-12 pb-20 md:pt-0 md:pb-0">
         <Outlet />
       </main>
@@ -33,14 +40,16 @@ function ClientLayout() {
 export default function App() {
   return (
     <Routes>
-      <Route path="/" element={<ClientsPage />} />
-      <Route path="/client/:clientId" element={<ClientLayout />}>
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/" element={<RequireAuth><ClientsPage /></RequireAuth>} />
+      <Route path="/client/:clientId" element={<RequireAuth><ClientLayout /></RequireAuth>}>
         <Route index element={<DashboardPage />} />
         <Route path="calendar" element={<CalendarPage />} />
         <Route path="content" element={<ContentPage />} />
         <Route path="agents" element={<AgentsPage />} />
         <Route path="analytics" element={<AnalyticsPage />} />
       </Route>
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
 }

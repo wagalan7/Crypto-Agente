@@ -1,4 +1,5 @@
 import { NavLink, useParams, useNavigate } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
 
 const NAV = [
   { to: '', label: 'Dashboard', icon: '⬡' },
@@ -11,7 +12,13 @@ const NAV = [
 export function Sidebar({ clientName }: { clientName?: string }) {
   const { clientId } = useParams<{ clientId: string }>()
   const navigate = useNavigate()
+  const { user, logout } = useAuth()
   const base = `/client/${clientId}`
+
+  function handleLogout() {
+    logout()
+    navigate('/login', { replace: true })
+  }
 
   return (
     <>
@@ -37,11 +44,20 @@ export function Sidebar({ clientName }: { clientName?: string }) {
             </NavLink>
           ))}
         </nav>
-        <div className="p-3 border-t border-gray-800">
+        <div className="p-3 border-t border-gray-800 space-y-1">
           <NavLink to="/" className="nav-link nav-link-inactive text-xs">
             <span>←</span>
             <span>Trocar cliente</span>
           </NavLink>
+          {user && (
+            <div className="px-3 py-1">
+              <p className="text-[10px] text-gray-500 truncate">{user.email}</p>
+              <p className="text-[10px] text-violet-500 capitalize">{user.role}</p>
+            </div>
+          )}
+          <button onClick={handleLogout} className="nav-link nav-link-inactive text-xs w-full text-left">
+            <span>⏻</span><span>Sair</span>
+          </button>
         </div>
       </aside>
 
@@ -51,8 +67,8 @@ export function Sidebar({ clientName }: { clientName?: string }) {
           <div className="w-6 h-6 rounded-md bg-violet-600 flex items-center justify-center text-white font-bold text-xs">A</div>
           <span className="text-sm font-semibold text-white truncate max-w-[180px]">{clientName || 'ContentAI'}</span>
         </div>
-        <button onClick={() => navigate('/')} className="text-xs text-gray-400 border border-gray-700 rounded-md px-2 py-1">
-          Trocar
+        <button onClick={handleLogout} className="text-xs text-gray-400 border border-gray-700 rounded-md px-2 py-1">
+          Sair
         </button>
       </header>
 

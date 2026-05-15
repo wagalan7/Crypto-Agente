@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from database import init_db
-from routers import clients, agents, content, analytics, calendar
+from routers import auth, clients, agents, content, analytics, calendar
 
 app = FastAPI(title="Content Agency AI", version="2.0.0")
 
@@ -15,6 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router)
 app.include_router(clients.router)
 app.include_router(agents.router)
 app.include_router(content.router)
@@ -30,6 +31,32 @@ async def health():
 @app.on_event("startup")
 async def startup():
     init_db()
+    _seed_users()
+
+
+def _seed_users():
+    from database import SessionLocal
+    from models import User
+    from auth import hash_password
+
+    SEED = [
+        {"email": "wagalan@gmail.com", "password": "@l61310788", "name": "Wagner", "role": "master"},
+        {"email": "brunaparolin6@gmail.com", "password": "231981", "name": "Bruna", "role": "master"},
+    ]
+
+    db = SessionLocal()
+    try:
+        for s in SEED:
+            if not db.query(User).filter(User.email == s["email"]).first():
+                db.add(User(
+                    email=s["email"],
+                    password_hash=hash_password(s["password"]),
+                    name=s["name"],
+                    role=s["role"],
+                ))
+        db.commit()
+    finally:
+        db.close()
 
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")

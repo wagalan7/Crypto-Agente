@@ -3,11 +3,13 @@ import { useNavigate } from 'react-router-dom'
 import { api } from '../services/api'
 import type { Client } from '../types'
 import { AuthorityScore } from '../components/AuthorityScore'
+import { useAuth } from '../context/AuthContext'
 
 const PLATFORMS = ['instagram', 'tiktok', 'youtube', 'linkedin', 'twitter']
 const GOALS = ['Crescer seguidores', 'Vender produto', 'Gerar leads', 'Construir autoridade', 'Fidelizar audiência']
 
 export function ClientsPage() {
+  const { user, logout } = useAuth()
   const [clients, setClients] = useState<Client[]>([])
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState({
@@ -42,9 +44,15 @@ export function ClientsPage() {
               <p className="text-xs text-gray-500 hidden md:block">Plataforma de Autoridade Digital</p>
             </div>
           </div>
-          <button onClick={() => setCreating(true)} className="btn-primary w-auto px-4 py-2 text-xs md:text-sm">
-            + Novo Cliente
-          </button>
+          <div className="flex items-center gap-2">
+            {user && <span className="text-xs text-gray-500 hidden md:block">{user.name} · <span className="text-violet-400 capitalize">{user.role}</span></span>}
+            <button onClick={() => setCreating(true)} className="btn-primary w-auto px-4 py-2 text-xs md:text-sm">
+              + Novo Cliente
+            </button>
+            <button onClick={() => { logout(); navigate('/login', { replace: true }) }} className="btn-secondary px-3 py-2 text-xs">
+              Sair
+            </button>
+          </div>
         </div>
       </header>
 
