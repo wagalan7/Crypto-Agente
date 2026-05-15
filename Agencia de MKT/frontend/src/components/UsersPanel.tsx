@@ -88,6 +88,24 @@ export function UsersPanel({ authHeaders, currentUser }: Props) {
     }
   }
 
+  const handleToggleRole = async (u: User) => {
+    const newRole = u.role === 'admin' ? 'user' : 'admin'
+    const verb = newRole === 'admin' ? 'promover a admin' : 'rebaixar a usuário comum'
+    if (!confirm(`Tem certeza que quer ${verb} "${u.name || u.user}"?`)) return
+    try {
+      const res = await fetch(`/auth/users/${encodeURIComponent(u.user)}`, {
+        method: 'PATCH', headers: authHeaders,
+        body: JSON.stringify({ role: newRole }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail)
+      flash(`Role atualizada → ${newRole}`)
+      load()
+    } catch (err: unknown) {
+      flash(err instanceof Error ? err.message : 'Erro', true)
+    }
+  }
+
   const handleDelete = async (username: string) => {
     if (!confirm(`Remover ${username}?`)) return
     try {
@@ -155,6 +173,19 @@ export function UsersPanel({ authHeaders, currentUser }: Props) {
                 >
                   {editing === u.user ? '▲ fechar' : '✎ editar'}
                 </button>
+                {u.user !== currentUser && (
+                  <button
+                    onClick={() => handleToggleRole(u)}
+                    title={u.role === 'admin' ? 'Rebaixar a usuário comum' : 'Promover a admin'}
+                    className={`text-[10px] px-2 py-1 rounded border transition-colors ${
+                      u.role === 'admin'
+                        ? 'text-amber-400 border-amber-800/50 hover:bg-amber-900/20'
+                        : 'text-violet-400 border-violet-800/50 hover:bg-violet-900/20'
+                    }`}
+                  >
+                    {u.role === 'admin' ? '↓ rebaixar' : '⭐ promover'}
+                  </button>
+                )}
                 {u.user !== currentUser && (
                   <button
                     onClick={() => handleDelete(u.user)}

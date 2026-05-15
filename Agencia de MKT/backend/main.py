@@ -209,13 +209,15 @@ class UpdateUserRequest(BaseModel):
     new_username: Optional[str] = None
     new_password: Optional[str] = None
     name: Optional[str] = None
+    role: Optional[str] = None
 
 @app.patch("/auth/users/{username}")
 async def patch_user(username: str, req: UpdateUserRequest, user: str = Depends(require_auth)):
     return update_user(username, requester=user,
                        new_username=req.new_username,
                        new_password=req.new_password,
-                       new_name=req.name)
+                       new_name=req.name,
+                       new_role=req.role)
 
 @app.delete("/auth/users/{username}")
 async def remove_user(username: str, user: str = Depends(require_auth)):

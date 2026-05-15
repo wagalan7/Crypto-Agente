@@ -191,12 +191,15 @@ def db_add_user(username: str, password: str, role: str = "user", name: str = ""
 
 
 def db_update_user(username: str, new_username: str | None = None,
-                   new_password: str | None = None, new_name: str | None = None):
+                   new_password: str | None = None, new_name: str | None = None,
+                   new_role: str | None = None):
     con = _con()
     if new_password:
         con.execute("UPDATE users SET password=? WHERE username=?", (new_password, username))
     if new_name is not None:
         con.execute("UPDATE users SET name=? WHERE username=?", (new_name, username))
+    if new_role is not None:
+        con.execute("UPDATE users SET role=? WHERE username=?", (new_role, username))
     if new_username and new_username != username:
         con.execute("UPDATE users SET username=? WHERE username=?", (new_username, username))
     con.commit()

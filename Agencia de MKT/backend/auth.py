@@ -95,10 +95,16 @@ def delete_user(username: str, requester: str):
 def update_user(username: str, requester: str,
                 new_username: str | None = None,
                 new_password: str | None = None,
-                new_name: str | None = None) -> dict:
+                new_name: str | None = None,
+                new_role: str | None = None) -> dict:
     role = get_user_role(requester)
     if role != "admin" and username != requester:
         raise HTTPException(status_code=403, detail="Sem permissão")
+    # Only admin can change role
+    if new_role is not None and role != "admin":
+        raise HTTPException(status_code=403, detail="Apenas admin pode alterar role")
+    if new_role is not None and new_role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="Role inválida (use 'admin' ou 'user')")
     db_get_user, _, __, db_update_user, ___ = _db()
     u = db_get_user(username)
     if not u:
@@ -107,8 +113,15 @@ def update_user(username: str, requester: str,
     if new_username and new_username != username:
         if db_get_user(new_username):
             raise HTTPException(status_code=400, detail="Nome de usuário já existe")
+    # Prevent removing last admin
+    if new_role == "user" and u.get("role") == "admin":
+        from db import db_list_users
+        admins = [x for x in db_list_users() if x.get("role") == "admin"]
+        if len(admins) <= 1:
+            raise HTTPException(status_code=400, detail="Não é possível rebaixar o último admin")
     db_update_user(username, new_username=new_username,
-                   new_password=new_password, new_name=new_name)
+                   new_password=new_password, new_name=new_name,
+                   new_role=new_role)
     # Return updated record
     final = db_get_user(new_username if new_username else username)
     return {"user": final["user"], "role": final["role"], "name": final.get("name", "")}
