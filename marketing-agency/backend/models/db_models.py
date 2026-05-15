@@ -78,15 +78,37 @@ class ContentPiece(Base):
     script = Column(Text)
     copy = Column(Text)
     design_brief = Column(Text)
+    media_url = Column(Text)  # public URL of image/video to publish
     status = Column(String(50), default="pending")
     scheduled_at = Column(DateTime)
     published_at = Column(DateTime)
     trend_context = Column(Text)
     strategic_note = Column(Text)
+    external_post_id = Column(String(200))  # ID returned by Meta after publish
+    publish_error = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client", back_populates="contents")
     metrics = relationship("MetricsSnapshot", back_populates="content")
+
+
+class SocialAccount(Base):
+    """Manually-entered tokens to publish on Instagram / Facebook for a client."""
+    __tablename__ = "social_accounts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    platform = Column(String(50), nullable=False)  # "instagram" or "facebook"
+    account_id = Column(String(200), nullable=False)  # IG Business User ID or FB Page ID
+    account_name = Column(String(200))  # display name (e.g., "@thiago.fitness")
+    access_token = Column(Text, nullable=False)  # long-lived Page Access Token
+    expires_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    last_error = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    client = relationship("Client")
 
 
 class CalendarSlot(Base):

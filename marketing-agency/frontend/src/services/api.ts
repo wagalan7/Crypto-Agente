@@ -92,6 +92,14 @@ export const api = {
     metrics: (clientId: number) => get(`/analytics/client/${clientId}/metrics`),
     addMetrics: (data: unknown) => post('/analytics/metrics', data),
   },
+  social: {
+    list: (clientId: number) => get(`/social/client/${clientId}`),
+    upsert: (data: { client_id: number; platform: string; account_id: string; account_name?: string; access_token: string }) => post('/social/', data),
+    update: (id: number, data: unknown) => patch(`/social/${id}`, data),
+    remove: (id: number) => del(`/social/${id}`),
+    test: (id: number) => post(`/social/${id}/test`, {}),
+    publish: (contentId: number) => post(`/social/publish/${contentId}`, {}),
+  },
   agents: {
     strategy: (clientId: number, period?: string) => streamAgent('/agents/strategy/stream', { client_id: clientId, period }),
     analytics: (clientId: number, metricsData: string) => streamAgent('/agents/analytics/stream', { client_id: clientId, metrics_data: metricsData }),

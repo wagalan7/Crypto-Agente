@@ -8,6 +8,7 @@ import { CalendarPage } from './pages/CalendarPage'
 import { ContentPage } from './pages/ContentPage'
 import { AgentsPage } from './pages/AgentsPage'
 import { AnalyticsPage } from './pages/AnalyticsPage'
+import { SocialAccountsPage } from './pages/SocialAccountsPage'
 import { Sidebar } from './components/Sidebar'
 import { api } from './services/api'
 
@@ -48,6 +49,7 @@ export default function App() {
         <Route path="content" element={<ContentPage />} />
         <Route path="agents" element={<AgentsPage />} />
         <Route path="analytics" element={<AnalyticsPage />} />
+        <Route path="social" element={<SocialAccountsPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

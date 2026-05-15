@@ -23,12 +23,28 @@ export interface ContentPiece {
   script: string | null
   copy: string | null
   design_brief: string | null
+  media_url: string | null
   status: 'pending' | 'approved' | 'recorded' | 'published'
   trend_context: string | null
   strategic_note: string | null
   scheduled_at: string | null
   published_at: string | null
+  external_post_id: string | null
+  publish_error: string | null
   created_at: string | null
+}
+
+export interface SocialAccount {
+  id: number
+  client_id: number
+  platform: 'instagram' | 'facebook'
+  account_id: string
+  account_name: string | null
+  access_token_preview: string
+  is_active: boolean
+  last_error: string | null
+  expires_at: string | null
+  updated_at: string | null
 }
 
 export interface CalendarSlot {

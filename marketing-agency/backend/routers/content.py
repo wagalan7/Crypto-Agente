@@ -20,6 +20,7 @@ class ContentCreate(BaseModel):
     script: Optional[str] = None
     copy: Optional[str] = None
     design_brief: Optional[str] = None
+    media_url: Optional[str] = None
     trend_context: Optional[str] = None
     strategic_note: Optional[str] = None
     scheduled_at: Optional[datetime] = None
@@ -31,6 +32,7 @@ class ContentUpdate(BaseModel):
     script: Optional[str] = None
     copy: Optional[str] = None
     design_brief: Optional[str] = None
+    media_url: Optional[str] = None
     status: Optional[str] = None
     strategic_note: Optional[str] = None
 
@@ -47,9 +49,12 @@ def _serialize(c: ContentPiece) -> dict:
         "script": c.script,
         "copy": c.copy,
         "design_brief": c.design_brief,
+        "media_url": c.media_url,
         "status": c.status,
         "trend_context": c.trend_context,
         "strategic_note": c.strategic_note,
+        "external_post_id": c.external_post_id,
+        "publish_error": c.publish_error,
         "scheduled_at": c.scheduled_at.isoformat() if c.scheduled_at else None,
         "published_at": c.published_at.isoformat() if c.published_at else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -85,6 +90,7 @@ def get_content(content_id: int, current_user: User = Depends(get_current_user),
     c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not c:
         raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
     return _serialize(c)
 
 
@@ -93,7 +99,8 @@ def update_content(content_id: int, data: ContentUpdate, current_user: User = De
     c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not c:
         raise HTTPException(404, "Content not found")
-    for field, value in data.model_dump(exclude_none=True).items():
+    assert_client_access(c.client_id, current_user, db)
+    for field, value in data.model_dump(exclude_unset=True).items():
         setattr(c, field, value)
     if data.status == "published" and not c.published_at:
         c.published_at = datetime.utcnow()
@@ -107,6 +114,7 @@ def approve_content(content_id: int, current_user: User = Depends(get_current_us
     c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not c:
         raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
     c.status = "approved"
     db.commit()
     return _serialize(c)

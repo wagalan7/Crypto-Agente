@@ -7,6 +7,7 @@ const NAV = [
   { to: 'content', label: 'Conteúdo', icon: '◈' },
   { to: 'agents', label: 'Agentes', icon: '◉' },
   { to: 'analytics', label: 'Analytics', icon: '◎' },
+  { to: 'social', label: 'Social', icon: '◐' },
 ]
 
 export function Sidebar({ clientName }: { clientName?: string }) {

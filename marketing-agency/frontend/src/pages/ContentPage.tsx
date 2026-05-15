@@ -12,6 +12,8 @@ export function ContentPage() {
   const [contents, setContents] = useState<ContentPiece[]>([])
   const [filter, setFilter] = useState<string>('')
   const [selected, setSelected] = useState<ContentPiece | null>(null)
+  const [mediaUrl, setMediaUrl] = useState('')
+  const [publishing, setPublishing] = useState(false)
 
   async function load() {
     const data: any = await api.content.list(id, filter || undefined)
@@ -19,6 +21,10 @@ export function ContentPage() {
   }
 
   useEffect(() => { load() }, [id, filter])
+
+  useEffect(() => {
+    if (selected) setMediaUrl(selected.media_url || '')
+  }, [selected?.id])
 
   async function approve(contentId: number) {
     const updated: any = await api.content.approve(contentId)
@@ -30,6 +36,30 @@ export function ContentPage() {
     const updated: any = await api.content.update(contentId, { status })
     setContents(prev => prev.map(c => c.id === contentId ? updated : c))
     if (selected?.id === contentId) setSelected(updated)
+  }
+
+  async function saveMediaUrl() {
+    if (!selected) return
+    const updated: any = await api.content.update(selected.id, { media_url: mediaUrl || null })
+    setContents(prev => prev.map(c => c.id === selected.id ? updated : c))
+    setSelected(updated)
+  }
+
+  async function publishNow() {
+    if (!selected) return
+    if (!confirm(`Publicar agora no ${selected.platform}?`)) return
+    setPublishing(true)
+    try {
+      await api.social.publish(selected.id)
+      const refreshed: any = await api.content.get(selected.id)
+      setContents(prev => prev.map(c => c.id === selected.id ? refreshed : c))
+      setSelected(refreshed)
+      alert('Publicado com sucesso!')
+    } catch (e: any) {
+      alert('Erro ao publicar: ' + e.message)
+    } finally {
+      setPublishing(false)
+    }
   }
 
   // Mobile: show detail as full overlay
@@ -86,6 +116,35 @@ export function ContentPage() {
             </div>
           )}
 
+          <div className="card">
+            <p className="text-xs text-violet-400 font-semibold mb-2">MÍDIA (URL pública)</p>
+            <div className="flex gap-2">
+              <input
+                type="url"
+                className="input-field text-xs"
+                placeholder="https://... (imagem ou vídeo público)"
+                value={mediaUrl}
+                onChange={e => setMediaUrl(e.target.value)}
+              />
+              <button onClick={saveMediaUrl} className="btn-secondary px-3 py-1.5 text-xs shrink-0">Salvar</button>
+            </div>
+            <p className="text-[11px] text-gray-500 mt-1.5">Obrigatório para publicar no Instagram. URL deve ser pública.</p>
+          </div>
+
+          {selected.external_post_id && (
+            <div className="card bg-green-900/10 border-green-800/40">
+              <p className="text-xs text-green-400 font-semibold mb-1">PUBLICADO</p>
+              <p className="text-xs text-gray-400">ID externo: <span className="font-mono">{selected.external_post_id}</span></p>
+            </div>
+          )}
+
+          {selected.publish_error && (
+            <div className="card bg-red-900/10 border-red-800/40">
+              <p className="text-xs text-red-400 font-semibold mb-1">ERRO AO PUBLICAR</p>
+              <p className="text-xs text-gray-400">{selected.publish_error}</p>
+            </div>
+          )}
+
           <div className="space-y-2 pt-1">
             {selected.status === 'pending' && (
               <button onClick={() => approve(selected.id)} className="btn-primary w-full py-3">
@@ -98,10 +157,17 @@ export function ContentPage() {
                 Marcar como gravado
               </button>
             )}
+            {(selected.status === 'approved' || selected.status === 'recorded') &&
+             (selected.platform === 'instagram' || selected.platform === 'facebook') && (
+              <button onClick={publishNow} disabled={publishing}
+                className="btn-primary w-full py-3 bg-violet-600 hover:bg-violet-700">
+                {publishing ? 'Publicando...' : `📤 Publicar agora no ${selected.platform}`}
+              </button>
+            )}
             {selected.status === 'recorded' && (
               <button onClick={() => setStatus(selected.id, 'published')}
-                className="btn-primary w-full py-3 bg-green-600 hover:bg-green-700">
-                Marcar como publicado
+                className="btn-secondary w-full py-2 text-xs">
+                Marcar como publicado (manualmente)
               </button>
             )}
           </div>
