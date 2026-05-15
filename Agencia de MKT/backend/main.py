@@ -5,7 +5,7 @@ import urllib.parse
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse
+from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
@@ -196,6 +196,109 @@ class LoginRequest(BaseModel):
 async def login(req: LoginRequest):
     token = authenticate(req.username, req.password)
     return {"token": token}
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_policy():
+    return """<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8">
+<title>Política de Privacidade — Agente Consultorio</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font-family:system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 20px;line-height:1.6;color:#222}
+h1{border-bottom:2px solid #4a3aff;padding-bottom:8px}h2{color:#4a3aff;margin-top:32px}small{color:#666}</style></head>
+<body>
+<h1>Política de Privacidade — Agente Consultorio</h1>
+<small>Última atualização: 15 de maio de 2026</small>
+<p>Esta aplicação ("Agente Consultorio") é utilizada exclusivamente pelo seu titular para gerenciar
+suas próprias páginas, contas de anúncio e perfis de Instagram Business através das APIs oficiais da Meta
+(Facebook Graph API, Marketing API, Instagram Graph API) e do Google (Google Ads API).</p>
+
+<h2>Dados coletados</h2>
+<ul>
+<li>Tokens de acesso (Facebook Page Token, Instagram Business Token, Google Ads Refresh Token), armazenados
+de forma segura no banco de dados privado da aplicação.</li>
+<li>Métricas de campanhas (impressões, cliques, conversões, gasto, ROAS) lidas via API.</li>
+<li>Textos, imagens e configurações de campanha enviados pelo usuário para publicação.</li>
+<li>Credenciais de login (usuário, senha em hash) para acesso ao painel.</li>
+</ul>
+
+<h2>Uso dos dados</h2>
+<ul>
+<li>Publicação automática de posts orgânicos e anúncios pagos nas páginas autorizadas.</li>
+<li>Geração de relatórios de desempenho e dashboards de analytics.</li>
+<li>Os dados <strong>não são compartilhados</strong> com terceiros, vendidos ou usados para qualquer
+finalidade fora do escopo descrito.</li>
+</ul>
+
+<h2>Retenção e exclusão</h2>
+<p>Os dados são mantidos enquanto a conta estiver ativa. O usuário pode solicitar a exclusão completa
+de seus dados a qualquer momento enviando e-mail para <a href="mailto:agenteconsultorio@gmail.com">
+agenteconsultorio@gmail.com</a> ou acessando <a href="/data-deletion">/data-deletion</a>.</p>
+
+<h2>Segurança</h2>
+<p>Tokens e credenciais são armazenados em banco SQLite com acesso restrito, hospedado em volume
+privado na Railway. Conexões são protegidas por HTTPS/TLS.</p>
+
+<h2>Contato</h2>
+<p>Para dúvidas, exclusão de dados ou reportar problemas:
+<a href="mailto:agenteconsultorio@gmail.com">agenteconsultorio@gmail.com</a></p>
+</body></html>"""
+
+
+@app.get("/terms", response_class=HTMLResponse)
+async def terms_of_service():
+    return """<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8">
+<title>Termos de Serviço — Agente Consultorio</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font-family:system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 20px;line-height:1.6;color:#222}
+h1{border-bottom:2px solid #4a3aff;padding-bottom:8px}h2{color:#4a3aff;margin-top:32px}small{color:#666}</style></head>
+<body>
+<h1>Termos de Serviço — Agente Consultorio</h1>
+<small>Última atualização: 15 de maio de 2026</small>
+<p>Ao utilizar esta aplicação, você concorda com os termos abaixo.</p>
+
+<h2>1. Uso permitido</h2>
+<p>O sistema destina-se ao gerenciamento de páginas, anúncios e perfis sociais pelo próprio titular
+ou por usuários autorizados pelo titular. É proibido qualquer uso para envio de spam, conteúdo
+fraudulento, ilegal ou que viole as políticas da Meta, Google ou da legislação brasileira.</p>
+
+<h2>2. Responsabilidades do usuário</h2>
+<p>O usuário é o único responsável pelo conteúdo publicado em suas páginas e pelos resultados
+das campanhas pagas executadas através do sistema, incluindo valores investidos.</p>
+
+<h2>3. Limitação de responsabilidade</h2>
+<p>O sistema é fornecido "como está". O titular não se responsabiliza por bloqueios de conta
+impostos pelas plataformas (Meta, Google), por valores gastos em campanhas mal configuradas
+pelo usuário ou por indisponibilidades das APIs de terceiros.</p>
+
+<h2>4. Encerramento</h2>
+<p>O titular pode encerrar o acesso de qualquer usuário a qualquer momento. O usuário pode
+solicitar o encerramento de sua conta enviando e-mail para agenteconsultorio@gmail.com.</p>
+
+<h2>Contato</h2>
+<p><a href="mailto:agenteconsultorio@gmail.com">agenteconsultorio@gmail.com</a></p>
+</body></html>"""
+
+
+@app.get("/data-deletion", response_class=HTMLResponse)
+async def data_deletion():
+    return """<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8">
+<title>Exclusão de Dados — Agente Consultorio</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font-family:system-ui,sans-serif;max-width:780px;margin:40px auto;padding:0 20px;line-height:1.6;color:#222}
+h1{border-bottom:2px solid #4a3aff;padding-bottom:8px}h2{color:#4a3aff;margin-top:32px}</style></head>
+<body>
+<h1>Como excluir seus dados</h1>
+<p>Para solicitar a exclusão completa de todos os seus dados desta aplicação:</p>
+<ol>
+<li>Envie um e-mail para <a href="mailto:agenteconsultorio@gmail.com">agenteconsultorio@gmail.com</a>
+com o assunto <strong>"Exclusão de dados"</strong>.</li>
+<li>Inclua o e-mail ou nome de usuário utilizado para acessar o sistema.</li>
+<li>Sua solicitação será processada em até <strong>7 dias úteis</strong>.</li>
+</ol>
+<p>Serão excluídos: credenciais de login, tokens de acesso salvos, histórico de campanhas,
+perfis de cliente, agendamentos pendentes e qualquer outro dado pessoal associado à sua conta.</p>
+<p>Confirmação da exclusão será enviada para o mesmo e-mail.</p>
+</body></html>"""
+
 
 @app.get("/auth/me")
 async def me(user: str = Depends(require_auth)):
