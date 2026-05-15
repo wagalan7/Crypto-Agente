@@ -204,10 +204,13 @@ async def publish_facebook_ads(
         async with httpx.AsyncClient(timeout=30) as http:
 
             # 1. Create Campaign
+            # special_ad_categories is REQUIRED by Meta since 2020 — empty list means a normal commercial ad
+            # (not housing, employment, credit, social issues, politics).
             r = await http.post(f"{base}/{act}/campaigns", data={
                 "name":      f"Campanha MagaOne {ts}",
                 "objective": fb_objective,
                 "status":    "PAUSED",
+                "special_ad_categories": "[]",
                 "access_token": token,
             })
             rd = r.json()
