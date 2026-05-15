@@ -168,6 +168,18 @@ if not _seed:
               "role": "admin", "name": ""}]
 db_seed_users(_seed)
 
+# Optional: promote a specific user to admin on boot (set BOOTSTRAP_ADMIN_USER on Railway).
+# Idempotent — safe to keep running.
+_bootstrap_admin = os.getenv("BOOTSTRAP_ADMIN_USER", "").strip()
+if _bootstrap_admin:
+    try:
+        from db import db_get_user, db_update_user as _db_update_user
+        if db_get_user(_bootstrap_admin):
+            _db_update_user(_bootstrap_admin, new_role="admin")
+            print(f"[bootstrap] promoted {_bootstrap_admin} to admin")
+    except Exception as _e:
+        print(f"[bootstrap] failed to promote admin: {_e}")
+
 STATIC_DIR  = os.path.join(os.path.dirname(__file__), "static")
 ASSETS_DIR  = os.path.join(STATIC_DIR, "assets")
 UPLOADS_DIR = os.environ.get("UPLOADS_DIR", "/data/uploads")
