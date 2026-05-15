@@ -120,8 +120,14 @@ async def publish_instagram(caption: str, image_url: str, ig_user_id: str, token
     image_url = image_url.strip()
     ig_user_id = _sanitize_cred(ig_user_id)
     token      = _sanitize_cred(token)
+
+    if not image_url:
+        return PublishResult(platform="instagram", success=False,
+            error="Instagram exige uma imagem (image_url vazio)")
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
+            # 1. Create media container
             container = await client.post(
                 f"https://graph.facebook.com/v19.0/{ig_user_id}/media",
                 json={"caption": caption, "image_url": image_url, "access_token": token},
@@ -129,8 +135,34 @@ async def publish_instagram(caption: str, image_url: str, ig_user_id: str, token
             c_data = container.json()
             container_id = c_data.get("id")
             if not container_id:
-                return PublishResult(platform="instagram", success=False, error=c_data.get("error", {}).get("message", str(c_data)))
+                err = c_data.get("error", {})
+                msg = err.get("error_user_msg") or err.get("message") or str(c_data)
+                return PublishResult(platform="instagram", success=False,
+                    error=f"Erro ao criar container: {msg}")
 
+            # 2. Poll container status until FINISHED (Instagram needs time to fetch+process the image)
+            # Statuses: IN_PROGRESS, FINISHED, ERROR, EXPIRED, PUBLISHED
+            import asyncio
+            status = "IN_PROGRESS"
+            attempts = 0
+            while status == "IN_PROGRESS" and attempts < 20:  # up to ~40s
+                await asyncio.sleep(2)
+                attempts += 1
+                st = await client.get(
+                    f"https://graph.facebook.com/v19.0/{container_id}",
+                    params={"fields": "status_code,status", "access_token": token},
+                )
+                sd = st.json()
+                status = sd.get("status_code", "IN_PROGRESS")
+                if status in ("ERROR", "EXPIRED"):
+                    detail = sd.get("status") or str(sd)
+                    return PublishResult(platform="instagram", success=False,
+                        error=f"Container falhou (status={status}): {detail}")
+            if status != "FINISHED":
+                return PublishResult(platform="instagram", success=False,
+                    error=f"Timeout: container ainda em {status} após {attempts*2}s. Tente novamente.")
+
+            # 3. Publish
             pub = await client.post(
                 f"https://graph.facebook.com/v19.0/{ig_user_id}/media_publish",
                 json={"creation_id": container_id, "access_token": token},
@@ -138,7 +170,10 @@ async def publish_instagram(caption: str, image_url: str, ig_user_id: str, token
             p_data = pub.json()
             media_id = p_data.get("id")
             if not media_id:
-                return PublishResult(platform="instagram", success=False, error=p_data.get("error", {}).get("message", str(p_data)))
+                err = p_data.get("error", {})
+                msg = err.get("error_user_msg") or err.get("message") or str(p_data)
+                return PublishResult(platform="instagram", success=False,
+                    error=f"Erro ao publicar: {msg}")
 
             return PublishResult(
                 platform="instagram",
