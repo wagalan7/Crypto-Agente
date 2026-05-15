@@ -887,7 +887,10 @@ async def exchange_instagram_token(req: IgTokenRequest, user: str = Depends(requ
                     "access_token": long_token,
                     "expires_in":   expires_in,
                     "expires_days": expires_days,
-                    "warning":      f"Não foi possível buscar páginas: {pdata['error'].get('message', '')}",
+                    "permanent":    False,
+                    "pages":        [],
+                    "page_id_sent": page_id_req,
+                    "warning":      f"Não foi possível buscar páginas: {pdata['error'].get('message', '')}. Possível causa: o token não tem permissão 'pages_show_list' / 'pages_manage_posts'.",
                 }
 
             pages = pdata.get("data", [])
@@ -930,6 +933,7 @@ async def exchange_instagram_token(req: IgTokenRequest, user: str = Depends(requ
                 "expires_days": expires_days,
                 "permanent":    False,
                 "pages":        page_list,
+                "page_id_sent": page_id_req,
             }
     except HTTPException:
         raise

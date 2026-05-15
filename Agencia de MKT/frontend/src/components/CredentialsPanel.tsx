@@ -197,7 +197,15 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
       if (data.permanent) {
         setIgRefreshMsg(`✓ Token PERMANENTE da página "${data.page_name}" obtido! Não expira. Clique em Salvar.`)
       } else {
-        setIgRefreshMsg(`✓ Token renovado para ~${data.expires_days ?? 60} dias (token de usuário). Clique em Salvar.`)
+        const pagesInfo = data.pages?.length
+          ? ` Páginas que seu token vê: ${data.pages.map((p:any)=>`"${p.name}" (ID: ${p.id})`).join(', ')}.`
+          : ''
+        const warn = data.warning ? ` ⚠ ${data.warning}` : ''
+        setIgRefreshMsg(
+          `⚠ Token renovado para ${data.expires_days ?? 60} dias (token de USUÁRIO, não da página).` +
+          ` Isso significa que o Page ID enviado não bateu com nenhuma página deste token, OU o page_id estava vazio.${pagesInfo}${warn}`
+        )
+        if (data.pages) setFbPages(data.pages)
       }
     } catch (e) { flashErr(String(e)) }
     setIgRefreshing(false)
