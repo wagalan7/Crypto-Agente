@@ -237,15 +237,17 @@ async def publish_facebook_ads(
         act = f"act_{ad_account_id.lstrip('act_')}"
         base = f"https://graph.facebook.com/v19.0"
 
-        # Map objective to billing/optimization
+        # Map ODAX objective to (fb_objective, ad-set optimization_goal, billing_event).
+        # Meta deprecated legacy objective names in Apr 2024 — only OUTCOME_* is accepted.
         OBJ_MAP = {
-            "LINK_CLICKS":   ("LINK_CLICKS", "LINK_CLICKS", "IMPRESSIONS"),
-            "CONVERSIONS":   ("OFFSITE_CONVERSIONS", "OFFSITE_CONVERSIONS", "IMPRESSIONS"),
-            "REACH":         ("REACH", "REACH", "IMPRESSIONS"),
-            "BRAND_AWARENESS": ("BRAND_AWARENESS", "REACH", "IMPRESSIONS"),
-            "ENGAGEMENT":    ("POST_ENGAGEMENT", "POST_ENGAGEMENT", "IMPRESSIONS"),
+            "OUTCOME_TRAFFIC":        ("OUTCOME_TRAFFIC",        "LINK_CLICKS",        "IMPRESSIONS"),
+            "OUTCOME_SALES":          ("OUTCOME_SALES",          "OFFSITE_CONVERSIONS","IMPRESSIONS"),
+            "OUTCOME_LEADS":          ("OUTCOME_LEADS",          "LEAD_GENERATION",    "IMPRESSIONS"),
+            "OUTCOME_ENGAGEMENT":     ("OUTCOME_ENGAGEMENT",     "POST_ENGAGEMENT",    "IMPRESSIONS"),
+            "OUTCOME_AWARENESS":      ("OUTCOME_AWARENESS",      "REACH",              "IMPRESSIONS"),
+            "OUTCOME_APP_PROMOTION":  ("OUTCOME_APP_PROMOTION",  "APP_INSTALLS",       "IMPRESSIONS"),
         }
-        obj_key = objective if objective in OBJ_MAP else "LINK_CLICKS"
+        obj_key = objective if objective in OBJ_MAP else "OUTCOME_TRAFFIC"
         fb_objective, opt_goal, billing_event = OBJ_MAP[obj_key]
 
         if not final_url or not final_url.startswith("http"):
