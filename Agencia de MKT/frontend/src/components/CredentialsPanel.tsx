@@ -162,23 +162,48 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
     setFetchingAccounts(false)
   }
 
-  const refreshInstagramToken = async () => {
-    const currentToken = (drafts['instagram'] || creds['instagram'] || {})['ig_token'] || ''
+  // Generic refresh: exchanges short token → long, then fetches permanent PAGE token.
+  // platform: 'instagram' | 'facebook' — which token field to update.
+  const refreshMetaToken = async (platform: 'instagram' | 'facebook') => {
+    const tokenKey = platform === 'instagram' ? 'ig_token' : 'fb_token'
+    const currentToken = (drafts[platform] || creds[platform] || {})[tokenKey] || ''
     if (!currentToken) { flashErr('Cole o token atual no campo antes de renovar.'); return }
+
+    // Page ID is required for permanent token. Try the platform's own page_id field,
+    // falling back to facebook.fb_page_id (Instagram uses the FB page it's linked to).
+    const fbPageId =
+      (drafts['facebook'] || creds['facebook'] || {})['fb_page_id'] ||
+      (drafts['instagram'] || creds['instagram'] || {})['fb_page_id'] || ''
+    if (!fbPageId) {
+      flashErr('Preencha o Page ID (ID da Página do Facebook) antes de renovar — necessário para obter o token PERMANENTE da página.')
+      return
+    }
+
     setIgRefreshing(true); setIgRefreshMsg(null)
     try {
       const res = await fetch('/auth/instagram/exchange-token', {
         method: 'POST', headers: authHeaders,
-        body: JSON.stringify({ short_token: currentToken }),
+        body: JSON.stringify({ short_token: currentToken, page_id: fbPageId }),
       })
       const data = await res.json()
       if (!res.ok) { flashErr(data.detail || 'Erro ao renovar token'); setIgRefreshing(false); return }
       const newToken = data.access_token
-      setDraftField('instagram', 'ig_token', newToken)
-      setIgRefreshMsg(`✓ Token renovado! Válido por ~${data.expires_days ?? 60} dias. Clique em Salvar.`)
+      setDraftField(platform, tokenKey, newToken)
+      // If the response also returned the IG business account ID, prefill it (Instagram only)
+      if (platform === 'instagram' && data.instagram_business_account_id) {
+        setDraftField('instagram', 'ig_user_id', data.instagram_business_account_id)
+      }
+      if (data.permanent) {
+        setIgRefreshMsg(`✓ Token PERMANENTE da página "${data.page_name}" obtido! Não expira. Clique em Salvar.`)
+      } else {
+        setIgRefreshMsg(`✓ Token renovado para ~${data.expires_days ?? 60} dias (token de usuário). Clique em Salvar.`)
+      }
     } catch (e) { flashErr(String(e)) }
     setIgRefreshing(false)
   }
+
+  const refreshInstagramToken = () => refreshMetaToken('instagram')
+  const refreshFacebookToken  = () => refreshMetaToken('facebook')
 
   const startGoogleOAuth = () => {
     const token = authHeaders['Authorization']?.split(' ')[1] || ''
@@ -284,8 +309,8 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
                     {p.oauth ? 'Ou preencha manualmente:' : 'Credenciais:'}
                   </p>
 
-                  {/* Instagram token refresh message */}
-                  {p.id === 'instagram' && igRefreshMsg && (
+                  {/* Meta token refresh message (Facebook & Instagram) */}
+                  {(p.id === 'instagram' || p.id === 'facebook') && igRefreshMsg && (
                     <div className="px-3 py-2 bg-emerald-900/30 border border-emerald-800 rounded-lg text-[10px] text-emerald-400">
                       {igRefreshMsg}
                     </div>
@@ -295,7 +320,7 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
                     <div key={f.key}>
                       <div className="flex items-center justify-between mb-0.5">
                         <label className="text-[9px] text-gray-500 uppercase tracking-wider">{f.label}</label>
-                        {/* Instagram token: renovar para 60 dias */}
+                        {/* Instagram token: trocar por token PERMANENTE da página */}
                         {p.id === 'instagram' && f.key === 'ig_token' && (
                           <button
                             onClick={refreshInstagramToken}
@@ -303,7 +328,18 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
                             className="text-[9px] text-pink-400 hover:text-pink-300 disabled:text-gray-600 transition-colors flex items-center gap-1">
                             {igRefreshing
                               ? <><span className="w-2 h-2 border border-pink-400/30 border-t-pink-400 rounded-full animate-spin inline-block"/>renovando...</>
-                              : '🔄 renovar para 60 dias'}
+                              : '🔄 obter token PERMANENTE da página'}
+                          </button>
+                        )}
+                        {/* Facebook token: trocar por token PERMANENTE da página */}
+                        {p.id === 'facebook' && f.key === 'fb_token' && (
+                          <button
+                            onClick={refreshFacebookToken}
+                            disabled={igRefreshing}
+                            className="text-[9px] text-blue-400 hover:text-blue-300 disabled:text-gray-600 transition-colors flex items-center gap-1">
+                            {igRefreshing
+                              ? <><span className="w-2 h-2 border border-blue-400/30 border-t-blue-400 rounded-full animate-spin inline-block"/>renovando...</>
+                              : '🔄 obter token PERMANENTE da página'}
                           </button>
                         )}
                         {/* Customer ID: botão buscar automático */}

@@ -832,34 +832,105 @@ async def toggle_facebook_campaign(req: FbToggleRequest, user: str = Depends(req
 
 class IgTokenRequest(BaseModel):
     short_token: str
+    page_id: str | None = None   # if provided, returns the permanent page token for this page
 
 @app.post("/auth/instagram/exchange-token")
 async def exchange_instagram_token(req: IgTokenRequest, user: str = Depends(require_auth)):
-    """Exchange a short-lived Instagram/Facebook token for a 60-day long-lived token."""
+    """Exchange a short-lived user token for a 60-day long-lived user token,
+    then fetch the *permanent* page access token from /me/accounts.
+
+    Page tokens derived from a long-lived user token never expire. This is what
+    we want for posting to Facebook/Instagram, since user tokens only last 60 days
+    (and short-lived ones expire in 1 hour)."""
     app_id     = os.getenv("FACEBOOK_APP_ID", "")
     app_secret = os.getenv("FACEBOOK_APP_SECRET", "")
     if not app_id or not app_secret:
         raise HTTPException(400, detail="FACEBOOK_APP_ID e FACEBOOK_APP_SECRET não configurados no servidor. Adicione no Railway.")
+
+    # sanitize the incoming token (remove whitespace/invisible chars)
+    short_token = "".join(c for c in req.short_token if c.isprintable() and not c.isspace())
+    page_id_req = "".join(c for c in (req.page_id or "") if c.isprintable() and not c.isspace())
+
     try:
         async with httpx.AsyncClient(timeout=15) as c:
+            # ── Step 1: short-lived user token → long-lived user token (60 days) ──
             r = await c.get(
                 "https://graph.facebook.com/v19.0/oauth/access_token",
                 params={
                     "grant_type":        "fb_exchange_token",
                     "client_id":         app_id,
                     "client_secret":     app_secret,
-                    "fb_exchange_token": req.short_token,
+                    "fb_exchange_token": short_token,
                 },
             )
             data = r.json()
-        if "error" in data:
-            raise HTTPException(400, detail=data["error"].get("message", str(data["error"])))
-        long_token  = data.get("access_token", "")
-        expires_in  = data.get("expires_in", 0)
-        if not long_token:
-            raise HTTPException(400, detail="Token não retornado pela Meta.")
-        expires_days = round(expires_in / 86400) if expires_in else 60
-        return {"access_token": long_token, "expires_in": expires_in, "expires_days": expires_days}
+            if "error" in data:
+                raise HTTPException(400, detail=data["error"].get("message", str(data["error"])))
+            long_token = data.get("access_token", "")
+            expires_in = data.get("expires_in", 0)
+            if not long_token:
+                raise HTTPException(400, detail="Token não retornado pela Meta.")
+            expires_days = round(expires_in / 86400) if expires_in else 60
+
+            # ── Step 2: fetch pages (each has its own permanent token) ──
+            pr = await c.get(
+                "https://graph.facebook.com/v19.0/me/accounts",
+                params={
+                    "access_token": long_token,
+                    "fields":       "id,name,access_token,instagram_business_account",
+                },
+            )
+            pdata = pr.json()
+            if "error" in pdata:
+                # User token works, but pages fetch failed — return user token as fallback
+                return {
+                    "access_token": long_token,
+                    "expires_in":   expires_in,
+                    "expires_days": expires_days,
+                    "warning":      f"Não foi possível buscar páginas: {pdata['error'].get('message', '')}",
+                }
+
+            pages = pdata.get("data", [])
+            # Build a simplified list for the frontend
+            page_list = [
+                {
+                    "id":   p.get("id", ""),
+                    "name": p.get("name", ""),
+                    "instagram_business_account_id": (p.get("instagram_business_account") or {}).get("id", ""),
+                }
+                for p in pages
+            ]
+
+            # If a specific page_id was requested, return its permanent token
+            if page_id_req:
+                match = next((p for p in pages if p.get("id") == page_id_req), None)
+                if not match:
+                    raise HTTPException(
+                        400,
+                        detail=f"Página {page_id_req} não encontrada nas páginas vinculadas a esse token. Páginas disponíveis: {[p['name'] for p in page_list]}",
+                    )
+                page_token = match.get("access_token", "")
+                ig_id      = (match.get("instagram_business_account") or {}).get("id", "")
+                return {
+                    "access_token": page_token,           # permanent page token
+                    "page_id":      match.get("id", ""),
+                    "page_name":    match.get("name", ""),
+                    "instagram_business_account_id": ig_id,
+                    "expires_in":   0,
+                    "expires_days": 0,                    # 0 = nunca expira
+                    "permanent":    True,
+                    "long_user_token": long_token,        # also return user token (for renewals)
+                    "pages":        page_list,
+                }
+
+            # No specific page requested — return the user token + page list
+            return {
+                "access_token": long_token,
+                "expires_in":   expires_in,
+                "expires_days": expires_days,
+                "permanent":    False,
+                "pages":        page_list,
+            }
     except HTTPException:
         raise
     except Exception as e:
