@@ -253,6 +253,24 @@ async def publish_facebook_ads(
         if not final_url or not final_url.startswith("http"):
             final_url = "https://example.com"
 
+        def _meta_err(rd: dict, fallback: str = "") -> str:
+            """Extract every diagnostic field Meta returns for a failed call."""
+            err = rd.get("error") or {}
+            parts = []
+            msg = err.get("message") or fallback or "erro desconhecido"
+            parts.append(msg)
+            if err.get("error_user_title"):
+                parts.append(f"[{err['error_user_title']}]")
+            if err.get("error_user_msg") and err["error_user_msg"] != msg:
+                parts.append(f"— {err['error_user_msg']}")
+            if err.get("error_subcode"):
+                parts.append(f"(subcode {err['error_subcode']})")
+            if err.get("code"):
+                parts.append(f"code={err['code']}")
+            if err.get("fbtrace_id"):
+                parts.append(f"trace={err['fbtrace_id']}")
+            return " ".join(parts)
+
         async with httpx.AsyncClient(timeout=30) as http:
 
             # 1. Create Campaign
@@ -268,8 +286,9 @@ async def publish_facebook_ads(
             rd = r.json()
             campaign_id = rd.get("id", "")
             if not campaign_id:
+                print(f"[fb_ads] campaign create failed (objective={fb_objective}): {rd}")
                 return PublishResult(platform="facebook_ads", success=False,
-                    error=f"Erro ao criar campanha: {rd.get('error', {}).get('message', str(rd))}")
+                    error=f"Erro ao criar campanha (objective={fb_objective}): {_meta_err(rd)}")
 
             # 2. Create Ad Set
             r = await http.post(f"{base}/{act}/adsets", data={
@@ -285,8 +304,9 @@ async def publish_facebook_ads(
             rd = r.json()
             adset_id = rd.get("id", "")
             if not adset_id:
+                print(f"[fb_ads] adset create failed (goal={opt_goal}): {rd}")
                 return PublishResult(platform="facebook_ads", success=False,
-                    error=f"Erro ao criar conjunto: {rd.get('error', {}).get('message', str(rd))}")
+                    error=f"Erro ao criar conjunto: {_meta_err(rd)}")
 
             # 3. Create Ad Creative (link ad)
             lines  = [l.strip() for l in text.split("\n") if l.strip()]
@@ -311,8 +331,9 @@ async def publish_facebook_ads(
             rd = r.json()
             creative_id = rd.get("id", "")
             if not creative_id:
+                print(f"[fb_ads] creative create failed: {rd}")
                 return PublishResult(platform="facebook_ads", success=False,
-                    error=f"Erro ao criar criativo: {rd.get('error', {}).get('message', str(rd))}")
+                    error=f"Erro ao criar criativo: {_meta_err(rd)}")
 
             # 4. Create Ad
             r = await http.post(f"{base}/{act}/ads", data={
@@ -325,8 +346,9 @@ async def publish_facebook_ads(
             rd = r.json()
             ad_id = rd.get("id", "")
             if not ad_id:
+                print(f"[fb_ads] ad create failed: {rd}")
                 return PublishResult(platform="facebook_ads", success=False,
-                    error=f"Erro ao criar anúncio: {rd.get('error', {}).get('message', str(rd))}")
+                    error=f"Erro ao criar anúncio: {_meta_err(rd)}")
 
         return PublishResult(
             platform="facebook_ads",
