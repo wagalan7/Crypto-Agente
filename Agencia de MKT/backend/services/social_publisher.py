@@ -27,12 +27,40 @@ def _sanitize_cred(value: str) -> str:
     """Strip ALL whitespace and non-printable chars from credential values."""
     return "".join(c for c in value if c.isprintable() and not c.isspace())
 
-async def publish_facebook(text: str, page_id: str, token: str) -> PublishResult:
+async def publish_facebook(text: str, page_id: str, token: str, image_url: str = "") -> PublishResult:
+    """Publica no feed da Page. Se image_url for fornecido, publica como foto com legenda
+    via /{page_id}/photos. Caso contrário, usa /{page_id}/feed (somente texto)."""
     text     = _sanitize_text(text)
     page_id  = _sanitize_cred(page_id)
     token    = _sanitize_cred(token)
+    image_url = (image_url or "").strip()
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
+            if image_url:
+                # Publicação com imagem
+                resp = await client.post(
+                    f"https://graph.facebook.com/v19.0/{page_id}/photos",
+                    json={
+                        "url":          image_url,
+                        "caption":      text,
+                        "access_token": token,
+                    },
+                )
+                data = resp.json()
+                if "post_id" in data or "id" in data:
+                    # /photos returns {id, post_id} — prefer post_id for the feed link
+                    post_id  = data.get("post_id") or data.get("id")
+                    photo_id = data.get("id")
+                    url = f"https://www.facebook.com/{post_id.replace('_', '/posts/')}" if "_" in (post_id or "") else f"https://www.facebook.com/{page_id}/posts/{photo_id}"
+                    return PublishResult(
+                        platform="facebook",
+                        success=True,
+                        post_id=post_id,
+                        url=url,
+                    )
+                return PublishResult(platform="facebook", success=False, error=data.get("error", {}).get("message", str(data)))
+
+            # Somente texto
             resp = await client.post(
                 f"https://graph.facebook.com/v19.0/{page_id}/feed",
                 json={"message": text, "access_token": token},

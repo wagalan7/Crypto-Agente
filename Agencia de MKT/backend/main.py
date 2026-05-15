@@ -65,7 +65,7 @@ async def _scheduled_worker():
                 text  = post["text"]
                 img   = post.get("image_url", "")
                 if "facebook" in platforms and creds.get("fb_page_id") and creds.get("fb_token"):
-                    tasks.append(publish_facebook(text, creds["fb_page_id"], creds["fb_token"]))
+                    tasks.append(publish_facebook(text, creds["fb_page_id"], creds["fb_token"], img))
                 if "instagram" in platforms and creds.get("ig_user_id") and creds.get("ig_token") and img:
                     tasks.append(publish_instagram(text, img, creds["ig_user_id"], creds["ig_token"]))
                 if "twitter" in platforms and creds.get("tw_api_key"):
@@ -634,7 +634,7 @@ class PublishRequest(BaseModel):
 async def publish(req: PublishRequest, user: str = Depends(require_auth)):
     tasks = []
     if "facebook" in req.platforms and req.fb_page_id and req.fb_token:
-        tasks.append(publish_facebook(req.text, req.fb_page_id, req.fb_token))
+        tasks.append(publish_facebook(req.text, req.fb_page_id, req.fb_token, req.image_url or ""))
     if "facebook_ads" in req.platforms and req.fb_token and req.fb_ad_account_id and req.fb_page_id:
         tasks.append(publish_facebook_ads(
             req.text,
