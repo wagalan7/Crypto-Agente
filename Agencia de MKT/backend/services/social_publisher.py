@@ -300,6 +300,8 @@ async def publish_facebook_ads(
                 "daily_budget":      str(daily_budget_cents),
                 "billing_event":     billing_event,
                 "optimization_goal": opt_goal,
+                # Meta requires explicit bid_strategy; lowest cost w/o cap lets Meta optimize freely.
+                "bid_strategy":      "LOWEST_COST_WITHOUT_CAP",
                 "targeting":         '{"geo_locations":{"countries":["BR"]},"age_min":18,"age_max":65}',
                 "status":            "PAUSED",
                 "access_token":      token,
