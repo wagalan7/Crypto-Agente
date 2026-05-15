@@ -23,6 +23,42 @@ def _sanitize_text(text: str) -> str:
     )
     return cleaned.strip()
 
+
+def _extract_final_text(raw: str) -> str:
+    """Last-resort defense: if the frontend sent the agent's raw markdown output
+    (with headers like '**Post 1**', 'Plataforma:', 'Texto final:'),
+    pull out just the actual post text from the 'Texto final' / quoted block.
+
+    Returns the cleaned post text, or the raw text if no pattern matches.
+    """
+    import re
+    if not raw:
+        return raw
+    # Normalize curly quotes
+    text = raw.replace("\u201c", '"').replace("\u201d", '"').replace("\u201e", '"').replace("\u2019", "'").replace("\u2018", "'")
+
+    # Heuristic: if the text doesn't look like a marketing brief (no "Texto final" / "Post X" / "Plataforma:"),
+    # assume it's already clean and return as-is.
+    looks_raw = any(marker in text.lower() for marker in (
+        "texto final:", "**post ", "**peça", "plataforma:", "hashtags:", "horário:",
+    ))
+    if not looks_raw:
+        return raw
+
+    # Try: labelled "Texto final" / "Caption final" / etc + quoted content
+    label_re = r'(?:Texto\s+final|Post\s+final|Versão\s+final|Caption\s+final|Legenda\s+final|Caption|Legenda)'
+    sep_re   = r'[*_:\s\-\.]*'
+    m = re.search(rf'{label_re}{sep_re}"([^"]+)"', text, re.IGNORECASE)
+    if m and m.group(1):
+        return m.group(1).strip()
+
+    # Fallback: longest quoted string ≥30 chars (assumed to be the post body)
+    quotes = re.findall(r'"([^"]{30,})"', text)
+    if quotes:
+        return max(quotes, key=len).strip()
+
+    return raw
+
 def _sanitize_cred(value: str) -> str:
     """Strip ALL whitespace and non-printable chars from credential values."""
     return "".join(c for c in value if c.isprintable() and not c.isspace())
@@ -30,7 +66,7 @@ def _sanitize_cred(value: str) -> str:
 async def publish_facebook(text: str, page_id: str, token: str, image_url: str = "") -> PublishResult:
     """Publica no feed da Page. Se image_url for fornecido, publica como foto com legenda
     via /{page_id}/photos. Caso contrário, usa /{page_id}/feed (somente texto)."""
-    text     = _sanitize_text(text)
+    text     = _sanitize_text(_extract_final_text(text))
     page_id  = _sanitize_cred(page_id)
     token    = _sanitize_cred(token)
     image_url = (image_url or "").strip()
@@ -80,7 +116,7 @@ async def publish_facebook(text: str, page_id: str, token: str, image_url: str =
 
 
 async def publish_instagram(caption: str, image_url: str, ig_user_id: str, token: str) -> PublishResult:
-    caption   = _sanitize_text(caption)
+    caption   = _sanitize_text(_extract_final_text(caption))
     image_url = image_url.strip()
     ig_user_id = _sanitize_cred(ig_user_id)
     token      = _sanitize_cred(token)
@@ -166,13 +202,27 @@ async def publish_facebook_ads(
     ad_account_id: str,
     final_url: str,
     budget_amount: str = "20",
-    objective: str = "LINK_CLICKS",
+    objective: str = "OUTCOME_TRAFFIC",
 ) -> PublishResult:
     """
     Cria uma campanha paga no Facebook Ads (Marketing API v19.0).
     Criada em status PAUSED para revisão antes de ativar.
     """
     try:
+        # Clean the post text (strip agent's raw markdown if present)
+        text = _extract_final_text(text)
+
+        # Legacy objective names → ODAX (Meta deprecated old names in Apr 2024)
+        legacy_map = {
+            "LINK_CLICKS":     "OUTCOME_TRAFFIC",
+            "CONVERSIONS":     "OUTCOME_SALES",
+            "REACH":           "OUTCOME_AWARENESS",
+            "BRAND_AWARENESS": "OUTCOME_AWARENESS",
+            "ENGAGEMENT":      "OUTCOME_ENGAGEMENT",
+            "APP_INSTALLS":    "OUTCOME_APP_PROMOTION",
+            "LEAD_GENERATION": "OUTCOME_LEADS",
+        }
+        objective = legacy_map.get(objective, objective)
         # Parse budget (R$ → cents in BRL)
         try:
             amount = float(

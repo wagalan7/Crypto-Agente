@@ -105,6 +105,13 @@ const BUDGET_DEFAULTS: Record<string, { min: number; max: number; currency: stri
 }
 
 const FB_ADS_OBJECTIVES = [
+  { value: 'OUTCOME_TRAFFIC',        label: 'Tráfego (cliques no link)' },
+  { value: 'OUTCOME_SALES',          label: 'Vendas / Conversões' },
+  { value: 'OUTCOME_LEADS',          label: 'Geração de leads' },
+  { value: 'OUTCOME_ENGAGEMENT',     label: 'Engajamento' },
+  { value: 'OUTCOME_AWARENESS',      label: 'Reconhecimento de marca' },
+  { value: 'OUTCOME_APP_PROMOTION',  label: 'Promoção de app' },
+  // legacy values (kept for backward compat with old saved campaigns):
   { value: 'LINK_CLICKS',     label: 'Tráfego (cliques no link)' },
   { value: 'CONVERSIONS',     label: 'Conversões' },
   { value: 'REACH',           label: 'Alcance' },
@@ -228,7 +235,7 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
   const [publishedPosts, setPublishedPosts] = useState<{
     platform: string; post_id: string; token: string; bearer_token?: string; url?: string
   }[]>([])
-  const [fbAdsObjective, setFbAdsObjective] = useState('LINK_CLICKS')
+  const [fbAdsObjective, setFbAdsObjective] = useState('OUTCOME_TRAFFIC')
   const [fbAdsFinalUrl, setFbAdsFinalUrl]   = useState('')
   const [uploading, setUploading]     = useState(false)
   const [profiles, setProfiles]       = useState<ClientProfile[]>([])
