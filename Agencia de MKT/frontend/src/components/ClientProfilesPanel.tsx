@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react'
 
 interface Props {
   authHeaders: Record<string, string>
+  isAdmin?: boolean
+  currentUser?: string
   onProfilesChange?: () => void
 }
 
@@ -11,6 +13,13 @@ interface Profile {
   client_name: string
   credentials: Record<string, string>
   created_at: string
+  shared?: boolean
+}
+
+interface SystemUser {
+  username: string
+  role: string
+  name?: string
 }
 
 const CRED_FIELDS = [
@@ -32,7 +41,7 @@ const CRED_FIELDS = [
 
 interface FbPage { id: string; name: string; instagram_business_account_id: string }
 
-export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
+export function ClientProfilesPanel({ authHeaders, isAdmin = false, currentUser = '', onProfilesChange }: Props) {
   const [profiles, setProfiles]     = useState<Profile[]>([])
   const [loading, setLoading]       = useState(false)
   const [creating, setCreating]     = useState(false)
@@ -45,6 +54,10 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
   const [metaBusy, setMetaBusy]     = useState(false)
   const [metaMsg, setMetaMsg]       = useState<string | null>(null)
   const [metaPages, setMetaPages]   = useState<FbPage[]>([])
+  const [shareProfileId, setShareProfileId] = useState<number | null>(null)
+  const [allUsers, setAllUsers]     = useState<SystemUser[]>([])
+  const [currentShares, setCurrentShares] = useState<string[]>([])
+  const [shareBusy, setShareBusy]   = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -99,6 +112,48 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
     await fetch(`/client-profiles/${id}`, { method: 'DELETE', headers: authHeaders })
     flash('✓ Perfil removido')
     load(); onProfilesChange?.()
+  }
+
+  // ── Sharing (admin only) ──
+  const openShare = async (profileId: number) => {
+    setShareProfileId(profileId)
+    setShareBusy(true)
+    try {
+      const [uRes, sRes] = await Promise.all([
+        fetch('/auth/users', { headers: authHeaders }),
+        fetch(`/client-profiles/${profileId}/shares`, { headers: authHeaders }),
+      ])
+      if (uRes.ok) setAllUsers(await uRes.json())
+      if (sRes.ok) {
+        const data = await sRes.json()
+        setCurrentShares(data.shares || [])
+      }
+    } catch { /* ignore */ }
+    setShareBusy(false)
+  }
+
+  const toggleShare = async (username: string) => {
+    if (shareProfileId == null) return
+    setShareBusy(true)
+    const has = currentShares.includes(username)
+    try {
+      if (has) {
+        const r = await fetch(`/client-profiles/${shareProfileId}/share/${encodeURIComponent(username)}`,
+          { method: 'DELETE', headers: authHeaders })
+        if (r.ok) setCurrentShares(prev => prev.filter(u => u !== username))
+      } else {
+        const r = await fetch(`/client-profiles/${shareProfileId}/share`, {
+          method: 'POST', headers: authHeaders,
+          body: JSON.stringify({ username }),
+        })
+        if (r.ok) setCurrentShares(prev => [...prev, username])
+      }
+    } catch { /* ignore */ }
+    setShareBusy(false)
+  }
+
+  const closeShare = () => {
+    setShareProfileId(null); setCurrentShares([]); setAllUsers([])
   }
 
   const startEdit = (p: Profile) => {
@@ -287,19 +342,35 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
                   className="text-[9px] text-gray-500 hover:text-gray-300 transition-colors">
                   {expandedId === p.id ? '▲ fechar' : '▼ ver'}
                 </button>
-                <button
-                  onClick={() => editing === p.id ? (setEditing(null), setDraft({})) : startEdit(p)}
-                  className={`text-[9px] px-2 py-1 rounded border transition-colors
-                    ${editing === p.id
-                      ? 'border-violet-700 text-violet-300 bg-violet-900/20'
-                      : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}>
-                  {editing === p.id ? 'cancelar' : '✎ editar'}
-                </button>
-                <button
-                  onClick={() => handleDelete(p.id, p.client_name)}
-                  className="text-[9px] text-red-600 hover:text-red-400 transition-colors">
-                  remover
-                </button>
+                {!p.shared && (
+                  <button
+                    onClick={() => editing === p.id ? (setEditing(null), setDraft({})) : startEdit(p)}
+                    className={`text-[9px] px-2 py-1 rounded border transition-colors
+                      ${editing === p.id
+                        ? 'border-violet-700 text-violet-300 bg-violet-900/20'
+                        : 'border-gray-700 text-gray-400 hover:text-gray-200'}`}>
+                    {editing === p.id ? 'cancelar' : '✎ editar'}
+                  </button>
+                )}
+                {isAdmin && (
+                  <button
+                    onClick={() => openShare(p.id)}
+                    className="text-[9px] px-2 py-1 rounded border border-gray-700 text-gray-400 hover:text-blue-300 hover:border-blue-700 transition-colors">
+                    👥 compartilhar
+                  </button>
+                )}
+                {!p.shared && (
+                  <button
+                    onClick={() => handleDelete(p.id, p.client_name)}
+                    className="text-[9px] text-red-600 hover:text-red-400 transition-colors">
+                    remover
+                  </button>
+                )}
+                {p.shared && (
+                  <span className="text-[9px] text-blue-400" title={`compartilhado por ${p.owner}`}>
+                    🔗 compartilhado
+                  </span>
+                )}
               </div>
             </div>
 
@@ -352,6 +423,72 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
           </div>
         ))}
       </div>
+
+      {/* Share modal */}
+      {shareProfileId !== null && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+             onClick={closeShare}>
+          <div className="bg-gray-900 border border-gray-700 rounded-xl max-w-md w-full p-5 space-y-3"
+               onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-gray-200">
+                👥 Compartilhar perfil
+              </h3>
+              <button onClick={closeShare}
+                className="text-gray-500 hover:text-gray-200 text-lg leading-none">×</button>
+            </div>
+            <p className="text-[10px] text-gray-500">
+              Marque os usuários que poderão <b>visualizar e usar</b> as credenciais deste perfil.
+              Eles não poderão editar nem remover.
+            </p>
+            {shareBusy && <p className="text-[10px] text-gray-500">carregando...</p>}
+            <div className="max-h-72 overflow-y-auto space-y-1">
+              {allUsers
+                .filter(u => u.username !== currentUser)
+                .map(u => {
+                  const checked = currentShares.includes(u.username)
+                  return (
+                    <label key={u.username}
+                      className={`flex items-center gap-2 px-2.5 py-1.5 rounded cursor-pointer
+                                  border transition-colors ${
+                        checked
+                          ? 'bg-blue-900/30 border-blue-700'
+                          : 'bg-gray-800 border-gray-700 hover:border-gray-600'
+                      }`}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={shareBusy}
+                        onChange={() => toggleShare(u.username)}
+                        className="accent-blue-500"
+                      />
+                      <div className="flex-1">
+                        <div className="text-[11px] text-gray-200">
+                          {u.name || u.username}
+                          {u.role === 'admin' && (
+                            <span className="ml-1.5 text-[8px] text-violet-400">⭐</span>
+                          )}
+                        </div>
+                        <div className="text-[9px] text-gray-500">{u.username}</div>
+                      </div>
+                    </label>
+                  )
+                })}
+              {allUsers.filter(u => u.username !== currentUser).length === 0 && !shareBusy && (
+                <p className="text-[10px] text-gray-600 text-center py-4">
+                  Nenhum outro usuário cadastrado.
+                </p>
+              )}
+            </div>
+            <button
+              onClick={closeShare}
+              className="w-full py-1.5 rounded-lg text-[11px] font-semibold text-gray-300
+                         bg-gray-800 hover:bg-gray-700 transition-colors">
+              Concluído
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

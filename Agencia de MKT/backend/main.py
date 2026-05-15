@@ -24,7 +24,9 @@ from db import (init_db, db_seed_users, save_campaign, list_campaigns, get_campa
                 list_notifications, mark_notifications_read, count_unread,
                 get_client_stats,
                 list_client_profiles, create_client_profile,
-                update_client_profile, delete_client_profile)
+                update_client_profile, delete_client_profile,
+                grant_client_profile, revoke_client_profile_grant,
+                list_client_profile_grants)
 from services.social_publisher import (
     publish_facebook, publish_instagram, publish_twitter, publish_webhook,
     publish_google_ads, toggle_google_ads_campaign,
@@ -1011,6 +1013,31 @@ async def remove_client_profile(profile_id: int, user: str = Depends(require_aut
     ok = delete_client_profile(profile_id, user, is_admin)
     if not ok:
         raise HTTPException(404, detail="Perfil não encontrado ou sem permissão.")
+    return {"ok": True}
+
+
+class ShareProfileRequest(BaseModel):
+    username: str
+
+@app.get("/client-profiles/{profile_id}/shares")
+async def get_profile_shares(profile_id: int, user: str = Depends(require_auth)):
+    require_admin(user)
+    return {"shares": list_client_profile_grants(profile_id)}
+
+@app.post("/client-profiles/{profile_id}/share")
+async def share_profile(profile_id: int, req: ShareProfileRequest, user: str = Depends(require_auth)):
+    require_admin(user)
+    if req.username == user:
+        raise HTTPException(400, detail="Não é possível compartilhar consigo mesmo.")
+    ok = grant_client_profile(profile_id, req.username, user)
+    if not ok:
+        raise HTTPException(404, detail="Perfil não encontrado.")
+    return {"ok": True}
+
+@app.delete("/client-profiles/{profile_id}/share/{username}")
+async def unshare_profile(profile_id: int, username: str, user: str = Depends(require_auth)):
+    require_admin(user)
+    revoke_client_profile_grant(profile_id, username)
     return {"ok": True}
 
 

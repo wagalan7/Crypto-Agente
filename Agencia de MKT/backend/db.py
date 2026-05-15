@@ -109,6 +109,15 @@ def init_db():
             updated_at   TEXT DEFAULT (datetime('now','localtime'))
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS client_profile_grants (
+            profile_id  INTEGER NOT NULL,
+            granted_to  TEXT NOT NULL,
+            granted_by  TEXT NOT NULL,
+            granted_at  TEXT DEFAULT (datetime('now','localtime')),
+            PRIMARY KEY (profile_id, granted_to)
+        )
+    """)
     con.commit()
 
     # One-time migrations
@@ -517,17 +526,59 @@ def list_client_profiles(owner: str, is_admin: bool) -> list[dict]:
             "SELECT * FROM client_profiles ORDER BY client_name"
         ).fetchall()
     else:
+        # Own profiles + profiles shared with this user
         rows = con.execute(
-            "SELECT * FROM client_profiles WHERE owner=? ORDER BY client_name",
-            (owner,)
+            """SELECT DISTINCT cp.* FROM client_profiles cp
+               LEFT JOIN client_profile_grants g ON g.profile_id = cp.id
+               WHERE cp.owner = ? OR g.granted_to = ?
+               ORDER BY cp.client_name""",
+            (owner, owner)
         ).fetchall()
     con.close()
     result = []
     for r in rows:
         d = dict(r)
         d['credentials'] = json.loads(d.get('credentials') or '{}')
+        d['shared'] = (d.get('owner') != owner) and not is_admin
         result.append(d)
     return result
+
+
+def grant_client_profile(profile_id: int, granted_to: str, granted_by: str) -> bool:
+    con = _con()
+    profile = con.execute("SELECT owner FROM client_profiles WHERE id=?", (profile_id,)).fetchone()
+    if not profile:
+        con.close(); return False
+    try:
+        con.execute(
+            "INSERT OR IGNORE INTO client_profile_grants (profile_id, granted_to, granted_by) VALUES (?,?,?)",
+            (profile_id, granted_to, granted_by)
+        )
+        con.commit()
+    finally:
+        con.close()
+    return True
+
+
+def revoke_client_profile_grant(profile_id: int, granted_to: str) -> bool:
+    con = _con()
+    cur = con.execute(
+        "DELETE FROM client_profile_grants WHERE profile_id=? AND granted_to=?",
+        (profile_id, granted_to)
+    )
+    changed = cur.rowcount > 0
+    con.commit(); con.close()
+    return changed
+
+
+def list_client_profile_grants(profile_id: int) -> list[str]:
+    con = _con()
+    rows = con.execute(
+        "SELECT granted_to FROM client_profile_grants WHERE profile_id=? ORDER BY granted_to",
+        (profile_id,)
+    ).fetchall()
+    con.close()
+    return [r[0] for r in rows]
 
 
 def create_client_profile(owner: str, client_name: str, credentials: dict) -> dict:

@@ -348,7 +348,7 @@ export default function App() {
           <ClientsPanel authHeaders={authHeaders} isAdmin={isAdmin} currentUser={currentUser} />
         )}
         {showProfiles && (
-          <ClientProfilesPanel authHeaders={authHeaders} />
+          <ClientProfilesPanel authHeaders={authHeaders} isAdmin={isAdmin} currentUser={currentUser} />
         )}
         {showUsers && isAdmin && (
           <UsersPanel authHeaders={authHeaders} currentUser={currentUser} />
