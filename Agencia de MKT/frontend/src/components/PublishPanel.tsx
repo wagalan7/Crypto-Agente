@@ -224,6 +224,8 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
   const [selected, setSelected]         = useState<Set<string>>(new Set())
   const [publishing, setPublishing]     = useState(false)
   const [results, setResults]           = useState<PublishResult[]>([])
+  const [activatingCampaign, setActivatingCampaign] = useState<string | null>(null)
+  const [activatedCampaigns, setActivatedCampaigns] = useState<Set<string>>(new Set())
   const [validationErrors, setValidationErrors] = useState<string[]>([])
   const [customText, setCustomText]     = useState<string | null>(null)
   const [showGuide, setShowGuide]       = useState<string | null>(null)
@@ -355,6 +357,26 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
       if (!creds.webhook_url) errors.push('Webhook: URL não preenchida')
     }
     return errors
+  }
+
+  const activateCampaign = async (campaignId: string) => {
+    setActivatingCampaign(campaignId)
+    try {
+      const res = await fetch('/reports/facebook-ads/toggle', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ campaign_id: campaignId, new_status: 'ACTIVE' }),
+      })
+      const data = await res.json()
+      if (res.ok && data.success) {
+        setActivatedCampaigns(prev => new Set(prev).add(campaignId))
+      } else {
+        alert(`Erro ao ativar campanha: ${data.detail || data.error || 'desconhecido'}`)
+      }
+    } catch (e) {
+      alert(`Erro: ${e}`)
+    }
+    setActivatingCampaign(null)
   }
 
   const handlePublish = async () => {
@@ -948,10 +970,25 @@ export function PublishPanel({ publisherOutput, copyOutput, socialOutput, design
                         <span className="text-red-400 break-all whitespace-pre-wrap flex-1">{r.error}</span>
                       )}
                     </div>
-                    {r.success && r.url && (
-                      <a href={r.url} target="_blank" rel="noopener noreferrer"
-                        className="text-emerald-400 hover:underline shrink-0">ver post ↗</a>
-                    )}
+                    <div className="flex items-center gap-2 shrink-0">
+                      {/* Activate paused FB Ads campaign */}
+                      {r.success && r.platform === 'facebook_ads' && r.post_id && !activatedCampaigns.has(r.post_id) && (
+                        <button
+                          onClick={() => activateCampaign(r.post_id!)}
+                          disabled={activatingCampaign === r.post_id}
+                          className="text-[10px] px-2.5 py-1 rounded bg-emerald-700 hover:bg-emerald-600
+                                     disabled:bg-gray-700 text-white transition-colors">
+                          {activatingCampaign === r.post_id ? 'ativando...' : '▶ Ativar campanha'}
+                        </button>
+                      )}
+                      {r.success && r.platform === 'facebook_ads' && r.post_id && activatedCampaigns.has(r.post_id) && (
+                        <span className="text-[10px] text-emerald-400">✓ campanha ativa</span>
+                      )}
+                      {r.success && r.url && (
+                        <a href={r.url} target="_blank" rel="noopener noreferrer"
+                          className="text-emerald-400 hover:underline">ver post ↗</a>
+                      )}
+                    </div>
                   </div>
                 </div>
               ))}
