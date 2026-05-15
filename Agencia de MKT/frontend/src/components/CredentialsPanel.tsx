@@ -73,6 +73,7 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
   const [googleAccounts, setGoogleAccounts]       = useState<string[]>([])
   const [igRefreshing, setIgRefreshing]   = useState(false)
   const [igRefreshMsg, setIgRefreshMsg]   = useState<string | null>(null)
+  const [fbPages, setFbPages] = useState<{id: string; name: string; instagram_business_account_id: string}[]>([])
 
   // Check URL params for Google OAuth result
   useEffect(() => {
@@ -205,6 +206,41 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
   const refreshInstagramToken = () => refreshMetaToken('instagram')
   const refreshFacebookToken  = () => refreshMetaToken('facebook')
 
+  // Lists all Facebook pages the user has access to (no page_id needed).
+  // Helpful when the user doesn't know the correct Page ID.
+  const listFacebookPages = async () => {
+    const tokenFb = (drafts['facebook'] || creds['facebook'] || {})['fb_token'] || ''
+    const tokenIg = (drafts['instagram'] || creds['instagram'] || {})['ig_token'] || ''
+    const currentToken = tokenFb || tokenIg
+    if (!currentToken) { flashErr('Cole um token (Facebook ou Instagram) antes de listar páginas.'); return }
+    setIgRefreshing(true); setIgRefreshMsg(null); setFbPages([])
+    try {
+      const res = await fetch('/auth/instagram/exchange-token', {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify({ short_token: currentToken }),   // sem page_id → retorna lista
+      })
+      const data = await res.json()
+      if (!res.ok) { flashErr(data.detail || 'Erro ao listar páginas'); setIgRefreshing(false); return }
+      const pages = data.pages || []
+      setFbPages(pages)
+      if (!pages.length) {
+        setIgRefreshMsg('Nenhuma página encontrada nesse token. Verifique se o token tem permissão "pages_show_list".')
+      } else {
+        setIgRefreshMsg(`✓ ${pages.length} página(s) encontrada(s). Clique em uma para preencher automaticamente.`)
+      }
+    } catch (e) { flashErr(String(e)) }
+    setIgRefreshing(false)
+  }
+
+  const selectFbPage = (page: {id: string; name: string; instagram_business_account_id: string}) => {
+    setDraftField('facebook', 'fb_page_id', page.id)
+    if (page.instagram_business_account_id) {
+      setDraftField('instagram', 'ig_user_id', page.instagram_business_account_id)
+    }
+    setIgRefreshMsg(`✓ Página "${page.name}" selecionada (ID: ${page.id}). Agora clique em "obter token PERMANENTE" pra finalizar.`)
+    setFbPages([])
+  }
+
   const startGoogleOAuth = () => {
     const token = authHeaders['Authorization']?.split(' ')[1] || ''
     if (!token) { flashErr('Faça login novamente antes de conectar o Google Ads'); return }
@@ -313,6 +349,37 @@ export function CredentialsPanel({ authHeaders, onLoaded }: Props) {
                   {(p.id === 'instagram' || p.id === 'facebook') && igRefreshMsg && (
                     <div className="px-3 py-2 bg-emerald-900/30 border border-emerald-800 rounded-lg text-[10px] text-emerald-400">
                       {igRefreshMsg}
+                    </div>
+                  )}
+
+                  {/* Facebook: botão pra LISTAR páginas (descobrir Page ID correto) */}
+                  {p.id === 'facebook' && (
+                    <div className="bg-blue-950/20 border border-blue-900/40 rounded-lg p-3 space-y-2">
+                      <p className="text-[10px] text-blue-300 font-semibold">
+                        Não sabe o Page ID? Cole o token abaixo e clique:
+                      </p>
+                      <button
+                        onClick={listFacebookPages}
+                        disabled={igRefreshing}
+                        className="text-[10px] px-3 py-1.5 rounded bg-blue-700 hover:bg-blue-600 disabled:bg-gray-700 text-white transition-colors">
+                        {igRefreshing ? 'buscando...' : '🔍 Listar minhas páginas do Facebook'}
+                      </button>
+                      {fbPages.length > 0 && (
+                        <div className="space-y-1 mt-2">
+                          {fbPages.map(pg => (
+                            <button
+                              key={pg.id}
+                              onClick={() => selectFbPage(pg)}
+                              className="w-full text-left px-2 py-1.5 rounded bg-gray-800 hover:bg-blue-900/40 border border-gray-700 hover:border-blue-700 transition-colors">
+                              <div className="text-[11px] text-gray-200 font-semibold">{pg.name}</div>
+                              <div className="text-[9px] text-gray-500 font-mono">ID: {pg.id}</div>
+                              {pg.instagram_business_account_id && (
+                                <div className="text-[9px] text-pink-400">IG vinculado: {pg.instagram_business_account_id}</div>
+                              )}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   )}
 
