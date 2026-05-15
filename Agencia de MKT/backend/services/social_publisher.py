@@ -280,7 +280,10 @@ async def publish_facebook_ads(
                 "name":      f"Campanha MagaOne {ts}",
                 "objective": fb_objective,
                 "status":    "PAUSED",
-                "special_ad_categories": "[]",
+                "special_ad_categories":        "[]",
+                # Required since v19: must be explicit when budget is at ad-set level (not CBO).
+                "is_adset_budget_sharing_enabled": "false",
+                "buying_type":                   "AUCTION",
                 "access_token": token,
             })
             rd = r.json()
