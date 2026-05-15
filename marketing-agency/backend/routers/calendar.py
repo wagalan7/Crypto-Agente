@@ -52,10 +52,12 @@ def get_calendar(client_id: int, days: int = 14, current_user: User = Depends(ge
 
 @router.patch("/{slot_id}/attach")
 def attach_content(slot_id: int, req: AttachContentRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    svc = CalendarService(db)
-    slot = svc.attach_content(slot_id, req.content_id)
+    slot = db.query(CalendarSlot).filter(CalendarSlot.id == slot_id).first()
     if not slot:
         raise HTTPException(404, "Slot not found")
+    assert_client_access(slot.client_id, current_user, db)
+    svc = CalendarService(db)
+    slot = svc.attach_content(slot_id, req.content_id)
     return _serialize(slot)
 
 
@@ -64,6 +66,7 @@ def update_slot_status(slot_id: int, status: str, current_user: User = Depends(g
     slot = db.query(CalendarSlot).filter(CalendarSlot.id == slot_id).first()
     if not slot:
         raise HTTPException(404, "Slot not found")
+    assert_client_access(slot.client_id, current_user, db)
     slot.status = status
     db.commit()
     return _serialize(slot)

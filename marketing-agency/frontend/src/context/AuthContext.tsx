@@ -20,9 +20,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       api.auth.me().then((u: any) => {
         setUser(u)
         saveSession(getToken()!, u)
-      }).catch(() => {
-        clearSession()
-        setUser(null)
+      }).catch((err) => {
+        // Only clear session on auth failure (401 throws "Não autenticado").
+        // Other errors (network, server) shouldn't kick the user out.
+        if (err?.message === 'Não autenticado') {
+          clearSession()
+          setUser(null)
+        } else {
+          console.error('auth.me failed:', err)
+        }
       }).finally(() => setLoading(false))
     } else {
       setLoading(false)

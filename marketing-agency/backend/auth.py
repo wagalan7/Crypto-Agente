@@ -9,7 +9,9 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import User
 
-SECRET_KEY = os.getenv("SECRET_KEY", "contentai-secret-key-change-in-production-2024")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY env var is required — generate one with: openssl rand -hex 32")
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_DAYS = 30
 

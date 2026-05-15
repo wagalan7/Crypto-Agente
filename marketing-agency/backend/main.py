@@ -40,8 +40,8 @@ def _seed_users():
     from auth import hash_password
 
     SEED = [
-        {"email": "wagalan@gmail.com", "password": "@l61310788", "name": "Wagner", "role": "master"},
-        {"email": "brunaparolin6@gmail.com", "password": "231981", "name": "Bruna", "role": "master"},
+        {"email": "wagalan@gmail.com", "password": os.getenv("SEED_WAGNER_PASSWORD", "@l61310788"), "name": "Wagner", "role": "master"},
+        {"email": "brunaparolin6@gmail.com", "password": os.getenv("SEED_BRUNA_PASSWORD", "231981"), "name": "Bruna", "role": "master"},
     ]
 
     db = SessionLocal()

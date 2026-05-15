@@ -33,6 +33,7 @@ async function patch<T>(path: string, body: unknown): Promise<T> {
 
 async function del<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { method: 'DELETE', headers: headers(), body: body ? JSON.stringify(body) : undefined })
+  if (res.status === 401) { window.dispatchEvent(new Event('auth:logout')); throw new Error('Não autenticado') }
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
