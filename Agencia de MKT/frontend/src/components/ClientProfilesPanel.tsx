@@ -30,6 +30,8 @@ const CRED_FIELDS = [
   { key: 'webhook_url',             label: 'Webhook URL',                   secret: false },
 ]
 
+interface FbPage { id: string; name: string; instagram_business_account_id: string }
+
 export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
   const [profiles, setProfiles]     = useState<Profile[]>([])
   const [loading, setLoading]       = useState(false)
@@ -40,6 +42,9 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
   const [saving, setSaving]         = useState(false)
   const [msg, setMsg]               = useState('')
   const [expandedId, setExpandedId] = useState<number | null>(null)
+  const [metaBusy, setMetaBusy]     = useState(false)
+  const [metaMsg, setMetaMsg]       = useState<string | null>(null)
+  const [metaPages, setMetaPages]   = useState<FbPage[]>([])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -100,10 +105,80 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
     setEditing(p.id)
     setDraft({ ...p.credentials })
     setExpandedId(p.id)
+    resetMeta()
   }
 
   const setField = (key: string, value: string) =>
     setDraft(d => ({ ...d, [key]: value }))
+
+  // ── Meta helpers (Facebook/Instagram token & page ID) ──
+  const listPages = async () => {
+    const token = draft.fb_token || draft.ig_token || ''
+    if (!token) { setMetaMsg('Cole o Access Token do Facebook (ou Instagram) antes de listar páginas.'); return }
+    setMetaBusy(true); setMetaMsg(null); setMetaPages([])
+    try {
+      const r = await fetch('/auth/instagram/exchange-token', {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify({ short_token: token }),
+      })
+      const data = await r.json()
+      if (!r.ok) { setMetaMsg(data.detail || 'Erro ao listar páginas'); setMetaBusy(false); return }
+      const pages: FbPage[] = data.pages || []
+      setMetaPages(pages)
+      setMetaMsg(pages.length
+        ? `✓ ${pages.length} página(s) encontrada(s). Clique pra preencher.`
+        : '⚠ Nenhuma página vinculada a esse token. Verifique permissões "pages_show_list".')
+    } catch (e) { setMetaMsg(String(e)) }
+    setMetaBusy(false)
+  }
+
+  const pickPage = (pg: FbPage) => {
+    setDraft(d => ({
+      ...d,
+      fb_page_id: pg.id,
+      ig_user_id: pg.instagram_business_account_id || d.ig_user_id || '',
+    }))
+    setMetaMsg(`✓ "${pg.name}" selecionada. Agora clique em "obter token PERMANENTE" abaixo.`)
+    setMetaPages([])
+  }
+
+  const getPermanentToken = async () => {
+    const token   = draft.fb_token || draft.ig_token || ''
+    const pageId  = draft.fb_page_id || ''
+    if (!token)  { setMetaMsg('Cole o Access Token antes.'); return }
+    if (!pageId) { setMetaMsg('Preencha o Page ID (ou clique em "Listar minhas páginas" pra escolher).'); return }
+    setMetaBusy(true); setMetaMsg(null)
+    try {
+      const r = await fetch('/auth/instagram/exchange-token', {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify({ short_token: token, page_id: pageId }),
+      })
+      const data = await r.json()
+      if (!r.ok) { setMetaMsg(data.detail || 'Erro'); setMetaBusy(false); return }
+      if (data.permanent) {
+        setDraft(d => ({
+          ...d,
+          fb_token:   data.access_token,           // permanent page token (works for both FB & IG)
+          ig_token:   data.access_token,
+          fb_page_id: data.page_id || d.fb_page_id,
+          ig_user_id: data.instagram_business_account_id || d.ig_user_id || '',
+        }))
+        setMetaMsg(`✓ Token PERMANENTE da página "${data.page_name}" obtido! Não expira. Clique em Salvar.`)
+      } else {
+        const pgs = (data.pages || []) as FbPage[]
+        setMetaPages(pgs)
+        setMetaMsg(
+          `⚠ Token só renovou pra ${data.expires_days ?? 60} dias (token de usuário).` +
+          (pgs.length ? ` Páginas disponíveis listadas abaixo — clique na correta.` : '') +
+          (data.warning ? ` ${data.warning}` : '')
+        )
+      }
+    } catch (e) { setMetaMsg(String(e)) }
+    setMetaBusy(false)
+  }
+
+  // Reset Meta panel state when opening/closing edit/create
+  const resetMeta = () => { setMetaMsg(null); setMetaPages([]) }
 
   const countFilled = (creds: Record<string, string>) =>
     Object.values(creds).filter(v => v).length
@@ -119,7 +194,7 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
           </span>
         </div>
         <button
-          onClick={() => { setCreating(c => !c); setEditing(null); setDraft({}); setNewName('') }}
+          onClick={() => { setCreating(c => !c); setEditing(null); setDraft({}); setNewName(''); resetMeta() }}
           className={`text-[11px] px-3 py-1 rounded-lg border transition-all
             ${creating ? 'border-violet-600 text-violet-300 bg-violet-900/20' : 'border-gray-700 text-gray-400 hover:text-gray-200 hover:border-gray-600'}`}>
           {creating ? '✕ Cancelar' : '+ Novo perfil'}
@@ -151,6 +226,12 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
               />
             </div>
             <p className="text-[9px] text-gray-500 uppercase tracking-widest">Credenciais (preencha apenas as que usar):</p>
+
+            <MetaHelperPanel
+              metaBusy={metaBusy} metaMsg={metaMsg} metaPages={metaPages}
+              onList={listPages} onPick={pickPage} onPermanent={getPermanentToken}
+            />
+
             <div className="grid grid-cols-1 gap-2">
               {CRED_FIELDS.map(f => (
                 <div key={f.key}>
@@ -227,6 +308,10 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
               <div className="px-4 py-3 border-t border-gray-700 bg-gray-900/40 space-y-2">
                 {editing === p.id ? (
                   <>
+                    <MetaHelperPanel
+                      metaBusy={metaBusy} metaMsg={metaMsg} metaPages={metaPages}
+                      onList={listPages} onPick={pickPage} onPermanent={getPermanentToken}
+                    />
                     {CRED_FIELDS.map(f => (
                       <div key={f.key}>
                         <label className="block text-[9px] text-gray-600 mb-0.5">{f.label}</label>
@@ -267,6 +352,72 @@ export function ClientProfilesPanel({ authHeaders, onProfilesChange }: Props) {
           </div>
         ))}
       </div>
+    </div>
+  )
+}
+
+interface MetaHelperProps {
+  metaBusy: boolean
+  metaMsg: string | null
+  metaPages: FbPage[]
+  onList: () => void
+  onPick: (pg: FbPage) => void
+  onPermanent: () => void
+}
+
+function MetaHelperPanel({ metaBusy, metaMsg, metaPages, onList, onPick, onPermanent }: MetaHelperProps) {
+  return (
+    <div className="border border-blue-900/50 bg-blue-950/20 rounded-lg p-3 space-y-2">
+      <p className="text-[10px] font-semibold text-blue-300 uppercase tracking-wider">
+        🔗 Assistente Facebook / Instagram
+      </p>
+      <p className="text-[9px] text-gray-500 leading-relaxed">
+        1. Cole o Access Token (curto, do Graph API Explorer) no campo abaixo.
+        2. Clique <b>Listar páginas</b> pra descobrir o Page ID correto e IG vinculado.
+        3. Clique <b>Obter token PERMANENTE</b> — substitui o token curto pelo token da página (não expira).
+      </p>
+      <div className="flex gap-2 flex-wrap">
+        <button
+          type="button"
+          onClick={onList}
+          disabled={metaBusy}
+          className="text-[10px] px-3 py-1.5 rounded bg-blue-700 hover:bg-blue-600 disabled:bg-gray-700 text-white transition-colors">
+          {metaBusy ? 'aguarde...' : '🔍 Listar páginas'}
+        </button>
+        <button
+          type="button"
+          onClick={onPermanent}
+          disabled={metaBusy}
+          className="text-[10px] px-3 py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 disabled:bg-gray-700 text-white transition-colors">
+          {metaBusy ? 'aguarde...' : '🔄 Obter token PERMANENTE'}
+        </button>
+      </div>
+      {metaMsg && (
+        <div className={`px-2.5 py-1.5 rounded text-[10px] border whitespace-pre-wrap break-words ${
+          metaMsg.startsWith('✓') ? 'bg-emerald-900/30 border-emerald-800 text-emerald-300'
+          : metaMsg.startsWith('⚠') ? 'bg-amber-900/30 border-amber-800 text-amber-300'
+          : 'bg-red-900/30 border-red-800 text-red-300'
+        }`}>
+          {metaMsg}
+        </div>
+      )}
+      {metaPages.length > 0 && (
+        <div className="space-y-1">
+          {metaPages.map(pg => (
+            <button
+              key={pg.id}
+              type="button"
+              onClick={() => onPick(pg)}
+              className="w-full text-left px-2.5 py-1.5 rounded bg-gray-800 hover:bg-blue-900/40 border border-gray-700 hover:border-blue-700 transition-colors">
+              <div className="text-[11px] text-gray-200 font-semibold">{pg.name}</div>
+              <div className="text-[9px] text-gray-500 font-mono">Page ID: {pg.id}</div>
+              {pg.instagram_business_account_id && (
+                <div className="text-[9px] text-pink-400">IG Business ID: {pg.instagram_business_account_id}</div>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
