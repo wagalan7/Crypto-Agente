@@ -293,7 +293,7 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     tenant_id = tenant["id"]
     db.save_message(tenant_id, phone, "user", text)
 
-    offered_slots = cal.get_available_slots(tenant, days_ahead=7, limit=6)
+    offered_slots = cal.get_available_slots(tenant, days_ahead=10, limit=6)
     context = _build_context(tenant, phone, offered_slots)
 
     history = db.get_conversation_history(tenant_id, phone, limit=8)

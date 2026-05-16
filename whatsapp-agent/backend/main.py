@@ -573,7 +573,7 @@ def dash_caldav_test(request: Request):
 def dash_slots(request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
-    slots = cal.get_available_slots(tenant, days_ahead=7, limit=20)
+    slots = cal.get_available_slots(tenant, days_ahead=10, limit=20)
     return {"slots": cal.format_slots(slots)}
 
 
