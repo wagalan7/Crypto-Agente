@@ -1,21 +1,34 @@
 import { useState, useRef } from 'react'
 
+interface SavePayload {
+  title: string
+  format: string
+  platform: string
+  objective: string
+  field?: 'script' | 'copy' | 'design_brief' | 'strategic_note'
+}
+
 interface Props {
   label: string
   onRun: () => AsyncGenerator<{ type: string; payload: string }>
   placeholder?: string
+  onSave?: (output: string) => Promise<SavePayload | null> | SavePayload | null
+  saveLabel?: string
 }
 
-export function AgentStream({ label, onRun, placeholder }: Props) {
+export function AgentStream({ label, onRun, placeholder, onSave, saveLabel = 'Salvar como Conteúdo' }: Props) {
   const [output, setOutput] = useState('')
   const [status, setStatus] = useState('')
   const [running, setRunning] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveMsg, setSaveMsg] = useState('')
   const abortRef = useRef(false)
 
   async function run() {
     setRunning(true)
     setOutput('')
     setStatus('')
+    setSaveMsg('')
     abortRef.current = false
 
     try {
@@ -30,6 +43,20 @@ export function AgentStream({ label, onRun, placeholder }: Props) {
       setStatus(`Erro: ${e.message}`)
     } finally {
       setRunning(false)
+    }
+  }
+
+  async function handleSave() {
+    if (!onSave || !output) return
+    setSaving(true)
+    setSaveMsg('')
+    try {
+      const result = await onSave(output)
+      if (result) setSaveMsg('Salvo! Veja na aba Conteúdo.')
+    } catch (e: any) {
+      setSaveMsg(`Erro ao salvar: ${e.message}`)
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -60,6 +87,15 @@ export function AgentStream({ label, onRun, placeholder }: Props) {
           <p className="text-gray-500 text-sm">{placeholder}</p>
         </div>
       ) : null}
+
+      {output && !running && onSave && (
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-xs text-gray-500">{saveMsg}</p>
+          <button onClick={handleSave} disabled={saving} className="btn-secondary text-xs">
+            {saving ? 'Salvando...' : saveLabel}
+          </button>
+        </div>
+      )}
     </div>
   )
 }

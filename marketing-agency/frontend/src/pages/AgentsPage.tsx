@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router-dom'
 import { api } from '../services/api'
 import { AgentStream } from '../components/AgentStream'
 
@@ -25,7 +25,17 @@ const TABS: { id: AgentTab; label: string; icon: string }[] = [
 export function AgentsPage() {
   const { clientId } = useParams<{ clientId: string }>()
   const id = Number(clientId)
+  const navigate = useNavigate()
   const [tab, setTab] = useState<AgentTab>('strategy')
+
+  async function saveContent(payload: {
+    title: string; format: string; platform: string; objective: string;
+    script?: string; copy?: string; design_brief?: string; strategic_note?: string;
+  }) {
+    await api.content.create({ client_id: id, ...payload })
+    setTimeout(() => navigate(`/client/${clientId}/content`), 800)
+    return payload
+  }
 
   const [scriptForm, setScriptForm] = useState({ topic: '', format: 'reels', platform: 'instagram', objective: 'attract' })
   const [trendInput, setTrendInput] = useState('')
@@ -64,6 +74,11 @@ export function AgentsPage() {
             label="Gerar Estratégia"
             placeholder="Clique para gerar estratégia personalizada"
             onRun={() => api.agents.strategy(id, 'semanal')}
+            onSave={(output) => saveContent({
+              title: `Estratégia semanal — ${new Date().toLocaleDateString('pt-BR')}`,
+              format: 'post', platform: 'instagram', objective: 'authority',
+              strategic_note: output,
+            })}
           />
         </div>
       )}
@@ -113,6 +128,11 @@ export function AgentsPage() {
             label="Gerar Roteiro"
             placeholder="Preencha o tema acima"
             onRun={() => api.agents.script(id, scriptForm.topic, scriptForm.format, scriptForm.platform, scriptForm.objective)}
+            onSave={(output) => saveContent({
+              title: scriptForm.topic || 'Roteiro sem título',
+              format: scriptForm.format, platform: scriptForm.platform, objective: scriptForm.objective,
+              script: output,
+            })}
           />
         </div>
       )}
@@ -175,6 +195,11 @@ export function AgentsPage() {
             label="Gerar Briefing Visual"
             placeholder="Preencha o tema acima"
             onRun={() => api.agents.design(id, designForm.topic, designForm.format, designForm.platform, designForm.references)}
+            onSave={(output) => saveContent({
+              title: `Design — ${designForm.topic || 'sem título'}`,
+              format: designForm.format, platform: designForm.platform, objective: 'attract',
+              design_brief: output,
+            })}
           />
         </div>
       )}
@@ -198,6 +223,11 @@ export function AgentsPage() {
             label="Amplificar Ideia"
             placeholder="Digite sua ideia acima"
             onRun={() => api.agents.amplifier(id, amplifierInput || 'ideia geral sobre o nicho')}
+            onSave={(output) => saveContent({
+              title: amplifierInput ? amplifierInput.slice(0, 60) : 'Ideia amplificada',
+              format: 'post', platform: 'instagram', objective: 'connect',
+              copy: output,
+            })}
           />
         </div>
       )}
