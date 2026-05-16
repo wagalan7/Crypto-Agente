@@ -6,10 +6,11 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 from database import get_db
-from models import ContentPiece, User, Product, Client
+from models import ContentPiece, User, Product, Client, Inspiration
 from auth import get_current_user, assert_client_access
-from agents import ProductionBriefingAgent, SectionRewriterAgent
+from agents import ProductionBriefingAgent, SectionRewriterAgent, InspirationAlignmentAgent
 from agents.production_briefing import parse_json_response as parse_brief_json
+from agents.inspiration_alignment import parse_json_response as parse_align_json
 from services import BrandBrain
 
 REGEN_SECTIONS = {"hook", "script", "copy", "design_brief"}
@@ -377,6 +378,65 @@ def bulk_delete(req: BulkDeleteRequest,
             continue
     db.commit()
     return {"deleted": n}
+
+
+@router.post("/{content_id}/inspiration-alignment")
+async def inspiration_alignment(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Score how well this generated post lands the saved inspirations.
+
+    Returns alignment_score, strengths, divergences and a concrete adjustment
+    suggestion. If the client has no inspirations cadastrated, returns 0 with
+    a hint to add some.
+    """
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+
+    inspirations = db.query(Inspiration).filter(Inspiration.client_id == c.client_id).order_by(Inspiration.created_at.desc()).all()
+    if not inspirations:
+        return {
+            "best_match": None,
+            "alignment_score": 0,
+            "strengths": [],
+            "divergences": ["Você ainda não cadastrou inspirações pra essa marca."],
+            "adjustment_suggestion": "Adicione referências (URLs, prints ou textos) na aba Inspirações pra IA aprender o tom desejado.",
+        }
+
+    insp_payload = [
+        {"label": i.label, "analysis": i.analysis or {}, "adapted_brief": i.adapted_brief or ""}
+        for i in inspirations
+    ]
+    brain = BrandBrain(db).build(c.client_id)
+    agent = InspirationAlignmentAgent()
+    prompt = agent.build_prompt(
+        brand_brain_text=brain["text"],
+        title=c.title or "",
+        format=c.format or "post",
+        platform=c.platform or "instagram",
+        hook=c.hook or "",
+        script=c.script or "",
+        copy=c.copy or "",
+        design_brief=c.design_brief or "",
+        inspirations=insp_payload,
+    )
+    raw = await agent.run(prompt)
+    result = parse_align_json(raw)
+    if not result:
+        raise HTTPException(500, "IA não retornou análise válida")
+    # sanitize
+    score = result.get("alignment_score") or 0
+    try:
+        score = max(0, min(100, int(score)))
+    except Exception:
+        score = 0
+    return {
+        "best_match": result.get("best_match"),
+        "alignment_score": score,
+        "strengths": result.get("strengths") or [],
+        "divergences": result.get("divergences") or [],
+        "adjustment_suggestion": result.get("adjustment_suggestion") or "",
+    }
 
 
 @router.post("/{content_id}/regenerate-brief")

@@ -7,7 +7,7 @@ the LLM-generated insights — they're fast, free, and never hallucinate.
 from collections import Counter
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
-from models import ContentPiece, CalendarSlot
+from models import ContentPiece, CalendarSlot, Persona
 
 
 def detect_saturation(db: Session, client_id: int, window_days: int = 14) -> list[dict]:
@@ -138,10 +138,47 @@ def detect_velocity_drop(db: Session, client_id: int) -> list[dict]:
     return []
 
 
+def detect_stale_persona(db: Session, client_id: int) -> list[dict]:
+    """Persona drifts as the brand evolves and produces more content.
+
+    Triggers a suggestion to regenerate when:
+      - Persona is >60 days old AND ≥10 new contents created since then, OR
+      - Persona is >120 days old regardless of volume
+    """
+    persona = db.query(Persona).filter(Persona.client_id == client_id).first()
+    if not persona or not persona.generated_at:
+        return []
+    now = datetime.utcnow()
+    age_days = (now - persona.generated_at).days
+    new_contents = db.query(ContentPiece).filter(
+        ContentPiece.client_id == client_id,
+        ContentPiece.created_at > persona.generated_at,
+    ).count()
+
+    if age_days > 120:
+        return [{
+            "kind": "persona_stale",
+            "title": f"Persona com {age_days} dias — pode estar desatualizada",
+            "message": "Sua marca evoluiu desde que a persona foi gerada. Regenere pra IA usar o contexto atual.",
+            "evidence": f"{age_days}d · {new_contents} posts desde último refresh",
+            "severity": "warning",
+        }]
+    if age_days > 60 and new_contents >= 10:
+        return [{
+            "kind": "persona_stale",
+            "title": "Persona pode estar desatualizada",
+            "message": f"Você criou {new_contents} posts nos últimos {age_days} dias — a persona aprende com o que você publica. Regenere pra calibrar.",
+            "evidence": f"{age_days}d · {new_contents} posts novos",
+            "severity": "info",
+        }]
+    return []
+
+
 def all_heuristics(db: Session, client_id: int) -> list[dict]:
     """Run all deterministic checks. Returns insight dicts ready to persist."""
     return [
         *detect_saturation(db, client_id),
         *detect_calendar_gaps(db, client_id),
         *detect_velocity_drop(db, client_id),
+        *detect_stale_persona(db, client_id),
     ]

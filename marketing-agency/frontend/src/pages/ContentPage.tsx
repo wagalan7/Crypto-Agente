@@ -21,6 +21,14 @@ export function ContentPage() {
   const [bulkBusy, setBulkBusy] = useState(false)
   const [hookVarLoading, setHookVarLoading] = useState(false)
   const [hookVariations, setHookVariations] = useState<Array<{ style: string; hook: string }> | null>(null)
+  const [alignLoading, setAlignLoading] = useState(false)
+  const [alignResult, setAlignResult] = useState<{
+    best_match: string | null
+    alignment_score: number
+    strengths: string[]
+    divergences: string[]
+    adjustment_suggestion: string
+  } | null>(null)
 
   async function load() {
     const data: any = await api.content.list(id, filter || undefined)
@@ -130,6 +138,21 @@ export function ContentPage() {
     setHookVariations(null)
   }
 
+  async function runInspirationAlignment() {
+    if (!selected) return
+    setAlignLoading(true)
+    setAlignResult(null)
+    try {
+      const r: any = await api.content.inspirationAlignment(selected.id)
+      setAlignResult(r)
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    } finally { setAlignLoading(false) }
+  }
+
+  // Clear alignment when switching pieces
+  useEffect(() => { setAlignResult(null) }, [selected?.id])
+
   async function publishNow() {
     if (!selected) return
     if (!confirm(`Publicar agora no ${selected.platform}?`)) return
@@ -234,6 +257,57 @@ export function ContentPage() {
               </div>
             </div>
           )}
+          {/* Inspiration alignment */}
+          <div className="card bg-purple-900/10 border-purple-800/50 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-purple-300 font-semibold">🎯 ALINHAMENTO COM INSPIRAÇÕES</p>
+              <button onClick={runInspirationAlignment} disabled={alignLoading}
+                className="text-[10px] text-purple-400 hover:text-purple-300 disabled:opacity-50">
+                {alignLoading ? 'Analisando...' : alignResult ? '↻ Re-analisar' : '✦ Analisar'}
+              </button>
+            </div>
+            {!alignResult && !alignLoading && (
+              <p className="text-[11px] text-gray-500">Compara esse post contra as referências que você cadastrou e mostra o que ajustar.</p>
+            )}
+            {alignResult && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <div className={`text-2xl font-bold ${
+                    alignResult.alignment_score >= 80 ? 'text-green-400'
+                    : alignResult.alignment_score >= 50 ? 'text-yellow-400'
+                    : 'text-red-400'
+                  }`}>{alignResult.alignment_score}</div>
+                  <div className="text-[10px] text-gray-400">
+                    <p>/ 100 de alinhamento</p>
+                    {alignResult.best_match && <p className="text-purple-300">Mais próximo: {alignResult.best_match}</p>}
+                  </div>
+                </div>
+                {alignResult.strengths.length > 0 && (
+                  <div>
+                    <p className="text-[10px] text-green-400 font-semibold">ACERTOS</p>
+                    <ul className="text-xs text-gray-300 space-y-0.5">
+                      {alignResult.strengths.map((s, i) => <li key={i}>· {s}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {alignResult.divergences.length > 0 && (
+                  <div>
+                    <p className="text-[10px] text-orange-400 font-semibold">DIVERGÊNCIAS</p>
+                    <ul className="text-xs text-gray-300 space-y-0.5">
+                      {alignResult.divergences.map((d, i) => <li key={i}>· {d}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {alignResult.adjustment_suggestion && (
+                  <div className="bg-purple-950/30 border border-purple-800/40 rounded p-2">
+                    <p className="text-[10px] text-purple-300 font-semibold mb-0.5">SUGESTÃO DE AJUSTE</p>
+                    <p className="text-xs text-gray-200">{alignResult.adjustment_suggestion}</p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {selected.strategic_note && (
             <div className="card bg-violet-900/10 border-violet-800/50">
               <p className="text-xs text-violet-400 font-semibold mb-1">NOTA ESTRATÉGICA</p>

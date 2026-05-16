@@ -47,6 +47,7 @@ export function ProductsPage() {
   const [editing, setEditing] = useState<number | null>(null)
   const [form, setForm] = useState<FormState>(empty)
   const [busy, setBusy] = useState(false)
+  const [templates, setTemplates] = useState<Array<{ key: string; label: string; defaults: any }>>([])
   // Sales sequence modal
   const [seqProduct, setSeqProduct] = useState<Product | null>(null)
   const [seqDays, setSeqDays] = useState(7)
@@ -82,6 +83,25 @@ export function ProductsPage() {
     setItems(r)
   }
   useEffect(() => { load() }, [id])
+  useEffect(() => {
+    api.products.templates().then((r: any) => setTemplates(r)).catch(() => {})
+  }, [])
+
+  function applyTemplate(key: string) {
+    const tpl = templates.find(t => t.key === key)
+    if (!tpl) return
+    const d = tpl.defaults || {}
+    setForm(prev => ({
+      ...prev,
+      type: d.type || prev.type,
+      awareness_stage: d.awareness_stage || prev.awareness_stage,
+      funnel_stage: d.funnel_stage || prev.funnel_stage,
+      pains_solved: (d.pains_solved || []).join(', '),
+      desires: (d.desires || []).join(', '),
+      objections: (d.objections || []).join(', '),
+      transformation: d.transformation || prev.transformation,
+    }))
+  }
 
   function startEdit(p: Product) {
     setEditing(p.id)
@@ -139,6 +159,20 @@ export function ProductsPage() {
       {showForm && (
         <div className="card space-y-3">
           <h2 className="text-sm font-semibold text-white">{editing ? 'Editar' : 'Novo produto/oferta'}</h2>
+          {!editing && templates.length > 0 && (
+            <div className="bg-violet-900/10 border border-violet-800/40 rounded-lg p-2">
+              <label className="text-[10px] text-violet-300 font-semibold">PRÉ-PREENCHER COM TEMPLATE</label>
+              <select
+                className="input text-sm w-full mt-1"
+                defaultValue=""
+                onChange={e => { if (e.target.value) { applyTemplate(e.target.value); e.target.value = '' } }}
+              >
+                <option value="">— escolher template —</option>
+                {templates.map(t => <option key={t.key} value={t.key}>{t.label}</option>)}
+              </select>
+              <p className="text-[10px] text-gray-500 mt-1">Preenche dores, desejos, objeções e transformação. Você edita o que quiser depois.</p>
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-2">
             <input className="input text-sm col-span-2" placeholder="Nome" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
             <select className="input text-sm" value={form.type} onChange={e => setForm({ ...form, type: e.target.value })}>

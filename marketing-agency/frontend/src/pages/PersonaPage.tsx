@@ -110,9 +110,16 @@ export function PersonaPage() {
               <p className="text-xs text-gray-400 whitespace-pre-line">{persona.evidence}</p>
             </div>
           )}
-          {persona.generated_at && (
-            <p className="text-[10px] text-gray-600">Gerado em {new Date(persona.generated_at).toLocaleString('pt-BR')}</p>
-          )}
+          {persona.generated_at && (() => {
+            const ageDays = Math.floor((Date.now() - new Date(persona.generated_at!).getTime()) / 86_400_000)
+            const stale = ageDays > 60
+            return (
+              <div className={`text-[10px] flex items-center gap-2 ${stale ? 'text-yellow-300' : 'text-gray-600'}`}>
+                <span>Gerada em {new Date(persona.generated_at!).toLocaleString('pt-BR')} · {ageDays}d atrás</span>
+                {stale && <span className="px-1.5 py-0.5 rounded bg-yellow-900/40 border border-yellow-800/50">⚠ Pode estar desatualizada — considere regenerar</span>}
+              </div>
+            )
+          })()}
         </>
       )}
     </div>

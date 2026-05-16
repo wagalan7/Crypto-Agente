@@ -90,7 +90,8 @@ def _refresh_heuristics(db: Session, client_id: int) -> None:
     set current without polluting LLM-generated insights.
     """
     HEURISTIC_KINDS = ("saturation_emotion", "saturation_funnel", "saturation_format",
-                       "calendar_gap_urgent", "calendar_gap_soon", "velocity_drop")
+                       "calendar_gap_urgent", "calendar_gap_soon", "velocity_drop",
+                       "persona_stale")
     db.query(Insight).filter(
         Insight.client_id == client_id,
         Insight.is_dismissed == False,

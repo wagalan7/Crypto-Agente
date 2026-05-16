@@ -91,6 +91,7 @@ export const api = {
     selectHook: (id: number, hook: string) => post(`/content/${id}/select-hook`, { hook }),
     bulkApprove: (ids: number[]) => post('/content/bulk/approve', { ids }),
     bulkDelete: (ids: number[]) => post('/content/bulk/delete', { ids }),
+    inspirationAlignment: (id: number) => post(`/content/${id}/inspiration-alignment`, {}),
   },
   calendar: {
     get: (clientId: number, days?: number) => get(`/calendar/client/${clientId}${days ? `?days=${days}` : ''}`),
@@ -135,6 +136,7 @@ export const api = {
     create: (data: unknown) => post('/products/', data),
     update: (id: number, data: unknown) => patch(`/products/${id}`, data),
     remove: (id: number) => del(`/products/${id}`),
+    templates: () => get('/products/templates'),
   },
   knowledge: {
     list: (clientId: number) => get(`/knowledge/client/${clientId}`),
