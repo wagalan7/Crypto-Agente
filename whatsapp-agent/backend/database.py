@@ -316,9 +316,12 @@ def create_appointment(tenant_id: int, patient_name: str, phone: str,
 
 
 def update_appointment(tenant_id: int, appointment_id: int, scheduled_at: datetime) -> bool:
+    """Atualiza data/hora da consulta e reseta flags de confirmação (nova data = pendente)."""
     with get_conn() as conn:
         cur = conn.execute(
-            "UPDATE appointments SET scheduled_at = ? WHERE id = ? AND tenant_id = ?",
+            """UPDATE appointments
+               SET scheduled_at = ?, confirmed = 0, confirmation_sent = 0, followup_sent = 0
+               WHERE id = ? AND tenant_id = ?""",
             (scheduled_at.isoformat(), appointment_id, tenant_id),
         )
         return cur.rowcount > 0
