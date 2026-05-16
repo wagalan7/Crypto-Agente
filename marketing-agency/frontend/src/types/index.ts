@@ -37,6 +37,7 @@ export interface ContentPiece {
   funnel_stage?: string | null
   format_reasoning?: string | null
   linked_product_id?: number | null
+  linked_product_name?: string | null
 }
 
 export interface Persona {

@@ -57,6 +57,25 @@ export function CentralEstrategicaPage() {
   const [loadingA, setLoadingA] = useState(false)
   const [audit, setAudit] = useState<AuditResult | null>(null)
   const [err, setErr] = useState('')
+  const [regenAllLoading, setRegenAllLoading] = useState(false)
+  const [regenAllMsg, setRegenAllMsg] = useState<string | null>(null)
+
+  async function regenerateAll() {
+    setRegenAllLoading(true); setErr(''); setRegenAllMsg(null)
+    try {
+      const results = await Promise.allSettled([
+        api.persona.generate(id),
+        api.strategy.regenerateWeekly(id),
+        api.strategy.regenerateInsights(id),
+      ])
+      const labels = ['Persona', 'Semanal', 'Insights']
+      const summary = results.map((r, i) => `${r.status === 'fulfilled' ? '✓' : '✗'} ${labels[i]}`).join('  ')
+      setRegenAllMsg(summary)
+      await load()
+    } catch (e: any) {
+      setErr(e.message || 'Erro na regeneração')
+    } finally { setRegenAllLoading(false) }
+  }
 
   async function runAudit() {
     setLoadingA(true); setErr('')
@@ -115,10 +134,17 @@ export function CentralEstrategicaPage() {
 
   return (
     <div className="p-4 md:p-6 space-y-4 max-w-5xl">
-      <div>
-        <h1 className="text-lg md:text-xl font-bold text-white">Central Estratégica</h1>
-        <p className="text-xs text-gray-400 mt-0.5">Cérebro semanal + insights inteligentes da marca</p>
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <h1 className="text-lg md:text-xl font-bold text-white">Central Estratégica</h1>
+          <p className="text-xs text-gray-400 mt-0.5">Cérebro semanal + insights inteligentes da marca</p>
+        </div>
+        <button onClick={regenerateAll} disabled={regenAllLoading}
+          className="px-3 py-1.5 text-xs rounded-lg border border-violet-600 bg-gradient-to-r from-violet-700/30 to-pink-700/30 text-violet-200 hover:from-violet-700/50 hover:to-pink-700/50 transition-colors disabled:opacity-50">
+          {regenAllLoading ? 'Regenerando tudo...' : '✦ Regenerar tudo'}
+        </button>
       </div>
+      {regenAllMsg && <p className="text-xs text-gray-400">{regenAllMsg}</p>}
 
       {err && <div className="card bg-red-900/20 border-red-800/50 text-xs text-red-300">{err}</div>}
 

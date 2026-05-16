@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 from database import get_db
-from models import ContentPiece, User
+from models import ContentPiece, User, Product
 from auth import get_current_user, assert_client_access
 
 router = APIRouter(prefix="/content", tags=["content"])
@@ -47,11 +47,12 @@ class ContentUpdate(BaseModel):
     linked_product_id: Optional[int] = None
 
 
-def _serialize(c: ContentPiece) -> dict:
+def _serialize(c: ContentPiece, product_name: Optional[str] = None) -> dict:
     return {
         "id": c.id,
         "client_id": c.client_id,
         "title": c.title,
+        "linked_product_name": product_name,
         "format": c.format,
         "platform": c.platform,
         "objective": c.objective,
@@ -87,7 +88,14 @@ def list_content(
     q = db.query(ContentPiece).filter(ContentPiece.client_id == client_id)
     if status:
         q = q.filter(ContentPiece.status == status)
-    return [_serialize(c) for c in q.order_by(ContentPiece.created_at.desc()).all()]
+    contents = q.order_by(ContentPiece.created_at.desc()).all()
+    # Resolve product names for linked content
+    product_ids = {c.linked_product_id for c in contents if c.linked_product_id}
+    name_by_id: dict[int, str] = {}
+    if product_ids:
+        for p in db.query(Product).filter(Product.id.in_(product_ids)).all():
+            name_by_id[p.id] = p.name
+    return [_serialize(c, name_by_id.get(c.linked_product_id) if c.linked_product_id else None) for c in contents]
 
 
 @router.post("/")
@@ -106,7 +114,11 @@ def get_content(content_id: int, current_user: User = Depends(get_current_user),
     if not c:
         raise HTTPException(404, "Content not found")
     assert_client_access(c.client_id, current_user, db)
-    return _serialize(c)
+    pname = None
+    if c.linked_product_id:
+        p = db.query(Product).filter(Product.id == c.linked_product_id).first()
+        pname = p.name if p else None
+    return _serialize(c, pname)
 
 
 @router.patch("/{content_id}")

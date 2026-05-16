@@ -42,6 +42,24 @@ export function AgentsPage() {
     if (params.get('tab')) setTab(params.get('tab') as AgentTab)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params.toString()])
+  const [prereq, setPrereq] = useState<{ persona: boolean; product: boolean; primary: boolean } | null>(null)
+  useEffect(() => {
+    (async () => {
+      try {
+        const [p, prods] = await Promise.allSettled([
+          api.persona.get(id),
+          api.products.list(id),
+        ])
+        const personaOk = p.status === 'fulfilled' && !!(p.value as any)?.id
+        const list = prods.status === 'fulfilled' ? ((prods.value as any[]) || []) : []
+        const productOk = list.some(x => x.is_active)
+        const primaryOk = list.some(x => x.is_primary && x.is_active)
+        setPrereq({ persona: personaOk, product: productOk, primary: primaryOk })
+      } catch {
+        setPrereq({ persona: false, product: false, primary: false })
+      }
+    })()
+  }, [id])
   const [autoStatus, setAutoStatus] = useState('')
   const [autoOutput, setAutoOutput] = useState('')
   const [autoResult, setAutoResult] = useState<{ content_id: number; image_url: string; title: string; objective?: string; objective_reasoning?: string; emotion_used?: string; funnel_stage?: string; format_reasoning?: string } | null>(null)
@@ -119,6 +137,32 @@ export function AgentsPage() {
               <p className="text-[11px] text-violet-300 mt-1.5 bg-violet-900/20 border border-violet-700/50 rounded px-2 py-1">
                 ✦ Pré-preenchido a partir de um insight da Central Estratégica
               </p>
+            )}
+            {prereq && (!prereq.persona || !prereq.product) && (
+              <div className="mt-2 space-y-1.5 bg-yellow-900/15 border border-yellow-800/50 rounded px-2.5 py-2">
+                <p className="text-[11px] text-yellow-300 font-semibold">⚠ A IA precisa de contexto pra criar conteúdo afiado</p>
+                {!prereq.persona && (
+                  <p className="text-[11px] text-gray-300">
+                    · Persona ausente —{' '}
+                    <button onClick={() => navigate(`/client/${clientId}/persona`)} className="text-violet-300 underline">gerar persona</button>
+                  </p>
+                )}
+                {!prereq.product && (
+                  <p className="text-[11px] text-gray-300">
+                    · Nenhum produto ativo —{' '}
+                    <button onClick={() => navigate(`/client/${clientId}/products`)} className="text-violet-300 underline">cadastrar produto</button>
+                  </p>
+                )}
+                {prereq.product && !prereq.primary && (
+                  <p className="text-[11px] text-gray-400">
+                    · Sem produto principal definido —{' '}
+                    <button onClick={() => navigate(`/client/${clientId}/products`)} className="text-violet-300 underline">marcar 1 como principal</button>
+                  </p>
+                )}
+              </div>
+            )}
+            {prereq && prereq.persona && prereq.product && prereq.primary && (
+              <p className="text-[11px] text-green-400 mt-1.5">✓ Persona, produto e produto principal configurados — IA com contexto completo</p>
             )}
           </div>
           <div className="space-y-3">

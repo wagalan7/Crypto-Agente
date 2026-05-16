@@ -72,7 +72,10 @@
       "Bash(railway volume *)",
       "Bash(railway add *)",
       "Bash(yes)",
-      "Bash(expect -c ' *)"
+      "Bash(expect -c ' *)",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['main.py','routers/agents.py','routers/content.py','routers/persona.py','routers/inspirations.py','routers/products.py','routers/knowledge.py','routers/strategy.py','services/brand_brain.py','agents/auto_creator.py']]; print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['main.py','routers/agents.py','routers/content.py','routers/persona.py','routers/inspirations.py','routers/products.py','routers/knowledge.py','routers/strategy.py','services/brand_brain.py','agents/auto_creator.py']]; print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['routers/strategy.py','agents/sales_sequence.py','agents/profile_analyzer.py','agents/__init__.py']]; print\\('OK'\\)\")"
     ]
   }
 }

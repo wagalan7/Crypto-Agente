@@ -77,6 +77,11 @@ export function ContentPage() {
             <span className={`badge border ${OBJECTIVE_COLORS[selected.objective] || 'bg-gray-700 text-gray-300 border-gray-600'}`}>
               {OBJECTIVE_LABELS[selected.objective] || selected.objective}
             </span>
+            {selected.linked_product_name && (
+              <span className="badge bg-cyan-900/30 text-cyan-300 border border-cyan-800/60">
+                → {selected.linked_product_name}
+              </span>
+            )}
           </div>
 
           <h2 className="text-base font-semibold text-white">{selected.title}</h2>
@@ -252,6 +257,11 @@ export function ContentPage() {
                     <span className={`badge border text-[10px] ${OBJECTIVE_COLORS[content.objective] || 'bg-gray-700 text-gray-300 border-gray-600'}`}>
                       {OBJECTIVE_LABELS[content.objective] || content.objective}
                     </span>
+                    {content.linked_product_name && (
+                      <span className="badge bg-cyan-900/30 text-cyan-300 border border-cyan-800/60 text-[10px]">
+                        → {content.linked_product_name}
+                      </span>
+                    )}
                   </div>
                   <p className="text-sm font-medium text-white truncate">{content.title}</p>
                   {content.hook && (

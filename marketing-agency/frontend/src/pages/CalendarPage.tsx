@@ -19,6 +19,8 @@ export function CalendarPage() {
   const id = Number(clientId)
   const [slots, setSlots] = useState<CalendarSlot[]>([])
   const [generating, setGenerating] = useState(false)
+  const [populating, setPopulating] = useState(false)
+  const [populateMsg, setPopulateMsg] = useState<string | null>(null)
   const [frequency, setFrequency] = useState(5)
   const [days, setDays] = useState(14)
   const [view, setView] = useState<'grid' | 'list'>('list')
@@ -40,6 +42,20 @@ export function CalendarPage() {
       await load()
     } finally {
       setGenerating(false)
+    }
+  }
+
+  async function populateFromWeekly() {
+    setPopulating(true)
+    setPopulateMsg(null)
+    try {
+      const created: any = await api.calendar.populateFromWeekly({ client_id: id, platform: 'instagram', default_hour: 18 })
+      setPopulateMsg(`✓ ${created.length} slots criados a partir da sequência emocional`)
+      await load()
+    } catch (e: any) {
+      setPopulateMsg(`Erro: ${e?.message?.slice(0, 200) || 'falha ao popular'}`)
+    } finally {
+      setPopulating(false)
     }
   }
 
@@ -83,7 +99,11 @@ export function CalendarPage() {
           <button onClick={generate} disabled={generating} className="btn-primary w-auto px-4 py-2 shrink-0 text-xs">
             {generating ? 'Gerando...' : 'Gerar semana'}
           </button>
+          <button onClick={populateFromWeekly} disabled={populating} className="w-auto px-3 py-2 shrink-0 text-xs rounded-lg border border-violet-700 bg-violet-900/20 text-violet-300 hover:bg-violet-900/40 transition-colors disabled:opacity-50">
+            {populating ? 'Populando...' : '✦ Popular c/ sequência emocional'}
+          </button>
         </div>
+        {populateMsg && <p className="text-xs text-gray-400">{populateMsg}</p>}
       </div>
 
       {/* Grid view (desktop only) */}

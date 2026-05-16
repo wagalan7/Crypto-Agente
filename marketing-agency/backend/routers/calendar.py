@@ -2,11 +2,35 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from database import get_db
-from models import CalendarSlot, User
+from models import CalendarSlot, User, WeeklyBrain
 from services import CalendarService
 from auth import get_current_user, assert_client_access
+
+# Day-name → weekday index (PT/EN). 0=Monday following Python convention.
+WEEKDAY_MAP = {
+    "segunda": 0, "monday": 0, "seg": 0,
+    "terca": 1, "terça": 1, "tuesday": 1, "ter": 1,
+    "quarta": 2, "wednesday": 2, "qua": 2,
+    "quinta": 3, "thursday": 3, "qui": 3,
+    "sexta": 4, "friday": 4, "sex": 4,
+    "sabado": 5, "sábado": 5, "saturday": 5, "sab": 5,
+    "domingo": 6, "sunday": 6, "dom": 6,
+}
+
+
+def _emotion_to_objective(emotion: str) -> str:
+    e = (emotion or "").lower()
+    if any(x in e for x in ("vulnerab", "alívio", "alivio", "esperança", "esperanca")):
+        return "conexao"
+    if any(x in e for x in ("urgenc", "urg\u00eanc", "desejo")):
+        return "conversao"
+    if "autorid" in e or "credib" in e:
+        return "autoridade"
+    if "curios" in e or "surpres" in e:
+        return "atracao"
+    return "conexao"
 
 router = APIRouter(prefix="/calendar", tags=["calendar"])
 
@@ -59,6 +83,64 @@ def attach_content(slot_id: int, req: AttachContentRequest, current_user: User =
     svc = CalendarService(db)
     slot = svc.attach_content(slot_id, req.content_id)
     return _serialize(slot)
+
+
+class PopulateFromWeeklyRequest(BaseModel):
+    client_id: int
+    start_date: Optional[datetime] = None  # defaults to next Monday
+    platform: str = "instagram"
+    default_hour: int = 18
+
+
+@router.post("/populate-from-weekly")
+def populate_from_weekly(req: PopulateFromWeeklyRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Cria slots na próxima semana usando a sequência emocional do WeeklyBrain."""
+    assert_client_access(req.client_id, current_user, db)
+    wb = db.query(WeeklyBrain).filter(WeeklyBrain.client_id == req.client_id).order_by(WeeklyBrain.generated_at.desc()).first()
+    if not wb or not wb.emotional_sequence:
+        raise HTTPException(400, "Sem WeeklyBrain ou sequência emocional. Gere o cérebro semanal primeiro.")
+
+    if req.start_date:
+        start = req.start_date
+    else:
+        today = datetime.utcnow()
+        days_to_monday = (7 - today.weekday()) % 7 or 7
+        start = (today + timedelta(days=days_to_monday)).replace(hour=req.default_hour, minute=0, second=0, microsecond=0)
+
+    created = []
+    for entry in wb.emotional_sequence:
+        if not isinstance(entry, dict):
+            continue
+        day_name = (entry.get("day") or "").lower().strip()
+        weekday = WEEKDAY_MAP.get(day_name)
+        if weekday is None:
+            # try numeric "1"..."7"
+            try:
+                weekday = (int(day_name) - 1) % 7
+            except Exception:
+                continue
+        offset = (weekday - start.weekday()) % 7
+        scheduled = (start + timedelta(days=offset)).replace(hour=req.default_hour, minute=0)
+        fmt = (entry.get("format_suggestion") or "post").lower().strip()
+        # normalize
+        if fmt not in ("reels", "carousel", "story", "post", "shorts", "youtube"):
+            if "reel" in fmt: fmt = "reels"
+            elif "carro" in fmt: fmt = "carousel"
+            elif "story" in fmt or "stor" in fmt: fmt = "story"
+            elif "short" in fmt: fmt = "shorts"
+            else: fmt = "post"
+        slot = CalendarSlot(
+            client_id=req.client_id,
+            scheduled_at=scheduled,
+            platform=req.platform,
+            format=fmt,
+            objective=_emotion_to_objective(entry.get("emotion", "")),
+            status="planned",
+        )
+        db.add(slot)
+        created.append(slot)
+    db.commit()
+    return [_serialize(s) for s in created]
 
 
 @router.patch("/{slot_id}/status")
