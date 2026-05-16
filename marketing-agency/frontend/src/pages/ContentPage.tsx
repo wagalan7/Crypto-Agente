@@ -17,6 +17,10 @@ export function ContentPage() {
   const [publishing, setPublishing] = useState(false)
   const [approving, setApproving] = useState(false)
   const [regenBrief, setRegenBrief] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [bulkBusy, setBulkBusy] = useState(false)
+  const [hookVarLoading, setHookVarLoading] = useState(false)
+  const [hookVariations, setHookVariations] = useState<Array<{ style: string; hook: string }> | null>(null)
 
   async function load() {
     const data: any = await api.content.list(id, filter || undefined)
@@ -66,6 +70,66 @@ export function ContentPage() {
     setSelected(updated)
   }
 
+  function toggleSelect(cid: number) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(cid)) next.delete(cid); else next.add(cid)
+      return next
+    })
+  }
+  function selectAllVisible() {
+    setSelectedIds(new Set(contents.map(c => c.id)))
+  }
+  function clearSelection() { setSelectedIds(new Set()) }
+
+  async function bulkApprove() {
+    if (selectedIds.size === 0) return
+    if (!confirm(`Aprovar ${selectedIds.size} conteúdo(s)? A IA vai gerar briefing de produção pra cada um.`)) return
+    setBulkBusy(true)
+    try {
+      const res: any = await api.content.bulkApprove(Array.from(selectedIds))
+      await load()
+      clearSelection()
+      alert(`✓ ${res.approved?.length || 0} aprovado(s)${res.failed?.length ? ` · ${res.failed.length} falharam` : ''}`)
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    } finally { setBulkBusy(false) }
+  }
+
+  async function bulkDelete() {
+    if (selectedIds.size === 0) return
+    if (!confirm(`Excluir ${selectedIds.size} conteúdo(s)? Essa ação não pode ser desfeita.`)) return
+    setBulkBusy(true)
+    try {
+      const res: any = await api.content.bulkDelete(Array.from(selectedIds))
+      await load()
+      clearSelection()
+      alert(`✓ ${res.deleted || 0} excluído(s)`)
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    } finally { setBulkBusy(false) }
+  }
+
+  async function generateHookVariations() {
+    if (!selected) return
+    setHookVarLoading(true)
+    setHookVariations(null)
+    try {
+      const res: any = await api.content.hookVariations(selected.id, 3)
+      setHookVariations(res.variations || [])
+    } catch (e: any) {
+      alert('Erro ao gerar variações: ' + e.message)
+    } finally { setHookVarLoading(false) }
+  }
+
+  async function selectHookVariation(hook: string) {
+    if (!selected) return
+    const updated: any = await api.content.selectHook(selected.id, hook)
+    setContents(prev => prev.map(c => c.id === selected.id ? updated : c))
+    setSelected(updated)
+    setHookVariations(null)
+  }
+
   async function publishNow() {
     if (!selected) return
     if (!confirm(`Publicar agora no ${selected.platform}?`)) return
@@ -109,11 +173,34 @@ export function ContentPage() {
 
           {selected.hook && (
             <div className="card">
-              <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center justify-between mb-1 gap-2 flex-wrap">
                 <p className="text-xs text-violet-400 font-semibold">HOOK</p>
-                <SectionRegenButton contentId={selected.id} section="hook" onUpdated={(u) => { setSelected(u); setContents(prev => prev.map(c => c.id === u.id ? u : c)) }} />
+                <div className="flex items-center gap-1.5">
+                  <button onClick={generateHookVariations} disabled={hookVarLoading}
+                    className="text-[10px] text-fuchsia-400 hover:text-fuchsia-300 px-1.5 py-0.5 rounded disabled:opacity-50">
+                    {hookVarLoading ? 'Gerando...' : '⚖ A/B 3 variações'}
+                  </button>
+                  <SectionRegenButton contentId={selected.id} section="hook" onUpdated={(u) => { setSelected(u); setContents(prev => prev.map(c => c.id === u.id ? u : c)) }} />
+                </div>
               </div>
               <p className="text-sm text-gray-300">{selected.hook}</p>
+              {hookVariations && hookVariations.length > 0 && (
+                <div className="mt-2 space-y-1.5 border-t border-fuchsia-800/40 pt-2">
+                  <p className="text-[10px] text-fuchsia-400 font-semibold">ESCOLHA O MELHOR HOOK</p>
+                  {hookVariations.map((v, i) => (
+                    <div key={i} className="flex items-start gap-2 bg-fuchsia-950/30 border border-fuchsia-800/40 rounded p-2">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[10px] text-fuchsia-300/80 mb-0.5">{v.style}</p>
+                        <p className="text-xs text-gray-200">{v.hook}</p>
+                      </div>
+                      <button onClick={() => selectHookVariation(v.hook)} className="text-[10px] px-2 py-1 rounded bg-fuchsia-700 hover:bg-fuchsia-600 text-white shrink-0">
+                        Usar
+                      </button>
+                    </div>
+                  ))}
+                  <button onClick={() => setHookVariations(null)} className="text-[10px] text-gray-500 hover:text-gray-300">× Cancelar</button>
+                </div>
+              )}
             </div>
           )}
           {selected.script && (
@@ -319,6 +406,26 @@ export function ContentPage() {
     <div className="p-4 md:p-6 max-w-5xl">
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-lg font-bold text-white">Conteúdo</h1>
+        {contents.length > 0 && (
+          <div className="flex items-center gap-2">
+            {selectedIds.size > 0 ? (
+              <>
+                <span className="text-xs text-gray-400">{selectedIds.size} selecionado(s)</span>
+                <button onClick={bulkApprove} disabled={bulkBusy} className="text-xs px-2.5 py-1 rounded bg-green-700 hover:bg-green-600 text-white disabled:opacity-50">
+                  ✓ Aprovar
+                </button>
+                <button onClick={bulkDelete} disabled={bulkBusy} className="text-xs px-2.5 py-1 rounded bg-red-700 hover:bg-red-600 text-white disabled:opacity-50">
+                  Excluir
+                </button>
+                <button onClick={clearSelection} className="text-xs text-gray-400 hover:text-gray-200">×</button>
+              </>
+            ) : (
+              <button onClick={selectAllVisible} className="text-xs text-violet-400 hover:text-violet-300">
+                Selecionar todos
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Filter pills - horizontal scroll on mobile */}
@@ -347,11 +454,21 @@ export function ContentPage() {
       ) : (
         <div className="space-y-2">
           {contents.map(content => (
-            <button
+            <div
               key={content.id}
-              onClick={() => setSelected(content)}
-              className="card w-full text-left active:border-violet-600 hover:border-violet-700 transition-colors"
+              className={`card flex items-start gap-2 active:border-violet-600 hover:border-violet-700 transition-colors ${selectedIds.has(content.id) ? 'border-violet-500 bg-violet-900/10' : ''}`}
             >
+              <input
+                type="checkbox"
+                checked={selectedIds.has(content.id)}
+                onChange={(e) => { e.stopPropagation(); toggleSelect(content.id) }}
+                onClick={(e) => e.stopPropagation()}
+                className="mt-1 shrink-0 accent-violet-500"
+              />
+              <button
+                onClick={() => setSelected(content)}
+                className="flex-1 text-left min-w-0"
+              >
               <div className="flex items-start gap-2">
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-1.5 mb-1 flex-wrap">
@@ -377,7 +494,8 @@ export function ContentPage() {
                   <p className="text-xs text-gray-600">{FORMAT_LABELS[content.format] || content.format}</p>
                 </div>
               </div>
-            </button>
+              </button>
+            </div>
           ))}
         </div>
       )}

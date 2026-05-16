@@ -75,6 +75,7 @@ export const api = {
     get: (id: number) => get(`/clients/${id}`),
     update: (id: number, data: unknown) => patch(`/clients/${id}`, data),
     refreshScore: (id: number) => post(`/clients/${id}/refresh-score`, {}),
+    scoreHistory: (id: number, days?: number) => get(`/clients/${id}/score-history${days ? `?days=${days}` : ''}`),
   },
   content: {
     list: (clientId: number, status?: string) => get(`/content/client/${clientId}${status ? `?status=${status}` : ''}`),
@@ -85,6 +86,11 @@ export const api = {
     regenerateBrief: (id: number) => post(`/content/${id}/regenerate-brief`, {}),
     regenerateSection: (id: number, section: string, instruction?: string) =>
       post(`/content/${id}/regenerate-section`, { section, instruction: instruction || null }),
+    hookVariations: (id: number, count?: number, instruction?: string) =>
+      post(`/content/${id}/hook-variations`, { count: count || 3, instruction: instruction || null }),
+    selectHook: (id: number, hook: string) => post(`/content/${id}/select-hook`, { hook }),
+    bulkApprove: (ids: number[]) => post('/content/bulk/approve', { ids }),
+    bulkDelete: (ids: number[]) => post('/content/bulk/delete', { ids }),
   },
   calendar: {
     get: (clientId: number, days?: number) => get(`/calendar/client/${clientId}${days ? `?days=${days}` : ''}`),

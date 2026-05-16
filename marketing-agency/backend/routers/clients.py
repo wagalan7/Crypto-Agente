@@ -3,7 +3,8 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, List
 from database import get_db
-from models import User, Client, ClientAccess
+from datetime import datetime, timedelta
+from models import User, Client, ClientAccess, AuthorityScoreSnapshot
 from auth import get_current_user, assert_client_access
 from services import AuthorityScorer
 
@@ -96,3 +97,19 @@ def refresh_score(client_id: int, current_user: User = Depends(get_current_user)
     scorer = AuthorityScorer(db)
     score = scorer.update(client_id)
     return {"authority_score": score}
+
+
+@router.get("/{client_id}/score-history")
+def score_history(client_id: int, days: int = 30,
+                    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Daily Authority Score snapshots for the last N days (max 180)."""
+    assert_client_access(client_id, current_user, db)
+    cutoff = datetime.utcnow() - timedelta(days=min(max(days, 7), 180))
+    rows = (
+        db.query(AuthorityScoreSnapshot)
+        .filter(AuthorityScoreSnapshot.client_id == client_id,
+                AuthorityScoreSnapshot.recorded_at >= cutoff)
+        .order_by(AuthorityScoreSnapshot.recorded_at.asc())
+        .all()
+    )
+    return [{"score": r.score, "recorded_at": r.recorded_at.isoformat()} for r in rows]

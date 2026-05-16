@@ -4,6 +4,7 @@ import { api } from '../services/api'
 import type { Client, CalendarSlot, MetricsSummary, Insight } from '../types'
 import { AuthorityScore } from '../components/AuthorityScore'
 import { OnboardingChecklist } from '../components/OnboardingChecklist'
+import { ScoreSparkline } from '../components/ScoreSparkline'
 import { OBJECTIVE_LABELS, OBJECTIVE_COLORS, FORMAT_LABELS } from '../types'
 
 function MetricCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
@@ -55,7 +56,10 @@ export function DashboardPage() {
 
       {/* Authority + metrics */}
       <div className="flex items-center gap-4">
-        <AuthorityScore score={client.authority_score} />
+        <div className="flex flex-col items-center gap-1">
+          <AuthorityScore score={client.authority_score} />
+          <ScoreSparkline clientId={id} days={30} />
+        </div>
         <div className="flex-1 grid grid-cols-2 gap-2">
           <MetricCard label="Views (30d)" value={summary ? fmt(summary.totals.views) : '—'} />
           <MetricCard label="Shares" value={summary ? fmt(summary.totals.shares) : '—'} />

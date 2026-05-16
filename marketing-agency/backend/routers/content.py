@@ -1,3 +1,4 @@
+import asyncio
 import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -217,6 +218,165 @@ async def regenerate_section(content_id: int, req: RegenerateSectionRequest,
     db.commit()
     db.refresh(c)
     return _serialize(c)
+
+
+class HookVariationsRequest(BaseModel):
+    count: int = 3
+    instruction: Optional[str] = None  # optional vibe ("3 estilos: pergunta, dor, curiosidade")
+
+
+HOOK_STYLES = [
+    "Comece com uma pergunta direta que toca uma dor da persona.",
+    "Comece com uma afirmação polêmica/contraintuitiva que gera tensão.",
+    "Comece com uma cena visual concreta (1-2 substantivos + verbo de ação) que prende em 3 palavras.",
+    "Comece com vulnerabilidade — admita algo que a audiência sente mas não verbaliza.",
+    "Comece com um número específico ou estatística que choca.",
+]
+
+
+@router.post("/{content_id}/hook-variations")
+async def generate_hook_variations(content_id: int, req: HookVariationsRequest,
+                                    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Generate N hook variations in parallel so the user can pick the strongest.
+
+    Each variation uses a different stylistic angle. Returns a list — frontend
+    presents them side-by-side and the user calls /select-hook to commit one.
+    """
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+
+    n = max(2, min(req.count or 3, 5))
+    brain = BrandBrain(db).build(c.client_id)
+    agent = SectionRewriterAgent()
+
+    styles = HOOK_STYLES[:n]
+    custom = req.instruction or ""
+
+    async def gen_one(style: str):
+        prompt = agent.build_prompt(
+            brand_brain_text=brain["text"],
+            section="hook",
+            current_value=c.hook or "",
+            title=c.title or "",
+            format=c.format or "post",
+            platform=c.platform or "instagram",
+            objective=c.objective or "",
+            emotion=c.emotion_used or "",
+            instruction=f"{style} {custom}".strip(),
+        )
+        try:
+            raw = await agent.run(prompt)
+            return (raw or "").strip().strip('"').strip("'")
+        except Exception:
+            return ""
+
+    results = await asyncio.gather(*[gen_one(s) for s in styles])
+    variations = [
+        {"style": styles[i].split(".")[0], "hook": v}
+        for i, v in enumerate(results) if v
+    ]
+    if not variations:
+        raise HTTPException(500, "IA não retornou variações")
+    return {"current": c.hook, "variations": variations}
+
+
+class SelectHookRequest(BaseModel):
+    hook: str
+
+
+@router.post("/{content_id}/select-hook")
+def select_hook(content_id: int, req: SelectHookRequest,
+                 current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+    if not (req.hook or "").strip():
+        raise HTTPException(400, "Hook vazio")
+    c.hook = req.hook.strip()
+    db.commit()
+    db.refresh(c)
+    return _serialize(c)
+
+
+class BulkApproveRequest(BaseModel):
+    ids: List[int]
+
+
+@router.post("/bulk/approve")
+async def bulk_approve(req: BulkApproveRequest,
+                        current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Approve many at once. Production briefs are generated in parallel but
+    failures don't block the approval — same fallback policy as single approve.
+    """
+    if not req.ids:
+        return {"approved": [], "failed": []}
+    contents = db.query(ContentPiece).filter(ContentPiece.id.in_(req.ids)).all()
+    approved: list[int] = []
+    failed: list[dict] = []
+
+    # Authorize each (skip silently if user lacks access)
+    accessible: list[ContentPiece] = []
+    for c in contents:
+        try:
+            assert_client_access(c.client_id, current_user, db)
+            accessible.append(c)
+        except Exception:
+            failed.append({"id": c.id, "reason": "sem acesso"})
+
+    # Mark approved synchronously
+    for c in accessible:
+        c.status = "approved"
+        approved.append(c.id)
+    db.commit()
+
+    # Generate briefs in parallel (best-effort)
+    async def make_brief(c: ContentPiece):
+        if c.production_brief:
+            return
+        try:
+            client = db.query(Client).filter(Client.id == c.client_id).first()
+            agent = ProductionBriefingAgent()
+            prompt = agent.build_prompt(
+                title=c.title or "", format=c.format or "post", platform=c.platform or "instagram",
+                hook=c.hook or "", script=c.script or "", design_brief=c.design_brief or "",
+                copy=c.copy or "", emotion=c.emotion_used or "",
+                tone=(client.tone if client else "") or "",
+            )
+            raw = await agent.run(prompt)
+            brief = parse_brief_json(raw)
+            if brief:
+                c.production_brief = json.dumps(brief, ensure_ascii=False)
+        except Exception:
+            pass
+
+    await asyncio.gather(*[make_brief(c) for c in accessible])
+    db.commit()
+    return {"approved": approved, "failed": failed}
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: List[int]
+
+
+@router.post("/bulk/delete")
+def bulk_delete(req: BulkDeleteRequest,
+                 current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not req.ids:
+        return {"deleted": 0}
+    contents = db.query(ContentPiece).filter(ContentPiece.id.in_(req.ids)).all()
+    n = 0
+    for c in contents:
+        try:
+            assert_client_access(c.client_id, current_user, db)
+            db.delete(c)
+            n += 1
+        except Exception:
+            continue
+    db.commit()
+    return {"deleted": n}
 
 
 @router.post("/{content_id}/regenerate-brief")

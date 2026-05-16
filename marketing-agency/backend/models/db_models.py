@@ -284,3 +284,13 @@ class WeeklyBrain(Base):
     generated_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client")
+
+
+class AuthorityScoreSnapshot(Base):
+    """Daily snapshot of authority score for history charts."""
+    __tablename__ = "authority_score_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False, index=True)
+    score = Column(Float, nullable=False)
+    recorded_at = Column(DateTime, default=datetime.utcnow, index=True)

@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from models import Client, MetricsSnapshot, ContentPiece, Persona, Product, KnowledgeItem, Insight
+from models import Client, MetricsSnapshot, ContentPiece, Persona, Product, KnowledgeItem, Insight, AuthorityScoreSnapshot
 from datetime import datetime, timedelta
 
 
@@ -79,5 +79,18 @@ class AuthorityScorer:
         client = self.db.query(Client).filter(Client.id == client_id).first()
         if client:
             client.authority_score = score
+            # Daily snapshot: only one row per UTC day to keep the timeline clean
+            today = datetime.utcnow().date()
+            existing = (
+                self.db.query(AuthorityScoreSnapshot)
+                .filter(AuthorityScoreSnapshot.client_id == client_id)
+                .order_by(AuthorityScoreSnapshot.recorded_at.desc())
+                .first()
+            )
+            if existing and existing.recorded_at.date() == today:
+                existing.score = score
+                existing.recorded_at = datetime.utcnow()
+            else:
+                self.db.add(AuthorityScoreSnapshot(client_id=client_id, score=score))
             self.db.commit()
         return score
