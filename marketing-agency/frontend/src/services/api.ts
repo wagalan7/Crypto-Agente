@@ -67,6 +67,7 @@ export const api = {
     createUser: (data: unknown) => post('/auth/users', data),
     grantAccess: (userId: number, clientId: number) => post('/auth/grant-access', { user_id: userId, client_id: clientId }),
     revokeAccess: (userId: number, clientId: number) => del('/auth/revoke-access', { user_id: userId, client_id: clientId }),
+    listAccess: (clientId: number) => get(`/auth/access/${clientId}`),
   },
   clients: {
     list: () => get('/clients/'),

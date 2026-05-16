@@ -94,6 +94,15 @@ def grant_access(data: GrantAccessRequest, current_user: User = Depends(require_
     return {"detail": "Acesso concedido"}
 
 
+@router.get("/access/{client_id}")
+def list_access(client_id: int, current_user: User = Depends(require_master), db: Session = Depends(get_db)):
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client or client.owner_id != current_user.id:
+        raise HTTPException(403, "Sem permissão")
+    grants = db.query(ClientAccess).filter(ClientAccess.client_id == client_id).all()
+    return [{"user_id": g.user_id, "client_id": g.client_id} for g in grants]
+
+
 @router.delete("/revoke-access")
 def revoke_access(data: GrantAccessRequest, current_user: User = Depends(require_master), db: Session = Depends(get_db)):
     client = db.query(Client).filter(Client.id == data.client_id).first()
