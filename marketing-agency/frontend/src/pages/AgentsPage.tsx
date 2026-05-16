@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { api } from '../services/api'
 import { AgentStream } from '../components/AgentStream'
 
@@ -27,9 +27,21 @@ export function AgentsPage() {
   const { clientId } = useParams<{ clientId: string }>()
   const id = Number(clientId)
   const navigate = useNavigate()
-  const [tab, setTab] = useState<AgentTab>('auto')
+  const [params] = useSearchParams()
+  const [tab, setTab] = useState<AgentTab>((params.get('tab') as AgentTab) || 'auto')
 
-  const [autoForm, setAutoForm] = useState({ site_url: '', topic: '', format: 'post', platform: 'instagram', objective: '' })
+  const [autoForm, setAutoForm] = useState({
+    site_url: params.get('site_url') || '',
+    topic: params.get('topic') || '',
+    format: params.get('format') || 'post',
+    platform: params.get('platform') || 'instagram',
+    objective: params.get('objective') || '',
+  })
+  const prefillNotice = !!(params.get('topic') || params.get('objective'))
+  useEffect(() => {
+    if (params.get('tab')) setTab(params.get('tab') as AgentTab)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params.toString()])
   const [autoStatus, setAutoStatus] = useState('')
   const [autoOutput, setAutoOutput] = useState('')
   const [autoResult, setAutoResult] = useState<{ content_id: number; image_url: string; title: string; objective?: string; objective_reasoning?: string; emotion_used?: string; funnel_stage?: string; format_reasoning?: string } | null>(null)
@@ -103,6 +115,11 @@ export function AgentsPage() {
               Cole o link do seu site/produto. A IA lê, junta com o briefing do cliente, e cria
               hook, roteiro, legenda, briefing visual <span className="text-violet-400">e a imagem</span> — tudo de uma vez.
             </p>
+            {prefillNotice && (
+              <p className="text-[11px] text-violet-300 mt-1.5 bg-violet-900/20 border border-violet-700/50 rounded px-2 py-1">
+                ✦ Pré-preenchido a partir de um insight da Central Estratégica
+              </p>
+            )}
           </div>
           <div className="space-y-3">
             <div>

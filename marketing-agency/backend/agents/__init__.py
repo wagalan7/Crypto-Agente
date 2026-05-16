@@ -9,6 +9,8 @@ from .persona_creator import PersonaAgent
 from .inspiration_analyzer import InspirationAnalyzerAgent
 from .weekly_brain_agent import WeeklyBrainAgent
 from .insight_generator import InsightGeneratorAgent
+from .sales_sequence import SalesSequenceAgent
+from .profile_analyzer import ProfileAnalyzerAgent
 
 __all__ = [
     "StrategyAgent", "AnalyticsAgent", "ScriptAgent", "TrendAgent",
@@ -16,4 +18,5 @@ __all__ = [
     "AutoCreatorAgent", "parse_json_response",
     "PersonaAgent", "InspirationAnalyzerAgent",
     "WeeklyBrainAgent", "InsightGeneratorAgent",
+    "SalesSequenceAgent", "ProfileAnalyzerAgent",
 ]

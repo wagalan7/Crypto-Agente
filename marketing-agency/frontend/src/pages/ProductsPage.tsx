@@ -1,7 +1,18 @@
 import { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router-dom'
 import { api } from '../services/api'
 import type { Product } from '../types'
+
+interface SeqPost {
+  id: number
+  title: string
+  scheduled_at: string
+  funnel_stage: string | null
+  objective: string
+  emotion_used: string | null
+  media_url: string | null
+  reasoning: string | null
+}
 
 interface FormState {
   name: string
@@ -30,11 +41,41 @@ function csv(s: string): string[] {
 export function ProductsPage() {
   const { clientId } = useParams<{ clientId: string }>()
   const id = Number(clientId)
+  const navigate = useNavigate()
   const [items, setItems] = useState<Product[]>([])
   const [showForm, setShowForm] = useState(false)
   const [editing, setEditing] = useState<number | null>(null)
   const [form, setForm] = useState<FormState>(empty)
   const [busy, setBusy] = useState(false)
+  // Sales sequence modal
+  const [seqProduct, setSeqProduct] = useState<Product | null>(null)
+  const [seqDays, setSeqDays] = useState(7)
+  const [seqLaunch, setSeqLaunch] = useState(() => {
+    const d = new Date(); d.setDate(d.getDate() + 7)
+    return d.toISOString().slice(0, 10)
+  })
+  const [seqPlatform, setSeqPlatform] = useState('instagram')
+  const [seqGenImg, setSeqGenImg] = useState(true)
+  const [seqBusy, setSeqBusy] = useState(false)
+  const [seqResult, setSeqResult] = useState<{ summary: string; posts: SeqPost[] } | null>(null)
+  const [seqErr, setSeqErr] = useState('')
+
+  async function runSequence() {
+    if (!seqProduct) return
+    setSeqBusy(true); setSeqErr(''); setSeqResult(null)
+    try {
+      const r: any = await api.strategy.salesSequence(id, {
+        product_id: seqProduct.id,
+        launch_date: seqLaunch,
+        total_days: seqDays,
+        platform: seqPlatform,
+        generate_images: seqGenImg,
+      })
+      setSeqResult({ summary: r.strategy_summary || '', posts: r.posts || [] })
+    } catch (e: any) {
+      setSeqErr(e.message || 'Erro ao gerar sequência')
+    } finally { setSeqBusy(false) }
+  }
 
   async function load() {
     const r: any = await api.products.list(id)
@@ -158,14 +199,102 @@ export function ProductsPage() {
                   {(p.pains_solved || []).slice(0, 3).map((x, i) => <span key={i} className="text-[10px] px-1.5 py-0.5 bg-red-900/30 text-red-200 rounded">{x}</span>)}
                 </div>
               </div>
-              <div className="flex gap-1 shrink-0">
-                <button onClick={() => startEdit(p)} className="text-xs text-violet-400">Editar</button>
-                <button onClick={() => remove(p.id)} className="text-xs text-red-400">×</button>
+              <div className="flex flex-col gap-1 shrink-0 items-end">
+                <button onClick={() => { setSeqProduct(p); setSeqResult(null); setSeqErr('') }} className="text-xs text-violet-300 bg-violet-900/30 border border-violet-700/60 rounded px-2 py-0.5">✦ Sequência</button>
+                <div className="flex gap-1">
+                  <button onClick={() => startEdit(p)} className="text-xs text-violet-400">Editar</button>
+                  <button onClick={() => remove(p.id)} className="text-xs text-red-400">×</button>
+                </div>
               </div>
             </div>
           </div>
         ))}
       </div>
+
+      {seqProduct && (
+        <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4 overflow-y-auto" onClick={() => !seqBusy && setSeqProduct(null)}>
+          <div className="bg-gray-950 border border-gray-800 rounded-xl p-4 max-w-2xl w-full max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="flex items-start justify-between mb-3">
+              <div>
+                <p className="text-sm font-bold text-white">Sequência de venda</p>
+                <p className="text-xs text-gray-400">Produto: {seqProduct.name}</p>
+              </div>
+              <button onClick={() => !seqBusy && setSeqProduct(null)} className="text-gray-500 text-lg">×</button>
+            </div>
+
+            {!seqResult && (
+              <div className="space-y-3">
+                <p className="text-xs text-gray-400">
+                  A IA vai criar uma sequência psicológica de posts (aquecimento → autoridade → quebra de objeção → desejo → oferta) distribuída até a data do lançamento. Cada peça vira ContentPiece + slot no calendário.
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] text-gray-500">Data do lançamento</label>
+                    <input type="date" value={seqLaunch} onChange={e => setSeqLaunch(e.target.value)} className="input text-sm w-full" />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-500">Total de dias</label>
+                    <input type="number" min={3} max={30} value={seqDays} onChange={e => setSeqDays(Math.max(3, Math.min(30, Number(e.target.value) || 7)))} className="input text-sm w-full" />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-gray-500">Plataforma</label>
+                    <select value={seqPlatform} onChange={e => setSeqPlatform(e.target.value)} className="input text-sm w-full">
+                      <option value="instagram">Instagram</option>
+                      <option value="tiktok">TikTok</option>
+                      <option value="youtube">YouTube</option>
+                      <option value="linkedin">LinkedIn</option>
+                    </select>
+                  </div>
+                  <label className="flex items-center gap-2 text-xs text-gray-300 mt-4">
+                    <input type="checkbox" checked={seqGenImg} onChange={e => setSeqGenImg(e.target.checked)} />
+                    Gerar imagens
+                  </label>
+                </div>
+                {seqErr && <p className="text-xs text-red-400">{seqErr}</p>}
+                <div className="flex gap-2 justify-end">
+                  <button onClick={() => setSeqProduct(null)} disabled={seqBusy} className="btn-secondary text-xs">Cancelar</button>
+                  <button onClick={runSequence} disabled={seqBusy} className="btn-primary text-xs">
+                    {seqBusy ? 'Gerando sequência (pode levar 30-60s)...' : '✦ Gerar Sequência'}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {seqResult && (
+              <div className="space-y-3">
+                <div className="card bg-violet-900/10 border-violet-800/50">
+                  <p className="text-xs text-violet-300 font-semibold mb-1">ESTRATÉGIA</p>
+                  <p className="text-xs text-gray-200">{seqResult.summary}</p>
+                </div>
+                <p className="text-xs text-gray-400">{seqResult.posts.length} peças criadas e agendadas no calendário:</p>
+                <div className="space-y-2">
+                  {seqResult.posts.map((p, i) => (
+                    <div key={p.id} className="card">
+                      <div className="flex items-start gap-2">
+                        {p.media_url && <img src={p.media_url} alt="" className="w-12 h-12 rounded object-cover shrink-0" />}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-[10px] text-gray-500">#{i + 1}</span>
+                            <span className="text-[10px] text-gray-400">{new Date(p.scheduled_at).toLocaleDateString('pt-BR')}</span>
+                            {p.funnel_stage && <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-900/30 text-cyan-200">{p.funnel_stage}</span>}
+                            {p.emotion_used && <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-900/30 text-orange-200">{p.emotion_used}</span>}
+                          </div>
+                          <p className="text-sm text-white truncate">{p.title}</p>
+                          {p.reasoning && <p className="text-[10px] text-gray-500 mt-0.5">{p.reasoning}</p>}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex gap-2 justify-end">
+                  <button onClick={() => setSeqProduct(null)} className="btn-secondary text-xs">Fechar</button>
+                  <button onClick={() => navigate(`/client/${clientId}/calendar`)} className="btn-primary text-xs">Ver no calendário →</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

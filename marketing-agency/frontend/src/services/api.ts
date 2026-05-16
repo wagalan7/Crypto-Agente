@@ -137,5 +137,8 @@ export const api = {
     insights: (clientId: number) => get(`/strategy/insights/${clientId}`),
     regenerateInsights: (clientId: number) => post(`/strategy/insights/${clientId}/generate`, {}),
     dismissInsight: (insightId: number) => post(`/strategy/insights/${insightId}/dismiss`, {}),
+    salesSequence: (clientId: number, data: { product_id: number; launch_date: string; total_days: number; platform?: string; generate_images?: boolean }) =>
+      post(`/strategy/sales-sequence/${clientId}`, data),
+    profileAudit: (clientId: number) => post(`/strategy/profile-audit/${clientId}`, {}),
   },
 }
