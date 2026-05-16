@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom'
 import { api } from '../services/api'
 import type { Client, CalendarSlot, MetricsSummary, Insight } from '../types'
 import { AuthorityScore } from '../components/AuthorityScore'
+import { OnboardingChecklist } from '../components/OnboardingChecklist'
 import { OBJECTIVE_LABELS, OBJECTIVE_COLORS, FORMAT_LABELS } from '../types'
 
 function MetricCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
@@ -49,6 +50,8 @@ export function DashboardPage() {
         </div>
         <button onClick={refreshScore} className="btn-secondary text-xs shrink-0 ml-2">Score</button>
       </div>
+
+      <OnboardingChecklist clientId={id} client={client} />
 
       {/* Authority + metrics */}
       <div className="flex items-center gap-4">

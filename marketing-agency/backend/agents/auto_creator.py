@@ -30,6 +30,8 @@ Regras DE OURO:
 - Se houver produto principal e for fase de aquecer venda, faça funnel_stage=quebra_objecao/desejo/conversao
 - objective_reasoning e format_reasoning são OBRIGATÓRIOS — sem isso, output é genérico
 - Linguagem deve copiar os padrões da persona (gírias, formalidade)
+- Se houver "PADRÕES VENCEDORES" no contexto, INCORPORE deliberadamente — replique emoção/formato/funil que já funcionaram. Cite a inspiração no objective_reasoning ("seguindo o padrão de 'X' que teve N shares")
+- Se houver "FUNCIONOU PIOR", EVITE replicar exatamente aquele formato+emoção
 - JSON válido, sem comentários, sem texto antes ou depois
 - image_prompt em inglês descritivo sem palavra "text"
 """

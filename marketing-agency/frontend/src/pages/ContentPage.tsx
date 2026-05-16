@@ -14,6 +14,8 @@ export function ContentPage() {
   const [selected, setSelected] = useState<ContentPiece | null>(null)
   const [mediaUrl, setMediaUrl] = useState('')
   const [publishing, setPublishing] = useState(false)
+  const [approving, setApproving] = useState(false)
+  const [regenBrief, setRegenBrief] = useState(false)
 
   async function load() {
     const data: any = await api.content.list(id, filter || undefined)
@@ -27,9 +29,27 @@ export function ContentPage() {
   }, [selected?.id])
 
   async function approve(contentId: number) {
-    const updated: any = await api.content.approve(contentId)
-    setContents(prev => prev.map(c => c.id === contentId ? updated : c))
-    if (selected?.id === contentId) setSelected(updated)
+    setApproving(true)
+    try {
+      const updated: any = await api.content.approve(contentId)
+      setContents(prev => prev.map(c => c.id === contentId ? updated : c))
+      if (selected?.id === contentId) setSelected(updated)
+    } finally {
+      setApproving(false)
+    }
+  }
+
+  async function regenerateBrief(contentId: number) {
+    setRegenBrief(true)
+    try {
+      const updated: any = await api.content.regenerateBrief(contentId)
+      setContents(prev => prev.map(c => c.id === contentId ? updated : c))
+      if (selected?.id === contentId) setSelected(updated)
+    } catch (e: any) {
+      alert('Erro ao gerar briefing: ' + e.message)
+    } finally {
+      setRegenBrief(false)
+    }
   }
 
   async function setStatus(contentId: number, status: string) {
@@ -151,6 +171,77 @@ export function ContentPage() {
             </div>
           )}
 
+          {selected.production_brief && (
+            <div className="card bg-emerald-900/10 border-emerald-800/50 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-emerald-300 font-semibold">📋 BRIEFING DE PRODUÇÃO</p>
+                <button onClick={() => regenerateBrief(selected.id)} disabled={regenBrief} className="text-[10px] text-emerald-400 hover:text-emerald-300 disabled:opacity-50">
+                  {regenBrief ? 'Regenerando...' : '↻ Regenerar'}
+                </button>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                {selected.production_brief.location && <div><span className="text-emerald-400 text-[10px] font-semibold">LOCAL:</span> <span className="text-gray-300">{selected.production_brief.location}</span></div>}
+                {selected.production_brief.wardrobe && <div><span className="text-emerald-400 text-[10px] font-semibold">FIGURINO:</span> <span className="text-gray-300">{selected.production_brief.wardrobe}</span></div>}
+                {selected.production_brief.lighting && <div><span className="text-emerald-400 text-[10px] font-semibold">LUZ:</span> <span className="text-gray-300">{selected.production_brief.lighting}</span></div>}
+                {selected.production_brief.audio && <div><span className="text-emerald-400 text-[10px] font-semibold">ÁUDIO:</span> <span className="text-gray-300">{selected.production_brief.audio}</span></div>}
+                {selected.production_brief.duration_estimate_seconds != null && <div><span className="text-emerald-400 text-[10px] font-semibold">DURAÇÃO:</span> <span className="text-gray-300">~{selected.production_brief.duration_estimate_seconds}s</span></div>}
+              </div>
+              {selected.production_brief.props && selected.production_brief.props.length > 0 && (
+                <div>
+                  <p className="text-[10px] text-emerald-400 font-semibold">PROPS</p>
+                  <p className="text-xs text-gray-300">{selected.production_brief.props.join(' · ')}</p>
+                </div>
+              )}
+              {selected.production_brief.shots && selected.production_brief.shots.length > 0 && (
+                <div>
+                  <p className="text-[10px] text-emerald-400 font-semibold mb-1">SHOTS</p>
+                  <ol className="text-xs text-gray-300 space-y-0.5">
+                    {selected.production_brief.shots.map(s => (
+                      <li key={s.order} className="flex gap-2">
+                        <span className="text-emerald-500 shrink-0">{s.order}.</span>
+                        <span><span className="text-emerald-300">[{s.type}]</span> {s.description}</span>
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+              {selected.production_brief.captions_overlay && selected.production_brief.captions_overlay.length > 0 && (
+                <div>
+                  <p className="text-[10px] text-emerald-400 font-semibold">LEGENDAS NA TELA</p>
+                  <p className="text-xs text-gray-300">{selected.production_brief.captions_overlay.map(c => `"${c}"`).join(' · ')}</p>
+                </div>
+              )}
+              {selected.production_brief.equipment_minimum && selected.production_brief.equipment_minimum.length > 0 && (
+                <div>
+                  <p className="text-[10px] text-emerald-400 font-semibold">EQUIPAMENTO MÍNIMO</p>
+                  <p className="text-xs text-gray-300">{selected.production_brief.equipment_minimum.join(' · ')}</p>
+                </div>
+              )}
+              {selected.production_brief.edit_notes && (
+                <div>
+                  <p className="text-[10px] text-emerald-400 font-semibold">EDIÇÃO</p>
+                  <p className="text-xs text-gray-300">{selected.production_brief.edit_notes}</p>
+                </div>
+              )}
+              {selected.production_brief.production_tips && selected.production_brief.production_tips.length > 0 && (
+                <div>
+                  <p className="text-[10px] text-emerald-400 font-semibold">DICAS</p>
+                  <ul className="text-xs text-gray-300 space-y-0.5">
+                    {selected.production_brief.production_tips.map((t, i) => <li key={i}>· {t}</li>)}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          {selected.status !== 'pending' && !selected.production_brief && (
+            <div className="card">
+              <button onClick={() => regenerateBrief(selected.id)} disabled={regenBrief} className="btn-secondary w-full py-2 text-xs">
+                {regenBrief ? 'Gerando briefing...' : '📋 Gerar briefing de produção'}
+              </button>
+            </div>
+          )}
+
           <div className="card">
             <p className="text-xs text-violet-400 font-semibold mb-2">MÍDIA (URL pública)</p>
             <div className="flex gap-2">
@@ -182,8 +273,8 @@ export function ContentPage() {
 
           <div className="space-y-2 pt-1">
             {selected.status === 'pending' && (
-              <button onClick={() => approve(selected.id)} className="btn-primary w-full py-3">
-                ✓ Aprovar conteúdo
+              <button onClick={() => approve(selected.id)} disabled={approving} className="btn-primary w-full py-3 disabled:opacity-60">
+                {approving ? 'Aprovando + gerando briefing...' : '✓ Aprovar conteúdo (gera briefing de gravação)'}
               </button>
             )}
             {selected.status === 'approved' && (

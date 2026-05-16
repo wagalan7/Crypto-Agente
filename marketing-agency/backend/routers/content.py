@@ -1,11 +1,14 @@
+import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 from database import get_db
-from models import ContentPiece, User, Product
+from models import ContentPiece, User, Product, Client
 from auth import get_current_user, assert_client_access
+from agents import ProductionBriefingAgent
+from agents.production_briefing import parse_json_response as parse_brief_json
 
 router = APIRouter(prefix="/content", tags=["content"])
 
@@ -71,6 +74,7 @@ def _serialize(c: ContentPiece, product_name: Optional[str] = None) -> dict:
         "linked_product_id": c.linked_product_id,
         "external_post_id": c.external_post_id,
         "publish_error": c.publish_error,
+        "production_brief": json.loads(c.production_brief) if c.production_brief else None,
         "scheduled_at": c.scheduled_at.isoformat() if c.scheduled_at else None,
         "published_at": c.published_at.isoformat() if c.published_at else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -137,11 +141,63 @@ def update_content(content_id: int, data: ContentUpdate, current_user: User = De
 
 
 @router.post("/{content_id}/approve")
-def approve_content(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def approve_content(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not c:
         raise HTTPException(404, "Content not found")
     assert_client_access(c.client_id, current_user, db)
     c.status = "approved"
+    # Auto-generate production briefing on approve if missing — turns "approved"
+    # from a status flag into an actionable shooting plan.
+    if not c.production_brief:
+        try:
+            client = db.query(Client).filter(Client.id == c.client_id).first()
+            agent = ProductionBriefingAgent()
+            prompt = agent.build_prompt(
+                title=c.title or "",
+                format=c.format or "post",
+                platform=c.platform or "instagram",
+                hook=c.hook or "",
+                script=c.script or "",
+                design_brief=c.design_brief or "",
+                copy=c.copy or "",
+                emotion=c.emotion_used or "",
+                tone=(client.tone if client else "") or "",
+            )
+            raw = await agent.run(prompt)
+            brief = parse_brief_json(raw)
+            if brief:
+                c.production_brief = json.dumps(brief, ensure_ascii=False)
+        except Exception:
+            # Never fail approve because of briefing — silent fallback
+            pass
+    db.commit()
+    return _serialize(c)
+
+
+@router.post("/{content_id}/regenerate-brief")
+async def regenerate_brief(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+    client = db.query(Client).filter(Client.id == c.client_id).first()
+    agent = ProductionBriefingAgent()
+    prompt = agent.build_prompt(
+        title=c.title or "",
+        format=c.format or "post",
+        platform=c.platform or "instagram",
+        hook=c.hook or "",
+        script=c.script or "",
+        design_brief=c.design_brief or "",
+        copy=c.copy or "",
+        emotion=c.emotion_used or "",
+        tone=(client.tone if client else "") or "",
+    )
+    raw = await agent.run(prompt)
+    brief = parse_brief_json(raw)
+    if not brief:
+        raise HTTPException(500, "Falha ao gerar briefing de produção")
+    c.production_brief = json.dumps(brief, ensure_ascii=False)
     db.commit()
     return _serialize(c)

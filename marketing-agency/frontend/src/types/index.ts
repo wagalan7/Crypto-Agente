@@ -38,6 +38,21 @@ export interface ContentPiece {
   format_reasoning?: string | null
   linked_product_id?: number | null
   linked_product_name?: string | null
+  production_brief?: ProductionBrief | null
+}
+
+export interface ProductionBrief {
+  location?: string
+  wardrobe?: string
+  props?: string[]
+  shots?: Array<{ order: number; type: string; description: string }>
+  audio?: string
+  lighting?: string
+  captions_overlay?: string[]
+  duration_estimate_seconds?: number
+  equipment_minimum?: string[]
+  production_tips?: string[]
+  edit_notes?: string
 }
 
 export interface Persona {

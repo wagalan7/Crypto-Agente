@@ -143,15 +143,66 @@ class BrandBrain:
         ])
 
     def _winning_patterns(self, client_id: int) -> str:
+        """Surface BOTH winners and losers so IA can replicate + avoid.
+
+        We score each snapshot by (shares*3 + saves*2 + comments) — the share+save
+        signal that an asset actually moved someone, not just got eyeballs.
+        """
         snaps = self.db.query(MetricsSnapshot).filter(
             MetricsSnapshot.client_id == client_id
-        ).order_by(MetricsSnapshot.recorded_at.desc()).limit(20).all()
+        ).order_by(MetricsSnapshot.recorded_at.desc()).limit(30).all()
         if not snaps:
             return ""
-        snaps.sort(key=lambda m: (m.shares + m.saves + m.comments), reverse=True)
+
+        def score(m):
+            return (m.shares or 0) * 3 + (m.saves or 0) * 2 + (m.comments or 0)
+
+        snaps_scored = [(s, score(s)) for s in snaps if s.content_id]
+        if not snaps_scored:
+            return ""
+        snaps_scored.sort(key=lambda t: t[1], reverse=True)
+
+        top = snaps_scored[:3]
+        bottom = snaps_scored[-3:] if len(snaps_scored) >= 6 else []
+
+        # Aggregate winning emotion/format patterns
+        from collections import Counter
+        top_ids = [m.content_id for m, _ in top]
+        top_contents = self.db.query(ContentPiece).filter(ContentPiece.id.in_(top_ids)).all() if top_ids else []
+        emo_counter = Counter([c.emotion_used for c in top_contents if c.emotion_used])
+        fmt_counter = Counter([c.format for c in top_contents if c.format])
+        funnel_counter = Counter([c.funnel_stage for c in top_contents if c.funnel_stage])
+
         lines = []
-        for m in snaps[:3]:
-            c = self.db.query(ContentPiece).filter(ContentPiece.id == m.content_id).first()
-            if c:
-                lines.append(f"  - '{c.title}' ({c.format}/{c.platform}) — emoção: {c.emotion_used or '?'} — shares:{m.shares} saves:{m.saves} comments:{m.comments}")
+        if top_contents:
+            lines.append("  ✓ FUNCIONOU MELHOR (replicar padrões):")
+            for m, sc in top:
+                c = next((x for x in top_contents if x.id == m.content_id), None)
+                if c:
+                    lines.append(f"    - '{(c.title or '')[:60]}' ({c.format}/{c.platform}) emoção={c.emotion_used or '?'} funil={c.funnel_stage or '?'} | shares={m.shares} saves={m.saves} comments={m.comments}")
+
+        if bottom:
+            bot_ids = [m.content_id for m, _ in bottom]
+            bot_contents = self.db.query(ContentPiece).filter(ContentPiece.id.in_(bot_ids)).all()
+            if bot_contents:
+                lines.append("  ✗ FUNCIONOU PIOR (evitar replicar exatamente):")
+                for m, sc in bottom:
+                    c = next((x for x in bot_contents if x.id == m.content_id), None)
+                    if c:
+                        lines.append(f"    - '{(c.title or '')[:60]}' ({c.format}/{c.platform}) emoção={c.emotion_used or '?'} | shares={m.shares} saves={m.saves}")
+
+        # Aggregated heuristics
+        agg = []
+        if emo_counter:
+            top_emo = emo_counter.most_common(1)[0]
+            agg.append(f"emoção '{top_emo[0]}' aparece em {top_emo[1]}/{len(top_contents)} vencedores")
+        if fmt_counter:
+            top_fmt = fmt_counter.most_common(1)[0]
+            agg.append(f"formato '{top_fmt[0]}' domina topo")
+        if funnel_counter:
+            top_fn = funnel_counter.most_common(1)[0]
+            agg.append(f"estágio '{top_fn[0]}' performa")
+        if agg:
+            lines.append(f"  → SINAL: {' · '.join(agg)}. Considere replicar.")
+
         return "\n".join(lines)

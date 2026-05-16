@@ -92,6 +92,7 @@ class ContentPiece(Base):
     funnel_stage = Column(String(50))   # identificação / dor / autoridade / quebra_objecao / desejo / conversao
     format_reasoning = Column(Text)     # why this format
     linked_product_id = Column(Integer, ForeignKey("products.id"), nullable=True)  # product this content sells
+    production_brief = Column(Text)  # JSON: shooting checklist (auto-generated on approve)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client", back_populates="contents")

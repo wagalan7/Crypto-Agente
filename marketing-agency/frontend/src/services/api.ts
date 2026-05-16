@@ -82,6 +82,7 @@ export const api = {
     get: (id: number) => get(`/content/${id}`),
     update: (id: number, data: unknown) => patch(`/content/${id}`, data),
     approve: (id: number) => post(`/content/${id}/approve`, {}),
+    regenerateBrief: (id: number) => post(`/content/${id}/regenerate-brief`, {}),
   },
   calendar: {
     get: (clientId: number, days?: number) => get(`/calendar/client/${clientId}${days ? `?days=${days}` : ''}`),

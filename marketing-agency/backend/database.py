@@ -53,6 +53,7 @@ def _run_lightweight_migrations():
         "funnel_stage": "VARCHAR(50)",
         "format_reasoning": "TEXT",
         "linked_product_id": "INTEGER",
+        "production_brief": "TEXT",
     }
 
     if "content_pieces" in inspector.get_table_names():
