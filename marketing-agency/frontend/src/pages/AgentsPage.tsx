@@ -29,10 +29,10 @@ export function AgentsPage() {
   const navigate = useNavigate()
   const [tab, setTab] = useState<AgentTab>('auto')
 
-  const [autoForm, setAutoForm] = useState({ site_url: '', topic: '', format: 'post', platform: 'instagram', objective: 'attract' })
+  const [autoForm, setAutoForm] = useState({ site_url: '', topic: '', format: 'post', platform: 'instagram', objective: '' })
   const [autoStatus, setAutoStatus] = useState('')
   const [autoOutput, setAutoOutput] = useState('')
-  const [autoResult, setAutoResult] = useState<{ content_id: number; image_url: string; title: string } | null>(null)
+  const [autoResult, setAutoResult] = useState<{ content_id: number; image_url: string; title: string; objective?: string; objective_reasoning?: string; emotion_used?: string; funnel_stage?: string; format_reasoning?: string } | null>(null)
   const [autoRunning, setAutoRunning] = useState(false)
 
   async function runAuto() {
@@ -132,8 +132,16 @@ export function AgentsPage() {
               </div>
             </div>
             <div>
-              <label className="text-xs text-gray-400 mb-1.5 block">Objetivo</label>
+              <label className="text-xs text-gray-400 mb-1.5 block">Objetivo (opcional — IA decide e justifica)</label>
               <div className="flex flex-wrap gap-1.5">
+                <button onClick={() => setAutoForm(p => ({ ...p, objective: '' }))}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                    !autoForm.objective
+                      ? 'bg-violet-600/20 border-violet-500 text-violet-300'
+                      : 'bg-gray-800 border-gray-700 text-gray-400'
+                  }`}>
+                  ✦ IA decide
+                </button>
                 {OBJECTIVES.map(o => (
                   <button key={o} onClick={() => setAutoForm(p => ({ ...p, objective: o }))}
                     className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
@@ -171,13 +179,41 @@ export function AgentsPage() {
               <p className="text-xs text-violet-300 font-semibold">✓ Conteúdo criado e salvo</p>
               <p className="text-sm text-white font-medium">{autoResult.title}</p>
               <img src={autoResult.image_url} alt="" className="rounded-lg w-full max-w-sm" />
+
+              {(autoResult.objective_reasoning || autoResult.emotion_used || autoResult.funnel_stage || autoResult.format_reasoning) && (
+                <div className="space-y-2 pt-2 border-t border-violet-800/40">
+                  <p className="text-[10px] text-violet-400 font-semibold">POR QUE A IA TOMOU ESSAS DECISÕES</p>
+                  {autoResult.objective_reasoning && (
+                    <div>
+                      <p className="text-[10px] text-violet-300">Objetivo: {autoResult.objective}</p>
+                      <p className="text-xs text-gray-300">{autoResult.objective_reasoning}</p>
+                    </div>
+                  )}
+                  <div className="flex flex-wrap gap-1.5">
+                    {autoResult.emotion_used && (
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-orange-900/30 text-orange-200">
+                        Emoção: {autoResult.emotion_used}
+                      </span>
+                    )}
+                    {autoResult.funnel_stage && (
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-900/30 text-cyan-200">
+                        Funil: {autoResult.funnel_stage}
+                      </span>
+                    )}
+                  </div>
+                  {autoResult.format_reasoning && (
+                    <p className="text-xs text-gray-300">{autoResult.format_reasoning}</p>
+                  )}
+                </div>
+              )}
+
               <div className="flex gap-2">
                 <button onClick={() => navigate(`/client/${clientId}/content`)} className="btn-primary text-xs flex-1">
                   Ver na aba Conteúdo
                 </button>
               </div>
               <p className="text-[11px] text-gray-500">
-                A imagem é gerada pelo Pollinations.ai (URL pública). Já está pronta pra publicar no Instagram/Facebook.
+                Imagem gerada pelo Pollinations.ai (URL pública). Pronta pra publicar.
               </p>
             </div>
           )}

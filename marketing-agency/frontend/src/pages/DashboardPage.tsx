@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { api } from '../services/api'
-import type { Client, CalendarSlot, MetricsSummary } from '../types'
+import type { Client, CalendarSlot, MetricsSummary, Insight } from '../types'
 import { AuthorityScore } from '../components/AuthorityScore'
 import { OBJECTIVE_LABELS, OBJECTIVE_COLORS, FORMAT_LABELS } from '../types'
 
@@ -21,11 +21,13 @@ export function DashboardPage() {
   const [client, setClient] = useState<Client | null>(null)
   const [slots, setSlots] = useState<CalendarSlot[]>([])
   const [summary, setSummary] = useState<MetricsSummary | null>(null)
+  const [insights, setInsights] = useState<Insight[]>([])
 
   useEffect(() => {
     api.clients.get(id).then((c: any) => setClient(c))
     api.calendar.get(id, 7).then((s: any) => setSlots(s))
     api.analytics.summary(id, 30).then((s: any) => setSummary(s))
+    api.strategy.insights(id).then((s: any) => setInsights(s)).catch(() => {})
   }, [id])
 
   async function refreshScore() {
@@ -62,6 +64,34 @@ export function DashboardPage() {
           />
         </div>
       </div>
+
+      {/* Insights inteligentes */}
+      {insights.length > 0 && (
+        <div className="card">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold text-white">Insights da IA</h2>
+            <Link to={`/client/${id}/strategy`} className="text-xs text-violet-400">Central →</Link>
+          </div>
+          <div className="space-y-2">
+            {insights.slice(0, 4).map(i => {
+              const sev = i.severity === 'critical' ? 'bg-red-900/20 border-red-800/50 text-red-200'
+                : i.severity === 'warning' ? 'bg-yellow-900/20 border-yellow-800/50 text-yellow-200'
+                : i.severity === 'opportunity' ? 'bg-green-900/20 border-green-800/50 text-green-200'
+                : 'bg-blue-900/10 border-blue-800/50 text-blue-200'
+              const icon = i.severity === 'critical' ? '⚠' : i.severity === 'warning' ? '⚡' : i.severity === 'opportunity' ? '✦' : 'ℹ'
+              return (
+                <div key={i.id} className={`border rounded-lg px-3 py-2 ${sev}`}>
+                  <p className="text-xs font-semibold flex items-center gap-1.5">
+                    <span>{icon}</span><span>{i.title}</span>
+                    <span className="text-[10px] opacity-60">· {i.kind}</span>
+                  </p>
+                  <p className="text-xs opacity-90 mt-0.5">{i.message}</p>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Next 7 days */}
       <div className="card">

@@ -24,6 +24,11 @@ class ContentCreate(BaseModel):
     trend_context: Optional[str] = None
     strategic_note: Optional[str] = None
     scheduled_at: Optional[datetime] = None
+    objective_reasoning: Optional[str] = None
+    emotion_used: Optional[str] = None
+    funnel_stage: Optional[str] = None
+    format_reasoning: Optional[str] = None
+    linked_product_id: Optional[int] = None
 
 
 class ContentUpdate(BaseModel):
@@ -35,6 +40,11 @@ class ContentUpdate(BaseModel):
     media_url: Optional[str] = None
     status: Optional[str] = None
     strategic_note: Optional[str] = None
+    objective_reasoning: Optional[str] = None
+    emotion_used: Optional[str] = None
+    funnel_stage: Optional[str] = None
+    format_reasoning: Optional[str] = None
+    linked_product_id: Optional[int] = None
 
 
 def _serialize(c: ContentPiece) -> dict:
@@ -53,6 +63,11 @@ def _serialize(c: ContentPiece) -> dict:
         "status": c.status,
         "trend_context": c.trend_context,
         "strategic_note": c.strategic_note,
+        "objective_reasoning": c.objective_reasoning,
+        "emotion_used": c.emotion_used,
+        "funnel_stage": c.funnel_stage,
+        "format_reasoning": c.format_reasoning,
+        "linked_product_id": c.linked_product_id,
         "external_post_id": c.external_post_id,
         "publish_error": c.publish_error,
         "scheduled_at": c.scheduled_at.isoformat() if c.scheduled_at else None,

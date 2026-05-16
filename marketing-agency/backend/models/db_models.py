@@ -86,10 +86,17 @@ class ContentPiece(Base):
     strategic_note = Column(Text)
     external_post_id = Column(String(200))  # ID returned by Meta after publish
     publish_error = Column(Text)
+    # Strategic reasoning (item 10: justificativa das decisões)
+    objective_reasoning = Column(Text)  # why this objective
+    emotion_used = Column(String(100))  # dominant emotion (e.g., "vulnerabilidade", "esperança")
+    funnel_stage = Column(String(50))   # identificação / dor / autoridade / quebra_objecao / desejo / conversao
+    format_reasoning = Column(Text)     # why this format
+    linked_product_id = Column(Integer, ForeignKey("products.id"), nullable=True)  # product this content sells
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client", back_populates="contents")
     metrics = relationship("MetricsSnapshot", back_populates="content")
+    linked_product = relationship("Product", foreign_keys=[linked_product_id])
 
 
 class SocialAccount(Base):
@@ -162,3 +169,117 @@ class AgentMemory(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client", back_populates="memories")
+
+
+# ============================================================
+# Strategic Intelligence Modules
+# ============================================================
+
+class Persona(Base):
+    """Audience persona generated from bio, content, comments, metrics, language."""
+    __tablename__ = "personas"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False, unique=True)
+    pains = Column(JSON, default=list)              # ["medo de fracasso", ...]
+    desires = Column(JSON, default=list)
+    emotions = Column(JSON, default=list)           # dominant emotions
+    insecurities = Column(JSON, default=list)
+    audience_goals = Column(JSON, default=list)
+    language_patterns = Column(Text)                # how they speak (long text)
+    psychological_patterns = Column(Text)
+    audience_profile = Column(Text)                 # demographic + psychographic
+    evidence = Column(Text)                         # what data was used
+    generated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    client = relationship("Client")
+
+
+class Inspiration(Base):
+    """Saved reference (URL, screenshot, text) with structured analysis."""
+    __tablename__ = "inspirations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    source_type = Column(String(50))    # "url" / "text" / "image"
+    source_value = Column(Text)         # the URL or pasted text or image URL
+    label = Column(String(300))         # user-given name
+    analysis = Column(JSON, default=dict)  # {hook, narrative, cta, rhythm, retention, emotion, structure, visual_style}
+    adapted_brief = Column(Text)        # how to adapt to this client's brand
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    client = relationship("Client")
+
+
+class Insight(Base):
+    """Strategic insight surfaced by the AI for the user (dashboard cards)."""
+    __tablename__ = "insights"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    kind = Column(String(50))           # positioning / retention / format / audience / growth / authority / risk
+    title = Column(String(300))
+    message = Column(Text)
+    evidence = Column(Text)
+    severity = Column(String(20), default="info")  # info / warning / critical / opportunity
+    is_dismissed = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    client = relationship("Client")
+
+
+class Product(Base):
+    """Offer / product / service to monetize. Drives sales-aware content."""
+    __tablename__ = "products"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    name = Column(String(300), nullable=False)
+    type = Column(String(50))           # service / mentorship / course / ebook / offer
+    price = Column(String(100))
+    description = Column(Text)
+    pains_solved = Column(JSON, default=list)
+    desires = Column(JSON, default=list)
+    objections = Column(JSON, default=list)
+    transformation = Column(Text)
+    awareness_stage = Column(String(50))  # unaware / problem / solution / product / most_aware
+    funnel_stage = Column(String(50))     # top / middle / bottom
+    is_primary = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    client = relationship("Client")
+
+
+class KnowledgeItem(Base):
+    """User's intellectual capital: notes, PDFs, books, ideas. AI absorbs vision."""
+    __tablename__ = "knowledge_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    title = Column(String(300), nullable=False)
+    content = Column(Text)              # extracted text
+    source_type = Column(String(50))    # pdf / note / screenshot / idea / book / concept / reference
+    tags = Column(JSON, default=list)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    client = relationship("Client")
+
+
+class WeeklyBrain(Base):
+    """Weekly strategic summary: focus, opportunities, alerts, priorities."""
+    __tablename__ = "weekly_brains"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    focus = Column(Text)                # main focus of the week
+    opportunities = Column(JSON, default=list)
+    alerts = Column(JSON, default=list)
+    risks = Column(JSON, default=list)
+    priorities = Column(JSON, default=list)
+    audience_behavior = Column(Text)
+    trends = Column(JSON, default=list)
+    emotional_sequence = Column(JSON, default=list)  # day-by-day emotional plan
+    generated_at = Column(DateTime, default=datetime.utcnow)
+
+    client = relationship("Client")

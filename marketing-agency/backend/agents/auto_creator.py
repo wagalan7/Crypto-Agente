@@ -2,56 +2,65 @@ import json
 import re
 from .base_agent import BaseAgent
 
-SYSTEM = """Você é o Diretor de Conteúdo de uma agência de marketing digital.
-Sua função: ler o briefing do cliente + conteúdo do site/produto + tema, e gerar UM conteúdo COMPLETO pronto pra publicar.
+SYSTEM = """Você é o Diretor Estratégico de Conteúdo da agência.
+Sua função: ler todo o contexto da marca (briefing, persona, produto, conhecimento, insights, semana) e produzir UM conteúdo COMPLETO que seja estrategicamente justificado — não um post genérico.
 
 Responda SEMPRE em PT-BR.
 
-FORMATO OBRIGATÓRIO — retorne APENAS um JSON válido (sem markdown, sem ```json), com estes campos:
+FORMATO OBRIGATÓRIO — JSON puro, sem markdown, com TODOS estes campos:
 {
-  "title": "título curto e claro (máx 80 chars)",
-  "hook": "primeira frase que prende (1 linha)",
-  "script": "roteiro completo de 5-10 linhas, separado por \\n",
-  "copy": "legenda pronta pra publicação com CTA e até 5 hashtags relevantes",
-  "design_brief": "descrição visual do post em 3-4 linhas (cores, elementos, mood)",
-  "image_prompt": "prompt em INGLÊS para gerador de imagem, fotorrealista ou design moderno, sem texto na imagem, máx 200 chars"
+  "title": "título curto (máx 80 chars)",
+  "hook": "primeira frase que prende — calibrada pra persona",
+  "script": "roteiro 5-10 linhas separadas por \\n",
+  "copy": "legenda pronta com CTA e até 5 hashtags relevantes",
+  "design_brief": "descrição visual em 3-4 linhas — paleta, elementos, mood",
+  "image_prompt": "prompt EM INGLÊS pro gerador de imagem (sem texto na imagem, máx 200 chars)",
+  "objective": "atracao | conexao | autoridade | conversao | compartilhamento",
+  "objective_reasoning": "POR QUE esse objetivo agora — 1-2 frases ligadas ao contexto",
+  "emotion_used": "emoção dominante explorada (ex: vulnerabilidade, alívio, esperança, validação)",
+  "funnel_stage": "identificacao | dor | autoridade | quebra_objecao | desejo | conversao",
+  "format_reasoning": "POR QUE esse formato/plataforma — 1 frase",
+  "why_for_audience": "qual dor/desejo da persona esse conteúdo toca — 1 frase",
+  "linked_product_hint": "se for útil pra vender o produto principal, qual conexão. Caso contrário, 'nenhuma'."
 }
 
-Regras:
-- Linguagem direta, sem clichês de marketing
-- Adaptado ao tom de voz e nicho do cliente
-- Hook deve gerar curiosidade ou parar o scroll
-- image_prompt em inglês, descritivo, sem palavras como "text" ou "logo"
-- JSON válido, sem comentários, sem texto antes ou depois"""
+Regras DE OURO:
+- O conteúdo deve refletir a PERSONA específica (não audiência genérica)
+- A emoção escolhida deve estar nas emoções da persona ou justificar mudança
+- Se houver produto principal e for fase de aquecer venda, faça funnel_stage=quebra_objecao/desejo/conversao
+- objective_reasoning e format_reasoning são OBRIGATÓRIOS — sem isso, output é genérico
+- Linguagem deve copiar os padrões da persona (gírias, formalidade)
+- JSON válido, sem comentários, sem texto antes ou depois
+- image_prompt em inglês descritivo sem palavra "text"
+"""
 
 
 class AutoCreatorAgent(BaseAgent):
     def __init__(self):
         super().__init__(SYSTEM)
 
-    def build_prompt(self, client_context: str, site_context: str, topic: str, format: str, platform: str, objective: str) -> str:
-        return f"""BRIEFING DO CLIENTE:
-{client_context or '(sem briefing)'}
+    def build_prompt(self, brand_brain_text: str, site_context: str, topic: str, format: str, platform: str, requested_objective: str = "") -> str:
+        objective_hint = f"O usuário sugeriu objetivo='{requested_objective}', mas você pode SOBRESCREVER se achar melhor — basta justificar." if requested_objective else "Decida o objetivo automaticamente baseado no contexto e justifique."
+        return f"""=== CONTEXTO ESTRATÉGICO DA MARCA ===
+{brand_brain_text or '(briefing mínimo)'}
 
-CONTEÚDO DO SITE / PRODUTO:
-{site_context or '(sem site informado)'}
+=== SITE / PRODUTO REFERENCIADO ===
+{site_context or '(nenhum)'}
 
-TEMA: {topic or 'livre, escolha o melhor com base no briefing'}
-FORMATO: {format}
-PLATAFORMA: {platform}
-OBJETIVO: {objective}
+=== PARÂMETROS DESTE CONTEÚDO ===
+Tema: {topic or 'livre — escolha o melhor com base no contexto'}
+Formato: {format}
+Plataforma: {platform}
+Objetivo: {objective_hint}
 
-Gere o JSON com o conteúdo completo."""
+Gere o JSON completo do conteúdo estratégico."""
 
 
 def parse_json_response(raw: str) -> dict:
-    """Robust JSON extraction — handles markdown fences and stray text."""
     if not raw:
         return {}
-    # Strip markdown fences
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
     raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
-    # Find first { and last }
     start = raw.find("{")
     end = raw.rfind("}")
     if start == -1 or end == -1:
@@ -60,7 +69,6 @@ def parse_json_response(raw: str) -> dict:
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
-        # Try to fix common issues: unescaped newlines inside strings
         try:
             return json.loads(candidate.replace("\n", "\\n").replace("\r", ""))
         except Exception:

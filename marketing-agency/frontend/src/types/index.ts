@@ -32,6 +32,91 @@ export interface ContentPiece {
   external_post_id: string | null
   publish_error: string | null
   created_at: string | null
+  objective_reasoning?: string | null
+  emotion_used?: string | null
+  funnel_stage?: string | null
+  format_reasoning?: string | null
+  linked_product_id?: number | null
+}
+
+export interface Persona {
+  id: number
+  client_id: number
+  pains: string[]
+  desires: string[]
+  emotions: string[]
+  insecurities: string[]
+  audience_goals: string[]
+  language_patterns: string
+  psychological_patterns: string
+  audience_profile: string
+  evidence: string
+  generated_at: string | null
+}
+
+export interface Inspiration {
+  id: number
+  client_id: number
+  source_type: 'url' | 'text' | 'image'
+  source_value: string
+  label: string | null
+  analysis: Record<string, unknown>
+  adapted_brief: string | null
+  created_at: string | null
+}
+
+export interface Insight {
+  id: number
+  client_id: number
+  kind: string
+  title: string
+  message: string
+  evidence: string | null
+  severity: 'info' | 'warning' | 'critical' | 'opportunity'
+  is_dismissed: boolean
+  created_at: string | null
+}
+
+export interface Product {
+  id: number
+  client_id: number
+  name: string
+  type: string
+  price: string | null
+  description: string | null
+  pains_solved: string[]
+  desires: string[]
+  objections: string[]
+  transformation: string | null
+  awareness_stage: string | null
+  funnel_stage: string | null
+  is_primary: boolean
+  is_active: boolean
+  created_at: string | null
+}
+
+export interface KnowledgeItem {
+  id: number
+  client_id: number
+  title: string
+  content: string
+  source_type: string
+  tags: string[]
+  created_at: string | null
+}
+
+export interface WeeklyBrain {
+  id: number
+  client_id: number
+  focus: string
+  opportunities: string[]
+  alerts: string[]
+  risks: string[]
+  priorities: string[]
+  audience_behavior: string | null
+  trends: string[]
+  emotional_sequence: Array<{ day: string; emotion: string; intent: string; format_suggestion: string }>
+  generated_at: string | null
 }
 
 export interface SocialAccount {
@@ -103,20 +188,39 @@ export interface SSEEvent {
 
 export const OBJECTIVE_LABELS: Record<string, string> = {
   attract: 'Atrair',
+  atracao: 'Atrair',
   connect: 'Conectar',
+  conexao: 'Conectar',
   authority: 'Autoridade',
+  autoridade: 'Autoridade',
   sell: 'Vender',
+  conversao: 'Converter',
+  compartilhamento: 'Compartilhar',
   break_objection: 'Quebrar Objeção',
   retention: 'Retenção',
 }
 
 export const OBJECTIVE_COLORS: Record<string, string> = {
   attract: 'bg-blue-900/40 text-blue-300 border-blue-700',
+  atracao: 'bg-blue-900/40 text-blue-300 border-blue-700',
   connect: 'bg-green-900/40 text-green-300 border-green-700',
+  conexao: 'bg-green-900/40 text-green-300 border-green-700',
   authority: 'bg-violet-900/40 text-violet-300 border-violet-700',
+  autoridade: 'bg-violet-900/40 text-violet-300 border-violet-700',
   sell: 'bg-orange-900/40 text-orange-300 border-orange-700',
+  conversao: 'bg-orange-900/40 text-orange-300 border-orange-700',
+  compartilhamento: 'bg-pink-900/40 text-pink-300 border-pink-700',
   break_objection: 'bg-red-900/40 text-red-300 border-red-700',
   retention: 'bg-cyan-900/40 text-cyan-300 border-cyan-700',
+}
+
+export const FUNNEL_STAGE_LABELS: Record<string, string> = {
+  identificacao: 'Identificação',
+  dor: 'Dor',
+  autoridade: 'Autoridade',
+  quebra_objecao: 'Quebra de Objeção',
+  desejo: 'Desejo',
+  conversao: 'Conversão',
 }
 
 export const FORMAT_LABELS: Record<string, string> = {

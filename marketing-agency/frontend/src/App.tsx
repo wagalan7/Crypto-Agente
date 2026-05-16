@@ -9,6 +9,11 @@ import { ContentPage } from './pages/ContentPage'
 import { AgentsPage } from './pages/AgentsPage'
 import { AnalyticsPage } from './pages/AnalyticsPage'
 import { SocialAccountsPage } from './pages/SocialAccountsPage'
+import { PersonaPage } from './pages/PersonaPage'
+import { InspirationsPage } from './pages/InspirationsPage'
+import { ProductsPage } from './pages/ProductsPage'
+import { KnowledgePage } from './pages/KnowledgePage'
+import { CentralEstrategicaPage } from './pages/CentralEstrategicaPage'
 import { Sidebar } from './components/Sidebar'
 import { api } from './services/api'
 
@@ -50,6 +55,11 @@ export default function App() {
         <Route path="agents" element={<AgentsPage />} />
         <Route path="analytics" element={<AnalyticsPage />} />
         <Route path="social" element={<SocialAccountsPage />} />
+        <Route path="persona" element={<PersonaPage />} />
+        <Route path="inspirations" element={<InspirationsPage />} />
+        <Route path="products" element={<ProductsPage />} />
+        <Route path="knowledge" element={<KnowledgePage />} />
+        <Route path="strategy" element={<CentralEstrategicaPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

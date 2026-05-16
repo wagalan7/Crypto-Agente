@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { api } from '../services/api'
 import type { ContentPiece } from '../types'
-import { STATUS_LABELS, STATUS_COLORS, FORMAT_LABELS, OBJECTIVE_LABELS, OBJECTIVE_COLORS } from '../types'
+import { STATUS_LABELS, STATUS_COLORS, FORMAT_LABELS, OBJECTIVE_LABELS, OBJECTIVE_COLORS, FUNNEL_STAGE_LABELS } from '../types'
 
 const STATUSES = ['pending', 'approved', 'recorded', 'published'] as const
 
@@ -113,6 +113,36 @@ export function ContentPage() {
             <div className="card bg-violet-900/10 border-violet-800/50">
               <p className="text-xs text-violet-400 font-semibold mb-1">NOTA ESTRATÉGICA</p>
               <p className="text-sm text-gray-300">{selected.strategic_note}</p>
+            </div>
+          )}
+
+          {(selected.objective_reasoning || selected.emotion_used || selected.funnel_stage || selected.format_reasoning) && (
+            <div className="card bg-indigo-900/10 border-indigo-800/50 space-y-2">
+              <p className="text-xs text-indigo-300 font-semibold">JUSTIFICATIVA ESTRATÉGICA</p>
+              {selected.objective_reasoning && (
+                <div>
+                  <p className="text-[10px] text-indigo-400 font-semibold">POR QUE ESSE OBJETIVO</p>
+                  <p className="text-xs text-gray-300">{selected.objective_reasoning}</p>
+                </div>
+              )}
+              <div className="flex flex-wrap gap-1.5">
+                {selected.emotion_used && (
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-orange-900/30 text-orange-200 border border-orange-800/50">
+                    Emoção: {selected.emotion_used}
+                  </span>
+                )}
+                {selected.funnel_stage && (
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-900/30 text-cyan-200 border border-cyan-800/50">
+                    Funil: {FUNNEL_STAGE_LABELS[selected.funnel_stage] || selected.funnel_stage}
+                  </span>
+                )}
+              </div>
+              {selected.format_reasoning && (
+                <div>
+                  <p className="text-[10px] text-indigo-400 font-semibold">POR QUE ESSE FORMATO</p>
+                  <p className="text-xs text-gray-300">{selected.format_reasoning}</p>
+                </div>
+              )}
             </div>
           )}
 

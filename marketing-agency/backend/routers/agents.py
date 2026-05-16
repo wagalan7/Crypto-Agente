@@ -7,7 +7,7 @@ from typing import Optional
 from database import get_db
 from models import Client, User
 from agents import StrategyAgent, AnalyticsAgent, ScriptAgent, TrendAgent, DesignAgent, AmplifierAgent, AutoCreatorAgent, parse_json_response
-from services import MemoryService, fetch_site_context, generate_image_url, aspect_for_format
+from services import MemoryService, BrandBrain, fetch_site_context, generate_image_url, aspect_for_format
 from models import ContentPiece
 from auth import get_current_user, assert_client_access
 
@@ -68,7 +68,7 @@ class AutoCreateRequest(BaseModel):
     topic: Optional[str] = ""
     format: str = "post"
     platform: str = "instagram"
-    objective: str = "attract"
+    objective: Optional[str] = ""
 
 
 @router.post("/strategy/stream")
@@ -167,8 +167,7 @@ async def design_stream(req: DesignRequest, current_user: User = Depends(get_cur
 @router.post("/auto/stream")
 async def auto_create_stream(req: AutoCreateRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     assert_client_access(req.client_id, current_user, db)
-    mem = MemoryService(db)
-    client_context = mem.build_client_context(req.client_id)
+    brain = BrandBrain(db).build(req.client_id)
 
     async def gen():
         # 1. Scrape site
@@ -177,10 +176,10 @@ async def auto_create_stream(req: AutoCreateRequest, current_user: User = Depend
             yield _sse("status", f"Analisando site: {req.site_url}...")
             site_context = await fetch_site_context(req.site_url)
 
-        # 2. Generate content via LLM
-        yield _sse("status", "Gerando conteúdo com IA...")
+        # 2. Generate content via LLM (with full BrandBrain context)
+        yield _sse("status", "Gerando conteúdo estratégico...")
         agent = AutoCreatorAgent()
-        prompt = agent.build_prompt(client_context, site_context, req.topic or "", req.format, req.platform, req.objective)
+        prompt = agent.build_prompt(brain["text"], site_context, req.topic or "", req.format, req.platform, req.objective or "")
         raw = ""
         async for chunk in agent.stream(prompt):
             raw += chunk
@@ -197,26 +196,47 @@ async def auto_create_stream(req: AutoCreateRequest, current_user: User = Depend
         w, h = aspect_for_format(req.format)
         image_url = generate_image_url(data.get("image_prompt", data.get("title", "")), width=w, height=h)
 
-        # 5. Persist as ContentPiece
+        # 5. Try resolve linked product
+        linked_product_id = None
+        primary = brain["data"].get("primary_product")
+        if primary and (data.get("linked_product_hint") or "").lower() not in ("", "nenhuma", "none", "n/a"):
+            linked_product_id = primary.id
+
+        # 6. Persist as ContentPiece with reasoning fields
+        objective_final = (data.get("objective") or req.objective or "atracao")[:50]
         content = ContentPiece(
             client_id=req.client_id,
             title=(data.get("title") or req.topic or "Conteúdo auto-gerado")[:200],
             format=req.format,
             platform=req.platform,
-            objective=req.objective,
+            objective=objective_final,
             hook=data.get("hook"),
             script=data.get("script"),
             copy=data.get("copy"),
             design_brief=data.get("design_brief"),
             media_url=image_url,
-            strategic_note=f"Auto-criado a partir de: {req.site_url or 'briefing do cliente'}",
+            strategic_note=data.get("why_for_audience") or f"Auto-criado a partir de: {req.site_url or 'briefing'}",
+            objective_reasoning=data.get("objective_reasoning"),
+            emotion_used=(data.get("emotion_used") or "")[:100] or None,
+            funnel_stage=(data.get("funnel_stage") or "")[:50] or None,
+            format_reasoning=data.get("format_reasoning"),
+            linked_product_id=linked_product_id,
             status="pending",
         )
         db.add(content)
         db.commit()
         db.refresh(content)
 
-        yield _sse("done", {"content_id": content.id, "image_url": image_url, "title": content.title})
+        yield _sse("done", {
+            "content_id": content.id,
+            "image_url": image_url,
+            "title": content.title,
+            "objective": content.objective,
+            "objective_reasoning": content.objective_reasoning,
+            "emotion_used": content.emotion_used,
+            "funnel_stage": content.funnel_stage,
+            "format_reasoning": content.format_reasoning,
+        })
 
     return _stream_response(gen())
 

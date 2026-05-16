@@ -108,7 +108,34 @@ export const api = {
     trend: (clientId: number, currentTrends: string) => streamAgent('/agents/trend/stream', { client_id: clientId, current_trends: currentTrends }),
     design: (clientId: number, topic: string, format: string, platform: string, references?: string) => streamAgent('/agents/design/stream', { client_id: clientId, content_topic: topic, format, platform, references }),
     amplifier: (clientId: number, rawIdea: string) => streamAgent('/agents/amplifier/stream', { client_id: clientId, raw_idea: rawIdea }),
-    auto: (clientId: number, siteUrl: string, topic: string, format: string, platform: string, objective: string) =>
-      streamAgent('/agents/auto/stream', { client_id: clientId, site_url: siteUrl, topic, format, platform, objective }),
+    auto: (clientId: number, siteUrl: string, topic: string, format: string, platform: string, objective?: string) =>
+      streamAgent('/agents/auto/stream', { client_id: clientId, site_url: siteUrl, topic, format, platform, objective: objective || '' }),
+  },
+  persona: {
+    get: (clientId: number) => get(`/persona/client/${clientId}`),
+    generate: (clientId: number) => post(`/persona/client/${clientId}/generate`, {}),
+  },
+  inspirations: {
+    list: (clientId: number) => get(`/inspirations/client/${clientId}`),
+    create: (data: { client_id: number; source_type: string; source_value: string; label?: string }) => post('/inspirations/', data),
+    remove: (id: number) => del(`/inspirations/${id}`),
+  },
+  products: {
+    list: (clientId: number) => get(`/products/client/${clientId}`),
+    create: (data: unknown) => post('/products/', data),
+    update: (id: number, data: unknown) => patch(`/products/${id}`, data),
+    remove: (id: number) => del(`/products/${id}`),
+  },
+  knowledge: {
+    list: (clientId: number) => get(`/knowledge/client/${clientId}`),
+    create: (data: { client_id: number; title: string; content: string; source_type?: string; tags?: string[] }) => post('/knowledge/', data),
+    remove: (id: number) => del(`/knowledge/${id}`),
+  },
+  strategy: {
+    weekly: (clientId: number) => get(`/strategy/weekly/${clientId}`),
+    regenerateWeekly: (clientId: number) => post(`/strategy/weekly/${clientId}/generate`, {}),
+    insights: (clientId: number) => get(`/strategy/insights/${clientId}`),
+    regenerateInsights: (clientId: number) => post(`/strategy/insights/${clientId}/generate`, {}),
+    dismissInsight: (insightId: number) => post(`/strategy/insights/${insightId}/dismiss`, {}),
   },
 }
