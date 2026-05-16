@@ -138,3 +138,58 @@ async def publish(account: SocialAccount, content: ContentPiece) -> str:
     if account.platform == "facebook":
         return await publish_facebook(account, content)
     raise PublishError(f"Unsupported platform: {account.platform}")
+
+
+# ---------------------------------------------------------------------------
+# Metrics ingestion
+# ---------------------------------------------------------------------------
+# Maps Meta insight metric names to our MetricsSnapshot columns.
+IG_METRIC_MAP = {
+    "impressions": "views",      # legacy but still returned for many accounts
+    "reach": "reach",
+    "likes": "likes",
+    "comments": "comments",
+    "saved": "saves",
+    "shares": "shares",
+    "video_views": "views",
+    "plays": "views",
+}
+
+
+async def fetch_insights(account: SocialAccount, external_post_id: str) -> dict:
+    """Pull engagement metrics for a published IG/FB post.
+
+    Returns a dict of normalized fields {views, likes, comments, shares, saves, reach}.
+    Missing metrics default to 0 — Meta omits metrics that aren't applicable for
+    a given media type. Errors raise PublishError so caller can decide.
+    """
+    if account.platform != "instagram":
+        # Facebook page post insights have a different shape — skip for now,
+        # leave normalized zeros so the snapshot still gets created.
+        return {}
+
+    # IG metric set varies by media type; ask for a superset and ignore omissions.
+    metric_names = ",".join(["reach", "likes", "comments", "saved", "shares", "video_views", "plays", "impressions"])
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            f"{GRAPH_API}/{external_post_id}/insights",
+            params={"metric": metric_names, "access_token": account.access_token},
+        )
+        if r.status_code >= 400:
+            raise PublishError(f"IG insights failed: {_extract_meta_error(r)}")
+        data = r.json().get("data") or []
+
+    normalized: dict[str, int] = {}
+    for item in data:
+        name = item.get("name")
+        values = item.get("values") or []
+        if not values:
+            continue
+        val = values[0].get("value", 0) or 0
+        if not isinstance(val, (int, float)):
+            continue
+        col = IG_METRIC_MAP.get(name)
+        if col and val > normalized.get(col, 0):
+            normalized[col] = int(val)
+
+    return normalized

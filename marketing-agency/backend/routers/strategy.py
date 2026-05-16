@@ -418,3 +418,48 @@ async def weekly_retrospective(client_id: int, current_user: User = Depends(get_
         "post_count": len(pieces),
         "period": "últimos 7 dias",
     }
+
+
+@router.get("/notifications/{client_id}")
+def notifications(client_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Lightweight aggregate of what needs the user's attention right now.
+
+    Returns counts + the top item per category so the frontend badge can render
+    a tooltip without a second request. Refreshes heuristics first so calendar
+    gaps and saturation alerts are always current.
+    """
+    assert_client_access(client_id, current_user, db)
+    try:
+        _refresh_heuristics(db, client_id)
+    except Exception:
+        pass
+
+    pending_count = db.query(ContentPiece).filter(
+        ContentPiece.client_id == client_id,
+        ContentPiece.status == "pending",
+    ).count()
+
+    insights = db.query(Insight).filter(
+        Insight.client_id == client_id,
+        Insight.is_dismissed == False,
+    ).order_by(Insight.created_at.desc()).all()
+    critical = [i for i in insights if i.severity == "critical"]
+    warning = [i for i in insights if i.severity == "warning"]
+
+    # Failed publishes still need user attention
+    failed_publish = db.query(ContentPiece).filter(
+        ContentPiece.client_id == client_id,
+        ContentPiece.publish_error.isnot(None),
+    ).count()
+
+    total = pending_count + len(critical) + len(warning) + failed_publish
+    top_critical = critical[0] if critical else None
+    top_warning = warning[0] if (not critical and warning) else None
+    return {
+        "total": total,
+        "pending_approvals": pending_count,
+        "critical": len(critical),
+        "warning": len(warning),
+        "failed_publish": failed_publish,
+        "top_alert": _serialize_insight(top_critical) if top_critical else (_serialize_insight(top_warning) if top_warning else None),
+    }

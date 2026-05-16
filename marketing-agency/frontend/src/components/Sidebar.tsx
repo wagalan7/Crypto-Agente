@@ -1,5 +1,6 @@
 import { NavLink, useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { NotificationBadge } from './NotificationBadge'
 
 const NAV = [
   { to: '', label: 'Dashboard', icon: '⬡' },
@@ -31,9 +32,12 @@ export function Sidebar({ clientName }: { clientName?: string }) {
       {/* Desktop sidebar */}
       <aside className="hidden md:flex w-52 shrink-0 border-r border-gray-800 flex-col min-h-screen bg-gray-950">
         <div className="px-4 py-5 border-b border-gray-800">
-          <div className="flex items-center gap-2 mb-1">
-            <div className="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center text-white font-bold text-xs">A</div>
-            <span className="text-sm font-bold text-white">ContentAI</span>
+          <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center gap-2">
+              <div className="w-7 h-7 rounded-lg bg-violet-600 flex items-center justify-center text-white font-bold text-xs">A</div>
+              <span className="text-sm font-bold text-white">ContentAI</span>
+            </div>
+            {clientId && <NotificationBadge clientId={Number(clientId)} />}
           </div>
           {clientName && <p className="text-xs text-gray-500 truncate mt-1">{clientName}</p>}
         </div>
@@ -73,9 +77,12 @@ export function Sidebar({ clientName }: { clientName?: string }) {
           <div className="w-6 h-6 rounded-md bg-violet-600 flex items-center justify-center text-white font-bold text-xs">A</div>
           <span className="text-sm font-semibold text-white truncate max-w-[180px]">{clientName || 'ContentAI'}</span>
         </div>
-        <button onClick={handleLogout} className="text-xs text-gray-400 border border-gray-700 rounded-md px-2 py-1">
-          Sair
-        </button>
+        <div className="flex items-center gap-2">
+          {clientId && <NotificationBadge clientId={Number(clientId)} />}
+          <button onClick={handleLogout} className="text-xs text-gray-400 border border-gray-700 rounded-md px-2 py-1">
+            Sair
+          </button>
+        </div>
       </header>
 
       {/* Mobile bottom nav */}

@@ -155,5 +155,6 @@ export const api = {
       post(`/strategy/sales-sequence/${clientId}`, data),
     profileAudit: (clientId: number) => post(`/strategy/profile-audit/${clientId}`, {}),
     retrospective: (clientId: number) => post(`/strategy/retrospective/${clientId}`, {}),
+    notifications: (clientId: number) => get(`/strategy/notifications/${clientId}`),
   },
 }

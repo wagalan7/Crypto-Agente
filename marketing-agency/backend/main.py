@@ -38,6 +38,18 @@ async def health():
 async def startup():
     init_db()
     _seed_users()
+    # Background jobs: auto-publish due slots + auto-fetch IG metrics.
+    # Safe to disable via DISABLE_SCHEDULER=1 (useful for local dev / tests).
+    if os.getenv("DISABLE_SCHEDULER") != "1":
+        from services.scheduler import start_scheduler
+        start_scheduler()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if os.getenv("DISABLE_SCHEDULER") != "1":
+        from services.scheduler import stop_scheduler
+        stop_scheduler()
 
 
 def _seed_users():
