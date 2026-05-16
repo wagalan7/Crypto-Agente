@@ -18,5 +18,5 @@ COPY backend/ .
 COPY --from=frontend-builder /app/frontend/dist ./static
 
 EXPOSE 8000
-ENV DATABASE_URL=sqlite:////data/content_agency.db
+# DATABASE_URL is injected by Railway (Postgres reference); falls back to SQLite for local dev
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
