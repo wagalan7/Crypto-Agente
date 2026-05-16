@@ -4,6 +4,7 @@ from .script import ScriptAgent
 from .trend import TrendAgent
 from .design import DesignAgent
 from .amplifier import AmplifierAgent
+from .auto_creator import AutoCreatorAgent, parse_json_response
 
 __all__ = [
     "StrategyAgent",
@@ -12,4 +13,6 @@ __all__ = [
     "TrendAgent",
     "DesignAgent",
     "AmplifierAgent",
+    "AutoCreatorAgent",
+    "parse_json_response",
 ]

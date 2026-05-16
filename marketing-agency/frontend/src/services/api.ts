@@ -107,5 +107,7 @@ export const api = {
     trend: (clientId: number, currentTrends: string) => streamAgent('/agents/trend/stream', { client_id: clientId, current_trends: currentTrends }),
     design: (clientId: number, topic: string, format: string, platform: string, references?: string) => streamAgent('/agents/design/stream', { client_id: clientId, content_topic: topic, format, platform, references }),
     amplifier: (clientId: number, rawIdea: string) => streamAgent('/agents/amplifier/stream', { client_id: clientId, raw_idea: rawIdea }),
+    auto: (clientId: number, siteUrl: string, topic: string, format: string, platform: string, objective: string) =>
+      streamAgent('/agents/auto/stream', { client_id: clientId, site_url: siteUrl, topic, format, platform, objective }),
   },
 }

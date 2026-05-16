@@ -11,9 +11,10 @@ const OBJECTIVE_LABELS: Record<string, string> = {
   sell: 'Vender', break_objection: 'Quebrar Objeção',
 }
 
-type AgentTab = 'strategy' | 'script' | 'trend' | 'design' | 'amplifier' | 'analytics'
+type AgentTab = 'auto' | 'strategy' | 'script' | 'trend' | 'design' | 'amplifier' | 'analytics'
 
 const TABS: { id: AgentTab; label: string; icon: string }[] = [
+  { id: 'auto', label: 'Auto-Criar', icon: '✦' },
   { id: 'strategy', label: 'Estratégia', icon: '◎' },
   { id: 'script', label: 'Roteiro', icon: '◈' },
   { id: 'trend', label: 'Trends', icon: '◉' },
@@ -26,7 +27,37 @@ export function AgentsPage() {
   const { clientId } = useParams<{ clientId: string }>()
   const id = Number(clientId)
   const navigate = useNavigate()
-  const [tab, setTab] = useState<AgentTab>('strategy')
+  const [tab, setTab] = useState<AgentTab>('auto')
+
+  const [autoForm, setAutoForm] = useState({ site_url: '', topic: '', format: 'post', platform: 'instagram', objective: 'attract' })
+  const [autoStatus, setAutoStatus] = useState('')
+  const [autoOutput, setAutoOutput] = useState('')
+  const [autoResult, setAutoResult] = useState<{ content_id: number; image_url: string; title: string } | null>(null)
+  const [autoRunning, setAutoRunning] = useState(false)
+
+  async function runAuto() {
+    setAutoRunning(true)
+    setAutoStatus('')
+    setAutoOutput('')
+    setAutoResult(null)
+    try {
+      const gen = api.agents.auto(id, autoForm.site_url, autoForm.topic, autoForm.format, autoForm.platform, autoForm.objective)
+      for await (const ev of gen) {
+        if (ev.type === 'status') setAutoStatus(ev.payload as string)
+        else if (ev.type === 'chunk') setAutoOutput(prev => prev + ev.payload)
+        else if (ev.type === 'error') setAutoStatus(`Erro: ${ev.payload}`)
+        else if (ev.type === 'done') {
+          const result = ev.payload as any
+          setAutoResult(result)
+          setAutoStatus('Pronto! Conteúdo criado e salvo.')
+        }
+      }
+    } catch (e: any) {
+      setAutoStatus(`Erro: ${e.message}`)
+    } finally {
+      setAutoRunning(false)
+    }
+  }
 
   async function saveContent(payload: {
     title: string; format: string; platform: string; objective: string;
@@ -63,6 +94,95 @@ export function AgentsPage() {
           </button>
         ))}
       </div>
+
+      {tab === 'auto' && (
+        <div className="card space-y-4">
+          <div>
+            <h2 className="text-sm font-semibold text-white">Auto-Criar Conteúdo</h2>
+            <p className="text-xs text-gray-400 mt-0.5">
+              Cole o link do seu site/produto. A IA lê, junta com o briefing do cliente, e cria
+              hook, roteiro, legenda, briefing visual <span className="text-violet-400">e a imagem</span> — tudo de uma vez.
+            </p>
+          </div>
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs text-gray-400 mb-1 block">URL do site / página de vendas (opcional)</label>
+              <input className="input-field" placeholder="https://meusite.com.br/produto"
+                value={autoForm.site_url} onChange={e => setAutoForm(p => ({ ...p, site_url: e.target.value }))} />
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 mb-1 block">Tema (opcional — IA escolhe se vazio)</label>
+              <input className="input-field" placeholder="Ex: lançamento da nova linha verão"
+                value={autoForm.topic} onChange={e => setAutoForm(p => ({ ...p, topic: e.target.value }))} />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs text-gray-400 mb-1 block">Formato</label>
+                <select className="input-field" value={autoForm.format}
+                  onChange={e => setAutoForm(p => ({ ...p, format: e.target.value }))}>
+                  {FORMATS.map(f => <option key={f} value={f}>{f}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-gray-400 mb-1 block">Plataforma</label>
+                <select className="input-field" value={autoForm.platform}
+                  onChange={e => setAutoForm(p => ({ ...p, platform: e.target.value }))}>
+                  {PLATFORMS.map(p => <option key={p} value={p}>{p}</option>)}
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 mb-1.5 block">Objetivo</label>
+              <div className="flex flex-wrap gap-1.5">
+                {OBJECTIVES.map(o => (
+                  <button key={o} onClick={() => setAutoForm(p => ({ ...p, objective: o }))}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
+                      autoForm.objective === o
+                        ? 'bg-violet-600/20 border-violet-500 text-violet-300'
+                        : 'bg-gray-800 border-gray-700 text-gray-400'
+                    }`}>
+                    {OBJECTIVE_LABELS[o]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between">
+            {autoStatus && (
+              <p className="text-xs text-gray-400 flex items-center gap-1.5">
+                {autoRunning && <span className="w-1.5 h-1.5 rounded-full bg-violet-400 animate-pulse" />}
+                {autoStatus}
+              </p>
+            )}
+            <button onClick={runAuto} disabled={autoRunning} className="btn-primary ml-auto">
+              {autoRunning ? 'Gerando...' : '✦ Gerar Conteúdo Completo'}
+            </button>
+          </div>
+
+          {autoOutput && (
+            <div className="card max-h-60 overflow-y-auto bg-gray-950">
+              <pre className="agent-output text-[11px]">{autoOutput}</pre>
+            </div>
+          )}
+
+          {autoResult && (
+            <div className="card bg-violet-900/10 border-violet-700/40 space-y-3">
+              <p className="text-xs text-violet-300 font-semibold">✓ Conteúdo criado e salvo</p>
+              <p className="text-sm text-white font-medium">{autoResult.title}</p>
+              <img src={autoResult.image_url} alt="" className="rounded-lg w-full max-w-sm" />
+              <div className="flex gap-2">
+                <button onClick={() => navigate(`/client/${clientId}/content`)} className="btn-primary text-xs flex-1">
+                  Ver na aba Conteúdo
+                </button>
+              </div>
+              <p className="text-[11px] text-gray-500">
+                A imagem é gerada pelo Pollinations.ai (URL pública). Já está pronta pra publicar no Instagram/Facebook.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
 
       {tab === 'strategy' && (
         <div className="card space-y-4">
