@@ -83,6 +83,8 @@ export const api = {
     update: (id: number, data: unknown) => patch(`/content/${id}`, data),
     approve: (id: number) => post(`/content/${id}/approve`, {}),
     regenerateBrief: (id: number) => post(`/content/${id}/regenerate-brief`, {}),
+    regenerateSection: (id: number, section: string, instruction?: string) =>
+      post(`/content/${id}/regenerate-section`, { section, instruction: instruction || null }),
   },
   calendar: {
     get: (clientId: number, days?: number) => get(`/calendar/client/${clientId}${days ? `?days=${days}` : ''}`),

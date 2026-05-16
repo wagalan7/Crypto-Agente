@@ -12,6 +12,7 @@ from .insight_generator import InsightGeneratorAgent
 from .sales_sequence import SalesSequenceAgent
 from .profile_analyzer import ProfileAnalyzerAgent
 from .production_briefing import ProductionBriefingAgent
+from .section_rewriter import SectionRewriterAgent
 
 __all__ = [
     "StrategyAgent", "AnalyticsAgent", "ScriptAgent", "TrendAgent",
@@ -20,5 +21,5 @@ __all__ = [
     "PersonaAgent", "InspirationAnalyzerAgent",
     "WeeklyBrainAgent", "InsightGeneratorAgent",
     "SalesSequenceAgent", "ProfileAnalyzerAgent",
-    "ProductionBriefingAgent",
+    "ProductionBriefingAgent", "SectionRewriterAgent",
 ]

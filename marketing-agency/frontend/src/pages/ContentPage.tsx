@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom'
 import { api } from '../services/api'
 import type { ContentPiece } from '../types'
 import { STATUS_LABELS, STATUS_COLORS, FORMAT_LABELS, OBJECTIVE_LABELS, OBJECTIVE_COLORS, FUNNEL_STAGE_LABELS } from '../types'
+import { SectionRegenButton } from '../components/SectionRegenButton'
 
 const STATUSES = ['pending', 'approved', 'recorded', 'published'] as const
 
@@ -108,13 +109,19 @@ export function ContentPage() {
 
           {selected.hook && (
             <div className="card">
-              <p className="text-xs text-violet-400 font-semibold mb-1">HOOK</p>
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-xs text-violet-400 font-semibold">HOOK</p>
+                <SectionRegenButton contentId={selected.id} section="hook" onUpdated={(u) => { setSelected(u); setContents(prev => prev.map(c => c.id === u.id ? u : c)) }} />
+              </div>
               <p className="text-sm text-gray-300">{selected.hook}</p>
             </div>
           )}
           {selected.script && (
             <div className="card">
-              <p className="text-xs text-violet-400 font-semibold mb-1">ROTEIRO</p>
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-xs text-violet-400 font-semibold">ROTEIRO</p>
+                <SectionRegenButton contentId={selected.id} section="script" onUpdated={(u) => { setSelected(u); setContents(prev => prev.map(c => c.id === u.id ? u : c)) }} />
+              </div>
               <div className="max-h-60 overflow-y-auto">
                 <p className="text-sm text-gray-300 whitespace-pre-wrap">{selected.script}</p>
               </div>
@@ -122,13 +129,19 @@ export function ContentPage() {
           )}
           {selected.copy && (
             <div className="card">
-              <p className="text-xs text-violet-400 font-semibold mb-1">COPY</p>
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-xs text-violet-400 font-semibold">COPY</p>
+                <SectionRegenButton contentId={selected.id} section="copy" onUpdated={(u) => { setSelected(u); setContents(prev => prev.map(c => c.id === u.id ? u : c)) }} />
+              </div>
               <p className="text-sm text-gray-300">{selected.copy}</p>
             </div>
           )}
           {selected.design_brief && (
             <div className="card">
-              <p className="text-xs text-violet-400 font-semibold mb-1">BRIEFING VISUAL</p>
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-xs text-violet-400 font-semibold">BRIEFING VISUAL</p>
+                <SectionRegenButton contentId={selected.id} section="design_brief" onUpdated={(u) => { setSelected(u); setContents(prev => prev.map(c => c.id === u.id ? u : c)) }} />
+              </div>
               <div className="max-h-48 overflow-y-auto">
                 <p className="text-sm text-gray-300 whitespace-pre-wrap">{selected.design_brief}</p>
               </div>

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import Insight, WeeklyBrain, User, Product, ContentPiece, CalendarSlot
 from auth import get_current_user, assert_client_access
-from services import BrandBrain, generate_image_url, aspect_for_format
+from services import BrandBrain, generate_image_url, aspect_for_format, compute_heuristic_insights
 from agents import (
     WeeklyBrainAgent, InsightGeneratorAgent, parse_json_response,
     SalesSequenceAgent, ProfileAnalyzerAgent,
@@ -82,9 +82,41 @@ async def regenerate_weekly(client_id: int, current_user: User = Depends(get_cur
     return _serialize_wb(wb)
 
 
+def _refresh_heuristics(db: Session, client_id: int) -> None:
+    """Re-run deterministic checks and persist as Insight rows.
+
+    Heuristic insights have kinds prefixed with saturation_/calendar_gap_/velocity_.
+    We dismiss the old ones with those prefixes and create fresh ones — keeps the
+    set current without polluting LLM-generated insights.
+    """
+    HEURISTIC_KINDS = ("saturation_emotion", "saturation_funnel", "saturation_format",
+                       "calendar_gap_urgent", "calendar_gap_soon", "velocity_drop")
+    db.query(Insight).filter(
+        Insight.client_id == client_id,
+        Insight.is_dismissed == False,
+        Insight.kind.in_(HEURISTIC_KINDS),
+    ).update({"is_dismissed": True}, synchronize_session=False)
+    for h in compute_heuristic_insights(db, client_id):
+        db.add(Insight(
+            client_id=client_id,
+            kind=h["kind"][:50],
+            title=h["title"][:300],
+            message=h["message"],
+            evidence=h.get("evidence", ""),
+            severity=h.get("severity", "info"),
+        ))
+    db.commit()
+
+
 @router.get("/insights/{client_id}")
 def list_insights(client_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     assert_client_access(client_id, current_user, db)
+    # Refresh heuristic insights on every read (cheap, deterministic) so calendar
+    # gaps and saturation alerts are always up-to-date without manual regen.
+    try:
+        _refresh_heuristics(db, client_id)
+    except Exception:
+        pass  # never break the read because of heuristic side effect
     items = db.query(Insight).filter(Insight.client_id == client_id, Insight.is_dismissed == False).order_by(Insight.created_at.desc()).limit(20).all()
     return [_serialize_insight(i) for i in items]
 
@@ -114,7 +146,14 @@ async def regenerate_insights(client_id: int, current_user: User = Depends(get_c
         db.add(i)
         created.append(i)
     db.commit()
-    return [_serialize_insight(i) for i in created]
+    # Append deterministic heuristics alongside LLM insights
+    try:
+        _refresh_heuristics(db, client_id)
+    except Exception:
+        pass
+    # Return ALL active insights (LLM + heuristic) so frontend sees everything
+    items = db.query(Insight).filter(Insight.client_id == client_id, Insight.is_dismissed == False).order_by(Insight.created_at.desc()).limit(20).all()
+    return [_serialize_insight(i) for i in items]
 
 
 class SalesSequenceRequest(BaseModel):

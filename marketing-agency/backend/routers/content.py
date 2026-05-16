@@ -7,8 +7,11 @@ from datetime import datetime
 from database import get_db
 from models import ContentPiece, User, Product, Client
 from auth import get_current_user, assert_client_access
-from agents import ProductionBriefingAgent
+from agents import ProductionBriefingAgent, SectionRewriterAgent
 from agents.production_briefing import parse_json_response as parse_brief_json
+from services import BrandBrain
+
+REGEN_SECTIONS = {"hook", "script", "copy", "design_brief"}
 
 router = APIRouter(prefix="/content", tags=["content"])
 
@@ -172,6 +175,47 @@ async def approve_content(content_id: int, current_user: User = Depends(get_curr
             # Never fail approve because of briefing — silent fallback
             pass
     db.commit()
+    return _serialize(c)
+
+
+class RegenerateSectionRequest(BaseModel):
+    section: str  # hook | script | copy | design_brief
+    instruction: Optional[str] = None  # optional steer ("mais vulnerável", "mais curto", etc)
+
+
+@router.post("/{content_id}/regenerate-section")
+async def regenerate_section(content_id: int, req: RegenerateSectionRequest,
+                              current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if req.section not in REGEN_SECTIONS:
+        raise HTTPException(400, f"Seção inválida. Use: {sorted(REGEN_SECTIONS)}")
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+
+    brain = BrandBrain(db).build(c.client_id)
+    agent = SectionRewriterAgent()
+    prompt = agent.build_prompt(
+        brand_brain_text=brain["text"],
+        section=req.section,
+        current_value=getattr(c, req.section) or "",
+        title=c.title or "",
+        format=c.format or "post",
+        platform=c.platform or "instagram",
+        objective=c.objective or "",
+        emotion=c.emotion_used or "",
+        instruction=req.instruction or "",
+    )
+    new_value = (await agent.run(prompt) or "").strip()
+    # Strip accidental code fences or leading labels
+    if new_value.startswith("```"):
+        lines = new_value.split("\n")
+        new_value = "\n".join(lines[1:-1] if len(lines) >= 2 else lines).strip()
+    if not new_value:
+        raise HTTPException(500, "IA retornou vazio")
+    setattr(c, req.section, new_value)
+    db.commit()
+    db.refresh(c)
     return _serialize(c)
 
 
