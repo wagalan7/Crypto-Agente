@@ -88,10 +88,12 @@ export const api = {
       post(`/content/${id}/regenerate-section`, { section, instruction: instruction || null }),
     hookVariations: (id: number, count?: number, instruction?: string) =>
       post(`/content/${id}/hook-variations`, { count: count || 3, instruction: instruction || null }),
-    selectHook: (id: number, hook: string) => post(`/content/${id}/select-hook`, { hook }),
+    selectHook: (id: number, hook: string, style?: string) => post(`/content/${id}/select-hook`, { hook, style: style || null }),
     bulkApprove: (ids: number[]) => post('/content/bulk/approve', { ids }),
     bulkDelete: (ids: number[]) => post('/content/bulk/delete', { ids }),
     inspirationAlignment: (id: number) => post(`/content/${id}/inspiration-alignment`, {}),
+    repurpose: (id: number, data: { target_format: string; target_platform: string; instruction?: string }) =>
+      post(`/content/${id}/repurpose`, data),
   },
   calendar: {
     get: (clientId: number, days?: number) => get(`/calendar/client/${clientId}${days ? `?days=${days}` : ''}`),
@@ -152,5 +154,6 @@ export const api = {
     salesSequence: (clientId: number, data: { product_id: number; launch_date: string; total_days: number; platform?: string; generate_images?: boolean }) =>
       post(`/strategy/sales-sequence/${clientId}`, data),
     profileAudit: (clientId: number) => post(`/strategy/profile-audit/${clientId}`, {}),
+    retrospective: (clientId: number) => post(`/strategy/retrospective/${clientId}`, {}),
   },
 }

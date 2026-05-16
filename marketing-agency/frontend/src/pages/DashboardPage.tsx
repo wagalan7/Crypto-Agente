@@ -24,6 +24,16 @@ export function DashboardPage() {
   const [slots, setSlots] = useState<CalendarSlot[]>([])
   const [summary, setSummary] = useState<MetricsSummary | null>(null)
   const [insights, setInsights] = useState<Insight[]>([])
+  const [retro, setRetro] = useState<{
+    headline: string
+    wins: string[]
+    losses: string[]
+    themes: string[]
+    next_week_priority: string
+    mood_score: number
+    post_count: number
+  } | null>(null)
+  const [retroBusy, setRetroBusy] = useState(false)
 
   useEffect(() => {
     api.clients.get(id).then((c: any) => setClient(c))
@@ -35,6 +45,16 @@ export function DashboardPage() {
   async function refreshScore() {
     const res: any = await api.clients.refreshScore(id)
     setClient(prev => prev ? { ...prev, authority_score: res.authority_score } : prev)
+  }
+
+  async function generateRetro() {
+    setRetroBusy(true)
+    try {
+      const r: any = await api.strategy.retrospective(id)
+      setRetro(r)
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    } finally { setRetroBusy(false) }
   }
 
   if (!client) return <div className="p-6 text-gray-400 text-sm">Carregando...</div>
@@ -70,6 +90,57 @@ export function DashboardPage() {
             sub={summary ? `${summary.content_count} conteúdos` : undefined}
           />
         </div>
+      </div>
+
+      {/* Weekly retrospective */}
+      <div className="card bg-teal-900/10 border-teal-800/50">
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-sm font-semibold text-white">Revisão semanal</h2>
+          <button onClick={generateRetro} disabled={retroBusy} className="text-xs text-teal-400 hover:text-teal-300 disabled:opacity-50">
+            {retroBusy ? 'Gerando...' : retro ? '↻ Atualizar' : '✦ Gerar'}
+          </button>
+        </div>
+        {!retro && !retroBusy && (
+          <p className="text-xs text-gray-500">Recap dos últimos 7 dias com acertos, falhas e a prioridade da próxima semana.</p>
+        )}
+        {retro && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-3">
+              <div className={`text-3xl font-bold ${retro.mood_score >= 70 ? 'text-green-400' : retro.mood_score >= 40 ? 'text-yellow-400' : 'text-red-400'}`}>
+                {retro.mood_score}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs text-teal-300">{retro.headline}</p>
+                <p className="text-[10px] text-gray-500">{retro.post_count} peças nos últimos 7 dias</p>
+              </div>
+            </div>
+            {retro.themes.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {retro.themes.map((t, i) => <span key={i} className="text-[10px] px-1.5 py-0.5 rounded bg-teal-900/40 text-teal-200 border border-teal-800/50">{t}</span>)}
+              </div>
+            )}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              {retro.wins.length > 0 && (
+                <div>
+                  <p className="text-[10px] text-green-400 font-semibold mb-0.5">✓ FUNCIONOU</p>
+                  <ul className="text-xs text-gray-300 space-y-0.5">{retro.wins.map((w, i) => <li key={i}>· {w}</li>)}</ul>
+                </div>
+              )}
+              {retro.losses.length > 0 && (
+                <div>
+                  <p className="text-[10px] text-red-400 font-semibold mb-0.5">✗ FALHOU</p>
+                  <ul className="text-xs text-gray-300 space-y-0.5">{retro.losses.map((l, i) => <li key={i}>· {l}</li>)}</ul>
+                </div>
+              )}
+            </div>
+            {retro.next_week_priority && (
+              <div className="bg-teal-950/40 border border-teal-800/50 rounded p-2">
+                <p className="text-[10px] text-teal-300 font-semibold mb-0.5">PRIORIDADE PRÓXIMA SEMANA</p>
+                <p className="text-xs text-gray-200">{retro.next_week_priority}</p>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Insights inteligentes */}

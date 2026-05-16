@@ -6,11 +6,12 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 from database import get_db
-from models import ContentPiece, User, Product, Client, Inspiration
+from models import ContentPiece, User, Product, Client, Inspiration, AgentMemory
 from auth import get_current_user, assert_client_access
-from agents import ProductionBriefingAgent, SectionRewriterAgent, InspirationAlignmentAgent
+from agents import ProductionBriefingAgent, SectionRewriterAgent, InspirationAlignmentAgent, RepurposeAgent
 from agents.production_briefing import parse_json_response as parse_brief_json
 from agents.inspiration_alignment import parse_json_response as parse_align_json
+from agents.repurpose import parse_json_response as parse_repurpose_json
 from services import BrandBrain
 
 REGEN_SECTIONS = {"hook", "script", "copy", "design_brief"}
@@ -285,6 +286,7 @@ async def generate_hook_variations(content_id: int, req: HookVariationsRequest,
 
 class SelectHookRequest(BaseModel):
     hook: str
+    style: Optional[str] = None  # which A/B variation style won (logged for learning)
 
 
 @router.post("/{content_id}/select-hook")
@@ -297,6 +299,16 @@ def select_hook(content_id: int, req: SelectHookRequest,
     if not (req.hook or "").strip():
         raise HTTPException(400, "Hook vazio")
     c.hook = req.hook.strip()
+    # Learning loop: register which style the user picked so BrandBrain can
+    # surface "hook patterns that won" to future generators.
+    if req.style:
+        db.add(AgentMemory(
+            client_id=c.client_id,
+            agent_type="hook_style_winner",
+            memory_key=req.style.strip()[:200],
+            memory_value=c.hook[:500],
+            is_active=True,
+        ))
     db.commit()
     db.refresh(c)
     return _serialize(c)
@@ -378,6 +390,80 @@ def bulk_delete(req: BulkDeleteRequest,
             continue
     db.commit()
     return {"deleted": n}
+
+
+class RepurposeRequest(BaseModel):
+    target_format: str
+    target_platform: str
+    instruction: Optional[str] = None
+
+
+@router.post("/{content_id}/repurpose")
+async def repurpose_content(content_id: int, req: RepurposeRequest,
+                             current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Generate a NEW ContentPiece adapted to a different format/platform.
+
+    Inherits strategic core (objective, funnel_stage, emotion, linked product)
+    but rewrites hook/script/copy/design_brief in the language of the target.
+    Returns the freshly created piece.
+    """
+    src = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not src:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(src.client_id, current_user, db)
+
+    tgt_fmt = (req.target_format or "").strip().lower()
+    tgt_plat = (req.target_platform or "").strip().lower()
+    if not tgt_fmt or not tgt_plat:
+        raise HTTPException(400, "target_format e target_platform são obrigatórios")
+    if tgt_fmt == (src.format or "").lower() and tgt_plat == (src.platform or "").lower():
+        raise HTTPException(400, "Destino igual à origem — nada pra adaptar")
+
+    brain = BrandBrain(db).build(src.client_id)
+    agent = RepurposeAgent()
+    prompt = agent.build_prompt(
+        brand_brain_text=brain["text"],
+        source_title=src.title or "",
+        source_format=src.format or "post",
+        source_platform=src.platform or "instagram",
+        source_hook=src.hook or "",
+        source_script=src.script or "",
+        source_copy=src.copy or "",
+        source_design_brief=src.design_brief or "",
+        source_emotion=src.emotion_used or "",
+        source_funnel=src.funnel_stage or "",
+        source_objective=src.objective or "",
+        target_format=tgt_fmt,
+        target_platform=tgt_plat,
+        instruction=req.instruction or "",
+    )
+    raw = await agent.run(prompt)
+    data = parse_repurpose_json(raw)
+    if not data or not data.get("hook"):
+        raise HTTPException(500, "IA não retornou adaptação válida")
+
+    new_piece = ContentPiece(
+        client_id=src.client_id,
+        title=data.get("title") or src.title,
+        format=tgt_fmt,
+        platform=tgt_plat,
+        objective=src.objective,
+        hook=data.get("hook"),
+        script=data.get("script"),
+        copy=data.get("copy"),
+        design_brief=data.get("design_brief"),
+        emotion_used=src.emotion_used,
+        funnel_stage=src.funnel_stage,
+        objective_reasoning=src.objective_reasoning,
+        format_reasoning=data.get("adaptation_notes") or f"Adaptado de '{src.title}' ({src.format}/{src.platform})",
+        strategic_note=f"♻ Reaproveitamento de #{src.id}. {data.get('adaptation_notes') or ''}".strip(),
+        linked_product_id=src.linked_product_id,
+        status="pending",
+    )
+    db.add(new_piece)
+    db.commit()
+    db.refresh(new_piece)
+    return _serialize(new_piece)
 
 
 @router.post("/{content_id}/inspiration-alignment")

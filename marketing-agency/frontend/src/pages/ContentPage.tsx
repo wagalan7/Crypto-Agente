@@ -21,6 +21,11 @@ export function ContentPage() {
   const [bulkBusy, setBulkBusy] = useState(false)
   const [hookVarLoading, setHookVarLoading] = useState(false)
   const [hookVariations, setHookVariations] = useState<Array<{ style: string; hook: string }> | null>(null)
+  const [remixOpen, setRemixOpen] = useState(false)
+  const [remixFmt, setRemixFmt] = useState('carousel')
+  const [remixPlat, setRemixPlat] = useState('instagram')
+  const [remixInstr, setRemixInstr] = useState('')
+  const [remixBusy, setRemixBusy] = useState(false)
   const [alignLoading, setAlignLoading] = useState(false)
   const [alignResult, setAlignResult] = useState<{
     best_match: string | null
@@ -130,12 +135,31 @@ export function ContentPage() {
     } finally { setHookVarLoading(false) }
   }
 
-  async function selectHookVariation(hook: string) {
+  async function selectHookVariation(hook: string, style?: string) {
     if (!selected) return
-    const updated: any = await api.content.selectHook(selected.id, hook)
+    const updated: any = await api.content.selectHook(selected.id, hook, style)
     setContents(prev => prev.map(c => c.id === selected.id ? updated : c))
     setSelected(updated)
     setHookVariations(null)
+  }
+
+  async function runRemix() {
+    if (!selected) return
+    setRemixBusy(true)
+    try {
+      const created: any = await api.content.repurpose(selected.id, {
+        target_format: remixFmt,
+        target_platform: remixPlat,
+        instruction: remixInstr || undefined,
+      })
+      await load()
+      setRemixOpen(false)
+      setRemixInstr('')
+      setSelected(created)
+      alert('✓ Nova peça criada — você está vendo a adaptação')
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    } finally { setRemixBusy(false) }
   }
 
   async function runInspirationAlignment() {
@@ -216,7 +240,7 @@ export function ContentPage() {
                         <p className="text-[10px] text-fuchsia-300/80 mb-0.5">{v.style}</p>
                         <p className="text-xs text-gray-200">{v.hook}</p>
                       </div>
-                      <button onClick={() => selectHookVariation(v.hook)} className="text-[10px] px-2 py-1 rounded bg-fuchsia-700 hover:bg-fuchsia-600 text-white shrink-0">
+                      <button onClick={() => selectHookVariation(v.hook, v.style)} className="text-[10px] px-2 py-1 rounded bg-fuchsia-700 hover:bg-fuchsia-600 text-white shrink-0">
                         Usar
                       </button>
                     </div>
@@ -257,6 +281,53 @@ export function ContentPage() {
               </div>
             </div>
           )}
+          {/* Repurpose / Remix */}
+          <div className="card bg-amber-900/10 border-amber-800/50 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-amber-300 font-semibold">♻ REAPROVEITAR EM OUTRO FORMATO</p>
+              <button onClick={() => setRemixOpen(o => !o)} className="text-[10px] text-amber-400 hover:text-amber-300">
+                {remixOpen ? '× Fechar' : 'Abrir →'}
+              </button>
+            </div>
+            {!remixOpen && (
+              <p className="text-[11px] text-gray-500">Transforma esse post numa adaptação pra outro formato/plataforma sem perder o ângulo estratégico.</p>
+            )}
+            {remixOpen && (
+              <div className="space-y-2">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[10px] text-amber-400 font-semibold">FORMATO ALVO</label>
+                    <select value={remixFmt} onChange={e => setRemixFmt(e.target.value)} className="input text-sm w-full">
+                      <option value="reel">Reel/Short</option>
+                      <option value="carousel">Carrossel</option>
+                      <option value="post">Post estático</option>
+                      <option value="story">Story</option>
+                      <option value="long_video">Vídeo longo (YouTube)</option>
+                      <option value="thread">Thread</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-amber-400 font-semibold">PLATAFORMA ALVO</label>
+                    <select value={remixPlat} onChange={e => setRemixPlat(e.target.value)} className="input text-sm w-full">
+                      <option value="instagram">Instagram</option>
+                      <option value="tiktok">TikTok</option>
+                      <option value="youtube">YouTube</option>
+                      <option value="linkedin">LinkedIn</option>
+                      <option value="twitter">Twitter/X</option>
+                    </select>
+                  </div>
+                </div>
+                <input value={remixInstr} onChange={e => setRemixInstr(e.target.value)}
+                  placeholder="Instrução opcional: 'mais técnico', 'tom analítico'..."
+                  className="input text-sm w-full" />
+                <button onClick={runRemix} disabled={remixBusy}
+                  className="btn-primary text-xs w-full py-2 bg-amber-700 hover:bg-amber-600">
+                  {remixBusy ? 'Adaptando...' : '♻ Gerar adaptação'}
+                </button>
+              </div>
+            )}
+          </div>
+
           {/* Inspiration alignment */}
           <div className="card bg-purple-900/10 border-purple-800/50 space-y-2">
             <div className="flex items-center justify-between gap-2">

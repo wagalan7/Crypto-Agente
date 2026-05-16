@@ -5,13 +5,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Insight, WeeklyBrain, User, Product, ContentPiece, CalendarSlot
+from models import Insight, WeeklyBrain, User, Product, ContentPiece, CalendarSlot, MetricsSnapshot
 from auth import get_current_user, assert_client_access
 from services import BrandBrain, generate_image_url, aspect_for_format, compute_heuristic_insights
 from agents import (
     WeeklyBrainAgent, InsightGeneratorAgent, parse_json_response,
-    SalesSequenceAgent, ProfileAnalyzerAgent,
+    SalesSequenceAgent, ProfileAnalyzerAgent, WeeklyRetroAgent,
 )
+from agents.weekly_retro import parse_json_response as parse_retro_json
 
 router = APIRouter(prefix="/strategy", tags=["strategy"])
 
@@ -357,3 +358,63 @@ def dismiss_insight(insight_id: int, current_user: User = Depends(get_current_us
     i.is_dismissed = True
     db.commit()
     return _serialize_insight(i)
+
+
+@router.post("/retrospective/{client_id}")
+async def weekly_retrospective(client_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """End-of-week recap: wins, losses, themes, next-week priority.
+
+    Reads everything created OR published in the last 7 days plus any metrics
+    snapshots attached, feeds the LLM and returns a short verdict.
+    """
+    assert_client_access(client_id, current_user, db)
+    cutoff = datetime.utcnow() - timedelta(days=7)
+    pieces = db.query(ContentPiece).filter(
+        ContentPiece.client_id == client_id,
+        ContentPiece.created_at >= cutoff,
+    ).order_by(ContentPiece.created_at.desc()).all()
+
+    # Attach metrics by content_id (best-effort)
+    metrics_by_cid: dict[int, dict] = {}
+    if pieces:
+        ids = [p.id for p in pieces]
+        for m in db.query(MetricsSnapshot).filter(MetricsSnapshot.content_id.in_(ids)).all():
+            cur = metrics_by_cid.setdefault(m.content_id, {"views": 0, "shares": 0, "saves": 0, "comments": 0})
+            cur["views"] += m.views or 0
+            cur["shares"] += m.shares or 0
+            cur["saves"] += m.saves or 0
+            cur["comments"] += m.comments or 0
+
+    serialized_posts = [{
+        "title": p.title,
+        "format": p.format,
+        "platform": p.platform,
+        "funnel_stage": p.funnel_stage,
+        "emotion_used": p.emotion_used,
+        "status": p.status,
+        "metrics": metrics_by_cid.get(p.id),
+    } for p in pieces]
+
+    brain = BrandBrain(db).build(client_id)
+    agent = WeeklyRetroAgent()
+    prompt = agent.build_prompt(brand_brain_text=brain["text"], posts=serialized_posts)
+    raw = await agent.run(prompt)
+    result = parse_retro_json(raw)
+    if not result:
+        raise HTTPException(500, "IA não retornou retrospectiva válida")
+
+    score = result.get("mood_score") or 0
+    try:
+        score = max(0, min(100, int(score)))
+    except Exception:
+        score = 0
+    return {
+        "headline": result.get("headline") or "",
+        "wins": result.get("wins") or [],
+        "losses": result.get("losses") or [],
+        "themes": result.get("themes") or [],
+        "next_week_priority": result.get("next_week_priority") or "",
+        "mood_score": score,
+        "post_count": len(pieces),
+        "period": "últimos 7 dias",
+    }

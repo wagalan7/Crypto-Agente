@@ -8,9 +8,10 @@ calls BrandBrain.build(client_id) instead of stitching context manually.
 This is what makes outputs feel intelligent — every decision sees the whole.
 """
 from sqlalchemy.orm import Session
+from collections import Counter
 from models import (
     Client, Persona, Product, KnowledgeItem, Insight, WeeklyBrain,
-    ContentPiece, MetricsSnapshot,
+    ContentPiece, MetricsSnapshot, AgentMemory,
 )
 
 
@@ -83,6 +84,11 @@ class BrandBrain:
         if winners:
             sections.append("PADRÕES VENCEDORES (últimos posts performáticos):\n" + winners)
 
+        # --- Winning hook styles (A/B feedback loop)
+        hook_block = self._winning_hook_styles(client_id)
+        if hook_block:
+            sections.append(hook_block)
+
         text = "\n\n".join(sections)
         return {
             "text": text,
@@ -141,6 +147,35 @@ class BrandBrain:
             f"  Oportunidades: {', '.join(wb.opportunities or [])}",
             f"  Alertas: {', '.join(wb.alerts or [])}",
         ])
+
+    def _winning_hook_styles(self, client_id: int) -> str:
+        """Closed-loop learning: when the user picks a hook from A/B variations,
+        we log the chosen style. Here we count picks per style across the last
+        30 selections and tell the IA which angles the brand consistently prefers.
+        """
+        memos = self.db.query(AgentMemory).filter(
+            AgentMemory.client_id == client_id,
+            AgentMemory.agent_type == "hook_style_winner",
+            AgentMemory.is_active == True,
+        ).order_by(AgentMemory.created_at.desc()).limit(30).all()
+        if len(memos) < 2:
+            return ""
+        style_counts = Counter(m.memory_key for m in memos if m.memory_key)
+        if not style_counts:
+            return ""
+        top = style_counts.most_common(3)
+        # Sample winning hooks for the top style (gives the IA concrete examples)
+        top_style = top[0][0]
+        examples = [m.memory_value for m in memos if m.memory_key == top_style and m.memory_value][:2]
+        lines = ["PADRÕES DE HOOK QUE A MARCA ESCOLHEU (feedback A/B):"]
+        for style, n in top:
+            lines.append(f"  - '{style}' venceu {n}x")
+        if examples:
+            lines.append("  EXEMPLOS do estilo dominante:")
+            for ex in examples:
+                lines.append(f"    • {ex[:140]}")
+        lines.append("  → Ao gerar hooks novos, priorize esses ângulos.")
+        return "\n".join(lines)
 
     def _winning_patterns(self, client_id: int) -> str:
         """Surface BOTH winners and losers so IA can replicate + avoid.

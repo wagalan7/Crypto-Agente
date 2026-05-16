@@ -14,6 +14,8 @@ from .profile_analyzer import ProfileAnalyzerAgent
 from .production_briefing import ProductionBriefingAgent
 from .section_rewriter import SectionRewriterAgent
 from .inspiration_alignment import InspirationAlignmentAgent
+from .repurpose import RepurposeAgent
+from .weekly_retro import WeeklyRetroAgent
 
 __all__ = [
     "StrategyAgent", "AnalyticsAgent", "ScriptAgent", "TrendAgent",
@@ -23,5 +25,5 @@ __all__ = [
     "WeeklyBrainAgent", "InsightGeneratorAgent",
     "SalesSequenceAgent", "ProfileAnalyzerAgent",
     "ProductionBriefingAgent", "SectionRewriterAgent",
-    "InspirationAlignmentAgent",
+    "InspirationAlignmentAgent", "RepurposeAgent", "WeeklyRetroAgent",
 ]
