@@ -31,3 +31,37 @@ def get_db():
 def init_db():
     from models import db_models  # noqa: F401
     Base.metadata.create_all(bind=engine)
+    _run_lightweight_migrations()
+
+
+def _run_lightweight_migrations():
+    """Add new columns to existing tables when upgrading schema.
+
+    SQLAlchemy create_all only creates new tables — it never ALTERs.
+    We use IF NOT EXISTS (Postgres 9.6+) so it's safe to run every startup.
+    SQLite doesn't support IF NOT EXISTS on ADD COLUMN, so we check pragma.
+    """
+    from sqlalchemy import text, inspect
+
+    is_sqlite = DATABASE_URL.startswith("sqlite")
+    inspector = inspect(engine)
+
+    # ContentPiece new columns (strategic reasoning)
+    content_columns = {
+        "objective_reasoning": "TEXT",
+        "emotion_used": "VARCHAR(100)",
+        "funnel_stage": "VARCHAR(50)",
+        "format_reasoning": "TEXT",
+        "linked_product_id": "INTEGER",
+    }
+
+    if "content_pieces" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("content_pieces")}
+        with engine.begin() as conn:
+            for col, coltype in content_columns.items():
+                if col in existing:
+                    continue
+                if is_sqlite:
+                    conn.execute(text(f"ALTER TABLE content_pieces ADD COLUMN {col} {coltype}"))
+                else:
+                    conn.execute(text(f"ALTER TABLE content_pieces ADD COLUMN IF NOT EXISTS {col} {coltype}"))
