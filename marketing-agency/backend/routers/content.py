@@ -8,10 +8,11 @@ from datetime import datetime
 from database import get_db
 from models import ContentPiece, User, Product, Client, Inspiration, AgentMemory
 from auth import get_current_user, assert_client_access
-from agents import ProductionBriefingAgent, SectionRewriterAgent, InspirationAlignmentAgent, RepurposeAgent
+from agents import ProductionBriefingAgent, SectionRewriterAgent, InspirationAlignmentAgent, RepurposeAgent, VoiceScorerAgent
 from agents.production_briefing import parse_json_response as parse_brief_json
 from agents.inspiration_alignment import parse_json_response as parse_align_json
 from agents.repurpose import parse_json_response as parse_repurpose_json
+from agents.voice_scorer import parse_json_response as parse_voice_json
 from services import BrandBrain
 
 REGEN_SECTIONS = {"hook", "script", "copy", "design_brief"}
@@ -81,6 +82,8 @@ def _serialize(c: ContentPiece, product_name: Optional[str] = None) -> dict:
         "external_post_id": c.external_post_id,
         "publish_error": c.publish_error,
         "production_brief": json.loads(c.production_brief) if c.production_brief else None,
+        "voice_score": c.voice_score,
+        "voice_feedback": json.loads(c.voice_feedback) if c.voice_feedback else None,
         "scheduled_at": c.scheduled_at.isoformat() if c.scheduled_at else None,
         "published_at": c.published_at.isoformat() if c.published_at else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -390,6 +393,48 @@ def bulk_delete(req: BulkDeleteRequest,
             continue
     db.commit()
     return {"deleted": n}
+
+
+@router.post("/{content_id}/voice-score")
+async def voice_score(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Score how on-brand the piece sounds (0-100) and persist on the row.
+
+    Cheap call — used both on-demand from the UI and as a quality gate after
+    auto-generation. Returns the full updated piece so the frontend re-renders.
+    """
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+    client = db.query(Client).filter(Client.id == c.client_id).first()
+
+    agent = VoiceScorerAgent()
+    prompt = agent.build_prompt(
+        tone=(client.tone if client else "") or "",
+        personality=(client.personality if client else "") or "",
+        positioning=(client.positioning if client else "") or "",
+        hook=c.hook or "",
+        script=c.script or "",
+        copy=c.copy or "",
+    )
+    raw = await agent.run(prompt)
+    data = parse_voice_json(raw)
+    if not data:
+        raise HTTPException(500, "IA não retornou pontuação válida")
+    try:
+        score = max(0, min(100, int(data.get("score") or 0)))
+    except Exception:
+        score = 0
+    feedback = {
+        "verdict": data.get("verdict") or "",
+        "weakest_part": data.get("weakest_part"),
+        "fix_hint": data.get("fix_hint") or "",
+    }
+    c.voice_score = score
+    c.voice_feedback = json.dumps(feedback, ensure_ascii=False)
+    db.commit()
+    db.refresh(c)
+    return _serialize(c)
 
 
 class RepurposeRequest(BaseModel):

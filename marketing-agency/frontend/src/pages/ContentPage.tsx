@@ -21,6 +21,7 @@ export function ContentPage() {
   const [bulkBusy, setBulkBusy] = useState(false)
   const [hookVarLoading, setHookVarLoading] = useState(false)
   const [hookVariations, setHookVariations] = useState<Array<{ style: string; hook: string }> | null>(null)
+  const [voiceBusy, setVoiceBusy] = useState(false)
   const [remixOpen, setRemixOpen] = useState(false)
   const [remixFmt, setRemixFmt] = useState('carousel')
   const [remixPlat, setRemixPlat] = useState('instagram')
@@ -176,6 +177,18 @@ export function ContentPage() {
 
   // Clear alignment when switching pieces
   useEffect(() => { setAlignResult(null) }, [selected?.id])
+
+  async function runVoiceScore() {
+    if (!selected) return
+    setVoiceBusy(true)
+    try {
+      const updated: any = await api.content.voiceScore(selected.id)
+      setContents(prev => prev.map(c => c.id === updated.id ? updated : c))
+      setSelected(updated)
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    } finally { setVoiceBusy(false) }
+  }
 
   async function publishNow() {
     if (!selected) return
@@ -373,6 +386,47 @@ export function ContentPage() {
                   <div className="bg-purple-950/30 border border-purple-800/40 rounded p-2">
                     <p className="text-[10px] text-purple-300 font-semibold mb-0.5">SUGESTÃO DE AJUSTE</p>
                     <p className="text-xs text-gray-200">{alignResult.adjustment_suggestion}</p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Voice consistency scorer */}
+          <div className="card bg-cyan-900/10 border-cyan-800/50 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-cyan-300 font-semibold">🎙 CONSISTÊNCIA DE VOZ</p>
+              <button onClick={runVoiceScore} disabled={voiceBusy}
+                className="text-[10px] text-cyan-400 hover:text-cyan-300 disabled:opacity-50">
+                {voiceBusy ? 'Avaliando...' : selected.voice_score != null ? '↻ Re-avaliar' : '✦ Avaliar'}
+              </button>
+            </div>
+            {selected.voice_score == null && !voiceBusy && (
+              <p className="text-[11px] text-gray-500">Pontua de 0 a 100 o quanto esse post soa como a marca (tom, personalidade, posicionamento).</p>
+            )}
+            {selected.voice_score != null && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <div className={`text-2xl font-bold ${
+                    selected.voice_score >= 70 ? 'text-green-400'
+                    : selected.voice_score >= 40 ? 'text-yellow-400'
+                    : 'text-red-400'
+                  }`}>{selected.voice_score}</div>
+                  <div className="text-[10px] text-gray-400">
+                    <p>/ 100 on-brand</p>
+                    {selected.voice_feedback?.verdict && <p className="text-cyan-300">{selected.voice_feedback.verdict}</p>}
+                  </div>
+                </div>
+                {selected.voice_feedback?.weakest_part && (
+                  <div>
+                    <p className="text-[10px] text-orange-400 font-semibold">PONTO MAIS FRACO</p>
+                    <p className="text-xs text-gray-300">{selected.voice_feedback.weakest_part}</p>
+                  </div>
+                )}
+                {selected.voice_feedback?.fix_hint && (
+                  <div className="bg-cyan-950/30 border border-cyan-800/40 rounded p-2">
+                    <p className="text-[10px] text-cyan-300 font-semibold mb-0.5">COMO AJUSTAR</p>
+                    <p className="text-xs text-gray-200">{selected.voice_feedback.fix_hint}</p>
                   </div>
                 )}
               </div>

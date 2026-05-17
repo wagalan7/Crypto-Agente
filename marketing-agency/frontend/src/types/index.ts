@@ -39,6 +39,8 @@ export interface ContentPiece {
   linked_product_id?: number | null
   linked_product_name?: string | null
   production_brief?: ProductionBrief | null
+  voice_score?: number | null
+  voice_feedback?: { verdict: string; weakest_part: string | null; fix_hint: string } | null
 }
 
 export interface ProductionBrief {

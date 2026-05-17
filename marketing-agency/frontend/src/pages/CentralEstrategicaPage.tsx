@@ -59,6 +59,27 @@ export function CentralEstrategicaPage() {
   const [err, setErr] = useState('')
   const [regenAllLoading, setRegenAllLoading] = useState(false)
   const [regenAllMsg, setRegenAllMsg] = useState<string | null>(null)
+  const [trends, setTrends] = useState<Array<{ id: number; subreddit: string | null; title: string; url: string | null; score: number; num_comments: number; locale: string | null; discovered_at: string | null }>>([])
+  const [trendsLoading, setTrendsLoading] = useState(false)
+
+  async function loadTrends() {
+    try {
+      const r: any = await api.trends.list(15, 'pt-BR')
+      setTrends(r)
+    } catch { /* ignore */ }
+  }
+
+  async function refreshTrends() {
+    setTrendsLoading(true)
+    try {
+      await api.trends.refresh()
+      await loadTrends()
+    } catch (e: any) {
+      setErr(e.message || 'Erro nas tendências')
+    } finally { setTrendsLoading(false) }
+  }
+
+  useEffect(() => { loadTrends() }, [])
 
   async function regenerateAll() {
     setRegenAllLoading(true); setErr(''); setRegenAllMsg(null)
@@ -291,6 +312,45 @@ export function CentralEstrategicaPage() {
             )}
           </div>
         ) : null}
+      </section>
+
+      {/* Trending topics — auto-discovered */}
+      <section className="card bg-pink-900/10 border-pink-800/50">
+        <div className="flex items-center justify-between mb-2">
+          <div>
+            <h2 className="text-sm font-semibold text-white">🔥 Tendências em alta</h2>
+            <p className="text-[11px] text-gray-500">Tópicos quentes do Reddit (Brasil) — clique para abrir e usar como inspiração.</p>
+          </div>
+          <button onClick={refreshTrends} disabled={trendsLoading}
+            className="text-xs text-pink-400 hover:text-pink-300 disabled:opacity-50">
+            {trendsLoading ? 'Buscando...' : '↻ Atualizar'}
+          </button>
+        </div>
+        {trends.length === 0 ? (
+          <p className="text-xs text-gray-500">Nenhuma tendência indexada ainda. Clique em "Atualizar" para buscar.</p>
+        ) : (
+          <ul className="space-y-1.5">
+            {trends.map(t => (
+              <li key={t.id} className="flex items-start gap-2 text-xs">
+                <span className="text-[10px] text-pink-300 shrink-0 mt-0.5">{t.score >= 1000 ? `${(t.score / 1000).toFixed(1)}k` : t.score}↑</span>
+                <div className="flex-1 min-w-0">
+                  {t.url ? (
+                    <a href={t.url} target="_blank" rel="noreferrer" className="text-gray-200 hover:text-pink-300 line-clamp-2">{t.title}</a>
+                  ) : (
+                    <span className="text-gray-200">{t.title}</span>
+                  )}
+                  <p className="text-[10px] text-gray-500">r/{t.subreddit} · {t.num_comments} comentários</p>
+                </div>
+                <button
+                  onClick={() => navigate(`/client/${clientId}/agents?tab=auto&topic=${encodeURIComponent(t.title)}`)}
+                  className="text-[10px] text-pink-400 hover:text-pink-200 shrink-0"
+                  title="Usar como tema">
+                  ↗ usar
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
     </div>
   )

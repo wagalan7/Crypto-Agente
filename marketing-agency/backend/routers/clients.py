@@ -7,6 +7,9 @@ from datetime import datetime, timedelta
 from models import User, Client, ClientAccess, AuthorityScoreSnapshot
 from auth import get_current_user, assert_client_access
 from services import AuthorityScorer
+from services.pdf_report import generate_monthly_report
+from fastapi.responses import StreamingResponse
+import io
 
 router = APIRouter(prefix="/clients", tags=["clients"])
 
@@ -113,3 +116,29 @@ def score_history(client_id: int, days: int = 30,
         .all()
     )
     return [{"score": r.score, "recorded_at": r.recorded_at.isoformat()} for r in rows]
+
+
+@router.get("/{client_id}/monthly-report.pdf")
+def monthly_report(client_id: int, month: Optional[str] = None,
+                   current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Generate a PDF monthly performance report. `month` is YYYY-MM (defaults to current month)."""
+    assert_client_access(client_id, current_user, db)
+    now = datetime.utcnow()
+    year, mon = now.year, now.month
+    if month:
+        try:
+            year, mon = map(int, month.split("-"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="month deve estar no formato YYYY-MM")
+        if mon < 1 or mon > 12:
+            raise HTTPException(status_code=400, detail="mês inválido")
+    try:
+        pdf_bytes = generate_monthly_report(db, client_id, year, mon)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    filename = f"relatorio-{client_id}-{year:04d}-{mon:02d}.pdf"
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

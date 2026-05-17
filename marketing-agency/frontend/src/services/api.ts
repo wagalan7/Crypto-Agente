@@ -76,6 +76,12 @@ export const api = {
     update: (id: number, data: unknown) => patch(`/clients/${id}`, data),
     refreshScore: (id: number) => post(`/clients/${id}/refresh-score`, {}),
     scoreHistory: (id: number, days?: number) => get(`/clients/${id}/score-history${days ? `?days=${days}` : ''}`),
+    monthlyReport: async (id: number, month?: string): Promise<Blob> => {
+      const res = await fetch(`${BASE}/clients/${id}/monthly-report.pdf${month ? `?month=${month}` : ''}`, { headers: headers() })
+      if (res.status === 401) { window.dispatchEvent(new Event('auth:logout')); throw new Error('Não autenticado') }
+      if (!res.ok) throw new Error(await res.text())
+      return res.blob()
+    },
   },
   content: {
     list: (clientId: number, status?: string) => get(`/content/client/${clientId}${status ? `?status=${status}` : ''}`),
@@ -94,6 +100,7 @@ export const api = {
     inspirationAlignment: (id: number) => post(`/content/${id}/inspiration-alignment`, {}),
     repurpose: (id: number, data: { target_format: string; target_platform: string; instruction?: string }) =>
       post(`/content/${id}/repurpose`, data),
+    voiceScore: (id: number) => post(`/content/${id}/voice-score`, {}),
   },
   calendar: {
     get: (clientId: number, days?: number) => get(`/calendar/client/${clientId}${days ? `?days=${days}` : ''}`),
@@ -156,5 +163,15 @@ export const api = {
     profileAudit: (clientId: number) => post(`/strategy/profile-audit/${clientId}`, {}),
     retrospective: (clientId: number) => post(`/strategy/retrospective/${clientId}`, {}),
     notifications: (clientId: number) => get(`/strategy/notifications/${clientId}`),
+  },
+  trends: {
+    list: (limit?: number, locale?: string) => {
+      const params = new URLSearchParams()
+      if (limit) params.set('limit', String(limit))
+      if (locale) params.set('locale', locale)
+      const qs = params.toString()
+      return get(`/trends/${qs ? '?' + qs : ''}`)
+    },
+    refresh: () => post('/trends/refresh', {}),
   },
 }

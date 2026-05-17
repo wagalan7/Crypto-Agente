@@ -93,6 +93,8 @@ class ContentPiece(Base):
     format_reasoning = Column(Text)     # why this format
     linked_product_id = Column(Integer, ForeignKey("products.id"), nullable=True)  # product this content sells
     production_brief = Column(Text)  # JSON: shooting checklist (auto-generated on approve)
+    voice_score = Column(Integer, nullable=True)  # 0-100: how on-brand the piece sounds
+    voice_feedback = Column(Text, nullable=True)  # JSON: {verdict, weakest_part, fix_hint}
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client", back_populates="contents")
@@ -294,3 +296,20 @@ class AuthorityScoreSnapshot(Base):
     client_id = Column(Integer, ForeignKey("clients.id"), nullable=False, index=True)
     score = Column(Float, nullable=False)
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class TrendTopic(Base):
+    """Auto-discovered trending topic (e.g. from Reddit) — global, not per-client."""
+    __tablename__ = "trend_topics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    source = Column(String(50), nullable=False, index=True)  # 'reddit', 'manual'
+    source_id = Column(String(255), nullable=True, index=True)  # external id for dedupe
+    subreddit = Column(String(100), nullable=True, index=True)
+    title = Column(Text, nullable=False)
+    url = Column(Text, nullable=True)
+    score = Column(Integer, default=0)
+    num_comments = Column(Integer, default=0)
+    locale = Column(String(10), nullable=True, default="pt-BR")
+    tags = Column(JSON, default=list)
+    discovered_at = Column(DateTime, default=datetime.utcnow, index=True)

@@ -54,6 +54,8 @@ def _run_lightweight_migrations():
         "format_reasoning": "TEXT",
         "linked_product_id": "INTEGER",
         "production_brief": "TEXT",
+        "voice_score": "INTEGER",
+        "voice_feedback": "TEXT",
     }
 
     if "content_pieces" in inspector.get_table_names():

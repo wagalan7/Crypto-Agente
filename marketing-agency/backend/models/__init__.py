@@ -2,12 +2,12 @@ from .db_models import (
     User, Client, ClientAccess, ContentPiece, CalendarSlot, MetricsSnapshot,
     AgentMemory, SocialAccount,
     Persona, Inspiration, Insight, Product, KnowledgeItem, WeeklyBrain,
-    AuthorityScoreSnapshot,
+    AuthorityScoreSnapshot, TrendTopic,
 )
 
 __all__ = [
     "User", "Client", "ClientAccess", "ContentPiece", "CalendarSlot",
     "MetricsSnapshot", "AgentMemory", "SocialAccount",
     "Persona", "Inspiration", "Insight", "Product", "KnowledgeItem", "WeeklyBrain",
-    "AuthorityScoreSnapshot",
+    "AuthorityScoreSnapshot", "TrendTopic",
 ]

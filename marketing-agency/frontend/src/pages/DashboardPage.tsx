@@ -47,6 +47,24 @@ export function DashboardPage() {
     setClient(prev => prev ? { ...prev, authority_score: res.authority_score } : prev)
   }
 
+  async function downloadMonthlyReport() {
+    const now = new Date()
+    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+    try {
+      const blob = await api.clients.monthlyReport(id, month)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `relatorio-${id}-${month}.pdf`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    }
+  }
+
   async function generateRetro() {
     setRetroBusy(true)
     try {
@@ -69,7 +87,10 @@ export function DashboardPage() {
           <h1 className="text-lg md:text-xl font-bold text-white truncate">{client.name}</h1>
           <p className="text-xs text-gray-400 mt-0.5 truncate">{client.niche} · {client.platforms.join(', ')}</p>
         </div>
-        <button onClick={refreshScore} className="btn-secondary text-xs shrink-0 ml-2">Score</button>
+        <div className="flex gap-2 shrink-0 ml-2">
+          <button onClick={downloadMonthlyReport} className="btn-secondary text-xs" title="Baixar PDF do mês">📄 PDF</button>
+          <button onClick={refreshScore} className="btn-secondary text-xs">Score</button>
+        </div>
       </div>
 
       <OnboardingChecklist clientId={id} client={client} />

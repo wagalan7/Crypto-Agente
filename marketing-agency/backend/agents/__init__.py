@@ -16,6 +16,7 @@ from .section_rewriter import SectionRewriterAgent
 from .inspiration_alignment import InspirationAlignmentAgent
 from .repurpose import RepurposeAgent
 from .weekly_retro import WeeklyRetroAgent
+from .voice_scorer import VoiceScorerAgent
 
 __all__ = [
     "StrategyAgent", "AnalyticsAgent", "ScriptAgent", "TrendAgent",
@@ -26,4 +27,5 @@ __all__ = [
     "SalesSequenceAgent", "ProfileAnalyzerAgent",
     "ProductionBriefingAgent", "SectionRewriterAgent",
     "InspirationAlignmentAgent", "RepurposeAgent", "WeeklyRetroAgent",
+    "VoiceScorerAgent",
 ]

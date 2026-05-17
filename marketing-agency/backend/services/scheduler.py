@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from database import SessionLocal
 from models import CalendarSlot, ContentPiece, SocialAccount, MetricsSnapshot
 from services import meta_publisher
+from services.trend_discovery import discover_trends
 
 logger = logging.getLogger("scheduler")
 
@@ -154,8 +155,19 @@ def start_scheduler() -> None:
                         max_instances=1, coalesce=True)
     _scheduler.add_job(fetch_metrics_for_published, "interval", minutes=30,
                         id="fetch_metrics", max_instances=1, coalesce=True)
+    _scheduler.add_job(_trend_discovery_job, "interval", hours=6,
+                        id="trend_discovery", max_instances=1, coalesce=True,
+                        next_run_time=datetime.utcnow() + timedelta(minutes=2))
     _scheduler.start()
-    logger.info("scheduler started (publish=60s, metrics=30m)")
+    logger.info("scheduler started (publish=60s, metrics=30m, trends=6h)")
+
+
+async def _trend_discovery_job() -> None:
+    try:
+        n = await discover_trends()
+        logger.info(f"trend discovery tick: inserted={n}")
+    except Exception as e:
+        logger.exception(f"trend discovery failed: {e}")
 
 
 def stop_scheduler() -> None:
