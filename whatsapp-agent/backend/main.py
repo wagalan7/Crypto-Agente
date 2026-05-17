@@ -824,16 +824,66 @@ def onboarding_form(request: Request):
 
 
 class OnboardingCreate(BaseModel):
+    # Dados do consultório
     name: str
-    psychologist_name: str = "Psicóloga"
-    email: str = ""
+    psychologist_name: str
     working_hours_start: int = 8
     working_hours_end: int = 18
     session_minutes: int = 50
+    # Dados de faturamento (obrigatórios)
+    full_name: str            # Nome completo do responsável
+    email: str
+    phone: str                # Telefone de contato
+    cpf_cnpj: str             # CPF ou CNPJ
+    billing_zip: str          # CEP
+    billing_address: str      # Rua
+    billing_number: str       # Número
+    billing_complement: str = ""
+    billing_neighborhood: str # Bairro
+    billing_city: str
+    billing_state: str        # UF
+
+
+def _only_digits(s: str) -> str:
+    return "".join(c for c in (s or "") if c.isdigit())
+
+
+def _validate_cpf_cnpj(value: str) -> bool:
+    digits = _only_digits(value)
+    return len(digits) in (11, 14)
 
 
 @app.post("/onboarding/create", status_code=201)
 def onboarding_create(body: OnboardingCreate):
+    # Validação básica dos campos obrigatórios
+    required = {
+        "Nome do consultório": body.name,
+        "Nome do responsável": body.full_name,
+        "E-mail": body.email,
+        "Telefone": body.phone,
+        "CPF/CNPJ": body.cpf_cnpj,
+        "CEP": body.billing_zip,
+        "Endereço": body.billing_address,
+        "Número": body.billing_number,
+        "Bairro": body.billing_neighborhood,
+        "Cidade": body.billing_city,
+        "Estado (UF)": body.billing_state,
+    }
+    for label, value in required.items():
+        if not (value or "").strip():
+            raise HTTPException(status_code=400, detail=f"Campo obrigatório: {label}")
+
+    if "@" not in body.email or "." not in body.email:
+        raise HTTPException(status_code=400, detail="E-mail inválido.")
+    if not _validate_cpf_cnpj(body.cpf_cnpj):
+        raise HTTPException(status_code=400, detail="CPF/CNPJ inválido (use 11 dígitos para CPF ou 14 para CNPJ).")
+    if len(_only_digits(body.phone)) < 10:
+        raise HTTPException(status_code=400, detail="Telefone inválido (informe DDD + número).")
+    if len(_only_digits(body.billing_zip)) != 8:
+        raise HTTPException(status_code=400, detail="CEP deve ter 8 dígitos.")
+    if len(body.billing_state.strip()) != 2:
+        raise HTTPException(status_code=400, detail="UF deve ter 2 letras (ex: SP).")
+
     try:
         tenant = ts.create_tenant(
             name=body.name,
@@ -847,11 +897,26 @@ def onboarding_create(body: OnboardingCreate):
 
     slug = tenant["slug"]
 
-    # Gerar tokens e salvar email
+    # Gerar tokens e salvar todos os dados
     dash_token = secrets.token_urlsafe(24)
     setup_token = secrets.token_urlsafe(24)
-    db.update_tenant(slug, dashboard_token=dash_token, setup_token=setup_token,
-                     email=body.email, status="pending_payment")
+    db.update_tenant(
+        slug,
+        dashboard_token=dash_token,
+        setup_token=setup_token,
+        email=body.email,
+        full_name=body.full_name,
+        phone=_only_digits(body.phone),
+        cpf_cnpj=_only_digits(body.cpf_cnpj),
+        billing_zip=_only_digits(body.billing_zip),
+        billing_address=body.billing_address,
+        billing_number=body.billing_number,
+        billing_complement=body.billing_complement,
+        billing_neighborhood=body.billing_neighborhood,
+        billing_city=body.billing_city,
+        billing_state=body.billing_state.upper().strip()[:2],
+        status="pending_payment",
+    )
 
     return {"slug": slug, "setup_token": setup_token}
 
@@ -1060,11 +1125,230 @@ async def webhook_mercadopago(request: Request):
     return result
 
 
-# ── Landing page ───────────────────────────────────────────────────────────────
+# ── Landing page (com tracking + depoimentos dinâmicos) ────────────────────────
+
+import json as _json
+
+DEFAULT_TESTIMONIALS = [
+    {"name": "Marina R.", "role": "Psicóloga clínica · São Paulo", "initial": "M", "stars": 5,
+     "text": "Antes eu ficava ansiosa no intervalo entre sessões, sempre olhando o WhatsApp. Hoje o agente cuida disso e eu consigo <strong>realmente descansar</strong> entre os atendimentos."},
+    {"name": "Camila F.", "role": "Terapeuta · Rio de Janeiro", "initial": "C", "stars": 5, "highlight": True,
+     "text": "Tive <strong>40% menos faltas no primeiro mês</strong>. O lembrete automático com a política de cobrança fez uma diferença enorme. Vale muito mais do que pago."},
+    {"name": "Letícia M.", "role": "Psicóloga · Curitiba", "initial": "L", "stars": 5,
+     "text": "Minha preocupação era parecer fria para os pacientes. Mas o agente escreve de um jeito tão humanizado que <strong>vários pacientes nem perceberam</strong> que era automático."},
+    {"name": "Bruna P.", "role": "Psicóloga · Florianópolis", "initial": "B", "stars": 5,
+     "text": "Ganhei <strong>2 horas livres por dia</strong>. Os pacientes adoraram a agilidade nas respostas, e eu consegui pegar mais sessões com a agenda otimizada."},
+    {"name": "Patrícia S.", "role": "Psicanalista · Belo Horizonte", "initial": "P", "stars": 5,
+     "text": "Comecei achando que ia ser uma dor de cabeça configurar, mas em <strong>10 minutos estava tudo pronto</strong>. O suporte respondeu rapidíssimo no WhatsApp."},
+    {"name": "Fernanda A.", "role": "Psicóloga infantil · Porto Alegre", "initial": "F", "stars": 5,
+     "text": "O melhor é a confirmação na noite anterior — <strong>quase ninguém esquece a sessão</strong>. Reduziu drasticamente os no-shows que eram um problema crônico para mim."},
+]
+
+
+def _get_testimonials() -> list[dict]:
+    raw = db.get_site_content("testimonials", "")
+    if not raw:
+        return DEFAULT_TESTIMONIALS
+    try:
+        data = _json.loads(raw)
+        if isinstance(data, list) and data:
+            return data
+    except Exception:
+        pass
+    return DEFAULT_TESTIMONIALS
+
 
 @app.get("/", response_class=HTMLResponse)
 def landing(request: Request):
-    return templates.TemplateResponse("landing.html", {"request": request})
+    # Tracking não-bloqueante
+    try:
+        ip = request.client.host if request.client else ""
+        ua = request.headers.get("user-agent", "")
+        ref = request.headers.get("referer", "")
+        db.record_landing_view(ip=ip, user_agent=ua, referrer=ref)
+    except Exception as e:
+        logger.warning(f"[landing] tracking falhou: {e}")
+    return templates.TemplateResponse(
+        "landing.html",
+        {"request": request, "testimonials": _get_testimonials()},
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Painel Admin (login + dashboard + APIs)
+# ════════════════════════════════════════════════════════════════════════════
+
+_ADMIN_COOKIE = "admin_session"
+
+
+def _require_admin(request: Request) -> dict:
+    """Lê cookie de sessão e valida. Retorna a sessão ou levanta 401."""
+    token = request.cookies.get(_ADMIN_COOKIE, "")
+    session = db.admin_get_session(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Não autenticado.")
+    return session
+
+
+@app.get("/painel/login", response_class=HTMLResponse)
+def painel_login_page(request: Request, erro: str = ""):
+    return templates.TemplateResponse("admin_login.html", {"request": request, "erro": erro})
+
+
+class AdminLoginBody(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/painel/login")
+def painel_login(body: AdminLoginBody):
+    admin = db.admin_verify_login(body.username.strip(), body.password)
+    if not admin:
+        raise HTTPException(status_code=401, detail="Usuário ou senha incorretos.")
+    token = db.admin_create_session(admin["username"], days=7)
+    resp = JSONResponse({"ok": True, "username": admin["username"]})
+    resp.set_cookie(
+        _ADMIN_COOKIE, token,
+        httponly=True, samesite="lax", max_age=7 * 24 * 3600,
+        secure=config.BASE_URL.startswith("https"),
+    )
+    return resp
+
+
+@app.post("/painel/logout")
+def painel_logout(request: Request):
+    token = request.cookies.get(_ADMIN_COOKIE, "")
+    if token:
+        db.admin_delete_session(token)
+    resp = RedirectResponse("/painel/login", status_code=303)
+    resp.delete_cookie(_ADMIN_COOKIE)
+    return resp
+
+
+@app.get("/painel", response_class=HTMLResponse)
+def painel_home(request: Request):
+    token = request.cookies.get(_ADMIN_COOKIE, "")
+    if not db.admin_get_session(token):
+        return RedirectResponse("/painel/login", status_code=303)
+    return templates.TemplateResponse("admin_panel.html", {"request": request})
+
+
+# ── APIs do painel ────────────────────────────────────────────────────────────
+
+@app.get("/painel/api/stats")
+def painel_api_stats(request: Request):
+    _require_admin(request)
+    return db.admin_stats_overview()
+
+
+@app.get("/painel/api/subscriptions")
+def painel_api_subscriptions(request: Request):
+    _require_admin(request)
+    return {"subscriptions": db.admin_list_subscriptions()}
+
+
+@app.get("/painel/api/abandoned-carts")
+def painel_api_abandoned(request: Request, hours_min: int = 1):
+    _require_admin(request)
+    items = db.admin_list_abandoned_carts(hours_min=hours_min)
+    base = config.BASE_URL
+    for it in items:
+        st = it.get("setup_token") or ""
+        it["payment_url"] = f"{base}/onboarding/pagamento?token={st}" if st else ""
+    return {"carts": items}
+
+
+@app.get("/painel/api/tenants")
+def painel_api_tenants(request: Request):
+    _require_admin(request)
+    items = db.admin_list_all_tenants()
+    base = config.BASE_URL
+    for it in items:
+        dt = it.get("dashboard_token") or ""
+        st = it.get("setup_token") or ""
+        it["dashboard_url"] = f"{base}/dashboard/{it['slug']}?token={dt}" if dt else ""
+        it["payment_url"]   = f"{base}/onboarding/pagamento?token={st}" if st else ""
+    return {"tenants": items}
+
+
+@app.get("/painel/api/tenant/{slug}")
+def painel_api_tenant_detail(slug: str, request: Request):
+    _require_admin(request)
+    t = db.admin_get_tenant_full(slug)
+    if not t:
+        raise HTTPException(status_code=404, detail="Não encontrado.")
+    # Não retorna senhas
+    for k in ("twilio_token", "evolution_key", "caldav_password"):
+        t.pop(k, None)
+    return t
+
+
+class AdminTenantAction(BaseModel):
+    free_until: Optional[str] = None    # ISO date
+    plan: Optional[str] = None          # mensal/semestral/anual
+    status: Optional[str] = None        # active/suspended
+
+
+@app.post("/painel/api/tenant/{slug}/action")
+def painel_api_tenant_action(slug: str, body: AdminTenantAction, request: Request):
+    _require_admin(request)
+    tenant = db.get_tenant(slug)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Não encontrado.")
+
+    updates = {}
+    if body.status:
+        if body.status not in ("active", "suspended", "pending_payment"):
+            raise HTTPException(status_code=400, detail="Status inválido.")
+        updates["status"] = body.status
+    if body.plan:
+        if body.plan not in ("mensal", "semestral", "anual"):
+            raise HTTPException(status_code=400, detail="Plano inválido.")
+        updates["plan"] = body.plan
+    if body.free_until is not None:
+        updates["free_until"] = body.free_until or None
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nada para atualizar.")
+
+    db.update_tenant(slug, **updates)
+    logger.info(f"[admin] tenant {slug} atualizado: {updates}")
+    return {"ok": True, "updates": updates}
+
+
+@app.get("/painel/api/content/{key}")
+def painel_api_content_get(key: str, request: Request):
+    _require_admin(request)
+    raw = db.get_site_content(key, "")
+    return {"key": key, "value": raw}
+
+
+class ContentBody(BaseModel):
+    value: str
+
+
+@app.put("/painel/api/content/{key}")
+def painel_api_content_put(key: str, body: ContentBody, request: Request):
+    _require_admin(request)
+    # Validar JSON se for testimonials (lista de objetos com campos esperados)
+    if key == "testimonials":
+        try:
+            data = _json.loads(body.value)
+            if not isinstance(data, list):
+                raise ValueError("JSON deve ser uma lista")
+            for item in data:
+                if not all(k in item for k in ("name", "role", "text")):
+                    raise ValueError("Cada depoimento precisa ter: name, role, text")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"JSON inválido: {e}")
+    db.set_site_content(key, body.value)
+    return {"ok": True}
+
+
+@app.get("/painel/api/content-defaults/testimonials")
+def painel_api_testimonials_default(request: Request):
+    _require_admin(request)
+    return {"defaults": DEFAULT_TESTIMONIALS}
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Painel — Consultório Inteligente</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  .tab-btn.active { background:#7c3aed; color:white; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+  .b-active   { background:#dcfce7; color:#166534; }
+  .b-suspended{ background:#fee2e2; color:#991b1b; }
+  .b-pending  { background:#fef3c7; color:#92400e; }
+</style>
+</head>
+<body class="bg-slate-50 min-h-screen">
+
+<header class="bg-white border-b border-slate-200 shadow-sm">
+  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-violet-600 to-fuchsia-600 text-white font-bold flex items-center justify-center">CI</div>
+      <div>
+        <h1 class="font-bold text-gray-900">Painel Administrativo</h1>
+        <p class="text-xs text-gray-500">Consultório Inteligente</p>
+      </div>
+    </div>
+    <form method="post" action="/painel/logout">
+      <button class="text-sm text-gray-500 hover:text-red-600">Sair</button>
+    </form>
+  </div>
+  <nav class="max-w-7xl mx-auto px-4 pb-3 flex gap-2 flex-wrap text-sm">
+    <button class="tab-btn active px-4 py-2 rounded-lg border border-slate-200" data-tab="overview">Visão Geral</button>
+    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="subs">Assinaturas</button>
+    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="abandoned">Carrinho Abandonado</button>
+    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="tenants">Usuários</button>
+    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="content">Conteúdo do Site</button>
+  </nav>
+</header>
+
+<main class="max-w-7xl mx-auto px-4 py-6">
+
+  <!-- VISÃO GERAL -->
+  <section id="tab-overview" class="tab-pane">
+    <div id="kpis" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-gray-500">MRR</div>
+        <div class="text-2xl font-bold text-violet-700" id="kpi-mrr">—</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-gray-500">Assinantes ativos</div>
+        <div class="text-2xl font-bold text-emerald-600" id="kpi-active">—</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-gray-500">Pendentes pagto</div>
+        <div class="text-2xl font-bold text-amber-600" id="kpi-pending">—</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-gray-500">Suspensos</div>
+        <div class="text-2xl font-bold text-rose-600" id="kpi-suspended">—</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-gray-500">Signups 24h</div>
+        <div class="text-2xl font-bold" id="kpi-s24">—</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-gray-500">Signups 7d</div>
+        <div class="text-2xl font-bold" id="kpi-s7">—</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-gray-500">Visitas landing 30d</div>
+        <div class="text-2xl font-bold" id="kpi-v30">—</div>
+      </div>
+      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+        <div class="text-xs text-gray-500">Conversão 30d</div>
+        <div class="text-2xl font-bold" id="kpi-conv">—</div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-200">
+      <h3 class="font-semibold text-gray-900 mb-3">Distribuição por plano</h3>
+      <div id="byplan" class="grid grid-cols-3 gap-3 text-sm"></div>
+    </div>
+  </section>
+
+  <!-- ASSINATURAS -->
+  <section id="tab-subs" class="tab-pane hidden">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
+          <tr>
+            <th class="p-3">Consultório</th>
+            <th class="p-3">Responsável</th>
+            <th class="p-3">E-mail / Tel</th>
+            <th class="p-3">Plano</th>
+            <th class="p-3">Vence em</th>
+            <th class="p-3">Início</th>
+          </tr>
+        </thead>
+        <tbody id="subs-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- CARRINHO ABANDONADO -->
+  <section id="tab-abandoned" class="tab-pane hidden">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
+          <tr>
+            <th class="p-3">Lead</th>
+            <th class="p-3">Contato</th>
+            <th class="p-3">Plano</th>
+            <th class="p-3">Há quanto tempo</th>
+            <th class="p-3">Ações</th>
+          </tr>
+        </thead>
+        <tbody id="abandoned-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- USUÁRIOS -->
+  <section id="tab-tenants" class="tab-pane hidden">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
+          <tr>
+            <th class="p-3">Consultório</th>
+            <th class="p-3">Contato</th>
+            <th class="p-3">Plano / Status</th>
+            <th class="p-3">Vence</th>
+            <th class="p-3">Free até</th>
+            <th class="p-3">Ações</th>
+          </tr>
+        </thead>
+        <tbody id="tenants-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- CONTEÚDO -->
+  <section id="tab-content" class="tab-pane hidden">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold text-gray-900">Depoimentos da landing page</h3>
+        <div class="flex gap-2">
+          <button id="btn-restore" class="text-sm px-3 py-1.5 rounded-lg border border-slate-300 hover:bg-slate-50">Restaurar padrão</button>
+          <button id="btn-save" class="text-sm px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">Salvar</button>
+        </div>
+      </div>
+      <p class="text-xs text-gray-500 mb-2">Formato: lista JSON com objetos <code>{ "name", "role", "text", "stars", "highlight" }</code>. Salvar vazio para usar os padrões.</p>
+      <textarea id="content-editor" rows="20" class="w-full font-mono text-xs border border-slate-300 rounded-lg p-3 focus:ring-2 focus:ring-violet-500 outline-none"></textarea>
+      <div id="content-msg" class="mt-2 text-sm"></div>
+    </div>
+  </section>
+
+</main>
+
+<!-- Modal de ação do tenant -->
+<div id="modal" class="hidden fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl w-full max-w-md p-6 shadow-2xl">
+    <h3 class="font-bold text-gray-900 mb-1" id="modal-title">Ações</h3>
+    <p class="text-xs text-gray-500 mb-4" id="modal-sub"></p>
+    <div class="space-y-3">
+      <div>
+        <label class="text-sm font-medium text-gray-700">Status</label>
+        <select id="m-status" class="w-full mt-1 border border-slate-300 rounded-lg p-2 text-sm">
+          <option value="">(não alterar)</option>
+          <option value="active">Ativar</option>
+          <option value="suspended">Suspender</option>
+          <option value="pending_payment">Marcar pendente</option>
+        </select>
+      </div>
+      <div>
+        <label class="text-sm font-medium text-gray-700">Plano</label>
+        <select id="m-plan" class="w-full mt-1 border border-slate-300 rounded-lg p-2 text-sm">
+          <option value="">(não alterar)</option>
+          <option value="mensal">Mensal</option>
+          <option value="semestral">Semestral</option>
+          <option value="anual">Anual</option>
+        </select>
+      </div>
+      <div>
+        <label class="text-sm font-medium text-gray-700">Free até (YYYY-MM-DD)</label>
+        <input id="m-free" type="date" class="w-full mt-1 border border-slate-300 rounded-lg p-2 text-sm">
+      </div>
+    </div>
+    <div class="flex justify-end gap-2 mt-5">
+      <button onclick="closeModal()" class="px-4 py-2 text-sm rounded-lg border border-slate-300">Cancelar</button>
+      <button onclick="saveAction()" class="px-4 py-2 text-sm rounded-lg bg-violet-600 text-white">Aplicar</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const fmtBRL = (v) => 'R$ ' + (v||0).toLocaleString('pt-BR', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const fmtDate = (s) => {
+  if (!s) return '—';
+  try { return new Date(s).toLocaleDateString('pt-BR'); } catch { return s; }
+};
+const timeAgo = (s) => {
+  if (!s) return '—';
+  const ms = Date.now() - new Date(s).getTime();
+  const h = Math.floor(ms/3600000);
+  if (h < 24) return h + 'h';
+  return Math.floor(h/24) + 'd';
+};
+const badge = (status) => {
+  const map = {active:'b-active', suspended:'b-suspended', pending_payment:'b-pending'};
+  const labels = {active:'Ativo', suspended:'Suspenso', pending_payment:'Pendente'};
+  return `<span class="badge ${map[status]||''}">${labels[status]||status}</span>`;
+};
+
+// Tabs
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const tab = btn.dataset.tab;
+    document.querySelectorAll('.tab-pane').forEach(p => p.classList.add('hidden'));
+    document.getElementById('tab-' + tab).classList.remove('hidden');
+    loadTab(tab);
+  });
+});
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (r.status === 401) { window.location.href = '/painel/login'; return; }
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || ('HTTP '+r.status));
+  return r.json();
+}
+
+async function loadOverview() {
+  const s = await api('/painel/api/stats');
+  document.getElementById('kpi-mrr').textContent = fmtBRL(s.mrr);
+  document.getElementById('kpi-active').textContent = s.tenants.active;
+  document.getElementById('kpi-pending').textContent = s.tenants.pending_payment;
+  document.getElementById('kpi-suspended').textContent = s.tenants.suspended;
+  document.getElementById('kpi-s24').textContent = s.signups.last_24h;
+  document.getElementById('kpi-s7').textContent = s.signups.last_7d;
+  document.getElementById('kpi-v30').textContent = s.landing_views.last_30d;
+  const conv = (s.conversion_30d != null) ? s.conversion_30d : (s.landing_views.last_30d ? (100 * s.signups.last_7d / s.landing_views.last_30d) : 0);
+  document.getElementById('kpi-conv').textContent = (conv || 0).toFixed(1) + '%';
+
+  const bp = s.by_plan || {};
+  document.getElementById('byplan').innerHTML = ['mensal','semestral','anual'].map(p => `
+    <div class="rounded-lg bg-slate-50 p-3 text-center">
+      <div class="text-xs uppercase text-slate-500">${p}</div>
+      <div class="text-xl font-bold text-violet-700">${bp[p]||0}</div>
+    </div>`).join('');
+}
+
+async function loadSubs() {
+  const {subscriptions} = await api('/painel/api/subscriptions');
+  document.getElementById('subs-body').innerHTML = subscriptions.map(s => `
+    <tr class="border-t border-slate-100">
+      <td class="p-3"><div class="font-medium">${s.name||'—'}</div><div class="text-xs text-slate-500">${s.slug}</div></td>
+      <td class="p-3">${s.psychologist_name||s.full_name||'—'}</td>
+      <td class="p-3 text-xs">${s.email||'—'}<br>${s.phone||''}</td>
+      <td class="p-3">${s.plan||'—'}</td>
+      <td class="p-3">${fmtDate(s.plan_expires_at)}</td>
+      <td class="p-3 text-xs text-slate-500">${fmtDate(s.created_at)}</td>
+    </tr>`).join('') || '<tr><td colspan="6" class="p-6 text-center text-slate-400">Nenhuma assinatura ativa.</td></tr>';
+}
+
+async function loadAbandoned() {
+  const {carts} = await api('/painel/api/abandoned-carts');
+  document.getElementById('abandoned-body').innerHTML = carts.map(c => `
+    <tr class="border-t border-slate-100">
+      <td class="p-3"><div class="font-medium">${c.full_name||c.name||'—'}</div><div class="text-xs text-slate-500">${c.slug}</div></td>
+      <td class="p-3 text-xs">${c.email||'—'}<br>${c.phone||''}</td>
+      <td class="p-3">${c.plan||'—'}</td>
+      <td class="p-3">${timeAgo(c.created_at)}</td>
+      <td class="p-3">
+        ${c.payment_url ? `<button onclick="copyLink('${c.payment_url}')" class="text-xs bg-violet-100 text-violet-700 px-2 py-1 rounded hover:bg-violet-200">Copiar link de pagto</button>` : '—'}
+      </td>
+    </tr>`).join('') || '<tr><td colspan="5" class="p-6 text-center text-slate-400">Nenhum carrinho abandonado.</td></tr>';
+}
+
+async function loadTenants() {
+  const {tenants} = await api('/painel/api/tenants');
+  document.getElementById('tenants-body').innerHTML = tenants.map(t => `
+    <tr class="border-t border-slate-100">
+      <td class="p-3"><div class="font-medium">${t.name||'—'}</div><div class="text-xs text-slate-500">${t.slug}</div></td>
+      <td class="p-3 text-xs">${t.email||'—'}<br>${t.phone||''}<br><span class="text-slate-400">${[t.billing_city,t.billing_state].filter(Boolean).join('/')}</span></td>
+      <td class="p-3">${t.plan||'—'}<br>${badge(t.status)}</td>
+      <td class="p-3 text-xs">${fmtDate(t.plan_expires_at)}</td>
+      <td class="p-3 text-xs">${fmtDate(t.free_until)}</td>
+      <td class="p-3">
+        <button onclick='openModal(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)})' class="text-xs bg-slate-100 hover:bg-slate-200 px-2 py-1 rounded">Editar</button>
+        ${t.dashboard_url ? `<a href="${t.dashboard_url}" target="_blank" class="text-xs text-violet-600 hover:underline ml-2">Dashboard</a>` : ''}
+      </td>
+    </tr>`).join('') || '<tr><td colspan="6" class="p-6 text-center text-slate-400">Nenhum consultório.</td></tr>';
+}
+
+async function loadContent() {
+  const r = await api('/painel/api/content/testimonials');
+  const ed = document.getElementById('content-editor');
+  if (r.value) {
+    try { ed.value = JSON.stringify(JSON.parse(r.value), null, 2); } catch { ed.value = r.value; }
+  } else {
+    const d = await api('/painel/api/content-defaults/testimonials');
+    ed.value = JSON.stringify(d.defaults, null, 2);
+  }
+}
+
+document.getElementById('btn-save').addEventListener('click', async () => {
+  const msg = document.getElementById('content-msg');
+  msg.textContent = ''; msg.className = 'mt-2 text-sm';
+  try {
+    await api('/painel/api/content/testimonials', {
+      method: 'PUT',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({value: document.getElementById('content-editor').value.trim()})
+    });
+    msg.textContent = '✓ Salvo. A landing já reflete os novos depoimentos.';
+    msg.className = 'mt-2 text-sm text-emerald-600';
+  } catch (e) {
+    msg.textContent = '✗ ' + e.message;
+    msg.className = 'mt-2 text-sm text-red-600';
+  }
+});
+
+document.getElementById('btn-restore').addEventListener('click', async () => {
+  const d = await api('/painel/api/content-defaults/testimonials');
+  document.getElementById('content-editor').value = JSON.stringify(d.defaults, null, 2);
+});
+
+function copyLink(url) {
+  navigator.clipboard.writeText(url).then(() => alert('Link copiado:\n' + url));
+}
+
+let currentSlug = null;
+function openModal(slug, name) {
+  currentSlug = slug;
+  document.getElementById('modal-title').textContent = 'Editar ' + name;
+  document.getElementById('modal-sub').textContent = slug;
+  document.getElementById('m-status').value = '';
+  document.getElementById('m-plan').value = '';
+  document.getElementById('m-free').value = '';
+  document.getElementById('modal').classList.remove('hidden');
+}
+function closeModal() { document.getElementById('modal').classList.add('hidden'); }
+async function saveAction() {
+  const body = {};
+  const st = document.getElementById('m-status').value;
+  const pl = document.getElementById('m-plan').value;
+  const fr = document.getElementById('m-free').value;
+  if (st) body.status = st;
+  if (pl) body.plan = pl;
+  if (fr) body.free_until = fr;
+  if (Object.keys(body).length === 0) { alert('Nada para alterar.'); return; }
+  try {
+    await api(`/painel/api/tenant/${currentSlug}/action`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    closeModal();
+    loadTenants();
+  } catch (e) { alert('Erro: ' + e.message); }
+}
+
+function loadTab(tab) {
+  if (tab === 'overview') loadOverview();
+  else if (tab === 'subs') loadSubs();
+  else if (tab === 'abandoned') loadAbandoned();
+  else if (tab === 'tenants') loadTenants();
+  else if (tab === 'content') loadContent();
+}
+
+loadOverview();
+</script>
+</body>
+</html>
