@@ -30,11 +30,40 @@ _SEND_AFTER_HOUR  = 17        # confirmações de amanhã a partir das 17h
 _FOLLOWUP_HOUR    = 8         # followup no dia da sessão a partir das 8h
 
 
+_DIAS_SEMANA = {
+    0: "segunda-feira",
+    1: "terça-feira",
+    2: "quarta-feira",
+    3: "quinta-feira",
+    4: "sexta-feira",
+    5: "sábado",
+    6: "domingo",
+}
+
+
+def _quando_label(appt: dict) -> str:
+    """Retorna 'de amanhã', 'de hoje' ou 'de [dia da semana]' conforme a data da consulta."""
+    try:
+        appt_dt = datetime.fromisoformat(appt["scheduled_at"])
+    except Exception:
+        return "de amanhã"
+    today_br = datetime.now(_TZ).replace(tzinfo=None).date()
+    appt_date = appt_dt.date()
+    delta_days = (appt_date - today_br).days
+    if delta_days <= 0:
+        return "de hoje"
+    if delta_days == 1:
+        return "de amanhã"
+    # 2+ dias à frente → usa nome do dia da semana
+    return f"de {_DIAS_SEMANA[appt_date.weekday()]}"
+
+
 def _confirmation_message(tenant: dict, appt: dict) -> str:
     formatted = cal.format_appointment(appt)
     name = appt["patient_name"].split()[0]
+    quando = _quando_label(appt)
     return (
-        f"Olá, {name}! 😊 Passando para confirmar sua sessão de amanhã:\n\n"
+        f"Olá, {name}! 😊 Passando para confirmar sua sessão {quando}:\n\n"
         f"📅 {formatted}\n\n"
         f"Você pode confirmar presença? Responda *SIM* para confirmar "
         f"ou me avise se precisar remarcar. 🙏\n\n"
