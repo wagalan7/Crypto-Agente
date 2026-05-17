@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, HTMLResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
