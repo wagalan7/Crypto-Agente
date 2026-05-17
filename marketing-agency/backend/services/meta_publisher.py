@@ -193,3 +193,54 @@ async def fetch_insights(account: SocialAccount, external_post_id: str) -> dict:
             normalized[col] = int(val)
 
     return normalized
+
+
+async def refresh_long_lived_token(token: str) -> tuple[str, int]:
+    """Exchange a long-lived user token for a fresh one (still ~60 days).
+
+    Page tokens derived from long-lived user tokens never expire, but if the
+    user provided a long-lived USER token we can refresh it before the 60-day
+    window closes. Returns (new_token, expires_in_seconds).
+
+    Requires META_APP_ID + META_APP_SECRET in env.
+    """
+    import os
+    app_id = os.getenv("META_APP_ID")
+    app_secret = os.getenv("META_APP_SECRET")
+    if not app_id or not app_secret:
+        raise PublishError("META_APP_ID/SECRET não configurados")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            f"{GRAPH_API}/oauth/access_token",
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": app_id,
+                "client_secret": app_secret,
+                "fb_exchange_token": token,
+            },
+        )
+        if r.status_code >= 400:
+            raise PublishError(f"Token refresh failed: {_extract_meta_error(r)}")
+        body = r.json()
+        return body["access_token"], int(body.get("expires_in") or 0)
+
+
+async def debug_token(token: str) -> dict:
+    """Inspect a token's metadata (expires_at, scopes, is_valid).
+
+    Requires META_APP_ID + META_APP_SECRET in env so we can build an app token.
+    """
+    import os
+    app_id = os.getenv("META_APP_ID")
+    app_secret = os.getenv("META_APP_SECRET")
+    if not app_id or not app_secret:
+        raise PublishError("META_APP_ID/SECRET não configurados")
+    app_token = f"{app_id}|{app_secret}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            f"{GRAPH_API}/debug_token",
+            params={"input_token": token, "access_token": app_token},
+        )
+        if r.status_code >= 400:
+            raise PublishError(f"debug_token failed: {_extract_meta_error(r)}")
+        return (r.json().get("data") or {})

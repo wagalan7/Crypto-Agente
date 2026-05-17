@@ -56,6 +56,8 @@ def _run_lightweight_migrations():
         "production_brief": "TEXT",
         "voice_score": "INTEGER",
         "voice_feedback": "TEXT",
+        "publish_attempts": "INTEGER DEFAULT 0",
+        "next_retry_at": "TIMESTAMP",
     }
 
     if "content_pieces" in inspector.get_table_names():

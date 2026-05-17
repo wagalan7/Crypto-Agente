@@ -1,12 +1,51 @@
 import os
-from fastapi import FastAPI
+import logging
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import init_db
 from routers import auth, clients, agents, content, analytics, calendar, social, persona, inspirations, products, knowledge, strategy, trends, billing
 
+logger = logging.getLogger(__name__)
+
+# --- Sentry (optional) -----------------------------------------------------
+# Enable by setting SENTRY_DSN. Captures unhandled exceptions + slow requests.
+SENTRY_DSN = os.getenv("SENTRY_DSN")
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        from sentry_sdk.integrations.starlette import StarletteIntegration
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            environment=os.getenv("SENTRY_ENV", "production"),
+            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE", "0.1")),
+            integrations=[FastApiIntegration(), StarletteIntegration()],
+            send_default_pii=False,
+            release=os.getenv("RAILWAY_GIT_COMMIT_SHA"),
+        )
+        logger.info("Sentry initialized")
+    except Exception as e:
+        logger.warning(f"Sentry init failed: {e}")
+
+# --- Rate limiting ---------------------------------------------------------
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+def _key_func(request: Request) -> str:
+    # Rate-limit by authenticated user when possible, else by IP
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        return f"user:{auth_header[7:32]}"  # token prefix is a stable per-user key
+    return get_remote_address(request)
+
+limiter = Limiter(key_func=_key_func, default_limits=["120/minute"])
+
 app = FastAPI(title="Content Agency AI", version="2.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,

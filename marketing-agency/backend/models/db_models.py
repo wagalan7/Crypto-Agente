@@ -101,6 +101,8 @@ class ContentPiece(Base):
     production_brief = Column(Text)  # JSON: shooting checklist (auto-generated on approve)
     voice_score = Column(Integer, nullable=True)  # 0-100: how on-brand the piece sounds
     voice_feedback = Column(Text, nullable=True)  # JSON: {verdict, weakest_part, fix_hint}
+    publish_attempts = Column(Integer, default=0)  # retry counter for auto-publish
+    next_retry_at = Column(DateTime, nullable=True)  # exponential backoff schedule
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client", back_populates="contents")
@@ -302,6 +304,21 @@ class AuthorityScoreSnapshot(Base):
     client_id = Column(Integer, ForeignKey("clients.id"), nullable=False, index=True)
     score = Column(Float, nullable=False)
     recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AuditLog(Base):
+    """Append-only log of impactful user actions for debugging + compliance."""
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    client_id = Column(Integer, nullable=True, index=True)
+    action = Column(String(80), nullable=False, index=True)  # e.g. "content.approve", "social.publish"
+    target_type = Column(String(50), nullable=True)  # e.g. "content_piece"
+    target_id = Column(Integer, nullable=True)
+    meta = Column(JSON, default=dict)
+    ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 class TrendTopic(Base):

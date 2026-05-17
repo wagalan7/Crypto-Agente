@@ -8,6 +8,8 @@ from models import SocialAccount, ContentPiece, User
 from auth import get_current_user, assert_client_access
 from services import meta_publisher
 from services.plans import assert_feature
+from services.audit import log_action
+from fastapi import Request
 
 router = APIRouter(prefix="/social", tags=["social"])
 
@@ -127,7 +129,8 @@ async def test_account(account_id: int, current_user: User = Depends(get_current
 
 
 @router.post("/publish/{content_id}")
-async def publish_content(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def publish_content(content_id: int, request: Request,
+                            current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     content = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not content:
         raise HTTPException(404, "Content not found")
@@ -153,6 +156,9 @@ async def publish_content(content_id: int, current_user: User = Depends(get_curr
         content.publish_error = str(e)
         acc.last_error = str(e)
         db.commit()
+        log_action(db, user=current_user, action="social.publish.failed",
+                    client_id=content.client_id, target_type="content_piece", target_id=content.id,
+                    meta={"platform": platform, "error": str(e)[:300]}, request=request)
         raise HTTPException(502, str(e))
 
     content.external_post_id = external_id
@@ -160,4 +166,7 @@ async def publish_content(content_id: int, current_user: User = Depends(get_curr
     content.published_at = datetime.utcnow()
     content.publish_error = None
     db.commit()
+    log_action(db, user=current_user, action="social.publish",
+                client_id=content.client_id, target_type="content_piece", target_id=content.id,
+                meta={"platform": platform, "external_id": external_id}, request=request)
     return {"ok": True, "external_post_id": external_id, "status": "published"}

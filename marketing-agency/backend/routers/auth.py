@@ -5,6 +5,8 @@ from database import get_db
 from models import User, Client, ClientAccess
 from auth import hash_password, verify_password, create_token, get_current_user, require_master
 from services.plans import start_trial, plan_status
+from services.audit import log_action
+from fastapi import Request
 from typing import Optional, List
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -88,13 +90,16 @@ def complete_onboarding(data: OnboardingCompleteRequest,
 
 
 @router.post("/login")
-def login(data: LoginRequest, db: Session = Depends(get_db)):
+def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email.lower().strip()).first()
     if not user or not verify_password(data.password, user.password_hash):
+        log_action(db, user=None, action="auth.login.failed",
+                    meta={"email": data.email[:80]}, request=request)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Email ou senha incorretos")
     if not user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Conta desativada")
     token = create_token(user.id, user.email, user.role)
+    log_action(db, user=user, action="auth.login", request=request)
     return {"access_token": token, "token_type": "bearer", "user": _serialize_user(user)}
 
 
@@ -151,6 +156,28 @@ def list_access(client_id: int, current_user: User = Depends(require_master), db
         raise HTTPException(403, "Sem permissão")
     grants = db.query(ClientAccess).filter(ClientAccess.client_id == client_id).all()
     return [{"user_id": g.user_id, "client_id": g.client_id} for g in grants]
+
+
+@router.get("/audit")
+def list_audit(limit: int = 100, action: Optional[str] = None,
+                current_user: User = Depends(require_master), db: Session = Depends(get_db)):
+    """Master-only: tail of the audit log for debugging + compliance."""
+    from models import AuditLog
+    q = db.query(AuditLog).order_by(AuditLog.created_at.desc())
+    if action:
+        q = q.filter(AuditLog.action == action)
+    rows = q.limit(min(max(limit, 1), 500)).all()
+    return [{
+        "id": r.id,
+        "user_id": r.user_id,
+        "client_id": r.client_id,
+        "action": r.action,
+        "target_type": r.target_type,
+        "target_id": r.target_id,
+        "meta": r.meta or {},
+        "ip": r.ip,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]
 
 
 @router.delete("/revoke-access")

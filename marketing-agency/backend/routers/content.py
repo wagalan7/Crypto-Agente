@@ -15,6 +15,8 @@ from agents.repurpose import parse_json_response as parse_repurpose_json
 from agents.voice_scorer import parse_json_response as parse_voice_json
 from services import BrandBrain
 from services.plans import assert_can_create_content, assert_feature
+from services.audit import log_action
+from fastapi import Request
 
 REGEN_SECTIONS = {"hook", "script", "copy", "design_brief"}
 
@@ -152,7 +154,8 @@ def update_content(content_id: int, data: ContentUpdate, current_user: User = De
 
 
 @router.post("/{content_id}/approve")
-async def approve_content(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def approve_content(content_id: int, request: Request,
+                           current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not c:
         raise HTTPException(404, "Content not found")
@@ -183,6 +186,9 @@ async def approve_content(content_id: int, current_user: User = Depends(get_curr
             # Never fail approve because of briefing — silent fallback
             pass
     db.commit()
+    log_action(db, user=current_user, action="content.approve",
+                client_id=c.client_id, target_type="content_piece", target_id=c.id,
+                meta={"title": c.title}, request=request)
     return _serialize(c)
 
 
