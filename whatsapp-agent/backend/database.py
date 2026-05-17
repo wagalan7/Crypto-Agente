@@ -113,12 +113,79 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN caldav_url TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN caldav_username TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN caldav_password TEXT DEFAULT ''",
+            # Dados de faturamento (obrigatórios no onboarding)
+            "ALTER TABLE tenants ADD COLUMN full_name TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN cpf_cnpj TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN billing_zip TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN billing_address TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN billing_number TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN billing_complement TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN billing_neighborhood TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN billing_city TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN billing_state TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN phone TEXT DEFAULT ''",
         ]
         for sql in migrations:
             try:
                 conn.execute(sql)
             except sqlite3.OperationalError:
                 pass  # coluna já existe
+
+        # ── Tabelas auxiliares (admin, tracking, CMS) ─────────────────────────
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS admin_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT DEFAULT '',
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                token TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS landing_views (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                viewed_at TEXT DEFAULT (datetime('now')),
+                ip TEXT DEFAULT '',
+                user_agent TEXT DEFAULT '',
+                referrer TEXT DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS site_content (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_landing_views_date ON landing_views(viewed_at);
+            CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at);
+        """)
+
+        # Seed do usuário admin padrão (alanmalta) se ainda não existir
+        _seed_default_admin(conn)
+
+
+def _seed_default_admin(conn):
+    """Cria o usuário admin padrão se nenhum existir."""
+    import os, hashlib, secrets as _secrets
+    row = conn.execute("SELECT COUNT(*) AS n FROM admin_users").fetchone()
+    if row["n"] > 0:
+        return
+    username = os.getenv("ADMIN_USERNAME", "alanmalta")
+    email    = os.getenv("ADMIN_EMAIL", "wagalan@gmail.com")
+    password = os.getenv("ADMIN_PASSWORD", "@l61310788")
+    salt = _secrets.token_hex(16)
+    pw_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+    conn.execute(
+        "INSERT INTO admin_users (username, email, password_hash, salt) VALUES (?, ?, ?, ?)",
+        (username, email, pw_hash, salt),
+    )
 
 
 @contextmanager
@@ -204,6 +271,9 @@ def update_tenant(slug: str, **fields) -> bool:
         "working_days", "blocked_hours", "confirmation_hour", "psychologist_phone", "plan",
         "free_until", "plan_expires_at",
         "caldav_url", "caldav_username", "caldav_password",
+        "full_name", "cpf_cnpj", "phone",
+        "billing_zip", "billing_address", "billing_number", "billing_complement",
+        "billing_neighborhood", "billing_city", "billing_state",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -509,3 +579,212 @@ def get_billing_logs(tenant_id: int, limit: int = 50) -> list[dict]:
             ORDER BY sent_at DESC LIMIT ?
         """, (tenant_id, limit)).fetchall()
     return [dict(r) for r in rows]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Admin (autenticação)
+# ════════════════════════════════════════════════════════════════════════════
+
+import hashlib as _hashlib
+import secrets as _secrets
+from datetime import datetime as _datetime, timedelta as _timedelta
+
+
+def admin_verify_login(username_or_email: str, password: str) -> dict | None:
+    """Valida credenciais. Retorna o admin (sem senha) ou None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM admin_users WHERE username = ? OR email = ? LIMIT 1",
+            (username_or_email, username_or_email),
+        ).fetchone()
+    if not row:
+        return None
+    expected = _hashlib.pbkdf2_hmac("sha256", password.encode(), row["salt"].encode(), 100_000).hex()
+    if not _secrets.compare_digest(expected, row["password_hash"]):
+        return None
+    return {"id": row["id"], "username": row["username"], "email": row["email"]}
+
+
+def admin_create_session(username: str, days: int = 7) -> str:
+    """Cria token de sessão e retorna o token."""
+    token = _secrets.token_urlsafe(32)
+    expires = (_datetime.utcnow() + _timedelta(days=days)).isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO admin_sessions (token, username, expires_at) VALUES (?, ?, ?)",
+            (token, username, expires),
+        )
+    return token
+
+
+def admin_get_session(token: str) -> dict | None:
+    """Retorna sessão se válida e não expirada, senão None."""
+    if not token:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM admin_sessions WHERE token = ?", (token,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        if _datetime.fromisoformat(row["expires_at"]) < _datetime.utcnow():
+            return None
+    except Exception:
+        return None
+    return dict(row)
+
+
+def admin_delete_session(token: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM admin_sessions WHERE token = ?", (token,))
+
+
+def admin_change_password(username: str, new_password: str) -> bool:
+    salt = _secrets.token_hex(16)
+    pw_hash = _hashlib.pbkdf2_hmac("sha256", new_password.encode(), salt.encode(), 100_000).hex()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE admin_users SET password_hash = ?, salt = ? WHERE username = ?",
+            (pw_hash, salt, username),
+        )
+        return cur.rowcount > 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Landing page tracking
+# ════════════════════════════════════════════════════════════════════════════
+
+def record_landing_view(ip: str = "", user_agent: str = "", referrer: str = ""):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO landing_views (ip, user_agent, referrer) VALUES (?, ?, ?)",
+            (ip[:64], user_agent[:512], referrer[:512]),
+        )
+
+
+def count_landing_views(days: int | None = None) -> int:
+    sql = "SELECT COUNT(*) AS n FROM landing_views"
+    params = ()
+    if days:
+        sql += " WHERE viewed_at >= datetime('now', ?)"
+        params = (f"-{int(days)} days",)
+    with get_conn() as conn:
+        row = conn.execute(sql, params).fetchone()
+    return int(row["n"] or 0)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CMS / Conteúdo do site (depoimentos editáveis, etc)
+# ════════════════════════════════════════════════════════════════════════════
+
+def get_site_content(key: str, default: str = "") -> str:
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM site_content WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_site_content(key: str, value: str):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO site_content (key, value, updated_at) VALUES (?, ?, datetime('now'))
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')""",
+            (key, value),
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Admin stats — métricas agregadas
+# ════════════════════════════════════════════════════════════════════════════
+
+# Preços dos planos (sincronizados com stripe_service.PLANS)
+_PLAN_MONTHLY_VALUE = {"mensal": 199.0, "semestral": 169.0, "anual": 149.0}
+
+
+def admin_stats_overview() -> dict:
+    """Retorna KPIs do painel: tenants, MRR, vendas, conversão."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT status, plan, free_until, created_at FROM tenants WHERE active = 1"
+        ).fetchall()
+
+    total = len(rows)
+    active = sum(1 for r in rows if r["status"] == "active")
+    suspended = sum(1 for r in rows if r["status"] == "suspended")
+    pending = sum(1 for r in rows if r["status"] == "pending_payment")
+
+    # MRR = soma de active * valor mensal-equivalente do plano
+    mrr = 0.0
+    by_plan = {"mensal": 0, "semestral": 0, "anual": 0}
+    for r in rows:
+        if r["status"] != "active":
+            continue
+        plan = r["plan"] or "mensal"
+        by_plan[plan] = by_plan.get(plan, 0) + 1
+        mrr += _PLAN_MONTHLY_VALUE.get(plan, 199.0)
+
+    # Cadastros nas últimas 24h e 7d
+    new_24h = sum(1 for r in rows if r["created_at"] and r["created_at"] >= (_datetime.utcnow() - _timedelta(days=1)).isoformat())
+    new_7d  = sum(1 for r in rows if r["created_at"] and r["created_at"] >= (_datetime.utcnow() - _timedelta(days=7)).isoformat())
+
+    views_total = count_landing_views()
+    views_7d = count_landing_views(7)
+    views_30d = count_landing_views(30)
+
+    return {
+        "tenants": {"total": total, "active": active, "suspended": suspended, "pending_payment": pending},
+        "mrr": round(mrr, 2),
+        "by_plan": by_plan,
+        "signups": {"last_24h": new_24h, "last_7d": new_7d},
+        "landing_views": {"total": views_total, "last_7d": views_7d, "last_30d": views_30d},
+        "conversion_30d": round((active / views_30d * 100), 2) if views_30d else 0.0,
+    }
+
+
+def admin_list_subscriptions() -> list[dict]:
+    """Lista todas as assinaturas ativas com plano, vencimento, etc."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, slug, name, full_name, email, phone, psychologist_name,
+                   plan, status, plan_expires_at, free_until, created_at,
+                   stripe_subscription_id, mp_subscription_id
+            FROM tenants
+            WHERE active = 1 AND status = 'active'
+            ORDER BY created_at DESC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def admin_list_abandoned_carts(hours_min: int = 1) -> list[dict]:
+    """Pessoas que criaram conta mas não pagaram (status pending_payment, criados há > hours_min)."""
+    cutoff = (_datetime.utcnow() - _timedelta(hours=hours_min)).isoformat()
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, slug, name, full_name, email, phone, cpf_cnpj,
+                   plan, setup_token, created_at
+            FROM tenants
+            WHERE active = 1 AND status = 'pending_payment' AND created_at <= ?
+            ORDER BY created_at DESC
+        """, (cutoff,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def admin_list_all_tenants() -> list[dict]:
+    """Lista completa de tenants para gestão."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, slug, name, full_name, email, phone, cpf_cnpj,
+                   psychologist_name, plan, status, plan_expires_at, free_until,
+                   billing_city, billing_state, created_at,
+                   stripe_subscription_id, mp_subscription_id, dashboard_token, setup_token
+            FROM tenants
+            WHERE active = 1
+            ORDER BY created_at DESC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def admin_get_tenant_full(slug: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM tenants WHERE slug = ?", (slug,)).fetchone()
+    return dict(row) if row else None
