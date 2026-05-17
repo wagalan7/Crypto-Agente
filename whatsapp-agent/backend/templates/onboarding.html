@@ -37,10 +37,85 @@
             class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
         </div>
 
+        <!-- ── DADOS DE FATURAMENTO (obrigatórios) ───────────────────────────── -->
+        <div class="pt-2 border-t border-gray-100">
+          <h3 class="text-sm font-semibold text-gray-800 mb-3 mt-2">Dados de faturamento</h3>
+        </div>
+
         <div>
-          <label class="block text-sm font-medium text-gray-700 mb-1">E-mail <span class="text-red-500">*</span></label>
-          <input id="email" type="email" placeholder="seu@email.com"
+          <label class="block text-sm font-medium text-gray-700 mb-1">Nome completo do titular <span class="text-red-500">*</span></label>
+          <input id="full_name" type="text" placeholder="Ex: Ana Lima Silva"
             class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">E-mail <span class="text-red-500">*</span></label>
+            <input id="email" type="email" placeholder="seu@email.com"
+              class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">WhatsApp/Telefone <span class="text-red-500">*</span></label>
+            <input id="phone" type="tel" placeholder="(11) 99999-9999"
+              class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">CPF ou CNPJ <span class="text-red-500">*</span></label>
+          <input id="cpf_cnpj" type="text" placeholder="000.000.000-00 ou 00.000.000/0000-00"
+            class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+
+        <div class="grid grid-cols-[1fr_2fr] gap-3">
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">CEP <span class="text-red-500">*</span></label>
+            <input id="zip" type="text" placeholder="00000-000" maxlength="9"
+              class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+            <p id="cep-status" class="text-xs text-gray-400 mt-1 hidden">Buscando...</p>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Endereço (rua/av.) <span class="text-red-500">*</span></label>
+            <input id="addr" type="text" placeholder="Rua das Flores"
+              class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Número <span class="text-red-500">*</span></label>
+            <input id="num" type="text" placeholder="123"
+              class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Complemento</label>
+            <input id="compl" type="text" placeholder="Sala 4, Apto 12 (opcional)"
+              class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Bairro <span class="text-red-500">*</span></label>
+          <input id="neigh" type="text" placeholder="Centro"
+            class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+
+        <div class="grid grid-cols-[2fr_1fr] gap-3">
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Cidade <span class="text-red-500">*</span></label>
+            <input id="city" type="text" placeholder="São Paulo"
+              class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">UF <span class="text-red-500">*</span></label>
+            <input id="state" type="text" placeholder="SP" maxlength="2"
+              class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm uppercase focus:outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+        </div>
+
+        <!-- ── HORÁRIOS ──────────────────────────────────────────────────────── -->
+        <div class="pt-2 border-t border-gray-100">
+          <h3 class="text-sm font-semibold text-gray-800 mb-3 mt-2">Horário de atendimento</h3>
         </div>
 
         <div class="grid grid-cols-2 gap-3">
@@ -87,25 +162,82 @@
 </div>
 
 <script>
-async function submit() {
-  const name    = document.getElementById("name").value.trim();
-  const psy     = document.getElementById("psy").value.trim();
-  const email   = document.getElementById("email").value.trim();
-  const start   = +document.getElementById("start").value;
-  const end     = +document.getElementById("end").value;
-  const minutes = +document.getElementById("minutes").value;
-  const errEl   = document.getElementById("error-msg");
-  const btn     = document.getElementById("btn");
+const v = (id) => document.getElementById(id).value.trim();
 
+// Máscara CEP + ViaCEP autocomplete
+const cepEl = document.getElementById("zip");
+cepEl.addEventListener("input", (e) => {
+  let s = e.target.value.replace(/\D/g, "").slice(0, 8);
+  if (s.length > 5) s = s.slice(0,5) + "-" + s.slice(5);
+  e.target.value = s;
+});
+cepEl.addEventListener("blur", async () => {
+  const cep = cepEl.value.replace(/\D/g, "");
+  if (cep.length !== 8) return;
+  const status = document.getElementById("cep-status");
+  status.textContent = "Buscando..."; status.classList.remove("hidden");
+  try {
+    const r = await fetch(`https://viacep.com.br/ws/${cep}/json/`);
+    const d = await r.json();
+    if (d.erro) { status.textContent = "CEP não encontrado"; return; }
+    if (!document.getElementById("addr").value) document.getElementById("addr").value = d.logradouro || "";
+    if (!document.getElementById("neigh").value) document.getElementById("neigh").value = d.bairro || "";
+    if (!document.getElementById("city").value) document.getElementById("city").value = d.localidade || "";
+    if (!document.getElementById("state").value) document.getElementById("state").value = (d.uf || "").toUpperCase();
+    status.classList.add("hidden");
+    document.getElementById("num").focus();
+  } catch { status.textContent = "Falha ao buscar CEP"; }
+});
+
+// Máscara CPF/CNPJ
+document.getElementById("cpf_cnpj").addEventListener("input", (e) => {
+  let s = e.target.value.replace(/\D/g, "").slice(0, 14);
+  if (s.length <= 11) {
+    s = s.replace(/(\d{3})(\d)/, "$1.$2").replace(/(\d{3})(\d)/, "$1.$2").replace(/(\d{3})(\d{1,2})$/, "$1-$2");
+  } else {
+    s = s.replace(/^(\d{2})(\d)/, "$1.$2").replace(/^(\d{2})\.(\d{3})(\d)/, "$1.$2.$3").replace(/\.(\d{3})(\d)/, ".$1/$2").replace(/(\d{4})(\d)/, "$1-$2");
+  }
+  e.target.value = s;
+});
+
+async function submit() {
+  const payload = {
+    name: v("name"),
+    psychologist_name: v("psy"),
+    full_name: v("full_name"),
+    email: v("email"),
+    phone: v("phone"),
+    cpf_cnpj: v("cpf_cnpj"),
+    billing_zip: v("zip"),
+    billing_address: v("addr"),
+    billing_number: v("num"),
+    billing_complement: v("compl"),
+    billing_neighborhood: v("neigh"),
+    billing_city: v("city"),
+    billing_state: v("state").toUpperCase(),
+    working_hours_start: +document.getElementById("start").value,
+    working_hours_end: +document.getElementById("end").value,
+    session_minutes: +document.getElementById("minutes").value,
+  };
+  const errEl = document.getElementById("error-msg");
+  const btn   = document.getElementById("btn");
   errEl.classList.add("hidden");
 
-  if (!name || !psy || !email) {
-    errEl.textContent = "Preencha todos os campos obrigatórios.";
+  const required = ["name","psychologist_name","full_name","email","phone","cpf_cnpj","billing_zip","billing_address","billing_number","billing_neighborhood","billing_city","billing_state"];
+  for (const k of required) {
+    if (!payload[k]) {
+      errEl.textContent = "Preencha todos os campos obrigatórios marcados com *.";
+      errEl.classList.remove("hidden");
+      return;
+    }
+  }
+  if (payload.working_hours_end <= payload.working_hours_start) {
+    errEl.textContent = "O horário de fim deve ser depois do início.";
     errEl.classList.remove("hidden");
     return;
   }
-  if (end <= start) {
-    errEl.textContent = "O horário de fim deve ser depois do início.";
+  if (payload.billing_state.length !== 2) {
+    errEl.textContent = "UF deve ter 2 letras (ex: SP).";
     errEl.classList.remove("hidden");
     return;
   }
@@ -117,7 +249,7 @@ async function submit() {
     const r = await fetch("/onboarding/create", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ name, psychologist_name: psy, email, working_hours_start: start, working_hours_end: end, session_minutes: minutes })
+      body: JSON.stringify(payload)
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || "Erro ao criar consultório.");
