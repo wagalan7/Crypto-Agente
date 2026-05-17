@@ -41,6 +41,22 @@ export interface ContentPiece {
   production_brief?: ProductionBrief | null
   voice_score?: number | null
   voice_feedback?: { verdict: string; weakest_part: string | null; fix_hint: string } | null
+  edit_count?: number | null
+  review_notes?: string | null
+}
+
+export interface ContentVersion {
+  id: number
+  content_id: number
+  version_number: number
+  title: string | null
+  hook: string | null
+  script: string | null
+  copy: string | null
+  design_brief: string | null
+  change_summary: string | null
+  edited_by_user: boolean
+  created_at: string | null
 }
 
 export interface ProductionBrief {
@@ -70,6 +86,8 @@ export interface Persona {
   audience_profile: string
   evidence: string
   generated_at: string | null
+  user_refinements?: Array<{ field: string; note?: string; previous?: unknown; at?: string }>
+  edit_count?: number
 }
 
 export interface Inspiration {
@@ -79,6 +97,8 @@ export interface Inspiration {
   source_value: string
   label: string | null
   analysis: Record<string, unknown>
+  visual_analysis?: Record<string, unknown> | null
+  image_url?: string | null
   adapted_brief: string | null
   created_at: string | null
 }
@@ -120,6 +140,11 @@ export interface KnowledgeItem {
   content: string
   source_type: string
   tags: string[]
+  summary?: string | null
+  key_insights?: string[] | null
+  voice_signals?: string[] | null
+  use_count?: number | null
+  last_used_at?: string | null
   created_at: string | null
 }
 
@@ -159,6 +184,10 @@ export interface CalendarSlot {
   format: string
   objective: string
   status: 'planned' | 'ready' | 'published'
+  narrative?: string | null
+  intent?: string | null
+  hook_idea?: string | null
+  strategic_reasoning?: string | null
 }
 
 export interface MetricsSummary {

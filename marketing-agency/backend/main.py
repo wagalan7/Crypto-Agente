@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from database import init_db
-from routers import auth, clients, agents, content, analytics, calendar, social, persona, inspirations, products, knowledge, strategy, trends, billing
+from routers import auth, clients, agents, content, analytics, calendar, social, persona, inspirations, products, knowledge, strategy, trends, billing, amplifier
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ app.include_router(knowledge.router)
 app.include_router(strategy.router)
 app.include_router(trends.router)
 app.include_router(billing.router)
+app.include_router(amplifier.router)
 
 
 @app.get("/health")

@@ -15,13 +15,21 @@ FORMATO OBRIGATÓRIO — JSON puro:
   "audience_behavior": "1-2 frases sobre o que a audiência está fazendo agora",
   "trends": ["trend útil 1", "2"],
   "emotional_sequence": [
-    {"day": "segunda", "emotion": "identificação", "intent": "atrair pessoas certas", "format_suggestion": "reels curto com hook de dor"},
-    {"day": "terça", "emotion": "vulnerabilidade", "intent": "conectar", "format_suggestion": "carrossel narrativa pessoal"},
-    {"day": "quarta", "emotion": "autoridade", "intent": "ensinar", "format_suggestion": "carrossel didático"},
-    {"day": "quinta", "emotion": "quebra de objeção", "intent": "destravar venda", "format_suggestion": "reels com mito vs verdade"},
-    {"day": "sexta", "emotion": "desejo", "intent": "ativar transformação", "format_suggestion": "reels case/depoimento"},
-    {"day": "sábado", "emotion": "compartilhamento", "intent": "alcance orgânico", "format_suggestion": "post relacionável"},
-    {"day": "domingo", "emotion": "reflexão", "intent": "fidelizar", "format_suggestion": "carrossel filosófico"}
+    {
+      "day": "segunda",
+      "emotion": "identificação",
+      "intent": "atrair pessoas certas — o que a persona deve sentir/fazer",
+      "format_suggestion": "reels curto com hook de dor",
+      "narrative": "qual história/ângulo o post conta (frase curta, concreta)",
+      "hook": "ideia de hook em 1 linha — não slogan genérico",
+      "why": "por que ESSE dia pede ISSO no contexto da marca"
+    },
+    {"day": "terça", "emotion": "vulnerabilidade", "intent": "...", "format_suggestion": "...", "narrative": "...", "hook": "...", "why": "..."},
+    {"day": "quarta", "emotion": "autoridade", "intent": "...", "format_suggestion": "...", "narrative": "...", "hook": "...", "why": "..."},
+    {"day": "quinta", "emotion": "quebra de objeção", "intent": "...", "format_suggestion": "...", "narrative": "...", "hook": "...", "why": "..."},
+    {"day": "sexta", "emotion": "desejo", "intent": "...", "format_suggestion": "...", "narrative": "...", "hook": "...", "why": "..."},
+    {"day": "sábado", "emotion": "compartilhamento", "intent": "...", "format_suggestion": "...", "narrative": "...", "hook": "...", "why": "..."},
+    {"day": "domingo", "emotion": "reflexão", "intent": "...", "format_suggestion": "...", "narrative": "...", "hook": "...", "why": "..."}
   ]
 }
 

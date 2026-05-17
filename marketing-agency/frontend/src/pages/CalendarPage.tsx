@@ -27,6 +27,7 @@ export function CalendarPage() {
   const [loading, setLoading] = useState(true)
   const [dragOverDay, setDragOverDay] = useState<string | null>(null)
   const [rescheduleMsg, setRescheduleMsg] = useState<string | null>(null)
+  const [expandedSlot, setExpandedSlot] = useState<number | null>(null)
 
   async function load() {
     setLoading(true)
@@ -197,25 +198,41 @@ export function CalendarPage() {
           {slots.map(slot => {
             const date = new Date(slot.scheduled_at)
             const isToday = slot.scheduled_at.slice(0, 10) === today
+            const isOpen = expandedSlot === slot.id
+            const hasStrategy = !!(slot.narrative || slot.intent || slot.hook_idea || slot.strategic_reasoning)
             return (
-              <div key={slot.id} className={`card flex items-center gap-3 py-3 ${isToday ? 'border-violet-700 bg-violet-900/5' : ''}`}>
-                <div className="w-12 text-center shrink-0">
-                  <p className="text-[10px] text-gray-400">{date.toLocaleDateString('pt-BR', { weekday: 'short' })}</p>
-                  <p className={`text-base font-bold ${isToday ? 'text-violet-400' : 'text-white'}`}>{date.getDate()}</p>
-                  <p className="text-[10px] text-gray-500">{date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</p>
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <span className={`badge border text-[10px] ${OBJECTIVE_COLORS[slot.objective] || 'bg-gray-700 text-gray-300 border-gray-600'}`}>
-                      {OBJECTIVE_LABELS[slot.objective] || slot.objective}
+              <div key={slot.id} className={`card py-3 ${isToday ? 'border-violet-700 bg-violet-900/5' : ''}`}>
+                <div className="flex items-center gap-3">
+                  <div className="w-12 text-center shrink-0">
+                    <p className="text-[10px] text-gray-400">{date.toLocaleDateString('pt-BR', { weekday: 'short' })}</p>
+                    <p className={`text-base font-bold ${isToday ? 'text-violet-400' : 'text-white'}`}>{date.getDate()}</p>
+                    <p className="text-[10px] text-gray-500">{date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</p>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className={`badge border text-[10px] ${OBJECTIVE_COLORS[slot.objective] || 'bg-gray-700 text-gray-300 border-gray-600'}`}>
+                        {OBJECTIVE_LABELS[slot.objective] || slot.objective}
+                      </span>
+                      <span className="text-xs text-gray-400">{FORMAT_LABELS[slot.format] || slot.format}</span>
+                      <span className="text-xs text-gray-500">{slot.platform}</span>
+                    </div>
+                    {slot.hook_idea && !isOpen && (
+                      <p className="text-xs text-gray-300 mt-1 truncate">💡 {slot.hook_idea}</p>
+                    )}
+                    {slot.intent && !isOpen && !slot.hook_idea && (
+                      <p className="text-xs text-gray-400 mt-1 truncate">{slot.intent}</p>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className={`text-xs ${slot.content_id ? 'text-green-400' : 'text-gray-600'}`}>
+                      {slot.content_id ? '●' : '○'}
                     </span>
-                    <span className="text-xs text-gray-400">{FORMAT_LABELS[slot.format] || slot.format}</span>
-                    <span className="text-xs text-gray-500">{slot.platform}</span>
+                    <button onClick={() => setExpandedSlot(isOpen ? null : slot.id)} className="text-[10px] text-violet-400 hover:text-violet-300">
+                      {isOpen ? 'fechar' : hasStrategy ? 'estratégia' : '+'}
+                    </button>
                   </div>
                 </div>
-                <span className={`text-xs shrink-0 ${slot.content_id ? 'text-green-400' : 'text-gray-600'}`}>
-                  {slot.content_id ? '●' : '○'}
-                </span>
+                {isOpen && <SlotEditor slot={slot} onSaved={load} />}
               </div>
             )
           })}
@@ -228,6 +245,57 @@ export function CalendarPage() {
           <p className="text-gray-600 text-xs">Clique em "Gerar semana" para criar o calendário</p>
         </div>
       )}
+    </div>
+  )
+}
+
+function SlotEditor({ slot, onSaved }: { slot: CalendarSlot; onSaved: () => void }) {
+  const [narrative, setNarrative] = useState(slot.narrative || '')
+  const [intent, setIntent] = useState(slot.intent || '')
+  const [hookIdea, setHookIdea] = useState(slot.hook_idea || '')
+  const [reasoning, setReasoning] = useState(slot.strategic_reasoning || '')
+  const [saving, setSaving] = useState(false)
+  const [msg, setMsg] = useState('')
+
+  async function save() {
+    setSaving(true); setMsg('')
+    try {
+      await api.calendar.updateSlot(slot.id, {
+        narrative: narrative || undefined,
+        intent: intent || undefined,
+        hook_idea: hookIdea || undefined,
+        strategic_reasoning: reasoning || undefined,
+      })
+      setMsg('✓ Salvo')
+      onSaved()
+      setTimeout(() => setMsg(''), 1500)
+    } catch (e: any) {
+      setMsg(`Erro: ${e?.message?.slice(0, 80) || 'falha'}`)
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <div className="mt-3 pt-3 border-t border-gray-800 space-y-2">
+      <div>
+        <label className="text-[10px] text-gray-500 font-semibold uppercase">Hook</label>
+        <input value={hookIdea} onChange={e => setHookIdea(e.target.value)} placeholder="Ideia do hook em 1 linha" className="input text-xs" />
+      </div>
+      <div>
+        <label className="text-[10px] text-gray-500 font-semibold uppercase">Intenção</label>
+        <input value={intent} onChange={e => setIntent(e.target.value)} placeholder="O que a persona deve sentir/fazer" className="input text-xs" />
+      </div>
+      <div>
+        <label className="text-[10px] text-gray-500 font-semibold uppercase">Narrativa</label>
+        <textarea rows={2} value={narrative} onChange={e => setNarrative(e.target.value)} placeholder="Qual história/ângulo o post conta" className="input text-xs" />
+      </div>
+      <div>
+        <label className="text-[10px] text-gray-500 font-semibold uppercase">Por que esse dia</label>
+        <textarea rows={2} value={reasoning} onChange={e => setReasoning(e.target.value)} placeholder="Justificativa estratégica" className="input text-xs" />
+      </div>
+      <div className="flex items-center gap-2 justify-end">
+        {msg && <span className="text-[10px] text-gray-400">{msg}</span>}
+        <button onClick={save} disabled={saving} className="btn-primary text-xs">{saving ? '...' : 'Salvar'}</button>
+      </div>
     </div>
   )
 }

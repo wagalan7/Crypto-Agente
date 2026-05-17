@@ -58,6 +58,8 @@ def _run_lightweight_migrations():
         "voice_feedback": "TEXT",
         "publish_attempts": "INTEGER DEFAULT 0",
         "next_retry_at": "TIMESTAMP",
+        "edit_count": "INTEGER DEFAULT 0",
+        "review_notes": "TEXT",
     }
 
     if "content_pieces" in inspector.get_table_names():
@@ -90,3 +92,72 @@ def _run_lightweight_migrations():
                     conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {coltype}"))
                 else:
                     conn.execute(text(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {coltype}"))
+
+    # Phase 16: strategic calendar fields
+    slot_columns = {
+        "narrative": "TEXT",
+        "intent": "TEXT",
+        "hook_idea": "TEXT",
+        "strategic_reasoning": "TEXT",
+    }
+    if "calendar_slots" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("calendar_slots")}
+        with engine.begin() as conn:
+            for col, coltype in slot_columns.items():
+                if col in existing:
+                    continue
+                if is_sqlite:
+                    conn.execute(text(f"ALTER TABLE calendar_slots ADD COLUMN {col} {coltype}"))
+                else:
+                    conn.execute(text(f"ALTER TABLE calendar_slots ADD COLUMN IF NOT EXISTS {col} {coltype}"))
+
+    # Phase 16: persona refinement loop
+    persona_columns = {
+        "user_refinements": "JSON" if not is_sqlite else "TEXT",
+        "edit_count": "INTEGER DEFAULT 0",
+    }
+    if "personas" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("personas")}
+        with engine.begin() as conn:
+            for col, coltype in persona_columns.items():
+                if col in existing:
+                    continue
+                if is_sqlite:
+                    conn.execute(text(f"ALTER TABLE personas ADD COLUMN {col} {coltype}"))
+                else:
+                    conn.execute(text(f"ALTER TABLE personas ADD COLUMN IF NOT EXISTS {col} {coltype}"))
+
+    # Phase 16: inspirations gain visual analysis + image_url
+    insp_columns = {
+        "visual_analysis": "JSON" if not is_sqlite else "TEXT",
+        "image_url": "TEXT",
+    }
+    if "inspirations" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("inspirations")}
+        with engine.begin() as conn:
+            for col, coltype in insp_columns.items():
+                if col in existing:
+                    continue
+                if is_sqlite:
+                    conn.execute(text(f"ALTER TABLE inspirations ADD COLUMN {col} {coltype}"))
+                else:
+                    conn.execute(text(f"ALTER TABLE inspirations ADD COLUMN IF NOT EXISTS {col} {coltype}"))
+
+    # Phase 16: knowledge items gain AI-extracted intelligence
+    ki_columns = {
+        "summary": "TEXT",
+        "key_insights": "JSON" if not is_sqlite else "TEXT",
+        "voice_signals": "JSON" if not is_sqlite else "TEXT",
+        "last_used_at": "TIMESTAMP",
+        "use_count": "INTEGER DEFAULT 0",
+    }
+    if "knowledge_items" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("knowledge_items")}
+        with engine.begin() as conn:
+            for col, coltype in ki_columns.items():
+                if col in existing:
+                    continue
+                if is_sqlite:
+                    conn.execute(text(f"ALTER TABLE knowledge_items ADD COLUMN {col} {coltype}"))
+                else:
+                    conn.execute(text(f"ALTER TABLE knowledge_items ADD COLUMN IF NOT EXISTS {col} {coltype}"))

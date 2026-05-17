@@ -64,6 +64,16 @@ export function AgentsPage() {
   const [autoOutput, setAutoOutput] = useState('')
   const [autoResult, setAutoResult] = useState<{ content_id: number; image_url: string; title: string; objective?: string; objective_reasoning?: string; emotion_used?: string; funnel_stage?: string; format_reasoning?: string } | null>(null)
   const [autoRunning, setAutoRunning] = useState(false)
+  const [inspirations, setInspirations] = useState<Array<{ id: number; label?: string | null; image_url?: string | null; source_value: string }>>([])
+  const [selectedInspirationIds, setSelectedInspirationIds] = useState<number[]>([])
+
+  useEffect(() => {
+    api.inspirations.list(id).then((r: any) => setInspirations(r || [])).catch(() => {})
+  }, [id])
+
+  function toggleInspiration(insId: number) {
+    setSelectedInspirationIds(prev => prev.includes(insId) ? prev.filter(x => x !== insId) : [...prev, insId])
+  }
 
   async function runAuto() {
     setAutoRunning(true)
@@ -71,7 +81,7 @@ export function AgentsPage() {
     setAutoOutput('')
     setAutoResult(null)
     try {
-      const gen = api.agents.auto(id, autoForm.site_url, autoForm.topic, autoForm.format, autoForm.platform, autoForm.objective)
+      const gen = api.agents.auto(id, autoForm.site_url, autoForm.topic, autoForm.format, autoForm.platform, autoForm.objective, selectedInspirationIds.length ? selectedInspirationIds : undefined)
       for await (const ev of gen) {
         if (ev.type === 'status') setAutoStatus(ev.payload as string)
         else if (ev.type === 'chunk') setAutoOutput(prev => prev + ev.payload)
@@ -216,6 +226,35 @@ export function AgentsPage() {
               </div>
             </div>
           </div>
+
+          {inspirations.length > 0 && (
+            <div>
+              <label className="text-xs text-gray-400 mb-1.5 block">
+                Referências visuais (opcional — IA replica estética){selectedInspirationIds.length > 0 && <span className="text-violet-400"> · {selectedInspirationIds.length} selecionada(s)</span>}
+              </label>
+              <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-none">
+                {inspirations.map(ins => {
+                  const selected = selectedInspirationIds.includes(ins.id)
+                  return (
+                    <button
+                      key={ins.id}
+                      type="button"
+                      onClick={() => toggleInspiration(ins.id)}
+                      className={`shrink-0 w-20 rounded-lg border-2 p-1 text-left transition-colors ${selected ? 'border-violet-500 bg-violet-900/30' : 'border-gray-700 bg-gray-900'}`}
+                      title={ins.label || ins.source_value}
+                    >
+                      {ins.image_url ? (
+                        <img src={ins.image_url} alt="" className="w-full h-16 object-cover rounded" />
+                      ) : (
+                        <div className="w-full h-16 bg-gray-800 rounded flex items-center justify-center text-[10px] text-gray-500">{ins.source_value.slice(0, 20)}</div>
+                      )}
+                      <p className="text-[9px] text-gray-400 truncate mt-1">{ins.label || 'ref'}</p>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
 
           <div className="flex items-center justify-between">
             {autoStatus && (

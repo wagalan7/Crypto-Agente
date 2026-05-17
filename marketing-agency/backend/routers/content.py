@@ -6,16 +6,54 @@ from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
 from database import get_db
-from models import ContentPiece, User, Product, Client, Inspiration, AgentMemory
+from models import ContentPiece, User, Product, Client, Inspiration, AgentMemory, ContentVersion, Persona
 from auth import get_current_user, assert_client_access
 from agents import ProductionBriefingAgent, SectionRewriterAgent, InspirationAlignmentAgent, RepurposeAgent, VoiceScorerAgent
 from agents.production_briefing import parse_json_response as parse_brief_json
 from agents.inspiration_alignment import parse_json_response as parse_align_json
 from agents.repurpose import parse_json_response as parse_repurpose_json
 from agents.voice_scorer import parse_json_response as parse_voice_json
-from services import BrandBrain
+from services import BrandBrain, humanize_clean, humanize_with_voice
 from services.plans import assert_can_create_content, assert_feature
 from services.audit import log_action
+
+
+# ---------------- Status workflow (Phase 16: flexible approval) ----------------
+# Allowed statuses + transitions. We accept any string for backward compat but
+# this set documents the workflow used by the new UI.
+STATUS_DRAFT = "draft"
+STATUS_PENDING = "pending"          # awaiting review (default for fresh AI output)
+STATUS_NEEDS_CHANGES = "needs_changes"  # reviewer asked for refinement
+STATUS_APPROVED = "approved"
+STATUS_RECORDED = "recorded"
+STATUS_PUBLISHED = "published"
+
+ALLOWED_STATUSES = {STATUS_DRAFT, STATUS_PENDING, STATUS_NEEDS_CHANGES,
+                    STATUS_APPROVED, STATUS_RECORDED, STATUS_PUBLISHED}
+
+# Snapshot a version BEFORE mutating these fields
+VERSIONED_FIELDS = ("title", "hook", "script", "copy", "design_brief")
+
+
+def _snapshot_version(db, c: ContentPiece, change_summary: str, edited_by_user: bool = True):
+    """Persist a ContentVersion row capturing the current state of c BEFORE the edit."""
+    try:
+        next_n = (db.query(ContentVersion).filter(ContentVersion.content_id == c.id).count() or 0) + 1
+        v = ContentVersion(
+            content_id=c.id,
+            version_number=next_n,
+            title=c.title,
+            hook=c.hook,
+            script=c.script,
+            copy=c.copy,
+            design_brief=c.design_brief,
+            change_summary=change_summary[:300],
+            edited_by_user=edited_by_user,
+        )
+        db.add(v)
+    except Exception:
+        # Versioning is best-effort — never block the edit
+        pass
 from fastapi import Request
 
 REGEN_SECTIONS = {"hook", "script", "copy", "design_brief"}
@@ -58,6 +96,7 @@ class ContentUpdate(BaseModel):
     funnel_stage: Optional[str] = None
     format_reasoning: Optional[str] = None
     linked_product_id: Optional[int] = None
+    review_notes: Optional[str] = None
 
 
 def _serialize(c: ContentPiece, product_name: Optional[str] = None) -> dict:
@@ -87,6 +126,8 @@ def _serialize(c: ContentPiece, product_name: Optional[str] = None) -> dict:
         "production_brief": json.loads(c.production_brief) if c.production_brief else None,
         "voice_score": c.voice_score,
         "voice_feedback": json.loads(c.voice_feedback) if c.voice_feedback else None,
+        "edit_count": c.edit_count or 0,
+        "review_notes": c.review_notes,
         "scheduled_at": c.scheduled_at.isoformat() if c.scheduled_at else None,
         "published_at": c.published_at.isoformat() if c.published_at else None,
         "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -144,10 +185,131 @@ def update_content(content_id: int, data: ContentUpdate, current_user: User = De
     if not c:
         raise HTTPException(404, "Content not found")
     assert_client_access(c.client_id, current_user, db)
-    for field, value in data.model_dump(exclude_unset=True).items():
+
+    payload = data.model_dump(exclude_unset=True)
+    # Snapshot the BEFORE state if any versioned field is changing
+    touched = [f for f in VERSIONED_FIELDS if f in payload and payload[f] != getattr(c, f)]
+    if touched:
+        _snapshot_version(db, c, change_summary=f"editou: {', '.join(touched)}", edited_by_user=True)
+        c.edit_count = (c.edit_count or 0) + 1
+
+    for field, value in payload.items():
+        # Humanize free-text fields (cheap deterministic cleanup)
+        if field in VERSIONED_FIELDS and isinstance(value, str):
+            value = humanize_clean(value)
+        if field == "status" and value and value not in ALLOWED_STATUSES:
+            # Don't reject — but log; keeps backward compat
+            pass
         setattr(c, field, value)
-    if data.status == "published" and not c.published_at:
+    if data.status == STATUS_PUBLISHED and not c.published_at:
         c.published_at = datetime.utcnow()
+    db.commit()
+    db.refresh(c)
+    return _serialize(c)
+
+
+class RequestChangesRequest(BaseModel):
+    note: str  # user explains what needs to change
+
+
+@router.post("/{content_id}/request-changes")
+def request_changes(content_id: int, req: RequestChangesRequest,
+                     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Flexible approval: instead of binary approve/reject, the user can ask for
+    refinement and leave a note. Status flips to needs_changes; the IA (or the
+    user) can then revise."""
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+    if not (req.note or "").strip():
+        raise HTTPException(400, "Explique o que ajustar")
+    c.status = STATUS_NEEDS_CHANGES
+    c.review_notes = humanize_clean(req.note.strip())[:2000]
+    db.commit()
+    db.refresh(c)
+    return _serialize(c)
+
+
+@router.get("/{content_id}/versions")
+def list_versions(content_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+    versions = db.query(ContentVersion).filter(ContentVersion.content_id == content_id).order_by(ContentVersion.version_number.desc()).all()
+    return [{
+        "id": v.id,
+        "version_number": v.version_number,
+        "title": v.title,
+        "hook": v.hook,
+        "script": v.script,
+        "copy": v.copy,
+        "design_brief": v.design_brief,
+        "change_summary": v.change_summary,
+        "edited_by_user": v.edited_by_user,
+        "created_at": v.created_at.isoformat() if v.created_at else None,
+    } for v in versions]
+
+
+@router.post("/{content_id}/restore-version/{version_id}")
+def restore_version(content_id: int, version_id: int,
+                     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+    v = db.query(ContentVersion).filter(
+        ContentVersion.id == version_id,
+        ContentVersion.content_id == content_id,
+    ).first()
+    if not v:
+        raise HTTPException(404, "Versão não encontrada")
+    # Snapshot current state first
+    _snapshot_version(db, c, change_summary=f"antes de restaurar v{v.version_number}", edited_by_user=True)
+    c.title = v.title
+    c.hook = v.hook
+    c.script = v.script
+    c.copy = v.copy
+    c.design_brief = v.design_brief
+    c.edit_count = (c.edit_count or 0) + 1
+    db.commit()
+    db.refresh(c)
+    return _serialize(c)
+
+
+class HumanizeRequest(BaseModel):
+    sections: Optional[List[str]] = None  # default: hook+script+copy
+
+
+@router.post("/{content_id}/humanize")
+async def humanize_piece(content_id: int, req: HumanizeRequest,
+                          current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Deeper humanization pass using Groq + persona language patterns.
+    Snapshots a version first, then rewrites the requested sections in place."""
+    c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
+    if not c:
+        raise HTTPException(404, "Content not found")
+    assert_client_access(c.client_id, current_user, db)
+    sections = req.sections or ["hook", "script", "copy"]
+    sections = [s for s in sections if s in VERSIONED_FIELDS]
+    if not sections:
+        raise HTTPException(400, "Nenhuma seção válida")
+
+    client = db.query(Client).filter(Client.id == c.client_id).first()
+    persona = db.query(Persona).filter(Persona.client_id == c.client_id).first()
+    lang = persona.language_patterns if persona else ""
+    tone = client.tone if client else ""
+
+    _snapshot_version(db, c, change_summary=f"humanizou: {', '.join(sections)}", edited_by_user=False)
+    for s in sections:
+        current = getattr(c, s) or ""
+        if not current.strip():
+            continue
+        rewritten = await humanize_with_voice(current, persona_language=lang, creator_tone=tone)
+        if rewritten and rewritten.strip():
+            setattr(c, s, rewritten)
+    c.edit_count = (c.edit_count or 0) + 1
     db.commit()
     db.refresh(c)
     return _serialize(c)
@@ -227,7 +389,10 @@ async def regenerate_section(content_id: int, req: RegenerateSectionRequest,
         new_value = "\n".join(lines[1:-1] if len(lines) >= 2 else lines).strip()
     if not new_value:
         raise HTTPException(500, "IA retornou vazio")
+    new_value = humanize_clean(new_value)
+    _snapshot_version(db, c, change_summary=f"regenerou: {req.section}", edited_by_user=False)
     setattr(c, req.section, new_value)
+    c.edit_count = (c.edit_count or 0) + 1
     db.commit()
     db.refresh(c)
     return _serialize(c)

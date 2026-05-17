@@ -7,6 +7,7 @@ const NAV = [
   { to: 'strategy', label: 'Central', icon: '✦' },
   { to: 'persona', label: 'Persona', icon: '☉' },
   { to: 'products', label: 'Produtos', icon: '⊙' },
+  { to: 'amplifier', label: 'Amplificador', icon: '⚡' },
   { to: 'inspirations', label: 'Inspirações', icon: '✧' },
   { to: 'knowledge', label: 'Base', icon: '☷' },
   { to: 'calendar', label: 'Calendário', icon: '◫' },

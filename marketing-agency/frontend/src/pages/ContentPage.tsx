@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { api } from '../services/api'
-import type { ContentPiece } from '../types'
+import type { ContentPiece, ContentVersion } from '../types'
 import { STATUS_LABELS, STATUS_COLORS, FORMAT_LABELS, OBJECTIVE_LABELS, OBJECTIVE_COLORS, FUNNEL_STAGE_LABELS } from '../types'
 import { SectionRegenButton } from '../components/SectionRegenButton'
 
@@ -31,6 +31,13 @@ export function ContentPage() {
   const [remixPlat, setRemixPlat] = useState('instagram')
   const [remixInstr, setRemixInstr] = useState('')
   const [remixBusy, setRemixBusy] = useState(false)
+  const [versionsOpen, setVersionsOpen] = useState(false)
+  const [versions, setVersions] = useState<ContentVersion[] | null>(null)
+  const [versionsLoading, setVersionsLoading] = useState(false)
+  const [requestChangesOpen, setRequestChangesOpen] = useState(false)
+  const [changesNote, setChangesNote] = useState('')
+  const [changesBusy, setChangesBusy] = useState(false)
+  const [humanizeBusy, setHumanizeBusy] = useState(false)
   const [alignLoading, setAlignLoading] = useState(false)
   const [alignResult, setAlignResult] = useState<{
     best_match: string | null
@@ -212,6 +219,58 @@ export function ContentPage() {
     } catch (e: any) {
       alert('Erro: ' + e.message)
     } finally { setVoiceBusy(false) }
+  }
+
+  async function openVersions() {
+    if (!selected) return
+    setVersionsOpen(true)
+    setVersionsLoading(true)
+    try {
+      const r: any = await api.content.versions(selected.id)
+      setVersions(r)
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    } finally { setVersionsLoading(false) }
+  }
+
+  async function restoreVersion(versionId: number) {
+    if (!selected) return
+    if (!confirm('Restaurar esta versão? A versão atual será arquivada antes.')) return
+    try {
+      const updated: any = await api.content.restoreVersion(selected.id, versionId)
+      setContents(prev => prev.map(c => c.id === updated.id ? updated : c))
+      setSelected(updated)
+      setVersionsOpen(false)
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    }
+  }
+
+  async function submitRequestChanges() {
+    if (!selected || !changesNote.trim()) return
+    setChangesBusy(true)
+    try {
+      const updated: any = await api.content.requestChanges(selected.id, changesNote)
+      setContents(prev => prev.map(c => c.id === updated.id ? updated : c))
+      setSelected(updated)
+      setRequestChangesOpen(false)
+      setChangesNote('')
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    } finally { setChangesBusy(false) }
+  }
+
+  async function runHumanize() {
+    if (!selected) return
+    if (!confirm('Reescrever as seções na voz da marca? (afeta hook, copy, script)')) return
+    setHumanizeBusy(true)
+    try {
+      const updated: any = await api.content.humanize(selected.id)
+      setContents(prev => prev.map(c => c.id === updated.id ? updated : c))
+      setSelected(updated)
+    } catch (e: any) {
+      alert('Erro: ' + e.message)
+    } finally { setHumanizeBusy(false) }
   }
 
   async function publishNow() {
@@ -595,6 +654,25 @@ export function ContentPage() {
           )}
 
           <div className="space-y-2 pt-1">
+            <div className="flex gap-2 flex-wrap">
+              <button onClick={openVersions} className="text-xs px-2.5 py-1.5 rounded border border-gray-700 text-gray-300 hover:bg-gray-800">
+                ⟲ Histórico{selected.edit_count ? ` (${selected.edit_count})` : ''}
+              </button>
+              <button onClick={() => setRequestChangesOpen(true)} className="text-xs px-2.5 py-1.5 rounded border border-amber-700 bg-amber-900/15 text-amber-300 hover:bg-amber-900/30">
+                ✎ Pedir ajustes
+              </button>
+              <button onClick={runHumanize} disabled={humanizeBusy} className="text-xs px-2.5 py-1.5 rounded border border-cyan-700 bg-cyan-900/15 text-cyan-300 hover:bg-cyan-900/30 disabled:opacity-50">
+                {humanizeBusy ? 'Humanizando...' : '✨ Humanizar na voz da marca'}
+              </button>
+            </div>
+
+            {selected.review_notes && (
+              <div className="card bg-amber-900/10 border-amber-800/50 text-xs">
+                <p className="text-amber-400 font-semibold mb-0.5">REVISÃO PEDIDA</p>
+                <p className="text-gray-300 whitespace-pre-line">{selected.review_notes}</p>
+              </div>
+            )}
+
             {selected.status === 'pending' && (
               <button onClick={() => approve(selected.id)} disabled={approving} className="btn-primary w-full py-3 disabled:opacity-60">
                 {approving ? 'Aprovando + gerando briefing...' : '✓ Aprovar conteúdo (gera briefing de gravação)'}
@@ -621,6 +699,60 @@ export function ContentPage() {
             )}
           </div>
         </div>
+
+        {/* Versions modal */}
+        {versionsOpen && (
+          <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setVersionsOpen(false)}>
+            <div className="card max-w-2xl w-full max-h-[80vh] overflow-y-auto space-y-3" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-semibold text-white">Histórico de versões</p>
+                <button onClick={() => setVersionsOpen(false)} className="text-gray-400">×</button>
+              </div>
+              {versionsLoading && <p className="text-xs text-gray-400">Carregando...</p>}
+              {!versionsLoading && versions && versions.length === 0 && (
+                <p className="text-xs text-gray-500">Sem edições anteriores — ainda é a versão original</p>
+              )}
+              {versions && versions.map(v => (
+                <div key={v.id} className="card">
+                  <div className="flex items-center justify-between mb-1">
+                    <p className="text-xs font-semibold text-violet-300">v{v.version_number} {v.edited_by_user ? '· editado' : '· auto'}</p>
+                    <button onClick={() => restoreVersion(v.id)} className="text-[10px] text-violet-400 hover:text-violet-300">Restaurar</button>
+                  </div>
+                  {v.change_summary && <p className="text-[11px] text-gray-400 mb-1">{v.change_summary}</p>}
+                  {v.title && <p className="text-xs text-white">{v.title}</p>}
+                  {v.hook && <p className="text-[11px] text-gray-300 mt-0.5 line-clamp-2">{v.hook}</p>}
+                  {v.created_at && <p className="text-[10px] text-gray-500 mt-1">{new Date(v.created_at).toLocaleString('pt-BR')}</p>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Request changes modal */}
+        {requestChangesOpen && (
+          <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" onClick={() => setRequestChangesOpen(false)}>
+            <div className="card max-w-lg w-full space-y-3" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-semibold text-amber-300">Pedir ajustes</p>
+                <button onClick={() => setRequestChangesOpen(false)} className="text-gray-400">×</button>
+              </div>
+              <textarea
+                rows={5}
+                className="input text-sm"
+                placeholder="Ex: tom muito formal, ajustar pra mais casual. Hook precisa de tensão maior nos 3 primeiros segundos."
+                value={changesNote}
+                onChange={e => setChangesNote(e.target.value)}
+              />
+              <p className="text-[10px] text-gray-500">A nota fica registrada no conteúdo. Use o "Regenerar" em cada seção pra aplicar.</p>
+              <div className="flex gap-2 justify-end">
+                <button onClick={() => setRequestChangesOpen(false)} className="text-xs px-3 py-1.5 text-gray-400 border border-gray-700 rounded-md">Cancelar</button>
+                <button onClick={submitRequestChanges} disabled={changesBusy || !changesNote.trim()} className="btn-primary text-xs">
+                  {changesBusy ? '...' : 'Salvar nota'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     )
   }

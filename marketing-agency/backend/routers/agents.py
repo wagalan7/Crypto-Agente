@@ -3,12 +3,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from database import get_db
 from models import Client, User
 from agents import StrategyAgent, AnalyticsAgent, ScriptAgent, TrendAgent, DesignAgent, AmplifierAgent, AutoCreatorAgent, parse_json_response
 from services import MemoryService, BrandBrain, fetch_site_context, generate_image_url, aspect_for_format
-from models import ContentPiece
+from models import ContentPiece, Inspiration
 from auth import get_current_user, assert_client_access
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -69,6 +69,7 @@ class AutoCreateRequest(BaseModel):
     format: str = "post"
     platform: str = "instagram"
     objective: Optional[str] = ""
+    inspiration_ids: Optional[List[int]] = None  # attach saved inspirations as creative direction
 
 
 @router.post("/strategy/stream")
@@ -176,10 +177,28 @@ async def auto_create_stream(req: AutoCreateRequest, current_user: User = Depend
             yield _sse("status", f"Analisando site: {req.site_url}...")
             site_context = await fetch_site_context(req.site_url)
 
-        # 2. Generate content via LLM (with full BrandBrain context)
-        yield _sse("status", "Gerando conteúdo estratégico...")
+        # 2. Resolve inspiration refs if attached
+        image_refs = []
+        if req.inspiration_ids:
+            insps = db.query(Inspiration).filter(
+                Inspiration.id.in_(req.inspiration_ids),
+                Inspiration.client_id == req.client_id,
+            ).all()
+            for i in insps:
+                image_refs.append({
+                    "label": i.label,
+                    "analysis": i.analysis or {},
+                    "visual_analysis": i.visual_analysis or {},
+                    "adapted_brief": i.adapted_brief,
+                })
+
+        # 3. Generate content via LLM (with full BrandBrain context + refs)
+        yield _sse("status", f"Gerando conteúdo estratégico{(' com ' + str(len(image_refs)) + ' referências') if image_refs else ''}...")
         agent = AutoCreatorAgent()
-        prompt = agent.build_prompt(brain["text"], site_context, req.topic or "", req.format, req.platform, req.objective or "")
+        prompt = agent.build_prompt(
+            brain["text"], site_context, req.topic or "", req.format, req.platform,
+            req.objective or "", image_refs=image_refs,
+        )
         raw = ""
         async for chunk in agent.stream(prompt):
             raw += chunk
@@ -202,18 +221,19 @@ async def auto_create_stream(req: AutoCreateRequest, current_user: User = Depend
         if primary and (data.get("linked_product_hint") or "").lower() not in ("", "nenhuma", "none", "n/a"):
             linked_product_id = primary.id
 
-        # 6. Persist as ContentPiece with reasoning fields
+        # 6. Persist as ContentPiece with reasoning fields (with humanization pass)
+        from services import humanize_clean as _clean
         objective_final = (data.get("objective") or req.objective or "atracao")[:50]
         content = ContentPiece(
             client_id=req.client_id,
-            title=(data.get("title") or req.topic or "Conteúdo auto-gerado")[:200],
+            title=_clean(data.get("title") or req.topic or "Conteúdo auto-gerado")[:200],
             format=req.format,
             platform=req.platform,
             objective=objective_final,
-            hook=data.get("hook"),
-            script=data.get("script"),
-            copy=data.get("copy"),
-            design_brief=data.get("design_brief"),
+            hook=_clean(data.get("hook") or ""),
+            script=_clean(data.get("script") or ""),
+            copy=_clean(data.get("copy") or ""),
+            design_brief=_clean(data.get("design_brief") or ""),
             media_url=image_url,
             strategic_note=data.get("why_for_audience") or f"Auto-criado a partir de: {req.site_url or 'briefing'}",
             objective_reasoning=data.get("objective_reasoning"),

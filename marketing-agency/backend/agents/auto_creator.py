@@ -41,14 +41,38 @@ class AutoCreatorAgent(BaseAgent):
     def __init__(self):
         super().__init__(SYSTEM)
 
-    def build_prompt(self, brand_brain_text: str, site_context: str, topic: str, format: str, platform: str, requested_objective: str = "") -> str:
+    def build_prompt(self, brand_brain_text: str, site_context: str, topic: str, format: str, platform: str,
+                      requested_objective: str = "", image_refs: list = None) -> str:
         objective_hint = f"O usuário sugeriu objetivo='{requested_objective}', mas você pode SOBRESCREVER se achar melhor — basta justificar." if requested_objective else "Decida o objetivo automaticamente baseado no contexto e justifique."
+        refs_block = ""
+        if image_refs:
+            refs_block = "\n=== REFERÊNCIAS VISUAIS ANEXADAS (replicar a estética + adaptar pro nicho) ===\n"
+            for i, ref in enumerate(image_refs[:5], 1):
+                analysis = ref.get("analysis") or {}
+                visual = ref.get("visual_analysis") or {}
+                refs_block += f"\nRef #{i} — {ref.get('label') or 'sem label'}\n"
+                if visual.get("composition"):
+                    refs_block += f"  Composição: {visual.get('composition')}\n"
+                if visual.get("mood"):
+                    refs_block += f"  Mood: {visual.get('mood')}\n"
+                if visual.get("palette"):
+                    refs_block += f"  Paleta: {', '.join(visual.get('palette') or [])}\n"
+                if visual.get("identity"):
+                    refs_block += f"  Identidade visual: {visual.get('identity')}\n"
+                if analysis.get("hook"):
+                    refs_block += f"  Hook: {analysis.get('hook')}\n"
+                if analysis.get("structure"):
+                    refs_block += f"  Estrutura: {analysis.get('structure')}\n"
+                if ref.get("adapted_brief"):
+                    refs_block += f"  Como adaptar pra essa marca: {ref.get('adapted_brief')}\n"
+            refs_block += "\nUSE essas referências como direção criativa — não copie literalmente; traduza pro nicho/persona.\n"
+
         return f"""=== CONTEXTO ESTRATÉGICO DA MARCA ===
 {brand_brain_text or '(briefing mínimo)'}
 
 === SITE / PRODUTO REFERENCIADO ===
 {site_context or '(nenhum)'}
-
+{refs_block}
 === PARÂMETROS DESTE CONTEÚDO ===
 Tema: {topic or 'livre — escolha o melhor com base no contexto'}
 Formato: {format}

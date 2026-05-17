@@ -55,6 +55,10 @@ def _serialize(s: CalendarSlot) -> dict:
         "format": s.format,
         "objective": s.objective,
         "status": s.status,
+        "narrative": s.narrative,
+        "intent": s.intent,
+        "hook_idea": s.hook_idea,
+        "strategic_reasoning": s.strategic_reasoning,
     }
 
 
@@ -129,6 +133,11 @@ def populate_from_weekly(req: PopulateFromWeeklyRequest, current_user: User = De
             elif "story" in fmt or "stor" in fmt: fmt = "story"
             elif "short" in fmt: fmt = "shorts"
             else: fmt = "post"
+        # Strategic narrative pulled from the weekly emotional sequence entry
+        narrative = (entry.get("narrative") or entry.get("theme") or entry.get("idea") or "").strip() or None
+        intent = (entry.get("intent") or entry.get("audience_action") or "").strip() or None
+        hook_idea = (entry.get("hook") or entry.get("hook_idea") or "").strip() or None
+        strategic = (entry.get("why") or entry.get("reasoning") or "").strip() or None
         slot = CalendarSlot(
             client_id=req.client_id,
             scheduled_at=scheduled,
@@ -136,6 +145,10 @@ def populate_from_weekly(req: PopulateFromWeeklyRequest, current_user: User = De
             format=fmt,
             objective=_emotion_to_objective(entry.get("emotion", "")),
             status="planned",
+            narrative=narrative,
+            intent=intent,
+            hook_idea=hook_idea,
+            strategic_reasoning=strategic,
         )
         db.add(slot)
         created.append(slot)
@@ -151,6 +164,30 @@ def update_slot_status(slot_id: int, status: str, current_user: User = Depends(g
     assert_client_access(slot.client_id, current_user, db)
     slot.status = status
     db.commit()
+    return _serialize(slot)
+
+
+class SlotUpdateRequest(BaseModel):
+    narrative: Optional[str] = None
+    intent: Optional[str] = None
+    hook_idea: Optional[str] = None
+    strategic_reasoning: Optional[str] = None
+    format: Optional[str] = None
+    objective: Optional[str] = None
+
+
+@router.patch("/{slot_id}")
+def update_slot(slot_id: int, req: SlotUpdateRequest,
+                 current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Edit strategic fields of a slot (item 9: calendário estratégico)."""
+    slot = db.query(CalendarSlot).filter(CalendarSlot.id == slot_id).first()
+    if not slot:
+        raise HTTPException(404, "Slot not found")
+    assert_client_access(slot.client_id, current_user, db)
+    for f, v in req.model_dump(exclude_unset=True).items():
+        setattr(slot, f, v)
+    db.commit()
+    db.refresh(slot)
     return _serialize(slot)
 
 

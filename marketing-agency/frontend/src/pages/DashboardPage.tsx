@@ -34,12 +34,20 @@ export function DashboardPage() {
     post_count: number
   } | null>(null)
   const [retroBusy, setRetroBusy] = useState(false)
+  const [patterns, setPatterns] = useState<{
+    sample_size: number
+    winners: { format?: Array<[string, number]>; emotion?: Array<[string, number]>; funnel?: Array<[string, number]>; platform?: Array<[string, number]> }
+    losers: { format?: Array<[string, number]>; emotion?: Array<[string, number]> }
+    recommendations: Array<{ kind: string; title: string; rationale: string }>
+    best_day?: string | null
+  } | null>(null)
 
   useEffect(() => {
     api.clients.get(id).then((c: any) => setClient(c))
     api.calendar.get(id, 7).then((s: any) => setSlots(s))
     api.analytics.summary(id, 30).then((s: any) => setSummary(s))
     api.strategy.insights(id).then((s: any) => setInsights(s)).catch(() => {})
+    api.analytics.patterns(id).then((p: any) => setPatterns(p)).catch(() => {})
   }, [id])
 
   async function refreshScore() {
@@ -125,6 +133,61 @@ export function DashboardPage() {
           />
         </div>
       </div>
+
+      {/* Patterns — what's working */}
+      {patterns && patterns.sample_size > 0 && (() => {
+        const fmt = patterns.winners.format?.[0]
+        const emo = patterns.winners.emotion?.[0]
+        const fun = patterns.winners.funnel?.[0]
+        return (
+          <div className="card bg-indigo-900/10 border-indigo-800/50">
+            <div className="flex items-center justify-between mb-2">
+              <h2 className="text-sm font-semibold text-white">🧠 Padrões detectados</h2>
+              <span className="text-[10px] text-gray-500">{patterns.sample_size} amostras</span>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+              {emo && (
+                <div className="text-center bg-orange-900/20 border border-orange-800/40 rounded p-2">
+                  <p className="text-[10px] text-orange-400 uppercase">Emoção</p>
+                  <p className="text-sm font-semibold text-white truncate">{emo[0]}</p>
+                  <p className="text-[10px] text-gray-400">{emo[1]} vitórias</p>
+                </div>
+              )}
+              {fmt && (
+                <div className="text-center bg-violet-900/20 border border-violet-800/40 rounded p-2">
+                  <p className="text-[10px] text-violet-400 uppercase">Formato</p>
+                  <p className="text-sm font-semibold text-white truncate">{fmt[0]}</p>
+                  <p className="text-[10px] text-gray-400">{fmt[1]} vitórias</p>
+                </div>
+              )}
+              {fun && (
+                <div className="text-center bg-cyan-900/20 border border-cyan-800/40 rounded p-2">
+                  <p className="text-[10px] text-cyan-400 uppercase">Funil</p>
+                  <p className="text-sm font-semibold text-white truncate">{fun[0]}</p>
+                  <p className="text-[10px] text-gray-400">{fun[1]} vitórias</p>
+                </div>
+              )}
+              {patterns.best_day && (
+                <div className="text-center bg-emerald-900/20 border border-emerald-800/40 rounded p-2">
+                  <p className="text-[10px] text-emerald-400 uppercase">Melhor dia</p>
+                  <p className="text-sm font-semibold text-white capitalize">{patterns.best_day}</p>
+                </div>
+              )}
+            </div>
+            {patterns.recommendations.length > 0 && (
+              <div className="space-y-1">
+                <p className="text-[10px] text-indigo-400 font-semibold uppercase">Recomendações</p>
+                {patterns.recommendations.slice(0, 4).map((r, i) => (
+                  <div key={i} className="text-xs">
+                    <p className="text-gray-200">→ {r.title}</p>
+                    <p className="text-[10px] text-gray-500 ml-3">{r.rationale}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      })()}
 
       {/* Weekly retrospective */}
       <div className="card bg-teal-900/10 border-teal-800/50">

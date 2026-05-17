@@ -64,20 +64,55 @@ class BrandBrain:
         if wb:
             sections.append(self._weekly_block(wb))
 
-        # --- Knowledge (top items, truncated)
-        items = self.db.query(KnowledgeItem).filter(KnowledgeItem.client_id == client_id).order_by(KnowledgeItem.created_at.desc()).limit(5).all()
+        # --- Knowledge (AI digests preferred over raw text — denser per token)
+        items = self.db.query(KnowledgeItem).filter(KnowledgeItem.client_id == client_id).order_by(KnowledgeItem.created_at.desc()).limit(8).all()
         if items:
             kb = []
             budget = max_knowledge_chars
+            voice_words: list[str] = []
             for it in items:
-                snippet = (it.content or "")[:600]
-                if len(snippet) > budget:
-                    snippet = snippet[:budget]
-                kb.append(f"  [{it.source_type}] {it.title}\n  {snippet}")
-                budget -= len(snippet)
+                # Mark as used (cheap — single field bump)
+                from datetime import datetime as _dt
+                it.use_count = (it.use_count or 0) + 1
+                it.last_used_at = _dt.utcnow()
+                # Prefer summary + insights over raw content
+                if it.summary or it.key_insights:
+                    block = f"  [{it.source_type}] {it.title}"
+                    if it.summary:
+                        block += f"\n  RESUMO: {it.summary[:300]}"
+                    if it.key_insights:
+                        insights_txt = " · ".join(it.key_insights[:5])[:400]
+                        block += f"\n  IDEIAS-CHAVE: {insights_txt}"
+                    kb.append(block)
+                    budget -= len(block)
+                else:
+                    snippet = (it.content or "")[:500]
+                    if len(snippet) > budget:
+                        snippet = snippet[:budget]
+                    if snippet:
+                        kb.append(f"  [{it.source_type}] {it.title}\n  {snippet}")
+                        budget -= len(snippet)
+                # Aggregate voice signals across items
+                for vs in (it.voice_signals or []):
+                    if vs and vs not in voice_words:
+                        voice_words.append(vs)
                 if budget <= 0:
                     break
-            sections.append("BASE DE CONHECIMENTO DO CRIADOR:\n" + "\n".join(kb))
+            try:
+                self.db.commit()  # persist use_count bumps; safe — read-only context build
+            except Exception:
+                self.db.rollback()
+            sections.append("BASE DE CONHECIMENTO DO CRIADOR (já digerida pela IA):\n" + "\n".join(kb))
+            if voice_words:
+                sections.append("VOZ DO CRIADOR (palavras/expressões a reusar):\n  " + " · ".join(voice_words[:20]))
+
+        # --- Persona refinements (user edits — high signal)
+        if persona and (persona.user_refinements or []):
+            recent = (persona.user_refinements or [])[-5:]
+            lines = ["AJUSTES MANUAIS DO USUÁRIO NA PERSONA (preserve esta direção):"]
+            for r in recent:
+                lines.append(f"  - [{r.get('field')}] {r.get('note') or ''}")
+            sections.append("\n".join(lines))
 
         # --- Winning content patterns
         winners = self._winning_patterns(client_id)

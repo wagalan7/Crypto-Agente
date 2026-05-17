@@ -16,6 +16,7 @@ import { PersonaPage } from './pages/PersonaPage'
 import { InspirationsPage } from './pages/InspirationsPage'
 import { ProductsPage } from './pages/ProductsPage'
 import { KnowledgePage } from './pages/KnowledgePage'
+import { AmplifierPage } from './pages/AmplifierPage'
 import { CentralEstrategicaPage } from './pages/CentralEstrategicaPage'
 import { Sidebar } from './components/Sidebar'
 import { api } from './services/api'
@@ -69,6 +70,7 @@ export default function App() {
         <Route path="inspirations" element={<InspirationsPage />} />
         <Route path="products" element={<ProductsPage />} />
         <Route path="knowledge" element={<KnowledgePage />} />
+        <Route path="amplifier" element={<AmplifierPage />} />
         <Route path="strategy" element={<CentralEstrategicaPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

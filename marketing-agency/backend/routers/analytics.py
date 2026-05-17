@@ -5,7 +5,7 @@ from typing import Optional
 from datetime import datetime
 from database import get_db
 from models import MetricsSnapshot, User
-from services import AuthorityScorer
+from services import AuthorityScorer, detect_patterns
 from auth import get_current_user, assert_client_access
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
@@ -89,6 +89,15 @@ def get_summary(client_id: int, days: int = 30, current_user: User = Depends(get
             "conversion_rate": round(sum(m.conversion_rate for m in metrics) / n, 2),
         },
     }
+
+
+@router.get("/client/{client_id}/patterns")
+def get_patterns(client_id: int, limit: int = 60,
+                  current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Prescriptive learning: ranked winners/losers + day-of-week + concrete recs.
+    Use this on the dashboard to tell the user WHAT to do next, not just what happened."""
+    assert_client_access(client_id, current_user, db)
+    return detect_patterns(db, client_id, limit=limit)
 
 
 @router.get("/client/{client_id}/metrics")

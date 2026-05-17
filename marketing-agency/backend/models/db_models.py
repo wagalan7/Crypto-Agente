@@ -103,11 +103,34 @@ class ContentPiece(Base):
     voice_feedback = Column(Text, nullable=True)  # JSON: {verdict, weakest_part, fix_hint}
     publish_attempts = Column(Integer, default=0)  # retry counter for auto-publish
     next_retry_at = Column(DateTime, nullable=True)  # exponential backoff schedule
+    edit_count = Column(Integer, default=0)  # how many manual edits applied
+    review_notes = Column(Text, nullable=True)  # user's "request changes" message
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client", back_populates="contents")
     metrics = relationship("MetricsSnapshot", back_populates="content")
     linked_product = relationship("Product", foreign_keys=[linked_product_id])
+    versions = relationship("ContentVersion", back_populates="content", order_by="ContentVersion.version_number.desc()")
+
+
+class ContentVersion(Base):
+    """Snapshot of a content piece after each edit/regeneration — enables version history + rollback."""
+    __tablename__ = "content_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content_id = Column(Integer, ForeignKey("content_pieces.id"), nullable=False, index=True)
+    version_number = Column(Integer, nullable=False)  # 1, 2, 3...
+    title = Column(String(500))
+    hook = Column(Text)
+    script = Column(Text)
+    copy = Column(Text)
+    design_brief = Column(Text)
+    cta = Column(Text)  # extracted CTA line
+    change_summary = Column(String(300))  # "edited hook" / "regenerated script" / "refined CTA"
+    edited_by_user = Column(Boolean, default=True)  # False if AI-generated revision
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    content = relationship("ContentPiece", back_populates="versions")
 
 
 class SocialAccount(Base):
@@ -140,6 +163,11 @@ class CalendarSlot(Base):
     format = Column(String(50))
     objective = Column(String(100))
     status = Column(String(50), default="planned")
+    # Strategic intent (item 9: calendário estratégico, não só visual)
+    narrative = Column(Text, nullable=True)         # what story this slot tells
+    intent = Column(Text, nullable=True)            # what the audience should feel/do
+    hook_idea = Column(Text, nullable=True)         # opening line concept
+    strategic_reasoning = Column(Text, nullable=True)  # why this slot exists in the week
 
     client = relationship("Client", back_populates="calendar_slots")
     content = relationship("ContentPiece")
@@ -201,6 +229,9 @@ class Persona(Base):
     psychological_patterns = Column(Text)
     audience_profile = Column(Text)                 # demographic + psychographic
     evidence = Column(Text)                         # what data was used
+    # User refinements (item 6: persona editável + IA aprende)
+    user_refinements = Column(JSON, default=list)   # [{field, before, after, note, at}]
+    edit_count = Column(Integer, default=0)
     generated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     client = relationship("Client")
@@ -216,7 +247,9 @@ class Inspiration(Base):
     source_value = Column(Text)         # the URL or pasted text or image URL
     label = Column(String(300))         # user-given name
     analysis = Column(JSON, default=dict)  # {hook, narrative, cta, rhythm, retention, emotion, structure, visual_style}
+    visual_analysis = Column(JSON, default=dict)  # vision-model output: {composition, palette, mood, layout, identity}
     adapted_brief = Column(Text)        # how to adapt to this client's brand
+    image_url = Column(Text, nullable=True)  # public URL of uploaded screenshot
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client")
@@ -270,8 +303,14 @@ class KnowledgeItem(Base):
     client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
     title = Column(String(300), nullable=False)
     content = Column(Text)              # extracted text
-    source_type = Column(String(50))    # pdf / note / screenshot / idea / book / concept / reference
+    source_type = Column(String(50))    # pdf / note / screenshot / idea / book / concept / reference / framework / observation
     tags = Column(JSON, default=list)
+    # AI-extracted intelligence (item 1: amplificador central absorve a mente)
+    summary = Column(Text, nullable=True)         # 2-3 sentence digest
+    key_insights = Column(JSON, default=list)     # bullet-list of usable ideas
+    voice_signals = Column(JSON, default=list)    # phrases/words to imitate
+    last_used_at = Column(DateTime, nullable=True)  # when last referenced by an agent
+    use_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     client = relationship("Client")

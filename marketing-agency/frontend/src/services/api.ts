@@ -103,6 +103,11 @@ export const api = {
     repurpose: (id: number, data: { target_format: string; target_platform: string; instruction?: string }) =>
       post(`/content/${id}/repurpose`, data),
     voiceScore: (id: number) => post(`/content/${id}/voice-score`, {}),
+    // Phase 16: version history + flexible approval + humanization
+    requestChanges: (id: number, note: string) => post(`/content/${id}/request-changes`, { note }),
+    versions: (id: number) => get(`/content/${id}/versions`),
+    restoreVersion: (id: number, versionId: number) => post(`/content/${id}/restore-version/${versionId}`, {}),
+    humanize: (id: number, sections?: string[]) => post(`/content/${id}/humanize`, { sections: sections || null }),
   },
   calendar: {
     get: (clientId: number, days?: number) => get(`/calendar/client/${clientId}${days ? `?days=${days}` : ''}`),
@@ -110,10 +115,13 @@ export const api = {
     attachContent: (slotId: number, contentId: number) => patch(`/calendar/${slotId}/attach`, { content_id: contentId }),
     populateFromWeekly: (data: { client_id: number; start_date?: string; platform?: string; default_hour?: number }) => post('/calendar/populate-from-weekly', data),
     reschedule: (slotId: number, scheduledAt: string) => patch(`/calendar/${slotId}/reschedule`, { scheduled_at: scheduledAt }),
+    updateSlot: (slotId: number, data: { narrative?: string; intent?: string; hook_idea?: string; strategic_reasoning?: string; format?: string; objective?: string }) =>
+      patch(`/calendar/${slotId}`, data),
   },
   analytics: {
     summary: (clientId: number, days?: number) => get(`/analytics/client/${clientId}/summary${days ? `?days=${days}` : ''}`),
     metrics: (clientId: number) => get(`/analytics/client/${clientId}/metrics`),
+    patterns: (clientId: number, limit?: number) => get(`/analytics/client/${clientId}/patterns${limit ? `?limit=${limit}` : ''}`),
     addMetrics: (data: unknown) => post('/analytics/metrics', data),
   },
   social: {
@@ -131,17 +139,38 @@ export const api = {
     trend: (clientId: number, currentTrends: string) => streamAgent('/agents/trend/stream', { client_id: clientId, current_trends: currentTrends }),
     design: (clientId: number, topic: string, format: string, platform: string, references?: string) => streamAgent('/agents/design/stream', { client_id: clientId, content_topic: topic, format, platform, references }),
     amplifier: (clientId: number, rawIdea: string) => streamAgent('/agents/amplifier/stream', { client_id: clientId, raw_idea: rawIdea }),
-    auto: (clientId: number, siteUrl: string, topic: string, format: string, platform: string, objective?: string) =>
-      streamAgent('/agents/auto/stream', { client_id: clientId, site_url: siteUrl, topic, format, platform, objective: objective || '' }),
+    auto: (clientId: number, siteUrl: string, topic: string, format: string, platform: string, objective?: string, inspirationIds?: number[]) =>
+      streamAgent('/agents/auto/stream', {
+        client_id: clientId, site_url: siteUrl, topic, format, platform,
+        objective: objective || '', inspiration_ids: inspirationIds || null,
+      }),
   },
   persona: {
     get: (clientId: number) => get(`/persona/client/${clientId}`),
     generate: (clientId: number) => post(`/persona/client/${clientId}/generate`, {}),
+    update: (clientId: number, data: Record<string, unknown>) => patch(`/persona/client/${clientId}`, data),
   },
   inspirations: {
     list: (clientId: number) => get(`/inspirations/client/${clientId}`),
     create: (data: { client_id: number; source_type: string; source_value: string; label?: string }) => post('/inspirations/', data),
+    uploadImage: async (clientId: number, file: File, label?: string) => {
+      const fd = new FormData()
+      fd.append('client_id', String(clientId))
+      if (label) fd.append('label', label)
+      fd.append('file', file)
+      const token = getToken()
+      const res = await fetch(`${BASE}/inspirations/upload-image`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: fd,
+      })
+      if (!res.ok) throw new Error(await res.text())
+      return res.json()
+    },
     remove: (id: number) => del(`/inspirations/${id}`),
+  },
+  amplifier: {
+    get: (clientId: number) => get(`/amplifier/client/${clientId}`),
   },
   products: {
     list: (clientId: number) => get(`/products/client/${clientId}`),
@@ -153,6 +182,23 @@ export const api = {
   knowledge: {
     list: (clientId: number) => get(`/knowledge/client/${clientId}`),
     create: (data: { client_id: number; title: string; content: string; source_type?: string; tags?: string[] }) => post('/knowledge/', data),
+    update: (id: number, data: { title?: string; content?: string; tags?: string[]; source_type?: string }) => patch(`/knowledge/${id}`, data),
+    redigest: (id: number) => post(`/knowledge/${id}/redigest`, {}),
+    uploadPdf: async (clientId: number, file: File, title?: string, tags?: string) => {
+      const fd = new FormData()
+      fd.append('client_id', String(clientId))
+      if (title) fd.append('title', title)
+      if (tags) fd.append('tags', tags)
+      fd.append('file', file)
+      const token = getToken()
+      const res = await fetch(`${BASE}/knowledge/upload-pdf`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: fd,
+      })
+      if (!res.ok) throw new Error(await res.text())
+      return res.json()
+    },
     remove: (id: number) => del(`/knowledge/${id}`),
   },
   strategy: {
