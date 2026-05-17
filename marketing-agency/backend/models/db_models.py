@@ -20,6 +20,12 @@ class User(Base):
     name = Column(String(200))
     role = Column(String(20), default="user")  # master / admin / user
     is_active = Column(Boolean, default=True)
+    plan_tier = Column(String(20), default="free")  # free / pro / agency
+    plan_status = Column(String(20), default="active")  # active / trialing / past_due / canceled
+    trial_ends_at = Column(DateTime, nullable=True)
+    stripe_customer_id = Column(String(120), nullable=True, index=True)
+    stripe_subscription_id = Column(String(120), nullable=True)
+    onboarding_completed = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     clients = relationship("Client", back_populates="owner", foreign_keys="Client.owner_id")

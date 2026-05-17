@@ -7,6 +7,7 @@ from database import get_db
 from models import SocialAccount, ContentPiece, User
 from auth import get_current_user, assert_client_access
 from services import meta_publisher
+from services.plans import assert_feature
 
 router = APIRouter(prefix="/social", tags=["social"])
 
@@ -131,6 +132,7 @@ async def publish_content(content_id: int, current_user: User = Depends(get_curr
     if not content:
         raise HTTPException(404, "Content not found")
     assert_client_access(content.client_id, current_user, db)
+    assert_feature(current_user, "auto_publish")
 
     # Map content platform → social account platform
     platform = (content.platform or "").lower()

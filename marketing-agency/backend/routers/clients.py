@@ -8,6 +8,7 @@ from models import User, Client, ClientAccess, AuthorityScoreSnapshot
 from auth import get_current_user, assert_client_access
 from services import AuthorityScorer
 from services.pdf_report import generate_monthly_report
+from services.plans import assert_can_create_client, assert_feature
 from fastapi.responses import StreamingResponse
 import io
 
@@ -69,6 +70,7 @@ def list_clients(current_user: User = Depends(get_current_user), db: Session = D
 
 @router.post("/")
 def create_client(data: ClientCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    assert_can_create_client(current_user, db)
     client = Client(**data.model_dump(), owner_id=current_user.id)
     db.add(client)
     db.commit()
@@ -123,6 +125,7 @@ def monthly_report(client_id: int, month: Optional[str] = None,
                    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Generate a PDF monthly performance report. `month` is YYYY-MM (defaults to current month)."""
     assert_client_access(client_id, current_user, db)
+    assert_feature(current_user, "pdf_report")
     now = datetime.utcnow()
     year, mon = now.year, now.month
     if month:

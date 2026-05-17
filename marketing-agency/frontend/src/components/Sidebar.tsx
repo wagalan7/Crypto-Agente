@@ -59,10 +59,14 @@ export function Sidebar({ clientName }: { clientName?: string }) {
             <span>←</span>
             <span>Trocar cliente</span>
           </NavLink>
+          <NavLink to="/billing" className="nav-link nav-link-inactive text-xs">
+            <span>💳</span>
+            <span>Planos {user?.plan?.trialing ? '(trial)' : ''}</span>
+          </NavLink>
           {user && (
             <div className="px-3 py-1">
               <p className="text-[10px] text-gray-500 truncate">{user.email}</p>
-              <p className="text-[10px] text-violet-500 capitalize">{user.role}</p>
+              <p className="text-[10px] text-violet-500 capitalize">{user.role} · {user.plan?.label || 'Free'}</p>
             </div>
           )}
           <button onClick={handleLogout} className="nav-link nav-link-inactive text-xs w-full text-left">

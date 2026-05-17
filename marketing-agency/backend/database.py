@@ -68,3 +68,23 @@ def _run_lightweight_migrations():
                     conn.execute(text(f"ALTER TABLE content_pieces ADD COLUMN {col} {coltype}"))
                 else:
                     conn.execute(text(f"ALTER TABLE content_pieces ADD COLUMN IF NOT EXISTS {col} {coltype}"))
+
+    # Users new columns (Phase 13: plans + onboarding + Stripe)
+    user_columns = {
+        "plan_tier": "VARCHAR(20) DEFAULT 'free'",
+        "plan_status": "VARCHAR(20) DEFAULT 'active'",
+        "trial_ends_at": "TIMESTAMP",
+        "stripe_customer_id": "VARCHAR(120)",
+        "stripe_subscription_id": "VARCHAR(120)",
+        "onboarding_completed": "BOOLEAN DEFAULT FALSE",
+    }
+    if "users" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("users")}
+        with engine.begin() as conn:
+            for col, coltype in user_columns.items():
+                if col in existing:
+                    continue
+                if is_sqlite:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {coltype}"))
+                else:
+                    conn.execute(text(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {coltype}"))

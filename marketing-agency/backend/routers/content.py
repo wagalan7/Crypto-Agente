@@ -14,6 +14,7 @@ from agents.inspiration_alignment import parse_json_response as parse_align_json
 from agents.repurpose import parse_json_response as parse_repurpose_json
 from agents.voice_scorer import parse_json_response as parse_voice_json
 from services import BrandBrain
+from services.plans import assert_can_create_content, assert_feature
 
 REGEN_SECTIONS = {"hook", "script", "copy", "design_brief"}
 
@@ -114,6 +115,7 @@ def list_content(
 @router.post("/")
 def create_content(data: ContentCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     assert_client_access(data.client_id, current_user, db)
+    assert_can_create_content(current_user, db)
     content = ContentPiece(**data.model_dump())
     db.add(content)
     db.commit()
@@ -402,6 +404,7 @@ async def voice_score(content_id: int, current_user: User = Depends(get_current_
     Cheap call — used both on-demand from the UI and as a quality gate after
     auto-generation. Returns the full updated piece so the frontend re-renders.
     """
+    assert_feature(current_user, "voice_scorer")
     c = db.query(ContentPiece).filter(ContentPiece.id == content_id).first()
     if not c:
         raise HTTPException(404, "Content not found")

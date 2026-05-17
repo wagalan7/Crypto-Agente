@@ -4,6 +4,7 @@ from pydantic import BaseModel, EmailStr
 from database import get_db
 from models import User, Client, ClientAccess
 from auth import hash_password, verify_password, create_token, get_current_user, require_master
+from services.plans import start_trial, plan_status
 from typing import Optional, List
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -33,8 +34,57 @@ def _serialize_user(u: User) -> dict:
         "name": u.name,
         "role": u.role,
         "is_active": u.is_active,
+        "onboarding_completed": bool(u.onboarding_completed),
+        "plan": plan_status(u),
         "created_at": u.created_at.isoformat() if u.created_at else None,
     }
+
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    name: Optional[str] = None
+
+
+@router.post("/signup")
+def signup(data: SignupRequest, db: Session = Depends(get_db)):
+    import os
+    if os.getenv("DISABLE_SIGNUP") == "1":
+        raise HTTPException(403, "Cadastro público desativado")
+    email = data.email.lower().strip()
+    if "@" not in email or len(email) < 5:
+        raise HTTPException(400, "Email inválido")
+    if len(data.password) < 8:
+        raise HTTPException(400, "Senha precisa de ao menos 8 caracteres")
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(400, "Email já cadastrado")
+    user = User(
+        email=email,
+        password_hash=hash_password(data.password),
+        name=data.name or email.split("@")[0],
+        role="user",
+        plan_tier="free",
+        plan_status="trialing",
+    )
+    start_trial(user, days=7)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    token = create_token(user.id, user.email, user.role)
+    return {"access_token": token, "token_type": "bearer", "user": _serialize_user(user)}
+
+
+class OnboardingCompleteRequest(BaseModel):
+    completed: bool = True
+
+
+@router.post("/onboarding/complete")
+def complete_onboarding(data: OnboardingCompleteRequest,
+                         current_user: User = Depends(get_current_user),
+                         db: Session = Depends(get_db)):
+    current_user.onboarding_completed = data.completed
+    db.commit()
+    return {"onboarding_completed": current_user.onboarding_completed}
 
 
 @router.post("/login")

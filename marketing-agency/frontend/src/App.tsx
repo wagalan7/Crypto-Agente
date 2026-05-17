@@ -2,6 +2,9 @@ import { Routes, Route, Navigate, useParams, Outlet } from 'react-router-dom'
 import { useState, useEffect } from 'react'
 import { useAuth } from './context/AuthContext'
 import { LoginPage } from './pages/LoginPage'
+import { SignupPage } from './pages/SignupPage'
+import { OnboardingPage } from './pages/OnboardingPage'
+import { BillingPage } from './pages/BillingPage'
 import { ClientsPage } from './pages/ClientsPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { CalendarPage } from './pages/CalendarPage'
@@ -17,10 +20,14 @@ import { CentralEstrategicaPage } from './pages/CentralEstrategicaPage'
 import { Sidebar } from './components/Sidebar'
 import { api } from './services/api'
 
-function RequireAuth({ children }: { children: JSX.Element }) {
+function RequireAuth({ children, skipOnboardingCheck = false }: { children: JSX.Element; skipOnboardingCheck?: boolean }) {
   const { user, loading } = useAuth()
   if (loading) return <div className="min-h-screen bg-gray-950 flex items-center justify-center text-gray-400 text-sm">Carregando...</div>
-  return user ? children : <Navigate to="/login" replace />
+  if (!user) return <Navigate to="/login" replace />
+  if (!skipOnboardingCheck && user.onboarding_completed === false) {
+    return <Navigate to="/onboarding" replace />
+  }
+  return children
 }
 
 function ClientLayout() {
@@ -47,6 +54,9 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/signup" element={<SignupPage />} />
+      <Route path="/onboarding" element={<RequireAuth skipOnboardingCheck><OnboardingPage /></RequireAuth>} />
+      <Route path="/billing" element={<RequireAuth skipOnboardingCheck><BillingPage /></RequireAuth>} />
       <Route path="/" element={<RequireAuth><ClientsPage /></RequireAuth>} />
       <Route path="/client/:clientId" element={<RequireAuth><ClientLayout /></RequireAuth>}>
         <Route index element={<DashboardPage />} />

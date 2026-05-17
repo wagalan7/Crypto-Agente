@@ -62,6 +62,8 @@ export async function* streamAgent(path: string, body: unknown): AsyncGenerator<
 export const api = {
   auth: {
     login: (email: string, password: string) => post('/auth/login', { email, password }),
+    signup: (email: string, password: string, name?: string) => post('/auth/signup', { email, password, name }),
+    completeOnboarding: () => post('/auth/onboarding/complete', { completed: true }),
     me: () => get('/auth/me'),
     users: () => get('/auth/users'),
     createUser: (data: unknown) => post('/auth/users', data),
@@ -163,6 +165,12 @@ export const api = {
     profileAudit: (clientId: number) => post(`/strategy/profile-audit/${clientId}`, {}),
     retrospective: (clientId: number) => post(`/strategy/retrospective/${clientId}`, {}),
     notifications: (clientId: number) => get(`/strategy/notifications/${clientId}`),
+  },
+  billing: {
+    plans: () => get('/billing/plans'),
+    me: () => get('/billing/me'),
+    checkout: (tier: 'pro' | 'agency') => post('/billing/checkout', { tier }),
+    portal: () => post('/billing/portal', {}),
   },
   trends: {
     list: (limit?: number, locale?: string) => {
