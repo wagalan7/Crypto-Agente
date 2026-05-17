@@ -152,3 +152,19 @@ def update_slot_status(slot_id: int, status: str, current_user: User = Depends(g
     slot.status = status
     db.commit()
     return _serialize(slot)
+
+
+class RescheduleRequest(BaseModel):
+    scheduled_at: datetime
+
+
+@router.patch("/{slot_id}/reschedule")
+def reschedule_slot(slot_id: int, req: RescheduleRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Move a slot to a new datetime (used by drag-and-drop on the calendar grid)."""
+    slot = db.query(CalendarSlot).filter(CalendarSlot.id == slot_id).first()
+    if not slot:
+        raise HTTPException(404, "Slot not found")
+    assert_client_access(slot.client_id, current_user, db)
+    slot.scheduled_at = req.scheduled_at
+    db.commit()
+    return _serialize(slot)

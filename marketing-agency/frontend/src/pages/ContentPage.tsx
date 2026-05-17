@@ -12,6 +12,10 @@ export function ContentPage() {
   const id = Number(clientId)
   const [contents, setContents] = useState<ContentPiece[]>([])
   const [filter, setFilter] = useState<string>('')
+  const [search, setSearch] = useState<string>('')
+  const [debouncedSearch, setDebouncedSearch] = useState<string>('')
+  const [pageSize, setPageSize] = useState(20)
+  const [listLoading, setListLoading] = useState(true)
   const [selected, setSelected] = useState<ContentPiece | null>(null)
   const [mediaUrl, setMediaUrl] = useState('')
   const [publishing, setPublishing] = useState(false)
@@ -37,11 +41,31 @@ export function ContentPage() {
   } | null>(null)
 
   async function load() {
-    const data: any = await api.content.list(id, filter || undefined)
-    setContents(data)
+    setListLoading(true)
+    try {
+      const data: any = await api.content.list(id, filter || undefined)
+      setContents(data)
+    } finally { setListLoading(false) }
   }
 
   useEffect(() => { load() }, [id, filter])
+
+  // Debounce search input (250ms) so we don't filter on every keystroke
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search.trim().toLowerCase()), 250)
+    return () => clearTimeout(t)
+  }, [search])
+
+  // Reset page size when filter or search changes
+  useEffect(() => { setPageSize(20) }, [filter, debouncedSearch])
+
+  const filtered = debouncedSearch
+    ? contents.filter(c => {
+        const hay = `${c.title || ''} ${c.hook || ''} ${c.platform || ''} ${c.format || ''} ${c.linked_product_name || ''}`.toLowerCase()
+        return hay.includes(debouncedSearch)
+      })
+    : contents
+  const visible = filtered.slice(0, pageSize)
 
   useEffect(() => {
     if (selected) setMediaUrl(selected.media_url || '')
@@ -627,6 +651,21 @@ export function ContentPage() {
         )}
       </div>
 
+      {/* Search */}
+      <div className="mb-2 relative">
+        <input
+          type="search"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder="🔍 Buscar por título, hook, plataforma, produto..."
+          className="input-field pl-3 pr-9 text-sm"
+        />
+        {search && (
+          <button onClick={() => setSearch('')} aria-label="Limpar busca"
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300 text-xs">×</button>
+        )}
+      </div>
+
       {/* Filter pills - horizontal scroll on mobile */}
       <div className="flex gap-1.5 overflow-x-auto pb-2 -mx-4 px-4 md:mx-0 md:px-0 mb-4 scrollbar-none">
         <button onClick={() => setFilter('')}
@@ -645,14 +684,28 @@ export function ContentPage() {
         ))}
       </div>
 
-      {contents.length === 0 ? (
+      {listLoading ? (
+        <div className="space-y-2">
+          {[0, 1, 2, 3].map(i => (
+            <div key={i} className="card animate-pulse">
+              <div className="h-3 w-1/3 bg-gray-800 rounded mb-2"></div>
+              <div className="h-4 w-2/3 bg-gray-800 rounded mb-2"></div>
+              <div className="h-3 w-1/2 bg-gray-800 rounded"></div>
+            </div>
+          ))}
+        </div>
+      ) : filtered.length === 0 ? (
         <div className="card text-center py-12">
-          <p className="text-gray-500 text-sm">Nenhum conteúdo encontrado</p>
-          <p className="text-gray-600 text-xs mt-1">Use os Agentes IA para gerar conteúdo</p>
+          <p className="text-gray-500 text-sm">
+            {debouncedSearch ? `Nada encontrado para "${debouncedSearch}"` : 'Nenhum conteúdo encontrado'}
+          </p>
+          <p className="text-gray-600 text-xs mt-1">
+            {debouncedSearch ? 'Tente outro termo ou limpe a busca' : 'Use os Agentes IA para gerar conteúdo'}
+          </p>
         </div>
       ) : (
         <div className="space-y-2">
-          {contents.map(content => (
+          {visible.map(content => (
             <div
               key={content.id}
               className={`card flex items-start gap-2 active:border-violet-600 hover:border-violet-700 transition-colors ${selectedIds.has(content.id) ? 'border-violet-500 bg-violet-900/10' : ''}`}
@@ -696,6 +749,18 @@ export function ContentPage() {
               </button>
             </div>
           ))}
+          {filtered.length > visible.length && (
+            <div className="text-center pt-2">
+              <button onClick={() => setPageSize(p => p + 20)}
+                className="text-xs text-violet-400 hover:text-violet-300 px-4 py-2">
+                Mostrar mais ({filtered.length - visible.length} restantes)
+              </button>
+            </div>
+          )}
+          <p className="text-[10px] text-gray-600 text-center pt-1">
+            Mostrando {visible.length} de {filtered.length}
+            {debouncedSearch ? ` · busca: "${debouncedSearch}"` : ''}
+          </p>
         </div>
       )}
     </div>

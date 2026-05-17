@@ -109,6 +109,7 @@ export const api = {
     generateWeek: (data: unknown) => post('/calendar/generate-week', data),
     attachContent: (slotId: number, contentId: number) => patch(`/calendar/${slotId}/attach`, { content_id: contentId }),
     populateFromWeekly: (data: { client_id: number; start_date?: string; platform?: string; default_hour?: number }) => post('/calendar/populate-from-weekly', data),
+    reschedule: (slotId: number, scheduledAt: string) => patch(`/calendar/${slotId}/reschedule`, { scheduled_at: scheduledAt }),
   },
   analytics: {
     summary: (clientId: number, days?: number) => get(`/analytics/client/${clientId}/summary${days ? `?days=${days}` : ''}`),

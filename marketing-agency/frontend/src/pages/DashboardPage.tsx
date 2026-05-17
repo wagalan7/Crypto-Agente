@@ -75,7 +75,20 @@ export function DashboardPage() {
     } finally { setRetroBusy(false) }
   }
 
-  if (!client) return <div className="p-6 text-gray-400 text-sm">Carregando...</div>
+  if (!client) return (
+    <div className="p-4 md:p-6 space-y-4 max-w-5xl animate-pulse">
+      <div className="h-6 w-1/3 bg-gray-800 rounded" />
+      <div className="h-3 w-1/2 bg-gray-900 rounded" />
+      <div className="flex items-center gap-4">
+        <div className="w-20 h-20 rounded-full bg-gray-800" />
+        <div className="flex-1 grid grid-cols-2 gap-2">
+          {[0, 1, 2, 3].map(i => <div key={i} className="card h-16 bg-gray-900/60" />)}
+        </div>
+      </div>
+      <div className="card h-32 bg-gray-900/60" />
+      <div className="card h-40 bg-gray-900/60" />
+    </div>
+  )
 
   const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 

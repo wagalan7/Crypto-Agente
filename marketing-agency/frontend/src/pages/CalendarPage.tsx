@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { api } from '../services/api'
 import type { CalendarSlot } from '../types'
@@ -24,13 +24,48 @@ export function CalendarPage() {
   const [frequency, setFrequency] = useState(5)
   const [days, setDays] = useState(14)
   const [view, setView] = useState<'grid' | 'list'>('list')
+  const [loading, setLoading] = useState(true)
+  const [dragOverDay, setDragOverDay] = useState<string | null>(null)
+  const [rescheduleMsg, setRescheduleMsg] = useState<string | null>(null)
 
   async function load() {
-    const data: any = await api.calendar.get(id, days)
-    setSlots(data)
+    setLoading(true)
+    try {
+      const data: any = await api.calendar.get(id, days)
+      setSlots(data)
+    } finally { setLoading(false) }
   }
 
   useEffect(() => { load() }, [id, days])
+
+  function onDragStart(e: React.DragEvent, slotId: number) {
+    e.dataTransfer.setData('text/plain', String(slotId))
+    e.dataTransfer.effectAllowed = 'move'
+  }
+
+  async function onDropOnDay(e: React.DragEvent, targetDay: string) {
+    e.preventDefault()
+    setDragOverDay(null)
+    const slotId = Number(e.dataTransfer.getData('text/plain'))
+    const slot = slots.find(s => s.id === slotId)
+    if (!slot) return
+    if (slot.scheduled_at.slice(0, 10) === targetDay) return
+    // Preserve the existing time-of-day, swap only the date
+    const orig = new Date(slot.scheduled_at)
+    const [y, m, d] = targetDay.split('-').map(Number)
+    const next = new Date(orig)
+    next.setFullYear(y, m - 1, d)
+    // Optimistic update
+    setSlots(prev => prev.map(s => s.id === slotId ? { ...s, scheduled_at: next.toISOString() } : s))
+    try {
+      await api.calendar.reschedule(slotId, next.toISOString())
+      setRescheduleMsg(`✓ Reagendado para ${next.toLocaleDateString('pt-BR')}`)
+      setTimeout(() => setRescheduleMsg(null), 2500)
+    } catch (err: any) {
+      setRescheduleMsg(`Erro: ${err?.message?.slice(0, 100) || 'falha ao reagendar'}`)
+      await load()
+    }
+  }
 
   async function generate() {
     setGenerating(true)
@@ -104,10 +139,23 @@ export function CalendarPage() {
           </button>
         </div>
         {populateMsg && <p className="text-xs text-gray-400">{populateMsg}</p>}
+        {rescheduleMsg && <p className="text-xs text-violet-400">{rescheduleMsg}</p>}
       </div>
 
+      {view === 'grid' && !loading && (
+        <p className="text-[10px] text-gray-500">Dica: arraste os slots entre os dias para reagendar</p>
+      )}
+
+      {loading && (
+        <div className="space-y-2">
+          {[0, 1, 2, 3].map(i => (
+            <div key={i} className="card animate-pulse h-14 bg-gray-900/60" />
+          ))}
+        </div>
+      )}
+
       {/* Grid view (desktop only) */}
-      {view === 'grid' && (
+      {!loading && view === 'grid' && (
         <div className="hidden md:block">
           <div className="grid grid-cols-7 gap-1 mb-1">
             {['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom'].map(d => (
@@ -119,11 +167,20 @@ export function CalendarPage() {
               const daySlots = grouped.get(day) || []
               const date = new Date(day + 'T12:00:00')
               const isToday = day === today
+              const isDragOver = dragOverDay === day
               return (
-                <div key={day} className={`min-h-20 rounded-lg border p-1.5 ${isToday ? 'border-violet-600 bg-violet-900/10' : 'border-gray-800 bg-gray-900'}`}>
+                <div key={day}
+                  onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; if (dragOverDay !== day) setDragOverDay(day) }}
+                  onDragLeave={() => { if (dragOverDay === day) setDragOverDay(null) }}
+                  onDrop={e => onDropOnDay(e, day)}
+                  className={`min-h-20 rounded-lg border p-1.5 transition-colors ${isDragOver ? 'border-violet-400 bg-violet-900/30 ring-1 ring-violet-400' : isToday ? 'border-violet-600 bg-violet-900/10' : 'border-gray-800 bg-gray-900'}`}>
                   <p className={`text-xs font-semibold mb-1 ${isToday ? 'text-violet-400' : 'text-gray-400'}`}>{date.getDate()}</p>
                   {daySlots.map(slot => (
-                    <div key={slot.id} className={`text-[10px] rounded px-1 py-0.5 mb-0.5 border ${OBJECTIVE_COLORS[slot.objective] || 'bg-gray-700 text-gray-300 border-gray-600'}`}>
+                    <div key={slot.id}
+                      draggable
+                      onDragStart={e => onDragStart(e, slot.id)}
+                      title="Arraste para reagendar"
+                      className={`text-[10px] rounded px-1 py-0.5 mb-0.5 border cursor-move hover:opacity-80 ${OBJECTIVE_COLORS[slot.objective] || 'bg-gray-700 text-gray-300 border-gray-600'}`}>
                       {FORMAT_LABELS[slot.format] || slot.format}
                     </div>
                   ))}
@@ -135,7 +192,7 @@ export function CalendarPage() {
       )}
 
       {/* List view */}
-      {(view === 'list' || true) && slots.length > 0 && (
+      {!loading && (view === 'list' || true) && slots.length > 0 && (
         <div className="space-y-2">
           {slots.map(slot => {
             const date = new Date(slot.scheduled_at)
@@ -165,7 +222,7 @@ export function CalendarPage() {
         </div>
       )}
 
-      {slots.length === 0 && (
+      {!loading && slots.length === 0 && (
         <div className="card text-center py-12">
           <p className="text-gray-500 text-sm mb-1">Nenhum slot planejado</p>
           <p className="text-gray-600 text-xs">Clique em "Gerar semana" para criar o calendário</p>
