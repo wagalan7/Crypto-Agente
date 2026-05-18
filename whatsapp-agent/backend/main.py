@@ -49,23 +49,47 @@ if _SENTRY_DSN:
     except Exception as e:
         logger.warning(f"Falha ao inicializar Sentry: {e}")
 
-# ── Rate limiter (slowapi) ──────────────────────────────────────────────────
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
+# ── Rate limiter manual (em memória, simples, sem dependências externas) ───
+import time as _time
+from collections import deque as _deque
+from threading import Lock as _Lock
 
-def _rate_limit_key(request: Request) -> str:
+_rate_buckets: dict[tuple[str, str], "_deque[float]"] = {}
+_rate_lock = _Lock()
+
+# (path_prefix, limit, window_seconds). Primeira correspondência ganha.
+_RATE_RULES = [
+    ("/painel/login",       10, 60),    # 10 logins/min por IP
+    ("/onboarding/create",  5,  60),    # 5 cadastros/min por IP
+    ("/webhook/",           120, 60),   # 120 webhooks/min por IP
+]
+
+
+def _client_ip(request: Request) -> str:
     """Usa X-Forwarded-For (Railway edge) ou IP direto."""
     xff = request.headers.get("x-forwarded-for", "")
     if xff:
         return xff.split(",")[0].strip()
-    return get_remote_address(request)
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
 
-limiter = Limiter(key_func=_rate_limit_key, default_limits=["240/minute"])
 
-
-def _client_ip(request: Request) -> str:
-    return _rate_limit_key(request)
+def _check_rate_limit(ip: str, path: str) -> bool:
+    """True se permitido, False se excedeu."""
+    for prefix, limit, window in _RATE_RULES:
+        if path.startswith(prefix):
+            key = (ip, prefix)
+            now = _time.time()
+            with _rate_lock:
+                bucket = _rate_buckets.setdefault(key, _deque())
+                while bucket and bucket[0] < now - window:
+                    bucket.popleft()
+                if len(bucket) >= limit:
+                    return False
+                bucket.append(now)
+            return True
+    return True
 
 
 @asynccontextmanager
@@ -83,9 +107,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agente de Atendimento — Multi-Consultório", lifespan=lifespan)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+
+@app.middleware("http")
+async def _rate_limit_middleware(request: Request, call_next):
+    ip = _client_ip(request)
+    if not _check_rate_limit(ip, request.url.path):
+        return JSONResponse(
+            {"detail": "Muitas requisições. Aguarde e tente novamente."},
+            status_code=429,
+        )
+    return await call_next(request)
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _STATIC_DIR.mkdir(exist_ok=True)
@@ -287,7 +320,6 @@ def _validate_webhook_token(tenant: dict, request: Request) -> bool:
 
 
 @app.post("/webhook/{slug}/zapi")
-@limiter.limit("120/minute")
 async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
     if not _validate_webhook_token(tenant, request):
@@ -1044,7 +1076,6 @@ def _validate_cpf_cnpj(value: str) -> bool:
 
 
 @app.post("/onboarding/create", status_code=201)
-@limiter.limit("5/minute")
 def onboarding_create(request: Request, body: OnboardingCreate):
     # Validação básica dos campos obrigatórios
     required = {
@@ -1431,7 +1462,6 @@ class AdminLoginBody(BaseModel):
 
 
 @app.post("/painel/login")
-@limiter.limit("10/minute")
 def painel_login(request: Request, body: AdminLoginBody):
     username = body.username.strip()
     ip = _client_ip(request)
