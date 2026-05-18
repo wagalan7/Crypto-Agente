@@ -30,6 +30,9 @@ import caldav_service as caldav_svc
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# Versão atual dos Termos/Política — incrementar quando publicar nova versão.
+TERMS_VERSION = "2026-05-18"
+
 # ── Sentry (opcional, ativa se SENTRY_DSN estiver definido) ─────────────────
 import os as _os_init
 _SENTRY_DSN = _os_init.getenv("SENTRY_DSN", "").strip()
@@ -63,6 +66,48 @@ _RATE_RULES = [
     ("/onboarding/create",  5,  60),    # 5 cadastros/min por IP
     ("/webhook/",           120, 60),   # 120 webhooks/min por IP
 ]
+
+
+# ── TOTP (RFC 6238) — stdlib, sem dependências ──────────────────────────────
+import base64 as _b64
+import hmac as _hmac
+import hashlib as _hashlib
+import struct as _struct
+import time as _ttime
+import secrets as _secrets
+
+def _b32_normalize(secret: str) -> str:
+    s = secret.upper().replace(" ", "").replace("-", "")
+    # base32 precisa ser múltiplo de 8 caracteres
+    while len(s) % 8 != 0:
+        s += "="
+    return s
+
+def totp_generate_secret() -> str:
+    """Retorna secret base32 de 20 bytes (160 bits)."""
+    return _b64.b32encode(_secrets.token_bytes(20)).decode("ascii").rstrip("=")
+
+def totp_now(secret: str, step: int = 30, digits: int = 6, drift: int = 0) -> str:
+    counter = int(_ttime.time() // step) + drift
+    key = _b64.b32decode(_b32_normalize(secret))
+    msg = _struct.pack(">Q", counter)
+    h = _hmac.new(key, msg, _hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    code = (_struct.unpack(">I", h[o:o + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+def totp_verify(secret: str, code: str, window: int = 1) -> bool:
+    """Aceita códigos ±window passos (30s cada). Codes devem ter 6 dígitos."""
+    if not secret or not code or not code.isdigit() or len(code) != 6:
+        return False
+    for d in range(-window, window + 1):
+        if _hmac.compare_digest(totp_now(secret, drift=d), code):
+            return True
+    return False
+
+def totp_provisioning_uri(secret: str, account: str, issuer: str = "Agente Consultorio") -> str:
+    from urllib.parse import quote
+    return f"otpauth://totp/{quote(issuer)}:{quote(account)}?secret={secret}&issuer={quote(issuer)}&digits=6&period=30"
 
 
 def _client_ip(request: Request) -> str:
@@ -1141,6 +1186,7 @@ def onboarding_create(request: Request, body: OnboardingCreate):
         billing_state=body.billing_state.upper().strip()[:2],
         status="pending_payment",
         accepted_terms_at=datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds"),
+        accepted_terms_version=TERMS_VERSION,
     )
 
     db.audit_log("tenant_created", actor=body.email, target=slug, ip=_client_ip(request),
@@ -1459,6 +1505,7 @@ def painel_login_page(request: Request, erro: str = ""):
 class AdminLoginBody(BaseModel):
     username: str
     password: str
+    totp: Optional[str] = ""
 
 
 @app.post("/painel/login")
@@ -1474,6 +1521,16 @@ def painel_login(request: Request, body: AdminLoginBody):
         db.record_login_attempt(username, ip, success=False)
         db.audit_log("admin_login_failed", actor=username, ip=ip)
         raise HTTPException(status_code=401, detail="Usuário ou senha incorretos.")
+    # Se TOTP estiver ativo, exigir código
+    totp = db.admin_get_totp(admin["username"])
+    if totp and totp["enabled"]:
+        code = (body.totp or "").strip()
+        if not code:
+            raise HTTPException(status_code=401, detail="2FA_REQUIRED")
+        if not totp_verify(totp["secret"], code):
+            db.record_login_attempt(username, ip, success=False)
+            db.audit_log("admin_login_failed", actor=username, ip=ip, details="invalid_totp")
+            raise HTTPException(status_code=401, detail="Código 2FA inválido.")
     db.record_login_attempt(username, ip, success=True)
     db.clear_login_attempts(username)
     db.audit_log("admin_login_success", actor=admin["username"], ip=ip)
@@ -1656,3 +1713,54 @@ def healthz():
 def painel_api_audit(request: Request, limit: int = 100):
     _require_admin(request)
     return {"items": db.audit_list(limit=min(limit, 500))}
+
+
+# ── 2FA TOTP do admin ────────────────────────────────────────────────────────
+
+@app.get("/painel/api/2fa/status")
+def painel_2fa_status(request: Request):
+    session = _require_admin(request)
+    info = db.admin_get_totp(session["username"]) or {"secret": "", "enabled": False}
+    return {"enabled": info["enabled"]}
+
+
+@app.post("/painel/api/2fa/setup")
+def painel_2fa_setup(request: Request):
+    """Gera secret novo e retorna URI para QR code (não ativa ainda)."""
+    session = _require_admin(request)
+    secret = totp_generate_secret()
+    # Salva como NÃO habilitado — só ativa após verificação
+    db.admin_set_totp(session["username"], secret, enabled=False)
+    uri = totp_provisioning_uri(secret, account=session["username"])
+    return {"secret": secret, "otpauth_uri": uri}
+
+
+class Confirm2FABody(BaseModel):
+    code: str
+
+
+@app.post("/painel/api/2fa/enable")
+def painel_2fa_enable(request: Request, body: Confirm2FABody):
+    session = _require_admin(request)
+    info = db.admin_get_totp(session["username"])
+    if not info or not info["secret"]:
+        raise HTTPException(status_code=400, detail="Configure o 2FA primeiro (chame /setup).")
+    if not totp_verify(info["secret"], body.code.strip()):
+        raise HTTPException(status_code=400, detail="Código inválido. Tente novamente.")
+    db.admin_set_totp(session["username"], info["secret"], enabled=True)
+    db.audit_log("admin_2fa_enabled", actor=session["username"], ip=_client_ip(request))
+    return {"enabled": True}
+
+
+@app.post("/painel/api/2fa/disable")
+def painel_2fa_disable(request: Request, body: Confirm2FABody):
+    session = _require_admin(request)
+    info = db.admin_get_totp(session["username"])
+    if not info or not info["enabled"]:
+        return {"enabled": False}
+    # Para desabilitar exige código válido (anti-sequestro de sessão)
+    if not totp_verify(info["secret"], body.code.strip()):
+        raise HTTPException(status_code=400, detail="Código inválido.")
+    db.admin_disable_totp(session["username"])
+    db.audit_log("admin_2fa_disabled", actor=session["username"], ip=_client_ip(request))
+    return {"enabled": False}
