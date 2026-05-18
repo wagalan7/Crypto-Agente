@@ -6,6 +6,7 @@ from models.trade_signal import (
     TradeSignal, TradeType, SignalDirection, DetectedPattern, Indicator
 )
 from services.indicator_service import get_indicator_signals
+from services.confluence_service import calculate_confluence
 
 
 TIMEFRAME_TRADE_TYPE = {
@@ -179,7 +180,16 @@ def build_trade_signal(
     trade_type = TIMEFRAME_TRADE_TYPE.get(timeframe, TradeType.DAY_TRADE)
 
     direction = determine_direction(ind, patterns, current_price)
-    confidence = calculate_confidence(ind, patterns, direction, current_price)
+
+    # Score de confluência ponderado e transparente — substitui o cálculo antigo
+    if direction != SignalDirection.NEUTRAL:
+        confluence = calculate_confluence(ind, patterns, df, direction, current_price)
+        confidence = round(confluence.pct / 100, 2)
+    else:
+        confluence = calculate_confluence(ind, patterns, df, SignalDirection.NEUTRAL, current_price)
+        # Para neutro, usa o antigo (sem direção)
+        confidence = calculate_confidence(ind, patterns, direction, current_price)
+
     levels = calculate_levels(current_price, atr, direction, trade_type, patterns, ind)
 
     return TradeSignal(
@@ -197,6 +207,8 @@ def build_trade_signal(
         patterns=patterns,
         indicators=ind,
         ai_analysis=None,
+        ai_critique=None,
+        confluence=confluence,
         timestamp=int(df["timestamp"].iloc[-1]),
         signal_strength=signal_strength_label(confidence),
     )

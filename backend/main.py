@@ -112,7 +112,9 @@ async def analyze(
             mc_text = macro.get("context_text", "")
         except Exception:
             mc_text = ""
-        signal.ai_analysis = await generate_ai_analysis(signal, mc_text)
+        analysis, critique = await generate_ai_analysis(signal, mc_text)
+        signal.ai_analysis = analysis
+        signal.ai_critique = critique
 
     return signal
 
@@ -159,7 +161,9 @@ async def analyze_data(body: AnalyzeDataRequest):
             mc_text = macro.get("context_text", "")
         except Exception:
             mc_text = ""
-        signal.ai_analysis = await generate_ai_analysis(signal, mc_text)
+        analysis, critique = await generate_ai_analysis(signal, mc_text)
+        signal.ai_analysis = analysis
+        signal.ai_critique = critique
 
     return signal
 
@@ -235,7 +239,9 @@ async def best_timeframe_analysis(symbol: str, with_ai: bool = False):
 
     best_tf, best_sig, best_score = max(valid, key=lambda x: x[2])
     if with_ai:
-        best_sig.ai_analysis = await generate_ai_analysis(best_sig)
+        analysis, critique = await generate_ai_analysis(best_sig)
+        best_sig.ai_analysis = analysis
+        best_sig.ai_critique = critique
 
     return {
         "best_timeframe": best_tf,

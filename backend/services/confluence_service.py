@@ -1,0 +1,366 @@
+"""
+Score de confluência ponderado e transparente.
+
+Cada categoria contribui com pontos para a direção do sinal.
+Soma final é mapeada para % de confiança. A diferença vs o `confidence`
+antigo é que aqui CADA fator é justificado individualmente, o que dá
+à IA contexto muito mais rico para gerar análise assertiva.
+"""
+
+from __future__ import annotations
+from typing import List
+import pandas as pd
+
+from models.trade_signal import (
+    Indicator,
+    DetectedPattern,
+    SignalDirection,
+    ConfluenceFactor,
+    ConfluenceScore,
+)
+
+
+# ─── Pesos por categoria ──────────────────────────────────────────────────────
+WEIGHTS = {
+    "momentum":   30,   # RSI + Stochastic
+    "trend":      40,   # EMAs + ADX + Supertrend
+    "macd":       20,   # MACD cross + histograma
+    "volume":     20,   # Volume vs média
+    "bollinger":  15,   # Posição BB
+    "pattern":    35,   # Padrões clássicos detectados
+    "structure":  20,   # Pivot levels, suporte/resistência
+    "volatility": 10,   # ATR / regime
+}
+MAX_TOTAL = sum(WEIGHTS.values())   # = 190
+
+
+def _sign_for_direction(direction: SignalDirection, val: int) -> int:
+    """Retorna 1 se o sinal indicador alinha com a direção, -1 se contrário, 0 se neutro."""
+    if direction == SignalDirection.LONG:
+        return val
+    if direction == SignalDirection.SHORT:
+        return -val
+    return 0
+
+
+def calculate_confluence(
+    ind: Indicator,
+    patterns: List[DetectedPattern],
+    df: pd.DataFrame,
+    direction: SignalDirection,
+    current_price: float,
+) -> ConfluenceScore:
+    factors: List[ConfluenceFactor] = []
+    warnings: List[str] = []
+
+    # ── 1. Momentum: RSI ──────────────────────────────────────────────────────
+    if ind.rsi is not None:
+        if direction == SignalDirection.LONG:
+            if ind.rsi < 30:
+                factors.append(ConfluenceFactor(
+                    name="RSI em sobrevenda",
+                    category="momentum",
+                    points=18, max_points=18, aligned=True,
+                    description=f"RSI={ind.rsi:.1f} (<30) — pressão compradora provável após exaustão da venda."
+                ))
+            elif ind.rsi < 45:
+                factors.append(ConfluenceFactor(
+                    name="RSI saindo da zona neutra-baixa",
+                    category="momentum",
+                    points=10, max_points=18, aligned=True,
+                    description=f"RSI={ind.rsi:.1f} — momentum lateral inclinando para alta."
+                ))
+            elif ind.rsi > 75:
+                factors.append(ConfluenceFactor(
+                    name="RSI extremamente sobrecomprado",
+                    category="momentum",
+                    points=-12, max_points=18, aligned=False,
+                    description=f"RSI={ind.rsi:.1f} (>75) — risco de pullback no curto prazo, entrada tardia."
+                ))
+                warnings.append("RSI muito alto — considerar aguardar pullback antes de comprar.")
+        elif direction == SignalDirection.SHORT:
+            if ind.rsi > 70:
+                factors.append(ConfluenceFactor(
+                    name="RSI em sobrecompra",
+                    category="momentum",
+                    points=18, max_points=18, aligned=True,
+                    description=f"RSI={ind.rsi:.1f} (>70) — pressão vendedora provável após exaustão da alta."
+                ))
+            elif ind.rsi > 55:
+                factors.append(ConfluenceFactor(
+                    name="RSI saindo da zona neutra-alta",
+                    category="momentum",
+                    points=10, max_points=18, aligned=True,
+                    description=f"RSI={ind.rsi:.1f} — momentum inclinando para baixa."
+                ))
+            elif ind.rsi < 25:
+                factors.append(ConfluenceFactor(
+                    name="RSI extremamente sobrevendido",
+                    category="momentum",
+                    points=-12, max_points=18, aligned=False,
+                    description=f"RSI={ind.rsi:.1f} (<25) — risco de quique no curto prazo."
+                ))
+                warnings.append("RSI muito baixo — considerar aguardar repique antes de vender.")
+
+    # Stochastic
+    if ind.stoch_k is not None and ind.stoch_d is not None:
+        if direction == SignalDirection.LONG and ind.stoch_k < 20 and ind.stoch_d < 20:
+            factors.append(ConfluenceFactor(
+                name="Stochastic em sobrevenda",
+                category="momentum",
+                points=12, max_points=12, aligned=True,
+                description=f"K={ind.stoch_k:.1f} / D={ind.stoch_d:.1f} — duplo sinal de fundo."
+            ))
+        elif direction == SignalDirection.SHORT and ind.stoch_k > 80 and ind.stoch_d > 80:
+            factors.append(ConfluenceFactor(
+                name="Stochastic em sobrecompra",
+                category="momentum",
+                points=12, max_points=12, aligned=True,
+                description=f"K={ind.stoch_k:.1f} / D={ind.stoch_d:.1f} — duplo sinal de topo."
+            ))
+
+    # ── 2. Trend: EMAs ────────────────────────────────────────────────────────
+    if ind.ema9 and ind.ema21 and ind.ema50:
+        if direction == SignalDirection.LONG and ind.ema9 > ind.ema21 > ind.ema50:
+            factors.append(ConfluenceFactor(
+                name="EMAs alinhadas em alta (9>21>50)",
+                category="trend",
+                points=18, max_points=18, aligned=True,
+                description="Estrutura de médias confirma tendência de alta em múltiplas janelas."
+            ))
+        elif direction == SignalDirection.SHORT and ind.ema9 < ind.ema21 < ind.ema50:
+            factors.append(ConfluenceFactor(
+                name="EMAs alinhadas em baixa (9<21<50)",
+                category="trend",
+                points=18, max_points=18, aligned=True,
+                description="Estrutura de médias confirma tendência de baixa em múltiplas janelas."
+            ))
+        elif direction != SignalDirection.NEUTRAL:
+            factors.append(ConfluenceFactor(
+                name="EMAs sem alinhamento claro",
+                category="trend",
+                points=0, max_points=18, aligned=False,
+                description="EMAs entrelaçadas — sem confirmação de tendência."
+            ))
+
+    # EMA 200 (golden/death cross)
+    if ind.ema50 and ind.ema200:
+        if direction == SignalDirection.LONG and ind.ema50 > ind.ema200 and current_price > ind.ema200:
+            factors.append(ConfluenceFactor(
+                name="Golden cross e preço acima da EMA 200",
+                category="trend",
+                points=12, max_points=12, aligned=True,
+                description="Confirmação de tendência primária de alta no longo prazo."
+            ))
+        elif direction == SignalDirection.SHORT and ind.ema50 < ind.ema200 and current_price < ind.ema200:
+            factors.append(ConfluenceFactor(
+                name="Death cross e preço abaixo da EMA 200",
+                category="trend",
+                points=12, max_points=12, aligned=True,
+                description="Confirmação de tendência primária de baixa no longo prazo."
+            ))
+        elif direction == SignalDirection.LONG and current_price < ind.ema200:
+            warnings.append("Compra contra a tendência primária (preço abaixo da EMA 200).")
+            factors.append(ConfluenceFactor(
+                name="Preço abaixo da EMA 200",
+                category="trend",
+                points=-8, max_points=12, aligned=False,
+                description="Operação contra-tendência primária. Risco maior, alvos menores."
+            ))
+
+    # ADX (força da tendência)
+    if ind.adx is not None:
+        if ind.adx > 35:
+            factors.append(ConfluenceFactor(
+                name="ADX em tendência muito forte",
+                category="trend",
+                points=10, max_points=10, aligned=True,
+                description=f"ADX={ind.adx:.1f} (>35) — tendência muito definida e respeitada."
+            ))
+        elif ind.adx > 25:
+            factors.append(ConfluenceFactor(
+                name="ADX em tendência forte",
+                category="trend",
+                points=6, max_points=10, aligned=True,
+                description=f"ADX={ind.adx:.1f} (>25) — tendência consistente."
+            ))
+        elif ind.adx < 20:
+            factors.append(ConfluenceFactor(
+                name="ADX baixo — mercado lateral",
+                category="trend",
+                points=-3, max_points=10, aligned=False,
+                description=f"ADX={ind.adx:.1f} (<20) — sem tendência, evitar breakouts."
+            ))
+            warnings.append("Mercado lateralizado (ADX baixo) — sinais direcionais menos confiáveis.")
+
+    # Supertrend
+    if ind.supertrend_direction is not None:
+        st_aligned = (
+            (direction == SignalDirection.LONG and ind.supertrend_direction == 1) or
+            (direction == SignalDirection.SHORT and ind.supertrend_direction == -1)
+        )
+        factors.append(ConfluenceFactor(
+            name="Supertrend alinhado" if st_aligned else "Supertrend contrário",
+            category="trend",
+            points=10 if st_aligned else -6, max_points=10, aligned=st_aligned,
+            description="Supertrend confirma a direção." if st_aligned else "Supertrend aponta na direção contrária ao sinal."
+        ))
+
+    # ── 3. MACD ───────────────────────────────────────────────────────────────
+    if ind.macd is not None and ind.macd_signal is not None and ind.macd_hist is not None:
+        macd_bull = ind.macd > ind.macd_signal
+        macd_strong = abs(ind.macd_hist) > 0
+        if direction == SignalDirection.LONG and macd_bull:
+            pts = 18 if macd_strong and ind.macd_hist > 0 else 10
+            factors.append(ConfluenceFactor(
+                name="MACD bullish",
+                category="macd",
+                points=pts, max_points=20, aligned=True,
+                description=f"MACD cruzou acima da linha de sinal{' com histograma positivo crescente' if pts == 18 else ''}."
+            ))
+        elif direction == SignalDirection.SHORT and not macd_bull:
+            pts = 18 if macd_strong and ind.macd_hist < 0 else 10
+            factors.append(ConfluenceFactor(
+                name="MACD bearish",
+                category="macd",
+                points=pts, max_points=20, aligned=True,
+                description=f"MACD cruzou abaixo da linha de sinal{' com histograma negativo' if pts == 18 else ''}."
+            ))
+        else:
+            factors.append(ConfluenceFactor(
+                name="MACD contra o sinal",
+                category="macd",
+                points=-6, max_points=20, aligned=False,
+                description="MACD não confirma a direção do sinal."
+            ))
+
+    # ── 4. Volume ─────────────────────────────────────────────────────────────
+    if ind.volume_avg and len(df) >= 3:
+        last_vol = float(df["volume"].iloc[-1])
+        ratio = last_vol / ind.volume_avg if ind.volume_avg else 0
+        if ratio > 2.0:
+            factors.append(ConfluenceFactor(
+                name="Volume explosivo (>2x média)",
+                category="volume",
+                points=20, max_points=20, aligned=True,
+                description=f"Volume atual {ratio:.1f}x a média — institucionais ativos."
+            ))
+        elif ratio > 1.5:
+            factors.append(ConfluenceFactor(
+                name="Volume acima da média",
+                category="volume",
+                points=14, max_points=20, aligned=True,
+                description=f"Volume {ratio:.1f}x a média — interesse acima do normal."
+            ))
+        elif ratio < 0.5:
+            factors.append(ConfluenceFactor(
+                name="Volume muito baixo",
+                category="volume",
+                points=-5, max_points=20, aligned=False,
+                description=f"Volume apenas {ratio:.1f}x a média — falta convicção no movimento."
+            ))
+            warnings.append("Volume baixo — movimento pode não se sustentar.")
+
+    # ── 5. Bollinger Bands ────────────────────────────────────────────────────
+    if ind.bb_upper and ind.bb_lower and ind.bb_middle:
+        if direction == SignalDirection.LONG and current_price <= ind.bb_lower * 1.005:
+            factors.append(ConfluenceFactor(
+                name="Preço na banda inferior",
+                category="bollinger",
+                points=15, max_points=15, aligned=True,
+                description=f"Preço tocando BB inferior ({ind.bb_lower:.6g}) — zona de compra estatística."
+            ))
+        elif direction == SignalDirection.SHORT and current_price >= ind.bb_upper * 0.995:
+            factors.append(ConfluenceFactor(
+                name="Preço na banda superior",
+                category="bollinger",
+                points=15, max_points=15, aligned=True,
+                description=f"Preço tocando BB superior ({ind.bb_upper:.6g}) — zona de venda estatística."
+            ))
+
+    # ── 6. Padrões gráficos ───────────────────────────────────────────────────
+    aligned_patterns = [p for p in patterns if p.direction == direction]
+    if aligned_patterns:
+        # Pega até 2 padrões mais confiantes
+        top = sorted(aligned_patterns, key=lambda p: p.confidence, reverse=True)[:2]
+        for p in top:
+            pts = round(p.confidence * 17, 1)  # max ~17 por padrão (35 total)
+            factors.append(ConfluenceFactor(
+                name=f"Padrão: {p.type.value.replace('_', ' ').title()}",
+                category="pattern",
+                points=pts, max_points=17, aligned=True,
+                description=p.description,
+            ))
+    # Padrões contrários = warning
+    contrary = [p for p in patterns if p.direction != direction and p.direction != SignalDirection.NEUTRAL]
+    if contrary:
+        warnings.append(f"{len(contrary)} padrão(ões) contrário(s) detectado(s) — verificar antes de operar.")
+
+    # ── 7. Estrutura (pivots) ────────────────────────────────────────────────
+    if ind.pivot_low and ind.pivot_high:
+        range_size = ind.pivot_high - ind.pivot_low
+        if range_size > 0:
+            position = (current_price - ind.pivot_low) / range_size
+            if direction == SignalDirection.LONG and position < 0.3:
+                factors.append(ConfluenceFactor(
+                    name="Preço próximo do fundo do range",
+                    category="structure",
+                    points=15, max_points=20, aligned=True,
+                    description=f"Preço a {position*100:.0f}% do range (fundo em {ind.pivot_low:.6g}) — compra com stop curto."
+                ))
+            elif direction == SignalDirection.SHORT and position > 0.7:
+                factors.append(ConfluenceFactor(
+                    name="Preço próximo do topo do range",
+                    category="structure",
+                    points=15, max_points=20, aligned=True,
+                    description=f"Preço a {position*100:.0f}% do range (topo em {ind.pivot_high:.6g}) — venda com stop curto."
+                ))
+            elif direction == SignalDirection.LONG and position > 0.85:
+                factors.append(ConfluenceFactor(
+                    name="Preço próximo do topo do range",
+                    category="structure",
+                    points=-8, max_points=20, aligned=False,
+                    description=f"Compra próxima de resistência ({ind.pivot_high:.6g}) — risco de rejeição."
+                ))
+                warnings.append("Entrada próxima do topo do range — risco de rejeição.")
+            elif direction == SignalDirection.SHORT and position < 0.15:
+                factors.append(ConfluenceFactor(
+                    name="Preço próximo do fundo do range",
+                    category="structure",
+                    points=-8, max_points=20, aligned=False,
+                    description=f"Venda próxima de suporte ({ind.pivot_low:.6g}) — risco de quique."
+                ))
+                warnings.append("Entrada próxima do fundo do range — risco de quique.")
+
+    # ── 8. Volatilidade ──────────────────────────────────────────────────────
+    if ind.atr and current_price > 0:
+        atr_pct = (ind.atr / current_price) * 100
+        if 1.0 <= atr_pct <= 4.0:
+            factors.append(ConfluenceFactor(
+                name="Volatilidade saudável",
+                category="volatility",
+                points=10, max_points=10, aligned=True,
+                description=f"ATR {atr_pct:.2f}% — range operacional adequado."
+            ))
+        elif atr_pct > 8.0:
+            factors.append(ConfluenceFactor(
+                name="Volatilidade excessiva",
+                category="volatility",
+                points=-5, max_points=10, aligned=False,
+                description=f"ATR {atr_pct:.2f}% — risco elevado, reduzir tamanho de posição."
+            ))
+            warnings.append(f"Volatilidade alta ({atr_pct:.1f}%) — usar tamanho reduzido.")
+
+    # ── Total ────────────────────────────────────────────────────────────────
+    total = sum(f.points for f in factors)
+    # Cap entre 0 e MAX_TOTAL
+    total = max(0, min(total, MAX_TOTAL))
+    pct = round((total / MAX_TOTAL) * 100, 1) if MAX_TOTAL > 0 else 0.0
+
+    return ConfluenceScore(
+        total=round(total, 1),
+        max_total=float(MAX_TOTAL),
+        pct=pct,
+        factors=factors,
+        warnings=warnings,
+    )

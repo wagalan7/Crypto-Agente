@@ -76,6 +76,23 @@ class Indicator(BaseModel):
     pivot_low: Optional[float] = None
 
 
+class ConfluenceFactor(BaseModel):
+    name: str           # ex: "RSI sobrevenda"
+    category: str       # ex: "momentum" | "trend" | "volume" | "pattern" | "macro" | "structure"
+    points: float       # pontos somados (positivo = a favor da direção)
+    max_points: float   # pontos máximos possíveis dessa categoria
+    description: str    # justificativa em PT-BR
+    aligned: bool       # True se contribui para a direção do sinal
+
+
+class ConfluenceScore(BaseModel):
+    total: float
+    max_total: float
+    pct: float                       # 0–100
+    factors: List[ConfluenceFactor]
+    warnings: List[str] = []         # red-flags (ex: "divergência baixista no RSI")
+
+
 class TradeSignal(BaseModel):
     symbol: str
     timeframe: str
@@ -91,5 +108,7 @@ class TradeSignal(BaseModel):
     patterns: List[DetectedPattern]
     indicators: Indicator
     ai_analysis: Optional[str] = None
+    ai_critique: Optional[str] = None         # self-critique da IA
+    confluence: Optional[ConfluenceScore] = None
     timestamp: int
     signal_strength: str

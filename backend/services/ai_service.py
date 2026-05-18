@@ -171,19 +171,95 @@ REGRAS:
 - Justifique SEMPRE o stop e os alvos com estrutura de mercado, suporte/resistência e liquidez"""
 
 
-async def generate_ai_analysis(signal: TradeSignal, macro_context: str = "") -> str:
-    if not has_ai():
-        return _fallback_analysis(signal)
+def _format_confluence_for_prompt(signal: TradeSignal) -> str:
+    """Formata o score de confluência para o prompt da IA — dá contexto rico para análise."""
+    if not signal.confluence:
+        return ""
+    c = signal.confluence
 
-    prompt_data = _format_signal_for_prompt(signal, macro_context)
+    pro = [f for f in c.factors if f.aligned and f.points > 0]
+    contra = [f for f in c.factors if not f.aligned or f.points < 0]
+
+    out = [
+        f"\n=== SCORE DE CONFLUÊNCIA: {c.total:.0f}/{c.max_total:.0f} pontos ({c.pct:.0f}%) ===",
+        f"\nFATORES A FAVOR ({len(pro)}):"
+    ]
+    for f in pro:
+        out.append(f"  ✅ [{f.category}] +{f.points:.0f}pts — {f.name}: {f.description}")
+
+    if contra:
+        out.append(f"\nFATORES CONTRA / ALERTAS ({len(contra)}):")
+        for f in contra:
+            out.append(f"  ⚠️ [{f.category}] {f.points:.0f}pts — {f.name}: {f.description}")
+
+    if c.warnings:
+        out.append("\nWARNINGS DETECTADOS:")
+        for w in c.warnings:
+            out.append(f"  🚨 {w}")
+    return "\n".join(out)
+
+
+CRITIQUE_PROMPT = """Você é um GESTOR DE RISCO SÊNIOR muito cético. Acabou de ler esta análise de um analista júnior.
+
+Seu trabalho é encontrar BURACOS na análise. Para cada um dos pontos abaixo, responda em 1-2 frases CURTAS:
+
+1. **PRINCIPAL RISCO IGNORADO** — qual cenário negativo o analista não considerou?
+2. **QUALIDADE DOS STOPS/ALVOS** — eles estão em estrutura real ou foram colocados arbitrariamente? O stop pode ser caçado?
+3. **CONTEXTO MACRO** — algo no BTC, DXY, S&P, dominância foi subestimado?
+4. **TIMING** — entrar agora é correto ou seria melhor aguardar pullback/confirmação?
+5. **VEREDITO FINAL** — após sua crítica, qual sua recomendação real?
+   - ✅ APROVADO: análise sólida, pode operar
+   - ⏳ CONDICIONAL: operar somente se [condição específica]
+   - ❌ REPROVADO: NÃO operar — [motivo claro]
+
+Seja DIRETO. Sem floreio. Cada item máximo 2 frases. Total: máximo 200 palavras."""
+
+
+async def generate_ai_analysis(
+    signal: TradeSignal,
+    macro_context: str = "",
+    with_critique: bool = True,
+) -> tuple[str, str | None]:
+    """
+    Gera análise + crítica (self-critique loop).
+    Retorna (analise_principal, critica_ou_none).
+    """
+    if not has_ai():
+        return _fallback_analysis(signal), None
+
+    confluence_block = _format_confluence_for_prompt(signal)
+    prompt_data = _format_signal_for_prompt(signal, macro_context) + confluence_block
+
     try:
-        return await call_ai(
+        analysis = await call_ai(
             system=SYSTEM_PROMPT,
-            user=f"Analise este setup seguindo a ordem obrigatória:\n{prompt_data}",
+            user=(
+                f"Analise este setup seguindo a ordem obrigatória. "
+                f"Use o SCORE DE CONFLUÊNCIA fornecido para justificar a confiança no setup — "
+                f"cite os fatores específicos que sustentam a recomendação.\n{prompt_data}"
+            ),
             max_tokens=1000,
         )
     except Exception:
-        return _fallback_analysis(signal)
+        return _fallback_analysis(signal), None
+
+    if not with_critique:
+        return analysis, None
+
+    # Self-critique — segunda chamada
+    try:
+        critique = await call_ai(
+            system=CRITIQUE_PROMPT,
+            user=(
+                f"=== DADOS DO SETUP ===\n{prompt_data}\n\n"
+                f"=== ANÁLISE GERADA PELO JÚNIOR ===\n{analysis}\n\n"
+                f"Sua crítica:"
+            ),
+            max_tokens=500,
+        )
+        return analysis, critique
+    except Exception:
+        return analysis, None
 
 
 def _fallback_analysis(signal: TradeSignal) -> str:

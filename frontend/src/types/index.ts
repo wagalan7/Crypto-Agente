@@ -49,6 +49,23 @@ export interface Indicator {
   pivot_low?: number
 }
 
+export interface ConfluenceFactor {
+  name: string
+  category: string
+  points: number
+  max_points: number
+  description: string
+  aligned: boolean
+}
+
+export interface ConfluenceScore {
+  total: number
+  max_total: number
+  pct: number
+  factors: ConfluenceFactor[]
+  warnings: string[]
+}
+
 export interface TradeSignal {
   symbol: string
   timeframe: string
@@ -64,6 +81,8 @@ export interface TradeSignal {
   patterns: DetectedPattern[]
   indicators: Indicator
   ai_analysis?: string
+  ai_critique?: string
+  confluence?: ConfluenceScore
   timestamp: number
   signal_strength: string
 }

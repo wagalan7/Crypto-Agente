@@ -1,5 +1,5 @@
 import type { TradeSignal, SignalDirection, TradeType } from '../../types'
-import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText } from 'lucide-react'
+import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle } from 'lucide-react'
 
 interface Props {
   signal: TradeSignal
@@ -326,15 +326,74 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
         </div>
       )}
 
+      {/* Confluence breakdown */}
+      {signal.confluence && (
+        <div className="bg-slate-800/60 rounded-lg p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1">
+              <Layers className="w-4 h-4 text-cyan-400" />
+              <span className="text-xs font-semibold text-cyan-400">CONFLUÊNCIA</span>
+            </div>
+            <span className="text-xs font-bold text-white">
+              {signal.confluence.total.toFixed(0)} / {signal.confluence.max_total.toFixed(0)} ({signal.confluence.pct.toFixed(0)}%)
+            </span>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {signal.confluence.factors.map((f, i) => (
+              <div key={i} className="flex items-start gap-2">
+                <span className={`mt-1 w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                  f.aligned ? 'bg-green-400' : f.points < 0 ? 'bg-red-400' : 'bg-slate-500'
+                }`} />
+                <div className="flex-1 min-w-0">
+                  <div className="flex justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-200">{f.name}</span>
+                    <span className={`text-xs font-mono ${f.aligned ? 'text-green-400' : f.points < 0 ? 'text-red-400' : 'text-slate-500'}`}>
+                      {f.points >= 0 ? '+' : ''}{f.points.toFixed(1)} / {f.max_points.toFixed(0)}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400 leading-tight">{f.description}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+          {signal.confluence.warnings.length > 0 && (
+            <div className="mt-3 pt-2 border-t border-slate-700/60">
+              <div className="flex items-center gap-1 mb-1">
+                <AlertTriangle className="w-3.5 h-3.5 text-yellow-400" />
+                <span className="text-xs font-semibold text-yellow-400">RED FLAGS</span>
+              </div>
+              <ul className="flex flex-col gap-0.5">
+                {signal.confluence.warnings.map((w, i) => (
+                  <li key={i} className="text-xs text-yellow-300/80 leading-tight">• {w}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* AI Analysis */}
       {signal.ai_analysis && (
         <div className="bg-slate-800/60 rounded-lg p-3">
           <div className="flex items-center gap-1 mb-2">
             <Brain className="w-4 h-4 text-violet-400" />
-            <span className="text-xs font-semibold text-violet-400">ANÁLISE IA (Claude)</span>
+            <span className="text-xs font-semibold text-violet-400">ANÁLISE IA</span>
           </div>
           <p className="text-xs text-slate-300 leading-relaxed whitespace-pre-line">
             {signal.ai_analysis}
+          </p>
+        </div>
+      )}
+
+      {/* AI Self-Critique (Risk Manager) */}
+      {signal.ai_critique && (
+        <div className="bg-orange-500/5 border border-orange-500/30 rounded-lg p-3">
+          <div className="flex items-center gap-1 mb-2">
+            <ShieldAlert className="w-4 h-4 text-orange-400" />
+            <span className="text-xs font-semibold text-orange-400">CRÍTICA DO GESTOR DE RISCO (Devil's Advocate)</span>
+          </div>
+          <p className="text-xs text-orange-100/80 leading-relaxed whitespace-pre-line">
+            {signal.ai_critique}
           </p>
         </div>
       )}
