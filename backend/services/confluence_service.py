@@ -8,7 +8,7 @@ antigo é que aqui CADA fator é justificado individualmente, o que dá
 """
 
 from __future__ import annotations
-from typing import List
+from typing import List, Optional
 import pandas as pd
 
 from models.trade_signal import (
@@ -18,20 +18,25 @@ from models.trade_signal import (
     ConfluenceFactor,
     ConfluenceScore,
 )
+from services.smc_service import SMCAnalysis
+from services.derivatives_service import DerivativesData
+from services.backtest_service import PatternStats
 
 
 # ─── Pesos por categoria ──────────────────────────────────────────────────────
 WEIGHTS = {
-    "momentum":   30,   # RSI + Stochastic
-    "trend":      40,   # EMAs + ADX + Supertrend
-    "macd":       20,   # MACD cross + histograma
-    "volume":     20,   # Volume vs média
-    "bollinger":  15,   # Posição BB
-    "pattern":    35,   # Padrões clássicos detectados
-    "structure":  20,   # Pivot levels, suporte/resistência
-    "volatility": 10,   # ATR / regime
+    "momentum":    30,   # RSI + Stochastic
+    "trend":       40,   # EMAs + ADX + Supertrend
+    "macd":        20,   # MACD cross + histograma
+    "volume":      20,   # Volume vs média
+    "bollinger":   15,   # Posição BB
+    "pattern":     35,   # Padrões clássicos detectados
+    "structure":   20,   # Pivot levels, suporte/resistência
+    "volatility":  10,   # ATR / regime
+    "smc":         25,   # Order Blocks, FVG, Liquidity Sweeps, BOS/CHoCH
+    "derivatives": 15,   # Funding rate + OI
 }
-MAX_TOTAL = sum(WEIGHTS.values())   # = 190
+MAX_TOTAL = sum(WEIGHTS.values())   # = 230
 
 
 def _sign_for_direction(direction: SignalDirection, val: int) -> int:
@@ -49,6 +54,9 @@ def calculate_confluence(
     df: pd.DataFrame,
     direction: SignalDirection,
     current_price: float,
+    smc: Optional[SMCAnalysis] = None,
+    derivatives: Optional[DerivativesData] = None,
+    pattern_stats: Optional[PatternStats] = None,
 ) -> ConfluenceScore:
     factors: List[ConfluenceFactor] = []
     warnings: List[str] = []
@@ -350,6 +358,154 @@ def calculate_confluence(
                 description=f"ATR {atr_pct:.2f}% — risco elevado, reduzir tamanho de posição."
             ))
             warnings.append(f"Volatilidade alta ({atr_pct:.1f}%) — usar tamanho reduzido.")
+
+    # ── 9. Smart Money Concepts ──────────────────────────────────────────────
+    if smc is not None and direction != SignalDirection.NEUTRAL:
+        dir_word = "bullish" if direction == SignalDirection.LONG else "bearish"
+
+        # Order Blocks alinhados (preço dentro/perto)
+        aligned_obs = [z for z in smc.order_blocks if z.direction == dir_word]
+        if aligned_obs:
+            ob = aligned_obs[0]
+            near = (ob.bottom * 0.99 <= current_price <= ob.top * 1.01)
+            pts = 10 if near else 6
+            factors.append(ConfluenceFactor(
+                name=f"Order Block {dir_word} ativo",
+                category="smc",
+                points=pts, max_points=10, aligned=True,
+                description=ob.description + (" — preço dentro da zona." if near else " — atrás de suporte/resistência institucional."),
+            ))
+
+        # FVG alinhado (preço pode buscar preencher)
+        aligned_fvgs = [z for z in smc.fvgs if z.direction == dir_word]
+        if aligned_fvgs:
+            fvg = aligned_fvgs[0]
+            factors.append(ConfluenceFactor(
+                name=f"FVG {dir_word}",
+                category="smc",
+                points=6, max_points=8, aligned=True,
+                description=fvg.description,
+            ))
+
+        # Liquidity sweep recente alinhado
+        aligned_sweeps = [z for z in smc.liquidity_sweeps if z.direction == dir_word]
+        if aligned_sweeps:
+            sw = aligned_sweeps[0]
+            factors.append(ConfluenceFactor(
+                name=f"Liquidity Sweep {dir_word}",
+                category="smc",
+                points=7, max_points=7, aligned=True,
+                description=sw.description,
+            ))
+
+        # BOS/CHoCH
+        if smc.structure is not None:
+            s = smc.structure
+            if s.direction == dir_word:
+                pts = 8 if s.type == "BOS" else 6  # CHoCH = reversão (menos consolidado)
+                factors.append(ConfluenceFactor(
+                    name=f"{s.type} {dir_word}",
+                    category="smc",
+                    points=pts, max_points=8, aligned=True,
+                    description=s.description,
+                ))
+            else:
+                factors.append(ConfluenceFactor(
+                    name=f"{s.type} contrário",
+                    category="smc",
+                    points=-5, max_points=8, aligned=False,
+                    description=f"Estrutura ({s.type}) aponta na direção oposta — atenção.",
+                ))
+                warnings.append(f"{s.type} contrário ao sinal — estrutura de mercado divergente.")
+
+        # Trend bias estrutural contrário
+        if smc.trend_bias != "neutral" and smc.trend_bias != dir_word:
+            warnings.append(f"Bias estrutural ({smc.trend_bias}) contrário ao sinal.")
+
+    # ── 10. Derivativos ─────────────────────────────────────────────────────
+    if derivatives is not None and direction != SignalDirection.NEUTRAL:
+        # Funding extremo NA direção do sinal = perigoso (squeeze contrário)
+        if derivatives.funding_sentiment == "extreme_long":
+            if direction == SignalDirection.LONG:
+                factors.append(ConfluenceFactor(
+                    name="Funding extremo positivo",
+                    category="derivatives",
+                    points=-8, max_points=8, aligned=False,
+                    description=f"Funding {derivatives.funding_rate_pct:.3f}% — longs sobreaquecidos, risco de squeeze.",
+                ))
+                warnings.append("Longs sobreaquecidos — entrada de compra arriscada.")
+            else:  # SHORT
+                factors.append(ConfluenceFactor(
+                    name="Setup contra-tendência (longs esticados)",
+                    category="derivatives",
+                    points=8, max_points=8, aligned=True,
+                    description="Funding muito positivo favorece reversão para baixa.",
+                ))
+        elif derivatives.funding_sentiment == "extreme_short":
+            if direction == SignalDirection.SHORT:
+                factors.append(ConfluenceFactor(
+                    name="Funding extremo negativo",
+                    category="derivatives",
+                    points=-8, max_points=8, aligned=False,
+                    description=f"Funding {derivatives.funding_rate_pct:.3f}% — shorts sobreaquecidos, risco de squeeze.",
+                ))
+                warnings.append("Shorts sobreaquecidos — entrada de venda arriscada.")
+            else:  # LONG
+                factors.append(ConfluenceFactor(
+                    name="Setup contra-tendência (shorts esticados)",
+                    category="derivatives",
+                    points=8, max_points=8, aligned=True,
+                    description="Funding muito negativo favorece reversão para alta.",
+                ))
+        elif derivatives.funding_sentiment in ("bullish_squeeze", "bearish_squeeze"):
+            factors.append(ConfluenceFactor(
+                name="Funding moderado",
+                category="derivatives",
+                points=2, max_points=4, aligned=True,
+                description=f"Funding {derivatives.funding_rate_pct:.3f}% — sentimento sem extremos.",
+            ))
+
+        # OI sentiment
+        if derivatives.oi_sentiment == "bullish" and direction == SignalDirection.LONG:
+            factors.append(ConfluenceFactor(
+                name="OI subindo com preço",
+                category="derivatives",
+                points=7, max_points=7, aligned=True,
+                description=f"OI {derivatives.oi_change_24h_pct:+.1f}% (24h) — dinheiro novo entrando comprado.",
+            ))
+        elif derivatives.oi_sentiment == "bearish" and direction == SignalDirection.SHORT:
+            factors.append(ConfluenceFactor(
+                name="OI subindo com preço caindo",
+                category="derivatives",
+                points=7, max_points=7, aligned=True,
+                description=f"OI {derivatives.oi_change_24h_pct:+.1f}% (24h) — shorts pesados ainda abrindo.",
+            ))
+
+    # ── 11. Backtest histórico de padrões ───────────────────────────────────
+    if pattern_stats is not None and patterns:
+        # Aplica modificador baseado em win-rate dos padrões alinhados
+        for p in patterns[:2]:
+            if p.direction != direction:
+                continue
+            stat = pattern_stats.stats.get(p.type.value)
+            if not stat or stat.sample_size_warning:
+                continue
+            wr = stat.win_rate
+            if wr >= 0.6:
+                factors.append(ConfluenceFactor(
+                    name=f"Win-rate histórico {p.type.value.replace('_', ' ')}",
+                    category="pattern",
+                    points=8, max_points=8, aligned=True,
+                    description=f"Histórico: {stat.wins}/{stat.occurrences} ({wr*100:.0f}% win-rate) neste ativo+TF.",
+                ))
+            elif wr < 0.4:
+                factors.append(ConfluenceFactor(
+                    name=f"Win-rate histórico baixo",
+                    category="pattern",
+                    points=-5, max_points=8, aligned=False,
+                    description=f"Padrão {p.type.value} só {wr*100:.0f}% win-rate ({stat.occurrences} amostras) neste contexto.",
+                ))
+                warnings.append(f"Padrão {p.type.value} historicamente fraco neste ativo/TF ({wr*100:.0f}%).")
 
     # ── Total ────────────────────────────────────────────────────────────────
     total = sum(f.points for f in factors)

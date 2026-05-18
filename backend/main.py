@@ -27,6 +27,7 @@ from services.indicator_service import calculate_indicators
 from services.pattern_service import detect_all_patterns
 from services.signal_service import build_trade_signal
 from services.ai_service import generate_ai_analysis
+from services.derivatives_service import analyze_derivatives
 from services.trade_service import get_trades, save_trades
 from services.macro_service import get_btc_dominance, build_macro_context, get_global_market_data
 from models.trade_signal import TradeSignal
@@ -101,7 +102,14 @@ async def analyze(
     try:
         indicators = calculate_indicators(df)
         patterns = detect_all_patterns(df)
-        signal = build_trade_signal(symbol, timeframe, df, indicators, patterns)
+        # Derivativos em paralelo (não bloqueia se falhar)
+        try:
+            ticker = await fetch_ticker(symbol)
+            price_change_24h = ticker.get("change", 0.0)
+            derivatives = await analyze_derivatives(symbol, price_change_24h)
+        except Exception:
+            derivatives = None
+        signal = build_trade_signal(symbol, timeframe, df, indicators, patterns, derivatives=derivatives)
     except Exception as e:
         logging.error(f"analysis error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro na análise: {e}")
@@ -150,7 +158,13 @@ async def analyze_data(body: AnalyzeDataRequest):
     try:
         indicators = calculate_indicators(df)
         patterns = detect_all_patterns(df)
-        signal = build_trade_signal(body.symbol, body.timeframe, df, indicators, patterns)
+        try:
+            ticker = await fetch_ticker(body.symbol)
+            price_change_24h = ticker.get("change", 0.0)
+            derivatives = await analyze_derivatives(body.symbol, price_change_24h)
+        except Exception:
+            derivatives = None
+        signal = build_trade_signal(body.symbol, body.timeframe, df, indicators, patterns, derivatives=derivatives)
     except Exception as e:
         logging.error(f"analyze_data error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro na análise: {e}")

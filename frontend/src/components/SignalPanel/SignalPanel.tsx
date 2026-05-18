@@ -1,5 +1,5 @@
 import type { TradeSignal, SignalDirection, TradeType } from '../../types'
-import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle } from 'lucide-react'
+import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle, Crosshair, BarChart3, History } from 'lucide-react'
 
 interface Props {
   signal: TradeSignal
@@ -369,6 +369,122 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
               </ul>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Smart Money Concepts */}
+      {signal.smc && (signal.smc.order_blocks.length > 0 || signal.smc.fvgs.length > 0 || signal.smc.liquidity_sweeps.length > 0 || signal.smc.structure) && (
+        <div className="bg-slate-800/60 rounded-lg p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1">
+              <Crosshair className="w-4 h-4 text-fuchsia-400" />
+              <span className="text-xs font-semibold text-fuchsia-400">SMART MONEY (SMC)</span>
+            </div>
+            <span className={`text-xs font-semibold ${
+              signal.smc.trend_bias === 'bullish' ? 'text-green-400' :
+              signal.smc.trend_bias === 'bearish' ? 'text-red-400' : 'text-slate-400'
+            }`}>
+              Bias estrutural: {signal.smc.trend_bias === 'bullish' ? 'ALTA' : signal.smc.trend_bias === 'bearish' ? 'BAIXA' : 'NEUTRO'}
+            </span>
+          </div>
+          {signal.smc.structure && (
+            <div className="mb-2 px-2 py-1.5 rounded bg-slate-900/60 border border-slate-700/50">
+              <span className={`text-xs font-bold ${signal.smc.structure.direction === 'bullish' ? 'text-green-400' : 'text-red-400'}`}>
+                {signal.smc.structure.type}
+              </span>
+              <span className="text-xs text-slate-300 ml-2">{signal.smc.structure.description}</span>
+            </div>
+          )}
+          <div className="flex flex-col gap-1">
+            {signal.smc.order_blocks.map((z, i) => (
+              <div key={`ob-${i}`} className="flex items-start gap-2 text-xs">
+                <span className={`mt-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold ${z.direction === 'bullish' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>OB</span>
+                <span className="text-slate-300 flex-1">{z.description}</span>
+              </div>
+            ))}
+            {signal.smc.fvgs.map((z, i) => (
+              <div key={`fvg-${i}`} className="flex items-start gap-2 text-xs">
+                <span className={`mt-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold ${z.direction === 'bullish' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>FVG</span>
+                <span className="text-slate-300 flex-1">{z.description}</span>
+              </div>
+            ))}
+            {signal.smc.liquidity_sweeps.map((z, i) => (
+              <div key={`sw-${i}`} className="flex items-start gap-2 text-xs">
+                <span className={`mt-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold ${z.direction === 'bullish' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>SWEEP</span>
+                <span className="text-slate-300 flex-1">{z.description}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Derivatives */}
+      {signal.derivatives && (signal.derivatives.funding_rate_pct != null || signal.derivatives.oi_change_24h_pct != null) && (
+        <div className="bg-slate-800/60 rounded-lg p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1">
+              <BarChart3 className="w-4 h-4 text-amber-400" />
+              <span className="text-xs font-semibold text-amber-400">DERIVATIVOS</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+            {signal.derivatives.funding_rate_pct != null && (
+              <>
+                <span className="text-xs text-slate-500">Funding (8h)</span>
+                <span className={`text-xs font-mono font-semibold ${
+                  signal.derivatives.funding_sentiment === 'extreme_long' ? 'text-red-400' :
+                  signal.derivatives.funding_sentiment === 'extreme_short' ? 'text-green-400' : 'text-slate-300'
+                }`}>
+                  {signal.derivatives.funding_rate_pct >= 0 ? '+' : ''}{signal.derivatives.funding_rate_pct.toFixed(4)}%
+                </span>
+              </>
+            )}
+            {signal.derivatives.oi_change_24h_pct != null && (
+              <>
+                <span className="text-xs text-slate-500">OI Δ 24h</span>
+                <span className={`text-xs font-mono font-semibold ${
+                  signal.derivatives.oi_sentiment === 'bullish' ? 'text-green-400' :
+                  signal.derivatives.oi_sentiment === 'bearish' ? 'text-red-400' : 'text-slate-300'
+                }`}>
+                  {signal.derivatives.oi_change_24h_pct >= 0 ? '+' : ''}{signal.derivatives.oi_change_24h_pct.toFixed(2)}%
+                </span>
+              </>
+            )}
+          </div>
+          <p className="text-xs text-slate-400 mt-2">{signal.derivatives.description}</p>
+          {signal.derivatives.warnings.length > 0 && (
+            <ul className="mt-2 flex flex-col gap-0.5">
+              {signal.derivatives.warnings.map((w, i) => (
+                <li key={i} className="text-xs text-yellow-300/80">⚠ {w}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* Pattern backtest */}
+      {signal.pattern_stats && Object.keys(signal.pattern_stats.stats).length > 0 && (
+        <div className="bg-slate-800/60 rounded-lg p-3">
+          <div className="flex items-center gap-1 mb-2">
+            <History className="w-4 h-4 text-teal-400" />
+            <span className="text-xs font-semibold text-teal-400">WIN-RATE HISTÓRICO (padrões deste ativo+TF)</span>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {Object.values(signal.pattern_stats.stats).map((s, i) => (
+              <div key={i} className="flex items-center justify-between text-xs">
+                <span className="text-slate-300 capitalize">{s.pattern_type.replace(/_/g, ' ')}</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-500">{s.wins}/{s.occurrences}</span>
+                  <span className={`font-mono font-semibold ${
+                    s.win_rate >= 0.6 ? 'text-green-400' : s.win_rate < 0.4 ? 'text-red-400' : 'text-slate-300'
+                  }`}>
+                    {(s.win_rate * 100).toFixed(0)}%
+                  </span>
+                  {s.sample_size_warning && <span className="text-yellow-400 text-[10px]">⚠ poucas amostras</span>}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

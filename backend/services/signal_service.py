@@ -7,6 +7,9 @@ from models.trade_signal import (
 )
 from services.indicator_service import get_indicator_signals
 from services.confluence_service import calculate_confluence
+from services.smc_service import analyze_smc, SMCAnalysis
+from services.derivatives_service import DerivativesData
+from services.backtest_service import compute_pattern_stats, PatternStats
 
 
 TIMEFRAME_TRADE_TYPE = {
@@ -174,6 +177,8 @@ def build_trade_signal(
     df: pd.DataFrame,
     ind: Indicator,
     patterns: List[DetectedPattern],
+    derivatives: Optional[DerivativesData] = None,
+    with_backtest: bool = True,
 ) -> TradeSignal:
     current_price = float(df["close"].iloc[-1])
     atr = ind.atr or (current_price * 0.01)
@@ -181,13 +186,32 @@ def build_trade_signal(
 
     direction = determine_direction(ind, patterns, current_price)
 
-    # Score de confluência ponderado e transparente — substitui o cálculo antigo
+    # SMC analysis (sempre roda)
+    try:
+        smc = analyze_smc(df)
+    except Exception:
+        smc = None
+
+    # Backtest histórico (cacheado)
+    pattern_stats: Optional[PatternStats] = None
+    if with_backtest and patterns:
+        try:
+            pattern_stats = compute_pattern_stats(symbol, timeframe, df)
+        except Exception:
+            pattern_stats = None
+
+    # Score de confluência ponderado e transparente
     if direction != SignalDirection.NEUTRAL:
-        confluence = calculate_confluence(ind, patterns, df, direction, current_price)
+        confluence = calculate_confluence(
+            ind, patterns, df, direction, current_price,
+            smc=smc, derivatives=derivatives, pattern_stats=pattern_stats,
+        )
         confidence = round(confluence.pct / 100, 2)
     else:
-        confluence = calculate_confluence(ind, patterns, df, SignalDirection.NEUTRAL, current_price)
-        # Para neutro, usa o antigo (sem direção)
+        confluence = calculate_confluence(
+            ind, patterns, df, SignalDirection.NEUTRAL, current_price,
+            smc=smc, derivatives=derivatives, pattern_stats=pattern_stats,
+        )
         confidence = calculate_confidence(ind, patterns, direction, current_price)
 
     levels = calculate_levels(current_price, atr, direction, trade_type, patterns, ind)
@@ -209,6 +233,9 @@ def build_trade_signal(
         ai_analysis=None,
         ai_critique=None,
         confluence=confluence,
+        smc=smc.model_dump() if smc else None,
+        derivatives=derivatives.model_dump() if derivatives else None,
+        pattern_stats=pattern_stats.model_dump() if pattern_stats else None,
         timestamp=int(df["timestamp"].iloc[-1]),
         signal_strength=signal_strength_label(confidence),
     )

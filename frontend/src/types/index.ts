@@ -66,6 +66,62 @@ export interface ConfluenceScore {
   warnings: string[]
 }
 
+export interface SMCZone {
+  type: 'order_block' | 'fvg' | 'liquidity_sweep'
+  direction: 'bullish' | 'bearish'
+  top: number
+  bottom: number
+  index: number
+  timestamp: number
+  description: string
+  active: boolean
+}
+
+export interface StructureSignal {
+  type: 'BOS' | 'CHoCH'
+  direction: 'bullish' | 'bearish'
+  price: number
+  index: number
+  timestamp: number
+  description: string
+}
+
+export interface SMCAnalysis {
+  order_blocks: SMCZone[]
+  fvgs: SMCZone[]
+  liquidity_sweeps: SMCZone[]
+  structure?: StructureSignal | null
+  trend_bias: 'bullish' | 'bearish' | 'neutral'
+}
+
+export interface DerivativesData {
+  funding_rate?: number | null
+  funding_rate_pct?: number | null
+  funding_sentiment: 'bullish_squeeze' | 'bearish_squeeze' | 'neutral' | 'extreme_long' | 'extreme_short'
+  open_interest?: number | null
+  oi_change_24h_pct?: number | null
+  oi_sentiment: 'bullish' | 'bearish' | 'neutral'
+  description: string
+  warnings: string[]
+}
+
+export interface PatternStat {
+  pattern_type: string
+  occurrences: number
+  wins: number
+  losses: number
+  win_rate: number
+  avg_bars_to_resolve: number
+  sample_size_warning: boolean
+}
+
+export interface PatternStats {
+  symbol: string
+  timeframe: string
+  stats: Record<string, PatternStat>
+  computed_at: number
+}
+
 export interface TradeSignal {
   symbol: string
   timeframe: string
@@ -83,6 +139,9 @@ export interface TradeSignal {
   ai_analysis?: string
   ai_critique?: string
   confluence?: ConfluenceScore
+  smc?: SMCAnalysis | null
+  derivatives?: DerivativesData | null
+  pattern_stats?: PatternStats | null
   timestamp: number
   signal_strength: string
 }

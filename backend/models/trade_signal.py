@@ -110,5 +110,8 @@ class TradeSignal(BaseModel):
     ai_analysis: Optional[str] = None
     ai_critique: Optional[str] = None         # self-critique da IA
     confluence: Optional[ConfluenceScore] = None
+    smc: Optional[dict] = None                # SMCAnalysis serializado
+    derivatives: Optional[dict] = None        # DerivativesData serializado
+    pattern_stats: Optional[dict] = None      # {pattern_type: PatternStat}
     timestamp: int
     signal_strength: str
