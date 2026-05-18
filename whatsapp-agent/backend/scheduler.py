@@ -251,9 +251,46 @@ async def run_confirmations_now():
     return results
 
 
+async def _run_backup():
+    """Backup diário do SQLite às 3h da manhã, com rotação (mantém últimos 7 dias).
+    Usa o BACKUP API do SQLite (consistente mesmo com escritas concorrentes)."""
+    now = datetime.now(_TZ)
+    if now.hour != 3:
+        return
+    import os, sqlite3 as _sql, shutil
+    src = db.DB_PATH
+    backup_dir = os.path.join(os.path.dirname(src), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = now.strftime("%Y%m%d")
+    dest = os.path.join(backup_dir, f"consultorio-{stamp}.db")
+    if os.path.exists(dest):
+        return  # já feito hoje
+    try:
+        src_conn = _sql.connect(src)
+        dst_conn = _sql.connect(dest)
+        with dst_conn:
+            src_conn.backup(dst_conn)
+        src_conn.close()
+        dst_conn.close()
+        size_mb = os.path.getsize(dest) / (1024 * 1024)
+        logger.info(f"[backup] ✓ {dest} ({size_mb:.1f} MB)")
+
+        # Rotação: remove backups > 7 dias
+        import time as _t
+        cutoff = _t.time() - 7 * 86400
+        for fname in os.listdir(backup_dir):
+            fpath = os.path.join(backup_dir, fname)
+            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+                logger.info(f"[backup] rotacionado: {fname}")
+    except Exception as e:
+        logger.exception(f"[backup] FALHOU: {e}")
+
+
 async def _run_all():
     await _run_confirmations()
     await _run_billing()
+    await _run_backup()
 
 
 def _scheduler_loop():

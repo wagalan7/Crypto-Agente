@@ -147,6 +147,15 @@
           </select>
         </div>
 
+        <div class="flex items-start gap-3 pt-2 border-t border-gray-100">
+          <input type="checkbox" id="accept_terms" class="mt-1 w-4 h-4 text-brand border-gray-300 rounded focus:ring-brand">
+          <label for="accept_terms" class="text-sm text-gray-700 leading-relaxed">
+            Li e aceito os <a href="/termos" target="_blank" class="text-brand font-medium hover:underline">Termos de Uso</a>
+            e a <a href="/privacidade" target="_blank" class="text-brand font-medium hover:underline">Política de Privacidade</a>
+            (LGPD). <span class="text-red-500">*</span>
+          </label>
+        </div>
+
         <div id="error-msg" class="hidden text-sm text-red-600 bg-red-50 rounded-xl px-4 py-2.5"></div>
 
         <button onclick="submit()" id="btn"
@@ -218,6 +227,7 @@ async function submit() {
     working_hours_start: +document.getElementById("start").value,
     working_hours_end: +document.getElementById("end").value,
     session_minutes: +document.getElementById("minutes").value,
+    accept_terms: document.getElementById("accept_terms").checked,
   };
   const errEl = document.getElementById("error-msg");
   const btn   = document.getElementById("btn");
@@ -238,6 +248,11 @@ async function submit() {
   }
   if (payload.billing_state.length !== 2) {
     errEl.textContent = "UF deve ter 2 letras (ex: SP).";
+    errEl.classList.remove("hidden");
+    return;
+  }
+  if (!payload.accept_terms) {
+    errEl.textContent = "Você precisa aceitar os Termos de Uso e a Política de Privacidade.";
     errEl.classList.remove("hidden");
     return;
   }
