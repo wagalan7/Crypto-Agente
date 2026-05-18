@@ -30,6 +30,43 @@ import caldav_service as caldav_svc
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+# ── Sentry (opcional, ativa se SENTRY_DSN estiver definido) ─────────────────
+import os as _os_init
+_SENTRY_DSN = _os_init.getenv("SENTRY_DSN", "").strip()
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            traces_sample_rate=float(_os_init.getenv("SENTRY_TRACES_SAMPLE", "0.05")),
+            profiles_sample_rate=0.0,
+            send_default_pii=False,
+            integrations=[FastApiIntegration()],
+            environment=_os_init.getenv("RAILWAY_ENVIRONMENT", "production"),
+        )
+        logger.info("Sentry inicializado")
+    except Exception as e:
+        logger.warning(f"Falha ao inicializar Sentry: {e}")
+
+# ── Rate limiter (slowapi) ──────────────────────────────────────────────────
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+def _rate_limit_key(request: Request) -> str:
+    """Usa X-Forwarded-For (Railway edge) ou IP direto."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return get_remote_address(request)
+
+limiter = Limiter(key_func=_rate_limit_key, default_limits=["240/minute"])
+
+
+def _client_ip(request: Request) -> str:
+    return _rate_limit_key(request)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,6 +83,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agente de Atendimento — Multi-Consultório", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -248,6 +287,7 @@ def _validate_webhook_token(tenant: dict, request: Request) -> bool:
 
 
 @app.post("/webhook/{slug}/zapi")
+@limiter.limit("120/minute")
 async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
     if not _validate_webhook_token(tenant, request):
@@ -1004,7 +1044,8 @@ def _validate_cpf_cnpj(value: str) -> bool:
 
 
 @app.post("/onboarding/create", status_code=201)
-def onboarding_create(body: OnboardingCreate):
+@limiter.limit("5/minute")
+def onboarding_create(request: Request, body: OnboardingCreate):
     # Validação básica dos campos obrigatórios
     required = {
         "Nome do consultório": body.name,
@@ -1071,6 +1112,8 @@ def onboarding_create(body: OnboardingCreate):
         accepted_terms_at=datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds"),
     )
 
+    db.audit_log("tenant_created", actor=body.email, target=slug, ip=_client_ip(request),
+                 details=f"name={body.name}, plan=pending_payment")
     return {"slug": slug, "setup_token": setup_token}
 
 
@@ -1388,10 +1431,22 @@ class AdminLoginBody(BaseModel):
 
 
 @app.post("/painel/login")
-def painel_login(body: AdminLoginBody):
-    admin = db.admin_verify_login(body.username.strip(), body.password)
+@limiter.limit("10/minute")
+def painel_login(request: Request, body: AdminLoginBody):
+    username = body.username.strip()
+    ip = _client_ip(request)
+    # Lockout: 8 falhas em 15 min para mesmo user OU IP
+    if db.is_account_locked(username, ip, threshold=8, minutes=15):
+        db.audit_log("admin_login_locked", actor=username, ip=ip)
+        raise HTTPException(status_code=429, detail="Muitas tentativas falhas. Aguarde 15 minutos.")
+    admin = db.admin_verify_login(username, body.password)
     if not admin:
+        db.record_login_attempt(username, ip, success=False)
+        db.audit_log("admin_login_failed", actor=username, ip=ip)
         raise HTTPException(status_code=401, detail="Usuário ou senha incorretos.")
+    db.record_login_attempt(username, ip, success=True)
+    db.clear_login_attempts(username)
+    db.audit_log("admin_login_success", actor=admin["username"], ip=ip)
     token = db.admin_create_session(admin["username"], days=7)
     resp = JSONResponse({"ok": True, "username": admin["username"]})
     resp.set_cookie(
@@ -1542,5 +1597,32 @@ def painel_api_testimonials_default(request: Request):
 
 @app.get("/health")
 def health():
-    tenants = db.list_tenants()
-    return {"status": "ok", "tenants_active": len(tenants)}
+    """Healthcheck simples (uptime probe)."""
+    return {"status": "ok"}
+
+
+@app.get("/healthz")
+def healthz():
+    """Healthcheck profundo: testa conexão com o banco."""
+    try:
+        with db.get_conn() as conn:
+            row = conn.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()
+        return {
+            "status": "ok",
+            "db": "ok",
+            "tenants_count": int(row["n"]) if row else 0,
+            "ts": datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds"),
+            "sentry": bool(_os.getenv("SENTRY_DSN", "").strip()),
+        }
+    except Exception as e:
+        logger.error(f"healthz falhou: {e}")
+        return JSONResponse(
+            {"status": "degraded", "db": "fail", "error": str(e)[:200]},
+            status_code=503,
+        )
+
+
+@app.get("/painel/api/audit")
+def painel_api_audit(request: Request, limit: int = 100):
+    _require_admin(request)
+    return {"items": db.audit_list(limit=min(limit, 500))}
