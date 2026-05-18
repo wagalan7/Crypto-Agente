@@ -3,6 +3,7 @@ import logging
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Form
@@ -33,6 +34,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    # Backfill: garante webhook_token para todos os tenants existentes
+    try:
+        for t in db.list_tenants():
+            db.ensure_webhook_token(t["id"])
+    except Exception as e:
+        logger.warning(f"Erro no backfill de webhook_token: {e}")
     scheduler.start_scheduler()
     logger.info("Agente de Atendimento iniciado")
     yield
@@ -45,11 +52,24 @@ _STATIC_DIR = Path(__file__).parent / "static"
 _STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
+_ALLOWED_ORIGINS = [
+    config.BASE_URL,
+    "https://agenteconsultorio.com.br",
+    "https://www.agenteconsultorio.com.br",
+    "https://agente-atendimento-production.up.railway.app",
+]
+# Suporte a override por env var (CORS_ORIGINS=https://a.com,https://b.com)
+import os as _os
+_extra = _os.getenv("CORS_ORIGINS", "")
+if _extra:
+    _ALLOWED_ORIGINS.extend([o.strip() for o in _extra.split(",") if o.strip()])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=list(set(_ALLOWED_ORIGINS)),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Dashboard-Token", "X-Master-Token"],
 )
 
 
@@ -206,9 +226,32 @@ async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
     return {"status": "queued"}
 
 
+def _validate_webhook_token(tenant: dict, request: Request) -> bool:
+    """Valida o token de webhook esperado.
+    - Aceita via query string ?token=, header X-Webhook-Token ou Client-Token.
+    - Se o tenant ainda não tem webhook_token (legacy), aceita mas loga warning.
+    """
+    expected = (tenant.get("webhook_token") or "").strip()
+    if not expected:
+        logger.warning(f"[{tenant['slug']}] Webhook recebido SEM token configurado — modo legacy")
+        return True
+    provided = (
+        request.query_params.get("token", "")
+        or request.headers.get("X-Webhook-Token", "")
+        or request.headers.get("Client-Token", "")
+    ).strip()
+    import hmac as _hmac
+    if not provided or not _hmac.compare_digest(provided, expected):
+        logger.warning(f"[{tenant['slug']}] Webhook REJEITADO — token inválido (provided={provided[:8]}...)")
+        return False
+    return True
+
+
 @app.post("/webhook/{slug}/zapi")
 async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
+    if not _validate_webhook_token(tenant, request):
+        raise HTTPException(status_code=403, detail="Token de webhook inválido.")
     payload = await request.json()
     # Ignorar mensagens enviadas pelo próprio número (ecos, status, etc.)
     if payload.get("fromMe"):
@@ -360,12 +403,14 @@ class ZAPIConfig(BaseModel):
 @app.patch("/admin/tenants/{slug}/zapi")
 def configure_zapi(slug: str, body: ZAPIConfig):
     """Configura Z-API para o consultório."""
-    _get_tenant(slug)
+    tenant = _get_tenant(slug)
     ts.configure_zapi(slug, body.instance_id, body.token, body.client_token or "")
+    wt = db.ensure_webhook_token(tenant["id"])
     return {
         "status": "configured",
         "provider": "zapi",
-        "webhook_url": f"{config.BASE_URL}/webhook/{slug}/zapi",
+        "webhook_url": f"{config.BASE_URL}/webhook/{slug}/zapi?token={wt}",
+        "webhook_token": wt,
     }
 
 
@@ -782,6 +827,53 @@ def controle_novo_paciente(token: str, request: Request,
     return RedirectResponse(f"/controle/{token}", status_code=303)
 
 
+@app.get("/dashboard/api/export")
+def dash_export(request: Request):
+    """LGPD: exporta todos os dados do tenant em JSON (direito de portabilidade — art. 18, V)."""
+    token = request.headers.get("X-Dashboard-Token", "") or request.query_params.get("token", "")
+    tenant = _get_tenant_by_token(token)
+    tid = tenant["id"]
+    # Coleta de dados
+    from datetime import datetime as _dt2
+    with db.get_conn() as conn:
+        appts = [dict(r) for r in conn.execute(
+            "SELECT * FROM appointments WHERE tenant_id = ? ORDER BY scheduled_at", (tid,)
+        ).fetchall()]
+        convs = [dict(r) for r in conn.execute(
+            "SELECT phone, role, content, created_at FROM conversations WHERE tenant_id = ? ORDER BY created_at",
+            (tid,)
+        ).fetchall()]
+        try:
+            billing = [dict(r) for r in conn.execute(
+                "SELECT * FROM billing_logs WHERE tenant_id = ? ORDER BY sent_at", (tid,)
+            ).fetchall()]
+        except Exception:
+            billing = []
+        try:
+            paused = [dict(r) for r in conn.execute(
+                "SELECT * FROM paused_conversations WHERE tenant_id = ?", (tid,)
+            ).fetchall()]
+        except Exception:
+            paused = []
+
+    # Remove campos sensíveis do tenant antes de exportar
+    tenant_safe = {k: v for k, v in dict(tenant).items()
+                   if k not in {"dashboard_token", "setup_token", "webhook_token",
+                                "evolution_key", "twilio_token", "google_refresh_token",
+                                "caldav_password", "stripe_subscription_id"}}
+    payload = {
+        "exported_at": _dt2.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds"),
+        "tenant": tenant_safe,
+        "appointments": appts,
+        "conversations": convs,
+        "billing_logs": billing,
+        "paused_conversations": paused,
+        "_lgpd_notice": "Exportação realizada conforme art. 18, V da LGPD. Conserve este arquivo em local seguro.",
+    }
+    fname = f"export-{tenant['slug']}-{_dt2.now().strftime('%Y%m%d-%H%M%S')}.json"
+    return JSONResponse(payload, headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
 @app.get("/dashboard/api/conversation/{phone}")
 def dash_conversation(phone: str, request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
@@ -865,6 +957,16 @@ def generate_dashboard_token(slug: str):
 
 # ── Onboarding público ─────────────────────────────────────────────────────────
 
+@app.get("/termos", response_class=HTMLResponse)
+def termos_de_uso(request: Request):
+    return templates.TemplateResponse("termos.html", {"request": request})
+
+
+@app.get("/privacidade", response_class=HTMLResponse)
+def politica_privacidade(request: Request):
+    return templates.TemplateResponse("privacidade.html", {"request": request})
+
+
 @app.get("/onboarding", response_class=HTMLResponse)
 def onboarding_form(request: Request):
     return templates.TemplateResponse("onboarding.html", {"request": request})
@@ -889,6 +991,7 @@ class OnboardingCreate(BaseModel):
     billing_neighborhood: str # Bairro
     billing_city: str
     billing_state: str        # UF
+    accept_terms: bool = False  # Aceite dos Termos de Uso e Política de Privacidade (LGPD)
 
 
 def _only_digits(s: str) -> str:
@@ -930,6 +1033,8 @@ def onboarding_create(body: OnboardingCreate):
         raise HTTPException(status_code=400, detail="CEP deve ter 8 dígitos.")
     if len(body.billing_state.strip()) != 2:
         raise HTTPException(status_code=400, detail="UF deve ter 2 letras (ex: SP).")
+    if not body.accept_terms:
+        raise HTTPException(status_code=400, detail="É necessário aceitar os Termos de Uso e a Política de Privacidade.")
 
     try:
         tenant = ts.create_tenant(
@@ -963,6 +1068,7 @@ def onboarding_create(body: OnboardingCreate):
         billing_city=body.billing_city,
         billing_state=body.billing_state.upper().strip()[:2],
         status="pending_payment",
+        accepted_terms_at=datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds"),
     )
 
     return {"slug": slug, "setup_token": setup_token}
@@ -981,12 +1087,14 @@ def onboarding_info(setup_token: str):
     slug = tenant["slug"]
     dash_token = tenant.get("dashboard_token", "")
     base = config.BASE_URL
+    wt = db.ensure_webhook_token(tenant["id"])
     return {
         "name": tenant["name"],
         "slug": slug,
         "dashboard_url": f"{base}/dashboard/{slug}?token={dash_token}" if dash_token else "",
         "controle_url": f"{base}/controle/{dash_token}" if dash_token else "",
-        "webhook_url": f"{base}/webhook/{slug}/zapi",
+        "webhook_url": f"{base}/webhook/{slug}/zapi?token={wt}",
+        "webhook_token": wt,
     }
 
 
@@ -1167,9 +1275,41 @@ async def checkout_mercadopago(request: Request):
 
 @app.post("/webhooks/mercadopago")
 async def webhook_mercadopago(request: Request):
-    data = await request.json()
+    # Validação opcional: se MP_WEBHOOK_SECRET estiver configurado, exige x-signature válida
+    secret = _os.getenv("MP_WEBHOOK_SECRET", "")
+    if secret:
+        x_sig = request.headers.get("x-signature", "")
+        x_req = request.headers.get("x-request-id", "")
+        raw   = await request.body()
+        if not _verify_mp_signature(secret, x_sig, x_req, raw, request.query_params.get("data.id", "")):
+            logger.warning(f"[mp] Webhook REJEITADO — assinatura inválida")
+            raise HTTPException(status_code=403, detail="Assinatura inválida.")
+        import json as _json
+        data = _json.loads(raw.decode("utf-8") or "{}")
+    else:
+        data = await request.json()
+        logger.info("[mp] MP_WEBHOOK_SECRET não configurado — webhook aceito sem validação (NÃO recomendado em produção)")
     result = mp_svc.handle_webhook(data)
     return result
+
+
+def _verify_mp_signature(secret: str, x_signature: str, x_request_id: str, body: bytes, data_id: str) -> bool:
+    """Verifica HMAC-SHA256 conforme docs do Mercado Pago.
+    x-signature vem no formato: 'ts=NNN,v1=HEX_HMAC'. O manifest é:
+    'id:DATA_ID;request-id:REQ_ID;ts:TS;'"""
+    import hmac as _hmac, hashlib as _hashlib
+    try:
+        parts = dict(p.split("=", 1) for p in x_signature.split(",") if "=" in p)
+        ts = parts.get("ts", "")
+        v1 = parts.get("v1", "")
+        if not ts or not v1:
+            return False
+        manifest = f"id:{data_id};request-id:{x_request_id};ts:{ts};"
+        expected = _hmac.new(secret.encode(), manifest.encode(), _hashlib.sha256).hexdigest()
+        return _hmac.compare_digest(expected, v1)
+    except Exception as e:
+        logger.warning(f"[mp] erro validando assinatura: {e}")
+        return False
 
 
 # ── Landing page (com tracking + depoimentos dinâmicos) ────────────────────────

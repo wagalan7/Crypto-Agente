@@ -124,6 +124,8 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN billing_city TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN billing_state TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN phone TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN webhook_token TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN accepted_terms_at TEXT DEFAULT NULL",
         ]
         for sql in migrations:
             try:
@@ -172,14 +174,26 @@ def init_db():
 
 
 def _seed_default_admin(conn):
-    """Cria o usuário admin padrão se nenhum existir."""
-    import os, hashlib, secrets as _secrets
+    """Cria o usuário admin inicial se nenhum existir.
+    Lê credenciais EXCLUSIVAMENTE de variáveis de ambiente. Se ADMIN_PASSWORD
+    não estiver configurada, gera uma senha aleatória e LOGA UMA VEZ — a senha
+    precisa ser anotada e usada no primeiro login. NUNCA usa senha hardcoded."""
+    import os, hashlib, secrets as _secrets, logging as _logging
+    _log = _logging.getLogger(__name__)
     row = conn.execute("SELECT COUNT(*) AS n FROM admin_users").fetchone()
     if row["n"] > 0:
         return
     username = os.getenv("ADMIN_USERNAME", "alanmalta")
     email    = os.getenv("ADMIN_EMAIL", "wagalan@gmail.com")
-    password = os.getenv("ADMIN_PASSWORD", "@l61310788")
+    password = os.getenv("ADMIN_PASSWORD", "")
+    if not password:
+        password = _secrets.token_urlsafe(16)
+        _log.warning("=" * 70)
+        _log.warning(f"⚠️  ADMIN_PASSWORD não configurada. Senha temporária gerada:")
+        _log.warning(f"    usuário: {username}")
+        _log.warning(f"    senha:   {password}")
+        _log.warning(f"    Defina ADMIN_PASSWORD no Railway e reinicie OU troque a senha pelo painel.")
+        _log.warning("=" * 70)
     salt = _secrets.token_hex(16)
     pw_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
     conn.execute(
@@ -204,14 +218,28 @@ def get_conn():
 def create_tenant(slug: str, name: str, psychologist_name: str = "Psicóloga",
                   working_hours_start: int = 7, working_hours_end: int = 21,
                   session_minutes: int = 50) -> int:
+    import secrets as _secrets
+    webhook_token = _secrets.token_urlsafe(24)
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO tenants
-               (slug, name, psychologist_name, working_hours_start, working_hours_end, session_minutes)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (slug, name, psychologist_name, working_hours_start, working_hours_end, session_minutes),
+               (slug, name, psychologist_name, working_hours_start, working_hours_end, session_minutes, webhook_token)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (slug, name, psychologist_name, working_hours_start, working_hours_end, session_minutes, webhook_token),
         )
         return cur.lastrowid
+
+
+def ensure_webhook_token(tenant_id: int) -> str:
+    """Backfill: garante que o tenant tem webhook_token; cria se vazio."""
+    import secrets as _secrets
+    with get_conn() as conn:
+        row = conn.execute("SELECT webhook_token FROM tenants WHERE id = ?", (tenant_id,)).fetchone()
+        if row and row["webhook_token"]:
+            return row["webhook_token"]
+        token = _secrets.token_urlsafe(24)
+        conn.execute("UPDATE tenants SET webhook_token = ? WHERE id = ?", (token, tenant_id))
+        return token
 
 
 def get_tenant(slug: str) -> dict | None:
@@ -274,6 +302,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "full_name", "cpf_cnpj", "phone",
         "billing_zip", "billing_address", "billing_number", "billing_complement",
         "billing_neighborhood", "billing_city", "billing_state",
+        "accepted_terms_at",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
