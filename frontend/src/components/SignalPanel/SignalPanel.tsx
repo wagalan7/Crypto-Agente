@@ -1,5 +1,5 @@
 import type { TradeSignal, SignalDirection, TradeType } from '../../types'
-import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle, Crosshair, BarChart3, History } from 'lucide-react'
+import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle, Crosshair, BarChart3, History, GitCompare } from 'lucide-react'
 
 interface Props {
   signal: TradeSignal
@@ -459,6 +459,39 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
               ))}
             </ul>
           )}
+        </div>
+      )}
+
+      {/* Divergences */}
+      {signal.divergences && signal.divergences.length > 0 && (
+        <div className="bg-slate-800/60 rounded-lg p-3">
+          <div className="flex items-center gap-1 mb-2">
+            <GitCompare className="w-4 h-4 text-indigo-400" />
+            <span className="text-xs font-semibold text-indigo-400">DIVERGÊNCIAS DETECTADAS</span>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {signal.divergences.map((d, i) => (
+              <div key={i} className="flex items-start gap-2 text-xs">
+                <span className={`mt-0.5 px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                  d.direction === 'bullish' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+                }`}>
+                  {d.indicator} {d.type === 'regular' ? 'REG' : 'OCULTA'}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-slate-300 leading-tight">{d.description}</p>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <div className="flex-1 h-1 bg-slate-700 rounded-full">
+                      <div
+                        className={`h-full rounded-full ${d.direction === 'bullish' ? 'bg-green-400' : 'bg-red-400'}`}
+                        style={{ width: `${d.strength * 100}%` }}
+                      />
+                    </div>
+                    <span className="text-[10px] text-slate-500">força {(d.strength * 100).toFixed(0)}%</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

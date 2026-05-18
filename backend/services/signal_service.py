@@ -10,6 +10,7 @@ from services.confluence_service import calculate_confluence
 from services.smc_service import analyze_smc, SMCAnalysis
 from services.derivatives_service import DerivativesData
 from services.backtest_service import compute_pattern_stats, PatternStats
+from services.divergence_service import detect_divergences
 
 
 TIMEFRAME_TRADE_TYPE = {
@@ -192,6 +193,12 @@ def build_trade_signal(
     except Exception:
         smc = None
 
+    # Divergências RSI/MACD
+    try:
+        divergences = detect_divergences(df)
+    except Exception:
+        divergences = []
+
     # Backtest histórico (cacheado)
     pattern_stats: Optional[PatternStats] = None
     if with_backtest and patterns:
@@ -205,12 +212,14 @@ def build_trade_signal(
         confluence = calculate_confluence(
             ind, patterns, df, direction, current_price,
             smc=smc, derivatives=derivatives, pattern_stats=pattern_stats,
+            divergences=divergences,
         )
         confidence = round(confluence.pct / 100, 2)
     else:
         confluence = calculate_confluence(
             ind, patterns, df, SignalDirection.NEUTRAL, current_price,
             smc=smc, derivatives=derivatives, pattern_stats=pattern_stats,
+            divergences=divergences,
         )
         confidence = calculate_confidence(ind, patterns, direction, current_price)
 
@@ -236,6 +245,7 @@ def build_trade_signal(
         smc=smc.model_dump() if smc else None,
         derivatives=derivatives.model_dump() if derivatives else None,
         pattern_stats=pattern_stats.model_dump() if pattern_stats else None,
+        divergences=[d.model_dump() for d in divergences] if divergences else None,
         timestamp=int(df["timestamp"].iloc[-1]),
         signal_strength=signal_strength_label(confidence),
     )

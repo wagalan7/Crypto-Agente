@@ -142,8 +142,23 @@ export interface TradeSignal {
   smc?: SMCAnalysis | null
   derivatives?: DerivativesData | null
   pattern_stats?: PatternStats | null
+  divergences?: Divergence[] | null
   timestamp: number
   signal_strength: string
+}
+
+export interface Divergence {
+  indicator: 'RSI' | 'MACD'
+  type: 'regular' | 'hidden'
+  direction: 'bullish' | 'bearish'
+  price_p1: number
+  price_p2: number
+  ind_p1: number
+  ind_p2: number
+  index_p1: number
+  index_p2: number
+  strength: number
+  description: string
 }
 
 export interface OHLCVCandle {

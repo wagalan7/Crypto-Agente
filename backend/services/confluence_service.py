@@ -21,22 +21,24 @@ from models.trade_signal import (
 from services.smc_service import SMCAnalysis
 from services.derivatives_service import DerivativesData
 from services.backtest_service import PatternStats
+from services.divergence_service import Divergence
 
 
 # ─── Pesos por categoria ──────────────────────────────────────────────────────
 WEIGHTS = {
-    "momentum":    30,   # RSI + Stochastic
-    "trend":       40,   # EMAs + ADX + Supertrend
-    "macd":        20,   # MACD cross + histograma
-    "volume":      20,   # Volume vs média
-    "bollinger":   15,   # Posição BB
-    "pattern":     35,   # Padrões clássicos detectados
-    "structure":   20,   # Pivot levels, suporte/resistência
-    "volatility":  10,   # ATR / regime
-    "smc":         25,   # Order Blocks, FVG, Liquidity Sweeps, BOS/CHoCH
-    "derivatives": 15,   # Funding rate + OI
+    "momentum":     30,   # RSI + Stochastic
+    "trend":        40,   # EMAs + ADX + Supertrend
+    "macd":         20,   # MACD cross + histograma
+    "volume":       20,   # Volume vs média
+    "bollinger":    15,   # Posição BB
+    "pattern":      35,   # Padrões clássicos detectados
+    "structure":    20,   # Pivot levels, suporte/resistência
+    "volatility":   10,   # ATR / regime
+    "smc":          25,   # Order Blocks, FVG, Liquidity Sweeps, BOS/CHoCH
+    "derivatives":  15,   # Funding rate + OI
+    "divergence":   20,   # Divergências RSI/MACD
 }
-MAX_TOTAL = sum(WEIGHTS.values())   # = 230
+MAX_TOTAL = sum(WEIGHTS.values())   # = 250
 
 
 def _sign_for_direction(direction: SignalDirection, val: int) -> int:
@@ -57,6 +59,7 @@ def calculate_confluence(
     smc: Optional[SMCAnalysis] = None,
     derivatives: Optional[DerivativesData] = None,
     pattern_stats: Optional[PatternStats] = None,
+    divergences: Optional[List[Divergence]] = None,
 ) -> ConfluenceScore:
     factors: List[ConfluenceFactor] = []
     warnings: List[str] = []
@@ -506,6 +509,34 @@ def calculate_confluence(
                     description=f"Padrão {p.type.value} só {wr*100:.0f}% win-rate ({stat.occurrences} amostras) neste contexto.",
                 ))
                 warnings.append(f"Padrão {p.type.value} historicamente fraco neste ativo/TF ({wr*100:.0f}%).")
+
+    # ── 12. Divergências RSI/MACD ────────────────────────────────────────────
+    if divergences and direction != SignalDirection.NEUTRAL:
+        dir_word = "bullish" if direction == SignalDirection.LONG else "bearish"
+        aligned = [d for d in divergences if d.direction == dir_word]
+        contrary = [d for d in divergences if d.direction != dir_word]
+
+        # Até 2 divergências alinhadas
+        for d in aligned[:2]:
+            # Regular = mais peso (reversão clara), hidden = continuação
+            base = 10 if d.type == "regular" else 7
+            pts = round(base * d.strength + 3, 1)  # min 3 pts mesmo strength baixo
+            factors.append(ConfluenceFactor(
+                name=f"Divergência {d.type} {d.indicator} ({dir_word})",
+                category="divergence",
+                points=pts, max_points=10, aligned=True,
+                description=d.description,
+            ))
+
+        # Divergências contrárias = penalidade + warning
+        for d in contrary[:1]:
+            factors.append(ConfluenceFactor(
+                name=f"Divergência contrária no {d.indicator}",
+                category="divergence",
+                points=-6, max_points=10, aligned=False,
+                description=d.description,
+            ))
+            warnings.append(f"Divergência {d.type} {d.indicator} oposta ao sinal — risco de reversão.")
 
     # ── Total ────────────────────────────────────────────────────────────────
     total = sum(f.points for f in factors)

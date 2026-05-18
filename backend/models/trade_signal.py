@@ -113,5 +113,6 @@ class TradeSignal(BaseModel):
     smc: Optional[dict] = None                # SMCAnalysis serializado
     derivatives: Optional[dict] = None        # DerivativesData serializado
     pattern_stats: Optional[dict] = None      # {pattern_type: PatternStat}
+    divergences: Optional[list] = None        # List[Divergence] serializado
     timestamp: int
     signal_strength: str
