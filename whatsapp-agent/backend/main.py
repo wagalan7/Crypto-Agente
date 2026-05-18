@@ -1105,19 +1105,6 @@ def _check_master_key(key: str):
         raise HTTPException(status_code=403, detail="Acesso negado.")
 
 
-@app.post("/master/reset-admin-password")
-def master_reset_admin_password(key: str = "", username: str = "", new_password: str = ""):
-    """One-shot: reseta senha de admin existente (uso emergencial). Protegido por MASTER_KEY."""
-    _check_master_key(key)
-    if not username or not new_password or len(new_password) < 8:
-        raise HTTPException(status_code=400, detail="username e new_password (>= 8 chars) obrigatórios.")
-    ok = db.admin_change_password(username, new_password)
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"Admin '{username}' não encontrado.")
-    logger.warning(f"[master] Senha do admin '{username}' resetada via endpoint master.")
-    return {"status": "ok", "username": username}
-
-
 @app.get("/master", response_class=HTMLResponse)
 def master_panel(request: Request, key: str = ""):
     _check_master_key(key)
