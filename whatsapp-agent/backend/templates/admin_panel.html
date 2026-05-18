@@ -505,7 +505,7 @@ const ACTION_BADGES = {
   admin_login_locked:  'bg-amber-100 text-amber-700',
   tenant_created:      'bg-violet-100 text-violet-700',
 };
-function fmtDate(iso) {
+function fmtDateTime(iso) {
   if (!iso) return '';
   const d = new Date(iso.replace(' ', 'T') + 'Z');
   return d.toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
@@ -521,7 +521,7 @@ async function loadAudit() {
     : items.map(it => {
         const cls = ACTION_BADGES[it.action] || 'bg-slate-100 text-slate-700';
         return `<tr>
-          <td class="py-2 text-xs text-gray-500">${fmtDate(it.created_at)}</td>
+          <td class="py-2 text-xs text-gray-500">${fmtDateTime(it.created_at)}</td>
           <td><span class="inline-block px-2 py-0.5 rounded text-xs ${cls}">${it.action}</span></td>
           <td class="text-xs">${it.actor || '—'}</td>
           <td class="text-xs">${it.target || '—'}</td>
