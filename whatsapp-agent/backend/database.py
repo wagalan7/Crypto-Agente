@@ -126,6 +126,9 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN phone TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN webhook_token TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN accepted_terms_at TEXT DEFAULT NULL",
+            "ALTER TABLE tenants ADD COLUMN accepted_terms_version TEXT DEFAULT ''",
+            "ALTER TABLE admin_users ADD COLUMN totp_secret TEXT DEFAULT ''",
+            "ALTER TABLE admin_users ADD COLUMN totp_enabled INTEGER DEFAULT 0",
         ]
         for sql in migrations:
             try:
@@ -324,7 +327,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "full_name", "cpf_cnpj", "phone",
         "billing_zip", "billing_address", "billing_number", "billing_complement",
         "billing_neighborhood", "billing_city", "billing_state",
-        "accepted_terms_at",
+        "accepted_terms_at", "accepted_terms_version",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -930,3 +933,32 @@ def clear_login_attempts(username: str):
             conn.execute("DELETE FROM login_attempts WHERE username = ? AND success = 0", (username,))
     except Exception:
         pass
+
+
+def admin_get_totp(username: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT totp_secret, totp_enabled FROM admin_users WHERE username = ?",
+            (username,)
+        ).fetchone()
+    if not row:
+        return None
+    return {"secret": row["totp_secret"] or "", "enabled": bool(row["totp_enabled"])}
+
+
+def admin_set_totp(username: str, secret: str, enabled: bool) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE admin_users SET totp_secret = ?, totp_enabled = ? WHERE username = ?",
+            (secret, 1 if enabled else 0, username),
+        )
+        return cur.rowcount > 0
+
+
+def admin_disable_totp(username: str) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE admin_users SET totp_secret = '', totp_enabled = 0 WHERE username = ?",
+            (username,),
+        )
+        return cur.rowcount > 0

@@ -34,6 +34,8 @@
     <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="abandoned">Carrinho Abandonado</button>
     <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="tenants">Usuários</button>
     <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="content">Conteúdo do Site</button>
+    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="audit">Auditoria</button>
+    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="security">Segurança</button>
   </nav>
 </header>
 
@@ -151,6 +153,68 @@
       <p class="text-xs text-gray-500 mb-2">Formato: lista JSON com objetos <code>{ "name", "role", "text", "stars", "highlight" }</code>. Salvar vazio para usar os padrões.</p>
       <textarea id="content-editor" rows="20" class="w-full font-mono text-xs border border-slate-300 rounded-lg p-3 focus:ring-2 focus:ring-violet-500 outline-none"></textarea>
       <div id="content-msg" class="mt-2 text-sm"></div>
+    </div>
+  </section>
+
+  <section id="tab-security" class="tab-pane hidden">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5 max-w-2xl">
+      <h3 class="font-semibold text-gray-900 mb-1">Autenticação em duas etapas (2FA)</h3>
+      <p class="text-sm text-gray-500 mb-4">Adiciona uma camada extra ao seu login usando um app autenticador (Google Authenticator, Authy, 1Password, etc).</p>
+      <div id="totp-status" class="text-sm mb-4"></div>
+
+      <div id="totp-setup" class="hidden space-y-3">
+        <p class="text-sm text-gray-700">1. Abra seu app autenticador e escaneie o QR code abaixo (ou cole a chave manualmente):</p>
+        <div id="totp-qr" class="bg-white border border-slate-200 rounded-lg p-3 inline-block"></div>
+        <p class="text-xs text-gray-600">Chave manual: <code id="totp-secret" class="font-mono bg-slate-100 px-2 py-1 rounded"></code></p>
+        <p class="text-sm text-gray-700">2. Digite o código de 6 dígitos gerado pelo app para confirmar:</p>
+        <div class="flex items-center gap-2">
+          <input id="totp-confirm-code" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+                 class="px-3 py-2 border border-slate-300 rounded-lg w-32 font-mono text-center tracking-widest">
+          <button id="btn-totp-confirm" class="px-4 py-2 rounded-lg bg-violet-600 text-white text-sm hover:bg-violet-700">Ativar 2FA</button>
+        </div>
+        <div id="totp-msg" class="text-sm"></div>
+      </div>
+
+      <div id="totp-actions" class="space-x-2">
+        <button id="btn-totp-enable" class="hidden px-4 py-2 rounded-lg bg-violet-600 text-white text-sm hover:bg-violet-700">Ativar 2FA</button>
+        <button id="btn-totp-disable" class="hidden px-4 py-2 rounded-lg bg-red-600 text-white text-sm hover:bg-red-700">Desativar 2FA</button>
+      </div>
+
+      <div id="totp-disable-prompt" class="hidden mt-3 space-y-2">
+        <p class="text-sm text-gray-700">Informe o código atual para desativar:</p>
+        <div class="flex items-center gap-2">
+          <input id="totp-disable-code" type="text" inputmode="numeric" maxlength="6" placeholder="000000"
+                 class="px-3 py-2 border border-slate-300 rounded-lg w-32 font-mono text-center tracking-widest">
+          <button id="btn-totp-disable-confirm" class="px-4 py-2 rounded-lg bg-red-600 text-white text-sm hover:bg-red-700">Confirmar</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-audit" class="tab-pane hidden">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold text-gray-900">Trilha de auditoria</h3>
+        <div class="flex items-center gap-2">
+          <select id="audit-filter" class="text-sm border border-slate-300 rounded-lg px-2 py-1">
+            <option value="">Todas as ações</option>
+            <option value="admin_login_success">Login OK</option>
+            <option value="admin_login_failed">Login falhou</option>
+            <option value="admin_login_locked">Login bloqueado</option>
+            <option value="tenant_created">Tenant criado</option>
+          </select>
+          <button id="btn-audit-refresh" class="text-sm px-3 py-1.5 rounded-lg border border-slate-300 hover:bg-slate-50">Atualizar</button>
+        </div>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">Últimos 100 eventos. Registros são imutáveis e usados para conformidade.</p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="text-left text-xs uppercase text-gray-500 border-b">
+            <tr><th class="py-2">Quando</th><th>Ação</th><th>Ator</th><th>Alvo</th><th>IP</th><th>Detalhes</th></tr>
+          </thead>
+          <tbody id="audit-tbody" class="divide-y"></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -367,7 +431,107 @@ function loadTab(tab) {
   else if (tab === 'abandoned') loadAbandoned();
   else if (tab === 'tenants') loadTenants();
   else if (tab === 'content') loadContent();
+  else if (tab === 'audit') loadAudit();
+  else if (tab === 'security') loadSecurity();
 }
+
+// ── Segurança / 2FA ─────────────────────────────────────────────────────────
+async function loadSecurity() {
+  const r = await fetch('/painel/api/2fa/status');
+  const d = await r.json();
+  const status = document.getElementById('totp-status');
+  const btnEnable  = document.getElementById('btn-totp-enable');
+  const btnDisable = document.getElementById('btn-totp-disable');
+  const setupBox   = document.getElementById('totp-setup');
+  const disablePrompt = document.getElementById('totp-disable-prompt');
+  setupBox.classList.add('hidden');
+  disablePrompt.classList.add('hidden');
+  if (d.enabled) {
+    status.innerHTML = '<span class="inline-block px-2 py-1 text-xs rounded bg-emerald-100 text-emerald-700">✓ 2FA ativo</span>';
+    btnEnable.classList.add('hidden');
+    btnDisable.classList.remove('hidden');
+  } else {
+    status.innerHTML = '<span class="inline-block px-2 py-1 text-xs rounded bg-slate-100 text-slate-700">2FA desativado</span>';
+    btnEnable.classList.remove('hidden');
+    btnDisable.classList.add('hidden');
+  }
+}
+document.getElementById('btn-totp-enable')?.addEventListener('click', async () => {
+  const r = await fetch('/painel/api/2fa/setup', { method: 'POST' });
+  const d = await r.json();
+  document.getElementById('totp-secret').textContent = d.secret;
+  // Renderiza QR via API pública (image only, sem JS lib)
+  const qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(d.otpauth_uri);
+  document.getElementById('totp-qr').innerHTML = '<img src="' + qrUrl + '" alt="QR Code 2FA" width="200" height="200">';
+  document.getElementById('totp-setup').classList.remove('hidden');
+});
+document.getElementById('btn-totp-confirm')?.addEventListener('click', async () => {
+  const code = document.getElementById('totp-confirm-code').value.trim();
+  const msg = document.getElementById('totp-msg');
+  msg.textContent = ''; msg.className = 'text-sm';
+  const r = await fetch('/painel/api/2fa/enable', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({code})
+  });
+  if (r.ok) {
+    msg.textContent = '2FA ativado com sucesso!';
+    msg.className = 'text-sm text-emerald-600';
+    setTimeout(loadSecurity, 800);
+  } else {
+    const j = await r.json().catch(()=>({}));
+    msg.textContent = j.detail || 'Falha ao ativar.';
+    msg.className = 'text-sm text-red-600';
+  }
+});
+document.getElementById('btn-totp-disable')?.addEventListener('click', () => {
+  document.getElementById('totp-disable-prompt').classList.remove('hidden');
+});
+document.getElementById('btn-totp-disable-confirm')?.addEventListener('click', async () => {
+  const code = document.getElementById('totp-disable-code').value.trim();
+  const r = await fetch('/painel/api/2fa/disable', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({code})
+  });
+  if (r.ok) loadSecurity();
+  else {
+    const j = await r.json().catch(()=>({}));
+    alert(j.detail || 'Falha ao desativar.');
+  }
+});
+
+const ACTION_BADGES = {
+  admin_login_success: 'bg-emerald-100 text-emerald-700',
+  admin_login_failed:  'bg-red-100 text-red-700',
+  admin_login_locked:  'bg-amber-100 text-amber-700',
+  tenant_created:      'bg-violet-100 text-violet-700',
+};
+function fmtDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso.replace(' ', 'T') + 'Z');
+  return d.toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+}
+async function loadAudit() {
+  const r = await fetch('/painel/api/audit?limit=200');
+  const d = await r.json();
+  const filter = document.getElementById('audit-filter').value;
+  const items = (d.items || []).filter(it => !filter || it.action === filter);
+  const tb = document.getElementById('audit-tbody');
+  tb.innerHTML = items.length === 0
+    ? '<tr><td colspan="6" class="py-6 text-center text-gray-400">Nenhum evento.</td></tr>'
+    : items.map(it => {
+        const cls = ACTION_BADGES[it.action] || 'bg-slate-100 text-slate-700';
+        return `<tr>
+          <td class="py-2 text-xs text-gray-500">${fmtDate(it.created_at)}</td>
+          <td><span class="inline-block px-2 py-0.5 rounded text-xs ${cls}">${it.action}</span></td>
+          <td class="text-xs">${it.actor || '—'}</td>
+          <td class="text-xs">${it.target || '—'}</td>
+          <td class="text-xs font-mono">${it.ip || '—'}</td>
+          <td class="text-xs text-gray-600">${(it.details || '').slice(0, 80)}</td>
+        </tr>`;
+      }).join('');
+}
+document.getElementById('btn-audit-refresh')?.addEventListener('click', loadAudit);
+document.getElementById('audit-filter')?.addEventListener('change', loadAudit);
 
 loadOverview();
 </script>
