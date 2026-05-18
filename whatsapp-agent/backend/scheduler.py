@@ -26,7 +26,8 @@ _TZ = ZoneInfo("America/Sao_Paulo")
 
 logger = logging.getLogger(__name__)
 _INTERVAL_SECONDS = 30 * 60   # checa a cada 30 minutos
-_SEND_AFTER_HOUR  = 17        # confirmações de amanhã a partir das 17h
+_SEND_AFTER_HOUR  = 8         # janela de envio de confirmações: a partir das 8h
+_SEND_BEFORE_HOUR = 21        # janela de envio: até as 21h (NÃO enviar 22h–7h59)
 _FOLLOWUP_HOUR    = 8         # followup no dia da sessão a partir das 8h
 
 
@@ -88,6 +89,12 @@ def _followup_message(tenant: dict, appt: dict) -> str:
 
 async def _run_confirmations():
     now = datetime.now(_TZ)  # sempre no horário de Brasília
+
+    # ── Trava de horário: NUNCA envia entre 22h e 7h59 ─────────────────────────
+    if not (_SEND_AFTER_HOUR <= now.hour < _SEND_BEFORE_HOUR + 1):
+        logger.info(f"[scheduler] Fora da janela de envio ({now.hour}h) — pulando")
+        return
+
     tenants = db.list_tenants()
     for tenant in tenants:
         # ── Pular consultórios suspensos ───────────────────────────────────────
@@ -263,4 +270,4 @@ def _scheduler_loop():
 def start_scheduler():
     t = threading.Thread(target=_scheduler_loop, daemon=True, name="confirmation-scheduler")
     t.start()
-    logger.info("Scheduler iniciado (intervalo: 30 min | confirmações: 17h | followup: 8h)")
+    logger.info(f"Scheduler iniciado (intervalo: 30 min | janela de envio: {_SEND_AFTER_HOUR}h-{_SEND_BEFORE_HOUR}h | followup: {_FOLLOWUP_HOUR}h)")

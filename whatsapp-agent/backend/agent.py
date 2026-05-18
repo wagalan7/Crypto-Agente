@@ -63,6 +63,47 @@ def _call_llm(system: str, messages: list[dict], max_tokens: int = 512) -> str:
     raise RuntimeError("Nenhuma chave de API configurada (GROQ_API_KEY ou ANTHROPIC_API_KEY)")
 
 
+async def classify_image(image_url: str) -> str:
+    """Classifica uma imagem como 'receipt' (comprovante PIX/transferência/boleto)
+    ou 'other'. Usa Claude vision. Retorna 'unknown' em caso de erro/sem URL."""
+    if not image_url or not config.ANTHROPIC_API_KEY:
+        return "unknown"
+    try:
+        import base64, httpx
+        # Baixa a imagem (alguns provedores exigem auth — Z-API em geral entrega URL aberta)
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as c:
+            r = await c.get(image_url)
+            r.raise_for_status()
+            content_type = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            if content_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+                content_type = "image/jpeg"
+            data = base64.standard_b64encode(r.content).decode("ascii")
+
+        client = _get_anthropic_client()
+        resp = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=20,
+            system=("Você classifica imagens recebidas no WhatsApp de um consultório. "
+                    "Responda APENAS com uma palavra: 'receipt' se a imagem for um comprovante "
+                    "de pagamento (PIX, transferência bancária, boleto pago, recibo, screenshot "
+                    "de app de banco mostrando transação concluída). Responda 'other' para "
+                    "qualquer outra coisa (foto pessoal, screenshot de rede social, documento "
+                    "não-financeiro, foto de cenário, print de conversa, etc)."),
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": content_type, "data": data}},
+                    {"type": "text", "text": "Esta imagem é um comprovante de pagamento? Responda 'receipt' ou 'other'."},
+                ],
+            }],
+        )
+        out = (resp.content[0].text or "").strip().lower()
+        return "receipt" if "receipt" in out else "other"
+    except Exception as e:
+        logger.warning(f"[classify_image] Falha: {e}")
+        return "unknown"
+
+
 def _build_system_prompt(tenant: dict) -> str:
     if tenant.get('pix_key'):
         pix_section = (

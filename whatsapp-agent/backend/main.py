@@ -76,14 +76,42 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         logger.info(f"[{tenant['slug']}][{phone}] Agente pausado — mensagem ignorada")
         return
 
-    # ── Imagem / documento → responder direto, sem passar pelo agente ───────────
-    if text == "__IMAGEM__":
-        logger.info(f"[{tenant['slug']}][{phone}] Imagem/doc recebido — respondendo como comprovante")
-        await wa.send_message(tenant, phone,
-            "Obrigada pelo pagamento! 😊 Recebi o comprovante. Em breve enviarei a nota fiscal. Até a sessão!")
-        db.save_message(tenant["id"], phone, "user", "[comprovante de pagamento enviado]")
-        db.save_message(tenant["id"], phone, "assistant",
-            "Obrigada pelo pagamento! 😊 Recebi o comprovante. Em breve enviarei a nota fiscal. Até a sessão!")
+    # ── Documento (PDF/Word) → quase sempre é comprovante; resposta padrão ──────
+    if text == "__DOCUMENTO__":
+        logger.info(f"[{tenant['slug']}][{phone}] Documento recebido — tratando como comprovante")
+        reply = "Obrigada pelo pagamento! 😊 Recebi o comprovante. Em breve enviarei a nota fiscal. Até a sessão!"
+        await wa.send_message(tenant, phone, reply)
+        db.save_message(tenant["id"], phone, "user", "[documento enviado]")
+        db.save_message(tenant["id"], phone, "assistant", reply)
+        return
+
+    # ── Imagem → analisar por visão antes de assumir comprovante ────────────────
+    if text == "__IMAGEM__" or text.startswith("__IMAGEM__:"):
+        img_url = text.split(":", 1)[1] if text.startswith("__IMAGEM__:") else ""
+        logger.info(f"[{tenant['slug']}][{phone}] Imagem recebida — analisando...")
+        kind = await agent.classify_image(img_url) if img_url else "unknown"
+        logger.info(f"[{tenant['slug']}][{phone}] Imagem classificada como: {kind}")
+
+        if kind == "receipt":
+            reply = "Obrigada pelo pagamento! 😊 Recebi o comprovante. Em breve enviarei a nota fiscal. Até a sessão!"
+            db.save_message(tenant["id"], phone, "user", "[comprovante de pagamento enviado]")
+        else:
+            reply = ("Recebi sua imagem! 😊 No momento eu (assistente) não consigo analisar "
+                     "imagens em detalhe — vou repassar para a psicóloga, que responde "
+                     "assim que puder. Se for sobre agenda ou pagamento, pode me contar por texto que te ajudo. 🙏")
+            db.save_message(tenant["id"], phone, "user", "[imagem enviada — não-comprovante]")
+            # Avisar psicóloga
+            psy_phone = tenant.get("psychologist_phone", "")
+            if psy_phone:
+                try:
+                    await wa.send_message(tenant, psy_phone,
+                        f"📷 *Paciente enviou uma imagem que não parece comprovante.*\n"
+                        f"Número: {phone}\n"
+                        f"Vale dar uma olhada quando puder.")
+                except Exception as e:
+                    logger.warning(f"[{tenant['slug']}] Falha ao notificar psicóloga sobre imagem: {e}")
+        await wa.send_message(tenant, phone, reply)
+        db.save_message(tenant["id"], phone, "assistant", reply)
         return
 
     # ── Urgência / crise → notificar psicóloga imediatamente ────────────────────

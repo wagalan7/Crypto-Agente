@@ -162,15 +162,22 @@ def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
         # Texto direto
         text = (payload.get("text") or {}).get("message", "")
 
-        # Imagem → usa caption se tiver, senão trata como comprovante
+        # Imagem → captura URL para análise por visão computacional
         if not text:
             image = payload.get("image") or {}
             if image:
                 caption = image.get("caption", "").strip()
-                text = caption if caption else "__IMAGEM__"
+                if caption:
+                    text = caption
+                else:
+                    img_url = (
+                        image.get("imageUrl") or image.get("url")
+                        or image.get("link") or image.get("mediaUrl") or ""
+                    )
+                    text = f"__IMAGEM__:{img_url}" if img_url else "__IMAGEM__"
                 logger.info(f"[ZAPI] Imagem recebida de {phone} — caption={caption!r}")
 
-        # Documento / PDF → tenta vários campos que o Z-API pode usar
+        # Documento / PDF → tratado como provável comprovante (extensão indica intenção)
         if not text:
             doc = (
                 payload.get("document")
@@ -180,10 +187,10 @@ def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
             )
             if doc:
                 caption = (doc.get("caption") or doc.get("fileName") or "").strip()
-                text = caption if caption else "__IMAGEM__"
+                text = caption if caption else "__DOCUMENTO__"
                 logger.info(f"[ZAPI] Documento recebido de {phone} — caption={caption!r}")
 
-        # Qualquer outro tipo de mídia não reconhecida → trata como comprovante
+        # Qualquer outro tipo de mídia não reconhecida
         if not text and _t in _MEDIA_TYPES:
             text = "__IMAGEM__"
             logger.info(f"[ZAPI] Mídia genérica de {phone} — type={payload.get('type')} keys={list(payload.keys())}")
