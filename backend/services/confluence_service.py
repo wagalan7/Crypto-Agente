@@ -22,6 +22,7 @@ from services.smc_service import SMCAnalysis
 from services.derivatives_service import DerivativesData
 from services.backtest_service import PatternStats
 from services.divergence_service import Divergence
+from services.vp_service import VPVWAPAnalysis
 
 
 # ─── Pesos por categoria ──────────────────────────────────────────────────────
@@ -37,8 +38,9 @@ WEIGHTS = {
     "smc":          25,   # Order Blocks, FVG, Liquidity Sweeps, BOS/CHoCH
     "derivatives":  15,   # Funding rate + OI
     "divergence":   20,   # Divergências RSI/MACD
+    "vp_vwap":      20,   # Volume Profile (POC/VAH/VAL) + VWAP
 }
-MAX_TOTAL = sum(WEIGHTS.values())   # = 250
+MAX_TOTAL = sum(WEIGHTS.values())   # = 270
 
 
 def _sign_for_direction(direction: SignalDirection, val: int) -> int:
@@ -60,6 +62,7 @@ def calculate_confluence(
     derivatives: Optional[DerivativesData] = None,
     pattern_stats: Optional[PatternStats] = None,
     divergences: Optional[List[Divergence]] = None,
+    vp_vwap: Optional[VPVWAPAnalysis] = None,
 ) -> ConfluenceScore:
     factors: List[ConfluenceFactor] = []
     warnings: List[str] = []
@@ -537,6 +540,125 @@ def calculate_confluence(
                 description=d.description,
             ))
             warnings.append(f"Divergência {d.type} {d.indicator} oposta ao sinal — risco de reversão.")
+
+    # ── 13. Volume Profile + VWAP ────────────────────────────────────────────
+    if vp_vwap is not None and direction != SignalDirection.NEUTRAL:
+        vp = vp_vwap.volume_profile
+        vw = vp_vwap.vwap
+
+        # ── POC como ímã ────────────────────────────────────────────────
+        poc_dist_pct = abs(current_price - vp.poc) / vp.poc * 100 if vp.poc else 0
+        if poc_dist_pct < 0.3:
+            factors.append(ConfluenceFactor(
+                name="Preço no POC",
+                category="vp_vwap",
+                points=4, max_points=8, aligned=True,
+                description=f"Preço colado no POC ({vp.poc:.6g}) — zona de equilíbrio, alta liquidez.",
+            ))
+
+        # ── Value Area: dentro = equilíbrio, fora = extensão ────────────
+        if vp.val <= current_price <= vp.vah:
+            # Compras perto do VAL ou vendas perto do VAH = setups premium
+            if direction == SignalDirection.LONG and current_price <= vp.val * 1.005:
+                factors.append(ConfluenceFactor(
+                    name="Compra no VAL",
+                    category="vp_vwap",
+                    points=10, max_points=10, aligned=True,
+                    description=f"Preço no Value Area Low ({vp.val:.6g}) — base de demanda, alvo POC ({vp.poc:.6g}).",
+                ))
+            elif direction == SignalDirection.SHORT and current_price >= vp.vah * 0.995:
+                factors.append(ConfluenceFactor(
+                    name="Venda no VAH",
+                    category="vp_vwap",
+                    points=10, max_points=10, aligned=True,
+                    description=f"Preço no Value Area High ({vp.vah:.6g}) — topo de oferta, alvo POC ({vp.poc:.6g}).",
+                ))
+        else:
+            # Fora do VA: extensão — bom para reversão (mean reversion ao POC)
+            if direction == SignalDirection.LONG and current_price < vp.val:
+                factors.append(ConfluenceFactor(
+                    name="Compra abaixo do Value Area",
+                    category="vp_vwap",
+                    points=7, max_points=10, aligned=True,
+                    description=f"Preço extendido abaixo do VAL ({vp.val:.6g}) — reversão estatística para POC.",
+                ))
+            elif direction == SignalDirection.SHORT and current_price > vp.vah:
+                factors.append(ConfluenceFactor(
+                    name="Venda acima do Value Area",
+                    category="vp_vwap",
+                    points=7, max_points=10, aligned=True,
+                    description=f"Preço extendido acima do VAH ({vp.vah:.6g}) — reversão estatística para POC.",
+                ))
+            elif direction == SignalDirection.LONG and current_price > vp.vah:
+                # Compra esticada
+                factors.append(ConfluenceFactor(
+                    name="Compra esticada (fora do VA)",
+                    category="vp_vwap",
+                    points=-4, max_points=10, aligned=False,
+                    description=f"Preço já está acima do VAH ({vp.vah:.6g}) — entrada tardia, risco de pullback.",
+                ))
+                warnings.append("Entrada de compra fora do Value Area — risco de mean reversion ao POC.")
+            elif direction == SignalDirection.SHORT and current_price < vp.val:
+                factors.append(ConfluenceFactor(
+                    name="Venda esticada (fora do VA)",
+                    category="vp_vwap",
+                    points=-4, max_points=10, aligned=False,
+                    description=f"Preço já está abaixo do VAL ({vp.val:.6g}) — entrada tardia.",
+                ))
+                warnings.append("Entrada de venda fora do Value Area — risco de mean reversion ao POC.")
+
+        # ── VWAP como suporte/resistência dinâmico ─────────────────────
+        if abs(vw.distance_pct) < 0.5:
+            factors.append(ConfluenceFactor(
+                name="Preço no VWAP",
+                category="vp_vwap",
+                points=4, max_points=6, aligned=True,
+                description=f"Preço colado no VWAP ({vw.vwap:.6g}) — referência institucional, S/R dinâmico.",
+            ))
+        elif direction == SignalDirection.LONG and current_price > vw.vwap:
+            factors.append(ConfluenceFactor(
+                name="Preço acima do VWAP",
+                category="vp_vwap",
+                points=6, max_points=6, aligned=True,
+                description=f"Preço {vw.distance_pct:+.1f}% acima do VWAP — bias institucional comprador.",
+            ))
+        elif direction == SignalDirection.SHORT and current_price < vw.vwap:
+            factors.append(ConfluenceFactor(
+                name="Preço abaixo do VWAP",
+                category="vp_vwap",
+                points=6, max_points=6, aligned=True,
+                description=f"Preço {vw.distance_pct:+.1f}% abaixo do VWAP — bias institucional vendedor.",
+            ))
+        elif direction == SignalDirection.LONG and current_price < vw.vwap:
+            factors.append(ConfluenceFactor(
+                name="Compra abaixo do VWAP",
+                category="vp_vwap",
+                points=-3, max_points=6, aligned=False,
+                description="Compra contra o bias institucional (preço abaixo do VWAP).",
+            ))
+        elif direction == SignalDirection.SHORT and current_price > vw.vwap:
+            factors.append(ConfluenceFactor(
+                name="Venda acima do VWAP",
+                category="vp_vwap",
+                points=-3, max_points=6, aligned=False,
+                description="Venda contra o bias institucional (preço acima do VWAP).",
+            ))
+
+        # ── Extremos VWAP ±2σ = reversão estatística ───────────────────
+        if direction == SignalDirection.LONG and current_price <= vw.lower_2sd:
+            factors.append(ConfluenceFactor(
+                name="VWAP -2σ tocado",
+                category="vp_vwap",
+                points=6, max_points=6, aligned=True,
+                description=f"Preço no extremo inferior do VWAP (banda -2σ {vw.lower_2sd:.6g}) — reversão provável.",
+            ))
+        elif direction == SignalDirection.SHORT and current_price >= vw.upper_2sd:
+            factors.append(ConfluenceFactor(
+                name="VWAP +2σ tocado",
+                category="vp_vwap",
+                points=6, max_points=6, aligned=True,
+                description=f"Preço no extremo superior do VWAP (banda +2σ {vw.upper_2sd:.6g}) — reversão provável.",
+            ))
 
     # ── Total ────────────────────────────────────────────────────────────────
     total = sum(f.points for f in factors)

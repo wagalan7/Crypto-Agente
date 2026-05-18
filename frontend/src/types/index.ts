@@ -143,8 +143,31 @@ export interface TradeSignal {
   derivatives?: DerivativesData | null
   pattern_stats?: PatternStats | null
   divergences?: Divergence[] | null
+  vp_vwap?: VPVWAPAnalysis | null
   timestamp: number
   signal_strength: string
+}
+
+export interface VolumeProfile {
+  poc: number
+  vah: number
+  val: number
+  bins: number[][]
+}
+
+export interface VWAPData {
+  vwap: number
+  upper_1sd: number
+  lower_1sd: number
+  upper_2sd: number
+  lower_2sd: number
+  distance_pct: number
+}
+
+export interface VPVWAPAnalysis {
+  volume_profile: VolumeProfile
+  vwap: VWAPData
+  description: string
 }
 
 export interface Divergence {

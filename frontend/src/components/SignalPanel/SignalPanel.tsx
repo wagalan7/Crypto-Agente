@@ -1,5 +1,5 @@
 import type { TradeSignal, SignalDirection, TradeType } from '../../types'
-import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle, Crosshair, BarChart3, History, GitCompare } from 'lucide-react'
+import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle, Crosshair, BarChart3, History, GitCompare, BarChartHorizontal } from 'lucide-react'
 
 interface Props {
   signal: TradeSignal
@@ -459,6 +459,42 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
               ))}
             </ul>
           )}
+        </div>
+      )}
+
+      {/* Volume Profile + VWAP */}
+      {signal.vp_vwap && (
+        <div className="bg-slate-800/60 rounded-lg p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1">
+              <BarChartHorizontal className="w-4 h-4 text-sky-400" />
+              <span className="text-xs font-semibold text-sky-400">VOLUME PROFILE + VWAP</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 mb-2">
+            <span className="text-xs text-slate-500">POC</span>
+            <span className="text-xs font-mono text-amber-300">{fmt(signal.vp_vwap.volume_profile.poc)}</span>
+
+            <span className="text-xs text-slate-500">VAH</span>
+            <span className="text-xs font-mono text-red-300">{fmt(signal.vp_vwap.volume_profile.vah)}</span>
+
+            <span className="text-xs text-slate-500">VAL</span>
+            <span className="text-xs font-mono text-green-300">{fmt(signal.vp_vwap.volume_profile.val)}</span>
+
+            <span className="text-xs text-slate-500">VWAP</span>
+            <span className={`text-xs font-mono ${
+              Math.abs(signal.vp_vwap.vwap.distance_pct) < 0.5 ? 'text-yellow-300' :
+              signal.vp_vwap.vwap.distance_pct > 0 ? 'text-green-300' : 'text-red-300'
+            }`}>
+              {fmt(signal.vp_vwap.vwap.vwap)} ({signal.vp_vwap.vwap.distance_pct >= 0 ? '+' : ''}{signal.vp_vwap.vwap.distance_pct.toFixed(2)}%)
+            </span>
+
+            <span className="text-xs text-slate-500">VWAP ±2σ</span>
+            <span className="text-xs font-mono text-slate-400">
+              {fmt(signal.vp_vwap.vwap.lower_2sd)} – {fmt(signal.vp_vwap.vwap.upper_2sd)}
+            </span>
+          </div>
+          <p className="text-xs text-slate-300 leading-relaxed">{signal.vp_vwap.description}</p>
         </div>
       )}
 

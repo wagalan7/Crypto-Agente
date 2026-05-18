@@ -114,5 +114,6 @@ class TradeSignal(BaseModel):
     derivatives: Optional[dict] = None        # DerivativesData serializado
     pattern_stats: Optional[dict] = None      # {pattern_type: PatternStat}
     divergences: Optional[list] = None        # List[Divergence] serializado
+    vp_vwap: Optional[dict] = None            # VPVWAPAnalysis serializado
     timestamp: int
     signal_strength: str

@@ -11,6 +11,7 @@ from services.smc_service import analyze_smc, SMCAnalysis
 from services.derivatives_service import DerivativesData
 from services.backtest_service import compute_pattern_stats, PatternStats
 from services.divergence_service import detect_divergences
+from services.vp_service import analyze_vp_vwap
 
 
 TIMEFRAME_TRADE_TYPE = {
@@ -199,6 +200,12 @@ def build_trade_signal(
     except Exception:
         divergences = []
 
+    # Volume Profile + VWAP
+    try:
+        vp_vwap = analyze_vp_vwap(df)
+    except Exception:
+        vp_vwap = None
+
     # Backtest histórico (cacheado)
     pattern_stats: Optional[PatternStats] = None
     if with_backtest and patterns:
@@ -212,14 +219,14 @@ def build_trade_signal(
         confluence = calculate_confluence(
             ind, patterns, df, direction, current_price,
             smc=smc, derivatives=derivatives, pattern_stats=pattern_stats,
-            divergences=divergences,
+            divergences=divergences, vp_vwap=vp_vwap,
         )
         confidence = round(confluence.pct / 100, 2)
     else:
         confluence = calculate_confluence(
             ind, patterns, df, SignalDirection.NEUTRAL, current_price,
             smc=smc, derivatives=derivatives, pattern_stats=pattern_stats,
-            divergences=divergences,
+            divergences=divergences, vp_vwap=vp_vwap,
         )
         confidence = calculate_confidence(ind, patterns, direction, current_price)
 
@@ -246,6 +253,7 @@ def build_trade_signal(
         derivatives=derivatives.model_dump() if derivatives else None,
         pattern_stats=pattern_stats.model_dump() if pattern_stats else None,
         divergences=[d.model_dump() for d in divergences] if divergences else None,
+        vp_vwap=vp_vwap.model_dump() if vp_vwap else None,
         timestamp=int(df["timestamp"].iloc[-1]),
         signal_strength=signal_strength_label(confidence),
     )
