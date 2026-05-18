@@ -167,6 +167,28 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_landing_views_date ON landing_views(viewed_at);
             CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at);
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT DEFAULT (datetime('now')),
+                actor TEXT DEFAULT '',
+                action TEXT NOT NULL,
+                target TEXT DEFAULT '',
+                ip TEXT DEFAULT '',
+                details TEXT DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor);
+
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                ip TEXT DEFAULT '',
+                success INTEGER NOT NULL DEFAULT 0,
+                attempted_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_login_attempts_user ON login_attempts(username, attempted_at);
+            CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, attempted_at);
         """)
 
         # Seed do usuário admin padrão (alanmalta) se ainda não existir
@@ -844,3 +866,67 @@ def admin_get_tenant_full(slug: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM tenants WHERE slug = ?", (slug,)).fetchone()
     return dict(row) if row else None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Audit log + login attempts (P1 security)
+# ════════════════════════════════════════════════════════════════════════════
+
+def audit_log(action: str, actor: str = "", target: str = "", ip: str = "", details: str = ""):
+    """Registra ação sensível para auditoria. Falha silenciosamente — nunca quebra a request."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO audit_log (actor, action, target, ip, details) VALUES (?, ?, ?, ?, ?)",
+                (actor[:64], action[:64], target[:128], ip[:64], details[:512]),
+            )
+    except Exception:
+        pass
+
+
+def audit_list(limit: int = 100) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_login_attempt(username: str, ip: str, success: bool):
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO login_attempts (username, ip, success) VALUES (?, ?, ?)",
+                (username[:64], ip[:64], 1 if success else 0),
+            )
+    except Exception:
+        pass
+
+
+def count_recent_failed_logins(username: str, ip: str, minutes: int = 15) -> int:
+    """Conta falhas recentes para (username) OU (ip)."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM login_attempts
+                   WHERE success = 0
+                     AND attempted_at >= datetime('now', ?)
+                     AND (username = ? OR ip = ?)""",
+                (f"-{minutes} minutes", username, ip),
+            ).fetchone()
+            return int(row["n"]) if row else 0
+    except Exception:
+        return 0
+
+
+def is_account_locked(username: str, ip: str, threshold: int = 8, minutes: int = 15) -> bool:
+    return count_recent_failed_logins(username, ip, minutes) >= threshold
+
+
+def clear_login_attempts(username: str):
+    """Limpa tentativas após login bem-sucedido."""
+    try:
+        with get_conn() as conn:
+            conn.execute("DELETE FROM login_attempts WHERE username = ? AND success = 0", (username,))
+    except Exception:
+        pass

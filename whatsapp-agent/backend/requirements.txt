@@ -12,3 +12,5 @@ google-api-python-client==2.127.0
 stripe==10.5.0
 python-multipart==0.0.9
 groq==0.11.0
+slowapi==0.1.9
+sentry-sdk[fastapi]==2.18.0
