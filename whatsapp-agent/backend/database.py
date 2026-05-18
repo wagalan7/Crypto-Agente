@@ -397,6 +397,33 @@ def update_appointment(tenant_id: int, appointment_id: int, scheduled_at: dateti
         return cur.rowcount > 0
 
 
+def rename_patient(tenant_id: int, appointment_id: int, new_name: str, apply_all: bool = False) -> int:
+    """Renomeia o paciente em uma consulta (ou em todas as consultas com o mesmo telefone, se apply_all=True).
+    Retorna o número de linhas atualizadas."""
+    new_name = (new_name or "").strip()
+    if not new_name:
+        return 0
+    with get_conn() as conn:
+        if apply_all:
+            # Pega o telefone da consulta-alvo e atualiza todas as consultas do mesmo telefone
+            row = conn.execute(
+                "SELECT phone FROM appointments WHERE id = ? AND tenant_id = ?",
+                (appointment_id, tenant_id),
+            ).fetchone()
+            if not row:
+                return 0
+            cur = conn.execute(
+                "UPDATE appointments SET patient_name = ? WHERE tenant_id = ? AND phone = ?",
+                (new_name, tenant_id, row["phone"]),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE appointments SET patient_name = ? WHERE id = ? AND tenant_id = ?",
+                (new_name, appointment_id, tenant_id),
+            )
+        return cur.rowcount
+
+
 def confirm_appointment(tenant_id: int, appointment_id: int) -> bool:
     with get_conn() as conn:
         cur = conn.execute(

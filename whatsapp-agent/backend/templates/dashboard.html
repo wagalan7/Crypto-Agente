@@ -577,6 +577,41 @@
   </div>
 </div>
 
+<!-- Modal: Editar nome do paciente -->
+<div id="modal-rename" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4">
+  <div class="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
+    <div class="flex items-center justify-between mb-5">
+      <h3 class="text-base font-semibold text-gray-800">✏️ Editar nome do paciente</h3>
+      <button onclick="closeRename()" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+    </div>
+    <input type="hidden" id="rn-appt-id"/>
+    <div class="space-y-4">
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Nome atual</label>
+        <input id="rn-old" type="text" readonly
+          class="w-full bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5 text-sm text-gray-500"/>
+      </div>
+      <div>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Novo nome <span class="text-red-500">*</span></label>
+        <input id="rn-new" type="text" placeholder="Ex: Maria Silva"
+          class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+      </div>
+      <label class="flex items-start gap-2 cursor-pointer">
+        <input type="checkbox" id="rn-applyall" checked class="accent-brand w-4 h-4 mt-0.5"/>
+        <span class="text-sm text-gray-700 leading-snug">
+          Aplicar a <strong>todas as consultas deste telefone</strong>
+          <span class="block text-xs text-gray-500 mt-0.5">Recomendado se o nome foi cadastrado errado e existem outras consultas do mesmo paciente.</span>
+        </span>
+      </label>
+      <div id="rn-error" class="hidden text-sm text-red-600 bg-red-50 rounded-xl px-4 py-2.5"></div>
+      <button onclick="submitRename()" id="rn-btn"
+        class="w-full bg-brand text-white py-3 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        Salvar
+      </button>
+    </div>
+  </div>
+</div>
+
 <!-- Mobile bottom nav -->
 <nav class="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 z-40">
   <div class="grid grid-cols-4">
@@ -714,6 +749,7 @@ function loadAgenda() {
             </div>
             <div class="flex gap-2 flex-shrink-0 flex-wrap justify-end">
               ${!a.confirmed ? `<button onclick="confirmAppt(${a.id})" class="text-xs bg-green-100 text-green-700 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">Confirmar</button>` : ''}
+              <button onclick='openRename(${a.id}, ${JSON.stringify(a.patient_name)})' class="text-xs bg-purple-100 text-purple-700 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">✏️ Editar nome</button>
               <button onclick="openReschedule(${a.id}, '${a.scheduled_at}')" class="text-xs bg-blue-100 text-blue-700 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">🔄 Reagendar</button>
               <button onclick="cancelAppt(${a.id})" class="text-xs bg-red-100 text-red-600 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">Cancelar</button>
             </div>
@@ -1044,6 +1080,55 @@ function caldavClear() {
     setTimeout(() => location.reload(), 1200);
   }).catch(() => showToast("Erro ao remover", "error"));
 }
+
+// ── Editar nome do paciente ───────────────────────────────────────────────────
+function openRename(id, currentName) {
+  document.getElementById("rn-appt-id").value = id;
+  document.getElementById("rn-old").value = currentName || "";
+  document.getElementById("rn-new").value = currentName || "";
+  document.getElementById("rn-applyall").checked = true;
+  document.getElementById("rn-error").classList.add("hidden");
+  document.getElementById("modal-rename").classList.remove("hidden");
+  setTimeout(() => { document.getElementById("rn-new").focus(); document.getElementById("rn-new").select(); }, 50);
+}
+function closeRename() {
+  document.getElementById("modal-rename").classList.add("hidden");
+}
+async function submitRename() {
+  const id    = document.getElementById("rn-appt-id").value;
+  const name  = document.getElementById("rn-new").value.trim();
+  const all   = document.getElementById("rn-applyall").checked;
+  const errEl = document.getElementById("rn-error");
+  const btn   = document.getElementById("rn-btn");
+  errEl.classList.add("hidden");
+  if (!name) {
+    errEl.textContent = "Informe o novo nome.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+  btn.textContent = "Salvando...";
+  btn.disabled = true;
+  try {
+    const r = await api(`/dashboard/api/appointments/${id}/rename`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({patient_name: name, apply_all: all}),
+    });
+    closeRename();
+    loadAgenda();
+    if (typeof loadConversas === "function") loadConversas();
+    showToast(`✓ Nome atualizado em ${r.updated} consulta(s)`, "success");
+  } catch(e) {
+    errEl.textContent = e.message || "Erro ao salvar.";
+    errEl.classList.remove("hidden");
+  } finally {
+    btn.textContent = "Salvar";
+    btn.disabled = false;
+  }
+}
+document.getElementById("modal-rename").addEventListener("click", function(e) {
+  if (e.target.id === "modal-rename") closeRename();
+});
 
 // ── Reagendar ─────────────────────────────────────────────────────────────────
 function openReschedule(id, scheduledAt) {
