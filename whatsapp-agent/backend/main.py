@@ -512,6 +512,25 @@ def dash_confirm(appt_id: int, request: Request):
     return {"status": "confirmed"}
 
 
+class RenameBody(BaseModel):
+    patient_name: str
+    apply_all: bool = False    # se True, atualiza todas as consultas do mesmo telefone
+
+
+@app.patch("/dashboard/api/appointments/{appt_id}/rename")
+def dash_rename(appt_id: int, body: RenameBody, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    new_name = (body.patient_name or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Nome não pode ser vazio.")
+    n = db.rename_patient(tenant["id"], appt_id, new_name, apply_all=body.apply_all)
+    if n == 0:
+        raise HTTPException(status_code=404, detail="Consulta não encontrada.")
+    logger.info(f"[{tenant['slug']}] Paciente renomeado em {n} consulta(s) → {new_name}")
+    return {"status": "renamed", "updated": n, "patient_name": new_name}
+
+
 class RescheduleBody(BaseModel):
     scheduled_at: str  # ISO datetime, ex: "2026-05-13T14:00:00"
     notify_patient: bool = True
