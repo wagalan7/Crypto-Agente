@@ -3,21 +3,30 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Consultório Inteligente — Agente IA no WhatsApp para Psicólogas</title>
+  <title>Agente Consultório — IA no WhatsApp para Psicólogas</title>
   <meta name="description" content="Agente de IA que agenda, confirma e remarca consultas automaticamente pelo WhatsApp do seu consultório. Reduza faltas e foque nos seus pacientes."/>
+  <meta property="og:title" content="Agente Consultório — IA no WhatsApp para Psicólogas"/>
+  <meta property="og:description" content="Agenda, confirma e remarca consultas automaticamente pelo WhatsApp."/>
+  <meta property="og:image" content="/static/hero-agente.jpg"/>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%237c3aed'><path d='M12 2a4 4 0 0 0-4 4 3 3 0 0 0-3 3v1a3 3 0 0 0 0 6 3 3 0 0 0 3 3v1a3 3 0 0 0 4 3 3 3 0 0 0 4-3v-1a3 3 0 0 0 3-3 3 3 0 0 0 0-6V9a3 3 0 0 0-3-3 4 4 0 0 0-4-4z'/></svg>"/>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C', dark: '#12060d' } } } }</script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: '#7c3aed', brandDark: '#5b21b6', brandLight: '#a78bfa', dark: '#1a0b2e' } } } }</script>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/>
   <style>
     * { font-family: 'Inter', sans-serif; }
-    .hero-bg { background: linear-gradient(135deg, #12060d 0%, #2a0a1c 40%, #12060d 100%); }
-    .cta-bg  { background: linear-gradient(135deg, #12060d 0%, #2a0a1c 100%); }
-    .btn-brand { background: linear-gradient(135deg, #E91E8C, #c2185b); }
-    .glow { box-shadow: 0 0 50px rgba(233,30,140,0.2); }
-    .glow-sm { box-shadow: 0 0 20px rgba(233,30,140,0.15); }
-    .chat-in  { border-radius: 4px 18px 18px 18px; }
-    .chat-out { border-radius: 18px 4px 18px 18px; background: linear-gradient(135deg,#E91E8C,#c2185b); }
+    .hero-bg { background: linear-gradient(135deg, #1a0b2e 0%, #2d1657 50%, #1a0b2e 100%); }
+    .cta-bg  { background: linear-gradient(135deg, #1a0b2e 0%, #3b1781 100%); }
+    .btn-brand { background: linear-gradient(135deg, #7c3aed, #a855f7); }
+    .glow { box-shadow: 0 0 50px rgba(124,58,237,0.25); }
+    .glow-sm { box-shadow: 0 0 20px rgba(124,58,237,0.18); }
+    /* Estilo dos balões inspirado na arte oficial */
+    .chat-in  { border-radius: 4px 18px 18px 18px; background: #ffffff; color:#374151; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+    .chat-out { border-radius: 18px 4px 18px 18px; background: #ede9fe; color:#4c1d95; }
+    .chat-time { font-size: 10px; color:#9ca3af; margin-top:4px; display:block; }
+    .chat-slot { display:flex; align-items:center; gap:10px; background:#fff; border:1px solid #e9d5ff; border-radius:12px; padding:10px 14px; font-size:13px; color:#4c1d95; transition: all .15s; }
+    .chat-slot:hover { background:#faf5ff; border-color:#c4b5fd; }
+    .chat-slot svg { color:#7c3aed; }
     @keyframes float  { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
     @keyframes fadein { from{opacity:0;transform:translateY(24px)} to{opacity:1;transform:translateY(0)} }
     @keyframes pulse-ring { 0%{transform:scale(1);opacity:1} 100%{transform:scale(1.6);opacity:0} }
@@ -27,19 +36,16 @@
     .fadein-3 { animation: fadein .7s .4s ease both; }
     .pulse-ring::before {
       content:''; position:absolute; inset:-6px; border-radius:50%;
-      border:2px solid #E91E8C;
+      border:2px solid #a855f7;
       animation: pulse-ring 1.8s ease-out infinite;
     }
-    .plan-popular { border-color:#E91E8C; transform:scale(1.03); }
+    .plan-popular { border-color:#7c3aed; transform:scale(1.03); }
     @media(max-width:768px){ .plan-popular{transform:scale(1); } }
-    .toggle-annual .price-mensal { display:none; }
-    .toggle-annual .price-annual { display:flex; }
-    .price-annual { display:none; }
     details summary { cursor:pointer; list-style:none; }
     details summary::-webkit-details-marker { display:none; }
     details[open] .faq-icon { transform:rotate(45deg); }
     .faq-icon { transition: transform .2s; }
-    .tag-pill { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:100px; padding:6px 14px; font-size:13px; color:#e2e8f0; }
+    .tag-pill { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:100px; padding:6px 14px; font-size:13px; color:#e9d5ff; }
     .before-card { border-left: 3px solid #f87171; }
     .after-card  { border-left: 3px solid #34d399; }
     .whatsapp-float {
@@ -50,6 +56,12 @@
       transition: transform .2s;
     }
     .whatsapp-float:hover { transform:scale(1.1); }
+    .hero-img-wrap { position:relative; }
+    .hero-img-wrap::after {
+      content:''; position:absolute; inset:-20px; z-index:-1;
+      background: radial-gradient(circle at center, rgba(168,85,247,0.35) 0%, rgba(168,85,247,0) 70%);
+      filter: blur(20px);
+    }
   </style>
 </head>
 <body class="bg-white text-gray-900 overflow-x-hidden">
@@ -65,8 +77,18 @@
 <nav class="sticky top-0 z-50 bg-white/95 backdrop-blur border-b border-gray-100">
   <div class="max-w-6xl mx-auto px-5 py-3.5 flex items-center justify-between">
     <div class="flex items-center gap-2.5">
-      <div class="w-8 h-8 btn-brand rounded-lg flex items-center justify-center text-white text-sm font-bold shadow">CI</div>
-      <span class="font-bold text-gray-900 text-sm md:text-base">Consultório Inteligente</span>
+      <div class="w-9 h-9 btn-brand rounded-xl flex items-center justify-center text-white shadow">
+        <!-- Brain icon (Lucide) -->
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
+          <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
+          <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
+        </svg>
+      </div>
+      <div class="leading-tight">
+        <span class="block font-extrabold text-gray-900 text-sm md:text-base tracking-tight">AGENTE</span>
+        <span class="block font-bold text-brand text-[11px] md:text-xs -mt-1 tracking-[0.18em]">CONSULTÓRIO</span>
+      </div>
     </div>
     <div class="flex items-center gap-3">
       <a href="#precos" class="hidden md:block text-sm text-gray-500 hover:text-gray-800 font-medium transition">Preços</a>
@@ -78,8 +100,12 @@
 </nav>
 
 <!-- ── HERO ── -->
-<section class="hero-bg text-white px-5 py-20 md:py-32">
-  <div class="max-w-6xl mx-auto grid md:grid-cols-2 gap-14 items-center">
+<section class="hero-bg text-white px-5 py-20 md:py-28 relative overflow-hidden">
+  <!-- Decoração: bolhas violeta no fundo -->
+  <div class="absolute top-20 -left-20 w-72 h-72 rounded-full" style="background:radial-gradient(circle,rgba(168,85,247,0.25),transparent 70%);filter:blur(40px)"></div>
+  <div class="absolute bottom-10 -right-10 w-96 h-96 rounded-full" style="background:radial-gradient(circle,rgba(124,58,237,0.2),transparent 70%);filter:blur(50px)"></div>
+
+  <div class="max-w-6xl mx-auto grid md:grid-cols-2 gap-14 items-center relative">
     <div class="fadein">
       <div class="tag-pill mb-6">
         <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse relative pulse-ring"></span>
@@ -87,7 +113,7 @@
       </div>
       <h1 class="text-4xl md:text-5xl xl:text-6xl font-black leading-[1.1] mb-6">
         Sua agenda cheia.<br/>
-        <span style="background:linear-gradient(90deg,#E91E8C,#ff6ec7);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Sua cabeça livre.</span>
+        <span style="background:linear-gradient(90deg,#a855f7,#e9d5ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Sua cabeça livre.</span>
       </h1>
       <p class="text-gray-300 text-lg md:text-xl mb-8 leading-relaxed">
         Um agente de IA que fica no WhatsApp do seu consultório —
@@ -111,48 +137,106 @@
       </div>
     </div>
 
-    <!-- Chat animado -->
-    <div class="float hidden md:flex justify-center fadein-2">
-      <div class="bg-gray-900 rounded-3xl p-4 glow w-full max-w-[340px] border border-white/5">
-        <div class="rounded-2xl px-4 py-2.5 flex items-center gap-3 mb-5" style="background:linear-gradient(135deg,#E91E8C,#c2185b)">
-          <div class="w-9 h-9 bg-white/20 rounded-full flex items-center justify-center font-bold text-sm">🤖</div>
-          <div>
-            <p class="text-white font-semibold text-sm">Consultório Dra. Ana</p>
-            <p class="text-pink-200 text-xs flex items-center gap-1">
-              <span class="w-1.5 h-1.5 bg-green-300 rounded-full inline-block"></span> Online agora
-            </p>
-          </div>
-        </div>
-        <div class="space-y-3 px-1 text-sm">
-          <div class="flex justify-start">
-            <div class="chat-in bg-gray-700 text-gray-100 px-4 py-2.5 max-w-[85%]">Oi, queria marcar uma sessão 😊</div>
-          </div>
-          <div class="flex justify-end">
-            <div class="chat-out text-white px-4 py-2.5 max-w-[85%]">Olá! Seja bem-vinda! 😊 Qual é o seu nome?</div>
-          </div>
-          <div class="flex justify-start">
-            <div class="chat-in bg-gray-700 text-gray-100 px-4 py-2.5 max-w-[85%]">Maria Silva</div>
-          </div>
-          <div class="flex justify-end">
-            <div class="chat-out text-white px-4 py-2.5 max-w-[85%]">
-              Ótimo, Maria! Horários disponíveis:<br/>
-              • Ter 13/05 às 10:00<br/>
-              • Qua 14/05 às 14:00<br/>
-              • Sex 16/05 às 09:00<br/>
-              Qual prefere? 🗓️
-            </div>
-          </div>
-          <div class="flex justify-start">
-            <div class="chat-in bg-gray-700 text-gray-100 px-4 py-2.5 max-w-[85%]">Quarta às 14h!</div>
-          </div>
-          <div class="flex justify-end">
-            <div class="chat-out text-white px-4 py-2.5 max-w-[85%]">✅ Agendado! Qua, 14/05 às 14:00. Até lá! 😊</div>
-          </div>
-        </div>
-        <p class="text-center text-gray-500 text-xs mt-4 pb-1">Tudo automático, enquanto você atende 🎯</p>
-      </div>
+    <!-- Imagem oficial da arte -->
+    <div class="float fadein-2 hero-img-wrap">
+      <img src="/static/hero-agente.jpg"
+           alt="Agente Consultório atendendo pacientes no WhatsApp"
+           class="w-full rounded-3xl shadow-2xl border border-white/10"
+           loading="eager" decoding="async"/>
     </div>
 
+  </div>
+</section>
+
+<!-- ── BALÕES CSS ── (logo abaixo do hero, no mesmo estilo da arte) -->
+<section class="bg-gradient-to-b from-violet-50 via-white to-white py-20 px-5">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-12">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Como suas conversas ficam</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Uma conversa real, no seu WhatsApp</h2>
+      <p class="text-gray-500 text-lg">A paciente conversa naturalmente. O agente entende, propõe horários e confirma.</p>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-8">
+
+      <!-- Coluna 1: agendamento -->
+      <div class="bg-white rounded-3xl border border-violet-100 shadow-xl p-6 md:p-7 fadein">
+        <div class="flex items-center gap-2 text-xs text-violet-700 font-semibold mb-4 pb-3 border-b border-violet-50">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2" ry="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>
+          Olá, tudo bem? 😊 Precisa agendar?
+        </div>
+        <div class="space-y-3 text-sm">
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[80%]">Olá! Quero agendar uma consulta. <span class="chat-time">10:31</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[80%]">Claro! Vou te ajudar a agendar. 😊<br/>Com qual psicólogo(a) você gostaria de agendar? <span class="chat-time">10:31</span></div></div>
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[80%]">Com a Dra. Juliana. <span class="chat-time">10:32</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[80%]">Perfeito! Vou verificar os horários disponíveis para você. <span class="chat-time">10:32</span></div></div>
+          <div class="flex justify-start">
+            <div class="chat-in px-4 py-3 max-w-[90%] space-y-2">
+              <p class="text-xs text-violet-700 font-semibold mb-1">Confira os próximos horários:</p>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 09:00</div>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 14:00</div>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quinta-feira, 23/05 – 10:00</div>
+              <span class="chat-time">10:32</span>
+            </div>
+          </div>
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[80%]">Quarta-feira, 22/05 às 14:00. <span class="chat-time">10:33</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[85%]">Pronto! Sua consulta com a Dra. Juliana foi agendada para quarta-feira, 22/05 às 14:00. 💜<br/>Você receberá um lembrete antes do horário. <span class="chat-time">10:33</span></div></div>
+        </div>
+      </div>
+
+      <!-- Coluna 2: remarcação -->
+      <div class="bg-white rounded-3xl border border-violet-100 shadow-xl p-6 md:p-7 fadein-2">
+        <div class="flex items-center gap-2 text-xs text-violet-700 font-semibold mb-4 pb-3 border-b border-violet-50">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+          Precisa remarcar? Eu também cuido disso pra você!
+        </div>
+        <div class="space-y-3 text-sm">
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[80%]">Olá, preciso remarcar minha consulta. <span class="chat-time">11:15</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[85%]">Sem problemas! Vou te ajudar com isso. 😊<br/>Qual consulta você deseja remarcar? <span class="chat-time">11:15</span></div></div>
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[85%]">Consulta com Dra. Juliana<br/>Quarta-feira, 22/05 às 14:00 <span class="chat-time">11:15</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[85%]">Perfeito! Vamos escolher uma nova data. Confira os horários disponíveis: <span class="chat-time">11:16</span></div></div>
+          <div class="flex justify-start">
+            <div class="chat-in px-4 py-3 max-w-[90%] space-y-2">
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Sexta-feira, 24/05 – 09:00</div>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Sexta-feira, 24/05 – 15:00</div>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Terça-feira, 28/05 – 10:00</div>
+              <span class="chat-time">11:16</span>
+            </div>
+          </div>
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[80%]">Sexta-feira, 24/05 às 15:00, por favor. <span class="chat-time">11:17</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[85%]">Pronto! Sua consulta foi reagendada para sexta-feira, 24/05 às 15:00 com a Dra. Juliana.<br/>Você receberá um novo lembrete. Qualquer dúvida, estou aqui! 💜 <span class="chat-time">11:17</span></div></div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Mini "selos" estilo arte -->
+    <div class="mt-12 grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+      <div class="bg-white rounded-2xl border border-violet-100 p-4">
+        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-violet-100 text-brand flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>
+        </div>
+        <p class="text-xs font-semibold text-gray-900">Agenda organizada<br/>e sempre atualizada</p>
+      </div>
+      <div class="bg-white rounded-2xl border border-violet-100 p-4">
+        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-violet-100 text-brand flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+        </div>
+        <p class="text-xs font-semibold text-gray-900">Lembretes automáticos<br/>que reduzem faltas</p>
+      </div>
+      <div class="bg-white rounded-2xl border border-violet-100 p-4">
+        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-violet-100 text-brand flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        </div>
+        <p class="text-xs font-semibold text-gray-900">Atendimento humanizado<br/>que acolhe</p>
+      </div>
+      <div class="bg-white rounded-2xl border border-violet-100 p-4">
+        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-violet-100 text-brand flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        </div>
+        <p class="text-xs font-semibold text-gray-900">Mais tempo para<br/>cuidar de pessoas</p>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -216,7 +300,7 @@
   <div class="max-w-4xl mx-auto">
     <div class="text-center mb-14">
       <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">A virada</p>
-      <h2 class="text-3xl md:text-4xl font-black text-gray-900">Antes × Depois do Consultório Inteligente</h2>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900">Antes × Depois do Agente Consultório</h2>
     </div>
     <div class="grid md:grid-cols-2 gap-5">
       <div class="space-y-3">
@@ -275,19 +359,19 @@
     <div class="grid md:grid-cols-3 gap-8">
       <div class="text-center group">
         <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">⚡</div>
-        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-pink-50 rounded-full mb-3">PASSO 1</div>
+        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-violet-50 rounded-full mb-3">PASSO 1</div>
         <h3 class="font-bold text-gray-900 text-lg mb-2">Configure o consultório</h3>
         <p class="text-gray-500 text-sm leading-relaxed">Nome, psicóloga, horários de atendimento e duração da sessão. Um formulário simples.</p>
       </div>
       <div class="text-center group">
         <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">📱</div>
-        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-pink-50 rounded-full mb-3">PASSO 2</div>
+        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-violet-50 rounded-full mb-3">PASSO 2</div>
         <h3 class="font-bold text-gray-900 text-lg mb-2">Conecte seu WhatsApp</h3>
         <p class="text-gray-500 text-sm leading-relaxed">Integre com seu número via Z-API com um QR code. Seu número, sua identidade.</p>
       </div>
       <div class="text-center group">
         <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">🎉</div>
-        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-pink-50 rounded-full mb-3">PASSO 3</div>
+        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-violet-50 rounded-full mb-3">PASSO 3</div>
         <h3 class="font-bold text-gray-900 text-lg mb-2">Relaxe e atenda</h3>
         <p class="text-gray-500 text-sm leading-relaxed">O agente cuida de tudo. Você acompanha pelo painel no celular ou computador.</p>
       </div>
@@ -441,7 +525,7 @@
           <li class="flex gap-2"><span class="text-brand">✓</span> Reagendamento pelo painel</li>
           <li class="flex gap-2"><span class="text-brand">✓</span> Suporte via WhatsApp</li>
         </ul>
-        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-pink-50 transition">
+        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-violet-50 transition">
           Começar agora →
         </a>
       </div>
@@ -498,7 +582,7 @@
           <li class="flex gap-2"><span class="text-brand">✓</span> 7 dias grátis para testar</li>
           <li class="flex gap-2"><span class="text-brand">✓</span> Parcelamento em 3x s/ juros</li>
         </ul>
-        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-pink-50 transition">
+        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-violet-50 transition">
           Começar com desconto →
         </a>
       </div>
@@ -631,13 +715,26 @@
 <footer class="bg-gray-950 text-gray-500 py-10 px-5">
   <div class="max-w-5xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
     <div class="flex items-center gap-2">
-      <div class="w-7 h-7 btn-brand rounded-lg flex items-center justify-center text-white text-xs font-bold">CI</div>
-      <span class="font-semibold text-gray-400 text-sm">Consultório Inteligente</span>
+      <div class="w-8 h-8 btn-brand rounded-lg flex items-center justify-center text-white shadow">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
+          <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
+          <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
+        </svg>
+      </div>
+      <div class="leading-tight">
+        <span class="block font-extrabold text-gray-300 text-xs tracking-tight">AGENTE</span>
+        <span class="block font-bold text-brandLight text-[10px] -mt-0.5 tracking-[0.18em]">CONSULTÓRIO</span>
+      </div>
     </div>
-    <p class="text-sm text-center">© 2025 Consultório Inteligente · Powered by Claude AI · Anthropic</p>
-    <a href="https://wa.me/5511968439527" target="_blank" class="text-sm text-gray-400 hover:text-green-400 transition">
-      💬 Suporte: (11) 96843-9527
-    </a>
+    <p class="text-sm text-center">© 2026 Agente Consultório · Powered by Claude AI · Anthropic</p>
+    <div class="flex items-center gap-4 text-xs">
+      <a href="/termos" class="hover:text-gray-300 transition">Termos</a>
+      <a href="/privacidade" class="hover:text-gray-300 transition">Privacidade</a>
+      <a href="https://wa.me/5511968439527" target="_blank" class="text-gray-400 hover:text-green-400 transition">
+        💬 (11) 96843-9527
+      </a>
+    </div>
   </div>
 </footer>
 
