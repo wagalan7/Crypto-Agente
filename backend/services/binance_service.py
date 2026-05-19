@@ -17,7 +17,7 @@ from typing import List, Dict, Optional
 import httpx
 import pandas as pd
 
-BASE = "https://api.bybit.com"
+BASE = "https://api.bytick.com"   # mirror oficial Bybit — geralmente aceita cloud IPs (api.bybit.com bloqueia 403)
 
 _http_client: Optional[httpx.AsyncClient] = None
 _symbols_cache: List[str] = []

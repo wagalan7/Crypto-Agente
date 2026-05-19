@@ -13,7 +13,7 @@ import httpx
 
 from services.binance_service import to_bybit, fetch_funding_rate, fetch_open_interest
 
-BASE = "https://api.bybit.com"
+BASE = "https://api.bytick.com"   # mirror oficial Bybit (idêntico funcional; melhor pra cloud IPs)
 
 
 class DerivativesData(BaseModel):
