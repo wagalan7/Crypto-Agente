@@ -224,15 +224,59 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
           <Target className="w-4 h-4 text-slate-400" />
           <span className="text-xs font-semibold text-slate-400">NÍVEIS DE OPERAÇÃO</span>
         </div>
-        <LevelRow label="ENTRADA"   price={signal.entry}      entry={signal.entry} color="text-yellow-400" />
+
+        {signal.trade_plan?.entry_zone && signal.trade_plan.entry_zone.type !== 'market' ? (
+          <div className="mb-2 px-2 py-2 rounded bg-yellow-500/5 border border-yellow-500/30">
+            <div className="flex justify-between items-baseline mb-0.5">
+              <span className="text-xs font-bold text-yellow-400">ZONA DE ENTRADA (limit)</span>
+              <span className="text-xs font-mono text-yellow-300">
+                {fmt(signal.trade_plan.entry_zone.bottom)} – {fmt(signal.trade_plan.entry_zone.top)}
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-300 leading-tight">{signal.trade_plan.entry_zone.description}</p>
+          </div>
+        ) : (
+          <LevelRow label="ENTRADA" price={signal.entry} entry={signal.entry} color="text-yellow-400" />
+        )}
+
         <LevelRow label="STOP LOSS" price={signal.stop_loss}  entry={signal.entry} color="text-red-400"    />
-        <LevelRow label="ALVO 1"    price={signal.tp1}        entry={signal.entry} color="text-green-400"  />
-        <LevelRow label="ALVO 2"    price={signal.tp2}        entry={signal.entry} color="text-green-500"  />
-        <LevelRow label="ALVO 3"    price={signal.tp3}        entry={signal.entry} color="text-emerald-400"/>
+        {signal.trade_plan?.reasoning_stop && (
+          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_stop.reason}</p>
+        )}
+
+        <LevelRow label="ALVO 1" price={signal.tp1} entry={signal.entry} color="text-green-400" />
+        {signal.trade_plan?.reasoning_tp1 && (
+          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_tp1.reason} (R:R {signal.trade_plan.risk_reward_tp1})</p>
+        )}
+
+        <LevelRow label="ALVO 2" price={signal.tp2} entry={signal.entry} color="text-green-500" />
+        {signal.trade_plan?.reasoning_tp2 && (
+          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_tp2.reason} (R:R {signal.trade_plan.risk_reward})</p>
+        )}
+
+        <LevelRow label="ALVO 3" price={signal.tp3} entry={signal.entry} color="text-emerald-400" />
+        {signal.trade_plan?.reasoning_tp3 && (
+          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_tp3.reason} (R:R {signal.trade_plan.risk_reward_tp3})</p>
+        )}
+
         <div className="flex justify-between pt-2">
-          <span className="text-xs text-slate-400">Risco/Retorno</span>
+          <span className="text-xs text-slate-400">Risco/Retorno (TP2)</span>
           <span className="text-sm font-bold text-white">1 : {signal.risk_reward}</span>
         </div>
+
+        {signal.trade_plan?.quality_warnings && signal.trade_plan.quality_warnings.length > 0 && (
+          <div className="mt-2 pt-2 border-t border-slate-700/60">
+            <div className="flex items-center gap-1 mb-1">
+              <AlertTriangle className="w-3.5 h-3.5 text-yellow-400" />
+              <span className="text-xs font-semibold text-yellow-400">QUALIDADE DO SETUP</span>
+            </div>
+            <ul className="flex flex-col gap-0.5">
+              {signal.trade_plan.quality_warnings.map((w, i) => (
+                <li key={i} className="text-[11px] text-yellow-300/80 leading-tight">• {w}</li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
 
       {/* Indicators */}

@@ -145,8 +145,41 @@ export interface TradeSignal {
   divergences?: Divergence[] | null
   vp_vwap?: VPVWAPAnalysis | null
   mtf?: MTFAlignment | null
+  trade_plan?: TradePlan | null
   timestamp: number
   signal_strength: string
+}
+
+export interface LevelReasoning {
+  price: number
+  reason: string
+  source: string
+}
+
+export interface EntryZone {
+  top: number
+  bottom: number
+  mid: number
+  type: 'limit_pullback' | 'limit_retest' | 'limit_fvg_fill' | 'limit_ob' | 'market' | 'limit_value_area'
+  description: string
+}
+
+export interface TradePlan {
+  entry: number
+  entry_zone?: EntryZone | null
+  stop_loss: number
+  tp1: number
+  tp2: number
+  tp3: number
+  risk_reward: number
+  risk_reward_tp1: number
+  risk_reward_tp3: number
+  reasoning_entry: string
+  reasoning_stop: LevelReasoning
+  reasoning_tp1: LevelReasoning
+  reasoning_tp2: LevelReasoning
+  reasoning_tp3: LevelReasoning
+  quality_warnings: string[]
 }
 
 export interface TFDirection {

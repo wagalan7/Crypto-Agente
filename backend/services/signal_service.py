@@ -13,6 +13,7 @@ from services.backtest_service import compute_pattern_stats, PatternStats
 from services.divergence_service import detect_divergences
 from services.vp_service import analyze_vp_vwap
 from services.mtf_service import MTFAlignment
+from services.entry_planner import plan_trade, TradePlan
 
 
 TIMEFRAME_TRADE_TYPE = {
@@ -232,7 +233,33 @@ def build_trade_signal(
         )
         confidence = calculate_confidence(ind, patterns, direction, current_price)
 
-    levels = calculate_levels(current_price, atr, direction, trade_type, patterns, ind)
+    # Sprint B: plano de trade estruturado (zona de entrada + stop estrutural + alvos por liquidez)
+    trade_plan: Optional[TradePlan] = None
+    if direction != SignalDirection.NEUTRAL:
+        try:
+            trade_plan = plan_trade(
+                direction=direction,
+                current_price=current_price,
+                df=df,
+                ind=ind,
+                patterns=patterns,
+                smc=smc.model_dump() if smc else None,
+                vp_vwap=vp_vwap.model_dump() if vp_vwap else None,
+            )
+        except Exception:
+            trade_plan = None
+
+    if trade_plan is not None:
+        levels = {
+            "entry": trade_plan.entry,
+            "stop_loss": trade_plan.stop_loss,
+            "tp1": trade_plan.tp1,
+            "tp2": trade_plan.tp2,
+            "tp3": trade_plan.tp3,
+            "risk_reward": trade_plan.risk_reward,
+        }
+    else:
+        levels = calculate_levels(current_price, atr, direction, trade_type, patterns, ind)
 
     return TradeSignal(
         symbol=symbol,
@@ -257,6 +284,7 @@ def build_trade_signal(
         divergences=[d.model_dump() for d in divergences] if divergences else None,
         vp_vwap=vp_vwap.model_dump() if vp_vwap else None,
         mtf=mtf.model_dump() if mtf else None,
+        trade_plan=trade_plan.model_dump() if trade_plan else None,
         timestamp=int(df["timestamp"].iloc[-1]),
         signal_strength=signal_strength_label(confidence),
     )

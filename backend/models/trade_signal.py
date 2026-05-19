@@ -116,5 +116,6 @@ class TradeSignal(BaseModel):
     divergences: Optional[list] = None        # List[Divergence] serializado
     vp_vwap: Optional[dict] = None            # VPVWAPAnalysis serializado
     mtf: Optional[dict] = None                # MTFAlignment serializado
+    trade_plan: Optional[dict] = None         # TradePlan (Sprint B): zona de entrada, stop estrutural, alvos por liquidez + reasoning
     timestamp: int
     signal_strength: str
