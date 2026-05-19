@@ -26,9 +26,9 @@ _TZ = ZoneInfo("America/Sao_Paulo")
 
 logger = logging.getLogger(__name__)
 _INTERVAL_SECONDS = 30 * 60   # checa a cada 30 minutos
-_SEND_AFTER_HOUR  = 8         # janela de envio de confirmações: a partir das 8h
-_SEND_BEFORE_HOUR = 21        # janela de envio: até as 21h (NÃO enviar 22h–7h59)
-_FOLLOWUP_HOUR    = 8         # followup no dia da sessão a partir das 8h
+_SEND_AFTER_HOUR  = 7         # janela de envio de confirmações: a partir das 7h
+_SEND_BEFORE_HOUR = 22        # janela de envio: até as 22h (NÃO enviar 23h–6h59)
+_FOLLOWUP_HOUR    = 7         # followup no dia da sessão a partir das 7h
 
 
 _DIAS_SEMANA = {
