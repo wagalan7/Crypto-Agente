@@ -15,8 +15,9 @@ import asyncio
 from services.binance_service import fetch_ohlcv
 from services.indicator_service import calculate_indicators
 from services.pattern_service import detect_all_patterns
-from services.signal_service import determine_direction
 from models.trade_signal import SignalDirection
+# NOTA: `determine_direction` é importado lazy dentro de _analyze_tf para
+# evitar import circular (signal_service importa este módulo).
 
 
 # Mapa de TFs primários → superiores para conferir alinhamento
@@ -64,6 +65,8 @@ def _direction_word(d: SignalDirection) -> str:
 
 
 async def _analyze_tf(symbol: str, tf: str) -> Optional[TFDirection]:
+    # Import lazy para quebrar ciclo signal_service ↔ mtf_service
+    from services.signal_service import determine_direction
     try:
         df = await fetch_ohlcv(symbol, tf, limit=200)
         if df.empty or len(df) < 50:
