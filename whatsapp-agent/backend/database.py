@@ -521,26 +521,19 @@ def mark_followup_sent(appointment_id: int):
 
 
 def get_appointments_for_confirmation(tenant_id: int) -> list[dict]:
-    """Retorna consultas de HOJE ou AMANHÃ ainda sem confirmação.
+    """Retorna consultas cuja janela de 23-25h antes da sessão está aberta.
 
-    Corrige bug em que a janela fixa de 36h disparava confirmações com >32h
-    de antecedência (ex: às 21h da segunda para sessão de quarta 09:30).
-
-    Regras:
-    - Limite inferior: agora + 1h (não disparar pra consulta imediata).
-    - Limite superior: fim de amanhã (23:59:59) em horário de Brasília.
-
-    Combinado com a janela 8h-21h do scheduler, isso garante que a
-    confirmação saia no dia anterior (entre 8h e 21h), nunca dois dias antes.
-    Agendamentos last-minute do mesmo dia também são cobertos.
+    Janela estrita: a confirmação só sai quando faltam entre 23h e 25h
+    para a consulta. Como o scheduler roda a cada 30 min (entre 8h-21h),
+    qualquer sessão com janela sobreposta a esse intervalo é capturada
+    exatamente uma vez (flag confirmation_sent=0 evita duplicidade).
     """
     from datetime import datetime as _dt, timedelta as _td
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo("America/Sao_Paulo")
     now_br = _dt.now(_TZ).replace(tzinfo=None)  # naive, mesmo formato do scheduled_at
-    window_start = (now_br + _td(hours=1)).isoformat(timespec="seconds")
-    tomorrow = now_br.date() + _td(days=1)
-    window_end = f"{tomorrow.isoformat()}T23:59:59"
+    window_start = (now_br + _td(hours=23)).isoformat(timespec="seconds")
+    window_end   = (now_br + _td(hours=25)).isoformat(timespec="seconds")
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM appointments
