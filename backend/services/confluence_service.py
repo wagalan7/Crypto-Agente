@@ -23,6 +23,7 @@ from services.derivatives_service import DerivativesData
 from services.backtest_service import PatternStats
 from services.divergence_service import Divergence
 from services.vp_service import VPVWAPAnalysis
+from services.mtf_service import MTFAlignment
 
 
 # ─── Pesos por categoria ──────────────────────────────────────────────────────
@@ -39,8 +40,9 @@ WEIGHTS = {
     "derivatives":  15,   # Funding rate + OI
     "divergence":   20,   # Divergências RSI/MACD
     "vp_vwap":      20,   # Volume Profile (POC/VAH/VAL) + VWAP
+    "mtf":          30,   # Multi-timeframe alignment
 }
-MAX_TOTAL = sum(WEIGHTS.values())   # = 270
+MAX_TOTAL = sum(WEIGHTS.values())   # = 300
 
 
 def _sign_for_direction(direction: SignalDirection, val: int) -> int:
@@ -63,6 +65,7 @@ def calculate_confluence(
     pattern_stats: Optional[PatternStats] = None,
     divergences: Optional[List[Divergence]] = None,
     vp_vwap: Optional[VPVWAPAnalysis] = None,
+    mtf: Optional[MTFAlignment] = None,
 ) -> ConfluenceScore:
     factors: List[ConfluenceFactor] = []
     warnings: List[str] = []
@@ -659,6 +662,57 @@ def calculate_confluence(
                 points=6, max_points=6, aligned=True,
                 description=f"Preço no extremo superior do VWAP (banda +2σ {vw.upper_2sd:.6g}) — reversão provável.",
             ))
+
+    # ── 14. Multi-TF Alignment ──────────────────────────────────────────────
+    if mtf is not None and direction != SignalDirection.NEUTRAL:
+        # alignment_score ∈ [-1, 1]
+        if mtf.alignment_score >= 0.99:
+            # Todos os TFs superiores alinhados
+            factors.append(ConfluenceFactor(
+                name="MTF totalmente alinhado",
+                category="mtf",
+                points=30, max_points=30, aligned=True,
+                description=mtf.summary,
+            ))
+        elif mtf.alignment_score >= 0.5:
+            factors.append(ConfluenceFactor(
+                name="MTF majoritariamente alinhado",
+                category="mtf",
+                points=20, max_points=30, aligned=True,
+                description=mtf.summary,
+            ))
+        elif mtf.alignment_score > 0:
+            factors.append(ConfluenceFactor(
+                name="MTF parcialmente alinhado",
+                category="mtf",
+                points=8, max_points=30, aligned=True,
+                description=mtf.summary,
+            ))
+        elif mtf.alignment_score == 0:
+            factors.append(ConfluenceFactor(
+                name="MTF neutro",
+                category="mtf",
+                points=0, max_points=30, aligned=False,
+                description=mtf.summary,
+            ))
+            warnings.append("Timeframes superiores neutros — falta confirmação macro.")
+        elif mtf.alignment_score >= -0.5:
+            factors.append(ConfluenceFactor(
+                name="MTF parcialmente contrário",
+                category="mtf",
+                points=-10, max_points=30, aligned=False,
+                description=mtf.summary,
+            ))
+            warnings.append("Maioria dos TFs superiores contraria o sinal — operação contra-tendência.")
+        else:
+            # Todos contra: vetar fortemente
+            factors.append(ConfluenceFactor(
+                name="MTF totalmente contrário",
+                category="mtf",
+                points=-25, max_points=30, aligned=False,
+                description=mtf.summary,
+            ))
+            warnings.append("Todos os TFs superiores apontam direção contrária — risco extremo, evitar operar.")
 
     # ── Total ────────────────────────────────────────────────────────────────
     total = sum(f.points for f in factors)

@@ -1,5 +1,5 @@
 import type { TradeSignal, SignalDirection, TradeType } from '../../types'
-import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle, Crosshair, BarChart3, History, GitCompare, BarChartHorizontal } from 'lucide-react'
+import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle, Crosshair, BarChart3, History, GitCompare, BarChartHorizontal, LayoutGrid } from 'lucide-react'
 
 interface Props {
   signal: TradeSignal
@@ -459,6 +459,49 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
               ))}
             </ul>
           )}
+        </div>
+      )}
+
+      {/* Multi-TF Alignment */}
+      {signal.mtf && signal.mtf.higher_tfs.length > 0 && (
+        <div className={`rounded-lg p-3 border ${
+          signal.mtf.alignment_score >= 0.5 ? 'bg-green-500/5 border-green-500/30' :
+          signal.mtf.alignment_score <= -0.5 ? 'bg-red-500/5 border-red-500/30' :
+          'bg-slate-800/60 border-slate-700/40'
+        }`}>
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1">
+              <LayoutGrid className={`w-4 h-4 ${
+                signal.mtf.alignment_score >= 0.5 ? 'text-green-400' :
+                signal.mtf.alignment_score <= -0.5 ? 'text-red-400' : 'text-slate-300'
+              }`} />
+              <span className={`text-xs font-semibold ${
+                signal.mtf.alignment_score >= 0.5 ? 'text-green-400' :
+                signal.mtf.alignment_score <= -0.5 ? 'text-red-400' : 'text-slate-300'
+              }`}>ALINHAMENTO MULTI-TF</span>
+            </div>
+            <span className="text-xs font-mono text-white">
+              {signal.mtf.aligned_count}/{signal.mtf.higher_tfs.length} a favor
+            </span>
+          </div>
+          <p className="text-xs text-slate-300 leading-tight mb-2">{signal.mtf.summary}</p>
+          <div className="flex flex-col gap-1">
+            {signal.mtf.higher_tfs.map((t, i) => (
+              <div key={i} className="flex items-center gap-2 text-xs">
+                <span className="font-mono font-bold w-10 text-slate-400">{t.timeframe}</span>
+                <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                  t.direction === 'bullish' ? 'bg-green-500/20 text-green-400' :
+                  t.direction === 'bearish' ? 'bg-red-500/20 text-red-400' :
+                  'bg-slate-700 text-slate-400'
+                }`}>{t.direction.toUpperCase()}</span>
+                <span className="text-slate-400 flex-1">
+                  {t.rsi != null && <span>RSI {t.rsi.toFixed(0)}</span>}
+                  {t.ema_aligned && <span> · EMAs {t.ema_aligned}</span>}
+                  {t.adx != null && <span> · ADX {t.adx.toFixed(0)}</span>}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

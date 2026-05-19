@@ -12,6 +12,7 @@ from services.derivatives_service import DerivativesData
 from services.backtest_service import compute_pattern_stats, PatternStats
 from services.divergence_service import detect_divergences
 from services.vp_service import analyze_vp_vwap
+from services.mtf_service import MTFAlignment
 
 
 TIMEFRAME_TRADE_TYPE = {
@@ -180,6 +181,7 @@ def build_trade_signal(
     ind: Indicator,
     patterns: List[DetectedPattern],
     derivatives: Optional[DerivativesData] = None,
+    mtf: Optional[MTFAlignment] = None,
     with_backtest: bool = True,
 ) -> TradeSignal:
     current_price = float(df["close"].iloc[-1])
@@ -219,14 +221,14 @@ def build_trade_signal(
         confluence = calculate_confluence(
             ind, patterns, df, direction, current_price,
             smc=smc, derivatives=derivatives, pattern_stats=pattern_stats,
-            divergences=divergences, vp_vwap=vp_vwap,
+            divergences=divergences, vp_vwap=vp_vwap, mtf=mtf,
         )
         confidence = round(confluence.pct / 100, 2)
     else:
         confluence = calculate_confluence(
             ind, patterns, df, SignalDirection.NEUTRAL, current_price,
             smc=smc, derivatives=derivatives, pattern_stats=pattern_stats,
-            divergences=divergences, vp_vwap=vp_vwap,
+            divergences=divergences, vp_vwap=vp_vwap, mtf=mtf,
         )
         confidence = calculate_confidence(ind, patterns, direction, current_price)
 
@@ -254,6 +256,7 @@ def build_trade_signal(
         pattern_stats=pattern_stats.model_dump() if pattern_stats else None,
         divergences=[d.model_dump() for d in divergences] if divergences else None,
         vp_vwap=vp_vwap.model_dump() if vp_vwap else None,
+        mtf=mtf.model_dump() if mtf else None,
         timestamp=int(df["timestamp"].iloc[-1]),
         signal_strength=signal_strength_label(confidence),
     )

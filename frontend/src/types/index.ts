@@ -144,8 +144,29 @@ export interface TradeSignal {
   pattern_stats?: PatternStats | null
   divergences?: Divergence[] | null
   vp_vwap?: VPVWAPAnalysis | null
+  mtf?: MTFAlignment | null
   timestamp: number
   signal_strength: string
+}
+
+export interface TFDirection {
+  timeframe: string
+  direction: 'bullish' | 'bearish' | 'neutral'
+  rsi?: number | null
+  ema_aligned?: 'bullish' | 'bearish' | 'mixed' | null
+  adx?: number | null
+  description: string
+}
+
+export interface MTFAlignment {
+  primary_tf: string
+  primary_direction: 'bullish' | 'bearish' | 'neutral'
+  higher_tfs: TFDirection[]
+  alignment_score: number
+  aligned_count: number
+  contrary_count: number
+  neutral_count: number
+  summary: string
 }
 
 export interface VolumeProfile {
