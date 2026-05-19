@@ -1,7 +1,13 @@
 """
-Usa a API pública REST da OKX (www.okx.com/api/v5/) para perpétuos USDT.
-OKX não bloqueia IPs de cloud providers.
-A interface pública permanece igual — nada muda no resto do código.
+Fonte de dados: Bybit V5 (api.bybit.com) — perpétuos USDT lineares.
+
+Trocado de OKX para Bybit pq Bybit lista ~3× mais perps USDT (~600 vs ~210),
+e a API V5 deles aceita IPs de cloud providers (Railway etc).
+Binance Futures também tem cobertura ampla, mas o `fapi.binance.com` retorna 451
+para IPs de cloud — por isso fica reservado pro frontend (browser do usuário).
+
+A interface pública permanece IGUAL — nada muda no resto do código.
+Funções helper auxiliares (`to_okx`/`from_okx`) viraram aliases pra Bybit.
 """
 from __future__ import annotations
 import asyncio
@@ -11,17 +17,18 @@ from typing import List, Dict, Optional
 import httpx
 import pandas as pd
 
-BASE = "https://www.okx.com"
+BASE = "https://api.bybit.com"
 
 _http_client: Optional[httpx.AsyncClient] = None
 _symbols_cache: List[str] = []
 _symbols_cache_time: float = 0
 CACHE_TTL = 300
 
+# Bybit intervals: 1, 3, 5, 15, 30, 60, 120, 240, 360, 720, D, W, M
 TIMEFRAME_MAP = {
-    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-    "1h": "1H", "4h": "4H", "6h": "6H", "8h": "8H", "12h": "12H",
-    "1d": "1D", "3d": "3D",
+    "1m": "1", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "4h": "240", "6h": "360", "8h": "480", "12h": "720",
+    "1d": "D", "3d": "D",   # 3d não existe na Bybit — degrada pra D
 }
 
 
@@ -32,16 +39,22 @@ def get_client() -> httpx.AsyncClient:
     return _http_client
 
 
-def to_okx(symbol: str) -> str:
-    """'BTC/USDT:USDT' → 'BTC-USDT-SWAP'"""
-    base = symbol.split(":")[0].split("/")[0]
-    return f"{base}-USDT-SWAP"
+def to_bybit(symbol: str) -> str:
+    """'BTC/USDT:USDT' → 'BTCUSDT'"""
+    return symbol.split(":")[0].replace("/", "")
 
 
-def from_okx(inst_id: str) -> str:
-    """'BTC-USDT-SWAP' → 'BTC/USDT:USDT'"""
-    base = inst_id.replace("-USDT-SWAP", "")
-    return f"{base}/USDT:USDT"
+def from_bybit(bb_symbol: str) -> str:
+    """'BTCUSDT' → 'BTC/USDT:USDT' (assume sufixo USDT)"""
+    if bb_symbol.endswith("USDT"):
+        base = bb_symbol[:-4]
+        return f"{base}/USDT:USDT"
+    return bb_symbol
+
+
+# Aliases retro-compatíveis (recommendation_service e outros podem chamar)
+to_okx = to_bybit
+from_okx = from_bybit
 
 
 async def get_perpetual_symbols() -> List[str]:
@@ -51,19 +64,23 @@ async def get_perpetual_symbols() -> List[str]:
         return _symbols_cache
 
     client = get_client()
-    symbols: List[str] = []
     r = await client.get(
-        f"{BASE}/api/v5/public/instruments",
-        params={"instType": "SWAP"},
+        f"{BASE}/v5/market/instruments-info",
+        params={"category": "linear", "limit": 1000},
     )
     r.raise_for_status()
-    data = r.json()
-    for item in data.get("data", []):
-        inst_id = item.get("instId", "")
-        settle = item.get("settleCcy", "")
-        state = item.get("state", "")
-        if inst_id.endswith("-USDT-SWAP") and settle == "USDT" and state == "live":
-            symbols.append(from_okx(inst_id))
+    payload = r.json()
+    items = payload.get("result", {}).get("list", [])
+
+    symbols: List[str] = []
+    for item in items:
+        sym = item.get("symbol", "")
+        quote = item.get("quoteCoin", "")
+        status = item.get("status", "")
+        contract_type = item.get("contractType", "")
+        # LinearPerpetual + USDT + Trading
+        if quote == "USDT" and status == "Trading" and contract_type == "LinearPerpetual":
+            symbols.append(from_bybit(sym))
 
     symbols.sort()
     _symbols_cache = symbols
@@ -72,20 +89,29 @@ async def get_perpetual_symbols() -> List[str]:
 
 
 async def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 300) -> pd.DataFrame:
-    bar = TIMEFRAME_MAP.get(timeframe, "1H")
-    inst_id = to_okx(symbol)
+    interval = TIMEFRAME_MAP.get(timeframe, "60")
+    bb_symbol = to_bybit(symbol)
 
     client = get_client()
     r = await client.get(
-        f"{BASE}/api/v5/market/candles",
-        params={"instId": inst_id, "bar": bar, "limit": min(limit, 300)},
+        f"{BASE}/v5/market/kline",
+        params={
+            "category": "linear",
+            "symbol": bb_symbol,
+            "interval": interval,
+            "limit": min(limit, 1000),   # Bybit aceita até 1000
+        },
     )
     r.raise_for_status()
-    raw = r.json().get("data", [])  # newest first
-
+    payload = r.json()
+    raw = payload.get("result", {}).get("list", [])  # newest first
     raw = list(reversed(raw))
-    # OKX columns: ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm
-    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume", "volCcy", "volCcyQuote", "confirm"])
+
+    # Bybit kline: [start, open, high, low, close, volume, turnover]
+    if not raw:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].copy()
     df = df.astype({
         "timestamp": int, "open": float, "high": float,
@@ -95,26 +121,29 @@ async def fetch_ohlcv(symbol: str, timeframe: str = "1h", limit: int = 300) -> p
 
 
 async def fetch_ticker(symbol: str) -> Dict:
-    inst_id = to_okx(symbol)
+    bb_symbol = to_bybit(symbol)
     client = get_client()
     r = await client.get(
-        f"{BASE}/api/v5/market/ticker",
-        params={"instId": inst_id},
+        f"{BASE}/v5/market/tickers",
+        params={"category": "linear", "symbol": bb_symbol},
     )
     r.raise_for_status()
-    t = r.json()["data"][0]
-    last = float(t.get("last", 0))
-    open24 = float(t.get("open24h", last))
-    change = ((last - open24) / open24 * 100) if open24 else 0
+    payload = r.json()
+    rows = payload.get("result", {}).get("list", [])
+    if not rows:
+        raise ValueError(f"Ticker vazio para {symbol}")
+    t = rows[0]
+    last = float(t.get("lastPrice", 0))
+    change_pct = float(t.get("price24hPcnt", 0)) * 100   # vem em fração
     return {
         "symbol": symbol,
         "last": last,
-        "change": round(change, 2),
-        "volume": float(t.get("volCcy24h", 0)),
-        "high": float(t.get("high24h", 0)),
-        "low": float(t.get("low24h", 0)),
-        "bid": float(t.get("bidPx", 0)),
-        "ask": float(t.get("askPx", 0)),
+        "change": round(change_pct, 2),
+        "volume": float(t.get("turnover24h", 0)),    # turnover em USDT
+        "high": float(t.get("highPrice24h", 0)),
+        "low": float(t.get("lowPrice24h", 0)),
+        "bid": float(t.get("bid1Price", 0)),
+        "ask": float(t.get("ask1Price", 0)),
     }
 
 
@@ -131,19 +160,19 @@ async def fetch_top_volume_symbols(limit: int = 30) -> List[str]:
         if now - ts < TOP_VOLUME_TTL:
             return data
     client = get_client()
-    r = await client.get(f"{BASE}/api/v5/market/tickers", params={"instType": "SWAP"})
+    r = await client.get(f"{BASE}/v5/market/tickers", params={"category": "linear"})
     r.raise_for_status()
-    rows = r.json().get("data", [])
+    rows = r.json().get("result", {}).get("list", [])
     usdt_rows = []
     for t in rows:
-        inst = t.get("instId", "")
-        if not inst.endswith("-USDT-SWAP"):
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
             continue
         try:
-            vol_usd = float(t.get("volCcy24h", 0))
+            vol_usd = float(t.get("turnover24h", 0))
         except Exception:
             vol_usd = 0
-        usdt_rows.append((from_okx(inst), vol_usd))
+        usdt_rows.append((from_bybit(sym), vol_usd))
     usdt_rows.sort(key=lambda x: x[1], reverse=True)
     top = [s for s, _ in usdt_rows[:limit]]
     _top_volume_cache[cache_key] = (now, top)
@@ -157,31 +186,40 @@ async def fetch_multiple_tickers(symbols: List[str]) -> List[Dict]:
 
 
 async def fetch_funding_rate(symbol: str) -> Optional[float]:
+    """Bybit retorna funding atual junto com o ticker."""
     try:
-        inst_id = to_okx(symbol)
+        bb_symbol = to_bybit(symbol)
         client = get_client()
         r = await client.get(
-            f"{BASE}/api/v5/public/funding-rate",
-            params={"instId": inst_id},
+            f"{BASE}/v5/market/tickers",
+            params={"category": "linear", "symbol": bb_symbol},
         )
         r.raise_for_status()
-        data = r.json().get("data", [])
-        return float(data[0].get("fundingRate", 0)) if data else None
+        rows = r.json().get("result", {}).get("list", [])
+        if not rows:
+            return None
+        return float(rows[0].get("fundingRate", 0))
     except Exception:
         return None
 
 
 async def fetch_open_interest(symbol: str) -> Optional[float]:
+    """OI mais recente. Bybit retorna histórico — pegamos o último ponto."""
     try:
-        inst_id = to_okx(symbol)
+        bb_symbol = to_bybit(symbol)
         client = get_client()
         r = await client.get(
-            f"{BASE}/api/v5/public/open-interest",
-            params={"instType": "SWAP", "instId": inst_id},
+            f"{BASE}/v5/market/open-interest",
+            params={
+                "category": "linear",
+                "symbol": bb_symbol,
+                "intervalTime": "1h",
+                "limit": 1,
+            },
         )
         r.raise_for_status()
-        data = r.json().get("data", [])
-        return float(data[0].get("oi", 0)) if data else None
+        data = r.json().get("result", {}).get("list", [])
+        return float(data[0].get("openInterest", 0)) if data else None
     except Exception:
         return None
 
