@@ -722,7 +722,15 @@ function showTab(name) {
 }
 
 function api(path, opts={}) {
-  return fetch(path, { headers:{"Content-Type":"application/json","X-Dashboard-Token":TOKEN}, ...opts }).then(r=>r.json());
+  const headers = Object.assign(
+    {"Content-Type":"application/json","X-Dashboard-Token":TOKEN},
+    opts.headers || {}
+  );
+  return fetch(path, { ...opts, headers }).then(async r => {
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    return data;
+  });
 }
 
 // ── Agenda ────────────────────────────────────────────────────────────────────
@@ -1111,7 +1119,6 @@ async function submitRename() {
   try {
     const r = await api(`/dashboard/api/appointments/${id}/rename`, {
       method: "PATCH",
-      headers: {"Content-Type": "application/json"},
       body: JSON.stringify({patient_name: name, apply_all: all}),
     });
     closeRename();

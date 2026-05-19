@@ -374,9 +374,9 @@ def _execute_action(tenant: dict, resp: AgentResponse,
         name = data.get("patient_name", "Paciente")
         if 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
-            if not db.is_slot_taken(tenant_id, slot):
+            duration = tenant.get("session_minutes", 50)
+            if not db.has_conflict(tenant_id, slot, duration):
                 appt_id = db.create_appointment(tenant_id, name, phone, slot)
-                duration = tenant.get("session_minutes", 50)
                 # Sincronizar com Google Calendar (se conectado)
                 try:
                     event_id = gcal.create_event(tenant, name, slot.isoformat(), duration)
@@ -410,7 +410,8 @@ def _execute_action(tenant: dict, resp: AgentResponse,
         idx = int(idx_raw) - 1  # 1-based (display) → 0-based
         if appt_id and 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
-            if not db.is_slot_taken(tenant_id, slot):
+            duration = tenant.get("session_minutes", 50)
+            if not db.has_conflict(tenant_id, slot, duration, exclude_id=int(appt_id)):
                 # Buscar google_event_id antes de atualizar
                 appt = db.get_appointment_by_id(tenant_id, appt_id)
                 db.update_appointment(tenant_id, appt_id, slot)

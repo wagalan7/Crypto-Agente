@@ -586,6 +586,28 @@ def is_slot_taken(tenant_id: int, dt: datetime) -> bool:
     return row is not None
 
 
+def has_conflict(tenant_id: int, dt: datetime, duration_min: int, exclude_id: int | None = None) -> bool:
+    """Detecta sobreposição real: True se `dt` cair dentro de [b - duration, b + duration]
+    de qualquer consulta existente (exceto a própria, via exclude_id).
+    """
+    from datetime import datetime as _dt
+    with get_conn() as conn:
+        query = "SELECT id, scheduled_at FROM appointments WHERE tenant_id = ?"
+        params = [tenant_id]
+        if exclude_id is not None:
+            query += " AND id != ?"
+            params.append(exclude_id)
+        rows = conn.execute(query, params).fetchall()
+    for r in rows:
+        try:
+            b = _dt.fromisoformat(r["scheduled_at"])
+        except Exception:
+            continue
+        if abs((dt - b).total_seconds()) < duration_min * 60:
+            return True
+    return False
+
+
 # ── Patients ───────────────────────────────────────────────────────────────────
 
 def upsert_patient(tenant_id: int, phone: str, name: str = "", session_price: float = 0.0, email: str = "") -> None:

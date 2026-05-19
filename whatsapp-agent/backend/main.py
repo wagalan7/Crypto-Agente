@@ -649,8 +649,9 @@ def dash_create_appointment(body: ManualAppointment, request: Request):
     except ValueError:
         raise HTTPException(status_code=400, detail="Data/hora inválida. Use formato ISO: 2025-05-10T14:00:00")
 
-    if db.is_slot_taken(tenant["id"], scheduled):
-        raise HTTPException(status_code=409, detail="Já existe uma consulta neste horário.")
+    duration = tenant.get("session_minutes", 50)
+    if db.has_conflict(tenant["id"], scheduled, duration):
+        raise HTTPException(status_code=409, detail="Este horário conflita com outra consulta (sobreposição de sessão).")
 
     phone = body.phone.strip().replace(" ", "").replace("-", "")
     appt_id = db.create_appointment(tenant["id"], body.patient_name, phone, scheduled)
@@ -709,6 +710,10 @@ async def dash_reschedule(appt_id: int, body: RescheduleBody, request: Request):
         new_dt = datetime.fromisoformat(body.scheduled_at)
     except ValueError:
         raise HTTPException(status_code=400, detail="Data/hora inválida.")
+
+    duration = tenant.get("session_minutes", 50)
+    if db.has_conflict(tenant["id"], new_dt, duration, exclude_id=appt_id):
+        raise HTTPException(status_code=409, detail="Este horário conflita com outra consulta (sobreposição de sessão).")
 
     # Atualiza no banco
     db.update_appointment(tenant["id"], appt_id, new_dt)
