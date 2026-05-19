@@ -31,7 +31,7 @@ from services.derivatives_service import analyze_derivatives
 from services.mtf_service import analyze_mtf
 from services.trade_service import get_trades, save_trades
 from services.macro_service import get_btc_dominance, build_macro_context, get_global_market_data
-from services.recommendation_service import get_recommendations
+from services.recommendation_service import get_recommendations, get_recommendations_from_batch
 from models.trade_signal import TradeSignal
 
 
@@ -289,6 +289,34 @@ async def recommendations(top_n: int = 30):
     except Exception as e:
         logging.error(f"recommendations error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao gerar recomendações: {e}")
+
+
+class RecommendationBatchItem(BaseModel):
+    symbol: str
+    timeframe: str
+    candles: List[CandleData]
+
+
+class RecommendationBatchRequest(BaseModel):
+    items: List[RecommendationBatchItem]
+
+
+@app.post("/api/recommendations-batch")
+async def recommendations_batch(body: RecommendationBatchRequest):
+    """Recebe candles (já baixados pelo browser da Bybit) em lote, agrupa por
+    símbolo, escolhe melhor TF, classifica em tiers A+/A/B. Backend nunca
+    chama a Bybit (Railway leva 403)."""
+    try:
+        items = [
+            {"symbol": it.symbol, "timeframe": it.timeframe,
+             "candles": [c.model_dump() for c in it.candles]}
+            for it in body.items
+        ]
+        recs = await get_recommendations_from_batch(items)
+        return {"count": len(recs), "recommendations": [r.model_dump() for r in recs]}
+    except Exception as e:
+        logging.error(f"recommendations-batch error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao processar recomendações: {e}")
 
 
 @app.get("/api/multi-timeframe")

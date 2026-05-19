@@ -181,6 +181,131 @@ async def _best_tf_for_symbol(symbol: str) -> Optional[tuple]:
     return max(scored, key=lambda x: x[1])
 
 
+def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Recommendation:
+    return Recommendation(
+        tier=tier,
+        score=score,
+        symbol=sig.symbol,
+        timeframe=sig.timeframe,
+        direction=sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction),
+        confidence=sig.confidence,
+        risk_reward=sig.risk_reward,
+        entry=sig.entry,
+        stop_loss=sig.stop_loss,
+        tp2=sig.tp2,
+        summary=_build_summary(sig),
+        warnings=(sig.trade_plan or {}).get("quality_warnings", []) if sig.trade_plan else [],
+        signal=sig,
+    )
+
+
+async def _analyze_candles_for_tf(symbol: str, tf: str, df) -> Optional[TradeSignal]:
+    """Variante de _analyze_symbol_tf que recebe candles já baixados (frontend)."""
+    try:
+        if df is None or df.empty or len(df) < 80:
+            return None
+        ind = calculate_indicators(df)
+        patterns = detect_all_patterns(df)
+        current = float(df["close"].iloc[-1])
+        primary_dir = determine_direction(ind, patterns, current)
+
+        # Derivativos + MTF: backend ainda chama OKX pra esses dois (rate-limit-friendly).
+        # Se falhar (símbolo só existe na Bybit), seguimos sem.
+        try:
+            from services.binance_service import fetch_ticker
+            ticker = await fetch_ticker(symbol)
+            change_24h = ticker.get("change", 0.0)
+        except Exception:
+            change_24h = 0.0
+        try:
+            derivatives, mtf = await asyncio.gather(
+                analyze_derivatives(symbol, change_24h),
+                analyze_mtf(symbol, tf, primary_dir),
+                return_exceptions=True,
+            )
+            if isinstance(derivatives, Exception):
+                derivatives = None
+            if isinstance(mtf, Exception):
+                mtf = None
+        except Exception:
+            derivatives = None
+            mtf = None
+
+        return build_trade_signal(
+            symbol, tf, df, ind, patterns,
+            derivatives=derivatives, mtf=mtf, with_backtest=False,
+        )
+    except Exception:
+        return None
+
+
+async def get_recommendations_from_batch(
+    items: List[dict],
+) -> List[Recommendation]:
+    """
+    Entrada: lista de {symbol, timeframe, candles: [{timestamp,open,high,low,close,volume}, ...]}
+    O frontend baixa candles direto da Bybit e envia em lote — backend só processa.
+    Agrupa por símbolo, escolhe o melhor TF, classifica em tiers.
+    """
+    import pandas as pd
+
+    # Agrupa por símbolo
+    per_symbol: Dict[str, List[tuple]] = {}
+    for item in items:
+        symbol = item.get("symbol")
+        tf = item.get("timeframe")
+        candles = item.get("candles", [])
+        if not symbol or not tf or len(candles) < 80:
+            continue
+        try:
+            df = pd.DataFrame(candles)
+            df = df.astype({
+                "timestamp": int, "open": float, "high": float,
+                "low": float, "close": float, "volume": float,
+            })
+        except Exception:
+            continue
+        per_symbol.setdefault(symbol, []).append((tf, df))
+
+    if not per_symbol:
+        return []
+
+    # Limita concorrência por símbolo (3 TFs em paralelo, 6 símbolos em paralelo)
+    sem_sym = asyncio.Semaphore(6)
+
+    async def _process_symbol(symbol: str, tfs: List[tuple]) -> Optional[tuple]:
+        async with sem_sym:
+            results = await asyncio.gather(*[
+                _analyze_candles_for_tf(symbol, tf, df) for tf, df in tfs
+            ])
+            scored = []
+            for sig in results:
+                if sig is None or sig.direction == SignalDirection.NEUTRAL:
+                    continue
+                scored.append((sig, _compute_score(sig)))
+            if not scored:
+                return None
+            return max(scored, key=lambda x: x[1])
+
+    best_per_symbol = await asyncio.gather(*[
+        _process_symbol(sym, tfs) for sym, tfs in per_symbol.items()
+    ])
+
+    recommendations: List[Recommendation] = []
+    for best in best_per_symbol:
+        if best is None:
+            continue
+        sig, score = best
+        tier = _classify_tier(sig, score)
+        if tier is None:
+            continue
+        recommendations.append(_build_recommendation(sig, score, tier))
+
+    tier_order = {"A+": 0, "A": 1, "B": 2}
+    recommendations.sort(key=lambda r: (tier_order[r.tier], -r.score))
+    return recommendations
+
+
 async def get_recommendations(top_n: int = 30) -> List[Recommendation]:
     """Endpoint principal. Cacheado por 90s."""
     now = time.time()

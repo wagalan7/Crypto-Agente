@@ -15,7 +15,7 @@ function toBinance(symbol: string): string {
   return symbol.split(':')[0].replace('/', '')  // 'BTC/USDT:USDT' → 'BTCUSDT'
 }
 
-async function fetchBinanceOHLCV(symbol: string, timeframe: string, limit = 300): Promise<OHLCVCandle[]> {
+export async function fetchBinanceOHLCV(symbol: string, timeframe: string, limit = 300): Promise<OHLCVCandle[]> {
   const interval = BINANCE_INTERVAL[timeframe] ?? '1h'
   const res = await fetch(
     `${BINANCE_FAPI}/klines?symbol=${toBinance(symbol)}&interval=${interval}&limit=${limit}`,
@@ -135,6 +135,21 @@ export const api = {
 
   recommendations: (topN = 30) =>
     get<{ count: number; recommendations: Recommendation[] }>('/recommendations', { top_n: topN }),
+
+  recommendationsBatch: (items: { symbol: string; timeframe: string; candles: OHLCVCandle[] }[]) =>
+    post<{ count: number; recommendations: Recommendation[] }>('/recommendations-batch', { items }),
+
+  // Top símbolos por volume (Binance Futures, direto do browser — IP residencial)
+  fetchTopBinanceSymbols: async (limit = 30): Promise<string[]> => {
+    const res = await fetch(`${BINANCE_FAPI}/ticker/24hr`, { signal: AbortSignal.timeout(10000) })
+    if (!res.ok) throw new Error(`Binance 24hr ${res.status}`)
+    const rows: { symbol: string; quoteVolume: string }[] = await res.json()
+    return rows
+      .filter(r => r.symbol.endsWith('USDT'))
+      .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+      .slice(0, limit)
+      .map(r => `${r.symbol.replace(/USDT$/, '')}/USDT:USDT`)
+  },
 
   bestTimeframe: (symbol: string) =>
     get<{ best_timeframe: string; score: number; signal: TradeSignal; all_scores: Record<string, number> }>(

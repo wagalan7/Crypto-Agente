@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { X, Sparkles, TrendingUp, TrendingDown, RefreshCw, AlertTriangle } from 'lucide-react'
-import { api } from '../services/api'
+import { api, fetchBinanceOHLCV } from '../services/api'
 import type { Recommendation, RecommendationTier } from '../types'
 
 interface Props {
@@ -54,14 +54,49 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
   const [error, setError] = useState<string | null>(null)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
   const [filter, setFilter] = useState<RecommendationTier | 'all'>('all')
+  const [progress, setProgress] = useState<string>('')
 
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
+    setProgress('Buscando top 30 perpétuos…')
     try {
-      const res = await api.recommendations(30)
+      // 1) Top símbolos por volume (Binance Futures, IP do browser — não bloqueado)
+      const symbols = await api.fetchTopBinanceSymbols(30)
+      if (symbols.length === 0) throw new Error('Nenhum símbolo encontrado')
+
+      // 2) Baixa candles de 15m/1h/4h para cada símbolo (em paralelo, com limite)
+      const TFS = ['15m', '1h', '4h'] as const
+      setProgress(`Baixando candles (${symbols.length} símbolos × ${TFS.length} TFs)…`)
+
+      const tasks: Promise<{ symbol: string; timeframe: string; candles: Awaited<ReturnType<typeof fetchBinanceOHLCV>> } | null>[] = []
+      for (const symbol of symbols) {
+        for (const tf of TFS) {
+          tasks.push(
+            fetchBinanceOHLCV(symbol, tf, 200)
+              .then(candles => ({ symbol, timeframe: tf, candles }))
+              .catch(() => null),
+          )
+        }
+      }
+      // Concorrência limitada (lotes de 12)
+      const results: ({ symbol: string; timeframe: string; candles: unknown[] } | null)[] = []
+      const BATCH = 12
+      for (let i = 0; i < tasks.length; i += BATCH) {
+        const slice = await Promise.all(tasks.slice(i, i + BATCH))
+        results.push(...slice)
+        setProgress(`Baixando candles… ${Math.min(i + BATCH, tasks.length)}/${tasks.length}`)
+      }
+      const items = results.filter((x): x is { symbol: string; timeframe: string; candles: { timestamp: number; open: number; high: number; low: number; close: number; volume: number }[] } => x !== null && x.candles.length >= 80)
+
+      if (items.length === 0) throw new Error('Falha ao baixar candles')
+
+      // 3) Envia em lote pro backend pra analisar + classificar
+      setProgress(`Analisando ${items.length} (símbolo × TF)…`)
+      const res = await api.recommendationsBatch(items)
       setRecs(res.recommendations)
       setLastUpdate(new Date())
+      setProgress('')
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Erro ao carregar')
     } finally {
@@ -143,7 +178,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
           {loading && recs.length === 0 && (
             <div className="flex flex-col items-center justify-center py-20 gap-3">
               <div className="w-8 h-8 border-2 border-yellow-500 border-t-transparent rounded-full animate-spin" />
-              <span className="text-sm text-slate-500">Varredura em andamento… (~30s)</span>
+              <span className="text-sm text-slate-500">{progress || 'Varredura em andamento…'}</span>
             </div>
           )}
 
