@@ -521,20 +521,26 @@ def mark_followup_sent(appointment_id: int):
 
 
 def get_appointments_for_confirmation(tenant_id: int) -> list[dict]:
-    """Retorna consultas nas próximas 25h que ainda não receberam confirmação.
-    Cobre tanto o fluxo normal (24h antes) quanto agendamentos de última hora
-    (feitos com menos de 23h de antecedência — antes ignorados pela janela fixa).
-    Usa horário de Brasília passado pelo Python (evita bug de UTC vs localtime no SQLite)."""
+    """Retorna consultas de HOJE ou AMANHÃ ainda sem confirmação.
+
+    Corrige bug em que a janela fixa de 36h disparava confirmações com >32h
+    de antecedência (ex: às 21h da segunda para sessão de quarta 09:30).
+
+    Regras:
+    - Limite inferior: agora + 1h (não disparar pra consulta imediata).
+    - Limite superior: fim de amanhã (23:59:59) em horário de Brasília.
+
+    Combinado com a janela 8h-21h do scheduler, isso garante que a
+    confirmação saia no dia anterior (entre 8h e 21h), nunca dois dias antes.
+    Agendamentos last-minute do mesmo dia também são cobertos.
+    """
     from datetime import datetime as _dt, timedelta as _td
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo("America/Sao_Paulo")
     now_br = _dt.now(_TZ).replace(tzinfo=None)  # naive, mesmo formato do scheduled_at
-    # Janela: de 1h até 36h no futuro.
-    # 36h garante que consultas de "amanhã" são sempre capturadas independentemente
-    # do horário atual (ex: consulta às 10:50 com 25h15min de distância não fica fora).
-    # O flag confirmation_sent=0 evita envios duplicados.
     window_start = (now_br + _td(hours=1)).isoformat(timespec="seconds")
-    window_end   = (now_br + _td(hours=36)).isoformat(timespec="seconds")
+    tomorrow = now_br.date() + _td(days=1)
+    window_end = f"{tomorrow.isoformat()}T23:59:59"
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM appointments
