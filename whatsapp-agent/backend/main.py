@@ -1239,6 +1239,7 @@ def master_list_tenants(key: str = ""):
     result = []
     for t in tenants:
         dash_token = t.get("dashboard_token", "")
+        wt = db.ensure_webhook_token(t["id"])
         result.append({
             "id": t["id"],
             "slug": t["slug"],
@@ -1249,6 +1250,7 @@ def master_list_tenants(key: str = ""):
             "session_minutes": t["session_minutes"],
             "whatsapp_provider": t["whatsapp_provider"],
             "dashboard_url": f"{base}/dashboard/{t['slug']}?token={dash_token}" if dash_token else "",
+            "webhook_url": f"{base}/webhook/{t['slug']}/zapi?token={wt}",
         })
     return {"tenants": result}
 
