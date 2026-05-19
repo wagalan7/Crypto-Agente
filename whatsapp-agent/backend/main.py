@@ -1255,6 +1255,46 @@ def master_list_tenants(key: str = ""):
     return {"tenants": result}
 
 
+@app.post("/master/tenants/{slug}/fix-zapi-webhook")
+async def master_fix_zapi_webhook(slug: str, key: str = ""):
+    """Atualiza a URL de webhook no Z-API para a URL atual (com ?token=...).
+
+    Usado quando a validação de token foi adicionada e o Z-API ficou apontando
+    pra URL antiga. Configura os três callbacks (received/delivery/sent) via
+    API REST do Z-API. Requer MASTER_KEY.
+    """
+    _check_master_key(key)
+    tenant = _get_tenant(slug)
+    instance_id = tenant.get("evolution_instance", "")
+    zapi_token = tenant.get("evolution_key", "")
+    client_token = tenant.get("evolution_url", "")  # convenção interna: client_token vive aqui
+    if not instance_id or not zapi_token:
+        raise HTTPException(status_code=400, detail="Tenant sem credenciais Z-API configuradas.")
+    wt = db.ensure_webhook_token(tenant["id"])
+    base = config.BASE_URL
+    webhook_url = f"{base}/webhook/{slug}/zapi?token={wt}"
+
+    import httpx
+    headers = {"Content-Type": "application/json"}
+    if client_token:
+        headers["Client-Token"] = client_token
+
+    endpoints = {
+        "received":      f"https://api.z-api.io/instances/{instance_id}/token/{zapi_token}/update-webhook-received",
+        "received-delivery": f"https://api.z-api.io/instances/{instance_id}/token/{zapi_token}/update-webhook-delivery",
+        "message-status": f"https://api.z-api.io/instances/{instance_id}/token/{zapi_token}/update-webhook-message-status",
+    }
+    results = {}
+    async with httpx.AsyncClient(timeout=15) as cli:
+        for name, url in endpoints.items():
+            try:
+                r = await cli.put(url, json={"value": webhook_url}, headers=headers)
+                results[name] = {"status": r.status_code, "body": r.text[:200]}
+            except Exception as e:
+                results[name] = {"error": str(e)}
+    return {"slug": slug, "webhook_url": webhook_url, "zapi_results": results}
+
+
 @app.get("/master/onboarding-link/{slug}")
 def master_onboarding_link(slug: str, key: str = ""):
     _check_master_key(key)
