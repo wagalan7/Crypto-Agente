@@ -11,9 +11,9 @@ from typing import Optional, List
 from pydantic import BaseModel
 import httpx
 
-from services.binance_service import to_bybit, fetch_funding_rate, fetch_open_interest
+from services.binance_service import to_okx, fetch_funding_rate, fetch_open_interest
 
-BASE = "https://api.bytick.com"   # mirror oficial Bybit (idêntico funcional; melhor pra cloud IPs)
+BASE = "https://www.okx.com"
 
 
 class DerivativesData(BaseModel):
@@ -28,26 +28,22 @@ class DerivativesData(BaseModel):
 
 
 async def _fetch_oi_history(symbol: str) -> Optional[float]:
-    """Busca histórico de OI das últimas 24h (Bybit, intervalo 1h) e retorna variação %."""
+    """Busca histórico de OI nas últimas 24h e retorna variação %."""
     try:
-        bb_symbol = to_bybit(symbol)
+        inst_id = to_okx(symbol)
+        # OKX rubik stats: period 1H, 24 valores
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(
-                f"{BASE}/v5/market/open-interest",
-                params={
-                    "category": "linear",
-                    "symbol": bb_symbol,
-                    "intervalTime": "1h",
-                    "limit": 24,
-                },
+                f"{BASE}/api/v5/rubik/stat/contracts/open-interest-volume",
+                params={"ccy": inst_id.split("-")[0], "period": "1H"},
             )
             r.raise_for_status()
-            rows = r.json().get("result", {}).get("list", [])
-            if len(rows) < 24:
+            data = r.json().get("data", [])
+            if len(data) < 24:
                 return None
-            # Bybit retorna newest-first: rows[0] = mais recente, rows[-1] = ~24h atrás
-            oi_now = float(rows[0].get("openInterest", 0))
-            oi_24h_ago = float(rows[-1].get("openInterest", 0))
+            # Cada item: [ts, oi, vol]. Mais recente último.
+            oi_now = float(data[-1][1])
+            oi_24h_ago = float(data[-24][1])
             if oi_24h_ago == 0:
                 return None
             return ((oi_now - oi_24h_ago) / oi_24h_ago) * 100
