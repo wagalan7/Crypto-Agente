@@ -31,6 +31,7 @@ from services.derivatives_service import analyze_derivatives
 from services.mtf_service import analyze_mtf
 from services.trade_service import get_trades, save_trades
 from services.macro_service import get_btc_dominance, build_macro_context, get_global_market_data
+from services.recommendation_service import get_recommendations
 from models.trade_signal import TradeSignal
 
 
@@ -276,6 +277,18 @@ async def best_timeframe_analysis(symbol: str, with_ai: bool = False):
         "signal": best_sig,
         "all_scores": {r[0]: round(r[2], 3) for r in valid},
     }
+
+
+@app.get("/api/recommendations")
+async def recommendations(top_n: int = 30):
+    """Trade Recommendations — varre top-N perpétuos por volume, escolhe melhor
+    TF por símbolo, classifica em tiers A+/A/B. Cache 90s no service."""
+    try:
+        recs = await get_recommendations(top_n=min(max(top_n, 5), 50))
+        return {"count": len(recs), "recommendations": [r.model_dump() for r in recs]}
+    except Exception as e:
+        logging.error(f"recommendations error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao gerar recomendações: {e}")
 
 
 @app.get("/api/multi-timeframe")

@@ -258,6 +258,24 @@ export interface Ticker {
   ask: number
 }
 
+export type RecommendationTier = 'A+' | 'A' | 'B'
+
+export interface Recommendation {
+  tier: RecommendationTier
+  score: number
+  symbol: string
+  timeframe: string
+  direction: 'long' | 'short'
+  confidence: number
+  risk_reward: number
+  entry: number
+  stop_loss: number
+  tp2: number
+  summary: string
+  warnings: string[]
+  signal: TradeSignal
+}
+
 export interface WatchlistItem {
   symbol: string
   direction?: SignalDirection

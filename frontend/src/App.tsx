@@ -4,6 +4,7 @@ import TickerBar from './components/TickerBar'
 import ChartPanel from './components/ChartPanel'
 import TradeManager from './components/TradeManager'
 import NLPPanel from './components/NLPPanel'
+import RecommendationsPanel from './components/RecommendationsPanel'
 import { api } from './services/api'
 import type { SignalDirection, TradeType } from './types'
 
@@ -178,6 +179,7 @@ async function fetchFreshTickers(): Promise<BinanceTicker[]> {
 export default function App() {
   const [showTradeManager, setShowTradeManager] = useState(false)
   const [showNLP, setShowNLP] = useState(false)
+  const [showRecommendations, setShowRecommendations] = useState(false)
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const [tradeMode, setTradeMode] = useState<TradeMode>('swing')
   const [filter, setFilter] = useState<Filter>('all')
@@ -450,6 +452,14 @@ export default function App() {
         <span className="text-slate-500 text-xs">{assets.length} pares</span>
         <div className="flex items-center gap-1.5">
           <button
+            onClick={() => setShowRecommendations(true)}
+            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-yellow-500/20 to-emerald-500/20 hover:from-yellow-500/30 hover:to-emerald-500/30 border border-yellow-500/40 rounded text-xs font-bold text-yellow-300"
+            title="Trades Recomendados — varredura automática"
+          >
+            <span>✨</span>
+            <span className="hidden sm:block">Recomendados</span>
+          </button>
+          <button
             onClick={() => setShowNLP(v => !v)}
             className={`flex items-center gap-1 px-2 py-1 border rounded text-xs font-semibold transition-colors ${
               showNLP
@@ -638,6 +648,16 @@ export default function App() {
 
       {showNLP && (
         <NLPPanel onClose={() => setShowNLP(false)} />
+      )}
+
+      {showRecommendations && (
+        <RecommendationsPanel
+          onClose={() => setShowRecommendations(false)}
+          onSelectSymbol={(sym) => {
+            setSelectedSymbol(sym)
+            setShowRecommendations(false)
+          }}
+        />
       )}
     </div>
   )

@@ -118,6 +118,38 @@ async def fetch_ticker(symbol: str) -> Dict:
     }
 
 
+_top_volume_cache: Dict[str, tuple] = {}
+TOP_VOLUME_TTL = 120
+
+
+async def fetch_top_volume_symbols(limit: int = 30) -> List[str]:
+    """Retorna os top-N símbolos perp USDT por volume 24h (cache 2 min)."""
+    cache_key = f"top_{limit}"
+    now = time.time()
+    if cache_key in _top_volume_cache:
+        ts, data = _top_volume_cache[cache_key]
+        if now - ts < TOP_VOLUME_TTL:
+            return data
+    client = get_client()
+    r = await client.get(f"{BASE}/api/v5/market/tickers", params={"instType": "SWAP"})
+    r.raise_for_status()
+    rows = r.json().get("data", [])
+    usdt_rows = []
+    for t in rows:
+        inst = t.get("instId", "")
+        if not inst.endswith("-USDT-SWAP"):
+            continue
+        try:
+            vol_usd = float(t.get("volCcy24h", 0))
+        except Exception:
+            vol_usd = 0
+        usdt_rows.append((from_okx(inst), vol_usd))
+    usdt_rows.sort(key=lambda x: x[1], reverse=True)
+    top = [s for s, _ in usdt_rows[:limit]]
+    _top_volume_cache[cache_key] = (now, top)
+    return top
+
+
 async def fetch_multiple_tickers(symbols: List[str]) -> List[Dict]:
     tasks = [fetch_ticker(s) for s in symbols[:50]]
     results = await asyncio.gather(*tasks, return_exceptions=True)

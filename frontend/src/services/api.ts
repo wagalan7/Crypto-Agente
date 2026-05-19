@@ -1,4 +1,4 @@
-import type { TradeSignal, OHLCVCandle, Ticker, WatchlistItem } from '../types'
+import type { TradeSignal, OHLCVCandle, Ticker, WatchlistItem, Recommendation } from '../types'
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
 const BASE = `${BACKEND}/api`
@@ -132,6 +132,9 @@ export const api = {
       market_data: { dxy?: { price: number; change: number }; sp500?: { price: number; change: number }; nasdaq?: { price: number; change: number } }
       context_text: string
     }>('/macro', { symbol }),
+
+  recommendations: (topN = 30) =>
+    get<{ count: number; recommendations: Recommendation[] }>('/recommendations', { top_n: topN }),
 
   bestTimeframe: (symbol: string) =>
     get<{ best_timeframe: string; score: number; signal: TradeSignal; all_scores: Record<string, number> }>(
