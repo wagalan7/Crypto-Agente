@@ -110,15 +110,21 @@
 
   <!-- Agenda -->
   <div id="pane-agenda" class="tab-content active">
-    <div class="flex items-center justify-between mb-4 mt-4 md:mt-0">
+    <div class="flex items-center justify-between mb-3 mt-4 md:mt-0 gap-2">
       <h2 class="text-base font-semibold text-gray-800">Próximas consultas</h2>
       <div class="flex gap-2">
-        <button onclick="loadAgenda()" class="text-sm text-brand">↻ Atualizar</button>
+        <button onclick="loadAgenda()" class="text-sm text-brand whitespace-nowrap">↻ Atualizar</button>
         <button onclick="openNewAppt()"
-          class="text-sm bg-brand text-white px-3 py-1.5 rounded-lg font-medium hover:opacity-90 transition">
-          + Nova consulta
+          class="text-sm bg-brand text-white px-3 py-1.5 rounded-lg font-medium hover:opacity-90 transition whitespace-nowrap">
+          + Nova
         </button>
       </div>
+    </div>
+    <!-- Busca -->
+    <div class="mb-3 relative">
+      <input id="agenda-search" type="text" placeholder="🔎 Buscar paciente..."
+        oninput="filterAgenda()"
+        class="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-brand"/>
     </div>
     <div id="agenda-list" class="space-y-3">
       <div class="text-gray-400 text-sm text-center py-8">Carregando...</div>
@@ -127,11 +133,16 @@
 
   <!-- Slots -->
   <div id="pane-slots" class="tab-content">
-    <div class="flex items-center justify-between mb-4 mt-4 md:mt-0">
-      <h2 class="text-base font-semibold text-gray-800">Horários disponíveis</h2>
-      <button onclick="loadSlots()" class="text-sm text-brand">↻ Atualizar</button>
+    <div class="flex items-center justify-between mb-3 mt-4 md:mt-0">
+      <h2 class="text-base font-semibold text-gray-800">Horários</h2>
+      <button onclick="loadSlots(); loadWeekly()" class="text-sm text-brand">↻ Atualizar</button>
     </div>
-    <div id="slots-list" class="grid grid-cols-2 md:grid-cols-3 gap-3"></div>
+    <p class="text-xs text-gray-500 mb-2">Próximos horários livres</p>
+    <div id="slots-list" class="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6"></div>
+    <p class="text-xs text-gray-500 mb-2">Agenda das próximas semanas</p>
+    <div id="weekly-list" class="space-y-3">
+      <div class="text-gray-400 text-sm text-center py-6">Carregando...</div>
+    </div>
   </div>
 
   <!-- Conversas -->
@@ -612,6 +623,18 @@
   </div>
 </div>
 
+<!-- Modal: Histórico do paciente -->
+<div id="modal-history" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4">
+  <div class="bg-white rounded-2xl w-full max-w-lg p-5 shadow-xl max-h-[85vh] overflow-y-auto">
+    <div class="flex items-center justify-between mb-3 sticky top-0 bg-white">
+      <h3 class="text-base font-semibold text-gray-800">📋 Histórico — <span id="history-title"></span></h3>
+      <button onclick="closeHistory()" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+    </div>
+    <p class="text-xs text-gray-500 mb-3">Sessões agrupadas por mês. "cobr." = sessões que entram na cobrança.</p>
+    <div id="history-body"></div>
+  </div>
+</div>
+
 <!-- Mobile bottom nav -->
 <nav class="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 z-40">
   <div class="grid grid-cols-4">
@@ -716,7 +739,7 @@ function showTab(name) {
   if (mtab) mtab.classList.replace("text-gray-400","text-brand");
 
   if (name==="agenda")    { loadAgenda();    newAppointments=0; updateBadge("agenda",0); }
-  if (name==="slots")     loadSlots();
+  if (name==="slots")     { loadSlots(); loadWeekly(); }
   if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
   if (name==="config")    loadBillingLogs();
 }
@@ -734,18 +757,39 @@ function api(path, opts={}) {
 }
 
 // ── Agenda ────────────────────────────────────────────────────────────────────
+let _agendaCache = [];   // appointments
+let _agendaCounts = {};  // phone -> count
+
+function filterAgenda() {
+  const q = (document.getElementById("agenda-search")?.value || "").trim().toLowerCase();
+  document.querySelectorAll("#agenda-list [data-card]").forEach(card => {
+    const name = (card.getAttribute("data-name") || "").toLowerCase();
+    const phone = (card.getAttribute("data-phone") || "").toLowerCase();
+    card.style.display = (!q || name.includes(q) || phone.includes(q)) ? "" : "none";
+  });
+}
+
 function loadAgenda() {
   const el = document.getElementById("agenda-list");
   // Feedback visual claro do "Atualizar"
   el.innerHTML = '<div class="text-gray-400 text-sm text-center py-8">⏳ Carregando…</div>';
-  api("/dashboard/api/appointments").then(data => {
-    if (!data.appointments?.length) {
+  Promise.all([
+    api("/dashboard/api/appointments"),
+    api("/dashboard/api/session-counts").catch(() => ({counts: {}})),
+  ]).then(([data, scData]) => {
+    _agendaCounts = scData?.counts || {};
+    _agendaCache = data.appointments || [];
+    if (!_agendaCache.length) {
       el.innerHTML = '<div class="text-gray-400 text-sm text-center py-10">Nenhuma consulta agendada.</div>';
       return;
     }
     const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
     const now = new Date();
-    el.innerHTML = data.appointments.map(a => {
+    el.innerHTML = _agendaCache.map(a => {
+      const sessCount = _agendaCounts[a.phone] || 0;
+      const sessTag = sessCount > 0
+        ? `<span class="ml-1 text-xs font-medium text-brand bg-pink-50 px-1.5 py-0.5 rounded-full">(${sessCount})</span>`
+        : '';
       const dt = new Date(a.scheduled_at);
       const label = `${days[dt.getDay()]}, ${String(dt.getDate()).padStart(2,"0")}/${String(dt.getMonth()+1).padStart(2,"0")} às ${String(dt.getHours()).padStart(2,"0")}:${String(dt.getMinutes()).padStart(2,"0")}`;
       const att = a.attendance || 'pending';
@@ -775,12 +819,13 @@ function loadAgenda() {
       const showAttendance = (isPast || isToday) && att === 'pending';
       const showClearAttendance = (att !== 'pending');
 
+      const safeName = (a.patient_name || '').replace(/"/g,'&quot;');
       return `
-        <div class="bg-white rounded-xl ${borderCls} p-4">
+        <div class="bg-white rounded-xl ${borderCls} p-4" data-card data-name="${safeName}" data-phone="${a.phone || ''}">
           <!-- Cabeçalho: nome + data + status -->
           <div class="flex items-start justify-between gap-3 mb-3">
             <div class="min-w-0 flex-1">
-              <p class="font-semibold text-gray-800 truncate">${a.patient_name}</p>
+              <p class="font-semibold text-gray-800 truncate">${a.patient_name}${sessTag}</p>
               <p class="text-sm text-gray-500 mt-0.5">${label}</p>
               <div class="mt-1.5">${statusBadge}</div>
             </div>
@@ -794,15 +839,65 @@ function loadAgenda() {
               <button onclick="setAttendance(${a.id}, 'missed_with_notice')" class="text-xs bg-orange-50 text-orange-700 px-3 py-2 rounded-full font-medium active:scale-95 transition border border-orange-200">📞 Avisou</button>
             ` : ''}
             ${showClearAttendance ? `<button onclick="setAttendance(${a.id}, 'pending')" class="text-xs bg-gray-100 text-gray-600 px-3 py-2 rounded-full font-medium active:scale-95 transition">↺ Desfazer</button>` : ''}
+            <button onclick='openHistory(${JSON.stringify(a.phone)}, ${JSON.stringify(a.patient_name)})' class="text-xs bg-indigo-100 text-indigo-700 px-3 py-2 rounded-full font-medium active:scale-95 transition">📋 Histórico</button>
             <button onclick='openRename(${a.id}, ${JSON.stringify(a.patient_name)})' class="text-xs bg-purple-100 text-purple-700 px-3 py-2 rounded-full font-medium active:scale-95 transition">✏️ Editar nome</button>
             <button onclick="openReschedule(${a.id}, '${a.scheduled_at}')" class="text-xs bg-blue-100 text-blue-700 px-3 py-2 rounded-full font-medium active:scale-95 transition">🔄 Reagendar</button>
             <button onclick="cancelAppt(${a.id})" class="text-xs bg-red-100 text-red-600 px-3 py-2 rounded-full font-medium active:scale-95 transition">🗑 Cancelar</button>
           </div>
         </div>`;
     }).join("");
+    filterAgenda();
   }).catch(e => {
     el.innerHTML = `<div class="text-red-500 text-sm text-center py-8">Falha ao carregar: ${e.message}</div>`;
   });
+}
+
+// Modal histórico do paciente
+function openHistory(phone, name) {
+  const modal = document.getElementById('modal-history');
+  const body = document.getElementById('history-body');
+  document.getElementById('history-title').textContent = name || phone;
+  body.innerHTML = '<div class="text-gray-400 text-sm text-center py-6">⏳ Carregando…</div>';
+  modal.classList.remove('hidden');
+  api(`/dashboard/api/patient-history/${encodeURIComponent(phone)}`).then(data => {
+    if (!data.months?.length) {
+      body.innerHTML = '<div class="text-gray-400 text-sm text-center py-6">Sem histórico.</div>';
+      return;
+    }
+    const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+    body.innerHTML = data.months.map(g => {
+      const [y,m] = g.month.split('-');
+      const monthNames = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+      const title = `${monthNames[parseInt(m)-1] || m}/${y}`;
+      const items = g.items.map(a => {
+        const dt = new Date(a.scheduled_at);
+        const label = `${days[dt.getDay()]} ${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')} ${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}`;
+        const att = a.attendance || 'pending';
+        let badge = '';
+        if (a.cancelled) badge = '<span class="text-xs text-gray-500">cancelada</span>';
+        else if (att === 'attended') badge = '<span class="text-xs text-green-700">✓ compareceu</span>';
+        else if (att === 'missed_no_notice') badge = '<span class="text-xs text-red-700">⚠️ faltou (cobra)</span>';
+        else if (att === 'missed_with_notice') badge = '<span class="text-xs text-orange-700">📞 avisou (não cobra)</span>';
+        else if (a.confirmed) badge = '<span class="text-xs text-green-600">confirmada</span>';
+        else badge = '<span class="text-xs text-yellow-700">pendente</span>';
+        return `<div class="flex justify-between py-1.5 border-b border-gray-50 last:border-0">
+          <span class="text-sm text-gray-700">${label}</span>${badge}</div>`;
+      }).join('');
+      return `<div class="mb-4">
+        <div class="flex items-center justify-between mb-1.5">
+          <p class="font-semibold text-sm text-gray-800">${title}</p>
+          <span class="text-xs bg-pink-50 text-brand px-2 py-0.5 rounded-full font-medium">${g.billable} cobr.</span>
+        </div>
+        ${items}
+      </div>`;
+    }).join("");
+  }).catch(e => {
+    body.innerHTML = `<div class="text-red-500 text-sm text-center py-4">Erro: ${e.message}</div>`;
+  });
+}
+
+function closeHistory() {
+  document.getElementById('modal-history').classList.add('hidden');
 }
 
 function setAttendance(id, status) {
@@ -837,6 +932,73 @@ function loadSlots() {
     el.innerHTML = data.slots.map(s =>
       `<div class="bg-white border border-gray-200 rounded-xl px-3 py-3 text-sm text-gray-700 text-center">${s}</div>`
     ).join("");
+  });
+}
+
+// Visão semanal: agrupa próximas consultas por semana e por dia
+function loadWeekly() {
+  const el = document.getElementById("weekly-list");
+  if (!el) return;
+  el.innerHTML = '<div class="text-gray-400 text-sm text-center py-6">⏳ Carregando…</div>';
+  api("/dashboard/api/appointments").then(data => {
+    const appts = (data.appointments || []).filter(a => !a.cancelled);
+    if (!appts.length) {
+      el.innerHTML = '<div class="text-gray-400 text-sm text-center py-6">Nenhuma consulta agendada.</div>';
+      return;
+    }
+    const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+    const months = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+    // Agrupa por semana ISO (segunda como início)
+    function weekKey(d) {
+      const x = new Date(d); x.setHours(0,0,0,0);
+      const day = (x.getDay() + 6) % 7;  // 0=seg
+      x.setDate(x.getDate() - day);
+      return x.toISOString().slice(0,10);
+    }
+    const groups = {};
+    appts.forEach(a => {
+      const dt = new Date(a.scheduled_at);
+      const wk = weekKey(dt);
+      const dayKey = dt.toISOString().slice(0,10);
+      groups[wk] = groups[wk] || {};
+      groups[wk][dayKey] = groups[wk][dayKey] || [];
+      groups[wk][dayKey].push(a);
+    });
+    const sortedWeeks = Object.keys(groups).sort();
+    el.innerHTML = sortedWeeks.map(wk => {
+      const wkDate = new Date(wk + "T00:00:00");
+      const wkEnd = new Date(wkDate); wkEnd.setDate(wkEnd.getDate() + 6);
+      const wkLabel = `${String(wkDate.getDate()).padStart(2,'0')}/${months[wkDate.getMonth()]} — ${String(wkEnd.getDate()).padStart(2,'0')}/${months[wkEnd.getMonth()]}`;
+      const daysHtml = Object.keys(groups[wk]).sort().map(dayKey => {
+        const d = new Date(dayKey + "T00:00:00");
+        const list = groups[wk][dayKey].sort((a,b) => a.scheduled_at.localeCompare(b.scheduled_at));
+        const items = list.map(a => {
+          const dt = new Date(a.scheduled_at);
+          const hm = `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}`;
+          const att = a.attendance || 'pending';
+          let dot = 'bg-gray-300';
+          if (att === 'attended') dot = 'bg-green-500';
+          else if (att === 'missed_no_notice') dot = 'bg-red-500';
+          else if (att === 'missed_with_notice') dot = 'bg-orange-400';
+          else if (a.confirmed) dot = 'bg-green-300';
+          return `<div class="flex items-center gap-2 text-sm py-1">
+            <span class="inline-block w-2 h-2 rounded-full ${dot}"></span>
+            <span class="font-mono text-gray-500 w-12">${hm}</span>
+            <span class="text-gray-800 truncate">${a.patient_name || a.phone}</span>
+          </div>`;
+        }).join('');
+        return `<div class="border-l-2 border-pink-100 pl-3 mb-2">
+          <p class="text-xs font-medium text-brand">${days[d.getDay()]}, ${String(d.getDate()).padStart(2,'0')}/${months[d.getMonth()]}</p>
+          ${items}
+        </div>`;
+      }).join('');
+      return `<div class="bg-white border border-gray-200 rounded-xl p-4">
+        <p class="text-sm font-semibold text-gray-800 mb-2">Semana: ${wkLabel}</p>
+        ${daysHtml}
+      </div>`;
+    }).join("");
+  }).catch(e => {
+    el.innerHTML = `<div class="text-red-500 text-sm text-center py-4">Erro: ${e.message}</div>`;
   });
 }
 

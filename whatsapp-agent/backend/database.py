@@ -743,6 +743,36 @@ def get_valid_sessions_for_month(tenant_id: int, phone: str, month_start: str, m
     return [dict(r) for r in rows]
 
 
+def get_session_counts_by_month(tenant_id: int, month_start: str, month_end: str) -> dict[str, int]:
+    """Quantidade de sessões 'efetivas' por telefone no mês.
+
+    Conta: attended + missed_no_notice + pending (ainda não marcadas).
+    Exclui: missed_with_notice + cancelled.
+    """
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT phone, COUNT(*) AS n FROM appointments
+            WHERE tenant_id = ?
+              AND scheduled_at >= ? AND scheduled_at < ?
+              AND cancelled = 0
+              AND COALESCE(attendance, 'pending') != 'missed_with_notice'
+            GROUP BY phone
+        """, (tenant_id, month_start, month_end)).fetchall()
+    return {r["phone"]: r["n"] for r in rows}
+
+
+def get_full_patient_history(tenant_id: int, phone: str) -> list[dict]:
+    """Histórico completo de um paciente (todas as consultas, ordem decrescente)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM appointments
+               WHERE tenant_id = ? AND phone = ?
+               ORDER BY scheduled_at DESC""",
+            (tenant_id, phone),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ── Billing logs ───────────────────────────────────────────────────────────────
 
 def billing_already_sent(tenant_id: int, phone: str, month: str) -> bool:

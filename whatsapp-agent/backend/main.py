@@ -868,6 +868,50 @@ def dash_slots(request: Request):
     return {"slots": cal.format_slots(slots)}
 
 
+@app.get("/dashboard/api/session-counts")
+def dash_session_counts(request: Request, month: str | None = None):
+    """Retorna contagem de sessões 'efetivas' do mês por telefone.
+
+    month no formato 'YYYY-MM'. Se omitido, usa o mês corrente em São Paulo.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _Zi
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    now = _dt.now(_Zi("America/Sao_Paulo")).replace(tzinfo=None)
+    if month:
+        try:
+            y, m = month.split("-")
+            y, m = int(y), int(m)
+        except Exception:
+            y, m = now.year, now.month
+    else:
+        y, m = now.year, now.month
+    start = _dt(y, m, 1).isoformat()
+    end = (_dt(y + 1, 1, 1) if m == 12 else _dt(y, m + 1, 1)).isoformat()
+    counts = db.get_session_counts_by_month(tenant["id"], start, end)
+    return {"month": f"{y:04d}-{m:02d}", "counts": counts}
+
+
+@app.get("/dashboard/api/patient-history/{phone}")
+def dash_patient_history(phone: str, request: Request):
+    """Histórico completo de um paciente, agrupado por mês."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    appts = db.get_full_patient_history(tenant["id"], phone)
+    # Agrupa por YYYY-MM
+    groups: dict[str, dict] = {}
+    for a in appts:
+        sched = a.get("scheduled_at") or ""
+        key = sched[:7] if len(sched) >= 7 else "sem-data"
+        g = groups.setdefault(key, {"month": key, "items": [], "billable": 0})
+        g["items"].append(a)
+        if not a.get("cancelled") and (a.get("attendance") or "pending") != "missed_with_notice":
+            g["billable"] += 1
+    out = sorted(groups.values(), key=lambda g: g["month"], reverse=True)
+    return {"phone": phone, "months": out}
+
+
 @app.get("/dashboard/api/patients")
 def dash_patients(request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
