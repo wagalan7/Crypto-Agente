@@ -403,16 +403,25 @@ def clear_conversation(tenant_id: int, phone: str):
 def get_appointments_by_phone(tenant_id: int, phone: str, now_iso: str | None = None) -> list[dict]:
     # Appointments are stored in Brasília time (naive). Use now_iso passed from caller
     # to avoid comparing against SQLite's datetime('now') which is UTC.
+    # IMPORTANTE: consideramos "sessão atual" qualquer agendamento iniciado nos
+    # últimos 90 minutos — assim o agente continua reconhecendo a consulta de hoje
+    # mesmo se o paciente mandar mensagem 20-30min depois do horário marcado.
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
     if now_iso is None:
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        now_iso = datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None).isoformat()
+        now_dt = datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None)
+    else:
+        try:
+            now_dt = datetime.fromisoformat(now_iso)
+        except Exception:
+            now_dt = datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None)
+    threshold = (now_dt - timedelta(minutes=90)).isoformat()
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM appointments
                WHERE tenant_id = ? AND phone = ? AND scheduled_at >= ?
                ORDER BY scheduled_at""",
-            (tenant_id, phone, now_iso),
+            (tenant_id, phone, threshold),
         ).fetchall()
     return [dict(r) for r in rows]
 
