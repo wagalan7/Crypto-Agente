@@ -120,6 +120,26 @@
         </button>
       </div>
     </div>
+    <!-- Resumo de hoje -->
+    <div id="agenda-summary" class="grid grid-cols-4 gap-2 mb-3 text-center hidden">
+      <div class="bg-white rounded-xl border border-gray-100 py-2">
+        <p id="sum-total" class="text-base font-bold text-gray-800">–</p>
+        <p class="text-[10px] text-gray-400">hoje</p>
+      </div>
+      <div class="bg-green-50 rounded-xl border border-green-100 py-2">
+        <p id="sum-attended" class="text-base font-bold text-green-700">–</p>
+        <p class="text-[10px] text-green-600">present.</p>
+      </div>
+      <div class="bg-red-50 rounded-xl border border-red-100 py-2">
+        <p id="sum-missed" class="text-base font-bold text-red-600">–</p>
+        <p class="text-[10px] text-red-500">faltou</p>
+      </div>
+      <div class="bg-yellow-50 rounded-xl border border-yellow-100 py-2">
+        <p id="sum-pending" class="text-base font-bold text-yellow-700">–</p>
+        <p class="text-[10px] text-yellow-600">pendente</p>
+      </div>
+    </div>
+
     <!-- Busca -->
     <div class="mb-3 relative">
       <input id="agenda-search" type="text" placeholder="🔎 Buscar paciente..."
@@ -883,6 +903,22 @@ function loadAgenda() {
     }
     const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
     const now = new Date();
+    // Resumo de hoje
+    const todayStr = now.toDateString();
+    const todayAppts = _agendaCache.filter(a => new Date(a.scheduled_at).toDateString() === todayStr);
+    if (todayAppts.length) {
+      const att = todayAppts.filter(a => (a.attendance||'pending') === 'attended').length;
+      const missed = todayAppts.filter(a => (a.attendance||'pending').startsWith('missed')).length;
+      const pend = todayAppts.filter(a => (a.attendance||'pending') === 'pending').length;
+      document.getElementById('sum-total').textContent = todayAppts.length;
+      document.getElementById('sum-attended').textContent = att;
+      document.getElementById('sum-missed').textContent = missed;
+      document.getElementById('sum-pending').textContent = pend;
+      document.getElementById('agenda-summary').classList.remove('hidden');
+    } else {
+      document.getElementById('agenda-summary').classList.add('hidden');
+    }
+
     el.innerHTML = _agendaCache.map(a => {
       const sessCount = _agendaCounts[a.phone] || 0;
       const sessTag = sessCount > 0

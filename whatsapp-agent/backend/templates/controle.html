@@ -9,6 +9,8 @@
   <style>
     body { -webkit-tap-highlight-color: transparent; }
     button:active { transform: scale(0.96); }
+    .patient-card { transition: opacity .15s; }
+    .patient-card.hidden-search { display: none; }
   </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -63,6 +65,37 @@
 
   <div class="px-4 py-4 max-w-lg mx-auto">
 
+    <!-- Stats rápidos -->
+    {% if patients %}
+    {% set total = patients | length %}
+    {% set n_pausados = patients | selectattr('phone', 'in', paused) | list | length %}
+    {% set n_sem_nome = patients | rejectattr('patient_name') | list | length %}
+    <div class="grid grid-cols-3 gap-2 mb-4 text-center">
+      <div class="bg-white rounded-xl border border-gray-100 py-2.5">
+        <p class="text-lg font-bold text-gray-800">{{ total }}</p>
+        <p class="text-[10px] text-gray-400">pacientes</p>
+      </div>
+      <div class="bg-yellow-50 rounded-xl border border-yellow-100 py-2.5">
+        <p class="text-lg font-bold text-yellow-700">{{ n_pausados }}</p>
+        <p class="text-[10px] text-yellow-600">pausados</p>
+      </div>
+      <div class="bg-pink-50 rounded-xl border border-pink-100 py-2.5">
+        <p class="text-lg font-bold text-brand">{{ n_sem_nome }}</p>
+        <p class="text-[10px] text-brand">sem nome</p>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Busca -->
+    {% if patients %}
+    <div class="mb-3">
+      <input id="ctrl-search" type="text" placeholder="🔎 Buscar por nome ou número..."
+        oninput="filterControle()"
+        class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-brand bg-white"/>
+    </div>
+    <p id="ctrl-no-results" class="hidden text-center text-sm text-gray-400 py-4">Nenhum resultado.</p>
+    {% endif %}
+
     <!-- Legenda -->
     <div class="flex gap-4 mb-3 text-xs text-gray-500">
       <span class="flex items-center gap-1.5">
@@ -109,8 +142,9 @@
       {% if p.phone and p.phone.startswith('55') and p.phone|length >= 12 and not is_group %}
         {% set phone_pretty = '+55 (' ~ p.phone[2:4] ~ ') ' ~ p.phone[4:-4] ~ '-' ~ p.phone[-4:] %}
       {% endif %}
-      <div class="bg-white rounded-2xl border p-4
-        {{ 'border-yellow-200' if is_paused else 'border-gray-100' }}">
+      <div class="patient-card bg-white rounded-2xl border p-4
+        {{ 'border-yellow-200' if is_paused else 'border-gray-100' }}"
+        data-search="{{ (p.patient_name or '') | lower }} {{ p.phone or '' }}">
         <div class="flex items-center gap-3">
 
         <!-- Avatar -->
@@ -204,5 +238,20 @@
 
   </div>
 
+<script>
+function filterControle() {
+  const q = (document.getElementById('ctrl-search')?.value || '').trim().toLowerCase();
+  const cards = document.querySelectorAll('.patient-card');
+  let visible = 0;
+  cards.forEach(card => {
+    const text = (card.getAttribute('data-search') || '').toLowerCase();
+    const match = !q || text.includes(q);
+    card.classList.toggle('hidden-search', !match);
+    if (match) visible++;
+  });
+  const noRes = document.getElementById('ctrl-no-results');
+  if (noRes) noRes.classList.toggle('hidden', visible > 0);
+}
+</script>
 </body>
 </html>
