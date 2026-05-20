@@ -103,6 +103,12 @@
     {% for p in patients %}
       {% set is_paused = p.phone in paused %}
       {% set sem_nome = not p.patient_name %}
+      {% set is_group = p.phone and ('@g.us' in p.phone or p.phone.startswith('120363')) %}
+      {# Formatação BR amigável: 55 (11) 99999-9999 #}
+      {% set phone_pretty = p.phone %}
+      {% if p.phone and p.phone.startswith('55') and p.phone|length >= 12 and not is_group %}
+        {% set phone_pretty = '+55 (' ~ p.phone[2:4] ~ ') ' ~ p.phone[4:-4] ~ '-' ~ p.phone[-4:] %}
+      {% endif %}
       <div class="bg-white rounded-2xl border p-4
         {{ 'border-yellow-200' if is_paused else 'border-gray-100' }}">
         <div class="flex items-center gap-3">
@@ -115,20 +121,28 @@
 
         <!-- Nome + status -->
         <div class="flex-1 min-w-0">
-          <div class="flex items-center gap-1.5">
-            <p class="font-medium text-gray-900 text-sm truncate">{{ p.patient_name or p.phone }}</p>
-            {% if sem_nome %}
-            <button type="button"
-              onclick="document.getElementById('rename-{{ loop.index }}').classList.toggle('hidden')"
-              class="text-[10px] text-brand font-semibold border border-brand px-1.5 py-0.5 rounded-full whitespace-nowrap">
-              + Nome
-            </button>
-            {% endif %}
-          </div>
-          <p class="text-xs {{ 'text-yellow-600 font-medium' if is_paused else 'text-gray-400' }}">
-            {% if is_paused %}⏸ Pausado{% else %}🤖 Agente ativo{% endif %}
-            {% if not sem_nome %}<span class="text-gray-300"> · {{ p.phone }}</span>{% endif %}
-          </p>
+          {% if sem_nome %}
+            <!-- Sem nome: mostra número completo bem visível -->
+            <p class="font-mono text-gray-900 text-[13px] break-all leading-snug">
+              {{ phone_pretty }}{% if is_group %} <span class="text-[10px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full font-sans">grupo</span>{% endif %}
+            </p>
+            <div class="flex items-center gap-1.5 mt-1">
+              <button type="button"
+                onclick="document.getElementById('rename-{{ loop.index }}').classList.remove('hidden'); this.style.display='none';"
+                class="text-[10px] text-brand font-semibold border border-brand px-2 py-0.5 rounded-full whitespace-nowrap">
+                + Nome
+              </button>
+              <span class="text-[11px] {{ 'text-yellow-600 font-medium' if is_paused else 'text-gray-400' }}">
+                {% if is_paused %}⏸ Pausado{% else %}🤖 Ativo{% endif %}
+              </span>
+            </div>
+          {% else %}
+            <p class="font-medium text-gray-900 text-sm truncate">{{ p.patient_name }}</p>
+            <p class="text-xs {{ 'text-yellow-600 font-medium' if is_paused else 'text-gray-400' }}">
+              {% if is_paused %}⏸ Pausado{% else %}🤖 Agente ativo{% endif %}
+              <span class="text-gray-300"> · {{ phone_pretty }}</span>
+            </p>
+          {% endif %}
         </div>
 
         <!-- Botões -->
