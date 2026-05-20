@@ -125,6 +125,7 @@ def handle_webhook(payload: bytes, sig_header: str) -> dict:
                     f"[stripe] Tenant {tenant['slug']} ativado — sub={subscription_id} "
                     f"expira={expires_at}"
                 )
+                _send_activation_email(tenant, expires_at)
 
     # ── Assinatura renovada (cobrança recorrente bem-sucedida) ─────────────────
     elif event_type == "customer.subscription.updated":
@@ -191,6 +192,28 @@ def _plan_info(tenant: dict) -> dict:
     """Retorna metadados do plano atual do tenant."""
     plan_key = tenant.get("plan") or "mensal"
     return PLANS.get(plan_key, PLANS["mensal"])
+
+
+def _send_activation_email(tenant: dict, expires_at: str | None = None):
+    """Envia e-mail de ativação após pagamento confirmado."""
+    email = tenant.get("email", "")
+    if not email:
+        return
+    try:
+        import email_service as email_svc
+        plan = _plan_info(tenant)
+        name = tenant.get("full_name") or tenant.get("psychologist_name") or tenant.get("name") or ""
+        email_svc.send_activation_email(
+            email=email,
+            name=name,
+            slug=tenant["slug"],
+            dashboard_token=tenant.get("dashboard_token", ""),
+            setup_token=tenant.get("setup_token", ""),
+            plan_label=plan["label"],
+            expires_at=expires_at,
+        )
+    except Exception as e:
+        logger.warning(f"[stripe] Falha ao enviar e-mail de ativação para {email}: {e}")
 
 
 def _notify_suspended(tenant: dict):

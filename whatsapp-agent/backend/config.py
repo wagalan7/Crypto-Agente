@@ -56,3 +56,12 @@ BACKUP_S3_ACCESS_KEY_ID     = os.getenv("BACKUP_S3_ACCESS_KEY_ID", "")
 BACKUP_S3_SECRET_ACCESS_KEY = os.getenv("BACKUP_S3_SECRET_ACCESS_KEY", "")
 BACKUP_S3_REGION            = os.getenv("BACKUP_S3_REGION", "auto")
 BACKUP_RETENTION_DAYS       = int(os.getenv("BACKUP_RETENTION_DAYS", "30"))
+
+# ── E-mail transacional (SMTP) ────────────────────────────────────────────────
+# Deixe SMTP_HOST em branco para desabilitar o envio de e-mails.
+SMTP_HOST     = os.getenv("SMTP_HOST", "")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM     = os.getenv("SMTP_FROM", SMTP_USER)   # "Nome <email>" ou só email
+SMTP_USE_SSL  = os.getenv("SMTP_USE_SSL", "0")      # "1" para porta 465 (SSL direto)

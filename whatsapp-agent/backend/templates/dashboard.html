@@ -389,6 +389,49 @@
       <div id="cfg-msg" class="text-sm text-center hidden text-green-600"></div>
     </div>
 
+    <!-- WhatsApp Z-API -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-xl">📲</span>
+        <h3 class="font-semibold text-gray-800 text-sm">WhatsApp (Z-API)</h3>
+      </div>
+      <p class="text-xs text-gray-500 mb-4">
+        Configure as credenciais do Z-API para conectar o agente ao seu número de WhatsApp.
+        Obtenha esses dados no painel <a href="https://app.z-api.io" target="_blank" class="text-brand underline">app.z-api.io</a>.
+      </p>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Instance ID</label>
+          <input id="cfg-zapi-instance" type="text" placeholder="Ex: 3B2C1-XXXXXXX"
+            value="{{ tenant.evolution_instance or '' }}"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand font-mono"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Token</label>
+          <input id="cfg-zapi-token" type="text" placeholder="Token da instância"
+            value="{{ tenant.evolution_key or '' }}"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand font-mono"/>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">Client Token</label>
+          <input id="cfg-zapi-client" type="text" placeholder="Client Token (Security Token)"
+            value="{{ tenant.evolution_url or '' }}"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand font-mono"/>
+        </div>
+      </div>
+      <div class="mt-3 p-3 bg-blue-50 border border-blue-100 rounded-xl text-xs text-blue-700">
+        <strong>Onde encontrar:</strong> No painel Z-API, abra sua instância →
+        <em>Detalhes da Instância</em>. O <strong>Instance ID</strong> e o <strong>Token</strong>
+        estão listados. O <strong>Client Token (Security Token)</strong> aparece nas configurações
+        de segurança da conta.
+      </div>
+      <button onclick="saveZapiConfig(this)"
+        class="w-full mt-4 bg-brand text-white py-2.5 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        💾 Salvar configuração do WhatsApp
+      </button>
+      <div id="cfg-zapi-msg" class="hidden text-sm text-center mt-2"></div>
+    </div>
+
     <!-- Mensagens personalizáveis -->
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
       <div class="flex items-center gap-2 mb-1">
@@ -2011,6 +2054,39 @@ function exportBilling() {
       showToast('CSV baixado', 'success');
     })
     .catch(e => showToast('Erro ao exportar: ' + e.message, 'error'));
+}
+
+// ── Salvar configuração Z-API ──────────────────────────────────────────────────
+function saveZapiConfig(btn) {
+  const fb = document.getElementById('cfg-zapi-msg');
+  fb.classList.add('hidden');
+  const payload = {
+    evolution_instance:  document.getElementById('cfg-zapi-instance').value.trim(),
+    evolution_key:       document.getElementById('cfg-zapi-token').value.trim(),
+    evolution_url:       document.getElementById('cfg-zapi-client').value.trim(),
+  };
+  if (!payload.evolution_instance || !payload.evolution_key) {
+    fb.className = 'text-sm text-center text-red-600 mt-2';
+    fb.textContent = 'Instance ID e Token são obrigatórios.';
+    fb.classList.remove('hidden');
+    return;
+  }
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ Salvando…';
+  // Also set provider to zapi
+  api('/dashboard/api/config', { method: 'PATCH', body: JSON.stringify(payload) })
+    .then(() => {
+      fb.className = 'text-sm text-center text-green-600 mt-2';
+      fb.textContent = '✓ WhatsApp configurado com sucesso.';
+      fb.classList.remove('hidden');
+      showToast('WhatsApp Z-API salvo', 'success');
+    })
+    .catch(e => {
+      fb.className = 'text-sm text-center text-red-600 mt-2';
+      fb.textContent = 'Erro: ' + e.message;
+      fb.classList.remove('hidden');
+    })
+    .finally(() => { btn.disabled = false; btn.textContent = orig; });
 }
 
 // ── Salvar templates de mensagem ───────────────────────────────────────────────

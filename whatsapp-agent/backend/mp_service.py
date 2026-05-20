@@ -114,6 +114,7 @@ def handle_webhook(data: dict) -> dict:
     if status == "authorized":
         db.update_tenant(tenant["slug"], status="active", mp_subscription_id=sub_id)
         logger.info(f"[mp] Tenant {tenant['slug']} ativado via MP")
+        _send_activation_email(tenant)
     elif status in ("cancelled", "paused"):
         if db.is_tenant_exempt(tenant):
             logger.info(f"[mp] Tenant {tenant['slug']} isento (free_until) — suspensão ignorada")
@@ -122,6 +123,28 @@ def handle_webhook(data: dict) -> dict:
             logger.info(f"[mp] Tenant {tenant['slug']} suspenso via MP (status={status})")
 
     return {"received": True}
+
+
+def _send_activation_email(tenant: dict):
+    """Envia e-mail de ativação após pagamento MP confirmado."""
+    email = tenant.get("email", "")
+    if not email:
+        return
+    try:
+        import email_service as email_svc
+        name = tenant.get("full_name") or tenant.get("psychologist_name") or tenant.get("name") or ""
+        plan_key = tenant.get("plan") or "mensal"
+        plan_label = MP_PLANS.get(plan_key, MP_PLANS["mensal"])["label"]
+        email_svc.send_activation_email(
+            email=email,
+            name=name,
+            slug=tenant["slug"],
+            dashboard_token=tenant.get("dashboard_token", ""),
+            setup_token=tenant.get("setup_token", ""),
+            plan_label=plan_label,
+        )
+    except Exception as e:
+        logger.warning(f"[mp] Falha ao enviar e-mail de ativação para {email}: {e}")
 
 
 def _get_tenant_by_mp_sub(sub_id: str) -> dict | None:

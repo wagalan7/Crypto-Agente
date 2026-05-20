@@ -26,6 +26,7 @@ import google_calendar_service as gcal
 import stripe_service as stripe_svc
 import mp_service as mp_svc
 import caldav_service as caldav_svc
+import email_service as email_svc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -552,6 +553,10 @@ class TenantUpdate(BaseModel):
     caldav_url: Optional[str] = None
     caldav_username: Optional[str] = None
     caldav_password: Optional[str] = None
+    # Z-API / WhatsApp
+    evolution_instance: Optional[str] = None
+    evolution_key: Optional[str] = None
+    evolution_url: Optional[str] = None
 
 
 @app.patch("/admin/tenants/{slug}")
@@ -1185,6 +1190,9 @@ def dash_config(request: Request, body: TenantUpdate):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
     fields = body.model_dump(exclude_none=True)
+    # Auto-set provider to zapi when Z-API credentials are provided
+    if fields.get("evolution_instance") and fields.get("evolution_key"):
+        fields["whatsapp_provider"] = "zapi"
     if fields:
         db.update_tenant(tenant["slug"], **fields)
     return {"status": "updated"}
@@ -1452,6 +1460,17 @@ def onboarding_create(request: Request, body: OnboardingCreate):
 
     db.audit_log("tenant_created", actor=body.email, target=slug, ip=_client_ip(request),
                  details=f"name={body.name}, plan=pending_payment")
+
+    # Enviar e-mail de boas-vindas com link de pagamento
+    try:
+        email_svc.send_welcome_email(
+            email=body.email,
+            name=body.full_name or body.psychologist_name or body.name,
+            setup_token=setup_token,
+        )
+    except Exception as _e:
+        logger.warning(f"[onboarding] Falha ao enviar e-mail de boas-vindas: {_e}")
+
     return {"slug": slug, "setup_token": setup_token}
 
 
@@ -1477,6 +1496,54 @@ def onboarding_info(setup_token: str):
         "webhook_url": f"{base}/webhook/{slug}/zapi?token={wt}",
         "webhook_token": wt,
     }
+
+
+# ── Recuperação de acesso ──────────────────────────────────────────────────────
+
+class LinkRecoveryBody(BaseModel):
+    email: str
+
+
+@app.get("/recuperar-acesso", response_class=HTMLResponse)
+def recuperar_acesso_page(request: Request):
+    return templates.TemplateResponse("recuperar_acesso.html", {"request": request})
+
+
+@app.post("/onboarding/recuperar-acesso")
+def recuperar_acesso(body: LinkRecoveryBody, request: Request):
+    """Envia o link do painel para o e-mail cadastrado."""
+    email = (body.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="E-mail inválido.")
+
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM tenants WHERE lower(email) = ? AND status = 'active'",
+            (email,)
+        ).fetchone()
+
+    if not row:
+        # Resposta genérica para não vazar informação
+        return {"status": "ok", "message": "Se o e-mail estiver cadastrado, você receberá as instruções."}
+
+    tenant = dict(row)
+    slug = tenant["slug"]
+    dash_token = tenant.get("dashboard_token", "")
+    name = tenant.get("full_name") or tenant.get("psychologist_name") or tenant.get("name") or ""
+
+    if dash_token:
+        try:
+            email_svc.send_link_recovery_email(
+                email=tenant["email"],
+                name=name,
+                slug=slug,
+                dashboard_token=dash_token,
+            )
+        except Exception as _e:
+            logger.warning(f"[recuperar-acesso] Falha ao enviar e-mail: {_e}")
+
+    db.audit_log("link_recovery", actor=email, target=slug, ip=_client_ip(request))
+    return {"status": "ok", "message": "Se o e-mail estiver cadastrado, você receberá as instruções."}
 
 
 # ── Painel Master ──────────────────────────────────────────────────────────────
