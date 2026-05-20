@@ -25,6 +25,12 @@ def _blocked_hours(tenant: dict) -> list[int]:
         return _DEFAULT_BLOCKED_HOURS
 
 
+def _blocked_dates(tenant: dict) -> set[str]:
+    """Datas bloqueadas (feriados/férias) — set de YYYY-MM-DD."""
+    raw = tenant.get("blocked_dates", "") or ""
+    return {d.strip() for d in raw.split(",") if d.strip()}
+
+
 def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> list[datetime]:
     tenant_id = tenant["id"]
     start_h = tenant["working_hours_start"]
@@ -32,6 +38,7 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
     duration = tenant["session_minutes"]
     working_days = _working_days(tenant)
     blocked_hours = _blocked_hours(tenant)
+    blocked_dates = _blocked_dates(tenant)
 
     now = datetime.now(_TZ).replace(tzinfo=None)  # naive, horário de Brasília
     check = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -58,6 +65,7 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
             check.weekday() in working_days
             and start_h <= check.hour < end_h
             and check.hour not in blocked_hours
+            and check.strftime("%Y-%m-%d") not in blocked_dates
             and not _conflicts(check)
         ):
             slots.append(check)

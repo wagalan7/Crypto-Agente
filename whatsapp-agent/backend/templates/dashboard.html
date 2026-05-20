@@ -195,6 +195,22 @@
           <div id="slot-blocked-grid" class="grid grid-cols-6 gap-1.5"></div>
         </div>
 
+        <!-- Datas bloqueadas (feriados/férias) -->
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">Datas bloqueadas (feriados / férias)</label>
+          <div class="flex gap-2 mb-2">
+            <input id="slot-block-date" type="date"
+              class="flex-1 border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-brand"/>
+            <button type="button" onclick="addBlockedDate()"
+              class="bg-pink-50 text-brand border border-brand text-sm font-semibold px-3 py-2 rounded-lg active:scale-95 transition">
+              + Bloquear
+            </button>
+          </div>
+          <input type="hidden" id="slot-blocked-dates-raw" value="{{ tenant.blocked_dates or '' }}"/>
+          <div id="slot-blocked-dates-list" class="flex flex-wrap gap-1.5"></div>
+          <p class="text-[11px] text-gray-400 mt-1">O dia inteiro fica indisponível.</p>
+        </div>
+
         <div id="slot-config-feedback" class="hidden text-sm rounded-lg px-3 py-2"></div>
         <div class="flex gap-2">
           <button onclick="saveSlotConfig(this)"
@@ -821,7 +837,7 @@ function showTab(name) {
   if (mtab) mtab.classList.replace("text-gray-400","text-brand");
 
   if (name==="agenda")    { loadAgenda();    newAppointments=0; updateBadge("agenda",0); }
-  if (name==="slots")     { loadSlots(); loadWeekly(); renderBlockedHours(); }
+  if (name==="slots")     { loadSlots(); loadWeekly(); renderBlockedHours(); renderBlockedDates(); }
   if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
   if (name==="config")    loadBillingLogs();
 }
@@ -1086,6 +1102,9 @@ function toggleSlotConfig() {
 }
 
 function renderBlockedHours() {
+  // Aproveita pra setar min do date picker
+  const dt = document.getElementById('slot-block-date');
+  if (dt) dt.min = new Date().toISOString().slice(0,10);
   const start = parseInt(document.getElementById('slot-start').value, 10) || 0;
   const end = parseInt(document.getElementById('slot-end').value, 10) || 24;
   const raw = document.getElementById('slot-blocked-raw').value || '';
@@ -1102,6 +1121,46 @@ function renderBlockedHours() {
       onclick="toggleBlockedHour(this)"
       class="border ${cls} text-xs font-medium py-2 rounded-lg active:scale-95 transition">${String(h).padStart(2,'0')}h</button>`;
   }).join('');
+}
+
+// Datas bloqueadas (feriados/férias)
+function _getBlockedDates() {
+  const raw = document.getElementById('slot-blocked-dates-raw').value || '';
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+function _setBlockedDates(arr) {
+  // Mantém só futuras + únicas + ordenadas
+  const today = new Date().toISOString().slice(0,10);
+  const unique = Array.from(new Set(arr)).filter(d => d >= today).sort();
+  document.getElementById('slot-blocked-dates-raw').value = unique.join(',');
+  renderBlockedDates();
+}
+function renderBlockedDates() {
+  const list = document.getElementById('slot-blocked-dates-list');
+  const dates = _getBlockedDates();
+  if (!dates.length) {
+    list.innerHTML = '<span class="text-[11px] text-gray-400">Nenhuma data bloqueada.</span>';
+    return;
+  }
+  list.innerHTML = dates.map(d => {
+    const [y,m,day] = d.split('-');
+    return `<span class="inline-flex items-center gap-1 bg-red-50 text-red-700 border border-red-200 text-xs px-2 py-1 rounded-full">
+      ${day}/${m}/${y}
+      <button type="button" onclick="removeBlockedDate('${d}')" class="text-red-400 hover:text-red-700 font-bold">×</button>
+    </span>`;
+  }).join('');
+}
+function addBlockedDate() {
+  const input = document.getElementById('slot-block-date');
+  const v = input.value;
+  if (!v) return;
+  const dates = _getBlockedDates();
+  if (!dates.includes(v)) dates.push(v);
+  _setBlockedDates(dates);
+  input.value = '';
+}
+function removeBlockedDate(d) {
+  _setBlockedDates(_getBlockedDates().filter(x => x !== d));
 }
 
 function toggleBlockedHour(btn) {
@@ -1141,12 +1200,14 @@ function saveSlotConfig(btn) {
     return;
   }
   const blocked = Array.from(document.querySelectorAll('#slot-blocked-grid [data-blocked="1"]')).map(b => b.getAttribute('data-hour')).sort((a,b)=>parseInt(a)-parseInt(b));
+  const blockedDates = _getBlockedDates();
   const payload = {
     working_hours_start: start,
     working_hours_end: end,
     session_minutes: duration,
     working_days: days.join(','),
     blocked_hours: blocked.join(','),
+    blocked_dates: blockedDates.join(','),
   };
   btn.disabled = true;
   const orig = btn.textContent;

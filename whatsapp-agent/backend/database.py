@@ -131,6 +131,8 @@ def init_db():
             "ALTER TABLE admin_users ADD COLUMN totp_enabled INTEGER DEFAULT 0",
             # Comparecimento: pending | attended | missed_no_notice | missed_with_notice
             "ALTER TABLE appointments ADD COLUMN attendance TEXT DEFAULT 'pending'",
+            # Bloqueios de datas específicas (feriados/férias) — CSV YYYY-MM-DD
+            "ALTER TABLE tenants ADD COLUMN blocked_dates TEXT DEFAULT ''",
         ]
         for sql in migrations:
             try:
@@ -323,7 +325,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "dashboard_token", "setup_token", "google_refresh_token", "google_calendar_id",
         "email", "status", "stripe_customer_id", "stripe_subscription_id", "mp_subscription_id",
         "pix_key", "pix_name",
-        "working_days", "blocked_hours", "confirmation_hour", "psychologist_phone", "plan",
+        "working_days", "blocked_hours", "blocked_dates", "confirmation_hour", "psychologist_phone", "plan",
         "free_until", "plan_expires_at",
         "caldav_url", "caldav_username", "caldav_password",
         "full_name", "cpf_cnpj", "phone",

@@ -541,6 +541,7 @@ class TenantUpdate(BaseModel):
     pix_name: Optional[str] = None
     working_days: Optional[str] = None
     blocked_hours: Optional[str] = None
+    blocked_dates: Optional[str] = None
     confirmation_hour: Optional[int] = None
     psychologist_phone: Optional[str] = None
     free_until: Optional[str] = None  # data ISO (YYYY-MM-DD) de acesso gratuito
@@ -1010,8 +1011,12 @@ def controle_mobile(token: str, request: Request):
         if p and p not in seen:
             seen[p] = ""  # sem nome — mostra só o número
 
+    # Filtra IDs de grupo do WhatsApp (não são pacientes)
+    def _is_group(ph: str) -> bool:
+        return bool(ph) and ("@g.us" in ph or ph.startswith("120363"))
+
     patients = sorted(
-        [{"phone": p, "patient_name": name} for p, name in seen.items()],
+        [{"phone": p, "patient_name": name} for p, name in seen.items() if not _is_group(p)],
         key=lambda x: x["patient_name"].lower() if x["patient_name"] else x["phone"]
     )
 
