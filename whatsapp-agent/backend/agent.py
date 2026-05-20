@@ -9,7 +9,7 @@ import database as db
 import calendar_service as cal
 import google_calendar_service as gcal
 import caldav_service as caldav_svc
-from models import AgentResponse, Action
+from models import AgentResponse, Action, Intent
 
 logger = logging.getLogger(__name__)
 
@@ -134,13 +134,24 @@ PSICÓLOGA: {tenant['psychologist_name']}
 
 IMPORTANTE: use o nome da psicóloga EXATAMENTE como fornecido acima, sem adicionar títulos como "Dra." ou "Dr.".
 
-{pix_section}FLUXO PARA NOVO PACIENTE (quando "CONSULTA AGENDADA: nenhuma" e NÃO há "PACIENTE CONHECIDO" no contexto):
+{pix_section}REGRA ABSOLUTA — IDENTIFICAÇÃO DO PACIENTE (verifique ANTES de qualquer resposta):
+- Se o CONTEXTO contém "CONSULTA AGENDADA:" com um id (ex: "id=233") → PACIENTE JÁ CADASTRADO. NUNCA pergunte o nome. NUNCA dê boas-vindas de novo paciente. Cumprimente normalmente e ajude.
+- Se o CONTEXTO contém "PACIENTE CONHECIDO:" → PACIENTE JÁ CADASTRADO. NUNCA pergunte o nome.
+- Use intent "new_patient" SOMENTE quando o contexto disser literalmente "CONSULTA AGENDADA: nenhuma" E não tiver linha "PACIENTE CONHECIDO".
+
+FLUXO PARA NOVO PACIENTE (somente se as 2 condições acima forem verdadeiras):
 1. Dê boas-vindas de forma calorosa
 2. Peça o nome completo
 3. Após receber o nome: informe que {tenant['psychologist_name']} vai entrar em contato em breve para explicar o processo, o método e os próximos passos
 4. NÃO ofereça horários — NÃO agende — NÃO explique o método
 5. Use action "none" e intent "new_patient"
 6. Coloque o nome do paciente em data: {{"patient_name": "..."}} assim que souber
+
+PACIENTE COM CONSULTA AGENDADA (linha "CONSULTA AGENDADA: ... id=..."):
+- Já é paciente conhecido. NUNCA peça nome.
+- Cumprimente educadamente ("Olá!", "Oi!", "Tudo bem?") sem boas-vindas de novo paciente
+- Se a mensagem for vaga ("oi", "olá"), responda algo como "Olá! Tudo bem? Posso ajudar com sua consulta de [DIA]?"
+- Pode confirmar / remarcar / listar horários
 
 PACIENTE CONHECIDO SEM CONSULTA FUTURA (quando aparecer "PACIENTE CONHECIDO" no contexto):
 - NÃO peça o nome — você já sabe quem é
@@ -337,6 +348,10 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     offered_slots = cal.get_available_slots(tenant, days_ahead=10, limit=6)
     context = _build_context(tenant, phone, offered_slots)
 
+    # Flag: paciente é conhecido (tem consulta futura OU já cadastrado)?
+    known_patient = ("CONSULTA AGENDADA:" in context and "id=" in context) or "PACIENTE CONHECIDO:" in context
+    logger.info(f"[{tenant['slug']}][{phone}] known_patient={known_patient} | ctx={context.splitlines()[0] if context else ''!r}")
+
     history = db.get_conversation_history(tenant_id, phone, limit=8)
     messages = history + [
         {"role": "user", "content": f"[CONTEXTO]\n{context}\n\n[MENSAGEM DO PACIENTE]\n{text}"}
@@ -349,6 +364,29 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     )
     parsed = _extract_json(raw)
     agent_resp = AgentResponse(**parsed)
+
+    # Guard-rail: se LLM tratou paciente conhecido como novo, corrigir
+    if known_patient and agent_resp.intent == Intent.new_patient:
+        logger.warning(
+            f"[{tenant['slug']}][{phone}] LLM alucinou new_patient para paciente conhecido — corrigindo. "
+            f"context_head={context[:200]!r}"
+        )
+        patient = db.get_patient(tenant_id, phone)
+        nome = (patient.get("name") if patient else None) or "tudo bem"
+        appt = cal.get_next_appointment(tenant_id, phone)
+        if appt:
+            from datetime import datetime as _dt
+            try:
+                dt = _dt.fromisoformat(appt["scheduled_at"])
+                quando = cal.format_slots([dt])[0]
+                agent_resp.response_text = f"Olá! 😊 Tudo bem? Posso ajudar com sua sessão de {quando}?"
+            except Exception:
+                agent_resp.response_text = "Olá! 😊 Tudo bem? Posso ajudar com algo?"
+        else:
+            agent_resp.response_text = f"Olá, {nome}! 😊 Como posso ajudar?"
+        agent_resp.intent = Intent.other
+        agent_resp.action = Action.none
+        agent_resp.data = {}
 
     reply, event = _execute_action(tenant, agent_resp, offered_slots, phone)
     db.save_message(tenant_id, phone, "assistant", reply)

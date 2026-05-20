@@ -177,7 +177,8 @@
       "Bash(curl -sS 'https://www.agenteconsultorio.com.br/master/tenants?key=e_jYpCNXdOFYuC181FdO6evmzaDya2lMLYQu71teK1E')",
       "Bash(curl -sS \"https://api.z-api.io/instances/3F2A4B6500DB01C22DBCD217A5857A3E/token/9E4029CDA7A9B5D56212E877/status\" -H \"Client-Token: $\\(curl -sS 'https://www.agenteconsultorio.com.br/master/tenants?key=e_jYpCNXdOFYuC181FdO6evmzaDya2lMLYQu71teK1E')",
       "Bash(curl -sS \"https://www.agenteconsultorio.com.br/admin/bruna-parolin/appointments\")",
-      "Bash(curl -sS \"https://www.agenteconsultorio.com.br/admin/bruna-parolin/conversation/5511986523663\")"
+      "Bash(curl -sS \"https://www.agenteconsultorio.com.br/admin/bruna-parolin/conversation/5511986523663\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('backend/agent.py'\\).read\\(\\)\\); print\\('ok'\\)\")"
     ]
   }
 }
