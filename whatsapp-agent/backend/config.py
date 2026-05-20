@@ -45,3 +45,14 @@ STRIPE_PRICE_ANUAL         = os.getenv("STRIPE_PRICE_ANUAL", "")
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+
+# ── Observabilidade ───────────────────────────────────────────────────────────
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+
+# ── Backup (S3-compatible: Cloudflare R2, Backblaze B2, AWS S3) ──────────────
+BACKUP_S3_BUCKET            = os.getenv("BACKUP_S3_BUCKET", "")
+BACKUP_S3_ENDPOINT_URL      = os.getenv("BACKUP_S3_ENDPOINT_URL", "")   # ex: https://<account>.r2.cloudflarestorage.com
+BACKUP_S3_ACCESS_KEY_ID     = os.getenv("BACKUP_S3_ACCESS_KEY_ID", "")
+BACKUP_S3_SECRET_ACCESS_KEY = os.getenv("BACKUP_S3_SECRET_ACCESS_KEY", "")
+BACKUP_S3_REGION            = os.getenv("BACKUP_S3_REGION", "auto")
+BACKUP_RETENTION_DAYS       = int(os.getenv("BACKUP_RETENTION_DAYS", "30"))

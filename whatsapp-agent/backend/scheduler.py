@@ -286,6 +286,19 @@ async def _run_backup():
     except Exception as e:
         logger.exception(f"[backup] FALHOU: {e}")
 
+    # Upload off-site para S3/R2 (idempotente — só sobe se ainda não subiu hoje)
+    try:
+        import backup_service
+        result = backup_service.run_backup_if_due()
+        if result.get("status") == "ok":
+            logger.info(f"[backup-offsite] ✓ {result.get('key')}")
+        elif result.get("status") == "skipped" and result.get("reason") == "not_configured":
+            pass  # silencioso quando S3 não está configurado
+        elif result.get("status") == "error":
+            logger.warning(f"[backup-offsite] erro: {result.get('reason')}")
+    except Exception as e:
+        logger.warning(f"[backup-offsite] exceção: {e}")
+
 
 async def _run_all():
     await _run_confirmations()

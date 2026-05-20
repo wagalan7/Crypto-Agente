@@ -151,6 +151,26 @@ async def lifespan(app: FastAPI):
     yield
 
 
+# ── Sentry (observabilidade) ─────────────────────────────────────────────────
+if config.SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        from sentry_sdk.integrations.starlette import StarletteIntegration
+        sentry_sdk.init(
+            dsn=config.SENTRY_DSN,
+            traces_sample_rate=0.05,        # 5% de traces (suficiente p/ diagnóstico, baixo custo)
+            profiles_sample_rate=0.0,
+            send_default_pii=False,         # LGPD: não enviar PII por padrão
+            integrations=[StarletteIntegration(), FastApiIntegration()],
+            environment=__import__("os").getenv("RAILWAY_ENVIRONMENT_NAME") or "production",
+            release=__import__("os").getenv("RAILWAY_GIT_COMMIT_SHA", "")[:7] or None,
+        )
+        logger.info("Sentry inicializado")
+    except Exception as e:
+        logger.warning(f"Sentry init falhou: {e}")
+
+
 app = FastAPI(title="Agente de Atendimento — Multi-Consultório", lifespan=lifespan)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -1258,6 +1278,24 @@ def master_list_tenants(key: str = ""):
             "webhook_url": f"{base}/webhook/{t['slug']}/zapi?token={wt}",
         })
     return {"tenants": result}
+
+
+@app.post("/master/backup/run")
+async def master_run_backup(key: str = ""):
+    """Dispara backup off-site agora (idempotente — só sobe se ainda não subiu hoje).
+    Requer MASTER_KEY. Retorna 503 se BACKUP_S3_* não estiver configurado.
+    """
+    _check_master_key(key)
+    try:
+        import backup_service
+        result = backup_service.run_backup_if_due()
+        if result.get("status") == "skipped" and result.get("reason") == "not_configured":
+            raise HTTPException(status_code=503, detail="Backup S3 não configurado (BACKUP_S3_* env vars ausentes).")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backup falhou: {e}")
 
 
 @app.post("/master/tenants/{slug}/fix-zapi-webhook")
