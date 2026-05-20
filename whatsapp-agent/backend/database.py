@@ -129,6 +129,8 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN accepted_terms_version TEXT DEFAULT ''",
             "ALTER TABLE admin_users ADD COLUMN totp_secret TEXT DEFAULT ''",
             "ALTER TABLE admin_users ADD COLUMN totp_enabled INTEGER DEFAULT 0",
+            # Comparecimento: pending | attended | missed_no_notice | missed_with_notice
+            "ALTER TABLE appointments ADD COLUMN attendance TEXT DEFAULT 'pending'",
         ]
         for sql in migrations:
             try:
@@ -393,6 +395,25 @@ def list_paused_phones(tenant_id: int) -> list[str]:
     return [r["phone"] for r in rows]
 
 
+def pause_all_agents(tenant_id: int, phones: list[str]) -> int:
+    """Pausa o agente para todos os telefones informados. Retorna nº pausados."""
+    if not phones:
+        return 0
+    with get_conn() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO agent_paused (tenant_id, phone) VALUES (?, ?)",
+            [(tenant_id, p) for p in phones if p]
+        )
+    return len([p for p in phones if p])
+
+
+def resume_all_agents(tenant_id: int) -> int:
+    """Remove TODAS as pausas do tenant. Retorna nº de pausas removidas."""
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM agent_paused WHERE tenant_id = ?", (tenant_id,))
+        return cur.rowcount or 0
+
+
 def clear_conversation(tenant_id: int, phone: str):
     with get_conn() as conn:
         conn.execute("DELETE FROM conversations WHERE tenant_id = ? AND phone = ?", (tenant_id, phone))
@@ -494,6 +515,47 @@ def confirm_appointment(tenant_id: int, appointment_id: int) -> bool:
             (appointment_id, tenant_id),
         )
         return cur.rowcount > 0
+
+
+ATTENDANCE_VALUES = {"pending", "attended", "missed_no_notice", "missed_with_notice"}
+
+
+def set_attendance(tenant_id: int, appointment_id: int, status: str) -> bool:
+    """Atualiza status de comparecimento. Valores válidos:
+    - pending: ainda não passou / não marcado
+    - attended: compareceu (cobra)
+    - missed_no_notice: faltou sem aviso (COBRA)
+    - missed_with_notice: não compareceu com aviso (NÃO COBRA)
+    """
+    if status not in ATTENDANCE_VALUES:
+        return False
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE appointments SET attendance = ? WHERE id = ? AND tenant_id = ?",
+            (status, appointment_id, tenant_id),
+        )
+        return cur.rowcount > 0
+
+
+def rename_patient_by_phone(tenant_id: int, phone: str, new_name: str) -> int:
+    """Atualiza o nome de todos os agendamentos e do cadastro do paciente.
+    Usado quando o contato apareceu inicialmente só com número.
+    """
+    new_name = (new_name or "").strip()
+    if not new_name or not phone:
+        return 0
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE appointments SET patient_name = ? WHERE tenant_id = ? AND phone = ?",
+            (new_name, tenant_id, phone),
+        )
+        # Atualiza também a tabela patients (se houver registro)
+        conn.execute(
+            """UPDATE patients SET name = ?
+               WHERE tenant_id = ? AND phone = ? AND (name IS NULL OR name = '')""",
+            (new_name, tenant_id, phone),
+        )
+        return cur.rowcount or 0
 
 
 def get_appointment_by_id(tenant_id: int, appointment_id: int) -> dict | None:
@@ -660,12 +722,20 @@ def get_patients_with_price(tenant_id: int) -> list[dict]:
 
 
 def get_valid_sessions_for_month(tenant_id: int, phone: str, month_start: str, month_end: str, now_str: str) -> list[dict]:
-    """Sessions that are confirmed AND already occurred (date passed) within the month."""
+    """Sessões que entram no faturamento do mês.
+
+    Critério: confirmadas, ocorreram dentro do mês, e:
+    - attendance != 'missed_with_notice'  (não compareceu com aviso → NÃO cobra)
+    - cancelled = 0
+    'attended', 'missed_no_notice' e 'pending' (default) entram no cálculo.
+    """
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT * FROM appointments
             WHERE tenant_id = ? AND phone = ?
               AND confirmed = 1
+              AND cancelled = 0
+              AND COALESCE(attendance, 'pending') != 'missed_with_notice'
               AND scheduled_at >= ? AND scheduled_at < ?
               AND scheduled_at <= ?
             ORDER BY scheduled_at

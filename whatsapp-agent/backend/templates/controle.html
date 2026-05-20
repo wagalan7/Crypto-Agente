@@ -64,7 +64,7 @@
   <div class="px-4 py-4 max-w-lg mx-auto">
 
     <!-- Legenda -->
-    <div class="flex gap-4 mb-4 text-xs text-gray-500">
+    <div class="flex gap-4 mb-3 text-xs text-gray-500">
       <span class="flex items-center gap-1.5">
         <span class="w-2.5 h-2.5 rounded-full bg-green-400 inline-block"></span> Agente ativo
       </span>
@@ -72,6 +72,26 @@
         <span class="w-2.5 h-2.5 rounded-full bg-yellow-400 inline-block"></span> Agente pausado
       </span>
     </div>
+
+    <!-- Ações em massa -->
+    {% if patients %}
+    <div class="grid grid-cols-2 gap-2 mb-4">
+      <form method="POST" action="/controle/{{ token }}/pausar-todos"
+        onsubmit="return confirm('Pausar o agente para TODOS os pacientes?')">
+        <button type="submit"
+          class="w-full bg-yellow-50 border border-yellow-200 text-yellow-800 text-xs font-semibold py-2.5 rounded-xl">
+          ⏸ Pausar todos
+        </button>
+      </form>
+      <form method="POST" action="/controle/{{ token }}/retomar-todos"
+        onsubmit="return confirm('Retomar o agente para TODOS os pacientes?')">
+        <button type="submit"
+          class="w-full bg-green-50 border border-green-200 text-green-800 text-xs font-semibold py-2.5 rounded-xl">
+          ▶ Retomar todos
+        </button>
+      </form>
+    </div>
+    {% endif %}
 
     {% if not patients %}
     <div class="text-center py-16 text-gray-400">
@@ -82,8 +102,10 @@
     <div class="space-y-2">
     {% for p in patients %}
       {% set is_paused = p.phone in paused %}
-      <div class="bg-white rounded-2xl border p-4 flex items-center gap-3
+      {% set sem_nome = not p.patient_name %}
+      <div class="bg-white rounded-2xl border p-4
         {{ 'border-yellow-200' if is_paused else 'border-gray-100' }}">
+        <div class="flex items-center gap-3">
 
         <!-- Avatar -->
         <div class="w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0
@@ -93,9 +115,19 @@
 
         <!-- Nome + status -->
         <div class="flex-1 min-w-0">
-          <p class="font-medium text-gray-900 text-sm truncate">{{ p.patient_name or p.phone }}</p>
+          <div class="flex items-center gap-1.5">
+            <p class="font-medium text-gray-900 text-sm truncate">{{ p.patient_name or p.phone }}</p>
+            {% if sem_nome %}
+            <button type="button"
+              onclick="document.getElementById('rename-{{ loop.index }}').classList.toggle('hidden')"
+              class="text-[10px] text-brand font-semibold border border-brand px-1.5 py-0.5 rounded-full whitespace-nowrap">
+              + Nome
+            </button>
+            {% endif %}
+          </div>
           <p class="text-xs {{ 'text-yellow-600 font-medium' if is_paused else 'text-gray-400' }}">
             {% if is_paused %}⏸ Pausado{% else %}🤖 Agente ativo{% endif %}
+            {% if not sem_nome %}<span class="text-gray-300"> · {{ p.phone }}</span>{% endif %}
           </p>
         </div>
 
@@ -127,6 +159,22 @@
             </button>
           </form>
         </div>
+        </div>
+
+        {% if sem_nome %}
+        <!-- Form inline renomear -->
+        <form id="rename-{{ loop.index }}" method="POST"
+          action="/controle/{{ token }}/renomear/{{ p.phone }}"
+          class="hidden mt-3 pt-3 border-t border-gray-100 flex gap-2">
+          <input name="patient_name" required maxlength="80"
+            placeholder="Nome do paciente"
+            class="flex-1 border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-brand"/>
+          <button type="submit"
+            class="bg-brand text-white text-xs font-semibold px-4 py-2 rounded-xl whitespace-nowrap">
+            Salvar
+          </button>
+        </form>
+        {% endif %}
       </div>
     {% endfor %}
     </div>

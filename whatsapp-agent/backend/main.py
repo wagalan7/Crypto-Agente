@@ -676,9 +676,14 @@ def dashboard(slug: str, request: Request, token: str = ""):
 def dash_appointments(request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
-    now = datetime.now().isoformat()
-    far = datetime.now().replace(year=datetime.now().year + 1).isoformat()
-    appts = db.get_appointments_in_range(tenant["id"], now, far)
+    # Inclui consultas a partir do início de hoje — assim sessões que já ocorreram
+    # hoje continuam visíveis para a psicóloga marcar comparecimento depois.
+    _br = ZoneInfo("America/Sao_Paulo")
+    today_start = datetime.now(_br).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None).isoformat()
+    far = (datetime.now(_br).replace(tzinfo=None).replace(year=datetime.now().year + 1)).isoformat()
+    appts = db.get_appointments_in_range(tenant["id"], today_start, far)
+    # Esconde canceladas da listagem
+    appts = [a for a in appts if not a.get("cancelled")]
     return {"appointments": appts}
 
 
@@ -722,6 +727,29 @@ def dash_confirm(appt_id: int, request: Request):
     tenant = _get_tenant_by_token(token)
     db.confirm_appointment(tenant["id"], appt_id)
     return {"status": "confirmed"}
+
+
+class AttendanceBody(BaseModel):
+    status: str  # 'attended' | 'missed_no_notice' | 'missed_with_notice' | 'pending'
+
+
+@app.post("/dashboard/api/appointments/{appt_id}/attendance")
+def dash_attendance(appt_id: int, body: AttendanceBody, request: Request):
+    """Marca o status de comparecimento de uma consulta.
+    - attended: compareceu (cobra)
+    - missed_no_notice: faltou sem aviso (cobra)
+    - missed_with_notice: não compareceu com aviso (não cobra)
+    - pending: limpa marcação
+    """
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    if body.status not in db.ATTENDANCE_VALUES:
+        raise HTTPException(status_code=400, detail=f"Status inválido. Use: {sorted(db.ATTENDANCE_VALUES)}")
+    ok = db.set_attendance(tenant["id"], appt_id, body.status)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Consulta não encontrada.")
+    logger.info(f"[{tenant['slug']}] Attendance set: appt={appt_id} → {body.status}")
+    return {"status": "ok", "attendance": body.status}
 
 
 class RenameBody(BaseModel):
@@ -952,6 +980,46 @@ def controle_mobile(token: str, request: Request):
 def controle_pausar(token: str, phone: str):
     tenant = _get_tenant_by_token(token)
     db.pause_agent(tenant["id"], _norm_phone(phone))
+    return RedirectResponse(f"/controle/{token}", status_code=303)
+
+
+@app.post("/controle/{token}/pausar-todos", response_class=HTMLResponse)
+def controle_pausar_todos(token: str):
+    """Pausa o agente para TODOS os contatos do tenant (agendamentos + conversas)."""
+    tenant = _get_tenant_by_token(token)
+    with db.get_conn() as conn:
+        appt_phones = [r["phone"] for r in conn.execute(
+            "SELECT DISTINCT phone FROM appointments WHERE tenant_id = ? AND phone != ''",
+            (tenant["id"],)
+        ).fetchall()]
+        conv_phones = [r["phone"] for r in conn.execute(
+            "SELECT DISTINCT phone FROM conversations WHERE tenant_id = ? AND phone != '' AND role = 'user'",
+            (tenant["id"],)
+        ).fetchall()]
+    phones = sorted({_norm_phone(p) for p in (appt_phones + conv_phones) if p})
+    n = db.pause_all_agents(tenant["id"], phones)
+    logger.info(f"[{tenant['slug']}] Pausa em massa: {n} contatos pausados")
+    return RedirectResponse(f"/controle/{token}", status_code=303)
+
+
+@app.post("/controle/{token}/retomar-todos", response_class=HTMLResponse)
+def controle_retomar_todos(token: str):
+    """Remove TODAS as pausas do tenant — agente volta a responder todos."""
+    tenant = _get_tenant_by_token(token)
+    n = db.resume_all_agents(tenant["id"])
+    logger.info(f"[{tenant['slug']}] Retomada em massa: {n} pausas removidas")
+    return RedirectResponse(f"/controle/{token}", status_code=303)
+
+
+@app.post("/controle/{token}/renomear/{phone}", response_class=HTMLResponse)
+def controle_renomear(token: str, phone: str, patient_name: str = Form(...)):
+    """Salva nome de um contato que aparecia só com número."""
+    tenant = _get_tenant_by_token(token)
+    p = _norm_phone(phone)
+    name = (patient_name or "").strip()
+    if p and name:
+        n = db.rename_patient_by_phone(tenant["id"], p, name)
+        logger.info(f"[{tenant['slug']}] Contato renomeado: {p} → {name} ({n} consultas afetadas)")
     return RedirectResponse(f"/controle/{token}", status_code=303)
 
 

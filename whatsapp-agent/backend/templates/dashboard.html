@@ -735,36 +735,90 @@ function api(path, opts={}) {
 
 // ── Agenda ────────────────────────────────────────────────────────────────────
 function loadAgenda() {
+  const el = document.getElementById("agenda-list");
+  // Feedback visual claro do "Atualizar"
+  el.innerHTML = '<div class="text-gray-400 text-sm text-center py-8">⏳ Carregando…</div>';
   api("/dashboard/api/appointments").then(data => {
-    const el = document.getElementById("agenda-list");
     if (!data.appointments?.length) {
       el.innerHTML = '<div class="text-gray-400 text-sm text-center py-10">Nenhuma consulta agendada.</div>';
       return;
     }
     const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+    const now = new Date();
     el.innerHTML = data.appointments.map(a => {
       const dt = new Date(a.scheduled_at);
       const label = `${days[dt.getDay()]}, ${String(dt.getDate()).padStart(2,"0")}/${String(dt.getMonth()+1).padStart(2,"0")} às ${String(dt.getHours()).padStart(2,"0")}:${String(dt.getMinutes()).padStart(2,"0")}`;
+      const att = a.attendance || 'pending';
+      const isPast = dt < now;
+      const missed = (att === 'missed_no_notice' || att === 'missed_with_notice');
+
+      // Borda lateral colorida — destaque visual para faltosos
+      let borderCls = 'border-gray-200';
+      if (att === 'missed_no_notice') borderCls = 'border-l-4 border-red-400 border-y border-r border-gray-200';
+      else if (att === 'missed_with_notice') borderCls = 'border-l-4 border-orange-300 border-y border-r border-gray-200';
+      else if (att === 'attended') borderCls = 'border-l-4 border-green-400 border-y border-r border-gray-200';
+
+      // Badge de status
+      let statusBadge = '';
+      if (att === 'attended')               statusBadge = '<span class="inline-block text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 text-green-700">✓ Compareceu</span>';
+      else if (att === 'missed_no_notice')  statusBadge = '<span class="inline-block text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 text-red-700">⚠️ Faltou sem aviso</span>';
+      else if (att === 'missed_with_notice')statusBadge = '<span class="inline-block text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">📞 Avisou que não vem</span>';
+      else statusBadge = a.confirmed
+        ? '<span class="inline-block text-xs font-medium px-2 py-0.5 rounded-full bg-green-100 text-green-700">✓ Confirmado</span>'
+        : '<span class="inline-block text-xs font-medium px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-700">⏳ Pendente</span>';
+
+      // Botões: layout mobile = stack vertical | desktop = inline
+      // Confirmar só aparece se ainda não foi confirmada e não tem attendance marcada
+      const showConfirm = !a.confirmed && att === 'pending';
+      // Botões de comparecimento aparecem se a sessão já passou OU é hoje
+      const isToday = dt.toDateString() === now.toDateString();
+      const showAttendance = (isPast || isToday) && att === 'pending';
+      const showClearAttendance = (att !== 'pending');
+
       return `
-        <div class="bg-white rounded-xl border border-gray-200 p-4">
-          <div class="flex items-start justify-between gap-2">
-            <div>
-              <p class="font-semibold text-gray-800">${a.patient_name}</p>
+        <div class="bg-white rounded-xl ${borderCls} p-4">
+          <!-- Cabeçalho: nome + data + status -->
+          <div class="flex items-start justify-between gap-3 mb-3">
+            <div class="min-w-0 flex-1">
+              <p class="font-semibold text-gray-800 truncate">${a.patient_name}</p>
               <p class="text-sm text-gray-500 mt-0.5">${label}</p>
-              <span class="inline-block text-xs mt-1 font-medium px-2 py-0.5 rounded-full ${a.confirmed ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'}">
-                ${a.confirmed ? '✓ Confirmado' : '⏳ Pendente'}
-              </span>
+              <div class="mt-1.5">${statusBadge}</div>
             </div>
-            <div class="flex gap-2 flex-shrink-0 flex-wrap justify-end">
-              ${!a.confirmed ? `<button onclick="confirmAppt(${a.id})" class="text-xs bg-green-100 text-green-700 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">Confirmar</button>` : ''}
-              <button onclick='openRename(${a.id}, ${JSON.stringify(a.patient_name)})' class="text-xs bg-purple-100 text-purple-700 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">✏️ Editar nome</button>
-              <button onclick="openReschedule(${a.id}, '${a.scheduled_at}')" class="text-xs bg-blue-100 text-blue-700 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">🔄 Reagendar</button>
-              <button onclick="cancelAppt(${a.id})" class="text-xs bg-red-100 text-red-600 px-3 py-1.5 rounded-full font-medium active:scale-95 transition">Cancelar</button>
-            </div>
+          </div>
+          <!-- Ações: grid responsivo - 2 col no mobile, inline no desktop -->
+          <div class="grid grid-cols-2 sm:flex sm:flex-wrap gap-2">
+            ${showConfirm ? `<button onclick="confirmAppt(${a.id})" class="text-xs bg-green-100 text-green-700 px-3 py-2 rounded-full font-medium active:scale-95 transition">✓ Confirmar</button>` : ''}
+            ${showAttendance ? `
+              <button onclick="setAttendance(${a.id}, 'attended')" class="text-xs bg-green-50 text-green-700 px-3 py-2 rounded-full font-medium active:scale-95 transition border border-green-200">✓ Compareceu</button>
+              <button onclick="setAttendance(${a.id}, 'missed_no_notice')" class="text-xs bg-red-50 text-red-700 px-3 py-2 rounded-full font-medium active:scale-95 transition border border-red-200">⚠️ Faltou</button>
+              <button onclick="setAttendance(${a.id}, 'missed_with_notice')" class="text-xs bg-orange-50 text-orange-700 px-3 py-2 rounded-full font-medium active:scale-95 transition border border-orange-200">📞 Avisou</button>
+            ` : ''}
+            ${showClearAttendance ? `<button onclick="setAttendance(${a.id}, 'pending')" class="text-xs bg-gray-100 text-gray-600 px-3 py-2 rounded-full font-medium active:scale-95 transition">↺ Desfazer</button>` : ''}
+            <button onclick='openRename(${a.id}, ${JSON.stringify(a.patient_name)})' class="text-xs bg-purple-100 text-purple-700 px-3 py-2 rounded-full font-medium active:scale-95 transition">✏️ Editar nome</button>
+            <button onclick="openReschedule(${a.id}, '${a.scheduled_at}')" class="text-xs bg-blue-100 text-blue-700 px-3 py-2 rounded-full font-medium active:scale-95 transition">🔄 Reagendar</button>
+            <button onclick="cancelAppt(${a.id})" class="text-xs bg-red-100 text-red-600 px-3 py-2 rounded-full font-medium active:scale-95 transition">🗑 Cancelar</button>
           </div>
         </div>`;
     }).join("");
+  }).catch(e => {
+    el.innerHTML = `<div class="text-red-500 text-sm text-center py-8">Falha ao carregar: ${e.message}</div>`;
   });
+}
+
+function setAttendance(id, status) {
+  const labels = {
+    'attended': '✓ Marcado como compareceu',
+    'missed_no_notice': '⚠️ Marcado: faltou sem aviso (cobra)',
+    'missed_with_notice': '📞 Marcado: avisou que não vem (não cobra)',
+    'pending': '↺ Marcação removida',
+  };
+  api(`/dashboard/api/appointments/${id}/attendance`, {
+    method: "POST",
+    body: JSON.stringify({status}),
+  }).then(() => {
+    loadAgenda();
+    showToast(labels[status] || 'Atualizado', status === 'missed_no_notice' ? 'warn' : 'success');
+  }).catch(e => showToast('Erro: ' + e.message, 'error'));
 }
 
 function confirmAppt(id) {
