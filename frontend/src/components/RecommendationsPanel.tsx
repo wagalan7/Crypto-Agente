@@ -1,7 +1,17 @@
 import { useState, useEffect, useCallback } from 'react'
-import { X, Sparkles, TrendingUp, TrendingDown, RefreshCw, AlertTriangle } from 'lucide-react'
+import { X, Sparkles, TrendingUp, TrendingDown, RefreshCw, AlertTriangle, Brain } from 'lucide-react'
 import { api, fetchBinanceOHLCV } from '../services/api'
 import type { Recommendation, RecommendationTier } from '../types'
+
+interface HistoricalStat {
+  trades: number
+  win_rate: number | null
+  avg_r: number | null
+  sample_ok: boolean
+  verdict: 'winning' | 'losing' | 'neutro' | 'amostra_pequena' | 'sem_historico'
+}
+
+const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
 
 interface Props {
   onClose: () => void
@@ -55,6 +65,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
   const [filter, setFilter] = useState<RecommendationTier | 'all'>('all')
   const [progress, setProgress] = useState<string>('')
+  const [historical, setHistorical] = useState<Record<string, HistoricalStat>>({})
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -97,6 +108,21 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
       setRecs(res.recommendations)
       setLastUpdate(new Date())
       setProgress('')
+
+      // Busca histórico (não bloqueia UI se falhar)
+      try {
+        const lookupItems = res.recommendations.map(r => ({
+          tier: r.tier, timeframe: r.timeframe, direction: r.direction,
+        }))
+        if (lookupItems.length > 0) {
+          const histRes = await fetch(`${BACKEND}/api/historical-lookup`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ items: lookupItems, days: 60 }),
+          })
+          if (histRes.ok) setHistorical(await histRes.json())
+        }
+      } catch { /* ignora — badge histórico é opcional */ }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Erro ao carregar')
     } finally {
@@ -207,6 +233,8 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
               const isLong = r.direction === 'long'
               const DirIcon = isLong ? TrendingUp : TrendingDown
               const dirColor = isLong ? 'text-green-400' : 'text-red-400'
+              const histKey = `${r.tier}_${r.timeframe}_${r.direction}`
+              const hist = historical[histKey]
               return (
                 <button
                   key={`${r.symbol}-${r.timeframe}`}
@@ -266,6 +294,25 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                       <div className="font-mono text-orange-300 font-bold">{r.leverage}x</div>
                     </div>
                   </div>
+
+                  {/* Badge histórico — aprendizado contínuo */}
+                  {hist && hist.trades > 0 && (
+                    <div className={`mt-2 flex items-center gap-1.5 text-[10px] rounded px-2 py-1 ${
+                      hist.verdict === 'winning' ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
+                      : hist.verdict === 'losing' ? 'bg-red-500/10 text-red-300 border border-red-500/30'
+                      : 'bg-slate-700/30 text-slate-400 border border-slate-700/50'
+                    }`}>
+                      <Brain className="w-3 h-3" />
+                      <span>
+                        {hist.verdict === 'winning' && '✓ setup forte: '}
+                        {hist.verdict === 'losing' && '⚠ setups similares perderam: '}
+                        {(hist.verdict === 'neutro' || hist.verdict === 'amostra_pequena') && 'histórico: '}
+                        {hist.win_rate != null && <strong>{hist.win_rate.toFixed(0)}% win</strong>}
+                        {hist.avg_r != null && <span className="ml-1">· {hist.avg_r >= 0 ? '+' : ''}{hist.avg_r.toFixed(2)}R médio</span>}
+                        <span className="ml-1 text-slate-500">({hist.trades} trades{!hist.sample_ok && ', amostra pequena'})</span>
+                      </span>
+                    </div>
+                  )}
                 </button>
               )
             })}

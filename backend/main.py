@@ -38,6 +38,10 @@ from services.snapshot_service import (
     get_daily_pnl,
     get_history_stats,
 )
+from services.learning_service import (
+    compute_stats_by_bucket,
+    lookup_historical_batch,
+)
 from db import init_db, close_db, DB_ENABLED
 from models.trade_signal import TradeSignal
 
@@ -378,6 +382,40 @@ async def daily_pnl(date_str: Optional[str] = Query(None, alias="date")):
     except Exception as e:
         logging.error(f"daily-pnl error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao obter P&L: {e}")
+
+
+@app.get("/api/learning-insights")
+async def learning_insights(days: int = 60):
+    """Estatísticas agregadas por bucket (tier/TF/sessão/padrão/funding/etc.)
+    + combos vencedores e perdedores."""
+    try:
+        return await compute_stats_by_bucket(days=max(7, min(days, 365)))
+    except Exception as e:
+        logging.error(f"learning-insights error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao obter insights: {e}")
+
+
+class HistoricalLookupItem(BaseModel):
+    tier: str
+    timeframe: str
+    direction: str
+
+
+class HistoricalLookupRequest(BaseModel):
+    items: List[HistoricalLookupItem]
+    days: int = 60
+
+
+@app.post("/api/historical-lookup")
+async def historical_lookup(body: HistoricalLookupRequest):
+    """Recebe [{tier, tf, direction}, ...] e retorna stat histórico de cada.
+    Usado pelo painel de recomendações pra exibir badge "histórico" no card."""
+    try:
+        keys = [{"tier": it.tier, "timeframe": it.timeframe, "direction": it.direction} for it in body.items]
+        return await lookup_historical_batch(keys, days=max(7, min(body.days, 365)))
+    except Exception as e:
+        logging.error(f"historical-lookup error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao buscar histórico: {e}")
 
 
 @app.get("/api/history-stats")

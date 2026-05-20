@@ -5,6 +5,7 @@ Permite rastrear outcome (won/lost/open/expired) e calcular P&L diário.
 from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import String, Float, Integer, DateTime, Index
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db import Base
@@ -41,6 +42,11 @@ class RecommendationSnapshot(Base):
     outcome_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     realized_r: Mapped[float | None] = mapped_column(Float, nullable=True)
     # múltiplo de R: +2 se TP2, +1 se TP1, -1 se stop, 0 se expirado.
+
+    # ── Features do setup pra learning loop ──────────────────────────────
+    # JSONB com vetor de features: rsi, mtf_score, confluence_pct, patterns,
+    # funding_pct, oi_change_pct, hour_utc, day_of_week, atr_pct, etc.
+    features: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(

@@ -6,6 +6,7 @@ import TradeManager from './components/TradeManager'
 import NLPPanel from './components/NLPPanel'
 import RecommendationsPanel from './components/RecommendationsPanel'
 import DailyPnLPanel from './components/DailyPnLPanel'
+import InsightsPanel from './components/InsightsPanel'
 import { api } from './services/api'
 import type { SignalDirection, TradeType } from './types'
 
@@ -182,6 +183,7 @@ export default function App() {
   const [showNLP, setShowNLP] = useState(false)
   const [showRecommendations, setShowRecommendations] = useState(false)
   const [showDailyPnL, setShowDailyPnL] = useState(false)
+  const [showInsights, setShowInsights] = useState(false)
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const [tradeMode, setTradeMode] = useState<TradeMode>('swing')
   const [filter, setFilter] = useState<Filter>('all')
@@ -470,6 +472,14 @@ export default function App() {
             <span className="hidden sm:block">Resultado</span>
           </button>
           <button
+            onClick={() => setShowInsights(true)}
+            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-violet-500/20 to-purple-500/20 hover:from-violet-500/30 hover:to-purple-500/30 border border-violet-500/40 rounded text-xs font-bold text-violet-300"
+            title="Insights — o que o sistema aprendeu"
+          >
+            <span>🎓</span>
+            <span className="hidden sm:block">Insights</span>
+          </button>
+          <button
             onClick={() => setShowNLP(v => !v)}
             className={`flex items-center gap-1 px-2 py-1 border rounded text-xs font-semibold transition-colors ${
               showNLP
@@ -672,6 +682,10 @@ export default function App() {
 
       {showDailyPnL && (
         <DailyPnLPanel onClose={() => setShowDailyPnL(false)} />
+      )}
+
+      {showInsights && (
+        <InsightsPanel onClose={() => setShowInsights(false)} />
       )}
     </div>
   )

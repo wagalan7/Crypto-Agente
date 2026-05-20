@@ -56,14 +56,24 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 async def init_db():
-    """Cria todas as tabelas declaradas em Base. Idempotente."""
+    """Cria todas as tabelas declaradas em Base. Idempotente.
+
+    Também roda migrações incrementais simples (ADD COLUMN IF NOT EXISTS) pra
+    tabelas que já existem mas ganharam colunas novas — evita ter que dropar.
+    """
     if not DB_ENABLED or _engine is None:
         return
     # Importa modelos pra registrar metadata
     from models import recommendation_snapshot  # noqa: F401
+    from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    log.info("Schema do banco verificado/criado.")
+        # Migrações incrementais
+        await conn.execute(text(
+            "ALTER TABLE recommendation_snapshots "
+            "ADD COLUMN IF NOT EXISTS features JSONB"
+        ))
+    log.info("Schema do banco verificado/criado (migrações aplicadas).")
 
 
 async def close_db():

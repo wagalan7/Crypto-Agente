@@ -31,6 +31,53 @@ REALIZED_R_TP2 = 2.0
 REALIZED_R_STOP = -1.0
 
 
+def _extract_features(rec: Dict[str, Any], created_at: datetime) -> Dict[str, Any]:
+    """Captura vetor de features pro learning loop. Robust a campos ausentes."""
+    sig = rec.get("signal") or {}
+    if not isinstance(sig, dict):
+        return {"hour_utc": created_at.hour, "day_of_week": created_at.weekday()}
+
+    ind = sig.get("indicators") or {}
+    mtf = sig.get("mtf") or {}
+    confluence = sig.get("confluence") or {}
+    derivatives = sig.get("derivatives") or {}
+    patterns = sig.get("patterns") or []
+
+    # Padrões: lista de strings
+    pattern_types = []
+    if isinstance(patterns, list):
+        for p in patterns:
+            if isinstance(p, dict):
+                t = p.get("type")
+                if t:
+                    pattern_types.append(t)
+
+    # ATR como % do entry (medida de volatilidade)
+    atr = ind.get("atr")
+    entry = sig.get("entry") or rec.get("entry") or 0
+    atr_pct = None
+    if atr and entry:
+        try:
+            atr_pct = round((float(atr) / float(entry)) * 100, 3)
+        except Exception:
+            atr_pct = None
+
+    return {
+        "rsi": ind.get("rsi"),
+        "adx": ind.get("adx"),
+        "atr_pct": atr_pct,
+        "mtf_score": mtf.get("alignment_score") if mtf else None,
+        "mtf_aligned": mtf.get("aligned_count") if mtf else None,
+        "confluence_pct": confluence.get("pct") if confluence else None,
+        "patterns": pattern_types,
+        "funding_pct": derivatives.get("funding_rate_pct") if derivatives else None,
+        "funding_sentiment": derivatives.get("funding_sentiment") if derivatives else None,
+        "oi_change_pct": derivatives.get("oi_change_24h_pct") if derivatives else None,
+        "hour_utc": created_at.hour,
+        "day_of_week": created_at.weekday(),    # 0 = Monday
+    }
+
+
 async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     """
     Salva snapshots de recomendações novas (desduplicadas).
@@ -81,6 +128,7 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                     stop_distance_pct=float(rec.get("stop_distance_pct", 0.0)),
                     status="open",
                     created_at=now,
+                    features=_extract_features(rec, now),
                 )
                 session.add(snap)
                 inserted += 1
