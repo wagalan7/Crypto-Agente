@@ -51,6 +51,11 @@ class Recommendation(BaseModel):
     summary: str                  # 1 linha PT-BR (principal razão)
     warnings: List[str] = []
     signal: TradeSignal           # objeto completo (frontend usa pra carregar painel)
+    # ── Gestão de risco / alavancagem ─────────────────────────────────────
+    leverage: int = 1             # alavancagem sugerida (inteiro)
+    risk_pct: float = 1.0         # % da banca arriscado por trade
+    margin_pct: float = 10.0      # % da banca a usar como margem
+    stop_distance_pct: float = 0.0  # distância do entry até o stop em %
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -181,7 +186,46 @@ async def _best_tf_for_symbol(symbol: str) -> Optional[tuple]:
     return max(scored, key=lambda x: x[1])
 
 
+def _compute_leverage(entry: float, stop_loss: float, tier: str) -> dict:
+    """
+    Calcula alavancagem sugerida com gestão de risco proporcional ao tier.
+
+    Modelo: usuário aloca ~10% da banca como margem isolada. A alavancagem é
+    dimensionada para que, se o stop bater, a perda total seja `risk_pct`%
+    da banca. Cap de segurança por tier (A+ mais agressivo, B mais conservador).
+
+    Fórmula: leverage = risk_pct / (margin_pct × stop_dist_pct), tudo em frações.
+    """
+    if entry <= 0 or stop_loss <= 0:
+        return {"leverage": 1, "risk_pct": 1.0, "margin_pct": 10.0, "stop_dist_pct": 0.0}
+    stop_dist = abs(entry - stop_loss) / entry
+    if stop_dist <= 0:
+        return {"leverage": 1, "risk_pct": 1.0, "margin_pct": 10.0, "stop_dist_pct": 0.0}
+
+    # Por tier: risco que aceitamos perder e teto de alavancagem
+    profile = {
+        "A+": {"risk_pct": 1.5, "cap": 15},
+        "A":  {"risk_pct": 1.0, "cap": 10},
+        "B":  {"risk_pct": 0.5, "cap": 5},
+    }.get(tier, {"risk_pct": 1.0, "cap": 5})
+
+    margin_pct = 10.0  # 10% da banca como margem isolada
+    risk_frac = profile["risk_pct"] / 100
+    margin_frac = margin_pct / 100
+
+    raw_lev = risk_frac / (margin_frac * stop_dist)
+    leverage = max(1, min(profile["cap"], int(round(raw_lev))))
+
+    return {
+        "leverage": leverage,
+        "risk_pct": profile["risk_pct"],
+        "margin_pct": margin_pct,
+        "stop_dist_pct": round(stop_dist * 100, 3),
+    }
+
+
 def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Recommendation:
+    lev = _compute_leverage(sig.entry, sig.stop_loss, tier)
     return Recommendation(
         tier=tier,
         score=score,
@@ -196,6 +240,10 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Recommen
         summary=_build_summary(sig),
         warnings=(sig.trade_plan or {}).get("quality_warnings", []) if sig.trade_plan else [],
         signal=sig,
+        leverage=lev["leverage"],
+        risk_pct=lev["risk_pct"],
+        margin_pct=lev["margin_pct"],
+        stop_distance_pct=lev["stop_dist_pct"],
     )
 
 
@@ -336,21 +384,7 @@ async def get_recommendations(top_n: int = 30) -> List[Recommendation]:
         tier = _classify_tier(sig, score)
         if tier is None:
             continue
-        recommendations.append(Recommendation(
-            tier=tier,
-            score=score,
-            symbol=sig.symbol,
-            timeframe=sig.timeframe,
-            direction=sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction),
-            confidence=sig.confidence,
-            risk_reward=sig.risk_reward,
-            entry=sig.entry,
-            stop_loss=sig.stop_loss,
-            tp2=sig.tp2,
-            summary=_build_summary(sig),
-            warnings=(sig.trade_plan or {}).get("quality_warnings", []) if sig.trade_plan else [],
-            signal=sig,
-        ))
+        recommendations.append(_build_recommendation(sig, score, tier))
 
     # Ordena por tier (A+ > A > B) e depois score
     tier_order = {"A+": 0, "A": 1, "B": 2}

@@ -274,6 +274,10 @@ export interface Recommendation {
   summary: string
   warnings: string[]
   signal: TradeSignal
+  leverage: number
+  risk_pct: number
+  margin_pct: number
+  stop_distance_pct: number
 }
 
 export interface WatchlistItem {

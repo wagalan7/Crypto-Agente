@@ -238,16 +238,17 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                       )}
                     </div>
 
-                    {/* Score + R:R + entry */}
+                    {/* Score + R:R + leverage */}
                     <div className="flex-shrink-0 text-right">
                       <div className="text-sm font-bold text-white">{r.score.toFixed(0)}</div>
                       <div className="text-[10px] text-slate-500">score</div>
                       <div className="text-[10px] text-emerald-300 mt-1 font-mono">1:{r.risk_reward}</div>
+                      <div className="text-[11px] text-orange-300 mt-0.5 font-mono font-bold">{r.leverage}x</div>
                     </div>
                   </div>
 
                   {/* Levels resumido */}
-                  <div className="grid grid-cols-3 gap-2 mt-2 pt-2 border-t border-slate-800/60 text-[11px]">
+                  <div className="grid grid-cols-4 gap-2 mt-2 pt-2 border-t border-slate-800/60 text-[11px]">
                     <div>
                       <div className="text-slate-600">Entrada</div>
                       <div className="font-mono text-yellow-300">{fmt(r.entry)}</div>
@@ -259,6 +260,10 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                     <div>
                       <div className="text-slate-600">TP2</div>
                       <div className="font-mono text-green-300">{fmt(r.tp2)}</div>
+                    </div>
+                    <div title={`Margem ${r.margin_pct}% da banca · risco ${r.risk_pct}% por trade · stop a ${r.stop_distance_pct.toFixed(2)}% do entry`}>
+                      <div className="text-slate-600">Alavanc.</div>
+                      <div className="font-mono text-orange-300 font-bold">{r.leverage}x</div>
                     </div>
                   </div>
                 </button>
@@ -275,6 +280,8 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
           <span className="text-blue-400">B</span> {TIER_DESC['B']}
           <br />
           Atualiza automaticamente a cada 2 min · Cache backend 90s
+          <br />
+          <strong className="text-slate-400">Alavancagem:</strong> dimensionada para 10% da banca em margem · risco por trade A+ 1.5% / A 1% / B 0.5%. Quanto mais perto o stop, mais leverage cabe (calculado individualmente por setup).
         </div>
       </div>
     </div>
