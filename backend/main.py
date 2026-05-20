@@ -534,6 +534,83 @@ async def history_stats(days: int = 30):
         raise HTTPException(500, f"Erro ao obter stats: {e}")
 
 
+@app.get("/api/debug/vision-pipeline")
+async def debug_vision_pipeline():
+    """Roda cada estágio do pipeline Vision e reporta onde quebra."""
+    from services import binance_vision_service as bvs
+    from services.recommendation_service import (
+        _analyze_symbol_tf_via_vision, _compute_score, _classify_tier, SCAN_TFS,
+    )
+    from models.trade_signal import SignalDirection
+
+    stages: Dict[str, Any] = {}
+
+    # 1. Top symbols
+    try:
+        symbols = await bvs.fetch_top_volume_symbols(limit=10)
+        stages["fetch_top_volume_symbols"] = {"ok": True, "count": len(symbols), "sample": symbols[:5]}
+    except Exception as e:
+        stages["fetch_top_volume_symbols"] = {"ok": False, "error": str(e)[:300]}
+        return stages
+
+    if not symbols:
+        return stages
+
+    # 2. OHLCV de um símbolo
+    test_sym = symbols[0]
+    try:
+        df = await bvs.fetch_ohlcv(test_sym, "1h", 100)
+        stages["fetch_ohlcv"] = {"ok": True, "symbol": test_sym, "rows": len(df),
+                                  "last_close": float(df["close"].iloc[-1]) if len(df) else None}
+    except Exception as e:
+        stages["fetch_ohlcv"] = {"ok": False, "error": str(e)[:300]}
+        return stages
+
+    # 3. Análise por símbolo: filtra estágio a estágio
+    per_symbol_results = []
+    for sym in symbols[:10]:
+        sym_info: Dict[str, Any] = {"symbol": sym, "tfs": {}}
+        for tf in SCAN_TFS:
+            try:
+                sig = await _analyze_symbol_tf_via_vision(sym, tf)
+                if sig is None:
+                    sym_info["tfs"][tf] = {"signal": None}
+                    continue
+                score = _compute_score(sig)
+                tier = _classify_tier(sig, score)
+                sym_info["tfs"][tf] = {
+                    "direction": sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction),
+                    "confidence": round(sig.confidence, 2),
+                    "rr": sig.risk_reward,
+                    "score": score,
+                    "tier": tier,
+                    "neutral": sig.direction == SignalDirection.NEUTRAL,
+                }
+            except Exception as e:
+                sym_info["tfs"][tf] = {"error": str(e)[:200]}
+        per_symbol_results.append(sym_info)
+
+    stages["per_symbol"] = per_symbol_results
+
+    # Resumo
+    tier_counts = {"A+": 0, "A": 0, "B": 0, "None": 0}
+    rr_distribution = []
+    for s in per_symbol_results:
+        for tf, info in s["tfs"].items():
+            if "tier" in info:
+                key = info["tier"] if info["tier"] else "None"
+                tier_counts[key] = tier_counts.get(key, 0) + 1
+                if info.get("rr") is not None:
+                    rr_distribution.append(info["rr"])
+    stages["summary"] = {
+        "tier_counts": tier_counts,
+        "rr_min": min(rr_distribution) if rr_distribution else None,
+        "rr_max": max(rr_distribution) if rr_distribution else None,
+        "rr_avg": round(sum(rr_distribution)/len(rr_distribution), 2) if rr_distribution else None,
+    }
+    return stages
+
+
 @app.get("/api/debug/binance-reachability")
 async def debug_binance_reachability():
     """
