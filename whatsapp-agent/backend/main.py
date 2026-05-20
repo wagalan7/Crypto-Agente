@@ -384,6 +384,24 @@ def _validate_webhook_token(tenant: dict, request: Request) -> bool:
     return True
 
 
+# ── Idempotência do webhook Z-API (evita reprocessar mesma mensagem em retries) ──
+_zapi_seen_ids: "_deque[str]" = _deque(maxlen=2000)
+_zapi_seen_set: set[str] = set()
+_zapi_seen_lock = _Lock()
+
+def _zapi_already_seen(msg_id: str) -> bool:
+    if not msg_id:
+        return False
+    with _zapi_seen_lock:
+        if msg_id in _zapi_seen_set:
+            return True
+        if len(_zapi_seen_ids) == _zapi_seen_ids.maxlen:
+            _zapi_seen_set.discard(_zapi_seen_ids[0])
+        _zapi_seen_ids.append(msg_id)
+        _zapi_seen_set.add(msg_id)
+        return False
+
+
 @app.post("/webhook/{slug}/zapi")
 async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
@@ -393,6 +411,17 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     # Ignorar mensagens enviadas pelo próprio número (ecos, status, etc.)
     if payload.get("fromMe"):
         return {"status": "ignored"}
+    # Deduplicação por messageId — Z-API faz retry em caso de timeout e
+    # entregava a mesma mensagem 2x, gerando duas respostas do agente.
+    msg_id = (
+        payload.get("messageId")
+        or payload.get("zaapId")
+        or payload.get("id")
+        or ""
+    )
+    if msg_id and _zapi_already_seen(msg_id):
+        logger.info(f"[{slug}] Webhook duplicado ignorado (msg_id={msg_id})")
+        return {"status": "duplicate"}
     result = wa.extract_message_zapi(payload)
     if not result:
         return {"status": "ignored"}

@@ -295,18 +295,21 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
         now_br = datetime.now(_TZ).replace(tzinfo=None)
         diff_min = (appt_dt - now_br).total_seconds() / 60
 
+        # Usa comparação por data de calendário (não por minutos) para evitar
+        # marcar "amanhã 9h" como "HOJE" quando consultado às 10h da véspera.
+        today_d = now_br.date()
+        appt_d = appt_dt.date()
+        delta_days = (appt_d - today_d).days
         if diff_min < 0:
             timing = "JÁ PASSOU (sessão já ocorreu hoje)"
         elif diff_min <= 30:
             timing = f"EM BREVE — em {int(diff_min)} minutos (HOJE)"
-        elif diff_min <= 120:
+        elif delta_days == 0:
             timing = f"HOJE — em {int(diff_min/60)}h{int(diff_min%60)}min"
-        elif diff_min <= 1440:
-            timing = "HOJE"
-        elif diff_min <= 2880:
+        elif delta_days == 1:
             timing = "AMANHÃ"
         else:
-            timing = f"em {int(diff_min/1440)} dias"
+            timing = f"em {delta_days} dias"
 
         lines.append(
             f"CONSULTA AGENDADA: {cal.format_appointment(appt)} "
@@ -362,8 +365,22 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
         messages=messages,
         max_tokens=512,
     )
-    parsed = _extract_json(raw)
-    agent_resp = AgentResponse(**parsed)
+    # Parse defensivo: LLM pode devolver JSON malformado, prosa misturada,
+    # ou campos fora do schema. Em qualquer falha, devolve resposta segura
+    # em vez de derrubar o webhook.
+    try:
+        parsed = _extract_json(raw)
+        agent_resp = AgentResponse(**parsed)
+    except Exception as e:
+        logger.warning(
+            f"[{tenant['slug']}][{phone}] Falha ao parsear resposta do LLM: {e} | raw={raw[:300]!r}"
+        )
+        agent_resp = AgentResponse(
+            intent=Intent.other,
+            action=Action.none,
+            response_text="Desculpe, não entendi muito bem 😅 Pode reformular?",
+            data={},
+        )
 
     # Guard-rail: se LLM tratou paciente conhecido como novo, corrigir
     if known_patient and agent_resp.intent == Intent.new_patient:
@@ -408,7 +425,11 @@ def _execute_action(tenant: dict, resp: AgentResponse,
         # slot_index vem do LLM como número do display (1-based).
         # Converter para 0-based antes de indexar offered_slots.
         idx_raw = data.get("slot_index", 1)
-        idx = int(idx_raw) - 1  # 1-based → 0-based
+        try:
+            idx = int(idx_raw) - 1  # 1-based → 0-based
+        except (TypeError, ValueError):
+            logger.warning(f"[{tenant['slug']}][{phone}] slot_index inválido do LLM: {idx_raw!r}")
+            return "Não consegui identificar o horário escolhido. Pode repetir, por favor? 😊", None
         name = data.get("patient_name", "Paciente")
         if 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
@@ -445,7 +466,11 @@ def _execute_action(tenant: dict, resp: AgentResponse,
     if action == Action.update:
         appt_id = data.get("appointment_id")
         idx_raw = data.get("slot_index", 1)
-        idx = int(idx_raw) - 1  # 1-based (display) → 0-based
+        try:
+            idx = int(idx_raw) - 1  # 1-based (display) → 0-based
+        except (TypeError, ValueError):
+            logger.warning(f"[{tenant['slug']}][{phone}] slot_index inválido (update): {idx_raw!r}")
+            return "Não consegui identificar o horário escolhido. Pode repetir, por favor? 😊", None
         if appt_id and 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
             duration = tenant.get("session_minutes", 50)
