@@ -1327,6 +1327,15 @@ async def master_run_backup(key: str = ""):
         raise HTTPException(status_code=500, detail=f"Backup falhou: {e}")
 
 
+@app.get("/master/sentry-test")
+async def master_sentry_test(key: str = ""):
+    """Dispara um erro de propósito para validar integração com Sentry.
+    Requer MASTER_KEY. Use uma vez após configurar SENTRY_DSN e depois ignore.
+    """
+    _check_master_key(key)
+    raise RuntimeError("Sentry test error — se você está vendo isso no Sentry, está funcionando ✓")
+
+
 @app.post("/master/tenants/{slug}/fix-zapi-webhook")
 async def master_fix_zapi_webhook(slug: str, key: str = ""):
     """Atualiza a URL de webhook no Z-API para a URL atual (com ?token=...).
