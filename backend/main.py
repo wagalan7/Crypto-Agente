@@ -61,7 +61,7 @@ _snapshot_task: Optional[asyncio.Task] = None
 _scan_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 300        # 5 min entre varreduras server-side
-SERVER_SCAN_TOP_N = 30            # quantos símbolos varrer
+SERVER_SCAN_TOP_N = 40            # quantos símbolos varrer (Vision spot — universo maior compensa filtros)
 SERVER_SCAN_INITIAL_DELAY = 45    # espera 45s após startup pra não competir com init
 
 

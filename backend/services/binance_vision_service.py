@@ -21,8 +21,11 @@ TICKER_TTL = 60
 
 # Pares a ignorar (stablecoins, fiat pairs — sem oportunidade técnica)
 _BLACKLIST_BASES = {
+    # Stablecoins
     "USDC", "BUSD", "TUSD", "FDUSD", "USDP", "DAI", "USDS", "PAX",
-    "EUR", "GBP", "TRY", "BRL", "JPY", "RUB", "ARS", "AUD", "CAD",
+    "USD1", "RLUSD", "PYUSD", "USDD", "USTC", "GUSD", "USDQ",
+    # Fiat
+    "EUR", "GBP", "TRY", "BRL", "JPY", "RUB", "ARS", "AUD", "CAD", "PLN", "ZAR", "MXN",
 }
 
 _client: Optional[httpx.AsyncClient] = None
