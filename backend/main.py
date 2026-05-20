@@ -31,7 +31,11 @@ from services.derivatives_service import analyze_derivatives
 from services.mtf_service import analyze_mtf
 from services.trade_service import get_trades, save_trades
 from services.macro_service import get_btc_dominance, build_macro_context, get_global_market_data
-from services.recommendation_service import get_recommendations, get_recommendations_from_batch
+from services.recommendation_service import (
+    get_recommendations,
+    get_recommendations_from_batch,
+    get_recommendations_via_vision,
+)
 from services.snapshot_service import (
     save_recommendations,
     check_open_snapshots,
@@ -79,24 +83,20 @@ async def _server_scan_loop():
     snapshots e dispara push notifications pras recs A+ / A novas — sem
     precisar do usuário abrir o app.
     """
-    from services.recommendation_service import _cache as _rec_cache
     await asyncio.sleep(SERVER_SCAN_INITIAL_DELAY)
     while True:
         try:
             from services.push_service import PUSH_ENABLED as _PE
             logging.info(
-                f"[server-scan] iniciando ciclo — DB={DB_ENABLED} PUSH={_PE} top_n={SERVER_SCAN_TOP_N}"
+                f"[server-scan] iniciando ciclo — DB={DB_ENABLED} PUSH={_PE} "
+                f"top_n={SERVER_SCAN_TOP_N} fonte=binance-vision"
             )
             if not _PE and not DB_ENABLED:
                 logging.info("[server-scan] DB e push ambos OFF, pulando")
                 await asyncio.sleep(SERVER_SCAN_INTERVAL)
                 continue
 
-            # Invalida cache de 90s pra forçar varredura fresca
-            _rec_cache["ts"] = 0
-            _rec_cache["data"] = None
-
-            recs = await get_recommendations(top_n=SERVER_SCAN_TOP_N)
+            recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
             recs_dict = [r.model_dump() for r in recs]
 
             # Distribuição por tier — útil pra diagnosticar
@@ -174,6 +174,11 @@ async def lifespan(app: FastAPI):
                 pass
     await close_db()
     await close_exchange()
+    try:
+        from services import binance_vision_service as _bvs
+        await _bvs.close()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Crypto AI Agent", version="1.0.0", lifespan=lifespan)
@@ -571,15 +576,11 @@ async def debug_binance_reachability():
 @app.post("/api/push/test-scan")
 async def push_test_scan():
     """
-    DIAGNÓSTICO: dispara uma varredura server-side AGORA e retorna o que achou.
-    Útil pra verificar por que o loop não está mandando push.
+    DIAGNÓSTICO: dispara uma varredura server-side AGORA (via Binance Vision)
+    e retorna o que achou. Útil pra verificar por que o loop não está mandando push.
     """
-    from services.recommendation_service import _cache as _rec_cache
-    _rec_cache["ts"] = 0
-    _rec_cache["data"] = None
-
     try:
-        recs = await get_recommendations(top_n=SERVER_SCAN_TOP_N)
+        recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
     except Exception as e:
         raise HTTPException(500, f"varredura falhou: {e}")
 

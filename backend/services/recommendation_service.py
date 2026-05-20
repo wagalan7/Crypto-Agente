@@ -354,6 +354,74 @@ async def get_recommendations_from_batch(
     return recommendations
 
 
+async def _analyze_symbol_tf_via_vision(symbol: str, tf: str) -> Optional[TradeSignal]:
+    """Variante de _analyze_symbol_tf que usa Binance Vision (spot). Pula
+    derivativos (não tem em spot) e MTF (consistência da fonte) — vai
+    pontuar levemente abaixo, mas aceitável pro server-scan."""
+    from services import binance_vision_service as bvs
+    try:
+        df = await bvs.fetch_ohlcv(symbol, tf, 300)
+        if df.empty or len(df) < 80:
+            return None
+        ind = calculate_indicators(df)
+        patterns = detect_all_patterns(df)
+        return build_trade_signal(
+            symbol, tf, df, ind, patterns,
+            derivatives=None, mtf=None, with_backtest=False,
+        )
+    except Exception:
+        return None
+
+
+async def _best_tf_for_symbol_via_vision(symbol: str) -> Optional[tuple]:
+    results = await asyncio.gather(*[
+        _analyze_symbol_tf_via_vision(symbol, tf) for tf in SCAN_TFS
+    ])
+    scored: List[tuple] = []
+    for sig in results:
+        if sig is None or sig.direction == SignalDirection.NEUTRAL:
+            continue
+        score = _compute_score(sig)
+        scored.append((sig, score))
+    if not scored:
+        return None
+    return max(scored, key=lambda x: x[1])
+
+
+async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation]:
+    """Versão server-side via Binance Spot (data-api.binance.vision).
+    Cache próprio (não compartilha com get_recommendations)."""
+    from services import binance_vision_service as bvs
+    try:
+        symbols = await bvs.fetch_top_volume_symbols(limit=top_n)
+    except Exception:
+        symbols = []
+    if not symbols:
+        return []
+
+    recommendations: List[Recommendation] = []
+    sem = asyncio.Semaphore(6)
+
+    async def _bounded(sym: str):
+        async with sem:
+            return sym, await _best_tf_for_symbol_via_vision(sym)
+
+    all_results = await asyncio.gather(*[_bounded(s) for s in symbols])
+
+    for _symbol, best in all_results:
+        if best is None:
+            continue
+        sig, score = best
+        tier = _classify_tier(sig, score)
+        if tier is None:
+            continue
+        recommendations.append(_build_recommendation(sig, score, tier))
+
+    tier_order = {"A+": 0, "A": 1, "B": 2}
+    recommendations.sort(key=lambda r: (tier_order[r.tier], -r.score))
+    return recommendations
+
+
 async def get_recommendations(top_n: int = 30) -> List[Recommendation]:
     """Endpoint principal. Cacheado por 90s."""
     now = time.time()
