@@ -476,7 +476,18 @@ def _execute_action(tenant: dict, resp: AgentResponse,
 
     if action == Action.confirm:
         appt_id = data.get("appointment_id")
+        # Fallback: se o LLM não devolveu appointment_id, pega a próxima consulta do paciente.
+        if not appt_id:
+            try:
+                nxt = cal.get_next_appointment(tenant_id, phone)
+                if nxt:
+                    appt_id = nxt.get("id")
+            except Exception as e:
+                logger.warning(f"[confirm] fallback get_next_appointment falhou: {e}")
         if appt_id:
             db.confirm_appointment(tenant_id, appt_id)
+            logger.info(f"[{tenant['slug']}][{phone}] confirmed appointment id={appt_id}")
+        else:
+            logger.warning(f"[{tenant['slug']}][{phone}] Action.confirm sem appointment_id e sem próxima consulta")
 
     return text, {"type": "new_message", "data": {"phone": phone, "intent": resp.intent}}

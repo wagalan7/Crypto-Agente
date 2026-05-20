@@ -542,6 +542,11 @@ def get_appointments_for_confirmation(tenant_id: int) -> list[dict]:
                  AND cancelled = 0
                  AND scheduled_at > ?
                  AND scheduled_at <= ?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM agent_paused ap
+                     WHERE ap.tenant_id = appointments.tenant_id
+                       AND ap.phone = appointments.phone
+                 )
                ORDER BY scheduled_at""",
             (tenant_id, window_start, window_end),
         ).fetchall()
@@ -571,6 +576,11 @@ def get_appointments_today_unconfirmed(tenant_id: int) -> list[dict]:
                  AND followup_sent = 0
                  AND cancelled = 0
                  AND scheduled_at > ?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM agent_paused ap
+                     WHERE ap.tenant_id = appointments.tenant_id
+                       AND ap.phone = appointments.phone
+                 )
                ORDER BY scheduled_at""",
             (tenant_id, today_str, now_str),
         ).fetchall()
