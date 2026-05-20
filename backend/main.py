@@ -56,9 +56,9 @@ from models.trade_signal import TradeSignal
 _snapshot_task: Optional[asyncio.Task] = None
 _scan_task: Optional[asyncio.Task] = None
 
-SERVER_SCAN_INTERVAL = 600        # 10 min entre varreduras server-side
-SERVER_SCAN_TOP_N = 25            # quantos símbolos varrer
-SERVER_SCAN_INITIAL_DELAY = 60    # espera 60s após startup pra não competir com init
+SERVER_SCAN_INTERVAL = 300        # 5 min entre varreduras server-side
+SERVER_SCAN_TOP_N = 30            # quantos símbolos varrer
+SERVER_SCAN_INITIAL_DELAY = 45    # espera 45s após startup pra não competir com init
 
 
 async def _snapshot_loop():
@@ -79,36 +79,68 @@ async def _server_scan_loop():
     snapshots e dispara push notifications pras recs A+ / A novas — sem
     precisar do usuário abrir o app.
     """
+    from services.recommendation_service import _cache as _rec_cache
     await asyncio.sleep(SERVER_SCAN_INITIAL_DELAY)
     while True:
         try:
             from services.push_service import PUSH_ENABLED as _PE
+            logging.info(
+                f"[server-scan] iniciando ciclo — DB={DB_ENABLED} PUSH={_PE} top_n={SERVER_SCAN_TOP_N}"
+            )
             if not _PE and not DB_ENABLED:
+                logging.info("[server-scan] DB e push ambos OFF, pulando")
                 await asyncio.sleep(SERVER_SCAN_INTERVAL)
                 continue
 
+            # Invalida cache de 90s pra forçar varredura fresca
+            _rec_cache["ts"] = 0
+            _rec_cache["data"] = None
+
             recs = await get_recommendations(top_n=SERVER_SCAN_TOP_N)
             recs_dict = [r.model_dump() for r in recs]
+
+            # Distribuição por tier — útil pra diagnosticar
+            by_tier = {"A+": 0, "A": 0, "B": 0}
+            for r in recs_dict:
+                t = r.get("tier", "")
+                if t in by_tier:
+                    by_tier[t] += 1
+            logging.info(
+                f"[server-scan] varredura completa: {len(recs)} recs "
+                f"(A+={by_tier['A+']} A={by_tier['A']} B={by_tier['B']})"
+            )
+
+            # Filtra só A+ e A (B não notifica por default do usuário)
+            pushable = [r for r in recs_dict if r.get("tier") in ("A+", "A")]
 
             newly_saved = 0
             if DB_ENABLED and recs_dict:
                 try:
                     newly_saved = await save_recommendations(recs_dict) or 0
                 except Exception as e:
-                    logging.warning(f"server_scan save falhou: {e}")
+                    logging.warning(f"[server-scan] save falhou: {e}")
 
-            if _PE and newly_saved > 0:
+            logging.info(
+                f"[server-scan] {newly_saved}/{len(recs_dict)} novas (dedup 2h), "
+                f"{len(pushable)} elegíveis pra push"
+            )
+
+            if _PE and newly_saved > 0 and pushable:
                 try:
-                    sent = await notify_recommendations_batch(recs_dict, newly_saved)
-                    logging.info(f"[server-scan] {len(recs)} recs, {newly_saved} novas, {sent} pushes enviados")
+                    sent = await notify_recommendations_batch(pushable, len(pushable))
+                    logging.info(f"[server-scan] ✅ {sent} push(es) enviados")
                 except Exception as e:
-                    logging.warning(f"server_scan push falhou: {e}")
+                    logging.warning(f"[server-scan] push falhou: {e}")
             else:
-                logging.info(f"[server-scan] {len(recs)} recs, {newly_saved} novas (sem push)")
+                reason = []
+                if not _PE: reason.append("push OFF")
+                if newly_saved == 0: reason.append("nada novo")
+                if not pushable: reason.append("nenhum A+/A")
+                logging.info(f"[server-scan] sem push enviado ({', '.join(reason) or '?'})")
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logging.warning(f"server_scan_loop error: {e}")
+            logging.warning(f"[server-scan] erro: {e}", exc_info=True)
 
         try:
             await asyncio.sleep(SERVER_SCAN_INTERVAL)
@@ -495,6 +527,60 @@ async def history_stats(days: int = 30):
     except Exception as e:
         logging.error(f"history-stats error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao obter stats: {e}")
+
+
+@app.post("/api/push/test-scan")
+async def push_test_scan():
+    """
+    DIAGNÓSTICO: dispara uma varredura server-side AGORA e retorna o que achou.
+    Útil pra verificar por que o loop não está mandando push.
+    """
+    from services.recommendation_service import _cache as _rec_cache
+    _rec_cache["ts"] = 0
+    _rec_cache["data"] = None
+
+    try:
+        recs = await get_recommendations(top_n=SERVER_SCAN_TOP_N)
+    except Exception as e:
+        raise HTTPException(500, f"varredura falhou: {e}")
+
+    recs_dict = [r.model_dump() for r in recs]
+    by_tier = {"A+": 0, "A": 0, "B": 0}
+    for r in recs_dict:
+        t = r.get("tier", "")
+        if t in by_tier:
+            by_tier[t] += 1
+
+    pushable = [r for r in recs_dict if r.get("tier") in ("A+", "A")]
+
+    newly_saved = 0
+    if DB_ENABLED and recs_dict:
+        try:
+            newly_saved = await save_recommendations(recs_dict) or 0
+        except Exception as e:
+            logging.warning(f"test-scan save falhou: {e}")
+
+    sent = 0
+    if PUSH_ENABLED and newly_saved > 0 and pushable:
+        try:
+            sent = await notify_recommendations_batch(pushable, len(pushable))
+        except Exception as e:
+            logging.warning(f"test-scan push falhou: {e}")
+
+    return {
+        "push_enabled": PUSH_ENABLED,
+        "db_enabled": DB_ENABLED,
+        "total_recs": len(recs),
+        "by_tier": by_tier,
+        "pushable_count": len(pushable),
+        "newly_saved": newly_saved,
+        "pushes_sent": sent,
+        "top_samples": [
+            {"symbol": r["symbol"], "tier": r["tier"], "tf": r["timeframe"],
+             "rr": r["risk_reward"], "score": r["score"], "direction": r["direction"]}
+            for r in recs_dict[:10]
+        ],
+    }
 
 
 @app.get("/api/push/vapid-public-key")
