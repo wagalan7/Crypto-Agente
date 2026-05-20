@@ -135,10 +135,89 @@
   <div id="pane-slots" class="tab-content">
     <div class="flex items-center justify-between mb-3 mt-4 md:mt-0">
       <h2 class="text-base font-semibold text-gray-800">Horários</h2>
-      <button onclick="loadSlots(); loadWeekly()" class="text-sm text-brand">↻ Atualizar</button>
+      <button onclick="refreshSlotsTab(this)" class="text-sm text-brand whitespace-nowrap">↻ Atualizar</button>
     </div>
+
+    <!-- Editor de horários -->
+    <div class="bg-white border border-gray-200 rounded-xl mb-4 overflow-hidden">
+      <button onclick="toggleSlotConfig()" id="slot-config-toggle"
+        class="w-full flex items-center justify-between px-4 py-3 text-left">
+        <span class="font-medium text-sm text-gray-800">⚙️ Configurar horários (adicionar / bloquear / alterar)</span>
+        <span id="slot-config-arrow" class="text-gray-400 text-sm">▼</span>
+      </button>
+      <div id="slot-config-body" class="hidden border-t border-gray-100 p-4 space-y-4">
+
+        <!-- Dias da semana -->
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-2">Dias de atendimento</label>
+          <div class="grid grid-cols-7 gap-1.5">
+            {% set wd_set = (tenant.working_days or '0,1,2,3,4').split(',') %}
+            {% set day_labels = [('0','Seg'),('1','Ter'),('2','Qua'),('3','Qui'),('4','Sex'),('5','Sáb'),('6','Dom')] %}
+            {% for v, lbl in day_labels %}
+            <label class="cursor-pointer">
+              <input type="checkbox" class="peer hidden slot-wd" value="{{ v }}" {% if v in wd_set %}checked{% endif %}/>
+              <div class="text-center text-xs py-2 rounded-lg border border-gray-200 bg-gray-50 text-gray-500 peer-checked:bg-brand peer-checked:text-white peer-checked:border-brand transition">
+                {{ lbl }}
+              </div>
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+
+        <!-- Início / Fim / Duração -->
+        <div class="grid grid-cols-3 gap-2">
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1">Início</label>
+            <input id="slot-start" type="number" min="0" max="23" value="{{ tenant.working_hours_start }}"
+              onchange="renderBlockedHours()"
+              class="w-full border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-brand"/>
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1">Fim</label>
+            <input id="slot-end" type="number" min="1" max="24" value="{{ tenant.working_hours_end }}"
+              onchange="renderBlockedHours()"
+              class="w-full border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-brand"/>
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1">Duração (min)</label>
+            <input id="slot-duration" type="number" min="20" max="180" step="5" value="{{ tenant.session_minutes }}"
+              class="w-full border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-brand"/>
+          </div>
+        </div>
+
+        <!-- Horas bloqueadas -->
+        <div>
+          <div class="flex items-center justify-between mb-2">
+            <label class="block text-xs font-medium text-gray-600">Horas bloqueadas (almoço / pausa)</label>
+            <span class="text-[10px] text-gray-400">clique para alternar</span>
+          </div>
+          <input type="hidden" id="slot-blocked-raw" value="{{ tenant.blocked_hours or '12,13,14' }}"/>
+          <div id="slot-blocked-grid" class="grid grid-cols-6 gap-1.5"></div>
+        </div>
+
+        <div id="slot-config-feedback" class="hidden text-sm rounded-lg px-3 py-2"></div>
+        <div class="flex gap-2">
+          <button onclick="saveSlotConfig(this)"
+            class="flex-1 bg-brand text-white py-2.5 rounded-xl text-sm font-semibold">
+            💾 Salvar configuração
+          </button>
+          <button onclick="toggleSlotConfig()"
+            class="px-4 py-2.5 rounded-xl text-sm font-medium text-gray-500 border border-gray-200">
+            Fechar
+          </button>
+        </div>
+        <p class="text-[11px] text-gray-400 leading-relaxed">
+          Para excluir um horário específico (ex: cancelar consulta), use a aba <strong>Agenda</strong>.
+          Para bloquear uma janela do dia (ex: almoço), marque as horas acima.
+          Para adicionar mais horários, aumente o intervalo Início–Fim ou marque mais dias.
+        </p>
+      </div>
+    </div>
+
     <p class="text-xs text-gray-500 mb-2">Próximos horários livres</p>
-    <div id="slots-list" class="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6"></div>
+    <div id="slots-list" class="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
+      <div class="text-gray-400 text-sm col-span-2 md:col-span-3 text-center py-4">Carregando...</div>
+    </div>
     <p class="text-xs text-gray-500 mb-2">Agenda das próximas semanas</p>
     <div id="weekly-list" class="space-y-3">
       <div class="text-gray-400 text-sm text-center py-6">Carregando...</div>
@@ -739,7 +818,7 @@ function showTab(name) {
   if (mtab) mtab.classList.replace("text-gray-400","text-brand");
 
   if (name==="agenda")    { loadAgenda();    newAppointments=0; updateBadge("agenda",0); }
-  if (name==="slots")     { loadSlots(); loadWeekly(); }
+  if (name==="slots")     { loadSlots(); loadWeekly(); renderBlockedHours(); }
   if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
   if (name==="config")    loadBillingLogs();
 }
@@ -926,13 +1005,122 @@ function cancelAppt(id) {
 
 // ── Slots ─────────────────────────────────────────────────────────────────────
 function loadSlots() {
+  const el = document.getElementById("slots-list");
+  el.innerHTML = '<div class="text-gray-400 text-sm col-span-2 md:col-span-3 text-center py-4">⏳ Carregando…</div>';
   api("/dashboard/api/slots").then(data => {
-    const el = document.getElementById("slots-list");
-    if (!data.slots?.length) { el.innerHTML='<div class="text-gray-400 text-sm col-span-2">Nenhum horário.</div>'; return; }
+    if (!data.slots?.length) {
+      el.innerHTML = '<div class="text-gray-400 text-sm col-span-2 md:col-span-3 text-center py-4">Nenhum horário disponível com a configuração atual.</div>';
+      return;
+    }
     el.innerHTML = data.slots.map(s =>
       `<div class="bg-white border border-gray-200 rounded-xl px-3 py-3 text-sm text-gray-700 text-center">${s}</div>`
     ).join("");
+  }).catch(e => {
+    el.innerHTML = `<div class="text-red-500 text-sm col-span-2 md:col-span-3 text-center py-4">Erro: ${e.message}</div>`;
   });
+}
+
+// Botão "↻ Atualizar" da aba — feedback visual + recarrega tudo
+function refreshSlotsTab(btn) {
+  if (btn) { btn.disabled = true; const t = btn.textContent; btn.textContent = "⏳ Atualizando…"; setTimeout(() => { btn.disabled = false; btn.textContent = t; }, 1200); }
+  loadSlots();
+  loadWeekly();
+}
+
+// Editor de horários
+function toggleSlotConfig() {
+  const body = document.getElementById('slot-config-body');
+  const arrow = document.getElementById('slot-config-arrow');
+  const opened = body.classList.toggle('hidden');
+  arrow.textContent = opened ? '▼' : '▲';
+  if (!opened) renderBlockedHours();
+}
+
+function renderBlockedHours() {
+  const start = parseInt(document.getElementById('slot-start').value, 10) || 0;
+  const end = parseInt(document.getElementById('slot-end').value, 10) || 24;
+  const raw = document.getElementById('slot-blocked-raw').value || '';
+  const blocked = new Set(raw.split(',').map(s => s.trim()).filter(Boolean));
+  const grid = document.getElementById('slot-blocked-grid');
+  const hours = [];
+  for (let h = start; h < end; h++) hours.push(h);
+  grid.innerHTML = hours.map(h => {
+    const isBlocked = blocked.has(String(h));
+    const cls = isBlocked
+      ? 'bg-red-50 text-red-700 border-red-200'
+      : 'bg-gray-50 text-gray-600 border-gray-200';
+    return `<button type="button" data-hour="${h}" data-blocked="${isBlocked ? '1':'0'}"
+      onclick="toggleBlockedHour(this)"
+      class="border ${cls} text-xs font-medium py-2 rounded-lg active:scale-95 transition">${String(h).padStart(2,'0')}h</button>`;
+  }).join('');
+}
+
+function toggleBlockedHour(btn) {
+  const isBlocked = btn.getAttribute('data-blocked') === '1';
+  if (isBlocked) {
+    btn.setAttribute('data-blocked', '0');
+    btn.className = 'border bg-gray-50 text-gray-600 border-gray-200 text-xs font-medium py-2 rounded-lg active:scale-95 transition';
+  } else {
+    btn.setAttribute('data-blocked', '1');
+    btn.className = 'border bg-red-50 text-red-700 border-red-200 text-xs font-medium py-2 rounded-lg active:scale-95 transition';
+  }
+}
+
+function saveSlotConfig(btn) {
+  const fb = document.getElementById('slot-config-feedback');
+  fb.classList.add('hidden');
+  const start = parseInt(document.getElementById('slot-start').value, 10);
+  const end = parseInt(document.getElementById('slot-end').value, 10);
+  const duration = parseInt(document.getElementById('slot-duration').value, 10);
+  if (isNaN(start) || isNaN(end) || start >= end) {
+    fb.className = 'text-sm rounded-lg px-3 py-2 bg-red-50 text-red-700';
+    fb.textContent = 'O horário de início precisa ser menor que o de fim.';
+    fb.classList.remove('hidden');
+    return;
+  }
+  if (isNaN(duration) || duration < 20) {
+    fb.className = 'text-sm rounded-lg px-3 py-2 bg-red-50 text-red-700';
+    fb.textContent = 'Duração mínima da sessão: 20 minutos.';
+    fb.classList.remove('hidden');
+    return;
+  }
+  const days = Array.from(document.querySelectorAll('.slot-wd:checked')).map(c => c.value).sort();
+  if (!days.length) {
+    fb.className = 'text-sm rounded-lg px-3 py-2 bg-red-50 text-red-700';
+    fb.textContent = 'Selecione ao menos um dia da semana.';
+    fb.classList.remove('hidden');
+    return;
+  }
+  const blocked = Array.from(document.querySelectorAll('#slot-blocked-grid [data-blocked="1"]')).map(b => b.getAttribute('data-hour')).sort((a,b)=>parseInt(a)-parseInt(b));
+  const payload = {
+    working_hours_start: start,
+    working_hours_end: end,
+    session_minutes: duration,
+    working_days: days.join(','),
+    blocked_hours: blocked.join(','),
+  };
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '⏳ Salvando…';
+  api('/dashboard/api/config', { method: 'PATCH', body: JSON.stringify(payload) })
+    .then(() => {
+      document.getElementById('slot-blocked-raw').value = blocked.join(',');
+      fb.className = 'text-sm rounded-lg px-3 py-2 bg-green-50 text-green-700';
+      fb.textContent = '✓ Horários atualizados.';
+      fb.classList.remove('hidden');
+      loadSlots();
+      loadWeekly();
+      showToast('Configuração de horários salva', 'success');
+    })
+    .catch(e => {
+      fb.className = 'text-sm rounded-lg px-3 py-2 bg-red-50 text-red-700';
+      fb.textContent = 'Erro: ' + e.message;
+      fb.classList.remove('hidden');
+    })
+    .finally(() => {
+      btn.disabled = false;
+      btn.textContent = orig;
+    });
 }
 
 // Visão semanal: agrupa próximas consultas por semana e por dia
