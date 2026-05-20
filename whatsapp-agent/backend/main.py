@@ -548,6 +548,7 @@ class TenantUpdate(BaseModel):
     followup_msg_template: Optional[str] = None
     billing_msg_template: Optional[str] = None
     psychologist_phone: Optional[str] = None
+    email: Optional[str] = None
     free_until: Optional[str] = None  # data ISO (YYYY-MM-DD) de acesso gratuito
     # CalDAV
     caldav_url: Optional[str] = None
