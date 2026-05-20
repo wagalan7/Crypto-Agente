@@ -999,6 +999,12 @@ def controle_mobile(token: str, request: Request):
                WHERE tenant_id = ? AND phone != '' AND role = 'user'""",
             (tenant["id"],)
         ).fetchall()
+        # Nomes salvos manualmente (via renomear ou cadastro)
+        patient_rows = conn.execute(
+            """SELECT phone, name FROM patients
+               WHERE tenant_id = ? AND name != '' AND name IS NOT NULL""",
+            (tenant["id"],)
+        ).fetchall()
 
     # Monta dicionário phone → nome(s) — agrupa múltiplos pacientes no mesmo número
     names_by_phone: dict[str, list[str]] = {}
@@ -1018,6 +1024,12 @@ def controle_mobile(token: str, request: Request):
         p = _norm_phone(r["phone"])
         if p and p not in seen:
             seen[p] = ""  # sem nome — mostra só o número
+
+    # Preenche nomes salvos em patients (renomeados via controle)
+    for r in patient_rows:
+        p = _norm_phone(r["phone"])
+        if p and p in seen and not seen[p]:
+            seen[p] = r["name"]
 
     # Filtra IDs de grupo do WhatsApp (não são pacientes)
     def _is_group(ph: str) -> bool:

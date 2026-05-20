@@ -547,6 +547,7 @@ def set_attendance(tenant_id: int, appointment_id: int, status: str) -> bool:
 def rename_patient_by_phone(tenant_id: int, phone: str, new_name: str) -> int:
     """Atualiza o nome de todos os agendamentos e do cadastro do paciente.
     Usado quando o contato apareceu inicialmente só com número.
+    Funciona mesmo para contatos que só têm conversas (sem agendamentos).
     """
     new_name = (new_name or "").strip()
     if not new_name or not phone:
@@ -556,12 +557,13 @@ def rename_patient_by_phone(tenant_id: int, phone: str, new_name: str) -> int:
             "UPDATE appointments SET patient_name = ? WHERE tenant_id = ? AND phone = ?",
             (new_name, tenant_id, phone),
         )
-        # Atualiza também a tabela patients (se houver registro)
-        conn.execute(
-            """UPDATE patients SET name = ?
-               WHERE tenant_id = ? AND phone = ? AND (name IS NULL OR name = '')""",
-            (new_name, tenant_id, phone),
-        )
+        # Sempre faz upsert na tabela patients — garante que o nome fica salvo
+        # mesmo para contatos que só aparecem em conversas (sem agendamentos)
+        conn.execute("""
+            INSERT INTO patients (tenant_id, phone, name)
+            VALUES (?, ?, ?)
+            ON CONFLICT(tenant_id, phone) DO UPDATE SET name = excluded.name
+        """, (tenant_id, phone, new_name))
         return cur.rowcount or 0
 
 
