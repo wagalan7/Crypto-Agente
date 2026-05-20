@@ -2072,14 +2072,24 @@ function saveZapiConfig(btn) {
     return;
   }
   const orig = btn.textContent;
-  btn.disabled = true; btn.textContent = '⏳ Salvando…';
-  // Also set provider to zapi
+  btn.disabled = true; btn.textContent = '⏳ Configurando…';
   api('/dashboard/api/config', { method: 'PATCH', body: JSON.stringify(payload) })
-    .then(() => {
-      fb.className = 'text-sm text-center text-green-600 mt-2';
-      fb.textContent = '✓ WhatsApp configurado com sucesso.';
+    .then(data => {
+      const wh = data.webhook;
+      if (wh && wh.ok) {
+        fb.className = 'text-sm text-center text-green-600 mt-2';
+        fb.textContent = '✓ WhatsApp configurado e webhook ativado automaticamente!';
+        showToast('WhatsApp Z-API ativo ✓', 'success');
+      } else if (wh && !wh.ok) {
+        fb.className = 'text-sm text-center text-yellow-600 mt-2';
+        fb.textContent = '⚠️ Credenciais salvas, mas o webhook precisará ser configurado manualmente no Z-API.';
+        showToast('Credenciais salvas', 'success');
+      } else {
+        fb.className = 'text-sm text-center text-green-600 mt-2';
+        fb.textContent = '✓ Configuração salva.';
+        showToast('WhatsApp Z-API salvo', 'success');
+      }
       fb.classList.remove('hidden');
-      showToast('WhatsApp Z-API salvo', 'success');
     })
     .catch(e => {
       fb.className = 'text-sm text-center text-red-600 mt-2';

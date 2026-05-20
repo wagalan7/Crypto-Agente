@@ -108,6 +108,50 @@ def extract_selfmessage_zapi(payload: dict) -> tuple[str, str, str] | None:
     return None
 
 
+async def configure_webhook_zapi(tenant: dict, webhook_url: str) -> dict:
+    """
+    Configura o webhook de mensagens recebidas no Z-API automaticamente.
+    Retorna {"ok": True} ou {"ok": False, "error": "..."}
+    """
+    instance_id = tenant.get("evolution_instance", "")
+    token = tenant.get("evolution_key", "")
+    client_token = tenant.get("evolution_url", "")
+
+    if not instance_id or not token:
+        return {"ok": False, "error": "Instance ID ou Token não configurados"}
+
+    base = f"https://api.z-api.io/instances/{instance_id}/token/{token}"
+    headers = {"Content-Type": "application/json"}
+    if client_token:
+        headers["Client-Token"] = client_token
+
+    errors = []
+    # Z-API tem endpoints separados para cada tipo de webhook
+    endpoints = [
+        ("update-webhook-received",  webhook_url),  # mensagens recebidas
+        ("update-webhook-delivery",  webhook_url),  # confirmação de entrega (opcional)
+    ]
+    async with httpx.AsyncClient(timeout=15) as client:
+        for ep, url_val in endpoints:
+            try:
+                r = await client.put(
+                    f"{base}/{ep}",
+                    json={"value": url_val},
+                    headers=headers,
+                )
+                if r.status_code >= 400:
+                    errors.append(f"{ep}: HTTP {r.status_code} — {r.text[:120]}")
+            except Exception as e:
+                errors.append(f"{ep}: {e}")
+
+    if errors:
+        logger.warning(f"[zapi-webhook] Erros ao configurar: {errors}")
+        return {"ok": False, "error": "; ".join(errors)}
+
+    logger.info(f"[zapi-webhook] Webhook configurado → {webhook_url}")
+    return {"ok": True}
+
+
 async def delete_message_zapi(tenant: dict, phone: str, msg_id: str) -> bool:
     """Deleta uma mensagem enviada via Z-API (para todos)."""
     if not msg_id:

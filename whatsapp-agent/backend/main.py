@@ -1199,16 +1199,26 @@ def dash_conversation(phone: str, request: Request):
 
 
 @app.patch("/dashboard/api/config")
-def dash_config(request: Request, body: TenantUpdate):
+async def dash_config(request: Request, body: TenantUpdate):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
     fields = body.model_dump(exclude_none=True)
+    saving_zapi = fields.get("evolution_instance") and fields.get("evolution_key")
     # Auto-set provider to zapi when Z-API credentials are provided
-    if fields.get("evolution_instance") and fields.get("evolution_key"):
+    if saving_zapi:
         fields["whatsapp_provider"] = "zapi"
     if fields:
         db.update_tenant(tenant["slug"], **fields)
-    return {"status": "updated"}
+
+    # Configurar webhook automaticamente ao salvar credenciais Z-API
+    webhook_result = None
+    if saving_zapi:
+        updated_tenant = db.get_tenant(tenant["slug"])
+        wt = db.ensure_webhook_token(updated_tenant["id"])
+        webhook_url = f"{config.BASE_URL}/webhook/{updated_tenant['slug']}/zapi?token={wt}"
+        webhook_result = await wa.configure_webhook_zapi(updated_tenant, webhook_url)
+
+    return {"status": "updated", "webhook": webhook_result}
 
 
 # ── Cobrança ────────────────────────────────────────────────────────────────────
