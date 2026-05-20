@@ -59,31 +59,66 @@ def _quando_label(appt: dict) -> str:
     return f"de {_DIAS_SEMANA[appt_date.weekday()]}"
 
 
+_DEFAULT_CONFIRMATION = (
+    "Olá, {nome}! 😊 Passando para confirmar sua sessão {quando}:\n\n"
+    "📅 {data_hora}\n\n"
+    "Você pode confirmar presença? Responda *SIM* para confirmar "
+    "ou me avise se precisar remarcar. 🙏\n\n"
+    "— {psicologa}"
+)
+
+_DEFAULT_FOLLOWUP = (
+    "Olá, {nome}! 😊 Sua sessão de *hoje* ainda não foi confirmada:\n\n"
+    "📅 {data_hora}\n\n"
+    "Por favor responda *SIM* para confirmar sua presença, ou me avise "
+    "caso precise cancelar ou remarcar.\n\n"
+    "⚠️ *Lembrete:* conforme combinado na primeira sessão, sessões não "
+    "canceladas com antecedência e com ausência serão cobradas normalmente, "
+    "pois o horário fica reservado exclusivamente para você.\n\n"
+    "— {psicologa}"
+)
+
+_DEFAULT_BILLING = (
+    "Boa tardeee {nome} 🌷\n"
+    "Espero que esteja tudo bem.\n\n"
+    "Gostaria de informar o valor das sessões do último mês.\n\n"
+    "Fechamos em R$ {total} 🩷\n\n"
+    "Qualquer dúvida estou à disposição."
+)
+
+
+def _apply_template(template: str, **kwargs) -> str:
+    """Substitui {variavel} no template. Ignora chaves não reconhecidas."""
+    try:
+        return template.format(**kwargs)
+    except KeyError:
+        # template tem variável desconhecida — aplica o que conseguir
+        import re
+        result = template
+        for k, v in kwargs.items():
+            result = result.replace("{" + k + "}", str(v))
+        return result
+
+
 def _confirmation_message(tenant: dict, appt: dict) -> str:
-    formatted = cal.format_appointment(appt)
-    name = appt["patient_name"].split()[0]
-    quando = _quando_label(appt)
-    return (
-        f"Olá, {name}! 😊 Passando para confirmar sua sessão {quando}:\n\n"
-        f"📅 {formatted}\n\n"
-        f"Você pode confirmar presença? Responda *SIM* para confirmar "
-        f"ou me avise se precisar remarcar. 🙏\n\n"
-        f"— {tenant['psychologist_name']}"
+    tpl = (tenant.get("confirmation_msg_template") or "").strip() or _DEFAULT_CONFIRMATION
+    return _apply_template(
+        tpl,
+        nome=appt["patient_name"].split()[0],
+        data_hora=cal.format_appointment(appt),
+        quando=_quando_label(appt),
+        psicologa=tenant["psychologist_name"],
     )
 
 
 def _followup_message(tenant: dict, appt: dict) -> str:
-    formatted = cal.format_appointment(appt)
-    name = appt["patient_name"].split()[0]
-    return (
-        f"Olá, {name}! 😊 Sua sessão de *hoje* ainda não foi confirmada:\n\n"
-        f"📅 {formatted}\n\n"
-        f"Por favor responda *SIM* para confirmar sua presença, ou me avise "
-        f"caso precise cancelar ou remarcar.\n\n"
-        f"⚠️ *Lembrete:* conforme combinado na primeira sessão, sessões não "
-        f"canceladas com antecedência e com ausência serão cobradas normalmente, "
-        f"pois o horário fica reservado exclusivamente para você.\n\n"
-        f"— {tenant['psychologist_name']}"
+    tpl = (tenant.get("followup_msg_template") or "").strip() or _DEFAULT_FOLLOWUP
+    return _apply_template(
+        tpl,
+        nome=appt["patient_name"].split()[0],
+        data_hora=cal.format_appointment(appt),
+        quando="de hoje",
+        psicologa=tenant["psychologist_name"],
     )
 
 
@@ -126,15 +161,16 @@ async def _run_confirmations():
                     logger.warning(f"[{tenant['slug']}] ✗ Falha followup → {appt['phone']}")
 
 
-def _billing_message(patient_name: str, total: float, sessions_count: int) -> str:
+def _billing_message(tenant: dict, patient_name: str, total: float, sessions_count: int) -> str:
     first_name = patient_name.split()[0] if patient_name else "paciente"
     total_fmt = f"{total:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return (
-        f"Boa tardeee {first_name} 🌷\n"
-        f"Espero que esteja tudo bem.\n\n"
-        f"Gostaria de informar o valor das sessões do último mês.\n\n"
-        f"Fechamos em R$ {total_fmt} 🩷\n\n"
-        f"Qualquer dúvida estou à disposição."
+    tpl = (tenant.get("billing_msg_template") or "").strip() or _DEFAULT_BILLING
+    return _apply_template(
+        tpl,
+        nome=first_name,
+        total=total_fmt,
+        sessoes=sessions_count,
+        psicologa=tenant.get("psychologist_name", ""),
     )
 
 
@@ -173,7 +209,7 @@ async def _run_billing():
             count = len(sessions)
             total = count * patient["session_price"]
             patient_name = sessions[0]["patient_name"] if sessions else patient.get("name", "Paciente")
-            msg = _billing_message(patient_name, total, count)
+            msg = _billing_message(tenant, patient_name, total, count)
             sent = await wa.send_message(tenant, phone, msg)
             if sent:
                 db.save_billing_log(tenant["id"], phone, patient_name, month_str, count, total, "whatsapp")
@@ -207,7 +243,7 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
         count = len(sessions)
         total = count * patient["session_price"]
         patient_name = sessions[0]["patient_name"] if sessions else patient.get("name", "Paciente")
-        msg = _billing_message(patient_name, total, count)
+        msg = _billing_message(tenant, patient_name, total, count)
         sent = await wa.send_message(tenant, phone, msg)
         if sent:
             db.save_billing_log(tenant_id, phone, patient_name, month_str, count, total, "whatsapp")

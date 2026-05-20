@@ -543,6 +543,9 @@ class TenantUpdate(BaseModel):
     blocked_hours: Optional[str] = None
     blocked_dates: Optional[str] = None
     confirmation_hour: Optional[int] = None
+    confirmation_msg_template: Optional[str] = None
+    followup_msg_template: Optional[str] = None
+    billing_msg_template: Optional[str] = None
     psychologist_phone: Optional[str] = None
     free_until: Optional[str] = None  # data ISO (YYYY-MM-DD) de acesso gratuito
     # CalDAV
@@ -1211,6 +1214,86 @@ def dash_patient_billing_info(phone: str, request: Request):
         "session_price": patient["session_price"] if patient else 0,
         "email": patient["email"] if patient else "",
     }
+
+@app.get("/dashboard/api/stats")
+def dash_stats(request: Request, month: str | None = None):
+    """Indicadores do mês: sessões, receita, taxa de presença, pacientes ativos."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _Zi
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    now = _dt.now(_Zi("America/Sao_Paulo")).replace(tzinfo=None)
+    if month:
+        try:
+            y, m = [int(x) for x in month.split("-")]
+        except Exception:
+            y, m = now.year, now.month
+    else:
+        y, m = now.year, now.month
+    start = _dt(y, m, 1).isoformat()
+    end = (_dt(y + 1, 1, 1) if m == 12 else _dt(y, m + 1, 1)).isoformat()
+    now_str = now.isoformat()
+    stats = db.get_dashboard_stats(tenant["id"], start, end, now_str)
+    stats["month"] = f"{y:04d}-{m:02d}"
+    return stats
+
+
+@app.get("/dashboard/api/billing/export")
+def dash_billing_export(request: Request, month: str | None = None):
+    """Exporta cobrança do mês como CSV."""
+    import csv, io
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _Zi
+    from fastapi.responses import StreamingResponse
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    now = _dt.now(_Zi("America/Sao_Paulo")).replace(tzinfo=None)
+    if month:
+        try:
+            y, m = [int(x) for x in month.split("-")]
+        except Exception:
+            y, m = now.year, now.month
+    else:
+        y, m = now.year, now.month
+    start = _dt(y, m, 1).isoformat()
+    end = (_dt(y + 1, 1, 1) if m == 12 else _dt(y, m + 1, 1)).isoformat()
+    now_str = now.isoformat()
+    # Busca sessões cobráveis por paciente
+    with db.get_conn() as conn:
+        rows = conn.execute("""
+            SELECT a.phone, a.patient_name,
+                   COUNT(*) as sessions,
+                   p.session_price
+            FROM appointments a
+            LEFT JOIN patients p ON p.phone = a.phone AND p.tenant_id = a.tenant_id
+            WHERE a.tenant_id=? AND a.scheduled_at>=? AND a.scheduled_at<?
+              AND a.cancelled=0
+              AND COALESCE(a.attendance,'pending') != 'missed_with_notice'
+              AND a.scheduled_at <= ?
+            GROUP BY a.phone
+            ORDER BY a.patient_name
+        """, (tenant["id"], start, end, now_str)).fetchall()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Paciente", "Telefone", "Sessões", "Valor unit. (R$)", "Total (R$)"])
+    for r in rows:
+        price = r["session_price"] or 0
+        total = price * r["sessions"]
+        writer.writerow([
+            r["patient_name"] or "",
+            r["phone"] or "",
+            r["sessions"],
+            f"{price:.2f}".replace(".", ","),
+            f"{total:.2f}".replace(".", ","),
+        ])
+    output.seek(0)
+    filename = f"cobranca_{y:04d}-{m:02d}.csv"
+    return StreamingResponse(
+        iter([output.getvalue().encode("utf-8-sig")]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 
 @app.get("/dashboard/api/billing/logs")
 def dash_billing_logs(request: Request):

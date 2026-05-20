@@ -133,6 +133,10 @@ def init_db():
             "ALTER TABLE appointments ADD COLUMN attendance TEXT DEFAULT 'pending'",
             # Bloqueios de datas específicas (feriados/férias) — CSV YYYY-MM-DD
             "ALTER TABLE tenants ADD COLUMN blocked_dates TEXT DEFAULT ''",
+            # Templates de mensagem personalizáveis
+            "ALTER TABLE tenants ADD COLUMN confirmation_msg_template TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN followup_msg_template TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN billing_msg_template TEXT DEFAULT ''",
         ]
         for sql in migrations:
             try:
@@ -326,6 +330,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "email", "status", "stripe_customer_id", "stripe_subscription_id", "mp_subscription_id",
         "pix_key", "pix_name",
         "working_days", "blocked_hours", "blocked_dates", "confirmation_hour", "psychologist_phone", "plan",
+        "confirmation_msg_template", "followup_msg_template", "billing_msg_template",
         "free_until", "plan_expires_at",
         "caldav_url", "caldav_username", "caldav_password",
         "full_name", "cpf_cnpj", "phone",
@@ -802,6 +807,75 @@ def get_billing_logs(tenant_id: int, limit: int = 50) -> list[dict]:
             ORDER BY sent_at DESC LIMIT ?
         """, (tenant_id, limit)).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_dashboard_stats(tenant_id: int, month_start: str, month_end: str, now_str: str) -> dict:
+    """Indicadores do mês: sessões, receita, taxa de presença, pacientes ativos."""
+    with get_conn() as conn:
+        total = conn.execute("""SELECT COUNT(*) FROM appointments
+            WHERE tenant_id=? AND scheduled_at>=? AND scheduled_at<? AND cancelled=0
+        """, (tenant_id, month_start, month_end)).fetchone()[0]
+
+        attended = conn.execute("""SELECT COUNT(*) FROM appointments
+            WHERE tenant_id=? AND scheduled_at>=? AND scheduled_at<? AND cancelled=0
+              AND attendance='attended'
+        """, (tenant_id, month_start, month_end)).fetchone()[0]
+
+        missed_no = conn.execute("""SELECT COUNT(*) FROM appointments
+            WHERE tenant_id=? AND scheduled_at>=? AND scheduled_at<? AND cancelled=0
+              AND attendance='missed_no_notice'
+        """, (tenant_id, month_start, month_end)).fetchone()[0]
+
+        missed_with = conn.execute("""SELECT COUNT(*) FROM appointments
+            WHERE tenant_id=? AND scheduled_at>=? AND scheduled_at<? AND cancelled=0
+              AND attendance='missed_with_notice'
+        """, (tenant_id, month_start, month_end)).fetchone()[0]
+
+        cancelled_n = conn.execute("""SELECT COUNT(*) FROM appointments
+            WHERE tenant_id=? AND scheduled_at>=? AND scheduled_at<? AND cancelled=1
+        """, (tenant_id, month_start, month_end)).fetchone()[0]
+
+        active_patients = conn.execute("""SELECT COUNT(DISTINCT phone) FROM appointments
+            WHERE tenant_id=? AND scheduled_at>=? AND scheduled_at<? AND cancelled=0
+        """, (tenant_id, month_start, month_end)).fetchone()[0]
+
+        revenue_rows = conn.execute("""
+            SELECT a.phone, COUNT(*) as sessions FROM appointments a
+            WHERE a.tenant_id=? AND a.scheduled_at>=? AND a.scheduled_at<?
+              AND a.cancelled=0
+              AND COALESCE(a.attendance,'pending') != 'missed_with_notice'
+              AND a.scheduled_at <= ?
+            GROUP BY a.phone
+        """, (tenant_id, month_start, month_end, now_str)).fetchall()
+
+        revenue = 0.0
+        for row in revenue_rows:
+            pr = conn.execute(
+                "SELECT session_price FROM patients WHERE tenant_id=? AND phone=?",
+                (tenant_id, row["phone"])
+            ).fetchone()
+            if pr and pr["session_price"]:
+                revenue += pr["session_price"] * row["sessions"]
+
+        # Distribuição por dia da semana — strftime('%w')=0 Dom … 6 Sáb → Seg=0…Dom=6
+        wd_rows = conn.execute("""
+            SELECT CAST(strftime('%w', scheduled_at) AS INTEGER) as wd, COUNT(*) as n
+            FROM appointments
+            WHERE tenant_id=? AND scheduled_at>=? AND scheduled_at<? AND cancelled=0
+            GROUP BY wd
+        """, (tenant_id, month_start, month_end)).fetchall()
+        wd_map = {(r["wd"] + 6) % 7: r["n"] for r in wd_rows}
+        weekdays = [wd_map.get(i, 0) for i in range(7)]
+
+    pending = max(0, total - attended - missed_no - missed_with - cancelled_n)
+    return {
+        "total": total, "attended": attended,
+        "missed_no_notice": missed_no, "missed_with_notice": missed_with,
+        "cancelled": cancelled_n, "pending": pending,
+        "active_patients": active_patients,
+        "revenue": round(revenue, 2),
+        "weekdays": weekdays,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════

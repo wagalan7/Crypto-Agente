@@ -276,6 +276,24 @@
   <!-- Config -->
   <div id="pane-config" class="tab-content">
     <h2 class="text-base font-semibold text-gray-800 mb-4 mt-4 md:mt-0">Configurações</h2>
+
+    <!-- Indicadores do mês -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <span class="text-xl">📊</span>
+          <h3 class="font-semibold text-gray-800 text-sm">Indicadores do mês</h3>
+        </div>
+        <div class="flex items-center gap-2">
+          <input type="month" id="stats-month"
+            class="border border-gray-200 rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-brand"/>
+          <button onclick="loadStats()" class="text-xs text-brand font-medium">↻</button>
+        </div>
+      </div>
+      <div id="stats-body">
+        <div class="text-gray-400 text-sm text-center py-4">Carregando…</div>
+      </div>
+    </div>
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg space-y-4">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Nome do consultório</label>
@@ -371,6 +389,48 @@
       <div id="cfg-msg" class="text-sm text-center hidden text-green-600"></div>
     </div>
 
+    <!-- Mensagens personalizáveis -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-xl">✏️</span>
+        <h3 class="font-semibold text-gray-800 text-sm">Mensagens do agente</h3>
+      </div>
+      <p class="text-xs text-gray-500 mb-4">
+        Personalize os textos enviados automaticamente. Variáveis disponíveis:<br/>
+        <code class="bg-gray-100 px-1 rounded">{nome}</code> primeiro nome do paciente ·
+        <code class="bg-gray-100 px-1 rounded">{data_hora}</code> data e hora da sessão ·
+        <code class="bg-gray-100 px-1 rounded">{quando}</code> "de hoje" / "de amanhã" ·
+        <code class="bg-gray-100 px-1 rounded">{psicologa}</code> seu nome ·
+        <code class="bg-gray-100 px-1 rounded">{total}</code> valor (só na cobrança) ·
+        <code class="bg-gray-100 px-1 rounded">{sessoes}</code> nº sessões (só na cobrança)
+      </p>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">📅 Confirmação (enviada ~24h antes)</label>
+          <textarea id="cfg-confirmation-tpl" rows="5"
+            placeholder="Deixe em branco para usar o texto padrão"
+            class="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand font-mono resize-y">{{ tenant.confirmation_msg_template or '' }}</textarea>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">🔔 Lembrete no dia (não confirmados)</label>
+          <textarea id="cfg-followup-tpl" rows="5"
+            placeholder="Deixe em branco para usar o texto padrão"
+            class="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand font-mono resize-y">{{ tenant.followup_msg_template or '' }}</textarea>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-gray-700 mb-1">💰 Cobrança mensal</label>
+          <textarea id="cfg-billing-tpl" rows="4"
+            placeholder="Deixe em branco para usar o texto padrão"
+            class="w-full border border-gray-300 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand font-mono resize-y">{{ tenant.billing_msg_template or '' }}</textarea>
+        </div>
+        <button onclick="saveMsgTemplates(this)"
+          class="w-full bg-brand text-white py-2.5 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+          💾 Salvar mensagens
+        </button>
+        <div id="cfg-tpl-msg" class="hidden text-sm text-center"></div>
+      </div>
+    </div>
+
     <!-- Assinatura -->
     {% if tenant.stripe_subscription_id or tenant.mp_subscription_id or tenant.free_until %}
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
@@ -446,6 +506,10 @@
           <p class="text-xs text-gray-500">Envia mensagem de confirmação para todos os pacientes de amanhã</p>
         </div>
       </div>
+      <button onclick="exportBilling()" id="btn-export-csv"
+        class="w-full mb-2 border border-brand text-brand py-2.5 rounded-lg text-sm font-semibold hover:bg-pink-50 transition">
+        📥 Exportar CSV do mês
+      </button>
       <button onclick="dispararConfirmacoes()" id="btn-confirmar"
         class="w-full bg-green-600 text-white py-2.5 rounded-lg text-sm font-semibold hover:bg-green-700 transition">
         📨 Enviar confirmações agora
@@ -785,6 +849,7 @@
 
 <script>
 const TOKEN = "{{ token }}";
+window._dashToken = TOKEN;
 const SLUG  = "{{ tenant.slug }}";
 
 // ── Contadores de notificação ─────────────────────────────────────────────────
@@ -859,7 +924,7 @@ function showTab(name) {
   if (name==="agenda")    { loadAgenda();    newAppointments=0; updateBadge("agenda",0); }
   if (name==="slots")     { loadSlots(); loadWeekly(); renderBlockedHours(); renderBlockedDates(); }
   if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
-  if (name==="config")    loadBillingLogs();
+  if (name==="config")    { loadBillingLogs(); loadStats(); }
 }
 
 function api(path, opts={}) {
@@ -1868,7 +1933,122 @@ function checkWelcome() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 connectSSE();
 loadAgenda();
+// ── Indicadores ───────────────────────────────────────────────────────────────
+function loadStats() {
+  const month = document.getElementById('stats-month')?.value || '';
+  const el = document.getElementById('stats-body');
+  el.innerHTML = '<div class="text-gray-400 text-sm text-center py-4">⏳ Carregando…</div>';
+  const url = '/dashboard/api/stats' + (month ? `?month=${month}` : '');
+  api(url).then(s => {
+    const fmtR = v => v > 0 ? `R$ ${v.toLocaleString('pt-BR', {minimumFractionDigits:2})}` : '–';
+    const pct = (n, d) => d > 0 ? Math.round(n/d*100) + '%' : '–';
+    const days = ['Seg','Ter','Qua','Qui','Sex','Sáb','Dom'];
+    const maxWd = Math.max(...s.weekdays, 1);
+    const wdBars = s.weekdays.map((n,i) =>
+      `<div class="flex flex-col items-center gap-1 flex-1">
+        <div class="w-full rounded-t" style="height:${Math.max(4, Math.round(n/maxWd*40))}px; background:#E91E8C; opacity:${n>0?1:0.15}"></div>
+        <span class="text-[10px] text-gray-500">${days[i]}</span>
+        <span class="text-[10px] font-medium text-gray-700">${n}</span>
+      </div>`
+    ).join('');
+    el.innerHTML = `
+      <div class="grid grid-cols-2 gap-2 mb-4">
+        <div class="bg-pink-50 rounded-xl p-3 text-center">
+          <p class="text-xl font-bold text-brand">${s.total}</p>
+          <p class="text-[10px] text-gray-500">sessões no mês</p>
+        </div>
+        <div class="bg-green-50 rounded-xl p-3 text-center">
+          <p class="text-xl font-bold text-green-700">${fmtR(s.revenue)}</p>
+          <p class="text-[10px] text-gray-500">receita estimada</p>
+        </div>
+        <div class="bg-blue-50 rounded-xl p-3 text-center">
+          <p class="text-xl font-bold text-blue-700">${s.active_patients}</p>
+          <p class="text-[10px] text-gray-500">pacientes ativos</p>
+        </div>
+        <div class="bg-orange-50 rounded-xl p-3 text-center">
+          <p class="text-xl font-bold text-orange-600">${pct(s.attended, s.total - s.pending)}</p>
+          <p class="text-[10px] text-gray-500">taxa de presença</p>
+        </div>
+      </div>
+      <div class="grid grid-cols-4 gap-1.5 text-center text-xs mb-4">
+        <div class="bg-green-50 rounded-lg py-2">
+          <p class="font-bold text-green-700">${s.attended}</p><p class="text-gray-400">comparec.</p></div>
+        <div class="bg-red-50 rounded-lg py-2">
+          <p class="font-bold text-red-600">${s.missed_no_notice}</p><p class="text-gray-400">faltou</p></div>
+        <div class="bg-orange-50 rounded-lg py-2">
+          <p class="font-bold text-orange-600">${s.missed_with_notice}</p><p class="text-gray-400">avisou</p></div>
+        <div class="bg-gray-50 rounded-lg py-2">
+          <p class="font-bold text-gray-600">${s.cancelled}</p><p class="text-gray-400">canceladas</p></div>
+      </div>
+      <p class="text-[11px] text-gray-500 mb-1 font-medium">Sessões por dia da semana</p>
+      <div class="flex items-end gap-1 h-14">${wdBars}</div>`;
+  }).catch(e => {
+    el.innerHTML = `<div class="text-red-500 text-sm text-center py-4">Erro: ${e.message}</div>`;
+  });
+}
+
+// ── Exportar CSV ──────────────────────────────────────────────────────────────
+function exportBilling() {
+  const monthEl = document.getElementById('billing-month');
+  const month = monthEl?.value || '';
+  const token = document.cookie.match(/dashboard_token=([^;]+)/)?.[1] ||
+    document.querySelector('meta[name="dashboard-token"]')?.content || '';
+  const url = '/dashboard/api/billing/export' + (month ? `?month=${month}` : '');
+  const a = document.createElement('a');
+  a.href = url;
+  a.setAttribute('download', '');
+  // Passa o token via header não é possível em <a> — usa fetch + blob
+  api(url).catch(() => {}).finally(() => {});
+  fetch(url, { headers: { 'X-Dashboard-Token': window._dashToken || '' } })
+    .then(r => r.blob())
+    .then(blob => {
+      const u = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = u;
+      link.download = month ? `cobranca_${month}.csv` : 'cobranca.csv';
+      link.click();
+      URL.revokeObjectURL(u);
+      showToast('CSV baixado', 'success');
+    })
+    .catch(e => showToast('Erro ao exportar: ' + e.message, 'error'));
+}
+
+// ── Salvar templates de mensagem ───────────────────────────────────────────────
+function saveMsgTemplates(btn) {
+  const fb = document.getElementById('cfg-tpl-msg');
+  fb.classList.add('hidden');
+  const payload = {
+    confirmation_msg_template: document.getElementById('cfg-confirmation-tpl').value,
+    followup_msg_template: document.getElementById('cfg-followup-tpl').value,
+    billing_msg_template: document.getElementById('cfg-billing-tpl').value,
+  };
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ Salvando…';
+  api('/dashboard/api/config', { method: 'PATCH', body: JSON.stringify(payload) })
+    .then(() => {
+      fb.className = 'text-sm text-center text-green-600';
+      fb.textContent = '✓ Mensagens salvas com sucesso.';
+      fb.classList.remove('hidden');
+      showToast('Mensagens atualizadas', 'success');
+    })
+    .catch(e => {
+      fb.className = 'text-sm text-center text-red-600';
+      fb.textContent = 'Erro: ' + e.message;
+      fb.classList.remove('hidden');
+    })
+    .finally(() => { btn.disabled = false; btn.textContent = orig; });
+}
+
 initBillingMonth();
+
+// Inicializa seletor de mês dos indicadores
+(function() {
+  const el = document.getElementById('stats-month');
+  if (el) {
+    const now = new Date();
+    el.value = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+  }
+})();
 checkWelcome();
 </script>
 </body>
