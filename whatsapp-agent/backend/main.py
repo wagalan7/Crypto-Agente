@@ -1805,9 +1805,9 @@ def painel_api_testimonials_default(request: Request):
 
 # ── Health ─────────────────────────────────────────────────────────────────────
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    """Healthcheck simples (uptime probe)."""
+    """Healthcheck simples (uptime probe). Aceita HEAD para UptimeRobot etc."""
     return {"status": "ok"}
 
 
