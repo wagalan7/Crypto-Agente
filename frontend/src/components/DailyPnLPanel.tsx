@@ -128,7 +128,7 @@ export default function DailyPnLPanel({ onClose }: Props) {
 
         {/* Resumo cards */}
         {s && (
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 p-3 border-b border-slate-800">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 p-3 border-b border-slate-800">
             <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
               <div className="text-[10px] text-slate-500 uppercase">Total R</div>
               <div className={`text-xl font-bold font-mono ${rColor}`}>
@@ -148,9 +148,15 @@ export default function DailyPnLPanel({ onClose }: Props) {
               <div className="text-xl font-bold text-white font-mono">{s.total_trades}</div>
               <div className="text-[10px] text-slate-600 mt-0.5">resolvidos</div>
             </div>
-            <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
-              <div className="text-[10px] text-slate-500 uppercase">Vencidos</div>
+            <div className="bg-emerald-500/5 border border-emerald-500/30 rounded-lg p-3">
+              <div className="text-[10px] text-emerald-400/70 uppercase">Vencedores</div>
               <div className="text-xl font-bold text-emerald-300 font-mono">{s.wins}</div>
+              <div className="text-[10px] text-slate-600 mt-0.5">TP atingido</div>
+            </div>
+            <div className="bg-red-500/5 border border-red-500/30 rounded-lg p-3">
+              <div className="text-[10px] text-red-400/70 uppercase">Perdedores</div>
+              <div className="text-xl font-bold text-red-300 font-mono">{s.losses}</div>
+              <div className="text-[10px] text-slate-600 mt-0.5">stop bateu</div>
             </div>
             <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
               <div className="text-[10px] text-slate-500 uppercase">Abertos</div>
