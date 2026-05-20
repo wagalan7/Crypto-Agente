@@ -42,6 +42,13 @@ from services.learning_service import (
     compute_stats_by_bucket,
     lookup_historical_batch,
 )
+from services.push_service import (
+    get_public_key as push_get_public_key,
+    save_subscription as push_save_subscription,
+    remove_subscription as push_remove_subscription,
+    notify_recommendations_batch,
+    PUSH_ENABLED,
+)
 from db import init_db, close_db, DB_ENABLED
 from models.trade_signal import TradeSignal
 
@@ -356,11 +363,18 @@ async def recommendations_batch(body: RecommendationBatchRequest):
         recs = await get_recommendations_from_batch(items)
         recs_dict = [r.model_dump() for r in recs]
         # Persistência (não bloqueia se DB indisponível)
+        newly_saved = 0
         if DB_ENABLED and recs_dict:
             try:
-                await save_recommendations(recs_dict)
+                newly_saved = await save_recommendations(recs_dict) or 0
             except Exception as e:
                 logging.warning(f"save_recommendations falhou (segue sem persistir): {e}")
+        # Push notifications (só dispara pra recs novas — dedup feito por tag)
+        if PUSH_ENABLED and newly_saved > 0:
+            try:
+                asyncio.create_task(notify_recommendations_batch(recs_dict, newly_saved))
+            except Exception as e:
+                logging.warning(f"notify push falhou: {e}")
         return {"count": len(recs), "recommendations": recs_dict}
     except Exception as e:
         logging.error(f"recommendations-batch error: {e}\n{traceback.format_exc()}")
@@ -426,6 +440,45 @@ async def history_stats(days: int = 30):
     except Exception as e:
         logging.error(f"history-stats error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao obter stats: {e}")
+
+
+@app.get("/api/push/vapid-public-key")
+async def push_vapid_public_key():
+    """Frontend usa esta chave pra gerar a subscription do PushManager."""
+    key = push_get_public_key()
+    return {"enabled": PUSH_ENABLED, "public_key": key or ""}
+
+
+class PushSubscribeRequest(BaseModel):
+    endpoint: str
+    keys: Dict[str, str]
+    user_agent: Optional[str] = None
+    filters: Optional[Dict[str, bool]] = None
+
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(body: PushSubscribeRequest):
+    if not PUSH_ENABLED:
+        raise HTTPException(503, "Push não habilitado no backend (VAPID_* ausentes ou DB off).")
+    p256dh = body.keys.get("p256dh", "")
+    auth = body.keys.get("auth", "")
+    if not (body.endpoint and p256dh and auth):
+        raise HTTPException(400, "endpoint, keys.p256dh e keys.auth são obrigatórios")
+    ok = await push_save_subscription(
+        endpoint=body.endpoint, p256dh=p256dh, auth=auth,
+        user_agent=body.user_agent, filters=body.filters or {},
+    )
+    return {"ok": ok}
+
+
+class PushUnsubscribeRequest(BaseModel):
+    endpoint: str
+
+
+@app.post("/api/push/unsubscribe")
+async def push_unsubscribe(body: PushUnsubscribeRequest):
+    ok = await push_remove_subscription(body.endpoint)
+    return {"ok": ok}
 
 
 @app.get("/api/multi-timeframe")

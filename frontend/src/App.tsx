@@ -7,6 +7,7 @@ import NLPPanel from './components/NLPPanel'
 import RecommendationsPanel from './components/RecommendationsPanel'
 import DailyPnLPanel from './components/DailyPnLPanel'
 import InsightsPanel from './components/InsightsPanel'
+import PushSubscribeButton from './components/PushSubscribeButton'
 import { api } from './services/api'
 import type { SignalDirection, TradeType } from './types'
 
@@ -479,6 +480,7 @@ export default function App() {
             <span>🎓</span>
             <span className="hidden sm:block">Insights</span>
           </button>
+          <PushSubscribeButton />
           <button
             onClick={() => setShowNLP(v => !v)}
             className={`flex items-center gap-1 px-2 py-1 border rounded text-xs font-semibold transition-colors ${
