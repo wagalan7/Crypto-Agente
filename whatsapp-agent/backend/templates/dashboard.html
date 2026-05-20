@@ -579,8 +579,11 @@
     <div class="space-y-4">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Nome do paciente <span class="text-red-500">*</span></label>
-        <input id="na-name" type="text" placeholder="Nome completo"
+        <input id="na-name" type="text" placeholder="Nome completo" list="na-patients"
+          oninput="onNaNameInput()"
           class="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        <datalist id="na-patients"></datalist>
+        <p class="text-xs text-gray-400 mt-1">Digite para sugerir pacientes já cadastrados</p>
       </div>
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">WhatsApp <span class="text-red-500">*</span></label>
@@ -1008,16 +1011,62 @@ function loadSlots() {
   const el = document.getElementById("slots-list");
   el.innerHTML = '<div class="text-gray-400 text-sm col-span-2 md:col-span-3 text-center py-4">⏳ Carregando…</div>';
   api("/dashboard/api/slots").then(data => {
-    if (!data.slots?.length) {
+    const list = data.slots_detailed || (data.slots || []).map(label => ({label, iso: null}));
+    if (!list.length) {
       el.innerHTML = '<div class="text-gray-400 text-sm col-span-2 md:col-span-3 text-center py-4">Nenhum horário disponível com a configuração atual.</div>';
       return;
     }
-    el.innerHTML = data.slots.map(s =>
-      `<div class="bg-white border border-gray-200 rounded-xl px-3 py-3 text-sm text-gray-700 text-center">${s}</div>`
-    ).join("");
+    el.innerHTML = list.map(s => {
+      if (!s.iso) {
+        return `<div class="bg-white border border-gray-200 rounded-xl px-3 py-3 text-sm text-gray-700 text-center">${s.label}</div>`;
+      }
+      const safeIso = s.iso.replace(/'/g, "");
+      return `<button type="button" onclick="openNewApptAtSlot('${safeIso}')"
+        class="bg-white border border-gray-200 rounded-xl px-3 py-3 text-sm text-gray-700 text-center
+               hover:border-brand hover:bg-pink-50 hover:text-brand active:scale-95 transition cursor-pointer">
+        <span class="block">${s.label}</span>
+        <span class="block text-[10px] text-gray-400 mt-0.5 group-hover:text-brand">toque para agendar</span>
+      </button>`;
+    }).join("");
   }).catch(e => {
     el.innerHTML = `<div class="text-red-500 text-sm col-span-2 md:col-span-3 text-center py-4">Erro: ${e.message}</div>`;
   });
+}
+
+// Abre o modal "Nova consulta" pré-preenchido com a data/hora do slot escolhido
+function openNewApptAtSlot(iso) {
+  openNewAppt();
+  try {
+    const dt = new Date(iso);
+    const yyyy = dt.getFullYear();
+    const mm = String(dt.getMonth()+1).padStart(2, "0");
+    const dd = String(dt.getDate()).padStart(2, "0");
+    const hh = String(dt.getHours()).padStart(2, "0");
+    const mi = String(dt.getMinutes()).padStart(2, "0");
+    document.getElementById("na-date").value = `${yyyy}-${mm}-${dd}`;
+    document.getElementById("na-time").value = `${hh}:${mi}`;
+  } catch (e) {}
+  // Foco direto no nome do paciente (data/hora já estão preenchidos)
+  setTimeout(() => {
+    const n = document.getElementById("na-name");
+    if (n) n.focus();
+  }, 100);
+  // Carrega lista de pacientes para autocompletar
+  loadPatientsDatalist();
+}
+
+// Datalist com pacientes existentes para acelerar agendamento por slot
+function loadPatientsDatalist() {
+  const dl = document.getElementById("na-patients");
+  if (!dl) return;
+  if (dl.dataset.loaded === "1") return;
+  api("/dashboard/api/patients").then(data => {
+    const items = (data.patients || []).filter(p => p.name);
+    dl.innerHTML = items.map(p =>
+      `<option data-phone="${p.phone}" value="${(p.name || "").replace(/"/g,'&quot;')}"></option>`
+    ).join("");
+    dl.dataset.loaded = "1";
+  }).catch(()=>{});
 }
 
 // Botão "↻ Atualizar" da aba — feedback visual + recarrega tudo
@@ -1316,6 +1365,23 @@ function saveConfig() {
 }
 
 // ── Nova Consulta (manual) ────────────────────────────────────────────────────
+// Quando o usuário escolhe um nome do datalist, preenche telefone automaticamente
+function onNaNameInput() {
+  const input = document.getElementById("na-name");
+  const dl = document.getElementById("na-patients");
+  if (!input || !dl) return;
+  const val = (input.value || "").trim().toLowerCase();
+  if (!val) return;
+  const opt = Array.from(dl.querySelectorAll("option")).find(o =>
+    (o.value || "").toLowerCase() === val
+  );
+  if (opt) {
+    const phoneEl = document.getElementById("na-phone");
+    const phone = opt.getAttribute("data-phone") || "";
+    if (phoneEl && phone && !phoneEl.value) phoneEl.value = phone;
+  }
+}
+
 function openNewAppt() {
   const today = new Date().toISOString().split("T")[0];
   document.getElementById("na-date").value = today;
@@ -1328,6 +1394,7 @@ function openNewAppt() {
   document.getElementById("na-btn").textContent = "Agendar consulta";
   document.getElementById("na-btn").disabled = false;
   document.getElementById("modal-appt").classList.remove("hidden");
+  loadPatientsDatalist();
 }
 
 function toggleRepeat() {

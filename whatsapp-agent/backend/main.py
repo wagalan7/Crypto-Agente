@@ -861,11 +861,18 @@ def dash_caldav_test(request: Request):
 
 
 @app.get("/dashboard/api/slots")
-def dash_slots(request: Request):
+def dash_slots(request: Request, days: int = 14, limit: int = 30):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
-    slots = cal.get_available_slots(tenant, days_ahead=10, limit=20)
-    return {"slots": cal.format_slots(slots)}
+    slots = cal.get_available_slots(tenant, days_ahead=days, limit=limit)
+    labels = cal.format_slots(slots)
+    return {
+        "slots": labels,  # compat
+        "slots_detailed": [
+            {"label": labels[i], "iso": slots[i].isoformat()}
+            for i in range(len(slots))
+        ],
+    }
 
 
 @app.get("/dashboard/api/session-counts")
