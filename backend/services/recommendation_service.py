@@ -356,29 +356,12 @@ async def get_recommendations_from_batch(
 
 def _classify_tier_vision(sig: TradeSignal, score: float) -> Optional[str]:
     """
-    Classificador específico pra dados de Spot (Binance Vision). Spot tem
-    volatilidade menor que futures → confidence/score sistematicamente
-    mais baixos. Thresholds recalibrados pra essa fonte, mantendo a mesma
-    semântica de qualidade (A+ > A > B).
-
-    Calibrado com base em distribuição real observada do scan top-30:
-      • Score típico: 24–49 (não passa de 50 sem MTF)
-      • Confidence típica: 0.0–0.37
-      • R:R: amplo (0.03 – 7.82, média 2.26)
+    Vision usa exatamente os MESMOS thresholds estritos do classifier
+    principal — preferimos zero push do que push de setup fraco. Quando o
+    spot gerar um setup que passe nos critérios rigorosos, aí sim dispara
+    notificação. Menos pushes, mas cada um vale.
     """
-    if sig.direction == SignalDirection.NEUTRAL:
-        return None
-    if sig.risk_reward < 1.5:
-        return None
-    rr = sig.risk_reward
-    conf = sig.confidence
-    if score >= 45 and conf >= 0.32 and rr >= 2.5:
-        return "A+"
-    if score >= 38 and conf >= 0.27 and rr >= 2.0:
-        return "A"
-    if score >= 32 and conf >= 0.22 and rr >= 1.5:
-        return "B"
-    return None
+    return _classify_tier(sig, score)
 
 
 async def _analyze_symbol_tf_via_vision(symbol: str, tf: str) -> Optional[TradeSignal]:
