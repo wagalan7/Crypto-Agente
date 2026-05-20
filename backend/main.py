@@ -529,6 +529,45 @@ async def history_stats(days: int = 30):
         raise HTTPException(500, f"Erro ao obter stats: {e}")
 
 
+@app.get("/api/debug/binance-reachability")
+async def debug_binance_reachability():
+    """
+    Testa se algum endpoint Binance/alternativo responde do Railway.
+    Útil pra escolher fonte de dados pro server-scan.
+    """
+    import httpx
+    targets = [
+        # Binance Futures (provavelmente bloqueado)
+        ("fapi.binance.com", "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=2"),
+        ("fapi1.binance.com", "https://fapi1.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=2"),
+        ("fapi2.binance.com", "https://fapi2.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=2"),
+        ("fapi3.binance.com", "https://fapi3.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1h&limit=2"),
+        # Binance Spot
+        ("api.binance.com", "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"),
+        ("api1.binance.com", "https://api1.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"),
+        # Binance Data (sem geo-block na teoria)
+        ("data-api.binance.vision", "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=2"),
+        # Bybit
+        ("api.bybit.com", "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=2"),
+        # OKX (controle — sabemos que funciona)
+        ("www.okx.com", "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=1H&limit=2"),
+    ]
+    results = []
+    async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for name, url in targets:
+            try:
+                r = await client.get(url)
+                preview = r.text[:120]
+                results.append({
+                    "host": name, "status": r.status_code,
+                    "ok": r.status_code == 200,
+                    "preview": preview,
+                })
+            except Exception as e:
+                results.append({"host": name, "status": None, "ok": False, "error": str(e)[:200]})
+    return {"results": results}
+
+
 @app.post("/api/push/test-scan")
 async def push_test_scan():
     """
