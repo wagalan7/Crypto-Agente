@@ -5,6 +5,7 @@ import ChartPanel from './components/ChartPanel'
 import TradeManager from './components/TradeManager'
 import NLPPanel from './components/NLPPanel'
 import RecommendationsPanel from './components/RecommendationsPanel'
+import DailyPnLPanel from './components/DailyPnLPanel'
 import { api } from './services/api'
 import type { SignalDirection, TradeType } from './types'
 
@@ -180,6 +181,7 @@ export default function App() {
   const [showTradeManager, setShowTradeManager] = useState(false)
   const [showNLP, setShowNLP] = useState(false)
   const [showRecommendations, setShowRecommendations] = useState(false)
+  const [showDailyPnL, setShowDailyPnL] = useState(false)
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const [tradeMode, setTradeMode] = useState<TradeMode>('swing')
   const [filter, setFilter] = useState<Filter>('all')
@@ -460,6 +462,14 @@ export default function App() {
             <span className="hidden sm:block">Recomendados</span>
           </button>
           <button
+            onClick={() => setShowDailyPnL(true)}
+            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-emerald-500/20 to-teal-500/20 hover:from-emerald-500/30 hover:to-teal-500/30 border border-emerald-500/40 rounded text-xs font-bold text-emerald-300"
+            title="Resultado do Dia — P&L das recomendações"
+          >
+            <span>📊</span>
+            <span className="hidden sm:block">Resultado</span>
+          </button>
+          <button
             onClick={() => setShowNLP(v => !v)}
             className={`flex items-center gap-1 px-2 py-1 border rounded text-xs font-semibold transition-colors ${
               showNLP
@@ -658,6 +668,10 @@ export default function App() {
             setShowRecommendations(false)
           }}
         />
+      )}
+
+      {showDailyPnL && (
+        <DailyPnLPanel onClose={() => setShowDailyPnL(false)} />
       )}
     </div>
   )

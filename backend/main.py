@@ -32,12 +32,49 @@ from services.mtf_service import analyze_mtf
 from services.trade_service import get_trades, save_trades
 from services.macro_service import get_btc_dominance, build_macro_context, get_global_market_data
 from services.recommendation_service import get_recommendations, get_recommendations_from_batch
+from services.snapshot_service import (
+    save_recommendations,
+    check_open_snapshots,
+    get_daily_pnl,
+    get_history_stats,
+)
+from db import init_db, close_db, DB_ENABLED
 from models.trade_signal import TradeSignal
+
+
+_snapshot_task: Optional[asyncio.Task] = None
+
+
+async def _snapshot_loop():
+    """Roda check_open_snapshots a cada 5 minutos."""
+    while True:
+        try:
+            await asyncio.sleep(300)
+            await check_open_snapshots()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.warning(f"snapshot_loop error: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _snapshot_task
+    if DB_ENABLED:
+        try:
+            await init_db()
+            _snapshot_task = asyncio.create_task(_snapshot_loop())
+            logging.info("Snapshot tracker iniciado (intervalo 5 min).")
+        except Exception as e:
+            logging.error(f"Falha ao inicializar DB: {e}")
     yield
+    if _snapshot_task:
+        _snapshot_task.cancel()
+        try:
+            await _snapshot_task
+        except asyncio.CancelledError:
+            pass
+    await close_db()
     await close_exchange()
 
 
@@ -313,10 +350,44 @@ async def recommendations_batch(body: RecommendationBatchRequest):
             for it in body.items
         ]
         recs = await get_recommendations_from_batch(items)
-        return {"count": len(recs), "recommendations": [r.model_dump() for r in recs]}
+        recs_dict = [r.model_dump() for r in recs]
+        # Persistência (não bloqueia se DB indisponível)
+        if DB_ENABLED and recs_dict:
+            try:
+                await save_recommendations(recs_dict)
+            except Exception as e:
+                logging.warning(f"save_recommendations falhou (segue sem persistir): {e}")
+        return {"count": len(recs), "recommendations": recs_dict}
     except Exception as e:
         logging.error(f"recommendations-batch error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao processar recomendações: {e}")
+
+
+@app.get("/api/daily-pnl")
+async def daily_pnl(date_str: Optional[str] = Query(None, alias="date")):
+    """P&L do dia (default = hoje em UTC). Use ?date=YYYY-MM-DD pra outros dias."""
+    from datetime import date as _date
+    target = None
+    if date_str:
+        try:
+            target = _date.fromisoformat(date_str)
+        except ValueError:
+            raise HTTPException(400, "date deve estar em formato YYYY-MM-DD")
+    try:
+        return await get_daily_pnl(target)
+    except Exception as e:
+        logging.error(f"daily-pnl error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao obter P&L: {e}")
+
+
+@app.get("/api/history-stats")
+async def history_stats(days: int = 30):
+    """Stats agregadas dos últimos N dias — alimenta planejador da banca."""
+    try:
+        return await get_history_stats(days=max(7, min(days, 180)))
+    except Exception as e:
+        logging.error(f"history-stats error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao obter stats: {e}")
 
 
 @app.get("/api/multi-timeframe")
