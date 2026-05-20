@@ -54,6 +54,11 @@ from models.trade_signal import TradeSignal
 
 
 _snapshot_task: Optional[asyncio.Task] = None
+_scan_task: Optional[asyncio.Task] = None
+
+SERVER_SCAN_INTERVAL = 600        # 10 min entre varreduras server-side
+SERVER_SCAN_TOP_N = 25            # quantos símbolos varrer
+SERVER_SCAN_INITIAL_DELAY = 60    # espera 60s após startup pra não competir com init
 
 
 async def _snapshot_loop():
@@ -68,9 +73,52 @@ async def _snapshot_loop():
             logging.warning(f"snapshot_loop error: {e}")
 
 
+async def _server_scan_loop():
+    """
+    Varredura server-side periódica (OKX → Railway funciona). Salva novos
+    snapshots e dispara push notifications pras recs A+ / A novas — sem
+    precisar do usuário abrir o app.
+    """
+    await asyncio.sleep(SERVER_SCAN_INITIAL_DELAY)
+    while True:
+        try:
+            from services.push_service import PUSH_ENABLED as _PE
+            if not _PE and not DB_ENABLED:
+                await asyncio.sleep(SERVER_SCAN_INTERVAL)
+                continue
+
+            recs = await get_recommendations(top_n=SERVER_SCAN_TOP_N)
+            recs_dict = [r.model_dump() for r in recs]
+
+            newly_saved = 0
+            if DB_ENABLED and recs_dict:
+                try:
+                    newly_saved = await save_recommendations(recs_dict) or 0
+                except Exception as e:
+                    logging.warning(f"server_scan save falhou: {e}")
+
+            if _PE and newly_saved > 0:
+                try:
+                    sent = await notify_recommendations_batch(recs_dict, newly_saved)
+                    logging.info(f"[server-scan] {len(recs)} recs, {newly_saved} novas, {sent} pushes enviados")
+                except Exception as e:
+                    logging.warning(f"server_scan push falhou: {e}")
+            else:
+                logging.info(f"[server-scan] {len(recs)} recs, {newly_saved} novas (sem push)")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.warning(f"server_scan_loop error: {e}")
+
+        try:
+            await asyncio.sleep(SERVER_SCAN_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task
+    global _snapshot_task, _scan_task
     if DB_ENABLED:
         try:
             await init_db()
@@ -78,13 +126,20 @@ async def lifespan(app: FastAPI):
             logging.info("Snapshot tracker iniciado (intervalo 5 min).")
         except Exception as e:
             logging.error(f"Falha ao inicializar DB: {e}")
+    # Varredura server-side (OKX) — alimenta push notifications
+    try:
+        _scan_task = asyncio.create_task(_server_scan_loop())
+        logging.info(f"Server-scan iniciado (intervalo {SERVER_SCAN_INTERVAL}s, top {SERVER_SCAN_TOP_N}).")
+    except Exception as e:
+        logging.warning(f"Falha ao iniciar server_scan: {e}")
     yield
-    if _snapshot_task:
-        _snapshot_task.cancel()
-        try:
-            await _snapshot_task
-        except asyncio.CancelledError:
-            pass
+    for t in (_snapshot_task, _scan_task):
+        if t:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
     await close_db()
     await close_exchange()
 
