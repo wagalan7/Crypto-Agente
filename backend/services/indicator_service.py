@@ -56,8 +56,10 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
     # ── OBV ──────────────────────────────────────────────
     obv = _safe(ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume())
 
-    # ── Volume médio 20 períodos ──────────────────────────
+    # ── Volume médio 20 períodos + ratio do último candle ────────
     volume_avg = float(volume.tail(20).mean())
+    volume_last = float(volume.iloc[-1]) if len(volume) > 0 else 0.0
+    volume_ratio = (volume_last / volume_avg) if volume_avg > 0 else None
 
     # ── Supertrend (implementação manual) ────────────────
     supertrend, supertrend_dir = _calc_supertrend(high, low, close, atr)
@@ -87,6 +89,8 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
         stoch_d=r(stoch_d, 2),
         obv=r(obv, 2),
         volume_avg=r(volume_avg, 2),
+        volume_last=r(volume_last, 2),
+        volume_ratio=r(volume_ratio, 3),
         supertrend=r(supertrend),
         supertrend_direction=supertrend_dir,
         pivot_high=r(pivot_high),

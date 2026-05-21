@@ -83,11 +83,66 @@ def _compute_score(sig: TradeSignal) -> float:
     return round(max(0.0, min(100.0, score)), 1)
 
 
+def _has_liquidity_squeeze_risk(sig: TradeSignal) -> bool:
+    """
+    Detecta cluster de liquidação iminente contra a direção do trade.
+
+    Heurística: funding rate extremo na MESMA direção do trade → posições
+    muito alavancadas a favor → squeeze provável. Long com funding >0.05%
+    (longs pagando muito → muitos longs) ou short com funding <-0.05%
+    (shorts pagando → muitos shorts) viram alvo de caça de liquidez.
+
+    Não bloqueia se funding extremo é CONTRA o trade — aí o squeeze
+    favorece a entrada (short squeeze impulsiona long).
+    """
+    der = sig.derivatives
+    if not der:
+        return False
+    sentiment = getattr(der, "funding_sentiment", None) or (
+        der.get("funding_sentiment") if isinstance(der, dict) else None
+    )
+    if not sentiment:
+        return False
+    if sig.direction == SignalDirection.LONG and sentiment == "extreme_long":
+        return True
+    if sig.direction == SignalDirection.SHORT and sentiment == "extreme_short":
+        return True
+    return False
+
+
+def _volume_gate_pass(sig: TradeSignal, tier: str) -> bool:
+    """
+    Volume confirmation por tier — quanto melhor o tier, mais exigente.
+      A+: volume_ratio >= 1.0 (não pode estar abaixo da média)
+      A:  volume_ratio >= 0.8
+      B:  volume_ratio >= 0.6  (rejeita só fantasmas)
+    Se volume_ratio = None (indicador antigo / sem dado), passa.
+    """
+    ind = sig.indicators
+    if not ind:
+        return True
+    ratio = getattr(ind, "volume_ratio", None)
+    if ratio is None:
+        return True
+    if tier == "A+" and ratio < 1.0:
+        return False
+    if tier == "A" and ratio < 0.8:
+        return False
+    if tier == "B" and ratio < 0.6:
+        return False
+    return True
+
+
 def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
     """Retorna 'A+' | 'A' | 'B' | None (rejeitado)."""
     if sig.direction == SignalDirection.NEUTRAL:
         return None
     if sig.risk_reward < MIN_RR:
+        return None
+
+    # Liquidation squeeze risk: funding extremo a favor da posição → caça
+    # de liquidez provável. Bloqueia completamente.
+    if _has_liquidity_squeeze_risk(sig):
         return None
 
     mtf_score = sig.mtf.get("alignment_score", 0) if sig.mtf else 0
@@ -99,13 +154,25 @@ def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
                 has_critical_warning = True
                 break
 
+    tier: Optional[str] = None
     if score >= 80 and mtf_score >= 0.5 and sig.risk_reward >= 2.5 and not has_critical_warning:
-        return "A+"
-    if score >= 70 and mtf_score >= 0.0 and sig.risk_reward >= 2.0:
-        return "A"
-    if score >= 55 and sig.confidence >= MIN_CONFIDENCE_B and sig.risk_reward >= MIN_RR:
-        return "B"
-    return None
+        tier = "A+"
+    elif score >= 70 and mtf_score >= 0.0 and sig.risk_reward >= 2.0:
+        tier = "A"
+    elif score >= 55 and sig.confidence >= MIN_CONFIDENCE_B and sig.risk_reward >= MIN_RR:
+        tier = "B"
+    else:
+        return None
+
+    # Volume confirmation (downgrade em cascata, rejeita se nem B passa)
+    while tier is not None and not _volume_gate_pass(sig, tier):
+        if tier == "A+":
+            tier = "A"
+        elif tier == "A":
+            tier = "B"
+        else:
+            return None
+    return tier
 
 
 def _build_summary(sig: TradeSignal) -> str:

@@ -70,6 +70,8 @@ class Indicator(BaseModel):
     stoch_d: Optional[float] = None
     obv: Optional[float] = None
     volume_avg: Optional[float] = None
+    volume_last: Optional[float] = None
+    volume_ratio: Optional[float] = None  # last / avg20
     supertrend: Optional[float] = None
     supertrend_direction: Optional[int] = None
     pivot_high: Optional[float] = None
