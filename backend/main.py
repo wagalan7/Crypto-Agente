@@ -495,6 +495,20 @@ async def daily_pnl(date_str: Optional[str] = Query(None, alias="date")):
         raise HTTPException(500, f"Erro ao obter P&L: {e}")
 
 
+@app.get("/api/news-status")
+async def news_status(upcoming_hours: int = 24):
+    """Status do filtro de notícias macro (FOMC/CPI/NFP etc).
+    Retorna se há blackout ativo agora + lista de próximos eventos high-impact."""
+    try:
+        from services import news_filter_service as nfs
+        status = await nfs.get_blackout_status()
+        upcoming = await nfs.get_upcoming_events(hours=max(1, min(upcoming_hours, 168)))
+        return {"status": status, "upcoming": upcoming}
+    except Exception as e:
+        logging.warning(f"news-status error (fail-open): {e}")
+        return {"status": {"active": False, "reason": "error"}, "upcoming": []}
+
+
 @app.get("/api/learning-insights")
 async def learning_insights(days: int = 60):
     """Estatísticas agregadas por bucket (tier/TF/sessão/padrão/funding/etc.)

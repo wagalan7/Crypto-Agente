@@ -339,7 +339,27 @@ async def get_recommendations_from_batch(
         _process_symbol(sym, tfs) for sym, tfs in per_symbol.items()
     ])
 
+    # News blackout: durante janela de FOMC/CPI/NFP etc. NÃO gera novas recs.
+    # Volatilidade extrema estopa setups técnicos bons. Falha aberta (sem
+    # bloquear) se o filtro estiver desabilitado ou sem dados.
+    try:
+        from services import news_filter_service as nfs
+        blackout = await nfs.get_blackout_status()
+    except Exception as e:
+        import logging as _log
+        _log.warning(f"[news] check falhou (fail-open): {e}")
+        blackout = {"active": False}
+
     recommendations: List[Recommendation] = []
+    if blackout.get("active"):
+        import logging as _log
+        _log.info(
+            f"[news] BLACKOUT ativo: {blackout.get('event')} ({blackout.get('country')}) "
+            f"— retomando em {blackout.get('minutes_until_resume')}min. "
+            "Nenhuma rec será gerada nesta janela."
+        )
+        return recommendations
+
     for best in best_per_symbol:
         if best is None:
             continue
@@ -437,6 +457,22 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
     import logging as _log
     svc, source_name = _get_server_data_source()
     _log.info(f"[server-scan] fonte: {source_name}")
+
+    # News blackout: pula scan inteiro durante janela de evento high-impact.
+    # Economiza chamadas pra exchange E evita push notifications no pior
+    # momento possível (FOMC/CPI/NFP estopam setups técnicos).
+    try:
+        from services import news_filter_service as nfs
+        blackout = await nfs.get_blackout_status()
+        if blackout.get("active"):
+            _log.info(
+                f"[server-scan] BLACKOUT: {blackout.get('event')} "
+                f"({blackout.get('country')}) — skip scan. "
+                f"Retoma em {blackout.get('minutes_until_resume')}min."
+            )
+            return []
+    except Exception as e:
+        _log.warning(f"[server-scan] news check falhou (fail-open): {e}")
 
     try:
         symbols = await svc.fetch_top_volume_symbols(limit=top_n)

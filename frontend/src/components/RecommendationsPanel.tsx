@@ -91,6 +91,31 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
   const [filter, setFilter] = useState<RecommendationTier | 'all'>('all')
   const [progress, setProgress] = useState<string>('')
   const [historical, setHistorical] = useState<Record<string, HistoricalStat>>({})
+  const [newsStatus, setNewsStatus] = useState<{
+    active: boolean
+    event?: string
+    country?: string
+    minutes_until_event?: number
+    minutes_until_resume?: number
+    next_event?: string
+    next_country?: string
+    minutes_until_next?: number
+  } | null>(null)
+
+  useEffect(() => {
+    const fetchNews = async () => {
+      try {
+        const r = await fetch(`${BACKEND}/api/news-status`)
+        if (r.ok) {
+          const data = await r.json()
+          setNewsStatus(data.status)
+        }
+      } catch { /* fail-open */ }
+    }
+    fetchNews()
+    const id = setInterval(fetchNews, 60_000)
+    return () => clearInterval(id)
+  }, [])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -196,6 +221,29 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
             </button>
           </div>
         </div>
+
+        {/* News blackout banner */}
+        {newsStatus?.active && (
+          <div className="px-4 py-2 bg-amber-900/30 border-b border-amber-700/50 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+            <div className="text-xs leading-snug">
+              <div className="font-semibold text-amber-300">
+                Blackout de notícia macro ativo — recomendações pausadas
+              </div>
+              <div className="text-amber-200/80 mt-0.5">
+                {newsStatus.event} ({newsStatus.country})
+                {typeof newsStatus.minutes_until_resume === 'number' && (
+                  <> · retoma em {newsStatus.minutes_until_resume}min</>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        {!newsStatus?.active && newsStatus?.next_event && typeof newsStatus.minutes_until_next === 'number' && newsStatus.minutes_until_next <= 120 && (
+          <div className="px-4 py-1.5 bg-slate-900/60 border-b border-slate-800 text-[11px] text-slate-400">
+            <span className="text-amber-400">⚠</span> Próx. evento macro: <span className="text-slate-200">{newsStatus.next_event}</span> ({newsStatus.next_country}) em {newsStatus.minutes_until_next}min
+          </div>
+        )}
 
         {/* Filtros / contagem */}
         <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-800 overflow-x-auto">
