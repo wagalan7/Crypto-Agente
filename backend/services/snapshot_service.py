@@ -406,6 +406,28 @@ async def check_open_snapshots() -> int:
     return resolved
 
 
+async def get_recently_stopped_symbols(hours: int = 6) -> set[str]:
+    """
+    Retorna o set de símbolos que tiveram stop ('lost') ou expiry sem TP1
+    nas últimas N horas. Usado como cooldown — não recomendar de novo
+    enquanto a tese técnica não 'resfria'.
+    """
+    if not DB_ENABLED:
+        return set()
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        async with get_session() as session:
+            stmt = select(RecommendationSnapshot.symbol).where(
+                RecommendationSnapshot.outcome_at >= cutoff,
+                RecommendationSnapshot.status.in_(("lost", "expired")),
+            )
+            result = await session.execute(stmt)
+            return {row[0] for row in result.all()}
+    except Exception as e:
+        log.warning(f"[cooldown] falha buscando símbolos estopados: {e}")
+        return set()
+
+
 async def get_daily_pnl(target_date: Optional[date] = None) -> Dict[str, Any]:
     """
     Agrega P&L do dia especificado (ou hoje).

@@ -72,6 +72,9 @@ class Indicator(BaseModel):
     volume_avg: Optional[float] = None
     volume_last: Optional[float] = None
     volume_ratio: Optional[float] = None  # last / avg20
+    displacement_3c: Optional[float] = None       # (close - close[-3]) / close[-3]  (sinalizado)
+    displacement_3c_atr: Optional[float] = None   # mesmo em múltiplos de ATR (sinalizado)
+    atr_pct: Optional[float] = None               # ATR / preço atual (0.01 = 1%)
     supertrend: Optional[float] = None
     supertrend_direction: Optional[int] = None
     pivot_high: Optional[float] = None

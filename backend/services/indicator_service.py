@@ -61,6 +61,27 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
     volume_last = float(volume.iloc[-1]) if len(volume) > 0 else 0.0
     volume_ratio = (volume_last / volume_avg) if volume_avg > 0 else None
 
+    # ── Displacement das últimas 3 velas (anti-chase) ────────────
+    # Mede o quanto o preço já se moveu. Se setup já correu muito
+    # (>2× ATR em 3 velas), entrar agora = chasing → maior chance de stop.
+    displacement_3c = None
+    displacement_3c_atr = None
+    if len(close) >= 4 and atr and atr > 0:
+        c_now = float(close.iloc[-1])
+        c_prev3 = float(close.iloc[-4])
+        if c_prev3 > 0:
+            displacement_3c = (c_now - c_prev3) / c_prev3
+            displacement_3c_atr = (c_now - c_prev3) / atr
+
+    # ── ATR % (volatilidade relativa) ────────────────────────────
+    # Mercado parado (ATR/preço < 0.3%) raramente entrega R alto e
+    # paga slippage demais. Filtro upstream usa isso pra rejeitar.
+    atr_pct = None
+    if atr and len(close) > 0:
+        c_now_ = float(close.iloc[-1])
+        if c_now_ > 0:
+            atr_pct = atr / c_now_
+
     # ── Supertrend (implementação manual) ────────────────
     supertrend, supertrend_dir = _calc_supertrend(high, low, close, atr)
 
@@ -91,6 +112,9 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
         volume_avg=r(volume_avg, 2),
         volume_last=r(volume_last, 2),
         volume_ratio=r(volume_ratio, 3),
+        displacement_3c=r(displacement_3c, 5),
+        displacement_3c_atr=r(displacement_3c_atr, 3),
+        atr_pct=r(atr_pct, 5),
         supertrend=r(supertrend),
         supertrend_direction=supertrend_dir,
         pivot_high=r(pivot_high),

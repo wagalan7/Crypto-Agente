@@ -133,6 +133,46 @@ def _volume_gate_pass(sig: TradeSignal, tier: str) -> bool:
     return True
 
 
+def _is_chasing(sig: TradeSignal) -> bool:
+    """
+    Detecta "chasing": entrar depois do movimento já ter rodado.
+    Se displacement das últimas 3 velas, no sentido do trade, > 2.0× ATR,
+    o setup está estendido — risco alto de pullback estopar a entrada.
+    """
+    ind = sig.indicators
+    if not ind:
+        return False
+    disp_atr = getattr(ind, "displacement_3c_atr", None)
+    if disp_atr is None:
+        return False
+    if sig.direction == SignalDirection.LONG and disp_atr > 2.0:
+        return True
+    if sig.direction == SignalDirection.SHORT and disp_atr < -2.0:
+        return True
+    return False
+
+
+# Volatilidade mínima por TF (ATR/preço). Abaixo disso, mercado está parado
+# e o R esperado fica menor que o spread/slippage.
+MIN_ATR_PCT_BY_TF = {
+    "1m": 0.0008, "3m": 0.0010, "5m": 0.0012, "15m": 0.0018, "30m": 0.0025,
+    "1h": 0.0030, "2h": 0.0040, "4h": 0.0050, "6h": 0.0060,
+    "8h": 0.0070, "12h": 0.0080, "1d": 0.0100,
+}
+
+
+def _is_dead_market(sig: TradeSignal) -> bool:
+    """True se ATR% abaixo do mínimo do TF (mercado lateral/morto)."""
+    ind = sig.indicators
+    if not ind:
+        return False
+    atr_pct = getattr(ind, "atr_pct", None)
+    if atr_pct is None:
+        return False
+    threshold = MIN_ATR_PCT_BY_TF.get(sig.timeframe, 0.003)
+    return atr_pct < threshold
+
+
 def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
     """Retorna 'A+' | 'A' | 'B' | None (rejeitado)."""
     if sig.direction == SignalDirection.NEUTRAL:
@@ -143,6 +183,16 @@ def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
     # Liquidation squeeze risk: funding extremo a favor da posição → caça
     # de liquidez provável. Bloqueia completamente.
     if _has_liquidity_squeeze_risk(sig):
+        return None
+
+    # Anti-chase: setup já rodou demais nas últimas 3 velas. Entrar agora
+    # é comprar o topo / vender o fundo do impulso → stop logo na primeira
+    # correção. Rejeita.
+    if _is_chasing(sig):
+        return None
+
+    # Min ATR%: mercado parado, R não compensa custo. Rejeita.
+    if _is_dead_market(sig):
         return None
 
     mtf_score = sig.mtf.get("alignment_score", 0) if sig.mtf else 0
@@ -441,12 +491,26 @@ async def get_recommendations_from_batch(
         _log.info(f"[regime] {regime.get('regime')} — bloqueia tudo: {regime.get('reasons')}")
         return recommendations
 
+    # Cooldown por símbolo: bloqueia recs em símbolos que estoparam/expiraram
+    # nas últimas 6h (evita "revenge entry" no mesmo nível derrotado).
+    try:
+        from services.snapshot_service import get_recently_stopped_symbols
+        cooldown_symbols = await get_recently_stopped_symbols(hours=6)
+    except Exception:
+        cooldown_symbols = set()
+
     for best in best_per_symbol:
         if best is None:
             continue
         sig, score = best
         tier = _classify_tier(sig, score)
         if tier is None:
+            continue
+
+        # Cooldown: símbolo estopado nas últimas 6h → skip
+        if sig.symbol in cooldown_symbols:
+            import logging as _log
+            _log.info(f"[cooldown] skip {sig.symbol}: estopado nas últimas 6h")
             continue
 
         # Regime filter por rec
@@ -619,12 +683,22 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
         _log.info(f"[server-scan] regime {regime.get('regime')} — skip: {regime.get('reasons')}")
         return []
 
+    # Cooldown por símbolo (6h pós-stop/expire)
+    try:
+        from services.snapshot_service import get_recently_stopped_symbols
+        cooldown_symbols = await get_recently_stopped_symbols(hours=6)
+    except Exception:
+        cooldown_symbols = set()
+
     for _symbol, best in all_results:
         if best is None:
             continue
         sig, score = best
         tier = _classify_tier_vision(sig, score)
         if tier is None:
+            continue
+        if sig.symbol in cooldown_symbols:
+            _log.info(f"[server-scan] cooldown skip {sig.symbol}")
             continue
         # Regime filter
         try:
