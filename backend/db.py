@@ -78,6 +78,11 @@ async def init_db():
             "ALTER TABLE recommendation_snapshots "
             "ADD COLUMN IF NOT EXISTS tp1_hit_at TIMESTAMP WITH TIME ZONE"
         ))
+        # Step 2b: trail por ATR no resto após TP1
+        await conn.execute(text(
+            "ALTER TABLE recommendation_snapshots "
+            "ADD COLUMN IF NOT EXISTS peak_price_since_tp1 DOUBLE PRECISION"
+        ))
     log.info("Schema do banco verificado/criado (migrações aplicadas).")
 
 

@@ -222,10 +222,11 @@ export default function DailyPnLPanel({ onClose }: Props) {
 
         {/* Footer */}
         <div className="px-4 py-2 border-t border-slate-800 bg-slate-900/60 text-[10px] text-slate-500 leading-relaxed">
-          <strong className="text-slate-400">R:</strong> múltiplo de risco. +2R = atingiu TP2 (2× o risco). −1R = stop bateu.
+          <strong className="text-slate-400">R:</strong> múltiplo de risco com gestão parcial:
+          +1.5R = TP2 cheio (50% TP1 + 50% TP2) · +0.5R = breakeven após TP1 (50% TP1 + 50% trail/BE) · −1R = stop original.
           A coluna de <strong>% da banca</strong> assume o risco_pct do tier (A+ 1.5% / A 1% / B 0.5%).
           <br />
-          Tracker verifica preço a cada 5 min · snapshots expiram em 48h se não resolverem
+          Tracker verifica preço a cada 5 min · stop trail por ATR após TP1 · snapshots expiram em 48h
         </div>
       </div>
     </div>

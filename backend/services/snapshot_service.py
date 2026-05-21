@@ -26,10 +26,22 @@ log = logging.getLogger(__name__)
 # ── Configuração ─────────────────────────────────────────────────────────
 DEDUP_WINDOW_HOURS = 2       # mesma rec não entra 2× nesse intervalo
 EXPIRY_HOURS = 48            # snapshots abertos viram "expired" depois disso
-REALIZED_R_TP1 = 1.0          # TP1 atingido e posição encerrada com lucro parcial (expiry após TP1)
-REALIZED_R_TP2 = 2.0          # TP2 cheio
-REALIZED_R_STOP = -1.0        # stop original (antes de TP1)
-REALIZED_R_BREAKEVEN = 0.0    # stop em entry após TP1 — Step 2a
+# ── R esperado (Step 2b: parcial 50% no TP1) ─────────────────────────────
+# Premissa: ao tocar TP1, fecha 50% da posição (+1R em metade), restante segue
+# com stop em entry e trail por ATR. O R reportado é a MÉDIA ponderada das
+# duas metades:
+#   • Parcial sai em TP1 (+1R) → metade = +0.5R
+#   • Final em TP2 (+2R)       → metade = +1.0R  → total +1.5R (won_tp2)
+#   • Final em entry/trail (0R) → metade = 0R    → total +0.5R (won_tp1_be)
+#   • Final expira após TP1     → conservador 0R → total +0.5R (won_tp1)
+# Stop original (antes de TP1) = -1R cheio (não houve parcial).
+REALIZED_R_TP1 = 0.5           # 50% TP1 + 50% breakeven (conservador no expiry após TP1)
+REALIZED_R_TP2 = 1.5           # 50% TP1 + 50% TP2
+REALIZED_R_STOP = -1.0         # stop original (antes de TP1)
+REALIZED_R_BREAKEVEN = 0.5     # 50% TP1 + 50% entry (stop em BE bate ou trail aciona)
+
+# Trail por ATR após TP1 hit. Stop trail = peak ± K × ATR, com piso em entry.
+ATR_TRAIL_K = 1.5
 
 
 def _extract_features(rec: Dict[str, Any], created_at: datetime) -> Dict[str, Any]:
@@ -142,38 +154,82 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     return inserted
 
 
+def _atr_abs(snap: RecommendationSnapshot) -> Optional[float]:
+    """ATR absoluto do setup, derivado das features (atr_pct × entry)."""
+    feats = snap.features or {}
+    atr_pct = feats.get("atr_pct")
+    if atr_pct is None or snap.entry is None:
+        return None
+    try:
+        return float(atr_pct) / 100.0 * float(snap.entry)
+    except Exception:
+        return None
+
+
 def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Optional[tuple]:
     """
-    Step 2a: processa candles em ordem cronológica e aplica a regra:
-      • Se TP1 toca → stop sobe pra entry (breakeven) nas próximas velas.
-      • Se TP2 toca → fecha como won_tp2 (+2R).
-      • Se stop ORIGINAL bate antes de TP1 → lost (-1R).
-      • Se stop EFETIVO (entry) bate APÓS TP1 → won_tp1_be (0R, breakeven).
+    Steps 2a+2b: processa candles em ordem cronológica.
+
+    Lógica:
+      • Se TP1 toca → fecha 50% (+1R parcial), stop sobe pra entry, restante
+        passa a trailar pelo ATR (peak ± K×ATR, piso em entry).
+      • Se TP2 toca a qualquer momento → fecha como won_tp2 (+1.5R total,
+        incluindo o parcial).
+      • Se stop ORIGINAL bate antes de TP1 → lost (-1R, posição cheia).
+      • Se stop EFETIVO (entry ou trail) bate APÓS TP1 → won_tp1_be (+0.5R).
 
     Retorna uma das opções:
-      ("won_tp2", price, +2.0, tp1_just_hit_bool)        → fecha lucro máximo
-      ("won_tp1_be", entry, 0.0, tp1_just_hit_bool)      → breakeven após TP1
-      ("lost", stop_loss, -1.0, False)                   → stop original
-      ("open_after_tp1", None, None, True)               → ainda aberto, MAS tocou TP1 agora
-      None                                                → segue aberto, sem evento
+      ("won_tp2", price, +1.5, tp1_just_hit_bool, new_peak)   → lucro máximo
+      ("won_tp1_be", price, +0.5, tp1_just_hit_bool, new_peak) → trail/BE
+      ("lost", stop_loss, -1.0, False, None)                   → stop original
+      ("open_after_tp1", None, None, True, new_peak)           → segue aberto
+      ("open_update", None, None, False, new_peak)             → só atualiza peak
+      None                                                      → segue aberto
 
-    Regra conservadora mantida: se uma MESMA vela toca stop e tp1, assume que
-    stop bateu antes (pior caso) — exceto se TP1 já tinha sido marcado em
-    rounds anteriores.
+    `new_peak` é o pico do preço a favor desde TP1 hit (None se ainda não houve
+    TP1). O caller persiste em snap.peak_price_since_tp1.
+
+    Regra conservadora: na MESMA vela, stop tem prioridade SE TP1 ainda não
+    foi marcado em rounds anteriores.
     """
     if df_window is None or df_window.empty:
         return None
 
     is_long = snap.direction == "long"
     tp1_already = snap.tp1_hit_at is not None
-    tp1_hit_now = False  # marca se TP1 acabou de bater nesta janela
+    tp1_hit_now = False
+    peak = snap.peak_price_since_tp1  # pode ser None
+    atr = _atr_abs(snap)  # pode ser None — sem ATR, vira só BE puro
 
     for _, c in df_window.iterrows():
         h = float(c["high"])
         l = float(c["low"])
 
-        # Stop efetivo: se TP1 (passado OU agora) já bateu, stop = entry
-        effective_stop = snap.entry if (tp1_already or tp1_hit_now) else snap.stop_loss
+        # Atualiza peak se TP1 já foi (passado ou agora)
+        if tp1_already or tp1_hit_now:
+            cand_peak = h if is_long else l
+            if peak is None:
+                peak = cand_peak
+            else:
+                peak = max(peak, cand_peak) if is_long else min(peak, cand_peak)
+
+        # Stop efetivo:
+        #   • Antes de TP1: stop original
+        #   • Após TP1 sem ATR: stop = entry (BE puro)
+        #   • Após TP1 com ATR: max(entry, peak - K×ATR) pra long;
+        #                       min(entry, peak + K×ATR) pra short
+        if tp1_already or tp1_hit_now:
+            if atr is not None and peak is not None:
+                if is_long:
+                    trail = peak - ATR_TRAIL_K * atr
+                    effective_stop = max(snap.entry, trail)
+                else:
+                    trail = peak + ATR_TRAIL_K * atr
+                    effective_stop = min(snap.entry, trail)
+            else:
+                effective_stop = snap.entry
+        else:
+            effective_stop = snap.stop_loss
 
         if is_long:
             stop_hit = l <= effective_stop
@@ -184,34 +240,41 @@ def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Option
             tp1_hit = (snap.tp1 is not None) and (l <= snap.tp1)
             tp2_hit = l <= snap.tp2
 
-        # Conservador: na MESMA vela, stop tem prioridade SE TP1 ainda não foi
-        # marcado em rounds anteriores. Se TP1 já era hit no passado, stop em
-        # entry pode bater junto com TP2 — aí ainda assim damos prioridade pro
-        # breakeven (worst-case) só se TP2 não bater junto.
+        # Stop original antes de TP1 → loss cheio (worst-case)
         if stop_hit and not (tp1_already or tp1_hit_now):
-            # Stop original antes de TP1 → loss puro, mesmo se TP1/TP2 batem
-            # na mesma vela (worst-case assume stop primeiro).
-            return ("lost", snap.stop_loss, REALIZED_R_STOP, False)
+            return ("lost", snap.stop_loss, REALIZED_R_STOP, False, None)
 
-        # Após (ou junto com) TP1 já marcado, TP2 ganha prioridade sobre BE
+        # TP2 a qualquer momento → won_tp2 (lucro max). Se TP1 e TP2 batem
+        # na MESMA vela sem TP1 prévio, ambos efeitos contam.
         if tp2_hit:
-            return ("won_tp2", snap.tp2, REALIZED_R_TP2, tp1_hit_now)
+            # Garante que peak refletiu o evento se TP1 foi marcado agora
+            if (tp1_hit and not tp1_already) or tp1_hit_now:
+                tp1_hit_now = True
+                if atr is not None:
+                    cand_peak = h if is_long else l
+                    peak = cand_peak if peak is None else (max(peak, cand_peak) if is_long else min(peak, cand_peak))
+            return ("won_tp2", snap.tp2, REALIZED_R_TP2, tp1_hit_now, peak)
 
-        # TP1 acabou de bater nesta vela
+        # TP1 acabou de bater nesta vela (e não tinha batido antes)
         if tp1_hit and not (tp1_already or tp1_hit_now):
             tp1_hit_now = True
-            # NÃO retorna ainda — continua iterando candles, agora com stop
-            # efetivo no entry. Pode bater TP2 ou voltar pro entry no próprio
-            # window.
+            # Inicializa peak com o high (long) / low (short) da vela
+            cand_peak = h if is_long else l
+            peak = cand_peak if peak is None else (max(peak, cand_peak) if is_long else min(peak, cand_peak))
+            # Continua iterando — pode bater TP2 ou stop trail nesta janela
             continue
 
-        # Stop efetivo (= entry) bate após TP1 já estar marcado
+        # Stop trail/BE bate após TP1 já estar marcado
         if stop_hit and (tp1_already or tp1_hit_now):
-            return ("won_tp1_be", snap.entry, REALIZED_R_BREAKEVEN, tp1_hit_now)
+            # Saída efetiva é o stop trail/BE
+            return ("won_tp1_be", effective_stop, REALIZED_R_BREAKEVEN, tp1_hit_now, peak)
 
-    # Não fechou. Reporta se TP1 acabou de ser tocado agora.
+    # Não fechou. Se TP1 acabou de ser tocado, sinaliza com peak novo.
     if tp1_hit_now:
-        return ("open_after_tp1", None, None, True)
+        return ("open_after_tp1", None, None, True, peak)
+    # Se TP1 já era hit no passado, peak pode ter mudado — sinaliza update
+    if tp1_already and peak != snap.peak_price_since_tp1:
+        return ("open_update", None, None, False, peak)
     return None
 
 
@@ -268,26 +331,34 @@ async def check_open_snapshots() -> int:
 
                 outcome = _classify_outcome_candles(snap, df_window)
                 if outcome is not None:
-                    status, price, r, tp1_just_hit = outcome
+                    status, price, r, tp1_just_hit, new_peak = outcome
 
                     if status == "open_after_tp1":
-                        # Step 2a: TP1 tocou agora — marca timestamp, stop sobe
-                        # pra entry, posição segue aberta esperando TP2 ou BE.
+                        # Step 2a+2b: TP1 tocou agora — marca timestamp + peak,
+                        # stop vira BE/trail, posição segue aberta.
                         snap.tp1_hit_at = now
+                        if new_peak is not None:
+                            snap.peak_price_since_tp1 = new_peak
                         log.info(
-                            f"[breakeven] {snap.symbol} {snap.timeframe} {snap.direction} "
-                            f"TP1 hit → stop movido pra entry ({snap.entry})"
+                            f"[step-2b] {snap.symbol} {snap.timeframe} {snap.direction} "
+                            f"TP1 hit (parcial 50%) → trail ativo (peak={new_peak})"
                         )
+                    elif status == "open_update":
+                        # Só atualiza peak (TP1 já era passado, mas peak melhorou)
+                        if new_peak is not None:
+                            snap.peak_price_since_tp1 = new_peak
                     else:
                         # Fecha snapshot
                         snap.status = status
                         snap.outcome_price = price
                         snap.outcome_at = now
                         snap.realized_r = r
-                        # Se foi won_tp2 e TP1 bateu na MESMA janela (sem ter sido
-                        # marcado antes), grava também tp1_hit_at pra rastreio.
+                        # Se TP1 bateu na MESMA janela (sem ter sido marcado
+                        # antes), persiste tp1_hit_at e peak pra rastreio.
                         if tp1_just_hit and snap.tp1_hit_at is None:
                             snap.tp1_hit_at = now
+                        if new_peak is not None:
+                            snap.peak_price_since_tp1 = new_peak
                         resolved += 1
 
                 snap.last_check_at = now
