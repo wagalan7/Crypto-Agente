@@ -360,6 +360,20 @@ async def get_recommendations_from_batch(
         )
         return recommendations
 
+    # Macro regime gate: bloqueia tudo se RISK_OFF; alt longs se ALT_DANGER.
+    try:
+        from services import regime_service as rs
+        regime = await rs.get_regime_status()
+    except Exception as e:
+        import logging as _log
+        _log.warning(f"[regime] check falhou (fail-open): {e}")
+        regime = {"regime": "NORMAL", "block_all": False, "block_alt_longs": False, "downgrade_alt_longs": False}
+
+    if regime.get("block_all"):
+        import logging as _log
+        _log.info(f"[regime] {regime.get('regime')} — bloqueia tudo: {regime.get('reasons')}")
+        return recommendations
+
     for best in best_per_symbol:
         if best is None:
             continue
@@ -367,6 +381,26 @@ async def get_recommendations_from_batch(
         tier = _classify_tier(sig, score)
         if tier is None:
             continue
+
+        # Regime filter por rec
+        try:
+            from services.regime_service import should_block_recommendation, is_btc_symbol
+            block_reason = should_block_recommendation(regime, sig.symbol, sig.direction)
+            if block_reason:
+                import logging as _log
+                _log.info(f"[regime] skip {sig.symbol} {sig.direction}: {block_reason}")
+                continue
+            # Downgrade alt longs em BTC_DOMINANT
+            if regime.get("downgrade_alt_longs") and sig.direction == "long" and not is_btc_symbol(sig.symbol):
+                if tier == "A+":
+                    tier = "A"
+                elif tier == "A":
+                    tier = "B"
+                elif tier == "B":
+                    continue  # B downgrade vira reject
+        except Exception:
+            pass
+
         recommendations.append(_build_recommendation(sig, score, tier))
 
     tier_order = {"A+": 0, "A": 1, "B": 2}
@@ -506,6 +540,18 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
 
     all_results = await asyncio.gather(*[_bounded(s) for s in symbols])
 
+    # Macro regime gate
+    try:
+        from services import regime_service as rs
+        regime = await rs.get_regime_status()
+    except Exception as e:
+        _log.warning(f"[server-scan] regime check falhou (fail-open): {e}")
+        regime = {"regime": "NORMAL", "block_all": False, "block_alt_longs": False, "downgrade_alt_longs": False}
+
+    if regime.get("block_all"):
+        _log.info(f"[server-scan] regime {regime.get('regime')} — skip: {regime.get('reasons')}")
+        return []
+
     for _symbol, best in all_results:
         if best is None:
             continue
@@ -513,6 +559,22 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
         tier = _classify_tier_vision(sig, score)
         if tier is None:
             continue
+        # Regime filter
+        try:
+            from services.regime_service import should_block_recommendation, is_btc_symbol
+            block_reason = should_block_recommendation(regime, sig.symbol, sig.direction)
+            if block_reason:
+                _log.info(f"[server-scan] skip {sig.symbol} {sig.direction}: {block_reason}")
+                continue
+            if regime.get("downgrade_alt_longs") and sig.direction == "long" and not is_btc_symbol(sig.symbol):
+                if tier == "A+":
+                    tier = "A"
+                elif tier == "A":
+                    tier = "B"
+                elif tier == "B":
+                    continue
+        except Exception:
+            pass
         recommendations.append(_build_recommendation(sig, score, tier))
 
     tier_order = {"A+": 0, "A": 1, "B": 2}

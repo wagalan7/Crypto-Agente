@@ -101,19 +101,29 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
     next_country?: string
     minutes_until_next?: number
   } | null>(null)
+  const [regime, setRegime] = useState<{
+    regime: string
+    btc_24h_pct: number | null
+    btc_dominance: number | null
+    block_all: boolean
+    block_alt_longs: boolean
+    downgrade_alt_longs: boolean
+    reasons: string[]
+  } | null>(null)
 
   useEffect(() => {
-    const fetchNews = async () => {
+    const fetchStatus = async () => {
       try {
-        const r = await fetch(`${BACKEND}/api/news-status`)
-        if (r.ok) {
-          const data = await r.json()
-          setNewsStatus(data.status)
-        }
+        const [n, r] = await Promise.all([
+          fetch(`${BACKEND}/api/news-status`).then(x => x.ok ? x.json() : null),
+          fetch(`${BACKEND}/api/regime-status`).then(x => x.ok ? x.json() : null),
+        ])
+        if (n) setNewsStatus(n.status)
+        if (r) setRegime(r)
       } catch { /* fail-open */ }
     }
-    fetchNews()
-    const id = setInterval(fetchNews, 60_000)
+    fetchStatus()
+    const id = setInterval(fetchStatus, 60_000)
     return () => clearInterval(id)
   }, [])
 
@@ -242,6 +252,37 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
         {!newsStatus?.active && newsStatus?.next_event && typeof newsStatus.minutes_until_next === 'number' && newsStatus.minutes_until_next <= 120 && (
           <div className="px-4 py-1.5 bg-slate-900/60 border-b border-slate-800 text-[11px] text-slate-400">
             <span className="text-amber-400">⚠</span> Próx. evento macro: <span className="text-slate-200">{newsStatus.next_event}</span> ({newsStatus.next_country}) em {newsStatus.minutes_until_next}min
+          </div>
+        )}
+
+        {/* Regime macro banner */}
+        {regime && regime.regime !== 'NORMAL' && (
+          <div className={`px-4 py-2 border-b flex items-start gap-2 ${
+            regime.block_all ? 'bg-red-900/40 border-red-700/60' :
+            regime.block_alt_longs ? 'bg-orange-900/30 border-orange-700/50' :
+            'bg-yellow-900/20 border-yellow-700/40'
+          }`}>
+            <AlertTriangle className={`w-4 h-4 flex-shrink-0 mt-0.5 ${
+              regime.block_all ? 'text-red-400' : regime.block_alt_longs ? 'text-orange-400' : 'text-yellow-400'
+            }`} />
+            <div className="text-xs leading-snug">
+              <div className={`font-semibold ${
+                regime.block_all ? 'text-red-300' : regime.block_alt_longs ? 'text-orange-300' : 'text-yellow-300'
+              }`}>
+                Regime: {regime.regime}
+                {regime.block_all && ' — todas as recs bloqueadas'}
+                {!regime.block_all && regime.block_alt_longs && ' — longs em alts bloqueados'}
+                {!regime.block_all && !regime.block_alt_longs && regime.downgrade_alt_longs && ' — alt longs com tier reduzido'}
+              </div>
+              <div className="text-slate-300/80 mt-0.5">
+                {regime.reasons?.join(' · ')}
+                {(regime.btc_dominance !== null || regime.btc_24h_pct !== null) && (
+                  <span className="ml-2 text-slate-500">
+                    [BTC.D {regime.btc_dominance?.toFixed(1) ?? '—'}% · BTC 24h {regime.btc_24h_pct !== null ? (regime.btc_24h_pct >= 0 ? '+' : '') + regime.btc_24h_pct.toFixed(2) + '%' : '—'}]
+                  </span>
+                )}
+              </div>
+            </div>
           </div>
         )}
 

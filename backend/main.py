@@ -509,6 +509,20 @@ async def news_status(upcoming_hours: int = 24):
         return {"status": {"active": False, "reason": "error"}, "upcoming": []}
 
 
+@app.get("/api/regime-status")
+async def regime_status():
+    """Status do regime macro (RISK_OFF / ALT_DANGER / BTC_DOMINANT / NORMAL).
+    Indica se recs estão sendo bloqueadas/downgraded por condição de mercado."""
+    try:
+        from services import regime_service as rs
+        return await rs.get_regime_status()
+    except Exception as e:
+        logging.warning(f"regime-status error (fail-open): {e}")
+        return {"regime": "NORMAL", "btc_24h_pct": None, "btc_dominance": None,
+                "block_all": False, "block_alt_longs": False,
+                "downgrade_alt_longs": False, "reasons": ["error"]}
+
+
 @app.get("/api/learning-insights")
 async def learning_insights(days: int = 60):
     """Estatísticas agregadas por bucket (tier/TF/sessão/padrão/funding/etc.)
