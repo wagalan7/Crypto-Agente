@@ -429,6 +429,21 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
     except Exception as e:
         _log.warning(f"[server-scan] fetch_top_volume falhou ({source_name}): {e}")
         symbols = []
+
+    # Fallback híbrido: se a fonte for futures-proxy mas o endpoint de listagem
+    # em massa (/fapi/v1/ticker/24hr) der 451 do DC do Railway (geo-block só
+    # do bulk, endpoints individuais passam), usa Vision pra descobrir os top
+    # símbolos e mantém Futures pro OHLCV de cada um.
+    if not symbols and source_name == "binance-futures-proxy":
+        try:
+            from services import binance_vision_service as _bvs
+            symbols = await _bvs.fetch_top_volume_symbols(limit=top_n)
+            _log.info(f"[server-scan] usando lista do Vision ({len(symbols)} símbolos), "
+                      f"OHLCV vem do Futures-proxy")
+        except Exception as e:
+            _log.warning(f"[server-scan] fallback Vision-list também falhou: {e}")
+            symbols = []
+
     if not symbols:
         return []
 
