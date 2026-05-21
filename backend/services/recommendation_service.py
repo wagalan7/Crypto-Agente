@@ -173,6 +173,18 @@ def _is_dead_market(sig: TradeSignal) -> bool:
     return atr_pct < threshold
 
 
+def _has_confirming_pattern(sig: TradeSignal) -> bool:
+    """True se existe pelo menos 1 padrão detectado alinhado à direção
+    do trade (long pattern em LONG, short pattern em SHORT). Padrão é a
+    diferença entre 'setup numérico' e 'estrutura visível' — A+ exige."""
+    if not sig.patterns:
+        return False
+    for p in sig.patterns:
+        if getattr(p, "direction", None) == sig.direction:
+            return True
+    return False
+
+
 def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
     """Retorna 'A+' | 'A' | 'B' | None (rejeitado)."""
     if sig.direction == SignalDirection.NEUTRAL:
@@ -205,7 +217,10 @@ def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
                 break
 
     tier: Optional[str] = None
-    if score >= 80 and mtf_score >= 0.5 and sig.risk_reward >= 2.5 and not has_critical_warning:
+    if (
+        score >= 80 and mtf_score >= 0.5 and sig.risk_reward >= 2.5
+        and not has_critical_warning and _has_confirming_pattern(sig)
+    ):
         tier = "A+"
     elif score >= 70 and mtf_score >= 0.0 and sig.risk_reward >= 2.0:
         tier = "A"
@@ -339,6 +354,53 @@ def _compute_leverage(entry: float, stop_loss: float, tier: str) -> dict:
         "margin_pct": margin_pct,
         "stop_dist_pct": round(stop_dist * 100, 3),
     }
+
+
+def _apply_btc_correlation_throttle(
+    recommendations: List["Recommendation"],
+    regime: Dict[str, Any],
+) -> None:
+    """
+    Quando BTC está indeciso (|24h pct| ≤ 1%) e temos vários alt LONGs,
+    todos sofrem do mesmo risco correlato: uma reversão do BTC estopa
+    todos juntos. Reduz risk_pct (e portanto leverage proporcionalmente)
+    pra limitar exposição agregada.
+
+    Throttle factors:
+      ≥3 alt longs simultâneos: 0.66× risk_pct
+      ≥5 alt longs simultâneos: 0.50× risk_pct
+    Mutação in-place. Anexa warning explicando.
+    """
+    try:
+        btc_24h = regime.get("btc_24h_pct")
+        if btc_24h is None or abs(btc_24h) > 1.0:
+            return  # BTC tem viés claro: correlação alts-BTC bate normal
+        from services.regime_service import is_btc_symbol
+        alt_longs = [
+            r for r in recommendations
+            if r.direction == "long" and not is_btc_symbol(r.symbol)
+        ]
+        if len(alt_longs) < 3:
+            return
+        factor = 0.5 if len(alt_longs) >= 5 else 0.66
+        msg = (
+            f"BTC indeciso ({btc_24h:+.2f}% / 24h) + {len(alt_longs)} alt longs "
+            f"simultâneos: risco reduzido {int((1-factor)*100)}% por correlação"
+        )
+        for r in alt_longs:
+            r.risk_pct = round(r.risk_pct * factor, 3)
+            # Re-escala leverage proporcionalmente (mantém stop_dist)
+            r.leverage = max(1, int(round(r.leverage * factor)))
+            if msg not in (r.warnings or []):
+                r.warnings = (r.warnings or []) + [msg]
+        import logging as _log
+        _log.info(
+            f"[corr-throttle] aplicado em {len(alt_longs)} alt longs "
+            f"(fator {factor})"
+        )
+    except Exception as e:
+        import logging as _log
+        _log.warning(f"[corr-throttle] falhou: {e}")
 
 
 def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Recommendation:
@@ -534,6 +596,9 @@ async def get_recommendations_from_batch(
 
         recommendations.append(_build_recommendation(sig, score, tier))
 
+    # BTC correlation throttle: vários alt longs + BTC indeciso → reduz size
+    _apply_btc_correlation_throttle(recommendations, regime)
+
     tier_order = {"A+": 0, "A": 1, "B": 2}
     recommendations.sort(key=lambda r: (tier_order[r.tier], -r.score))
     return recommendations
@@ -717,6 +782,9 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
         except Exception:
             pass
         recommendations.append(_build_recommendation(sig, score, tier))
+
+    # BTC correlation throttle (idem batch)
+    _apply_btc_correlation_throttle(recommendations, regime)
 
     tier_order = {"A+": 0, "A": 1, "B": 2}
     recommendations.sort(key=lambda r: (tier_order[r.tier], -r.score))
