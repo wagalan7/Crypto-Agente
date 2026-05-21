@@ -25,7 +25,23 @@ log = logging.getLogger(__name__)
 
 # ── Configuração ─────────────────────────────────────────────────────────
 DEDUP_WINDOW_HOURS = 2       # mesma rec não entra 2× nesse intervalo
-EXPIRY_HOURS = 48            # snapshots abertos viram "expired" depois disso
+EXPIRY_HOURS = 48            # ceiling absoluto — qualquer trade > 48h é encerrado
+
+# Time-stop por timeframe: se TP1 não bater em N candles, encerra o trade
+# (evita "morte lenta" que trava capital sem stop nem TP). Cada TF tem
+# horizonte próprio — scalp deve resolver em horas, swing aguenta dias.
+# Valor = horas máximas SEM tocar TP1. Se TP1 já tocou, NÃO aplica
+# (trade está em lucro, deixa o trail/TP2 cuidar).
+TIME_STOP_HOURS_BY_TF = {
+    "1m": 1, "3m": 2, "5m": 3, "15m": 4, "30m": 8,
+    "1h": 12, "2h": 24, "4h": 36, "6h": 48,
+    "8h": 48, "12h": 48, "1d": 48,  # cappado pelo EXPIRY_HOURS
+}
+
+
+def _time_stop_hours(tf: str) -> float:
+    """Horas máximas sem tocar TP1 antes de encerrar por time-stop."""
+    return float(TIME_STOP_HOURS_BY_TF.get(tf, EXPIRY_HOURS))
 # ── R esperado (Step 2b: parcial 50% no TP1) ─────────────────────────────
 # Premissa: ao tocar TP1, fecha 50% da posição (+1R em metade), restante segue
 # com stop em entry e trail por ATR. O R reportado é a MÉDIA ponderada das
@@ -303,10 +319,28 @@ async def check_open_snapshots() -> int:
 
         for snap in open_snaps:
             try:
-                # Expiração: passou de EXPIRY_HOURS desde criado.
-                # Step 2a: se TP1 já tinha sido tocado, expira como won_tp1 (+1R)
+                # Time-stop por TF: se TP1 NÃO tocou ainda E passou o limite
+                # do TF (ex: 4h pro 15m), encerra como expired (0R, sem perda
+                # nem ganho). Evita capital travado em trade que não anda.
+                # Se TP1 já tocou, ignora time-stop (deixa trail/TP2 cuidar).
+                age = now - snap.created_at
+                tf_limit_h = _time_stop_hours(snap.timeframe)
+                if snap.tp1_hit_at is None and age > timedelta(hours=tf_limit_h):
+                    snap.status = "expired"
+                    snap.realized_r = 0.0
+                    snap.outcome_at = now
+                    log.info(
+                        f"[time-stop] {snap.symbol} {snap.timeframe} {snap.direction} "
+                        f"expirado: {age.total_seconds()/3600:.1f}h sem TP1 "
+                        f"(limite {tf_limit_h}h)"
+                    )
+                    resolved += 1
+                    continue
+
+                # Ceiling absoluto (48h): independente de TF, fecha.
+                # Step 2a: se TP1 já tinha sido tocado, expira como won_tp1 (+0.5R)
                 # — lucro parcial travado. Caso contrário, expired (0R).
-                if (now - snap.created_at) > timedelta(hours=EXPIRY_HOURS):
+                if age > timedelta(hours=EXPIRY_HOURS):
                     if snap.tp1_hit_at is not None:
                         snap.status = "won_tp1"
                         snap.outcome_price = snap.tp1
