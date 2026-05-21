@@ -398,15 +398,16 @@ async def get_daily_pnl(target_date: Optional[date] = None) -> Dict[str, Any]:
         result = await session.execute(stmt)
         snaps = result.scalars().all()
 
-        # Snapshots ainda abertos criados hoje
-        open_stmt = select(func.count(RecommendationSnapshot.id)).where(
+        # Snapshots ainda abertos criados hoje (detalhe completo pro drill-down)
+        open_stmt = select(RecommendationSnapshot).where(
             and_(
                 RecommendationSnapshot.created_at >= day_start,
                 RecommendationSnapshot.created_at < day_end,
                 RecommendationSnapshot.status == "open",
             )
         )
-        open_count = (await session.execute(open_stmt)).scalar() or 0
+        open_snaps = (await session.execute(open_stmt)).scalars().all()
+        open_count = len(open_snaps)
 
     wins = [s for s in snaps if s.realized_r and s.realized_r > 0]
     losses = [s for s in snaps if s.realized_r and s.realized_r < 0]
@@ -416,24 +417,34 @@ async def get_daily_pnl(target_date: Optional[date] = None) -> Dict[str, Any]:
     total = win_count + loss_count
     win_rate = (win_count / total * 100) if total else 0
 
-    # Detalhe por trade
-    trades = []
-    for s in sorted(snaps, key=lambda x: x.outcome_at or x.created_at):
-        trades.append({
+    # Detalhe por trade (resolvido + aberto, em listas separadas)
+    def _serialize(s):
+        return {
             "symbol": s.symbol,
             "timeframe": s.timeframe,
             "tier": s.tier,
             "direction": s.direction,
             "entry": s.entry,
             "stop_loss": s.stop_loss,
+            "tp1": s.tp1,
             "tp2": s.tp2,
             "leverage": s.leverage,
             "status": s.status,
             "realized_r": s.realized_r,
             "risk_pct": s.risk_pct,
+            "score": s.score,
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "outcome_at": s.outcome_at.isoformat() if s.outcome_at else None,
-        })
+            "tp1_hit_at": s.tp1_hit_at.isoformat() if s.tp1_hit_at else None,
+        }
+
+    trades = [_serialize(s) for s in sorted(snaps, key=lambda x: x.outcome_at or x.created_at)]
+    open_trades = [_serialize(s) for s in sorted(open_snaps, key=lambda x: x.created_at)]
+
+    # Soma o % real da banca afetado no dia (cada trade tem seu risco próprio:
+    # A+=1.5%, A=1%, B=0.5%). Não é total_r × risk_pct[0] — isso só vale se
+    # todos os trades fossem do mesmo tier. Aqui somamos por trade.
+    total_pct_banca = sum((s.realized_r or 0) * s.risk_pct for s in snaps)
 
     return {
         "enabled": True,
@@ -444,9 +455,11 @@ async def get_daily_pnl(target_date: Optional[date] = None) -> Dict[str, Any]:
             "losses": loss_count,
             "win_rate_pct": round(win_rate, 1),
             "total_r": round(total_r, 2),
+            "total_pct_banca": round(total_pct_banca, 3),
             "still_open": open_count,
         },
         "trades": trades,
+        "open_trades": open_trades,
     }
 
 

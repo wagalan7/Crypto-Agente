@@ -58,6 +58,31 @@ function symbolBase(s: string): string {
   return s.split('/')[0]
 }
 
+// Classifica a operação pelo timeframe — define expectativa de holding period
+// e ajuda o user a saber se entra/sai no mesmo dia ou carrega posição.
+function operationType(tf: string): { label: string; cls: string; hint: string } {
+  const t = tf.toLowerCase()
+  if (['1m', '3m', '5m', '15m'].includes(t)) {
+    return {
+      label: 'SCALP',
+      cls: 'bg-pink-500/15 text-pink-300 border-pink-500/40',
+      hint: 'Operação rápida (minutos a 1h). Entra e sai no mesmo dia, geralmente em janela curta.',
+    }
+  }
+  if (['30m', '1h', '2h'].includes(t)) {
+    return {
+      label: 'DAY TRADE',
+      cls: 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40',
+      hint: 'Operação intradiária (horas). Abre e fecha no mesmo dia, sem carregar overnight.',
+    }
+  }
+  return {
+    label: 'SWING',
+    cls: 'bg-purple-500/15 text-purple-300 border-purple-500/40',
+    hint: 'Posição multi-dia (4h+). Carrega overnight — atenção a funding e gaps.',
+  }
+}
+
 export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props) {
   const [recs, setRecs] = useState<Recommendation[]>([])
   const [loading, setLoading] = useState(false)
@@ -248,7 +273,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                       {cfg.label}
                     </div>
 
-                    {/* Symbol + direction */}
+                    {/* Symbol + direction + op type */}
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-sm font-bold text-white">{symbolBase(r.symbol)}</span>
@@ -257,6 +282,17 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                         <span className={`text-xs font-bold ${dirColor}`}>
                           {isLong ? 'LONG' : 'SHORT'}
                         </span>
+                        {(() => {
+                          const op = operationType(r.timeframe)
+                          return (
+                            <span
+                              title={op.hint}
+                              className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${op.cls}`}
+                            >
+                              {op.label}
+                            </span>
+                          )
+                        })()}
                       </div>
                       <p className="text-[11px] text-slate-400 mt-0.5 leading-tight">{r.summary}</p>
                       {r.warnings.length > 0 && (
@@ -276,8 +312,8 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                     </div>
                   </div>
 
-                  {/* Levels resumido */}
-                  <div className="grid grid-cols-4 gap-2 mt-2 pt-2 border-t border-slate-800/60 text-[11px]">
+                  {/* Levels resumido — agora com TP1 + TP2 */}
+                  <div className="grid grid-cols-5 gap-2 mt-2 pt-2 border-t border-slate-800/60 text-[11px]">
                     <div>
                       <div className="text-slate-600">Entrada</div>
                       <div className="font-mono text-yellow-300">{fmt(r.entry)}</div>
@@ -286,7 +322,11 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                       <div className="text-slate-600">Stop</div>
                       <div className="font-mono text-red-300">{fmt(r.stop_loss)}</div>
                     </div>
-                    <div>
+                    <div title="50% da posição sai aqui — depois stop sobe pra entrada (breakeven)">
+                      <div className="text-slate-600">TP1</div>
+                      <div className="font-mono text-emerald-300">{fmt(r.signal?.tp1 ?? r.entry)}</div>
+                    </div>
+                    <div title="Saída final dos 50% restantes (ou trail por ATR)">
                       <div className="text-slate-600">TP2</div>
                       <div className="font-mono text-green-300">{fmt(r.tp2)}</div>
                     </div>

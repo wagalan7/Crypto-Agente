@@ -1,5 +1,24 @@
-import { useState, useEffect, useCallback } from 'react'
-import { X, BarChart3, TrendingUp, TrendingDown, Clock, RefreshCw, Calendar } from 'lucide-react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
+import { X, BarChart3, TrendingUp, TrendingDown, Clock, RefreshCw, Calendar, ChevronLeft } from 'lucide-react'
+
+interface Trade {
+  symbol: string
+  timeframe: string
+  tier: string
+  direction: 'long' | 'short'
+  entry: number
+  stop_loss: number
+  tp1?: number
+  tp2: number
+  leverage: number
+  status: string
+  realized_r: number | null
+  risk_pct: number
+  score?: number
+  created_at: string
+  outcome_at: string | null
+  tp1_hit_at?: string | null
+}
 
 interface DailyPnL {
   enabled: boolean
@@ -11,23 +30,11 @@ interface DailyPnL {
     losses: number
     win_rate_pct: number
     total_r: number
+    total_pct_banca?: number
     still_open: number
   }
-  trades?: {
-    symbol: string
-    timeframe: string
-    tier: string
-    direction: 'long' | 'short'
-    entry: number
-    stop_loss: number
-    tp2: number
-    leverage: number
-    status: string
-    realized_r: number | null
-    risk_pct: number
-    created_at: string
-    outcome_at: string | null
-  }[]
+  trades?: Trade[]
+  open_trades?: Trade[]
 }
 
 interface Props {
@@ -50,6 +57,14 @@ function fmt(n: number) {
   return n.toFixed(6)
 }
 
+// Mesma lógica do RecommendationsPanel — manter em sincronia.
+function operationType(tf: string): string {
+  const t = tf.toLowerCase()
+  if (['1m', '3m', '5m', '15m'].includes(t)) return 'SCALP'
+  if (['30m', '1h', '2h'].includes(t)) return 'DAY'
+  return 'SWING'
+}
+
 const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
   won_tp2: { label: 'TP2 ✓', cls: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' },
   won_tp1: { label: 'TP1 ✓', cls: 'bg-green-500/20 text-green-300 border-green-500/40' },
@@ -59,11 +74,23 @@ const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
   expired: { label: 'expirado', cls: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40' },
 }
 
+const STATUS_REASON: Record<string, string> = {
+  won_tp2: 'Preço atingiu o TP2 — 50% saiu em TP1 (+0.5R) e 50% em TP2 (+1.0R). Total +1.5R.',
+  won_tp1: 'Preço atingiu TP1 (50% saiu, +0.5R) mas snapshot expirou antes de TP2. Conservador: contou +0.5R.',
+  won_tp1_be: 'Preço atingiu TP1 (50% saiu) e depois voltou pra entry. Stop subiu pra breakeven nos 50% restantes. Total +0.5R.',
+  lost: 'Preço bateu o stop ANTES de tocar TP1 (sem parcial). Perda total de −1R.',
+  expired: 'Snapshot expirou (48h) sem o preço tocar TP1 nem stop. Sem entrada.',
+  open: 'Tracker ainda monitorando — aguardando preço tocar TP1, TP2 ou stop.',
+}
+
+type DrillKind = 'wins' | 'losses' | 'open' | 'all' | null
+
 export default function DailyPnLPanel({ onClose }: Props) {
   const [date, setDate] = useState(todayISO())
   const [data, setData] = useState<DailyPnL | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [drill, setDrill] = useState<DrillKind>(null)
 
   const load = useCallback(async (d: string) => {
     setLoading(true)
@@ -84,6 +111,144 @@ export default function DailyPnLPanel({ onClose }: Props) {
   const s = data?.summary
   const totalR = s?.total_r ?? 0
   const rColor = totalR > 0 ? 'text-emerald-300' : totalR < 0 ? 'text-red-300' : 'text-slate-300'
+
+  // % real da banca (soma por trade, não total_r × risk_pct[0])
+  const realPctBanca = useMemo(() => {
+    if (typeof s?.total_pct_banca === 'number') return s.total_pct_banca
+    // fallback (versão antiga do backend): soma cliente-side
+    if (!data?.trades) return 0
+    return data.trades.reduce((acc, t) => acc + (t.realized_r ?? 0) * t.risk_pct, 0)
+  }, [s, data?.trades])
+
+  // Detalhamento de % por categoria
+  const pctBreakdown = useMemo(() => {
+    if (!data?.trades) return { wins: 0, losses: 0 }
+    let w = 0, l = 0
+    for (const t of data.trades) {
+      const pct = (t.realized_r ?? 0) * t.risk_pct
+      if (pct > 0) w += pct
+      else if (pct < 0) l += pct
+    }
+    return { wins: w, losses: l }
+  }, [data?.trades])
+
+  const winsList = useMemo(
+    () => (data?.trades ?? []).filter(t => (t.realized_r ?? 0) > 0),
+    [data?.trades]
+  )
+  const lossesList = useMemo(
+    () => (data?.trades ?? []).filter(t => (t.realized_r ?? 0) < 0),
+    [data?.trades]
+  )
+  const openList = data?.open_trades ?? []
+
+  // ── Drill-down render ────────────────────────────────────────────────────
+  if (drill !== null && data) {
+    const title =
+      drill === 'wins' ? 'Vencedores do dia' :
+      drill === 'losses' ? 'Perdedores do dia' :
+      drill === 'open' ? 'Trades em aberto' :
+      'Todos os trades'
+    const list =
+      drill === 'wins' ? winsList :
+      drill === 'losses' ? lossesList :
+      drill === 'open' ? openList :
+      [...(data.trades ?? []), ...openList]
+    const subtitle =
+      drill === 'wins' ? `${winsList.length} trade(s) · ${fmtPct(pctBreakdown.wins)} da banca` :
+      drill === 'losses' ? `${lossesList.length} trade(s) · ${fmtPct(pctBreakdown.losses)} da banca` :
+      drill === 'open' ? `${openList.length} aguardando preço bater TP ou stop` :
+      `${list.length} trade(s) no total`
+
+    return (
+      <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
+        <div className="w-full max-w-3xl max-h-[92vh] bg-[#0a0e1a] border border-slate-700 rounded-xl flex flex-col overflow-hidden shadow-2xl">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-gradient-to-r from-slate-900 to-slate-800">
+            <button onClick={() => setDrill(null)} className="flex items-center gap-1.5 text-xs text-slate-300 hover:text-white transition-colors">
+              <ChevronLeft className="w-4 h-4" />
+              voltar
+            </button>
+            <div className="flex-1 text-center">
+              <h2 className="text-sm font-bold text-white">{title}</h2>
+              <p className="text-[10px] text-slate-500">{subtitle}</p>
+            </div>
+            <button onClick={onClose} className="p-1 hover:bg-slate-800 rounded">
+              <X className="w-5 h-5 text-slate-400" />
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-3">
+            {list.length === 0 && (
+              <div className="text-center py-12 text-sm text-slate-500">Nada por aqui ainda.</div>
+            )}
+            <div className="flex flex-col gap-2">
+              {list.map((t, i) => {
+                const badge = STATUS_BADGE[t.status] || STATUS_BADGE.open
+                const reason = STATUS_REASON[t.status] || '—'
+                const isLong = t.direction === 'long'
+                const DirIcon = isLong ? TrendingUp : TrendingDown
+                const r = t.realized_r ?? 0
+                const pct = r * t.risk_pct
+                const opType = operationType(t.timeframe)
+                return (
+                  <div key={i} className="p-3 rounded-lg border border-slate-800 bg-slate-900/40">
+                    <div className="flex items-center gap-2 flex-wrap mb-2">
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${badge.cls}`}>{badge.label}</span>
+                      <DirIcon className={`w-4 h-4 ${isLong ? 'text-green-400' : 'text-red-400'}`} />
+                      <span className="text-sm font-bold text-white">{t.symbol.split('/')[0]}</span>
+                      <span className="text-[10px] text-slate-500 font-mono">{t.timeframe}</span>
+                      <span className="text-[10px] text-slate-400 px-1.5 py-0.5 rounded border border-slate-700">{opType}</span>
+                      <span className="text-[10px] text-orange-300 font-mono">{t.leverage}x</span>
+                      <span className="text-[10px] text-slate-500">tier {t.tier}</span>
+                      <span className="ml-auto font-mono text-sm font-bold text-right">
+                        <span className={r > 0 ? 'text-emerald-300' : r < 0 ? 'text-red-300' : 'text-slate-400'}>
+                          {r > 0 ? `+${r.toFixed(1)}R` : r < 0 ? `${r.toFixed(1)}R` : '–'}
+                        </span>
+                        <span className="block text-[10px] text-slate-500 font-normal font-sans">
+                          {t.status !== 'open' && fmtPct(pct)}
+                        </span>
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 text-[11px] mb-2">
+                      <div>
+                        <div className="text-slate-600 text-[9px]">Entrada</div>
+                        <div className="font-mono text-yellow-300">{fmt(t.entry)}</div>
+                      </div>
+                      <div>
+                        <div className="text-slate-600 text-[9px]">Stop</div>
+                        <div className="font-mono text-red-300">{fmt(t.stop_loss)}</div>
+                      </div>
+                      {t.tp1 != null && (
+                        <div>
+                          <div className="text-slate-600 text-[9px]">TP1</div>
+                          <div className="font-mono text-emerald-300">{fmt(t.tp1)}</div>
+                        </div>
+                      )}
+                      <div>
+                        <div className="text-slate-600 text-[9px]">TP2</div>
+                        <div className="font-mono text-green-300">{fmt(t.tp2)}</div>
+                      </div>
+                    </div>
+
+                    <p className="text-[10px] text-slate-400 leading-snug">{reason}</p>
+                    {(t.created_at || t.outcome_at) && (
+                      <p className="text-[9px] text-slate-600 mt-1 font-mono">
+                        criado {t.created_at && new Date(t.created_at).toLocaleString('pt-BR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}
+                        {t.outcome_at && (
+                          <> · resolvido {new Date(t.outcome_at).toLocaleString('pt-BR', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}</>
+                        )}
+                      </p>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
@@ -127,43 +292,73 @@ export default function DailyPnLPanel({ onClose }: Props) {
           <div className="m-4 p-3 bg-red-500/10 border border-red-500/40 rounded-lg text-sm text-red-300">⚠ {error}</div>
         )}
 
-        {/* Resumo cards */}
+        {/* Resumo cards — clicáveis pra drill-down */}
         {s && (
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 p-3 border-b border-slate-800">
-            <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
+            <button
+              onClick={() => setDrill('all')}
+              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors"
+              title="Ver todos os trades do dia"
+            >
               <div className="text-[10px] text-slate-500 uppercase">Total R</div>
               <div className={`text-xl font-bold font-mono ${rColor}`}>
                 {totalR > 0 ? '+' : ''}{totalR.toFixed(2)}R
               </div>
-              <div className="text-[10px] text-slate-600 mt-0.5">
-                ≈ {fmtPct(totalR * (data?.trades?.[0]?.risk_pct ?? 1))} da banca
+              <div className={`text-[10px] mt-0.5 font-semibold ${rColor}`}>
+                {fmtPct(realPctBanca)} da banca
               </div>
-            </div>
-            <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
+              {(pctBreakdown.wins !== 0 || pctBreakdown.losses !== 0) && (
+                <div className="text-[9px] text-slate-600 mt-0.5 leading-tight">
+                  {pctBreakdown.wins !== 0 && <span className="text-emerald-400">+{pctBreakdown.wins.toFixed(2)}%</span>}
+                  {pctBreakdown.losses !== 0 && <span className="text-red-400 ml-1">{pctBreakdown.losses.toFixed(2)}%</span>}
+                </div>
+              )}
+            </button>
+            <button
+              onClick={() => setDrill('all')}
+              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors"
+              title="Ver desempenho"
+            >
               <div className="text-[10px] text-slate-500 uppercase">Win Rate</div>
               <div className="text-xl font-bold text-white font-mono">{s.win_rate_pct.toFixed(1)}%</div>
               <div className="text-[10px] text-slate-600 mt-0.5">{s.wins}W · {s.losses}L</div>
-            </div>
-            <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
+            </button>
+            <button
+              onClick={() => setDrill('all')}
+              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors"
+              title="Ver todos os trades resolvidos"
+            >
               <div className="text-[10px] text-slate-500 uppercase">Trades</div>
               <div className="text-xl font-bold text-white font-mono">{s.total_trades}</div>
               <div className="text-[10px] text-slate-600 mt-0.5">resolvidos</div>
-            </div>
-            <div className="bg-emerald-500/5 border border-emerald-500/30 rounded-lg p-3">
+            </button>
+            <button
+              onClick={() => setDrill('wins')}
+              className="text-left bg-emerald-500/5 border border-emerald-500/30 hover:border-emerald-400 rounded-lg p-3 transition-colors"
+              title="Ver vencedores e por quê venceram"
+            >
               <div className="text-[10px] text-emerald-400/70 uppercase">Vencedores</div>
               <div className="text-xl font-bold text-emerald-300 font-mono">{s.wins}</div>
-              <div className="text-[10px] text-slate-600 mt-0.5">TP atingido</div>
-            </div>
-            <div className="bg-red-500/5 border border-red-500/30 rounded-lg p-3">
+              <div className="text-[10px] text-emerald-400/60 mt-0.5">{fmtPct(pctBreakdown.wins)}</div>
+            </button>
+            <button
+              onClick={() => setDrill('losses')}
+              className="text-left bg-red-500/5 border border-red-500/30 hover:border-red-400 rounded-lg p-3 transition-colors"
+              title="Ver perdedores e por quê perderam"
+            >
               <div className="text-[10px] text-red-400/70 uppercase">Perdedores</div>
               <div className="text-xl font-bold text-red-300 font-mono">{s.losses}</div>
-              <div className="text-[10px] text-slate-600 mt-0.5">stop bateu</div>
-            </div>
-            <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
+              <div className="text-[10px] text-red-400/60 mt-0.5">{fmtPct(pctBreakdown.losses)}</div>
+            </button>
+            <button
+              onClick={() => setDrill('open')}
+              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors"
+              title="Ver trades em aberto"
+            >
               <div className="text-[10px] text-slate-500 uppercase">Abertos</div>
               <div className="text-xl font-bold text-slate-300 font-mono">{s.still_open}</div>
               <div className="text-[10px] text-slate-600 mt-0.5">aguardando</div>
-            </div>
+            </button>
           </div>
         )}
 
@@ -193,6 +388,7 @@ export default function DailyPnLPanel({ onClose }: Props) {
               const DirIcon = isLong ? TrendingUp : TrendingDown
               const r = t.realized_r ?? 0
               const rText = r > 0 ? `+${r.toFixed(1)}R` : r < 0 ? `${r.toFixed(1)}R` : '–'
+              const opType = operationType(t.timeframe)
               return (
                 <div key={i} className="flex items-center gap-3 p-2.5 rounded-lg border border-slate-800 bg-slate-900/40 hover:bg-slate-900/80 transition-colors">
                   <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${badge.cls}`}>{badge.label}</span>
@@ -201,11 +397,14 @@ export default function DailyPnLPanel({ onClose }: Props) {
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-sm font-bold text-white">{t.symbol.split('/')[0]}</span>
                       <span className="text-[10px] text-slate-500 font-mono">{t.timeframe}</span>
+                      <span className="text-[9px] text-slate-400 px-1.5 py-0.5 rounded border border-slate-700">{opType}</span>
                       <span className="text-[10px] text-orange-300 font-mono">{t.leverage}x</span>
                       <span className="text-[10px] text-slate-500">tier {t.tier}</span>
                     </div>
                     <div className="text-[10px] text-slate-500 font-mono mt-0.5">
-                      entry {fmt(t.entry)} → stop {fmt(t.stop_loss)} · tp2 {fmt(t.tp2)}
+                      entry {fmt(t.entry)} → stop {fmt(t.stop_loss)}
+                      {t.tp1 != null && <> · tp1 {fmt(t.tp1)}</>}
+                      {' · '}tp2 {fmt(t.tp2)}
                     </div>
                   </div>
                   <div className={`text-right font-mono text-sm font-bold ${r > 0 ? 'text-emerald-300' : r < 0 ? 'text-red-300' : 'text-slate-400'}`}>
@@ -224,9 +423,10 @@ export default function DailyPnLPanel({ onClose }: Props) {
         <div className="px-4 py-2 border-t border-slate-800 bg-slate-900/60 text-[10px] text-slate-500 leading-relaxed">
           <strong className="text-slate-400">R:</strong> múltiplo de risco com gestão parcial:
           +1.5R = TP2 cheio (50% TP1 + 50% TP2) · +0.5R = breakeven após TP1 (50% TP1 + 50% trail/BE) · −1R = stop original.
-          A coluna de <strong>% da banca</strong> assume o risco_pct do tier (A+ 1.5% / A 1% / B 0.5%).
+          A coluna de <strong>% da banca</strong> soma o impacto real por trade (cada tier tem seu risco_pct: A+ 1.5% / A 1% / B 0.5%).
           <br />
-          Tracker verifica preço a cada 5 min · stop trail por ATR após TP1 · snapshots expiram em 48h
+          Tracker verifica preço a cada 5 min · stop trail por ATR após TP1 · snapshots expiram em 48h ·
+          <span className="text-slate-400"> clique nos cards pra detalhar.</span>
         </div>
       </div>
     </div>
