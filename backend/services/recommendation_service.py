@@ -367,27 +367,29 @@ def _classify_tier_vision(sig: TradeSignal, score: float) -> Optional[str]:
 def _get_server_data_source():
     """
     Escolhe a fonte de dados pro server-scan, em ordem de preferência:
-      1. Binance Futures via Cloudflare Worker (se BINANCE_PROXY_URL setado e
-         funcional) — mesmos dados que o app aberto vê
-      2. Bybit V5 (linear USDT perp) — universo de pares ~2x maior que OKX,
-         mais oportunidades. Default desde a migração.
-      3. binance_service (OKX perp) — fallback se Bybit der geo-block do Railway
-      4. Binance Vision (spot) — fallback de último caso
+      1. Binance Futures via Cloudflare Worker (se BINANCE_PROXY_URL setado)
+      2. binance_service (OKX perp) — DEFAULT. Bybit/Binance Futures dão 403
+         do IP do Railway; OKX é a única exchange perp que aceita cloud IPs.
+      3. Bybit V5 — só se DATA_SOURCE=bybit explícito (útil pra teste local
+         ou se Bybit liberar IPs cloud no futuro)
 
-    Override via env var: DATA_SOURCE=bybit|okx (default bybit).
+    Painel via browser (RecommendationsPanel) continua usando Bybit
+    independente — IP residencial do user passa sem geo-block.
+
+    Override via env var: DATA_SOURCE=bybit (default okx).
     """
     import os
     from services import binance_futures_service as bfs
     if bfs.PROXY_ENABLED:
         return bfs, "binance-futures-proxy"
 
-    preferred = os.getenv("DATA_SOURCE", "bybit").strip().lower()
-    if preferred == "okx":
-        from services import binance_service as bs
-        return bs, "okx-perp"
-    # Default: Bybit
-    from services import bybit_service as bys
-    return bys, "bybit-linear"
+    preferred = os.getenv("DATA_SOURCE", "okx").strip().lower()
+    if preferred == "bybit":
+        from services import bybit_service as bys
+        return bys, "bybit-linear"
+    # Default: OKX (única que passa do Railway sem proxy)
+    from services import binance_service as bs
+    return bs, "okx-perp"
 
 
 async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[TradeSignal]:
