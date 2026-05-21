@@ -366,16 +366,22 @@ def _classify_tier_vision(sig: TradeSignal, score: float) -> Optional[str]:
 
 def _get_server_data_source():
     """
-    Escolhe a fonte de dados pro server-scan:
-      • Se BINANCE_PROXY_URL setado → Binance Futures via Cloudflare Worker
-        (mesmos dados que o app aberto vê — push idêntico)
-      • Senão → Binance Vision (spot) como fallback
+    Escolhe a fonte de dados pro server-scan, em ordem de preferência:
+      1. Binance Futures via Cloudflare Worker (se BINANCE_PROXY_URL setado e
+         funcional) — mesmos dados que o app aberto vê
+      2. binance_service (alias atual: OKX perp via mirror) — MESMA fonte do
+         painel live `/api/recommendations`, garante que push e UI batem
+      3. Binance Vision (spot) — fallback de último caso
+
+    Antes o server-scan caía em Vision (spot) por padrão, gerando 0 recs
+    enquanto o painel mostrava A/A+. Agora unificamos com a fonte do painel.
     """
     from services import binance_futures_service as bfs
     if bfs.PROXY_ENABLED:
         return bfs, "binance-futures-proxy"
-    from services import binance_vision_service as bvs
-    return bvs, "binance-vision-spot"
+    # Fonte principal: a mesma usada pelo /api/recommendations
+    from services import binance_service as bs
+    return bs, "binance-service-main"
 
 
 async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[TradeSignal]:
