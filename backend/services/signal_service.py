@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import time
@@ -5,6 +6,16 @@ from typing import List, Optional
 from models.trade_signal import (
     TradeSignal, TradeType, SignalDirection, DetectedPattern, Indicator
 )
+
+# Step 2c: confirmação de candle no entry. Default ON — preferimos zero
+# pushes do que push em vela contra-direção. Pode desligar via env var:
+#   REQUIRE_CANDLE_CONFIRMATION=0
+REQUIRE_CANDLE_CONFIRMATION = os.getenv(
+    "REQUIRE_CANDLE_CONFIRMATION", "1"
+).strip() not in ("0", "false", "False", "no", "off", "")
+# Posição do close dentro do range (0.0 = no low, 1.0 = no high).
+# Long precisa fechar acima desse percentil; short abaixo de (1 - percentil).
+CANDLE_CONFIRM_CLOSE_POS = 0.55
 from services.indicator_service import get_indicator_signals
 from services.confluence_service import calculate_confluence
 from services.smc_service import analyze_smc, SMCAnalysis
@@ -43,6 +54,49 @@ ATR_MULTIPLIERS = {
     TradeType.SWING:     {"sl": 2.0, "tp1": 3.0, "tp2": 5.0, "tp3": 8.0},
     TradeType.HODL:      {"sl": 3.0, "tp1": 5.0, "tp2": 10.0, "tp3": 20.0},
 }
+
+
+def _candle_confirms(df: pd.DataFrame, direction: SignalDirection) -> bool:
+    """
+    Step 2c: a última vela fechada deve confirmar a direção do sinal.
+
+    Critérios (ambos precisam passar):
+      • Corpo na direção: close > open (long) / close < open (short)
+      • Close na metade favorável do range: pelo menos 55% pra cima (long)
+        ou pelo menos 55% pra baixo (short)
+
+    Filtra: dojis, velas de rejeição (long upper wick em long, long lower wick
+    em short), reversões intra-vela. Mantém: velas momentum claras na direção.
+
+    Retorna True se NÃO houver direção (NEUTRAL não precisa confirmar) ou se a
+    vela confirmar. False se vela contradiz o sinal.
+    """
+    if direction == SignalDirection.NEUTRAL or df is None or df.empty:
+        return True
+
+    last = df.iloc[-1]
+    try:
+        o = float(last["open"])
+        h = float(last["high"])
+        l = float(last["low"])
+        c = float(last["close"])
+    except (KeyError, ValueError, TypeError):
+        return True  # falha de leitura → não bloqueia
+
+    rng = h - l
+    if rng <= 0:
+        return False  # vela degenerada — bloqueia
+
+    close_pos = (c - l) / rng  # 0..1, posição do close no range
+
+    if direction == SignalDirection.LONG:
+        body_ok = c > o
+        pos_ok = close_pos >= CANDLE_CONFIRM_CLOSE_POS
+    else:  # SHORT
+        body_ok = c < o
+        pos_ok = close_pos <= (1.0 - CANDLE_CONFIRM_CLOSE_POS)
+
+    return body_ok and pos_ok
 
 
 def determine_direction(ind: Indicator, patterns: List[DetectedPattern], current_price: float) -> SignalDirection:
@@ -190,6 +244,12 @@ def build_trade_signal(
     trade_type = TIMEFRAME_TRADE_TYPE.get(timeframe, TradeType.DAY_TRADE)
 
     direction = determine_direction(ind, patterns, current_price)
+
+    # Step 2c: se a vela do sinal NÃO confirmar a direção, descarta o sinal.
+    # Filtra dojis, velas de rejeição (wick contra), reversões intra-vela.
+    if REQUIRE_CANDLE_CONFIRMATION and direction != SignalDirection.NEUTRAL:
+        if not _candle_confirms(df, direction):
+            direction = SignalDirection.NEUTRAL
 
     # SMC analysis (sempre roda)
     try:
