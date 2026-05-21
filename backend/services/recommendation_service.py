@@ -364,28 +364,42 @@ def _classify_tier_vision(sig: TradeSignal, score: float) -> Optional[str]:
     return _classify_tier(sig, score)
 
 
-async def _analyze_symbol_tf_via_vision(symbol: str, tf: str) -> Optional[TradeSignal]:
-    """Variante de _analyze_symbol_tf que usa Binance Vision (spot). Pula
-    derivativos (não tem em spot) e MTF (consistência da fonte) — vai
-    pontuar levemente abaixo, mas aceitável pro server-scan."""
+def _get_server_data_source():
+    """
+    Escolhe a fonte de dados pro server-scan:
+      • Se BINANCE_PROXY_URL setado → Binance Futures via Cloudflare Worker
+        (mesmos dados que o app aberto vê — push idêntico)
+      • Senão → Binance Vision (spot) como fallback
+    """
+    from services import binance_futures_service as bfs
+    if bfs.PROXY_ENABLED:
+        return bfs, "binance-futures-proxy"
     from services import binance_vision_service as bvs
+    return bvs, "binance-vision-spot"
+
+
+async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[TradeSignal]:
+    """Análise server-side usando a fonte escolhida (futures via proxy ou spot)."""
     try:
-        df = await bvs.fetch_ohlcv(symbol, tf, 300)
+        df = await svc.fetch_ohlcv(symbol, tf, 300)
         if df.empty or len(df) < 80:
             return None
         ind = calculate_indicators(df)
         patterns = detect_all_patterns(df)
+        # Derivativos/MTF: só se a fonte for futures (tem funding/OI)
+        derivatives = None
+        mtf = None
         return build_trade_signal(
             symbol, tf, df, ind, patterns,
-            derivatives=None, mtf=None, with_backtest=False,
+            derivatives=derivatives, mtf=mtf, with_backtest=False,
         )
     except Exception:
         return None
 
 
-async def _best_tf_for_symbol_via_vision(symbol: str) -> Optional[tuple]:
+async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
     results = await asyncio.gather(*[
-        _analyze_symbol_tf_via_vision(symbol, tf) for tf in SCAN_TFS
+        _analyze_symbol_tf_server(svc, symbol, tf) for tf in SCAN_TFS
     ])
     scored: List[tuple] = []
     for sig in results:
@@ -399,12 +413,21 @@ async def _best_tf_for_symbol_via_vision(symbol: str) -> Optional[tuple]:
 
 
 async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation]:
-    """Versão server-side via Binance Spot (data-api.binance.vision).
-    Cache próprio (não compartilha com get_recommendations)."""
-    from services import binance_vision_service as bvs
+    """
+    Versão server-side pro Railway. Escolhe fonte dinamicamente:
+      • BINANCE_PROXY_URL setado → Binance Futures (mesmos dados do app)
+      • Senão → Binance Vision (spot)
+
+    Nome mantido por compat — agora é "via server" mais genérico.
+    """
+    import logging as _log
+    svc, source_name = _get_server_data_source()
+    _log.info(f"[server-scan] fonte: {source_name}")
+
     try:
-        symbols = await bvs.fetch_top_volume_symbols(limit=top_n)
-    except Exception:
+        symbols = await svc.fetch_top_volume_symbols(limit=top_n)
+    except Exception as e:
+        _log.warning(f"[server-scan] fetch_top_volume falhou ({source_name}): {e}")
         symbols = []
     if not symbols:
         return []
@@ -414,7 +437,7 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
 
     async def _bounded(sym: str):
         async with sem:
-            return sym, await _best_tf_for_symbol_via_vision(sym)
+            return sym, await _best_tf_for_symbol_server(svc, sym)
 
     all_results = await asyncio.gather(*[_bounded(s) for s in symbols])
 

@@ -179,6 +179,11 @@ async def lifespan(app: FastAPI):
         await _bvs.close()
     except Exception:
         pass
+    try:
+        from services import binance_futures_service as _bfs
+        await _bfs.close()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Crypto AI Agent", version="1.0.0", lifespan=lifespan)
