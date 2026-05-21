@@ -675,6 +675,23 @@ async def push_test_scan():
     except Exception as e:
         _symbols_probe = [f"probe_error: {e}"]
 
+    # Probe extra: klines individual via Worker (endpoint que NÃO sofre geo-block bulk)
+    _klines_probe: str = "skipped"
+    if _bfs.PROXY_ENABLED:
+        try:
+            _df = await _bfs.fetch_ohlcv("BTC/USDT:USDT", "1h", 5)
+            _klines_probe = f"ok rows={len(_df)} last_close={float(_df['close'].iloc[-1])}" if not _df.empty else "empty"
+        except Exception as e:
+            _klines_probe = f"error: {e}"
+
+    # Probe extra: Vision spot lista (fallback do híbrido)
+    _vision_list_probe: list = []
+    try:
+        from services import binance_vision_service as _bvs2
+        _vision_list_probe = await _bvs2.fetch_top_volume_symbols(limit=5)
+    except Exception as e:
+        _vision_list_probe = [f"vision_error: {e}"]
+
     try:
         recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
     except Exception as e:
@@ -707,6 +724,8 @@ async def push_test_scan():
         "source": _source,
         "proxy_url": _proxy_url,
         "symbols_probe": _symbols_probe,
+        "klines_probe": _klines_probe,
+        "vision_list_probe": _vision_list_probe,
         "push_enabled": PUSH_ENABLED,
         "db_enabled": DB_ENABLED,
         "total_recs": len(recs),
