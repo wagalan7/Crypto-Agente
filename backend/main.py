@@ -692,6 +692,24 @@ async def push_test_scan():
     except Exception as e:
         _vision_list_probe = [f"vision_error: {e}"]
 
+    # Probe Bybit: testa se o Railway consegue falar com api.bybit.com
+    # (lista + 1 candle de BTC). Se passar, Bybit pode virar default do server-scan.
+    _bybit_list_probe: list = []
+    _bybit_klines_probe: str = "skipped"
+    try:
+        from services import bybit_service as _bys
+        _bybit_list_probe = await _bys.fetch_top_volume_symbols(limit=5)
+        try:
+            _bdf = await _bys.fetch_ohlcv("BTC/USDT:USDT", "1h", 5)
+            _bybit_klines_probe = (
+                f"ok rows={len(_bdf)} last_close={float(_bdf['close'].iloc[-1])}"
+                if not _bdf.empty else "empty"
+            )
+        except Exception as ke:
+            _bybit_klines_probe = f"error: {ke}"
+    except Exception as e:
+        _bybit_list_probe = [f"bybit_error: {e}"]
+
     try:
         recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
     except Exception as e:
@@ -726,6 +744,8 @@ async def push_test_scan():
         "symbols_probe": _symbols_probe,
         "klines_probe": _klines_probe,
         "vision_list_probe": _vision_list_probe,
+        "bybit_list_probe": _bybit_list_probe,
+        "bybit_klines_probe": _bybit_klines_probe,
         "push_enabled": PUSH_ENABLED,
         "db_enabled": DB_ENABLED,
         "total_recs": len(recs),

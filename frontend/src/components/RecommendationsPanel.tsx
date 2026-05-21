@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { X, Sparkles, TrendingUp, TrendingDown, RefreshCw, AlertTriangle, Brain } from 'lucide-react'
-import { api, fetchBinanceOHLCV } from '../services/api'
+import { api, fetchBybitOHLCV, fetchTopBybitSymbols } from '../services/api'
 import type { Recommendation, RecommendationTier } from '../types'
 
 interface HistoricalStat {
@@ -70,21 +70,22 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
-    setProgress('Buscando top 30 perpétuos…')
+    setProgress('Buscando top 50 perpétuos…')
     try {
-      // 1) Top símbolos por volume (Binance Futures, IP do browser — não bloqueado)
-      const symbols = await api.fetchTopBinanceSymbols(30)
+      // 1) Top símbolos por volume (Bybit linear, IP do browser — não bloqueado).
+      // Bybit tem ~2x mais alts líquidos que Binance/OKX, então pegamos 50.
+      const symbols = await fetchTopBybitSymbols(50)
       if (symbols.length === 0) throw new Error('Nenhum símbolo encontrado')
 
       // 2) Baixa candles de 15m/1h/4h para cada símbolo (em paralelo, com limite)
       const TFS = ['15m', '1h', '4h'] as const
       setProgress(`Baixando candles (${symbols.length} símbolos × ${TFS.length} TFs)…`)
 
-      const tasks: Promise<{ symbol: string; timeframe: string; candles: Awaited<ReturnType<typeof fetchBinanceOHLCV>> } | null>[] = []
+      const tasks: Promise<{ symbol: string; timeframe: string; candles: Awaited<ReturnType<typeof fetchBybitOHLCV>> } | null>[] = []
       for (const symbol of symbols) {
         for (const tf of TFS) {
           tasks.push(
-            fetchBinanceOHLCV(symbol, tf, 200)
+            fetchBybitOHLCV(symbol, tf, 200)
               .then(candles => ({ symbol, timeframe: tf, candles }))
               .catch(() => null),
           )

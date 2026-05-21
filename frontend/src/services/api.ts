@@ -15,6 +15,55 @@ function toBinance(symbol: string): string {
   return symbol.split(':')[0].replace('/', '')  // 'BTC/USDT:USDT' → 'BTCUSDT'
 }
 
+// ─── Bybit V5 public API (perp linear USDT) ────────────────────────────────────
+// Universo de pares ~2x maior que OKX/Binance Futures. Requests vão do IP
+// do browser (residencial), sem geo-block. Mesmo formato de retorno do
+// fetchBinanceOHLCV pra ser drop-in.
+const BYBIT_BASE = 'https://api.bybit.com'
+const BYBIT_INTERVAL: Record<string, string> = {
+  '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
+  '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720',
+  '1d': 'D', '1w': 'W', '1M': 'M',
+}
+
+function toBybit(symbol: string): string {
+  return symbol.split(':')[0].replace('/', '')  // 'BTC/USDT:USDT' → 'BTCUSDT'
+}
+
+export async function fetchBybitOHLCV(symbol: string, timeframe: string, limit = 300): Promise<OHLCVCandle[]> {
+  const interval = BYBIT_INTERVAL[timeframe] ?? '60'
+  const url = `${BYBIT_BASE}/v5/market/kline?category=linear&symbol=${toBybit(symbol)}&interval=${interval}&limit=${Math.min(limit, 1000)}`
+  const res = await fetch(url, { signal: AbortSignal.timeout(10000) })
+  if (!res.ok) throw new Error(`Bybit ${res.status}`)
+  const json = await res.json()
+  const raw: string[][] = json?.result?.list ?? []
+  // Bybit: newest first. Inverte e parsa.
+  return raw.slice().reverse().map(c => ({
+    timestamp: parseInt(c[0], 10),
+    open: parseFloat(c[1]),
+    high: parseFloat(c[2]),
+    low: parseFloat(c[3]),
+    close: parseFloat(c[4]),
+    volume: parseFloat(c[5]),
+  }))
+}
+
+export async function fetchTopBybitSymbols(limit = 50): Promise<string[]> {
+  const res = await fetch(
+    `${BYBIT_BASE}/v5/market/tickers?category=linear`,
+    { signal: AbortSignal.timeout(10000) },
+  )
+  if (!res.ok) throw new Error(`Bybit tickers ${res.status}`)
+  const json = await res.json()
+  const rows: { symbol: string; turnover24h: string }[] = json?.result?.list ?? []
+  return rows
+    .filter(r => r.symbol.endsWith('USDT'))
+    .map(r => ({ s: r.symbol, t: parseFloat(r.turnover24h || '0') }))
+    .sort((a, b) => b.t - a.t)
+    .slice(0, limit)
+    .map(r => `${r.s.replace(/USDT$/, '')}/USDT:USDT`)
+}
+
 export async function fetchBinanceOHLCV(symbol: string, timeframe: string, limit = 300): Promise<OHLCVCandle[]> {
   const interval = BINANCE_INTERVAL[timeframe] ?? '1h'
   const res = await fetch(

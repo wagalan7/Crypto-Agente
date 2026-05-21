@@ -369,19 +369,25 @@ def _get_server_data_source():
     Escolhe a fonte de dados pro server-scan, em ordem de preferência:
       1. Binance Futures via Cloudflare Worker (se BINANCE_PROXY_URL setado e
          funcional) — mesmos dados que o app aberto vê
-      2. binance_service (alias atual: OKX perp via mirror) — MESMA fonte do
-         painel live `/api/recommendations`, garante que push e UI batem
-      3. Binance Vision (spot) — fallback de último caso
+      2. Bybit V5 (linear USDT perp) — universo de pares ~2x maior que OKX,
+         mais oportunidades. Default desde a migração.
+      3. binance_service (OKX perp) — fallback se Bybit der geo-block do Railway
+      4. Binance Vision (spot) — fallback de último caso
 
-    Antes o server-scan caía em Vision (spot) por padrão, gerando 0 recs
-    enquanto o painel mostrava A/A+. Agora unificamos com a fonte do painel.
+    Override via env var: DATA_SOURCE=bybit|okx (default bybit).
     """
+    import os
     from services import binance_futures_service as bfs
     if bfs.PROXY_ENABLED:
         return bfs, "binance-futures-proxy"
-    # Fonte principal: a mesma usada pelo /api/recommendations
-    from services import binance_service as bs
-    return bs, "binance-service-main"
+
+    preferred = os.getenv("DATA_SOURCE", "bybit").strip().lower()
+    if preferred == "okx":
+        from services import binance_service as bs
+        return bs, "okx-perp"
+    # Default: Bybit
+    from services import bybit_service as bys
+    return bys, "bybit-linear"
 
 
 async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[TradeSignal]:
