@@ -73,6 +73,11 @@ async def init_db():
             "ALTER TABLE recommendation_snapshots "
             "ADD COLUMN IF NOT EXISTS features JSONB"
         ))
+        # Step 2a: breakeven após TP1
+        await conn.execute(text(
+            "ALTER TABLE recommendation_snapshots "
+            "ADD COLUMN IF NOT EXISTS tp1_hit_at TIMESTAMP WITH TIME ZONE"
+        ))
     log.info("Schema do banco verificado/criado (migrações aplicadas).")
 
 

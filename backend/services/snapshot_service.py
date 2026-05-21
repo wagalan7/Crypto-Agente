@@ -26,9 +26,10 @@ log = logging.getLogger(__name__)
 # ── Configuração ─────────────────────────────────────────────────────────
 DEDUP_WINDOW_HOURS = 2       # mesma rec não entra 2× nesse intervalo
 EXPIRY_HOURS = 48            # snapshots abertos viram "expired" depois disso
-REALIZED_R_TP1 = 1.0
-REALIZED_R_TP2 = 2.0
-REALIZED_R_STOP = -1.0
+REALIZED_R_TP1 = 1.0          # TP1 atingido e posição encerrada com lucro parcial (expiry após TP1)
+REALIZED_R_TP2 = 2.0          # TP2 cheio
+REALIZED_R_STOP = -1.0        # stop original (antes de TP1)
+REALIZED_R_BREAKEVEN = 0.0    # stop em entry após TP1 — Step 2a
 
 
 def _extract_features(rec: Dict[str, Any], created_at: datetime) -> Dict[str, Any]:
@@ -141,27 +142,76 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     return inserted
 
 
-def _classify_outcome(snap: RecommendationSnapshot, high: float, low: float) -> Optional[tuple]:
+def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Optional[tuple]:
     """
-    Dado o range (high, low) desde o último check, decide o outcome.
-    Retorna (status, outcome_price, realized_r) ou None se ainda aberto.
+    Step 2a: processa candles em ordem cronológica e aplica a regra:
+      • Se TP1 toca → stop sobe pra entry (breakeven) nas próximas velas.
+      • Se TP2 toca → fecha como won_tp2 (+2R).
+      • Se stop ORIGINAL bate antes de TP1 → lost (-1R).
+      • Se stop EFETIVO (entry) bate APÓS TP1 → won_tp1_be (0R, breakeven).
 
-    Regra conservadora: se a barra tocou stop E tp no mesmo período, assume
-    que stop bateu antes (pior caso) — evita over-estimar perfomance.
+    Retorna uma das opções:
+      ("won_tp2", price, +2.0, tp1_just_hit_bool)        → fecha lucro máximo
+      ("won_tp1_be", entry, 0.0, tp1_just_hit_bool)      → breakeven após TP1
+      ("lost", stop_loss, -1.0, False)                   → stop original
+      ("open_after_tp1", None, None, True)               → ainda aberto, MAS tocou TP1 agora
+      None                                                → segue aberto, sem evento
+
+    Regra conservadora mantida: se uma MESMA vela toca stop e tp1, assume que
+    stop bateu antes (pior caso) — exceto se TP1 já tinha sido marcado em
+    rounds anteriores.
     """
+    if df_window is None or df_window.empty:
+        return None
+
     is_long = snap.direction == "long"
-    stop_hit = (low <= snap.stop_loss) if is_long else (high >= snap.stop_loss)
-    tp2_hit = (high >= snap.tp2) if is_long else (low <= snap.tp2)
-    tp1_hit = False
-    if snap.tp1 is not None:
-        tp1_hit = (high >= snap.tp1) if is_long else (low <= snap.tp1)
+    tp1_already = snap.tp1_hit_at is not None
+    tp1_hit_now = False  # marca se TP1 acabou de bater nesta janela
 
-    if stop_hit:
-        return ("lost", snap.stop_loss, REALIZED_R_STOP)
-    if tp2_hit:
-        return ("won_tp2", snap.tp2, REALIZED_R_TP2)
-    if tp1_hit:
-        return ("won_tp1", snap.tp1, REALIZED_R_TP1)
+    for _, c in df_window.iterrows():
+        h = float(c["high"])
+        l = float(c["low"])
+
+        # Stop efetivo: se TP1 (passado OU agora) já bateu, stop = entry
+        effective_stop = snap.entry if (tp1_already or tp1_hit_now) else snap.stop_loss
+
+        if is_long:
+            stop_hit = l <= effective_stop
+            tp1_hit = (snap.tp1 is not None) and (h >= snap.tp1)
+            tp2_hit = h >= snap.tp2
+        else:
+            stop_hit = h >= effective_stop
+            tp1_hit = (snap.tp1 is not None) and (l <= snap.tp1)
+            tp2_hit = l <= snap.tp2
+
+        # Conservador: na MESMA vela, stop tem prioridade SE TP1 ainda não foi
+        # marcado em rounds anteriores. Se TP1 já era hit no passado, stop em
+        # entry pode bater junto com TP2 — aí ainda assim damos prioridade pro
+        # breakeven (worst-case) só se TP2 não bater junto.
+        if stop_hit and not (tp1_already or tp1_hit_now):
+            # Stop original antes de TP1 → loss puro, mesmo se TP1/TP2 batem
+            # na mesma vela (worst-case assume stop primeiro).
+            return ("lost", snap.stop_loss, REALIZED_R_STOP, False)
+
+        # Após (ou junto com) TP1 já marcado, TP2 ganha prioridade sobre BE
+        if tp2_hit:
+            return ("won_tp2", snap.tp2, REALIZED_R_TP2, tp1_hit_now)
+
+        # TP1 acabou de bater nesta vela
+        if tp1_hit and not (tp1_already or tp1_hit_now):
+            tp1_hit_now = True
+            # NÃO retorna ainda — continua iterando candles, agora com stop
+            # efetivo no entry. Pode bater TP2 ou voltar pro entry no próprio
+            # window.
+            continue
+
+        # Stop efetivo (= entry) bate após TP1 já estar marcado
+        if stop_hit and (tp1_already or tp1_hit_now):
+            return ("won_tp1_be", snap.entry, REALIZED_R_BREAKEVEN, tp1_hit_now)
+
+    # Não fechou. Reporta se TP1 acabou de ser tocado agora.
+    if tp1_hit_now:
+        return ("open_after_tp1", None, None, True)
     return None
 
 
@@ -190,12 +240,18 @@ async def check_open_snapshots() -> int:
 
         for snap in open_snaps:
             try:
-                age = now - (snap.last_check_at or snap.created_at)
-                # Expiração: passou de EXPIRY_HOURS desde criado
+                # Expiração: passou de EXPIRY_HOURS desde criado.
+                # Step 2a: se TP1 já tinha sido tocado, expira como won_tp1 (+1R)
+                # — lucro parcial travado. Caso contrário, expired (0R).
                 if (now - snap.created_at) > timedelta(hours=EXPIRY_HOURS):
-                    snap.status = "expired"
+                    if snap.tp1_hit_at is not None:
+                        snap.status = "won_tp1"
+                        snap.outcome_price = snap.tp1
+                        snap.realized_r = REALIZED_R_TP1
+                    else:
+                        snap.status = "expired"
+                        snap.realized_r = 0.0
                     snap.outcome_at = now
-                    snap.realized_r = 0.0
                     resolved += 1
                     continue
 
@@ -210,17 +266,30 @@ async def check_open_snapshots() -> int:
                 if df_window.empty:
                     df_window = df.tail(1)
 
-                high = float(df_window["high"].max())
-                low = float(df_window["low"].min())
+                outcome = _classify_outcome_candles(snap, df_window)
+                if outcome is not None:
+                    status, price, r, tp1_just_hit = outcome
 
-                outcome = _classify_outcome(snap, high, low)
-                if outcome:
-                    status, price, r = outcome
-                    snap.status = status
-                    snap.outcome_price = price
-                    snap.outcome_at = now
-                    snap.realized_r = r
-                    resolved += 1
+                    if status == "open_after_tp1":
+                        # Step 2a: TP1 tocou agora — marca timestamp, stop sobe
+                        # pra entry, posição segue aberta esperando TP2 ou BE.
+                        snap.tp1_hit_at = now
+                        log.info(
+                            f"[breakeven] {snap.symbol} {snap.timeframe} {snap.direction} "
+                            f"TP1 hit → stop movido pra entry ({snap.entry})"
+                        )
+                    else:
+                        # Fecha snapshot
+                        snap.status = status
+                        snap.outcome_price = price
+                        snap.outcome_at = now
+                        snap.realized_r = r
+                        # Se foi won_tp2 e TP1 bateu na MESMA janela (sem ter sido
+                        # marcado antes), grava também tp1_hit_at pra rastreio.
+                        if tp1_just_hit and snap.tp1_hit_at is None:
+                            snap.tp1_hit_at = now
+                        resolved += 1
+
                 snap.last_check_at = now
             except Exception as e:
                 log.warning(f"Erro checando snapshot {snap.id} ({snap.symbol}): {e}")
@@ -252,7 +321,7 @@ async def get_daily_pnl(target_date: Optional[date] = None) -> Dict[str, Any]:
             and_(
                 RecommendationSnapshot.outcome_at >= day_start,
                 RecommendationSnapshot.outcome_at < day_end,
-                RecommendationSnapshot.status.in_(("won_tp1", "won_tp2", "lost")),
+                RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2", "lost")),
             )
         )
         result = await session.execute(stmt)
@@ -320,7 +389,7 @@ async def get_history_stats(days: int = 30) -> Dict[str, Any]:
         stmt = select(RecommendationSnapshot).where(
             and_(
                 RecommendationSnapshot.outcome_at >= since,
-                RecommendationSnapshot.status.in_(("won_tp1", "won_tp2", "lost")),
+                RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2", "lost")),
             )
         )
         snaps = (await session.execute(stmt)).scalars().all()

@@ -37,7 +37,8 @@ class RecommendationSnapshot(Base):
 
     # Status / outcome
     status: Mapped[str] = mapped_column(String(12), default="open", index=True)
-    # "open" | "won_tp1" | "won_tp2" | "lost" | "expired"
+    # "open" | "won_tp1" | "won_tp1_be" | "won_tp2" | "lost" | "expired"
+    # won_tp1_be = breakeven após TP1 (Step 2a): TP1 tocou, stop subiu pra entry, depois voltou.
     outcome_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     outcome_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     realized_r: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -53,6 +54,10 @@ class RecommendationSnapshot(Base):
         DateTime(timezone=True), default=datetime.utcnow, index=True
     )
     last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Step 2a: quando TP1 é tocado, stop sobe pra entry (breakeven). Esse campo
+    # marca o momento do hit — se None, posição ainda não tocou TP1.
+    tp1_hit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_snap_status_created", "status", "created_at"),

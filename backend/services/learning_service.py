@@ -95,7 +95,7 @@ async def compute_stats_by_bucket(days: int = 60) -> Dict[str, Any]:
         stmt = select(RecommendationSnapshot).where(
             and_(
                 RecommendationSnapshot.outcome_at >= since,
-                RecommendationSnapshot.status.in_(("won_tp1", "won_tp2", "lost")),
+                RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2", "lost")),
             )
         )
         snaps = (await session.execute(stmt)).scalars().all()
@@ -249,7 +249,7 @@ async def lookup_historical_for(
                 RecommendationSnapshot.timeframe == timeframe,
                 RecommendationSnapshot.direction == direction,
                 RecommendationSnapshot.outcome_at >= since,
-                RecommendationSnapshot.status.in_(("won_tp1", "won_tp2", "lost")),
+                RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2", "lost")),
             )
         )
         snaps = (await session.execute(stmt)).scalars().all()
@@ -299,7 +299,7 @@ async def lookup_historical_batch(
         stmt = select(RecommendationSnapshot).where(
             and_(
                 RecommendationSnapshot.outcome_at >= since,
-                RecommendationSnapshot.status.in_(("won_tp1", "won_tp2", "lost")),
+                RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2", "lost")),
             )
         )
         snaps = (await session.execute(stmt)).scalars().all()

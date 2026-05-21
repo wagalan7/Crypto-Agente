@@ -53,6 +53,7 @@ function fmt(n: number) {
 const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
   won_tp2: { label: 'TP2 ✓', cls: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' },
   won_tp1: { label: 'TP1 ✓', cls: 'bg-green-500/20 text-green-300 border-green-500/40' },
+  won_tp1_be: { label: 'BE (TP1)', cls: 'bg-sky-500/20 text-sky-300 border-sky-500/40' },
   lost:    { label: 'STOP ✗', cls: 'bg-red-500/20 text-red-300 border-red-500/40' },
   open:    { label: 'aberto', cls: 'bg-slate-500/20 text-slate-300 border-slate-500/40' },
   expired: { label: 'expirado', cls: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40' },
