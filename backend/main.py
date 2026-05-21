@@ -661,6 +661,20 @@ async def push_test_scan():
     DIAGNÓSTICO: dispara uma varredura server-side AGORA (via Binance Vision)
     e retorna o que achou. Útil pra verificar por que o loop não está mandando push.
     """
+    # Diagnóstico: qual fonte está ativa?
+    from services import binance_futures_service as _bfs
+    _source = "binance-futures-proxy" if _bfs.PROXY_ENABLED else "binance-vision-spot"
+    _proxy_url = _bfs.PROXY_URL if _bfs.PROXY_ENABLED else None
+    _symbols_probe: list = []
+    try:
+        if _bfs.PROXY_ENABLED:
+            _symbols_probe = await _bfs.fetch_top_volume_symbols(limit=5)
+        else:
+            from services import binance_vision_service as _bvs
+            _symbols_probe = await _bvs.fetch_top_volume_symbols(limit=5)
+    except Exception as e:
+        _symbols_probe = [f"probe_error: {e}"]
+
     try:
         recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
     except Exception as e:
@@ -690,6 +704,9 @@ async def push_test_scan():
             logging.warning(f"test-scan push falhou: {e}")
 
     return {
+        "source": _source,
+        "proxy_url": _proxy_url,
+        "symbols_probe": _symbols_probe,
         "push_enabled": PUSH_ENABLED,
         "db_enabled": DB_ENABLED,
         "total_recs": len(recs),
