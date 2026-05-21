@@ -77,7 +77,7 @@ async def save_subscription(
                 user_agent=user_agent,
                 notify_a_plus=bool(filters.get("notify_a_plus", True)),
                 notify_a=bool(filters.get("notify_a", True)),
-                notify_b=bool(filters.get("notify_b", False)),
+                notify_b=bool(filters.get("notify_b", True)),
                 active=True,
             )
             session.add(sub)

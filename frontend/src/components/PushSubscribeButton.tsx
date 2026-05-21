@@ -80,7 +80,7 @@ export default function PushSubscribeButton() {
           endpoint: subJson.endpoint,
           keys: subJson.keys,
           user_agent: navigator.userAgent.slice(0, 250),
-          filters: { notify_a_plus: true, notify_a: true, notify_b: false },
+          filters: { notify_a_plus: true, notify_a: true, notify_b: true },
         }),
       })
       localStorage.setItem(LS_KEY, '1')
