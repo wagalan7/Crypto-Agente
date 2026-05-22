@@ -296,8 +296,9 @@ export default function DailyPnLPanel({ onClose }: Props) {
         {s && (
           <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 p-3 border-b border-slate-800">
             <button
-              onClick={() => setDrill('all')}
-              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors"
+              type="button"
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('all') }}
+              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors cursor-pointer"
               title="Ver todos os trades do dia"
             >
               <div className="text-[10px] text-slate-500 uppercase">Total R</div>
@@ -315,8 +316,9 @@ export default function DailyPnLPanel({ onClose }: Props) {
               )}
             </button>
             <button
-              onClick={() => setDrill('all')}
-              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors"
+              type="button"
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('all') }}
+              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors cursor-pointer"
               title="Ver desempenho"
             >
               <div className="text-[10px] text-slate-500 uppercase">Win Rate</div>
@@ -324,8 +326,9 @@ export default function DailyPnLPanel({ onClose }: Props) {
               <div className="text-[10px] text-slate-600 mt-0.5">{s.wins}W · {s.losses}L</div>
             </button>
             <button
-              onClick={() => setDrill('all')}
-              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors"
+              type="button"
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('all') }}
+              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors cursor-pointer"
               title="Ver todos os trades resolvidos"
             >
               <div className="text-[10px] text-slate-500 uppercase">Trades</div>
@@ -333,8 +336,9 @@ export default function DailyPnLPanel({ onClose }: Props) {
               <div className="text-[10px] text-slate-600 mt-0.5">resolvidos</div>
             </button>
             <button
-              onClick={() => setDrill('wins')}
-              className="text-left bg-emerald-500/5 border border-emerald-500/30 hover:border-emerald-400 rounded-lg p-3 transition-colors"
+              type="button"
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('wins') }}
+              className="text-left bg-emerald-500/5 border border-emerald-500/30 hover:border-emerald-400 rounded-lg p-3 transition-colors cursor-pointer"
               title="Ver vencedores e por quê venceram"
             >
               <div className="text-[10px] text-emerald-400/70 uppercase">Vencedores</div>
@@ -342,8 +346,9 @@ export default function DailyPnLPanel({ onClose }: Props) {
               <div className="text-[10px] text-emerald-400/60 mt-0.5">{fmtPct(pctBreakdown.wins)}</div>
             </button>
             <button
-              onClick={() => setDrill('losses')}
-              className="text-left bg-red-500/5 border border-red-500/30 hover:border-red-400 rounded-lg p-3 transition-colors"
+              type="button"
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('losses') }}
+              className="text-left bg-red-500/5 border border-red-500/30 hover:border-red-400 rounded-lg p-3 transition-colors cursor-pointer"
               title="Ver perdedores e por quê perderam"
             >
               <div className="text-[10px] text-red-400/70 uppercase">Perdedores</div>
@@ -351,8 +356,9 @@ export default function DailyPnLPanel({ onClose }: Props) {
               <div className="text-[10px] text-red-400/60 mt-0.5">{fmtPct(pctBreakdown.losses)}</div>
             </button>
             <button
-              onClick={() => setDrill('open')}
-              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors"
+              type="button"
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('open') }}
+              className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors cursor-pointer"
               title="Ver trades em aberto"
             >
               <div className="text-[10px] text-slate-500 uppercase">Abertos</div>
