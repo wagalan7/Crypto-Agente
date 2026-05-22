@@ -454,13 +454,11 @@ async def get_daily_pnl(target_date: Optional[date] = None) -> Dict[str, Any]:
         result = await session.execute(stmt)
         snaps = result.scalars().all()
 
-        # Snapshots ainda abertos criados hoje (detalhe completo pro drill-down)
+        # Snapshots ainda abertos — TODOS, independente do dia em que foram
+        # criados. Trade de ontem que ainda não bateu TP/stop é tão relevante
+        # quanto um aberto hoje (capital travado em ambos).
         open_stmt = select(RecommendationSnapshot).where(
-            and_(
-                RecommendationSnapshot.created_at >= day_start,
-                RecommendationSnapshot.created_at < day_end,
-                RecommendationSnapshot.status == "open",
-            )
+            RecommendationSnapshot.status == "open"
         )
         open_snaps = (await session.execute(open_stmt)).scalars().all()
         open_count = len(open_snaps)
