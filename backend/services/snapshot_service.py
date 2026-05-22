@@ -443,12 +443,16 @@ async def get_daily_pnl(target_date: Optional[date] = None) -> Dict[str, Any]:
     day_end = day_start + timedelta(days=1)
 
     async with get_session() as session:
-        # Snapshots resolvidos hoje (won_tp1, won_tp2, lost)
+        # Snapshots resolvidos NESTE dia (outcome_at). O dia do fechamento
+        # manda — trade aberto ontem mas que estopou hoje aparece em hoje.
+        # Inclui expired pra ficar visível (não conta em win/loss, r=0).
         stmt = select(RecommendationSnapshot).where(
             and_(
                 RecommendationSnapshot.outcome_at >= day_start,
                 RecommendationSnapshot.outcome_at < day_end,
-                RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2", "lost")),
+                RecommendationSnapshot.status.in_(
+                    ("won_tp1", "won_tp1_be", "won_tp2", "lost", "expired")
+                ),
             )
         )
         result = await session.execute(stmt)

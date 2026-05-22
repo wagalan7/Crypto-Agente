@@ -79,7 +79,7 @@ const STATUS_REASON: Record<string, string> = {
   won_tp1: 'Preço atingiu TP1 (50% saiu, +0.5R) mas snapshot expirou antes de TP2. Conservador: contou +0.5R.',
   won_tp1_be: 'Preço atingiu TP1 (50% saiu) e depois voltou pra entry. Stop subiu pra breakeven nos 50% restantes. Total +0.5R.',
   lost: 'Preço bateu o stop ANTES de tocar TP1 (sem parcial). Perda total de −1R.',
-  expired: 'Snapshot expirou (48h) sem o preço tocar TP1 nem stop. Sem entrada.',
+  expired: 'Trade fechado pelo time-stop (janela do TF expirou sem tocar TP1 nem stop). Sem perda, sem ganho — capital liberado.',
   open: 'Tracker ainda monitorando — aguardando preço tocar TP1, TP2 ou stop.',
 }
 
