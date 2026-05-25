@@ -45,6 +45,20 @@ WEIGHTS = {
 MAX_TOTAL = sum(WEIGHTS.values())   # = 300
 
 
+# ─── Pesos empíricos por padrão (calibração via learning loop) ────────────────
+# Multiplicador aplicado ao "pts" do fator pattern, baseado em performance
+# histórica observada (insights de aprendizado).
+# Critério: só aplica boost se n≥30 trades resolvidos com win_rate ≥ 88%
+# e avg_R ≥ +0.70. Caso contrário, neutro (1.0).
+# Revisar trimestralmente conforme amostra cresce.
+PATTERN_EMPIRICAL_WEIGHT: dict = {
+    "double_bottom": 1.20,   # n=45, wr=91%, +0.82R (melhor padrão observado)
+    "double_top":    1.15,   # n=38, wr=92%, +0.74R
+    "ltb":           1.10,   # n=25, wr=92%, +0.82R — sample ainda crescendo
+    # Resto = 1.0 (neutro). Patterns com n<10 ou wr<85% ficam sem boost.
+}
+
+
 def _sign_for_direction(direction: SignalDirection, val: int) -> int:
     """Retorna 1 se o sinal indicador alinha com a direção, -1 se contrário, 0 se neutro."""
     if direction == SignalDirection.LONG:
@@ -301,12 +315,18 @@ def calculate_confluence(
         # Pega até 2 padrões mais confiantes
         top = sorted(aligned_patterns, key=lambda p: p.confidence, reverse=True)[:2]
         for p in top:
-            pts = round(p.confidence * 17, 1)  # max ~17 por padrão (35 total)
+            base_pts = p.confidence * 17  # max ~17 por padrão (35 total)
+            # Boost empírico baseado em performance histórica do padrão
+            empirical_mult = PATTERN_EMPIRICAL_WEIGHT.get(p.type.value, 1.0)
+            pts = round(base_pts * empirical_mult, 1)
+            desc = p.description
+            if empirical_mult > 1.0:
+                desc = f"{desc} [boost empírico ×{empirical_mult}]"
             factors.append(ConfluenceFactor(
                 name=f"Padrão: {p.type.value.replace('_', ' ').title()}",
                 category="pattern",
-                points=pts, max_points=17, aligned=True,
-                description=p.description,
+                points=pts, max_points=round(17 * empirical_mult, 1), aligned=True,
+                description=desc,
             ))
     # Padrões contrários = warning
     contrary = [p for p in patterns if p.direction != direction and p.direction != SignalDirection.NEUTRAL]

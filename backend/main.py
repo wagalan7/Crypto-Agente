@@ -814,6 +814,119 @@ async def status_distribution(days: int = 30):
         raise HTTPException(500, f"Erro: {e}")
 
 
+@app.get("/api/debug/tier-a-losses")
+async def tier_a_losses(days: int = 60):
+    """Drill-down dos trades tier A que stoparam (status='lost').
+    Usado pra investigar paradoxo A vs B no scoring — quais features em comum?"""
+    try:
+        from db import DB_ENABLED, get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import select
+        if not DB_ENABLED:
+            return {"enabled": False}
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        async with get_session() as session:
+            stmt = (
+                select(RecommendationSnapshot)
+                .where(
+                    RecommendationSnapshot.created_at >= since,
+                    RecommendationSnapshot.tier.in_(("A", "A+")),
+                    RecommendationSnapshot.status == "lost",
+                )
+                .order_by(RecommendationSnapshot.created_at.desc())
+            )
+            losses = list((await session.execute(stmt)).scalars().all())
+
+            # Também: tier A vencedores pra comparar features
+            stmt_wins = (
+                select(RecommendationSnapshot)
+                .where(
+                    RecommendationSnapshot.created_at >= since,
+                    RecommendationSnapshot.tier.in_(("A", "A+")),
+                    RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2")),
+                )
+            )
+            wins = list((await session.execute(stmt_wins)).scalars().all())
+
+        def serialize(s):
+            f = s.features or {}
+            return {
+                "id": s.id, "symbol": s.symbol, "tf": s.timeframe, "tier": s.tier,
+                "direction": s.direction, "score": s.score, "rr": s.risk_reward,
+                "confidence": f.get("confidence"),
+                "mtf_score": f.get("mtf_score"),
+                "confluence_pct": f.get("confluence_pct"),
+                "rsi": f.get("rsi"),
+                "patterns": f.get("patterns"),
+                "funding_pct": f.get("funding_pct"),
+                "oi_change_pct": f.get("oi_change_pct"),
+                "atr_pct": f.get("atr_pct"),
+                "hour_utc": f.get("hour_utc"),
+                "day_of_week": f.get("day_of_week"),
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+            }
+
+        # Aggregates pra comparar — alguns campos vêm do snapshot, outros de features
+        SNAP_FIELDS = {"score", "rr"}
+        def agg(arr, key):
+            vals = []
+            for s in arr:
+                if key == "score":
+                    v = s.score
+                elif key == "rr":
+                    v = s.risk_reward
+                else:
+                    v = (s.features or {}).get(key)
+                if v is not None:
+                    vals.append(float(v))
+            if not vals:
+                return None
+            return {"mean": round(sum(vals) / len(vals), 2), "n": len(vals)}
+
+        def pattern_freq(arr):
+            from collections import Counter
+            cnt = Counter()
+            for s in arr:
+                pats = (s.features or {}).get("patterns") or []
+                for p in pats:
+                    cnt[p] += 1
+            return dict(cnt.most_common(10))
+
+        return {
+            "enabled": True,
+            "days": days,
+            "losses": [serialize(s) for s in losses],
+            "n_losses": len(losses),
+            "n_wins": len(wins),
+            "compare": {
+                "losses": {
+                    "score": agg(losses, "score"),
+                    "rr":    agg(losses, "rr"),
+                    "mtf_score":      agg(losses, "mtf_score"),
+                    "confluence_pct": agg(losses, "confluence_pct"),
+                    "rsi":            agg(losses, "rsi"),
+                    "funding_pct":    agg(losses, "funding_pct"),
+                    "atr_pct":        agg(losses, "atr_pct"),
+                    "patterns_top":   pattern_freq(losses),
+                },
+                "wins": {
+                    "score": agg(wins, "score"),
+                    "rr":    agg(wins, "rr"),
+                    "mtf_score":      agg(wins, "mtf_score"),
+                    "confluence_pct": agg(wins, "confluence_pct"),
+                    "rsi":            agg(wins, "rsi"),
+                    "funding_pct":    agg(wins, "funding_pct"),
+                    "atr_pct":        agg(wins, "atr_pct"),
+                    "patterns_top":   pattern_freq(wins),
+                },
+            },
+        }
+    except Exception as e:
+        logging.error(f"tier-a-losses error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro: {e}")
+
+
 @app.get("/api/debug/vision-pipeline")
 async def debug_vision_pipeline():
     """Roda cada estágio do pipeline Vision e reporta onde quebra."""
