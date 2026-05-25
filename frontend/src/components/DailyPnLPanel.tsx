@@ -37,6 +37,30 @@ interface DailyPnL {
   open_trades?: Trade[]
 }
 
+interface ViabilityItem {
+  id: number
+  symbol: string
+  timeframe: string
+  direction: 'long' | 'short'
+  tier: string
+  entry: number
+  current_price: number
+  distance_atr: number | null
+  stop_progress_pct: number
+  age_hours: number
+  tp1_hit: boolean
+  viability: 'valid' | 'wait' | 'missed' | 'tp1_done'
+  advice: string
+  created_at: string | null
+}
+
+const VIABILITY_BADGE: Record<string, { label: string; cls: string }> = {
+  valid:    { label: '🟢 viável',    cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' },
+  wait:     { label: '🟡 aguardar',  cls: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/40' },
+  missed:   { label: '🔴 perdeu',    cls: 'bg-red-500/15 text-red-300 border-red-500/40' },
+  tp1_done: { label: '🔵 TP1 hit',   cls: 'bg-sky-500/15 text-sky-300 border-sky-500/40' },
+}
+
 interface Props {
   onClose: () => void
 }
@@ -66,37 +90,43 @@ function operationType(tf: string): string {
 }
 
 const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
-  won_tp2: { label: 'TP2 ✓', cls: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' },
-  won_tp1: { label: 'TP1 ✓', cls: 'bg-green-500/20 text-green-300 border-green-500/40' },
-  won_tp1_be: { label: 'BE (TP1)', cls: 'bg-sky-500/20 text-sky-300 border-sky-500/40' },
-  lost:    { label: 'STOP ✗', cls: 'bg-red-500/20 text-red-300 border-red-500/40' },
-  open:    { label: 'aberto', cls: 'bg-slate-500/20 text-slate-300 border-slate-500/40' },
-  expired: { label: 'expirado', cls: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40' },
+  won_tp2:    { label: '🏆 TP2',     cls: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' },
+  won_tp1:    { label: '✅ TP1',     cls: 'bg-green-500/20 text-green-300 border-green-500/40' },
+  won_tp1_be: { label: '✅ TP1+BE',  cls: 'bg-sky-500/20 text-sky-300 border-sky-500/40' },
+  lost:       { label: '✗ STOP',     cls: 'bg-red-500/20 text-red-300 border-red-500/40' },
+  open:       { label: 'aberto',     cls: 'bg-slate-500/20 text-slate-300 border-slate-500/40' },
+  expired:    { label: '⏱ expirado', cls: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40' },
 }
 
 const STATUS_REASON: Record<string, string> = {
-  won_tp2: 'Preço atingiu o TP2 — 50% saiu em TP1 (+0.5R) e 50% em TP2 (+1.0R). Total +1.5R.',
-  won_tp1: 'Preço atingiu TP1 (50% saiu, +0.5R) mas snapshot expirou antes de TP2. Conservador: contou +0.5R.',
-  won_tp1_be: 'Preço atingiu TP1 (50% saiu) e depois voltou pra entry. Stop subiu pra breakeven nos 50% restantes. Total +0.5R.',
-  lost: 'Preço bateu o stop ANTES de tocar TP1 (sem parcial). Perda total de −1R.',
-  expired: 'Trade fechado pelo time-stop (janela do TF expirou sem tocar TP1 nem stop). Sem perda, sem ganho — capital liberado.',
-  open: 'Tracker ainda monitorando — aguardando preço tocar TP1, TP2 ou stop.',
+  won_tp2: 'Preço atingiu o TP2 — 50% da posição saiu em TP1 (+0.5R) e 50% em TP2 (+1.0R). Total +1.5R.',
+  won_tp1: 'Preço atingiu TP1 (50% saiu, +0.5R) e snapshot expirou em BE+ lock nos 50% restantes (+0.1R). Total +0.6R.',
+  won_tp1_be: 'Preço atingiu TP1 (50% saiu, +0.5R), depois retraiu e bateu o BE+ lock (entry + 0.2R) nos 50% restantes (+0.1R). Total +0.6R. Trail v2 ampliado evita whipsaw.',
+  lost: 'Preço bateu o stop ANTES de tocar TP1 (sem parcial). Perda total −1R.',
+  expired: 'Time-stop por TF (15m=4h, 1h=12h, 4h=36h) sem tocar TP1 nem stop. Sem perda, sem ganho — capital liberado.',
+  open: 'Tracker monitorando — aguardando preço tocar TP1, TP2 ou stop.',
 }
 
-type DrillKind = 'wins' | 'losses' | 'open' | 'all' | null
+type DrillKind = 'wins' | 'losses' | 'open' | 'open_today' | 'open_older' | 'all' | null
 
 export default function DailyPnLPanel({ onClose }: Props) {
   const [date, setDate] = useState(todayISO())
+  const [endDate, setEndDate] = useState(todayISO())
   const [data, setData] = useState<DailyPnL | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [drill, setDrill] = useState<DrillKind>(null)
+  const [viability, setViability] = useState<Record<number, ViabilityItem>>({})
+  const isRange = date !== endDate
 
-  const load = useCallback(async (d: string) => {
+  const load = useCallback(async (d: string, end: string) => {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch(`${BACKEND}/api/daily-pnl?date=${d}`)
+      const url = d === end
+        ? `${BACKEND}/api/daily-pnl?date=${d}`
+        : `${BACKEND}/api/daily-pnl?date=${d}&end_date=${end}`
+      const res = await fetch(url)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setData(await res.json())
     } catch (e) {
@@ -106,7 +136,40 @@ export default function DailyPnLPanel({ onClose }: Props) {
     }
   }, [])
 
-  useEffect(() => { load(date) }, [load, date])
+  useEffect(() => { load(date, endDate) }, [load, date, endDate])
+
+  // Fetch viability dos abertos sempre que data muda (viability é estado
+  // atual — só relevante se range inclui hoje). Cache local — refresca
+  // quando recarrega.
+  useEffect(() => {
+    const today = todayISO()
+    if (endDate < today && date < today) return
+    let alive = true
+    ;(async () => {
+      try {
+        const res = await fetch(`${BACKEND}/api/snapshots/open-viability`)
+        if (!res.ok) return
+        const json = await res.json()
+        if (!alive || !json.enabled) return
+        const map: Record<number, ViabilityItem> = {}
+        for (const it of (json.items ?? []) as ViabilityItem[]) map[it.id] = it
+        setViability(map)
+      } catch { /* fail-silent */ }
+    })()
+    return () => { alive = false }
+  }, [date, endDate, data?.summary?.still_open])
+
+  // Separa abertos em "hoje" (criados no dia atual) vs "anteriores"
+  const openListAll = data?.open_trades ?? []
+  const todayStr = todayISO()
+  const openToday = useMemo(
+    () => openListAll.filter(t => t.created_at?.slice(0, 10) === todayStr),
+    [openListAll, todayStr]
+  )
+  const openOlder = useMemo(
+    () => openListAll.filter(t => t.created_at?.slice(0, 10) !== todayStr),
+    [openListAll, todayStr]
+  )
 
   const s = data?.summary
   const totalR = s?.total_r ?? 0
@@ -140,24 +203,28 @@ export default function DailyPnLPanel({ onClose }: Props) {
     () => (data?.trades ?? []).filter(t => (t.realized_r ?? 0) < 0),
     [data?.trades]
   )
-  const openList = data?.open_trades ?? []
-
   // ── Drill-down render ────────────────────────────────────────────────────
   if (drill !== null && data) {
     const title =
       drill === 'wins' ? 'Vencedores do dia' :
       drill === 'losses' ? 'Perdedores do dia' :
-      drill === 'open' ? 'Trades em aberto' :
+      drill === 'open' ? 'Trades em aberto (todos)' :
+      drill === 'open_today' ? 'Abertos · criados hoje' :
+      drill === 'open_older' ? 'Abertos · dias anteriores' :
       'Todos os trades'
     const list =
       drill === 'wins' ? winsList :
       drill === 'losses' ? lossesList :
-      drill === 'open' ? openList :
-      [...(data.trades ?? []), ...openList]
+      drill === 'open' ? openListAll :
+      drill === 'open_today' ? openToday :
+      drill === 'open_older' ? openOlder :
+      [...(data.trades ?? []), ...openListAll]
     const subtitle =
       drill === 'wins' ? `${winsList.length} trade(s) · ${fmtPct(pctBreakdown.wins)} da banca` :
       drill === 'losses' ? `${lossesList.length} trade(s) · ${fmtPct(pctBreakdown.losses)} da banca` :
-      drill === 'open' ? `${openList.length} aguardando preço bater TP ou stop` :
+      drill === 'open' ? `${openListAll.length} aguardando preço bater TP ou stop` :
+      drill === 'open_today' ? `${openToday.length} trade(s) abertos no dia de hoje` :
+      drill === 'open_older' ? `${openOlder.length} trade(s) de dias anteriores · avaliando viabilidade atual` :
       `${list.length} trade(s) no total`
 
     return (
@@ -190,10 +257,23 @@ export default function DailyPnLPanel({ onClose }: Props) {
                 const r = t.realized_r ?? 0
                 const pct = r * t.risk_pct
                 const opType = operationType(t.timeframe)
+                // Match viability por símbolo+tf+direction+entry (snapshot.id não está no payload de daily-pnl)
+                const viab = t.status === 'open'
+                  ? Object.values(viability).find(v =>
+                      v.symbol === t.symbol && v.timeframe === t.timeframe &&
+                      v.direction === t.direction && Math.abs(v.entry - t.entry) < 1e-8
+                    )
+                  : undefined
+                const vBadge = viab ? VIABILITY_BADGE[viab.viability] : null
                 return (
                   <div key={i} className="p-3 rounded-lg border border-slate-800 bg-slate-900/40">
                     <div className="flex items-center gap-2 flex-wrap mb-2">
                       <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${badge.cls}`}>{badge.label}</span>
+                      {vBadge && (
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${vBadge.cls}`} title={viab?.advice}>
+                          {vBadge.label}
+                        </span>
+                      )}
                       <DirIcon className={`w-4 h-4 ${isLong ? 'text-green-400' : 'text-red-400'}`} />
                       <span className="text-sm font-bold text-white">{t.symbol.split('/')[0]}</span>
                       <span className="text-[10px] text-slate-500 font-mono">{t.timeframe}</span>
@@ -210,7 +290,7 @@ export default function DailyPnLPanel({ onClose }: Props) {
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 text-[11px] mb-2">
+                    <div className="grid grid-cols-3 sm:grid-cols-5 gap-2 text-[11px] mb-2">
                       <div>
                         <div className="text-slate-600 text-[9px]">Entrada</div>
                         <div className="font-mono text-yellow-300">{fmt(t.entry)}</div>
@@ -229,7 +309,37 @@ export default function DailyPnLPanel({ onClose }: Props) {
                         <div className="text-slate-600 text-[9px]">TP2</div>
                         <div className="font-mono text-green-300">{fmt(t.tp2)}</div>
                       </div>
+                      {viab && (
+                        <div>
+                          <div className="text-slate-600 text-[9px]">Preço atual</div>
+                          <div className="font-mono text-sky-300">{fmt(viab.current_price)}</div>
+                        </div>
+                      )}
                     </div>
+
+                    {viab && (
+                      <div className="mb-2 text-[10px] flex items-center gap-2 flex-wrap">
+                        {viab.distance_atr !== null && (
+                          <span className="text-slate-500">
+                            dist:{' '}
+                            <span className={
+                              viab.distance_atr >= 1.0 ? 'text-red-400' :
+                              viab.distance_atr >= 0.5 ? 'text-yellow-400' :
+                              'text-emerald-400'
+                            }>
+                              {viab.distance_atr >= 0 ? '+' : ''}{viab.distance_atr}×ATR
+                            </span>
+                          </span>
+                        )}
+                        <span className="text-slate-500">stop: <span className="text-slate-300">{viab.stop_progress_pct.toFixed(0)}%</span></span>
+                        <span className="text-slate-500">há <span className="text-slate-300">{viab.age_hours.toFixed(1)}h</span></span>
+                      </div>
+                    )}
+                    {viab && (
+                      <p className="text-[10px] text-slate-300 leading-snug bg-slate-950/50 border border-slate-800 rounded p-2 mb-2">
+                        💡 {viab.advice}
+                      </p>
+                    )}
 
                     <p className="text-[10px] text-slate-400 leading-snug">{reason}</p>
                     {(t.created_at || t.outcome_at) && (
@@ -258,21 +368,44 @@ export default function DailyPnLPanel({ onClose }: Props) {
         <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-gradient-to-r from-slate-900 to-slate-800">
           <div className="flex items-center gap-2">
             <BarChart3 className="w-5 h-5 text-emerald-400" />
-            <h2 className="text-base font-bold text-white">Resultado do Dia</h2>
+            <h2 className="text-base font-bold text-white">{isRange ? 'Resultado do Período' : 'Resultado do Dia'}</h2>
             <span className="text-xs text-slate-500 hidden sm:inline">· P&L das recomendações</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap justify-end">
             <div className="flex items-center gap-1 bg-slate-800 border border-slate-700 rounded px-2 py-1">
               <Calendar className="w-3.5 h-3.5 text-slate-400" />
               <input
                 type="date"
                 value={date}
-                onChange={e => setDate(e.target.value)}
+                onChange={e => {
+                  const v = e.target.value
+                  setDate(v)
+                  // se o end estava antes do novo start, ajusta
+                  if (endDate < v) setEndDate(v)
+                }}
                 className="bg-transparent text-xs text-slate-200 outline-none"
                 max={todayISO()}
+                title="Data inicial"
+              />
+              <span className="text-slate-600 text-xs">→</span>
+              <input
+                type="date"
+                value={endDate}
+                onChange={e => setEndDate(e.target.value)}
+                className="bg-transparent text-xs text-slate-200 outline-none"
+                min={date}
+                max={todayISO()}
+                title="Data final (= inicial pra ver só 1 dia)"
               />
             </div>
-            <button onClick={() => load(date)} disabled={loading}
+            {(date !== todayISO() || endDate !== todayISO()) && (
+              <button
+                onClick={() => { setDate(todayISO()); setEndDate(todayISO()) }}
+                className="px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-[10px] text-slate-300"
+                title="Voltar pra hoje"
+              >Hoje</button>
+            )}
+            <button onClick={() => load(date, endDate)} disabled={loading}
               className="flex items-center gap-1 px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-xs text-slate-300 disabled:opacity-50">
               <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
             </button>
@@ -357,14 +490,26 @@ export default function DailyPnLPanel({ onClose }: Props) {
             </button>
             <button
               type="button"
-              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('open') }}
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('open_today') }}
               className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors cursor-pointer"
-              title="Ver trades em aberto"
+              title="Trades abertos criados hoje"
             >
-              <div className="text-[10px] text-slate-500 uppercase">Abertos</div>
-              <div className="text-xl font-bold text-slate-300 font-mono">{s.still_open}</div>
-              <div className="text-[10px] text-slate-600 mt-0.5">aguardando</div>
+              <div className="text-[10px] text-slate-500 uppercase">Abertos · hoje</div>
+              <div className="text-xl font-bold text-slate-300 font-mono">{openToday.length}</div>
+              <div className="text-[10px] text-slate-600 mt-0.5">criados hoje</div>
             </button>
+            {openOlder.length > 0 && (
+              <button
+                type="button"
+                onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('open_older') }}
+                className="text-left bg-amber-500/5 border border-amber-500/30 hover:border-amber-400 rounded-lg p-3 transition-colors cursor-pointer"
+                title="Trades abertos de dias anteriores — clique pra ver viabilidade"
+              >
+                <div className="text-[10px] text-amber-400/70 uppercase">Abertos · anteriores</div>
+                <div className="text-xl font-bold text-amber-300 font-mono">{openOlder.length}</div>
+                <div className="text-[10px] text-amber-400/60 mt-0.5">avaliando viabilidade</div>
+              </button>
+            )}
           </div>
         )}
 
@@ -427,11 +572,13 @@ export default function DailyPnLPanel({ onClose }: Props) {
 
         {/* Footer */}
         <div className="px-4 py-2 border-t border-slate-800 bg-slate-900/60 text-[10px] text-slate-500 leading-relaxed">
-          <strong className="text-slate-400">R:</strong> múltiplo de risco com gestão parcial:
-          +1.5R = TP2 cheio (50% TP1 + 50% TP2) · +0.5R = breakeven após TP1 (50% TP1 + 50% trail/BE) · −1R = stop original.
-          A coluna de <strong>% da banca</strong> soma o impacto real por trade (cada tier tem seu risco_pct: A+ 1.5% / A 1% / B 0.5%).
+          <strong className="text-slate-400">R:</strong> múltiplo de risco com gestão parcial v2:
+          <span className="text-emerald-400"> +1.5R = TP2</span> (50% TP1 + 50% TP2) ·
+          <span className="text-sky-400"> +0.6R = TP1+BE+</span> (50% TP1 + 50% lock 0.2R) ·
+          <span className="text-red-400"> −1R = stop</span>.
+          A coluna de <strong>% da banca</strong> soma o impacto real por trade (A+ 1.5% / A 1% / B 0.5%).
           <br />
-          Tracker verifica preço a cada 5 min · stop trail por ATR após TP1 · snapshots expiram em 48h ·
+          Tracker checa a cada 5 min · trail v2 com K=2.2 ATR e buffer de 0.5×ATR pós-TP1 · snapshots expiram em 48h ·
           <span className="text-slate-400"> clique nos cards pra detalhar.</span>
         </div>
       </div>

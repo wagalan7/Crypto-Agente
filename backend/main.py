@@ -479,17 +479,31 @@ async def recommendations_batch(body: RecommendationBatchRequest):
 
 
 @app.get("/api/daily-pnl")
-async def daily_pnl(date_str: Optional[str] = Query(None, alias="date")):
-    """P&L do dia (default = hoje em UTC). Use ?date=YYYY-MM-DD pra outros dias."""
+async def daily_pnl(
+    date_str: Optional[str] = Query(None, alias="date"),
+    end_date_str: Optional[str] = Query(None, alias="end_date"),
+):
+    """P&L do dia (default = hoje em UTC).
+    - ?date=YYYY-MM-DD                    → um único dia
+    - ?date=YYYY-MM-DD&end_date=YYYY-MM-DD → range (inclusivo)
+    """
     from datetime import date as _date
-    target = None
+    start = None
+    end = None
     if date_str:
         try:
-            target = _date.fromisoformat(date_str)
+            start = _date.fromisoformat(date_str)
         except ValueError:
             raise HTTPException(400, "date deve estar em formato YYYY-MM-DD")
+    if end_date_str:
+        try:
+            end = _date.fromisoformat(end_date_str)
+        except ValueError:
+            raise HTTPException(400, "end_date deve estar em formato YYYY-MM-DD")
+        if start and end < start:
+            raise HTTPException(400, "end_date deve ser ≥ date")
     try:
-        return await get_daily_pnl(target)
+        return await get_daily_pnl(start, end)
     except Exception as e:
         logging.error(f"daily-pnl error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao obter P&L: {e}")
@@ -565,6 +579,116 @@ async def history_stats(days: int = 30):
     except Exception as e:
         logging.error(f"history-stats error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao obter stats: {e}")
+
+
+@app.get("/api/snapshots/open-viability")
+async def open_viability():
+    """Pra cada snapshot aberto, avalia se ainda vale entrar agora:
+       🟢 valid    — preço perto do entry, setup ainda intacto
+       🟡 wait     — preço já andou a favor, esperar pullback
+       🔴 missed   — preço passou demais ou perto do stop
+       🔵 tp1_done — já tocou TP1, posição com lock garantido (não entrar new)
+    """
+    try:
+        from db import DB_ENABLED, get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        from services.binance_service import fetch_ticker
+        from sqlalchemy import select
+        from datetime import datetime, timezone
+        if not DB_ENABLED:
+            return {"enabled": False, "items": []}
+        async with get_session() as session:
+            stmt = select(RecommendationSnapshot).where(RecommendationSnapshot.status == "open")
+            snaps = (await session.execute(stmt)).scalars().all()
+
+        items = []
+        now = datetime.now(timezone.utc)
+        # Cache de tickers pra evitar bater 2× no mesmo símbolo
+        ticker_cache: dict = {}
+
+        for snap in snaps:
+            try:
+                if snap.symbol not in ticker_cache:
+                    t = await fetch_ticker(snap.symbol)
+                    ticker_cache[snap.symbol] = t
+                ticker = ticker_cache[snap.symbol]
+                price = float(ticker.get("last") or ticker.get("close") or 0)
+                if price <= 0:
+                    continue
+
+                feats = snap.features or {}
+                atr_pct = feats.get("atr_pct")
+                atr_abs = (
+                    float(atr_pct) / 100.0 * float(snap.entry)
+                    if atr_pct and snap.entry else None
+                )
+
+                is_long = snap.direction == "long"
+                # Distância em ATR, SIGNED a favor da direção
+                # (long: positivo se preço subiu acima do entry; short: positivo se desceu)
+                if atr_abs and atr_abs > 0:
+                    delta = (price - snap.entry) if is_long else (snap.entry - price)
+                    distance_atr = round(delta / atr_abs, 2)
+                else:
+                    distance_atr = None
+
+                # Distância pra stop em % do range entry→stop
+                stop_range = abs(snap.entry - snap.stop_loss) or 1
+                stop_progress = (
+                    (snap.entry - price) / stop_range if is_long
+                    else (price - snap.entry) / stop_range
+                )  # 0 = no entry, 1 = no stop. Negativo = a favor.
+
+                age_h = (now - snap.created_at).total_seconds() / 3600.0
+
+                # Classificação
+                if snap.tp1_hit_at is not None:
+                    viability = "tp1_done"
+                    advice = "TP1 já tocou — lock garantido. Não entrar nova posição."
+                elif stop_progress >= 0.7:
+                    viability = "missed"
+                    advice = "Preço quase no stop — não entrar."
+                elif distance_atr is None:
+                    viability = "wait"
+                    advice = "Sem dado de ATR. Avaliar manualmente."
+                elif distance_atr >= 1.0:
+                    viability = "missed"
+                    advice = f"Preço já andou {distance_atr}×ATR a favor — perdeu o trem. Aguardar pullback."
+                elif distance_atr >= 0.5:
+                    viability = "wait"
+                    advice = f"Preço {distance_atr}×ATR adiantado. Aguardar pullback até entry ±0.3×ATR."
+                elif distance_atr <= -0.3:
+                    viability = "wait"
+                    advice = "Preço retraiu abaixo do entry — boa zona de entrada se setup ainda válido."
+                else:
+                    viability = "valid"
+                    advice = "Preço próximo ao entry — entrada ainda viável."
+
+                items.append({
+                    "id": snap.id,
+                    "symbol": snap.symbol,
+                    "timeframe": snap.timeframe,
+                    "direction": snap.direction,
+                    "tier": snap.tier,
+                    "entry": snap.entry,
+                    "stop_loss": snap.stop_loss,
+                    "tp1": snap.tp1,
+                    "tp2": snap.tp2,
+                    "current_price": price,
+                    "distance_atr": distance_atr,
+                    "stop_progress_pct": round(stop_progress * 100, 1),
+                    "age_hours": round(age_h, 1),
+                    "tp1_hit": snap.tp1_hit_at is not None,
+                    "viability": viability,
+                    "advice": advice,
+                    "created_at": snap.created_at.isoformat() if snap.created_at else None,
+                })
+            except Exception as ex:
+                logging.warning(f"[viability] erro em snap {snap.id} ({snap.symbol}): {ex}")
+        return {"enabled": True, "count": len(items), "items": items}
+    except Exception as e:
+        logging.error(f"open-viability error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro: {e}")
 
 
 @app.get("/api/debug/status-distribution")

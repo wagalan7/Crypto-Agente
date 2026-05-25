@@ -459,19 +459,24 @@ async def get_recently_stopped_symbols(hours: int = 6) -> set[str]:
         return set()
 
 
-async def get_daily_pnl(target_date: Optional[date] = None) -> Dict[str, Any]:
+async def get_daily_pnl(
+    target_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> Dict[str, Any]:
     """
-    Agrega P&L do dia especificado (ou hoje).
-    Considera snapshots cujo `outcome_at` cai no dia, ignorando expired/open.
+    Agrega P&L do dia especificado (ou hoje) — ou range [target_date, end_date].
+    Considera snapshots cujo `outcome_at` cai no intervalo.
     """
     if not DB_ENABLED:
         return {"enabled": False, "message": "Banco de dados não configurado."}
 
     if target_date is None:
         target_date = datetime.now(timezone.utc).date()
+    if end_date is None:
+        end_date = target_date
 
     day_start = datetime.combine(target_date, datetime.min.time(), tzinfo=timezone.utc)
-    day_end = day_start + timedelta(days=1)
+    day_end = datetime.combine(end_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
 
     async with get_session() as session:
         # Snapshots resolvidos NESTE dia (outcome_at). O dia do fechamento
@@ -538,6 +543,8 @@ async def get_daily_pnl(target_date: Optional[date] = None) -> Dict[str, Any]:
     return {
         "enabled": True,
         "date": target_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "is_range": target_date != end_date,
         "summary": {
             "total_trades": total,
             "wins": win_count,
