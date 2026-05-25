@@ -721,14 +721,17 @@ def dash_create_appointment(body: ManualAppointment, request: Request):
     appt_id = db.create_appointment(tenant["id"], body.patient_name, phone, scheduled)
 
     # Sincronizar com Google Calendar
+    gcal_synced = False
     try:
         event_id = gcal.create_event(tenant, body.patient_name, scheduled.isoformat(), tenant.get("session_minutes", 50))
         if event_id:
             db.set_appointment_google_event_id(appt_id, event_id)
-    except Exception:
-        pass
+            gcal_synced = True
+            logger.info(f"[gcal][{tenant['slug']}] Evento criado: {event_id}")
+    except Exception as e:
+        logger.warning(f"[gcal][{tenant['slug']}] Falha ao criar evento para {body.patient_name}: {e}")
 
-    return {"status": "created", "id": appt_id}
+    return {"status": "created", "id": appt_id, "gcal_synced": gcal_synced}
 
 
 @app.post("/dashboard/api/appointments/{appt_id}/confirm")
@@ -1743,6 +1746,24 @@ def google_disconnect(request: Request):
     tenant = _get_tenant_by_token(token)
     db.update_tenant(tenant["slug"], google_refresh_token="")
     return {"status": "disconnected"}
+
+
+@app.get("/dashboard/api/google/status")
+def google_status(request: Request):
+    """Testa se o Google Calendar está funcionando para este tenant."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    if not tenant.get("google_refresh_token"):
+        return {"connected": False, "reason": "Sem token de autorização — conecte o Google Calendar nas configurações."}
+    service = gcal._get_service(tenant)
+    if not service:
+        return {"connected": False, "reason": "Falha ao autenticar — token pode ter expirado ou sido revogado. Desconecte e reconecte."}
+    try:
+        cal_id = tenant.get("google_calendar_id") or "primary"
+        info = service.calendars().get(calendarId=cal_id).execute()
+        return {"connected": True, "calendar": info.get("summary", cal_id)}
+    except Exception as e:
+        return {"connected": False, "reason": str(e)}
 
 
 # ── Pagamento ──────────────────────────────────────────────────────────────────
