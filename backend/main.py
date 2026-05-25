@@ -567,6 +567,50 @@ async def history_stats(days: int = 30):
         raise HTTPException(500, f"Erro ao obter stats: {e}")
 
 
+@app.get("/api/debug/status-distribution")
+async def status_distribution(days: int = 30):
+    """Distribuição de status dos snapshots nos últimos N dias.
+    Usado pra diagnosticar se TP2 está sendo atingido ou se trail está
+    encerrando trades em won_tp1_be antes de chegar lá."""
+    try:
+        from db import DB_ENABLED, get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import select, func
+        if not DB_ENABLED:
+            return {"enabled": False}
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        async with get_session() as session:
+            stmt = (
+                select(RecommendationSnapshot.status, func.count())
+                .where(RecommendationSnapshot.created_at >= since)
+                .group_by(RecommendationSnapshot.status)
+            )
+            rows = (await session.execute(stmt)).all()
+            # Também: quantos chegaram a tocar TP1 (tp1_hit_at != null)
+            stmt2 = select(func.count()).where(
+                RecommendationSnapshot.created_at >= since,
+                RecommendationSnapshot.tp1_hit_at.isnot(None),
+            )
+            tp1_hits = (await session.execute(stmt2)).scalar() or 0
+        dist = {row[0]: row[1] for row in rows}
+        total = sum(dist.values())
+        return {
+            "enabled": True,
+            "days": days,
+            "total": total,
+            "distribution": dist,
+            "tp1_hits_total": tp1_hits,
+            "won_tp2_pct_of_tp1_hits": (
+                round(dist.get("won_tp2", 0) / tp1_hits * 100, 1)
+                if tp1_hits else None
+            ),
+        }
+    except Exception as e:
+        logging.error(f"status-distribution error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro: {e}")
+
+
 @app.get("/api/debug/vision-pipeline")
 async def debug_vision_pipeline():
     """Roda cada estágio do pipeline Vision e reporta onde quebra."""
