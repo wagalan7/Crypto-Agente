@@ -345,6 +345,7 @@ def build_trade_signal(
         vp_vwap=vp_vwap.model_dump() if vp_vwap else None,
         mtf=mtf.model_dump() if mtf else None,
         trade_plan=trade_plan.model_dump() if trade_plan else None,
+        current_price=current_price,
         timestamp=int(df["timestamp"].iloc[-1]),
         signal_strength=signal_strength_label(confidence),
     )

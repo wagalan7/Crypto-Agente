@@ -401,6 +401,29 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                     </div>
                   </div>
 
+                  {/* Entry zone + chase flag */}
+                  {(r.entry_zone_low != null && r.entry_zone_high != null && r.entry_zone_type && r.entry_zone_type !== 'market') && (
+                    <div className="mt-2 flex items-center gap-2 text-[10px] flex-wrap">
+                      <span className="px-2 py-0.5 rounded border border-sky-500/40 bg-sky-500/10 text-sky-300">
+                        🎯 zona limit: <span className="font-mono">{fmt(r.entry_zone_low)} – {fmt(r.entry_zone_high)}</span>
+                      </span>
+                      {r.chase_level === 'chasing' && (
+                        <span className="px-2 py-0.5 rounded border border-red-500/40 bg-red-500/10 text-red-300" title={r.warnings[0]}>
+                          🔴 já estendido {r.chase_atr}×ATR — aguarde pullback
+                        </span>
+                      )}
+                      {r.chase_level === 'extended' && (
+                        <span className="px-2 py-0.5 rounded border border-yellow-500/40 bg-yellow-500/10 text-yellow-300">
+                          🟡 {r.chase_atr}×ATR adiantado
+                        </span>
+                      )}
+                      {r.chase_level === 'ok' && (
+                        <span className="px-2 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300">
+                          🟢 entry ainda viável
+                        </span>
+                      )}
+                    </div>
+                  )}
                   {/* Levels resumido — agora com TP1 + TP2 */}
                   <div className="grid grid-cols-5 gap-2 mt-2 pt-2 border-t border-slate-800/60 text-[11px]">
                     <div>

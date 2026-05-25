@@ -56,6 +56,13 @@ class Recommendation(BaseModel):
     risk_pct: float = 1.0         # % da banca arriscado por trade
     margin_pct: float = 10.0      # % da banca a usar como margem
     stop_distance_pct: float = 0.0  # distância do entry até o stop em %
+    # ── Entry zone (sprint B do entry_planner) + flag de chase ────────────
+    entry_zone_low: Optional[float] = None    # piso da zona de pullback
+    entry_zone_high: Optional[float] = None   # teto da zona
+    entry_zone_type: Optional[str] = None     # "limit_pullback" | "limit_ob" | "market" | ...
+    current_price: Optional[float] = None     # preço de mercado no momento da varredura
+    chase_atr: Optional[float] = None         # múltiplos de ATR entre current_price e entry (signed a favor)
+    chase_level: Optional[str] = None         # "ok" | "extended" | "chasing"
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -405,6 +412,39 @@ def _apply_btc_correlation_throttle(
 
 def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Recommendation:
     lev = _compute_leverage(sig.entry, sig.stop_loss, tier)
+
+    # Entry zone (do TradePlan, se houver) — usuário usa pra colocar limit order
+    entry_zone_low = entry_zone_high = entry_zone_type = None
+    tp = sig.trade_plan if isinstance(sig.trade_plan, dict) else None
+    if tp and tp.get("entry_zone"):
+        ez = tp["entry_zone"]
+        entry_zone_low = ez.get("bottom")
+        entry_zone_high = ez.get("top")
+        entry_zone_type = ez.get("type")
+
+    # Flag de "chase": preço atual já passou a favor da direção, demais do entry?
+    # Mede em múltiplos de ATR (signed: positivo = a favor → mais chase).
+    chase_atr = None
+    chase_level = None
+    cp = sig.current_price
+    atr = sig.indicators.atr if sig.indicators else None
+    is_long = (sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction)) == "long"
+    if cp is not None and atr and atr > 0 and sig.entry:
+        delta = (cp - sig.entry) if is_long else (sig.entry - cp)
+        chase_atr = round(delta / atr, 2)
+        if chase_atr >= 0.8:
+            chase_level = "chasing"     # 🔴 já passou demais, espera pullback
+        elif chase_atr >= 0.4:
+            chase_level = "extended"    # 🟡 levemente estendido, ainda aceitável
+        else:
+            chase_level = "ok"          # 🟢 perto do entry ou abaixo
+
+    warnings = (tp or {}).get("quality_warnings", []) if tp else []
+    if chase_level == "chasing":
+        warnings = warnings + [
+            f"⚠ Preço {chase_atr}×ATR acima do entry — esperar pullback à zona ou pular."
+        ]
+
     return Recommendation(
         tier=tier,
         score=score,
@@ -417,12 +457,18 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Recommen
         stop_loss=sig.stop_loss,
         tp2=sig.tp2,
         summary=_build_summary(sig),
-        warnings=(sig.trade_plan or {}).get("quality_warnings", []) if sig.trade_plan else [],
+        warnings=warnings,
         signal=sig,
         leverage=lev["leverage"],
         risk_pct=lev["risk_pct"],
         margin_pct=lev["margin_pct"],
         stop_distance_pct=lev["stop_dist_pct"],
+        entry_zone_low=entry_zone_low,
+        entry_zone_high=entry_zone_high,
+        entry_zone_type=entry_zone_type,
+        current_price=cp,
+        chase_atr=chase_atr,
+        chase_level=chase_level,
     )
 
 

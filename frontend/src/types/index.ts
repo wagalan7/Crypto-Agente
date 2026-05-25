@@ -278,6 +278,13 @@ export interface Recommendation {
   risk_pct: number
   margin_pct: number
   stop_distance_pct: number
+  // Entry zone + chase flag (Sprint v2)
+  entry_zone_low?: number | null
+  entry_zone_high?: number | null
+  entry_zone_type?: string | null
+  current_price?: number | null
+  chase_atr?: number | null
+  chase_level?: 'ok' | 'extended' | 'chasing' | null
 }
 
 export interface WatchlistItem {

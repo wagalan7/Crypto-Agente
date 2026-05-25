@@ -122,5 +122,6 @@ class TradeSignal(BaseModel):
     vp_vwap: Optional[dict] = None            # VPVWAPAnalysis serializado
     mtf: Optional[dict] = None                # MTFAlignment serializado
     trade_plan: Optional[dict] = None         # TradePlan (Sprint B): zona de entrada, stop estrutural, alvos por liquidez + reasoning
+    current_price: Optional[float] = None     # preço de mercado no momento da varredura (≠ entry quando entry_zone é limit)
     timestamp: int
     signal_strength: str
