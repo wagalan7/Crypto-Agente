@@ -581,6 +581,85 @@ async def history_stats(days: int = 30):
         raise HTTPException(500, f"Erro ao obter stats: {e}")
 
 
+@app.get("/api/probabilities")
+async def probabilities(days: int = 90, min_sample: int = 8):
+    """Probabilidades empíricas P(TP1) e P(TP2) agregadas por bucket
+    (tier, timeframe, direction). Usa snapshots resolvidos dos últimos
+    N dias. min_sample = mínimo de trades pra considerar confiável.
+
+    Cada bucket retorna:
+      - n_total: trades resolvidos
+      - p_tp1: % que tocou TP1 (won_tp1 + won_tp1_be + won_tp2)
+      - p_tp2: % que atingiu TP2 cheio
+      - confidence: "high" (≥30), "medium" (≥min_sample), "low" (<min)
+    """
+    try:
+        from db import DB_ENABLED, get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import select
+        if not DB_ENABLED:
+            return {"enabled": False, "buckets": {}}
+        since = datetime.now(timezone.utc) - timedelta(days=max(7, min(days, 365)))
+        async with get_session() as session:
+            stmt = select(
+                RecommendationSnapshot.tier,
+                RecommendationSnapshot.timeframe,
+                RecommendationSnapshot.direction,
+                RecommendationSnapshot.status,
+                RecommendationSnapshot.tp1_hit_at,
+            ).where(RecommendationSnapshot.created_at >= since)
+            rows = (await session.execute(stmt)).all()
+
+        # bucket = (tier, timeframe, direction)
+        agg: Dict[tuple, Dict[str, int]] = {}
+        for tier, tf, direction, status, tp1_hit_at in rows:
+            if status == "open":
+                continue
+            key = (tier, tf, direction)
+            b = agg.setdefault(key, {"n_total": 0, "tp1_hits": 0, "tp2_hits": 0, "stops": 0, "expired": 0})
+            b["n_total"] += 1
+            if status == "won_tp2":
+                b["tp1_hits"] += 1
+                b["tp2_hits"] += 1
+            elif status in ("won_tp1", "won_tp1_be"):
+                b["tp1_hits"] += 1
+            elif status == "lost":
+                b["stops"] += 1
+            elif status == "expired":
+                # expired SEM TP1 → nada conta. expired COM TP1 → conta TP1.
+                if tp1_hit_at is not None:
+                    b["tp1_hits"] += 1
+                else:
+                    b["expired"] += 1
+
+        buckets = {}
+        for (tier, tf, direction), b in agg.items():
+            n = b["n_total"]
+            if n == 0:
+                continue
+            p_tp1 = b["tp1_hits"] / n * 100
+            p_tp2 = b["tp2_hits"] / n * 100
+            if n >= 30:
+                conf = "high"
+            elif n >= min_sample:
+                conf = "medium"
+            else:
+                conf = "low"
+            buckets[f"{tier}|{tf}|{direction}"] = {
+                "tier": tier, "timeframe": tf, "direction": direction,
+                "n_total": n,
+                "p_tp1_pct": round(p_tp1, 1),
+                "p_tp2_pct": round(p_tp2, 1),
+                "p_stop_pct": round(b["stops"] / n * 100, 1),
+                "confidence": conf,
+            }
+        return {"enabled": True, "days": days, "min_sample": min_sample, "buckets": buckets}
+    except Exception as e:
+        logging.error(f"probabilities error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro: {e}")
+
+
 @app.get("/api/snapshots/open-viability")
 async def open_viability():
     """Pra cada snapshot aberto, avalia se ainda vale entrar agora:

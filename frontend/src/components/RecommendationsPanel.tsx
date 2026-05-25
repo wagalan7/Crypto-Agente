@@ -91,6 +91,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
   const [filter, setFilter] = useState<RecommendationTier | 'all'>('all')
   const [progress, setProgress] = useState<string>('')
   const [historical, setHistorical] = useState<Record<string, HistoricalStat>>({})
+  const [probs, setProbs] = useState<Record<string, { p_tp1_pct: number; p_tp2_pct: number; n_total: number; confidence: string }>>({})
   const [newsStatus, setNewsStatus] = useState<{
     active: boolean
     event?: string
@@ -184,6 +185,15 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
           if (histRes.ok) setHistorical(await histRes.json())
         }
       } catch { /* ignora — badge histórico é opcional */ }
+
+      // Probabilidades empíricas por bucket (não bloqueia UI)
+      try {
+        const pRes = await fetch(`${BACKEND}/api/probabilities?days=90`)
+        if (pRes.ok) {
+          const pJson = await pRes.json()
+          if (pJson.enabled) setProbs(pJson.buckets ?? {})
+        }
+      } catch { /* opcional */ }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Erro ao carregar')
     } finally {
@@ -392,12 +402,25 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                       )}
                     </div>
 
-                    {/* Score + R:R + leverage */}
+                    {/* Score + R:R + leverage + probabilidades */}
                     <div className="flex-shrink-0 text-right">
                       <div className="text-sm font-bold text-white">{r.score.toFixed(0)}</div>
                       <div className="text-[10px] text-slate-500">score</div>
                       <div className="text-[10px] text-emerald-300 mt-1 font-mono">1:{r.risk_reward}</div>
                       <div className="text-[11px] text-orange-300 mt-0.5 font-mono font-bold">{r.leverage}x</div>
+                      {(() => {
+                        const p = probs[`${r.tier}|${r.timeframe}|${r.direction}`]
+                        if (!p || p.confidence === 'low') return null
+                        return (
+                          <div
+                            className="mt-1 text-[9px] leading-tight"
+                            title={`Baseado em ${p.n_total} trades históricos do mesmo bucket (tier/TF/direção). Confiança: ${p.confidence}.`}
+                          >
+                            <div className="text-emerald-400/80">TP1: <span className="font-mono font-bold">{p.p_tp1_pct.toFixed(0)}%</span></div>
+                            <div className="text-green-400/80">TP2: <span className="font-mono font-bold">{p.p_tp2_pct.toFixed(0)}%</span></div>
+                          </div>
+                        )
+                      })()}
                     </div>
                   </div>
 
