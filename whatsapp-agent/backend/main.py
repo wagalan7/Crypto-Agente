@@ -259,7 +259,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                      "assim que puder. Se for sobre agenda ou pagamento, pode me contar por texto que te ajudo. 🙏")
             db.save_message(tenant["id"], phone, "user", "[imagem enviada — não-comprovante]")
             # Avisar psicóloga
-            psy_phone = tenant.get("psychologist_phone", "")
+            psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
             if psy_phone:
                 try:
                     await wa.send_message(tenant, psy_phone,
@@ -277,7 +277,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                          "me machucar", "suicídio", "suicidio", "desistir de tudo",
                          "não quero mais", "nao quero mais", "crise", "emergência", "emergencia")
     if any(kw in text.lower() for kw in _URGENCY_KEYWORDS):
-        psy_phone = tenant.get("psychologist_phone", "")
+        psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
         if psy_phone:
             urgency_notif = (
                 f"🚨 *Mensagem urgente de paciente!*\n"
@@ -313,7 +313,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         # ── Notificar psicóloga quando novo paciente entrar em contato ───────────
         if resp.intent == "new_patient":
             patient_name = resp.data.get("patient_name", "") if resp.data else ""
-            psy_phone = tenant.get("psychologist_phone", "")
+            psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
             if psy_phone and is_first_message:
                 nome_display = patient_name if patient_name else "novo contato"
                 notif = (
@@ -957,6 +957,7 @@ def dash_patients(request: Request):
 def dash_pause(phone: str, request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(phone)  # garante dígitos-only antes de gravar
     db.pause_agent(tenant["id"], phone)
     return {"status": "paused", "phone": phone}
 
@@ -965,6 +966,7 @@ def dash_pause(phone: str, request: Request):
 def dash_resume(phone: str, request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(phone)  # garante dígitos-only antes de remover
     db.resume_agent(tenant["id"], phone)
     return {"status": "resumed", "phone": phone}
 

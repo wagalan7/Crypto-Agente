@@ -369,7 +369,13 @@ def save_message(tenant_id: int, phone: str, role: str, content: str):
         )
 
 
+def _norm_digits(phone: str) -> str:
+    """Remove tudo que não for dígito — garante consistência na tabela agent_paused."""
+    return "".join(c for c in (phone or "") if c.isdigit())
+
+
 def is_agent_paused(tenant_id: int, phone: str) -> bool:
+    phone = _norm_digits(phone)
     with get_conn() as conn:
         row = conn.execute(
             "SELECT 1 FROM agent_paused WHERE tenant_id = ? AND phone = ?",
@@ -379,6 +385,9 @@ def is_agent_paused(tenant_id: int, phone: str) -> bool:
 
 
 def pause_agent(tenant_id: int, phone: str):
+    phone = _norm_digits(phone)
+    if not phone:
+        return
     with get_conn() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO agent_paused (tenant_id, phone) VALUES (?, ?)",
@@ -387,6 +396,9 @@ def pause_agent(tenant_id: int, phone: str):
 
 
 def resume_agent(tenant_id: int, phone: str):
+    phone = _norm_digits(phone)
+    if not phone:
+        return
     with get_conn() as conn:
         conn.execute(
             "DELETE FROM agent_paused WHERE tenant_id = ? AND phone = ?",
