@@ -280,14 +280,9 @@ export default function DailyPnLPanel({ onClose }: Props) {
                       <span className="text-[10px] text-slate-400 px-1.5 py-0.5 rounded border border-slate-700">{opType}</span>
                       <span className="text-[10px] text-orange-300 font-mono">{t.leverage}x</span>
                       <span className="text-[10px] text-slate-500">tier {t.tier}</span>
-                      {t.score != null && (
-                        <span className="text-[10px] text-purple-300 font-mono" title="Score do recommendation engine">
-                          score {t.score.toFixed(0)}
-                        </span>
-                      )}
                       <span className="ml-auto font-mono text-sm font-bold text-right">
-                        <span className={r > 0 ? 'text-emerald-300' : r < 0 ? 'text-red-300' : 'text-slate-400'}>
-                          {r > 0 ? `+${r.toFixed(1)}R` : r < 0 ? `${r.toFixed(1)}R` : '–'}
+                        <span className={r > 0 ? 'text-emerald-300' : r < 0 ? 'text-red-300' : 'text-purple-300'}>
+                          {r > 0 ? `+${r.toFixed(1)}R` : r < 0 ? `${r.toFixed(1)}R` : (t.score != null ? `score ${t.score.toFixed(0)}` : '–')}
                         </span>
                         <span className="block text-[10px] text-slate-500 font-normal font-sans">
                           {t.status !== 'open' && fmtPct(pct)}
@@ -560,11 +555,6 @@ export default function DailyPnLPanel({ onClose }: Props) {
                       <span className="text-[9px] text-slate-400 px-1.5 py-0.5 rounded border border-slate-700">{opType}</span>
                       <span className="text-[10px] text-orange-300 font-mono">{t.leverage}x</span>
                       <span className="text-[10px] text-slate-500">tier {t.tier}</span>
-                      {t.score != null && (
-                        <span className="text-[10px] text-purple-300 font-mono" title="Score do recommendation engine">
-                          score {t.score.toFixed(0)}
-                        </span>
-                      )}
                     </div>
                     <div className="text-[10px] text-slate-500 font-mono mt-0.5">
                       entry {fmt(t.entry)} → stop {fmt(t.stop_loss)}
