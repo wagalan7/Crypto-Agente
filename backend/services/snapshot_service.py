@@ -42,22 +42,38 @@ TIME_STOP_HOURS_BY_TF = {
 def _time_stop_hours(tf: str) -> float:
     """Horas máximas sem tocar TP1 antes de encerrar por time-stop."""
     return float(TIME_STOP_HOURS_BY_TF.get(tf, EXPIRY_HOURS))
-# ── R esperado (Step 2b: parcial 50% no TP1) ─────────────────────────────
+# ── R esperado (Step 2b v2: parcial 50% no TP1 + BE+ assimétrico) ────────
 # Premissa: ao tocar TP1, fecha 50% da posição (+1R em metade), restante segue
-# com stop em entry e trail por ATR. O R reportado é a MÉDIA ponderada das
-# duas metades:
+# com stop EFETIVO em "BE+" (entry + 0.2R lock) e trail por ATR mais largo.
+# Mudança vs v1: trail era 1.5×ATR e piso em entry puro. Resultado: 55% dos
+# TP1-hits viravam won_tp1_be (+0.5R) em vez de won_tp2 (+1.5R). Diagnóstico
+# via /api/debug/status-distribution em 2026-05 mostrou 23 won_tp1_be vs 19
+# won_tp2 nos últimos 30 dias. Conclusão: trail apertado demais. Agora:
+#   • Trail mais largo (K=2.2) → dá respiro pra retração normal
+#   • Buffer mínimo (peak precisa avançar ≥0.5×ATR além do TP1 pra trail ativar)
+#   • Piso = BE+ lock (0.2R) → ainda garante lucro mínimo
+# R reportado é média ponderada das duas metades:
 #   • Parcial sai em TP1 (+1R) → metade = +0.5R
 #   • Final em TP2 (+2R)       → metade = +1.0R  → total +1.5R (won_tp2)
-#   • Final em entry/trail (0R) → metade = 0R    → total +0.5R (won_tp1_be)
-#   • Final expira após TP1     → conservador 0R → total +0.5R (won_tp1)
+#   • Final em BE+ lock        → metade = +0.2R  → total +0.6R (won_tp1_be)
+#   • Final expira após TP1    → conservador     → total +0.6R (won_tp1)
 # Stop original (antes de TP1) = -1R cheio (não houve parcial).
-REALIZED_R_TP1 = 0.5           # 50% TP1 + 50% breakeven (conservador no expiry após TP1)
+REALIZED_R_TP1 = 0.6           # 50% TP1 (+1R) + 50% BE+lock (+0.2R) = +0.6R
 REALIZED_R_TP2 = 1.5           # 50% TP1 + 50% TP2
 REALIZED_R_STOP = -1.0         # stop original (antes de TP1)
-REALIZED_R_BREAKEVEN = 0.5     # 50% TP1 + 50% entry (stop em BE bate ou trail aciona)
+REALIZED_R_BREAKEVEN = 0.6     # 50% TP1 (+1R) + 50% BE+lock (+0.2R) = +0.6R
 
-# Trail por ATR após TP1 hit. Stop trail = peak ± K × ATR, com piso em entry.
-ATR_TRAIL_K = 1.5
+# Trail por ATR após TP1 hit (v2 — mais largo).
+ATR_TRAIL_K = 2.2
+
+# BE+ lock: parcela do range (tp1-entry) que vira piso do stop após TP1.
+# 0.2 = 20% do caminho do entry até o TP1, garantindo +0.2R no pior caso.
+BE_PLUS_LOCK_R = 0.2
+
+# Buffer antes do trail por ATR ativar: peak precisa avançar ≥ esse múltiplo
+# do ATR ALÉM do TP1 antes do trail dinâmico começar a apertar. Evita o
+# whipsaw imediato pós-TP1 (vela seguinte retrai e mata posição).
+TRAIL_ACTIVATION_BUFFER_ATR = 0.5
 
 
 def _extract_features(rec: Dict[str, Any], created_at: datetime) -> Dict[str, Any]:
@@ -184,15 +200,16 @@ def _atr_abs(snap: RecommendationSnapshot) -> Optional[float]:
 
 def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Optional[tuple]:
     """
-    Steps 2a+2b: processa candles em ordem cronológica.
+    Steps 2a+2b v2: processa candles em ordem cronológica.
 
-    Lógica:
-      • Se TP1 toca → fecha 50% (+1R parcial), stop sobe pra entry, restante
-        passa a trailar pelo ATR (peak ± K×ATR, piso em entry).
-      • Se TP2 toca a qualquer momento → fecha como won_tp2 (+1.5R total,
-        incluindo o parcial).
+    Lógica (v2 — BE+ assimétrico + buffer):
+      • Se TP1 toca → fecha 50% (+1R parcial). Stop EFETIVO da metade restante
+        vira BE+ lock (entry + 0.2×(tp1-entry)) = piso garantindo +0.2R.
+      • Trail por ATR (K=2.2) só "aperta" o stop acima do BE+ se o peak
+        avançou ≥0.5×ATR além do TP1 (buffer de ativação).
+      • Se TP2 toca a qualquer momento → fecha como won_tp2 (+1.5R total).
       • Se stop ORIGINAL bate antes de TP1 → lost (-1R, posição cheia).
-      • Se stop EFETIVO (entry ou trail) bate APÓS TP1 → won_tp1_be (+0.5R).
+      • Se stop EFETIVO (BE+/trail) bate APÓS TP1 → won_tp1_be (+0.6R).
 
     Retorna uma das opções:
       ("won_tp2", price, +1.5, tp1_just_hit_bool, new_peak)   → lucro máximo
@@ -229,21 +246,35 @@ def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Option
             else:
                 peak = max(peak, cand_peak) if is_long else min(peak, cand_peak)
 
-        # Stop efetivo:
+        # Stop efetivo (v2 — BE+ assimétrico + trail com buffer de ativação):
         #   • Antes de TP1: stop original
-        #   • Após TP1 sem ATR: stop = entry (BE puro)
-        #   • Após TP1 com ATR: max(entry, peak - K×ATR) pra long;
-        #                       min(entry, peak + K×ATR) pra short
+        #   • Após TP1: PISO = BE+ lock (entry + 0.2 × (tp1-entry)) — garante
+        #     mínimo +0.2R no pior caso. Trail dinâmico só "aperta" o stop
+        #     ACIMA do BE+ se peak avançou ≥0.5×ATR além do TP1 (buffer).
         if tp1_already or tp1_hit_now:
-            if atr is not None and peak is not None:
-                if is_long:
-                    trail = peak - ATR_TRAIL_K * atr
-                    effective_stop = max(snap.entry, trail)
-                else:
-                    trail = peak + ATR_TRAIL_K * atr
-                    effective_stop = min(snap.entry, trail)
+            if snap.tp1 is not None:
+                tp1_distance = snap.tp1 - snap.entry  # signed
+                be_plus = snap.entry + BE_PLUS_LOCK_R * tp1_distance
             else:
-                effective_stop = snap.entry
+                be_plus = snap.entry
+            if atr is not None and peak is not None:
+                # Trail só ativa depois do peak avançar além do buffer
+                if is_long:
+                    activation_threshold = (snap.tp1 or snap.entry) + TRAIL_ACTIVATION_BUFFER_ATR * atr
+                    if peak >= activation_threshold:
+                        trail = peak - ATR_TRAIL_K * atr
+                        effective_stop = max(be_plus, trail)
+                    else:
+                        effective_stop = be_plus
+                else:
+                    activation_threshold = (snap.tp1 or snap.entry) - TRAIL_ACTIVATION_BUFFER_ATR * atr
+                    if peak <= activation_threshold:
+                        trail = peak + ATR_TRAIL_K * atr
+                        effective_stop = min(be_plus, trail)
+                    else:
+                        effective_stop = be_plus
+            else:
+                effective_stop = be_plus
         else:
             effective_stop = snap.stop_loss
 
