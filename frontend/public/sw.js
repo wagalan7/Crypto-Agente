@@ -7,7 +7,7 @@
  * vê a UI desatualizada). O activate handler limpa TODOS os caches antigos.
  */
 
-const CACHE_VERSION = 'crypto-ai-v2';
+const CACHE_VERSION = 'crypto-ai-v3';
 
 self.addEventListener('install', (event) => {
   self.skipWaiting();

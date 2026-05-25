@@ -56,8 +56,8 @@ interface ViabilityItem {
 
 const VIABILITY_BADGE: Record<string, { label: string; cls: string }> = {
   valid:    { label: '🟢 viável',    cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' },
-  wait:     { label: '🟡 aguardar',  cls: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/40' },
-  missed:   { label: '🔴 perdeu',    cls: 'bg-red-500/15 text-red-300 border-red-500/40' },
+  wait:     { label: '🟡 aguarde pullback', cls: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/40' },
+  missed:   { label: '🔴 perdeu o trem',    cls: 'bg-red-500/15 text-red-300 border-red-500/40' },
   tp1_done: { label: '🔵 TP1 hit',   cls: 'bg-sky-500/15 text-sky-300 border-sky-500/40' },
 }
 
@@ -331,7 +331,11 @@ export default function DailyPnLPanel({ onClose }: Props) {
                             </span>
                           </span>
                         )}
-                        <span className="text-slate-500">stop: <span className="text-slate-300">{viab.stop_progress_pct.toFixed(0)}%</span></span>
+                        {viab.stop_progress_pct >= 0 ? (
+                          <span className="text-slate-500">rumo ao stop: <span className="text-slate-300">{viab.stop_progress_pct.toFixed(0)}%</span></span>
+                        ) : (
+                          <span className="text-emerald-400">stop longe ✓</span>
+                        )}
                         <span className="text-slate-500">há <span className="text-slate-300">{viab.age_hours.toFixed(1)}h</span></span>
                       </div>
                     )}
