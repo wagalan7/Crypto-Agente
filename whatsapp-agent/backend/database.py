@@ -685,7 +685,9 @@ def get_appointments_today_unconfirmed(tenant_id: int) -> list[dict]:
 def is_slot_taken(tenant_id: int, dt: datetime) -> bool:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id FROM appointments WHERE tenant_id = ? AND scheduled_at = ?",
+            """SELECT id FROM appointments
+               WHERE tenant_id = ? AND scheduled_at = ?
+                 AND cancelled = 0 AND scheduled_at < '2099-01-01'""",
             (tenant_id, dt.isoformat()),
         ).fetchone()
     return row is not None
@@ -794,11 +796,14 @@ def get_session_counts_by_month(tenant_id: int, month_start: str, month_end: str
 
 
 def get_full_patient_history(tenant_id: int, phone: str) -> list[dict]:
-    """Histórico completo de um paciente (todas as consultas, ordem decrescente)."""
+    """Histórico completo de um paciente (todas as consultas, ordem decrescente).
+    Exclui placeholders de "novo paciente aguardando agendamento" (ano 2099).
+    """
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM appointments
                WHERE tenant_id = ? AND phone = ?
+                 AND scheduled_at < '2099-01-01'
                ORDER BY scheduled_at DESC""",
             (tenant_id, phone),
         ).fetchall()

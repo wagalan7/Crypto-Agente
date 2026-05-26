@@ -739,7 +739,17 @@ def dash_create_appointment(body: ManualAppointment, request: Request):
     if db.has_conflict(tenant["id"], scheduled, duration):
         raise HTTPException(status_code=409, detail="Este horário conflita com outra consulta (sobreposição de sessão).")
 
-    phone = body.phone.strip().replace(" ", "").replace("-", "")
+    phone = _norm_phone(body.phone)
+    # Remove placeholder 2099 ("novo paciente aguardando agendamento") deste número
+    # — agora que há sessão real, o placeholder não faz mais sentido.
+    try:
+        with db.get_conn() as conn:
+            conn.execute(
+                "DELETE FROM appointments WHERE tenant_id = ? AND phone = ? AND scheduled_at >= '2099-01-01'",
+                (tenant["id"], phone),
+            )
+    except Exception as e:
+        logger.warning(f"[{tenant['slug']}] Falha ao limpar placeholder de {phone}: {e}")
     appt_id = db.create_appointment(tenant["id"], body.patient_name, phone, scheduled)
 
     # Sincronizar com Google Calendar
@@ -875,13 +885,13 @@ def dash_cancel(appt_id: int, request: Request):
         if tenant.get("google_refresh_token"):
             try:
                 gcal.delete_event(tenant, appt["google_event_id"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[gcal][{tenant['slug']}] Falha ao deletar evento {appt['google_event_id']}: {e}")
         else:
             try:
                 caldav_svc.delete_event(tenant, appt["google_event_id"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[caldav][{tenant['slug']}] Falha ao deletar evento {appt['google_event_id']}: {e}")
     with db.get_conn() as conn:
         conn.execute("DELETE FROM appointments WHERE id = ? AND tenant_id = ?", (appt_id, tenant["id"]))
     return {"status": "cancelled"}
@@ -1011,7 +1021,6 @@ def _norm_phone(phone: str) -> str:
 
 
 # ── Detecção de SPAM / propaganda ──────────────────────────────────────────────
-import re as _re
 
 _SPAM_DOMAINS = (
     "tiktok.com", "vm.tiktok", "gol-de-premios", "goldepremios",
