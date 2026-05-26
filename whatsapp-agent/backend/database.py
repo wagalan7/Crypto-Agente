@@ -456,10 +456,13 @@ def get_appointments_by_phone(tenant_id: int, phone: str, now_iso: str | None = 
         except Exception:
             now_dt = datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None)
     threshold = (now_dt - timedelta(minutes=90)).isoformat()
+    # Excluir placeholders de "novo paciente aguardando agendamento" (ano 2099)
+    # para que o agente não os mostre como consultas reais ao paciente.
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM appointments
                WHERE tenant_id = ? AND phone = ? AND scheduled_at >= ?
+                 AND scheduled_at < '2099-01-01'
                ORDER BY scheduled_at""",
             (tenant_id, phone, threshold),
         ).fetchall()
