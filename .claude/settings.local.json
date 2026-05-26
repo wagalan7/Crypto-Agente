@@ -196,7 +196,18 @@
       "Bash(python3 /tmp/md2pdf.py)",
       "Bash(python3 -m py_compile backend/database.py backend/main.py)",
       "Bash(python3 -m py_compile backend/database.py backend/main.py backend/scheduler.py)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('email_service.py'\\).read\\(\\)\\); print\\('email_service.py OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('email_service.py'\\).read\\(\\)\\); print\\('email_service.py OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('whatsapp-agent/backend/main.py'\\).read\\(\\)\\); ast.parse\\(open\\('whatsapp-agent/backend/database.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "WebFetch(domain:www.agenteconsultorio.com.br)",
+      "Bash(curl -s -X PATCH https://www.agenteconsultorio.com.br/admin/tenants/bruna-parolin -H 'Content-Type: application/json' -H 'X-Master-Token: e_jYpCNXdOFYuC181FdO6evmzaDya2lMLYQu71teK1E' -d '{\"email\": \"bruna.parolin@icloud.com\"}')",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('whatsapp-agent/backend/main.py'\\).read\\(\\)\\); ast.parse\\(open\\('whatsapp-agent/backend/whatsapp_service.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(cp \"/Users/alanmalta/Agente atendimento/.claude/worktrees/nifty-black-9b0c2c/whatsapp-agent/backend/database.py\" \"/Users/alanmalta/Agente atendimento/whatsapp-agent/backend/database.py\")",
+      "Bash(cp \"/Users/alanmalta/Agente atendimento/.claude/worktrees/nifty-black-9b0c2c/whatsapp-agent/backend/main.py\" \"/Users/alanmalta/Agente atendimento/whatsapp-agent/backend/main.py\")",
+      "Bash(python3 -c \"import reportlab; import markdown; print\\(reportlab.__version__, markdown.__version__\\)\")",
+      "Bash(python3 -c \"import bs4\")",
+      "Bash(python3 md_to_pdf.py)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('backend/agent.py'\\).read\\(\\)\\); ast.parse\\(open\\('backend/main.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['backend/database.py','backend/whatsapp_service.py','backend/main.py']]; print\\('OK'\\)\")"
     ]
   }
 }

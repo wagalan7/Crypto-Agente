@@ -694,10 +694,18 @@ def is_slot_taken(tenant_id: int, dt: datetime) -> bool:
 def has_conflict(tenant_id: int, dt: datetime, duration_min: int, exclude_id: int | None = None) -> bool:
     """Detecta sobreposição real: True se `dt` cair dentro de [b - duration, b + duration]
     de qualquer consulta existente (exceto a própria, via exclude_id).
+
+    Ignora:
+    - Consultas canceladas (cancelled = 1)
+    - Placeholders de "novo paciente" (ano >= 2099)
     """
     from datetime import datetime as _dt
     with get_conn() as conn:
-        query = "SELECT id, scheduled_at FROM appointments WHERE tenant_id = ?"
+        query = (
+            "SELECT id, scheduled_at FROM appointments "
+            "WHERE tenant_id = ? AND cancelled = 0 "
+            "AND scheduled_at < '2099-01-01'"
+        )
         params = [tenant_id]
         if exclude_id is not None:
             query += " AND id != ?"

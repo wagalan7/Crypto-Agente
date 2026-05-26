@@ -255,12 +255,13 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         logger.info(f"[{tenant['slug']}][{phone}] Spam detectado — agente pausado para esse número")
         return
 
-    # ── Documento (PDF/Word) → quase sempre é comprovante; resposta padrão ──────
-    if text == "__DOCUMENTO__":
-        logger.info(f"[{tenant['slug']}][{phone}] Documento recebido — tratando como comprovante")
+    # ── Documento (PDF/Word) ou Comprovante PIX nativo → resposta padrão ────────
+    if text in ("__DOCUMENTO__", "__COMPROVANTE_PIX__"):
+        kind_label = "Comprovante PIX" if text == "__COMPROVANTE_PIX__" else "Documento"
+        logger.info(f"[{tenant['slug']}][{phone}] {kind_label} recebido — tratando como comprovante")
         reply = "Obrigada pelo pagamento! 😊 Recebi o comprovante. Em breve enviarei a nota fiscal. Até a sessão!"
         await wa.send_message(tenant, phone, reply)
-        db.save_message(tenant["id"], phone, "user", "[documento enviado]")
+        db.save_message(tenant["id"], phone, "user", f"[{kind_label.lower()} enviado]")
         db.save_message(tenant["id"], phone, "assistant", reply)
         return
 

@@ -197,14 +197,35 @@ def extract_message_zapi(payload: dict) -> tuple[str, str] | None:
         _t = (payload.get("type") or "").lower()
         if _t and _t not in ("receivedcallback",) and "received" not in _t:
             # Permite passar tipos de mídia mesmo sem "Received" no nome
-            if _t not in _MEDIA_TYPES:
+            if _t not in _MEDIA_TYPES and "pix" not in _t and "payment" not in _t:
                 return None
         phone = payload.get("phone", "").replace("+", "").replace("-", "")
         if not phone:
             return None
 
+        # Comprovante PIX nativo do WhatsApp (Z-API pode entregar como tipo
+        # específico "pix", "paymentMessage", "pixMessage", etc., ou com payload
+        # que contém um objeto pix/payment).
+        if (
+            "pix" in _t or "payment" in _t
+            or payload.get("pix") or payload.get("payment")
+            or payload.get("pixMessage") or payload.get("paymentMessage")
+        ):
+            logger.info(f"[ZAPI] Comprovante PIX nativo detectado de {phone} (type={_t})")
+            return phone, "__COMPROVANTE_PIX__"
+
         # Texto direto
         text = (payload.get("text") or {}).get("message", "")
+
+        # Heurística: às vezes o comprovante chega como texto contendo dados da transação
+        if text:
+            _low = text.lower()
+            _markers = ("chave pix", "id da transação", "id da transacao",
+                        "autenticação", "autenticacao", "comprovante de",
+                        "transferência realizada", "transferencia realizada")
+            if sum(1 for m in _markers if m in _low) >= 2:
+                logger.info(f"[ZAPI] Comprovante detectado por texto de {phone}")
+                return phone, "__COMPROVANTE_PIX__"
 
         # Imagem → captura URL para análise por visão computacional
         if not text:
