@@ -234,6 +234,27 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         logger.info(f"[{tenant['slug']}][{phone}] Agente pausado — mensagem ignorada")
         return
 
+    # ── Filtro anti-spam (propagandas, links promocionais) ──────────────────────
+    if _is_spam(text):
+        history = db.get_conversation_history(tenant["id"], phone, limit=2)
+        if not history:
+            # Primeiro contato spam → responde uma única vez, educadamente
+            reply = ("Olá! Aqui é o consultório. Qualquer dúvida sobre sua consulta "
+                     "estou à disposição. 🙏")
+            try:
+                await wa.send_message(tenant, phone, reply)
+            except Exception as e:
+                logger.warning(f"[{tenant['slug']}][{phone}] Falha ao responder spam: {e}")
+            db.save_message(tenant["id"], phone, "user", "[spam/propaganda]")
+            db.save_message(tenant["id"], phone, "assistant", reply)
+        # Pausa o agente para esse número — nunca mais responde automaticamente
+        try:
+            db.pause_agent(tenant["id"], phone)
+        except Exception:
+            pass
+        logger.info(f"[{tenant['slug']}][{phone}] Spam detectado — agente pausado para esse número")
+        return
+
     # ── Documento (PDF/Word) → quase sempre é comprovante; resposta padrão ──────
     if text == "__DOCUMENTO__":
         logger.info(f"[{tenant['slug']}][{phone}] Documento recebido — tratando como comprovante")
@@ -986,6 +1007,40 @@ def dash_paused(request: Request):
 def _norm_phone(phone: str) -> str:
     """Normaliza número removendo tudo que não é dígito."""
     return "".join(c for c in phone if c.isdigit())
+
+
+# ── Detecção de SPAM / propaganda ──────────────────────────────────────────────
+import re as _re
+
+_SPAM_DOMAINS = (
+    "tiktok.com", "vm.tiktok", "gol-de-premios", "goldepremios",
+    "bit.ly", "tinyurl.com", "encurtador", "shopee.com.br", "amzn.to",
+    "mlb.com.br", "mercadolivre", "instagram.com/reel",
+    "youtube.com/shorts", "youtu.be",
+)
+_SPAM_KEYWORDS = (
+    "ganhe prêmio", "ganhe premio", "clique no link", "click no link",
+    "promoção imperdível", "promocao imperdivel", "oferta relâmpago",
+    "oferta relampago", "renda extra", "trabalhe em casa", "ganhe dinheiro",
+    "loteria", "sorteio", "prêmio acumulado", "premio acumulado",
+    "cashback grátis", "cashback gratis", "fature r$", "ganhe r$",
+    "🎁🎁", "💰💰", "👉👉",
+)
+
+
+def _is_spam(text: str) -> bool:
+    """Detecta mensagens promocionais / spam (links de TikTok, gol-de-premios etc.)."""
+    if not text or len(text) < 5:
+        return False
+    t = text.lower()
+    if any(d in t for d in _SPAM_DOMAINS):
+        return True
+    if any(k in t for k in _SPAM_KEYWORDS):
+        return True
+    # Heurística: mensagem muito longa (>400 chars) cheia de emojis e link http
+    if len(text) > 400 and "http" in t and text.count("\n") < 3:
+        return True
+    return False
 
 
 @app.get("/controle/{token}", response_class=HTMLResponse)

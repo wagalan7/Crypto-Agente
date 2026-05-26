@@ -283,7 +283,14 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"No JSON in response: {text[:200]}")
 
 
+_DIAS_PT = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
+            "sexta-feira", "sábado", "domingo"]
+_MESES_PT = ["janeiro", "fevereiro", "março", "abril", "maio", "junho",
+             "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+
+
 def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
+    from datetime import timedelta
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo("America/Sao_Paulo")
     tenant_id = tenant["id"]
@@ -336,7 +343,15 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
         for i, s in enumerate(cal.format_slots(offered_slots), 1):
             lines.append(f"  {i}. {s}")
 
-    lines.append(f"DATA/HORA ATUAL: {datetime.now(_TZ).strftime('%A, %d/%m/%Y %H:%M')}")
+    now = datetime.now(_TZ)
+    amanha = now + timedelta(days=1)
+    hoje_str = f"{_DIAS_PT[now.weekday()]}, {now.day} de {_MESES_PT[now.month-1]} de {now.year}"
+    amanha_str = f"{_DIAS_PT[amanha.weekday()]}, {amanha.strftime('%d/%m')}"
+    lines.append(
+        f"DATA/HORA ATUAL: {hoje_str} — {now.strftime('%H:%M')} "
+        f"(HOJE é {_DIAS_PT[now.weekday()]}; AMANHÃ é {amanha_str}). "
+        "Sempre use ESTA referência ao falar de dias da semana — NUNCA invente."
+    )
     return "\n".join(lines)
 
 
