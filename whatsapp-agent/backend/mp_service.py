@@ -100,18 +100,35 @@ def handle_webhook(data: dict) -> dict:
 
     logger.info(f"[mp] Assinatura {sub_id}: status={status} ref={external_ref}")
 
-    # Buscar tenant pelo setup_token (external_reference) ou mp_subscription_id
-    tenant = None
-    if external_ref:
-        tenant = db.get_tenant_by_setup_token(external_ref)
-    if not tenant:
-        tenant = _get_tenant_by_mp_sub(sub_id)
+    # Buscar tenant: primeiro por mp_subscription_id (binding já estabelecido);
+    # senão por setup_token (external_reference) — mas SÓ se o tenant não tiver
+    # outra mp_subscription_id divergente (impede spoofing de external_reference
+    # apontando para o tenant de outra pessoa).
+    tenant = _get_tenant_by_mp_sub(sub_id)
+    if not tenant and external_ref:
+        cand = db.get_tenant_by_setup_token(external_ref)
+        if cand:
+            existing_sub = (cand.get("mp_subscription_id") or "").strip()
+            if existing_sub and existing_sub != sub_id:
+                logger.warning(
+                    f"[mp] Webhook ignorado: external_reference={external_ref} aponta para tenant "
+                    f"{cand['slug']} que já tem outra assinatura ({existing_sub}), não {sub_id}"
+                )
+                return {"received": True}
+            tenant = cand
 
     if not tenant:
         logger.warning(f"[mp] Tenant não encontrado para sub={sub_id}")
         return {"received": True}
 
+    # Idempotência: evita reativar e reenviar e-mail várias vezes para o mesmo evento.
+    current_status = (tenant.get("status") or "").lower()
+    already_bound = (tenant.get("mp_subscription_id") or "") == sub_id
+
     if status == "authorized":
+        if already_bound and current_status == "active":
+            logger.info(f"[mp] Tenant {tenant['slug']} já ativo com {sub_id} — webhook ignorado (idempotência)")
+            return {"received": True}
         db.update_tenant(tenant["slug"], status="active", mp_subscription_id=sub_id)
         logger.info(f"[mp] Tenant {tenant['slug']} ativado via MP")
         _send_activation_email(tenant)

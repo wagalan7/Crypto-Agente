@@ -341,28 +341,39 @@ async def _handle_message(tenant: dict, phone: str, text: str):
 
         # ── Notificar psicóloga quando novo paciente entrar em contato ───────────
         if resp.intent == "new_patient":
-            patient_name = resp.data.get("patient_name", "") if resp.data else ""
+            raw_name = resp.data.get("patient_name", "") if resp.data else ""
+            # Sanitização: remove caracteres de controle, recorta para 100 chars.
+            patient_name = "".join(ch for ch in (raw_name or "") if ch.isprintable()).strip()[:100]
             psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
-            if psy_phone and is_first_message:
+            phone_norm = _norm_phone(phone)
+
+            # Decide se notifica: primeira mensagem OU primeira vez que aprendemos o nome
+            # (paciente pode revelar o nome só depois de algumas trocas).
+            existing = db.get_appointments_by_phone(tenant["id"], phone_norm)
+            placeholder_exists = any(
+                (a.get("scheduled_at") or "").startswith("2099-") for a in (existing or [])
+            )
+            name_just_learned = bool(patient_name) and not placeholder_exists
+            should_notify = psy_phone and (is_first_message or name_just_learned)
+
+            if should_notify:
                 nome_display = patient_name if patient_name else "novo contato"
                 notif = (
                     f"🔔 *Novo paciente!*\n"
                     f"*{nome_display}* entrou em contato pelo WhatsApp.\n"
-                    f"Número: {phone}\n\n"
+                    f"Número: {phone_norm}\n\n"
                     f"Ele(a) está aguardando seu retorno para conhecer o processo. 😊"
                 )
                 await wa.send_message(tenant, psy_phone, notif)
                 logger.info(f"[{tenant['slug']}] Notificação enviada para psicóloga ({psy_phone})")
 
             # ── Auto-registrar novo paciente na agenda (placeholder) ──────────
-            if patient_name:
-                already = db.get_appointments_by_phone(tenant["id"], phone)
-                if not already:
-                    from datetime import datetime as _dt
-                    placeholder = _dt(2099, 1, 1, 9, 0)
-                    db.create_appointment(tenant["id"], patient_name, phone,
-                                          placeholder, "Novo paciente — aguardando agendamento")
-                    logger.info(f"[{tenant['slug']}] Auto-registrado: {patient_name} ({phone})")
+            if patient_name and not existing:
+                from datetime import datetime as _dt
+                placeholder = _dt(2099, 1, 1, 9, 0)
+                db.create_appointment(tenant["id"], patient_name, phone_norm,
+                                      placeholder, "Novo paciente — aguardando agendamento")
+                logger.info(f"[{tenant['slug']}] Auto-registrado: {patient_name} ({phone_norm})")
 
             # Publicar evento no dashboard mesmo sem nome ainda
             await events.publish(tenant["id"], "new_patient", {
@@ -595,6 +606,13 @@ def update_tenant(slug: str, body: TenantUpdate):
     fields = body.model_dump(exclude_none=True)
     if not fields:
         raise HTTPException(status_code=400, detail="Nenhum campo para atualizar.")
+    # Segurança: CalDAV trafega credenciais via Basic Auth — exigir HTTPS.
+    cu = (fields.get("caldav_url") or "").strip()
+    if cu and not cu.lower().startswith("https://"):
+        raise HTTPException(
+            status_code=400,
+            detail="caldav_url deve usar HTTPS (credenciais não podem trafegar em texto puro).",
+        )
     db.update_tenant(slug, **fields)
     return db.get_tenant(slug)
 
@@ -1283,6 +1301,13 @@ async def dash_config(request: Request, body: TenantUpdate):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
     fields = body.model_dump(exclude_none=True)
+    # Segurança: CalDAV trafega credenciais via Basic Auth — exigir HTTPS.
+    cu = (fields.get("caldav_url") or "").strip()
+    if cu and not cu.lower().startswith("https://"):
+        raise HTTPException(
+            status_code=400,
+            detail="A URL do CalDAV precisa começar com https:// (suas credenciais não podem trafegar em texto puro).",
+        )
     saving_zapi = fields.get("evolution_instance") and fields.get("evolution_key")
     # Auto-set provider to zapi when Z-API credentials are provided
     if saving_zapi:
@@ -1915,18 +1940,18 @@ async def checkout_mercadopago(request: Request):
 async def webhook_mercadopago(request: Request):
     # Validação opcional: se MP_WEBHOOK_SECRET estiver configurado, exige x-signature válida
     secret = _os.getenv("MP_WEBHOOK_SECRET", "")
-    if secret:
-        x_sig = request.headers.get("x-signature", "")
-        x_req = request.headers.get("x-request-id", "")
-        raw   = await request.body()
-        if not _verify_mp_signature(secret, x_sig, x_req, raw, request.query_params.get("data.id", "")):
-            logger.warning(f"[mp] Webhook REJEITADO — assinatura inválida")
-            raise HTTPException(status_code=403, detail="Assinatura inválida.")
-        import json as _json
-        data = _json.loads(raw.decode("utf-8") or "{}")
-    else:
-        data = await request.json()
-        logger.info("[mp] MP_WEBHOOK_SECRET não configurado — webhook aceito sem validação (NÃO recomendado em produção)")
+    if not secret:
+        # Falha fechada: sem secret, qualquer um poderia ativar/suspender tenants.
+        logger.error("[mp] Webhook REJEITADO — MP_WEBHOOK_SECRET não configurado")
+        raise HTTPException(status_code=503, detail="Webhook não configurado.")
+    x_sig = request.headers.get("x-signature", "")
+    x_req = request.headers.get("x-request-id", "")
+    raw   = await request.body()
+    if not _verify_mp_signature(secret, x_sig, x_req, raw, request.query_params.get("data.id", "")):
+        logger.warning(f"[mp] Webhook REJEITADO — assinatura inválida")
+        raise HTTPException(status_code=403, detail="Assinatura inválida.")
+    import json as _json
+    data = _json.loads(raw.decode("utf-8") or "{}")
     result = mp_svc.handle_webhook(data)
     return result
 
