@@ -577,14 +577,30 @@ def _execute_action(tenant: dict, resp: AgentResponse,
 
     if action == Action.confirm:
         appt_id = data.get("appointment_id")
-        # Fallback: se o LLM não devolveu appointment_id, pega a próxima consulta do paciente.
+        # Fallback: se o LLM não devolveu appointment_id, pega a próxima consulta
+        # do paciente — MAS só se for a ÚNICA futura. Se houver 2+ consultas
+        # futuras, é ambíguo qual confirmar — peça desambiguação ao paciente
+        # em vez de confirmar a errada.
         if not appt_id:
             try:
-                nxt = cal.get_next_appointment(tenant_id, phone)
-                if nxt:
-                    appt_id = nxt.get("id")
+                futuras = db.get_appointments_by_phone(tenant_id, phone)
+                if len(futuras) == 1:
+                    appt_id = futuras[0].get("id")
+                elif len(futuras) > 1:
+                    logger.warning(
+                        f"[{tenant['slug']}][{phone}] Action.confirm ambíguo: {len(futuras)} consultas futuras, "
+                        f"sem appointment_id do LLM — pedindo desambiguação"
+                    )
+                    lista = "\n".join(
+                        f"  • {cal.format_appointment(a)} (id={a['id']})"
+                        for a in futuras[:5]
+                    )
+                    return (
+                        f"Você tem mais de uma sessão agendada. Qual você quer confirmar?\n\n{lista}",
+                        None,
+                    )
             except Exception as e:
-                logger.warning(f"[confirm] fallback get_next_appointment falhou: {e}")
+                logger.warning(f"[confirm] fallback get_appointments_by_phone falhou: {e}")
         if appt_id:
             db.confirm_appointment(tenant_id, appt_id)
             logger.info(f"[{tenant['slug']}][{phone}] confirmed appointment id={appt_id}")

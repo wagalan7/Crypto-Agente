@@ -100,11 +100,17 @@ def _apply_template(template: str, **kwargs) -> str:
         return result
 
 
+def _first_name(patient_name: str | None) -> str:
+    """Primeiro nome do paciente, ou fallback genérico se vazio."""
+    parts = (patient_name or "").strip().split()
+    return parts[0] if parts else "tudo bem"
+
+
 def _confirmation_message(tenant: dict, appt: dict) -> str:
     tpl = (tenant.get("confirmation_msg_template") or "").strip() or _DEFAULT_CONFIRMATION
     return _apply_template(
         tpl,
-        nome=appt["patient_name"].split()[0],
+        nome=_first_name(appt.get("patient_name")),
         data_hora=cal.format_appointment(appt),
         quando=_quando_label(appt),
         psicologa=tenant["psychologist_name"],
@@ -115,7 +121,7 @@ def _followup_message(tenant: dict, appt: dict) -> str:
     tpl = (tenant.get("followup_msg_template") or "").strip() or _DEFAULT_FOLLOWUP
     return _apply_template(
         tpl,
-        nome=appt["patient_name"].split()[0],
+        nome=_first_name(appt.get("patient_name")),
         data_hora=cal.format_appointment(appt),
         quando="de hoje",
         psicologa=tenant["psychologist_name"],

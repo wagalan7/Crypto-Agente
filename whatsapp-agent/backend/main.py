@@ -235,10 +235,20 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         return
 
     # ── Filtro anti-spam (propagandas, links promocionais) ──────────────────────
+    # Comportamento:
+    # - Primeiro contato spam: responde uma vez, educadamente, e grava no histórico
+    # - Spam subsequente do mesmo número: ignora silenciosamente (não responde
+    #   nem polui banco). Detectado por presença de marcador "[spam/propaganda]"
+    #   no histórico recente.
+    # - NÃO pausa o agente permanentemente: se o paciente mandar uma mensagem
+    #   legítima depois (sem padrão de spam), o agente responde normalmente.
     if _is_spam(text):
-        history = db.get_conversation_history(tenant["id"], phone, limit=2)
-        if not history:
-            # Primeiro contato spam → responde uma única vez, educadamente
+        recent = db.get_conversation_history(tenant["id"], phone, limit=8)
+        already_warned = any(
+            (m.get("content") or "").startswith("[spam/propaganda]")
+            for m in recent
+        )
+        if not already_warned:
             reply = ("Olá! Aqui é o consultório. Qualquer dúvida sobre sua consulta "
                      "estou à disposição. 🙏")
             try:
@@ -247,12 +257,9 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                 logger.warning(f"[{tenant['slug']}][{phone}] Falha ao responder spam: {e}")
             db.save_message(tenant["id"], phone, "user", "[spam/propaganda]")
             db.save_message(tenant["id"], phone, "assistant", reply)
-        # Pausa o agente para esse número — nunca mais responde automaticamente
-        try:
-            db.pause_agent(tenant["id"], phone)
-        except Exception:
-            pass
-        logger.info(f"[{tenant['slug']}][{phone}] Spam detectado — agente pausado para esse número")
+            logger.info(f"[{tenant['slug']}][{phone}] Spam detectado (1ª vez) — resposta educada enviada")
+        else:
+            logger.info(f"[{tenant['slug']}][{phone}] Spam detectado (repetido) — ignorado silenciosamente")
         return
 
     # ── Documento (PDF/Word) ou Comprovante PIX nativo → resposta padrão ────────
@@ -624,8 +631,11 @@ def list_slots(slug: str, days: int = 7):
 @app.get("/admin/{slug}/appointments")
 def list_appointments(slug: str):
     tenant = _get_tenant(slug)
-    now = datetime.now().isoformat()
-    far = datetime.now().replace(year=datetime.now().year + 1).isoformat()
+    # America/Sao_Paulo (consultas são salvas em horário de Brasília naive).
+    _br = ZoneInfo("America/Sao_Paulo")
+    now_br = datetime.now(_br).replace(tzinfo=None)
+    now = now_br.isoformat()
+    far = now_br.replace(year=now_br.year + 1).isoformat()
     appts = db.get_appointments_in_range(tenant["id"], now, far)
     return {"tenant": slug, "appointments": appts}
 
