@@ -165,6 +165,18 @@ CAPACIDADES (apenas para pacientes JÁ CADASTRADOS com consulta):
 3. Listar horários disponíveis (fornecidos no contexto)
 4. Atualizar agenda (sem conflitos)
 
+CUMPRIMENTOS E MENSAGENS SIMPLES — REGRA CRÍTICA:
+- "Bom dia", "Boa tarde", "Boa noite", "Oi", "Olá", "Tudo bem?" e variações = cumprimento.
+- SEMPRE responda cumprimentos com calor, mesmo sem entender intenção: "Olá! Tudo bem? 😊 Posso te ajudar com sua consulta de [DIA]?" ou "Bom dia! 😊 Tudo ótimo. Como posso ajudar?"
+- NUNCA responda "não entendi" para cumprimento, mesmo curto. Se a mensagem for só saudação, pergunte gentilmente como pode ajudar.
+
+FILTRO DE PERÍODO AO OFERECER HORÁRIOS — REGRA CRÍTICA:
+- Quando o paciente pedir horários, observe se ele especifica período: "manhã", "tarde", "noite", "fim do dia", "início da tarde", etc.
+- Manhã = 06:00–11:59 | Tarde = 12:00–17:59 | Noite = 18:00–23:59
+- Filtre a lista HORÁRIOS DISPONÍVEIS do contexto e ofereça APENAS os que cabem no período pedido.
+- Se NÃO houver horário no período pedido, diga claramente: "Infelizmente não tenho horários disponíveis na [parte do dia] pedida. Posso oferecer [outros períodos com horários]?" — NUNCA finja oferecer "tarde" quando só tem manhã.
+- Se o paciente disser "qualquer horário" ou não especificar, ofereça uma seleção variada (manhã + tarde + noite quando disponíveis).
+
 CONFIRMAÇÃO — REGRAS CRÍTICAS:
 - Se o paciente responder com QUALQUER expressão positiva APÓS receber mensagem de confirmação → use action: "confirm" e data: {{"appointment_id": ID_DA_CONSULTA}}
 - Exemplos que SÃO confirmação: "SIM", "sim", "siim", "siimm", "simm", "ok", "confirmo", "confirmado", "pode ser", "tô lá", "estarei lá", "claro", "com certeza", "sem dúvidas", "com certeza", "pode", "vai", "vou estar", "estarei", "confirmar sim", "Confirmo simm", "pode sim", "ótimo", "tudo bem", "perfeito", "combinado"
@@ -276,11 +288,49 @@ Novo paciente:
 
 
 def _extract_json(text: str) -> dict:
-    text = text.strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        return json.loads(match.group())
-    raise ValueError(f"No JSON in response: {text[:200]}")
+    """Extrai JSON da resposta do LLM, tolerante a code fences e prefixos."""
+    text = (text or "").strip()
+    # Remove cercas de código markdown (```json ... ``` ou ``` ... ```)
+    if text.startswith("```"):
+        # Tira primeira linha (``` ou ```json) e última (```)
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    # Tenta parse direto
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Procura o primeiro `{` e tenta achar `}` correspondente (balanceando)
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"No JSON in response: {text[:200]}")
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise ValueError(f"Unbalanced JSON in response: {text[:200]}")
 
 
 _DIAS_PT = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira",
@@ -363,7 +413,9 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     tenant_id = tenant["id"]
     db.save_message(tenant_id, phone, "user", text)
 
-    offered_slots = cal.get_available_slots(tenant, days_ahead=10, limit=6)
+    # limit aumentado de 6 → 24 para garantir cobertura de manhã, tarde e noite
+    # em vários dias, permitindo ao LLM filtrar quando paciente pede "tarde"/"manhã"
+    offered_slots = cal.get_available_slots(tenant, days_ahead=10, limit=24)
     context = _build_context(tenant, phone, offered_slots)
 
     # Flag: paciente é conhecido (tem consulta futura OU já cadastrado)?

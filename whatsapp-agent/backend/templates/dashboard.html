@@ -1390,18 +1390,24 @@ function loadWeekly() {
     }
     const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
     const months = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
-    // Agrupa por semana ISO (segunda como início)
+    // Helper: data local em YYYY-MM-DD (evita drift de timezone do toISOString,
+    // que convertia 21:10 BR → 00:10 UTC do dia seguinte e colocava a consulta
+    // no dia errado da agenda).
+    function localDateKey(d) {
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    }
+    // Agrupa por semana ISO (segunda como início) — usando data LOCAL
     function weekKey(d) {
       const x = new Date(d); x.setHours(0,0,0,0);
       const day = (x.getDay() + 6) % 7;  // 0=seg
       x.setDate(x.getDate() - day);
-      return x.toISOString().slice(0,10);
+      return localDateKey(x);
     }
     const groups = {};
     appts.forEach(a => {
       const dt = new Date(a.scheduled_at);
       const wk = weekKey(dt);
-      const dayKey = dt.toISOString().slice(0,10);
+      const dayKey = localDateKey(dt);
       groups[wk] = groups[wk] || {};
       groups[wk][dayKey] = groups[wk][dayKey] || [];
       groups[wk][dayKey].push(a);
