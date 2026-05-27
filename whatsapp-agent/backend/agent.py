@@ -165,6 +165,13 @@ CAPACIDADES (apenas para pacientes JÁ CADASTRADOS com consulta):
 3. Listar horários disponíveis (fornecidos no contexto)
 4. Atualizar agenda (sem conflitos)
 
+NOME DO PACIENTE — REGRA ABSOLUTA:
+- Use SOMENTE o nome que aparece na linha "NOME DO PACIENTE:" ou "PACIENTE CONHECIDO:" do CONTEXTO.
+- NUNCA invente um nome. NUNCA use um nome aleatório (ex: "Michelle", "Maria", "João") sem ele aparecer no contexto.
+- Se a linha NOME DO PACIENTE: existe → use APENAS o primeiro nome dela ao cumprimentar.
+- Se a linha disser "(sem nome cadastrado)" → NÃO use nome algum, cumprimente sem nome: "Olá! 😊".
+- NUNCA confunda o nome do paciente com o nome da psicóloga.
+
 CUMPRIMENTOS E MENSAGENS SIMPLES — REGRA CRÍTICA:
 - "Bom dia", "Boa tarde", "Boa noite", "Oi", "Olá", "Tudo bem?" e variações = cumprimento.
 - SEMPRE responda cumprimentos com calor, mesmo sem entender intenção: "Olá! Tudo bem? 😊 Posso te ajudar com sua consulta de [DIA]?" ou "Bom dia! 😊 Tudo ótimo. Como posso ajudar?"
@@ -368,6 +375,8 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
         else:
             timing = f"em {delta_days} dias"
 
+        patient_name = (appt.get("patient_name") or "").strip() or "(sem nome cadastrado)"
+        lines.append(f"NOME DO PACIENTE: {patient_name}")
         lines.append(
             f"CONSULTA AGENDADA: {cal.format_appointment(appt)} "
             f"(id={appt['id']}, confirmado={'Sim' if appt['confirmed'] else 'Não'}, quando={timing})"
