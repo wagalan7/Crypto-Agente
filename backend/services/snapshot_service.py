@@ -127,6 +127,10 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     """
     Salva snapshots de recomendações novas (desduplicadas).
     Retorna quantos foram efetivamente inseridos.
+
+    Side-effect: marca cada rec com `_just_saved=True` se foi inserida nesta
+    chamada (não duplicata). Permite ao caller filtrar quais notificar via
+    push sem precisar re-consultar o DB.
     """
     if not DB_ENABLED or not recommendations:
         return 0
@@ -149,6 +153,7 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                 ).limit(1)
                 existing = (await session.execute(stmt)).scalar_one_or_none()
                 if existing:
+                    rec["_just_saved"] = False
                     continue
 
                 # tp1 pode estar em signal.tp1 ou ausente
@@ -176,6 +181,7 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                     features=_extract_features(rec, now),
                 )
                 session.add(snap)
+                rec["_just_saved"] = True
                 inserted += 1
             except Exception as e:
                 log.warning(f"Falha ao salvar snapshot {rec.get('symbol')}: {e}")

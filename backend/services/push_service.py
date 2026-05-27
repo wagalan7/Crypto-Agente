@@ -213,22 +213,26 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
 
 async def notify_recommendations_batch(recs: List[Dict[str, Any]], newly_saved: int) -> int:
     """
-    Chama notify_new_recommendation pra cada rec, mas só se for "nova"
-    (i.e., foi efetivamente salva no DB — dedup já foi aplicado no
-    snapshot_service). Como o save_recommendations só retorna o count,
-    optamos por uma heurística: se newly_saved == len(recs), tudo é novo;
-    caso contrário, dispara só para top scores (provavelmente as novas).
+    Dispara push só para recs marcadas com `_just_saved=True` por
+    save_recommendations (flag setada no próprio dict da rec quando o
+    snapshot é efetivamente inserido, vs duplicata que já existia).
 
-    Mais simples: dispara só para recs com tier A+ que tenham sido salvas
-    nesta janela. Limita a 5 alerts por batch pra não floodar.
+    Isso garante que push notifications NÃO se repitam para o mesmo setup
+    que ainda está dentro da janela de dedup (2h). Limita a 5 alerts/batch
+    pra não floodar.
     """
     if not PUSH_ENABLED or not recs or newly_saved == 0:
         return 0
 
-    # Ordena por score desc, pega até `newly_saved` recs (proxy: as melhores
-    # tendem a ser novas porque o cache de 90s da varredura roda pouco).
-    sorted_recs = sorted(recs, key=lambda r: r.get("score", 0), reverse=True)
-    candidates = sorted_recs[:min(newly_saved, 5)]   # cap em 5 push/batch
+    # Filtra só recs que foram REALMENTE inseridas nesta chamada.
+    # Fallback: se a flag não existir (caller antigo), assume top-N por score.
+    just_saved = [r for r in recs if r.get("_just_saved") is True]
+    if not just_saved:
+        # Fallback de compatibilidade (callers antigos sem a flag)
+        log.warning("notify_recommendations_batch: nenhuma rec marcada _just_saved — fallback top-score")
+        just_saved = sorted(recs, key=lambda r: r.get("score", 0), reverse=True)[:newly_saved]
+
+    candidates = just_saved[:5]   # cap em 5 push/batch
 
     total_sent = 0
     for rec in candidates:
