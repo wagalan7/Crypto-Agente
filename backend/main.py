@@ -459,6 +459,42 @@ async def recommendations_batch(body: RecommendationBatchRequest):
         ]
         recs = await get_recommendations_from_batch(items)
         recs_dict = [r.model_dump() for r in recs]
+        # Anexa recent_outcome quando o mesmo setup (symbol+tf+direction) já
+        # foi resolvido nas últimas 2h. Evita reapresentar trade já realizado
+        # como se fosse novo (UX). Backend continua não duplicando no DB
+        # graças ao dedup em save_recommendations.
+        if DB_ENABLED and recs_dict:
+            try:
+                from db import get_session
+                from models.recommendation_snapshot import RecommendationSnapshot
+                from sqlalchemy import select, and_, desc
+                from datetime import datetime, timedelta, timezone
+                cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
+                resolved_statuses = ("won_tp1", "won_tp1_be", "won_tp2", "lost")
+                async with get_session() as session:
+                    for r in recs_dict:
+                        stmt = (
+                            select(RecommendationSnapshot)
+                            .where(and_(
+                                RecommendationSnapshot.symbol == r["symbol"],
+                                RecommendationSnapshot.timeframe == r["timeframe"],
+                                RecommendationSnapshot.direction == r["direction"],
+                                RecommendationSnapshot.status.in_(resolved_statuses),
+                                RecommendationSnapshot.outcome_at >= cutoff,
+                            ))
+                            .order_by(desc(RecommendationSnapshot.outcome_at))
+                            .limit(1)
+                        )
+                        snap = (await session.execute(stmt)).scalar_one_or_none()
+                        if snap is not None:
+                            r["recent_outcome"] = {
+                                "status": snap.status,
+                                "realized_r": float(snap.realized_r) if snap.realized_r is not None else None,
+                                "resolved_at": snap.outcome_at.isoformat() if snap.outcome_at else None,
+                                "entry": float(snap.entry),
+                            }
+            except Exception as e:
+                logging.warning(f"recent_outcome lookup falhou (segue sem badge): {e}")
         # Persistência (não bloqueia se DB indisponível)
         newly_saved = 0
         if DB_ENABLED and recs_dict:

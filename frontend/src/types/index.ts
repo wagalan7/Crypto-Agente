@@ -285,6 +285,13 @@ export interface Recommendation {
   current_price?: number | null
   chase_atr?: number | null
   chase_level?: 'ok' | 'extended' | 'chasing' | null
+  // Setup já foi resolvido nas últimas 2h (mesmo symbol+tf+direction)
+  recent_outcome?: {
+    status: 'won_tp1' | 'won_tp1_be' | 'won_tp2' | 'lost'
+    realized_r: number | null
+    resolved_at: string | null
+    entry: number
+  } | null
 }
 
 export interface WatchlistItem {

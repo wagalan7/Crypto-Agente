@@ -364,7 +364,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                 <button
                   key={`${r.symbol}-${r.timeframe}`}
                   onClick={() => onSelectSymbol(r.symbol, r.timeframe)}
-                  className={`w-full text-left p-3 rounded-lg border ${cfg.bg} ${cfg.border} ${cfg.ring} hover:bg-slate-800/40 transition-colors`}
+                  className={`w-full text-left p-3 rounded-lg border ${cfg.bg} ${cfg.border} ${cfg.ring} hover:bg-slate-800/40 transition-colors ${r.recent_outcome ? 'opacity-60' : ''}`}
                 >
                   <div className="flex items-center gap-3">
                     {/* Tier badge */}
@@ -423,6 +423,34 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                       })()}
                     </div>
                   </div>
+
+                  {/* Outcome recente (mesmo setup já resolveu nas últimas 2h) */}
+                  {r.recent_outcome && (() => {
+                    const ro = r.recent_outcome
+                    const STATUS_INFO: Record<string, { label: string; cls: string }> = {
+                      won_tp2:    { label: '🏆 já bateu TP2', cls: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300' },
+                      won_tp1:    { label: '✅ já bateu TP1', cls: 'border-green-500/40 bg-green-500/10 text-green-300' },
+                      won_tp1_be: { label: '✅ TP1 + BE',     cls: 'border-sky-500/40 bg-sky-500/10 text-sky-300' },
+                      lost:       { label: '✗ stopou',        cls: 'border-red-500/40 bg-red-500/10 text-red-300' },
+                    }
+                    const info = STATUS_INFO[ro.status] || STATUS_INFO.won_tp1
+                    let agoMin: number | null = null
+                    if (ro.resolved_at) {
+                      const diff = Date.now() - new Date(ro.resolved_at).getTime()
+                      agoMin = Math.max(1, Math.round(diff / 60000))
+                    }
+                    const rTxt = ro.realized_r != null
+                      ? (ro.realized_r >= 0 ? `+${ro.realized_r.toFixed(1)}R` : `${ro.realized_r.toFixed(1)}R`)
+                      : ''
+                    return (
+                      <div className="mt-2 text-[10px]">
+                        <span className={`px-2 py-0.5 rounded border ${info.cls}`} title="Setup idêntico (symbol+TF+direction) já foi resolvido nas últimas 2h. Aguardar novo ciclo.">
+                          {info.label} {rTxt && <span className="font-mono font-bold">({rTxt})</span>}
+                          {agoMin != null && <span className="text-slate-400"> · há {agoMin}min</span>} · aguarde novo ciclo
+                        </span>
+                      </div>
+                    )
+                  })()}
 
                   {/* Entry zone + chase flag */}
                   {(r.entry_zone_low != null && r.entry_zone_high != null && r.entry_zone_type && r.entry_zone_type !== 'market') && (
