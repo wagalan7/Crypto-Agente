@@ -1248,7 +1248,7 @@ function toggleSlotConfig() {
 function renderBlockedHours() {
   // Aproveita pra setar min do date picker
   const dt = document.getElementById('slot-block-date');
-  if (dt) dt.min = new Date().toISOString().slice(0,10);
+  if (dt) dt.min = todayLocal();
   const start = parseInt(document.getElementById('slot-start').value, 10) || 0;
   const end = parseInt(document.getElementById('slot-end').value, 10) || 24;
   const raw = document.getElementById('slot-blocked-raw').value || '';
@@ -1274,7 +1274,7 @@ function _getBlockedDates() {
 }
 function _setBlockedDates(arr) {
   // Mantém só futuras + únicas + ordenadas
-  const today = new Date().toISOString().slice(0,10);
+  const today = todayLocal();
   const unique = Array.from(new Set(arr)).filter(d => d >= today).sort();
   document.getElementById('slot-blocked-dates-raw').value = unique.join(',');
   renderBlockedDates();
@@ -1377,6 +1377,13 @@ function saveSlotConfig(btn) {
     });
 }
 
+// Helper global: YYYY-MM-DD da data LOCAL (sem drift de timezone do toISOString).
+// Usado para "hoje", chave de agrupamento por dia, e mínimo de date pickers.
+function localDateKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function todayLocal() { return localDateKey(new Date()); }
+
 // Visão semanal: agrupa próximas consultas por semana e por dia
 function loadWeekly() {
   const el = document.getElementById("weekly-list");
@@ -1390,13 +1397,8 @@ function loadWeekly() {
     }
     const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
     const months = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
-    // Helper: data local em YYYY-MM-DD (evita drift de timezone do toISOString,
-    // que convertia 21:10 BR → 00:10 UTC do dia seguinte e colocava a consulta
-    // no dia errado da agenda).
-    function localDateKey(d) {
-      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-    }
     // Agrupa por semana ISO (segunda como início) — usando data LOCAL
+    // (localDateKey global evita drift de timezone do toISOString).
     function weekKey(d) {
       const x = new Date(d); x.setHours(0,0,0,0);
       const day = (x.getDay() + 6) % 7;  // 0=seg
@@ -1594,7 +1596,7 @@ function onNaNameInput() {
 }
 
 function openNewAppt() {
-  const today = new Date().toISOString().split("T")[0];
+  const today = todayLocal();
   document.getElementById("na-date").value = today;
   document.getElementById("na-time").value = "";
   document.getElementById("na-name").value = "";
@@ -1661,8 +1663,7 @@ async function submitNewAppt() {
   try {
     let created = 0, conflicts = 0;
     for (const d of dates) {
-      const iso = d.toISOString().slice(0,19); // sem timezone
-      // Ajustar para horário local
+      // ISO local (sem timezone) — não usar toISOString aqui (drift UTC)
       const localIso = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}T${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:00`;
       const r = await api("/dashboard/api/appointments", {
         method: "POST",
