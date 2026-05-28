@@ -30,7 +30,7 @@ _BACKEND = _THIS.parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from services.recommendation_backtest import run_backtest  # noqa: E402
+from services.recommendation_backtest import run_backtest, run_walkforward  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,6 +88,8 @@ async def main():
                     help="path pra salvar JSON completo (opcional)")
     ap.add_argument("--end", type=str, default=None,
                     help="data final ISO (default: agora). útil pra walk-forward manual")
+    ap.add_argument("--folds", type=int, default=0,
+                    help="se >=2, roda walk-forward com N janelas temporais (default 0=off)")
     args = ap.parse_args()
 
     symbols = parse_symbols(args.symbols)
@@ -102,11 +104,19 @@ async def main():
     print(f"  TFs:     {', '.join(timeframes)}\n")
 
     t0 = datetime.now()
-    report = await run_backtest(
-        symbols=symbols, timeframes=timeframes,
-        days_back=args.days, step_bars=args.step,
-        end_dt=end_dt,
-    )
+    if args.folds and args.folds >= 2:
+        report = await run_walkforward(
+            symbols=symbols, timeframes=timeframes,
+            days_back=args.days, step_bars=args.step,
+            n_folds=args.folds, end_dt=end_dt,
+        )
+    else:
+        report = await run_backtest(
+            symbols=symbols, timeframes=timeframes,
+            days_back=args.days, step_bars=args.step,
+            end_dt=end_dt,
+        )
+        report.pop("_all_trades", None)
     elapsed = (datetime.now() - t0).total_seconds()
 
     # ── Imprime resumo ──────────────────────────────────────────────────────
@@ -141,6 +151,33 @@ async def main():
               f"n={m['total_trades']:>3} wr={m['win_rate_pct']:>5}% "
               f"PF={pf_s} R={m['total_r']:+7.2f} "
               f"DD={m['max_dd_r']:.2f}R")
+
+    if "walkforward" in report:
+        wf = report["walkforward"]
+        print("\n─ Walk-forward ─")
+        print(f"  janelas: {wf['n_folds']} ({wf['folds_with_trades']} c/ trades, "
+              f"{wf['empty_folds']} vazias)")
+        print(f"  stability: {wf['stability_pct']}% folds positivos "
+              f"({wf['positive_folds']}/{wf['folds_with_trades']})")
+        cr = wf['consistency_ratio']
+        cr_s = f"{cr:.2f}" if cr is not None else "∞"
+        print(f"  R por fold:  μ={wf['fold_total_r_mean']:+.2f}  "
+              f"σ={wf['fold_total_r_std']:.2f}  consistency(μ/σ)={cr_s}")
+        print(f"  WR por fold: μ={wf['fold_wr_mean']:.1f}%  σ={wf['fold_wr_std']:.1f}%")
+        print()
+        for f in wf["folds"]:
+            fm = f["metrics"]
+            start_short = f["start"][:10]
+            end_short = f["end"][:10]
+            if not fm or fm.get("total_trades", 0) == 0:
+                print(f"  fold {f['fold']:>2} ({start_short}→{end_short} {f['days']}d): "
+                      f"sem trades")
+                continue
+            pf = fm["profit_factor"]
+            pf_s = f"{pf:>5.2f}" if pf is not None else "   ∞ "
+            print(f"  fold {f['fold']:>2} ({start_short}→{end_short} {f['days']}d): "
+                  f"n={fm['total_trades']:>3} wr={fm['win_rate_pct']:>5}% "
+                  f"PF={pf_s} R={fm['total_r']:+7.2f}")
 
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2, default=str))

@@ -513,4 +513,114 @@ async def run_backtest(
         "days_back": days_back, "step_bars": step_bars,
         "start": start_dt.isoformat(), "end": end_dt.isoformat(),
     }
+    # Anexa lista plana de trades pra walkforward consumir; CLI remove antes
+    # de salvar JSON pra não inflar o arquivo.
+    report["_all_trades"] = all_trades
+    return report
+
+
+# ── Walk-forward ─────────────────────────────────────────────────────────────
+# A estratégia é rule-based (sem parâmetros pra "treinar"), então walk-forward
+# aqui mede **robustez temporal**: divide o range em N janelas e mede métricas
+# por janela. Stability score = % janelas com R>0. Mostra se a estratégia
+# degrada em regimes diferentes (bull/bear/chop) ou é consistente.
+
+def _slice_trades_by_window(
+    trades: List[Dict[str, Any]], start_ms: int, end_ms: int,
+) -> List[Dict[str, Any]]:
+    return [t for t in trades if start_ms <= t["created_ts"] < end_ms]
+
+
+def walkforward_report(
+    all_trades: List[Dict[str, Any]],
+    start_dt: datetime, end_dt: datetime, n_folds: int,
+) -> Dict[str, Any]:
+    if n_folds < 2:
+        raise ValueError("n_folds deve ser ≥ 2")
+    total_ms = int((end_dt - start_dt).total_seconds() * 1000)
+    fold_ms = total_ms // n_folds
+
+    folds: List[Dict[str, Any]] = []
+    fold_total_r: List[float] = []
+    fold_wr: List[float] = []
+    positive_folds = 0
+    empty_folds = 0
+
+    for k in range(n_folds):
+        f_start_ms = int(start_dt.timestamp() * 1000) + k * fold_ms
+        f_end_ms = f_start_ms + fold_ms if k < n_folds - 1 else int(end_dt.timestamp() * 1000)
+        slice_trades = _slice_trades_by_window(all_trades, f_start_ms, f_end_ms)
+        metrics = compute_metrics(slice_trades)
+        f_start = datetime.fromtimestamp(f_start_ms / 1000, tz=timezone.utc)
+        f_end = datetime.fromtimestamp(f_end_ms / 1000, tz=timezone.utc)
+        if slice_trades:
+            fold_total_r.append(metrics["total_r"])
+            fold_wr.append(metrics["win_rate_pct"])
+            if metrics["total_r"] > 0:
+                positive_folds += 1
+        else:
+            empty_folds += 1
+        folds.append({
+            "fold": k + 1,
+            "start": f_start.isoformat(), "end": f_end.isoformat(),
+            "days": round((f_end - f_start).total_seconds() / 86400, 1),
+            "metrics": metrics,
+        })
+
+    # Stability: % de folds com trades que foram positivos
+    folds_with_trades = n_folds - empty_folds
+    stability_pct = (positive_folds / folds_with_trades * 100) if folds_with_trades > 0 else 0.0
+
+    if fold_total_r:
+        mean_r = sum(fold_total_r) / len(fold_total_r)
+        var_r = sum((r - mean_r) ** 2 for r in fold_total_r) / len(fold_total_r)
+        std_r = math.sqrt(var_r)
+        consistency = (mean_r / std_r) if std_r > 0 else float("inf")
+    else:
+        mean_r = std_r = consistency = 0.0
+
+    if fold_wr:
+        mean_wr = sum(fold_wr) / len(fold_wr)
+        var_wr = sum((w - mean_wr) ** 2 for w in fold_wr) / len(fold_wr)
+        std_wr = math.sqrt(var_wr)
+    else:
+        mean_wr = std_wr = 0.0
+
+    return {
+        "n_folds": n_folds,
+        "folds_with_trades": folds_with_trades,
+        "empty_folds": empty_folds,
+        "positive_folds": positive_folds,
+        "stability_pct": round(stability_pct, 1),
+        "fold_total_r_mean": round(mean_r, 2),
+        "fold_total_r_std": round(std_r, 2),
+        "consistency_ratio": round(consistency, 2) if math.isfinite(consistency) else None,
+        "fold_wr_mean": round(mean_wr, 1),
+        "fold_wr_std": round(std_wr, 1),
+        "folds": folds,
+    }
+
+
+async def run_walkforward(
+    symbols: List[str], timeframes: List[str],
+    days_back: int = 90, step_bars: int = 1,
+    n_folds: int = 6,
+    end_dt: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """
+    Walk-forward analysis: roda backtest no range completo, depois fatia os
+    trades em N janelas temporais iguais e reporta métricas por janela +
+    estatísticas de robustez (stability, consistency).
+    """
+    report = await run_backtest(
+        symbols=symbols, timeframes=timeframes,
+        days_back=days_back, step_bars=step_bars, end_dt=end_dt,
+    )
+    end_dt_actual = datetime.fromisoformat(report["params"]["end"])
+    start_dt_actual = datetime.fromisoformat(report["params"]["start"])
+    all_trades = report.get("_all_trades", [])
+    wf = walkforward_report(all_trades, start_dt_actual, end_dt_actual, n_folds)
+    report["walkforward"] = wf
+    # Não expor _all_trades no JSON final pra não inflar
+    report.pop("_all_trades", None)
     return report
