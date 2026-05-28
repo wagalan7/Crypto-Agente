@@ -450,9 +450,15 @@ export default function App() {
     <div className="flex flex-col h-full overflow-hidden bg-[#0a0e1a]">
       {/* Sub-header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800/50 flex-shrink-0">
-        <div className="flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-          <span className="text-xs text-slate-300 font-medium">Binance Futures – Tempo Real</span>
+        <div className="flex items-center gap-2">
+          <img src="/logo.jpg" alt="Crypto Win" className="w-7 h-7 rounded-md object-cover border border-yellow-500/40 shadow-[0_0_8px_rgba(234,179,8,0.25)]" />
+          <div className="flex flex-col leading-tight">
+            <span className="text-sm font-bold bg-gradient-to-r from-yellow-300 to-emerald-300 bg-clip-text text-transparent">Crypto Win</span>
+            <span className="flex items-center gap-1 text-[10px] text-slate-400">
+              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+              Binance Futures · Tempo Real
+            </span>
+          </div>
         </div>
         <span className="text-slate-500 text-xs">{assets.length} pares</span>
         <div className="flex items-center gap-1.5">
