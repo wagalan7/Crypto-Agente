@@ -406,6 +406,14 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                     <div className="flex-shrink-0 text-right">
                       <div className="text-sm font-bold text-white">{r.score.toFixed(0)}</div>
                       <div className="text-[10px] text-slate-500">score</div>
+                      {r.prob_tp1 != null && (
+                        <div
+                          className="text-[10px] text-sky-300 font-mono mt-0.5"
+                          title="P(TP1) calibrada empiricamente — mapeia score → win rate observado em snapshots resolvidos (PAV + shrinkage bayesiano)"
+                        >
+                          P {(r.prob_tp1 * 100).toFixed(0)}%
+                        </div>
+                      )}
                       <div className="text-[10px] text-emerald-300 mt-1 font-mono">1:{r.risk_reward}</div>
                       <div className="text-[11px] text-orange-300 mt-0.5 font-mono font-bold">{r.leverage}x</div>
                       {(() => {

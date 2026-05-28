@@ -74,6 +74,7 @@ from services.learning_service import (
     compute_stats_by_bucket,
     lookup_historical_batch,
 )
+from services.calibration_service import get_calibration
 from services.push_service import (
     get_public_key as push_get_public_key,
     save_subscription as push_save_subscription,
@@ -140,6 +141,12 @@ async def _server_scan_loop():
                 logging.info("[server-scan] DB e push ambos OFF, pulando")
                 await asyncio.sleep(SERVER_SCAN_INTERVAL)
                 continue
+
+            # Warmup calibration cache ANTES de gerar recs (preenche prob_tp1)
+            try:
+                await get_calibration()
+            except Exception as e:
+                logging.warning(f"[server-scan] calibration warmup falhou: {e}")
 
             recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
             recs_dict = [r.model_dump() for r in recs]
@@ -700,6 +707,25 @@ async def learning_insights(days: int = 60):
     except Exception as e:
         logging.error(f"learning-insights error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao obter insights: {e}")
+
+
+@app.get("/api/calibration")
+async def calibration():
+    """
+    Tabela score → P(TP1) calibrada empiricamente.
+    Retorna {enabled: false, ...} se ainda não houver amostra mínima (30 trades).
+    """
+    try:
+        data = await get_calibration()
+        if data is None:
+            return {
+                "enabled": False,
+                "message": "Calibração ainda não disponível — precisa de pelo menos 30 trades resolvidos nos últimos 90 dias.",
+            }
+        return data
+    except Exception as e:
+        logging.error(f"calibration error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao obter calibração: {e}")
 
 
 class HistoricalLookupItem(BaseModel):

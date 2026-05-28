@@ -63,6 +63,9 @@ class Recommendation(BaseModel):
     current_price: Optional[float] = None     # preço de mercado no momento da varredura
     chase_atr: Optional[float] = None         # múltiplos de ATR entre current_price e entry (signed a favor)
     chase_level: Optional[str] = None         # "ok" | "extended" | "chasing"
+    # P(TP1) calibrada via calibration_service — None se calib não está pronta
+    # (precisa de ≥30 snapshots resolvidos nos últimos 90 dias).
+    prob_tp1: Optional[float] = None          # 0..1 — exibido no card como %
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -522,6 +525,13 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
             f"⚠ Preço {chase_atr}×ATR acima do entry — esperar pullback à zona ou pular."
         ]
 
+    # P(TP1) calibrada — lookup sync no cache (None se calib não pronta)
+    try:
+        from services.calibration_service import prob_tp1_for_score_sync
+        prob_tp1 = prob_tp1_for_score_sync(score)
+    except Exception:
+        prob_tp1 = None
+
     return Recommendation(
         tier=tier,
         score=score,
@@ -546,6 +556,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         current_price=cp,
         chase_atr=chase_atr,
         chase_level=chase_level,
+        prob_tp1=prob_tp1,
     )
 
 
