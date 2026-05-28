@@ -1492,12 +1492,18 @@ function loadConv(phone) {
     const pauseBtn = `
       <div class="flex items-center justify-between mb-3 pb-3 border-b border-gray-100">
         <p class="text-xs text-gray-500 font-medium">${phone}</p>
-        <button onclick="togglePause('${phone}')" id="pause-btn-${phone}"
-          class="text-xs font-semibold px-3 py-1.5 rounded-lg transition ${isPaused
-            ? 'bg-green-100 text-green-700 hover:bg-green-200'
-            : 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200'}">
-          ${isPaused ? '▶ Retomar agente' : '⏸ Pausar agente'}
-        </button>
+        <div class="flex items-center gap-2">
+          <button onclick="renamePatientPrompt('${phone}')"
+            class="text-xs font-semibold px-3 py-1.5 rounded-lg transition bg-purple-100 text-purple-700 hover:bg-purple-200">
+            ✏️ Editar nome
+          </button>
+          <button onclick="togglePause('${phone}')" id="pause-btn-${phone}"
+            class="text-xs font-semibold px-3 py-1.5 rounded-lg transition ${isPaused
+              ? 'bg-green-100 text-green-700 hover:bg-green-200'
+              : 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200'}">
+            ${isPaused ? '▶ Retomar agente' : '⏸ Pausar agente'}
+          </button>
+        </div>
       </div>
       <div class="mt-3 pt-3 border-t border-gray-100 flex items-center gap-3">
         <label class="text-xs text-gray-500 font-medium whitespace-nowrap">💰 Valor da sessão:</label>
@@ -1538,6 +1544,31 @@ async function savePatientPrice(phone, value) {
   });
   const el = document.getElementById(`price-saved-${phone}`);
   if (el) { el.classList.remove("hidden"); setTimeout(() => el.classList.add("hidden"), 2000); }
+}
+
+async function renamePatientPrompt(phone) {
+  // Tenta pré-preencher com o nome atual do paciente.
+  let current = "";
+  try {
+    const d = await api("/dashboard/api/patients");
+    const p = (d.patients || []).find(x => x.phone === phone);
+    if (p && p.name) current = p.name;
+  } catch(_) {}
+  const novo = prompt("Corrigir nome do paciente:\n(atualiza todas as consultas dele)", current);
+  if (novo === null) return;
+  const name = (novo || "").trim();
+  if (!name) { showToast("Nome inválido", "error"); return; }
+  try {
+    await api(`/dashboard/api/patients/${phone}/name`, {
+      method: "PATCH",
+      body: JSON.stringify({ name })
+    });
+    showToast(`✓ Nome atualizado para "${name}"`, "success");
+    loadConversas();
+    if (typeof loadAgenda === "function") loadAgenda();
+  } catch(e) {
+    showToast(e.message || "Erro ao salvar", "error");
+  }
 }
 
 async function togglePause(phone) {
