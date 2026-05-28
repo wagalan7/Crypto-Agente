@@ -30,7 +30,7 @@ _BACKEND = _THIS.parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from services.backtest_service import run_backtest  # noqa: E402
+from services.recommendation_backtest import run_backtest  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,13 +55,17 @@ def print_metrics_block(label: str, m: dict):
     if not m or m.get("total_trades", 0) == 0:
         print(f"  [{label}] sem trades")
         return
+    pf = m["profit_factor"]
+    sh = m["sharpe_r"]
+    pf_s = f"{pf:.2f}" if pf is not None else "∞"
+    sh_s = f"{sh:.2f}" if sh is not None else "∞"
     print(f"  [{label}] n={m['total_trades']} "
           f"wr={m['win_rate_pct']}% "
-          f"PF={m['profit_factor']} "
+          f"PF={pf_s} "
           f"R={m['total_r']:+.2f} "
           f"avgR={m['avg_r']:+.3f} "
           f"exp={m['expectancy_r']:+.3f} "
-          f"Sharpe={m['sharpe_r']:.2f} "
+          f"Sharpe={sh_s} "
           f"DD={m['max_dd_r']:.2f}R")
     sd = m.get("status_dist", {})
     if sd:
@@ -131,9 +135,11 @@ async def main():
             print(f"  {p['symbol'].split('/')[0]} {p['timeframe']}: "
                   f"{p.get('candles', 0)} candles, 0 trades")
             continue
+        pf = m["profit_factor"]
+        pf_s = f"{pf:>5.2f}" if pf is not None else "   ∞ "
         print(f"  {p['symbol'].split('/')[0]:>6} {p['timeframe']:>4}: "
               f"n={m['total_trades']:>3} wr={m['win_rate_pct']:>5}% "
-              f"PF={m['profit_factor']:>5} R={m['total_r']:+7.2f} "
+              f"PF={pf_s} R={m['total_r']:+7.2f} "
               f"DD={m['max_dd_r']:.2f}R")
 
     if args.out:
