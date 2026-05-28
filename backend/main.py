@@ -1,12 +1,40 @@
 import asyncio
 import json
+import os
 import time
 import traceback
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
 logging.basicConfig(level=logging.INFO)
+
+# ── Sentry (opcional, no-op se SENTRY_DSN não setado) ────────────────────────
+_SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        from sentry_sdk.integrations.logging import LoggingIntegration
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            environment=os.getenv("RAILWAY_ENVIRONMENT", "production"),
+            release=os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7],
+            traces_sample_rate=0.05,         # 5% trace sampling
+            profiles_sample_rate=0.0,
+            integrations=[
+                FastApiIntegration(),
+                LoggingIntegration(level=logging.INFO, event_level=logging.ERROR),
+            ],
+        )
+        logging.info(f"[sentry] habilitado (env={os.getenv('RAILWAY_ENVIRONMENT', 'production')})")
+    except ImportError:
+        logging.warning("[sentry] SENTRY_DSN setado mas sentry-sdk não instalado")
+    except Exception as e:
+        logging.warning(f"[sentry] init falhou: {e}")
+else:
+    logging.info("[sentry] desabilitado (SENTRY_DSN não setado)")
 
 import pandas as pd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
@@ -64,6 +92,22 @@ SERVER_SCAN_INTERVAL = 300        # 5 min entre varreduras server-side
 SERVER_SCAN_TOP_N = 40            # quantos símbolos varrer (Vision spot — universo maior compensa filtros)
 SERVER_SCAN_INITIAL_DELAY = 45    # espera 45s após startup pra não competir com init
 
+# ── Métricas operacionais (lidas via /api/health) ────────────────────────────
+_METRICS: Dict[str, Any] = {
+    "startup_at": datetime.now(timezone.utc).isoformat(),
+    "last_scan_at": None,
+    "last_scan_ok": None,             # True / False / None
+    "last_scan_error": None,
+    "scans_total": 0,
+    "scans_failed": 0,
+    "recs_last_scan": 0,
+    "recs_a_plus_last_scan": 0,
+    "recs_a_last_scan": 0,
+    "pushes_sent_total": 0,
+    "pushes_sent_last_scan": 0,
+    "last_snapshot_check_at": None,
+}
+
 
 async def _snapshot_loop():
     """Roda check_open_snapshots a cada 5 minutos."""
@@ -71,6 +115,7 @@ async def _snapshot_loop():
         try:
             await asyncio.sleep(300)
             await check_open_snapshots()
+            _METRICS["last_snapshot_check_at"] = datetime.now(timezone.utc).isoformat()
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -125,10 +170,11 @@ async def _server_scan_loop():
                 f"{len(pushable)} elegíveis pra push"
             )
 
+            pushes_this_scan = 0
             if _PE and newly_saved > 0 and pushable:
                 try:
-                    sent = await notify_recommendations_batch(pushable, len(pushable))
-                    logging.info(f"[server-scan] ✅ {sent} push(es) enviados")
+                    pushes_this_scan = await notify_recommendations_batch(pushable, len(pushable))
+                    logging.info(f"[server-scan] ✅ {pushes_this_scan} push(es) enviados")
                 except Exception as e:
                     logging.warning(f"[server-scan] push falhou: {e}")
             else:
@@ -137,10 +183,25 @@ async def _server_scan_loop():
                 if newly_saved == 0: reason.append("nada novo")
                 if not pushable: reason.append("nenhum A+/A")
                 logging.info(f"[server-scan] sem push enviado ({', '.join(reason) or '?'})")
+
+            # Atualiza métricas operacionais (lidas via /api/health)
+            _METRICS["last_scan_at"] = datetime.now(timezone.utc).isoformat()
+            _METRICS["last_scan_ok"] = True
+            _METRICS["last_scan_error"] = None
+            _METRICS["scans_total"] += 1
+            _METRICS["recs_last_scan"] = len(recs_dict)
+            _METRICS["recs_a_plus_last_scan"] = by_tier["A+"]
+            _METRICS["recs_a_last_scan"] = by_tier["A"]
+            _METRICS["pushes_sent_last_scan"] = pushes_this_scan
+            _METRICS["pushes_sent_total"] += pushes_this_scan
         except asyncio.CancelledError:
             break
         except Exception as e:
             logging.warning(f"[server-scan] erro: {e}", exc_info=True)
+            _METRICS["last_scan_at"] = datetime.now(timezone.utc).isoformat()
+            _METRICS["last_scan_ok"] = False
+            _METRICS["last_scan_error"] = str(e)[:300]
+            _METRICS["scans_failed"] += 1
 
         try:
             await asyncio.sleep(SERVER_SCAN_INTERVAL)
@@ -198,6 +259,61 @@ app.add_middleware(
 
 
 # ─── REST ENDPOINTS ────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+async def health():
+    """
+    Healthcheck operacional — usado por UptimeRobot / dashboards.
+
+    Status:
+      • ok        → último scan rodou nos últimos 15 min e foi sucesso
+      • degraded  → último scan falhou OU não rodou há mais de 15 min
+      • starting  → ainda não rodou nenhum scan (boot recente)
+
+    Retorna 200 sempre (UptimeRobot pode checar o campo `status`).
+    """
+    now = datetime.now(timezone.utc)
+    last_at_str = _METRICS.get("last_scan_at")
+    status = "starting"
+    age_seconds: Optional[float] = None
+    if last_at_str:
+        try:
+            last_at = datetime.fromisoformat(last_at_str)
+            age_seconds = (now - last_at).total_seconds()
+            stale = age_seconds > (SERVER_SCAN_INTERVAL * 3)  # 15 min default
+            if _METRICS.get("last_scan_ok") and not stale:
+                status = "ok"
+            else:
+                status = "degraded"
+        except Exception:
+            status = "degraded"
+
+    return {
+        "status": status,
+        "now": now.isoformat(),
+        "db_enabled": DB_ENABLED,
+        "push_enabled": PUSH_ENABLED,
+        "sentry_enabled": bool(_SENTRY_DSN),
+        "scan_loop": {
+            "interval_seconds": SERVER_SCAN_INTERVAL,
+            "last_scan_at": _METRICS.get("last_scan_at"),
+            "last_scan_age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
+            "last_scan_ok": _METRICS.get("last_scan_ok"),
+            "last_scan_error": _METRICS.get("last_scan_error"),
+            "scans_total": _METRICS.get("scans_total"),
+            "scans_failed": _METRICS.get("scans_failed"),
+            "recs_last_scan": _METRICS.get("recs_last_scan"),
+            "recs_a_plus_last_scan": _METRICS.get("recs_a_plus_last_scan"),
+            "recs_a_last_scan": _METRICS.get("recs_a_last_scan"),
+            "pushes_sent_last_scan": _METRICS.get("pushes_sent_last_scan"),
+            "pushes_sent_total": _METRICS.get("pushes_sent_total"),
+        },
+        "snapshot_loop": {
+            "last_check_at": _METRICS.get("last_snapshot_check_at"),
+        },
+        "startup_at": _METRICS.get("startup_at"),
+    }
+
 
 @app.get("/api/symbols")
 async def get_symbols():

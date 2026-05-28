@@ -117,6 +117,63 @@ def _has_liquidity_squeeze_risk(sig: TradeSignal) -> bool:
     return False
 
 
+def _derivatives_tier_penalty(sig: TradeSignal) -> int:
+    """
+    Penalidade GRADUAL baseada em derivativos. Retorna número de "downgrades"
+    a aplicar no tier (0 = sem penalidade, 1 = A+→A, 2 = A→B, etc).
+
+    Regras:
+      • Funding moderado (0.02–0.05%) na MESMA direção → -1 (crowded trade)
+      • OI bearish em LONG (preço caindo + OI subindo = shorts institucionais
+        pesados) → -1
+      • OI bullish em SHORT (preço subindo + OI subindo) → -1
+
+    Não retorna mais que 2 (evita downgrade triplo em casos limítrofes).
+    Adiciona warnings ao trade_plan pra exibir no card.
+    """
+    der = sig.derivatives
+    if not der:
+        return 0
+
+    funding_sent = getattr(der, "funding_sentiment", None) or (
+        der.get("funding_sentiment") if isinstance(der, dict) else None
+    )
+    oi_sent = getattr(der, "oi_sentiment", None) or (
+        der.get("oi_sentiment") if isinstance(der, dict) else None
+    )
+    funding_pct = getattr(der, "funding_rate_pct", None) or (
+        der.get("funding_rate_pct") if isinstance(der, dict) else None
+    )
+
+    penalty = 0
+    warnings: List[str] = []
+
+    # Funding moderado same-direction → crowded
+    if sig.direction == SignalDirection.LONG and funding_sent == "bullish_squeeze":
+        penalty += 1
+        f_str = f"{funding_pct:+.3f}%" if funding_pct is not None else "moderado"
+        warnings.append(f"⚠ Funding {f_str} positivo — long crowded, downgrade de tier.")
+    elif sig.direction == SignalDirection.SHORT and funding_sent == "bearish_squeeze":
+        penalty += 1
+        f_str = f"{funding_pct:+.3f}%" if funding_pct is not None else "moderado"
+        warnings.append(f"⚠ Funding {f_str} negativo — short crowded, downgrade de tier.")
+
+    # OI adverso: institucional posicionado contra o trade
+    if sig.direction == SignalDirection.LONG and oi_sent == "bearish":
+        penalty += 1
+        warnings.append("⚠ OI subindo com preço caindo — shorts institucionais pesados contra o long.")
+    elif sig.direction == SignalDirection.SHORT and oi_sent == "bullish":
+        penalty += 1
+        warnings.append("⚠ OI subindo com preço subindo — dinheiro novo long contra o short.")
+
+    # Propaga warnings pro trade_plan (UI lê de lá)
+    if warnings and isinstance(sig.trade_plan, dict):
+        existing = sig.trade_plan.get("quality_warnings") or []
+        sig.trade_plan["quality_warnings"] = existing + warnings
+
+    return min(penalty, 2)
+
+
 def _volume_gate_pass(sig: TradeSignal, tier: str) -> bool:
     """
     Volume confirmation por tier — quanto melhor o tier, mais exigente.
@@ -244,6 +301,16 @@ def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
             tier = "B"
         else:
             return None
+
+    # Derivativos: funding moderado same-dir / OI adverso → downgrade gradual
+    deriv_penalty = _derivatives_tier_penalty(sig)
+    tier_order = ["A+", "A", "B"]
+    if tier in tier_order and deriv_penalty > 0:
+        idx = tier_order.index(tier) + deriv_penalty
+        if idx >= len(tier_order):
+            return None  # nem B sobrevive → rejeita
+        tier = tier_order[idx]
+
     return tier
 
 
