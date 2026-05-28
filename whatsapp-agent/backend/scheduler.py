@@ -146,6 +146,9 @@ async def _run_confirmations():
         # ── Confirmações com 24h de antecedência ──────────────────────────────
         appts = db.get_appointments_for_confirmation(tenant["id"])
         for appt in appts:
+            if db.is_agent_paused(tenant["id"], appt["phone"]):
+                logger.info(f"[{tenant['slug']}] ⏸ Confirmação pulada (agente pausado) → {appt['phone']}")
+                continue
             msg = _confirmation_message(tenant, appt)
             sent = await wa.send_message(tenant, appt["phone"], msg)
             if sent:
@@ -158,6 +161,9 @@ async def _run_confirmations():
         if now.hour >= _FOLLOWUP_HOUR:
             appts_hoje = db.get_appointments_today_unconfirmed(tenant["id"])
             for appt in appts_hoje:
+                if db.is_agent_paused(tenant["id"], appt["phone"]):
+                    logger.info(f"[{tenant['slug']}] ⏸ Followup pulado (agente pausado) → {appt['phone']}")
+                    continue
                 msg = _followup_message(tenant, appt)
                 sent = await wa.send_message(tenant, appt["phone"], msg)
                 if sent:
@@ -205,6 +211,9 @@ async def _run_billing():
                 logger.info(f"[{tenant['slug']}] Cobrança {month_str} já enviada para {phone}")
                 continue
             if not phone:
+                continue
+            if db.is_agent_paused(tenant["id"], phone):
+                logger.info(f"[{tenant['slug']}] ⏸ Cobrança pulada (agente pausado) → {phone}")
                 continue
             sessions = db.get_valid_sessions_for_month(
                 tenant["id"], phone, month_start, month_end, now_str
@@ -265,6 +274,11 @@ async def run_confirmations_now():
         # Confirmações com 24h de antecedência
         appts = db.get_appointments_for_confirmation(tenant["id"])
         for appt in appts:
+            if db.is_agent_paused(tenant["id"], appt["phone"]):
+                results.append({"tenant": tenant["slug"], "patient": appt["patient_name"],
+                                "phone": appt["phone"], "sent": False, "type": "confirmation",
+                                "skipped": "paused"})
+                continue
             msg = _confirmation_message(tenant, appt)
             sent = await wa.send_message(tenant, appt["phone"], msg)
             if sent:
@@ -279,6 +293,11 @@ async def run_confirmations_now():
         # Followup de hoje
         appts_hoje = db.get_appointments_today_unconfirmed(tenant["id"])
         for appt in appts_hoje:
+            if db.is_agent_paused(tenant["id"], appt["phone"]):
+                results.append({"tenant": tenant["slug"], "patient": appt["patient_name"],
+                                "phone": appt["phone"], "sent": False, "type": "followup",
+                                "skipped": "paused"})
+                continue
             msg = _followup_message(tenant, appt)
             sent = await wa.send_message(tenant, appt["phone"], msg)
             if sent:

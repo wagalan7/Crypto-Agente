@@ -344,6 +344,25 @@ async def _handle_message(tenant: dict, phone: str, text: str):
             raw_name = resp.data.get("patient_name", "") if resp.data else ""
             # Sanitização: remove caracteres de controle, recorta para 100 chars.
             patient_name = "".join(ch for ch in (raw_name or "") if ch.isprintable()).strip()[:100]
+            # Anti-alucinação: o LLM às vezes inventa nome. Só aceita se o primeiro
+            # nome aparecer (case-insensitive) no texto do paciente OU no histórico
+            # recente. Senão, descarta (vira "novo contato").
+            if patient_name:
+                first = patient_name.split()[0].lower()
+                hay = (text or "").lower()
+                if first not in hay:
+                    try:
+                        recent = db.get_conversation_history(tenant["id"], phone, limit=8)
+                        hay_hist = " ".join((m.get("content") or "") for m in recent
+                                            if m.get("role") == "user").lower()
+                    except Exception:
+                        hay_hist = ""
+                    if first not in hay_hist:
+                        logger.warning(
+                            f"[{tenant['slug']}][{phone}] Descartando patient_name='{patient_name}' "
+                            f"— não aparece no texto nem no histórico (provável alucinação do LLM)"
+                        )
+                        patient_name = ""
             psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
             phone_norm = _norm_phone(phone)
 
@@ -1331,6 +1350,35 @@ async def dash_config(request: Request, body: TenantUpdate):
 class PatientPriceBody(BaseModel):
     session_price: float
     email: str = ""
+
+class PatientRenameBody(BaseModel):
+    name: str
+
+@app.patch("/dashboard/api/patients/{phone}/name")
+def dash_rename_patient(phone: str, body: PatientRenameBody, request: Request):
+    """Corrige o nome do paciente em todos os registros (appointments + patients).
+    Útil quando o agente gravou um nome errado (ex: alucinação)."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(phone)
+    new_name = "".join(ch for ch in (body.name or "") if ch.isprintable()).strip()[:100]
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Nome inválido.")
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE appointments SET patient_name = ? WHERE tenant_id = ? AND phone = ?",
+            (new_name, tenant["id"], phone),
+        )
+        try:
+            conn.execute(
+                "UPDATE patients SET name = ? WHERE tenant_id = ? AND phone = ?",
+                (new_name, tenant["id"], phone),
+            )
+        except Exception:
+            pass
+    logger.info(f"[{tenant['slug']}] Paciente renomeado: {phone} → '{new_name}'")
+    return {"status": "ok", "phone": phone, "name": new_name}
+
 
 @app.patch("/dashboard/api/patients/{phone}/price")
 def dash_set_patient_price(phone: str, body: PatientPriceBody, request: Request):
