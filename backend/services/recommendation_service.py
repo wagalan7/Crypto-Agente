@@ -410,7 +410,17 @@ def _apply_btc_correlation_throttle(
         _log.warning(f"[corr-throttle] falhou: {e}")
 
 
-def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Recommendation:
+def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional[Recommendation]:
+    # Supressão: se o preço atual já passou de TP1 a favor da direção,
+    # o trade "foi embora" — não faz sentido recomendar entrada agora
+    # (entry tá obsoleto e R:R restante ficou ruim).
+    is_long_dir = (sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction)) == "long"
+    if sig.current_price is not None and sig.tp1:
+        if is_long_dir and sig.current_price >= sig.tp1:
+            return None
+        if (not is_long_dir) and sig.current_price <= sig.tp1:
+            return None
+
     lev = _compute_leverage(sig.entry, sig.stop_loss, tier)
 
     # Entry zone (do TradePlan, se houver) — usuário usa pra colocar limit order
@@ -640,7 +650,9 @@ async def get_recommendations_from_batch(
         except Exception:
             pass
 
-        recommendations.append(_build_recommendation(sig, score, tier))
+        _rec = _build_recommendation(sig, score, tier)
+        if _rec is not None:
+            recommendations.append(_rec)
 
     # BTC correlation throttle: vários alt longs + BTC indeciso → reduz size
     _apply_btc_correlation_throttle(recommendations, regime)
@@ -827,7 +839,9 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
                     continue
         except Exception:
             pass
-        recommendations.append(_build_recommendation(sig, score, tier))
+        _rec = _build_recommendation(sig, score, tier)
+        if _rec is not None:
+            recommendations.append(_rec)
 
     # BTC correlation throttle (idem batch)
     _apply_btc_correlation_throttle(recommendations, regime)
@@ -867,7 +881,9 @@ async def get_recommendations(top_n: int = 30) -> List[Recommendation]:
         tier = _classify_tier(sig, score)
         if tier is None:
             continue
-        recommendations.append(_build_recommendation(sig, score, tier))
+        _rec = _build_recommendation(sig, score, tier)
+        if _rec is not None:
+            recommendations.append(_rec)
 
     # Ordena por tier (A+ > A > B) e depois score
     tier_order = {"A+": 0, "A": 1, "B": 2}

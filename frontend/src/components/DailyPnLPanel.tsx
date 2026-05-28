@@ -368,53 +368,95 @@ export default function DailyPnLPanel({ onClose }: Props) {
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
       <div className="w-full max-w-5xl max-h-[92vh] bg-[#0a0e1a] border border-slate-700 rounded-xl flex flex-col overflow-hidden shadow-2xl">
 
-        {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-gradient-to-r from-slate-900 to-slate-800">
-          <div className="flex items-center gap-2">
-            <BarChart3 className="w-5 h-5 text-emerald-400" />
-            <h2 className="text-base font-bold text-white">{isRange ? 'Resultado do Período' : 'Resultado do Dia'}</h2>
-            <span className="text-xs text-slate-500 hidden sm:inline">· P&L das recomendações</span>
+        {/* Header — responsivo: 1 linha desktop, 2 linhas mobile (título+X em cima, controles embaixo) */}
+        <div className="border-b border-slate-800 bg-gradient-to-r from-slate-900 to-slate-800">
+          {/* Linha 1: título + close (X sempre visível, mesmo no mobile) */}
+          <div className="flex items-center justify-between px-4 py-3 gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <BarChart3 className="w-5 h-5 text-emerald-400 shrink-0" />
+              <h2 className="text-base font-bold text-white truncate">{isRange ? 'Resultado do Período' : 'Resultado do Dia'}</h2>
+              <span className="text-xs text-slate-500 hidden sm:inline">· P&L das recomendações</span>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              {/* Controles inline no desktop (sm+) */}
+              <div className="hidden sm:flex items-center gap-2">
+                <div className="flex items-center gap-1 bg-slate-800 border border-slate-700 rounded px-2 py-1">
+                  <Calendar className="w-3.5 h-3.5 text-slate-400" />
+                  <input
+                    type="date"
+                    value={date}
+                    onChange={e => {
+                      const v = e.target.value
+                      setDate(v)
+                      if (endDate < v) setEndDate(v)
+                    }}
+                    className="bg-transparent text-xs text-slate-200 outline-none"
+                    max={todayISO()}
+                    title="Data inicial"
+                  />
+                  <span className="text-slate-600 text-xs">→</span>
+                  <input
+                    type="date"
+                    value={endDate}
+                    onChange={e => setEndDate(e.target.value)}
+                    className="bg-transparent text-xs text-slate-200 outline-none"
+                    min={date}
+                    max={todayISO()}
+                    title="Data final"
+                  />
+                </div>
+                {(date !== todayISO() || endDate !== todayISO()) && (
+                  <button
+                    onClick={() => { setDate(todayISO()); setEndDate(todayISO()) }}
+                    className="px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-[10px] text-slate-300"
+                    title="Voltar pra hoje"
+                  >Hoje</button>
+                )}
+                <button onClick={() => load(date, endDate)} disabled={loading}
+                  className="flex items-center gap-1 px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-xs text-slate-300 disabled:opacity-50">
+                  <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+                </button>
+              </div>
+              {/* X close — sempre visível, shrink-0 */}
+              <button onClick={onClose} className="p-2 hover:bg-slate-800 rounded shrink-0" aria-label="Fechar">
+                <X className="w-5 h-5 text-slate-300" />
+              </button>
+            </div>
           </div>
-          <div className="flex items-center gap-2 flex-wrap justify-end">
-            <div className="flex items-center gap-1 bg-slate-800 border border-slate-700 rounded px-2 py-1">
-              <Calendar className="w-3.5 h-3.5 text-slate-400" />
+          {/* Linha 2: controles no mobile (sm:hidden) */}
+          <div className="flex sm:hidden items-center gap-2 px-4 pb-3 flex-wrap">
+            <div className="flex items-center gap-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 flex-1 min-w-0">
+              <Calendar className="w-3.5 h-3.5 text-slate-400 shrink-0" />
               <input
                 type="date"
                 value={date}
                 onChange={e => {
                   const v = e.target.value
                   setDate(v)
-                  // se o end estava antes do novo start, ajusta
                   if (endDate < v) setEndDate(v)
                 }}
-                className="bg-transparent text-xs text-slate-200 outline-none"
+                className="bg-transparent text-xs text-slate-200 outline-none min-w-0 flex-1"
                 max={todayISO()}
-                title="Data inicial"
               />
-              <span className="text-slate-600 text-xs">→</span>
+              <span className="text-slate-600 text-xs shrink-0">→</span>
               <input
                 type="date"
                 value={endDate}
                 onChange={e => setEndDate(e.target.value)}
-                className="bg-transparent text-xs text-slate-200 outline-none"
+                className="bg-transparent text-xs text-slate-200 outline-none min-w-0 flex-1"
                 min={date}
                 max={todayISO()}
-                title="Data final (= inicial pra ver só 1 dia)"
               />
             </div>
             {(date !== todayISO() || endDate !== todayISO()) && (
               <button
                 onClick={() => { setDate(todayISO()); setEndDate(todayISO()) }}
-                className="px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-[10px] text-slate-300"
-                title="Voltar pra hoje"
+                className="px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-[10px] text-slate-300 shrink-0"
               >Hoje</button>
             )}
             <button onClick={() => load(date, endDate)} disabled={loading}
-              className="flex items-center gap-1 px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-xs text-slate-300 disabled:opacity-50">
+              className="flex items-center gap-1 px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-xs text-slate-300 disabled:opacity-50 shrink-0">
               <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-            </button>
-            <button onClick={onClose} className="p-1 hover:bg-slate-800 rounded">
-              <X className="w-5 h-5 text-slate-400" />
             </button>
           </div>
         </div>
