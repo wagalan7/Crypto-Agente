@@ -414,6 +414,52 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
     return "\n".join(lines)
 
 
+_GREETING_TOKENS = {
+    "oi", "olá", "ola", "ooi", "oii", "oiii", "oie", "opa", "eai", "e ai", "ei",
+    "bom dia", "boa tarde", "boa noite",
+    "tudo bem", "tudo bem?", "td bem", "td bm",
+    "boa", "blz", "beleza",
+}
+
+def _is_simple_greeting(text: str) -> bool:
+    """Detecta saudação curta sem outra intenção embutida.
+    Critério: até 25 chars, sem dígitos, e composto apenas por uma das
+    expressões de cumprimento (com emojis/pontuação opcionais)."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    if len(t) > 25 or any(ch.isdigit() for ch in t):
+        return False
+    # Remove emojis/pontuação básica
+    cleaned = "".join(ch for ch in t if ch.isalpha() or ch.isspace() or ch == "?").strip()
+    cleaned = " ".join(cleaned.split())  # colapsa espaços
+    if not cleaned:
+        return False
+    return cleaned in _GREETING_TOKENS
+
+
+def _greeting_reply(tenant: dict, phone: str) -> str:
+    """Resposta determinística para saudações — não passa pelo LLM."""
+    tenant_id = tenant["id"]
+    # Tenta usar primeiro nome se já cadastrado.
+    nome = ""
+    try:
+        patient = db.get_patient(tenant_id, phone)
+        if patient and patient.get("name"):
+            nome = patient["name"].split()[0]
+    except Exception:
+        pass
+    if not nome:
+        try:
+            appt = cal.get_next_appointment(tenant_id, phone)
+            if appt and appt.get("patient_name"):
+                nome = appt["patient_name"].split()[0]
+        except Exception:
+            pass
+    saud = f"Olá, {nome}!" if nome else "Olá!"
+    return f"{saud} 😊 Tudo bem? Como posso te ajudar hoje?"
+
+
 def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResponse]:
     """
     Processa uma mensagem e retorna (reply, agent_response).
@@ -421,6 +467,16 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     """
     tenant_id = tenant["id"]
     db.save_message(tenant_id, phone, "user", text)
+
+    # ── Atalho determinístico para saudações ────────────────────────────────────
+    # Antes o LLM às vezes devolvia JSON malformado para "Olá" e caíamos no
+    # fallback "Desculpe, não entendi". Saudação simples nunca precisa de LLM.
+    if _is_simple_greeting(text):
+        reply = _greeting_reply(tenant, phone)
+        db.save_message(tenant_id, phone, "assistant", reply)
+        logger.info(f"[{tenant['slug']}][{phone}] saudação simples — resposta determinística")
+        return reply, AgentResponse(intent=Intent.other, action=Action.none,
+                                     response_text=reply, data={}), None
 
     # limit aumentado de 6 → 24 para garantir cobertura de manhã, tarde e noite
     # em vários dias, permitindo ao LLM filtrar quando paciente pede "tarde"/"manhã"

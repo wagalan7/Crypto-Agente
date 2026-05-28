@@ -375,11 +375,41 @@ def _norm_digits(phone: str) -> str:
 
 
 def is_agent_paused(tenant_id: int, phone: str) -> bool:
-    phone = _norm_digits(phone)
+    """Verifica pause tolerando divergência de DDI (55) e do dígito 9
+    do celular brasileiro entre o que foi gravado e o que chega no webhook.
+
+    Exemplo: usuária pausou '41988667599' pelo painel mas o Z-API entrega
+    '5541988667599'. Antes, isso causava o agente a continuar respondendo
+    um paciente 'pausado'. Agora as variantes plausíveis são todas
+    consultadas com IN (...).
+    """
+    p = _norm_digits(phone)
+    if not p:
+        return False
+    variantes = {p}
+    # Sem DDI 55 → adiciona com
+    if not p.startswith("55") and len(p) >= 10:
+        variantes.add("55" + p)
+    # Com DDI 55 → adiciona sem
+    if p.startswith("55") and len(p) >= 12:
+        variantes.add(p[2:])
+    # Variantes com/sem o "9" extra do celular (após DDD)
+    extra = set()
+    for v in list(variantes):
+        if v.startswith("55") and len(v) == 13 and v[4] == "9":
+            extra.add(v[:4] + v[5:])  # remove o 9
+        elif v.startswith("55") and len(v) == 12:
+            extra.add(v[:4] + "9" + v[4:])  # adiciona o 9
+        elif len(v) == 11 and v[2] == "9":
+            extra.add(v[:2] + v[3:])
+        elif len(v) == 10:
+            extra.add(v[:2] + "9" + v[2:])
+    variantes |= extra
+    placeholders = ",".join("?" * len(variantes))
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT 1 FROM agent_paused WHERE tenant_id = ? AND phone = ?",
-            (tenant_id, phone)
+            f"SELECT 1 FROM agent_paused WHERE tenant_id = ? AND phone IN ({placeholders})",
+            (tenant_id, *variantes),
         ).fetchone()
     return row is not None
 
