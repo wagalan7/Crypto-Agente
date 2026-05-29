@@ -31,7 +31,7 @@ if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
 from services.recommendation_backtest import (  # noqa: E402
-    run_backtest, run_walkforward, run_param_sweep,
+    run_backtest, run_walkforward, run_param_sweep, compute_equity_curve,
 )
 
 logging.basicConfig(
@@ -51,6 +51,29 @@ def parse_symbols(s: str):
             raw = f"{raw}/USDT:USDT"
         out.append(raw)
     return out
+
+
+def parse_equity_spec(spec: str):
+    """Aceita '10000:1.0' (balance:risk_pct). Default risk 1.0."""
+    if ":" in spec:
+        bal_s, risk_s = spec.split(":", 1)
+        return float(bal_s), float(risk_s)
+    return float(spec), 1.0
+
+
+def print_equity_block(eq: dict, label: str = ""):
+    tag = f" [{label}]" if label else ""
+    ret_color = "+" if eq["total_return_pct"] >= 0 else ""
+    print(f"  Equity{tag}: ${eq['starting_balance']:,.0f} → "
+          f"${eq['final_balance']:,.2f}  "
+          f"({ret_color}{eq['total_return_pct']:.2f}% em {eq['n_trades']} trades, "
+          f"risk {eq['risk_pct']}%)")
+    print(f"    PnL: {ret_color}${eq['total_pnl_usd']:,.2f}  "
+          f"avg ${eq['avg_pnl_usd']:+,.2f}/trade  "
+          f"best ${eq['best_trade_usd']:+,.2f}  worst ${eq['worst_trade_usd']:+,.2f}")
+    print(f"    Max DD: {eq['max_account_dd_pct']:.2f}% "
+          f"(${eq['max_account_dd_usd']:,.2f})  "
+          f"streak W={eq['winning_streak_max']}  L={eq['losing_streak_max']}")
 
 
 def print_metrics_block(label: str, m: dict):
@@ -94,6 +117,8 @@ async def main():
                     help="se >=2, roda walk-forward com N janelas temporais (default 0=off)")
     ap.add_argument("--sweep", type=str, default=None,
                     help="param sweep: PARAM=v1,v2,v3 (ex: ATR_TRAIL_K=2.0,2.2,2.5)")
+    ap.add_argument("--equity", type=str, default=None,
+                    help="simula equity: START:RISK_PCT (ex: 10000:1.0 = $10k 1% risk)")
     args = ap.parse_args()
 
     symbols = parse_symbols(args.symbols)
@@ -106,6 +131,10 @@ async def main():
           f"× {args.days}d (step={args.step})")
     print(f"  symbols: {', '.join(s.split('/')[0] for s in symbols)}")
     print(f"  TFs:     {', '.join(timeframes)}\n")
+
+    eq_start, eq_risk = (None, None)
+    if args.equity:
+        eq_start, eq_risk = parse_equity_spec(args.equity)
 
     t0 = datetime.now()
     if args.sweep:
@@ -147,6 +176,25 @@ async def main():
                 cr_s = f"{cr:>5.2f}" if cr is not None else "    ∞"
                 line += f"  {wf['stability_pct']:>6.1f} {cr_s}"
             print(line)
+        # Equity por variante
+        if eq_start is not None:
+            print("\n  Equity por variante:")
+            for v in report["variants"]:
+                trades_v = v.get("_all_trades", [])
+                if not trades_v:
+                    print(f"    {str(v['value']):>10}: sem trades"); continue
+                eq = compute_equity_curve(trades_v, eq_start, eq_risk)
+                v["equity"] = {k: val for k, val in eq.items() if k != "equity_curve"}
+                ret_sign = "+" if eq["total_return_pct"] >= 0 else ""
+                print(f"    {str(v['value']):>10}: "
+                      f"${eq['final_balance']:,.2f}  "
+                      f"({ret_sign}{eq['total_return_pct']:.2f}%)  "
+                      f"DD={eq['max_account_dd_pct']:.2f}%  "
+                      f"avg ${eq['avg_pnl_usd']:+,.2f}/trade")
+                v.pop("_all_trades", None)
+        else:
+            for v in report["variants"]:
+                v.pop("_all_trades", None)
         # Por tier
         print("\n  Por tier:")
         for v in report["variants"]:
@@ -182,8 +230,28 @@ async def main():
             days_back=args.days, step_bars=args.step,
             end_dt=end_dt,
         )
-        report.pop("_all_trades", None)
     elapsed = (datetime.now() - t0).total_seconds()
+
+    # Equity opcional (usa _all_trades preservado por run_backtest/walkforward)
+    if eq_start is not None:
+        all_t = report.get("_all_trades", [])
+        if all_t:
+            eq_full = compute_equity_curve(all_t, eq_start, eq_risk)
+            report["equity"] = {k: v for k, v in eq_full.items() if k != "equity_curve"}
+            # Por tier
+            by_tier_eq = {}
+            for tier in ["A+", "A", "B"]:
+                tier_trades = [t for t in all_t if t.get("tier") == tier]
+                if tier_trades:
+                    by_tier_eq[tier] = compute_equity_curve(tier_trades, eq_start, eq_risk)
+            report["equity_by_tier"] = {
+                k: {kk: vv for kk, vv in eq.items() if kk != "equity_curve"}
+                for k, eq in by_tier_eq.items()
+            }
+        else:
+            report["equity"] = None
+    # Pop trades pra não inflar JSON
+    report.pop("_all_trades", None)
 
     # ── Imprime resumo ──────────────────────────────────────────────────────
     print(f"\n══════════ RESULTADO ({elapsed:.1f}s) ══════════")
@@ -217,6 +285,15 @@ async def main():
               f"n={m['total_trades']:>3} wr={m['win_rate_pct']:>5}% "
               f"PF={pf_s} R={m['total_r']:+7.2f} "
               f"DD={m['max_dd_r']:.2f}R")
+
+    if report.get("equity"):
+        print("\n─ Equity simulada ─")
+        print_equity_block(report["equity"], "ALL")
+        by_t = report.get("equity_by_tier", {})
+        for tier in ["A+", "A", "B"]:
+            if tier in by_t:
+                print()
+                print_equity_block(by_t[tier], tier)
 
     if "walkforward" in report:
         wf = report["walkforward"]

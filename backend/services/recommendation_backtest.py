@@ -456,6 +456,91 @@ def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+# ── Simulador de equity ──────────────────────────────────────────────────────
+# Converte trades R-based em curva de equity em $. Premissa: risco fixo em %
+# do balance atual a cada trade (composição). PnL_$ = balance_atual * (R/100)
+# * risk_pct. Modela como conta real cresceria/sofreria com a estratégia.
+#
+# Notas:
+# - Não considera fees nem slippage (em futuros perp BTC/USDT taker ~0.05%,
+#   slip ~0.02% — em 50 trades isso vira ~3-4% de drag. Ajuste mental: subtrair
+#   ~0.07% × n_trades do retorno final).
+# - Trades fora de ordem por símbolo são sequenciados por created_ts global.
+# - Account DD% mede pico→vale na curva de equity, não em R.
+
+def compute_equity_curve(
+    trades: List[Dict[str, Any]],
+    starting_balance: float = 10000.0,
+    risk_pct: float = 1.0,
+) -> Dict[str, Any]:
+    if not trades:
+        return {
+            "starting_balance": starting_balance,
+            "final_balance": starting_balance,
+            "total_pnl_usd": 0.0, "total_return_pct": 0.0,
+            "max_account_dd_pct": 0.0, "max_account_dd_usd": 0.0,
+            "n_trades": 0, "avg_pnl_usd": 0.0,
+            "winning_streak_max": 0, "losing_streak_max": 0,
+            "best_trade_usd": 0.0, "worst_trade_usd": 0.0,
+            "equity_curve": [],
+        }
+    sorted_trades = sorted(trades, key=lambda t: t["created_ts"])
+    risk_frac = risk_pct / 100.0
+    balance = starting_balance
+    peak = balance
+    max_dd_pct = 0.0
+    max_dd_usd = 0.0
+    cur_win_streak = 0
+    cur_lose_streak = 0
+    max_win_streak = 0
+    max_lose_streak = 0
+    best = float("-inf")
+    worst = float("inf")
+    curve: List[Dict[str, Any]] = [{"ts": sorted_trades[0]["created_ts"], "balance": round(balance, 2)}]
+    pnls: List[float] = []
+    for t in sorted_trades:
+        r = t["realized_r"]
+        risk_usd = balance * risk_frac
+        pnl_usd = risk_usd * r
+        balance += pnl_usd
+        pnls.append(pnl_usd)
+        if pnl_usd > best: best = pnl_usd
+        if pnl_usd < worst: worst = pnl_usd
+        if r > 0:
+            cur_win_streak += 1; cur_lose_streak = 0
+            if cur_win_streak > max_win_streak: max_win_streak = cur_win_streak
+        elif r < 0:
+            cur_lose_streak += 1; cur_win_streak = 0
+            if cur_lose_streak > max_lose_streak: max_lose_streak = cur_lose_streak
+        if balance > peak: peak = balance
+        dd_usd = peak - balance
+        dd_pct = (dd_usd / peak * 100) if peak > 0 else 0
+        if dd_pct > max_dd_pct:
+            max_dd_pct = dd_pct
+            max_dd_usd = dd_usd
+        curve.append({"ts": t.get("exit_ts") or t["created_ts"], "balance": round(balance, 2)})
+
+    total_pnl = balance - starting_balance
+    total_ret_pct = (total_pnl / starting_balance * 100) if starting_balance > 0 else 0
+    avg_pnl = sum(pnls) / len(pnls)
+    return {
+        "starting_balance": starting_balance,
+        "final_balance": round(balance, 2),
+        "total_pnl_usd": round(total_pnl, 2),
+        "total_return_pct": round(total_ret_pct, 2),
+        "max_account_dd_pct": round(max_dd_pct, 2),
+        "max_account_dd_usd": round(max_dd_usd, 2),
+        "n_trades": len(sorted_trades),
+        "avg_pnl_usd": round(avg_pnl, 2),
+        "winning_streak_max": max_win_streak,
+        "losing_streak_max": max_lose_streak,
+        "best_trade_usd": round(best, 2),
+        "worst_trade_usd": round(worst, 2),
+        "risk_pct": risk_pct,
+        "equity_curve": curve,
+    }
+
+
 def aggregate_report(all_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     by_tier: Dict[str, List[Dict[str, Any]]] = {"A+": [], "A": [], "B": []}
     by_symbol: Dict[str, List[Dict[str, Any]]] = {}
@@ -667,6 +752,7 @@ async def run_param_sweep(
                 "trades_count": report["trades_count"],
                 "by_tier": report["by_tier"],
                 "walkforward": report.get("walkforward"),
+                "_all_trades": report.get("_all_trades", []),
             })
     finally:
         setattr(module, attr, original)
@@ -704,6 +790,6 @@ async def run_walkforward(
     all_trades = report.get("_all_trades", [])
     wf = walkforward_report(all_trades, start_dt_actual, end_dt_actual, n_folds)
     report["walkforward"] = wf
-    # Não expor _all_trades no JSON final pra não inflar
-    report.pop("_all_trades", None)
+    # CLI decide se preserva _all_trades (pra equity) ou descarta antes
+    # de salvar o JSON.
     return report
