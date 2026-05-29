@@ -24,9 +24,12 @@ Fallback: enquanto não houver >= MIN_SAMPLE_TOTAL trades, retorna None
 e o frontend não mostra prob calibrada.
 """
 from __future__ import annotations
+import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
 from sqlalchemy import select, and_
@@ -96,37 +99,25 @@ def _pav_isotonic(values: List[float], weights: List[float]) -> List[float]:
     return result
 
 
-async def _compute_calibration() -> Optional[Dict[str, Any]]:
+def compute_calibration_from_pairs(
+    pairs: List[Tuple[float, str]],
+    source: str = "db",
+) -> Optional[Dict[str, Any]]:
     """
-    Calcula tabela score-bin → P(TP1) calibrada.
-    Retorna None se não houver dados suficientes.
+    Núcleo puro: dado lista de (score, status) → tabela de bins calibrada.
+    `status` precisa estar em RESOLVED_STATUSES; vitórias contam pra P.
+
+    Não checa MIN_SAMPLE_TOTAL — chamador decide. Retorna None se vazio.
     """
-    if not DB_ENABLED:
+    total = len(pairs)
+    if total == 0:
         return None
-
-    since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-    async with get_session() as session:
-        stmt = select(
-            RecommendationSnapshot.score,
-            RecommendationSnapshot.status,
-        ).where(and_(
-            RecommendationSnapshot.outcome_at >= since,
-            RecommendationSnapshot.status.in_(RESOLVED_STATUSES),
-        ))
-        rows = (await session.execute(stmt)).all()
-
-    total = len(rows)
-    if total < MIN_SAMPLE_TOTAL:
-        return None
-
-    # P_global
-    wins_global = sum(1 for _, st in rows if st in WIN_STATUSES)
+    wins_global = sum(1 for _, st in pairs if st in WIN_STATUSES)
     p_global = wins_global / total
 
-    # Per-bin counts
     bin_total = [0] * len(SCORE_BINS)
     bin_wins = [0] * len(SCORE_BINS)
-    for score, status in rows:
+    for score, status in pairs:
         bi = _bin_index(float(score))
         if bi < 0:
             continue
@@ -134,9 +125,7 @@ async def _compute_calibration() -> Optional[Dict[str, Any]]:
         if status in WIN_STATUSES:
             bin_wins[bi] += 1
 
-    # P_observed + shrinkage bayesiano
-    bin_p_raw = []
-    bin_p_shrunk = []
+    bin_p_raw, bin_p_shrunk = [], []
     for i in range(len(SCORE_BINS)):
         n = bin_total[i]
         if n == 0:
@@ -148,12 +137,9 @@ async def _compute_calibration() -> Optional[Dict[str, Any]]:
             bin_p_raw.append(p_obs)
             bin_p_shrunk.append(p_shr)
 
-    # PAV: força monotonicidade não-decrescente
-    # Peso = max(1, n) pra bins vazios não dominarem
     weights = [max(1.0, float(n)) for n in bin_total]
     bin_p_calibrated = _pav_isotonic(bin_p_shrunk, weights)
 
-    # Constrói saída
     bins_out = []
     for i, (lo, hi) in enumerate(SCORE_BINS):
         bins_out.append({
@@ -166,9 +152,9 @@ async def _compute_calibration() -> Optional[Dict[str, Any]]:
             "p_shrunk": round(bin_p_shrunk[i], 4),
             "p_calibrated": round(bin_p_calibrated[i], 4),
         })
-
     return {
         "enabled": True,
+        "source": source,
         "total_resolved": total,
         "wins_global": wins_global,
         "p_global": round(p_global, 4),
@@ -176,6 +162,76 @@ async def _compute_calibration() -> Optional[Dict[str, Any]]:
         "computed_at": datetime.now(timezone.utc).isoformat(),
         "bins": bins_out,
     }
+
+
+def _load_seed_pairs() -> List[Tuple[float, str]]:
+    """
+    Lê seed externo (ex: gerado pelo scripts/seed_calibration.py a partir
+    de backtest). Caminho via env CALIBRATION_SEED_PATH. Formato JSON:
+      {"pairs": [{"score": 78.3, "status": "won_tp2"}, ...]}
+    Trades virtuais — não substituem dados reais, são complementares.
+    """
+    path = os.getenv("CALIBRATION_SEED_PATH")
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        log.warning(f"[calibration] CALIBRATION_SEED_PATH={path} não existe")
+        return []
+    try:
+        data = json.loads(p.read_text())
+        pairs_raw = data.get("pairs", [])
+        out = []
+        for r in pairs_raw:
+            sc = r.get("score")
+            st = r.get("status")
+            if sc is None or st not in RESOLVED_STATUSES:
+                continue
+            out.append((float(sc), st))
+        log.info(f"[calibration] seed carregado: {len(out)} pares de {path}")
+        return out
+    except Exception as e:
+        log.warning(f"[calibration] falha lendo seed {path}: {e}")
+        return []
+
+
+async def _compute_calibration() -> Optional[Dict[str, Any]]:
+    """
+    Calcula tabela score-bin → P(TP1) calibrada combinando:
+      1. Trades reais resolvidos do DB (últimos LOOKBACK_DAYS)
+      2. Trades sintéticos do backtest (se CALIBRATION_SEED_PATH setado)
+    Retorna None se total < MIN_SAMPLE_TOTAL.
+    """
+    pairs: List[Tuple[float, str]] = []
+    real_count = 0
+    if DB_ENABLED:
+        since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+        try:
+            async with get_session() as session:
+                stmt = select(
+                    RecommendationSnapshot.score,
+                    RecommendationSnapshot.status,
+                ).where(and_(
+                    RecommendationSnapshot.outcome_at >= since,
+                    RecommendationSnapshot.status.in_(RESOLVED_STATUSES),
+                ))
+                rows = (await session.execute(stmt)).all()
+                for sc, st in rows:
+                    pairs.append((float(sc), st))
+                real_count = len(rows)
+        except Exception as e:
+            log.warning(f"[calibration] DB read falhou: {e}")
+
+    seed_pairs = _load_seed_pairs()
+    pairs.extend(seed_pairs)
+
+    if len(pairs) < MIN_SAMPLE_TOTAL:
+        return None
+
+    source = "db" if not seed_pairs else (
+        f"db({real_count})+seed({len(seed_pairs)})" if real_count > 0 else "seed"
+    )
+    return compute_calibration_from_pairs(pairs, source=source)
 
 
 async def get_calibration() -> Optional[Dict[str, Any]]:
