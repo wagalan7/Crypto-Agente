@@ -601,6 +601,89 @@ def walkforward_report(
     }
 
 
+# ── Param sweep ──────────────────────────────────────────────────────────────
+# Roda o mesmo dataset histórico variando 1 constante (ex.: ATR_TRAIL_K,
+# MIN_RR) e reporta métricas comparativas. Útil pra A/B testing rápido:
+# "subir K de 2.2 pra 2.5 ajuda ou piora?".
+#
+# Aceita "module.CONST" e faz monkey-patch via setattr no módulo. Funções
+# leem do globals do módulo a cada call, então o patch tem efeito imediato
+# nas próximas iterações.
+
+_SWEEPABLE_PARAMS: Dict[str, Any] = {
+    "MIN_RR":            ("services.recommendation_service", float),
+    "MIN_CONFIDENCE_B":  ("services.recommendation_service", float),
+    "ATR_TRAIL_K":       ("services.snapshot_service", float),
+    "BE_PLUS_LOCK_R":    ("services.snapshot_service", float),
+    "EXPIRY_HOURS":      ("services.snapshot_service", int),
+    "DEDUP_WINDOW_HOURS":("services.snapshot_service", int),
+}
+
+
+def _resolve_param(param_name: str):
+    if param_name not in _SWEEPABLE_PARAMS:
+        raise ValueError(
+            f"param '{param_name}' não é sweepável. Suportados: "
+            f"{sorted(_SWEEPABLE_PARAMS.keys())}"
+        )
+    mod_path, caster = _SWEEPABLE_PARAMS[param_name]
+    import importlib
+    module = importlib.import_module(mod_path)
+    return module, param_name, caster
+
+
+async def run_param_sweep(
+    symbols: List[str], timeframes: List[str],
+    param_name: str, values: List[Any],
+    days_back: int = 90, step_bars: int = 1,
+    n_folds: int = 0,
+    end_dt: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    module, attr, caster = _resolve_param(param_name)
+    original = getattr(module, attr)
+    log.info(f"[sweep] {param_name} original={original}, testando {values}")
+
+    variants: List[Dict[str, Any]] = []
+    try:
+        for v in values:
+            v_cast = caster(v)
+            setattr(module, attr, v_cast)
+            log.info(f"[sweep] === {param_name} = {v_cast} ===")
+            if n_folds and n_folds >= 2:
+                report = await run_walkforward(
+                    symbols=symbols, timeframes=timeframes,
+                    days_back=days_back, step_bars=step_bars,
+                    n_folds=n_folds, end_dt=end_dt,
+                )
+            else:
+                report = await run_backtest(
+                    symbols=symbols, timeframes=timeframes,
+                    days_back=days_back, step_bars=step_bars, end_dt=end_dt,
+                )
+                report.pop("_all_trades", None)
+            variants.append({
+                "value": v_cast,
+                "summary": report["summary"],
+                "trades_count": report["trades_count"],
+                "by_tier": report["by_tier"],
+                "walkforward": report.get("walkforward"),
+            })
+    finally:
+        setattr(module, attr, original)
+        log.info(f"[sweep] restaurado {param_name} = {original}")
+
+    return {
+        "param": param_name,
+        "original_value": original,
+        "variants": variants,
+        "params": {
+            "symbols": symbols, "timeframes": timeframes,
+            "days_back": days_back, "step_bars": step_bars,
+            "n_folds": n_folds,
+        },
+    }
+
+
 async def run_walkforward(
     symbols: List[str], timeframes: List[str],
     days_back: int = 90, step_bars: int = 1,

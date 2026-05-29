@@ -30,7 +30,9 @@ _BACKEND = _THIS.parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from services.recommendation_backtest import run_backtest, run_walkforward  # noqa: E402
+from services.recommendation_backtest import (  # noqa: E402
+    run_backtest, run_walkforward, run_param_sweep,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,6 +92,8 @@ async def main():
                     help="data final ISO (default: agora). útil pra walk-forward manual")
     ap.add_argument("--folds", type=int, default=0,
                     help="se >=2, roda walk-forward com N janelas temporais (default 0=off)")
+    ap.add_argument("--sweep", type=str, default=None,
+                    help="param sweep: PARAM=v1,v2,v3 (ex: ATR_TRAIL_K=2.0,2.2,2.5)")
     args = ap.parse_args()
 
     symbols = parse_symbols(args.symbols)
@@ -104,6 +108,68 @@ async def main():
     print(f"  TFs:     {', '.join(timeframes)}\n")
 
     t0 = datetime.now()
+    if args.sweep:
+        if "=" not in args.sweep:
+            print("--sweep precisa de formato PARAM=v1,v2,v3"); return
+        pname, vstr = args.sweep.split("=", 1)
+        values = [v.strip() for v in vstr.split(",") if v.strip()]
+        print(f"\n▶ Param sweep: {pname} = {values}\n")
+        report = await run_param_sweep(
+            symbols=symbols, timeframes=timeframes,
+            param_name=pname.strip(), values=values,
+            days_back=args.days, step_bars=args.step,
+            n_folds=args.folds, end_dt=end_dt,
+        )
+        elapsed = (datetime.now() - t0).total_seconds()
+        print(f"\n══════════ SWEEP {report['param']} ({elapsed:.1f}s) ══════════")
+        print(f"  original: {report['original_value']}\n")
+        # Cabeçalho
+        print(f"  {'value':>10} {'n':>4} {'wr%':>6} {'PF':>6} {'R':>8} "
+              f"{'avgR':>7} {'expR':>7} {'DD':>6}", end="")
+        if args.folds and args.folds >= 2:
+            print(f"  {'stab%':>6} {'cons':>5}")
+        else:
+            print()
+        for v in report["variants"]:
+            m = v["summary"]
+            if not m or m.get("total_trades", 0) == 0:
+                print(f"  {str(v['value']):>10} sem trades")
+                continue
+            pf = m["profit_factor"]
+            pf_s = f"{pf:>6.2f}" if pf is not None else "    ∞ "
+            line = (f"  {str(v['value']):>10} {m['total_trades']:>4} "
+                    f"{m['win_rate_pct']:>6.1f} {pf_s} {m['total_r']:>+8.2f} "
+                    f"{m['avg_r']:>+7.3f} {m['expectancy_r']:>+7.3f} "
+                    f"{m['max_dd_r']:>5.2f}R")
+            if v.get("walkforward"):
+                wf = v["walkforward"]
+                cr = wf["consistency_ratio"]
+                cr_s = f"{cr:>5.2f}" if cr is not None else "    ∞"
+                line += f"  {wf['stability_pct']:>6.1f} {cr_s}"
+            print(line)
+        # Por tier
+        print("\n  Por tier:")
+        for v in report["variants"]:
+            tiers = v.get("by_tier", {})
+            line_bits = [f"{str(v['value']):>10}"]
+            for tier in ["A+", "A", "B"]:
+                if tier in tiers:
+                    tm = tiers[tier]
+                    pf = tm["profit_factor"]
+                    pf_s = f"{pf:.1f}" if pf is not None else "∞"
+                    line_bits.append(
+                        f"{tier} n={tm['total_trades']} wr={tm['win_rate_pct']}% "
+                        f"PF={pf_s} R={tm['total_r']:+.1f}"
+                    )
+                else:
+                    line_bits.append(f"{tier} -")
+            print("    " + "  ·  ".join(line_bits))
+        if args.out:
+            Path(args.out).write_text(json.dumps(report, indent=2, default=str))
+            print(f"\n✓ JSON completo salvo em {args.out}")
+        print()
+        return
+
     if args.folds and args.folds >= 2:
         report = await run_walkforward(
             symbols=symbols, timeframes=timeframes,
