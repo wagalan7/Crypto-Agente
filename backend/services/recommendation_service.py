@@ -72,13 +72,25 @@ _cache: Dict[str, Any] = {"ts": 0, "data": None}
 
 
 def _compute_score(sig: TradeSignal) -> float:
-    """Score 0–100. Combina confluence + MTF + R:R + win-rate histórico."""
+    """
+    Score 0–100. Combina confluence + MTF + R:R + win-rate histórico + derivatives.
+
+    Mudanças vs versão anterior (ceiling 75):
+      • RR cap 5→3: RR=3 (excelente) agora vale 100% do componente. Antes
+        RR=3 dava só 60% — A+ era inalcançável organicamente.
+      • Pesos rebalanceados: conf 0.45→0.35, mtf 0.30→0.25, RR 0.20→0.25,
+        + novo der 0.10. Mantém soma=1.0 + win_bonus aditivo.
+      • Derivatives entram via _derivatives_score (-15 a +15):
+        - funding neutro/contra-trade = bom; extremo a favor = ruim
+        - OI a favor da direção = bom
+    """
     conf_score = (sig.confluence.pct if sig.confluence else sig.confidence * 100)
     mtf_score = 50.0
     if sig.mtf:
         # mtf.alignment_score vai de -1 a +1 → mapeia pra 0–100
         mtf_score = (sig.mtf.get("alignment_score", 0) + 1) * 50
-    rr_score = min(sig.risk_reward / 5.0, 1.0) * 100
+    # RR cap em 3 (era 5). RR=3 vira 100, RR=2 vira 67. Mais diferenciação.
+    rr_score = min(sig.risk_reward / 3.0, 1.0) * 100
     win_bonus = 0.0
     if sig.pattern_stats and sig.pattern_stats.get("stats"):
         win_rates = [
@@ -88,9 +100,74 @@ def _compute_score(sig: TradeSignal) -> float:
         if win_rates:
             avg = sum(win_rates) / len(win_rates)
             win_bonus = (avg - 0.5) * 20   # ±10 pontos
-    # Pesos: confluence 0.45, MTF 0.30, R:R 0.20, win-rate ±5
-    score = conf_score * 0.45 + mtf_score * 0.30 + rr_score * 0.20 + win_bonus * 0.5
+    # Derivatives score: 50 = neutro, 0–100. Penaliza crowded trades.
+    der_score = _derivatives_score(sig)
+    # Pesos: conf 0.35, MTF 0.25, R:R 0.25, der 0.10 (soma 0.95) + win ±5
+    score = (
+        conf_score * 0.35
+        + mtf_score * 0.25
+        + rr_score * 0.25
+        + der_score * 0.10
+        + win_bonus * 0.5
+    )
     return round(max(0.0, min(100.0, score)), 1)
+
+
+def _derivatives_score(sig: TradeSignal) -> float:
+    """
+    Score 0–100 baseado em sentimento de derivatives. 50 = neutro/sem dados.
+
+    Lógica:
+      • Funding contra a direção do trade (short squeeze pra LONG / long
+        squeeze pra SHORT) → +20 (gatilho de movimento a favor).
+      • Funding neutro → +10 (sem crowded trade).
+      • Funding moderado a favor (bullish_squeeze p/ long) → -10 (crowded).
+      • Funding extremo a favor → -25 (alto risco de liquidação contrária).
+      • OI a favor da direção (LONG + oi bullish, SHORT + oi bearish) → +10.
+      • OI contra → -10.
+    """
+    der = sig.derivatives
+    if not der:
+        return 50.0
+
+    score = 50.0
+    funding_sent = getattr(der, "funding_sentiment", None) or (
+        der.get("funding_sentiment") if isinstance(der, dict) else None
+    )
+    oi_sent = getattr(der, "oi_sentiment", None) or (
+        der.get("oi_sentiment") if isinstance(der, dict) else None
+    )
+
+    is_long = sig.direction == SignalDirection.LONG
+    is_short = sig.direction == SignalDirection.SHORT
+
+    # Funding
+    if funding_sent == "neutral":
+        score += 10
+    elif is_long and funding_sent == "extreme_long":
+        score -= 25
+    elif is_short and funding_sent == "extreme_short":
+        score -= 25
+    elif is_long and funding_sent == "bullish_squeeze":
+        score -= 10
+    elif is_short and funding_sent == "bearish_squeeze":
+        score -= 10
+    elif is_long and funding_sent in ("extreme_short", "bearish_squeeze"):
+        score += 20   # short squeeze a favor do long
+    elif is_short and funding_sent in ("extreme_long", "bullish_squeeze"):
+        score += 20
+
+    # OI
+    if is_long and oi_sent == "bullish":
+        score += 10
+    elif is_short and oi_sent == "bearish":
+        score += 10
+    elif is_long and oi_sent == "bearish":
+        score -= 10
+    elif is_short and oi_sent == "bullish":
+        score -= 10
+
+    return max(0.0, min(100.0, score))
 
 
 def _has_liquidity_squeeze_risk(sig: TradeSignal) -> bool:
