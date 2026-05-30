@@ -1301,6 +1301,43 @@ async def debug_vision_pipeline():
     return stages
 
 
+@app.post("/api/debug/push-broadcast-test")
+async def debug_push_broadcast_test():
+    """
+    Envia um push de TESTE pra todas subscriptions ativas — não depende
+    de scan/mercado. Usado pra confirmar que push funciona com app fechado.
+    """
+    from services.push_service import PUSH_ENABLED, _send_one
+    from db import DB_ENABLED, get_session
+    from models.push_subscription import PushSubscription
+    from sqlalchemy import select
+    if not PUSH_ENABLED or not DB_ENABLED:
+        return {"enabled": False}
+    async with get_session() as session:
+        stmt = select(PushSubscription).where(PushSubscription.active.is_(True))
+        subs = (await session.execute(stmt)).scalars().all()
+    payload = {
+        "title": "🧪 Teste de push",
+        "body": "Se você vê isto com o app/painel fechado, push está OK.",
+        "tag": "test-broadcast",
+        "data": {"url": "/", "event": "test"},
+    }
+    sent = 0
+    errors = []
+    for sub in subs:
+        try:
+            ok = await _send_one(sub, payload)
+            if ok:
+                sent += 1
+        except Exception as e:
+            errors.append(str(e)[:120])
+    return {
+        "total_subscriptions": len(subs),
+        "sent": sent,
+        "errors": errors,
+    }
+
+
 @app.post("/api/debug/backfill-notify-b")
 async def debug_backfill_notify_b():
     """
