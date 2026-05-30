@@ -479,6 +479,34 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
                     </div>
                   </div>
 
+                  {/* Preço atual vs entry — mostra delta sempre que houver current_price.
+                      Ajuda usuário a julgar se rec ainda é "fresca" ou se preço já fugiu. */}
+                  {r.current_price != null && r.entry != null && (() => {
+                    const isLong = r.direction === 'long'
+                    const delta = r.current_price - r.entry
+                    const deltaFav = isLong ? delta : -delta  // positivo = preço já correu a favor
+                    const deltaPct = (deltaFav / r.entry) * 100
+                    const lvl = r.chase_level  // 'ok' | 'extended' | 'chasing' | null
+                    const color =
+                      lvl === 'chasing' ? 'text-red-300 border-red-500/30 bg-red-500/10'
+                      : lvl === 'extended' ? 'text-yellow-300 border-yellow-500/30 bg-yellow-500/10'
+                      : deltaFav < 0 ? 'text-emerald-300 border-emerald-500/30 bg-emerald-500/10'
+                      : 'text-slate-300 border-slate-700/50 bg-slate-800/40'
+                    const arrow = deltaFav >= 0 ? '↑ a favor' : '↓ abaixo do entry'
+                    const atrPart = r.chase_atr != null ? ` · ${r.chase_atr}×ATR` : ''
+                    return (
+                      <div className={`mt-2 flex items-center justify-between gap-2 text-[10px] rounded px-2 py-1 border ${color}`}>
+                        <span>
+                          Preço agora <span className="font-mono font-bold">{fmt(r.current_price)}</span>
+                          <span className="text-slate-500 ml-1">vs entry {fmt(r.entry)}</span>
+                        </span>
+                        <span className="font-mono">
+                          {deltaFav >= 0 ? '+' : ''}{deltaPct.toFixed(2)}% {arrow}{atrPart}
+                        </span>
+                      </div>
+                    )
+                  })()}
+
                   {/* Badge histórico — aprendizado contínuo */}
                   {hist && hist.trades > 0 && (
                     <div className={`mt-2 flex items-center gap-1.5 text-[10px] rounded px-2 py-1 ${

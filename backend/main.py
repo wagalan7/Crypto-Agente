@@ -1301,6 +1301,44 @@ async def debug_vision_pipeline():
     return stages
 
 
+@app.post("/api/debug/backfill-notify-b")
+async def debug_backfill_notify_b():
+    """
+    One-shot: marca notify_b=True em todas subscriptions existentes que
+    estavam com False (default antigo). Após este endpoint rodar, todos
+    subscribers ativos passam a receber push de tier B (era 0% antes).
+
+    Idempotente: rodar de novo não muda nada (só conta 0 affected).
+    """
+    from db import DB_ENABLED, get_session
+    from models.push_subscription import PushSubscription
+    from sqlalchemy import update, select, func
+    if not DB_ENABLED:
+        return {"enabled": False}
+    async with get_session() as session:
+        # Conta antes
+        total_q = await session.execute(select(func.count(PushSubscription.id)))
+        total = total_q.scalar() or 0
+        off_q = await session.execute(
+            select(func.count(PushSubscription.id)).where(PushSubscription.notify_b == False)
+        )
+        off_before = off_q.scalar() or 0
+
+        # UPDATE
+        result = await session.execute(
+            update(PushSubscription)
+            .where(PushSubscription.notify_b == False)
+            .values(notify_b=True)
+        )
+        await session.commit()
+
+        return {
+            "total_subscriptions": total,
+            "notify_b_off_before": off_before,
+            "updated_rows": result.rowcount,
+        }
+
+
 @app.get("/api/debug/binance-reachability")
 async def debug_binance_reachability():
     """

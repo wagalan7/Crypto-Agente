@@ -1,16 +1,29 @@
-/* Service Worker — Crypto AI Agent
+/* Service Worker — Crypto Win
  * Recebe push notifications e gerencia clicks.
  * Sem cache offline (PWA leve — apenas vehicle pra notificações).
+ *
+ * IMPORTANTE: bump CACHE_VERSION sempre que mudar este arquivo OU quando
+ * quiser forçar revalidação de assets nos clientes (útil quando o usuário
+ * vê a UI desatualizada). O activate handler limpa TODOS os caches antigos.
  */
 
-const CACHE_VERSION = 'crypto-ai-v1';
+const CACHE_VERSION = 'crypto-win-v9';
 
 self.addEventListener('install', (event) => {
   self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(
+    Promise.all([
+      // Limpa qualquer Cache Storage antigo (caso versões futuras adicionem cache)
+      caches.keys().then(keys => Promise.all(
+        keys.filter(k => k !== CACHE_VERSION).map(k => caches.delete(k))
+      )),
+      // Toma controle imediato de todas as abas abertas
+      self.clients.claim(),
+    ])
+  );
 });
 
 self.addEventListener('push', (event) => {

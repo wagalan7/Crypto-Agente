@@ -14,7 +14,7 @@ Tiers:
   - A  : score ≥ 70, MTF score ≥ 0.0, R:R ≥ 2.0
   - B  : score ≥ 55, R:R ≥ 1.5
 
-Cache: 90s.
+Cache: 30s.
 """
 from __future__ import annotations
 import asyncio
@@ -32,7 +32,7 @@ from models.trade_signal import TradeSignal, SignalDirection
 
 
 SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
-CACHE_TTL = 90                    # segundos
+CACHE_TTL = 30                    # segundos (era 90 — reduzido pra rec menos stale)
 MIN_RR = 1.5                      # filtro mínimo absoluto
 MIN_CONFIDENCE_B = 0.55           # tier B mínimo
 
