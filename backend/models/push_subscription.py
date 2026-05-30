@@ -28,7 +28,10 @@ class PushSubscription(Base):
     # Filtros: usuário pode escolher quais tiers receber
     notify_a_plus: Mapped[bool] = mapped_column(Boolean, default=True)
     notify_a: Mapped[bool] = mapped_column(Boolean, default=True)
-    notify_b: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Default True: B é objetivamente o melhor tier do sistema atual
+    # (WR 84% PF 6.7), maior produção de sinais. Subscribers antigos com
+    # notify_b=False permanecem opt-out até trocarem na UI.
+    notify_b: Mapped[bool] = mapped_column(Boolean, default=True)
 
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)

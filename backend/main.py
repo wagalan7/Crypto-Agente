@@ -163,7 +163,7 @@ async def _server_scan_loop():
             )
 
             # Filtra só A+ e A (B não notifica por default do usuário)
-            pushable = [r for r in recs_dict if r.get("tier") in ("A+", "A")]
+            pushable = [r for r in recs_dict if r.get("tier") in ("A+", "A", "B")]
 
             newly_saved = 0
             if DB_ENABLED and recs_dict:
@@ -1407,7 +1407,7 @@ async def push_test_scan():
         if t in by_tier:
             by_tier[t] += 1
 
-    pushable = [r for r in recs_dict if r.get("tier") in ("A+", "A")]
+    pushable = [r for r in recs_dict if r.get("tier") in ("A+", "A", "B")]
 
     newly_saved = 0
     if DB_ENABLED and recs_dict:
