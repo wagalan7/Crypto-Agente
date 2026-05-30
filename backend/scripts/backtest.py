@@ -74,6 +74,10 @@ def print_equity_block(eq: dict, label: str = ""):
     print(f"    Max DD: {eq['max_account_dd_pct']:.2f}% "
           f"(${eq['max_account_dd_usd']:,.2f})  "
           f"streak W={eq['winning_streak_max']}  L={eq['losing_streak_max']}")
+    if eq.get("fees_total_usd", 0) > 0:
+        print(f"    Fees+slip: ${eq['fees_total_usd']:,.2f} total  "
+              f"(drag {eq['fee_drag_pct']:.2f}% do balance inicial · "
+              f"fee {eq['fee_pct_per_side']}%, slip {eq['slippage_pct_per_side']}%/side)")
 
 
 def print_metrics_block(label: str, m: dict):
@@ -119,6 +123,12 @@ async def main():
                     help="param sweep: PARAM=v1,v2,v3 (ex: ATR_TRAIL_K=2.0,2.2,2.5)")
     ap.add_argument("--equity", type=str, default=None,
                     help="simula equity: START:RISK_PCT (ex: 10000:1.0 = $10k 1% risk)")
+    ap.add_argument("--fee", type=float, default=0.0,
+                    help="fee taker por entrada/saída em %% do notional (ex: 0.05)")
+    ap.add_argument("--slip", type=float, default=0.0,
+                    help="slippage por entrada/saída em %% (ex: 0.02)")
+    ap.add_argument("--patterns", action="store_true",
+                    help="imprime breakdown WR/PF/R por pattern_type")
     args = ap.parse_args()
 
     symbols = parse_symbols(args.symbols)
@@ -183,7 +193,7 @@ async def main():
                 trades_v = v.get("_all_trades", [])
                 if not trades_v:
                     print(f"    {str(v['value']):>10}: sem trades"); continue
-                eq = compute_equity_curve(trades_v, eq_start, eq_risk)
+                eq = compute_equity_curve(trades_v, eq_start, eq_risk, args.fee, args.slip)
                 v["equity"] = {k: val for k, val in eq.items() if k != "equity_curve"}
                 ret_sign = "+" if eq["total_return_pct"] >= 0 else ""
                 print(f"    {str(v['value']):>10}: "
@@ -236,14 +246,14 @@ async def main():
     if eq_start is not None:
         all_t = report.get("_all_trades", [])
         if all_t:
-            eq_full = compute_equity_curve(all_t, eq_start, eq_risk)
+            eq_full = compute_equity_curve(all_t, eq_start, eq_risk, args.fee, args.slip)
             report["equity"] = {k: v for k, v in eq_full.items() if k != "equity_curve"}
             # Por tier
             by_tier_eq = {}
             for tier in ["A+", "A", "B"]:
                 tier_trades = [t for t in all_t if t.get("tier") == tier]
                 if tier_trades:
-                    by_tier_eq[tier] = compute_equity_curve(tier_trades, eq_start, eq_risk)
+                    by_tier_eq[tier] = compute_equity_curve(tier_trades, eq_start, eq_risk, args.fee, args.slip)
             report["equity_by_tier"] = {
                 k: {kk: vv for kk, vv in eq.items() if kk != "equity_curve"}
                 for k, eq in by_tier_eq.items()
@@ -321,6 +331,28 @@ async def main():
             print(f"  fold {f['fold']:>2} ({start_short}→{end_short} {f['days']}d): "
                   f"n={fm['total_trades']:>3} wr={fm['win_rate_pct']:>5}% "
                   f"PF={pf_s} R={fm['total_r']:+7.2f}")
+
+    if args.patterns and report.get("by_pattern"):
+        print("\n─ Por pattern ─")
+        # Ordena por total_r desc, com __no_pattern__ no fim
+        items = list(report["by_pattern"].items())
+        def _sort_key(kv):
+            name, m = kv
+            tr = m.get("total_r", 0) if m else 0
+            sentinel = name == "__no_pattern__"
+            return (sentinel, -(tr or 0))
+        items.sort(key=_sort_key)
+        print(f"  {'pattern':<22} {'n':>4} {'wr':>6} {'PF':>6} "
+              f"{'totR':>8} {'avgR':>7}")
+        for pname, m in items:
+            if not m or m.get("total_trades", 0) == 0:
+                continue
+            pf = m.get("profit_factor")
+            pf_s = f"{pf:>6.2f}" if pf is not None else "     ∞"
+            label = pname if pname != "__no_pattern__" else "(sem pattern)"
+            print(f"  {label[:22]:<22} {m['total_trades']:>4} "
+                  f"{m['win_rate_pct']:>5}% {pf_s} "
+                  f"{m['total_r']:>+8.2f} {m.get('avg_r', 0):>+7.3f}")
 
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2, default=str))

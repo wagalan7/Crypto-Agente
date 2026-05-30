@@ -60,6 +60,7 @@ from services.indicator_service import calculate_indicators
 from services.pattern_service import detect_all_patterns
 from services.binance_vision_service import to_bv
 from services.mtf_service import MTFAlignment, TFDirection, MTF_MAP, _direction_word
+from services.derivatives_service import DerivativesData
 from models.trade_signal import SignalDirection
 
 WARMUP_BARS = 200
@@ -143,6 +144,107 @@ async def load_historical_ohlcv(
     return df
 
 
+# ── Funding histórico (binance fapi) ─────────────────────────────────────────
+# fapi.binance.com retorna lista de funding events (cada 8h). Cobertura
+# >300 dias por requisição.
+
+async def load_historical_funding(
+    symbol: str, start_ms: int, end_ms: int,
+) -> pd.DataFrame:
+    """
+    Retorna DataFrame com colunas (fundingTime, fundingRate) ordenado.
+    Vazio em caso de falha — caller deve tratar.
+    """
+    bv_sym = to_bv(symbol)  # ex: BTCUSDT
+    base = "https://fapi.binance.com"
+    all_rows: List[List[Any]] = []
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        cur = start_ms
+        while cur < end_ms:
+            params = {
+                "symbol": bv_sym,
+                "startTime": cur, "endTime": end_ms,
+                "limit": 1000,
+            }
+            try:
+                r = await client.get(f"{base}/fapi/v1/fundingRate", params=params)
+                r.raise_for_status()
+                rows = r.json()
+            except Exception as e:
+                log.warning(f"[backtest] funding fetch falhou {symbol} @ {cur}: {e}")
+                break
+            if not rows:
+                break
+            for row in rows:
+                all_rows.append([int(row["fundingTime"]), float(row["fundingRate"])])
+            last_ft = all_rows[-1][0]
+            if last_ft + 1 <= cur:
+                break
+            cur = last_ft + 1
+    if not all_rows:
+        return pd.DataFrame(columns=["fundingTime", "fundingRate"])
+    df = pd.DataFrame(all_rows, columns=["fundingTime", "fundingRate"])
+    df = df.drop_duplicates(subset=["fundingTime"]).sort_values("fundingTime").reset_index(drop=True)
+    return df
+
+
+def _build_derivatives_offline(
+    funding_df: Optional[pd.DataFrame],
+    df_candles: pd.DataFrame,
+    as_of_ms: int,
+    bar_ms: int,
+) -> Optional[DerivativesData]:
+    """
+    Constrói DerivativesData no ponto-no-tempo `as_of_ms`:
+      - funding_rate: mais recente fundingTime ≤ as_of_ms
+      - oi_change_24h_pct: None (sem fonte histórica acessível confiável)
+      - price_change_24h: derivado dos próprios candles
+    Mesma lógica de threshold de derivatives_service.analyze_derivatives.
+    """
+    if funding_df is None or funding_df.empty:
+        return None
+
+    # Funding mais recente <= as_of
+    prior = funding_df[funding_df["fundingTime"] <= as_of_ms]
+    if prior.empty:
+        return None
+    funding = float(prior["fundingRate"].iloc[-1])
+    f_pct = funding * 100
+
+    # Price change 24h dos candles
+    bars_24h = max(1, int(24 * 3600 * 1000 / bar_ms))
+    if len(df_candles) < bars_24h + 1:
+        price_change_24h = 0.0
+    else:
+        last_close = float(df_candles["close"].iloc[-1])
+        prev_close = float(df_candles["close"].iloc[-1 - bars_24h])
+        price_change_24h = ((last_close - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
+
+    data = DerivativesData(
+        funding_rate=funding,
+        funding_rate_pct=round(f_pct, 4),
+        open_interest=None,
+        oi_change_24h_pct=None,
+    )
+    # Funding sentiment (mesmos thresholds de derivatives_service)
+    if f_pct > 0.05:
+        data.funding_sentiment = "extreme_long"
+        data.warnings.append(f"Funding extremamente positivo ({f_pct:.3f}%) — risco de long-squeeze.")
+    elif f_pct > 0.02:
+        data.funding_sentiment = "bullish_squeeze"
+    elif f_pct < -0.05:
+        data.funding_sentiment = "extreme_short"
+        data.warnings.append(f"Funding extremamente negativo ({f_pct:.3f}%) — risco de short-squeeze.")
+    elif f_pct < -0.02:
+        data.funding_sentiment = "bearish_squeeze"
+    else:
+        data.funding_sentiment = "neutral"
+    # OI sentiment: sem dado histórico confiável → neutral
+    data.oi_sentiment = "neutral"
+    data.description = f"Funding {f_pct:+.3f}%/8h"
+    return data
+
+
 # ── MTF offline: usa dfs higher TFs pré-carregados ───────────────────────────
 def _compute_mtf_offline(
     higher_dfs: Dict[str, pd.DataFrame],
@@ -198,28 +300,35 @@ def _compute_mtf_offline(
 def _signal_and_tier(
     symbol: str, tf: str, df_visible: pd.DataFrame,
     higher_dfs: Optional[Dict[str, pd.DataFrame]] = None,
+    funding_df: Optional[pd.DataFrame] = None,
 ):
     if df_visible is None or len(df_visible) < WARMUP_BARS:
         return None
     try:
         ind = calculate_indicators(df_visible)
         patterns = detect_all_patterns(df_visible)
-        # Build sinal sem MTF primeiro pra pegar a direção
+        # Build sinal sem MTF/deriv primeiro pra pegar a direção
         ts_raw = build_trade_signal(
             symbol, tf, df_visible, ind, patterns,
             derivatives=None, mtf=None, with_backtest=False,
         )
         if ts_raw is None:
             return None
+        as_of = int(df_visible["timestamp"].iloc[-1])
         # Calcular MTF offline com base na direção primária
         mtf = None
         if higher_dfs:
-            as_of = int(df_visible["timestamp"].iloc[-1])
             mtf = _compute_mtf_offline(higher_dfs, tf, ts_raw.direction, as_of)
-        # Rebuild sinal com MTF pra que score/confluência usem o sinal correto
+        # Derivatives offline (funding hist) — None se sem fonte
+        derivatives = None
+        if funding_df is not None and not funding_df.empty:
+            derivatives = _build_derivatives_offline(
+                funding_df, df_visible, as_of, TF_MS[tf],
+            )
+        # Rebuild sinal com MTF + derivatives
         ts = build_trade_signal(
             symbol, tf, df_visible, ind, patterns,
-            derivatives=None, mtf=mtf, with_backtest=False,
+            derivatives=derivatives, mtf=mtf, with_backtest=False,
         )
     except Exception:
         return None
@@ -350,6 +459,18 @@ async def backtest_symbol_tf(
         except Exception as e:
             log.warning(f"[backtest] higher {tf_h} fetch falhou: {e}")
 
+    # Pré-carrega funding rate histórica (fapi.binance.com)
+    funding_df: Optional[pd.DataFrame] = None
+    try:
+        funding_df = await load_historical_funding(symbol, start_ms, end_ms)
+        if not funding_df.empty:
+            log.info(f"[backtest] {symbol} funding: {len(funding_df)} events")
+        else:
+            funding_df = None
+    except Exception as e:
+        log.warning(f"[backtest] funding fetch falhou: {e}")
+        funding_df = None
+
     trades: List[Dict[str, Any]] = []
     last_open_per_dir: Dict[str, datetime] = {}
     dedup_delta = timedelta(hours=DEDUP_WINDOW_HOURS)
@@ -358,7 +479,10 @@ async def backtest_symbol_tf(
 
     for i in range(WARMUP_BARS, len(df) - 1, step_bars):
         df_visible = df.iloc[:i + 1]
-        result = _signal_and_tier(symbol, timeframe, df_visible, higher_dfs=higher_dfs)
+        result = _signal_and_tier(
+            symbol, timeframe, df_visible,
+            higher_dfs=higher_dfs, funding_df=funding_df,
+        )
         if result is None:
             continue
         ts, score, tier = result
@@ -386,6 +510,15 @@ async def backtest_symbol_tf(
         if future.empty:
             continue
         outcome = _simulate_trade(snap, future, timeframe)
+        # Patterns presentes no signal (lista de pattern_type strings).
+        pat_types: List[str] = []
+        try:
+            for p in (ts.patterns or []):
+                pt = getattr(p, "type", None)
+                if pt is not None:
+                    pat_types.append(pt.value if hasattr(pt, "value") else str(pt))
+        except Exception:
+            pass
         trades.append({
             "symbol": symbol, "timeframe": timeframe, "tier": tier,
             "direction": direction,
@@ -393,6 +526,7 @@ async def backtest_symbol_tf(
             "rr": round(ts.risk_reward, 2),
             "entry": snap.entry, "stop": snap.stop_loss,
             "tp1": snap.tp1, "tp2": snap.tp2,
+            "patterns": pat_types,
             "created_ts": int(df.iloc[i]["timestamp"]),
             "created_at": bar_ts.isoformat(),
             **outcome,
@@ -472,7 +606,24 @@ def compute_equity_curve(
     trades: List[Dict[str, Any]],
     starting_balance: float = 10000.0,
     risk_pct: float = 1.0,
+    fee_pct_per_side: float = 0.0,
+    slippage_pct_per_side: float = 0.0,
 ) -> Dict[str, Any]:
+    """
+    Simula curva de equity com risco composto.
+    `fee_pct_per_side`: taxa por entrada/saída em % do notional (ex: 0.05 = 0.05%).
+    `slippage_pct_per_side`: slip por entrada/saída em % (ex: 0.02).
+    Custo total por trade = 2 × (fee + slip) × leverage_implícito do notional.
+
+    Premissa simplificada: notional = risk_usd / stop_distance_pct, então
+    custo_pct_do_balance = 2 × (fee+slip) × (risk_pct / stop_distance_pct).
+    Como não temos stop_distance_pct por trade aqui (não foi persistido no
+    trade dict), aproximamos: custo_usd = 2 × (fee+slip)/100 × notional,
+    e notional ≈ risk_usd / 0.01 (assume stop ~1% — conservador). Resultado:
+    custo_usd = (fee+slip)/100 × risk_usd × 2 / 0.01 = (fee+slip)*2*risk_usd*100.
+
+    Versão tighter: usa stop_distance_pct se trade tiver. Fallback 1%.
+    """
     if not trades:
         return {
             "starting_balance": starting_balance,
@@ -482,10 +633,12 @@ def compute_equity_curve(
             "n_trades": 0, "avg_pnl_usd": 0.0,
             "winning_streak_max": 0, "losing_streak_max": 0,
             "best_trade_usd": 0.0, "worst_trade_usd": 0.0,
+            "fees_total_usd": 0.0, "fee_drag_pct": 0.0,
             "equity_curve": [],
         }
     sorted_trades = sorted(trades, key=lambda t: t["created_ts"])
     risk_frac = risk_pct / 100.0
+    cost_per_side_frac = (fee_pct_per_side + slippage_pct_per_side) / 100.0
     balance = starting_balance
     peak = balance
     max_dd_pct = 0.0
@@ -496,12 +649,27 @@ def compute_equity_curve(
     max_lose_streak = 0
     best = float("-inf")
     worst = float("inf")
+    fees_total = 0.0
     curve: List[Dict[str, Any]] = [{"ts": sorted_trades[0]["created_ts"], "balance": round(balance, 2)}]
     pnls: List[float] = []
     for t in sorted_trades:
         r = t["realized_r"]
         risk_usd = balance * risk_frac
-        pnl_usd = risk_usd * r
+        # Notional implícito: risk_usd / stop_distance_frac.
+        # stop_distance ≈ |entry - stop|/entry. Se ausente, fallback 1%.
+        entry = t.get("entry")
+        stop = t.get("stop")
+        if entry and stop and entry > 0:
+            stop_dist_frac = abs(entry - stop) / entry
+        else:
+            stop_dist_frac = 0.01
+        if stop_dist_frac <= 0:
+            stop_dist_frac = 0.01
+        notional = risk_usd / stop_dist_frac
+        cost_usd = 2 * cost_per_side_frac * notional  # entry + exit
+        gross_pnl = risk_usd * r
+        pnl_usd = gross_pnl - cost_usd
+        fees_total += cost_usd
         balance += pnl_usd
         pnls.append(pnl_usd)
         if pnl_usd > best: best = pnl_usd
@@ -523,6 +691,7 @@ def compute_equity_curve(
     total_pnl = balance - starting_balance
     total_ret_pct = (total_pnl / starting_balance * 100) if starting_balance > 0 else 0
     avg_pnl = sum(pnls) / len(pnls)
+    fee_drag_pct = (fees_total / starting_balance * 100) if starting_balance > 0 else 0
     return {
         "starting_balance": starting_balance,
         "final_balance": round(balance, 2),
@@ -537,8 +706,35 @@ def compute_equity_curve(
         "best_trade_usd": round(best, 2),
         "worst_trade_usd": round(worst, 2),
         "risk_pct": risk_pct,
+        "fee_pct_per_side": fee_pct_per_side,
+        "slippage_pct_per_side": slippage_pct_per_side,
+        "fees_total_usd": round(fees_total, 2),
+        "fee_drag_pct": round(fee_drag_pct, 2),
         "equity_curve": curve,
     }
+
+
+def pattern_breakdown(all_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Breakdown WR/PF/R por pattern_type. Cada trade pode ter múltiplos
+    patterns; conta cada pattern individualmente (overlap esperado).
+
+    Útil pra responder: "double_bottom realmente ganha mais que descending
+    wedge? Vale o peso na confluência?"
+    """
+    by_pattern: Dict[str, List[Dict[str, Any]]] = {}
+    for t in all_trades:
+        pats = t.get("patterns") or []
+        if not pats:
+            by_pattern.setdefault("__no_pattern__", []).append(t)
+            continue
+        for p in pats:
+            by_pattern.setdefault(p, []).append(t)
+    out = {}
+    for pname, trs in by_pattern.items():
+        m = compute_metrics(trs)
+        out[pname] = m
+    return out
 
 
 def aggregate_report(all_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -552,6 +748,7 @@ def aggregate_report(all_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "summary": compute_metrics(all_trades),
         "by_tier": {k: compute_metrics(v) for k, v in by_tier.items() if v},
         "by_symbol": {k: compute_metrics(v) for k, v in by_symbol.items() if v},
+        "by_pattern": pattern_breakdown(all_trades) if all_trades else {},
         "trades_count": len(all_trades),
     }
 
