@@ -1107,6 +1107,111 @@ async def tier_a_losses(days: int = 60):
         raise HTTPException(500, f"Erro: {e}")
 
 
+@app.get("/api/debug/tier-wr")
+async def debug_tier_wr(days: int = 90):
+    """
+    WR / n / avg_score / avg_realized_R agrupado por tier.
+
+    Diagnóstico-chave: tier A+/A/B realmente prediz outcome diferente?
+    Se WR(A+) ≈ WR(A) ≈ WR(B), tier é cosmético — score não diferencia
+    qualidade. Se WR(A+) >> WR(B), filtro funciona — só falta empurrar
+    mais setups pra A+ (= revisar pesos de _compute_score).
+
+    Também breakdown por score-bin (mesmos bins da calibration) pra ver
+    onde os trades realmente caem.
+    """
+    try:
+        from db import DB_ENABLED, get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import select, and_
+        if not DB_ENABLED:
+            return {"enabled": False}
+
+        WIN_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2")
+        RESOLVED_STATUSES = WIN_STATUSES + ("lost", "expired")
+
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        async with get_session() as session:
+            stmt = select(
+                RecommendationSnapshot.tier,
+                RecommendationSnapshot.score,
+                RecommendationSnapshot.status,
+                RecommendationSnapshot.realized_r,
+                RecommendationSnapshot.risk_reward,
+            ).where(and_(
+                RecommendationSnapshot.outcome_at >= since,
+                RecommendationSnapshot.status.in_(RESOLVED_STATUSES),
+            ))
+            rows = (await session.execute(stmt)).all()
+
+        if not rows:
+            return {"enabled": True, "days": days, "n": 0,
+                    "note": "sem trades resolvidos no período"}
+
+        def _bucket_metrics(items):
+            if not items:
+                return None
+            n = len(items)
+            wins = sum(1 for r in items if r.status in WIN_STATUSES)
+            losses = sum(1 for r in items if r.status == "lost")
+            expired = sum(1 for r in items if r.status == "expired")
+            wr = wins / n
+            scores = [r.score for r in items if r.score is not None]
+            rrs = [r.risk_reward for r in items if r.risk_reward is not None]
+            r_vals = [r.realized_r for r in items if r.realized_r is not None]
+            r_wins = [r for r in r_vals if r > 0]
+            r_losses_abs = [abs(r) for r in r_vals if r < 0]
+            pf = (sum(r_wins) / sum(r_losses_abs)) if r_losses_abs else None
+            return {
+                "n": n, "wins": wins, "losses": losses, "expired": expired,
+                "wr_pct": round(wr * 100, 1),
+                "avg_score": round(sum(scores) / len(scores), 1) if scores else None,
+                "avg_rr": round(sum(rrs) / len(rrs), 2) if rrs else None,
+                "total_r": round(sum(r_vals), 2) if r_vals else None,
+                "avg_r": round(sum(r_vals) / len(r_vals), 3) if r_vals else None,
+                "profit_factor": round(pf, 2) if pf is not None else None,
+            }
+
+        # Por tier
+        by_tier: dict[str, list] = {}
+        for r in rows:
+            by_tier.setdefault(r.tier or "?", []).append(r)
+        tier_breakdown = {
+            tier: _bucket_metrics(items)
+            for tier, items in sorted(by_tier.items())
+        }
+
+        # Por score-bin (mesmos da calibration)
+        SCORE_BINS = [(55, 60), (60, 65), (65, 70), (70, 75),
+                      (75, 80), (80, 85), (85, 90), (90, 95), (95, 100.1)]
+
+        def _bin_label(lo, hi, last):
+            return f"[{lo}-100]" if last else f"[{lo}-{int(hi)})"
+
+        bins_breakdown = []
+        for i, (lo, hi) in enumerate(SCORE_BINS):
+            in_bin = [r for r in rows
+                      if r.score is not None and lo <= r.score < hi]
+            m = _bucket_metrics(in_bin) or {"n": 0, "wins": 0, "losses": 0,
+                                            "expired": 0, "wr_pct": None}
+            bins_breakdown.append({
+                "label": _bin_label(lo, hi, i == len(SCORE_BINS) - 1),
+                **m,
+            })
+
+        return {
+            "enabled": True,
+            "days": days,
+            "total_resolved": len(rows),
+            "by_tier": tier_breakdown,
+            "by_score_bin": bins_breakdown,
+        }
+    except Exception as e:
+        logging.error(f"tier-wr error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro: {e}")
+
+
 @app.get("/api/debug/vision-pipeline")
 async def debug_vision_pipeline():
     """Roda cada estágio do pipeline Vision e reporta onde quebra."""
