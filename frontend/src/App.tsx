@@ -9,6 +9,7 @@ import DailyPnLPanel from './components/DailyPnLPanel'
 import InsightsPanel from './components/InsightsPanel'
 import PushSubscribeButton from './components/PushSubscribeButton'
 import { api } from './services/api'
+import { usePushFocus } from './hooks/usePushFocus'
 import type { SignalDirection, TradeType } from './types'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -186,6 +187,14 @@ export default function App() {
   const [showDailyPnL, setShowDailyPnL] = useState(false)
   const [showInsights, setShowInsights] = useState(false)
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
+  const { focus: pushFocus, clear: clearPushFocus } = usePushFocus()
+
+  // Quando chega foco de push, abre o painel de recomendações automaticamente.
+  useEffect(() => {
+    if (pushFocus) {
+      setShowRecommendations(true)
+    }
+  }, [pushFocus])
   const [tradeMode, setTradeMode] = useState<TradeMode>('swing')
   const [filter, setFilter] = useState<Filter>('all')
   const [sort, setSort] = useState<Sort>('az')
@@ -680,11 +689,16 @@ export default function App() {
 
       {showRecommendations && (
         <RecommendationsPanel
-          onClose={() => setShowRecommendations(false)}
+          onClose={() => {
+            setShowRecommendations(false)
+            clearPushFocus()
+          }}
           onSelectSymbol={(sym) => {
             setSelectedSymbol(sym)
             setShowRecommendations(false)
+            clearPushFocus()
           }}
+          focus={pushFocus}
         />
       )}
 

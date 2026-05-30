@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, Sparkles, TrendingUp, TrendingDown, RefreshCw, AlertTriangle, Brain } from 'lucide-react'
 import { api, fetchBybitOHLCV, fetchTopBybitSymbols } from '../services/api'
 import type { Recommendation, RecommendationTier } from '../types'
@@ -16,6 +16,7 @@ const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-productio
 interface Props {
   onClose: () => void
   onSelectSymbol: (symbol: string, timeframe: string) => void
+  focus?: { symbol: string; timeframe: string; event?: string } | null
 }
 
 const TIER_CONFIG: Record<RecommendationTier, { label: string; bg: string; border: string; text: string; ring: string }> = {
@@ -83,7 +84,9 @@ function operationType(tf: string): { label: string; cls: string; hint: string }
   }
 }
 
-export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props) {
+export default function RecommendationsPanel({ onClose, onSelectSymbol, focus }: Props) {
+  const cardRefs = useRef<Record<string, HTMLButtonElement | null>>({})
+  const [highlightKey, setHighlightKey] = useState<string | null>(null)
   const [recs, setRecs] = useState<Recommendation[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -213,6 +216,32 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
     'B':  recs.filter(r => r.tier === 'B').length,
   }
   const filtered = filter === 'all' ? recs : recs.filter(r => r.tier === filter)
+
+  // Quando chega foco via push, scrolla até o card e destaca por ~3s.
+  // Roda quando focus muda OU quando as recs carregam (ordem indefinida entre os dois).
+  useEffect(() => {
+    if (!focus || recs.length === 0) return
+    const match = recs.find(
+      r => symbolBase(r.symbol) === focus.symbol && r.timeframe === focus.timeframe
+    )
+    if (!match) return
+    const key = `${match.symbol}-${match.timeframe}`
+    // Se o filtro de tier esconde o card, abre "all" pra revelar
+    if (filter !== 'all' && match.tier !== filter) {
+      setFilter('all')
+    }
+    // Espera o DOM aplicar o filtro/render antes de scrollar
+    const t = setTimeout(() => {
+      const el = cardRefs.current[key]
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        setHighlightKey(key)
+        setTimeout(() => setHighlightKey(null), 3000)
+      }
+    }, 100)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus, recs])
 
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
@@ -363,8 +392,13 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol }: Props)
               return (
                 <button
                   key={`${r.symbol}-${r.timeframe}`}
+                  ref={(el) => { cardRefs.current[`${r.symbol}-${r.timeframe}`] = el }}
                   onClick={() => onSelectSymbol(r.symbol, r.timeframe)}
-                  className={`w-full text-left p-3 rounded-lg border ${cfg.bg} ${cfg.border} ${cfg.ring} hover:bg-slate-800/40 transition-colors`}
+                  className={`w-full text-left p-3 rounded-lg border ${cfg.bg} ${cfg.border} ${cfg.ring} hover:bg-slate-800/40 transition-colors ${
+                    highlightKey === `${r.symbol}-${r.timeframe}`
+                      ? 'ring-2 ring-amber-400/80 shadow-lg shadow-amber-400/30 animate-pulse'
+                      : ''
+                  }`}
                 >
                   <div className="flex items-center gap-3">
                     {/* Tier badge */}

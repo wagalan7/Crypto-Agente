@@ -167,15 +167,17 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
         f"Score {score:.0f} · entry {_fmt(rec.get('entry', 0))}"
     )
 
+    tf_short = rec.get("timeframe", "")
+    focus_url = f"/?focus={symbol_short}&tf={tf_short}"
     payload = {
         "title": title,
         "body": body,
-        "tag": f"rec-{symbol_short}-{rec.get('timeframe')}",  # deduplica notifs
+        "tag": f"rec-{symbol_short}-{tf_short}",  # deduplica notifs
         "data": {
             "symbol": rec.get("symbol"),
-            "timeframe": rec.get("timeframe"),
+            "timeframe": tf_short,
             "tier": tier,
-            "url": "/",
+            "url": focus_url,
         },
     }
 
@@ -303,6 +305,7 @@ async def notify_outcome(snap, event: str) -> int:
     else:
         return 0
 
+    focus_url = f"/?focus={symbol_short}&tf={tf}&event={event}"
     payload = {
         "title": title,
         "body": body,
@@ -312,7 +315,7 @@ async def notify_outcome(snap, event: str) -> int:
             "timeframe": tf,
             "tier": tier,
             "event": event,
-            "url": "/",
+            "url": focus_url,
         },
     }
 
