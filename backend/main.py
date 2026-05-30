@@ -1108,7 +1108,7 @@ async def tier_a_losses(days: int = 60):
 
 
 @app.get("/api/debug/tier-wr")
-async def debug_tier_wr(days: int = 90):
+async def debug_tier_wr(days: int = 90, since_iso: Optional[str] = None):
     """
     WR / n / avg_score / avg_realized_R agrupado por tier.
 
@@ -1132,17 +1132,29 @@ async def debug_tier_wr(days: int = 90):
         RESOLVED_STATUSES = WIN_STATUSES + ("lost", "expired")
 
         since = datetime.now(timezone.utc) - timedelta(days=days)
+        # Permite override por created_at >= since_iso (pra excluir leftovers
+        # de janelas onde thresholds de tier estavam relaxados).
+        created_after = None
+        if since_iso:
+            try:
+                created_after = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+            except Exception:
+                raise HTTPException(400, f"since_iso inválido: {since_iso}")
+
         async with get_session() as session:
+            conds = [
+                RecommendationSnapshot.outcome_at >= since,
+                RecommendationSnapshot.status.in_(RESOLVED_STATUSES),
+            ]
+            if created_after is not None:
+                conds.append(RecommendationSnapshot.created_at >= created_after)
             stmt = select(
                 RecommendationSnapshot.tier,
                 RecommendationSnapshot.score,
                 RecommendationSnapshot.status,
                 RecommendationSnapshot.realized_r,
                 RecommendationSnapshot.risk_reward,
-            ).where(and_(
-                RecommendationSnapshot.outcome_at >= since,
-                RecommendationSnapshot.status.in_(RESOLVED_STATUSES),
-            ))
+            ).where(and_(*conds))
             rows = (await session.execute(stmt)).all()
 
         if not rows:
