@@ -243,6 +243,7 @@ def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Option
     for _, c in df_window.iterrows():
         h = float(c["high"])
         l = float(c["low"])
+        cl = float(c["close"])
 
         # Atualiza peak se TP1 já foi (passado ou agora)
         if tp1_already or tp1_hit_now:
@@ -284,12 +285,25 @@ def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Option
         else:
             effective_stop = snap.stop_loss
 
+        # Stop ORIGINAL (pre-TP1) é close-based: só conta loss se a vela
+        # FECHAR além do stop. Wick que toca e volta NÃO é stop. Em cripto,
+        # wicks de 0.3-1% em pivôs são rotineiros — usar low/high pra stop
+        # vira hunt de liquidez.
+        # Stop POST-TP1 (BE+ / trail) permanece wick-based: protege lucro,
+        # comportamento de stop order real em exchange.
+        post_tp1 = tp1_already or tp1_hit_now
         if is_long:
-            stop_hit = l <= effective_stop
+            if post_tp1:
+                stop_hit = l <= effective_stop
+            else:
+                stop_hit = cl <= effective_stop
             tp1_hit = (snap.tp1 is not None) and (h >= snap.tp1)
             tp2_hit = h >= snap.tp2
         else:
-            stop_hit = h >= effective_stop
+            if post_tp1:
+                stop_hit = h >= effective_stop
+            else:
+                stop_hit = cl >= effective_stop
             tp1_hit = (snap.tp1 is not None) and (l <= snap.tp1)
             tp2_hit = l <= snap.tp2
 
