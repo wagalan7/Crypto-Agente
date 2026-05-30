@@ -243,6 +243,109 @@ async def notify_recommendations_batch(recs: List[Dict[str, Any]], newly_saved: 
     return total_sent
 
 
+async def notify_outcome(snap, event: str) -> int:
+    """
+    Dispara push de SAÍDA de um trade: TP1, TP2, stop, BE+ ou expiry pós-TP1.
+
+    Args:
+        snap: RecommendationSnapshot (precisa de symbol, tier, direction,
+              timeframe, realized_r)
+        event: um de:
+          - "tp1_partial"  (TP1 batido — parcial 50%, trail ativo)
+          - "tp2"          (TP2 batido — saída total)
+          - "be_plus"      (stop pós-TP1 ativado — saída em BE+/trail)
+          - "expired_tp1"  (expirou pós-TP1 — parcial trava)
+          - "lost"         (stop antes de TP1)
+
+    Respeita filtro de tier do subscriber (mesma lógica de
+    notify_new_recommendation).
+    """
+    if not PUSH_ENABLED:
+        return 0
+    tier = getattr(snap, "tier", "") or ""
+    if tier not in ("A+", "A", "B"):
+        return 0
+
+    field_map = {"A+": "notify_a_plus", "A": "notify_a", "B": "notify_b"}
+    filter_field = field_map[tier]
+
+    async with get_session() as session:
+        stmt = select(PushSubscription).where(
+            (PushSubscription.active.is_(True))
+            & (getattr(PushSubscription, filter_field).is_(True))
+        )
+        subs = (await session.execute(stmt)).scalars().all()
+
+    if not subs:
+        return 0
+
+    symbol_short = (getattr(snap, "symbol", "") or "").split("/")[0]
+    direction = (getattr(snap, "direction", "") or "").upper()
+    realized_r = getattr(snap, "realized_r", 0) or 0
+    tf = getattr(snap, "timeframe", "") or ""
+
+    # Título + corpo por evento
+    if event == "tp2":
+        title = f"🚀 TP2 · {symbol_short} {direction}"
+        body = f"{tf} · TP2 batido! +{realized_r:.1f}R fechado"
+    elif event == "tp1_partial":
+        title = f"🎯 TP1 · {symbol_short} {direction}"
+        body = f"{tf} · TP1 batido (parcial 50%) — stop subiu pra BE+, trail ativo"
+    elif event == "be_plus":
+        title = f"✅ BE+ · {symbol_short} {direction}"
+        body = f"{tf} · saída pós-TP1 em BE+/trail · +{realized_r:.1f}R"
+    elif event == "expired_tp1":
+        title = f"⏰ Expirou · {symbol_short} {direction}"
+        body = f"{tf} · 48h pós-TP1 · +{realized_r:.1f}R travados na parcial"
+    elif event == "lost":
+        title = f"🛑 Stop · {symbol_short} {direction}"
+        body = f"{tf} · stop batido · {realized_r:.1f}R"
+    else:
+        return 0
+
+    payload = {
+        "title": title,
+        "body": body,
+        "tag": f"outcome-{symbol_short}-{tf}-{event}",
+        "data": {
+            "symbol": getattr(snap, "symbol", None),
+            "timeframe": tf,
+            "tier": tier,
+            "event": event,
+            "url": "/",
+        },
+    }
+
+    sent = 0
+    to_deactivate: List[int] = []
+    for sub in subs:
+        try:
+            ok = await _send_one(sub, payload)
+            if ok:
+                sent += 1
+            else:
+                to_deactivate.append(sub.id)
+        except Exception:
+            async with get_session() as s2:
+                await s2.execute(
+                    update(PushSubscription).where(PushSubscription.id == sub.id)
+                    .values(fail_count=sub.fail_count + 1)
+                )
+                await s2.commit()
+
+    if to_deactivate:
+        async with get_session() as session:
+            await session.execute(
+                update(PushSubscription).where(PushSubscription.id.in_(to_deactivate))
+                .values(active=False)
+            )
+            await session.commit()
+
+    if sent:
+        log.info(f"Push outcome ({event}) enviado pra {sent} device(s) — {tier} {symbol_short}")
+    return sent
+
+
 def _fmt(n: float) -> str:
     if n >= 1000:
         return f"{n:,.2f}"

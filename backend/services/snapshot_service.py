@@ -20,6 +20,7 @@ from sqlalchemy import select, and_, func, update
 
 from db import DB_ENABLED, get_session
 from models.recommendation_snapshot import RecommendationSnapshot
+from services.push_service import notify_outcome
 
 log = logging.getLogger(__name__)
 
@@ -396,9 +397,15 @@ async def check_open_snapshots() -> int:
                         snap.status = "won_tp1"
                         snap.outcome_price = snap.tp1
                         snap.realized_r = REALIZED_R_TP1
+                        # Push: expirou pós-TP1, parcial travada.
+                        try:
+                            await notify_outcome(snap, "expired_tp1")
+                        except Exception as e:
+                            log.warning(f"notify_outcome expired_tp1 falhou: {e}")
                     else:
                         snap.status = "expired"
                         snap.realized_r = 0.0
+                        # Não notifica expired sem TP1 (não aconteceu nada).
                     snap.outcome_at = now
                     resolved += 1
                     continue
@@ -428,6 +435,12 @@ async def check_open_snapshots() -> int:
                             f"[step-2b] {snap.symbol} {snap.timeframe} {snap.direction} "
                             f"TP1 hit (parcial 50%) → trail ativo (peak={new_peak})"
                         )
+                        # Push: TP1 parcial — usuário sabe que 50% saiu e
+                        # stop subiu pra BE+.
+                        try:
+                            await notify_outcome(snap, "tp1_partial")
+                        except Exception as e:
+                            log.warning(f"notify_outcome tp1_partial falhou: {e}")
                     elif status == "open_update":
                         # Só atualiza peak (TP1 já era passado, mas peak melhorou)
                         if new_peak is not None:
@@ -445,6 +458,20 @@ async def check_open_snapshots() -> int:
                         if new_peak is not None:
                             snap.peak_price_since_tp1 = new_peak
                         resolved += 1
+                        # Push de saída — emoji + R realizado.
+                        # Mapeia status interno → evento user-facing.
+                        event_map = {
+                            "won_tp2": "tp2",
+                            "won_tp1_be": "be_plus",
+                            "won_tp1": "be_plus",  # tratado como saída pós-TP1
+                            "lost": "lost",
+                        }
+                        ev = event_map.get(status)
+                        if ev:
+                            try:
+                                await notify_outcome(snap, ev)
+                            except Exception as e:
+                                log.warning(f"notify_outcome {ev} falhou: {e}")
 
                 snap.last_check_at = now
             except Exception as e:
