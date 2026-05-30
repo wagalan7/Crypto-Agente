@@ -50,6 +50,11 @@ class DetectedPattern(BaseModel):
     lines: Optional[List[List[float]]] = None
     description: str
     breakout_target: Optional[float] = None
+    # Rompimento confirmado: última vela fechou além do nível-chave do
+    # padrão na direção (ex: triângulo simétrico → close > linha superior).
+    breakout_confirmed: bool = False
+    # Volume na vela do rompimento vs média 20 candles (>1.5 = volume forte)
+    breakout_volume_ratio: Optional[float] = None
 
 
 class Indicator(BaseModel):

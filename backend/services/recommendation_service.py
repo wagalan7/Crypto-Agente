@@ -102,13 +102,26 @@ def _compute_score(sig: TradeSignal) -> float:
             win_bonus = (avg - 0.5) * 20   # ±10 pontos
     # Derivatives score: 50 = neutro, 0–100. Penaliza crowded trades.
     der_score = _derivatives_score(sig)
-    # Pesos: conf 0.35, MTF 0.25, R:R 0.25, der 0.10 (soma 0.95) + win ±5
+    # Bonus de rompimento confirmado com volume — gatilho técnico forte.
+    # +5pts se algum padrão a favor da direção tem breakout_confirmed=True.
+    # Cap em +5 (não acumula entre múltiplos padrões).
+    breakout_bonus = 0.0
+    if sig.patterns:
+        for p in sig.patterns:
+            if (
+                getattr(p, "breakout_confirmed", False)
+                and p.direction == sig.direction
+            ):
+                breakout_bonus = 5.0
+                break
+    # Pesos: conf 0.35, MTF 0.25, R:R 0.25, der 0.10 (soma 0.95) + win ±5 + breakout +5
     score = (
         conf_score * 0.35
         + mtf_score * 0.25
         + rr_score * 0.25
         + der_score * 0.10
         + win_bonus * 0.5
+        + breakout_bonus
     )
     return round(max(0.0, min(100.0, score)), 1)
 
@@ -361,14 +374,18 @@ def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
                 break
 
     tier: Optional[str] = None
+    # Thresholds ajustados após rebalance do _compute_score (cap RR 5→3,
+    # derivatives entram). Score equivalente "muito bom" caiu de ~80 pra ~75.
+    # Gates de qualidade (MTF, RR, pattern, warnings) preservados — apenas
+    # o score numérico foi recalibrado.
     if (
-        score >= 80 and mtf_score >= 0.5 and sig.risk_reward >= 2.5
+        score >= 75 and mtf_score >= 0.5 and sig.risk_reward >= 2.5
         and not has_critical_warning and _has_confirming_pattern(sig)
     ):
         tier = "A+"
-    elif score >= 70 and mtf_score >= 0.0 and sig.risk_reward >= 2.0:
+    elif score >= 65 and mtf_score >= 0.0 and sig.risk_reward >= 2.0:
         tier = "A"
-    elif score >= 55 and sig.confidence >= MIN_CONFIDENCE_B and sig.risk_reward >= MIN_RR:
+    elif score >= 52 and sig.confidence >= MIN_CONFIDENCE_B and sig.risk_reward >= MIN_RR:
         tier = "B"
     else:
         return None

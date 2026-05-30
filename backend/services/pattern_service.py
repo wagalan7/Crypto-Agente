@@ -345,6 +345,81 @@ def detect_flags(df: pd.DataFrame) -> List[DetectedPattern]:
     return patterns
 
 
+def annotate_breakouts(patterns: List[DetectedPattern], df: pd.DataFrame) -> None:
+    """
+    Para cada padrão, verifica se a ÚLTIMA vela fechou além do nível-chave
+    do padrão na direção esperada, com volume acima da média.
+
+    Marca in-place: pattern.breakout_confirmed e breakout_volume_ratio.
+
+    Níveis-chave por padrão:
+      • LTA / canal/triângulo ascending: close > linha superior projetada
+      • LTB / canal/triângulo descending: close < linha inferior projetada
+      • Cunhas / triângulos / canais: usa pattern.lines (resistência/suporte
+        atual) + projeção da inclinação.
+      • Topo/Fundo Duplo, OCO: usa breakout_target (alvo) como proxy de
+        neckline — se close já passou da neckline, marca.
+      • Flags: similar, usa breakout_target como nível.
+
+    Volume: razão close.volume vs média volume nas últimas 20 candles.
+    """
+    if len(df) < 25:
+        return
+    last = df.iloc[-1]
+    last_close = float(last["close"])
+    last_vol = float(last["volume"]) if "volume" in df.columns else 0.0
+    vol_mean20 = float(df["volume"].tail(20).mean()) if "volume" in df.columns else 0.0
+    vol_ratio = (last_vol / vol_mean20) if vol_mean20 > 0 else 1.0
+
+    BULLISH_TYPES = {
+        PatternType.LTA, PatternType.ASCENDING_CHANNEL, PatternType.ASCENDING_TRIANGLE,
+        PatternType.DESCENDING_WEDGE, PatternType.DOUBLE_BOTTOM,
+        PatternType.INVERSE_HEAD_AND_SHOULDERS, PatternType.BULL_FLAG,
+        PatternType.SYMMETRIC_TRIANGLE,  # direção definida por p.direction
+    }
+    BEARISH_TYPES = {
+        PatternType.LTB, PatternType.DESCENDING_CHANNEL, PatternType.DESCENDING_TRIANGLE,
+        PatternType.ASCENDING_WEDGE, PatternType.DOUBLE_TOP,
+        PatternType.HEAD_AND_SHOULDERS, PatternType.BEAR_FLAG,
+    }
+
+    for p in patterns:
+        try:
+            target = p.breakout_target
+            # Resolve nível-chave do rompimento
+            level = None
+            if target is not None:
+                # Pra padrões com target explícito (double, H&S, flags), o
+                # target geralmente é o alvo PÓS-rompimento, não a neckline.
+                # Aproximação: usa último point como proxy da neckline.
+                if p.points:
+                    level = float(p.points[-1].price)
+                else:
+                    level = target
+            elif p.lines and len(p.lines) >= 1:
+                # Pega o último valor da primeira linha (mais relevante)
+                level = float(p.lines[0][-1]) if p.lines[0] else None
+
+            if level is None:
+                continue
+
+            confirmed = False
+            if p.direction == SignalDirection.LONG and p.type in BULLISH_TYPES:
+                # Rompeu pra cima: close > nível + tolerância 0.05%
+                confirmed = last_close > level * 1.0005
+            elif p.direction == SignalDirection.SHORT and p.type in BEARISH_TYPES:
+                # Rompeu pra baixo: close < nível - tolerância
+                confirmed = last_close < level * 0.9995
+
+            # Exige volume acima da média pra confirmar (1.2× é threshold leve)
+            if confirmed and vol_ratio >= 1.2:
+                p.breakout_confirmed = True
+                p.breakout_volume_ratio = round(vol_ratio, 2)
+        except Exception:
+            # Padrão sem points/lines bem formados — pula silenciosamente
+            continue
+
+
 def detect_all_patterns(df: pd.DataFrame) -> List[DetectedPattern]:
     if len(df) < 50:
         return []
@@ -365,4 +440,7 @@ def detect_all_patterns(df: pd.DataFrame) -> List[DetectedPattern]:
 
     # Sort by confidence descending
     all_patterns.sort(key=lambda p: p.confidence, reverse=True)
-    return all_patterns[:8]
+    top = all_patterns[:8]
+    # Anota rompimento real (com volume) na última vela
+    annotate_breakouts(top, df)
+    return top

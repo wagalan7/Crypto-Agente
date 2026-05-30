@@ -55,6 +55,13 @@ ATR_MULTIPLIERS = {
     TradeType.HODL:      {"sl": 3.0, "tp1": 5.0, "tp2": 10.0, "tp3": 20.0},
 }
 
+# Anti-stop-hunt: ao snapar stop em pivot_low/high, afasta o stop por
+# PIVOT_BUFFER_ATR ×ATR do nível. Pavios típicos em pivôs óbvios são
+# 0.2-0.5% (ou ~0.2-0.4 ATR). Buffer 0.35 ATR cobre o ruído sem alargar
+# absurdamente. Antes era 0.2% fixo (pivot_low * 0.998) — invariante ao
+# regime de volatilidade.
+PIVOT_BUFFER_ATR = 0.35
+
 
 def _candle_confirms(df: pd.DataFrame, direction: SignalDirection) -> bool:
     """
@@ -167,9 +174,9 @@ def calculate_levels(
         entry = current_price
         stop_loss = entry - atr * mults["sl"]
 
-        # Snap to support if available
+        # Snap to support if available (com buffer ATR anti-hunt)
         if ind.pivot_low and ind.pivot_low < entry and ind.pivot_low > stop_loss * 0.95:
-            stop_loss = ind.pivot_low * 0.998
+            stop_loss = ind.pivot_low - atr * PIVOT_BUFFER_ATR
 
         tp1 = entry + atr * mults["tp1"]
         tp2 = entry + atr * mults["tp2"]
@@ -185,9 +192,9 @@ def calculate_levels(
         entry = current_price
         stop_loss = entry + atr * mults["sl"]
 
-        # Snap to resistance if available
+        # Snap to resistance if available (com buffer ATR anti-hunt)
         if ind.pivot_high and ind.pivot_high > entry and ind.pivot_high < stop_loss * 1.05:
-            stop_loss = ind.pivot_high * 1.002
+            stop_loss = ind.pivot_high + atr * PIVOT_BUFFER_ATR
 
         tp1 = entry - atr * mults["tp1"]
         tp2 = entry - atr * mults["tp2"]
