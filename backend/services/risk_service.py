@@ -27,6 +27,7 @@ from sqlalchemy import select, func
 
 from db import DB_ENABLED, get_session
 from models.risk_state import RiskState
+from models.risk_event import RiskEvent
 from models.recommendation_snapshot import RecommendationSnapshot
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,19 @@ async def _get_or_create_state(session) -> RiskState:
         session.add(state)
         await session.flush()
     return state
+
+
+def _log_event(session, state: RiskState, event_type: str, reason: str | None) -> None:
+    """Grava evento de transição na tabela risk_events (snapshot das métricas)."""
+    ev = RiskEvent(
+        event_type=event_type,
+        reason=reason,
+        daily_dd_pct=state.daily_dd_pct,
+        weekly_dd_pct=state.weekly_dd_pct,
+        daily_trades=state.daily_trades,
+        weekly_trades=state.weekly_trades,
+    )
+    session.add(ev)
 
 
 async def _compute_window_dd(session, hours: int) -> tuple[float, int]:
@@ -109,6 +123,7 @@ async def update_and_check() -> dict:
                 state.trading_paused = False
                 state.pause_reason = None
                 state.paused_at = None
+                _log_event(session, state, "auto_resume", "Virada de semana UTC")
 
         # Recalcula DD
         daily_dd, daily_trades = await _compute_window_dd(session, hours=24)
@@ -129,6 +144,7 @@ async def update_and_check() -> dict:
                 )
                 state.paused_at = datetime.now(timezone.utc)
                 log.warning(f"[circuit-breaker] AUTO-PAUSE: {state.pause_reason}")
+                _log_event(session, state, "auto_pause", state.pause_reason)
             elif weekly_dd <= WEEKLY_DD_LIMIT_PCT:
                 state.trading_paused = True
                 state.pause_manual = False
@@ -138,6 +154,7 @@ async def update_and_check() -> dict:
                 )
                 state.paused_at = datetime.now(timezone.utc)
                 log.warning(f"[circuit-breaker] AUTO-PAUSE: {state.pause_reason}")
+                _log_event(session, state, "auto_pause", state.pause_reason)
 
         state.updated_at = datetime.now(timezone.utc)
         await session.commit()
@@ -171,14 +188,48 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
         return {"enabled": False}
     async with get_session() as session:
         state = await _get_or_create_state(session)
+        was_paused = bool(state.trading_paused)
         state.trading_paused = paused
         state.pause_manual = paused
         state.pause_reason = (reason or "Pausa manual via kill switch") if paused else None
         state.paused_at = datetime.now(timezone.utc) if paused else None
         state.updated_at = datetime.now(timezone.utc)
+        # Log apenas em transições reais
+        if paused and not was_paused:
+            _log_event(session, state, "manual_pause", state.pause_reason)
+        elif (not paused) and was_paused:
+            _log_event(session, state, "manual_resume", reason or "Retomado manualmente")
         await session.commit()
         log.warning(f"[circuit-breaker] MANUAL pause={paused} reason={reason}")
         return _to_dict(state)
+
+
+async def list_events(days: int = 30, limit: int = 200) -> list[dict]:
+    """Lista eventos do circuit breaker dos últimos N dias (mais recentes primeiro)."""
+    if not DB_ENABLED:
+        return []
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+    async with get_session() as session:
+        stmt = (
+            select(RiskEvent)
+            .where(RiskEvent.ts >= since)
+            .order_by(RiskEvent.ts.desc())
+            .limit(limit)
+        )
+        rows = (await session.execute(stmt)).scalars().all()
+        return [
+            {
+                "id": r.id,
+                "event_type": r.event_type,
+                "reason": r.reason,
+                "daily_dd_pct": round(r.daily_dd_pct, 3) if r.daily_dd_pct is not None else None,
+                "weekly_dd_pct": round(r.weekly_dd_pct, 3) if r.weekly_dd_pct is not None else None,
+                "daily_trades": r.daily_trades,
+                "weekly_trades": r.weekly_trades,
+                "ts": r.ts.isoformat() if r.ts else None,
+            }
+            for r in rows
+        ]
 
 
 def _to_dict(state: RiskState) -> dict:

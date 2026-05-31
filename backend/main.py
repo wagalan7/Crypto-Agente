@@ -1336,6 +1336,17 @@ async def risk_kill_switch(paused: bool = True, reason: str | None = None):
     return await risk_service.set_manual_pause(paused, reason)
 
 
+@app.get("/api/risk/events")
+async def risk_events(days: int = 30, limit: int = 200):
+    """
+    Histórico de eventos do circuit breaker (pausas/retomadas automáticas
+    e manuais) dos últimos `days` dias. Usado pelo painel Status.
+    """
+    from services import risk_service
+    items = await risk_service.list_events(days=days, limit=limit)
+    return {"events": items, "count": len(items), "days": days}
+
+
 @app.post("/api/debug/push-broadcast-test")
 async def debug_push_broadcast_test():
     """

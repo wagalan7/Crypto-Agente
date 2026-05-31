@@ -9,6 +9,7 @@ import DailyPnLPanel from './components/DailyPnLPanel'
 import InsightsPanel from './components/InsightsPanel'
 import PushSubscribeButton from './components/PushSubscribeButton'
 import RiskStatusBadge from './components/RiskStatusBadge'
+import StatusPanel from './components/StatusPanel'
 import { api } from './services/api'
 import { usePushFocus } from './hooks/usePushFocus'
 import type { SignalDirection, TradeType } from './types'
@@ -187,6 +188,7 @@ export default function App() {
   const [showRecommendations, setShowRecommendations] = useState(false)
   const [showDailyPnL, setShowDailyPnL] = useState(false)
   const [showInsights, setShowInsights] = useState(false)
+  const [showStatus, setShowStatus] = useState(false)
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const { focus: pushFocus, clear: clearPushFocus } = usePushFocus()
 
@@ -501,7 +503,7 @@ export default function App() {
             <span>🎓</span>
             <span className="hidden sm:block">Insights</span>
           </button>
-          <RiskStatusBadge />
+          <RiskStatusBadge onOpen={() => setShowStatus(true)} />
           <PushSubscribeButton />
           <button
             onClick={() => setShowNLP(v => !v)}
@@ -717,6 +719,10 @@ export default function App() {
           }}
           focus={pushFocus}
         />
+      )}
+
+      {showStatus && (
+        <StatusPanel onClose={() => setShowStatus(false)} />
       )}
 
       {showInsights && (

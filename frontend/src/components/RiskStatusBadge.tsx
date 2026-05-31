@@ -17,16 +17,22 @@ interface RiskStatus {
   weekly_limit_pct: number
 }
 
+interface BadgeProps {
+  /** Quando fornecido, clique chama onOpen() em vez de abrir o modal interno. */
+  onOpen?: () => void
+}
+
 /**
  * RiskStatusBadge — mostra estado do circuit breaker no header.
  *
  * - Verde "ativo" quando trading_paused=false
- * - Vermelho piscando "pausado" quando true; clique abre confirmação
- *   pra alternar kill switch
+ * - Vermelho piscando "pausado" quando true
+ * - Clique: se `onOpen` fornecido, delega (ex: abrir StatusPanel completo);
+ *   senão abre modal inline com kill switch rápido.
  *
  * Faz poll leve a cada 30s. Não bloqueia UI — silencia erros.
  */
-export default function RiskStatusBadge() {
+export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
   const [status, setStatus] = useState<RiskStatus | null>(null)
   const [busy, setBusy] = useState(false)
   const [showPanel, setShowPanel] = useState(false)
@@ -76,7 +82,7 @@ export default function RiskStatusBadge() {
   return (
     <>
       <button
-        onClick={() => setShowPanel(true)}
+        onClick={() => (onOpen ? onOpen() : setShowPanel(true))}
         className={`flex items-center gap-1 px-2 py-1 border rounded text-xs font-bold ${cls}`}
         title={
           paused
