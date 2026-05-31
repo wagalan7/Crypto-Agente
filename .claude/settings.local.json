@@ -207,7 +207,15 @@
       "Bash(python3 -c \"import bs4\")",
       "Bash(python3 md_to_pdf.py)",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('backend/agent.py'\\).read\\(\\)\\); ast.parse\\(open\\('backend/main.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['backend/database.py','backend/whatsapp_service.py','backend/main.py']]; print\\('OK'\\)\")"
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['backend/database.py','backend/whatsapp_service.py','backend/main.py']]; print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); ast.parse\\(open\\('agent.py'\\).read\\(\\)\\); ast.parse\\(open\\('database.py'\\).read\\(\\)\\); ast.parse\\(open\\('scheduler.py'\\).read\\(\\)\\); print\\('OK: todos os módulos parseiam'\\)\")",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code} | %{time_total}s\\\\n\" https://crypto-agente-production.up.railway.app/)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code} | tempo %{time_total}s\\\\n\" https://agenteconsultorio.com.br/healthz)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code} | tempo %{time_total}s\\\\n\" https://agenteconsultorio.com.br/)",
+      "Bash(curl -sk -o /dev/null -w \"HTTP %{http_code} | %{time_total}s\\\\n\" https://agenteconsultorio.com.br/)",
+      "Bash(curl -sk -I https://agenteconsultorio.com.br/)",
+      "Bash(openssl s_client -showcerts -servername agenteconsultorio.com.br -connect agenteconsultorio.com.br:443)",
+      "Bash(openssl x509 *)"
     ]
   }
 }

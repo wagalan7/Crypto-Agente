@@ -979,7 +979,48 @@ function api(path, opts={}) {
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
     return data;
+  }).catch(err => {
+    // Detecta falha de rede / TLS (típico quando domínio customizado está
+    // sem certificado válido: Safari/iOS retorna "Load failed", Chrome
+    // "Failed to fetch", Firefox "NetworkError").
+    const msg = (err && err.message) || "";
+    if (err instanceof TypeError
+        || /load failed/i.test(msg)
+        || /failed to fetch/i.test(msg)
+        || /networkerror/i.test(msg)) {
+      showSslBanner();
+    }
+    throw err;
   });
+}
+
+// ── Banner de SSL/rede ────────────────────────────────────────────────────────
+// Aparece quando fetch falha por TLS/rede (ex: domínio customizado sem cert
+// válido) e ensina a usuária a contornar até resolver na Railway.
+let _sslBannerShown = false;
+function showSslBanner() {
+  if (_sslBannerShown) return;
+  _sslBannerShown = true;
+  const host = location.hostname;
+  const isRailwayHost = /\.up\.railway\.app$/i.test(host);
+  const div = document.createElement("div");
+  div.id = "ssl-banner";
+  div.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#7f1d1d;color:#fff;padding:14px 16px;font-size:13px;line-height:1.45;box-shadow:0 2px 8px rgba(0,0,0,.25);";
+  div.innerHTML = isRailwayHost
+    ? `<div style="max-width:680px;margin:0 auto">
+         <strong>⚠ Falha de rede ao salvar.</strong> O servidor parece indisponível.
+         Tente novamente em alguns segundos. Se persistir, recarregue a página.
+         <button onclick="document.getElementById('ssl-banner').remove();_sslBannerShown=false" style="float:right;background:rgba(255,255,255,.2);border:0;color:#fff;padding:4px 10px;border-radius:6px;cursor:pointer">Fechar</button>
+       </div>`
+    : `<div style="max-width:680px;margin:0 auto">
+         <strong>⚠ Certificado SSL do domínio <code>${host}</code> não está válido</strong> —
+         por isso "Salvar" falha com <em>Load failed</em>.<br/>
+         <span style="opacity:.9">Solução definitiva: no painel da Railway → <strong>Settings → Networking → Custom Domains</strong>,
+         adicione <code>${host}</code> (Railway provisiona Let's Encrypt em ~10 min).<br/>
+         Enquanto isso, acesse pelo subdomínio <code>*.up.railway.app</code> do seu projeto Railway.</span>
+         <button onclick="document.getElementById('ssl-banner').remove();_sslBannerShown=false" style="float:right;background:rgba(255,255,255,.2);border:0;color:#fff;padding:4px 10px;border-radius:6px;cursor:pointer">Fechar</button>
+       </div>`;
+  document.body.appendChild(div);
 }
 
 // ── Agenda ────────────────────────────────────────────────────────────────────
