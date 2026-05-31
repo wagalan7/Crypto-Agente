@@ -1344,6 +1344,56 @@ async def risk_kill_switch(paused: bool = True, reason: str | None = None):
     return await risk_service.set_manual_pause(paused, reason)
 
 
+@app.get("/api/calibration/versions")
+async def calibration_versions_list(limit: int = 20):
+    """Lista versões versionadas do modelo PAV (#9), mais recentes primeiro."""
+    from services import calibration_versions_service
+    items = await calibration_versions_service.list_versions(limit=limit)
+    return {"versions": items, "count": len(items)}
+
+
+@app.get("/api/calibration/active")
+async def calibration_active():
+    """Versão ativa do modelo PAV atualmente em produção."""
+    from services import calibration_versions_service
+    return await calibration_versions_service.get_active() or {"active": None}
+
+
+@app.post("/api/calibration/snapshot")
+async def calibration_snapshot(notes: str | None = None, make_active: bool = True):
+    """
+    Cria snapshot da calibração atual (#9). Captura bins do PAV + métricas
+    retroativas (WR, avgR, Sharpe) e versiona.
+    """
+    from services import calibration_versions_service
+    result = await calibration_versions_service.snapshot_current(
+        notes=notes, make_active=make_active,
+    )
+    if result is None:
+        raise HTTPException(409, "Calibração não está pronta (amostra insuficiente).")
+    return result
+
+
+@app.get("/api/calibration/compare")
+async def calibration_compare(version_a: str, version_b: str):
+    """Diff entre duas versões do modelo: delta P por bin + delta de métricas."""
+    from services import calibration_versions_service
+    result = await calibration_versions_service.compare(version_a, version_b)
+    if result is None:
+        raise HTTPException(404, "Uma das versões não foi encontrada.")
+    return result
+
+
+@app.post("/api/calibration/monthly-snapshot")
+async def calibration_monthly_snapshot():
+    """Wrapper do cron mensal — snapshot + compara com versão anterior + log."""
+    from services import calibration_versions_service
+    result = await calibration_versions_service.run_monthly_snapshot()
+    if result is None:
+        raise HTTPException(409, "Snapshot não pôde ser criado (calibração não pronta).")
+    return result
+
+
 @app.get("/api/paper/equity-curve")
 async def paper_equity_curve(days: int = 30):
     """
