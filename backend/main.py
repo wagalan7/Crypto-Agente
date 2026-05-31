@@ -177,8 +177,23 @@ async def _server_scan_loop():
                 f"{len(pushable)} elegíveis pra push"
             )
 
+            # Circuit breaker: atualiza DD e checa se deve pausar push
+            try:
+                from services import risk_service
+                risk_snapshot = await risk_service.update_and_check()
+                trading_paused = bool(risk_snapshot.get("trading_paused"))
+            except Exception as e:
+                logging.warning(f"[server-scan] risk_service falhou: {e}")
+                trading_paused = False
+                risk_snapshot = {}
+
             pushes_this_scan = 0
-            if _PE and newly_saved > 0 and pushable:
+            if trading_paused:
+                logging.warning(
+                    f"[server-scan] 🛑 push BLOQUEADO — circuit breaker "
+                    f"({risk_snapshot.get('pause_reason', 'pause')})"
+                )
+            elif _PE and newly_saved > 0 and pushable:
                 try:
                     pushes_this_scan = await notify_recommendations_batch(pushable, len(pushable))
                     logging.info(f"[server-scan] ✅ {pushes_this_scan} push(es) enviados")
@@ -1299,6 +1314,26 @@ async def debug_vision_pipeline():
         "rr_avg": round(sum(rr_distribution)/len(rr_distribution), 2) if rr_distribution else None,
     }
     return stages
+
+
+@app.get("/api/risk/status")
+async def risk_status():
+    """
+    Estado atual do circuit breaker: pausado? por quê? DD diário/semanal?
+    Lê estado do DB sem recomputar — chamada barata pra UI consultar.
+    """
+    from services import risk_service
+    return await risk_service.get_status()
+
+
+@app.post("/api/risk/kill-switch")
+async def risk_kill_switch(paused: bool = True, reason: str | None = None):
+    """
+    Kill switch manual. POST com query param `paused=true|false`.
+    Quando ligado, server-scan não emite push de novas recs até desligar.
+    """
+    from services import risk_service
+    return await risk_service.set_manual_pause(paused, reason)
 
 
 @app.post("/api/debug/push-broadcast-test")

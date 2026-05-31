@@ -8,6 +8,7 @@ import RecommendationsPanel from './components/RecommendationsPanel'
 import DailyPnLPanel from './components/DailyPnLPanel'
 import InsightsPanel from './components/InsightsPanel'
 import PushSubscribeButton from './components/PushSubscribeButton'
+import RiskStatusBadge from './components/RiskStatusBadge'
 import { api } from './services/api'
 import { usePushFocus } from './hooks/usePushFocus'
 import type { SignalDirection, TradeType } from './types'
@@ -500,6 +501,7 @@ export default function App() {
             <span>🎓</span>
             <span className="hidden sm:block">Insights</span>
           </button>
+          <RiskStatusBadge />
           <PushSubscribeButton />
           <button
             onClick={() => setShowNLP(v => !v)}

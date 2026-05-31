@@ -65,6 +65,8 @@ async def init_db():
         return
     # Importa modelos pra registrar metadata
     from models import recommendation_snapshot  # noqa: F401
+    from models import push_subscription  # noqa: F401
+    from models import risk_state  # noqa: F401
     from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
