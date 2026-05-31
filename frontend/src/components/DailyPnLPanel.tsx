@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { X, BarChart3, TrendingUp, TrendingDown, Clock, RefreshCw, Calendar, ChevronLeft } from 'lucide-react'
 
 interface Trade {
@@ -63,6 +63,9 @@ const VIABILITY_BADGE: Record<string, { label: string; cls: string }> = {
 
 interface Props {
   onClose: () => void
+  // Foco vindo de push de outcome (TP1/TP2/stop/BE+/expirou).
+  // Roteia pro drill correto e destaca o card.
+  focus?: { symbol: string; timeframe: string; event?: string } | null
 }
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
@@ -109,7 +112,7 @@ const STATUS_REASON: Record<string, string> = {
 
 type DrillKind = 'wins' | 'losses' | 'open' | 'open_today' | 'open_older' | 'all' | null
 
-export default function DailyPnLPanel({ onClose }: Props) {
+export default function DailyPnLPanel({ onClose, focus }: Props) {
   const [date, setDate] = useState(todayISO())
   const [endDate, setEndDate] = useState(todayISO())
   const [data, setData] = useState<DailyPnL | null>(null)
@@ -118,6 +121,18 @@ export default function DailyPnLPanel({ onClose }: Props) {
   const [drill, setDrill] = useState<DrillKind>(null)
   const [viability, setViability] = useState<Record<number, ViabilityItem>>({})
   const isRange = date !== endDate
+  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const [highlightKey, setHighlightKey] = useState<string | null>(null)
+
+  // Quando chega foco de push de outcome, abre o drill correto e
+  // tenta destacar o card daquela operação.
+  useEffect(() => {
+    if (!focus || !focus.event) return
+    const ev = focus.event
+    if (ev === 'tp1_partial') setDrill('open')
+    else if (ev === 'lost') setDrill('losses')
+    else setDrill('wins') // tp2, be_plus, expired_tp1
+  }, [focus])
 
   const load = useCallback(async (d: string, end: string) => {
     setLoading(true)
@@ -137,6 +152,26 @@ export default function DailyPnLPanel({ onClose }: Props) {
   }, [])
 
   useEffect(() => { load(date, endDate) }, [load, date, endDate])
+
+  // Após carregar trades + drill setado pelo foco, scrolla até a operação.
+  useEffect(() => {
+    if (!focus || !data || drill === null) return
+    const trades = data.trades ?? []
+    const match = trades.find(
+      t => t.symbol.split('/')[0] === focus.symbol && t.timeframe === focus.timeframe
+    )
+    if (!match) return
+    const key = `${match.symbol}-${match.timeframe}-${match.entry}`
+    const t = setTimeout(() => {
+      const el = cardRefs.current[key]
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        setHighlightKey(key)
+        setTimeout(() => setHighlightKey(null), 3000)
+      }
+    }, 150)
+    return () => clearTimeout(t)
+  }, [focus, data, drill])
 
   // Fetch viability dos abertos sempre que data muda (viability é estado
   // atual — só relevante se range inclui hoje). Cache local — refresca
@@ -265,8 +300,18 @@ export default function DailyPnLPanel({ onClose }: Props) {
                     )
                   : undefined
                 const vBadge = viab ? VIABILITY_BADGE[viab.viability] : null
+                const tradeKey = `${t.symbol}-${t.timeframe}-${t.entry}`
+                const isHighlighted = highlightKey === tradeKey
                 return (
-                  <div key={i} className="p-3 rounded-lg border border-slate-800 bg-slate-900/40">
+                  <div
+                    key={i}
+                    ref={(el) => { cardRefs.current[tradeKey] = el }}
+                    className={`p-3 rounded-lg border bg-slate-900/40 transition-all ${
+                      isHighlighted
+                        ? 'border-amber-400/80 ring-2 ring-amber-400/60 shadow-lg shadow-amber-400/30 animate-pulse'
+                        : 'border-slate-800'
+                    }`}
+                  >
                     <div className="flex items-center gap-2 flex-wrap mb-2">
                       <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${badge.cls}`}>{badge.label}</span>
                       {vBadge && (

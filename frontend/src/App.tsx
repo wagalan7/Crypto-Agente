@@ -189,9 +189,14 @@ export default function App() {
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const { focus: pushFocus, clear: clearPushFocus } = usePushFocus()
 
-  // Quando chega foco de push, abre o painel de recomendações automaticamente.
+  // Roteia foco vindo de push:
+  // - push de OUTCOME (tem .event) → painel "Resultados" (drill abre conforme evento)
+  // - push de NOVA REC (sem .event) → painel de Recomendações
   useEffect(() => {
-    if (pushFocus) {
+    if (!pushFocus) return
+    if (pushFocus.event) {
+      setShowDailyPnL(true)
+    } else {
       setShowRecommendations(true)
     }
   }, [pushFocus])
@@ -703,7 +708,13 @@ export default function App() {
       )}
 
       {showDailyPnL && (
-        <DailyPnLPanel onClose={() => setShowDailyPnL(false)} />
+        <DailyPnLPanel
+          onClose={() => {
+            setShowDailyPnL(false)
+            clearPushFocus()
+          }}
+          focus={pushFocus}
+        />
       )}
 
       {showInsights && (
