@@ -127,7 +127,13 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
   // Quando chega foco de push de outcome, abre o drill correto e
   // tenta destacar o card daquela operação.
   useEffect(() => {
-    if (!focus || !focus.event) return
+    if (!focus) return
+    if (!focus.event) {
+      // Veio do fallback de push de NOVA REC (rec saiu do top do panel)
+      // → trade já é uma posição aberta criada hoje
+      setDrill('open_today')
+      return
+    }
     const ev = focus.event
     if (ev === 'tp1_partial') setDrill('open')
     else if (ev === 'lost') setDrill('losses')

@@ -17,6 +17,8 @@ interface Props {
   onClose: () => void
   onSelectSymbol: (symbol: string, timeframe: string) => void
   focus?: { symbol: string; timeframe: string; event?: string } | null
+  /** Chamado quando foco vem de push mas rec já saiu do top — App roteia pra Abertos. */
+  onFocusNotFound?: (focus: { symbol: string; timeframe: string }) => void
 }
 
 const TIER_CONFIG: Record<RecommendationTier, { label: string; bg: string; border: string; text: string; ring: string }> = {
@@ -84,7 +86,7 @@ function operationType(tf: string): { label: string; cls: string; hint: string }
   }
 }
 
-export default function RecommendationsPanel({ onClose, onSelectSymbol, focus }: Props) {
+export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, onFocusNotFound }: Props) {
   const cardRefs = useRef<Record<string, HTMLButtonElement | null>>({})
   const [highlightKey, setHighlightKey] = useState<string | null>(null)
   const [recs, setRecs] = useState<Recommendation[]>([])
@@ -220,11 +222,19 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus }:
   // Quando chega foco via push, scrolla até o card e destaca por ~3s.
   // Roda quando focus muda OU quando as recs carregam (ordem indefinida entre os dois).
   useEffect(() => {
-    if (!focus || recs.length === 0) return
+    if (!focus) return
+    // Espera o loading terminar antes de decidir
+    if (loading) return
     const match = recs.find(
       r => symbolBase(r.symbol) === focus.symbol && r.timeframe === focus.timeframe
     )
-    if (!match) return
+    if (!match) {
+      // Rec saiu do top (preço andou ou rotou) — fallback pra Abertos
+      if (onFocusNotFound) {
+        onFocusNotFound({ symbol: focus.symbol, timeframe: focus.timeframe })
+      }
+      return
+    }
     const key = `${match.symbol}-${match.timeframe}`
     // Se o filtro de tier esconde o card, abre "all" pra revelar
     if (filter !== 'all' && match.tier !== filter) {
@@ -241,7 +251,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus }:
     }, 100)
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focus, recs])
+  }, [focus, recs, loading])
 
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">

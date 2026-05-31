@@ -708,6 +708,12 @@ export default function App() {
             clearPushFocus()
           }}
           focus={pushFocus}
+          onFocusNotFound={() => {
+            // Rec saiu do top — abre Resultados >> Abertos (mantém pushFocus
+            // pra DailyPnLPanel scrollar até o card certo)
+            setShowRecommendations(false)
+            setShowDailyPnL(true)
+          }}
         />
       )}
 

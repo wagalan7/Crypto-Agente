@@ -89,7 +89,7 @@ from models.trade_signal import TradeSignal
 _snapshot_task: Optional[asyncio.Task] = None
 _scan_task: Optional[asyncio.Task] = None
 
-SERVER_SCAN_INTERVAL = 180        # 3 min entre varreduras server-side (era 5min — push tava chegando atrasado quando painel fechado)
+SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
 SERVER_SCAN_TOP_N = 40            # quantos símbolos varrer (Vision spot — universo maior compensa filtros)
 SERVER_SCAN_INITIAL_DELAY = 45    # espera 45s após startup pra não competir com init
 
