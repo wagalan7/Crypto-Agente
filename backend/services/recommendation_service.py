@@ -32,7 +32,7 @@ from models.trade_signal import TradeSignal, SignalDirection
 
 
 SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
-CACHE_TTL = 30                    # segundos (era 90 — reduzido pra rec menos stale)
+CACHE_TTL = 15                    # segundos (era 30 — push do scan tava com delay, agora mais fresco)
 MIN_RR = 1.5                      # filtro mínimo absoluto
 MIN_CONFIDENCE_B = 0.55           # tier B mínimo
 
