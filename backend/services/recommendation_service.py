@@ -921,6 +921,9 @@ async def get_recommendations_from_batch(
 
     tier_order = {"A+": 0, "A": 1, "B": 2}
     recommendations.sort(key=lambda r: (tier_order[r.tier], -r.score))
+
+    # Portfolio risk guard (#5): aplica caps de correlação/exposição
+    recommendations = await _apply_portfolio_guard(recommendations)
     return recommendations
 
 
@@ -1110,6 +1113,9 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
 
     tier_order = {"A+": 0, "A": 1, "B": 2}
     recommendations.sort(key=lambda r: (tier_order[r.tier], -r.score))
+
+    # Portfolio risk guard (#5)
+    recommendations = await _apply_portfolio_guard(recommendations)
     return recommendations
 
 
@@ -1151,6 +1157,37 @@ async def get_recommendations(top_n: int = 30) -> List[Recommendation]:
     tier_order = {"A+": 0, "A": 1, "B": 2}
     recommendations.sort(key=lambda r: (tier_order[r.tier], -r.score))
 
+    # Portfolio risk guard (#5)
+    recommendations = await _apply_portfolio_guard(recommendations)
+
     _cache["ts"] = now
     _cache["data"] = recommendations
     return recommendations
+
+
+async def _apply_portfolio_guard(recommendations: List[Recommendation]) -> List[Recommendation]:
+    """
+    Filtra recomendações aplicando caps de correlação/exposição (Issue #5).
+    Posições "abertas" = snapshots com status='open' (proxy até #11 trazer
+    integração Bybit). Logs drops com motivo claro pra debug.
+    """
+    if not recommendations:
+        return recommendations
+    try:
+        from services import portfolio_service
+        positions = await portfolio_service.get_open_positions()
+        summary = portfolio_service._summarize(positions)
+        kept, dropped = portfolio_service.filter_recommendations(
+            recommendations, open_summary=summary,
+        )
+        for d in dropped:
+            import logging as _log
+            _log.info(
+                f"[portfolio-guard] DROP {d['symbol']} {d['direction']} "
+                f"({d.get('tier')}): {d['reason']}"
+            )
+        return kept
+    except Exception as e:
+        import logging as _log
+        _log.warning(f"[portfolio-guard] falhou (passando todos): {e}")
+        return recommendations

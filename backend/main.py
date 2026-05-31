@@ -1336,6 +1336,17 @@ async def risk_kill_switch(paused: bool = True, reason: str | None = None):
     return await risk_service.set_manual_pause(paused, reason)
 
 
+@app.get("/api/portfolio/exposure")
+async def portfolio_exposure():
+    """
+    Exposição atual do portfólio (proxy via snapshots open): número de
+    posições, breakdown por categoria/direção, soma de risk_pct e limites
+    configurados (#5).
+    """
+    from services import portfolio_service
+    return await portfolio_service.get_exposure()
+
+
 @app.get("/api/risk/events")
 async def risk_events(days: int = 30, limit: int = 200):
     """
