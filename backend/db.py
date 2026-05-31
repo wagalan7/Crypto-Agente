@@ -68,6 +68,7 @@ async def init_db():
     from models import push_subscription  # noqa: F401
     from models import risk_state  # noqa: F401
     from models import risk_event  # noqa: F401
+    from models import heartbeat  # noqa: F401
     from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

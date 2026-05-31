@@ -177,6 +177,14 @@ async def _server_scan_loop():
                 f"{len(pushable)} elegíveis pra push"
             )
 
+            # Heartbeat (#6): bate antes do circuit breaker pra sinalizar
+            # que o loop está vivo mesmo se nenhuma rec for emitida
+            try:
+                from services import heartbeat_service
+                await heartbeat_service.tick("server-scan")
+            except Exception as e:
+                logging.warning(f"[server-scan] heartbeat falhou: {e}")
+
             # Circuit breaker: atualiza DD e checa se deve pausar push
             try:
                 from services import risk_service
@@ -1334,6 +1342,17 @@ async def risk_kill_switch(paused: bool = True, reason: str | None = None):
     """
     from services import risk_service
     return await risk_service.set_manual_pause(paused, reason)
+
+
+@app.get("/api/admin/health")
+async def admin_health():
+    """
+    Heartbeat do backend (#6): gap desde último tick do server-scan,
+    severidade (healthy/degraded/unknown) e contador de ticks.
+    Gap > 5min indica que o loop está congelado/morreu.
+    """
+    from services import heartbeat_service
+    return await heartbeat_service.get_health()
 
 
 @app.get("/api/portfolio/exposure")

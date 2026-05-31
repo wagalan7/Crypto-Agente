@@ -31,6 +31,16 @@ interface RiskEvent {
   ts: string
 }
 
+interface HealthStatus {
+  enabled: boolean
+  status: 'healthy' | 'degraded' | 'unknown'
+  last_alive_ts: string | null
+  gap_seconds: number | null
+  gap_alert_threshold: number
+  last_source: string | null
+  tick_count: number
+}
+
 interface Props {
   onClose: () => void
 }
@@ -46,6 +56,7 @@ interface Props {
 export default function StatusPanel({ onClose }: Props) {
   const [status, setStatus] = useState<RiskStatus | null>(null)
   const [events, setEvents] = useState<RiskEvent[]>([])
+  const [health, setHealth] = useState<HealthStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [confirmKill, setConfirmKill] = useState(false)
@@ -53,9 +64,10 @@ export default function StatusPanel({ onClose }: Props) {
 
   const load = useCallback(async () => {
     try {
-      const [sRes, eRes] = await Promise.all([
+      const [sRes, eRes, hRes] = await Promise.all([
         fetch(`${BACKEND}/api/risk/status`),
         fetch(`${BACKEND}/api/risk/events?days=30&limit=100`),
+        fetch(`${BACKEND}/api/admin/health`),
       ])
       if (sRes.ok) {
         const j = (await sRes.json()) as RiskStatus
@@ -64,6 +76,10 @@ export default function StatusPanel({ onClose }: Props) {
       if (eRes.ok) {
         const j = await eRes.json()
         setEvents(j.events ?? [])
+      }
+      if (hRes.ok) {
+        const j = (await hRes.json()) as HealthStatus
+        if (j.enabled !== false) setHealth(j)
       }
       setError(null)
     } catch (e) {
@@ -248,6 +264,51 @@ export default function StatusPanel({ onClose }: Props) {
                   )}
                 </div>
               </div>
+
+              {/* Heartbeat backend (#6) */}
+              {health && (
+                <div
+                  className={`p-3 rounded-lg border text-xs ${
+                    health.status === 'healthy'
+                      ? 'border-emerald-500/30 bg-emerald-500/5'
+                      : health.status === 'degraded'
+                      ? 'border-red-500/40 bg-red-500/10'
+                      : 'border-slate-700 bg-slate-900/40'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span
+                        className={`inline-block w-2 h-2 rounded-full ${
+                          health.status === 'healthy'
+                            ? 'bg-emerald-400 animate-pulse'
+                            : health.status === 'degraded'
+                            ? 'bg-red-400 animate-pulse'
+                            : 'bg-slate-500'
+                        }`}
+                      />
+                      <span className="font-bold text-slate-200">
+                        Heartbeat backend ·{' '}
+                        {health.status === 'healthy'
+                          ? 'saudável'
+                          : health.status === 'degraded'
+                          ? 'DEGRADADO'
+                          : 'desconhecido'}
+                      </span>
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      gap {health.gap_seconds != null ? `${health.gap_seconds}s` : '—'} /{' '}
+                      alerta {health.gap_alert_threshold}s
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[10px] text-slate-500 font-mono">
+                    {health.tick_count} ticks · fonte {health.last_source ?? '—'}
+                    {health.last_alive_ts && (
+                      <> · último {new Date(health.last_alive_ts).toLocaleTimeString('pt-BR')}</>
+                    )}
+                  </div>
+                </div>
+              )}
 
               {/* Histórico */}
               <div>
