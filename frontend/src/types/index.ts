@@ -287,6 +287,9 @@ export interface Recommendation {
   chase_level?: 'ok' | 'extended' | 'chasing' | null
   // P(TP1) calibrada empiricamente — null se calibração não disponível
   prob_tp1?: number | null
+  // Position sizing dinâmico (Kelly fracionado × score × vol) — % da banca sugerido
+  suggested_size_pct?: number | null
+  size_rationale?: string | null
   // Setup já foi resolvido nas últimas 2h (mesmo symbol+tf+direction)
   recent_outcome?: {
     status: 'won_tp1' | 'won_tp1_be' | 'won_tp2' | 'lost'

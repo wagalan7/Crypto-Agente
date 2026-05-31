@@ -66,6 +66,12 @@ class Recommendation(BaseModel):
     # P(TP1) calibrada via calibration_service — None se calib não está pronta
     # (precisa de ≥30 snapshots resolvidos nos últimos 90 dias).
     prob_tp1: Optional[float] = None          # 0..1 — exibido no card como %
+    # ── Position sizing dinâmico (Issue #4 — Kelly fracionado) ────────────
+    # Tamanho sugerido em % da banca, baseado em prob_tp1 × RR × score × volatilidade.
+    # Diferente de risk_pct (que é o % de PERDA aceitável se o stop bater).
+    # Cap [0.25%, 1.0%]. None se não foi possível computar (calib não pronta etc).
+    suggested_size_pct: Optional[float] = None
+    size_rationale: Optional[str] = None      # explicação curta PT-BR (UI tooltip)
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -489,6 +495,78 @@ async def _best_tf_for_symbol(symbol: str) -> Optional[tuple]:
     return max(scored, key=lambda x: x[1])
 
 
+# ── Position sizing dinâmico (Issue #4 — Fase 1.2) ───────────────────────────
+# Constantes:
+#  - Kelly fracionário 25%: Kelly cheio é estatisticamente "ótimo" mas leva a
+#    drawdowns brutais; fracionário reduz variância. Indústria usa 25-50%.
+#  - ATR de referência 2%: típico de cripto liquid; size cresce/encolhe em
+#    proporção inversa. Cap em [0.5, 2.0] pra evitar explosão.
+#  - WR fallback por tier quando prob_tp1 não está pronta (calib < 30 trades).
+KELLY_FRACTION = 0.25
+ATR_REFERENCE_PCT = 0.02
+ATR_MULT_FLOOR = 0.5
+ATR_MULT_CEIL = 2.0
+SIZE_MIN_PCT = 0.25
+SIZE_MAX_PCT = 1.0
+
+# Fallback de WR por tier (alinhado com backtests recentes).
+# Usado quando prob_tp1 está None (calibração ainda imatura).
+_TIER_WR_FALLBACK = {"A+": 0.62, "A": 0.55, "B": 0.50}
+
+
+def _compute_dynamic_size(
+    score: float,
+    tier: str,
+    risk_reward: float,
+    prob_tp1: Optional[float],
+    atr_pct: Optional[float],
+) -> tuple[Optional[float], str]:
+    """
+    Position sizing dinâmico via Kelly fracionado × score × volatilidade.
+
+    Fórmula:
+        kelly = (p × b − (1−p)) / b   onde b = RR
+        size  = kelly × KELLY_FRACTION × (score/100) × vol_mult
+        vol_mult = clamp(ATR_REF / atr_pct, FLOOR, CEIL)
+
+    Cap final [SIZE_MIN, SIZE_MAX].
+
+    Returns (size_pct, rationale_text). Retorna (None, motivo) se inputs
+    insuficientes — caller pode optar por usar risk_pct fixo como fallback.
+    """
+    # p_win: prob calibrada, ou fallback por tier
+    p = prob_tp1 if prob_tp1 is not None else _TIER_WR_FALLBACK.get(tier)
+    if p is None or risk_reward <= 0:
+        return None, "Dados insuficientes para sizing dinâmico"
+
+    # Kelly cheio
+    b = max(risk_reward, 0.5)  # RR muito baixo torna Kelly negativo → clamp
+    kelly = (p * b - (1.0 - p)) / b
+    if kelly <= 0:
+        return None, f"Kelly negativo (p={p:.2f}, RR={b:.1f}) — setup sem edge esperado"
+
+    # Multiplicador de volatilidade (ATR menor → posição maior; ATR maior → menor)
+    if atr_pct is None or atr_pct <= 0:
+        vol_mult = 1.0
+        vol_note = "ATR n/d"
+    else:
+        raw_mult = ATR_REFERENCE_PCT / atr_pct
+        vol_mult = max(ATR_MULT_FLOOR, min(ATR_MULT_CEIL, raw_mult))
+        vol_note = f"ATR {atr_pct*100:.1f}% → mult {vol_mult:.2f}"
+
+    score_mult = max(0.0, min(1.0, score / 100.0))
+
+    raw_size = kelly * KELLY_FRACTION * score_mult * vol_mult * 100.0  # em %
+    final_size = max(SIZE_MIN_PCT, min(SIZE_MAX_PCT, raw_size))
+
+    rationale = (
+        f"p={p*100:.0f}% × RR {b:.1f} → Kelly {kelly*100:.1f}% × "
+        f"{KELLY_FRACTION:.0%} × score {score_mult:.2f} × {vol_note} "
+        f"= {raw_size:.2f}% (cap → {final_size:.2f}%)"
+    )
+    return round(final_size, 3), rationale
+
+
 def _compute_leverage(entry: float, stop_loss: float, tier: str) -> dict:
     """
     Calcula alavancagem sugerida com gestão de risco proporcional ao tier.
@@ -626,6 +704,16 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
     except Exception:
         prob_tp1 = None
 
+    # Position sizing dinâmico (Issue #4) — Kelly fracionado × score × volatilidade
+    atr_pct_val = sig.indicators.atr_pct if sig.indicators else None
+    suggested_size_pct, size_rationale = _compute_dynamic_size(
+        score=score,
+        tier=tier,
+        risk_reward=sig.risk_reward,
+        prob_tp1=prob_tp1,
+        atr_pct=atr_pct_val,
+    )
+
     return Recommendation(
         tier=tier,
         score=score,
@@ -651,6 +739,8 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         chase_atr=chase_atr,
         chase_level=chase_level,
         prob_tp1=prob_tp1,
+        suggested_size_pct=suggested_size_pct,
+        size_rationale=size_rationale,
     )
 
 

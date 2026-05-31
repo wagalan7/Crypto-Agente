@@ -513,6 +513,21 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus }:
                     </div>
                   </div>
 
+                  {/* Size sugerido — Kelly fracionado × score × volatilidade.
+                      Diferente de risk_pct (perda aceitável se stop bater).
+                      Esse aqui é o TAMANHO da posição em % da banca. */}
+                  {r.suggested_size_pct != null && (
+                    <div
+                      className="mt-2 flex items-center justify-between gap-2 text-[10px] rounded px-2 py-1 border border-sky-500/30 bg-sky-500/10"
+                      title={r.size_rationale ?? ''}
+                    >
+                      <span className="text-sky-300">
+                        💰 Size sugerido <span className="font-mono font-bold">{r.suggested_size_pct.toFixed(2)}%</span> da banca
+                      </span>
+                      <span className="text-[9px] text-slate-400">Kelly·score·vol</span>
+                    </div>
+                  )}
+
                   {/* Preço atual vs entry — mostra delta sempre que houver current_price.
                       Ajuda usuário a julgar se rec ainda é "fresca" ou se preço já fugiu. */}
                   {r.current_price != null && r.entry != null && (() => {
