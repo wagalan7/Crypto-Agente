@@ -215,7 +215,9 @@
       "Bash(curl -sk -o /dev/null -w \"HTTP %{http_code} | %{time_total}s\\\\n\" https://agenteconsultorio.com.br/)",
       "Bash(curl -sk -I https://agenteconsultorio.com.br/)",
       "Bash(openssl s_client -showcerts -servername agenteconsultorio.com.br -connect agenteconsultorio.com.br:443)",
-      "Bash(openssl x509 *)"
+      "Bash(openssl x509 *)",
+      "Bash(command -v railway)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('agent.py'\\).read\\(\\)\\); print\\('agent.py OK'\\)\")"
     ]
   }
 }

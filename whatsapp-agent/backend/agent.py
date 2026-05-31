@@ -33,18 +33,26 @@ def _get_anthropic_client():
     return _anthropic_client
 
 
-def _call_llm(system: str, messages: list[dict], max_tokens: int = 512) -> str:
-    """Chama Groq (primário, gratuito). Fallback para Anthropic se necessário."""
+def _call_llm(system: str, messages: list[dict], max_tokens: int = 512,
+              force_json: bool = True) -> str:
+    """Chama Groq (primário, gratuito). Fallback para Anthropic se necessário.
+
+    Quando force_json=True, ativa JSON mode na Groq (response_format=json_object)
+    pra eliminar respostas em prosa que faziam o parser cair no 'não entendi'.
+    """
     if config.GROQ_API_KEY:
         try:
             client = _get_groq_client()
             msgs = [{"role": "system", "content": system}] + messages
-            resp = client.chat.completions.create(
+            kwargs = dict(
                 model="llama-3.3-70b-versatile",
                 messages=msgs,
                 max_tokens=max_tokens,
                 temperature=0.3,
             )
+            if force_json:
+                kwargs["response_format"] = {"type": "json_object"}
+            resp = client.chat.completions.create(**kwargs)
             return resp.choices[0].message.content
         except Exception as e:
             logger.warning(f"[groq] Erro: {e} — tentando Anthropic como fallback")
@@ -52,13 +60,20 @@ def _call_llm(system: str, messages: list[dict], max_tokens: int = 512) -> str:
     if config.ANTHROPIC_API_KEY:
         import anthropic
         client = _get_anthropic_client()
+        # Para Anthropic, força JSON via prefill do assistant
+        msgs = list(messages)
+        if force_json:
+            msgs = msgs + [{"role": "assistant", "content": "{"}]
         resp = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=max_tokens,
             system=system,
-            messages=messages,
+            messages=msgs,
         )
-        return resp.content[0].text
+        text = resp.content[0].text
+        if force_json and not text.lstrip().startswith("{"):
+            text = "{" + text
+        return text
 
     raise RuntimeError("Nenhuma chave de API configurada (GROQ_API_KEY ou ANTHROPIC_API_KEY)")
 
@@ -492,27 +507,57 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
         {"role": "user", "content": f"[CONTEXTO]\n{context}\n\n[MENSAGEM DO PACIENTE]\n{text}"}
     ]
 
-    raw = _call_llm(
-        system=_build_system_prompt(tenant),
-        messages=messages,
-        max_tokens=512,
-    )
+    system_prompt = _build_system_prompt(tenant)
+    raw = _call_llm(system=system_prompt, messages=messages, max_tokens=512)
     # Parse defensivo: LLM pode devolver JSON malformado, prosa misturada,
-    # ou campos fora do schema. Em qualquer falha, devolve resposta segura
-    # em vez de derrubar o webhook.
+    # ou campos fora do schema. Tenta 1 retry com prompt reforçado antes do
+    # fallback humanizado.
     try:
         parsed = _extract_json(raw)
         agent_resp = AgentResponse(**parsed)
     except Exception as e:
         logger.warning(
-            f"[{tenant['slug']}][{phone}] Falha ao parsear resposta do LLM: {e} | raw={raw[:300]!r}"
+            f"[{tenant['slug']}][{phone}] Falha JSON do LLM (tent.1): {e} | raw={raw[:200]!r}"
         )
-        agent_resp = AgentResponse(
-            intent=Intent.other,
-            action=Action.none,
-            response_text="Desculpe, não entendi muito bem 😅 Pode reformular?",
-            data={},
-        )
+        # Retry: reforça que precisa ser JSON válido
+        try:
+            retry_msgs = messages + [
+                {"role": "assistant", "content": raw or ""},
+                {"role": "user", "content":
+                    "Sua resposta anterior não era JSON válido. Responda AGORA "
+                    "APENAS com um objeto JSON no formato exigido (intent, action, "
+                    "response_text, data). Sem texto fora do JSON, sem ```."}
+            ]
+            raw2 = _call_llm(system=system_prompt, messages=retry_msgs, max_tokens=512)
+            parsed = _extract_json(raw2)
+            agent_resp = AgentResponse(**parsed)
+            logger.info(f"[{tenant['slug']}][{phone}] Retry JSON OK")
+        except Exception as e2:
+            logger.warning(
+                f"[{tenant['slug']}][{phone}] Falha JSON (tent.2): {e2} | raw={raw[:200]!r}"
+            )
+            # Fallback humanizado — escolhe baseado na intenção provável do texto
+            t = (text or "").lower()
+            if any(k in t for k in ("agend", "marc", "horário", "horario", "consult", "sess", "atend")):
+                resp_text = ("Recebi sua mensagem! 😊 Para te ajudar com o agendamento, "
+                             "vou repassar para a psicóloga, que entra em contato em breve.")
+            elif any(k in t for k in ("remarcar", "desmarcar", "cancelar", "mudar")):
+                resp_text = ("Anotado! 😊 Vou repassar seu pedido para a psicóloga, "
+                             "que retorna em breve para combinar com você.")
+            elif any(k in t for k in ("valor", "preço", "preco", "quanto", "pagar", "pagamento")):
+                resp_text = ("Sobre valores e pagamento, prefiro que a psicóloga te explique "
+                             "diretamente. Já estou avisando ela! 😊")
+            else:
+                resp_text = ("Recebi sua mensagem! 😊 Vou repassar para a psicóloga, "
+                             "que responde assim que puder.")
+            logger.error(
+                f"[{tenant['slug']}][{phone}] FALLBACK humanizado acionado "
+                f"para texto={text[:80]!r} — verificar logs do LLM acima"
+            )
+            agent_resp = AgentResponse(
+                intent=Intent.other, action=Action.none,
+                response_text=resp_text, data={},
+            )
 
     # Guard-rail: se LLM tratou paciente conhecido como novo, corrigir
     if known_patient and agent_resp.intent == Intent.new_patient:
