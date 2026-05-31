@@ -31,6 +31,24 @@ interface RiskEvent {
   ts: string
 }
 
+interface TierStat {
+  n: number
+  wins: number
+  losses: number
+  wr_pct: number | null
+  avg_r: number | null
+  expectancy_r: number | null
+  pnl_pct: number
+}
+
+interface PaperSummary {
+  enabled: boolean
+  mode: string
+  days: number
+  equity: { final_pnl_pct: number; trades_total: number; curve: { date: string; cumulative_pct: number }[] }
+  tier_stats: Record<string, TierStat>
+}
+
 interface HealthStatus {
   enabled: boolean
   status: 'healthy' | 'degraded' | 'unknown'
@@ -57,6 +75,7 @@ export default function StatusPanel({ onClose }: Props) {
   const [status, setStatus] = useState<RiskStatus | null>(null)
   const [events, setEvents] = useState<RiskEvent[]>([])
   const [health, setHealth] = useState<HealthStatus | null>(null)
+  const [paper, setPaper] = useState<PaperSummary | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [confirmKill, setConfirmKill] = useState(false)
@@ -64,10 +83,11 @@ export default function StatusPanel({ onClose }: Props) {
 
   const load = useCallback(async () => {
     try {
-      const [sRes, eRes, hRes] = await Promise.all([
+      const [sRes, eRes, hRes, pRes] = await Promise.all([
         fetch(`${BACKEND}/api/risk/status`),
         fetch(`${BACKEND}/api/risk/events?days=30&limit=100`),
         fetch(`${BACKEND}/api/admin/health`),
+        fetch(`${BACKEND}/api/paper/summary?days=30`),
       ])
       if (sRes.ok) {
         const j = (await sRes.json()) as RiskStatus
@@ -80,6 +100,10 @@ export default function StatusPanel({ onClose }: Props) {
       if (hRes.ok) {
         const j = (await hRes.json()) as HealthStatus
         if (j.enabled !== false) setHealth(j)
+      }
+      if (pRes.ok) {
+        const j = (await pRes.json()) as PaperSummary
+        if (j.enabled !== false) setPaper(j)
       }
       setError(null)
     } catch (e) {
@@ -264,6 +288,60 @@ export default function StatusPanel({ onClose }: Props) {
                   )}
                 </div>
               </div>
+
+              {/* Paper-trade summary (#8) */}
+              {paper && (
+                <div className="p-3 rounded-lg border border-violet-500/30 bg-violet-500/5">
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-violet-300 font-bold text-xs">
+                        🧪 Paper-trade · últimos {paper.days}d
+                      </span>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40">
+                        {paper.equity.trades_total} trades
+                      </span>
+                    </div>
+                    <span
+                      className={`text-sm font-mono font-bold ${
+                        paper.equity.final_pnl_pct >= 0 ? 'text-emerald-300' : 'text-red-300'
+                      }`}
+                    >
+                      {paper.equity.final_pnl_pct >= 0 ? '+' : ''}
+                      {paper.equity.final_pnl_pct.toFixed(2)}%
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 text-[10px]">
+                    {(['A+', 'A', 'B'] as const).map(t => {
+                      const s = paper.tier_stats[t]
+                      if (!s || s.n === 0) {
+                        return (
+                          <div key={t} className="p-1.5 rounded bg-slate-900/40 border border-slate-800 text-center">
+                            <div className="font-bold text-slate-400">{t}</div>
+                            <div className="text-slate-600">sem dados</div>
+                          </div>
+                        )
+                      }
+                      return (
+                        <div key={t} className="p-1.5 rounded bg-slate-900/40 border border-slate-800 text-center">
+                          <div className="font-bold text-slate-300">
+                            {t} · <span className="text-slate-500">{s.n}</span>
+                          </div>
+                          <div className="text-slate-400 font-mono">
+                            WR <span className={s.wr_pct && s.wr_pct >= 50 ? 'text-emerald-400' : 'text-red-400'}>
+                              {s.wr_pct?.toFixed(0) ?? '—'}%
+                            </span>
+                          </div>
+                          <div className="text-slate-400 font-mono">
+                            R <span className={s.avg_r && s.avg_r >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                              {s.avg_r != null ? (s.avg_r >= 0 ? '+' : '') + s.avg_r.toFixed(2) : '—'}
+                            </span>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
 
               {/* Heartbeat backend (#6) */}
               {health && (

@@ -1344,6 +1344,30 @@ async def risk_kill_switch(paused: bool = True, reason: str | None = None):
     return await risk_service.set_manual_pause(paused, reason)
 
 
+@app.get("/api/paper/equity-curve")
+async def paper_equity_curve(days: int = 30):
+    """
+    Paper-trade equity curve (#8): P&L cumulativo diário das snapshots
+    resolvidas. Hoje todo snapshot é paper (sem execução real ainda).
+    """
+    from services import paper_trade_service
+    return await paper_trade_service.equity_curve(days=days)
+
+
+@app.get("/api/paper/stats")
+async def paper_stats(days: int = 30):
+    """Stats por tier (WR, avgR, expectancy, streak de perdas) — paper-trade."""
+    from services import paper_trade_service
+    return await paper_trade_service.stats_by_tier(days=days)
+
+
+@app.get("/api/paper/summary")
+async def paper_summary(days: int = 30):
+    """Combo equity-curve + tier stats numa chamada só — pra dashboard #10."""
+    from services import paper_trade_service
+    return await paper_trade_service.summary(days=days)
+
+
 @app.get("/api/admin/health")
 async def admin_health():
     """
