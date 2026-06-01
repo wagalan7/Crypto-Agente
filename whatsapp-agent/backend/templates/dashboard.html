@@ -175,7 +175,7 @@
             {% set day_labels = [('0','Seg'),('1','Ter'),('2','Qua'),('3','Qui'),('4','Sex'),('5','Sáb'),('6','Dom')] %}
             {% for v, lbl in day_labels %}
             <label class="cursor-pointer">
-              <input type="checkbox" class="peer hidden slot-wd" value="{{ v }}" {% if v in wd_set %}checked{% endif %}/>
+              <input type="checkbox" class="peer hidden slot-wd" value="{{ v }}" {% if v in wd_set %}checked{% endif %} onchange="renderBlockedByDay()"/>
               <div class="text-center text-xs py-2 rounded-lg border border-gray-200 bg-gray-50 text-gray-500 peer-checked:bg-brand peer-checked:text-white peer-checked:border-brand transition">
                 {{ lbl }}
               </div>
@@ -213,6 +213,18 @@
           </div>
           <input type="hidden" id="slot-blocked-raw" value="{{ tenant.blocked_hours or '12,13,14' }}"/>
           <div id="slot-blocked-grid" class="grid grid-cols-6 gap-1.5"></div>
+          <p class="text-[11px] text-gray-400 mt-1">Aplica para <strong>todos</strong> os dias de atendimento.</p>
+        </div>
+
+        <!-- Bloqueio por dia da semana (ex: só terça às 17h) -->
+        <div>
+          <div class="flex items-center justify-between mb-2">
+            <label class="block text-xs font-medium text-gray-600">Bloquear hora em dia específico</label>
+            <span class="text-[10px] text-gray-400">só esse dia</span>
+          </div>
+          <input type="hidden" id="slot-blocked-by-day-raw" value='{{ tenant.blocked_hours_by_day or "" }}'/>
+          <div id="slot-blocked-by-day-grid" class="space-y-2"></div>
+          <p class="text-[11px] text-gray-400 mt-1">Ex.: deixar a terça às 17h indisponível sem afetar os outros dias.</p>
         </div>
 
         <!-- Datas bloqueadas (feriados/férias) -->
@@ -1306,6 +1318,96 @@ function renderBlockedHours() {
       onclick="toggleBlockedHour(this)"
       class="border ${cls} text-xs font-medium py-2 rounded-lg active:scale-95 transition">${String(h).padStart(2,'0')}h</button>`;
   }).join('');
+  renderBlockedByDay();
+}
+
+// ── Bloqueio por dia da semana ──────────────────────────────────────────
+const _DAY_LABELS = ['Seg','Ter','Qua','Qui','Sex','Sáb','Dom'];
+
+function _parseBlockedByDay() {
+  const raw = (document.getElementById('slot-blocked-by-day-raw').value || '').trim();
+  if (!raw) return {};
+  try {
+    const data = JSON.parse(raw);
+    const out = {};
+    Object.keys(data).forEach(k => {
+      const wd = parseInt(k, 10);
+      if (wd >= 0 && wd <= 6 && Array.isArray(data[k])) {
+        out[wd] = data[k].map(h => parseInt(h, 10)).filter(h => !isNaN(h));
+      }
+    });
+    return out;
+  } catch (e) { return {}; }
+}
+
+function renderBlockedByDay() {
+  const wrap = document.getElementById('slot-blocked-by-day-grid');
+  if (!wrap) return;
+  const start = parseInt(document.getElementById('slot-start').value, 10) || 0;
+  const end = parseInt(document.getElementById('slot-end').value, 10) || 24;
+  const activeDays = Array.from(document.querySelectorAll('.slot-wd:checked'))
+    .map(c => parseInt(c.value, 10))
+    .sort((a,b) => a - b);
+  if (!activeDays.length) {
+    wrap.innerHTML = '<p class="text-[11px] text-gray-400">Selecione dias de atendimento acima.</p>';
+    return;
+  }
+  const globalBlocked = new Set(
+    (document.getElementById('slot-blocked-raw').value || '')
+      .split(',').map(s => s.trim()).filter(Boolean).map(Number)
+  );
+  const perDay = _parseBlockedByDay();
+  const hours = [];
+  for (let h = start; h < end; h++) hours.push(h);
+  wrap.innerHTML = activeDays.map(wd => {
+    const blockedSet = new Set(perDay[wd] || []);
+    const buttons = hours.map(h => {
+      const isGlobal = globalBlocked.has(h);
+      const isBlocked = blockedSet.has(h);
+      let cls, label, disabled = '', dataBlocked = isBlocked ? '1' : '0';
+      if (isGlobal) {
+        cls = 'bg-red-50 text-red-300 border-red-100 cursor-not-allowed';
+        disabled = 'disabled';
+        dataBlocked = '0';
+      } else if (isBlocked) {
+        cls = 'bg-red-50 text-red-700 border-red-200';
+      } else {
+        cls = 'bg-gray-50 text-gray-600 border-gray-200';
+      }
+      return `<button type="button" data-wd="${wd}" data-hour="${h}" data-blocked="${dataBlocked}" ${disabled}
+        onclick="togglePerDayHour(this)"
+        class="per-day-hour border ${cls} text-[11px] font-medium py-1.5 rounded-md active:scale-95 transition">
+        ${String(h).padStart(2,'0')}h</button>`;
+    }).join('');
+    return `<div class="border border-gray-100 rounded-lg p-2 bg-gray-50/50">
+      <div class="text-[11px] font-semibold text-gray-600 mb-1.5">${_DAY_LABELS[wd]}</div>
+      <div class="grid grid-cols-6 gap-1">${buttons}</div>
+    </div>`;
+  }).join('');
+}
+
+function togglePerDayHour(btn) {
+  if (btn.disabled) return;
+  const isBlocked = btn.getAttribute('data-blocked') === '1';
+  if (isBlocked) {
+    btn.setAttribute('data-blocked', '0');
+    btn.className = 'per-day-hour border bg-gray-50 text-gray-600 border-gray-200 text-[11px] font-medium py-1.5 rounded-md active:scale-95 transition';
+  } else {
+    btn.setAttribute('data-blocked', '1');
+    btn.className = 'per-day-hour border bg-red-50 text-red-700 border-red-200 text-[11px] font-medium py-1.5 rounded-md active:scale-95 transition';
+  }
+}
+
+function _collectBlockedByDay() {
+  const out = {};
+  document.querySelectorAll('.per-day-hour[data-blocked="1"]').forEach(b => {
+    const wd = b.getAttribute('data-wd');
+    const h = parseInt(b.getAttribute('data-hour'), 10);
+    if (!out[wd]) out[wd] = [];
+    out[wd].push(h);
+  });
+  Object.keys(out).forEach(k => out[k].sort((a,b) => a - b));
+  return out;
 }
 
 // Datas bloqueadas (feriados/férias)
@@ -1357,6 +1459,11 @@ function toggleBlockedHour(btn) {
     btn.setAttribute('data-blocked', '1');
     btn.className = 'border bg-red-50 text-red-700 border-red-200 text-xs font-medium py-2 rounded-lg active:scale-95 transition';
   }
+  // sincroniza com slot-blocked-raw pra que o grid por-dia se atualize
+  const newRaw = Array.from(document.querySelectorAll('#slot-blocked-grid [data-blocked="1"]'))
+    .map(b => b.getAttribute('data-hour')).sort((a,b)=>parseInt(a)-parseInt(b)).join(',');
+  document.getElementById('slot-blocked-raw').value = newRaw;
+  renderBlockedByDay();
 }
 
 function saveSlotConfig(btn) {
@@ -1386,12 +1493,15 @@ function saveSlotConfig(btn) {
   }
   const blocked = Array.from(document.querySelectorAll('#slot-blocked-grid [data-blocked="1"]')).map(b => b.getAttribute('data-hour')).sort((a,b)=>parseInt(a)-parseInt(b));
   const blockedDates = _getBlockedDates();
+  const blockedByDay = _collectBlockedByDay();
+  const blockedByDayJson = Object.keys(blockedByDay).length ? JSON.stringify(blockedByDay) : '';
   const payload = {
     working_hours_start: start,
     working_hours_end: end,
     session_minutes: duration,
     working_days: days.join(','),
     blocked_hours: blocked.join(','),
+    blocked_hours_by_day: blockedByDayJson,
     blocked_dates: blockedDates.join(','),
   };
   btn.disabled = true;
@@ -1400,6 +1510,7 @@ function saveSlotConfig(btn) {
   api('/dashboard/api/config', { method: 'PATCH', body: JSON.stringify(payload) })
     .then(() => {
       document.getElementById('slot-blocked-raw').value = blocked.join(',');
+      document.getElementById('slot-blocked-by-day-raw').value = blockedByDayJson;
       fb.className = 'text-sm rounded-lg px-3 py-2 bg-green-50 text-green-700';
       fb.textContent = '✓ Horários atualizados.';
       fb.classList.remove('hidden');

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import json
 import database as db
 
 _TZ = ZoneInfo("America/Sao_Paulo")
@@ -31,6 +32,27 @@ def _blocked_dates(tenant: dict) -> set[str]:
     return {d.strip() for d in raw.split(",") if d.strip()}
 
 
+def _blocked_hours_by_day(tenant: dict) -> dict[int, set[int]]:
+    """Horas bloqueadas em dias específicos da semana.
+    Retorna {weekday(0=Seg): {hora, …}}. Se o campo estiver vazio, retorna {}."""
+    raw = (tenant.get("blocked_hours_by_day") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        out: dict[int, set[int]] = {}
+        for k, v in data.items():
+            try:
+                wd = int(k)
+            except Exception:
+                continue
+            if 0 <= wd <= 6 and isinstance(v, list):
+                out[wd] = {int(h) for h in v if isinstance(h, (int, str)) and str(h).isdigit()}
+        return out
+    except Exception:
+        return {}
+
+
 def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> list[datetime]:
     tenant_id = tenant["id"]
     start_h = tenant["working_hours_start"]
@@ -39,6 +61,7 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
     working_days = _working_days(tenant)
     blocked_hours = _blocked_hours(tenant)
     blocked_dates = _blocked_dates(tenant)
+    blocked_by_day = _blocked_hours_by_day(tenant)
 
     now = datetime.now(_TZ).replace(tzinfo=None)  # naive, horário de Brasília
     check = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -65,6 +88,7 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
             check.weekday() in working_days
             and start_h <= check.hour < end_h
             and check.hour not in blocked_hours
+            and check.hour not in blocked_by_day.get(check.weekday(), set())
             and check.strftime("%Y-%m-%d") not in blocked_dates
             and not _conflicts(check)
         ):

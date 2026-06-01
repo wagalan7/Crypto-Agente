@@ -601,6 +601,7 @@ class TenantUpdate(BaseModel):
     pix_name: Optional[str] = None
     working_days: Optional[str] = None
     blocked_hours: Optional[str] = None
+    blocked_hours_by_day: Optional[str] = None
     blocked_dates: Optional[str] = None
     confirmation_hour: Optional[int] = None
     confirmation_msg_template: Optional[str] = None
