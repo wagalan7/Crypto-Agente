@@ -98,7 +98,11 @@ async def _signed_get(path: str, params: Optional[dict] = None) -> dict:
     url = f"{BASE}{path}" + (f"?{qs}" if qs else "")
     try:
         r = await _get_client().get(url, headers=_headers(ts, sign))
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            log.warning(f"[bybit] GET {path} resposta não-JSON status={r.status_code} body={r.text[:300]}")
+            return {"ok": False, "error": f"resposta não-JSON ({r.status_code}): {r.text[:200]}"}
         ret_code = data.get("retCode")
         if ret_code != 0:
             log.warning(f"[bybit] {path} retCode={ret_code} msg={data.get('retMsg')}")
@@ -118,7 +122,11 @@ async def _signed_post(path: str, body: dict) -> dict:
     url = f"{BASE}{path}"
     try:
         r = await _get_client().post(url, headers=_headers(ts, sign), content=payload)
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            log.warning(f"[bybit] POST {path} resposta não-JSON status={r.status_code} body={r.text[:300]}")
+            return {"ok": False, "error": f"resposta não-JSON ({r.status_code}): {r.text[:200]}"}
         ret_code = data.get("retCode")
         if ret_code != 0:
             log.warning(f"[bybit] POST {path} retCode={ret_code} msg={data.get('retMsg')}")
