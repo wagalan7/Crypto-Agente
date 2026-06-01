@@ -172,10 +172,18 @@
             </div>
           {% else %}
             <p class="font-medium text-gray-900 text-sm truncate">{{ p.patient_name }}</p>
-            <p class="text-xs {{ 'text-yellow-600 font-medium' if is_paused else 'text-gray-400' }}">
-              {% if is_paused %}⏸ Pausado{% else %}🤖 Agente ativo{% endif %}
-              <span class="text-gray-300"> · {{ phone_pretty }}</span>
-            </p>
+            <div class="flex items-center gap-1.5 mt-0.5">
+              <p class="text-xs {{ 'text-yellow-600 font-medium' if is_paused else 'text-gray-400' }} truncate">
+                {% if is_paused %}⏸ Pausado{% else %}🤖 Agente ativo{% endif %}
+                <span class="text-gray-300"> · {{ phone_pretty }}</span>
+              </p>
+              <button type="button"
+                onclick="document.getElementById('rename-{{ loop.index }}').classList.toggle('hidden');"
+                class="text-[10px] text-purple-600 font-semibold border border-purple-200 bg-purple-50 px-2 py-0.5 rounded-full whitespace-nowrap flex-shrink-0"
+                title="Corrigir nome">
+                ✏️ Editar
+              </button>
+            </div>
           {% endif %}
         </div>
 
@@ -209,12 +217,12 @@
         </div>
         </div>
 
-        {% if sem_nome %}
-        <!-- Form inline renomear -->
+        <!-- Form inline renomear (vale tanto para "sem nome" quanto edição) -->
         <form id="rename-{{ loop.index }}" method="POST"
           action="/controle/{{ token }}/renomear/{{ p.phone }}"
           class="hidden mt-3 pt-3 border-t border-gray-100 flex gap-2">
           <input name="patient_name" required maxlength="80"
+            value="{{ p.patient_name or '' }}"
             placeholder="Nome do paciente"
             class="flex-1 border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-brand"/>
           <button type="submit"
@@ -222,7 +230,6 @@
             Salvar
           </button>
         </form>
-        {% endif %}
       </div>
     {% endfor %}
     </div>

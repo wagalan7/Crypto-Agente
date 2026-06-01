@@ -644,9 +644,16 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                     logger.warning(f"[caldav] create_event falhou: {e}")
                 formatted = cal.format_slots([slot])[0]
                 # Forçar o horário correto na resposta — o LLM pode ter escrito
-                # um horário diferente no texto. Substituímos qualquer menção
-                # ao slot pelo horário real armazenado.
-                reply = text.replace("[slot]", formatted).replace("[hora]", formatted)
+                # um horário/dia da semana errado no texto (ex: "sexta, 11/06"
+                # quando 11/06 é quinta). Substituímos qualquer menção ao slot
+                # pelo formato canônico calculado a partir do datetime real.
+                import re as _re
+                _DOW = r"(?:segunda(?:-feira)?|ter[çc]a(?:-feira)?|quarta(?:-feira)?|quinta(?:-feira)?|sexta(?:-feira)?|s[áa]bado|domingo)"
+                _PAT = _re.compile(rf"{_DOW},\s*\d{{1,2}}/\d{{1,2}}(?:\s+(?:[àa]s)\s+\d{{1,2}}[:h]\d{{2}})?", _re.IGNORECASE)
+                fixed_text = _PAT.sub(formatted, text or "")
+                reply = fixed_text.replace("[slot]", formatted).replace("[hora]", formatted)
+                if not reply.strip() or formatted not in reply:
+                    reply = f"Pronto! ✅ {name.split()[0] if name else 'Sua consulta'} agendado(a) para {formatted}. Até lá! 😊"
                 logger.info(f"[{tenant['slug']}] Agendamento criado: {name} | slot_index={idx_raw}(raw)→{idx}(0based) | slot={formatted}")
                 event = {"type": "new_appointment", "data": {"patient_name": name, "slot": formatted, "phone": phone}}
                 return reply, event
@@ -685,7 +692,23 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 except Exception as e:
                     logger.warning(f"[caldav] update_event falhou: {e}")
                 formatted = cal.format_slots([slot])[0]
-                reply = text.replace("[slot]", formatted).replace("[hora]", formatted)
+                # ── Anti-alucinação: a LLM às vezes inventa o dia da semana
+                # (ex: "sexta, 11/06" quando 11/06 é quinta). Substituímos
+                # qualquer "<dia da semana>, DD/MM" do texto da LLM pelo
+                # formato canônico calculado a partir do datetime real.
+                import re as _re
+                _DOW = r"(?:segunda(?:-feira)?|ter[çc]a(?:-feira)?|quarta(?:-feira)?|quinta(?:-feira)?|sexta(?:-feira)?|s[áa]bado|domingo)"
+                _PAT = _re.compile(rf"{_DOW},\s*\d{{1,2}}/\d{{1,2}}(?:\s+(?:[àa]s)\s+\d{{1,2}}[:h]\d{{2}})?", _re.IGNORECASE)
+                fixed_text = _PAT.sub(formatted, text or "")
+                reply = fixed_text.replace("[slot]", formatted).replace("[hora]", formatted)
+                # Se o texto da LLM veio vazio ou mesmo após substituição não
+                # menciona o slot canônico, montamos uma confirmação determinística.
+                if not reply.strip() or formatted not in reply:
+                    old_fmt = cal.format_appointment(appt) if appt else ""
+                    if old_fmt:
+                        reply = f"Pronto! ✅ Sua consulta de {old_fmt} foi reagendada para {formatted}. Até lá! 😊"
+                    else:
+                        reply = f"Pronto! ✅ Sua consulta foi reagendada para {formatted}. Até lá! 😊"
                 return reply, {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}
         return "Não consegui remarcar. Pode escolher outro horário? 😊", None
 

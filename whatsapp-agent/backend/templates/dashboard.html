@@ -770,7 +770,7 @@
             <select id="na-freq" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand">
               <option value="7">Semanal</option>
               <option value="14" selected>Quinzenal</option>
-              <option value="21">A cada 3 semanas</option>
+              <option value="3xmonth">3x por mês (semanal, pula 1 sem)</option>
               <option value="28">Mensal</option>
             </select>
           </div>
@@ -1813,7 +1813,8 @@ async function submitNewAppt() {
   const date    = document.getElementById("na-date").value;
   const time    = document.getElementById("na-time").value;
   const repeat  = document.getElementById("na-repeat").checked;
-  const freq    = parseInt(document.getElementById("na-freq").value);
+  const freqRaw = document.getElementById("na-freq").value;
+  const freq    = parseInt(freqRaw); // NaN se for "3xmonth"
   const sessions= parseInt(document.getElementById("na-sessions").value) || 1;
   const errEl   = document.getElementById("na-error");
   const btn     = document.getElementById("na-btn");
@@ -1836,11 +1837,26 @@ async function submitNewAppt() {
 
   // Gerar lista de datas
   const dates = [];
-  let current = new Date(`${date}T${time}:00`);
+  const start = new Date(`${date}T${time}:00`);
   const count = repeat ? sessions : 1;
-  for (let i = 0; i < count; i++) {
-    dates.push(new Date(current));
-    current.setDate(current.getDate() + freq);
+  if (repeat && freqRaw === "3xmonth") {
+    // 3 sessões por mês: semanal por 3 semanas (offsets 0,7,14),
+    // pula a 4ª semana (offset 28 vira sessão 4 do próximo mês), repete.
+    // Padrão de offsets: 0, 7, 14, 28, 35, 42, 56, 63, 70, ...
+    for (let i = 0; i < count; i++) {
+      const cycle = Math.floor(i / 3);   // qual mês (0 = atual)
+      const inCycle = i % 3;             // 0, 1 ou 2 dentro do mês
+      const offsetDays = cycle * 28 + inCycle * 7;
+      const d = new Date(start);
+      d.setDate(d.getDate() + offsetDays);
+      dates.push(d);
+    }
+  } else {
+    let current = new Date(start);
+    for (let i = 0; i < count; i++) {
+      dates.push(new Date(current));
+      current.setDate(current.getDate() + (isNaN(freq) ? 7 : freq));
+    }
   }
 
   try {
