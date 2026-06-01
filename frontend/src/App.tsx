@@ -10,6 +10,7 @@ import InsightsPanel from './components/InsightsPanel'
 import PushSubscribeButton from './components/PushSubscribeButton'
 import RiskStatusBadge from './components/RiskStatusBadge'
 import StatusPanel from './components/StatusPanel'
+import DashboardPanel from './components/DashboardPanel'
 import { api } from './services/api'
 import { usePushFocus } from './hooks/usePushFocus'
 import type { SignalDirection, TradeType } from './types'
@@ -189,6 +190,7 @@ export default function App() {
   const [showDailyPnL, setShowDailyPnL] = useState(false)
   const [showInsights, setShowInsights] = useState(false)
   const [showStatus, setShowStatus] = useState(false)
+  const [showDashboard, setShowDashboard] = useState(false)
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const { focus: pushFocus, clear: clearPushFocus } = usePushFocus()
 
@@ -503,6 +505,14 @@ export default function App() {
             <span>🎓</span>
             <span className="hidden sm:block">Insights</span>
           </button>
+          <button
+            onClick={() => setShowDashboard(true)}
+            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-cyan-500/20 to-blue-500/20 hover:from-cyan-500/30 hover:to-blue-500/30 border border-cyan-500/40 rounded text-xs font-bold text-cyan-300"
+            title="Dashboard — performance comparativa"
+          >
+            <span>📈</span>
+            <span className="hidden sm:block">Dashboard</span>
+          </button>
           <RiskStatusBadge onOpen={() => setShowStatus(true)} />
           <PushSubscribeButton />
           <button
@@ -733,6 +743,10 @@ export default function App() {
 
       {showInsights && (
         <InsightsPanel onClose={() => setShowInsights(false)} />
+      )}
+
+      {showDashboard && (
+        <DashboardPanel onClose={() => setShowDashboard(false)} />
       )}
     </div>
   )
