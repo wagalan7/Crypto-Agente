@@ -144,6 +144,30 @@ def init_db():
             except sqlite3.OperationalError:
                 pass  # coluna já existe
 
+        # ── Limpeza one-shot: remove saudação "Boa tarde..." inicial dos
+        # templates de cobrança personalizados (passa a iniciar pelo nome). ──
+        try:
+            rows = conn.execute(
+                "SELECT id, billing_msg_template FROM tenants "
+                "WHERE billing_msg_template IS NOT NULL AND billing_msg_template != ''"
+            ).fetchall()
+            import re as _re
+            _BAD_PREFIX = _re.compile(
+                r"^\s*(boa\s*tarde+e*|bom\s*dia+a*|boa\s*noite+e*|ol[áa]+|oi+)"
+                r"[^\n]*\n+",
+                _re.IGNORECASE,
+            )
+            for row in rows:
+                tpl = row["billing_msg_template"]
+                new_tpl = _BAD_PREFIX.sub("", tpl, count=1)
+                if new_tpl != tpl:
+                    conn.execute(
+                        "UPDATE tenants SET billing_msg_template=? WHERE id=?",
+                        (new_tpl, row["id"]),
+                    )
+        except Exception:
+            pass  # se algo falhar, não quebra o boot
+
         # ── Tabelas auxiliares (admin, tracking, CMS) ─────────────────────────
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS admin_users (

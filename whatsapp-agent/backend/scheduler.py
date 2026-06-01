@@ -79,7 +79,7 @@ _DEFAULT_FOLLOWUP = (
 )
 
 _DEFAULT_BILLING = (
-    "Boa tardeee {nome} 🌷\n"
+    "{nome} 🌷\n"
     "Espero que esteja tudo bem.\n\n"
     "Gostaria de informar o valor das sessões do último mês.\n\n"
     "Fechamos em R$ {total} 🩷\n\n"
