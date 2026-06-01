@@ -37,8 +37,10 @@ class RealTrade(Base):
         Integer, ForeignKey("recommendation_snapshots.id"), nullable=True, index=True
     )
 
-    # Bybit order tracking (quando source='bybit' ou 'auto')
-    bybit_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Exchange order tracking (quando source != 'manual')
+    # `exchange` = "bybit" | "binance" | "okx" | ... (qualquer corretora suportada)
+    exchange: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    exchange_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     client_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
     # Tamanho da posição

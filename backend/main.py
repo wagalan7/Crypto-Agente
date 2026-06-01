@@ -1531,19 +1531,66 @@ async def real_trade_get(trade_id: int):
     return result
 
 
-# ─── Bybit signed endpoints (#11.1) ───────────────────────────────────────────
+# ─── Exchange signed endpoints (#11) ──────────────────────────────────────────
+# Endpoints sob /api/exchange/* usam o cliente ativo (EXCHANGE=binance|bybit).
+# Aliases /api/bybit/* e /api/binance/* forçam o cliente específico — úteis
+# pra debug/comparação. UI deve preferir /api/exchange/*.
+
+
+@app.get("/api/exchange/env")
+async def exchange_env():
+    """Qual corretora está ativa + diagnóstico (testnet, key configurada)."""
+    from services import exchange_service
+    return exchange_service.env_info()
+
+
+@app.get("/api/exchange/account")
+async def exchange_account():
+    from services import exchange_service
+    res = await exchange_service.get_wallet_balance()
+    if not res.get("ok"):
+        raise HTTPException(502, f"Exchange: {res.get('error') or res.get('msg')}")
+    return res
+
+
+@app.get("/api/exchange/positions")
+async def exchange_positions(symbol: str | None = None):
+    from services import exchange_service
+    res = await exchange_service.get_positions(symbol=symbol)
+    if not res.get("ok"):
+        raise HTTPException(502, f"Exchange: {res.get('error') or res.get('msg')}")
+    return res
+
+
+@app.get("/api/exchange/orders")
+async def exchange_orders(symbol: str | None = None, limit: int = 50):
+    from services import exchange_service
+    res = await exchange_service.get_order_history(symbol=symbol, limit=limit)
+    if not res.get("ok"):
+        raise HTTPException(502, f"Exchange: {res.get('error') or res.get('msg')}")
+    return res
+
+
+@app.get("/api/exchange/executions")
+async def exchange_executions(symbol: str | None = None, limit: int = 50):
+    from services import exchange_service
+    res = await exchange_service.get_executions(symbol=symbol, limit=limit)
+    if not res.get("ok"):
+        raise HTTPException(502, f"Exchange: {res.get('error') or res.get('msg')}")
+    return res
+
+
+# Aliases por corretora — força o cliente específico independente do EXCHANGE
 
 
 @app.get("/api/bybit/env")
 async def bybit_env():
-    """Diagnóstico: testnet/mainnet, key configurada, base URL. Não vaza secret."""
     from services import bybit_signed_service
     return bybit_signed_service.env_info()
 
 
 @app.get("/api/bybit/account")
 async def bybit_account():
-    """Saldo da carteira na Bybit (testnet por padrão)."""
     from services import bybit_signed_service
     res = await bybit_signed_service.get_wallet_balance()
     if not res.get("ok"):
@@ -1551,30 +1598,27 @@ async def bybit_account():
     return res
 
 
-@app.get("/api/bybit/positions")
-async def bybit_positions(symbol: str | None = None):
-    from services import bybit_signed_service
-    res = await bybit_signed_service.get_positions(symbol=symbol)
+@app.get("/api/binance/env")
+async def binance_env():
+    from services import binance_signed_service
+    return binance_signed_service.env_info()
+
+
+@app.get("/api/binance/account")
+async def binance_account():
+    from services import binance_signed_service
+    res = await binance_signed_service.get_wallet_balance()
     if not res.get("ok"):
-        raise HTTPException(502, f"Bybit: {res.get('error') or res.get('msg')}")
+        raise HTTPException(502, f"Binance: {res.get('error') or res.get('msg')}")
     return res
 
 
-@app.get("/api/bybit/orders")
-async def bybit_orders(symbol: str | None = None, limit: int = 50):
-    from services import bybit_signed_service
-    res = await bybit_signed_service.get_order_history(symbol=symbol, limit=limit)
+@app.get("/api/binance/positions")
+async def binance_positions(symbol: str | None = None):
+    from services import binance_signed_service
+    res = await binance_signed_service.get_positions(symbol=symbol)
     if not res.get("ok"):
-        raise HTTPException(502, f"Bybit: {res.get('error') or res.get('msg')}")
-    return res
-
-
-@app.get("/api/bybit/executions")
-async def bybit_executions(symbol: str | None = None, limit: int = 50):
-    from services import bybit_signed_service
-    res = await bybit_signed_service.get_executions(symbol=symbol, limit=limit)
-    if not res.get("ok"):
-        raise HTTPException(502, f"Bybit: {res.get('error') or res.get('msg')}")
+        raise HTTPException(502, f"Binance: {res.get('error') or res.get('msg')}")
     return res
 
 

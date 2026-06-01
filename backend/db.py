@@ -89,6 +89,29 @@ async def init_db():
             "ALTER TABLE recommendation_snapshots "
             "ADD COLUMN IF NOT EXISTS peak_price_since_tp1 DOUBLE PRECISION"
         ))
+        # #11.x: real_trades virou exchange-agnostic (era bybit-only)
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS exchange VARCHAR(20)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS exchange_order_id VARCHAR(64)"
+        ))
+        # Se a coluna antiga existir (deploy anterior), copia o valor pro novo nome.
+        # Em Postgres o IF EXISTS no information_schema é mais seguro:
+        await conn.execute(text("""
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='real_trades' AND column_name='bybit_order_id'
+              ) THEN
+                UPDATE real_trades
+                   SET exchange_order_id = COALESCE(exchange_order_id, bybit_order_id),
+                       exchange = COALESCE(exchange, 'bybit')
+                 WHERE bybit_order_id IS NOT NULL;
+              END IF;
+            END $$;
+        """))
     log.info("Schema do banco verificado/criado (migrações aplicadas).")
 
 
