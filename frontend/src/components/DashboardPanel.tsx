@@ -75,6 +75,7 @@ const PERIODS: { value: Period; label: string }[] = [
 export default function DashboardPanel({ onClose }: Props) {
   const [period, setPeriod] = useState<Period>(30)
   const [paper, setPaper] = useState<PaperSummary | null>(null)
+  const [real, setReal] = useState<PaperSummary | null>(null)
   const [calib, setCalib] = useState<CalibrationVersion | null>(null)
   const [calibVersions, setCalibVersions] = useState<CalibrationVersion[]>([])
   const [loading, setLoading] = useState(true)
@@ -84,14 +85,21 @@ export default function DashboardPanel({ onClose }: Props) {
     setLoading(true)
     setError(null)
     try {
-      const [sumRes, activeRes, versionsRes] = await Promise.all([
+      const [sumRes, realRes, activeRes, versionsRes] = await Promise.all([
         fetch(`${BACKEND}/api/paper/summary?days=${period}`),
+        fetch(`${BACKEND}/api/real-trades/summary?days=${period}`).catch(() => null),
         fetch(`${BACKEND}/api/calibration/active`).catch(() => null),
         fetch(`${BACKEND}/api/calibration/versions?limit=10`).catch(() => null),
       ])
       if (!sumRes.ok) throw new Error(`paper summary ${sumRes.status}`)
       const sum = await sumRes.json()
       setPaper(sum)
+      if (realRes && realRes.ok) {
+        const r = await realRes.json()
+        setReal(r)
+      } else {
+        setReal(null)
+      }
       if (activeRes && activeRes.ok) {
         const a = await activeRes.json()
         setCalib(a)
@@ -277,23 +285,39 @@ export default function DashboardPanel({ onClose }: Props) {
               <TierTable tiers={paper?.tier_stats ?? {}} />
             </div>
 
-            {/* Real (locked) */}
-            <div className="bg-slate-900/30 border border-slate-700/30 rounded-lg p-3 relative">
+            {/* Real */}
+            <div className={`bg-slate-900/50 border rounded-lg p-3 ${
+              (real?.equity?.trades_total ?? 0) > 0
+                ? 'border-cyan-700/30'
+                : 'border-slate-700/30'
+            }`}>
               <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
-                  <Lock className="w-3 h-3" />
+                <h3 className={`text-xs font-bold uppercase tracking-wider flex items-center gap-1.5 ${
+                  (real?.equity?.trades_total ?? 0) > 0 ? 'text-cyan-300' : 'text-slate-500'
+                }`}>
+                  {(real?.equity?.trades_total ?? 0) > 0 ? '💵' : <Lock className="w-3 h-3" />}
                   Real Trading
                 </h3>
-                <span className="text-[10px] text-slate-600">aguardando #11</span>
+                <span className={`text-[10px] ${
+                  (real?.equity?.trades_total ?? 0) > 0 ? 'text-cyan-400/60' : 'text-slate-600'
+                }`}>
+                  {(real?.equity?.trades_total ?? 0) > 0
+                    ? `${real?.equity?.trades_total} trades · ${(real?.equity?.final_pnl_pct ?? 0) >= 0 ? '+' : ''}${(real?.equity?.final_pnl_pct ?? 0).toFixed(2)}%`
+                    : 'sem fills registrados'}
+                </span>
               </div>
-              <div className="flex flex-col items-center justify-center py-8 text-center">
-                <Lock className="w-8 h-8 text-slate-700 mb-2" />
-                <p className="text-xs text-slate-500 max-w-[240px]">
-                  Integração Bybit em paper-API até que #11 esteja deployado.
-                  Quando ativo, esta coluna compara WR/avgR do paper-trade
-                  vs execução real (slippage incluído).
-                </p>
-              </div>
+              {(real?.equity?.trades_total ?? 0) > 0 ? (
+                <TierTable tiers={real?.tier_stats ?? {}} />
+              ) : (
+                <div className="flex flex-col items-center justify-center py-8 text-center">
+                  <Lock className="w-8 h-8 text-slate-700 mb-2" />
+                  <p className="text-xs text-slate-500 max-w-[260px]">
+                    Nenhum fill real registrado ainda. Quando você executar uma rec
+                    na corretora, faça <code className="text-cyan-400">POST /api/real-trades</code> com
+                    o entry_price real — o sistema calcula slippage vs paper.
+                  </p>
+                </div>
+              )}
             </div>
           </div>
 

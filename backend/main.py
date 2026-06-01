@@ -1440,6 +1440,144 @@ async def portfolio_exposure():
     return await portfolio_service.get_exposure()
 
 
+# ─── Real-trade endpoints (#11.2) ─────────────────────────────────────────────
+
+
+class OpenTradeRequest(BaseModel):
+    symbol: str
+    side: str  # "long" | "short"
+    qty: float
+    entry_price: float
+    recommendation_id: int | None = None
+    leverage: int | None = None
+    planned_stop: float | None = None
+    planned_tp1: float | None = None
+    planned_tp2: float | None = None
+    entry_fee: float = 0.0
+    source: str = "manual"
+    notes: str | None = None
+
+
+class CloseTradeRequest(BaseModel):
+    exit_price: float
+    status: str = "closed_manual"  # closed_tp1/tp2/be/stop/manual
+    exit_fee: float = 0.0
+    notes: str | None = None
+
+
+@app.post("/api/real-trades")
+async def real_trade_open(req: OpenTradeRequest):
+    """
+    Registra fill real (modo shadow manual): user executa na corretora e
+    informa entry_price; sistema computa slippage vs rec (#11.2).
+    """
+    from services import real_trade_service
+    result = await real_trade_service.open_trade(
+        symbol=req.symbol,
+        side=req.side,
+        qty=req.qty,
+        entry_price=req.entry_price,
+        recommendation_id=req.recommendation_id,
+        leverage=req.leverage,
+        planned_stop=req.planned_stop,
+        planned_tp1=req.planned_tp1,
+        planned_tp2=req.planned_tp2,
+        entry_fee=req.entry_fee,
+        source=req.source,
+        notes=req.notes,
+    )
+    if result is None:
+        raise HTTPException(503, "DB desabilitado")
+    return result
+
+
+@app.patch("/api/real-trades/{trade_id}/close")
+async def real_trade_close(trade_id: int, req: CloseTradeRequest):
+    """Fecha real-trade: informa exit_price e status; sistema calcula P&L e R."""
+    from services import real_trade_service
+    result = await real_trade_service.close_trade(
+        trade_id=trade_id,
+        exit_price=req.exit_price,
+        status=req.status,
+        exit_fee=req.exit_fee,
+        notes=req.notes,
+    )
+    if result is None:
+        raise HTTPException(404, "Trade não encontrado")
+    return result
+
+
+@app.get("/api/real-trades")
+async def real_trade_list(status: str | None = None, days: int = 30, limit: int = 200):
+    """Lista real-trades (default: últimos 30d, todos status)."""
+    from services import real_trade_service
+    items = await real_trade_service.list_trades(status=status, days=days, limit=limit)
+    return {"trades": items, "count": len(items), "days": days}
+
+
+@app.get("/api/real-trades/summary")
+async def real_trade_summary(days: int = 30):
+    """Equity curve + tier stats das execuções reais (#11.2) — mesmo shape do paper."""
+    from services import real_trade_service
+    return await real_trade_service.summary(days=days)
+
+
+@app.get("/api/real-trades/{trade_id}")
+async def real_trade_get(trade_id: int):
+    from services import real_trade_service
+    result = await real_trade_service.get_trade(trade_id)
+    if result is None:
+        raise HTTPException(404, "Trade não encontrado")
+    return result
+
+
+# ─── Bybit signed endpoints (#11.1) ───────────────────────────────────────────
+
+
+@app.get("/api/bybit/env")
+async def bybit_env():
+    """Diagnóstico: testnet/mainnet, key configurada, base URL. Não vaza secret."""
+    from services import bybit_signed_service
+    return bybit_signed_service.env_info()
+
+
+@app.get("/api/bybit/account")
+async def bybit_account():
+    """Saldo da carteira na Bybit (testnet por padrão)."""
+    from services import bybit_signed_service
+    res = await bybit_signed_service.get_wallet_balance()
+    if not res.get("ok"):
+        raise HTTPException(502, f"Bybit: {res.get('error') or res.get('msg')}")
+    return res
+
+
+@app.get("/api/bybit/positions")
+async def bybit_positions(symbol: str | None = None):
+    from services import bybit_signed_service
+    res = await bybit_signed_service.get_positions(symbol=symbol)
+    if not res.get("ok"):
+        raise HTTPException(502, f"Bybit: {res.get('error') or res.get('msg')}")
+    return res
+
+
+@app.get("/api/bybit/orders")
+async def bybit_orders(symbol: str | None = None, limit: int = 50):
+    from services import bybit_signed_service
+    res = await bybit_signed_service.get_order_history(symbol=symbol, limit=limit)
+    if not res.get("ok"):
+        raise HTTPException(502, f"Bybit: {res.get('error') or res.get('msg')}")
+    return res
+
+
+@app.get("/api/bybit/executions")
+async def bybit_executions(symbol: str | None = None, limit: int = 50):
+    from services import bybit_signed_service
+    res = await bybit_signed_service.get_executions(symbol=symbol, limit=limit)
+    if not res.get("ok"):
+        raise HTTPException(502, f"Bybit: {res.get('error') or res.get('msg')}")
+    return res
+
+
 @app.get("/api/risk/events")
 async def risk_events(days: int = 30, limit: int = 200):
     """
