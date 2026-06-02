@@ -48,6 +48,12 @@ SHADOW_ENABLED = os.getenv("EXCHANGE_SHADOW", "true").strip().lower() in ("1", "
 # Em condições normais, exchange_service.get_equity() lê o saldo real.
 VIRTUAL_EQUITY_USD = float(os.getenv("EXCHANGE_SHADOW_EQUITY_USD", "5000"))
 
+# Guard de notional mínimo (Binance Futures: $50). Se o sizing por risco
+# ficar abaixo do mínimo, inflamos o qty pra atingir — desde que isso não
+# leve o risco real além de MAX_RISK_PCT_HARD. Caso contrário, pula a trade.
+MIN_NOTIONAL_USD = float(os.getenv("EXCHANGE_MIN_NOTIONAL_USD", "50"))
+MAX_RISK_PCT_HARD = float(os.getenv("EXCHANGE_MAX_RISK_PCT", "2.0"))
+
 
 async def _resolve_equity_usd() -> tuple[float, str]:
     """
@@ -70,24 +76,69 @@ def env_info() -> dict:
         "shadow_enabled": SHADOW_ENABLED,
         "fallback_equity_usd": VIRTUAL_EQUITY_USD,
         "sizing_mode": "live (com fallback estático em erro)",
+        "min_notional_usd": MIN_NOTIONAL_USD,
+        "max_risk_pct_hard": MAX_RISK_PCT_HARD,
         "exchange_active": os.getenv("EXCHANGE", "binance"),
-        "note": "Sizing usa equity ao vivo da exchange (cache 60s). Env var só é usada se a API falhar.",
+        "note": "Sizing: risk_pct nominal; eleva ao notional mínimo se < $50; pula se risco real > 2%.",
     }
 
 
-def _compute_qty(entry: float, stop: float, risk_pct: float, equity_usd: float) -> Optional[float]:
+def _compute_qty(
+    entry: float, stop: float, risk_pct: float, equity_usd: float
+) -> Optional[dict]:
     """
-    Dimensiona a posição pelo método de risco fixo:
-        risk_usd = equity × risk_pct/100
-        qty = risk_usd / |entry - stop|
-    Retorna None se a distância for zero (rec inválida).
+    Dimensiona a posição com guard de notional mínimo + cap de risco máximo.
+
+    Fluxo:
+      1. qty_nominal = (equity × risk_pct/100) / |entry−stop|
+      2. notional_nominal = qty_nominal × entry
+      3. Se notional_nominal >= MIN_NOTIONAL_USD → usa nominal (status="ok")
+      4. Senão, qty_inflated = MIN_NOTIONAL_USD / entry
+         - Calcula risco real = qty_inflated × |entry−stop| / equity × 100
+         - Se risco_real <= MAX_RISK_PCT_HARD → usa inflated (status="inflated")
+         - Senão → status="skip" (rec descartada)
+
+    Retorna dict com {qty, status, notional, risk_pct_real, reason} ou None
+    se rec é inválida (risk_dist=0).
     """
     risk_dist = abs(entry - stop)
     if risk_dist <= 0:
         return None
-    risk_usd = equity_usd * (risk_pct / 100.0)
-    qty = risk_usd / risk_dist
-    return round(qty, 6)
+
+    risk_usd_target = equity_usd * (risk_pct / 100.0)
+    qty_nominal = risk_usd_target / risk_dist
+    notional_nominal = qty_nominal * entry
+
+    if notional_nominal >= MIN_NOTIONAL_USD:
+        return {
+            "qty": round(qty_nominal, 6),
+            "status": "ok",
+            "notional_usd": round(notional_nominal, 2),
+            "risk_pct_real": round(risk_pct, 3),
+            "reason": "nominal sizing",
+        }
+
+    # Inflar pro mínimo
+    qty_inflated = MIN_NOTIONAL_USD / entry
+    risk_inflated_usd = qty_inflated * risk_dist
+    risk_pct_inflated = (risk_inflated_usd / equity_usd) * 100.0
+
+    if risk_pct_inflated <= MAX_RISK_PCT_HARD:
+        return {
+            "qty": round(qty_inflated, 6),
+            "status": "inflated",
+            "notional_usd": round(qty_inflated * entry, 2),
+            "risk_pct_real": round(risk_pct_inflated, 3),
+            "reason": f"inflated to min notional ${MIN_NOTIONAL_USD:.0f}; risk {risk_pct:.2f}% → {risk_pct_inflated:.2f}%",
+        }
+
+    return {
+        "qty": round(qty_inflated, 6),
+        "status": "skip",
+        "notional_usd": round(qty_inflated * entry, 2),
+        "risk_pct_real": round(risk_pct_inflated, 3),
+        "reason": f"would inflate risk to {risk_pct_inflated:.2f}% > cap {MAX_RISK_PCT_HARD:.2f}%",
+    }
 
 
 async def open_shadow_for_recs(recs: list[dict]) -> int:
@@ -119,14 +170,22 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             stop = float(rec.get("stop_loss") or 0)
             risk_pct = float(rec.get("risk_pct") or 1.0)
             equity_usd, equity_src = await _resolve_equity_usd()
-            qty = _compute_qty(entry, stop, risk_pct, equity_usd)
-            log.debug(
-                f"[shadow] sizing {rec.get('symbol')}: equity=${equity_usd:.2f} "
-                f"({equity_src}) risk_pct={risk_pct} → qty={qty}"
-            )
-            if qty is None:
+            sizing = _compute_qty(entry, stop, risk_pct, equity_usd)
+            if sizing is None:
                 log.warning(f"[shadow] {rec.get('symbol')} risk_dist=0 — pulando")
                 continue
+            log.info(
+                f"[shadow] sizing {rec.get('symbol')}: equity=${equity_usd:.2f} "
+                f"({equity_src}) → qty={sizing['qty']} notional=${sizing['notional_usd']} "
+                f"risk_real={sizing['risk_pct_real']}% status={sizing['status']} ({sizing['reason']})"
+            )
+            if sizing["status"] == "skip":
+                log.warning(
+                    f"[shadow] {rec.get('symbol')} SKIP: {sizing['reason']} "
+                    f"(would-be notional=${sizing['notional_usd']})"
+                )
+                continue
+            qty = sizing["qty"]
 
             # Snapshot_id é setado em save_recommendations? Não — o `_just_saved`
             # flag é booleano. Precisamos do id do snapshot recém-criado pra
