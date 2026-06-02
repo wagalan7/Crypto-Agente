@@ -33,6 +33,29 @@ interface TierStat {
   pnl_usd?: number
 }
 
+interface RealTradeRow {
+  id: number
+  symbol: string
+  side: 'long' | 'short' | string
+  source: string
+  qty: number
+  leverage: number | null
+  notional_usd: number | null
+  entry_price: number
+  exit_price: number | null
+  planned_stop: number | null
+  planned_tp1: number | null
+  planned_tp2: number | null
+  opened_at: string | null
+  closed_at: string | null
+  status: string
+  pnl_usd: number | null
+  pnl_pct: number | null
+  realized_r: number | null
+  exchange: string | null
+  exchange_order_id: string | null
+}
+
 interface PaperSummary {
   enabled: boolean
   mode: string
@@ -79,6 +102,7 @@ export default function DashboardPanel({ onClose }: Props) {
   const [period, setPeriod] = useState<Period>(30)
   const [paper, setPaper] = useState<PaperSummary | null>(null)
   const [real, setReal] = useState<PaperSummary | null>(null)
+  const [realTrades, setRealTrades] = useState<RealTradeRow[]>([])
   const [calib, setCalib] = useState<CalibrationVersion | null>(null)
   const [calibVersions, setCalibVersions] = useState<CalibrationVersion[]>([])
   const [loading, setLoading] = useState(true)
@@ -88,9 +112,10 @@ export default function DashboardPanel({ onClose }: Props) {
     setLoading(true)
     setError(null)
     try {
-      const [sumRes, realRes, activeRes, versionsRes] = await Promise.all([
+      const [sumRes, realRes, tradesRes, activeRes, versionsRes] = await Promise.all([
         fetch(`${BACKEND}/api/paper/summary?days=${period}`),
         fetch(`${BACKEND}/api/real-trades/summary?days=${period}`).catch(() => null),
+        fetch(`${BACKEND}/api/real-trades?days=${period}&limit=100`).catch(() => null),
         fetch(`${BACKEND}/api/calibration/active`).catch(() => null),
         fetch(`${BACKEND}/api/calibration/versions?limit=10`).catch(() => null),
       ])
@@ -102,6 +127,12 @@ export default function DashboardPanel({ onClose }: Props) {
         setReal(r)
       } else {
         setReal(null)
+      }
+      if (tradesRes && tradesRes.ok) {
+        const t = await tradesRes.json()
+        setRealTrades(Array.isArray(t) ? t : (t?.trades ?? []))
+      } else {
+        setRealTrades([])
       }
       if (activeRes && activeRes.ok) {
         const a = await activeRes.json()
@@ -331,6 +362,11 @@ export default function DashboardPanel({ onClose }: Props) {
               )}
             </div>
           </div>
+
+          {/* Histórico de trades reais/shadow */}
+          {realTrades.length > 0 && (
+            <TradeHistory trades={realTrades} />
+          )}
 
           {/* Calibração ativa */}
           {calib && (
@@ -570,6 +606,153 @@ function TierTable({ tiers, showUsd = false }: { tiers: Record<string, TierStat>
           })}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+// ─── Trade history / journal ──────────────────────────────────────────────────
+
+const INITIAL_BALANCE_USD = 5000 // Binance Demo starts at $5000
+
+function statusToTarget(status: string): { label: string; cls: string } {
+  switch (status) {
+    case 'closed_tp2': return { label: 'TP2', cls: 'text-green-300 bg-green-500/15 border-green-500/30' }
+    case 'closed_tp1': return { label: 'TP1', cls: 'text-emerald-300 bg-emerald-500/15 border-emerald-500/30' }
+    case 'closed_be':  return { label: 'BE',  cls: 'text-amber-300 bg-amber-500/15 border-amber-500/30' }
+    case 'closed_stop':return { label: 'SL',  cls: 'text-red-300 bg-red-500/15 border-red-500/30' }
+    case 'closed_manual':return { label: 'Manual', cls: 'text-slate-300 bg-slate-500/15 border-slate-500/30' }
+    case 'open':       return { label: 'Aberto', cls: 'text-cyan-300 bg-cyan-500/15 border-cyan-500/30' }
+    default:           return { label: status, cls: 'text-slate-300 bg-slate-500/15 border-slate-500/30' }
+  }
+}
+
+function fmtDate(iso: string | null): string {
+  if (!iso) return '—'
+  try {
+    const d = new Date(iso)
+    return d.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+  } catch { return iso.slice(0, 16) }
+}
+
+function fmtNum(v: number | null | undefined, digits = 4): string {
+  if (v == null || Number.isNaN(v)) return '—'
+  const abs = Math.abs(v)
+  if (abs >= 1000) return v.toFixed(2)
+  if (abs >= 1) return v.toFixed(digits)
+  return v.toFixed(Math.max(digits, 6))
+}
+
+function TradeHistory({ trades }: { trades: RealTradeRow[] }) {
+  // Filtrar só auto/shadow (ignorar manual)
+  const filtered = trades.filter(t => t.source === 'auto' || t.source === 'shadow')
+
+  // Computar saldo cumulativo: ordenar por opened_at ASC, somar pnl_usd dos fechados
+  const sortedAsc = [...filtered].sort((a, b) => {
+    const ta = a.opened_at ? new Date(a.opened_at).getTime() : 0
+    const tb = b.opened_at ? new Date(b.opened_at).getTime() : 0
+    return ta - tb
+  })
+  const balanceMap = new Map<number, { before: number; after: number }>()
+  let running = INITIAL_BALANCE_USD
+  for (const t of sortedAsc) {
+    const before = running
+    const pnl = t.pnl_usd ?? 0
+    const after = t.status === 'open' ? running : running + pnl
+    balanceMap.set(t.id, { before, after })
+    if (t.status !== 'open') running = after
+  }
+
+  // Exibir DESC (mais recente primeiro)
+  const rows = [...filtered].sort((a, b) => {
+    const ta = a.opened_at ? new Date(a.opened_at).getTime() : 0
+    const tb = b.opened_at ? new Date(b.opened_at).getTime() : 0
+    return tb - ta
+  })
+
+  return (
+    <div className="bg-slate-900/50 border border-slate-700/40 rounded-lg p-3">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
+          📋 Histórico de operações (real / shadow)
+        </h3>
+        <span className="text-[10px] text-slate-500">
+          {rows.length} trade{rows.length === 1 ? '' : 's'} · saldo inicial ${INITIAL_BALANCE_USD.toLocaleString('pt-BR')}
+        </span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-[11px]">
+          <thead>
+            <tr className="text-[9px] text-slate-500 uppercase tracking-wider border-b border-slate-800">
+              <th className="text-left py-1.5 px-1 font-semibold">Data</th>
+              <th className="text-left py-1.5 px-1 font-semibold">Moeda</th>
+              <th className="text-left py-1.5 px-1 font-semibold">Side</th>
+              <th className="text-right py-1.5 px-1 font-semibold">Qty</th>
+              <th className="text-right py-1.5 px-1 font-semibold" title="Alavancagem">Lev</th>
+              <th className="text-right py-1.5 px-1 font-semibold">Entrada</th>
+              <th className="text-right py-1.5 px-1 font-semibold" title="Tamanho da posição em USD">Notional</th>
+              <th className="text-right py-1.5 px-1 font-semibold" title="Margem usada = notional / leverage">Margem</th>
+              <th className="text-right py-1.5 px-1 font-semibold">Stop</th>
+              <th className="text-right py-1.5 px-1 font-semibold">TP1</th>
+              <th className="text-right py-1.5 px-1 font-semibold">TP2</th>
+              <th className="text-right py-1.5 px-1 font-semibold">Saída</th>
+              <th className="text-center py-1.5 px-1 font-semibold">Alvo</th>
+              <th className="text-right py-1.5 px-1 font-semibold">P&L USD</th>
+              <th className="text-right py-1.5 px-1 font-semibold" title="Saldo antes da operação">Saldo ant.</th>
+              <th className="text-right py-1.5 px-1 font-semibold" title="Saldo após a operação">Saldo atual</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(t => {
+              const target = statusToTarget(t.status)
+              const lev = t.leverage ?? 1
+              const notional = t.notional_usd ?? (t.entry_price * t.qty)
+              const margem = lev > 0 ? notional / lev : notional
+              const bal = balanceMap.get(t.id) ?? { before: 0, after: 0 }
+              const sideCls = t.side === 'long'
+                ? 'text-green-300 bg-green-500/10 border-green-500/30'
+                : 'text-red-300 bg-red-500/10 border-red-500/30'
+              const pnl = t.pnl_usd
+              return (
+                <tr key={t.id} className="border-b border-slate-800/40 hover:bg-slate-800/30">
+                  <td className="py-1.5 px-1 text-slate-400 font-mono whitespace-nowrap">{fmtDate(t.opened_at)}</td>
+                  <td className="py-1.5 px-1 text-slate-200 font-semibold">{t.symbol}</td>
+                  <td className="py-1.5 px-1">
+                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border uppercase ${sideCls}`}>
+                      {t.side}
+                    </span>
+                  </td>
+                  <td className="text-right py-1.5 px-1 font-mono text-slate-300">{fmtNum(t.qty, 4)}</td>
+                  <td className="text-right py-1.5 px-1 font-mono text-slate-400">{lev}x</td>
+                  <td className="text-right py-1.5 px-1 font-mono text-slate-200">{fmtNum(t.entry_price, 4)}</td>
+                  <td className="text-right py-1.5 px-1 font-mono text-slate-300">${notional.toFixed(2)}</td>
+                  <td className="text-right py-1.5 px-1 font-mono text-cyan-400">${margem.toFixed(2)}</td>
+                  <td className="text-right py-1.5 px-1 font-mono text-red-300/80">{fmtNum(t.planned_stop, 4)}</td>
+                  <td className="text-right py-1.5 px-1 font-mono text-emerald-300/80">{fmtNum(t.planned_tp1, 4)}</td>
+                  <td className="text-right py-1.5 px-1 font-mono text-green-300/80">{fmtNum(t.planned_tp2, 4)}</td>
+                  <td className="text-right py-1.5 px-1 font-mono text-slate-200">{fmtNum(t.exit_price, 4)}</td>
+                  <td className="text-center py-1.5 px-1">
+                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border ${target.cls}`}>
+                      {target.label}
+                    </span>
+                  </td>
+                  <td className="text-right py-1.5 px-1 font-mono">
+                    {pnl != null ? (
+                      <span className={pnl >= 0 ? 'text-green-400 font-bold' : 'text-red-400 font-bold'}>
+                        {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}
+                      </span>
+                    ) : <span className="text-slate-600">—</span>}
+                  </td>
+                  <td className="text-right py-1.5 px-1 font-mono text-slate-400">${bal.before.toFixed(2)}</td>
+                  <td className="text-right py-1.5 px-1 font-mono text-slate-200 font-semibold">${bal.after.toFixed(2)}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="mt-2 text-[9px] text-slate-600">
+        Saldo inicial assumido = ${INITIAL_BALANCE_USD.toLocaleString('pt-BR')} (Binance Demo). Saldo acumulado considera apenas trades fechados; trades abertos mostram saldo anterior idêntico ao posterior.
+      </div>
     </div>
   )
 }
