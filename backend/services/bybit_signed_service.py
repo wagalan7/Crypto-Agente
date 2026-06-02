@@ -362,11 +362,21 @@ async def diagnostic_endpoints() -> dict:
     """
     if not is_configured():
         return {"ok": False, "error": "BYBIT_API_KEY/SECRET não configurados"}
+    # Detecta chars não-ASCII (hidden unicode, zero-width, etc) que `.strip()` não pega
+    key_has_nonascii = any(ord(c) > 127 or ord(c) < 32 for c in _API_KEY)
+    secret_has_nonascii = any(ord(c) > 127 or ord(c) < 32 for c in _API_SECRET)
+    # SHA1 do secret (não vaza o secret, mas permite comparar bit-a-bit com o que está no Bybit)
+    key_sha1 = hashlib.sha1(_API_KEY.encode("utf-8")).hexdigest()[:12]
+    secret_sha1 = hashlib.sha1(_API_SECRET.encode("utf-8")).hexdigest()[:12]
     out = {
         "key_prefix": _API_KEY[:4] + "...",
         "key_len": len(_API_KEY),
         "secret_len": len(_API_SECRET),
-        "_hint": "Bybit espera key=18 chars, secret=36 chars. Se invertido, key e secret estão trocados nas env vars.",
+        "key_has_nonascii": key_has_nonascii,
+        "secret_has_nonascii": secret_has_nonascii,
+        "key_sha1_12": key_sha1,
+        "secret_sha1_12": secret_sha1,
+        "_hint": "Rode local: echo -n 'SEU_SECRET' | shasum | cut -c1-12. Tem que bater com secret_sha1_12.",
         "tests": [],
     }
     for base, label in [
