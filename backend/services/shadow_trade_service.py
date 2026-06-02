@@ -294,6 +294,19 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     f"[{source}] OPEN {rec['symbol']} {side} qty={qty} entry={entry_actual} "
                     f"SL={stop} TP1={tp1} TP2={tp2} (snap={snap_id})"
                 )
+                # Push só pra execução real (auto). Shadow fica silencioso pra
+                # não floodar enquanto o sistema simula em paralelo.
+                if source == "auto":
+                    try:
+                        from services import push_service
+                        await push_service.notify_trade_open({
+                            **trade,
+                            "planned_stop": stop,
+                            "planned_tp1": float(tp1) if tp1 is not None else None,
+                            "planned_tp2": tp2,
+                        })
+                    except Exception as e:
+                        log.warning(f"[shadow] push trade-open falhou: {e}")
         except Exception as e:
             log.warning(f"[shadow] falha abrindo trade pra {rec.get('symbol')}: {e}")
 

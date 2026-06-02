@@ -1688,6 +1688,41 @@ async def admin_force_test_trade(
     return result
 
 
+@app.post("/api/admin/test-push")
+async def admin_test_push(kind: str = "trade_open"):
+    """
+    Dispara um push de teste pra TODOS subscribers ativos.
+    kind: "trade_open" (default) | "outcome_tp2" | "outcome_lost" | "rec_new"
+    Útil pra confirmar que push está funcionando independente do app aberto.
+    """
+    from services import push_service
+    if kind == "trade_open":
+        fake_trade = {
+            "id": 0, "symbol": "BTCUSDT", "side": "long",
+            "qty": 0.0009, "entry_price": 67000.0, "leverage": 5,
+            "planned_stop": 66000.0, "planned_tp1": 68000.0, "planned_tp2": 69000.0,
+            "source": "auto", "exchange": "binance",
+        }
+        sent = await push_service.notify_trade_open(fake_trade)
+        return {"kind": kind, "sent": sent}
+    if kind in ("outcome_tp2", "outcome_lost"):
+        class _FakeSnap:
+            symbol = "BTCUSDT"; tier = "A+"; direction = "long"
+            timeframe = "1h"; realized_r = 2.1 if kind == "outcome_tp2" else -1.0
+        event = "tp2" if kind == "outcome_tp2" else "lost"
+        sent = await push_service.notify_outcome(_FakeSnap(), event)
+        return {"kind": kind, "sent": sent}
+    if kind == "rec_new":
+        fake_rec = {
+            "symbol": "BTCUSDT", "tier": "A+", "direction": "long",
+            "timeframe": "1h", "leverage": 5, "score": 85.0,
+            "risk_reward": 2.5, "entry": 67000.0,
+        }
+        sent = await push_service.notify_new_recommendation(fake_rec)
+        return {"kind": kind, "sent": sent}
+    return {"error": f"kind desconhecido: {kind}"}
+
+
 @app.get("/api/exchange/equity")
 async def exchange_equity(force: bool = False):
     """

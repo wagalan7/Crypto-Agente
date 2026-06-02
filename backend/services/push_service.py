@@ -362,6 +362,103 @@ async def notify_outcome(snap, event: str) -> int:
     return sent
 
 
+async def notify_trade_open(trade: Dict[str, Any]) -> int:
+    """
+    Push quando o bot abre uma trade REAL na exchange (source="auto").
+    Dispara independente do tier do subscriber — execução real é evento
+    crítico que merece notificação pra todos os subscribers ativos.
+
+    `trade` precisa de: symbol, side, qty, entry_price, leverage,
+                       planned_stop, planned_tp1, planned_tp2,
+                       source, exchange, exchange_order_id.
+    """
+    if not PUSH_ENABLED:
+        return 0
+
+    source = (trade.get("source") or "").lower()
+    if source not in ("auto", "shadow"):
+        return 0  # ignora trades manuais
+
+    async with get_session() as session:
+        stmt = select(PushSubscription).where(PushSubscription.active.is_(True))
+        subs = (await session.execute(stmt)).scalars().all()
+
+    if not subs:
+        return 0
+
+    symbol_short = (trade.get("symbol") or "").split("/")[0].replace(":USDT", "")
+    side = (trade.get("side") or "").upper()
+    qty = trade.get("qty") or 0
+    entry = trade.get("entry_price") or 0
+    lev = trade.get("leverage") or 1
+    sl = trade.get("planned_stop")
+    tp1 = trade.get("planned_tp1")
+    tp2 = trade.get("planned_tp2")
+    exch = trade.get("exchange") or "?"
+    notional = qty * entry if (qty and entry) else 0
+
+    if source == "auto":
+        emoji = "💵"
+        prefix = "EXECUTADO"
+    else:
+        emoji = "👻"
+        prefix = "SHADOW"
+
+    title = f"{emoji} {prefix} · {symbol_short} {side} {lev}x"
+    body_parts = [
+        f"qty={_fmt(qty)} @ {_fmt(entry)} · notional ${notional:.0f}",
+    ]
+    if sl is not None:
+        body_parts.append(f"SL {_fmt(sl)}")
+    if tp1 is not None:
+        body_parts.append(f"TP1 {_fmt(tp1)}")
+    if tp2 is not None:
+        body_parts.append(f"TP2 {_fmt(tp2)}")
+    body = " · ".join(body_parts) + f"\n{exch}"
+
+    payload = {
+        "title": title,
+        "body": body,
+        "tag": f"trade-open-{trade.get('id') or symbol_short}",
+        "data": {
+            "symbol": trade.get("symbol"),
+            "side": side,
+            "source": source,
+            "trade_id": trade.get("id"),
+            "url": f"/?focus={symbol_short}",
+        },
+    }
+
+    sent = 0
+    to_deactivate: List[int] = []
+    for sub in subs:
+        try:
+            ok = await _send_one(sub, payload)
+            if ok:
+                sent += 1
+            else:
+                to_deactivate.append(sub.id)
+        except Exception:
+            async with get_session() as s2:
+                await s2.execute(
+                    update(PushSubscription).where(PushSubscription.id == sub.id)
+                    .values(fail_count=sub.fail_count + 1)
+                )
+                await s2.commit()
+
+    if to_deactivate:
+        async with get_session() as session:
+            await session.execute(
+                update(PushSubscription).where(PushSubscription.id.in_(to_deactivate))
+                .values(active=False)
+            )
+            await session.commit()
+
+    if sent:
+        log.info(f"Push trade-open ({source}) enviado pra {sent} device(s) — {symbol_short} {side}")
+    return sent
+
+
 def _fmt(n: float) -> str:
     if n >= 1000:
         return f"{n:,.2f}"
