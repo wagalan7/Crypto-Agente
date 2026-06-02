@@ -103,6 +103,7 @@ export default function DashboardPanel({ onClose }: Props) {
   const [paper, setPaper] = useState<PaperSummary | null>(null)
   const [real, setReal] = useState<PaperSummary | null>(null)
   const [realTrades, setRealTrades] = useState<RealTradeRow[]>([])
+  const [liveEquity, setLiveEquity] = useState<{ total: number; available: number; source: string; exchange: string } | null>(null)
   const [calib, setCalib] = useState<CalibrationVersion | null>(null)
   const [calibVersions, setCalibVersions] = useState<CalibrationVersion[]>([])
   const [loading, setLoading] = useState(true)
@@ -112,10 +113,11 @@ export default function DashboardPanel({ onClose }: Props) {
     setLoading(true)
     setError(null)
     try {
-      const [sumRes, realRes, tradesRes, activeRes, versionsRes] = await Promise.all([
+      const [sumRes, realRes, tradesRes, equityRes, activeRes, versionsRes] = await Promise.all([
         fetch(`${BACKEND}/api/paper/summary?days=${period}`),
         fetch(`${BACKEND}/api/real-trades/summary?days=${period}`).catch(() => null),
         fetch(`${BACKEND}/api/real-trades?days=${period}&limit=100`).catch(() => null),
+        fetch(`${BACKEND}/api/exchange/equity`).catch(() => null),
         fetch(`${BACKEND}/api/calibration/active`).catch(() => null),
         fetch(`${BACKEND}/api/calibration/versions?limit=10`).catch(() => null),
       ])
@@ -133,6 +135,17 @@ export default function DashboardPanel({ onClose }: Props) {
         setRealTrades(Array.isArray(t) ? t : (t?.trades ?? []))
       } else {
         setRealTrades([])
+      }
+      if (equityRes && equityRes.ok) {
+        const e = await equityRes.json()
+        if (e?.ok) {
+          setLiveEquity({
+            total: Number(e.total_usd ?? 0),
+            available: Number(e.available_usd ?? 0),
+            source: String(e.source ?? 'unknown'),
+            exchange: String(e.exchange ?? ''),
+          })
+        }
       }
       if (activeRes && activeRes.ok) {
         const a = await activeRes.json()
@@ -365,7 +378,7 @@ export default function DashboardPanel({ onClose }: Props) {
 
           {/* Histórico de trades reais/shadow */}
           {realTrades.length > 0 && (
-            <TradeHistory trades={realTrades} />
+            <TradeHistory trades={realTrades} liveEquity={liveEquity} />
           )}
 
           {/* Calibração ativa */}
@@ -612,7 +625,7 @@ function TierTable({ tiers, showUsd = false }: { tiers: Record<string, TierStat>
 
 // ─── Trade history / journal ──────────────────────────────────────────────────
 
-const INITIAL_BALANCE_USD = 5000 // Binance Demo starts at $5000
+const FALLBACK_INITIAL_BALANCE_USD = 5000 // só se a API de equity estiver fora
 
 function statusToTarget(status: string): { label: string; cls: string } {
   switch (status) {
@@ -642,18 +655,31 @@ function fmtNum(v: number | null | undefined, digits = 4): string {
   return v.toFixed(Math.max(digits, 6))
 }
 
-function TradeHistory({ trades }: { trades: RealTradeRow[] }) {
+function TradeHistory({ trades, liveEquity }: {
+  trades: RealTradeRow[]
+  liveEquity: { total: number; available: number; source: string; exchange: string } | null
+}) {
   // Filtrar só auto/shadow (ignorar manual)
   const filtered = trades.filter(t => t.source === 'auto' || t.source === 'shadow')
 
-  // Computar saldo cumulativo: ordenar por opened_at ASC, somar pnl_usd dos fechados
+  // Computar saldo cumulativo. Se temos saldo ao vivo, derivamos o saldo inicial:
+  //   saldo_inicial = saldo_atual_live − Σ pnl_usd(fechados)
+  // Assim o "Saldo atual" da última linha bate com a banca real da exchange.
+  // Sem live equity (fallback), partimos de $5000.
   const sortedAsc = [...filtered].sort((a, b) => {
     const ta = a.opened_at ? new Date(a.opened_at).getTime() : 0
     const tb = b.opened_at ? new Date(b.opened_at).getTime() : 0
     return ta - tb
   })
+  const totalClosedPnl = sortedAsc
+    .filter(t => t.status !== 'open')
+    .reduce((acc, t) => acc + (t.pnl_usd ?? 0), 0)
+  const initialBalance = liveEquity
+    ? liveEquity.total - totalClosedPnl
+    : FALLBACK_INITIAL_BALANCE_USD
+
   const balanceMap = new Map<number, { before: number; after: number }>()
-  let running = INITIAL_BALANCE_USD
+  let running = initialBalance
   for (const t of sortedAsc) {
     const before = running
     const pnl = t.pnl_usd ?? 0
@@ -671,12 +697,19 @@ function TradeHistory({ trades }: { trades: RealTradeRow[] }) {
 
   return (
     <div className="bg-slate-900/50 border border-slate-700/40 rounded-lg p-3">
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
         <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
           📋 Histórico de operações (real / shadow)
         </h3>
         <span className="text-[10px] text-slate-500">
-          {rows.length} trade{rows.length === 1 ? '' : 's'} · saldo inicial ${INITIAL_BALANCE_USD.toLocaleString('pt-BR')}
+          {rows.length} trade{rows.length === 1 ? '' : 's'} · {liveEquity ? (
+            <>
+              saldo atual <span className="text-cyan-300 font-semibold">${liveEquity.total.toFixed(2)}</span>
+              {' '}({liveEquity.exchange} live) · disp. ${liveEquity.available.toFixed(2)}
+            </>
+          ) : (
+            <>saldo inicial ${FALLBACK_INITIAL_BALANCE_USD.toLocaleString('pt-BR')} <span className="text-amber-400">(fallback — equity API offline)</span></>
+          )}
         </span>
       </div>
       <div className="overflow-x-auto">
@@ -751,7 +784,9 @@ function TradeHistory({ trades }: { trades: RealTradeRow[] }) {
         </table>
       </div>
       <div className="mt-2 text-[9px] text-slate-600">
-        Saldo inicial assumido = ${INITIAL_BALANCE_USD.toLocaleString('pt-BR')} (Binance Demo). Saldo acumulado considera apenas trades fechados; trades abertos mostram saldo anterior idêntico ao posterior.
+        {liveEquity
+          ? `Saldo lido ao vivo da ${liveEquity.exchange} (cache 60s). Saldo inicial derivado: $${initialBalance.toFixed(2)}. Trades abertos mostram saldo anterior idêntico ao posterior.`
+          : `Equity API offline — usando fallback $${FALLBACK_INITIAL_BALANCE_USD.toLocaleString('pt-BR')}. Quando voltar, o saldo será derivado da banca real.`}
       </div>
     </div>
   )

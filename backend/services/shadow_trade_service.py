@@ -44,16 +44,34 @@ from services import real_trade_service
 log = logging.getLogger(__name__)
 
 SHADOW_ENABLED = os.getenv("EXCHANGE_SHADOW", "true").strip().lower() in ("1", "true", "yes")
-VIRTUAL_EQUITY_USD = float(os.getenv("EXCHANGE_SHADOW_EQUITY_USD", "10000"))
+# Fallback estático — usado APENAS se a exchange estiver fora do ar.
+# Em condições normais, exchange_service.get_equity() lê o saldo real.
+VIRTUAL_EQUITY_USD = float(os.getenv("EXCHANGE_SHADOW_EQUITY_USD", "5000"))
+
+
+async def _resolve_equity_usd() -> tuple[float, str]:
+    """
+    Tenta ler equity ao vivo da exchange. Em caso de falha, usa fallback estático.
+    Retorna (equity_usd, source) onde source ∈ {"live","cache","fallback"}.
+    """
+    try:
+        from services import exchange_service
+        eq = await exchange_service.get_equity()
+        if eq.get("ok") and eq.get("total_usd", 0) > 0:
+            return float(eq["total_usd"]), eq.get("source", "live")
+    except Exception as e:
+        log.warning(f"[shadow] get_equity falhou: {e}")
+    return VIRTUAL_EQUITY_USD, "fallback"
 
 
 def env_info() -> dict:
     """Diagnóstico — quanto o shadow está ativo + equity virtual usado pra sizing."""
     return {
         "shadow_enabled": SHADOW_ENABLED,
-        "virtual_equity_usd": VIRTUAL_EQUITY_USD,
+        "fallback_equity_usd": VIRTUAL_EQUITY_USD,
+        "sizing_mode": "live (com fallback estático em erro)",
         "exchange_active": os.getenv("EXCHANGE", "binance"),
-        "note": "shadow=true → registra trades sem chamar exchange. false → executa real.",
+        "note": "Sizing usa equity ao vivo da exchange (cache 60s). Env var só é usada se a API falhar.",
     }
 
 
@@ -100,7 +118,12 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             entry = float(rec.get("entry") or 0)
             stop = float(rec.get("stop_loss") or 0)
             risk_pct = float(rec.get("risk_pct") or 1.0)
-            qty = _compute_qty(entry, stop, risk_pct, VIRTUAL_EQUITY_USD)
+            equity_usd, equity_src = await _resolve_equity_usd()
+            qty = _compute_qty(entry, stop, risk_pct, equity_usd)
+            log.debug(
+                f"[shadow] sizing {rec.get('symbol')}: equity=${equity_usd:.2f} "
+                f"({equity_src}) risk_pct={risk_pct} → qty={qty}"
+            )
             if qty is None:
                 log.warning(f"[shadow] {rec.get('symbol')} risk_dist=0 — pulando")
                 continue

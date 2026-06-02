@@ -1617,6 +1617,17 @@ async def shadow_env():
     return shadow_trade_service.env_info()
 
 
+@app.get("/api/exchange/equity")
+async def exchange_equity(force: bool = False):
+    """
+    Saldo real da exchange ativa (Binance/Bybit) com cache de 60s.
+    Usado pelo sizing de shadow/auto e exibido no dashboard.
+    `force=true` ignora cache.
+    """
+    from services import exchange_service
+    return await exchange_service.get_equity(force=force)
+
+
 @app.get("/api/exchange/diagnostic")
 async def exchange_diagnostic():
     """Debug verboso de auth da Bybit: query-api, wallet UNIFIED + CONTRACT.
