@@ -317,3 +317,63 @@ async def close_client():
     if _http_client and not _http_client.is_closed:
         await _http_client.aclose()
         _http_client = None
+
+
+# ─── Diagnostic (debug auth issues) ────────────────────────────────────────────
+
+
+async def diagnostic() -> dict:
+    """
+    Diagnóstico verboso pra debug de auth Binance — não vaza secret.
+    Inclui lengths e SHA1 de key/secret pra comparar bit-a-bit com painel.
+    Bybit keys são 18/36 chars; Binance Futures testnet keys são 64/64 chars.
+    """
+    if not is_configured():
+        return {"ok": False, "error": "BINANCE_API_KEY/SECRET não configurados"}
+    key_has_nonascii = any(ord(c) > 127 or ord(c) < 32 for c in _API_KEY)
+    secret_has_nonascii = any(ord(c) > 127 or ord(c) < 32 for c in _API_SECRET)
+    key_sha1 = hashlib.sha1(_API_KEY.encode("utf-8")).hexdigest()[:12]
+    secret_sha1 = hashlib.sha1(_API_SECRET.encode("utf-8")).hexdigest()[:12]
+    out = {
+        "exchange": "binance",
+        "base_url": BASE,
+        "testnet": _TESTNET,
+        "key_prefix": _API_KEY[:4] + "...",
+        "key_len": len(_API_KEY),
+        "secret_len": len(_API_SECRET),
+        "key_has_nonascii": key_has_nonascii,
+        "secret_has_nonascii": secret_has_nonascii,
+        "key_sha1_12": key_sha1,
+        "secret_sha1_12": secret_sha1,
+        "_hint": "Binance Futures testnet keys = 64 chars cada. Compare local: echo -n 'X' | shasum | cut -c1-12",
+        "tests": [],
+    }
+    # Test 1: public ping (network)
+    try:
+        r = await _get_client().get(f"{BASE}/fapi/v1/ping")
+        out["tests"].append({"name": "public_ping", "status": r.status_code, "body": r.text[:200]})
+    except Exception as e:
+        out["tests"].append({"name": "public_ping", "error": str(e)})
+    # Test 2: server time (clock drift)
+    try:
+        r = await _get_client().get(f"{BASE}/fapi/v1/time")
+        try:
+            data = r.json()
+            server_ms = int(data.get("serverTime") or 0)
+            local_ms = int(time.time() * 1000)
+            drift = local_ms - server_ms
+            out["tests"].append({"name": "server_time", "status": r.status_code,
+                                 "server_ms": server_ms, "local_ms": local_ms, "drift_ms": drift})
+        except Exception:
+            out["tests"].append({"name": "server_time", "status": r.status_code, "body": r.text[:200]})
+    except Exception as e:
+        out["tests"].append({"name": "server_time", "error": str(e)})
+    # Test 3: signed — account (auth)
+    res = await _signed_request("GET", "/fapi/v2/account")
+    out["tests"].append({"name": "signed_account", "ok": res.get("ok"),
+                         "code": res.get("code"), "msg": res.get("msg")})
+    # Test 4: signed — balance (alt endpoint, sometimes auth differs)
+    res2 = await _signed_request("GET", "/fapi/v2/balance")
+    out["tests"].append({"name": "signed_balance", "ok": res2.get("ok"),
+                         "code": res2.get("code"), "msg": res2.get("msg")})
+    return out

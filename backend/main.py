@@ -1639,6 +1639,17 @@ async def exchange_diagnostic_endpoints():
     return {"error": "diagnostic_endpoints não suportado pelo cliente ativo"}
 
 
+@app.get("/api/exchange/diagnostic-binance")
+async def exchange_diagnostic_binance():
+    """Diagnóstico verboso do Binance Futures (testnet ou mainnet).
+    Mostra length/SHA1 de key+secret (sem vazar), clock drift e tenta
+    chamadas signed pra revelar erro exato de auth."""
+    from services import binance_signed_service
+    if hasattr(binance_signed_service, "diagnostic"):
+        return await binance_signed_service.diagnostic()
+    return {"error": "diagnostic não suportado pelo cliente Binance"}
+
+
 @app.get("/api/exchange/account")
 async def exchange_account():
     from services import exchange_service
