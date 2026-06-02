@@ -22,7 +22,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from collections import defaultdict
 
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 
 from db import DB_ENABLED, get_session
 from models.real_trade import RealTrade
@@ -214,11 +214,18 @@ async def summary(days: int = 30) -> dict:
         rows = (await session.execute(stmt)).all()
 
     if not rows:
+        async with get_session() as session:
+            open_count = int((await session.execute(
+                select(func.count(RealTrade.id)).where(RealTrade.status == "open")
+            )).scalar() or 0)
         return {
             "enabled": True,
             "mode": "real",
             "days": days,
-            "equity": {"curve": [], "trades_total": 0, "final_pnl_pct": 0.0},
+            "equity": {
+                "curve": [], "trades_total": 0, "final_pnl_pct": 0.0,
+                "final_pnl_usd": 0.0, "open_positions": open_count,
+            },
             "tier_stats": {},
         }
 
@@ -226,6 +233,8 @@ async def summary(days: int = 30) -> dict:
     daily_pnl: dict[str, float] = defaultdict(float)
     daily_count: dict[str, int] = defaultdict(int)
     by_tier: dict[str, list] = defaultdict(list)
+    total_pnl_usd = 0.0
+    by_tier_pnl_usd: dict[str, float] = defaultdict(float)
     for trade, tier in rows:
         if trade.closed_at is None or trade.pnl_pct is None:
             continue
@@ -244,12 +253,18 @@ async def summary(days: int = 30) -> dict:
         daily_pnl[day] += contrib
         daily_count[day] += 1
 
+        # Soma USD reais (do campo pnl_usd, não da contribuição percentual)
+        pnl_usd_val = float(trade.pnl_usd or 0)
+        total_pnl_usd += pnl_usd_val
+
         tier_key = tier or "?"
         by_tier[tier_key].append({
             "realized_r": float(trade.realized_r) if trade.realized_r is not None else 0.0,
             "risk_pct": 1.0,
             "status": trade.status,
+            "pnl_usd": pnl_usd_val,
         })
+        by_tier_pnl_usd[tier_key] += pnl_usd_val
 
     sorted_days = sorted(daily_pnl.keys())
     curve = []
@@ -296,9 +311,20 @@ async def summary(days: int = 30) -> dict:
             "expectancy_r": round(avg_r, 3),
             "max_consec_losses": max_consec,
             "pnl_pct": round(pnl, 3),
+            "pnl_usd": round(by_tier_pnl_usd.get(tier_key, 0.0), 2),
         }
 
     total = sum(t["n"] for t in tier_summary.values())
+
+    # Open positions snapshot (não entram nos closed stats mas aparecem na UI)
+    open_count = 0
+    async with get_session() as session:
+        stmt = (
+            select(func.count(RealTrade.id))
+            .where(RealTrade.status == "open")
+        )
+        open_count = int((await session.execute(stmt)).scalar() or 0)
+
     return {
         "enabled": True,
         "mode": "real",
@@ -310,6 +336,8 @@ async def summary(days: int = 30) -> dict:
             "curve": curve,
             "trades_total": total,
             "final_pnl_pct": round(acc, 3),
+            "final_pnl_usd": round(total_pnl_usd, 2),
+            "open_positions": open_count,
         },
         "tier_stats": tier_summary,
     }

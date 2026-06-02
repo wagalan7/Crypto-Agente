@@ -17,6 +17,8 @@ interface EquityCurve {
   curve: EquityPoint[]
   trades_total: number
   final_pnl_pct: number
+  final_pnl_usd?: number
+  open_positions?: number
 }
 
 interface TierStat {
@@ -28,6 +30,7 @@ interface TierStat {
   expectancy_r: number | null
   max_consec_losses: number
   pnl_pct: number
+  pnl_usd?: number
 }
 
 interface PaperSummary {
@@ -302,12 +305,19 @@ export default function DashboardPanel({ onClose }: Props) {
                   (real?.equity?.trades_total ?? 0) > 0 ? 'text-cyan-400/60' : 'text-slate-600'
                 }`}>
                   {(real?.equity?.trades_total ?? 0) > 0
-                    ? `${real?.equity?.trades_total} trades · ${(real?.equity?.final_pnl_pct ?? 0) >= 0 ? '+' : ''}${(real?.equity?.final_pnl_pct ?? 0).toFixed(2)}%`
+                    ? (() => {
+                        const n = real?.equity?.trades_total ?? 0
+                        const pct = real?.equity?.final_pnl_pct ?? 0
+                        const usd = real?.equity?.final_pnl_usd ?? 0
+                        const open = real?.equity?.open_positions ?? 0
+                        const sign = (v: number) => (v >= 0 ? '+' : '')
+                        return `${n} fechados${open ? ` · ${open} abertos` : ''} · ${sign(pct)}${pct.toFixed(2)}% · ${sign(usd)}$${usd.toFixed(2)}`
+                      })()
                     : 'aguardando 1ª execução'}
                 </span>
               </div>
               {(real?.equity?.trades_total ?? 0) > 0 ? (
-                <TierTable tiers={real?.tier_stats ?? {}} />
+                <TierTable tiers={real?.tier_stats ?? {}} showUsd />
               ) : (
                 <div className="flex flex-col items-center justify-center py-8 text-center">
                   <Lock className="w-8 h-8 text-slate-700 mb-2" />
@@ -483,7 +493,7 @@ function EquityChart({ points }: { points: EquityPoint[] }) {
 
 // ─── Tier breakdown table ─────────────────────────────────────────────────────
 
-function TierTable({ tiers }: { tiers: Record<string, TierStat> }) {
+function TierTable({ tiers, showUsd = false }: { tiers: Record<string, TierStat>; showUsd?: boolean }) {
   const order: string[] = ['A+', 'A', 'B']
   const tierColor: Record<string, string> = {
     'A+': 'text-yellow-300 bg-yellow-500/10 border-yellow-500/30',
@@ -502,6 +512,7 @@ function TierTable({ tiers }: { tiers: Record<string, TierStat> }) {
             <th className="text-right py-1 font-semibold">Exp.</th>
             <th className="text-right py-1 font-semibold" title="Max consec. losses">str</th>
             <th className="text-right py-1 font-semibold">P&L</th>
+            {showUsd && <th className="text-right py-1 font-semibold">USD</th>}
           </tr>
         </thead>
         <tbody>
@@ -545,6 +556,15 @@ function TierTable({ tiers }: { tiers: Record<string, TierStat> }) {
                     </span>
                   ) : <span className="text-slate-600">—</span>}
                 </td>
+                {showUsd && (
+                  <td className="text-right py-1.5 font-mono">
+                    {s?.pnl_usd != null ? (
+                      <span className={s.pnl_usd >= 0 ? 'text-cyan-400' : 'text-red-400'}>
+                        {s.pnl_usd >= 0 ? '+' : ''}${s.pnl_usd.toFixed(2)}
+                      </span>
+                    ) : <span className="text-slate-600">—</span>}
+                  </td>
+                )}
               </tr>
             )
           })}
