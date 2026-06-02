@@ -172,6 +172,13 @@ async def _server_scan_loop():
                 except Exception as e:
                     logging.warning(f"[server-scan] save falhou: {e}")
 
+                # Shadow #11.3: abre trades sombra pras recs novas (A/A+)
+                try:
+                    from services.shadow_trade_service import open_shadow_for_recs
+                    await open_shadow_for_recs(recs_dict)
+                except Exception as e:
+                    logging.warning(f"[server-scan] shadow open falhou: {e}")
+
             logging.info(
                 f"[server-scan] {newly_saved}/{len(recs_dict)} novas (dedup 2h), "
                 f"{len(pushable)} elegíveis pra push"
@@ -650,6 +657,12 @@ async def recommendations_batch(body: RecommendationBatchRequest):
                 newly_saved = await save_recommendations(recs_dict) or 0
             except Exception as e:
                 logging.warning(f"save_recommendations falhou (segue sem persistir): {e}")
+            # Shadow #11.3
+            try:
+                from services.shadow_trade_service import open_shadow_for_recs
+                await open_shadow_for_recs(recs_dict)
+            except Exception as e:
+                logging.warning(f"shadow open falhou: {e}")
         # Push notifications (só dispara pra recs novas — dedup feito por tag)
         if PUSH_ENABLED and newly_saved > 0:
             try:
@@ -1542,6 +1555,13 @@ async def exchange_env():
     """Qual corretora está ativa + diagnóstico (testnet, key configurada)."""
     from services import exchange_service
     return exchange_service.env_info()
+
+
+@app.get("/api/shadow/env")
+async def shadow_env():
+    """Status do shadow trade (#11.3) — se ativo, abre RealTrades sem exchange."""
+    from services import shadow_trade_service
+    return shadow_trade_service.env_info()
 
 
 @app.get("/api/exchange/account")

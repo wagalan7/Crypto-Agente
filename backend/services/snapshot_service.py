@@ -472,6 +472,12 @@ async def check_open_snapshots() -> int:
                                 await notify_outcome(snap, ev)
                             except Exception as e:
                                 log.warning(f"notify_outcome {ev} falhou: {e}")
+                        # Shadow #11.3: fecha trade sombra ligado a essa rec
+                        try:
+                            from services.shadow_trade_service import close_shadow_for_snapshot
+                            await close_shadow_for_snapshot(snap)
+                        except Exception as e:
+                            log.warning(f"shadow close falhou: {e}")
 
                 snap.last_check_at = now
             except Exception as e:
