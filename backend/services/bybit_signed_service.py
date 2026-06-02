@@ -335,6 +335,43 @@ async def get_executions(symbol: Optional[str] = None, limit: int = 50) -> dict:
     return {"ok": True, "fills": fills, "count": len(fills)}
 
 
+async def _try_endpoint(base: str, label: str) -> dict:
+    """Tenta query-api num endpoint específico — usado pra confirmar qual
+    sistema da Bybit reconhece a key (testnet vs demo)."""
+    ts = str(int(time.time() * 1000))
+    sign = _sign(ts, "")
+    headers = _headers(ts, sign)
+    try:
+        r = await _get_client().get(f"{base}/v5/user/query-api", headers=headers)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"_raw_text": (r.text or "")[:300]}
+        return {"label": label, "base": base, "status": r.status_code, "response": data}
+    except Exception as e:
+        return {"label": label, "base": base, "error": str(e)}
+
+
+async def diagnostic_endpoints() -> dict:
+    """
+    Tenta a MESMA key em todos os endpoints Bybit conhecidos pra descobrir
+    qual sistema a reconhece:
+      - api-testnet.bybit.com (testnet padrão)
+      - api-demo.bybit.com    (demo trading dentro da conta principal)
+      - api.bybit.com         (mainnet — só pra confirmar que não é key real)
+    """
+    if not is_configured():
+        return {"ok": False, "error": "BYBIT_API_KEY/SECRET não configurados"}
+    out = {"key_prefix": _API_KEY[:4] + "...", "tests": []}
+    for base, label in [
+        ("https://api-testnet.bybit.com", "testnet"),
+        ("https://api-demo.bybit.com", "demo"),
+        ("https://api.bybit.com", "mainnet"),
+    ]:
+        out["tests"].append(await _try_endpoint(base, label))
+    return out
+
+
 async def diagnostic() -> dict:
     """
     Diagnóstico verboso pra debug de auth: chama /v5/user/query-api (endpoint

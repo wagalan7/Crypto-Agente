@@ -1628,6 +1628,17 @@ async def exchange_diagnostic():
     return {"error": "diagnostic não suportado pelo cliente ativo"}
 
 
+@app.get("/api/exchange/diagnostic-endpoints")
+async def exchange_diagnostic_endpoints():
+    """Testa a MESMA chave contra testnet, demo e mainnet pra descobrir
+    em qual sistema ela está registrada. Bybit tem 2 ambientes separados
+    (testnet.bybit.com vs demo trading dentro da conta principal)."""
+    from services import bybit_signed_service
+    if hasattr(bybit_signed_service, "diagnostic_endpoints"):
+        return await bybit_signed_service.diagnostic_endpoints()
+    return {"error": "diagnostic_endpoints não suportado pelo cliente ativo"}
+
+
 @app.get("/api/exchange/account")
 async def exchange_account():
     from services import exchange_service
