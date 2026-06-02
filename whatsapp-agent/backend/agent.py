@@ -264,6 +264,67 @@ Mensagem de urgência / crise emocional:
 - Exemplo: "Fico feliz que você entrou em contato 💙 Sua mensagem chegou para a {tenant['psychologist_name']} e ela vai te responder o quanto antes. Você não está sozinho(a). 🌸"
 - Use action "none" e intent "other"
 
+CONTEÚDO PESSOAL / DESABAFO — REGRA ABSOLUTA (LEIA COM ATENÇÃO):
+- Se o paciente compartilhar QUALQUER conteúdo pessoal, desabafo, queixa,
+  relato sobre família, filhos, parceiro(a), comportamento, escola, trabalho,
+  sentimento, opinião pessoal, dúvida sobre conduta clínica, pedido de
+  orientação sobre como agir, ou QUALQUER assunto que NÃO seja estritamente
+  agendamento/remarcação/confirmação/pagamento → NÃO TENTE RESPONDER.
+- Sinais típicos: "minha filha…", "meu marido…", "estou perdendo a cabeça",
+  "ela está irritada", "não sei o que fazer", "queria conversar sobre…",
+  "compartilhar com você", "estou me sentindo", relatos longos do dia, etc.
+- Sua ÚNICA resposta nesses casos deve ser, de forma calorosa mas curta:
+  "Olá! 😊 Recebi sua mensagem. Vou repassar para a {tenant['psychologist_name']},
+   que entra em contato em breve para conversar com você com a atenção que isso merece. 💙"
+- Use intent "other" e action "none". NÃO tente acolher, opinar, orientar,
+  validar sentimentos, dar conselhos, nem fazer perguntas de aprofundamento.
+- NÃO mencione confirmação de consulta. NÃO ofereça horários. NÃO faça
+  triagem clínica. Apenas a frase de repasse acima.
+- EXCEÇÃO: se for crise/risco grave (auto-lesão, suicídio, urgência médica)
+  → use a regra "Mensagem de urgência / crise emocional" acima.
+
+PRIMEIRO CONTATO / NOVO PACIENTE — REGRA ABSOLUTA:
+- Se a pessoa estiver fazendo primeiro contato e perguntar "como funciona a terapia",
+  "qual o método", "atende on-line", "atende criança/adolescente/adulto",
+  "qual o valor", "quanto custa", "tem convênio", "onde fica", "qual horário",
+  "qual a abordagem", ou QUALQUER pergunta sobre o serviço/funcionamento:
+  → NÃO tente explicar nada. NÃO invente. NÃO ofereça a primeira sessão.
+- Resposta ÚNICA: "Olá! 😊 Recebi sua mensagem. Vou repassar para a
+  {tenant['psychologist_name']}, que entra em contato em breve para te passar
+  essas informações com calma. 💙"
+- intent "new_patient" (se for o caso) ou "other", action "none".
+
+PERGUNTAS SOBRE VALOR / PAGAMENTO / PRAZO — REGRA ABSOLUTA:
+- Se perguntarem "qual o valor", "até quando posso pagar", "como pago",
+  "tem desconto", "parcela", "qual a forma de pagamento", ou qualquer
+  pergunta sobre dinheiro/cobrança que NÃO seja resposta a uma cobrança
+  já enviada: NÃO responda com valor nem prazo.
+- Resposta ÚNICA: "Vou entrar em contato com a {tenant['psychologist_name']}
+  para te passar essa informação. 💙"
+- action "none".
+
+FRASES PROIBIDAS (NUNCA escreva isso):
+- "Quer que eu a notifique para ela te responder?" / "Quer que eu avise ela?"
+  → em vez disso: "Vou entrar em contato com a {tenant['psychologist_name']}
+  para te passar a informação."
+- "Te abraço" / "Um abraço" / "Abraço" (com ou sem emoji 💙)
+  → não usar despedidas afetivas. Encerre com "💙" sozinho ou sem nada.
+- "O que você precisa conversar com a {tenant['psychologist_name']}?" /
+  "Qual o assunto?" / "Pode me contar o que está acontecendo?"
+  → SIGILO. NUNCA pergunte o motivo, o assunto, o que a pessoa quer
+  conversar, nem peça detalhes. A IA não tem acesso ao conteúdo clínico.
+  Se a pessoa quiser falar com a psicóloga, apenas: "Claro! 😊 Vou avisar
+  a {tenant['psychologist_name']} e ela te responde em breve por aqui. 💙"
+- "Como posso te ajudar hoje?" / "No que posso ajudar?" no fim das frases
+  → deixe a pessoa puxar o assunto.
+
+CONFIRMAÇÃO FUTURA (paciente disse que vai confirmar depois):
+- Se o paciente disser "posso confirmar amanhã?", "te aviso depois",
+  "confirmo mais tarde", "deixa eu ver e te falo": NÃO diga "te esperamos
+  quarta" nem dê como confirmado. Apenas: "Claro, sem problema! 😊
+  Fico no aguardo da sua confirmação. 💙"
+- action "none".
+
 FORMATO DE RESPOSTA (OBRIGATÓRIO — responda APENAS com JSON válido, sem markdown):
 
 {{
@@ -484,8 +545,9 @@ def _greeting_reply(tenant: dict, phone: str) -> str:
                 nome = appt["patient_name"].split()[0]
         except Exception:
             pass
-    saud = f"Olá, {nome}!" if nome else "Olá!"
-    return f"{saud} 😊 Tudo bem? Como posso te ajudar hoje?"
+    # NÃO oferecer ajuda no fim — deixa o paciente puxar o assunto.
+    # Pedido da Bruna: evita "no que posso te ajudar" toda hora.
+    return f"Olá, {nome}! 😊" if nome else "Olá! 😊"
 
 
 def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResponse]:
@@ -596,8 +658,44 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
         agent_resp.data = {}
 
     reply, event = _execute_action(tenant, agent_resp, offered_slots, phone)
+    reply = _strip_forbidden_phrases(reply)
     db.save_message(tenant_id, phone, "assistant", reply)
     return reply, agent_resp, event
+
+
+# ── Sanitização final: remove frases proibidas que o LLM insiste em escrever ────
+import re as _re_san
+
+_FORBIDDEN_PATTERNS = [
+    # "Te abraço! 💙" / "Um abraço" / "Abraço(s)" no fim
+    _re_san.compile(r"\s*(?:te\s+abra[çc]o|um\s+abra[çc]o|abra[çc]os?)[\s!.,💙💗🩷🌸😊]*$", _re_san.IGNORECASE),
+    # "Quer que eu (a) notifique/avise..."
+    _re_san.compile(r"\s*Quer que eu\s+a?\s*notifi\w+[^?]*\?", _re_san.IGNORECASE),
+    _re_san.compile(r"\s*Quer que eu\s+a?\s*avis\w+[^?]*\?", _re_san.IGNORECASE),
+    # "O que você precisa conversar..." (quebra de sigilo)
+    _re_san.compile(r"\s*(?:O\s+que|Qual)\s+(?:voc[êe]\s+)?(?:precisa|quer|gostaria\s+de)\s+(?:conversar|falar|tratar)[^?]*\?", _re_san.IGNORECASE),
+    # "Como posso te ajudar hoje?" / "No que posso ajudar?"
+    _re_san.compile(r"\s*(?:Como|No que)\s+posso\s+(?:te\s+)?ajud\w+[^?]*\?", _re_san.IGNORECASE),
+    # "Pode me contar o que está acontecendo"
+    _re_san.compile(r"\s*Pode me contar[^?.!]*[?.!]", _re_san.IGNORECASE),
+]
+
+
+def _strip_forbidden_phrases(text: str) -> str:
+    if not text:
+        return text
+    out = text
+    # Aplica várias passadas porque uma frase pode vir colada na outra.
+    for _ in range(3):
+        prev = out
+        for pat in _FORBIDDEN_PATTERNS:
+            out = pat.sub("", out)
+        out = out.strip()
+        if out == prev:
+            break
+    # Se ficou só pontuação/emoji solto no final, limpa.
+    out = _re_san.sub(r"[\s]+([!?.])", r"\1", out).strip()
+    return out or "Olá! 😊 Vou repassar sua mensagem. 💙"
 
 
 def _execute_action(tenant: dict, resp: AgentResponse,

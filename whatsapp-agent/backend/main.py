@@ -317,19 +317,17 @@ async def _handle_message(tenant: dict, phone: str, text: str):
             await wa.send_message(tenant, psy_phone, urgency_notif)
             logger.info(f"[{tenant['slug']}] ⚠️ Notificação de urgência enviada para psicóloga")
 
-    # ── Áudio: transcrever antes de processar ────────────────────────────────────
+    # ── Áudio: NÃO transcrever mais. Apenas repassar à psicóloga. ───────────────
+    # Decisão da Bruna (sigilo + qualidade): a IA não deve interpretar áudio.
     if text.startswith("__AUDIO__:"):
-        audio_url = text[len("__AUDIO__:"):]
-        logger.info(f"[{tenant['slug']}][{phone}] Áudio recebido — transcrevendo...")
-        transcribed = await wa.transcribe_audio_groq(audio_url)
-        if transcribed:
-            text = transcribed
-            logger.info(f"[{tenant['slug']}][{phone}] Transcrição: {text[:80]}")
-        else:
-            await wa.send_message(tenant, phone,
-                "Recebi seu áudio! 🎙️ Mas ainda não consigo ouvir mensagens de voz. "
-                "Pode me enviar a mesma mensagem em texto? Assim posso te ajudar melhor 😊")
-            return
+        logger.info(f"[{tenant['slug']}][{phone}] Áudio recebido — repassando à psicóloga sem transcrição")
+        psy_name = tenant.get("psychologist_name") or "psicóloga"
+        await wa.send_message(
+            tenant, phone,
+            f"Recebi seu áudio! 🎙️ Vou repassar para a {psy_name}, "
+            f"que entra em contato em breve para te responder por aqui. 💙",
+        )
+        return
 
     # Detectar se é primeira mensagem de um novo contato (antes de salvar)
     is_first_message = len(db.get_conversation_history(tenant["id"], phone, limit=1)) == 0
