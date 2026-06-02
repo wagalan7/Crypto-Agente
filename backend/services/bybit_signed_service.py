@@ -362,7 +362,13 @@ async def diagnostic_endpoints() -> dict:
     """
     if not is_configured():
         return {"ok": False, "error": "BYBIT_API_KEY/SECRET não configurados"}
-    out = {"key_prefix": _API_KEY[:4] + "...", "tests": []}
+    out = {
+        "key_prefix": _API_KEY[:4] + "...",
+        "key_len": len(_API_KEY),
+        "secret_len": len(_API_SECRET),
+        "_hint": "Bybit espera key=18 chars, secret=36 chars. Se invertido, key e secret estão trocados nas env vars.",
+        "tests": [],
+    }
     for base, label in [
         ("https://api-testnet.bybit.com", "testnet"),
         ("https://api-demo.bybit.com", "demo"),
