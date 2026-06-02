@@ -38,10 +38,23 @@ log = logging.getLogger(__name__)
 
 _API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 _API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
-_TESTNET = os.getenv("BINANCE_TESTNET", "true").strip().lower() in ("1", "true", "yes")
-_RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW", "5000"))
+# BINANCE_MODE: "demo" (default — demo-fapi.binance.com, conta principal Binance),
+#               "testnet" (testnet.binancefuture.com — sistema legado, GitHub login),
+#               "mainnet" (fapi.binance.com — produção real)
+# Backward-compat: se BINANCE_MODE não setado, usa BINANCE_TESTNET (true=demo, false=mainnet).
+_MODE = os.getenv("BINANCE_MODE", "").strip().lower()
+if not _MODE:
+    _TESTNET_LEGACY = os.getenv("BINANCE_TESTNET", "true").strip().lower() in ("1", "true", "yes")
+    _MODE = "demo" if _TESTNET_LEGACY else "mainnet"
 
-BASE = "https://testnet.binancefuture.com" if _TESTNET else "https://fapi.binance.com"
+_BASE_BY_MODE = {
+    "demo":    "https://demo-fapi.binance.com",
+    "testnet": "https://testnet.binancefuture.com",
+    "mainnet": "https://fapi.binance.com",
+}
+BASE = _BASE_BY_MODE.get(_MODE, "https://demo-fapi.binance.com")
+_TESTNET = _MODE in ("demo", "testnet")  # mantém flag pra compat com env_info
+_RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW", "5000"))
 
 _http_client: Optional[httpx.AsyncClient] = None
 
@@ -53,6 +66,7 @@ def is_configured() -> bool:
 def env_info() -> dict:
     return {
         "configured": is_configured(),
+        "mode": _MODE,
         "testnet": _TESTNET,
         "base_url": BASE,
         "key_prefix": _API_KEY[:4] + "..." if _API_KEY else None,
@@ -336,6 +350,7 @@ async def diagnostic() -> dict:
     secret_sha1 = hashlib.sha1(_API_SECRET.encode("utf-8")).hexdigest()[:12]
     out = {
         "exchange": "binance",
+        "mode": _MODE,
         "base_url": BASE,
         "testnet": _TESTNET,
         "key_prefix": _API_KEY[:4] + "...",
