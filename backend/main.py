@@ -1617,6 +1617,77 @@ async def shadow_env():
     return shadow_trade_service.env_info()
 
 
+@app.post("/api/admin/force-test-trade")
+async def admin_force_test_trade(
+    symbol: str = "BTCUSDT",
+    side: str = "Buy",            # "Buy" | "Sell"
+    notional_usd: float = 50.0,
+    leverage: int = 5,
+    close_after: bool = True,     # se True, emite ordem oposta reduceOnly logo após
+):
+    """
+    Ordem REAL de teste na exchange ativa — valida que auth, perms e place_order
+    funcionam end-to-end. Default: BTC Buy $50 notional 5x, fecha logo após.
+
+    Use no Binance Demo pra confirmar que o bot está conectado. Em produção,
+    REMOVA esse endpoint (ou proteja com token) — qualquer um que acertar a URL
+    abre ordem real.
+    """
+    import httpx
+    from services import exchange_service, binance_signed_service
+
+    # 1. Fetch current price (público, sem auth) — usa o BASE da exchange ativa
+    sym = symbol.upper().replace("/", "").replace(":USDT", "")
+    try:
+        async with httpx.AsyncClient(timeout=10) as cli:
+            r = await cli.get(f"{binance_signed_service.BASE}/fapi/v1/ticker/price?symbol={sym}")
+            data = r.json()
+            mark = float(data.get("price") or 0)
+    except Exception as e:
+        return {"ok": False, "step": "fetch_price", "error": str(e)}
+
+    if mark <= 0:
+        return {"ok": False, "step": "fetch_price", "error": f"preço inválido: {data}"}
+
+    # 2. Computa qty pra atingir o notional alvo
+    qty = round(notional_usd / mark, 4)
+    if qty <= 0:
+        return {"ok": False, "step": "compute_qty", "mark": mark, "qty": qty,
+                "error": "qty=0; aumente notional_usd"}
+
+    # 3. Place order (Market, sem TP/SL pra teste simples)
+    open_res = await exchange_service.place_order(
+        symbol=sym, side=side, qty=qty,
+        order_type="Market", leverage=leverage,
+        client_order_id=f"cw-test-{int(__import__('time').time())}",
+    )
+    result = {
+        "step": "place_order", "symbol": sym, "side": side, "qty": qty,
+        "leverage": leverage, "mark_price_at_request": mark,
+        "notional_target_usd": notional_usd,
+        "open_response": open_res,
+    }
+    if not open_res.get("ok"):
+        result["ok"] = False
+        return result
+
+    # 4. Fecha imediatamente se solicitado (reduceOnly oposto)
+    if close_after:
+        opposite = "Sell" if side.lower() == "buy" else "Buy"
+        close_res = await exchange_service.place_order(
+            symbol=sym, side=opposite, qty=qty,
+            order_type="Market", reduce_only=True,
+            client_order_id=f"cw-test-close-{int(__import__('time').time())}",
+        )
+        result["close_response"] = close_res
+        result["ok"] = bool(close_res.get("ok"))
+    else:
+        result["ok"] = True
+        result["note"] = "posição aberta na exchange — feche manualmente"
+
+    return result
+
+
 @app.get("/api/exchange/equity")
 async def exchange_equity(force: bool = False):
     """
