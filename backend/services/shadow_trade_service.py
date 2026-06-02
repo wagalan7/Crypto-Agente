@@ -74,18 +74,19 @@ def _compute_qty(entry: float, stop: float, risk_pct: float, equity_usd: float) 
 
 async def open_shadow_for_recs(recs: list[dict]) -> int:
     """
-    Pra cada rec marcada com `_just_saved=True` e tier A/A+, abre uma RealTrade
-    sombra. Retorna quantas foram criadas.
+    Pra cada rec marcada com `_just_saved=True` e tier A/A+, abre uma RealTrade.
 
-    Idempotente: se já existe RealTrade com mesma recommendation_id e
-    status='open', pula (snapshot_service.save_recommendations já dedupa, mas
-    paranoia extra aqui).
+    Modos:
+      SHADOW_ENABLED=True  → source="shadow" (sem chamar exchange)
+      SHADOW_ENABLED=False → source="auto" + chama exchange_service.place_order()
+                              (passa pelo kill_switch_service.check_can_trade primeiro)
+
+    Idempotente: snapshot_service.save_recommendations dedupa antes.
     """
-    if not SHADOW_ENABLED:
-        log.debug("[shadow] desabilitado (EXCHANGE_SHADOW=false) — pulando")
-        return 0
     if not DB_ENABLED or not recs:
         return 0
+    mode = "shadow" if SHADOW_ENABLED else "live"
+    log.debug(f"[shadow] processando {len(recs)} recs em modo={mode}")
 
     opened = 0
     for rec in recs:
@@ -133,26 +134,83 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             if isinstance(sig, dict):
                 tp1 = sig.get("tp1")
 
+            tp2 = float(rec.get("tp2") or 0) or None
+
+            # ─── LIVE EXECUTION (kill-switch + exchange call) ────────────
+            exchange_order_id = None
+            client_order_id = None
+            exchange_name = os.getenv("EXCHANGE", "binance")
+            source = "shadow"
+            entry_actual = entry
+
+            if not SHADOW_ENABLED:
+                # 1. Kill-switch
+                from services import kill_switch_service
+                ks = await kill_switch_service.check_can_trade()
+                if not ks.get("allowed"):
+                    log.warning(
+                        f"[shadow→live] BLOCKED {rec['symbol']} {side}: {ks.get('reason')}"
+                    )
+                    continue
+
+                # 2. Exchange order
+                from services import exchange_service
+                exch_side = "Buy" if side == "long" else "Sell"
+                client_order_id = f"cw-{snap_id}"  # crypto-win + snap id
+                order_res = await exchange_service.place_order(
+                    symbol=rec["symbol"],
+                    side=exch_side,
+                    qty=qty,
+                    order_type="Market",
+                    stop_loss=stop,
+                    take_profit=tp2,  # TP2 como target principal; TP1 fica manual
+                    leverage=int(rec.get("leverage") or 1),
+                    client_order_id=client_order_id,
+                )
+                if not order_res.get("ok"):
+                    log.error(
+                        f"[shadow→live] place_order falhou {rec['symbol']}: "
+                        f"{order_res.get('msg') or order_res.get('error')}"
+                    )
+                    continue
+
+                result = order_res.get("result") or {}
+                exchange_order_id = str(result.get("orderId") or result.get("orderID") or "")
+                # Binance retorna avgPrice; Bybit retorna em outro campo
+                avg = result.get("avgPrice") or result.get("avgFillPrice")
+                if avg:
+                    try:
+                        entry_actual = float(avg)
+                    except Exception:
+                        pass
+                source = "auto"
+                log.info(
+                    f"[shadow→live] EXECUTED {rec['symbol']} {exch_side} qty={qty} "
+                    f"order_id={exchange_order_id} avg={entry_actual}"
+                )
+
             trade = await real_trade_service.open_trade(
                 symbol=rec["symbol"],
                 side=side,
                 qty=qty,
-                entry_price=entry,
+                entry_price=entry_actual,
                 recommendation_id=snap_id,
                 leverage=int(rec.get("leverage") or 1),
                 planned_stop=stop,
                 planned_tp1=float(tp1) if tp1 is not None else None,
-                planned_tp2=float(rec.get("tp2") or 0),
+                planned_tp2=tp2,
                 entry_fee=0.0,
-                source="shadow",
-                exchange=os.getenv("EXCHANGE", "binance"),
-                notes=f"shadow auto-open (tier {tier})",
+                source=source,
+                exchange=exchange_name,
+                exchange_order_id=exchange_order_id,
+                client_order_id=client_order_id,
+                notes=f"{source} auto-open (tier {tier})",
             )
             if trade is not None:
                 opened += 1
                 log.info(
-                    f"[shadow] OPEN {rec['symbol']} {side} qty={qty} entry={entry} "
-                    f"SL={stop} TP1={tp1} TP2={rec.get('tp2')} (snap={snap_id})"
+                    f"[{source}] OPEN {rec['symbol']} {side} qty={qty} entry={entry_actual} "
+                    f"SL={stop} TP1={tp1} TP2={tp2} (snap={snap_id})"
                 )
         except Exception as e:
             log.warning(f"[shadow] falha abrindo trade pra {rec.get('symbol')}: {e}")
@@ -194,7 +252,7 @@ async def close_shadow_for_snapshot(snap) -> bool:
         stmt = (
             select(RealTrade)
             .where(RealTrade.recommendation_id == snap.id)
-            .where(RealTrade.source == "shadow")
+            .where(RealTrade.source.in_(("shadow", "auto")))
             .where(RealTrade.status == "open")
         )
         trade = (await session.execute(stmt)).scalar_one_or_none()
@@ -202,12 +260,36 @@ async def close_shadow_for_snapshot(snap) -> bool:
             return False
 
     new_status = _STATUS_MAP[snap.status]
+    # Se foi execução real (auto) com TP/SL já emitidos como ordens separadas,
+    # o exchange resolveu sozinho — só atualizamos o DB pra refletir.
+    # Se snap.status=expired (não bateu nada), pode ser que a posição esteja
+    # aberta na exchange ainda; pra esse caso emitimos market close.
+    if trade.source == "auto" and snap.status == "expired":
+        try:
+            from services import exchange_service
+            close_side = "Sell" if trade.side == "long" else "Buy"
+            close_res = await exchange_service.place_order(
+                symbol=trade.symbol,
+                side=close_side,
+                qty=float(trade.qty),
+                order_type="Market",
+                reduce_only=True,
+                client_order_id=f"cw-close-{trade.id}",
+            )
+            if not close_res.get("ok"):
+                log.warning(
+                    f"[live] close_position falhou trade#{trade.id}: "
+                    f"{close_res.get('msg') or close_res.get('error')}"
+                )
+        except Exception as e:
+            log.warning(f"[live] erro fechando posição #{trade.id}: {e}")
+
     await real_trade_service.close_trade(
         trade_id=trade.id,
         exit_price=float(snap.outcome_price),
         status=new_status,
         exit_fee=0.0,
-        notes=f"shadow auto-close from snap #{snap.id} ({snap.status})",
+        notes=f"{trade.source} auto-close from snap #{snap.id} ({snap.status})",
     )
     log.info(
         f"[shadow] CLOSE trade#{trade.id} {snap.symbol} → {new_status} "

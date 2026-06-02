@@ -1639,6 +1639,14 @@ async def exchange_diagnostic_endpoints():
     return {"error": "diagnostic_endpoints não suportado pelo cliente ativo"}
 
 
+@app.get("/api/kill-switch/status")
+async def kill_switch_status():
+    """Estado atual do circuit breaker — checks, thresholds, motivo de bloqueio se houver.
+    UI pode pollar isso pra mostrar warning quando próximo dos limites."""
+    from services import kill_switch_service
+    return await kill_switch_service.status()
+
+
 @app.get("/api/exchange/diagnostic-binance")
 async def exchange_diagnostic_binance():
     """Diagnóstico verboso do Binance Futures (testnet ou mainnet).
