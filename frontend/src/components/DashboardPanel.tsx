@@ -296,14 +296,14 @@ export default function DashboardPanel({ onClose }: Props) {
                   (real?.equity?.trades_total ?? 0) > 0 ? 'text-cyan-300' : 'text-slate-500'
                 }`}>
                   {(real?.equity?.trades_total ?? 0) > 0 ? '💵' : <Lock className="w-3 h-3" />}
-                  Real Trading
+                  Real / Shadow
                 </h3>
                 <span className={`text-[10px] ${
                   (real?.equity?.trades_total ?? 0) > 0 ? 'text-cyan-400/60' : 'text-slate-600'
                 }`}>
                   {(real?.equity?.trades_total ?? 0) > 0
                     ? `${real?.equity?.trades_total} trades · ${(real?.equity?.final_pnl_pct ?? 0) >= 0 ? '+' : ''}${(real?.equity?.final_pnl_pct ?? 0).toFixed(2)}%`
-                    : 'sem fills registrados'}
+                    : 'aguardando 1ª execução'}
                 </span>
               </div>
               {(real?.equity?.trades_total ?? 0) > 0 ? (
@@ -311,10 +311,11 @@ export default function DashboardPanel({ onClose }: Props) {
               ) : (
                 <div className="flex flex-col items-center justify-center py-8 text-center">
                   <Lock className="w-8 h-8 text-slate-700 mb-2" />
-                  <p className="text-xs text-slate-500 max-w-[260px]">
-                    Nenhum fill real registrado ainda. Quando você executar uma rec
-                    na corretora, faça <code className="text-cyan-400">POST /api/real-trades</code> com
-                    o entry_price real — o sistema calcula slippage vs paper.
+                  <p className="text-xs text-slate-500 max-w-[280px] leading-relaxed">
+                    Vai mostrar trades executados: <strong className="text-slate-400">shadow</strong> (sistema
+                    abre auto sem mexer em saldo real) e <strong className="text-slate-400">live</strong> quando
+                    flipar <code className="text-cyan-400">EXCHANGE_SHADOW=false</code>. Aparece P&L, WR,
+                    Sharpe e tier breakdown — idêntico ao Paper, mas com fills reais.
                   </p>
                 </div>
               )}
