@@ -650,25 +650,78 @@ async def recommendations_batch(body: RecommendationBatchRequest):
                 recs_dict = filtered
             except Exception as e:
                 logging.warning(f"filtro recent_outcome falhou (segue sem filtrar): {e}")
-        # Persistência (não bloqueia se DB indisponível)
+
+        # Paridade com server-scan: aplica MESMOS filtros (news/regime/cooldown)
+        # ANTES de salvar e disparar push. Sem isso, server-scan "engole" recs
+        # silenciosamente (filtros conservadores) mas o frontend salva+pusha as
+        # mesmas → user só recebe push quando abre o painel, com delay.
+        # Os filtros são aplicados a uma cópia pra não distorcer o retorno da
+        # API (UI continua exibindo todas as recs cruas pro user decidir).
+        pushable_recs = list(recs_dict)
+        try:
+            # News blackout
+            from services import news_filter_service as nfs
+            blackout = await nfs.get_blackout_status()
+            if blackout.get("active"):
+                logging.info(f"[push-gate] news blackout ({blackout.get('event')}) — suprimindo push")
+                pushable_recs = []
+        except Exception as e:
+            logging.warning(f"[push-gate] news check falhou (fail-open): {e}")
+        try:
+            # Regime block_all + per-rec block + downgrade alt longs
+            from services import regime_service as rs
+            regime = await rs.get_regime_status()
+            if regime.get("block_all"):
+                logging.info(f"[push-gate] regime {regime.get('regime')} block_all — suprimindo push")
+                pushable_recs = []
+            else:
+                from services.regime_service import should_block_recommendation, is_btc_symbol
+                kept = []
+                for r in pushable_recs:
+                    if should_block_recommendation(regime, r["symbol"], r["direction"]):
+                        continue
+                    if regime.get("downgrade_alt_longs") and r["direction"] == "long" and not is_btc_symbol(r["symbol"]):
+                        if r.get("tier") == "A+":
+                            r = {**r, "tier": "A"}
+                        elif r.get("tier") == "A":
+                            r = {**r, "tier": "B"}
+                        elif r.get("tier") == "B":
+                            continue
+                    kept.append(r)
+                pushable_recs = kept
+        except Exception as e:
+            logging.warning(f"[push-gate] regime check falhou (fail-open): {e}")
+        try:
+            # Cooldown 6h pós-stop
+            from services.snapshot_service import get_recently_stopped_symbols
+            cooldown = await get_recently_stopped_symbols(hours=6)
+            if cooldown:
+                pushable_recs = [r for r in pushable_recs if r["symbol"] not in cooldown]
+        except Exception as e:
+            logging.warning(f"[push-gate] cooldown check falhou (fail-open): {e}")
+
+        # Persistência (não bloqueia se DB indisponível) — só persiste o que
+        # passou nos gates, evitando que o frontend antecipe o server-scan.
         newly_saved = 0
-        if DB_ENABLED and recs_dict:
+        if DB_ENABLED and pushable_recs:
             try:
-                newly_saved = await save_recommendations(recs_dict) or 0
+                newly_saved = await save_recommendations(pushable_recs) or 0
             except Exception as e:
                 logging.warning(f"save_recommendations falhou (segue sem persistir): {e}")
             # Shadow #11.3
             try:
                 from services.shadow_trade_service import open_shadow_for_recs
-                await open_shadow_for_recs(recs_dict)
+                await open_shadow_for_recs(pushable_recs)
             except Exception as e:
                 logging.warning(f"shadow open falhou: {e}")
         # Push notifications (só dispara pra recs novas — dedup feito por tag)
         if PUSH_ENABLED and newly_saved > 0:
             try:
-                asyncio.create_task(notify_recommendations_batch(recs_dict, newly_saved))
+                asyncio.create_task(notify_recommendations_batch(pushable_recs, newly_saved))
             except Exception as e:
                 logging.warning(f"notify push falhou: {e}")
+        # UI ainda recebe a lista bruta (recs_dict) pra exibição;
+        # filtros são só pra push/persistência.
         return {"count": len(recs), "recommendations": recs_dict}
     except Exception as e:
         logging.error(f"recommendations-batch error: {e}\n{traceback.format_exc()}")
