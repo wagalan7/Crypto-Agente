@@ -335,6 +335,92 @@ async def get_executions(symbol: Optional[str] = None, limit: int = 50) -> dict:
     return {"ok": True, "fills": fills, "count": len(fills)}
 
 
+async def diagnostic() -> dict:
+    """
+    Diagnóstico verboso pra debug de auth: chama /v5/user/query-api (endpoint
+    que retorna metadados da própria key — perms, type, status) e devolve a
+    resposta crua + headers do request. Não vaza secret, mas mostra o que a
+    Bybit responde EXATAMENTE pra cada tentativa.
+
+    Útil quando "API key is invalid" persiste mesmo com key recriada — pode
+    ser permission level, account type (Standard vs Unified) ou outro detalhe
+    que o retMsg genérico não revela.
+    """
+    if not is_configured():
+        return {"ok": False, "error": "BYBIT_API_KEY/SECRET não configurados"}
+
+    out = {"key_prefix": _API_KEY[:4] + "...", "testnet": _TESTNET, "base_url": BASE,
+           "tests": []}
+
+    # 1) Public time — confirma alcance
+    try:
+        r = await _get_client().get(f"{BASE}/v5/market/time")
+        out["tests"].append({"name": "public_time", "status": r.status_code,
+                              "body": (r.text or "")[:200]})
+    except Exception as e:
+        out["tests"].append({"name": "public_time", "error": str(e)})
+
+    # 2) /v5/user/query-api — RETORNA INFO DA KEY (perms, status, type)
+    ts = str(int(time.time() * 1000))
+    sign = _sign(ts, "")
+    headers = _headers(ts, sign)
+    try:
+        r = await _get_client().get(f"{BASE}/v5/user/query-api", headers=headers)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"_raw_text": (r.text or "")[:300]}
+        out["tests"].append({
+            "name": "query_api_info", "status": r.status_code,
+            "request_headers_sent": {
+                "X-BAPI-API-KEY": _API_KEY[:4] + "...",
+                "X-BAPI-TIMESTAMP": ts,
+                "X-BAPI-RECV-WINDOW": _RECV_WINDOW,
+                "X-BAPI-SIGN": sign[:12] + "...",
+            },
+            "server_time_used": ts,
+            "response": data,
+        })
+    except Exception as e:
+        out["tests"].append({"name": "query_api_info", "error": str(e)})
+
+    # 3) Wallet balance (UNIFIED) — o que estava falhando
+    ts2 = str(int(time.time() * 1000))
+    qs = "accountType=UNIFIED"
+    sign2 = _sign(ts2, qs)
+    headers2 = _headers(ts2, sign2)
+    try:
+        r = await _get_client().get(f"{BASE}/v5/account/wallet-balance?{qs}", headers=headers2)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"_raw_text": (r.text or "")[:300]}
+        out["tests"].append({
+            "name": "wallet_unified", "status": r.status_code, "response": data,
+        })
+    except Exception as e:
+        out["tests"].append({"name": "wallet_unified", "error": str(e)})
+
+    # 4) Wallet balance (CONTRACT) — caso conta seja Standard (não Unified)
+    ts3 = str(int(time.time() * 1000))
+    qs3 = "accountType=CONTRACT"
+    sign3 = _sign(ts3, qs3)
+    headers3 = _headers(ts3, sign3)
+    try:
+        r = await _get_client().get(f"{BASE}/v5/account/wallet-balance?{qs3}", headers=headers3)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"_raw_text": (r.text or "")[:300]}
+        out["tests"].append({
+            "name": "wallet_contract", "status": r.status_code, "response": data,
+        })
+    except Exception as e:
+        out["tests"].append({"name": "wallet_contract", "error": str(e)})
+
+    return out
+
+
 async def close_client():
     global _http_client
     if _http_client and not _http_client.is_closed:

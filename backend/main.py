@@ -1617,6 +1617,17 @@ async def shadow_env():
     return shadow_trade_service.env_info()
 
 
+@app.get("/api/exchange/diagnostic")
+async def exchange_diagnostic():
+    """Debug verboso de auth da Bybit: query-api, wallet UNIFIED + CONTRACT.
+    Mostra resposta crua de cada chamada — útil quando 'API key is invalid'
+    persiste e a gente precisa entender se é permission, account type, etc."""
+    from services import bybit_signed_service
+    if hasattr(bybit_signed_service, "diagnostic"):
+        return await bybit_signed_service.diagnostic()
+    return {"error": "diagnostic não suportado pelo cliente ativo"}
+
+
 @app.get("/api/exchange/account")
 async def exchange_account():
     from services import exchange_service
