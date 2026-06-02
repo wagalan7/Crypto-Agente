@@ -116,7 +116,20 @@ async def _send_one(sub: PushSubscription, payload: Dict[str, Any]) -> bool:
 
 
 def _sync_push(sub: PushSubscription, payload: Dict[str, Any]):
+    """
+    TTL: tempo máximo que o push provider (FCM/APNs/Mozilla) guarda a mensagem
+    enquanto o device está offline antes de descartar.
+
+    Outcomes (TP/SL) costumam disparar horas após a entry — se device dormir,
+    push é perdido com TTL curto. Recs novas a gente quer entregar rápido ou
+    descartar (notícia "fresca"). Heurística pelo tipo do payload:
+      - outcome  → 12h  (TP/SL bate enquanto user dorme — entregar quando acordar)
+      - rec nova → 1h   (sinal envelhece rápido em cripto)
+    """
     from pywebpush import webpush  # type: ignore
+    tag = (payload.get("tag") or "")
+    is_outcome = tag.startswith("outcome-")
+    ttl = 43200 if is_outcome else 3600  # 12h ou 1h
     webpush(
         subscription_info={
             "endpoint": sub.endpoint,
@@ -125,7 +138,7 @@ def _sync_push(sub: PushSubscription, payload: Dict[str, Any]):
         data=json.dumps(payload),
         vapid_private_key=VAPID_PRIVATE_KEY,
         vapid_claims={"sub": VAPID_SUBJECT},
-        ttl=3600,  # 1 hora
+        ttl=ttl,
     )
 
 
