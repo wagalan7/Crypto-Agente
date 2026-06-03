@@ -51,6 +51,11 @@ async def open_trade(
     exchange_order_id: Optional[str] = None,
     client_order_id: Optional[str] = None,
     notes: Optional[str] = None,
+    # Bracket / trade manager (Fase 2)
+    sl_order_id: Optional[str] = None,
+    tp1_order_id: Optional[str] = None,
+    tp2_order_id: Optional[str] = None,
+    sl_current_price: Optional[float] = None,
 ) -> Optional[dict]:
     if not DB_ENABLED:
         return None
@@ -96,6 +101,13 @@ async def open_trade(
             status="open",
             entry_slippage_pct=slippage,
             notes=notes,
+            # Bracket state
+            phase="pre_tp1",
+            qty_initial=qty,
+            sl_order_id=sl_order_id,
+            tp1_order_id=tp1_order_id,
+            tp2_order_id=tp2_order_id,
+            sl_current_price=sl_current_price if sl_current_price is not None else planned_stop,
         )
         session.add(trade)
         await session.flush()

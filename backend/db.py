@@ -96,6 +96,25 @@ async def init_db():
         await conn.execute(text(
             "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS exchange_order_id VARCHAR(64)"
         ))
+        # Fase 2 — trade manager (bracket TP1/TP2 + breakeven pós-TP1)
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS phase VARCHAR(16) DEFAULT 'pre_tp1'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS qty_initial DOUBLE PRECISION"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS sl_order_id VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS tp1_order_id VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS tp2_order_id VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS sl_current_price DOUBLE PRECISION"
+        ))
         # Se a coluna antiga existir (deploy anterior), copia o valor pro novo nome.
         # Em Postgres o IF EXISTS no information_schema é mais seguro:
         await conn.execute(text("""

@@ -88,6 +88,7 @@ from models.trade_signal import TradeSignal
 
 _snapshot_task: Optional[asyncio.Task] = None
 _scan_task: Optional[asyncio.Task] = None
+_trade_manager_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
 SERVER_SCAN_TOP_N = 40            # quantos símbolos varrer (Vision spot — universo maior compensa filtros)
@@ -248,7 +249,7 @@ async def _server_scan_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _scan_task
+    global _snapshot_task, _scan_task, _trade_manager_task
     if DB_ENABLED:
         try:
             await init_db()
@@ -262,8 +263,15 @@ async def lifespan(app: FastAPI):
         logging.info(f"Server-scan iniciado (intervalo {SERVER_SCAN_INTERVAL}s, top {SERVER_SCAN_TOP_N}).")
     except Exception as e:
         logging.warning(f"Falha ao iniciar server_scan: {e}")
+    # Trade manager — gerencia bracket TP1/TP2 + breakeven pós-TP1 (Fase 2)
+    try:
+        from services import trade_manager_service
+        _trade_manager_task = asyncio.create_task(trade_manager_service.loop())
+        logging.info("Trade manager iniciado.")
+    except Exception as e:
+        logging.warning(f"Falha ao iniciar trade_manager: {e}")
     yield
-    for t in (_snapshot_task, _scan_task):
+    for t in (_snapshot_task, _scan_task, _trade_manager_task):
         if t:
             t.cancel()
             try:
@@ -1607,6 +1615,27 @@ async def real_trade_get(trade_id: int):
     if result is None:
         raise HTTPException(404, "Trade não encontrado")
     return result
+
+
+# ─── Trade manager (bracket TP1/TP2 + breakeven pós-TP1, Fase 2) ─────────────
+
+
+@app.get("/api/trade-manager/status")
+async def trade_manager_status():
+    """Snapshot de trades sob gerenciamento ativo (fase, qty, ordens condicionais)."""
+    from services import trade_manager_service
+    return await trade_manager_service.get_status()
+
+
+@app.post("/api/trade-manager/backfill-protection")
+async def trade_manager_backfill():
+    """
+    Cria SL + TP1 + TP2 na exchange pros trades 'open' source='auto' que
+    ainda não têm sl_order_id setado. Útil pra "consertar" posições abertas
+    antes do bracket existir, ou cujas ordens condicionais falharam.
+    """
+    from services import trade_manager_service
+    return await trade_manager_service.backfill_protection()
 
 
 # ─── Exchange signed endpoints (#11) ──────────────────────────────────────────

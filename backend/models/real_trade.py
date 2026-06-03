@@ -74,6 +74,18 @@ class RealTrade(Base):
     # Slippage vs rec (em pips/%, pode ser negativo se a favor)
     entry_slippage_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # ── Bracket management (Fase 2 — trade manager) ──────────────────────
+    # phase: "pre_tp1" (SL inicial em planned_stop) → "post_tp1" (SL movido pra entry/BE)
+    phase: Mapped[str] = mapped_column(String(16), default="pre_tp1", index=True)
+    # qty_initial preserva o tamanho original; `qty` pode diminuir após parcial.
+    qty_initial: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # IDs das 3 ordens condicionais na exchange (SL + TP1 parcial + TP2 restante)
+    sl_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tp1_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tp2_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Preço atual do SL ativo na exchange (muda quando vai pra breakeven)
+    sl_current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Notas livres
     notes: Mapped[str | None] = mapped_column(String(255), nullable=True)
 

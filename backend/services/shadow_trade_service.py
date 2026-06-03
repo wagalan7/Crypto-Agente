@@ -245,7 +245,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     qty=qty,
                     order_type="Market",
                     stop_loss=stop,
-                    take_profit=tp2,  # TP2 como target principal; TP1 fica manual
+                    take_profit=tp2,  # TP2 — alvo final (closePosition=true)
+                    tp1=float(tp1) if tp1 is not None else None,  # bracket 45/55 quando ambos vierem
                     leverage=int(rec.get("leverage") or 1),
                     client_order_id=client_order_id,
                 )
@@ -266,10 +267,33 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     except Exception:
                         pass
                 source = "auto"
+
+                # Captura IDs das ordens condicionais pro trade manager (Fase 2)
+                sl_oid = order_res.get("sl_order_id")
+                tp1_oid = order_res.get("tp1_order_id")
+                tp2_oid = order_res.get("tp2_order_id")
+                if not order_res.get("sl_ok"):
+                    log.error(
+                        f"[shadow→live] ⚠ {rec['symbol']} ABERTO SEM STOP — "
+                        f"posição precisa atenção manual"
+                    )
+                if order_res.get("tp1_skipped"):
+                    log.warning(f"[shadow→live] {rec['symbol']} TP1 skip (qty parcial=0); 100% no TP2")
+                elif not order_res.get("tp1_ok"):
+                    log.warning(f"[shadow→live] {rec['symbol']} TP1 falhou (sem parcial)")
+                if not order_res.get("tp2_ok"):
+                    log.warning(f"[shadow→live] {rec['symbol']} TP2 falhou")
+
                 log.info(
                     f"[shadow→live] EXECUTED {rec['symbol']} {exch_side} qty={qty} "
-                    f"order_id={exchange_order_id} avg={entry_actual}"
+                    f"order_id={exchange_order_id} avg={entry_actual} "
+                    f"SL={sl_oid} TP1={tp1_oid} TP2={tp2_oid}"
                 )
+
+            # IDs das ordens condicionais (só existem no fluxo "auto"; em shadow ficam None)
+            _sl_oid = locals().get("sl_oid") if source == "auto" else None
+            _tp1_oid = locals().get("tp1_oid") if source == "auto" else None
+            _tp2_oid = locals().get("tp2_oid") if source == "auto" else None
 
             trade = await real_trade_service.open_trade(
                 symbol=rec["symbol"],
@@ -287,6 +311,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 exchange_order_id=exchange_order_id,
                 client_order_id=client_order_id,
                 notes=f"{source} auto-open (tier {tier})",
+                sl_order_id=_sl_oid,
+                tp1_order_id=_tp1_oid,
+                tp2_order_id=_tp2_oid,
+                sl_current_price=stop,
             )
             if trade is not None:
                 opened += 1

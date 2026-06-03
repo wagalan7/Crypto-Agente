@@ -272,6 +272,118 @@ async def get_positions(symbol: Optional[str] = None) -> dict:
             "testnet": _TESTNET, "exchange": "binance"}
 
 
+async def place_protection_orders(
+    symbol: str,
+    entry_side: str,        # lado da ENTRADA ("Buy" | "Sell" ou "BUY" | "SELL")
+    qty: float,             # qty total da posição (será dividida 45/55 se tp1+tp2)
+    *,
+    stop_loss: Optional[float] = None,
+    tp1: Optional[float] = None,
+    tp2: Optional[float] = None,
+    tp1_qty_pct: float = 0.45,
+    client_order_id_prefix: Optional[str] = None,
+) -> dict:
+    """
+    Cria as ordens condicionais (SL + TP1 parcial + TP2 restante) para uma posição
+    JÁ ABERTA. Não cria entry — útil tanto pro fluxo bracket-na-entrada quanto
+    pra backfill de posições já existentes sem proteção.
+
+    Convenções:
+      - entry_side = "Buy" (long) → counter_side = "SELL" (fecha)
+      - SL: STOP_MARKET com closePosition=true (fecha tudo se ruir)
+      - TP1: TAKE_PROFIT_MARKET com quantity = qty * 0.45 + reduceOnly=true
+      - TP2: TAKE_PROFIT_MARKET com closePosition=true (fecha o restante)
+
+    Retorno:
+      {
+        "sl_ok": bool, "sl_order_id": str|None, "sl_msg": str|None,
+        "tp1_ok": bool, "tp1_order_id": str|None, "tp1_msg": str|None, "tp1_qty": float,
+        "tp2_ok": bool, "tp2_order_id": str|None, "tp2_msg": str|None,
+        "tp1_skipped": bool,  # true se qty*0.45 arredondou pra 0 → manda 100% no TP2
+      }
+    """
+    sym = to_binance(symbol) if "/" in symbol else symbol
+    binance_entry_side = entry_side.upper()
+    counter_side = "SELL" if binance_entry_side == "BUY" else "BUY"
+
+    out = {
+        "sl_ok": True, "sl_order_id": None, "sl_msg": None,
+        "tp1_ok": True, "tp1_order_id": None, "tp1_msg": None, "tp1_qty": 0.0,
+        "tp2_ok": True, "tp2_order_id": None, "tp2_msg": None,
+        "tp1_skipped": False,
+    }
+
+    # ── SL ───────────────────────────────────────────────────────────────
+    if stop_loss is not None:
+        sl_price = await _round_price(sym, float(stop_loss))
+        sl_params = {
+            "symbol": sym, "side": counter_side, "type": "STOP_MARKET",
+            "stopPrice": sl_price, "closePosition": "true",
+        }
+        if client_order_id_prefix:
+            sl_params["newClientOrderId"] = f"{client_order_id_prefix}-sl"
+        sl = await _signed_request("POST", "/fapi/v1/order", sl_params)
+        if sl.get("ok"):
+            out["sl_order_id"] = str((sl.get("result") or {}).get("orderId") or "")
+            log.info(f"[binance] SL ok {sym} @ {sl_price} id={out['sl_order_id']}")
+        else:
+            out["sl_ok"] = False
+            out["sl_msg"] = sl.get("msg") or sl.get("error")
+            log.error(f"[binance] SL FALHOU {sym} @ {sl_price} side={counter_side}: {out['sl_msg']}")
+
+    # ── TP1 (parcial 45% reduceOnly) ─────────────────────────────────────
+    # Só faz parcial se TP1 e TP2 ambos definidos e qty_parcial > 0 após arredondar.
+    has_partial = tp1 is not None and tp2 is not None
+    if has_partial:
+        tp1_qty_raw = float(qty) * float(tp1_qty_pct)
+        tp1_qty = await _round_qty(sym, tp1_qty_raw)
+        if tp1_qty <= 0:
+            out["tp1_skipped"] = True
+            log.warning(
+                f"[binance] TP1 skip {sym}: qty*{tp1_qty_pct} ({tp1_qty_raw}) arredondou pra 0 "
+                f"→ manda 100% no TP2"
+            )
+        else:
+            tp1_price = await _round_price(sym, float(tp1))
+            tp1_params = {
+                "symbol": sym, "side": counter_side, "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": tp1_price, "quantity": tp1_qty, "reduceOnly": "true",
+            }
+            if client_order_id_prefix:
+                tp1_params["newClientOrderId"] = f"{client_order_id_prefix}-tp1"
+            tp1_res = await _signed_request("POST", "/fapi/v1/order", tp1_params)
+            if tp1_res.get("ok"):
+                out["tp1_order_id"] = str((tp1_res.get("result") or {}).get("orderId") or "")
+                out["tp1_qty"] = tp1_qty
+                log.info(f"[binance] TP1 ok {sym} @ {tp1_price} qty={tp1_qty} id={out['tp1_order_id']}")
+            else:
+                out["tp1_ok"] = False
+                out["tp1_msg"] = tp1_res.get("msg") or tp1_res.get("error")
+                log.error(f"[binance] TP1 FALHOU {sym} @ {tp1_price} qty={tp1_qty}: {out['tp1_msg']}")
+
+    # ── TP2 / TP único (closePosition=true) ──────────────────────────────
+    # Usa tp2 se fornecido; senão usa tp1 como TP único (caso só haja 1 alvo).
+    tp_final = tp2 if tp2 is not None else tp1
+    if tp_final is not None:
+        tp_price = await _round_price(sym, float(tp_final))
+        tp_params = {
+            "symbol": sym, "side": counter_side, "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": tp_price, "closePosition": "true",
+        }
+        if client_order_id_prefix:
+            tp_params["newClientOrderId"] = f"{client_order_id_prefix}-tp2"
+        tp_res = await _signed_request("POST", "/fapi/v1/order", tp_params)
+        if tp_res.get("ok"):
+            out["tp2_order_id"] = str((tp_res.get("result") or {}).get("orderId") or "")
+            log.info(f"[binance] TP2 ok {sym} @ {tp_price} id={out['tp2_order_id']}")
+        else:
+            out["tp2_ok"] = False
+            out["tp2_msg"] = tp_res.get("msg") or tp_res.get("error")
+            log.error(f"[binance] TP2 FALHOU {sym} @ {tp_price}: {out['tp2_msg']}")
+
+    return out
+
+
 async def place_order(
     symbol: str,
     side: str,           # "Buy" | "Sell" (Bybit-compat)
@@ -279,7 +391,9 @@ async def place_order(
     order_type: str = "Market",  # "Market" | "Limit"
     price: Optional[float] = None,
     stop_loss: Optional[float] = None,
-    take_profit: Optional[float] = None,
+    take_profit: Optional[float] = None,   # = TP2 (alvo final). Se tp1 também vier, vira bracket 45/55.
+    tp1: Optional[float] = None,           # TP1 parcial — quando setado junto com take_profit, dispara bracket
+    tp1_qty_pct: float = 0.45,
     reduce_only: bool = False,
     leverage: Optional[int] = None,
     client_order_id: Optional[str] = None,
@@ -288,12 +402,22 @@ async def place_order(
     Cria ordem em futures USDT-M. Aceita "Buy/Sell" (Bybit-style) e traduz pra
     "BUY/SELL" (Binance). Para TP/SL, Binance exige ordens SEPARADAS — emitidas
     aqui em sequência após a entry.
+
+    Modo bracket (quando `tp1` e `take_profit` ambos fornecidos):
+      - Entry MARKET (100% qty)
+      - SL STOP_MARKET (closePosition=true)
+      - TP1 TAKE_PROFIT_MARKET qty=qty*45% (reduceOnly=true) — fecha parcial
+      - TP2 TAKE_PROFIT_MARKET (closePosition=true) — fecha resto
+
+    Modo simples (só `take_profit` ou só `stop_loss`):
+      - Entry MARKET
+      - 1 ordem SL e/ou 1 ordem TP com closePosition=true
+
+    Retorno enriquecido com sl_ok/tp1_ok/tp2_ok pra caller propagar diagnóstico.
     """
     sym = to_binance(symbol) if "/" in symbol else symbol
 
-    # Arredonda qty/SL/TP pro stepSize/tickSize do símbolo. Sem isso, Binance
-    # rejeita com "Precision is over the maximum defined for this asset"
-    # (ex: DOGE só aceita qty inteiro, qty=61651.676 → erro).
+    # Arredonda qty pro stepSize do símbolo (DOGE só aceita inteiro, etc.).
     qty_rounded = await _round_qty(sym, float(qty))
     if qty_rounded <= 0:
         f = await _get_symbol_filters(sym)
@@ -327,25 +451,39 @@ async def place_order(
     if not entry_res.get("ok"):
         return entry_res
 
-    # TP/SL em ordens separadas (Binance pattern). Side invertido + closePosition.
-    extras = []
-    counter_side = "SELL" if binance_side == "BUY" else "BUY"
-    if stop_loss is not None:
-        sl_price = await _round_price(sym, float(stop_loss))
-        sl = await _signed_request("POST", "/fapi/v1/order", {
-            "symbol": sym, "side": counter_side, "type": "STOP_MARKET",
-            "stopPrice": sl_price, "closePosition": "true",
-        })
-        extras.append({"stop_loss": sl})
-    if take_profit is not None:
-        tp_price = await _round_price(sym, float(take_profit))
-        tp = await _signed_request("POST", "/fapi/v1/order", {
-            "symbol": sym, "side": counter_side, "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": tp_price, "closePosition": "true",
-        })
-        extras.append({"take_profit": tp})
+    # ── Ordens de proteção (SL + TP1 parcial + TP2) ─────────────────────
+    protection = await place_protection_orders(
+        sym, binance_side, qty_rounded,
+        stop_loss=stop_loss,
+        tp1=tp1,
+        tp2=take_profit,
+        tp1_qty_pct=tp1_qty_pct,
+        client_order_id_prefix=client_order_id,
+    )
 
-    return {"ok": True, "result": entry_res["result"], "extras": extras, "raw": entry_res["raw"]}
+    # Backward-compat: monta `extras` no mesmo shape antigo
+    extras = []
+    if stop_loss is not None:
+        extras.append({"stop_loss": {"ok": protection["sl_ok"], "order_id": protection["sl_order_id"], "msg": protection["sl_msg"]}})
+    if tp1 is not None:
+        extras.append({"tp1": {"ok": protection["tp1_ok"], "order_id": protection["tp1_order_id"], "qty": protection["tp1_qty"], "msg": protection["tp1_msg"], "skipped": protection["tp1_skipped"]}})
+    if take_profit is not None:
+        extras.append({"take_profit": {"ok": protection["tp2_ok"], "order_id": protection["tp2_order_id"], "msg": protection["tp2_msg"]}})
+
+    return {
+        "ok": True,
+        "result": entry_res["result"],
+        "extras": extras,
+        "raw": entry_res["raw"],
+        # Novos campos pro caller decidir o que fazer
+        "sl_ok": protection["sl_ok"],
+        "sl_order_id": protection["sl_order_id"],
+        "tp1_ok": protection["tp1_ok"],
+        "tp1_order_id": protection["tp1_order_id"],
+        "tp1_skipped": protection["tp1_skipped"],
+        "tp2_ok": protection["tp2_ok"],
+        "tp2_order_id": protection["tp2_order_id"],
+    }
 
 
 async def cancel_order(symbol: str, order_id: Optional[str] = None, client_order_id: Optional[str] = None) -> dict:
