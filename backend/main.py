@@ -798,6 +798,18 @@ async def learning_insights(days: int = 60):
         raise HTTPException(500, f"Erro ao obter insights: {e}")
 
 
+@app.get("/api/learning-auto-adjust")
+async def learning_auto_adjust(days: int = 90):
+    """Estado do auto-learning nível 2 — multiplicadores e blocks ativos por
+    bucket. Dormente por bucket até atingir LEARNING_MIN_SAMPLE_ADJUST."""
+    try:
+        from services.learning_service import compute_auto_adjustments
+        return await compute_auto_adjustments(days=max(30, min(days, 365)))
+    except Exception as e:
+        logging.error(f"learning-auto-adjust error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao obter auto-adjust: {e}")
+
+
 @app.get("/api/calibration")
 async def calibration():
     """

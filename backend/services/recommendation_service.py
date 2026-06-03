@@ -909,10 +909,46 @@ async def get_recommendations_from_batch(
     except Exception:
         cooldown_symbols = set()
 
+    # Auto-learning (nível 2): multiplicadores + block list por bucket.
+    # Dormente por bucket — só desperta quando bucket atinge amostra mínima.
+    # Falha aberta se DB/learning indisponível.
+    auto_adj = {}
+    try:
+        from services.learning_service import compute_auto_adjustments
+        auto_adj = await compute_auto_adjustments(days=90)
+    except Exception as e:
+        import logging as _log
+        _log.warning(f"[learning] auto-adjust falhou (fail-open): {e}")
+
     for best in best_per_symbol:
         if best is None:
             continue
         sig, score = best
+        # Classifica tier provisório (pra lookup de bucket tier_tf antes do ajuste)
+        tier_prov = _classify_tier(sig, score)
+
+        # Aplica auto-learning: multiplica score, checa block list
+        if auto_adj.get("enabled"):
+            try:
+                from services.learning_service import apply_score_adjustment
+                adj_res = apply_score_adjustment(sig, score, auto_adj, tier_provisional=tier_prov)
+                if adj_res.get("blocked"):
+                    import logging as _log
+                    _log.info(f"[learning] BLOCK {sig.symbol}: {adj_res.get('block_reason')}")
+                    continue
+                if adj_res.get("multiplier", 1.0) != 1.0:
+                    import logging as _log
+                    score = adj_res["score"]
+                    _log.info(
+                        f"[learning] adjust {sig.symbol} {sig.timeframe}: "
+                        f"score×{adj_res['multiplier']:.2f} → {score:.1f} "
+                        f"({', '.join(adj_res.get('matched_buckets') or [])})"
+                    )
+            except Exception as e:
+                import logging as _log
+                _log.warning(f"[learning] apply_score_adjustment falhou (fail-open): {e}")
+
+        # Re-classifica com score ajustado (pode subir/descer tier)
         tier = _classify_tier(sig, score)
         if tier is None:
             continue
@@ -1108,10 +1144,38 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
     except Exception:
         cooldown_symbols = set()
 
+    # Auto-learning (igual ao caminho batch)
+    auto_adj = {}
+    try:
+        from services.learning_service import compute_auto_adjustments
+        auto_adj = await compute_auto_adjustments(days=90)
+    except Exception as e:
+        _log.warning(f"[learning] auto-adjust falhou (fail-open): {e}")
+
     for _symbol, best in all_results:
         if best is None:
             continue
         sig, score = best
+        tier_prov = _classify_tier_vision(sig, score)
+
+        # Auto-learning: bloqueia bucket catastrófico + ajusta score
+        if auto_adj.get("enabled"):
+            try:
+                from services.learning_service import apply_score_adjustment
+                adj_res = apply_score_adjustment(sig, score, auto_adj, tier_provisional=tier_prov)
+                if adj_res.get("blocked"):
+                    _log.info(f"[server-scan][learning] BLOCK {sig.symbol}: {adj_res.get('block_reason')}")
+                    continue
+                if adj_res.get("multiplier", 1.0) != 1.0:
+                    score = adj_res["score"]
+                    _log.info(
+                        f"[server-scan][learning] adjust {sig.symbol} {sig.timeframe}: "
+                        f"×{adj_res['multiplier']:.2f} → {score:.1f} "
+                        f"({', '.join(adj_res.get('matched_buckets') or [])})"
+                    )
+            except Exception as e:
+                _log.warning(f"[learning] apply falhou (fail-open): {e}")
+
         tier = _classify_tier_vision(sig, score)
         if tier is None:
             continue

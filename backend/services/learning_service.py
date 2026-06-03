@@ -338,25 +338,266 @@ async def lookup_historical_batch(
     return result
 
 
-# ── NÍVEL 2 (preparado, não ativo) ──────────────────────────────────────
-async def compute_score_adjustments() -> Dict[str, float]:
-    """
-    Multiplicadores por bucket (tier_tf) que poderiam ser aplicados ao score
-    composto antes da classificação. Só usa buckets com sample >= 50.
+# ── NÍVEL 2: AUTO-ADJUST + AUTO-BLOCK ───────────────────────────────────
+# Dormente por bucket: só aplica quando o bucket atinge amostra mínima.
+# Buckets independentes — pattern X pode despertar antes de pattern Y.
+# Multi-categoria: combina multiplicadores de tier_tf × pattern × session × dow × funding.
 
-    Não está sendo chamado em produção ainda — ativar quando dados forem
-    suficientes pra evitar over-fitting em ruído.
-    """
-    stats = await compute_stats_by_bucket(days=90)
-    if not stats.get("enabled") or stats.get("total_trades", 0) < 50:
-        return {}
+import os as _os
 
-    adjustments = {}
-    for bucket_key, stat in stats.get("by_tier_timeframe", {}).items():
-        if stat["trades"] < 50:
+AUTO_ADJUST_ENABLED = _os.getenv("LEARNING_AUTO_ADJUST", "true").strip().lower() in ("1", "true", "yes")
+AUTO_BLOCK_ENABLED = _os.getenv("LEARNING_AUTO_BLOCK", "true").strip().lower() in ("1", "true", "yes")
+MIN_SAMPLE_ADJUST = int(_os.getenv("LEARNING_MIN_SAMPLE_ADJUST", "20"))
+MIN_SAMPLE_BLOCK = int(_os.getenv("LEARNING_MIN_SAMPLE_BLOCK", "30"))
+BLOCK_WR_MAX = float(_os.getenv("LEARNING_BLOCK_WR_MAX", "30"))     # bloqueia bucket com wr ≤ 30%
+BOOST_WR_MIN = float(_os.getenv("LEARNING_BOOST_WR_MIN", "65"))     # boost só se wr ≥ 65%
+ADJUST_CAP = float(_os.getenv("LEARNING_ADJUST_CAP", "0.25"))       # ±25% no score
+
+# Categorias e como derivar a chave do bucket a partir do sig
+_BUCKET_CATEGORIES = ("tier_tf", "pattern", "session", "dow", "funding")
+
+
+async def compute_auto_adjustments(days: int = 90) -> Dict[str, Any]:
+    """
+    Calcula multiplicadores de score (por bucket) + lista de buckets bloqueados.
+    Cada categoria é independente e dormente: só ativa quando bucket atinge
+    amostra mínima. Resultado cacheado via compute_stats_by_bucket (5 min).
+
+    Shape:
+      {
+        "enabled": bool,
+        "score_multipliers": {
+            "tier_tf": {"A_4h": 1.12, ...},
+            "pattern": {"engulfing_bull": 1.18, ...},
+            "session": {"NY": 0.92, ...},
+            "dow": {"Qua": 0.88, ...},
+            "funding": {"contango_alto": 1.05, ...},
+        },
+        "blocked_buckets": [
+            {"category":"pattern", "key":"hammer_bear", "wr":22, "n":34},
+        ],
+        "active_buckets": int,
+        "dormant_buckets": int,
+        "thresholds": {...},
+        "total_trades": int,
+      }
+
+    Não-destrutivo: se uma rec NÃO bate em nenhum bucket despertado, score
+    fica inalterado (multiplicador = 1.0).
+    """
+    if not AUTO_ADJUST_ENABLED and not AUTO_BLOCK_ENABLED:
+        return {"enabled": False, "reason": "ambos LEARNING_AUTO_* desativados"}
+
+    stats = await compute_stats_by_bucket(days=days)
+    if not stats.get("enabled"):
+        return {"enabled": False, "reason": "stats indisponíveis"}
+
+    total_trades = stats.get("total_trades", 0)
+
+    multipliers: Dict[str, Dict[str, float]] = {c: {} for c in _BUCKET_CATEGORIES}
+    blocked: List[Dict[str, Any]] = []
+    active = 0
+    dormant = 0
+
+    # Mapa categoria → bucket no stats
+    category_to_field = {
+        "tier_tf": "by_tier_timeframe",
+        "pattern": "by_pattern",
+        "session": "by_session",
+        "dow": "by_day_of_week",
+        "funding": "by_funding",
+    }
+
+    for category, field in category_to_field.items():
+        for key, stat in stats.get(field, {}).items():
+            n = stat["trades"]
+            wr = stat["win_rate"]
+
+            # Auto-block tem prioridade — bucket catastrófico nunca contribui pro multiplicador
+            if AUTO_BLOCK_ENABLED and n >= MIN_SAMPLE_BLOCK and wr <= BLOCK_WR_MAX:
+                blocked.append({
+                    "category": category, "key": key, "wr": wr, "n": n,
+                    "reason": f"win_rate {wr}% ≤ {BLOCK_WR_MAX}% em {n} amostras",
+                })
+                active += 1
+                continue
+
+            # Boost só vale quando bucket é claramente vencedor
+            if AUTO_ADJUST_ENABLED and n >= MIN_SAMPLE_ADJUST and wr >= BOOST_WR_MIN:
+                # Mapeia wr [BOOST_WR_MIN..100] → multiplier [1.0..1+CAP]
+                excess = (wr - BOOST_WR_MIN) / (100.0 - BOOST_WR_MIN)
+                mult = 1.0 + ADJUST_CAP * max(0.0, min(1.0, excess))
+                multipliers[category][key] = round(mult, 3)
+                active += 1
+                continue
+
+            # Penalidade leve pra buckets ruins (>= MIN_SAMPLE_ADJUST mas < blocking)
+            # win_rate entre BLOCK_WR_MAX e 50% → multiplier 1-CAP até 1.0
+            if AUTO_ADJUST_ENABLED and n >= MIN_SAMPLE_ADJUST and wr < 50.0:
+                deficit = (50.0 - wr) / (50.0 - BLOCK_WR_MAX)
+                mult = 1.0 - ADJUST_CAP * max(0.0, min(1.0, deficit))
+                multipliers[category][key] = round(mult, 3)
+                active += 1
+                continue
+
+            # Bucket existe mas sem amostra → dormente
+            if n > 0:
+                dormant += 1
+
+    return {
+        "enabled": True,
+        "score_multipliers": multipliers,
+        "blocked_buckets": blocked,
+        "active_buckets": active,
+        "dormant_buckets": dormant,
+        "total_trades": total_trades,
+        "thresholds": {
+            "min_sample_adjust": MIN_SAMPLE_ADJUST,
+            "min_sample_block": MIN_SAMPLE_BLOCK,
+            "block_wr_max": BLOCK_WR_MAX,
+            "boost_wr_min": BOOST_WR_MIN,
+            "adjust_cap_pct": int(ADJUST_CAP * 100),
+        },
+        "feature_flags": {
+            "auto_adjust": AUTO_ADJUST_ENABLED,
+            "auto_block": AUTO_BLOCK_ENABLED,
+        },
+    }
+
+
+def _sig_to_bucket_keys(sig: Any) -> Dict[str, Any]:
+    """Mapeia um TradeSignal pros keys de bucket. Robusto a campos faltando."""
+    keys: Dict[str, Any] = {}
+    try:
+        # timeframe
+        tf = getattr(sig, "timeframe", None)
+
+        # Sessão/dow a partir do timestamp (int ms ou s)
+        ts = getattr(sig, "timestamp", None)
+        if ts is not None:
+            try:
+                ts_int = int(ts)
+                if ts_int > 1e12:  # ms
+                    ts_int = ts_int // 1000
+                from datetime import datetime as _dt, timezone as _tz
+                dt = _dt.fromtimestamp(ts_int, tz=_tz.utc)
+                keys["session"] = _hour_bucket(dt.hour)
+                keys["dow"] = _dow_name(dt.weekday())
+            except Exception:
+                pass
+
+        # Padrões — extrai .type.value de cada DetectedPattern
+        patterns = getattr(sig, "patterns", None)
+        if patterns and isinstance(patterns, list):
+            pat_names: List[str] = []
+            for p in patterns:
+                t = getattr(p, "type", None)
+                if t is None and isinstance(p, dict):
+                    t = p.get("type")
+                if t is not None:
+                    name = t.value if hasattr(t, "value") else str(t)
+                    pat_names.append(name)
+            if pat_names:
+                keys["__patterns_list"] = pat_names
+
+        # Funding sentiment (derivatives pode ser dict ou obj)
+        deriv = getattr(sig, "derivatives", None)
+        if deriv:
+            fs = None
+            if isinstance(deriv, dict):
+                fs = deriv.get("funding_sentiment")
+            else:
+                fs = getattr(deriv, "funding_sentiment", None)
+            if fs:
+                keys["funding"] = fs
+
+        # tier_tf é setado externamente via tier_provisional
+        if tf:
+            keys["__tf"] = tf
+    except Exception:
+        pass
+    return keys
+
+
+def apply_score_adjustment(
+    sig: Any, base_score: float, adjustments: Dict[str, Any], tier_provisional: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Aplica multiplicadores de bucket ao score. Combina por produto, capeia.
+    Retorna {score, multiplier, matched_buckets, blocked, block_reason}.
+
+    Se algum bucket está na block list → blocked=True.
+    """
+    if not adjustments or not adjustments.get("enabled"):
+        return {"score": base_score, "multiplier": 1.0, "matched_buckets": [], "blocked": False, "block_reason": None}
+
+    # Constrói chaves do sig
+    sig_keys = _sig_to_bucket_keys(sig)
+    tf = sig_keys.get("__tf") or getattr(sig, "timeframe", None)
+    if tier_provisional and tf:
+        sig_keys["tier_tf"] = f"{tier_provisional}_{tf}"
+
+    # 1) Block check
+    blocked_buckets = adjustments.get("blocked_buckets", [])
+    for b in blocked_buckets:
+        cat = b["category"]
+        key = b["key"]
+        if cat == "pattern":
+            pats = sig_keys.get("__patterns_list") or []
+            if key in pats:
+                return {
+                    "score": 0.0, "multiplier": 0.0, "matched_buckets": [],
+                    "blocked": True,
+                    "block_reason": f"bucket {cat}={key} bloqueado ({b['reason']})",
+                }
+        else:
+            if sig_keys.get(cat) == key:
+                return {
+                    "score": 0.0, "multiplier": 0.0, "matched_buckets": [],
+                    "blocked": True,
+                    "block_reason": f"bucket {cat}={key} bloqueado ({b['reason']})",
+                }
+
+    # 2) Apply multipliers — produto combinado, capeado em [1-CAP, 1+CAP] no agregado
+    multipliers = adjustments.get("score_multipliers", {})
+    combined = 1.0
+    matched: List[str] = []
+
+    for cat in _BUCKET_CATEGORIES:
+        cat_mults = multipliers.get(cat, {})
+        if not cat_mults:
             continue
-        # Ajuste: relação win_rate / baseline. >1 = upweight, <1 = downweight.
-        adj = (stat["win_rate"] / 100) / BASELINE_WIN_RATE
-        adj = max(0.7, min(1.3, adj))  # cap em ±30%
-        adjustments[bucket_key] = round(adj, 3)
-    return adjustments
+        if cat == "pattern":
+            for pat in (sig_keys.get("__patterns_list") or []):
+                m = cat_mults.get(pat)
+                if m is not None:
+                    combined *= m
+                    matched.append(f"pattern={pat}({m:.2f})")
+        else:
+            key = sig_keys.get(cat)
+            if key and key in cat_mults:
+                m = cat_mults[key]
+                combined *= m
+                matched.append(f"{cat}={key}({m:.2f})")
+
+    # Cap agregado pra evitar drift extremo quando vários buckets se acumulam
+    combined = max(1.0 - ADJUST_CAP, min(1.0 + ADJUST_CAP, combined))
+
+    adjusted = base_score * combined
+    return {
+        "score": round(adjusted, 2),
+        "multiplier": round(combined, 3),
+        "matched_buckets": matched,
+        "blocked": False,
+        "block_reason": None,
+    }
+
+
+# ── Backward-compat: stub antigo ────────────────────────────────────────
+async def compute_score_adjustments() -> Dict[str, float]:
+    """Mantido pra compatibilidade — agora delega pra compute_auto_adjustments
+    e retorna só o bucket tier_tf como dict plano."""
+    data = await compute_auto_adjustments(days=90)
+    if not data.get("enabled"):
+        return {}
+    return data.get("score_multipliers", {}).get("tier_tf", {})
