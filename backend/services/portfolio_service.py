@@ -39,12 +39,22 @@ from models.recommendation_snapshot import RecommendationSnapshot
 log = logging.getLogger(__name__)
 
 # ── Limites (Fase 1.3) ────────────────────────────────────────────────────
-MAX_OPEN_POSITIONS = 3
-MAX_PER_CATEGORY = 2          # por categoria + direção
-MAX_AGGREGATE_RISK_PCT = 5.0  # soma de risk_pct das posições abertas
+import os as _os
+
+MAX_OPEN_POSITIONS = int(_os.getenv("PORTFOLIO_MAX_OPEN_POSITIONS", "5"))
+MAX_PER_CATEGORY = int(_os.getenv("PORTFOLIO_MAX_PER_CATEGORY", "2"))         # por categoria + direção
+MAX_AGGREGATE_RISK_PCT = float(_os.getenv("PORTFOLIO_MAX_AGG_RISK_PCT", "5.0"))  # soma de risk_pct
 
 # Janela max pra considerar snapshot "aberto" (segurança contra órfãos)
-OPEN_WINDOW_HOURS = 48
+OPEN_WINDOW_HOURS = int(_os.getenv("PORTFOLIO_OPEN_WINDOW_HOURS", "48"))
+
+# Modo de contagem do portfolio:
+#   "real_only" (default) → conta só posições com RealTrade source="auto" ativa
+#                          (= ordens realmente abertas na exchange).
+#                          Snapshots-tracker que não viraram trade NÃO contam.
+#   "snapshots"           → comportamento antigo: conta todo snapshot status='open'
+#                          (inflavel; engole o cap com recs só sendo monitoradas).
+PORTFOLIO_COUNT_MODE = _os.getenv("PORTFOLIO_COUNT_MODE", "real_only").strip().lower()
 
 
 # ── Mapeamento símbolo → categoria ───────────────────────────────────────
@@ -77,15 +87,49 @@ def categorize(symbol: str) -> str:
     return "other"
 
 
-# ── Leitura de posições abertas (proxy: snapshots open) ──────────────────
+# ── Leitura de posições abertas ─────────────────────────────────────────
 async def get_open_positions() -> list[dict]:
     """
-    Retorna snapshots com status='open' das últimas OPEN_WINDOW_HOURS horas.
-    Cada item: {symbol, direction, risk_pct, category, opened_at, snapshot_id}
+    Em modo "real_only" (default): conta RealTrade com source="auto" e
+    status="open" — ou seja, posições REAIS na exchange. Snapshots
+    sendo só rastreados pelo tracker NÃO contam (tracker monitora todas
+    as recs; só virou trade quando foi auto-executada).
+
+    Em modo "snapshots" (legado): conta snapshots com status="open".
+    Útil pra simulação conservadora — bloqueia mesmo se nada virou trade.
     """
     if not DB_ENABLED:
         return []
     since = datetime.now(timezone.utc) - timedelta(hours=OPEN_WINDOW_HOURS)
+
+    if PORTFOLIO_COUNT_MODE == "real_only":
+        try:
+            from models.real_trade import RealTrade  # type: ignore
+            async with get_session() as session:
+                stmt = (
+                    select(RealTrade)
+                    .where(RealTrade.status == "open")
+                    .where(RealTrade.source == "auto")
+                    .where(RealTrade.opened_at >= since)
+                )
+                rows = (await session.execute(stmt)).scalars().all()
+                return [
+                    {
+                        "snapshot_id": getattr(r, "recommendation_id", None),
+                        "symbol": r.symbol,
+                        "direction": r.side if r.side in ("long", "short") else ("long" if r.side == "Buy" else "short"),
+                        "risk_pct": 1.0,  # estimativa default — RealTrade não armazena risk_pct
+                        "category": categorize(r.symbol),
+                        "opened_at": r.opened_at.isoformat() if getattr(r, "opened_at", None) else None,
+                        "tier": None,
+                        "source": r.source,
+                    }
+                    for r in rows
+                ]
+        except Exception as e:
+            log.warning(f"[portfolio] real_only count falhou (fallback snapshots): {e}")
+
+    # Modo legado / fallback
     async with get_session() as session:
         stmt = (
             select(RecommendationSnapshot)
