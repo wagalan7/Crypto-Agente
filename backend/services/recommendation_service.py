@@ -744,8 +744,21 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
     )
 
 
-async def _analyze_candles_for_tf(symbol: str, tf: str, df) -> Optional[TradeSignal]:
-    """Variante de _analyze_symbol_tf que recebe candles já baixados (frontend)."""
+async def _analyze_candles_for_tf(
+    symbol: str,
+    tf: str,
+    df,
+    *,
+    derivatives_cached=None,  # já resolvido por símbolo (compartilhado entre TFs)
+    derivatives_done: bool = False,
+    change_24h_cached: Optional[float] = None,
+) -> Optional[TradeSignal]:
+    """Variante de _analyze_symbol_tf que recebe candles já baixados (frontend).
+
+    Ticker e derivatives são por SÍMBOLO (não dependem do TF), então o caller
+    resolve uma vez e passa pré-computado — economiza ~67% das chamadas externas
+    quando processa 3 TFs do mesmo símbolo.
+    """
     try:
         if df is None or df.empty or len(df) < 80:
             return None
@@ -754,31 +767,28 @@ async def _analyze_candles_for_tf(symbol: str, tf: str, df) -> Optional[TradeSig
         current = float(df["close"].iloc[-1])
         primary_dir = determine_direction(ind, patterns, current)
 
-        # Derivativos + MTF: backend ainda chama OKX pra esses dois (rate-limit-friendly).
-        # Se falhar (símbolo só existe na Bybit), seguimos sem.
+        # Resolve ticker/derivatives só se o caller não passou (fallback)
+        if not derivatives_done:
+            try:
+                from services.binance_service import fetch_ticker
+                ticker = await fetch_ticker(symbol)
+                change_24h_cached = ticker.get("change", 0.0)
+            except Exception:
+                change_24h_cached = 0.0
+            try:
+                derivatives_cached = await analyze_derivatives(symbol, change_24h_cached or 0.0)
+            except Exception:
+                derivatives_cached = None
+
+        # MTF depende do TF — sempre por-TF
         try:
-            from services.binance_service import fetch_ticker
-            ticker = await fetch_ticker(symbol)
-            change_24h = ticker.get("change", 0.0)
+            mtf = await analyze_mtf(symbol, tf, primary_dir)
         except Exception:
-            change_24h = 0.0
-        try:
-            derivatives, mtf = await asyncio.gather(
-                analyze_derivatives(symbol, change_24h),
-                analyze_mtf(symbol, tf, primary_dir),
-                return_exceptions=True,
-            )
-            if isinstance(derivatives, Exception):
-                derivatives = None
-            if isinstance(mtf, Exception):
-                mtf = None
-        except Exception:
-            derivatives = None
             mtf = None
 
         return build_trade_signal(
             symbol, tf, df, ind, patterns,
-            derivatives=derivatives, mtf=mtf, with_backtest=False,
+            derivatives=derivatives_cached, mtf=mtf, with_backtest=False,
         )
     except Exception:
         return None
@@ -815,13 +825,33 @@ async def get_recommendations_from_batch(
     if not per_symbol:
         return []
 
-    # Limita concorrência por símbolo (3 TFs em paralelo, 6 símbolos em paralelo)
-    sem_sym = asyncio.Semaphore(6)
+    # Limita concorrência por símbolo (3 TFs em paralelo, 12 símbolos em paralelo)
+    sem_sym = asyncio.Semaphore(12)
 
     async def _process_symbol(symbol: str, tfs: List[tuple]) -> Optional[tuple]:
         async with sem_sym:
+            # Ticker + derivatives são por-símbolo — resolve 1x e compartilha
+            # entre todos os TFs do mesmo símbolo (corta ~67% das chamadas
+            # externas pesadas quando o batch tem 3 TFs/símbolo).
+            try:
+                from services.binance_service import fetch_ticker
+                ticker = await fetch_ticker(symbol)
+                change_24h = ticker.get("change", 0.0)
+            except Exception:
+                change_24h = 0.0
+            try:
+                derivatives_cached = await analyze_derivatives(symbol, change_24h)
+            except Exception:
+                derivatives_cached = None
+
             results = await asyncio.gather(*[
-                _analyze_candles_for_tf(symbol, tf, df) for tf, df in tfs
+                _analyze_candles_for_tf(
+                    symbol, tf, df,
+                    derivatives_cached=derivatives_cached,
+                    derivatives_done=True,
+                    change_24h_cached=change_24h,
+                )
+                for tf, df in tfs
             ])
             scored = []
             for sig in results:
