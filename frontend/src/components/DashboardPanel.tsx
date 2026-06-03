@@ -211,24 +211,26 @@ export default function DashboardPanel({ onClose }: Props) {
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-2 md:p-6">
       <div className="bg-[#0a0e1a] border border-slate-700/50 rounded-xl shadow-2xl w-full max-w-6xl max-h-[95vh] flex flex-col overflow-hidden">
-        {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 flex-shrink-0">
-          <div className="flex items-center gap-2">
-            <BarChart3 className="w-5 h-5 text-cyan-400" />
-            <h2 className="text-base font-bold bg-gradient-to-r from-cyan-300 to-emerald-300 bg-clip-text text-transparent">
-              Dashboard de Performance
+        {/* Header — responsivo: título + badge à esquerda (encolhe/trunca em mobile),
+            controles à direita NUNCA somem (shrink-0 + ordem garantida pro X). */}
+        <div className="flex items-center gap-2 px-3 md:px-4 py-2.5 md:py-3 border-b border-slate-800 flex-shrink-0">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <BarChart3 className="w-5 h-5 text-cyan-400 flex-shrink-0" />
+            <h2 className="text-sm md:text-base font-bold bg-gradient-to-r from-cyan-300 to-emerald-300 bg-clip-text text-transparent truncate">
+              <span className="hidden sm:inline">Dashboard de Performance</span>
+              <span className="sm:hidden">Dashboard</span>
             </h2>
-            <span className="px-1.5 py-0.5 text-[10px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30 rounded">
+            <span className="hidden sm:inline px-1.5 py-0.5 text-[10px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30 rounded flex-shrink-0">
               PAPER
             </span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 md:gap-2 flex-shrink-0">
             <div className="flex bg-slate-800/60 rounded-md overflow-hidden border border-slate-700/50">
               {PERIODS.map(p => (
                 <button
                   key={p.value}
                   onClick={() => setPeriod(p.value)}
-                  className={`px-2.5 py-1 text-xs font-bold transition-colors ${
+                  className={`px-2 md:px-2.5 py-1 text-xs font-bold transition-colors ${
                     period === p.value
                       ? 'bg-cyan-500/20 text-cyan-300'
                       : 'text-slate-400 hover:text-slate-200'
@@ -241,16 +243,17 @@ export default function DashboardPanel({ onClose }: Props) {
             <button
               onClick={load}
               disabled={loading}
-              className="p-1.5 hover:bg-slate-800 rounded text-slate-400 hover:text-slate-200 transition-colors disabled:opacity-40"
+              className="p-1.5 hover:bg-slate-800 rounded text-slate-400 hover:text-slate-200 transition-colors disabled:opacity-40 flex-shrink-0"
               title="Atualizar"
             >
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
             </button>
             <button
               onClick={onClose}
-              className="p-1.5 hover:bg-slate-800 rounded text-slate-400 hover:text-slate-200 transition-colors"
+              aria-label="Fechar"
+              className="p-2 hover:bg-slate-800 rounded text-slate-400 hover:text-slate-200 transition-colors flex-shrink-0"
             >
-              <X className="w-4 h-4" />
+              <X className="w-5 h-5 md:w-4 md:h-4" />
             </button>
           </div>
         </div>
