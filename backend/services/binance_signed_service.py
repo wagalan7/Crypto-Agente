@@ -313,29 +313,17 @@ async def place_protection_orders(
         "tp1_skipped": False,
     }
 
-    # ── SL ───────────────────────────────────────────────────────────────
-    if stop_loss is not None:
-        sl_price = await _round_price(sym, float(stop_loss))
-        sl_params = {
-            "symbol": sym, "side": counter_side, "type": "STOP_MARKET",
-            "stopPrice": sl_price, "closePosition": "true",
-        }
-        if client_order_id_prefix:
-            sl_params["newClientOrderId"] = f"{client_order_id_prefix}-sl"
-        sl = await _signed_request("POST", "/fapi/v1/order", sl_params)
-        if sl.get("ok"):
-            out["sl_order_id"] = str((sl.get("result") or {}).get("orderId") or "")
-            log.info(f"[binance] SL ok {sym} @ {sl_price} id={out['sl_order_id']}")
-        else:
-            out["sl_ok"] = False
-            out["sl_msg"] = sl.get("msg") or sl.get("error")
-            log.error(f"[binance] SL FALHOU {sym} @ {sl_price} side={counter_side}: {out['sl_msg']}")
+    qty_total = await _round_qty(sym, float(qty))
+    if qty_total <= 0:
+        out["sl_ok"] = out["tp1_ok"] = out["tp2_ok"] = False
+        out["sl_msg"] = out["tp1_msg"] = out["tp2_msg"] = f"qty inválido após round: {qty}"
+        return out
 
-    # ── TP1 (parcial 45% reduceOnly) ─────────────────────────────────────
-    # Só faz parcial se TP1 e TP2 ambos definidos e qty_parcial > 0 após arredondar.
+    # ── TP1 qty primeiro (precisamos pra calcular qty restante de SL/TP2) ─
     has_partial = tp1 is not None and tp2 is not None
+    tp1_qty = 0.0
     if has_partial:
-        tp1_qty_raw = float(qty) * float(tp1_qty_pct)
+        tp1_qty_raw = float(qty_total) * float(tp1_qty_pct)
         tp1_qty = await _round_qty(sym, tp1_qty_raw)
         if tp1_qty <= 0:
             out["tp1_skipped"] = True
@@ -343,43 +331,69 @@ async def place_protection_orders(
                 f"[binance] TP1 skip {sym}: qty*{tp1_qty_pct} ({tp1_qty_raw}) arredondou pra 0 "
                 f"→ manda 100% no TP2"
             )
-        else:
-            tp1_price = await _round_price(sym, float(tp1))
-            tp1_params = {
-                "symbol": sym, "side": counter_side, "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": tp1_price, "quantity": tp1_qty, "reduceOnly": "true",
-            }
-            if client_order_id_prefix:
-                tp1_params["newClientOrderId"] = f"{client_order_id_prefix}-tp1"
-            tp1_res = await _signed_request("POST", "/fapi/v1/order", tp1_params)
-            if tp1_res.get("ok"):
-                out["tp1_order_id"] = str((tp1_res.get("result") or {}).get("orderId") or "")
-                out["tp1_qty"] = tp1_qty
-                log.info(f"[binance] TP1 ok {sym} @ {tp1_price} qty={tp1_qty} id={out['tp1_order_id']}")
-            else:
-                out["tp1_ok"] = False
-                out["tp1_msg"] = tp1_res.get("msg") or tp1_res.get("error")
-                log.error(f"[binance] TP1 FALHOU {sym} @ {tp1_price} qty={tp1_qty}: {out['tp1_msg']}")
+            has_partial = False
 
-    # ── TP2 / TP único (closePosition=true) ──────────────────────────────
-    # Usa tp2 se fornecido; senão usa tp1 como TP único (caso só haja 1 alvo).
+    qty_remaining = qty_total - tp1_qty if has_partial else qty_total
+
+    # ── SL (reduceOnly + quantity=qty_total — em vez de closePosition) ────
+    # Demo Binance rejeita closePosition=true com erro "Algo Order API".
+    # reduceOnly + quantity explícito tem o mesmo efeito prático: só fecha
+    # o que existe da posição. Mesmo se TP1 já reduziu, SL com qty_total
+    # vira efetivamente qty_atual (Binance ignora o excedente em reduceOnly).
+    if stop_loss is not None:
+        sl_price = await _round_price(sym, float(stop_loss))
+        sl_params = {
+            "symbol": sym, "side": counter_side, "type": "STOP_MARKET",
+            "stopPrice": sl_price, "quantity": qty_total, "reduceOnly": "true",
+        }
+        if client_order_id_prefix:
+            sl_params["newClientOrderId"] = f"{client_order_id_prefix}-sl"
+        sl = await _signed_request("POST", "/fapi/v1/order", sl_params)
+        if sl.get("ok"):
+            out["sl_order_id"] = str((sl.get("result") or {}).get("orderId") or "")
+            log.info(f"[binance] SL ok {sym} @ {sl_price} qty={qty_total} id={out['sl_order_id']}")
+        else:
+            out["sl_ok"] = False
+            out["sl_msg"] = sl.get("msg") or sl.get("error")
+            log.error(f"[binance] SL FALHOU {sym} @ {sl_price} side={counter_side}: {out['sl_msg']}")
+
+    # ── TP1 parcial 45% ──────────────────────────────────────────────────
+    if has_partial:
+        tp1_price = await _round_price(sym, float(tp1))
+        tp1_params = {
+            "symbol": sym, "side": counter_side, "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": tp1_price, "quantity": tp1_qty, "reduceOnly": "true",
+        }
+        if client_order_id_prefix:
+            tp1_params["newClientOrderId"] = f"{client_order_id_prefix}-tp1"
+        tp1_res = await _signed_request("POST", "/fapi/v1/order", tp1_params)
+        if tp1_res.get("ok"):
+            out["tp1_order_id"] = str((tp1_res.get("result") or {}).get("orderId") or "")
+            out["tp1_qty"] = tp1_qty
+            log.info(f"[binance] TP1 ok {sym} @ {tp1_price} qty={tp1_qty} id={out['tp1_order_id']}")
+        else:
+            out["tp1_ok"] = False
+            out["tp1_msg"] = tp1_res.get("msg") or tp1_res.get("error")
+            log.error(f"[binance] TP1 FALHOU {sym} @ {tp1_price} qty={tp1_qty}: {out['tp1_msg']}")
+
+    # ── TP2 / TP único — qty = restante (ou total se sem parcial) ────────
     tp_final = tp2 if tp2 is not None else tp1
     if tp_final is not None:
         tp_price = await _round_price(sym, float(tp_final))
         tp_params = {
             "symbol": sym, "side": counter_side, "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": tp_price, "closePosition": "true",
+            "stopPrice": tp_price, "quantity": qty_remaining, "reduceOnly": "true",
         }
         if client_order_id_prefix:
             tp_params["newClientOrderId"] = f"{client_order_id_prefix}-tp2"
         tp_res = await _signed_request("POST", "/fapi/v1/order", tp_params)
         if tp_res.get("ok"):
             out["tp2_order_id"] = str((tp_res.get("result") or {}).get("orderId") or "")
-            log.info(f"[binance] TP2 ok {sym} @ {tp_price} id={out['tp2_order_id']}")
+            log.info(f"[binance] TP2 ok {sym} @ {tp_price} qty={qty_remaining} id={out['tp2_order_id']}")
         else:
             out["tp2_ok"] = False
             out["tp2_msg"] = tp_res.get("msg") or tp_res.get("error")
-            log.error(f"[binance] TP2 FALHOU {sym} @ {tp_price}: {out['tp2_msg']}")
+            log.error(f"[binance] TP2 FALHOU {sym} @ {tp_price} qty={qty_remaining}: {out['tp2_msg']}")
 
     return out
 
