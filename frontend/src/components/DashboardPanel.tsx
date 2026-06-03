@@ -662,30 +662,42 @@ function TradeHistory({ trades, liveEquity }: {
   // Filtrar só auto/shadow (ignorar manual)
   const filtered = trades.filter(t => t.source === 'auto' || t.source === 'shadow')
 
-  // Computar saldo cumulativo. Se temos saldo ao vivo, derivamos o saldo inicial:
-  //   saldo_inicial = saldo_atual_live − Σ pnl_usd(fechados)
-  // Assim o "Saldo atual" da última linha bate com a banca real da exchange.
-  // Sem live equity (fallback), partimos de $5000.
+  // Computar saldo cumulativo:
+  // - Shadow trades NÃO afetam o saldo real (são simulações paralelas).
+  //   Mostramos before==after pra deixar claro que não houve impacto.
+  // - Auto trades fechados afetam o saldo pelo pnl_usd real.
+  // - Saldo inicial é derivado: saldo_atual_live − Σ pnl_usd(auto fechados)
+  //   Assim a última linha sempre bate com a banca real da exchange.
   const sortedAsc = [...filtered].sort((a, b) => {
     const ta = a.opened_at ? new Date(a.opened_at).getTime() : 0
     const tb = b.opened_at ? new Date(b.opened_at).getTime() : 0
     return ta - tb
   })
-  const totalClosedPnl = sortedAsc
-    .filter(t => t.status !== 'open')
+  // Só auto FECHADO conta pro saldo real
+  const totalRealClosedPnl = sortedAsc
+    .filter(t => t.source === 'auto' && t.status !== 'open')
     .reduce((acc, t) => acc + (t.pnl_usd ?? 0), 0)
   const initialBalance = liveEquity
-    ? liveEquity.total - totalClosedPnl
+    ? liveEquity.total - totalRealClosedPnl
     : FALLBACK_INITIAL_BALANCE_USD
+
+  // Saldo simulado paralelo: igual ao real, mas conta shadows também.
+  // Útil pra ver "quanto teria sido" se tudo fosse executado.
+  const totalSimClosedPnl = sortedAsc
+    .filter(t => t.status !== 'open')
+    .reduce((acc, t) => acc + (t.pnl_usd ?? 0), 0)
+  const simulatedBalance = initialBalance + totalSimClosedPnl
 
   const balanceMap = new Map<number, { before: number; after: number }>()
   let running = initialBalance
   for (const t of sortedAsc) {
     const before = running
     const pnl = t.pnl_usd ?? 0
-    const after = t.status === 'open' ? running : running + pnl
+    // Shadow: balance não muda. Auto fechado: aplica pnl. Auto aberto: balance não muda ainda.
+    const impactsBalance = t.source === 'auto' && t.status !== 'open'
+    const after = impactsBalance ? running + pnl : running
     balanceMap.set(t.id, { before, after })
-    if (t.status !== 'open') running = after
+    if (impactsBalance) running = after
   }
 
   // Exibir DESC (mais recente primeiro)
@@ -704,8 +716,11 @@ function TradeHistory({ trades, liveEquity }: {
         <span className="text-[10px] text-slate-500">
           {rows.length} trade{rows.length === 1 ? '' : 's'} · {liveEquity ? (
             <>
-              saldo atual <span className="text-cyan-300 font-semibold">${liveEquity.total.toFixed(2)}</span>
-              {' '}({liveEquity.exchange} live) · disp. ${liveEquity.available.toFixed(2)}
+              real <span className="text-cyan-300 font-semibold">${liveEquity.total.toFixed(2)}</span>
+              {' '}({liveEquity.exchange} live)
+              {totalSimClosedPnl !== totalRealClosedPnl && (
+                <> · simulado <span className="text-violet-300 font-semibold">${simulatedBalance.toFixed(2)}</span></>
+              )}
             </>
           ) : (
             <>saldo inicial ${FALLBACK_INITIAL_BALANCE_USD.toLocaleString('pt-BR')} <span className="text-amber-400">(fallback — equity API offline)</span></>
@@ -785,7 +800,7 @@ function TradeHistory({ trades, liveEquity }: {
       </div>
       <div className="mt-2 text-[9px] text-slate-600">
         {liveEquity
-          ? `Saldo lido ao vivo da ${liveEquity.exchange} (cache 60s). Saldo inicial derivado: $${initialBalance.toFixed(2)}. Trades abertos mostram saldo anterior idêntico ao posterior.`
+          ? `Saldo real lido ao vivo da ${liveEquity.exchange} (cache 60s). Inicial derivado: $${initialBalance.toFixed(2)}. Apenas trades source=auto fechados movem o saldo — shadows são simulações paralelas (before==after). "Simulado" no header soma shadow+auto pra ver o que teria sido se tudo executasse.`
           : `Equity API offline — usando fallback $${FALLBACK_INITIAL_BALANCE_USD.toLocaleString('pt-BR')}. Quando voltar, o saldo será derivado da banca real.`}
       </div>
     </div>
