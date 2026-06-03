@@ -125,6 +125,87 @@ def to_binance(symbol: str) -> str:
     return symbol.split(":")[0].replace("/", "")
 
 
+# ─── Precision (stepSize/tickSize) cache ──────────────────────────────────────
+# Binance Futures rejeita ordens com qty/preço fora do stepSize/tickSize do
+# símbolo (erro "Precision is over the maximum"). Buscamos exchangeInfo 1x
+# e cacheamos os filtros por símbolo — depois truncamos qty/SL/TP antes do
+# submit. ExchangeInfo é público; usa o mesmo BASE.
+
+_filters_cache: dict = {}  # sym → {"step": float, "tick": float, "min_qty": float}
+_filters_lock = None  # lazy: criado no primeiro uso pra herdar o loop ativo
+
+
+async def _load_exchange_info() -> dict:
+    """Pega /fapi/v1/exchangeInfo (público, sem assinar) e popula o cache."""
+    try:
+        r = await _get_client().get(f"{BASE}/fapi/v1/exchangeInfo")
+        data = r.json()
+        for s in (data.get("symbols") or []):
+            sym = s.get("symbol")
+            if not sym:
+                continue
+            step = 0.0
+            tick = 0.0
+            min_qty = 0.0
+            for f in (s.get("filters") or []):
+                if f.get("filterType") == "LOT_SIZE":
+                    step = float(f.get("stepSize") or 0)
+                    min_qty = float(f.get("minQty") or 0)
+                elif f.get("filterType") == "PRICE_FILTER":
+                    tick = float(f.get("tickSize") or 0)
+            _filters_cache[sym] = {"step": step, "tick": tick, "min_qty": min_qty}
+        log.info(f"[binance] exchangeInfo carregado: {len(_filters_cache)} símbolos")
+    except Exception as e:
+        log.warning(f"[binance] exchangeInfo falhou (segue sem precisão): {e}")
+    return _filters_cache
+
+
+async def _get_symbol_filters(sym: str) -> dict:
+    if sym in _filters_cache:
+        return _filters_cache[sym]
+    import asyncio as _aio
+    global _filters_lock
+    if _filters_lock is None:
+        _filters_lock = _aio.Lock()
+    async with _filters_lock:
+        if sym in _filters_cache:
+            return _filters_cache[sym]
+        if not _filters_cache:
+            await _load_exchange_info()
+    return _filters_cache.get(sym, {"step": 0.0, "tick": 0.0, "min_qty": 0.0})
+
+
+def _floor_to_step(value: float, step: float) -> float:
+    """Trunca (não arredonda) pro múltiplo de step mais próximo abaixo.
+    Ex: floor(61651.676, 1) = 61651; floor(0.123456, 0.001) = 0.123.
+    Usa string formatting pra evitar drift de float."""
+    if step <= 0:
+        return value
+    n = int(value / step)  # floor implícito (truncamento)
+    out = n * step
+    # Acerta casas decimais — quantas tem o step
+    # ex: step=0.001 → 3 casas; step=1 → 0 casas
+    s = f"{step:.10f}".rstrip("0").rstrip(".")
+    decimals = len(s.split(".")[1]) if "." in s else 0
+    return round(out, decimals)
+
+
+async def _round_qty(sym: str, qty: float) -> float:
+    f = await _get_symbol_filters(sym)
+    step = f.get("step", 0.0)
+    if step <= 0:
+        return qty
+    return _floor_to_step(qty, step)
+
+
+async def _round_price(sym: str, price: float) -> float:
+    f = await _get_symbol_filters(sym)
+    tick = f.get("tick", 0.0)
+    if tick <= 0:
+        return price
+    return _floor_to_step(price, tick)
+
+
 # ─── High-level endpoints (mesma interface do bybit_signed_service) ───────────
 
 
@@ -210,6 +291,16 @@ async def place_order(
     """
     sym = to_binance(symbol) if "/" in symbol else symbol
 
+    # Arredonda qty/SL/TP pro stepSize/tickSize do símbolo. Sem isso, Binance
+    # rejeita com "Precision is over the maximum defined for this asset"
+    # (ex: DOGE só aceita qty inteiro, qty=61651.676 → erro).
+    qty_rounded = await _round_qty(sym, float(qty))
+    if qty_rounded <= 0:
+        f = await _get_symbol_filters(sym)
+        return {"ok": False, "error": f"qty arredondado virou 0 (step={f.get('step')}, min={f.get('min_qty')}, raw={qty})"}
+    if qty_rounded != qty:
+        log.info(f"[binance] qty arredondado {sym}: {qty} → {qty_rounded}")
+
     if leverage is not None:
         await set_leverage(sym, leverage)
 
@@ -220,12 +311,12 @@ async def place_order(
         "symbol": sym,
         "side": binance_side,
         "type": binance_type,
-        "quantity": qty,
+        "quantity": qty_rounded,
     }
     if binance_type == "LIMIT":
         if price is None:
             return {"ok": False, "error": "LIMIT exige price"}
-        params["price"] = price
+        params["price"] = await _round_price(sym, float(price))
         params["timeInForce"] = "GTC"
     if reduce_only:
         params["reduceOnly"] = "true"
@@ -240,15 +331,17 @@ async def place_order(
     extras = []
     counter_side = "SELL" if binance_side == "BUY" else "BUY"
     if stop_loss is not None:
+        sl_price = await _round_price(sym, float(stop_loss))
         sl = await _signed_request("POST", "/fapi/v1/order", {
             "symbol": sym, "side": counter_side, "type": "STOP_MARKET",
-            "stopPrice": stop_loss, "closePosition": "true",
+            "stopPrice": sl_price, "closePosition": "true",
         })
         extras.append({"stop_loss": sl})
     if take_profit is not None:
+        tp_price = await _round_price(sym, float(take_profit))
         tp = await _signed_request("POST", "/fapi/v1/order", {
             "symbol": sym, "side": counter_side, "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": take_profit, "closePosition": "true",
+            "stopPrice": tp_price, "closePosition": "true",
         })
         extras.append({"take_profit": tp})
 
