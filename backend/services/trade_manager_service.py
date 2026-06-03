@@ -301,14 +301,22 @@ async def backfill_protection() -> dict:
         results.append({
             "trade_id": t.id,
             "symbol": t.symbol,
+            "side": t.side,
             "qty": qty_now,
+            "planned_stop": t.planned_stop,
+            "planned_tp1": t.planned_tp1,
+            "planned_tp2": t.planned_tp2,
             "sl_ok": prot.get("sl_ok"),
             "sl_order_id": prot.get("sl_order_id"),
+            "sl_msg": prot.get("sl_msg"),
             "tp1_ok": prot.get("tp1_ok"),
             "tp1_order_id": prot.get("tp1_order_id"),
+            "tp1_msg": prot.get("tp1_msg"),
             "tp1_skipped": prot.get("tp1_skipped"),
+            "tp1_qty": prot.get("tp1_qty"),
             "tp2_ok": prot.get("tp2_ok"),
             "tp2_order_id": prot.get("tp2_order_id"),
+            "tp2_msg": prot.get("tp2_msg"),
         })
         log.info(
             f"[trade-manager] backfill #{t.id} {t.symbol}: "
