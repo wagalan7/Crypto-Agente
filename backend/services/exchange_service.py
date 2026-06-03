@@ -43,6 +43,13 @@ get_wallet_balance = _client.get_wallet_balance
 get_positions = _client.get_positions
 place_order = _client.place_order
 cancel_order = _client.cancel_order
+# cancel_algo_order só existe no cliente Binance (algo orders são feature deles).
+# Se o cliente ativo for outro, expõe um stub que retorna erro.
+if hasattr(_client, "cancel_algo_order"):
+    cancel_algo_order = _client.cancel_algo_order
+else:
+    async def cancel_algo_order(algo_id: str) -> dict:  # type: ignore
+        return {"ok": False, "error": f"cancel_algo_order não suportado em {ACTIVE_EXCHANGE}"}
 set_leverage = _client.set_leverage
 get_order_history = _client.get_order_history
 get_executions = _client.get_executions

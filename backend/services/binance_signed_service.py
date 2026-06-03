@@ -335,65 +335,59 @@ async def place_protection_orders(
 
     qty_remaining = qty_total - tp1_qty if has_partial else qty_total
 
-    # ── SL (reduceOnly + quantity=qty_total — em vez de closePosition) ────
-    # Demo Binance rejeita closePosition=true com erro "Algo Order API".
-    # reduceOnly + quantity explícito tem o mesmo efeito prático: só fecha
-    # o que existe da posição. Mesmo se TP1 já reduziu, SL com qty_total
-    # vira efetivamente qty_atual (Binance ignora o excedente em reduceOnly).
-    if stop_loss is not None:
-        sl_price = await _round_price(sym, float(stop_loss))
-        sl_params = {
-            "symbol": sym, "side": counter_side, "type": "STOP_MARKET",
-            "stopPrice": sl_price, "quantity": qty_total, "reduceOnly": "true",
+    # ── Helper: cria 1 conditional via Algo Order API ────────────────────
+    # Desde 2025-12-09, STOP_MARKET/TAKE_PROFIT_MARKET DEVEM ir pelo endpoint
+    # /fapi/v1/algoOrder (não mais /fapi/v1/order). Diferenças:
+    #   - usa `triggerPrice` em vez de `stopPrice`
+    #   - precisa de `algoType=CONDITIONAL`
+    #   - retorna `algoId` (não `orderId`)
+    async def _place_algo(otype: str, trigger_price: float, q: float, label: str) -> tuple[bool, str | None, str | None]:
+        params = {
+            "algoType": "CONDITIONAL",
+            "symbol": sym,
+            "side": counter_side,
+            "type": otype,
+            "triggerPrice": trigger_price,
+            "quantity": q,
+            "reduceOnly": "true",
+            "workingType": "MARK_PRICE",  # mark price evita trigger por wick fino
         }
         if client_order_id_prefix:
-            sl_params["newClientOrderId"] = f"{client_order_id_prefix}-sl"
-        sl = await _signed_request("POST", "/fapi/v1/order", sl_params)
-        if sl.get("ok"):
-            out["sl_order_id"] = str((sl.get("result") or {}).get("orderId") or "")
-            log.info(f"[binance] SL ok {sym} @ {sl_price} qty={qty_total} id={out['sl_order_id']}")
-        else:
-            out["sl_ok"] = False
-            out["sl_msg"] = sl.get("msg") or sl.get("error")
-            log.error(f"[binance] SL FALHOU {sym} @ {sl_price} side={counter_side}: {out['sl_msg']}")
+            params["clientAlgoId"] = f"{client_order_id_prefix}-{label}"
+        res = await _signed_request("POST", "/fapi/v1/algoOrder", params)
+        if res.get("ok"):
+            algo_id = str((res.get("result") or {}).get("algoId") or "")
+            log.info(f"[binance] {label.upper()} ok {sym} {otype} @ {trigger_price} qty={q} algoId={algo_id}")
+            return True, algo_id, None
+        msg = res.get("msg") or res.get("error")
+        log.error(f"[binance] {label.upper()} FALHOU {sym} {otype} @ {trigger_price} qty={q}: {msg}")
+        return False, None, msg
+
+    # ── SL ───────────────────────────────────────────────────────────────
+    if stop_loss is not None:
+        sl_price = await _round_price(sym, float(stop_loss))
+        ok, oid, msg = await _place_algo("STOP_MARKET", sl_price, qty_total, "sl")
+        out["sl_ok"] = ok
+        out["sl_order_id"] = oid
+        out["sl_msg"] = msg
 
     # ── TP1 parcial 45% ──────────────────────────────────────────────────
     if has_partial:
         tp1_price = await _round_price(sym, float(tp1))
-        tp1_params = {
-            "symbol": sym, "side": counter_side, "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": tp1_price, "quantity": tp1_qty, "reduceOnly": "true",
-        }
-        if client_order_id_prefix:
-            tp1_params["newClientOrderId"] = f"{client_order_id_prefix}-tp1"
-        tp1_res = await _signed_request("POST", "/fapi/v1/order", tp1_params)
-        if tp1_res.get("ok"):
-            out["tp1_order_id"] = str((tp1_res.get("result") or {}).get("orderId") or "")
-            out["tp1_qty"] = tp1_qty
-            log.info(f"[binance] TP1 ok {sym} @ {tp1_price} qty={tp1_qty} id={out['tp1_order_id']}")
-        else:
-            out["tp1_ok"] = False
-            out["tp1_msg"] = tp1_res.get("msg") or tp1_res.get("error")
-            log.error(f"[binance] TP1 FALHOU {sym} @ {tp1_price} qty={tp1_qty}: {out['tp1_msg']}")
+        ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp1_price, tp1_qty, "tp1")
+        out["tp1_ok"] = ok
+        out["tp1_order_id"] = oid
+        out["tp1_msg"] = msg
+        out["tp1_qty"] = tp1_qty if ok else 0.0
 
-    # ── TP2 / TP único — qty = restante (ou total se sem parcial) ────────
+    # ── TP2 / TP único — qty restante (ou total se sem parcial) ──────────
     tp_final = tp2 if tp2 is not None else tp1
     if tp_final is not None:
         tp_price = await _round_price(sym, float(tp_final))
-        tp_params = {
-            "symbol": sym, "side": counter_side, "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": tp_price, "quantity": qty_remaining, "reduceOnly": "true",
-        }
-        if client_order_id_prefix:
-            tp_params["newClientOrderId"] = f"{client_order_id_prefix}-tp2"
-        tp_res = await _signed_request("POST", "/fapi/v1/order", tp_params)
-        if tp_res.get("ok"):
-            out["tp2_order_id"] = str((tp_res.get("result") or {}).get("orderId") or "")
-            log.info(f"[binance] TP2 ok {sym} @ {tp_price} qty={qty_remaining} id={out['tp2_order_id']}")
-        else:
-            out["tp2_ok"] = False
-            out["tp2_msg"] = tp_res.get("msg") or tp_res.get("error")
-            log.error(f"[binance] TP2 FALHOU {sym} @ {tp_price} qty={qty_remaining}: {out['tp2_msg']}")
+        ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, qty_remaining, "tp2")
+        out["tp2_ok"] = ok
+        out["tp2_order_id"] = oid
+        out["tp2_msg"] = msg
 
     return out
 
@@ -510,6 +504,13 @@ async def cancel_order(symbol: str, order_id: Optional[str] = None, client_order
     else:
         return {"ok": False, "error": "informe order_id ou client_order_id"}
     return await _signed_request("DELETE", "/fapi/v1/order", params)
+
+
+async def cancel_algo_order(algo_id: str) -> dict:
+    """Cancela uma ordem CONDITIONAL (SL/TP) criada via /fapi/v1/algoOrder."""
+    if not algo_id:
+        return {"ok": False, "error": "algo_id vazio"}
+    return await _signed_request("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id})
 
 
 async def set_leverage(symbol: str, leverage: int) -> dict:

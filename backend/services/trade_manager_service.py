@@ -67,13 +67,13 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
     sym = trade.symbol
     entry = trade.entry_price
 
-    # 1. Cancela SL antigo (se existir)
+    # 1. Cancela SL antigo (algo order — endpoint diferente)
     if trade.sl_order_id:
         try:
-            cancel_res = await exchange_service.cancel_order(symbol=sym, order_id=trade.sl_order_id)
+            cancel_res = await exchange_service.cancel_algo_order(trade.sl_order_id)
             if not cancel_res.get("ok"):
                 log.warning(
-                    f"[trade-manager] cancel SL antigo {sym} id={trade.sl_order_id} falhou: "
+                    f"[trade-manager] cancel SL antigo {sym} algoId={trade.sl_order_id} falhou: "
                     f"{cancel_res.get('msg') or cancel_res.get('error')} (pode já ter sido executado)"
                 )
         except Exception as e:
