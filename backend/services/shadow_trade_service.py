@@ -110,6 +110,14 @@ ENTRY_MAX_PER_HOUR = int(os.getenv("ENTRY_MAX_PER_HOUR", "3"))
 # quando o mercado vira pra baixo.
 MAX_OPEN_PER_DIRECTION = int(os.getenv("MAX_OPEN_PER_DIRECTION", "5"))
 
+# ── Symbol blacklist (postmortem) ──────────────────────────────────────────
+# Símbolos temporariamente proibidos por má performance recente. CSV de bases
+# (PEPE,NEIRO,...). Case-insensitive. Comparado contra _symbol_base(symbol).
+_BLACKLIST_RAW = os.getenv("SYMBOL_BLACKLIST", "NEIRO,PEOPLE,OPN,MEME").strip()
+SYMBOL_BLACKLIST: set[str] = {
+    s.strip().upper() for s in _BLACKLIST_RAW.split(",") if s.strip()
+}
+
 _TIER_RANK = {"B": 1, "A": 2, "A+": 3}
 
 
@@ -930,6 +938,13 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"[entry-throttle] cooldown={age:.0f}s "
                         f"last_hour={last_hour}/{ENTRY_MAX_PER_HOUR} — skip"
                     )
+                    continue
+
+            # ── Symbol blacklist (postmortem): pula símbolos banidos.
+            if not SHADOW_ENABLED:
+                base = _symbol_base(rec["symbol"])
+                if base and base in SYMBOL_BLACKLIST:
+                    log.info(f"[blacklist] {rec['symbol']} skip")
                     continue
 
             # ── Global directional cap (postmortem): max longs/shorts.
