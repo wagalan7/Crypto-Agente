@@ -166,6 +166,21 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
     }
     status = status_map.get(reason, "closed_manual")
 
+    # Limpa algo orders órfãs antes de fechar — SL/TP que não dispararam ficam
+    # pendentes na Binance e poluem o painel (apesar de reduceOnly=true impedir
+    # reentrada real, acumular lixo eventualmente bate o cap de ~200/símbolo).
+    for oid_field in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
+        oid = getattr(trade, oid_field, None)
+        if oid:
+            try:
+                res = await exchange_service.cancel_algo_order(str(oid))
+                if res.get("ok"):
+                    log.info(f"[trade-manager] {trade.symbol} #{trade.id} cancelled orphan {oid_field}={oid}")
+                else:
+                    log.debug(f"[trade-manager] cancel {oid_field}={oid}: {res.get('error') or res.get('msg')}")
+            except Exception as e:
+                log.warning(f"[trade-manager] cancel {oid_field}={oid} falhou: {e}")
+
     try:
         await real_trade_service.close_trade(
             trade.id,
