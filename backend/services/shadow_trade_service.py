@@ -85,7 +85,68 @@ TF_UPGRADE_BUFFER_PCT = float(os.getenv("TF_UPGRADE_BUFFER_PCT", "0.5"))   # SL 
 TF_UPGRADE_COOLDOWN_HOURS = float(os.getenv("TF_UPGRADE_COOLDOWN_HOURS", "4"))
 TF_UPGRADE_NEAR_TP1_R = float(os.getenv("TF_UPGRADE_NEAR_TP1_R", "0.3"))   # bloqueia se r_now > tp1_R - 0.3
 
+# ── Cluster correlation cap (postmortem 28-losses/24h) ─────────────────────
+# Diversos losses correlacionados em memes/AI numa mesma janela. Limita
+# trades abertos simultâneos por cluster. Base symbol extraído do ticker
+# (ex: PEPE/USDT:USDT → PEPE). Símbolos fora de qualquer cluster vão pra
+# "other" (não compartilham cap entre si).
+SYMBOL_CLUSTERS = {
+    "memes": ["PEPE", "DOGE", "FLOKI", "BOME", "NEIRO", "MEME", "PENGU", "MEW", "TURBO", "WIF", "SHIB", "BONK"],
+    "ai_gaming": ["GALA", "GPS", "RLS", "AI", "AIXBT", "FET", "AGIX", "RNDR"],
+    "l2_infra": ["LINEA", "ARB", "OP", "MATIC", "STRK", "ZK"],
+    "defi": ["UNI", "AAVE", "CRV", "1INCH", "DYDX", "GMX"],
+    "majors": ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA"],
+}
+CLUSTER_MAX_OPEN = int(os.getenv("CLUSTER_MAX_OPEN", "2"))
+
 _TIER_RANK = {"B": 1, "A": 2, "A+": 3}
+
+
+def _symbol_base(symbol: str) -> str:
+    """Extrai a base do ticker. 'PEPE/USDT:USDT' → 'PEPE', 'BTCUSDT' → 'BTC'."""
+    if not symbol:
+        return ""
+    s = symbol.upper().strip()
+    # ccxt-style: 'BASE/QUOTE:SETTLE'
+    if "/" in s:
+        s = s.split("/", 1)[0]
+    # plain 'BASEUSDT' / 'BASEUSD' / 'BASEUSDC'
+    for suf in ("USDT", "USDC", "USD", "BUSD"):
+        if s.endswith(suf) and len(s) > len(suf):
+            s = s[: -len(suf)]
+            break
+    return s
+
+
+def _get_symbol_cluster(symbol: str) -> str:
+    """Retorna nome do cluster do símbolo, ou 'other' se não pertencer a nenhum."""
+    base = _symbol_base(symbol)
+    if not base:
+        return "other"
+    for cluster, members in SYMBOL_CLUSTERS.items():
+        if base in members:
+            return cluster
+    return "other"
+
+
+async def _count_open_in_cluster(cluster: str) -> int:
+    """Conta RealTrade open cujo símbolo pertence ao cluster informado."""
+    if not DB_ENABLED:
+        return 0
+    try:
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            stmt = select(RealTrade.symbol).where(
+                RealTrade.status == "open",
+                RealTrade.source == "auto",
+            )
+            rows = (await session.execute(stmt)).all()
+            return sum(1 for (sym,) in rows if _get_symbol_cluster(sym) == cluster)
+    except Exception as e:
+        log.warning(f"[cluster-cap] count falhou: {e}")
+        return 0
 
 
 def _tf_rank_local(tf: str) -> int:
@@ -778,6 +839,19 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             tier = rec.get("tier")
             if tier not in ("A+", "A"):
                 continue
+
+            # ── Cluster correlation cap (postmortem): bloqueia se já há
+            # CLUSTER_MAX_OPEN trades abertos num cluster correlacionado.
+            if not SHADOW_ENABLED:
+                cluster = _get_symbol_cluster(rec["symbol"])
+                if cluster != "other":
+                    open_in_cluster = await _count_open_in_cluster(cluster)
+                    if open_in_cluster >= CLUSTER_MAX_OPEN:
+                        log.info(
+                            f"[cluster-cap] {rec['symbol']} cluster={cluster} "
+                            f"{open_in_cluster}/{CLUSTER_MAX_OPEN} — skip"
+                        )
+                        continue
 
             # ── Direction flip (Fase 2): se há trade aberto na direção oposta,
             # avalia gate. Passa → fecha atual primeiro. Bloqueia → advisory
