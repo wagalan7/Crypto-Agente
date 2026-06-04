@@ -1888,6 +1888,119 @@ async def admin_recalc_pnl_zero_entry(dry_run: bool = True):
     }
 
 
+@app.post("/api/admin/dedupe-open-trades")
+async def admin_dedupe_open_trades(dry_run: bool = True):
+    """
+    Limpa trades duplicados legados (mesmo símbolo+direção abertos em TFs
+    diferentes) que ficaram de antes da Fase 1 (snapshot 1-rec-por-direção).
+
+    Agrupa RealTrade status=open por (symbol, side). Pra cada grupo com >1
+    trade, mantém o de TF maior (SCALP<DAY<SWING via snapshot_service._tf_rank).
+    Empate de rank → mantém o mais recente (opened_at desc). Demais são
+    fechados via trade_manager_service._close_trade (cancela algo orders +
+    fecha posição na Binance demo).
+
+    Use dry_run=true (default) primeiro pra ver o plano.
+    """
+    from sqlalchemy import select
+    from db import get_session, DB_ENABLED
+    from models.real_trade import RealTrade
+    from models.recommendation_snapshot import RecommendationSnapshot
+    from services.snapshot_service import _tf_rank
+    from services import trade_manager_service
+
+    if not DB_ENABLED:
+        return {"ok": False, "error": "DB desabilitado"}
+
+    groups: dict[tuple[str, str], list[dict]] = {}
+    actions: list[dict] = []
+    errors: list[dict] = []
+    trades_to_close = 0
+    trades_to_keep = 0
+
+    async with get_session() as session:
+        stmt = select(RealTrade).where(RealTrade.status == "open")
+        opens = (await session.execute(stmt)).scalars().all()
+
+        # Resolve TF de cada trade via recommendation_snapshot
+        rec_ids = [t.recommendation_id for t in opens if t.recommendation_id]
+        tf_by_rec: dict[int, str] = {}
+        if rec_ids:
+            rec_stmt = select(RecommendationSnapshot.id, RecommendationSnapshot.timeframe).where(
+                RecommendationSnapshot.id.in_(rec_ids)
+            )
+            for rid, tf in (await session.execute(rec_stmt)).all():
+                tf_by_rec[rid] = tf
+
+        for t in opens:
+            tf = tf_by_rec.get(t.recommendation_id, "") if t.recommendation_id else ""
+            key = (t.symbol, t.side)
+            groups.setdefault(key, []).append({
+                "trade": t,
+                "tf": tf,
+                "rank": _tf_rank(tf),
+                "opened_at": t.opened_at,
+            })
+
+        groups_with_dupes = 0
+        for (symbol, side), items in groups.items():
+            if len(items) <= 1:
+                continue
+            groups_with_dupes += 1
+            # Ordena: rank desc, opened_at desc → primeiro é o "keeper"
+            items.sort(key=lambda x: (x["rank"], x["opened_at"]), reverse=True)
+            keep = items[0]
+            close_list = items[1:]
+            trades_to_keep += 1
+            trades_to_close += len(close_list)
+
+            action = {
+                "symbol": symbol,
+                "direction": side,
+                "keep": {
+                    "id": keep["trade"].id,
+                    "tf": keep["tf"] or None,
+                    "opened_at": keep["opened_at"].isoformat() if keep["opened_at"] else None,
+                },
+                "close": [
+                    {
+                        "id": c["trade"].id,
+                        "tf": c["tf"] or None,
+                        "opened_at": c["opened_at"].isoformat() if c["opened_at"] else None,
+                        "reason": "lower_tf" if c["rank"] < keep["rank"] else "older_same_rank",
+                    }
+                    for c in close_list
+                ],
+            }
+            actions.append(action)
+
+            log.info(
+                f"[admin-dedupe] {symbol} {side}: keep #{keep['trade'].id} "
+                f"(tf={keep['tf']}), close {[c['trade'].id for c in close_list]} "
+                f"(dry_run={dry_run})"
+            )
+
+            if not dry_run:
+                for c in close_list:
+                    try:
+                        await trade_manager_service._close_trade(c["trade"], "dedupe_legacy")
+                        log.info(f"[admin-dedupe] closed trade #{c['trade'].id} ({symbol})")
+                    except Exception as e:
+                        log.error(f"[admin-dedupe] erro fechando #{c['trade'].id}: {e}")
+                        errors.append({"trade_id": c["trade"].id, "symbol": symbol, "error": str(e)})
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "groups_with_duplicates": groups_with_dupes,
+        "trades_to_close": trades_to_close,
+        "trades_to_keep": trades_to_keep,
+        "actions": actions,
+        "errors": errors,
+        "note": "Use ?dry_run=false pra executar.",
+    }
+
+
 @app.post("/api/kill-switch/reset")
 async def kill_switch_reset():
     """
