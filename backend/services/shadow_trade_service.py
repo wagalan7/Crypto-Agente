@@ -1351,6 +1351,26 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         })
                     except Exception as e:
                         log.warning(f"[shadow] push trade-open falhou: {e}")
+                    # Telegram notify (desacoplado - no-op se nao configurado)
+                    try:
+                        from services.notification_service import (
+                            send_telegram,
+                            fmt_trade_opened,
+                        )
+                        await send_telegram(
+                            fmt_trade_opened(
+                                {
+                                    **trade,
+                                    "planned_stop": stop,
+                                    "planned_tp1": float(tp1) if tp1 is not None else None,
+                                    "planned_tp2": tp2,
+                                },
+                                rec,
+                            ),
+                            event_type="open",
+                        )
+                    except Exception as e:
+                        log.warning(f"[notify] telegram open falhou: {e}")
         except Exception as e:
             log.warning(f"[shadow] falha abrindo trade pra {rec.get('symbol')}: {e}")
 

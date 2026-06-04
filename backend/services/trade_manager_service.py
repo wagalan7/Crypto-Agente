@@ -138,6 +138,12 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
         f"[trade-manager] {sym} #{trade.id} → post_tp1: SL @ BE {entry} qty={qty_rem} "
         f"(novo algoId={new_sl_id})"
     )
+    # Telegram notify TP1 (desacoplado)
+    try:
+        from services.notification_service import send_telegram, fmt_tp1_hit
+        await send_telegram(fmt_tp1_hit(trade), event_type="tp1")
+    except Exception as e:
+        log.warning(f"[notify] telegram tp1 falhou: {e}")
     return True
 
 
@@ -189,6 +195,23 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
             notes=f"auto-closed by trade_manager ({reason})",
         )
         log.info(f"[trade-manager] {trade.symbol} #{trade.id} CLOSED {status} @ {exit_price}")
+        # Telegram notify close (desacoplado)
+        try:
+            from services.notification_service import send_telegram, fmt_trade_closed
+            # Tenta PnL atualizado do DB
+            pnl_val = None
+            try:
+                fresh = await real_trade_service.get_trade(trade.id)
+                if fresh:
+                    pnl_val = fresh.get("pnl_usd")
+            except Exception:
+                pnl_val = getattr(trade, "pnl_usd", None)
+            await send_telegram(
+                fmt_trade_closed(trade, reason=reason, pnl=pnl_val),
+                event_type="close",
+            )
+        except Exception as ne:
+            log.warning(f"[notify] telegram close falhou: {ne}")
     except Exception as e:
         log.error(f"[trade-manager] close_trade {trade.id} erro: {e}")
 

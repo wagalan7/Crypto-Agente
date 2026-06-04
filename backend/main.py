@@ -1731,6 +1731,19 @@ async def admin_force_test_trade(
     return result
 
 
+@app.post("/api/admin/telegram-test")
+async def admin_telegram_test():
+    """Testa Telegram. Retorna ok=False se nao configurado."""
+    from services.notification_service import send_telegram, TELEGRAM_ENABLED
+    if not TELEGRAM_ENABLED:
+        return {"ok": False, "reason": "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID nao configurado"}
+    sent = await send_telegram(
+        "\U0001F916 *Teste* \u2014 Bot Crypto Win conectado ao Telegram!",
+        event_type="test",
+    )
+    return {"ok": sent}
+
+
 @app.post("/api/admin/test-push")
 async def admin_test_push(kind: str = "trade_open"):
     """

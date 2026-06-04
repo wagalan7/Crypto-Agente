@@ -32,6 +32,9 @@ from models.real_trade import RealTrade
 
 log = logging.getLogger(__name__)
 
+# Estado em memoria pra dedupe de notificacao Telegram (uma por dia).
+_KILL_NOTIFIED_DAY: Optional[str] = None
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name, "").strip().lower()
@@ -179,6 +182,21 @@ async def check_can_trade() -> dict:
 
     allowed = len(blocked_reasons) == 0
     reason = " | ".join(blocked_reasons) if blocked_reasons else None
+
+    # Notifica Telegram quando o kill-switch (por daily_loss) ativa, uma vez por dia.
+    if not allowed and pnl_today <= -th["max_daily_loss_usd"]:
+        global _KILL_NOTIFIED_DAY
+        today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if _KILL_NOTIFIED_DAY != today_key:
+            _KILL_NOTIFIED_DAY = today_key
+            try:
+                from services.notification_service import send_telegram, fmt_kill_switch
+                await send_telegram(
+                    fmt_kill_switch(pnl_today, th["max_daily_loss_usd"]),
+                    event_type="kill",
+                )
+            except Exception as e:
+                log.warning(f"[notify] telegram kill falhou: {e}")
 
     return {
         "allowed": allowed,
