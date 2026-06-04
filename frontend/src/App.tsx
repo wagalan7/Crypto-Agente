@@ -85,6 +85,30 @@ function assetColor(base: string): string {
   return ASSET_COLORS[base] ?? 'bg-slate-600'
 }
 
+// ─── Signal cache (module-level, TTL) ─────────────────────────────────────────
+// Evita refetch do /api/watchlist/analyze a cada remount ou troca/volta de modo.
+// Cache por modo (scalp/day/swing). TTL 120s — depois disso refetch.
+const SIGNAL_CACHE_TTL_MS = 120_000
+type SignalCacheEntry = {
+  ts: number
+  signals: Map<string, Partial<ScannerAsset>>
+}
+const signalCache = new Map<TradeMode, SignalCacheEntry>()
+
+function getCachedSignals(mode: TradeMode): Map<string, Partial<ScannerAsset>> | null {
+  const entry = signalCache.get(mode)
+  if (!entry) return null
+  if (Date.now() - entry.ts > SIGNAL_CACHE_TTL_MS) {
+    signalCache.delete(mode)
+    return null
+  }
+  return entry.signals
+}
+
+function setCachedSignals(mode: TradeMode, signals: Map<string, Partial<ScannerAsset>>) {
+  signalCache.set(mode, { ts: Date.now(), signals })
+}
+
 function signalBadge(direction: SignalDirection, strength: string) {
   const forte = strength?.toLowerCase().includes('fort') || strength?.toLowerCase().includes('strong')
   if (direction === 'long') {
@@ -260,30 +284,40 @@ export default function App() {
       setAssets(initial)
       setLoadingProgress(25)
 
-      // 2. Load signals from backend in batches
+      // 2. Load signals from backend in batches (cached por modo, TTL 120s)
       const symbols = initial.map(a => a.symbol)
       const tf = TRADE_MODES[mode].timeframe
-      const batchSize = 20
-      const signalMap = new Map<string, Partial<ScannerAsset>>()
 
-      for (let i = 0; i < symbols.length; i += batchSize) {
-        const batch = symbols.slice(i, i + batchSize)
-        try {
-          const result = await api.watchlistAnalyze(batch, tf)
-          result.results.forEach(r => {
-            signalMap.set(r.symbol, {
-              direction: r.direction ?? 'neutral',
-              confidence: r.confidence ?? 0,
-              signal_strength: r.signal_strength ?? '',
-              trade_type: r.trade_type ?? 'day_trade',
-              rsi: r.rsi ?? null,
-              patterns_count: r.patterns_count ?? 0,
+      const cached = getCachedSignals(mode)
+      if (cached) {
+        // Cache hit — aplica direto sem chamar backend
+        setAssets(prev => prev.map(a => ({ ...a, ...(cached.get(a.symbol) ?? {}) })))
+        setLoadingProgress(99)
+      } else {
+        const batchSize = 20
+        const signalMap = new Map<string, Partial<ScannerAsset>>()
+
+        for (let i = 0; i < symbols.length; i += batchSize) {
+          const batch = symbols.slice(i, i + batchSize)
+          try {
+            const result = await api.watchlistAnalyze(batch, tf)
+            result.results.forEach(r => {
+              signalMap.set(r.symbol, {
+                direction: r.direction ?? 'neutral',
+                confidence: r.confidence ?? 0,
+                signal_strength: r.signal_strength ?? '',
+                trade_type: r.trade_type ?? 'day_trade',
+                rsi: r.rsi ?? null,
+                patterns_count: r.patterns_count ?? 0,
+              })
             })
-          })
-        } catch { /* batch failed, skip */ }
-        const progress = 25 + Math.round(((i + batchSize) / symbols.length) * 75)
-        setLoadingProgress(Math.min(progress, 99))
-        setAssets(prev => prev.map(a => ({ ...a, ...(signalMap.get(a.symbol) ?? {}) })))
+          } catch { /* batch failed, skip */ }
+          const progress = 25 + Math.round(((i + batchSize) / symbols.length) * 75)
+          setLoadingProgress(Math.min(progress, 99))
+          setAssets(prev => prev.map(a => ({ ...a, ...(signalMap.get(a.symbol) ?? {}) })))
+        }
+
+        setCachedSignals(mode, signalMap)
       }
     } catch {
       // Binance unavailable: fall back to backend symbols + signals

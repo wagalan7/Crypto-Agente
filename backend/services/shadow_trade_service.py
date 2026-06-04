@@ -109,7 +109,7 @@ ENTRY_MAX_PER_HOUR = int(os.getenv("ENTRY_MAX_PER_HOUR", "3"))
 # ── Global directional cap (postmortem) ────────────────────────────────────
 # Limita exposição direcional total — não fica com 8 longs simultâneos
 # quando o mercado vira pra baixo.
-MAX_OPEN_PER_DIRECTION = int(os.getenv("MAX_OPEN_PER_DIRECTION", "5"))
+MAX_OPEN_PER_DIRECTION = int(os.getenv("MAX_OPEN_PER_DIRECTION", "7"))
 
 # ── Symbol blacklist (postmortem) ──────────────────────────────────────────
 # Símbolos temporariamente proibidos por má performance recente. CSV de bases
@@ -120,10 +120,11 @@ SYMBOL_BLACKLIST: set[str] = {
 }
 
 # ── Score threshold (postmortem) ───────────────────────────────────────────
-# Subimos o piso de score para 75 (era implicitamente >=65 via tier A). O
-# postmortem mostrou win-rate sensivelmente melhor acima de 75. Override
-# via env SCORE_MIN.
-SCORE_MIN = float(os.getenv("SCORE_MIN", "75"))
+# Subimos o piso de score para 72 (era implicitamente >=65 via tier A). O
+# postmortem mostrou win-rate sensivelmente melhor acima de 75, mas 75
+# estava bloqueando trades demais (0 entradas em 48h). 72 = meio-termo
+# pra coletar amostra mantendo qualidade. Override via env SCORE_MIN.
+SCORE_MIN = float(os.getenv("SCORE_MIN", "72"))
 
 # ── Time-of-day block (postmortem 104 snapshots / 168h) ────────────────────
 # Sessão EU (7-14 UTC) mostrou 50 trades / 42% wr / lift -21.46%.
