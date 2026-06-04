@@ -458,6 +458,25 @@ async def close_shadow_for_snapshot(snap) -> bool:
         if trade is None:
             return False
 
+    # FIX CRÍTICO: paper-trade NÃO fecha trades reais (source="auto").
+    # Antes, snap resolvendo via candle simulado fechava o RealTrade no DB,
+    # mas a posição na exchange seguia aberta (preço só passou perto do TP,
+    # não bateu o trigger real). Resultado: DB "closed" + posição órfã +
+    # PnL errado calculado com exit=planned_tp2 e entry possivelmente 0.
+    #
+    # Comportamento correto:
+    #   - source="shadow": fecha via paper (simulação é a fonte da verdade)
+    #   - source="auto" + qualquer outcome (tp1/tp2/be/stop): NÃO fecha,
+    #     deixa o trade_manager (que poll a exchange) detectar qty=0 e fechar.
+    #   - source="auto" + expired: ainda emite market close (snap expirou,
+    #     posição precisa ser fechada explicitamente — não há trigger pendente).
+    if trade.source == "auto" and snap.status != "expired":
+        log.debug(
+            f"[shadow] skip close paper-resolved trade#{trade.id} {trade.symbol} "
+            f"source=auto snap={snap.status} — trade_manager cuida via polling"
+        )
+        return False
+
     new_status = _STATUS_MAP[snap.status]
     # Se foi execução real (auto) com TP/SL já emitidos como ordens separadas,
     # o exchange resolveu sozinho — só atualizamos o DB pra refletir.

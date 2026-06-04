@@ -146,6 +146,42 @@ async def close_trade(
         if notes:
             trade.notes = (trade.notes + " | " + notes) if trade.notes else notes
 
+        # FIX entry_price=0: trades reais (auto) podem ter sido abertos com
+        # avgPrice=0 da Binance (market order não retornou fill price). Sem
+        # entry válido, PnL calcula (exit - 0) × qty × side → loss/profit
+        # astronômico falso. Resolve com 3 fallbacks em cascata.
+        if not trade.entry_price or trade.entry_price <= 0:
+            recovered = None
+            # 1. Tenta /fapi/v2/positionRisk (só funciona se posição ainda existe;
+            #    com auto-close por TP2 a posição já foi → pula)
+            try:
+                from services import exchange_service
+                positions = await exchange_service.get_positions()
+                if positions.get("ok"):
+                    for p in positions.get("positions") or []:
+                        if p.get("symbol", "").replace("/", "").replace(":USDT", "") == trade.symbol.replace("/", "").replace(":USDT", ""):
+                            ep = float(p.get("entry_price") or 0)
+                            if ep > 0:
+                                recovered = ep
+                                break
+            except Exception as e:
+                log.warning(f"[real-trade] entry recover via positions falhou #{trade.id}: {e}")
+            # 2. Fallback: planned_tp1 implícita — o entry está entre planned_stop
+            #    e planned_tp1. Aproximação razoável quando rec foi seguida à risca.
+            if recovered is None and trade.planned_stop and trade.planned_tp1:
+                recovered = (trade.planned_stop + trade.planned_tp1) / 2.0
+                log.warning(
+                    f"[real-trade] entry recover #{trade.id}: usando média stop/tp1 = {recovered}"
+                )
+            # 3. Último recurso: exit_price (PnL fica 0 mas não explode)
+            if recovered is None or recovered <= 0:
+                recovered = exit_price
+                log.warning(
+                    f"[real-trade] entry recover #{trade.id}: sem fallback, usando exit_price"
+                )
+            log.info(f"[real-trade] entry_price recuperado #{trade.id}: 0 → {recovered}")
+            trade.entry_price = recovered
+
         # Calcula P&L
         sign = 1 if trade.side == "long" else -1
         price_diff = (exit_price - trade.entry_price) * sign

@@ -291,6 +291,10 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
             )}
             <div className="flex flex-col gap-2">
               {list.map((t, i) => {
+                // Contagem multi-timeframe — recs do mesmo símbolo+direção em
+                // timeframes diferentes (1h DAY + 15m SCALP) não são duplicatas,
+                // são setups paralelos. Pill "MTF Nx" sinaliza isso pro usuário.
+                const mtfSiblings = list.filter(x => x.symbol === t.symbol && x.direction === t.direction).length
                 const badge = STATUS_BADGE[t.status] || STATUS_BADGE.open
                 const reason = STATUS_REASON[t.status] || '—'
                 const isLong = t.direction === 'long'
@@ -327,6 +331,14 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                       )}
                       <DirIcon className={`w-4 h-4 ${isLong ? 'text-green-400' : 'text-red-400'}`} />
                       <span className="text-sm font-bold text-white">{t.symbol.split('/')[0]}</span>
+                      {mtfSiblings > 1 && (
+                        <span
+                          className="text-[9px] font-bold text-purple-300 bg-purple-900/30 border border-purple-700/50 px-1.5 py-0.5 rounded"
+                          title={`${mtfSiblings} setups paralelos pro mesmo símbolo (timeframes diferentes) — não é duplicata`}
+                        >
+                          MTF {mtfSiblings}x
+                        </span>
+                      )}
                       <span className="text-[10px] text-slate-500 font-mono">{t.timeframe}</span>
                       <span className="text-[10px] text-slate-400 px-1.5 py-0.5 rounded border border-slate-700">{opType}</span>
                       <span className="text-[10px] text-orange-300 font-mono">{t.leverage}x</span>
