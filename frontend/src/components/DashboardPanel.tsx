@@ -742,6 +742,7 @@ function TradeHistory({ trades, liveEquity }: {
               <th className="text-right py-1.5 px-1 font-semibold">Entrada</th>
               <th className="text-right py-1.5 px-1 font-semibold" title="Tamanho da posição em USD">Notional</th>
               <th className="text-right py-1.5 px-1 font-semibold" title="Margem usada = notional / leverage">Margem</th>
+              <th className="text-right py-1.5 px-1 font-semibold" title="Margem como % do saldo no momento da entrada">% Banca</th>
               <th className="text-right py-1.5 px-1 font-semibold">Stop</th>
               <th className="text-right py-1.5 px-1 font-semibold">TP1</th>
               <th className="text-right py-1.5 px-1 font-semibold">TP2</th>
@@ -777,6 +778,18 @@ function TradeHistory({ trades, liveEquity }: {
                   <td className="text-right py-1.5 px-1 font-mono text-slate-200">{fmtNum(t.entry_price, 4)}</td>
                   <td className="text-right py-1.5 px-1 font-mono text-slate-300">${notional.toFixed(2)}</td>
                   <td className="text-right py-1.5 px-1 font-mono text-cyan-400">${margem.toFixed(2)}</td>
+                  <td className="text-right py-1.5 px-1 font-mono">
+                    {(() => {
+                      // Base = saldo antes da operação; fallback pra liveEquity se before=0 (shadow / dados antigos)
+                      const base = bal.before > 0 ? bal.before : (liveEquity?.total ?? 0)
+                      if (!base || base <= 0) return <span className="text-slate-600">—</span>
+                      const pct = (margem / base) * 100
+                      const cls = pct <= 5 ? 'text-emerald-300'
+                        : pct <= 15 ? 'text-amber-300'
+                        : 'text-red-300 font-bold'
+                      return <span className={cls} title={`${margem.toFixed(2)} / ${base.toFixed(2)}`}>{pct.toFixed(1)}%</span>
+                    })()}
+                  </td>
                   <td className="text-right py-1.5 px-1 font-mono text-red-300/80">{fmtNum(t.planned_stop, 4)}</td>
                   <td className="text-right py-1.5 px-1 font-mono text-emerald-300/80">{fmtNum(t.planned_tp1, 4)}</td>
                   <td className="text-right py-1.5 px-1 font-mono text-green-300/80">{fmtNum(t.planned_tp2, 4)}</td>
