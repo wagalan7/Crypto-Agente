@@ -124,6 +124,20 @@ def _extract_features(rec: Dict[str, Any], created_at: datetime) -> Dict[str, An
     }
 
 
+def _tf_rank(tf: str) -> int:
+    """Rank do timeframe pra comparar 'tamanho' (SCALP < DAY < SWING).
+    Maior número = TF maior. Usado pra bloquear duplicação intra-direção.
+    Sincronizar com frontend/DailyPnLPanel.operationType()."""
+    if not tf:
+        return 0
+    t = tf.strip().lower()
+    if t in ("1m", "3m", "5m", "15m"):
+        return 1  # SCALP
+    if t in ("30m", "1h", "2h"):
+        return 2  # DAY
+    return 3      # SWING (4h, 1d, 1w, etc)
+
+
 async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     """
     Salva snapshots de recomendações novas (desduplicadas).
@@ -132,6 +146,12 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     Side-effect: marca cada rec com `_just_saved=True` se foi inserida nesta
     chamada (não duplicata). Permite ao caller filtrar quais notificar via
     push sem precisar re-consultar o DB.
+
+    Regras de bloqueio (Fase 1 — 1 rec ativa por símbolo+direção):
+      1. Dedup janela curta: mesmo (symbol, tf, direction) recente → skip
+      2. Anti-duplicação intra-direção: se já existe snapshot OPEN com
+         (symbol, direction) MESMO TF ou TF MENOR → skip. Só permite
+         se a nova rec é TF MAIOR (upgrade — Fase 3 trata a transição).
     """
     if not DB_ENABLED or not recommendations:
         return 0
@@ -155,6 +175,33 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                 existing = (await session.execute(stmt)).scalar_one_or_none()
                 if existing:
                     rec["_just_saved"] = False
+                    continue
+
+                # Fase 1: bloqueia rec adicional pro mesmo (symbol, direction)
+                # se já houver snapshot OPEN em TF igual ou MENOR. Permite
+                # passar quando a nova é TF MAIOR — vira candidato a upgrade.
+                new_rank = _tf_rank(rec.get("timeframe"))
+                open_stmt = select(
+                    RecommendationSnapshot.id,
+                    RecommendationSnapshot.timeframe,
+                ).where(
+                    and_(
+                        RecommendationSnapshot.symbol == rec["symbol"],
+                        RecommendationSnapshot.direction == rec["direction"],
+                        RecommendationSnapshot.status == "open",
+                    )
+                )
+                open_rows = (await session.execute(open_stmt)).all()
+                # Se qualquer aberto tem rank >= novo → bloqueia (mesmo TF
+                # ou maior já cobre a direção). Só deixa passar se TODOS
+                # os abertos forem TF MENOR que o novo (upgrade legítimo).
+                blocked = any(_tf_rank(row.timeframe) >= new_rank for row in open_rows)
+                if blocked:
+                    rec["_just_saved"] = False
+                    log.debug(
+                        f"[snapshot] skip rec {rec['symbol']} {rec['direction']} "
+                        f"tf={rec.get('timeframe')} — já há OPEN em TF >= nesse par"
+                    )
                     continue
 
                 # tp1 pode estar em signal.tp1 ou ausente
