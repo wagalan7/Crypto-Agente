@@ -1807,6 +1807,99 @@ async def kill_switch_status():
     return await kill_switch_service.status()
 
 
+@app.post("/api/admin/recalc-pnl-zero-entry")
+async def admin_recalc_pnl_zero_entry(dry_run: bool = True):
+    """
+    Recalcula pnl_usd / pnl_pct / realized_r de trades fechados que ficaram
+    com entry_price=0 (bug histórico — market order da Binance voltou avgPrice=0).
+
+    Fallback em cascata:
+      1. Tenta /fapi/v2/positionRisk (improvável funcionar — posição já fechou)
+      2. Média entre planned_stop e planned_tp1
+      3. Último recurso: exit_price (PnL = 0)
+
+    Use dry_run=true (default) primeiro pra ver diff antes de aplicar.
+    """
+    from sqlalchemy import select
+    from db import get_session, DB_ENABLED
+    from models.real_trade import RealTrade
+    if not DB_ENABLED:
+        return {"ok": False, "error": "DB desabilitado"}
+
+    fixes = []
+    async with get_session() as session:
+        stmt = select(RealTrade).where(
+            RealTrade.status != "open",
+            RealTrade.entry_price <= 0,
+        )
+        rows = (await session.execute(stmt)).scalars().all()
+
+        for t in rows:
+            # Recupera entry com mesma cascata do real_trade_service.close_trade
+            recovered = None
+            if t.planned_stop and t.planned_tp1:
+                recovered = (float(t.planned_stop) + float(t.planned_tp1)) / 2.0
+                src = "media_stop_tp1"
+            else:
+                recovered = float(t.exit_price or 0)
+                src = "exit_price"
+
+            if recovered <= 0:
+                fixes.append({
+                    "id": t.id, "symbol": t.symbol, "skip": "no fallback",
+                })
+                continue
+
+            sign = 1 if t.side == "long" else -1
+            price_diff = (float(t.exit_price or 0) - recovered) * sign
+            new_pnl_usd = round(price_diff * float(t.qty) - float(t.entry_fee or 0) - float(t.exit_fee or 0), 4)
+            new_pnl_pct = round((price_diff / recovered) * 100, 4)
+            new_r = None
+            if t.planned_stop:
+                risk_dist = abs(recovered - float(t.planned_stop))
+                if risk_dist > 0:
+                    new_r = round(price_diff / risk_dist, 3)
+
+            fix = {
+                "id": t.id, "symbol": t.symbol, "side": t.side,
+                "entry_recovered": recovered, "recover_source": src,
+                "exit_price": float(t.exit_price or 0),
+                "old": {"pnl_usd": float(t.pnl_usd or 0), "pnl_pct": float(t.pnl_pct or 0), "realized_r": t.realized_r},
+                "new": {"pnl_usd": new_pnl_usd, "pnl_pct": new_pnl_pct, "realized_r": new_r},
+            }
+            fixes.append(fix)
+
+            if not dry_run:
+                t.entry_price = recovered
+                t.pnl_usd = new_pnl_usd
+                t.pnl_pct = new_pnl_pct
+                t.realized_r = new_r
+                t.notes = (t.notes or "") + f" | pnl recalc (entry 0 → {recovered:.6f} via {src})"
+
+        if not dry_run:
+            await session.commit()
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "trades_affected": len(fixes),
+        "fixes": fixes,
+        "note": "Use ?dry_run=false pra aplicar.",
+    }
+
+
+@app.post("/api/kill-switch/reset")
+async def kill_switch_reset():
+    """
+    Força recálculo do kill-switch (lê PnL atualizado do DB).
+    Útil depois de corrigir registros de PnL — o switch é stateless e recomputa
+    no próximo check_can_trade, mas esse endpoint dá feedback imediato.
+    """
+    from services import kill_switch_service
+    res = await kill_switch_service.check_can_trade()
+    return {"ok": True, "now_allowed": res.get("allowed"), "details": res}
+
+
 @app.get("/api/exchange/diagnostic-binance")
 async def exchange_diagnostic_binance():
     """Diagnóstico verboso do Binance Futures (testnet ou mainnet).
