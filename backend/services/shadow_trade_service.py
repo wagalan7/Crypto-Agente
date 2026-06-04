@@ -36,6 +36,7 @@ Quando ativar execução real (futuro #11.4):
 from __future__ import annotations
 import os
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from db import DB_ENABLED
@@ -123,6 +124,35 @@ SYMBOL_BLACKLIST: set[str] = {
 # postmortem mostrou win-rate sensivelmente melhor acima de 75. Override
 # via env SCORE_MIN.
 SCORE_MIN = float(os.getenv("SCORE_MIN", "75"))
+
+# ── Time-of-day block (postmortem 104 snapshots / 168h) ────────────────────
+# Sessão EU (7-14 UTC) mostrou 50 trades / 42% wr / lift -21.46%.
+# Quinta-feira mostrou 67 trades / 50.75% wr / lift -12.72%. Bloqueia ambos
+# por padrão; override via env (string vazia desativa).
+BLOCK_HOURS_UTC = os.getenv("BLOCK_HOURS_UTC", "7,8,9,10,11,12,13").strip()
+_BLOCKED_HOURS: set[int] = set()
+if BLOCK_HOURS_UTC:
+    try:
+        _BLOCKED_HOURS = {int(h.strip()) for h in BLOCK_HOURS_UTC.split(",") if h.strip()}
+    except Exception:
+        _BLOCKED_HOURS = set()
+
+BLOCK_DAYS_UTC = os.getenv("BLOCK_DAYS_UTC", "thu").strip().lower()
+_DAY_NAMES = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
+_BLOCKED_DAYS: set[str] = set()
+if BLOCK_DAYS_UTC:
+    _BLOCKED_DAYS = {d.strip() for d in BLOCK_DAYS_UTC.split(",") if d.strip()}
+
+
+def _is_blocked_time(now_utc: datetime) -> tuple[bool, str]:
+    """Retorna (blocked, reason)."""
+    if now_utc.hour in _BLOCKED_HOURS:
+        return True, f"hour_utc={now_utc.hour}"
+    dow = _DAY_NAMES.get(now_utc.weekday(), "?")
+    if dow in _BLOCKED_DAYS:
+        return True, f"dow={dow}"
+    return False, ""
+
 
 _TIER_RANK = {"B": 1, "A": 2, "A+": 3}
 
@@ -947,6 +977,21 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 )
                 continue
 
+            # ── Symbol blacklist (postmortem): pula símbolos banidos.
+            if not SHADOW_ENABLED:
+                base = _symbol_base(rec["symbol"])
+                if base and base in SYMBOL_BLACKLIST:
+                    log.info(f"[blacklist] {rec['symbol']} skip")
+                    continue
+
+            # ── Time-of-day block (postmortem -21% lift EU / -12% lift quinta).
+            if not SHADOW_ENABLED:
+                now_utc = datetime.now(timezone.utc)
+                blocked, reason = _is_blocked_time(now_utc)
+                if blocked:
+                    log.info(f"[time-block] {rec.get('symbol')} {reason} — skip")
+                    continue
+
             # ── Entry throttle (postmortem): cooldown global + max/hora.
             if not SHADOW_ENABLED:
                 age = await _last_entry_age_seconds()
@@ -956,13 +1001,6 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"[entry-throttle] cooldown={age:.0f}s "
                         f"last_hour={last_hour}/{ENTRY_MAX_PER_HOUR} — skip"
                     )
-                    continue
-
-            # ── Symbol blacklist (postmortem): pula símbolos banidos.
-            if not SHADOW_ENABLED:
-                base = _symbol_base(rec["symbol"])
-                if base and base in SYMBOL_BLACKLIST:
-                    log.info(f"[blacklist] {rec['symbol']} skip")
                     continue
 
             # ── Global directional cap (postmortem): max longs/shorts.
