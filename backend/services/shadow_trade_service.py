@@ -144,6 +144,42 @@ if BLOCK_DAYS_UTC:
     _BLOCKED_DAYS = {d.strip() for d in BLOCK_DAYS_UTC.split(",") if d.strip()}
 
 
+# ── MTF aligned gate (postmortem mtf_aligned=true → 82% wr / +18.68 lift) ──
+# Modo:
+#   "boost"    (default) → não bloqueia; só loga preferência (futuro: boost qty)
+#   "required"           → hard gate: pula se não alinhado
+#   "off"                → ignora
+MTF_ALIGNED_MODE = os.getenv("MTF_ALIGNED_MODE", "boost").strip().lower()
+# Quando "required", quantos TFs maiores precisam estar alinhados pra contar
+# como "aligned=true". Default 2 (típico: 1h+4h ambos a favor).
+MTF_ALIGNED_MIN_COUNT = int(os.getenv("MTF_ALIGNED_MIN_COUNT", "2"))
+
+def _get_rec_feature(rec: dict, key: str, default=None):
+    """Extrai feature da rec acessando rec['signal'] (que carrega mtf/derivatives).
+    Suporta:
+      - 'mtf_aligned'   → signal.mtf.aligned_count (int) ou None
+      - 'funding_pct'   → signal.derivatives.funding_rate_pct (% já em pct) ou None
+      - 'hour_utc'      → derivado de datetime.now() (uso interno)
+    Safety: nunca lança."""
+    try:
+        sig = rec.get("signal") or {}
+        if not isinstance(sig, dict):
+            return default
+        if key == "mtf_aligned":
+            mtf = sig.get("mtf") or {}
+            if not isinstance(mtf, dict):
+                return default
+            return mtf.get("aligned_count", default)
+        if key == "funding_pct":
+            der = sig.get("derivatives") or {}
+            if not isinstance(der, dict):
+                return default
+            return der.get("funding_rate_pct", default)
+    except Exception:
+        return default
+    return default
+
+
 def _is_blocked_time(now_utc: datetime) -> tuple[bool, str]:
     """Retorna (blocked, reason)."""
     if now_utc.hour in _BLOCKED_HOURS:
@@ -991,6 +1027,28 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 if blocked:
                     log.info(f"[time-block] {rec.get('symbol')} {reason} — skip")
                     continue
+
+            # ── MTF aligned gate (postmortem +18.68 lift / 82% wr quando alinhado).
+            if not SHADOW_ENABLED and MTF_ALIGNED_MODE != "off":
+                mtf_aligned_raw = _get_rec_feature(rec, "mtf_aligned", default=None)
+                try:
+                    aligned_count = int(mtf_aligned_raw) if mtf_aligned_raw is not None else None
+                except Exception:
+                    aligned_count = None
+                is_aligned = aligned_count is not None and aligned_count >= MTF_ALIGNED_MIN_COUNT
+                if MTF_ALIGNED_MODE == "required":
+                    if not is_aligned:
+                        log.info(
+                            f"[mtf-gate] {rec.get('symbol')} aligned_count={aligned_count} "
+                            f"< {MTF_ALIGNED_MIN_COUNT} mode=required — skip"
+                        )
+                        continue
+                elif MTF_ALIGNED_MODE == "boost":
+                    if is_aligned:
+                        log.info(
+                            f"[mtf-gate] {rec.get('symbol')} aligned_count={aligned_count} "
+                            f"— preferred (boost mode, sem bloqueio)"
+                        )
 
             # ── Entry throttle (postmortem): cooldown global + max/hora.
             if not SHADOW_ENABLED:
