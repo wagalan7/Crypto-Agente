@@ -54,6 +54,17 @@ VIRTUAL_EQUITY_USD = float(os.getenv("EXCHANGE_SHADOW_EQUITY_USD", "5000"))
 MIN_NOTIONAL_USD = float(os.getenv("EXCHANGE_MIN_NOTIONAL_USD", "50"))
 MAX_RISK_PCT_HARD = float(os.getenv("EXCHANGE_MAX_RISK_PCT", "2.0"))
 
+# Cap de margem por trade (% banca). Quando SL é apertado, sizing por risco
+# fixo (1%) infla notional. Esse cap limita: margin_used = notional/leverage
+# nunca passa de MAX_MARGIN_PCT × equity. Risco real cai abaixo do alvo, mas
+# a banca não fica refém de SL apertado.
+MAX_MARGIN_PCT_PER_TRADE = float(os.getenv("EXCHANGE_MAX_MARGIN_PCT", "15"))
+
+# Cap de exposição agregada (notional somado / equity × 100). Bloqueia abrir
+# nova posição se notional_total + nova_trade > esse limite. 150% = 1.5×
+# banca em exposição total (com 10x lev = 15% margem agregada).
+MAX_TOTAL_NOTIONAL_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_NOTIONAL_PCT", "150"))
+
 
 async def _resolve_equity_usd() -> tuple[float, str]:
     """
@@ -78,13 +89,41 @@ def env_info() -> dict:
         "sizing_mode": "live (com fallback estático em erro)",
         "min_notional_usd": MIN_NOTIONAL_USD,
         "max_risk_pct_hard": MAX_RISK_PCT_HARD,
+        "max_margin_pct_per_trade": MAX_MARGIN_PCT_PER_TRADE,
+        "max_total_notional_pct": MAX_TOTAL_NOTIONAL_PCT,
         "exchange_active": os.getenv("EXCHANGE", "binance"),
-        "note": "Sizing: risk_pct nominal; eleva ao notional mínimo se < $50; pula se risco real > 2%.",
+        "note": "Sizing: risk_pct nominal; eleva ao mín notional; capa em margin%/trade e total notional%.",
     }
 
 
+async def _open_notional_usd() -> float:
+    """Soma notional (entry × qty) dos trades reais auto abertos. Pra cap agregado."""
+    if not DB_ENABLED:
+        return 0.0
+    try:
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            stmt = select(RealTrade).where(
+                RealTrade.status == "open",
+                RealTrade.source == "auto",
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            total = 0.0
+            for t in rows:
+                ep = float(t.entry_price or 0)
+                q = float(t.qty or 0)
+                total += ep * q
+            return total
+    except Exception as e:
+        log.warning(f"[shadow] _open_notional_usd falhou: {e}")
+        return 0.0
+
+
 def _compute_qty(
-    entry: float, stop: float, risk_pct: float, equity_usd: float
+    entry: float, stop: float, risk_pct: float, equity_usd: float,
+    leverage: int = 1,
 ) -> Optional[dict]:
     """
     Dimensiona a posição com guard de notional mínimo + cap de risco máximo.
@@ -109,13 +148,32 @@ def _compute_qty(
     qty_nominal = risk_usd_target / risk_dist
     notional_nominal = qty_nominal * entry
 
+    # Cap de margem por trade — se notional/lev > max_margin% × equity, reduz qty.
+    # Isso protege quando SL é apertado (risk_dist pequeno → qty explode).
+    lev = max(int(leverage or 1), 1)
+    max_margin_usd = equity_usd * (MAX_MARGIN_PCT_PER_TRADE / 100.0)
+    max_notional_by_margin = max_margin_usd * lev
+    capped_reason = None
+    if notional_nominal > max_notional_by_margin:
+        qty_capped = max_notional_by_margin / entry
+        risk_capped_usd = qty_capped * risk_dist
+        risk_pct_capped = (risk_capped_usd / equity_usd) * 100.0
+        capped_reason = (
+            f"margin cap: notional ${notional_nominal:.0f} → ${max_notional_by_margin:.0f} "
+            f"(margem {MAX_MARGIN_PCT_PER_TRADE}% × lev {lev}); "
+            f"risco real {risk_pct:.2f}% → {risk_pct_capped:.2f}%"
+        )
+        qty_nominal = qty_capped
+        notional_nominal = qty_capped * entry
+        risk_pct = risk_pct_capped  # reflete risco real reduzido
+
     if notional_nominal >= MIN_NOTIONAL_USD:
         return {
             "qty": round(qty_nominal, 6),
-            "status": "ok",
+            "status": "capped" if capped_reason else "ok",
             "notional_usd": round(notional_nominal, 2),
             "risk_pct_real": round(risk_pct, 3),
-            "reason": "nominal sizing",
+            "reason": capped_reason or "nominal sizing",
         }
 
     # Inflar pro mínimo
@@ -170,7 +228,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             stop = float(rec.get("stop_loss") or 0)
             risk_pct = float(rec.get("risk_pct") or 1.0)
             equity_usd, equity_src = await _resolve_equity_usd()
-            sizing = _compute_qty(entry, stop, risk_pct, equity_usd)
+            lev = int(rec.get("leverage") or 1)
+            sizing = _compute_qty(entry, stop, risk_pct, equity_usd, leverage=lev)
             if sizing is None:
                 log.warning(f"[shadow] {rec.get('symbol')} risk_dist=0 — pulando")
                 continue
@@ -186,6 +245,23 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 )
                 continue
             qty = sizing["qty"]
+
+            # Cap de exposição agregada — bloqueia se total notional > X% banca
+            try:
+                open_notional = await _open_notional_usd()
+                new_notional = float(sizing["notional_usd"])
+                total_after = open_notional + new_notional
+                cap_usd = equity_usd * (MAX_TOTAL_NOTIONAL_PCT / 100.0)
+                if total_after > cap_usd:
+                    log.warning(
+                        f"[shadow] {rec.get('symbol')} BLOCKED total-notional cap: "
+                        f"open=${open_notional:.0f} + new=${new_notional:.0f} = "
+                        f"${total_after:.0f} > cap ${cap_usd:.0f} "
+                        f"({MAX_TOTAL_NOTIONAL_PCT}% × equity ${equity_usd:.0f})"
+                    )
+                    continue
+            except Exception as e:
+                log.warning(f"[shadow] total-notional check falhou: {e}")
 
             # Snapshot_id é setado em save_recommendations? Não — o `_just_saved`
             # flag é booleano. Precisamos do id do snapshot recém-criado pra
