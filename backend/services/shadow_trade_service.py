@@ -65,6 +65,18 @@ MAX_MARGIN_PCT_PER_TRADE = float(os.getenv("EXCHANGE_MAX_MARGIN_PCT", "15"))
 # banca em exposição total (com 10x lev = 15% margem agregada).
 MAX_TOTAL_NOTIONAL_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_NOTIONAL_PCT", "150"))
 
+# ── Direction flip (Fase 2) ────────────────────────────────────────────────
+# Quando aparece rec na direção OPOSTA a um trade aberto, avalia se a reversão
+# é forte o bastante pra justificar fechar a atual e abrir contra. Por padrão
+# bloqueia (advisory mode) — só flipa se gate de qualidade + risco passa.
+FLIP_ENABLED = os.getenv("FLIP_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+FLIP_MIN_SCORE_DELTA = float(os.getenv("FLIP_MIN_SCORE_DELTA", "10"))
+FLIP_MIN_TIER_UPGRADE = int(os.getenv("FLIP_MIN_TIER_UPGRADE", "1"))  # nível de upgrade exigido
+FLIP_MAX_CURRENT_R = float(os.getenv("FLIP_MAX_CURRENT_R", "0.3"))    # se trade atual > 0.3R, não flipa
+FLIP_COOLDOWN_HOURS = float(os.getenv("FLIP_COOLDOWN_HOURS", "4"))     # min horas entre flips no mesmo símbolo
+
+_TIER_RANK = {"B": 1, "A": 2, "A+": 3}
+
 
 async def _resolve_equity_usd() -> tuple[float, str]:
     """
@@ -119,6 +131,185 @@ async def _open_notional_usd() -> float:
     except Exception as e:
         log.warning(f"[shadow] _open_notional_usd falhou: {e}")
         return 0.0
+
+
+# ── Direction flip helpers ──────────────────────────────────────────────────
+
+
+async def _find_opposite_open_trade(symbol: str, new_direction: str):
+    """Procura RealTrade auto OPEN no símbolo, direção oposta. Retorna o objeto
+    ou None. Usado pra detectar se há candidato a flip."""
+    if not DB_ENABLED:
+        return None
+    try:
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+        opposite_side = "long" if new_direction == "short" else "short"
+        async with get_session() as session:
+            stmt = select(RealTrade).where(
+                RealTrade.symbol == symbol,
+                RealTrade.status == "open",
+                RealTrade.source == "auto",
+                RealTrade.side == opposite_side,
+            )
+            return (await session.execute(stmt)).scalar_one_or_none()
+    except Exception as e:
+        log.warning(f"[flip] busca opposite falhou {symbol}: {e}")
+        return None
+
+
+async def _flip_cooldown_active(symbol: str) -> bool:
+    """True se houve flip nesse símbolo há menos de FLIP_COOLDOWN_HOURS horas.
+    Detecta via notes contendo 'closed_flip' nos closed_at recentes."""
+    if not DB_ENABLED:
+        return False
+    try:
+        from datetime import datetime, timezone, timedelta
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=FLIP_COOLDOWN_HOURS)
+        async with get_session() as session:
+            stmt = select(RealTrade.id).where(
+                RealTrade.symbol == symbol,
+                RealTrade.closed_at >= cutoff,
+                RealTrade.status.like("closed_flip%"),
+            ).limit(1)
+            return (await session.execute(stmt)).scalar_one_or_none() is not None
+    except Exception as e:
+        log.warning(f"[flip] cooldown check falhou {symbol}: {e}")
+        return False
+
+
+async def _get_mark_price(symbol: str) -> float:
+    """Mark price atual do símbolo via positionRisk. 0 se falhar."""
+    try:
+        from services import exchange_service
+        res = await exchange_service.get_positions(symbol=symbol)
+        if not res.get("ok"):
+            return 0.0
+        for p in res.get("positions") or []:
+            return float(p.get("mark_price") or 0)
+    except Exception as e:
+        log.warning(f"[flip] mark_price falhou {symbol}: {e}")
+    return 0.0
+
+
+async def _get_current_tier_score(rec_id: int) -> tuple[str, float]:
+    """Tier e score da rec original que abriu o trade. ('', 0) se não achou."""
+    if not DB_ENABLED or not rec_id:
+        return ("", 0.0)
+    try:
+        from sqlalchemy import select
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        async with get_session() as session:
+            stmt = select(RecommendationSnapshot.tier, RecommendationSnapshot.score).where(
+                RecommendationSnapshot.id == rec_id
+            )
+            row = (await session.execute(stmt)).first()
+            if row:
+                return (row.tier or "", float(row.score or 0))
+    except Exception as e:
+        log.warning(f"[flip] get_current_tier_score falhou: {e}")
+    return ("", 0.0)
+
+
+async def _evaluate_flip_gate(current_trade, new_rec: dict) -> tuple[bool, str]:
+    """
+    Avalia se rec na direção oposta justifica flip automático.
+    Retorna (should_flip, reason).
+    """
+    if not FLIP_ENABLED:
+        return (False, "FLIP_ENABLED=false")
+
+    # 1. Fase: nunca flipa pós-TP1 (lock garantido seria destruído)
+    phase = getattr(current_trade, "phase", None) or "pre_tp1"
+    if phase != "pre_tp1":
+        return (False, f"phase={phase} (pós-TP1 nunca flipa)")
+
+    # 2. Cooldown
+    if await _flip_cooldown_active(current_trade.symbol):
+        return (False, f"cooldown ativo (último flip < {FLIP_COOLDOWN_HOURS}h)")
+
+    # 3. Qualidade — tier upgrade OU score delta
+    new_tier = new_rec.get("tier") or ""
+    new_score = float(new_rec.get("score") or 0)
+    cur_tier, cur_score = await _get_current_tier_score(current_trade.recommendation_id)
+    tier_delta = _TIER_RANK.get(new_tier, 0) - _TIER_RANK.get(cur_tier, 0)
+    score_delta = new_score - cur_score
+    tier_ok = tier_delta >= FLIP_MIN_TIER_UPGRADE
+    score_ok = score_delta >= FLIP_MIN_SCORE_DELTA
+    if not (tier_ok or score_ok):
+        return (False, (
+            f"qualidade insuficiente: tier {cur_tier}→{new_tier} (Δ{tier_delta}, "
+            f"precisa ≥{FLIP_MIN_TIER_UPGRADE}), score {cur_score:.0f}→{new_score:.0f} "
+            f"(Δ{score_delta:+.0f}, precisa ≥{FLIP_MIN_SCORE_DELTA})"
+        ))
+
+    # 4. R atual — não flipa trade já ganhando bem
+    mark = await _get_mark_price(current_trade.symbol)
+    entry = float(current_trade.entry_price or 0)
+    planned_stop = float(current_trade.planned_stop or 0)
+    if mark > 0 and entry > 0 and planned_stop > 0:
+        sign = 1 if current_trade.side == "long" else -1
+        risk_dist = abs(entry - planned_stop)
+        if risk_dist > 0:
+            r_now = ((mark - entry) * sign) / risk_dist
+            if r_now > FLIP_MAX_CURRENT_R:
+                return (False, f"trade atual ganhando {r_now:+.2f}R > {FLIP_MAX_CURRENT_R}R (deixa fluir)")
+
+    return (True, f"approved: tier {cur_tier}→{new_tier} (Δ{tier_delta}), score Δ{score_delta:+.0f}")
+
+
+async def _execute_flip(current_trade) -> bool:
+    """
+    Fecha trade atual via market (reduceOnly), cancela ordens condicionais,
+    marca como closed_flip no DB. Retorna True se conseguiu.
+    """
+    from services import exchange_service, real_trade_service
+    symbol = current_trade.symbol
+    try:
+        # 1. Cancela algo orders pendentes (SL/TP1/TP2)
+        for oid_field in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
+            oid = getattr(current_trade, oid_field, None)
+            if oid:
+                try:
+                    await exchange_service.cancel_algo_order(str(oid))
+                except Exception as e:
+                    log.warning(f"[flip] cancel {oid_field}={oid} falhou: {e}")
+
+        # 2. Market close (reduceOnly)
+        close_side = "Sell" if current_trade.side == "long" else "Buy"
+        close_res = await exchange_service.place_order(
+            symbol=symbol,
+            side=close_side,
+            qty=float(current_trade.qty),
+            order_type="Market",
+            reduce_only=True,
+            client_order_id=f"cw-flip-{current_trade.id}",
+        )
+        if not close_res.get("ok"):
+            log.error(f"[flip] market close falhou trade#{current_trade.id}: {close_res.get('msg') or close_res.get('error')}")
+            return False
+
+        # 3. Exit price aproximado via avgPrice
+        result = close_res.get("result") or {}
+        exit_price = float(result.get("avgPrice") or 0) or await _get_mark_price(symbol) or float(current_trade.entry_price or 0)
+
+        # 4. Fecha no DB
+        await real_trade_service.close_trade(
+            trade_id=current_trade.id,
+            exit_price=exit_price,
+            status="closed_flip",
+            notes=f"auto-flip: fechado pra reversão de direção",
+        )
+        log.info(f"[flip] EXECUTED close trade#{current_trade.id} {symbol} {current_trade.side} → flipping")
+        return True
+    except Exception as e:
+        log.error(f"[flip] erro flipando trade#{current_trade.id}: {e}")
+        return False
 
 
 def _compute_qty(
@@ -223,6 +414,28 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             tier = rec.get("tier")
             if tier not in ("A+", "A"):
                 continue
+
+            # ── Direction flip (Fase 2): se há trade aberto na direção oposta,
+            # avalia gate. Passa → fecha atual primeiro. Bloqueia → advisory
+            # (não abre, snapshot fica como referência informativa).
+            if not SHADOW_ENABLED:
+                opposite = await _find_opposite_open_trade(rec["symbol"], rec["direction"])
+                if opposite is not None:
+                    should_flip, reason = await _evaluate_flip_gate(opposite, rec)
+                    if should_flip:
+                        log.info(
+                            f"[flip] {rec['symbol']} {opposite.side}→{rec['direction']}: {reason}"
+                        )
+                        ok = await _execute_flip(opposite)
+                        if not ok:
+                            log.warning(f"[flip] {rec['symbol']} falhou — pulando entrada nova")
+                            continue
+                        # flip executado — segue fluxo abrindo a nova direção
+                    else:
+                        log.info(
+                            f"[flip] {rec['symbol']} ADVISORY (não executa): {reason}"
+                        )
+                        continue
 
             entry = float(rec.get("entry") or 0)
             stop = float(rec.get("stop_loss") or 0)
