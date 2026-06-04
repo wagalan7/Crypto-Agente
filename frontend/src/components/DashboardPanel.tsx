@@ -757,7 +757,10 @@ function TradeHistory({ trades, liveEquity }: {
             {rows.map(t => {
               const target = statusToTarget(t.status)
               const lev = t.leverage ?? 1
-              const notional = t.notional_usd ?? (t.entry_price * t.qty)
+              // notional_usd no DB pode ter sido salvo como 0 (entry_price=0 no momento da open
+              // de market orders, vem preenchido depois). Recalcula se DB veio inválido.
+              const notionalDb = t.notional_usd
+              const notional = (notionalDb && notionalDb > 0) ? notionalDb : (t.entry_price * t.qty)
               const margem = lev > 0 ? notional / lev : notional
               const bal = balanceMap.get(t.id) ?? { before: 0, after: 0 }
               const sideCls = t.side === 'long'
