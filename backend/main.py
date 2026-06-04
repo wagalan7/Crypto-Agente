@@ -3215,6 +3215,127 @@ async def websocket_analysis(websocket: WebSocket, symbol: str, timeframe: str =
         manager.disconnect(websocket, symbol)
 
 
+@app.get("/api/admin/feature-importance")
+async def admin_feature_importance(hours: int = 168):
+    """
+    Feature importance via win-rate por feature ativa.
+
+    Itera RecommendationSnapshot resolvidos (status != open) na janela.
+    Para cada feature do JSON `features`, agrega wins/losses quando a
+    feature está "ativa" (não-null/não-zero/lista não-vazia). Lift =
+    win_rate da feature - baseline.
+
+    Numéricos: ativos quando != None e != 0. Listas (ex: patterns):
+    cada item vira sua própria feature "patterns:<tipo>". Strings:
+    feature "<nome>:<valor>".
+    """
+    from datetime import timedelta
+    from sqlalchemy import select
+    from db import get_session, DB_ENABLED
+    from models.recommendation_snapshot import RecommendationSnapshot
+
+    if not DB_ENABLED:
+        return {"ok": False, "error": "DB desabilitado"}
+
+    hours = max(1, min(int(hours), 24 * 60))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    async with get_session() as session:
+        stmt = select(RecommendationSnapshot).where(
+            RecommendationSnapshot.status != "open",
+            RecommendationSnapshot.outcome_at >= cutoff,
+        )
+        snaps = (await session.execute(stmt)).scalars().all()
+
+    if not snaps:
+        return {
+            "ok": True,
+            "window_hours": hours,
+            "total_resolved": 0,
+            "baseline_win_rate": 0.0,
+            "features": [],
+        }
+
+    def is_win(s) -> bool:
+        if s.realized_r is not None:
+            return s.realized_r > 0
+        return s.status in ("won_tp1", "won_tp1_be", "won_tp2")
+
+    total = len(snaps)
+    base_wins = sum(1 for s in snaps if is_win(s))
+    baseline = (base_wins / total * 100) if total else 0.0
+
+    # Verifica se existe campo de features (sanity check)
+    sample = next((s for s in snaps if s.features), None)
+    if sample is None:
+        return {
+            "ok": False,
+            "error": "no feature column found in snapshot",
+            "fields_inspected": ["features"],
+        }
+
+    # Agrega por feature
+    agg: dict[str, dict[str, int]] = {}
+
+    def _bump(key: str, win: bool):
+        d = agg.setdefault(key, {"active": 0, "wins": 0, "losses": 0})
+        d["active"] += 1
+        if win:
+            d["wins"] += 1
+        else:
+            d["losses"] += 1
+
+    for s in snaps:
+        feats = s.features or {}
+        if not isinstance(feats, dict):
+            continue
+        win = is_win(s)
+        for k, v in feats.items():
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                if v:
+                    _bump(k, win)
+            elif isinstance(v, (int, float)):
+                if v != 0:
+                    _bump(k, win)
+            elif isinstance(v, str):
+                if v:
+                    _bump(f"{k}:{v}", win)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, (str, int, float)) and item:
+                        _bump(f"{k}:{item}", win)
+                    elif isinstance(item, dict):
+                        t = item.get("type") or item.get("name")
+                        if t:
+                            _bump(f"{k}:{t}", win)
+
+    features_out = []
+    for key, d in agg.items():
+        active = d["active"]
+        wins = d["wins"]
+        losses = d["losses"]
+        wr = (wins / active * 100) if active else 0.0
+        features_out.append({
+            "feature": key,
+            "active_count": active,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wr, 2),
+            "lift_vs_baseline_pct": round(wr - baseline, 2),
+        })
+    features_out.sort(key=lambda x: x["lift_vs_baseline_pct"], reverse=True)
+
+    return {
+        "ok": True,
+        "window_hours": hours,
+        "total_resolved": total,
+        "baseline_win_rate": round(baseline, 2),
+        "features": features_out,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

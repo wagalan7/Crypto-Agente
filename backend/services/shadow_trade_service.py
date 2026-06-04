@@ -118,6 +118,12 @@ SYMBOL_BLACKLIST: set[str] = {
     s.strip().upper() for s in _BLACKLIST_RAW.split(",") if s.strip()
 }
 
+# ── Score threshold (postmortem) ───────────────────────────────────────────
+# Subimos o piso de score para 75 (era implicitamente >=65 via tier A). O
+# postmortem mostrou win-rate sensivelmente melhor acima de 75. Override
+# via env SCORE_MIN.
+SCORE_MIN = float(os.getenv("SCORE_MIN", "75"))
+
 _TIER_RANK = {"B": 1, "A": 2, "A+": 3}
 
 
@@ -927,6 +933,18 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 continue
             tier = rec.get("tier")
             if tier not in ("A+", "A"):
+                continue
+
+            # ── Score threshold (postmortem): piso configurável.
+            try:
+                rec_score = float(rec.get("score") or 0)
+            except Exception:
+                rec_score = 0.0
+            if rec_score < SCORE_MIN:
+                log.info(
+                    f"[score-min] {rec.get('symbol')} score={rec_score:.0f} < "
+                    f"{SCORE_MIN:.0f} — skip"
+                )
                 continue
 
             # ── Entry throttle (postmortem): cooldown global + max/hora.
