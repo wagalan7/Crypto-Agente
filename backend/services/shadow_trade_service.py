@@ -137,7 +137,7 @@ if BLOCK_HOURS_UTC:
     except Exception:
         _BLOCKED_HOURS = set()
 
-BLOCK_DAYS_UTC = os.getenv("BLOCK_DAYS_UTC", "thu").strip().lower()
+BLOCK_DAYS_UTC = os.getenv("BLOCK_DAYS_UTC", "").strip().lower()  # vazio por padrão — bloqueio por dia exige >= 4 semanas de dados pra ter sinal estatisticamente válido
 _DAY_NAMES = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
 _BLOCKED_DAYS: set[str] = set()
 if BLOCK_DAYS_UTC:
