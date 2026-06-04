@@ -154,6 +154,14 @@ MTF_ALIGNED_MODE = os.getenv("MTF_ALIGNED_MODE", "boost").strip().lower()
 # como "aligned=true". Default 2 (típico: 1h+4h ambos a favor).
 MTF_ALIGNED_MIN_COUNT = int(os.getenv("MTF_ALIGNED_MIN_COUNT", "2"))
 
+# ── Funding directional filter (postmortem funding 0-0.05% → 75% wr) ───────
+# Hipótese: funding extremo na mesma direção do trade = trade contra o
+# sentiment dominante (mercado já enviesado) → pior expectância.
+# funding_rate_pct já vem em % (ex: 0.05 = 0.05%/8h), conforme
+# derivatives_service.py (round(funding * 100, 4)).
+FUNDING_GATE_ENABLED = os.getenv("FUNDING_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+FUNDING_BLOCK_THRESHOLD = float(os.getenv("FUNDING_BLOCK_THRESHOLD", "0.05"))  # em %
+
 def _get_rec_feature(rec: dict, key: str, default=None):
     """Extrai feature da rec acessando rec['signal'] (que carrega mtf/derivatives).
     Suporta:
@@ -1027,6 +1035,29 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 if blocked:
                     log.info(f"[time-block] {rec.get('symbol')} {reason} — skip")
                     continue
+
+            # ── Funding directional filter (postmortem: funding 0-0.05% = 75% wr).
+            # Bloqueia trade contra sentiment já super-extremo na mesma direção.
+            if not SHADOW_ENABLED and FUNDING_GATE_ENABLED:
+                funding = _get_rec_feature(rec, "funding_pct", default=None)
+                try:
+                    funding_val = float(funding) if funding is not None else None
+                except Exception:
+                    funding_val = None
+                if funding_val is not None:
+                    direction = rec.get("direction")
+                    if direction == "long" and funding_val > FUNDING_BLOCK_THRESHOLD:
+                        log.info(
+                            f"[funding-gate] {rec.get('symbol')} long blocked "
+                            f"funding={funding_val:.4f}% > {FUNDING_BLOCK_THRESHOLD}% — skip"
+                        )
+                        continue
+                    if direction == "short" and funding_val < -FUNDING_BLOCK_THRESHOLD:
+                        log.info(
+                            f"[funding-gate] {rec.get('symbol')} short blocked "
+                            f"funding={funding_val:.4f}% < -{FUNDING_BLOCK_THRESHOLD}% — skip"
+                        )
+                        continue
 
             # ── MTF aligned gate (postmortem +18.68 lift / 82% wr quando alinhado).
             if not SHADOW_ENABLED and MTF_ALIGNED_MODE != "off":
