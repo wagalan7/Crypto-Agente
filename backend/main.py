@@ -2001,6 +2001,231 @@ async def admin_dedupe_open_trades(dry_run: bool = True):
     }
 
 
+@app.get("/api/admin/loss-postmortem")
+async def admin_loss_postmortem(hours: int = 24):
+    """
+    Analisa trades perdedores das últimas N horas pra encontrar padrões.
+
+    Junta RealTrade (status closed_stop OU pnl_usd<0) com RecommendationSnapshot
+    via recommendation_id pra puxar tier/score/timeframe/features. Devolve
+    agregações (por símbolo, TF, tier, hora UTC, direção), comparação score
+    win vs loss, distribuição de tempo até SL, e top 20 piores trades.
+
+    Best-effort: campos ausentes viram null, não trava o endpoint.
+    """
+    import statistics
+    from datetime import timedelta
+    from sqlalchemy import select
+    from db import get_session, DB_ENABLED
+    from models.real_trade import RealTrade
+    from models.recommendation_snapshot import RecommendationSnapshot
+
+    if not DB_ENABLED:
+        return {"ok": False, "error": "DB desabilitado"}
+
+    hours = max(1, min(int(hours), 24 * 30))  # clamp 1h..30d
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    logging.info(f"[loss-postmortem] window={hours}h cutoff={cutoff.isoformat()}")
+
+    async with get_session() as session:
+        stmt = select(RealTrade).where(
+            RealTrade.status != "open",
+            RealTrade.closed_at >= cutoff,
+        )
+        closed = (await session.execute(stmt)).scalars().all()
+
+        rec_ids = [t.recommendation_id for t in closed if t.recommendation_id]
+        rec_by_id: dict[int, RecommendationSnapshot] = {}
+        if rec_ids:
+            rec_stmt = select(RecommendationSnapshot).where(
+                RecommendationSnapshot.id.in_(rec_ids)
+            )
+            for r in (await session.execute(rec_stmt)).scalars().all():
+                rec_by_id[r.id] = r
+
+    def is_loss(t: RealTrade) -> bool:
+        if t.pnl_usd is not None:
+            return float(t.pnl_usd) < 0
+        return t.status == "closed_stop"
+
+    def is_win(t: RealTrade) -> bool:
+        if t.pnl_usd is not None:
+            return float(t.pnl_usd) > 0
+        return t.status in ("closed_tp1", "closed_tp2")
+
+    wins = [t for t in closed if is_win(t)]
+    losses = [t for t in closed if is_loss(t)]
+    total_closed = len(closed)
+
+    gross_win = sum(float(t.pnl_usd or 0) for t in wins)
+    gross_loss = sum(float(t.pnl_usd or 0) for t in losses)
+    net_pnl = gross_win + gross_loss
+    win_rate = (len(wins) / total_closed * 100) if total_closed else 0.0
+    profit_factor = (gross_win / abs(gross_loss)) if gross_loss < 0 else None
+
+    # by_symbol
+    sym_stats: dict[str, dict] = {}
+    for t in closed:
+        s = sym_stats.setdefault(t.symbol, {"losses": 0, "total": 0, "net_pnl": 0.0})
+        s["total"] += 1
+        s["net_pnl"] += float(t.pnl_usd or 0)
+        if is_loss(t):
+            s["losses"] += 1
+    by_symbol = sorted(
+        [
+            {
+                "symbol": k,
+                "losses": v["losses"],
+                "total": v["total"],
+                "loss_rate_pct": round(v["losses"] / v["total"] * 100, 1) if v["total"] else 0.0,
+                "net_pnl": round(v["net_pnl"], 4),
+            }
+            for k, v in sym_stats.items()
+            if v["losses"] > 0
+        ],
+        key=lambda x: x["losses"],
+        reverse=True,
+    )[:5]
+
+    # by_timeframe
+    tf_stats: dict[str, dict] = {}
+    for t in losses:
+        rec = rec_by_id.get(t.recommendation_id) if t.recommendation_id else None
+        tf = rec.timeframe if rec else "unknown"
+        s = tf_stats.setdefault(tf, {"losses": 0, "net_pnl": 0.0})
+        s["losses"] += 1
+        s["net_pnl"] += float(t.pnl_usd or 0)
+    by_timeframe = [
+        {"timeframe": k, "losses": v["losses"], "net_pnl": round(v["net_pnl"], 4)}
+        for k, v in sorted(tf_stats.items(), key=lambda x: x[1]["losses"], reverse=True)
+    ]
+
+    # by_tier
+    tier_stats: dict[str, dict] = {}
+    for t in losses:
+        rec = rec_by_id.get(t.recommendation_id) if t.recommendation_id else None
+        tier = rec.tier if rec else "unknown"
+        s = tier_stats.setdefault(tier, {"losses": 0, "net_pnl": 0.0})
+        s["losses"] += 1
+        s["net_pnl"] += float(t.pnl_usd or 0)
+    by_tier = [
+        {"tier": k, "losses": v["losses"], "net_pnl": round(v["net_pnl"], 4)}
+        for k, v in sorted(tier_stats.items(), key=lambda x: x[1]["losses"], reverse=True)
+    ]
+
+    # by_hour_utc
+    hour_stats: dict[int, int] = {}
+    for t in losses:
+        if t.opened_at:
+            h = t.opened_at.astimezone(timezone.utc).hour if t.opened_at.tzinfo else t.opened_at.hour
+            hour_stats[h] = hour_stats.get(h, 0) + 1
+    by_hour_utc = [
+        {"hour": h, "losses": hour_stats[h]}
+        for h in sorted(hour_stats.keys())
+    ]
+
+    # by_direction
+    dir_stats = {"long": {"losses": 0, "wins": 0}, "short": {"losses": 0, "wins": 0}}
+    for t in closed:
+        side = t.side if t.side in ("long", "short") else None
+        if not side:
+            continue
+        if is_loss(t):
+            dir_stats[side]["losses"] += 1
+        elif is_win(t):
+            dir_stats[side]["wins"] += 1
+
+    # score analysis
+    def _score_of(t: RealTrade) -> float | None:
+        rec = rec_by_id.get(t.recommendation_id) if t.recommendation_id else None
+        return float(rec.score) if rec and rec.score is not None else None
+
+    win_scores = [s for s in (_score_of(t) for t in wins) if s is not None]
+    loss_scores = [s for s in (_score_of(t) for t in losses) if s is not None]
+    score_analysis = {
+        "avg_score_wins": round(statistics.mean(win_scores), 2) if win_scores else None,
+        "avg_score_losses": round(statistics.mean(loss_scores), 2) if loss_scores else None,
+        "median_score_wins": round(statistics.median(win_scores), 2) if win_scores else None,
+        "median_score_losses": round(statistics.median(loss_scores), 2) if loss_scores else None,
+    }
+
+    # time to SL
+    durations_min: list[float] = []
+    for t in losses:
+        if t.opened_at and t.closed_at:
+            try:
+                d = (t.closed_at - t.opened_at).total_seconds() / 60.0
+                if d >= 0:
+                    durations_min.append(d)
+            except Exception:
+                pass
+    time_to_sl = {
+        "avg": round(statistics.mean(durations_min), 2) if durations_min else None,
+        "median": round(statistics.median(durations_min), 2) if durations_min else None,
+        "fast_losses_under_5min": sum(1 for d in durations_min if d < 5),
+        "slow_losses_over_2h": sum(1 for d in durations_min if d > 120),
+    }
+
+    # loss details (top 20 piores por PnL ascendente)
+    losses_sorted = sorted(losses, key=lambda t: float(t.pnl_usd or 0))[:20]
+    loss_details = []
+    for t in losses_sorted:
+        rec = rec_by_id.get(t.recommendation_id) if t.recommendation_id else None
+        dur_min = None
+        if t.opened_at and t.closed_at:
+            try:
+                dur_min = round((t.closed_at - t.opened_at).total_seconds() / 60.0, 2)
+            except Exception:
+                pass
+        loss_details.append({
+            "id": t.id,
+            "symbol": t.symbol,
+            "direction": t.side,
+            "tf": rec.timeframe if rec else None,
+            "tier": rec.tier if rec else None,
+            "score": float(rec.score) if rec and rec.score is not None else None,
+            "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+            "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+            "duration_min": dur_min,
+            "entry": float(t.entry_price) if t.entry_price is not None else None,
+            "stop": float(t.planned_stop) if t.planned_stop is not None else None,
+            "tp1": float(t.planned_tp1) if t.planned_tp1 is not None else None,
+            "tp2": float(t.planned_tp2) if t.planned_tp2 is not None else None,
+            "pnl_usd": round(float(t.pnl_usd), 4) if t.pnl_usd is not None else None,
+            "status": t.status,
+            "notes": t.notes,
+        })
+
+    logging.info(
+        f"[loss-postmortem] closed={total_closed} wins={len(wins)} losses={len(losses)} "
+        f"win_rate={win_rate:.1f}% net=${net_pnl:.2f}"
+    )
+
+    return {
+        "ok": True,
+        "window_hours": hours,
+        "summary": {
+            "total_trades_closed": total_closed,
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate_pct": round(win_rate, 1),
+            "gross_win_usd": round(gross_win, 4),
+            "gross_loss_usd": round(gross_loss, 4),
+            "net_pnl_usd": round(net_pnl, 4),
+            "profit_factor": round(profit_factor, 2) if profit_factor is not None else None,
+        },
+        "by_symbol": by_symbol,
+        "by_timeframe": by_timeframe,
+        "by_tier": by_tier,
+        "by_hour_utc": by_hour_utc,
+        "by_direction": dir_stats,
+        "score_analysis": score_analysis,
+        "time_to_sl_minutes": time_to_sl,
+        "loss_details": loss_details,
+    }
+
+
 @app.post("/api/kill-switch/reset")
 async def kill_switch_reset():
     """
