@@ -99,6 +99,12 @@ SYMBOL_CLUSTERS = {
 }
 CLUSTER_MAX_OPEN = int(os.getenv("CLUSTER_MAX_OPEN", "2"))
 
+# ── Entry throttle (postmortem) ────────────────────────────────────────────
+# Cooldown global + max entradas/hora pra prevenir "fome de fila" disparando
+# trades em rajada quando o regime de mercado vira contra.
+ENTRY_COOLDOWN_SECONDS = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "300"))  # 5min
+ENTRY_MAX_PER_HOUR = int(os.getenv("ENTRY_MAX_PER_HOUR", "3"))
+
 _TIER_RANK = {"B": 1, "A": 2, "A+": 3}
 
 
@@ -127,6 +133,56 @@ def _get_symbol_cluster(symbol: str) -> str:
         if base in members:
             return cluster
     return "other"
+
+
+async def _last_entry_age_seconds() -> float:
+    """Segundos desde o último RealTrade auto aberto (qualquer símbolo).
+    Retorna inf se nunca houve trade ou DB off."""
+    if not DB_ENABLED:
+        return float("inf")
+    try:
+        from datetime import datetime, timezone
+        from sqlalchemy import select, desc
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            stmt = (
+                select(RealTrade.opened_at)
+                .where(RealTrade.source == "auto")
+                .order_by(desc(RealTrade.opened_at))
+                .limit(1)
+            )
+            row = (await session.execute(stmt)).first()
+            if not row or row[0] is None:
+                return float("inf")
+            last = row[0]
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - last).total_seconds()
+    except Exception as e:
+        log.warning(f"[entry-throttle] last_entry_age falhou: {e}")
+        return float("inf")
+
+
+async def _count_entries_last_hour() -> int:
+    """Conta RealTrade auto abertos na última hora."""
+    if not DB_ENABLED:
+        return 0
+    try:
+        from datetime import datetime, timezone, timedelta
+        from sqlalchemy import select, func
+        from db import get_session
+        from models.real_trade import RealTrade
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        async with get_session() as session:
+            stmt = select(func.count(RealTrade.id)).where(
+                RealTrade.source == "auto",
+                RealTrade.opened_at >= cutoff,
+            )
+            return int((await session.execute(stmt)).scalar() or 0)
+    except Exception as e:
+        log.warning(f"[entry-throttle] count_last_hour falhou: {e}")
+        return 0
 
 
 async def _count_open_in_cluster(cluster: str) -> int:
@@ -839,6 +895,17 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             tier = rec.get("tier")
             if tier not in ("A+", "A"):
                 continue
+
+            # ── Entry throttle (postmortem): cooldown global + max/hora.
+            if not SHADOW_ENABLED:
+                age = await _last_entry_age_seconds()
+                last_hour = await _count_entries_last_hour()
+                if age < ENTRY_COOLDOWN_SECONDS or last_hour >= ENTRY_MAX_PER_HOUR:
+                    log.info(
+                        f"[entry-throttle] cooldown={age:.0f}s "
+                        f"last_hour={last_hour}/{ENTRY_MAX_PER_HOUR} — skip"
+                    )
+                    continue
 
             # ── Cluster correlation cap (postmortem): bloqueia se já há
             # CLUSTER_MAX_OPEN trades abertos num cluster correlacionado.
