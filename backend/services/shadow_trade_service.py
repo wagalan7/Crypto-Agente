@@ -105,6 +105,11 @@ CLUSTER_MAX_OPEN = int(os.getenv("CLUSTER_MAX_OPEN", "2"))
 ENTRY_COOLDOWN_SECONDS = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "300"))  # 5min
 ENTRY_MAX_PER_HOUR = int(os.getenv("ENTRY_MAX_PER_HOUR", "3"))
 
+# ── Global directional cap (postmortem) ────────────────────────────────────
+# Limita exposição direcional total — não fica com 8 longs simultâneos
+# quando o mercado vira pra baixo.
+MAX_OPEN_PER_DIRECTION = int(os.getenv("MAX_OPEN_PER_DIRECTION", "5"))
+
 _TIER_RANK = {"B": 1, "A": 2, "A+": 3}
 
 
@@ -182,6 +187,26 @@ async def _count_entries_last_hour() -> int:
             return int((await session.execute(stmt)).scalar() or 0)
     except Exception as e:
         log.warning(f"[entry-throttle] count_last_hour falhou: {e}")
+        return 0
+
+
+async def _count_open_by_direction(direction: str) -> int:
+    """Conta RealTrade auto open com side==direction (long|short)."""
+    if not DB_ENABLED:
+        return 0
+    try:
+        from sqlalchemy import select, func
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            stmt = select(func.count(RealTrade.id)).where(
+                RealTrade.status == "open",
+                RealTrade.source == "auto",
+                RealTrade.side == direction,
+            )
+            return int((await session.execute(stmt)).scalar() or 0)
+    except Exception as e:
+        log.warning(f"[direction-cap] count falhou: {e}")
         return 0
 
 
@@ -904,6 +929,16 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     log.info(
                         f"[entry-throttle] cooldown={age:.0f}s "
                         f"last_hour={last_hour}/{ENTRY_MAX_PER_HOUR} — skip"
+                    )
+                    continue
+
+            # ── Global directional cap (postmortem): max longs/shorts.
+            if not SHADOW_ENABLED:
+                dir_count = await _count_open_by_direction(rec["direction"])
+                if dir_count >= MAX_OPEN_PER_DIRECTION:
+                    log.info(
+                        f"[direction-cap] {rec['direction']} "
+                        f"{dir_count}/{MAX_OPEN_PER_DIRECTION} — skip"
                     )
                     continue
 
