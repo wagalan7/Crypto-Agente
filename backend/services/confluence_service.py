@@ -8,6 +8,9 @@ antigo é que aqui CADA fator é justificado individualmente, o que dá
 """
 
 from __future__ import annotations
+import json
+import logging
+import os
 from typing import List, Optional
 import pandas as pd
 
@@ -57,6 +60,56 @@ PATTERN_EMPIRICAL_WEIGHT: dict = {
     "ltb":           1.10,   # n=25, wr=92%, +0.82R — sample ainda crescendo
     # Resto = 1.0 (neutro). Patterns com n<10 ou wr<85% ficam sem boost.
 }
+
+
+# ─── Calibração empírica (postmortem 168h, 104 snapshots resolvidos) ──────────
+# Multiplicador aplicado *POR CIMA* do PATTERN_EMPIRICAL_WEIGHT base, refletindo
+# performance observada em janela rolante. Permite ajuste tático sem mexer nos
+# pesos históricos.
+#
+# Observações (n=104, janela 168h):
+#   • ltb              : n=75 (72% dos snaps), lift +0.5% vs baseline → ruído
+#   • double_top       : n=52, lift +3.9% → medíocre
+#   • inverse_h_s      : sample pequeno + lift fraco → reduz
+#   • double_bottom    : n=30, lift +13.2% → bom
+#   • head_and_shoulders: n=12, lift +11.5% → bom
+#   • descending_wedge : n=21, lift +17.5% → excelente
+#   • descending_channel: n=12, lift +28.2% → excelente
+#
+# Override em runtime via env var PATTERN_CALIBRATION_JSON (JSON string).
+PATTERN_WEIGHT_CALIBRATION: dict = {
+    "ltb": 0.0,
+    "double_top": 0.5,
+    "inverse_head_and_shoulders": 0.5,
+    "descending_wedge": 2.0,
+    "descending_channel": 2.0,
+    "double_bottom": 1.5,
+    "head_and_shoulders": 1.5,
+}
+
+
+def _load_pattern_calibration_override() -> dict:
+    raw = os.getenv("PATTERN_CALIBRATION_JSON")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            # Apenas chaves str → floats
+            return {str(k): float(v) for k, v in parsed.items()}
+    except Exception as e:
+        logging.warning(f"[confluence] PATTERN_CALIBRATION_JSON inválido: {e}")
+    return {}
+
+
+_PATTERN_CALIBRATION_OVERRIDE = _load_pattern_calibration_override()
+
+
+def _pattern_calibration_mult(pattern_type: str) -> float:
+    """Multiplicador final (base * override). Default 1.0 se ausente."""
+    if pattern_type in _PATTERN_CALIBRATION_OVERRIDE:
+        return _PATTERN_CALIBRATION_OVERRIDE[pattern_type]
+    return PATTERN_WEIGHT_CALIBRATION.get(pattern_type, 1.0)
 
 
 def _sign_for_direction(direction: SignalDirection, val: int) -> int:
@@ -318,14 +371,20 @@ def calculate_confluence(
             base_pts = p.confidence * 17  # max ~17 por padrão (35 total)
             # Boost empírico baseado em performance histórica do padrão
             empirical_mult = PATTERN_EMPIRICAL_WEIGHT.get(p.type.value, 1.0)
-            pts = round(base_pts * empirical_mult, 1)
+            # Calibração rolante (postmortem 168h sobre 104 snapshots resolvidos)
+            calib_mult = _pattern_calibration_mult(p.type.value)
+            final_mult = empirical_mult * calib_mult
+            pts = round(base_pts * final_mult, 1)
             desc = p.description
-            if empirical_mult > 1.0:
-                desc = f"{desc} [boost empírico ×{empirical_mult}]"
+            if final_mult != 1.0:
+                desc = f"{desc} [mult ×{final_mult:.2f} | base ×{empirical_mult} × calib ×{calib_mult}]"
+            if final_mult <= 0:
+                # Pattern zerado pela calibração — não adiciona ao score.
+                continue
             factors.append(ConfluenceFactor(
                 name=f"Padrão: {p.type.value.replace('_', ' ').title()}",
                 category="pattern",
-                points=pts, max_points=round(17 * empirical_mult, 1), aligned=True,
+                points=pts, max_points=round(17 * final_mult, 1), aligned=True,
                 description=desc,
             ))
     # Padrões contrários = warning
