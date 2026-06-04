@@ -1628,14 +1628,16 @@ async def trade_manager_status():
 
 
 @app.post("/api/trade-manager/backfill-protection")
-async def trade_manager_backfill():
+async def trade_manager_backfill(force: bool = False):
     """
-    Cria SL + TP1 + TP2 na exchange pros trades 'open' source='auto' que
-    ainda não têm sl_order_id setado. Útil pra "consertar" posições abertas
-    antes do bracket existir, ou cujas ordens condicionais falharam.
+    Cria SL + TP1 + TP2 na exchange pros trades 'open' source='auto'.
+
+    - force=false (default): só atua nos sem sl_order_id setado.
+    - force=true: ignora sl_order_id (re-cria mesmo se já tem); em trades
+      já pós-TP1, cria SL em entry (BE) + TP2 (pula TP1).
     """
     from services import trade_manager_service
-    return await trade_manager_service.backfill_protection()
+    return await trade_manager_service.backfill_protection(force=force)
 
 
 # ─── Exchange signed endpoints (#11) ──────────────────────────────────────────

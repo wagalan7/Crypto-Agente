@@ -42,50 +42,55 @@ POLL_SECONDS = int(os.getenv("TRADE_MANAGER_POLL_SECONDS", "15"))
 _TP1_DETECTED_AT = 0.60
 
 
-async def _fetch_exchange_qty(symbol: str) -> float | None:
-    """Busca a qty atual da posição na exchange. Retorna None se erro, 0 se fechada."""
+async def _fetch_exchange_position(symbol: str) -> tuple[float | None, float | None]:
+    """Busca (qty, entry_price) atuais da posição na exchange. (None, None) se erro, (0, None) se fechada."""
     try:
         from services import exchange_service
         res = await exchange_service.get_positions(symbol=symbol)
         if not res.get("ok"):
-            return None
+            return None, None
         for p in res.get("positions") or []:
-            # exchange_service retorna sym normalizado; comparar suficiente
-            return float(p.get("size") or 0)
-        return 0.0  # sem posição = qty 0
+            return float(p.get("size") or 0), float(p.get("entry_price") or 0) or None
+        return 0.0, None
     except Exception as e:
-        log.warning(f"[trade-manager] fetch qty {symbol} falhou: {e}")
-        return None
+        log.warning(f"[trade-manager] fetch position {symbol} falhou: {e}")
+        return None, None
+
+
+async def _fetch_exchange_qty(symbol: str) -> float | None:
+    """Backward-compat wrapper — só retorna qty."""
+    qty, _ = await _fetch_exchange_position(symbol)
+    return qty
 
 
 async def _transition_to_post_tp1(trade: RealTrade) -> bool:
     """
-    TP1 detectado: cancela SL antigo, cria novo SL em entry (breakeven).
-    Retorna True se transitou com sucesso.
+    TP1 detectado: cria novo SL em entry (breakeven), depois cancela SL antigo.
+    Ordem importa: se create falhar, antigo permanece — posição NUNCA fica nua.
     """
     from services import exchange_service, binance_signed_service
     sym = trade.symbol
-    entry = trade.entry_price
 
-    # 1. Cancela SL antigo (algo order — endpoint diferente)
-    if trade.sl_order_id:
-        try:
-            cancel_res = await exchange_service.cancel_algo_order(trade.sl_order_id)
-            if not cancel_res.get("ok"):
-                log.warning(
-                    f"[trade-manager] cancel SL antigo {sym} algoId={trade.sl_order_id} falhou: "
-                    f"{cancel_res.get('msg') or cancel_res.get('error')} (pode já ter sido executado)"
-                )
-        except Exception as e:
-            log.warning(f"[trade-manager] cancel SL {sym} erro: {e}")
+    # Resolve entry price: prefere o real da exchange (mais confiável que DB,
+    # que pode ter avgPrice=0 em market orders).
+    qty_now, entry_real = await _fetch_exchange_position(sym)
+    entry = entry_real or trade.entry_price or trade.planned_tp1 or 0.0
+    if entry <= 0:
+        log.error(
+            f"[trade-manager] {sym} #{trade.id} sem entry_price válido "
+            f"(db={trade.entry_price}, exchange={entry_real}) — abortando transição"
+        )
+        return False
 
-    # 2. Cria novo SL em entry (BE). Reusa place_protection_orders com só SL.
+    qty_rem = qty_now if (qty_now and qty_now > 0) else trade.qty
+
+    # 1. Cria novo SL em BE PRIMEIRO
     entry_side = "Buy" if trade.side == "long" else "Sell"
     try:
         prot = await binance_signed_service.place_protection_orders(
-            sym, entry_side, qty=trade.qty,  # qty restante (pós-parcial)
+            sym, entry_side, qty=qty_rem,
             stop_loss=entry,
-            tp1=None, tp2=None,  # não recria TPs — TP2 antigo ainda está ativo
+            tp1=None, tp2=None,
             client_order_id_prefix=f"cw-be-{trade.id}",
         )
     except Exception as e:
@@ -95,9 +100,23 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
     if not prot.get("sl_ok"):
         log.error(
             f"[trade-manager] CRITICAL: novo SL@BE {sym} falhou: {prot.get('sl_msg')} "
-            f"— trade #{trade.id} sem SL ativo!"
+            f"— mantendo SL antigo (#{trade.sl_order_id})"
         )
         return False
+
+    new_sl_id = prot.get("sl_order_id")
+
+    # 2. SÓ AGORA cancela SL antigo (já temos cobertura nova)
+    if trade.sl_order_id:
+        try:
+            cancel_res = await exchange_service.cancel_algo_order(trade.sl_order_id)
+            if not cancel_res.get("ok"):
+                log.warning(
+                    f"[trade-manager] cancel SL antigo {sym} algoId={trade.sl_order_id}: "
+                    f"{cancel_res.get('msg') or cancel_res.get('error')} (pode já ter executado)"
+                )
+        except Exception as e:
+            log.warning(f"[trade-manager] cancel SL {sym} erro: {e}")
 
     # 3. Atualiza DB
     async with get_session() as session:
@@ -107,14 +126,17 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
         if fresh is None:
             return False
         fresh.phase = "post_tp1"
-        fresh.sl_order_id = prot.get("sl_order_id")
+        fresh.sl_order_id = new_sl_id
         fresh.sl_current_price = entry
+        # Se entry no DB estava errado, atualiza
+        if (not fresh.entry_price or fresh.entry_price <= 0) and entry_real:
+            fresh.entry_price = entry_real
         fresh.updated_at = datetime.now(timezone.utc)
         await session.commit()
 
     log.info(
-        f"[trade-manager] {sym} #{trade.id} → post_tp1: SL movido pra BE {entry} "
-        f"(novo id={prot.get('sl_order_id')})"
+        f"[trade-manager] {sym} #{trade.id} → post_tp1: SL @ BE {entry} qty={qty_rem} "
+        f"(novo algoId={new_sl_id})"
     )
     return True
 
@@ -235,11 +257,16 @@ async def loop() -> None:
 
 
 # ── Backfill de proteção pra trades já abertos sem SL/TP ─────────────────
-async def backfill_protection() -> dict:
+async def backfill_protection(force: bool = False) -> dict:
     """
-    Itera trades RealTrade com status='open' que não têm sl_order_id e cria
-    SL + TP1 + TP2 na exchange. Útil pra "consertar" posições que foram abertas
-    antes desse sistema existir (ou cujas ordens condicionais falharam).
+    Itera trades RealTrade com status='open' e cria SL + TP1 + TP2 na exchange.
+
+    Comportamento:
+      - force=False (default): só atua nos trades sem sl_order_id setado.
+      - force=True: ignora sl_order_id, tenta criar novamente. Útil quando
+        ordens antigas foram canceladas/expiraram (ex: bug do transition).
+        Em modo force, SE o trade já está em phase=post_tp1, cria apenas SL
+        em entry (BE) + TP2; pula TP1 (que já executou).
     """
     if not DB_ENABLED:
         return {"ok": False, "error": "DB disabled"}
@@ -256,45 +283,69 @@ async def backfill_protection() -> dict:
         trades = (await session.execute(stmt)).scalars().all()
 
     for t in trades:
-        # Já tem SL ativo? pula
-        if t.sl_order_id:
+        # Já tem SL ativo e não estamos forçando? pula
+        if t.sl_order_id and not force:
             results.append({"trade_id": t.id, "symbol": t.symbol, "skipped": True, "reason": "já tem sl_order_id"})
             continue
         if not t.planned_stop:
             results.append({"trade_id": t.id, "symbol": t.symbol, "skipped": True, "reason": "sem planned_stop"})
             continue
 
-        # Confirma qty real na exchange
-        qty_now = await _fetch_exchange_qty(t.symbol)
+        # Confirma qty real na exchange + entry price atual
+        qty_now, entry_real = await _fetch_exchange_position(t.symbol)
         if qty_now is None or qty_now <= 0:
             results.append({"trade_id": t.id, "symbol": t.symbol, "skipped": True, "reason": f"qty na exchange = {qty_now}"})
+            continue
+
+        # Em force + phase=post_tp1: SL em BE (entry), não em planned_stop. TP1 já bateu.
+        is_post_tp1 = (t.phase == "post_tp1") or (t.qty_initial and qty_now <= t.qty_initial * _TP1_DETECTED_AT)
+        if force and is_post_tp1:
+            sl_price = entry_real or t.entry_price
+            tp1_arg = None  # já executou
+            tp2_arg = t.planned_tp2
+            note = "force/post_tp1"
+        else:
+            sl_price = t.planned_stop
+            tp1_arg = t.planned_tp1
+            tp2_arg = t.planned_tp2
+            note = "force" if force else "fresh"
+
+        if not sl_price or sl_price <= 0:
+            results.append({"trade_id": t.id, "symbol": t.symbol, "skipped": True, "reason": f"sl_price inválido ({sl_price}); entry_real={entry_real}"})
             continue
 
         entry_side = "Buy" if t.side == "long" else "Sell"
         try:
             prot = await binance_signed_service.place_protection_orders(
                 t.symbol, entry_side, qty=qty_now,
-                stop_loss=t.planned_stop,
-                tp1=t.planned_tp1,
-                tp2=t.planned_tp2,
+                stop_loss=sl_price,
+                tp1=tp1_arg,
+                tp2=tp2_arg,
                 client_order_id_prefix=f"cw-bf-{t.id}",
             )
         except Exception as e:
             results.append({"trade_id": t.id, "symbol": t.symbol, "error": str(e)})
             continue
 
-        # Salva os IDs
+        # Salva os IDs (só sobrescreve se a ordem foi criada com sucesso)
         async with get_session() as session:
             fresh = (await session.execute(
                 select(RealTrade).where(RealTrade.id == t.id)
             )).scalar_one_or_none()
             if fresh:
-                fresh.sl_order_id = prot.get("sl_order_id")
-                fresh.tp1_order_id = prot.get("tp1_order_id")
-                fresh.tp2_order_id = prot.get("tp2_order_id")
-                fresh.sl_current_price = t.planned_stop
+                if prot.get("sl_ok"):
+                    fresh.sl_order_id = prot.get("sl_order_id")
+                    fresh.sl_current_price = sl_price
+                if prot.get("tp1_ok") and tp1_arg:
+                    fresh.tp1_order_id = prot.get("tp1_order_id")
+                if prot.get("tp2_ok"):
+                    fresh.tp2_order_id = prot.get("tp2_order_id")
                 if fresh.qty_initial is None:
                     fresh.qty_initial = qty_now
+                if (not fresh.entry_price or fresh.entry_price <= 0) and entry_real:
+                    fresh.entry_price = entry_real
+                if is_post_tp1 and fresh.phase != "post_tp1":
+                    fresh.phase = "post_tp1"
                 fresh.updated_at = datetime.now(timezone.utc)
                 await session.commit()
 
@@ -303,6 +354,10 @@ async def backfill_protection() -> dict:
             "symbol": t.symbol,
             "side": t.side,
             "qty": qty_now,
+            "entry_real": entry_real,
+            "sl_price_used": sl_price,
+            "note": note,
+            "is_post_tp1": is_post_tp1,
             "planned_stop": t.planned_stop,
             "planned_tp1": t.planned_tp1,
             "planned_tp2": t.planned_tp2,
