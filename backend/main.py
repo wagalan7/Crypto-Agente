@@ -2226,6 +2226,268 @@ async def admin_loss_postmortem(hours: int = 24):
     }
 
 
+@app.get("/api/admin/loss-postmortem-snapshots")
+async def admin_loss_postmortem_snapshots(hours: int = 24):
+    """
+    Postmortem das RECOMENDAÇÕES tracked (paper/shadow) das últimas N horas.
+
+    Análogo ao /api/admin/loss-postmortem (que opera em RealTrade), mas aqui o
+    universo é RecommendationSnapshot — onde mora o tracking dos sinais que o
+    painel sugere, mesmo sem trade real executado. Métrica é R multiple (paper).
+
+    Status terminais: won_tp1, won_tp1_be, won_tp2, lost, expired. "open" sai.
+    Best-effort: campos ausentes viram null.
+    """
+    import statistics
+    from datetime import timedelta
+    from sqlalchemy import select
+    from db import get_session, DB_ENABLED
+    from models.recommendation_snapshot import RecommendationSnapshot
+
+    if not DB_ENABLED:
+        return {"ok": False, "error": "DB desabilitado"}
+
+    hours = max(1, min(int(hours), 720))  # clamp 1h..30d
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    logging.info(f"[loss-postmortem-snap] window={hours}h cutoff={cutoff.isoformat()}")
+
+    async with get_session() as session:
+        stmt = select(RecommendationSnapshot).where(
+            RecommendationSnapshot.status != "open",
+            RecommendationSnapshot.outcome_at >= cutoff,
+        )
+        closed = (await session.execute(stmt)).scalars().all()
+
+    def r_of(s: RecommendationSnapshot) -> float | None:
+        return float(s.realized_r) if s.realized_r is not None else None
+
+    def is_loss(s: RecommendationSnapshot) -> bool:
+        r = r_of(s)
+        if r is not None:
+            return r < 0
+        return s.status == "lost"
+
+    def is_win(s: RecommendationSnapshot) -> bool:
+        r = r_of(s)
+        if r is not None:
+            return r > 0
+        return s.status in ("won_tp1", "won_tp1_be", "won_tp2")
+
+    wins = [s for s in closed if is_win(s)]
+    losses = [s for s in closed if is_loss(s)]
+    total_closed = len(closed)
+
+    gross_win_R = sum((r_of(s) or 0.0) for s in wins)
+    gross_loss_R = sum((r_of(s) or 0.0) for s in losses)
+    net_R = gross_win_R + gross_loss_R
+    win_rate = (len(wins) / total_closed * 100) if total_closed else 0.0
+    profit_factor = (gross_win_R / abs(gross_loss_R)) if gross_loss_R < 0 else None
+
+    # by_symbol — top 10 piores
+    sym_stats: dict[str, dict] = {}
+    for s in closed:
+        d = sym_stats.setdefault(s.symbol, {"losses": 0, "total": 0, "net_R": 0.0})
+        d["total"] += 1
+        d["net_R"] += (r_of(s) or 0.0)
+        if is_loss(s):
+            d["losses"] += 1
+    by_symbol = sorted(
+        [
+            {
+                "symbol": k,
+                "losses": v["losses"],
+                "total": v["total"],
+                "loss_rate_pct": round(v["losses"] / v["total"] * 100, 1) if v["total"] else 0.0,
+                "net_R": round(v["net_R"], 4),
+            }
+            for k, v in sym_stats.items()
+            if v["losses"] > 0
+        ],
+        key=lambda x: x["losses"],
+        reverse=True,
+    )[:10]
+
+    # by_timeframe — agrupa em SCALP/DAY/SWING
+    def _tf_bucket(tf: str | None) -> str:
+        if not tf:
+            return "unknown"
+        t = tf.lower()
+        if t in ("1m", "3m", "5m", "15m"):
+            return "SCALP"
+        if t in ("30m", "1h", "2h", "4h"):
+            return "DAY"
+        if t in ("6h", "8h", "12h", "1d", "1w", "1mo"):
+            return "SWING"
+        return tf
+    tf_stats: dict[str, dict] = {}
+    for s in losses:
+        bucket = _tf_bucket(s.timeframe)
+        d = tf_stats.setdefault(bucket, {"losses": 0, "net_R": 0.0})
+        d["losses"] += 1
+        d["net_R"] += (r_of(s) or 0.0)
+    by_timeframe = [
+        {"timeframe": k, "losses": v["losses"], "net_R": round(v["net_R"], 4)}
+        for k, v in sorted(tf_stats.items(), key=lambda x: x[1]["losses"], reverse=True)
+    ]
+
+    # by_tier
+    tier_stats: dict[str, dict] = {}
+    for s in losses:
+        tier = s.tier or "unknown"
+        d = tier_stats.setdefault(tier, {"losses": 0, "net_R": 0.0})
+        d["losses"] += 1
+        d["net_R"] += (r_of(s) or 0.0)
+    by_tier = [
+        {"tier": k, "losses": v["losses"], "net_R": round(v["net_R"], 4)}
+        for k, v in sorted(tier_stats.items(), key=lambda x: x[1]["losses"], reverse=True)
+    ]
+
+    # by_hour_utc — histograma dos LOSSES (usa created_at, equivalente ao "opened_at")
+    hour_stats: dict[int, int] = {}
+    for s in losses:
+        ts = s.created_at
+        if ts:
+            h = ts.astimezone(timezone.utc).hour if ts.tzinfo else ts.hour
+            hour_stats[h] = hour_stats.get(h, 0) + 1
+    by_hour_utc = [
+        {"hour": h, "losses": hour_stats[h]}
+        for h in sorted(hour_stats.keys())
+    ]
+
+    # by_direction
+    dir_stats = {"long": {"losses": 0, "wins": 0}, "short": {"losses": 0, "wins": 0}}
+    for s in closed:
+        side = s.direction if s.direction in ("long", "short") else None
+        if not side:
+            continue
+        if is_loss(s):
+            dir_stats[side]["losses"] += 1
+        elif is_win(s):
+            dir_stats[side]["wins"] += 1
+
+    # by_leverage — bucketiza por valor exato; expõe wins+losses
+    lev_stats: dict[str, dict] = {}
+    for s in closed:
+        lev = s.leverage if s.leverage is not None else None
+        key = f"{int(lev)}x" if lev is not None else "unknown"
+        d = lev_stats.setdefault(key, {"losses": 0, "wins": 0, "total": 0, "net_R": 0.0})
+        d["total"] += 1
+        d["net_R"] += (r_of(s) or 0.0)
+        if is_loss(s):
+            d["losses"] += 1
+        elif is_win(s):
+            d["wins"] += 1
+    def _lev_sort_key(k: str) -> int:
+        try:
+            return int(k.rstrip("x"))
+        except Exception:
+            return 999
+    by_leverage = [
+        {
+            "leverage": k,
+            "wins": v["wins"],
+            "losses": v["losses"],
+            "total": v["total"],
+            "net_R": round(v["net_R"], 4),
+        }
+        for k, v in sorted(lev_stats.items(), key=lambda x: _lev_sort_key(x[0]))
+    ]
+
+    # score_analysis
+    win_scores = [float(s.score) for s in wins if s.score is not None]
+    loss_scores = [float(s.score) for s in losses if s.score is not None]
+    score_analysis = {
+        "avg_score_wins": round(statistics.mean(win_scores), 2) if win_scores else None,
+        "avg_score_losses": round(statistics.mean(loss_scores), 2) if loss_scores else None,
+        "median_score_wins": round(statistics.median(win_scores), 2) if win_scores else None,
+        "median_score_losses": round(statistics.median(loss_scores), 2) if loss_scores else None,
+    }
+
+    # time to SL (losses)
+    durations_min: list[float] = []
+    for s in losses:
+        if s.created_at and s.outcome_at:
+            try:
+                d = (s.outcome_at - s.created_at).total_seconds() / 60.0
+                if d >= 0:
+                    durations_min.append(d)
+            except Exception:
+                pass
+    time_to_sl = {
+        "avg": round(statistics.mean(durations_min), 2) if durations_min else None,
+        "median": round(statistics.median(durations_min), 2) if durations_min else None,
+        "fast_losses_under_5min": sum(1 for d in durations_min if d < 5),
+        "slow_losses_over_2h": sum(1 for d in durations_min if d > 120),
+    }
+
+    # loss_details top 20 piores (R ascendente)
+    losses_sorted = sorted(losses, key=lambda s: (r_of(s) if r_of(s) is not None else 0.0))[:20]
+    loss_details = []
+    for s in losses_sorted:
+        dur_min = None
+        if s.created_at and s.outcome_at:
+            try:
+                dur_min = round((s.outcome_at - s.created_at).total_seconds() / 60.0, 2)
+            except Exception:
+                pass
+        r_mult = r_of(s)
+        pct_banca = None
+        try:
+            if r_mult is not None and s.risk_pct is not None:
+                pct_banca = round(float(r_mult) * float(s.risk_pct), 4)
+        except Exception:
+            pass
+        loss_details.append({
+            "id": s.id,
+            "symbol": s.symbol,
+            "direction": s.direction,
+            "tf": s.timeframe,
+            "tier": s.tier,
+            "score": float(s.score) if s.score is not None else None,
+            "leverage": int(s.leverage) if s.leverage is not None else None,
+            "opened_at": s.created_at.isoformat() if s.created_at else None,
+            "closed_at": s.outcome_at.isoformat() if s.outcome_at else None,
+            "duration_min": dur_min,
+            "entry": float(s.entry) if s.entry is not None else None,
+            "stop": float(s.stop_loss) if s.stop_loss is not None else None,
+            "tp1": float(s.tp1) if s.tp1 is not None else None,
+            "r_multiple": round(float(r_mult), 4) if r_mult is not None else None,
+            "pct_banca_loss": pct_banca,
+            "status": s.status,
+        })
+
+    logging.info(
+        f"[loss-postmortem-snap] closed={total_closed} wins={len(wins)} losses={len(losses)} "
+        f"win_rate={win_rate:.1f}% net_R={net_R:.2f}"
+    )
+
+    return {
+        "ok": True,
+        "window_hours": hours,
+        "summary": {
+            "unit": "R",
+            "total_snapshots_closed": total_closed,
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate_pct": round(win_rate, 1),
+            "gross_win_R": round(gross_win_R, 4),
+            "gross_loss_R": round(gross_loss_R, 4),
+            "net_R": round(net_R, 4),
+            "profit_factor": round(profit_factor, 2) if profit_factor is not None else None,
+        },
+        "by_symbol": by_symbol,
+        "by_timeframe": by_timeframe,
+        "by_tier": by_tier,
+        "by_hour_utc": by_hour_utc,
+        "by_direction": dir_stats,
+        "by_leverage": by_leverage,
+        "score_analysis": score_analysis,
+        "time_to_sl_minutes": time_to_sl,
+        "loss_details": loss_details,
+    }
+
+
 @app.post("/api/kill-switch/reset")
 async def kill_switch_reset():
     """
