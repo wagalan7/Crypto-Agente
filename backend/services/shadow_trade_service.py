@@ -75,7 +75,29 @@ FLIP_MIN_TIER_UPGRADE = int(os.getenv("FLIP_MIN_TIER_UPGRADE", "1"))  # nível d
 FLIP_MAX_CURRENT_R = float(os.getenv("FLIP_MAX_CURRENT_R", "0.3"))    # se trade atual > 0.3R, não flipa
 FLIP_COOLDOWN_HOURS = float(os.getenv("FLIP_COOLDOWN_HOURS", "4"))     # min horas entre flips no mesmo símbolo
 
+# ── TF upgrade (Fase 3) ────────────────────────────────────────────────────
+# Mesma direção, TF maior: ajusta SL/TPs do trade aberto se nova rec é de
+# qualidade superior. Pré-TP1 atualiza tudo; pós-TP1 só TP2 (SL fica no BE).
+TF_UPGRADE_ENABLED = os.getenv("TF_UPGRADE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+TF_UPGRADE_MIN_SCORE_DELTA = float(os.getenv("TF_UPGRADE_MIN_SCORE_DELTA", "10"))
+TF_UPGRADE_MIN_TIER_UPGRADE = int(os.getenv("TF_UPGRADE_MIN_TIER_UPGRADE", "1"))
+TF_UPGRADE_BUFFER_PCT = float(os.getenv("TF_UPGRADE_BUFFER_PCT", "0.5"))   # SL novo precisa estar >= 0.5% do preço
+TF_UPGRADE_COOLDOWN_HOURS = float(os.getenv("TF_UPGRADE_COOLDOWN_HOURS", "4"))
+TF_UPGRADE_NEAR_TP1_R = float(os.getenv("TF_UPGRADE_NEAR_TP1_R", "0.3"))   # bloqueia se r_now > tp1_R - 0.3
+
 _TIER_RANK = {"B": 1, "A": 2, "A+": 3}
+
+
+def _tf_rank_local(tf: str) -> int:
+    """Mirror de snapshot_service._tf_rank — SCALP=1, DAY=2, SWING=3."""
+    if not tf:
+        return 0
+    t = tf.strip().lower()
+    if t in ("1m", "3m", "5m", "15m"):
+        return 1
+    if t in ("30m", "1h", "2h"):
+        return 2
+    return 3
 
 
 async def _resolve_equity_usd() -> tuple[float, str]:
@@ -312,6 +334,348 @@ async def _execute_flip(current_trade) -> bool:
         return False
 
 
+# ── TF upgrade helpers (Fase 3) ─────────────────────────────────────────────
+
+
+async def _find_same_direction_open_trade(symbol: str, new_direction: str):
+    """Procura RealTrade auto OPEN no símbolo, MESMA direção. Retorna o mais
+    recente (por opened_at desc) ou None. Usado para detectar candidato a TF
+    upgrade."""
+    if not DB_ENABLED:
+        return None
+    try:
+        from sqlalchemy import select, desc
+        from db import get_session
+        from models.real_trade import RealTrade
+        same_side = "long" if new_direction == "long" else "short"
+        async with get_session() as session:
+            stmt = (
+                select(RealTrade)
+                .where(RealTrade.symbol == symbol)
+                .where(RealTrade.status == "open")
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.side == same_side)
+                .order_by(desc(RealTrade.opened_at))
+                .limit(1)
+            )
+            return (await session.execute(stmt)).scalar_one_or_none()
+    except Exception as e:
+        log.warning(f"[tf-upgrade] busca same-direction falhou {symbol}: {e}")
+        return None
+
+
+async def _upgrade_cooldown_active(symbol: str) -> bool:
+    """True se houve TF upgrade nesse símbolo há menos de TF_UPGRADE_COOLDOWN_HOURS.
+    Detecta via notes contendo 'tf_upgrade' no trade aberto (atualizamos notes
+    quando upgrade roda) — janela vale por trade vivo."""
+    if not DB_ENABLED:
+        return False
+    try:
+        from datetime import datetime, timezone, timedelta
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=TF_UPGRADE_COOLDOWN_HOURS)
+        async with get_session() as session:
+            stmt = select(RealTrade.id).where(
+                RealTrade.symbol == symbol,
+                RealTrade.updated_at >= cutoff,
+                RealTrade.notes.like("%tf_upgrade%"),
+            ).limit(1)
+            return (await session.execute(stmt)).scalar_one_or_none() is not None
+    except Exception as e:
+        log.warning(f"[tf-upgrade] cooldown check falhou {symbol}: {e}")
+        return False
+
+
+async def _get_rec_timeframe(rec_id: int) -> str:
+    """Lê timeframe da snapshot original. '' se não achou."""
+    if not DB_ENABLED or not rec_id:
+        return ""
+    try:
+        from sqlalchemy import select
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        async with get_session() as session:
+            stmt = select(RecommendationSnapshot.timeframe).where(
+                RecommendationSnapshot.id == rec_id
+            )
+            row = (await session.execute(stmt)).first()
+            if row:
+                return row.timeframe or ""
+    except Exception as e:
+        log.warning(f"[tf-upgrade] get_rec_timeframe falhou: {e}")
+    return ""
+
+
+async def _evaluate_upgrade_gate(current_trade, new_rec: dict, mark_price: float) -> tuple[bool, str, dict]:
+    """
+    Avalia se rec na mesma direção, em TF maior, justifica ajuste de SL/TPs.
+    Retorna (allow, reason, ctx). ctx contém phase, novos níveis, qty, tiers/scores.
+    """
+    ctx: dict = {}
+    if not TF_UPGRADE_ENABLED:
+        return (False, "TF_UPGRADE_ENABLED=false", ctx)
+
+    # 1. TF estritamente maior
+    new_tf = (new_rec.get("timeframe") or "").strip()
+    cur_tf = await _get_rec_timeframe(current_trade.recommendation_id)
+    cur_rank = _tf_rank_local(cur_tf)
+    new_rank = _tf_rank_local(new_tf)
+    if new_rank <= cur_rank:
+        return (False, f"TF não maior: {cur_tf}(r{cur_rank}) → {new_tf}(r{new_rank})", ctx)
+
+    # 2. Qualidade — tier upgrade OU score delta
+    new_tier = new_rec.get("tier") or ""
+    new_score = float(new_rec.get("score") or 0)
+    cur_tier, cur_score = await _get_current_tier_score(current_trade.recommendation_id)
+    tier_delta = _TIER_RANK.get(new_tier, 0) - _TIER_RANK.get(cur_tier, 0)
+    score_delta = new_score - cur_score
+    tier_ok = tier_delta >= TF_UPGRADE_MIN_TIER_UPGRADE
+    score_ok = score_delta >= TF_UPGRADE_MIN_SCORE_DELTA
+    if not (tier_ok or score_ok):
+        return (False, (
+            f"qualidade insuficiente: tier {cur_tier}→{new_tier} (Δ{tier_delta}, "
+            f"precisa ≥{TF_UPGRADE_MIN_TIER_UPGRADE}), score {cur_score:.0f}→{new_score:.0f} "
+            f"(Δ{score_delta:+.0f}, precisa ≥{TF_UPGRADE_MIN_SCORE_DELTA})"
+        ), ctx)
+
+    # 3. Cooldown
+    if await _upgrade_cooldown_active(current_trade.symbol):
+        return (False, f"cooldown ativo (último upgrade < {TF_UPGRADE_COOLDOWN_HOURS}h)", ctx)
+
+    # 4. Fase do trade atual
+    phase = getattr(current_trade, "phase", None) or "pre_tp1"
+
+    # 5. Near-TP1 block (só pré-TP1 importa)
+    entry = float(current_trade.entry_price or 0)
+    planned_stop = float(current_trade.planned_stop or 0)
+    planned_tp1 = float(current_trade.planned_tp1 or 0)
+    sign = 1 if current_trade.side == "long" else -1
+    if phase == "pre_tp1" and mark_price > 0 and entry > 0 and planned_stop > 0 and planned_tp1 > 0:
+        risk_dist_old = abs(entry - planned_stop)
+        if risk_dist_old > 0:
+            r_now = ((mark_price - entry) * sign) / risk_dist_old
+            tp1_r = ((planned_tp1 - entry) * sign) / risk_dist_old
+            if r_now > (tp1_r - TF_UPGRADE_NEAR_TP1_R):
+                return (False, (
+                    f"near-TP1: r_now={r_now:+.2f} > tp1_R({tp1_r:.2f}) - "
+                    f"{TF_UPGRADE_NEAR_TP1_R} (deixa TP1 disparar)"
+                ), ctx)
+
+    # 6. Geometria do SL novo — distância mark→stop deve ser >= BUFFER_PCT% do preço
+    new_stop = float(new_rec.get("stop_loss") or 0)
+    if mark_price > 0 and new_stop > 0:
+        sl_dist_pct = abs(mark_price - new_stop) / mark_price * 100.0
+        if sl_dist_pct < TF_UPGRADE_BUFFER_PCT:
+            return (False, (
+                f"SL novo muito colado: dist {sl_dist_pct:.2f}% < buffer "
+                f"{TF_UPGRADE_BUFFER_PCT}% (mark={mark_price}, stop={new_stop})"
+            ), ctx)
+
+    # 7. Direção do novo SL deve ser coerente com o lado (long: stop<mark; short: stop>mark)
+    if new_stop > 0 and mark_price > 0:
+        if current_trade.side == "long" and new_stop >= mark_price:
+            return (False, f"SL novo {new_stop} >= mark {mark_price} em long (inválido)", ctx)
+        if current_trade.side == "short" and new_stop <= mark_price:
+            return (False, f"SL novo {new_stop} <= mark {mark_price} em short (inválido)", ctx)
+
+    # 8. Novos níveis
+    sig = new_rec.get("signal") or {}
+    new_tp1 = None
+    if isinstance(sig, dict):
+        try:
+            new_tp1 = float(sig.get("tp1")) if sig.get("tp1") is not None else None
+        except Exception:
+            new_tp1 = None
+    new_tp2 = float(new_rec.get("tp2") or 0) or None
+
+    # 9. Qty: pré-TP1 pode recalcular respeitando cap 3% de risco
+    new_qty = None
+    if phase == "pre_tp1":
+        try:
+            equity_usd, _src = await _resolve_equity_usd()
+            risk_dist_new = abs(entry - new_stop) if new_stop > 0 else 0
+            if risk_dist_new > 0 and equity_usd > 0:
+                # Mantém o risco atual da rec (cap em 3%)
+                risk_pct_new = min(float(new_rec.get("risk_pct") or 1.0), 3.0)
+                lev = int(current_trade.leverage or 1)
+                sizing = _compute_qty(entry, new_stop, risk_pct_new, equity_usd, leverage=lev)
+                if sizing is not None and sizing["status"] != "skip":
+                    new_qty = float(sizing["qty"])
+        except Exception as e:
+            log.warning(f"[tf-upgrade] sizing recalc falhou {current_trade.symbol}: {e}")
+
+    ctx.update({
+        "phase": phase,
+        "new_qty": new_qty,
+        "new_stop": new_stop or None,
+        "new_tp1": new_tp1,
+        "new_tp2": new_tp2,
+        "tier_old": cur_tier,
+        "tier_new": new_tier,
+        "score_old": cur_score,
+        "score_new": new_score,
+        "tf_old": cur_tf,
+        "tf_new": new_tf,
+    })
+    return (True, (
+        f"approved: TF {cur_tf}→{new_tf}, tier {cur_tier}→{new_tier} "
+        f"(Δ{tier_delta}), score Δ{score_delta:+.0f}, phase={phase}"
+    ), ctx)
+
+
+async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
+    """
+    Ajusta SL/TPs do trade aberto refletindo TF/níveis novos.
+      - pre_tp1: cancela SL+TP1+TP2 → recoloca bracket completo (com qty nova)
+      - post_tp1: cancela só TP2 → recoloca TP2 novo (SL fica no BE intocado)
+    Atualiza DB: planned_*, qty, *_order_id, recommendation_id, notes.
+    """
+    from services import exchange_service, binance_signed_service
+    from sqlalchemy import select, desc
+    from datetime import datetime, timezone
+    from db import get_session
+    from models.real_trade import RealTrade
+    from models.recommendation_snapshot import RecommendationSnapshot
+
+    symbol = current_trade.symbol
+    phase = ctx.get("phase") or "pre_tp1"
+    new_stop = ctx.get("new_stop")
+    new_tp1 = ctx.get("new_tp1")
+    new_tp2 = ctx.get("new_tp2")
+    new_qty = ctx.get("new_qty")
+    tf_old = ctx.get("tf_old") or ""
+    tf_new = ctx.get("tf_new") or ""
+
+    try:
+        # 1. Resolve recommendation_id da nova rec (último snapshot do símbolo/dir/tf)
+        new_rec_id = None
+        if DB_ENABLED:
+            try:
+                async with get_session() as session:
+                    stmt = (
+                        select(RecommendationSnapshot.id)
+                        .where(RecommendationSnapshot.symbol == symbol)
+                        .where(RecommendationSnapshot.direction == new_rec.get("direction"))
+                        .where(RecommendationSnapshot.timeframe == new_rec.get("timeframe"))
+                        .order_by(desc(RecommendationSnapshot.created_at))
+                        .limit(1)
+                    )
+                    new_rec_id = (await session.execute(stmt)).scalar_one_or_none()
+            except Exception as e:
+                log.warning(f"[tf-upgrade] resolve new_rec_id falhou {symbol}: {e}")
+
+        # 2. Cancela ordens condicionais conforme a fase
+        cancel_fields = ("sl_order_id", "tp1_order_id", "tp2_order_id") if phase == "pre_tp1" else ("tp2_order_id",)
+        for oid_field in cancel_fields:
+            oid = getattr(current_trade, oid_field, None)
+            if oid:
+                try:
+                    res = await exchange_service.cancel_algo_order(str(oid))
+                    if not res.get("ok"):
+                        log.warning(
+                            f"[tf-upgrade] cancel {oid_field}={oid} {symbol}: "
+                            f"{res.get('msg') or res.get('error')}"
+                        )
+                except Exception as e:
+                    log.warning(f"[tf-upgrade] cancel {oid_field}={oid} falhou: {e}")
+
+        # 3. Recoloca ordens
+        entry_side = "Buy" if current_trade.side == "long" else "Sell"
+        qty_for_brackets = float(new_qty if (phase == "pre_tp1" and new_qty and new_qty > 0) else current_trade.qty)
+
+        new_sl_oid = None
+        new_tp1_oid = None
+        new_tp2_oid = None
+
+        if phase == "pre_tp1":
+            prot = await binance_signed_service.place_protection_orders(
+                symbol, entry_side, qty=qty_for_brackets,
+                stop_loss=new_stop,
+                tp1=new_tp1,
+                tp2=new_tp2,
+                client_order_id_prefix=f"cw-tfu-{current_trade.id}",
+            )
+            if not prot.get("sl_ok"):
+                log.error(
+                    f"[tf-upgrade] CRITICAL: novo SL falhou {symbol} #{current_trade.id}: "
+                    f"{prot.get('sl_msg')} — trade pode estar SEM proteção"
+                )
+                return False
+            new_sl_oid = prot.get("sl_order_id")
+            new_tp1_oid = prot.get("tp1_order_id")
+            new_tp2_oid = prot.get("tp2_order_id")
+            if not prot.get("tp2_ok"):
+                log.warning(f"[tf-upgrade] {symbol} TP2 novo falhou: {prot.get('tp2_msg')}")
+            if prot.get("tp1_skipped"):
+                log.warning(f"[tf-upgrade] {symbol} TP1 skip (qty parcial=0)")
+            elif not prot.get("tp1_ok"):
+                log.warning(f"[tf-upgrade] {symbol} TP1 novo falhou: {prot.get('tp1_msg')}")
+        else:
+            # post_tp1: só TP2 — SL@BE fica intocado, qty atual já é a remanescente
+            prot = await binance_signed_service.place_protection_orders(
+                symbol, entry_side, qty=float(current_trade.qty),
+                stop_loss=None,
+                tp1=None,
+                tp2=new_tp2,
+                client_order_id_prefix=f"cw-tfu-{current_trade.id}",
+            )
+            if not prot.get("tp2_ok"):
+                log.error(
+                    f"[tf-upgrade] TP2 novo falhou post-TP1 {symbol} #{current_trade.id}: "
+                    f"{prot.get('tp2_msg')}"
+                )
+                return False
+            new_tp2_oid = prot.get("tp2_order_id")
+
+        # 4. Atualiza DB
+        if DB_ENABLED:
+            async with get_session() as session:
+                fresh = (await session.execute(
+                    select(RealTrade).where(RealTrade.id == current_trade.id)
+                )).scalar_one_or_none()
+                if fresh is None:
+                    return False
+                if phase == "pre_tp1":
+                    if new_stop:
+                        fresh.planned_stop = new_stop
+                        fresh.sl_current_price = new_stop
+                    if new_tp1 is not None:
+                        fresh.planned_tp1 = new_tp1
+                    if new_tp2 is not None:
+                        fresh.planned_tp2 = new_tp2
+                    if new_qty and new_qty > 0:
+                        fresh.qty = qty_for_brackets
+                        fresh.qty_initial = qty_for_brackets
+                    if new_sl_oid:
+                        fresh.sl_order_id = new_sl_oid
+                    if new_tp1_oid:
+                        fresh.tp1_order_id = new_tp1_oid
+                    if new_tp2_oid:
+                        fresh.tp2_order_id = new_tp2_oid
+                else:
+                    if new_tp2 is not None:
+                        fresh.planned_tp2 = new_tp2
+                    if new_tp2_oid:
+                        fresh.tp2_order_id = new_tp2_oid
+                if new_rec_id:
+                    fresh.recommendation_id = new_rec_id
+                tag = f"tf_upgrade {phase} {tf_old}->{tf_new}"
+                fresh.notes = (fresh.notes + " | " + tag) if fresh.notes else tag
+                fresh.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+
+        log.info(
+            f"[tf-upgrade] {symbol} #{current_trade.id} {phase} {tf_old}->{tf_new} "
+            f"score {ctx.get('score_old', 0):.0f}->{ctx.get('score_new', 0):.0f}"
+        )
+        return True
+    except Exception as e:
+        log.error(f"[tf-upgrade] erro upgrade trade#{current_trade.id} {symbol}: {e}", exc_info=True)
+        return False
+
+
 def _compute_qty(
     entry: float, stop: float, risk_pct: float, equity_usd: float,
     leverage: int = 1,
@@ -435,6 +799,33 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         log.info(
                             f"[flip] {rec['symbol']} ADVISORY (não executa): {reason}"
                         )
+                        continue
+
+                # ── TF upgrade (Fase 3): se já há trade aberto na MESMA
+                # direção e a nova rec é de TF maior + qualidade superior,
+                # ajusta SL/TPs do trade vivo em vez de abrir um segundo.
+                same_dir = await _find_same_direction_open_trade(rec["symbol"], rec["direction"])
+                if same_dir is not None:
+                    mark = await _get_mark_price(rec["symbol"])
+                    allow, reason, ctx = await _evaluate_upgrade_gate(same_dir, rec, mark)
+                    if allow:
+                        log.info(
+                            f"[tf-upgrade] {rec['symbol']} #{same_dir.id}: {reason}"
+                        )
+                        ok = await _execute_tf_upgrade(same_dir, rec, ctx)
+                        if not ok:
+                            log.warning(
+                                f"[tf-upgrade] {rec['symbol']} falhou — não abre trade novo"
+                            )
+                        # Seja sucesso ou falha do upgrade, NÃO abre um segundo trade
+                        # na mesma direção. Pula pra próxima rec.
+                        continue
+                    else:
+                        log.info(
+                            f"[tf-upgrade] {rec['symbol']} SKIP upgrade ({reason}); "
+                            f"trade existente continua — não abre duplicata"
+                        )
+                        # Trade já aberto na mesma direção; não abre paralelo
                         continue
 
             entry = float(rec.get("entry") or 0)
