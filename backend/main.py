@@ -3336,6 +3336,247 @@ async def admin_feature_importance(hours: int = 168):
     }
 
 
+# ─── Bucketing para feature-importance v2 ─────────────────────────────────────
+NUMERIC_BUCKETS = {
+    "funding_pct": [
+        (-999.0, -0.05, "<-0.05"),
+        (-0.05, 0.0, "-0.05_to_0"),
+        (0.0, 0.05, "0_to_0.05"),
+        (0.05, 999.0, ">0.05"),
+    ],
+    "rsi": [
+        (0.0, 30.0, "<30"),
+        (30.0, 50.0, "30-50"),
+        (50.0, 70.0, "50-70"),
+        (70.0, 100.0, ">70"),
+    ],
+    "adx": [
+        (0.0, 20.0, "<20"),
+        (20.0, 30.0, "20-30"),
+        (30.0, 100.0, ">30"),
+    ],
+    "atr_pct": [
+        (0.0, 1.0, "<1"),
+        (1.0, 3.0, "1-3"),
+        (3.0, 999.0, ">3"),
+    ],
+    "mtf_score": [
+        (0.0, 60.0, "<60"),
+        (60.0, 75.0, "60-75"),
+        (75.0, 999.0, ">75"),
+    ],
+    "confluence_pct": [
+        (0.0, 50.0, "<50"),
+        (50.0, 70.0, "50-70"),
+        (70.0, 100.0, ">70"),
+    ],
+    "oi_change_pct": [
+        (-999.0, -5.0, "<-5"),
+        (-5.0, 0.0, "-5_to_0"),
+        (0.0, 5.0, "0_to_5"),
+        (5.0, 999.0, ">5"),
+    ],
+}
+
+HOUR_SESSIONS = {
+    "asia": range(0, 7),
+    "eu": range(7, 14),
+    "us": range(14, 22),
+    "off": range(22, 24),
+}
+
+DAY_LABELS = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
+
+
+def _bucket_for(name: str, value):
+    """Retorna o label do bucket pra um valor numérico, ou None se fora."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    buckets = NUMERIC_BUCKETS.get(name)
+    if not buckets:
+        return None
+    for lo, hi, label in buckets:
+        # Intervalo half-open [lo, hi); último bucket inclui o limite superior.
+        if lo <= v < hi:
+            return label
+    # Cobertura do extremo superior
+    last = buckets[-1]
+    if v >= last[1]:
+        return last[2]
+    return None
+
+
+def _session_for_hour(h: int) -> str | None:
+    try:
+        h = int(h)
+    except Exception:
+        return None
+    for label, rng in HOUR_SESSIONS.items():
+        if h in rng:
+            return label
+    return None
+
+
+@app.get("/api/admin/feature-importance-v2")
+async def admin_feature_importance_v2(hours: int = 168):
+    """
+    feature-importance v2 com bucketing de numéricos.
+
+    Diferenças vs v1:
+      • Numéricos conhecidos (rsi/adx/atr_pct/mtf_score/confluence_pct/
+        funding_pct/oi_change_pct) são discretizados em buckets fixos. Cada
+        bucket vira sua própria feature key "<nome>:<label>".
+      • hour_utc é mapeado em sessões (asia/eu/us/off) → "hour_utc:<sess>".
+      • day_of_week → "dow:<mon|tue|…>".
+      • Booleans, strings (sentiment) e listas (patterns) seguem o v1.
+      • Filtra buckets com active_count < 5 e reporta o count em
+        excluded_low_sample_count.
+    """
+    from datetime import timedelta
+    from sqlalchemy import select
+    from db import get_session, DB_ENABLED
+    from models.recommendation_snapshot import RecommendationSnapshot
+
+    if not DB_ENABLED:
+        return {"ok": False, "error": "DB desabilitado"}
+
+    hours = max(1, min(int(hours), 24 * 60))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    logging.info(f"[feature-importance-v2] window={hours}h cutoff={cutoff.isoformat()}")
+
+    async with get_session() as session:
+        stmt = select(RecommendationSnapshot).where(
+            RecommendationSnapshot.status != "open",
+            RecommendationSnapshot.outcome_at >= cutoff,
+        )
+        snaps = (await session.execute(stmt)).scalars().all()
+
+    if not snaps:
+        return {
+            "ok": True,
+            "window_hours": hours,
+            "total_resolved": 0,
+            "baseline_win_rate": 0.0,
+            "features": [],
+            "excluded_low_sample_count": 0,
+        }
+
+    def is_win(s) -> bool:
+        if s.realized_r is not None:
+            return s.realized_r > 0
+        return s.status in ("won_tp1", "won_tp1_be", "won_tp2")
+
+    total = len(snaps)
+    base_wins = sum(1 for s in snaps if is_win(s))
+    baseline = (base_wins / total * 100) if total else 0.0
+
+    sample = next((s for s in snaps if s.features), None)
+    if sample is None:
+        return {
+            "ok": False,
+            "error": "no feature column found in snapshot",
+            "fields_inspected": ["features"],
+        }
+
+    agg: dict[str, dict[str, int]] = {}
+
+    def _bump(key: str, win: bool):
+        d = agg.setdefault(key, {"active": 0, "wins": 0, "losses": 0})
+        d["active"] += 1
+        if win:
+            d["wins"] += 1
+        else:
+            d["losses"] += 1
+
+    for s in snaps:
+        feats = s.features or {}
+        if not isinstance(feats, dict):
+            continue
+        win = is_win(s)
+        for k, v in feats.items():
+            if v is None:
+                continue
+            # Numéricos com bucketing
+            if k in NUMERIC_BUCKETS:
+                label = _bucket_for(k, v)
+                if label is not None:
+                    _bump(f"{k}:{label}", win)
+                continue
+            # hour_utc → sessão
+            if k == "hour_utc":
+                sess = _session_for_hour(v)
+                if sess is not None:
+                    _bump(f"hour_utc:{sess}", win)
+                continue
+            # day_of_week → label
+            if k == "day_of_week":
+                try:
+                    lbl = DAY_LABELS.get(int(v))
+                except Exception:
+                    lbl = None
+                if lbl is not None:
+                    _bump(f"dow:{lbl}", win)
+                continue
+            # Booleans
+            if isinstance(v, bool):
+                if v:
+                    _bump(k, win)
+            elif isinstance(v, (int, float)):
+                # Numérico não-buckable → fallback v1 (boolean: != 0)
+                if v != 0:
+                    _bump(k, win)
+            elif isinstance(v, str):
+                if v:
+                    _bump(f"{k}:{v}", win)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, (str, int, float)) and item:
+                        _bump(f"{k}:{item}", win)
+                    elif isinstance(item, dict):
+                        t = item.get("type") or item.get("name")
+                        if t:
+                            _bump(f"{k}:{t}", win)
+
+    MIN_SAMPLES = 5
+    excluded = 0
+    features_out = []
+    for key, d in agg.items():
+        active = d["active"]
+        if active < MIN_SAMPLES:
+            excluded += 1
+            continue
+        wins = d["wins"]
+        losses = d["losses"]
+        wr = (wins / active * 100) if active else 0.0
+        features_out.append({
+            "feature": key,
+            "active_count": active,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wr, 2),
+            "lift_vs_baseline_pct": round(wr - baseline, 2),
+        })
+    features_out.sort(key=lambda x: x["lift_vs_baseline_pct"], reverse=True)
+
+    logging.info(
+        f"[feature-importance-v2] resolved={total} baseline={baseline:.2f}% "
+        f"features={len(features_out)} excluded_low_sample={excluded}"
+    )
+
+    return {
+        "ok": True,
+        "window_hours": hours,
+        "total_resolved": total,
+        "baseline_win_rate": round(baseline, 2),
+        "features": features_out,
+        "excluded_low_sample_count": excluded,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
