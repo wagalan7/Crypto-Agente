@@ -147,9 +147,64 @@ async def lifespan(app: FastAPI):
             db.ensure_webhook_token(t["id"])
     except Exception as e:
         logger.warning(f"Erro no backfill de webhook_token: {e}")
+    # Reconciliação GCal: cria eventos para appointments futuros sem
+    # google_event_id (consultas legadas, criadas antes da conexão com
+    # o Google Calendar, ou que perderam o ID por algum motivo).
+    # Roda 1× a cada boot; é idempotente (só pega quem está sem ID).
+    try:
+        _reconcile_gcal_events()
+    except Exception as e:
+        logger.warning(f"Reconciliação GCal falhou: {e}")
     scheduler.start_scheduler()
     logger.info("Agente de Atendimento iniciado")
     yield
+
+
+def _reconcile_gcal_events() -> None:
+    """Para cada tenant com Google Calendar conectado, cria eventos no GCal
+    para appointments futuros cujo google_event_id está vazio. Persiste o
+    novo event_id no banco. CalDAV recebe o mesmo tratamento se não houver
+    GCal configurado."""
+    from datetime import datetime as _dt
+    now_iso = _dt.now().isoformat()
+    total_created = 0
+    for t in db.list_tenants():
+        has_gcal = bool(t.get("google_refresh_token"))
+        has_caldav = bool(t.get("caldav_url")) if not has_gcal else False
+        if not (has_gcal or has_caldav):
+            continue
+        try:
+            with db.get_conn() as conn:
+                rows = conn.execute(
+                    """SELECT id, patient_name, scheduled_at FROM appointments
+                       WHERE tenant_id = ?
+                         AND (google_event_id IS NULL OR google_event_id = '')
+                         AND scheduled_at >= ?
+                         AND (cancelled IS NULL OR cancelled = 0)""",
+                    (t["id"], now_iso),
+                ).fetchall()
+        except Exception as e:
+            logger.warning(f"[reconcile] tenant {t.get('slug')}: query falhou: {e}")
+            continue
+        duration = t.get("session_minutes", 50)
+        for r in rows:
+            appt_id = r["id"]
+            name = r["patient_name"] or "Paciente"
+            scheduled_at = r["scheduled_at"]
+            try:
+                new_id = None
+                if has_gcal:
+                    new_id = gcal.create_event(t, name, scheduled_at, duration)
+                elif has_caldav:
+                    new_id = caldav_svc.create_event(t, name, scheduled_at, duration)
+                if new_id:
+                    db.set_appointment_google_event_id(appt_id, new_id)
+                    total_created += 1
+                    logger.info(f"[reconcile][{t['slug']}] appt {appt_id} ({name}) → event_id={new_id}")
+            except Exception as e:
+                logger.warning(f"[reconcile][{t.get('slug')}] appt {appt_id} falhou: {e}")
+    if total_created:
+        logger.info(f"[reconcile] {total_created} evento(s) criado(s) no calendário externo")
 
 
 # ── Sentry (observabilidade) ─────────────────────────────────────────────────
