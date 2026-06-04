@@ -773,22 +773,52 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 # Buscar google_event_id antes de atualizar
                 appt = db.get_appointment_by_id(tenant_id, appt_id)
                 db.update_appointment(tenant_id, appt_id, slot)
-                # Sincronizar com Google Calendar
-                try:
-                    if appt and appt.get("google_event_id") and tenant.get("google_refresh_token"):
-                        gcal.update_event(tenant, appt["google_event_id"],
-                                          appt.get("patient_name", "Paciente"),
-                                          slot.isoformat(), tenant.get("session_minutes", 50))
-                except Exception as e:
-                    logger.warning(f"[gcal] update_event falhou: {e}")
-                # Sincronizar com CalDAV (se configurado e Google não estiver ativo)
-                try:
-                    if appt and appt.get("google_event_id") and not tenant.get("google_refresh_token"):
-                        caldav_svc.update_event(tenant, appt["google_event_id"],
-                                                appt.get("patient_name", "Paciente"),
-                                                slot.isoformat(), tenant.get("session_minutes", 50))
-                except Exception as e:
-                    logger.warning(f"[caldav] update_event falhou: {e}")
+                # ── Sincronizar com Google Calendar / CalDAV ─────────────────
+                # Antes só atualizava se já existisse google_event_id; isso
+                # quebrava remarcações de pacientes cuja consulta foi criada
+                # ANTES da integração com o GCal (event_id vazio). Agora:
+                #   1. Se houver event_id → tenta update
+                #   2. Se update falhar OU event_id estiver vazio → cria evento
+                #      novo no horário novo e persiste o event_id.
+                # O evento antigo (se órfão) fica no GCal e a Bruna remove
+                # manualmente — preferível a perder o novo agendamento.
+                patient_name = appt.get("patient_name", "Paciente") if appt else "Paciente"
+                duration_min = tenant.get("session_minutes", 50)
+                gcal_ok = False
+                if tenant.get("google_refresh_token"):
+                    try:
+                        if appt and appt.get("google_event_id"):
+                            gcal_ok = gcal.update_event(
+                                tenant, appt["google_event_id"], patient_name,
+                                slot.isoformat(), duration_min,
+                            )
+                        if not gcal_ok:
+                            new_id = gcal.create_event(
+                                tenant, patient_name, slot.isoformat(), duration_min,
+                            )
+                            if new_id:
+                                db.set_appointment_google_event_id(int(appt_id), new_id)
+                                gcal_ok = True
+                                logger.info(f"[gcal] reschedule fallback create: novo event_id={new_id}")
+                    except Exception as e:
+                        logger.warning(f"[gcal] sincronização de update falhou: {e}")
+                # CalDAV apenas quando Google não está ativo
+                if not tenant.get("google_refresh_token"):
+                    try:
+                        cd_ok = False
+                        if appt and appt.get("google_event_id"):
+                            cd_ok = caldav_svc.update_event(
+                                tenant, appt["google_event_id"], patient_name,
+                                slot.isoformat(), duration_min,
+                            )
+                        if not cd_ok:
+                            new_uid = caldav_svc.create_event(
+                                tenant, patient_name, slot.isoformat(), duration_min,
+                            )
+                            if new_uid:
+                                db.set_appointment_google_event_id(int(appt_id), new_uid)
+                    except Exception as e:
+                        logger.warning(f"[caldav] sincronização de update falhou: {e}")
                 formatted = cal.format_slots([slot])[0]
                 # ── Anti-alucinação: a LLM às vezes inventa o dia da semana
                 # (ex: "sexta, 11/06" quando 11/06 é quinta). Substituímos

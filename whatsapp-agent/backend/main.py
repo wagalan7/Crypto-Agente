@@ -892,20 +892,43 @@ async def dash_reschedule(appt_id: int, body: RescheduleBody, request: Request):
             (appt_id, tenant["id"])
         )
 
-    # Atualiza no Google Calendar
-    if appt.get("google_event_id") and tenant.get("google_refresh_token"):
+    # Atualiza no Google Calendar (fallback cria evento novo se faltar event_id
+    # ou se o update falhar — assim consultas criadas antes da conexão com o
+    # GCal também aparecem após o reagendamento).
+    if tenant.get("google_refresh_token"):
+        gcal_ok = False
         try:
-            gcal.update_event(tenant, appt["google_event_id"],
-                              appt["patient_name"], new_dt.isoformat(),
-                              tenant.get("session_minutes", 50))
+            if appt.get("google_event_id"):
+                gcal_ok = gcal.update_event(
+                    tenant, appt["google_event_id"], appt["patient_name"],
+                    new_dt.isoformat(), tenant.get("session_minutes", 50),
+                )
+            if not gcal_ok:
+                new_id = gcal.create_event(
+                    tenant, appt["patient_name"], new_dt.isoformat(),
+                    tenant.get("session_minutes", 50),
+                )
+                if new_id:
+                    db.set_appointment_google_event_id(appt_id, new_id)
+                    logger.info(f"[gcal] reschedule(dashboard) fallback create: novo event_id={new_id}")
         except Exception as e:
             logger.warning(f"[gcal] reagendamento falhou: {e}")
     # Atualiza no CalDAV (se Google não estiver conectado)
-    elif appt.get("google_event_id") and not tenant.get("google_refresh_token"):
+    elif not tenant.get("google_refresh_token"):
         try:
-            caldav_svc.update_event(tenant, appt["google_event_id"],
-                                    appt["patient_name"], new_dt.isoformat(),
-                                    tenant.get("session_minutes", 50))
+            cd_ok = False
+            if appt.get("google_event_id"):
+                cd_ok = caldav_svc.update_event(
+                    tenant, appt["google_event_id"], appt["patient_name"],
+                    new_dt.isoformat(), tenant.get("session_minutes", 50),
+                )
+            if not cd_ok:
+                new_uid = caldav_svc.create_event(
+                    tenant, appt["patient_name"], new_dt.isoformat(),
+                    tenant.get("session_minutes", 50),
+                )
+                if new_uid:
+                    db.set_appointment_google_event_id(appt_id, new_uid)
         except Exception as e:
             logger.warning(f"[caldav] reagendamento falhou: {e}")
 
