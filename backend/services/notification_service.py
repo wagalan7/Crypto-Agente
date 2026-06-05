@@ -137,6 +137,40 @@ def fmt_trade_closed(trade: Any, reason: str = "?", pnl: Optional[float] = None)
     )
 
 
+def fmt_time_stop(
+    trade: Any,
+    age_min: float,
+    threshold_min: int,
+    category: str = "?",
+) -> str:
+    """Trade fechado por time stop: explica TF, idade, threshold e motivo."""
+    symbol = _get(trade, "symbol", "?")
+    side = str(_get(trade, "side", "?")).upper()
+    entry = _get(trade, "entry_price", 0) or 0
+    tp1 = _get(trade, "planned_tp1", 0) or 0
+    tf = _get(trade, "timeframe", "?")
+    if age_min < 60:
+        age_str = f"{age_min:.0f}min"
+    elif age_min < 1440:
+        age_str = f"{age_min/60:.1f}h"
+    else:
+        age_str = f"{age_min/1440:.1f}d"
+    if threshold_min < 60:
+        thr_str = f"{threshold_min}min"
+    elif threshold_min < 1440:
+        thr_str = f"{threshold_min//60}h"
+    else:
+        thr_str = f"{threshold_min//1440}d"
+    return (
+        f"\u23F1\uFE0F *Time Stop* \u2014 `{symbol}` ({side})\n"
+        f"Categoria: `{category.upper()}` (TF `{tf}`)\n"
+        f"Idade: `{age_str}` \u2265 limite `{thr_str}`\n"
+        f"Trade fechado SEM atingir TP1.\n"
+        f"Entry: `{_fmt_num(entry)}` \u00B7 TP1 alvo: `{_fmt_num(tp1)}`\n"
+        f"_Motivo: posicao sem progresso no prazo limite. Liberar capital pra setups mais frescos._"
+    )
+
+
 def fmt_kill_switch(daily_pnl: float, threshold: float) -> str:
     return (
         f"\U0001F6A8 *KILL SWITCH ATIVADO*\n"

@@ -41,6 +41,38 @@ POLL_SECONDS = int(os.getenv("TRADE_MANAGER_POLL_SECONDS", "15"))
 # 0.6 dá folga pra arredondamentos (parcial planejada é 45%, resta 55% ≈ 0.55).
 _TP1_DETECTED_AT = 0.60
 
+# ── Time stop (Fase B Lite, postmortem N=237) ──────────────────────────────
+# 42% dos SLs duraram > 2h (slow bleed). Fecha trade que não atingiu TP1
+# após um teto por categoria de TF. Defaults:
+#   SCALP (1m-15m)   → 240 min  (4h)
+#   DAY   (30m-2h)   → 1440 min (24h)
+#   SWING (4h+)      → 10080 min (1 semana)
+TIME_STOP_ENABLED = os.getenv("TIME_STOP_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+TIME_STOP_SCALP_MIN = int(os.getenv("TIME_STOP_SCALP_MIN", "240"))
+TIME_STOP_DAY_MIN = int(os.getenv("TIME_STOP_DAY_MIN", "1440"))
+TIME_STOP_SWING_MIN = int(os.getenv("TIME_STOP_SWING_MIN", "10080"))
+
+
+def _tf_category(tf: str | None) -> str:
+    """Mapeia timeframe → 'scalp' | 'day' | 'swing'."""
+    if not tf:
+        return "day"
+    t = tf.strip().lower()
+    if t in ("1m", "3m", "5m", "15m"):
+        return "scalp"
+    if t in ("30m", "1h", "2h"):
+        return "day"
+    return "swing"
+
+
+def _time_stop_threshold_min(tf: str | None) -> int:
+    cat = _tf_category(tf)
+    if cat == "scalp":
+        return TIME_STOP_SCALP_MIN
+    if cat == "day":
+        return TIME_STOP_DAY_MIN
+    return TIME_STOP_SWING_MIN
+
 
 async def _fetch_exchange_position(symbol: str) -> tuple[float | None, float | None]:
     """Busca (qty, entry_price) atuais da posição na exchange. (None, None) se erro, (0, None) se fechada."""
@@ -216,11 +248,113 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
         log.error(f"[trade-manager] close_trade {trade.id} erro: {e}")
 
 
+async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
+    """
+    Time stop: se trade está em pre_tp1 há mais que o threshold do TF, fecha
+    mercado, envia alerta Telegram explicando o motivo, e marca como
+    closed_manual com nota time_stop.
+
+    Retorna True se fechou; False caso contrário.
+    Pós-TP1 NÃO dispara — trade já parcialmente realizado fica protegido
+    por BE e pode rodar TP2 quanto quiser.
+    """
+    if not TIME_STOP_ENABLED:
+        return False
+    if trade.phase == "post_tp1":
+        return False
+    if not trade.opened_at:
+        return False
+
+    threshold_min = _time_stop_threshold_min(trade.timeframe)
+    opened = trade.opened_at
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=timezone.utc)
+    age_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+    if age_min < threshold_min:
+        return False
+
+    cat = _tf_category(trade.timeframe)
+    sym = trade.symbol
+    log.info(
+        f"[time-stop] {sym} #{trade.id} idade={age_min:.0f}min >= {threshold_min}min "
+        f"({cat.upper()}) — fechando market"
+    )
+
+    # 1. Fecha posição market (reduce_only pra não inverter)
+    try:
+        from services import binance_signed_service, exchange_service
+        exit_side = "Sell" if trade.side == "long" else "Buy"
+        res = await binance_signed_service.place_order(
+            sym, exit_side, qty=qty_now,
+            order_type="Market",
+            reduce_only=True,
+            client_order_id=f"cw-ts-{trade.id}",
+        )
+        if not res.get("ok"):
+            log.warning(f"[time-stop] {sym} close market falhou: {res.get('error')}")
+            # Mesmo assim segue — o ciclo seguinte vai detectar qty=0 ou retry
+            return False
+    except Exception as e:
+        log.warning(f"[time-stop] {sym} exchange close erro: {e}")
+        return False
+
+    # 2. Cancela algo orders órfãs (SL/TPs ainda pendentes)
+    try:
+        from services import exchange_service
+        for oid_field in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
+            oid = getattr(trade, oid_field, None)
+            if oid:
+                try:
+                    await exchange_service.cancel_algo_order(str(oid))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 3. Marca closed_manual com nota time_stop e exit price = mark atual ou entry
+    try:
+        from services import real_trade_service
+        _, entry_real = await _fetch_exchange_position(sym)  # talvez já zerado
+        exit_price = entry_real or trade.entry_price
+        await real_trade_service.close_trade(
+            trade.id,
+            exit_price=exit_price or trade.entry_price,
+            status="closed_manual",
+            notes=(
+                f"time_stop {cat} age={age_min:.0f}min "
+                f">= {threshold_min}min (sem TP1)"
+            ),
+        )
+        log.info(f"[time-stop] {sym} #{trade.id} CLOSED time_stop @ {exit_price}")
+    except Exception as e:
+        log.error(f"[time-stop] close_trade {trade.id} erro: {e}")
+
+    # 4. Telegram alerta com motivo
+    try:
+        from services.notification_service import send_telegram, fmt_time_stop
+        await send_telegram(
+            fmt_time_stop(trade, age_min=age_min, threshold_min=threshold_min, category=cat),
+            event_type="time_stop",
+        )
+    except Exception as e:
+        log.warning(f"[notify] telegram time_stop falhou: {e}")
+
+    return True
+
+
 async def _process_trade(trade: RealTrade) -> None:
     """Avalia um trade aberto e age conforme a fase."""
     qty_now = await _fetch_exchange_qty(trade.symbol)
     if qty_now is None:
         return  # erro de leitura — pula esse ciclo
+
+    # ── Time stop check (antes de qualquer outra coisa) ──────────────────
+    if qty_now > 0:
+        try:
+            if await _check_time_stop(trade, qty_now):
+                return
+        except Exception as e:
+            log.warning(f"[time-stop] check #{trade.id} erro: {e}")
 
     qty_initial = trade.qty_initial or trade.qty
 

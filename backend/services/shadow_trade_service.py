@@ -158,6 +158,8 @@ SCORE_MIN = float(os.getenv("SCORE_MIN", "72"))
 # Sessão EU (7-14 UTC) mostrou 50 trades / 42% wr / lift -21.46%.
 # Quinta-feira mostrou 67 trades / 50.75% wr / lift -12.72%. Bloqueia ambos
 # por padrão; override via env (string vazia desativa).
+# thu reativado pós-análise N=237 (lift -9.6pp em 124 trades, vários thursdays)
+BLOCK_DAYS_DEFAULT = "thu"
 BLOCK_HOURS_UTC = os.getenv("BLOCK_HOURS_UTC", "7,8,9,10,11,12,13").strip()
 _BLOCKED_HOURS: set[int] = set()
 if BLOCK_HOURS_UTC:
@@ -166,7 +168,7 @@ if BLOCK_HOURS_UTC:
     except Exception:
         _BLOCKED_HOURS = set()
 
-BLOCK_DAYS_UTC = os.getenv("BLOCK_DAYS_UTC", "").strip().lower()  # vazio por padrão — bloqueio por dia exige >= 4 semanas de dados pra ter sinal estatisticamente válido
+BLOCK_DAYS_UTC = os.getenv("BLOCK_DAYS_UTC", BLOCK_DAYS_DEFAULT).strip().lower()
 _DAY_NAMES = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
 _BLOCKED_DAYS: set[str] = set()
 if BLOCK_DAYS_UTC:
@@ -191,30 +193,193 @@ MTF_ALIGNED_MIN_COUNT = int(os.getenv("MTF_ALIGNED_MIN_COUNT", "2"))
 FUNDING_GATE_ENABLED = os.getenv("FUNDING_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 FUNDING_BLOCK_THRESHOLD = float(os.getenv("FUNDING_BLOCK_THRESHOLD", "0.05"))  # em %
 
+# ── ATR gate (Fase B Lite, postmortem N=237) ───────────────────────────────
+# atr_pct > 3% mostrou lift -10.6pp em n=36. Vol muito alta = SL voa.
+ATR_GATE_ENABLED = os.getenv("ATR_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+ATR_BLOCK_THRESHOLD = float(os.getenv("ATR_BLOCK_THRESHOLD", "3.0"))
+
+# ── Score adjusters (Fase B Lite, postmortem N=237) ────────────────────────
+# Ajustes baseados em lift_vs_baseline. Aplicados como delta no score antes
+# do SCORE_MIN gate. Cap em ±20 pra não dominar o sinal original.
+SCORE_ADJUSTERS_ENABLED = os.getenv("SCORE_ADJUSTERS_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+SCORE_ADJUSTER_CAP = float(os.getenv("SCORE_ADJUSTER_CAP", "20"))
+
 def _get_rec_feature(rec: dict, key: str, default=None):
-    """Extrai feature da rec acessando rec['signal'] (que carrega mtf/derivatives).
-    Suporta:
-      - 'mtf_aligned'   → signal.mtf.aligned_count (int) ou None
-      - 'funding_pct'   → signal.derivatives.funding_rate_pct (% já em pct) ou None
-      - 'hour_utc'      → derivado de datetime.now() (uso interno)
-    Safety: nunca lança."""
+    """Extrai feature da rec acessando rec['signal']. Safety: nunca lança."""
     try:
         sig = rec.get("signal") or {}
         if not isinstance(sig, dict):
             return default
         if key == "mtf_aligned":
             mtf = sig.get("mtf") or {}
-            if not isinstance(mtf, dict):
-                return default
-            return mtf.get("aligned_count", default)
+            return mtf.get("aligned_count", default) if isinstance(mtf, dict) else default
+        if key == "mtf_score":
+            mtf = sig.get("mtf") or {}
+            return mtf.get("alignment_score", default) if isinstance(mtf, dict) else default
         if key == "funding_pct":
             der = sig.get("derivatives") or {}
-            if not isinstance(der, dict):
-                return default
-            return der.get("funding_rate_pct", default)
+            return der.get("funding_rate_pct", default) if isinstance(der, dict) else default
+        if key == "funding_sentiment":
+            der = sig.get("derivatives") or {}
+            return der.get("funding_sentiment", default) if isinstance(der, dict) else default
+        if key == "rsi":
+            ind = sig.get("indicators") or {}
+            return ind.get("rsi", default) if isinstance(ind, dict) else default
+        if key == "adx":
+            ind = sig.get("indicators") or {}
+            return ind.get("adx", default) if isinstance(ind, dict) else default
+        if key == "atr_pct":
+            ind = sig.get("indicators") or {}
+            atr = ind.get("atr") if isinstance(ind, dict) else None
+            entry = sig.get("entry") or rec.get("entry") or 0
+            if atr and entry:
+                try:
+                    return (float(atr) / float(entry)) * 100.0
+                except Exception:
+                    return default
+            return default
+        if key == "confluence_pct":
+            conf = sig.get("confluence") or {}
+            return conf.get("pct", default) if isinstance(conf, dict) else default
+        if key == "patterns":
+            pats = sig.get("patterns") or []
+            out = []
+            for p in pats if isinstance(pats, list) else []:
+                if isinstance(p, dict) and p.get("type"):
+                    out.append(p["type"])
+            return out
     except Exception:
         return default
     return default
+
+
+def _hour_bucket(hour_utc: int) -> str:
+    """Buckets de hora UTC usados no feature-importance v2."""
+    if 7 <= hour_utc <= 13:
+        return "eu"
+    if 14 <= hour_utc <= 21:
+        return "us"
+    if 0 <= hour_utc <= 6:
+        return "asia"
+    return "off"
+
+
+def _compute_score_adjustment(rec: dict, now_utc: datetime) -> tuple[float, list[str]]:
+    """
+    Calcula delta de score baseado em features de alto lift (N=237).
+    Retorna (delta, reasons[]). Cap em ±SCORE_ADJUSTER_CAP.
+
+    Pesos calibrados a partir de feature-importance v2:
+      • atr_pct > 3                   → -8   (lift -10.6pp)
+      • confluence_pct < 50           → -4   (lift -4.4pp)
+      • rsi < 30                      → -7   (lift -9.2pp)
+      • adx > 30                      → -2   (lift -1.9pp, suave)
+      • confluence_pct ∈ [50,70]      → +12  (lift +19pp, sweet spot)
+      • mtf_aligned (count >=2)       → +8   (lift +12.2pp)
+      • atr_pct < 1                   → +6   (lift +8.6pp)
+      • adx < 20                      → +6   (lift +12.3pp, mean reversion)
+      • funding_sentiment=neutral     → +6   (lift +11.6pp)
+      • funding_pct ∈ [-0.05, 0.05]   → +6   (lift +9-22pp)
+      • pattern: descending_channel   → +12  (lift +17.2pp)
+      • pattern: descending_wedge     → +10  (lift +14.8pp)
+      • pattern: inv_h&s              → +7   (lift +10.6pp)
+      • pattern: double_bottom        → +6   (lift +10.3pp)
+      • hour_utc ∈ asia               → +6   (lift +15.2pp)
+      • hour_utc ∈ us                 → +5   (lift +10.5pp)
+    """
+    delta = 0.0
+    reasons: list[str] = []
+
+    atr_pct = _get_rec_feature(rec, "atr_pct")
+    if atr_pct is not None:
+        try:
+            v = float(atr_pct)
+            if v > 3.0:
+                delta -= 8; reasons.append(f"atr>{v:.2f}(-8)")
+            elif v < 1.0:
+                delta += 6; reasons.append(f"atr<1(+6)")
+        except Exception:
+            pass
+
+    conf_pct = _get_rec_feature(rec, "confluence_pct")
+    if conf_pct is not None:
+        try:
+            v = float(conf_pct)
+            if v < 50:
+                delta -= 4; reasons.append(f"conf<50(-4)")
+            elif 50 <= v <= 70:
+                delta += 12; reasons.append(f"conf:50-70(+12)")
+        except Exception:
+            pass
+
+    rsi = _get_rec_feature(rec, "rsi")
+    if rsi is not None:
+        try:
+            v = float(rsi)
+            if v < 30:
+                delta -= 7; reasons.append(f"rsi<30(-7)")
+        except Exception:
+            pass
+
+    adx = _get_rec_feature(rec, "adx")
+    if adx is not None:
+        try:
+            v = float(adx)
+            if v < 20:
+                delta += 6; reasons.append(f"adx<20(+6)")
+            elif v > 30:
+                delta -= 2; reasons.append(f"adx>30(-2)")
+        except Exception:
+            pass
+
+    mtf_aligned = _get_rec_feature(rec, "mtf_aligned")
+    if mtf_aligned is not None:
+        try:
+            if int(mtf_aligned) >= 2:
+                delta += 8; reasons.append(f"mtf_aligned(+8)")
+        except Exception:
+            pass
+
+    funding_sent = _get_rec_feature(rec, "funding_sentiment")
+    if funding_sent == "neutral":
+        delta += 6; reasons.append("funding:neutral(+6)")
+
+    funding_pct = _get_rec_feature(rec, "funding_pct")
+    if funding_pct is not None:
+        try:
+            v = float(funding_pct)
+            if -0.05 <= v <= 0.05:
+                delta += 6; reasons.append(f"funding_pct∈±0.05(+6)")
+        except Exception:
+            pass
+
+    patterns = _get_rec_feature(rec, "patterns") or []
+    if isinstance(patterns, list):
+        pattern_weights = {
+            "descending_channel": (12, "desc_channel"),
+            "descending_wedge": (10, "desc_wedge"),
+            "inverse_head_and_shoulders": (7, "inv_h&s"),
+            "double_bottom": (6, "db"),
+        }
+        for p in patterns:
+            if p in pattern_weights:
+                w, tag = pattern_weights[p]
+                delta += w
+                reasons.append(f"pat:{tag}(+{w})")
+
+    bucket = _hour_bucket(now_utc.hour)
+    if bucket == "asia":
+        delta += 6; reasons.append("hour:asia(+6)")
+    elif bucket == "us":
+        delta += 5; reasons.append("hour:us(+5)")
+
+    # Cap pra não dominar score original
+    if delta > SCORE_ADJUSTER_CAP:
+        delta = SCORE_ADJUSTER_CAP
+    elif delta < -SCORE_ADJUSTER_CAP:
+        delta = -SCORE_ADJUSTER_CAP
+
+    return delta, reasons
 
 
 def _is_blocked_time(now_utc: datetime) -> tuple[bool, str]:
@@ -1131,11 +1296,38 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             if tier not in ("A+", "A"):
                 continue
 
-            # ── Score threshold (postmortem): piso configurável.
+            # ── ATR gate (Fase B Lite): atr_pct > 3 → -10.6pp lift, skip.
+            if ATR_GATE_ENABLED:
+                _atr_pct = _get_rec_feature(rec, "atr_pct")
+                if _atr_pct is not None:
+                    try:
+                        if float(_atr_pct) > ATR_BLOCK_THRESHOLD:
+                            log.info(
+                                f"[atr-gate] {rec.get('symbol')} atr_pct={float(_atr_pct):.2f} "
+                                f"> {ATR_BLOCK_THRESHOLD} — skip"
+                            )
+                            continue
+                    except Exception:
+                        pass
+
+            # ── Score threshold (postmortem): piso configurável + adjusters.
             try:
                 rec_score = float(rec.get("score") or 0)
             except Exception:
                 rec_score = 0.0
+
+            # Score adjusters (Fase B Lite): aplica delta calibrado.
+            if SCORE_ADJUSTERS_ENABLED:
+                from datetime import datetime as _dt, timezone as _tz
+                _delta, _reasons = _compute_score_adjustment(rec, _dt.now(_tz.utc))
+                if _delta != 0:
+                    log.info(
+                        f"[score-adj] {rec.get('symbol')} base={rec_score:.1f} "
+                        f"delta={_delta:+.1f} → {rec_score + _delta:.1f} "
+                        f"[{', '.join(_reasons)}]"
+                    )
+                    rec_score += _delta
+
             if rec_score < SCORE_MIN:
                 log.info(
                     f"[score-min] {rec.get('symbol')} score={rec_score:.0f} < "
