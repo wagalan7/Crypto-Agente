@@ -204,6 +204,56 @@ ATR_BLOCK_THRESHOLD = float(os.getenv("ATR_BLOCK_THRESHOLD", "3.0"))
 SCORE_ADJUSTERS_ENABLED = os.getenv("SCORE_ADJUSTERS_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 SCORE_ADJUSTER_CAP = float(os.getenv("SCORE_ADJUSTER_CAP", "20"))
 
+# ── Proximity gate / anti-chase (alinha execução com o tracker) ─────────────
+# O painel marca "perdeu o trem" quando o preço já andou >=1×ATR a favor do
+# entry. Até aqui a abertura NÃO checava isso → o bot perseguia preço esticado
+# (pior fill, menor expectância). Agora bloqueia abrir quando chase_atr >= teto.
+# chase_atr já vem na rec (recommendation_service): signed a favor da direção.
+PROXIMITY_GATE_ENABLED = os.getenv("PROXIMITY_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+PROXIMITY_MAX_ATR = float(os.getenv("PROXIMITY_MAX_ATR", "1.0"))
+
+# ── Diagnóstico: motivo do último skip por símbolo ──────────────────────────
+# Pra responder "por que a tier A não virou trade?" sem caçar log. Guarda o
+# último motivo de skip por símbolo (cap de tamanho). Exposto via API.
+_LAST_SKIP_REASONS: dict[str, dict] = {}
+_SKIP_REASONS_MAX = 200
+
+
+def _record_skip(rec: dict, gate: str, reason: str) -> None:
+    """Registra por que uma rec (tier A/A+) não virou trade. Best-effort."""
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        sym = rec.get("symbol") or "?"
+        if len(_LAST_SKIP_REASONS) >= _SKIP_REASONS_MAX and sym not in _LAST_SKIP_REASONS:
+            # cap atingido: remove o mais antigo
+            oldest = min(_LAST_SKIP_REASONS, key=lambda k: _LAST_SKIP_REASONS[k].get("ts", ""))
+            _LAST_SKIP_REASONS.pop(oldest, None)
+        _LAST_SKIP_REASONS[sym] = {
+            "symbol": sym,
+            "gate": gate,
+            "reason": reason,
+            "tier": rec.get("tier"),
+            "score": rec.get("score"),
+            "direction": rec.get("direction"),
+            "timeframe": rec.get("timeframe"),
+            "ts": _dt.now(_tz.utc).isoformat(),
+        }
+    except Exception:
+        pass
+
+
+def get_skip_reasons() -> list[dict]:
+    """Snapshot dos últimos motivos de skip (mais recentes primeiro)."""
+    try:
+        return sorted(
+            _LAST_SKIP_REASONS.values(),
+            key=lambda r: r.get("ts", ""),
+            reverse=True,
+        )
+    except Exception:
+        return list(_LAST_SKIP_REASONS.values())
+
+
 def _get_rec_feature(rec: dict, key: str, default=None):
     """Extrai feature da rec acessando rec['signal']. Safety: nunca lança."""
     try:
@@ -1296,16 +1346,32 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             if tier not in ("A+", "A"):
                 continue
 
+            # ── Proximity gate / anti-chase: não persegue preço esticado.
+            # chase_atr signed a favor da direção (vem da rec). >= teto = "perdeu
+            # o trem" → skip pra não abrir com fill ruim atrás de movimento.
+            if PROXIMITY_GATE_ENABLED:
+                _chase = rec.get("chase_atr")
+                try:
+                    _chase_f = float(_chase) if _chase is not None else None
+                except Exception:
+                    _chase_f = None
+                if _chase_f is not None and _chase_f >= PROXIMITY_MAX_ATR:
+                    reason = (
+                        f"preço {_chase_f:.2f}×ATR a favor (>= {PROXIMITY_MAX_ATR}) — perdeu o trem"
+                    )
+                    log.info(f"[proximity-gate] {rec.get('symbol')} {reason} — skip")
+                    _record_skip(rec, "proximity", reason)
+                    continue
+
             # ── ATR gate (Fase B Lite): atr_pct > 3 → -10.6pp lift, skip.
             if ATR_GATE_ENABLED:
                 _atr_pct = _get_rec_feature(rec, "atr_pct")
                 if _atr_pct is not None:
                     try:
                         if float(_atr_pct) > ATR_BLOCK_THRESHOLD:
-                            log.info(
-                                f"[atr-gate] {rec.get('symbol')} atr_pct={float(_atr_pct):.2f} "
-                                f"> {ATR_BLOCK_THRESHOLD} — skip"
-                            )
+                            reason = f"atr_pct={float(_atr_pct):.2f} > {ATR_BLOCK_THRESHOLD} (vol alta)"
+                            log.info(f"[atr-gate] {rec.get('symbol')} {reason} — skip")
+                            _record_skip(rec, "atr-gate", reason)
                             continue
                     except Exception:
                         pass
@@ -1329,17 +1395,18 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     rec_score += _delta
 
             if rec_score < SCORE_MIN:
-                log.info(
-                    f"[score-min] {rec.get('symbol')} score={rec_score:.0f} < "
-                    f"{SCORE_MIN:.0f} — skip"
-                )
+                reason = f"score {rec_score:.0f} < mínimo {SCORE_MIN:.0f}"
+                log.info(f"[score-min] {rec.get('symbol')} {reason} — skip")
+                _record_skip(rec, "score-min", reason)
                 continue
 
             # ── Symbol blacklist (postmortem): pula símbolos banidos.
             if not SHADOW_ENABLED:
                 base = _symbol_base(rec["symbol"])
                 if base and base in SYMBOL_BLACKLIST:
+                    reason = f"símbolo {base} na blacklist"
                     log.info(f"[blacklist] {rec['symbol']} skip")
+                    _record_skip(rec, "blacklist", reason)
                     continue
 
             # ── Time-of-day block (postmortem -21% lift EU / -12% lift quinta).
@@ -1348,6 +1415,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 blocked, reason = _is_blocked_time(now_utc)
                 if blocked:
                     log.info(f"[time-block] {rec.get('symbol')} {reason} — skip")
+                    _record_skip(rec, "time-block", reason)
                     continue
 
             # ── Funding directional filter (postmortem: funding 0-0.05% = 75% wr).
@@ -1361,16 +1429,14 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 if funding_val is not None:
                     direction = rec.get("direction")
                     if direction == "long" and funding_val > FUNDING_BLOCK_THRESHOLD:
-                        log.info(
-                            f"[funding-gate] {rec.get('symbol')} long blocked "
-                            f"funding={funding_val:.4f}% > {FUNDING_BLOCK_THRESHOLD}% — skip"
-                        )
+                        reason = f"funding {funding_val:.4f}% > {FUNDING_BLOCK_THRESHOLD}% (long contra sentiment)"
+                        log.info(f"[funding-gate] {rec.get('symbol')} {reason} — skip")
+                        _record_skip(rec, "funding-gate", reason)
                         continue
                     if direction == "short" and funding_val < -FUNDING_BLOCK_THRESHOLD:
-                        log.info(
-                            f"[funding-gate] {rec.get('symbol')} short blocked "
-                            f"funding={funding_val:.4f}% < -{FUNDING_BLOCK_THRESHOLD}% — skip"
-                        )
+                        reason = f"funding {funding_val:.4f}% < -{FUNDING_BLOCK_THRESHOLD}% (short contra sentiment)"
+                        log.info(f"[funding-gate] {rec.get('symbol')} {reason} — skip")
+                        _record_skip(rec, "funding-gate", reason)
                         continue
 
             # ── MTF aligned gate (postmortem +18.68 lift / 82% wr quando alinhado).
@@ -1383,10 +1449,9 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 is_aligned = aligned_count is not None and aligned_count >= MTF_ALIGNED_MIN_COUNT
                 if MTF_ALIGNED_MODE == "required":
                     if not is_aligned:
-                        log.info(
-                            f"[mtf-gate] {rec.get('symbol')} aligned_count={aligned_count} "
-                            f"< {MTF_ALIGNED_MIN_COUNT} mode=required — skip"
-                        )
+                        reason = f"MTF não alinhado ({aligned_count}/{MTF_ALIGNED_MIN_COUNT} TFs)"
+                        log.info(f"[mtf-gate] {rec.get('symbol')} {reason} mode=required — skip")
+                        _record_skip(rec, "mtf-gate", reason)
                         continue
                 elif MTF_ALIGNED_MODE == "boost":
                     if is_aligned:
@@ -1400,20 +1465,21 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 age = await _last_entry_age_seconds()
                 last_hour = await _count_entries_last_hour()
                 if age < ENTRY_COOLDOWN_SECONDS or last_hour >= ENTRY_MAX_PER_HOUR:
-                    log.info(
-                        f"[entry-throttle] cooldown={age:.0f}s "
-                        f"last_hour={last_hour}/{ENTRY_MAX_PER_HOUR} — skip"
+                    reason = (
+                        f"throttle: cooldown {age:.0f}s/{ENTRY_COOLDOWN_SECONDS}s, "
+                        f"última hora {last_hour}/{ENTRY_MAX_PER_HOUR}"
                     )
+                    log.info(f"[entry-throttle] {rec.get('symbol')} {reason} — skip")
+                    _record_skip(rec, "entry-throttle", reason)
                     continue
 
             # ── Global directional cap (postmortem): max longs/shorts.
             if not SHADOW_ENABLED:
                 dir_count = await _count_open_by_direction(rec["direction"])
                 if dir_count >= MAX_OPEN_PER_DIRECTION:
-                    log.info(
-                        f"[direction-cap] {rec['direction']} "
-                        f"{dir_count}/{MAX_OPEN_PER_DIRECTION} — skip"
-                    )
+                    reason = f"{rec['direction']} cheio: {dir_count}/{MAX_OPEN_PER_DIRECTION} abertos"
+                    log.info(f"[direction-cap] {rec.get('symbol')} {reason} — skip")
+                    _record_skip(rec, "direction-cap", reason)
                     continue
 
             # ── Cluster correlation cap (postmortem): bloqueia se já há
@@ -1423,10 +1489,9 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 if cluster != "other":
                     open_in_cluster = await _count_open_in_cluster(cluster)
                     if open_in_cluster >= CLUSTER_MAX_OPEN:
-                        log.info(
-                            f"[cluster-cap] {rec['symbol']} cluster={cluster} "
-                            f"{open_in_cluster}/{CLUSTER_MAX_OPEN} — skip"
-                        )
+                        reason = f"cluster {cluster} cheio: {open_in_cluster}/{CLUSTER_MAX_OPEN}"
+                        log.info(f"[cluster-cap] {rec['symbol']} {reason} — skip")
+                        _record_skip(rec, "cluster-cap", reason)
                         continue
                     # Cap por direção dentro do cluster (postmortem 04/06):
                     # 22 dos 33 SLs do dia foram meme-short. Impede empilhar.
@@ -1434,11 +1499,12 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         cluster, rec["direction"]
                     )
                     if open_in_cluster_dir >= CLUSTER_MAX_OPEN_PER_DIRECTION:
-                        log.info(
-                            f"[cluster-cap-dir] {rec['symbol']} cluster={cluster} "
-                            f"{rec['direction']}={open_in_cluster_dir}/"
-                            f"{CLUSTER_MAX_OPEN_PER_DIRECTION} — skip"
+                        reason = (
+                            f"cluster {cluster} {rec['direction']} cheio: "
+                            f"{open_in_cluster_dir}/{CLUSTER_MAX_OPEN_PER_DIRECTION}"
                         )
+                        log.info(f"[cluster-cap-dir] {rec['symbol']} {reason} — skip")
+                        _record_skip(rec, "cluster-cap-dir", reason)
                         continue
 
             # ── Per-symbol SL cooldown (postmortem 04/06): bloqueia retry no
@@ -1446,10 +1512,9 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             # bateram SL 3-4× cada no mesmo dia.
             if not SHADOW_ENABLED and SYMBOL_SL_COOLDOWN_HOURS > 0:
                 if await _has_recent_sl_on_symbol(rec["symbol"], SYMBOL_SL_COOLDOWN_HOURS):
-                    log.info(
-                        f"[symbol-sl-cooldown] {rec['symbol']} bateu SL nas últimas "
-                        f"{SYMBOL_SL_COOLDOWN_HOURS:.0f}h — skip"
-                    )
+                    reason = f"bateu SL nas últimas {SYMBOL_SL_COOLDOWN_HOURS:.0f}h"
+                    log.info(f"[symbol-sl-cooldown] {rec['symbol']} {reason} — skip")
+                    _record_skip(rec, "symbol-sl-cooldown", reason)
                     continue
 
             # ── Directional regime guard (postmortem 04/06): se 3+ SLs na
@@ -1458,9 +1523,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             if not SHADOW_ENABLED:
                 blocked, reason = await _regime_blocked(rec["direction"])
                 if blocked:
-                    log.info(
-                        f"[regime-guard] {rec['direction']} bloqueado: {reason} — skip"
-                    )
+                    log.info(f"[regime-guard] {rec['direction']} bloqueado: {reason} — skip")
+                    _record_skip(rec, "regime-guard", f"regime adverso: {reason}")
                     continue
 
             # ── Direction flip (Fase 2): se há trade aberto na direção oposta,
@@ -1483,6 +1547,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         log.info(
                             f"[flip] {rec['symbol']} ADVISORY (não executa): {reason}"
                         )
+                        _record_skip(rec, "flip-advisory", f"trade oposto aberto, flip negado: {reason}")
                         continue
 
                 # ── TF upgrade (Fase 3): se já há trade aberto na MESMA

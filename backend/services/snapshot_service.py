@@ -13,6 +13,7 @@ Como funciona:
 """
 from __future__ import annotations
 import logging
+import os
 from datetime import datetime, timedelta, timezone, date
 from typing import List, Dict, Any, Optional
 
@@ -27,6 +28,12 @@ log = logging.getLogger(__name__)
 # ── Configuração ─────────────────────────────────────────────────────────
 DEDUP_WINDOW_HOURS = 2       # mesma rec não entra 2× nesse intervalo
 EXPIRY_HOURS = 48            # ceiling absoluto — qualquer trade > 48h é encerrado
+
+# 1 rec por SÍMBOLO (não só por símbolo+direção): bloqueia gerar uma rec
+# na direção OPOSTA enquanto já há uma aberta no mesmo símbolo. Evita o
+# absurdo de ter long e short simultâneos na mesma moeda (sinais contraditórios
+# poluindo o painel). Default ligado; desligue com ONE_REC_PER_SYMBOL=false.
+ONE_REC_PER_SYMBOL = os.getenv("ONE_REC_PER_SYMBOL", "true").strip().lower() in ("1", "true", "yes")
 
 # Time-stop por timeframe: se TP1 não bater em N candles, encerra o trade
 # (evita "morte lenta" que trava capital sem stop nem TP). Cada TF tem
@@ -180,27 +187,42 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                 # Fase 1: bloqueia rec adicional pro mesmo (symbol, direction)
                 # se já houver snapshot OPEN em TF igual ou MENOR. Permite
                 # passar quando a nova é TF MAIOR — vira candidato a upgrade.
+                # Busca TODOS os abertos do símbolo (qualquer direção) pra também
+                # aplicar o "1 rec por símbolo" (bloqueia direção oposta).
                 new_rank = _tf_rank(rec.get("timeframe"))
                 open_stmt = select(
                     RecommendationSnapshot.id,
                     RecommendationSnapshot.timeframe,
+                    RecommendationSnapshot.direction,
                 ).where(
                     and_(
                         RecommendationSnapshot.symbol == rec["symbol"],
-                        RecommendationSnapshot.direction == rec["direction"],
                         RecommendationSnapshot.status == "open",
                     )
                 )
                 open_rows = (await session.execute(open_stmt)).all()
-                # Se qualquer aberto tem rank >= novo → bloqueia (mesmo TF
-                # ou maior já cobre a direção). Só deixa passar se TODOS
-                # os abertos forem TF MENOR que o novo (upgrade legítimo).
-                blocked = any(_tf_rank(row.timeframe) >= new_rank for row in open_rows)
-                if blocked:
+                same_dir_rows = [r for r in open_rows if r.direction == rec["direction"]]
+                opp_dir_rows = [r for r in open_rows if r.direction != rec["direction"]]
+
+                # (a) Mesma direção: se qualquer aberto tem rank >= novo →
+                # bloqueia (mesmo TF ou maior já cobre). Só passa se TODOS os
+                # abertos forem TF MENOR que o novo (upgrade legítimo).
+                if any(_tf_rank(r.timeframe) >= new_rank for r in same_dir_rows):
                     rec["_just_saved"] = False
                     log.debug(
                         f"[snapshot] skip rec {rec['symbol']} {rec['direction']} "
                         f"tf={rec.get('timeframe')} — já há OPEN em TF >= nesse par"
+                    )
+                    continue
+
+                # (b) 1 rec por símbolo: bloqueia direção OPOSTA enquanto há
+                # uma aberta no mesmo símbolo (evita long+short simultâneo).
+                if ONE_REC_PER_SYMBOL and opp_dir_rows:
+                    rec["_just_saved"] = False
+                    log.debug(
+                        f"[snapshot] skip rec {rec['symbol']} {rec['direction']} "
+                        f"tf={rec.get('timeframe')} — já há OPEN na direção oposta "
+                        f"(ONE_REC_PER_SYMBOL)"
                     )
                     continue
 

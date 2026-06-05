@@ -1660,6 +1660,18 @@ async def shadow_env():
     return shadow_trade_service.env_info()
 
 
+@app.get("/api/shadow/skip-reasons")
+async def shadow_skip_reasons():
+    """
+    Por que cada tier A/A+ recente NÃO virou trade na exchange. Mostra o gate
+    que barrou (score-min, direction-cap, cluster-cap, proximity, cooldown…),
+    o motivo legível e quando. Diagnóstico pra 'a moeda é tier A e não entrou'.
+    """
+    from services import shadow_trade_service
+    reasons = shadow_trade_service.get_skip_reasons()
+    return {"ok": True, "count": len(reasons), "items": reasons}
+
+
 @app.post("/api/admin/force-test-trade")
 async def admin_force_test_trade(
     symbol: str = "BTCUSDT",
