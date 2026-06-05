@@ -92,13 +92,41 @@ TF_UPGRADE_NEAR_TP1_R = float(os.getenv("TF_UPGRADE_NEAR_TP1_R", "0.3"))   # blo
 # (ex: PEPE/USDT:USDT → PEPE). Símbolos fora de qualquer cluster vão pra
 # "other" (não compartilham cap entre si).
 SYMBOL_CLUSTERS = {
-    "memes": ["PEPE", "DOGE", "FLOKI", "BOME", "NEIRO", "MEME", "PENGU", "MEW", "TURBO", "WIF", "SHIB", "BONK"],
-    "ai_gaming": ["GALA", "GPS", "RLS", "AI", "AIXBT", "FET", "AGIX", "RNDR"],
-    "l2_infra": ["LINEA", "ARB", "OP", "MATIC", "STRK", "ZK"],
-    "defi": ["UNI", "AAVE", "CRV", "1INCH", "DYDX", "GMX"],
+    # Expandido pós-postmortem 04/06: PEOPLE, MON, MEW, PENGU, TURBO faltavam ou
+    # estavam classificados errado. PEOPLE e MEW são meme. MON é gaming.
+    "memes": [
+        "PEPE", "DOGE", "FLOKI", "BOME", "NEIRO", "MEME", "PENGU", "MEW",
+        "TURBO", "WIF", "SHIB", "BONK", "PEOPLE", "POPCAT", "BRETT", "MOG",
+        "BABYDOGE", "FARTCOIN", "GOAT", "AI16Z", "ACT", "TRUMP", "MELANIA",
+    ],
+    "ai_gaming": [
+        "GALA", "GPS", "RLS", "AI", "AIXBT", "FET", "AGIX", "RNDR",
+        "MON", "BEAM", "PIXEL", "ACE", "BIGTIME", "RON",
+    ],
+    "l2_infra": ["LINEA", "ARB", "OP", "MATIC", "STRK", "ZK", "MANTA", "BLAST", "MODE", "SCROLL"],
+    "defi": ["UNI", "AAVE", "CRV", "1INCH", "DYDX", "GMX", "SUSHI", "COMP", "MKR", "LDO", "ENA"],
     "majors": ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA"],
 }
 CLUSTER_MAX_OPEN = int(os.getenv("CLUSTER_MAX_OPEN", "2"))
+
+# ── Cluster cap POR DIREÇÃO (postmortem 04/06) ─────────────────────────────
+# 22 dos 33 losses do dia foram meme-short. Cluster cap total não basta —
+# precisa limitar por direção. Ex: 2 longs no cluster + 2 shorts ok; 4 shorts no
+# mesmo cluster, não.
+CLUSTER_MAX_OPEN_PER_DIRECTION = int(os.getenv("CLUSTER_MAX_OPEN_PER_DIRECTION", "2"))
+
+# ── Per-symbol SL cooldown (postmortem 04/06) ──────────────────────────────
+# FLOKI/NEIRO/PEOPLE/GALA bateram SL múltiplas vezes seguidas (3-4× cada).
+# Bloqueia novas entradas no MESMO símbolo por N horas após um SL. Override
+# via env SYMBOL_SL_COOLDOWN_HOURS=0 desativa.
+SYMBOL_SL_COOLDOWN_HOURS = float(os.getenv("SYMBOL_SL_COOLDOWN_HOURS", "4"))
+
+# ── Directional regime guard (postmortem 04/06) ────────────────────────────
+# Se nas últimas N horas N+ SLs aconteceram na MESMA direção, pausa novas
+# entradas nessa direção por 1h. Detecta regime adverso em tempo real.
+REGIME_GUARD_WINDOW_HOURS = float(os.getenv("REGIME_GUARD_WINDOW_HOURS", "2"))
+REGIME_GUARD_MAX_SL = int(os.getenv("REGIME_GUARD_MAX_SL", "3"))
+REGIME_GUARD_PAUSE_HOURS = float(os.getenv("REGIME_GUARD_PAUSE_HOURS", "1"))
 
 # ── Entry throttle (postmortem) ────────────────────────────────────────────
 # Cooldown global + max entradas/hora pra prevenir "fome de fila" disparando
@@ -317,6 +345,99 @@ async def _count_open_in_cluster(cluster: str) -> int:
     except Exception as e:
         log.warning(f"[cluster-cap] count falhou: {e}")
         return 0
+
+
+async def _count_open_in_cluster_by_direction(cluster: str, direction: str) -> int:
+    """Conta RealTrade open no cluster informado E na direção informada."""
+    if not DB_ENABLED:
+        return 0
+    try:
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            stmt = select(RealTrade.symbol).where(
+                RealTrade.status == "open",
+                RealTrade.source == "auto",
+                RealTrade.side == direction,
+            )
+            rows = (await session.execute(stmt)).all()
+            return sum(1 for (sym,) in rows if _get_symbol_cluster(sym) == cluster)
+    except Exception as e:
+        log.warning(f"[cluster-cap-dir] count falhou: {e}")
+        return 0
+
+
+async def _has_recent_sl_on_symbol(symbol: str, hours: float) -> bool:
+    """True se o símbolo bateu SL nas últimas `hours` horas (RealTrade fechado)."""
+    if not DB_ENABLED or hours <= 0:
+        return False
+    try:
+        from datetime import datetime, timezone, timedelta
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        async with get_session() as session:
+            stmt = select(RealTrade.id).where(
+                RealTrade.symbol == symbol,
+                RealTrade.source == "auto",
+                RealTrade.status == "closed_stop",
+                RealTrade.closed_at >= cutoff,
+            ).limit(1)
+            row = (await session.execute(stmt)).first()
+            return row is not None
+    except Exception as e:
+        log.warning(f"[symbol-sl-cooldown] check falhou: {e}")
+        return False
+
+
+async def _count_recent_sl_by_direction(direction: str, hours: float) -> int:
+    """Conta SLs recentes na direção informada (RealTrade closed_stop)."""
+    if not DB_ENABLED or hours <= 0:
+        return 0
+    try:
+        from datetime import datetime, timezone, timedelta
+        from sqlalchemy import select, func
+        from db import get_session
+        from models.real_trade import RealTrade
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        async with get_session() as session:
+            stmt = select(func.count(RealTrade.id)).where(
+                RealTrade.source == "auto",
+                RealTrade.status == "closed_stop",
+                RealTrade.side == direction,
+                RealTrade.closed_at >= cutoff,
+            )
+            return int((await session.execute(stmt)).scalar() or 0)
+    except Exception as e:
+        log.warning(f"[regime-guard] count falhou: {e}")
+        return 0
+
+
+# Estado em memória: timestamp do último SL que disparou pausa por direção.
+# Quando _count_recent_sl_by_direction(d, REGIME_GUARD_WINDOW_HOURS) >= MAX_SL,
+# armamos pause em _REGIME_PAUSE_UNTIL[d] = now + PAUSE_HOURS. Novas entradas
+# nessa direção ficam bloqueadas até passar o timestamp.
+_REGIME_PAUSE_UNTIL: dict[str, float] = {}
+
+
+async def _regime_blocked(direction: str) -> tuple[bool, str]:
+    """Retorna (blocked, reason). Confere pausa armada + arma nova se preciso."""
+    import time
+    now = time.time()
+    until = _REGIME_PAUSE_UNTIL.get(direction, 0)
+    if until > now:
+        mins = (until - now) / 60.0
+        return True, f"pausa ativa há {mins:.0f}min"
+    sl_count = await _count_recent_sl_by_direction(direction, REGIME_GUARD_WINDOW_HOURS)
+    if sl_count >= REGIME_GUARD_MAX_SL:
+        _REGIME_PAUSE_UNTIL[direction] = now + REGIME_GUARD_PAUSE_HOURS * 3600
+        return True, (
+            f"{sl_count} SLs {direction} em {REGIME_GUARD_WINDOW_HOURS:.0f}h — "
+            f"pausa {REGIME_GUARD_PAUSE_HOURS:.0f}h"
+        )
+    return False, ""
 
 
 def _tf_rank_local(tf: str) -> int:
@@ -1115,6 +1236,40 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"{open_in_cluster}/{CLUSTER_MAX_OPEN} — skip"
                         )
                         continue
+                    # Cap por direção dentro do cluster (postmortem 04/06):
+                    # 22 dos 33 SLs do dia foram meme-short. Impede empilhar.
+                    open_in_cluster_dir = await _count_open_in_cluster_by_direction(
+                        cluster, rec["direction"]
+                    )
+                    if open_in_cluster_dir >= CLUSTER_MAX_OPEN_PER_DIRECTION:
+                        log.info(
+                            f"[cluster-cap-dir] {rec['symbol']} cluster={cluster} "
+                            f"{rec['direction']}={open_in_cluster_dir}/"
+                            f"{CLUSTER_MAX_OPEN_PER_DIRECTION} — skip"
+                        )
+                        continue
+
+            # ── Per-symbol SL cooldown (postmortem 04/06): bloqueia retry no
+            # mesmo símbolo dentro de X horas após SL. FLOKI/NEIRO/PEOPLE/GALA
+            # bateram SL 3-4× cada no mesmo dia.
+            if not SHADOW_ENABLED and SYMBOL_SL_COOLDOWN_HOURS > 0:
+                if await _has_recent_sl_on_symbol(rec["symbol"], SYMBOL_SL_COOLDOWN_HOURS):
+                    log.info(
+                        f"[symbol-sl-cooldown] {rec['symbol']} bateu SL nas últimas "
+                        f"{SYMBOL_SL_COOLDOWN_HOURS:.0f}h — skip"
+                    )
+                    continue
+
+            # ── Directional regime guard (postmortem 04/06): se 3+ SLs na
+            # direção nas últimas 2h, pausa essa direção 1h. Detecta regime
+            # adverso (mercado andando contra o viés do bot).
+            if not SHADOW_ENABLED:
+                blocked, reason = await _regime_blocked(rec["direction"])
+                if blocked:
+                    log.info(
+                        f"[regime-guard] {rec['direction']} bloqueado: {reason} — skip"
+                    )
+                    continue
 
             # ── Direction flip (Fase 2): se há trade aberto na direção oposta,
             # avalia gate. Passa → fecha atual primeiro. Bloqueia → advisory
