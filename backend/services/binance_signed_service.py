@@ -24,6 +24,7 @@ conta mainnet via Binance global desde 2023 (CVM). Testnet funciona
 normalmente — útil pra validar bot. Pra mainnet em BR, considere Bybit/OKX.
 """
 from __future__ import annotations
+import asyncio
 import hmac
 import hashlib
 import os
@@ -35,6 +36,48 @@ from urllib.parse import urlencode
 import httpx
 
 log = logging.getLogger(__name__)
+
+# ── Retry de ordens condicionais (algo orders) ──────────────────────────────
+# As 3 ordens de proteção (SL/TP1/TP2) são emitidas em sequência. Falhas
+# transitórias (rate-limit, timeout, indisponibilidade momentânea) deixavam a
+# posição parcialmente desprotegida. Retry com backoff cobre esse buraco.
+_ALGO_MAX_ATTEMPTS = int(os.getenv("BINANCE_ALGO_MAX_ATTEMPTS", "3"))
+_ALGO_RETRY_BASE_DELAY = float(os.getenv("BINANCE_ALGO_RETRY_DELAY", "0.4"))  # s, escala com a tentativa
+
+# Códigos de erro Binance que NÃO adianta repetir (problema é o pedido, não o canal).
+_PERMANENT_ALGO_CODES = {
+    -2021,  # Order would immediately trigger (preço do gatilho do lado errado do mercado)
+    -2022,  # ReduceOnly Order is rejected
+    -1111,  # Precision is over the maximum defined for this asset
+    -1102,  # Mandatory parameter not sent / empty / malformed
+    -1106,  # Parameter not required
+    -1130,  # Invalid data sent for a parameter
+    -4003,  # Quantity less than zero
+    -4014,  # Price not increased by tick size
+    -4131,  # Counterparty best price exceeds permissible range
+}
+_PERMANENT_ALGO_SUBSTRINGS = (
+    "would immediately trigger",
+    "reduceonly",
+    "precision",
+    "tick size",
+    "min notional",
+    "notional must be no smaller",
+)
+
+
+def _is_permanent_algo_error(code, msg: str | None) -> bool:
+    """True se o erro é do próprio pedido (sem chance de sucesso ao repetir)."""
+    try:
+        if code is not None and int(code) in _PERMANENT_ALGO_CODES:
+            return True
+    except (TypeError, ValueError):
+        pass
+    if msg:
+        low = msg.lower()
+        if any(s in low for s in _PERMANENT_ALGO_SUBSTRINGS):
+            return True
+    return False
 
 _API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 _API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
@@ -354,14 +397,37 @@ async def place_protection_orders(
         }
         if client_order_id_prefix:
             params["clientAlgoId"] = f"{client_order_id_prefix}-{label}"
-        res = await _signed_request("POST", "/fapi/v1/algoOrder", params)
-        if res.get("ok"):
-            algo_id = str((res.get("result") or {}).get("algoId") or "")
-            log.info(f"[binance] {label.upper()} ok {sym} {otype} @ {trigger_price} qty={q} algoId={algo_id}")
-            return True, algo_id, None
-        msg = res.get("msg") or res.get("error")
-        log.error(f"[binance] {label.upper()} FALHOU {sym} {otype} @ {trigger_price} qty={q}: {msg}")
-        return False, None, msg
+
+        last_msg: str | None = None
+        for attempt in range(1, _ALGO_MAX_ATTEMPTS + 1):
+            res = await _signed_request("POST", "/fapi/v1/algoOrder", params)
+            if res.get("ok"):
+                algo_id = str((res.get("result") or {}).get("algoId") or "")
+                tag = f" (tentativa {attempt})" if attempt > 1 else ""
+                log.info(f"[binance] {label.upper()} ok {sym} {otype} @ {trigger_price} qty={q} algoId={algo_id}{tag}")
+                return True, algo_id, None
+            last_msg = res.get("msg") or res.get("error")
+            code = res.get("code")
+            # Erro permanente (preço inválido, gatilho imediato, precisão) → não adianta repetir.
+            if _is_permanent_algo_error(code, last_msg):
+                log.error(
+                    f"[binance] {label.upper()} FALHOU {sym} {otype} @ {trigger_price} qty={q}: "
+                    f"{last_msg} (code={code}, permanente — sem retry)"
+                )
+                return False, None, last_msg
+            # Erro transitório (rate-limit, timeout, indisponibilidade) → backoff e tenta de novo.
+            if attempt < _ALGO_MAX_ATTEMPTS:
+                delay = _ALGO_RETRY_BASE_DELAY * attempt
+                log.warning(
+                    f"[binance] {label.upper()} falha transitória {sym} {otype} "
+                    f"(tentativa {attempt}/{_ALGO_MAX_ATTEMPTS}): {last_msg} (code={code}) — retry em {delay:.2f}s"
+                )
+                await asyncio.sleep(delay)
+        log.error(
+            f"[binance] {label.upper()} FALHOU {sym} {otype} @ {trigger_price} qty={q}: "
+            f"{last_msg} (esgotou {_ALGO_MAX_ATTEMPTS} tentativas)"
+        )
+        return False, None, last_msg
 
     # ── SL ───────────────────────────────────────────────────────────────
     if stop_loss is not None:

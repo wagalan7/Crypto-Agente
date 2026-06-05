@@ -423,5 +423,12 @@ def _to_dict(t: RealTrade | None) -> dict | None:
         "pnl_usd": t.pnl_usd,
         "pnl_pct": t.pnl_pct,
         "entry_slippage_pct": t.entry_slippage_pct,
+        # ── Bracket / proteção (diagnóstico: ver se SL/TP foram criados) ──
+        "phase": t.phase,
+        "qty_initial": t.qty_initial,
+        "sl_order_id": t.sl_order_id,
+        "tp1_order_id": t.tp1_order_id,
+        "tp2_order_id": t.tp2_order_id,
+        "sl_current_price": t.sl_current_price,
         "notes": t.notes,
     }

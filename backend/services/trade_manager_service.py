@@ -52,6 +52,15 @@ TIME_STOP_SCALP_MIN = int(os.getenv("TIME_STOP_SCALP_MIN", "240"))
 TIME_STOP_DAY_MIN = int(os.getenv("TIME_STOP_DAY_MIN", "1440"))
 TIME_STOP_SWING_MIN = int(os.getenv("TIME_STOP_SWING_MIN", "10080"))
 
+# ── Auto-cura de proteção (postmortem SUI/DOGE 05/06) ───────────────────────
+# Bug em prod: posições abriram com pernas de proteção faltando (SUI sem TP2,
+# DOGE sem SL nem TP) — falha transitória no algoOrder na hora da abertura.
+# A cada poll, em pre_tp1, verifica os IDs de proteção no DB e recria as pernas
+# ausentes. SL é a perna crítica (segurança); TPs evitam correr além do alvo.
+PROTECTION_AUTOHEAL_ENABLED = os.getenv("PROTECTION_AUTOHEAL_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Fração da posição destinada ao TP1 parcial (espelha tp1_qty_pct=0.45 do open).
+_TP1_QTY_PCT = float(os.getenv("PROTECTION_TP1_QTY_PCT", "0.45"))
+
 
 def _tf_category(tf: str | None) -> str:
     """Mapeia timeframe → 'scalp' | 'day' | 'swing'."""
@@ -371,6 +380,151 @@ async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
     return True
 
 
+async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
+    """
+    Auto-cura: em pre_tp1, recria pernas de proteção (SL/TP1/TP2) que faltam
+    no DB. Cobre o bug SUI (sem TP2) / DOGE (sem SL nem TP) — falhas transitórias
+    no algoOrder durante a abertura deixavam a posição parcialmente nua.
+
+    Estratégia conservadora (evita ordens duplicadas):
+      - Só age em phase=pre_tp1 (em post_tp1 o TP1 já executou e o SL@BE é
+        gerido pelo transition; os IDs antigos ficam "usados").
+      - "Faltando" = ID None no DB. Com o retry no algoOrder, ID None significa
+        de fato que a perna não foi criada.
+      - Guarda do TP1 legitimamente pulado: se tp1_order_id é None mas
+        tp2_order_id existe, assume skip (qty*0.45 arredondou pra 0) e NÃO
+        recria TP1 — senão duplicaria cobertura.
+
+    Retorna True se recriou ao menos uma perna.
+    """
+    if not PROTECTION_AUTOHEAL_ENABLED:
+        return False
+    if trade.phase != "pre_tp1" or qty_now <= 0:
+        return False
+
+    sl_missing = (not trade.sl_order_id) and bool(trade.planned_stop)
+    tp2_missing = bool(trade.planned_tp2) and not trade.tp2_order_id
+    # TP1 só é "bracket" quando há TP2 planejado. Skip legítimo: tp2 já existe.
+    tp1_missing = (
+        bool(trade.planned_tp1) and bool(trade.planned_tp2)
+        and not trade.tp1_order_id and not trade.tp2_order_id
+    )
+    if not (sl_missing or tp1_missing or tp2_missing):
+        return False
+
+    from services import binance_signed_service
+    sym = trade.symbol
+    entry_side = "Buy" if trade.side == "long" else "Sell"
+
+    log.warning(
+        f"[autoheal] {sym} #{trade.id} proteção incompleta — "
+        f"sl_missing={sl_missing} tp1_missing={tp1_missing} tp2_missing={tp2_missing} "
+        f"(sl_id={trade.sl_order_id} tp1_id={trade.tp1_order_id} tp2_id={trade.tp2_order_id})"
+    )
+
+    healed: list[str] = []
+    failed: list[str] = []
+    new_sl_id = new_tp1_id = new_tp2_id = None
+
+    # ── SL (perna crítica — sempre primeiro) ─────────────────────────────
+    if sl_missing:
+        try:
+            r = await binance_signed_service.place_protection_orders(
+                sym, entry_side, qty=qty_now,
+                stop_loss=trade.planned_stop, tp1=None, tp2=None,
+                client_order_id_prefix=f"cw-heal-sl-{trade.id}",
+            )
+            if r.get("sl_ok") and r.get("sl_order_id"):
+                new_sl_id = r.get("sl_order_id")
+                healed.append("SL")
+            else:
+                failed.append(f"SL({r.get('sl_msg')})")
+        except Exception as e:
+            failed.append(f"SL({e})")
+
+    # ── TP2 / TP restante ────────────────────────────────────────────────
+    if tp2_missing:
+        # qty restante: se há (ou vamos recriar) TP1 parcial, TP2 cobre os 55%;
+        # senão cobre o total. Como estamos em pre_tp1, TP1 ainda não bateu.
+        # reduceOnly limita a execução ao tamanho real da posição de qualquer forma.
+        tp1_present = bool(trade.tp1_order_id) or tp1_missing
+        qty_tp2 = qty_now * (1.0 - _TP1_QTY_PCT) if tp1_present else qty_now
+        try:
+            r = await binance_signed_service.place_protection_orders(
+                sym, entry_side, qty=qty_tp2,
+                stop_loss=None, tp1=None, tp2=trade.planned_tp2,
+                client_order_id_prefix=f"cw-heal-tp2-{trade.id}",
+            )
+            if r.get("tp2_ok") and r.get("tp2_order_id"):
+                new_tp2_id = r.get("tp2_order_id")
+                healed.append("TP2")
+            else:
+                failed.append(f"TP2({r.get('tp2_msg')})")
+        except Exception as e:
+            failed.append(f"TP2({e})")
+
+    # ── TP1 parcial (só quando SL+TP também estavam nus = abertura falhou) ─
+    if tp1_missing:
+        qty_tp1 = qty_now * _TP1_QTY_PCT
+        try:
+            r = await binance_signed_service.place_protection_orders(
+                sym, entry_side, qty=qty_tp1,
+                stop_loss=None, tp1=None, tp2=trade.planned_tp1,
+                client_order_id_prefix=f"cw-heal-tp1-{trade.id}",
+            )
+            if r.get("tp2_ok") and r.get("tp2_order_id"):
+                new_tp1_id = r.get("tp2_order_id")  # placed via tp_final → vem em tp2_order_id
+                healed.append("TP1")
+            else:
+                failed.append(f"TP1({r.get('tp2_msg')})")
+        except Exception as e:
+            failed.append(f"TP1({e})")
+
+    if not healed and not new_sl_id and not new_tp1_id and not new_tp2_id:
+        log.error(f"[autoheal] {sym} #{trade.id} nada curado — falhas: {failed}")
+        return False
+
+    # ── Persiste IDs novos ───────────────────────────────────────────────
+    async with get_session() as session:
+        fresh = (await session.execute(
+            select(RealTrade).where(RealTrade.id == trade.id)
+        )).scalar_one_or_none()
+        if fresh:
+            if new_sl_id:
+                fresh.sl_order_id = new_sl_id
+                fresh.sl_current_price = trade.planned_stop
+            if new_tp1_id:
+                fresh.tp1_order_id = new_tp1_id
+            if new_tp2_id:
+                fresh.tp2_order_id = new_tp2_id
+            fresh.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            # reflete no objeto em memória pra não recurar no mesmo tick
+            trade.sl_order_id = fresh.sl_order_id
+            trade.tp1_order_id = fresh.tp1_order_id
+            trade.tp2_order_id = fresh.tp2_order_id
+
+    log.info(f"[autoheal] {sym} #{trade.id} recriou: {healed} (falhas: {failed or 'nenhuma'})")
+
+    # ── Alerta Telegram (item 3) ─────────────────────────────────────────
+    try:
+        from services.notification_service import send_telegram
+        side = str(trade.side).upper()
+        ok_str = ", ".join(healed) if healed else "nenhuma"
+        fail_str = ", ".join(failed) if failed else "—"
+        msg = (
+            f"\U0001F527 *Auto-cura de proteção* \u2014 `{sym}` ({side})\n"
+            f"Posição estava sem proteção completa.\n"
+            f"Pernas recriadas: `{ok_str}`\n"
+            f"Falhas restantes: `{fail_str}`"
+        )
+        await send_telegram(msg, event_type="autoheal")
+    except Exception as e:
+        log.warning(f"[notify] telegram autoheal falhou: {e}")
+
+    return True
+
+
 async def _process_trade(trade: RealTrade) -> None:
     """Avalia um trade aberto e age conforme a fase."""
     qty_now = await _fetch_exchange_qty(trade.symbol)
@@ -384,6 +538,12 @@ async def _process_trade(trade: RealTrade) -> None:
                 return
         except Exception as e:
             log.warning(f"[time-stop] check #{trade.id} erro: {e}")
+
+        # ── Auto-cura de proteção (recria pernas faltantes) ──────────────
+        try:
+            await _ensure_protection(trade, qty_now)
+        except Exception as e:
+            log.warning(f"[autoheal] check #{trade.id} erro: {e}")
 
     qty_initial = trade.qty_initial or trade.qty
 
