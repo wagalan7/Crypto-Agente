@@ -1548,6 +1548,17 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"[flip] {rec['symbol']} ADVISORY (não executa): {reason}"
                         )
                         _record_skip(rec, "flip-advisory", f"trade oposto aberto, flip negado: {reason}")
+                        # Flip negado: a rec oposta foi deixada fluir por
+                        # save_recommendations só pra alimentar este avaliador.
+                        # Como não disparou, expira o snapshot pra não poluir o
+                        # painel com par long+short do mesmo símbolo.
+                        try:
+                            from services import snapshot_service as _snap
+                            await _snap.expire_open_snapshot(
+                                rec["symbol"], rec["direction"], reason="flip_advisory"
+                            )
+                        except Exception as _e:
+                            log.debug(f"[flip] expire snapshot advisory falhou {rec['symbol']}: {_e}")
                         continue
 
                 # ── TF upgrade (Fase 3): se já há trade aberto na MESMA

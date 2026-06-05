@@ -145,6 +145,31 @@ def _tf_rank(tf: str) -> int:
     return 3      # SWING (4h, 1d, 1w, etc)
 
 
+async def _has_open_opposite_real_trade(session, symbol: str, direction: str) -> bool:
+    """True se existe RealTrade auto OPEN no símbolo em direção OPOSTA.
+
+    Usado por save_recommendations rule (b): quando há um trade real oposto
+    aberto, a rec oposta NÃO deve ser bloqueada — ela precisa fluir até o
+    avaliador de flip (Fase 2) no shadow_trade_service. Bloquear aqui mataria
+    o auto-flip. Quando NÃO há trade real oposto, o ONE_REC_PER_SYMBOL segue
+    valendo (evita long+short simultâneo só de snapshots informativos)."""
+    try:
+        from models.real_trade import RealTrade
+        opposite_side = "long" if direction == "short" else "short"
+        stmt = select(RealTrade.id).where(
+            and_(
+                RealTrade.symbol == symbol,
+                RealTrade.status == "open",
+                RealTrade.source == "auto",
+                RealTrade.side == opposite_side,
+            )
+        ).limit(1)
+        return (await session.execute(stmt)).scalar_one_or_none() is not None
+    except Exception as e:
+        log.warning(f"[snapshot] check trade real oposto falhou {symbol}: {e}")
+        return False
+
+
 async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     """
     Salva snapshots de recomendações novas (desduplicadas).
@@ -217,14 +242,28 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
 
                 # (b) 1 rec por símbolo: bloqueia direção OPOSTA enquanto há
                 # uma aberta no mesmo símbolo (evita long+short simultâneo).
+                # EXCEÇÃO: se há um TRADE REAL aberto na direção oposta, a rec
+                # oposta DEVE fluir (não bloquear) pra alimentar o avaliador de
+                # flip (Fase 2) no shadow_trade_service. Bloquear aqui setaria
+                # _just_saved=False e o flip nunca seria avaliado.
                 if ONE_REC_PER_SYMBOL and opp_dir_rows:
-                    rec["_just_saved"] = False
-                    log.debug(
-                        f"[snapshot] skip rec {rec['symbol']} {rec['direction']} "
-                        f"tf={rec.get('timeframe')} — já há OPEN na direção oposta "
-                        f"(ONE_REC_PER_SYMBOL)"
-                    )
-                    continue
+                    if await _has_open_opposite_real_trade(
+                        session, rec["symbol"], rec["direction"]
+                    ):
+                        log.debug(
+                            f"[snapshot] rec OPOSTA {rec['symbol']} {rec['direction']} "
+                            f"tf={rec.get('timeframe')} FLUI — há trade real oposto aberto "
+                            f"(candidato a flip)"
+                        )
+                        # não dá continue — segue pro insert abaixo (flip pipeline)
+                    else:
+                        rec["_just_saved"] = False
+                        log.debug(
+                            f"[snapshot] skip rec {rec['symbol']} {rec['direction']} "
+                            f"tf={rec.get('timeframe')} — já há OPEN na direção oposta "
+                            f"(ONE_REC_PER_SYMBOL, sem trade real)"
+                        )
+                        continue
 
                 # tp1 pode estar em signal.tp1 ou ausente
                 tp1 = None
@@ -260,6 +299,42 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     if inserted:
         log.info(f"Snapshots persistidos: {inserted}")
     return inserted
+
+
+async def expire_open_snapshot(symbol: str, direction: str, reason: str = "flip_advisory") -> int:
+    """Marca como 'expired' os snapshots OPEN de (symbol, direction).
+
+    Chamado quando o flip é REJEITADO (advisory): a rec oposta foi deixada
+    fluir por save_recommendations (pra alimentar o avaliador de flip), mas
+    como o flip não disparou, não queremos poluir o painel 'Abertos' com um
+    par long+short do mesmo símbolo. Expira a rec oposta — sem afetar o trade
+    real, que continua aberto. Retorna quantos snapshots foram expirados."""
+    if not DB_ENABLED:
+        return 0
+    try:
+        async with get_session() as session:
+            stmt = (
+                update(RecommendationSnapshot)
+                .where(
+                    and_(
+                        RecommendationSnapshot.symbol == symbol,
+                        RecommendationSnapshot.direction == direction,
+                        RecommendationSnapshot.status == "open",
+                    )
+                )
+                .values(status="expired", outcome_at=datetime.now(timezone.utc))
+            )
+            res = await session.execute(stmt)
+            await session.commit()
+            n = res.rowcount or 0
+            if n:
+                log.debug(
+                    f"[snapshot] expirado {n} snapshot(s) {symbol} {direction} ({reason})"
+                )
+            return n
+    except Exception as e:
+        log.warning(f"[snapshot] expire_open_snapshot falhou {symbol} {direction}: {e}")
+        return 0
 
 
 def _atr_abs(snap: RecommendationSnapshot) -> Optional[float]:
