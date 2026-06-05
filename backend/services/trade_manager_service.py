@@ -74,6 +74,28 @@ def _time_stop_threshold_min(tf: str | None) -> int:
     return TIME_STOP_SWING_MIN
 
 
+async def _resolve_trade_timeframe(trade: RealTrade) -> str | None:
+    """
+    RealTrade NÃO tem coluna `timeframe`. Deriva da snapshot ligada via
+    recommendation_id. Retorna None se não houver link — caller usa default DAY.
+    """
+    rec_id = getattr(trade, "recommendation_id", None)
+    if not rec_id:
+        return None
+    try:
+        from models.recommendation_snapshot import RecommendationSnapshot
+        async with get_session() as session:
+            stmt = select(RecommendationSnapshot.timeframe).where(
+                RecommendationSnapshot.id == rec_id
+            )
+            row = (await session.execute(stmt)).first()
+            if row and row[0]:
+                return row[0]
+    except Exception as e:
+        log.warning(f"[time-stop] resolve tf #{trade.id} falhou: {e}")
+    return None
+
+
 async def _fetch_exchange_position(symbol: str) -> tuple[float | None, float | None]:
     """Busca (qty, entry_price) atuais da posição na exchange. (None, None) se erro, (0, None) se fechada."""
     try:
@@ -265,7 +287,11 @@ async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
     if not trade.opened_at:
         return False
 
-    threshold_min = _time_stop_threshold_min(trade.timeframe)
+    # RealTrade não tem coluna timeframe → deriva da snapshot. Default DAY
+    # (24h, conservador) se não houver link — evita fechar scalp cedo demais
+    # por engano, mas ainda garante teto.
+    tf = await _resolve_trade_timeframe(trade)
+    threshold_min = _time_stop_threshold_min(tf)
     opened = trade.opened_at
     if opened.tzinfo is None:
         opened = opened.replace(tzinfo=timezone.utc)
@@ -273,7 +299,7 @@ async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
     if age_min < threshold_min:
         return False
 
-    cat = _tf_category(trade.timeframe)
+    cat = _tf_category(tf)
     sym = trade.symbol
     log.info(
         f"[time-stop] {sym} #{trade.id} idade={age_min:.0f}min >= {threshold_min}min "
@@ -333,7 +359,10 @@ async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
     try:
         from services.notification_service import send_telegram, fmt_time_stop
         await send_telegram(
-            fmt_time_stop(trade, age_min=age_min, threshold_min=threshold_min, category=cat),
+            fmt_time_stop(
+                trade, age_min=age_min, threshold_min=threshold_min,
+                category=cat, tf=tf,
+            ),
             event_type="time_stop",
         )
     except Exception as e:

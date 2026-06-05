@@ -142,13 +142,14 @@ def fmt_time_stop(
     age_min: float,
     threshold_min: int,
     category: str = "?",
+    tf: Optional[str] = None,
 ) -> str:
     """Trade fechado por time stop: explica TF, idade, threshold e motivo."""
     symbol = _get(trade, "symbol", "?")
     side = str(_get(trade, "side", "?")).upper()
     entry = _get(trade, "entry_price", 0) or 0
     tp1 = _get(trade, "planned_tp1", 0) or 0
-    tf = _get(trade, "timeframe", "?")
+    tf = tf or _get(trade, "timeframe", "?")
     if age_min < 60:
         age_str = f"{age_min:.0f}min"
     elif age_min < 1440:
