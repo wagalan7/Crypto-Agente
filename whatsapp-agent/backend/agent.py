@@ -325,11 +325,32 @@ CONFIRMAÇÃO FUTURA (paciente disse que vai confirmar depois):
   Fico no aguardo da sua confirmação. 💙"
 - action "none".
 
+CANCELAMENTO — REGRA ABSOLUTA (NÃO CONFUNDIR COM REMARCAÇÃO):
+- Se o paciente disser que quer/precisa CANCELAR ou DESMARCAR e NÃO pedir
+  outro horário no lugar → é CANCELAMENTO, não remarcação.
+- Sinais de cancelamento: "vou precisar cancelar", "quero cancelar",
+  "preciso cancelar", "tenho que cancelar", "vou cancelar", "cancelei",
+  "vou desmarcar", "preciso desmarcar", "não vou poder ir", "não consigo ir",
+  "não vou conseguir", "vou ter que faltar".
+- NUNCA, em hipótese alguma, ofereça novos horários, pergunte disponibilidade,
+  ou tente remarcar quando o paciente está CANCELANDO. Ele NÃO pediu outro dia.
+- Ação: use intent "cancel" e action "cancel" com
+  data: {{"appointment_id": ID_DA_CONSULTA}} (use o ID da próxima consulta
+  do paciente fornecido no contexto).
+- response_text deve apenas acolher e avisar que a {tenant['psychologist_name']}
+  vai entrar em contato — SEM oferecer reagendamento, SEM cobrar, SEM citar
+  política. Exemplo: "Entendi, {{primeiro_nome}}! 😊 Vou avisar a
+  {tenant['psychologist_name']} sobre o cancelamento e ela entra em contato
+  com você em breve. 💙"
+- DIFERENÇA: se o paciente pedir para MUDAR/REMARCAR para outro dia/horário
+  ("preciso mudar para quinta", "dá pra remarcar?") → aí sim é remarcação
+  (intent "reschedule"), e aí pergunte a disponibilidade normalmente.
+
 FORMATO DE RESPOSTA (OBRIGATÓRIO — responda APENAS com JSON válido, sem markdown):
 
 {{
-  "intent": "confirm|schedule|reschedule|new_patient|other",
-  "action": "none|list_slots|create|update|confirm",
+  "intent": "confirm|schedule|reschedule|cancel|new_patient|other",
+  "action": "none|list_slots|create|update|confirm|cancel",
   "data": {{}},
   "response_text": ""
 }}
@@ -339,6 +360,7 @@ CAMPOS data ESPERADOS POR AÇÃO:
 - create: {{"patient_name": "...", "slot_index": 1}}   ← número exibido ao paciente (1 = primeiro, 2 = segundo, etc.)
 - update: {{"appointment_id": 1, "slot_index": 1}}     ← mesmo padrão: número do item na lista
 - confirm: {{"appointment_id": 1}}
+- cancel: {{"appointment_id": 1}}     ← cancelar a consulta (NÃO oferecer outro horário)
 - none: {{}}
 
 REGRA CRÍTICA — slot_index:
@@ -616,7 +638,10 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
             if any(k in t for k in ("agend", "marc", "horário", "horario", "consult", "sess", "atend")):
                 resp_text = ("Recebi sua mensagem! 😊 Para te ajudar com o agendamento, "
                              "vou repassar para a psicóloga, que entra em contato em breve.")
-            elif any(k in t for k in ("remarcar", "desmarcar", "cancelar", "mudar")):
+            elif any(k in t for k in ("cancelar", "desmarcar", "não vou poder", "nao vou poder")):
+                resp_text = ("Entendi! 😊 Vou avisar a psicóloga sobre o cancelamento "
+                             "e ela entra em contato com você em breve. 💙")
+            elif any(k in t for k in ("remarcar", "mudar")):
                 resp_text = ("Anotado! 😊 Vou repassar seu pedido para a psicóloga, "
                              "que retorna em breve para combinar com você.")
             elif any(k in t for k in ("valor", "preço", "preco", "quanto", "pagar", "pagamento")):
@@ -708,6 +733,57 @@ def _execute_action(tenant: dict, resp: AgentResponse,
 
     if action == Action.list_slots:
         return text, {"type": "new_message", "data": {"phone": phone, "intent": resp.intent}}
+
+    if action == Action.cancel:
+        # Cancelamento suave: marca cancelled=1 (para lembretes), remove do
+        # calendário externo e avisa a psicóloga (notificação feita no main.py
+        # via resp.intent == cancel). NUNCA oferece outro horário.
+        appt_id = data.get("appointment_id")
+        appt = None
+        if appt_id:
+            try:
+                appt = db.get_appointment_by_id(tenant_id, int(appt_id))
+            except (TypeError, ValueError):
+                appt = None
+        # Fallback: se o LLM não passou ID, pega a próxima consulta do paciente.
+        if not appt and phone:
+            appt = cal.get_next_appointment(tenant_id, phone)
+        if appt:
+            try:
+                db.cancel_appointment(tenant_id, appt["id"])
+            except Exception as e:
+                logger.warning(f"[{tenant['slug']}][{phone}] cancel_appointment falhou: {e}")
+            # Remover do Google Calendar / CalDAV
+            if appt.get("google_event_id"):
+                try:
+                    if tenant.get("google_refresh_token"):
+                        gcal.delete_event(tenant, appt["google_event_id"])
+                    else:
+                        caldav_svc.delete_event(tenant, appt["google_event_id"])
+                except Exception as e:
+                    logger.warning(f"[gcal/caldav] delete (cancel) falhou: {e}")
+            logger.info(f"[{tenant['slug']}][{phone}] Consulta {appt['id']} cancelada pelo paciente")
+        else:
+            logger.info(f"[{tenant['slug']}][{phone}] Cancelamento sem consulta futura encontrada")
+        # Resposta: acolhe e avisa que a psicóloga entra em contato. NUNCA
+        # oferece reagendamento nem cita política de cobrança.
+        psy = tenant.get("psychologist_name") or "psicóloga"
+        nome = ""
+        if appt and appt.get("patient_name"):
+            nome = appt["patient_name"].split()[0]
+        reply = text or ""
+        # Sanitiza: se o LLM escorregou e ofereceu horário/disponibilidade,
+        # substitui por mensagem segura de cancelamento.
+        low = reply.lower()
+        if (not reply.strip()
+                or "disponibilidade" in low or "horário" in low or "horario" in low
+                or "remarc" in low or "qual dia" in low or "opções" in low or "opcoes" in low):
+            saud = f"Entendi, {nome}!" if nome else "Entendi!"
+            reply = (f"{saud} 😊 Vou avisar a {psy} sobre o cancelamento e ela "
+                     f"entra em contato com você em breve. 💙")
+        return reply, {"type": "appointment_cancelled",
+                       "data": {"phone": phone,
+                                "patient_name": (appt or {}).get("patient_name", "")}}
 
     if action == Action.create:
         # slot_index vem do LLM como número do display (1-based).

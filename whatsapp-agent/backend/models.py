@@ -8,6 +8,7 @@ class Intent(str, Enum):
     confirm = "confirm"
     schedule = "schedule"
     reschedule = "reschedule"
+    cancel = "cancel"
     new_patient = "new_patient"
     other = "other"
 
@@ -18,6 +19,7 @@ class Action(str, Enum):
     create = "create"
     update = "update"
     confirm = "confirm"
+    cancel = "cancel"
 
 
 class AgentResponse(BaseModel):

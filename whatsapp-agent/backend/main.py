@@ -392,8 +392,53 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         await wa.send_message(tenant, phone, reply)
         logger.info(f"[{tenant['slug']}][{phone}] intent={resp.intent} action={resp.action}")
 
+        # ── Notificar psicóloga quando paciente CANCELAR ─────────────────────────
+        if resp.action == "cancel" or resp.intent == "cancel":
+            psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
+            phone_norm = _norm_phone(phone)
+            quando_txt = ""
+            nome_txt = ""
+            try:
+                ev_data = (event or {}).get("data", {}) if event else {}
+                nome_txt = ev_data.get("patient_name", "") or ""
+            except Exception:
+                pass
+            # Busca a consulta cancelada (já marcada cancelled=1) para informar a data
+            try:
+                appts = db.get_appointments_by_phone(tenant["id"], phone_norm) or []
+                future_cancel = [a for a in appts if a.get("cancelled")]
+                if future_cancel:
+                    import calendar_service as _cal
+                    from datetime import datetime as _dt
+                    last = sorted(future_cancel, key=lambda a: a.get("scheduled_at") or "")[-1]
+                    nome_txt = nome_txt or (last.get("patient_name") or "")
+                    try:
+                        _d = _dt.fromisoformat(last["scheduled_at"])
+                        quando_txt = _cal.format_slots([_d])[0]
+                    except Exception:
+                        quando_txt = ""
+            except Exception as e:
+                logger.warning(f"[{tenant['slug']}] Falha ao montar notificação de cancelamento: {e}")
+            if psy_phone:
+                nome_disp = nome_txt or "Paciente"
+                linha_quando = f"\nSessão: *{quando_txt}*" if quando_txt else ""
+                notif = (
+                    f"❌ *Cancelamento de sessão*\n"
+                    f"*{nome_disp}* avisou que vai cancelar.{linha_quando}\n"
+                    f"Número: {phone_norm}\n\n"
+                    f"O horário foi liberado na agenda. Se quiser aplicar a política "
+                    f"de cobrança, entre em contato com o(a) paciente. 💙"
+                )
+                await wa.send_message(tenant, psy_phone, notif)
+                logger.info(f"[{tenant['slug']}] Notificação de cancelamento enviada para psicóloga")
+            try:
+                await events.publish(tenant["id"], "appointment_cancelled",
+                                     {"phone": phone, "patient_name": nome_txt})
+            except Exception:
+                pass
+
         # ── Notificar psicóloga quando novo paciente entrar em contato ───────────
-        if resp.intent == "new_patient":
+        elif resp.intent == "new_patient":
             raw_name = resp.data.get("patient_name", "") if resp.data else ""
             # Sanitização: remove caracteres de controle, recorta para 100 chars.
             patient_name = "".join(ch for ch in (raw_name or "") if ch.isprintable()).strip()[:100]

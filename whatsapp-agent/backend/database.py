@@ -560,6 +560,21 @@ def update_appointment(tenant_id: int, appointment_id: int, scheduled_at: dateti
         return cur.rowcount > 0
 
 
+def cancel_appointment(tenant_id: int, appointment_id: int) -> bool:
+    """Cancelamento SUAVE: marca cancelled=1 (não apaga a linha).
+    Mantém o registro para a psicóloga decidir sobre a política de cobrança
+    e para as estatísticas; também faz o agendador PARAR de enviar lembretes
+    (todas as queries de lembrete filtram cancelled=0)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE appointments
+               SET cancelled = 1, confirmation_sent = 1, followup_sent = 1
+               WHERE id = ? AND tenant_id = ?""",
+            (appointment_id, tenant_id),
+        )
+        return cur.rowcount > 0
+
+
 def rename_patient(tenant_id: int, appointment_id: int, new_name: str, apply_all: bool = False) -> int:
     """Renomeia o paciente em uma consulta (ou em todas as consultas com o mesmo telefone, se apply_all=True).
     Retorna o número de linhas atualizadas."""
