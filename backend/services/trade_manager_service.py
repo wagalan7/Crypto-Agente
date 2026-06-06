@@ -467,8 +467,8 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     # openAlgoOrders só devolve ordens ABERTAS → presença = viva. A posição
     # ainda tem qty (qty_now > 0), então se um SL/TP2 com closePosition sumiu,
     # ele NÃO disparou (senão a posição teria fechado) — sumiu de fato.
-    sl_vanished = tp2_vanished = False
-    if PROTECTION_VERIFY_LIVE and (trade.sl_order_id or trade.tp2_order_id):
+    sl_vanished = tp2_vanished = tp1_vanished = False
+    if PROTECTION_VERIFY_LIVE and (trade.sl_order_id or trade.tp2_order_id or trade.tp1_order_id):
         try:
             from services import exchange_service
             res = await exchange_service.get_open_algo_orders(trade.symbol)
@@ -478,6 +478,15 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
                     sl_vanished = True
                 if trade.tp2_order_id and str(trade.tp2_order_id) not in live_ids and bool(trade.planned_tp2):
                     tp2_vanished = True
+                # TP1 parcial: só conta como sumido se a posição ainda está CHEIA
+                # (parcial NÃO bateu). Se a qty já caiu abaixo do limiar de detecção,
+                # a ausência do TP1 é execução legítima — não recria (senão duplicaria
+                # cobertura e bagunçaria a transição pra post_tp1).
+                if (not is_post) and trade.tp1_order_id and bool(trade.planned_tp1):
+                    qty_initial = trade.qty_initial or trade.qty or qty_now
+                    still_full = qty_now > (qty_initial * _TP1_DETECTED_AT)
+                    if still_full and str(trade.tp1_order_id) not in live_ids:
+                        tp1_vanished = True
             else:
                 # Leitura incerta → não age por sumiço (fail-safe).
                 log.info(
@@ -489,6 +498,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
 
     sl_missing = sl_missing or sl_vanished
     tp2_missing = tp2_missing or tp2_vanished
+    tp1_missing = tp1_missing or tp1_vanished
 
     if not (sl_missing or tp1_missing or tp2_missing):
         return False
@@ -500,7 +510,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     log.warning(
         f"[autoheal] {sym} #{trade.id} proteção incompleta — "
         f"sl_missing={sl_missing} tp1_missing={tp1_missing} tp2_missing={tp2_missing} "
-        f"(vanished: sl={sl_vanished} tp2={tp2_vanished}) "
+        f"(vanished: sl={sl_vanished} tp1={tp1_vanished} tp2={tp2_vanished}) "
         f"(sl_id={trade.sl_order_id} tp1_id={trade.tp1_order_id} tp2_id={trade.tp2_order_id})"
     )
 
@@ -548,7 +558,8 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
         except Exception as e:
             failed.append(f"TP2({e})")
 
-    # ── TP1 parcial (só quando SL+TP também estavam nus = abertura falhou) ─
+    # ── TP1 parcial (abertura falhou com SL+TP nus, OU TP1 sumiu da exchange
+    #    com a posição ainda cheia = deleção manual sem o parcial ter batido) ─
     if tp1_missing:
         qty_tp1 = qty_now * _TP1_QTY_PCT
         try:
