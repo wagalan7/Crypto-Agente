@@ -49,6 +49,94 @@ SHADOW_ENABLED = os.getenv("EXCHANGE_SHADOW", "true").strip().lower() in ("1", "
 # Em condições normais, exchange_service.get_equity() lê o saldo real.
 VIRTUAL_EQUITY_USD = float(os.getenv("EXCHANGE_SHADOW_EQUITY_USD", "5000"))
 
+# ── Trava de dinheiro real (go-live #1) ─────────────────────────────────────
+# O master gate de execução é SHADOW_ENABLED. Mas desligar o shadow
+# (EXCHANGE_SHADOW=false) numa conta de PRODUÇÃO = dinheiro real de verdade.
+# Pra blindar contra acidente (ex: alguém setou EXCHANGE_SHADOW=false sem
+# perceber que a conta é mainnet), exigimos uma confirmação EXPLÍCITA: a env
+# LIVE_TRADING_CONFIRM precisa bater exatamente a frase abaixo. Sem ela, o bot
+# se RECUSA a executar ordens reais — loga ABORT e pula a trade. Demo/testnet
+# (dinheiro fake) não exige confirmação.
+_LIVE_CONFIRM_PHRASE = "ENTENDO_RISCO_DINHEIRO_REAL"
+LIVE_TRADING_CONFIRM = os.getenv("LIVE_TRADING_CONFIRM", "").strip()
+
+# ── Canary / ramp de tamanho (go-live #2) ───────────────────────────────────
+# Multiplicador global aplicado ao qty SÓ em modo live. Permite começar a
+# operar dinheiro real com fração do tamanho (ex: 0.1 = 10%) e subir gradual
+# conforme ganha confiança. 1.0 = tamanho cheio. Não afeta shadow. Se a fração
+# levar o notional abaixo do mínimo da exchange, a trade é pulada (canary muito
+# pequeno pra esse símbolo).
+LIVE_SIZE_MULT = max(0.0, min(float(os.getenv("LIVE_SIZE_MULT", "1.0")), 1.0))
+
+
+def _exchange_is_production() -> bool:
+    """True se a exchange ativa está em modo produção (dinheiro real)."""
+    try:
+        from services import exchange_service
+        info = exchange_service.env_info()
+        mode = (info.get("mode") or "").strip().lower()
+        if mode:
+            # binance: demo/testnet = fake; mainnet = real
+            return mode == "mainnet"
+        # fallback genérico: flag testnet (true = fake)
+        return not bool(info.get("testnet", True))
+    except Exception:
+        # Na dúvida, assume produção (fail-safe → exige confirmação explícita)
+        return True
+
+
+def _live_money_guard() -> tuple[bool, str]:
+    """
+    (allowed, reason) — bloqueia execução real se a conta é produção e a
+    confirmação explícita (LIVE_TRADING_CONFIRM) não foi dada.
+    """
+    if not _exchange_is_production():
+        return True, "non-prod (demo/testnet) — sem dinheiro real"
+    if LIVE_TRADING_CONFIRM == _LIVE_CONFIRM_PHRASE:
+        return True, "produção confirmada (LIVE_TRADING_CONFIRM ok)"
+    return False, (
+        f"conta de PRODUÇÃO sem confirmação — defina "
+        f"LIVE_TRADING_CONFIRM={_LIVE_CONFIRM_PHRASE} pra liberar dinheiro real"
+    )
+
+
+def log_boot_safety_banner() -> None:
+    """
+    Banner gritante no boot resumindo o estado de execução (shadow vs live,
+    produção vs demo, canary, confirmação). Chamado no lifespan do app.
+    """
+    try:
+        prod = _exchange_is_production()
+        exch = os.getenv("EXCHANGE", "binance")
+        if SHADOW_ENABLED:
+            log.info(
+                f"[boot-safety] 🟢 SHADOW ON ({exch}) — nenhuma ordem real é "
+                f"enviada à exchange (sizing usa equity real só pra simular)"
+            )
+            return
+        # Live (shadow off)
+        armed, why = _live_money_guard()
+        env_tag = "PRODUÇÃO/MAINNET" if prod else "demo/testnet"
+        if not prod:
+            log.warning(
+                f"[boot-safety] 🟡 LIVE ON ({exch}, {env_tag}) — ordens enviadas, "
+                f"mas dinheiro FAKE. canary×{LIVE_SIZE_MULT}"
+            )
+        elif armed:
+            log.warning(
+                "[boot-safety] 🔴🔴🔴 LIVE ON EM PRODUÇÃO — DINHEIRO REAL 🔴🔴🔴 "
+                f"({exch}, {env_tag}) confirmação OK. canary×{LIVE_SIZE_MULT}. "
+                f"Cada rec tier A/A+ abre posição real."
+            )
+        else:
+            log.error(
+                f"[boot-safety] ⛔ LIVE pedido em PRODUÇÃO ({exch}) MAS SEM "
+                f"CONFIRMAÇÃO — ordens reais serão BLOQUEADAS até definir "
+                f"LIVE_TRADING_CONFIRM={_LIVE_CONFIRM_PHRASE}. (Trades pulados.)"
+            )
+    except Exception as e:
+        log.warning(f"[boot-safety] banner falhou: {e}")
+
 # Guard de notional mínimo (Binance Futures: $50). Se o sizing por risco
 # ficar abaixo do mínimo, inflamos o qty pra atingir — desde que isso não
 # leve o risco real além de MAX_RISK_PCT_HARD. Caso contrário, pula a trade.
@@ -684,15 +772,23 @@ async def _resolve_equity_usd() -> tuple[float, str]:
 
 def env_info() -> dict:
     """Diagnóstico — quanto o shadow está ativo + equity virtual usado pra sizing."""
+    prod = _exchange_is_production()
+    armed, guard_reason = _live_money_guard()
     return {
         "shadow_enabled": SHADOW_ENABLED,
         "fallback_equity_usd": VIRTUAL_EQUITY_USD,
-        "sizing_mode": "live (com fallback estático em erro)",
+        "sizing_mode": "live (aborta se equity real indisponível em modo live)",
         "min_notional_usd": MIN_NOTIONAL_USD,
         "max_risk_pct_hard": MAX_RISK_PCT_HARD,
         "max_margin_pct_per_trade": MAX_MARGIN_PCT_PER_TRADE,
         "max_total_notional_pct": MAX_TOTAL_NOTIONAL_PCT,
         "exchange_active": os.getenv("EXCHANGE", "binance"),
+        # go-live safety rails
+        "is_production": prod,
+        "live_money_armed": (not SHADOW_ENABLED) and armed,
+        "live_money_guard": guard_reason,
+        "live_trading_confirmed": LIVE_TRADING_CONFIRM == _LIVE_CONFIRM_PHRASE,
+        "live_size_mult": LIVE_SIZE_MULT,
         "note": "Sizing: risk_pct nominal; eleva ao mín notional; capa em margin%/trade e total notional%.",
     }
 
@@ -1592,6 +1688,16 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             stop = float(rec.get("stop_loss") or 0)
             risk_pct = float(rec.get("risk_pct") or 1.0)
             equity_usd, equity_src = await _resolve_equity_usd()
+            # go-live #5 — em modo LIVE, nunca dimensiona dinheiro real com
+            # equity fictício. Se a exchange falhou (source="fallback"), aborta
+            # a trade em vez de usar o VIRTUAL_EQUITY_USD estático.
+            if not SHADOW_ENABLED and equity_src == "fallback":
+                log.error(
+                    f"[shadow→live] {rec.get('symbol')} ABORT: equity ao vivo "
+                    f"indisponível (fallback estático ${equity_usd:.0f}) — não "
+                    f"dimensiona dinheiro real com equity fictício"
+                )
+                continue
             lev = int(rec.get("leverage") or 1)
             sizing = _compute_qty(entry, stop, risk_pct, equity_usd, leverage=lev)
             if sizing is None:
@@ -1609,11 +1715,32 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 )
                 continue
             qty = sizing["qty"]
+            notional_effective = float(sizing["notional_usd"])
+
+            # go-live #2 — canary/ramp: em LIVE, escala o tamanho por um
+            # multiplicador global pra começar pequeno e subir gradual. Não
+            # afeta shadow. Se a fração jogar o notional abaixo do mínimo da
+            # exchange, pula (canary pequeno demais pra esse símbolo).
+            if not SHADOW_ENABLED and LIVE_SIZE_MULT < 1.0:
+                qty_full = qty
+                qty = round(qty * LIVE_SIZE_MULT, 6)
+                notional_effective = qty * entry
+                if notional_effective < MIN_NOTIONAL_USD:
+                    log.warning(
+                        f"[shadow→live] {rec.get('symbol')} SKIP canary: "
+                        f"size×{LIVE_SIZE_MULT} → notional ${notional_effective:.0f} "
+                        f"< mín ${MIN_NOTIONAL_USD:.0f} (qty cheio {qty_full})"
+                    )
+                    continue
+                log.info(
+                    f"[shadow→live] canary {rec.get('symbol')}: qty {qty_full} → "
+                    f"{qty} (×{LIVE_SIZE_MULT}); notional ${notional_effective:.0f}"
+                )
 
             # Cap de exposição agregada — bloqueia se total notional > X% banca
             try:
                 open_notional = await _open_notional_usd()
-                new_notional = float(sizing["notional_usd"])
+                new_notional = notional_effective
                 total_after = open_notional + new_notional
                 cap_usd = equity_usd * (MAX_TOTAL_NOTIONAL_PCT / 100.0)
                 if total_after > cap_usd:
@@ -1666,6 +1793,15 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             entry_actual = entry
 
             if not SHADOW_ENABLED:
+                # 0. Trava de dinheiro real (go-live #1) — produção exige
+                #    confirmação explícita. Sem ela, NÃO envia ordem real.
+                armed, guard_why = _live_money_guard()
+                if not armed:
+                    log.error(
+                        f"[shadow→live] ⛔ BLOCKED {rec['symbol']} {side}: {guard_why}"
+                    )
+                    continue
+
                 # 1. Kill-switch
                 from services import kill_switch_service
                 ks = await kill_switch_service.check_can_trade()

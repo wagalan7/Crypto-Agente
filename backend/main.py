@@ -313,6 +313,12 @@ async def _server_scan_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task
+    # Banner de segurança go-live — shadow vs live, produção vs demo, canary.
+    try:
+        from services import shadow_trade_service
+        shadow_trade_service.log_boot_safety_banner()
+    except Exception as e:
+        logging.warning(f"Falha no boot-safety banner: {e}")
     if DB_ENABLED:
         try:
             await init_db()

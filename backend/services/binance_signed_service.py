@@ -19,9 +19,11 @@ Env:
   BINANCE_TESTNET        — "true" (default) → testnet.binancefuture.com
   BINANCE_RECV_WINDOW    — janela em ms (default 5000)
 
-Restrição regulatória: residentes BR não conseguem acessar futures na
-conta mainnet via Binance global desde 2023 (CVM). Testnet funciona
-normalmente — útil pra validar bot. Pra mainnet em BR, considere Bybit/OKX.
+Nota regulatória: o acesso a futures mainnet pelo BR depende da conta/KYC.
+Contas com o módulo de futuros liberado operam normalmente. Antes de ligar
+dinheiro real, confirme: BINANCE_MODE=mainnet + EXCHANGE_SHADOW=false +
+LIVE_TRADING_CONFIRM=ENTENDO_RISCO_DINHEIRO_REAL (trava de segurança no
+shadow_trade_service). Comece com LIVE_SIZE_MULT pequeno (ex: 0.1).
 """
 from __future__ import annotations
 import asyncio
