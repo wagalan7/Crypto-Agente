@@ -246,6 +246,23 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
         else:
             exit_price = trade.entry_price
 
+    # ── Classificação refinada (post_tp1) ────────────────────────────────
+    # O caller passa "tp2" pra qualquer fechamento em post_tp1, mas pode ter
+    # sido BE ou SL. Se temos exit real, reclassifica pela proximidade: perto
+    # do TP2 = tp2; perto do entry = be (lucro≥0) ou stop (lucro<0). Mantém a
+    # atribuição de P&L correta no dashboard.
+    if reason == "tp2" and exit_price and exit_price > 0 and trade.entry_price and trade.entry_price > 0:
+        sign = 1 if trade.side == "long" else -1
+        d_be = abs(exit_price - trade.entry_price)
+        d_tp2 = abs(exit_price - trade.planned_tp2) if trade.planned_tp2 else float("inf")
+        if d_be < d_tp2:
+            pnl_dir = (exit_price - trade.entry_price) * sign
+            reason = "be" if pnl_dir >= 0 else "stop"
+            log.info(
+                f"[trade-manager] #{trade.id} reclassificado post_tp1 → {reason} "
+                f"(exit={exit_price} entry={trade.entry_price} tp2={trade.planned_tp2})"
+            )
+
     status_map = {
         "tp2": "closed_tp2",
         "stop": "closed_stop",
@@ -400,15 +417,20 @@ async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
 
 async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     """
-    Auto-cura: em pre_tp1, recria pernas de proteção (SL/TP1/TP2) que faltam
-    no DB. Cobre o bug SUI (sem TP2) / DOGE (sem SL nem TP) — falhas transitórias
-    no algoOrder durante a abertura deixavam a posição parcialmente nua.
+    Auto-cura: recria pernas de proteção que faltam no DB. Cobre o bug SUI
+    (sem TP2) / DOGE (sem SL nem TP) — falhas transitórias no algoOrder durante
+    a abertura/transição deixavam a posição parcialmente nua.
+
+    Cobre AS DUAS fases:
+      - pre_tp1: SL (no stop original) + TP1 parcial + TP2.
+      - post_tp1: SL no breakeven (sl_current_price) + TP2. NÃO recria TP1
+        (já foi consumido). Pega o caso de a transição ter criado o SL@BE mas
+        o TP2 ter sumido, ou vice-versa.
 
     Estratégia conservadora (evita ordens duplicadas):
-      - Só age em phase=pre_tp1 (em post_tp1 o TP1 já executou e o SL@BE é
-        gerido pelo transition; os IDs antigos ficam "usados").
       - "Faltando" = ID None no DB. Com o retry no algoOrder, ID None significa
-        de fato que a perna não foi criada.
+        de fato que a perna não foi criada. (Não verifica ordem viva na
+        exchange — só ausência de criação; cobre o cenário real de falha.)
       - Guarda do TP1 legitimamente pulado: se tp1_order_id é None mas
         tp2_order_id existe, assume skip (qty*0.45 arredondou pra 0) e NÃO
         recria TP1 — senão duplicaria cobertura.
@@ -417,14 +439,21 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     """
     if not PROTECTION_AUTOHEAL_ENABLED:
         return False
-    if trade.phase != "pre_tp1" or qty_now <= 0:
+    if qty_now <= 0 or trade.phase not in ("pre_tp1", "post_tp1"):
         return False
 
-    sl_missing = (not trade.sl_order_id) and bool(trade.planned_stop)
+    is_post = trade.phase == "post_tp1"
+    # SL: em pre_tp1 protege no stop original; em post_tp1 protege no breakeven
+    # (sl_current_price setado pela transição, com fallback no entry).
+    sl_price = (trade.sl_current_price or trade.entry_price) if is_post else trade.planned_stop
+
+    sl_missing = (not trade.sl_order_id) and bool(sl_price)
     tp2_missing = bool(trade.planned_tp2) and not trade.tp2_order_id
-    # TP1 só é "bracket" quando há TP2 planejado. Skip legítimo: tp2 já existe.
+    # TP1 só recria em pre_tp1 (em post_tp1 já foi consumido). "Bracket" só
+    # quando há TP2 planejado; skip legítimo: tp2 já existe.
     tp1_missing = (
-        bool(trade.planned_tp1) and bool(trade.planned_tp2)
+        (not is_post)
+        and bool(trade.planned_tp1) and bool(trade.planned_tp2)
         and not trade.tp1_order_id and not trade.tp2_order_id
     )
     if not (sl_missing or tp1_missing or tp2_missing):
@@ -449,7 +478,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
         try:
             r = await binance_signed_service.place_protection_orders(
                 sym, entry_side, qty=qty_now,
-                stop_loss=trade.planned_stop, tp1=None, tp2=None,
+                stop_loss=sl_price, tp1=None, tp2=None,
                 client_order_id_prefix=f"cw-heal-sl-{trade.id}",
             )
             if r.get("sl_ok") and r.get("sl_order_id"):
@@ -465,8 +494,11 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
         # qty restante: se há (ou vamos recriar) TP1 parcial, TP2 cobre os 55%;
         # senão cobre o total. Como estamos em pre_tp1, TP1 ainda não bateu.
         # reduceOnly limita a execução ao tamanho real da posição de qualquer forma.
+        # Em post_tp1 a posição já é o restante (TP1 saiu) → qty_now cobre tudo.
+        # Em pre_tp1, se há TP1 parcial, TP2 cobre os 55%. (Com closePosition=true
+        # a qty é ignorada de qualquer forma; só importa no fallback reduceOnly.)
         tp1_present = bool(trade.tp1_order_id) or tp1_missing
-        qty_tp2 = qty_now * (1.0 - _TP1_QTY_PCT) if tp1_present else qty_now
+        qty_tp2 = qty_now if is_post else (qty_now * (1.0 - _TP1_QTY_PCT) if tp1_present else qty_now)
         try:
             r = await binance_signed_service.place_protection_orders(
                 sym, entry_side, qty=qty_tp2,
@@ -510,7 +542,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
         if fresh:
             if new_sl_id:
                 fresh.sl_order_id = new_sl_id
-                fresh.sl_current_price = trade.planned_stop
+                fresh.sl_current_price = sl_price
             if new_tp1_id:
                 fresh.tp1_order_id = new_tp1_id
             if new_tp2_id:
