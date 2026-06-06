@@ -384,17 +384,29 @@ async def place_protection_orders(
     #   - usa `triggerPrice` em vez de `stopPrice`
     #   - precisa de `algoType=CONDITIONAL`
     #   - retorna `algoId` (não `orderId`)
-    async def _place_algo(otype: str, trigger_price: float, q: float, label: str) -> tuple[bool, str | None, str | None]:
+    async def _place_algo(
+        otype: str,
+        trigger_price: float,
+        q: float,
+        label: str,
+        close_position: bool = False,
+    ) -> tuple[bool, str | None, str | None]:
         params = {
             "algoType": "CONDITIONAL",
             "symbol": sym,
             "side": counter_side,
             "type": otype,
             "triggerPrice": trigger_price,
-            "quantity": q,
-            "reduceOnly": "true",
             "workingType": "MARK_PRICE",  # mark price evita trigger por wick fino
         }
+        if close_position:
+            # closePosition=true fecha 100% da posição no trigger — imune a
+            # descasamento de qty/stepSize (a poeira que sobrava com quantity
+            # fixo). Não envia quantity nem reduceOnly (a API rejeita junto).
+            params["closePosition"] = "true"
+        else:
+            params["quantity"] = q
+            params["reduceOnly"] = "true"
         if client_order_id_prefix:
             params["clientAlgoId"] = f"{client_order_id_prefix}-{label}"
 
@@ -432,7 +444,13 @@ async def place_protection_orders(
     # ── SL ───────────────────────────────────────────────────────────────
     if stop_loss is not None:
         sl_price = await _round_price(sym, float(stop_loss))
-        ok, oid, msg = await _place_algo("STOP_MARKET", sl_price, qty_total, "sl")
+        # closePosition=true fecha tudo (sem sobrar poeira). Se a API rejeitar
+        # closePosition no algoOrder, cai pra quantity+reduceOnly (nunca fica
+        # sem stop).
+        ok, oid, msg = await _place_algo("STOP_MARKET", sl_price, qty_total, "sl", close_position=True)
+        if not ok:
+            log.warning(f"[binance] SL closePosition falhou {sym}: {msg} — fallback quantity")
+            ok, oid, msg = await _place_algo("STOP_MARKET", sl_price, qty_total, "sl")
         out["sl_ok"] = ok
         out["sl_order_id"] = oid
         out["sl_msg"] = msg
@@ -446,11 +464,14 @@ async def place_protection_orders(
         out["tp1_msg"] = msg
         out["tp1_qty"] = tp1_qty if ok else 0.0
 
-    # ── TP2 / TP único — qty restante (ou total se sem parcial) ──────────
+    # ── TP2 / TP único — fecha o restante (closePosition, sem poeira) ────
     tp_final = tp2 if tp2 is not None else tp1
     if tp_final is not None:
         tp_price = await _round_price(sym, float(tp_final))
-        ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, qty_remaining, "tp2")
+        ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, qty_remaining, "tp2", close_position=True)
+        if not ok:
+            log.warning(f"[binance] TP2 closePosition falhou {sym}: {msg} — fallback quantity")
+            ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, qty_remaining, "tp2")
         out["tp2_ok"] = ok
         out["tp2_order_id"] = oid
         out["tp2_msg"] = msg

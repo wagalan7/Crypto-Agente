@@ -60,6 +60,9 @@ TIME_STOP_SWING_MIN = int(os.getenv("TIME_STOP_SWING_MIN", "10080"))
 PROTECTION_AUTOHEAL_ENABLED = os.getenv("PROTECTION_AUTOHEAL_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 # Fração da posição destinada ao TP1 parcial (espelha tp1_qty_pct=0.45 do open).
 _TP1_QTY_PCT = float(os.getenv("PROTECTION_TP1_QTY_PCT", "0.45"))
+# Poeira: residual cujo notional fica abaixo disto é tratado como "fechado".
+# Evita travar o trade aberto por sobra de stepSize (ex.: 0,1 FARTCOIN ≈ $0,01).
+DUST_NOTIONAL_USD = float(os.getenv("TRADE_MANAGER_DUST_USD", "1.0"))
 
 
 def _tf_category(tf: str | None) -> str:
@@ -214,19 +217,34 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
     """Detectou qty=0 na exchange → marca trade fechado. Usa mark price atual como exit."""
     from services import real_trade_service, exchange_service
     exit_price = None
+
+    # 1. Preço de saída REAL: último fill no lado de fechamento. Mais preciso
+    #    que estimar por planned_stop/tp2 — e corrige o PnL $0,00 que acontecia
+    #    quando sl_current_price/planned_stop estavam vazios e o exit caía no
+    #    entry_price (diff = 0 → pnl 0).
     try:
-        # Tenta pegar último preço pra estimar exit
-        from services import binance_signed_service
-        # /fapi/v1/ticker/price é público, mas usar mark price das posições é caro;
-        # fallback: usa planned_tp2 ou planned_stop dependendo do reason.
+        close_side = "SELL" if trade.side == "long" else "BUY"
+        ex = await exchange_service.get_executions(trade.symbol, limit=20)
+        if ex.get("ok"):
+            fills = [
+                f for f in (ex.get("fills") or [])
+                if str(f.get("side", "")).upper() == close_side and float(f.get("price") or 0) > 0
+            ]
+            if fills:
+                latest = max(fills, key=lambda f: int(f.get("time") or 0))
+                exit_price = float(latest["price"])
+                log.info(f"[trade-manager] exit real #{trade.id} via fill: {exit_price}")
+    except Exception as e:
+        log.warning(f"[trade-manager] exit real via fills #{trade.id} falhou: {e}")
+
+    # 2. Fallback: níveis planejados conforme o motivo do fechamento.
+    if not exit_price or exit_price <= 0:
         if reason == "tp2":
             exit_price = trade.planned_tp2 or trade.entry_price
         elif reason == "stop":
             exit_price = trade.sl_current_price or trade.planned_stop or trade.entry_price
         else:
             exit_price = trade.entry_price
-    except Exception:
-        exit_price = trade.entry_price
 
     status_map = {
         "tp2": "closed_tp2",
@@ -546,6 +564,29 @@ async def _process_trade(trade: RealTrade) -> None:
             log.warning(f"[autoheal] check #{trade.id} erro: {e}")
 
     qty_initial = trade.qty_initial or trade.qty
+
+    # ── Poeira: residual minúsculo (sobra de stepSize em fechamentos sem
+    # closePosition) trava o trade aberto. Se o notional do residual < limiar,
+    # tenta zerar a mercado e trata como fechado. ──────────────────────────
+    if qty_now > 0:
+        ref_price = float(trade.sl_current_price or trade.planned_stop or trade.entry_price or 0)
+        residual_notional = qty_now * ref_price
+        if 0 < residual_notional < DUST_NOTIONAL_USD:
+            log.info(
+                f"[trade-manager] {trade.symbol} #{trade.id} POEIRA qty={qty_now} "
+                f"(~${residual_notional:.2f}) — zerando e fechando"
+            )
+            try:
+                from services import exchange_service
+                close_side = "Sell" if trade.side == "long" else "Buy"
+                await exchange_service.place_order(
+                    symbol=trade.symbol, side=close_side, qty=qty_now,
+                    order_type="Market", reduce_only=True,
+                )
+            except Exception as e:
+                log.warning(f"[trade-manager] flatten poeira #{trade.id} falhou: {e}")
+            await _close_trade(trade, "tp2" if trade.phase == "post_tp1" else "stop")
+            return
 
     # ── Posição fechou totalmente ────────────────────────────────────────
     if qty_now <= 0:
