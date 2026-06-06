@@ -5,7 +5,7 @@ import time
 import traceback
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
 logging.basicConfig(level=logging.INFO)
@@ -89,6 +89,7 @@ from models.trade_signal import TradeSignal
 _snapshot_task: Optional[asyncio.Task] = None
 _scan_task: Optional[asyncio.Task] = None
 _trade_manager_task: Optional[asyncio.Task] = None
+_recalibration_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
 SERVER_SCAN_TOP_N = 40            # quantos símbolos varrer (Vision spot — universo maior compensa filtros)
@@ -108,7 +109,17 @@ _METRICS: Dict[str, Any] = {
     "pushes_sent_total": 0,
     "pushes_sent_last_scan": 0,
     "last_snapshot_check_at": None,
+    "last_recalibration_at": None,
 }
+
+# ── Recalibração automática da autoaprendizagem ─────────────────────────────
+# A cada N dias o app reaprende com TODO o histórico (score→P(TP1) + buckets).
+# Robusto a restart: o "relógio" vem do timestamp persistido da última
+# recalibração no DB (não de um timer em memória).
+RECALIBRATION_INTERVAL_DAYS = int(os.getenv("RECALIBRATION_INTERVAL_DAYS", "10"))
+RECALIBRATION_CHECK_INTERVAL = int(os.getenv("RECALIBRATION_CHECK_INTERVAL_SEC", str(6 * 3600)))
+RECALIBRATION_INITIAL_DELAY = 120  # espera 2min após boot pra não competir com init
+RECALIBRATION_ENABLED = os.getenv("RECALIBRATION_AUTO_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 
 
 async def _snapshot_loop():
@@ -122,6 +133,58 @@ async def _snapshot_loop():
             break
         except Exception as e:
             logging.warning(f"snapshot_loop error: {e}")
+
+
+async def _recalibration_loop():
+    """
+    Recalibração automática a cada RECALIBRATION_INTERVAL_DAYS dias.
+
+    Checa periodicamente (a cada RECALIBRATION_CHECK_INTERVAL) quando foi a
+    última recalibração persistida no DB; se passou do intervalo, dispara
+    `recalibrate()` (reaprende com todo o histórico + versiona). Baseado em
+    timestamp do banco → sobrevive a restarts do Railway sem refazer cedo
+    demais nem ficar "preso" se o processo cair.
+    """
+    if not DB_ENABLED or not RECALIBRATION_ENABLED:
+        logging.info(
+            f"[recalibration] loop desativado (DB={DB_ENABLED} enabled={RECALIBRATION_ENABLED})"
+        )
+        return
+    await asyncio.sleep(RECALIBRATION_INITIAL_DELAY)
+    from services import calibration_versions_service as cvs
+    while True:
+        try:
+            last = await cvs.last_recalibration_at()
+            now = datetime.now(timezone.utc)
+            due = last is None or (now - last) >= timedelta(days=RECALIBRATION_INTERVAL_DAYS)
+            if due:
+                logging.info(
+                    f"[recalibration] disparando recalibração automática "
+                    f"(última: {last}, intervalo: {RECALIBRATION_INTERVAL_DAYS}d)"
+                )
+                result = await cvs.recalibrate(
+                    notes=f"auto-recalibração {RECALIBRATION_INTERVAL_DAYS}d"
+                )
+                if result.get("recalibrated"):
+                    _METRICS["last_recalibration_at"] = now.isoformat()
+                    ver = (result.get("version") or {}).get("version")
+                    logging.info(
+                        f"[recalibration] ✅ ok — n={result.get('total_resolved')} "
+                        f"p_global={result.get('p_global')} versão={ver}"
+                    )
+                else:
+                    logging.info(f"[recalibration] adiada: {result.get('reason')}")
+            else:
+                next_due = last + timedelta(days=RECALIBRATION_INTERVAL_DAYS)
+                logging.info(f"[recalibration] ainda no prazo — próxima ~{next_due.isoformat()}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.warning(f"[recalibration] erro: {e}", exc_info=True)
+        try:
+            await asyncio.sleep(RECALIBRATION_CHECK_INTERVAL)
+        except asyncio.CancelledError:
+            break
 
 
 async def _server_scan_loop():
@@ -249,7 +312,7 @@ async def _server_scan_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _scan_task, _trade_manager_task
+    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task
     if DB_ENABLED:
         try:
             await init_db()
@@ -257,6 +320,15 @@ async def lifespan(app: FastAPI):
             logging.info("Snapshot tracker iniciado (intervalo 5 min).")
         except Exception as e:
             logging.error(f"Falha ao inicializar DB: {e}")
+    # Recalibração automática da autoaprendizagem (a cada N dias)
+    try:
+        _recalibration_task = asyncio.create_task(_recalibration_loop())
+        logging.info(
+            f"Recalibração automática iniciada (a cada {RECALIBRATION_INTERVAL_DAYS}d, "
+            f"enabled={RECALIBRATION_ENABLED})."
+        )
+    except Exception as e:
+        logging.warning(f"Falha ao iniciar recalibração automática: {e}")
     # Varredura server-side (OKX) — alimenta push notifications
     try:
         _scan_task = asyncio.create_task(_server_scan_loop())
@@ -271,7 +343,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logging.warning(f"Falha ao iniciar trade_manager: {e}")
     yield
-    for t in (_snapshot_task, _scan_task, _trade_manager_task):
+    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task):
         if t:
             t.cancel()
             try:

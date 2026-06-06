@@ -222,6 +222,24 @@ def _to_dict(ver: CalibrationVersion | None) -> dict | None:
     }
 
 
+async def last_recalibration_at() -> Optional[datetime]:
+    """
+    Retorna o `computed_at` da recalibração mais recente (manual ou automática),
+    identificada pelo marcador "recalibra" nas notes. None se nunca houve uma.
+    Usado pelo loop automático pra decidir se já passou o intervalo.
+    """
+    if not DB_ENABLED:
+        return None
+    async with get_session() as session:
+        stmt = (
+            select(CalibrationVersion.computed_at)
+            .where(CalibrationVersion.notes.ilike("%recalibra%"))
+            .order_by(desc(CalibrationVersion.computed_at))
+            .limit(1)
+        )
+        return (await session.execute(stmt)).scalar_one_or_none()
+
+
 async def recalibrate(notes: Optional[str] = None, make_active: bool = True) -> dict:
     """
     Recalibração manual da autoaprendizagem (#10).
