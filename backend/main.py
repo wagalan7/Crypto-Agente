@@ -2662,6 +2662,17 @@ async def exchange_executions(symbol: str | None = None, limit: int = 50):
     return res
 
 
+@app.get("/api/exchange/open-algo-orders")
+async def exchange_open_algo_orders(symbol: str | None = None):
+    """Ordens condicionais (SL/TP) ABERTAS na corretora — pra verificar que a
+    proteção das posições está realmente viva (não só registrada no DB)."""
+    from services import exchange_service
+    res = await exchange_service.get_open_algo_orders(symbol=symbol)
+    if not res.get("ok"):
+        raise HTTPException(502, f"Exchange: {res.get('error') or res.get('msg')}")
+    return res
+
+
 # Aliases por corretora — força o cliente específico independente do EXCHANGE
 
 

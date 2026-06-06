@@ -58,6 +58,12 @@ TIME_STOP_SWING_MIN = int(os.getenv("TIME_STOP_SWING_MIN", "10080"))
 # A cada poll, em pre_tp1, verifica os IDs de proteção no DB e recria as pernas
 # ausentes. SL é a perna crítica (segurança); TPs evitam correr além do alvo.
 PROTECTION_AUTOHEAL_ENABLED = os.getenv("PROTECTION_AUTOHEAL_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Verificação ao vivo: além de ID None no DB, confirma na corretora que SL/TP2
+# estão REALMENTE vivos (GET /fapi/v1/openAlgoOrders). Pega a perna cujo ID
+# existe no DB mas sumiu da exchange (cancelada/expirada/disparada por fora sem
+# fechar a posição). Fail-safe: se a query falhar, NÃO recria por "sumiço"
+# (evita duplicar ordem com base em leitura incerta) — mantém a cura por ID-None.
+PROTECTION_VERIFY_LIVE = os.getenv("PROTECTION_VERIFY_LIVE", "true").strip().lower() in ("1", "true", "yes")
 # Fração da posição destinada ao TP1 parcial (espelha tp1_qty_pct=0.45 do open).
 _TP1_QTY_PCT = float(os.getenv("PROTECTION_TP1_QTY_PCT", "0.45"))
 # Poeira: residual cujo notional fica abaixo disto é tratado como "fechado".
@@ -456,6 +462,34 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
         and bool(trade.planned_tp1) and bool(trade.planned_tp2)
         and not trade.tp1_order_id and not trade.tp2_order_id
     )
+
+    # ── Verificação ao vivo na corretora (perna sumiu apesar de ID no DB) ──
+    # openAlgoOrders só devolve ordens ABERTAS → presença = viva. A posição
+    # ainda tem qty (qty_now > 0), então se um SL/TP2 com closePosition sumiu,
+    # ele NÃO disparou (senão a posição teria fechado) — sumiu de fato.
+    sl_vanished = tp2_vanished = False
+    if PROTECTION_VERIFY_LIVE and (trade.sl_order_id or trade.tp2_order_id):
+        try:
+            from services import exchange_service
+            res = await exchange_service.get_open_algo_orders(trade.symbol)
+            if res.get("ok"):
+                live_ids = {str(o.get("algo_id")) for o in (res.get("orders") or [])}
+                if trade.sl_order_id and str(trade.sl_order_id) not in live_ids and bool(sl_price):
+                    sl_vanished = True
+                if trade.tp2_order_id and str(trade.tp2_order_id) not in live_ids and bool(trade.planned_tp2):
+                    tp2_vanished = True
+            else:
+                # Leitura incerta → não age por sumiço (fail-safe).
+                log.info(
+                    f"[autoheal] {trade.symbol} #{trade.id} verify-live indisponível "
+                    f"({res.get('msg') or res.get('error')}) — só cura por ID-None"
+                )
+        except Exception as e:
+            log.warning(f"[autoheal] {trade.symbol} #{trade.id} verify-live erro: {e}")
+
+    sl_missing = sl_missing or sl_vanished
+    tp2_missing = tp2_missing or tp2_vanished
+
     if not (sl_missing or tp1_missing or tp2_missing):
         return False
 
@@ -466,6 +500,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     log.warning(
         f"[autoheal] {sym} #{trade.id} proteção incompleta — "
         f"sl_missing={sl_missing} tp1_missing={tp1_missing} tp2_missing={tp2_missing} "
+        f"(vanished: sl={sl_vanished} tp2={tp2_vanished}) "
         f"(sl_id={trade.sl_order_id} tp1_id={trade.tp1_order_id} tp2_id={trade.tp2_order_id})"
     )
 

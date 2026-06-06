@@ -600,6 +600,48 @@ async def cancel_algo_order(algo_id: str) -> dict:
     return await _signed_request("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id})
 
 
+async def get_open_algo_orders(symbol: Optional[str] = None) -> dict:
+    """
+    Lista as ordens CONDITIONAL (SL/TP) ABERTAS na corretora via
+    GET /fapi/v1/openAlgoOrders. `symbol` opcional (omitido = todos).
+
+    Usado pelo trade_manager pra VERIFICAR que SL/TP2 estão realmente vivos
+    na Binance — não só não-nulos no DB. Pega ordens que foram criadas e
+    depois sumiram (canceladas/expiradas/disparadas externamente).
+
+    Retorno:
+      {"ok": True, "orders": [{algo_id, client_algo_id, symbol, side, type,
+       trigger_price, quantity, close_position, reduce_only, status,
+       working_type}], "count": int}
+    Em falha: {"ok": False, ...} — o caller DEVE tratar como "incerto" e
+    NÃO recriar ordens (fail-safe contra duplicação).
+    """
+    params = {}
+    if symbol:
+        params["symbol"] = to_binance(symbol) if "/" in symbol else symbol
+    res = await _signed_request("GET", "/fapi/v1/openAlgoOrders", params or None)
+    if not res.get("ok"):
+        return res
+    rows = res["result"] or []
+    orders = [
+        {
+            "algo_id": str(o.get("algoId")),
+            "client_algo_id": o.get("clientAlgoId"),
+            "symbol": o.get("symbol"),
+            "side": o.get("side"),
+            "type": o.get("orderType") or o.get("algoType"),
+            "trigger_price": float(o.get("triggerPrice") or 0),
+            "quantity": float(o.get("quantity") or 0),
+            "close_position": bool(o.get("closePosition")),
+            "reduce_only": bool(o.get("reduceOnly")),
+            "status": o.get("algoStatus"),
+            "working_type": o.get("workingType"),
+        }
+        for o in rows
+    ]
+    return {"ok": True, "orders": orders, "count": len(orders)}
+
+
 async def set_leverage(symbol: str, leverage: int) -> dict:
     res = await _signed_request("POST", "/fapi/v1/leverage", {
         "symbol": symbol, "leverage": leverage,

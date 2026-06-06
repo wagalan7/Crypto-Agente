@@ -50,6 +50,13 @@ if hasattr(_client, "cancel_algo_order"):
 else:
     async def cancel_algo_order(algo_id: str) -> dict:  # type: ignore
         return {"ok": False, "error": f"cancel_algo_order não suportado em {ACTIVE_EXCHANGE}"}
+# get_open_algo_orders idem — só Binance. Stub retorna ok=False (caller trata
+# como "incerto" e NÃO recria ordens, evitando duplicação).
+if hasattr(_client, "get_open_algo_orders"):
+    get_open_algo_orders = _client.get_open_algo_orders
+else:
+    async def get_open_algo_orders(symbol=None) -> dict:  # type: ignore
+        return {"ok": False, "error": f"get_open_algo_orders não suportado em {ACTIVE_EXCHANGE}"}
 set_leverage = _client.set_leverage
 get_order_history = _client.get_order_history
 get_executions = _client.get_executions
