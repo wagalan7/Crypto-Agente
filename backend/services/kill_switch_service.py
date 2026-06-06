@@ -7,7 +7,9 @@ Se algum limite estourar, bloqueia + grava motivo + retorna {allowed: False}.
 Checks (todos com env var override):
   KILL_SWITCH=true                  → bloqueio manual global (default false)
   KILL_MAX_OPEN_POSITIONS=5         → bloqueia se já há N posições abertas
-  KILL_MAX_DAILY_LOSS_USD=200       → bloqueia se P&L do dia <= -X USD
+  KILL_MAX_DAILY_LOSS_USD=200       → bloqueia se P&L do dia <= -X USD (piso/fallback)
+  KILL_MAX_DAILY_LOSS_PCT=0         → se >0, limite = pct × equity real (escala c/ banca;
+                                      cai pro _USD se equity indisponível)
   KILL_MAX_CONSEC_LOSSES=3          → bloqueia após N losses seguidos
   KILL_COOLDOWN_HOURS=12            → janela em que o bloqueio por consec_losses fica ativo
   KILL_MAX_DAILY_TRADES=20          → bloqueia após N trades abertos hoje
@@ -62,6 +64,7 @@ def thresholds() -> dict:
         "kill_switch": _env_bool("KILL_SWITCH", False),
         "max_open_positions": _env_int("KILL_MAX_OPEN_POSITIONS", 5),
         "max_daily_loss_usd": _env_float("KILL_MAX_DAILY_LOSS_USD", 200.0),
+        "max_daily_loss_pct": _env_float("KILL_MAX_DAILY_LOSS_PCT", 0.0),
         "max_consec_losses": _env_int("KILL_MAX_CONSEC_LOSSES", 3),
         "cooldown_hours": _env_int("KILL_COOLDOWN_HOURS", 12),
         "max_daily_trades": _env_int("KILL_MAX_DAILY_TRADES", 20),
@@ -132,6 +135,28 @@ async def _recent_losses_streak(hours: int) -> tuple[int, Optional[datetime]]:
     return (streak, last_close)
 
 
+async def _resolve_daily_loss_limit_usd(th: dict) -> tuple[float, str]:
+    """
+    Resolve o limite de perda diária em USD (go-live #3). Se KILL_MAX_DAILY_LOSS_PCT
+    > 0, escala com o equity real da exchange; senão (ou se equity indisponível),
+    usa o piso absoluto KILL_MAX_DAILY_LOSS_USD.
+    Retorna (limite_usd, descrição_origem).
+    """
+    pct = th.get("max_daily_loss_pct") or 0.0
+    floor = float(th["max_daily_loss_usd"])
+    if pct > 0:
+        try:
+            from services import exchange_service
+            eq = await exchange_service.get_equity()
+            if eq.get("ok") and float(eq.get("total_usd") or 0) > 0:
+                equity = float(eq["total_usd"])
+                return equity * (pct / 100.0), f"{pct:.1f}% × equity ${equity:.0f}"
+        except Exception as e:
+            log.warning(f"[kill] equity p/ daily-loss-pct falhou: {e}")
+        return floor, f"piso USD (equity indisponível; pct {pct:.1f}% ignorado)"
+    return floor, "USD absoluto"
+
+
 async def check_can_trade() -> dict:
     """
     Chamado ANTES de cada ordem real. Retorna:
@@ -154,12 +179,15 @@ async def check_can_trade() -> dict:
             f"max_open_positions: {open_count}/{th['max_open_positions']}"
         )
 
-    # 3. P&L diário
+    # 3. P&L diário (limite escala com equity se KILL_MAX_DAILY_LOSS_PCT > 0)
     pnl_today = await _daily_pnl_usd()
+    daily_loss_limit, limit_src = await _resolve_daily_loss_limit_usd(th)
     checks["daily_pnl_usd"] = round(pnl_today, 2)
-    if pnl_today <= -th["max_daily_loss_usd"]:
+    checks["daily_loss_limit_usd"] = round(daily_loss_limit, 2)
+    checks["daily_loss_limit_src"] = limit_src
+    if pnl_today <= -daily_loss_limit:
         blocked_reasons.append(
-            f"daily_loss: ${pnl_today:.2f} <= -${th['max_daily_loss_usd']:.2f}"
+            f"daily_loss: ${pnl_today:.2f} <= -${daily_loss_limit:.2f} ({limit_src})"
         )
 
     # 4. Losses consecutivos (cooldown)
@@ -184,7 +212,7 @@ async def check_can_trade() -> dict:
     reason = " | ".join(blocked_reasons) if blocked_reasons else None
 
     # Notifica Telegram quando o kill-switch (por daily_loss) ativa, uma vez por dia.
-    if not allowed and pnl_today <= -th["max_daily_loss_usd"]:
+    if not allowed and pnl_today <= -daily_loss_limit:
         global _KILL_NOTIFIED_DAY
         today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if _KILL_NOTIFIED_DAY != today_key:
@@ -192,7 +220,7 @@ async def check_can_trade() -> dict:
             try:
                 from services.notification_service import send_telegram, fmt_kill_switch
                 await send_telegram(
-                    fmt_kill_switch(pnl_today, th["max_daily_loss_usd"]),
+                    fmt_kill_switch(pnl_today, daily_loss_limit),
                     event_type="kill",
                 )
             except Exception as e:

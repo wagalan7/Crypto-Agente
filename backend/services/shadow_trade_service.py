@@ -818,6 +818,103 @@ async def _open_notional_usd() -> float:
         return 0.0
 
 
+def _norm_sym(s: str) -> str:
+    """'BTC/USDT:USDT' ou 'BTCUSDT' → 'BTCUSDT' (pra casar DB × exchange)."""
+    if not s:
+        return ""
+    return s.split(":")[0].replace("/", "").upper()
+
+
+async def reconcile_open_positions() -> dict:
+    """
+    go-live #4 — Reconcilia posições reais na exchange × trades OPEN no DB.
+
+    Roda no boot (e exposto via endpoint). NÃO muta nada — só detecta e loga
+    drift, porque fechar/abrir automaticamente no startup é arriscado. Surfa:
+      - db_orphans:  trade OPEN no DB sem posição viva na exchange (fechou por
+                     fora / nunca abriu) → o trade manager seguiria gerenciando
+                     algo que não existe.
+      - untracked:   posição viva na exchange sem trade OPEN no DB → o bot NÃO
+                     está gerenciando (sem SL/TP automático da nossa parte).
+
+    Retorna {"ok", "shadow", "db_open", "exchange_open", "db_orphans",
+             "untracked", "matched"}.
+    """
+    report = {
+        "ok": True, "shadow": SHADOW_ENABLED,
+        "db_open": 0, "exchange_open": 0,
+        "matched": [], "db_orphans": [], "untracked": [],
+    }
+    if not DB_ENABLED:
+        report["ok"] = False
+        report["error"] = "DB desabilitado"
+        return report
+    if SHADOW_ENABLED:
+        # Em shadow não há posição real na exchange pra reconciliar.
+        log.info("[reconcile] shadow ON — sem posições reais pra reconciliar")
+        return report
+    try:
+        from services import exchange_service
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+
+        # DB: trades reais auto OPEN
+        async with get_session() as session:
+            stmt = select(RealTrade).where(
+                RealTrade.status == "open",
+                RealTrade.source == "auto",
+            )
+            db_rows = (await session.execute(stmt)).scalars().all()
+        db_by_sym = {_norm_sym(t.symbol): t for t in db_rows}
+        report["db_open"] = len(db_rows)
+
+        # Exchange: posições vivas
+        pos_res = await exchange_service.get_positions()
+        if not pos_res.get("ok"):
+            report["ok"] = False
+            report["error"] = f"get_positions falhou: {pos_res.get('error') or pos_res.get('msg')}"
+            log.warning(f"[reconcile] {report['error']}")
+            return report
+        positions = pos_res.get("positions") or []
+        pos_by_sym = {_norm_sym(p.get("symbol")): p for p in positions}
+        report["exchange_open"] = len(positions)
+
+        db_syms = set(db_by_sym)
+        ex_syms = set(pos_by_sym)
+
+        for s in sorted(db_syms & ex_syms):
+            report["matched"].append(s)
+        for s in sorted(db_syms - ex_syms):
+            t = db_by_sym[s]
+            report["db_orphans"].append({"symbol": s, "trade_id": t.id, "side": t.side})
+        for s in sorted(ex_syms - db_syms):
+            p = pos_by_sym[s]
+            report["untracked"].append({
+                "symbol": s, "side": p.get("side"), "size": p.get("size"),
+                "entry_price": p.get("entry_price"),
+            })
+
+        # Log resumido — alto e claro quando há drift.
+        if report["db_orphans"] or report["untracked"]:
+            log.warning(
+                f"[reconcile] ⚠ DRIFT exchange↔DB: "
+                f"{len(report['db_orphans'])} órfão(s) no DB, "
+                f"{len(report['untracked'])} posição(ões) não-gerenciada(s). "
+                f"db_orphans={report['db_orphans']} untracked={report['untracked']}"
+            )
+        else:
+            log.info(
+                f"[reconcile] ✓ sincronizado: {len(report['matched'])} posição(ões) "
+                f"casada(s), sem drift"
+            )
+    except Exception as e:
+        report["ok"] = False
+        report["error"] = str(e)
+        log.warning(f"[reconcile] falhou: {e}")
+    return report
+
+
 # ── Direction flip helpers ──────────────────────────────────────────────────
 
 

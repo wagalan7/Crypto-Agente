@@ -324,6 +324,14 @@ async def lifespan(app: FastAPI):
             await init_db()
             _snapshot_task = asyncio.create_task(_snapshot_loop())
             logging.info("Snapshot tracker iniciado (intervalo 5 min).")
+            # go-live #4 — reconciliação posições exchange↔DB no boot (só loga drift)
+            async def _reconcile_once():
+                try:
+                    from services import shadow_trade_service
+                    await shadow_trade_service.reconcile_open_positions()
+                except Exception as e:
+                    logging.warning(f"Reconciliação de boot falhou: {e}")
+            asyncio.create_task(_reconcile_once())
         except Exception as e:
             logging.error(f"Falha ao inicializar DB: {e}")
     # Recalibração automática da autoaprendizagem (a cada N dias)
@@ -1754,6 +1762,17 @@ async def shadow_env():
     """Status do shadow trade (#11.3) — se ativo, abre RealTrades sem exchange."""
     from services import shadow_trade_service
     return shadow_trade_service.env_info()
+
+
+@app.get("/api/exchange/reconcile")
+async def exchange_reconcile():
+    """
+    Reconcilia posições reais na exchange × trades OPEN no DB (go-live #4).
+    Não muta nada — só reporta drift: órfãos no DB (trade aberto sem posição
+    viva) e posições não-gerenciadas (posição viva sem trade no DB).
+    """
+    from services import shadow_trade_service
+    return await shadow_trade_service.reconcile_open_positions()
 
 
 @app.get("/api/shadow/skip-reasons")
