@@ -37,7 +37,7 @@ else:
     logging.info("[sentry] desabilitado (SENTRY_DSN não setado)")
 
 import pandas as pd
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -1787,6 +1787,36 @@ async def shadow_skip_reasons():
     return {"ok": True, "count": len(reasons), "items": reasons}
 
 
+def _check_admin_token(token: Optional[str]) -> Optional[dict]:
+    """
+    Auth de endpoints admin que emitem ordem real. Retorna None se liberado, ou
+    um dict de erro se bloqueado.
+
+    Regra:
+      - ADMIN_API_TOKEN setado → exige header X-Admin-Token igual (sempre).
+      - ADMIN_API_TOKEN vazio:
+          · produção (mainnet) → BLOQUEIA (não deixa endpoint perigoso aberto).
+          · demo/testnet       → libera (conveniência, dinheiro fake).
+    """
+    expected = os.getenv("ADMIN_API_TOKEN", "").strip()
+    if expected:
+        if (token or "").strip() != expected:
+            return {"ok": False, "error": "token inválido ou ausente (header X-Admin-Token)"}
+        return None
+    # Sem token configurado — só libera fora de produção
+    try:
+        from services import shadow_trade_service
+        prod = shadow_trade_service._exchange_is_production()
+    except Exception:
+        prod = True  # fail-safe
+    if prod:
+        return {
+            "ok": False,
+            "error": "ADMIN_API_TOKEN não configurado — endpoint admin bloqueado em produção (mainnet)",
+        }
+    return None
+
+
 @app.post("/api/admin/force-test-trade")
 async def admin_force_test_trade(
     symbol: str = "BTCUSDT",
@@ -1794,15 +1824,19 @@ async def admin_force_test_trade(
     notional_usd: float = 50.0,
     leverage: int = 5,
     close_after: bool = True,     # se True, emite ordem oposta reduceOnly logo após
+    x_admin_token: Optional[str] = Header(None),
 ):
     """
     Ordem REAL de teste na exchange ativa — valida que auth, perms e place_order
     funcionam end-to-end. Default: BTC Buy $50 notional 5x, fecha logo após.
 
-    Use no Binance Demo pra confirmar que o bot está conectado. Em produção,
-    REMOVA esse endpoint (ou proteja com token) — qualquer um que acertar a URL
-    abre ordem real.
+    Protegido: em mainnet exige header X-Admin-Token == ADMIN_API_TOKEN. Em
+    demo/testnet libera sem token (dinheiro fake). Veja _check_admin_token.
     """
+    gate = _check_admin_token(x_admin_token)
+    if gate is not None:
+        raise HTTPException(status_code=403, detail=gate["error"])
+
     import httpx
     from services import exchange_service, binance_signed_service
 
