@@ -154,6 +154,12 @@ MAX_MARGIN_PCT_PER_TRADE = float(os.getenv("EXCHANGE_MAX_MARGIN_PCT", "15"))
 # banca em exposição total (com 10x lev = 15% margem agregada).
 MAX_TOTAL_NOTIONAL_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_NOTIONAL_PCT", "150"))
 
+# Cap de MARGEM agregada (capital comprometido = Σ notional/leverage, em % da
+# banca). É o "manter só X% da banca aberta no máximo" — diferente do notional,
+# conta o que sai de garantia, não o tamanho alavancado. Quando uma posição
+# fecha, libera espaço pra novas (orçamento rotativo). 0 = desligado.
+MAX_TOTAL_MARGIN_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_MARGIN_PCT", "0"))
+
 # ── Direction flip (Fase 2) ────────────────────────────────────────────────
 # Quando aparece rec na direção OPOSTA a um trade aberto, avalia se a reversão
 # é forte o bastante pra justificar fechar a atual e abrir contra. Por padrão
@@ -782,6 +788,7 @@ def env_info() -> dict:
         "max_risk_pct_hard": MAX_RISK_PCT_HARD,
         "max_margin_pct_per_trade": MAX_MARGIN_PCT_PER_TRADE,
         "max_total_notional_pct": MAX_TOTAL_NOTIONAL_PCT,
+        "max_total_margin_pct": MAX_TOTAL_MARGIN_PCT,
         "exchange_active": os.getenv("EXCHANGE", "binance"),
         # go-live safety rails
         "is_production": prod,
@@ -815,6 +822,33 @@ async def _open_notional_usd() -> float:
             return total
     except Exception as e:
         log.warning(f"[shadow] _open_notional_usd falhou: {e}")
+        return 0.0
+
+
+async def _open_margin_usd() -> float:
+    """Soma a MARGEM (notional/leverage) dos trades reais auto abertos. Pra cap
+    de capital comprometido — 'X% da banca aberta no máx'."""
+    if not DB_ENABLED:
+        return 0.0
+    try:
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            stmt = select(RealTrade).where(
+                RealTrade.status == "open",
+                RealTrade.source == "auto",
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            total = 0.0
+            for t in rows:
+                ep = float(t.entry_price or 0)
+                q = float(t.qty or 0)
+                lev = max(int(t.leverage or 1), 1)
+                total += (ep * q) / lev
+            return total
+    except Exception as e:
+        log.warning(f"[shadow] _open_margin_usd falhou: {e}")
         return 0.0
 
 
@@ -1850,6 +1884,26 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     continue
             except Exception as e:
                 log.warning(f"[shadow] total-notional check falhou: {e}")
+
+            # Cap de MARGEM agregada — "manter só X% da banca aberta no máx".
+            # Conta capital comprometido (notional/lev), não o notional cheio.
+            # Posições fechadas liberam orçamento pra novas. 0 = desligado.
+            if MAX_TOTAL_MARGIN_PCT > 0:
+                try:
+                    open_margin = await _open_margin_usd()
+                    new_margin = notional_effective / max(int(lev or 1), 1)
+                    margin_after = open_margin + new_margin
+                    margin_cap = equity_usd * (MAX_TOTAL_MARGIN_PCT / 100.0)
+                    if margin_after > margin_cap:
+                        log.warning(
+                            f"[shadow] {rec.get('symbol')} BLOCKED total-margin cap: "
+                            f"open=${open_margin:.0f} + new=${new_margin:.0f} = "
+                            f"${margin_after:.0f} > cap ${margin_cap:.0f} "
+                            f"({MAX_TOTAL_MARGIN_PCT}% × equity ${equity_usd:.0f})"
+                        )
+                        continue
+                except Exception as e:
+                    log.warning(f"[shadow] total-margin check falhou: {e}")
 
             # Snapshot_id é setado em save_recommendations? Não — o `_just_saved`
             # flag é booleano. Precisamos do id do snapshot recém-criado pra
