@@ -115,6 +115,10 @@ async def init_db():
         await conn.execute(text(
             "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS sl_current_price DOUBLE PRECISION"
         ))
+        # Go-live Opção B — P&L parcial real embolsada no TP1 (somada no close)
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS tp1_realized_usd DOUBLE PRECISION"
+        ))
         # Se a coluna antiga existir (deploy anterior), copia o valor pro novo nome.
         # Em Postgres o IF EXISTS no information_schema é mais seguro:
         await conn.execute(text("""

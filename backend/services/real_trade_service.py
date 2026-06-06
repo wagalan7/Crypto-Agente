@@ -182,18 +182,34 @@ async def close_trade(
             log.info(f"[real-trade] entry_price recuperado #{trade.id}: 0 → {recovered}")
             trade.entry_price = recovered
 
-        # Calcula P&L
+        # Calcula P&L. `trade.qty` aqui é o RESTANTE (após o TP1 parcial, que
+        # reduziu qty no DB). A perna do TP1 já foi embolsada e está persistida
+        # em tp1_realized_usd (go-live Opção B) — somamos pra não subcontar.
         sign = 1 if trade.side == "long" else -1
         price_diff = (exit_price - trade.entry_price) * sign
-        pnl_usd = price_diff * trade.qty - (trade.entry_fee or 0) - (exit_fee or 0)
-        pnl_pct = (price_diff / trade.entry_price) * 100 if trade.entry_price else 0
+        # entry_fee é da posição CHEIA (evento único na abertura); a fee de saída
+        # do TP1 já está descontada dentro de tp1_realized_usd.
+        remainder_pnl = price_diff * trade.qty - (trade.entry_fee or 0) - (exit_fee or 0)
+        tp1_partial = float(trade.tp1_realized_usd or 0.0)
+        pnl_usd = remainder_pnl + tp1_partial
 
-        # realized_r = pnl em múltiplos do risco original (entry → stop)
+        # Base de risco/notional usa o tamanho ORIGINAL (qty_initial), senão o R
+        # ficaria distorcido após a parcial ter reduzido qty.
+        qty_initial = trade.qty_initial or trade.qty
+        pnl_pct = (
+            (pnl_usd / (trade.entry_price * qty_initial)) * 100
+            if (trade.entry_price and qty_initial) else 0
+        )
+
+        # realized_r = P&L total (parcial + restante) em múltiplos do risco em $
+        # da posição cheia (risco unitário × qty_initial). Trade que bate TP1 e
+        # fecha em breakeven agora marca R positivo, não mais 0.
         realized_r = None
-        if trade.planned_stop and trade.entry_price:
+        if trade.planned_stop and trade.entry_price and qty_initial:
             risk_dist = abs(trade.entry_price - trade.planned_stop)
-            if risk_dist > 0:
-                realized_r = round((price_diff) / risk_dist, 3)
+            risk_dollar = risk_dist * qty_initial
+            if risk_dollar > 0:
+                realized_r = round(pnl_usd / risk_dollar, 3)
 
         trade.pnl_usd = round(pnl_usd, 4)
         trade.pnl_pct = round(pnl_pct, 4)
@@ -422,6 +438,7 @@ def _to_dict(t: RealTrade | None) -> dict | None:
         "realized_r": t.realized_r,
         "pnl_usd": t.pnl_usd,
         "pnl_pct": t.pnl_pct,
+        "tp1_realized_usd": t.tp1_realized_usd,
         "entry_slippage_pct": t.entry_slippage_pct,
         # ── Bracket / proteção (diagnóstico: ver se SL/TP foram criados) ──
         "phase": t.phase,

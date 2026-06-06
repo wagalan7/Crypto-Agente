@@ -190,6 +190,55 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
         except Exception as e:
             log.warning(f"[trade-manager] cancel SL {sym} erro: {e}")
 
+    # 2b. Captura P&L parcial REAL embolsada no TP1 (go-live Opção B). A perna
+    #     parcial já saiu na corretora; sem persistir isso, o close_trade só
+    #     contaria o restante e subcontaria o ganho (ex: trade que vira breakeven
+    #     marcava R=0 apesar de ter embolsado o TP1). Usa o fill real; cai pro
+    #     planned_tp1 se a corretora não devolver execuções.
+    tp1_partial_usd = None
+    try:
+        qty_init = trade.qty_initial
+        if not qty_init or qty_init <= 0:
+            qty_init = (qty_rem / (1.0 - _TP1_QTY_PCT)) if qty_rem else 0.0
+        filled_tp1 = max(0.0, float(qty_init) - float(qty_rem))
+        if filled_tp1 > 0 and entry > 0:
+            sign = 1 if trade.side == "long" else -1
+            close_side = "SELL" if trade.side == "long" else "BUY"
+            fill_price = float(trade.planned_tp1 or 0.0)
+            fill_fee = 0.0
+            ex = await exchange_service.get_executions(sym, limit=20)
+            if ex.get("ok"):
+                cfills = sorted(
+                    [f for f in (ex.get("fills") or [])
+                     if str(f.get("side", "")).upper() == close_side
+                     and float(f.get("price") or 0) > 0],
+                    key=lambda f: int(f.get("time") or 0), reverse=True,
+                )
+                acc_q = acc_val = acc_fee = 0.0
+                for f in cfills:
+                    q = float(f.get("qty") or 0)
+                    if q <= 0:
+                        continue
+                    take = min(q, filled_tp1 - acc_q)
+                    acc_q += take
+                    acc_val += take * float(f["price"])
+                    acc_fee += float(f.get("fee") or 0) * (take / q)
+                    if acc_q >= filled_tp1 * 0.999:
+                        break
+                if acc_q > 0:
+                    fill_price = acc_val / acc_q
+                    fill_fee = acc_fee
+            if fill_price > 0:
+                tp1_partial_usd = round(
+                    (fill_price - entry) * sign * filled_tp1 - fill_fee, 4
+                )
+                log.info(
+                    f"[trade-manager] {sym} #{trade.id} TP1 parcial embolsada: "
+                    f"qty={filled_tp1} @ {fill_price} → ${tp1_partial_usd:+.4f}"
+                )
+    except Exception as e:
+        log.warning(f"[trade-manager] captura TP1 parcial #{trade.id} falhou: {e}")
+
     # 3. Atualiza DB
     async with get_session() as session:
         fresh = (await session.execute(
@@ -200,6 +249,8 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
         fresh.phase = "post_tp1"
         fresh.sl_order_id = new_sl_id
         fresh.sl_current_price = entry
+        if tp1_partial_usd is not None:
+            fresh.tp1_realized_usd = tp1_partial_usd
         # Se entry no DB estava errado, atualiza
         if (not fresh.entry_price or fresh.entry_price <= 0) and entry_real:
             fresh.entry_price = entry_real

@@ -70,6 +70,11 @@ class RealTrade(Base):
     realized_r: Mapped[float | None] = mapped_column(Float, nullable=True)
     pnl_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     pnl_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # P&L REAL embolsada na perna parcial do TP1 (líquido da fee de saída do TP1,
+    # sem a entry_fee — essa é contada uma vez no restante). Gravada em
+    # _transition_to_post_tp1 com o fill real da corretora; somada no close_trade
+    # pra não subcontar trades que batem TP1 e depois fecham em breakeven/stop.
+    tp1_realized_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Slippage vs rec (em pips/%, pode ser negativo se a favor)
     entry_slippage_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
