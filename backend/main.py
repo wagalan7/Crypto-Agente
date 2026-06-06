@@ -796,23 +796,26 @@ async def regime_status():
 
 
 @app.get("/api/learning-insights")
-async def learning_insights(days: int = 60):
+async def learning_insights(days: int = 0):
     """Estatísticas agregadas por bucket (tier/TF/sessão/padrão/funding/etc.)
-    + combos vencedores e perdedores."""
+    + combos vencedores e perdedores. days=0 (default) = todo o histórico."""
     try:
-        return await compute_stats_by_bucket(days=max(7, min(days, 365)))
+        d = 0 if days <= 0 else max(7, min(days, 365))
+        return await compute_stats_by_bucket(days=d)
     except Exception as e:
         logging.error(f"learning-insights error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao obter insights: {e}")
 
 
 @app.get("/api/learning-auto-adjust")
-async def learning_auto_adjust(days: int = 90):
+async def learning_auto_adjust(days: int = 0):
     """Estado do auto-learning nível 2 — multiplicadores e blocks ativos por
-    bucket. Dormente por bucket até atingir LEARNING_MIN_SAMPLE_ADJUST."""
+    bucket. Dormente por bucket até atingir LEARNING_MIN_SAMPLE_ADJUST.
+    days=0 (default) = todo o histórico."""
     try:
         from services.learning_service import compute_auto_adjustments
-        return await compute_auto_adjustments(days=max(30, min(days, 365)))
+        d = 0 if days <= 0 else max(30, min(days, 365))
+        return await compute_auto_adjustments(days=d)
     except Exception as e:
         logging.error(f"learning-auto-adjust error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao obter auto-adjust: {e}")
@@ -829,7 +832,7 @@ async def calibration():
         if data is None:
             return {
                 "enabled": False,
-                "message": "Calibração ainda não disponível — precisa de pelo menos 30 trades resolvidos nos últimos 90 dias.",
+                "message": "Calibração ainda não disponível — precisa de pelo menos 30 trades resolvidos no histórico.",
             }
         return data
     except Exception as e:
@@ -845,7 +848,7 @@ class HistoricalLookupItem(BaseModel):
 
 class HistoricalLookupRequest(BaseModel):
     items: List[HistoricalLookupItem]
-    days: int = 60
+    days: int = 0  # 0 = todo o histórico
 
 
 @app.post("/api/historical-lookup")
@@ -854,7 +857,8 @@ async def historical_lookup(body: HistoricalLookupRequest):
     Usado pelo painel de recomendações pra exibir badge "histórico" no card."""
     try:
         keys = [{"tier": it.tier, "timeframe": it.timeframe, "direction": it.direction} for it in body.items]
-        return await lookup_historical_batch(keys, days=max(7, min(body.days, 365)))
+        d = 0 if body.days <= 0 else max(7, min(body.days, 365))
+        return await lookup_historical_batch(keys, days=d)
     except Exception as e:
         logging.error(f"historical-lookup error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao buscar histórico: {e}")
@@ -1478,6 +1482,20 @@ async def calibration_monthly_snapshot():
     if result is None:
         raise HTTPException(409, "Snapshot não pôde ser criado (calibração não pronta).")
     return result
+
+
+@app.post("/api/calibration/recalibrate")
+async def calibration_recalibrate(notes: str | None = None, make_active: bool = True):
+    """
+    Recalibração manual da autoaprendizagem (#10): reaprende com TODO o
+    histórico de trades resolvidos (wins totais, win com 1 TP, e losses),
+    recomputa score→P(TP1) + multiplicadores/blocks de bucket, e versiona
+    como nova calibração ativa. Seguro pra rodar a qualquer momento.
+    """
+    from services import calibration_versions_service
+    return await calibration_versions_service.recalibrate(
+        notes=notes, make_active=make_active,
+    )
 
 
 @app.get("/api/paper/equity-curve")

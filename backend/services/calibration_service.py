@@ -40,7 +40,10 @@ from models.recommendation_snapshot import RecommendationSnapshot
 log = logging.getLogger(__name__)
 
 CACHE_TTL = 600                  # 10 min
-LOOKBACK_DAYS = 90               # janela de aprendizado
+# Janela de aprendizado em dias. 0 (default) = TODO o histórico, sem corte
+# temporal — a calibração aprende com cada trade resolvido que existe.
+# Defina CALIBRATION_LOOKBACK_DAYS > 0 pra voltar a uma janela móvel.
+LOOKBACK_DAYS = int(os.getenv("CALIBRATION_LOOKBACK_DAYS", "0"))
 MIN_SAMPLE_TOTAL = 30            # mínimo de trades resolvidos pra ativar calib
 SHRINKAGE_K = 10                 # peso do P_global quando bin é pequeno
 SCORE_BINS = [(55, 60), (60, 65), (65, 70), (70, 75),
@@ -205,16 +208,17 @@ async def _compute_calibration() -> Optional[Dict[str, Any]]:
     pairs: List[Tuple[float, str]] = []
     real_count = 0
     if DB_ENABLED:
-        since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
         try:
             async with get_session() as session:
+                conds = [RecommendationSnapshot.status.in_(RESOLVED_STATUSES)]
+                # LOOKBACK_DAYS <= 0 ⇒ TODO o histórico (sem corte temporal)
+                if LOOKBACK_DAYS > 0:
+                    since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+                    conds.append(RecommendationSnapshot.outcome_at >= since)
                 stmt = select(
                     RecommendationSnapshot.score,
                     RecommendationSnapshot.status,
-                ).where(and_(
-                    RecommendationSnapshot.outcome_at >= since,
-                    RecommendationSnapshot.status.in_(RESOLVED_STATUSES),
-                ))
+                ).where(and_(*conds))
                 rows = (await session.execute(stmt)).all()
                 for sc, st in rows:
                     pairs.append((float(sc), st))

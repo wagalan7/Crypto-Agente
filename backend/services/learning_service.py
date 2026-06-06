@@ -14,6 +14,7 @@ Ativar quando houver >= 50 trades por bucket.
 """
 from __future__ import annotations
 import logging
+import os
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -33,8 +34,38 @@ WINNING_THRESHOLD = 0.60         # win_rate >= 60% → "winning combo"
 LOSING_THRESHOLD = 0.40          # win_rate <= 40% → "losing combo"
 BASELINE_WIN_RATE = 0.50         # baseline pra comparar
 
+# Janela padrão de aprendizado em dias. 0 = TODO o histórico (sem corte
+# temporal) — o agente aprende com cada trade resolvido que já existiu.
+# Defina LEARNING_LOOKBACK_DAYS > 0 pra voltar a uma janela móvel.
+LEARNING_LOOKBACK_DAYS = int(os.getenv("LEARNING_LOOKBACK_DAYS", "0"))
+
+# Status considerados "resolvidos" pra estatística de bucket.
+_RESOLVED_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2", "lost")
+
+
+def _resolved_conditions(days: int):
+    """
+    Monta as condições WHERE pra snapshots resolvidos. Se days <= 0,
+    NÃO aplica corte temporal — usa todo o histórico disponível.
+    """
+    conds = [RecommendationSnapshot.status.in_(_RESOLVED_STATUSES)]
+    if days and days > 0:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        conds.append(RecommendationSnapshot.outcome_at >= since)
+    return conds
+
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
+
+
+def invalidate_cache() -> None:
+    """Limpa o cache de buckets — força recomputo na próxima chamada.
+    Usado pela recalibração manual e por testes."""
+    keys = [k for k in _cache.keys() if k.startswith("stats_")]
+    for k in keys:
+        _cache.pop(k, None)
+    _cache["ts"] = 0
+    _cache["data"] = None
 
 
 def _empty_stat() -> Dict[str, Any]:
@@ -75,10 +106,10 @@ def _dow_name(dow: int) -> str:
     return ["Seg", "Ter", "Qua", "Qui", "Sex", "Sab", "Dom"][dow] if 0 <= dow <= 6 else "?"
 
 
-async def compute_stats_by_bucket(days: int = 60) -> Dict[str, Any]:
+async def compute_stats_by_bucket(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[str, Any]:
     """
-    Agrupa trades resolvidos dos últimos N dias em vários buckets.
-    Cacheia por CACHE_TTL.
+    Agrupa trades resolvidos em vários buckets. Se days <= 0 usa TODO o
+    histórico (sem corte temporal). Cacheia por CACHE_TTL.
     """
     if not DB_ENABLED:
         return {"enabled": False, "message": "Banco de dados não configurado."}
@@ -89,15 +120,8 @@ async def compute_stats_by_bucket(days: int = 60) -> Dict[str, Any]:
     if cached and (now - cached["ts"]) < CACHE_TTL:
         return cached["data"]
 
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-
     async with get_session() as session:
-        stmt = select(RecommendationSnapshot).where(
-            and_(
-                RecommendationSnapshot.outcome_at >= since,
-                RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2", "lost")),
-            )
-        )
+        stmt = select(RecommendationSnapshot).where(and_(*_resolved_conditions(days)))
         snaps = (await session.execute(stmt)).scalars().all()
 
     total = len(snaps)
@@ -224,7 +248,7 @@ async def compute_stats_by_bucket(days: int = 60) -> Dict[str, Any]:
 
 
 async def lookup_historical_for(
-    tier: str, timeframe: str, direction: str, days: int = 60,
+    tier: str, timeframe: str, direction: str, days: int = LEARNING_LOOKBACK_DAYS,
 ) -> Optional[Dict[str, Any]]:
     """
     Devolve stat histórico do bucket (tier, tf, direction) — usado pelo
@@ -241,15 +265,13 @@ async def lookup_historical_for(
     if not DB_ENABLED:
         return None
 
-    since = datetime.now(timezone.utc) - timedelta(days=days)
     async with get_session() as session:
         stmt = select(RecommendationSnapshot).where(
             and_(
                 RecommendationSnapshot.tier == tier,
                 RecommendationSnapshot.timeframe == timeframe,
                 RecommendationSnapshot.direction == direction,
-                RecommendationSnapshot.outcome_at >= since,
-                RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2", "lost")),
+                *_resolved_conditions(days),
             )
         )
         snaps = (await session.execute(stmt)).scalars().all()
@@ -285,7 +307,7 @@ async def lookup_historical_for(
 
 
 async def lookup_historical_batch(
-    keys: List[Dict[str, str]], days: int = 60,
+    keys: List[Dict[str, str]], days: int = LEARNING_LOOKBACK_DAYS,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Lookup em batch: recebe [{tier, timeframe, direction}, ...] e retorna
@@ -294,14 +316,8 @@ async def lookup_historical_batch(
     if not DB_ENABLED or not keys:
         return {}
 
-    since = datetime.now(timezone.utc) - timedelta(days=days)
     async with get_session() as session:
-        stmt = select(RecommendationSnapshot).where(
-            and_(
-                RecommendationSnapshot.outcome_at >= since,
-                RecommendationSnapshot.status.in_(("won_tp1", "won_tp1_be", "won_tp2", "lost")),
-            )
-        )
+        stmt = select(RecommendationSnapshot).where(and_(*_resolved_conditions(days)))
         snaps = (await session.execute(stmt)).scalars().all()
 
     # Indexa por (tier, tf, dir)
@@ -357,7 +373,7 @@ ADJUST_CAP = float(_os.getenv("LEARNING_ADJUST_CAP", "0.25"))       # ±25% no s
 _BUCKET_CATEGORIES = ("tier_tf", "pattern", "session", "dow", "funding")
 
 
-async def compute_auto_adjustments(days: int = 90) -> Dict[str, Any]:
+async def compute_auto_adjustments(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[str, Any]:
     """
     Calcula multiplicadores de score (por bucket) + lista de buckets bloqueados.
     Cada categoria é independente e dormente: só ativa quando bucket atinge
@@ -597,7 +613,7 @@ def apply_score_adjustment(
 async def compute_score_adjustments() -> Dict[str, float]:
     """Mantido pra compatibilidade — agora delega pra compute_auto_adjustments
     e retorna só o bucket tier_tf como dict plano."""
-    data = await compute_auto_adjustments(days=90)
+    data = await compute_auto_adjustments(days=LEARNING_LOOKBACK_DAYS)
     if not data.get("enabled"):
         return {}
     return data.get("score_multipliers", {}).get("tier_tf", {})

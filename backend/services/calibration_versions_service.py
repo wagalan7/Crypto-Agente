@@ -94,7 +94,7 @@ async def snapshot_current(notes: Optional[str] = None, make_active: bool = True
             version=version_str,
             total_resolved=int(calib.get("total_resolved") or 0),
             p_global=float(calib.get("p_global") or 0.0),
-            lookback_days=int(calib.get("lookback_days") or 90),
+            lookback_days=int(calib.get("lookback_days") if calib.get("lookback_days") is not None else 90),
             source=str(calib.get("source") or "db"),
             bins_json={"bins": calib.get("bins", [])},
             win_rate=metrics["win_rate"],
@@ -219,6 +219,87 @@ def _to_dict(ver: CalibrationVersion | None) -> dict | None:
         "notes": ver.notes,
         "computed_at": ver.computed_at.isoformat() if ver.computed_at else None,
         "bins": (ver.bins_json or {}).get("bins", []),
+    }
+
+
+async def recalibrate(notes: Optional[str] = None, make_active: bool = True) -> dict:
+    """
+    Recalibração manual da autoaprendizagem (#10).
+
+    Força o modelo a reaprender com TODO o histórico de trades resolvidos
+    (won_tp2, won_tp1_be, won_tp1, lost, expired), não só a janela móvel:
+      1. Invalida os caches de calibração E de learning (buckets).
+      2. Recomputa a tabela score→P(TP1) sobre o histórico completo.
+      3. Recomputa os multiplicadores/blocks de bucket sobre o histórico.
+      4. Versiona o resultado como nova calibração ativa e compara com a
+         anterior (verdict por Sharpe, política log-only da Fase 1).
+
+    Retorna um relatório com o que mudou — seguro pra chamar a qualquer hora.
+    """
+    from services import calibration_service
+    from services import learning_service
+
+    # 1) Invalida caches pra garantir recomputo do zero
+    calibration_service.invalidate_cache()
+    learning_service.invalidate_cache()
+
+    # 2) Recomputa calibração (full history via LOOKBACK_DAYS<=0)
+    calib = await calibration_service.get_calibration()
+
+    # 3) Recomputa auto-adjust/blocks sobre o histórico completo
+    try:
+        auto_adj = await learning_service.compute_auto_adjustments()
+    except Exception as e:
+        log.warning(f"[recalibrate] auto-adjust falhou (fail-open): {e}")
+        auto_adj = {"enabled": False, "reason": str(e)}
+
+    if calib is None:
+        return {
+            "recalibrated": False,
+            "reason": "Calibração ainda não pronta — amostra de trades resolvidos insuficiente.",
+            "calibration": None,
+            "auto_adjust": auto_adj,
+            "version": None,
+            "comparison": None,
+        }
+
+    # 4) Captura active anterior antes de versionar
+    old_version = None
+    if DB_ENABLED:
+        async with get_session() as session:
+            old = (await session.execute(
+                select(CalibrationVersion).where(CalibrationVersion.active.is_(True)).limit(1)
+            )).scalar_one_or_none()
+            old_version = old.version if old else None
+
+    new = await snapshot_current(
+        notes=notes or "recalibração manual (histórico completo)",
+        make_active=make_active,
+    )
+
+    cmp = None
+    if new is not None and old_version and old_version != new["version"]:
+        cmp = await compare(old_version, new["version"])
+        if cmp and "rejected" in cmp.get("verdict", ""):
+            log.warning(
+                f"[recalibrate] nova calibração tem Sharpe menor: {cmp['verdict']} "
+                f"(mantida ativa — política log-only)"
+            )
+
+    return {
+        "recalibrated": True,
+        "lookback_days": calib.get("lookback_days"),
+        "total_resolved": calib.get("total_resolved"),
+        "p_global": calib.get("p_global"),
+        "calibration": calib,
+        "auto_adjust": {
+            "enabled": auto_adj.get("enabled"),
+            "active_buckets": auto_adj.get("active_buckets"),
+            "blocked_buckets": auto_adj.get("blocked_buckets"),
+            "total_trades": auto_adj.get("total_trades"),
+        },
+        "version": new,
+        "comparison": cmp,
     }
 
 

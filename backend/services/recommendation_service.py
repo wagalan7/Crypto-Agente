@@ -915,7 +915,8 @@ async def get_recommendations_from_batch(
     auto_adj = {}
     try:
         from services.learning_service import compute_auto_adjustments
-        auto_adj = await compute_auto_adjustments(days=90)
+        # days omitido ⇒ usa LEARNING_LOOKBACK_DAYS (default 0 = todo o histórico)
+        auto_adj = await compute_auto_adjustments()
     except Exception as e:
         import logging as _log
         _log.warning(f"[learning] auto-adjust falhou (fail-open): {e}")
@@ -1148,7 +1149,8 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
     auto_adj = {}
     try:
         from services.learning_service import compute_auto_adjustments
-        auto_adj = await compute_auto_adjustments(days=90)
+        # days omitido ⇒ usa LEARNING_LOOKBACK_DAYS (default 0 = todo o histórico)
+        auto_adj = await compute_auto_adjustments()
     except Exception as e:
         _log.warning(f"[learning] auto-adjust falhou (fail-open): {e}")
 
