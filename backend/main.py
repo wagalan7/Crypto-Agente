@@ -1439,6 +1439,74 @@ async def debug_tier_wr(days: int = 90, since_iso: Optional[str] = None):
         raise HTTPException(500, f"Erro: {e}")
 
 
+@app.get("/api/debug/direction-wr")
+async def debug_direction_wr(days: int = 5):
+    """WR por direção × (major vs alt). Diagnóstico do downgrade_alt_longs:
+    se long-alt vence muito mais que short-alt, o viés short (regime
+    BTC_DOMINANT) está penalizando os trades certos. major = BTC/ETH."""
+    try:
+        from db import DB_ENABLED, get_session
+        from models.recommendation_snapshot import RecommendationSnapshot as RS
+        from services.regime_service import is_btc_symbol
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import select, and_
+        if not DB_ENABLED:
+            return {"enabled": False}
+
+        WIN = ("won_tp1", "won_tp1_be", "won_tp2")
+        RESOLVED = WIN + ("lost", "expired")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+
+        async with get_session() as session:
+            stmt = select(
+                RS.symbol, RS.direction, RS.status, RS.realized_r, RS.tier,
+            ).where(and_(RS.outcome_at >= since, RS.status.in_(RESOLVED)))
+            rows = (await session.execute(stmt)).all()
+
+        if not rows:
+            return {"enabled": True, "days": days, "n": 0,
+                    "note": "sem trades resolvidos no período"}
+
+        def _metrics(items):
+            n = len(items)
+            if n == 0:
+                return {"n": 0}
+            wins = sum(1 for r in items if r.status in WIN)
+            losses = sum(1 for r in items if r.status == "lost")
+            expired = sum(1 for r in items if r.status == "expired")
+            decided = wins + losses
+            r_vals = [r.realized_r for r in items if r.realized_r is not None]
+            return {
+                "n": n, "wins": wins, "losses": losses, "expired": expired,
+                "wr_pct": round(wins / decided * 100, 1) if decided else None,
+                "total_r": round(sum(r_vals), 2) if r_vals else None,
+            }
+
+        buckets: dict[str, list] = {
+            "long_major": [], "long_alt": [], "short_major": [], "short_alt": [],
+        }
+        for r in rows:
+            major = is_btc_symbol(r.symbol)
+            key = f"{r.direction}_{'major' if major else 'alt'}"
+            if key in buckets:
+                buckets[key].append(r)
+
+        by_direction = {
+            "long": _metrics([r for r in rows if r.direction == "long"]),
+            "short": _metrics([r for r in rows if r.direction == "short"]),
+        }
+        return {
+            "enabled": True,
+            "days": days,
+            "total_resolved": len(rows),
+            "by_direction": by_direction,
+            "by_direction_x_asset": {k: _metrics(v) for k, v in buckets.items()},
+        }
+    except Exception as e:
+        logging.error(f"direction-wr error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro: {e}")
+
+
 @app.get("/api/debug/vision-pipeline")
 async def debug_vision_pipeline():
     """Roda cada estágio do pipeline Vision e reporta onde quebra."""
