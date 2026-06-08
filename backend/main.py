@@ -775,12 +775,12 @@ async def recommendations_batch(body: RecommendationBatchRequest):
                     if should_block_recommendation(regime, r["symbol"], r["direction"]):
                         continue
                     if regime.get("downgrade_alt_longs") and r["direction"] == "long" and not is_btc_symbol(r["symbol"]):
+                        # Fix #2 (A): rebaixamento suave — no máximo 1 nível
+                        # (A+→A) e NUNCA descarta. Os dados mostram que long de
+                        # alt está entre os melhores trades; descartar/cascatear
+                        # jogava dinheiro bom fora. A e B passam intactos.
                         if r.get("tier") == "A+":
                             r = {**r, "tier": "A"}
-                        elif r.get("tier") == "A":
-                            r = {**r, "tier": "B"}
-                        elif r.get("tier") == "B":
-                            continue
                     kept.append(r)
                 pushable_recs = kept
         except Exception as e:

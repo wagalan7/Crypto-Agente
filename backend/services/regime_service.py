@@ -44,6 +44,10 @@ RISK_OFF_BTC_24H = -5.0          # BTC caindo 5%+ em 24h → bloqueia tudo
 ALT_DANGER_DOM = 56.0            # dominance acima disso
 ALT_DANGER_BTC_24H = 3.0         # E BTC subindo 3%+ → alts sangram
 BTC_DOMINANT_THRESHOLD = 55.0    # dominance alta — downgrade alt longs
+# Fix #2 (B): só rebaixa long de alt se, ALÉM da dominância alta, o BTC estiver
+# de fato puxando pra cima (rotação real pro BTC). Sem isso a regra era cega —
+# rebaixava long de alt só pelo número da dominância, mesmo com alts subindo.
+BTC_DOMINANT_MIN_BTC_24H = float(os.getenv("BTC_DOMINANT_MIN_BTC_24H", "1.5"))
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
 CACHE_TTL = 600  # 10min: regime muda devagar
@@ -107,10 +111,18 @@ def _classify(btc_24h: Optional[float], dom: Optional[float]) -> Dict[str, Any]:
             f"Dominância BTC {dom:.1f}% + BTC {btc_24h:+.2f}% 24h "
             f"(capital migrando p/ BTC, alts sangram)"
         )
-    elif dom is not None and dom >= BTC_DOMINANT_THRESHOLD:
+    elif (
+        dom is not None and dom >= BTC_DOMINANT_THRESHOLD
+        and btc_24h is not None and btc_24h >= BTC_DOMINANT_MIN_BTC_24H
+    ):
+        # Só rebaixa long de alt quando há rotação real pro BTC (dominância alta
+        # E BTC subindo). Se as alts não estão de fato sangrando, não penaliza.
         regime = "BTC_DOMINANT"
         downgrade_alt_longs = True
-        reasons.append(f"Dominância BTC {dom:.1f}% (alts pressionadas)")
+        reasons.append(
+            f"Dominância BTC {dom:.1f}% + BTC {btc_24h:+.2f}% 24h "
+            f"(rotação pro BTC — long de alt rebaixado)"
+        )
 
     return {
         "regime": regime,
