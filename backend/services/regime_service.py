@@ -57,19 +57,21 @@ def is_btc_symbol(symbol: str) -> bool:
 
 
 async def _fetch_btc_24h_pct() -> Optional[float]:
-    """% mudança do BTC nas últimas 24h via candle 1d."""
+    """% mudança do BTC nas últimas 24h.
+
+    Usa fetch_ticker, que já calcula `change` a partir de open24h (preço de
+    24h atrás) vs last. A versão antiga usava fetch_ohlcv, que retorna um
+    pandas DataFrame — o teste `if not candles` levantava ValueError
+    (truth value of a DataFrame is ambiguous) e a função sempre devolvia None,
+    desligando a proteção RISK_OFF.
+    """
     try:
-        from services.binance_service import fetch_ohlcv
-        # 1d candles, últimas 2: hoje (incompleto) + ontem (fechado).
-        # Mais robusto: pega 1h x 25 e compara primeira e última close.
-        candles = await fetch_ohlcv("BTC/USDT:USDT", "1h", limit=25)
-        if not candles or len(candles) < 24:
+        from services.binance_service import fetch_ticker
+        t = await fetch_ticker("BTC/USDT:USDT")
+        change = t.get("change") if isinstance(t, dict) else None
+        if change is None:
             return None
-        first = candles[0]["close"] if isinstance(candles[0], dict) else candles[0][4]
-        last = candles[-1]["close"] if isinstance(candles[-1], dict) else candles[-1][4]
-        if not first:
-            return None
-        return round((last - first) / first * 100, 2)
+        return round(float(change), 2)
     except Exception as e:
         log.warning(f"[regime] btc 24h falhou: {e}")
         return None
