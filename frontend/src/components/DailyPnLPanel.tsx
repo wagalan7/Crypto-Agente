@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { X, BarChart3, TrendingUp, TrendingDown, Clock, RefreshCw, Calendar, ChevronLeft } from 'lucide-react'
+import { api } from '../services/api'
 
 interface Trade {
   symbol: string
@@ -123,6 +124,66 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
   const isRange = date !== endDate
   const cardRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const [highlightKey, setHighlightKey] = useState<string | null>(null)
+
+  // ── Confirmar entrada a partir do painel de abertos ──────────────────────
+  // Reaproveita o mesmo endpoint do RecommendationsPanel: você abre na
+  // corretora, o bot coloca SL+TP1+TP2 e gerencia o BE pós-TP1.
+  const [confirmFor, setConfirmFor] = useState<string | null>(null)
+  const [confirmForm, setConfirmForm] = useState({ entry: '', qty: '' })
+  const [confirmBusy, setConfirmBusy] = useState(false)
+  const [confirmToast, setConfirmToast] = useState<{ k: string; msg: string; level: 'ok' | 'err' } | null>(null)
+
+  const openConfirm = (key: string, price: number) => {
+    setConfirmForm({ entry: price ? String(price) : '', qty: '' })
+    setConfirmToast(null)
+    setConfirmFor(prev => (prev === key ? null : key))
+  }
+
+  const submitConfirm = async (t: Trade, viab: ViabilityItem, key: string) => {
+    const entry = parseFloat(confirmForm.entry)
+    if (!entry) {
+      setConfirmToast({ k: key, msg: 'Informe o preço de entrada', level: 'err' })
+      return
+    }
+    setConfirmBusy(true)
+    try {
+      const res = await api.confirmEntry({
+        symbol: t.symbol,
+        side: t.direction,
+        entry_price: entry,
+        qty: confirmForm.qty ? parseFloat(confirmForm.qty) : null,
+        timeframe: t.timeframe,
+        leverage: t.leverage,
+        planned_stop: t.stop_loss,
+        planned_tp1: t.tp1 ?? null,
+        planned_tp2: t.tp2,
+        recommendation_id: viab.id,
+      })
+      const prot = res.protection
+      const protMsg = prot?.placed
+        ? 'Bot colocou SL+TP1+TP2.'
+        : prot?.error
+          ? `⚠ bracket não criado (${prot.error}).`
+          : '⚠ bracket pendente — auto-cura vai tentar.'
+      setConfirmToast({
+        k: key,
+        msg: `✅ Entrada confirmada · qty ${res.qty_source}. ${protMsg} Acompanhe em "Operações Ativas".`,
+        level: prot?.placed === false ? 'err' : 'ok',
+      })
+      setConfirmFor(null)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'erro'
+      setConfirmToast({
+        k: key,
+        msg: msg.includes('422')
+          ? 'Sem posição aberta na conta — abra na corretora ou informe o qty.'
+          : `Falha: ${msg}`,
+        level: 'err',
+      })
+    } finally {
+      setConfirmBusy(false)
+    }
+  }
 
   // Quando chega foco de push de outcome, abre o drill correto e
   // tenta destacar o card daquela operação.
@@ -406,6 +467,71 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                       <p className="text-[10px] text-slate-300 leading-snug bg-slate-950/50 border border-slate-800 rounded p-2 mb-2">
                         💡 {viab.advice}
                       </p>
+                    )}
+
+                    {/* Confirmar entrada — só quando o setup ainda é entrável (valid/wait).
+                        Você abre na corretora; o bot coloca SL+TP1+TP2 e gerencia o BE. */}
+                    {viab && (viab.viability === 'valid' || viab.viability === 'wait') && (
+                      <div className="mb-2">
+                        {confirmFor !== tradeKey ? (
+                          <button
+                            onClick={() => openConfirm(tradeKey, viab.current_price)}
+                            className="text-[11px] font-bold px-2.5 py-1 rounded border border-emerald-500/50 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 transition-colors"
+                          >
+                            ✅ entrei nesse
+                          </button>
+                        ) : (
+                          <div className="bg-slate-950/60 border border-emerald-700/40 rounded p-2 flex flex-col gap-2">
+                            <div className="flex items-center gap-2">
+                              <div className="flex-1">
+                                <label className="block text-[9px] text-slate-500 mb-0.5">Preço de entrada</label>
+                                <input
+                                  type="number"
+                                  step="any"
+                                  value={confirmForm.entry}
+                                  onChange={e => setConfirmForm(f => ({ ...f, entry: e.target.value }))}
+                                  className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-yellow-300 outline-none focus:border-emerald-500"
+                                  placeholder="preço"
+                                />
+                              </div>
+                              <div className="flex-1">
+                                <label className="block text-[9px] text-slate-500 mb-0.5">Qty (opcional)</label>
+                                <input
+                                  type="number"
+                                  step="any"
+                                  value={confirmForm.qty}
+                                  onChange={e => setConfirmForm(f => ({ ...f, qty: e.target.value }))}
+                                  className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px] font-mono text-slate-200 outline-none focus:border-emerald-500"
+                                  placeholder="lê da conta"
+                                />
+                              </div>
+                            </div>
+                            <p className="text-[9px] text-slate-500 leading-snug">
+                              Você abre na corretora; o bot coloca SL+TP1+TP2 e gerencia o BE pós-TP1.
+                            </p>
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => submitConfirm(t, viab, tradeKey)}
+                                disabled={confirmBusy}
+                                className="text-[11px] font-bold px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white disabled:opacity-50 transition-colors"
+                              >
+                                {confirmBusy ? 'enviando…' : 'confirmar entrada'}
+                              </button>
+                              <button
+                                onClick={() => { setConfirmFor(null); setConfirmToast(null) }}
+                                className="text-[11px] px-2 py-1 rounded border border-slate-700 text-slate-400 hover:text-slate-200"
+                              >
+                                cancelar
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                        {confirmToast && confirmToast.k === tradeKey && (
+                          <p className={`mt-1 text-[10px] leading-snug ${confirmToast.level === 'ok' ? 'text-emerald-300' : 'text-red-300'}`}>
+                            {confirmToast.msg}
+                          </p>
+                        )}
+                      </div>
                     )}
 
                     <p className="text-[10px] text-slate-400 leading-snug">{reason}</p>
