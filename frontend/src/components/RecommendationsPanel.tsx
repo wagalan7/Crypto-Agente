@@ -97,6 +97,11 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
   const [progress, setProgress] = useState<string>('')
   const [historical, setHistorical] = useState<Record<string, HistoricalStat>>({})
   const [probs, setProbs] = useState<Record<string, { p_tp1_pct: number; p_tp2_pct: number; n_total: number; confidence: string }>>({})
+  // Confirmar entrada manual a partir de uma rec
+  const [confirmFor, setConfirmFor] = useState<string | null>(null)
+  const [confirmForm, setConfirmForm] = useState({ entry: '', qty: '' })
+  const [confirmBusy, setConfirmBusy] = useState(false)
+  const [confirmToast, setConfirmToast] = useState<{ k: string; msg: string; level: 'ok' | 'err' } | null>(null)
   const [newsStatus, setNewsStatus] = useState<{
     active: boolean
     event?: string
@@ -253,6 +258,57 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focus, recs, loading])
 
+  const openConfirm = (r: Recommendation, key: string) => {
+    setConfirmForm({ entry: String(r.current_price ?? r.entry ?? ''), qty: '' })
+    setConfirmToast(null)
+    setConfirmFor(prev => (prev === key ? null : key))
+  }
+
+  const submitConfirm = async (r: Recommendation, key: string) => {
+    const entry = parseFloat(confirmForm.entry)
+    if (!entry) {
+      setConfirmToast({ k: key, msg: 'Informe o preço de entrada', level: 'err' })
+      return
+    }
+    setConfirmBusy(true)
+    try {
+      const res = await api.confirmEntry({
+        symbol: r.symbol,
+        side: r.direction,
+        entry_price: entry,
+        qty: confirmForm.qty ? parseFloat(confirmForm.qty) : null,
+        timeframe: r.timeframe,
+        leverage: r.leverage,
+        planned_stop: r.stop_loss,
+        planned_tp1: r.signal?.tp1 ?? null,
+        planned_tp2: r.tp2,
+      })
+      const prot = res.protection
+      const protMsg = prot?.placed
+        ? 'Bot colocou SL+TP1+TP2.'
+        : prot?.error
+          ? `⚠ bracket não criado (${prot.error}).`
+          : '⚠ bracket pendente — auto-cura vai tentar.'
+      setConfirmToast({
+        k: key,
+        msg: `✅ Entrada confirmada · qty ${res.qty_source}. ${protMsg} Acompanhe em "Operações Ativas".`,
+        level: prot?.placed === false ? 'err' : 'ok',
+      })
+      setConfirmFor(null)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'erro'
+      setConfirmToast({
+        k: key,
+        msg: msg.includes('422')
+          ? 'Sem posição aberta na conta — abra na corretora ou informe o qty.'
+          : `Falha: ${msg}`,
+        level: 'err',
+      })
+    } finally {
+      setConfirmBusy(false)
+    }
+  }
+
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
       <div className="w-full max-w-5xl max-h-[92vh] bg-[#0a0e1a] border border-slate-700 rounded-xl flex flex-col overflow-hidden shadow-2xl">
@@ -399,13 +455,14 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
               const dirColor = isLong ? 'text-green-400' : 'text-red-400'
               const histKey = `${r.tier}_${r.timeframe}_${r.direction}`
               const hist = historical[histKey]
+              const rkey = `${r.symbol}-${r.timeframe}`
               return (
+                <div key={rkey} className="flex flex-col">
                 <button
-                  key={`${r.symbol}-${r.timeframe}`}
-                  ref={(el) => { cardRefs.current[`${r.symbol}-${r.timeframe}`] = el }}
+                  ref={(el) => { cardRefs.current[rkey] = el }}
                   onClick={() => onSelectSymbol(r.symbol, r.timeframe)}
                   className={`w-full text-left p-3 rounded-lg border ${cfg.bg} ${cfg.border} ${cfg.ring} hover:bg-slate-800/40 transition-colors ${
-                    highlightKey === `${r.symbol}-${r.timeframe}`
+                    highlightKey === rkey
                       ? 'ring-2 ring-amber-400/80 shadow-lg shadow-amber-400/30 animate-pulse'
                       : ''
                   }`}
@@ -585,6 +642,62 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                     </div>
                   )}
                 </button>
+
+                {/* Confirmar entrada manual a partir desta rec */}
+                <div className="px-1 pt-1.5">
+                  {confirmFor === rkey ? (
+                    <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-2 flex flex-col gap-2">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number" step="any" placeholder="Preço de entrada *"
+                          className="flex-1 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 placeholder-slate-500"
+                          value={confirmForm.entry}
+                          onChange={e => setConfirmForm(f => ({ ...f, entry: e.target.value }))}
+                        />
+                        <input
+                          type="number" step="any" placeholder="Qty (auto)"
+                          className="w-24 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 placeholder-slate-500"
+                          value={confirmForm.qty}
+                          onChange={e => setConfirmForm(f => ({ ...f, qty: e.target.value }))}
+                        />
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          disabled={confirmBusy}
+                          onClick={() => submitConfirm(r, rkey)}
+                          className="flex-1 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-xs font-bold text-white"
+                        >
+                          {confirmBusy ? 'Registrando…' : 'Confirmar entrada'}
+                        </button>
+                        <button
+                          onClick={() => setConfirmFor(null)}
+                          className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-slate-300"
+                        >
+                          Cancelar
+                        </button>
+                      </div>
+                      <p className="text-[9px] text-slate-500 leading-snug">
+                        Você abre na corretora; o bot coloca SL+TP1+TP2 e gerencia o BE pós-TP1.
+                        Níveis herdados da rec. Qty vazio = lê automático da posição na conta.
+                      </p>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => openConfirm(r, rkey)}
+                      className="w-full py-1 rounded-lg border border-slate-700 bg-slate-800/40 hover:bg-slate-700/60 text-[11px] font-semibold text-emerald-300 transition-colors"
+                    >
+                      ✅ Confirmar que entrei nessa
+                    </button>
+                  )}
+                  {confirmToast?.k === rkey && (
+                    <div className={`mt-1 text-[10px] px-2 py-1 rounded ${
+                      confirmToast.level === 'ok' ? 'text-emerald-300 bg-emerald-500/10' : 'text-red-300 bg-red-500/10'
+                    }`}>
+                      {confirmToast.msg}
+                    </div>
+                  )}
+                </div>
+                </div>
               )
             })}
           </div>

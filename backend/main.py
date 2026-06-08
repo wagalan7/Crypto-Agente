@@ -1805,6 +1805,166 @@ async def real_trade_get(trade_id: int):
     return result
 
 
+class ConfirmEntryRequest(BaseModel):
+    """Confirma que o user entrou numa recomendação do painel (modo híbrido
+    gerenciado). Você abre a posição na corretora; o bot coloca o bracket
+    (SL + TP1 parcial 45% + TP2) e gerencia o breakeven pós-TP1 sozinho.
+    Níveis vêm da rec; só o entry_price é livre. O qty é automático — lido da
+    posição viva na conta — se não informado."""
+    symbol: str
+    side: str                         # "long" | "short"
+    entry_price: float
+    qty: float | None = None          # se None/0 → lê da posição na conta
+    timeframe: str | None = None
+    leverage: int | None = None
+    planned_stop: float | None = None
+    planned_tp1: float | None = None
+    planned_tp2: float | None = None
+    recommendation_id: int | None = None
+    entry_fee: float = 0.0
+    notes: str | None = None
+
+
+@app.post("/api/real-trades/from-recommendation")
+async def real_trade_from_recommendation(req: ConfirmEntryRequest):
+    """
+    Registra entrada manual a partir de uma recomendação do painel.
+      - Herda SL/TP1/TP2/leverage da rec (níveis enviados pelo painel; e, se
+        achar o snapshot por symbol+tf+direction, linka pra atribuição/slippage).
+      - qty automático: se não informado, lê o tamanho da posição viva na conta.
+      - source="manual" → entra no monitor advise-only (não dispara ordem).
+    """
+    from services import real_trade_service
+
+    # 1. Resolve o snapshot da rec (atribuição/tier/slippage) — best effort.
+    rec_id = req.recommendation_id
+    if rec_id is None:
+        try:
+            from db import get_session
+            from sqlalchemy import select, desc
+            from models.recommendation_snapshot import RecommendationSnapshot
+            async with get_session() as session:
+                stmt = (
+                    select(RecommendationSnapshot.id)
+                    .where(RecommendationSnapshot.symbol == req.symbol)
+                    .where(RecommendationSnapshot.direction == req.side)
+                    .where(RecommendationSnapshot.status == "open")
+                    .order_by(desc(RecommendationSnapshot.created_at))
+                    .limit(1)
+                )
+                if req.timeframe:
+                    stmt = stmt.where(RecommendationSnapshot.timeframe == req.timeframe)
+                rec_id = (await session.execute(stmt)).scalar_one_or_none()
+        except Exception as e:
+            log.warning(f"[confirm-entry] resolver snapshot falhou: {e}")
+            rec_id = None
+
+    # 2. qty automático — lê da posição viva na conta se não informado.
+    qty = req.qty
+    qty_source = "informado"
+    if qty is None or qty <= 0:
+        try:
+            from services import exchange_service
+            pos = await exchange_service.get_positions(symbol=req.symbol)
+            if pos.get("ok"):
+                for p in pos.get("positions") or []:
+                    sz = abs(float(p.get("size") or 0))
+                    if sz > 0:
+                        qty = sz
+                        qty_source = "posição"
+                        break
+        except Exception as e:
+            log.warning(f"[confirm-entry] ler qty da posição falhou: {e}")
+    if qty is None or qty <= 0:
+        raise HTTPException(
+            422,
+            f"qty não informado e nenhuma posição aberta encontrada na conta para {req.symbol}. "
+            f"Abra a posição na corretora antes de confirmar, ou informe o qty.",
+        )
+
+    # 3. Grava o RealTrade gerenciado (open_trade herda níveis da rec se
+    #    rec_id existe). source="managed": o bot coloca o bracket e gerencia o
+    #    ciclo de vida (mesmo caminho do auto), mas a posição é sua.
+    result = await real_trade_service.open_trade(
+        symbol=req.symbol,
+        side=req.side,
+        qty=qty,
+        entry_price=req.entry_price,
+        recommendation_id=rec_id,
+        leverage=req.leverage,
+        planned_stop=req.planned_stop,
+        planned_tp1=req.planned_tp1,
+        planned_tp2=req.planned_tp2,
+        entry_fee=req.entry_fee,
+        source="managed",
+        notes=req.notes or f"confirmado do painel (qty {qty_source}) — gerenciado pelo bot",
+    )
+    if result is None:
+        raise HTTPException(503, "DB desabilitado")
+
+    # 4. Coloca o bracket de proteção (SL + TP1 parcial + TP2) na posição já
+    #    aberta. Os níveis já foram resolvidos da rec dentro de open_trade →
+    #    lê do result. Se faltar SL, não coloca (sem stop não há bracket); a
+    #    auto-cura do trade-manager tentará recriar pernas faltantes nos ticks
+    #    seguintes. Falha aqui NÃO derruba o registro — o trade fica gravado e
+    #    o lifecycle assume.
+    trade_id = result["id"]
+    sl_lvl = result.get("planned_stop")
+    tp1_lvl = result.get("planned_tp1")
+    tp2_lvl = result.get("planned_tp2")
+    protection: dict = {"placed": False}
+    if sl_lvl and sl_lvl > 0:
+        try:
+            from services import binance_signed_service
+            from db import get_session
+            from sqlalchemy import select
+            from models.real_trade import RealTrade
+
+            entry_side = "Buy" if req.side == "long" else "Sell"
+            prot = await binance_signed_service.place_protection_orders(
+                req.symbol, entry_side, qty=qty,
+                stop_loss=sl_lvl, tp1=tp1_lvl, tp2=tp2_lvl,
+                client_order_id_prefix=f"cw-managed-{trade_id}",
+            )
+            async with get_session() as session:
+                fresh = (await session.execute(
+                    select(RealTrade).where(RealTrade.id == trade_id)
+                )).scalar_one_or_none()
+                if fresh:
+                    if prot.get("sl_ok"):
+                        fresh.sl_order_id = prot.get("sl_order_id")
+                        fresh.sl_current_price = sl_lvl
+                    if prot.get("tp1_ok") and tp1_lvl:
+                        fresh.tp1_order_id = prot.get("tp1_order_id")
+                    if prot.get("tp2_ok"):
+                        fresh.tp2_order_id = prot.get("tp2_order_id")
+                    await session.commit()
+            protection = {
+                "placed": bool(prot.get("sl_ok")),
+                "sl_ok": prot.get("sl_ok"), "sl_msg": prot.get("sl_msg"),
+                "tp1_ok": prot.get("tp1_ok"), "tp1_msg": prot.get("tp1_msg"),
+                "tp1_skipped": prot.get("tp1_skipped"),
+                "tp2_ok": prot.get("tp2_ok"), "tp2_msg": prot.get("tp2_msg"),
+            }
+            log.info(
+                f"[confirm-entry] proteção #{trade_id} {req.symbol}: "
+                f"SL={prot.get('sl_order_id')} TP1={prot.get('tp1_order_id')} "
+                f"TP2={prot.get('tp2_order_id')}"
+            )
+        except Exception as e:
+            log.error(f"[confirm-entry] colocar proteção #{trade_id} falhou: {e}")
+            protection = {"placed": False, "error": str(e)}
+    else:
+        protection = {"placed": False, "error": "sem planned_stop — bracket não criado"}
+
+    return {
+        **result,
+        "qty_source": qty_source,
+        "linked_recommendation_id": rec_id,
+        "protection": protection,
+    }
+
+
 # ─── Trade manager (bracket TP1/TP2 + breakeven pós-TP1, Fase 2) ─────────────
 
 

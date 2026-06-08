@@ -745,26 +745,198 @@ async def _process_trade(trade: RealTrade) -> None:
         await _transition_to_post_tp1(trade)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Monitor ADVISE-ONLY de trades MANUAIS (v1 pré go-live)
+# ══════════════════════════════════════════════════════════════════════════
+# Trades source="manual" rodam na MESMA conta demo (em moedas diferentes das
+# do bot). O bot NÃO cria nem mexe em NENHUMA ordem dessas posições — só
+# observa e aconselha:
+#   - preço tocou TP1   → sugere realizar parcial e subir SL pro BE (seu entry)
+#   - preço tocou TP2   → sugere fechar a posição
+#   - posição sumiu     → marca o trade fechado (classifica por proximidade)
+#
+# "TP1 já avisado" persiste no DB via phase pre_tp1 → post_tp1 (sobrevive
+# restart). "TP2 já avisado" fica em memória (re-push no máx. 1x após restart —
+# aceitável). Toggle: MANUAL_MONITOR_ENABLED env (default "true").
+MANUAL_MONITOR_ENABLED = os.getenv("MANUAL_MONITOR_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+_MANUAL_TP2_ADVISED: set[int] = set()
+
+
+def _hit(side: str, price: float, level: float, kind: str) -> bool:
+    """price cruzou `level`? kind='tp' (alvo) | 'sl' (stop).
+    long: TP acima (price≥level), SL abaixo (price≤level). short: invertido."""
+    if not level or level <= 0:
+        return False
+    is_long = side == "long"
+    if kind == "tp":
+        return price >= level if is_long else price <= level
+    # sl
+    return price <= level if is_long else price >= level
+
+
+async def _fetch_mark_price(symbol: str) -> float | None:
+    try:
+        from services.binance_service import fetch_ticker
+        t = await fetch_ticker(symbol)
+        last = float(t.get("last") or 0) if isinstance(t, dict) else 0.0
+        return last or None
+    except Exception as e:
+        log.warning(f"[manual-monitor] preço {symbol} falhou: {e}")
+        return None
+
+
+async def _advise(trade: RealTrade, title: str, body: str, event_type: str) -> None:
+    """Envia conselho (Telegram) sobre trade manual — sem tocar em ordem."""
+    try:
+        from services.notification_service import send_telegram
+        await send_telegram(f"{title}\n{body}", event_type=event_type)
+        log.info(f"[manual-monitor] advise #{trade.id} {trade.symbol}: {title}")
+    except Exception as e:
+        log.warning(f"[manual-monitor] advise #{trade.id} falhou: {e}")
+
+
+async def _close_manual_trade(trade: RealTrade) -> None:
+    """Posição manual sumiu da conta → marca fechado. NÃO cancela ordens
+    (não são nossas). Classifica por proximidade do preço de saída aos níveis."""
+    from services import real_trade_service, exchange_service
+    sym_short = (trade.symbol or "").split("/")[0]
+
+    # Preço de saída real: último fill no lado de fechamento
+    exit_price = None
+    try:
+        close_side = "SELL" if trade.side == "long" else "BUY"
+        ex = await exchange_service.get_executions(trade.symbol, limit=20)
+        if ex.get("ok"):
+            fills = [
+                f for f in (ex.get("fills") or [])
+                if str(f.get("side", "")).upper() == close_side and float(f.get("price") or 0) > 0
+            ]
+            if fills:
+                exit_price = float(max(fills, key=lambda f: int(f.get("time") or 0))["price"])
+    except Exception as e:
+        log.warning(f"[manual-monitor] exit fill #{trade.id} falhou: {e}")
+
+    # Classifica por proximidade aos níveis planejados
+    reason = "manual"
+    if exit_price and trade.entry_price:
+        dists: dict[str, float] = {"be": abs(exit_price - trade.entry_price)}
+        if trade.planned_tp2:
+            dists["tp2"] = abs(exit_price - trade.planned_tp2)
+        if trade.planned_tp1:
+            dists["tp1"] = abs(exit_price - trade.planned_tp1)
+        if trade.planned_stop:
+            dists["stop"] = abs(exit_price - trade.planned_stop)
+        reason = min(dists, key=lambda k: dists[k])
+
+    status_map = {"tp2": "closed_tp2", "tp1": "closed_tp1", "stop": "closed_stop", "be": "closed_be"}
+    status = status_map.get(reason, "closed_manual")
+    if not exit_price or exit_price <= 0:
+        exit_price = trade.entry_price
+
+    try:
+        result = await real_trade_service.close_trade(
+            trade.id, exit_price=exit_price, status=status,
+            notes="manual-monitor: posição fechada na conta",
+        )
+        pnl = (result or {}).get("pnl_usd")
+        pnl_txt = f" · {pnl:+.2f} USD" if isinstance(pnl, (int, float)) else ""
+        log.info(f"[manual-monitor] CLOSE #{trade.id} {trade.symbol} → {status} @ {exit_price}{pnl_txt}")
+        await _advise(
+            trade,
+            f"✅ Fechado · {sym_short} {trade.side.upper()}",
+            f"Posição manual encerrada @ {exit_price} ({status.replace('closed_', '').upper()}){pnl_txt}.",
+            "close",
+        )
+    except Exception as e:
+        log.error(f"[manual-monitor] close_trade #{trade.id} erro: {e}")
+
+
+async def _process_manual_trade(trade: RealTrade) -> None:
+    """Observa um trade manual e aconselha. Nunca cria/cancela ordem."""
+    sym = trade.symbol
+    sym_short = (sym or "").split("/")[0]
+    qty_now, entry_real = await _fetch_exchange_position(sym)
+
+    # Posição sumiu da conta (user fechou, ou bateu SL/TP na corretora) → fecha
+    if qty_now is not None and qty_now <= 0:
+        await _close_manual_trade(trade)
+        _MANUAL_TP2_ADVISED.discard(trade.id)
+        return
+
+    price = await _fetch_mark_price(sym)
+    if not price:
+        return
+
+    side = trade.side
+    entry = entry_real or trade.entry_price
+
+    # TP1 tocado → avisa 1x (persiste via phase pre_tp1 → post_tp1)
+    if trade.phase != "post_tp1" and _hit(side, price, trade.planned_tp1 or 0, "tp"):
+        await _advise(
+            trade,
+            f"🎯 TP1 tocado · {sym_short} {side.upper()}",
+            f"Preço {price} atingiu o TP1 {trade.planned_tp1}. Sugiro realizar a "
+            f"parcial e subir o SL pro seu break-even (entrada {entry}).",
+            "tp1",
+        )
+        async with get_session() as session:
+            fresh = (await session.execute(
+                select(RealTrade).where(RealTrade.id == trade.id)
+            )).scalar_one_or_none()
+            if fresh:
+                fresh.phase = "post_tp1"
+                fresh.sl_current_price = entry
+                fresh.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+        return
+
+    # TP2 tocado → avisa 1x (em memória)
+    if trade.id not in _MANUAL_TP2_ADVISED and _hit(side, price, trade.planned_tp2 or 0, "tp"):
+        await _advise(
+            trade,
+            f"🚀 TP2 tocado · {sym_short} {side.upper()}",
+            f"Preço {price} atingiu o TP2 {trade.planned_tp2}. Considere fechar a posição.",
+            "tp2",
+        )
+        _MANUAL_TP2_ADVISED.add(trade.id)
+
+
 async def _tick() -> None:
-    """Uma iteração do loop: processa todos os trades open auto."""
+    """Uma iteração do loop: processa trades open auto (gestão ativa) e
+    manuais (monitor advise-only, sem tocar em ordem)."""
     if not DB_ENABLED:
         return
+    # "auto" (trades do bot) e "managed" (entradas manuais que o bot gerencia:
+    # coloca bracket + move SL pro BE pós-TP1) seguem o MESMO lifecycle ativo.
     async with get_session() as session:
         stmt = (
             select(RealTrade)
             .where(RealTrade.status == "open")
-            .where(RealTrade.source == "auto")
+            .where(RealTrade.source.in_(["auto", "managed"]))
         )
         trades = (await session.execute(stmt)).scalars().all()
-
-    if not trades:
-        return
 
     for t in trades:
         try:
             await _process_trade(t)
         except Exception as e:
             log.warning(f"[trade-manager] processar #{t.id} {t.symbol} erro: {e}", exc_info=True)
+
+    # ── Monitor advise-only de trades manuais puros (source="manual", sem
+    #    bracket do bot — fluxo shadow). "managed" NÃO entra aqui (já é tratado
+    #    no lifecycle ativo acima). ──
+    if MANUAL_MONITOR_ENABLED:
+        async with get_session() as session:
+            manual = (await session.execute(
+                select(RealTrade)
+                .where(RealTrade.status == "open")
+                .where(RealTrade.source == "manual")
+            )).scalars().all()
+        for t in manual:
+            try:
+                await _process_manual_trade(t)
+            except Exception as e:
+                log.warning(f"[manual-monitor] processar #{t.id} {t.symbol} erro: {e}", exc_info=True)
 
 
 async def loop() -> None:
@@ -809,7 +981,7 @@ async def backfill_protection(force: bool = False) -> dict:
         stmt = (
             select(RealTrade)
             .where(RealTrade.status == "open")
-            .where(RealTrade.source == "auto")
+            .where(RealTrade.source.in_(["auto", "managed"]))
         )
         trades = (await session.execute(stmt)).scalars().all()
 
@@ -920,7 +1092,7 @@ async def get_status() -> dict:
         stmt = (
             select(RealTrade)
             .where(RealTrade.status == "open")
-            .where(RealTrade.source == "auto")
+            .where(RealTrade.source.in_(["auto", "managed"]))
         )
         trades = (await session.execute(stmt)).scalars().all()
     return {

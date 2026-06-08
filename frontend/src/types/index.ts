@@ -299,6 +299,35 @@ export interface Recommendation {
   } | null
 }
 
+// Operação real/manual em aberto ou fechada (backend RealTrade). Espelha o
+// shape de _to_dict do real_trade_service.
+export interface RealTradeRow {
+  id: number
+  symbol: string
+  side: 'long' | 'short' | string
+  source: 'manual' | 'auto' | 'shadow' | string
+  recommendation_id: number | null
+  qty: number
+  qty_initial: number | null
+  leverage: number | null
+  notional_usd: number | null
+  entry_price: number
+  opened_at: string | null
+  planned_stop: number | null
+  planned_tp1: number | null
+  planned_tp2: number | null
+  exit_price: number | null
+  closed_at: string | null
+  status: string
+  phase: string | null
+  sl_current_price: number | null
+  realized_r: number | null
+  pnl_usd: number | null
+  pnl_pct: number | null
+  entry_slippage_pct: number | null
+  notes: string | null
+}
+
 export interface WatchlistItem {
   symbol: string
   direction?: SignalDirection

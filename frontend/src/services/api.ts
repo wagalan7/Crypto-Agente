@@ -1,4 +1,4 @@
-import type { TradeSignal, OHLCVCandle, Ticker, WatchlistItem, Recommendation } from '../types'
+import type { TradeSignal, OHLCVCandle, Ticker, WatchlistItem, Recommendation, RealTradeRow } from '../types'
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
 const BASE = `${BACKEND}/api`
@@ -117,6 +117,31 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json()
 }
 
+async function patch<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`API error ${res.status}: ${await res.text()}`)
+  return res.json()
+}
+
+// Payload pra confirmar entrada manual a partir de uma recomendação.
+export interface ConfirmEntryPayload {
+  symbol: string
+  side: 'long' | 'short' | string
+  entry_price: number
+  qty?: number | null
+  timeframe?: string
+  leverage?: number | null
+  planned_stop?: number | null
+  planned_tp1?: number | null
+  planned_tp2?: number | null
+  recommendation_id?: number | null
+  notes?: string | null
+}
+
 // ─── Public API ────────────────────────────────────────────────────────────────
 
 export const api = {
@@ -204,6 +229,37 @@ export const api = {
     get<{ best_timeframe: string; score: number; signal: TradeSignal; all_scores: Record<string, number> }>(
       '/best-timeframe', { symbol }
     ),
+
+  // ── Operações reais/manuais (backend RealTrade) ──────────────────────────
+  // Menu "Operações Ativas": lista o que está vivo (status=open), unificando
+  // trades manuais (você) e automáticos (bot).
+  listRealTrades: (params?: { status?: string; days?: number; limit?: number }) =>
+    get<{ trades: RealTradeRow[]; count: number; days: number }>('/real-trades', {
+      ...(params?.status ? { status: params.status } : {}),
+      days: params?.days ?? 30,
+      limit: params?.limit ?? 200,
+    }),
+
+  // Confirma que você entrou numa recomendação (modo híbrido: o bot coloca o
+  // bracket SL+TP1+TP2 e gerencia o break-even pós-TP1).
+  confirmEntry: (body: ConfirmEntryPayload) =>
+    post<RealTradeRow & {
+      qty_source: string
+      linked_recommendation_id: number | null
+      protection?: {
+        placed: boolean
+        error?: string
+        sl_ok?: boolean; sl_msg?: string | null
+        tp1_ok?: boolean; tp1_msg?: string | null; tp1_skipped?: boolean
+        tp2_ok?: boolean; tp2_msg?: string | null
+      }
+    }>(
+      '/real-trades/from-recommendation', body,
+    ),
+
+  // Fecha manualmente uma operação real (remove do menu de ativos).
+  closeRealTrade: (id: number, body: { exit_price: number; status?: string; notes?: string }) =>
+    patch<RealTradeRow>(`/real-trades/${id}/close`, body),
 
   loadTrades: (userId: string) =>
     get<{ trades: unknown[] }>(`/trades/${userId}`),
