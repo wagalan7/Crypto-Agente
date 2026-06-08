@@ -558,6 +558,33 @@ async def check_open_snapshots() -> int:
                 # Conservador: pega ~12 candles de 5m = 1h pra cobrir.
                 df = await fetch_ohlcv(snap.symbol, "5m", 50)
                 if df.empty:
+                    # Sem candles. Pode ser falha transitória OU o par sumiu da
+                    # fonte (ex.: símbolo que só existia na exchange anterior e
+                    # não está no universo atual). Sem tratar, o snapshot
+                    # congelaria "aberto" até o teto de 48h — escondendo o
+                    # resultado real e travando na UI. Se o símbolo
+                    # confirmadamente NÃO está no universo da fonte, não há como
+                    # resolver por preço: encerra como expired (sem dados) e
+                    # segue. Indisponibilidade transitória (símbolo no universo,
+                    # candle vazio pontual) cai no continue normal e tenta de novo.
+                    unavailable = False
+                    try:
+                        from services.binance_service import get_perpetual_symbols
+                        universe = set(await get_perpetual_symbols())
+                        unavailable = bool(universe) and snap.symbol not in universe
+                    except Exception as e:
+                        log.warning(f"[no-data] checar universo {snap.symbol} falhou: {e}")
+                    if unavailable:
+                        snap.status = "expired"
+                        snap.realized_r = 0.0
+                        snap.outcome_at = now
+                        snap.last_check_at = now
+                        log.warning(
+                            f"[no-data] {snap.symbol} {snap.timeframe} {snap.direction} "
+                            f"encerrado expired: fora do universo da fonte "
+                            f"(sem preço pra resolver outcome)"
+                        )
+                        resolved += 1
                     continue
                 # Filtra apenas candles após last_check_at
                 ref_ts = int((snap.last_check_at or snap.created_at).timestamp() * 1000)

@@ -1703,6 +1703,84 @@ async def admin_health():
     return await heartbeat_service.get_health()
 
 
+class ResolveSnapshotRequest(BaseModel):
+    symbol: str
+    direction: str | None = None          # "long" | "short" (opcional, filtra match)
+    status: str = "lost"                  # won_tp1 | won_tp1_be | won_tp2 | lost | expired
+    realized_r: float | None = None       # default por status se None
+    outcome_price: float | None = None    # default = stop_loss/tp do snapshot se None
+    only_open: bool = False               # se True, só resolve quando status atual == open
+
+
+@app.post("/api/admin/snapshots/resolve")
+async def admin_resolve_snapshot(req: ResolveSnapshotRequest):
+    """
+    Força a resolução do snapshot mais recente que casa com symbol (+direction):
+    seta status/realized_r/outcome_price/outcome_at. Usado pra corrigir snapshots
+    travados em open quando o símbolo saiu do universo da fonte (sem preço pra
+    resolver outcome automaticamente).
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+    from db import get_session
+    from models.recommendation_snapshot import RecommendationSnapshot
+
+    default_r = {
+        "won_tp2": 1.5, "won_tp1_be": 0.5, "won_tp1": 0.5,
+        "lost": -1.0, "expired": 0.0,
+    }
+    now = datetime.now(timezone.utc)
+
+    async with get_session() as session:
+        conds = [RecommendationSnapshot.symbol == req.symbol]
+        if req.direction:
+            conds.append(RecommendationSnapshot.direction == req.direction)
+        if req.only_open:
+            conds.append(RecommendationSnapshot.status == "open")
+        stmt = (
+            select(RecommendationSnapshot)
+            .where(*conds)
+            .order_by(RecommendationSnapshot.created_at.desc())
+            .limit(1)
+        )
+        snap = (await session.execute(stmt)).scalar_one_or_none()
+        if snap is None:
+            return {"resolved": False, "error": "nenhum snapshot encontrado pro filtro"}
+
+        prev_status = snap.status
+        # outcome_price default: stop pra lost, tp2 pra won_tp2, tp1 pros tp1, senão entry
+        if req.outcome_price is not None:
+            outcome_price = req.outcome_price
+        elif req.status == "lost":
+            outcome_price = snap.stop_loss
+        elif req.status == "won_tp2":
+            outcome_price = snap.tp2
+        elif req.status in ("won_tp1", "won_tp1_be"):
+            outcome_price = snap.tp1 or snap.entry
+        else:
+            outcome_price = snap.entry
+
+        snap.status = req.status
+        snap.realized_r = req.realized_r if req.realized_r is not None else default_r.get(req.status, 0.0)
+        snap.outcome_price = outcome_price
+        snap.outcome_at = now
+        snap.last_check_at = now
+        await session.commit()
+
+        return {
+            "resolved": True,
+            "id": snap.id,
+            "symbol": snap.symbol,
+            "direction": snap.direction,
+            "timeframe": snap.timeframe,
+            "prev_status": prev_status,
+            "new_status": snap.status,
+            "realized_r": snap.realized_r,
+            "outcome_price": snap.outcome_price,
+            "outcome_at": now.isoformat(),
+        }
+
+
 @app.get("/api/portfolio/exposure")
 async def portfolio_exposure():
     """
