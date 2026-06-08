@@ -232,6 +232,11 @@ REGIME_GUARD_PAUSE_HOURS = float(os.getenv("REGIME_GUARD_PAUSE_HOURS", "1"))
 BREAKER_MIN_SAMPLE = int(os.getenv("BREAKER_MIN_SAMPLE", "15"))
 BREAKER_SL_RATE = float(os.getenv("BREAKER_SL_RATE", "0.40"))
 BREAKER_PAUSE_HOURS = float(os.getenv("BREAKER_PAUSE_HOURS", "3"))
+# Gatilho 2 (complementar): N SLs CONSECUTIVOS na mesma direção — mesmo que a
+# taxa não tenha batido o limiar — pausa a direção (sinal de mercado indeciso/
+# picotado). Independe do piso de amostra. Olha só a janela recente.
+BREAKER_STREAK_SL = int(os.getenv("BREAKER_STREAK_SL", "5"))
+BREAKER_STREAK_WINDOW_HOURS = float(os.getenv("BREAKER_STREAK_WINDOW_HOURS", "24"))
 
 # ── Entry throttle (postmortem) ────────────────────────────────────────────
 # Cooldown global + max entradas/hora pra prevenir "fome de fila" disparando
@@ -792,32 +797,87 @@ async def _count_today_decided_by_direction(direction: str, cutoff_dt) -> tuple[
         return 0, 0
 
 
+async def _trailing_sl_streak(direction: str, cutoff_dt) -> int:
+    """Nº de SLs consecutivos mais recentes na direção (won* quebra a sequência).
+
+    Olha só resoluções decididas (won*+lost) dentro da janela recente e após o
+    cutoff de limpeza (pós-pausa). Conta a sequência que termina na resolução
+    mais recente.
+    """
+    if not DB_ENABLED:
+        return 0
+    try:
+        from sqlalchemy import select
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot as RS
+        won = ("won_tp1", "won_tp1_be", "won_tp2")
+        stmt = select(RS.status).where(
+            RS.direction == direction,
+            RS.status.in_(("lost",) + won),
+            RS.outcome_at >= cutoff_dt,
+        ).order_by(RS.outcome_at.desc()).limit(BREAKER_STREAK_SL + 5)
+        async with get_session() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        streak = 0
+        for st in rows:
+            if st == "lost":
+                streak += 1
+            else:
+                break
+        return streak
+    except Exception as e:
+        log.warning(f"[daily-breaker] streak count falhou: {e}")
+        return 0
+
+
 async def _daily_sl_breaker(direction: str) -> tuple[bool, str]:
-    """Breaker por taxa de SL diária na direção. (blocked, reason)."""
+    """Breaker por direção. Dois gatilhos:
+      1) taxa de SL do dia >= BREAKER_SL_RATE (com >= BREAKER_MIN_SAMPLE amostras);
+      2) BREAKER_STREAK_SL SLs consecutivos na janela recente (mercado indeciso).
+    Qualquer um pausa a direção por BREAKER_PAUSE_HOURS. (blocked, reason).
+    """
     import time
-    from datetime import datetime, timezone
-    if BREAKER_MIN_SAMPLE <= 0:
-        return False, ""
+    from datetime import datetime, timezone, timedelta
     now = time.time()
     until = _DAILY_BREAKER_UNTIL.get(direction, 0)
     if until > now:
         mins = (until - now) / 60.0
-        return True, f"taxa SL alta — pausa ativa ({mins:.0f}min restantes)"
-    # cutoff = início do dia UTC, ou após a última pausa (o que for mais recente)
-    start_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    cutoff = _DAILY_BREAKER_CUTOFF.get(direction)
-    if cutoff is None or cutoff < start_day:
-        cutoff = start_day
-    total, sl = await _count_today_decided_by_direction(direction, cutoff)
-    if total >= BREAKER_MIN_SAMPLE and total > 0:
-        rate = sl / total
-        if rate >= BREAKER_SL_RATE:
-            _DAILY_BREAKER_UNTIL[direction] = now + BREAKER_PAUSE_HOURS * 3600
-            _DAILY_BREAKER_CUTOFF[direction] = datetime.now(timezone.utc)
-            return True, (
-                f"{sl}/{total} SL ({rate*100:.0f}%) {direction} hoje — "
-                f"pausa {BREAKER_PAUSE_HOURS:.0f}h"
+        return True, f"pausa ativa ({mins:.0f}min restantes)"
+
+    def _arm(reason: str) -> tuple[bool, str]:
+        _DAILY_BREAKER_UNTIL[direction] = now + BREAKER_PAUSE_HOURS * 3600
+        _DAILY_BREAKER_CUTOFF[direction] = datetime.now(timezone.utc)
+        return True, reason
+
+    # ── Gatilho 1: taxa de SL diária ──────────────────────────────────────
+    if BREAKER_MIN_SAMPLE > 0:
+        # cutoff = início do dia UTC, ou após a última pausa (o mais recente)
+        start_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff = _DAILY_BREAKER_CUTOFF.get(direction)
+        if cutoff is None or cutoff < start_day:
+            cutoff = start_day
+        total, sl = await _count_today_decided_by_direction(direction, cutoff)
+        if total >= BREAKER_MIN_SAMPLE and total > 0:
+            rate = sl / total
+            if rate >= BREAKER_SL_RATE:
+                return _arm(
+                    f"{sl}/{total} SL ({rate*100:.0f}%) {direction} hoje — "
+                    f"pausa {BREAKER_PAUSE_HOURS:.0f}h"
+                )
+
+    # ── Gatilho 2: sequência de SLs consecutivos ──────────────────────────
+    if BREAKER_STREAK_SL > 0:
+        window_start = datetime.now(timezone.utc) - timedelta(hours=BREAKER_STREAK_WINDOW_HOURS)
+        streak_cutoff = _DAILY_BREAKER_CUTOFF.get(direction)
+        if streak_cutoff is None or streak_cutoff < window_start:
+            streak_cutoff = window_start
+        streak = await _trailing_sl_streak(direction, streak_cutoff)
+        if streak >= BREAKER_STREAK_SL:
+            return _arm(
+                f"{streak} SL seguidos {direction} — pausa {BREAKER_PAUSE_HOURS:.0f}h "
+                f"(mercado indeciso)"
             )
+
     return False, ""
 
 
@@ -872,6 +932,8 @@ def env_info() -> dict:
         "breaker_min_sample": BREAKER_MIN_SAMPLE,
         "breaker_sl_rate": BREAKER_SL_RATE,
         "breaker_pause_hours": BREAKER_PAUSE_HOURS,
+        "breaker_streak_sl": BREAKER_STREAK_SL,
+        "breaker_streak_window_hours": BREAKER_STREAK_WINDOW_HOURS,
         "breaker_paused_directions": {
             d: round((u - __import__("time").time()) / 60.0, 1)
             for d, u in _DAILY_BREAKER_UNTIL.items()
