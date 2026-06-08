@@ -786,6 +786,22 @@ async def recommendations_batch(body: RecommendationBatchRequest):
         except Exception as e:
             logging.warning(f"[push-gate] regime check falhou (fail-open): {e}")
         try:
+            # Daily SL-rate breaker: se a taxa de SL do dia numa direção cruzou
+            # o limiar, suprime recomendações dessa direção (e o executor já
+            # bloqueia entradas reais via mesmo breaker). Avalia 1x por direção.
+            from services.shadow_trade_service import _daily_sl_breaker
+            dir_blocked = {}
+            for d in ("long", "short"):
+                if any(r["direction"] == d for r in pushable_recs):
+                    blocked, reason = await _daily_sl_breaker(d)
+                    if blocked:
+                        dir_blocked[d] = reason
+                        logging.info(f"[push-gate] daily-breaker {d}: {reason} — suprimindo {d}")
+            if dir_blocked:
+                pushable_recs = [r for r in pushable_recs if r["direction"] not in dir_blocked]
+        except Exception as e:
+            logging.warning(f"[push-gate] daily-breaker check falhou (fail-open): {e}")
+        try:
             # Cooldown 6h pós-stop
             from services.snapshot_service import get_recently_stopped_symbols
             cooldown = await get_recently_stopped_symbols(hours=6)

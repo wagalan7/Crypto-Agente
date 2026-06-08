@@ -222,6 +222,17 @@ REGIME_GUARD_WINDOW_HOURS = float(os.getenv("REGIME_GUARD_WINDOW_HOURS", "2"))
 REGIME_GUARD_MAX_SL = int(os.getenv("REGIME_GUARD_MAX_SL", "3"))
 REGIME_GUARD_PAUSE_HOURS = float(os.getenv("REGIME_GUARD_PAUSE_HOURS", "1"))
 
+# ── Daily SL-rate breaker (taxa de acerto diária por direção) ───────────────
+# Diferente do regime guard (rajada curta), este olha a TAXA de SL do dia por
+# direção. A partir de BREAKER_MIN_SAMPLE recomendações DECIDIDAS (won+lost,
+# sem expired) numa direção, se a fração que deu SL >= BREAKER_SL_RATE, pausa
+# ESSA direção por BREAKER_PAUSE_HOURS. Mede sobre RecommendationSnapshot
+# (painel inteiro), age na execução real e na recomendação. Após a pausa, só
+# conta resoluções NOVAS (começo limpo) — não re-pausa pela estatística velha.
+BREAKER_MIN_SAMPLE = int(os.getenv("BREAKER_MIN_SAMPLE", "15"))
+BREAKER_SL_RATE = float(os.getenv("BREAKER_SL_RATE", "0.40"))
+BREAKER_PAUSE_HOURS = float(os.getenv("BREAKER_PAUSE_HOURS", "3"))
+
 # ── Entry throttle (postmortem) ────────────────────────────────────────────
 # Cooldown global + max entradas/hora pra prevenir "fome de fila" disparando
 # trades em rajada quando o regime de mercado vira contra.
@@ -749,6 +760,67 @@ async def _regime_blocked(direction: str) -> tuple[bool, str]:
     return False, ""
 
 
+# Estado do breaker de taxa diária. _DAILY_BREAKER_UNTIL = quando a pausa
+# expira; _DAILY_BREAKER_CUTOFF = só conta recomendações criadas a partir deste
+# instante (vira "now" ao armar → começo limpo após a pausa; reseta no dia UTC).
+_DAILY_BREAKER_UNTIL: dict[str, float] = {}
+_DAILY_BREAKER_CUTOFF: dict[str, "datetime"] = {}
+
+
+async def _count_today_decided_by_direction(direction: str, cutoff_dt) -> tuple[int, int]:
+    """(decididas, sls) hoje na direção. Decididas = won*+lost (sem expired)."""
+    if not DB_ENABLED:
+        return 0, 0
+    try:
+        from sqlalchemy import select, func, case
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot as RS
+        won = ("won_tp1", "won_tp1_be", "won_tp2")
+        async with get_session() as session:
+            stmt = select(
+                func.count(RS.id),
+                func.coalesce(func.sum(case((RS.status == "lost", 1), else_=0)), 0),
+            ).where(
+                RS.direction == direction,
+                RS.status.in_(("lost",) + won),
+                RS.created_at >= cutoff_dt,
+            )
+            row = (await session.execute(stmt)).one()
+            return int(row[0] or 0), int(row[1] or 0)
+    except Exception as e:
+        log.warning(f"[daily-breaker] count falhou: {e}")
+        return 0, 0
+
+
+async def _daily_sl_breaker(direction: str) -> tuple[bool, str]:
+    """Breaker por taxa de SL diária na direção. (blocked, reason)."""
+    import time
+    from datetime import datetime, timezone
+    if BREAKER_MIN_SAMPLE <= 0:
+        return False, ""
+    now = time.time()
+    until = _DAILY_BREAKER_UNTIL.get(direction, 0)
+    if until > now:
+        mins = (until - now) / 60.0
+        return True, f"taxa SL alta — pausa ativa ({mins:.0f}min restantes)"
+    # cutoff = início do dia UTC, ou após a última pausa (o que for mais recente)
+    start_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = _DAILY_BREAKER_CUTOFF.get(direction)
+    if cutoff is None or cutoff < start_day:
+        cutoff = start_day
+    total, sl = await _count_today_decided_by_direction(direction, cutoff)
+    if total >= BREAKER_MIN_SAMPLE and total > 0:
+        rate = sl / total
+        if rate >= BREAKER_SL_RATE:
+            _DAILY_BREAKER_UNTIL[direction] = now + BREAKER_PAUSE_HOURS * 3600
+            _DAILY_BREAKER_CUTOFF[direction] = datetime.now(timezone.utc)
+            return True, (
+                f"{sl}/{total} SL ({rate*100:.0f}%) {direction} hoje — "
+                f"pausa {BREAKER_PAUSE_HOURS:.0f}h"
+            )
+    return False, ""
+
+
 def _tf_rank_local(tf: str) -> int:
     """Mirror de snapshot_service._tf_rank — SCALP=1, DAY=2, SWING=3."""
     if not tf:
@@ -796,6 +868,15 @@ def env_info() -> dict:
         "live_money_guard": guard_reason,
         "live_trading_confirmed": LIVE_TRADING_CONFIRM == _LIVE_CONFIRM_PHRASE,
         "live_size_mult": LIVE_SIZE_MULT,
+        # daily SL-rate breaker (por direção)
+        "breaker_min_sample": BREAKER_MIN_SAMPLE,
+        "breaker_sl_rate": BREAKER_SL_RATE,
+        "breaker_pause_hours": BREAKER_PAUSE_HOURS,
+        "breaker_paused_directions": {
+            d: round((u - __import__("time").time()) / 60.0, 1)
+            for d, u in _DAILY_BREAKER_UNTIL.items()
+            if u > __import__("time").time()
+        },
         "note": "Sizing: risk_pct nominal; eleva ao mín notional; capa em margin%/trade e total notional%.",
     }
 
@@ -1752,6 +1833,16 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 if blocked:
                     log.info(f"[regime-guard] {rec['direction']} bloqueado: {reason} — skip")
                     _record_skip(rec, "regime-guard", f"regime adverso: {reason}")
+                    continue
+
+            # ── Daily SL-rate breaker: se a taxa de SL do dia nessa direção
+            # cruzou o limiar (>= BREAKER_MIN_SAMPLE decididas, >= BREAKER_SL_RATE
+            # delas em SL), pausa entradas reais nessa direção por BREAKER_PAUSE_HOURS.
+            if not SHADOW_ENABLED:
+                blocked, reason = await _daily_sl_breaker(rec["direction"])
+                if blocked:
+                    log.info(f"[daily-breaker] {rec['direction']} bloqueado: {reason} — skip")
+                    _record_skip(rec, "daily-sl-breaker", reason)
                     continue
 
             # ── Direction flip (Fase 2): se há trade aberto na direção oposta,
