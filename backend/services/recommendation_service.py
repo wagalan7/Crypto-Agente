@@ -69,6 +69,30 @@ TF_MIN_TIER: Dict[str, int] = _parse_tf_min_tier(
 )
 
 
+def _norm_sym(s: str) -> str:
+    """Reduz um símbolo só à moeda base, pra casar o denylist em qualquer
+    formato. 'BTC/USDT:USDT'→'BTC', 'BTCUSDT'→'BTC', 'BTC-USDT-SWAP'→'BTC',
+    'BTC'→'BTC', '1000PEPE/USDT:USDT'→'1000PEPE'."""
+    s = (s or "").upper().strip()
+    s = s.split(":", 1)[0].split("/", 1)[0]          # tira /USDT:USDT
+    s = s.replace("-USDT-SWAP", "").replace("-SWAP", "")
+    for suf in ("USDT", "USD", "PERP"):
+        if s.endswith(suf) and len(s) > len(suf):
+            s = s[: -len(suf)]
+            break
+    return s.replace("-", "").replace("_", "").strip()
+
+
+# Denylist de símbolos: memecoins/junk que pumpam volume mas dão setups erráticos
+# (NEIRO, GALA...) — NÃO são filtrados por volume (justamente têm volume alto),
+# então exigem exclusão explícita. CSV de moedas-base, reversível sem deploy.
+# Vazio (SYMBOL_DENYLIST="") = sem denylist. Aplicado no chokepoint _classify_tier
+# (cobre live, server-scan e auto-trade) + pré-filtro no scan (economia de CPU).
+SYMBOL_DENYLIST: set = {
+    _norm_sym(x) for x in os.getenv("SYMBOL_DENYLIST", "NEIRO,GALA").split(",") if x.strip()
+}
+
+
 class Recommendation(BaseModel):
     tier: str                     # "A+" | "A" | "B"
     score: float                  # 0–100 composto
@@ -383,6 +407,10 @@ def _has_confirming_pattern(sig: TradeSignal) -> bool:
 def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
     """Retorna 'A+' | 'A' | 'B' | None (rejeitado)."""
     if sig.direction == SignalDirection.NEUTRAL:
+        return None
+    # Denylist: junk/memecoin explicitamente excluído (chokepoint único —
+    # cobre live endpoint, server-scan e, por consequência, o auto-trade).
+    if SYMBOL_DENYLIST and _norm_sym(sig.symbol) in SYMBOL_DENYLIST:
         return None
     if sig.risk_reward < MIN_RR:
         return None
@@ -1156,6 +1184,16 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
 
     if not symbols:
         return []
+
+    # Pré-filtro do denylist: descarta junk antes da análise (economia de CPU/HTTP).
+    # A garantia real está no _classify_tier; isto é só otimização.
+    if SYMBOL_DENYLIST:
+        _before = len(symbols)
+        symbols = [s for s in symbols if _norm_sym(s) not in SYMBOL_DENYLIST]
+        if len(symbols) != _before:
+            _log.info(f"[server-scan] denylist removeu {_before - len(symbols)} símbolo(s)")
+        if not symbols:
+            return []
 
     recommendations: List[Recommendation] = []
     sem = asyncio.Semaphore(6)

@@ -68,6 +68,36 @@ LIVE_TRADING_CONFIRM = os.getenv("LIVE_TRADING_CONFIRM", "").strip()
 # pequeno pra esse símbolo).
 LIVE_SIZE_MULT = max(0.0, min(float(os.getenv("LIVE_SIZE_MULT", "1.0")), 1.0))
 
+# ── Filtro de sessão/horário (go-live, opcional) ────────────────────────────
+# Gate de EXECUÇÃO (não esconde recomendações — o painel segue mostrando; só
+# evita o bot AUTO-abrir posição em janelas de horário ruins, ex.: sessão
+# europeia de baixa qualidade ou madrugada ilíquida). CSV de faixas em UTC no
+# formato "hA-hB" (intervalo [hA, hB), com wrap em 24h). Vazio = DESLIGADO.
+# Ex.: "0-6"  → bloqueia 00:00–05:59 UTC; "22-2" → bloqueia 22,23,0,1h UTC.
+# Reversível sem deploy. Default OFF: sem dado provando uma sessão ruim, não
+# corta trades — a infra fica pronta pra ligar quando os dados justificarem.
+def _parse_block_hours(raw: str) -> set:
+    out: set = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part or "-" not in part:
+            continue
+        try:
+            a_s, b_s = part.split("-", 1)
+            a, b = int(a_s) % 24, int(b_s) % 24
+        except Exception:
+            continue
+        h = a
+        guard = 0
+        while h % 24 != b and guard < 24:
+            out.add(h % 24)
+            h += 1
+            guard += 1
+    return out
+
+
+TRADE_BLOCK_HOURS_UTC: set = _parse_block_hours(os.getenv("TRADE_BLOCK_HOURS_UTC", ""))
+
 
 def _exchange_is_production() -> bool:
     """True se a exchange ativa está em modo produção (dinheiro real)."""
@@ -2114,6 +2144,16 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"[shadow→live] BLOCKED {rec['symbol']} {side}: {ks.get('reason')}"
                     )
                     continue
+
+                # 1b. Filtro de sessão/horário (opcional, off por padrão)
+                if TRADE_BLOCK_HOURS_UTC:
+                    _hr = datetime.now(timezone.utc).hour
+                    if _hr in TRADE_BLOCK_HOURS_UTC:
+                        log.info(
+                            f"[shadow→live] BLOCKED {rec['symbol']} {side}: "
+                            f"sessão UTC {_hr}h em janela bloqueada {sorted(TRADE_BLOCK_HOURS_UTC)}"
+                        )
+                        continue
 
                 # 2. Exchange order
                 from services import exchange_service
