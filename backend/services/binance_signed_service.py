@@ -327,6 +327,7 @@ async def place_protection_orders(
     tp2: Optional[float] = None,
     tp1_qty_pct: float = 0.45,
     client_order_id_prefix: Optional[str] = None,
+    dedup_live: bool = False,
 ) -> dict:
     """
     Cria as ordens condicionais (SL + TP1 parcial + TP2 restante) para uma posição
@@ -350,6 +351,43 @@ async def place_protection_orders(
     sym = to_binance(symbol) if "/" in symbol else symbol
     binance_entry_side = entry_side.upper()
     counter_side = "SELL" if binance_entry_side == "BUY" else "BUY"
+
+    # ── Idempotência ao vivo (anti-duplicação) ───────────────────────────────
+    # Quando dedup_live=True, consulta as ordens condicionais JÁ vivas na
+    # corretora e pula qualquer perna que já exista (mesmo type+side+trigger≈).
+    # Mata as 3 fontes de duplicata: (1) corrida confirmação×auto-cura, (2) IDs
+    # diferentes entre caminhos sem dedup nativo, (3) retry que recoloca após
+    # timeout-com-sucesso. NÃO usar na transição pós-TP1 (ela cancela+recoloca
+    # o SL de propósito). Leitura incerta → fail-open (coloca; melhor dup que nu).
+    _existing: list[dict] = []
+    if dedup_live:
+        try:
+            live = await get_open_algo_orders(sym)
+            if live.get("ok"):
+                _existing = live.get("orders") or []
+            else:
+                log.info(
+                    f"[dedup] {sym} leitura de ordens vivas incerta "
+                    f"({live.get('msg') or live.get('error')}) — segue sem dedup"
+                )
+        except Exception as e:
+            log.warning(f"[dedup] {sym} get_open_algo_orders erro: {e} — segue sem dedup")
+
+    def _existing_leg_id(otype: str, trigger: float) -> str | None:
+        """algoId de uma perna viva equivalente (type+side+trigger≈), ou None."""
+        if not trigger or trigger <= 0:
+            return None
+        for o in _existing:
+            if (o.get("type") or "").upper() != otype:
+                continue
+            if (o.get("side") or "").upper() != counter_side:
+                continue
+            ot = o.get("trigger_price") or 0
+            if ot <= 0:
+                continue
+            if abs(ot - trigger) / trigger <= 0.002:  # 0.2% — distingue TP1 de TP2
+                return o.get("algo_id")
+        return None
 
     out = {
         "sl_ok": True, "sl_order_id": None, "sl_msg": None,
@@ -431,6 +469,25 @@ async def place_protection_orders(
                 return False, None, last_msg
             # Erro transitório (rate-limit, timeout, indisponibilidade) → backoff e tenta de novo.
             if attempt < _ALGO_MAX_ATTEMPTS:
+                # Anti-dup do retry: a falha pode ser timeout-COM-sucesso (a ordem
+                # chegou na corretora mas a resposta se perdeu). Antes de recolocar,
+                # confere se a ordem com nosso clientAlgoId já está viva — se sim,
+                # adota e não duplica.
+                if client_order_id_prefix:
+                    want_cid = params.get("clientAlgoId")
+                    try:
+                        chk = await get_open_algo_orders(sym)
+                        if chk.get("ok"):
+                            for o in (chk.get("orders") or []):
+                                if o.get("client_algo_id") == want_cid:
+                                    aid = o.get("algo_id")
+                                    log.info(
+                                        f"[binance] {label.upper()} {sym} já vivo (clientAlgoId={want_cid} "
+                                        f"algoId={aid}) — timeout-com-sucesso, adota sem recolocar"
+                                    )
+                                    return True, aid, None
+                    except Exception as e:
+                        log.warning(f"[binance] {label.upper()} {sym} recheck pré-retry falhou: {e}")
                 delay = _ALGO_RETRY_BASE_DELAY * attempt
                 log.warning(
                     f"[binance] {label.upper()} falha transitória {sym} {otype} "
@@ -446,37 +503,59 @@ async def place_protection_orders(
     # ── SL ───────────────────────────────────────────────────────────────
     if stop_loss is not None:
         sl_price = await _round_price(sym, float(stop_loss))
-        # closePosition=true fecha tudo (sem sobrar poeira). Se a API rejeitar
-        # closePosition no algoOrder, cai pra quantity+reduceOnly (nunca fica
-        # sem stop).
-        ok, oid, msg = await _place_algo("STOP_MARKET", sl_price, qty_total, "sl", close_position=True)
-        if not ok:
-            log.warning(f"[binance] SL closePosition falhou {sym}: {msg} — fallback quantity")
-            ok, oid, msg = await _place_algo("STOP_MARKET", sl_price, qty_total, "sl")
-        out["sl_ok"] = ok
-        out["sl_order_id"] = oid
-        out["sl_msg"] = msg
+        dup_id = _existing_leg_id("STOP_MARKET", sl_price)
+        if dup_id:
+            log.info(f"[dedup] SL {sym} @ {sl_price} já vivo algoId={dup_id} — pula recolocação")
+            out["sl_ok"] = True
+            out["sl_order_id"] = dup_id
+            out["sl_msg"] = "dedup: já existia"
+        else:
+            # closePosition=true fecha tudo (sem sobrar poeira). Se a API rejeitar
+            # closePosition no algoOrder, cai pra quantity+reduceOnly (nunca fica
+            # sem stop).
+            ok, oid, msg = await _place_algo("STOP_MARKET", sl_price, qty_total, "sl", close_position=True)
+            if not ok:
+                log.warning(f"[binance] SL closePosition falhou {sym}: {msg} — fallback quantity")
+                ok, oid, msg = await _place_algo("STOP_MARKET", sl_price, qty_total, "sl")
+            out["sl_ok"] = ok
+            out["sl_order_id"] = oid
+            out["sl_msg"] = msg
 
     # ── TP1 parcial 45% ──────────────────────────────────────────────────
     if has_partial:
         tp1_price = await _round_price(sym, float(tp1))
-        ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp1_price, tp1_qty, "tp1")
-        out["tp1_ok"] = ok
-        out["tp1_order_id"] = oid
-        out["tp1_msg"] = msg
-        out["tp1_qty"] = tp1_qty if ok else 0.0
+        dup_id = _existing_leg_id("TAKE_PROFIT_MARKET", tp1_price)
+        if dup_id:
+            log.info(f"[dedup] TP1 {sym} @ {tp1_price} já vivo algoId={dup_id} — pula recolocação")
+            out["tp1_ok"] = True
+            out["tp1_order_id"] = dup_id
+            out["tp1_msg"] = "dedup: já existia"
+            out["tp1_qty"] = tp1_qty
+        else:
+            ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp1_price, tp1_qty, "tp1")
+            out["tp1_ok"] = ok
+            out["tp1_order_id"] = oid
+            out["tp1_msg"] = msg
+            out["tp1_qty"] = tp1_qty if ok else 0.0
 
     # ── TP2 / TP único — fecha o restante (closePosition, sem poeira) ────
     tp_final = tp2 if tp2 is not None else tp1
     if tp_final is not None:
         tp_price = await _round_price(sym, float(tp_final))
-        ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, qty_remaining, "tp2", close_position=True)
-        if not ok:
-            log.warning(f"[binance] TP2 closePosition falhou {sym}: {msg} — fallback quantity")
-            ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, qty_remaining, "tp2")
-        out["tp2_ok"] = ok
-        out["tp2_order_id"] = oid
-        out["tp2_msg"] = msg
+        dup_id = _existing_leg_id("TAKE_PROFIT_MARKET", tp_price)
+        if dup_id:
+            log.info(f"[dedup] TP2 {sym} @ {tp_price} já vivo algoId={dup_id} — pula recolocação")
+            out["tp2_ok"] = True
+            out["tp2_order_id"] = dup_id
+            out["tp2_msg"] = "dedup: já existia"
+        else:
+            ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, qty_remaining, "tp2", close_position=True)
+            if not ok:
+                log.warning(f"[binance] TP2 closePosition falhou {sym}: {msg} — fallback quantity")
+                ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, qty_remaining, "tp2")
+            out["tp2_ok"] = ok
+            out["tp2_order_id"] = oid
+            out["tp2_msg"] = msg
 
     return out
 

@@ -58,6 +58,10 @@ TIME_STOP_SWING_MIN = int(os.getenv("TIME_STOP_SWING_MIN", "10080"))
 # A cada poll, em pre_tp1, verifica os IDs de proteção no DB e recria as pernas
 # ausentes. SL é a perna crítica (segurança); TPs evitam correr além do alvo.
 PROTECTION_AUTOHEAL_ENABLED = os.getenv("PROTECTION_AUTOHEAL_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Folga (s) pós-criação do trade antes da auto-cura agir: dá tempo da colocação
+# inicial do bracket persistir os IDs no DB, evitando bracket duplicado por
+# corrida confirm-entry × tick. Trabalha junto com dedup_live (rede principal).
+PROTECTION_HEAL_GRACE_SECONDS = float(os.getenv("PROTECTION_HEAL_GRACE_SECONDS", "60"))
 # Verificação ao vivo: além de ID None no DB, confirma na corretora que SL/TP2
 # estão REALMENTE vivos (GET /fapi/v1/openAlgoOrders). Pega a perna cujo ID
 # existe no DB mas sumiu da exchange (cancelada/expirada/disparada por fora sem
@@ -499,6 +503,20 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     if qty_now <= 0 or trade.phase not in ("pre_tp1", "post_tp1"):
         return False
 
+    # ── Grace pós-abertura: não cura trade recém-criado ──────────────────────
+    # A colocação inicial do bracket (confirm-entry / abertura auto) leva alguns
+    # segundos pra colocar as 3 pernas E persistir os IDs no DB. Se o tick rodar
+    # nessa janela, lê sl_order_id=None e dispara auto-cura → bracket duplicado.
+    # Dar uma folga garante que a colocação inicial settle. O dedup_live é a
+    # rede principal; isso é cinto + suspensório.
+    created = trade.created_at or trade.opened_at
+    if created is not None:
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(timezone.utc) - created).total_seconds()
+        if age_s < PROTECTION_HEAL_GRACE_SECONDS:
+            return False
+
     is_post = trade.phase == "post_tp1"
     # SL: em pre_tp1 protege no stop original; em post_tp1 protege no breakeven
     # (sl_current_price setado pela transição, com fallback no entry).
@@ -576,6 +594,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
                 sym, entry_side, qty=qty_now,
                 stop_loss=sl_price, tp1=None, tp2=None,
                 client_order_id_prefix=f"cw-heal-sl-{trade.id}",
+                dedup_live=True,
             )
             if r.get("sl_ok") and r.get("sl_order_id"):
                 new_sl_id = r.get("sl_order_id")
@@ -600,6 +619,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
                 sym, entry_side, qty=qty_tp2,
                 stop_loss=None, tp1=None, tp2=trade.planned_tp2,
                 client_order_id_prefix=f"cw-heal-tp2-{trade.id}",
+                dedup_live=True,
             )
             if r.get("tp2_ok") and r.get("tp2_order_id"):
                 new_tp2_id = r.get("tp2_order_id")
@@ -618,6 +638,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
                 sym, entry_side, qty=qty_tp1,
                 stop_loss=None, tp1=None, tp2=trade.planned_tp1,
                 client_order_id_prefix=f"cw-heal-tp1-{trade.id}",
+                dedup_live=True,
             )
             if r.get("tp2_ok") and r.get("tp2_order_id"):
                 new_tp1_id = r.get("tp2_order_id")  # placed via tp_final → vem em tp2_order_id
@@ -1025,6 +1046,7 @@ async def backfill_protection(force: bool = False) -> dict:
                 tp1=tp1_arg,
                 tp2=tp2_arg,
                 client_order_id_prefix=f"cw-bf-{t.id}",
+                dedup_live=True,
             )
         except Exception as e:
             results.append({"trade_id": t.id, "symbol": t.symbol, "error": str(e)})

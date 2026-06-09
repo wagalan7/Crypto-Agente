@@ -1781,6 +1781,63 @@ async def admin_resolve_snapshot(req: ResolveSnapshotRequest):
         }
 
 
+class DedupProtectionRequest(BaseModel):
+    symbol: str
+    dry_run: bool = True   # default seguro: só lista o que cancelaria
+
+
+@app.post("/api/admin/protection/dedup")
+async def admin_dedup_protection(req: DedupProtectionRequest):
+    """
+    Cancela ordens condicionais DUPLICADAS de um símbolo, mantendo 1 por perna
+    (agrupa por type+side+triggerPrice≈). Limpa posições que ficaram com bracket
+    em duplicata. dry_run=True (default) só reporta; dry_run=False cancela.
+    """
+    from services import binance_signed_service
+    live = await binance_signed_service.get_open_algo_orders(req.symbol)
+    if not live.get("ok"):
+        return {"ok": False, "error": live.get("msg") or live.get("error")}
+    orders = live.get("orders") or []
+
+    # Agrupa por (type, side, trigger arredondado a 4 casas relativas)
+    buckets: dict[tuple, list[dict]] = {}
+    for o in orders:
+        key = (
+            (o.get("type") or "").upper(),
+            (o.get("side") or "").upper(),
+            round(float(o.get("trigger_price") or 0), 8),
+        )
+        buckets.setdefault(key, []).append(o)
+
+    kept: list[dict] = []
+    to_cancel: list[dict] = []
+    for key, group in buckets.items():
+        # mantém o primeiro (mais antigo na listagem), cancela o resto
+        kept.append({"type": key[0], "side": key[1], "trigger": key[2], "algo_id": group[0].get("algo_id")})
+        for dup in group[1:]:
+            to_cancel.append({"type": key[0], "side": key[1], "trigger": key[2], "algo_id": dup.get("algo_id")})
+
+    cancelled: list[dict] = []
+    if not req.dry_run:
+        for d in to_cancel:
+            try:
+                r = await binance_signed_service.cancel_algo_order(d["algo_id"])
+                cancelled.append({**d, "ok": bool(r.get("ok")), "msg": r.get("msg") or r.get("error")})
+            except Exception as e:
+                cancelled.append({**d, "ok": False, "msg": str(e)})
+
+    return {
+        "ok": True,
+        "symbol": req.symbol,
+        "dry_run": req.dry_run,
+        "total_live": len(orders),
+        "legs_kept": kept,
+        "duplicates_found": len(to_cancel),
+        "duplicates": to_cancel,
+        "cancelled": cancelled,
+    }
+
+
 @app.get("/api/portfolio/exposure")
 async def portfolio_exposure():
     """
@@ -2003,6 +2060,7 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
                 req.symbol, entry_side, qty=qty,
                 stop_loss=sl_lvl, tp1=tp1_lvl, tp2=tp2_lvl,
                 client_order_id_prefix=f"cw-managed-{trade_id}",
+                dedup_live=True,  # anti-dup: pula perna que já exista viva
             )
             async with get_session() as session:
                 fresh = (await session.execute(
