@@ -30,6 +30,13 @@ VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "")
 VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:admin@crypto-agente.app")
 PUSH_ENABLED = bool(VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY and DB_ENABLED)
 
+# Gate GLOBAL de tier para push (recs novas + outcomes).
+# Por padrão NÃO envia push de tier B — só A e A+ (usuário pediu menos ruído).
+# Sobrepõe o filtro por-subscription (notify_b): mesmo com notify_b=True no device,
+# tier B não dispara enquanto este gate estiver desligado.
+# Reversível: setar PUSH_TIER_B_ENABLED=true no Railway re-habilita push de B.
+PUSH_TIER_B_ENABLED = os.getenv("PUSH_TIER_B_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+
 if PUSH_ENABLED:
     try:
         from pywebpush import webpush, WebPushException  # type: ignore
@@ -153,6 +160,8 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
     tier = rec.get("tier", "")
     if tier not in ("A+", "A", "B"):
         return 0
+    if tier == "B" and not PUSH_TIER_B_ENABLED:
+        return 0  # gate global: tier B não dispara push
 
     # Filtro: quais subs querem esse tier?
     field_map = {"A+": "notify_a_plus", "A": "notify_a", "B": "notify_b"}
@@ -280,6 +289,8 @@ async def notify_outcome(snap, event: str) -> int:
     tier = getattr(snap, "tier", "") or ""
     if tier not in ("A+", "A", "B"):
         return 0
+    if tier == "B" and not PUSH_TIER_B_ENABLED:
+        return 0  # gate global: tier B não dispara push (nem outcomes)
 
     field_map = {"A+": "notify_a_plus", "A": "notify_a", "B": "notify_b"}
     filter_field = field_map[tier]
