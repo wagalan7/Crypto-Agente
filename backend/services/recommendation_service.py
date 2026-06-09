@@ -18,6 +18,7 @@ Cache: 30s.
 """
 from __future__ import annotations
 import asyncio
+import os
 import time
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
@@ -35,6 +36,37 @@ SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
 CACHE_TTL = 15                    # segundos (era 30 — push do scan tava com delay, agora mais fresco)
 MIN_RR = 1.5                      # filtro mínimo absoluto
 MIN_CONFIDENCE_B = 0.55           # tier B mínimo
+
+# ── Gate por timeframe × tier ────────────────────────────────────────────
+# Corta setups de baixa qualidade nos TFs mais ruidosos pra reduzir stops.
+# Histórico (441 trades): 4h ~93% WR, 1h ~72%, 15m ~73% — mas o 15m é 58% do
+# volume e concentra a maioria dos stops (scalp = stop apertado = whipsaw).
+# Aqui exigimos um tier MÍNIMO por TF: 15m só passa se A+; 1h só A/A+; 4h
+# aceita todos (confiável até em B). Config via env CSV "tf:tier", reversível
+# sem deploy. TFs ausentes do mapa = sem restrição. TF_TIER_GATE_ENABLED=0
+# desliga o gate inteiro.
+TF_TIER_GATE_ENABLED = os.getenv("TF_TIER_GATE_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+_TIER_RANK = {"B": 0, "A": 1, "A+": 2}
+
+
+def _parse_tf_min_tier(raw: str) -> Dict[str, int]:
+    """Parseia "15m:A+,1h:A,4h:B" → {"15m": 2, "1h": 1, "4h": 0}. Ignora lixo."""
+    out: Dict[str, int] = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        tf, tier = part.split(":", 1)
+        tf = tf.strip()
+        tier = tier.strip().upper()
+        if tf and tier in _TIER_RANK:
+            out[tf] = _TIER_RANK[tier]
+    return out
+
+
+TF_MIN_TIER: Dict[str, int] = _parse_tf_min_tier(
+    os.getenv("TF_MIN_TIER", "15m:A+,1h:A,4h:B")
+)
 
 
 class Recommendation(BaseModel):
@@ -413,6 +445,14 @@ def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
         if idx >= len(tier_order):
             return None  # nem B sobrevive → rejeita
         tier = tier_order[idx]
+
+    # Gate TF × tier: exige tier mínimo conforme a confiabilidade do TF.
+    # Ex.: scalp 15m só publica se A+; 1h só A/A+; 4h aceita todos. Corta o
+    # grosso dos stops sem mexer no SL (que já é estrutural).
+    if TF_TIER_GATE_ENABLED and tier is not None:
+        min_rank = TF_MIN_TIER.get(sig.timeframe)
+        if min_rank is not None and _TIER_RANK.get(tier, 0) < min_rank:
+            return None
 
     return tier
 
