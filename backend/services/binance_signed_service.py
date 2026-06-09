@@ -152,9 +152,18 @@ async def _signed_request(method: str, path: str, params: Optional[dict] = None)
             data = r.json()
         except Exception:
             return {"ok": False, "error": f"resposta não-JSON ({r.status_code}): {r.text[:200]}"}
-        if r.status_code >= 400 or (isinstance(data, dict) and data.get("code") and data.get("code") < 0):
+        # `code` pode vir int (Futures clássico: -2011) OU string (endpoints
+        # algoOrder: "000000"=sucesso). Coage com segurança — só erro se < 0.
+        _raw_code = data.get("code") if isinstance(data, dict) else None
+        _code_int: Optional[int] = None
+        if _raw_code is not None:
+            try:
+                _code_int = int(_raw_code)
+            except (ValueError, TypeError):
+                _code_int = None
+        if r.status_code >= 400 or (_code_int is not None and _code_int < 0):
             log.warning(f"[binance] {method} {path} status={r.status_code} resp={data}")
-            return {"ok": False, "code": data.get("code") if isinstance(data, dict) else r.status_code,
+            return {"ok": False, "code": _raw_code if _raw_code is not None else r.status_code,
                     "msg": data.get("msg") if isinstance(data, dict) else r.text, "raw": data}
         return {"ok": True, "result": data, "raw": data}
     except Exception as e:
