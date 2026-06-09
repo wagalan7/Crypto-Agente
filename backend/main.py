@@ -1971,6 +1971,45 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
     """
     from services import real_trade_service
 
+    # 0. Idempotência: se já existe um trade gerenciado ABERTO pro mesmo
+    #    símbolo+lado, NÃO cria duplicado — retorna o existente. Protege contra
+    #    double-click no painel e retry-on-500 (o bot modela 1 posição por
+    #    symbol+side, igual ao dedupe-open-trades). Best-effort: se a checagem
+    #    falhar, segue o fluxo normal de criação.
+    try:
+        from db import get_session, DB_ENABLED
+        if DB_ENABLED:
+            from sqlalchemy import select, desc
+            from models.real_trade import RealTrade
+            async with get_session() as session:
+                existing = (await session.execute(
+                    select(RealTrade)
+                    .where(RealTrade.symbol == req.symbol)
+                    .where(RealTrade.side == req.side)
+                    .where(RealTrade.status == "open")
+                    .where(RealTrade.source == "managed")
+                    .order_by(desc(RealTrade.opened_at))
+                    .limit(1)
+                )).scalar_one_or_none()
+                if existing is not None:
+                    from services.real_trade_service import _to_dict
+                    log.info(
+                        f"[confirm-entry] idempotente: trade #{existing.id} já "
+                        f"aberto p/ {req.symbol} {req.side}; retorna existente"
+                    )
+                    return {
+                        **(_to_dict(existing) or {}),
+                        "idempotent": True,
+                        "qty_source": "existente",
+                        "linked_recommendation_id": existing.recommendation_id,
+                        "protection": {
+                            "placed": bool(existing.sl_order_id),
+                            "note": "trade gerenciado já existente — não duplicado",
+                        },
+                    }
+    except Exception as e:
+        log.warning(f"[confirm-entry] checagem de idempotência falhou: {e}")
+
     # 1. Resolve o snapshot da rec (atribuição/tier/slippage) — best effort.
     rec_id = req.recommendation_id
     if rec_id is None:
