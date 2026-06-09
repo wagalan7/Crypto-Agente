@@ -387,8 +387,8 @@ async def notify_trade_open(trade: Dict[str, Any]) -> int:
         return 0
 
     source = (trade.get("source") or "").lower()
-    if source not in ("auto", "shadow"):
-        return 0  # ignora trades manuais
+    if source not in ("auto", "shadow", "managed"):
+        return 0  # ignora trades manuais (advise-only)
 
     async with get_session() as session:
         stmt = select(PushSubscription).where(PushSubscription.active.is_(True))
@@ -411,6 +411,9 @@ async def notify_trade_open(trade: Dict[str, Any]) -> int:
     if source == "auto":
         emoji = "💵"
         prefix = "EXECUTADO"
+    elif source == "managed":
+        emoji = "🤝"
+        prefix = "GERENCIADO"
     else:
         emoji = "👻"
         prefix = "SHADOW"

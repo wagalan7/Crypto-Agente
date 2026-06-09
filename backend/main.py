@@ -2093,6 +2093,42 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
     else:
         protection = {"placed": False, "error": "sem planned_stop — bracket não criado"}
 
+    # 5. Notifica abertura do trade gerenciado (Telegram + push). O caminho
+    #    auto/shadow já notifica em shadow_trade_service; o managed (confirmado
+    #    do painel) não tinha notificação — adicionado aqui. Best-effort: no-op
+    #    silencioso se Telegram/push não estiverem configurados; falha não
+    #    derruba a resposta.
+    try:
+        from services.notification_service import send_telegram, fmt_trade_opened
+        _notify_trade = {
+            **result,
+            "planned_stop": sl_lvl,
+            "planned_tp1": tp1_lvl,
+            "planned_tp2": tp2_lvl,
+            "qty": qty,
+        }
+        _notify_rec = {"timeframe": req.timeframe or result.get("timeframe") or "?"}
+        _bracket = "✅ bracket colocado" if protection.get("placed") else "⚠️ sem bracket (SL pendente)"
+        await send_telegram(
+            fmt_trade_opened(_notify_trade, _notify_rec)
+            + f"\n_Gerenciado · {_bracket}_",
+            event_type="open_managed",
+        )
+    except Exception as e:
+        log.warning(f"[confirm-entry] telegram open falhou: {e}")
+    try:
+        from services import push_service
+        await push_service.notify_trade_open({
+            **result,
+            "planned_stop": sl_lvl,
+            "planned_tp1": tp1_lvl,
+            "planned_tp2": tp2_lvl,
+            "qty": qty,
+            "source": "managed",
+        })
+    except Exception as e:
+        log.warning(f"[confirm-entry] push open falhou: {e}")
+
     return {
         **result,
         "qty_source": qty_source,
