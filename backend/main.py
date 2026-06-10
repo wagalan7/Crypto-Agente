@@ -703,7 +703,7 @@ async def recommendations(top_n: int = 30):
     Servido a partir do cache do último scan (loop a cada 90s); fallback faz um
     scan próprio se o cache estiver frio."""
     try:
-        recs = await get_recommendations_cached_for_api(top_n=min(max(top_n, 5), 60))
+        recs = await get_recommendations_cached_for_api(top_n=min(max(top_n, 5), 300))
         return {"count": len(recs), "recommendations": [r.model_dump() for r in recs]}
     except Exception as e:
         logging.error(f"recommendations error: {e}\n{traceback.format_exc()}")

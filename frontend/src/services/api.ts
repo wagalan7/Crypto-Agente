@@ -3,6 +3,14 @@ import type { TradeSignal, OHLCVCandle, Ticker, WatchlistItem, Recommendation, R
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
 const BASE = `${BACKEND}/api`
 
+// Ambiente de TESTES (champion/challenger) — fonte das recs de OBSERVAÇÃO.
+// Universo amplo (perpétuos), shadow, DB próprio. Mantido SEPARADO do PRD de
+// propósito: o bot real (sexta) opera só as 60 do PRD; aqui é só pra analisar.
+// Override via VITE_OBSERVATION_API_URL. '' desliga (painel mostra só o bot).
+const OBSERVATION_BACKEND =
+  import.meta.env.VITE_OBSERVATION_API_URL ??
+  'https://crypto-agente-production-c6c4.up.railway.app'
+
 // Binance Futures public API — requests come from the user's browser IP, no geo-blocking
 const BINANCE_FAPI = 'https://fapi.binance.com/fapi/v1'
 const BINANCE_INTERVAL: Record<string, string> = {
@@ -209,6 +217,23 @@ export const api = {
 
   recommendations: (topN = 30) =>
     get<{ count: number; recommendations: Recommendation[] }>('/recommendations', { top_n: topN }),
+
+  // Recomendações de OBSERVAÇÃO — vêm do ambiente de TESTES (universo amplo,
+  // shadow, DB separado). O bot NÃO opera essas; são só pro usuário analisar/
+  // aprender (TradingView). Fonte desacoplada do PRD de propósito: o caminho de
+  // execução real (sexta) fica congelado em 60. Falha graciosamente (retorna []).
+  recommendationsObservation: async (topN = 300): Promise<Recommendation[]> => {
+    if (!OBSERVATION_BACKEND) return []
+    try {
+      const url = `${OBSERVATION_BACKEND}/api/recommendations?top_n=${topN}`
+      const res = await fetch(url, { signal: AbortSignal.timeout(12000) })
+      if (!res.ok) return []
+      const json = (await res.json()) as { recommendations?: Recommendation[] }
+      return json.recommendations ?? []
+    } catch {
+      return []  // ambiente de testes fora do ar → painel mostra só as do bot
+    }
+  },
 
   recommendationsBatch: (items: { symbol: string; timeframe: string; candles: OHLCVCandle[] }[]) =>
     post<{ count: number; recommendations: Recommendation[] }>('/recommendations-batch', { items }),

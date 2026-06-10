@@ -297,6 +297,10 @@ export interface Recommendation {
     resolved_at: string | null
     entry: number
   } | null
+  // Marcador de origem (client-side): 'bot' = o bot opera essa rec (vem do PRD,
+  // top-60 que ele realmente executa) · 'observation' = só observável (vem do
+  // ambiente de testes, universo amplo) — pro usuário analisar no TradingView.
+  origin?: 'bot' | 'observation'
 }
 
 // Operação real/manual em aberto ou fechada (backend RealTrade). Espelha o

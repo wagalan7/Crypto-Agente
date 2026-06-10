@@ -94,6 +94,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
   const [error, setError] = useState<string | null>(null)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
   const [filter, setFilter] = useState<RecommendationTier | 'all'>('all')
+  const [originFilter, setOriginFilter] = useState<'all' | 'bot' | 'observation'>('all')
   const [progress, setProgress] = useState<string>('')
   const [historical, setHistorical] = useState<Record<string, HistoricalStat>>({})
   const [probs, setProbs] = useState<Record<string, { p_tp1_pct: number; p_tp2_pct: number; n_total: number; confidence: string }>>({})
@@ -143,18 +144,36 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
     setError(null)
     setProgress('Carregando recomendações…')
     try {
-      // O backend (scan loop server-side, fonte Binance) já varre os perpétuos,
-      // classifica em tiers e abre os shadow/auto-trades. O app lê EXATAMENTE
-      // essas recs — mesma fonte que o bot opera. Sem chamadas Bybit do celular
-      // (eliminamos o "Load failed" e a inconsistência app≠bot).
-      const res = await api.recommendations(60)
-      setRecs(res.recommendations)
+      // Duas fontes, de propósito desacopladas:
+      //  • PRD (api.recommendations) → as recs que o BOT realmente opera (top-60
+      //    que ele executa na sexta). Marcadas 🤖 BOT OPERA.
+      //  • TESTES (api.recommendationsObservation) → universo amplo de perpétuos,
+      //    shadow, DB separado. O bot NÃO opera; são pro usuário analisar no
+      //    TradingView. Marcadas 👁 OBSERVAÇÃO. Falha graciosa (se testes cair,
+      //    o painel ainda mostra as do bot).
+      const [botRes, obsRecs] = await Promise.all([
+        api.recommendations(60),
+        api.recommendationsObservation(300),
+      ])
+
+      const botRecs: Recommendation[] = botRes.recommendations.map(r => ({ ...r, origin: 'bot' as const }))
+      // Chave de dedupe: símbolo base + timeframe + direção. Se a mesma rec
+      // aparece nas duas fontes, a do BOT vence (é a que ele opera de fato).
+      const botKeys = new Set(botRecs.map(r => `${symbolBase(r.symbol)}_${r.timeframe}_${r.direction}`))
+      const obsOnly: Recommendation[] = obsRecs
+        .filter(r => !botKeys.has(`${symbolBase(r.symbol)}_${r.timeframe}_${r.direction}`))
+        .map(r => ({ ...r, origin: 'observation' as const }))
+
+      // Bot primeiro, depois observação. Dentro de cada grupo a ordenação
+      // original (tier+score) é preservada.
+      const merged = [...botRecs, ...obsOnly]
+      setRecs(merged)
       setLastUpdate(new Date())
       setProgress('')
 
       // Busca histórico (não bloqueia UI se falhar)
       try {
-        const lookupItems = res.recommendations.map(r => ({
+        const lookupItems = merged.map(r => ({
           tier: r.tier, timeframe: r.timeframe, direction: r.direction,
         }))
         if (lookupItems.length > 0) {
@@ -193,7 +212,13 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
     'A':  recs.filter(r => r.tier === 'A').length,
     'B':  recs.filter(r => r.tier === 'B').length,
   }
-  const filtered = filter === 'all' ? recs : recs.filter(r => r.tier === filter)
+  const originCounts = {
+    bot: recs.filter(r => r.origin === 'bot').length,
+    observation: recs.filter(r => r.origin === 'observation').length,
+  }
+  const byTier = filter === 'all' ? recs : recs.filter(r => r.tier === filter)
+  const filtered =
+    originFilter === 'all' ? byTier : byTier.filter(r => (r.origin ?? 'bot') === originFilter)
 
   // Quando chega foco via push, scrolla até o card e destaca por ~3s.
   // Roda quando focus muda OU quando as recs carregam (ordem indefinida entre os dois).
@@ -390,6 +415,36 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
           )}
         </div>
 
+        {/* Origem: o que o BOT opera vs só OBSERVAÇÃO (pro usuário analisar) */}
+        <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-800 overflow-x-auto">
+          {([
+            { key: 'all', label: 'Tudo', count: recs.length },
+            { key: 'bot', label: '🤖 Bot opera', count: originCounts.bot },
+            { key: 'observation', label: '👁 Observação', count: originCounts.observation },
+          ] as const).map(opt => {
+            const active = originFilter === opt.key
+            const activeCls =
+              opt.key === 'bot' ? 'bg-emerald-500/15 border-emerald-400/50 text-emerald-300'
+              : opt.key === 'observation' ? 'bg-sky-500/15 border-sky-400/50 text-sky-300'
+              : 'bg-white/10 border-white/30 text-white'
+            return (
+              <button
+                key={opt.key}
+                onClick={() => setOriginFilter(opt.key)}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs font-semibold whitespace-nowrap transition-colors ${
+                  active ? activeCls : 'bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <span>{opt.label}</span>
+                <span className="text-slate-500">({opt.count})</span>
+              </button>
+            )
+          })}
+          <span className="ml-auto text-[10px] text-slate-500 whitespace-nowrap hidden sm:inline">
+            🤖 = o bot opera · 👁 = só pra você analisar (TradingView)
+          </span>
+        </div>
+
         {/* Lista */}
         <div className="flex-1 overflow-y-auto">
           {loading && recs.length === 0 && (
@@ -427,6 +482,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
               const histKey = `${r.tier}_${r.timeframe}_${r.direction}`
               const hist = historical[histKey]
               const rkey = `${r.symbol}-${r.timeframe}`
+              const isObs = r.origin === 'observation'
               return (
                 <div key={rkey} className="flex flex-col">
                 <button
@@ -436,7 +492,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                     highlightKey === rkey
                       ? 'ring-2 ring-amber-400/80 shadow-lg shadow-amber-400/30 animate-pulse'
                       : ''
-                  }`}
+                  } ${isObs ? 'opacity-90' : ''}`}
                 >
                   <div className="flex items-center gap-3">
                     {/* Tier badge */}
@@ -447,6 +503,19 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                     {/* Symbol + direction + op type */}
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
+                        {/* Origem: 🤖 o bot opera · 👁 só observação (analisar) */}
+                        <span
+                          title={isObs
+                            ? 'OBSERVAÇÃO — o bot NÃO opera essa. Vem do ambiente de testes (universo amplo). Use pra analisar no TradingView e aprender.'
+                            : 'BOT OPERA — está no universo que o bot executa de verdade.'}
+                          className={`px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${
+                            isObs
+                              ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
+                              : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                          }`}
+                        >
+                          {isObs ? '👁 OBSERVAÇÃO' : '🤖 BOT OPERA'}
+                        </span>
                         <span className="text-sm font-bold text-white">{symbolBase(r.symbol)}</span>
                         <span className="text-[10px] text-slate-500 font-mono">{r.timeframe}</span>
                         <DirIcon className={`w-3.5 h-3.5 ${dirColor}`} />
