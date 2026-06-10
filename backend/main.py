@@ -95,6 +95,12 @@ SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3m
 SERVER_SCAN_TOP_N = 40            # quantos símbolos varrer (Vision spot — universo maior compensa filtros)
 SERVER_SCAN_INITIAL_DELAY = 45    # espera 45s após startup pra não competir com init
 
+# Intervalo de checagem de snapshots abertos (detecção de TP1/TP2/SL → push).
+# Era 300s (5min) — esse era o MAIOR atraso percebido nos pushes de saída: o
+# preço batia o alvo e a notificação só saía no próximo ciclo. 90s entrega o
+# push de TP/SL em ~1.5min. Reversível via env sem deploy (SNAPSHOT_CHECK_INTERVAL_SEC).
+SNAPSHOT_CHECK_INTERVAL = int(os.getenv("SNAPSHOT_CHECK_INTERVAL_SEC", "90"))
+
 # ── Métricas operacionais (lidas via /api/health) ────────────────────────────
 _METRICS: Dict[str, Any] = {
     "startup_at": datetime.now(timezone.utc).isoformat(),
@@ -123,10 +129,10 @@ RECALIBRATION_ENABLED = os.getenv("RECALIBRATION_AUTO_ENABLED", "true").strip().
 
 
 async def _snapshot_loop():
-    """Roda check_open_snapshots a cada 5 minutos."""
+    """Roda check_open_snapshots a cada SNAPSHOT_CHECK_INTERVAL segundos (default 90s)."""
     while True:
         try:
-            await asyncio.sleep(300)
+            await asyncio.sleep(SNAPSHOT_CHECK_INTERVAL)
             await check_open_snapshots()
             _METRICS["last_snapshot_check_at"] = datetime.now(timezone.utc).isoformat()
         except asyncio.CancelledError:

@@ -122,6 +122,52 @@ async def _send_one(sub: PushSubscription, payload: Dict[str, Any]) -> bool:
         raise
 
 
+async def _fanout_push(subs: List[PushSubscription], payload: Dict[str, Any]) -> int:
+    """
+    Envia `payload` para todas as subscriptions EM PARALELO (asyncio.gather).
+    Antes os envios eram sequenciais — com vários devices isso somava latência.
+
+    Trata por subscription:
+      - True  → sucesso (conta)
+      - False → expirou (410/404) → desativa
+      - Exception → erro transitório → incrementa fail_count
+
+    Retorna quantos envios bem-sucedidos.
+    """
+    if not subs:
+        return 0
+    results = await asyncio.gather(
+        *[_send_one(sub, payload) for sub in subs],
+        return_exceptions=True,
+    )
+    sent = 0
+    to_deactivate: List[int] = []
+    fail_ids: List[int] = []
+    for sub, res in zip(subs, results):
+        if isinstance(res, Exception):
+            fail_ids.append(sub.id)
+        elif res is True:
+            sent += 1
+        else:  # False → subscription morta (410/404)
+            to_deactivate.append(sub.id)
+
+    if to_deactivate:
+        async with get_session() as session:
+            await session.execute(
+                update(PushSubscription).where(PushSubscription.id.in_(to_deactivate))
+                .values(active=False)
+            )
+            await session.commit()
+    if fail_ids:
+        async with get_session() as session:
+            await session.execute(
+                update(PushSubscription).where(PushSubscription.id.in_(fail_ids))
+                .values(fail_count=PushSubscription.fail_count + 1)
+            )
+            await session.commit()
+    return sent
+
+
 def _sync_push(sub: PushSubscription, payload: Dict[str, Any]):
     """
     TTL: tempo máximo que o push provider (FCM/APNs/Mozilla) guarda a mensagem
@@ -203,33 +249,7 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
         },
     }
 
-    sent = 0
-    to_deactivate: List[int] = []
-    for sub in subs:
-        try:
-            ok = await _send_one(sub, payload)
-            if ok:
-                sent += 1
-            else:
-                to_deactivate.append(sub.id)
-        except Exception:
-            # Erro transitório — incrementa fail_count
-            async with get_session() as s2:
-                await s2.execute(
-                    update(PushSubscription).where(PushSubscription.id == sub.id)
-                    .values(fail_count=sub.fail_count + 1)
-                )
-                await s2.commit()
-
-    # Desativa subscriptions mortas
-    if to_deactivate:
-        async with get_session() as session:
-            await session.execute(
-                update(PushSubscription).where(PushSubscription.id.in_(to_deactivate))
-                .values(active=False)
-            )
-            await session.commit()
-
+    sent = await _fanout_push(subs, payload)
     if sent:
         log.info(f"Push enviado pra {sent} device(s) — {tier} {symbol_short}")
     return sent
@@ -343,31 +363,7 @@ async def notify_outcome(snap, event: str) -> int:
         },
     }
 
-    sent = 0
-    to_deactivate: List[int] = []
-    for sub in subs:
-        try:
-            ok = await _send_one(sub, payload)
-            if ok:
-                sent += 1
-            else:
-                to_deactivate.append(sub.id)
-        except Exception:
-            async with get_session() as s2:
-                await s2.execute(
-                    update(PushSubscription).where(PushSubscription.id == sub.id)
-                    .values(fail_count=sub.fail_count + 1)
-                )
-                await s2.commit()
-
-    if to_deactivate:
-        async with get_session() as session:
-            await session.execute(
-                update(PushSubscription).where(PushSubscription.id.in_(to_deactivate))
-                .values(active=False)
-            )
-            await session.commit()
-
+    sent = await _fanout_push(subs, payload)
     if sent:
         log.info(f"Push outcome ({event}) enviado pra {sent} device(s) — {tier} {symbol_short}")
     return sent
@@ -443,31 +439,7 @@ async def notify_trade_open(trade: Dict[str, Any]) -> int:
         },
     }
 
-    sent = 0
-    to_deactivate: List[int] = []
-    for sub in subs:
-        try:
-            ok = await _send_one(sub, payload)
-            if ok:
-                sent += 1
-            else:
-                to_deactivate.append(sub.id)
-        except Exception:
-            async with get_session() as s2:
-                await s2.execute(
-                    update(PushSubscription).where(PushSubscription.id == sub.id)
-                    .values(fail_count=sub.fail_count + 1)
-                )
-                await s2.commit()
-
-    if to_deactivate:
-        async with get_session() as session:
-            await session.execute(
-                update(PushSubscription).where(PushSubscription.id.in_(to_deactivate))
-                .values(active=False)
-            )
-            await session.commit()
-
+    sent = await _fanout_push(subs, payload)
     if sent:
         log.info(f"Push trade-open ({source}) enviado pra {sent} device(s) — {symbol_short} {side}")
     return sent
