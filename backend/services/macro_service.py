@@ -3,10 +3,16 @@ Contexto macro: BTC dominance + DXY + S&P500 + Nasdaq via yfinance.
 """
 from __future__ import annotations
 import asyncio
+import time
 import httpx
 from typing import Optional
 
 _http: Optional[httpx.AsyncClient] = None
+
+# Cache dos totais (TOTAL/TOTAL2/TOTAL3 + dominâncias). O /global muda devagar
+# e o CoinGecko free tem rate limit baixo → cache de 10min.
+_totals_cache: dict = {"ts": 0.0, "data": None}
+_TOTALS_TTL = 600.0
 
 
 def _get_http() -> httpx.AsyncClient:
@@ -25,6 +31,46 @@ async def get_btc_dominance() -> Optional[float]:
         return round(float(pct), 2) if pct else None
     except Exception:
         return None
+
+
+async def get_crypto_totals() -> dict:
+    """
+    Capitalização total do mercado cripto + dominâncias, via CoinGecko /global
+    (a MESMA chamada do get_btc_dominance — aqui só extraímos mais campos).
+
+    Retorna (USD):
+      total_usd   = TOTAL  (cap. total do mercado)
+      total2_usd  = TOTAL2 (exclui BTC)        = TOTAL × (1 − BTC.D)
+      total3_usd  = TOTAL3 (exclui BTC e ETH)  = TOTAL × (1 − BTC.D − ETH.D)
+      btc_dominance / eth_dominance / usdt_dominance (em %)
+
+    Cache 10min. Fail-soft: retorna {} se a API falhar (não quebra o caller).
+    """
+    now = time.time()
+    if _totals_cache["data"] is not None and (now - _totals_cache["ts"]) < _TOTALS_TTL:
+        return _totals_cache["data"]
+    try:
+        r = await _get_http().get("https://api.coingecko.com/api/v3/global")
+        r.raise_for_status()
+        d = r.json()["data"]
+        total = float(d["total_market_cap"]["usd"])
+        mcp = d.get("market_cap_percentage", {}) or {}
+        btc_d = float(mcp.get("btc") or 0.0)
+        eth_d = float(mcp.get("eth") or 0.0)
+        usdt_d = float(mcp.get("usdt") or 0.0)
+        out = {
+            "total_usd": total,
+            "total2_usd": total * (1.0 - btc_d / 100.0),
+            "total3_usd": total * (1.0 - (btc_d + eth_d) / 100.0),
+            "btc_dominance": round(btc_d, 2),
+            "eth_dominance": round(eth_d, 2),
+            "usdt_dominance": round(usdt_d, 2),
+        }
+        _totals_cache["data"] = out
+        _totals_cache["ts"] = now
+        return out
+    except Exception:
+        return {}
 
 
 async def get_global_market_data() -> dict:
@@ -99,6 +145,32 @@ def build_macro_context(
             lines.append("→ Alta dominância: BTC favorecido sobre altcoins.")
         elif btc_dominance < 45:
             lines.append("→ Baixa dominância: possível rotação para altcoins.")
+
+    # Capitalização total do mercado (TOTAL / TOTAL2 / TOTAL3) + USDT.D
+    total = md.get("total_usd")
+    if total:
+        def _t(v) -> str:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return "?"
+            if v >= 1e12:
+                return f"${v / 1e12:.2f}T"
+            if v >= 1e9:
+                return f"${v / 1e9:.1f}B"
+            return f"${v:,.0f}"
+        lines.append(f"Cap. Total (TOTAL): {_t(total)}")
+        if md.get("total2_usd"):
+            lines.append(f"Cap. Alts ex-BTC (TOTAL2): {_t(md['total2_usd'])}")
+        if md.get("total3_usd"):
+            lines.append(f"Cap. Alts ex-BTC/ETH (TOTAL3): {_t(md['total3_usd'])}")
+        usdt_d = md.get("usdt_dominance")
+        if usdt_d:
+            lines.append(f"Dominância USDT (USDT.D): {usdt_d:.2f}%")
+            if usdt_d > 5.0:
+                lines.append("→ USDT.D elevada: capital parado em stablecoin (risk-off / medo).")
+            elif usdt_d < 3.5:
+                lines.append("→ USDT.D baixa: capital alocado em risco (risk-on).")
 
     # DXY
     dxy = md.get("dxy")

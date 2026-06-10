@@ -58,7 +58,7 @@ from services.ai_service import generate_ai_analysis
 from services.derivatives_service import analyze_derivatives
 from services.mtf_service import analyze_mtf
 from services.trade_service import get_trades, save_trades
-from services.macro_service import get_btc_dominance, build_macro_context, get_global_market_data
+from services.macro_service import get_btc_dominance, build_macro_context, get_global_market_data, get_crypto_totals
 from services.recommendation_service import (
     get_recommendations,
     get_recommendations_from_batch,
@@ -602,15 +602,19 @@ async def analyze_data(body: AnalyzeDataRequest):
 async def macro_context(symbol: str = "BTC/USDT:USDT"):
     """Retorna contexto macro: BTC + dominância + DXY + S&P500 + Nasdaq."""
     try:
-        btc_dominance, btc_df, market_data = await asyncio.gather(
+        btc_dominance, btc_df, market_data, crypto_totals = await asyncio.gather(
             get_btc_dominance(),
             fetch_ohlcv("BTC/USDT:USDT", "1d", 100),
             get_global_market_data(),
+            get_crypto_totals(),
             return_exceptions=True,
         )
         dominance = btc_dominance if not isinstance(btc_dominance, Exception) else None
         btc_data = btc_df if not isinstance(btc_df, Exception) else None
         mdata = market_data if not isinstance(market_data, Exception) else {}
+        # Merge dos totais (TOTAL/TOTAL2/TOTAL3 + USDT.D) no mesmo dict de mercado
+        if isinstance(crypto_totals, dict) and crypto_totals:
+            mdata = {**mdata, **crypto_totals}
 
         btc_direction = "neutro"
         btc_rsi = btc_adx = btc_st = None
@@ -899,7 +903,15 @@ async def regime_status():
     Indica se recs estão sendo bloqueadas/downgraded por condição de mercado."""
     try:
         from services import regime_service as rs
-        return await rs.get_regime_status()
+        status = await rs.get_regime_status()
+        # Enriquece com TOTAL/TOTAL2/TOTAL3 + USDT.D (observável, não bloqueia).
+        try:
+            totals = await get_crypto_totals()
+            if totals:
+                status = {**status, "totals": totals}
+        except Exception:
+            pass
+        return status
     except Exception as e:
         logging.warning(f"regime-status error (fail-open): {e}")
         return {"regime": "NORMAL", "btc_24h_pct": None, "btc_dominance": None,
