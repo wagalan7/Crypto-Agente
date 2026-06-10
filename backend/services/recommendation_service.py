@@ -132,6 +132,38 @@ class Recommendation(BaseModel):
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
 
+# Cache compartilhado pra alimentar o endpoint /api/recommendations (consumido
+# pelo app) com EXATAMENTE as recs que o scan loop server-side gera — as mesmas
+# que abrem shadow/auto-trade. O loop (a cada 90s) chama set_api_recommendations_cache().
+# O app refresca a cada 120s → cache sempre quente, zero scan extra. TTL governa só
+# o fallback (se o loop estiver atrasado/parado, o endpoint faz um scan próprio).
+_api_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+API_CACHE_TTL = 150.0  # segundos
+
+
+def set_api_recommendations_cache(recs: "List[Recommendation]") -> None:
+    """Chamado pelo scan loop após cada varredura — mantém o cache do app alinhado
+    ao que o bot realmente gerou. Idempotente e fail-soft."""
+    try:
+        _api_cache["data"] = list(recs or [])
+        _api_cache["ts"] = time.time()
+    except Exception:
+        pass
+
+
+async def get_recommendations_cached_for_api(top_n: int = 50) -> "List[Recommendation]":
+    """Serve o endpoint /api/recommendations. Retorna o último scan do loop (cache).
+    Se o cache estiver frio/expirado (ex.: app abre antes do 1º scan, ou loop parado),
+    faz um scan via vision como fallback e popula o cache."""
+    now = time.time()
+    c = _api_cache
+    if c["data"] is not None and (now - c["ts"]) < API_CACHE_TTL:
+        return c["data"]
+    recs = await get_recommendations_via_vision(top_n=top_n)
+    c["data"] = recs
+    c["ts"] = now
+    return recs
+
 
 def _compute_score(sig: TradeSignal) -> float:
     """

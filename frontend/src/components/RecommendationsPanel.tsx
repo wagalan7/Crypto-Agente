@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, Sparkles, TrendingUp, TrendingDown, RefreshCw, AlertTriangle, Brain } from 'lucide-react'
-import { api, fetchBybitOHLCV, fetchTopBybitSymbols } from '../services/api'
+import { api } from '../services/api'
 import type { Recommendation, RecommendationTier } from '../types'
 
 interface HistoricalStat {
@@ -141,42 +141,13 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
-    setProgress('Buscando top 50 perpétuos…')
+    setProgress('Carregando recomendações…')
     try {
-      // 1) Top símbolos por volume (Bybit linear, IP do browser — não bloqueado).
-      // Bybit tem ~2x mais alts líquidos que Binance/OKX, então pegamos 50.
-      const symbols = await fetchTopBybitSymbols(50)
-      if (symbols.length === 0) throw new Error('Nenhum símbolo encontrado')
-
-      // 2) Baixa candles de 15m/1h/4h para cada símbolo (em paralelo, com limite)
-      const TFS = ['15m', '1h', '4h'] as const
-      setProgress(`Baixando candles (${symbols.length} símbolos × ${TFS.length} TFs)…`)
-
-      const tasks: Promise<{ symbol: string; timeframe: string; candles: Awaited<ReturnType<typeof fetchBybitOHLCV>> } | null>[] = []
-      for (const symbol of symbols) {
-        for (const tf of TFS) {
-          tasks.push(
-            fetchBybitOHLCV(symbol, tf, 200)
-              .then(candles => ({ symbol, timeframe: tf, candles }))
-              .catch(() => null),
-          )
-        }
-      }
-      // Concorrência limitada (lotes de 12)
-      const results: ({ symbol: string; timeframe: string; candles: unknown[] } | null)[] = []
-      const BATCH = 12
-      for (let i = 0; i < tasks.length; i += BATCH) {
-        const slice = await Promise.all(tasks.slice(i, i + BATCH))
-        results.push(...slice)
-        setProgress(`Baixando candles… ${Math.min(i + BATCH, tasks.length)}/${tasks.length}`)
-      }
-      const items = results.filter((x): x is { symbol: string; timeframe: string; candles: { timestamp: number; open: number; high: number; low: number; close: number; volume: number }[] } => x !== null && x.candles.length >= 80)
-
-      if (items.length === 0) throw new Error('Falha ao baixar candles')
-
-      // 3) Envia em lote pro backend pra analisar + classificar
-      setProgress(`Analisando ${items.length} (símbolo × TF)…`)
-      const res = await api.recommendationsBatch(items)
+      // O backend (scan loop server-side, fonte Binance) já varre os perpétuos,
+      // classifica em tiers e abre os shadow/auto-trades. O app lê EXATAMENTE
+      // essas recs — mesma fonte que o bot opera. Sem chamadas Bybit do celular
+      // (eliminamos o "Load failed" e a inconsistência app≠bot).
+      const res = await api.recommendations(60)
       setRecs(res.recommendations)
       setLastUpdate(new Date())
       setProgress('')

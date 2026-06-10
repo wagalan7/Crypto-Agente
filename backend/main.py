@@ -63,6 +63,7 @@ from services.recommendation_service import (
     get_recommendations,
     get_recommendations_from_batch,
     get_recommendations_via_vision,
+    get_recommendations_cached_for_api,
 )
 from services.snapshot_service import (
     save_recommendations,
@@ -224,6 +225,15 @@ async def _server_scan_loop():
 
             recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
             recs_dict = [r.model_dump() for r in recs]
+
+            # Alimenta o cache do endpoint /api/recommendations com o resultado deste
+            # scan → o app passa a mostrar EXATAMENTE as recs que o bot gerou (mesma
+            # fonte Binance), sem o app precisar bater na Bybit pelo celular.
+            try:
+                from services.recommendation_service import set_api_recommendations_cache
+                set_api_recommendations_cache(recs)
+            except Exception as e:
+                logging.warning(f"[server-scan] set api cache falhou: {e}")
 
             # Distribuição por tier — útil pra diagnosticar
             by_tier = {"A+": 0, "A": 0, "B": 0}
@@ -687,10 +697,13 @@ async def best_timeframe_analysis(symbol: str, with_ai: bool = False):
 
 @app.get("/api/recommendations")
 async def recommendations(top_n: int = 30):
-    """Trade Recommendations — varre top-N perpétuos por volume, escolhe melhor
-    TF por símbolo, classifica em tiers A+/A/B. Cache 90s no service."""
+    """Trade Recommendations — serve as MESMAS recs que o scan loop server-side
+    (Binance Vision) gera e usa pra abrir shadow/auto-trade. Assim o app reflete
+    exatamente o que o bot opera, sem depender de chamadas Bybit do celular.
+    Servido a partir do cache do último scan (loop a cada 90s); fallback faz um
+    scan próprio se o cache estiver frio."""
     try:
-        recs = await get_recommendations(top_n=min(max(top_n, 5), 50))
+        recs = await get_recommendations_cached_for_api(top_n=min(max(top_n, 5), 60))
         return {"count": len(recs), "recommendations": [r.model_dump() for r in recs]}
     except Exception as e:
         logging.error(f"recommendations error: {e}\n{traceback.format_exc()}")
