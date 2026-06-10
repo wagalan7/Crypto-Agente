@@ -445,6 +445,32 @@ async def notify_trade_open(trade: Dict[str, Any]) -> int:
     return sent
 
 
+async def notify_alert(title: str, body: str, tag: str = "alert") -> int:
+    """Push de alerta operacional crítico (ex.: posição real sem stop) pra TODOS
+    os subscribers ativos, independente de tier. Fail-soft: nunca levanta."""
+    if not PUSH_ENABLED:
+        return 0
+    try:
+        async with get_session() as session:
+            stmt = select(PushSubscription).where(PushSubscription.active.is_(True))
+            subs = (await session.execute(stmt)).scalars().all()
+        if not subs:
+            return 0
+        payload = {
+            "title": title,
+            "body": body,
+            "tag": tag,
+            "data": {"url": "/", "alert": True},
+        }
+        sent = await _fanout_push(subs, payload)
+        if sent:
+            log.info(f"Push ALERTA enviado pra {sent} device(s) — {title}")
+        return sent
+    except Exception as e:
+        log.warning(f"notify_alert falhou: {e}")
+        return 0
+
+
 def _fmt(n: float) -> str:
     if n >= 1000:
         return f"{n:,.2f}"

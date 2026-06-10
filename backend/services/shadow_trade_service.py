@@ -2193,10 +2193,55 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 tp1_oid = order_res.get("tp1_order_id")
                 tp2_oid = order_res.get("tp2_order_id")
                 if not order_res.get("sl_ok"):
+                    # Dinheiro real NUNCA pode ficar sem stop. Se o SL falhou,
+                    # fecha a posição a mercado imediatamente (reduce_only) em vez
+                    # de deixá-la nua. Regra de ouro: "sem stop = sem trade".
                     log.error(
                         f"[shadow→live] ⚠ {rec['symbol']} ABERTO SEM STOP — "
-                        f"posição precisa atenção manual"
+                        f"fechando a mercado por segurança"
                     )
+                    close_side = "Sell" if exch_side == "Buy" else "Buy"
+                    closed_ok = False
+                    try:
+                        close_res = await exchange_service.place_order(
+                            symbol=rec["symbol"],
+                            side=close_side,
+                            qty=qty,
+                            order_type="Market",
+                            reduce_only=True,
+                            client_order_id=f"cw-nostop-{snap_id}",
+                        )
+                        closed_ok = bool(close_res.get("ok"))
+                        if not closed_ok:
+                            log.critical(
+                                f"[shadow→live] 🚨 {rec['symbol']} FALHA AO FECHAR posição sem stop: "
+                                f"{close_res.get('msg') or close_res.get('error')}"
+                            )
+                    except Exception as _e:
+                        log.critical(
+                            f"[shadow→live] 🚨 {rec['symbol']} erro ao fechar posição sem stop: {_e}"
+                        )
+                    # Alerta push imediato (crítico) — você precisa saber na hora.
+                    try:
+                        from services import push_service
+                        _sym = rec["symbol"].split("/")[0]
+                        if closed_ok:
+                            await push_service.notify_alert(
+                                title=f"🛡️ {_sym}: entrada sem stop foi FECHADA",
+                                body="O stop não foi criado na corretora. A posição foi fechada a mercado por segurança — sem exposição desprotegida.",
+                                tag=f"nostop-{snap_id}",
+                            )
+                        else:
+                            await push_service.notify_alert(
+                                title=f"🚨 {_sym}: POSIÇÃO SEM STOP — AÇÃO MANUAL",
+                                body="O stop falhou E o fechamento automático falhou. Há uma posição real SEM proteção. Feche manualmente AGORA.",
+                                tag=f"nostop-crit-{snap_id}",
+                            )
+                    except Exception:
+                        pass
+                    # Não registra trade aberto: posição foi fechada (ou exige
+                    # intervenção manual). Pula pro próximo rec.
+                    continue
                 if order_res.get("tp1_skipped"):
                     log.warning(f"[shadow→live] {rec['symbol']} TP1 skip (qty parcial=0); 100% no TP2")
                 elif not order_res.get("tp1_ok"):
