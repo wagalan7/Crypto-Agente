@@ -973,6 +973,116 @@ def env_info() -> dict:
     }
 
 
+async def preflight_live_checks(
+    sample_symbol: str = "BTC/USDT:USDT",
+    sample_direction: str = "long",
+) -> dict:
+    """
+    Smoke-test READ-ONLY dos gates que só rodam em live (todos os blocos
+    `if not SHADOW_ENABLED:`). NUNCA envia ordem — só exercita cada função de
+    gate com inputs de exemplo pra garantir que nenhuma estoura exceção quando
+    o primeiro trade real disparar na sexta. Também valida conectividade crítica:
+    equity real (não fallback), kill-switch e config da exchange.
+
+    Retorna {ready, all_gates_ok, checks[], env}. `ready` = gates críticos OK.
+    Aditivo: não toca em nenhuma decisão de trade nem no caminho de execução.
+    """
+    checks: list[dict] = []
+
+    def _add(gate: str, ok: bool, detail: str) -> None:
+        checks.append({"gate": gate, "ok": bool(ok), "detail": str(detail)[:300]})
+
+    async def _run_db(gate: str, coro) -> None:
+        try:
+            val = await coro
+            _add(gate, True, f"ok → {val}")
+        except Exception as e:
+            _add(gate, False, f"EXCEPTION: {type(e).__name__}: {e}")
+
+    # 1. Trava de dinheiro real (env)
+    try:
+        armed, why = _live_money_guard()
+        _add("live_money_guard", True, f"armed={armed and not SHADOW_ENABLED} · {why}")
+    except Exception as e:
+        _add("live_money_guard", False, f"EXCEPTION: {e}")
+
+    # 2. Kill-switch (DB/estado)
+    try:
+        from services import kill_switch_service
+        ks = await kill_switch_service.check_can_trade()
+        _add("kill_switch", True, f"allowed={ks.get('allowed')} · {ks.get('reason')}")
+    except Exception as e:
+        _add("kill_switch", False, f"EXCEPTION: {e}")
+
+    # 3. Equity REAL (não pode ser fallback pra armar live) — bate na exchange
+    try:
+        from services import exchange_service
+        eq = await exchange_service.get_equity()
+        src = eq.get("source", "?")
+        total = eq.get("total_usd", 0)
+        is_real = bool(eq.get("ok")) and src != "fallback" and total > 0
+        _add("equity_real", is_real, f"source={src} total=${total} (live exige source≠fallback)")
+    except Exception as e:
+        _add("equity_real", False, f"EXCEPTION: {e}")
+
+    # 4. Exchange configurada (chaves presentes)
+    try:
+        from services import exchange_service
+        _add("exchange_configured", exchange_service.is_configured(), str(exchange_service.env_info()))
+    except Exception as e:
+        _add("exchange_configured", False, f"EXCEPTION: {e}")
+
+    # 5. Time-of-day block (lógica pura)
+    try:
+        blocked, reason = _is_blocked_time(datetime.now(timezone.utc))
+        _add("time_block", True, f"blocked_now={blocked} · {reason}")
+    except Exception as e:
+        _add("time_block", False, f"EXCEPTION: {e}")
+
+    # 6. Cluster resolver (lógica pura)
+    try:
+        cluster = _get_symbol_cluster(sample_symbol)
+        _add("symbol_cluster", True, f"{sample_symbol} → cluster={cluster}")
+    except Exception as e:
+        cluster = "other"
+        _add("symbol_cluster", False, f"EXCEPTION: {e}")
+
+    # 7-16. Gates apoiados em DB (validam conectividade + queries sem abrir nada)
+    await _run_db("entry_age_seconds", _last_entry_age_seconds())
+    await _run_db("entries_last_hour", _count_entries_last_hour())
+    await _run_db("open_by_direction", _count_open_by_direction(sample_direction))
+    await _run_db("open_in_cluster", _count_open_in_cluster(cluster))
+    await _run_db("open_in_cluster_dir", _count_open_in_cluster_by_direction(cluster, sample_direction))
+    await _run_db("recent_sl_on_symbol", _has_recent_sl_on_symbol(sample_symbol, SYMBOL_SL_COOLDOWN_HOURS or 6.0))
+    await _run_db("regime_blocked", _regime_blocked(sample_direction))
+    await _run_db("daily_sl_breaker", _daily_sl_breaker(sample_direction))
+    await _run_db("opposite_open_trade", _find_opposite_open_trade(sample_symbol, sample_direction))
+    await _run_db("open_notional_usd", _open_notional_usd())
+    await _run_db("open_margin_usd", _open_margin_usd())
+
+    # Gates críticos: precisam passar pra armar dinheiro real com segurança.
+    CRITICAL = {"equity_real", "kill_switch", "exchange_configured"}
+    all_ok = all(c["ok"] for c in checks)
+    crit_ok = all(c["ok"] for c in checks if c["gate"] in CRITICAL)
+    failures = [c["gate"] for c in checks if not c["ok"]]
+
+    try:
+        armed_flag = (not SHADOW_ENABLED) and _live_money_guard()[0]
+    except Exception:
+        armed_flag = False
+
+    return {
+        "ready": crit_ok,
+        "all_gates_ok": all_ok,
+        "failures": failures,
+        "shadow_enabled": SHADOW_ENABLED,
+        "live_money_armed": armed_flag,
+        "sample": {"symbol": sample_symbol, "direction": sample_direction},
+        "checks": checks,
+        "env": env_info(),
+    }
+
+
 async def _open_notional_usd() -> float:
     """Soma notional (entry × qty) dos trades reais auto abertos. Pra cap agregado."""
     if not DB_ENABLED:

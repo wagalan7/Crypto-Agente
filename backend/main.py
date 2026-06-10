@@ -2254,6 +2254,21 @@ async def shadow_env():
     return shadow_trade_service.env_info()
 
 
+@app.get("/api/live/preflight")
+async def live_preflight(symbol: str = "BTC/USDT:USDT", direction: str = "long"):
+    """
+    Preflight go/no-go pré-dinheiro-real. Roda READ-ONLY todos os gates que só
+    ativam em live (kill-switch, funding, throttle, caps, cooldown, breaker,
+    equity, etc.) e reporta ok/erro de cada um — SEM enviar nenhuma ordem.
+    `ready=true` quando os gates críticos (equity real, kill-switch, exchange
+    configurada) passam. Use antes de armar live e de novo na sexta.
+    """
+    from services import shadow_trade_service
+    return await shadow_trade_service.preflight_live_checks(
+        sample_symbol=symbol, sample_direction=direction
+    )
+
+
 @app.get("/api/exchange/reconcile")
 async def exchange_reconcile():
     """
