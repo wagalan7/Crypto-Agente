@@ -235,6 +235,24 @@ export const api = {
     }
   },
 
+  // Trades ABERTOS de OBSERVAÇÃO — open_trades do ambiente de TESTES (shadow,
+  // DB separado). Pro usuário acompanhar até TP/stop uma moeda que viu como
+  // 👁 OBSERVAÇÃO mesmo depois que ela some de Recomendados. NÃO contamina as
+  // estatísticas do PRD (só entra na lista de abertos). Falha gracioso → [].
+  dailyPnlOpenObservation: async (date: string, endDate: string): Promise<unknown[]> => {
+    if (!OBSERVATION_BACKEND) return []
+    try {
+      const qs = date === endDate ? `date=${date}` : `date=${date}&end_date=${endDate}`
+      const url = `${OBSERVATION_BACKEND}/api/daily-pnl?${qs}`
+      const res = await fetch(url, { signal: AbortSignal.timeout(12000) })
+      if (!res.ok) return []
+      const json = (await res.json()) as { open_trades?: unknown[] }
+      return json.open_trades ?? []
+    } catch {
+      return []
+    }
+  },
+
   recommendationsBatch: (items: { symbol: string; timeframe: string; candles: OHLCVCandle[] }[]) =>
     post<{ count: number; recommendations: Recommendation[] }>('/recommendations-batch', { items }),
 

@@ -19,6 +19,9 @@ interface Trade {
   created_at: string
   outcome_at: string | null
   tp1_hit_at?: string | null
+  // Origem (client-side): 'bot' = o bot opera (PRD) · 'observation' = só
+  // observação (ambiente de testes). Default 'bot' (trades do PRD).
+  origin?: 'bot' | 'observation'
 }
 
 interface DailyPnL {
@@ -121,6 +124,11 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [drill, setDrill] = useState<DrillKind>(null)
   const [viability, setViability] = useState<Record<number, ViabilityItem>>({})
+  // Abertos de OBSERVAÇÃO (ambiente de testes) — só entram na lista de abertos,
+  // nunca nas estatísticas do PRD. Filtro de origem (default 'bot' = preserva a
+  // visão atual; usuário opta por ver observação).
+  const [obsOpen, setObsOpen] = useState<Trade[]>([])
+  const [originFilter, setOriginFilter] = useState<'all' | 'bot' | 'observation'>('bot')
   const isRange = date !== endDate
   const cardRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const [highlightKey, setHighlightKey] = useState<string | null>(null)
@@ -261,9 +269,31 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
     return () => { alive = false }
   }, [date, endDate, data?.summary?.still_open])
 
-  // Separa abertos em "hoje" (criados no dia atual) vs "anteriores"
-  const openListAll = data?.open_trades ?? []
+  // Abertos de OBSERVAÇÃO (ambiente de testes) — buscados em paralelo, mesma
+  // janela de datas. Só pra acompanhar até TP/stop; não tocam nas estatísticas.
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      try {
+        const raw = await api.dailyPnlOpenObservation(date, endDate)
+        if (!alive) return
+        setObsOpen((raw as Trade[]).map(t => ({ ...t, origin: 'observation' as const })))
+      } catch { if (alive) setObsOpen([]) }
+    })()
+    return () => { alive = false }
+  }, [date, endDate, data?.summary?.still_open])
+
+  // Separa abertos em "hoje" (criados no dia atual) vs "anteriores".
+  // PRD = 🤖 bot · testes = 👁 observação. Dedupe por símbolo+tf+entry (bot vence).
   const todayStr = todayISO()
+  const openListAll = useMemo(() => {
+    const bot = (data?.open_trades ?? []).map(t => ({ ...t, origin: (t.origin ?? 'bot') as 'bot' | 'observation' }))
+    const botKeys = new Set(bot.map(t => `${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`))
+    const obs = obsOpen.filter(t => !botKeys.has(`${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`))
+    let all = [...bot, ...obs]
+    if (originFilter !== 'all') all = all.filter(t => (t.origin ?? 'bot') === originFilter)
+    return all
+  }, [data?.open_trades, obsOpen, originFilter])
   const openToday = useMemo(
     () => openListAll.filter(t => t.created_at?.slice(0, 10) === todayStr),
     [openListAll, todayStr]
@@ -346,6 +376,39 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
             </button>
           </div>
 
+          {/* Filtro de origem — só nos drills de abertos. Default 🤖 Bot
+              (preserva a visão de operações); usuário opta por ver 👁 observação. */}
+          {(drill === 'open' || drill === 'open_today' || drill === 'open_older') && (
+            <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-800 overflow-x-auto">
+              {([
+                { key: 'bot', label: '🤖 Bot opera', count: (data?.open_trades ?? []).length },
+                { key: 'observation', label: '👁 Observação', count: obsOpen.length },
+                { key: 'all', label: 'Tudo', count: (data?.open_trades ?? []).length + obsOpen.length },
+              ] as const).map(opt => {
+                const active = originFilter === opt.key
+                const activeCls =
+                  opt.key === 'bot' ? 'bg-emerald-500/15 border-emerald-400/50 text-emerald-300'
+                  : opt.key === 'observation' ? 'bg-sky-500/15 border-sky-400/50 text-sky-300'
+                  : 'bg-white/10 border-white/30 text-white'
+                return (
+                  <button
+                    key={opt.key}
+                    onClick={() => setOriginFilter(opt.key)}
+                    className={`flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs font-semibold whitespace-nowrap transition-colors ${
+                      active ? activeCls : 'bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <span>{opt.label}</span>
+                    <span className="text-slate-500">({opt.count})</span>
+                  </button>
+                )
+              })}
+              <span className="ml-auto text-[10px] text-slate-500 whitespace-nowrap hidden sm:inline">
+                👁 = ambiente de testes (não conta nas estatísticas)
+              </span>
+            </div>
+          )}
+
           <div className="flex-1 overflow-y-auto p-3">
             {list.length === 0 && (
               <div className="text-center py-12 text-sm text-slate-500">Nada por aqui ainda.</div>
@@ -384,6 +447,19 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                     }`}
                   >
                     <div className="flex items-center gap-2 flex-wrap mb-2">
+                      {/* Origem: 🤖 o bot opera (PRD) · 👁 só observação (testes) */}
+                      <span
+                        title={(t.origin ?? 'bot') === 'observation'
+                          ? 'OBSERVAÇÃO — o bot NÃO opera essa. Vem do ambiente de testes. Acompanhe até TP/stop pra aprender.'
+                          : 'BOT OPERA — está no universo que o bot executa de verdade.'}
+                        className={`px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${
+                          (t.origin ?? 'bot') === 'observation'
+                            ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
+                            : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                        }`}
+                      >
+                        {(t.origin ?? 'bot') === 'observation' ? '👁 OBSERVAÇÃO' : '🤖 BOT OPERA'}
+                      </span>
                       <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${badge.cls}`}>{badge.label}</span>
                       {vBadge && (
                         <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${vBadge.cls}`} title={viab?.advice}>
@@ -470,8 +546,10 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                     )}
 
                     {/* Confirmar entrada — só quando o setup ainda é entrável (valid/wait).
-                        Você abre na corretora; o bot coloca SL+TP1+TP2 e gerencia o BE. */}
-                    {viab && (viab.viability === 'valid' || viab.viability === 'wait') && (
+                        Você abre na corretora; o bot coloca SL+TP1+TP2 e gerencia o BE.
+                        Oculto para OBSERVAÇÃO: esses trades vêm do ambiente de testes (Dev),
+                        não existem no PRD, então confirmar entrada não se aplica. */}
+                    {(t.origin ?? 'bot') !== 'observation' && viab && (viab.viability === 'valid' || viab.viability === 'wait') && (
                       <div className="mb-2">
                         {confirmFor !== tradeKey ? (
                           <button
