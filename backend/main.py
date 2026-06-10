@@ -92,7 +92,11 @@ _trade_manager_task: Optional[asyncio.Task] = None
 _recalibration_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
-SERVER_SCAN_TOP_N = 40            # quantos símbolos varrer (Vision spot — universo maior compensa filtros)
+# Quantos símbolos varrer por ciclo (top-N por volume). Universo maior = mais
+# setups bons encontrados SEM baixar a régua de qualidade (cada um ainda passa
+# pelos mesmos filtros/tiers). Era 40 fixo → 60 default, ajustável via env
+# (SERVER_SCAN_TOP_N) sem deploy. Se o ciclo ficar lento, baixar de volta.
+SERVER_SCAN_TOP_N = int(os.getenv("SERVER_SCAN_TOP_N", "60"))
 SERVER_SCAN_INITIAL_DELAY = 45    # espera 45s após startup pra não competir com init
 
 # Intervalo de checagem de snapshots abertos (detecção de TP1/TP2/SL → push).
