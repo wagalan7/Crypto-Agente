@@ -40,3 +40,23 @@ Regra dura: **não quebrar código que funciona.**
 - Deploy = `git push origin main` (Railway auto-deploy). Confirmar conclusão pelo
   `startup_at` em `/api/health`. Preflight de gates: `/api/live/preflight`.
 - Promoção Dev→PRD (futuro): ≥20 trades · expectancy>0 · win-rate≥alvo · ~2 semanas.
+
+## Pendência — "app do DEV" (fazer SEXTA, após a migração)
+
+Objetivo: dar ao usuário um app apontando 100% pro **DEV** (`-c6c4`), com os
+mesmos painéis, pra validar testes futuros (champion/challenger) e dar OK.
+
+- Frontend roda na **Vercel** (não é servido pelo Railway). A API base é
+  escolhida no **build** via `VITE_API_URL` (sem env = PRD por padrão).
+  `frontend/vercel.json` → build `npm run build`, output `dist`.
+- Solução: **segundo projeto Vercel** (mesmo repo, pasta `frontend`), só mudam
+  as envs de build:
+  - `VITE_API_URL = https://crypto-agente-production-c6c4.up.railway.app` (DEV)
+  - `VITE_OBSERVATION_API_URL = ` (vazio — não remesclar observação)
+  - Ganha URL própria (ex.: `crypto-agente-dev.vercel.app`).
+- **Zero impacto no PRD** (projeto Vercel separado, aditivo). Sem mudança de código.
+- Eu **não** mexo na Vercel (igual Railway) → criar projeto + setar envs é passo
+  do usuário no painel; eu passo o passo a passo.
+- Cosmético (não bloqueia): no app do DEV o marcador 🤖/👁 é conceito do PRD →
+  tudo apareceria como 🤖 (lá o bot é shadow). Se o usuário quiser, trocar a
+  label pra algo tipo "🧪 TESTE" só no app do DEV.
