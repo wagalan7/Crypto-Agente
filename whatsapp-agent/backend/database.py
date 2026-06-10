@@ -725,6 +725,43 @@ def get_appointments_for_tomorrow(tenant_id: int) -> list[dict]:
     return get_appointments_for_confirmation(tenant_id)
 
 
+def get_pending_confirmations_for_tomorrow(tenant_id: int) -> list[dict]:
+    """Para o DISPARO MANUAL do painel: TODAS as consultas de AMANHÃ (dia do
+    calendário, horário de Brasília) que ainda não receberam confirmação,
+    independentemente da janela de 23-25h usada pelo agendamento automático.
+
+    Diferente de get_appointments_for_confirmation (janela estrita 23-25h),
+    aqui o objetivo é a psicóloga clicar e enviar para o dia inteiro de amanhã.
+
+    Exclui: já confirmadas/enviadas, canceladas, "avisou que não vem",
+    placeholders de novo paciente (2099) e pacientes com agente pausado.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo("America/Sao_Paulo")
+    now_br = _dt.now(_TZ).replace(tzinfo=None)
+    tomorrow_str = (now_br.date() + _td(days=1)).isoformat()   # 'YYYY-MM-DD'
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM appointments
+               WHERE tenant_id = ?
+                 AND date(scheduled_at) = ?
+                 AND confirmation_sent = 0
+                 AND confirmed = 0
+                 AND cancelled = 0
+                 AND COALESCE(attendance, 'pending') != 'missed_with_notice'
+                 AND scheduled_at < '2099-01-01'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM agent_paused ap
+                     WHERE ap.tenant_id = appointments.tenant_id
+                       AND ap.phone = appointments.phone
+                 )
+               ORDER BY scheduled_at""",
+            (tenant_id, tomorrow_str),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_appointments_today_unconfirmed(tenant_id: int) -> list[dict]:
     """Retorna consultas de hoje que ainda não foram confirmadas e o followup não foi enviado.
     Usa horário de Brasília passado pelo Python."""

@@ -267,12 +267,14 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
 
 
 async def run_confirmations_now():
-    """Disparo manual (endpoint admin). Usa a mesma janela de 24h."""
+    """Disparo manual (endpoint admin). Envia para TODAS as consultas de
+    amanhã ainda não confirmadas — não usa a janela estrita de 23-25h, pois
+    a psicóloga clica querendo cobrir o dia inteiro de amanhã."""
     tenants = db.list_tenants()
     results = []
     for tenant in tenants:
-        # Confirmações com 24h de antecedência
-        appts = db.get_appointments_for_confirmation(tenant["id"])
+        # Confirmações: dia inteiro de amanhã (não a janela estrita 23-25h)
+        appts = db.get_pending_confirmations_for_tomorrow(tenant["id"])
         for appt in appts:
             if db.is_agent_paused(tenant["id"], appt["phone"]):
                 results.append({"tenant": tenant["slug"], "patient": appt["patient_name"],
