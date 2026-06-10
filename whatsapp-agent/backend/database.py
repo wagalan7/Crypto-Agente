@@ -771,6 +771,8 @@ def has_conflict(tenant_id: int, dt: datetime, duration_min: int, exclude_id: in
 
     Ignora:
     - Consultas canceladas (cancelled = 1)
+    - Consultas em que o paciente avisou que não vem (missed_with_notice) —
+      o horário foi liberado e pode receber outro paciente
     - Placeholders de "novo paciente" (ano >= 2099)
     """
     from datetime import datetime as _dt
@@ -778,6 +780,7 @@ def has_conflict(tenant_id: int, dt: datetime, duration_min: int, exclude_id: in
         query = (
             "SELECT id, scheduled_at FROM appointments "
             "WHERE tenant_id = ? AND cancelled = 0 "
+            "AND COALESCE(attendance, 'pending') != 'missed_with_notice' "
             "AND scheduled_at < '2099-01-01'"
         )
         params = [tenant_id]
