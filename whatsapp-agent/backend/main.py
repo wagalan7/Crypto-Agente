@@ -180,7 +180,8 @@ def _reconcile_gcal_events() -> None:
                        WHERE tenant_id = ?
                          AND (google_event_id IS NULL OR google_event_id = '')
                          AND scheduled_at >= ?
-                         AND (cancelled IS NULL OR cancelled = 0)""",
+                         AND (cancelled IS NULL OR cancelled = 0)
+                         AND COALESCE(attendance, 'pending') != 'missed_with_notice'""",
                     (t["id"], now_iso),
                 ).fetchall()
         except Exception as e:
@@ -940,6 +941,51 @@ def dash_attendance(appt_id: int, body: AttendanceBody, request: Request):
     if not ok:
         raise HTTPException(status_code=404, detail="Consulta não encontrada.")
     logger.info(f"[{tenant['slug']}] Attendance set: appt={appt_id} → {body.status}")
+
+    # Sincroniza o calendário externo. "Avisou que não vem" libera o horário,
+    # então o evento DEVE sair do Google Calendar / CalDAV. Se o status for
+    # revertido (Desfazer, compareceu, faltou sem aviso) e o horário ainda for
+    # futuro, recria o evento para o calendário ficar consistente.
+    has_gcal = bool(tenant.get("google_refresh_token"))
+    has_caldav = bool(tenant.get("caldav_url")) if not has_gcal else False
+    if has_gcal or has_caldav:
+        try:
+            appt = db.get_appointment_by_id(tenant["id"], appt_id)
+            if appt:
+                if body.status == "missed_with_notice":
+                    ev = appt.get("google_event_id")
+                    if ev:
+                        try:
+                            if has_gcal:
+                                gcal.delete_event(tenant, ev)
+                            else:
+                                caldav_svc.delete_event(tenant, ev)
+                        except Exception as e:
+                            logger.warning(f"[cal][{tenant['slug']}] del evento {ev} falhou: {e}")
+                        db.set_appointment_google_event_id(appt_id, "")
+                        logger.info(f"[cal][{tenant['slug']}] appt {appt_id} removido do calendário (avisou que não vem)")
+                else:
+                    # Status normal: garante que o evento exista se for futuro.
+                    from datetime import datetime as _dt
+                    try:
+                        future = _dt.fromisoformat(appt["scheduled_at"]) > _dt.now()
+                    except Exception:
+                        future = False
+                    if future and not appt.get("google_event_id"):
+                        name = appt.get("patient_name") or "Paciente"
+                        duration = tenant.get("session_minutes", 50)
+                        try:
+                            new_id = (gcal.create_event(tenant, name, appt["scheduled_at"], duration)
+                                      if has_gcal else
+                                      caldav_svc.create_event(tenant, name, appt["scheduled_at"], duration))
+                            if new_id:
+                                db.set_appointment_google_event_id(appt_id, new_id)
+                                logger.info(f"[cal][{tenant['slug']}] appt {appt_id} recriado no calendário (status={body.status})")
+                        except Exception as e:
+                            logger.warning(f"[cal][{tenant['slug']}] recriar evento appt {appt_id} falhou: {e}")
+        except Exception as e:
+            logger.warning(f"[cal][{tenant['slug']}] sync atendimento appt {appt_id} falhou: {e}")
+
     return {"status": "ok", "attendance": body.status}
 
 

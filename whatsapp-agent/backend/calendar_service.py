@@ -70,6 +70,13 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
     booked = db.get_appointments_in_range(tenant_id, now.isoformat(), end_date.isoformat())
     booked_dts = []
     for r in booked:
+        # Horário fica LIVRE quando a consulta foi cancelada ou o paciente
+        # avisou que não vem (missed_with_notice) — nesses casos a vaga deve
+        # voltar a ser ofertada para outro paciente.
+        if r.get("cancelled"):
+            continue
+        if (r.get("attendance") or "pending") == "missed_with_notice":
+            continue
         try:
             booked_dts.append(datetime.fromisoformat(r["scheduled_at"]))
         except Exception:
