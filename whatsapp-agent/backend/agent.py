@@ -549,6 +549,92 @@ def _is_simple_greeting(text: str) -> bool:
     return cleaned in _GREETING_TOKENS
 
 
+# Confirmações afirmativas curtas — tratadas de forma DETERMINÍSTICA, sem LLM.
+# Motivo: o fluxo de confirmação é o mais frequente e crítico; deixá-lo
+# 100% dependente do LLM fazia o "Sim" às vezes virar sugestão de horário
+# ou não persistir confirmado=1. Aqui é à prova de regressão do prompt.
+_AFFIRMATION_TOKENS = {
+    "sim", "ssim", "siim", "simm", "siimm", "simmm", "sii", "sim sim",
+    "sinm", "sm", "ok", "okay", "okk", "okey", "ock", "isso", "isso mesmo",
+    "confirmo", "confirmado", "confirmada", "confirma", "confirmar",
+    "confirmo sim", "sim confirmo", "confirmado sim", "sim confirmado",
+    "pode confirmar", "pode ser", "pode sim", "claro", "com certeza",
+    "perfeito", "combinado", "positivo", "quero confirmar", "confirmadissimo",
+    "ta confirmado", "tá confirmado", "estarei la", "estarei lá", "vou sim",
+    "to la", "tô lá", "estarei presente", "presença confirmada", "confirmando",
+    "confirmadinho", "sim quero", "sim por favor", "sim pode", "podeser",
+}
+_AFFIRMATION_EMOJIS = {"👍", "👍🏻", "👍🏼", "👍🏽", "👍🏾", "👍🏿", "✅", "🙏", "🙏🏻", "👌", "👌🏻"}
+
+
+def _is_affirmation(text: str) -> bool:
+    """Detecta confirmação afirmativa PURA (sem outra intenção embutida).
+    Exige correspondência exata a um token afirmativo — assim 'sim, mas quero
+    remarcar' NÃO casa e cai no LLM normalmente."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    if len(t) > 30 or any(ch.isdigit() for ch in t):
+        return False
+    # Emoji-only afirmativo
+    stripped_emoji = t.strip()
+    if stripped_emoji in _AFFIRMATION_EMOJIS:
+        return True
+    cleaned = "".join(ch for ch in t if ch.isalpha() or ch.isspace()).strip()
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        # pode ser só emoji (👍✅) — checar se algum char é emoji afirmativo
+        return any(c in _AFFIRMATION_EMOJIS for c in t)
+    # Guarda contra negação/ressalva embutida
+    if any(neg in cleaned for neg in ("nao", "não", "mas ", "porem", "porém", "remarc", "cancel", "outro", "depois")):
+        return False
+    return cleaned in _AFFIRMATION_TOKENS
+
+
+def _try_deterministic_confirm(tenant: dict, phone: str, text: str) -> str | None:
+    """Se o paciente respondeu afirmativamente E existe uma consulta futura
+    aguardando confirmação (não confirmada, não cancelada, e o sistema JÁ
+    enviou o pedido de confirmação), confirma de forma determinística e
+    devolve a resposta canônica. Caso contrário, devolve None (segue p/ LLM)."""
+    if not _is_affirmation(text):
+        return None
+    tenant_id = tenant["id"]
+    try:
+        appt = cal.get_next_appointment(tenant_id, phone)
+    except Exception:
+        return None
+    if not appt:
+        return None
+    # Precisa estar pendente, não cancelada, e termos pedido confirmação antes.
+    if appt.get("confirmed") or appt.get("cancelled"):
+        return None
+    pedimos = bool(appt.get("confirmation_sent")) or bool(appt.get("followup_sent"))
+    if not pedimos:
+        return None
+    try:
+        db.confirm_appointment(tenant_id, appt["id"])
+    except Exception as e:
+        logger.warning(f"[{tenant['slug']}][{phone}] confirm determinístico falhou: {e}")
+        return None
+    logger.info(f"[{tenant['slug']}][{phone}] CONFIRMAÇÃO DETERMINÍSTICA id={appt['id']}")
+    # Monta resposta canônica conforme o dia.
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        appt_dt = datetime.fromisoformat(appt["scheduled_at"])
+        now_br = datetime.now(_ZI("America/Sao_Paulo")).replace(tzinfo=None)
+        delta_days = (appt_dt.date() - now_br.date()).days
+        if delta_days <= 0:
+            quando = "Até mais tarde!"
+        elif delta_days == 1:
+            quando = "Até amanhã!"
+        else:
+            dia = _DIAS_PT[appt_dt.weekday()].split("-")[0]
+            quando = f"Até {dia}!"
+    except Exception:
+        quando = "Até lá!"
+    return f"Ótimo! ✅ Presença confirmada. {quando} 😊"
+
+
 def _greeting_reply(tenant: dict, phone: str) -> str:
     """Resposta determinística para saudações — não passa pelo LLM."""
     tenant_id = tenant["id"]
@@ -589,6 +675,19 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
         logger.info(f"[{tenant['slug']}][{phone}] saudação simples — resposta determinística")
         return reply, AgentResponse(intent=Intent.other, action=Action.none,
                                      response_text=reply, data={}), None
+
+    # ── Atalho determinístico para CONFIRMAÇÃO ("Sim", "Ok", "Confirmo"…) ───────
+    # Fluxo mais crítico e frequente: não pode depender do LLM (regredia toda
+    # vez que o prompt crescia). Só dispara quando há consulta futura pendente
+    # à qual o sistema JÁ pediu confirmação — então é seguro confirmar.
+    _det_confirm = _try_deterministic_confirm(tenant, phone, text)
+    if _det_confirm is not None:
+        db.save_message(tenant_id, phone, "assistant", _det_confirm)
+        logger.info(f"[{tenant['slug']}][{phone}] confirmação determinística — sem LLM")
+        return _det_confirm, AgentResponse(
+            intent=Intent.confirm, action=Action.confirm,
+            response_text=_det_confirm, data={}), {
+                "type": "appointment_confirmed", "data": {"phone": phone}}
 
     # limit aumentado de 6 → 24 para garantir cobertura de manhã, tarde e noite
     # em vários dias, permitindo ao LLM filtrar quando paciente pede "tarde"/"manhã"
