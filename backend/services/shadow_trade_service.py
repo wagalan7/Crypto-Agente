@@ -287,6 +287,19 @@ SYMBOL_BLACKLIST: set[str] = {
     s.strip().upper() for s in _BLACKLIST_RAW.split(",") if s.strip()
 }
 
+# ── Universo de EXECUÇÃO (decoupling scan↔execução) ────────────────────────
+# CSV de bases (BTC,ETH,...) que o bot pode operar com DINHEIRO REAL. Permite
+# AMPLIAR o scan/observação SEM ampliar a execução: mesmo que o scan veja 300
+# moedas, só executa as que estiverem aqui.
+#   • VAZIO (default) = SEM restrição → executa o que o scan trouxe (= comportamento
+#     atual; PRD hoje varre 60, então opera as 60). PRD INTOCADO por default.
+#   • SETADO = só executa bases na lista (allowlist). Usado quando o scan ampliar.
+# Aplicado SÓ em modo live (não-shadow): no DEV (shadow) observa-se tudo.
+# Futuro: o motor de rotação (champion/challenger) gerencia essa lista (via DB).
+EXEC_UNIVERSE_ALLOWLIST: set[str] = {
+    s.strip().upper() for s in os.getenv("EXEC_UNIVERSE_ALLOWLIST", "").split(",") if s.strip()
+}
+
 # ── Score threshold (postmortem) ───────────────────────────────────────────
 # Subimos o piso de score para 72 (era implicitamente >=65 via tier A). O
 # postmortem mostrou win-rate sensivelmente melhor acima de 75, mas 75
@@ -1909,6 +1922,16 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 log.info(f"[score-min] {rec.get('symbol')} {reason} — skip")
                 _record_skip(rec, "score-min", reason)
                 continue
+
+            # ── Universo de execução (allowlist): só opera real bases permitidas.
+            # Vazio = sem restrição (comportamento atual). Aplicado só em live.
+            if not SHADOW_ENABLED and EXEC_UNIVERSE_ALLOWLIST:
+                base = _symbol_base(rec["symbol"])
+                if base and base not in EXEC_UNIVERSE_ALLOWLIST:
+                    reason = f"{base} fora do universo de execução (allowlist)"
+                    log.info(f"[exec-universe] {rec['symbol']} {reason} — skip")
+                    _record_skip(rec, "exec-universe", reason)
+                    continue
 
             # ── Symbol blacklist (postmortem): pula símbolos banidos.
             if not SHADOW_ENABLED:

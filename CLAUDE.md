@@ -15,16 +15,35 @@ Regra dura: **não quebrar código que funciona.**
 - PRD e Dev têm **DBs separados** de propósito (o universo amplo do Dev não pode
   contaminar o auto-learner do PRD).
 
-## Regra de execução (segurança go-live)
+## Regra de execução (universo do bot: 60 → até ~300, por mérito)
 
-- **PRD opera SÓ as 60** (top-60 por volume). Isso é firme pra sexta.
-- **NÃO subir `SERVER_SCAN_TOP_N` do PRD** pra mostrar mais moedas: as mesmas
-  `recs` alimentam display + snapshots + **execução** (`open_shadow_for_recs`),
-  e o `portfolio_guard` (slots: 5 posições / 2 por categoria / 5% risco) daria
-  slot pra moeda de score alto fora das 60 → **mudaria o que o bot opera**.
-- Universo amplo (observação/aprendizado) vem do **Crypto-Agente-Dev**, não do PRD.
-- `SERVER_SCAN_TOP_N` é lido **só no boot** (backend/services/recommendation_service.py:100)
-  → mudar a env exige **redeploy/restart** do serviço.
+> Mudança de regra (11/06): as 60 são o **PONTO DE PARTIDA** do canário (mais
+> líquidas/seguras pra estrear dinheiro real), **NÃO o teto**. Objetivo: crescer o
+> universo de execução **até ~300** (limitado por liquidez), de forma **aditiva e
+> por performance** — não "trocar melhor por pior".
+
+- **Hoje (canário): execução = top-60 por volume.** Trava de curto prazo mantida.
+- **Crescimento (champion/challenger):**
+  - **Promoção (aditiva, automática):** moeda fora do pool com **≥15 trades**
+    resolvidos + expectancy>0 / win-rate no alvo + **piso de liquidez** → entra.
+    Ex.: 60 boas + 15 de fora que também foram bem → opera **75**.
+  - **Demoção (rara, "maçã podre"):** só sai quem for **muito mal** sustentado
+    (ponto de partida: expectancy < −0.2R sobre ≥15 trades, por 2 ciclos). Histerese.
+  - **Cadência:** semanal (junto da recalibração de segunda). Crescimento automático.
+  - O `portfolio_guard` (5 posições / 2 por categoria / 5% risco) **continua** → 300
+    elegíveis ≠ 300 abertas; o bot só escolhe os 5 melhores setups de um cardápio maior.
+- **Decoupling scan ↔ execução (infra — branch `feat/decouple-exec-universe`):**
+  - `EXEC_UNIVERSE_ALLOWLIST` (CSV de bases) em shadow_trade_service.py: **vazio =
+    sem restrição** (= comportamento atual, PRD intocado); setado = só executa essas
+    bases mesmo com scan amplo. Aplicado **só em live** (DEV/shadow observa tudo).
+  - `PORTFOLIO_GUARD_ENABLED` (default true) em recommendation_service.py: desligar
+    **só no DEV** pra o painel 👁 mostrar o universo amplo sem o cap de 5.
+  - **Regra operacional dura:** NÃO ampliar `SERVER_SCAN_TOP_N` do PRD **sem antes**
+    setar `EXEC_UNIVERSE_ALLOWLIST` — senão o scan amplo arrastaria a execução junto.
+- **Ativação real do crescimento só PÓS-canário (1.0 estável) + dados do DEV.** Até
+  lá o universo amplo (observação/aprendizado) vem do **Crypto-Agente-Dev**.
+- `SERVER_SCAN_TOP_N` lido **só no boot** (recommendation_service.py:100) → mudar
+  exige **redeploy/restart**.
 
 ## App — painel "Trades Recomendados"
 
