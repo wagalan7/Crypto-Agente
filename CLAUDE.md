@@ -41,6 +41,27 @@ Regra dura: **não quebrar código que funciona.**
   `startup_at` em `/api/health`. Preflight de gates: `/api/live/preflight`.
 - Promoção Dev→PRD (futuro): ≥20 trades · expectancy>0 · win-rate≥alvo · ~2 semanas.
 
+## Recalibração da autoaprendizagem (calibração P(TP1) + buckets)
+
+- Reaprende com TODO o histórico resolvido (score→P(TP1) via shrinkage bayesiano
+  + isotônica) e versiona/compara por Sharpe. Fail-open, **não toca execução**.
+- Cadência atual: **semanal — toda segunda às 09h BRT (= 12:00 UTC)**.
+  Implementado em `_recalibration_loop` (backend/main.py); modo via env:
+  - `RECALIBRATION_MODE=weekly` (default) | `interval`
+  - `RECALIBRATION_WEEKLY_DOW=0` (0=segunda) · `RECALIBRATION_WEEKLY_HOUR_UTC=12`
+  - check a cada 1h (`RECALIBRATION_CHECK_INTERVAL_SEC`, default 3600).
+  - Relógio vem do `last_recalibration_at` no DB → robusto a restart, não dispara 2×.
+- Manual a qualquer momento: `POST /api/calibration/recalibrate` (seguro).
+
+## Roadmap pós-go-live (NÃO antes de sexta)
+
+- **[A] Aprender do universo amplo (observação/DEV), não só das 60.** Hoje os DBs
+  PRD/DEV são separados de propósito (não contaminar o learner do PRD). Desenhar
+  uma "ponte" controlada DEV→aprendizado, validar no DEV antes de encostar no PRD.
+- **[C] TP/SL adaptativo por símbolo** (histórico do símbolo ajusta alvo/stop
+  inicial). Hoje TP/SL inicial é fixo por ATR; só trail+BE adaptam pós-TP1.
+- **App do DEV** (ver seção acima) — fazer na sexta após a migração.
+
 ## Pendência — "app do DEV" (fazer SEXTA, após a migração)
 
 Objetivo: dar ao usuário um app apontando 100% pro **DEV** (`-c6c4`), com os

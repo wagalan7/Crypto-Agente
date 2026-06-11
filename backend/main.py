@@ -128,9 +128,23 @@ _METRICS: Dict[str, Any] = {
 # Robusto a restart: o "relógio" vem do timestamp persistido da última
 # recalibração no DB (não de um timer em memória).
 RECALIBRATION_INTERVAL_DAYS = int(os.getenv("RECALIBRATION_INTERVAL_DAYS", "10"))
-RECALIBRATION_CHECK_INTERVAL = int(os.getenv("RECALIBRATION_CHECK_INTERVAL_SEC", str(6 * 3600)))
+RECALIBRATION_CHECK_INTERVAL = int(os.getenv("RECALIBRATION_CHECK_INTERVAL_SEC", str(3600)))
 RECALIBRATION_INITIAL_DELAY = 120  # espera 2min após boot pra não competir com init
 RECALIBRATION_ENABLED = os.getenv("RECALIBRATION_AUTO_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Modo de agendamento: "weekly" (dia/hora fixos) ou "interval" (a cada N dias).
+# Default weekly: toda segunda às 09h de Brasília (= 12h UTC, BRT é UTC-3, sem DST).
+RECALIBRATION_MODE = os.getenv("RECALIBRATION_MODE", "weekly").strip().lower()
+RECALIBRATION_WEEKLY_DOW = int(os.getenv("RECALIBRATION_WEEKLY_DOW", "0"))   # 0=segunda (Python weekday)
+RECALIBRATION_WEEKLY_HOUR_UTC = int(os.getenv("RECALIBRATION_WEEKLY_HOUR_UTC", "12"))  # 12 UTC = 09h BRT
+
+
+def _last_scheduled_occurrence(now: datetime, dow: int, hour: int) -> datetime:
+    """Datetime mais recente (<= now) que cai no weekday `dow` às `hour`:00 UTC."""
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    target -= timedelta(days=(now.weekday() - dow) % 7)
+    if target > now:
+        target -= timedelta(days=7)
+    return target
 
 
 async def _snapshot_loop():
@@ -167,15 +181,21 @@ async def _recalibration_loop():
         try:
             last = await cvs.last_recalibration_at()
             now = datetime.now(timezone.utc)
-            due = last is None or (now - last) >= timedelta(days=RECALIBRATION_INTERVAL_DAYS)
+            if RECALIBRATION_MODE == "weekly":
+                occ = _last_scheduled_occurrence(
+                    now, RECALIBRATION_WEEKLY_DOW, RECALIBRATION_WEEKLY_HOUR_UTC
+                )
+                due = last is None or last < occ
+                notes = "auto-recalibração semanal (seg 09h BRT)"
+            else:
+                due = last is None or (now - last) >= timedelta(days=RECALIBRATION_INTERVAL_DAYS)
+                notes = f"auto-recalibração {RECALIBRATION_INTERVAL_DAYS}d"
             if due:
                 logging.info(
                     f"[recalibration] disparando recalibração automática "
-                    f"(última: {last}, intervalo: {RECALIBRATION_INTERVAL_DAYS}d)"
+                    f"(modo={RECALIBRATION_MODE}, última: {last})"
                 )
-                result = await cvs.recalibrate(
-                    notes=f"auto-recalibração {RECALIBRATION_INTERVAL_DAYS}d"
-                )
+                result = await cvs.recalibrate(notes=notes)
                 if result.get("recalibrated"):
                     _METRICS["last_recalibration_at"] = now.isoformat()
                     ver = (result.get("version") or {}).get("version")
@@ -186,7 +206,10 @@ async def _recalibration_loop():
                 else:
                     logging.info(f"[recalibration] adiada: {result.get('reason')}")
             else:
-                next_due = last + timedelta(days=RECALIBRATION_INTERVAL_DAYS)
+                if RECALIBRATION_MODE == "weekly":
+                    next_due = occ + timedelta(days=7)
+                else:
+                    next_due = last + timedelta(days=RECALIBRATION_INTERVAL_DAYS)
                 logging.info(f"[recalibration] ainda no prazo — próxima ~{next_due.isoformat()}")
         except asyncio.CancelledError:
             break
