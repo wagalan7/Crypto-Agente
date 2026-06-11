@@ -343,21 +343,21 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
       drill === 'open' ? 'Trades em aberto (todos)' :
       drill === 'open_today' ? 'Abertos · criados hoje' :
       drill === 'open_older' ? 'Abertos · dias anteriores' :
-      'Todos os trades'
+      'Trades resolvidos'
     const list =
       drill === 'wins' ? winsList :
       drill === 'losses' ? lossesList :
       drill === 'open' ? openListAll :
       drill === 'open_today' ? openToday :
       drill === 'open_older' ? openOlder :
-      [...(data.trades ?? []), ...openListAll]
+      (data.trades ?? [])
     const subtitle =
       drill === 'wins' ? `${winsList.length} trade(s) · ${fmtPct(pctBreakdown.wins)} da banca` :
       drill === 'losses' ? `${lossesList.length} trade(s) · ${fmtPct(pctBreakdown.losses)} da banca` :
       drill === 'open' ? `${openListAll.length} aguardando preço bater TP ou stop` :
       drill === 'open_today' ? `${openToday.length} trade(s) abertos no dia de hoje` :
       drill === 'open_older' ? `${openOlder.length} trade(s) de dias anteriores · avaliando viabilidade atual` :
-      `${list.length} trade(s) no total`
+      `${list.length} trade(s) resolvido(s) · vencedores + perdedores`
 
     return (
       <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
@@ -745,7 +745,7 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
               type="button"
               onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDrill('all') }}
               className="text-left bg-slate-900/60 border border-slate-800 hover:border-slate-600 rounded-lg p-3 transition-colors cursor-pointer"
-              title="Ver todos os trades do dia"
+              title="Ver trades resolvidos do dia"
             >
               <div className="text-[10px] text-slate-500 uppercase">Total R</div>
               <div className={`text-xl font-bold font-mono ${rColor}`}>
