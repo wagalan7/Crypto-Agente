@@ -489,6 +489,37 @@ async def health():
     }
 
 
+@app.get("/api/debug/egress-ip")
+async def debug_egress_ip():
+    """
+    Diagnóstico read-only: retorna o IP público de SAÍDA deste serviço.
+
+    Uso: descobrir o egress IP do Railway pra colocar na whitelist da Binance
+    (a permissão de Futuros exige restrição de acesso por IP). Não toca em nada,
+    só faz um GET a serviços públicos de echo de IP. Tenta vários por robustez.
+    """
+    import httpx
+    echo_urls = [
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.me/all.json",
+        "https://ipinfo.io/json",
+    ]
+    results: list = []
+    ip: Optional[str] = None
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        for url in echo_urls:
+            try:
+                r = await client.get(url)
+                data = r.json()
+                cand = data.get("ip") or data.get("ip_addr")
+                if cand and not ip:
+                    ip = cand
+                results.append({"source": url, "ip": cand})
+            except Exception as e:  # noqa: BLE001
+                results.append({"source": url, "error": str(e)[:120]})
+    return {"egress_ip": ip, "checks": results}
+
+
 @app.get("/api/symbols")
 async def get_symbols():
     symbols = await get_perpetual_symbols()
