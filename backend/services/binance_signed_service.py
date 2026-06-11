@@ -101,11 +101,33 @@ BASE = _BASE_BY_MODE.get(_MODE, "https://demo-fapi.binance.com")
 _TESTNET = _MODE in ("demo", "testnet")  # mantém flag pra compat com env_info
 _RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW", "5000"))
 
+# Proxy de IP fixo (opcional): rotear as chamadas ASSINADAS por um proxy com IP
+# estável, pra a whitelist da Binance não quebrar quando o egress IP do host
+# mudar. Vazio = sem proxy (comportamento idêntico ao de sempre). Só as chamadas
+# autenticadas passam por aqui; dados públicos não precisam (funcionam de qq IP).
+# Formato: "http://user:pass@host:porta" (http/https/socks5).
+_PROXY_URL = os.getenv("BINANCE_PROXY_URL", "").strip() or None
+
 _http_client: Optional[httpx.AsyncClient] = None
 
 
 def is_configured() -> bool:
     return bool(_API_KEY and _API_SECRET)
+
+
+def _proxy_masked() -> Optional[str]:
+    """Host:porta do proxy sem credenciais (pra logar/expor sem vazar segredo)."""
+    if not _PROXY_URL:
+        return None
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(_PROXY_URL)
+        netloc = p.hostname or ""
+        if p.port:
+            netloc += f":{p.port}"
+        return f"{p.scheme}://{netloc}" if netloc else "set"
+    except Exception:  # noqa: BLE001
+        return "set"
 
 
 def env_info() -> dict:
@@ -116,13 +138,18 @@ def env_info() -> dict:
         "base_url": BASE,
         "key_prefix": _API_KEY[:4] + "..." if _API_KEY else None,
         "recv_window_ms": _RECV_WINDOW,
+        "proxy_enabled": bool(_PROXY_URL),
+        "proxy": _proxy_masked(),
     }
 
 
 def _get_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=15.0, headers={"X-MBX-APIKEY": _API_KEY})
+        kwargs: dict = {"timeout": 15.0, "headers": {"X-MBX-APIKEY": _API_KEY}}
+        if _PROXY_URL:
+            kwargs["proxy"] = _PROXY_URL
+        _http_client = httpx.AsyncClient(**kwargs)
     return _http_client
 
 
