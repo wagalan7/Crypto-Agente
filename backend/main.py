@@ -1051,6 +1051,20 @@ async def rotation_symbol_stats(days: int = 0):
         raise HTTPException(500, f"Erro ao obter symbol-stats: {e}")
 
 
+@app.get("/api/rotation/plan")
+async def rotation_plan(days: int = 0):
+    """DRY-RUN do motor de rotação: o que ENTRARIA (promoção aditiva) e SAIRIA
+    (maçã podre) do universo de execução, dado o histórico atual. NÃO aplica nada,
+    NÃO opera dinheiro. Pra inspecionar/validar antes de ligar a rotação real."""
+    try:
+        from services.rotation_service import compute_rotation_plan
+        d = 0 if days <= 0 else max(7, min(days, 365))
+        return await compute_rotation_plan(days=d)
+    except Exception as e:
+        logging.error(f"rotation plan error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao computar plano de rotação: {e}")
+
+
 @app.get("/api/calibration")
 async def calibration():
     """
