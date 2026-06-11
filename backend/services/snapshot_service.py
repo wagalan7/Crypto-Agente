@@ -17,7 +17,7 @@ import os
 from datetime import datetime, timedelta, timezone, date
 from typing import List, Dict, Any, Optional
 
-from sqlalchemy import select, and_, func, update
+from sqlalchemy import select, and_, func, update, delete
 
 from db import DB_ENABLED, get_session
 from models.recommendation_snapshot import RecommendationSnapshot
@@ -27,6 +27,15 @@ log = logging.getLogger(__name__)
 
 # ── Configuração ─────────────────────────────────────────────────────────
 DEDUP_WINDOW_HOURS = 2       # mesma rec não entra 2× nesse intervalo
+
+# Decouple (EXEC_UNIVERSE_DECOUPLE): status reservado pros snapshots do universo
+# AMPLO (só display/push). É invisível a TODO agregador de aprendizado/risco/PnL
+# porque eles filtram status resolvido, =="open", ou realized_r IS NOT NULL — e
+# 'wide' não é nenhum deles (realized_r fica NULL, nunca resolve). check_open
+# também o ignora (status != "open") → zero carga de candles. Só existe pra
+# dedup DB-backed do push (sem storm no restart). Podado por TTL.
+WIDE_DISPLAY_STATUS = "wide"
+WIDE_DISPLAY_TTL_HOURS = float(os.getenv("WIDE_DISPLAY_TTL_HOURS", "6"))
 # Teto absoluto: qualquer trade mais velho que isto é encerrado. Antes era 48h
 # hardcoded, o que cortava SWING cedo demais (swing aguenta dias) e desalinhava
 # do gerenciador dos trades reais (TIME_STOP_SWING_MIN = 7 dias). Agora é env,
@@ -209,11 +218,16 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
         for rec in recommendations:
             try:
                 # Dedup: existe registro recente do mesmo setup?
+                # status != "wide": um snapshot do universo AMPLO (display/push,
+                # decouple) NÃO deve bloquear o save de EXECUÇÃO do mesmo setup —
+                # senão um setup que migrou de "amplo" pra "executado" perderia
+                # o registro real e não alimentaria o auto-learner.
                 stmt = select(RecommendationSnapshot.id).where(
                     and_(
                         RecommendationSnapshot.symbol == rec["symbol"],
                         RecommendationSnapshot.timeframe == rec["timeframe"],
                         RecommendationSnapshot.direction == rec["direction"],
+                        RecommendationSnapshot.status != WIDE_DISPLAY_STATUS,
                         RecommendationSnapshot.created_at >= cutoff,
                     )
                 ).limit(1)
@@ -311,6 +325,99 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
 
     if inserted:
         log.info(f"Snapshots persistidos: {inserted}")
+    return inserted
+
+
+async def save_wide_display_snapshots(recommendations: List[Dict[str, Any]]) -> int:
+    """
+    Decouple (EXEC_UNIVERSE_DECOUPLE): persiste os snapshots do universo AMPLO
+    (display/push) com status='wide'. Esse status NÃO é considerado por NENHUM
+    agregador de aprendizado/risco/PnL — todos filtram status resolvido, =="open",
+    ou realized_r IS NOT NULL, e 'wide' não é nenhum deles (realized_r=NULL, nunca
+    resolve). Logo o auto-learner / circuit breaker / planejador da banca do PRD
+    ficam INTOCADOS por construção (não por filtro espalhado que poderia falhar).
+
+    Propósito único:
+      1. dedup DB-backed → não repete push do mesmo setup na janela (sobrevive a
+         restart ⇒ sem storm de push no deploy);
+      2. marca rec['_just_saved'] nos recém-inseridos pro batch de push.
+
+    NÃO são rastreados por check_open_snapshots (status != "open") ⇒ zero carga
+    extra de candles. Linhas wide mais velhas que WIDE_DISPLAY_TTL_HOURS são
+    podadas aqui (não há outcome a preservar). Isolado de save_recommendations
+    de propósito: o caminho de EXECUÇÃO/learner não muda em nada.
+    """
+    if not DB_ENABLED or not recommendations:
+        return 0
+
+    inserted = 0
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=DEDUP_WINDOW_HOURS)
+    prune_before = now - timedelta(hours=WIDE_DISPLAY_TTL_HOURS)
+
+    async with get_session() as session:
+        # Poda linhas wide antigas (só a dedup importa; sem outcome a guardar).
+        try:
+            await session.execute(
+                delete(RecommendationSnapshot).where(
+                    and_(
+                        RecommendationSnapshot.status == WIDE_DISPLAY_STATUS,
+                        RecommendationSnapshot.created_at < prune_before,
+                    )
+                )
+            )
+        except Exception as e:
+            log.warning(f"[wide] prune falhou: {e}")
+
+        for rec in recommendations:
+            try:
+                # Dedup só contra OUTROS snapshots 'wide' (namespace próprio —
+                # não interage com a dedup/anti-dup do caminho de execução).
+                stmt = select(RecommendationSnapshot.id).where(
+                    and_(
+                        RecommendationSnapshot.symbol == rec["symbol"],
+                        RecommendationSnapshot.timeframe == rec["timeframe"],
+                        RecommendationSnapshot.direction == rec["direction"],
+                        RecommendationSnapshot.status == WIDE_DISPLAY_STATUS,
+                        RecommendationSnapshot.created_at >= cutoff,
+                    )
+                ).limit(1)
+                if (await session.execute(stmt)).scalar_one_or_none():
+                    rec["_just_saved"] = False
+                    continue
+
+                tp1 = None
+                sig = rec.get("signal") or {}
+                if isinstance(sig, dict):
+                    tp1 = sig.get("tp1")
+
+                snap = RecommendationSnapshot(
+                    symbol=rec["symbol"],
+                    timeframe=rec["timeframe"],
+                    tier=rec["tier"],
+                    direction=rec["direction"],
+                    entry=float(rec["entry"]),
+                    stop_loss=float(rec["stop_loss"]),
+                    tp1=float(tp1) if tp1 is not None else None,
+                    tp2=float(rec["tp2"]),
+                    score=float(rec["score"]),
+                    risk_reward=float(rec["risk_reward"]),
+                    leverage=int(rec.get("leverage", 1)),
+                    risk_pct=float(rec.get("risk_pct", 1.0)),
+                    stop_distance_pct=float(rec.get("stop_distance_pct", 0.0)),
+                    status=WIDE_DISPLAY_STATUS,
+                    created_at=now,
+                    features=_extract_features(rec, now),
+                )
+                session.add(snap)
+                rec["_just_saved"] = True
+                inserted += 1
+            except Exception as e:
+                log.warning(f"[wide] falha ao salvar {rec.get('symbol')}: {e}")
+        await session.commit()
+
+    if inserted:
+        log.info(f"[wide] snapshots display persistidos: {inserted}")
     return inserted
 
 

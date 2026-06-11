@@ -100,6 +100,16 @@ SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3m
 SERVER_SCAN_TOP_N = int(os.getenv("SERVER_SCAN_TOP_N", "60"))
 SERVER_SCAN_INITIAL_DELAY = 45    # espera 45s após startup pra não competir com init
 
+# Decouple display↔execução (default OFF → comportamento atual idêntico).
+# ON: o painel/push veem o universo AMPLO (varredura inteira, SEM portfolio_guard),
+# enquanto a EXECUÇÃO usa a lista guardada (portfolio_guard) + EXEC_UNIVERSE_ALLOWLIST
+# — ou seja, o bot só opera as bases da allowlist, mas você vê/recebe o universo todo.
+# Snapshots/save continuam só na lista de execução → auto-learner do PRD intocado.
+# Só faz efeito junto de SERVER_SCAN_TOP_N ampliado (ex.: 300) + EXEC_UNIVERSE_ALLOWLIST setada.
+EXEC_UNIVERSE_DECOUPLE = os.getenv(
+    "EXEC_UNIVERSE_DECOUPLE", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # Intervalo de checagem de snapshots abertos (detecção de TP1/TP2/SL → push).
 # Era 300s (5min) — esse era o MAIOR atraso percebido nos pushes de saída: o
 # preço batia o alvo e a notificação só saía no próximo ciclo. 90s entrega o
@@ -246,17 +256,41 @@ async def _server_scan_loop():
             except Exception as e:
                 logging.warning(f"[server-scan] calibration warmup falhou: {e}")
 
-            recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
+            # ── Decouple display↔execução (gate EXEC_UNIVERSE_DECOUPLE, default OFF) ──
+            # OFF (default/PRD atual): UMA lista só — guard aplicado, display == execução.
+            # ON: display/push veem o universo AMPLO (sem portfolio_guard); a EXECUÇÃO
+            #     (recs) usa a lista guardada → o bot só abre o subconjunto guard+allowlist.
+            #     Save/snapshots seguem na lista de execução → auto-learner do PRD intocado.
+            if EXEC_UNIVERSE_DECOUPLE:
+                from services.recommendation_service import _apply_portfolio_guard
+                recs_display = await get_recommendations_via_vision(
+                    top_n=SERVER_SCAN_TOP_N, apply_guard=False
+                )
+                recs = await _apply_portfolio_guard(list(recs_display))
+            else:
+                recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
+                recs_display = recs
             recs_dict = [r.model_dump() for r in recs]
+            # OFF: display == execução. ON: display amplo (pro painel/push amplo).
+            recs_display_dict = (
+                [r.model_dump() for r in recs_display]
+                if EXEC_UNIVERSE_DECOUPLE else recs_dict
+            )
 
             # Alimenta o cache do endpoint /api/recommendations com o resultado deste
             # scan → o app passa a mostrar EXATAMENTE as recs que o bot gerou (mesma
             # fonte Binance), sem o app precisar bater na Bybit pelo celular.
+            # Em modo decouple, mostra o universo AMPLO; senão, a mesma lista da execução.
             try:
                 from services.recommendation_service import set_api_recommendations_cache
-                set_api_recommendations_cache(recs)
+                set_api_recommendations_cache(recs_display)
             except Exception as e:
                 logging.warning(f"[server-scan] set api cache falhou: {e}")
+            if EXEC_UNIVERSE_DECOUPLE:
+                logging.info(
+                    f"[server-scan] decouple ON: display={len(recs_display)} (amplo) · "
+                    f"exec/save={len(recs)} (guard+allowlist)"
+                )
 
             # Distribuição por tier — útil pra diagnosticar
             by_tier = {"A+": 0, "A": 0, "B": 0}
@@ -275,11 +309,45 @@ async def _server_scan_loop():
             newly_saved = 0
             if DB_ENABLED and recs_dict:
                 try:
+                    # EXECUÇÃO: salva normal (untagged) → alimenta o auto-learner.
                     newly_saved = await save_recommendations(recs_dict) or 0
                 except Exception as e:
                     logging.warning(f"[server-scan] save falhou: {e}")
 
-                # Shadow #11.3: abre trades sombra pras recs novas (A/A+)
+                # Decouple: salva o RESTANTE do universo AMPLO como status='wide'
+                # (invisível ao learner/risco/PnL por construção — ver
+                # save_wide_display_snapshots). Só pra dedup + push + painel.
+                if EXEC_UNIVERSE_DECOUPLE and recs_display_dict:
+                    try:
+                        from services.snapshot_service import save_wide_display_snapshots
+                        exec_keys = {
+                            (r["symbol"], r["timeframe"], r["direction"]) for r in recs_dict
+                        }
+                        wide_only = [
+                            r for r in recs_display_dict
+                            if (r["symbol"], r["timeframe"], r["direction"]) not in exec_keys
+                            and r.get("tier") in ("A+", "A", "B")
+                        ]
+                        wide_saved = await save_wide_display_snapshots(wide_only) or 0
+                        newly_saved += wide_saved
+                        # Push amplo: só os recém-inseridos (marcados _just_saved)
+                        # entram no batch. Execução vem primeiro (prioridade),
+                        # depois preenche com os do universo amplo (cap 5/batch
+                        # é aplicado em notify_recommendations_batch).
+                        pushable = pushable + [
+                            r for r in wide_only if r.get("_just_saved") is True
+                        ]
+                        if wide_saved:
+                            logging.info(
+                                f"[server-scan] decouple: +{wide_saved} wide novos pra push "
+                                f"(de {len(wide_only)} amplos elegíveis)"
+                            )
+                    except Exception as e:
+                        logging.warning(f"[server-scan] wide save falhou: {e}")
+
+                # Shadow #11.3: abre trades sombra pras recs novas (A/A+).
+                # SEMPRE na lista de EXECUÇÃO (recs_dict) — o bot nunca opera o
+                # universo amplo; allowlist+guard já aplicados em recs.
                 try:
                     from services.shadow_trade_service import open_shadow_for_recs
                     await open_shadow_for_recs(recs_dict)

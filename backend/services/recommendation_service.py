@@ -1175,13 +1175,19 @@ async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
     return max(scored, key=lambda x: x[1])
 
 
-async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation]:
+async def get_recommendations_via_vision(
+    top_n: int = 30, apply_guard: bool = True
+) -> List[Recommendation]:
     """
     Versão server-side pro Railway. Escolhe fonte dinamicamente:
       • BINANCE_PROXY_URL setado → Binance Futures (mesmos dados do app)
       • Senão → Binance Vision (spot)
 
     Nome mantido por compat — agora é "via server" mais genérico.
+
+    `apply_guard` (default True): aplica o portfolio_guard (corta pras ~melhores
+    por exposição/correlação). Passe False pra obter a lista AMPLA crua (display/
+    observação) — a execução aplica o guard separadamente (ver EXEC_UNIVERSE_DECOUPLE).
     """
     import logging as _log
     svc, source_name = _get_server_data_source()
@@ -1329,8 +1335,9 @@ async def get_recommendations_via_vision(top_n: int = 30) -> List[Recommendation
     tier_order = {"A+": 0, "A": 1, "B": 2}
     recommendations.sort(key=lambda r: (tier_order[r.tier], -r.score))
 
-    # Portfolio risk guard (#5)
-    recommendations = await _apply_portfolio_guard(recommendations)
+    # Portfolio risk guard (#5) — pulável pro caminho de display amplo (decouple).
+    if apply_guard:
+        recommendations = await _apply_portfolio_guard(recommendations)
     return recommendations
 
 
