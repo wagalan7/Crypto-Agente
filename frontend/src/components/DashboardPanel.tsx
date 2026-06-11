@@ -662,23 +662,34 @@ function TradeHistory({ trades, liveEquity }: {
   trades: RealTradeRow[]
   liveEquity: { total: number; available: number; source: string; exchange: string } | null
 }) {
-  // Filtrar só auto/shadow (ignorar manual)
-  const filtered = trades.filter(t => t.source === 'auto' || t.source === 'shadow')
+  // Toggle pra mostrar/ocultar o histórico de TESTE (shadow). Default: oculto.
+  // IMPORTANTE: os shadows NUNCA são apagados do banco — alimentam a
+  // autoaprendizagem (calibração + buckets). Aqui é só filtro de exibição.
+  const [showShadow, setShowShadow] = useState(false)
+
+  // O que é "trade real" (mexeu em dinheiro de verdade):
+  //  - auto    = bot executou sozinho
+  //  - managed = você entrou pelo painel "Trades Recomendados / BOT OPERA"
+  //              e o bot gerencia (TP1/TP2/SL). Conta como MANUAL pra controle.
+  const isReal = (t: RealTradeRow) => t.source === 'auto' || t.source === 'managed'
+
+  // Default: só os REAIS (auto + managed). Toggle adiciona os shadows (teste).
+  const filtered = trades.filter(t => isReal(t) || (showShadow && t.source === 'shadow'))
 
   // Computar saldo cumulativo:
   // - Shadow trades NÃO afetam o saldo real (são simulações paralelas).
   //   Mostramos before==after pra deixar claro que não houve impacto.
-  // - Auto trades fechados afetam o saldo pelo pnl_usd real.
-  // - Saldo inicial é derivado: saldo_atual_live − Σ pnl_usd(auto fechados)
+  // - Trades reais (auto/managed) fechados afetam o saldo pelo pnl_usd real.
+  // - Saldo inicial é derivado: saldo_atual_live − Σ pnl_usd(reais fechados)
   //   Assim a última linha sempre bate com a banca real da exchange.
   const sortedAsc = [...filtered].sort((a, b) => {
     const ta = a.opened_at ? new Date(a.opened_at).getTime() : 0
     const tb = b.opened_at ? new Date(b.opened_at).getTime() : 0
     return ta - tb
   })
-  // Só auto FECHADO conta pro saldo real
+  // Só trade REAL (auto/managed) FECHADO conta pro saldo real
   const totalRealClosedPnl = sortedAsc
-    .filter(t => t.source === 'auto' && t.status !== 'open')
+    .filter(t => isReal(t) && t.status !== 'open')
     .reduce((acc, t) => acc + (t.pnl_usd ?? 0), 0)
   const initialBalance = liveEquity
     ? liveEquity.total - totalRealClosedPnl
@@ -696,8 +707,8 @@ function TradeHistory({ trades, liveEquity }: {
   for (const t of sortedAsc) {
     const before = running
     const pnl = t.pnl_usd ?? 0
-    // Shadow: balance não muda. Auto fechado: aplica pnl. Auto aberto: balance não muda ainda.
-    const impactsBalance = t.source === 'auto' && t.status !== 'open'
+    // Shadow: balance não muda. Real (auto/managed) fechado: aplica pnl. Aberto: ainda não.
+    const impactsBalance = isReal(t) && t.status !== 'open'
     const after = impactsBalance ? running + pnl : running
     balanceMap.set(t.id, { before, after })
     if (impactsBalance) running = after
@@ -713,9 +724,22 @@ function TradeHistory({ trades, liveEquity }: {
   return (
     <div className="bg-slate-900/50 border border-slate-700/40 rounded-lg p-3">
       <div className="flex items-center justify-between mb-2 flex-wrap gap-1">
-        <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
-          📋 Histórico de operações (real / shadow)
-        </h3>
+        <div className="flex items-center gap-2 flex-wrap">
+          <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
+            📋 Histórico de operações reais
+          </h3>
+          <button
+            onClick={() => setShowShadow(v => !v)}
+            className={`px-2 py-0.5 rounded text-[9px] font-bold border uppercase tracking-wider transition-colors ${
+              showShadow
+                ? 'text-violet-300 bg-violet-500/15 border-violet-500/40'
+                : 'text-slate-500 bg-slate-800/40 border-slate-700/50 hover:text-slate-300'
+            }`}
+            title="Mostra/oculta o histórico de TESTE (shadow). Os testes nunca são apagados — alimentam a autoaprendizagem."
+          >
+            {showShadow ? '🧪 ocultar testes' : '🧪 ver testes'}
+          </button>
+        </div>
         <span className="text-[10px] text-slate-500">
           {rows.length} trade{rows.length === 1 ? '' : 's'} · {liveEquity ? (
             <>
@@ -736,6 +760,7 @@ function TradeHistory({ trades, liveEquity }: {
             <tr className="text-[9px] text-slate-500 uppercase tracking-wider border-b border-slate-800">
               <th className="text-left py-1.5 px-1 font-semibold">Data</th>
               <th className="text-left py-1.5 px-1 font-semibold">Moeda</th>
+              <th className="text-left py-1.5 px-1 font-semibold" title="Origem do trade: AUTO = bot executou sozinho · MANUAL = você entrou pelo painel e o bot gerencia · TESTE = shadow (simulação, não move dinheiro)">Tipo</th>
               <th className="text-left py-1.5 px-1 font-semibold">Side</th>
               <th className="text-right py-1.5 px-1 font-semibold">Qty</th>
               <th className="text-right py-1.5 px-1 font-semibold" title="Alavancagem">Lev</th>
@@ -766,11 +791,24 @@ function TradeHistory({ trades, liveEquity }: {
               const sideCls = t.side === 'long'
                 ? 'text-green-300 bg-green-500/10 border-green-500/30'
                 : 'text-red-300 bg-red-500/10 border-red-500/30'
+              // Badge de origem do trade
+              const srcBadge = t.source === 'managed'
+                ? { label: 'MANUAL', cls: 'text-amber-300 bg-amber-500/10 border-amber-500/30', title: 'Entrada manual pelo painel "Trades Recomendados / BOT OPERA" — o bot gerencia TP1/TP2/SL. Mantido para controle e histórico de aprendizagem.' }
+                : t.source === 'auto'
+                ? { label: 'AUTO', cls: 'text-cyan-300 bg-cyan-500/10 border-cyan-500/30', title: 'Bot executou automaticamente.' }
+                : t.source === 'shadow'
+                ? { label: 'TESTE', cls: 'text-violet-300 bg-violet-500/10 border-violet-500/30', title: 'Shadow (simulação) — não move dinheiro real. Mantido para a autoaprendizagem.' }
+                : { label: (t.source || '—').toUpperCase(), cls: 'text-slate-400 bg-slate-500/10 border-slate-500/30', title: t.source || '' }
               const pnl = t.pnl_usd
               return (
                 <tr key={t.id} className="border-b border-slate-800/40 hover:bg-slate-800/30">
                   <td className="py-1.5 px-1 text-slate-400 font-mono whitespace-nowrap">{fmtDate(t.opened_at)}</td>
                   <td className="py-1.5 px-1 text-slate-200 font-semibold">{t.symbol}</td>
+                  <td className="py-1.5 px-1">
+                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border uppercase ${srcBadge.cls}`} title={srcBadge.title}>
+                      {srcBadge.label}
+                    </span>
+                  </td>
                   <td className="py-1.5 px-1">
                     <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border uppercase ${sideCls}`}>
                       {t.side}
@@ -819,7 +857,7 @@ function TradeHistory({ trades, liveEquity }: {
       </div>
       <div className="mt-2 text-[9px] text-slate-600">
         {liveEquity
-          ? `Saldo real lido ao vivo da ${liveEquity.exchange} (cache 60s). Inicial derivado: $${initialBalance.toFixed(2)}. Apenas trades source=auto fechados movem o saldo — shadows são simulações paralelas (before==after). "Simulado" no header soma shadow+auto pra ver o que teria sido se tudo executasse.`
+          ? `Saldo real lido ao vivo da ${liveEquity.exchange} (cache 60s). Inicial derivado: $${initialBalance.toFixed(2)}. Trades reais (AUTO + MANUAL) fechados movem o saldo — testes (shadow) são simulações paralelas (before==after) e ficam ocultos por padrão (botão "ver testes"). Nada é apagado: os testes alimentam a autoaprendizagem. "Simulado" no header soma teste+real pra ver o que teria sido se tudo executasse.`
           : `Equity API offline — usando fallback $${FALLBACK_INITIAL_BALANCE_USD.toLocaleString('pt-BR')}. Quando voltar, o saldo será derivado da banca real.`}
       </div>
     </div>
