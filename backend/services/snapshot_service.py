@@ -27,7 +27,12 @@ log = logging.getLogger(__name__)
 
 # ── Configuração ─────────────────────────────────────────────────────────
 DEDUP_WINDOW_HOURS = 2       # mesma rec não entra 2× nesse intervalo
-EXPIRY_HOURS = 48            # ceiling absoluto — qualquer trade > 48h é encerrado
+# Teto absoluto: qualquer trade mais velho que isto é encerrado. Antes era 48h
+# hardcoded, o que cortava SWING cedo demais (swing aguenta dias) e desalinhava
+# do gerenciador dos trades reais (TIME_STOP_SWING_MIN = 7 dias). Agora é env,
+# default 168h (7 dias) — alinhado ao swing real. Não reescreve histórico:
+# só vale pros snapshots resolvidos daqui pra frente.
+EXPIRY_HOURS = float(os.getenv("SNAPSHOT_EXPIRY_HOURS", "168"))
 
 # 1 rec por SÍMBOLO (não só por símbolo+direção): bloqueia gerar uma rec
 # na direção OPOSTA enquanto já há uma aberta no mesmo símbolo. Evita o
@@ -40,10 +45,18 @@ ONE_REC_PER_SYMBOL = os.getenv("ONE_REC_PER_SYMBOL", "true").strip().lower() in 
 # horizonte próprio — scalp deve resolver em horas, swing aguenta dias.
 # Valor = horas máximas SEM tocar TP1. Se TP1 já tocou, NÃO aplica
 # (trade está em lucro, deixa o trail/TP2 cuidar).
+#
+# SWING (4h+) usa o mesmo horizonte do gerenciador dos trades reais
+# (TIME_STOP_SWING_MIN = 10080 min = 168h = 7 dias). Antes 4h→36h e
+# 6h/8h/12h/1d→48h (cappado), o que expirava swing cedo demais e treinava
+# o learner com uma política de saída diferente da do bot real. Via env
+# pra ajustar sem mexer em código.
+_SWING_HOURS = float(os.getenv("SNAPSHOT_TIME_STOP_SWING_HOURS", "168"))
 TIME_STOP_HOURS_BY_TF = {
     "1m": 1, "3m": 2, "5m": 3, "15m": 4, "30m": 8,
-    "1h": 12, "2h": 24, "4h": 36, "6h": 48,
-    "8h": 48, "12h": 48, "1d": 48,  # cappado pelo EXPIRY_HOURS
+    "1h": 12, "2h": 24,
+    "4h": _SWING_HOURS, "6h": _SWING_HOURS,
+    "8h": _SWING_HOURS, "12h": _SWING_HOURS, "1d": _SWING_HOURS,
 }
 
 
@@ -533,7 +546,7 @@ async def check_open_snapshots() -> int:
                     resolved += 1
                     continue
 
-                # Ceiling absoluto (48h): independente de TF, fecha.
+                # Ceiling absoluto (EXPIRY_HOURS, default 168h): independente de TF, fecha.
                 # Step 2a: se TP1 já tinha sido tocado, expira como won_tp1 (+0.5R)
                 # — lucro parcial travado. Caso contrário, expired (0R).
                 if age > timedelta(hours=EXPIRY_HOURS):
@@ -561,7 +574,7 @@ async def check_open_snapshots() -> int:
                     # Sem candles. Pode ser falha transitória OU o par sumiu da
                     # fonte (ex.: símbolo que só existia na exchange anterior e
                     # não está no universo atual). Sem tratar, o snapshot
-                    # congelaria "aberto" até o teto de 48h — escondendo o
+                    # congelaria "aberto" até o teto (EXPIRY_HOURS) — escondendo o
                     # resultado real e travando na UI. Se o símbolo
                     # confirmadamente NÃO está no universo da fonte, não há como
                     # resolver por preço: encerra como expired (sem dados) e
