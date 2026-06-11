@@ -42,6 +42,14 @@ LEARNING_LOOKBACK_DAYS = int(os.getenv("LEARNING_LOOKBACK_DAYS", "0"))
 # Status considerados "resolvidos" pra estatística de bucket.
 _RESOLVED_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2", "lost")
 
+# ── Rotação do universo de execução (champion/challenger) ───────────────────
+# Amostra mínima + thresholds de mérito (em expectancy R = avg dos realized_r)
+# pra PROMOVER (aditivo) ou REBAIXAR (maçã podre) uma moeda. Mesma fonte/critério
+# de "resolvido" do learning, pra consistência. Tudo env-tunável.
+ROTATION_MIN_SAMPLE = int(os.getenv("ROTATION_MIN_SAMPLE", "15"))
+ROTATION_PROMOTE_MIN_R = float(os.getenv("ROTATION_PROMOTE_MIN_R", "0.0"))   # avg_r > 0 → candidata
+ROTATION_DEMOTE_MAX_R = float(os.getenv("ROTATION_DEMOTE_MAX_R", "-0.2"))    # avg_r < -0.2R → ejetar
+
 
 def _resolved_conditions(days: int):
     """
@@ -350,6 +358,75 @@ async def lookup_historical_batch(
             "trades": n, "wins": wins, "losses": n - wins,
             "win_rate": round(wr, 1), "avg_r": round(avg_r, 2),
             "sample_ok": n >= MIN_SAMPLE_BUCKET, "verdict": verdict,
+        }
+    return result
+
+
+def _base_symbol(symbol: str) -> str:
+    """'CRV/USDT:USDT' → 'CRV'; 'BTCUSDT' → 'BTC'. Normaliza pra agregação por moeda."""
+    if not symbol:
+        return ""
+    s = symbol.upper().strip()
+    if "/" in s:
+        return s.split("/")[0]
+    s = s.split(":")[0]
+    for q in ("USDT", "USDC", "BUSD", "USD"):
+        if s.endswith(q) and len(s) > len(q):
+            return s[: -len(q)]
+    return s
+
+
+async def compute_symbol_stats(
+    days: int = LEARNING_LOOKBACK_DAYS,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Agrega performance por SÍMBOLO (base) dos snapshots resolvidos — mesma fonte e
+    critério de "resolvido" do learning. É a matéria-prima do motor de rotação do
+    universo de execução (champion/challenger). NÃO decide nada: só mede.
+
+    Retorna {base: {trades, wins, losses, win_rate, avg_r, total_r, sample_ok,
+    verdict}}, verdict ∈ {amostra_pequena, promote, demote, neutro}:
+      • promote  → sample_ok e avg_r > ROTATION_PROMOTE_MIN_R (expectancy positiva)
+      • demote   → sample_ok e avg_r < ROTATION_DEMOTE_MAX_R  (maçã podre)
+      • neutro   → sample_ok mas entre os dois (mantém)
+      • amostra_pequena → trades < ROTATION_MIN_SAMPLE (não julga)
+    """
+    if not DB_ENABLED:
+        return {}
+    async with get_session() as session:
+        stmt = select(RecommendationSnapshot).where(and_(*_resolved_conditions(days)))
+        snaps = (await session.execute(stmt)).scalars().all()
+
+    by_sym: Dict[str, list] = defaultdict(list)
+    for s in snaps:
+        base = _base_symbol(s.symbol)
+        if base:
+            by_sym[base].append(s.realized_r or 0)
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for base, rs in by_sym.items():
+        n = len(rs)
+        wins = sum(1 for r in rs if r > 0)
+        wr = wins / n * 100 if n else 0.0
+        avg_r = sum(rs) / n if n else 0.0
+        sample_ok = n >= ROTATION_MIN_SAMPLE
+        if not sample_ok:
+            verdict = "amostra_pequena"
+        elif avg_r > ROTATION_PROMOTE_MIN_R:
+            verdict = "promote"
+        elif avg_r < ROTATION_DEMOTE_MAX_R:
+            verdict = "demote"
+        else:
+            verdict = "neutro"
+        result[base] = {
+            "trades": n,
+            "wins": wins,
+            "losses": n - wins,
+            "win_rate": round(wr, 1),
+            "avg_r": round(avg_r, 3),
+            "total_r": round(sum(rs), 2),
+            "sample_ok": sample_ok,
+            "verdict": verdict,
         }
     return result
 

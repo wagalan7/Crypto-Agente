@@ -1012,6 +1012,45 @@ async def learning_auto_adjust(days: int = 0):
         raise HTTPException(500, f"Erro ao obter auto-adjust: {e}")
 
 
+@app.get("/api/rotation/symbol-stats")
+async def rotation_symbol_stats(days: int = 0):
+    """Performance por SÍMBOLO (base) dos snapshots resolvidos — matéria-prima do
+    motor de rotação do universo de execução (champion/challenger). Read-only, não
+    decide nada. days=0 (default) = todo o histórico. Ordena por avg_r desc."""
+    try:
+        from services.learning_service import (
+            compute_symbol_stats,
+            ROTATION_MIN_SAMPLE,
+            ROTATION_PROMOTE_MIN_R,
+            ROTATION_DEMOTE_MAX_R,
+        )
+        d = 0 if days <= 0 else max(7, min(days, 365))
+        stats = await compute_symbol_stats(days=d)
+        rows = sorted(
+            ({"symbol": k, **v} for k, v in stats.items()),
+            key=lambda r: (r["sample_ok"], r["avg_r"]),
+            reverse=True,
+        )
+        return {
+            "thresholds": {
+                "min_sample": ROTATION_MIN_SAMPLE,
+                "promote_min_r": ROTATION_PROMOTE_MIN_R,
+                "demote_max_r": ROTATION_DEMOTE_MAX_R,
+            },
+            "counts": {
+                "symbols": len(rows),
+                "promote": sum(1 for r in rows if r["verdict"] == "promote"),
+                "demote": sum(1 for r in rows if r["verdict"] == "demote"),
+                "neutro": sum(1 for r in rows if r["verdict"] == "neutro"),
+                "amostra_pequena": sum(1 for r in rows if r["verdict"] == "amostra_pequena"),
+            },
+            "symbols": rows,
+        }
+    except Exception as e:
+        logging.error(f"rotation symbol-stats error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao obter symbol-stats: {e}")
+
+
 @app.get("/api/calibration")
 async def calibration():
     """
