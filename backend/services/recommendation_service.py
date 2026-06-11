@@ -92,6 +92,15 @@ SYMBOL_DENYLIST: set = {
     _norm_sym(x) for x in os.getenv("SYMBOL_DENYLIST", "NEIRO,GALA").split(",") if x.strip()
 }
 
+# Portfolio guard (caps correlação/exposição: 5 posições / 2 por categoria / 5%
+# risco) — regra de EXECUÇÃO/sizing, não de display. Default ON (PRD: execução
+# real precisa do cap). Desligar SÓ no DEV (ambiente de observação/estudo) pra
+# o painel 👁 OBSERVAÇÃO mostrar o universo amplo SEM o corte pras ~5 melhores.
+# Env-gated: PRD fica intocado (default true).
+PORTFOLIO_GUARD_ENABLED: bool = os.getenv(
+    "PORTFOLIO_GUARD_ENABLED", "true"
+).strip().lower() not in ("0", "false", "no", "off")
+
 
 class Recommendation(BaseModel):
     tier: str                     # "A+" | "A" | "B"
@@ -1378,6 +1387,15 @@ async def _apply_portfolio_guard(recommendations: List[Recommendation]) -> List[
     integração Bybit). Logs drops com motivo claro pra debug.
     """
     if not recommendations:
+        return recommendations
+    # Observação/estudo (DEV): guard OFF → painel mostra o universo amplo inteiro,
+    # sem o corte pras ~5 melhores. PRD mantém default ON (execução real).
+    if not PORTFOLIO_GUARD_ENABLED:
+        import logging as _log
+        _log.info(
+            f"[portfolio-guard] DESLIGADO (PORTFOLIO_GUARD_ENABLED=false) — "
+            f"passando {len(recommendations)} recs sem cap (modo observação/DEV)"
+        )
         return recommendations
     try:
         from services import portfolio_service

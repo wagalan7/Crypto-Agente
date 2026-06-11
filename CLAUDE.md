@@ -41,6 +41,39 @@ Regra dura: **não quebrar código que funciona.**
   `startup_at` em `/api/health`. Preflight de gates: `/api/live/preflight`.
 - Promoção Dev→PRD (futuro): ≥20 trades · expectancy>0 · win-rate≥alvo · ~2 semanas.
 
+## Plano de ramp do canário (tamanho da posição — `LIVE_SIZE_MULT`)
+
+Hoje: **`LIVE_SIZE_MULT=0.25`** (25% do tamanho normal). Sobe por **evidência**, não
+por calendário:
+
+- **0.25 → 0.5:** após as **3 primeiras entradas reais** executando limpo (preço/qtd
+  certos, SL+TP1 colocados, trail/BE pós-TP1 ok, sem ordem rejeitada/erro IP/proxy).
+- **0.5 → 1.0 (oficial):** próximas **10 trades OU 1 semana (o que vier primeiro)**
+  com tudo ok e expectancy não-negativa.
+- Cada subida = você muda a env no Railway + redeploy; eu valido via curl.
+
+## Kill-switch / circuit breaker (já implementado: `kill_switch_service.py`)
+
+Roda **antes de cada ordem real**; bloqueia **novas entradas** (NÃO fecha as abertas).
+Estado derivado de `RealTrade` (sobrevive restart). Envs:
+- `KILL_SWITCH` (manual global) · `KILL_MAX_OPEN_POSITIONS=5`
+- **Perda diária**: `KILL_MAX_DAILY_LOSS_PCT=4` ← **decidido** (4% × equity ≈ $112/dia
+  no início; escala com a banca). Conta **PnL realizado** dos fechados hoje (reset 00h
+  UTC). Fallback `KILL_MAX_DAILY_LOSS_USD=200` se equity indisponível. Avisa Telegram.
+- `KILL_MAX_CONSEC_LOSSES=3` (cooldown `KILL_COOLDOWN_HOURS=12`) · `KILL_MAX_DAILY_TRADES=20`
+
+## Protocolo de operação assistida (pós go-live)
+
+1. **1ª entrada real (sexta):** acompanhar ao vivo cada entrada — preço/qtd certos no
+   tamanho 0.25, SL+TP1 colocados, saldo coerente, sem rejeição/erro IP-proxy. Falhou →
+   **pausa imediata** e diagnóstico.
+2. **Pós-TP1:** confirmar break-even movido + trailing seguindo + parcial realizada.
+3. **Guardas ao vivo:** 5 posições / 2 por categoria / 5% risco; kill-switch à mão.
+4. **Cadência:** sexta = intensivo (loop + kill-switch, aviso por evento); fim de cada
+   dia = revisão (trades, PnL, expectancy, anomalias + decisão de ramp); semanal =
+   revisão maior + recalibração de segunda + decisão 0.5→1.0.
+5. **Diário de bordo:** registrar marcos (1ª entrada, 1º TP1, mudança de ramp, incidentes).
+
 ## Recalibração da autoaprendizagem (calibração P(TP1) + buckets)
 
 - Reaprende com TODO o histórico resolvido (score→P(TP1) via shrinkage bayesiano
