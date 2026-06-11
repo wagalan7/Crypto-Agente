@@ -714,11 +714,20 @@ function TradeHistory({ trades, liveEquity }: {
     if (impactsBalance) running = after
   }
 
-  // Exibir DESC (mais recente primeiro)
-  const rows = [...filtered].sort((a, b) => {
+  // Exibir DESC (mais recente primeiro). Quando "ver testes" está ligado, os
+  // testes (shadow) sobem pro TOPO — assim ficam visíveis sem precisar rolar.
+  const byDateDesc = (a: RealTradeRow, b: RealTradeRow) => {
     const ta = a.opened_at ? new Date(a.opened_at).getTime() : 0
     const tb = b.opened_at ? new Date(b.opened_at).getTime() : 0
     return tb - ta
+  }
+  const rows = [...filtered].sort((a, b) => {
+    if (showShadow) {
+      const sa = a.source === 'shadow' ? 0 : 1
+      const sb = b.source === 'shadow' ? 0 : 1
+      if (sa !== sb) return sa - sb // shadows primeiro
+    }
+    return byDateDesc(a, b)
   })
 
   return (
@@ -800,8 +809,9 @@ function TradeHistory({ trades, liveEquity }: {
                 ? { label: 'TESTE', cls: 'text-violet-300 bg-violet-500/10 border-violet-500/30', title: 'Shadow (simulação) — não move dinheiro real. Mantido para a autoaprendizagem.' }
                 : { label: (t.source || '—').toUpperCase(), cls: 'text-slate-400 bg-slate-500/10 border-slate-500/30', title: t.source || '' }
               const pnl = t.pnl_usd
+              const isShadowRow = t.source === 'shadow'
               return (
-                <tr key={t.id} className="border-b border-slate-800/40 hover:bg-slate-800/30">
+                <tr key={t.id} className={`border-b border-slate-800/40 hover:bg-slate-800/30 ${isShadowRow ? 'bg-violet-500/10' : ''}`}>
                   <td className="py-1.5 px-1 text-slate-400 font-mono whitespace-nowrap">{fmtDate(t.opened_at)}</td>
                   <td className="py-1.5 px-1 text-slate-200 font-semibold">{t.symbol}</td>
                   <td className="py-1.5 px-1">
