@@ -1903,9 +1903,24 @@ async function dispararConfirmacoes() {
     const r = await fetch('/admin/confirmacoes/disparar', {method:'POST'});
     const data = await r.json();
     const n = data.enviados || 0;
+    const det = Array.isArray(data.detalhes) ? data.detalhes : [];
     btn.textContent = `✓ ${n} mensagem(ns) enviada(s)`;
     btn.classList.replace('bg-green-600','bg-green-500');
-    status.textContent = n === 0 ? 'Nenhuma consulta pendente para amanhã.' : `Confirmações enviadas com sucesso!`;
+    // Detalhar quem NÃO recebeu, com o motivo, para não ficar invisível.
+    const naoEnviados = det.filter(d => !d.sent);
+    let extra = '';
+    if (naoEnviados.length) {
+      const motivo = (d) => d.skipped === 'paused' ? 'agente pausado p/ este contato'
+                          : d.skipped ? d.skipped
+                          : 'falha no envio (WhatsApp)';
+      extra = '<br><span class="text-amber-700">Não enviadas:</span><br>' +
+        naoEnviados.map(d => `• ${d.patient || d.phone}: ${motivo(d)}`).join('<br>');
+    }
+    if (n === 0 && naoEnviados.length === 0) {
+      status.innerHTML = 'Nenhuma consulta pendente para amanhã. (Quem já confirmou ou já recebeu não entra na lista.)';
+    } else {
+      status.innerHTML = (n > 0 ? `✓ ${n} confirmação(ões) enviada(s).` : 'Nenhuma enviada.') + extra;
+    }
     status.classList.remove('hidden');
   } catch(e) {
     btn.textContent = '📨 Enviar confirmações agora';
