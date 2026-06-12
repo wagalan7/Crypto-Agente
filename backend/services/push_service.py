@@ -37,6 +37,14 @@ PUSH_ENABLED = bool(VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY and DB_ENABLED)
 # Reversível: setar PUSH_TIER_B_ENABLED=true no Railway re-habilita push de B.
 PUSH_TIER_B_ENABLED = os.getenv("PUSH_TIER_B_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 
+# Máximo de push por batch de scan (anti-flood). Default 5 (comportamento antigo).
+# Subir via env PUSH_BATCH_CAP (ex.: 25) quando se quer receber TODAS as recs
+# do ciclo (bot opera + observação/wide) pra aprendizagem passiva no celular.
+try:
+    PUSH_BATCH_CAP = max(1, int(os.getenv("PUSH_BATCH_CAP", "5")))
+except (TypeError, ValueError):
+    PUSH_BATCH_CAP = 5
+
 if PUSH_ENABLED:
     try:
         from pywebpush import webpush, WebPushException  # type: ignore
@@ -262,8 +270,8 @@ async def notify_recommendations_batch(recs: List[Dict[str, Any]], newly_saved: 
     snapshot é efetivamente inserido, vs duplicata que já existia).
 
     Isso garante que push notifications NÃO se repitam para o mesmo setup
-    que ainda está dentro da janela de dedup (2h). Limita a 5 alerts/batch
-    pra não floodar.
+    que ainda está dentro da janela de dedup (2h). Limita a PUSH_BATCH_CAP
+    alerts/batch (default 5, env-driven) pra não floodar.
     """
     if not PUSH_ENABLED or not recs or newly_saved == 0:
         return 0
@@ -276,7 +284,7 @@ async def notify_recommendations_batch(recs: List[Dict[str, Any]], newly_saved: 
         log.warning("notify_recommendations_batch: nenhuma rec marcada _just_saved — fallback top-score")
         just_saved = sorted(recs, key=lambda r: r.get("score", 0), reverse=True)[:newly_saved]
 
-    candidates = just_saved[:5]   # cap em 5 push/batch
+    candidates = just_saved[:PUSH_BATCH_CAP]   # cap configurável (env PUSH_BATCH_CAP, default 5)
 
     total_sent = 0
     for rec in candidates:
