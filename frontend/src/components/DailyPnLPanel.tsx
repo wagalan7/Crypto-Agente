@@ -132,7 +132,10 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
   // nunca nas estatísticas do PRD. Filtro de origem (default 'bot' = preserva a
   // visão atual; usuário opta por ver observação).
   const [obsOpen, setObsOpen] = useState<Trade[]>([])
-  const [originFilter, setOriginFilter] = useState<'all' | 'bot' | 'observation'>('bot')
+  // Filtro por ACIONABILIDADE (tier): 'bot' = 🎯 acionável (A/A+, pode entrar) ·
+  // 'observation' = 👁 observação (tier B, só acompanhar) · 'all' = tudo.
+  // Default 'all' pra ver as duas categorias distinguidas pelo selo.
+  const [originFilter, setOriginFilter] = useState<'all' | 'bot' | 'observation'>('all')
   const isRange = date !== endDate
   const cardRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const [highlightKey, setHighlightKey] = useState<string | null>(null)
@@ -310,7 +313,9 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
     const botKeys = new Set(bot.map(t => `${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`))
     const obs = obsOpenAll.filter(t => !botKeys.has(`${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`))
     let all = [...bot, ...obs]
-    if (originFilter !== 'all') all = all.filter(t => (t.origin ?? 'bot') === originFilter)
+    // Filtro por tier: 'observation' = tier B · 'bot' = acionável (A/A+).
+    if (originFilter === 'observation') all = all.filter(t => t.tier === 'B')
+    else if (originFilter === 'bot') all = all.filter(t => t.tier !== 'B')
     return all
   }, [data?.open_trades, obsOpenAll, originFilter])
   const openToday = useMemo(
@@ -353,7 +358,8 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
     const bot = (data?.trades ?? []).map(t => ({ ...t, origin: (t.origin ?? 'bot') as 'bot' | 'observation' }))
     const wide = (data?.wide_trades ?? []).map(t => ({ ...t, origin: 'observation' as const }))
     let all = [...bot, ...wide]
-    if (originFilter !== 'all') all = all.filter(t => (t.origin ?? 'bot') === originFilter)
+    if (originFilter === 'observation') all = all.filter(t => t.tier === 'B')
+    else if (originFilter === 'bot') all = all.filter(t => t.tier !== 'B')
     return all
   }, [data?.trades, data?.wide_trades, originFilter])
   const winsList = useMemo(
@@ -405,26 +411,31 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
             </button>
           </div>
 
-          {/* Filtro de origem — nos drills de abertos E de vencedores/perdedores.
-              Default 🤖 Bot (preserva a visão de operações do PRD); usuário opta
-              por ver 👁 observação (universo amplo, não conta nas estatísticas). */}
+          {/* Filtro por ACIONABILIDADE (tier) — nos drills de abertos e de
+              vencedores/perdedores. 🎯 Acionável = tier A/A+ (você pode entrar) ·
+              👁 Observação = tier B (só acompanhar/aprender). */}
           {(drill === 'open' || drill === 'open_today' || drill === 'open_older'
             || drill === 'wins' || drill === 'losses') && (() => {
-            // Contagens por origem dependem do drill atual.
+            // Base (sem filtro de tier) do drill atual, pra contar A/A+ vs B.
             const isOpenDrill = drill === 'open' || drill === 'open_today' || drill === 'open_older'
             const sign = drill === 'losses' ? -1 : 1
-            const botCount = isOpenDrill
-              ? (data?.open_trades ?? []).length
-              : (data?.trades ?? []).filter(t => sign * (t.realized_r ?? 0) > 0).length
-            const obsCount = isOpenDrill
-              ? obsOpenAll.length
-              : (data?.wide_trades ?? []).filter(t => sign * (t.realized_r ?? 0) > 0).length
+            const baseList: Trade[] = isOpenDrill
+              ? (() => {
+                  const bot = (data?.open_trades ?? [])
+                  const k = (t: Trade) => `${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`
+                  const botKeys = new Set(bot.map(k))
+                  return [...bot, ...obsOpenAll.filter(t => !botKeys.has(k(t)))]
+                })()
+              : [...(data?.trades ?? []), ...(data?.wide_trades ?? [])]
+                  .filter(t => sign * (t.realized_r ?? 0) > 0)
+            const actCount = baseList.filter(t => t.tier !== 'B').length
+            const obsCount = baseList.filter(t => t.tier === 'B').length
             return (
             <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-800 overflow-x-auto">
               {([
-                { key: 'bot', label: '🤖 Bot opera', count: botCount },
-                { key: 'observation', label: '👁 Observação', count: obsCount },
-                { key: 'all', label: 'Tudo', count: botCount + obsCount },
+                { key: 'bot', label: '🎯 Acionável (A/A+)', count: actCount },
+                { key: 'observation', label: '👁 Observação (B)', count: obsCount },
+                { key: 'all', label: 'Tudo', count: actCount + obsCount },
               ] as const).map(opt => {
                 const active = originFilter === opt.key
                 const activeCls =
@@ -445,7 +456,7 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                 )
               })}
               <span className="ml-auto text-[10px] text-slate-500 whitespace-nowrap hidden sm:inline">
-                👁 = observação (não conta nas estatísticas)
+                👁 = tier B (só acompanhar) · 🎯 = tier A/A+ (pode entrar)
               </span>
             </div>
             )
@@ -489,18 +500,19 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                     }`}
                   >
                     <div className="flex items-center gap-2 flex-wrap mb-2">
-                      {/* Origem: 🤖 o bot opera (PRD) · 👁 só observação (testes) */}
+                      {/* Acionabilidade por TIER: 🎯 A/A+ = convicção alta (você
+                          pode avaliar entrada manual) · 👁 B = só observação/aprendizado. */}
                       <span
-                        title={(t.origin ?? 'bot') === 'observation'
-                          ? 'OBSERVAÇÃO — o bot NÃO opera essa. Vem do ambiente de testes. Acompanhe até TP/stop pra aprender.'
-                          : 'BOT OPERA — está no universo que o bot executa de verdade.'}
+                        title={t.tier === 'B'
+                          ? 'OBSERVAÇÃO (tier B) — convicção menor. Acompanhe até TP/stop pra aprender; não recomendado pra entrada manual.'
+                          : 'PODE ENTRAR (tier A/A+) — convicção alta. Você pode avaliar entrada manual na corretora.'}
                         className={`px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${
-                          (t.origin ?? 'bot') === 'observation'
+                          t.tier === 'B'
                             ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
                             : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
                         }`}
                       >
-                        {(t.origin ?? 'bot') === 'observation' ? '👁 OBSERVAÇÃO' : '🤖 BOT OPERA'}
+                        {t.tier === 'B' ? '👁 OBSERVAÇÃO' : '🎯 PODE ENTRAR'}
                       </span>
                       <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${badge.cls}`}>{badge.label}</span>
                       {vBadge && (
@@ -589,9 +601,9 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
 
                     {/* Confirmar entrada — só quando o setup ainda é entrável (valid/wait).
                         Você abre na corretora; o bot coloca SL+TP1+TP2 e gerencia o BE.
-                        Oculto para OBSERVAÇÃO: esses trades vêm do ambiente de testes (Dev),
-                        não existem no PRD, então confirmar entrada não se aplica. */}
-                    {(t.origin ?? 'bot') !== 'observation' && viab && (viab.viability === 'valid' || viab.viability === 'wait') && (
+                        Oculto para OBSERVAÇÃO: (a) tier B = só acompanhar (convicção menor);
+                        (b) trades do ambiente de testes (Dev) não existem no PRD. */}
+                    {(t.origin ?? 'bot') !== 'observation' && t.tier !== 'B' && viab && (viab.viability === 'valid' || viab.viability === 'wait') && (
                       <div className="mb-2">
                         {confirmFor !== tradeKey ? (
                           <button
