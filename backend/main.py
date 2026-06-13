@@ -1719,78 +1719,97 @@ async def debug_direction_wr(days: int = 5):
 
 @app.get("/api/debug/vision-pipeline")
 async def debug_vision_pipeline():
-    """Roda cada estágio do pipeline Vision e reporta onde quebra."""
-    from services import binance_vision_service as bvs
+    """Roda cada estágio do server-scan REAL e reporta onde o funil zera.
+    Usa exatamente a fonte/funções do scan loop (_get_server_data_source +
+    _best_tf_for_symbol_server + _classify_tier_vision)."""
     from services.recommendation_service import (
-        _analyze_symbol_tf_via_vision, _compute_score, _classify_tier, SCAN_TFS,
+        _get_server_data_source, _analyze_symbol_tf_server,
+        _best_tf_for_symbol_server, _compute_score, _classify_tier_vision,
+        SCAN_TFS,
     )
     from models.trade_signal import SignalDirection
 
     stages: Dict[str, Any] = {}
 
-    # 1. Top symbols
+    # 0. Qual fonte o scan está usando AGORA
     try:
-        symbols = await bvs.fetch_top_volume_symbols(limit=10)
+        svc, source_name = _get_server_data_source()
+        stages["source"] = source_name
+    except Exception as e:
+        stages["source"] = {"ok": False, "error": str(e)[:300]}
+        return stages
+
+    # 1. Top symbols (mesma chamada do scan)
+    try:
+        symbols = await svc.fetch_top_volume_symbols(limit=10)
         stages["fetch_top_volume_symbols"] = {"ok": True, "count": len(symbols), "sample": symbols[:5]}
     except Exception as e:
-        stages["fetch_top_volume_symbols"] = {"ok": False, "error": str(e)[:300]}
+        stages["fetch_top_volume_symbols"] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}"}
         return stages
 
     if not symbols:
+        stages["verdict"] = "ZERO: fetch_top_volume_symbols retornou lista vazia"
         return stages
 
-    # 2. OHLCV de um símbolo
+    # 2. OHLCV de um símbolo (estágio que costuma falhar silenciosamente no scan)
     test_sym = symbols[0]
     try:
-        df = await bvs.fetch_ohlcv(test_sym, "1h", 100)
+        df = await svc.fetch_ohlcv(test_sym, "1h", 300)
         stages["fetch_ohlcv"] = {"ok": True, "symbol": test_sym, "rows": len(df),
                                   "last_close": float(df["close"].iloc[-1]) if len(df) else None}
     except Exception as e:
-        stages["fetch_ohlcv"] = {"ok": False, "error": str(e)[:300]}
+        stages["fetch_ohlcv"] = {"ok": False, "symbol": test_sym,
+                                  "error": f"{type(e).__name__}: {str(e)[:300]}"}
+        stages["verdict"] = "ZERO: OHLCV falha por símbolo → _analyze_symbol_tf_server engole e retorna None"
         return stages
 
-    # 3. Análise por símbolo: filtra estágio a estágio
+    # 3. Análise por símbolo/TF: revela onde o sinal some
     per_symbol_results = []
+    tier_counts = {"A+": 0, "A": 0, "B": 0, "None": 0}
+    neutral_count = 0
+    signal_ok_count = 0
     for sym in symbols[:10]:
         sym_info: Dict[str, Any] = {"symbol": sym, "tfs": {}}
         for tf in SCAN_TFS:
             try:
-                sig = await _analyze_symbol_tf_via_vision(sym, tf)
+                sig = await _analyze_symbol_tf_server(svc, sym, tf)
                 if sig is None:
                     sym_info["tfs"][tf] = {"signal": None}
                     continue
+                if sig.direction == SignalDirection.NEUTRAL:
+                    neutral_count += 1
+                    sym_info["tfs"][tf] = {"neutral": True}
+                    continue
+                signal_ok_count += 1
                 score = _compute_score(sig)
-                tier = _classify_tier(sig, score)
+                tier = _classify_tier_vision(sig, score)
+                key = tier if tier else "None"
+                tier_counts[key] = tier_counts.get(key, 0) + 1
                 sym_info["tfs"][tf] = {
                     "direction": sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction),
                     "confidence": round(sig.confidence, 2),
                     "rr": sig.risk_reward,
-                    "score": score,
+                    "score": round(score, 1),
                     "tier": tier,
-                    "neutral": sig.direction == SignalDirection.NEUTRAL,
                 }
             except Exception as e:
-                sym_info["tfs"][tf] = {"error": str(e)[:200]}
+                sym_info["tfs"][tf] = {"error": f"{type(e).__name__}: {str(e)[:200]}"}
         per_symbol_results.append(sym_info)
 
     stages["per_symbol"] = per_symbol_results
-
-    # Resumo
-    tier_counts = {"A+": 0, "A": 0, "B": 0, "None": 0}
-    rr_distribution = []
-    for s in per_symbol_results:
-        for tf, info in s["tfs"].items():
-            if "tier" in info:
-                key = info["tier"] if info["tier"] else "None"
-                tier_counts[key] = tier_counts.get(key, 0) + 1
-                if info.get("rr") is not None:
-                    rr_distribution.append(info["rr"])
     stages["summary"] = {
         "tier_counts": tier_counts,
-        "rr_min": min(rr_distribution) if rr_distribution else None,
-        "rr_max": max(rr_distribution) if rr_distribution else None,
-        "rr_avg": round(sum(rr_distribution)/len(rr_distribution), 2) if rr_distribution else None,
+        "non_neutral_signals": signal_ok_count,
+        "neutral_signals": neutral_count,
+        "qualified_recs": tier_counts["A+"] + tier_counts["A"] + tier_counts["B"],
     }
+    if stages["summary"]["qualified_recs"] == 0:
+        if signal_ok_count == 0:
+            stages["verdict"] = "ZERO: nenhum sinal não-neutro gerado (todos None/NEUTRAL)"
+        else:
+            stages["verdict"] = "ZERO: sinais existem mas nenhum passa _classify_tier_vision"
+    else:
+        stages["verdict"] = f"OK: {stages['summary']['qualified_recs']} recs qualificadas nos top-10"
     return stages
 
 
