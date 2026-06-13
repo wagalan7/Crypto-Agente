@@ -36,6 +36,28 @@ DEDUP_WINDOW_HOURS = 2       # mesma rec não entra 2× nesse intervalo
 # dedup DB-backed do push (sem storm no restart). Podado por TTL.
 WIDE_DISPLAY_STATUS = "wide"
 WIDE_DISPLAY_TTL_HOURS = float(os.getenv("WIDE_DISPLAY_TTL_HOURS", "6"))
+
+# ── Opção B: rastreio do universo AMPLO p/ HISTÓRICO (observação) ─────────
+# Quando WIDE_TRACKING_ENABLED, os snapshots 'wide' deixam de ser podados aos
+# 6h e passam a ser RASTREADOS pelo mesmo motor de outcome dos trades reais
+# (check_wide_snapshots ≈ check_open_snapshots), seguindo o ciclo de vida
+# completo (abertos → resolvidos → vencedores/perdedores). MAS de forma
+# ISOLADA das estatísticas do bot: a coluna `realized_r` fica SEMPRE NULL e o
+# status resolvido vai pra um namespace próprio ("wide_won_tp2", "wide_lost"…).
+# O R/PnL de observação é gravado em features['wide_outcome'] (JSON), NUNCA na
+# coluna compartilhada — logo todo agregador de aprendizado/risco/PnL (que
+# filtra realized_r IS NOT NULL ou status resolvido conhecido) continua cego a
+# eles, POR CONSTRUÇÃO. Default OFF: nada muda no bot ao subir.
+WIDE_TRACKING_ENABLED = os.getenv("WIDE_TRACKING_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+# Teto de quantos 'wide' abertos são checados por ciclo (limita carga de candles
+# no proxy — cada um faz fetch_ohlcv). Rotaciona pelos menos-recentemente-checados.
+WIDE_TRACKING_MAX = int(os.getenv("WIDE_TRACKING_MAX", "40"))
+# Prefixo do namespace de status resolvido da observação.
+WIDE_STATUS_PREFIX = "wide_"
+# Status resolvidos de observação (espelham os reais, com prefixo).
+WIDE_RESOLVED_STATUSES = (
+    "wide_won_tp1", "wide_won_tp1_be", "wide_won_tp2", "wide_lost", "wide_expired",
+)
 # Teto absoluto: qualquer trade mais velho que isto é encerrado. Antes era 48h
 # hardcoded, o que cortava SWING cedo demais (swing aguenta dias) e desalinhava
 # do gerenciador dos trades reais (TIME_STOP_SWING_MIN = 7 dias). Agora é env,
@@ -353,7 +375,13 @@ async def save_wide_display_snapshots(recommendations: List[Dict[str, Any]]) -> 
     inserted = 0
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=DEDUP_WINDOW_HOURS)
-    prune_before = now - timedelta(hours=WIDE_DISPLAY_TTL_HOURS)
+    # Sem rastreio (Opção B OFF): poda 'wide' aos WIDE_DISPLAY_TTL_HOURS — só a
+    # dedup importa, não há outcome a guardar. Com rastreio ON: NÃO podar aos 6h,
+    # senão mataríamos snapshots ainda EM VOO antes do outcome. Deixa viver até o
+    # teto de expiração (EXPIRY_HOURS); o check_wide_snapshots resolve antes e os
+    # resolvidos (status 'wide_*') são podados separadamente lá, por outcome_at.
+    _wide_prune_h = EXPIRY_HOURS if WIDE_TRACKING_ENABLED else WIDE_DISPLAY_TTL_HOURS
+    prune_before = now - timedelta(hours=_wide_prune_h)
 
     async with get_session() as session:
         # Poda linhas wide antigas (só a dedup importa; sem outcome a guardar).
@@ -781,6 +809,153 @@ async def check_open_snapshots() -> int:
     return resolved
 
 
+def _record_wide_outcome(snap, status: str, price, r, now) -> None:
+    """
+    Grava o resultado de OBSERVAÇÃO de um snapshot 'wide':
+      • status resolvido vai pro namespace 'wide_*' (NUNCA os status reais);
+      • realized_r fica SEMPRE NULL (não contamina nenhum agregador);
+      • R/preço/saída ficam em features['wide_outcome'] (JSON), fonte de verdade
+        do painel de observação.
+    Reatribui o dict de features (não muta in-place) pra o JSON ser marcado dirty.
+    """
+    snap.status = status if status.startswith(WIDE_STATUS_PREFIX) else (WIDE_STATUS_PREFIX + status)
+    snap.outcome_price = price
+    snap.outcome_at = now
+    snap.realized_r = None  # ISOLAMENTO: jamais escreve a coluna compartilhada
+    feats = dict(snap.features or {})
+    feats["wide_outcome"] = {
+        "r": float(r) if r is not None else None,
+        "price": float(price) if price is not None else None,
+        "status": snap.status,
+        "at": now.isoformat(),
+    }
+    snap.features = feats
+
+
+async def check_wide_snapshots() -> int:
+    """
+    Opção B — rastreio do universo AMPLO p/ HISTÓRICO/observação.
+
+    Espelha check_open_snapshots, MAS sobre os snapshots status=='wide' e SEM
+    tocar em nada que alimente as estatísticas reais:
+      • usa o MESMO motor de outcome (_classify_outcome_candles, time-stop,
+        expiry, candles 5m) — mesma fidelidade do tracker real;
+      • ao resolver, status vai pro namespace 'wide_*' e o R vai em
+        features['wide_outcome']; realized_r fica NULL ⇒ invisível ao
+        learner/risco/PnL POR CONSTRUÇÃO;
+      • NÃO dispara notify_outcome nem close_shadow (não é dinheiro real, não
+        deve poluir push/sombra);
+      • limita a WIDE_TRACKING_MAX por ciclo (carga de candles no proxy),
+        rotacionando pelos menos-recentemente-checados;
+      • poda resolvidos 'wide_*' velhos (outcome_at < EXPIRY_HOURS) — o painel
+        já filtra por janela de data, então não há porque acumular pra sempre.
+
+    Gated por WIDE_TRACKING_ENABLED (default OFF). No-op se desligado.
+    """
+    if not DB_ENABLED or not WIDE_TRACKING_ENABLED:
+        return 0
+
+    from services.binance_service import fetch_ohlcv
+
+    resolved = 0
+    now = datetime.now(timezone.utc)
+
+    async with get_session() as session:
+        # Poda resolvidos 'wide_*' já fora da janela de exibição útil.
+        try:
+            await session.execute(
+                delete(RecommendationSnapshot).where(
+                    and_(
+                        RecommendationSnapshot.status.in_(WIDE_RESOLVED_STATUSES),
+                        RecommendationSnapshot.outcome_at < (now - timedelta(hours=EXPIRY_HOURS)),
+                    )
+                )
+            )
+        except Exception as e:
+            log.warning(f"[wide-track] prune resolvidos falhou: {e}")
+
+        # Abertos 'wide', menos-recentemente-checados primeiro, capado.
+        stmt = (
+            select(RecommendationSnapshot)
+            .where(RecommendationSnapshot.status == WIDE_DISPLAY_STATUS)
+            .order_by(RecommendationSnapshot.last_check_at.asc().nullsfirst())
+            .limit(WIDE_TRACKING_MAX)
+        )
+        result = await session.execute(stmt)
+        wide_snaps = result.scalars().all()
+
+        for snap in wide_snaps:
+            try:
+                age = now - snap.created_at
+                tf_limit_h = _time_stop_hours(snap.timeframe)
+                # Time-stop sem TP1 → expired de observação (0R).
+                if snap.tp1_hit_at is None and age > timedelta(hours=tf_limit_h):
+                    _record_wide_outcome(snap, "wide_expired", None, 0.0, now)
+                    resolved += 1
+                    continue
+
+                # Teto absoluto de expiração.
+                if age > timedelta(hours=EXPIRY_HOURS):
+                    if snap.tp1_hit_at is not None:
+                        _record_wide_outcome(snap, "wide_won_tp1", snap.tp1, REALIZED_R_TP1, now)
+                    else:
+                        _record_wide_outcome(snap, "wide_expired", None, 0.0, now)
+                    resolved += 1
+                    continue
+
+                df = await fetch_ohlcv(snap.symbol, "5m", 50)
+                if df.empty:
+                    # Símbolo fora do universo da fonte → encerra como expired obs.
+                    unavailable = False
+                    try:
+                        from services.binance_service import get_perpetual_symbols
+                        universe = set(await get_perpetual_symbols())
+                        unavailable = bool(universe) and snap.symbol not in universe
+                    except Exception as e:
+                        log.warning(f"[wide-track] checar universo {snap.symbol} falhou: {e}")
+                    if unavailable:
+                        _record_wide_outcome(snap, "wide_expired", None, 0.0, now)
+                        snap.last_check_at = now
+                        resolved += 1
+                    continue
+
+                ref_ts = int((snap.last_check_at or snap.created_at).timestamp() * 1000)
+                df_window = df[df["timestamp"] >= ref_ts]
+                if df_window.empty:
+                    df_window = df.tail(1)
+
+                outcome = _classify_outcome_candles(snap, df_window)
+                if outcome is not None:
+                    status, price, r, tp1_just_hit, new_peak = outcome
+                    if status == "open_after_tp1":
+                        # TP1 parcial: mantém status 'wide', marca tp1/peak — segue aberto.
+                        snap.tp1_hit_at = now
+                        if new_peak is not None:
+                            snap.peak_price_since_tp1 = new_peak
+                    elif status == "open_update":
+                        if new_peak is not None:
+                            snap.peak_price_since_tp1 = new_peak
+                    else:
+                        # Resolveu: grava no namespace de observação.
+                        if tp1_just_hit and snap.tp1_hit_at is None:
+                            snap.tp1_hit_at = now
+                        if new_peak is not None:
+                            snap.peak_price_since_tp1 = new_peak
+                        _record_wide_outcome(snap, WIDE_STATUS_PREFIX + status, price, r, now)
+                        resolved += 1
+                        # SEM notify_outcome / close_shadow: observação não é real.
+
+                snap.last_check_at = now
+            except Exception as e:
+                log.warning(f"Erro checando wide {snap.id} ({snap.symbol}): {e}")
+
+        await session.commit()
+
+    if resolved:
+        log.info(f"[wide-track] snapshots de observação resolvidos: {resolved}")
+    return resolved
+
+
 async def get_recently_stopped_symbols(hours: int = 6) -> set[str]:
     """
     Retorna o set de símbolos que tiveram stop ('lost') ou expiry sem TP1
@@ -847,6 +1022,25 @@ async def get_daily_pnl(
         open_snaps = (await session.execute(open_stmt)).scalars().all()
         open_count = len(open_snaps)
 
+        # ── Opção B: observação (universo AMPLO, status 'wide'/'wide_*') ──
+        # Coletados SÓ se houver rastreio ligado (senão as listas ficam vazias).
+        # São retornados em chaves PRÓPRIAS, NUNCA somados ao summary do bot.
+        wide_snaps = []
+        wide_open_snaps = []
+        if WIDE_TRACKING_ENABLED:
+            wide_stmt = select(RecommendationSnapshot).where(
+                and_(
+                    RecommendationSnapshot.outcome_at >= day_start,
+                    RecommendationSnapshot.outcome_at < day_end,
+                    RecommendationSnapshot.status.in_(WIDE_RESOLVED_STATUSES),
+                )
+            )
+            wide_snaps = (await session.execute(wide_stmt)).scalars().all()
+            wide_open_stmt = select(RecommendationSnapshot).where(
+                RecommendationSnapshot.status == WIDE_DISPLAY_STATUS
+            )
+            wide_open_snaps = (await session.execute(wide_open_stmt)).scalars().all()
+
     wins = [s for s in snaps if s.realized_r and s.realized_r > 0]
     losses = [s for s in snaps if s.realized_r and s.realized_r < 0]
     total_r = sum(s.realized_r or 0 for s in snaps)
@@ -879,6 +1073,39 @@ async def get_daily_pnl(
     trades = [_serialize(s) for s in sorted(snaps, key=lambda x: x.outcome_at or x.created_at)]
     open_trades = [_serialize(s) for s in sorted(open_snaps, key=lambda x: x.created_at)]
 
+    # Serializer de OBSERVAÇÃO: tira o prefixo 'wide_' do status (pra o painel
+    # bucketizar em vencedor/perdedor/aberto igual aos reais) e puxa o R de
+    # features['wide_outcome'] — a coluna realized_r é sempre NULL nesses.
+    # Marca origin='observation' pro front exibir o selo 👁 e isolar das stats.
+    def _serialize_wide(s):
+        out = (s.features or {}).get("wide_outcome") or {}
+        raw_status = s.status or ""
+        disp_status = raw_status[len(WIDE_STATUS_PREFIX):] if raw_status.startswith(WIDE_STATUS_PREFIX) else (
+            "open" if raw_status == WIDE_DISPLAY_STATUS else raw_status
+        )
+        return {
+            "symbol": s.symbol,
+            "timeframe": s.timeframe,
+            "tier": s.tier,
+            "direction": s.direction,
+            "entry": s.entry,
+            "stop_loss": s.stop_loss,
+            "tp1": s.tp1,
+            "tp2": s.tp2,
+            "leverage": s.leverage,
+            "status": disp_status,
+            "realized_r": out.get("r"),  # R de observação (de features, não da coluna)
+            "risk_pct": s.risk_pct,
+            "score": s.score,
+            "origin": "observation",
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "outcome_at": s.outcome_at.isoformat() if s.outcome_at else None,
+            "tp1_hit_at": s.tp1_hit_at.isoformat() if s.tp1_hit_at else None,
+        }
+
+    wide_trades = [_serialize_wide(s) for s in sorted(wide_snaps, key=lambda x: x.outcome_at or x.created_at)]
+    wide_open_trades = [_serialize_wide(s) for s in sorted(wide_open_snaps, key=lambda x: x.created_at)]
+
     # Soma o % real da banca afetado no dia (cada trade tem seu risco próprio:
     # A+=1.5%, A=1%, B=0.5%). Não é total_r × risk_pct[0] — isso só vale se
     # todos os trades fossem do mesmo tier. Aqui somamos por trade.
@@ -900,6 +1127,10 @@ async def get_daily_pnl(
         },
         "trades": trades,
         "open_trades": open_trades,
+        # Opção B — observação (universo amplo). Listas PRÓPRIAS, fora do summary
+        # do bot. Vazias quando WIDE_TRACKING_ENABLED=OFF.
+        "wide_trades": wide_trades,
+        "wide_open_trades": wide_open_trades,
     }
 
 

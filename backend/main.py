@@ -163,6 +163,13 @@ async def _snapshot_loop():
         try:
             await asyncio.sleep(SNAPSHOT_CHECK_INTERVAL)
             await check_open_snapshots()
+            # Opção B: rastreia o universo AMPLO p/ histórico de observação
+            # (no-op se WIDE_TRACKING_ENABLED=OFF). Isolado das stats reais.
+            try:
+                from services.snapshot_service import check_wide_snapshots
+                await check_wide_snapshots()
+            except Exception as e:
+                logging.warning(f"wide_track error: {e}")
             _METRICS["last_snapshot_check_at"] = datetime.now(timezone.utc).isoformat()
         except asyncio.CancelledError:
             break

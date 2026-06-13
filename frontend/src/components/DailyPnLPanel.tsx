@@ -39,6 +39,10 @@ interface DailyPnL {
   }
   trades?: Trade[]
   open_trades?: Trade[]
+  // Opção B — observação (universo amplo, PRD). Listas próprias, isoladas do
+  // summary do bot. Só preenchidas quando WIDE_TRACKING_ENABLED no backend.
+  wide_trades?: Trade[]
+  wide_open_trades?: Trade[]
 }
 
 interface ViabilityItem {
@@ -286,14 +290,29 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
   // Separa abertos em "hoje" (criados no dia atual) vs "anteriores".
   // PRD = 🤖 bot · testes = 👁 observação. Dedupe por símbolo+tf+entry (bot vence).
   const todayStr = todayISO()
+  // Observação = ambiente de testes (DEV, obsOpen) + universo amplo do PRD
+  // (data.wide_open_trades). Dedupe interno por símbolo+tf+direção.
+  const obsOpenAll = useMemo(() => {
+    const wide = (data?.wide_open_trades ?? []).map(t => ({ ...t, origin: 'observation' as const }))
+    const merged = [...obsOpen, ...wide]
+    const seen = new Set<string>()
+    const out: Trade[] = []
+    for (const t of merged) {
+      const k = `${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`
+      if (seen.has(k)) continue
+      seen.add(k)
+      out.push({ ...t, origin: 'observation' as const })
+    }
+    return out
+  }, [obsOpen, data?.wide_open_trades])
   const openListAll = useMemo(() => {
     const bot = (data?.open_trades ?? []).map(t => ({ ...t, origin: (t.origin ?? 'bot') as 'bot' | 'observation' }))
     const botKeys = new Set(bot.map(t => `${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`))
-    const obs = obsOpen.filter(t => !botKeys.has(`${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`))
+    const obs = obsOpenAll.filter(t => !botKeys.has(`${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`))
     let all = [...bot, ...obs]
     if (originFilter !== 'all') all = all.filter(t => (t.origin ?? 'bot') === originFilter)
     return all
-  }, [data?.open_trades, obsOpen, originFilter])
+  }, [data?.open_trades, obsOpenAll, originFilter])
   const openToday = useMemo(
     () => openListAll.filter(t => t.created_at?.slice(0, 10) === todayStr),
     [openListAll, todayStr]
@@ -327,13 +346,23 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
     return { wins: w, losses: l }
   }, [data?.trades])
 
+  // Resolvidos = bot (data.trades, conta nas stats) + observação amplo
+  // (data.wide_trades, NÃO conta). Origin filter decide o que aparece nos
+  // drills de vencedores/perdedores; default 'bot' preserva a visão atual.
+  const resolvedAll = useMemo(() => {
+    const bot = (data?.trades ?? []).map(t => ({ ...t, origin: (t.origin ?? 'bot') as 'bot' | 'observation' }))
+    const wide = (data?.wide_trades ?? []).map(t => ({ ...t, origin: 'observation' as const }))
+    let all = [...bot, ...wide]
+    if (originFilter !== 'all') all = all.filter(t => (t.origin ?? 'bot') === originFilter)
+    return all
+  }, [data?.trades, data?.wide_trades, originFilter])
   const winsList = useMemo(
-    () => (data?.trades ?? []).filter(t => (t.realized_r ?? 0) > 0),
-    [data?.trades]
+    () => resolvedAll.filter(t => (t.realized_r ?? 0) > 0),
+    [resolvedAll]
   )
   const lossesList = useMemo(
-    () => (data?.trades ?? []).filter(t => (t.realized_r ?? 0) < 0),
-    [data?.trades]
+    () => resolvedAll.filter(t => (t.realized_r ?? 0) < 0),
+    [resolvedAll]
   )
   // ── Drill-down render ────────────────────────────────────────────────────
   if (drill !== null && data) {
@@ -376,14 +405,26 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
             </button>
           </div>
 
-          {/* Filtro de origem — só nos drills de abertos. Default 🤖 Bot
-              (preserva a visão de operações); usuário opta por ver 👁 observação. */}
-          {(drill === 'open' || drill === 'open_today' || drill === 'open_older') && (
+          {/* Filtro de origem — nos drills de abertos E de vencedores/perdedores.
+              Default 🤖 Bot (preserva a visão de operações do PRD); usuário opta
+              por ver 👁 observação (universo amplo, não conta nas estatísticas). */}
+          {(drill === 'open' || drill === 'open_today' || drill === 'open_older'
+            || drill === 'wins' || drill === 'losses') && (() => {
+            // Contagens por origem dependem do drill atual.
+            const isOpenDrill = drill === 'open' || drill === 'open_today' || drill === 'open_older'
+            const sign = drill === 'losses' ? -1 : 1
+            const botCount = isOpenDrill
+              ? (data?.open_trades ?? []).length
+              : (data?.trades ?? []).filter(t => sign * (t.realized_r ?? 0) > 0).length
+            const obsCount = isOpenDrill
+              ? obsOpenAll.length
+              : (data?.wide_trades ?? []).filter(t => sign * (t.realized_r ?? 0) > 0).length
+            return (
             <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-800 overflow-x-auto">
               {([
-                { key: 'bot', label: '🤖 Bot opera', count: (data?.open_trades ?? []).length },
-                { key: 'observation', label: '👁 Observação', count: obsOpen.length },
-                { key: 'all', label: 'Tudo', count: (data?.open_trades ?? []).length + obsOpen.length },
+                { key: 'bot', label: '🤖 Bot opera', count: botCount },
+                { key: 'observation', label: '👁 Observação', count: obsCount },
+                { key: 'all', label: 'Tudo', count: botCount + obsCount },
               ] as const).map(opt => {
                 const active = originFilter === opt.key
                 const activeCls =
@@ -404,10 +445,11 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                 )
               })}
               <span className="ml-auto text-[10px] text-slate-500 whitespace-nowrap hidden sm:inline">
-                👁 = ambiente de testes (não conta nas estatísticas)
+                👁 = observação (não conta nas estatísticas)
               </span>
             </div>
-          )}
+            )
+          })()}
 
           <div className="flex-1 overflow-y-auto p-3">
             {list.length === 0 && (
