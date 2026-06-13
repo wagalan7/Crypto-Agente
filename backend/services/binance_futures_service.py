@@ -1,9 +1,17 @@
 """
-Binance Futures via Cloudflare Worker proxy.
+Binance Futures via proxy de saída (forward proxy).
 
-Se BINANCE_PROXY_URL estiver setada no ambiente, usamos fapi.binance.com via
-proxy (mesmos dados que o app vê quando aberto). Senão, falha graceful e o
-caller deve usar `binance_vision_service` (spot) como fallback.
+Se BINANCE_PROXY_URL estiver setada, batemos direto em fapi.binance.com COM o
+proxy de egress (mesmo padrão de binance_signed_service: httpx `proxy=`), pra a
+whitelist da Binance não quebrar quando o IP do host muda. Formato esperado:
+"http://user:pass@host:porta" (forward proxy: tinyproxy/squid/socks5).
+
+IMPORTANTE: NÃO anexar o path no proxy (`{PROXY}/fapi/...`) — isso trata o
+forward proxy como reverse proxy e o tinyproxy responde 407. O proxy vai no
+cliente httpx (`proxy=`), e a URL alvo é o fapi.binance.com real.
+
+Senão (sem proxy), falha graceful e o caller usa `binance_vision_service`
+(spot) como fallback.
 
 Símbolos: CCXT "BTC/USDT:USDT" ↔ Binance Futures "BTCUSDT".
 """
@@ -14,8 +22,11 @@ import httpx
 import pandas as pd
 from typing import List, Dict, Optional
 
-PROXY_URL = os.getenv("BINANCE_PROXY_URL", "").rstrip("/")
+PROXY_URL = os.getenv("BINANCE_PROXY_URL", "").strip() or None
 PROXY_ENABLED = bool(PROXY_URL)
+
+# Alvo real das chamadas; o proxy (se houver) é aplicado no cliente httpx.
+FAPI_BASE = "https://fapi.binance.com"
 
 TOP_VOLUME_TTL = 120
 TICKER_TTL = 60
@@ -32,12 +43,15 @@ _ticker_cache: Dict[str, tuple] = {}
 
 def _get_client() -> httpx.AsyncClient:
     global _client
-    if _client is None:
-        _client = httpx.AsyncClient(
-            timeout=20.0,
-            headers={"User-Agent": "CryptoAgent/1.0"},
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=30),
-        )
+    if _client is None or _client.is_closed:
+        kwargs: dict = {
+            "timeout": 20.0,
+            "headers": {"User-Agent": "CryptoAgent/1.0"},
+            "limits": httpx.Limits(max_keepalive_connections=10, max_connections=30),
+        }
+        if PROXY_ENABLED:
+            kwargs["proxy"] = PROXY_URL  # forward proxy (mesmo padrão do signed_service)
+        _client = httpx.AsyncClient(**kwargs)
     return _client
 
 
@@ -72,7 +86,7 @@ async def fetch_top_volume_symbols(limit: int = 40) -> List[str]:
             return data
 
     client = _get_client()
-    r = await client.get(f"{PROXY_URL}/fapi/v1/ticker/24hr")
+    r = await client.get(f"{FAPI_BASE}/fapi/v1/ticker/24hr")
     r.raise_for_status()
     rows = r.json()
 
@@ -108,7 +122,7 @@ async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> pd.DataF
     fut_sym = to_fut(symbol)
     client = _get_client()
     r = await client.get(
-        f"{PROXY_URL}/fapi/v1/klines",
+        f"{FAPI_BASE}/fapi/v1/klines",
         params={"symbol": fut_sym, "interval": timeframe, "limit": limit},
     )
     r.raise_for_status()
@@ -138,7 +152,7 @@ async def fetch_ticker(symbol: str) -> Dict:
             return data
     client = _get_client()
     r = await client.get(
-        f"{PROXY_URL}/fapi/v1/ticker/24hr", params={"symbol": fut_sym}
+        f"{FAPI_BASE}/fapi/v1/ticker/24hr", params={"symbol": fut_sym}
     )
     r.raise_for_status()
     j = r.json()
@@ -161,7 +175,7 @@ async def fetch_funding_rate(symbol: str) -> Optional[float]:
     try:
         client = _get_client()
         r = await client.get(
-            f"{PROXY_URL}/fapi/v1/premiumIndex", params={"symbol": fut_sym}
+            f"{FAPI_BASE}/fapi/v1/premiumIndex", params={"symbol": fut_sym}
         )
         r.raise_for_status()
         j = r.json()
@@ -177,7 +191,7 @@ async def fetch_open_interest(symbol: str) -> Optional[float]:
     try:
         client = _get_client()
         r = await client.get(
-            f"{PROXY_URL}/fapi/v1/openInterest", params={"symbol": fut_sym}
+            f"{FAPI_BASE}/fapi/v1/openInterest", params={"symbol": fut_sym}
         )
         r.raise_for_status()
         j = r.json()
