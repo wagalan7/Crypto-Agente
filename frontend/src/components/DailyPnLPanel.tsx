@@ -433,7 +433,8 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
             const actCount = baseList.filter(t => t.tier !== 'B').length
             const obsCount = baseList.filter(t => t.tier === 'B').length
             return (
-            <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-800 overflow-x-auto">
+            <div className="px-4 py-2 border-b border-slate-800">
+             <div className="flex items-center gap-2 flex-wrap">
               {([
                 { key: 'bot', label: '🎯 Acionável (A/A+)', count: actCount },
                 { key: 'observation', label: '👁 Observação (B)', count: obsCount },
@@ -457,9 +458,10 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                   </button>
                 )
               })}
-              <span className="ml-auto text-[10px] text-slate-500 whitespace-nowrap hidden sm:inline">
-                👁 = tier B (só acompanhar) · 🎯 = tier A/A+ (pode entrar)
-              </span>
+             </div>
+             <p className="mt-1.5 text-[10px] text-slate-500 leading-snug">
+               👁 = tier B (só acompanhar) · 🎯 = tier A/A+ (pode entrar)
+             </p>
             </div>
             )
           })()}
@@ -546,7 +548,7 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-3 sm:grid-cols-5 gap-2 text-[11px] mb-2">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-3 gap-y-2 text-[11px] mb-2">
                       <div>
                         <div className="text-slate-600 text-[9px]">Entrada</div>
                         <div className="font-mono text-yellow-300">{fmt(t.entry)}</div>
