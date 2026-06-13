@@ -365,6 +365,17 @@ SCORE_ADJUSTER_CAP = float(os.getenv("SCORE_ADJUSTER_CAP", "20"))
 PROXIMITY_GATE_ENABLED = os.getenv("PROXIMITY_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 PROXIMITY_MAX_ATR = float(os.getenv("PROXIMITY_MAX_ATR", "1.0"))
 
+# ── R:R gate (geometria estrutural) ─────────────────────────────────────────
+# O entry_planner já calcula stop/TP por estrutura (swing low/high, OB, pools de
+# liquidez). Mas até aqui um setup com stop longe e alvo perto (R:R fraco) abria
+# igual — expectância ruim. Este gate exige um R:R mínimo medido SOBRE O PRÓPRIO
+# plano estrutural (entry→stop vs entry→TP). Complementa o anti-chase: aquele
+# garante que o mercado não fugiu do entry; este garante que a geometria do
+# setup vale o risco. Aplica em shadow e live. 0 desliga cada piso.
+RR_GATE_ENABLED = os.getenv("RR_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+MIN_RR_TP1_EXEC = float(os.getenv("MIN_RR_TP1_EXEC", "0.7"))   # TP1 (parcial) >= 0.7R
+MIN_RR_TP2_EXEC = float(os.getenv("MIN_RR_TP2_EXEC", "1.5"))   # TP2 (alvo final) >= 1.5R
+
 # ── Diagnóstico: motivo do último skip por símbolo ──────────────────────────
 # Pra responder "por que a tier A não virou trade?" sem caçar log. Guarda o
 # último motivo de skip por símbolo (cap de tamanho). Exposto via API.
@@ -1898,6 +1909,34 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             continue
                     except Exception:
                         pass
+
+            # ── R:R gate (geometria estrutural): stop longe + alvo perto =
+            # expectância ruim. Exige R:R mínimo a TP1 e TP2 medido sobre o
+            # plano (entry/stop/TP do entry_planner). Mantém o stop/TP intactos;
+            # só RECUSA setups com geometria fraca — "estrutural ou nada".
+            if RR_GATE_ENABLED:
+                try:
+                    _entry = float(rec.get("entry") or 0)
+                    _stop = float(rec.get("stop_loss") or 0)
+                    _sig = rec.get("signal") or {}
+                    _tp1 = _sig.get("tp1") if isinstance(_sig, dict) else None
+                    _tp2 = rec.get("tp2")
+                    _risk = abs(_entry - _stop)
+                    if _entry > 0 and _risk > 0:
+                        _rr1 = abs(float(_tp1) - _entry) / _risk if _tp1 else None
+                        _rr2 = abs(float(_tp2) - _entry) / _risk if _tp2 else None
+                        if _rr1 is not None and MIN_RR_TP1_EXEC > 0 and _rr1 < MIN_RR_TP1_EXEC:
+                            reason = f"R:R TP1 {_rr1:.2f} < mín {MIN_RR_TP1_EXEC}"
+                            log.info(f"[rr-gate] {rec.get('symbol')} {reason} — skip")
+                            _record_skip(rec, "rr-gate", reason)
+                            continue
+                        if _rr2 is not None and MIN_RR_TP2_EXEC > 0 and _rr2 < MIN_RR_TP2_EXEC:
+                            reason = f"R:R TP2 {_rr2:.2f} < mín {MIN_RR_TP2_EXEC}"
+                            log.info(f"[rr-gate] {rec.get('symbol')} {reason} — skip")
+                            _record_skip(rec, "rr-gate", reason)
+                            continue
+                except Exception as e:
+                    log.warning(f"[rr-gate] {rec.get('symbol')} check falhou: {e}")
 
             # ── Score threshold (postmortem): piso configurável + adjusters.
             try:
