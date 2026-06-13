@@ -498,6 +498,37 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                 "phone": phone,
                 "patient_name": patient_name or phone,
             })
+        # ── Paciente respondeu NÃO à confirmação → avisar psicóloga ──────────────
+        elif event and event.get("type") == "confirmation_declined":
+            psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
+            ev_data = event.get("data", {}) or {}
+            phone_norm = _norm_phone(phone)
+            nome_txt = ev_data.get("patient_name", "") or "Paciente"
+            quando_txt = ""
+            try:
+                import calendar_service as _cal
+                from datetime import datetime as _dt
+                if ev_data.get("scheduled_at"):
+                    quando_txt = _cal.format_slots([_dt.fromisoformat(ev_data["scheduled_at"])])[0]
+            except Exception:
+                quando_txt = ""
+            if psy_phone:
+                linha_quando = f"\nSessão: *{quando_txt}*" if quando_txt else ""
+                notif = (
+                    f"⚠️ *Confirmação recusada*\n"
+                    f"*{nome_txt}* respondeu *NÃO* ao pedido de confirmação.{linha_quando}\n"
+                    f"Número: {phone_norm}\n\n"
+                    f"Pode ser que precise remarcar ou cancelar — recomendo falar "
+                    f"com o(a) paciente. 💙"
+                )
+                await wa.send_message(tenant, psy_phone, notif)
+                logger.info(f"[{tenant['slug']}] Notificação de NEGATIVA enviada para psicóloga")
+            try:
+                await events.publish(tenant["id"], "confirmation_declined",
+                                     {"phone": phone, "patient_name": ev_data.get("patient_name", "")})
+            except Exception:
+                pass
+
         elif event:
             await events.publish(tenant["id"], event["type"], event["data"])
 

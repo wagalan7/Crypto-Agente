@@ -635,6 +635,73 @@ def _try_deterministic_confirm(tenant: dict, phone: str, text: str) -> str | Non
     return f"Ótimo! ✅ Presença confirmada. {quando} 😊"
 
 
+# Negativas CURTAS e isoladas a um pedido de confirmação ("NÃO", "n", "nops"…).
+# NÃO incluímos frases verbais de cancelamento ("não vou poder ir", "não consigo
+# ir") de propósito: essas seguem para o fluxo de CANCELAMENTO do LLM, que de
+# fato cancela e libera o horário. Aqui tratamos só o "NÃO" seco, que o LLM
+# vinha confundindo com desabafo e respondendo "vou repassar para a Bruna".
+_DECLINE_TOKENS = {
+    "nao", "não", "naao", "naão", "naum", "naun", "nãoo", "naoo", "nn",
+    "nops", "nope", "negativo", "n", "ainda nao", "ainda não",
+    "nao confirmo", "não confirmo", "nao posso confirmar", "não posso confirmar",
+    "nao vou confirmar", "não vou confirmar", "agora nao", "agora não",
+    "hoje nao", "hoje não", "infelizmente nao", "infelizmente não",
+}
+
+
+def _is_confirmation_decline(text: str) -> bool:
+    """True só para negativas curtas e isoladas (sem data/horário, sem pedido
+    de remarcar embutido). Espelha _is_affirmation, mas para o 'NÃO'."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    if len(t) > 25 or any(ch.isdigit() for ch in t):
+        return False
+    cleaned = "".join(ch for ch in t if ch.isalpha() or ch.isspace()).strip()
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return False
+    # Se vier pedido de remarcar/horário embutido, NÃO é negativa pura.
+    if any(w in cleaned for w in ("remarc", "outro", "dia", "hora", "manha", "manhã",
+                                  "tarde", "noite", "pode ser", "consigo", "vou poder",
+                                  "desmarc", "cancel")):
+        return False
+    return cleaned in _DECLINE_TOKENS
+
+
+def _try_deterministic_decline(tenant: dict, phone: str, text: str):
+    """Se o paciente respondeu 'NÃO' (seco) a um pedido de confirmação que o
+    sistema JÁ enviou, devolve (reply, event) acolhendo e sinalizando para a
+    psicóloga. NÃO cancela nem remarca — a Bruna decide (sigilo + segurança).
+    Caso contrário devolve None (segue para o LLM)."""
+    if not _is_confirmation_decline(text):
+        return None
+    tenant_id = tenant["id"]
+    try:
+        appt = cal.get_next_appointment(tenant_id, phone)
+    except Exception:
+        return None
+    if not appt:
+        return None
+    if appt.get("confirmed") or appt.get("cancelled"):
+        return None
+    pedimos = bool(appt.get("confirmation_sent")) or bool(appt.get("followup_sent"))
+    if not pedimos:
+        return None
+    nome = (appt.get("patient_name") or "").split()[0] if appt.get("patient_name") else ""
+    psic = tenant.get("psychologist_name") or "a psicóloga"
+    saud = f"Entendi, {nome}! 😊" if nome else "Entendi! 😊"
+    reply = (f"{saud} Sem problema. Vou avisar a {psic} e ela entra em contato "
+             f"com você em breve por aqui. 💙")
+    logger.info(f"[{tenant['slug']}][{phone}] NEGATIVA DETERMINÍSTICA à confirmação id={appt['id']}")
+    event = {"type": "confirmation_declined", "data": {
+        "phone": phone,
+        "patient_name": appt.get("patient_name") or "",
+        "scheduled_at": appt.get("scheduled_at") or "",
+    }}
+    return reply, event
+
+
 def _greeting_reply(tenant: dict, phone: str) -> str:
     """Resposta determinística para saudações — não passa pelo LLM."""
     tenant_id = tenant["id"]
@@ -688,6 +755,20 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
             intent=Intent.confirm, action=Action.confirm,
             response_text=_det_confirm, data={}), {
                 "type": "appointment_confirmed", "data": {"phone": phone}}
+
+    # ── Atalho determinístico para NEGATIVA ("Não" seco) à confirmação ──────────
+    # Antes o LLM confundia "NÃO" com desabafo e respondia "vou repassar para a
+    # Bruna" (errado no contexto). Agora acolhe e sinaliza para a psicóloga,
+    # sem cancelar nem remarcar (ela decide). Só dispara se há confirmação
+    # pendente que o sistema já pediu.
+    _det_decline = _try_deterministic_decline(tenant, phone, text)
+    if _det_decline is not None:
+        _reply_d, _event_d = _det_decline
+        db.save_message(tenant_id, phone, "assistant", _reply_d)
+        logger.info(f"[{tenant['slug']}][{phone}] negativa determinística — sem LLM")
+        return _reply_d, AgentResponse(
+            intent=Intent.other, action=Action.none,
+            response_text=_reply_d, data={}), _event_d
 
     # limit aumentado de 6 → 24 para garantir cobertura de manhã, tarde e noite
     # em vários dias, permitindo ao LLM filtrar quando paciente pede "tarde"/"manhã"
