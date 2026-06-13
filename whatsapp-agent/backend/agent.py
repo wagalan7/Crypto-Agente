@@ -2,7 +2,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import config
 import database as db
@@ -10,6 +11,11 @@ import calendar_service as cal
 import google_calendar_service as gcal
 import caldav_service as caldav_svc
 from models import AgentResponse, Action, Intent
+
+# Fuso de Brasília — usado pelos atalhos determinísticos (confirmação,
+# remarcação, parsing de data/hora). Mantido em nível de módulo para não
+# depender de variáveis locais de outras funções.
+_TZ = ZoneInfo("America/Sao_Paulo")
 
 logger = logging.getLogger(__name__)
 
@@ -702,6 +708,176 @@ def _try_deterministic_decline(tenant: dict, phone: str, text: str):
     return reply, event
 
 
+_WEEKDAYS_PT = {
+    "segunda-feira": 0, "segunda": 0, "seg": 0,
+    "terça-feira": 1, "terca-feira": 1, "terça": 1, "terca": 1, "ter": 1,
+    "quarta-feira": 2, "quarta": 2, "qua": 2,
+    "quinta-feira": 3, "quinta": 3, "qui": 3,
+    "sexta-feira": 4, "sexta": 4, "sex": 4,
+    "sábado": 5, "sabado": 5, "sab": 5,
+    "domingo": 6, "dom": 6,
+}
+
+
+def _parse_time_br(t: str):
+    """Extrai (hora, minuto) de um texto PT-BR. None se não achar."""
+    m = re.search(r"\b(\d{1,2})[:h](\d{2})\b", t)          # 16:30 / 16h30
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return h, mi
+    m = re.search(r"\b(\d{1,2})\s*h(?:oras|rs|r)?\b", t)   # 16h / 16 horas / 16hrs
+    if m:
+        h = int(m.group(1))
+        if 0 <= h <= 23:
+            return h, 0
+    m = re.search(r"[àa]s\s+(\d{1,2})\b(?!\s*/)", t)        # às 16 (não "às 16/06")
+    if m:
+        h = int(m.group(1))
+        if 0 <= h <= 23:
+            return h, 0
+    if "meio dia" in t or "meio-dia" in t or "meiodia" in t:
+        return 12, 0
+    return None
+
+
+def _parse_date_br(t: str, now: datetime):
+    """Extrai uma data (date) de um texto PT-BR. None se não achar."""
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", t)   # dd/mm(/aaaa)
+    if m:
+        d, mo = int(m.group(1)), int(m.group(2))
+        ystr = m.group(3)
+        y = (int(ystr) + 2000 if int(ystr) < 100 else int(ystr)) if ystr else now.year
+        try:
+            cand = datetime(y, mo, d).date()
+        except ValueError:
+            return None
+        if not ystr and cand < now.date():     # sem ano e já passou → ano que vem
+            try:
+                cand = datetime(y + 1, mo, d).date()
+            except ValueError:
+                return None
+        return cand
+    if "depois de amanha" in t or "depois de amanhã" in t:
+        return (now + timedelta(days=2)).date()
+    if "amanha" in t or "amanhã" in t:
+        return (now + timedelta(days=1)).date()
+    if re.search(r"\bhoje\b", t):
+        return now.date()
+    m = re.search(r"\bdia\s+(\d{1,2})\b", t)                       # "dia 20"
+    if m:
+        d = int(m.group(1))
+        try:
+            cand = datetime(now.year, now.month, d).date()
+        except ValueError:
+            return None
+        if cand < now.date():
+            mo, y = now.month + 1, now.year
+            if mo > 12:
+                mo, y = 1, y + 1
+            try:
+                cand = datetime(y, mo, d).date()
+            except ValueError:
+                return None
+        return cand
+    for name, wd in _WEEKDAYS_PT.items():                         # nomes de dia
+        if re.search(rf"\b{name}\b", t):
+            ahead = (wd - now.weekday()) % 7
+            if ahead == 0:
+                ahead = 7      # "terça" quando hoje é terça → próxima terça
+            return (now + timedelta(days=ahead)).date()
+    return None
+
+
+def _do_reschedule(tenant: dict, phone: str, appt: dict, slot: datetime) -> str:
+    """Move a consulta para `slot`, sincroniza Google Calendar/CalDAV e devolve
+    a confirmação. Reusa a mesma lógica comprovada de Action.update."""
+    tenant_id = tenant["id"]
+    appt_id = appt["id"]
+    duration_min = tenant.get("session_minutes", 50)
+    patient_name = appt.get("patient_name", "Paciente") or "Paciente"
+    db.update_appointment(tenant_id, appt_id, slot)
+    if tenant.get("google_refresh_token"):
+        try:
+            gcal_ok = False
+            if appt.get("google_event_id"):
+                gcal_ok = gcal.update_event(tenant, appt["google_event_id"],
+                                            patient_name, slot.isoformat(), duration_min)
+            if not gcal_ok:
+                new_id = gcal.create_event(tenant, patient_name, slot.isoformat(), duration_min)
+                if new_id:
+                    db.set_appointment_google_event_id(int(appt_id), new_id)
+        except Exception as e:
+            logger.warning(f"[gcal] reschedule determinístico falhou: {e}")
+    else:
+        try:
+            cd_ok = False
+            if appt.get("google_event_id"):
+                cd_ok = caldav_svc.update_event(tenant, appt["google_event_id"],
+                                                patient_name, slot.isoformat(), duration_min)
+            if not cd_ok:
+                new_uid = caldav_svc.create_event(tenant, patient_name, slot.isoformat(), duration_min)
+                if new_uid:
+                    db.set_appointment_google_event_id(int(appt_id), new_uid)
+        except Exception as e:
+            logger.warning(f"[caldav] reschedule determinístico falhou: {e}")
+    formatted = cal.format_slots([slot])[0]
+    nome = patient_name.split()[0] if patient_name else ""
+    saud = f"Pronto, {nome}! ✅" if nome else "Pronto! ✅"
+    logger.info(f"[{tenant['slug']}][{phone}] REMARCAÇÃO DETERMINÍSTICA id={appt_id} → {slot.isoformat()}")
+    return f"{saud} Sua sessão foi remarcada para {formatted}. Até lá! 🌸"
+
+
+def _try_deterministic_reschedule(tenant: dict, phone: str, text: str):
+    """Paciente informou DATA + HORA explícitas (ex.: 'Dia 20/06 às 16h') e tem
+    uma consulta futura → remarca direto se o horário estiver livre, ou oferece
+    alternativas próximas se não. Antes o LLM ignorava a data e perguntava de
+    novo a disponibilidade. Devolve (reply, event) ou None (segue p/ LLM)."""
+    if not text:
+        return None
+    t = text.strip().lower()
+    if "?" in t or len(t) > 50:
+        return None
+    # Cancelamento/desabafo não são remarcação — deixa o fluxo próprio cuidar.
+    if any(w in t for w in ("cancel", "desmarc", "nao vou", "não vou", "nao posso", "não posso")):
+        return None
+    now_br = datetime.now(_TZ).replace(tzinfo=None)
+    tm = _parse_time_br(t)
+    dd = _parse_date_br(t, now_br)
+    if not tm or not dd:
+        return None
+    target = datetime(dd.year, dd.month, dd.day, tm[0], tm[1])
+    tenant_id = tenant["id"]
+    try:
+        appt = cal.get_next_appointment(tenant_id, phone)
+    except Exception:
+        return None
+    # Só remarca quem JÁ tem consulta real futura (não placeholder de novo paciente).
+    if not appt or appt.get("cancelled"):
+        return None
+    if (appt.get("scheduled_at") or "").startswith("2099-"):
+        return None
+    nome = (appt.get("patient_name") or "").split()[0] if appt.get("patient_name") else ""
+    ok, motivo = cal.is_slot_bookable(tenant, target, exclude_id=int(appt["id"]))
+    event = {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}
+    if ok:
+        reply = _do_reschedule(tenant, phone, appt, target)
+        return reply, event
+    # Horário pedido indisponível → oferecer próximos (determinístico).
+    fmt_target = cal.format_slots([target])[0]
+    alts = cal.suggest_slots_near(tenant, target, n=3)
+    logger.info(f"[{tenant['slug']}][{phone}] data explícita indisponível ({motivo}): {target.isoformat()}")
+    if alts:
+        linhas = "\n".join(f"  • {s}" for s in cal.format_slots(alts))
+        abre = f"Poxa, {nome}! " if nome else ""
+        reply = (f"{abre}O horário {fmt_target} não está disponível. 😕\n"
+                 f"Posso te oferecer:\n{linhas}\n\nAlgum desses serve pra você? 😊")
+    else:
+        reply = (f"O horário {fmt_target} não está disponível e não encontrei horários "
+                 f"próximos. Quer me dizer outro dia ou período? 😊")
+    return reply, event
+
+
 def _greeting_reply(tenant: dict, phone: str) -> str:
     """Resposta determinística para saudações — não passa pelo LLM."""
     tenant_id = tenant["id"]
@@ -769,6 +945,19 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
         return _reply_d, AgentResponse(
             intent=Intent.other, action=Action.none,
             response_text=_reply_d, data={}), _event_d
+
+    # ── Atalho determinístico para REMARCAÇÃO com DATA+HORA explícitas ──────────
+    # "Dia 20/06 às 16h", "amanhã às 15h", "terça 10h" → o LLM ignorava a data e
+    # perguntava de novo a disponibilidade. Agora, se o paciente tem consulta
+    # futura, remarca direto (se livre) ou oferece horários próximos.
+    _det_resched = _try_deterministic_reschedule(tenant, phone, text)
+    if _det_resched is not None:
+        _reply_r, _event_r = _det_resched
+        db.save_message(tenant_id, phone, "assistant", _reply_r)
+        logger.info(f"[{tenant['slug']}][{phone}] remarcação determinística — sem LLM")
+        return _reply_r, AgentResponse(
+            intent=Intent.reschedule, action=Action.update,
+            response_text=_reply_r, data={}), _event_r
 
     # limit aumentado de 6 → 24 para garantir cobertura de manhã, tarde e noite
     # em vários dias, permitindo ao LLM filtrar quando paciente pede "tarde"/"manhã"

@@ -105,6 +105,43 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
     return slots
 
 
+def is_slot_bookable(tenant: dict, dt: datetime, exclude_id: int | None = None) -> tuple[bool, str]:
+    """Valida se `dt` pode receber uma sessão: precisa ser futuro, em dia
+    atendido, dentro do expediente, fora de horários/datas bloqueados e sem
+    conflito com outra consulta. Retorna (ok, motivo)."""
+    now = datetime.now(_TZ).replace(tzinfo=None)
+    if dt <= now:
+        return False, "passado"
+    if dt.weekday() not in _working_days(tenant):
+        return False, "dia_nao_atendido"
+    start_h = tenant["working_hours_start"]
+    end_h = tenant["working_hours_end"]
+    if not (start_h <= dt.hour < end_h):
+        return False, "fora_expediente"
+    if dt.hour in _blocked_hours(tenant):
+        return False, "horario_bloqueado"
+    if dt.hour in _blocked_hours_by_day(tenant).get(dt.weekday(), set()):
+        return False, "horario_bloqueado"
+    if dt.strftime("%Y-%m-%d") in _blocked_dates(tenant):
+        return False, "data_bloqueada"
+    duration = tenant.get("session_minutes", 50)
+    if db.has_conflict(tenant["id"], dt, duration, exclude_id=exclude_id):
+        return False, "ocupado"
+    return True, "ok"
+
+
+def suggest_slots_near(tenant: dict, target_dt: datetime, n: int = 3) -> list[datetime]:
+    """Sugere até `n` horários livres próximos da data pedida — prioriza o
+    MESMO dia (mais perto do horário pedido) e depois os dias seguintes."""
+    slots = get_available_slots(tenant, days_ahead=14, limit=80)
+    same_day = sorted(
+        [s for s in slots if s.date() == target_dt.date()],
+        key=lambda s: abs((s - target_dt).total_seconds()),
+    )
+    rest = [s for s in slots if s.date() != target_dt.date()]
+    return (same_day + rest)[:n]
+
+
 def format_slots(slots: list[datetime]) -> list[str]:
     day_names = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
     return [
