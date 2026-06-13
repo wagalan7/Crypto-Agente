@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { X, BarChart3, TrendingUp, TrendingDown, Clock, RefreshCw, Calendar, ChevronLeft } from 'lucide-react'
 import { api } from '../services/api'
+import LiveTestWidget from './LiveTestWidget'
 
 interface Trade {
   symbol: string
@@ -467,6 +468,7 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
           })()}
 
           <div className="flex-1 overflow-y-auto p-3">
+            <LiveTestWidget />
             {list.length === 0 && (
               <div className="text-center py-12 text-sm text-slate-500">Nada por aqui ainda.</div>
             )}
