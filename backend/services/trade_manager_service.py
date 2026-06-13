@@ -255,9 +255,11 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
         fresh.sl_current_price = entry
         if tp1_partial_usd is not None:
             fresh.tp1_realized_usd = tp1_partial_usd
-        # Se entry no DB estava errado, atualiza
+        # Se entry no DB estava errado, atualiza + recalcula slippage (estava -100%)
         if (not fresh.entry_price or fresh.entry_price <= 0) and entry_real:
             fresh.entry_price = entry_real
+            from services import real_trade_service
+            await real_trade_service.recompute_entry_slippage(session, fresh)
         fresh.updated_at = datetime.now(timezone.utc)
         await session.commit()
 
@@ -1069,6 +1071,8 @@ async def backfill_protection(force: bool = False) -> dict:
                     fresh.qty_initial = qty_now
                 if (not fresh.entry_price or fresh.entry_price <= 0) and entry_real:
                     fresh.entry_price = entry_real
+                    from services import real_trade_service
+                    await real_trade_service.recompute_entry_slippage(session, fresh)
                 if is_post_tp1 and fresh.phase != "post_tp1":
                     fresh.phase = "post_tp1"
                 fresh.updated_at = datetime.now(timezone.utc)

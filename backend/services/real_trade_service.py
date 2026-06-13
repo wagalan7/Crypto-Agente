@@ -72,9 +72,12 @@ async def open_trade(
                 planned_tp2 = planned_tp2 if planned_tp2 is not None else rec.tp2
                 leverage = leverage or rec.leverage
 
-        # Slippage vs entry teórico da rec
+        # Slippage vs entry teórico da rec. IMPORTANTE: só calcula com entry_price
+        # válido (>0). Auto-trade a mercado pode abrir com avgPrice=0 (fill ainda
+        # não retornado) — calcular aqui daria -100% falso. Nesse caso deixa None;
+        # recompute_entry_slippage() corrige quando o fill real é backfillado.
         slippage = None
-        if rec is not None and rec.entry:
+        if rec is not None and rec.entry and entry_price and entry_price > 0:
             diff = (entry_price - rec.entry) / rec.entry * 100
             # Em long, slippage positivo é ruim (pagou caro); em short, negativo é ruim.
             slippage = round(diff if side == "long" else -diff, 4)
@@ -117,6 +120,28 @@ async def open_trade(
             f"(rec={recommendation_id}, source={source}, slip={slippage}%)"
         )
         return _to_dict(trade)
+
+
+async def recompute_entry_slippage(session, trade) -> None:
+    """Recalcula entry_slippage_pct depois que o entry_price REAL é backfillado.
+    Auto-trade a mercado abre com avgPrice=0 (fill assíncrono); o slippage da
+    criação ficaria travado em -100%. Quando o trade-manager descobre o fill
+    real e seta trade.entry_price, chamamos isto pra corrigir. Usa a mesma
+    sessão do caller (não commita — o caller commita)."""
+    try:
+        if not getattr(trade, "recommendation_id", None):
+            return
+        if not trade.entry_price or trade.entry_price <= 0:
+            return
+        rec_entry = (await session.execute(
+            select(RecommendationSnapshot.entry)
+            .where(RecommendationSnapshot.id == trade.recommendation_id)
+        )).scalar_one_or_none()
+        if rec_entry and rec_entry > 0:
+            diff = (trade.entry_price - rec_entry) / rec_entry * 100
+            trade.entry_slippage_pct = round(diff if trade.side == "long" else -diff, 4)
+    except Exception as e:
+        log.warning(f"[real-trade] recompute slippage #{getattr(trade, 'id', '?')} falhou: {e}")
 
 
 async def close_trade(
