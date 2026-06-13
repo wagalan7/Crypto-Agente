@@ -170,6 +170,13 @@ async def _snapshot_loop():
                 await check_wide_snapshots()
             except Exception as e:
                 logging.warning(f"wide_track error: {e}")
+            # Teste canário 0.50: marco de TEMPO (janela de dias) + rede de
+            # segurança do marco de contagem. Idempotente. No-op se desligado.
+            try:
+                from services import live_test_service
+                await live_test_service.check_milestones()
+            except Exception as e:
+                logging.warning(f"live_test error: {e}")
             _METRICS["last_snapshot_check_at"] = datetime.now(timezone.utc).isoformat()
         except asyncio.CancelledError:
             break
@@ -2420,6 +2427,14 @@ async def trade_manager_status():
     """Snapshot de trades sob gerenciamento ativo (fase, qty, ordens condicionais)."""
     from services import trade_manager_service
     return await trade_manager_service.get_status()
+
+
+@app.get("/api/live-test/status")
+async def live_test_status():
+    """Progresso do teste do canário a 0.50: contagem de auto-trades desde o
+    marco, alvo, dias restantes e flags de notificação."""
+    from services import live_test_service
+    return await live_test_service.status()
 
 
 @app.post("/api/trade-manager/backfill-protection")

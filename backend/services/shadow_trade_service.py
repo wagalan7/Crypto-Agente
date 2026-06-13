@@ -2433,6 +2433,17 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         })
                     except Exception as e:
                         log.warning(f"[shadow] push trade-open falhou: {e}")
+                    # Contador do teste canário a 0.50 (#N/alvo + marco)
+                    try:
+                        from services import live_test_service
+                        await live_test_service.on_auto_trade_opened({
+                            **trade,
+                            "planned_stop": stop,
+                            "planned_tp1": float(tp1) if tp1 is not None else None,
+                            "planned_tp2": tp2,
+                        })
+                    except Exception as e:
+                        log.warning(f"[shadow] live-test contador falhou: {e}")
                     # Telegram notify (desacoplado - no-op se nao configurado)
                     try:
                         from services.notification_service import (
