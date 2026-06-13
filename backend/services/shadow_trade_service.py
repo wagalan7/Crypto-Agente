@@ -376,6 +376,24 @@ RR_GATE_ENABLED = os.getenv("RR_GATE_ENABLED", "true").strip().lower() in ("1", 
 MIN_RR_TP1_EXEC = float(os.getenv("MIN_RR_TP1_EXEC", "0.7"))   # TP1 (parcial) >= 0.7R
 MIN_RR_TP2_EXEC = float(os.getenv("MIN_RR_TP2_EXEC", "1.5"))   # TP2 (alvo final) >= 1.5R
 
+# ── Liquidity gate (Fase 2) ─────────────────────────────────────────────────
+# A allowlist já restringe execução às mais líquidas, mas é ESTÁTICA: se o
+# volume de uma moeda secar ou o spread abrir, o fill sai caro (slippage real).
+# Este gate mede no momento da execução: volume 24h em USD (volume_base × preço)
+# e o spread bid/ask. Fail-soft — erro de dado NÃO bloqueia (allowlist+sizing
+# ainda protegem). 0 desliga cada piso/teto. Aplica shadow+live.
+LIQUIDITY_GATE_ENABLED = os.getenv("LIQUIDITY_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+MIN_QUOTE_VOL_24H_USD = float(os.getenv("MIN_QUOTE_VOL_24H_USD", "10000000"))  # $10M/24h
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.25"))                    # 0.25%
+
+# ── P(TP1) gate (calibração) ────────────────────────────────────────────────
+# rec.prob_tp1 = P(TP1) calibrada por bin de score (calibration_service). Pula
+# setups com probabilidade calibrada baixa de bater o TP1. NO-OP-SAFE: quando a
+# calibração não está madura (prob_tp1=None), não filtra nada — começa a morder
+# sozinho quando amadurece. Env-tunável; 0 desliga.
+PROB_TP1_GATE_ENABLED = os.getenv("PROB_TP1_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+MIN_PROB_TP1_EXEC = float(os.getenv("MIN_PROB_TP1_EXEC", "0.45"))  # 45% calibrado
+
 # ── Diagnóstico: motivo do último skip por símbolo ──────────────────────────
 # Pra responder "por que a tier A não virou trade?" sem caçar log. Guarda o
 # último motivo de skip por símbolo (cap de tamanho). Exposto via API.
@@ -1938,6 +1956,20 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 except Exception as e:
                     log.warning(f"[rr-gate] {rec.get('symbol')} check falhou: {e}")
 
+            # ── P(TP1) gate (calibração): pula baixa probabilidade calibrada de
+            # bater o TP1. No-op-safe quando prob_tp1=None (calib imatura).
+            if PROB_TP1_GATE_ENABLED and MIN_PROB_TP1_EXEC > 0:
+                _p = rec.get("prob_tp1")
+                try:
+                    _p = float(_p) if _p is not None else None
+                except Exception:
+                    _p = None
+                if _p is not None and _p < MIN_PROB_TP1_EXEC:
+                    reason = f"P(TP1) {_p*100:.0f}% < mín {MIN_PROB_TP1_EXEC*100:.0f}%"
+                    log.info(f"[prob-gate] {rec.get('symbol')} {reason} — skip")
+                    _record_skip(rec, "prob-gate", reason)
+                    continue
+
             # ── Score threshold (postmortem): piso configurável + adjusters.
             try:
                 rec_score = float(rec.get("score") or 0)
@@ -1980,6 +2012,34 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     log.info(f"[blacklist] {rec['symbol']} skip")
                     _record_skip(rec, "blacklist", reason)
                     continue
+
+            # ── Liquidity gate (Fase 2): volume 24h em USD + spread bid/ask no
+            # momento da execução. Protege o fill em moedas que secaram ou com
+            # spread largo (slippage real). Fail-soft: erro de dado não bloqueia.
+            if LIQUIDITY_GATE_ENABLED and (MIN_QUOTE_VOL_24H_USD > 0 or MAX_SPREAD_PCT > 0):
+                try:
+                    from services.binance_service import fetch_ticker as _fetch_ticker
+                    _t = await _fetch_ticker(rec["symbol"])
+                    _last = float(_t.get("last") or 0)
+                    _vol_base = float(_t.get("volume") or 0)
+                    _usd_vol = _vol_base * _last
+                    if MIN_QUOTE_VOL_24H_USD > 0 and _usd_vol > 0 and _usd_vol < MIN_QUOTE_VOL_24H_USD:
+                        reason = f"vol 24h ${_usd_vol/1e6:.1f}M < mín ${MIN_QUOTE_VOL_24H_USD/1e6:.1f}M"
+                        log.info(f"[liquidity-gate] {rec['symbol']} {reason} — skip")
+                        _record_skip(rec, "liquidity-gate", reason)
+                        continue
+                    _bid = float(_t.get("bid") or 0)
+                    _ask = float(_t.get("ask") or 0)
+                    if MAX_SPREAD_PCT > 0 and _bid > 0 and _ask > 0:
+                        _mid = (_bid + _ask) / 2
+                        _spread_pct = (_ask - _bid) / _mid * 100 if _mid > 0 else 0
+                        if _spread_pct > MAX_SPREAD_PCT:
+                            reason = f"spread {_spread_pct:.3f}% > máx {MAX_SPREAD_PCT}%"
+                            log.info(f"[liquidity-gate] {rec['symbol']} {reason} — skip")
+                            _record_skip(rec, "liquidity-gate", reason)
+                            continue
+                except Exception as e:
+                    log.warning(f"[liquidity-gate] {rec.get('symbol')} check falhou (fail-soft): {e}")
 
             # ── Time-of-day block (postmortem -21% lift EU / -12% lift quinta).
             if not SHADOW_ENABLED:
