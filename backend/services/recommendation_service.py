@@ -33,6 +33,12 @@ from models.trade_signal import TradeSignal, SignalDirection
 
 
 SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
+# Concorrência do server-scan (símbolos em paralelo). Default 6. Com top_n alto
+# (ex.: 500) via proxy, subir p/ ~14 mantém o ciclo perto de 90s. Env-driven.
+try:
+    SCAN_CONCURRENCY = max(1, int(os.getenv("SCAN_CONCURRENCY", "6")))
+except (TypeError, ValueError):
+    SCAN_CONCURRENCY = 6
 CACHE_TTL = 15                    # segundos (era 30 — push do scan tava com delay, agora mais fresco)
 MIN_RR = 1.5                      # filtro mínimo absoluto
 MIN_CONFIDENCE_B = 0.55           # tier B mínimo
@@ -1243,7 +1249,7 @@ async def get_recommendations_via_vision(
             return []
 
     recommendations: List[Recommendation] = []
-    sem = asyncio.Semaphore(6)
+    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
 
     async def _bounded(sym: str):
         async with sem:
