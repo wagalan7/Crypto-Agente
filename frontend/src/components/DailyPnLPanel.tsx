@@ -154,7 +154,7 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
     setConfirmFor(prev => (prev === key ? null : key))
   }
 
-  const submitConfirm = async (t: Trade, viab: ViabilityItem, key: string) => {
+  const submitConfirm = async (t: Trade, viab: ViabilityItem | undefined, key: string) => {
     const entry = parseFloat(confirmForm.entry)
     if (!entry) {
       setConfirmToast({ k: key, msg: 'Informe o preço de entrada', level: 'err' })
@@ -172,7 +172,9 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
         planned_stop: t.stop_loss,
         planned_tp1: t.tp1 ?? null,
         planned_tp2: t.tp2,
-        recommendation_id: viab.id,
+        // Sem viab (trade recém-criado): backend resolve o snapshot por
+        // símbolo+lado+tf (main.py confirm-entry).
+        recommendation_id: viab?.id ?? null,
       })
       const prot = res.protection
       const protMsg = prot?.placed
@@ -599,15 +601,17 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                       </p>
                     )}
 
-                    {/* Confirmar entrada — só quando o setup ainda é entrável (valid/wait).
-                        Você abre na corretora; o bot coloca SL+TP1+TP2 e gerencia o BE.
+                    {/* Confirmar entrada — disponível pra todo trade ABERTO tier A/A+
+                        (você pode entrar manual na corretora; o bot coloca SL+TP1+TP2
+                        e gerencia o BE). Não depende de viab: trades recém-criados ainda
+                        não têm viabilidade calculada, mas o botão tem que aparecer.
                         Oculto para OBSERVAÇÃO: (a) tier B = só acompanhar (convicção menor);
                         (b) trades do ambiente de testes (Dev) não existem no PRD. */}
-                    {(t.origin ?? 'bot') !== 'observation' && t.tier !== 'B' && viab && (viab.viability === 'valid' || viab.viability === 'wait') && (
+                    {(t.origin ?? 'bot') !== 'observation' && t.tier !== 'B' && t.status === 'open' && (
                       <div className="mb-2">
                         {confirmFor !== tradeKey ? (
                           <button
-                            onClick={() => openConfirm(tradeKey, viab.current_price)}
+                            onClick={() => openConfirm(tradeKey, viab?.current_price ?? t.entry)}
                             className="text-[11px] font-bold px-2.5 py-1 rounded border border-emerald-500/50 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 transition-colors"
                           >
                             ✅ entrei nesse
