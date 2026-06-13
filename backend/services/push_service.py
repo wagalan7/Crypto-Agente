@@ -237,11 +237,32 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
     score = rec.get("score", 0)
     rr = rec.get("risk_reward", 0)
 
+    # Níveis sugeridos (entry/SL/TP1/TP2): permitem replicar manualmente na
+    # corretora, inclusive para moedas do universo amplo (fora da allowlist),
+    # que só recebem push e não viram trade do bot.
+    entry_v = rec.get("entry", 0)
+    sl_v = rec.get("stop_loss")
+    tp2_v = rec.get("tp2")
+    _sig = rec.get("signal") or {}
+    tp1_v = rec.get("tp1")
+    if tp1_v is None and isinstance(_sig, dict):
+        tp1_v = _sig.get("tp1")
+
     title = f"🚀 {tier} · {symbol_short} {direction}"
-    body = (
-        f"{rec.get('timeframe', '')} · {leverage}x · R:R 1:{rr}\n"
-        f"Score {score:.0f} · entry {_fmt(rec.get('entry', 0))}"
-    )
+    lines = [
+        f"{rec.get('timeframe', '')} · {leverage}x · R:R 1:{rr}",
+        f"Score {score:.0f} · entry {_fmt(entry_v)}",
+    ]
+    levels = []
+    if sl_v is not None:
+        levels.append(f"SL {_fmt(sl_v)}")
+    if tp1_v is not None:
+        levels.append(f"TP1 {_fmt(tp1_v)}")
+    if tp2_v is not None:
+        levels.append(f"TP2 {_fmt(tp2_v)}")
+    if levels:
+        lines.append(" · ".join(levels))
+    body = "\n".join(lines)
 
     tf_short = rec.get("timeframe", "")
     focus_url = f"/?focus={symbol_short}&tf={tf_short}"
@@ -254,6 +275,13 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
             "timeframe": tf_short,
             "tier": tier,
             "url": focus_url,
+            "entry": entry_v,
+            "stop_loss": sl_v,
+            "tp1": tp1_v,
+            "tp2": tp2_v,
+            "direction": rec.get("direction"),
+            "score": score,
+            "risk_reward": rr,
         },
     }
 
