@@ -61,6 +61,30 @@ function symbolBase(s: string): string {
   return s.split('/')[0]
 }
 
+// Traduz o código do gate de execução (backend) num rótulo curto PT-BR pro selo
+// "bot não opera". O motivo completo (com números) vai no tooltip.
+function gateLabel(gate: string): string {
+  const map: Record<string, string> = {
+    'liquidity-gate': 'liquidez baixa',
+    'prob-gate': 'P(TP1) baixa',
+    'rr-gate': 'R:R fraco',
+    'proximity': 'preço esticado',
+    'atr-gate': 'volatilidade alta',
+    'score-min': 'score baixo',
+    'exec-universe': 'fora da allowlist',
+    'blacklist': 'símbolo banido',
+    'time-block': 'horário bloqueado',
+    'funding-gate': 'funding contra',
+    'mtf-gate': 'timeframes desalinhados',
+    'regime-guard': 'regime adverso',
+    'cluster-cap': 'limite de exposição',
+    'direction-cap': 'limite direcional',
+    'entry-throttle': 'cadência (throttle)',
+    'cooldown': 'cooldown',
+  }
+  return map[gate] ?? gate
+}
+
 // Classifica a operação pelo timeframe — define expectativa de holding period
 // e ajuda o user a saber se entra/sai no mesmo dia ou carrega posição.
 function operationType(tf: string): { label: string; cls: string; hint: string } {
@@ -123,15 +147,33 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
     reasons: string[]
   } | null>(null)
 
+  // Veredito de execução do bot por símbolo+direção: por que uma rec NÃO virou
+  // trade real (gate que barrou). Alinha "recomendado" com "o bot vai operar".
+  const [skipReasons, setSkipReasons] = useState<Record<string, { gate: string; reason: string; ts: string }>>({})
+
   useEffect(() => {
     const fetchStatus = async () => {
       try {
-        const [n, r] = await Promise.all([
+        const [n, r, sk] = await Promise.all([
           fetch(`${BACKEND}/api/news-status`).then(x => x.ok ? x.json() : null),
           fetch(`${BACKEND}/api/regime-status`).then(x => x.ok ? x.json() : null),
+          fetch(`${BACKEND}/api/shadow/skip-reasons`).then(x => x.ok ? x.json() : null),
         ])
         if (n) setNewsStatus(n.status)
         if (r) setRegime(r)
+        if (sk?.items) {
+          // Só motivos recentes (<= 20min) — evita veredito velho após o cenário
+          // mudar. Chaveado por símbolo+direção.
+          const now = Date.now()
+          const map: Record<string, { gate: string; reason: string; ts: string }> = {}
+          for (const it of sk.items as Array<{ symbol: string; gate: string; reason: string; ts: string; direction?: string }>) {
+            const age = now - new Date(it.ts).getTime()
+            if (age > 20 * 60_000) continue
+            const key = `${it.symbol}__${it.direction ?? ''}`
+            map[key] = { gate: it.gate, reason: it.reason, ts: it.ts }
+          }
+          setSkipReasons(map)
+        }
       } catch { /* fail-open */ }
     }
     fetchStatus()
@@ -483,6 +525,9 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
               const hist = historical[histKey]
               const rkey = `${r.symbol}-${r.timeframe}`
               const isObs = r.origin === 'observation'
+              // Veredito de execução: rec do bot que foi barrada por um gate.
+              // Só aplica a recs do bot (observação nunca executa de qualquer jeito).
+              const skip = isObs ? undefined : skipReasons[`${r.symbol}__${r.direction}`]
               return (
                 <div key={rkey} className="flex flex-col">
                 <button
@@ -503,18 +548,22 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                     {/* Symbol + direction + op type */}
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
-                        {/* Origem: 🤖 o bot opera · 👁 só observação (analisar) */}
+                        {/* Origem/veredito: 👁 observação · ⛔ bot recusou (gate) · 🤖 bot opera */}
                         <span
                           title={isObs
                             ? 'OBSERVAÇÃO — o bot NÃO opera essa. Vem do ambiente de testes (universo amplo). Use pra analisar no TradingView e aprender.'
-                            : 'BOT OPERA — está no universo que o bot executa de verdade.'}
+                            : skip
+                              ? `BOT NÃO OPERA — recusada na execução pelo gate "${skip.gate}": ${skip.reason}. A recomendação continua válida pra você analisar, mas o bot não abriu por essa razão.`
+                              : 'BOT OPERA — passou em todos os gates de execução; está no universo que o bot executa de verdade.'}
                           className={`px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${
                             isObs
                               ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
-                              : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                              : skip
+                                ? 'bg-red-500/15 text-red-300 border-red-500/40'
+                                : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
                           }`}
                         >
-                          {isObs ? '👁 OBSERVAÇÃO' : '🤖 BOT OPERA'}
+                          {isObs ? '👁 OBSERVAÇÃO' : skip ? `⛔ BOT NÃO OPERA · ${gateLabel(skip.gate)}` : '🤖 BOT OPERA'}
                         </span>
                         <span className="text-sm font-bold text-white">{symbolBase(r.symbol)}</span>
                         <span className="text-[10px] text-slate-500 font-mono">{r.timeframe}</span>
