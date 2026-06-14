@@ -290,6 +290,24 @@ export interface Recommendation {
   // Position sizing dinâmico (Kelly fracionado × score × vol) — % da banca sugerido
   suggested_size_pct?: number | null
   size_rationale?: string | null
+  // Liquidez do ticker da varredura (alimenta o gate de liquidez do bot)
+  quote_vol_usd?: number | null
+  spread_pct?: number | null
+  // Veredito READ-ONLY dos gates de qualidade do bot (R:R, P(TP1), liquidez),
+  // computado no backend com a MESMA lógica/limites do loop de execução. Permite
+  // exibir "o bot operaria / não operaria" e por qual gate parou — fonte única.
+  bot_verdict?: {
+    ok: boolean
+    blocked_by: string | null
+    reason: string | null
+    checks?: {
+      rr1?: number | null
+      rr2?: number | null
+      prob_tp1?: number | null
+      quote_vol_usd?: number | null
+      spread_pct?: number | null
+    }
+  } | null
   // Setup já foi resolvido nas últimas 2h (mesmo symbol+tf+direction)
   recent_outcome?: {
     status: 'won_tp1' | 'won_tp1_be' | 'won_tp2' | 'lost'

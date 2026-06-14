@@ -525,9 +525,21 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
               const hist = historical[histKey]
               const rkey = `${r.symbol}-${r.timeframe}`
               const isObs = r.origin === 'observation'
-              // Veredito de execução: rec do bot que foi barrada por um gate.
-              // Só aplica a recs do bot (observação nunca executa de qualquer jeito).
+              // Veredito de qualidade do backend (R:R/P(TP1)/liquidez) — mesma
+              // lógica/limites do loop, anexado a TODA rec (inclusive observação)
+              // e sempre fresco (não reseta no redeploy).
+              const verdict = r.bot_verdict ?? undefined
+              // Veredito de execução pra recs do BOT: combina skip-reasons (cobre
+              // TODOS os gates do loop: proximity, atr, allowlist, time-block…) com
+              // o veredito de qualidade. skip-reasons tem prioridade quando existe.
               const skip = isObs ? undefined : skipReasons[`${r.symbol}__${r.direction}`]
+              const blocked = isObs
+                ? undefined
+                : skip
+                  ? { gate: skip.gate, reason: skip.reason }
+                  : verdict && verdict.ok === false && verdict.blocked_by
+                    ? { gate: verdict.blocked_by, reason: verdict.reason ?? '' }
+                    : undefined
               return (
                 <div key={rkey} className="flex flex-col">
                 <button
@@ -552,19 +564,36 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                         <span
                           title={isObs
                             ? 'OBSERVAÇÃO — o bot NÃO opera essa. Vem do ambiente de testes (universo amplo). Use pra analisar no TradingView e aprender.'
-                            : skip
-                              ? `BOT NÃO OPERA — recusada na execução pelo gate "${skip.gate}": ${skip.reason}. A recomendação continua válida pra você analisar, mas o bot não abriu por essa razão.`
+                            : blocked
+                              ? `BOT NÃO OPERA — recusada na execução pelo gate "${blocked.gate}": ${blocked.reason}. A recomendação continua válida pra você analisar, mas o bot não abriu por essa razão.`
                               : 'BOT OPERA — passou em todos os gates de execução; está no universo que o bot executa de verdade.'}
                           className={`px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${
                             isObs
                               ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
-                              : skip
+                              : blocked
                                 ? 'bg-red-500/15 text-red-300 border-red-500/40'
                                 : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
                           }`}
                         >
-                          {isObs ? '👁 OBSERVAÇÃO' : skip ? `⛔ BOT NÃO OPERA · ${gateLabel(skip.gate)}` : '🤖 BOT OPERA'}
+                          {isObs ? '👁 OBSERVAÇÃO' : blocked ? `⛔ BOT NÃO OPERA · ${gateLabel(blocked.gate)}` : '🤖 BOT OPERA'}
                         </span>
+                        {/* Vetagem de qualidade pra OBSERVAÇÃO: mesma lógica do bot
+                            (R:R/P(TP1)/liquidez) aplicada às indicações do universo
+                            amplo — diz se o setup atende o padrão que o bot exige. */}
+                        {isObs && verdict && (
+                          <span
+                            title={verdict.ok
+                              ? 'CRITÉRIO DO BOT: passa nos gates de qualidade (R:R, P(TP1), liquidez). Mesmo sendo observação, esse setup atende o padrão que o bot exige pra operar.'
+                              : `CRITÉRIO DO BOT: NÃO passa — barrado em "${verdict.blocked_by}": ${verdict.reason}.`}
+                            className={`px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${
+                              verdict.ok
+                                ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                                : 'bg-amber-500/15 text-amber-300 border-amber-500/40'
+                            }`}
+                          >
+                            {verdict.ok ? '✅ critério do bot' : `⚠ ${gateLabel(verdict.blocked_by ?? '')}`}
+                          </span>
+                        )}
                         <span className="text-sm font-bold text-white">{symbolBase(r.symbol)}</span>
                         <span className="text-[10px] text-slate-500 font-mono">{r.timeframe}</span>
                         <DirIcon className={`w-3.5 h-3.5 ${dirColor}`} />

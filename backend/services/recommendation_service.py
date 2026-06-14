@@ -143,6 +143,13 @@ class Recommendation(BaseModel):
     # Cap [0.25%, 1.0%]. None se não foi possível computar (calib não pronta etc).
     suggested_size_pct: Optional[float] = None
     size_rationale: Optional[str] = None      # explicação curta PT-BR (UI tooltip)
+    # ── Liquidez (do ticker da varredura) + veredito de execução do bot ───
+    quote_vol_usd: Optional[float] = None     # volume 24h em USD (alimenta o gate de liquidez)
+    spread_pct: Optional[float] = None        # spread bid/ask em %
+    # Veredito READ-ONLY dos gates de qualidade do bot (R:R, P(TP1), liquidez),
+    # computado com a MESMA lógica/limites do loop de execução (fonte única).
+    # {ok, blocked_by, reason, checks}. None se não foi possível avaliar.
+    bot_verdict: Optional[dict] = None
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -555,6 +562,26 @@ def _build_summary(sig: TradeSignal) -> str:
     return " · ".join(bits)
 
 
+def _liquidity_from_ticker(ticker: dict) -> tuple[Optional[float], Optional[float]]:
+    """Extrai (quote_vol_usd, spread_pct) de um ticker da binance_service (facade
+    OKX). quote_vol_usd = volume_base × last; spread_pct = (ask-bid)/mid × 100.
+    Reaproveita o ticker JÁ buscado na varredura (zero chamada externa extra) pra
+    alimentar o veredito de liquidez do bot. Fail-soft: devolve (None, None)."""
+    try:
+        last = float(ticker.get("last") or 0)
+        vol_base = float(ticker.get("volume") or 0)
+        qvol = vol_base * last if (last > 0 and vol_base > 0) else None
+        bid = float(ticker.get("bid") or 0)
+        ask = float(ticker.get("ask") or 0)
+        spread = None
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2
+            spread = (ask - bid) / mid * 100 if mid > 0 else None
+        return qvol, spread
+    except Exception:
+        return None, None
+
+
 async def _analyze_symbol_tf(symbol: str, tf: str) -> Optional[TradeSignal]:
     """Retorna o TradeSignal completo para (symbol, tf) ou None se falhar."""
     try:
@@ -567,9 +594,11 @@ async def _analyze_symbol_tf(symbol: str, tf: str) -> Optional[TradeSignal]:
         primary_dir = determine_direction(ind, patterns, current)
 
         # Derivativos + MTF em paralelo
+        liq_vol = liq_spread = None
         try:
             ticker = await fetch_ticker(symbol)
             change_24h = ticker.get("change", 0.0)
+            liq_vol, liq_spread = _liquidity_from_ticker(ticker)
         except Exception:
             change_24h = 0.0
 
@@ -588,10 +617,14 @@ async def _analyze_symbol_tf(symbol: str, tf: str) -> Optional[TradeSignal]:
             mtf = None
 
         # with_backtest=False evita martelar — recomendação não precisa de stats finos
-        return build_trade_signal(
+        sig = build_trade_signal(
             symbol, tf, df, ind, patterns,
             derivatives=derivatives, mtf=mtf, with_backtest=False,
         )
+        if sig is not None:
+            sig.quote_vol_usd = liq_vol
+            sig.spread_pct = liq_spread
+        return sig
     except Exception:
         return None
 
@@ -829,6 +862,26 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         atr_pct=atr_pct_val,
     )
 
+    # Veredito do bot (mesma lógica/limites do loop de execução — fonte única).
+    # Read-only: NÃO toca no loop real; só anexa "o bot operaria / não operaria"
+    # à recomendação, pra o app exibir a indicação vetada pelo critério do bot.
+    q_vol = getattr(sig, "quote_vol_usd", None)
+    sp_pct = getattr(sig, "spread_pct", None)
+    try:
+        from services.shadow_trade_service import exec_verdict
+        bot_verdict = exec_verdict({
+            "symbol": sig.symbol,
+            "entry": sig.entry,
+            "stop_loss": sig.stop_loss,
+            "tp1": sig.tp1,
+            "tp2": sig.tp2,
+            "prob_tp1": prob_tp1,
+            "quote_vol_usd": q_vol,
+            "spread_pct": sp_pct,
+        })
+    except Exception:
+        bot_verdict = None
+
     return Recommendation(
         tier=tier,
         score=score,
@@ -856,6 +909,9 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         prob_tp1=prob_tp1,
         suggested_size_pct=suggested_size_pct,
         size_rationale=size_rationale,
+        quote_vol_usd=q_vol,
+        spread_pct=sp_pct,
+        bot_verdict=bot_verdict,
     )
 
 
@@ -867,6 +923,7 @@ async def _analyze_candles_for_tf(
     derivatives_cached=None,  # já resolvido por símbolo (compartilhado entre TFs)
     derivatives_done: bool = False,
     change_24h_cached: Optional[float] = None,
+    liquidity_cached: Optional[tuple] = None,  # (quote_vol_usd, spread_pct) resolvido por símbolo
 ) -> Optional[TradeSignal]:
     """Variante de _analyze_symbol_tf que recebe candles já baixados (frontend).
 
@@ -882,12 +939,15 @@ async def _analyze_candles_for_tf(
         current = float(df["close"].iloc[-1])
         primary_dir = determine_direction(ind, patterns, current)
 
+        liq_vol, liq_spread = (liquidity_cached or (None, None))
+
         # Resolve ticker/derivatives só se o caller não passou (fallback)
         if not derivatives_done:
             try:
                 from services.binance_service import fetch_ticker
                 ticker = await fetch_ticker(symbol)
                 change_24h_cached = ticker.get("change", 0.0)
+                liq_vol, liq_spread = _liquidity_from_ticker(ticker)
             except Exception:
                 change_24h_cached = 0.0
             try:
@@ -901,10 +961,14 @@ async def _analyze_candles_for_tf(
         except Exception:
             mtf = None
 
-        return build_trade_signal(
+        sig = build_trade_signal(
             symbol, tf, df, ind, patterns,
             derivatives=derivatives_cached, mtf=mtf, with_backtest=False,
         )
+        if sig is not None:
+            sig.quote_vol_usd = liq_vol
+            sig.spread_pct = liq_spread
+        return sig
     except Exception:
         return None
 
@@ -948,10 +1012,12 @@ async def get_recommendations_from_batch(
             # Ticker + derivatives são por-símbolo — resolve 1x e compartilha
             # entre todos os TFs do mesmo símbolo (corta ~67% das chamadas
             # externas pesadas quando o batch tem 3 TFs/símbolo).
+            liq = (None, None)
             try:
                 from services.binance_service import fetch_ticker
                 ticker = await fetch_ticker(symbol)
                 change_24h = ticker.get("change", 0.0)
+                liq = _liquidity_from_ticker(ticker)
             except Exception:
                 change_24h = 0.0
             try:
@@ -965,6 +1031,7 @@ async def get_recommendations_from_batch(
                     derivatives_cached=derivatives_cached,
                     derivatives_done=True,
                     change_24h_cached=change_24h,
+                    liquidity_cached=liq,
                 )
                 for tf, df in tfs
             ])

@@ -128,5 +128,7 @@ class TradeSignal(BaseModel):
     mtf: Optional[dict] = None                # MTFAlignment serializado
     trade_plan: Optional[dict] = None         # TradePlan (Sprint B): zona de entrada, stop estrutural, alvos por liquidez + reasoning
     current_price: Optional[float] = None     # preço de mercado no momento da varredura (≠ entry quando entry_zone é limit)
+    quote_vol_usd: Optional[float] = None     # volume 24h em USD (volume_base × last) — alimenta o gate de liquidez
+    spread_pct: Optional[float] = None        # spread bid/ask em % no momento da varredura
     timestamp: int
     signal_strength: str

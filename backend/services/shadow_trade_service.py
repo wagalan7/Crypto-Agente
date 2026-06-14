@@ -436,6 +436,85 @@ def get_skip_reasons() -> list[dict]:
         return list(_LAST_SKIP_REASONS.values())
 
 
+def exec_verdict(rec: dict) -> dict:
+    """Avaliador READ-ONLY dos gates de QUALIDADE do bot (R:R, P(TP1), liquidez)
+    — MESMA lógica e MESMOS limites do loop de execução, sem tocar no loop real
+    nem registrar skip nem fazer I/O. Fonte única da verdade: reaproveita os
+    thresholds deste módulo (RR/PROB/LIQUIDITY) pra que o app possa anexar um
+    veredito a cada recomendação e mostrar "o bot operaria / não operaria" com
+    exatamente o mesmo critério, sem duplicar regra que poderia divergir.
+
+    Espera um dict com (todos opcionais, fail-soft):
+        entry, stop_loss, tp1, tp2, prob_tp1, quote_vol_usd, spread_pct
+
+    Retorna:
+        {
+          "ok": bool,              # passaria nos 3 gates de qualidade
+          "blocked_by": str|None,  # "rr-gate" | "prob-gate" | "liquidity-gate"
+          "reason": str|None,      # motivo PT-BR (mesmo texto do bot)
+          "checks": {rr1, rr2, prob_tp1, quote_vol_usd, spread_pct},
+        }
+    Ordem de avaliação espelha o loop: R:R → P(TP1) → liquidez. Dado ausente
+    (None/0) NÃO bloqueia — igual ao fail-soft do gate de liquidez no loop.
+    """
+    def _f(v):
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    entry = _f(rec.get("entry"))
+    stop = _f(rec.get("stop_loss"))
+    tp1 = _f(rec.get("tp1"))
+    tp2 = _f(rec.get("tp2"))
+    prob = _f(rec.get("prob_tp1"))
+    qvol = _f(rec.get("quote_vol_usd"))
+    spread = _f(rec.get("spread_pct"))
+
+    rr1 = rr2 = None
+    if entry and stop is not None:
+        risk = abs(entry - stop)
+        if risk > 0:
+            rr1 = abs(tp1 - entry) / risk if tp1 else None
+            rr2 = abs(tp2 - entry) / risk if tp2 else None
+
+    checks = {
+        "rr1": round(rr1, 2) if rr1 is not None else None,
+        "rr2": round(rr2, 2) if rr2 is not None else None,
+        "prob_tp1": prob,
+        "quote_vol_usd": qvol,
+        "spread_pct": round(spread, 4) if spread is not None else None,
+    }
+
+    # ── R:R gate (geometria) ──
+    if RR_GATE_ENABLED:
+        if rr1 is not None and MIN_RR_TP1_EXEC > 0 and rr1 < MIN_RR_TP1_EXEC:
+            return {"ok": False, "blocked_by": "rr-gate",
+                    "reason": f"R:R TP1 {rr1:.2f} < mín {MIN_RR_TP1_EXEC}", "checks": checks}
+        if rr2 is not None and MIN_RR_TP2_EXEC > 0 and rr2 < MIN_RR_TP2_EXEC:
+            return {"ok": False, "blocked_by": "rr-gate",
+                    "reason": f"R:R TP2 {rr2:.2f} < mín {MIN_RR_TP2_EXEC}", "checks": checks}
+
+    # ── P(TP1) gate (calibração) ── no-op-safe quando prob=None (calib imatura)
+    if PROB_TP1_GATE_ENABLED and MIN_PROB_TP1_EXEC > 0:
+        if prob is not None and prob < MIN_PROB_TP1_EXEC:
+            return {"ok": False, "blocked_by": "prob-gate",
+                    "reason": f"P(TP1) {prob*100:.0f}% < mín {MIN_PROB_TP1_EXEC*100:.0f}%",
+                    "checks": checks}
+
+    # ── Liquidity gate ── fail-soft: dado ausente (None/0) não bloqueia
+    if LIQUIDITY_GATE_ENABLED:
+        if MIN_QUOTE_VOL_24H_USD > 0 and qvol and qvol > 0 and qvol < MIN_QUOTE_VOL_24H_USD:
+            return {"ok": False, "blocked_by": "liquidity-gate",
+                    "reason": f"vol 24h ${qvol/1e6:.1f}M < mín ${MIN_QUOTE_VOL_24H_USD/1e6:.1f}M",
+                    "checks": checks}
+        if MAX_SPREAD_PCT > 0 and spread is not None and spread > MAX_SPREAD_PCT:
+            return {"ok": False, "blocked_by": "liquidity-gate",
+                    "reason": f"spread {spread:.3f}% > máx {MAX_SPREAD_PCT}%", "checks": checks}
+
+    return {"ok": True, "blocked_by": None, "reason": None, "checks": checks}
+
+
 def _get_rec_feature(rec: dict, key: str, default=None):
     """Extrai feature da rec acessando rec['signal']. Safety: nunca lança."""
     try:
