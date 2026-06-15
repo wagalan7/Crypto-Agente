@@ -2511,6 +2511,24 @@ async def shadow_skip_reasons():
     return {"ok": True, "count": len(reasons), "items": reasons}
 
 
+@app.get("/api/shadow/assertiveness")
+async def shadow_assertiveness(days: int = 30, gate_days: int = 7):
+    """
+    Painel de assertividade — quão confiável o bot está sendo. Cruza, num único
+    lugar: outcomes de dinheiro real (source=auto), outcomes shadow (snapshots,
+    amostra maior), contadores de skip por gate PERSISTIDOS (sobrevivem
+    redeploy) e maturidade da calibração de P(TP1). READ-ONLY, fail-soft.
+    """
+    from services import assertiveness_service
+    try:
+        days = max(1, min(int(days), 365))
+        gate_days = max(1, min(int(gate_days), 90))
+    except Exception:
+        days, gate_days = 30, 7
+    data = await assertiveness_service.get_assertiveness(days=days, gate_days=gate_days)
+    return {"ok": True, **data}
+
+
 def _check_admin_token(token: Optional[str]) -> Optional[dict]:
     """
     Auth de endpoints admin que emitem ordem real. Retorna None se liberado, ou

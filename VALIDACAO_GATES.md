@@ -86,6 +86,58 @@ negativo). Fallback total pro BE exato se faltar estrutura/dado.
 Validar: ver no log `[trade-manager] … BE estrutural: SL @ …` vs `BE exato`, e
 checar `closed_be` caindo / `closed_tp2` subindo nos auto-trades pós-deploy.
 
+## Painel de assertividade + persistência de skips (#1 — 14/06)
+
+Objetivo: **medir antes de afrouxar**. Antes os skip-reasons viviam só em
+memória (`_LAST_SKIP_REASONS`) e zeravam a cada redeploy — impossível saber qual
+gate mais barrou na semana. Agora:
+
+- **Persistência durável** — `models/skip_reason_stat.py` (`skip_reason_stats`):
+  contador **por gate por dia-UTC** (upsert ON CONFLICT, limitado a ~20 gates ×
+  N dias). `_record_skip` agenda fire-and-forget (`_persist_skip_stat`); fail-soft
+  total — nunca bloqueia/derruba o loop. Sobrevive redeploy.
+- **Endpoint** `/api/shadow/assertiveness?days=30&gate_days=7` (read-only,
+  `services/assertiveness_service.py`): cruza dinheiro real (auto-trades
+  resolvidos: win-rate, TP1/TP2 hit, expectancy R, P&L USD, por status), shadow
+  (snapshots resolvidos — amostra ampla, base da calibração), gates (contadores
+  persistidos), e maturidade da calibração.
+- **Painel** `🛡️ Assertividade` no app (`AssertivenessPanel.tsx`).
+
+Validar quando reabrir: abrir o painel, ver se "Gates que mais barraram" começa
+a acumular pós-deploy desta versão (tabela nova → vazia até o primeiro skip
+persistido). Cruzar o gate dominante aqui com a decisão de afrouxar/apertar na
+tabela de env knobs acima — **este painel é a fonte do "está secando trade bom?"**.
+
+## Sizing por convicção + orçamento de risco agregado (#2 — 14/06)
+
+Ambos em `shadow_trade_service.py`, **default DESLIGADO** (dinheiro real → opt-in
+explícito; zero mudança de comportamento no deploy). Os caps duros já existentes
+(`_compute_qty`: `EXCHANGE_MAX_RISK_PCT`, margem) continuam mandando.
+
+- **#2a Sizing por convicção** (`_conviction_mult`): escala o `risk_pct`/trade
+  pela P(TP1) calibrada — setup de alta convicção arrisca um pouco mais, fraco um
+  pouco menos. Mapeia P(TP1) `[LO..HI]` → `[MIN..MAX]`, clampado. **NO-OP-SAFE**:
+  desligado ou calibração imatura (`prob_tp1=None`) → ×1.0.
+- **#2b Orçamento de risco aberto** (`_open_risk_usd` + cap no loop): bloqueia
+  nova entrada se Σ risco em aberto (`|entry−stop|×qty`) + risco novo > teto da
+  banca. Conta a PERDA potencial se tudo estopar junto (≠ notional/margem).
+  Posição pós-TP1 (SL≥entry) conta risco ~0 → orçamento rotativo. Skip tag
+  `risk-budget` (aparece no painel de assertividade).
+
+| Gate/feature | Env | Default | Afrouxar | Apertar |
+|---|---|---|---|---|
+| Convicção — liga/desliga | `CONVICTION_SIZING_ENABLED` | `false` | `true` | — |
+| Convicção — piso P(TP1) | `CONVICTION_PROB_LO` | `0.45` | — | subir |
+| Convicção — teto P(TP1) | `CONVICTION_PROB_HI` | `0.65` | baixar | subir |
+| Convicção — mult mín | `CONVICTION_MULT_MIN` | `0.8` | subir p/ `0.9` | baixar p/ `0.7` |
+| Convicção — mult máx | `CONVICTION_MULT_MAX` | `1.25` | subir p/ `1.4` | baixar p/ `1.1` |
+| Risco agregado | `EXCHANGE_MAX_TOTAL_OPEN_RISK_PCT` | `0` (off) | subir o teto | baixar p/ `3` (3% banca) |
+
+Validar quando reabrir: com convicção ON, ver no log `[conviction] … risco X% →
+Y% (prob=..)` e confirmar que `_compute_qty` ainda clampa pelos caps duros (risco
+real nunca > `EXCHANGE_MAX_RISK_PCT`). Com risco agregado ON, ver
+`BLOCKED risk-budget` quando a banca já tem muito risco aberto.
+
 ## Hipótese de trabalho
 
 Defaults foram postos **conservadores** de propósito (pra não secar o teste

@@ -7,6 +7,7 @@ import NLPPanel from './components/NLPPanel'
 import RecommendationsPanel from './components/RecommendationsPanel'
 import DailyPnLPanel from './components/DailyPnLPanel'
 import InsightsPanel from './components/InsightsPanel'
+import AssertivenessPanel from './components/AssertivenessPanel'
 import PushSubscribeButton from './components/PushSubscribeButton'
 import RiskStatusBadge from './components/RiskStatusBadge'
 import StatusPanel from './components/StatusPanel'
@@ -215,6 +216,7 @@ export default function App() {
   const [showInsights, setShowInsights] = useState(false)
   const [showStatus, setShowStatus] = useState(false)
   const [showDashboard, setShowDashboard] = useState(false)
+  const [showAssertiveness, setShowAssertiveness] = useState(false)
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const { focus: pushFocus, clear: clearPushFocus } = usePushFocus()
 
@@ -547,6 +549,14 @@ export default function App() {
             <span>📈</span>
             <span className="hidden sm:block">Dashboard</span>
           </button>
+          <button
+            onClick={() => setShowAssertiveness(true)}
+            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-emerald-500/20 to-green-500/20 hover:from-emerald-500/30 hover:to-green-500/30 border border-emerald-500/40 rounded text-xs font-bold text-emerald-300"
+            title="Assertividade — o quão confiável o bot está sendo"
+          >
+            <span>🛡️</span>
+            <span className="hidden sm:block">Assertividade</span>
+          </button>
           <RiskStatusBadge onOpen={() => setShowStatus(true)} />
           <PushSubscribeButton />
           <button
@@ -781,6 +791,10 @@ export default function App() {
 
       {showDashboard && (
         <DashboardPanel onClose={() => setShowDashboard(false)} />
+      )}
+
+      {showAssertiveness && (
+        <AssertivenessPanel onClose={() => setShowAssertiveness(false)} />
       )}
     </div>
   )

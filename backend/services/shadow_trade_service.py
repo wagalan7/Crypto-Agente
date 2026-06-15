@@ -190,6 +190,32 @@ MAX_TOTAL_NOTIONAL_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_NOTIONAL_PCT", "150
 # fecha, libera espaço pra novas (orçamento rotativo). 0 = desligado.
 MAX_TOTAL_MARGIN_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_MARGIN_PCT", "0"))
 
+# ── #2a Sizing por CONVICÇÃO (escala o risco/trade pela P(TP1) calibrada) ─────
+# Em vez de risco fixo por tier, escala o risk_pct por um multiplicador ligado à
+# convicção do setup (P(TP1) calibrada). Setup com prob alta arrisca um pouco
+# mais; prob baixa, um pouco menos. SEMPRE dentro dos caps duros já existentes
+# (_compute_qty aplica MAX_RISK_PCT_HARD e margem). NO-OP-SAFE: se a calibração
+# não está madura (prob_tp1=None) → mult=1.0 (não mexe). Default DESLIGADO —
+# dinheiro real, opt-in explícito via env.
+CONVICTION_SIZING_ENABLED = os.getenv("CONVICTION_SIZING_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+# Faixa de P(TP1) mapeada linearmente pra faixa de multiplicador. lo no piso do
+# gate (0.45), hi numa prob alta (0.65). Fora da faixa → clampa.
+CONVICTION_PROB_LO = float(os.getenv("CONVICTION_PROB_LO", "0.45"))
+CONVICTION_PROB_HI = float(os.getenv("CONVICTION_PROB_HI", "0.65"))
+# Banda do multiplicador — apertada de propósito (0.8×..1.25×). Subir o teto =
+# mais agressivo nos setups de alta convicção; baixar o piso = mais defensivo
+# nos fracos. Caps duros continuam mandando.
+CONVICTION_MULT_MIN = float(os.getenv("CONVICTION_MULT_MIN", "0.8"))
+CONVICTION_MULT_MAX = float(os.getenv("CONVICTION_MULT_MAX", "1.25"))
+
+# ── #2b Orçamento de RISCO aberto agregado (soma do R em risco das posições) ──
+# Diferente dos caps de notional/margem (tamanho/garantia): este soma o RISCO
+# REAL em aberto — quanto a banca perde se TODAS as posições abertas baterem o
+# stop ao mesmo tempo (Σ |entry−stop|×qty), em % da equity. Bloqueia nova
+# entrada se open_risk + nova_trade > teto. Posição pós-TP1 (SL≥entry) conta
+# risco ~0 → orçamento rotativo. 0 = DESLIGADO (default, sem mudança).
+MAX_TOTAL_OPEN_RISK_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_OPEN_RISK_PCT", "0"))
+
 # ── Direction flip (Fase 2) ────────────────────────────────────────────────
 # Quando aparece rec na direção OPOSTA a um trade aberto, avalia se a reversão
 # é forte o bastante pra justificar fechar a atual e abrir contra. Por padrão
@@ -420,6 +446,58 @@ def _record_skip(rec: dict, gate: str, reason: str) -> None:
             "timeframe": rec.get("timeframe"),
             "ts": _dt.now(_tz.utc).isoformat(),
         }
+        # Persistência durável (contador por gate/dia) — sobrevive redeploy.
+        # Fire-and-forget: nunca bloqueia nem derruba o loop de execução.
+        _schedule_skip_persist(gate, reason, sym)
+    except Exception:
+        pass
+
+
+def _schedule_skip_persist(gate: str, reason: str, sym: str) -> None:
+    """Agenda o upsert do contador de skip sem bloquear. Best-effort total:
+    se não houver loop async rodando ou o DB estiver desabilitado, vira no-op."""
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        loop.create_task(_persist_skip_stat(gate, reason, sym))
+    except RuntimeError:
+        # Sem event loop (ex.: chamada sync isolada) — ignora persistência.
+        pass
+    except Exception:
+        pass
+
+
+async def _persist_skip_stat(gate: str, reason: str, sym: str) -> None:
+    """Upsert do contador (gate, dia-UTC) na tabela skip_reason_stats.
+    Bounded por construção (~20 gates × N dias). Fail-soft: qualquer erro de DB
+    é engolido — assertividade nunca pode afetar a execução."""
+    try:
+        from db import DB_ENABLED, get_session
+        if not DB_ENABLED:
+            return
+        from datetime import datetime as _dt2, timezone as _tz2
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert
+        from models.skip_reason_stat import SkipReasonStat
+        now = _dt2.now(_tz2.utc)
+        day = now.date()
+        reason_s = (reason or "")[:255]
+        sym_s = (sym or "")[:50]
+        stmt = _pg_insert(SkipReasonStat).values(
+            gate=(gate or "?")[:40], day=day, count=1,
+            last_reason=reason_s, last_symbol=sym_s, last_seen=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["gate", "day"],
+            set_={
+                "count": SkipReasonStat.count + 1,
+                "last_reason": stmt.excluded.last_reason,
+                "last_symbol": stmt.excluded.last_symbol,
+                "last_seen": stmt.excluded.last_seen,
+            },
+        )
+        async with get_session() as session:
+            await session.execute(stmt)
+            await session.commit()
     except Exception:
         pass
 
@@ -1254,6 +1332,64 @@ async def _open_margin_usd() -> float:
     except Exception as e:
         log.warning(f"[shadow] _open_margin_usd falhou: {e}")
         return 0.0
+
+
+async def _open_risk_usd() -> float:
+    """Soma o RISCO em aberto (USD) dos trades reais auto — quanto a banca perde
+    se cada posição bater seu stop ATUAL. Pré-TP1 usa o stop planejado; pós-TP1
+    o SL já está em/above entry (BE estrutural) → risco ~0 (clampa em 0, não soma
+    negativo). Base do orçamento de risco agregado (#2b)."""
+    if not DB_ENABLED:
+        return 0.0
+    try:
+        from sqlalchemy import select
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            stmt = select(RealTrade).where(
+                RealTrade.status == "open",
+                RealTrade.source == "auto",
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            total = 0.0
+            for t in rows:
+                ep = float(t.entry_price or 0)
+                q = float(t.qty or 0)
+                # SL efetivo: o atual (pós-TP1 sobe pra BE) senão o planejado.
+                sl = t.sl_current_price if t.sl_current_price is not None else t.planned_stop
+                if sl is None or ep <= 0 or q <= 0:
+                    continue
+                side = (t.side or "long").lower()
+                # risco por unidade só conta se o stop está ADVERSO ao entry
+                if side == "long":
+                    risk_per_unit = max(0.0, ep - float(sl))
+                else:
+                    risk_per_unit = max(0.0, float(sl) - ep)
+                total += risk_per_unit * q
+            return total
+    except Exception as e:
+        log.warning(f"[shadow] _open_risk_usd falhou: {e}")
+        return 0.0
+
+
+def _conviction_mult(rec: dict) -> tuple[float, str]:
+    """Multiplicador de tamanho por CONVICÇÃO (#2a). Mapeia P(TP1) calibrada
+    [LO..HI] linearmente em [MIN..MAX], clampado. NO-OP-SAFE: desligado ou sem
+    prob calibrada → 1.0 (não mexe). Os caps duros de _compute_qty mandam depois."""
+    if not CONVICTION_SIZING_ENABLED:
+        return 1.0, "disabled"
+    p = rec.get("prob_tp1")
+    try:
+        p = float(p) if p is not None else None
+    except Exception:
+        p = None
+    if p is None:
+        return 1.0, "no-prob"  # calibração imatura — não escala
+    lo, hi = CONVICTION_PROB_LO, CONVICTION_PROB_HI
+    frac = (p - lo) / (hi - lo) if hi > lo else 0.5
+    frac = max(0.0, min(1.0, frac))
+    mult = CONVICTION_MULT_MIN + frac * (CONVICTION_MULT_MAX - CONVICTION_MULT_MIN)
+    return mult, f"prob={p*100:.0f}%→×{mult:.2f}"
 
 
 def _norm_sym(s: str) -> str:
@@ -2312,6 +2448,17 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             entry = float(rec.get("entry") or 0)
             stop = float(rec.get("stop_loss") or 0)
             risk_pct = float(rec.get("risk_pct") or 1.0)
+            # #2a — sizing por convicção: escala o risco/trade pela P(TP1)
+            # calibrada (dentro dos caps duros de _compute_qty). No-op se
+            # desligado ou calibração imatura.
+            _conv_mult, _conv_reason = _conviction_mult(rec)
+            if _conv_mult != 1.0:
+                _risk_before = risk_pct
+                risk_pct = round(risk_pct * _conv_mult, 4)
+                log.info(
+                    f"[conviction] {rec.get('symbol')} risco {_risk_before:.2f}% "
+                    f"→ {risk_pct:.2f}% ({_conv_reason})"
+                )
             equity_usd, equity_src = await _resolve_equity_usd()
             # go-live #5 — em modo LIVE, nunca dimensiona dinheiro real com
             # equity fictício. Se a exchange falhou (source="fallback"), aborta
@@ -2398,6 +2545,29 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         continue
                 except Exception as e:
                     log.warning(f"[shadow] total-margin check falhou: {e}")
+
+            # #2b — Cap de RISCO aberto agregado: bloqueia se a soma do risco em
+            # aberto (Σ |entry−stop|×qty) + o risco desta trade passar do teto da
+            # banca. Diferente do notional/margem — conta a PERDA potencial se
+            # tudo estopar junto. Posições pós-TP1 já contam risco ~0 (BE) →
+            # orçamento rotativo. 0 = desligado (default).
+            if MAX_TOTAL_OPEN_RISK_PCT > 0:
+                try:
+                    open_risk = await _open_risk_usd()
+                    new_risk = abs(entry - stop) * qty
+                    risk_after = open_risk + new_risk
+                    risk_cap = equity_usd * (MAX_TOTAL_OPEN_RISK_PCT / 100.0)
+                    if risk_after > risk_cap:
+                        reason = (
+                            f"risco aberto ${open_risk:.0f} + novo ${new_risk:.0f} = "
+                            f"${risk_after:.0f} > teto ${risk_cap:.0f} "
+                            f"({MAX_TOTAL_OPEN_RISK_PCT}% × equity ${equity_usd:.0f})"
+                        )
+                        log.warning(f"[shadow] {rec.get('symbol')} BLOCKED risk-budget: {reason}")
+                        _record_skip(rec, "risk-budget", reason)
+                        continue
+                except Exception as e:
+                    log.warning(f"[shadow] risk-budget check falhou: {e}")
 
             # Snapshot_id é setado em save_recommendations? Não — o `_just_saved`
             # flag é booleano. Precisamos do id do snapshot recém-criado pra
