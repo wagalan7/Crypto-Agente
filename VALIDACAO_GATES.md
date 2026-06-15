@@ -126,17 +126,25 @@ explícito; zero mudança de comportamento no deploy). Os caps duros já existen
 
 | Gate/feature | Env | Default | Afrouxar | Apertar |
 |---|---|---|---|---|
-| Convicção — liga/desliga | `CONVICTION_SIZING_ENABLED` | `false` | `true` | — |
+| Convicção — liga/desliga | `CONVICTION_SIZING_ENABLED` | `true` | `false` | — |
 | Convicção — piso P(TP1) | `CONVICTION_PROB_LO` | `0.45` | — | subir |
 | Convicção — teto P(TP1) | `CONVICTION_PROB_HI` | `0.65` | baixar | subir |
 | Convicção — mult mín | `CONVICTION_MULT_MIN` | `0.8` | subir p/ `0.9` | baixar p/ `0.7` |
-| Convicção — mult máx | `CONVICTION_MULT_MAX` | `1.25` | subir p/ `1.4` | baixar p/ `1.1` |
-| Risco agregado | `EXCHANGE_MAX_TOTAL_OPEN_RISK_PCT` | `0` (off) | subir o teto | baixar p/ `3` (3% banca) |
+| Convicção — mult máx | `CONVICTION_MULT_MAX` | `1.0` (defensivo) | subir p/ `1.25` (libera upside) | manter `1.0` |
+| Risco agregado | `EXCHANGE_MAX_TOTAL_OPEN_RISK_PCT` | `4` (4% banca) | subir o teto | baixar p/ `3` · `0`=off |
 
-Validar quando reabrir: com convicção ON, ver no log `[conviction] … risco X% →
-Y% (prob=..)` e confirmar que `_compute_qty` ainda clampa pelos caps duros (risco
-real nunca > `EXCHANGE_MAX_RISK_PCT`). Com risco agregado ON, ver
-`BLOCKED risk-budget` quando a banca já tem muito risco aberto.
+> **Config ATIVA desde 15/06**: os dois seguros agora sobem LIGADOS por default.
+> Convicção em **modo defensivo** (`MULT_MAX=1.0` → só reduz risco em setup
+> fraco, NUNCA aumenta) + orçamento de risco agregado em **4%** da banca. Pra
+> liberar o lado de cima (mais risco em alta convicção) subir `CONVICTION_MULT_MAX`
+> via env (>1.0) — recomendado só após o teste 0.50. **TP2: pendente** —
+> P(TP2) calibrada pra blendar no multiplicador (passo aditivo, a combinar/implantar).
+
+Validar quando reabrir: com convicção ON (default), ver no log `[conviction] …
+risco X% → Y% (prob=..)` — com `MULT_MAX=1.0` o `Y` nunca passa do `X` base — e
+confirmar que `_compute_qty` ainda clampa pelos caps duros (risco real nunca >
+`EXCHANGE_MAX_RISK_PCT`). Com risco agregado em 4%, ver `BLOCKED risk-budget`
+quando a banca já tem muito risco aberto.
 
 ## Hipótese de trabalho
 

@@ -195,26 +195,30 @@ MAX_TOTAL_MARGIN_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_MARGIN_PCT", "0"))
 # convicção do setup (P(TP1) calibrada). Setup com prob alta arrisca um pouco
 # mais; prob baixa, um pouco menos. SEMPRE dentro dos caps duros já existentes
 # (_compute_qty aplica MAX_RISK_PCT_HARD e margem). NO-OP-SAFE: se a calibração
-# não está madura (prob_tp1=None) → mult=1.0 (não mexe). Default DESLIGADO —
-# dinheiro real, opt-in explícito via env.
-CONVICTION_SIZING_ENABLED = os.getenv("CONVICTION_SIZING_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+# não está madura (prob_tp1=None) → mult=1.0 (não mexe). LIGADO em modo DEFENSIVO
+# por default (ver MULT_MAX=1.0 abaixo): só REDUZ risco em setup fraco, nunca
+# aumenta. Pra liberar o lado de cima (mais risco em alta convicção) sobe
+# CONVICTION_MULT_MAX via env (>1.0) — recomendado só após o teste 0.50.
+CONVICTION_SIZING_ENABLED = os.getenv("CONVICTION_SIZING_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 # Faixa de P(TP1) mapeada linearmente pra faixa de multiplicador. lo no piso do
 # gate (0.45), hi numa prob alta (0.65). Fora da faixa → clampa.
 CONVICTION_PROB_LO = float(os.getenv("CONVICTION_PROB_LO", "0.45"))
 CONVICTION_PROB_HI = float(os.getenv("CONVICTION_PROB_HI", "0.65"))
-# Banda do multiplicador — apertada de propósito (0.8×..1.25×). Subir o teto =
-# mais agressivo nos setups de alta convicção; baixar o piso = mais defensivo
-# nos fracos. Caps duros continuam mandando.
+# Banda do multiplicador. Default DEFENSIVO: piso 0.8× (reduz nos fracos), teto
+# 1.0× (NÃO aumenta acima do risco base). Subir o teto p/ >1.0 via env = liberar
+# agressividade nos setups de alta convicção (recomendado só após o teste 0.50).
+# Caps duros (_compute_qty) continuam mandando independente disso.
 CONVICTION_MULT_MIN = float(os.getenv("CONVICTION_MULT_MIN", "0.8"))
-CONVICTION_MULT_MAX = float(os.getenv("CONVICTION_MULT_MAX", "1.25"))
+CONVICTION_MULT_MAX = float(os.getenv("CONVICTION_MULT_MAX", "1.0"))
 
 # ── #2b Orçamento de RISCO aberto agregado (soma do R em risco das posições) ──
 # Diferente dos caps de notional/margem (tamanho/garantia): este soma o RISCO
 # REAL em aberto — quanto a banca perde se TODAS as posições abertas baterem o
 # stop ao mesmo tempo (Σ |entry−stop|×qty), em % da equity. Bloqueia nova
 # entrada se open_risk + nova_trade > teto. Posição pós-TP1 (SL≥entry) conta
-# risco ~0 → orçamento rotativo. 0 = DESLIGADO (default, sem mudança).
-MAX_TOTAL_OPEN_RISK_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_OPEN_RISK_PCT", "0"))
+# risco ~0 → orçamento rotativo. 0 = DESLIGADO. Default 4 (4% da banca) — teto
+# conservador do risco simultâneo em aberto; sobe/baixa via env sem deploy.
+MAX_TOTAL_OPEN_RISK_PCT = float(os.getenv("EXCHANGE_MAX_TOTAL_OPEN_RISK_PCT", "4"))
 
 # ── Direction flip (Fase 2) ────────────────────────────────────────────────
 # Quando aparece rec na direção OPOSTA a um trade aberto, avalia se a reversão
