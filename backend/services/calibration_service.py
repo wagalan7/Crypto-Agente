@@ -68,12 +68,17 @@ FAST_VOID_MAX = timedelta(minutes=30)
 def _not_fast_void():
     """Condição SQLAlchemy: exclui 'expired' que nunca teve avaliação justa.
     Agnóstico de causa — pega no-data E flip_advisory."""
+    # Usa a forma timestamp+intervalo (outcome_at < created_at + 30min) — não a
+    # subtração (outcome_at - created_at < 30min): SQLAlchemy tipa a subtração de
+    # dois DateTime como DateTime (não Interval), e comparar com um timedelta
+    # Python gera bind inválido → asyncpg estoura. Já 'DateTime + timedelta' é
+    # tratado nativamente (bind como interval) e vira comparação limpa de timestamp.
     return not_(and_(
         RecommendationSnapshot.status == "expired",
         or_(
             RecommendationSnapshot.last_check_at.is_(None),
-            (RecommendationSnapshot.outcome_at
-             - RecommendationSnapshot.created_at) < FAST_VOID_MAX,
+            RecommendationSnapshot.outcome_at
+            < (RecommendationSnapshot.created_at + FAST_VOID_MAX),
         ),
     ))
 
