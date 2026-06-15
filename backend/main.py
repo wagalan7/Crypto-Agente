@@ -1147,6 +1147,22 @@ async def rotation_plan(days: int = 0):
         raise HTTPException(500, f"Erro ao computar plano de rotação: {e}")
 
 
+@app.get("/api/score/feature-analysis")
+async def score_feature_analysis(days: int = 0):
+    """READ-ONLY. Mede o poder preditivo de cada componente do score (confluence,
+    mtf, rr, der, atr, funding…) contra o outcome real dos trades resolvidos:
+    AUC, correlação ponto-bisserial, win-rate por quartil e COBERTURA (% em que a
+    feature existe). Diagnóstico pra re-pesar _compute_score com base em dado.
+    NÃO altera execução, sizing nem calibração."""
+    try:
+        from services.score_analysis_service import compute_feature_analysis
+        d = 0 if days <= 0 else max(7, min(days, 365))
+        return await compute_feature_analysis(days=d)
+    except Exception as e:
+        logging.error(f"score feature-analysis error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao computar análise de features: {e}")
+
+
 @app.get("/api/calibration")
 async def calibration():
     """
