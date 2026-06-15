@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, or_, not_
 
 from db import DB_ENABLED, get_session
 from models.recommendation_snapshot import RecommendationSnapshot
@@ -52,6 +52,30 @@ SCORE_BINS = [(55, 60), (60, 65), (65, 70), (70, 75),
 # Estados considerados vitória pra P(TP1)
 WIN_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2")
 RESOLVED_STATUSES = WIN_STATUSES + ("lost", "expired")
+
+# Janela mínima pra um 'expired' ser um time-stop LEGÍTIMO. O menor time-stop
+# por TF é 1h (TIME_STOP_HOURS_BY_TF), então qualquer 'expired' que resolveu em
+# menos que isto NÃO pode ser time-stop real — é um "void" (descarte que nunca
+# foi avaliado contra TP1/stop). Dois produtores conhecidos:
+#   1. no-data / fora do universo (snapshot_service: fetch_ohlcv vazio + símbolo
+#      não-rastreável) → expira no PRIMEIRO check, segundos após criar. DOMINANTE.
+#   2. flip_advisory (expire_open_snapshot) → expira na hora, last_check_at NULL.
+# Ambos contavam como não-win e diluíam a P(TP1) pra baixo. 30min dá folga ampla
+# (nada legítimo resolve entre ~2min e 1h).
+FAST_VOID_MAX = timedelta(minutes=30)
+
+
+def _not_fast_void():
+    """Condição SQLAlchemy: exclui 'expired' que nunca teve avaliação justa.
+    Agnóstico de causa — pega no-data E flip_advisory."""
+    return not_(and_(
+        RecommendationSnapshot.status == "expired",
+        or_(
+            RecommendationSnapshot.last_check_at.is_(None),
+            (RecommendationSnapshot.outcome_at
+             - RecommendationSnapshot.created_at) < FAST_VOID_MAX,
+        ),
+    ))
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
 
@@ -210,7 +234,7 @@ async def _compute_calibration() -> Optional[Dict[str, Any]]:
     if DB_ENABLED:
         try:
             async with get_session() as session:
-                conds = [RecommendationSnapshot.status.in_(RESOLVED_STATUSES)]
+                conds.append(_not_fast_void())
                 # LOOKBACK_DAYS <= 0 ⇒ TODO o histórico (sem corte temporal)
                 if LOOKBACK_DAYS > 0:
                     since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)

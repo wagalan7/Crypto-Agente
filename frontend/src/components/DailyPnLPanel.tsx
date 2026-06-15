@@ -15,6 +15,9 @@ interface Trade {
   leverage: number
   status: string
   realized_r: number | null
+  // void = 'expired' que nunca foi avaliado (descarte administrativo, não
+  // time-stop real). Capital nunca ficou de fato exposto. Vem do backend.
+  void?: boolean
   risk_pct: number
   score?: number
   created_at: string
@@ -115,9 +118,16 @@ const STATUS_REASON: Record<string, string> = {
   won_tp1: 'Preço atingiu TP1 (50% saiu, +0.5R) e snapshot expirou em BE+ lock nos 50% restantes (+0.1R). Total +0.6R.',
   won_tp1_be: 'Preço atingiu TP1 (50% saiu, +0.5R), depois retraiu e bateu o BE+ lock (entry + 0.2R) nos 50% restantes (+0.1R). Total +0.6R. Trail v2 ampliado evita whipsaw.',
   lost: 'Preço bateu o stop ANTES de tocar TP1 (sem parcial). Perda total −1R.',
-  expired: 'Time-stop por TF (15m=4h, 1h=12h, 4h=36h) sem tocar TP1 nem stop. Sem perda, sem ganho — capital liberado.',
+  expired: 'Time-stop por TF (15m=4h, 1h=12h, 4h e swing=168h; teto absoluto 168h) sem tocar TP1 nem stop. Sem perda, sem ganho — capital liberado.',
   open: 'Tracker monitorando — aguardando preço tocar TP1, TP2 ou stop.',
 }
+
+// Descarte administrativo (void) — 'expired' que nunca foi avaliado. NÃO é
+// time-stop: a indicação foi substituída/descartada (ex: sinal oposto chegou)
+// segundos após criar, sem o capital nunca ter ficado exposto. Não conta em
+// nenhuma estatística nem na calibração.
+const VOID_BADGE = { label: '⊘ descartado', cls: 'bg-slate-500/20 text-slate-400 border-slate-500/40' }
+const VOID_REASON = 'Indicação descartada/substituída pouco depois de criada (não foi time-stop real). Nunca foi avaliada contra TP1/stop — capital nunca ficou exposto. Não entra em vencedores, perdedores nem na calibração.'
 
 type DrillKind = 'wins' | 'losses' | 'open' | 'open_today' | 'open_older' | 'all' | null
 
@@ -478,8 +488,9 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                 // timeframes diferentes (1h DAY + 15m SCALP) não são duplicatas,
                 // são setups paralelos. Pill "MTF Nx" sinaliza isso pro usuário.
                 const mtfSiblings = list.filter(x => x.symbol === t.symbol && x.direction === t.direction).length
-                const badge = STATUS_BADGE[t.status] || STATUS_BADGE.open
-                const reason = STATUS_REASON[t.status] || '—'
+                const isVoid = !!t.void && t.status === 'expired'
+                const badge = isVoid ? VOID_BADGE : (STATUS_BADGE[t.status] || STATUS_BADGE.open)
+                const reason = isVoid ? VOID_REASON : (STATUS_REASON[t.status] || '—')
                 const isLong = t.direction === 'long'
                 const DirIcon = isLong ? TrendingUp : TrendingDown
                 const r = t.realized_r ?? 0

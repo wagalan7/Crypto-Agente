@@ -19,7 +19,9 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, not_
+
+from services import calibration_service as _calib
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +110,10 @@ async def _shadow_stats(days: int) -> Dict[str, Any]:
                     RecommendationSnapshot.realized_r,
                 )
                 .where(RecommendationSnapshot.status.in_(_SNAP_RESOLVED))
+                # DE-POLUIÇÃO (fonte única com calibration_service): exclui voids
+                # — 'expired' que nunca teve avaliação justa (no-data / flip).
+                # Mantém a win-rate do painel honesta.
+                .where(_calib._not_fast_void())
                 .where(RecommendationSnapshot.outcome_at >= since)
             )
             rows = list((await session.execute(stmt)).all())

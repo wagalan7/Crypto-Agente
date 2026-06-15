@@ -673,6 +673,7 @@ async def check_open_snapshots() -> int:
                     snap.status = "expired"
                     snap.realized_r = 0.0
                     snap.outcome_at = now
+                    snap.last_check_at = now  # time-stop REAL é outcome avaliado
                     log.info(
                         f"[time-stop] {snap.symbol} {snap.timeframe} {snap.direction} "
                         f"expirado: {age.total_seconds()/3600:.1f}h sem TP1 "
@@ -699,6 +700,7 @@ async def check_open_snapshots() -> int:
                         snap.realized_r = 0.0
                         # Não notifica expired sem TP1 (não aconteceu nada).
                     snap.outcome_at = now
+                    snap.last_check_at = now  # teto absoluto REAL é outcome avaliado
                     resolved += 1
                     continue
 
@@ -1065,6 +1067,20 @@ async def get_daily_pnl(
             "realized_r": s.realized_r,
             "risk_pct": s.risk_pct,
             "score": s.score,
+            # VOID = 'expired' que NUNCA teve avaliação justa. NÃO é time-stop
+            # real (esse só dispara com age >= 1h). Dois produtores: no-data /
+            # fora do universo (expira no 1º check, segundos após criar — set
+            # last_check_at) e flip_advisory (last_check_at NULL). Discriminador
+            # robusto = resolveu em < 30min OU last_check_at NULL. Capital nunca
+            # ficou exposto. Front rotula distinto; já fora da calibração.
+            "void": (
+                s.status == "expired" and (
+                    s.last_check_at is None or (
+                        s.outcome_at is not None and s.created_at is not None
+                        and (s.outcome_at - s.created_at) < timedelta(minutes=30)
+                    )
+                )
+            ),
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "outcome_at": s.outcome_at.isoformat() if s.outcome_at else None,
             "tp1_hit_at": s.tp1_hit_at.isoformat() if s.tp1_hit_at else None,
