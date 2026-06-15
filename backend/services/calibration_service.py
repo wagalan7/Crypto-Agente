@@ -239,6 +239,7 @@ async def _compute_calibration() -> Optional[Dict[str, Any]]:
     if DB_ENABLED:
         try:
             async with get_session() as session:
+                conds = [RecommendationSnapshot.status.in_(RESOLVED_STATUSES)]
                 conds.append(_not_fast_void())
                 # LOOKBACK_DAYS <= 0 ⇒ TODO o histórico (sem corte temporal)
                 if LOOKBACK_DAYS > 0:
