@@ -341,3 +341,191 @@ async def compute_feature_analysis(days: int = 0) -> Dict[str, Any]:
                  "coverage baixo confirma feature que falta muito (ancora em 50 no score)."),
         "features": results,
     }
+
+
+def _quantile(sorted_vals: List[float], q: float) -> Optional[float]:
+    """Quantil q∈[0,1] por interpolação linear. sorted_vals já ordenado asc."""
+    if not sorted_vals:
+        return None
+    if q <= 0:
+        return sorted_vals[0]
+    if q >= 1:
+        return sorted_vals[-1]
+    idx = q * (len(sorted_vals) - 1)
+    lo = int(idx)
+    frac = idx - lo
+    if lo + 1 < len(sorted_vals):
+        return sorted_vals[lo] * (1 - frac) + sorted_vals[lo + 1] * frac
+    return sorted_vals[lo]
+
+
+def _band_stats(rows: List[Tuple[float, int, float]], label: str) -> Dict[str, Any]:
+    """rows = [(v2_score, win01, r)] de uma faixa de tier. Win-rate + avg_r + n."""
+    n = len(rows)
+    if n == 0:
+        return {"tier": label, "n": 0, "win_rate": None, "avg_r": None,
+                "score_lo": None, "score_hi": None}
+    wins = sum(w for _, w, _ in rows)
+    scores = [v for v, _, _ in rows]
+    return {
+        "tier": label, "n": n,
+        "win_rate": round(100 * wins / n, 1),
+        "avg_r": round(sum(r for _, _, r in rows) / n, 3),
+        "score_lo": round(min(scores), 1), "score_hi": round(max(scores), 1),
+    }
+
+
+def _tierize(scored: List[Tuple[float, int, float]],
+             c_aplus: float, c_a: float, c_b: float) -> Dict[str, List]:
+    bands: Dict[str, List[Tuple[float, int, float]]] = {
+        "A+": [], "A": [], "B": [], "rejeitado": []}
+    for v, w, r in scored:
+        if v >= c_aplus:
+            bands["A+"].append((v, w, r))
+        elif v >= c_a:
+            bands["A"].append((v, w, r))
+        elif v >= c_b:
+            bands["B"].append((v, w, r))
+        else:
+            bands["rejeitado"].append((v, w, r))
+    return bands
+
+
+async def compute_tier_sim(
+    c_aplus: float = 0.0, c_a: float = 0.0, c_b: float = 0.0, days: int = 0,
+) -> Dict[str, Any]:
+    """READ-ONLY. Re-deriva os cortes de tier (A+/A/B) sob o score V2.
+
+    Por que: a execução real gate na TIER, e os cortes legados (75/65/52) estão
+    calibrados pra distribuição do score LEGADO. A V2 muda essa distribuição →
+    os cortes quebram. Esta sim re-pontua os trades resolvidos com `_compute_score_v2`
+    (o MESMO helper de produção) e:
+      • mostra a distribuição do score V2 (percentis);
+      • se cortes não forem passados (0), DERIVA cortes que preservam o MIX
+        A+/A/B atual (mesma proporção de hoje → não seca nem inunda execução);
+      • compara win-rate/avg_r por tier LEGADA vs tier V2 proposta (a V2 é melhor
+        se o gradiente A+→B for mais íngreme);
+      • reporta a interação com os gates duros do A+ (mtf≥0.5, rr≥2.5): quantos
+        dos A+ propostos passariam neles (pra decidir manter/derrubar os gates).
+    NÃO altera execução, sizing, nem nada — é só medição."""
+    if not DB_ENABLED:
+        return {"enabled": False, "message": "Banco de dados não configurado."}
+
+    from services.recommendation_service import _compute_score_v2
+
+    conds = [RecommendationSnapshot.status.in_(RESOLVED_STATUSES)]
+    if days and days > 0:
+        from datetime import datetime, timedelta, timezone
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        conds.append(RecommendationSnapshot.outcome_at >= since)
+
+    async with get_session() as session:
+        stmt = select(RecommendationSnapshot).where(and_(*conds))
+        snaps = (await session.execute(stmt)).scalars().all()
+
+    if not snaps:
+        return {"enabled": True, "total": 0, "message": "Sem trades resolvidos."}
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    # (v2_score, win, r) + metadados pra gate/legado
+    scored: List[Tuple[float, int, float]] = []
+    legacy_bands: Dict[str, List[Tuple[float, int, float]]] = {
+        "A+": [], "A": [], "B": [], "outro": []}
+    gate_meta: List[Tuple[float, Optional[float], Optional[float]]] = []  # (v2, mtf, rr)
+    n_uncomputable = 0
+
+    for s in snaps:
+        feats = s.features or {}
+        v2 = _compute_score_v2(
+            conf_pct=_f(feats.get("confluence_pct")),
+            adx_raw=_f(feats.get("adx")),
+            funding_pct=_f(feats.get("funding_pct")),
+        )
+        if v2 is None:
+            n_uncomputable += 1
+            continue
+        win = 1 if s.status in WIN_STATUSES else 0
+        r = float(s.realized_r) if s.realized_r is not None else 0.0
+        scored.append((v2, win, r))
+        gate_meta.append((v2, _f(feats.get("mtf_score")), _f(s.risk_reward)))
+        lt = s.tier if s.tier in ("A+", "A", "B") else "outro"
+        legacy_bands[lt].append((v2, win, r))
+
+    n = len(scored)
+    if n == 0:
+        return {"enabled": True, "total": len(snaps),
+                "message": "Nenhum trade com score V2 computável."}
+
+    sorted_v2 = sorted(v for v, _, _ in scored)
+
+    # mix legado entre os que têm score V2 (proporção a preservar)
+    n_aplus = len(legacy_bands["A+"])
+    n_a = len(legacy_bands["A"])
+    n_b = len(legacy_bands["B"])
+    n_tiered = n_aplus + n_a + n_b
+    auto = not (c_aplus or c_a or c_b)
+    derived_from = "parâmetros manuais"
+    if auto and n_tiered > 0:
+        p_aplus = n_aplus / n_tiered
+        p_a = n_a / n_tiered
+        # corta nos percentis que reproduzem o mix atual
+        c_aplus = round(_quantile(sorted_v2, 1.0 - p_aplus), 1)
+        c_a = round(_quantile(sorted_v2, 1.0 - p_aplus - p_a), 1)
+        c_b = round(sorted_v2[0], 1)   # preserva volume: tudo que pontua ≥ B
+        derived_from = "mix A+/A/B atual (preserva volume de execução)"
+    elif auto:
+        # sem tier legada — usa tercis como fallback neutro
+        c_aplus = round(_quantile(sorted_v2, 0.80), 1)
+        c_a = round(_quantile(sorted_v2, 0.50), 1)
+        c_b = round(sorted_v2[0], 1)
+        derived_from = "percentis 80/50 (sem tier legada de referência)"
+
+    v2_bands = _tierize(scored, c_aplus, c_a, c_b)
+
+    # gate duro do A+ legado: quantos A+ propostos passam mtf≥0.5 E rr≥2.5
+    aplus_meta = [(m, rr) for v, m, rr in gate_meta if v >= c_aplus]
+    pass_gate = sum(1 for m, rr in aplus_meta
+                    if (m is not None and m >= 0.5) and (rr is not None and rr >= 2.5))
+    n_aplus_prop = len(aplus_meta)
+
+    def spread(bands_map, order):
+        return [_band_stats(bands_map[k], k) for k in order]
+
+    return {
+        "enabled": True,
+        "total": n,
+        "uncomputable": n_uncomputable,
+        "days": days,
+        "derived_from": derived_from,
+        "proposed_cutoffs": {"A+": c_aplus, "A": c_a, "B": c_b},
+        "v2_distribution": {
+            "min": round(sorted_v2[0], 1),
+            "p10": round(_quantile(sorted_v2, 0.10), 1),
+            "p25": round(_quantile(sorted_v2, 0.25), 1),
+            "p50": round(_quantile(sorted_v2, 0.50), 1),
+            "p75": round(_quantile(sorted_v2, 0.75), 1),
+            "p90": round(_quantile(sorted_v2, 0.90), 1),
+            "max": round(sorted_v2[-1], 1),
+        },
+        "legacy_tier_mix": {"A+": n_aplus, "A": n_a, "B": n_b, "outro": len(legacy_bands["outro"])},
+        # win-rate/avg_r por TIER LEGADA (cada trade pelo tier que recebeu na época)
+        "by_legacy_tier": spread(legacy_bands, ["A+", "A", "B"]),
+        # win-rate/avg_r por TIER V2 proposta (re-tierizado pelos cortes acima)
+        "by_v2_tier": spread(v2_bands, ["A+", "A", "B", "rejeitado"]),
+        "aplus_hard_gate": {
+            "proposed_aplus": n_aplus_prop,
+            "pass_mtf0.5_rr2.5": pass_gate,
+            "pass_pct": round(100 * pass_gate / n_aplus_prop, 1) if n_aplus_prop else None,
+            "note": ("Se poucos A+ passam os gates mtf≥0.5/rr≥2.5, manter os gates "
+                     "esvazia o A+ sob a V2 → considerar afrouxar/derrubar (MTF/RR "
+                     "não são preditivos no score V2)."),
+        },
+        "note": ("READ-ONLY. Compare by_v2_tier vs by_legacy_tier: a V2 é melhor se "
+                 "o gradiente de win_rate A+→B for mais íngreme (separa ganhador). "
+                 "Cortes derivados preservam o mix atual (mesmo volume de execução)."),
+    }

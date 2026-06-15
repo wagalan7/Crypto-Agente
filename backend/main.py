@@ -1181,6 +1181,23 @@ async def score_reweight_sim(
         raise HTTPException(500, f"Erro ao simular re-peso: {e}")
 
 
+@app.get("/api/score/tier-sim")
+async def score_tier_sim(
+    c_aplus: float = 0.0, c_a: float = 0.0, c_b: float = 0.0, days: int = 0,
+):
+    """READ-ONLY. Re-deriva os cortes de tier (A+/A/B) sob o score V2 (a execução
+    real gate na TIER, e os cortes legados 75/65/52 são da distribuição do score
+    legado). Sem cortes manuais (0), deriva cortes que preservam o mix A+/A/B atual
+    e compara win-rate por tier legada vs V2. NÃO altera execução nem nada."""
+    try:
+        from services.score_analysis_service import compute_tier_sim
+        d = 0 if days <= 0 else max(7, min(days, 365))
+        return await compute_tier_sim(c_aplus=c_aplus, c_a=c_a, c_b=c_b, days=d)
+    except Exception as e:
+        logging.error(f"score tier-sim error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao simular tiers V2: {e}")
+
+
 @app.get("/api/calibration")
 async def calibration():
     """
