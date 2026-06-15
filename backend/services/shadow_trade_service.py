@@ -345,7 +345,17 @@ EXEC_UNIVERSE_ALLOWLIST: set[str] = {
 # postmortem mostrou win-rate sensivelmente melhor acima de 75, mas 75
 # estava bloqueando trades demais (0 entradas em 48h). 72 = meio-termo
 # pra coletar amostra mantendo qualidade. Override via env SCORE_MIN.
-SCORE_MIN = float(os.getenv("SCORE_MIN", "72"))
+#
+# V2 (flag SCORE_FORMULA_V2): a escala do score muda (legado 55-100 → V2 ~15-75),
+# então o piso de EXECUÇÃO precisa ser rescalado — senão NENHUM auto-trade passa
+# (V2 maxa ~71 < 72). 57 em V2 ≈ top ~12-15% dos candidatos de execução (p85-p90
+# medido nos snapshots), preservando a MESMA seletividade efetiva do 72 legado.
+# Override via env SCORE_MIN_V2.
+_SCORE_FORMULA_V2 = os.getenv("SCORE_FORMULA_V2", "false").strip().lower() in ("1", "true", "yes", "on")
+if _SCORE_FORMULA_V2:
+    SCORE_MIN = float(os.getenv("SCORE_MIN_V2", "57"))
+else:
+    SCORE_MIN = float(os.getenv("SCORE_MIN", "72"))
 
 # ── Time-of-day block (postmortem 104 snapshots / 168h) ────────────────────
 # Sessão EU (7-14 UTC) mostrou 50 trades / 42% wr / lift -21.46%.
