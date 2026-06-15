@@ -117,6 +117,149 @@ def _quartiles(triples: List[Tuple[float, int, float]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _deciles(triples: List[Tuple[float, int, float]]) -> List[Dict[str, Any]]:
+    """triples=[(score,win01,r)] → 10 grupos por score, win_rate+avg_r cada."""
+    s = sorted(triples, key=lambda t: t[0])
+    n = len(s)
+    if n < 10:
+        return []
+    out = []
+    for q in range(10):
+        lo = q * n // 10
+        hi = (q + 1) * n // 10
+        grp = s[lo:hi]
+        if not grp:
+            continue
+        wins = sum(w for _, w, _ in grp)
+        out.append({
+            "d": q + 1, "n": len(grp),
+            "score_lo": round(grp[0][0], 2), "score_hi": round(grp[-1][0], 2),
+            "win_rate": round(100 * wins / len(grp), 1),
+            "avg_r": round(sum(r for _, _, r in grp) / len(grp), 3),
+        })
+    return out
+
+
+def _norm_components(s) -> Dict[str, Optional[float]]:
+    """Reconstrói os componentes 0–100 de um snapshot a partir das features
+    armazenadas. None = ausente (pra renormalização). Espelha _compute_score."""
+    feats = s.features or {}
+
+    def g(k):
+        v = feats.get(k)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    conf = g("confluence_pct")                      # já 0–100
+    adx = g("adx")
+    adx_n = (max(0.0, min(adx, 50.0)) / 50.0 * 100.0) if adx is not None else None
+    mtf = g("mtf_score")                            # alignment -1..+1
+    mtf_n = ((max(-1.0, min(mtf, 1.0)) + 1.0) * 50.0) if mtf is not None else None
+    try:
+        rr = float(s.risk_reward) if s.risk_reward is not None else None
+    except (TypeError, ValueError):
+        rr = None
+    rr_n = (min(rr / 3.0, 1.0) * 100.0) if rr is not None else None
+    fund = g("funding_pct")                          # inverso: maior → pior
+    der_n = (50.0 - max(-1.0, min(fund / 0.05, 1.0)) * 50.0) if fund is not None else None
+    return {"conf": conf, "adx": adx_n, "mtf": mtf_n, "rr": rr_n, "der": der_n}
+
+
+async def compute_reweight_sim(
+    w_conf: float = 0.55, w_adx: float = 0.20, w_der: float = 0.10,
+    w_mtf: float = 0.05, w_rr: float = 0.0, days: int = 0,
+) -> Dict[str, Any]:
+    """READ-ONLY. Re-pontua os trades resolvidos com pesos novos (renormalizados
+    sobre componentes presentes), e compara com o score atual: AUC, win-rate por
+    decil e nº de platôs após calibração PAV. NÃO altera nada em produção."""
+    if not DB_ENABLED:
+        return {"enabled": False, "message": "Banco de dados não configurado."}
+
+    conds = [RecommendationSnapshot.status.in_(RESOLVED_STATUSES)]
+    if days and days > 0:
+        from datetime import datetime, timedelta, timezone
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        conds.append(RecommendationSnapshot.outcome_at >= since)
+
+    async with get_session() as session:
+        stmt = select(RecommendationSnapshot).where(and_(*conds))
+        snaps = (await session.execute(stmt)).scalars().all()
+    if not snaps:
+        return {"enabled": True, "total": 0, "message": "Sem trades resolvidos."}
+
+    new_w = {"conf": w_conf, "adx": w_adx, "der": w_der, "mtf": w_mtf, "rr": w_rr}
+    # pesos do score ATUAL (com mtf/der ANCORADOS em 50 quando ausentes)
+    old_triples: List[Tuple[float, int, float]] = []   # (stored_score, win, r)
+    new_triples: List[Tuple[float, int, float]] = []   # (new_score, win, r)
+    old_pairs: List[Tuple[float, str]] = []
+    new_pairs_raw: List[Tuple[float, str]] = []        # (new_score, status) p/ calib
+
+    for s in snaps:
+        win = 1 if s.status in WIN_STATUSES else 0
+        r = float(s.realized_r) if s.realized_r is not None else 0.0
+        comp = _norm_components(s)
+        # ── score novo: renormaliza sobre presentes ──
+        num = den = 0.0
+        for k, w in new_w.items():
+            if w > 0 and comp.get(k) is not None:
+                num += w * comp[k]
+                den += w
+        if den == 0:
+            continue
+        new_score = num / den
+        new_triples.append((new_score, win, r))
+        new_pairs_raw.append((new_score, s.status))
+        if s.score is not None:
+            old_triples.append((float(s.score), win, r))
+            old_pairs.append((float(s.score), s.status))
+
+    if not new_triples or not old_triples:
+        return {"enabled": True, "total": len(snaps), "message": "Dados insuficientes."}
+
+    auc_old = _auc([(v, w) for v, w, _ in old_triples])
+    auc_new = _auc([(v, w) for v, w, _ in new_triples])
+
+    # nº de platôs após PAV: re-escala new_score pro range do old p/ binning justo
+    from services.calibration_service import compute_calibration_from_pairs
+    omin = min(v for v, _ in old_pairs); omax = max(v for v, _ in old_pairs)
+    nmin = min(v for v, _ in new_pairs_raw); nmax = max(v for v, _ in new_pairs_raw)
+
+    def rescale(v):
+        if nmax == nmin:
+            return (omin + omax) / 2
+        return omin + (v - nmin) / (nmax - nmin) * (omax - omin)
+
+    new_pairs = [(rescale(v), st) for v, st in new_pairs_raw]
+
+    def plateaus(calib):
+        if not calib:
+            return None
+        vals = sorted({b["p_calibrated"] for b in calib["bins"] if b["n_total"] > 0})
+        return {"count": len(vals), "values": vals}
+
+    cal_old = compute_calibration_from_pairs(old_pairs, source="sim-old")
+    cal_new = compute_calibration_from_pairs(new_pairs, source="sim-new")
+
+    return {
+        "enabled": True,
+        "total": len(new_triples),
+        "weights_new": new_w,
+        "note": ("READ-ONLY. AUC maior + mais platôs = score discrimina melhor. "
+                 "new_score renormaliza sobre componentes presentes (dado faltante "
+                 "NÃO ancora em 50). Re-escalado pro range do score atual só p/ binning."),
+        "auc_old": round(auc_old, 4) if auc_old is not None else None,
+        "auc_new": round(auc_new, 4) if auc_new is not None else None,
+        "auc_delta": (round(auc_new - auc_old, 4)
+                      if (auc_old is not None and auc_new is not None) else None),
+        "plateaus_old": plateaus(cal_old),
+        "plateaus_new": plateaus(cal_new),
+        "deciles_old": _deciles(old_triples),
+        "deciles_new": _deciles(new_triples),
+    }
+
+
 async def compute_feature_analysis(days: int = 0) -> Dict[str, Any]:
     """READ-ONLY. Mede o poder preditivo de cada componente do score nos trades
     resolvidos. days<=0 = todo o histórico."""

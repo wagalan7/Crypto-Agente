@@ -1163,6 +1163,24 @@ async def score_feature_analysis(days: int = 0):
         raise HTTPException(500, f"Erro ao computar análise de features: {e}")
 
 
+@app.get("/api/score/reweight-sim")
+async def score_reweight_sim(
+    w_conf: float = 0.55, w_adx: float = 0.20, w_der: float = 0.10,
+    w_mtf: float = 0.05, w_rr: float = 0.0, days: int = 0,
+):
+    """READ-ONLY. Re-pontua os trades resolvidos com pesos novos e compara com o
+    score atual: AUC, win-rate por decil e nº de platôs após calibração PAV. Pesos
+    tunáveis por query. NÃO altera execução, sizing nem calibração de produção."""
+    try:
+        from services.score_analysis_service import compute_reweight_sim
+        d = 0 if days <= 0 else max(7, min(days, 365))
+        return await compute_reweight_sim(
+            w_conf=w_conf, w_adx=w_adx, w_der=w_der, w_mtf=w_mtf, w_rr=w_rr, days=d)
+    except Exception as e:
+        logging.error(f"score reweight-sim error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao simular re-peso: {e}")
+
+
 @app.get("/api/calibration")
 async def calibration():
     """
