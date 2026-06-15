@@ -210,6 +210,16 @@ CONVICTION_PROB_HI = float(os.getenv("CONVICTION_PROB_HI", "0.65"))
 # Caps duros (_compute_qty) continuam mandando independente disso.
 CONVICTION_MULT_MIN = float(os.getenv("CONVICTION_MULT_MIN", "0.8"))
 CONVICTION_MULT_MAX = float(os.getenv("CONVICTION_MULT_MAX", "1.0"))
+# ── #2 P(TP2) na convicção ── Blenda P(TP2) calibrada como sinal ADITIVO no
+# fator de convicção. Peso 0.0 = NO-OP (comportamento idêntico ao TP1-only).
+# Cada prob é normalizada na PRÓPRIA banda LO/HI e os fracs são misturados:
+#   frac = (1-w)*frac_tp1 + w*frac_tp2 ; mult = MIN + frac*(MAX-MIN)
+# Banda TP2 mais baixa que a do TP1 porque P(TP2) é sempre <= P(TP1) (subconjunto:
+# correr até o TP2 é mais raro que bater o TP1). Default desligado (w=0) até
+# medir a distribuição real de p_tp2_global ao vivo e calibrar a banda.
+CONVICTION_TP2_WEIGHT = float(os.getenv("CONVICTION_TP2_WEIGHT", "0.0"))
+CONVICTION_TP2_PROB_LO = float(os.getenv("CONVICTION_TP2_PROB_LO", "0.25"))
+CONVICTION_TP2_PROB_HI = float(os.getenv("CONVICTION_TP2_PROB_HI", "0.45"))
 
 # ── #2b Orçamento de RISCO aberto agregado (soma do R em risco das posições) ──
 # Diferente dos caps de notional/margem (tamanho/garantia): este soma o RISCO
@@ -1390,10 +1400,30 @@ def _conviction_mult(rec: dict) -> tuple[float, str]:
     if p is None:
         return 1.0, "no-prob"  # calibração imatura — não escala
     lo, hi = CONVICTION_PROB_LO, CONVICTION_PROB_HI
-    frac = (p - lo) / (hi - lo) if hi > lo else 0.5
-    frac = max(0.0, min(1.0, frac))
+    frac1 = (p - lo) / (hi - lo) if hi > lo else 0.5
+    frac1 = max(0.0, min(1.0, frac1))
+
+    # #2 blend P(TP2): peso aditivo. w=0 → idêntico ao TP1-only (NO-OP). Se a
+    # prob TP2 não está madura (None) mesmo com w>0, cai pro frac do TP1 sozinho
+    # (não penaliza por falta de dado).
+    frac = frac1
+    tag = f"p1={p*100:.0f}%"
+    w = CONVICTION_TP2_WEIGHT
+    if w > 0.0:
+        p2 = rec.get("prob_tp2")
+        try:
+            p2 = float(p2) if p2 is not None else None
+        except Exception:
+            p2 = None
+        if p2 is not None:
+            lo2, hi2 = CONVICTION_TP2_PROB_LO, CONVICTION_TP2_PROB_HI
+            frac2 = (p2 - lo2) / (hi2 - lo2) if hi2 > lo2 else 0.5
+            frac2 = max(0.0, min(1.0, frac2))
+            frac = (1.0 - w) * frac1 + w * frac2
+            tag = f"p1={p*100:.0f}% p2={p2*100:.0f}% w={w:.2f}"
+
     mult = CONVICTION_MULT_MIN + frac * (CONVICTION_MULT_MAX - CONVICTION_MULT_MIN)
-    return mult, f"prob={p*100:.0f}%→×{mult:.2f}"
+    return mult, f"{tag}→×{mult:.2f}"
 
 
 def _norm_sym(s: str) -> str:

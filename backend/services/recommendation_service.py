@@ -137,6 +137,10 @@ class Recommendation(BaseModel):
     # P(TP1) calibrada via calibration_service — None se calib não está pronta
     # (precisa de ≥30 snapshots resolvidos nos últimos 90 dias).
     prob_tp1: Optional[float] = None          # 0..1 — exibido no card como %
+    # P(TP2) calibrada — prob de correr até o TP2 (won_tp2). Subconjunto de
+    # prob_tp1 (sempre <=). Usada no sizing por convicção (#2a) como sinal
+    # aditivo. None se calib imatura.
+    prob_tp2: Optional[float] = None          # 0..1
     # ── Position sizing dinâmico (Issue #4 — Kelly fracionado) ────────────
     # Tamanho sugerido em % da banca, baseado em prob_tp1 × RR × score × volatilidade.
     # Diferente de risk_pct (que é o % de PERDA aceitável se o stop bater).
@@ -845,12 +849,16 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
             f"⚠ Preço {chase_atr}×ATR acima do entry — esperar pullback à zona ou pular."
         ]
 
-    # P(TP1) calibrada — lookup sync no cache (None se calib não pronta)
+    # P(TP1)/P(TP2) calibradas — lookup sync no cache (None se calib não pronta)
     try:
-        from services.calibration_service import prob_tp1_for_score_sync
+        from services.calibration_service import (
+            prob_tp1_for_score_sync, prob_tp2_for_score_sync,
+        )
         prob_tp1 = prob_tp1_for_score_sync(score)
+        prob_tp2 = prob_tp2_for_score_sync(score)
     except Exception:
         prob_tp1 = None
+        prob_tp2 = None
 
     # Position sizing dinâmico (Issue #4) — Kelly fracionado × score × volatilidade
     atr_pct_val = sig.indicators.atr_pct if sig.indicators else None
@@ -907,6 +915,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         chase_atr=chase_atr,
         chase_level=chase_level,
         prob_tp1=prob_tp1,
+        prob_tp2=prob_tp2,
         suggested_size_pct=suggested_size_pct,
         size_rationale=size_rationale,
         quote_vol_usd=q_vol,

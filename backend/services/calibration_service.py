@@ -51,6 +51,8 @@ SCORE_BINS = [(55, 60), (60, 65), (65, 70), (70, 75),
 
 # Estados considerados vitória pra P(TP1)
 WIN_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2")
+# Vitória pra P(TP2): SÓ quem correu até o TP2 (won_tp2). Subconjunto de WIN.
+TP2_WIN_STATUSES = ("won_tp2",)
 RESOLVED_STATUSES = WIN_STATUSES + ("lost", "expired")
 
 # Janela mínima pra um 'expired' ser um time-stop LEGÍTIMO. O menor time-stop
@@ -131,21 +133,16 @@ def _pav_isotonic(values: List[float], weights: List[float]) -> List[float]:
     return result
 
 
-def compute_calibration_from_pairs(
+def _calibrate_for_win_set(
     pairs: List[Tuple[float, str]],
-    source: str = "db",
-) -> Optional[Dict[str, Any]]:
-    """
-    Núcleo puro: dado lista de (score, status) → tabela de bins calibrada.
-    `status` precisa estar em RESOLVED_STATUSES; vitórias contam pra P.
-
-    Não checa MIN_SAMPLE_TOTAL — chamador decide. Retorna None se vazio.
-    """
+    win_set: Tuple[str, ...],
+) -> Dict[str, Any]:
+    """Roda shrinkage bayesiano + PAV pra um conjunto de "vitória" qualquer.
+    Reusável: TP1 (win = chegou no TP1) e TP2 (win = só won_tp2). Mesmos pares,
+    mesma matemática, só muda o que conta como vitória."""
     total = len(pairs)
-    if total == 0:
-        return None
-    wins_global = sum(1 for _, st in pairs if st in WIN_STATUSES)
-    p_global = wins_global / total
+    wins_global = sum(1 for _, st in pairs if st in win_set)
+    p_global = wins_global / total if total else 0.0
 
     bin_total = [0] * len(SCORE_BINS)
     bin_wins = [0] * len(SCORE_BINS)
@@ -154,7 +151,7 @@ def compute_calibration_from_pairs(
         if bi < 0:
             continue
         bin_total[bi] += 1
-        if status in WIN_STATUSES:
+        if status in win_set:
             bin_wins[bi] += 1
 
     bin_p_raw, bin_p_shrunk = [], []
@@ -171,6 +168,38 @@ def compute_calibration_from_pairs(
 
     weights = [max(1.0, float(n)) for n in bin_total]
     bin_p_calibrated = _pav_isotonic(bin_p_shrunk, weights)
+    return {
+        "wins_global": wins_global,
+        "p_global": p_global,
+        "bin_total": bin_total,
+        "bin_wins": bin_wins,
+        "bin_p_raw": bin_p_raw,
+        "bin_p_shrunk": bin_p_shrunk,
+        "bin_p_calibrated": bin_p_calibrated,
+    }
+
+
+def compute_calibration_from_pairs(
+    pairs: List[Tuple[float, str]],
+    source: str = "db",
+) -> Optional[Dict[str, Any]]:
+    """
+    Núcleo puro: dado lista de (score, status) → tabela de bins calibrada.
+    `status` precisa estar em RESOLVED_STATUSES.
+
+    Calcula DUAS calibrações sobre os MESMOS pares:
+      - P(TP1): vitória = chegou no TP1 (WIN_STATUSES). Campos `p_*`.
+      - P(TP2): vitória = correu até TP2 (TP2_WIN_STATUSES). Campos `p_tp2_*`.
+    P(TP2) <= P(TP1) por construção (won_tp2 ⊂ win). Usada no sizing por
+    convicção (#2a) como sinal aditivo — setup que tende a correr até TP2 vale
+    mais. Não checa MIN_SAMPLE_TOTAL — chamador decide. None se vazio.
+    """
+    total = len(pairs)
+    if total == 0:
+        return None
+
+    c1 = _calibrate_for_win_set(pairs, WIN_STATUSES)       # P(TP1)
+    c2 = _calibrate_for_win_set(pairs, TP2_WIN_STATUSES)   # P(TP2)
 
     bins_out = []
     for i, (lo, hi) in enumerate(SCORE_BINS):
@@ -178,18 +207,25 @@ def compute_calibration_from_pairs(
             "score_lo": lo,
             "score_hi": int(hi) if hi == int(hi) else round(hi, 1),
             "label": f"[{lo}-{int(hi)})" if i < len(SCORE_BINS) - 1 else f"[{lo}-100]",
-            "n_total": bin_total[i],
-            "n_wins": bin_wins[i],
-            "p_observed": round(bin_p_raw[i], 4),
-            "p_shrunk": round(bin_p_shrunk[i], 4),
-            "p_calibrated": round(bin_p_calibrated[i], 4),
+            "n_total": c1["bin_total"][i],
+            "n_wins": c1["bin_wins"][i],
+            "p_observed": round(c1["bin_p_raw"][i], 4),
+            "p_shrunk": round(c1["bin_p_shrunk"][i], 4),
+            "p_calibrated": round(c1["bin_p_calibrated"][i], 4),
+            # P(TP2) — mesma estrutura, win = só won_tp2
+            "n_wins_tp2": c2["bin_wins"][i],
+            "p_tp2_observed": round(c2["bin_p_raw"][i], 4),
+            "p_tp2_shrunk": round(c2["bin_p_shrunk"][i], 4),
+            "p_tp2_calibrated": round(c2["bin_p_calibrated"][i], 4),
         })
     return {
         "enabled": True,
         "source": source,
         "total_resolved": total,
-        "wins_global": wins_global,
-        "p_global": round(p_global, 4),
+        "wins_global": c1["wins_global"],
+        "p_global": round(c1["p_global"], 4),
+        "wins_tp2_global": c2["wins_global"],
+        "p_tp2_global": round(c2["p_global"], 4),
         "lookback_days": LOOKBACK_DAYS,
         "computed_at": datetime.now(timezone.utc).isoformat(),
         "bins": bins_out,
@@ -315,6 +351,23 @@ def prob_tp1_for_score_sync(score: float) -> Optional[float]:
     if bi < 0:
         return calib.get("p_global")
     return calib["bins"][bi]["p_calibrated"]
+
+
+def prob_tp2_for_score_sync(score: float) -> Optional[float]:
+    """
+    Igual a prob_tp1_for_score_sync mas pra P(TP2) (correr até o TP2). Lê só do
+    cache. None se calib imatura → conviction trata como NO-OP. Usada no sizing
+    por convicção (#2a) como sinal aditivo.
+    """
+    if score is None:
+        return None
+    calib = _cache.get("data")
+    if not calib or not calib.get("bins"):
+        return None
+    bi = _bin_index(float(score))
+    if bi < 0:
+        return calib.get("p_tp2_global")
+    return calib["bins"][bi].get("p_tp2_calibrated")
 
 
 def invalidate_cache() -> None:
