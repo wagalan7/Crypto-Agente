@@ -426,6 +426,25 @@ LIQUIDITY_GATE_ENABLED = os.getenv("LIQUIDITY_GATE_ENABLED", "true").strip().low
 MIN_QUOTE_VOL_24H_USD = float(os.getenv("MIN_QUOTE_VOL_24H_USD", "10000000"))  # $10M/24h
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.25"))                    # 0.25%
 
+# ── Exec size damper (liquidez/ATR-aware) ───────────────────────────────────
+# O gate de ATR/liquidez é BINÁRIO (bloqueia ou não). Mas o postmortem (LINK,
+# DOGE) mostrou stop-slippage em moedas LÍQUIDAS — não é profundidade de book,
+# é vol/momentum. E a feature-analysis (N=654) achou: atr_pct <1.65% rende
+# ~76%/0.54R vs >1.65% ~70%/0.42R (a pior faixa, Q3 1.65–2.66%, passa pelo gate
+# de 3%). Este damper REDUZ o size (não bloqueia) de forma graduada quando:
+#   • atr_pct sobe de ATR_DAMP_LO→HI (size cai 1.0→ATR_DAMP_MULT_MIN), e/ou
+#   • a posição vira fatia relevante do volume 24h (participação) — NO-OP nos
+#     tamanhos atuais (~0.0003% do vol), futuro-proof pro ramp de size.
+# DEFENSIVO (teto 1.0, só reduz), fail-soft (dado ausente = sem damp), compõe
+# multiplicativo com conviction_mult e LIVE_SIZE_MULT. Flag OFF = NO-OP total.
+EXEC_SIZE_DAMP_ENABLED = os.getenv("EXEC_SIZE_DAMP_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+ATR_DAMP_LO = float(os.getenv("ATR_DAMP_LO", "1.65"))          # %: início do damp
+ATR_DAMP_HI = float(os.getenv("ATR_DAMP_HI", "3.0"))           # %: damp máximo (= block gate)
+ATR_DAMP_MULT_MIN = float(os.getenv("ATR_DAMP_MULT_MIN", "0.6"))   # size mínimo por ATR
+LIQ_DAMP_PART_LO = float(os.getenv("LIQ_DAMP_PART_LO", "0.003"))   # 0.3% do vol 24h: início
+LIQ_DAMP_PART_HI = float(os.getenv("LIQ_DAMP_PART_HI", "0.02"))    # 2% do vol 24h: damp máx
+LIQ_DAMP_MULT_MIN = float(os.getenv("LIQ_DAMP_MULT_MIN", "0.5"))   # size mínimo por participação
+
 # ── P(TP1) gate (calibração) ────────────────────────────────────────────────
 # rec.prob_tp1 = P(TP1) calibrada por bin de score (calibration_service). Pula
 # setups com probabilidade calibrada baixa de bater o TP1. NO-OP-SAFE: quando a
@@ -2122,6 +2141,46 @@ def _compute_qty(
     }
 
 
+def _exec_size_damp(rec: dict, notional_usd: float) -> tuple[float, str]:
+    """Multiplicador DEFENSIVO de tamanho (≤1.0) por vol (atr_pct) + participação
+    no volume 24h. Retorna (mult, reason). Fail-soft: dado ausente = sem damp.
+    NÃO bloqueia — só reduz. Flag OFF = (1.0, 'off')."""
+    if not EXEC_SIZE_DAMP_ENABLED:
+        return 1.0, "off"
+
+    # componente ATR (a com suporte empírico)
+    m_atr, tag_atr = 1.0, ""
+    atr = _get_rec_feature(rec, "atr_pct")
+    try:
+        a = float(atr) if atr is not None else None
+    except Exception:
+        a = None
+    if a is not None and ATR_DAMP_HI > ATR_DAMP_LO and a > ATR_DAMP_LO:
+        frac = min(1.0, (a - ATR_DAMP_LO) / (ATR_DAMP_HI - ATR_DAMP_LO))
+        m_atr = 1.0 - frac * (1.0 - ATR_DAMP_MULT_MIN)
+        tag_atr = f"atr={a:.2f}%→×{m_atr:.2f}"
+
+    # componente participação (notional / volume 24h) — NO-OP nos tamanhos atuais
+    m_liq, tag_liq = 1.0, ""
+    try:
+        qvol = float(rec.get("quote_vol_usd")) if rec.get("quote_vol_usd") is not None else None
+    except Exception:
+        qvol = None
+    if (qvol and qvol > 0 and notional_usd and notional_usd > 0
+            and LIQ_DAMP_PART_HI > LIQ_DAMP_PART_LO):
+        part = notional_usd / qvol
+        if part > LIQ_DAMP_PART_LO:
+            frac = min(1.0, (part - LIQ_DAMP_PART_LO) / (LIQ_DAMP_PART_HI - LIQ_DAMP_PART_LO))
+            m_liq = 1.0 - frac * (1.0 - LIQ_DAMP_MULT_MIN)
+            tag_liq = f"part={part*100:.2f}%→×{m_liq:.2f}"
+
+    mult = min(m_atr, m_liq)
+    if mult >= 1.0:
+        return 1.0, "sem damp"
+    tag = " ".join(t for t in (tag_atr, tag_liq) if t)
+    return round(mult, 4), f"{tag} ⇒ ×{mult:.2f}"
+
+
 async def open_shadow_for_recs(recs: list[dict]) -> int:
     """
     Pra cada rec marcada com `_just_saved=True` e tier A/A+, abre uma RealTrade.
@@ -2522,6 +2581,27 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 continue
             qty = sizing["qty"]
             notional_effective = float(sizing["notional_usd"])
+
+            # ── Exec size damper (liquidez/ATR-aware) — DEFENSIVO, flag OFF=NO-OP.
+            # Reduz (não bloqueia) o size em vol alta (atr_pct) / posição grande vs
+            # vol 24h. Fail-soft. Compõe com conviction e LIVE_SIZE_MULT. Se o damp
+            # jogar o notional abaixo do mínimo da exchange, pula (vol alta demais).
+            if not SHADOW_ENABLED and EXEC_SIZE_DAMP_ENABLED:
+                _dmp, _dmp_reason = _exec_size_damp(rec, notional_effective)
+                if _dmp < 1.0:
+                    _qty_pre = qty
+                    qty = round(qty * _dmp, 6)
+                    notional_effective = qty * entry
+                    log.info(
+                        f"[size-damp] {rec.get('symbol')} qty {_qty_pre}→{qty} ({_dmp_reason})"
+                    )
+                    if notional_effective < MIN_NOTIONAL_USD:
+                        log.warning(
+                            f"[size-damp] {rec.get('symbol')} SKIP: notional pós-damp "
+                            f"${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f}"
+                        )
+                        _record_skip(rec, "size-damp", f"notional pós-damp < mín ({_dmp_reason})")
+                        continue
 
             # go-live #2 — canary/ramp: em LIVE, escala o tamanho por um
             # multiplicador global pra começar pequeno e subir gradual. Não
