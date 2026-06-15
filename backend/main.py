@@ -2210,7 +2210,10 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
       - Herda SL/TP1/TP2/leverage da rec (níveis enviados pelo painel; e, se
         achar o snapshot por symbol+tf+direction, linka pra atribuição/slippage).
       - qty automático: se não informado, lê o tamanho da posição viva na conta.
-      - source="manual" → entra no monitor advise-only (não dispara ordem).
+      - source="managed" → o bot COLOCA o bracket (SL + TP1 parcial 45% + TP2) na
+        corretora e o trade-manager gerencia o ciclo (incl. BE estrutural pós-TP1),
+        igual ao auto — só a posição é sua. (≠ source="manual" do POST /api/real-
+        trades, que é advise-only e NÃO coloca ordem.)
     """
     from services import real_trade_service
 
