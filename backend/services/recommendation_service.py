@@ -191,6 +191,49 @@ async def get_recommendations_cached_for_api(top_n: int = 50) -> "List[Recommend
     return recs
 
 
+# ── Score V2 (atrás de flag, default OFF — NO-OP até ativar pós-teste 0.50) ──
+# Diagnóstico (score_analysis_service): a fórmula legada tem AUC≈0.52 (≈moeda).
+# Confluence sozinho (0.579) já bate o composto; RR é INVERSO (0.442) e MTF é
+# ruído com 24% de cobertura. V2 mantém só os componentes preditivos
+# (confluence + ADX) + derivatives leve, e RENORMALIZA sobre os presentes
+# (dado faltante NÃO ancora em 50). Pesos e normalizações ESPELHAM
+# score_analysis_service._norm_components p/ que live == reweight-sim == backfill.
+SCORE_FORMULA_V2 = os.getenv("SCORE_FORMULA_V2", "false").lower() in ("1", "true", "yes", "on")
+try:
+    SCORE_V2_W_CONF = float(os.getenv("SCORE_V2_W_CONF", "0.60"))
+    SCORE_V2_W_ADX = float(os.getenv("SCORE_V2_W_ADX", "0.30"))
+    SCORE_V2_W_DER = float(os.getenv("SCORE_V2_W_DER", "0.10"))
+except (TypeError, ValueError):
+    SCORE_V2_W_CONF, SCORE_V2_W_ADX, SCORE_V2_W_DER = 0.60, 0.30, 0.10
+
+
+def _compute_score_v2(
+    conf_pct: Optional[float],
+    adx_raw: Optional[float],
+    funding_pct: Optional[float],
+) -> Optional[float]:
+    """Score 0–100 V2. Renormaliza sobre componentes presentes. Retorna None
+    quando nada é computável (sem confluence E sem adx E sem funding) → o caller
+    faz fallback pra fórmula legada. ESPELHA exatamente as normalizações de
+    score_analysis_service._norm_components (mesma matemática em live/sim/backfill)."""
+    conf_n = conf_pct if conf_pct is not None else None
+    adx_n = (max(0.0, min(adx_raw, 50.0)) / 50.0 * 100.0) if adx_raw is not None else None
+    der_n = (50.0 - max(-1.0, min(funding_pct / 0.05, 1.0)) * 50.0) if funding_pct is not None else None
+    comps = (
+        (conf_n, SCORE_V2_W_CONF),
+        (adx_n, SCORE_V2_W_ADX),
+        (der_n, SCORE_V2_W_DER),
+    )
+    num = den = 0.0
+    for val, w in comps:
+        if w > 0 and val is not None:
+            num += w * val
+            den += w
+    if den == 0:
+        return None
+    return round(max(0.0, min(100.0, num / den)), 1)
+
+
 def _compute_score(sig: TradeSignal) -> float:
     """
     Score 0–100. Combina confluence + MTF + R:R + win-rate histórico + derivatives.
@@ -203,7 +246,25 @@ def _compute_score(sig: TradeSignal) -> float:
       • Derivatives entram via _derivatives_score (-15 a +15):
         - funding neutro/contra-trade = bom; extremo a favor = ruim
         - OI a favor da direção = bom
+
+    V2 (flag SCORE_FORMULA_V2): usa só confluence+ADX+derivatives renormalizados.
+    Fallback transparente pra fórmula legada se V2 não for computável.
     """
+    if SCORE_FORMULA_V2:
+        conf_pct = sig.confluence.pct if sig.confluence else None
+        adx_raw = sig.indicators.adx if sig.indicators else None
+        der = sig.derivatives
+        funding_pct = None
+        if der:
+            funding_pct = (
+                der.get("funding_rate_pct") if isinstance(der, dict)
+                else getattr(der, "funding_rate_pct", None)
+            )
+        v2 = _compute_score_v2(conf_pct, adx_raw, funding_pct)
+        if v2 is not None:
+            return v2
+        # V2 não computável → cai na fórmula legada abaixo.
+
     conf_score = (sig.confluence.pct if sig.confluence else sig.confidence * 100)
     mtf_score = 50.0
     if sig.mtf:
