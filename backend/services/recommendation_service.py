@@ -206,6 +206,18 @@ try:
 except (TypeError, ValueError):
     SCORE_V2_W_CONF, SCORE_V2_W_ADX, SCORE_V2_W_DER = 0.60, 0.30, 0.10
 
+# Cortes de tier sob a V2 (a V2 comprime a faixa: max≈71, p50≈46 → os cortes
+# legados 75/65/52 esvaziariam A+/A). Derivados via /api/score/tier-sim pra
+# PRESERVAR o mix A+/A/B atual (mesmo volume de execução) e ainda assim dar um
+# gradiente de win-rate monotônico (A+ 92% / A 78% / B 68%, vs legado A≈B flat).
+# Só valem quando SCORE_FORMULA_V2=on; com a flag OFF, mantém-se 75/65/52.
+try:
+    SCORE_V2_TIER_APLUS = float(os.getenv("SCORE_V2_TIER_APLUS", "65"))
+    SCORE_V2_TIER_A = float(os.getenv("SCORE_V2_TIER_A", "46"))
+    SCORE_V2_TIER_B = float(os.getenv("SCORE_V2_TIER_B", "18"))
+except (TypeError, ValueError):
+    SCORE_V2_TIER_APLUS, SCORE_V2_TIER_A, SCORE_V2_TIER_B = 65.0, 46.0, 18.0
+
 
 def _compute_score_v2(
     conf_pct: Optional[float],
@@ -563,14 +575,21 @@ def _classify_tier(sig: TradeSignal, score: float) -> Optional[str]:
     # derivatives entram). Score equivalente "muito bom" caiu de ~80 pra ~75.
     # Gates de qualidade (MTF, RR, pattern, warnings) preservados — apenas
     # o score numérico foi recalibrado.
+    # Cortes numéricos do score: V2 usa faixa comprimida (65/46/18); legado 75/65/52.
+    # Os GATES de qualidade (mtf/rr/pattern/warnings) são idênticos nos dois — só o
+    # número do score muda, porque a distribuição do score V2 é outra.
+    c_aplus, c_a, c_b = (
+        (SCORE_V2_TIER_APLUS, SCORE_V2_TIER_A, SCORE_V2_TIER_B)
+        if SCORE_FORMULA_V2 else (75.0, 65.0, 52.0)
+    )
     if (
-        score >= 75 and mtf_score >= 0.5 and sig.risk_reward >= 2.5
+        score >= c_aplus and mtf_score >= 0.5 and sig.risk_reward >= 2.5
         and not has_critical_warning and _has_confirming_pattern(sig)
     ):
         tier = "A+"
-    elif score >= 65 and mtf_score >= 0.0 and sig.risk_reward >= 2.0:
+    elif score >= c_a and mtf_score >= 0.0 and sig.risk_reward >= 2.0:
         tier = "A"
-    elif score >= 52 and sig.confidence >= MIN_CONFIDENCE_B and sig.risk_reward >= MIN_RR:
+    elif score >= c_b and sig.confidence >= MIN_CONFIDENCE_B and sig.risk_reward >= MIN_RR:
         tier = "B"
     else:
         return None
