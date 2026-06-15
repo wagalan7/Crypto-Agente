@@ -68,6 +68,24 @@ Validação quando reabrir: conferir no app se observação ilíquida aparece co
 (é a mesma lógica). Se o veredito divergir do skip real do bot, é bug de
 fonte-única — investigar `exec_verdict`.
 
+## BE estrutural pós-TP1 (Opção B — 14/06)
+
+`trade_manager_service.py` → `_structural_be_stop()`. Antes: ao bater TP1 o SL ia
+pro **BE exato** (= entry) e o reteste normal pós-TP1 estopava em BE antes do TP2.
+Agora ancora o SL na **estrutura** (swing logo abaixo/acima do entry) com folga de
+ATR. Seguro por construção: clamp `[floor, entry]`, give-back limitado pelo que a
+parcial do TP1 cobre → **pior caso ≥ breakeven agregado** (matematicamente não vira
+negativo). Fallback total pro BE exato se faltar estrutura/dado.
+
+| Env | Default | Afrouxar (mais folga) | Apertar |
+|---|---|---|---|
+| `BE_STRUCTURAL_ENABLED` | `true` | — | `false` (volta ao BE exato) |
+| `BE_STRUCT_ATR_BUFFER` | `0.25` | subir p/ `0.4` | baixar p/ `0.15` |
+| `BE_MAX_GIVEBACK_R` | `0.5` | subir p/ `0.7` | baixar p/ `0.3` · `0` = BE exato |
+
+Validar: ver no log `[trade-manager] … BE estrutural: SL @ …` vs `BE exato`, e
+checar `closed_be` caindo / `closed_tp2` subindo nos auto-trades pós-deploy.
+
 ## Hipótese de trabalho
 
 Defaults foram postos **conservadores** de propósito (pra não secar o teste

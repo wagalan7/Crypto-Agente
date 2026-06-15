@@ -4,7 +4,8 @@ Trade Manager — gerenciamento ativo de trades em aberto (Fase 2).
 Loop async que poll-eia posições na exchange e gerencia transições de fase:
 
   Fase "pre_tp1": SL inicial em planned_stop, TP1 parcial 45% pendente, TP2 100%
-  Fase "post_tp1": TP1 bateu (parcial executada) → SL movido pra entry (breakeven)
+  Fase "post_tp1": TP1 bateu (parcial executada) → SL movido pra BE estrutural
+                   (swing logo abaixo/acima do entry; fallback pro BE exato)
 
 Detecção de TP1: comparar qty atual na exchange com qty_initial.
   Se qty_atual < qty_initial * 0.6 → parcial foi executada → transição pra post_tp1.
@@ -74,6 +75,26 @@ _TP1_QTY_PCT = float(os.getenv("PROTECTION_TP1_QTY_PCT", "0.45"))
 # Evita travar o trade aberto por sobra de stepSize (ex.: 0,1 FARTCOIN ≈ $0,01).
 DUST_NOTIONAL_USD = float(os.getenv("TRADE_MANAGER_DUST_USD", "1.0"))
 
+# ── BE estrutural pós-TP1 (Opção B) ─────────────────────────────────────────
+# Problema: ao bater TP1, o SL ia pro BREAKEVEN EXATO (= entry). No reteste
+# pós-TP1 (recuo normal antes de seguir pro TP2), um pavio tocava o entry e
+# estopava em BE; o preço retomava e ia pro TP2 sem a posição. Solução: ancorar
+# o novo SL na ESTRUTURA (último swing logo abaixo/acima do entry) com folga de
+# ATR, em vez do número exato — dando espaço pro ruído do reteste.
+# Seguro por construção (long; short é simétrico):
+#   • clamp em [floor, entry] — nunca afrouxa acima do entry nem além do floor;
+#   • give-back limitado DINAMICAMENTE pelo que a parcial do TP1 (45%) já cobre,
+#     de forma que o pior caso (estopar no floor) fique ≥ breakeven AGREGADO —
+#     ou seja, o trade não vira negativo por causa dessa folga;
+#   • nunca abaixo do planned_stop original; fallback pro BE exato se algo falhar.
+BE_STRUCTURAL_ENABLED = os.getenv("BE_STRUCTURAL_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Folga de ATR além do swing estrutural (mesma filosofia do entry_planner: 0.3).
+BE_STRUCT_ATR_BUFFER = float(os.getenv("BE_STRUCT_ATR_BUFFER", "0.25"))
+# Teto duro de give-back pós-TP1 em múltiplos do risco original (R). O limite
+# efetivo é o MENOR entre isto e o que a parcial do TP1 cobre (garantia de não
+# virar negativo). 0 desliga a folga (volta ao BE exato).
+BE_MAX_GIVEBACK_R = float(os.getenv("BE_MAX_GIVEBACK_R", "0.5"))
+
 
 def _tf_category(tf: str | None) -> str:
     """Mapeia timeframe → 'scalp' | 'day' | 'swing'."""
@@ -139,6 +160,85 @@ async def _fetch_exchange_qty(symbol: str) -> float | None:
     return qty
 
 
+async def _structural_be_stop(trade: RealTrade, entry: float) -> float | None:
+    """Calcula um SL pós-TP1 ancorado em ESTRUTURA (swing logo abaixo do entry
+    pra long / acima pra short) com folga de ATR, em vez do breakeven exato. Dá
+    espaço pro reteste pós-TP1 sem devolver mais do que a parcial do TP1 cobre.
+    Retorna o preço do SL, ou None pra o caller cair no BE exato (fail-soft).
+
+    Garantias de segurança (long; short é simétrico):
+      floor ≤ s ≤ entry, com floor = entry − giveback·R e
+      giveback = min(BE_MAX_GIVEBACK_R, (qty_tp1/qty_resto)·R_tp1) — assim o pior
+      caso (estopar no floor) fica ≥ breakeven AGREGADO, pois a perna do TP1
+      (≈45%) já foi embolsada. Nunca abaixo do planned_stop original.
+    """
+    if not BE_STRUCTURAL_ENABLED or BE_MAX_GIVEBACK_R <= 0:
+        return None
+    try:
+        from services.binance_service import fetch_ohlcv
+        from services.indicator_service import calculate_indicators
+        from services.entry_planner import _swing_points
+
+        planned_stop = float(trade.planned_stop or 0)
+        planned_tp1 = float(trade.planned_tp1 or 0)
+        if planned_stop <= 0 or entry <= 0:
+            return None
+        R = abs(entry - planned_stop)
+        if R <= 0:
+            return None
+
+        # Give-back seguro: com ~45% embolsado no TP1 a R_tp1, o restante (55%)
+        # pode devolver no máx (0.45/0.55)·R_tp1 sem o trade virar negativo.
+        rem_frac = max(1e-6, 1.0 - _TP1_QTY_PCT)
+        r_tp1 = (abs(planned_tp1 - entry) / R) if planned_tp1 > 0 else 0.0
+        safe_giveback_r = (_TP1_QTY_PCT / rem_frac) * r_tp1 if r_tp1 > 0 else 0.0
+        giveback_r = min(BE_MAX_GIVEBACK_R, safe_giveback_r)
+        if giveback_r <= 0:
+            return None  # sem margem segura → BE exato
+
+        tf = (await _resolve_trade_timeframe(trade)) or "15m"
+        df = await fetch_ohlcv(trade.symbol, tf, 150)
+        if df is None or df.empty or len(df) < 30:
+            return None
+        ind = calculate_indicators(df)
+        atr = float(getattr(ind, "atr", 0) or 0)
+        if atr <= 0:
+            return None
+        buffer = atr * BE_STRUCT_ATR_BUFFER
+        current = float(df["close"].iloc[-1])
+        highs_idx, lows_idx = _swing_points(df, lookback=3)
+
+        if trade.side == "long":
+            floor = entry - giveback_r * R
+            lows = [float(df["low"].iloc[i]) for i in lows_idx[-6:]
+                    if float(df["low"].iloc[i]) < entry]
+            if not lows:
+                return None
+            swing = min(lows[-2:]) if len(lows) >= 2 else lows[-1]
+            s = swing - buffer
+            s = min(s, entry)                 # nunca acima do BE
+            s = max(s, floor, planned_stop)   # respeita give-back e o stop original
+            if s >= current:                  # estoparia na hora → inútil
+                return None
+            return round(s, 8)
+        else:  # short
+            ceil = entry + giveback_r * R
+            highs = [float(df["high"].iloc[i]) for i in highs_idx[-6:]
+                     if float(df["high"].iloc[i]) > entry]
+            if not highs:
+                return None
+            swing = max(highs[-2:]) if len(highs) >= 2 else highs[-1]
+            s = swing + buffer
+            s = max(s, entry)                 # nunca abaixo do BE
+            s = min(s, ceil, planned_stop)    # respeita give-back e o stop original
+            if s <= current:
+                return None
+            return round(s, 8)
+    except Exception as e:
+        log.warning(f"[trade-manager] BE estrutural {trade.symbol} falhou (fallback BE exato): {e}")
+        return None
+
+
 async def _transition_to_post_tp1(trade: RealTrade) -> bool:
     """
     TP1 detectado: cria novo SL em entry (breakeven), depois cancela SL antigo.
@@ -160,12 +260,24 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
 
     qty_rem = qty_now if (qty_now and qty_now > 0) else trade.qty
 
+    # BE estrutural (Opção B): ancora o novo SL na estrutura logo abaixo/acima do
+    # entry (com folga de ATR) em vez do BE exato — dá espaço pro reteste pós-TP1.
+    # Fallback total pro entry exato se não houver estrutura segura/dado.
+    be_price = entry
+    struct = await _structural_be_stop(trade, entry)
+    if struct is not None:
+        be_price = struct
+        log.info(
+            f"[trade-manager] {sym} #{trade.id} BE estrutural: SL @ {be_price} "
+            f"(entry {entry}, folga {abs(entry - be_price):.6g})"
+        )
+
     # 1. Cria novo SL em BE PRIMEIRO
     entry_side = "Buy" if trade.side == "long" else "Sell"
     try:
         prot = await binance_signed_service.place_protection_orders(
             sym, entry_side, qty=qty_rem,
-            stop_loss=entry,
+            stop_loss=be_price,
             tp1=None, tp2=None,
             client_order_id_prefix=f"cw-be-{trade.id}",
         )
@@ -252,7 +364,7 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
             return False
         fresh.phase = "post_tp1"
         fresh.sl_order_id = new_sl_id
-        fresh.sl_current_price = entry
+        fresh.sl_current_price = be_price
         if tp1_partial_usd is not None:
             fresh.tp1_realized_usd = tp1_partial_usd
         # Se entry no DB estava errado, atualiza + recalcula slippage (estava -100%)
@@ -264,8 +376,9 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
         await session.commit()
 
     log.info(
-        f"[trade-manager] {sym} #{trade.id} → post_tp1: SL @ BE {entry} qty={qty_rem} "
-        f"(novo algoId={new_sl_id})"
+        f"[trade-manager] {sym} #{trade.id} → post_tp1: SL @ {be_price} "
+        f"(entry={entry}, {'estrutural' if be_price != entry else 'BE exato'}) "
+        f"qty={qty_rem} (novo algoId={new_sl_id})"
     )
     # Telegram notify TP1 (desacoplado)
     try:
