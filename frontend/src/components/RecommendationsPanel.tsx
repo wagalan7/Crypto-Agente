@@ -642,8 +642,13 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
 
                     {/* Score + R:R + leverage + probabilidades */}
                     <div className="flex-shrink-0 text-right">
-                      <div className="text-sm font-bold text-white">{r.score.toFixed(0)}</div>
-                      <div className="text-[10px] text-slate-500">score</div>
+                      <div
+                        className="text-sm font-bold text-white"
+                        title="Score V2 (régua recalibrada): índice ponderado de confluência (60%), tendência/ADX (30%) e derivativos (10%). Faixa típica ~15–75 — números menores que o modelo antigo são esperados. Compare pelo TIER e pela P(TP1)%, não pelo valor absoluto. Cortes: A+ ≥65 · A ≥46 · B ≥18."
+                      >
+                        {r.score.toFixed(0)}
+                      </div>
+                      <div className="text-[10px] text-slate-500">score V2</div>
                       {r.prob_tp1 != null && (
                         <div
                           className="text-[10px] text-sky-300 font-mono mt-0.5"
@@ -846,6 +851,8 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
           <span className="text-emerald-300">A+</span> {TIER_DESC['A+']} ·{' '}
           <span className="text-green-400">A</span> {TIER_DESC['A']} ·{' '}
           <span className="text-blue-400">B</span> {TIER_DESC['B']}
+          <br />
+          <strong className="text-slate-400">Score V2:</strong> régua recalibrada (faixa típica ~15–75; cortes A+ ≥65 · A ≥46 · B ≥18). Valores são menores que o modelo antigo — guie-se pelo tier e pela P(TP1)%, não pelo número absoluto.
           <br />
           Atualiza automaticamente a cada 2 min · Cache backend 90s
           <br />
