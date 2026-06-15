@@ -46,8 +46,21 @@ CACHE_TTL = 600                  # 10 min
 LOOKBACK_DAYS = int(os.getenv("CALIBRATION_LOOKBACK_DAYS", "0"))
 MIN_SAMPLE_TOTAL = 30            # mínimo de trades resolvidos pra ativar calib
 SHRINKAGE_K = 10                 # peso do P_global quando bin é pequeno
-SCORE_BINS = [(55, 60), (60, 65), (65, 70), (70, 75),
-              (75, 80), (80, 85), (85, 90), (90, 95), (95, 100.1)]
+
+# Gavetas (bins) score→P(TP1). A escala do score V2 é OUTRA (≈18–71, p50≈46) vs
+# o legado (55–100). Se a calibração usasse os bins legados sob a V2, a maioria
+# dos scores cairia ABAIXO de 55 (fora de range → p_global pra tudo), matando a
+# diferenciação da convicção e do gate de P(TP1). Por isso os bins seguem a flag
+# SCORE_FORMULA_V2 — lidos do env aqui (sem import de recommendation_service pra
+# evitar ciclo). Com a flag OFF, mantém-se os bins legados → NO-OP.
+_SCORE_FORMULA_V2 = os.getenv("SCORE_FORMULA_V2", "false").strip().lower() in ("1", "true", "yes", "on")
+SCORE_BINS_LEGACY = [(55, 60), (60, 65), (65, 70), (70, 75),
+                     (75, 80), (80, 85), (85, 90), (90, 95), (95, 100.1)]
+# Derivados da distribuição V2 medida (/api/score/tier-sim): min 18, p25 36,
+# p50 46, p75 53, p90 59, max 71. Bins ~equipopulados cobrindo a faixa + margem.
+SCORE_BINS_V2 = [(15, 31), (31, 36), (36, 40), (40, 44), (44, 48),
+                 (48, 52), (52, 57), (57, 63), (63, 75)]
+SCORE_BINS = SCORE_BINS_V2 if _SCORE_FORMULA_V2 else SCORE_BINS_LEGACY
 
 # Estados considerados vitória pra P(TP1)
 WIN_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2")
