@@ -119,6 +119,9 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
   const [filter, setFilter] = useState<RecommendationTier | 'all'>('all')
   const [originFilter, setOriginFilter] = useState<'all' | 'bot' | 'observation'>('all')
+  // "Só aprovados": mostra apenas recs que passam nos gates de qualidade do bot
+  // (bot_verdict.ok === true — R:R/P(TP1)/liquidez), independente da origem.
+  const [qualityOnly, setQualityOnly] = useState(false)
   const [progress, setProgress] = useState<string>('')
   const [historical, setHistorical] = useState<Record<string, HistoricalStat>>({})
   const [probs, setProbs] = useState<Record<string, { p_tp1_pct: number; p_tp2_pct: number; n_total: number; confidence: string }>>({})
@@ -259,8 +262,11 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
     observation: recs.filter(r => r.origin === 'observation').length,
   }
   const byTier = filter === 'all' ? recs : recs.filter(r => r.tier === filter)
-  const filtered =
+  const byOrigin =
     originFilter === 'all' ? byTier : byTier.filter(r => (r.origin ?? 'bot') === originFilter)
+  // Filtro de qualidade: só os que o bot aprovaria (passam nos gates R:R/P(TP1)/liquidez)
+  const qualityApprovedCount = recs.filter(r => r.bot_verdict?.ok === true).length
+  const filtered = qualityOnly ? byOrigin.filter(r => r.bot_verdict?.ok === true) : byOrigin
 
   // Quando chega foco via push, scrolla até o card e destaca por ~3s.
   // Roda quando focus muda OU quando as recs carregam (ordem indefinida entre os dois).
@@ -482,6 +488,19 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
               </button>
             )
           })}
+          {/* Toggle: só os que o bot APROVARIA (passam nos gates de qualidade) */}
+          <button
+            onClick={() => setQualityOnly(v => !v)}
+            title="Mostra só as recomendações que passam nos MESMOS gates de qualidade do bot (R:R, P(TP1), liquidez). As que o bot operaria de verdade."
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs font-semibold whitespace-nowrap transition-colors ${
+              qualityOnly
+                ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-200'
+                : 'bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <span>{qualityOnly ? '✅' : '☑️'} Só aprovados pelo bot</span>
+            <span className="text-slate-500">({qualityApprovedCount})</span>
+          </button>
           <span className="ml-auto text-[10px] text-slate-500 whitespace-nowrap hidden sm:inline">
             🤖 = o bot opera · 👁 = só pra você analisar (TradingView)
           </span>
