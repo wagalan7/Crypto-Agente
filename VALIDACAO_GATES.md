@@ -146,6 +146,21 @@ confirmar que `_compute_qty` ainda clampa pelos caps duros (risco real nunca >
 `EXCHANGE_MAX_RISK_PCT`). Com risco agregado em 4%, ver `BLOCKED risk-budget`
 quando a banca já tem muito risco aberto.
 
+## Push só A/A+ + recalibração antecipada (15/06)
+
+- **Push = só tier A e A+** (usuário pediu menos ruído). `PUSH_TIER_B_ENABLED`
+  setado **`false` no Railway** (era `true`). Gate global em `push_service.py`
+  (default de código já é `false`). Tier B **continua visível no app como
+  observação** — só não dispara push. `PUSH_BATCH_CAP=25` mantido (irrelevante p/
+  B agora). Reverter: `PUSH_TIER_B_ENABLED=true` no Railway.
+- **Recalibração — 3 camadas** (não é evento único): (a) **contínua** que o bot
+  usa ao vivo (`calibration_service.get_calibration`, cache 10min, todo histórico)
+  — auto-atualiza a cada trade resolvido; (b) **semanal versionada** (`main.py`
+  `_recalibration_loop`, modo `weekly`, **seg 12:00 UTC = 09:00 BRT**) — congela/
+  audita; (c) **auto-ajuste** (`learning_service`, ±25%/bucket, ≥20 amostras).
+  Em 15/06 disparei recalibração **manual antecipada** (`POST
+  /api/calibration/recalibrate`) → versão nova com **825 resolvidos**, P_global 0,56.
+
 ## Hipótese de trabalho
 
 Defaults foram postos **conservadores** de propósito (pra não secar o teste
