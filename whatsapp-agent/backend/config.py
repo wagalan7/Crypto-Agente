@@ -65,3 +65,16 @@ SMTP_USER     = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM     = os.getenv("SMTP_FROM", SMTP_USER)   # "Nome <email>" ou só email
 SMTP_USE_SSL  = os.getenv("SMTP_USE_SSL", "0")      # "1" para porta 465 (SSL direto)
+
+# ── Lembretes de vencimento (contas do operador + Z-API por consultório) ──────
+# Operador = você (dono do SaaS). Recebe avisos das contas de infra (Railway,
+# Anthropic, domínio, etc.) e dos novos clientes.
+OPERATOR_PHONE = os.getenv("OPERATOR_PHONE", "5511968439527")  # WhatsApp do operador (só dígitos, com DDI)
+OPERATOR_EMAIL = os.getenv("OPERATOR_EMAIL", "wagalan@gmail.com")
+# Quantos dias antes do vencimento disparar o lembrete.
+BILLING_REMINDER_DAYS_BEFORE = int(os.getenv("BILLING_REMINDER_DAYS_BEFORE", "5"))
+# Hora (BRT) em que o scheduler varre os vencimentos do dia.
+BILLING_REMINDER_HOUR = int(os.getenv("BILLING_REMINDER_HOUR", "9"))
+# Por qual consultório enviar o WhatsApp do operador (precisa de uma instância
+# Z-API ativa para mandar pro seu próprio número). Vazio = usa o 1º tenant ativo.
+OPERATOR_WHATSAPP_TENANT_SLUG = os.getenv("OPERATOR_WHATSAPP_TENANT_SLUG", "")

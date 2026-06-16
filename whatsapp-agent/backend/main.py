@@ -2435,6 +2435,97 @@ def painel_api_tenant_action(slug: str, body: AdminTenantAction, request: Reques
     return {"ok": True, "updates": updates}
 
 
+# ── Lembretes de vencimento (contas do operador + Z-API por consultório) ────────
+
+@app.get("/painel/api/op-bills")
+def painel_api_op_bills_list(request: Request):
+    _require_admin(request)
+    return {"bills": db.op_bills_list(only_active=False)}
+
+
+class OpBillBody(BaseModel):
+    label: str
+    due_date: str                       # YYYY-MM-DD
+    amount: Optional[float] = 0.0
+    recurrence: Optional[str] = "monthly"  # none | monthly | yearly
+    notes: Optional[str] = ""
+    active: Optional[int] = 1
+
+
+@app.post("/painel/api/op-bills")
+def painel_api_op_bills_add(body: OpBillBody, request: Request):
+    _require_admin(request)
+    if not body.label.strip():
+        raise HTTPException(status_code=400, detail="Informe o nome da conta.")
+    try:
+        datetime.fromisoformat(body.due_date[:10])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Data de vencimento inválida (use AAAA-MM-DD).")
+    if (body.recurrence or "monthly") not in ("none", "monthly", "yearly"):
+        raise HTTPException(status_code=400, detail="Recorrência inválida.")
+    bill_id = db.op_bill_add(
+        label=body.label, due_date=body.due_date, amount=body.amount or 0.0,
+        recurrence=body.recurrence or "monthly", notes=body.notes or "",
+    )
+    logger.info(f"[admin] op_bill criada: {body.label} venc {body.due_date}")
+    return {"ok": True, "id": bill_id}
+
+
+@app.put("/painel/api/op-bills/{bill_id}")
+def painel_api_op_bills_update(bill_id: int, body: OpBillBody, request: Request):
+    _require_admin(request)
+    if body.due_date:
+        try:
+            datetime.fromisoformat(body.due_date[:10])
+        except Exception:
+            raise HTTPException(status_code=400, detail="Data de vencimento inválida.")
+    ok = db.op_bill_update(
+        bill_id, label=body.label, due_date=body.due_date, amount=body.amount or 0.0,
+        recurrence=body.recurrence or "monthly", notes=body.notes or "",
+        active=1 if body.active is None else int(body.active),
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Conta não encontrada.")
+    return {"ok": True}
+
+
+@app.delete("/painel/api/op-bills/{bill_id}")
+def painel_api_op_bills_delete(bill_id: int, request: Request):
+    _require_admin(request)
+    if not db.op_bill_delete(bill_id):
+        raise HTTPException(status_code=404, detail="Conta não encontrada.")
+    return {"ok": True}
+
+
+class ZapiExpiresBody(BaseModel):
+    zapi_expires_at: Optional[str] = None   # YYYY-MM-DD ou null para limpar
+
+
+@app.post("/painel/api/tenant/{slug}/zapi-expires")
+def painel_api_set_zapi_expires(slug: str, body: ZapiExpiresBody, request: Request):
+    _require_admin(request)
+    if not db.get_tenant(slug):
+        raise HTTPException(status_code=404, detail="Consultório não encontrado.")
+    val = (body.zapi_expires_at or "").strip() or None
+    if val:
+        try:
+            datetime.fromisoformat(val[:10])
+        except Exception:
+            raise HTTPException(status_code=400, detail="Data inválida (use AAAA-MM-DD).")
+    db.update_tenant(slug, zapi_expires_at=val)
+    logger.info(f"[admin] {slug} zapi_expires_at = {val}")
+    return {"ok": True, "zapi_expires_at": val}
+
+
+@app.post("/painel/api/billing-reminders/run")
+async def painel_api_billing_reminders_run(request: Request):
+    """Dispara a varredura de lembretes de vencimento agora (teste manual)."""
+    _require_admin(request)
+    import billing_reminders
+    sent = await billing_reminders.run_reminders(force=True)
+    return {"ok": True, "enviados": len(sent), "detalhes": sent}
+
+
 @app.get("/painel/api/content/{key}")
 def painel_api_content_get(key: str, request: Request):
     _require_admin(request)

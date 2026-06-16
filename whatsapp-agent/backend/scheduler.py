@@ -363,9 +363,27 @@ async def _run_backup():
         logger.warning(f"[backup-offsite] exceção: {e}")
 
 
+async def _run_billing_reminders():
+    """Lembretes de vencimento (contas do operador + Z-API por consultório).
+    Roda 1x/dia na hora configurada (BRT). Fail-open e idempotente por design
+    (o log de lembretes é chaveado por vencimento, não pelo dia do envio)."""
+    import config
+    now = datetime.now(_TZ)
+    if now.hour != getattr(config, "BILLING_REMINDER_HOUR", 9):
+        return
+    try:
+        import billing_reminders
+        sent = await billing_reminders.run_reminders()
+        if sent:
+            logger.info(f"[scheduler] Lembretes de vencimento enviados: {len(sent)}")
+    except Exception as e:
+        logger.exception(f"[scheduler] Erro em lembretes de vencimento: {e}")
+
+
 async def _run_all():
     await _run_confirmations()
     await _run_billing()
+    await _run_billing_reminders()
     await _run_backup()
 
 

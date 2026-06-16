@@ -85,6 +85,33 @@ def init_db():
                 sent_at TEXT DEFAULT (datetime('now')),
                 channel TEXT DEFAULT 'whatsapp'
             );
+
+            -- Contas de infraestrutura do operador (Railway, Anthropic, domínio…)
+            -- cadastradas manualmente, pois o app não enxerga vencimentos de 3os.
+            CREATE TABLE IF NOT EXISTS op_bills (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                label       TEXT NOT NULL,                 -- ex: "Railway", "Anthropic", "Domínio"
+                amount      REAL DEFAULT 0,                -- valor (informativo)
+                due_date    TEXT NOT NULL,                 -- próximo vencimento YYYY-MM-DD
+                recurrence  TEXT NOT NULL DEFAULT 'monthly', -- none | monthly | yearly
+                active      INTEGER NOT NULL DEFAULT 1,
+                notes       TEXT DEFAULT '',
+                created_at  TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Log idempotente de lembretes de vencimento enviados.
+            -- kind: 'op_bill' (conta do operador) | 'zapi' (instância do consultório)
+            -- ref_id: id da op_bill OU id do tenant
+            -- due_date: vencimento a que o lembrete se refere (chave de idempotência)
+            CREATE TABLE IF NOT EXISTS bill_reminders_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind      TEXT NOT NULL,
+                ref_id    INTEGER NOT NULL,
+                due_date  TEXT NOT NULL,
+                channel   TEXT DEFAULT '',
+                sent_at   TEXT DEFAULT (datetime('now')),
+                UNIQUE(kind, ref_id, due_date)
+            );
         """)
         # Migrações incrementais — seguro rodar múltiplas vezes
         migrations = [
@@ -140,6 +167,9 @@ def init_db():
             # Bloqueio de horas por dia da semana — JSON tipo {"1":[17],"2":[17,18]}
             # (chaves = weekday 0=Seg…6=Dom; valores = lista de horas bloqueadas só nesse dia)
             "ALTER TABLE tenants ADD COLUMN blocked_hours_by_day TEXT DEFAULT ''",
+            # Vencimento da instância Z-API do consultório (responsabilidade da
+            # psicóloga) — YYYY-MM-DD. NULL = não cadastrado / não avisa.
+            "ALTER TABLE tenants ADD COLUMN zapi_expires_at TEXT DEFAULT NULL",
         ]
         for sql in migrations:
             try:
@@ -358,7 +388,7 @@ def update_tenant(slug: str, **fields) -> bool:
         "pix_key", "pix_name",
         "working_days", "blocked_hours", "blocked_hours_by_day", "blocked_dates", "confirmation_hour", "psychologist_phone", "plan",
         "confirmation_msg_template", "followup_msg_template", "billing_msg_template",
-        "free_until", "plan_expires_at",
+        "free_until", "plan_expires_at", "zapi_expires_at",
         "caldav_url", "caldav_username", "caldav_password",
         "full_name", "cpf_cnpj", "phone",
         "billing_zip", "billing_address", "billing_number", "billing_complement",
@@ -1111,6 +1141,68 @@ def count_landing_views(days: int | None = None) -> int:
     with get_conn() as conn:
         row = conn.execute(sql, params).fetchone()
     return int(row["n"] or 0)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Lembretes de vencimento — contas do operador (op_bills) + log idempotente
+# ════════════════════════════════════════════════════════════════════════════
+
+def op_bills_list(only_active: bool = True) -> list[dict]:
+    sql = "SELECT * FROM op_bills"
+    if only_active:
+        sql += " WHERE active = 1"
+    sql += " ORDER BY due_date ASC"
+    with get_conn() as conn:
+        rows = conn.execute(sql).fetchall()
+    return [dict(r) for r in rows]
+
+
+def op_bill_add(label: str, due_date: str, amount: float = 0.0,
+                recurrence: str = "monthly", notes: str = "") -> int:
+    recurrence = recurrence if recurrence in ("none", "monthly", "yearly") else "monthly"
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO op_bills (label, amount, due_date, recurrence, notes)
+               VALUES (?, ?, ?, ?, ?)""",
+            (label.strip()[:80], float(amount or 0), due_date[:10], recurrence, (notes or "")[:300]),
+        )
+        return cur.lastrowid
+
+
+def op_bill_update(bill_id: int, **fields) -> bool:
+    allowed = {"label", "amount", "due_date", "recurrence", "active", "notes"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [bill_id]
+    with get_conn() as conn:
+        cur = conn.execute(f"UPDATE op_bills SET {set_clause} WHERE id = ?", values)
+        return cur.rowcount > 0
+
+
+def op_bill_delete(bill_id: int) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM op_bills WHERE id = ?", (bill_id,))
+        return cur.rowcount > 0
+
+
+def bill_reminder_already_sent(kind: str, ref_id: int, due_date: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM bill_reminders_log WHERE kind = ? AND ref_id = ? AND due_date = ?",
+            (kind, ref_id, due_date[:10]),
+        ).fetchone()
+    return row is not None
+
+
+def mark_bill_reminder_sent(kind: str, ref_id: int, due_date: str, channel: str = ""):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO bill_reminders_log (kind, ref_id, due_date, channel)
+               VALUES (?, ?, ?, ?)""",
+            (kind, ref_id, due_date[:10], channel),
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════
