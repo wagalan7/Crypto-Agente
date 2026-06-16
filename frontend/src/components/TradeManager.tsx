@@ -1,9 +1,24 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, Plus, TrendingUp, TrendingDown, Bell, Bot, User, RefreshCw } from 'lucide-react'
 import { api } from '../services/api'
+import { roundRR } from '../utils/rr'
 import type { TradeSignal, RealTradeRow } from '../types'
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+// R:R da posição a partir dos níveis (entry/SL/TP1). null se faltar dado.
+function rrFromLevels(
+  side: string,
+  entry: number | null | undefined,
+  sl: number | null | undefined,
+  tp1: number | null | undefined,
+): number | null {
+  if (!entry || sl == null || tp1 == null) return null
+  const risk = side === 'long' ? entry - sl : sl - entry
+  const reward = side === 'long' ? tp1 - entry : entry - tp1
+  if (risk <= 0 || reward <= 0) return null
+  return reward / risk
+}
 
 function toBinance(symbol: string): string {
   return symbol.split(':')[0].replace('/', '')  // 'BTC/USDT:USDT' → 'BTCUSDT'
@@ -396,6 +411,15 @@ export default function TradeManager({ onClose, onSelectSymbol, initialSignal }:
                   <span className="text-slate-600">|</span>
                   {t.planned_tp1 != null && <span className="text-emerald-400">🎯 {fmtPrice(t.planned_tp1)}</span>}
                   {t.planned_tp2 != null && <span className="text-green-500">🎯 {fmtPrice(t.planned_tp2)}</span>}
+                  {(() => {
+                    const rr = rrFromLevels(t.side, t.entry_price, t.planned_stop, t.planned_tp1)
+                    if (rr == null) return null
+                    return (
+                      <span className="text-emerald-300 font-mono" title="Risco/Retorno até o TP1 (calculado de entry/SL/TP1).">
+                        R:R 1:{roundRR(rr)}
+                      </span>
+                    )
+                  })()}
                   {t.leverage != null && <span className="ml-auto text-orange-300 font-mono">{t.leverage}x</span>}
                 </div>
               </div>

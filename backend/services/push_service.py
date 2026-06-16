@@ -250,7 +250,7 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
 
     title = f"🚀 {tier} · {symbol_short} {direction}"
     lines = [
-        f"{rec.get('timeframe', '')} · {leverage}x · R:R 1:{rr}",
+        f"{rec.get('timeframe', '')} · {leverage}x · R:R 1:{_round_rr(rr)}",
         f"Score {score:.0f} · entry {_fmt(entry_v)}",
     ]
     levels = []
@@ -513,3 +513,15 @@ def _fmt(n: float) -> str:
     if n >= 1:
         return f"{n:.4f}"
     return f"{n:.6f}"
+
+
+def _round_rr(v) -> int:
+    """R:R arredondado pra inteiro (menos poluído no push). Regra do usuário:
+    até X,50 mantém X; a partir de X,51 sobe. Ex.: 4.19→4 · 4.50→4 · 4.51→5."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return 0
+    import math
+    frac = x - math.floor(x)
+    return math.ceil(x) if frac > 0.5 else math.floor(x)

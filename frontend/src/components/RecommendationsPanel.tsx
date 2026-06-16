@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, Sparkles, TrendingUp, TrendingDown, RefreshCw, AlertTriangle, Brain } from 'lucide-react'
 import { api } from '../services/api'
+import { fmtRR } from '../utils/rr'
 import type { Recommendation, RecommendationTier } from '../types'
 
 interface HistoricalStat {
@@ -649,6 +650,27 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                         {r.score.toFixed(0)}
                       </div>
                       <div className="text-[10px] text-slate-500">score V2</div>
+                      {/* Veredito de ENTRADA MANUAL: qualidade (gates do bot) + tier.
+                          Existe pra você não pular um setup bom só porque o número
+                          do Score V2 parece "baixo" (a régua mudou: A já vale ≥46).
+                          É a resposta direta pra "vale a pena EU entrar?". */}
+                      {(() => {
+                        const qOk = verdict?.ok
+                        const tierTop = r.tier === 'A+' || r.tier === 'A'
+                        const ev = qOk === false
+                          ? { lbl: '⛔ Evitar', cls: 'bg-red-500/15 text-red-300 border-red-500/40',
+                              hint: `Não passa no critério de qualidade do bot${verdict?.blocked_by ? ` (${verdict.blocked_by})` : ''} — melhor não entrar.` }
+                          : tierTop
+                            ? { lbl: '✅ Bom pra entrar', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
+                                hint: 'Passa nos gates de qualidade do bot (R:R, P(TP1), liquidez) e é tier A/A+. Bom pra entrada manual — ignore o número "baixo" do Score: a régua V2 vai só até ~75 e A já vale a partir de 46.' }
+                            : { lbl: '🟡 Aceitável', cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40',
+                                hint: 'Setup ok, mas tier B (menos forte). Dá pra entrar, com cautela.' }
+                        return (
+                          <div title={ev.hint} className={`mt-1 inline-block px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${ev.cls}`}>
+                            {ev.lbl}
+                          </div>
+                        )
+                      })()}
                       {r.prob_tp1 != null && (
                         <div
                           className="text-[10px] text-sky-300 font-mono mt-0.5"
@@ -657,7 +679,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                           P {(r.prob_tp1 * 100).toFixed(0)}%
                         </div>
                       )}
-                      <div className="text-[10px] text-emerald-300 mt-1 font-mono">1:{r.risk_reward}</div>
+                      <div className="text-[10px] text-emerald-300 mt-1 font-mono">{fmtRR(r.risk_reward)}</div>
                       <div className="text-[11px] text-orange-300 mt-0.5 font-mono font-bold">{r.leverage}x</div>
                       {(() => {
                         const p = probs[`${r.tier}|${r.timeframe}|${r.direction}`]

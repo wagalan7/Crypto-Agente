@@ -1,4 +1,5 @@
 import type { TradeSignal, SignalDirection, TradeType } from '../../types'
+import { roundRR } from '../../utils/rr'
 import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle, Crosshair, BarChart3, History, GitCompare, BarChartHorizontal, LayoutGrid } from 'lucide-react'
 
 interface Props {
@@ -246,22 +247,22 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
 
         <LevelRow label="ALVO 1" price={signal.tp1} entry={signal.entry} color="text-green-400" />
         {signal.trade_plan?.reasoning_tp1 && (
-          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_tp1.reason} (R:R {signal.trade_plan.risk_reward_tp1})</p>
+          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_tp1.reason} (R:R {roundRR(signal.trade_plan.risk_reward_tp1)})</p>
         )}
 
         <LevelRow label="ALVO 2" price={signal.tp2} entry={signal.entry} color="text-green-500" />
         {signal.trade_plan?.reasoning_tp2 && (
-          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_tp2.reason} (R:R {signal.trade_plan.risk_reward})</p>
+          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_tp2.reason} (R:R {roundRR(signal.trade_plan.risk_reward)})</p>
         )}
 
         <LevelRow label="ALVO 3" price={signal.tp3} entry={signal.entry} color="text-emerald-400" />
         {signal.trade_plan?.reasoning_tp3 && (
-          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_tp3.reason} (R:R {signal.trade_plan.risk_reward_tp3})</p>
+          <p className="text-[11px] text-slate-400 leading-tight -mt-1 mb-1 pl-1">↳ {signal.trade_plan.reasoning_tp3.reason} (R:R {roundRR(signal.trade_plan.risk_reward_tp3)})</p>
         )}
 
         <div className="flex justify-between pt-2">
           <span className="text-xs text-slate-400">Risco/Retorno (TP2)</span>
-          <span className="text-sm font-bold text-white">1 : {signal.risk_reward}</span>
+          <span className="text-sm font-bold text-white">1 : {roundRR(signal.risk_reward)}</span>
         </div>
 
         {signal.trade_plan?.quality_warnings && signal.trade_plan.quality_warnings.length > 0 && (
