@@ -161,6 +161,13 @@ class Recommendation(BaseModel):
     #   "manual" = qualidade ok, mas score < SCORE_MIN (só entrada manual)
     #   "avoid"  = não passa nos gates de qualidade do bot
     entry_grade: Optional[str] = None
+    # ── Edges (sinais que historicamente elevam o win-rate) ───────────────
+    # Fundamentado no learning-insights (701 snapshots): A+ ~92% wr, funding em
+    # squeeze ~100%, padrão forte ~90%, MTF alinhado ~82% — vs baseline ~72%.
+    # Tags legíveis (ex: ["A+","funding"]) + contagem. Alimentam o sizing por
+    # edge na execução (shadow_trade_service) e a transparência no app/push.
+    edge_tags: List[str] = []
+    edge_score: int = 0
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -753,6 +760,63 @@ SIZE_MAX_PCT = 1.0
 _TIER_WR_FALLBACK = {"A+": 0.62, "A": 0.55, "B": 0.50}
 
 
+# ── Edge tagging (sinais com win-rate historicamente acima do baseline) ──────
+# Funding alinhado: o squeeze/extremo a favor da direção do trade. Mapeamento:
+#   bullish_squeeze (shorts pagando → tende a esticar p/ CIMA)  → favorece LONG
+#   extreme_short   (shorts lotados → risco de squeeze p/ cima) → favorece LONG
+#   bearish_squeeze (longs pagando → tende a esticar p/ BAIXO)  → favorece SHORT
+#   extreme_long    (longs lotados → risco de squeeze p/ baixo) → favorece SHORT
+# 'neutral' NÃO conta como edge (é o baseline, n grande). Conf de padrão e nº de
+# TFs alinhados são env-tunáveis.
+_FUNDING_EDGE_LONG = {"bullish_squeeze", "extreme_short"}
+_FUNDING_EDGE_SHORT = {"bearish_squeeze", "extreme_long"}
+_EDGE_PATTERN_MIN_CONF = float(os.getenv("EDGE_PATTERN_MIN_CONF", "0.65"))
+_EDGE_MTF_MIN_COUNT = int(os.getenv("EDGE_MTF_MIN_COUNT", "2"))
+
+
+def _compute_edges(sig: TradeSignal, tier: str) -> tuple[list[str], int]:
+    """Retorna (tags legíveis, contagem). Read-only, fail-soft, SEMPRE roda —
+    barato e usado tanto pra sizing quanto pra exibição no app/push."""
+    tags: list[str] = []
+    direction = sig.direction.value if hasattr(sig.direction, "value") else str(sig.direction)
+
+    # 1. Tier A+ — o diferenciador mais forte do histórico (~92% wr).
+    if tier == "A+":
+        tags.append("A+")
+
+    # 2. Funding alinhado (squeeze/extremo a favor da direção).
+    try:
+        der = sig.derivatives
+        fs = getattr(der, "funding_sentiment", None) if der is not None else None
+        if fs:
+            fav = _FUNDING_EDGE_LONG if direction == "long" else _FUNDING_EDGE_SHORT
+            if fs in fav:
+                tags.append("funding")
+    except Exception:
+        pass
+
+    # 3. Padrão forte alinhado à direção (confiança >= piso).
+    try:
+        for p in (sig.patterns or []):
+            p_dir = p.direction.value if hasattr(p.direction, "value") else str(p.direction)
+            if p_dir == direction and float(p.confidence or 0) >= _EDGE_PATTERN_MIN_CONF:
+                tags.append("padrão")
+                break
+    except Exception:
+        pass
+
+    # 4. MTF alinhado (TFs superiores a favor) — gate histórico 82% wr.
+    try:
+        mtf = sig.mtf
+        ac = getattr(mtf, "aligned_count", None) if mtf is not None else None
+        if ac is not None and int(ac) >= _EDGE_MTF_MIN_COUNT:
+            tags.append("MTF")
+    except Exception:
+        pass
+
+    return tags, len(tags)
+
+
 def _compute_dynamic_size(
     score: float,
     tier: str,
@@ -990,6 +1054,12 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
     else:
         entry_grade = "manual"
 
+    # Edges (A+/funding/padrão/MTF) — read-only, alimenta sizing + exibição.
+    try:
+        edge_tags, edge_score = _compute_edges(sig, tier)
+    except Exception:
+        edge_tags, edge_score = [], 0
+
     return Recommendation(
         tier=tier,
         score=score,
@@ -1022,6 +1092,8 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         spread_pct=sp_pct,
         bot_verdict=bot_verdict,
         entry_grade=entry_grade,
+        edge_tags=edge_tags,
+        edge_score=edge_score,
     )
 
 

@@ -49,6 +49,20 @@ BTC_DOMINANT_THRESHOLD = 55.0    # dominance alta — downgrade alt longs
 # rebaixava long de alt só pelo número da dominância, mesmo com alts subindo.
 BTC_DOMINANT_MIN_BTC_24H = float(os.getenv("BTC_DOMINANT_MIN_BTC_24H", "1.5"))
 
+# ── #3 ALT_RISK_OFF (USDT.D-aware) ──────────────────────────────────────────
+# Os regimes acima só olham BTC% + dominância. Mas capital fugindo p/ stablecoin
+# (USDT.D elevada) com dominância alta é um ambiente em que LONG de alt sangra
+# MESMO sem o BTC pumpando — exatamente o cenário dos stops recentes (dominância
+# ~56% + USDT.D ~8% + BTC de lado/caindo). Este regime detecta isso e, por
+# default, REBAIXA (não bloqueia) long de alt; opcionalmente bloqueia se a flag
+# de block estiver ligada. DEFAULT OFF (NO-OP): liga via env após revisar.
+ALT_RISKOFF_ENABLED = os.getenv("ALT_RISKOFF_ENABLED", "false").strip().lower() not in (
+    "0", "false", "no", "off", "",
+)
+ALT_RISKOFF_USDT_D = float(os.getenv("ALT_RISKOFF_USDT_D", "5.0"))   # USDT.D >= isso = risk-off
+ALT_RISKOFF_DOM = float(os.getenv("ALT_RISKOFF_DOM", "55.0"))        # dominância BTC >= isso
+ALT_RISKOFF_BLOCK = os.getenv("ALT_RISKOFF_BLOCK", "false").strip().lower() in ("1", "true", "yes")
+
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
 CACHE_TTL = 600  # 10min: regime muda devagar
 
@@ -90,7 +104,11 @@ async def _fetch_btc_dominance() -> Optional[float]:
         return None
 
 
-def _classify(btc_24h: Optional[float], dom: Optional[float]) -> Dict[str, Any]:
+def _classify(
+    btc_24h: Optional[float],
+    dom: Optional[float],
+    usdt_d: Optional[float] = None,
+) -> Dict[str, Any]:
     reasons = []
     regime = "NORMAL"
     block_all = False
@@ -124,10 +142,30 @@ def _classify(btc_24h: Optional[float], dom: Optional[float]) -> Dict[str, Any]:
             f"(rotação pro BTC — long de alt rebaixado)"
         )
 
+    # #3 ALT_RISK_OFF (USDT.D): capital fugindo p/ stable + dominância alta. Só
+    # entra se NENHUM regime acima já tratou alt longs (não sobrepõe RISK_OFF /
+    # ALT_DANGER). Default rebaixa; bloqueia se ALT_RISKOFF_BLOCK ligado.
+    if (
+        ALT_RISKOFF_ENABLED and not block_all and not block_alt_longs
+        and usdt_d is not None and usdt_d >= ALT_RISKOFF_USDT_D
+        and dom is not None and dom >= ALT_RISKOFF_DOM
+    ):
+        regime = "ALT_RISK_OFF"
+        if ALT_RISKOFF_BLOCK:
+            block_alt_longs = True
+        else:
+            downgrade_alt_longs = True
+        reasons.append(
+            f"USDT.D {usdt_d:.2f}% (>= {ALT_RISKOFF_USDT_D}) + dominância {dom:.1f}% "
+            f"(>= {ALT_RISKOFF_DOM}) — capital em stable, long de alt "
+            f"{'bloqueado' if ALT_RISKOFF_BLOCK else 'rebaixado'}"
+        )
+
     return {
         "regime": regime,
         "btc_24h_pct": btc_24h,
         "btc_dominance": dom,
+        "usdt_dominance": usdt_d,
         "block_all": block_all,
         "block_alt_longs": block_alt_longs,
         "downgrade_alt_longs": downgrade_alt_longs,
@@ -151,7 +189,18 @@ async def get_regime_status() -> Dict[str, Any]:
     btc_24h = await _fetch_btc_24h_pct()
     dom = await _fetch_btc_dominance()
 
-    data = _classify(btc_24h, dom)
+    # USDT.D só é buscada quando o regime ALT_RISK_OFF está ligado (evita custo
+    # extra de rede quando o gate está OFF). get_crypto_totals já é cacheado 10min.
+    usdt_d = None
+    if ALT_RISKOFF_ENABLED:
+        try:
+            from services.macro_service import get_crypto_totals
+            totals = await get_crypto_totals()
+            usdt_d = totals.get("usdt_dominance") if isinstance(totals, dict) else None
+        except Exception as e:
+            log.warning(f"[regime] usdt.d falhou (fail-open): {e}")
+
+    data = _classify(btc_24h, dom, usdt_d)
     if btc_24h is not None or dom is not None:
         _cache["data"] = data
         _cache["ts"] = now

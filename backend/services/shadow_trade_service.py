@@ -221,6 +221,24 @@ CONVICTION_TP2_WEIGHT = float(os.getenv("CONVICTION_TP2_WEIGHT", "0.0"))
 CONVICTION_TP2_PROB_LO = float(os.getenv("CONVICTION_TP2_PROB_LO", "0.25"))
 CONVICTION_TP2_PROB_HI = float(os.getenv("CONVICTION_TP2_PROB_HI", "0.45"))
 
+# ── #1 Sizing por EDGE (tier A+ / funding / padrão / MTF) ────────────────────
+# A convicção acima escala pela P(TP1) calibrada — mas na escala V2 a calibração
+# é CHATA (score 31+ todos ~0.65-0.68), então quase não diferencia. O que de fato
+# separa win-rate no histórico (learning-insights, 701 trades) é TIER A+ (~92%),
+# funding em squeeze (~100%), padrão forte (~90%) e MTF alinhado (~82%) — vs
+# baseline ~72%. Este multiplicador escala o risco/trade pela CONTAGEM de edges
+# (rec['edge_score'], calculada read-only no recommendation_service) e dá um bônus
+# extra se A+ está entre eles. Compõe MULTIPLICATIVO com a convicção e o
+# LIVE_SIZE_MULT, SEMPRE dentro dos caps duros de _compute_qty. Setup SEM nenhum
+# edge (tier A/B puro) leva um leve desconto (NOEDGE_MULT) — concentra banca onde
+# há sinal. DEFAULT OFF (dinheiro real): liga via env após revisar.
+EDGE_SIZING_ENABLED = os.getenv("EDGE_SIZING_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+EDGE_PER_EDGE = float(os.getenv("EDGE_PER_EDGE", "0.07"))      # +7% por edge confirmado
+EDGE_APLUS_BONUS = float(os.getenv("EDGE_APLUS_BONUS", "0.06"))  # +6% extra se A+ presente
+EDGE_NOEDGE_MULT = float(os.getenv("EDGE_NOEDGE_MULT", "0.85"))  # desconto p/ setup sem edge
+EDGE_MULT_MIN = float(os.getenv("EDGE_MULT_MIN", "0.80"))
+EDGE_MULT_MAX = float(os.getenv("EDGE_MULT_MAX", "1.30"))
+
 # ── #2b Orçamento de RISCO aberto agregado (soma do R em risco das posições) ──
 # Diferente dos caps de notional/margem (tamanho/garantia): este soma o RISCO
 # REAL em aberto — quanto a banca perde se TODAS as posições abertas baterem o
@@ -356,6 +374,18 @@ if _SCORE_FORMULA_V2:
     SCORE_MIN = float(os.getenv("SCORE_MIN_V2", "57"))
 else:
     SCORE_MIN = float(os.getenv("SCORE_MIN", "72"))
+
+# ── #2 Gate de qualidade combinado (score marginal EXIGE edge) ──────────────
+# Na escala V2 a calibração é chata e o score quase não separa win-rate (score
+# 31+ todos ~0.65-0.68 de P(TP1)). O que separa é o EDGE (A+/funding/padrão/MTF,
+# learning-insights N=701). Este gate exige: na BANDA MARGINAL logo acima do
+# SCORE_MIN ([SCORE_MIN, SCORE_MIN+MARGIN)), o setup precisa ter >= 1 edge — senão
+# pula. Scores bem acima do piso passam livres (já são fortes). Corta justamente
+# os "score 57 pelado" que tendem a virar os stops. DEFAULT OFF (dinheiro real):
+# liga via env após revisar.
+QUALITY_EDGE_GATE_ENABLED = os.getenv("QUALITY_EDGE_GATE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+QUALITY_EDGE_MARGIN = float(os.getenv("QUALITY_EDGE_MARGIN", "6"))   # banda marginal acima do SCORE_MIN
+QUALITY_EDGE_MIN = int(os.getenv("QUALITY_EDGE_MIN", "1"))           # edges exigidos na banda
 
 # ── Time-of-day block (postmortem 104 snapshots / 168h) ────────────────────
 # Sessão EU (7-14 UTC) mostrou 50 trades / 42% wr / lift -21.46%.
@@ -1455,6 +1485,28 @@ def _conviction_mult(rec: dict) -> tuple[float, str]:
     return mult, f"{tag}→×{mult:.2f}"
 
 
+def _edge_mult(rec: dict) -> tuple[float, str]:
+    """#1 — Multiplicador de tamanho por EDGE (A+/funding/padrão/MTF). Escala o
+    risco/trade pela contagem de edges da rec, com bônus se A+ presente e leve
+    desconto se NENHUM edge. NO-OP-SAFE: desligado → 1.0. Clampa em
+    [EDGE_MULT_MIN, EDGE_MULT_MAX]; os caps duros de _compute_qty mandam depois."""
+    if not EDGE_SIZING_ENABLED:
+        return 1.0, "disabled"
+    try:
+        n = int(rec.get("edge_score") or 0)
+    except Exception:
+        n = 0
+    tags = rec.get("edge_tags") or []
+    if n <= 0:
+        mult = max(EDGE_MULT_MIN, min(EDGE_MULT_MAX, EDGE_NOEDGE_MULT))
+        return mult, f"sem edge→×{mult:.2f}"
+    raw = 1.0 + n * EDGE_PER_EDGE
+    if "A+" in tags:
+        raw += EDGE_APLUS_BONUS
+    mult = max(EDGE_MULT_MIN, min(EDGE_MULT_MAX, raw))
+    return mult, f"edges={n}[{','.join(str(t) for t in tags)}]→×{mult:.2f}"
+
+
 def _norm_sym(s: str) -> str:
     """'BTC/USDT:USDT' ou 'BTCUSDT' → 'BTCUSDT' (pra casar DB × exchange)."""
     if not s:
@@ -2312,6 +2364,25 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 _record_skip(rec, "score-min", reason)
                 continue
 
+            # ── #2 Gate de qualidade combinado: na banda marginal logo acima do
+            # SCORE_MIN, exige >= QUALITY_EDGE_MIN edges (A+/funding/padrão/MTF).
+            # Score já é >= SCORE_MIN aqui; só morde quem está colado no piso SEM
+            # nenhum edge. Default OFF.
+            if QUALITY_EDGE_GATE_ENABLED and QUALITY_EDGE_MARGIN > 0:
+                if rec_score < (SCORE_MIN + QUALITY_EDGE_MARGIN):
+                    try:
+                        _edges_n = int(rec.get("edge_score") or 0)
+                    except Exception:
+                        _edges_n = 0
+                    if _edges_n < QUALITY_EDGE_MIN:
+                        reason = (
+                            f"score marginal {rec_score:.0f} (< {SCORE_MIN + QUALITY_EDGE_MARGIN:.0f}) "
+                            f"sem edge (>= {QUALITY_EDGE_MIN} exigido)"
+                        )
+                        log.info(f"[quality-edge-gate] {rec.get('symbol')} {reason} — skip")
+                        _record_skip(rec, "quality-edge-gate", reason)
+                        continue
+
             # ── Universo de execução (allowlist): só opera real bases permitidas.
             # Vazio = sem restrição (comportamento atual). Aplicado só em live.
             if not SHADOW_ENABLED and EXEC_UNIVERSE_ALLOWLIST:
@@ -2561,6 +2632,16 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 log.info(
                     f"[conviction] {rec.get('symbol')} risco {_risk_before:.2f}% "
                     f"→ {risk_pct:.2f}% ({_conv_reason})"
+                )
+            # #1 — sizing por EDGE (A+/funding/padrão/MTF). Compõe multiplicativo
+            # com a convicção, dentro dos caps duros de _compute_qty. Default OFF.
+            _edge_m, _edge_reason = _edge_mult(rec)
+            if _edge_m != 1.0:
+                _risk_before_e = risk_pct
+                risk_pct = round(risk_pct * _edge_m, 4)
+                log.info(
+                    f"[edge-sizing] {rec.get('symbol')} risco {_risk_before_e:.2f}% "
+                    f"→ {risk_pct:.2f}% ({_edge_reason})"
                 )
             equity_usd, equity_src = await _resolve_equity_usd()
             # go-live #5 — em modo LIVE, nunca dimensiona dinheiro real com

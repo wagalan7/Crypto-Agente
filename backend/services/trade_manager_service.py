@@ -95,6 +95,20 @@ BE_STRUCT_ATR_BUFFER = float(os.getenv("BE_STRUCT_ATR_BUFFER", "0.25"))
 # virar negativo). 0 desliga a folga (volta ao BE exato).
 BE_MAX_GIVEBACK_R = float(os.getenv("BE_MAX_GIVEBACK_R", "0.5"))
 
+# ── #4 Proteção PRÉ-TP1 (lock parcial de risco) ─────────────────────────────
+# Dado: 68% dos setups TOCAM o TP1, mas só 31% correm até o TP2. A perna pré-TP1
+# fica no stop CHEIO (1R) o tempo todo — então um trade que andou 60-70% rumo ao
+# TP1 e reverteu devolve 1R inteiro. Esta proteção, quando o preço cruza
+# PROTECT_TRIGGER_FRAC do caminho entry→TP1 (sem ter batido o TP1 ainda), aperta o
+# SL de pre_tp1 pra entry ∓ PROTECT_LOCK_R·R — reduzindo a perda máxima daquela
+# perna SEM ir ao BE exato (que tomaria pavio). Reusa o mesmo mecanismo de troca
+# de SL do post_tp1 (cria-novo → cancela-antigo: posição nunca fica nua). Só
+# APERTA (nunca afrouxa) e age UMA vez por trade. DEFAULT OFF (dinheiro real):
+# liga via env após revisar. É a mudança mais delicada (mexe em SL ao vivo).
+PRE_TP1_PROTECT_ENABLED = os.getenv("PRE_TP1_PROTECT_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+PRE_TP1_PROTECT_TRIGGER_FRAC = float(os.getenv("PRE_TP1_PROTECT_TRIGGER_FRAC", "0.6"))  # 60% rumo ao TP1
+PRE_TP1_PROTECT_LOCK_R = float(os.getenv("PRE_TP1_PROTECT_LOCK_R", "0.5"))  # SL novo a entry ∓ 0.5R
+
 
 def _tf_category(tf: str | None) -> str:
     """Mapeia timeframe → 'scalp' | 'day' | 'swing'."""
@@ -808,6 +822,93 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     return True
 
 
+async def _maybe_pre_tp1_protect(trade: RealTrade, qty_now: float) -> bool:
+    """#4 — Em pre_tp1, se o preço já andou >= TRIGGER_FRAC rumo ao TP1, aperta o
+    SL pra entry ∓ LOCK_R·R (reduz a perda máxima dessa perna). Age UMA vez (guard
+    via sl_current_price já apertado vs planned_stop). Só APERTA. Reusa o padrão
+    cria-novo→cancela-antigo. Retorna True se moveu. Fail-soft total."""
+    if not PRE_TP1_PROTECT_ENABLED or trade.phase != "pre_tp1":
+        return False
+    try:
+        entry = float(trade.entry_price or 0)
+        planned_stop = float(trade.planned_stop or 0)
+        planned_tp1 = float(trade.planned_tp1 or 0)
+        if entry <= 0 or planned_stop <= 0 or planned_tp1 <= 0:
+            return False
+        is_long = trade.side == "long"
+        R = abs(entry - planned_stop)
+        if R <= 0:
+            return False
+
+        # Guard idempotência: SL atual já mais apertado que o planned_stop? Já moveu.
+        cur_sl = float(trade.sl_current_price or planned_stop)
+        already_moved = (cur_sl > planned_stop + 1e-12) if is_long else (cur_sl < planned_stop - 1e-12)
+        if already_moved:
+            return False
+
+        # Progresso rumo ao TP1 pelo mark price atual.
+        mark = await _fetch_mark_price(trade.symbol)
+        if mark is None or mark <= 0:
+            return False
+        denom = (planned_tp1 - entry) if is_long else (entry - planned_tp1)
+        if denom <= 0:
+            return False
+        progress = ((mark - entry) if is_long else (entry - mark)) / denom
+        if progress < PRE_TP1_PROTECT_TRIGGER_FRAC:
+            return False
+
+        # Novo SL: entry ∓ LOCK_R·R. Só aplica se for MAIS APERTADO que o atual e
+        # não passar do entry (não vira lucro travado aqui — isso é o pós-TP1).
+        new_sl = (entry - PRE_TP1_PROTECT_LOCK_R * R) if is_long else (entry + PRE_TP1_PROTECT_LOCK_R * R)
+        tighter = (new_sl > cur_sl + 1e-12) if is_long else (new_sl < cur_sl - 1e-12)
+        if not tighter:
+            return False
+        # Trava de segurança: nunca acima/abaixo do entry (mantém em pre-BE).
+        if is_long and new_sl >= entry:
+            new_sl = entry - 1e-9
+        if (not is_long) and new_sl <= entry:
+            new_sl = entry + 1e-9
+
+        from services import exchange_service, binance_signed_service
+        entry_side = "Buy" if is_long else "Sell"
+        prot = await binance_signed_service.place_protection_orders(
+            trade.symbol, entry_side, qty=qty_now,
+            stop_loss=new_sl, tp1=None, tp2=None,
+            client_order_id_prefix=f"cw-pre-{trade.id}",
+        )
+        if not prot.get("sl_ok"):
+            log.warning(
+                f"[pre-tp1-protect] {trade.symbol} #{trade.id} novo SL falhou: "
+                f"{prot.get('sl_msg')} — mantém SL atual"
+            )
+            return False
+        new_sl_id = prot.get("sl_order_id")
+        # Cancela SL antigo só depois de ter cobertura nova.
+        if trade.sl_order_id:
+            try:
+                await exchange_service.cancel_algo_order(trade.sl_order_id)
+            except Exception as e:
+                log.warning(f"[pre-tp1-protect] cancel SL antigo #{trade.id}: {e}")
+        async with get_session() as session:
+            fresh = (await session.execute(
+                select(RealTrade).where(RealTrade.id == trade.id)
+            )).scalar_one_or_none()
+            if fresh:
+                fresh.sl_order_id = new_sl_id
+                fresh.sl_current_price = new_sl
+                await session.commit()
+                trade.sl_order_id = new_sl_id
+                trade.sl_current_price = new_sl
+        log.info(
+            f"[pre-tp1-protect] {trade.symbol} #{trade.id} progress {progress*100:.0f}% "
+            f"rumo ao TP1 → SL {cur_sl} → {new_sl} (entry∓{PRE_TP1_PROTECT_LOCK_R}R)"
+        )
+        return True
+    except Exception as e:
+        log.warning(f"[pre-tp1-protect] #{trade.id} falhou (fail-soft): {e}")
+        return False
+
+
 async def _process_trade(trade: RealTrade) -> None:
     """Avalia um trade aberto e age conforme a fase."""
     qty_now = await _fetch_exchange_qty(trade.symbol)
@@ -827,6 +928,12 @@ async def _process_trade(trade: RealTrade) -> None:
             await _ensure_protection(trade, qty_now)
         except Exception as e:
             log.warning(f"[autoheal] check #{trade.id} erro: {e}")
+
+        # ── #4 Proteção pré-TP1: aperta SL quando andou rumo ao TP1 (default OFF)
+        try:
+            await _maybe_pre_tp1_protect(trade, qty_now)
+        except Exception as e:
+            log.warning(f"[pre-tp1-protect] check #{trade.id} erro: {e}")
 
     qty_initial = trade.qty_initial or trade.qty
 
