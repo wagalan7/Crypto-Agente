@@ -91,6 +91,7 @@ _snapshot_task: Optional[asyncio.Task] = None
 _scan_task: Optional[asyncio.Task] = None
 _trade_manager_task: Optional[asyncio.Task] = None
 _recalibration_task: Optional[asyncio.Task] = None
+_reminders_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
 # Quantos símbolos varrer por ciclo (top-N por volume). Universo maior = mais
@@ -443,7 +444,7 @@ async def _server_scan_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task
+    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task
     # Banner de segurança go-live — shadow vs live, produção vs demo, canary.
     try:
         from services import shadow_trade_service
@@ -487,8 +488,15 @@ async def lifespan(app: FastAPI):
         logging.info("Trade manager iniciado.")
     except Exception as e:
         logging.warning(f"Falha ao iniciar trade_manager: {e}")
+    # Lembretes de vencimento (renovações de serviços pagos) via Telegram
+    try:
+        from services import reminders_service
+        _reminders_task = asyncio.create_task(reminders_service.loop())
+        logging.info("Lembretes de vencimento iniciados.")
+    except Exception as e:
+        logging.warning(f"Falha ao iniciar reminders: {e}")
     yield
-    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task):
+    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task):
         if t:
             t.cancel()
             try:
