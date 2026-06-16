@@ -250,6 +250,7 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
 
     title = f"🚀 {tier} · {symbol_short} {direction}"
     lines = [
+        _entry_verdict(rec),
         f"{rec.get('timeframe', '')} · {leverage}x · R:R 1:{_round_rr(rr)}",
         f"Score {score:.0f} · entry {_fmt(entry_v)}",
     ]
@@ -525,3 +526,16 @@ def _round_rr(v) -> int:
     import math
     frac = x - math.floor(x)
     return math.ceil(x) if frac > 0.5 else math.floor(x)
+
+
+def _entry_verdict(rec) -> str:
+    """Selo de entrada manual no push — mesma lógica do card de Recomendações:
+    qualidade (gates do bot) + tier. Permite decidir já na notificação, sem
+    abrir o app. q_ok=False ⇒ avisa pra evitar; A/A+ que passa ⇒ bom pra entrar."""
+    v = rec.get("bot_verdict") or {}
+    q_ok = v.get("ok")
+    if q_ok is False:
+        return "⛔ Evitar — não passa no critério do bot"
+    if rec.get("tier", "") in ("A+", "A"):
+        return "✅ Bom pra entrar"
+    return "🟡 Aceitável (tier B)"
