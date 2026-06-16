@@ -172,6 +172,12 @@ def _extract_features(rec: Dict[str, Any], created_at: datetime) -> Dict[str, An
         "oi_change_pct": derivatives.get("oi_change_24h_pct") if derivatives else None,
         "hour_utc": created_at.hour,
         "day_of_week": created_at.weekday(),    # 0 = Monday
+        # Veredito de QUALIDADE do bot no momento da criação (R:R / P(TP1) /
+        # liquidez — mesma lógica de exec_verdict). Persistido pra o painel poder
+        # filtrar "só aprovados pelo bot" mesmo em trades de dias anteriores, com
+        # o veredito EXATO da decisão (não um recompute aproximado). None se a rec
+        # não trouxe bot_verdict.
+        "bot_verdict_ok": (rec.get("bot_verdict") or {}).get("ok"),
     }
 
 
@@ -1051,9 +1057,29 @@ async def get_daily_pnl(
     total = win_count + loss_count
     win_rate = (win_count / total * 100) if total else 0
 
+    # Veredito de qualidade do bot por snapshot — True/False/None.
+    # Snapshots NOVOS trazem o veredito EXATO em features['bot_verdict_ok'].
+    # Antigos (sem o campo) recomputam via exec_verdict a partir dos níveis
+    # (gate de R:R aplica; P(TP1)/liquidez ficam no-op por falta de dado —
+    # fail-soft, igual ao loop). Fonte única de regra = exec_verdict.
+    def _bot_approved(s):
+        feat = s.features or {}
+        v = feat.get("bot_verdict_ok")
+        if v is not None:
+            return bool(v)
+        try:
+            from services.shadow_trade_service import exec_verdict
+            return bool(exec_verdict({
+                "entry": s.entry, "stop_loss": s.stop_loss,
+                "tp1": s.tp1, "tp2": s.tp2,
+            }).get("ok"))
+        except Exception:
+            return None
+
     # Detalhe por trade (resolvido + aberto, em listas separadas)
     def _serialize(s):
         return {
+            "bot_approved": _bot_approved(s),
             "symbol": s.symbol,
             "timeframe": s.timeframe,
             "tier": s.tier,
@@ -1113,6 +1139,7 @@ async def get_daily_pnl(
             "realized_r": out.get("r"),  # R de observação (de features, não da coluna)
             "risk_pct": s.risk_pct,
             "score": s.score,
+            "bot_approved": _bot_approved(s),
             "origin": "observation",
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "outcome_at": s.outcome_at.isoformat() if s.outcome_at else None,

@@ -26,6 +26,9 @@ interface Trade {
   // Origem (client-side): 'bot' = o bot opera (PRD) · 'observation' = só
   // observação (ambiente de testes). Default 'bot' (trades do PRD).
   origin?: 'bot' | 'observation'
+  // Passaria nos gates de QUALIDADE do bot (R:R/P(TP1)/liquidez) — mesmo
+  // veredito do "Só aprovados pelo bot" das Recomendações. Vem do backend.
+  bot_approved?: boolean
 }
 
 interface DailyPnL {
@@ -147,6 +150,10 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
   // 'observation' = 👁 observação (tier B, só acompanhar) · 'all' = tudo.
   // Default 'all' pra ver as duas categorias distinguidas pelo selo.
   const [originFilter, setOriginFilter] = useState<'all' | 'bot' | 'observation'>('all')
+  // Toggle "Só aprovados pelo bot" — espelha o das Recomendações. Filtra os
+  // trades que passariam nos gates de qualidade do bot (bot_approved === true),
+  // independente da origem/tier. Composto COM o originFilter.
+  const [qualityOnly, setQualityOnly] = useState(false)
   const isRange = date !== endDate
   const cardRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const [highlightKey, setHighlightKey] = useState<string | null>(null)
@@ -329,8 +336,9 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
     // Filtro por tier: 'observation' = tier B · 'bot' = acionável (A/A+).
     if (originFilter === 'observation') all = all.filter(t => t.tier === 'B')
     else if (originFilter === 'bot') all = all.filter(t => t.tier !== 'B')
+    if (qualityOnly) all = all.filter(t => t.bot_approved === true)
     return all
-  }, [data?.open_trades, obsOpenAll, originFilter])
+  }, [data?.open_trades, obsOpenAll, originFilter, qualityOnly])
   const openToday = useMemo(
     () => openListAll.filter(t => t.created_at?.slice(0, 10) === todayStr),
     [openListAll, todayStr]
@@ -373,8 +381,9 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
     let all = [...bot, ...wide]
     if (originFilter === 'observation') all = all.filter(t => t.tier === 'B')
     else if (originFilter === 'bot') all = all.filter(t => t.tier !== 'B')
+    if (qualityOnly) all = all.filter(t => t.bot_approved === true)
     return all
-  }, [data?.trades, data?.wide_trades, originFilter])
+  }, [data?.trades, data?.wide_trades, originFilter, qualityOnly])
   const winsList = useMemo(
     () => resolvedAll.filter(t => (t.realized_r ?? 0) > 0),
     [resolvedAll]
@@ -443,6 +452,9 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                   .filter(t => sign * (t.realized_r ?? 0) > 0)
             const actCount = baseList.filter(t => t.tier !== 'B').length
             const obsCount = baseList.filter(t => t.tier === 'B').length
+            // Quantos do drill atual o bot APROVARIA (passam nos gates de
+            // qualidade) — mesmo critério do toggle das Recomendações.
+            const qaCount = baseList.filter(t => t.bot_approved === true).length
             return (
             <div className="px-4 py-2 border-b border-slate-800">
              <div className="flex items-center gap-2 flex-wrap">
@@ -469,9 +481,24 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                   </button>
                 )
               })}
+              {/* Toggle "Só aprovados pelo bot" — espelha o das Recomendações.
+                  Filtra os que passariam nos gates de qualidade (R:R/P(TP1)/
+                  liquidez), independente de tier/origem. */}
+              <button
+                onClick={() => setQualityOnly(v => !v)}
+                title="Mostra só os trades que passam nos MESMOS gates de qualidade do bot (R:R, P(TP1), liquidez). Os que o bot operaria de verdade."
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs font-semibold whitespace-nowrap transition-colors ${
+                  qualityOnly
+                    ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-200'
+                    : 'bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <span>{qualityOnly ? '✅' : '☑️'} Só aprovados pelo bot</span>
+                <span className="text-slate-500">({qaCount})</span>
+              </button>
              </div>
              <p className="mt-1.5 text-[10px] text-slate-500 leading-snug">
-               👁 = tier B (só acompanhar) · 🎯 = tier A/A+ (pode entrar)
+               👁 = tier B (só acompanhar) · 🎯 = tier A/A+ (pode entrar) · ✅ = passa nos gates de qualidade do bot
              </p>
             </div>
             )
