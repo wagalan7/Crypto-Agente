@@ -188,7 +188,7 @@ CAPACIDADES (apenas para pacientes JÁ CADASTRADOS com consulta):
 
 NOME DO PACIENTE — REGRA ABSOLUTA:
 - Use SOMENTE o nome que aparece na linha "NOME DO PACIENTE:" ou "PACIENTE CONHECIDO:" do CONTEXTO.
-- NUNCA invente um nome. NUNCA use um nome aleatório (ex: "Michelle", "Maria", "João") sem ele aparecer no contexto.
+- NUNCA invente um nome. NUNCA escreva um nome próprio que não apareça literalmente no CONTEXTO desta mensagem.
 - Se a linha NOME DO PACIENTE: existe → use APENAS o primeiro nome dela ao cumprimentar.
 - Se a linha disser "(sem nome cadastrado)" → NÃO use nome algum, cumprimente sem nome: "Olá! 😊".
 - NUNCA confunda o nome do paciente com o nome da psicóloga.
@@ -611,12 +611,22 @@ def _try_deterministic_confirm(tenant: dict, phone: str, text: str) -> str | Non
         return None
     if not appt:
         return None
-    # Precisa estar pendente, não cancelada, e termos pedido confirmação antes.
-    if appt.get("confirmed") or appt.get("cancelled"):
+    # Cancelada → não trata aqui (deixa o LLM/fluxo normal).
+    if appt.get("cancelled"):
         return None
     pedimos = bool(appt.get("confirmation_sent")) or bool(appt.get("followup_sent"))
     if not pedimos:
         return None
+    # Nome SEMPRE da fonte determinística (o agendamento), nunca do LLM —
+    # evita o caso em que o LLM cumprimentava com um nome errado/aleatório.
+    nome = (appt.get("patient_name") or "").split()[0] if appt.get("patient_name") else ""
+    # Já confirmada antes → re-afirmação ("Confirmado" de novo). Responde
+    # determinístico para NÃO cair no LLM (que podia hallucinar o nome). Não
+    # regrava nada no banco.
+    if appt.get("confirmed"):
+        saud = f"Perfeito, {nome}! 😊" if nome else "Perfeito! 😊"
+        logger.info(f"[{tenant['slug']}][{phone}] RE-CONFIRMAÇÃO determinística id={appt['id']}")
+        return f"{saud} Sua presença já está confirmada. Até lá! 🌸"
     try:
         db.confirm_appointment(tenant_id, appt["id"])
     except Exception as e:
