@@ -317,8 +317,10 @@ async def _server_scan_loop():
                 f"(A+={by_tier['A+']} A={by_tier['A']} B={by_tier['B']})"
             )
 
-            # Filtra só A+ e A (B não notifica por default do usuário)
-            pushable = [r for r in recs_dict if r.get("tier") in ("A+", "A", "B")]
+            # Push: SÓ A+ e A (decisão do usuário). B NÃO notifica — continua
+            # sendo salvo/exibido nas telas de Recomendações (save abaixo), mas
+            # fica fora do batch de push.
+            pushable = [r for r in recs_dict if r.get("tier") in ("A+", "A")]
 
             newly_saved = 0
             if DB_ENABLED and recs_dict:
@@ -348,8 +350,12 @@ async def _server_scan_loop():
                         # entram no batch. Execução vem primeiro (prioridade),
                         # depois preenche com os do universo amplo (cap 5/batch
                         # é aplicado em notify_recommendations_batch).
+                        # Push amplo: SÓ A+ e A (B só aparece no painel, não
+                        # notifica). wide_only mantém B pro save/display acima.
                         pushable = pushable + [
-                            r for r in wide_only if r.get("_just_saved") is True
+                            r for r in wide_only
+                            if r.get("_just_saved") is True
+                            and r.get("tier") in ("A+", "A")
                         ]
                         if wide_saved:
                             logging.info(
