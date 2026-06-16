@@ -529,13 +529,19 @@ def _round_rr(v) -> int:
 
 
 def _entry_verdict(rec) -> str:
-    """Selo de entrada manual no push — mesma lógica do card de Recomendações:
-    qualidade (gates do bot) + tier. Permite decidir já na notificação, sem
-    abrir o app. q_ok=False ⇒ avisa pra evitar; A/A+ que passa ⇒ bom pra entrar."""
-    v = rec.get("bot_verdict") or {}
-    q_ok = v.get("ok")
-    if q_ok is False:
+    """Selo de entrada manual no push. Lê o `entry_grade` calculado no backend
+    (fonte única: qualidade dos gates + piso de auto-execução SCORE_MIN), pra
+    decidir já na notificação sem abrir o app. Fallback p/ recs antigas sem o
+    campo: qualidade + tier."""
+    grade = rec.get("entry_grade")
+    if grade == "avoid":
         return "⛔ Evitar — não passa no critério do bot"
-    if rec.get("tier", "") in ("A+", "A"):
+    if grade == "manual":
+        return "🟡 Dá pra entrar — o bot não abriria sozinho"
+    if grade == "good":
         return "✅ Bom pra entrar"
-    return "🟡 Aceitável (tier B)"
+    # Fallback (rec sem entry_grade)
+    v = rec.get("bot_verdict") or {}
+    if v.get("ok") is False:
+        return "⛔ Evitar — não passa no critério do bot"
+    return "✅ Bom pra entrar" if rec.get("tier", "") in ("A+", "A") else "🟡 Aceitável (tier B)"

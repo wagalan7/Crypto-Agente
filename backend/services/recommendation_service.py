@@ -154,6 +154,13 @@ class Recommendation(BaseModel):
     # computado com a MESMA lógica/limites do loop de execução (fonte única).
     # {ok, blocked_by, reason, checks}. None se não foi possível avaliar.
     bot_verdict: Optional[dict] = None
+    # Grau de entrada manual — fonte única consumida pelo push e pelo app.
+    # Combina o veredito de qualidade (bot_verdict) com o piso de auto-execução
+    # (SCORE_MIN). Distingue "o bot abriria" de "só dá pra entrar manual":
+    #   "good"   = qualidade ok E score ≥ SCORE_MIN (o bot abriria sozinho)
+    #   "manual" = qualidade ok, mas score < SCORE_MIN (só entrada manual)
+    #   "avoid"  = não passa nos gates de qualidade do bot
+    entry_grade: Optional[str] = None
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -970,6 +977,19 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
     except Exception:
         bot_verdict = None
 
+    # Grau de entrada manual (fonte única p/ push + app). "avoid" se reprova na
+    # qualidade; senão "good" se score ≥ piso de auto-execução, "manual" abaixo.
+    try:
+        from services.shadow_trade_service import SCORE_MIN as _EXEC_SCORE_MIN
+    except Exception:
+        _EXEC_SCORE_MIN = 57.0
+    if bot_verdict is not None and bot_verdict.get("ok") is False:
+        entry_grade = "avoid"
+    elif score >= _EXEC_SCORE_MIN:
+        entry_grade = "good"
+    else:
+        entry_grade = "manual"
+
     return Recommendation(
         tier=tier,
         score=score,
@@ -1001,6 +1021,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         quote_vol_usd=q_vol,
         spread_pct=sp_pct,
         bot_verdict=bot_verdict,
+        entry_grade=entry_grade,
     )
 
 

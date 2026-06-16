@@ -308,6 +308,11 @@ export interface Recommendation {
       spread_pct?: number | null
     }
   } | null
+  // Grau de entrada manual (fonte única backend): qualidade + piso de auto-exec.
+  //   'good'   = qualidade ok E score ≥ SCORE_MIN (o bot abriria sozinho)
+  //   'manual' = qualidade ok, mas score < SCORE_MIN (só entrada manual)
+  //   'avoid'  = não passa nos gates de qualidade
+  entry_grade?: 'good' | 'manual' | 'avoid' | null
   // Setup já foi resolvido nas últimas 2h (mesmo symbol+tf+direction)
   recent_outcome?: {
     status: 'won_tp1' | 'won_tp1_be' | 'won_tp2' | 'lost'

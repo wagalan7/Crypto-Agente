@@ -650,21 +650,23 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                         {r.score.toFixed(0)}
                       </div>
                       <div className="text-[10px] text-slate-500">score V2</div>
-                      {/* Veredito de ENTRADA MANUAL: qualidade (gates do bot) + tier.
-                          Existe pra você não pular um setup bom só porque o número
-                          do Score V2 parece "baixo" (a régua mudou: A já vale ≥46).
-                          É a resposta direta pra "vale a pena EU entrar?". */}
+                      {/* Veredito de ENTRADA MANUAL — lê o entry_grade do backend
+                          (qualidade dos gates + piso de auto-execução SCORE_MIN):
+                          distingue "o bot abriria" de "só dá pra entrar manual".
+                          Existe pra você não pular setup bom por causa do número
+                          "baixo" do Score V2 (A já vale ≥46), mas sem fingir que um
+                          setup abaixo do piso de execução é igual aos que o bot abre. */}
                       {(() => {
-                        const qOk = verdict?.ok
-                        const tierTop = r.tier === 'A+' || r.tier === 'A'
-                        const ev = qOk === false
+                        const grade = r.entry_grade
+                          ?? (verdict?.ok === false ? 'avoid' : (r.tier === 'A+' || r.tier === 'A') ? 'good' : 'manual')
+                        const ev = grade === 'avoid'
                           ? { lbl: '⛔ Evitar', cls: 'bg-red-500/15 text-red-300 border-red-500/40',
-                              hint: `Não passa no critério de qualidade do bot${verdict?.blocked_by ? ` (${verdict.blocked_by})` : ''} — melhor não entrar.` }
-                          : tierTop
-                            ? { lbl: '✅ Bom pra entrar', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
-                                hint: 'Passa nos gates de qualidade do bot (R:R, P(TP1), liquidez) e é tier A/A+. Bom pra entrada manual — ignore o número "baixo" do Score: a régua V2 vai só até ~75 e A já vale a partir de 46.' }
-                            : { lbl: '🟡 Aceitável', cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40',
-                                hint: 'Setup ok, mas tier B (menos forte). Dá pra entrar, com cautela.' }
+                              hint: `Não passa nos gates de qualidade do bot${verdict?.blocked_by ? ` (${verdict.blocked_by})` : ''} — melhor não entrar.` }
+                          : grade === 'manual'
+                            ? { lbl: '🟡 Dá pra entrar', cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40',
+                                hint: 'Passa na qualidade (R:R/P(TP1)/liquidez), mas o Score está abaixo do piso de auto-execução do bot — ele NÃO abriria sozinho. Dá pra entrar manualmente, com cautela.' }
+                            : { lbl: '✅ Bom pra entrar', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
+                                hint: 'Passa nos gates de qualidade E o Score atinge o piso de auto-execução: é o tipo de setup que o próprio bot abre. Ignore o número "baixo" do Score — a régua V2 vai só até ~75.' }
                         return (
                           <div title={ev.hint} className={`mt-1 inline-block px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${ev.cls}`}>
                             {ev.lbl}
