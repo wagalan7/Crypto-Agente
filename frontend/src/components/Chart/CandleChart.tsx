@@ -285,12 +285,13 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
 
       // ── Padrões geométricos (LTA/LTB/canais/cunhas/triângulos) ────────────
       // Antes desenhava TODO padrão alinhado à direção, e o backend costuma
-      // emitir canal+cunha+triângulo ajustados aos MESMOS pivôs → várias
-      // diagonais quase-paralelas amontoadas ("desconfigurado"). Além disso o
-      // x das linhas é um ÍNDICE de barra no df do backend; mapear via
-      // `firstTs + x*timeUnit` assume candle[0] do front == barra[0] do back,
-      // o que desalinha a linha no eixo do tempo. Correções:
-      //  1) só os 2 padrões de MAIOR confiança (= os que o card nomeia);
+      // emitir canal+cunha+LTB+triângulo ajustados aos MESMOS pivôs → várias
+      // diagonais quase-paralelas amontoadas num "leque" ("desconfigurado").
+      // Ex.: um descending_channel (2 linhas) + uma LTB que praticamente repete
+      // a linha de cima do canal = 3 diagonais convergindo. Correções:
+      //  1) desenha SÓ o padrão de MAIOR confiança (= o chip primário do card).
+      //     Se for canal/cunha/triângulo → 2 paralelas limpas; se for LTA/LTB →
+      //     1 trendline. Nunca mais o leque de linhas redundantes.
       //  2) índice→tempo ancorado num PIVÔ real (point.index/timestamp), robusto
       //     a qualquer offset entre as séries do front e do back;
       //  3) projeta a linha até a barra atual (lê como trendline chegando no
@@ -310,7 +311,7 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
         .filter(p => p.direction === signal.direction || p.direction === 'neutral')
         .slice()
         .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))
-        .slice(0, 2)
+        .slice(0, 1)
         .forEach(pattern => {
           const color = PATTERN_COLORS[pattern.type] || '#a78bfa'
           // Âncora índice→tempo: usa um pivô real do próprio padrão. Fallback
