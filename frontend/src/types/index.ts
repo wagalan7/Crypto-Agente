@@ -326,6 +326,13 @@ export interface Recommendation {
     resolved_at: string | null
     entry: number
   } | null
+  // Setup nasceu de um pullback à linha rompida (retest re-arm) — entrada
+  // "limpa" pós-rompimento. Backend gated RETEST_REARM_ENABLED.
+  retest_armed?: boolean | null
+  // Esticamento do preço desde a BASE estrutural do movimento (perna inteira),
+  // em múltiplos de ATR + classificação. Backend gated STRUCT_CHASE_ENABLED.
+  struct_chase_atr?: number | null
+  struct_chase_level?: 'ok' | 'extended' | 'chasing' | null
   // Marcador de origem (client-side): 'bot' = o bot opera essa rec (vem do PRD,
   // top-60 que ele realmente executa) · 'observation' = só observável (vem do
   // ambiente de testes, universo amplo) — pro usuário analisar no TradingView.

@@ -642,6 +642,26 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                             </span>
                           )
                         })()}
+                        {/* Selo de TF ALTO de origem (12h+): padrão de swing/posição
+                            em timeframe relevante — destaque vs ruído de TF baixo. */}
+                        {['12h', '1d', '3d', '1w'].includes(r.timeframe) && (
+                          <span
+                            title={`Setup originado em timeframe ALTO (${r.timeframe.toUpperCase()}). Padrões gráficos em TFs altos são mais confiáveis — rompimentos limpos, menos ruído.`}
+                            className="px-1.5 py-0.5 rounded text-[9px] font-bold border bg-indigo-500/15 text-indigo-300 border-indigo-500/40 whitespace-nowrap"
+                          >
+                            📊 {r.timeframe.toUpperCase()}
+                          </span>
+                        )}
+                        {/* Rompeu + retestando: entrada limpa no pullback à linha
+                            rompida (suporte/resistência invertido). */}
+                        {r.retest_armed && (
+                          <span
+                            title="ROMPEU + RETESTANDO — o preço rompeu o nível-chave do padrão e voltou pra retestá-lo (agora como suporte/resistência invertido). É a entrada 'limpa' de pullback pós-rompimento."
+                            className="px-1.5 py-0.5 rounded text-[9px] font-bold border bg-teal-500/15 text-teal-300 border-teal-500/40 whitespace-nowrap"
+                          >
+                            🎯 rompeu+retest
+                          </span>
+                        )}
                       </div>
                       <p className="text-[11px] text-slate-400 mt-0.5 leading-tight">{r.summary}</p>
                       {/* Edges — sinais de alta convicção (A+/funding/padrão/MTF).
