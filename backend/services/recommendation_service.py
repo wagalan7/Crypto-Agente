@@ -90,6 +90,54 @@ async def _htf_signal_cached(symbol: str, tf: str, make_coro) -> Optional["Trade
         sig = None
     _HTF_SIGNAL_CACHE[ck] = (now + _HTF_TTL.get(tf, _HTF_TTL_DEFAULT), sig)
     return sig
+
+
+# ── Confirmação cruzada por TF alto (Passo 4 — gated) ────────────────────────
+# Quando um TF alto (12h/1D/3D/1W) tem rompimento confirmado OU retest ativo numa
+# direção, um setup de TF BAIXO na MESMA direção ganha um boost de score. Combina
+# convicção estrutural do TF alto com a entrada precisa do TF baixo (RR melhor) —
+# o caso HYPE: cunha rompida no 12h + entrada limpa no 4h/1h. Depende de
+# HIGH_TF_PATTERNS_ENABLED (sem os TFs altos varridos não há o que confirmar).
+HIGH_TF_CONFIRM_ENABLED = os.getenv("HIGH_TF_CONFIRM_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+HIGH_TF_CONFIRM_BONUS = float(os.getenv("HIGH_TF_CONFIRM_BONUS", "6.0"))
+
+
+def _sig_has_htf_trigger(sig: Optional["TradeSignal"]) -> bool:
+    """True se o sinal tem algum padrão com rompimento confirmado ou retest ativo
+    na MESMA direção do sinal (gatilho técnico forte)."""
+    if not sig or not getattr(sig, "patterns", None):
+        return False
+    for p in sig.patterns:
+        if (
+            (getattr(p, "breakout_confirmed", False) or getattr(p, "retest_active", False))
+            and p.direction == sig.direction
+        ):
+            return True
+    return False
+
+
+def _htf_confirm_dirs(results) -> set:
+    """Direções confirmadas por um gatilho (rompimento/retest) em algum TF alto."""
+    dirs = set()
+    for sig in results:
+        if sig is None:
+            continue
+        if sig.timeframe in HIGH_TF_LIST and _sig_has_htf_trigger(sig):
+            dirs.add(sig.direction)
+    return dirs
+
+
+def _score_with_htf_confirm(sig: "TradeSignal", base_score: float, confirm_dirs: set) -> float:
+    """Aplica o boost de confirmação cruzada a um setup de TF baixo cuja direção
+    é confirmada por um TF alto. No-op quando confirm_dirs vazio (flag off) ou
+    quando o próprio sinal já é de TF alto (o boost dele já vem da relevância)."""
+    if (
+        confirm_dirs
+        and sig.timeframe not in HIGH_TF_LIST
+        and sig.direction in confirm_dirs
+    ):
+        return min(100.0, base_score + HIGH_TF_CONFIRM_BONUS)
+    return base_score
 # Concorrência do server-scan (símbolos em paralelo). Default 6. Com top_n alto
 # (ex.: 500) via proxy, subir p/ ~14 mantém o ciclo perto de 90s. Env-driven.
 try:
@@ -812,11 +860,12 @@ async def _best_tf_for_symbol(symbol: str) -> Optional[tuple]:
             _htf_signal_cached(symbol, tf, lambda tf=tf: _analyze_symbol_tf(symbol, tf))
             for tf in HIGH_TF_LIST
         ]))
+    confirm_dirs = _htf_confirm_dirs(results) if (HIGH_TF_PATTERNS_ENABLED and HIGH_TF_CONFIRM_ENABLED) else set()
     scored: List[tuple] = []
     for sig in results:
         if sig is None or sig.direction == SignalDirection.NEUTRAL:
             continue
-        score = _compute_score(sig)
+        score = _score_with_htf_confirm(sig, _compute_score(sig), confirm_dirs)
         scored.append((sig, score))
     if not scored:
         return None
@@ -1559,11 +1608,12 @@ async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
             _htf_signal_cached(symbol, tf, lambda tf=tf: _analyze_symbol_tf_server(svc, symbol, tf))
             for tf in HIGH_TF_LIST
         ]))
+    confirm_dirs = _htf_confirm_dirs(results) if (HIGH_TF_PATTERNS_ENABLED and HIGH_TF_CONFIRM_ENABLED) else set()
     scored: List[tuple] = []
     for sig in results:
         if sig is None or sig.direction == SignalDirection.NEUTRAL:
             continue
-        score = _compute_score(sig)
+        score = _score_with_htf_confirm(sig, _compute_score(sig), confirm_dirs)
         scored.append((sig, score))
     if not scored:
         return None
