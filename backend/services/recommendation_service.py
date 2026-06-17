@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pydantic import BaseModel
 
 from services.binance_service import fetch_top_volume_symbols, fetch_ohlcv, fetch_ticker
@@ -42,6 +42,54 @@ SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
 STRUCT_CHASE_ENABLED = os.getenv("STRUCT_CHASE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 STRUCT_CHASE_CHASING_ATR = float(os.getenv("STRUCT_CHASE_CHASING_ATR", "5.0"))   # 🔴 esticado demais
 STRUCT_CHASE_EXTENDED_ATR = float(os.getenv("STRUCT_CHASE_EXTENDED_ATR", "3.0")) # 🟡 levemente esticado
+
+# ── TFs altos: padrões de swing/posição (gated) ──────────────────────────────
+# O scan base só vê 15m/1h/4h. Padrões gráficos relevantes (cunhas, triângulos,
+# OCO, canais) aparecem MUITO nos TFs altos — e um rompimento limpo em 12h/1D é
+# mais confiável que ruído de 15m. Aqui adicionamos 12h/1D/3D/1W ao leque de TFs
+# avaliados por símbolo. DEFAULT-OFF: com a flag off, HIGH_TF_LIST não é varrido
+# e nada muda (mesmos 3 TFs de sempre).
+#
+# Custo: candles altos mudam devagar, então cada (símbolo,TF alto) é cacheado com
+# TTL proporcional ao TF (12h re-avalia ~30min, 1W ~6h) — evita refetch dos 4 TFs
+# extras a cada ciclo de 90s. Só o ciclo frio paga o fetch completo.
+#
+# Relevância: TF maior = mais relevante ("do maior para o menor"). Multiplicador
+# de score >1.0 só para os TFs altos (15m/1h/4h ficam 1.0 → não mexe no balanço
+# atual). Aplicado em _compute_score, gated pela mesma flag (no-op quando off).
+HIGH_TF_PATTERNS_ENABLED = os.getenv("HIGH_TF_PATTERNS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+HIGH_TF_LIST = [tf.strip() for tf in os.getenv("HIGH_TF_LIST", "12h,1d,3d,1w").split(",") if tf.strip()]
+# TTL de cache por TF alto (segundos). Candle de 12h não muda em 90s.
+_HTF_TTL = {"12h": 1800, "1d": 3600, "3d": 10800, "1w": 21600}
+_HTF_TTL_DEFAULT = 1800
+# Peso de relevância por TF (multiplicador de score). >1.0 só nos TFs altos.
+_HTF_WEIGHT = {"12h": 1.05, "1d": 1.10, "3d": 1.15, "1w": 1.20}
+# Cache TTL de sinal por (símbolo, TF alto): (expira_em, signal|None)
+_HTF_SIGNAL_CACHE: Dict[Tuple[str, str], Tuple[float, Optional["TradeSignal"]]] = {}
+
+
+def _htf_relevance_mult(tf: str) -> float:
+    """Multiplicador de relevância por TF. 1.0 (no-op) quando a flag está off
+    ou para os TFs base (15m/1h/4h). Só TFs altos recebem prêmio (>1.0)."""
+    if not HIGH_TF_PATTERNS_ENABLED:
+        return 1.0
+    return _HTF_WEIGHT.get(tf, 1.0)
+
+
+async def _htf_signal_cached(symbol: str, tf: str, make_coro) -> Optional["TradeSignal"]:
+    """Avalia um TF alto com cache TTL. make_coro é um callable 0-arg que cria a
+    coroutine de análise (cliente ou server). Fail-soft: erro → None cacheado curto."""
+    now = time.time()
+    ck = (symbol, tf)
+    hit = _HTF_SIGNAL_CACHE.get(ck)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        sig = await make_coro()
+    except Exception:
+        sig = None
+    _HTF_SIGNAL_CACHE[ck] = (now + _HTF_TTL.get(tf, _HTF_TTL_DEFAULT), sig)
+    return sig
 # Concorrência do server-scan (símbolos em paralelo). Default 6. Com top_n alto
 # (ex.: 500) via proxy, subir p/ ~14 mantém o ciclo perto de 90s. Env-driven.
 try:
@@ -307,7 +355,8 @@ def _compute_score(sig: TradeSignal) -> float:
             )
         v2 = _compute_score_v2(conf_pct, adx_raw, funding_pct)
         if v2 is not None:
-            return v2
+            # Relevância por TF (gated, no-op quando off) também na fórmula V2.
+            return round(max(0.0, min(100.0, v2 * _htf_relevance_mult(sig.timeframe))), 1)
         # V2 não computável → cai na fórmula legada abaixo.
 
     conf_score = (sig.confluence.pct if sig.confluence else sig.confidence * 100)
@@ -351,6 +400,9 @@ def _compute_score(sig: TradeSignal) -> float:
         + win_bonus * 0.5
         + breakout_bonus
     )
+    # Relevância por TF (gated): TF maior = mais relevante. Mult 1.0 (no-op)
+    # quando HIGH_TF_PATTERNS_ENABLED off ou TF base. Cap final em 100.
+    score = score * _htf_relevance_mult(sig.timeframe)
     return round(max(0.0, min(100.0, score)), 1)
 
 
@@ -751,8 +803,15 @@ async def _analyze_symbol_tf(symbol: str, tf: str) -> Optional[TradeSignal]:
 
 
 async def _best_tf_for_symbol(symbol: str) -> Optional[tuple]:
-    """Roda SCAN_TFS em paralelo, devolve (signal, score) do melhor TF."""
-    results = await asyncio.gather(*[_analyze_symbol_tf(symbol, tf) for tf in SCAN_TFS])
+    """Roda SCAN_TFS em paralelo, devolve (signal, score) do melhor TF.
+    Quando HIGH_TF_PATTERNS_ENABLED, adiciona os TFs altos (12h/1D/3D/1W),
+    avaliados com cache TTL e peso de relevância (no-op com a flag off)."""
+    results = list(await asyncio.gather(*[_analyze_symbol_tf(symbol, tf) for tf in SCAN_TFS]))
+    if HIGH_TF_PATTERNS_ENABLED:
+        results += list(await asyncio.gather(*[
+            _htf_signal_cached(symbol, tf, lambda tf=tf: _analyze_symbol_tf(symbol, tf))
+            for tf in HIGH_TF_LIST
+        ]))
     scored: List[tuple] = []
     for sig in results:
         if sig is None or sig.direction == SignalDirection.NEUTRAL:
@@ -1491,9 +1550,15 @@ async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[Trade
 
 
 async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
-    results = await asyncio.gather(*[
+    results = list(await asyncio.gather(*[
         _analyze_symbol_tf_server(svc, symbol, tf) for tf in SCAN_TFS
-    ])
+    ]))
+    # TFs altos (gated): avaliados com cache TTL + peso de relevância.
+    if HIGH_TF_PATTERNS_ENABLED:
+        results += list(await asyncio.gather(*[
+            _htf_signal_cached(symbol, tf, lambda tf=tf: _analyze_symbol_tf_server(svc, symbol, tf))
+            for tf in HIGH_TF_LIST
+        ]))
     scored: List[tuple] = []
     for sig in results:
         if sig is None or sig.direction == SignalDirection.NEUTRAL:

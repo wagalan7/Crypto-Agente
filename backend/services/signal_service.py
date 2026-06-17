@@ -39,6 +39,7 @@ TIMEFRAME_TRADE_TYPE = {
     "12h": TradeType.SWING,
     "1d":  TradeType.HODL,
     "3d":  TradeType.HODL,
+    "1w":  TradeType.HODL,
 }
 
 TRADE_TYPE_LABELS = {
