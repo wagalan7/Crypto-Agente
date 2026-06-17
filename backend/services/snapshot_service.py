@@ -1076,9 +1076,32 @@ async def get_daily_pnl(
         except Exception:
             return None
 
+    # Calibração score→P(TP1)/P(TP2) — sync, lê do cache, fail-soft (None se
+    # calib imatura). Mesma fonte do "P 70%" das Recomendações; expõe a métrica
+    # no card de abertos pra dar paridade de decisão. risk_reward já é coluna;
+    # confluence_pct vem do vetor de features. Tudo opcional no front.
+    try:
+        from services.calibration_service import (
+            prob_tp1_for_score_sync, prob_tp2_for_score_sync,
+        )
+    except Exception:  # pragma: no cover — fail-soft
+        prob_tp1_for_score_sync = lambda _s: None  # noqa: E731
+        prob_tp2_for_score_sync = lambda _s: None  # noqa: E731
+
+    def _decision_fields(s):
+        """Campos de auxílio à decisão (paridade com o painel de Recomendações)."""
+        feat = s.features or {}
+        return {
+            "risk_reward": s.risk_reward,
+            "prob_tp1": prob_tp1_for_score_sync(s.score),
+            "prob_tp2": prob_tp2_for_score_sync(s.score),
+            "confluence_pct": feat.get("confluence_pct"),
+        }
+
     # Detalhe por trade (resolvido + aberto, em listas separadas)
     def _serialize(s):
         return {
+            **_decision_fields(s),
             "bot_approved": _bot_approved(s),
             "symbol": s.symbol,
             "timeframe": s.timeframe,
@@ -1126,6 +1149,7 @@ async def get_daily_pnl(
             "open" if raw_status == WIDE_DISPLAY_STATUS else raw_status
         )
         return {
+            **_decision_fields(s),
             "symbol": s.symbol,
             "timeframe": s.timeframe,
             "tier": s.tier,

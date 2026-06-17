@@ -124,7 +124,9 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
           )}
           <button
             onClick={() => setUseFallback(v => !v)}
-            title={useFallback ? 'Voltar para TradingView' : 'Usar gráfico local (se TradingView não carregar)'}
+            title={useFallback
+              ? 'Modo local: desenha os padrões detectados e os níveis do sinal. Toque pra voltar ao TradingView.'
+              : 'TradingView não desenha os padrões detectados pelo bot. Use o gráfico local (📊) pra ver o padrão e os níveis desenhados.'}
             className={`text-[10px] rounded px-1.5 py-0.5 flex-shrink-0 border transition-colors ${
               useFallback
                 ? 'bg-amber-800/40 text-amber-400 border-amber-700/50 hover:bg-amber-800/60'
@@ -195,10 +197,23 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
             </>
           ) : (
             /* TradingView widget — permanece até o usuário trocar manualmente */
-            <TradingViewWidget
-              symbol={symbol}
-              interval={tf}
-            />
+            <>
+              <TradingViewWidget
+                symbol={symbol}
+                interval={tf}
+              />
+              {/* O tv.js embed não desenha overlays. Se há padrão detectado,
+                  avisa e oferece trocar pro gráfico local (que desenha). */}
+              {displaySignal?.patterns?.some(p => p.lines?.length) && (
+                <button
+                  onClick={() => setUseFallback(true)}
+                  title="O padrão detectado pelo bot não aparece no TradingView. Toque pra abrir no gráfico local com o padrão desenhado."
+                  className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-amber-500/50 bg-amber-900/80 backdrop-blur text-amber-200 text-[11px] font-semibold shadow-lg hover:bg-amber-800/90 transition-colors"
+                >
+                  📐 padrão detectado — ver desenhado no 📊 local
+                </button>
+              )}
+            </>
           )}
 
           {/* Painel de desenho + IA (disponível em ambos os modos) */}

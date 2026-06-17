@@ -16,9 +16,12 @@ const TF_MAP: Record<string, string> = {
 function toTVSymbol(symbol: string): string {
   const isPerp = symbol.includes(':')
   const base = symbol.split(':')[0].replace('/', '')
-  // Perps: tenta BYBIT primeiro (melhor cobertura de altcoins)
-  // Spots: usa BINANCE
-  return isPerp ? `BYBIT:${base}` : `BINANCE:${base}`
+  // Perps: BINANCE perpétuo (sufixo .P) — é EXATAMENTE o mercado que o bot
+  //   opera (Binance Futures USDT-M). Antes usava BYBIT, que abria o SPOT da
+  //   Bybit (mercado/preço diferentes do trade). allow_symbol_change=true deixa
+  //   o usuário trocar de corretora se algum símbolo de observação não existir.
+  // Spots: BINANCE spot.
+  return isPerp ? `BINANCE:${base}.P` : `BINANCE:${base}`
 }
 
 const DEFAULT_STUDIES = [

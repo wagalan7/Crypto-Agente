@@ -20,6 +20,12 @@ interface Trade {
   void?: boolean
   risk_pct: number
   score?: number
+  // Auxílio à decisão (paridade com o painel de Recomendações). Opcionais —
+  // backend antigo pode não enviar; calibração imatura deixa prob = null.
+  risk_reward?: number | null
+  prob_tp1?: number | null
+  prob_tp2?: number | null
+  confluence_pct?: number | null
   created_at: string
   outcome_at: string | null
   tp1_hit_at?: string | null
@@ -97,6 +103,21 @@ function fmt(n: number) {
   if (n >= 1000) return n.toFixed(2)
   if (n >= 1) return n.toFixed(4)
   return n.toFixed(6)
+}
+
+// R:R a partir dos níveis (entry/SL/TP). null se faltar dado ou risco inválido.
+// Fallback pro card quando o backend não enviou risk_reward.
+function rrFromLevels(
+  side: string,
+  entry: number | null | undefined,
+  sl: number | null | undefined,
+  tp: number | null | undefined,
+): number | null {
+  if (!entry || sl == null || tp == null) return null
+  const risk = side === 'long' ? entry - sl : sl - entry
+  const reward = side === 'long' ? tp - entry : entry - tp
+  if (risk <= 0 || reward <= 0) return null
+  return reward / risk
 }
 
 // Mesma lógica do RecommendationsPanel — manter em sincronia.
@@ -446,7 +467,13 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                   const bot = (data?.open_trades ?? [])
                   const k = (t: Trade) => `${t.symbol.split('/')[0]}_${t.timeframe}_${t.direction}`
                   const botKeys = new Set(bot.map(k))
-                  return [...bot, ...obsOpenAll.filter(t => !botKeys.has(k(t)))]
+                  const merged = [...bot, ...obsOpenAll.filter(t => !botKeys.has(k(t)))]
+                  // Escopo de DATA conforme o drill — sem isso os chips contavam
+                  // TODOS os abertos (hoje + anteriores) enquanto a lista só
+                  // mostrava os do dia, gerando contagem maior que a lista.
+                  if (drill === 'open_today') return merged.filter(t => t.created_at?.slice(0, 10) === todayStr)
+                  if (drill === 'open_older') return merged.filter(t => t.created_at?.slice(0, 10) !== todayStr)
+                  return merged
                 })()
               : [...(data?.trades ?? []), ...(data?.wide_trades ?? [])]
                   .filter(t => sign * (t.realized_r ?? 0) > 0)
@@ -614,6 +641,40 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                         </div>
                       )}
                     </div>
+
+                    {/* Auxílio à decisão — paridade com o painel de Recomendações:
+                        R:R (coluna do snapshot ou calculado de entry/SL/TP1),
+                        P(TP1)/P(TP2) calibradas e confluência. Tudo opcional. */}
+                    {(() => {
+                      const rr = t.risk_reward ?? rrFromLevels(t.direction, t.entry, t.stop_loss, t.tp1 ?? t.tp2)
+                      const hasAny = rr != null || t.prob_tp1 != null || t.confluence_pct != null
+                      if (!hasAny) return null
+                      return (
+                        <div className="mb-2 flex items-center gap-2 flex-wrap text-[10px]">
+                          {rr != null && (
+                            <span className="font-mono text-emerald-300" title="Risco/Retorno até o TP1 (calculado de entry/SL/TP1).">
+                              R:R 1:{rr.toFixed(2)}
+                            </span>
+                          )}
+                          {t.prob_tp1 != null && (
+                            <span
+                              className="font-mono text-sky-300"
+                              title="P(TP1)/P(TP2) calibradas empiricamente (score → win-rate observado). Mesma métrica do painel de Recomendações."
+                            >
+                              P {(t.prob_tp1 * 100).toFixed(0)}%
+                              {t.prob_tp2 != null && (
+                                <span className="text-green-300/80"> · TP2 {(t.prob_tp2 * 100).toFixed(0)}%</span>
+                              )}
+                            </span>
+                          )}
+                          {t.confluence_pct != null && (
+                            <span className="text-violet-300" title="Confluência de fatores técnicos no momento da recomendação.">
+                              confluência {t.confluence_pct.toFixed(0)}%
+                            </span>
+                          )}
+                        </div>
+                      )
+                    })()}
 
                     {viab && (
                       <div className="mb-2 text-[10px] flex items-center gap-2 flex-wrap">
