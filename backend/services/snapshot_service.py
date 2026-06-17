@@ -83,17 +83,34 @@ ONE_REC_PER_SYMBOL = os.getenv("ONE_REC_PER_SYMBOL", "true").strip().lower() in 
 # o learner com uma política de saída diferente da do bot real. Via env
 # pra ajustar sem mexer em código.
 _SWING_HOURS = float(os.getenv("SNAPSHOT_TIME_STOP_SWING_HOURS", "168"))
+# HODL (3d) precisa de horizonte próprio: o candle de 3d tem 72h, então 168h
+# dava só ~2,3 candles de pista antes de expirar — cortava o setup hodl (atr_mult
+# 8.0, feito pra cavalgar movimento longo) antes de ele andar. Alinhado ao 1d,
+# que ganha ~7 candles (168h/24h): 3d com ~7 candles = 504h (21 dias).
+_HODL_HOURS = float(os.getenv("SNAPSHOT_TIME_STOP_HODL_HOURS", "504"))
 TIME_STOP_HOURS_BY_TF = {
     "1m": 1, "3m": 2, "5m": 3, "15m": 4, "30m": 8,
     "1h": 12, "2h": 24,
     "4h": _SWING_HOURS, "6h": _SWING_HOURS,
     "8h": _SWING_HOURS, "12h": _SWING_HOURS, "1d": _SWING_HOURS,
+    "3d": _HODL_HOURS,
 }
 
 
 def _time_stop_hours(tf: str) -> float:
     """Horas máximas sem tocar TP1 antes de encerrar por time-stop."""
     return float(TIME_STOP_HOURS_BY_TF.get(tf, EXPIRY_HOURS))
+
+
+def _expiry_ceiling_hours(tf: str) -> float:
+    """Teto absoluto por TF: nunca menor que o time-stop do próprio TF.
+
+    EXPIRY_HOURS (168h) é o piso pra TFs curtos/médios, mas TFs longos (3d=504h)
+    têm time-stop maior que o teto — sem isto o teto de 168h sobreporia o
+    time-stop e fecharia o hodl cedo demais. max() mantém 168h pra todo mundo e
+    estende só onde o TF exige mais pista.
+    """
+    return max(EXPIRY_HOURS, _time_stop_hours(tf))
 # ── R esperado (Step 2b v2: parcial 50% no TP1 + BE+ assimétrico) ────────
 # Premissa: ao tocar TP1, fecha 50% da posição (+1R em metade), restante segue
 # com stop EFETIVO em "BE+" (entry + 0.2R lock) e trail por ATR mais largo.
@@ -688,10 +705,12 @@ async def check_open_snapshots() -> int:
                     resolved += 1
                     continue
 
-                # Ceiling absoluto (EXPIRY_HOURS, default 168h): independente de TF, fecha.
+                # Ceiling absoluto por TF (>= EXPIRY_HOURS=168h): independente de
+                # TP1, fecha. Pra TFs longos (3d=504h) o teto acompanha o
+                # time-stop do TF pra não cortar o hodl cedo demais.
                 # Step 2a: se TP1 já tinha sido tocado, expira como won_tp1 (+0.5R)
                 # — lucro parcial travado. Caso contrário, expired (0R).
-                if age > timedelta(hours=EXPIRY_HOURS):
+                if age > timedelta(hours=_expiry_ceiling_hours(snap.timeframe)):
                     if snap.tp1_hit_at is not None:
                         snap.status = "won_tp1"
                         snap.outcome_price = snap.tp1
@@ -902,8 +921,9 @@ async def check_wide_snapshots() -> int:
                     resolved += 1
                     continue
 
-                # Teto absoluto de expiração.
-                if age > timedelta(hours=EXPIRY_HOURS):
+                # Teto absoluto de expiração (por TF: >= EXPIRY_HOURS, estende
+                # pra TFs longos como 3d=504h).
+                if age > timedelta(hours=_expiry_ceiling_hours(snap.timeframe)):
                     if snap.tp1_hit_at is not None:
                         _record_wide_outcome(snap, "wide_won_tp1", snap.tp1, REALIZED_R_TP1, now)
                     else:
