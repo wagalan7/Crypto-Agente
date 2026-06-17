@@ -122,6 +122,58 @@ const EDGE_TAG_META: Record<string, { label: string; hint: string }> = {
   'MTF': { label: 'MTF', hint: 'Múltiplos timeframes alinhados (≥ 2). ~82% wr quando MTF concorda.' },
 }
 
+// Nomes legíveis (PT-BR) dos padrões gráficos — pro chip de "padrão" dizer QUAL
+// padrão foi detectado (OB, Triângulo, Cunha…) em vez do genérico "padrão".
+const PATTERN_LABEL_PT: Record<string, string> = {
+  lta: 'LTA', ltb: 'LTB',
+  ascending_channel: 'Canal de Alta', descending_channel: 'Canal de Baixa',
+  horizontal_channel: 'Canal Lateral',
+  symmetric_triangle: 'Triângulo Simétrico',
+  ascending_triangle: 'Triângulo Ascendente',
+  descending_triangle: 'Triângulo Descendente',
+  ascending_wedge: 'Cunha Ascendente', descending_wedge: 'Cunha Descendente',
+  head_and_shoulders: 'OCO', inverse_head_and_shoulders: 'OCO Invertido',
+  double_top: 'Topo Duplo', double_bottom: 'Fundo Duplo',
+  bull_flag: 'Bandeira de Alta', bear_flag: 'Bandeira de Baixa',
+  cup_and_handle: 'Xícara c/ Alça',
+}
+
+// Deriva os chips de PADRÃO a partir do signal embutido na rec: nomeia a zona
+// SMC que originou a entrada (OB/FVG/Value Area) + os padrões gráficos alinhados
+// à direção, anexando o alvo de rompimento quando houver. Substitui o chip
+// genérico "padrão".
+function patternChips(r: Recommendation): { label: string; hint: string }[] {
+  const out: { label: string; hint: string }[] = []
+  const seen = new Set<string>()
+  const zoneMeta: Record<string, { label: string; hint: string }> = {
+    limit_ob: { label: 'OB', hint: 'Order Block — zona de oferta/demanda institucional. Entrada no reteste da zona.' },
+    limit_fvg_fill: { label: 'FVG', hint: 'Fair Value Gap (imbalance) — entrada no preenchimento do gap.' },
+    limit_value_area: { label: 'Value Area', hint: 'Borda da área de valor (VAL/VAH) — reação esperada na zona.' },
+    limit_pattern_fade: { label: 'Fade de padrão', hint: 'Entrada contra o exagero do padrão (fade), aguardando reversão à média.' },
+  }
+  if (r.entry_zone_type && zoneMeta[r.entry_zone_type]) {
+    out.push(zoneMeta[r.entry_zone_type])
+    seen.add('zone')
+  }
+  const pats = [...(r.signal?.patterns ?? [])]
+    .filter(p => p.direction === r.direction || p.direction === 'neutral')
+    .sort((a, b) => b.confidence - a.confidence)
+  for (const p of pats) {
+    if (seen.has(p.type)) continue
+    seen.add(p.type)
+    const name = PATTERN_LABEL_PT[p.type] ?? p.type
+    let label = name
+    let hint = p.description || name
+    if (p.breakout_target != null) {
+      label += ` · rompe ${fmt(p.breakout_target)}`
+      hint += ` · Possível rompimento — alvo ~${fmt(p.breakout_target)}.`
+    }
+    out.push({ label, hint })
+    if (out.length >= 3) break
+  }
+  return out
+}
+
 export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, onFocusNotFound }: Props) {
   const cardRefs = useRef<Record<string, HTMLButtonElement | null>>({})
   const [highlightKey, setHighlightKey] = useState<string | null>(null)
@@ -129,6 +181,9 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
+  // Chaves (símbolo_tf_direção) dos setups que JÁ estão em "Abertos" — usadas
+  // pra esconder de Recomendados o que já virou trade aberto (item A).
+  const [openKeys, setOpenKeys] = useState<Set<string>>(new Set())
   const [filter, setFilter] = useState<RecommendationTier | 'all'>('all')
   const [originFilter, setOriginFilter] = useState<'all' | 'bot' | 'observation'>('all')
   // "Só aprovados": mostra apenas recs que passam nos gates de qualidade do bot
@@ -264,20 +319,57 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
     return () => clearInterval(id)
   }, [load])
 
+  // ── Item A: esconder de Recomendados o que JÁ virou trade aberto ──────────
+  // Busca os "Abertos" (PRD open_trades + universo amplo wide_open_trades) e
+  // monta o set de chaves. Os setups que já estão abertos somem de Recomendados
+  // no próximo ciclo — mostram-se só os que ainda NÃO foram pegos; os pegos
+  // seguem visíveis no painel "Abertos". Falha-soft: se cair, mostra todas.
+  useEffect(() => {
+    let alive = true
+    const fetchOpen = async () => {
+      try {
+        const today = new Date().toISOString().slice(0, 10)
+        const res = await fetch(`${BACKEND}/api/daily-pnl?date=${today}`, {
+          signal: AbortSignal.timeout(12000),
+        })
+        if (!res.ok) return
+        const json = (await res.json()) as {
+          open_trades?: { symbol?: string; timeframe?: string; direction?: string }[]
+          wide_open_trades?: { symbol?: string; timeframe?: string; direction?: string }[]
+        }
+        if (!alive) return
+        const keys = new Set<string>()
+        for (const t of [...(json.open_trades ?? []), ...(json.wide_open_trades ?? [])]) {
+          if (t?.symbol && t?.timeframe && t?.direction) {
+            keys.add(`${symbolBase(t.symbol)}_${t.timeframe}_${t.direction}`)
+          }
+        }
+        setOpenKeys(keys)
+      } catch { /* fail-silent */ }
+    }
+    fetchOpen()
+    const id = setInterval(fetchOpen, 120_000)
+    return () => { alive = false; clearInterval(id) }
+  }, [])
+
+  // Recs visíveis = todas menos as que já estão abertas (item A).
+  const visibleRecs = recs.filter(
+    r => !openKeys.has(`${symbolBase(r.symbol)}_${r.timeframe}_${r.direction}`)
+  )
   const counts = {
-    'A+': recs.filter(r => r.tier === 'A+').length,
-    'A':  recs.filter(r => r.tier === 'A').length,
-    'B':  recs.filter(r => r.tier === 'B').length,
+    'A+': visibleRecs.filter(r => r.tier === 'A+').length,
+    'A':  visibleRecs.filter(r => r.tier === 'A').length,
+    'B':  visibleRecs.filter(r => r.tier === 'B').length,
   }
   const originCounts = {
-    bot: recs.filter(r => r.origin === 'bot').length,
-    observation: recs.filter(r => r.origin === 'observation').length,
+    bot: visibleRecs.filter(r => r.origin === 'bot').length,
+    observation: visibleRecs.filter(r => r.origin === 'observation').length,
   }
-  const byTier = filter === 'all' ? recs : recs.filter(r => r.tier === filter)
+  const byTier = filter === 'all' ? visibleRecs : visibleRecs.filter(r => r.tier === filter)
   const byOrigin =
     originFilter === 'all' ? byTier : byTier.filter(r => (r.origin ?? 'bot') === originFilter)
   // Filtro de qualidade: só os que o bot aprovaria (passam nos gates R:R/P(TP1)/liquidez)
-  const qualityApprovedCount = recs.filter(r => r.bot_verdict?.ok === true).length
+  const qualityApprovedCount = visibleRecs.filter(r => r.bot_verdict?.ok === true).length
   const filtered = qualityOnly ? byOrigin.filter(r => r.bot_verdict?.ok === true) : byOrigin
 
   // Quando chega foco via push, scrolla até o card e destaca por ~3s.
@@ -533,7 +625,20 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
             </div>
           )}
 
-          {!loading && !error && filtered.length === 0 && (
+          {!loading && !error && filtered.length === 0 && recs.length > 0 && visibleRecs.length === 0 && (
+            <div className="flex flex-col items-center justify-center py-20 gap-3 px-4 text-center">
+              <span className="text-4xl">📂</span>
+              <p className="text-sm text-slate-300 font-semibold">
+                Setups atuais já estão em “Abertos”
+              </p>
+              <p className="text-xs text-slate-500 max-w-md">
+                Todas as recomendações da varredura já viraram trades abertos — acompanhe-as no
+                painel de Abertos. Aqui aparecem só setups novos, ainda não pegos.
+              </p>
+            </div>
+          )}
+
+          {!loading && !error && filtered.length === 0 && !(recs.length > 0 && visibleRecs.length === 0) && (
             <div className="flex flex-col items-center justify-center py-20 gap-3 px-4 text-center">
               <span className="text-4xl">🧘</span>
               <p className="text-sm text-slate-300 font-semibold">
@@ -669,9 +774,35 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                       {r.edge_tags && r.edge_tags.length > 0 && (
                         <div className="flex items-center gap-1 flex-wrap mt-1">
                           <span className="text-[9px] text-violet-400/70 font-semibold">⚡ edges:</span>
-                          {r.edge_tags.map(tag => {
+                          {r.edge_tags.flatMap(tag => {
+                            // 'padrão' genérico → nomeia o(s) padrão(ões) detectado(s)
+                            // (OB/FVG/Triângulo/Cunha…) + alvo de rompimento se houver.
+                            if (tag === 'padrão') {
+                              const chips = patternChips(r)
+                              if (chips.length === 0) {
+                                const meta = EDGE_TAG_META['padrão']
+                                return [(
+                                  <span
+                                    key="padrão"
+                                    title={meta.hint}
+                                    className="px-1.5 py-0.5 rounded text-[9px] font-bold border bg-violet-500/15 text-violet-300 border-violet-500/40 whitespace-nowrap"
+                                  >
+                                    {meta.label}
+                                  </span>
+                                )]
+                              }
+                              return chips.map((c, i) => (
+                                <span
+                                  key={`pat-${i}`}
+                                  title={c.hint}
+                                  className="px-1.5 py-0.5 rounded text-[9px] font-bold border bg-fuchsia-500/15 text-fuchsia-200 border-fuchsia-500/40 whitespace-nowrap"
+                                >
+                                  {c.label}
+                                </span>
+                              ))
+                            }
                             const meta = EDGE_TAG_META[tag] ?? { label: tag, hint: 'Sinal de convicção' }
-                            return (
+                            return [(
                               <span
                                 key={tag}
                                 title={meta.hint}
@@ -679,7 +810,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                               >
                                 {meta.label}
                               </span>
-                            )
+                            )]
                           })}
                         </div>
                       )}

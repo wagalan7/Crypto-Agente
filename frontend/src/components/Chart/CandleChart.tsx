@@ -242,35 +242,94 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
       if (!signal) return
 
       const timeUnit = candles.length > 1 ? candles[1].timestamp - candles[0].timestamp : 3600000
+      const firstTs = candles[0].timestamp
+      const lastTs = candles[candles.length - 1].timestamp
+      const lastClose = candles[candles.length - 1].close
 
-      signal.patterns.forEach(pattern => {
-        if (!pattern.lines?.length) return
-        const color = PATTERN_COLORS[pattern.type] || '#a78bfa'
-        pattern.lines.forEach(lineData => {
-          if (lineData.length === 4) {
-            const [x0, y0, x1, y1] = lineData
-            const t0 = Math.floor((candles[0].timestamp + x0 * timeUnit) / 1000) as Time
-            const t1 = Math.floor((candles[0].timestamp + x1 * timeUnit) / 1000) as Time
-            const s = chartRef.current!.addLineSeries({
-              color, lineWidth: 1, lineStyle: LineStyle.Dashed,
-              priceLineVisible: false, lastValueVisible: false,
-            })
-            s.setData([{ time: t0, value: y0 }, { time: t1, value: y1 }])
-            patternLinesRef.current.push(s)
-          }
-        })
-        if (pattern.points.length > 0 && candleSeriesRef.current) {
-          try {
-            candleSeriesRef.current.setMarkers(
-              pattern.points.map(pt => ({
-                time: Math.floor(pt.timestamp / 1000) as Time,
-                position: (pattern.direction === 'long' ? 'belowBar' : 'aboveBar') as 'belowBar' | 'aboveBar',
-                color, shape: 'circle' as const, size: 1,
-              }))
-            )
-          } catch {}
+      // ── Zonas SMC (Order Blocks / FVG) — bandas horizontais ───────────────
+      // Estes são os "padrões" nomeados no card (ex.: Order Block / FVG). Antes
+      // não eram desenhados; o chart mostrava só as diagonais (LTB/canal/cunha),
+      // que pareciam "desconfiguradas" pra quem esperava uma zona horizontal.
+      // Desenha topo+fundo como linhas horizontais, só as zonas ativas perto do
+      // preço (≤12%) e no máx. 3, pra não poluir.
+      const drawZone = (top: number, bottom: number, tsStart: number, color: string) => {
+        const tStart = Math.floor(Math.max(firstTs, tsStart) / 1000) as Time
+        const tEnd = Math.floor(lastTs / 1000) as Time
+        for (const price of [top, bottom]) {
+          const s = chartRef.current!.addLineSeries({
+            color, lineWidth: 1, lineStyle: LineStyle.Solid,
+            priceLineVisible: false, lastValueVisible: false,
+          })
+          s.setData([{ time: tStart, value: price }, { time: tEnd, value: price }])
+          patternLinesRef.current.push(s)
         }
+      }
+      const smcZones = [
+        ...(signal.smc?.order_blocks ?? []),
+        ...(signal.smc?.fvgs ?? []),
+      ]
+        .filter(z =>
+          z.active && lastClose > 0 &&
+          Math.abs((z.top + z.bottom) / 2 - lastClose) / lastClose <= 0.12
+        )
+        .sort((a, b) =>
+          Math.abs((a.top + a.bottom) / 2 - lastClose) -
+          Math.abs((b.top + b.bottom) / 2 - lastClose)
+        )
+        .slice(0, 3)
+      smcZones.forEach(z => {
+        const color = z.direction === 'bullish' ? 'rgba(34,197,94,0.85)' : 'rgba(239,68,68,0.85)'
+        drawZone(z.top, z.bottom, z.timestamp, color)
       })
+
+      // ── Padrões geométricos (LTA/LTB/canais/cunhas/triângulos) ────────────
+      // Só os alinhados à direção do sinal (ou neutros) e com dedupe de linhas
+      // idênticas — o backend pode emitir canal e cunha com a MESMA geometria,
+      // o que dobrava as diagonais na tela.
+      const seenLines = new Set<string>()
+      const markers: {
+        time: Time
+        position: 'belowBar' | 'aboveBar'
+        color: string
+        shape: 'circle'
+        size: number
+      }[] = []
+      signal.patterns
+        .filter(p => p.direction === signal.direction || p.direction === 'neutral')
+        .forEach(pattern => {
+          const color = PATTERN_COLORS[pattern.type] || '#a78bfa'
+          if (pattern.lines?.length) {
+            pattern.lines.forEach(lineData => {
+              if (lineData.length !== 4) return
+              const key = lineData.map(v => Math.round(v * 100) / 100).join(',')
+              if (seenLines.has(key)) return
+              seenLines.add(key)
+              const [x0, y0, x1, y1] = lineData
+              const p0 = { t: Math.floor((firstTs + x0 * timeUnit) / 1000), v: y0 }
+              const p1 = { t: Math.floor((firstTs + x1 * timeUnit) / 1000), v: y1 }
+              const [a, b] = p0.t <= p1.t ? [p0, p1] : [p1, p0]
+              const s = chartRef.current!.addLineSeries({
+                color, lineWidth: 1, lineStyle: LineStyle.Dashed,
+                priceLineVisible: false, lastValueVisible: false,
+              })
+              s.setData([{ time: a.t as Time, value: a.v }, { time: b.t as Time, value: b.v }])
+              patternLinesRef.current.push(s)
+            })
+          }
+          pattern.points.forEach(pt => {
+            markers.push({
+              time: Math.floor(pt.timestamp / 1000) as Time,
+              position: pattern.direction === 'long' ? 'belowBar' : 'aboveBar',
+              color, shape: 'circle', size: 1,
+            })
+          })
+        })
+      if (candleSeriesRef.current) {
+        try {
+          markers.sort((a, b) => (a.time as number) - (b.time as number))
+          candleSeriesRef.current.setMarkers(markers)
+        } catch {}
+      }
 
       if (!candleSeriesRef.current) return
       const lastTime = Math.floor(candles[candles.length - 1].timestamp / 1000) as Time
