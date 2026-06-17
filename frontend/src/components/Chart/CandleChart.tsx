@@ -259,6 +259,7 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
           const s = chartRef.current!.addLineSeries({
             color, lineWidth: 1, lineStyle: LineStyle.Solid,
             priceLineVisible: false, lastValueVisible: false,
+            autoscaleInfoProvider: () => null,
           })
           s.setData([{ time: tStart, value: price }, { time: tEnd, value: price }])
           patternLinesRef.current.push(s)
@@ -283,9 +284,20 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
       })
 
       // ── Padrões geométricos (LTA/LTB/canais/cunhas/triângulos) ────────────
-      // Só os alinhados à direção do sinal (ou neutros) e com dedupe de linhas
-      // idênticas — o backend pode emitir canal e cunha com a MESMA geometria,
-      // o que dobrava as diagonais na tela.
+      // Antes desenhava TODO padrão alinhado à direção, e o backend costuma
+      // emitir canal+cunha+triângulo ajustados aos MESMOS pivôs → várias
+      // diagonais quase-paralelas amontoadas ("desconfigurado"). Além disso o
+      // x das linhas é um ÍNDICE de barra no df do backend; mapear via
+      // `firstTs + x*timeUnit` assume candle[0] do front == barra[0] do back,
+      // o que desalinha a linha no eixo do tempo. Correções:
+      //  1) só os 2 padrões de MAIOR confiança (= os que o card nomeia);
+      //  2) índice→tempo ancorado num PIVÔ real (point.index/timestamp), robusto
+      //     a qualquer offset entre as séries do front e do back;
+      //  3) projeta a linha até a barra atual (lê como trendline chegando no
+      //     preço, em vez de segmento flutuando no meio do gráfico);
+      //  4) dedupe por (slope, intercepto) — colapsa linhas redundantes mas
+      //     preserva as 2 paralelas distintas de um canal;
+      //  5) overlays não entram no autoscale (não distorcem os candles).
       const seenLines = new Set<string>()
       const markers: {
         time: Time
@@ -296,21 +308,44 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
       }[] = []
       signal.patterns
         .filter(p => p.direction === signal.direction || p.direction === 'neutral')
+        .slice()
+        .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))
+        .slice(0, 2)
         .forEach(pattern => {
           const color = PATTERN_COLORS[pattern.type] || '#a78bfa'
+          // Âncora índice→tempo: usa um pivô real do próprio padrão. Fallback
+          // pro mapeamento ingênuo se o padrão não trouxer points.
+          const anchor = pattern.points?.[0]
+          const idxToTime = (x: number): number =>
+            anchor
+              ? Math.floor((anchor.timestamp + (x - anchor.index) * timeUnit) / 1000)
+              : Math.floor((firstTs + x * timeUnit) / 1000)
+          // Índice (no espaço do backend) da última barra, p/ projetar a linha.
+          const lastIdx = anchor
+            ? anchor.index + Math.round((lastTs - anchor.timestamp) / timeUnit)
+            : null
           if (pattern.lines?.length) {
             pattern.lines.forEach(lineData => {
               if (lineData.length !== 4) return
-              const key = lineData.map(v => Math.round(v * 100) / 100).join(',')
+              const [x0, y0, x1, y1] = lineData
+              const dx = x1 - x0
+              if (dx === 0) return
+              const slope = (y1 - y0) / dx
+              const intercept = y0 - slope * x0
+              // dedupe por geometria (slope + intercepto), tolerante a ruído
+              const key = `${slope.toExponential(2)}|${Math.round(intercept)}`
               if (seenLines.has(key)) return
               seenLines.add(key)
-              const [x0, y0, x1, y1] = lineData
-              const p0 = { t: Math.floor((firstTs + x0 * timeUnit) / 1000), v: y0 }
-              const p1 = { t: Math.floor((firstTs + x1 * timeUnit) / 1000), v: y1 }
+              // projeta o fim da linha até a barra atual
+              const xEnd = lastIdx != null ? Math.max(x1, lastIdx) : x1
+              const yEnd = y0 + slope * (xEnd - x0)
+              const p0 = { t: idxToTime(x0), v: y0 }
+              const p1 = { t: idxToTime(xEnd), v: yEnd }
               const [a, b] = p0.t <= p1.t ? [p0, p1] : [p1, p0]
               const s = chartRef.current!.addLineSeries({
                 color, lineWidth: 1, lineStyle: LineStyle.Dashed,
                 priceLineVisible: false, lastValueVisible: false,
+                autoscaleInfoProvider: () => null,
               })
               s.setData([{ time: a.t as Time, value: a.v }, { time: b.t as Time, value: b.v }])
               patternLinesRef.current.push(s)
