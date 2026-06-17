@@ -1082,8 +1082,12 @@ async def get_daily_pnl(
     # confluence_pct vem do vetor de features. Tudo opcional no front.
     try:
         from services.calibration_service import (
-            prob_tp1_for_score_sync, prob_tp2_for_score_sync,
+            get_calibration, prob_tp1_for_score_sync, prob_tp2_for_score_sync,
         )
+        # Aquece o cache de calibração (sync lê só dele). Barato: guardado por
+        # TTL — quase sempre hit. Sem isso, num processo recém-deployado o
+        # cache pode estar frio e P(TP1) sairia None pra todos os abertos.
+        await get_calibration()
     except Exception:  # pragma: no cover — fail-soft
         prob_tp1_for_score_sync = lambda _s: None  # noqa: E731
         prob_tp2_for_score_sync = lambda _s: None  # noqa: E731
