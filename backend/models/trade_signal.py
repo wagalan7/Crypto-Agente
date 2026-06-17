@@ -55,6 +55,11 @@ class DetectedPattern(BaseModel):
     breakout_confirmed: bool = False
     # Volume na vela do rompimento vs média 20 candles (>1.5 = volume forte)
     breakout_volume_ratio: Optional[float] = None
+    # Retest re-arm: o preço rompeu este nível há N velas, voltou e está
+    # retestando a linha rompida (suporte/resistência invertido) — a entrada
+    # "limpa" de pullback. Setado por record_breakouts_and_retests (gated por
+    # RETEST_REARM_ENABLED). Padrões sintéticos de retest têm esta flag True.
+    retest_active: bool = False
 
 
 class Indicator(BaseModel):

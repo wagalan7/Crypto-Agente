@@ -445,6 +445,15 @@ SCORE_ADJUSTER_CAP = float(os.getenv("SCORE_ADJUSTER_CAP", "20"))
 PROXIMITY_GATE_ENABLED = os.getenv("PROXIMITY_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 PROXIMITY_MAX_ATR = float(os.getenv("PROXIMITY_MAX_ATR", "1.0"))
 
+# ── Anti-chase ESTRUTURAL (gated, DEFAULT-OFF) ──────────────────────────────
+# O proximity gate acima mede distância do PLANO de entrada — não pega o setup
+# que nasce esticado (entry≈mercado após pernada longa, caso HYPE). Este mede o
+# esticamento desde a BASE do movimento (struct_chase_atr, vem da rec). Bloqueia
+# abrir quando a perna já correu >= teto em ATR. ISENTA retest re-arm (entrada
+# limpa no pullback à linha rompida — aí o preço VOLTOU pra perto da base).
+STRUCT_CHASE_GATE_ENABLED = os.getenv("STRUCT_CHASE_GATE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+STRUCT_CHASE_MAX_ATR = float(os.getenv("STRUCT_CHASE_MAX_ATR", "5.0"))
+
 # ── R:R gate (geometria estrutural) ─────────────────────────────────────────
 # O entry_planner já calcula stop/TP por estrutura (swing low/high, OB, pools de
 # liquidez). Mas até aqui um setup com stop longe e alvo perto (R:R fraco) abria
@@ -2302,6 +2311,22 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     )
                     log.info(f"[proximity-gate] {rec.get('symbol')} {reason} — skip")
                     _record_skip(rec, "proximity", reason)
+                    continue
+
+            # ── Anti-chase ESTRUTURAL: perna esticada desde a base → skip.
+            # Isenta retest re-arm (entrada limpa no pullback, preço já voltou).
+            if STRUCT_CHASE_GATE_ENABLED and not rec.get("retest_armed"):
+                _sc = rec.get("struct_chase_atr")
+                try:
+                    _sc_f = float(_sc) if _sc is not None else None
+                except Exception:
+                    _sc_f = None
+                if _sc_f is not None and _sc_f >= STRUCT_CHASE_MAX_ATR:
+                    reason = (
+                        f"perna {_sc_f:.2f}×ATR desde a base (>= {STRUCT_CHASE_MAX_ATR}) — esticado, risco de topo"
+                    )
+                    log.info(f"[struct-chase-gate] {rec.get('symbol')} {reason} — skip")
+                    _record_skip(rec, "struct_chase", reason)
                     continue
 
             # ── ATR gate (Fase B Lite): atr_pct > 3 → -10.6pp lift, skip.

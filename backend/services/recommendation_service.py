@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 from services.binance_service import fetch_top_volume_symbols, fetch_ohlcv, fetch_ticker
 from services.indicator_service import calculate_indicators
-from services.pattern_service import detect_all_patterns
+from services.pattern_service import detect_all_patterns, record_breakouts_and_retests
 from services.signal_service import build_trade_signal, determine_direction
 from services.derivatives_service import analyze_derivatives
 from services.mtf_service import analyze_mtf
@@ -33,6 +33,15 @@ from models.trade_signal import TradeSignal, SignalDirection
 
 
 SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
+
+# ── Chase estrutural (gated) ─────────────────────────────────────────────────
+# Mede o esticamento do preço desde a BASE do movimento (pivot estrutural), não
+# só do plano de entrada. DEFAULT-OFF: sem a flag, struct_chase_* fica None e
+# nada muda. Tetos em múltiplos de ATR (a perna inteira é mais larga que a
+# distância entry→preço, por isso os limites são maiores que o anti-chase de plano).
+STRUCT_CHASE_ENABLED = os.getenv("STRUCT_CHASE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+STRUCT_CHASE_CHASING_ATR = float(os.getenv("STRUCT_CHASE_CHASING_ATR", "5.0"))   # 🔴 esticado demais
+STRUCT_CHASE_EXTENDED_ATR = float(os.getenv("STRUCT_CHASE_EXTENDED_ATR", "3.0")) # 🟡 levemente esticado
 # Concorrência do server-scan (símbolos em paralelo). Default 6. Com top_n alto
 # (ex.: 500) via proxy, subir p/ ~14 mantém o ciclo perto de 90s. Env-driven.
 try:
@@ -134,6 +143,16 @@ class Recommendation(BaseModel):
     current_price: Optional[float] = None     # preço de mercado no momento da varredura
     chase_atr: Optional[float] = None         # múltiplos de ATR entre current_price e entry (signed a favor)
     chase_level: Optional[str] = None         # "ok" | "extended" | "chasing"
+    # ── Chase ESTRUTURAL (gated STRUCT_CHASE_ENABLED) ─────────────────────
+    # O chase_atr acima mede distância do PLANO de entrada — não pega o setup
+    # que já nasce esticado (entry≈mercado após pernada longa). Este mede o
+    # esticamento desde a BASE do movimento (pivot estrutural): para long,
+    # (preço − pivot_low)/ATR; para short, (pivot_high − preço)/ATR. Alto =
+    # comprou/vendeu longe da origem → pior expectância (caso HYPE).
+    struct_chase_atr: Optional[float] = None
+    struct_chase_level: Optional[str] = None  # "ok" | "extended" | "chasing"
+    # Origem retest re-arm: a rec veio de um pullback à linha rompida (entrada limpa).
+    retest_armed: Optional[bool] = None
     # P(TP1) calibrada via calibration_service — None se calib não está pronta
     # (precisa de ≥30 snapshots resolvidos nos últimos 90 dias).
     prob_tp1: Optional[float] = None          # 0..1 — exibido no card como %
@@ -312,11 +331,13 @@ def _compute_score(sig: TradeSignal) -> float:
     # Bonus de rompimento confirmado com volume — gatilho técnico forte.
     # +5pts se algum padrão a favor da direção tem breakout_confirmed=True.
     # Cap em +5 (não acumula entre múltiplos padrões).
+    # Inclui retest_active (pullback à linha rompida) — só fica True quando
+    # RETEST_REARM_ENABLED, então é naturalmente gated (no-op com a flag off).
     breakout_bonus = 0.0
     if sig.patterns:
         for p in sig.patterns:
             if (
-                getattr(p, "breakout_confirmed", False)
+                (getattr(p, "breakout_confirmed", False) or getattr(p, "retest_active", False))
                 and p.direction == sig.direction
             ):
                 breakout_bonus = 5.0
@@ -688,6 +709,8 @@ async def _analyze_symbol_tf(symbol: str, tf: str) -> Optional[TradeSignal]:
             return None
         ind = calculate_indicators(df)
         patterns = detect_all_patterns(df)
+        # Retest re-arm (gated): re-dispara entrada no pullback à linha rompida.
+        record_breakouts_and_retests(symbol, tf, df, patterns)
         current = float(df["close"].iloc[-1])
         primary_dir = determine_direction(ind, patterns, current)
 
@@ -994,10 +1017,40 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         else:
             chase_level = "ok"          # 🟢 perto do entry ou abaixo
 
+    # Chase ESTRUTURAL (gated): esticamento desde a base do movimento.
+    struct_chase_atr = None
+    struct_chase_level = None
+    if STRUCT_CHASE_ENABLED and cp is not None and atr and atr > 0 and sig.indicators:
+        base = sig.indicators.pivot_low if is_long else sig.indicators.pivot_high
+        if base is not None and base > 0:
+            sdelta = (cp - base) if is_long else (base - cp)
+            struct_chase_atr = round(sdelta / atr, 2)
+            if struct_chase_atr >= STRUCT_CHASE_CHASING_ATR:
+                struct_chase_level = "chasing"
+            elif struct_chase_atr >= STRUCT_CHASE_EXTENDED_ATR:
+                struct_chase_level = "extended"
+            else:
+                struct_chase_level = "ok"
+
+    # Origem retest re-arm: algum padrão a favor da direção é um retest ativo?
+    retest_armed = None
+    try:
+        if sig.patterns:
+            retest_armed = any(
+                getattr(p, "retest_active", False) and p.direction == sig.direction
+                for p in sig.patterns
+            ) or None
+    except Exception:
+        retest_armed = None
+
     warnings = (tp or {}).get("quality_warnings", []) if tp else []
     if chase_level == "chasing":
         warnings = warnings + [
             f"⚠ Preço {chase_atr}×ATR acima do entry — esperar pullback à zona ou pular."
+        ]
+    if struct_chase_level == "chasing":
+        warnings = warnings + [
+            f"⚠ Preço {struct_chase_atr}×ATR acima da base do movimento — pernada esticada, risco de comprar topo."
         ]
 
     # P(TP1)/P(TP2) calibradas — lookup sync no cache (None se calib não pronta)
@@ -1099,6 +1152,9 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         current_price=cp,
         chase_atr=chase_atr,
         chase_level=chase_level,
+        struct_chase_atr=struct_chase_atr,
+        struct_chase_level=struct_chase_level,
+        retest_armed=retest_armed,
         prob_tp1=prob_tp1,
         prob_tp2=prob_tp2,
         suggested_size_pct=suggested_size_pct,
@@ -1133,6 +1189,8 @@ async def _analyze_candles_for_tf(
             return None
         ind = calculate_indicators(df)
         patterns = detect_all_patterns(df)
+        # Retest re-arm (gated): re-dispara entrada no pullback à linha rompida.
+        record_breakouts_and_retests(symbol, tf, df, patterns)
         current = float(df["close"].iloc[-1])
         primary_dir = determine_direction(ind, patterns, current)
 
@@ -1419,6 +1477,8 @@ async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[Trade
             return None
         ind = calculate_indicators(df)
         patterns = detect_all_patterns(df)
+        # Retest re-arm (gated): re-dispara entrada no pullback à linha rompida.
+        record_breakouts_and_retests(symbol, tf, df, patterns)
         # Derivativos/MTF: só se a fonte for futures (tem funding/OI)
         derivatives = None
         mtf = None

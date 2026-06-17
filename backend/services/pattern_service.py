@@ -1,7 +1,9 @@
+import os
+import time
 import numpy as np
 import pandas as pd
 from scipy.signal import argrelextrema
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from models.trade_signal import DetectedPattern, PatternType, PatternPoint, SignalDirection
 
 
@@ -444,3 +446,128 @@ def detect_all_patterns(df: pd.DataFrame) -> List[DetectedPattern]:
     # Anota rompimento real (com volume) na última vela
     annotate_breakouts(top, df)
     return top
+
+
+# ─── Retest re-arm (memória de rompimento entre scans) ───────────────────────
+# PROBLEMA: annotate_breakouts só marca breakout_confirmed na VELA EXATA do
+# rompimento. Quando o preço rompe e faz pullback (a entrada limpa), na varredura
+# seguinte o rompimento já "expirou" — o bot/app não vê a oportunidade de retest.
+# SOLUÇÃO: guardar rompimentos confirmados por (symbol, tf) por N velas e, quando
+# o preço volta e testa a linha rompida (suporte/resistência invertido), gerar um
+# padrão sintético com retest_active=True. DEFAULT-OFF: no-op total quando a flag
+# está desligada (não constrói memória, não muda nada).
+RETEST_REARM_ENABLED = os.getenv("RETEST_REARM_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+RETEST_MEMORY_BARS = int(os.getenv("RETEST_MEMORY_BARS", "10"))   # validade do rompimento (em velas)
+RETEST_TOL_PCT = float(os.getenv("RETEST_TOL_PCT", "0.4")) / 100.0  # tolerância de toque na linha
+
+# {(symbol, tf): [memo, ...]} — module-level, sobrevive enquanto o processo roda
+# (reset em redeploy, aceitável: o rompimento é re-gravado no próximo scan).
+_BREAKOUT_MEM: Dict[Tuple[str, str], List[dict]] = {}
+
+# Segundos por timeframe — pra calcular validade temporal do rompimento.
+_TF_SECONDS = {
+    "1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200,
+    "4h": 14400, "6h": 21600, "8h": 28800, "12h": 43200, "1d": 86400,
+    "3d": 259200, "1w": 604800,
+}
+
+
+def _pattern_key_level(p: DetectedPattern) -> Optional[float]:
+    """Nível-chave do padrão (mesma lógica de annotate_breakouts)."""
+    try:
+        if p.breakout_target is not None and p.points:
+            return float(p.points[-1].price)
+        if p.lines and len(p.lines) >= 1 and p.lines[0]:
+            return float(p.lines[0][-1])
+        if p.points:
+            return float(p.points[-1].price)
+    except Exception:
+        return None
+    return None
+
+
+def record_breakouts_and_retests(
+    symbol: str, tf: str, df: pd.DataFrame, patterns: List[DetectedPattern]
+) -> List[DetectedPattern]:
+    """Grava rompimentos confirmados e re-dispara o sinal no retest da linha.
+
+    Muta `patterns` in-place (anexa padrões sintéticos de retest) e os retorna.
+    DEFAULT-OFF: se RETEST_REARM_ENABLED for False, retorna sem efeito algum.
+    """
+    if not RETEST_REARM_ENABLED:
+        return patterns
+    try:
+        if df is None or len(df) < 2:
+            return patterns
+        key = (symbol, tf)
+        now_ts = float(df["timestamp"].iloc[-1]) if "timestamp" in df.columns else time.time()
+        tf_sec = _TF_SECONDS.get(tf, 3600)
+        ttl = tf_sec * max(1, RETEST_MEMORY_BARS)
+        last = df.iloc[-1]
+        last_high = float(last["high"]); last_low = float(last["low"]); last_close = float(last["close"])
+
+        memos = _BREAKOUT_MEM.get(key, [])
+        # 1) Expira memos velhos
+        memos = [m for m in memos if (now_ts - m["ts"]) <= ttl]
+
+        # 2) Grava rompimentos confirmados desta vela (dedup por nível ~0.2%)
+        for p in patterns:
+            if not getattr(p, "breakout_confirmed", False):
+                continue
+            lvl = _pattern_key_level(p)
+            if lvl is None or lvl <= 0:
+                continue
+            direction = p.direction.value if hasattr(p.direction, "value") else str(p.direction)
+            if direction not in ("long", "short"):
+                continue
+            dup = any(
+                m["direction"] == direction and abs(m["level"] - lvl) / lvl < 0.002
+                for m in memos
+            )
+            if not dup:
+                memos.append({
+                    "ptype": p.type.value if hasattr(p.type, "value") else str(p.type),
+                    "direction": direction,
+                    "level": lvl,
+                    "target": float(p.breakout_target) if p.breakout_target is not None else None,
+                    "ts": now_ts,
+                    "retested": False,
+                })
+
+        # 3) Detecta retest na vela atual (não na vela do próprio rompimento)
+        appended: List[DetectedPattern] = []
+        for m in memos:
+            if m["retested"] or (now_ts - m["ts"]) < tf_sec * 0.5:
+                continue  # já consumido ou ainda é a vela do rompimento
+            lvl = m["level"]; tol = lvl * RETEST_TOL_PCT
+            hit = False
+            if m["direction"] == "long":
+                # Resistência rompida vira suporte: preço dipou até a linha e segurou acima.
+                hit = (last_low <= lvl + tol) and (last_close >= lvl - tol)
+            else:
+                # Suporte rompido vira resistência: preço subiu até a linha e foi rejeitado.
+                hit = (last_high >= lvl - tol) and (last_close <= lvl + tol)
+            if not hit:
+                continue
+            m["retested"] = True
+            sdir = SignalDirection.LONG if m["direction"] == "long" else SignalDirection.SHORT
+            idx_last = len(df) - 1
+            appended.append(DetectedPattern(
+                type=PatternType(m["ptype"]) if m["ptype"] in PatternType._value2member_map_ else PatternType.LTA,
+                confidence=0.80,
+                direction=sdir,
+                points=[PatternPoint(index=idx_last, timestamp=int(now_ts), price=lvl)],
+                lines=[[float(idx_last - 1), lvl, float(idx_last), lvl]],
+                description=f"Retest de rompimento ({m['ptype']}) — pullback à linha rompida em {lvl:.6g} (re-arm)",
+                breakout_target=m["target"],
+                breakout_confirmed=False,
+                retest_active=True,
+            ))
+
+        _BREAKOUT_MEM[key] = memos
+        if appended:
+            patterns.extend(appended)
+    except Exception:
+        # Fail-soft: qualquer erro no re-arm NÃO pode quebrar o scan/recs.
+        return patterns
+    return patterns
