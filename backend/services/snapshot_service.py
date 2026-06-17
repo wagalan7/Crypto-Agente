@@ -195,6 +195,13 @@ def _extract_features(rec: Dict[str, Any], created_at: datetime) -> Dict[str, An
         # o veredito EXATO da decisão (não um recompute aproximado). None se a rec
         # não trouxe bot_verdict.
         "bot_verdict_ok": (rec.get("bot_verdict") or {}).get("ok"),
+        # Tipo da zona de entrada (Order Block / FVG / Value Area…) — pro card de
+        # Abertos nomear o padrão igual ao painel de Recomendações. Só novos
+        # snapshots terão; antigos saem como None (fail-soft no front).
+        "entry_zone_type": (
+            rec.get("entry_zone_type")
+            or ((sig.get("trade_plan") or {}).get("entry_zone") or {}).get("type")
+        ),
     }
 
 
@@ -1154,6 +1161,10 @@ async def get_daily_pnl(
                     )
                 )
             ),
+            # Padrões detectados no momento da criação (nomes de tipo) + zona de
+            # entrada — pra o card de Abertos nomear o padrão igual Recomendações.
+            "patterns": (s.features or {}).get("patterns") or [],
+            "entry_zone_type": (s.features or {}).get("entry_zone_type"),
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "outcome_at": s.outcome_at.isoformat() if s.outcome_at else None,
             "tp1_hit_at": s.tp1_hit_at.isoformat() if s.tp1_hit_at else None,
@@ -1189,6 +1200,8 @@ async def get_daily_pnl(
             "score": s.score,
             "bot_approved": _bot_approved(s),
             "origin": "observation",
+            "patterns": (s.features or {}).get("patterns") or [],
+            "entry_zone_type": (s.features or {}).get("entry_zone_type"),
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "outcome_at": s.outcome_at.isoformat() if s.outcome_at else None,
             "tp1_hit_at": s.tp1_hit_at.isoformat() if s.tp1_hit_at else None,

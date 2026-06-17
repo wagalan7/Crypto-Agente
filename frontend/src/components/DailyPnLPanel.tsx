@@ -35,6 +35,11 @@ interface Trade {
   // Passaria nos gates de QUALIDADE do bot (R:R/P(TP1)/liquidez) — mesmo
   // veredito do "Só aprovados pelo bot" das Recomendações. Vem do backend.
   bot_approved?: boolean
+  // Padrões detectados (nomes de tipo) + zona de entrada — pra nomear o padrão
+  // igual ao painel de Recomendações. Opcionais (backend antigo/snapshot antigo
+  // pode não enviar).
+  patterns?: string[] | null
+  entry_zone_type?: string | null
 }
 
 interface DailyPnL {
@@ -75,6 +80,55 @@ interface ViabilityItem {
   created_at: string | null
 }
 
+// Nomes legíveis (PT-BR) + viés direcional dos padrões — pro card de Abertos
+// nomear o padrão igual ao painel de Recomendações.
+const PATTERN_LABEL_PT: Record<string, string> = {
+  lta: 'LTA', ltb: 'LTB',
+  ascending_channel: 'Canal de Alta', descending_channel: 'Canal de Baixa',
+  horizontal_channel: 'Canal Lateral',
+  symmetric_triangle: 'Triângulo Simétrico',
+  ascending_triangle: 'Triângulo Ascendente',
+  descending_triangle: 'Triângulo Descendente',
+  ascending_wedge: 'Cunha Ascendente', descending_wedge: 'Cunha Descendente',
+  head_and_shoulders: 'OCO', inverse_head_and_shoulders: 'OCO Invertido',
+  double_top: 'Topo Duplo', double_bottom: 'Fundo Duplo',
+  bull_flag: 'Bandeira de Alta', bear_flag: 'Bandeira de Baixa',
+  cup_and_handle: 'Xícara c/ Alça',
+}
+const PATTERN_DIR: Record<string, 'long' | 'short' | 'neutral'> = {
+  lta: 'long', ltb: 'short',
+  ascending_channel: 'long', descending_channel: 'short', horizontal_channel: 'neutral',
+  symmetric_triangle: 'neutral', ascending_triangle: 'long', descending_triangle: 'short',
+  ascending_wedge: 'short', descending_wedge: 'long',
+  head_and_shoulders: 'short', inverse_head_and_shoulders: 'long',
+  double_top: 'short', double_bottom: 'long',
+  bull_flag: 'long', bear_flag: 'short', cup_and_handle: 'long',
+}
+const ZONE_LABEL_PT: Record<string, string> = {
+  limit_ob: 'OB', limit_fvg_fill: 'FVG', limit_value_area: 'Value Area',
+  limit_pattern_fade: 'Fade de padrão',
+}
+
+// Deriva os chips de PADRÃO de um trade: zona de entrada (OB/FVG…) + padrões
+// gráficos alinhados à direção, deduplicados e limitados.
+function tradePatternChips(t: Trade): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  if (t.entry_zone_type && ZONE_LABEL_PT[t.entry_zone_type]) {
+    out.push(ZONE_LABEL_PT[t.entry_zone_type])
+    seen.add('zone')
+  }
+  for (const p of t.patterns ?? []) {
+    if (seen.has(p)) continue
+    seen.add(p)
+    const dir = PATTERN_DIR[p] ?? 'neutral'
+    if (dir !== 'neutral' && dir !== t.direction) continue
+    out.push(PATTERN_LABEL_PT[p] ?? p)
+    if (out.length >= 3) break
+  }
+  return out
+}
+
 const VIABILITY_BADGE: Record<string, { label: string; cls: string }> = {
   valid:    { label: '🟢 viável',    cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' },
   wait:     { label: '🟡 aguarde pullback', cls: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/40' },
@@ -87,6 +141,8 @@ interface Props {
   // Foco vindo de push de outcome (TP1/TP2/stop/BE+/expirou).
   // Roteia pro drill correto e destaca o card.
   focus?: { symbol: string; timeframe: string; event?: string } | null
+  // Clique no símbolo abre o gráfico do ativo (paridade com Recomendações).
+  onSelectSymbol?: (symbol: string, timeframe: string) => void
 }
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
@@ -155,7 +211,7 @@ const VOID_REASON = 'Indicação descartada/substituída pouco depois de criada 
 
 type DrillKind = 'wins' | 'losses' | 'open' | 'open_today' | 'open_older' | 'all' | null
 
-export default function DailyPnLPanel({ onClose, focus }: Props) {
+export default function DailyPnLPanel({ onClose, focus, onSelectSymbol }: Props) {
   const [date, setDate] = useState(todayISO())
   const [endDate, setEndDate] = useState(todayISO())
   const [data, setData] = useState<DailyPnL | null>(null)
@@ -592,7 +648,18 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                         </span>
                       )}
                       <DirIcon className={`w-4 h-4 ${isLong ? 'text-green-400' : 'text-red-400'}`} />
-                      <span className="text-sm font-bold text-white">{t.symbol.split('/')[0]}</span>
+                      {onSelectSymbol ? (
+                        <button
+                          type="button"
+                          onClick={() => onSelectSymbol(t.symbol, t.timeframe)}
+                          title="Abrir gráfico do ativo"
+                          className="text-sm font-bold text-white hover:text-sky-300 hover:underline transition-colors cursor-pointer"
+                        >
+                          {t.symbol.split('/')[0]}
+                        </button>
+                      ) : (
+                        <span className="text-sm font-bold text-white">{t.symbol.split('/')[0]}</span>
+                      )}
                       {mtfSiblings > 1 && (
                         <span
                           className="text-[9px] font-bold text-purple-300 bg-purple-900/30 border border-purple-700/50 px-1.5 py-0.5 rounded"
@@ -672,6 +739,26 @@ export default function DailyPnLPanel({ onClose, focus }: Props) {
                               confluência {t.confluence_pct.toFixed(0)}%
                             </span>
                           )}
+                        </div>
+                      )
+                    })()}
+
+                    {/* Padrões detectados — paridade com Recomendações: zona de
+                        entrada (OB/FVG/Value Area) + padrões gráficos alinhados. */}
+                    {(() => {
+                      const chips = tradePatternChips(t)
+                      if (chips.length === 0) return null
+                      return (
+                        <div className="mb-2 flex items-center gap-1.5 flex-wrap">
+                          {chips.map((c, ci) => (
+                            <span
+                              key={ci}
+                              className="px-1.5 py-0.5 rounded text-[10px] font-semibold border bg-fuchsia-500/15 text-fuchsia-200 border-fuchsia-500/40"
+                              title="Padrão técnico detectado no momento da recomendação"
+                            >
+                              {c}
+                            </span>
+                          ))}
                         </div>
                       )
                     })()}

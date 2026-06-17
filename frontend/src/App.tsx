@@ -777,6 +777,11 @@ export default function App() {
             setShowDailyPnL(false)
             clearPushFocus()
           }}
+          onSelectSymbol={(sym) => {
+            setSelectedSymbol(sym)
+            setShowDailyPnL(false)
+            clearPushFocus()
+          }}
           focus={pushFocus}
         />
       )}
