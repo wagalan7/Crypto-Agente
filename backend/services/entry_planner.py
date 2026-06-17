@@ -20,6 +20,7 @@ Entry Planner — Sprint B:
 Retorna TradePlan rica com justificativas PT-BR por nível.
 """
 from __future__ import annotations
+import os
 from typing import List, Optional, Tuple
 from pydantic import BaseModel
 import pandas as pd
@@ -108,14 +109,101 @@ ATR_BUFFER = 0.3        # folga no stop além da estrutura
 MIN_RR_TP2 = 1.8        # alvo mínimo aceitável pra TP2
 EMA_PULLBACK_MAX_DIST = 0.04   # 4% — distância máxima do preço atual pra considerar pullback ao EMA
 
+# ── Fade na BORDA do padrão (Passo 6 — gated) ────────────────────────────────
+# Entrada ancorada na PRÓPRIA linha do padrão (resistência superior p/ short,
+# suporte inferior p/ long) quando o preço encosta na borda e o padrão NÃO
+# rompeu — ex.: short no topo de uma cunha ascendente. É contra-tendência por
+# natureza (aposta que a linha segura), então DEFAULT-OFF e só entra como
+# candidato extra de zona; a direção/confluência continuam vindo do pipeline
+# (o sinal já tem que ser SHORT/LONG pra chegar aqui). Patterns rompidos ou em
+# retest são tratados pelos outros modelos (Passos 1/2) e ficam de fora.
+PATTERN_FADE_ENABLED = os.getenv("PATTERN_FADE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+PATTERN_FADE_MAX_DIST = float(os.getenv("PATTERN_FADE_MAX_DIST", "0.02"))  # 2% — dist. máx. preço↔linha
+# Padrões com estrutura de "canal" (linha superior + inferior) — só estes têm
+# borda fadeável. Excluídos: OCO, topo/fundo duplo, LTA/LTB, cup&handle, flags.
+_BOUNDARY_FADE_TYPES = {
+    "ascending_wedge", "descending_wedge",
+    "symmetric_triangle", "ascending_triangle", "descending_triangle",
+    "ascending_channel", "descending_channel", "horizontal_channel",
+}
+
+
+def _line_price_at(line: List[float], x: float) -> Optional[float]:
+    """Projeta uma linha [x0,y0,x1,y1] (índice→preço) no índice x."""
+    if not line or len(line) < 4:
+        return None
+    x0, y0, x1, y1 = line[0], line[1], line[2], line[3]
+    if x1 == x0:
+        return y1
+    slope = (y1 - y0) / (x1 - x0)
+    return y0 + slope * (x - x0)
+
+
+def _pattern_fade_zone(
+    direction: SignalDirection, current_price: float, atr: float,
+    patterns: List[DetectedPattern], n_idx: int,
+) -> Optional[EntryZone]:
+    """Zona de entrada na borda do padrão não-rompido (gated PATTERN_FADE_ENABLED).
+    SHORT → linha superior (resistência) acima do preço; LONG → linha inferior."""
+    if not PATTERN_FADE_ENABLED or not patterns:
+        return None
+    band = atr * ATR_ENTRY_BAND
+    best: Optional[float] = None
+    for p in patterns:
+        try:
+            ptype = p.type.value if hasattr(p.type, "value") else str(p.type)
+            if ptype not in _BOUNDARY_FADE_TYPES:
+                continue
+            if getattr(p, "breakout_confirmed", False) or getattr(p, "retest_active", False):
+                continue
+            if not p.lines or len(p.lines) < 2:
+                continue
+            if direction == SignalDirection.SHORT:
+                # não fadear o topo de um padrão claramente bullish (briga com a estrutura)
+                if p.direction == SignalDirection.LONG:
+                    continue
+                lvl = _line_price_at(p.lines[0], n_idx)   # linha superior
+                if lvl is None or lvl <= current_price * 1.001:
+                    continue
+                if (lvl - current_price) / current_price > PATTERN_FADE_MAX_DIST:
+                    continue
+                if best is None or lvl < best:            # resistência mais próxima
+                    best = lvl
+            elif direction == SignalDirection.LONG:
+                if p.direction == SignalDirection.SHORT:
+                    continue
+                lvl = _line_price_at(p.lines[1], n_idx)   # linha inferior
+                if lvl is None or lvl >= current_price * 0.999:
+                    continue
+                if (current_price - lvl) / current_price > PATTERN_FADE_MAX_DIST:
+                    continue
+                if best is None or lvl > best:            # suporte mais próximo
+                    best = lvl
+        except Exception:
+            continue
+    if best is None:
+        return None
+    side = "resistência" if direction == SignalDirection.SHORT else "suporte"
+    return EntryZone(
+        top=best + band / 2, bottom=best - band / 2, mid=best,
+        type="limit_pattern_fade",
+        description=f"Fade na {side} do padrão ({best:.6g}) — entrada na borda (padrão não rompido).",
+    )
+
 
 def _pick_entry_zone_long(
     current_price: float, atr: float, ind: Indicator,
     smc: Optional[dict], vp_vwap: Optional[dict],
+    patterns: Optional[List[DetectedPattern]] = None, n_idx: int = 0,
 ) -> Optional[EntryZone]:
     """Acha a melhor zona de entrada limit para LONG abaixo do preço atual."""
     candidates: List[EntryZone] = []
     band = atr * ATR_ENTRY_BAND
+
+    # Fade na borda inferior do padrão (gated, no-op quando flag off)
+    fade = _pattern_fade_zone(SignalDirection.LONG, current_price, atr, patterns or [], n_idx)
+    if fade:
+        candidates.append(fade)
 
     # EMA21 pullback
     ema21 = ind.ema21
@@ -189,9 +277,15 @@ def _pick_entry_zone_long(
 def _pick_entry_zone_short(
     current_price: float, atr: float, ind: Indicator,
     smc: Optional[dict], vp_vwap: Optional[dict],
+    patterns: Optional[List[DetectedPattern]] = None, n_idx: int = 0,
 ) -> Optional[EntryZone]:
     candidates: List[EntryZone] = []
     band = atr * ATR_ENTRY_BAND
+
+    # Fade na borda superior do padrão (gated, no-op quando flag off)
+    fade = _pattern_fade_zone(SignalDirection.SHORT, current_price, atr, patterns or [], n_idx)
+    if fade:
+        candidates.append(fade)
 
     ema21 = ind.ema21
     if ema21 and ema21 > current_price * 1.001:
@@ -518,16 +612,19 @@ def plan_trade(
     warnings: List[str] = []
 
     # ── Zona de entrada ───────────────────────────────────────────────────
+    n_idx = len(df) - 1 if df is not None and len(df) else 0
     if direction == SignalDirection.LONG:
-        zone = _pick_entry_zone_long(current_price, atr, ind, smc, vp_vwap)
+        zone = _pick_entry_zone_long(current_price, atr, ind, smc, vp_vwap, patterns, n_idx)
     elif direction == SignalDirection.SHORT:
-        zone = _pick_entry_zone_short(current_price, atr, ind, smc, vp_vwap)
+        zone = _pick_entry_zone_short(current_price, atr, ind, smc, vp_vwap, patterns, n_idx)
     else:
         zone = None
 
     if zone:
         entry = zone.mid
         reasoning_entry = zone.description
+        if zone.type == "limit_pattern_fade":
+            warnings.append("Entrada contra-tendência na borda do padrão — fade; exige rejeição na linha e invalida se romper.")
     else:
         entry = current_price
         zone = EntryZone(

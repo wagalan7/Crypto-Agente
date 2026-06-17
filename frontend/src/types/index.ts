@@ -160,7 +160,7 @@ export interface EntryZone {
   top: number
   bottom: number
   mid: number
-  type: 'limit_pullback' | 'limit_retest' | 'limit_fvg_fill' | 'limit_ob' | 'market' | 'limit_value_area'
+  type: 'limit_pullback' | 'limit_retest' | 'limit_fvg_fill' | 'limit_ob' | 'market' | 'limit_value_area' | 'limit_pattern_fade'
   description: string
 }
 
