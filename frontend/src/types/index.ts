@@ -287,6 +287,12 @@ export interface Recommendation {
   chase_level?: 'ok' | 'extended' | 'chasing' | null
   // P(TP1) calibrada empiricamente — null se calibração não disponível
   prob_tp1?: number | null
+  // P(TP2) calibrada — prob de correr até o TP2 (subconjunto de P(TP1), sempre ≤)
+  prob_tp2?: number | null
+  // Edges (sinais que historicamente elevam o win-rate): A+/funding/padrão/MTF.
+  // Tags legíveis + contagem. Read-only — transparência do que o bot valoriza.
+  edge_tags?: string[]
+  edge_score?: number
   // Position sizing dinâmico (Kelly fracionado × score × vol) — % da banca sugerido
   suggested_size_pct?: number | null
   size_rationale?: string | null

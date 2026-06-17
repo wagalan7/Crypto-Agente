@@ -77,6 +77,7 @@ function gateLabel(gate: string): string {
     'time-block': 'horário bloqueado',
     'funding-gate': 'funding contra',
     'mtf-gate': 'timeframes desalinhados',
+    'quality-edge-gate': 'score marginal sem edge',
     'regime-guard': 'regime adverso',
     'cluster-cap': 'limite de exposição',
     'direction-cap': 'limite direcional',
@@ -109,6 +110,16 @@ function operationType(tf: string): { label: string; cls: string; hint: string }
     cls: 'bg-purple-500/15 text-purple-300 border-purple-500/40',
     hint: 'Posição multi-dia (4h+). Carrega overnight — atenção a funding e gaps.',
   }
+}
+
+// Edges = sinais que historicamente elevam o win-rate (learning-insights: A+ ~92%,
+// funding em squeeze ~100%, padrão forte ~90%, MTF alinhado ~82% vs baseline ~72%).
+// Tooltip explica cada um; o bot usa essas tags pra escalar o size (EDGE_SIZING).
+const EDGE_TAG_META: Record<string, { label: string; hint: string }> = {
+  'A+': { label: 'A+', hint: 'Tier A+ — setup premium. Historicamente ~92% win-rate.' },
+  'funding': { label: 'funding', hint: 'Funding em squeeze a favor da direção (~100% wr histórico em squeeze).' },
+  'padrão': { label: 'padrão', hint: 'Padrão gráfico forte alinhado (conf ≥ 0.65). ~90% wr em padrões fortes.' },
+  'MTF': { label: 'MTF', hint: 'Múltiplos timeframes alinhados (≥ 2). ~82% wr quando MTF concorda.' },
 }
 
 export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, onFocusNotFound }: Props) {
@@ -633,6 +644,25 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                         })()}
                       </div>
                       <p className="text-[11px] text-slate-400 mt-0.5 leading-tight">{r.summary}</p>
+                      {/* Edges — sinais de alta convicção (A+/funding/padrão/MTF).
+                          O bot usa pra escalar o size; aqui é transparência pro user. */}
+                      {r.edge_tags && r.edge_tags.length > 0 && (
+                        <div className="flex items-center gap-1 flex-wrap mt-1">
+                          <span className="text-[9px] text-violet-400/70 font-semibold">⚡ edges:</span>
+                          {r.edge_tags.map(tag => {
+                            const meta = EDGE_TAG_META[tag] ?? { label: tag, hint: 'Sinal de convicção' }
+                            return (
+                              <span
+                                key={tag}
+                                title={meta.hint}
+                                className="px-1.5 py-0.5 rounded text-[9px] font-bold border bg-violet-500/15 text-violet-300 border-violet-500/40 whitespace-nowrap"
+                              >
+                                {meta.label}
+                              </span>
+                            )
+                          })}
+                        </div>
+                      )}
                       {r.warnings.length > 0 && (
                         <div className="flex items-center gap-1 mt-1">
                           <AlertTriangle className="w-3 h-3 text-yellow-400 flex-shrink-0" />
@@ -676,9 +706,12 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                       {r.prob_tp1 != null && (
                         <div
                           className="text-[10px] text-sky-300 font-mono mt-0.5"
-                          title="P(TP1) calibrada empiricamente — mapeia score → win rate observado em snapshots resolvidos (PAV + shrinkage bayesiano)"
+                          title="P(TP1)/P(TP2) calibradas empiricamente — mapeiam score → win rate observado em snapshots resolvidos (PAV + shrinkage bayesiano). P(TP2) = prob de correr até o TP2 (subconjunto de P(TP1))."
                         >
                           P {(r.prob_tp1 * 100).toFixed(0)}%
+                          {r.prob_tp2 != null && (
+                            <span className="text-green-300/80"> · TP2 {(r.prob_tp2 * 100).toFixed(0)}%</span>
+                          )}
                         </div>
                       )}
                       <div className="text-[10px] text-emerald-300 mt-1 font-mono">{fmtRR(r.risk_reward)}</div>

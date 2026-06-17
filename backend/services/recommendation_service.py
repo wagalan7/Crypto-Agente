@@ -1011,6 +1011,13 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         prob_tp1 = None
         prob_tp2 = None
 
+    # Edges (A+/funding/padrão/MTF) — computados ANTES do sizing/veredito pra
+    # alimentar ambos (read-only, alimenta exibição no app + sizing no bot).
+    try:
+        edge_tags, edge_score = _compute_edges(sig, tier)
+    except Exception:
+        edge_tags, edge_score = [], 0
+
     # Position sizing dinâmico (Issue #4) — Kelly fracionado × score × volatilidade
     atr_pct_val = sig.indicators.atr_pct if sig.indicators else None
     suggested_size_pct, size_rationale = _compute_dynamic_size(
@@ -1020,6 +1027,18 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         prob_tp1=prob_tp1,
         atr_pct=atr_pct_val,
     )
+    # Espelha o EDGE_SIZING do bot no tamanho EXIBIDO (app conta a mesma história
+    # que o bot). Gated: NO-OP quando EDGE_SIZING_ENABLED=false. Re-clampa ao teto
+    # documentado [0.25%, 1.0%]. Fail-soft — qualquer erro mantém o size original.
+    if suggested_size_pct is not None:
+        try:
+            from services.shadow_trade_service import _edge_mult
+            _em, _ = _edge_mult({"edge_tags": edge_tags, "edge_score": edge_score})
+            if _em != 1.0:
+                suggested_size_pct = round(min(max(suggested_size_pct * _em, 0.25), 1.0), 2)
+                size_rationale = (size_rationale or "size dinâmico") + f" · edge ×{_em:.2f}"
+        except Exception:
+            pass
 
     # Veredito do bot (mesma lógica/limites do loop de execução — fonte única).
     # Read-only: NÃO toca no loop real; só anexa "o bot operaria / não operaria"
@@ -1037,6 +1056,8 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
             "prob_tp1": prob_tp1,
             "quote_vol_usd": q_vol,
             "spread_pct": sp_pct,
+            "score": score,
+            "edge_score": edge_score,
         })
     except Exception:
         bot_verdict = None
@@ -1053,12 +1074,6 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         entry_grade = "good"
     else:
         entry_grade = "manual"
-
-    # Edges (A+/funding/padrão/MTF) — read-only, alimenta sizing + exibição.
-    try:
-        edge_tags, edge_score = _compute_edges(sig, tier)
-    except Exception:
-        edge_tags, edge_score = [], 0
 
     return Recommendation(
         tier=tier,

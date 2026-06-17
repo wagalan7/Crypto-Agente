@@ -263,6 +263,11 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
         levels.append(f"TP2 {_fmt(tp2_v)}")
     if levels:
         lines.append(" · ".join(levels))
+    # Edges (A+/funding/padrão/MTF) — sinais de convicção que elevam o win-rate.
+    # Transparência: mostra no push o que o bot valoriza nesse setup. Fail-soft.
+    _edges = rec.get("edge_tags") or []
+    if isinstance(_edges, list) and _edges:
+        lines.append("⚡ " + " · ".join(str(t) for t in _edges))
     body = "\n".join(lines)
 
     tf_short = rec.get("timeframe", "")

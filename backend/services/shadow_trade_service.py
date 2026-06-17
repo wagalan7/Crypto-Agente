@@ -663,6 +663,25 @@ def exec_verdict(rec: dict) -> dict:
             return {"ok": False, "blocked_by": "liquidity-gate",
                     "reason": f"spread {spread:.3f}% > máx {MAX_SPREAD_PCT}%", "checks": checks}
 
+    # ── Quality-edge gate ── espelha o gate combinado do loop (banda marginal logo
+    # acima do SCORE_MIN exige >= QUALITY_EDGE_MIN edges). Gated: NO-OP quando
+    # QUALITY_EDGE_GATE_ENABLED=false. Só morde score >= SCORE_MIN (abaixo é o
+    # gate score-min/entry_grade). Mantém app e bot contando a MESMA história.
+    if QUALITY_EDGE_GATE_ENABLED and QUALITY_EDGE_MARGIN > 0:
+        sc = _f(rec.get("score"))
+        try:
+            edges_n = int(rec.get("edge_score") or 0)
+        except Exception:
+            edges_n = 0
+        if (
+            sc is not None and sc >= SCORE_MIN
+            and sc < (SCORE_MIN + QUALITY_EDGE_MARGIN) and edges_n < QUALITY_EDGE_MIN
+        ):
+            return {"ok": False, "blocked_by": "quality-edge-gate",
+                    "reason": (f"score marginal {sc:.0f} (< {SCORE_MIN + QUALITY_EDGE_MARGIN:.0f}) "
+                               f"sem edge (>= {QUALITY_EDGE_MIN})"),
+                    "checks": checks}
+
     return {"ok": True, "blocked_by": None, "reason": None, "checks": checks}
 
 
