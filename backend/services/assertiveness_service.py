@@ -779,6 +779,147 @@ async def _regime_audit(days: int) -> Dict[str, Any]:
     return out
 
 
+async def _gate_counterfactual(days: int) -> Dict[str, Any]:
+    """#B — Avaliador CONTRAFACTUAL dos gates protetivos que estão OFF. Para cada
+    gate desligado, mede sobre o histórico resolvido 'o que ele teria feito',
+    pra transformar a decisão de ligar em EVIDÊNCIA, não palpite.
+
+    HONESTIDADE sobre o que é reconstruível com dado persistido:
+      • quality_edge   — só a condição de SCORE (banda marginal) é reconstruível;
+                         o filtro de edge_score NÃO é persistido → reportamos a
+                         coorte da banda como COTA SUPERIOR do que o gate barraria.
+      • regime_sizing  — precisa do regime-na-entrada, gravado só a partir do
+                         deploy #A → amostra acumula (coverage informado).
+      • pre_tp1_protect— precisa do caminho intra-trade pré-TP1 (não persistido)
+                         → não reconstruível por outcome; só contexto de stops.
+    Read-only / fail-soft."""
+    out: Dict[str, Any] = {"window_days": days,
+                           "quality_edge": {}, "regime_sizing": {}, "pre_tp1_protect": {}}
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        from services.shadow_trade_service import (
+            SCORE_MIN, QUALITY_EDGE_MARGIN, QUALITY_EDGE_MIN,
+            QUALITY_EDGE_GATE_ENABLED, REGIME_SIZING_ENABLED, REGIME_SIZE_MULT_ALT_LONG,
+        )
+        from services.regime_service import is_btc_symbol
+    except Exception as e:
+        log.warning(f"[assertiveness] gate_counterfactual import falhou: {e}")
+        return out
+
+    # Snapshots resolvidos da janela (score/direction/symbol/features/status/R)
+    rows = []
+    try:
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        async with get_session() as session:
+            rows = list((await session.execute(
+                select(RecommendationSnapshot.symbol, RecommendationSnapshot.direction,
+                       RecommendationSnapshot.score, RecommendationSnapshot.status,
+                       RecommendationSnapshot.realized_r, RecommendationSnapshot.features)
+                .where(RecommendationSnapshot.status.in_(_SNAP_RESOLVED))
+                .where(_calib._not_fast_void())
+                .where(RecommendationSnapshot.outcome_at >= since)
+            )).all())
+    except Exception as e:
+        log.warning(f"[assertiveness] gate_counterfactual read falhou: {e}")
+
+    def _agg(rs_list):
+        n = len(rs_list)
+        if n == 0:
+            return {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": 0.0}
+        rs = [r for r, _ in rs_list]
+        wins = sum(1 for _, w in rs_list if w)
+        return {"count": n, "win_rate_pct": round(wins / n * 100, 1),
+                "avg_r": round(sum(rs) / n, 3), "sum_r": round(sum(rs), 2)}
+
+    # ── (1) quality_edge — coorte da banda marginal de score ───────────────────
+    band_lo, band_hi = SCORE_MIN, SCORE_MIN + QUALITY_EDGE_MARGIN
+    band = [(float(r or 0), st in _SNAP_WIN)
+            for sym, d, sc, st, r, f in rows
+            if sc is not None and band_lo <= float(sc) < band_hi]
+    qe = _agg(band)
+    qe_sum = qe["sum_r"]
+    if qe["count"] < 8:
+        qe_verdict = f"amostra pequena ({qe['count']}) na banda [{band_lo:.0f},{band_hi:.0f}) — inconclusivo"
+    elif qe_sum < 0:
+        qe_verdict = (f"banda marginal somou {qe_sum:+.1f}R (avg {qe['avg_r']:+.2f}, {qe['count']} setups) "
+                      f"— LIGAR o gate provavelmente protege (cota superior; gate corta subconjunto sem edge)")
+    else:
+        qe_verdict = (f"banda marginal é lucrativa ({qe_sum:+.1f}R, avg {qe['avg_r']:+.2f}, {qe['count']}) "
+                      f"— ligar o gate cortaria setups bons; NÃO recomendado agora")
+    out["quality_edge"] = {
+        "enabled_now": QUALITY_EDGE_GATE_ENABLED,
+        "score_band": f"[{band_lo:.0f},{band_hi:.0f})",
+        "edge_min_required": QUALITY_EDGE_MIN,
+        "cohort_score_band": qe,
+        "note": "edge_score não é persistido — coorte é só pela condição de score (cota superior do bloqueio)",
+        "verdict": qe_verdict,
+    }
+
+    # ── (2) regime_sizing — alt longs sob regime de downgrade (tag #A) ──────────
+    DOWNGRADE_REGIMES = {"BTC_DOMINANT", "ALT_RISK_OFF"}
+    tagged = 0
+    cohort = []
+    for sym, d, sc, st, r, f in rows:
+        label = f.get("regime") if isinstance(f, dict) else None
+        if label:
+            tagged += 1
+        if (label in DOWNGRADE_REGIMES and str(d).lower() == "long"
+                and not is_btc_symbol(sym or "")):
+            cohort.append((float(r or 0), st in _SNAP_WIN))
+    rs_agg = _agg(cohort)
+    # Projeção: ao escalar o size por REGIME_SIZE_MULT_ALT_LONG, o R da coorte
+    # escala linear → delta = (mult-1)*sum_r (negativo se coorte lucrativa).
+    proj_delta = round((REGIME_SIZE_MULT_ALT_LONG - 1.0) * rs_agg["sum_r"], 2)
+    if tagged == 0:
+        rs_verdict = "nenhum resolvido com regime tagueado ainda — aguardando amostra (deploy #A)"
+    elif rs_agg["count"] == 0:
+        rs_verdict = f"{tagged} resolvidos tagueados, mas nenhum alt-long sob regime de downgrade na janela"
+    elif rs_agg["sum_r"] < 0:
+        rs_verdict = (f"alt-longs em regime de downgrade somaram {rs_agg['sum_r']:+.1f}R "
+                      f"({rs_agg['count']} setups) — reduzir size (#6) teria poupado {-proj_delta:+.1f}R")
+    else:
+        rs_verdict = (f"alt-longs em regime de downgrade foram lucrativos ({rs_agg['sum_r']:+.1f}R) "
+                      f"— reduzir size teria custado {proj_delta:+.1f}R")
+    out["regime_sizing"] = {
+        "enabled_now": REGIME_SIZING_ENABLED,
+        "size_mult_alt_long": REGIME_SIZE_MULT_ALT_LONG,
+        "downgrade_regimes": sorted(DOWNGRADE_REGIMES),
+        "cohort_alt_long_downgrade": rs_agg,
+        "projected_r_delta_if_on": proj_delta,
+        "tagged_resolved": tagged, "total_resolved": len(rows),
+        "verdict": rs_verdict,
+    }
+
+    # ── (3) pre_tp1_protect — não reconstruível por outcome ────────────────────
+    try:
+        from services.trade_manager_service import PRE_TP1_PROTECT_ENABLED as _ptp_on
+    except Exception:
+        _ptp_on = False
+    stops_full = 0
+    try:
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            stops_full = int((await session.execute(
+                select(func.count(RealTrade.id))
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.status == "closed_stop")
+                .where(RealTrade.opened_at >= since)
+            )).scalar() or 0)
+    except Exception as e:
+        log.warning(f"[assertiveness] pre_tp1 stops read falhou: {e}")
+    out["pre_tp1_protect"] = {
+        "enabled_now": bool(_ptp_on),
+        "real_full_stops_in_window": stops_full,
+        "note": ("não reconstruível por outcome (precisa do caminho intra-trade pré-TP1, "
+                 "não persistido). Avaliar só via shadow ao vivo, ou logar progress→TP1 nos stops."),
+        "verdict": (f"{stops_full} stops cheios na janela são o alvo do gate; "
+                    f"medir adoção exige instrumentar o caminho pré-TP1 antes"),
+    }
+    return out
+
+
 async def _calibration_stats() -> Dict[str, Any]:
     out = {"mature": False, "total_resolved": 0, "min_sample": 30,
            "p_global": None, "win_rate_pct": None, "computed_at": None}
@@ -829,6 +970,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     calibration_audit = await _calibration_audit(days)
     directional = await _directional_audit(days)
     regime = await _regime_audit(days)
+    gate_counterfactual = await _gate_counterfactual(days)
     return {
         "enabled": True,
         "window_days": days,
@@ -843,5 +985,6 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "equity_curve": equity_curve,
         "directional": directional,
         "regime": regime,
+        "gate_counterfactual": gate_counterfactual,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
