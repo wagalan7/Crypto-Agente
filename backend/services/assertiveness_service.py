@@ -426,6 +426,114 @@ async def _per_coin_scorecard(days: int, limit: int = 40) -> Dict[str, Any]:
     return out
 
 
+async def _calibration_audit(days: int) -> Dict[str, Any]:
+    """#5 — Auditoria de calibração. A calibração (calibration_service) aprende
+    com TODO o histórico um mapa score→P(TP1). Esta auditoria pega os snapshots
+    RESOLVIDOS RECENTES (janela `days`) e, por bin de score, compara o P(TP1)
+    PREVISTO pelo modelo (p_calibrated) com o win-rate REALIZADO recente. O
+    descasamento é DRIFT: o modelo diz 70% mas a realidade recente é 50%.
+
+    Sinaliza por bin: over-confident (previu mais do que entregou),
+    under-confident (entregou mais), ou ok. Global: Brier score + gap médio.
+    Fail-soft / read-only — só lê e compara."""
+    out: Dict[str, Any] = {
+        "enabled": False, "window_days": days, "reason": None,
+        "n_recent": 0, "expected_wins": None, "actual_wins": None,
+        "actual_rate_pct": None, "predicted_rate_pct": None,
+        "calib_gap_pct": None, "brier": None, "verdict": None, "bins": [],
+    }
+    try:
+        from services import calibration_service as cs
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+    except Exception as e:
+        out["reason"] = f"import falhou: {e}"
+        return out
+    calib = await cs.get_calibration()
+    if not calib or not calib.get("bins"):
+        out["reason"] = "calibração imatura (sem mapa score→P(TP1) ainda)"
+        return out
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        async with get_session() as session:
+            rows = list((await session.execute(
+                select(RecommendationSnapshot.score, RecommendationSnapshot.status)
+                .where(RecommendationSnapshot.status.in_(_SNAP_RESOLVED))
+                .where(_calib._not_fast_void())
+                .where(RecommendationSnapshot.outcome_at >= since)
+            )).all())
+    except Exception as e:
+        out["reason"] = f"read falhou: {e}"
+        return out
+    if not rows:
+        out["reason"] = "sem snapshots resolvidos na janela"
+        return out
+    bins = calib["bins"]
+    nb = len(bins)
+    b_total = [0] * nb
+    b_wins = [0] * nb
+    exp_wins = 0.0
+    brier_sum = 0.0
+    n = 0
+    for sc, st in rows:
+        bi = cs._bin_index(float(sc))
+        if bi < 0:
+            continue
+        p_pred = float(bins[bi].get("p_calibrated") or 0.0)
+        y = 1.0 if st in cs.WIN_STATUSES else 0.0
+        b_total[bi] += 1
+        b_wins[bi] += int(y)
+        exp_wins += p_pred
+        brier_sum += (p_pred - y) ** 2
+        n += 1
+    if n == 0:
+        out["reason"] = "scores recentes fora dos bins"
+        return out
+    actual_wins = sum(b_wins)
+    actual_rate = actual_wins / n
+    predicted_rate = exp_wins / n
+    gap = actual_rate - predicted_rate  # >0 = modelo conservador; <0 = otimista
+    bins_out = []
+    worst = None  # (abs_gap, label) com amostra suficiente
+    for i in range(nb):
+        nt = b_total[i]
+        if nt == 0:
+            continue
+        p_pred = round(float(bins[i].get("p_calibrated") or 0.0), 4)
+        p_act = b_wins[i] / nt
+        bgap = p_act - p_pred
+        flag = "ok"
+        # só rotula drift com amostra mínima e gap material
+        if nt >= 8 and abs(bgap) >= 0.15:
+            flag = "otimista" if bgap < 0 else "conservador"
+            if worst is None or abs(bgap) > worst[0]:
+                worst = (abs(bgap), bins[i].get("label"), flag, round(p_pred*100,1), round(p_act*100,1))
+        bins_out.append({
+            "label": bins[i].get("label"), "n_recent": nt,
+            "predicted_pct": round(p_pred * 100, 1),
+            "actual_pct": round(p_act * 100, 1),
+            "gap_pct": round(bgap * 100, 1), "flag": flag,
+        })
+    if worst is not None:
+        verdict = (f"DRIFT no bin {worst[1]}: modelo previu {worst[3]}% mas realizou "
+                   f"{worst[4]}% ({worst[2]}) — vale revisar calibração se persistir")
+    elif abs(gap) >= 0.10:
+        verdict = (f"gap global {gap*100:+.1f}pp (modelo "
+                   f"{'conservador' if gap>0 else 'otimista'}) mas nenhum bin com drift material")
+    else:
+        verdict = f"calibração fiel: gap global {gap*100:+.1f}pp, sem drift por bin"
+    out.update({
+        "enabled": True, "n_recent": n,
+        "expected_wins": round(exp_wins, 1), "actual_wins": actual_wins,
+        "actual_rate_pct": round(actual_rate * 100, 1),
+        "predicted_rate_pct": round(predicted_rate * 100, 1),
+        "calib_gap_pct": round(gap * 100, 1),
+        "brier": round(brier_sum / n, 4),
+        "verdict": verdict, "bins": bins_out,
+    })
+    return out
+
+
 async def _equity_curve(days: int) -> Dict[str, Any]:
     """#8 — Curva de equity de DINHEIRO REAL. Série temporal acumulada (por
     closed_at) dos trades reais source=auto resolvidos: R acumulado, P&L USD
@@ -547,6 +655,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     funnel = await _funnel(gate_days, gates)
     scorecard = await _per_coin_scorecard(days)
     equity_curve = await _equity_curve(days)
+    calibration_audit = await _calibration_audit(days)
     return {
         "enabled": True,
         "window_days": days,
@@ -554,6 +663,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "shadow": shadow,
         "gates": gates,
         "calibration": calibration,
+        "calibration_audit": calibration_audit,
         "opportunity_cost": opportunity_cost,
         "funnel": funnel,
         "scorecard": scorecard,
