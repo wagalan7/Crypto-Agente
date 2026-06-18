@@ -161,6 +161,96 @@ ROTATION_HYSTERESIS_CYCLES = max(1, int(os.getenv("ROTATION_HYSTERESIS_CYCLES", 
 ROTATION_LIQ_FLOOR_TOP_N = int(os.getenv("ROTATION_LIQ_FLOOR_TOP_N", "200"))
 # Cadência do loop de aplicação (segundos). Default 6h → histerese de 3 ciclos ≈ 18h.
 ROTATION_APPLY_INTERVAL_SEC = int(os.getenv("ROTATION_APPLY_INTERVAL_SEC", "21600"))
+# Heartbeat do loop (segundos). 1h → preview semanal pontual ~1h; apply é gated
+# por ROTATION_APPLY_INTERVAL_SEC independentemente.
+ROTATION_CHECK_INTERVAL = int(os.getenv("ROTATION_CHECK_INTERVAL_SEC", "3600"))
+
+# Preview semanal no Telegram (dry-run informativo). Default: seg 09h BRT.
+ROTATION_PREVIEW_ENABLED = os.getenv("ROTATION_PREVIEW_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+ROTATION_PREVIEW_DOW = int(os.getenv("ROTATION_PREVIEW_DOW", "0"))        # 0=segunda (weekday)
+ROTATION_PREVIEW_HOUR_UTC = int(os.getenv("ROTATION_PREVIEW_HOUR_UTC", "12"))  # 12 UTC = 09h BRT
+
+
+def fmt_rotation_preview(plan: Dict[str, Any]) -> str:
+    """Mensagem informativa do preview semanal (funciona mesmo sem mudanças)."""
+    promo = plan.get("promote", [])
+    demo = plan.get("demote", [])
+    cur = plan.get("current_count", 0)
+    status = "LIGADA \u26A0\uFE0F" if ROTATION_AUTO_APPLY else "desligada (só preview)"
+    lines = [
+        "\U0001F501 *Preview semanal da rotação* (dry-run)",
+        f"Universo de execução atual: *{cur}* moedas.",
+        f"Aplicação automática: {status}.",
+    ]
+    if promo:
+        names = ", ".join(
+            f"`{p['symbol']}`(+{(p.get('avg_r') or 0):.2f}R, n={p.get('trades')})" for p in promo
+        )
+        lines.append(f"\u2795 Promoveria ({len(promo)}): {names}")
+    if demo:
+        names = ", ".join(
+            f"`{d['symbol']}`({(d.get('avg_r') or 0):.2f}R, n={d.get('trades')})" for d in demo
+        )
+        lines.append(f"\u2796 Rebaixaria ({len(demo)}): {names}")
+    if not promo and not demo:
+        lines.append("\u2705 Nenhuma mudança sugerida — sem candidatos com amostra suficiente fora do universo.")
+    return "\n".join(lines)
+
+
+async def _load_last_preview_at():
+    from db import get_session
+    from models.rotation_state import RotationUniverseState
+    from sqlalchemy import select
+    async with get_session() as session:
+        row = (await session.execute(
+            select(RotationUniverseState).where(RotationUniverseState.id == 1)
+        )).scalar_one_or_none()
+        return row.last_preview_at if row else None
+
+
+async def _save_last_preview_at(dt) -> None:
+    from db import get_session
+    from models.rotation_state import RotationUniverseState
+    from sqlalchemy import select
+    async with get_session() as session:
+        row = (await session.execute(
+            select(RotationUniverseState).where(RotationUniverseState.id == 1)
+        )).scalar_one_or_none()
+        if row is None:
+            seed = await _seed_universe()
+            row = RotationUniverseState(id=1, universe=seed, pending={})
+            session.add(row)
+        row.last_preview_at = dt
+        await session.commit()
+
+
+async def maybe_send_weekly_preview(occurrence) -> bool:
+    """
+    Envia o preview semanal ao Telegram se a `occurrence` (datetime da última
+    seg 09h) ainda não foi notificada. Idempotente via last_preview_at no DB.
+    """
+    try:
+        last = await _load_last_preview_at()
+    except Exception as e:
+        log.warning(f"[rotation] load last_preview falhou: {e}")
+        return False
+    if last is not None and last >= occurrence:
+        return False  # já enviado nesta ocorrência
+    plan = await compute_rotation_plan(days=0)
+    msg = fmt_rotation_preview(plan)
+    sent = False
+    try:
+        from services.notification_service import send_telegram
+        sent = await send_telegram(msg, event_type="rotation_preview")
+    except Exception as e:
+        log.warning(f"[rotation] envio do preview semanal falhou: {e}")
+    if sent:
+        from datetime import datetime, timezone
+        await _save_last_preview_at(datetime.now(timezone.utc))
+        log.info("[rotation] preview semanal enviado.")
+    return sent
 
 
 async def _seed_universe() -> List[str]:

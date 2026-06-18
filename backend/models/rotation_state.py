@@ -33,6 +33,12 @@ class RotationUniverseState(Base):
     # Contadores de histerese: {"BASE": {"action": "promote"|"demote", "count": N}}
     pending: Mapped[dict] = mapped_column(JSON, default=dict)
 
+    # Última vez que o preview semanal (seg 09h BRT) foi enviado ao Telegram.
+    # Idempotência: evita reenviar a mesma ocorrência após redeploy.
+    last_preview_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
     applied_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow
     )

@@ -77,6 +77,11 @@ async def init_db():
     from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Rotação FASE 2 — coluna do preview semanal (tabela já podia existir)
+        await conn.execute(text(
+            "ALTER TABLE rotation_universe_state "
+            "ADD COLUMN IF NOT EXISTS last_preview_at TIMESTAMP WITH TIME ZONE"
+        ))
         # Migrações incrementais
         await conn.execute(text(
             "ALTER TABLE recommendation_snapshots "

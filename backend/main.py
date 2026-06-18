@@ -267,22 +267,37 @@ async def _rotation_loop():
         logging.warning(f"[rotation] prime no boot falhou: {e}")
     # Pequeno delay pra não competir com o boot.
     await asyncio.sleep(120)
+    last_apply = 0.0  # monotonic da última avaliação de apply
     while True:
         try:
-            res = await rot.apply_rotation_plan()
-            if res.get("applied"):
-                logging.info(
-                    f"[rotation] aplicado: +{res.get('promoted')} -{res.get('demoted')} "
-                    f"→ {res.get('new_count')} bases"
-                )
-            else:
-                logging.info(f"[rotation] sem mudança ({res.get('reason', 'histerese/estável')}).")
+            now = datetime.now(timezone.utc)
+            # (1) Preview semanal (seg 09h BRT) no Telegram — informativo, não muta.
+            if rot.ROTATION_PREVIEW_ENABLED:
+                try:
+                    occ = _last_scheduled_occurrence(
+                        now, rot.ROTATION_PREVIEW_DOW, rot.ROTATION_PREVIEW_HOUR_UTC
+                    )
+                    await rot.maybe_send_weekly_preview(occ)
+                except Exception as e:
+                    logging.warning(f"[rotation] preview semanal falhou: {e}")
+            # (2) Avaliação de apply — gated pela cadência configurada (default 6h).
+            mono = time.monotonic()
+            if mono - last_apply >= rot.ROTATION_APPLY_INTERVAL_SEC:
+                last_apply = mono
+                res = await rot.apply_rotation_plan()
+                if res.get("applied"):
+                    logging.info(
+                        f"[rotation] aplicado: +{res.get('promoted')} -{res.get('demoted')} "
+                        f"→ {res.get('new_count')} bases"
+                    )
+                else:
+                    logging.info(f"[rotation] sem mudança ({res.get('reason', 'histerese/estável')}).")
         except asyncio.CancelledError:
             break
         except Exception as e:
             logging.warning(f"[rotation] ciclo falhou: {e}", exc_info=True)
         try:
-            await asyncio.sleep(rot.ROTATION_APPLY_INTERVAL_SEC)
+            await asyncio.sleep(rot.ROTATION_CHECK_INTERVAL)
         except asyncio.CancelledError:
             break
 
