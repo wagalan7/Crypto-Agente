@@ -93,6 +93,7 @@ _trade_manager_task: Optional[asyncio.Task] = None
 _recalibration_task: Optional[asyncio.Task] = None
 _reminders_task: Optional[asyncio.Task] = None
 _rotation_task: Optional[asyncio.Task] = None
+_health_watchdog_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
 # Quantos símbolos varrer por ciclo (top-N por volume). Universo maior = mais
@@ -134,6 +135,24 @@ _METRICS: Dict[str, Any] = {
     "last_snapshot_check_at": None,
     "last_recalibration_at": None,
 }
+
+# ── #9 Health watchdog — alertas proativos de degradação (push + telegram) ────
+# Tarefa INDEPENDENTE do scan loop: pega tanto FALHAS quanto um loop TRAVADO/MORTO
+# (que para de bater métrica). Puramente aditivo — sem efeito em execução. No-op
+# silencioso se push (VAPID) e telegram (BOT_TOKEN/CHAT_ID) ambos não configurados.
+# Default ON, mas com de-dup forte (estado + cooldown) pra nunca floodar.
+HEALTH_WATCHDOG_ENABLED = os.getenv("HEALTH_WATCHDOG_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+HEALTH_WATCHDOG_CHECK_INTERVAL = int(os.getenv("HEALTH_WATCHDOG_CHECK_INTERVAL_SEC", "60"))
+HEALTH_WATCHDOG_INITIAL_DELAY = int(os.getenv("HEALTH_WATCHDOG_INITIAL_DELAY_SEC", "180"))
+# Idade do último scan (s) acima da qual o loop é considerado parado. A cadência
+# real no PRD é ~210s (teto tinyproxy), então 300 dá folga de ~1,4 ciclo. Só
+# dispara se SUSTENTADO (≥2 checagens seguidas) — evita flap num ciclo lento.
+HEALTH_WATCHDOG_MAX_AGE_S = int(os.getenv("HEALTH_WATCHDOG_MAX_AGE_S", "300"))
+HEALTH_WATCHDOG_STALE_SUSTAIN = int(os.getenv("HEALTH_WATCHDOG_STALE_SUSTAIN", "2"))
+# Nº de falhas de scan consecutivas (sem nenhum sucesso no meio) pra alertar.
+HEALTH_WATCHDOG_FAIL_STREAK = int(os.getenv("HEALTH_WATCHDOG_FAIL_STREAK", "3"))
+# Tempo mínimo (s) entre re-alertas da MESMA condição ainda ativa.
+HEALTH_WATCHDOG_COOLDOWN_S = int(os.getenv("HEALTH_WATCHDOG_COOLDOWN_S", "1800"))
 
 # ── Recalibração automática da autoaprendizagem ─────────────────────────────
 # A cada N dias o app reaprende com TODO o histórico (score→P(TP1) + buckets).
@@ -498,9 +517,163 @@ async def _server_scan_loop():
             break
 
 
+async def _wd_notify(title: str, body: str, tag: str) -> None:
+    """Dispara um alerta do watchdog nos DOIS canais (push + telegram), fail-soft.
+    Cada canal é no-op silencioso se não configurado."""
+    try:
+        from services import push_service
+        await push_service.notify_alert(title, body, tag=tag)
+    except Exception as e:
+        logging.warning(f"[watchdog] push falhou: {e}")
+    try:
+        from services import notification_service
+        await notification_service.send_telegram(
+            f"*{title}*\n{body}", event_type="health", parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.warning(f"[watchdog] telegram falhou: {e}")
+
+
+async def _health_watchdog_loop():
+    """
+    #9 — Watchdog de saúde INDEPENDENTE do scan loop.
+
+    Diferente de um simples healthcheck reativo, esta tarefa roda em paralelo e
+    pega tanto FALHAS de scan quanto um loop TRAVADO/MORTO (que para de bater
+    métrica). Alerta em TRANSIÇÕES de estado (degradou / recuperou) com cooldown,
+    pra avisar uma vez — nunca floodar.
+
+    Condições monitoradas:
+      • scan_stale   — idade do último scan > MAX_AGE_S, sustentada ≥N checagens
+      • scan_failing — falhas de scan consecutivas ≥ FAIL_STREAK (sem sucesso no meio)
+      • kill_blocked — kill-switch passou a allowed=False (trava de trade)
+
+    Puramente observabilidade: NÃO toca execução. No-op se ambos os canais
+    (push/telegram) não estiverem configurados — só loga.
+    """
+    if not HEALTH_WATCHDOG_ENABLED:
+        logging.info("[watchdog] desativado (HEALTH_WATCHDOG_ENABLED=false).")
+        return
+    await asyncio.sleep(HEALTH_WATCHDOG_INITIAL_DELAY)
+    # Estado por condição: ativa? + monotonic do último alerta (pra cooldown).
+    st: Dict[str, Any] = {
+        "stale_active": False, "stale_alert_mono": 0.0, "stale_sustain": 0,
+        "fail_active": False, "fail_alert_mono": 0.0, "fail_streak": 0,
+        "kill_active": False, "kill_alert_mono": 0.0,
+        "last_scans_total": None, "last_scans_failed": None,
+    }
+
+    def _should_fire(active: bool, last_mono: float, now_mono: float) -> bool:
+        # Dispara se a condição acabou de ativar OU se já passou o cooldown.
+        return (not active) or (now_mono - last_mono >= HEALTH_WATCHDOG_COOLDOWN_S)
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            now_mono = time.monotonic()
+
+            # ── (1) scan_stale — idade do último scan sustentadamente alta ──────
+            last_at_str = _METRICS.get("last_scan_at")
+            age_s: Optional[float] = None
+            if last_at_str:
+                try:
+                    age_s = (now - datetime.fromisoformat(last_at_str)).total_seconds()
+                except Exception:
+                    age_s = None
+            if age_s is not None and age_s > HEALTH_WATCHDOG_MAX_AGE_S:
+                st["stale_sustain"] += 1
+            else:
+                st["stale_sustain"] = 0
+            stale_now = st["stale_sustain"] >= HEALTH_WATCHDOG_STALE_SUSTAIN
+            if stale_now:
+                if _should_fire(st["stale_active"], st["stale_alert_mono"], now_mono):
+                    await _wd_notify(
+                        "⚠️ Scan loop parado",
+                        f"Último scan há {int(age_s)}s (limite {HEALTH_WATCHDOG_MAX_AGE_S}s). "
+                        f"O loop pode estar travado — recomendações/pushes podem estar atrasados.",
+                        tag="health-stale",
+                    )
+                    st["stale_alert_mono"] = now_mono
+                st["stale_active"] = True
+            elif st["stale_active"]:
+                await _wd_notify(
+                    "✅ Scan loop normalizado",
+                    f"Scans voltaram a rodar (idade {int(age_s) if age_s is not None else '?'}s).",
+                    tag="health-stale",
+                )
+                st["stale_active"] = False
+
+            # ── (2) scan_failing — falhas consecutivas sem sucesso no meio ─────
+            cur_total = _METRICS.get("scans_total") or 0
+            cur_failed = _METRICS.get("scans_failed") or 0
+            if st["last_scans_total"] is not None:
+                d_total = cur_total - st["last_scans_total"]
+                d_failed = cur_failed - st["last_scans_failed"]
+                if d_total > 0:
+                    st["fail_streak"] = 0          # houve sucesso → reseta
+                elif d_failed > 0:
+                    st["fail_streak"] += d_failed   # só falhas desde a última checagem
+            st["last_scans_total"] = cur_total
+            st["last_scans_failed"] = cur_failed
+            fail_now = st["fail_streak"] >= HEALTH_WATCHDOG_FAIL_STREAK
+            if fail_now:
+                if _should_fire(st["fail_active"], st["fail_alert_mono"], now_mono):
+                    await _wd_notify(
+                        "🔴 Scans falhando",
+                        f"{st['fail_streak']} falhas de scan seguidas. "
+                        f"Último erro: {str(_METRICS.get('last_scan_error') or 'n/d')[:160]}",
+                        tag="health-fail",
+                    )
+                    st["fail_alert_mono"] = now_mono
+                st["fail_active"] = True
+            elif st["fail_active"]:
+                await _wd_notify(
+                    "✅ Scans recuperados",
+                    "Scan voltou a rodar com sucesso após falhas.",
+                    tag="health-fail",
+                )
+                st["fail_active"] = False
+
+            # ── (3) kill_blocked — kill-switch travou trading ──────────────────
+            try:
+                from services import kill_switch_service
+                ks = await kill_switch_service.status()
+                kill_now = ks.get("allowed") is False
+                kill_reason = ks.get("reason")
+            except Exception as e:
+                logging.warning(f"[watchdog] kill-switch status falhou: {e}")
+                kill_now = False
+                kill_reason = None
+            if kill_now:
+                if _should_fire(st["kill_active"], st["kill_alert_mono"], now_mono):
+                    await _wd_notify(
+                        "🛑 Kill-switch ativado",
+                        f"Trading BLOQUEADO. Motivo: {kill_reason or 'n/d'}.",
+                        tag="health-kill",
+                    )
+                    st["kill_alert_mono"] = now_mono
+                st["kill_active"] = True
+            elif st["kill_active"]:
+                await _wd_notify(
+                    "✅ Kill-switch liberado",
+                    "Trading voltou a ser permitido (allowed=true).",
+                    tag="health-kill",
+                )
+                st["kill_active"] = False
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.warning(f"[watchdog] ciclo falhou: {e}", exc_info=True)
+        try:
+            await asyncio.sleep(HEALTH_WATCHDOG_CHECK_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task
+    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task
     # Banner de segurança go-live — shadow vs live, produção vs demo, canary.
     try:
         from services import shadow_trade_service
@@ -561,8 +734,17 @@ async def lifespan(app: FastAPI):
         )
     except Exception as e:
         logging.warning(f"Falha ao iniciar rotação: {e}")
+    # #9 — Watchdog de saúde (push + telegram em degradação). Independente do scan.
+    try:
+        _health_watchdog_task = asyncio.create_task(_health_watchdog_loop())
+        logging.info(
+            f"Health watchdog iniciado (enabled={HEALTH_WATCHDOG_ENABLED}, "
+            f"max_age={HEALTH_WATCHDOG_MAX_AGE_S}s, fail_streak={HEALTH_WATCHDOG_FAIL_STREAK})."
+        )
+    except Exception as e:
+        logging.warning(f"Falha ao iniciar health watchdog: {e}")
     yield
-    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task):
+    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task):
         if t:
             t.cancel()
             try:
