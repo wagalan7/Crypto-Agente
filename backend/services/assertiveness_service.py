@@ -426,6 +426,80 @@ async def _per_coin_scorecard(days: int, limit: int = 40) -> Dict[str, Any]:
     return out
 
 
+async def _equity_curve(days: int) -> Dict[str, Any]:
+    """#8 — Curva de equity de DINHEIRO REAL. Série temporal acumulada (por
+    closed_at) dos trades reais source=auto resolvidos: R acumulado, P&L USD
+    acumulado, e o drawdown máximo (pico→vale) de cada um. Permite ver a
+    trajetória — não só o número final — e quantificar o pior soluço.
+
+    Fail-soft: erro de DB → curva vazia. Read-only."""
+    out: Dict[str, Any] = {
+        "window_days": days, "points": [],
+        "final_cum_r": 0.0, "final_cum_pnl_usd": 0.0,
+        "peak_cum_r": 0.0, "max_drawdown_r": 0.0,
+        "peak_cum_pnl_usd": 0.0, "max_drawdown_usd": 0.0,
+        "current_streak": 0,  # >0 = vitórias seguidas; <0 = derrotas seguidas
+    }
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            rows = list((await session.execute(
+                select(RealTrade.symbol, RealTrade.realized_r,
+                       RealTrade.pnl_usd, RealTrade.closed_at)
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.status != "open")
+                .where(RealTrade.closed_at.is_not(None))
+                .where(RealTrade.closed_at >= since)
+                .order_by(RealTrade.closed_at.asc())
+            )).all())
+    except Exception as e:
+        log.warning(f"[assertiveness] equity_curve read falhou: {e}")
+        return out
+    if not rows:
+        return out
+    cum_r = 0.0
+    cum_pnl = 0.0
+    peak_r = 0.0
+    peak_pnl = 0.0
+    max_dd_r = 0.0
+    max_dd_pnl = 0.0
+    streak = 0
+    points = []
+    for sym, r, pnl, closed in rows:
+        rv = float(r) if r is not None else 0.0
+        pv = float(pnl or 0)
+        cum_r += rv
+        cum_pnl += pv
+        peak_r = max(peak_r, cum_r)
+        peak_pnl = max(peak_pnl, cum_pnl)
+        max_dd_r = max(max_dd_r, peak_r - cum_r)
+        max_dd_pnl = max(max_dd_pnl, peak_pnl - cum_pnl)
+        # streak: reinicia ao trocar de sinal
+        if rv > 0:
+            streak = streak + 1 if streak > 0 else 1
+        elif rv < 0:
+            streak = streak - 1 if streak < 0 else -1
+        points.append({
+            "t": closed.isoformat() if closed else None,
+            "base": _norm_base(sym, set()),
+            "r": round(rv, 3), "pnl_usd": round(pv, 2),
+            "cum_r": round(cum_r, 3), "cum_pnl_usd": round(cum_pnl, 2),
+        })
+    out.update({
+        "points": points,
+        "final_cum_r": round(cum_r, 3),
+        "final_cum_pnl_usd": round(cum_pnl, 2),
+        "peak_cum_r": round(peak_r, 3),
+        "max_drawdown_r": round(max_dd_r, 3),
+        "peak_cum_pnl_usd": round(peak_pnl, 2),
+        "max_drawdown_usd": round(max_dd_pnl, 2),
+        "current_streak": streak,
+    })
+    return out
+
+
 async def _calibration_stats() -> Dict[str, Any]:
     out = {"mature": False, "total_resolved": 0, "min_sample": 30,
            "p_global": None, "win_rate_pct": None, "computed_at": None}
@@ -472,6 +546,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     opportunity_cost = await _opportunity_cost(days)
     funnel = await _funnel(gate_days, gates)
     scorecard = await _per_coin_scorecard(days)
+    equity_curve = await _equity_curve(days)
     return {
         "enabled": True,
         "window_days": days,
@@ -482,5 +557,6 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "opportunity_cost": opportunity_cost,
         "funnel": funnel,
         "scorecard": scorecard,
+        "equity_curve": equity_curve,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
