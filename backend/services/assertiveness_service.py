@@ -327,6 +327,105 @@ async def _funnel(days: int, gates: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+async def _per_coin_scorecard(days: int, limit: int = 40) -> Dict[str, Any]:
+    """#7 — Scorecard por moeda. Para cada base, cruza o desempenho de DINHEIRO
+    REAL (real_trades source=auto, verdade-terreno mas amostra pequena) com o do
+    SHADOW (recommendation_snapshots resolvidos, amostra grande). Serve pra
+    responder, moeda a moeda, 'quem puxa lucro e quem dreno?' — insumo direto
+    pra decidir allowlist/rotação. Ordena por R real somado (depois shadow).
+
+    Fail-soft: qualquer erro vira lista vazia, nunca derruba a API."""
+    out: Dict[str, Any] = {"window_days": days, "coins": [], "total_coins": 0}
+    real_by: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0, "rs": [], "pnl": 0.0, "last": None})
+    shad_by: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0, "rs": []})
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    # base normalizada usa a allowlist como referência de des-prefixo 1000
+    try:
+        from services.shadow_trade_service import get_exec_allowlist
+        allow = set(get_exec_allowlist() or set())
+    except Exception:
+        allow = set()
+    # 1) dinheiro real
+    try:
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            rows = list((await session.execute(
+                select(RealTrade.symbol, RealTrade.status, RealTrade.realized_r,
+                       RealTrade.pnl_usd, RealTrade.opened_at)
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.status != "open")
+                .where(RealTrade.opened_at >= since)
+            )).all())
+        for sym, st, r, pnl, opened in rows:
+            b = _norm_base(sym, allow)
+            d = real_by[b]
+            d["n"] += 1
+            rv = float(r) if r is not None else 0.0
+            d["rs"].append(rv)
+            if rv > 0:
+                d["wins"] += 1
+            d["pnl"] += float(pnl or 0)
+            iso = opened.isoformat() if opened else None
+            if iso and (d["last"] is None or iso > d["last"]):
+                d["last"] = iso
+    except Exception as e:
+        log.warning(f"[assertiveness] scorecard real read falhou: {e}")
+    # 2) shadow (amostra grande)
+    try:
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        async with get_session() as session:
+            srows = list((await session.execute(
+                select(RecommendationSnapshot.symbol,
+                       RecommendationSnapshot.status,
+                       RecommendationSnapshot.realized_r)
+                .where(RecommendationSnapshot.status.in_(_SNAP_RESOLVED))
+                .where(_calib._not_fast_void())
+                .where(RecommendationSnapshot.outcome_at >= since)
+            )).all())
+        for sym, st, r in srows:
+            b = _norm_base(sym, allow)
+            d = shad_by[b]
+            d["n"] += 1
+            d["rs"].append(float(r) if r is not None else 0.0)
+            if st in _SNAP_WIN:
+                d["wins"] += 1
+    except Exception as e:
+        log.warning(f"[assertiveness] scorecard shadow read falhou: {e}")
+
+    bases = set(real_by) | set(shad_by)
+    coins = []
+    for b in bases:
+        rm = real_by.get(b)
+        sh = shad_by.get(b)
+        entry: Dict[str, Any] = {"base": b, "in_allowlist": b in allow}
+        if rm and rm["n"]:
+            n = rm["n"]
+            entry["real"] = {
+                "count": n, "win_rate_pct": round(rm["wins"] / n * 100, 1),
+                "avg_r": round(sum(rm["rs"]) / n, 3), "sum_r": round(sum(rm["rs"]), 2),
+                "sum_pnl_usd": round(rm["pnl"], 2), "last_opened_at": rm["last"],
+            }
+        else:
+            entry["real"] = {"count": 0, "win_rate_pct": None, "avg_r": None,
+                             "sum_r": 0.0, "sum_pnl_usd": 0.0, "last_opened_at": None}
+        if sh and sh["n"]:
+            n = sh["n"]
+            entry["shadow"] = {
+                "count": n, "win_rate_pct": round(sh["wins"] / n * 100, 1),
+                "avg_r": round(sum(sh["rs"]) / n, 3), "sum_r": round(sum(sh["rs"]), 2),
+            }
+        else:
+            entry["shadow"] = {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": 0.0}
+        coins.append(entry)
+    # ordena: maior R real somado primeiro; empate desempata por R shadow somado
+    coins.sort(key=lambda c: (c["real"]["sum_r"], c["shadow"]["sum_r"]), reverse=True)
+    out["total_coins"] = len(coins)
+    out["coins"] = coins[:limit]
+    return out
+
+
 async def _calibration_stats() -> Dict[str, Any]:
     out = {"mature": False, "total_resolved": 0, "min_sample": 30,
            "p_global": None, "win_rate_pct": None, "computed_at": None}
@@ -372,6 +471,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     calibration = await _calibration_stats()
     opportunity_cost = await _opportunity_cost(days)
     funnel = await _funnel(gate_days, gates)
+    scorecard = await _per_coin_scorecard(days)
     return {
         "enabled": True,
         "window_days": days,
@@ -381,5 +481,6 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "calibration": calibration,
         "opportunity_cost": opportunity_cost,
         "funnel": funnel,
+        "scorecard": scorecard,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
