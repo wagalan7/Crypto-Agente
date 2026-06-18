@@ -94,6 +94,7 @@ _recalibration_task: Optional[asyncio.Task] = None
 _reminders_task: Optional[asyncio.Task] = None
 _rotation_task: Optional[asyncio.Task] = None
 _health_watchdog_task: Optional[asyncio.Task] = None
+_digest_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
 # Quantos símbolos varrer por ciclo (top-N por volume). Universo maior = mais
@@ -153,6 +154,15 @@ HEALTH_WATCHDOG_STALE_SUSTAIN = int(os.getenv("HEALTH_WATCHDOG_STALE_SUSTAIN", "
 HEALTH_WATCHDOG_FAIL_STREAK = int(os.getenv("HEALTH_WATCHDOG_FAIL_STREAK", "3"))
 # Tempo mínimo (s) entre re-alertas da MESMA condição ainda ativa.
 HEALTH_WATCHDOG_COOLDOWN_S = int(os.getenv("HEALTH_WATCHDOG_COOLDOWN_S", "1800"))
+
+# ── #C Digest diário (Telegram) — relato proativo 1x/dia ─────────────────────
+# Resumo da assertividade (equity, win-rate, calibração, viés direcional) enviado
+# uma vez por dia. Reaproveita send_telegram do #9 — no-op se Telegram não
+# configurado. Default ON (puramente informativo, sem efeito em execução).
+DIGEST_ENABLED = os.getenv("DIGEST_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", "11"))   # 11 UTC = 08h BRT
+DIGEST_CHECK_INTERVAL = int(os.getenv("DIGEST_CHECK_INTERVAL_SEC", "1800"))
+DIGEST_WINDOW_DAYS = int(os.getenv("DIGEST_WINDOW_DAYS", "30"))
 
 # ── Recalibração automática da autoaprendizagem ─────────────────────────────
 # A cada N dias o app reaprende com TODO o histórico (score→P(TP1) + buckets).
@@ -671,9 +681,101 @@ async def _health_watchdog_loop():
             break
 
 
+def _fmt_digest(a: Dict[str, Any]) -> str:
+    """Monta o texto do digest diário a partir do get_assertiveness(). Tolerante
+    a seções ausentes/None — nunca lança."""
+    def g(d, *keys, default=None):
+        for k in keys:
+            if not isinstance(d, dict):
+                return default
+            d = d.get(k)
+        return d if d is not None else default
+
+    eq = a.get("equity_curve") or {}
+    rm = a.get("real_money") or {}
+    cal = a.get("calibration_audit") or {}
+    dire = a.get("directional") or {}
+    gc = a.get("gate_counterfactual") or {}
+    win = a.get("window_days", DIGEST_WINDOW_DAYS)
+
+    lines = [f"📊 *Digest diário* — janela {win}d (dinheiro real, source=auto)"]
+    # Equity
+    fcr = g(eq, "final_cum_r", default=0.0)
+    fpnl = g(eq, "final_cum_pnl_usd", default=0.0)
+    ddr = g(eq, "max_drawdown_r", default=0.0)
+    streak = g(eq, "current_streak", default=0)
+    npts = len(eq.get("points") or [])
+    lines.append(f"• Equity: cumR *{fcr:+.2f}* · PnL *${fpnl:+.2f}* · maxDD {ddr:.2f}R · "
+                 f"streak {streak:+d} · {npts} trades")
+    # Win-rate real
+    if rm.get("count"):
+        lines.append(f"• Real: {rm['count']} trades · win {rm.get('win_rate_pct')}% · "
+                     f"avg_R {rm.get('avg_r')} · TP1 {rm.get('tp1_hit_rate_pct')}%")
+    else:
+        lines.append("• Real: sem trades resolvidos na janela")
+    # Calibração
+    if cal.get("enabled"):
+        lines.append(f"• Calibração: gap {cal.get('calib_gap_pct')}pp · Brier {cal.get('brier')} · "
+                     f"{cal.get('verdict')}")
+    # Viés direcional
+    if dire.get("verdict"):
+        lines.append(f"• Direcional: {dire['verdict']}")
+    # Gates (vereditos curtos)
+    qe = g(gc, "quality_edge", "verdict")
+    if qe:
+        lines.append(f"• Gate quality-edge: {qe}")
+    rs = g(gc, "regime_sizing", "verdict")
+    if rs:
+        lines.append(f"• Gate regime-size: {rs}")
+    # Últimos 3 fechamentos
+    pts = (eq.get("points") or [])[-3:]
+    if pts:
+        tail = " · ".join(f"{p.get('base')} {p.get('r'):+.2f}R" for p in pts)
+        lines.append(f"• Últimos: {tail}")
+    return "\n".join(lines)
+
+
+async def _daily_digest_loop():
+    """#C — Digest diário no Telegram (1x/dia às DIGEST_HOUR_UTC). Resumo proativo
+    da assertividade. Reaproveita send_telegram (#9). No-op se Telegram off."""
+    if not DIGEST_ENABLED:
+        logging.info("[digest] desativado (DIGEST_ENABLED=false).")
+        return
+    await asyncio.sleep(150)  # espera o boot assentar
+    last_sent_date = None     # date (UTC) do último envio — dedup 1x/dia
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            if now.hour == DIGEST_HOUR_UTC and now.date() != last_sent_date:
+                from services.assertiveness_service import get_assertiveness
+                a = await get_assertiveness(days=DIGEST_WINDOW_DAYS)
+                if a.get("enabled"):
+                    text = _fmt_digest(a)
+                    try:
+                        from services import notification_service
+                        ok = await notification_service.send_telegram(
+                            text, event_type="digest", parse_mode="Markdown"
+                        )
+                        logging.info(f"[digest] enviado (telegram ok={ok}).")
+                    except Exception as e:
+                        logging.warning(f"[digest] envio falhou: {e}")
+                    last_sent_date = now.date()  # marca mesmo se telegram off (evita loop quente)
+                else:
+                    logging.info("[digest] assertiveness desabilitado, pulando.")
+                    last_sent_date = now.date()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.warning(f"[digest] ciclo falhou: {e}", exc_info=True)
+        try:
+            await asyncio.sleep(DIGEST_CHECK_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task
+    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task
     # Banner de segurança go-live — shadow vs live, produção vs demo, canary.
     try:
         from services import shadow_trade_service
@@ -743,8 +845,14 @@ async def lifespan(app: FastAPI):
         )
     except Exception as e:
         logging.warning(f"Falha ao iniciar health watchdog: {e}")
+    # #C — Digest diário no Telegram (relato proativo 1x/dia)
+    try:
+        _digest_task = asyncio.create_task(_daily_digest_loop())
+        logging.info(f"Digest diário iniciado (enabled={DIGEST_ENABLED}, hora_utc={DIGEST_HOUR_UTC}).")
+    except Exception as e:
+        logging.warning(f"Falha ao iniciar digest diário: {e}")
     yield
-    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task):
+    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task):
         if t:
             t.cancel()
             try:
