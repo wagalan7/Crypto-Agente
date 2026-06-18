@@ -141,21 +141,26 @@ async def notify_rotation_plan(plan: Dict[str, Any]) -> bool:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# FASE 2 — APLICAÇÃO AUTOMÁTICA (atrás de flag, default OFF)
+# FASE 2 — APLICAÇÃO AUTOMÁTICA (LIGADA por pedido do usuário em 2026-06-18)
 # ════════════════════════════════════════════════════════════════════════════
 # Quando ROTATION_AUTO_APPLY=on: a cada ciclo o motor confronta o plano dry-run
 # com o estado persistido (DB) e SÓ aplica uma mudança que:
 #   1. passou o piso de liquidez (promote só de bases no top-N por volume), e
 #   2. sustentou ROTATION_HYSTERESIS_CYCLES ciclos consecutivos (histerese), e
-#   3. respeita o teto ROTATION_MAX_UNIVERSE (quando cheio, promove por desloca-
-#      mento: só entram tantos quantos saírem por demote; o resto fica pendente).
+#   3. respeita o teto ROTATION_MAX_UNIVERSE (cresce de forma ADITIVA até o teto;
+#      quando cheio, promove por deslocamento — só entra quem sai por demote).
 # Promoção aditiva, demoção rara. A allowlist gerida vive no DB (env = seed).
-# Com a flag OFF (default) NADA disto roda: rotação segue 100% dry-run (FASE 1).
+#
+# DESLIGAR a qualquer momento (sem deploy): setar env ROTATION_AUTO_APPLY=false.
+# IMPORTANTE: com auto-apply ON, a FONTE DA VERDADE da allowlist passa a ser o DB
+# (semeado do env). Editar EXEC_UNIVERSE_ALLOWLIST no env NÃO tem mais efeito
+# enquanto estiver ON — pra mexer na lista manualmente, desligue antes ou ajuste
+# via DB. Default do teto = 350 (cresce 100 → até 350 conforme moedas qualificam).
 
-ROTATION_AUTO_APPLY = os.getenv("ROTATION_AUTO_APPLY", "false").strip().lower() in (
+ROTATION_AUTO_APPLY = os.getenv("ROTATION_AUTO_APPLY", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
-ROTATION_MAX_UNIVERSE = int(os.getenv("ROTATION_MAX_UNIVERSE", "100"))
+ROTATION_MAX_UNIVERSE = int(os.getenv("ROTATION_MAX_UNIVERSE", "350"))
 ROTATION_HYSTERESIS_CYCLES = max(1, int(os.getenv("ROTATION_HYSTERESIS_CYCLES", "3")))
 # Piso de liquidez: só promove bases dentro do top-N por volume 24h.
 ROTATION_LIQ_FLOOR_TOP_N = int(os.getenv("ROTATION_LIQ_FLOOR_TOP_N", "200"))
