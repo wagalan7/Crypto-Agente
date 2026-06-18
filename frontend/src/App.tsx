@@ -239,6 +239,9 @@ export default function App() {
   const [loadingSignals, setLoadingSignals] = useState(false)
   const [loadingProgress, setLoadingProgress] = useState(0)
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null)
+  // TF do setup clicado (Recomendados/Abertos) — pra analisar o gráfico no
+  // MESMO timeframe em que o padrão foi detectado. null = usa o TF do modo.
+  const [selectedTimeframe, setSelectedTimeframe] = useState<string | null>(null)
   const [clock, setClock] = useState(new Date())
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768)
 
@@ -684,7 +687,7 @@ export default function App() {
             asset={asset}
             rank={i + 1}
             tradeMode={tradeMode}
-            onClick={() => setSelectedSymbol(asset.symbol)}
+            onClick={() => { setSelectedSymbol(asset.symbol); setSelectedTimeframe(null) }}
           />
         ))}
         {sorted.length === 0 && !loadingSignals && assets.length > 0 && (
@@ -723,7 +726,7 @@ export default function App() {
           <div className="flex-1 overflow-hidden">
             <ChartPanel
               symbol={selectedSymbol}
-              timeframe={TRADE_MODES[tradeMode].timeframe}
+              timeframe={selectedTimeframe ?? TRADE_MODES[tradeMode].timeframe}
               onClose={() => setSelectedSymbol(null)}
               isMobile={isMobile}
               onAddSignalToManager={(sig) => {
@@ -740,6 +743,7 @@ export default function App() {
           onClose={() => { setShowTradeManager(false); setPendingSignal(null) }}
           onSelectSymbol={(sym) => {
             setSelectedSymbol(sym)
+            setSelectedTimeframe(null)
             setShowTradeManager(false)
           }}
           initialSignal={pendingSignal}
@@ -756,8 +760,9 @@ export default function App() {
             setShowRecommendations(false)
             clearPushFocus()
           }}
-          onSelectSymbol={(sym) => {
+          onSelectSymbol={(sym, tf) => {
             setSelectedSymbol(sym)
+            setSelectedTimeframe(tf ?? null)
             setShowRecommendations(false)
             clearPushFocus()
           }}
@@ -777,8 +782,9 @@ export default function App() {
             setShowDailyPnL(false)
             clearPushFocus()
           }}
-          onSelectSymbol={(sym) => {
+          onSelectSymbol={(sym, tf) => {
             setSelectedSymbol(sym)
+            setSelectedTimeframe(tf ?? null)
             setShowDailyPnL(false)
             clearPushFocus()
           }}

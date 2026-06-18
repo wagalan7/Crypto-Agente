@@ -308,7 +308,15 @@ export const CandleChart = forwardRef<CandleChartHandle, Props>(
         size: number
       }[] = []
       signal.patterns
-        .filter(p => p.direction === signal.direction || p.direction === 'neutral')
+        // Sinal direcional → só padrões na mesma direção (ou neutros), pra não
+        // desenhar uma estrutura que contradiz o viés. Sinal NEUTRO → sem viés
+        // a contradizer, então mostra o padrão mais forte seja qual for (ex.:
+        // AUCTION neutro com cunha descendente de alta confiança).
+        .filter(p =>
+          signal.direction === 'neutral' ||
+          p.direction === signal.direction ||
+          p.direction === 'neutral'
+        )
         .slice()
         .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))
         .slice(0, 1)

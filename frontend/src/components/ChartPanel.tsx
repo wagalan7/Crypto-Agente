@@ -19,6 +19,16 @@ interface Props {
 
 const TIMEFRAMES = ['1m', '5m', '15m', '30m', '1h', '4h', '6h', '8h', '12h', '1d', '3d']
 
+// Padrões GEOMÉTRICOS (diagonais) que valem a pena abrir desenhados no gráfico
+// local — o TradingView não desenha. OB/FVG/duplo/OCO ficam de fora (são
+// zonas/níveis, não traçados que precisem do canvas local).
+const DRAWABLE_PATTERNS = new Set<string>([
+  'lta', 'ltb',
+  'ascending_channel', 'descending_channel', 'horizontal_channel',
+  'symmetric_triangle', 'ascending_triangle', 'descending_triangle',
+  'ascending_wedge', 'descending_wedge',
+])
+
 function cleanName(s: string) {
   return s.replace('/USDT:USDT', '/USDT').replace(':USDT', '')
 }
@@ -85,20 +95,42 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
 
   // Fallback para lightweight-charts quando símbolo não existe no TradingView
   const [useFallback, setUseFallback] = useState(false)
+  // Marca se o usuário trocou TV/local na mão — pra não sobrescrever a escolha
+  // dele com o auto-switch de padrão. Reseta a cada novo símbolo/TF.
+  const userToggledFallbackRef = useRef(false)
 
   const runAnalysis = useCallback(() => {
     analyze(symbol, tf, withAi)
   }, [analyze, symbol, tf, withAi])
 
-  // Reseta fallback quando muda de símbolo — novo símbolo pode funcionar no TradingView
+  // O TF vem como prop (do setup clicado em Recomendados/Abertos). Como `tf` é
+  // estado interno, precisa sincronizar quando a prop muda — senão o gráfico
+  // analisa no TF antigo e o padrão do setup (ex.: cunha no 12h) some.
+  useEffect(() => { setTf(initialTf) }, [initialTf])
+
+  // Reseta fallback quando muda de símbolo/TF — novo símbolo pode funcionar no
+  // TradingView. O auto-switch abaixo reabre o local se houver padrão desenhável.
   useEffect(() => {
     setUseFallback(false)
+    userToggledFallbackRef.current = false
     setDisplaySignal(null)
     runAnalysis()
   }, [symbol, tf])
 
   useEffect(() => {
     if (signal) setDisplaySignal(signal)
+  }, [signal])
+
+  // Auto-abre o gráfico LOCAL quando a análise traz um padrão GEOMÉTRICO
+  // relevante (cunha/canal/triângulo/LTA/LTB) — o TradingView não desenha
+  // padrões, então sem isso o usuário abria o setup e não via a cunha/canal.
+  // Só dispara se o usuário não tiver trocado pra TV manualmente.
+  useEffect(() => {
+    if (!signal || userToggledFallbackRef.current) return
+    const hasDrawable = signal.patterns?.some(
+      p => DRAWABLE_PATTERNS.has(p.type) && p.lines?.length,
+    )
+    if (hasDrawable) setUseFallback(true)
   }, [signal])
 
   return (
@@ -123,7 +155,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
             </>
           )}
           <button
-            onClick={() => setUseFallback(v => !v)}
+            onClick={() => { userToggledFallbackRef.current = true; setUseFallback(v => !v) }}
             title={useFallback
               ? 'Modo local: desenha os padrões detectados e os níveis do sinal. Toque pra voltar ao TradingView.'
               : 'TradingView não desenha os padrões detectados pelo bot. Use o gráfico local (📊) pra ver o padrão e os níveis desenhados.'}
@@ -206,7 +238,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
                   avisa e oferece trocar pro gráfico local (que desenha). */}
               {displaySignal?.patterns?.some(p => p.lines?.length) && (
                 <button
-                  onClick={() => setUseFallback(true)}
+                  onClick={() => { userToggledFallbackRef.current = true; setUseFallback(true) }}
                   title="O padrão detectado pelo bot não aparece no TradingView. Toque pra abrir no gráfico local com o padrão desenhado."
                   className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-amber-500/50 bg-amber-900/80 backdrop-blur text-amber-200 text-[11px] font-semibold shadow-lg hover:bg-amber-800/90 transition-colors"
                 >
