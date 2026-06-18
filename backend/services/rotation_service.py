@@ -163,7 +163,10 @@ ROTATION_AUTO_APPLY = os.getenv("ROTATION_AUTO_APPLY", "true").strip().lower() i
 ROTATION_MAX_UNIVERSE = int(os.getenv("ROTATION_MAX_UNIVERSE", "350"))
 ROTATION_HYSTERESIS_CYCLES = max(1, int(os.getenv("ROTATION_HYSTERESIS_CYCLES", "3")))
 # Piso de liquidez: só promove bases dentro do top-N por volume 24h.
-ROTATION_LIQ_FLOOR_TOP_N = int(os.getenv("ROTATION_LIQ_FLOOR_TOP_N", "200"))
+# Alinhado ao teto (ROTATION_MAX_UNIVERSE=350): o limitador deixa de ser
+# liquidez e passa a ser amostra+avg_R+histerese. Liquidez ruim que gera
+# trades ruins nunca passa no gate de performance (≥15 amostras, avg_R>0, 3 ciclos).
+ROTATION_LIQ_FLOOR_TOP_N = int(os.getenv("ROTATION_LIQ_FLOOR_TOP_N", "350"))
 # Cadência do loop de aplicação (segundos). Default 6h → histerese de 3 ciclos ≈ 18h.
 ROTATION_APPLY_INTERVAL_SEC = int(os.getenv("ROTATION_APPLY_INTERVAL_SEC", "21600"))
 # Heartbeat do loop (segundos). 1h → preview semanal pontual ~1h; apply é gated
