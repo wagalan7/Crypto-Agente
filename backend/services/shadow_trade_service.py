@@ -514,6 +514,24 @@ LIQ_DAMP_PART_LO = float(os.getenv("LIQ_DAMP_PART_LO", "0.003"))   # 0.3% do vol
 LIQ_DAMP_PART_HI = float(os.getenv("LIQ_DAMP_PART_HI", "0.02"))    # 2% do vol 24h: damp máx
 LIQ_DAMP_MULT_MIN = float(os.getenv("LIQ_DAMP_MULT_MIN", "0.5"))   # size mínimo por participação
 
+# ── Sizing por FAIXA de liquidez da moeda ───────────────────────────────────
+# Diferente do size-damp acima (que mira PARTICIPAÇÃO notional/vol, NO-OP em
+# tamanhos pequenos), este olha o VOLUME 24h absoluto da própria moeda e aplica
+# "mão menor" em moedas magras. Encaixe pro piso de rotação 350: moedas no
+# rank 200-350 (~$2-6M/dia) entram com size reduzido — aprendem e lucram quando
+# o trade for a favor, arriscam ainda menos quando for contra. O risco já é
+# fixo por trade (1R com SL), então isto só encolhe o R nas magras.
+# DEFENSIVO (teto 1.0, só reduz), fail-soft (vol ausente = mão cheia), compõe
+# multiplicativo com edge/conviction/LIVE_SIZE_MULT/size-damp.
+LIQ_TIER_SIZING_ENABLED = os.getenv("LIQ_TIER_SIZING_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Limiares de volume 24h (USD) e multiplicadores por faixa. Acima do HI = ×1.0.
+LIQ_TIER_VOL_HI = float(os.getenv("LIQ_TIER_VOL_HI", "50000000"))   # ≥$50M → mão cheia
+LIQ_TIER_VOL_MID = float(os.getenv("LIQ_TIER_VOL_MID", "10000000")) # ≥$10M → ×MULT_MID
+LIQ_TIER_VOL_LO = float(os.getenv("LIQ_TIER_VOL_LO", "3000000"))    # ≥$3M  → ×MULT_LO; abaixo → ×MULT_MIN
+LIQ_TIER_MULT_MID = float(os.getenv("LIQ_TIER_MULT_MID", "0.75"))
+LIQ_TIER_MULT_LO = float(os.getenv("LIQ_TIER_MULT_LO", "0.5"))
+LIQ_TIER_MULT_MIN = float(os.getenv("LIQ_TIER_MULT_MIN", "0.35"))   # <$3M (rank ~250-350)
+
 # ── P(TP1) gate (calibração) ────────────────────────────────────────────────
 # rec.prob_tp1 = P(TP1) calibrada por bin de score (calibration_service). Pula
 # setups com probabilidade calibrada baixa de bater o TP1. NO-OP-SAFE: quando a
@@ -2291,6 +2309,29 @@ def _exec_size_damp(rec: dict, notional_usd: float) -> tuple[float, str]:
     return round(mult, 4), f"{tag} ⇒ ×{mult:.2f}"
 
 
+def _liq_tier_mult(rec: dict) -> tuple[float, str]:
+    """Multiplicador de tamanho por FAIXA de volume 24h da moeda (≤1.0).
+    Mão menor em moedas magras (liberadas pelo piso de rotação 350). Retorna
+    (mult, reason). Fail-soft: vol ausente = mão cheia. Flag OFF = (1.0, 'off')."""
+    if not LIQ_TIER_SIZING_ENABLED:
+        return 1.0, "off"
+    try:
+        qvol = float(rec.get("quote_vol_usd")) if rec.get("quote_vol_usd") is not None else None
+    except Exception:
+        qvol = None
+    if qvol is None or qvol <= 0:
+        return 1.0, "vol n/d → mão cheia"
+    if qvol >= LIQ_TIER_VOL_HI:
+        return 1.0, f"vol ${qvol/1e6:.0f}M ≥ ${LIQ_TIER_VOL_HI/1e6:.0f}M → cheia"
+    if qvol >= LIQ_TIER_VOL_MID:
+        m = LIQ_TIER_MULT_MID
+    elif qvol >= LIQ_TIER_VOL_LO:
+        m = LIQ_TIER_MULT_LO
+    else:
+        m = LIQ_TIER_MULT_MIN
+    return round(m, 4), f"vol ${qvol/1e6:.1f}M → ×{m:.2f}"
+
+
 async def open_shadow_for_recs(recs: list[dict]) -> int:
     """
     Pra cada rec marcada com `_just_saved=True` e tier A/A+, abre uma RealTrade.
@@ -2757,6 +2798,26 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f}"
                         )
                         _record_skip(rec, "size-damp", f"notional pós-damp < mín ({_dmp_reason})")
+                        continue
+
+            # ── Sizing por faixa de liquidez — mão menor em moeda magra.
+            # Só LIVE. DEFENSIVO (só reduz). Se jogar abaixo do mínimo, pula
+            # (moeda magra demais pro size atual — sem fill ruim).
+            if not SHADOW_ENABLED and LIQ_TIER_SIZING_ENABLED:
+                _lt, _lt_reason = _liq_tier_mult(rec)
+                if _lt < 1.0:
+                    _qty_pre_lt = qty
+                    qty = round(qty * _lt, 6)
+                    notional_effective = qty * entry
+                    log.info(
+                        f"[liq-tier] {rec.get('symbol')} qty {_qty_pre_lt}→{qty} ({_lt_reason})"
+                    )
+                    if notional_effective < MIN_NOTIONAL_USD:
+                        log.warning(
+                            f"[liq-tier] {rec.get('symbol')} SKIP: notional pós-tier "
+                            f"${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f}"
+                        )
+                        _record_skip(rec, "liq-tier", f"notional pós-tier < mín ({_lt_reason})")
                         continue
 
             # go-live #2 — canary/ramp: em LIVE, escala o tamanho por um
