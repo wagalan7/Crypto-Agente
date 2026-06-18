@@ -92,6 +92,7 @@ _scan_task: Optional[asyncio.Task] = None
 _trade_manager_task: Optional[asyncio.Task] = None
 _recalibration_task: Optional[asyncio.Task] = None
 _reminders_task: Optional[asyncio.Task] = None
+_rotation_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
 # Quantos símbolos varrer por ciclo (top-N por volume). Universo maior = mais
@@ -242,6 +243,46 @@ async def _recalibration_loop():
             logging.warning(f"[recalibration] erro: {e}", exc_info=True)
         try:
             await asyncio.sleep(RECALIBRATION_CHECK_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+
+async def _rotation_loop():
+    """
+    Motor de rotação do universo de execução (FASE 2).
+
+    A cada ROTATION_APPLY_INTERVAL_SEC: computa o plano dry-run e chama
+    apply_rotation_plan(). Com ROTATION_AUTO_APPLY=off (default) NADA é mutado —
+    o apply devolve só preview. Com on, aplica promote/demote com histerese +
+    piso de liquidez + teto, persistindo a allowlist no DB.
+    """
+    from services import rotation_service as rot
+    if not DB_ENABLED:
+        logging.info("[rotation] loop desativado (sem DB).")
+        return
+    # No boot: se auto-apply on, prima a allowlist efetiva com o universo do DB.
+    try:
+        await rot.prime_effective_allowlist()
+    except Exception as e:
+        logging.warning(f"[rotation] prime no boot falhou: {e}")
+    # Pequeno delay pra não competir com o boot.
+    await asyncio.sleep(120)
+    while True:
+        try:
+            res = await rot.apply_rotation_plan()
+            if res.get("applied"):
+                logging.info(
+                    f"[rotation] aplicado: +{res.get('promoted')} -{res.get('demoted')} "
+                    f"→ {res.get('new_count')} bases"
+                )
+            else:
+                logging.info(f"[rotation] sem mudança ({res.get('reason', 'histerese/estável')}).")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.warning(f"[rotation] ciclo falhou: {e}", exc_info=True)
+        try:
+            await asyncio.sleep(rot.ROTATION_APPLY_INTERVAL_SEC)
         except asyncio.CancelledError:
             break
 
@@ -444,7 +485,7 @@ async def _server_scan_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task
+    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task
     # Banner de segurança go-live — shadow vs live, produção vs demo, canary.
     try:
         from services import shadow_trade_service
@@ -495,8 +536,18 @@ async def lifespan(app: FastAPI):
         logging.info("Lembretes de vencimento iniciados.")
     except Exception as e:
         logging.warning(f"Falha ao iniciar reminders: {e}")
+    # Motor de rotação do universo de execução (FASE 2 — atrás de ROTATION_AUTO_APPLY)
+    try:
+        from services.rotation_service import ROTATION_AUTO_APPLY, ROTATION_APPLY_INTERVAL_SEC
+        _rotation_task = asyncio.create_task(_rotation_loop())
+        logging.info(
+            f"Motor de rotação iniciado (auto_apply={ROTATION_AUTO_APPLY}, "
+            f"intervalo {ROTATION_APPLY_INTERVAL_SEC}s)."
+        )
+    except Exception as e:
+        logging.warning(f"Falha ao iniciar rotação: {e}")
     yield
-    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task):
+    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task):
         if t:
             t.cancel()
             try:
@@ -1159,6 +1210,47 @@ async def rotation_plan(days: int = 0):
     except Exception as e:
         logging.error(f"rotation plan error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao computar plano de rotação: {e}")
+
+
+@app.post("/api/rotation/apply")
+async def rotation_apply():
+    """
+    Dispara um ciclo do motor de rotação (FASE 2) manualmente.
+      • ROTATION_AUTO_APPLY=off (default) → devolve só PREVIEW, não muta nada.
+      • on → aplica promote/demote com histerese + piso de liquidez + teto e
+        persiste a allowlist no DB. Mesma lógica do loop automático.
+    Inspeção/validação. NÃO abre trades — só ajusta quais bases PODEM ser operadas.
+    """
+    try:
+        from services.rotation_service import apply_rotation_plan
+        return await apply_rotation_plan()
+    except Exception as e:
+        logging.error(f"rotation apply error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao aplicar rotação: {e}")
+
+
+@app.get("/api/rotation/state")
+async def rotation_state():
+    """Estado persistido do motor de rotação (universo gerido + contadores de histerese)."""
+    try:
+        from services.rotation_service import (
+            ROTATION_AUTO_APPLY, ROTATION_MAX_UNIVERSE, ROTATION_HYSTERESIS_CYCLES,
+            ROTATION_LIQ_FLOOR_TOP_N, ROTATION_APPLY_INTERVAL_SEC, _load_state,
+        )
+        cfg = {
+            "auto_apply": ROTATION_AUTO_APPLY,
+            "max_universe": ROTATION_MAX_UNIVERSE,
+            "hysteresis_cycles": ROTATION_HYSTERESIS_CYCLES,
+            "liq_floor_top_n": ROTATION_LIQ_FLOOR_TOP_N,
+            "apply_interval_sec": ROTATION_APPLY_INTERVAL_SEC,
+        }
+        if not DB_ENABLED:
+            return {"config": cfg, "state": None, "note": "DB desabilitado"}
+        st = await _load_state()
+        return {"config": cfg, "state": {"universe_count": len(st["universe"]), **st}}
+    except Exception as e:
+        logging.error(f"rotation state error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao obter estado da rotação: {e}")
 
 
 @app.get("/api/score/feature-analysis")

@@ -358,6 +358,26 @@ EXEC_UNIVERSE_ALLOWLIST: set[str] = {
     s.strip().upper() for s in os.getenv("EXEC_UNIVERSE_ALLOWLIST", "").split(",") if s.strip()
 }
 
+# Allowlist EFETIVA usada no gate de execução. Default = env (comportamento atual,
+# intocado). O motor de rotação (FASE 2) pode sobrescrever em runtime via
+# `set_exec_allowlist()` quando ROTATION_AUTO_APPLY=on. Mantida em memória pra não
+# bater no DB a cada rec; a rotação atualiza isto quando aplica uma mudança.
+_EFFECTIVE_ALLOWLIST: set[str] = set(EXEC_UNIVERSE_ALLOWLIST)
+
+
+def get_exec_allowlist() -> set[str]:
+    """Allowlist de execução efetiva (env por default; rotação pode sobrescrever)."""
+    return _EFFECTIVE_ALLOWLIST
+
+
+def set_exec_allowlist(bases) -> None:
+    """Sobrescreve a allowlist efetiva em runtime (usado pelo motor de rotação)."""
+    global _EFFECTIVE_ALLOWLIST
+    _EFFECTIVE_ALLOWLIST = {
+        str(b).strip().upper() for b in (bases or []) if str(b).strip()
+    }
+    log.info(f"[exec-universe] allowlist efetiva atualizada → {len(_EFFECTIVE_ALLOWLIST)} bases")
+
 # ── Score threshold (postmortem) ───────────────────────────────────────────
 # Subimos o piso de score para 72 (era implicitamente >=65 via tier A). O
 # postmortem mostrou win-rate sensivelmente melhor acima de 75, mas 75
@@ -2429,9 +2449,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
 
             # ── Universo de execução (allowlist): só opera real bases permitidas.
             # Vazio = sem restrição (comportamento atual). Aplicado só em live.
-            if not SHADOW_ENABLED and EXEC_UNIVERSE_ALLOWLIST:
+            _exec_allow = get_exec_allowlist()
+            if not SHADOW_ENABLED and _exec_allow:
                 base = _symbol_base(rec["symbol"])
-                if base and base not in EXEC_UNIVERSE_ALLOWLIST:
+                if base and base not in _exec_allow:
                     reason = f"{base} fora do universo de execução (allowlist)"
                     log.info(f"[exec-universe] {rec['symbol']} {reason} — skip")
                     _record_skip(rec, "exec-universe", reason)
