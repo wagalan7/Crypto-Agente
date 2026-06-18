@@ -200,6 +200,133 @@ async def _gate_stats(days: int) -> Dict[str, Any]:
     return out
 
 
+def _norm_base(symbol: str, allow: set[str]) -> str:
+    """Extrai a base de 'GAS/USDT:USDT' → 'GAS'. Normaliza prefixo 1000 quando
+    a forma sem prefixo está na allowlist (igual ao gate de execução)."""
+    b = (symbol or "").split("/")[0].strip().upper()
+    if b.startswith("1000") and b[4:] in allow:
+        return b[4:]
+    return b
+
+
+async def _opportunity_cost(days: int) -> Dict[str, Any]:
+    """#3 — Custo de oportunidade da allowlist. Entre os snapshots RESOLVIDOS
+    que eram candidatos de execução (tier A/A+ e score >= SCORE_MIN), compara o
+    desempenho das bases DENTRO vs FORA da allowlist. Responde, com número, se a
+    allowlist deixou dinheiro na mesa ou protegeu de trades ruins.
+
+    Caveat: 'fora' inclui perps de ação tokenizada (EWZ/HOOD/…) e moedas magras
+    que o bot nunca executaria — então o bucket 'fora' é teto otimista. Mesmo
+    assim, win-rate/avg_R abaixo do 'dentro' já mata o argumento de expandir."""
+    out = {
+        "enabled": True, "window_days": days, "score_min": None,
+        "in_allowlist": {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": None},
+        "out_allowlist": {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": None},
+        "verdict": None,
+    }
+    try:
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        from services.shadow_trade_service import get_exec_allowlist, SCORE_MIN
+    except Exception as e:
+        log.warning(f"[assertiveness] opportunity_cost import falhou: {e}")
+        return out
+    allow = set(get_exec_allowlist() or set())
+    out["score_min"] = SCORE_MIN
+    if not allow:
+        out["verdict"] = "allowlist vazia — sem restrição de execução"
+        return out
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        async with get_session() as session:
+            stmt = (
+                select(
+                    RecommendationSnapshot.symbol,
+                    RecommendationSnapshot.status,
+                    RecommendationSnapshot.realized_r,
+                )
+                .where(RecommendationSnapshot.tier.in_(("A", "A+")))
+                .where(RecommendationSnapshot.score >= SCORE_MIN)
+                .where(RecommendationSnapshot.status.in_(_SNAP_RESOLVED))
+                .where(_calib._not_fast_void())
+                .where(RecommendationSnapshot.outcome_at >= since)
+            )
+            rows = list((await session.execute(stmt)).all())
+    except Exception as e:
+        log.warning(f"[assertiveness] opportunity_cost read falhou: {e}")
+        return out
+
+    def _agg(items):
+        n = len(items)
+        if n == 0:
+            return {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": None}
+        rs = [float(r) if r is not None else 0.0 for _, _, r in items]
+        wins = sum(1 for _, st, _ in items if st in _SNAP_WIN)
+        return {
+            "count": n,
+            "win_rate_pct": round(wins / n * 100, 1),
+            "avg_r": round(sum(rs) / n, 3),
+            "sum_r": round(sum(rs), 2),
+        }
+
+    inside, outside = [], []
+    for sym, st, r in rows:
+        (inside if _norm_base(sym, allow) in allow else outside).append((sym, st, r))
+    out["in_allowlist"] = _agg(inside)
+    out["out_allowlist"] = _agg(outside)
+    # Veredito legível
+    ai = out["in_allowlist"]["avg_r"]
+    ao = out["out_allowlist"]["avg_r"]
+    if ao is None:
+        out["verdict"] = "nenhum candidato fora da allowlist na janela — allowlist não está custando trades"
+    elif ai is None:
+        out["verdict"] = "nenhum candidato dentro da allowlist resolvido na janela"
+    elif ao > ai:
+        out["verdict"] = (
+            f"FORA rendeu mais (avg_R {ao:+.2f} vs {ai:+.2f} dentro) em {out['out_allowlist']['count']} setups "
+            f"— allowlist pode estar deixando edge na mesa (checar se são cripto líquida, não ação/magra)"
+        )
+    else:
+        out["verdict"] = (
+            f"DENTRO rendeu igual ou mais (avg_R {ai:+.2f} vs {ao:+.2f} fora) "
+            f"— allowlist NÃO está custando; mantém a seletividade"
+        )
+    return out
+
+
+async def _funnel(days: int, gates: Dict[str, Any]) -> Dict[str, Any]:
+    """#1 — Funil de execução consolidado (janela = gate_days). Amarra os
+    candidatos tier A/A+ que chegaram ao loop com os drop-offs por gate e os
+    executados de verdade. candidates ≈ executed + total_skips."""
+    out = {"window_days": days, "candidates": None, "executed": 0,
+           "exec_rate_pct": None, "stages": []}
+    executed = 0
+    try:
+        from db import get_session
+        from models.real_trade import RealTrade
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        async with get_session() as session:
+            executed = int((await session.execute(
+                select(func.count(RealTrade.id))
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.opened_at >= since)
+            )).scalar() or 0)
+    except Exception as e:
+        log.warning(f"[assertiveness] funnel executed read falhou: {e}")
+    total_skips = int(gates.get("total_skips") or 0)
+    candidates = total_skips + executed
+    out["executed"] = executed
+    out["candidates"] = candidates
+    out["exec_rate_pct"] = round(executed / candidates * 100, 1) if candidates else None
+    # Etapas ordenadas: cada gate como um degrau de queda, executados no fim.
+    stages = [{"stage": "candidatos_tierA", "count": candidates}]
+    for it in gates.get("items", []):
+        stages.append({"stage": f"barrado:{it['gate']}", "count": it["count"]})
+    stages.append({"stage": "executados", "count": executed})
+    out["stages"] = stages
+    return out
+
+
 async def _calibration_stats() -> Dict[str, Any]:
     out = {"mature": False, "total_resolved": 0, "min_sample": 30,
            "p_global": None, "win_rate_pct": None, "computed_at": None}
@@ -243,6 +370,8 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     shadow = await _shadow_stats(days)
     gates = await _gate_stats(gate_days)
     calibration = await _calibration_stats()
+    opportunity_cost = await _opportunity_cost(days)
+    funnel = await _funnel(gate_days, gates)
     return {
         "enabled": True,
         "window_days": days,
@@ -250,5 +379,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "shadow": shadow,
         "gates": gates,
         "calibration": calibration,
+        "opportunity_cost": opportunity_cost,
+        "funnel": funnel,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
