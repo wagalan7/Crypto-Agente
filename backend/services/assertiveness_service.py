@@ -779,6 +779,129 @@ async def _regime_audit(days: int) -> Dict[str, Any]:
     return out
 
 
+async def _trade_journal(days: int, limit: int = 60) -> Dict[str, Any]:
+    """#D — Diário/post-mortem por trade. Para cada trade REAL fechado (source=
+    auto), cruza com o snapshot de origem (real_trade.recommendation_id →
+    recommendation_snapshots.id) e anexa o CONTEXTO DA ENTRADA: score, regime
+    (features['regime']) e P(TP1) calibrado no momento. Depois agrega padrões —
+    por regime e por bin de score — pra fazer emergir 'onde as perdas concentram'.
+
+    Insight extra: 'perdas de alta convicção' (P(TP1) >= 65% na entrada que ainda
+    assim deram stop) — sinaliza se o modelo erra confiante. Read-only/fail-soft."""
+    out: Dict[str, Any] = {
+        "window_days": days, "trades": [], "by_regime": [], "by_score_bin": [],
+        "high_conviction_losses": 0, "linked_pct": None, "note": None,
+    }
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    # mapa score→P(TP1) calibrado
+    try:
+        from services import calibration_service as cs
+        calib = await cs.get_calibration()
+        bins = (calib or {}).get("bins") or []
+    except Exception:
+        cs = None
+        bins = []
+
+    def _p_tp1(score):
+        if score is None or not bins or cs is None:
+            return None
+        try:
+            bi = cs._bin_index(float(score))
+            if bi < 0 or bi >= len(bins):
+                return None
+            return float(bins[bi].get("p_calibrated") or 0.0)
+        except Exception:
+            return None
+
+    def _bin_label(score):
+        if score is None or not bins or cs is None:
+            return None
+        try:
+            bi = cs._bin_index(float(score))
+            if bi < 0 or bi >= len(bins):
+                return None
+            return bins[bi].get("label")
+        except Exception:
+            return None
+
+    try:
+        from db import get_session
+        from models.real_trade import RealTrade
+        from models.recommendation_snapshot import RecommendationSnapshot
+        async with get_session() as session:
+            rows = list((await session.execute(
+                select(RealTrade.symbol, RealTrade.side, RealTrade.status,
+                       RealTrade.realized_r, RealTrade.pnl_usd, RealTrade.opened_at,
+                       RealTrade.closed_at, RecommendationSnapshot.score,
+                       RecommendationSnapshot.features)
+                .join(RecommendationSnapshot,
+                      RealTrade.recommendation_id == RecommendationSnapshot.id,
+                      isouter=True)
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.status != "open")
+                .where(RealTrade.opened_at >= since)
+                .order_by(RealTrade.closed_at.desc().nullslast())
+            )).all())
+    except Exception as e:
+        log.warning(f"[assertiveness] trade_journal read falhou: {e}")
+        return out
+    if not rows:
+        out["note"] = "sem trades reais fechados na janela"
+        return out
+
+    reg_by: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0, "rs": []})
+    sb_by: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0, "rs": []})
+    linked = 0
+    high_conv_loss = 0
+    trades = []
+    for sym, side, st, r, pnl, opened, closed, score, feats in rows:
+        rv = float(r) if r is not None else 0.0
+        is_win = rv > 0
+        regime = (feats.get("regime") if isinstance(feats, dict) else None) or "n/d"
+        p = _p_tp1(score)
+        sbl = _bin_label(score) or "n/d"
+        if score is not None:
+            linked += 1
+        # agregados
+        rd = reg_by[regime]; rd["n"] += 1; rd["rs"].append(rv); rd["wins"] += int(is_win)
+        sd = sb_by[sbl]; sd["n"] += 1; sd["rs"].append(rv); sd["wins"] += int(is_win)
+        if (not is_win) and p is not None and p >= 0.65:
+            high_conv_loss += 1
+        trades.append({
+            "base": _norm_base(sym, set()),
+            "side": (side or "").lower(),
+            "status": st, "r": round(rv, 3), "pnl_usd": round(float(pnl or 0), 2),
+            "opened_at": opened.isoformat() if opened else None,
+            "closed_at": closed.isoformat() if closed else None,
+            "score": round(float(score), 1) if score is not None else None,
+            "p_tp1_entry_pct": round(p * 100, 1) if p is not None else None,
+            "regime": regime,
+        })
+
+    def _emit(dmap):
+        items = []
+        for k, d in dmap.items():
+            n = d["n"]
+            items.append({"key": k, "count": n,
+                          "win_rate_pct": round(d["wins"] / n * 100, 1),
+                          "avg_r": round(sum(d["rs"]) / n, 3),
+                          "sum_r": round(sum(d["rs"]), 2)})
+        items.sort(key=lambda x: x["sum_r"])  # piores primeiro (foco em onde sangra)
+        return items
+
+    out["trades"] = trades[:limit]
+    out["by_regime"] = _emit(reg_by)
+    out["by_score_bin"] = _emit(sb_by)
+    out["high_conviction_losses"] = high_conv_loss
+    out["linked_pct"] = round(linked / len(rows) * 100, 1)
+    if linked == 0:
+        out["note"] = ("nenhum trade ligado a snapshot (recommendation_id nulo) — "
+                       "score/regime/P(TP1) indisponíveis; só outcome bruto")
+    elif linked < len(rows):
+        out["note"] = f"{linked}/{len(rows)} trades ligados a snapshot (resto sem contexto de entrada)"
+    return out
+
+
 async def _gate_counterfactual(days: int) -> Dict[str, Any]:
     """#B — Avaliador CONTRAFACTUAL dos gates protetivos que estão OFF. Para cada
     gate desligado, mede sobre o histórico resolvido 'o que ele teria feito',
@@ -971,6 +1094,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     directional = await _directional_audit(days)
     regime = await _regime_audit(days)
     gate_counterfactual = await _gate_counterfactual(days)
+    trade_journal = await _trade_journal(days)
     return {
         "enabled": True,
         "window_days": days,
@@ -986,5 +1110,6 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "directional": directional,
         "regime": regime,
         "gate_counterfactual": gate_counterfactual,
+        "trade_journal": trade_journal,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
