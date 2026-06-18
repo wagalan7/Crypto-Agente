@@ -1200,6 +1200,16 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
                 size_rationale = (size_rationale or "size dinâmico") + f" · edge ×{_em:.2f}"
         except Exception:
             pass
+        # Espelha o LIQ_TIER_SIZING do bot — mão menor em moeda magra. Mesma
+        # história no app. Gated: NO-OP quando LIQ_TIER_SIZING_ENABLED=false.
+        try:
+            from services.shadow_trade_service import _liq_tier_mult
+            _lm, _ = _liq_tier_mult({"quote_vol_usd": getattr(sig, "quote_vol_usd", None)})
+            if _lm != 1.0:
+                suggested_size_pct = round(min(max(suggested_size_pct * _lm, 0.25), 1.0), 2)
+                size_rationale = (size_rationale or "size dinâmico") + f" · liq ×{_lm:.2f}"
+        except Exception:
+            pass
 
     # Veredito do bot (mesma lógica/limites do loop de execução — fonte única).
     # Read-only: NÃO toca no loop real; só anexa "o bot operaria / não operaria"
