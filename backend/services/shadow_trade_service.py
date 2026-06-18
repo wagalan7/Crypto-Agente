@@ -532,6 +532,16 @@ LIQ_TIER_MULT_MID = float(os.getenv("LIQ_TIER_MULT_MID", "0.75"))
 LIQ_TIER_MULT_LO = float(os.getenv("LIQ_TIER_MULT_LO", "0.5"))
 LIQ_TIER_MULT_MIN = float(os.getenv("LIQ_TIER_MULT_MIN", "0.35"))   # <$3M (rank ~250-350)
 
+# ── #6 Sizing por REGIME — mão menor em regime adverso ──────────────────────
+# Complementa o regime_service: quando o macro está adverso (downgrade_alt_longs
+# = BTC_DOMINANT ou ALT_RISK_OFF), o regime já REBAIXA o tier do long de alt
+# (A+→A→B→reject). Este gate dá o passo seguinte no SIZE: mesmo o setup que
+# sobrevive ao corte de tier entra com MÃO MENOR. DEFENSIVO (só reduz),
+# fail-soft (regime n/d = mão cheia), compõe multiplicativo com liq-tier/edge/
+# LIVE_SIZE_MULT. DEFAULT OFF (NO-OP) — liga via env após revisar.
+REGIME_SIZING_ENABLED = os.getenv("REGIME_SIZING_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+REGIME_SIZE_MULT_ALT_LONG = float(os.getenv("REGIME_SIZE_MULT_ALT_LONG", "0.5"))  # long de alt em regime adverso
+
 # ── P(TP1) gate (calibração) ────────────────────────────────────────────────
 # rec.prob_tp1 = P(TP1) calibrada por bin de score (calibration_service). Pula
 # setups com probabilidade calibrada baixa de bater o TP1. NO-OP-SAFE: quando a
@@ -1296,6 +1306,9 @@ def env_info() -> dict:
         "live_money_guard": guard_reason,
         "live_trading_confirmed": LIVE_TRADING_CONFIRM == _LIVE_CONFIRM_PHRASE,
         "live_size_mult": LIVE_SIZE_MULT,
+        # #6 sizing por regime (DEFAULT OFF)
+        "regime_sizing_enabled": REGIME_SIZING_ENABLED,
+        "regime_size_mult_alt_long": REGIME_SIZE_MULT_ALT_LONG,
         # daily SL-rate breaker (por direção)
         "breaker_min_sample": BREAKER_MIN_SAMPLE,
         "breaker_sl_rate": BREAKER_SL_RATE,
@@ -2332,6 +2345,32 @@ def _liq_tier_mult(rec: dict) -> tuple[float, str]:
     return round(m, 4), f"vol ${qvol/1e6:.1f}M → ×{m:.2f}"
 
 
+def _regime_size_mult(rec: dict, regime: dict | None) -> tuple[float, str]:
+    """#6 — Multiplicador de tamanho por REGIME macro (≤1.0). Mão menor em
+    LONG de alt quando o regime está adverso (downgrade_alt_longs: BTC_DOMINANT
+    ou ALT_RISK_OFF). Recebe o regime já buscado (cache 10min, 1 fetch/lote).
+    Retorna (mult, reason). Fail-soft: regime n/d ou flag OFF = (1.0, ...).
+    Não toca BTC/ETH nem shorts — só o caso que historicamente sangra."""
+    if not REGIME_SIZING_ENABLED:
+        return 1.0, "off"
+    if not regime or not isinstance(regime, dict):
+        return 1.0, "regime n/d → mão cheia"
+    if not regime.get("downgrade_alt_longs"):
+        return 1.0, f"regime {regime.get('regime', '?')} → cheia"
+    direction = (rec.get("direction") or "").strip().lower()
+    symbol = rec.get("symbol") or ""
+    try:
+        from services.regime_service import is_btc_symbol
+        is_btc = is_btc_symbol(symbol)
+    except Exception:
+        is_btc = False
+    if direction == "long" and not is_btc:
+        return round(REGIME_SIZE_MULT_ALT_LONG, 4), (
+            f"regime {regime.get('regime', '?')} → long de alt ×{REGIME_SIZE_MULT_ALT_LONG:.2f}"
+        )
+    return 1.0, f"regime {regime.get('regime', '?')} → cheia (não-alt-long)"
+
+
 async def open_shadow_for_recs(recs: list[dict]) -> int:
     """
     Pra cada rec marcada com `_just_saved=True` e tier A/A+, abre uma RealTrade.
@@ -2347,6 +2386,16 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
         return 0
     mode = "shadow" if SHADOW_ENABLED else "live"
     log.debug(f"[shadow] processando {len(recs)} recs em modo={mode}")
+
+    # #6 — busca o regime UMA vez por lote (cache 10min no regime_service).
+    # Só quando o sizing por regime está ligado e em LIVE. Fail-soft.
+    _regime_cached: dict = {}
+    if not SHADOW_ENABLED and REGIME_SIZING_ENABLED:
+        try:
+            from services.regime_service import get_regime_status
+            _regime_cached = await get_regime_status()
+        except Exception as e:
+            log.warning(f"[regime-size] fetch regime falhou (fail-open mão cheia): {e}")
 
     opened = 0
     for rec in recs:
@@ -2818,6 +2867,26 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f}"
                         )
                         _record_skip(rec, "liq-tier", f"notional pós-tier < mín ({_lt_reason})")
+                        continue
+
+            # ── #6 Sizing por REGIME — mão menor em long de alt sob regime
+            # adverso. Só LIVE. DEFENSIVO (só reduz). Compõe após liq-tier. Se
+            # jogar abaixo do mínimo, pula (regime adverso + size pequeno).
+            if not SHADOW_ENABLED and REGIME_SIZING_ENABLED:
+                _rg, _rg_reason = _regime_size_mult(rec, _regime_cached)
+                if _rg < 1.0:
+                    _qty_pre_rg = qty
+                    qty = round(qty * _rg, 6)
+                    notional_effective = qty * entry
+                    log.info(
+                        f"[regime-size] {rec.get('symbol')} qty {_qty_pre_rg}→{qty} ({_rg_reason})"
+                    )
+                    if notional_effective < MIN_NOTIONAL_USD:
+                        log.warning(
+                            f"[regime-size] {rec.get('symbol')} SKIP: notional pós-regime "
+                            f"${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f}"
+                        )
+                        _record_skip(rec, "regime-size", f"notional pós-regime < mín ({_rg_reason})")
                         continue
 
             # go-live #2 — canary/ramp: em LIVE, escala o tamanho por um
