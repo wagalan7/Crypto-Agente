@@ -608,6 +608,177 @@ async def _equity_curve(days: int) -> Dict[str, Any]:
     return out
 
 
+async def _directional_audit(days: int) -> Dict[str, Any]:
+    """#A — Auditoria de edge por DIREÇÃO (long vs short). Cruza dinheiro REAL
+    (real_trades.side) com o SHADOW (recommendation_snapshots.direction) e mede,
+    de cada lado, win-rate / avg_R / sum_R. Responde com número a pergunta do
+    momento: 'os longs estão sangrando mais que os shorts?'. Funciona em TODO o
+    histórico (side/direction são persistidos). Read-only / fail-soft."""
+    out: Dict[str, Any] = {
+        "window_days": days,
+        "real": {"long": None, "short": None},
+        "shadow": {"long": None, "short": None},
+        "verdict": None,
+    }
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    def _agg_real(items):
+        n = len(items)
+        if n == 0:
+            return {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": 0.0,
+                    "sum_pnl_usd": 0.0, "tp1_hit_rate_pct": None}
+        rs = [float(r) if r is not None else 0.0 for _, r, _, _ in items]
+        wins = sum(1 for _, r, _, _ in items if (r or 0) > 0)
+        tp1 = sum(1 for _, _, st, _ in items if st in _REAL_TP1_HIT)
+        pnl = sum(float(p or 0) for _, _, _, p in items)
+        return {"count": n, "win_rate_pct": round(wins / n * 100, 1),
+                "avg_r": round(sum(rs) / n, 3), "sum_r": round(sum(rs), 2),
+                "sum_pnl_usd": round(pnl, 2), "tp1_hit_rate_pct": round(tp1 / n * 100, 1)}
+
+    def _agg_shadow(items):
+        n = len(items)
+        if n == 0:
+            return {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": 0.0}
+        rs = [float(r) if r is not None else 0.0 for st, r in items]
+        wins = sum(1 for st, _ in items if st in _SNAP_WIN)
+        return {"count": n, "win_rate_pct": round(wins / n * 100, 1),
+                "avg_r": round(sum(rs) / n, 3), "sum_r": round(sum(rs), 2)}
+
+    # 1) dinheiro real, por side
+    try:
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            rows = list((await session.execute(
+                select(RealTrade.side, RealTrade.realized_r,
+                       RealTrade.status, RealTrade.pnl_usd)
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.status != "open")
+                .where(RealTrade.opened_at >= since)
+            )).all())
+        rl = {"long": [], "short": []}
+        for side, r, st, pnl in rows:
+            key = "long" if str(side).lower() == "long" else "short"
+            rl[key].append((side, r, st, pnl))
+        out["real"]["long"] = _agg_real(rl["long"])
+        out["real"]["short"] = _agg_real(rl["short"])
+    except Exception as e:
+        log.warning(f"[assertiveness] directional real read falhou: {e}")
+
+    # 2) shadow, por direction
+    try:
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        async with get_session() as session:
+            srows = list((await session.execute(
+                select(RecommendationSnapshot.direction,
+                       RecommendationSnapshot.status,
+                       RecommendationSnapshot.realized_r)
+                .where(RecommendationSnapshot.status.in_(_SNAP_RESOLVED))
+                .where(_calib._not_fast_void())
+                .where(RecommendationSnapshot.outcome_at >= since)
+            )).all())
+        sl = {"long": [], "short": []}
+        for direction, st, r in srows:
+            key = "long" if str(direction).lower() == "long" else "short"
+            sl[key].append((st, r))
+        out["shadow"]["long"] = _agg_shadow(sl["long"])
+        out["shadow"]["short"] = _agg_shadow(sl["short"])
+    except Exception as e:
+        log.warning(f"[assertiveness] directional shadow read falhou: {e}")
+
+    # Veredito: prioriza o sinal de DINHEIRO REAL; usa shadow como reforço.
+    rlong = (out["real"]["long"] or {})
+    rshort = (out["real"]["short"] or {})
+    al, ash = rlong.get("avg_r"), rshort.get("avg_r")
+    nl, ns = rlong.get("count", 0), rshort.get("count", 0)
+    if nl and ns and al is not None and ash is not None:
+        if al < 0 <= ash:
+            out["verdict"] = (f"LONGS sangrando: avg_R long {al:+.2f} ({nl} trades) vs "
+                              f"short {ash:+.2f} ({ns}) — viés direcional desfavorável a long")
+        elif ash < 0 <= al:
+            out["verdict"] = (f"SHORTS sangrando: avg_R short {ash:+.2f} ({ns}) vs "
+                              f"long {al:+.2f} ({nl})")
+        else:
+            diff = al - ash
+            lado = "long" if diff > 0 else "short"
+            out["verdict"] = (f"sem viés direcional forte: long {al:+.2f} ({nl}) vs "
+                              f"short {ash:+.2f} ({ns}); leve vantagem {lado}")
+    elif nl and al is not None and not ns:
+        out["verdict"] = f"só longs reais na janela (avg_R {al:+.2f}, {nl}) — sem short pra comparar"
+    elif ns and ash is not None and not nl:
+        out["verdict"] = f"só shorts reais na janela (avg_R {ash:+.2f}, {ns}) — sem long pra comparar"
+    else:
+        out["verdict"] = "amostra real insuficiente por direção — ver shadow"
+    return out
+
+
+async def _regime_audit(days: int) -> Dict[str, Any]:
+    """#A — Auditoria de edge por REGIME de mercado na ENTRADA. Lê o rótulo de
+    regime persistido em snapshot.features['regime'] (NORMAL / RISK_OFF /
+    ALT_DANGER / BTC_DOMINANT / ALT_RISK_OFF) e mede win-rate / avg_R por regime.
+
+    IMPORTANTE: o regime só passou a ser gravado a partir do deploy desta feature
+    — snapshots antigos saem como 'n/d' e a amostra acumula com o tempo. Por isso
+    reporta `coverage` (quantos resolvidos já têm regime tagueado). Read-only."""
+    out: Dict[str, Any] = {
+        "window_days": days, "regimes": [], "coverage_pct": None,
+        "n_tagged": 0, "n_total": 0, "note": None,
+    }
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        async with get_session() as session:
+            rows = list((await session.execute(
+                select(RecommendationSnapshot.status,
+                       RecommendationSnapshot.realized_r,
+                       RecommendationSnapshot.features)
+                .where(RecommendationSnapshot.status.in_(_SNAP_RESOLVED))
+                .where(_calib._not_fast_void())
+                .where(RecommendationSnapshot.outcome_at >= since)
+            )).all())
+    except Exception as e:
+        log.warning(f"[assertiveness] regime_audit read falhou: {e}")
+        return out
+    n_total = len(rows)
+    by: dict[str, dict] = defaultdict(lambda: {"n": 0, "wins": 0, "rs": []})
+    n_tagged = 0
+    for st, r, feats in rows:
+        label = None
+        if isinstance(feats, dict):
+            label = feats.get("regime")
+        if not label:
+            continue
+        n_tagged += 1
+        d = by[label]
+        d["n"] += 1
+        d["rs"].append(float(r) if r is not None else 0.0)
+        if st in _SNAP_WIN:
+            d["wins"] += 1
+    regimes = []
+    for label, d in by.items():
+        n = d["n"]
+        regimes.append({
+            "regime": label, "count": n,
+            "win_rate_pct": round(d["wins"] / n * 100, 1),
+            "avg_r": round(sum(d["rs"]) / n, 3),
+            "sum_r": round(sum(d["rs"]), 2),
+        })
+    regimes.sort(key=lambda x: x["sum_r"], reverse=True)
+    out["regimes"] = regimes
+    out["n_total"] = n_total
+    out["n_tagged"] = n_tagged
+    out["coverage_pct"] = round(n_tagged / n_total * 100, 1) if n_total else None
+    if n_tagged == 0:
+        out["note"] = ("regime ainda não tagueado em nenhum resolvido — começa a "
+                       "acumular a partir deste deploy (snapshots antigos = n/d)")
+    elif n_tagged < n_total:
+        out["note"] = (f"amostra acumulando: {n_tagged}/{n_total} resolvidos já têm "
+                       f"regime tagueado (resto é pré-deploy)")
+    return out
+
+
 async def _calibration_stats() -> Dict[str, Any]:
     out = {"mature": False, "total_resolved": 0, "min_sample": 30,
            "p_global": None, "win_rate_pct": None, "computed_at": None}
@@ -656,6 +827,8 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     scorecard = await _per_coin_scorecard(days)
     equity_curve = await _equity_curve(days)
     calibration_audit = await _calibration_audit(days)
+    directional = await _directional_audit(days)
+    regime = await _regime_audit(days)
     return {
         "enabled": True,
         "window_days": days,
@@ -668,5 +841,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "funnel": funnel,
         "scorecard": scorecard,
         "equity_curve": equity_curve,
+        "directional": directional,
+        "regime": regime,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }

@@ -145,11 +145,23 @@ BE_PLUS_LOCK_R = 0.2
 TRAIL_ACTIVATION_BUFFER_ATR = 0.5
 
 
-def _extract_features(rec: Dict[str, Any], created_at: datetime) -> Dict[str, Any]:
-    """Captura vetor de features pro learning loop. Robust a campos ausentes."""
+def _extract_features(
+    rec: Dict[str, Any], created_at: datetime, regime_label: str | None = None
+) -> Dict[str, Any]:
+    """Captura vetor de features pro learning loop. Robust a campos ausentes.
+
+    `regime_label` (opcional): rótulo do regime de mercado VIGENTE na criação do
+    snapshot (NORMAL / RISK_OFF / ALT_DANGER / BTC_DOMINANT / ALT_RISK_OFF). É o
+    único jeito de auditar desempenho por regime DEPOIS — o regime não é
+    reconstruível com fidelidade pós-fato. Só novos snapshots terão; antigos
+    saem como None (a auditoria de regime acumula a partir do deploy)."""
     sig = rec.get("signal") or {}
     if not isinstance(sig, dict):
-        return {"hour_utc": created_at.hour, "day_of_week": created_at.weekday()}
+        return {
+            "hour_utc": created_at.hour,
+            "day_of_week": created_at.weekday(),
+            "regime": regime_label,
+        }
 
     ind = sig.get("indicators") or {}
     mtf = sig.get("mtf") or {}
@@ -202,7 +214,21 @@ def _extract_features(rec: Dict[str, Any], created_at: datetime) -> Dict[str, An
             rec.get("entry_zone_type")
             or ((sig.get("trade_plan") or {}).get("entry_zone") or {}).get("type")
         ),
+        # Regime de mercado vigente na criação (pro audit por regime — #A).
+        "regime": regime_label,
     }
+
+
+async def _current_regime_label() -> str | None:
+    """Rótulo do regime de mercado AGORA (fail-soft, cache de 10min no service).
+    Chamado 1x por batch de save — não por rec. None se indisponível."""
+    try:
+        from services.regime_service import get_regime_status
+        rg = await get_regime_status()
+        return (rg or {}).get("regime")
+    except Exception as e:
+        log.debug(f"[snapshot] regime label indisponível: {e}")
+        return None
 
 
 def _tf_rank(tf: str) -> int:
@@ -265,6 +291,7 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     inserted = 0
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=DEDUP_WINDOW_HOURS)
+    _regime_label = await _current_regime_label()  # 1x por batch (#A — audit por regime)
 
     async with get_session() as session:
         for rec in recommendations:
@@ -366,7 +393,7 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                     stop_distance_pct=float(rec.get("stop_distance_pct", 0.0)),
                     status="open",
                     created_at=now,
-                    features=_extract_features(rec, now),
+                    features=_extract_features(rec, now, _regime_label),
                 )
                 session.add(snap)
                 rec["_just_saved"] = True
@@ -405,6 +432,7 @@ async def save_wide_display_snapshots(recommendations: List[Dict[str, Any]]) -> 
     inserted = 0
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=DEDUP_WINDOW_HOURS)
+    _regime_label = await _current_regime_label()  # 1x por batch (#A — audit por regime)
     # Sem rastreio (Opção B OFF): poda 'wide' aos WIDE_DISPLAY_TTL_HOURS — só a
     # dedup importa, não há outcome a guardar. Com rastreio ON: NÃO podar aos 6h,
     # senão mataríamos snapshots ainda EM VOO antes do outcome. Deixa viver até o
@@ -465,7 +493,7 @@ async def save_wide_display_snapshots(recommendations: List[Dict[str, Any]]) -> 
                     stop_distance_pct=float(rec.get("stop_distance_pct", 0.0)),
                     status=WIDE_DISPLAY_STATUS,
                     created_at=now,
-                    features=_extract_features(rec, now),
+                    features=_extract_features(rec, now, _regime_label),
                 )
                 session.add(snap)
                 rec["_just_saved"] = True
