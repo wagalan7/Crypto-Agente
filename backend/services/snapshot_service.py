@@ -696,6 +696,50 @@ def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Option
     return None
 
 
+async def _resolver_fetch_ohlcv(symbol: str, timeframe: str = "5m", limit: int = 50):
+    """Fetch de candles pro RESOLVER de snapshots, à prova de ponto-cego entre
+    exchanges.
+
+    O scan/geração roda em Binance Futures (via proxy) — a exchange onde o bot
+    e o usuário operam de verdade. A resolução, porém, historicamente lia preço
+    da OKX (binance_service), que NÃO lista várias alts novas/menores presentes
+    na Binance (ex.: MIRA). Resultado: esses setups — reais e já notificados via
+    push — eram marcados 'expired/void' em segundos só porque a OKX não tinha o
+    candle ("fast-void" cross-exchange, ~88% dos expirados). Isso confundia o
+    usuário (push válido → painel diz "expirado na mesma hora") E sujava a
+    calibração com voids falsos.
+
+    Estratégia: tenta OKX primeiro (barata, sem custo de proxy). Se vier vazio E
+    o proxy Binance estiver ligado, tenta a Binance Futures (mesma fonte da
+    geração). Só devolve vazio se AS DUAS falharem — aí sim o símbolo é
+    genuinamente intrastreável. Carga extra no proxy é mínima: só as poucas
+    moedas/dia que a OKX não enxerga caem no fallback."""
+    from services.binance_service import fetch_ohlcv as _okx_fetch
+    try:
+        df = await _okx_fetch(symbol, timeframe, limit)
+    except Exception:
+        df = None
+    if df is not None and not df.empty:
+        return df
+    # Fallback: a OKX não tinha o candle. Tenta a Binance (fonte da geração).
+    try:
+        from services import binance_futures_service as _bfs
+        if _bfs.PROXY_ENABLED:
+            df_b = await _bfs.fetch_ohlcv(symbol, timeframe, limit)
+            if df_b is not None and not df_b.empty:
+                return df_b
+    except Exception as e:
+        log.debug(f"[resolver] fallback Binance falhou {symbol}: {e}")
+    # Devolve o df da OKX (vazio) pra preservar o fluxo de void existente.
+    return df if df is not None else _empty_ohlcv_df()
+
+
+def _empty_ohlcv_df():
+    """DataFrame vazio com as colunas esperadas — fallback se a OKX estourou."""
+    import pandas as pd
+    return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+
 async def check_open_snapshots() -> int:
     """
     Roda periodicamente. Busca todos abertos, consulta preço high/low desde
@@ -705,9 +749,6 @@ async def check_open_snapshots() -> int:
     """
     if not DB_ENABLED:
         return 0
-
-    # Import lazy pra evitar ciclo
-    from services.binance_service import fetch_ohlcv
 
     resolved = 0
     now = datetime.now(timezone.utc)
@@ -766,7 +807,9 @@ async def check_open_snapshots() -> int:
 
                 # Busca candles 5m desde o último check (no mínimo 1 candle)
                 # Conservador: pega ~12 candles de 5m = 1h pra cobrir.
-                df = await fetch_ohlcv(snap.symbol, "5m", 50)
+                # Resolver cross-exchange: OKX, com fallback Binance (ver
+                # _resolver_fetch_ohlcv) — evita void falso de alts só-Binance.
+                df = await _resolver_fetch_ohlcv(snap.symbol, "5m", 50)
                 if df.empty:
                     # Sem candles. Pode ser falha transitória OU o par sumiu da
                     # fonte (ex.: símbolo que só existia na exchange anterior e
@@ -917,8 +960,6 @@ async def check_wide_snapshots() -> int:
     if not DB_ENABLED or not WIDE_TRACKING_ENABLED:
         return 0
 
-    from services.binance_service import fetch_ohlcv
-
     resolved = 0
     now = datetime.now(timezone.utc)
 
@@ -966,7 +1007,7 @@ async def check_wide_snapshots() -> int:
                     resolved += 1
                     continue
 
-                df = await fetch_ohlcv(snap.symbol, "5m", 50)
+                df = await _resolver_fetch_ohlcv(snap.symbol, "5m", 50)
                 if df.empty:
                     # Símbolo fora do universo da fonte → encerra como expired obs.
                     unavailable = False
