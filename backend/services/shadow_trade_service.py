@@ -408,12 +408,21 @@ QUALITY_EDGE_MARGIN = float(os.getenv("QUALITY_EDGE_MARGIN", "6"))   # banda mar
 QUALITY_EDGE_MIN = int(os.getenv("QUALITY_EDGE_MIN", "1"))           # edges exigidos na banda
 
 # ── Time-of-day block (postmortem 104 snapshots / 168h) ────────────────────
-# Sessão EU (7-14 UTC) mostrou 50 trades / 42% wr / lift -21.46%.
-# Quinta-feira mostrou 67 trades / 50.75% wr / lift -12.72%. Bloqueia ambos
-# por padrão; override via env (string vazia desativa).
-# thu reativado pós-análise N=237 (lift -9.6pp em 124 trades, vários thursdays)
-BLOCK_DAYS_DEFAULT = "thu"
-BLOCK_HOURS_UTC = os.getenv("BLOCK_HOURS_UTC", "7,8,9,10,11,12,13").strip()
+# HISTÓRICO: ambos os blocks nasceram de postmortems de amostra PEQUENA —
+# Sessão EU (7-14 UTC) 50 trades / 42% wr / lift -21.46%; Quinta 67 (depois 124)
+# trades / lift ~-10pp. Ambos foram OVERWHELMED por amostra grande e viraram
+# net-positivos. Reavaliação 2026-06-19 (shadow, by_session/by_day_of_week):
+#   • Quinta: 163 trades / 69.3% wr / +0.44 avg_R / +71.9R (MAIOR total da
+#     semana; só -3.6pp do baseline 72.9% e MELHOR que segunda 63.2% que opera
+#     livre). O lift -9.6pp evaporou.
+#   • Sessão EU (= balde Europe, 7-14 UTC): 250 trades / 68.0% wr / +0.37 avg_R
+#     / +92.9R. É a sessão mais fraca (avg_R abaixo do +0.48 baseline) mas
+#     CLARAMENTE lucrativa. Como sessões não competem por capital (horas
+#     distintas), bloquear só reduz R total.
+# DECISÃO (pedido do usuário): liberar AMBOS por padrão. Reversível por env —
+# re-bloqueia com BLOCK_DAYS_UTC=thu e/ou BLOCK_HOURS_UTC=7,8,9,10,11,12,13.
+BLOCK_DAYS_DEFAULT = ""
+BLOCK_HOURS_UTC = os.getenv("BLOCK_HOURS_UTC", "").strip()
 _BLOCKED_HOURS: set[int] = set()
 if BLOCK_HOURS_UTC:
     try:
