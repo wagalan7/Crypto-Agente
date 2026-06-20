@@ -74,6 +74,7 @@ async def init_db():
     from models import live_test_state  # noqa: F401
     from models import skip_reason_stat  # noqa: F401
     from models import rotation_state  # noqa: F401
+    from models import symbol_backtest_stats  # noqa: F401
     from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

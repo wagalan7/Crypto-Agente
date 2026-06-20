@@ -2249,6 +2249,69 @@ async def debug_gate_counterfactual(days: int = 60):
         raise HTTPException(500, f"Erro: {e}")
 
 
+# ---------------------------------------------------------------------------
+# BACKTEST MASSIVO DO UNIVERSO (roda SÓ no DEV — gated por env).
+# Itera top-N perps × TFs, backtest full-history desde a listagem, persiste a
+# edge por moeda em symbol_backtest_stats e expõe um ranking → candidatas à
+# allowlist. O /start dispara um asyncio.task em background (resumível); /status
+# e /ranking são leitura. PRD nunca roda o job pesado (flag default OFF).
+# ---------------------------------------------------------------------------
+def _backtest_universe_enabled() -> bool:
+    return os.getenv("BACKTEST_UNIVERSE_ENABLED", "false").strip().lower() in ("1", "true", "on", "yes")
+
+
+@app.post("/api/backtest/universe/start")
+async def backtest_universe_start(
+    tfs: str = "4h",
+    limit: int = 30,
+    refresh_days: int = 7,
+    step_bars: int = 1,
+):
+    """Dispara o backtest massivo em background (SÓ DEV — BACKTEST_UNIVERSE_ENABLED=on).
+    `tfs`: lista separada por vírgula (ex.: "4h,1h"). `limit`: top-N perps por volume.
+    Idempotente/resumível: re-chamar continua de onde parou (pula (sym,tf) frescos)."""
+    if not _backtest_universe_enabled():
+        raise HTTPException(403, "Backtest do universo desabilitado (set BACKTEST_UNIVERSE_ENABLED=on no DEV).")
+    from services import backtest_universe_service as bus
+    if bus.get_universe_status().get("running"):
+        return {"ok": False, "error": "job já em execução", "progress": bus.get_universe_status()}
+    tf_list = [t.strip() for t in tfs.split(",") if t.strip()]
+    if not tf_list:
+        raise HTTPException(400, "tfs vazio")
+
+    async def _run():
+        try:
+            await bus.run_universe_backtest(tf_list, limit=limit, refresh_days=refresh_days, step_bars=step_bars)
+        except Exception as e:
+            logging.error(f"[bt-universe] job crashou: {e}\n{traceback.format_exc()}")
+
+    asyncio.create_task(_run())
+    return {"ok": True, "started": True, "tfs": tf_list, "limit": limit,
+            "refresh_days": refresh_days, "step_bars": step_bars,
+            "progress": bus.get_universe_status()}
+
+
+@app.get("/api/backtest/universe/status")
+async def backtest_universe_status():
+    """Progresso do job de backtest massivo (em memória; reseta no redeploy,
+    mas os resultados ficam no DB e o /start retoma)."""
+    from services import backtest_universe_service as bus
+    return {"enabled": _backtest_universe_enabled(), "progress": bus.get_universe_status()}
+
+
+@app.get("/api/backtest/universe/ranking")
+async def backtest_universe_ranking(
+    tf: Optional[str] = None,
+    min_trades: int = 30,
+    sort: str = "wf_avg_r",
+    limit: int = 100,
+):
+    """Ranking das moedas por edge (default: walk-forward avg_R out-of-sample).
+    Marca quem já está na allowlist e sugere candidatas à promoção. Leitura pura."""
+    from services import backtest_universe_service as bus
+    return await bus.get_ranking(tf=tf, min_trades=min_trades, sort=sort, limit=limit)
+
+
 @app.get("/api/debug/direction-wr")
 async def debug_direction_wr(days: int = 5):
     """WR por direção × (major vs alt). Diagnóstico do downgrade_alt_longs:
