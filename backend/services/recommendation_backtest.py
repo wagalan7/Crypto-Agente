@@ -106,7 +106,6 @@ async def load_historical_ohlcv(
     from services import binance_futures_service as _bfs
 
     bv_sym = to_bv(symbol)  # ex: BTCUSDT (igual to_fut)
-    per_candle_ms = TF_MS[timeframe]
     all_rows: List[List[Any]] = []
 
     if _bfs.PROXY_ENABLED:
@@ -125,14 +124,15 @@ async def load_historical_ohlcv(
         page_limit = 1000
         own_client = True
 
-    window_ms = per_candle_ms * page_limit
+    # Paginação canônica da Binance: SÓ startTime (sem endTime). Assim a API
+    # devolve a partir da LISTAGEM real da moeda mesmo pedindo desde 2017 — em vez
+    # de retornar vazio numa janela pré-lançamento e abortar (bug do endTime fixo).
     try:
         cur = start_ms
         while cur < end_ms:
             params = {
                 "symbol": bv_sym, "interval": timeframe,
-                "startTime": cur, "endTime": min(cur + window_ms, end_ms),
-                "limit": page_limit,
+                "startTime": cur, "limit": page_limit,
             }
             try:
                 r = await client.get(url, params=params)
@@ -149,6 +149,9 @@ async def load_historical_ohlcv(
             if new_cur <= cur:
                 break
             cur = new_cur
+            # Última página (a API devolveu menos que o teto) → acabou o histórico.
+            if len(rows) < page_limit:
+                break
     finally:
         if own_client:
             await client.aclose()
@@ -165,6 +168,8 @@ async def load_historical_ohlcv(
         "timestamp": int, "open": float, "high": float,
         "low": float, "close": float, "volume": float,
     })
+    # Apara candles além de end_ms (paginar sem endTime pode passar do alvo).
+    df = df[df["timestamp"] <= end_ms]
     df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
     return df
 
