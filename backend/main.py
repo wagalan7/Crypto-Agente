@@ -2125,6 +2125,130 @@ async def debug_tier_wr(days: int = 90, since_iso: Optional[str] = None):
         raise HTTPException(500, f"Erro: {e}")
 
 
+@app.get("/api/debug/gate-counterfactual")
+async def debug_gate_counterfactual(days: int = 60):
+    """Contrafactual dos GATES de execução: dos setups tier-A/A+ que o bot
+    RASTREOU até TP1/SL (snapshot é gravado PRÉ-gate), quantos teriam dado
+    won/lost se NÃO houvesse o gate? Responde "vale a pena afrouxar/expandir?".
+
+    Dois eixos:
+      • allowlist (DENTRO vs FORA do universo de execução) — mensurável já, pois
+        o símbolo sempre está no snapshot. Mostra a edge real de adicionar moedas.
+      • chase_atr / struct_chase_atr (faixas) — só preenche a partir do deploy que
+        passou a persistir essas features (snapshots antigos saem em 'sem_dado').
+
+    NÃO executa nada — leitura pura de snapshots resolvidos.
+    """
+    try:
+        from db import DB_ENABLED, get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        from services.shadow_trade_service import get_exec_allowlist, _symbol_base
+        from datetime import datetime, timedelta, timezone
+        from sqlalchemy import select, and_
+        if not DB_ENABLED:
+            return {"enabled": False}
+
+        WIN_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2")
+        RESOLVED_STATUSES = WIN_STATUSES + ("lost", "expired")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+
+        async with get_session() as session:
+            stmt = select(
+                RecommendationSnapshot.symbol,
+                RecommendationSnapshot.status,
+                RecommendationSnapshot.realized_r,
+                RecommendationSnapshot.features,
+            ).where(and_(
+                RecommendationSnapshot.outcome_at >= since,
+                RecommendationSnapshot.status.in_(RESOLVED_STATUSES),
+                RecommendationSnapshot.tier.in_(("A+", "A")),
+            ))
+            rows = (await session.execute(stmt)).all()
+
+        if not rows:
+            return {"enabled": True, "days": days, "n": 0,
+                    "note": "sem snapshots tier-A resolvidos no período"}
+
+        def _metrics(items):
+            # items: lista de (status, realized_r); win exclui 'expired' do numerador
+            n = len(items)
+            if n == 0:
+                return {"n": 0}
+            wins = sum(1 for s, _ in items if s in WIN_STATUSES)
+            losses = sum(1 for s, _ in items if s == "lost")
+            expired = sum(1 for s, _ in items if s == "expired")
+            decided = wins + losses  # WR limpa ignora expired
+            rv = [r for _, r in items if r is not None]
+            return {
+                "n": n, "wins": wins, "losses": losses, "expired": expired,
+                "wr_pct": round(wins / n * 100, 1),
+                "wr_clean_pct": round(wins / decided * 100, 1) if decided else None,
+                "avg_r": round(sum(rv) / len(rv), 3) if rv else None,
+                "total_r": round(sum(rv), 2) if rv else None,
+            }
+
+        allow = get_exec_allowlist()
+        dentro, fora = [], []
+        chase_bands = {"<1.0": [], "[1.0,1.3)": [], "[1.3,1.5)": [], ">=1.5": [], "sem_dado": []}
+        sc_bands = {"<3.0": [], "[3.0,5.0)": [], ">=5.0": [], "sem_dado": []}
+
+        for sym, status, rr, feats in rows:
+            pair = (status, rr)
+            base = _symbol_base(sym) if sym else None
+            if allow and base:
+                (dentro if base in allow else fora).append(pair)
+            f = feats if isinstance(feats, dict) else {}
+            ch = f.get("chase_atr")
+            if ch is None:
+                chase_bands["sem_dado"].append(pair)
+            else:
+                try:
+                    chf = float(ch)
+                    if chf < 1.0:
+                        chase_bands["<1.0"].append(pair)
+                    elif chf < 1.3:
+                        chase_bands["[1.0,1.3)"].append(pair)
+                    elif chf < 1.5:
+                        chase_bands["[1.3,1.5)"].append(pair)
+                    else:
+                        chase_bands[">=1.5"].append(pair)
+                except Exception:
+                    chase_bands["sem_dado"].append(pair)
+            sc = f.get("struct_chase_atr")
+            if sc is None:
+                sc_bands["sem_dado"].append(pair)
+            else:
+                try:
+                    scf = float(sc)
+                    if scf < 3.0:
+                        sc_bands["<3.0"].append(pair)
+                    elif scf < 5.0:
+                        sc_bands["[3.0,5.0)"].append(pair)
+                    else:
+                        sc_bands[">=5.0"].append(pair)
+                except Exception:
+                    sc_bands["sem_dado"].append(pair)
+
+        return {
+            "enabled": True,
+            "days": days,
+            "total_resolved_tierA": len(rows),
+            "allowlist_size": len(allow),
+            "by_allowlist": {
+                "DENTRO": _metrics(dentro),
+                "FORA": _metrics(fora),
+            },
+            "by_chase_atr": {k: _metrics(v) for k, v in chase_bands.items()},
+            "by_struct_chase_atr": {k: _metrics(v) for k, v in sc_bands.items()},
+            "nota": "chase/struct_chase só preenchem a partir do deploy que persiste "
+                    "essas features; 'sem_dado' = snapshots anteriores. DENTRO/FORA "
+                    "vale pra todo o período.",
+        }
+    except Exception as e:
+        logging.error(f"gate-counterfactual error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro: {e}")
+
+
 @app.get("/api/debug/direction-wr")
 async def debug_direction_wr(days: int = 5):
     """WR por direção × (major vs alt). Diagnóstico do downgrade_alt_longs:

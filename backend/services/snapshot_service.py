@@ -216,6 +216,15 @@ def _extract_features(
         ),
         # Regime de mercado vigente na criação (pro audit por regime — #A).
         "regime": regime_label,
+        # Anti-chase: distância (×ATR) que o preço já andou a favor (proximity) e
+        # tamanho da perna desde a base (struct_chase). Persistidos PRÉ-gate → o
+        # snapshot registra o desfecho MESMO dos setups que o proximity/struct_chase
+        # depois rejeitam na execução. Sem isso é impossível medir contrafactual
+        # "se eu tivesse afrouxado o gate, teria ganho ou perdido?". Lidos da MESMA
+        # chave que os gates usam (rec['chase_atr'] / rec['struct_chase_atr']).
+        "chase_atr": rec.get("chase_atr"),
+        "struct_chase_atr": rec.get("struct_chase_atr"),
+        "retest_armed": rec.get("retest_armed"),
     }
 
 
