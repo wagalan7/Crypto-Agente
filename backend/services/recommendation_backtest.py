@@ -93,27 +93,49 @@ class _MockSnapshot:
 async def load_historical_ohlcv(
     symbol: str, timeframe: str, start_ms: int, end_ms: int,
 ) -> pd.DataFrame:
+    """Klines históricos paginados.
+
+    Fonte PRIMÁRIA = fapi.binance.com via BINANCE_PROXY_URL (MESMO caminho que o
+    PRD usa ao vivo — o proxy de egress contorna o geobloqueio do IP do Railway).
+    Fallback (sem proxy) = data-api.binance.vision (spot), que pode estar
+    geobloqueado no host. Os dois endpoints retornam o MESMO array de 12 colunas.
+    """
     if timeframe not in TF_MS:
         raise ValueError(f"timeframe desconhecido: {timeframe}")
 
-    bv_sym = to_bv(symbol)
-    step_ms = TF_MS[timeframe] * 1000
-    base = "https://data-api.binance.vision"
+    from services import binance_futures_service as _bfs
+
+    bv_sym = to_bv(symbol)  # ex: BTCUSDT (igual to_fut)
+    per_candle_ms = TF_MS[timeframe]
     all_rows: List[List[Any]] = []
 
-    async with httpx.AsyncClient(
-        timeout=30.0,
-        headers={"User-Agent": "Mozilla/5.0 (CryptoAI-Backtest)"},
-    ) as client:
+    if _bfs.PROXY_ENABLED:
+        # igual PRD: fapi.binance.com (futures) via proxy de egress; limit 1500.
+        client = _bfs._get_client()
+        url = f"{_bfs.FAPI_BASE}/fapi/v1/klines"
+        page_limit = 1500
+        own_client = False
+    else:
+        # fallback sem proxy: spot vision, limit 1000.
+        client = httpx.AsyncClient(
+            timeout=30.0,
+            headers={"User-Agent": "Mozilla/5.0 (CryptoAI-Backtest)"},
+        )
+        url = "https://data-api.binance.vision/api/v3/klines"
+        page_limit = 1000
+        own_client = True
+
+    window_ms = per_candle_ms * page_limit
+    try:
         cur = start_ms
         while cur < end_ms:
             params = {
                 "symbol": bv_sym, "interval": timeframe,
-                "startTime": cur, "endTime": min(cur + step_ms, end_ms),
-                "limit": 1000,
+                "startTime": cur, "endTime": min(cur + window_ms, end_ms),
+                "limit": page_limit,
             }
             try:
-                r = await client.get(f"{base}/api/v3/klines", params=params)
+                r = await client.get(url, params=params)
                 r.raise_for_status()
                 rows = r.json()
             except Exception as e:
@@ -127,6 +149,9 @@ async def load_historical_ohlcv(
             if new_cur <= cur:
                 break
             cur = new_cur
+    finally:
+        if own_client:
+            await client.aclose()
 
     if not all_rows:
         return pd.DataFrame()
@@ -155,10 +180,22 @@ async def load_historical_funding(
     Retorna DataFrame com colunas (fundingTime, fundingRate) ordenado.
     Vazio em caso de falha — caller deve tratar.
     """
+    from services import binance_futures_service as _bfs
+
     bv_sym = to_bv(symbol)  # ex: BTCUSDT
-    base = "https://fapi.binance.com"
+    base = _bfs.FAPI_BASE
     all_rows: List[List[Any]] = []
-    async with httpx.AsyncClient(timeout=20.0) as client:
+
+    # MESMO caminho do PRD: fapi via proxy de egress quando disponível (contorna
+    # geobloqueio). Sem proxy, cliente próprio direto (pode 451 no Railway).
+    if _bfs.PROXY_ENABLED:
+        client = _bfs._get_client()
+        own_client = False
+    else:
+        client = httpx.AsyncClient(timeout=20.0)
+        own_client = True
+
+    try:
         cur = start_ms
         while cur < end_ms:
             params = {
@@ -181,6 +218,9 @@ async def load_historical_funding(
             if last_ft + 1 <= cur:
                 break
             cur = last_ft + 1
+    finally:
+        if own_client:
+            await client.aclose()
     if not all_rows:
         return pd.DataFrame(columns=["fundingTime", "fundingRate"])
     df = pd.DataFrame(all_rows, columns=["fundingTime", "fundingRate"])

@@ -170,7 +170,10 @@ async def run_universe_backtest(
     if _PROGRESS.get("running"):
         return {"ok": False, "error": "job já em execução", "progress": get_universe_status()}
 
-    from services.binance_service import fetch_top_volume_symbols
+    # Enumera o universo na MESMA fonte que o backtest consome (Binance Futures
+    # via proxy de egress, igual PRD) — evita mismatch de símbolo (moeda top na
+    # OKX que não existe na Binance) e cobre exatamente o universo tradável + além.
+    from services.binance_futures_service import fetch_top_volume_symbols
     from services.recommendation_backtest import backtest_symbol_tf
 
     end_dt = datetime.now(timezone.utc)
