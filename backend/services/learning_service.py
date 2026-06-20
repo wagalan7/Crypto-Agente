@@ -46,7 +46,13 @@ _RESOLVED_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2", "lost")
 # Amostra mínima + thresholds de mérito (em expectancy R = avg dos realized_r)
 # pra PROMOVER (aditivo) ou REBAIXAR (maçã podre) uma moeda. Mesma fonte/critério
 # de "resolvido" do learning, pra consistência. Tudo env-tunável.
-ROTATION_MIN_SAMPLE = int(os.getenv("ROTATION_MIN_SAMPLE", "15"))
+# 2026-06-20: afrouxado 15→12. Análise ao vivo (todo o histórico) mostrou que a
+# allowlist (100) já contém TODO símbolo com edge positivo provado; o gargalo é
+# acúmulo de amostra por símbolo, não slot (teto 350, 250 livres). Baixar pra 12
+# confirma candidatos FUTUROS ~1 ciclo mais cedo sem promover ruído (gate avg_r>0
+# segue ativo) nem rebaixar ninguém (nenhum in-universe tinha n∈[12,14] e avg_r≤-0.2).
+# Reversível: ROTATION_MIN_SAMPLE=15. Não descer abaixo de ~10 (n pequeno = frágil).
+ROTATION_MIN_SAMPLE = int(os.getenv("ROTATION_MIN_SAMPLE", "12"))
 ROTATION_PROMOTE_MIN_R = float(os.getenv("ROTATION_PROMOTE_MIN_R", "0.0"))   # avg_r > 0 → candidata
 ROTATION_DEMOTE_MAX_R = float(os.getenv("ROTATION_DEMOTE_MAX_R", "-0.2"))    # avg_r < -0.2R → ejetar
 
