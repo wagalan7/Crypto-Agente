@@ -551,7 +551,10 @@ async def backtest_symbol_tf(
             created_at=bar_ts,
         )
 
-        future = df.iloc[i + 1:i + 1 + min(MAX_FORWARD_BARS, EXPIRY_HOURS * bars_per_hour)]
+        # int(): EXPIRY_HOURS é float (168.0) → o fim do slice viraria float e o
+        # iloc estoura "positional indexing ... with these indexers [N.0] of type float".
+        fwd_bars = int(min(MAX_FORWARD_BARS, EXPIRY_HOURS * bars_per_hour))
+        future = df.iloc[i + 1:i + 1 + fwd_bars]
         if future.empty:
             continue
         outcome = _simulate_trade(snap, future, timeframe)
