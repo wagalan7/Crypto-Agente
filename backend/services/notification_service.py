@@ -108,6 +108,28 @@ def fmt_tp1_hit(trade: Any, pnl_partial: Optional[float] = None) -> str:
     return msg
 
 
+def _human_motivo(trade: Any, reason: str, pnl_f: float) -> str:
+    """
+    Motivo legível pro usuário, refletindo o PERCURSO do trade e não só o gatilho
+    final. Quando o TP1 já bateu (phase=post_tp1 ou tp1_realized_usd presente), o
+    SL sobe pra BE e o fechamento da sobra por "stop"/"be" NÃO é uma perda crua —
+    o TP1 ficou embolsado. Sem isso, um Win virava "Motivo: stop", escondendo o TP1.
+      • TP1 batido + tp2  → "TP1 + TP2"
+      • TP1 batido + be/stop (PnL≥0) → "TP1 + BE"   (sobra fechou no breakeven)
+      • TP1 batido + stop (PnL<0, raro) → "TP1 + Stop"
+      • TP1 NÃO batido    → "TP2" / "BE" / "Stop" diretos
+    """
+    phase = str(_get(trade, "phase", "pre_tp1") or "pre_tp1")
+    tp1_hit = phase == "post_tp1" or bool(_get(trade, "tp1_realized_usd", None))
+    if tp1_hit:
+        if reason == "tp2":
+            return "TP1 + TP2"
+        return "TP1 + BE" if pnl_f >= 0 else "TP1 + Stop"
+    return {"tp2": "TP2", "be": "BE", "stop": "Stop", "tp1": "TP1"}.get(
+        reason, str(reason)
+    )
+
+
 def fmt_trade_closed(trade: Any, reason: str = "?", pnl: Optional[float] = None) -> str:
     symbol = _get(trade, "symbol", "?")
     side = str(_get(trade, "side", "?")).upper()
@@ -130,9 +152,11 @@ def fmt_trade_closed(trade: Any, reason: str = "?", pnl: Optional[float] = None)
         emoji = "\u26AA"
         label = "BE"
 
+    motivo = _human_motivo(trade, reason, pnl_f)
+
     return (
         f"{emoji} *{label}* \u2014 `{symbol}` ({side})\n"
-        f"Motivo: `{reason}`\n"
+        f"Motivo: `{motivo}`\n"
         f"PnL: `${pnl_f:.2f}`"
     )
 
