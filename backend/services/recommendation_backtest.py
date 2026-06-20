@@ -516,6 +516,24 @@ async def backtest_symbol_tf(
         log.warning(f"[backtest] funding fetch falhou: {e}")
         funding_df = None
 
+    # Varredura barra-a-barra é CPU-bound e SÍNCRONA. Roda em thread separada via
+    # asyncio.to_thread pra NÃO travar o event loop do web dyno (senão /status,
+    # /health e o scan ao vivo do DEV ficam mudos durante todo o símbolo).
+    trades = await asyncio.to_thread(
+        _scan_bars_sync, symbol, timeframe, df, higher_dfs, funding_df, step_bars
+    )
+    return {"symbol": symbol, "timeframe": timeframe,
+            "candles": len(df), "trades": trades}
+
+
+def _scan_bars_sync(
+    symbol: str, timeframe: str, df: pd.DataFrame,
+    higher_dfs: Dict[str, pd.DataFrame],
+    funding_df: Optional[pd.DataFrame],
+    step_bars: int,
+) -> List[Dict[str, Any]]:
+    """Loop síncrono (CPU-bound) da simulação histórica. Todos os dados já vêm
+    carregados — só processa. Extraído pra rodar em asyncio.to_thread."""
     trades: List[Dict[str, Any]] = []
     last_open_per_dir: Dict[str, datetime] = {}
     dedup_delta = timedelta(hours=DEDUP_WINDOW_HOURS)
@@ -523,12 +541,6 @@ async def backtest_symbol_tf(
     bars_per_hour = max(1, int(3600 / (bar_ms / 1000)))
 
     for i in range(WARMUP_BARS, len(df) - 1, step_bars):
-        # Cede o event loop a cada ~250 barras: a varredura full-history (≈19k
-        # barras p/ BTC) é CPU-bound e síncrona — sem isto o web dyno fica MUDO
-        # (timeout no /status) durante todo o símbolo. sleep(0) deixa o servidor
-        # respirar entre blocos sem mudar o resultado.
-        if i % 250 == 0:
-            await asyncio.sleep(0)
         df_visible = df.iloc[:i + 1]
         result = _signal_and_tier(
             symbol, timeframe, df_visible,
@@ -586,8 +598,7 @@ async def backtest_symbol_tf(
             **outcome,
         })
 
-    return {"symbol": symbol, "timeframe": timeframe,
-            "candles": len(df), "trades": trades}
+    return trades
 
 
 # ── Métricas ─────────────────────────────────────────────────────────────────
