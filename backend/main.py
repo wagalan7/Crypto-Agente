@@ -2260,6 +2260,10 @@ def _backtest_universe_enabled() -> bool:
     return os.getenv("BACKTEST_UNIVERSE_ENABLED", "false").strip().lower() in ("1", "true", "on", "yes")
 
 
+# Referências fortes das tasks de backtest em background (anti-GC).
+_BT_UNIVERSE_TASKS: set = set()
+
+
 @app.post("/api/backtest/universe/start")
 async def backtest_universe_start(
     tfs: str = "4h",
@@ -2285,7 +2289,12 @@ async def backtest_universe_start(
         except Exception as e:
             logging.error(f"[bt-universe] job crashou: {e}\n{traceback.format_exc()}")
 
-    asyncio.create_task(_run())
+    # Guarda referência FORTE: sem isso o GC pode coletar a task antes de rodar
+    # (CPython coleta tasks só com referência fraca no loop) — causa "started mas
+    # nunca roda". Idiom oficial: manter num set + remover no done_callback.
+    task = asyncio.create_task(_run())
+    _BT_UNIVERSE_TASKS.add(task)
+    task.add_done_callback(_BT_UNIVERSE_TASKS.discard)
     return {"ok": True, "started": True, "tfs": tf_list, "limit": limit,
             "refresh_days": refresh_days, "step_bars": step_bars,
             "progress": bus.get_universe_status()}

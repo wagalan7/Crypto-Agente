@@ -181,6 +181,13 @@ async def run_universe_backtest(
         symbols = await fetch_top_volume_symbols(limit=limit)
     except Exception as e:
         log.error(f"[bt-universe] falha ao enumerar símbolos: {e}")
+        # Registra no _PROGRESS pra o /status mostrar o motivo (senão fica "total:0"
+        # mudo e parece que a task nem rodou).
+        _PROGRESS.update({
+            "running": False,
+            "current": f"ERRO enumerar símbolos: {e}",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
         return {"ok": False, "error": f"enumerar símbolos: {e}"}
 
     _PROGRESS.update({
