@@ -232,6 +232,15 @@ async def run_universe_backtest(
                 except Exception as e:
                     log.warning(f"[bt-universe] {sym} {tf} crash: {e}")
                     _PROGRESS["errors"] += 1
+                    # Persiste o motivo do crash pra aparecer no ranking/status
+                    # (senão fica invisível — só conta no contador de erros).
+                    try:
+                        await _upsert_stats(sym, tf, {
+                            "trades": [], "candles": 0,
+                            "error": f"crash: {type(e).__name__}: {e}"[:250],
+                        })
+                    except Exception:
+                        pass
                 finally:
                     _PROGRESS["done"] += 1
                 # Cede o loop pra não monopolizar o event loop do web dyno.
