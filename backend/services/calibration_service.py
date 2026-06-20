@@ -219,7 +219,10 @@ def compute_calibration_from_pairs(
         bins_out.append({
             "score_lo": lo,
             "score_hi": int(hi) if hi == int(hi) else round(hi, 1),
-            "label": f"[{lo}-{int(hi)})" if i < len(SCORE_BINS) - 1 else f"[{lo}-100]",
+            # Label reflete o hi REAL do bin (não hardcode "100"). Legado: último bin
+            # (95,100.1)→"[95-100)"; V2: último bin (63,75)→"[63-75)". Antes o último
+            # bin era sempre "[lo-100]", o que sob a V2 exibia "[63-100]" (errado).
+            "label": f"[{lo}-{min(int(hi), 100)})",
             "n_total": c1["bin_total"][i],
             "n_wins": c1["bin_wins"][i],
             "p_observed": round(c1["bin_p_raw"][i], 4),
