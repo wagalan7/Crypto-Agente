@@ -523,6 +523,12 @@ async def backtest_symbol_tf(
     bars_per_hour = max(1, int(3600 / (bar_ms / 1000)))
 
     for i in range(WARMUP_BARS, len(df) - 1, step_bars):
+        # Cede o event loop a cada ~250 barras: a varredura full-history (≈19k
+        # barras p/ BTC) é CPU-bound e síncrona — sem isto o web dyno fica MUDO
+        # (timeout no /status) durante todo o símbolo. sleep(0) deixa o servidor
+        # respirar entre blocos sem mudar o resultado.
+        if i % 250 == 0:
+            await asyncio.sleep(0)
         df_visible = df.iloc[:i + 1]
         result = _signal_and_tier(
             symbol, timeframe, df_visible,
