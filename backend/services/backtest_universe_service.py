@@ -49,6 +49,43 @@ PRD_ALLOWLIST_BASES = frozenset({
     "ZEC", "ZIL", "ZRO",
 })
 
+# --- CALIBRAÇÃO backtest×live (Fase 1, informativa/não-gating) -------------
+# O backtest é OTIMISTA (sem book/funding/slippage reais). Pra traduzir o
+# `wf_avg_r` (out-of-sample) num "edge calibrado" mais perto do que o bot
+# realiza ao vivo, aplicamos um fator de desconto global.
+#
+# Derivação (2026-06-22): cruzei o backtest 4h (DEV) com o desempenho REAL do
+# bot (PRD /api/rotation/symbol-stats, avg_r por símbolo) nas moedas que têm os
+# DOIS lados e amostra viva ≥6 trades. Overlap = 6 majors (todas grade A no
+# backtest, todas R+ ao vivo → sinal de sinal 6/6):
+#   BTC 0.33 · ETH 0.91 · SOL 0.57 · TAO 0.86 · WLD 0.43 · XRP 1.16
+#   mediana ratio live/bt_avg = 0.72 ; live/bt_wf = 0.79
+# Variância alta por moeda (amostras vivas de 6–12 trades) → usa-se SÓ fator
+# GLOBAL, nunca por moeda, e conservador (abaixo da mediana p/ margem):
+CALIBRATION_FACTOR = 0.70
+CALIBRATION_META = {
+    "factor": CALIBRATION_FACTOR,
+    "derived_at": "2026-06-22",
+    "method": "ratio live_avg_r / backtest_wf_avg_r, mediana de 6 majors com "
+              "amostra viva >=6 trades (BTC/ETH/SOL/TAO/WLD/XRP)",
+    "overlap_n": 6,
+    "ratio_median_avg": 0.72,
+    "ratio_median_wf": 0.79,
+    "sign_agreement": "6/6 grade-A do backtest deram R+ ao vivo",
+    "uso": "informativo/screening/teto de sizing; NUNCA como EV isolado",
+}
+
+
+def calibrated_edge(wf_avg_r) -> float | None:
+    """Edge calibrado = wf_avg_r × fator de desconto global (Fase 1).
+    Aproxima o R que o bot tende a realizar ao vivo. None se sem wf."""
+    if wf_avg_r is None:
+        return None
+    try:
+        return round(float(wf_avg_r) * CALIBRATION_FACTOR, 3)
+    except Exception:
+        return None
+
 
 def _norm_base(symbol_or_base: str) -> str:
     """Base normalizada p/ casar perp↔spot na exclusão da allowlist.
@@ -410,6 +447,7 @@ async def get_ranking(
         d["base"] = base
         d["in_allowlist"] = in_allow
         d["perp_tradeable"] = tradeable
+        d["calibrated_avg_r"] = calibrated_edge(r.wf_avg_r)
         ranking.append(d)
         # Candidata: FORA da allowlist, edge out-of-sample positiva e decente,
         # amostra ok, não dominada por expiry (trades-zumbi) E com perp negociável
@@ -427,6 +465,7 @@ async def get_ranking(
         "min_trades": min_trades,
         "allowlist_size": len(PRD_ALLOWLIST_BASES),
         "perp_check": perp_src if perp_bases else "indisponivel",
+        "calibration": CALIBRATION_META,
         "n": len(ranking),
         "ranking": ranking,
         "candidates_to_promote": candidates,
@@ -535,6 +574,7 @@ async def get_insights(
             # headline metrics (o que o card do app mostra)
             "avg_r": r.avg_r,
             "wf_avg_r": r.wf_avg_r,
+            "calibrated_avg_r": calibrated_edge(r.wf_avg_r),
             "win_rate_pct": r.wr_clean_pct,
             "profit_factor": r.profit_factor,
             "expiry_pct": r.expiry_pct,
@@ -557,6 +597,7 @@ async def get_insights(
         "allowlist_size": len(PRD_ALLOWLIST_BASES),
         "perp_check": perp_src if perp_bases else "indisponivel",
         "n_sem_perp": n_no_perp,
+        "calibration": CALIBRATION_META,
     }
     return {
         "enabled": True,
@@ -571,6 +612,10 @@ async def get_insights(
             "D": "fraca / amostra pequena / negativa",
             "sem_perp": "sem par perpétuo USDT ativo na Binance Futures (só-spot/"
                         "delistado/rebrandeado) — não promovível mesmo com edge",
+            "calibrated_avg_r": "wf_avg_r × fator de desconto global (0.70) — "
+                                "aproxima o R real que o bot tende a entregar ao "
+                                "vivo (backtest é otimista). Calibrado em 6 majors "
+                                "com os dois lados; uso só de screening, não EV.",
         },
         "nota": "Aprendizado a partir de backtest histórico (pré-filtro, otimista: "
                 "sem book/derivativos reais). perp_tradeable cruza com o "
