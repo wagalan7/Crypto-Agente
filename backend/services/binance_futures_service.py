@@ -205,6 +205,12 @@ async def fetch_open_interest(symbol: str) -> Optional[float]:
         return None
 
 
+def perp_bases_source() -> str:
+    """Origem do último set de perp bases servido: 'live' (fapi ao vivo) ou
+    'snapshot' (fallback embutido — DEV geobloqueado). 'none' se nunca buscou."""
+    return _perp_bases_cache.get("source", "none")
+
+
 async def fetch_perp_tradeable_bases() -> Optional[Set[str]]:
     """Set de BASES (normalizadas, sem prefixo '1000') com par PERPÉTUO USDT em
     status TRADING na Binance Futures (via /fapi/v1/exchangeInfo).
@@ -214,9 +220,10 @@ async def fetch_perp_tradeable_bases() -> Optional[Set[str]]:
     então tickers só-spot / delistados / rebrandeados (ex.: TOMO, TVK) viram
     candidatos fantasma. Aqui a gente filtra.
 
-    Usa o proxy de egress se configurado (PRD); senão tenta direto (DEV). Se
-    falhar (geoblock 451, timeout), retorna None → o caller marca como
-    'desconhecido' em vez de derrubar o ranking. Cache de 1h."""
+    Usa o proxy de egress se configurado (PRD); senão tenta direto (DEV). Se o
+    fetch ao vivo falhar (geoblock 451 no DEV, timeout), cai no SNAPSHOT embutido
+    (perp_bases_snapshot.PERP_BASES_SNAPSHOT) — assim o DEV ainda marca
+    perp_tradeable. Cache de 1h. `perp_bases_source()` diz a origem."""
     now = time.time()
     cached = _perp_bases_cache.get("set")
     if cached and now - cached[0] < PERP_BASES_TTL:
@@ -238,24 +245,31 @@ async def fetch_perp_tradeable_bases() -> Optional[Set[str]]:
         finally:
             if own_client:
                 await client.aclose()
+        bases: Set[str] = set()
+        for s in d.get("symbols", []):
+            if (s.get("quoteAsset") == "USDT"
+                    and s.get("contractType") == "PERPETUAL"
+                    and s.get("status") == "TRADING"):
+                b = (s.get("baseAsset") or "").upper()
+                if b.startswith("1000") and len(b) > 4:
+                    b = b[4:]
+                if b:
+                    bases.add(b)
+        if bases:
+            _perp_bases_cache["set"] = (now, bases)
+            _perp_bases_cache["source"] = "live"
+            return bases
+        raise ValueError("exchangeInfo sem símbolos perp")
     except Exception as e:
-        log.warning(f"[perp-bases] falha ao buscar exchangeInfo: {e}")
-        # Mantém o último cache válido (mesmo vencido) se houver — melhor um set
-        # levemente velho que 'desconhecido' geral.
-        return cached[1] if cached else None
-
-    bases: Set[str] = set()
-    for s in d.get("symbols", []):
-        if (s.get("quoteAsset") == "USDT"
-                and s.get("contractType") == "PERPETUAL"
-                and s.get("status") == "TRADING"):
-            b = (s.get("baseAsset") or "").upper()
-            if b.startswith("1000") and len(b) > 4:
-                b = b[4:]
-            if b:
-                bases.add(b)
-
-    if bases:
-        _perp_bases_cache["set"] = (now, bases)
-        return bases
-    return cached[1] if cached else None
+        log.warning(f"[perp-bases] fetch ao vivo falhou ({e}); usando snapshot.")
+        # Cache vencido ainda é melhor que snapshot estático.
+        if cached:
+            return cached[1]
+        try:
+            from services.perp_bases_snapshot import PERP_BASES_SNAPSHOT
+            _perp_bases_cache["set"] = (now, PERP_BASES_SNAPSHOT)
+            _perp_bases_cache["source"] = "snapshot"
+            return PERP_BASES_SNAPSHOT
+        except Exception as e2:
+            log.error(f"[perp-bases] snapshot indisponível: {e2}")
+            return None

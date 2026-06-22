@@ -1,0 +1,62 @@
+"""Snapshot das bases com par PERPÉTUO USDT ATIVO (status TRADING) na Binance
+Futures — gerado de /fapi/v1/exchangeInfo em 2026-06-22 (528 bases, normalizado 1000X→X).
+
+FALLBACK pro DEV: o dyno do DEV é geobloqueado no fapi.binance.com (451), então
+fetch_perp_tradeable_bases() não consegue a lista ao vivo lá. Quando o fetch
+falha, usamos este snapshot pra ainda marcar perp_tradeable no ranking/insights.
+Atualizar periodicamente (universo de perps muda devagar). Não é fonte de verdade
+pra execução — é só pra triagem de candidatas no estudo offline.
+"""
+
+PERP_BASES_SNAPSHOT = frozenset({
+    "000BOB", "000MOG", "0G", "1INCH", "1MBABYDOGE", "2Z", "4", "A", "AAVE", "ACE", "ACH",
+    "ACT", "ACU", "ACX", "ADA", "AERGO", "AERO", "AEVO", "AGLD", "AGT", "AIA", "AIGENSYN",
+    "AIN", "AIO", "AIOT", "AIXBT", "AKE", "AKT", "ALCH", "ALGO", "ALICE", "ALL", "ALLO",
+    "ALPINE", "ALT", "ANIME", "ANKR", "APE", "API3", "APR", "APT", "AR", "ARB", "ARC",
+    "ARIA", "ARK", "ARKM", "ARPA", "ASR", "ASTER", "ASTR", "AT", "ATH", "ATOM", "AUCTION",
+    "AVA", "AVAAI", "AVAX", "AVNT", "AWE", "AXL", "AXS", "AZTEC", "B", "B2", "BABY", "BAN",
+    "BANANA", "BANANAS31", "BAND", "BANK", "BARD", "BAS", "BASED", "BAT", "BB", "BCH",
+    "BEAMX", "BEAT", "BEL", "BERA", "BICO", "BIGTIME", "BILL", "BIO", "BIRB", "BLESS",
+    "BLUAI", "BLUR", "BMT", "BNB", "BNT", "BOME", "BONK", "BR", "BRETT", "BREV",
+    "BROCCOLI714", "BROCCOLIF3B", "BSB", "BSV", "BTC", "BTCDOM", "BTR", "BTW", "BULLA",
+    "C", "C98", "CAKE", "CARV", "CAT", "CATI", "CC", "CELO", "CELR", "CETUS", "CFG", "CFX",
+    "CGPT", "CHEEMS", "CHILLGUY", "CHIP", "CHR", "CHZ", "CKB", "CLANKER", "CLO", "COAI",
+    "COLLECT", "COMP", "COOKIE", "COTI", "COW", "CROSS", "CRV", "CTK", "CTR", "CTSI",
+    "CVC", "CVX", "CYBER", "CYS", "DASH", "DEEP", "DEXE", "DIA", "DODOX", "DOGE", "DOGS",
+    "DOLO", "DOOD", "DOT", "DRIFT", "DUSK", "DYDX", "DYM", "EDEN", "EDGE", "EDU", "EGLD",
+    "EIGEN", "ELSA", "ENA", "ENJ", "ENS", "ENSO", "EPIC", "ERA", "ESP", "ESPORTS", "ETC",
+    "ETH", "ETHFI", "ETHW", "EUL", "EVAA", "F", "FARTCOIN", "FET", "FF", "FHE", "FIDA",
+    "FIGHT", "FIL", "FLOCK", "FLOKI", "FLOW", "FLUID", "FLUX", "FOGO", "FOLKS", "FORM",
+    "FRAX", "G", "GALA", "GAS", "GENIUS", "GIGGLE", "GLM", "GMT", "GMX", "GOAT", "GPS",
+    "GRASS", "GRIFFAIN", "GRT", "GTC", "GUA", "GUN", "GWEI", "H", "HAEDAL", "HANA", "HBAR",
+    "HEI", "HEMI", "HFT", "HIVE", "HMSTR", "HOLO", "HOME", "HOT", "HUMA", "HYPE", "HYPER",
+    "ICNT", "ICP", "ICX", "ID", "IDOL", "ILV", "IMX", "IN", "INIT", "INJ", "INX", "IO",
+    "IOST", "IOTA", "IOTX", "IP", "IRYS", "JASMY", "JCT", "JELLYJELLY", "JOE", "JST",
+    "JTO", "JUP", "KAIA", "KAITO", "KAS", "KAT", "KAVA", "KERNEL", "KGEN", "KITE", "KMNO",
+    "KNC", "KOMA", "KSM", "LA", "LAB", "LAYER", "LDO", "LIGHT", "LINEA", "LINK", "LISTA",
+    "LIT", "LPT", "LQTY", "LSK", "LTC", "LUMIA", "LUNA2", "LUNC", "LYN", "M", "MAGIC",
+    "MAGMA", "MANA", "MANTA", "MANTRA", "MASK", "MAV", "MAVIA", "ME", "MEGA", "MELANIA",
+    "MEME", "MERL", "MET", "METIS", "MEW", "MINA", "MIRA", "MITO", "MMT", "MOCA", "MON",
+    "MOODENG", "MORPHO", "MOVE", "MOVR", "MTL", "MUBARAK", "MYX", "NAORIS", "NEAR",
+    "NEIRO", "NEO", "NEWT", "NFP", "NIGHT", "NIL", "NMR", "NOM", "NOT", "NXPC", "OG",
+    "OGN", "ON", "ONDO", "ONE", "ONG", "ONT", "OP", "OPEN", "OPG", "OPN", "ORCA", "ORDER",
+    "ORDI", "PARTI", "PAXG", "PENDLE", "PENGU", "PEOPLE", "PEPE", "PHA", "PHAROS",
+    "PIEVERSE", "PIPPIN", "PIXEL", "PLAY", "PLUME", "PNUT", "POL", "POLYX", "POPCAT",
+    "PORTAL", "POWER", "POWR", "PRL", "PROM", "PROMPT", "PROVE", "PTB", "PUMP", "PUMPBTC",
+    "PUNDIX", "PYTH", "Q", "QNT", "QTUM", "RARE", "RATS", "RAVE", "RAYSOL", "RE", "RECALL",
+    "RED", "RENDER", "RESOLV", "REZ", "RIF", "RIVER", "RLC", "ROBO", "RONIN", "ROSE",
+    "RPL", "RSR", "RUNE", "RVN", "S", "SAFE", "SAGA", "SAHARA", "SAND", "SANTOS", "SAPIEN",
+    "SATS", "SCR", "SCRT", "SEI", "SENT", "SFP", "SHELL", "SHIB", "SIGN", "SIREN", "SKL",
+    "SKR", "SKY", "SKYAI", "SLP", "SLX", "SNX", "SOL", "SOLV", "SOMI", "SONIC", "SOON",
+    "SOPH", "SPACE", "SPELL", "SPK", "SPORTFUN", "SPX", "SQD", "SSV", "STABLE", "STAR",
+    "STBL", "STEEM", "STG", "STO", "STORJ", "STRK", "STX", "SUI", "SUN", "SUPER", "SUSHI",
+    "SWARMS", "SXT", "SYN", "SYRUP", "T", "TA", "TAC", "TAG", "TAIKO", "TAKE", "TAO",
+    "THE", "THETA", "TIA", "TLM", "TNSR", "TON", "TOSHI", "TOWNS", "TRADOOR", "TRB",
+    "TREE", "TRIA", "TRUMP", "TRUST", "TRUTH", "TRX", "TST", "TURBO", "TURTLE", "TUT",
+    "TWT", "UAI", "UB", "UMA", "UNI", "US", "USDC", "USELESS", "USTC", "USUAL", "VANA",
+    "VANRY", "VELODROME", "VELVET", "VET", "VIC", "VIRTUAL", "VTHO", "VVV", "W", "WAL",
+    "WAXP", "WCT", "WET", "WIF", "WLD", "WLFI", "WOO", "XAI", "XAN", "XAUT", "XEC", "XLM",
+    "XMR", "XNY", "XPIN", "XPL", "XRP", "XTZ", "XVG", "XVS", "YB", "YFI", "YGG", "ZAMA",
+    "ZBT", "ZEC", "ZEN", "ZEREBRO", "ZEST", "ZETA", "ZIL", "ZK", "ZKC", "ZKP", "ZORA",
+    "ZRO", "ZRX", "币安人生", "我踏马来了", "龙虾",
+})

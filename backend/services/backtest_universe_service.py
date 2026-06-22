@@ -64,15 +64,18 @@ def _norm_base(symbol_or_base: str) -> str:
     return b
 
 
-async def _perp_tradeable_bases():
-    """Set de bases com perp USDT ativo na Binance Futures (None se não checável).
-    Wrapper tolerante: qualquer falha vira None → caller marca 'desconhecido'."""
+async def _perp_tradeable_bases() -> tuple:
+    """(set, source): bases com perp USDT ativo + origem ('live'/'snapshot'/'none').
+    Wrapper tolerante: qualquer falha vira (None, 'none')."""
     try:
-        from services.binance_futures_service import fetch_perp_tradeable_bases
-        return await fetch_perp_tradeable_bases()
+        from services.binance_futures_service import (
+            fetch_perp_tradeable_bases, perp_bases_source,
+        )
+        bases = await fetch_perp_tradeable_bases()
+        return bases, perp_bases_source()
     except Exception as e:
         log.warning(f"[bt-universe] perp-tradeable indisponível: {e}")
-        return None
+        return None, "none"
 
 # Estado de progresso em memória (lido pelo endpoint /status). Reseta no redeploy,
 # mas os RESULTADOS ficam no DB — o /start retoma de onde parou.
@@ -368,7 +371,7 @@ async def get_ranking(
             .limit(limit)
         )).scalars().all()
 
-    perp_bases = await _perp_tradeable_bases()
+    perp_bases, perp_src = await _perp_tradeable_bases()
 
     ranking = []
     candidates = []
@@ -399,7 +402,7 @@ async def get_ranking(
         "tf": tf,
         "min_trades": min_trades,
         "allowlist_size": len(PRD_ALLOWLIST_BASES),
-        "perp_check": "ok" if perp_bases else "indisponivel",
+        "perp_check": perp_src if perp_bases else "indisponivel",
         "n": len(ranking),
         "ranking": ranking,
         "candidates_to_promote": candidates,
@@ -465,7 +468,7 @@ async def get_insights(
             .limit(limit)
         )).scalars().all()
 
-    perp_bases = await _perp_tradeable_bases()
+    perp_bases, perp_src = await _perp_tradeable_bases()
 
     coins = []
     grade_counts = {"A": 0, "B": 0, "C": 0, "D": 0}
@@ -528,7 +531,7 @@ async def get_insights(
         "best": {"base": best["base"], "grade": best["grade"],
                  "wf_avg_r": best["wf_avg_r"]} if best else None,
         "allowlist_size": len(PRD_ALLOWLIST_BASES),
-        "perp_check": "ok" if perp_bases else "indisponivel",
+        "perp_check": perp_src if perp_bases else "indisponivel",
         "n_sem_perp": n_no_perp,
     }
     return {
