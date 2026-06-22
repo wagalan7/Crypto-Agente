@@ -80,6 +80,7 @@ _PROGRESS: dict = {
     "mode": "top",
     "pool": 0,
     "excluded": 0,
+    "offset": 0,
 }
 
 
@@ -203,14 +204,18 @@ async def run_universe_backtest(
     step_bars: int = 1,
     exclude_bases: Optional[frozenset] = None,
     outside_n: Optional[int] = None,
+    outside_offset: int = 0,
 ) -> dict:
     """Job de background: backtest full-history de top-`limit` perps × `tfs`.
     Idempotente/resumível. Atualiza _PROGRESS. Retorna resumo final.
 
     Modo "fora da allowlist" (para descobrir o que PROMOVER):
       • `exclude_bases`: bases a REMOVER do universo (ex.: PRD_ALLOWLIST_BASES).
-      • `outside_n`: depois de remover, fica só com as top-N que SOBRARAM.
-      Use limit alto (pool, ex.: 350) p/ garantir N moedas fora após o filtro."""
+      • `outside_offset`: pula as primeiras N que sobraram (leva 2 = offset 150).
+      • `outside_n`: depois de pular, fica só com as próximas N.
+      Use limit alto (pool, ex.: 500) p/ ter moedas suficientes após o filtro.
+      Como o pool vem ordenado por volume desc, leva1=[0:150] e leva2=[150:300]
+      são contíguas e disjuntas (drift de volume entre runs é desprezível)."""
     if _PROGRESS.get("running"):
         return {"ok": False, "error": "job já em execução", "progress": get_universe_status()}
 
@@ -250,6 +255,9 @@ async def run_universe_backtest(
         kept = [s for s in symbols if _norm_base(s) not in ex]
         excluded_n = pool_n - len(kept)
         symbols = kept
+    off = max(0, int(outside_offset or 0))
+    if off:
+        symbols = symbols[off:]
     if outside_n is not None and outside_n > 0:
         symbols = symbols[:outside_n]
 
@@ -268,9 +276,10 @@ async def run_universe_backtest(
         "mode": mode,
         "pool": pool_n,
         "excluded": excluded_n,
+        "offset": off,
     })
     log.info(f"[bt-universe] START mode={mode} pool={pool_n} excluded={excluded_n} "
-             f"→ {len(symbols)} símbolos × {tfs} = {len(symbols)*len(tfs)} jobs")
+             f"offset={off} → {len(symbols)} símbolos × {tfs} = {len(symbols)*len(tfs)} jobs")
 
     try:
         for sym in symbols:
