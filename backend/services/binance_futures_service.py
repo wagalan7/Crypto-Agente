@@ -18,9 +18,12 @@ Símbolos: CCXT "BTC/USDT:USDT" ↔ Binance Futures "BTCUSDT".
 from __future__ import annotations
 import os
 import time
+import logging
 import httpx
 import pandas as pd
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
+
+log = logging.getLogger(__name__)
 
 PROXY_URL = os.getenv("BINANCE_PROXY_URL", "").strip() or None
 PROXY_ENABLED = bool(PROXY_URL)
@@ -30,6 +33,7 @@ FAPI_BASE = "https://fapi.binance.com"
 
 TOP_VOLUME_TTL = 120
 TICKER_TTL = 60
+PERP_BASES_TTL = 3600  # universo de perps muda devagar; 1h de cache basta
 
 _BLACKLIST_BASES = {
     "USDC", "BUSD", "TUSD", "FDUSD", "USDP", "DAI", "USDS",
@@ -39,6 +43,7 @@ _BLACKLIST_BASES = {
 _client: Optional[httpx.AsyncClient] = None
 _top_cache: Dict[str, tuple] = {}
 _ticker_cache: Dict[str, tuple] = {}
+_perp_bases_cache: Dict[str, tuple] = {}
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -198,3 +203,59 @@ async def fetch_open_interest(symbol: str) -> Optional[float]:
         return float(j.get("openInterest", 0))
     except Exception:
         return None
+
+
+async def fetch_perp_tradeable_bases() -> Optional[Set[str]]:
+    """Set de BASES (normalizadas, sem prefixo '1000') com par PERPÉTUO USDT em
+    status TRADING na Binance Futures (via /fapi/v1/exchangeInfo).
+
+    Serve pra cruzar com o ranking de backtest e marcar `perp_tradeable`: a
+    allowlist do bot é de PERPS, mas o backtest enumera SPOT (binance.vision),
+    então tickers só-spot / delistados / rebrandeados (ex.: TOMO, TVK) viram
+    candidatos fantasma. Aqui a gente filtra.
+
+    Usa o proxy de egress se configurado (PRD); senão tenta direto (DEV). Se
+    falhar (geoblock 451, timeout), retorna None → o caller marca como
+    'desconhecido' em vez de derrubar o ranking. Cache de 1h."""
+    now = time.time()
+    cached = _perp_bases_cache.get("set")
+    if cached and now - cached[0] < PERP_BASES_TTL:
+        return cached[1]
+
+    own_client = False
+    try:
+        if PROXY_ENABLED:
+            client = _get_client()
+        else:
+            client = httpx.AsyncClient(
+                timeout=20.0, headers={"User-Agent": "CryptoAgent/1.0"}
+            )
+            own_client = True
+        try:
+            r = await client.get(f"{FAPI_BASE}/fapi/v1/exchangeInfo")
+            r.raise_for_status()
+            d = r.json()
+        finally:
+            if own_client:
+                await client.aclose()
+    except Exception as e:
+        log.warning(f"[perp-bases] falha ao buscar exchangeInfo: {e}")
+        # Mantém o último cache válido (mesmo vencido) se houver — melhor um set
+        # levemente velho que 'desconhecido' geral.
+        return cached[1] if cached else None
+
+    bases: Set[str] = set()
+    for s in d.get("symbols", []):
+        if (s.get("quoteAsset") == "USDT"
+                and s.get("contractType") == "PERPETUAL"
+                and s.get("status") == "TRADING"):
+            b = (s.get("baseAsset") or "").upper()
+            if b.startswith("1000") and len(b) > 4:
+                b = b[4:]
+            if b:
+                bases.add(b)
+
+    if bases:
+        _perp_bases_cache["set"] = (now, bases)
+        return bases
+    return cached[1] if cached else None

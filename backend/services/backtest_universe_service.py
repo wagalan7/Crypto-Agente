@@ -63,6 +63,17 @@ def _norm_base(symbol_or_base: str) -> str:
         b = b[4:]
     return b
 
+
+async def _perp_tradeable_bases():
+    """Set de bases com perp USDT ativo na Binance Futures (None se não checável).
+    Wrapper tolerante: qualquer falha vira None → caller marca 'desconhecido'."""
+    try:
+        from services.binance_futures_service import fetch_perp_tradeable_bases
+        return await fetch_perp_tradeable_bases()
+    except Exception as e:
+        log.warning(f"[bt-universe] perp-tradeable indisponível: {e}")
+        return None
+
 # Estado de progresso em memória (lido pelo endpoint /status). Reseta no redeploy,
 # mas os RESULTADOS ficam no DB — o /start retoma de onde parou.
 _PROGRESS: dict = {
@@ -357,6 +368,8 @@ async def get_ranking(
             .limit(limit)
         )).scalars().all()
 
+    perp_bases = await _perp_tradeable_bases()
+
     ranking = []
     candidates = []
     for r in rows:
@@ -364,13 +377,18 @@ async def get_ranking(
         # normalizando 1000X → X. DEV roda allowlist própria, então usar a do PRD.
         base = _norm_base(r.symbol) if r.symbol else r.symbol
         in_allow = base in PRD_ALLOWLIST_BASES
+        # perp_tradeable: True/False se temos o set; None se não deu p/ checar.
+        tradeable = (base in perp_bases) if perp_bases else None
         d = r.to_dict()
         d["base"] = base
         d["in_allowlist"] = in_allow
+        d["perp_tradeable"] = tradeable
         ranking.append(d)
         # Candidata: FORA da allowlist, edge out-of-sample positiva e decente,
-        # amostra ok e não dominada por expiry (trades-zumbi).
-        if (not in_allow and (r.wf_avg_r or 0) > 0.10
+        # amostra ok, não dominada por expiry (trades-zumbi) E com perp negociável
+        # (None = desconhecido NÃO desqualifica; só False — delistado/só-spot — sai).
+        if (not in_allow and tradeable is not False
+                and (r.wf_avg_r or 0) > 0.10
                 and (r.avg_r or 0) > 0.10
                 and (r.expiry_pct or 100) < 35):
             candidates.append(d)
@@ -381,12 +399,14 @@ async def get_ranking(
         "tf": tf,
         "min_trades": min_trades,
         "allowlist_size": len(PRD_ALLOWLIST_BASES),
+        "perp_check": "ok" if perp_bases else "indisponivel",
         "n": len(ranking),
         "ranking": ranking,
         "candidates_to_promote": candidates,
-        "nota": "candidatas = fora da allowlist PRD + wf_avg_r>0.10 + avg_r>0.10 + "
-                "expiry<35%. Backtest é PRÉ-FILTRO; veredito final = shadow+rotação "
-                "ao vivo (derivativos/book reais) antes de size cheio.",
+        "nota": "candidatas = fora da allowlist PRD + perp negociável + wf_avg_r>0.10 "
+                "+ avg_r>0.10 + expiry<35%. perp_tradeable=False (delistado/só-spot) "
+                "sai; None = não deu p/ checar (não desqualifica). Backtest é "
+                "PRÉ-FILTRO; veredito final = shadow+rotação ao vivo.",
     }
 
 
@@ -445,12 +465,15 @@ async def get_insights(
             .limit(limit)
         )).scalars().all()
 
+    perp_bases = await _perp_tradeable_bases()
+
     coins = []
     grade_counts = {"A": 0, "B": 0, "C": 0, "D": 0}
     n_positive = 0
     for r in rows:
         base = _norm_base(r.symbol) if r.symbol else r.symbol
         in_allow = base in PRD_ALLOWLIST_BASES
+        tradeable = (base in perp_bases) if perp_bases else None
         grade, reason = _grade_edge(r)
         grade_counts[grade] = grade_counts.get(grade, 0) + 1
         if (r.wf_avg_r or 0) > 0:
@@ -458,8 +481,10 @@ async def get_insights(
         badges = []
         if in_allow:
             badges.append("na_allowlist")
-        elif grade in ("A", "B"):
+        elif grade in ("A", "B") and tradeable is not False:
             badges.append("candidata")
+        if tradeable is False:
+            badges.append("sem_perp")
         if (r.profit_factor or 0) >= 2.0:
             badges.append("pf_alto")
         if (r.expiry_pct if r.expiry_pct is not None else 100) >= 50:
@@ -478,6 +503,7 @@ async def get_insights(
             "grade": grade,
             "grade_reason": reason,
             "in_allowlist": in_allow,
+            "perp_tradeable": tradeable,
             "badges": badges,
             # headline metrics (o que o card do app mostra)
             "avg_r": r.avg_r,
@@ -494,6 +520,7 @@ async def get_insights(
         })
 
     best = coins[0] if coins else None
+    n_no_perp = sum(1 for c in coins if c["perp_tradeable"] is False)
     summary = {
         "n_coins": len(coins),
         "n_positive_edge": n_positive,
@@ -501,6 +528,8 @@ async def get_insights(
         "best": {"base": best["base"], "grade": best["grade"],
                  "wf_avg_r": best["wf_avg_r"]} if best else None,
         "allowlist_size": len(PRD_ALLOWLIST_BASES),
+        "perp_check": "ok" if perp_bases else "indisponivel",
+        "n_sem_perp": n_no_perp,
     }
     return {
         "enabled": True,
@@ -513,8 +542,11 @@ async def get_insights(
             "B": "edge positiva e razoável",
             "C": "marginal / instável",
             "D": "fraca / amostra pequena / negativa",
+            "sem_perp": "sem par perpétuo USDT ativo na Binance Futures (só-spot/"
+                        "delistado/rebrandeado) — não promovível mesmo com edge",
         },
         "nota": "Aprendizado a partir de backtest histórico (pré-filtro, otimista: "
-                "sem book/derivativos reais). Não é recomendação de compra; o "
+                "sem book/derivativos reais). perp_tradeable cruza com o "
+                "exchangeInfo de futures. Não é recomendação de compra; o "
                 "veredito ao vivo vem do shadow+rotação.",
     }
