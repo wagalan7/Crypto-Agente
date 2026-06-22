@@ -29,6 +29,40 @@ WIN_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2")
 # então pedir desde aqui == "histórico completo de cada moeda".
 _FULL_HISTORY_START = datetime(2017, 1, 1, tzinfo=timezone.utc)
 
+# Allowlist EFETIVA do PRD (100 bases — rotação FASE 2, snapshot 2026-06-21).
+# Usada no modo "outside": enumera o universo amplo, REMOVE estas, e backtesta
+# as top-N que sobram — exatamente as candidatas a promover pra allowlist.
+# DEV roda com allowlist própria (372), então não dá pra inferir o universo do
+# PRD de dentro do DEV; por isso a lista vem fixada aqui (revisar quando a
+# rotação do PRD mudar de forma relevante).
+PRD_ALLOWLIST_BASES = frozenset({
+    "AAVE", "ADA", "AERO", "AI", "ALGO", "ALLO", "APT", "ARB", "ASTER", "ASTR",
+    "ATH", "ATOM", "AVAX", "BABY", "BCH", "BERA", "BLUR", "BNB", "BONK", "BSB",
+    "BTC", "CFX", "CHZ", "CRV", "DASH", "DEXE", "DOGE", "DOT", "DYDX", "EIGEN",
+    "ENA", "EPIC", "ETH", "ETHFI", "FARTCOIN", "FET", "FIDA", "FIL", "GALA",
+    "GPS", "HBAR", "HMSTR", "HOME", "HYPE", "ICP", "ID", "INJ", "JTO", "JUP",
+    "KAT", "LDO", "LINEA", "LINK", "LTC", "MEW", "MON", "NEAR", "NOT", "ONDO",
+    "OP", "OPN", "ORDI", "PAXG", "PENDLE", "PENGU", "PEPE", "PIPPIN", "PUMP",
+    "PYTH", "RENDER", "RUNE", "SAHARA", "SAND", "SEI", "SOL", "SPX", "STG",
+    "STRK", "SUI", "SXT", "TAO", "TIA", "TON", "TRUMP", "TRX", "TURBO", "U",
+    "UNI", "UTK", "VIRTUAL", "WIF", "WLD", "XAUT", "XLM", "XMR", "XPL", "XRP",
+    "ZEC", "ZIL", "ZRO",
+})
+
+
+def _norm_base(symbol_or_base: str) -> str:
+    """Base normalizada p/ casar perp↔spot na exclusão da allowlist.
+    Tira sufixo de quote E o prefixo de multiplicador '1000' (1000PEPE→PEPE,
+    1000SATS→SATS) — assim a base do perp do PRD bate com a base do spot/vision."""
+    try:
+        from services.shadow_trade_service import _symbol_base
+        b = _symbol_base(symbol_or_base)
+    except Exception:
+        b = (symbol_or_base or "").upper().split("/", 1)[0]
+    if b.startswith("1000") and len(b) > 4:
+        b = b[4:]
+    return b
+
 # Estado de progresso em memória (lido pelo endpoint /status). Reseta no redeploy,
 # mas os RESULTADOS ficam no DB — o /start retoma de onde parou.
 _PROGRESS: dict = {
@@ -43,6 +77,9 @@ _PROGRESS: dict = {
     "current": None,
     "tfs": [],
     "limit": 0,
+    "mode": "top",
+    "pool": 0,
+    "excluded": 0,
 }
 
 
@@ -164,9 +201,16 @@ async def run_universe_backtest(
     limit: int = 200,
     refresh_days: int = 7,
     step_bars: int = 1,
+    exclude_bases: Optional[frozenset] = None,
+    outside_n: Optional[int] = None,
 ) -> dict:
     """Job de background: backtest full-history de top-`limit` perps × `tfs`.
-    Idempotente/resumível. Atualiza _PROGRESS. Retorna resumo final."""
+    Idempotente/resumível. Atualiza _PROGRESS. Retorna resumo final.
+
+    Modo "fora da allowlist" (para descobrir o que PROMOVER):
+      • `exclude_bases`: bases a REMOVER do universo (ex.: PRD_ALLOWLIST_BASES).
+      • `outside_n`: depois de remover, fica só com as top-N que SOBRARAM.
+      Use limit alto (pool, ex.: 350) p/ garantir N moedas fora após o filtro."""
     if _PROGRESS.get("running"):
         return {"ok": False, "error": "job já em execução", "progress": get_universe_status()}
 
@@ -197,6 +241,18 @@ async def run_universe_backtest(
         })
         return {"ok": False, "error": f"enumerar símbolos: {e}"}
 
+    pool_n = len(symbols)
+    excluded_n = 0
+    mode = "top"
+    if exclude_bases:
+        mode = "outside"
+        ex = {_norm_base(b) for b in exclude_bases}
+        kept = [s for s in symbols if _norm_base(s) not in ex]
+        excluded_n = pool_n - len(kept)
+        symbols = kept
+    if outside_n is not None and outside_n > 0:
+        symbols = symbols[:outside_n]
+
     _PROGRESS.update({
         "running": True,
         "started_at": end_dt.isoformat(),
@@ -209,8 +265,12 @@ async def run_universe_backtest(
         "current": None,
         "tfs": list(tfs),
         "limit": limit,
+        "mode": mode,
+        "pool": pool_n,
+        "excluded": excluded_n,
     })
-    log.info(f"[bt-universe] START {len(symbols)} símbolos × {tfs} = {len(symbols)*len(tfs)} jobs")
+    log.info(f"[bt-universe] START mode={mode} pool={pool_n} excluded={excluded_n} "
+             f"→ {len(symbols)} símbolos × {tfs} = {len(symbols)*len(tfs)} jobs")
 
     try:
         for sym in symbols:
@@ -288,17 +348,13 @@ async def get_ranking(
             .limit(limit)
         )).scalars().all()
 
-    try:
-        from services.shadow_trade_service import get_exec_allowlist, _symbol_base
-        allow = get_exec_allowlist()
-    except Exception:
-        allow, _symbol_base = set(), lambda s: s
-
     ranking = []
     candidates = []
     for r in rows:
-        base = _symbol_base(r.symbol) if r.symbol else r.symbol
-        in_allow = bool(allow) and base in allow
+        # Casa contra a allowlist do PRD (a que importa pra "o que incluir"),
+        # normalizando 1000X → X. DEV roda allowlist própria, então usar a do PRD.
+        base = _norm_base(r.symbol) if r.symbol else r.symbol
+        in_allow = base in PRD_ALLOWLIST_BASES
         d = r.to_dict()
         d["base"] = base
         d["in_allowlist"] = in_allow
@@ -315,11 +371,141 @@ async def get_ranking(
         "sort": sort,
         "tf": tf,
         "min_trades": min_trades,
-        "allowlist_size": len(allow),
+        "allowlist_size": len(PRD_ALLOWLIST_BASES),
         "n": len(ranking),
         "ranking": ranking,
         "candidates_to_promote": candidates,
-        "nota": "candidatas = fora da allowlist + wf_avg_r>0.10 + avg_r>0.10 + "
+        "nota": "candidatas = fora da allowlist PRD + wf_avg_r>0.10 + avg_r>0.10 + "
                 "expiry<35%. Backtest é PRÉ-FILTRO; veredito final = shadow+rotação "
                 "ao vivo (derivativos/book reais) antes de size cheio.",
+    }
+
+
+# ── Grade de edge (A/B/C/D) p/ consumo do APP (não só do bot) ──────────────────
+# Traduz as métricas cruas numa nota legível pro usuário final. Conservador de
+# propósito: o backtest é otimista (sem book/derivativos reais), então exige
+# amostra + walk-forward positivo + expiry controlado pra dar nota alta.
+def _grade_edge(r) -> tuple[str, str]:
+    """Retorna (grade, motivo) a partir de uma linha SymbolBacktestStats."""
+    n = r.n_trades or 0
+    wf = r.wf_avg_r
+    avg = r.avg_r or 0
+    exp = r.expiry_pct if r.expiry_pct is not None else 100
+    pf = r.profit_factor
+    if n < 20:
+        return "D", "amostra pequena (<20 trades)"
+    if wf is None:
+        return "D", "sem walk-forward"
+    if exp >= 55:
+        return "D", f"dominado por expiry ({exp:.0f}%)"
+    # A: edge forte e PERSISTENTE out-of-sample, amostra sólida, expiry baixo.
+    if wf >= 0.20 and avg >= 0.20 and n >= 40 and exp < 35 and (pf is None or pf >= 1.4):
+        return "A", "edge forte e persistente (OOS)"
+    if wf >= 0.10 and avg >= 0.10 and exp < 45:
+        return "B", "edge positiva e razoável"
+    if wf >= 0.0 and avg >= 0.0:
+        return "C", "marginal / instável"
+    return "D", "edge negativa no backtest"
+
+
+async def get_insights(
+    tf: str = "4h",
+    min_trades: int = 20,
+    limit: int = 300,
+) -> dict:
+    """Camada de APRENDIZADO PRO APP (não só pro bot): por moeda, traduz o
+    backtest histórico numa leitura legível pro usuário (grade A–D, headline
+    metrics, badges, span de histórico) + um sumário do universo. Leitura pura.
+
+    Diferente de /ranking (foco operacional em candidatas a promover), aqui o
+    foco é o INSIGHT: 'esta moeda tem edge provada? quão forte? há quanto tempo?'."""
+    from db import DB_ENABLED, get_session
+    from models.symbol_backtest_stats import SymbolBacktestStats
+    from sqlalchemy import select
+    if not DB_ENABLED:
+        return {"enabled": False}
+
+    conds = [SymbolBacktestStats.n_trades >= min_trades]
+    if tf:
+        conds.append(SymbolBacktestStats.timeframe == tf)
+
+    async with get_session() as session:
+        rows = (await session.execute(
+            select(SymbolBacktestStats).where(*conds)
+            .order_by(SymbolBacktestStats.wf_avg_r.desc().nullslast())
+            .limit(limit)
+        )).scalars().all()
+
+    coins = []
+    grade_counts = {"A": 0, "B": 0, "C": 0, "D": 0}
+    n_positive = 0
+    for r in rows:
+        base = _norm_base(r.symbol) if r.symbol else r.symbol
+        in_allow = base in PRD_ALLOWLIST_BASES
+        grade, reason = _grade_edge(r)
+        grade_counts[grade] = grade_counts.get(grade, 0) + 1
+        if (r.wf_avg_r or 0) > 0:
+            n_positive += 1
+        badges = []
+        if in_allow:
+            badges.append("na_allowlist")
+        elif grade in ("A", "B"):
+            badges.append("candidata")
+        if (r.profit_factor or 0) >= 2.0:
+            badges.append("pf_alto")
+        if (r.expiry_pct if r.expiry_pct is not None else 100) >= 50:
+            badges.append("muito_expiry")
+        # Span de histórico legível.
+        span_days = None
+        try:
+            if r.first_ts and r.last_ts:
+                span_days = (r.last_ts - r.first_ts).days
+        except Exception:
+            pass
+        coins.append({
+            "symbol": r.symbol,
+            "base": base,
+            "tf": r.timeframe,
+            "grade": grade,
+            "grade_reason": reason,
+            "in_allowlist": in_allow,
+            "badges": badges,
+            # headline metrics (o que o card do app mostra)
+            "avg_r": r.avg_r,
+            "wf_avg_r": r.wf_avg_r,
+            "win_rate_pct": r.wr_clean_pct,
+            "profit_factor": r.profit_factor,
+            "expiry_pct": r.expiry_pct,
+            "n_trades": r.n_trades,
+            "total_r": r.total_r,
+            "candles": r.candles,
+            "history_days": span_days,
+            "first_ts": r.first_ts.isoformat() if r.first_ts else None,
+            "last_ts": r.last_ts.isoformat() if r.last_ts else None,
+        })
+
+    best = coins[0] if coins else None
+    summary = {
+        "n_coins": len(coins),
+        "n_positive_edge": n_positive,
+        "grade_counts": grade_counts,
+        "best": {"base": best["base"], "grade": best["grade"],
+                 "wf_avg_r": best["wf_avg_r"]} if best else None,
+        "allowlist_size": len(PRD_ALLOWLIST_BASES),
+    }
+    return {
+        "enabled": True,
+        "tf": tf,
+        "min_trades": min_trades,
+        "summary": summary,
+        "coins": coins,
+        "legenda": {
+            "A": "edge forte e persistente (out-of-sample)",
+            "B": "edge positiva e razoável",
+            "C": "marginal / instável",
+            "D": "fraca / amostra pequena / negativa",
+        },
+        "nota": "Aprendizado a partir de backtest histórico (pré-filtro, otimista: "
+                "sem book/derivativos reais). Não é recomendação de compra; o "
+                "veredito ao vivo vem do shadow+rotação.",
     }

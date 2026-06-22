@@ -2270,10 +2270,16 @@ async def backtest_universe_start(
     limit: int = 30,
     refresh_days: int = 7,
     step_bars: int = 1,
+    outside_allowlist: bool = False,
+    outside_n: int = 150,
 ):
     """Dispara o backtest massivo em background (SÓ DEV — BACKTEST_UNIVERSE_ENABLED=on).
     `tfs`: lista separada por vírgula (ex.: "4h,1h"). `limit`: top-N perps por volume.
-    Idempotente/resumível: re-chamar continua de onde parou (pula (sym,tf) frescos)."""
+    Idempotente/resumível: re-chamar continua de onde parou (pula (sym,tf) frescos).
+
+    `outside_allowlist=true`: modo "candidatas a promover" — enumera o pool `limit`
+    (use alto, ex.: 350), REMOVE as bases já na allowlist do PRD (100) e backtesta
+    as top-`outside_n` que sobram. É exatamente o "o que podemos incluir"."""
     if not _backtest_universe_enabled():
         raise HTTPException(403, "Backtest do universo desabilitado (set BACKTEST_UNIVERSE_ENABLED=on no DEV).")
     from services import backtest_universe_service as bus
@@ -2283,9 +2289,15 @@ async def backtest_universe_start(
     if not tf_list:
         raise HTTPException(400, "tfs vazio")
 
+    exclude_bases = bus.PRD_ALLOWLIST_BASES if outside_allowlist else None
+    onside_n = outside_n if outside_allowlist else None
+
     async def _run():
         try:
-            await bus.run_universe_backtest(tf_list, limit=limit, refresh_days=refresh_days, step_bars=step_bars)
+            await bus.run_universe_backtest(
+                tf_list, limit=limit, refresh_days=refresh_days, step_bars=step_bars,
+                exclude_bases=exclude_bases, outside_n=onside_n,
+            )
         except Exception as e:
             logging.error(f"[bt-universe] job crashou: {e}\n{traceback.format_exc()}")
 
@@ -2297,6 +2309,8 @@ async def backtest_universe_start(
     task.add_done_callback(_BT_UNIVERSE_TASKS.discard)
     return {"ok": True, "started": True, "tfs": tf_list, "limit": limit,
             "refresh_days": refresh_days, "step_bars": step_bars,
+            "outside_allowlist": outside_allowlist,
+            "outside_n": onside_n,
             "progress": bus.get_universe_status()}
 
 
@@ -2319,6 +2333,20 @@ async def backtest_universe_ranking(
     Marca quem já está na allowlist e sugere candidatas à promoção. Leitura pura."""
     from services import backtest_universe_service as bus
     return await bus.get_ranking(tf=tf, min_trades=min_trades, sort=sort, limit=limit)
+
+
+@app.get("/api/backtest/universe/insights")
+async def backtest_universe_insights(
+    tf: str = "4h",
+    min_trades: int = 20,
+    limit: int = 300,
+):
+    """Camada de APRENDIZADO pro APP: por moeda, traduz o backtest histórico
+    numa leitura legível pro usuário (grade A–D, headline metrics, badges, span
+    de histórico) + sumário do universo. Não é gated por env (leitura pura;
+    serve tanto PRD quanto DEV — quem tiver dado no DB)."""
+    from services import backtest_universe_service as bus
+    return await bus.get_insights(tf=tf, min_trades=min_trades, limit=limit)
 
 
 @app.get("/api/debug/direction-wr")
