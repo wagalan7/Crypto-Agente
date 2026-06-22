@@ -2273,6 +2273,7 @@ async def backtest_universe_start(
     outside_allowlist: bool = False,
     outside_n: int = 150,
     outside_offset: int = 0,
+    perp_universe: bool = False,
 ):
     """Dispara o backtest massivo em background (SÓ DEV — BACKTEST_UNIVERSE_ENABLED=on).
     `tfs`: lista separada por vírgula (ex.: "4h,1h"). `limit`: top-N perps por volume.
@@ -2281,7 +2282,12 @@ async def backtest_universe_start(
     `outside_allowlist=true`: modo "candidatas a promover" — enumera o pool `limit`
     (use alto, ex.: 500), REMOVE as bases já na allowlist do PRD (100) e backtesta
     as moedas que sobram. `outside_offset` pula as primeiras N de fora (leva 2 =
-    offset 150) e `outside_n` pega as próximas N. É o "o que podemos incluir"."""
+    offset 150) e `outside_n` pega as próximas N. É o "o que podemos incluir".
+
+    `perp_universe=true`: varre TODAS as bases com perp USDT ativo na Binance
+    (live/snapshot) menos a allowlist — sem outside_n/offset. As já feitas são
+    puladas (resumível). É o "rodar o resto que é perp e não tava na lista nem na
+    allowlist". (`limit` aqui só ordena por volume; a cauda vem alfabética.)"""
     if not _backtest_universe_enabled():
         raise HTTPException(403, "Backtest do universo desabilitado (set BACKTEST_UNIVERSE_ENABLED=on no DEV).")
     from services import backtest_universe_service as bus
@@ -2291,15 +2297,18 @@ async def backtest_universe_start(
     if not tf_list:
         raise HTTPException(400, "tfs vazio")
 
-    exclude_bases = bus.PRD_ALLOWLIST_BASES if outside_allowlist else None
-    onside_n = outside_n if outside_allowlist else None
-    onside_off = outside_offset if outside_allowlist else 0
+    # perp_universe e outside_allowlist excluem a allowlist; perp_universe ignora
+    # outside_n/offset (roda tudo).
+    exclude_bases = bus.PRD_ALLOWLIST_BASES if (outside_allowlist or perp_universe) else None
+    onside_n = outside_n if (outside_allowlist and not perp_universe) else None
+    onside_off = outside_offset if (outside_allowlist and not perp_universe) else 0
 
     async def _run():
         try:
             await bus.run_universe_backtest(
                 tf_list, limit=limit, refresh_days=refresh_days, step_bars=step_bars,
                 exclude_bases=exclude_bases, outside_n=onside_n, outside_offset=onside_off,
+                perp_universe=perp_universe,
             )
         except Exception as e:
             logging.error(f"[bt-universe] job crashou: {e}\n{traceback.format_exc()}")
@@ -2315,6 +2324,7 @@ async def backtest_universe_start(
             "outside_allowlist": outside_allowlist,
             "outside_n": onside_n,
             "outside_offset": onside_off,
+            "perp_universe": perp_universe,
             "progress": bus.get_universe_status()}
 
 

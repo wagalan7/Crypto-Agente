@@ -219,6 +219,7 @@ async def run_universe_backtest(
     exclude_bases: Optional[frozenset] = None,
     outside_n: Optional[int] = None,
     outside_offset: int = 0,
+    perp_universe: bool = False,
 ) -> dict:
     """Job de background: backtest full-history de top-`limit` perps × `tfs`.
     Idempotente/resumível. Atualiza _PROGRESS. Retorna resumo final.
@@ -228,8 +229,13 @@ async def run_universe_backtest(
       • `outside_offset`: pula as primeiras N que sobraram (leva 2 = offset 150).
       • `outside_n`: depois de pular, fica só com as próximas N.
       Use limit alto (pool, ex.: 500) p/ ter moedas suficientes após o filtro.
-      Como o pool vem ordenado por volume desc, leva1=[0:150] e leva2=[150:300]
-      são contíguas e disjuntas (drift de volume entre runs é desprezível)."""
+
+    Modo "perp_universe" (varrer TODOS os perps restantes):
+      • Enumera TODAS as bases com perp USDT ativo (live/snapshot), REMOVE
+        `exclude_bases` (allowlist) e roda TODAS — sem outside_n/offset. Ordena
+        por volume spot (liquidez primeiro) e a cauda longa em ordem alfabética.
+        As já backtestadas são puladas pelo skip-fresh (resumível). É o "rodar o
+        resto que é perp e não tava na lista nem na allowlist"."""
     if _PROGRESS.get("running"):
         return {"ok": False, "error": "job já em execução", "progress": get_universe_status()}
 
@@ -263,17 +269,35 @@ async def run_universe_backtest(
     pool_n = len(symbols)
     excluded_n = 0
     mode = "top"
-    if exclude_bases:
+    off = max(0, int(outside_offset or 0))
+    if perp_universe:
+        # Universo = TODAS as bases com perp ativo, menos a allowlist. Ordena por
+        # volume spot (as que já vieram em `symbols`), depois cauda alfabética.
+        mode = "perp_universe"
+        perp = await _perp_tradeable_bases()
+        perp = perp[0] if isinstance(perp, tuple) else perp
+        perp = perp or set()
+        ex = {_norm_base(b) for b in (exclude_bases or frozenset())}
+        ordered, seen = [], set()
+        for s in symbols:  # spot-volume desc → liquidez primeiro
+            b = _norm_base(s)
+            if b in perp and b not in ex and b not in seen:
+                ordered.append(s); seen.add(b)
+        for b in sorted(perp - ex - seen):  # cauda longa (perp fora do top spot)
+            ordered.append(f"{b}/USDT:USDT"); seen.add(b)
+        pool_n = len(perp)
+        excluded_n = len([b for b in perp if b in ex])
+        symbols = ordered
+    elif exclude_bases:
         mode = "outside"
         ex = {_norm_base(b) for b in exclude_bases}
         kept = [s for s in symbols if _norm_base(s) not in ex]
         excluded_n = pool_n - len(kept)
         symbols = kept
-    off = max(0, int(outside_offset or 0))
-    if off:
-        symbols = symbols[off:]
-    if outside_n is not None and outside_n > 0:
-        symbols = symbols[:outside_n]
+        if off:
+            symbols = symbols[off:]
+        if outside_n is not None and outside_n > 0:
+            symbols = symbols[:outside_n]
 
     _PROGRESS.update({
         "running": True,
