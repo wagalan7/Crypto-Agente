@@ -552,6 +552,40 @@ async def expire_open_snapshot(symbol: str, direction: str, reason: str = "flip_
         return 0
 
 
+async def filter_keys_with_open_snapshot(keys) -> set:
+    """Dado um iterável de chaves (symbol, timeframe, direction), retorna o
+    SUBCONJUNTO que tem um snapshot 'open' agora no DB.
+
+    Usado pelo scan loop pra NÃO empurrar push de uma rec que nasceu e já foi
+    expirada no MESMO ciclo — caso clássico: flip_advisory (rec oposta a uma
+    posição aberta, flip negado → expire_open_snapshot) e no-data. Sem isso, o
+    push é montado antes da expiração e o usuário recebe a notificação de um
+    trade que já aparece 'expirado'. Fail-open: em erro, devolve todas as
+    chaves (não bloqueia push legítimo)."""
+    want = {(s, tf, d) for (s, tf, d) in keys}
+    if not DB_ENABLED or not want:
+        return want
+    try:
+        syms = {k[0] for k in want}
+        async with get_session() as session:
+            stmt = select(
+                RecommendationSnapshot.symbol,
+                RecommendationSnapshot.timeframe,
+                RecommendationSnapshot.direction,
+            ).where(
+                and_(
+                    RecommendationSnapshot.symbol.in_(syms),
+                    RecommendationSnapshot.status == "open",
+                )
+            )
+            rows = (await session.execute(stmt)).all()
+        have = {(r[0], r[1], r[2]) for r in rows}
+        return want & have
+    except Exception as e:
+        log.warning(f"[snapshot] filter_keys_with_open_snapshot falhou: {e}")
+        return want
+
+
 def _atr_abs(snap: RecommendationSnapshot) -> Optional[float]:
     """ATR absoluto do setup, derivado das features (atr_pct × entry)."""
     feats = snap.features or {}

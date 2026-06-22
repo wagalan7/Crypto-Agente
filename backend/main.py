@@ -460,6 +460,31 @@ async def _server_scan_loop():
                 except Exception as e:
                     logging.warning(f"[server-scan] shadow open falhou: {e}")
 
+                # Coerência push↔painel: open_shadow_for_recs (acima) pode ter
+                # EXPIRADO no mesmo ciclo recs opostas a uma posição aberta com
+                # flip negado (flip_advisory) ou no-data. `pushable` foi montado
+                # ANTES disso → sem este filtro, o usuário recebe push de um
+                # trade que já nasce 'expirado' (caso DEXE). Mantém no batch só
+                # as recs que ainda têm snapshot 'open'. Fail-open em erro.
+                if pushable:
+                    try:
+                        from services.snapshot_service import filter_keys_with_open_snapshot
+                        keys = [(r["symbol"], r["timeframe"], r["direction"]) for r in pushable]
+                        still_open = await filter_keys_with_open_snapshot(keys)
+                        before_n = len(pushable)
+                        pushable = [
+                            r for r in pushable
+                            if (r["symbol"], r["timeframe"], r["direction"]) in still_open
+                        ]
+                        dropped = before_n - len(pushable)
+                        if dropped:
+                            logging.info(
+                                f"[server-scan] push: -{dropped} rec(s) expirada(s) no "
+                                f"ciclo (flip/no-data) removida(s) do batch"
+                            )
+                    except Exception as e:
+                        logging.warning(f"[server-scan] filtro push-open falhou: {e}")
+
             logging.info(
                 f"[server-scan] {newly_saved}/{len(recs_dict)} novas (dedup 2h), "
                 f"{len(pushable)} elegíveis pra push"
