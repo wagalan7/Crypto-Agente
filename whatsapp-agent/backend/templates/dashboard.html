@@ -446,6 +446,35 @@
       <div id="cfg-zapi-msg" class="hidden text-sm text-center mt-2"></div>
     </div>
 
+    <!-- Conectar o WhatsApp (parear via QR no próprio painel) -->
+    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+      <div class="flex items-center justify-between mb-1">
+        <div class="flex items-center gap-2">
+          <span class="text-xl">🔗</span>
+          <h3 class="font-semibold text-gray-800 text-sm">Conectar o WhatsApp</h3>
+        </div>
+        <span id="zapi-badge" class="text-xs font-semibold px-2 py-1 rounded-full bg-gray-100 text-gray-500">—</span>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">
+        Depois de salvar as credenciais acima, clique em <strong>Conectar</strong>. No celular,
+        abra o WhatsApp → <em>Aparelhos conectados</em> → <em>Conectar um aparelho</em> e
+        escaneie o código que vai aparecer aqui.
+      </p>
+      <div id="zapi-qr-wrap" class="hidden text-center my-3">
+        <img id="zapi-qr-img" alt="QR Code do WhatsApp"
+          class="mx-auto w-56 h-56 border border-gray-200 rounded-lg bg-white"/>
+        <p class="text-xs text-gray-400 mt-2">O código é renovado automaticamente enquanto esta janela está aberta.</p>
+      </div>
+      <div id="zapi-connected-box" class="hidden my-3 p-3 bg-green-50 border border-green-200 rounded-xl text-sm text-green-700 text-center">
+        ✅ WhatsApp conectado! Seu agente já está respondendo aos pacientes.
+      </div>
+      <button id="zapi-connect-btn" onclick="connectZapi(this)"
+        class="w-full mt-1 bg-green-600 text-white py-2.5 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        📲 Conectar WhatsApp
+      </button>
+      <div id="zapi-conn-msg" class="hidden text-sm text-center mt-2"></div>
+    </div>
+
     <!-- Mensagens personalizáveis -->
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
       <div class="flex items-center gap-2 mb-1">
@@ -2321,6 +2350,95 @@ function saveZapiConfig(btn) {
     })
     .finally(() => { btn.disabled = false; btn.textContent = orig; });
 }
+
+// ── Conectar WhatsApp via QR no painel (onboarding self-serve) ──────────────────
+let _zapiPoll = null;
+let _zapiTicks = 0;
+
+function _zapiSetBadge(state) {
+  const b = document.getElementById('zapi-badge');
+  if (!b) return;
+  if (state === 'connected') { b.className = 'text-xs font-semibold px-2 py-1 rounded-full bg-green-100 text-green-700'; b.textContent = '● Conectado'; }
+  else if (state === 'waiting') { b.className = 'text-xs font-semibold px-2 py-1 rounded-full bg-yellow-100 text-yellow-700'; b.textContent = '● Aguardando leitura'; }
+  else if (state === 'off') { b.className = 'text-xs font-semibold px-2 py-1 rounded-full bg-red-100 text-red-600'; b.textContent = '● Desconectado'; }
+  else { b.className = 'text-xs font-semibold px-2 py-1 rounded-full bg-gray-100 text-gray-500'; b.textContent = '—'; }
+}
+
+function _zapiStopPoll() { if (_zapiPoll) { clearInterval(_zapiPoll); _zapiPoll = null; } }
+
+function _zapiShowConnected() {
+  _zapiStopPoll();
+  const w = document.getElementById('zapi-qr-wrap'); if (w) w.classList.add('hidden');
+  const c = document.getElementById('zapi-connected-box'); if (c) c.classList.remove('hidden');
+  _zapiSetBadge('connected');
+  const btn = document.getElementById('zapi-connect-btn');
+  if (btn) { btn.disabled = false; btn.textContent = '🔄 Verificar conexão'; }
+}
+
+async function _zapiTick() {
+  _zapiTicks++;
+  if (_zapiTicks > 45) {  // ~3 min — para de gerar QR sozinho
+    _zapiStopPoll();
+    const btn = document.getElementById('zapi-connect-btn');
+    if (btn) { btn.disabled = false; btn.textContent = '📲 Conectar WhatsApp'; }
+    const m = document.getElementById('zapi-conn-msg');
+    m.className = 'text-sm text-center text-gray-500 mt-2';
+    m.textContent = 'Tempo esgotado. Clique em Conectar para gerar um novo código.';
+    m.classList.remove('hidden');
+    return;
+  }
+  try {
+    const d = await api('/dashboard/api/zapi/qr');
+    if (d.connected) { _zapiShowConnected(); showToast('WhatsApp conectado ✓', 'success'); return; }
+    if (d.qr) {
+      document.getElementById('zapi-qr-img').src = d.qr;
+      document.getElementById('zapi-qr-wrap').classList.remove('hidden');
+      document.getElementById('zapi-connected-box').classList.add('hidden');
+      _zapiSetBadge('waiting');
+      document.getElementById('zapi-conn-msg').classList.add('hidden');
+    } else {
+      const m = document.getElementById('zapi-conn-msg');
+      m.className = 'text-sm text-center text-yellow-600 mt-2';
+      m.textContent = d.error ? ('Aguardando QR: ' + d.error) : 'Gerando código…';
+      m.classList.remove('hidden');
+      _zapiSetBadge('off');
+    }
+  } catch (e) {
+    const m = document.getElementById('zapi-conn-msg');
+    m.className = 'text-sm text-center text-red-600 mt-2';
+    m.textContent = 'Erro: ' + e.message;
+    m.classList.remove('hidden');
+  }
+}
+
+function connectZapi(btn) {
+  const inst = (document.getElementById('cfg-zapi-instance').value || '').trim();
+  const tok = (document.getElementById('cfg-zapi-token').value || '').trim();
+  const m = document.getElementById('zapi-conn-msg');
+  if (!inst || !tok) {
+    m.className = 'text-sm text-center text-red-600 mt-2';
+    m.textContent = 'Salve o Instance ID e o Token primeiro (botão acima).';
+    m.classList.remove('hidden');
+    return;
+  }
+  btn.disabled = true; btn.textContent = '⏳ Conectando…';
+  _zapiTicks = 0;
+  _zapiStopPoll();
+  _zapiTick();                                  // imediata
+  _zapiPoll = setInterval(_zapiTick, 4000);     // renova QR + detecta conexão
+}
+
+// Checagem leve ao abrir: só atualiza o selo (não fica gerando QR).
+async function _zapiInit() {
+  const instEl = document.getElementById('cfg-zapi-instance');
+  const tokEl = document.getElementById('cfg-zapi-token');
+  if (!instEl || !tokEl || !instEl.value.trim() || !tokEl.value.trim()) { _zapiSetBadge(null); return; }
+  try {
+    const d = await api('/dashboard/api/zapi/qr');
+    if (d.connected) { _zapiShowConnected(); } else { _zapiSetBadge('off'); }
+  } catch (e) { /* silencioso */ }
+}
+window.addEventListener('load', _zapiInit);
 
 // ── Salvar templates de mensagem ───────────────────────────────────────────────
 function saveMsgTemplates(btn) {

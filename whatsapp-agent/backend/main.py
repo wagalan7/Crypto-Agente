@@ -1544,6 +1544,31 @@ async def dash_config(request: Request, body: TenantUpdate):
     return {"status": "updated", "webhook": webhook_result}
 
 
+@app.get("/dashboard/api/zapi/qr")
+async def dash_zapi_qr(request: Request):
+    """QR code para parear o WhatsApp direto no painel (onboarding self-serve).
+    Quando detecta que já conectou, garante o webhook configurado."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    if not tenant.get("evolution_instance") or not tenant.get("evolution_key"):
+        return {"ok": False, "connected": None, "error": "Salve o Instance ID e o Token antes de conectar."}
+    res = await wa.get_zapi_qr(tenant)
+    if res.get("connected"):
+        # Pareou agora → garante provider + webhook ativos (idempotente)
+        try:
+            updates = {}
+            if (tenant.get("whatsapp_provider") or "") != "zapi":
+                updates["whatsapp_provider"] = "zapi"
+            if updates:
+                db.update_tenant(tenant["slug"], **updates)
+            wt = db.ensure_webhook_token(tenant["id"])
+            webhook_url = f"{config.BASE_URL}/webhook/{tenant['slug']}/zapi?token={wt}"
+            res["webhook"] = await wa.configure_webhook_zapi(tenant, webhook_url)
+        except Exception as e:
+            logger.warning(f"[{tenant['slug']}] pós-conexão Z-API: {e}")
+    return res
+
+
 # ── Cobrança ────────────────────────────────────────────────────────────────────
 
 class PatientPriceBody(BaseModel):

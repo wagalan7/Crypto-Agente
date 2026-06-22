@@ -118,6 +118,59 @@ async def get_zapi_status(tenant: dict) -> dict:
         return {"ok": False, "connected": None, "error": str(e)[:200]}
 
 
+async def get_zapi_qr(tenant: dict) -> dict:
+    """
+    Retorna o QR code para parear o WhatsApp da instância Z-API — pra exibir
+    direto no painel (onboarding self-serve, sem mandar o cliente pro site da Z-API).
+
+    Retorna sempre um dict:
+      {"ok": True, "connected": True,  "qr": None}                 — já pareado, não precisa de QR
+      {"ok": True, "connected": False, "qr": "data:image/png;..."} — escaneie este QR
+      {"ok": False, "connected": None/False, "error": "..."}       — falha/credencial
+
+    GET https://api.z-api.io/instances/{id}/token/{token}/qr-code/image
+    A Z-API responde ora como JSON ({"value":"data:image/png;base64,..."}),
+    ora como bytes de imagem — tratamos os dois.
+    """
+    import base64
+
+    instance_id = tenant.get("evolution_instance", "")
+    token = tenant.get("evolution_key", "")
+    client_token = tenant.get("evolution_url", "")
+    if not instance_id or not token:
+        return {"ok": False, "connected": None, "error": "credenciais ausentes"}
+
+    # Se já está conectado, não há QR a mostrar.
+    st = await get_zapi_status(tenant)
+    if st.get("ok") and st.get("connected"):
+        return {"ok": True, "connected": True, "qr": None}
+
+    url = f"https://api.z-api.io/instances/{instance_id}/token/{token}/qr-code/image"
+    headers = {}
+    if client_token:
+        headers["Client-Token"] = client_token
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code >= 400:
+                return {"ok": False, "connected": False, "error": f"HTTP {r.status_code}", "raw": r.text[:200]}
+            ctype = (r.headers.get("content-type") or "").lower()
+            if "application/json" in ctype:
+                data = r.json()
+                if data.get("connected"):
+                    return {"ok": True, "connected": True, "qr": None}
+                val = data.get("value") or data.get("qrcode") or data.get("qrCode") or ""
+                if not val:
+                    return {"ok": True, "connected": False, "qr": None, "error": data.get("error") or "QR indisponível"}
+                qr = val if str(val).startswith("data:") else f"data:image/png;base64,{val}"
+                return {"ok": True, "connected": False, "qr": qr}
+            # bytes de imagem
+            b64 = base64.b64encode(r.content).decode()
+            return {"ok": True, "connected": False, "qr": f"data:{ctype or 'image/png'};base64,{b64}"}
+    except Exception as e:
+        return {"ok": False, "connected": None, "error": str(e)[:200]}
+
+
 def extract_selfmessage_zapi(payload: dict) -> tuple[str, str, str] | None:
     """
     Detecta mensagens enviadas PELA psicóloga (fromMe: true) via Z-API.
