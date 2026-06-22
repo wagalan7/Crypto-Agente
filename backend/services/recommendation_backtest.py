@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
@@ -65,6 +66,20 @@ from models.trade_signal import SignalDirection
 
 WARMUP_BARS = 200
 MAX_FORWARD_BARS = 480
+
+# Janela deslizante do scan: em vez de passar o slice que CRESCE (df[:i+1], até
+# ~19k barras no histórico completo → O(n²) recomputando indicadores/padrões a
+# cada barra), passamos só as últimas N barras. Indicadores são causais e de
+# lookback curto (maior = EMA200), e padrões só usam pivôs recentes
+# (pl_idx[-6:]); 800 barras dão ~600 de burn-in além do EMA200 → resultado
+# praticamente idêntico ao histórico completo, com custo CONSTANTE por barra.
+# Configurável via env pra tuning de velocidade × paridade.
+try:
+    SCAN_WINDOW_BARS = int(os.getenv("BACKTEST_SCAN_WINDOW_BARS", "800"))
+except (TypeError, ValueError):
+    SCAN_WINDOW_BARS = 800
+if SCAN_WINDOW_BARS < WARMUP_BARS + 50:
+    SCAN_WINDOW_BARS = WARMUP_BARS + 50
 
 TF_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
@@ -304,6 +319,10 @@ def _compute_mtf_offline(
         sub = df_h[df_h["timestamp"] <= as_of_ts_ms]
         if sub.empty or len(sub) < 50:
             continue
+        # Mesma limitação de janela do TF primário: o higher-TF df também cresce
+        # por barra; só as últimas SCAN_WINDOW_BARS importam (indicadores causais).
+        if len(sub) > SCAN_WINDOW_BARS:
+            sub = sub.iloc[-SCAN_WINDOW_BARS:]
         try:
             ind = calculate_indicators(sub)
             pats = detect_all_patterns(sub)
@@ -541,7 +560,10 @@ def _scan_bars_sync(
     bars_per_hour = max(1, int(3600 / (bar_ms / 1000)))
 
     for i in range(WARMUP_BARS, len(df) - 1, step_bars):
-        df_visible = df.iloc[:i + 1]
+        # Janela deslizante limitada (não o slice que cresce): custo constante
+        # por barra. lo nunca negativo. Bar i continua sendo a última visível.
+        lo = max(0, i + 1 - SCAN_WINDOW_BARS)
+        df_visible = df.iloc[lo:i + 1]
         result = _signal_and_tier(
             symbol, timeframe, df_visible,
             higher_dfs=higher_dfs, funding_df=funding_df,
