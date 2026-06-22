@@ -112,6 +112,18 @@ def init_db():
                 sent_at   TEXT DEFAULT (datetime('now')),
                 UNIQUE(kind, ref_id, due_date)
             );
+
+            -- Saúde da instância de WhatsApp (Z-API) por consultório.
+            -- connected: 1 online | 0 caiu | NULL desconhecido (falha ao checar)
+            CREATE TABLE IF NOT EXISTS instance_health (
+                tenant_id    INTEGER PRIMARY KEY,
+                connected    INTEGER,
+                fail_count   INTEGER NOT NULL DEFAULT 0,
+                down_since   TEXT,
+                alerted_at   TEXT,
+                last_checked TEXT,
+                last_error   TEXT DEFAULT ''
+            );
         """)
         # Migrações incrementais — seguro rodar múltiplas vezes
         migrations = [
@@ -1203,6 +1215,41 @@ def mark_bill_reminder_sent(kind: str, ref_id: int, due_date: str, channel: str 
                VALUES (?, ?, ?, ?)""",
             (kind, ref_id, due_date[:10], channel),
         )
+
+
+# ── Saúde das instâncias (monitor de Z-API) ────────────────────────────────────
+
+def instance_health_get(tenant_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM instance_health WHERE tenant_id = ?", (tenant_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def instance_health_upsert(tenant_id: int, connected, fail_count: int,
+                           down_since, alerted_at, last_checked: str,
+                           last_error: str = ""):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO instance_health
+                   (tenant_id, connected, fail_count, down_since, alerted_at, last_checked, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(tenant_id) DO UPDATE SET
+                   connected   = excluded.connected,
+                   fail_count  = excluded.fail_count,
+                   down_since  = excluded.down_since,
+                   alerted_at  = excluded.alerted_at,
+                   last_checked= excluded.last_checked,
+                   last_error  = excluded.last_error""",
+            (tenant_id, connected, fail_count, down_since, alerted_at, last_checked, last_error),
+        )
+
+
+def instance_health_all() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM instance_health").fetchall()
+    return [dict(r) for r in rows]
 
 
 # ════════════════════════════════════════════════════════════════════════════

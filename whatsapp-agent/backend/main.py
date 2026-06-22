@@ -2526,6 +2526,51 @@ async def painel_api_billing_reminders_run(request: Request):
     return {"ok": True, "enviados": len(sent), "detalhes": sent}
 
 
+# ── Saúde das instâncias de WhatsApp (monitor Z-API) ────────────────────────────
+
+@app.get("/painel/api/instances/health")
+def painel_api_instances_health(request: Request):
+    """Estado conhecido (última checagem) de cada instância monitorada."""
+    _require_admin(request)
+    rows = {r["tenant_id"]: r for r in db.instance_health_all()}
+    out = []
+    for t in db.list_tenants():
+        if (t.get("whatsapp_provider") or "").lower() != "zapi":
+            continue
+        h = rows.get(t["id"], {})
+        conn = h.get("connected")
+        out.append({
+            "slug": t["slug"],
+            "name": t.get("name"),
+            "connected": (None if conn is None else bool(conn)),
+            "down_since": h.get("down_since"),
+            "last_checked": h.get("last_checked"),
+            "last_error": h.get("last_error", ""),
+        })
+    return {"instances": out}
+
+
+@app.post("/painel/api/instances/check")
+async def painel_api_instances_check(request: Request):
+    """Força uma varredura de saúde agora e retorna o resultado."""
+    _require_admin(request)
+    import instance_monitor
+    res = await instance_monitor.monitor_once()
+    return {"ok": True, "resultado": res}
+
+
+@app.get("/painel/api/instances/{slug}/status")
+async def painel_api_instance_status_live(slug: str, request: Request):
+    """Consulta o status AO VIVO da instância Z-API de um consultório."""
+    _require_admin(request)
+    t = db.get_tenant(slug)
+    if not t:
+        raise HTTPException(status_code=404, detail="Consultório não encontrado.")
+    import whatsapp_service as _wa
+    st = await _wa.get_zapi_status(t)
+    return {"slug": slug, **st}
+
+
 @app.get("/painel/api/content/{key}")
 def painel_api_content_get(key: str, request: Request):
     _require_admin(request)

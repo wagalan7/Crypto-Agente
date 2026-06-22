@@ -402,3 +402,10 @@ def start_scheduler():
     t = threading.Thread(target=_scheduler_loop, daemon=True, name="confirmation-scheduler")
     t.start()
     logger.info(f"Scheduler iniciado (intervalo: 30 min | janela de envio: {_SEND_AFTER_HOUR}h-{_SEND_BEFORE_HOUR}h | followup: {_FOLLOWUP_HOUR}h)")
+
+    # Monitor de saúde das instâncias (thread própria, cadência mais curta).
+    try:
+        import instance_monitor
+        instance_monitor.start_monitor()
+    except Exception as e:
+        logger.warning(f"Não foi possível iniciar o monitor de instâncias: {e}")

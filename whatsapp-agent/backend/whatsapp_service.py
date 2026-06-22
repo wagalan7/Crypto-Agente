@@ -83,6 +83,41 @@ async def _send_zapi(tenant: dict, phone: str, text: str) -> bool:
         return False
 
 
+async def get_zapi_status(tenant: dict) -> dict:
+    """
+    Consulta o status da instância Z-API.
+    GET https://api.z-api.io/instances/{instance}/token/{token}/status
+
+    Retorna sempre um dict:
+      {"ok": True,  "connected": True/False, "raw": {...}}   — resposta válida da Z-API
+      {"ok": False, "connected": None, "error": "..."}        — falha de rede/HTTP/credencial
+
+    'ok' indica se conseguimos falar com a Z-API (não confundir com 'connected',
+    que é se o WhatsApp do celular está pareado/online).
+    """
+    instance_id = tenant.get("evolution_instance", "")
+    token = tenant.get("evolution_key", "")
+    client_token = tenant.get("evolution_url", "")
+    if not instance_id or not token:
+        return {"ok": False, "connected": None, "error": "credenciais ausentes"}
+
+    url = f"https://api.z-api.io/instances/{instance_id}/token/{token}/status"
+    headers = {}
+    if client_token:
+        headers["Client-Token"] = client_token
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code >= 400:
+                return {"ok": False, "connected": None, "error": f"HTTP {r.status_code}", "raw": r.text[:200]}
+            data = r.json()
+            # Z-API: {"connected": true, "error": null, "smartphoneConnected": true}
+            connected = bool(data.get("connected"))
+            return {"ok": True, "connected": connected, "raw": data}
+    except Exception as e:
+        return {"ok": False, "connected": None, "error": str(e)[:200]}
+
+
 def extract_selfmessage_zapi(payload: dict) -> tuple[str, str, str] | None:
     """
     Detecta mensagens enviadas PELA psicóloga (fromMe: true) via Z-API.

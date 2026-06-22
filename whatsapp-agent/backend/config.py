@@ -78,3 +78,11 @@ BILLING_REMINDER_HOUR = int(os.getenv("BILLING_REMINDER_HOUR", "9"))
 # Por qual consultório enviar o WhatsApp do operador (precisa de uma instância
 # Z-API ativa para mandar pro seu próprio número). Vazio = usa o 1º tenant ativo.
 OPERATOR_WHATSAPP_TENANT_SLUG = os.getenv("OPERATOR_WHATSAPP_TENANT_SLUG", "")
+
+# ── Monitor de saúde das instâncias de WhatsApp (Z-API) ───────────────────────
+# Detecta quando o WhatsApp de um consultório desconecta (o agente para de
+# responder) e avisa você + a psicóloga automaticamente.
+INSTANCE_MONITOR_ENABLED       = os.getenv("INSTANCE_MONITOR_ENABLED", "1") == "1"
+INSTANCE_MONITOR_INTERVAL_MIN  = int(os.getenv("INSTANCE_MONITOR_INTERVAL_MIN", "10"))   # checa a cada N min
+INSTANCE_MONITOR_FAIL_THRESHOLD= int(os.getenv("INSTANCE_MONITOR_FAIL_THRESHOLD", "3"))  # falhas seguidas p/ tratar como queda
+INSTANCE_MONITOR_REALERT_HOURS = int(os.getenv("INSTANCE_MONITOR_REALERT_HOURS", "6"))   # re-alerta se seguir caído
