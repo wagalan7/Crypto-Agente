@@ -19,10 +19,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+# Timeout por (símbolo, tf): sem isso, um fetch de dados pendurado (ex.: DEV
+# geobloqueado no fapi caindo num fallback que trava) congela o sweep inteiro
+# pra sempre — não lança exceção, só nunca retorna. Com timeout, o item estoura,
+# conta como erro e o sweep segue. Generoso pra não matar backtest legítimo lento.
+_SYMBOL_TIMEOUT_S = float(os.getenv("BT_UNIVERSE_SYMBOL_TIMEOUT_S", "180"))
 
 WIN_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2")
 # 2017-01-01: load_historical_ohlcv retorna só o que existe desde a listagem,
@@ -365,8 +372,11 @@ async def run_universe_backtest(
                         _PROGRESS["skipped"] += 1
                         _PROGRESS["done"] += 1
                         continue
-                    res = await backtest_symbol_tf(
-                        sym, tf, _FULL_HISTORY_START, end_dt, step_bars=step_bars
+                    res = await asyncio.wait_for(
+                        backtest_symbol_tf(
+                            sym, tf, _FULL_HISTORY_START, end_dt, step_bars=step_bars
+                        ),
+                        timeout=_SYMBOL_TIMEOUT_S,
                     )
                     await _upsert_stats(sym, tf, res)
                     if res.get("error") and not res.get("trades"):
