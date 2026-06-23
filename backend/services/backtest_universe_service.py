@@ -266,6 +266,7 @@ async def run_universe_backtest(
     outside_n: Optional[int] = None,
     outside_offset: int = 0,
     perp_universe: bool = False,
+    order_by: str = "volume",
 ) -> dict:
     """Job de background: backtest full-history de top-`limit` perps × `tfs`.
     Idempotente/resumível. Atualiza _PROGRESS. Retorna resumo final.
@@ -316,6 +317,22 @@ async def run_universe_backtest(
     excluded_n = 0
     mode = "top"
     off = max(0, int(outside_offset or 0))
+
+    # Ordenação por HISTÓRICO (listagem mais antiga primeiro = mais dados/confiança).
+    # Busca o mapa {base: onboardDate} via exchangeInfo; quem não tiver data vai pro
+    # fim. Se o fetch falhar (mapa vazio), mantém a ordem padrão (volume).
+    onboard_map: dict = {}
+    if order_by == "history":
+        try:
+            onboard_map = await _bfs.fetch_perp_onboard_dates()
+        except Exception as e:
+            log.warning(f"[bt-universe] onboard dates indisponíveis ({e}); ordem por volume")
+
+    def _hist_sorted(syms):
+        if not onboard_map:
+            return syms
+        return sorted(syms, key=lambda s: onboard_map.get(_norm_base(s), 1 << 62))
+
     if perp_universe:
         # Universo = TODAS as bases com perp ativo, menos a allowlist. Ordena por
         # volume spot (as que já vieram em `symbols`), depois cauda alfabética.
@@ -333,12 +350,13 @@ async def run_universe_backtest(
             ordered.append(f"{b}/USDT:USDT"); seen.add(b)
         pool_n = len(perp)
         excluded_n = len([b for b in perp if b in ex])
-        symbols = ordered
+        symbols = _hist_sorted(ordered)
     elif exclude_bases:
         mode = "outside"
         ex = {_norm_base(b) for b in exclude_bases}
         kept = [s for s in symbols if _norm_base(s) not in ex]
         excluded_n = pool_n - len(kept)
+        kept = _hist_sorted(kept)  # ordena ANTES do offset/slice → lotes por histórico
         symbols = kept
         if off:
             symbols = symbols[off:]

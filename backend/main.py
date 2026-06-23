@@ -2307,6 +2307,7 @@ async def backtest_universe_start(
     outside_n: int = 150,
     outside_offset: int = 0,
     perp_universe: bool = False,
+    order_by: str = "volume",
 ):
     """Dispara o backtest massivo em background (SÓ DEV — BACKTEST_UNIVERSE_ENABLED=on).
     `tfs`: lista separada por vírgula (ex.: "4h,1h"). `limit`: top-N perps por volume.
@@ -2341,7 +2342,7 @@ async def backtest_universe_start(
             await bus.run_universe_backtest(
                 tf_list, limit=limit, refresh_days=refresh_days, step_bars=step_bars,
                 exclude_bases=exclude_bases, outside_n=onside_n, outside_offset=onside_off,
-                perp_universe=perp_universe,
+                perp_universe=perp_universe, order_by=order_by,
             )
         except Exception as e:
             logging.error(f"[bt-universe] job crashou: {e}\n{traceback.format_exc()}")
@@ -2358,6 +2359,7 @@ async def backtest_universe_start(
             "outside_n": onside_n,
             "outside_offset": onside_off,
             "perp_universe": perp_universe,
+            "order_by": order_by,
             "progress": bus.get_universe_status()}
 
 

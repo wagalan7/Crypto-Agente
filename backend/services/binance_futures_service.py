@@ -273,3 +273,52 @@ async def fetch_perp_tradeable_bases() -> Optional[Set[str]]:
         except Exception as e2:
             log.error(f"[perp-bases] snapshot indisponível: {e2}")
             return None
+
+
+_perp_onboard_cache: dict = {}
+
+
+async def fetch_perp_onboard_dates() -> dict:
+    """Mapa {BASE: onboardDate_ms} dos perps USDT TRADING (via exchangeInfo).
+    Serve pra ORDENAR o sweep por histórico (listagem mais antiga = mais dados =
+    backtest mais confiável). Mesma via/proxy de fetch_perp_tradeable_bases. Se
+    falhar, devolve {} (chamador cai na ordem padrão por volume). Cache 1h."""
+    now = time.time()
+    cached = _perp_onboard_cache.get("map")
+    if cached and now - cached[0] < PERP_BASES_TTL:
+        return cached[1]
+    own_client = False
+    try:
+        if PROXY_ENABLED:
+            client = _get_client()
+        else:
+            client = httpx.AsyncClient(
+                timeout=20.0, headers={"User-Agent": "CryptoAgent/1.0"}
+            )
+            own_client = True
+        try:
+            r = await client.get(f"{FAPI_BASE}/fapi/v1/exchangeInfo")
+            r.raise_for_status()
+            d = r.json()
+        finally:
+            if own_client:
+                await client.aclose()
+        out: dict = {}
+        for s in d.get("symbols", []):
+            if (s.get("quoteAsset") == "USDT"
+                    and s.get("contractType") == "PERPETUAL"
+                    and s.get("status") == "TRADING"):
+                b = (s.get("baseAsset") or "").upper()
+                if b.startswith("1000") and len(b) > 4:
+                    b = b[4:]
+                ob = s.get("onboardDate")
+                if b and ob is not None:
+                    # se a base repetir, fica com a listagem mais antiga
+                    if b not in out or ob < out[b]:
+                        out[b] = ob
+        if out:
+            _perp_onboard_cache["map"] = (now, out)
+        return out
+    except Exception as e:
+        log.warning(f"[perp-onboard] fetch falhou ({e}); ordenação por histórico indisponível.")
+        return cached[1] if cached else {}
