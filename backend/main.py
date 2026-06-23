@@ -4170,6 +4170,18 @@ async def exchange_positions(symbol: str | None = None):
     return res
 
 
+@app.get("/api/exchange/positions-ratelimit")
+async def exchange_positions_ratelimit():
+    """Estado do cooldown anti-ban da leitura de posições (cache + -1003)."""
+    try:
+        from services import binance_signed_service
+        if hasattr(binance_signed_service, "get_positions_ban_status"):
+            return binance_signed_service.get_positions_ban_status()
+        return {"error": "cliente atual não expõe ban-status"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/exchange/orders")
 async def exchange_orders(symbol: str | None = None, limit: int = 50):
     from services import exchange_service

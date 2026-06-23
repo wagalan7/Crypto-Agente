@@ -322,13 +322,114 @@ async def get_wallet_balance(account_type: str = "UNIFIED") -> dict:
     }
 
 
-async def get_positions(symbol: Optional[str] = None) -> dict:
-    params = {}
-    if symbol:
-        params["symbol"] = to_binance(symbol) if "/" in symbol else symbol
-    res = await _signed_request("GET", "/fapi/v2/positionRisk", params or None)
+# ── Cache + anti-ban da leitura de posições (positionRisk) ──────────────────
+# positionRisk não tem cache nem backoff: cada poll do painel + trade-manager +
+# reconcile batia CRU na API assinada. Sob carga, a Binance devolve -1003 e
+# BANE o IP por minutos→horas; pior, sem detectar o ban o código continuava
+# chamando e a Binance ESCALAVA a duração. Solução:
+#   1. Snapshot único de TODAS as posições, cacheado por TTL curto. Toda chamada
+#      (com ou sem symbol) compartilha o mesmo fetch e filtra em memória —
+#      derruba N chamadas/ciclo pra no máx 1 a cada TTL.
+#   2. Detecção de -1003/"banned until <ms>" → cooldown: enquanto banido,
+#      devolve o último snapshot conhecido SEM chamar a API (não escala o ban).
+_POSITIONS_CACHE_TTL = float(os.getenv("BINANCE_POSITIONS_CACHE_TTL", "5.0"))  # s
+_RATE_LIMIT_COOLDOWN_MS = int(os.getenv("BINANCE_RATELIMIT_COOLDOWN_MS", "30000"))  # -1003 sem 'banned until'
+_positions_cache: dict = {"ts": 0.0, "data": None}  # data = lista normalizada (size>0)
+_ban_until_ms: float = 0.0
+
+
+def _parse_ban_until_ms(res: dict) -> float:
+    """Extrai o epoch-ms do ban de uma resposta -1003. 0 se não houver ban."""
+    try:
+        code = res.get("code")
+        try:
+            code = int(code)
+        except (ValueError, TypeError):
+            code = None
+        msg = str(res.get("msg") or res.get("error") or "")
+        if code == -1003 or "too many request" in msg.lower() or "banned" in msg.lower():
+            import re
+            m = re.search(r"banned until (\d+)", msg)
+            if m:
+                return float(m.group(1))
+            # -1003 sem ban explícito (só rate-limit) → cooldown curto preventivo
+            return (time.time() * 1000.0) + _RATE_LIMIT_COOLDOWN_MS
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_positions_ban_status() -> dict:
+    """Diagnóstico: estado do cooldown anti-ban da leitura de posições."""
+    now_ms = time.time() * 1000.0
+    return {
+        "banned": now_ms < _ban_until_ms,
+        "ban_until_ms": _ban_until_ms,
+        "seconds_left": max(0.0, round((_ban_until_ms - now_ms) / 1000.0, 1)),
+        "cache_age_s": round(time.time() - _positions_cache["ts"], 1) if _positions_cache["data"] is not None else None,
+        "cache_ttl_s": _POSITIONS_CACHE_TTL,
+    }
+
+
+def _filter_positions(data, symbol: Optional[str]):
+    if not symbol:
+        return list(data)
+    norm = to_binance(symbol) if "/" in symbol else symbol
+    return [p for p in data if p.get("symbol") == norm]
+
+
+async def get_positions(symbol: Optional[str] = None, *, force: bool = False) -> dict:
+    """Leitura de posições com cache curto + cooldown anti-ban.
+
+    Sempre busca TODAS as posições (mesmo weight que uma só no positionRisk) e
+    filtra por symbol em memória, pra todos os chamadores compartilharem o cache.
+    force=True ignora o cache (use só quando precisar de leitura garantidamente
+    fresca, ex.: logo após abrir/fechar ordem).
+    """
+    global _ban_until_ms
+    now = time.time()
+    now_ms = now * 1000.0
+
+    def _ok(data, *, stale: bool = False, banned: bool = False) -> dict:
+        out = {"ok": True, "positions": _filter_positions(data, symbol),
+               "count": len(_filter_positions(data, symbol)),
+               "testnet": _TESTNET, "exchange": "binance"}
+        if stale:
+            out["stale"] = True
+        if banned:
+            out["rate_limited"] = True
+            out["ban_until_ms"] = _ban_until_ms
+        return out
+
+    # 1. Em cooldown de ban: nunca chama a API (senão escala o ban). Devolve o
+    #    último snapshot conhecido marcado como stale; se não há cache, erro claro.
+    if now_ms < _ban_until_ms:
+        if _positions_cache["data"] is not None:
+            return _ok(_positions_cache["data"], stale=True, banned=True)
+        return {"ok": False, "code": -1003,
+                "msg": f"rate-limit cooldown ativo até {int(_ban_until_ms)} (sem cache p/ servir)",
+                "ban_until_ms": _ban_until_ms, "testnet": _TESTNET, "exchange": "binance"}
+
+    # 2. Cache fresco → serve sem chamar a API.
+    if (not force and _positions_cache["data"] is not None
+            and (now - _positions_cache["ts"]) < _POSITIONS_CACHE_TTL):
+        return _ok(_positions_cache["data"])
+
+    # 3. Fetch real (TODAS as posições).
+    res = await _signed_request("GET", "/fapi/v2/positionRisk", None)
     if not res.get("ok"):
+        ban_ms = _parse_ban_until_ms(res)
+        if ban_ms > 0:
+            _ban_until_ms = ban_ms
+            log.warning(
+                f"[binance] positionRisk rate-limit/ban detectado — cooldown até "
+                f"{int(ban_ms)} ({get_positions_ban_status()['seconds_left']}s). "
+                f"Servindo cache e parando de chamar pra não escalar."
+            )
+            if _positions_cache["data"] is not None:
+                return _ok(_positions_cache["data"], stale=True, banned=True)
         return res
+
     rows = res["result"] or []
     positions = []
     for p in rows:
@@ -349,8 +450,9 @@ async def get_positions(symbol: Optional[str] = None) -> dict:
             "take_profit": None,  # Binance não retorna TP/SL nesse endpoint
             "stop_loss": None,
         })
-    return {"ok": True, "positions": positions, "count": len(positions),
-            "testnet": _TESTNET, "exchange": "binance"}
+    _positions_cache["data"] = positions
+    _positions_cache["ts"] = now
+    return _ok(positions)
 
 
 async def place_protection_orders(
