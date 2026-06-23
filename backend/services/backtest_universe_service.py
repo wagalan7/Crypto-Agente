@@ -28,8 +28,10 @@ log = logging.getLogger(__name__)
 # Timeout por (símbolo, tf): sem isso, um fetch de dados pendurado (ex.: DEV
 # geobloqueado no fapi caindo num fallback que trava) congela o sweep inteiro
 # pra sempre — não lança exceção, só nunca retorna. Com timeout, o item estoura,
-# conta como erro e o sweep segue. Generoso pra não matar backtest legítimo lento.
-_SYMBOL_TIMEOUT_S = float(os.getenv("BT_UNIVERSE_SYMBOL_TIMEOUT_S", "180"))
+# conta como erro e o sweep segue. Default 600s: o 1h sobre histórico completo
+# (~78k candles dos majors) leva minutos legítimos; 180s cortava BTC/ETH/SOL e
+# gerava buracos nos dados. 600s cobre o pior caso sem deixar hang de verdade vivo.
+_SYMBOL_TIMEOUT_S = float(os.getenv("BT_UNIVERSE_SYMBOL_TIMEOUT_S", "600"))
 
 WIN_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2")
 # 2017-01-01: load_historical_ohlcv retorna só o que existe desde a listagem,
