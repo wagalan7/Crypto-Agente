@@ -170,11 +170,39 @@ def _build_signed_url(path: str, params: Optional[dict] = None) -> str:
 
 
 async def _signed_request(method: str, path: str, params: Optional[dict] = None) -> dict:
+    global _ban_until_ms, _throttle_until_ms, _used_weight_1m
     if not is_configured():
         return {"ok": False, "error": "BINANCE_API_KEY/SECRET não configurados"}
+
+    now_ms = time.time() * 1000.0
+    # ── Proteção 1: cooldown de ban (-1003). Vale pra TODOS os endpoints
+    #    assinados. Durante o ban NÃO chama a API (senão a Binance escala a
+    #    duração). Callers que têm cache (ex.: get_positions) servem o stale.
+    if now_ms < _ban_until_ms:
+        return {"ok": False, "code": -1003, "_cooldown": True,
+                "msg": f"rate-limit cooldown local ativo até {int(_ban_until_ms)}",
+                "ban_until_ms": _ban_until_ms}
+    # ── Proteção 2: throttle proativo. Se o peso usado recente passou do teto
+    #    macio, espaça as chamadas pra não chegar no hard limit (2400/min).
+    if now_ms < _throttle_until_ms:
+        await asyncio.sleep(min(2.0, max(0.0, (_throttle_until_ms - now_ms) / 1000.0)))
+
     url = _build_signed_url(path, params)
     try:
         r = await _get_client().request(method, url)
+        # Lê o peso consumido (header da Binance) → throttle proativo.
+        try:
+            uw = r.headers.get("x-mbx-used-weight-1m") or r.headers.get("X-MBX-USED-WEIGHT-1M")
+            if uw is not None:
+                _used_weight_1m = int(uw)
+                if _used_weight_1m >= _WEIGHT_SOFT_LIMIT:
+                    _throttle_until_ms = time.time() * 1000.0 + _THROTTLE_MS
+                    log.warning(
+                        f"[binance] used-weight-1m={_used_weight_1m} >= soft {_WEIGHT_SOFT_LIMIT} "
+                        f"— throttle proativo {_THROTTLE_MS}ms"
+                    )
+        except Exception:
+            pass
         try:
             data = r.json()
         except Exception:
@@ -190,8 +218,21 @@ async def _signed_request(method: str, path: str, params: Optional[dict] = None)
                 _code_int = None
         if r.status_code >= 400 or (_code_int is not None and _code_int < 0):
             log.warning(f"[binance] {method} {path} status={r.status_code} resp={data}")
-            return {"ok": False, "code": _raw_code if _raw_code is not None else r.status_code,
-                    "msg": data.get("msg") if isinstance(data, dict) else r.text, "raw": data}
+            err = {"ok": False, "code": _raw_code if _raw_code is not None else r.status_code,
+                   "msg": data.get("msg") if isinstance(data, dict) else r.text, "raw": data}
+            # ── Detecção CENTRALIZADA de ban (-1003 / HTTP 418/429). Arma o
+            #    cooldown global a partir de QUALQUER endpoint assinado.
+            ban_ms = _parse_ban_until_ms(err)
+            if ban_ms <= 0 and r.status_code in (418, 429):
+                ban_ms = now_ms + _RATE_LIMIT_COOLDOWN_MS
+            if ban_ms > 0:
+                _ban_until_ms = ban_ms
+                err["ban_until_ms"] = ban_ms
+                log.warning(
+                    f"[binance] rate-limit/ban via {path} (status={r.status_code} code={_raw_code}) "
+                    f"— cooldown local até {int(ban_ms)}. Parando de chamar pra não escalar."
+                )
+            return err
         return {"ok": True, "result": data, "raw": data}
     except Exception as e:
         log.exception(f"[binance] {method} {path} falhou")
@@ -296,11 +337,20 @@ async def get_wallet_balance(account_type: str = "UNIFIED") -> dict:
     parâmetro é aceito por compat mas ignorado. Retorna mesmo shape.
     """
     _ = account_type
+    now = time.time()
+    # Cache curto: saldo/conta também consome peso assinado e era chamado sem
+    # throttle. Durante cooldown de ban, serve o último saldo conhecido (stale).
+    if (_account_cache["data"] is not None
+            and (now - _account_cache["ts"]) < _ACCOUNT_CACHE_TTL):
+        return dict(_account_cache["data"])
     res = await _signed_request("GET", "/fapi/v2/account")
     if not res.get("ok"):
+        if res.get("_cooldown") and _account_cache["data"] is not None:
+            stale = dict(_account_cache["data"]); stale["stale"] = True
+            return stale
         return res
     acc = res["result"] or {}
-    return {
+    out = {
         "ok": True,
         "equity_usd": float(acc.get("totalMarginBalance") or 0),
         "available_usd": float(acc.get("availableBalance") or 0),
@@ -320,6 +370,9 @@ async def get_wallet_balance(account_type: str = "UNIFIED") -> dict:
         "testnet": _TESTNET,
         "exchange": "binance",
     }
+    _account_cache["data"] = out
+    _account_cache["ts"] = now
+    return dict(out)
 
 
 # ── Cache + anti-ban da leitura de posições (positionRisk) ──────────────────
@@ -333,9 +386,16 @@ async def get_wallet_balance(account_type: str = "UNIFIED") -> dict:
 #   2. Detecção de -1003/"banned until <ms>" → cooldown: enquanto banido,
 #      devolve o último snapshot conhecido SEM chamar a API (não escala o ban).
 _POSITIONS_CACHE_TTL = float(os.getenv("BINANCE_POSITIONS_CACHE_TTL", "5.0"))  # s
+_ACCOUNT_CACHE_TTL = float(os.getenv("BINANCE_ACCOUNT_CACHE_TTL", "5.0"))  # s (saldo/conta)
 _RATE_LIMIT_COOLDOWN_MS = int(os.getenv("BINANCE_RATELIMIT_COOLDOWN_MS", "30000"))  # -1003 sem 'banned until'
 _positions_cache: dict = {"ts": 0.0, "data": None}  # data = lista normalizada (size>0)
+_account_cache: dict = {"ts": 0.0, "data": None}    # data = dict de saldo já formatado
 _ban_until_ms: float = 0.0
+# ── Throttle proativo por peso (Binance fapi: hard limit ~2400/min por IP) ──
+_WEIGHT_SOFT_LIMIT = int(os.getenv("BINANCE_WEIGHT_SOFT_LIMIT", "1800"))  # ao passar, espaça chamadas
+_THROTTLE_MS = int(os.getenv("BINANCE_THROTTLE_MS", "2000"))               # janela de espaçamento
+_throttle_until_ms: float = 0.0
+_used_weight_1m: int = 0
 
 
 def _parse_ban_until_ms(res: dict) -> float:
@@ -360,7 +420,7 @@ def _parse_ban_until_ms(res: dict) -> float:
 
 
 def get_positions_ban_status() -> dict:
-    """Diagnóstico: estado do cooldown anti-ban da leitura de posições."""
+    """Diagnóstico: estado do cooldown anti-ban + throttle por peso."""
     now_ms = time.time() * 1000.0
     return {
         "banned": now_ms < _ban_until_ms,
@@ -368,6 +428,10 @@ def get_positions_ban_status() -> dict:
         "seconds_left": max(0.0, round((_ban_until_ms - now_ms) / 1000.0, 1)),
         "cache_age_s": round(time.time() - _positions_cache["ts"], 1) if _positions_cache["data"] is not None else None,
         "cache_ttl_s": _POSITIONS_CACHE_TTL,
+        "used_weight_1m": _used_weight_1m,
+        "weight_soft_limit": _WEIGHT_SOFT_LIMIT,
+        "throttling": now_ms < _throttle_until_ms,
+        "throttle_until_ms": _throttle_until_ms,
     }
 
 
@@ -418,6 +482,12 @@ async def get_positions(symbol: Optional[str] = None, *, force: bool = False) ->
     # 3. Fetch real (TODAS as posições).
     res = await _signed_request("GET", "/fapi/v2/positionRisk", None)
     if not res.get("ok"):
+        # _cooldown = o _signed_request já curto-circuitou (ban armado por outro
+        # endpoint). NÃO re-armar (evita auto-extensão) — só servir o stale.
+        if res.get("_cooldown"):
+            if _positions_cache["data"] is not None:
+                return _ok(_positions_cache["data"], stale=True, banned=True)
+            return res
         ban_ms = _parse_ban_until_ms(res)
         if ban_ms > 0:
             _ban_until_ms = ban_ms
@@ -426,8 +496,8 @@ async def get_positions(symbol: Optional[str] = None, *, force: bool = False) ->
                 f"{int(ban_ms)} ({get_positions_ban_status()['seconds_left']}s). "
                 f"Servindo cache e parando de chamar pra não escalar."
             )
-            if _positions_cache["data"] is not None:
-                return _ok(_positions_cache["data"], stale=True, banned=True)
+        if _positions_cache["data"] is not None:
+            return _ok(_positions_cache["data"], stale=True, banned=True)
         return res
 
     rows = res["result"] or []
