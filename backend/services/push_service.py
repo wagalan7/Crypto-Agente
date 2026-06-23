@@ -268,6 +268,10 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
     _edges = rec.get("edge_tags") or []
     if isinstance(_edges, list) and _edges:
         lines.append("⚡ " + " · ".join(str(t) for t in _edges))
+    # Bug 2: sinal mais forte que a operação já aberta no par → avisa que
+    # substitui a recomendação anterior (a posição real, se houver, é preservada).
+    if rec.get("_superseded_stronger"):
+        lines.append("🔁 Sinal mais forte — substitui a recomendação anterior")
     body = "\n".join(lines)
 
     tf_short = rec.get("timeframe", "")
@@ -329,6 +333,29 @@ async def notify_recommendations_batch(recs: List[Dict[str, Any]], newly_saved: 
     return total_sent
 
 
+async def _has_open_real_trade_same_dir(symbol: str, direction: str) -> bool:
+    """True se há RealTrade OPEN (auto OU manual) no mesmo símbolo+direção.
+
+    Guard do push de outcome do SHADOW: o rastreador de snapshot resolve por
+    PAVIO de candle (high/low toca o nível), então um wick atravessa TP1/TP2 e o
+    shadow anuncia 'batido' — mas a posição REAL não preencheu a ordem e segue
+    aberta. Quando há trade real no mesmo par/direção, a autoridade é o
+    trade_manager (avisa pelos FILLS reais) / manual-monitor; o push do shadow
+    seria conflitante ('batido' x posição aberta). Aqui suprimimos."""
+    try:
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            stmt = select(RealTrade.id).where(
+                (RealTrade.symbol == symbol)
+                & (RealTrade.status == "open")
+                & (RealTrade.side == direction)
+            ).limit(1)
+            return (await session.execute(stmt)).scalar_one_or_none() is not None
+    except Exception as e:
+        log.warning(f"[notify_outcome] check trade real {symbol} falhou: {e}")
+        return False
+
+
 async def notify_outcome(snap, event: str) -> int:
     """
     Dispara push de SAÍDA de um trade: TP1, TP2, stop, BE+ ou expiry pós-TP1.
@@ -348,6 +375,20 @@ async def notify_outcome(snap, event: str) -> int:
     """
     if not PUSH_ENABLED:
         return 0
+
+    # Bug 1: se há trade REAL aberto no mesmo par/direção, o shadow NÃO empurra
+    # push de outcome — o gestor do trade real (fills reais) é a autoridade.
+    # Evita o "TP1+TP2 batidos" do shadow (resolução por pavio) enquanto a
+    # posição real segue aberta sem ter preenchido nenhum TP.
+    sym = getattr(snap, "symbol", "") or ""
+    direction = getattr(snap, "direction", "") or ""
+    if sym and direction and await _has_open_real_trade_same_dir(sym, direction):
+        log.info(
+            f"[notify_outcome] push '{event}' suprimido p/ {sym} {direction}: "
+            f"há trade real aberto (autoridade = gestor do trade real)"
+        )
+        return 0
+
     tier = getattr(snap, "tier", "") or ""
     if tier not in ("A+", "A", "B"):
         return 0

@@ -279,6 +279,62 @@ async def _has_open_opposite_real_trade(session, symbol: str, direction: str) ->
         return False
 
 
+# ── Bug 2: gate de "operação já aberta" + comparação de força ────────────────
+# Sugestão do usuário: antes de empurrar push de uma rec, ver se a moeda JÁ está
+# aberta numa operação (trade real de qualquer dia OU snapshot de execução
+# aberto). Se estiver, só empurra se a nova rec for MAIS FORTE (tier, depois
+# score) — aí cancela (supersede) a recomendação anterior e marca o push como
+# "mais forte". Se não for mais forte, mantém a anterior e NÃO empurra. O trade
+# REAL nunca é tocado aqui (proteção de capital: posição já tem BE+/time-stop/
+# demoção cuidando dela; não desestabilizar via re-sinal).
+_TIER_STRENGTH = {"A+": 4, "A": 3, "B": 2, "C": 1}
+# Sentinela "imbatível": operação aberta cuja força não dá pra apurar (trade
+# real manual sem snapshot de origem). Na dúvida sobre capital comprometido,
+# NÃO re-empurra push duplicado (nenhuma rec finita supera o inf).
+_UNKNOWN_STRENGTH = (99, float("inf"))
+
+
+def _strength_tuple(tier, score) -> tuple:
+    """Força comparável de um setup: (rank do tier, score). Tier manda; score
+    desempata. Maior = mais forte."""
+    try:
+        s = float(score or 0)
+    except (TypeError, ValueError):
+        s = 0.0
+    return (_TIER_STRENGTH.get((tier or "").upper(), 0), s)
+
+
+async def _open_real_trade_strength(session, symbol: str, direction: str):
+    """Força da operação REAL aberta (qualquer source) no símbolo+direção,
+    derivada do snapshot que a originou (recommendation_id). None se não há
+    trade real aberto; _UNKNOWN_STRENGTH se há mas a origem não é apurável."""
+    try:
+        from models.real_trade import RealTrade
+        row = (await session.execute(
+            select(RealTrade.recommendation_id).where(
+                and_(
+                    RealTrade.symbol == symbol,
+                    RealTrade.status == "open",
+                    RealTrade.side == direction,
+                )
+            ).order_by(RealTrade.opened_at.desc()).limit(1)
+        )).first()
+        if row is None:
+            return None
+        rec_id = row[0]
+        if rec_id is not None:
+            snap_row = (await session.execute(
+                select(RecommendationSnapshot.tier, RecommendationSnapshot.score)
+                .where(RecommendationSnapshot.id == rec_id)
+            )).first()
+            if snap_row is not None:
+                return _strength_tuple(snap_row[0], snap_row[1])
+        return _UNKNOWN_STRENGTH
+    except Exception as e:
+        log.warning(f"[snapshot] força trade real {symbol} falhou: {e}")
+        return _UNKNOWN_STRENGTH  # fail-safe: na dúvida, suprime duplicado
+
+
 async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     """
     Salva snapshots de recomendações novas (desduplicadas).
@@ -334,6 +390,8 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                     RecommendationSnapshot.id,
                     RecommendationSnapshot.timeframe,
                     RecommendationSnapshot.direction,
+                    RecommendationSnapshot.tier,
+                    RecommendationSnapshot.score,
                 ).where(
                     and_(
                         RecommendationSnapshot.symbol == rec["symbol"],
@@ -344,16 +402,53 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                 same_dir_rows = [r for r in open_rows if r.direction == rec["direction"]]
                 opp_dir_rows = [r for r in open_rows if r.direction != rec["direction"]]
 
-                # (a) Mesma direção: se qualquer aberto tem rank >= novo →
-                # bloqueia (mesmo TF ou maior já cobre). Só passa se TODOS os
-                # abertos forem TF MENOR que o novo (upgrade legítimo).
-                if any(_tf_rank(r.timeframe) >= new_rank for r in same_dir_rows):
-                    rec["_just_saved"] = False
-                    log.debug(
-                        f"[snapshot] skip rec {rec['symbol']} {rec['direction']} "
-                        f"tf={rec.get('timeframe')} — já há OPEN em TF >= nesse par"
-                    )
-                    continue
+                # (a) Mesma direção + comparação de FORÇA (bug 2). Operação já
+                # aberta = snapshot OPEN de TF >= o novo (cobre o mesmo setup)
+                # OU trade real aberto (de qualquer dia). Regra do usuário:
+                #   • nova rec MAIS FORTE (tier, depois score) → cancela a
+                #     anterior (supersede dos snapshots bloqueantes) e empurra
+                #     marcando "mais forte"; o trade real NÃO é tocado (proteção
+                #     de capital);
+                #   • caso contrário → mantém a anterior e NÃO empurra.
+                # TF menor que um aberto já era upgrade legítimo: blocking_snaps
+                # fica vazio e, sem trade real, o fluxo segue (push do upgrade).
+                new_strength = _strength_tuple(rec.get("tier"), rec.get("score"))
+                blocking_snaps = [r for r in same_dir_rows if _tf_rank(r.timeframe) >= new_rank]
+                rt_strength = await _open_real_trade_strength(
+                    session, rec["symbol"], rec["direction"]
+                )
+                if blocking_snaps or rt_strength is not None:
+                    existing_strength = None
+                    for r in blocking_snaps:
+                        st = _strength_tuple(r.tier, r.score)
+                        existing_strength = st if existing_strength is None else max(existing_strength, st)
+                    if rt_strength is not None:
+                        existing_strength = rt_strength if existing_strength is None else max(existing_strength, rt_strength)
+
+                    if new_strength > existing_strength:
+                        for r in blocking_snaps:
+                            await session.execute(
+                                update(RecommendationSnapshot)
+                                .where(RecommendationSnapshot.id == r.id)
+                                .values(status="superseded", outcome_at=now, last_check_at=now)
+                            )
+                        rec["_superseded_stronger"] = True
+                        log.info(
+                            f"[snapshot] {rec['symbol']} {rec['direction']} "
+                            f"tf={rec.get('timeframe')} SUPERA operação aberta "
+                            f"(nova {new_strength} > {existing_strength}) — "
+                            f"supersede {len(blocking_snaps)} snapshot(s)"
+                            + (" · trade real preservado" if rt_strength is not None else "")
+                        )
+                        # segue pro insert abaixo (push sai marcado "mais forte")
+                    else:
+                        rec["_just_saved"] = False
+                        log.debug(
+                            f"[snapshot] skip rec {rec['symbol']} {rec['direction']} "
+                            f"tf={rec.get('timeframe')} — operação aberta não superada "
+                            f"(nova {new_strength} <= {existing_strength})"
+                        )
+                        continue
 
                 # (b) 1 rec por símbolo: bloqueia direção OPOSTA enquanto há
                 # uma aberta no mesmo símbolo (evita long+short simultâneo).
@@ -480,6 +575,60 @@ async def save_wide_display_snapshots(recommendations: List[Dict[str, Any]]) -> 
                 if (await session.execute(stmt)).scalar_one_or_none():
                     rec["_just_saved"] = False
                     continue
+
+                # Bug 2 no lane AMPLO: se a moeda já está em OPERAÇÃO aberta
+                # (trade real de qualquer dia OU snapshot de EXECUÇÃO aberto na
+                # mesma direção), não floodar push amplo do mesmo par — só passa
+                # se a nova for MAIS FORTE (tier, depois score); aí cancela
+                # (supersede) o wide anterior do par e marca "mais forte". Trade
+                # real nunca é tocado. Foi a causa do CHZ empurrado várias vezes.
+                new_rank = _tf_rank(rec.get("timeframe"))
+                new_strength = _strength_tuple(rec.get("tier"), rec.get("score"))
+                exec_rows = (await session.execute(
+                    select(
+                        RecommendationSnapshot.tier,
+                        RecommendationSnapshot.score,
+                        RecommendationSnapshot.timeframe,
+                    ).where(
+                        and_(
+                            RecommendationSnapshot.symbol == rec["symbol"],
+                            RecommendationSnapshot.direction == rec["direction"],
+                            RecommendationSnapshot.status == "open",
+                        )
+                    )
+                )).all()
+                blocking_exec = [r for r in exec_rows if _tf_rank(r.timeframe) >= new_rank]
+                rt_strength = await _open_real_trade_strength(
+                    session, rec["symbol"], rec["direction"]
+                )
+                if blocking_exec or rt_strength is not None:
+                    existing_strength = None
+                    for r in blocking_exec:
+                        st = _strength_tuple(r.tier, r.score)
+                        existing_strength = st if existing_strength is None else max(existing_strength, st)
+                    if rt_strength is not None:
+                        existing_strength = rt_strength if existing_strength is None else max(existing_strength, rt_strength)
+                    if new_strength > existing_strength:
+                        await session.execute(
+                            update(RecommendationSnapshot)
+                            .where(
+                                and_(
+                                    RecommendationSnapshot.symbol == rec["symbol"],
+                                    RecommendationSnapshot.direction == rec["direction"],
+                                    RecommendationSnapshot.status == WIDE_DISPLAY_STATUS,
+                                )
+                            )
+                            .values(status="wide_superseded", outcome_at=now)
+                        )
+                        rec["_superseded_stronger"] = True
+                    else:
+                        rec["_just_saved"] = False
+                        log.debug(
+                            f"[wide] skip {rec['symbol']} {rec['direction']} "
+                            f"tf={rec.get('timeframe')} — operação aberta não superada "
+                            f"(nova {new_strength} <= {existing_strength})"
+                        )
+                        continue
 
                 tp1 = None
                 sig = rec.get("signal") or {}
