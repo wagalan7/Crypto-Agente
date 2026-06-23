@@ -33,6 +33,15 @@ class RotationUniverseState(Base):
     # Contadores de histerese: {"BASE": {"action": "promote"|"demote", "count": N}}
     pending: Mapped[dict] = mapped_column(JSON, default=dict)
 
+    # Via ADITIVA "backtest_seed" (complementa a promoção ao vivo, não a sobrepõe):
+    #   {"active": ["BASE", ...], "blocked": ["BASE", ...]}
+    # - active  = bases que entraram no universo pela via de backtest (cap BT_SEED_MAX).
+    # - blocked = bases que entraram por seed e depois foram rebaixadas ao vivo
+    #             (demote_max_r) — NUNCA re-semeadas, pra evitar churn seed↔demote.
+    # A via ao vivo (pending/promote/demote) é intocada; seed só preenche slots que
+    # sobram DEPOIS da promoção ao vivo e segue 100% sujeita à demoção ao vivo.
+    seeded: Mapped[dict] = mapped_column(JSON, default=dict)
+
     # Última vez que o preview semanal (seg 09h BRT) foi enviado ao Telegram.
     # Idempotência: evita reenviar a mesma ocorrência após redeploy.
     last_preview_at: Mapped[datetime | None] = mapped_column(

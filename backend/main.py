@@ -1566,6 +1566,7 @@ async def rotation_state():
         from services.rotation_service import (
             ROTATION_AUTO_APPLY, ROTATION_MAX_UNIVERSE, ROTATION_HYSTERESIS_CYCLES,
             ROTATION_LIQ_FLOOR_TOP_N, ROTATION_APPLY_INTERVAL_SEC, _load_state,
+            BT_SEED_ENABLED, BT_SEED_MAX, BT_SEED_MIN_TRADES, BT_SEED_MIN_CALIB, BT_SEED_TF,
         )
         cfg = {
             "auto_apply": ROTATION_AUTO_APPLY,
@@ -1573,6 +1574,13 @@ async def rotation_state():
             "hysteresis_cycles": ROTATION_HYSTERESIS_CYCLES,
             "liq_floor_top_n": ROTATION_LIQ_FLOOR_TOP_N,
             "apply_interval_sec": ROTATION_APPLY_INTERVAL_SEC,
+            "backtest_seed": {
+                "enabled": BT_SEED_ENABLED,
+                "max": BT_SEED_MAX,
+                "min_trades": BT_SEED_MIN_TRADES,
+                "min_calib": BT_SEED_MIN_CALIB,
+                "tf": BT_SEED_TF,
+            },
         }
         if not DB_ENABLED:
             return {"config": cfg, "state": None, "note": "DB desabilitado"}

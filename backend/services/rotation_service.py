@@ -122,6 +122,10 @@ def fmt_rotation_change(plan: Dict[str, Any]) -> str:
     if demo:
         names = ", ".join(f"`{d['symbol']}`({(d.get('avg_r') or 0):.2f}R)" for d in demo)
         lines.append(f"\u2796 Saíram ({len(demo)}): {names}")
+    seed = plan.get("seed_promote", [])
+    if seed:
+        names = ", ".join(f"`{s}`" for s in seed)
+        lines.append(f"\U0001F9EA Seed backtest ({len(seed)}, provisórias): {names}")
     lines.append(f"\U0001F4CA O bot passa a operar *{new_count}* moedas.")
     syms = plan.get("new_universe", [])
     lines.append("Símbolos: " + (", ".join(f"`{s}`" for s in syms) if syms else "—"))
@@ -179,6 +183,32 @@ ROTATION_PREVIEW_ENABLED = os.getenv("ROTATION_PREVIEW_ENABLED", "true").strip()
 )
 ROTATION_PREVIEW_DOW = int(os.getenv("ROTATION_PREVIEW_DOW", "0"))        # 0=segunda (weekday)
 ROTATION_PREVIEW_HOUR_UTC = int(os.getenv("ROTATION_PREVIEW_HOUR_UTC", "12"))  # 12 UTC = 09h BRT
+
+# ════════════════════════════════════════════════════════════════════════════
+# VIA ADITIVA "backtest_seed" — COMPLEMENTA a promoção ao vivo, NÃO a sobrepõe.
+# ════════════════════════════════════════════════════════════════════════════
+# Problema que resolve: o aprendizado do SWEEP (symbol_backtest_stats) nunca virava
+# candidata real — a rotação só promove com evidência AO VIVO (sample≥12, avg_r>0).
+# Esta via abre uma SEGUNDA porta, provisória e conservadora, SEM mexer na via ao vivo:
+#   • Entra só quem o backtest aprovou forte: n_trades≥BT_SEED_MIN_TRADES E
+#     calibrated_avg_r≥BT_SEED_MIN_CALIB (calib = wf_avg_r × 0.70).
+#   • Continua passando pelo MESMO piso de liquidez (top-N por volume).
+#   • Preenche só os slots que SOBRAM depois da promoção ao vivo (prioridade menor),
+#     limitada a BT_SEED_MAX bases ativas por vez, dentro do teto ROTATION_MAX_UNIVERSE.
+#   • Sizing = o que já existe (LIQ_TIER_SIZING reduz a mão por faixa de volume).
+#   • Fica 100% sujeita à DEMOÇÃO AO VIVO (demote_max_r): se render mal ao vivo, sai.
+#   • Quem entra por seed e é rebaixada ao vivo vai pra blocklist (nunca re-semeada),
+#     evitando churn seed↔demote.
+# DESLIGADA por default (BT_SEED_ENABLED=false): subir o código NÃO muda nada até o
+# usuário ligar a flag. Desligar a qualquer momento → para de semear (não rebaixa as
+# que já entraram; a via ao vivo segue gerindo elas normalmente).
+BT_SEED_ENABLED = os.getenv("BT_SEED_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+BT_SEED_MAX = int(os.getenv("BT_SEED_MAX", "10"))
+BT_SEED_MIN_TRADES = int(os.getenv("BT_SEED_MIN_TRADES", "60"))
+BT_SEED_MIN_CALIB = float(os.getenv("BT_SEED_MIN_CALIB", "0.65"))
+BT_SEED_TF = os.getenv("BT_SEED_TF", "4h").strip()
 
 
 def fmt_rotation_preview(plan: Dict[str, Any]) -> str:
@@ -286,10 +316,13 @@ async def _load_state():
         return {
             "universe": list(row.universe or []),
             "pending": dict(row.pending or {}),
+            "seeded": dict(getattr(row, "seeded", None) or {}),
         }
 
 
-async def _save_state(universe: List[str], pending: Dict[str, Any]) -> None:
+async def _save_state(
+    universe: List[str], pending: Dict[str, Any], seeded: Dict[str, Any] | None = None
+) -> None:
     from datetime import datetime, timezone
     from db import get_session
     from models.rotation_state import RotationUniverseState
@@ -304,6 +337,8 @@ async def _save_state(universe: List[str], pending: Dict[str, Any]) -> None:
             session.add(row)
         row.universe = sorted(set(universe))
         row.pending = pending
+        if seeded is not None:
+            row.seeded = seeded
         row.applied_at = datetime.now(timezone.utc)
         await session.commit()
 
@@ -320,6 +355,42 @@ async def _liquidity_floor() -> set:
     except Exception as e:
         log.warning(f"[rotation] piso de liquidez indisponível ({e}) — promoção sem piso")
     return set()  # vazio = sem piso (fail-open, mas histerese ainda protege)
+
+
+async def _backtest_seed_candidates() -> Dict[str, float]:
+    """
+    Candidatos da via aditiva: bases que o SWEEP aprovou forte.
+    Filtro: n_trades≥BT_SEED_MIN_TRADES E calibrated_avg_r≥BT_SEED_MIN_CALIB,
+    no timeframe BT_SEED_TF. Retorna {base: calibrated_avg_r}. Leitura pura.
+    """
+    out: Dict[str, float] = {}
+    try:
+        from db import DB_ENABLED, get_session
+        if not DB_ENABLED:
+            return out
+        from models.symbol_backtest_stats import SymbolBacktestStats
+        from services.backtest_universe_service import calibrated_edge, _norm_base
+        from sqlalchemy import select
+        conds = [SymbolBacktestStats.n_trades >= BT_SEED_MIN_TRADES]
+        if BT_SEED_TF:
+            conds.append(SymbolBacktestStats.timeframe == BT_SEED_TF)
+        async with get_session() as session:
+            rows = (await session.execute(
+                select(SymbolBacktestStats).where(*conds)
+            )).scalars().all()
+        for r in rows:
+            calib = calibrated_edge(r.wf_avg_r)
+            if calib is None or calib < BT_SEED_MIN_CALIB:
+                continue
+            base = _norm_base(r.symbol) if r.symbol else r.symbol
+            if not base:
+                continue
+            # se o mesmo base aparecer em >1 tf, fica com o melhor calib
+            if base not in out or calib > out[base]:
+                out[base] = calib
+    except Exception as e:
+        log.warning(f"[rotation] backtest_seed candidatos indisponíveis: {e}")
+    return out
 
 
 async def get_effective_allowlist() -> set:
@@ -379,6 +450,9 @@ async def apply_rotation_plan(plan: Dict[str, Any] | None = None) -> Dict[str, A
 
     universe = set(state["universe"])
     pending: Dict[str, Any] = dict(state["pending"])
+    seeded_state = state.get("seeded") or {}
+    seed_active = set(seeded_state.get("active", []))
+    seed_blocked = set(seeded_state.get("blocked", []))
     liq = await _liquidity_floor()
 
     promo_avg = {p["symbol"]: (p.get("avg_r") or 0) for p in plan.get("promote", [])}
@@ -421,24 +495,59 @@ async def apply_rotation_plan(plan: Dict[str, Any] | None = None) -> Dict[str, A
     for b in applied_promote + applied_demote:
         new_pending.pop(b, None)
 
-    changed = bool(applied_promote or applied_demote)
+    # ── Via ADITIVA backtest_seed (prioridade MENOR que a promoção ao vivo) ──────
+    # Roda DEPOIS de promover/demover ao vivo: só preenche os slots que SOBRARAM,
+    # sem nunca empurrar pra fora quem entrou pela evidência ao vivo.
+    seed_admitted: List[str] = []
+    # quem entrou por seed e foi rebaixada ao vivo agora → blocklist (sem re-seed)
+    seed_blocked |= (set(applied_demote) & seed_active)
+    # ativos da via = os que continuam no universo após a rotação ao vivo
+    seed_active &= new_universe
+    if BT_SEED_ENABLED:
+        try:
+            seed_cands = await _backtest_seed_candidates()
+        except Exception as e:
+            log.warning(f"[rotation] backtest_seed lane falhou: {e}")
+            seed_cands = {}
+        seed_budget = max(0, BT_SEED_MAX - len(seed_active))         # cap da via
+        teto_budget = max(0, ROTATION_MAX_UNIVERSE - len(new_universe))  # teto global
+        n_slots = min(seed_budget, teto_budget)
+        if n_slots > 0 and seed_cands:
+            eligible = [
+                (b, c) for b, c in seed_cands.items()
+                if b not in new_universe          # ainda não está operando
+                and b not in seed_blocked         # não foi seed-rebaixada antes
+                and (not liq or b in liq)         # mesmo piso de liquidez da via ao vivo
+            ]
+            eligible.sort(key=lambda x: x[1], reverse=True)
+            seed_admitted = [b for b, _ in eligible[:n_slots]]
+            new_universe |= set(seed_admitted)
+            seed_active |= set(seed_admitted)
+    new_seeded = {"active": sorted(seed_active), "blocked": sorted(seed_blocked)}
+
+    changed = bool(applied_promote or applied_demote or seed_admitted)
     if changed:
-        await _save_state(sorted(new_universe), new_pending)
+        await _save_state(sorted(new_universe), new_pending, new_seeded)
         from services.shadow_trade_service import set_exec_allowlist
         set_exec_allowlist(new_universe)
     else:
-        # Sem mudança aplicada, mas persiste os contadores de histerese atualizados.
-        await _save_state(sorted(universe), new_pending)
+        # Sem mudança aplicada, mas persiste histerese + estado da via seed.
+        await _save_state(sorted(universe), new_pending, new_seeded)
 
     result = {
         "applied": changed,
         "promoted": sorted(applied_promote),
         "demoted": sorted(applied_demote),
+        "seed_promoted": sorted(seed_admitted),
+        "seed_active": new_seeded["active"],
+        "seed_blocked": new_seeded["blocked"],
         "new_count": len(new_universe),
         "new_universe": sorted(new_universe),
         "pending": new_pending,
         "max": ROTATION_MAX_UNIVERSE,
         "hysteresis_cycles": ROTATION_HYSTERESIS_CYCLES,
+        "seed_enabled": BT_SEED_ENABLED,
+        "seed_max": BT_SEED_MAX,
     }
     if changed:
         # Reaproveita o formato de notificação (constrói um "plan" enxuto).
@@ -446,6 +555,7 @@ async def apply_rotation_plan(plan: Dict[str, Any] | None = None) -> Dict[str, A
             "changed": True,
             "promote": [{"symbol": b, "avg_r": promo_avg.get(b)} for b in applied_promote],
             "demote": [{"symbol": b, "avg_r": demo_avg.get(b)} for b in applied_demote],
+            "seed_promote": sorted(seed_admitted),
             "new_count": len(new_universe),
             "new_universe": sorted(new_universe),
         }
@@ -453,5 +563,8 @@ async def apply_rotation_plan(plan: Dict[str, Any] | None = None) -> Dict[str, A
             await notify_rotation_plan(notif_plan)
         except Exception as e:
             log.warning(f"[rotation] notify do apply falhou: {e}")
-        log.info(f"[rotation] APLICADO +{applied_promote} -{applied_demote} → {len(new_universe)} bases")
+        log.info(
+            f"[rotation] APLICADO +{applied_promote} -{applied_demote} "
+            f"seed+{seed_admitted} → {len(new_universe)} bases"
+        )
     return result

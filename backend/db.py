@@ -83,6 +83,11 @@ async def init_db():
             "ALTER TABLE rotation_universe_state "
             "ADD COLUMN IF NOT EXISTS last_preview_at TIMESTAMP WITH TIME ZONE"
         ))
+        # Via aditiva "backtest_seed" — rastreia ativos/bloqueados da via de backtest
+        await conn.execute(text(
+            "ALTER TABLE rotation_universe_state "
+            "ADD COLUMN IF NOT EXISTS seeded JSON DEFAULT '{}'"
+        ))
         # Migrações incrementais
         await conn.execute(text(
             "ALTER TABLE recommendation_snapshots "
