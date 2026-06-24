@@ -563,6 +563,11 @@ FILLER_FORA_MAX = int(os.getenv("FILLER_FORA_MAX", "3"))                   # tet
 FILLER_FORA_SIZE_MULT = float(os.getenv("FILLER_FORA_SIZE_MULT", "0.75"))  # size FORA vs DENTRO
 FILLER_FORA_OFF_AT = int(os.getenv("FILLER_FORA_OFF_AT", "350"))           # allowlist ≥ isto → desliga filler
 FILLER_TOTAL_SLOTS = int(os.getenv("PORTFOLIO_MAX_OPEN_POSITIONS", "5"))   # espelha portfolio_service
+# Circuit-breaker do FORA: ao acumular N stops do FORA (desde o último TP2 cheio),
+# PAUSA novas entradas FORA. Exceção: se ainda no LUCRO do dia (e sem FORA aberto),
+# libera 1 probe; se o probe der TP1+TP2 (closed_tp2), a contagem zera (despausa).
+# Se o probe falhar e o dia sair do lucro, fica totalmente pausado até o próximo dia.
+FILLER_FORA_STOP_STREAK = int(os.getenv("FILLER_FORA_STOP_STREAK", "4"))
 
 # ── P(TP1) gate (calibração) ────────────────────────────────────────────────
 # rec.prob_tp1 = P(TP1) calibrada por bin de score (calibration_service). Pula
@@ -1505,6 +1510,42 @@ async def _open_auto_counts_by_allowlist() -> tuple[int, int]:
         else:
             n_dentro += 1
     return n_dentro, n_fora
+
+
+async def _filler_fora_brake_state() -> tuple[int, float]:
+    """(stop_streak, daily_pnl_usd) pro circuit-breaker do filler FORA.
+    stop_streak = nº de stops do FORA desde o último TP2 cheio (closed_tp2 zera;
+    neutros como expiry/BE/TP1-parcial nem contam nem zeram). daily_pnl_usd = soma
+    de pnl_usd dos trades FECHADOS hoje (UTC). Propaga erro pro chamador (o
+    fail-safe lá PAUSA o filler no ciclo)."""
+    if not DB_ENABLED:
+        return 0, 0.0
+    from datetime import datetime, timezone
+    from sqlalchemy import select, func, desc
+    from db import get_session
+    from models.real_trade import RealTrade
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    async with get_session() as session:
+        pnl = float((await session.execute(
+            select(func.coalesce(func.sum(RealTrade.pnl_usd), 0.0))
+            .where(RealTrade.closed_at >= start)
+            .where(RealTrade.status != "open")
+        )).scalar() or 0.0)
+        rows = (await session.execute(
+            select(RealTrade)
+            .where(RealTrade.source == "auto")
+            .where(RealTrade.status != "open")
+            .where(RealTrade.notes.like("%[filler]%"))
+            .order_by(desc(RealTrade.closed_at))
+            .limit(50)
+        )).scalars().all()
+    streak = 0
+    for t in rows:
+        if t.status == "closed_tp2":
+            break
+        if t.status == "closed_stop":
+            streak += 1
+    return streak, pnl
 
 
 async def _open_margin_usd() -> float:
@@ -2450,12 +2491,19 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
     # (sorted estável). Tudo NO-OP quando FILLER_FORA_ENABLED=OFF.
     _flr_n_dentro = 0
     _flr_n_fora = 0
+    _flr_stop_streak = 0
+    _flr_daily_pnl = 0.0
     if not SHADOW_ENABLED and FILLER_FORA_ENABLED:
         try:
             _flr_n_dentro, _flr_n_fora = await _open_auto_counts_by_allowlist()
         except Exception as e:
             log.warning(f"[filler-fora] contagem inicial falhou (fail-safe bloqueia filler): {e}")
             _flr_n_dentro, _flr_n_fora = FILLER_TOTAL_SLOTS, FILLER_FORA_MAX
+        try:
+            _flr_stop_streak, _flr_daily_pnl = await _filler_fora_brake_state()
+        except Exception as e:
+            log.warning(f"[filler-fora] brake-state falhou (fail-safe PAUSA filler): {e}")
+            _flr_stop_streak, _flr_daily_pnl = FILLER_FORA_STOP_STREAK, 0.0
         _allow_sort = get_exec_allowlist()
         if _allow_sort:
             recs = sorted(
@@ -2617,6 +2665,22 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     _flr_cap = 0
                     if FILLER_FORA_ENABLED and len(_exec_allow) < FILLER_FORA_OFF_AT:
                         _flr_cap = min(FILLER_FORA_MAX, FILLER_TOTAL_SLOTS - _flr_n_dentro)
+                        # Circuit-breaker: N stops do FORA → pausa entradas FORA.
+                        # Exceção: ainda no lucro do dia e sem FORA aberto → 1 probe;
+                        # TP1+TP2 (closed_tp2) zera o streak no próximo ciclo (despausa).
+                        if _flr_stop_streak >= FILLER_FORA_STOP_STREAK:
+                            if _flr_daily_pnl > 0 and _flr_n_fora == 0:
+                                _flr_cap = min(_flr_cap, 1)  # 1 probe enquanto no lucro
+                                log.info(
+                                    f"[filler-fora] PAUSADO ({_flr_stop_streak} stops) — "
+                                    f"libera 1 probe (lucro dia ${_flr_daily_pnl:.2f})"
+                                )
+                            else:
+                                _flr_cap = 0  # pausa total
+                                log.info(
+                                    f"[filler-fora] PAUSADO ({_flr_stop_streak} stops, "
+                                    f"pnl dia ${_flr_daily_pnl:.2f}, fora_open={_flr_n_fora}) — bloqueia FORA"
+                                )
                         if _flr_n_fora < _flr_cap:
                             _flr_ok = True
                     if _flr_ok:
@@ -3258,7 +3322,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 exchange=exchange_name,
                 exchange_order_id=exchange_order_id,
                 client_order_id=client_order_id,
-                notes=f"{source} auto-open (tier {tier})",
+                notes=f"{source} auto-open (tier {tier})" + (" [filler]" if rec.get("_is_filler") else ""),
                 sl_order_id=_sl_oid,
                 tp1_order_id=_tp1_oid,
                 tp2_order_id=_tp2_oid,
