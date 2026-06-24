@@ -171,24 +171,34 @@ async def _load_ohlcv_vision_bulk(
     now = datetime.now(timezone.utc)
     cur_ym = (now.year, now.month)
     rows: List[tuple] = []
+
+    # Monta TODAS as URLs (mensais fechados + diários do mês corrente) e baixa
+    # concorrente — antes era serial (símbolo antigo = ~80 zips × ~6s = ~8-10min).
+    urls: List[str] = []
+    for y, m in _vision_month_iter(start_ms, end_ms):
+        if (y, m) < cur_ym:
+            urls.append(f"{_VISION_BULK_BASE}/monthly/klines/{sym}/{timeframe}/"
+                        f"{sym}-{timeframe}-{y:04d}-{m:02d}.zip")
+        else:  # mês corrente: daily até o dia de hoje
+            for day in range(1, now.day + 1):
+                urls.append(f"{_VISION_BULK_BASE}/daily/klines/{sym}/{timeframe}/"
+                            f"{sym}-{timeframe}-{y:04d}-{m:02d}-{day:02d}.zip")
+
     client = httpx.AsyncClient(
         timeout=60.0, headers={"User-Agent": "Mozilla/5.0 (CryptoAI-Backtest)"},
+        limits=httpx.Limits(max_keepalive_connections=12, max_connections=12),
     )
+    sem = asyncio.Semaphore(10)
+
+    async def _bounded(url: str) -> Optional[bytes]:
+        async with sem:
+            return await _fetch_vision_zip(client, url)
+
     try:
-        for y, m in _vision_month_iter(start_ms, end_ms):
-            if (y, m) < cur_ym:
-                url = (f"{_VISION_BULK_BASE}/monthly/klines/{sym}/{timeframe}/"
-                       f"{sym}-{timeframe}-{y:04d}-{m:02d}.zip")
-                raw = await _fetch_vision_zip(client, url)
-                if raw:
-                    rows.extend(_parse_klines_csv(raw))
-            else:  # mês corrente: daily até o dia de hoje
-                for day in range(1, now.day + 1):
-                    url = (f"{_VISION_BULK_BASE}/daily/klines/{sym}/{timeframe}/"
-                           f"{sym}-{timeframe}-{y:04d}-{m:02d}-{day:02d}.zip")
-                    raw = await _fetch_vision_zip(client, url)
-                    if raw:
-                        rows.extend(_parse_klines_csv(raw))
+        results = await asyncio.gather(*[_bounded(u) for u in urls])
+        for raw in results:  # ordem não importa: ordenamos por timestamp depois
+            if raw:
+                rows.extend(_parse_klines_csv(raw))
     finally:
         await client.aclose()
 
