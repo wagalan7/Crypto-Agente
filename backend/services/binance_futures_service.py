@@ -322,3 +322,48 @@ async def fetch_perp_onboard_dates() -> dict:
     except Exception as e:
         log.warning(f"[perp-onboard] fetch falhou ({e}); ordenação por histórico indisponível.")
         return cached[1] if cached else {}
+
+
+_perp_symbols_cache: dict = {}
+
+
+async def fetch_perp_symbols_exchangeinfo() -> List[str]:
+    """Lista de símbolos CCXT ('1000BONK/USDT:USDT') de TODOS os perps USDT
+    TRADING, via exchangeInfo (weight 1). MANTÉM o prefixo 1000 (usa from_fut,
+    igual a fetch_top_volume_symbols) → casa com o símbolo gravado em
+    symbol_backtest_stats E com o arquivo do data.binance.vision. Enumeração
+    LEVE pro sweep bulk não bater no ticker/24hr (weight 40). Cache 1h."""
+    now = time.time()
+    cached = _perp_symbols_cache.get("list")
+    if cached and now - cached[0] < PERP_BASES_TTL:
+        return cached[1]
+    own_client = False
+    try:
+        if PROXY_ENABLED:
+            client = _get_client()
+        else:
+            client = httpx.AsyncClient(
+                timeout=20.0, headers={"User-Agent": "CryptoAgent/1.0"}
+            )
+            own_client = True
+        try:
+            r = await client.get(f"{FAPI_BASE}/fapi/v1/exchangeInfo")
+            r.raise_for_status()
+            d = r.json()
+        finally:
+            if own_client:
+                await client.aclose()
+        syms: List[str] = []
+        for s in d.get("symbols", []):
+            if (s.get("quoteAsset") == "USDT"
+                    and s.get("contractType") == "PERPETUAL"
+                    and s.get("status") == "TRADING"):
+                fut = s.get("symbol") or ""
+                if fut:
+                    syms.append(from_fut(fut))
+        if syms:
+            _perp_symbols_cache["list"] = (now, syms)
+        return syms
+    except Exception as e:
+        log.warning(f"[perp-symbols] exchangeInfo falhou ({e}).")
+        return cached[1] if cached else []

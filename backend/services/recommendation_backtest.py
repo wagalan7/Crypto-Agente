@@ -87,6 +87,15 @@ TF_MS = {
     "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000,
 }
 
+# ── Fonte de dados do BACKTEST ───────────────────────────────────────────────
+# `vision_bulk` = arquivos estáticos do data.binance.vision (FUTURES UM perp).
+# Arquivo estático NÃO tem weight/rate-limit → NÃO bane o IP. Isola 100% o sweep
+# pesado do IP que executa dinheiro real (proxy de egress). Default vazio =
+# comportamento de sempre (fapi via proxy). Ligar só via env no PRD.
+_BT_DATA_SOURCE = os.getenv("BACKTEST_DATA_SOURCE", "").strip().lower()
+VISION_BULK = _BT_DATA_SOURCE in ("vision_bulk", "vision", "bulk")
+_VISION_BULK_BASE = "https://data.binance.vision/data/futures/um"
+
 
 @dataclass
 class _MockSnapshot:
@@ -104,6 +113,96 @@ class _MockSnapshot:
     peak_price_since_tp1: Optional[float] = None
 
 
+# ── Loader BULK data.binance.vision (FUTURES UM, arquivos estáticos) ──────────
+def _vision_month_iter(start_ms: int, end_ms: int):
+    d = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    end = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
+    y, m = d.year, d.month
+    while (y, m) <= (end.year, end.month):
+        yield y, m
+        m += 1
+        if m > 12:
+            m, y = 1, y + 1
+
+
+def _parse_klines_csv(raw: bytes) -> List[tuple]:
+    """CSV de klines da Binance (12 colunas, sem/com header). Tolera header novo
+    (2025+) e open_time em µs (Binance migrou alguns arquivos)."""
+    out: List[tuple] = []
+    for line in raw.decode("utf-8", "ignore").splitlines():
+        if not line:
+            continue
+        p = line.split(",")
+        if len(p) < 6 or not p[0][:1].isdigit():  # pula header/linha inválida
+            continue
+        try:
+            ts = int(float(p[0]))
+            if ts >= 1_000_000_000_000_000:  # 16+ dígitos = µs → ms
+                ts //= 1000
+            out.append((ts, float(p[1]), float(p[2]), float(p[3]),
+                        float(p[4]), float(p[5])))
+        except (ValueError, IndexError):
+            continue
+    return out
+
+
+async def _fetch_vision_zip(client: httpx.AsyncClient, url: str) -> Optional[bytes]:
+    import io
+    import zipfile
+    try:
+        r = await client.get(url)
+        if r.status_code == 404:
+            return None  # arquivo não existe (moeda não listada nesse mês/dia)
+        r.raise_for_status()
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        return zf.read(zf.namelist()[0])
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[vision-bulk] {url}: {e}")
+        return None
+
+
+async def _load_ohlcv_vision_bulk(
+    symbol: str, timeframe: str, start_ms: int, end_ms: int,
+) -> pd.DataFrame:
+    """Klines de FUTURES perp via arquivos estáticos do data.binance.vision.
+    Mês fechado → arquivo monthly; mês corrente → arquivos daily até hoje.
+    Zero weight/rate-limit → nunca bane o IP do bot live."""
+    sym = to_bv(symbol)  # ex: BTCUSDT
+    now = datetime.now(timezone.utc)
+    cur_ym = (now.year, now.month)
+    rows: List[tuple] = []
+    client = httpx.AsyncClient(
+        timeout=60.0, headers={"User-Agent": "Mozilla/5.0 (CryptoAI-Backtest)"},
+    )
+    try:
+        for y, m in _vision_month_iter(start_ms, end_ms):
+            if (y, m) < cur_ym:
+                url = (f"{_VISION_BULK_BASE}/monthly/klines/{sym}/{timeframe}/"
+                       f"{sym}-{timeframe}-{y:04d}-{m:02d}.zip")
+                raw = await _fetch_vision_zip(client, url)
+                if raw:
+                    rows.extend(_parse_klines_csv(raw))
+            else:  # mês corrente: daily até o dia de hoje
+                for day in range(1, now.day + 1):
+                    url = (f"{_VISION_BULK_BASE}/daily/klines/{sym}/{timeframe}/"
+                           f"{sym}-{timeframe}-{y:04d}-{m:02d}-{day:02d}.zip")
+                    raw = await _fetch_vision_zip(client, url)
+                    if raw:
+                        rows.extend(_parse_klines_csv(raw))
+    finally:
+        await client.aclose()
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+    ])
+    df = df[(df["timestamp"] >= start_ms) & (df["timestamp"] <= end_ms)]
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values(
+        "timestamp").reset_index(drop=True)
+    return df
+
+
 # ── Loader histórico paginado ────────────────────────────────────────────────
 async def load_historical_ohlcv(
     symbol: str, timeframe: str, start_ms: int, end_ms: int,
@@ -114,9 +213,15 @@ async def load_historical_ohlcv(
     PRD usa ao vivo — o proxy de egress contorna o geobloqueio do IP do Railway).
     Fallback (sem proxy) = data-api.binance.vision (spot), que pode estar
     geobloqueado no host. Os dois endpoints retornam o MESMO array de 12 colunas.
+
+    Se VISION_BULK (env BACKTEST_DATA_SOURCE=vision_bulk): usa arquivos estáticos
+    de FUTURES perp (data.binance.vision), que não oneram nenhum IP.
     """
     if timeframe not in TF_MS:
         raise ValueError(f"timeframe desconhecido: {timeframe}")
+
+    if VISION_BULK:
+        return await _load_ohlcv_vision_bulk(symbol, timeframe, start_ms, end_ms)
 
     from services import binance_futures_service as _bfs
 
@@ -200,6 +305,12 @@ async def load_historical_funding(
     Retorna DataFrame com colunas (fundingTime, fundingRate) ordenado.
     Vazio em caso de falha — caller deve tratar.
     """
+    # Em modo bulk o sweep NÃO pode tocar o proxy (IP do bot live). Funding via
+    # fapi passaria pelo proxy, então pulamos — o backtest já tolera funding vazio
+    # (penalidade de derivativo simplesmente não aplica).
+    if VISION_BULK:
+        return pd.DataFrame()
+
     from services import binance_futures_service as _bfs
 
     bv_sym = to_bv(symbol)  # ex: BTCUSDT

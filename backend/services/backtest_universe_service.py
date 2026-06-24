@@ -293,15 +293,22 @@ async def run_universe_backtest(
     #     geobloqueio, e com histórico mais longo desde a listagem). Spot é proxy
     #     fiel do price-action histórico pro estudo offline.
     from services import binance_futures_service as _bfs
-    if _bfs.PROXY_ENABLED:
-        from services.binance_futures_service import fetch_top_volume_symbols
-    else:
-        from services.binance_vision_service import fetch_top_volume_symbols
-    from services.recommendation_backtest import backtest_symbol_tf
+    from services.recommendation_backtest import backtest_symbol_tf, VISION_BULK
 
     end_dt = datetime.now(timezone.utc)
     try:
-        symbols = await fetch_top_volume_symbols(limit=limit)
+        if VISION_BULK:
+            # Enumeração LEVE via exchangeInfo (weight 1) — NUNCA ticker/24hr
+            # (weight 40). Símbolos EXATOS (mantém prefixo 1000) p/ casar com o
+            # arquivo do vision E com o símbolo já gravado em stats (dedup do
+            # skip-fresh). O slice por histórico/offset (abaixo) faz o lotemento.
+            symbols = await _bfs.fetch_perp_symbols_exchangeinfo()
+        elif _bfs.PROXY_ENABLED:
+            from services.binance_futures_service import fetch_top_volume_symbols
+            symbols = await fetch_top_volume_symbols(limit=limit)
+        else:
+            from services.binance_vision_service import fetch_top_volume_symbols
+            symbols = await fetch_top_volume_symbols(limit=limit)
     except Exception as e:
         log.error(f"[bt-universe] falha ao enumerar símbolos: {e}")
         # Registra no _PROGRESS pra o /status mostrar o motivo (senão fica "total:0"
