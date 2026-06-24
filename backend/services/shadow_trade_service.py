@@ -551,6 +551,19 @@ LIQ_TIER_MULT_MIN = float(os.getenv("LIQ_TIER_MULT_MIN", "0.35"))   # <$3M (rank
 REGIME_SIZING_ENABLED = os.getenv("REGIME_SIZING_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 REGIME_SIZE_MULT_ALT_LONG = float(os.getenv("REGIME_SIZE_MULT_ALT_LONG", "0.5"))  # long de alt em regime adverso
 
+# ── Filler FORA da allowlist (modelo de slots) ──────────────────────────────
+# Quando ligado, o bot pode abrir posições FORA da allowlist de execução como
+# FILLER de slot ocioso: só tier A/A+ (tier B já é cortado antes), teto de
+# FILLER_FORA_MAX simultâneas e nunca passando do total de slots (prioriza
+# DENTRO, que é processado primeiro no ciclo). Size reduzido (×SIZE_MULT). A
+# regra DESLIGA sozinha quando a allowlist atinge FILLER_FORA_OFF_AT moedas
+# (aí opera só DENTRO). DEFAULT OFF (NO-OP) — não muda nada até ligar a env.
+FILLER_FORA_ENABLED = os.getenv("FILLER_FORA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+FILLER_FORA_MAX = int(os.getenv("FILLER_FORA_MAX", "3"))                   # teto de posições FORA simultâneas
+FILLER_FORA_SIZE_MULT = float(os.getenv("FILLER_FORA_SIZE_MULT", "0.75"))  # size FORA vs DENTRO
+FILLER_FORA_OFF_AT = int(os.getenv("FILLER_FORA_OFF_AT", "350"))           # allowlist ≥ isto → desliga filler
+FILLER_TOTAL_SLOTS = int(os.getenv("PORTFOLIO_MAX_OPEN_POSITIONS", "5"))   # espelha portfolio_service
+
 # ── P(TP1) gate (calibração) ────────────────────────────────────────────────
 # rec.prob_tp1 = P(TP1) calibrada por bin de score (calibration_service). Pula
 # setups com probabilidade calibrada baixa de bater o TP1. NO-OP-SAFE: quando a
@@ -1466,6 +1479,32 @@ async def _open_notional_usd() -> float:
     except Exception as e:
         log.warning(f"[shadow] _open_notional_usd falhou: {e}")
         return 0.0
+
+
+async def _open_auto_counts_by_allowlist() -> tuple[int, int]:
+    """(n_dentro, n_fora) — posições auto ABERTAS dentro vs fora da allowlist de
+    execução, pro modelo de slots do filler FORA. Propaga erro pro chamador
+    (o fail-safe lá bloqueia o filler no ciclo)."""
+    if not DB_ENABLED:
+        return 0, 0
+    from sqlalchemy import select
+    from db import get_session
+    from models.real_trade import RealTrade
+    allow = get_exec_allowlist()
+    async with get_session() as session:
+        stmt = select(RealTrade).where(
+            RealTrade.status == "open",
+            RealTrade.source == "auto",
+        )
+        rows = (await session.execute(stmt)).scalars().all()
+    n_dentro = n_fora = 0
+    for t in rows:
+        base = _symbol_base(t.symbol or "")
+        if allow and base and base not in allow:
+            n_fora += 1
+        else:
+            n_dentro += 1
+    return n_dentro, n_fora
 
 
 async def _open_margin_usd() -> float:
@@ -2406,6 +2445,24 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
         except Exception as e:
             log.warning(f"[regime-size] fetch regime falhou (fail-open mão cheia): {e}")
 
+    # ── Filler FORA da allowlist: snapshot dos slots ocupados (auto abertos)
+    # separando DENTRO/FORA + prioriza recs DENTRO antes de FORA no ciclo
+    # (sorted estável). Tudo NO-OP quando FILLER_FORA_ENABLED=OFF.
+    _flr_n_dentro = 0
+    _flr_n_fora = 0
+    if not SHADOW_ENABLED and FILLER_FORA_ENABLED:
+        try:
+            _flr_n_dentro, _flr_n_fora = await _open_auto_counts_by_allowlist()
+        except Exception as e:
+            log.warning(f"[filler-fora] contagem inicial falhou (fail-safe bloqueia filler): {e}")
+            _flr_n_dentro, _flr_n_fora = FILLER_TOTAL_SLOTS, FILLER_FORA_MAX
+        _allow_sort = get_exec_allowlist()
+        if _allow_sort:
+            recs = sorted(
+                recs,
+                key=lambda r: 0 if (_b := _symbol_base(r.get("symbol", ""))) and _b in _allow_sort else 1,
+            )
+
     opened = 0
     for rec in recs:
         try:
@@ -2548,14 +2605,31 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
 
             # ── Universo de execução (allowlist): só opera real bases permitidas.
             # Vazio = sem restrição (comportamento atual). Aplicado só em live.
+            # FILLER FORA: quando ligado, libera bases FORA como filler de slot
+            # ocioso (tier A/A+ — tier B já cortado acima), teto min(FILLER_FORA_MAX,
+            # slots livres = total − DENTRO) e desliga quando a allowlist atinge
+            # FILLER_FORA_OFF_AT. Marca rec["_is_filler"] pra size reduzido depois.
             _exec_allow = get_exec_allowlist()
             if not SHADOW_ENABLED and _exec_allow:
                 base = _symbol_base(rec["symbol"])
                 if base and base not in _exec_allow:
-                    reason = f"{base} fora do universo de execução (allowlist)"
-                    log.info(f"[exec-universe] {rec['symbol']} {reason} — skip")
-                    _record_skip(rec, "exec-universe", reason)
-                    continue
+                    _flr_ok = False
+                    _flr_cap = 0
+                    if FILLER_FORA_ENABLED and len(_exec_allow) < FILLER_FORA_OFF_AT:
+                        _flr_cap = min(FILLER_FORA_MAX, FILLER_TOTAL_SLOTS - _flr_n_dentro)
+                        if _flr_n_fora < _flr_cap:
+                            _flr_ok = True
+                    if _flr_ok:
+                        rec["_is_filler"] = True
+                        log.info(
+                            f"[filler-fora] {rec['symbol']} {base} FORA liberado como filler "
+                            f"(fora_open={_flr_n_fora} cap={_flr_cap} dentro={_flr_n_dentro})"
+                        )
+                    else:
+                        reason = f"{base} fora do universo de execução (allowlist)"
+                        log.info(f"[exec-universe] {rec['symbol']} {reason} — skip")
+                        _record_skip(rec, "exec-universe", reason)
+                        continue
 
             # ── Symbol blacklist (postmortem): pula símbolos banidos.
             if not SHADOW_ENABLED:
@@ -2898,6 +2972,25 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         _record_skip(rec, "regime-size", f"notional pós-regime < mín ({_rg_reason})")
                         continue
 
+            # Filler FORA: size reduzido (×FILLER_FORA_SIZE_MULT) só pra posições
+            # marcadas como filler de slot ocioso. Aplica ANTES do canary global.
+            if not SHADOW_ENABLED and FILLER_FORA_ENABLED and rec.get("_is_filler"):
+                _qty_full_flr = qty
+                qty = round(qty * FILLER_FORA_SIZE_MULT, 6)
+                notional_effective = qty * entry
+                if notional_effective < MIN_NOTIONAL_USD:
+                    log.warning(
+                        f"[filler-fora] {rec.get('symbol')} SKIP: size×{FILLER_FORA_SIZE_MULT} "
+                        f"→ notional ${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f} "
+                        f"(qty cheio {_qty_full_flr})"
+                    )
+                    _record_skip(rec, "filler-fora", "notional pós-filler < mín")
+                    continue
+                log.info(
+                    f"[filler-fora] {rec.get('symbol')}: qty {_qty_full_flr} → {qty} "
+                    f"(×{FILLER_FORA_SIZE_MULT}); notional ${notional_effective:.0f}"
+                )
+
             # go-live #2 — canary/ramp: em LIVE, escala o tamanho por um
             # multiplicador global pra começar pequeno e subir gradual. Não
             # afeta shadow. Se a fração jogar o notional abaixo do mínimo da
@@ -3173,6 +3266,13 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             )
             if trade is not None:
                 opened += 1
+                # Atualiza slots do filler DENTRO do batch (DB só reflete pós-commit):
+                # mantém o teto FORA correto entre recs do mesmo ciclo.
+                if not SHADOW_ENABLED and FILLER_FORA_ENABLED:
+                    if rec.get("_is_filler"):
+                        _flr_n_fora += 1
+                    else:
+                        _flr_n_dentro += 1
                 log.info(
                     f"[{source}] OPEN {rec['symbol']} {side} qty={qty} entry={entry_actual} "
                     f"SL={stop} TP1={tp1} TP2={tp2} (snap={snap_id})"
