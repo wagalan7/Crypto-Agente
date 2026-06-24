@@ -10,14 +10,21 @@ Símbolos: CCXT "BTC/USDT:USDT" ↔ Binance "BTCUSDT".
 Timeframes: "15m", "1h", "4h", "1d" são compatíveis 1:1.
 """
 from __future__ import annotations
+import re
 import time
+import asyncio
+from datetime import datetime, timezone
 import httpx
 import pandas as pd
 from typing import List, Dict, Optional
 
 BASE = "https://data-api.binance.vision"
+# Listing S3 público do arquivo (futures UM). Estático: sem proxy, sem weight,
+# NUNCA bane IP — ao contrário do exchangeInfo via fapi/proxy (que está 418).
+S3_LIST_BASE = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
 TOP_VOLUME_TTL = 120
 TICKER_TTL = 60
+PERP_VISION_TTL = 3600
 
 # Pares a ignorar (stablecoins, fiat pairs — sem oportunidade técnica)
 _BLACKLIST_BASES = {
@@ -31,6 +38,8 @@ _BLACKLIST_BASES = {
 _client: Optional[httpx.AsyncClient] = None
 _top_cache: Dict[str, tuple] = {}
 _ticker_cache: Dict[str, tuple] = {}
+_perp_symbols_vision_cache: Dict[str, tuple] = {}
+_perp_onboard_vision_cache: Dict[str, tuple] = {}
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -150,3 +159,96 @@ async def fetch_ticker(symbol: str) -> Dict:
     }
     _ticker_cache[bv_sym] = (now, out)
     return out
+
+
+def _norm_base_vision(symbol: str) -> str:
+    """Base normalizada (sem prefixo '1000') — espelha _norm_base do universe
+    service, pra dedup/ordenação casarem com a allowlist."""
+    b = symbol.split("/")[0].upper()
+    return b[4:] if b.startswith("1000") and len(b) > 4 else b
+
+
+async def fetch_perp_symbols_vision() -> List[str]:
+    """Símbolos CCXT de TODOS os perps USDT do ARQUIVO data.binance.vision
+    (futures UM), via listing S3 público — SEM proxy, SEM weight, NUNCA bane IP.
+    (O exchangeInfo via fapi/proxy está 418-banido; este caminho contorna.)
+
+    Lista os CommonPrefixes de data/futures/um/daily/klines/ (1 dir por símbolo),
+    filtra *USDT (descarta stablecoin/fiat e pares *USDC), dedup por base e devolve
+    em from_bv ('1000BONK/USDT:USDT' — mantém prefixo 1000, casa com o arquivo do
+    vision e com o símbolo gravado em symbol_backtest_stats). Cache 1h."""
+    now = time.time()
+    cached = _perp_symbols_vision_cache.get("list")
+    if cached and now - cached[0] < PERP_VISION_TTL:
+        return cached[1]
+    client = _get_client()
+    prefix = "data/futures/um/daily/klines/"
+    marker = ""
+    seen_base: set = set()
+    out: List[str] = []
+    for _ in range(50):  # guarda-chuva anti-loop (hoje cabe em 1 página)
+        params = {"delimiter": "/", "prefix": prefix}
+        if marker:
+            params["marker"] = marker
+        r = await client.get(S3_LIST_BASE, params=params)
+        r.raise_for_status()
+        body = r.text
+        page = re.findall(rf"<Prefix>{re.escape(prefix)}([^<]+?)/</Prefix>", body)
+        for sym in page:
+            if not sym.endswith("USDT"):
+                continue
+            base = sym[:-4]
+            if base in _BLACKLIST_BASES:
+                continue
+            nb = base[4:] if base.startswith("1000") and len(base) > 4 else base
+            if nb in seen_base:
+                continue
+            seen_base.add(nb)
+            out.append(from_bv(sym))
+        if "<IsTruncated>true</IsTruncated>" not in body:
+            break
+        m = re.search(r"<NextMarker>([^<]+)</NextMarker>", body)
+        marker = m.group(1) if m else (f"{prefix}{page[-1]}/" if page else "")
+        if not marker:
+            break
+    if out:
+        _perp_symbols_vision_cache["list"] = (now, out)
+    return out
+
+
+async def _earliest_ms_vision(client, sym_bv: str, sem, tf: str) -> Optional[int]:
+    """Mês mais antigo (ms) do arquivo monthly/klines/{sym}/{tf} no vision."""
+    prefix = f"data/futures/um/monthly/klines/{sym_bv}/{tf}/"
+    async with sem:
+        try:
+            r = await client.get(S3_LIST_BASE, params={"prefix": prefix})
+            r.raise_for_status()
+            months = re.findall(r"-(\d{4})-(\d{2})\.zip", r.text)
+        except Exception:
+            return None
+    if not months:
+        return None
+    y, mo = min((int(a), int(b)) for a, b in months)
+    return int(datetime(y, mo, 1, tzinfo=timezone.utc).timestamp() * 1000)
+
+
+async def fetch_perp_onboard_dates_vision(symbols: List[str], tf: str = "4h") -> dict:
+    """Mapa {NORM_BASE: onboard_ms} derivado do mês MAIS ANTIGO no arquivo vision
+    (proxy-free) — pra ORDENAR o sweep do histórico mais antigo p/ o mais novo SEM
+    tocar no fapi/proxy banido. Best-effort/concorrente: símbolo sem arquivo fica
+    ausente (vai pro fim na ordenação). Cache 1h."""
+    now = time.time()
+    cached = _perp_onboard_vision_cache.get("map")
+    base_map: dict = dict(cached[1]) if (cached and now - cached[0] < PERP_VISION_TTL) else {}
+    todo = [s for s in symbols if _norm_base_vision(s) not in base_map]
+    if todo:
+        client = _get_client()
+        sem = asyncio.Semaphore(12)
+        results = await asyncio.gather(
+            *[_earliest_ms_vision(client, to_bv(s), sem, tf) for s in todo]
+        )
+        for s, ms in zip(todo, results):
+            if ms is not None:
+                base_map[_norm_base_vision(s)] = ms
+    _perp_onboard_vision_cache["map"] = (now, base_map)
+    return base_map

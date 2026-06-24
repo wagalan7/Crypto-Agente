@@ -298,11 +298,14 @@ async def run_universe_backtest(
     end_dt = datetime.now(timezone.utc)
     try:
         if VISION_BULK:
-            # Enumeração LEVE via exchangeInfo (weight 1) — NUNCA ticker/24hr
-            # (weight 40). Símbolos EXATOS (mantém prefixo 1000) p/ casar com o
-            # arquivo do vision E com o símbolo já gravado em stats (dedup do
-            # skip-fresh). O slice por histórico/offset (abaixo) faz o lotemento.
-            symbols = await _bfs.fetch_perp_symbols_exchangeinfo()
+            # Enumeração PROXY-FREE via listing S3 do arquivo data.binance.vision
+            # (o exchangeInfo via fapi/proxy está 418-banido — e o proxy é o mesmo
+            # IP do bot live, então NÃO dá pra arriscar). Símbolos EXATOS (mantém
+            # prefixo 1000) p/ casar com o arquivo do vision E com o símbolo já
+            # gravado em stats (dedup do skip-fresh). O slice por histórico/offset
+            # (abaixo) faz o lotemento.
+            from services.binance_vision_service import fetch_perp_symbols_vision
+            symbols = await fetch_perp_symbols_vision()
         elif _bfs.PROXY_ENABLED:
             from services.binance_futures_service import fetch_top_volume_symbols
             symbols = await fetch_top_volume_symbols(limit=limit)
@@ -331,7 +334,13 @@ async def run_universe_backtest(
     onboard_map: dict = {}
     if order_by == "history":
         try:
-            onboard_map = await _bfs.fetch_perp_onboard_dates()
+            if VISION_BULK:
+                # Datas de listagem PROXY-FREE: mês mais antigo no arquivo vision
+                # (o onboard via exchangeInfo/proxy também está banido).
+                from services.binance_vision_service import fetch_perp_onboard_dates_vision
+                onboard_map = await fetch_perp_onboard_dates_vision(symbols)
+            else:
+                onboard_map = await _bfs.fetch_perp_onboard_dates()
         except Exception as e:
             log.warning(f"[bt-universe] onboard dates indisponíveis ({e}); ordem por volume")
 
