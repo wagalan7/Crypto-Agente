@@ -56,6 +56,20 @@ OPEN_WINDOW_HOURS = int(_os.getenv("PORTFOLIO_OPEN_WINDOW_HOURS", "48"))
 #                          (inflavel; engole o cap com recs só sendo monitoradas).
 PORTFOLIO_COUNT_MODE = _os.getenv("PORTFOLIO_COUNT_MODE", "real_only").strip().lower()
 
+# ── Slot livre pós-TP1/BE (pedido do usuário) ──────────────────────────────
+# Quando ON: posição que já bateu TP1 e moveu o SL pra breakeven (phase=="post_tp1")
+# NÃO conta mais pro teto de POSIÇÕES SIMULTÂNEAS (MAX_OPEN_POSITIONS). Lógica: ela
+# está "de-risked" (pior caso = BE, não perde), então libera um slot pra um novo
+# trade. Vale pra N posições no BE (cada uma libera um slot). NÃO afrouxa os caps de
+# margem/notional/risco-aberto (capital de verdade segue preso). DEFAULT OFF (NO-OP).
+SLOT_FREE_AFTER_TP1_BE = _os.getenv("SLOT_FREE_AFTER_TP1_BE", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_at_risk(phase) -> bool:
+    """True se a posição ainda ocupa um slot de risco (pré-TP1). Trata None/desconhecido
+    como at-risk (conservador). Só 'post_tp1' (TP1+BE) é considerado slot livre."""
+    return phase != "post_tp1"
+
 
 # ── Mapeamento símbolo → categoria ───────────────────────────────────────
 _CATEGORY_PATTERNS: list[tuple[str, re.Pattern]] = [
@@ -123,6 +137,7 @@ async def get_open_positions() -> list[dict]:
                         "opened_at": r.opened_at.isoformat() if getattr(r, "opened_at", None) else None,
                         "tier": None,
                         "source": r.source,
+                        "phase": getattr(r, "phase", None),
                     }
                     for r in rows
                 ]
@@ -154,6 +169,7 @@ async def get_open_positions() -> list[dict]:
 def _summarize(open_positions: list[dict]) -> dict:
     """Agrega métricas das posições abertas."""
     total = len(open_positions)
+    at_risk_total = 0
     by_cat: dict[str, int] = {}
     by_cat_dir: dict[str, int] = {}
     by_dir: dict[str, int] = {"long": 0, "short": 0}
@@ -167,8 +183,13 @@ def _summarize(open_positions: list[dict]) -> dict:
         if d in by_dir:
             by_dir[d] += 1
         agg_risk += p["risk_pct"]
+        if _is_at_risk(p.get("phase")):
+            at_risk_total += 1
     return {
         "total": total,
+        # at_risk_total = posições que ainda ocupam slot de risco (pré-TP1/BE).
+        # Usado pro cap de posições simultâneas quando SLOT_FREE_AFTER_TP1_BE=on.
+        "at_risk_total": at_risk_total,
         "by_category": by_cat,
         "by_category_direction": by_cat_dir,
         "by_direction": by_dir,
@@ -186,7 +207,9 @@ async def get_exposure() -> dict:
             "max_open_positions": MAX_OPEN_POSITIONS,
             "max_per_category": MAX_PER_CATEGORY,
             "max_aggregate_risk_pct": MAX_AGGREGATE_RISK_PCT,
+            "slot_free_after_tp1_be": SLOT_FREE_AFTER_TP1_BE,
         },
+        # at_risk_total já vem no **summary; é o que conta pro cap quando a regra está ON.
         "positions": positions,
         **summary,
     }
@@ -203,7 +226,13 @@ def _check_against_summary(
     Aplica os 3 limites contra um summary já computado. Retorna
     (allowed, motivo_se_bloqueado).
     """
-    if summary["total"] >= MAX_OPEN_POSITIONS:
+    # Slot livre pós-TP1/BE: quando ON, conta só posições at-risk (pré-TP1) pro
+    # teto. Posições no BE (post_tp1) liberam slot. Cai pro 'total' se a chave não
+    # vier (compat). Os caps de categoria/risco abaixo seguem usando o total real.
+    effective_total = summary["total"]
+    if SLOT_FREE_AFTER_TP1_BE and "at_risk_total" in summary:
+        effective_total = summary["at_risk_total"]
+    if effective_total >= MAX_OPEN_POSITIONS:
         return False, (
             f"Limite de {MAX_OPEN_POSITIONS} posições simultâneas atingido"
         )
@@ -247,6 +276,7 @@ def filter_recommendations(recommendations: list, open_summary: dict | None = No
     if open_summary is None:
         open_summary = {
             "total": 0,
+            "at_risk_total": 0,
             "by_category_direction": {},
             "aggregate_risk_pct": 0.0,
         }
@@ -254,6 +284,7 @@ def filter_recommendations(recommendations: list, open_summary: dict | None = No
     # Working copy pra mutação durante o loop
     summary = {
         "total": open_summary.get("total", 0),
+        "at_risk_total": open_summary.get("at_risk_total", open_summary.get("total", 0)),
         "by_category_direction": dict(open_summary.get("by_category_direction", {})),
         "aggregate_risk_pct": float(open_summary.get("aggregate_risk_pct", 0.0)),
     }
@@ -274,8 +305,10 @@ def filter_recommendations(recommendations: list, open_summary: dict | None = No
             })
             continue
         kept.append(rec)
-        # Atualiza summary incremental
+        # Atualiza summary incremental. Rec aprovada = trade NOVO = at-risk (pré-TP1),
+        # então ocupa um slot de risco no cap de posições simultâneas.
         summary["total"] += 1
+        summary["at_risk_total"] = summary.get("at_risk_total", 0) + 1
         cat = categorize(sym)
         key = f"{cat}:{direction}"
         summary["by_category_direction"][key] = summary["by_category_direction"].get(key, 0) + 1

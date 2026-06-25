@@ -574,6 +574,11 @@ FILLER_FORA_STOP_STREAK = int(os.getenv("FILLER_FORA_STOP_STREAK", "4"))
 FILLER_FORA_TEST_N = int(os.getenv("FILLER_FORA_TEST_N", "0"))               # 0 = desligado
 FILLER_FORA_TEST_SIZE_MULT = float(os.getenv("FILLER_FORA_TEST_SIZE_MULT", "0.50"))
 FILLER_FORA_TEST_START_AT = os.getenv("FILLER_FORA_TEST_START_AT", "").strip()  # ISO; conta só FORA abertos após isto
+# Slot livre pós-TP1/BE: quando ON, posição já no breakeven (phase=='post_tp1') não
+# conta nos slots DENTRO/FORA — libera vaga pra novo trade (prioriza DENTRO via ordem
+# de processamento; FORA entra como filler na vaga liberada). Espelha portfolio_service
+# e kill_switch. DEFAULT OFF (NO-OP).
+SLOT_FREE_AFTER_TP1_BE = os.getenv("SLOT_FREE_AFTER_TP1_BE", "false").strip().lower() in ("1", "true", "yes", "on")
 
 # ── P(TP1) gate (calibração) ────────────────────────────────────────────────
 # rec.prob_tp1 = P(TP1) calibrada por bin de score (calibration_service). Pula
@@ -1510,6 +1515,9 @@ async def _open_auto_counts_by_allowlist() -> tuple[int, int]:
         rows = (await session.execute(stmt)).scalars().all()
     n_dentro = n_fora = 0
     for t in rows:
+        # Slot livre pós-TP1/BE: posição no breakeven não ocupa slot (libera vaga).
+        if SLOT_FREE_AFTER_TP1_BE and getattr(t, "phase", None) == "post_tp1":
+            continue
         base = _symbol_base(t.symbol or "")
         if allow and base and base not in allow:
             n_fora += 1

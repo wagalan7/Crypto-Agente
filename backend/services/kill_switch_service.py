@@ -37,6 +37,10 @@ log = logging.getLogger(__name__)
 # Estado em memoria pra dedupe de notificacao Telegram (uma por dia).
 _KILL_NOTIFIED_DAY: Optional[str] = None
 
+# Slot livre pós-TP1/BE: quando ON, posições já no breakeven (phase=='post_tp1')
+# não contam pro teto de posições abertas — espelha portfolio_service. DEFAULT OFF.
+SLOT_FREE_AFTER_TP1_BE = os.getenv("SLOT_FREE_AFTER_TP1_BE", "false").strip().lower() in ("1", "true", "yes", "on")
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name, "").strip().lower()
@@ -92,6 +96,10 @@ async def _count_open() -> int:
         return 0
     async with get_session() as session:
         stmt = select(func.count(RealTrade.id)).where(RealTrade.status == "open")
+        if SLOT_FREE_AFTER_TP1_BE:
+            # Posição no BE (post_tp1) não ocupa slot. IS DISTINCT FROM trata NULL
+            # como at-risk (conta), só exclui exatamente 'post_tp1'.
+            stmt = stmt.where(RealTrade.phase.is_distinct_from("post_tp1"))
         return int((await session.execute(stmt)).scalar() or 0)
 
 
