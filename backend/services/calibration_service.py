@@ -47,6 +47,15 @@ LOOKBACK_DAYS = int(os.getenv("CALIBRATION_LOOKBACK_DAYS", "0"))
 MIN_SAMPLE_TOTAL = 30            # mínimo de trades resolvidos pra ativar calib
 SHRINKAGE_K = 10                 # peso do P_global quando bin é pequeno
 
+# ── Aprendizado por histórico (blended): mistura trades simulados do sweep ──────
+# (tabela backtest_trades) na calibração score→P(TP1). DESLIGADO no scoring de
+# dinheiro real por default — só entra ao vivo com CALIBRATION_INCLUDE_BACKTEST=on
+# (revisar o A/B do preview antes). O backtest é CAPADO a cap_mult × nº de trades
+# reais pra não afogar o sinal vivo recente.
+def _include_backtest_live() -> bool:
+    return os.getenv("CALIBRATION_INCLUDE_BACKTEST", "false").strip().lower() in ("1", "true", "yes", "on")
+BACKTEST_CAP_MULT = float(os.getenv("CALIBRATION_BACKTEST_CAP_MULT", "1.0"))
+
 # Gavetas (bins) score→P(TP1). A escala do score V2 é OUTRA (≈18–71, p50≈46) vs
 # o legado (55–100). Se a calibração usasse os bins legados sob a V2, a maioria
 # dos scores cairia ABAIXO de 55 (fora de range → p_global pra tudo), matando a
@@ -279,34 +288,80 @@ def _load_seed_pairs() -> List[Tuple[float, str]]:
         return []
 
 
-async def _compute_calibration() -> Optional[Dict[str, Any]]:
+async def _load_real_pairs() -> List[Tuple[float, str]]:
+    """Pares (score, status) dos trades REAIS resolvidos (RecommendationSnapshot)."""
+    pairs: List[Tuple[float, str]] = []
+    if not DB_ENABLED:
+        return pairs
+    try:
+        async with get_session() as session:
+            conds = [RecommendationSnapshot.status.in_(RESOLVED_STATUSES)]
+            conds.append(_not_fast_void())
+            # LOOKBACK_DAYS <= 0 ⇒ TODO o histórico (sem corte temporal)
+            if LOOKBACK_DAYS > 0:
+                since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+                conds.append(RecommendationSnapshot.outcome_at >= since)
+            stmt = select(
+                RecommendationSnapshot.score,
+                RecommendationSnapshot.status,
+            ).where(and_(*conds))
+            rows = (await session.execute(stmt)).all()
+            for sc, st in rows:
+                pairs.append((float(sc), st))
+    except Exception as e:
+        log.warning(f"[calibration] DB read (real) falhou: {e}")
+    return pairs
+
+
+async def _load_backtest_pairs(cap: Optional[int]) -> List[Tuple[float, str]]:
+    """Pares (score, status) dos trades SIMULADOS do sweep (backtest_trades).
+    `cap`: nº máximo de pares (amostra aleatória) pra não afogar o sinal real.
+    Fail-soft: tabela pode não existir ainda → retorna []."""
+    if cap is not None and cap <= 0:
+        return []
+    pairs: List[Tuple[float, str]] = []
+    if not DB_ENABLED:
+        return pairs
+    try:
+        from models.backtest_trade import BacktestTrade
+        from sqlalchemy import func as _func
+        async with get_session() as session:
+            stmt = select(BacktestTrade.score, BacktestTrade.status).where(
+                BacktestTrade.status.in_(RESOLVED_STATUSES)
+            )
+            if cap is not None:
+                stmt = stmt.order_by(_func.random()).limit(cap)
+            rows = (await session.execute(stmt)).all()
+            for sc, st in rows:
+                pairs.append((float(sc), st))
+    except Exception as e:
+        log.warning(f"[calibration] DB read (backtest) falhou: {e}")
+    return pairs
+
+
+async def _compute_calibration(include_backtest: Optional[bool] = None) -> Optional[Dict[str, Any]]:
     """
     Calcula tabela score-bin → P(TP1) calibrada combinando:
       1. Trades reais resolvidos do DB (últimos LOOKBACK_DAYS)
-      2. Trades sintéticos do backtest (se CALIBRATION_SEED_PATH setado)
+      2. Trades simulados do sweep (backtest_trades) — só se include_backtest
+      3. Seed externo legado (se CALIBRATION_SEED_PATH setado)
+    `include_backtest=None` ⇒ usa a flag CALIBRATION_INCLUDE_BACKTEST (caminho live).
+    Passe True/False explícito pra computar variantes (preview/compare A/B).
     Retorna None se total < MIN_SAMPLE_TOTAL.
     """
-    pairs: List[Tuple[float, str]] = []
-    real_count = 0
-    if DB_ENABLED:
-        try:
-            async with get_session() as session:
-                conds = [RecommendationSnapshot.status.in_(RESOLVED_STATUSES)]
-                conds.append(_not_fast_void())
-                # LOOKBACK_DAYS <= 0 ⇒ TODO o histórico (sem corte temporal)
-                if LOOKBACK_DAYS > 0:
-                    since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-                    conds.append(RecommendationSnapshot.outcome_at >= since)
-                stmt = select(
-                    RecommendationSnapshot.score,
-                    RecommendationSnapshot.status,
-                ).where(and_(*conds))
-                rows = (await session.execute(stmt)).all()
-                for sc, st in rows:
-                    pairs.append((float(sc), st))
-                real_count = len(rows)
-        except Exception as e:
-            log.warning(f"[calibration] DB read falhou: {e}")
+    if include_backtest is None:
+        include_backtest = _include_backtest_live()
+
+    real_pairs = await _load_real_pairs()
+    real_count = len(real_pairs)
+    pairs: List[Tuple[float, str]] = list(real_pairs)
+
+    bt_count = 0
+    if include_backtest:
+        cap = int(BACKTEST_CAP_MULT * real_count) if real_count > 0 else None
+        bt_pairs = await _load_backtest_pairs(cap)
+        bt_count = len(bt_pairs)
+        pairs.extend(bt_pairs)
 
     seed_pairs = _load_seed_pairs()
     pairs.extend(seed_pairs)
@@ -314,14 +369,23 @@ async def _compute_calibration() -> Optional[Dict[str, Any]]:
     if len(pairs) < MIN_SAMPLE_TOTAL:
         return None
 
-    source = "db" if not seed_pairs else (
-        f"db({real_count})+seed({len(seed_pairs)})" if real_count > 0 else "seed"
-    )
-    return compute_calibration_from_pairs(pairs, source=source)
+    parts = [f"db({real_count})"]
+    if bt_count:
+        parts.append(f"backtest({bt_count})")
+    if seed_pairs:
+        parts.append(f"seed({len(seed_pairs)})")
+    source = "+".join(parts)
+    out = compute_calibration_from_pairs(pairs, source=source)
+    if out is not None:
+        out["real_count"] = real_count
+        out["backtest_count"] = bt_count
+        out["include_backtest"] = bool(include_backtest)
+    return out
 
 
 async def get_calibration() -> Optional[Dict[str, Any]]:
-    """Wrapper cacheado. Retorna None se calib não está pronta ainda."""
+    """Wrapper cacheado. Retorna None se calib não está pronta ainda.
+    Usa a flag CALIBRATION_INCLUDE_BACKTEST pro caminho de dinheiro real."""
     now = time.time()
     if _cache["data"] is not None and (now - _cache["ts"]) < CACHE_TTL:
         return _cache["data"]
@@ -333,6 +397,39 @@ async def get_calibration() -> Optional[Dict[str, Any]]:
     _cache["ts"] = now
     _cache["data"] = data
     return data
+
+
+async def compute_calibration_preview() -> Dict[str, Any]:
+    """A/B pra revisão humana: calibração SÓ real vs real+backtest (blended),
+    SEM tocar o cache live nem o scoring de dinheiro real. Mostra o delta de
+    P(TP1) por bin e o p_global, pra decidir se vale ligar CALIBRATION_INCLUDE_BACKTEST."""
+    live = await _compute_calibration(include_backtest=False)
+    blended = await _compute_calibration(include_backtest=True)
+
+    bins_delta = []
+    if live and blended:
+        bl_by_label = {b["label"]: b for b in blended["bins"]}
+        for b in live["bins"]:
+            bb = bl_by_label.get(b["label"]) or {}
+            bins_delta.append({
+                "label": b["label"],
+                "n_real": b["n_total"],
+                "n_blended": bb.get("n_total"),
+                "p_live": b["p_calibrated"],
+                "p_blended": bb.get("p_calibrated"),
+                "delta": round((bb.get("p_calibrated", 0) - b["p_calibrated"]), 4),
+            })
+    return {
+        "active_live": "blended" if _include_backtest_live() else "real_only",
+        "cap_mult": BACKTEST_CAP_MULT,
+        "real_count": (live or {}).get("real_count") if live else None,
+        "backtest_count": (blended or {}).get("backtest_count") if blended else None,
+        "p_global_live": (live or {}).get("p_global") if live else None,
+        "p_global_blended": (blended or {}).get("p_global") if blended else None,
+        "bins": bins_delta,
+        "note": ("Ligue CALIBRATION_INCLUDE_BACKTEST=on (1 deploy) pra usar o blended "
+                 "no scoring real. Default OFF — só real."),
+    }
 
 
 async def prob_tp1_for_score(score: float) -> Optional[float]:

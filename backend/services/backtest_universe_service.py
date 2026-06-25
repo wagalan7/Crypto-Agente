@@ -33,6 +33,13 @@ log = logging.getLogger(__name__)
 # gerava buracos nos dados. 600s cobre o pior caso sem deixar hang de verdade vivo.
 _SYMBOL_TIMEOUT_S = float(os.getenv("BT_UNIVERSE_SYMBOL_TIMEOUT_S", "600"))
 
+# Persiste cada trade simulado (resolvido) em backtest_trades, pra o cérebro
+# poder aprender com o histórico inteiro do universo (calibração blended). É só
+# dado de pesquisa — o scoring real só consome se CALIBRATION_INCLUDE_BACKTEST=on.
+PERSIST_BACKTEST_TRADES = os.getenv("BACKTEST_PERSIST_TRADES", "true").strip().lower() in ("1", "true", "yes")
+# Statuses resolvidos que viram linha de aprendizado (no_data é descartado).
+_RESOLVED_BT_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2", "lost", "expired")
+
 WIN_STATUSES = ("won_tp1", "won_tp1_be", "won_tp2")
 # 2017-01-01: load_historical_ohlcv retorna só o que existe desde a listagem,
 # então pedir desde aqui == "histórico completo de cada moeda".
@@ -233,6 +240,80 @@ async def _upsert_stats(symbol: str, tf: str, res: dict) -> None:
         await session.commit()
 
 
+async def _persist_trades(symbol: str, tf: str, trades: list) -> int:
+    """DELETE+INSERT dos trades RESOLVIDOS de (symbol, tf) em backtest_trades.
+    Idempotente (re-rodar substitui as linhas da moeda). Fail-soft: nunca derruba
+    o sweep — só loga. Retorna quantas linhas foram gravadas."""
+    if not PERSIST_BACKTEST_TRADES:
+        return 0
+    from db import get_session
+    from models.backtest_trade import BacktestTrade
+    from sqlalchemy import delete
+
+    rows = []
+    for t in (trades or []):
+        st = t.get("status")
+        if st not in _RESOLVED_BT_STATUSES:
+            continue
+        bar_ts = None
+        hour_utc = dow = None
+        cts = t.get("created_ts")
+        if cts:
+            try:
+                bar_ts = datetime.fromtimestamp(int(cts) / 1000, tz=timezone.utc)
+                hour_utc = bar_ts.hour
+                dow = bar_ts.weekday()
+            except Exception:
+                pass
+        rows.append(BacktestTrade(
+            symbol=symbol, timeframe=tf,
+            tier=str(t.get("tier") or "")[:4],
+            direction=str(t.get("direction") or "")[:8],
+            score=float(t.get("score") or 0.0),
+            rr=t.get("rr"),
+            atr_pct=t.get("atr_pct"),
+            status=st,
+            realized_r=t.get("realized_r"),
+            hour_utc=hour_utc, dow=dow,
+            patterns=t.get("patterns") or None,
+            bar_ts=bar_ts,
+        ))
+    try:
+        async with get_session() as session:
+            await session.execute(
+                delete(BacktestTrade).where(
+                    BacktestTrade.symbol == symbol,
+                    BacktestTrade.timeframe == tf,
+                )
+            )
+            if rows:
+                session.add_all(rows)
+            await session.commit()
+        return len(rows)
+    except Exception as e:
+        log.warning(f"[bt-universe] persist trades {symbol} {tf} falhou: {e}")
+        return 0
+
+
+async def _has_backtest_trades(symbol: str, tf: str) -> bool:
+    """True se já há linhas por-trade gravadas pra (symbol, tf)."""
+    from db import get_session
+    from models.backtest_trade import BacktestTrade
+    from sqlalchemy import select, func
+    try:
+        async with get_session() as session:
+            n = (await session.execute(
+                select(func.count()).select_from(BacktestTrade).where(
+                    BacktestTrade.symbol == symbol,
+                    BacktestTrade.timeframe == tf,
+                )
+            )).scalar()
+        return bool(n and n > 0)
+    except Exception:
+        # Tabela pode não existir ainda no 1º deploy — trata como "sem trades".
+        return False
+
+
 async def _already_fresh(symbol: str, tf: str, refresh_days: int) -> bool:
     """True se já existe resultado de (symbol, tf) com sucesso dentro da janela."""
     from db import get_session
@@ -253,6 +334,10 @@ async def _already_fresh(symbol: str, tf: str, refresh_days: int) -> bool:
     if row.computed_at < cutoff:
         return False
     if row.error and row.n_trades == 0:
+        return False
+    # Captura por-trade ligada mas ainda sem linhas gravadas (ex.: stats fresco de
+    # um sweep anterior à feature) ⇒ re-roda pra preencher backtest_trades.
+    if PERSIST_BACKTEST_TRADES and row.n_trades and not await _has_backtest_trades(symbol, tf):
         return False
     return True
 
@@ -415,6 +500,8 @@ async def run_universe_backtest(
                         timeout=_SYMBOL_TIMEOUT_S,
                     )
                     await _upsert_stats(sym, tf, res)
+                    # Persiste trades resolvidos pro aprendizado blended (fail-soft).
+                    await _persist_trades(sym, tf, res.get("trades", []))
                     if res.get("error") and not res.get("trades"):
                         _PROGRESS["errors"] += 1
                     else:

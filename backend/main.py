@@ -2646,6 +2646,45 @@ async def calibration_recalibrate(notes: str | None = None, make_active: bool = 
     )
 
 
+@app.get("/api/calibration/backtest-preview")
+async def calibration_backtest_preview():
+    """A/B do aprendizado por histórico: compara a calibração score→P(TP1) SÓ
+    com trades reais vs real+backtest (blended, capada). NÃO altera o scoring de
+    dinheiro real — é só pra revisar antes de ligar CALIBRATION_INCLUDE_BACKTEST.
+    """
+    from services import calibration_service
+    return await calibration_service.compute_calibration_preview()
+
+
+@app.get("/api/calibration/backtest-coverage")
+async def calibration_backtest_coverage():
+    """Cobertura da tabela backtest_trades: total de trades simulados gravados,
+    por TF e por status — pra acompanhar o sweep alimentando o aprendizado."""
+    from db import DB_ENABLED, get_session
+    if not DB_ENABLED:
+        return {"enabled": False}
+    from models.backtest_trade import BacktestTrade
+    from sqlalchemy import select, func
+    out = {"enabled": True, "total": 0, "by_tf": {}, "by_status": {}, "symbols": 0}
+    try:
+        async with get_session() as session:
+            out["total"] = int((await session.execute(
+                select(func.count()).select_from(BacktestTrade))).scalar() or 0)
+            out["symbols"] = int((await session.execute(
+                select(func.count(func.distinct(BacktestTrade.symbol))))).scalar() or 0)
+            for tf, n in (await session.execute(
+                select(BacktestTrade.timeframe, func.count()).group_by(BacktestTrade.timeframe)
+            )).all():
+                out["by_tf"][tf] = int(n)
+            for st, n in (await session.execute(
+                select(BacktestTrade.status, func.count()).group_by(BacktestTrade.status)
+            )).all():
+                out["by_status"][st] = int(n)
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
 @app.get("/api/paper/equity-curve")
 async def paper_equity_curve(days: int = 30):
     """
