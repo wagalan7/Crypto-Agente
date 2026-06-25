@@ -59,6 +59,22 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _daily_reset_at() -> Optional[datetime]:
+    """Âncora opcional de reset (KILL_DAILY_RESET_AT, ISO). Quando setada, o PnL
+    diário e o streak de losses contam SÓ a partir desse instante — permite
+    'zerar' os contadores sob demanda (ex.: após repor/ajustar capital pra testar)
+    sem esperar a virada do dia UTC. Sem a env, comportamento normal. Aplicada só
+    se a âncora for mais recente que a janela natural (não estende pra trás)."""
+    raw = os.getenv("KILL_DAILY_RESET_AT", "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def thresholds() -> dict:
     return {
         "kill_switch": _env_bool("KILL_SWITCH", False),
@@ -84,6 +100,9 @@ async def _daily_pnl_usd() -> float:
     if not DB_ENABLED:
         return 0.0
     start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    anchor = _daily_reset_at()
+    if anchor and anchor > start:
+        start = anchor
     async with get_session() as session:
         stmt = (
             select(func.coalesce(func.sum(RealTrade.pnl_usd), 0.0))
@@ -111,6 +130,9 @@ async def _recent_losses_streak(hours: int) -> tuple[int, Optional[datetime]]:
     if not DB_ENABLED:
         return (0, None)
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    anchor = _daily_reset_at()
+    if anchor and anchor > since:
+        since = anchor
     async with get_session() as session:
         stmt = (
             select(RealTrade)
@@ -123,9 +145,21 @@ async def _recent_losses_streak(hours: int) -> tuple[int, Optional[datetime]]:
     streak = 0
     last_close = None
     for t in rows:
-        is_loss = (t.realized_r is not None and float(t.realized_r) <= 0) or \
-                  (t.pnl_usd is not None and float(t.pnl_usd) < 0) or \
-                  t.status == "closed_stop"
+        # Um trade que EMBOLSOU o TP1 (tp1_realized_usd>0) NÃO é loss pro streak:
+        # o SL já subiu pro BE estrutural, então fechar a sobra em stop/BE é um
+        # "TP1 + BE" (capital protegido), não uma perda crua. Sem isso, um trade
+        # vencedor com TP1 batido (ex.: ATOM tp1=$2,55, sobra -$0,17) inflava a
+        # contagem e disparava o kill-switch indevidamente. Só conta loss real:
+        # sem TP1 embolsado E com PnL líquido negativo (BE em r=0 não conta).
+        tp1_banked = t.tp1_realized_usd is not None and float(t.tp1_realized_usd) > 0
+        if tp1_banked:
+            is_loss = False
+        elif t.pnl_usd is not None:
+            is_loss = float(t.pnl_usd) < 0
+        elif t.realized_r is not None:
+            is_loss = float(t.realized_r) < 0
+        else:
+            is_loss = t.status == "closed_stop"
         if is_loss:
             streak += 1
             if last_close is None:
@@ -185,6 +219,8 @@ async def check_can_trade() -> dict:
     checks["daily_pnl_usd"] = round(pnl_today, 2)
     checks["daily_loss_limit_usd"] = round(daily_loss_limit, 2)
     checks["daily_loss_limit_src"] = limit_src
+    _anchor = _daily_reset_at()
+    checks["daily_reset_at"] = _anchor.isoformat() if _anchor else None
     if pnl_today <= -daily_loss_limit:
         blocked_reasons.append(
             f"daily_loss: ${pnl_today:.2f} <= -${daily_loss_limit:.2f} ({limit_src})"

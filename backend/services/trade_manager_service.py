@@ -698,6 +698,23 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     tp2_missing = tp2_missing or tp2_vanished
     tp1_missing = tp1_missing or tp1_vanished
 
+    # ── Anti-race do disparo do SL/TP ────────────────────────────────────────
+    # Uma perna pode "sumir" do openAlgoOrders porque DISPAROU (a posição está
+    # fechando AGORA) — não porque foi deletada. A qty da posição lê com lag
+    # entre os endpoints, então o tick que pegou qty_now>0 ainda enxerga a perna
+    # sumida e o trade vivo. Sem guarda, o autoheal recria o SL e NOTIFICA bem na
+    # hora do stop — o usuário vê "Auto-cura" ANTES do aviso de Loss. Antes de
+    # curar uma perna SUMIDA (não por ID-None de abertura), reconfirma a qty: se
+    # já zerou, a perna disparou → não cura, deixa o caminho de fechamento agir.
+    if sl_vanished or tp2_vanished or tp1_vanished:
+        qty_confirm = await _fetch_exchange_qty(trade.symbol)
+        if qty_confirm is not None and qty_confirm <= 0:
+            log.info(
+                f"[autoheal] {trade.symbol} #{trade.id} perna sumida mas posição "
+                f"zerou na reconfirmação (qty={qty_confirm}) → disparou, não cura"
+            )
+            return False
+
     if not (sl_missing or tp1_missing or tp2_missing):
         return False
 
