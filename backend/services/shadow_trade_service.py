@@ -568,6 +568,12 @@ FILLER_TOTAL_SLOTS = int(os.getenv("PORTFOLIO_MAX_OPEN_POSITIONS", "5"))   # esp
 # libera 1 probe; se o probe der TP1+TP2 (closed_tp2), a contagem zera (despausa).
 # Se o probe falhar e o dia sair do lucro, fica totalmente pausado até o próximo dia.
 FILLER_FORA_STOP_STREAK = int(os.getenv("FILLER_FORA_STOP_STREAK", "4"))
+# Teste cauteloso de size: os primeiros FILLER_FORA_TEST_N trades FORA abertos a
+# partir de FILLER_FORA_TEST_START_AT usam SIZE_MULT reduzido (TEST_SIZE_MULT);
+# depois de N, volta sozinho ao FILLER_FORA_SIZE_MULT normal. DEFAULT OFF (N=0).
+FILLER_FORA_TEST_N = int(os.getenv("FILLER_FORA_TEST_N", "0"))               # 0 = desligado
+FILLER_FORA_TEST_SIZE_MULT = float(os.getenv("FILLER_FORA_TEST_SIZE_MULT", "0.50"))
+FILLER_FORA_TEST_START_AT = os.getenv("FILLER_FORA_TEST_START_AT", "").strip()  # ISO; conta só FORA abertos após isto
 
 # ── P(TP1) gate (calibração) ────────────────────────────────────────────────
 # rec.prob_tp1 = P(TP1) calibrada por bin de score (calibration_service). Pula
@@ -1548,6 +1554,37 @@ async def _filler_fora_brake_state() -> tuple[int, float]:
     return streak, pnl
 
 
+async def _filler_fora_test_opened_count() -> int:
+    """Quantos trades FORA (auto [filler]) já foram ABERTOS desde
+    FILLER_FORA_TEST_START_AT — conta TODOS (abertos + fechados), pois o teste é
+    sobre quantos foram disparados, não quantos seguem vivos. Sem START_AT, conta
+    desde sempre. Propaga erro (fail-safe no chamador usa size de teste por garantia)."""
+    if not DB_ENABLED:
+        return 0
+    from datetime import datetime, timezone
+    from sqlalchemy import select, func
+    from db import get_session
+    from models.real_trade import RealTrade
+    cutoff = None
+    if FILLER_FORA_TEST_START_AT:
+        try:
+            cutoff = datetime.fromisoformat(FILLER_FORA_TEST_START_AT.replace("Z", "+00:00"))
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=timezone.utc)
+        except ValueError:
+            cutoff = None
+    async with get_session() as session:
+        stmt = (
+            select(func.count())
+            .select_from(RealTrade)
+            .where(RealTrade.source == "auto")
+            .where(RealTrade.notes.like("%[filler]%"))
+        )
+        if cutoff is not None:
+            stmt = stmt.where(RealTrade.opened_at >= cutoff)
+        return int((await session.execute(stmt)).scalar() or 0)
+
+
 async def _open_margin_usd() -> float:
     """Soma a MARGEM (notional/leverage) dos trades reais auto abertos. Pra cap
     de capital comprometido — 'X% da banca aberta no máx'."""
@@ -2493,6 +2530,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
     _flr_n_fora = 0
     _flr_stop_streak = 0
     _flr_daily_pnl = 0.0
+    _flr_test_done = 0
     if not SHADOW_ENABLED and FILLER_FORA_ENABLED:
         try:
             _flr_n_dentro, _flr_n_fora = await _open_auto_counts_by_allowlist()
@@ -2504,6 +2542,12 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
         except Exception as e:
             log.warning(f"[filler-fora] brake-state falhou (fail-safe PAUSA filler): {e}")
             _flr_stop_streak, _flr_daily_pnl = FILLER_FORA_STOP_STREAK, 0.0
+        if FILLER_FORA_TEST_N > 0:
+            try:
+                _flr_test_done = await _filler_fora_test_opened_count()
+            except Exception as e:
+                log.warning(f"[filler-fora] contagem do teste falhou (fail-safe usa size de teste): {e}")
+                _flr_test_done = 0
         _allow_sort = get_exec_allowlist()
         if _allow_sort:
             recs = sorted(
@@ -3040,11 +3084,15 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             # marcadas como filler de slot ocioso. Aplica ANTES do canary global.
             if not SHADOW_ENABLED and FILLER_FORA_ENABLED and rec.get("_is_filler"):
                 _qty_full_flr = qty
-                qty = round(qty * FILLER_FORA_SIZE_MULT, 6)
+                # Teste cauteloso: os primeiros FILLER_FORA_TEST_N FORA usam size
+                # reduzido de teste; depois volta sozinho ao mult normal.
+                _flr_in_test = FILLER_FORA_TEST_N > 0 and _flr_test_done < FILLER_FORA_TEST_N
+                _flr_mult = FILLER_FORA_TEST_SIZE_MULT if _flr_in_test else FILLER_FORA_SIZE_MULT
+                qty = round(qty * _flr_mult, 6)
                 notional_effective = qty * entry
                 if notional_effective < MIN_NOTIONAL_USD:
                     log.warning(
-                        f"[filler-fora] {rec.get('symbol')} SKIP: size×{FILLER_FORA_SIZE_MULT} "
+                        f"[filler-fora] {rec.get('symbol')} SKIP: size×{_flr_mult} "
                         f"→ notional ${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f} "
                         f"(qty cheio {_qty_full_flr})"
                     )
@@ -3052,7 +3100,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     continue
                 log.info(
                     f"[filler-fora] {rec.get('symbol')}: qty {_qty_full_flr} → {qty} "
-                    f"(×{FILLER_FORA_SIZE_MULT}); notional ${notional_effective:.0f}"
+                    f"(×{_flr_mult}{' TESTE ' + str(_flr_test_done + 1) + '/' + str(FILLER_FORA_TEST_N) if _flr_in_test else ''}); "
+                    f"notional ${notional_effective:.0f}"
                 )
 
             # go-live #2 — canary/ramp: em LIVE, escala o tamanho por um
@@ -3335,6 +3384,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 if not SHADOW_ENABLED and FILLER_FORA_ENABLED:
                     if rec.get("_is_filler"):
                         _flr_n_fora += 1
+                        if FILLER_FORA_TEST_N > 0:
+                            _flr_test_done += 1
                     else:
                         _flr_n_dentro += 1
                 log.info(

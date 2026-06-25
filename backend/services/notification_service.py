@@ -72,6 +72,20 @@ async def send_telegram(
 
 # === Formatadores por tipo de evento ===
 
+def _allowlist_line(symbol: Any) -> str:
+    """Linha DENTRO/FORA da allowlist de execução. Vazia se não der pra inferir."""
+    try:
+        from services.shadow_trade_service import get_exec_allowlist
+        base = str(symbol).split("/")[0].split(":")[0].strip().upper()
+        if not base or base == "?":
+            return ""
+        if base in get_exec_allowlist():
+            return "\U0001F4CD *DENTRO* da allowlist\n"
+        return "\U0001F310 *FORA* da allowlist (filler)\n"
+    except Exception:
+        return ""
+
+
 def fmt_trade_opened(trade: Any, rec: Optional[Any] = None) -> str:
     """Formata mensagem de trade aberto. Aceita trade dict ou objeto."""
     symbol = _get(trade, "symbol", "?")
@@ -90,6 +104,7 @@ def fmt_trade_opened(trade: Any, rec: Optional[Any] = None) -> str:
     emoji = "\U0001F7E2" if side == "LONG" else "\U0001F534"
     return (
         f"{emoji} *Trade Aberto* \u2014 `{symbol}`\n"
+        f"{_allowlist_line(symbol)}"
         f"`{side} {lev}x` \u00B7 TF `{tf}` \u00B7 Tier `{tier}` \u00B7 Score `{score}`\n"
         f"Entry: `{_fmt_num(entry)}`\n"
         f"SL: `{_fmt_num(sl)}` \u00B7 TP1: `{_fmt_num(tp1)}` \u00B7 TP2: `{_fmt_num(tp2)}`\n"
@@ -156,6 +171,7 @@ def fmt_trade_closed(trade: Any, reason: str = "?", pnl: Optional[float] = None)
 
     return (
         f"{emoji} *{label}* \u2014 `{symbol}` ({side})\n"
+        f"{_allowlist_line(symbol)}"
         f"Motivo: `{motivo}`\n"
         f"PnL: `${pnl_f:.2f}`"
     )
