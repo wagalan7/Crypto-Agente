@@ -37,6 +37,13 @@ LIVE_TEST_ENABLED = os.getenv("LIVE_TEST_ENABLED", "true").strip().lower() in ("
 _DEFAULT_START = "2026-06-13T12:00:00+00:00"  # 09:00 BRT de 13/06
 LIVE_TEST_TARGET = int(os.getenv("LIVE_TEST_TARGET", "10"))
 LIVE_TEST_DAYS = int(os.getenv("LIVE_TEST_DAYS", "7"))
+# Escopo FORA-only (pedido do usuário 2026-06-25): o canário passa a contar só
+# auto-trades FORA da allowlist (notes "[filler]"), pra avaliar isoladamente o
+# P&L dos próximos N FORA e decidir capital/canário. Rótulo e unidade ficam
+# configuráveis pro frontend exibir o size certo (não há mais "0.50" cravado).
+LIVE_TEST_FILLER_ONLY = os.getenv("LIVE_TEST_FILLER_ONLY", "true").strip().lower() in ("1", "true", "yes")
+LIVE_TEST_LABEL = os.getenv("LIVE_TEST_LABEL", "Teste FORA 0,75x").strip() or "Teste FORA 0,75x"
+LIVE_TEST_UNIT = os.getenv("LIVE_TEST_UNIT", "trades FORA").strip() or "trades FORA"
 
 
 def _start_at() -> datetime:
@@ -48,6 +55,13 @@ def _start_at() -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _is_filler_trade(trade: dict) -> bool:
+    """True se o auto-trade é FORA da allowlist (marcado [filler])."""
+    if trade.get("_is_filler"):
+        return True
+    return "[filler]" in (trade.get("notes") or "")
 
 
 def _parse_dt(v) -> Optional[datetime]:
@@ -70,6 +84,8 @@ async def _count_auto_since_start(session) -> int:
         .where(RealTrade.source == "auto")
         .where(RealTrade.opened_at >= start)
     )
+    if LIVE_TEST_FILLER_ONLY:
+        stmt = stmt.where(RealTrade.notes.like("%[filler]%"))
     return int((await session.execute(stmt)).scalar() or 0)
 
 
@@ -90,11 +106,11 @@ async def _push_done(reason: str, n: int) -> None:
         from services import push_service
         days = LIVE_TEST_DAYS
         await push_service.notify_alert(
-            title="🏁 Teste 0.50 concluído — hora de analisar",
+            title=f"🏁 {LIVE_TEST_LABEL} — hora de analisar",
             body=(
-                f"{reason} ({n}/{LIVE_TEST_TARGET} auto-trades). "
-                f"Bora revisar o resultado e decidir: subir pra 1.0, manter 0.50 "
-                f"ou ajustar. Janela do teste: {days} dias."
+                f"{reason} ({n}/{LIVE_TEST_TARGET} {LIVE_TEST_UNIT}). "
+                f"Bora somar o P&L desses FORA e decidir: colocar mais capital, "
+                f"subir/descer o canário ou ajustar o size. Janela: {days} dias."
             ),
             tag="livetest-done",
         )
@@ -109,6 +125,9 @@ async def on_auto_trade_opened(trade: Optional[dict]) -> None:
         return
     try:
         if trade.get("source") != "auto":
+            return
+        # FORA-only: só conta/avisa trades fora da allowlist ([filler]).
+        if LIVE_TEST_FILLER_ONLY and not _is_filler_trade(trade):
             return
         opened = _parse_dt(trade.get("opened_at"))
         start = _start_at()
@@ -129,7 +148,7 @@ async def on_auto_trade_opened(trade: Optional[dict]) -> None:
         try:
             from services import push_service
             await push_service.notify_alert(
-                title=f"🧪 Teste 0.50 · auto #{n}/{LIVE_TEST_TARGET}",
+                title=f"🧪 {LIVE_TEST_LABEL} · #{n}/{LIVE_TEST_TARGET}",
                 body=f"{sym} {side} · entry {entry} · SL {sl} · TP1 {tp1}",
                 tag=f"livetest-{n}",
             )
@@ -205,6 +224,9 @@ async def status() -> dict:
     days_left = max(0.0, (deadline - now).total_seconds() / 86400.0)
     return {
         "enabled": LIVE_TEST_ENABLED,
+        "label": LIVE_TEST_LABEL,
+        "unit": LIVE_TEST_UNIT,
+        "filler_only": LIVE_TEST_FILLER_ONLY,
         "start_at": start.isoformat(),
         "deadline_at": deadline.isoformat(),
         "target": LIVE_TEST_TARGET,

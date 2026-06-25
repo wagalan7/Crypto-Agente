@@ -4,6 +4,9 @@ const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-productio
 
 interface LiveTestStatus {
   enabled: boolean
+  label?: string
+  unit?: string
+  filler_only?: boolean
   start_at: string
   deadline_at: string
   target: number
@@ -60,10 +63,10 @@ export default function LiveTestWidget() {
     >
       <div className="flex items-center justify-between mb-2">
         <div className="text-[12px] font-semibold text-slate-200">
-          🧪 Teste 0.50 · canário
+          🧪 {st.label ?? 'Teste'} · canário
         </div>
         <div className="text-[11px] font-mono text-slate-300">
-          {st.count}/{st.target} auto-trades
+          {st.count}/{st.target} {st.unit ?? 'auto-trades'}
         </div>
       </div>
 

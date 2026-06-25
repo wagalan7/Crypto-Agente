@@ -3410,6 +3410,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         from services import live_test_service
                         await live_test_service.on_auto_trade_opened({
                             **trade,
+                            "_is_filler": bool(rec.get("_is_filler")),
                             "planned_stop": stop,
                             "planned_tp1": float(tp1) if tp1 is not None else None,
                             "planned_tp2": tp2,
