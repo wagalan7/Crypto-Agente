@@ -34,6 +34,7 @@ import asyncio
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
@@ -80,6 +81,23 @@ except (TypeError, ValueError):
     SCAN_WINDOW_BARS = 800
 if SCAN_WINDOW_BARS < WARMUP_BARS + 50:
     SCAN_WINDOW_BARS = WARMUP_BARS + 50
+
+# Co-tenancy com o trading AO VIVO: o sweep histórico é CPU-bound e roda em
+# asyncio.to_thread, mas num dyno single-core a thread segura o GIL e ESFOMEA o
+# event loop — o scan loop ao vivo atrasa (visto: ~64 scans em 5h vs ~200
+# esperados @90s) e o watchdog dispara "Scan loop parado". A cada N barras
+# damos um time.sleep() minúsculo: time.sleep LIBERA o GIL, deixando o event
+# loop (scan/health ao vivo) rodar durante jobs longos. Custo no sweep é
+# desprezível (~ms a cada centenas de barras). Default LIGADO pra proteger o
+# dinheiro real; pra sweeps offline sem trading, pode zerar via env.
+try:
+    BT_YIELD_EVERY_BARS = int(os.getenv("BT_UNIVERSE_YIELD_EVERY_BARS", "150"))
+except (TypeError, ValueError):
+    BT_YIELD_EVERY_BARS = 150
+try:
+    BT_YIELD_SLEEP_S = float(os.getenv("BT_UNIVERSE_YIELD_SLEEP_S", "0.003"))
+except (TypeError, ValueError):
+    BT_YIELD_SLEEP_S = 0.003
 
 TF_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
@@ -680,7 +698,16 @@ def _scan_bars_sync(
     bar_ms = TF_MS[timeframe]
     bars_per_hour = max(1, int(3600 / (bar_ms / 1000)))
 
+    _yield_every = BT_YIELD_EVERY_BARS
+    _yield_sleep = BT_YIELD_SLEEP_S
+    _bars_seen = 0
     for i in range(WARMUP_BARS, len(df) - 1, step_bars):
+        # Cede o GIL periodicamente pra não esfomear o event loop ao vivo (scan/
+        # health). time.sleep() solta o GIL — sem isso, esta thread de backtest
+        # monopoliza a CPU e o scan loop atrasa > limite do watchdog.
+        _bars_seen += 1
+        if _yield_every > 0 and _yield_sleep > 0 and _bars_seen % _yield_every == 0:
+            time.sleep(_yield_sleep)
         # Janela deslizante limitada (não o slice que cresce): custo constante
         # por barra. lo nunca negativo. Bar i continua sendo a última visível.
         lo = max(0, i + 1 - SCAN_WINDOW_BARS)
