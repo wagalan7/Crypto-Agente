@@ -84,20 +84,27 @@ if SCAN_WINDOW_BARS < WARMUP_BARS + 50:
 
 # Co-tenancy com o trading AO VIVO: o sweep histórico é CPU-bound e roda em
 # asyncio.to_thread, mas num dyno single-core a thread segura o GIL e ESFOMEA o
-# event loop — o scan loop ao vivo atrasa (visto: ~64 scans em 5h vs ~200
-# esperados @90s) e o watchdog dispara "Scan loop parado". A cada N barras
-# damos um time.sleep() minúsculo: time.sleep LIBERA o GIL, deixando o event
-# loop (scan/health ao vivo) rodar durante jobs longos. Custo no sweep é
-# desprezível (~ms a cada centenas de barras). Default LIGADO pra proteger o
-# dinheiro real; pra sweeps offline sem trading, pode zerar via env.
+# event loop — o scan loop ao vivo atrasa (visto: ~9 scans em 59min vs ~40
+# esperados @90s) e o watchdog dispara "Scan loop parado".
+#
+# Gating por TEMPO DE PAREDE (não por contagem de barras): barras de símbolos com
+# histórico enorme são caras (dezenas de ms cada), então "a cada N barras" deixa
+# a thread monopolizar a CPU por vários segundos seguidos. Aqui medimos o tempo
+# CONTÍNUO de processamento; quando passa de BT_YIELD_BUSY_S, soltamos o GIL por
+# BT_YIELD_SLEEP_S (time.sleep LIBERA o GIL → event loop ao vivo roda). Assim a
+# thread NUNCA segura a CPU mais que ~BT_YIELD_BUSY_S seguidos, garantindo ao
+# scan/health uma fatia mínima de ~SLEEP/(BUSY+SLEEP) da CPU. Defaults: cede 30ms
+# a cada 200ms de trabalho ⇒ ~13% de CPU garantida ao vivo, sweep ~13% mais
+# lento. LIGADO por padrão pra proteger o dinheiro real; zere o SLEEP via env pra
+# sweeps offline sem trading.
 try:
-    BT_YIELD_EVERY_BARS = int(os.getenv("BT_UNIVERSE_YIELD_EVERY_BARS", "150"))
+    BT_YIELD_BUSY_S = float(os.getenv("BT_UNIVERSE_YIELD_BUSY_S", "0.2"))
 except (TypeError, ValueError):
-    BT_YIELD_EVERY_BARS = 150
+    BT_YIELD_BUSY_S = 0.2
 try:
-    BT_YIELD_SLEEP_S = float(os.getenv("BT_UNIVERSE_YIELD_SLEEP_S", "0.003"))
+    BT_YIELD_SLEEP_S = float(os.getenv("BT_UNIVERSE_YIELD_SLEEP_S", "0.03"))
 except (TypeError, ValueError):
-    BT_YIELD_SLEEP_S = 0.003
+    BT_YIELD_SLEEP_S = 0.03
 
 TF_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
@@ -698,16 +705,18 @@ def _scan_bars_sync(
     bar_ms = TF_MS[timeframe]
     bars_per_hour = max(1, int(3600 / (bar_ms / 1000)))
 
-    _yield_every = BT_YIELD_EVERY_BARS
+    _yield_busy_s = BT_YIELD_BUSY_S
     _yield_sleep = BT_YIELD_SLEEP_S
-    _bars_seen = 0
+    _last_yield = time.monotonic()
     for i in range(WARMUP_BARS, len(df) - 1, step_bars):
-        # Cede o GIL periodicamente pra não esfomear o event loop ao vivo (scan/
-        # health). time.sleep() solta o GIL — sem isso, esta thread de backtest
-        # monopoliza a CPU e o scan loop atrasa > limite do watchdog.
-        _bars_seen += 1
-        if _yield_every > 0 and _yield_sleep > 0 and _bars_seen % _yield_every == 0:
+        # Cede o GIL por TEMPO DE PAREDE pra não esfomear o event loop ao vivo
+        # (scan/health). Se já processou _yield_busy_s contínuos, solta o GIL por
+        # _yield_sleep s. Adapta-se a símbolos pesados (barras caras) — a thread
+        # nunca segura a CPU mais que ~_yield_busy_s seguidos. time.sleep() solta
+        # o GIL; sem isso a thread monopoliza a CPU e o scan atrasa > watchdog.
+        if _yield_sleep > 0 and (time.monotonic() - _last_yield) >= _yield_busy_s:
             time.sleep(_yield_sleep)
+            _last_yield = time.monotonic()
         # Janela deslizante limitada (não o slice que cresce): custo constante
         # por barra. lo nunca negativo. Bar i continua sendo a última visível.
         lo = max(0, i + 1 - SCAN_WINDOW_BARS)
