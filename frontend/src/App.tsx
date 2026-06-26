@@ -12,6 +12,7 @@ import PushSubscribeButton from './components/PushSubscribeButton'
 import RiskStatusBadge from './components/RiskStatusBadge'
 import StatusPanel from './components/StatusPanel'
 import DashboardPanel from './components/DashboardPanel'
+import SweepPanel from './components/SweepPanel'
 import { api } from './services/api'
 import { usePushFocus } from './hooks/usePushFocus'
 import type { SignalDirection, TradeType } from './types'
@@ -217,6 +218,7 @@ export default function App() {
   const [showStatus, setShowStatus] = useState(false)
   const [showDashboard, setShowDashboard] = useState(false)
   const [showAssertiveness, setShowAssertiveness] = useState(false)
+  const [showSweep, setShowSweep] = useState(false)
   const [pendingSignal, setPendingSignal] = useState<import('./types').TradeSignal | null>(null)
   const { focus: pushFocus, clear: clearPushFocus } = usePushFocus()
 
@@ -560,6 +562,14 @@ export default function App() {
             <span>🛡️</span>
             <span className="hidden sm:block">Assertividade</span>
           </button>
+          <button
+            onClick={() => setShowSweep(true)}
+            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-sky-500/20 to-indigo-500/20 hover:from-sky-500/30 hover:to-indigo-500/30 border border-sky-500/40 rounded text-xs font-bold text-sky-300"
+            title="Sweep — backtest massivo do universo (worker)"
+          >
+            <span>📡</span>
+            <span className="hidden sm:block">Sweep</span>
+          </button>
           <RiskStatusBadge onOpen={() => setShowStatus(true)} />
           <PushSubscribeButton />
           <button
@@ -806,6 +816,10 @@ export default function App() {
 
       {showAssertiveness && (
         <AssertivenessPanel onClose={() => setShowAssertiveness(false)} />
+      )}
+
+      {showSweep && (
+        <SweepPanel onClose={() => setShowSweep(false)} />
       )}
     </div>
   )
