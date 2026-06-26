@@ -2325,8 +2325,9 @@ async def backtest_universe_start(
     if not _backtest_universe_enabled():
         raise HTTPException(403, "Backtest do universo desabilitado (set BACKTEST_UNIVERSE_ENABLED=on no DEV).")
     from services import backtest_universe_service as bus
-    if bus.get_universe_status().get("running"):
-        return {"ok": False, "error": "job já em execução", "progress": bus.get_universe_status()}
+    _st = await bus.get_universe_status_db()
+    if _st.get("running"):
+        return {"ok": False, "error": "job já em execução (worker ou web)", "progress": _st}
     tf_list = [t.strip() for t in tfs.split(",") if t.strip()]
     if not tf_list:
         raise HTTPException(400, "tfs vazio")
@@ -2365,10 +2366,12 @@ async def backtest_universe_start(
 
 @app.get("/api/backtest/universe/status")
 async def backtest_universe_status():
-    """Progresso do job de backtest massivo (em memória; reseta no redeploy,
-    mas os resultados ficam no DB e o /start retoma)."""
+    """Progresso do job de backtest massivo. Prefere o snapshot PERSISTIDO no DB
+    (Opção B: o sweep roda no worker separado; o web só lê), caindo pro in-memory
+    se não houver linha persistida."""
     from services import backtest_universe_service as bus
-    return {"enabled": _backtest_universe_enabled(), "progress": bus.get_universe_status()}
+    return {"enabled": _backtest_universe_enabled(),
+            "progress": await bus.get_universe_status_db()}
 
 
 @app.get("/api/backtest/universe/ranking")

@@ -155,6 +155,72 @@ def get_universe_status() -> dict:
     return dict(_PROGRESS)
 
 
+# ── Progresso PERSISTIDO (cross-process: worker escreve, web lê) ──────────────
+import time as _time  # noqa: E402
+
+_last_persist_mono: float = 0.0
+_PERSIST_MIN_INTERVAL_S = 3.0
+
+
+async def _persist_progress(force: bool = False) -> None:
+    """Salva o snapshot do _PROGRESS na linha singleton (id=1). Throttled por
+    tempo (a não ser force=True no start/finish) pra não martelar o DB durante
+    rajadas de skip. Fail-soft: nunca derruba o sweep."""
+    global _last_persist_mono
+    from db import DB_ENABLED
+    if not DB_ENABLED:
+        return
+    now_mono = _time.monotonic()
+    if not force and (now_mono - _last_persist_mono) < _PERSIST_MIN_INTERVAL_S:
+        return
+    _last_persist_mono = now_mono
+    try:
+        from db import get_session
+        from models.sweep_progress import SweepProgress
+        from sqlalchemy import select
+        snap = dict(_PROGRESS)
+        async with get_session() as session:
+            row = (await session.execute(
+                select(SweepProgress).where(SweepProgress.id == 1)
+            )).scalar_one_or_none()
+            if row is None:
+                session.add(SweepProgress(id=1, progress=snap,
+                                          updated_at=datetime.now(timezone.utc)))
+            else:
+                row.progress = snap
+                row.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+    except Exception as e:
+        log.warning(f"[bt-universe] persist progress falhou: {e}")
+
+
+async def get_universe_status_db() -> dict:
+    """Status pra API: prefere o progresso PERSISTIDO (worker), cai pro
+    in-memory (caso o sweep rode no próprio processo web, legado)."""
+    from db import DB_ENABLED
+    mem = dict(_PROGRESS)
+    if not DB_ENABLED:
+        return mem
+    try:
+        from db import get_session
+        from models.sweep_progress import SweepProgress
+        from sqlalchemy import select
+        async with get_session() as session:
+            row = (await session.execute(
+                select(SweepProgress).where(SweepProgress.id == 1)
+            )).scalar_one_or_none()
+        if row and isinstance(row.progress, dict) and row.progress:
+            db_prog = dict(row.progress)
+            db_prog["_persisted_at"] = row.updated_at.isoformat() if row.updated_at else None
+            # Se o web nunca rodou sweep (total=0) mas o DB tem dados, usa o DB.
+            # Se ambos têm dados, o DB (worker) é a fonte da verdade na Opção B.
+            return db_prog
+        return mem
+    except Exception as e:
+        log.warning(f"[bt-universe] read persisted progress falhou: {e}")
+        return mem
+
+
 def _metrics_from_trades(trades: list) -> Optional[dict]:
     n = len(trades)
     if n == 0:
@@ -483,6 +549,7 @@ async def run_universe_backtest(
     })
     log.info(f"[bt-universe] START mode={mode} pool={pool_n} excluded={excluded_n} "
              f"offset={off} → {len(symbols)} símbolos × {tfs} = {len(symbols)*len(tfs)} jobs")
+    await _persist_progress(force=True)
 
     try:
         for sym in symbols:
@@ -491,7 +558,8 @@ async def run_universe_backtest(
                 try:
                     if await _already_fresh(sym, tf, refresh_days):
                         _PROGRESS["skipped"] += 1
-                        _PROGRESS["done"] += 1
+                        # done é incrementado UMA vez no finally (antes contava +2
+                        # nos pulados — o continue ainda executa o finally).
                         continue
                     res = await asyncio.wait_for(
                         backtest_symbol_tf(
@@ -520,6 +588,9 @@ async def run_universe_backtest(
                         pass
                 finally:
                     _PROGRESS["done"] += 1
+                # Snapshot do progresso pro DB (throttled) — visível cross-process
+                # (worker grava, web lê via get_universe_status_db).
+                await _persist_progress()
                 # Cede o loop pra não monopolizar o event loop do web dyno.
                 await asyncio.sleep(0)
     finally:
@@ -528,6 +599,7 @@ async def run_universe_backtest(
         _PROGRESS["current"] = None
         log.info(f"[bt-universe] FIM — {_PROGRESS['computed']} computados, "
                  f"{_PROGRESS['skipped']} pulados, {_PROGRESS['errors']} erros")
+        await _persist_progress(force=True)
 
     return {"ok": True, "progress": get_universe_status()}
 
