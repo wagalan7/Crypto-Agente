@@ -34,6 +34,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -120,6 +121,9 @@ TF_MS = {
 _BT_DATA_SOURCE = os.getenv("BACKTEST_DATA_SOURCE", "").strip().lower()
 VISION_BULK = _BT_DATA_SOURCE in ("vision_bulk", "vision", "bulk")
 _VISION_BULK_BASE = "https://data.binance.vision/data/futures/um"
+# Endpoint S3 de LISTAGEM (XML) — UMA chamada diz quais meses existem p/ a moeda,
+# evitando gerar URLs de meses pré-listagem (404-storm).
+_VISION_S3_LIST_BASE = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
 
 
 @dataclass
@@ -186,6 +190,40 @@ async def _fetch_vision_zip(client: httpx.AsyncClient, url: str) -> Optional[byt
         return None
 
 
+async def _vision_list_monthly_months(
+    client: httpx.AsyncClient, sym: str, timeframe: str,
+) -> Optional[set]:
+    """UMA listagem S3 → set de (ano, mês) que REALMENTE têm arquivo monthly p/
+    {sym}/{timeframe}. Sem isso geramos URLs de 2017→hoje p/ TODA moeda (moeda
+    de 2024 = ~100 GETs 404/TF a cada restart). Retorna None se a listagem
+    falhar → o chamador cai no comportamento antigo (gera o range inteiro)."""
+    prefix = f"data/futures/um/monthly/klines/{sym}/{timeframe}/"
+    months: set = set()
+    marker = ""
+    pat = re.compile(
+        rf"{re.escape(sym)}-{re.escape(timeframe)}-(\d{{4}})-(\d{{2}})\.zip")
+    try:
+        for _ in range(10):  # paginação defensiva (S3 corta em 1000 chaves)
+            url = f"{_VISION_S3_LIST_BASE}?prefix={prefix}&max-keys=1000"
+            if marker:
+                url += f"&marker={marker}"
+            r = await client.get(url)
+            if r.status_code != 200:
+                return None
+            for y, m in pat.findall(r.text):
+                months.add((int(y), int(m)))
+            if "<IsTruncated>true</IsTruncated>" not in r.text:
+                break
+            keys = re.findall(r"<Key>([^<]+)</Key>", r.text)
+            if not keys:
+                break
+            marker = keys[-1]
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[vision-bulk] listagem {sym}/{timeframe}: {e}")
+        return None
+    return months
+
+
 async def _load_ohlcv_vision_bulk(
     symbol: str, timeframe: str, start_ms: int, end_ms: int,
 ) -> pd.DataFrame:
@@ -196,18 +234,6 @@ async def _load_ohlcv_vision_bulk(
     now = datetime.now(timezone.utc)
     cur_ym = (now.year, now.month)
     rows: List[tuple] = []
-
-    # Monta TODAS as URLs (mensais fechados + diários do mês corrente) e baixa
-    # concorrente — antes era serial (símbolo antigo = ~80 zips × ~6s = ~8-10min).
-    urls: List[str] = []
-    for y, m in _vision_month_iter(start_ms, end_ms):
-        if (y, m) < cur_ym:
-            urls.append(f"{_VISION_BULK_BASE}/monthly/klines/{sym}/{timeframe}/"
-                        f"{sym}-{timeframe}-{y:04d}-{m:02d}.zip")
-        else:  # mês corrente: daily até o dia de hoje
-            for day in range(1, now.day + 1):
-                urls.append(f"{_VISION_BULK_BASE}/daily/klines/{sym}/{timeframe}/"
-                            f"{sym}-{timeframe}-{y:04d}-{m:02d}-{day:02d}.zip")
 
     client = httpx.AsyncClient(
         timeout=60.0, headers={"User-Agent": "Mozilla/5.0 (CryptoAI-Backtest)"},
@@ -220,6 +246,25 @@ async def _load_ohlcv_vision_bulk(
             return await _fetch_vision_zip(client, url)
 
     try:
+        # UMA listagem S3 → só geramos URL de meses que EXISTEM. Mata o 404-storm
+        # (moeda de 2024 não tenta 2017..2023). None = listagem falhou → fallback
+        # ao range completo (comportamento antigo, tolerante a 404).
+        avail = await _vision_list_monthly_months(client, sym, timeframe)
+
+        # Monta as URLs (mensais fechados + diários do mês corrente) e baixa
+        # concorrente — antes era serial (símbolo antigo = ~80 zips × ~6s ≈ 8-10min).
+        urls: List[str] = []
+        for y, m in _vision_month_iter(start_ms, end_ms):
+            if (y, m) < cur_ym:
+                if avail is not None and (y, m) not in avail:
+                    continue  # mês sem arquivo → não gera o GET 404
+                urls.append(f"{_VISION_BULK_BASE}/monthly/klines/{sym}/{timeframe}/"
+                            f"{sym}-{timeframe}-{y:04d}-{m:02d}.zip")
+            else:  # mês corrente: daily até o dia de hoje
+                for day in range(1, now.day + 1):
+                    urls.append(f"{_VISION_BULK_BASE}/daily/klines/{sym}/{timeframe}/"
+                                f"{sym}-{timeframe}-{y:04d}-{m:02d}-{day:02d}.zip")
+
         results = await asyncio.gather(*[_bounded(u) for u in urls])
         for raw in results:  # ordem não importa: ordenamos por timestamp depois
             if raw:
