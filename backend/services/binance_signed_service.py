@@ -157,6 +157,59 @@ def _sign(qs: str) -> str:
     return hmac.new(_API_SECRET.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _fire_telegram(msg: str, event_type: str) -> None:
+    """Dispara um alerta no Telegram SEM bloquear o caller (fire-and-forget).
+    Import preguiçoso + create_task — evita ciclo de import e nunca propaga erro
+    de notificação pro caminho de trading."""
+    try:
+        from services.notification_service import send_telegram
+        loop = asyncio.get_running_loop()
+        loop.create_task(send_telegram(msg, event_type=event_type))
+    except Exception as e:  # noqa: BLE001 — alerta é best-effort
+        log.warning(f"[binance] alerta telegram '{event_type}' falhou: {e}")
+
+
+def _arm_ban(ban_ms: float, origin: str) -> None:
+    """Arma o cooldown de ban e ALERTA o usuário 1x por janela. Antes, o bot
+    ficava cego (parava de ler posições/ordens → sem detecção de fechamento e
+    sem autocura) SEM avisar. Agora manda um Telegram explícito."""
+    global _ban_until_ms, _ban_alert_sent_for_ms, _ban_recovery_pending
+    _ban_until_ms = ban_ms
+    _ban_recovery_pending = True
+    if _ban_alert_sent_for_ms != ban_ms:  # 1x por janela de ban
+        _ban_alert_sent_for_ms = ban_ms
+        try:
+            import datetime as _dt
+            until = _dt.datetime.fromtimestamp(ban_ms / 1000.0, tz=_dt.timezone.utc)
+            mins = max(0.0, (ban_ms - time.time() * 1000.0) / 60000.0)
+            _fire_telegram(
+                f"\u26A0\uFE0F *Bot cego \u2014 rate-limit Binance*\n"
+                f"used-weight estourou o teto (\u2248{_used_weight_1m}/min). A Binance "
+                f"baniu o IP via `{origin}` at\u00E9 *{until.strftime('%H:%M')} UTC* "
+                f"(~{mins:.0f}min).\n"
+                f"\U0001F6D1 *Monitoramento e autocura PAUSADOS* \u2014 sem leitura de "
+                f"posi\u00E7\u00F5es/ordens. Fechamentos e pernas faltantes ser\u00E3o "
+                f"reconciliados quando voltar. *Cheque o SL manualmente se preciso.*",
+                event_type="rate_limit",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[binance] alerta de ban falhou: {e}")
+
+
+def _clear_ban_if_recovered() -> None:
+    """Chamado após uma chamada assinada bem-sucedida. Se havia um ban ativo,
+    avisa que o monitoramento voltou."""
+    global _ban_recovery_pending
+    if _ban_recovery_pending:
+        _ban_recovery_pending = False
+        _fire_telegram(
+            "\u2705 *Rate-limit normalizado* \u2014 leitura da Binance retomada. "
+            "Monitoramento e autocura voltaram ao ar; fechamentos/pernas pendentes "
+            "ser\u00E3o reconciliados nos pr\u00F3ximos ciclos.",
+            event_type="rate_limit",
+        )
+
+
 def _build_signed_url(path: str, params: Optional[dict] = None) -> str:
     """Monta querystring + timestamp + signature. Funciona pra GET/POST/DELETE."""
     p = dict(params or {})
@@ -183,9 +236,11 @@ async def _signed_request(method: str, path: str, params: Optional[dict] = None)
                 "msg": f"rate-limit cooldown local ativo até {int(_ban_until_ms)}",
                 "ban_until_ms": _ban_until_ms}
     # ── Proteção 2: throttle proativo. Se o peso usado recente passou do teto
-    #    macio, espaça as chamadas pra não chegar no hard limit (2400/min).
+    #    macio/duro, espaça/pausa as chamadas pra não chegar no hard limit
+    #    (2400/min) que dispara o -1003. Teto = _MAX_THROTTLE_SLEEP_S (cobre a
+    #    pausa dura de 15s; antes era fixo 2s e não segurava o burst).
     if now_ms < _throttle_until_ms:
-        await asyncio.sleep(min(2.0, max(0.0, (_throttle_until_ms - now_ms) / 1000.0)))
+        await asyncio.sleep(min(_MAX_THROTTLE_SLEEP_S, max(0.0, (_throttle_until_ms - now_ms) / 1000.0)))
 
     url = _build_signed_url(path, params)
     try:
@@ -195,7 +250,14 @@ async def _signed_request(method: str, path: str, params: Optional[dict] = None)
             uw = r.headers.get("x-mbx-used-weight-1m") or r.headers.get("X-MBX-USED-WEIGHT-1M")
             if uw is not None:
                 _used_weight_1m = int(uw)
-                if _used_weight_1m >= _WEIGHT_SOFT_LIMIT:
+                if _used_weight_1m >= _WEIGHT_HARD_LIMIT:
+                    # Perto do teto duro (2400) → PAUSA dura pra a janela drenar.
+                    _throttle_until_ms = time.time() * 1000.0 + _HARD_PAUSE_MS
+                    log.warning(
+                        f"[binance] used-weight-1m={_used_weight_1m} >= HARD {_WEIGHT_HARD_LIMIT} "
+                        f"— PAUSA dura {_HARD_PAUSE_MS}ms (evita -1003/ban)"
+                    )
+                elif _used_weight_1m >= _WEIGHT_SOFT_LIMIT:
                     _throttle_until_ms = time.time() * 1000.0 + _THROTTLE_MS
                     log.warning(
                         f"[binance] used-weight-1m={_used_weight_1m} >= soft {_WEIGHT_SOFT_LIMIT} "
@@ -226,13 +288,14 @@ async def _signed_request(method: str, path: str, params: Optional[dict] = None)
             if ban_ms <= 0 and r.status_code in (418, 429):
                 ban_ms = now_ms + _RATE_LIMIT_COOLDOWN_MS
             if ban_ms > 0:
-                _ban_until_ms = ban_ms
+                _arm_ban(ban_ms, path)  # arma cooldown + ALERTA Telegram "bot cego"
                 err["ban_until_ms"] = ban_ms
                 log.warning(
                     f"[binance] rate-limit/ban via {path} (status={r.status_code} code={_raw_code}) "
                     f"— cooldown local até {int(ban_ms)}. Parando de chamar pra não escalar."
                 )
             return err
+        _clear_ban_if_recovered()  # 1ª chamada OK pós-ban → avisa que voltou
         return {"ok": True, "result": data, "raw": data}
     except Exception as e:
         log.exception(f"[binance] {method} {path} falhou")
@@ -392,10 +455,23 @@ _positions_cache: dict = {"ts": 0.0, "data": None}  # data = lista normalizada (
 _account_cache: dict = {"ts": 0.0, "data": None}    # data = dict de saldo já formatado
 _ban_until_ms: float = 0.0
 # ── Throttle proativo por peso (Binance fapi: hard limit ~2400/min por IP) ──
-_WEIGHT_SOFT_LIMIT = int(os.getenv("BINANCE_WEIGHT_SOFT_LIMIT", "1800"))  # ao passar, espaça chamadas
-_THROTTLE_MS = int(os.getenv("BINANCE_THROTTLE_MS", "2000"))               # janela de espaçamento
+# Postmortem 26/06: used-weight chegou a 2905 (> 2400) → -1003 / IP-ban de ~40min.
+# O espaçamento macio de 2s não segurou um burst. Defesa em 2 estágios:
+#   soft  (1500): começa a espaçar as chamadas (2s entre elas)
+#   hard  (2200): PAUSA dura — segura ~15s pra a janela rolante de 1min drenar
+#                 ANTES de chegar nos 2400 que disparam o ban. Melhor atrasar uma
+#                 ordem 15s do que ficar 40min cego.
+_WEIGHT_SOFT_LIMIT = int(os.getenv("BINANCE_WEIGHT_SOFT_LIMIT", "1500"))  # ao passar, espaça chamadas
+_WEIGHT_HARD_LIMIT = int(os.getenv("BINANCE_WEIGHT_HARD_LIMIT", "2200"))  # ao passar, PAUSA dura
+_THROTTLE_MS = int(os.getenv("BINANCE_THROTTLE_MS", "2000"))               # janela de espaçamento (soft)
+_HARD_PAUSE_MS = int(os.getenv("BINANCE_HARD_PAUSE_MS", "15000"))          # pausa dura (hard)
+_MAX_THROTTLE_SLEEP_S = _HARD_PAUSE_MS / 1000.0                            # teto do sleep proativo
 _throttle_until_ms: float = 0.0
 _used_weight_1m: int = 0
+# Alerta Telegram "bot cego": dispara 1x por janela de ban (não a cada chamada
+# bloqueada) + alerta de recuperação quando a 1ª chamada assinada volta a passar.
+_ban_alert_sent_for_ms: float = 0.0
+_ban_recovery_pending: bool = False
 
 
 def _parse_ban_until_ms(res: dict) -> float:
@@ -490,7 +566,7 @@ async def get_positions(symbol: Optional[str] = None, *, force: bool = False) ->
             return res
         ban_ms = _parse_ban_until_ms(res)
         if ban_ms > 0:
-            _ban_until_ms = ban_ms
+            _arm_ban(ban_ms, "positionRisk")  # arma + ALERTA (idempotente p/ msm janela)
             log.warning(
                 f"[binance] positionRisk rate-limit/ban detectado — cooldown até "
                 f"{int(ban_ms)} ({get_positions_ban_status()['seconds_left']}s). "
