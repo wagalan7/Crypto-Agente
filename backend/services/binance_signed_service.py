@@ -511,6 +511,68 @@ def get_positions_ban_status() -> dict:
     }
 
 
+# ─── Rate-gate COMPARTILHADO (p/ o caminho de dados PÚBLICOS no mesmo IP) ──────
+# O scan busca klines/ticker via binance_futures_service pelo MESMO proxy/IP das
+# chamadas assinadas → soma no mesmo x-mbx-used-weight-1m. Antes, esse caminho
+# público era 100% invisível ao freio: gerava a maior parte do peso E continuava
+# batendo no IP DURANTE o ban → a Binance escalava o ban (loop de horas). Estes
+# helpers deixam o caminho público: (a) RESPEITAR o ban (parar de chamar), (b)
+# compartilhar o MESMO freio de peso, (c) ARMAR o ban num 418/429.
+
+def is_banned() -> bool:
+    """True se o IP está em cooldown de ban — não deve bater na Binance."""
+    return (time.time() * 1000.0) < _ban_until_ms
+
+
+async def await_rate_gate() -> bool:
+    """Chamar ANTES de uma request pública pelo IP compartilhado.
+    Retorna False se estamos banidos (caller PULA a chamada → não escala o ban).
+    Se só throttling, dorme o necessário e retorna True."""
+    now_ms = time.time() * 1000.0
+    if now_ms < _ban_until_ms:
+        return False
+    if now_ms < _throttle_until_ms:
+        await asyncio.sleep(min(_MAX_THROTTLE_SLEEP_S,
+                                max(0.0, (_throttle_until_ms - now_ms) / 1000.0)))
+    return True
+
+
+def record_external_weight(used_weight_1m) -> None:
+    """Registra o x-mbx-used-weight-1m de uma resposta PÚBLICA (klines/ticker) e
+    arma soft/hard throttle igual ao caminho assinado — o peso público deixa de
+    ser invisível ao controle."""
+    global _used_weight_1m, _throttle_until_ms
+    if used_weight_1m is None:
+        return
+    try:
+        _used_weight_1m = int(used_weight_1m)
+    except (TypeError, ValueError):
+        return
+    now_ms = time.time() * 1000.0
+    if _used_weight_1m >= _WEIGHT_HARD_LIMIT:
+        _throttle_until_ms = now_ms + _HARD_PAUSE_MS
+        log.warning(f"[binance] (público) used-weight-1m={_used_weight_1m} >= HARD "
+                    f"{_WEIGHT_HARD_LIMIT} — PAUSA dura {_HARD_PAUSE_MS}ms")
+    elif _used_weight_1m >= _WEIGHT_SOFT_LIMIT:
+        _throttle_until_ms = now_ms + _THROTTLE_MS
+
+
+def arm_ban_external(status_code: int, retry_after_s=None, origin: str = "público") -> None:
+    """O caminho público recebeu 418/429 → arma o MESMO cooldown de ban (+ alerta
+    Telegram), pra todo o app parar de bater no IP."""
+    now_ms = time.time() * 1000.0
+    ban_ms = 0.0
+    try:
+        if retry_after_s and float(retry_after_s) > 0:
+            ban_ms = now_ms + float(retry_after_s) * 1000.0
+    except (TypeError, ValueError):
+        ban_ms = 0.0
+    if ban_ms <= 0 and status_code in (418, 429):
+        ban_ms = now_ms + _RATE_LIMIT_COOLDOWN_MS
+    if ban_ms > 0:
+        _arm_ban(ban_ms, origin)
+
+
 def _filter_positions(data, symbol: Optional[str]):
     if not symbol:
         return list(data)

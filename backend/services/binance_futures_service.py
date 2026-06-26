@@ -33,6 +33,7 @@ FAPI_BASE = "https://fapi.binance.com"
 
 TOP_VOLUME_TTL = 120
 TICKER_TTL = 60
+OHLCV_TTL = float(os.getenv("BINANCE_OHLCV_TTL", "60"))  # cache klines (corta dup intra-scan)
 PERP_BASES_TTL = 3600  # universo de perps muda devagar; 1h de cache basta
 
 _BLACKLIST_BASES = {
@@ -43,6 +44,7 @@ _BLACKLIST_BASES = {
 _client: Optional[httpx.AsyncClient] = None
 _top_cache: Dict[str, tuple] = {}
 _ticker_cache: Dict[str, tuple] = {}
+_ohlcv_cache: Dict[str, tuple] = {}
 _perp_bases_cache: Dict[str, tuple] = {}
 
 
@@ -58,6 +60,39 @@ def _get_client() -> httpx.AsyncClient:
             kwargs["proxy"] = PROXY_URL  # forward proxy (mesmo padrão do signed_service)
         _client = httpx.AsyncClient(**kwargs)
     return _client
+
+
+async def _proxied_get(url: str, params: Optional[dict] = None) -> httpx.Response:
+    """GET pelo proxy compartilhado COM o rate-gate do binance_signed_service.
+    Este caminho público (klines/ticker) sai pelo MESMO IP das chamadas
+    assinadas, então PRECISA respeitar o mesmo controle de peso/ban — senão
+    estoura o limite do IP e escala o ban (era a causa raiz do loop de ban).
+
+      - banido → levanta RuntimeError (caller cai no fallback vision/spot e NÃO
+        bate no IP banido);
+      - throttling → dorme o necessário antes de chamar;
+      - 418/429 → arma o ban global (+ alerta) e levanta;
+      - sempre registra o x-mbx-used-weight-1m no freio compartilhado.
+    """
+    from services import binance_signed_service as _signed
+    if not await _signed.await_rate_gate():
+        raise RuntimeError("rate-limit ban ativo — pulando chamada pública (anti-escalada)")
+    r = await _get_client().get(url, params=params)
+    try:
+        uw = r.headers.get("x-mbx-used-weight-1m") or r.headers.get("X-MBX-USED-WEIGHT-1M")
+        _signed.record_external_weight(uw)
+    except Exception:  # noqa: BLE001
+        pass
+    if r.status_code in (418, 429):
+        retry_after = None
+        try:
+            retry_after = float(r.headers.get("Retry-After") or 0) or None
+        except (TypeError, ValueError):
+            retry_after = None
+        _signed.arm_ban_external(r.status_code, retry_after, origin="público")
+        raise RuntimeError(f"rate-limit {r.status_code} no caminho público — ban armado")
+    r.raise_for_status()
+    return r
 
 
 def to_fut(symbol: str) -> str:
@@ -90,9 +125,7 @@ async def fetch_top_volume_symbols(limit: int = 40) -> List[str]:
         if now - ts < TOP_VOLUME_TTL:
             return data
 
-    client = _get_client()
-    r = await client.get(f"{FAPI_BASE}/fapi/v1/ticker/24hr")
-    r.raise_for_status()
+    r = await _proxied_get(f"{FAPI_BASE}/fapi/v1/ticker/24hr")
     rows = r.json()
 
     usdt_rows = []
@@ -121,16 +154,21 @@ async def fetch_top_volume_symbols(limit: int = 40) -> List[str]:
 
 
 async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
-    """OHLCV da Binance Futures."""
+    """OHLCV da Binance Futures (klines). Cache curto (OHLCV_TTL) corta klines
+    redundantes no mesmo ciclo de scan (ex.: best-TF + análise pegam o mesmo
+    symbol/TF), aliviando o peso no IP compartilhado."""
     if not PROXY_ENABLED:
         raise RuntimeError("BINANCE_PROXY_URL não configurado")
     fut_sym = to_fut(symbol)
-    client = _get_client()
-    r = await client.get(
+    cache_key = f"{fut_sym}|{timeframe}|{limit}"
+    now = time.time()
+    hit = _ohlcv_cache.get(cache_key)
+    if hit and (now - hit[0]) < OHLCV_TTL:
+        return hit[1].copy()
+    r = await _proxied_get(
         f"{FAPI_BASE}/fapi/v1/klines",
         params={"symbol": fut_sym, "interval": timeframe, "limit": limit},
     )
-    r.raise_for_status()
     rows = r.json()
     if not rows:
         return pd.DataFrame()
@@ -140,10 +178,12 @@ async def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300) -> pd.DataF
         "taker_buy_base", "taker_buy_quote", "ignore",
     ])
     df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-    return df.astype({
+    df = df.astype({
         "timestamp": int, "open": float, "high": float,
         "low": float, "close": float, "volume": float,
     })
+    _ohlcv_cache[cache_key] = (now, df)
+    return df.copy()
 
 
 async def fetch_ticker(symbol: str) -> Dict:
@@ -155,11 +195,9 @@ async def fetch_ticker(symbol: str) -> Dict:
         ts, data = _ticker_cache[fut_sym]
         if now - ts < TICKER_TTL:
             return data
-    client = _get_client()
-    r = await client.get(
+    r = await _proxied_get(
         f"{FAPI_BASE}/fapi/v1/ticker/24hr", params={"symbol": fut_sym}
     )
-    r.raise_for_status()
     j = r.json()
     out = {
         "symbol": symbol,
@@ -178,11 +216,9 @@ async def fetch_funding_rate(symbol: str) -> Optional[float]:
         return None
     fut_sym = to_fut(symbol)
     try:
-        client = _get_client()
-        r = await client.get(
+        r = await _proxied_get(
             f"{FAPI_BASE}/fapi/v1/premiumIndex", params={"symbol": fut_sym}
         )
-        r.raise_for_status()
         j = r.json()
         return float(j.get("lastFundingRate", 0))
     except Exception:
@@ -194,11 +230,9 @@ async def fetch_open_interest(symbol: str) -> Optional[float]:
         return None
     fut_sym = to_fut(symbol)
     try:
-        client = _get_client()
-        r = await client.get(
+        r = await _proxied_get(
             f"{FAPI_BASE}/fapi/v1/openInterest", params={"symbol": fut_sym}
         )
-        r.raise_for_status()
         j = r.json()
         return float(j.get("openInterest", 0))
     except Exception:
