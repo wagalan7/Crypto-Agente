@@ -1012,13 +1012,28 @@ async def check_open_snapshots() -> int:
                     # resolver por preço: encerra como expired (sem dados) e
                     # segue. Indisponibilidade transitória (símbolo no universo,
                     # candle vazio pontual) cai no continue normal e tenta de novo.
+                    # IMPORTANTE: o bot OPERA Binance Futures. O universo de
+                    # elegibilidade-a-void DEVE ser o da Binance, não o da OKX:
+                    # alts Binance-native (ex.: MTL) muitas vezes NÃO existem na
+                    # OKX, então usar get_perpetual_symbols() (OKX) marcava esses
+                    # perps válidos como "fora do universo" e os VOIDAVA falso —
+                    # pior ainda durante um ban Binance (resolver fallback vazio →
+                    # df.empty). Aqui cruzamos com o set de perps TRADING da
+                    # Binance (cache 1h + snapshot fallback, resiliente a ban):
+                    # só voida se o símbolo confirmadamente NÃO é perp Binance
+                    # (delistado de verdade). Perp Binance válido = transitório →
+                    # cai no continue e tenta de novo no próximo ciclo.
                     unavailable = False
                     try:
-                        from services.binance_service import get_perpetual_symbols
-                        universe = set(await get_perpetual_symbols())
-                        unavailable = bool(universe) and snap.symbol not in universe
+                        from services.binance_futures_service import fetch_perp_tradeable_bases
+                        bases = await fetch_perp_tradeable_bases()
+                        if bases:
+                            base = snap.symbol.split("/")[0].split(":")[0].upper()
+                            if base.startswith("1000") and len(base) > 4:
+                                base = base[4:]
+                            unavailable = base not in bases
                     except Exception as e:
-                        log.warning(f"[no-data] checar universo {snap.symbol} falhou: {e}")
+                        log.warning(f"[no-data] checar universo Binance {snap.symbol} falhou: {e}")
                     if unavailable:
                         snap.status = "expired"
                         snap.realized_r = 0.0
@@ -1026,8 +1041,8 @@ async def check_open_snapshots() -> int:
                         snap.last_check_at = now
                         log.warning(
                             f"[no-data] {snap.symbol} {snap.timeframe} {snap.direction} "
-                            f"encerrado expired: fora do universo da fonte "
-                            f"(sem preço pra resolver outcome)"
+                            f"encerrado expired: NÃO é perp TRADING na Binance "
+                            f"(delistado — sem preço pra resolver outcome)"
                         )
                         resolved += 1
                     continue
