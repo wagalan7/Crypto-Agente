@@ -180,12 +180,13 @@ def _arm_ban(ban_ms: float, origin: str) -> None:
         _ban_alert_sent_for_ms = ban_ms
         try:
             import datetime as _dt
-            until = _dt.datetime.fromtimestamp(ban_ms / 1000.0, tz=_dt.timezone.utc)
+            _BRT = _dt.timezone(_dt.timedelta(hours=-3))  # America/Sao_Paulo (sem DST)
+            until = _dt.datetime.fromtimestamp(ban_ms / 1000.0, tz=_BRT)
             mins = max(0.0, (ban_ms - time.time() * 1000.0) / 60000.0)
             _fire_telegram(
                 f"\u26A0\uFE0F *Bot cego \u2014 rate-limit Binance*\n"
                 f"used-weight estourou o teto (\u2248{_used_weight_1m}/min). A Binance "
-                f"baniu o IP via `{origin}` at\u00E9 *{until.strftime('%H:%M')} UTC* "
+                f"baniu o IP via `{origin}` at\u00E9 *{until.strftime('%H:%M')} BRT* "
                 f"(~{mins:.0f}min).\n"
                 f"\U0001F6D1 *Monitoramento e autocura PAUSADOS* \u2014 sem leitura de "
                 f"posi\u00E7\u00F5es/ordens. Fechamentos e pernas faltantes ser\u00E3o "
