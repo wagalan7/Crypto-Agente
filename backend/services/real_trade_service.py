@@ -245,7 +245,24 @@ async def close_trade(
             f"[real-trade] CLOSE #{trade.id} {trade.symbol} → status={status} "
             f"R={realized_r} pnl=${pnl_usd:.2f} ({pnl_pct:+.2f}%)"
         )
-        return _to_dict(trade)
+        rec_id = trade.recommendation_id
+        closed_at = trade.closed_at
+        result = _to_dict(trade)
+
+    # Reconcilia o snapshot ligado com o desfecho REAL (fora da sessão acima pra
+    # não aninhar transações). O trade real é ground truth: corrige o caso do
+    # snapshot marcado "expirado/0R" (rastreador cego no ban) quando na verdade
+    # a posição bateu o stop. Fail-safe: nunca quebra o fechamento.
+    if rec_id:
+        try:
+            from services import snapshot_service
+            await snapshot_service.reconcile_snapshot_from_real_trade(
+                rec_id, status, exit_price=exit_price,
+                outcome_at=closed_at, real_realized_r=realized_r,
+            )
+        except Exception as e:
+            log.warning(f"[real-trade] reconcile snapshot #{rec_id} falhou: {e}")
+    return result
 
 
 # ─── Reads ────────────────────────────────────────────────────────────────────

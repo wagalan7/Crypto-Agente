@@ -701,6 +701,71 @@ async def expire_open_snapshot(symbol: str, direction: str, reason: str = "flip_
         return 0
 
 
+# Mapa status do trade REAL → (status snapshot, realized_r na convenção snapshot)
+_REAL_TO_SNAP_OUTCOME = {
+    "closed_stop": ("lost", REALIZED_R_STOP),
+    "closed_tp2": ("won_tp2", REALIZED_R_TP2),
+    "closed_tp1": ("won_tp1", REALIZED_R_TP1),
+    "closed_be": ("won_tp1_be", REALIZED_R_BREAKEVEN),
+}
+
+
+async def reconcile_snapshot_from_real_trade(
+    rec_id: Optional[int],
+    real_status: str,
+    exit_price: Optional[float] = None,
+    outcome_at: Optional[datetime] = None,
+    real_realized_r: Optional[float] = None,
+) -> bool:
+    """Quando uma perna REAL fecha, propaga o desfecho de verdade pro snapshot
+    ligado (real_trades.recommendation_id → recommendation_snapshots.id).
+
+    O trade real é GROUND TRUTH: corrige o caso em que o rastreador de preço
+    ficou cego (ex.: ban da Binance → 5m vazio → snapshot caiu em 'expired/0R')
+    enquanto a posição real bateu o stop. Sem isto, o painel mostrava
+    "expirado +0.00%" escondendo um stop loss real.
+
+    Sobrescreve o snapshot SÓ se o desfecho mudar (real manda). Retorna True se
+    atualizou. Fail-safe: qualquer erro é engolido (não quebra o close_trade)."""
+    if not DB_ENABLED or not rec_id:
+        return False
+    mapped = _REAL_TO_SNAP_OUTCOME.get(real_status)
+    if mapped is None:
+        # closed_manual / desconhecido: deriva pelo sinal do R real medido.
+        if real_realized_r is None:
+            return False
+        if real_realized_r <= -0.02:
+            mapped = ("lost", REALIZED_R_STOP)
+        elif real_realized_r >= 0.02:
+            mapped = ("won_tp1_be", REALIZED_R_BREAKEVEN)
+        else:
+            return False  # ~breakeven cru → deixa o snapshot como está
+    snap_status, snap_r = mapped
+    try:
+        async with get_session() as session:
+            snap = (await session.execute(
+                select(RecommendationSnapshot).where(RecommendationSnapshot.id == rec_id)
+            )).scalar_one_or_none()
+            if snap is None or snap.status == snap_status:
+                return False
+            prev = snap.status
+            snap.status = snap_status
+            snap.realized_r = snap_r
+            if exit_price and exit_price > 0:
+                snap.outcome_price = exit_price
+            snap.outcome_at = outcome_at or snap.outcome_at or datetime.now(timezone.utc)
+            snap.last_check_at = datetime.now(timezone.utc)
+            await session.commit()
+        log.info(
+            f"[reconcile] snapshot #{rec_id} {prev} → {snap_status} "
+            f"(trade real {real_status}, R={snap_r}) — corrige rótulo pelo desfecho real"
+        )
+        return True
+    except Exception as e:
+        log.warning(f"[reconcile] snapshot #{rec_id} falhou ({real_status}): {e}")
+        return False
+
+
 async def filter_keys_with_open_snapshot(keys) -> set:
     """Dado um iterável de chaves (symbol, timeframe, direction), retorna o
     SUBCONJUNTO que tem um snapshot 'open' agora no DB.
