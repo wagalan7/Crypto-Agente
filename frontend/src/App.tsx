@@ -509,7 +509,7 @@ export default function App() {
   const ScannerPanel = (
     <div className="flex flex-col h-full overflow-hidden bg-[#0a0e1a]">
       {/* Sub-header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800/50 flex-shrink-0">
+      <div className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-between sm:gap-2 px-3 py-2 border-b border-slate-800/50 flex-shrink-0">
         <div className="flex items-center gap-2 flex-shrink-0">
           <img src="/logo.jpg" alt="Crypto Win" className="w-7 h-7 rounded-md object-cover border border-yellow-500/40 shadow-[0_0_8px_rgba(234,179,8,0.25)]" />
           <div className="flex flex-col leading-tight">
@@ -521,8 +521,8 @@ export default function App() {
           </div>
         </div>
         <span className="text-slate-500 text-xs flex-shrink-0 hidden sm:block">{assets.length} pares</span>
-        {/* Mobile: fileira de menus rola na horizontal (todos alcançáveis); desktop mantém alinhado à direita sem scroll */}
-        <div className="flex items-center gap-1.5 flex-1 min-w-0 overflow-x-auto justify-start sm:overflow-visible sm:justify-end [&>*]:flex-shrink-0">
+        {/* Mobile: fileira de menus em linha própria abaixo do logo, rola na horizontal (todos alcançáveis, sem sobrepor o logo); desktop mantém em linha única alinhado à direita sem scroll */}
+        <div className="flex items-center gap-1.5 w-full sm:w-auto min-w-0 overflow-x-auto justify-start sm:overflow-visible sm:justify-end [&>*]:flex-shrink-0">
           <button
             onClick={() => setShowRecommendations(true)}
             className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-yellow-500/20 to-emerald-500/20 hover:from-yellow-500/30 hover:to-emerald-500/30 border border-yellow-500/40 rounded text-xs font-bold text-yellow-300"
