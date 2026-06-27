@@ -510,7 +510,7 @@ export default function App() {
     <div className="flex flex-col h-full overflow-hidden bg-[#0a0e1a]">
       {/* Sub-header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800/50 flex-shrink-0">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-shrink-0">
           <img src="/logo.jpg" alt="Crypto Win" className="w-7 h-7 rounded-md object-cover border border-yellow-500/40 shadow-[0_0_8px_rgba(234,179,8,0.25)]" />
           <div className="flex flex-col leading-tight">
             <span className="text-sm font-bold bg-gradient-to-r from-yellow-300 to-emerald-300 bg-clip-text text-transparent">Crypto Win</span>
@@ -520,8 +520,9 @@ export default function App() {
             </span>
           </div>
         </div>
-        <span className="text-slate-500 text-xs">{assets.length} pares</span>
-        <div className="flex items-center gap-1.5">
+        <span className="text-slate-500 text-xs flex-shrink-0 hidden sm:block">{assets.length} pares</span>
+        {/* Mobile: fileira de menus rola na horizontal (todos alcançáveis); desktop mantém alinhado à direita sem scroll */}
+        <div className="flex items-center gap-1.5 flex-1 min-w-0 overflow-x-auto justify-start sm:overflow-visible sm:justify-end [&>*]:flex-shrink-0">
           <button
             onClick={() => setShowRecommendations(true)}
             className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-yellow-500/20 to-emerald-500/20 hover:from-yellow-500/30 hover:to-emerald-500/30 border border-yellow-500/40 rounded text-xs font-bold text-yellow-300"
