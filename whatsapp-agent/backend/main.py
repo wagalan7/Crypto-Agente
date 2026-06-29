@@ -1613,15 +1613,92 @@ def dash_set_patient_price(phone: str, body: PatientPriceBody, request: Request)
     return {"status": "ok"}
 
 @app.get("/dashboard/api/patients/{phone}/billing-info")
-def dash_patient_billing_info(phone: str, request: Request):
+def dash_patient_billing_info(phone: str, request: Request, month: str | None = None):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
     phone = _norm_phone(phone)
     patient = db.get_patient(tenant["id"], phone)
+    # Override do mês (se informado) — ajuste manual de valor combinado
+    override = None
+    if month:
+        ov = db.get_billing_override(tenant["id"], phone, month)
+        if ov:
+            override = {"total_amount": ov["total_amount"], "note": ov.get("note", "")}
     return {
         "session_price": patient["session_price"] if patient else 0,
         "email": patient["email"] if patient else "",
+        "billing_paused": bool(patient.get("billing_paused")) if patient else False,
+        "override": override,
     }
+
+
+@app.post("/dashboard/api/patients/{phone}/billing-pause")
+async def dash_patient_billing_pause(phone: str, request: Request):
+    """Pausa/retoma a cobrança automática de UM paciente (Feature: pausa individual)."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(phone)
+    body = await request.json()
+    paused = bool(body.get("paused"))
+    db.set_patient_billing_paused(tenant["id"], phone, paused)
+    logger.info(f"[{tenant['slug']}] Cobrança paciente {phone} → {'pausada' if paused else 'retomada'}")
+    return {"status": "ok", "phone": phone, "billing_paused": paused}
+
+
+@app.post("/dashboard/api/patients/{phone}/billing-override")
+async def dash_set_billing_override(phone: str, request: Request):
+    """Define/ajusta o valor TOTAL cobrado de um paciente num mês específico
+    (desconto combinado ou complemento de sessão). Substitui nº sessões × preço."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(phone)
+    body = await request.json()
+    month = (body.get("month") or "").strip()
+    if not month or len(month) != 7:
+        raise HTTPException(status_code=400, detail="Mês inválido (use YYYY-MM).")
+    try:
+        total = float(body.get("total_amount"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Valor total inválido.")
+    if total < 0:
+        raise HTTPException(status_code=400, detail="Valor não pode ser negativo.")
+    note = "".join(ch for ch in (body.get("note") or "") if ch.isprintable()).strip()[:200]
+    db.set_billing_override(tenant["id"], phone, month, total, note)
+    logger.info(f"[{tenant['slug']}] Override cobrança {phone} {month} → R${total:.2f}")
+    return {"status": "ok", "phone": phone, "month": month, "total_amount": total, "note": note}
+
+
+@app.delete("/dashboard/api/patients/{phone}/billing-override")
+def dash_delete_billing_override(phone: str, request: Request, month: str):
+    """Remove o ajuste manual de valor — volta ao cálculo padrão."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(phone)
+    db.delete_billing_override(tenant["id"], phone, month)
+    return {"status": "ok", "phone": phone, "month": month}
+
+
+@app.delete("/dashboard/api/patients/{phone}")
+def dash_delete_patient(phone: str, request: Request):
+    """Exclui DEFINITIVAMENTE um paciente (caso de desistência): conversas,
+    agendamentos, cadastro, pausas e overrides. Preserva o histórico financeiro
+    já enviado (billing_logs)."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    # Mantém o telefone cru (como gravado) — delete_patient_completely casa variantes
+    removed = db.delete_patient_completely(tenant["id"], phone)
+    logger.info(f"[{tenant['slug']}] 🗑 Paciente excluído {phone} → {removed}")
+    return {"status": "ok", "phone": phone, "removed": removed}
+
+
+@app.delete("/dashboard/api/conversation/{phone}")
+def dash_clear_conversation(phone: str, request: Request):
+    """Apaga SOMENTE as mensagens da conversa (mantém paciente/agendamentos)."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    db.clear_conversation(tenant["id"], phone)
+    logger.info(f"[{tenant['slug']}] 🧹 Conversa apagada {phone}")
+    return {"status": "ok", "phone": phone}
 
 @app.get("/dashboard/api/stats")
 def dash_stats(request: Request, month: str | None = None):
@@ -1718,6 +1795,26 @@ async def dash_billing_run(request: Request):
     month_str = body.get("month")  # "2026-05" or None for current
     results = await scheduler.run_billing_now(tenant["id"], month_str)
     return {"results": results, "total_sent": sum(1 for r in results if r["sent"])}
+
+
+@app.get("/dashboard/api/billing/pause-status")
+def dash_billing_pause_status(request: Request):
+    """Estado da pausa GLOBAL de cobrança do consultório."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    return {"paused": db.is_tenant_billing_paused(tenant["id"])}
+
+
+@app.post("/dashboard/api/billing/pause")
+async def dash_billing_set_pause(request: Request):
+    """Pausa/retoma o envio de TODAS as cobranças (automáticas e manuais)."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    body = await request.json()
+    paused = bool(body.get("paused"))
+    db.set_tenant_billing_paused(tenant["id"], paused)
+    logger.info(f"[{tenant['slug']}] Cobrança global → {'pausada' if paused else 'ativa'}")
+    return {"status": "ok", "paused": paused}
 
 
 @app.post("/admin/confirmacoes/disparar")

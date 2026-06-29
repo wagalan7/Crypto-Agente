@@ -204,6 +204,10 @@ async def _run_billing():
     for tenant in tenants:
         if tenant.get("status") == "suspended" and not db.is_tenant_exempt(tenant):
             continue
+        # Pausa global de cobrança do consultório → não dispara nada
+        if db.is_tenant_billing_paused(tenant["id"]):
+            logger.info(f"[{tenant['slug']}] ⏸ Cobrança {month_str} pausada (global)")
+            continue
         patients = db.get_patients_with_price(tenant["id"])
         for patient in patients:
             phone = patient["phone"]
@@ -215,6 +219,9 @@ async def _run_billing():
             if db.is_agent_paused(tenant["id"], phone):
                 logger.info(f"[{tenant['slug']}] ⏸ Cobrança pulada (agente pausado) → {phone}")
                 continue
+            if patient.get("billing_paused") or db.is_patient_billing_paused(tenant["id"], phone):
+                logger.info(f"[{tenant['slug']}] ⏸ Cobrança pulada (paciente pausado) → {phone}")
+                continue
             sessions = db.get_valid_sessions_for_month(
                 tenant["id"], phone, month_start, month_end, now_str
             )
@@ -222,8 +229,13 @@ async def _run_billing():
                 logger.info(f"[{tenant['slug']}] Sem sessões válidas para {patient['name']} em {month_str}")
                 continue
             count = len(sessions)
-            total = count * patient["session_price"]
             patient_name = sessions[0]["patient_name"] if sessions else patient.get("name", "Paciente")
+            # Override manual do total (desconto/complemento combinado) substitui o cálculo
+            override = db.get_billing_override(tenant["id"], phone, month_str)
+            if override is not None:
+                total = float(override["total_amount"])
+            else:
+                total = count * patient["session_price"]
             msg = _billing_message(tenant, patient_name, total, count)
             sent = await wa.send_message(tenant, phone, msg)
             if sent:
@@ -246,18 +258,28 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
     tenant = db.get_tenant_by_id(tenant_id)
     if not tenant:
         return []
+    # Pausa global de cobrança → disparo manual também respeita
+    if db.is_tenant_billing_paused(tenant_id):
+        return []
     patients = db.get_patients_with_price(tenant_id)
     results = []
     for patient in patients:
         phone = patient["phone"]
         if not phone:
             continue
+        # Pausa individual de cobrança do paciente
+        if patient.get("billing_paused") or db.is_patient_billing_paused(tenant_id, phone):
+            continue
         sessions = db.get_valid_sessions_for_month(tenant_id, phone, month_start, month_end, now_str)
         if not sessions:
             continue
         count = len(sessions)
-        total = count * patient["session_price"]
         patient_name = sessions[0]["patient_name"] if sessions else patient.get("name", "Paciente")
+        override = db.get_billing_override(tenant_id, phone, month_str)
+        if override is not None:
+            total = float(override["total_amount"])
+        else:
+            total = count * patient["session_price"]
         msg = _billing_message(tenant, patient_name, total, count)
         sent = await wa.send_message(tenant, phone, msg)
         if sent:

@@ -124,6 +124,21 @@ def init_db():
                 last_checked TEXT,
                 last_error   TEXT DEFAULT ''
             );
+
+            -- Ajuste manual do valor total cobrado de um paciente num mês
+            -- específico (ex.: desconto combinado ou complemento de sessão).
+            -- Quando existe override para (tenant, phone, month), ele SUBSTITUI
+            -- o cálculo padrão (nº de sessões × valor da sessão) na cobrança.
+            CREATE TABLE IF NOT EXISTS billing_overrides (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id    INTEGER NOT NULL,
+                phone        TEXT NOT NULL,
+                month        TEXT NOT NULL,          -- 'YYYY-MM'
+                total_amount REAL NOT NULL DEFAULT 0,
+                note         TEXT DEFAULT '',
+                updated_at   TEXT DEFAULT (datetime('now')),
+                UNIQUE(tenant_id, phone, month)
+            );
         """)
         # Migrações incrementais — seguro rodar múltiplas vezes
         migrations = [
@@ -182,6 +197,10 @@ def init_db():
             # Vencimento da instância Z-API do consultório (responsabilidade da
             # psicóloga) — YYYY-MM-DD. NULL = não cadastrado / não avisa.
             "ALTER TABLE tenants ADD COLUMN zapi_expires_at TEXT DEFAULT NULL",
+            # Pausar envio de cobrança — global (tenant) e por paciente.
+            # Separado de agent_paused: pausar o chat ≠ não cobrar.
+            "ALTER TABLE patients ADD COLUMN billing_paused INTEGER DEFAULT 0",
+            "ALTER TABLE tenants ADD COLUMN billing_paused INTEGER DEFAULT 0",
         ]
         for sql in migrations:
             try:
@@ -535,6 +554,158 @@ def resume_all_agents(tenant_id: int) -> int:
 def clear_conversation(tenant_id: int, phone: str):
     with get_conn() as conn:
         conn.execute("DELETE FROM conversations WHERE tenant_id = ? AND phone = ?", (tenant_id, phone))
+
+
+def _phone_variants(phone: str) -> set[str]:
+    """Variantes plausíveis de um número BR (com/sem DDI 55 e dígito 9 extra).
+    Usado para casar registros mesmo quando gravados em formatos diferentes
+    (ex.: conversa veio '5541988667599' mas pause foi gravado '41988667599').
+    """
+    p = _norm_digits(phone)
+    variantes: set[str] = set()
+    if not p:
+        return variantes
+    variantes.add(p)
+    if not p.startswith("55") and len(p) >= 10:
+        variantes.add("55" + p)
+    if p.startswith("55") and len(p) >= 12:
+        variantes.add(p[2:])
+    extra: set[str] = set()
+    for v in list(variantes):
+        if v.startswith("55") and len(v) == 13 and v[4] == "9":
+            extra.add(v[:4] + v[5:])
+        elif v.startswith("55") and len(v) == 12:
+            extra.add(v[:4] + "9" + v[4:])
+        elif len(v) == 11 and v[2] == "9":
+            extra.add(v[:2] + v[3:])
+        elif len(v) == 10:
+            extra.add(v[:2] + "9" + v[2:])
+    variantes |= extra
+    return variantes
+
+
+def delete_patient_completely(tenant_id: int, phone: str) -> dict:
+    """Exclui DEFINITIVAMENTE um paciente: conversas, agendamentos, cadastro,
+    pausas e overrides de cobrança. PRESERVA billing_logs (histórico financeiro
+    já enviado — registro contábil). Caso de desistência / LGPD.
+
+    Casa tanto o telefone exato (como gravado em conversations/appointments/
+    patients) quanto as variantes normalizadas (agent_paused guarda dígitos).
+    Retorna contagem de linhas removidas por tabela.
+    """
+    variants = _phone_variants(phone)
+    # Inclui o phone cru exatamente como veio (caso não normalize p/ dígitos)
+    all_phones = set(variants)
+    if phone:
+        all_phones.add(phone)
+    if not all_phones:
+        return {"conversations": 0, "appointments": 0, "patients": 0,
+                "agent_paused": 0, "billing_overrides": 0}
+    ph = ",".join("?" * len(all_phones))
+    params = (tenant_id, *all_phones)
+    out: dict[str, int] = {}
+    with get_conn() as conn:
+        for table in ("conversations", "appointments", "patients",
+                      "agent_paused", "billing_overrides"):
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE tenant_id = ? AND phone IN ({ph})",
+                params,
+            )
+            out[table] = cur.rowcount or 0
+    return out
+
+
+# ── Pausa de cobrança (global / por paciente) ──────────────────────────────────
+
+def set_tenant_billing_paused(tenant_id: int, paused: bool) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE tenants SET billing_paused = ? WHERE id = ?",
+            (1 if paused else 0, tenant_id),
+        )
+
+
+def is_tenant_billing_paused(tenant_id: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT billing_paused FROM tenants WHERE id = ?", (tenant_id,)
+        ).fetchone()
+    return bool(row and row["billing_paused"])
+
+
+def set_patient_billing_paused(tenant_id: int, phone: str, paused: bool) -> None:
+    """Pausa/retoma cobrança de um paciente. Garante a linha em patients
+    (faz upsert leve preservando preço/nome se já existir)."""
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO patients (tenant_id, phone, billing_paused)
+            VALUES (?, ?, ?)
+            ON CONFLICT(tenant_id, phone) DO UPDATE SET
+                billing_paused = excluded.billing_paused
+        """, (tenant_id, phone, 1 if paused else 0))
+
+
+def is_patient_billing_paused(tenant_id: int, phone: str) -> bool:
+    variants = _phone_variants(phone) or {phone}
+    if phone:
+        variants.add(phone)
+    if not variants:
+        return False
+    ph = ",".join("?" * len(variants))
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT 1 FROM patients WHERE tenant_id = ? AND phone IN ({ph}) "
+            f"AND billing_paused = 1 LIMIT 1",
+            (tenant_id, *variants),
+        ).fetchone()
+    return row is not None
+
+
+# ── Override de valor total de cobrança por mês ────────────────────────────────
+
+def set_billing_override(tenant_id: int, phone: str, month: str,
+                         total_amount: float, note: str = "") -> None:
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO billing_overrides (tenant_id, phone, month, total_amount, note, updated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(tenant_id, phone, month) DO UPDATE SET
+                total_amount = excluded.total_amount,
+                note = excluded.note,
+                updated_at = datetime('now')
+        """, (tenant_id, phone, month, float(total_amount), note))
+
+
+def get_billing_override(tenant_id: int, phone: str, month: str) -> dict | None:
+    """Override do mês para o paciente, tolerando variantes do telefone."""
+    variants = _phone_variants(phone) or {phone}
+    if phone:
+        variants.add(phone)
+    if not variants:
+        return None
+    ph = ",".join("?" * len(variants))
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT * FROM billing_overrides WHERE tenant_id = ? AND month = ? "
+            f"AND phone IN ({ph}) LIMIT 1",
+            (tenant_id, month, *variants),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_billing_override(tenant_id: int, phone: str, month: str) -> None:
+    variants = _phone_variants(phone) or {phone}
+    if phone:
+        variants.add(phone)
+    if not variants:
+        return
+    ph = ",".join("?" * len(variants))
+    with get_conn() as conn:
+        conn.execute(
+            f"DELETE FROM billing_overrides WHERE tenant_id = ? AND month = ? "
+            f"AND phone IN ({ph})",
+            (tenant_id, month, *variants),
+        )
 
 
 # ── Appointments ───────────────────────────────────────────────────────────────
