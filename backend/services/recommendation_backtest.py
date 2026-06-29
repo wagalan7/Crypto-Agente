@@ -327,6 +327,12 @@ async def load_historical_ohlcv(
     # Paginação canônica da Binance: SÓ startTime (sem endTime). Assim a API
     # devolve a partir da LISTAGEM real da moeda mesmo pedindo desde 2017 — em vez
     # de retornar vazio numa janela pré-lançamento e abortar (bug do endTime fixo).
+    # No caminho do PROXY (mesmo IP/egress do scan ao vivo), passa pelo rate-gate
+    # compartilhado: respeita o ban (pula em vez de martelar e escalar), registra
+    # o peso x-mbx-used-weight-1m e arma o ban num 418/429. Sem isto o sweep batia
+    # ungated em fapi.binance.com → saturava o egress → o scan do web pendurava E o
+    # próprio sweep estourava com fetch vazio ("candles insuficientes" = erro).
+    use_gate = _bfs.PROXY_ENABLED
     try:
         cur = start_ms
         while cur < end_ms:
@@ -335,8 +341,11 @@ async def load_historical_ohlcv(
                 "startTime": cur, "limit": page_limit,
             }
             try:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
+                if use_gate:
+                    r = await _bfs._proxied_get(url, params=params)
+                else:
+                    r = await client.get(url, params=params)
+                    r.raise_for_status()
                 rows = r.json()
             except Exception as e:
                 log.warning(f"[backtest] fetch falhou {symbol} {timeframe} @ {cur}: {e}")
@@ -406,6 +415,7 @@ async def load_historical_funding(
         client = httpx.AsyncClient(timeout=20.0)
         own_client = True
 
+    use_gate = _bfs.PROXY_ENABLED  # mesmo egress do scan ao vivo → passa no rate-gate
     try:
         cur = start_ms
         while cur < end_ms:
@@ -415,8 +425,11 @@ async def load_historical_funding(
                 "limit": 1000,
             }
             try:
-                r = await client.get(f"{base}/fapi/v1/fundingRate", params=params)
-                r.raise_for_status()
+                if use_gate:
+                    r = await _bfs._proxied_get(f"{base}/fapi/v1/fundingRate", params=params)
+                else:
+                    r = await client.get(f"{base}/fapi/v1/fundingRate", params=params)
+                    r.raise_for_status()
                 rows = r.json()
             except Exception as e:
                 log.warning(f"[backtest] funding fetch falhou {symbol} @ {cur}: {e}")

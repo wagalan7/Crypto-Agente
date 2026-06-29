@@ -604,6 +604,72 @@ async def run_universe_backtest(
     return {"ok": True, "progress": get_universe_status()}
 
 
+def _classify_bt_error(err: str) -> str:
+    """Agrupa o texto cru do erro do backtest numa categoria diagnóstica."""
+    e = (err or "").lower()
+    if "insuficiente candles" in e or "insufficient" in e:
+        return "candles_insuficientes"   # histórico curto OU fetch voltou vazio
+    if "rate-limit" in e or "ban" in e or "418" in e or "429" in e:
+        return "rate_limit_ban"          # egress estrangulado/banido
+    if "timeout" in e or "timed out" in e:
+        return "timeout_fetch"           # proxy pendurou
+    if e.startswith("crash:"):
+        return "crash"                   # exceção não tratada na varredura
+    if "451" in e or "403" in e or "geobloq" in e:
+        return "geobloqueio"
+    return "outro"
+
+
+async def get_error_breakdown(limit_samples: int = 12) -> dict:
+    """Diagnóstico dos erros do sweep: lê symbol_backtest_stats onde error != null,
+    classifica por categoria (candles_insuficientes / rate_limit_ban / timeout_fetch
+    / crash / geobloqueio / outro) e devolve contagem + amostras. Responde a pergunta
+    'os 311 erros são histórico curto legítimo OU fetch falhando?'. Leitura pura."""
+    from db import DB_ENABLED, get_session
+    from models.symbol_backtest_stats import SymbolBacktestStats
+    from sqlalchemy import select
+
+    if not DB_ENABLED:
+        return {"enabled": False}
+
+    async with get_session() as session:
+        rows = (await session.execute(
+            select(SymbolBacktestStats)
+            .where(SymbolBacktestStats.error.is_not(None))
+            .order_by(SymbolBacktestStats.computed_at.desc().nullslast())
+        )).scalars().all()
+
+    by_cat: dict = {}
+    samples: dict = {}
+    for r in rows:
+        cat = _classify_bt_error(r.error or "")
+        by_cat[cat] = by_cat.get(cat, 0) + 1
+        bucket = samples.setdefault(cat, [])
+        if len(bucket) < limit_samples:
+            bucket.append({
+                "symbol": r.symbol,
+                "timeframe": r.timeframe,
+                "candles": r.candles,
+                "error": (r.error or "")[:200],
+                "computed_at": r.computed_at.isoformat() if getattr(r, "computed_at", None) else None,
+            })
+
+    return {
+        "enabled": True,
+        "total_errors": len(rows),
+        "by_category": dict(sorted(by_cat.items(), key=lambda kv: -kv[1])),
+        "samples": samples,
+        "legenda": {
+            "candles_insuficientes": "histórico curto legítimo OU fetch voltou vazio (ver 'candles': 0 = fetch falhou; >0 = realmente curto)",
+            "rate_limit_ban": "egress estrangulado/banido pela Binance",
+            "timeout_fetch": "proxy pendurou além do timeout",
+            "crash": "exceção não tratada na varredura",
+            "geobloqueio": "IP bloqueado (451/403)",
+            "outro": "não classificado",
+        },
+    }
+
+
 async def get_ranking(
     tf: Optional[str] = None,
     min_trades: int = 30,

@@ -103,6 +103,12 @@ SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3m
 # (SERVER_SCAN_TOP_N) sem deploy. Se o ciclo ficar lento, baixar de volta.
 SERVER_SCAN_TOP_N = int(os.getenv("SERVER_SCAN_TOP_N", "60"))
 SERVER_SCAN_INITIAL_DELAY = 45    # espera 45s após startup pra não competir com init
+# Teto de tempo de UM ciclo de varredura. Se o fetch de mercado (klines via proxy)
+# pendurar, o ciclo inteiro travava sem retornar nem lançar — o heartbeat parava
+# de tickar e o watchdog disparava "Scan loop parado" por minutos a fio. Com este
+# wait_for o ciclo aborta, conta como falha e o loop se recupera no próximo ciclo
+# (90s). Fica < HEALTH_WATCHDOG_MAX_AGE_S (300s) pra cortar o hang ANTES do alerta.
+SERVER_SCAN_TIMEOUT_S = int(os.getenv("SERVER_SCAN_TIMEOUT_S", "240"))
 
 # Decouple display↔execução (default OFF → comportamento atual idêntico).
 # ON: o painel/push veem o universo AMPLO (varredura inteira, SEM portfolio_guard),
@@ -361,14 +367,23 @@ async def _server_scan_loop():
             # ON: display/push veem o universo AMPLO (sem portfolio_guard); a EXECUÇÃO
             #     (recs) usa a lista guardada → o bot só abre o subconjunto guard+allowlist.
             #     Save/snapshots seguem na lista de execução → auto-learner do PRD intocado.
+            # Teto de tempo no ciclo inteiro: se a busca de mercado pendurar (proxy
+            # lento), aborta com TimeoutError (cai no except → conta falha, loop
+            # segue) em vez de travar o heartbeat e disparar "Scan loop parado".
             if EXEC_UNIVERSE_DECOUPLE:
                 from services.recommendation_service import _apply_portfolio_guard
-                recs_display = await get_recommendations_via_vision(
-                    top_n=SERVER_SCAN_TOP_N, apply_guard=False
+                recs_display = await asyncio.wait_for(
+                    get_recommendations_via_vision(
+                        top_n=SERVER_SCAN_TOP_N, apply_guard=False
+                    ),
+                    timeout=SERVER_SCAN_TIMEOUT_S,
                 )
                 recs = await _apply_portfolio_guard(list(recs_display))
             else:
-                recs = await get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N)
+                recs = await asyncio.wait_for(
+                    get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N),
+                    timeout=SERVER_SCAN_TIMEOUT_S,
+                )
                 recs_display = recs
             recs_dict = [r.model_dump() for r in recs]
             # OFF: display == execução. ON: display amplo (pro painel/push amplo).
@@ -539,6 +554,15 @@ async def _server_scan_loop():
             _METRICS["pushes_sent_total"] += pushes_this_scan
         except asyncio.CancelledError:
             break
+        except (asyncio.TimeoutError, TimeoutError):
+            logging.warning(
+                f"[server-scan] ciclo abortado por TIMEOUT (>{SERVER_SCAN_TIMEOUT_S}s) — "
+                f"fetch de mercado pendurado; loop segue no próximo ciclo"
+            )
+            _METRICS["last_scan_at"] = datetime.now(timezone.utc).isoformat()
+            _METRICS["last_scan_ok"] = False
+            _METRICS["last_scan_error"] = f"timeout >{SERVER_SCAN_TIMEOUT_S}s na varredura"
+            _METRICS["scans_failed"] += 1
         except Exception as e:
             logging.warning(f"[server-scan] erro: {e}", exc_info=True)
             _METRICS["last_scan_at"] = datetime.now(timezone.utc).isoformat()
@@ -2385,6 +2409,15 @@ async def backtest_universe_ranking(
     Marca quem já está na allowlist e sugere candidatas à promoção. Leitura pura."""
     from services import backtest_universe_service as bus
     return await bus.get_ranking(tf=tf, min_trades=min_trades, sort=sort, limit=limit)
+
+
+@app.get("/api/backtest/universe/errors")
+async def backtest_universe_errors(limit_samples: int = 12):
+    """Diagnóstico: classifica os erros do sweep (candles_insuficientes /
+    rate_limit_ban / timeout_fetch / crash / geobloqueio) com contagem + amostras.
+    Responde 'os erros são histórico curto legítimo ou fetch falhando?'."""
+    from services import backtest_universe_service as bus
+    return await bus.get_error_breakdown(limit_samples=limit_samples)
 
 
 @app.get("/api/backtest/universe/insights")
