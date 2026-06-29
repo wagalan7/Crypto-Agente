@@ -535,7 +535,6 @@ async def save_wide_display_snapshots(recommendations: List[Dict[str, Any]]) -> 
 
     inserted = 0
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=DEDUP_WINDOW_HOURS)
     _regime_label = await _current_regime_label()  # 1x por batch (#A — audit por regime)
     # Sem rastreio (Opção B OFF): poda 'wide' aos WIDE_DISPLAY_TTL_HOURS — só a
     # dedup importa, não há outcome a guardar. Com rastreio ON: NÃO podar aos 6h,
@@ -563,13 +562,21 @@ async def save_wide_display_snapshots(recommendations: List[Dict[str, Any]]) -> 
             try:
                 # Dedup só contra OUTROS snapshots 'wide' (namespace próprio —
                 # não interage com a dedup/anti-dup do caminho de execução).
+                # SEM filtro de janela (created_at >= cutoff): basta existir UMA
+                # linha wide AINDA VIVA do mesmo (symbol, tf, direction) pra
+                # bloquear o re-push. Bug do ORCL: a janela era 2h mas a linha só
+                # é podada às WIDE_DISPLAY_TTL_HOURS (6h) — entre 2h e 6h a dedup
+                # "expirava" e re-empurrava o MESMO setup a cada ~2h. Espelha o
+                # lane de EXECUÇÃO, onde o snapshot OPEN segura o re-push pelo
+                # time-stop inteiro. Linhas RESOLVIDAS mudam de status (wide_*)
+                # ⇒ deixam de casar com WIDE_DISPLAY_STATUS ⇒ liberam novo push.
+                # O prune no topo desta função remove as velhas (TTL/expiry).
                 stmt = select(RecommendationSnapshot.id).where(
                     and_(
                         RecommendationSnapshot.symbol == rec["symbol"],
                         RecommendationSnapshot.timeframe == rec["timeframe"],
                         RecommendationSnapshot.direction == rec["direction"],
                         RecommendationSnapshot.status == WIDE_DISPLAY_STATUS,
-                        RecommendationSnapshot.created_at >= cutoff,
                     )
                 ).limit(1)
                 if (await session.execute(stmt)).scalar_one_or_none():
