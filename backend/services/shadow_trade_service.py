@@ -1334,6 +1334,12 @@ def env_info() -> dict:
         "sizing_mode": "live (aborta se equity real indisponível em modo live)",
         "min_notional_usd": MIN_NOTIONAL_USD,
         "max_risk_pct_hard": MAX_RISK_PCT_HARD,
+        # Filler FORA (allowlist) — visível pra auditar size/teto/breaker ao vivo
+        "filler_fora_enabled": FILLER_FORA_ENABLED,
+        "filler_fora_size_mult": FILLER_FORA_SIZE_MULT,
+        "filler_fora_max": FILLER_FORA_MAX,
+        "filler_fora_off_at": FILLER_FORA_OFF_AT,
+        "filler_fora_stop_streak": FILLER_FORA_STOP_STREAK,
         "max_margin_pct_per_trade": MAX_MARGIN_PCT_PER_TRADE,
         "max_total_notional_pct": MAX_TOTAL_NOTIONAL_PCT,
         "max_total_margin_pct": MAX_TOTAL_MARGIN_PCT,
