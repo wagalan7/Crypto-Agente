@@ -45,6 +45,50 @@ try:
 except (TypeError, ValueError):
     PUSH_BATCH_CAP = 5
 
+# ── Dedup de PUSH por setup (anti-duplicata) ─────────────────────────────────
+# Bug: o MESMO setup é salvo por DOIS caminhos de scan com status diferentes
+# (universo amplo → "wide"; execução → "open"). O dedup do snapshot_service
+# ignora o "wide" (status != WIDE_DISPLAY_STATUS), então o save "open" re-insere
+# → _just_saved=True nos DOIS → DOIS pushes idênticos (mesmo entry/score) com
+# minutos de diferença. Aqui guardamos um ledger em memória por
+# (symbol, tf, direction): dentro da janela, só re-empurra se for sinal MAIS
+# FORTE marcado (_superseded_stronger). Reset no redeploy = no máx. 1 push extra
+# após deploy (aceitável). Janela espelha DEDUP_WINDOW_HOURS do snapshot_service.
+try:
+    from services.snapshot_service import DEDUP_WINDOW_HOURS as _SNAP_DEDUP_H
+    _PUSH_DEDUP_TTL_S = max(60, int(_SNAP_DEDUP_H) * 3600)
+except Exception:
+    _PUSH_DEDUP_TTL_S = 2 * 3600
+_PUSH_LEDGER: Dict[str, float] = {}   # "SYMBOL|tf|DIR" → epoch do último push
+
+
+def _push_dedup_key(rec: Dict[str, Any]) -> str:
+    sym = (rec.get("symbol") or "").upper()
+    tf = rec.get("timeframe") or ""
+    direction = (rec.get("direction") or "").upper()
+    return f"{sym}|{tf}|{direction}"
+
+
+def _push_recently_sent(rec: Dict[str, Any]) -> bool:
+    """True se este setup já recebeu push dentro da janela (e não é override
+    explícito de sinal mais forte). Faz GC preguiçoso das entradas vencidas."""
+    if rec.get("_superseded_stronger"):
+        return False   # re-push intencional de sinal mais forte sempre passa
+    import time as _t
+    now = _t.time()
+    # GC preguiçoso pra não vazar memória num processo de vida longa.
+    if len(_PUSH_LEDGER) > 2000:
+        for k, ts in list(_PUSH_LEDGER.items()):
+            if now - ts > _PUSH_DEDUP_TTL_S:
+                _PUSH_LEDGER.pop(k, None)
+    ts = _PUSH_LEDGER.get(_push_dedup_key(rec))
+    return ts is not None and (now - ts) < _PUSH_DEDUP_TTL_S
+
+
+def _mark_push_sent(rec: Dict[str, Any]) -> None:
+    import time as _t
+    _PUSH_LEDGER[_push_dedup_key(rec)] = _t.time()
+
 if PUSH_ENABLED:
     try:
         from pywebpush import webpush, WebPushException  # type: ignore
@@ -217,6 +261,14 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
     if tier == "B" and not PUSH_TIER_B_ENABLED:
         return 0  # gate global: tier B não dispara push
 
+    # Dedup de setup: bloqueia o 2º push idêntico (wide+open) na janela.
+    if _push_recently_sent(rec):
+        log.info(
+            f"[push-dedup] {rec.get('symbol')} {rec.get('timeframe')} "
+            f"{rec.get('direction')} já empurrado na janela — push suprimido"
+        )
+        return 0
+
     # Filtro: quais subs querem esse tier?
     field_map = {"A+": "notify_a_plus", "A": "notify_a", "B": "notify_b"}
     filter_field = field_map[tier]
@@ -297,6 +349,7 @@ async def notify_new_recommendation(rec: Dict[str, Any]) -> int:
 
     sent = await _fanout_push(subs, payload)
     if sent:
+        _mark_push_sent(rec)   # registra no ledger p/ dedup do 2º caminho de scan
         log.info(f"Push enviado pra {sent} device(s) — {tier} {symbol_short}")
     return sent
 

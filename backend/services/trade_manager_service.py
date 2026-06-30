@@ -410,6 +410,7 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
     """Detectou qty=0 na exchange → marca trade fechado. Usa mark price atual como exit."""
     from services import real_trade_service, exchange_service
     exit_price = None
+    exit_from_fill = False
 
     # 1. Preço de saída REAL: último fill no lado de fechamento. Mais preciso
     #    que estimar por planned_stop/tp2 — e corrige o PnL $0,00 que acontecia
@@ -426,6 +427,7 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
             if fills:
                 latest = max(fills, key=lambda f: int(f.get("time") or 0))
                 exit_price = float(latest["price"])
+                exit_from_fill = True
                 log.info(f"[trade-manager] exit real #{trade.id} via fill: {exit_price}")
     except Exception as e:
         log.warning(f"[trade-manager] exit real via fills #{trade.id} falhou: {e}")
@@ -439,25 +441,40 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
         else:
             exit_price = trade.entry_price
 
-    # ── Classificação refinada (post_tp1) ────────────────────────────────
-    # O caller passa "tp2" pra qualquer fechamento em post_tp1, mas pode ter
-    # sido BE ou SL. Se temos exit real, reclassifica pela proximidade: perto
-    # do TP2 = tp2; perto do entry = be (lucro≥0) ou stop (lucro<0). Mantém a
-    # atribuição de P&L correta no dashboard.
-    if reason == "tp2" and exit_price and exit_price > 0 and trade.entry_price and trade.entry_price > 0:
+    # ── Reclassificação pelo preço de saída REAL ─────────────────────────
+    # O caller decide `reason` por HEURÍSTICA DE FASE (post_tp1→"tp2", senão
+    # "stop"). Isso erra quando TP1+TP2 preenchem ENTRE dois polls: o gestor
+    # nunca observa a parcial, a fase fica `pre_tp1` e um WIN era rotulado
+    # "Motivo: Stop" (contradizendo o PnL positivo). Com fill REAL, reclassifica
+    # pela proximidade aos níveis + sinal do PnL: lucro NUNCA é "stop"; prejuízo
+    # NUNCA é "tp1/tp2". Só roda com fill real (o fallback de nível já é
+    # autoconsistente com o reason de entrada).
+    if exit_from_fill and exit_price and exit_price > 0 and trade.entry_price and trade.entry_price > 0:
         sign = 1 if trade.side == "long" else -1
-        d_be = abs(exit_price - trade.entry_price)
-        d_tp2 = abs(exit_price - trade.planned_tp2) if trade.planned_tp2 else float("inf")
-        if d_be < d_tp2:
-            pnl_dir = (exit_price - trade.entry_price) * sign
-            reason = "be" if pnl_dir >= 0 else "stop"
+        pnl_dir = (exit_price - trade.entry_price) * sign
+        dists: dict[str, float] = {"be": abs(exit_price - trade.entry_price)}
+        if trade.planned_tp2:
+            dists["tp2"] = abs(exit_price - trade.planned_tp2)
+        if trade.planned_tp1:
+            dists["tp1"] = abs(exit_price - trade.planned_tp1)
+        if trade.planned_stop:
+            dists["stop"] = abs(exit_price - trade.planned_stop)
+        nearest = min(dists, key=lambda k: dists[k])
+        if pnl_dir >= 0 and nearest == "stop":
+            nearest = "be"          # saída lucrativa não é stop loss
+        elif pnl_dir < 0 and nearest in ("tp1", "tp2"):
+            nearest = "stop"        # saída no prejuízo não é TP
+        if nearest != reason:
             log.info(
-                f"[trade-manager] #{trade.id} reclassificado post_tp1 → {reason} "
-                f"(exit={exit_price} entry={trade.entry_price} tp2={trade.planned_tp2})"
+                f"[trade-manager] #{trade.id} reclassificado {reason}→{nearest} "
+                f"(exit={exit_price} entry={trade.entry_price} pnl_dir={pnl_dir:.6g} "
+                f"phase={getattr(trade, 'phase', '?')})"
             )
+            reason = nearest
 
     status_map = {
         "tp2": "closed_tp2",
+        "tp1": "closed_tp1",
         "stop": "closed_stop",
         "be": "closed_be",
     }
