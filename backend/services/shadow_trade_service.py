@@ -465,6 +465,25 @@ MTF_ALIGNED_MIN_COUNT = int(os.getenv("MTF_ALIGNED_MIN_COUNT", "2"))
 FUNDING_GATE_ENABLED = os.getenv("FUNDING_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 FUNDING_BLOCK_THRESHOLD = float(os.getenv("FUNDING_BLOCK_THRESHOLD", "0.05"))  # em %
 
+# ── #1 Funding-EV (harvest do edge de funding em trades DIRECIONAIS) ─────────
+# O bot já FILTRA funding extremo contra o sentiment (FUNDING_GATE acima). Este
+# bloco vai além: contabiliza o funding que a posição vai PAGAR(−) ou COLETAR(+)
+# enquanto aberta (Binance funda a cada 8h) e dobra isso na decisão:
+#   • LONG paga funding quando funding>0, coleta quando <0; SHORT o inverso.
+#   • ev_r>0 = posição COLETA funding (vento a favor); ev_r<0 = SANGRA funding.
+# É o "funding harvest" SEM precisar de spot (cash-and-carry exigiria um
+# subsistema spot novo): preferimos trades que coletam e evitamos os que sangram
+# R em funding. qty cancela na conta → independe do tamanho. Tudo default OFF:
+#   - GATE: skip se ev_r < -FUNDING_EV_MAX_DRAG_R (0 = gate desligado).
+#   - SIZE: multiplica o risco por 1 + ev_r×K, clampado [MIN, MAX].
+FUNDING_EV_ENABLED = os.getenv("FUNDING_EV_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+FUNDING_EV_HOLD_WINDOWS = float(os.getenv("FUNDING_EV_HOLD_WINDOWS", "2"))   # nº de janelas de 8h assumidas de hold
+FUNDING_EV_MAX_DRAG_R = float(os.getenv("FUNDING_EV_MAX_DRAG_R", "0.0"))     # gate: skip se ev_r < -este. 0 = OFF
+FUNDING_EV_SIZE_ENABLED = os.getenv("FUNDING_EV_SIZE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+FUNDING_EV_SIZE_K = float(os.getenv("FUNDING_EV_SIZE_K", "0.5"))             # sensibilidade do tilt de size por ev_r
+FUNDING_EV_SIZE_MIN = float(os.getenv("FUNDING_EV_SIZE_MIN", "0.85"))
+FUNDING_EV_SIZE_MAX = float(os.getenv("FUNDING_EV_SIZE_MAX", "1.15"))
+
 # ── ATR gate (Fase B Lite, postmortem N=237) ───────────────────────────────
 # atr_pct > 3% mostrou lift -10.6pp em n=36. Vol muito alta = SL voa.
 ATR_GATE_ENABLED = os.getenv("ATR_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
@@ -1736,6 +1755,33 @@ def _edge_mult(rec: dict) -> tuple[float, str]:
     return mult, f"edges={n}[{','.join(str(t) for t in tags)}]→×{mult:.2f}"
 
 
+def _funding_ev_r(rec: dict, entry: float, stop: float) -> tuple[float, float, str]:
+    """#1 — Funding-EV em R: quanto a posição PAGA(−)/COLETA(+) de funding ao
+    longo de FUNDING_EV_HOLD_WINDOWS janelas de 8h, normalizado pelo risco (R).
+
+    Mecânica Binance USDT-M: funding pago a cada 8h; funding>0 → LONG paga / SHORT
+    coleta. Pagamento por janela = notional × funding_rate. Em R (qty cancela):
+        ev_pct = funding_pct × janelas × side_sign     (% do notional)
+        ev_r   = (ev_pct/100) × (entry / |entry−stop|)
+    side_sign: long=−1 (paga quando funding>0), short=+1. Retorna (ev_r, ev_pct, reason)."""
+    funding = _get_rec_feature(rec, "funding_pct", default=None)
+    try:
+        f_pct = float(funding) if funding is not None else None
+    except Exception:
+        f_pct = None
+    if f_pct is None or not entry or not stop:
+        return 0.0, 0.0, "sem funding/preço"
+    risk_dist = abs(float(entry) - float(stop))
+    if risk_dist <= 0 or float(entry) <= 0:
+        return 0.0, 0.0, "risk_dist=0"
+    side_sign = -1.0 if rec.get("direction") == "long" else 1.0
+    ev_pct = f_pct * FUNDING_EV_HOLD_WINDOWS * side_sign           # % do notional
+    ev_r = (ev_pct / 100.0) * (float(entry) / risk_dist)
+    verb = "coleta" if ev_r >= 0 else "paga"
+    return ev_r, ev_pct, (f"funding {f_pct:+.4f}%/8h × {FUNDING_EV_HOLD_WINDOWS:g}j "
+                          f"→ {verb} {ev_r:+.3f}R")
+
+
 def _norm_sym(s: str) -> str:
     """'BTC/USDT:USDT' ou 'BTCUSDT' → 'BTCUSDT' (pra casar DB × exchange)."""
     if not s:
@@ -2992,6 +3038,23 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             entry = float(rec.get("entry") or 0)
             stop = float(rec.get("stop_loss") or 0)
             risk_pct = float(rec.get("risk_pct") or 1.0)
+            # ── #1 Funding-EV: calcula uma vez (qty-independente) e reusa no gate
+            # e no tilt de size. Stash na rec pra não recalcular. Default OFF.
+            _fund_ev_r = 0.0
+            if not SHADOW_ENABLED and FUNDING_EV_ENABLED:
+                try:
+                    _fund_ev_r, _fund_ev_pct, _fund_ev_reason = _funding_ev_r(rec, entry, stop)
+                    rec["_funding_ev_r"] = _fund_ev_r
+                    # GATE: posição vai SANGRAR funding além do teto → não vale o edge.
+                    if FUNDING_EV_MAX_DRAG_R > 0 and _fund_ev_r < -FUNDING_EV_MAX_DRAG_R:
+                        reason = (f"funding-EV {_fund_ev_r:+.3f}R < -{FUNDING_EV_MAX_DRAG_R}R "
+                                  f"({_fund_ev_reason})")
+                        log.info(f"[funding-ev] {rec.get('symbol')} {reason} — skip")
+                        _record_skip(rec, "funding-ev", reason)
+                        continue
+                except Exception as _e:
+                    log.warning(f"[funding-ev] {rec.get('symbol')} cálculo falhou: {_e}")
+                    _fund_ev_r = 0.0
             # #2a — sizing por convicção: escala o risco/trade pela P(TP1)
             # calibrada (dentro dos caps duros de _compute_qty). No-op se
             # desligado ou calibração imatura.
@@ -3013,6 +3076,19 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     f"[edge-sizing] {rec.get('symbol')} risco {_risk_before_e:.2f}% "
                     f"→ {risk_pct:.2f}% ({_edge_reason})"
                 )
+            # #1 — tilt de size por Funding-EV: aumenta quem COLETA funding,
+            # reduz quem PAGA. Compõe multiplicativo com convicção/edge; caps
+            # duros de _compute_qty mandam depois. Default OFF.
+            if not SHADOW_ENABLED and FUNDING_EV_ENABLED and FUNDING_EV_SIZE_ENABLED:
+                _fund_m = 1.0 + _fund_ev_r * FUNDING_EV_SIZE_K
+                _fund_m = max(FUNDING_EV_SIZE_MIN, min(FUNDING_EV_SIZE_MAX, _fund_m))
+                if _fund_m != 1.0:
+                    _risk_before_f = risk_pct
+                    risk_pct = round(risk_pct * _fund_m, 4)
+                    log.info(
+                        f"[funding-ev-size] {rec.get('symbol')} risco {_risk_before_f:.2f}% "
+                        f"→ {risk_pct:.2f}% (ev={_fund_ev_r:+.3f}R ×{_fund_m:.2f})"
+                    )
             equity_usd, equity_src = await _resolve_equity_usd()
             # go-live #5 — em modo LIVE, nunca dimensiona dinheiro real com
             # equity fictício. Se a exchange falhou (source="fallback"), aborta
