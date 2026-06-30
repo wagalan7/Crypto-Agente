@@ -380,6 +380,75 @@ async def _has_backtest_trades(symbol: str, tf: str) -> bool:
         return False
 
 
+async def _load_pairs_with_trades() -> set:
+    """Conjunto de (symbol, tf) que JÁ têm linhas em backtest_trades — em UMA query.
+    Usado pelo pré-load do resume p/ não fazer 1 round-trip por job."""
+    from db import get_session
+    from models.backtest_trade import BacktestTrade
+    from sqlalchemy import select
+    try:
+        async with get_session() as session:
+            rows = (await session.execute(
+                select(BacktestTrade.symbol, BacktestTrade.timeframe).distinct()
+            )).all()
+        return {(s, tf) for s, tf in rows}
+    except Exception:
+        return set()
+
+
+async def _load_fresh_pairs(symbols: set, tfs: list[str], refresh_days: int) -> set:
+    """Pré-carrega, em 1-2 queries, o conjunto de (symbol, tf) que JÁ estão frescos
+    E completos (não precisam re-rodar). Espelha a lógica de `_already_fresh`, mas
+    em LOTE.
+
+    Motivo: a cada redeploy o `_PROGRESS` zera (in-memory) e o sweep re-anda TODOS
+    os jobs chamando `_already_fresh` 1-a-1 (1 query por job) — lento e a barra
+    "reinicia do zero". Com o set pré-carregado dá pra (a) semear done/skipped na
+    posição REAL do resume e (b) pular o já-feito sem round-trip por job.
+
+    Fail-soft: em qualquer erro devolve set() → cai no caminho per-job legado."""
+    from db import get_session, DB_ENABLED
+    if not DB_ENABLED:
+        return set()
+    from models.symbol_backtest_stats import SymbolBacktestStats
+    from sqlalchemy import select
+    cutoff = datetime.now(timezone.utc) - timedelta(days=refresh_days)
+    tfset = set(tfs)
+    want = set(symbols)
+    fresh: set = set()
+    zero_trade_fresh: set = set()  # frescos com n_trades==0 → nada p/ backfill
+    try:
+        async with get_session() as session:
+            rows = (await session.execute(
+                select(
+                    SymbolBacktestStats.symbol,
+                    SymbolBacktestStats.timeframe,
+                    SymbolBacktestStats.computed_at,
+                    SymbolBacktestStats.error,
+                    SymbolBacktestStats.n_trades,
+                )
+            )).all()
+        for sym, tf, computed_at, error, n_trades in rows:
+            if sym not in want or tf not in tfset:
+                continue
+            if computed_at is None or computed_at < cutoff:
+                continue
+            if error and not n_trades:
+                continue
+            if not n_trades:
+                zero_trade_fresh.add((sym, tf))
+            fresh.add((sym, tf))
+        # Frescos com trades>0 precisam ter linhas em backtest_trades; senão re-roda
+        # (espelha o guard de `_already_fresh` linha ~406).
+        if PERSIST_BACKTEST_TRADES and (fresh - zero_trade_fresh):
+            have_trades = await _load_pairs_with_trades()
+            fresh = zero_trade_fresh | (fresh & have_trades)
+    except Exception as e:
+        log.warning(f"[bt-universe] preload fresh falhou ({e}); fallback per-job")
+        return set()
+    return fresh
+
+
 async def _already_fresh(symbol: str, tf: str, refresh_days: int) -> bool:
     """True se já existe resultado de (symbol, tf) com sucesso dentro da janela."""
     from db import get_session
@@ -530,14 +599,27 @@ async def run_universe_backtest(
         if outside_n is not None and outside_n > 0:
             symbols = symbols[:outside_n]
 
+    # ── Pré-load do JÁ-FEITO (resumível sem re-andar 1-a-1) ───────────────────
+    # A cada redeploy o _PROGRESS zera. Antes o sweep re-caminhava TODOS os jobs
+    # chamando _already_fresh 1-a-1 (1 query/job) → a barra "reiniciava do zero" e
+    # demorava ~minutos só pra re-pular o já-feito. Agora carregamos o conjunto de
+    # (sym,tf) frescos numa única passada e:
+    #   • SEMEAMOS done/skipped na posição REAL (a barra reflete o resume, não 0/N);
+    #   • só ITERAMOS os jobs PENDENTES (pula o já-feito sem round-trip por job).
+    all_jobs = [(sym, tf) for sym in symbols for tf in tfs]
+    total_jobs = len(all_jobs)
+    fresh_set = await _load_fresh_pairs(set(symbols), list(tfs), refresh_days)
+    pending = [(sym, tf) for (sym, tf) in all_jobs if (sym, tf) not in fresh_set]
+    preskipped = total_jobs - len(pending)
+
     _PROGRESS.update({
         "running": True,
         "started_at": end_dt.isoformat(),
         "finished_at": None,
-        "total": len(symbols) * len(tfs),
-        "done": 0,
+        "total": total_jobs,
+        "done": preskipped,       # ← resume começa na posição real, não em 0
         "computed": 0,
-        "skipped": 0,
+        "skipped": preskipped,    # ← os já-frescos já contam como pulados
         "errors": 0,
         "current": None,
         "tfs": list(tfs),
@@ -548,12 +630,13 @@ async def run_universe_backtest(
         "offset": off,
     })
     log.info(f"[bt-universe] START mode={mode} pool={pool_n} excluded={excluded_n} "
-             f"offset={off} → {len(symbols)} símbolos × {tfs} = {len(symbols)*len(tfs)} jobs")
+             f"offset={off} → {len(symbols)} símbolos × {tfs} = {total_jobs} jobs "
+             f"(pré-pulados {preskipped} frescos, pendentes {len(pending)})")
     await _persist_progress(force=True)
 
     try:
-        for sym in symbols:
-            for tf in tfs:
+        for sym, tf in pending:
+            if True:
                 _PROGRESS["current"] = f"{sym} {tf}"
                 try:
                     if await _already_fresh(sym, tf, refresh_days):

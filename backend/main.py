@@ -3457,6 +3457,21 @@ async def admin_telegram_test():
     return {"ok": sent}
 
 
+@app.post("/api/admin/telegram-send")
+async def admin_telegram_send(msg: str, event_type: str = "admin"):
+    """Envia uma mensagem CUSTOM ao Telegram (texto livre via querystring/body).
+    Usado p/ lembretes operacionais. Retorna ok=False se Telegram nao configurado
+    ou se o texto vier vazio."""
+    from services.notification_service import send_telegram, TELEGRAM_ENABLED
+    if not TELEGRAM_ENABLED:
+        return {"ok": False, "reason": "TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID nao configurado"}
+    text = (msg or "").strip()
+    if not text:
+        return {"ok": False, "reason": "msg vazio"}
+    sent = await send_telegram(text, event_type=event_type)
+    return {"ok": sent}
+
+
 @app.post("/api/admin/test-push")
 async def admin_test_push(kind: str = "trade_open"):
     """
