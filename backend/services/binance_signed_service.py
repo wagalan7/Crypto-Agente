@@ -1009,6 +1009,206 @@ async def place_order(
     }
 
 
+async def get_order(symbol: str, order_id: Optional[str] = None, client_order_id: Optional[str] = None) -> dict:
+    """Consulta UMA ordem (GET /fapi/v1/order) — barato e preciso pra polling de
+    fill (não puxa allOrders inteiro). Retorna status/avgPrice/executedQty."""
+    sym = to_binance(symbol) if "/" in symbol else symbol
+    params = {"symbol": sym}
+    if order_id:
+        params["orderId"] = order_id
+    elif client_order_id:
+        params["origClientOrderId"] = client_order_id
+    else:
+        return {"ok": False, "error": "informe order_id ou client_order_id"}
+    res = await _signed_request("GET", "/fapi/v1/order", params)
+    if not res.get("ok"):
+        return res
+    o = res["result"] or {}
+    return {
+        "ok": True,
+        "order_id": str(o.get("orderId") or ""),
+        "client_order_id": o.get("clientOrderId"),
+        "status": o.get("status"),               # NEW|PARTIALLY_FILLED|FILLED|CANCELED|EXPIRED|REJECTED
+        "orig_qty": float(o.get("origQty") or 0),
+        "executed_qty": float(o.get("executedQty") or 0),
+        "avg_fill_price": float(o.get("avgPrice") or 0),
+        "price": float(o.get("price") or 0),
+        "type": o.get("type"),
+        "side": o.get("side"),
+        "raw": o,
+    }
+
+
+# ── Entrada MAKER (post-only) com proteção desacoplada (#4) ──────────────────
+# Defaults seguros lidos do ambiente. Tudo OFF/curto por default — quem liga é o
+# caller (shadow_trade_service) atrás de MAKER_ENTRY_ENABLED. Mainnet dinheiro
+# real: prefira fail-safe (fallback a market) a ficar pendurado sem entrada.
+_MAKER_POLL_TIMEOUT_S = float(os.getenv("MAKER_ENTRY_TIMEOUT_S", "8"))
+_MAKER_POLL_INTERVAL_S = float(os.getenv("MAKER_ENTRY_POLL_INTERVAL_S", "0.8"))
+
+
+async def place_maker_entry_then_protect(
+    symbol: str,
+    side: str,                 # "Buy" | "Sell"
+    qty: float,
+    *,
+    limit_price: float,        # preço LIMIT post-only (caller calcula do book: bid p/ long, ask p/ short)
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,   # = TP2
+    tp1: Optional[float] = None,
+    tp1_qty_pct: float = 0.45,
+    leverage: Optional[int] = None,
+    client_order_id: Optional[str] = None,
+    poll_timeout_s: Optional[float] = None,
+    poll_interval_s: Optional[float] = None,
+    fallback_market: bool = True,
+) -> dict:
+    """
+    Entrada MAKER: coloca LIMIT post-only (timeInForce=GTX), faz polling do fill
+    até `poll_timeout_s`, e SÓ DEPOIS coloca a proteção (SL/TP1/TP2) sobre a qty
+    REALMENTE preenchida. Desacopla entrada de proteção (≠ place_order, que assume
+    posição cheia já na emissão).
+
+    Comportamentos:
+      - GTX rejeitado de imediato (cruzaria o book → vira taker): se fallback_market,
+        entra a MARKET; senão devolve {ok:False, "no_fill":True}.
+      - Timeout SEM fill (status NEW): cancela; recheck anti-corrida; se realmente
+        não preencheu e fallback_market → MARKET; senão {ok:False, "no_fill":True}.
+      - Timeout com fill PARCIAL: cancela o restante; protege a parte preenchida
+        (não completa a market — fill parcial maker já abriu posição válida).
+      - Fill total: protege a qty cheia.
+
+    Mantém o CONTRATO de place_order (mesmos campos sl_ok/tp1_ok/tp2_ok/etc.) pra
+    o guard cardinal "sem stop = sem trade" do caller funcionar igual. Campos extra:
+      was_maker (bool), fell_back_to_market (bool), entry_fill_price,
+      executed_qty, no_fill (bool).
+    """
+    sym = to_binance(symbol) if "/" in symbol else symbol
+    poll_timeout_s = _MAKER_POLL_TIMEOUT_S if poll_timeout_s is None else poll_timeout_s
+    poll_interval_s = _MAKER_POLL_INTERVAL_S if poll_interval_s is None else poll_interval_s
+
+    qty_rounded = await _round_qty(sym, float(qty))
+    if qty_rounded <= 0:
+        f = await _get_symbol_filters(sym)
+        return {"ok": False, "error": f"qty arredondado virou 0 (step={f.get('step')}, min={f.get('min_qty')}, raw={qty})"}
+
+    if leverage is not None:
+        await set_leverage(sym, leverage)
+
+    binance_side = side.upper()  # BUY | SELL
+
+    async def _market_fallback(reason: str) -> dict:
+        """Cai pra entrada MARKET reaproveitando place_order (entry+proteção juntos)."""
+        log.warning(f"[maker] {sym} fallback MARKET ({reason})")
+        res = await place_order(
+            sym, side, qty_rounded, order_type="Market",
+            stop_loss=stop_loss, take_profit=take_profit, tp1=tp1,
+            tp1_qty_pct=tp1_qty_pct, leverage=None,  # leverage já setado acima
+            client_order_id=client_order_id,
+        )
+        if isinstance(res, dict):
+            res["was_maker"] = False
+            res["fell_back_to_market"] = True
+        return res
+
+    async def _protect(executed_qty: float, fill_price: float, *, was_maker: bool, entry_order_id: str = "") -> dict:
+        """Coloca proteção sobre a posição já aberta e monta o retorno no shape de place_order."""
+        prot = await place_protection_orders(
+            sym, binance_side, executed_qty,
+            stop_loss=stop_loss, tp1=tp1, tp2=take_profit,
+            tp1_qty_pct=tp1_qty_pct,
+            client_order_id_prefix=client_order_id,
+            dedup_live=True,   # entrada lenta → outro caminho pode já ter protegido; não duplica
+        )
+        extras = []
+        if stop_loss is not None:
+            extras.append({"stop_loss": {"ok": prot["sl_ok"], "order_id": prot["sl_order_id"], "msg": prot["sl_msg"]}})
+        if tp1 is not None:
+            extras.append({"tp1": {"ok": prot["tp1_ok"], "order_id": prot["tp1_order_id"], "qty": prot["tp1_qty"], "msg": prot["tp1_msg"], "skipped": prot["tp1_skipped"]}})
+        if take_profit is not None:
+            extras.append({"take_profit": {"ok": prot["tp2_ok"], "order_id": prot["tp2_order_id"], "msg": prot["tp2_msg"]}})
+        return {
+            "ok": True,
+            "result": {"orderId": entry_order_id, "avgPrice": fill_price, "executedQty": executed_qty, "symbol": sym, "side": binance_side},
+            "extras": extras,
+            "sl_ok": prot["sl_ok"], "sl_order_id": prot["sl_order_id"],
+            "tp1_ok": prot["tp1_ok"], "tp1_order_id": prot["tp1_order_id"], "tp1_skipped": prot["tp1_skipped"],
+            "tp2_ok": prot["tp2_ok"], "tp2_order_id": prot["tp2_order_id"],
+            "was_maker": was_maker, "fell_back_to_market": False,
+            "entry_fill_price": fill_price, "executed_qty": executed_qty,
+        }
+
+    # ── 1. Coloca LIMIT post-only (GTX) ──────────────────────────────────────
+    px = await _round_price(sym, float(limit_price))
+    params = {
+        "symbol": sym, "side": binance_side, "type": "LIMIT",
+        "quantity": qty_rounded, "price": px, "timeInForce": "GTX",  # GTX = Post Only
+    }
+    if client_order_id:
+        params["newClientOrderId"] = client_order_id
+    entry_res = await _signed_request("POST", "/fapi/v1/order", params)
+    if not entry_res.get("ok"):
+        # GTX rejeitado (cruzaria o book) ou outro erro de emissão → fallback.
+        msg = entry_res.get("msg") or entry_res.get("error")
+        if fallback_market:
+            return await _market_fallback(f"GTX rejeitado: {msg}")
+        return {"ok": False, "error": f"GTX rejeitado: {msg}", "no_fill": True, "was_maker": True, "fell_back_to_market": False}
+
+    order = entry_res["result"] or {}
+    order_id = str(order.get("orderId") or "")
+    # Alguns retornos já trazem status FILLED (preencheu na emissão).
+    if (order.get("status") or "").upper() == "FILLED":
+        ex_qty = await _round_qty(sym, float(order.get("executedQty") or qty_rounded))
+        fill_px = float(order.get("avgPrice") or px)
+        log.info(f"[maker] {sym} GTX preencheu na emissão @ {fill_px} qty={ex_qty}")
+        return await _protect(ex_qty, fill_px, was_maker=True, entry_order_id=order_id)
+
+    # ── 2. Polling do fill ───────────────────────────────────────────────────
+    log.info(f"[maker] {sym} GTX vivo orderId={order_id} @ {px} qty={qty_rounded} — aguardando fill até {poll_timeout_s}s")
+    deadline = time.time() + poll_timeout_s
+    last = {"status": "NEW", "executed_qty": 0.0, "avg_fill_price": 0.0}
+    while time.time() < deadline:
+        await asyncio.sleep(poll_interval_s)
+        q = await get_order(sym, order_id=order_id)
+        if not q.get("ok"):
+            continue  # leitura incerta → tenta de novo até o deadline
+        last = q
+        st = (q.get("status") or "").upper()
+        if st == "FILLED":
+            ex_qty = await _round_qty(sym, q.get("executed_qty") or qty_rounded)
+            fill_px = q.get("avg_fill_price") or px
+            log.info(f"[maker] {sym} fill total @ {fill_px} qty={ex_qty}")
+            return await _protect(ex_qty, fill_px, was_maker=True, entry_order_id=order_id)
+        if st in ("CANCELED", "EXPIRED", "REJECTED"):
+            log.warning(f"[maker] {sym} ordem sumiu (status={st}) durante polling")
+            break
+
+    # ── 3. Timeout / ordem sumiu — cancela o que restou e decide ────────────
+    await cancel_order(sym, order_id=order_id)
+    # Recheck anti-corrida: o cancel pode ter cruzado com um fill (timeout-com-sucesso).
+    chk = await get_order(sym, order_id=order_id)
+    ex_qty = 0.0
+    fill_px = px
+    if chk.get("ok"):
+        ex_qty = float(chk.get("executed_qty") or 0)
+        fill_px = chk.get("avg_fill_price") or px
+    else:
+        ex_qty = float(last.get("executed_qty") or 0)
+        fill_px = last.get("avg_fill_price") or px
+
+    ex_qty_r = await _round_qty(sym, ex_qty) if ex_qty > 0 else 0.0
+    if ex_qty_r > 0:
+        # Fill PARCIAL (ou total que chegou junto do cancel) → protege o preenchido.
+        log.info(f"[maker] {sym} fill parcial {ex_qty_r}/{qty_rounded} @ {fill_px} — protegendo o preenchido (resto cancelado)")
+        return await _protect(ex_qty_r, fill_px, was_maker=True, entry_order_id=order_id)
+
+    # Sem fill nenhum.
+    if fallback_market:
+        return await _market_fallback("timeout sem fill")
+    log.info(f"[maker] {sym} timeout sem fill e sem fallback — desiste da entrada")
+    return {"ok": False, "error": "maker timeout sem fill", "no_fill": True, "was_maker": True, "fell_back_to_market": False}
+
+
 async def cancel_order(symbol: str, order_id: Optional[str] = None, client_order_id: Optional[str] = None) -> dict:
     sym = to_binance(symbol) if "/" in symbol else symbol
     params = {"symbol": sym}

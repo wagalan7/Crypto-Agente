@@ -57,6 +57,16 @@ if hasattr(_client, "get_open_algo_orders"):
 else:
     async def get_open_algo_orders(symbol=None) -> dict:  # type: ignore
         return {"ok": False, "error": f"get_open_algo_orders não suportado em {ACTIVE_EXCHANGE}"}
+# place_maker_entry_then_protect (#4) — entrada post-only desacoplada da proteção.
+# Feature da Binance (usa GTX + algo orders). Em outra exchange NÃO existe stub:
+# expomos só se o cliente ativo tiver, e o caller (shadow_trade) faz getattr →
+# se ausente, cai automaticamente no place_order MARKET.
+if hasattr(_client, "place_maker_entry_then_protect"):
+    place_maker_entry_then_protect = _client.place_maker_entry_then_protect
+if hasattr(_client, "place_protection_orders"):
+    place_protection_orders = _client.place_protection_orders
+if hasattr(_client, "get_order"):
+    get_order = _client.get_order
 set_leverage = _client.set_leverage
 get_order_history = _client.get_order_history
 get_executions = _client.get_executions

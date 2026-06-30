@@ -239,6 +239,16 @@ EDGE_NOEDGE_MULT = float(os.getenv("EDGE_NOEDGE_MULT", "0.85"))  # desconto p/ s
 EDGE_MULT_MIN = float(os.getenv("EDGE_MULT_MIN", "0.80"))
 EDGE_MULT_MAX = float(os.getenv("EDGE_MULT_MAX", "1.30"))
 
+# ── #4 Entrada MAKER (post-only) — economiza a taxa taker na entrada ─────────
+# Em vez de entrar a MARKET (taker ~0.04%/0.05%), posta LIMIT post-only (GTX) no
+# preço planejado e aguarda o fill como MAKER (taxa menor, às vezes rebate). Se
+# não preencher no tempo (mercado fugiu) → cai pra MARKET (fail-safe: prefere
+# entrar a ficar de fora). A proteção (SL/TP) só é colocada APÓS confirmar o fill
+# (helper place_maker_entry_then_protect, desacopla entrada de proteção).
+# DEFAULT OFF: dinheiro real → só liga após você revisar. Mudar só muda a entrada;
+# o guard cardinal "sem stop = sem trade" e os TPs seguem idênticos.
+MAKER_ENTRY_ENABLED = os.getenv("MAKER_ENTRY_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
 # ── #2b Orçamento de RISCO aberto agregado (soma do R em risco das posições) ──
 # Diferente dos caps de notional/margem (tamanho/garantia): este soma o RISCO
 # REAL em aberto — quanto a banca perde se TODAS as posições abertas baterem o
@@ -3273,17 +3283,41 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 from services import exchange_service
                 exch_side = "Buy" if side == "long" else "Sell"
                 client_order_id = f"cw-{snap_id}"  # crypto-win + snap id
-                order_res = await exchange_service.place_order(
-                    symbol=rec["symbol"],
-                    side=exch_side,
-                    qty=qty,
-                    order_type="Market",
-                    stop_loss=stop,
-                    take_profit=tp2,  # TP2 — alvo final (closePosition=true)
-                    tp1=float(tp1) if tp1 is not None else None,  # bracket 45/55 quando ambos vierem
-                    leverage=int(rec.get("leverage") or 1),
-                    client_order_id=client_order_id,
-                )
+                # #4: entrada MAKER (post-only) quando ligada E o helper existe na
+                # exchange ativa (Binance). Posta LIMIT GTX no entry planejado e só
+                # protege após o fill; se não preencher → fallback MARKET interno.
+                # Mantém o MESMO shape de retorno (sl_ok/tp1_ok/tp2_ok) → o resto do
+                # fluxo (guard "sem stop", captura de IDs) não muda.
+                _maker_fn = getattr(exchange_service, "place_maker_entry_then_protect", None)
+                if MAKER_ENTRY_ENABLED and _maker_fn is not None:
+                    order_res = await _maker_fn(
+                        symbol=rec["symbol"],
+                        side=exch_side,
+                        qty=qty,
+                        limit_price=float(entry),
+                        stop_loss=stop,
+                        take_profit=tp2,
+                        tp1=float(tp1) if tp1 is not None else None,
+                        leverage=int(rec.get("leverage") or 1),
+                        client_order_id=client_order_id,
+                    )
+                    if isinstance(order_res, dict) and order_res.get("ok"):
+                        log.info(
+                            f"[shadow→live] entrada {rec['symbol']} via "
+                            f"{'MAKER' if order_res.get('was_maker') and not order_res.get('fell_back_to_market') else 'MARKET(fallback)'}"
+                        )
+                else:
+                    order_res = await exchange_service.place_order(
+                        symbol=rec["symbol"],
+                        side=exch_side,
+                        qty=qty,
+                        order_type="Market",
+                        stop_loss=stop,
+                        take_profit=tp2,  # TP2 — alvo final (closePosition=true)
+                        tp1=float(tp1) if tp1 is not None else None,  # bracket 45/55 quando ambos vierem
+                        leverage=int(rec.get("leverage") or 1),
+                        client_order_id=client_order_id,
+                    )
                 if not order_res.get("ok"):
                     log.error(
                         f"[shadow→live] place_order falhou {rec['symbol']}: "
