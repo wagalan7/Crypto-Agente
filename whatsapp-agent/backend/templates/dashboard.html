@@ -2419,6 +2419,7 @@ function loadBillingPreview() {
       return;
     }
     // Linhas da AGENDA — valor clicável abre ajuste (override) por mês.
+    // Contagem clicável expande o detalhamento por status (cobrar/não cobrar).
     const rows = items.map(it => {
       let status = "", cls = "text-gray-700";
       if (it.no_price) { status = '<span class="text-orange-600" title="Sem valor cadastrado">⚠ sem valor</span>'; cls = "text-gray-400"; }
@@ -2434,12 +2435,30 @@ function loadBillingPreview() {
           title="Ajustar valor cobrado deste paciente no mês"
           onclick="editBillingValue('${it.phone}','${(it.patient_name||'').replace(/'/g,"\\'")}',${it.total},${it.has_override})">${fmt(it.total)}${ov}</button>`;
       }
-      return `<tr class="border-b border-gray-50 hover:bg-gray-50">
-        <td class="py-1.5 pr-2 font-medium ${cls}">${it.patient_name||it.phone}</td>
-        <td class="py-1.5 pr-2 text-center text-gray-600">${it.sessions}</td>
+      // Subtítulo: detalhamento por status (só quando há algo além de realizadas).
+      const bd = it.breakdown || {};
+      const bdParts = [];
+      if (bd.realizadas) bdParts.push(`${bd.realizadas} realizada${bd.realizadas>1?'s':''}`);
+      if (bd.faltou_sem_aviso) bdParts.push(`${bd.faltou_sem_aviso} falta${bd.faltou_sem_aviso>1?'s':''} s/ aviso`);
+      if (bd.nao_marcadas) bdParts.push(`${bd.nao_marcadas} não marcada${bd.nao_marcadas>1?'s':''}`);
+      const showBd = (bd.nao_marcadas || bd.faltou_sem_aviso) && bdParts.length;
+      const bdLine = showBd ? `<div class="text-[10px] text-gray-400 mt-0.5">${bdParts.join(" · ")}</div>` : "";
+      // Telefone só dígitos → id seguro para a sub-linha.
+      const detId = (it.phone||"").replace(/\D/g,"") || Math.random().toString(36).slice(2);
+      const hasDetail = (it.session_rows||[]).length > 0;
+      const sessCell = hasDetail
+        ? `<button class="text-gray-600 hover:text-brand underline decoration-dotted" title="Ver/ajustar sessões" onclick="toggleBillingDetail('${detId}')">${it.sessions} ▾</button>`
+        : `${it.sessions}`;
+      const mainRow = `<tr class="border-b border-gray-50 hover:bg-gray-50">
+        <td class="py-1.5 pr-2 font-medium ${cls}">${it.patient_name||it.phone}${bdLine}</td>
+        <td class="py-1.5 pr-2 text-center text-gray-600">${sessCell}</td>
         <td class="py-1.5 pr-2 text-right">${totalCell}</td>
         <td class="py-1.5 text-right text-xs">${status}</td>
       </tr>`;
+      const detailRow = hasDetail
+        ? `<tr id="bdet-${detId}" class="hidden"><td colspan="4" class="px-3 py-1.5 bg-gray-50/70">${_billingSessionsHtml(it.session_rows)}</td></tr>`
+        : "";
+      return mainRow + detailRow;
     }).join("");
     // Linhas AVULSAS — editáveis e removíveis.
     const manualRows = manual.map(it => {
@@ -2483,6 +2502,58 @@ function loadBillingPreview() {
     el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Erro ao carregar prévia.</p>';
     if (histEl) histEl.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Erro ao carregar histórico.</p>';
   });
+}
+
+// Detalhamento de sessões de um paciente no mês, com ação cobrar/não cobrar.
+const _ATT_LABEL = {
+  attended: '<span class="text-green-600">✅ realizada</span>',
+  pending: '<span class="text-gray-500">• não marcada</span>',
+  missed_no_notice: '<span class="text-orange-600">⚠ faltou sem aviso</span>',
+  missed_with_notice: '<span class="text-gray-400">🚫 faltou com aviso (não cobra)</span>',
+};
+function _fmtSessDT(s) {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (isNaN(d)) return s;
+  return d.toLocaleDateString("pt-BR", {day:"2-digit",month:"2-digit"}) + " " +
+         d.toLocaleTimeString("pt-BR", {hour:"2-digit",minute:"2-digit"});
+}
+function _billingSessionsHtml(rows) {
+  const lines = (rows||[]).map(r => {
+    let label, action = "";
+    if (r.future) {
+      label = '<span class="text-gray-400">🕓 futura (ainda não cobra)</span>';
+    } else if (r.cancelled) {
+      label = '<span class="text-gray-400">🚫 cancelada</span>';
+    } else {
+      label = _ATT_LABEL[r.attendance] || _ATT_LABEL.pending;
+      if (r.counts) {
+        action = `<button class="text-red-500 hover:text-red-700 text-[11px] whitespace-nowrap"
+          title="Não cobrar esta sessão (marca como falta com aviso)"
+          onclick="setSessionAttendance(${r.id},'missed_with_notice')">não cobrar ✕</button>`;
+      } else if (r.attendance === 'missed_with_notice') {
+        action = `<button class="text-green-600 hover:text-green-700 text-[11px] whitespace-nowrap"
+          title="Cobrar esta sessão (marca como realizada)"
+          onclick="setSessionAttendance(${r.id},'attended')">cobrar ✓</button>`;
+      }
+    }
+    return `<div class="flex items-center justify-between gap-2 py-0.5">
+      <span class="text-[11px] text-gray-600">${_fmtSessDT(r.scheduled_at)} — ${label}</span>
+      <span>${action}</span>
+    </div>`;
+  }).join("");
+  return `<div class="text-[11px] text-gray-400 mb-1">Sessões do mês — clique para incluir/excluir da cobrança:</div>${lines}`;
+}
+function toggleBillingDetail(detId) {
+  const el = document.getElementById("bdet-" + detId);
+  if (el) el.classList.toggle("hidden");
+}
+function setSessionAttendance(apptId, status) {
+  api(`/dashboard/api/appointments/${apptId}/attendance`, {
+    method: "POST", body: JSON.stringify({status})
+  })
+    .then(() => { showToast("Sessão atualizada", "success"); loadBillingPreview(); })
+    .catch(() => showToast("Erro ao atualizar sessão", "error"));
 }
 
 function renderBillingHistory(data, fmt) {

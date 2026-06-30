@@ -1925,6 +1925,11 @@ def dash_billing_preview(request: Request, month: str | None = None):
     tid = tenant["id"]
     global_paused = db.is_tenant_billing_paused(tid)
 
+    # Todas as linhas do mês (para o detalhamento por status de cada paciente —
+    # inclui canceladas/faltas com aviso, que NÃO entram na conta mas a
+    # psicóloga pode querer reincluir corrigindo a marcação). Read-only.
+    raw_month = db.get_month_appointments_raw(tid, month_start, month_end, now_str)
+
     items = []
     billed_ids: set = set()
     # 1) Pacientes com valor cadastrado → exatamente o que seria cobrado
@@ -1952,6 +1957,27 @@ def dash_billing_preview(request: Request, month: str | None = None):
             or db.is_agent_paused(tid, phone)
         )
         name = sessions[0].get("patient_name") or patient.get("name") or phone
+        # Detalhamento por status (das que ENTRAM na conta = sessions deduplicadas)
+        breakdown = {
+            "realizadas": sum(1 for s in sessions if (s.get("attendance") or "pending") == "attended"),
+            "nao_marcadas": sum(1 for s in sessions if (s.get("attendance") or "pending") == "pending"),
+            "faltou_sem_aviso": sum(1 for s in sessions if (s.get("attendance") or "pending") == "missed_no_notice"),
+        }
+        # Lista de TODAS as sessões do mês deste paciente (variantes de telefone),
+        # com status — para auditar/corrigir cada linha direto na tela.
+        pvariants = db._phone_variants(phone) | {db._norm_digits(phone)}
+        session_rows = sorted(
+            ({
+                "id": r.get("id"),
+                "scheduled_at": r.get("scheduled_at"),
+                "attendance": r.get("attendance") or "pending",
+                "cancelled": int(r.get("cancelled") or 0),
+                "future": bool(r.get("future")),
+                "counts": bool(r.get("counts_for_billing")),
+            } for r in raw_month
+              if db._norm_digits(r.get("phone") or "") in pvariants),
+            key=lambda x: x["scheduled_at"] or "",
+        )
         items.append({
             "phone": phone, "patient_name": name, "sessions": count,
             "unit_price": unit, "total": total,
@@ -1959,6 +1985,8 @@ def dash_billing_preview(request: Request, month: str | None = None):
             "paused": paused or global_paused,
             "already_sent": db.billing_already_sent(tid, phone, month_str),
             "no_price": False,
+            "breakdown": breakdown,
+            "session_rows": session_rows,
         })
 
     # 2) Contatos com sessão no mês mas SEM valor cadastrado (avisa, não cobra)
