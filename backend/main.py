@@ -3614,6 +3614,86 @@ async def admin_recalc_pnl_zero_entry(dry_run: bool = True):
     }
 
 
+@app.post("/api/admin/backfill-slippage-sentinels")
+async def admin_backfill_slippage_sentinels(
+    dry_run: bool = True,
+    include_filler_zeros: bool = False,
+):
+    """
+    Limpa telemetria de slippage corrompida (entry_slippage_pct):
+
+      1. SENTINELAS ±100%: vinham de entry_price=0 (market order async, bug
+         pré-guarda) → diff = -100% (long) / +100% (short), notional=0.
+         Critério: ABS(entry_slippage_pct) >= 99.9 OU notional_usd <= 0.
+         Ação: entry_slippage_pct = NULL (valor sabidamente quebrado).
+
+      2. (opcional, include_filler_zeros=true) ZEROS FALSOS: trades 'auto'
+         que gravaram exatamente 0.0000% porque entry_actual caiu no entry
+         TEÓRICO (avgPrice não retornado) — não é slippage real medido. O
+         fill real não é recuperável em trade fechado, então NULL-amos pra
+         não poluir a média. Só toca source='auto' com slippage == 0.
+
+    Não altera entry_price nem PnL. Use dry_run=true (default) primeiro.
+    """
+    from sqlalchemy import select, or_, func
+    from db import get_session, DB_ENABLED
+    from models.real_trade import RealTrade
+    if not DB_ENABLED:
+        return {"ok": False, "error": "DB desabilitado"}
+
+    sentinels, filler_zeros = [], []
+    async with get_session() as session:
+        # 1. Sentinelas ±100% / notional=0
+        stmt = select(RealTrade).where(
+            RealTrade.entry_slippage_pct.isnot(None),
+            or_(
+                func.abs(RealTrade.entry_slippage_pct) >= 99.9,
+                RealTrade.notional_usd <= 0,
+            ),
+        )
+        for t in (await session.execute(stmt)).scalars().all():
+            sentinels.append({
+                "id": t.id, "symbol": t.symbol, "side": t.side,
+                "status": t.status, "source": t.source,
+                "slippage": float(t.entry_slippage_pct),
+                "notional": float(t.notional_usd or 0),
+            })
+            if not dry_run:
+                t.entry_slippage_pct = None
+                t.notes = (t.notes or "") + " | slippage sentinela ±100% → NULL"
+
+        # 2. (opcional) zeros falsos de market order 'auto'
+        if include_filler_zeros:
+            stmt2 = select(RealTrade).where(
+                RealTrade.entry_slippage_pct == 0,
+                RealTrade.source == "auto",
+                RealTrade.notional_usd > 0,
+            )
+            for t in (await session.execute(stmt2)).scalars().all():
+                filler_zeros.append({
+                    "id": t.id, "symbol": t.symbol, "side": t.side,
+                    "status": t.status,
+                    "is_filler": "[filler]" in (t.notes or ""),
+                })
+                if not dry_run:
+                    t.entry_slippage_pct = None
+                    t.notes = (t.notes or "") + " | slippage 0% falso (entry teórico) → NULL"
+
+        if not dry_run:
+            await session.commit()
+
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "include_filler_zeros": include_filler_zeros,
+        "sentinels_affected": len(sentinels),
+        "filler_zeros_affected": len(filler_zeros),
+        "sentinels": sentinels,
+        "filler_zeros": filler_zeros,
+        "note": "Use ?dry_run=false pra aplicar. include_filler_zeros=true também NULL-a 0% falsos de 'auto'.",
+    }
+
+
 @app.post("/api/admin/dedupe-open-trades")
 async def admin_dedupe_open_trades(dry_run: bool = True):
     """
