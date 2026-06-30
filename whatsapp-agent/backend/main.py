@@ -1218,14 +1218,23 @@ def dash_patients(request: Request):
         rows = conn.execute(
             """SELECT phone, name FROM (
                SELECT c.phone,
-                 (SELECT a.patient_name FROM appointments a
-                  WHERE a.phone = c.phone AND a.tenant_id = c.tenant_id LIMIT 1) as name,
+                 COALESCE(
+                   (SELECT a.patient_name FROM appointments a
+                    WHERE a.phone = c.phone AND a.tenant_id = c.tenant_id
+                      AND COALESCE(a.patient_name,'') != '' LIMIT 1),
+                   (SELECT p.name FROM patients p
+                    WHERE p.phone = c.phone AND p.tenant_id = c.tenant_id
+                      AND COALESCE(p.name,'') != '' LIMIT 1)
+                 ) as name,
                  c.created_at as sort_key
                FROM conversations c WHERE c.tenant_id = ?
                UNION
                SELECT p.phone,
-                 (SELECT a.patient_name FROM appointments a
-                  WHERE a.phone = p.phone AND a.tenant_id = p.tenant_id LIMIT 1) as name,
+                 COALESCE(
+                   NULLIF(p.name,''),
+                   (SELECT a.patient_name FROM appointments a
+                    WHERE a.phone = p.phone AND a.tenant_id = p.tenant_id LIMIT 1)
+                 ) as name,
                  '1970-01-01' as sort_key
                FROM patients p WHERE p.tenant_id = ?
             ) GROUP BY phone ORDER BY sort_key DESC""",
@@ -1588,20 +1597,11 @@ def dash_rename_patient(phone: str, body: PatientRenameBody, request: Request):
     new_name = "".join(ch for ch in (body.name or "") if ch.isprintable()).strip()[:100]
     if not new_name:
         raise HTTPException(status_code=400, detail="Nome inválido.")
-    with db.get_conn() as conn:
-        conn.execute(
-            "UPDATE appointments SET patient_name = ? WHERE tenant_id = ? AND phone = ?",
-            (new_name, tenant["id"], phone),
-        )
-        try:
-            conn.execute(
-                "UPDATE patients SET name = ? WHERE tenant_id = ? AND phone = ?",
-                (new_name, tenant["id"], phone),
-            )
-        except Exception:
-            pass
-    logger.info(f"[{tenant['slug']}] Paciente renomeado: {phone} → '{new_name}'")
-    return {"status": "ok", "phone": phone, "name": new_name}
+    # Atualiza agendamentos casando variantes do telefone (com/sem 55 e o "9")
+    # e persiste em patients — robusto ao Z-API variar o formato do número.
+    updated = db.rename_patient_everywhere(tenant["id"], phone, new_name)
+    logger.info(f"[{tenant['slug']}] Paciente renomeado: {phone} → '{new_name}' ({updated} agend.)")
+    return {"status": "ok", "phone": phone, "name": new_name, "updated": updated}
 
 
 @app.patch("/dashboard/api/patients/{phone}/price")

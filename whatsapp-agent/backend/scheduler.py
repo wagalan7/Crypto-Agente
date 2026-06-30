@@ -209,6 +209,9 @@ async def _run_billing():
             logger.info(f"[{tenant['slug']}] ⏸ Cobrança {month_str} pausada (global)")
             continue
         patients = db.get_patients_with_price(tenant["id"])
+        # Dedup: cada agendamento é cobrado UMA vez no run, mesmo que o contato
+        # exista como 2 cadastros em variantes do telefone (evita cobrança dupla).
+        billed_ids: set = set()
         for patient in patients:
             phone = patient["phone"]
             if db.billing_already_sent(tenant["id"], phone, month_str):
@@ -225,9 +228,13 @@ async def _run_billing():
             sessions = db.get_valid_sessions_for_month(
                 tenant["id"], phone, month_start, month_end, now_str
             )
+            sessions = [s for s in sessions if s.get("id") not in billed_ids]
             if not sessions:
                 logger.info(f"[{tenant['slug']}] Sem sessões válidas para {patient['name']} em {month_str}")
                 continue
+            for s in sessions:
+                if s.get("id") is not None:
+                    billed_ids.add(s["id"])
             count = len(sessions)
             patient_name = sessions[0]["patient_name"] if sessions else patient.get("name", "Paciente")
             # Override manual do total (desconto/complemento combinado) substitui o cálculo
@@ -263,6 +270,9 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
         return []
     patients = db.get_patients_with_price(tenant_id)
     results = []
+    # Dedup: cada agendamento cobrado UMA vez (evita dupla em contato com
+    # 2 cadastros em variantes do telefone).
+    billed_ids: set = set()
     for patient in patients:
         phone = patient["phone"]
         if not phone:
@@ -271,8 +281,12 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
         if patient.get("billing_paused") or db.is_patient_billing_paused(tenant_id, phone):
             continue
         sessions = db.get_valid_sessions_for_month(tenant_id, phone, month_start, month_end, now_str)
+        sessions = [s for s in sessions if s.get("id") not in billed_ids]
         if not sessions:
             continue
+        for s in sessions:
+            if s.get("id") is not None:
+                billed_ids.add(s["id"])
         count = len(sessions)
         patient_name = sessions[0]["patient_name"] if sessions else patient.get("name", "Paciente")
         override = db.get_billing_override(tenant_id, phone, month_str)

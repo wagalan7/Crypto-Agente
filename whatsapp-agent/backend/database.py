@@ -1062,6 +1062,43 @@ def upsert_patient(tenant_id: int, phone: str, name: str = "", session_price: fl
         """, (tenant_id, phone, name, session_price, email))
 
 
+def set_patient_name(tenant_id: int, phone: str, name: str) -> None:
+    """Grava SOMENTE o nome do paciente (preserva preço/email). Cria a linha
+    se ainda não existir — assim a correção de nome persiste mesmo para
+    contatos que ainda não têm agendamento."""
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO patients (tenant_id, phone, name) VALUES (?, ?, ?)
+            ON CONFLICT(tenant_id, phone) DO UPDATE SET name = excluded.name
+        """, (tenant_id, phone, name))
+
+
+def rename_patient_everywhere(tenant_id: int, phone: str, name: str) -> int:
+    """Corrige o nome do paciente em TODOS os agendamentos (casando variantes
+    de telefone) e persiste em patients. Retorna nº de agendamentos atualizados.
+    """
+    variants = _phone_variants(phone) or {phone}
+    if phone:
+        variants.add(phone)
+    pn = _norm_digits(phone) or phone
+    with get_conn() as conn:
+        rows = 0
+        if variants:
+            ph = ",".join("?" * len(variants))
+            cur = conn.execute(
+                f"UPDATE appointments SET patient_name = ? "
+                f"WHERE tenant_id = ? AND phone IN ({ph})",
+                (name, tenant_id, *variants),
+            )
+            rows = cur.rowcount or 0
+        # Persiste o nome no cadastro (cria se não existir) — fonte estável
+        conn.execute("""
+            INSERT INTO patients (tenant_id, phone, name) VALUES (?, ?, ?)
+            ON CONFLICT(tenant_id, phone) DO UPDATE SET name = excluded.name
+        """, (tenant_id, pn, name))
+    return rows
+
+
 def get_patient(tenant_id: int, phone: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute(
@@ -1087,18 +1124,28 @@ def get_valid_sessions_for_month(tenant_id: int, phone: str, month_start: str, m
     - attendance != 'missed_with_notice'  (não compareceu com aviso → NÃO cobra)
     - cancelled = 0
     'attended', 'missed_no_notice' e 'pending' (default) entram no cálculo.
+
+    Casa o telefone em TODAS as variantes plausíveis (com/sem DDI 55 e o "9"
+    extra do celular). O Z-API às vezes entrega o mesmo contato em formatos
+    diferentes, então a sessão pode estar gravada num formato e o preço noutro.
     """
+    variants = _phone_variants(phone) or {phone}
+    if phone:
+        variants.add(phone)
+    if not variants:
+        return []
+    ph = ",".join("?" * len(variants))
     with get_conn() as conn:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT * FROM appointments
-            WHERE tenant_id = ? AND phone = ?
+            WHERE tenant_id = ? AND phone IN ({ph})
               AND confirmed = 1
               AND cancelled = 0
               AND COALESCE(attendance, 'pending') != 'missed_with_notice'
               AND scheduled_at >= ? AND scheduled_at < ?
               AND scheduled_at <= ?
             ORDER BY scheduled_at
-        """, (tenant_id, phone, month_start, month_end, now_str)).fetchall()
+        """, (tenant_id, *variants, month_start, month_end, now_str)).fetchall()
     return [dict(r) for r in rows]
 
 
