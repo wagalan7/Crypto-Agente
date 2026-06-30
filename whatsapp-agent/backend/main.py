@@ -1678,6 +1678,85 @@ def dash_delete_billing_override(phone: str, request: Request, month: str):
     return {"status": "ok", "phone": phone, "month": month}
 
 
+# ── Cobranças avulsas (manuais) ─────────────────────────────────────────────────
+
+@app.post("/dashboard/api/billing/manual")
+async def dash_add_manual_billing(request: Request):
+    """Inclui uma cobrança AVULSA no mês: sessão extra fora da agenda ou
+    paciente novo que nunca falou pelo WhatsApp profissional. Entra na prévia
+    e no total; se tiver telefone, é enviada no próximo disparo (uma vez)."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    body = await request.json()
+    month = (body.get("month") or "").strip()
+    if not month or len(month) != 7:
+        raise HTTPException(status_code=400, detail="Mês inválido (use YYYY-MM).")
+    name = "".join(ch for ch in (body.get("patient_name") or "") if ch.isprintable()).strip()[:120]
+    if not name:
+        raise HTTPException(status_code=400, detail="Informe o nome do paciente.")
+    raw_phone = (body.get("phone") or "").strip()
+    phone = _norm_phone(raw_phone) if raw_phone else ""
+    try:
+        total = float(body.get("total_amount"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Valor total inválido.")
+    if total < 0:
+        raise HTTPException(status_code=400, detail="Valor não pode ser negativo.")
+    try:
+        sessions = int(body.get("sessions_count") or 1)
+    except (TypeError, ValueError):
+        sessions = 1
+    if sessions < 0:
+        sessions = 0
+    note = "".join(ch for ch in (body.get("note") or "") if ch.isprintable()).strip()[:200]
+    entry_id = db.add_manual_billing_entry(tenant["id"], month, name, phone, sessions, total, note)
+    logger.info(f"[{tenant['slug']}] ➕ Cobrança avulsa {name} {month} → R${total:.2f} (phone={phone or '—'})")
+    return {"status": "ok", "id": entry_id}
+
+
+@app.patch("/dashboard/api/billing/manual/{entry_id}")
+async def dash_update_manual_billing(entry_id: int, request: Request):
+    """Edita uma cobrança avulsa (nome, telefone, sessões, valor, nota)."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    body = await request.json()
+    fields: dict = {}
+    if "patient_name" in body:
+        nm = "".join(ch for ch in (body.get("patient_name") or "") if ch.isprintable()).strip()[:120]
+        if not nm:
+            raise HTTPException(status_code=400, detail="Nome não pode ficar vazio.")
+        fields["patient_name"] = nm
+    if "phone" in body:
+        rp = (body.get("phone") or "").strip()
+        fields["phone"] = _norm_phone(rp) if rp else ""
+    if "total_amount" in body:
+        try:
+            t = float(body.get("total_amount"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Valor total inválido.")
+        if t < 0:
+            raise HTTPException(status_code=400, detail="Valor não pode ser negativo.")
+        fields["total_amount"] = t
+    if "sessions_count" in body:
+        try:
+            fields["sessions_count"] = max(0, int(body.get("sessions_count") or 0))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Nº de sessões inválido.")
+    if "note" in body:
+        fields["note"] = "".join(ch for ch in (body.get("note") or "") if ch.isprintable()).strip()[:200]
+    db.update_manual_billing_entry(tenant["id"], entry_id, **fields)
+    return {"status": "ok", "id": entry_id}
+
+
+@app.delete("/dashboard/api/billing/manual/{entry_id}")
+def dash_delete_manual_billing(entry_id: int, request: Request):
+    """Remove uma cobrança avulsa."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    db.delete_manual_billing_entry(tenant["id"], entry_id)
+    return {"status": "ok", "id": entry_id}
+
+
 @app.delete("/dashboard/api/patients/{phone}")
 def dash_delete_patient(phone: str, request: Request):
     """Exclui DEFINITIVAMENTE um paciente (caso de desistência): conversas,
@@ -1902,14 +1981,38 @@ def dash_billing_preview(request: Request, month: str | None = None):
         })
 
     items.sort(key=lambda x: (x["no_price"], (x["patient_name"] or "").lower()))
-    grand_total = sum(it["total"] for it in items if not it["paused"] and not it["no_price"])
+
+    # 3) Cobranças AVULSAS (manuais) do mês — sessão extra fora da agenda ou
+    #    paciente novo. Entram como linhas próprias (manual=True) e no total.
+    manual = []
+    for e in db.get_manual_billing_entries(tid, month_str):
+        manual.append({
+            "id": e["id"],
+            "phone": e.get("phone") or "",
+            "patient_name": e.get("patient_name") or (e.get("phone") or "Avulsa"),
+            "sessions": int(e.get("sessions_count") or 0),
+            "unit_price": 0.0,
+            "total": float(e.get("total_amount") or 0),
+            "note": e.get("note") or "",
+            "has_override": False,
+            "paused": global_paused,
+            "already_sent": bool(e.get("sent_at")),
+            "no_price": False,
+            "manual": True,
+            "can_send": bool(e.get("phone")),
+        })
+
+    grand_total = sum(
+        it["total"] for it in (items + manual)
+        if not it.get("paused") and not it.get("no_price")
+    )
 
     # Histórico do que JÁ foi enviado neste mês de referência (auditoria).
     history = db.get_billing_logs_for_month(tid, month_str)
     history_total = sum(float(h.get("total_amount") or 0) for h in history)
 
-    return {"month": month_str, "items": items, "grand_total": grand_total,
-            "global_paused": global_paused,
+    return {"month": month_str, "items": items, "manual": manual,
+            "grand_total": grand_total, "global_paused": global_paused,
             "history": history, "history_total": history_total}
 
 

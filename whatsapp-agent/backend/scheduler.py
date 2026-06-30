@@ -251,6 +251,9 @@ async def _run_billing():
             else:
                 logger.warning(f"[{tenant['slug']}] ✗ Falha cobrança → {phone}")
 
+        # Cobranças avulsas (manuais) do mês — após o loop regular do tenant.
+        await _send_manual_billing_entries(tenant, month_str)
+
 
 async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[dict]:
     """Disparo manual de cobrança."""
@@ -277,6 +280,11 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
         phone = patient["phone"]
         if not phone:
             continue
+        # Trava anti-dupla: se já foi cobrado neste mês (✓ enviado na prévia),
+        # não recobra mesmo que o botão seja clicado de novo. (Avulsas têm
+        # dedup próprio por sent_at e não entram nessa checagem.)
+        if db.billing_already_sent(tenant_id, phone, month_str):
+            continue
         # Pausa individual de cobrança do paciente
         if patient.get("billing_paused") or db.is_patient_billing_paused(tenant_id, phone):
             continue
@@ -299,6 +307,45 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
         if sent:
             db.save_billing_log(tenant_id, phone, patient_name, month_str, count, total, "whatsapp")
         results.append({"phone": phone, "patient_name": patient_name, "sessions": count, "total": total, "sent": sent})
+
+    # Cobranças avulsas (manuais) do mês — sessão extra/paciente novo.
+    results += await _send_manual_billing_entries(tenant, month_str)
+    return results
+
+
+async def _send_manual_billing_entries(tenant: dict, month_str: str) -> list[dict]:
+    """Envia as cobranças AVULSAS do mês que tenham telefone e ainda não foram
+    enviadas. Cada registro é enviado no máximo UMA vez (controle por sent_at na
+    própria entry). Entradas sem telefone ficam só como registro (não enviam).
+    Respeita pausa do agente e pausa individual de cobrança."""
+    results: list[dict] = []
+    tid = tenant["id"]
+    for e in db.get_manual_billing_entries(tid, month_str):
+        if e.get("sent_at"):
+            continue  # já enviada antes
+        phone = (e.get("phone") or "").strip()
+        name = e.get("patient_name") or "Paciente"
+        count = int(e.get("sessions_count") or 0)
+        total = float(e.get("total_amount") or 0)
+        if not phone:
+            # Só registro (paciente de número pessoal): entra no total, não envia.
+            results.append({"phone": "", "patient_name": name, "sessions": count,
+                            "total": total, "sent": False, "manual": True, "skipped": "sem_telefone"})
+            continue
+        if db.is_agent_paused(tid, phone) or db.is_patient_billing_paused(tid, phone):
+            results.append({"phone": phone, "patient_name": name, "sessions": count,
+                            "total": total, "sent": False, "manual": True, "skipped": "pausado"})
+            continue
+        msg = _billing_message(tenant, name, total, count)
+        sent = await wa.send_message(tenant, phone, msg)
+        if sent:
+            db.mark_manual_billing_entry_sent(tid, e["id"])
+            db.save_billing_log(tid, phone, name, month_str, count, total, "avulsa")
+            logger.info(f"[{tenant['slug']}] ✓ Cobrança avulsa {month_str} → {name} R${total:.2f}")
+        else:
+            logger.warning(f"[{tenant['slug']}] ✗ Falha cobrança avulsa → {phone}")
+        results.append({"phone": phone, "patient_name": name, "sessions": count,
+                        "total": total, "sent": sent, "manual": True})
     return results
 
 

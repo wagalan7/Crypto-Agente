@@ -641,9 +641,46 @@
       <div class="border-t border-gray-100 pt-3">
         <div class="flex items-center justify-between mb-2">
           <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide">Sessões do mês (prévia da cobrança)</p>
-          <button onclick="loadBillingPreview()" class="text-xs text-brand">↻ Atualizar</button>
+          <div class="flex items-center gap-3">
+            <button onclick="openManualBilling()" class="text-xs text-brand font-semibold">➕ Cobrança avulsa</button>
+            <button onclick="loadBillingPreview()" class="text-xs text-brand">↻ Atualizar</button>
+          </div>
         </div>
-        <p class="text-[11px] text-gray-400 mb-2">Calculado pela agenda do mês selecionado. ✓ = já cobrado · ⏸ = pausado · ⚠ = sem valor cadastrado.</p>
+        <p class="text-[11px] text-gray-400 mb-2">Calculado pela agenda do mês. Clique no valor para ajustar · ➕ inclui sessão extra/paciente novo · ✓ já cobrado · ⏸ pausado · ⚠ sem valor.</p>
+
+        <!-- Form de cobrança avulsa (oculto por padrão) -->
+        <div id="manual-billing-form" class="hidden mb-3 p-3 rounded-lg bg-purple-50 border border-purple-100">
+          <p class="text-xs font-semibold text-purple-700 mb-2">➕ Nova cobrança avulsa <span id="manual-form-month" class="text-purple-400 font-normal"></span></p>
+          <div class="grid grid-cols-2 gap-2">
+            <div class="col-span-2">
+              <label class="block text-[11px] text-gray-500 mb-0.5">Nome do paciente *</label>
+              <input id="manual-name" type="text" placeholder="Ex.: Maria Souza"
+                class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+            </div>
+            <div>
+              <label class="block text-[11px] text-gray-500 mb-0.5">WhatsApp (opcional)</label>
+              <input id="manual-phone" type="tel" placeholder="55119..."
+                class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+            </div>
+            <div>
+              <label class="block text-[11px] text-gray-500 mb-0.5">Nº de sessões</label>
+              <input id="manual-sessions" type="number" min="0" value="1"
+                class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+            </div>
+            <div class="col-span-2">
+              <label class="block text-[11px] text-gray-500 mb-0.5">Valor total (R$) *</label>
+              <input id="manual-total" type="number" min="0" step="0.01" placeholder="0,00"
+                class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+            </div>
+          </div>
+          <p class="text-[11px] text-gray-400 mt-1.5">Sem WhatsApp = só entra no total (não envia). Com WhatsApp = enviada no próximo disparo, uma única vez.</p>
+          <div class="flex gap-2 mt-2">
+            <button onclick="saveManualBilling()" id="manual-save-btn"
+              class="bg-brand text-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:opacity-90">Salvar</button>
+            <button onclick="closeManualBilling()" class="text-gray-500 px-3 py-1.5 rounded-lg text-xs hover:bg-gray-100">Cancelar</button>
+          </div>
+        </div>
+
         <div id="billing-preview" class="overflow-x-auto">
           <p class="text-xs text-gray-400 text-center py-3">Carregando...</p>
         </div>
@@ -2373,12 +2410,15 @@ function loadBillingPreview() {
   const url = "/dashboard/api/billing/preview" + (month ? `?month=${month}` : "");
   api(url).then(data => {
     const fmt = v => `R$ ${parseFloat(v).toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+    _billingMonth = data.month || month;
     renderBillingHistory(data, fmt);
     const items = data.items || [];
-    if (!items.length) {
-      el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Nenhuma sessão neste mês.</p>';
+    const manual = data.manual || [];
+    if (!items.length && !manual.length) {
+      el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Nenhuma sessão neste mês. Use ➕ Cobrança avulsa para incluir.</p>';
       return;
     }
+    // Linhas da AGENDA — valor clicável abre ajuste (override) por mês.
     const rows = items.map(it => {
       let status = "", cls = "text-gray-700";
       if (it.no_price) { status = '<span class="text-orange-600" title="Sem valor cadastrado">⚠ sem valor</span>'; cls = "text-gray-400"; }
@@ -2386,12 +2426,40 @@ function loadBillingPreview() {
       else if (it.already_sent) { status = '<span class="text-green-600" title="Já cobrado neste mês">✓ enviado</span>'; }
       else { status = '<span class="text-gray-400">a cobrar</span>'; }
       const ov = it.has_override ? ' <span class="text-purple-500" title="Valor ajustado manualmente">✏️</span>' : '';
-      const totalTxt = it.no_price ? "—" : fmt(it.total);
+      let totalCell;
+      if (it.no_price) {
+        totalCell = '—';
+      } else {
+        totalCell = `<button class="text-gray-700 hover:text-brand underline decoration-dotted"
+          title="Ajustar valor cobrado deste paciente no mês"
+          onclick="editBillingValue('${it.phone}','${(it.patient_name||'').replace(/'/g,"\\'")}',${it.total},${it.has_override})">${fmt(it.total)}${ov}</button>`;
+      }
       return `<tr class="border-b border-gray-50 hover:bg-gray-50">
         <td class="py-1.5 pr-2 font-medium ${cls}">${it.patient_name||it.phone}</td>
         <td class="py-1.5 pr-2 text-center text-gray-600">${it.sessions}</td>
-        <td class="py-1.5 pr-2 text-right text-gray-700">${totalTxt}${ov}</td>
+        <td class="py-1.5 pr-2 text-right">${totalCell}</td>
         <td class="py-1.5 text-right text-xs">${status}</td>
+      </tr>`;
+    }).join("");
+    // Linhas AVULSAS — editáveis e removíveis.
+    const manualRows = manual.map(it => {
+      let status;
+      if (it.paused) status = '<span class="text-yellow-700">⏸ pausado</span>';
+      else if (it.already_sent) status = '<span class="text-green-600" title="Avulsa já enviada">✓ enviado</span>';
+      else if (!it.can_send) status = '<span class="text-gray-400" title="Sem WhatsApp: só registro">📝 registro</span>';
+      else status = '<span class="text-gray-400">a cobrar</span>';
+      const nameEsc = (it.patient_name||'').replace(/'/g,"\\'");
+      return `<tr class="border-b border-gray-50 bg-purple-50/40">
+        <td class="py-1.5 pr-2 font-medium text-gray-700">${it.patient_name||it.phone}
+          <span class="text-[10px] text-purple-500 align-middle">avulsa</span></td>
+        <td class="py-1.5 pr-2 text-center text-gray-600">${it.sessions}</td>
+        <td class="py-1.5 pr-2 text-right">
+          <button class="text-gray-700 hover:text-brand underline decoration-dotted"
+            onclick="editManualBilling(${it.id},'${nameEsc}','${it.phone||''}',${it.sessions},${it.total})">${fmt(it.total)}</button>
+        </td>
+        <td class="py-1.5 text-right text-xs whitespace-nowrap">${status}
+          <button class="text-red-400 hover:text-red-600 ml-1" title="Remover" onclick="deleteManualBilling(${it.id})">✕</button>
+        </td>
       </tr>`;
     }).join("");
     el.innerHTML = `<table class="w-full text-xs">
@@ -2403,7 +2471,7 @@ function loadBillingPreview() {
           <th class="text-right py-1">Status</th>
         </tr>
       </thead>
-      <tbody>${rows}</tbody>
+      <tbody>${rows}${manualRows}</tbody>
       <tfoot>
         <tr class="border-t border-gray-200 font-semibold text-gray-700">
           <td class="py-1.5 pr-2" colspan="2">Total a cobrar${data.global_paused ? ' (pausado)' : ''}</td>
@@ -2453,6 +2521,93 @@ function renderBillingHistory(data, fmt) {
       </tr>
     </tfoot>
   </table>`;
+}
+
+// ── Cobranças avulsas + ajuste de valor (override) ────────────────────────────
+let _billingMonth = "";
+
+function _currentBillingMonth() {
+  const el = document.getElementById("billing-month");
+  return (el && el.value) ? el.value : (_billingMonth || "");
+}
+
+function openManualBilling() {
+  const m = _currentBillingMonth();
+  const lbl = document.getElementById("manual-form-month");
+  if (lbl) lbl.textContent = m ? `(${m})` : "";
+  document.getElementById("manual-name").value = "";
+  document.getElementById("manual-phone").value = "";
+  document.getElementById("manual-sessions").value = "1";
+  document.getElementById("manual-total").value = "";
+  document.getElementById("manual-billing-form").classList.remove("hidden");
+}
+
+function closeManualBilling() {
+  document.getElementById("manual-billing-form").classList.add("hidden");
+}
+
+function saveManualBilling() {
+  const month = _currentBillingMonth();
+  if (!month) { showToast("Selecione o mês de referência primeiro", "warning"); return; }
+  const name = document.getElementById("manual-name").value.trim();
+  const phone = document.getElementById("manual-phone").value.trim();
+  const sessions = parseInt(document.getElementById("manual-sessions").value || "1", 10);
+  const total = parseFloat(document.getElementById("manual-total").value);
+  if (!name) { showToast("Informe o nome do paciente", "warning"); return; }
+  if (isNaN(total) || total < 0) { showToast("Informe um valor total válido", "warning"); return; }
+  const btn = document.getElementById("manual-save-btn");
+  btn.disabled = true; btn.textContent = "Salvando…";
+  api("/dashboard/api/billing/manual", { method: "POST", body: JSON.stringify({
+    month, patient_name: name, phone, sessions_count: sessions, total_amount: total
+  })}).then(() => {
+    closeManualBilling();
+    showToast("Cobrança avulsa adicionada", "success");
+    loadBillingPreview();
+  }).catch(() => {
+    showToast("Erro ao adicionar cobrança", "warning");
+  }).finally(() => { btn.disabled = false; btn.textContent = "Salvar"; });
+}
+
+function editManualBilling(id, name, phone, sessions, total) {
+  const novoTotal = prompt(`Valor total da cobrança avulsa de ${name} (R$):`, total);
+  if (novoTotal === null) return;
+  const v = parseFloat(String(novoTotal).replace(",", "."));
+  if (isNaN(v) || v < 0) { showToast("Valor inválido", "warning"); return; }
+  api(`/dashboard/api/billing/manual/${id}`, { method: "PATCH", body: JSON.stringify({ total_amount: v })})
+    .then(() => { showToast("Valor atualizado", "success"); loadBillingPreview(); })
+    .catch(() => showToast("Erro ao atualizar", "warning"));
+}
+
+function deleteManualBilling(id) {
+  if (!confirm("Remover esta cobrança avulsa?")) return;
+  api(`/dashboard/api/billing/manual/${id}`, { method: "DELETE" })
+    .then(() => { showToast("Cobrança removida"); loadBillingPreview(); })
+    .catch(() => showToast("Erro ao remover", "warning"));
+}
+
+// Ajuste de valor de um paciente da AGENDA no mês (override) — ex.: sessão extra.
+function editBillingValue(phone, name, atual, hasOverride) {
+  const month = _currentBillingMonth();
+  if (!month) { showToast("Selecione o mês de referência", "warning"); return; }
+  const novo = prompt(
+    `Ajustar valor cobrado de ${name} em ${month} (R$):\n` +
+    `Use para sessão extra, desconto ou complemento. Substitui o cálculo da agenda.`,
+    atual);
+  if (novo === null) return;
+  const t = String(novo).trim();
+  // Campo vazio + já tinha override → volta ao cálculo padrão da agenda.
+  if (t === "" && hasOverride) {
+    api(`/dashboard/api/patients/${phone}/billing-override?month=${month}`, { method: "DELETE" })
+      .then(() => { showToast("Valor voltou ao cálculo da agenda", "success"); loadBillingPreview(); })
+      .catch(() => showToast("Erro ao limpar ajuste", "warning"));
+    return;
+  }
+  const v = parseFloat(t.replace(",", "."));
+  if (isNaN(v) || v < 0) { showToast("Valor inválido", "warning"); return; }
+  api(`/dashboard/api/patients/${phone}/billing-override`, { method: "POST", body: JSON.stringify({
+    month, total_amount: v
+  })}).then(() => { showToast("Valor ajustado", "success"); loadBillingPreview(); })
+    .catch(() => showToast("Erro ao ajustar valor", "warning"));
 }
 
 // Compat: chamadas antigas continuam funcionando apontando para a prévia.

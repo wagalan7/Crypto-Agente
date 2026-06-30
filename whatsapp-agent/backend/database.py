@@ -139,6 +139,23 @@ def init_db():
                 updated_at   TEXT DEFAULT (datetime('now')),
                 UNIQUE(tenant_id, phone, month)
             );
+
+            -- Cobranças AVULSAS (manuais): sessão extra fora da agenda, ou
+            -- paciente que nunca falou pelo WhatsApp profissional. Entram na
+            -- prévia/total e podem ser enviadas (se houver telefone). Cada
+            -- registro pertence a um mês e é enviado no máximo UMA vez (sent_at).
+            CREATE TABLE IF NOT EXISTS billing_manual_entries (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id      INTEGER NOT NULL,
+                month          TEXT NOT NULL,          -- 'YYYY-MM'
+                patient_name   TEXT NOT NULL,
+                phone          TEXT DEFAULT '',        -- vazio = só registro, não envia
+                sessions_count INTEGER DEFAULT 1,
+                total_amount   REAL NOT NULL DEFAULT 0,
+                note           TEXT DEFAULT '',
+                sent_at        TEXT,                   -- preenchido ao enviar via WhatsApp
+                created_at     TEXT DEFAULT (datetime('now'))
+            );
         """)
         # Migrações incrementais — seguro rodar múltiplas vezes
         migrations = [
@@ -708,6 +725,79 @@ def delete_billing_override(tenant_id: int, phone: str, month: str) -> None:
         )
 
 
+# ── Cobranças avulsas (manuais) ─────────────────────────────────────────────────
+
+def add_manual_billing_entry(tenant_id: int, month: str, patient_name: str,
+                             phone: str = "", sessions_count: int = 1,
+                             total_amount: float = 0.0, note: str = "") -> int:
+    """Cria uma cobrança avulsa para o mês. Retorna o id criado."""
+    with get_conn() as conn:
+        cur = conn.execute("""
+            INSERT INTO billing_manual_entries
+              (tenant_id, month, patient_name, phone, sessions_count, total_amount, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (tenant_id, month, patient_name, phone or "",
+              int(sessions_count or 0), float(total_amount or 0), note or ""))
+        return cur.lastrowid
+
+
+def get_manual_billing_entries(tenant_id: int, month: str) -> list[dict]:
+    """Cobranças avulsas do mês (mais recentes primeiro)."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM billing_manual_entries
+            WHERE tenant_id = ? AND month = ?
+            ORDER BY created_at DESC, id DESC
+        """, (tenant_id, month)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_manual_billing_entry(tenant_id: int, entry_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM billing_manual_entries WHERE tenant_id = ? AND id = ?",
+            (tenant_id, entry_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_manual_billing_entry(tenant_id: int, entry_id: int, **fields) -> None:
+    """Atualiza campos de uma cobrança avulsa (patient_name, phone,
+    sessions_count, total_amount, note). Ignora campos não permitidos."""
+    allowed = {"patient_name", "phone", "sessions_count", "total_amount", "note"}
+    sets, vals = [], []
+    for k, v in fields.items():
+        if k in allowed and v is not None:
+            sets.append(f"{k} = ?")
+            vals.append(v)
+    if not sets:
+        return
+    vals.extend([tenant_id, entry_id])
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE billing_manual_entries SET {', '.join(sets)} "
+            f"WHERE tenant_id = ? AND id = ?",
+            vals,
+        )
+
+
+def delete_manual_billing_entry(tenant_id: int, entry_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM billing_manual_entries WHERE tenant_id = ? AND id = ?",
+            (tenant_id, entry_id),
+        )
+
+
+def mark_manual_billing_entry_sent(tenant_id: int, entry_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE billing_manual_entries SET sent_at = datetime('now') "
+            "WHERE tenant_id = ? AND id = ?",
+            (tenant_id, entry_id),
+        )
+
+
 # ── Appointments ───────────────────────────────────────────────────────────────
 
 def get_appointments_by_phone(tenant_id: int, phone: str, now_iso: str | None = None) -> list[dict]:
@@ -1206,9 +1296,12 @@ def get_full_patient_history(tenant_id: int, phone: str) -> list[dict]:
 # ── Billing logs ───────────────────────────────────────────────────────────────
 
 def billing_already_sent(tenant_id: int, phone: str, month: str) -> bool:
+    # Ignora cobranças AVULSAS (channel='avulsa'): elas têm dedup próprio
+    # (sent_at na entry) e não devem bloquear a cobrança regular do mês.
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id FROM billing_logs WHERE tenant_id = ? AND phone = ? AND month = ?",
+            "SELECT id FROM billing_logs WHERE tenant_id = ? AND phone = ? "
+            "AND month = ? AND COALESCE(channel,'') != 'avulsa'",
             (tenant_id, phone, month)
         ).fetchone()
     return row is not None
