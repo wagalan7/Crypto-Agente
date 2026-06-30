@@ -1260,6 +1260,36 @@ def get_all_billable_appointments_for_month(tenant_id: int, month_start: str, mo
     return [dict(r) for r in rows]
 
 
+def get_month_appointments_raw(tenant_id: int, month_start: str, month_end: str, now_str: str) -> list[dict]:
+    """TODAS as linhas de agendamento do mês (SEM nenhum filtro de cobrança),
+    para diagnóstico/auditoria. Inclui canceladas, faltas com aviso e futuras —
+    cada linha traz por que entra ou não no faturamento. Read-only."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, phone, patient_name, scheduled_at, confirmed,
+                   COALESCE(cancelled, 0) AS cancelled,
+                   COALESCE(attendance, 'pending') AS attendance
+            FROM appointments
+            WHERE tenant_id = ?
+              AND scheduled_at >= ? AND scheduled_at < ?
+            ORDER BY scheduled_at
+        """, (tenant_id, month_start, month_end)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        sa = d.get("scheduled_at") or ""
+        future = sa > now_str  # ainda não ocorreu → não cobra
+        billable = (
+            int(d.get("cancelled") or 0) == 0
+            and (d.get("attendance") or "pending") != "missed_with_notice"
+            and not future
+        )
+        d["future"] = future
+        d["counts_for_billing"] = billable
+        out.append(d)
+    return out
+
+
 def get_session_counts_by_month(tenant_id: int, month_start: str, month_end: str) -> dict[str, int]:
     """Quantidade de sessões 'efetivas' por telefone no mês.
 

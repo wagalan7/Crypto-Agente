@@ -2016,6 +2016,122 @@ def dash_billing_preview(request: Request, month: str | None = None):
             "history": history, "history_total": history_total}
 
 
+@app.get("/dashboard/api/billing/diagnose")
+def dash_billing_diagnose(request: Request, month: str | None = None):
+    """Diagnóstico READ-ONLY da contagem de sessões do mês (não envia, não altera).
+
+    Mostra, paciente por paciente com valor cadastrado:
+    - quantas sessões a cobrança ESTÁ contando (com dedup, = o que o painel mostra)
+    - quantas sessões casam com o telefone SEM dedup (raw)
+    - cada linha do mês (data, telefone gravado, presença, cancelada, futura)
+    e detecta as 2 causas clássicas de divergência:
+    - COLISÃO: uma mesma sessão casa com >1 paciente (variantes de telefone se
+      sobrepõem → a 1ª em ordem alfabética "rouba" → outra fica a menos)
+    - DUPLICADA: 2+ linhas pro mesmo telefone+horário (conta a mais)
+
+    Aceita token via header X-Dashboard-Token ou ?token= (abrível no navegador)."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _Zi
+    from calendar import monthrange as _mr
+    token = request.headers.get("X-Dashboard-Token", "") or request.query_params.get("token", "")
+    tenant = _get_tenant_by_token(token)
+    now = _dt.now(_Zi("America/Sao_Paulo")).replace(tzinfo=None)
+    if month:
+        try:
+            y, m = [int(x) for x in month.split("-")]
+        except Exception:
+            y, m = now.year, now.month
+    else:
+        y, m = now.year, now.month
+    month_str = f"{y:04d}-{m:02d}"
+    month_start = f"{y:04d}-{m:02d}-01T00:00:00"
+    last_day = _mr(y, m)[1]
+    month_end = f"{y:04d}-{m:02d}-{last_day:02d}T23:59:59"
+    now_str = now.isoformat(timespec="seconds")
+    tid = tenant["id"]
+
+    # 1) Por paciente com valor: casamento por variantes (espelha a cobrança),
+    #    SEM o dedup de billed_ids → mostra o "bruto" que cada um reivindica.
+    id_to_claimers: dict = {}
+    patients_out = []
+    for patient in db.get_patients_with_price(tid):
+        phone = patient["phone"]
+        if not phone:
+            continue
+        sessions = db.get_valid_sessions_for_month(tid, phone, month_start, month_end, now_str)
+        rows = []
+        for s in sessions:
+            sid = s.get("id")
+            rows.append({
+                "id": sid,
+                "scheduled_at": s.get("scheduled_at"),
+                "phone_gravado": s.get("phone"),
+                "nome_gravado": s.get("patient_name"),
+                "attendance": s.get("attendance"),
+                "cancelled": s.get("cancelled"),
+            })
+            if sid is not None:
+                id_to_claimers.setdefault(sid, []).append(patient.get("name") or phone)
+        patients_out.append({
+            "name": patient.get("name") or phone,
+            "phone_cadastrado": phone,
+            "variantes": sorted(db._phone_variants(phone)),
+            "raw_match": len(sessions),
+            "sessions": rows,
+        })
+
+    # 2) Replica o dedup REAL da cobrança (1º paciente alfabético fica com a sessão)
+    #    para mostrar o "como está sendo cobrado" ao lado do bruto.
+    billed_ids: set = set()
+    billed_count: dict = {}
+    for patient in db.get_patients_with_price(tid):
+        phone = patient["phone"]
+        if not phone:
+            continue
+        sessions = db.get_valid_sessions_for_month(tid, phone, month_start, month_end, now_str)
+        sessions = [s for s in sessions if s.get("id") not in billed_ids]
+        for s in sessions:
+            if s.get("id") is not None:
+                billed_ids.add(s["id"])
+        billed_count[patient.get("name") or phone] = len(sessions)
+    for p in patients_out:
+        p["cobrado_agora"] = billed_count.get(p["name"], 0)
+
+    # 3) COLISÕES: sessões reivindicadas por mais de um paciente cadastrado.
+    collisions = [
+        {"appointment_id": sid, "reivindicada_por": names}
+        for sid, names in id_to_claimers.items() if len(names) > 1
+    ]
+
+    # 4) DUPLICADAS: mesma pessoa (telefone normalizado) + mesmo horário, 2+ linhas.
+    raw_month = db.get_month_appointments_raw(tid, month_start, month_end, now_str)
+    dup_map: dict = {}
+    for a in raw_month:
+        if not a.get("counts_for_billing"):
+            continue
+        key = (db._norm_digits(a.get("phone") or ""), a.get("scheduled_at") or "")
+        dup_map.setdefault(key, []).append(a)
+    duplicates = [
+        {"phone": k[0], "scheduled_at": k[1],
+         "ids": [x["id"] for x in v], "nomes": sorted({x.get("patient_name") or "" for x in v})}
+        for k, v in dup_map.items() if len(v) > 1
+    ]
+
+    return {
+        "month": month_str,
+        "patients": sorted(patients_out, key=lambda x: (x["name"] or "").lower()),
+        "collisions": collisions,
+        "duplicates": duplicates,
+        "raw_month_rows": raw_month,
+        "totais": {
+            "pacientes_com_valor": len(patients_out),
+            "colisoes": len(collisions),
+            "duplicadas": len(duplicates),
+            "linhas_no_mes": len(raw_month),
+        },
+    }
+
+
 @app.post("/admin/confirmacoes/disparar")
 async def disparar_confirmacoes():
     """Dispara confirmações de amanhã agora mesmo (ignora restrição de horário)."""
