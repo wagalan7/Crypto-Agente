@@ -1118,12 +1118,17 @@ def get_patients_with_price(tenant_id: int) -> list[dict]:
 
 
 def get_valid_sessions_for_month(tenant_id: int, phone: str, month_start: str, month_end: str, now_str: str) -> list[dict]:
-    """Sessões que entram no faturamento do mês.
+    """Sessões que entram no faturamento do mês — MESMO critério da agenda.
 
-    Critério: confirmadas, ocorreram dentro do mês, e:
-    - attendance != 'missed_with_notice'  (não compareceu com aviso → NÃO cobra)
+    Critério (espelha get_session_counts_by_month, a contagem do painel):
+    - ocorreram dentro do mês (e já passaram: scheduled_at <= agora)
     - cancelled = 0
+    - attendance != 'missed_with_notice'  (cancelou com aviso → NÃO cobra)
     'attended', 'missed_no_notice' e 'pending' (default) entram no cálculo.
+
+    NÃO exige confirmed=1: a sessão pode ter acontecido sem o paciente ter
+    respondido "SIM" à mensagem de confirmação. A cobrança segue o calendário,
+    não a resposta à confirmação (antes, sessões reais ficavam de fora).
 
     Casa o telefone em TODAS as variantes plausíveis (com/sem DDI 55 e o "9"
     extra do celular). O Z-API às vezes entrega o mesmo contato em formatos
@@ -1139,13 +1144,29 @@ def get_valid_sessions_for_month(tenant_id: int, phone: str, month_start: str, m
         rows = conn.execute(f"""
             SELECT * FROM appointments
             WHERE tenant_id = ? AND phone IN ({ph})
-              AND confirmed = 1
               AND cancelled = 0
               AND COALESCE(attendance, 'pending') != 'missed_with_notice'
               AND scheduled_at >= ? AND scheduled_at < ?
               AND scheduled_at <= ?
             ORDER BY scheduled_at
         """, (tenant_id, *variants, month_start, month_end, now_str)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_all_billable_appointments_for_month(tenant_id: int, month_start: str, month_end: str, now_str: str) -> list[dict]:
+    """Todos os agendamentos cobráveis do mês (mesmo critério da agenda), com
+    id/phone/patient_name. Usado pela PRÉVIA de cobrança para mostrar também
+    contatos que têm sessão mas ainda não têm valor cadastrado."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, phone, patient_name, scheduled_at FROM appointments
+            WHERE tenant_id = ?
+              AND cancelled = 0
+              AND COALESCE(attendance, 'pending') != 'missed_with_notice'
+              AND scheduled_at >= ? AND scheduled_at < ?
+              AND scheduled_at <= ?
+            ORDER BY scheduled_at
+        """, (tenant_id, month_start, month_end, now_str)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -1208,6 +1229,17 @@ def get_billing_logs(tenant_id: int, limit: int = 50) -> list[dict]:
             SELECT * FROM billing_logs WHERE tenant_id = ?
             ORDER BY sent_at DESC LIMIT ?
         """, (tenant_id, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_billing_logs_for_month(tenant_id: int, month: str) -> list[dict]:
+    """Histórico de cobranças efetivamente enviadas no mês de referência
+    (month no formato 'YYYY-MM'). Mais recentes primeiro."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM billing_logs WHERE tenant_id = ? AND month = ?
+            ORDER BY sent_at DESC
+        """, (tenant_id, month)).fetchall()
     return [dict(r) for r in rows]
 
 

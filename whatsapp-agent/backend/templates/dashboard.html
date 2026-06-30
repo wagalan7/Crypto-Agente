@@ -615,7 +615,7 @@
       <div class="flex items-center gap-3 mb-3">
         <div class="flex-1">
           <label class="block text-xs text-gray-500 mb-1">Mês de referência</label>
-          <input type="month" id="billing-month"
+          <input type="month" id="billing-month" onchange="loadBillingPreview()"
             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
         </div>
         <button onclick="dispararCobrancas()" id="btn-cobrar"
@@ -637,13 +637,23 @@
         </button>
       </div>
 
-      <!-- Billing logs table -->
+      <!-- Prévia da cobrança do mês (baseada na agenda) -->
       <div class="border-t border-gray-100 pt-3">
         <div class="flex items-center justify-between mb-2">
-          <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide">Histórico de cobranças</p>
-          <button onclick="loadBillingLogs()" class="text-xs text-brand">↻ Atualizar</button>
+          <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide">Sessões do mês (prévia da cobrança)</p>
+          <button onclick="loadBillingPreview()" class="text-xs text-brand">↻ Atualizar</button>
         </div>
-        <div id="billing-logs" class="overflow-x-auto">
+        <p class="text-[11px] text-gray-400 mb-2">Calculado pela agenda do mês selecionado. ✓ = já cobrado · ⏸ = pausado · ⚠ = sem valor cadastrado.</p>
+        <div id="billing-preview" class="overflow-x-auto">
+          <p class="text-xs text-gray-400 text-center py-3">Carregando...</p>
+        </div>
+      </div>
+
+      <!-- Histórico de cobranças efetivamente enviadas no mês selecionado -->
+      <div class="border-t border-gray-100 pt-3 mt-3">
+        <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Histórico de envios do mês</p>
+        <p class="text-[11px] text-gray-400 mb-2">Cobranças que já foram disparadas para este mês de referência (data, paciente e valor).</p>
+        <div id="billing-history" class="overflow-x-auto">
           <p class="text-xs text-gray-400 text-center py-3">Carregando...</p>
         </div>
       </div>
@@ -2286,6 +2296,7 @@ function initBillingMonth() {
   const el = document.getElementById("billing-month");
   if (el) el.value = `${y}-${m}`;
   loadGlobalBillingStatus();
+  loadBillingPreview();
 }
 
 function _renderGlobalBillingBtn(paused) {
@@ -2340,10 +2351,10 @@ async function dispararCobrancas() {
     const total = (r.results || []).length;
     btn.textContent = `✓ ${n}/${total} enviada(s)`;
     status.textContent = n === 0
-      ? "Nenhuma cobrança enviada (sem sessões confirmadas ou valores cadastrados)."
+      ? "Nenhuma cobrança enviada (sem sessões no mês, valores cadastrados ou cobrança pausada)."
       : `${n} cobrança(s) enviada(s) com sucesso!`;
     status.classList.remove("hidden");
-    loadBillingLogs();
+    loadBillingPreview();
   } catch(e) {
     btn.textContent = "Enviar cobranças";
     btn.disabled = false;
@@ -2351,44 +2362,101 @@ async function dispararCobrancas() {
   }
 }
 
-function loadBillingLogs() {
-  api("/dashboard/api/billing/logs").then(data => {
-    const el = document.getElementById("billing-logs");
-    if (!el) return;
-    const logs = data.logs || [];
-    if (!logs.length) {
-      el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Nenhuma cobrança enviada ainda.</p>';
+function loadBillingPreview() {
+  const monthEl = document.getElementById("billing-month");
+  const month = monthEl && monthEl.value ? monthEl.value : "";
+  const el = document.getElementById("billing-preview");
+  if (!el) return;
+  el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Carregando…</p>';
+  const histEl = document.getElementById("billing-history");
+  if (histEl) histEl.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Carregando…</p>';
+  const url = "/dashboard/api/billing/preview" + (month ? `?month=${month}` : "");
+  api(url).then(data => {
+    const fmt = v => `R$ ${parseFloat(v).toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+    renderBillingHistory(data, fmt);
+    const items = data.items || [];
+    if (!items.length) {
+      el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Nenhuma sessão neste mês.</p>';
       return;
     }
+    const rows = items.map(it => {
+      let status = "", cls = "text-gray-700";
+      if (it.no_price) { status = '<span class="text-orange-600" title="Sem valor cadastrado">⚠ sem valor</span>'; cls = "text-gray-400"; }
+      else if (it.paused) { status = '<span class="text-yellow-700" title="Cobrança pausada">⏸ pausado</span>'; }
+      else if (it.already_sent) { status = '<span class="text-green-600" title="Já cobrado neste mês">✓ enviado</span>'; }
+      else { status = '<span class="text-gray-400">a cobrar</span>'; }
+      const ov = it.has_override ? ' <span class="text-purple-500" title="Valor ajustado manualmente">✏️</span>' : '';
+      const totalTxt = it.no_price ? "—" : fmt(it.total);
+      return `<tr class="border-b border-gray-50 hover:bg-gray-50">
+        <td class="py-1.5 pr-2 font-medium ${cls}">${it.patient_name||it.phone}</td>
+        <td class="py-1.5 pr-2 text-center text-gray-600">${it.sessions}</td>
+        <td class="py-1.5 pr-2 text-right text-gray-700">${totalTxt}${ov}</td>
+        <td class="py-1.5 text-right text-xs">${status}</td>
+      </tr>`;
+    }).join("");
     el.innerHTML = `<table class="w-full text-xs">
       <thead>
         <tr class="text-gray-400 border-b border-gray-100">
           <th class="text-left py-1 pr-2">Paciente</th>
-          <th class="text-left py-1 pr-2">Mês</th>
           <th class="text-center py-1 pr-2">Sessões</th>
           <th class="text-right py-1 pr-2">Total</th>
-          <th class="text-right py-1">Enviado em</th>
+          <th class="text-right py-1">Status</th>
         </tr>
       </thead>
-      <tbody>
-        ${logs.map(l => {
-          const sentAt = l.sent_at ? l.sent_at.replace("T"," ").slice(0,16) : "-";
-          const total = `R$ ${parseFloat(l.total_amount).toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
-          return `<tr class="border-b border-gray-50 hover:bg-gray-50">
-            <td class="py-1.5 pr-2 font-medium text-gray-700">${l.patient_name}</td>
-            <td class="py-1.5 pr-2 text-gray-500">${l.month}</td>
-            <td class="py-1.5 pr-2 text-center text-gray-600">${l.sessions_count}</td>
-            <td class="py-1.5 pr-2 text-right text-gray-700">${total}</td>
-            <td class="py-1.5 text-right text-gray-400">${sentAt}</td>
-          </tr>`;
-        }).join("")}
-      </tbody>
+      <tbody>${rows}</tbody>
+      <tfoot>
+        <tr class="border-t border-gray-200 font-semibold text-gray-700">
+          <td class="py-1.5 pr-2" colspan="2">Total a cobrar${data.global_paused ? ' (pausado)' : ''}</td>
+          <td class="py-1.5 pr-2 text-right" colspan="2">${fmt(data.grand_total||0)}</td>
+        </tr>
+      </tfoot>
     </table>`;
   }).catch(() => {
-    const el = document.getElementById("billing-logs");
-    if (el) el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Erro ao carregar histórico.</p>';
+    el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Erro ao carregar prévia.</p>';
+    if (histEl) histEl.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Erro ao carregar histórico.</p>';
   });
 }
+
+function renderBillingHistory(data, fmt) {
+  const el = document.getElementById("billing-history");
+  if (!el) return;
+  const logs = data.history || [];
+  if (!logs.length) {
+    el.innerHTML = '<p class="text-xs text-gray-400 text-center py-3">Nenhuma cobrança enviada para este mês ainda.</p>';
+    return;
+  }
+  const fmtDate = s => {
+    if (!s) return "—";
+    const d = new Date(s.replace(" ", "T") + (s.includes("T") || s.includes("Z") ? "" : "Z"));
+    return isNaN(d) ? s : d.toLocaleDateString("pt-BR", {day:"2-digit",month:"2-digit",year:"2-digit"});
+  };
+  const rows = logs.map(l => `<tr class="border-b border-gray-50">
+      <td class="py-1.5 pr-2 text-gray-500 whitespace-nowrap">${fmtDate(l.sent_at)}</td>
+      <td class="py-1.5 pr-2 font-medium text-gray-700">${l.patient_name || l.phone}</td>
+      <td class="py-1.5 pr-2 text-center text-gray-600">${l.sessions_count ?? 0}</td>
+      <td class="py-1.5 text-right text-gray-700">${fmt(l.total_amount || 0)}</td>
+    </tr>`).join("");
+  el.innerHTML = `<table class="w-full text-xs">
+    <thead>
+      <tr class="text-gray-400 border-b border-gray-100">
+        <th class="text-left py-1 pr-2">Enviado em</th>
+        <th class="text-left py-1 pr-2">Paciente</th>
+        <th class="text-center py-1 pr-2">Sessões</th>
+        <th class="text-right py-1">Valor</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+    <tfoot>
+      <tr class="border-t border-gray-200 font-semibold text-gray-700">
+        <td class="py-1.5 pr-2" colspan="3">Total enviado no mês</td>
+        <td class="py-1.5 text-right">${fmt(data.history_total||0)}</td>
+      </tr>
+    </tfoot>
+  </table>`;
+}
+
+// Compat: chamadas antigas continuam funcionando apontando para a prévia.
+function loadBillingLogs() { loadBillingPreview(); }
 
 // ── Boas-vindas (primeiro acesso) ─────────────────────────────────────────────
 const WELCOME_KEY = "ci_welcome_done_{{ tenant.slug }}";

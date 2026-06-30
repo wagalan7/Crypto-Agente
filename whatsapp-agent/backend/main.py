@@ -1817,6 +1817,102 @@ async def dash_billing_set_pause(request: Request):
     return {"status": "ok", "paused": paused}
 
 
+@app.get("/dashboard/api/billing/preview")
+def dash_billing_preview(request: Request, month: str | None = None):
+    """Prévia da cobrança do mês com base na AGENDA (calendário).
+
+    Espelha exatamente o que o disparo manual cobraria (mesma contagem de
+    sessões, variantes de telefone, overrides, dedup e pausas), SEM enviar.
+    Mostra também contatos que têm sessão no mês mas ainda não têm valor
+    cadastrado (para a psicóloga não esquecer de cobrar ninguém)."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _Zi
+    from calendar import monthrange as _mr
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    now = _dt.now(_Zi("America/Sao_Paulo")).replace(tzinfo=None)
+    if month:
+        try:
+            y, m = [int(x) for x in month.split("-")]
+        except Exception:
+            y, m = now.year, now.month
+    else:
+        y, m = now.year, now.month
+    month_str = f"{y:04d}-{m:02d}"
+    month_start = f"{y:04d}-{m:02d}-01T00:00:00"
+    last_day = _mr(y, m)[1]
+    month_end = f"{y:04d}-{m:02d}-{last_day:02d}T23:59:59"
+    now_str = now.isoformat(timespec="seconds")
+    tid = tenant["id"]
+    global_paused = db.is_tenant_billing_paused(tid)
+
+    items = []
+    billed_ids: set = set()
+    # 1) Pacientes com valor cadastrado → exatamente o que seria cobrado
+    for patient in db.get_patients_with_price(tid):
+        phone = patient["phone"]
+        if not phone:
+            continue
+        sessions = db.get_valid_sessions_for_month(tid, phone, month_start, month_end, now_str)
+        sessions = [s for s in sessions if s.get("id") not in billed_ids]
+        if not sessions:
+            continue
+        for s in sessions:
+            if s.get("id") is not None:
+                billed_ids.add(s["id"])
+        count = len(sessions)
+        unit = float(patient.get("session_price") or 0)
+        override = db.get_billing_override(tid, phone, month_str)
+        if override is not None:
+            total = float(override["total_amount"])
+        else:
+            total = count * unit
+        paused = bool(
+            patient.get("billing_paused")
+            or db.is_patient_billing_paused(tid, phone)
+            or db.is_agent_paused(tid, phone)
+        )
+        name = sessions[0].get("patient_name") or patient.get("name") or phone
+        items.append({
+            "phone": phone, "patient_name": name, "sessions": count,
+            "unit_price": unit, "total": total,
+            "has_override": override is not None,
+            "paused": paused or global_paused,
+            "already_sent": db.billing_already_sent(tid, phone, month_str),
+            "no_price": False,
+        })
+
+    # 2) Contatos com sessão no mês mas SEM valor cadastrado (avisa, não cobra)
+    leftover: dict[str, dict] = {}
+    for a in db.get_all_billable_appointments_for_month(tid, month_start, month_end, now_str):
+        if a.get("id") in billed_ids:
+            continue
+        ph = a.get("phone") or ""
+        if not ph:
+            continue
+        g = leftover.setdefault(ph, {"phone": ph, "patient_name": a.get("patient_name") or ph, "sessions": 0})
+        g["sessions"] += 1
+        if a.get("patient_name") and (not g["patient_name"] or g["patient_name"] == ph):
+            g["patient_name"] = a["patient_name"]
+    for g in leftover.values():
+        items.append({
+            "phone": g["phone"], "patient_name": g["patient_name"], "sessions": g["sessions"],
+            "unit_price": 0.0, "total": 0.0, "has_override": False,
+            "paused": False, "already_sent": False, "no_price": True,
+        })
+
+    items.sort(key=lambda x: (x["no_price"], (x["patient_name"] or "").lower()))
+    grand_total = sum(it["total"] for it in items if not it["paused"] and not it["no_price"])
+
+    # Histórico do que JÁ foi enviado neste mês de referência (auditoria).
+    history = db.get_billing_logs_for_month(tid, month_str)
+    history_total = sum(float(h.get("total_amount") or 0) for h in history)
+
+    return {"month": month_str, "items": items, "grand_total": grand_total,
+            "global_paused": global_paused,
+            "history": history, "history_total": history_total}
+
+
 @app.post("/admin/confirmacoes/disparar")
 async def disparar_confirmacoes():
     """Dispara confirmações de amanhã agora mesmo (ignora restrição de horário)."""
