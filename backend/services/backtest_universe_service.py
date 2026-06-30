@@ -487,6 +487,7 @@ async def run_universe_backtest(
     outside_offset: int = 0,
     perp_universe: bool = False,
     order_by: str = "volume",
+    history_start: Optional[datetime] = None,
 ) -> dict:
     """Job de background: backtest full-history de top-`limit` perps × `tfs`.
     Idempotente/resumível. Atualiza _PROGRESS. Retorna resumo final.
@@ -634,10 +635,19 @@ async def run_universe_backtest(
              f"(pré-pulados {preskipped} frescos, pendentes {len(pending)})")
     await _persist_progress(force=True)
 
+    # Início do histórico: override (sweep amplo usa janela curta p/ caber no
+    # tempo/CPU) ou full-history (refino). Janela menor = menos barras carregadas
+    # E menos iterações de scan → destrava as moedas 1h gigantes (ex.: 1000SHIB
+    # tinha 45k barras em step_bars=1; o scan não terminava antes do restart).
+    hist_start = history_start or _FULL_HISTORY_START
+
     try:
         for sym, tf in pending:
             if True:
                 _PROGRESS["current"] = f"{sym} {tf}"
+                # Persiste a moeda atual JÁ no início (não só após terminar) → o
+                # painel mostra quem está sendo analisado e dá p/ ver onde trava.
+                await _persist_progress(force=True)
                 try:
                     if await _already_fresh(sym, tf, refresh_days):
                         _PROGRESS["skipped"] += 1
@@ -646,7 +656,7 @@ async def run_universe_backtest(
                         continue
                     res = await asyncio.wait_for(
                         backtest_symbol_tf(
-                            sym, tf, _FULL_HISTORY_START, end_dt, step_bars=step_bars
+                            sym, tf, hist_start, end_dt, step_bars=step_bars
                         ),
                         timeout=_SYMBOL_TIMEOUT_S,
                     )

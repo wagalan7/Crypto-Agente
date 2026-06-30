@@ -62,18 +62,28 @@ def _env_int(name: str, default: int) -> int:
 
 
 async def _run_once() -> dict:
+    from datetime import datetime, timedelta, timezone
     from services import backtest_universe_service as bus
     tfs = [t.strip() for t in os.getenv("SWEEP_WORKER_TFS", "1h,4h").split(",") if t.strip()]
     limit = _env_int("SWEEP_WORKER_LIMIT", 500)
     refresh_days = _env_int("SWEEP_WORKER_REFRESH_DAYS", 7)
     step_bars = _env_int("SWEEP_WORKER_STEP_BARS", 1)
     order_by = os.getenv("SWEEP_WORKER_ORDER_BY", "history").strip() or "history"
+    # Janela de histórico do sweep AMPLO. Full-history (2017) em 1h dá 45k+ barras
+    # por moeda → o scan barra-a-barra não termina num worker de 1 vCPU e o
+    # container reinicia antes (nunca passa da 1ª moeda pesada). Pré-filtro amplo
+    # não precisa de 5 anos: janela curta corta barras E iterações. 0 = ilimitado
+    # (full-history, comportamento antigo). Default 730d (~2 anos).
+    max_hist_days = _env_int("SWEEP_WORKER_MAX_HISTORY_DAYS", 730)
+    history_start = None
+    if max_hist_days > 0:
+        history_start = datetime.now(timezone.utc) - timedelta(days=max_hist_days)
     log.info(f"[worker] iniciando sweep tfs={tfs} limit={limit} "
              f"refresh_days={refresh_days} step_bars={step_bars} order_by={order_by} "
-             f"data_source={os.getenv('BACKTEST_DATA_SOURCE')}")
+             f"max_hist_days={max_hist_days} data_source={os.getenv('BACKTEST_DATA_SOURCE')}")
     return await bus.run_universe_backtest(
         tfs, limit=limit, refresh_days=refresh_days, step_bars=step_bars,
-        order_by=order_by,
+        order_by=order_by, history_start=history_start,
     )
 
 
