@@ -488,6 +488,7 @@ async def run_universe_backtest(
     perp_universe: bool = False,
     order_by: str = "volume",
     history_start: Optional[datetime] = None,
+    include_only_bases: Optional[frozenset] = None,
 ) -> dict:
     """Job de background: backtest full-history de top-`limit` perps × `tfs`.
     Idempotente/resumível. Atualiza _PROGRESS. Retorna resumo final.
@@ -570,7 +571,18 @@ async def run_universe_backtest(
             return syms
         return sorted(syms, key=lambda s: onboard_map.get(_norm_base(s), 1 << 62))
 
-    if perp_universe:
+    if include_only_bases:
+        # Modo "refino": roda SÓ as bases informadas (ex.: a allowlist do PRD),
+        # tipicamente com step_bars=1 + histórico longo — afina os níveis das
+        # moedas que o bot REALMENTE opera. Inverso do modo "outside". Ordena por
+        # histórico (listagem antiga primeiro = mais dados). O skip-fresh torna
+        # idempotente/resumível igual aos outros modos.
+        mode = "refino"
+        inc = {_norm_base(b) for b in include_only_bases}
+        kept = [s for s in symbols if _norm_base(s) in inc]
+        excluded_n = pool_n - len(kept)
+        symbols = _hist_sorted(kept)
+    elif perp_universe:
         # Universo = TODAS as bases com perp ativo, menos a allowlist. Ordena por
         # volume spot (as que já vieram em `symbols`), depois cauda alfabética.
         mode = "perp_universe"
