@@ -381,11 +381,14 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
         fresh.sl_current_price = be_price
         if tp1_partial_usd is not None:
             fresh.tp1_realized_usd = tp1_partial_usd
-        # Se entry no DB estava errado, atualiza + recalcula slippage (estava -100%)
-        if (not fresh.entry_price or fresh.entry_price <= 0) and entry_real:
-            fresh.entry_price = entry_real
+        # Slippage a partir do fill REAL da exchange (entry_real). Corrige tanto o
+        # -100% (entry_price<=0) quanto o 0% FALSO (entry teórico gravado como fill).
+        if entry_real and entry_real > 0:
             from services import real_trade_service
-            await real_trade_service.recompute_entry_slippage(session, fresh)
+            # entry_price (base de PnL) só é sobrescrito se estava inválido (<=0).
+            if not fresh.entry_price or fresh.entry_price <= 0:
+                fresh.entry_price = entry_real
+            await real_trade_service.recompute_entry_slippage(session, fresh, fill_price=entry_real)
         fresh.updated_at = datetime.now(timezone.utc)
         await session.commit()
 
@@ -1306,10 +1309,11 @@ async def backfill_protection(force: bool = False) -> dict:
                     fresh.tp2_order_id = prot.get("tp2_order_id")
                 if fresh.qty_initial is None:
                     fresh.qty_initial = qty_now
-                if (not fresh.entry_price or fresh.entry_price <= 0) and entry_real:
-                    fresh.entry_price = entry_real
+                if entry_real and entry_real > 0:
                     from services import real_trade_service
-                    await real_trade_service.recompute_entry_slippage(session, fresh)
+                    if not fresh.entry_price or fresh.entry_price <= 0:
+                        fresh.entry_price = entry_real
+                    await real_trade_service.recompute_entry_slippage(session, fresh, fill_price=entry_real)
                 if is_post_tp1 and fresh.phase != "post_tp1":
                     fresh.phase = "post_tp1"
                 fresh.updated_at = datetime.now(timezone.utc)

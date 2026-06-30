@@ -51,6 +51,10 @@ async def open_trade(
     exchange_order_id: Optional[str] = None,
     client_order_id: Optional[str] = None,
     notes: Optional[str] = None,
+    # True só quando entry_price é o fill REAL da corretora (avgPrice>0). Quando
+    # False (avg ainda não retornado, ou paper), entry_price é o entry teórico e
+    # o slippage fica None — evita gravar 0% falso. recompute corrige no backfill.
+    entry_is_real_fill: bool = True,
     # Bracket / trade manager (Fase 2)
     sl_order_id: Optional[str] = None,
     tp1_order_id: Optional[str] = None,
@@ -77,7 +81,7 @@ async def open_trade(
         # não retornado) — calcular aqui daria -100% falso. Nesse caso deixa None;
         # recompute_entry_slippage() corrige quando o fill real é backfillado.
         slippage = None
-        if rec is not None and rec.entry and entry_price and entry_price > 0:
+        if entry_is_real_fill and rec is not None and rec.entry and entry_price and entry_price > 0:
             diff = (entry_price - rec.entry) / rec.entry * 100
             # Em long, slippage positivo é ruim (pagou caro); em short, negativo é ruim.
             slippage = round(diff if side == "long" else -diff, 4)
@@ -122,23 +126,30 @@ async def open_trade(
         return _to_dict(trade)
 
 
-async def recompute_entry_slippage(session, trade) -> None:
-    """Recalcula entry_slippage_pct depois que o entry_price REAL é backfillado.
+async def recompute_entry_slippage(session, trade, fill_price: Optional[float] = None) -> None:
+    """Recalcula entry_slippage_pct a partir do fill REAL da corretora.
     Auto-trade a mercado abre com avgPrice=0 (fill assíncrono); o slippage da
-    criação ficaria travado em -100%. Quando o trade-manager descobre o fill
-    real e seta trade.entry_price, chamamos isto pra corrigir. Usa a mesma
-    sessão do caller (não commita — o caller commita)."""
+    criação fica None até aqui. Quando o trade-manager descobre o fill real,
+    chamamos isto pra calcular o slippage verdadeiro.
+
+    `fill_price` (quando >0) é a fonte de verdade do preço de entrada real
+    (ex.: avgPrice da posição na exchange) e tem prioridade sobre
+    trade.entry_price — isso permite corrigir o 0% FALSO mesmo quando o
+    entry_price do DB já é >0 (mas era o entry TEÓRICO, não o fill). Não
+    altera trade.entry_price (base de PnL); só a telemetria de slippage.
+    Usa a mesma sessão do caller (não commita — o caller commita)."""
     try:
         if not getattr(trade, "recommendation_id", None):
             return
-        if not trade.entry_price or trade.entry_price <= 0:
+        px = fill_price if (fill_price and fill_price > 0) else trade.entry_price
+        if not px or px <= 0:
             return
         rec_entry = (await session.execute(
             select(RecommendationSnapshot.entry)
             .where(RecommendationSnapshot.id == trade.recommendation_id)
         )).scalar_one_or_none()
         if rec_entry and rec_entry > 0:
-            diff = (trade.entry_price - rec_entry) / rec_entry * 100
+            diff = (px - rec_entry) / rec_entry * 100
             trade.entry_slippage_pct = round(diff if trade.side == "long" else -diff, 4)
     except Exception as e:
         log.warning(f"[real-trade] recompute slippage #{getattr(trade, 'id', '?')} falhou: {e}")

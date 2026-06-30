@@ -3235,6 +3235,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             exchange_name = os.getenv("EXCHANGE", "binance")
             source = "shadow"
             entry_actual = entry
+            # entry_actual cai no entry TEÓRICO até a corretora devolver avgPrice
+            # real. Só marcamos fill real quando avg>0 — senão o slippage seria 0%
+            # falso (mascara o slippage real). Telemetria fica None até backfill.
+            entry_is_real_fill = False
 
             if not SHADOW_ENABLED:
                 # 0. Trava de dinheiro real (go-live #1) — produção exige
@@ -3293,7 +3297,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 avg = result.get("avgPrice") or result.get("avgFillPrice")
                 if avg:
                     try:
-                        entry_actual = float(avg)
+                        _avg_f = float(avg)
+                        if _avg_f > 0:
+                            entry_actual = _avg_f
+                            entry_is_real_fill = True  # fill real confirmado
                     except Exception:
                         pass
                 source = "auto"
@@ -3386,6 +3393,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 exchange_order_id=exchange_order_id,
                 client_order_id=client_order_id,
                 notes=f"{source} auto-open (tier {tier})" + (" [filler]" if rec.get("_is_filler") else ""),
+                entry_is_real_fill=entry_is_real_fill,
                 sl_order_id=_sl_oid,
                 tp1_order_id=_tp1_oid,
                 tp2_order_id=_tp2_oid,
