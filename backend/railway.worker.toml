@@ -1,6 +1,7 @@
 [build]
 builder = "dockerfile"
 dockerfilePath = "Dockerfile"
+watchPatterns = ["backend/**"]
 
 [deploy]
 startCommand = "python sweep_worker.py"
