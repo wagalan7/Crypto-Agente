@@ -414,7 +414,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         await wa.send_message(
             tenant, phone,
             f"Recebi seu áudio! 🎙️ Vou repassar para a {psy_name}, "
-            f"que entra em contato em breve para te responder por aqui. 💙",
+            f"que entra em contato em breve para te responder por aqui. 💖",
         )
         return
 
@@ -461,7 +461,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                     f"*{nome_disp}* avisou que vai cancelar.{linha_quando}\n"
                     f"Número: {phone_norm}\n\n"
                     f"O horário foi liberado na agenda. Se quiser aplicar a política "
-                    f"de cobrança, entre em contato com o(a) paciente. 💙"
+                    f"de cobrança, entre em contato com o(a) paciente. 💖"
                 )
                 await wa.send_message(tenant, psy_phone, notif)
                 logger.info(f"[{tenant['slug']}] Notificação de cancelamento enviada para psicóloga")
@@ -552,7 +552,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                     f"*{nome_txt}* respondeu *NÃO* ao pedido de confirmação.{linha_quando}\n"
                     f"Número: {phone_norm}\n\n"
                     f"Pode ser que precise remarcar ou cancelar — recomendo falar "
-                    f"com o(a) paciente. 💙"
+                    f"com o(a) paciente. 💖"
                 )
                 await wa.send_message(tenant, psy_phone, notif)
                 logger.info(f"[{tenant['slug']}] Notificação de NEGATIVA enviada para psicóloga")

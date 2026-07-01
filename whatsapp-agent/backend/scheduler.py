@@ -60,30 +60,33 @@ def _quando_label(appt: dict) -> str:
 
 
 _DEFAULT_CONFIRMATION = (
-    "Olá, {nome}! 😊 Passando para confirmar sua sessão {quando}:\n\n"
+    "Oi, {nome}! 😊 Tudo bem?\n\n"
+    "Passando pra lembrar da sua sessão {quando}:\n\n"
     "📅 {data_hora}\n\n"
-    "Você pode confirmar presença? Responda *SIM* para confirmar "
-    "ou me avise se precisar remarcar. 🙏\n\n"
+    "Consegue confirmar sua presença pra mim? É só responder *SIM* 💖 "
+    "Se precisar remarcar, também pode me avisar sem problema.\n\n"
+    "Até breve!\n"
     "— {psicologa}"
 )
 
 _DEFAULT_FOLLOWUP = (
-    "Olá, {nome}! 😊 Sua sessão de *hoje* ainda não foi confirmada:\n\n"
+    "Oi, {nome}! 😊 Vi aqui que a sua sessão de *hoje* ainda não foi confirmada:\n\n"
     "📅 {data_hora}\n\n"
-    "Por favor responda *SIM* para confirmar sua presença, ou me avise "
-    "caso precise cancelar ou remarcar.\n\n"
-    "⚠️ *Lembrete:* conforme combinado na primeira sessão, sessões não "
-    "canceladas com antecedência e com ausência serão cobradas normalmente, "
-    "pois o horário fica reservado exclusivamente para você.\n\n"
+    "Consegue confirmar sua presença? É só responder *SIM* 💖 — e se precisar "
+    "cancelar ou remarcar, é só me falar, combinado?\n\n"
+    "⚠️ *Lembrete carinhoso:* como combinamos na primeira sessão, o horário "
+    "fica reservado só pra você, então sessões não canceladas com antecedência "
+    "acabam sendo cobradas normalmente.\n\n"
+    "Até logo!\n"
     "— {psicologa}"
 )
 
 _DEFAULT_BILLING = (
-    "{nome} 🌷\n"
-    "Espero que esteja tudo bem.\n\n"
-    "Gostaria de informar o valor das sessões do último mês.\n\n"
-    "Fechamos em R$ {total} 🩷\n\n"
-    "Qualquer dúvida estou à disposição."
+    "Oi, {nome}! 🌷\n"
+    "Espero que esteja tudo bem por aí.\n\n"
+    "Passando só pra compartilhar o valor das sessões do último mês:\n\n"
+    "Fechamos em R$ {total} 💖\n\n"
+    "Qualquer dúvida, é só me chamar, tá? 😊"
 )
 
 

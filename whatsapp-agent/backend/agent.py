@@ -149,6 +149,16 @@ REGRAS:
 - Se dúvida clínica ou situação sensível → encaminhar para humano
 - Não insistir se o paciente não responder
 
+TOM E LINGUAGEM — SOE COMO UMA PESSOA, NÃO COMO UM ROBÔ:
+- Fale como uma secretária simpática e próxima falaria no WhatsApp: leve, calorosa e natural.
+- Use contrações e linguagem coloquial do dia a dia ("tá", "pra", "prontinho", "combinado?", "sem problema", "é só me chamar").
+- Varie as frases — NÃO repita sempre a mesma estrutura ("Olá, {{nome}}! 😊 ...") em toda mensagem. Alterne aberturas: "Oi, {{nome}}!", "Prontinho!", "Perfeito!", "Que bom!", conforme o momento.
+- Chame o paciente pelo primeiro nome de vez em quando, com naturalidade — não em toda frase.
+- Emojis com moderação (1, no máximo 2 por mensagem), pra dar calor sem exagero.
+- Evite jargão robótico e formalidade fria ("prezado", "solicito", "informamos que", "conforme supracitado"). Escreva como você falaria de verdade.
+- Seja concisa: mensagens curtas soam mais humanas que parágrafos longos.
+- O coração padrão do assistente é 💖 (use esse, não outros corações).
+
 HORÁRIO DE FUNCIONAMENTO: Seg–Sex, {tenant['working_hours_start']:02d}:00–{tenant['working_hours_end']:02d}:00
 CONSULTÓRIO: {tenant['name']}
 PSICÓLOGA: {tenant['psychologist_name']}
@@ -215,6 +225,13 @@ FILTRO DE PERÍODO AO OFERECER HORÁRIOS — REGRA CRÍTICA:
 - Se NÃO houver horário no período pedido, diga claramente: "Infelizmente não tenho horários disponíveis na [parte do dia] pedida. Posso oferecer [outros períodos com horários]?" — NUNCA finja oferecer "tarde" quando só tem manhã.
 - Depois de mostrar as opções filtradas, ofereça abrir o leque caso o paciente queira: "Se preferir, posso te mostrar também os outros dias/horários disponíveis. 😊"
 
+AO CONCLUIR UM AGENDAMENTO OU REMARCAÇÃO (action create/update) — REGRA CRÍTICA:
+- Responda confirmando o horário marcado de forma calorosa e natural (com o primeiro nome do paciente).
+- NÃO peça "Você pode confirmar presença?" NEM "responda SIM" nesse momento. A confirmação de presença é enviada AUTOMATICAMENTE pelo sistema cerca de 1 dia ANTES da sessão — não agora, na hora de marcar.
+- Diga, com leveza, que você vai lembrar o paciente perto da data.
+- Exemplo de tom: "Prontinho, {{primeiro_nome}}! 😊 Sua sessão ficou marcada para [slot]. Vou te lembrar um dia antes, combinado? Qualquer coisa, é só me chamar. 💖"
+- NUNCA escreva "confirmar presença", "responda SIM" ou cobre confirmação logo após marcar.
+
 CONFIRMAÇÃO — REGRAS CRÍTICAS:
 - Se o paciente responder com QUALQUER expressão positiva APÓS receber mensagem de confirmação → use action: "confirm" e data: {{"appointment_id": ID_DA_CONSULTA}}
 - Exemplos que SÃO confirmação: "SIM", "sim", "siim", "siimm", "simm", "ok", "confirmo", "confirmado", "pode ser", "tô lá", "estarei lá", "claro", "com certeza", "sem dúvidas", "com certeza", "pode", "vai", "vou estar", "estarei", "confirmar sim", "Confirmo simm", "pode sim", "ótimo", "tudo bem", "perfeito", "combinado"
@@ -267,7 +284,7 @@ Comprovante de pagamento / PIX:
 Mensagem de urgência / crise emocional:
 - Se o paciente expressar sofrimento intenso, crise, pensamentos de se machucar ou pedir ajuda urgente: responda com acolhimento, diga que a {tenant['psychologist_name']} foi notificada e vai entrar em contato o quanto antes.
 - NUNCA minimize o sofrimento ou dê orientação clínica.
-- Exemplo: "Fico feliz que você entrou em contato 💙 Sua mensagem chegou para a {tenant['psychologist_name']} e ela vai te responder o quanto antes. Você não está sozinho(a). 🌸"
+- Exemplo: "Fico feliz que você entrou em contato 💖 Sua mensagem chegou para a {tenant['psychologist_name']} e ela vai te responder o quanto antes. Você não está sozinho(a). 🌸"
 - Use action "none" e intent "other"
 
 CONTEÚDO PESSOAL / DESABAFO — REGRA ABSOLUTA (LEIA COM ATENÇÃO):
@@ -281,7 +298,7 @@ CONTEÚDO PESSOAL / DESABAFO — REGRA ABSOLUTA (LEIA COM ATENÇÃO):
   "compartilhar com você", "estou me sentindo", relatos longos do dia, etc.
 - Sua ÚNICA resposta nesses casos deve ser, de forma calorosa mas curta:
   "Olá! 😊 Recebi sua mensagem. Vou repassar para a {tenant['psychologist_name']},
-   que entra em contato em breve para conversar com você com a atenção que isso merece. 💙"
+   que entra em contato em breve para conversar com você com a atenção que isso merece. 💖"
 - Use intent "other" e action "none". NÃO tente acolher, opinar, orientar,
   validar sentimentos, dar conselhos, nem fazer perguntas de aprofundamento.
 - NÃO mencione confirmação de consulta. NÃO ofereça horários. NÃO faça
@@ -297,7 +314,7 @@ PRIMEIRO CONTATO / NOVO PACIENTE — REGRA ABSOLUTA:
   → NÃO tente explicar nada. NÃO invente. NÃO ofereça a primeira sessão.
 - Resposta ÚNICA: "Olá! 😊 Recebi sua mensagem. Vou repassar para a
   {tenant['psychologist_name']}, que entra em contato em breve para te passar
-  essas informações com calma. 💙"
+  essas informações com calma. 💖"
 - intent "new_patient" (se for o caso) ou "other", action "none".
 
 PERGUNTAS SOBRE VALOR / PAGAMENTO / PRAZO — REGRA ABSOLUTA:
@@ -306,21 +323,21 @@ PERGUNTAS SOBRE VALOR / PAGAMENTO / PRAZO — REGRA ABSOLUTA:
   pergunta sobre dinheiro/cobrança que NÃO seja resposta a uma cobrança
   já enviada: NÃO responda com valor nem prazo.
 - Resposta ÚNICA: "Vou entrar em contato com a {tenant['psychologist_name']}
-  para te passar essa informação. 💙"
+  para te passar essa informação. 💖"
 - action "none".
 
 FRASES PROIBIDAS (NUNCA escreva isso):
 - "Quer que eu a notifique para ela te responder?" / "Quer que eu avise ela?"
   → em vez disso: "Vou entrar em contato com a {tenant['psychologist_name']}
   para te passar a informação."
-- "Te abraço" / "Um abraço" / "Abraço" (com ou sem emoji 💙)
-  → não usar despedidas afetivas. Encerre com "💙" sozinho ou sem nada.
+- "Te abraço" / "Um abraço" / "Abraço" (com ou sem emoji 💖)
+  → não usar despedidas afetivas. Encerre com "💖" sozinho ou sem nada.
 - "O que você precisa conversar com a {tenant['psychologist_name']}?" /
   "Qual o assunto?" / "Pode me contar o que está acontecendo?"
   → SIGILO. NUNCA pergunte o motivo, o assunto, o que a pessoa quer
   conversar, nem peça detalhes. A IA não tem acesso ao conteúdo clínico.
   Se a pessoa quiser falar com a psicóloga, apenas: "Claro! 😊 Vou avisar
-  a {tenant['psychologist_name']} e ela te responde em breve por aqui. 💙"
+  a {tenant['psychologist_name']} e ela te responde em breve por aqui. 💖"
 - "Como posso te ajudar hoje?" / "No que posso ajudar?" no fim das frases
   → deixe a pessoa puxar o assunto.
 
@@ -328,7 +345,7 @@ CONFIRMAÇÃO FUTURA (paciente disse que vai confirmar depois):
 - Se o paciente disser "posso confirmar amanhã?", "te aviso depois",
   "confirmo mais tarde", "deixa eu ver e te falo": NÃO diga "te esperamos
   quarta" nem dê como confirmado. Apenas: "Claro, sem problema! 😊
-  Fico no aguardo da sua confirmação. 💙"
+  Fico no aguardo da sua confirmação. 💖"
 - action "none".
 
 CANCELAMENTO — REGRA ABSOLUTA (NÃO CONFUNDIR COM REMARCAÇÃO):
@@ -347,7 +364,7 @@ CANCELAMENTO — REGRA ABSOLUTA (NÃO CONFUNDIR COM REMARCAÇÃO):
   vai entrar em contato — SEM oferecer reagendamento, SEM cobrar, SEM citar
   política. Exemplo: "Entendi, {{primeiro_nome}}! 😊 Vou avisar a
   {tenant['psychologist_name']} sobre o cancelamento e ela entra em contato
-  com você em breve. 💙"
+  com você em breve. 💖"
 - DIFERENÇA: se o paciente pedir para MUDAR/REMARCAR para outro dia/horário
   ("preciso mudar para quinta", "dá pra remarcar?") → aí sim é remarcação
   (intent "reschedule"), e aí pergunte a disponibilidade normalmente.
@@ -391,8 +408,8 @@ Paciente enviando comprovante de pagamento (PIX, transferência, etc.):
 
 EXEMPLOS DE TOM:
 
-Confirmação:
-"Olá! Tudo bem? 😊 Confirmando sua sessão amanhã às [hora]. Você pode confirmar presença?"
+Ao marcar / remarcar uma sessão (NÃO peça confirmação de presença agora):
+"Prontinho, [primeiro_nome]! 😊 Sua sessão ficou marcada para [slot]. Vou te lembrar um dia antes, combinado? 💖"
 
 Atraso pequeno:
 "Sem problema! 😊 Te esperamos hoje às [hora], pode chegar."
@@ -708,7 +725,7 @@ def _try_deterministic_decline(tenant: dict, phone: str, text: str):
     psic = tenant.get("psychologist_name") or "a psicóloga"
     saud = f"Entendi, {nome}! 😊" if nome else "Entendi! 😊"
     reply = (f"{saud} Sem problema. Vou avisar a {psic} e ela entra em contato "
-             f"com você em breve por aqui. 💙")
+             f"com você em breve por aqui. 💖")
     logger.info(f"[{tenant['slug']}][{phone}] NEGATIVA DETERMINÍSTICA à confirmação id={appt['id']}")
     event = {"type": "confirmation_declined", "data": {
         "phone": phone,
@@ -833,9 +850,9 @@ def _do_reschedule(tenant: dict, phone: str, appt: dict, slot: datetime) -> str:
             logger.warning(f"[caldav] reschedule determinístico falhou: {e}")
     formatted = cal.format_slots([slot])[0]
     nome = patient_name.split()[0] if patient_name else ""
-    saud = f"Pronto, {nome}! ✅" if nome else "Pronto! ✅"
+    saud = f"Prontinho, {nome}! ✅" if nome else "Prontinho! ✅"
     logger.info(f"[{tenant['slug']}][{phone}] REMARCAÇÃO DETERMINÍSTICA id={appt_id} → {slot.isoformat()}")
-    return f"{saud} Sua sessão foi remarcada para {formatted}. Até lá! 🌸"
+    return f"{saud} Sua sessão foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
 
 
 def _try_deterministic_reschedule(tenant: dict, phone: str, text: str):
@@ -1019,7 +1036,7 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
                              "vou repassar para a psicóloga, que entra em contato em breve.")
             elif any(k in t for k in ("cancelar", "desmarcar", "não vou poder", "nao vou poder")):
                 resp_text = ("Entendi! 😊 Vou avisar a psicóloga sobre o cancelamento "
-                             "e ela entra em contato com você em breve. 💙")
+                             "e ela entra em contato com você em breve. 💖")
             elif any(k in t for k in ("remarcar", "mudar")):
                 resp_text = ("Anotado! 😊 Vou repassar seu pedido para a psicóloga, "
                              "que retorna em breve para combinar com você.")
@@ -1071,8 +1088,8 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
 import re as _re_san
 
 _FORBIDDEN_PATTERNS = [
-    # "Te abraço! 💙" / "Um abraço" / "Abraço(s)" no fim
-    _re_san.compile(r"\s*(?:te\s+abra[çc]o|um\s+abra[çc]o|abra[çc]os?)[\s!.,💙💗🩷🌸😊]*$", _re_san.IGNORECASE),
+    # "Te abraço! 💖" / "Um abraço" / "Abraço(s)" no fim
+    _re_san.compile(r"\s*(?:te\s+abra[çc]o|um\s+abra[çc]o|abra[çc]os?)[\s!.,💖💗🩷🌸😊]*$", _re_san.IGNORECASE),
     # "Quer que eu (a) notifique/avise..."
     _re_san.compile(r"\s*Quer que eu\s+a?\s*notifi\w+[^?]*\?", _re_san.IGNORECASE),
     _re_san.compile(r"\s*Quer que eu\s+a?\s*avis\w+[^?]*\?", _re_san.IGNORECASE),
@@ -1099,7 +1116,7 @@ def _strip_forbidden_phrases(text: str) -> str:
             break
     # Se ficou só pontuação/emoji solto no final, limpa.
     out = _re_san.sub(r"[\s]+([!?.])", r"\1", out).strip()
-    return out or "Olá! 😊 Vou repassar sua mensagem. 💙"
+    return out or "Olá! 😊 Vou repassar sua mensagem. 💖"
 
 
 def _execute_action(tenant: dict, resp: AgentResponse,
@@ -1159,7 +1176,7 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 or "remarc" in low or "qual dia" in low or "opções" in low or "opcoes" in low):
             saud = f"Entendi, {nome}!" if nome else "Entendi!"
             reply = (f"{saud} 😊 Vou avisar a {psy} sobre o cancelamento e ela "
-                     f"entra em contato com você em breve. 💙")
+                     f"entra em contato com você em breve. 💖")
         return reply, {"type": "appointment_cancelled",
                        "data": {"phone": phone,
                                 "patient_name": (appt or {}).get("patient_name", "")}}
@@ -1206,7 +1223,7 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 fixed_text = _PAT.sub(formatted, text or "")
                 reply = fixed_text.replace("[slot]", formatted).replace("[hora]", formatted)
                 if not reply.strip() or formatted not in reply:
-                    reply = f"Pronto! ✅ {name.split()[0] if name else 'Sua consulta'} agendado(a) para {formatted}. Até lá! 😊"
+                    reply = f"Prontinho! ✅ {name.split()[0] if name else 'Sua consulta'}, sua sessão ficou marcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
                 logger.info(f"[{tenant['slug']}] Agendamento criado: {name} | slot_index={idx_raw}(raw)→{idx}(0based) | slot={formatted}")
                 event = {"type": "new_appointment", "data": {"patient_name": name, "slot": formatted, "phone": phone}}
                 return reply, event
@@ -1289,9 +1306,9 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 if not reply.strip() or formatted not in reply:
                     old_fmt = cal.format_appointment(appt) if appt else ""
                     if old_fmt:
-                        reply = f"Pronto! ✅ Sua consulta de {old_fmt} foi reagendada para {formatted}. Até lá! 😊"
+                        reply = f"Prontinho! ✅ Sua consulta de {old_fmt} foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
                     else:
-                        reply = f"Pronto! ✅ Sua consulta foi reagendada para {formatted}. Até lá! 😊"
+                        reply = f"Prontinho! ✅ Sua consulta foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
                 return reply, {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}
         return "Não consegui remarcar. Pode escolher outro horário? 😊", None
 
