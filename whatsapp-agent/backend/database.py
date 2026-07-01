@@ -156,6 +156,18 @@ def init_db():
                 sent_at        TEXT,                   -- preenchido ao enviar via WhatsApp
                 created_at     TEXT DEFAULT (datetime('now'))
             );
+
+            -- Controle de PAGAMENTO por paciente/mês (independente do envio da
+            -- cobrança). A presença de uma linha = pago; ausência = não pago.
+            -- Puramente informativo/gerencial: NÃO afeta cálculo nem disparo.
+            CREATE TABLE IF NOT EXISTS billing_payments (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id  INTEGER NOT NULL,
+                phone      TEXT NOT NULL,
+                month      TEXT NOT NULL,          -- 'YYYY-MM'
+                paid_at    TEXT DEFAULT (datetime('now')),
+                UNIQUE(tenant_id, phone, month)
+            );
         """)
         # Migrações incrementais — seguro rodar múltiplas vezes
         migrations = [
@@ -218,6 +230,8 @@ def init_db():
             # Separado de agent_paused: pausar o chat ≠ não cobrar.
             "ALTER TABLE patients ADD COLUMN billing_paused INTEGER DEFAULT 0",
             "ALTER TABLE tenants ADD COLUMN billing_paused INTEGER DEFAULT 0",
+            # Controle de pagamento das cobranças avulsas (NULL = não pago).
+            "ALTER TABLE billing_manual_entries ADD COLUMN paid_at TEXT DEFAULT NULL",
         ]
         for sql in migrations:
             try:
@@ -796,6 +810,75 @@ def mark_manual_billing_entry_sent(tenant_id: int, entry_id: int) -> None:
             "WHERE tenant_id = ? AND id = ?",
             (tenant_id, entry_id),
         )
+
+
+def set_manual_billing_paid(tenant_id: int, entry_id: int, paid: bool) -> None:
+    """Marca/desmarca uma cobrança avulsa como paga (via coluna paid_at).
+    NÃO afeta cálculo nem disparo — só controle visual de recebimento."""
+    with get_conn() as conn:
+        if paid:
+            conn.execute(
+                "UPDATE billing_manual_entries SET paid_at = datetime('now') "
+                "WHERE tenant_id = ? AND id = ? AND paid_at IS NULL",
+                (tenant_id, entry_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE billing_manual_entries SET paid_at = NULL "
+                "WHERE tenant_id = ? AND id = ?",
+                (tenant_id, entry_id),
+            )
+
+
+# ── Controle de pagamento (recebimento) por paciente/mês ────────────────────────
+# Presença de linha em billing_payments = "pago". Ausência = "não pago".
+# Puramente informativo: NÃO afeta cálculo de cobrança nem o disparo.
+
+def set_billing_paid(tenant_id: int, phone: str, month: str, paid: bool) -> None:
+    """Marca (paid=True) ou desmarca (paid=False) o pagamento do paciente no mês.
+    Grava/apaga usando o telefone exato do cadastro (mesmo usado na prévia)."""
+    with get_conn() as conn:
+        if paid:
+            conn.execute(
+                "INSERT OR IGNORE INTO billing_payments (tenant_id, phone, month) "
+                "VALUES (?, ?, ?)",
+                (tenant_id, phone or "", month),
+            )
+        else:
+            variants = _phone_variants(phone) or set()
+            if phone:
+                variants.add(phone)
+            variants.add(_norm_digits(phone))
+            variants = {v for v in variants if v}
+            if not variants:
+                conn.execute(
+                    "DELETE FROM billing_payments WHERE tenant_id = ? AND month = ? AND phone = ?",
+                    (tenant_id, month, phone or ""),
+                )
+                return
+            ph = ",".join("?" * len(variants))
+            conn.execute(
+                f"DELETE FROM billing_payments WHERE tenant_id = ? AND month = ? "
+                f"AND phone IN ({ph})",
+                (tenant_id, month, *variants),
+            )
+
+
+def get_paid_phones_for_month(tenant_id: int, month: str) -> set[str]:
+    """Retorna o conjunto de telefones (normalizados só-dígitos) marcados como
+    pagos no mês. Tolerante a variantes na hora de comparar na prévia."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT phone FROM billing_payments WHERE tenant_id = ? AND month = ?",
+            (tenant_id, month),
+        ).fetchall()
+    out: set[str] = set()
+    for r in rows:
+        p = r["phone"] if isinstance(r, dict) or hasattr(r, "keys") else r[0]
+        for v in (_phone_variants(p) or set()):
+            out.add(_norm_digits(v))
+        out.add(_norm_digits(p or ""))
+    return {v for v in out if v}
 
 
 # ── Appointments ───────────────────────────────────────────────────────────────

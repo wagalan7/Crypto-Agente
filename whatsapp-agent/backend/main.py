@@ -1896,6 +1896,35 @@ async def dash_billing_set_pause(request: Request):
     return {"status": "ok", "paused": paused}
 
 
+@app.post("/dashboard/api/billing/paid")
+async def dash_billing_set_paid(request: Request):
+    """Marca/desmarca um paciente (da agenda) como PAGO no mês. Só controle de
+    recebimento — NÃO altera a cobrança nem dispara nada."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    body = await request.json()
+    phone = (body.get("phone") or "").strip()
+    month = (body.get("month") or "").strip()
+    paid = bool(body.get("paid"))
+    if not phone or not month:
+        raise HTTPException(status_code=400, detail="phone e month são obrigatórios")
+    db.set_billing_paid(tenant["id"], phone, month, paid)
+    return {"status": "ok", "phone": phone, "month": month, "paid": paid}
+
+
+@app.post("/dashboard/api/billing/manual/{entry_id}/paid")
+async def dash_billing_manual_set_paid(entry_id: int, request: Request):
+    """Marca/desmarca uma cobrança AVULSA como paga. Só controle de recebimento."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    body = await request.json()
+    paid = bool(body.get("paid"))
+    if db.get_manual_billing_entry(tenant["id"], entry_id) is None:
+        raise HTTPException(status_code=404, detail="Cobrança avulsa não encontrada")
+    db.set_manual_billing_paid(tenant["id"], entry_id, paid)
+    return {"status": "ok", "id": entry_id, "paid": paid}
+
+
 @app.get("/dashboard/api/billing/preview")
 def dash_billing_preview(request: Request, month: str | None = None):
     """Prévia da cobrança do mês com base na AGENDA (calendário).
@@ -1929,6 +1958,10 @@ def dash_billing_preview(request: Request, month: str | None = None):
     # inclui canceladas/faltas com aviso, que NÃO entram na conta mas a
     # psicóloga pode querer reincluir corrigindo a marcação). Read-only.
     raw_month = db.get_month_appointments_raw(tid, month_start, month_end, now_str)
+
+    # Telefones já marcados como PAGOS neste mês (só-dígitos, tolerante a variantes).
+    # Puramente informativo — não afeta cálculo nem disparo.
+    paid_phones = db.get_paid_phones_for_month(tid, month_str)
 
     items = []
     billed_ids: set = set()
@@ -1985,6 +2018,7 @@ def dash_billing_preview(request: Request, month: str | None = None):
             "paused": paused or global_paused,
             "already_sent": db.billing_already_sent(tid, phone, month_str),
             "no_price": False,
+            "paid": db._norm_digits(phone) in paid_phones,
             "breakdown": breakdown,
             "session_rows": session_rows,
         })
@@ -2006,6 +2040,7 @@ def dash_billing_preview(request: Request, month: str | None = None):
             "phone": g["phone"], "patient_name": g["patient_name"], "sessions": g["sessions"],
             "unit_price": 0.0, "total": 0.0, "has_override": False,
             "paused": False, "already_sent": False, "no_price": True,
+            "paid": db._norm_digits(g["phone"]) in paid_phones,
         })
 
     items.sort(key=lambda x: (x["no_price"], (x["patient_name"] or "").lower()))
@@ -2027,20 +2062,26 @@ def dash_billing_preview(request: Request, month: str | None = None):
             "already_sent": bool(e.get("sent_at")),
             "no_price": False,
             "manual": True,
+            "paid": bool(e.get("paid_at")),
             "can_send": bool(e.get("phone")),
         })
 
-    grand_total = sum(
-        it["total"] for it in (items + manual)
+    billable_rows = [
+        it for it in (items + manual)
         if not it.get("paused") and not it.get("no_price")
-    )
+    ]
+    grand_total = sum(it["total"] for it in billable_rows)
+    # "A receber" = total das linhas cobráveis que AINDA NÃO foram marcadas como pagas.
+    unpaid_total = sum(it["total"] for it in billable_rows if not it.get("paid"))
+    paid_total = grand_total - unpaid_total
 
     # Histórico do que JÁ foi enviado neste mês de referência (auditoria).
     history = db.get_billing_logs_for_month(tid, month_str)
     history_total = sum(float(h.get("total_amount") or 0) for h in history)
 
     return {"month": month_str, "items": items, "manual": manual,
-            "grand_total": grand_total, "global_paused": global_paused,
+            "grand_total": grand_total, "unpaid_total": unpaid_total,
+            "paid_total": paid_total, "global_paused": global_paused,
             "history": history, "history_total": history_total}
 
 

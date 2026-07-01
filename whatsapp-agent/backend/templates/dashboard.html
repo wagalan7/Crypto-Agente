@@ -2449,14 +2449,17 @@ function loadBillingPreview() {
       const sessCell = hasDetail
         ? `<button class="text-gray-600 hover:text-brand underline decoration-dotted" title="Ver/ajustar sessões" onclick="toggleBillingDetail('${detId}')">${it.sessions} ▾</button>`
         : `${it.sessions}`;
-      const mainRow = `<tr class="border-b border-gray-50 hover:bg-gray-50">
+      const paidPhone = (it.phone||'').replace(/'/g,"\\'");
+      const paidCell = _paidToggleHtml(it.paid, `toggleBillingPaid('${paidPhone}',${it.paid?1:0})`);
+      const mainRow = `<tr class="border-b border-gray-50 hover:bg-gray-50 ${it.paid?'bg-green-50/40':''}">
         <td class="py-1.5 pr-2 font-medium ${cls}">${it.patient_name||it.phone}${bdLine}</td>
         <td class="py-1.5 pr-2 text-center text-gray-600">${sessCell}</td>
         <td class="py-1.5 pr-2 text-right">${totalCell}</td>
+        <td class="py-1.5 pr-2 text-center">${paidCell}</td>
         <td class="py-1.5 text-right text-xs">${status}</td>
       </tr>`;
       const detailRow = hasDetail
-        ? `<tr id="bdet-${detId}" class="hidden"><td colspan="4" class="px-3 py-1.5 bg-gray-50/70">${_billingSessionsHtml(it.session_rows)}</td></tr>`
+        ? `<tr id="bdet-${detId}" class="hidden"><td colspan="5" class="px-3 py-1.5 bg-gray-50/70">${_billingSessionsHtml(it.session_rows)}</td></tr>`
         : "";
       return mainRow + detailRow;
     }).join("");
@@ -2468,7 +2471,8 @@ function loadBillingPreview() {
       else if (!it.can_send) status = '<span class="text-gray-400" title="Sem WhatsApp: só registro">📝 registro</span>';
       else status = '<span class="text-gray-400">a cobrar</span>';
       const nameEsc = (it.patient_name||'').replace(/'/g,"\\'");
-      return `<tr class="border-b border-gray-50 bg-purple-50/40">
+      const paidCellM = _paidToggleHtml(it.paid, `toggleManualPaid(${it.id},${it.paid?1:0})`);
+      return `<tr class="border-b border-gray-50 ${it.paid?'bg-green-50/40':'bg-purple-50/40'}">
         <td class="py-1.5 pr-2 font-medium text-gray-700">${it.patient_name||it.phone}
           <span class="text-[10px] text-purple-500 align-middle">avulsa</span></td>
         <td class="py-1.5 pr-2 text-center text-gray-600">${it.sessions}</td>
@@ -2476,6 +2480,7 @@ function loadBillingPreview() {
           <button class="text-gray-700 hover:text-brand underline decoration-dotted"
             onclick="editManualBilling(${it.id},'${nameEsc}','${it.phone||''}',${it.sessions},${it.total})">${fmt(it.total)}</button>
         </td>
+        <td class="py-1.5 pr-2 text-center">${paidCellM}</td>
         <td class="py-1.5 text-right text-xs whitespace-nowrap">${status}
           <button class="text-red-400 hover:text-red-600 ml-1" title="Remover" onclick="deleteManualBilling(${it.id})">✕</button>
         </td>
@@ -2487,6 +2492,7 @@ function loadBillingPreview() {
           <th class="text-left py-1 pr-2">Paciente</th>
           <th class="text-center py-1 pr-2">Sessões</th>
           <th class="text-right py-1 pr-2">Total</th>
+          <th class="text-center py-1 pr-2">Pago?</th>
           <th class="text-right py-1">Status</th>
         </tr>
       </thead>
@@ -2494,7 +2500,15 @@ function loadBillingPreview() {
       <tfoot>
         <tr class="border-t border-gray-200 font-semibold text-gray-700">
           <td class="py-1.5 pr-2" colspan="2">Total a cobrar${data.global_paused ? ' (pausado)' : ''}</td>
-          <td class="py-1.5 pr-2 text-right" colspan="2">${fmt(data.grand_total||0)}</td>
+          <td class="py-1.5 pr-2 text-right" colspan="3">${fmt(data.grand_total||0)}</td>
+        </tr>
+        <tr class="text-gray-500">
+          <td class="py-1 pr-2" colspan="2">A receber (não pago)</td>
+          <td class="py-1 pr-2 text-right text-red-600 font-semibold" colspan="3">${fmt(data.unpaid_total||0)}</td>
+        </tr>
+        <tr class="text-gray-500">
+          <td class="py-1 pr-2" colspan="2">Já recebido (pago)</td>
+          <td class="py-1 pr-2 text-right text-green-600 font-semibold" colspan="3">${fmt(data.paid_total||0)}</td>
         </tr>
       </tfoot>
     </table>`;
@@ -2554,6 +2568,30 @@ function setSessionAttendance(apptId, status) {
   })
     .then(() => { showToast("Sessão atualizada", "success"); loadBillingPreview(); })
     .catch(() => showToast("Erro ao atualizar sessão", "error"));
+}
+
+// Botão de "pago/não pago" reutilizado por linha da agenda e avulsa.
+function _paidToggleHtml(isPaid, onclickExpr) {
+  return isPaid
+    ? `<button class="text-green-600 hover:text-green-800 whitespace-nowrap"
+        title="Pago — clique para desmarcar" onclick="${onclickExpr}">✓ pago</button>`
+    : `<button class="text-gray-400 hover:text-brand whitespace-nowrap"
+        title="Marcar como pago" onclick="${onclickExpr}">○ não pago</button>`;
+}
+function toggleBillingPaid(phone, isPaidNow) {
+  api("/dashboard/api/billing/paid", {
+    method: "POST",
+    body: JSON.stringify({phone, month: _billingMonth || "", paid: !isPaidNow})
+  })
+    .then(() => { showToast(isPaidNow ? "Marcado como não pago" : "Marcado como pago", "success"); loadBillingPreview(); })
+    .catch(() => showToast("Erro ao atualizar pagamento", "error"));
+}
+function toggleManualPaid(entryId, isPaidNow) {
+  api(`/dashboard/api/billing/manual/${entryId}/paid`, {
+    method: "POST", body: JSON.stringify({paid: !isPaidNow})
+  })
+    .then(() => { showToast(isPaidNow ? "Marcado como não pago" : "Marcado como pago", "success"); loadBillingPreview(); })
+    .catch(() => showToast("Erro ao atualizar pagamento", "error"));
 }
 
 function renderBillingHistory(data, fmt) {
