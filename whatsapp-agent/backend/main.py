@@ -3229,23 +3229,52 @@ def health():
     return {"status": "ok"}
 
 
+_APP_STARTED = _time.time()  # p/ detectar reinícios (OOM/restart loop) via /healthz
+
+
+def _proc_rss_mb() -> float | None:
+    """RSS atual do processo em MB (Linux). None se indisponível. Fail-open."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)  # kB → MB
+    except Exception:
+        pass
+    return None
+
+
 @app.get("/healthz")
 def healthz():
-    """Healthcheck profundo: testa conexão com o banco."""
+    """Healthcheck profundo: testa conexão com o banco.
+
+    Observabilidade p/ diagnosticar lentidão sem acesso ao painel Railway:
+    - db_ms: latência SÓ da query no banco (isola disco/lock do resto).
+    - uptime_s: se cai entre requisições = processo reiniciando (OOM/crash loop).
+    - rss_mb: memória do processo (perto do limite do container = swap/OOM).
+    """
+    _t0 = _time.time()
     try:
         with db.get_conn() as conn:
             row = conn.execute("SELECT COUNT(*) AS n FROM tenants").fetchone()
+        db_ms = round((_time.time() - _t0) * 1000, 1)
         return {
             "status": "ok",
             "db": "ok",
             "tenants_count": int(row["n"]) if row else 0,
+            "db_ms": db_ms,
+            "uptime_s": round(_time.time() - _APP_STARTED, 1),
+            "rss_mb": _proc_rss_mb(),
             "ts": datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds"),
             "sentry": bool(_os.getenv("SENTRY_DSN", "").strip()),
         }
     except Exception as e:
         logger.error(f"healthz falhou: {e}")
         return JSONResponse(
-            {"status": "degraded", "db": "fail", "error": str(e)[:200]},
+            {"status": "degraded", "db": "fail", "error": str(e)[:200],
+             "db_ms": round((_time.time() - _t0) * 1000, 1),
+             "uptime_s": round(_time.time() - _APP_STARTED, 1),
+             "rss_mb": _proc_rss_mb()},
             status_code=503,
         )
 
