@@ -32,6 +32,13 @@ def _decrypt_tenant(d: "dict | None") -> "dict | None":
 
 def init_db():
     with get_conn() as conn:
+        # WAL é persistente no arquivo: se um deploy anterior ligou WAL, o banco
+        # continua em WAL mesmo sem o PRAGMA. Volta explicitamente p/ DELETE (o
+        # modo conhecido-bom no volume em rede do Railway) e remove -wal/-shm.
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+        except Exception:
+            pass
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS tenants (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -395,16 +402,16 @@ def _seed_default_admin(conn):
 def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    # Concorrência: WAL deixa leitores e escritor coexistirem (no modo padrão
-    # 'delete' um escritor trava TODOS os leitores — foi o que deixou o painel
-    # lento durante a migração de criptografia de 2400 mensagens). busy_timeout
-    # faz aguardar o lock em vez de estourar "database is locked".
+    # busy_timeout: aguarda o lock liberar (até 30s) em vez de estourar
+    # "database is locked" na hora. Seguro em qualquer filesystem.
+    # NÃO usar WAL aqui: o volume do Railway é storage em rede e o arquivo
+    # -shm (shared memory / mmap) do WAL degrada MUITO nesse tipo de FS
+    # (healthz foi de 0,5s p/ 6-21s quando WAL foi ligado). Modo padrão
+    # ('delete') é o conhecido-bom; escritas normais são de milissegundos.
     try:
         conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
     except Exception:
-        pass  # fail-open: se o PRAGMA falhar, segue no modo padrão
+        pass  # fail-open
     try:
         yield conn
         conn.commit()
