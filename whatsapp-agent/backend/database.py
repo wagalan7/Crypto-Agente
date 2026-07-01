@@ -5,7 +5,29 @@ from datetime import datetime
 from contextlib import contextmanager
 
 import config as _cfg
+import crypto
 DB_PATH = os.path.join(_cfg.DATA_DIR, "consultorio.db")
+
+# Campos de tenant cifrados em repouso (credenciais + chave PIX). Ver crypto.py.
+_ENCRYPTED_TENANT_FIELDS = (
+    "evolution_key",         # token Z-API / Evolution
+    "evolution_url",         # Z-API: Client-Token (header de segurança)
+    "twilio_token",          # auth token Twilio
+    "google_refresh_token",  # OAuth Google Calendar
+    "caldav_password",       # senha de app CalDAV
+    "pix_key",               # chave PIX
+)
+
+
+def _decrypt_tenant(d: "dict | None") -> "dict | None":
+    """Decifra os campos sensíveis de um dict de tenant (in-place). Retrocompatível:
+    valores em texto puro (legado) passam direto."""
+    if not d:
+        return d
+    for f in _ENCRYPTED_TENANT_FIELDS:
+        if d.get(f) is not None:
+            d[f] = crypto.decrypt(d[f])
+    return d
 
 
 def init_db():
@@ -412,13 +434,13 @@ def ensure_webhook_token(tenant_id: int) -> str:
 def get_tenant(slug: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM tenants WHERE slug = ? AND active = 1", (slug,)).fetchone()
-    return dict(row) if row else None
+    return _decrypt_tenant(dict(row)) if row else None
 
 
 def get_tenant_by_id(tenant_id: int) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM tenants WHERE id = ?", (tenant_id,)).fetchone()
-    return dict(row) if row else None
+    return _decrypt_tenant(dict(row)) if row else None
 
 
 def get_tenant_by_token(token: str) -> dict | None:
@@ -426,7 +448,7 @@ def get_tenant_by_token(token: str) -> dict | None:
         row = conn.execute(
             "SELECT * FROM tenants WHERE dashboard_token = ? AND active = 1", (token,)
         ).fetchone()
-    return dict(row) if row else None
+    return _decrypt_tenant(dict(row)) if row else None
 
 
 def get_tenant_by_setup_token(token: str) -> dict | None:
@@ -434,7 +456,7 @@ def get_tenant_by_setup_token(token: str) -> dict | None:
         row = conn.execute(
             "SELECT * FROM tenants WHERE setup_token = ? AND active = 1", (token,)
         ).fetchone()
-    return dict(row) if row else None
+    return _decrypt_tenant(dict(row)) if row else None
 
 
 def is_tenant_exempt(tenant: dict) -> bool:
@@ -452,7 +474,7 @@ def is_tenant_exempt(tenant: dict) -> bool:
 def list_tenants() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM tenants WHERE active = 1 ORDER BY name").fetchall()
-    return [dict(r) for r in rows]
+    return [_decrypt_tenant(dict(r)) for r in rows]
 
 
 def update_tenant(slug: str, **fields) -> bool:
@@ -475,11 +497,68 @@ def update_tenant(slug: str, **fields) -> bool:
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False
+    # Cifra credenciais/PIX antes de gravar (transparente; ver crypto.py).
+    for k in _ENCRYPTED_TENANT_FIELDS:
+        if k in updates and isinstance(updates[k], str):
+            updates[k] = crypto.encrypt(updates[k])
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     values = list(updates.values()) + [slug]
     with get_conn() as conn:
         cur = conn.execute(f"UPDATE tenants SET {set_clause} WHERE slug = ?", values)
         return cur.rowcount > 0
+
+
+def encrypt_existing_data(include_conversations: bool = False) -> dict:
+    """Migra dados legados (texto puro) para cifrado em repouso. Idempotente —
+    pula valores já cifrados. Requer FIELD_ENCRYPTION_KEY ativa (ver crypto.py).
+
+    Credenciais/PIX dos tenants são migrados sempre; o conteúdo das conversas
+    (volumoso) só quando include_conversations=True, em lotes de 500."""
+    tenants_updated = 0
+    fields_encrypted = 0
+    cols = ", ".join(_ENCRYPTED_TENANT_FIELDS)
+    with get_conn() as conn:
+        rows = conn.execute(f"SELECT id, {cols} FROM tenants").fetchall()
+        for r in rows:
+            sets = {}
+            for f in _ENCRYPTED_TENANT_FIELDS:
+                v = r[f]
+                if isinstance(v, str) and v and not crypto.is_encrypted(v):
+                    sets[f] = crypto.encrypt(v)
+            if sets:
+                clause = ", ".join(f"{k} = ?" for k in sets)
+                conn.execute(
+                    f"UPDATE tenants SET {clause} WHERE id = ?",
+                    list(sets.values()) + [r["id"]],
+                )
+                tenants_updated += 1
+                fields_encrypted += len(sets)
+
+    conversations_encrypted = 0
+    if include_conversations:
+        last_id = 0
+        while True:
+            with get_conn() as conn:
+                batch = conn.execute(
+                    "SELECT id, content FROM conversations WHERE id > ? ORDER BY id LIMIT 500",
+                    (last_id,),
+                ).fetchall()
+                if not batch:
+                    break
+                for cr in batch:
+                    last_id = cr["id"]
+                    v = cr["content"]
+                    if isinstance(v, str) and v and not crypto.is_encrypted(v):
+                        conn.execute(
+                            "UPDATE conversations SET content = ? WHERE id = ?",
+                            (crypto.encrypt(v), cr["id"]),
+                        )
+                        conversations_encrypted += 1
+    return {
+        "tenants_updated": tenants_updated,
+        "fields_encrypted": fields_encrypted,
+        "conversations_encrypted": conversations_encrypted,
+    }
 
 
 # ── Conversations ──────────────────────────────────────────────────────────────
@@ -492,14 +571,14 @@ def get_conversation_history(tenant_id: int, phone: str, limit: int = 10) -> lis
                ORDER BY created_at DESC LIMIT ?""",
             (tenant_id, phone, limit),
         ).fetchall()
-    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    return [{"role": r["role"], "content": crypto.decrypt(r["content"])} for r in reversed(rows)]
 
 
 def save_message(tenant_id: int, phone: str, role: str, content: str):
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO conversations (tenant_id, phone, role, content) VALUES (?, ?, ?, ?)",
-            (tenant_id, phone, role, content),
+            (tenant_id, phone, role, crypto.encrypt(content)),
         )
 
 
@@ -1900,7 +1979,7 @@ def admin_list_all_tenants() -> list[dict]:
 def admin_get_tenant_full(slug: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM tenants WHERE slug = ?", (slug,)).fetchone()
-    return dict(row) if row else None
+    return _decrypt_tenant(dict(row)) if row else None
 
 
 # ════════════════════════════════════════════════════════════════════════════

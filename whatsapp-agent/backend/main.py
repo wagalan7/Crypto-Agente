@@ -2301,6 +2301,22 @@ async def disparar_confirmacoes(request: Request):
     return {"enviados": len([r for r in results if r["sent"]]), "detalhes": results}
 
 
+@app.post("/admin/security/encrypt-existing")
+def encrypt_existing_data(include_conversations: bool = False):
+    """Cifra em repouso os dados legados (texto puro) já gravados. Idempotente.
+    Protegido pela MASTER_KEY (via _admin_auth_middleware). Requer
+    FIELD_ENCRYPTION_KEY configurada. include_conversations=true também migra o
+    histórico de conversas (mais demorado)."""
+    import crypto
+    if not crypto.is_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="FIELD_ENCRYPTION_KEY não configurada — criptografia inativa.",
+        )
+    result = db.encrypt_existing_data(include_conversations=include_conversations)
+    return {"status": "ok", **result}
+
+
 @app.post("/admin/tenants/{slug}/dashboard-token")
 def generate_dashboard_token(slug: str):
     """Gera ou regenera o token de acesso ao painel."""
