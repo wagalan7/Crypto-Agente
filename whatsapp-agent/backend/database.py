@@ -393,8 +393,18 @@ def _seed_default_admin(conn):
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    # Concorrência: WAL deixa leitores e escritor coexistirem (no modo padrão
+    # 'delete' um escritor trava TODOS os leitores — foi o que deixou o painel
+    # lento durante a migração de criptografia de 2400 mensagens). busy_timeout
+    # faz aguardar o lock em vez de estourar "database is locked".
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass  # fail-open: se o PRAGMA falhar, segue no modo padrão
     try:
         yield conn
         conn.commit()
