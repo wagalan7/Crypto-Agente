@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import hmac
 import logging
 import secrets
@@ -456,7 +457,11 @@ async def _handle_message(tenant: dict, phone: str, text: str):
     is_first_message = len(db.get_conversation_history(tenant["id"], phone, limit=1)) == 0
 
     try:
-        reply, resp, event = agent.process_message(tenant, phone, text)
+        # agent.process_message é SÍNCRONO e bloqueante (chamada ao LLM, vários
+        # segundos). Como _handle_message roda no event loop (via BackgroundTasks),
+        # chamá-lo direto CONGELA o loop e trava todas as outras requisições
+        # (painel, healthz, outros webhooks) durante a geração. Offload p/ thread.
+        reply, resp, event = await asyncio.to_thread(agent.process_message, tenant, phone, text)
         await wa.send_message(tenant, phone, reply)
         logger.info(f"[{tenant['slug']}][{phone}] intent={resp.intent} action={resp.action}")
 
@@ -716,7 +721,9 @@ class TestMessage(BaseModel):
 async def test_message(slug: str, msg: TestMessage):
     """Simula uma mensagem sem WhatsApp real — para desenvolvimento."""
     tenant = _get_tenant(slug)
-    reply, resp, event = agent.process_message(tenant, msg.phone, msg.text)
+    # Offload da chamada síncrona ao LLM p/ não bloquear o event loop (ver nota
+    # em _handle_message).
+    reply, resp, event = await asyncio.to_thread(agent.process_message, tenant, msg.phone, msg.text)
     if event:
         await events.publish(tenant["id"], event["type"], event["data"])
     return {
