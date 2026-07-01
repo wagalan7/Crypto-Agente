@@ -1,4 +1,5 @@
 from __future__ import annotations
+import hmac
 import logging
 import secrets
 from contextlib import asynccontextmanager
@@ -240,6 +241,39 @@ async def _rate_limit_middleware(request: Request, call_next):
             {"detail": "Muitas requisições. Aguarde e tente novamente."},
             status_code=429,
         )
+    return await call_next(request)
+
+
+# ── Auth de superusuário para /admin/* e /test/* ────────────────────────────────
+# Estes endpoints são operações administrativas (CRUD de tenants, leitura/remoção
+# de conversas de QUALQUER consultório, simulação de mensagens). Antes estavam
+# ABERTOS na internet. Agora exigem a MASTER_KEY (via header X-Master-Key ou ?key=).
+# Fail-closed: sem MASTER_KEY configurada, tudo é negado.
+# Exceção: /admin/confirmacoes/disparar é ação do dashboard e valida o token do
+# painel no próprio endpoint (não a master key).
+_MASTER_PROTECTED_PREFIXES = ("/admin/", "/test/")
+_MASTER_EXEMPT_PATHS = {"/admin/confirmacoes/disparar"}
+
+
+def _extract_master_key(request: Request) -> str:
+    return (
+        request.headers.get("X-Master-Key", "")
+        or request.headers.get("X-Master-Token", "")
+        or request.query_params.get("key", "")
+    )
+
+
+@app.middleware("http")
+async def _admin_auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if (
+        request.method != "OPTIONS"
+        and path.startswith(_MASTER_PROTECTED_PREFIXES)
+        and path not in _MASTER_EXEMPT_PATHS
+    ):
+        key = _extract_master_key(request)
+        if not config.MASTER_KEY or not hmac.compare_digest(key, config.MASTER_KEY):
+            return JSONResponse({"detail": "Acesso negado."}, status_code=403)
     return await call_next(request)
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -2256,8 +2290,13 @@ def dash_billing_diagnose(request: Request, month: str | None = None):
 
 
 @app.post("/admin/confirmacoes/disparar")
-async def disparar_confirmacoes():
-    """Dispara confirmações de amanhã agora mesmo (ignora restrição de horário)."""
+async def disparar_confirmacoes(request: Request):
+    """Dispara confirmações de amanhã agora mesmo (ignora restrição de horário).
+
+    Ação do dashboard: exige um token de painel válido (X-Dashboard-Token ou
+    ?token=). Isenta da MASTER_KEY (ver _admin_auth_middleware)."""
+    token = request.headers.get("X-Dashboard-Token", "") or request.query_params.get("token", "")
+    _get_tenant_by_token(token)  # 403 se o token não corresponder a nenhum consultório
     results = await scheduler.run_confirmations_now()
     return {"enviados": len([r for r in results if r["sent"]]), "detalhes": results}
 
@@ -2484,7 +2523,7 @@ def recuperar_acesso(body: LinkRecoveryBody, request: Request):
 # ── Painel Master ──────────────────────────────────────────────────────────────
 
 def _check_master_key(key: str):
-    if not config.MASTER_KEY or key != config.MASTER_KEY:
+    if not config.MASTER_KEY or not hmac.compare_digest(key or "", config.MASTER_KEY):
         raise HTTPException(status_code=403, detail="Acesso negado.")
 
 

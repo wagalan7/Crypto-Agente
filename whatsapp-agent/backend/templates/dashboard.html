@@ -2117,7 +2117,7 @@ async function dispararConfirmacoes() {
   btn.textContent = '⏳ Enviando...';
   status.classList.add('hidden');
   try {
-    const r = await fetch('/admin/confirmacoes/disparar', {method:'POST'});
+    const r = await fetch('/admin/confirmacoes/disparar', {method:'POST', headers:{'X-Dashboard-Token':TOKEN}});
     const data = await r.json();
     const n = data.enviados || 0;
     const det = Array.isArray(data.detalhes) ? data.detalhes : [];
