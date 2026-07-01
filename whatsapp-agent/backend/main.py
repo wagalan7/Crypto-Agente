@@ -276,6 +276,36 @@ def _get_tenant(slug: str) -> dict:
     return tenant
 
 
+async def _flag_receipt_and_notify(tenant: dict, phone: str, kind: str) -> None:
+    """Sinaliza que chegou um comprovante do paciente (imagem/documento/PIX) para
+    a psicóloga confirmar o pagamento na tela de Cobranças. NÃO marca como pago —
+    a confirmação continua humana. Notifica a psicóloga só na 1ª vez do mês (sem
+    spam). Nunca deixa uma falha aqui atrapalhar a resposta ao paciente."""
+    try:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _Zi
+        now = _dt.now(_Zi("America/Sao_Paulo")).replace(tzinfo=None)
+        month = f"{now.year:04d}-{now.month:02d}"
+        newly_pending = db.flag_billing_receipt(tenant["id"], phone, month, kind)
+        if not newly_pending:
+            return
+        try:
+            pat = db.get_patient(tenant["id"], phone)
+        except Exception:
+            pat = None
+        nome = (pat or {}).get("name") or phone
+        psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
+        if psy_phone:
+            await wa.send_message(
+                tenant, psy_phone,
+                f"📎 *{nome}* enviou um comprovante de pagamento ({kind}).\n"
+                f"Número: {phone}\n"
+                f"Confira e, se estiver certo, marque *✓ pago* na tela de Cobranças.",
+            )
+    except Exception as e:
+        logger.warning(f"[{tenant.get('slug')}][{phone}] Falha ao sinalizar comprovante: {e}")
+
+
 async def _handle_message(tenant: dict, phone: str, text: str):
     phone = "".join(c for c in phone if c.isdigit())  # normaliza sempre
 
@@ -326,6 +356,8 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         await wa.send_message(tenant, phone, reply)
         db.save_message(tenant["id"], phone, "user", f"[{kind_label.lower()} enviado]")
         db.save_message(tenant["id"], phone, "assistant", reply)
+        await _flag_receipt_and_notify(
+            tenant, phone, "pix" if text == "__COMPROVANTE_PIX__" else "documento")
         return
 
     # ── Imagem → analisar por visão antes de assumir comprovante ────────────────
@@ -338,6 +370,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         if kind == "receipt":
             reply = "Obrigada pelo pagamento! 😊 Recebi o comprovante. Em breve enviarei a nota fiscal. Até a sessão!"
             db.save_message(tenant["id"], phone, "user", "[comprovante de pagamento enviado]")
+            await _flag_receipt_and_notify(tenant, phone, "imagem")
         else:
             reply = ("Recebi sua imagem! 😊 No momento eu (assistente) não consigo analisar "
                      "imagens em detalhe — vou repassar para a psicóloga, que responde "
@@ -1925,6 +1958,21 @@ async def dash_billing_manual_set_paid(entry_id: int, request: Request):
     return {"status": "ok", "id": entry_id, "paid": paid}
 
 
+@app.post("/dashboard/api/billing/receipt/dismiss")
+async def dash_billing_dismiss_receipt(request: Request):
+    """Dispensa o aviso de comprovante recebido de um paciente no mês (falso
+    alarme ou já resolvido). Só remove a sinalização — não altera pagamento."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    body = await request.json()
+    phone = (body.get("phone") or "").strip()
+    month = (body.get("month") or "").strip()
+    if not phone or not month:
+        raise HTTPException(status_code=400, detail="phone e month são obrigatórios")
+    db.dismiss_billing_receipt(tenant["id"], phone, month)
+    return {"status": "ok", "phone": phone, "month": month}
+
+
 @app.get("/dashboard/api/billing/preview")
 def dash_billing_preview(request: Request, month: str | None = None):
     """Prévia da cobrança do mês com base na AGENDA (calendário).
@@ -1962,6 +2010,9 @@ def dash_billing_preview(request: Request, month: str | None = None):
     # Telefones já marcados como PAGOS neste mês (só-dígitos, tolerante a variantes).
     # Puramente informativo — não afeta cálculo nem disparo.
     paid_phones = db.get_paid_phones_for_month(tid, month_str)
+    # Telefones que enviaram COMPROVANTE (imagem/documento/PIX) e aguardam
+    # confirmação humana → mapeia p/ tipo. Só sinalização, não marca pago.
+    pending_receipts = db.get_pending_receipts_for_month(tid, month_str)
 
     items = []
     billed_ids: set = set()
@@ -2019,6 +2070,7 @@ def dash_billing_preview(request: Request, month: str | None = None):
             "already_sent": db.billing_already_sent(tid, phone, month_str),
             "no_price": False,
             "paid": db._norm_digits(phone) in paid_phones,
+            "receipt": pending_receipts.get(db._norm_digits(phone)),
             "breakdown": breakdown,
             "session_rows": session_rows,
         })
@@ -2041,6 +2093,7 @@ def dash_billing_preview(request: Request, month: str | None = None):
             "unit_price": 0.0, "total": 0.0, "has_override": False,
             "paused": False, "already_sent": False, "no_price": True,
             "paid": db._norm_digits(g["phone"]) in paid_phones,
+            "receipt": pending_receipts.get(db._norm_digits(g["phone"])),
         })
 
     items.sort(key=lambda x: (x["no_price"], (x["patient_name"] or "").lower()))
@@ -2063,6 +2116,7 @@ def dash_billing_preview(request: Request, month: str | None = None):
             "no_price": False,
             "manual": True,
             "paid": bool(e.get("paid_at")),
+            "receipt": pending_receipts.get(db._norm_digits(e.get("phone") or "")) if e.get("phone") else None,
             "can_send": bool(e.get("phone")),
         })
 

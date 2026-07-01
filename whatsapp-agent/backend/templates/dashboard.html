@@ -2451,8 +2451,10 @@ function loadBillingPreview() {
         : `${it.sessions}`;
       const paidPhone = (it.phone||'').replace(/'/g,"\\'");
       const paidCell = _paidToggleHtml(it.paid, `toggleBillingPaid('${paidPhone}',${it.paid?1:0})`);
-      const mainRow = `<tr class="border-b border-gray-50 hover:bg-gray-50 ${it.paid?'bg-green-50/40':''}">
-        <td class="py-1.5 pr-2 font-medium ${cls}">${it.patient_name||it.phone}${bdLine}</td>
+      const rcptLine = _receiptLineHtml(it);
+      const rowBg = it.paid ? 'bg-green-50/40' : (it.receipt ? 'bg-amber-50/50' : '');
+      const mainRow = `<tr class="border-b border-gray-50 hover:bg-gray-50 ${rowBg}">
+        <td class="py-1.5 pr-2 font-medium ${cls}">${it.patient_name||it.phone}${bdLine}${rcptLine}</td>
         <td class="py-1.5 pr-2 text-center text-gray-600">${sessCell}</td>
         <td class="py-1.5 pr-2 text-right">${totalCell}</td>
         <td class="py-1.5 pr-2 text-center">${paidCell}</td>
@@ -2472,9 +2474,10 @@ function loadBillingPreview() {
       else status = '<span class="text-gray-400">a cobrar</span>';
       const nameEsc = (it.patient_name||'').replace(/'/g,"\\'");
       const paidCellM = _paidToggleHtml(it.paid, `toggleManualPaid(${it.id},${it.paid?1:0})`);
-      return `<tr class="border-b border-gray-50 ${it.paid?'bg-green-50/40':'bg-purple-50/40'}">
+      const rowBgM = it.paid ? 'bg-green-50/40' : (it.receipt ? 'bg-amber-50/50' : 'bg-purple-50/40');
+      return `<tr class="border-b border-gray-50 ${rowBgM}">
         <td class="py-1.5 pr-2 font-medium text-gray-700">${it.patient_name||it.phone}
-          <span class="text-[10px] text-purple-500 align-middle">avulsa</span></td>
+          <span class="text-[10px] text-purple-500 align-middle">avulsa</span>${_receiptLineHtml(it)}</td>
         <td class="py-1.5 pr-2 text-center text-gray-600">${it.sessions}</td>
         <td class="py-1.5 pr-2 text-right">
           <button class="text-gray-700 hover:text-brand underline decoration-dotted"
@@ -2592,6 +2595,23 @@ function toggleManualPaid(entryId, isPaidNow) {
   })
     .then(() => { showToast(isPaidNow ? "Marcado como não pago" : "Marcado como pago", "success"); loadBillingPreview(); })
     .catch(() => showToast("Erro ao atualizar pagamento", "error"));
+}
+
+// Aviso "comprovante recebido" (sinalização do bot p/ confirmar pagamento).
+// Só aparece quando há comprovante pendente E o paciente ainda não está pago.
+function _receiptLineHtml(it) {
+  if (!it || !it.receipt || it.paid) return "";
+  const phoneEsc = (it.phone||'').replace(/'/g,"\\'");
+  return `<div class="text-[10px] text-amber-600 mt-0.5">📎 comprovante recebido (${it.receipt}) — confira e confirme
+    <button class="text-gray-400 hover:text-gray-600 ml-1 underline decoration-dotted"
+      title="Dispensar aviso (falso alarme / já resolvido)" onclick="dismissReceipt('${phoneEsc}')">dispensar</button></div>`;
+}
+function dismissReceipt(phone) {
+  api("/dashboard/api/billing/receipt/dismiss", {
+    method: "POST", body: JSON.stringify({phone, month: _billingMonth || ""})
+  })
+    .then(() => { showToast("Aviso de comprovante dispensado", "success"); loadBillingPreview(); })
+    .catch(() => showToast("Erro ao dispensar aviso", "error"));
 }
 
 function renderBillingHistory(data, fmt) {

@@ -168,6 +168,21 @@ def init_db():
                 paid_at    TEXT DEFAULT (datetime('now')),
                 UNIQUE(tenant_id, phone, month)
             );
+
+            -- Comprovantes recebidos pelo WhatsApp (imagem/documento/PIX). Serve
+            -- só como SINALIZAÇÃO para a psicóloga confirmar o pagamento na tela
+            -- de Cobranças. NÃO marca como pago automaticamente nem confia na
+            -- imagem — a confirmação continua sendo humana (botão "✓ pago").
+            CREATE TABLE IF NOT EXISTS billing_receipts (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id    INTEGER NOT NULL,
+                phone        TEXT NOT NULL,
+                month        TEXT NOT NULL,          -- 'YYYY-MM'
+                kind         TEXT DEFAULT '',        -- imagem | documento | pix
+                received_at  TEXT DEFAULT (datetime('now')),
+                dismissed_at TEXT DEFAULT NULL,      -- dispensado sem confirmar
+                UNIQUE(tenant_id, phone, month)
+            );
         """)
         # Migrações incrementais — seguro rodar múltiplas vezes
         migrations = [
@@ -879,6 +894,70 @@ def get_paid_phones_for_month(tenant_id: int, month: str) -> set[str]:
             out.add(_norm_digits(v))
         out.add(_norm_digits(p or ""))
     return {v for v in out if v}
+
+
+# ── Comprovantes recebidos (sinalização p/ confirmar pagamento) ─────────────────
+
+def flag_billing_receipt(tenant_id: int, phone: str, month: str, kind: str = "") -> bool:
+    """Registra que chegou um comprovante do paciente no mês. Reativa o sinal se
+    estava dispensado. Retorna True se ficou PENDENTE agora (novo ou reativado) —
+    útil pra notificar a psicóloga só na transição, sem spammar."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT dismissed_at FROM billing_receipts "
+            "WHERE tenant_id = ? AND phone = ? AND month = ?",
+            (tenant_id, phone or "", month),
+        ).fetchone()
+        was_pending = bool(row) and (row["dismissed_at"] is None)
+        conn.execute("""
+            INSERT INTO billing_receipts (tenant_id, phone, month, kind, received_at, dismissed_at)
+            VALUES (?, ?, ?, ?, datetime('now'), NULL)
+            ON CONFLICT(tenant_id, phone, month) DO UPDATE SET
+                kind = excluded.kind,
+                received_at = datetime('now'),
+                dismissed_at = NULL
+        """, (tenant_id, phone or "", month, kind or ""))
+        return not was_pending
+
+
+def get_pending_receipts_for_month(tenant_id: int, month: str) -> dict[str, str]:
+    """Telefones (normalizados só-dígitos, tolerante a variantes) com comprovante
+    pendente de confirmação no mês → mapeia para o tipo (imagem/documento/pix)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT phone, kind FROM billing_receipts "
+            "WHERE tenant_id = ? AND month = ? AND dismissed_at IS NULL",
+            (tenant_id, month),
+        ).fetchall()
+    out: dict[str, str] = {}
+    for r in rows:
+        p = r["phone"]
+        kind = r["kind"] or ""
+        keys = {_norm_digits(v) for v in (_phone_variants(p) or set())}
+        keys.add(_norm_digits(p or ""))
+        for k in keys:
+            if k:
+                out[k] = kind
+    return out
+
+
+def dismiss_billing_receipt(tenant_id: int, phone: str, month: str) -> None:
+    """Dispensa o sinal de comprovante (falso alarme ou já resolvido), tolerando
+    variantes do telefone."""
+    variants = _phone_variants(phone) or set()
+    if phone:
+        variants.add(phone)
+    variants.add(_norm_digits(phone))
+    variants = {v for v in variants if v}
+    if not variants:
+        return
+    ph = ",".join("?" * len(variants))
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE billing_receipts SET dismissed_at = datetime('now') "
+            f"WHERE tenant_id = ? AND month = ? AND phone IN ({ph})",
+            (tenant_id, month, *variants),
+        )
 
 
 # ── Appointments ───────────────────────────────────────────────────────────────
