@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import re
@@ -101,7 +102,11 @@ async def classify_image(image_url: str) -> str:
             data = base64.standard_b64encode(r.content).decode("ascii")
 
         client = _get_anthropic_client()
-        resp = client.messages.create(
+        # client.messages.create é SÍNCRONO/bloqueante. classify_image roda no
+        # event loop (via _handle_message) — chamar direto congela o loop e trava
+        # o painel durante a análise da imagem. Offload p/ thread.
+        resp = await asyncio.to_thread(
+            client.messages.create,
             model="claude-haiku-4-5",
             max_tokens=20,
             system=("Você classifica imagens recebidas no WhatsApp de um consultório. "
