@@ -1199,6 +1199,26 @@ def _execute_action(tenant: dict, resp: AgentResponse,
         if 0 <= idx < len(offered_slots):
             slot = offered_slots[idx]
             duration = tenant.get("session_minutes", 50)
+            # ── GUARDA ANTI-DUPLICATA (reagendamento silencioso) ─────────────────
+            # Se o paciente JÁ tem UMA consulta futura real e o LLM escolheu
+            # "create" (porque ele escolheu um horário SEM dizer "remarcar" com
+            # todas as letras), MOVEMOS a consulta existente em vez de criar uma
+            # 2ª. No consultório o paciente tem 1 sessão futura via autoatendimento
+            # (confirmações e cobrança assumem "a próxima consulta"). Só aplica com
+            # EXATAMENTE 1 consulta ativa: 0 (paciente novo) → cria normal;
+            # 2+ (já ambíguo) → deixa como está.
+            try:
+                _future = [a for a in db.get_appointments_by_phone(tenant_id, phone)
+                           if not a.get("cancelled")]
+            except Exception:
+                _future = []
+            if len(_future) == 1 and not db.has_conflict(
+                    tenant_id, slot, duration, exclude_id=int(_future[0]["id"])):
+                reply = _do_reschedule(tenant, phone, _future[0], slot)
+                logger.info(f"[{tenant['slug']}][{phone}] create→remarcação "
+                            f"(evita duplicata) id={_future[0]['id']} → {slot.isoformat()}")
+                return reply, {"type": "new_message",
+                               "data": {"phone": phone, "intent": "reschedule"}}
             if not db.has_conflict(tenant_id, slot, duration):
                 appt_id = db.create_appointment(tenant_id, name, phone, slot)
                 # Sincronizar com Google Calendar (se conectado)

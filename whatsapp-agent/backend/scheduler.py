@@ -85,8 +85,7 @@ _DEFAULT_BILLING = (
     "Oi, {nome}! 🌷\n"
     "Espero que esteja tudo bem por aí.\n\n"
     "Passando só pra compartilhar o valor das sessões do último mês:\n\n"
-    "Fechamos em R$ {total} 💖\n\n"
-    "Qualquer dúvida, é só me chamar, tá? 😊"
+    "Fechamos em R$ {total} 💖"
 )
 
 
@@ -212,6 +211,10 @@ async def _run_billing():
             logger.info(f"[{tenant['slug']}] ⏸ Cobrança {month_str} pausada (global)")
             continue
         patients = db.get_patients_with_price(tenant["id"])
+        # Telefones já marcados como PAGO no mês (✓ pago no painel) → não recebem
+        # cobrança: se a psicóloga já recebeu e marcou, mandar mensagem seria
+        # constrangedor. Conjunto normalizado (só-dígitos, tolerante a variantes).
+        paid_phones = db.get_paid_phones_for_month(tenant["id"], month_str)
         # Dedup: cada agendamento é cobrado UMA vez no run, mesmo que o contato
         # exista como 2 cadastros em variantes do telefone (evita cobrança dupla).
         billed_ids: set = set()
@@ -227,6 +230,9 @@ async def _run_billing():
                 continue
             if patient.get("billing_paused") or db.is_patient_billing_paused(tenant["id"], phone):
                 logger.info(f"[{tenant['slug']}] ⏸ Cobrança pulada (paciente pausado) → {phone}")
+                continue
+            if db._norm_digits(phone) in paid_phones:
+                logger.info(f"[{tenant['slug']}] ⏸ Cobrança pulada (já marcado como pago) → {phone}")
                 continue
             sessions = db.get_valid_sessions_for_month(
                 tenant["id"], phone, month_start, month_end, now_str
@@ -275,6 +281,8 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
     if db.is_tenant_billing_paused(tenant_id):
         return []
     patients = db.get_patients_with_price(tenant_id)
+    # Telefones já marcados como PAGO no mês → pulados também no disparo manual.
+    paid_phones = db.get_paid_phones_for_month(tenant_id, month_str)
     results = []
     # Dedup: cada agendamento cobrado UMA vez (evita dupla em contato com
     # 2 cadastros em variantes do telefone).
@@ -290,6 +298,9 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
             continue
         # Pausa individual de cobrança do paciente
         if patient.get("billing_paused") or db.is_patient_billing_paused(tenant_id, phone):
+            continue
+        # Já marcado como pago no painel → não cobrar
+        if db._norm_digits(phone) in paid_phones:
             continue
         sessions = db.get_valid_sessions_for_month(tenant_id, phone, month_start, month_end, now_str)
         sessions = [s for s in sessions if s.get("id") not in billed_ids]
