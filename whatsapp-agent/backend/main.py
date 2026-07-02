@@ -1425,42 +1425,72 @@ def controle_mobile(token: str, request: Request):
             (tenant["id"],)
         ).fetchall()
 
-    # Monta dicionário phone → nome(s) — agrupa múltiplos pacientes no mesmo número
-    names_by_phone: dict[str, list[str]] = {}
-    for r in appt_rows:
-        p = _norm_phone(r["phone"])
-        if p and r["patient_name"]:
-            if p not in names_by_phone:
-                names_by_phone[p] = []
-            if r["patient_name"] not in names_by_phone[p]:
-                names_by_phone[p].append(r["patient_name"])
-
-    seen: dict[str, str] = {
-        p: " / ".join(names) for p, names in names_by_phone.items()
-    }
-    # Adiciona contatos de conversas que não estão na agenda
-    for r in conv_rows:
-        p = _norm_phone(r["phone"])
-        if p and p not in seen:
-            seen[p] = ""  # sem nome — mostra só o número
-
-    # Preenche nomes salvos em patients (renomeados via controle)
-    for r in patient_rows:
-        p = _norm_phone(r["phone"])
-        if p and p in seen and not seen[p]:
-            seen[p] = r["name"]
-
     # Filtra IDs de grupo do WhatsApp (não são pacientes)
     def _is_group(ph: str) -> bool:
         return bool(ph) and ("@g.us" in ph or ph.startswith("120363"))
 
+    # Forma canônica de um número BR: colapsa as variações com/sem DDI 55 e
+    # com/sem o "9" extra do celular. Assim o MESMO paciente que aparecia em
+    # duas linhas (ex.: 88 99412-xxxx e 88 9412-xxxx) vira uma linha só.
+    # Grupos ficam de fora do colapso.
+    def _canon(digits: str) -> str:
+        if not digits or _is_group(digits):
+            return digits
+        variants = db._phone_variants(digits) or {digits}
+        return min(variants, key=lambda v: (len(v), v))
+
+    # Agrupa por forma canônica → telefones reais observados + nomes acumulados.
+    groups: dict[str, dict] = {}
+    for r in appt_rows:
+        p = _norm_phone(r["phone"])
+        if not p:
+            continue
+        g = groups.setdefault(_canon(p), {"phones": set(), "names": []})
+        g["phones"].add(p)
+        nm = r["patient_name"]
+        if nm and nm not in g["names"]:
+            g["names"].append(nm)
+    for r in conv_rows:
+        p = _norm_phone(r["phone"])
+        if not p:
+            continue
+        g = groups.setdefault(_canon(p), {"phones": set(), "names": []})
+        g["phones"].add(p)
+    # Nomes salvos em patients enriquecem contatos JÁ existentes (não criam linha).
+    for r in patient_rows:
+        p = _norm_phone(r["phone"])
+        if not p:
+            continue
+        g = groups.get(_canon(p))
+        if g is not None and r["name"] and not g["names"]:
+            g["names"].append(r["name"])
+
+    # Telefones pausados (dígitos crus, como gravado em agent_paused).
+    paused_raw = set(_norm_phone(ph) for ph in db.list_paused_phones(tenant["id"]))
+
+    # Escolhe um telefone REAL do grupo para exibir/agir (prefere com DDI 55 e
+    # mais longo → formata bonito). Nunca inventa número fora do banco.
+    def _disp_rank(ph: str):
+        return (ph.startswith("55"), len(ph), ph)
+
+    patients_tmp = []
+    paused: set[str] = set()
+    for canon, g in groups.items():
+        rep = max(g["phones"], key=_disp_rank)
+        if _is_group(rep):
+            continue
+        patients_tmp.append({"phone": rep, "patient_name": " / ".join(g["names"])})
+        # Marca pausado se QUALQUER variante de QUALQUER telefone do grupo o for.
+        all_variants: set[str] = set()
+        for ph in g["phones"]:
+            all_variants |= db._phone_variants(ph) | {ph}
+        if all_variants & paused_raw:
+            paused.add(rep)
+
     patients = sorted(
-        [{"phone": p, "patient_name": name} for p, name in seen.items() if not _is_group(p)],
+        patients_tmp,
         key=lambda x: x["patient_name"].lower() if x["patient_name"] else x["phone"]
     )
-
-    # Normaliza os phones pausados também
-    paused = set(_norm_phone(ph) for ph in db.list_paused_phones(tenant["id"]))
 
     return templates.TemplateResponse("controle.html", {
         "request": request,
@@ -1521,18 +1551,25 @@ def controle_renomear(token: str, phone: str, patient_name: str = Form(...)):
 @app.post("/controle/{token}/retomar/{phone}", response_class=HTMLResponse)
 def controle_retomar(token: str, phone: str):
     tenant = _get_tenant_by_token(token)
-    db.resume_agent(tenant["id"], _norm_phone(phone))
+    # Remove a pausa em TODAS as variantes do número — o telefone exibido
+    # (representativo do grupo) pode diferir da forma gravada em agent_paused.
+    for v in (db._phone_variants(phone) | {_norm_phone(phone)}):
+        if v:
+            db.resume_agent(tenant["id"], v)
     return RedirectResponse(f"/controle/{token}", status_code=303)
 
 
 @app.post("/controle/{token}/excluir/{phone}", response_class=HTMLResponse)
 def controle_excluir(token: str, phone: str):
-    """Remove completamente um contato: conversas, agendamentos e pausa."""
+    """Remove completamente um contato: conversas, agendamentos, cadastro e
+    pausa — incluindo TODAS as variantes do número (com/sem o "9" e com/sem
+    DDI 55). Sem isso, apagar uma variante deixava a "irmã" e o contato voltava."""
     tenant = _get_tenant_by_token(token)
     p = _norm_phone(phone)
-    db.clear_conversation(tenant["id"], p)
-    db.resume_agent(tenant["id"], p)
-    # Remove também da tabela de agendamentos
+    # Apaga variantes de conversations/appointments/patients/agent_paused/
+    # billing_overrides de uma vez. Preserva billing_logs (histórico contábil).
+    db.delete_patient_completely(tenant["id"], p)
+    # Rede de segurança: agenda gravada com telefone formatado (+, -, espaço).
     with db.get_conn() as conn:
         conn.execute(
             "DELETE FROM appointments WHERE tenant_id = ? AND replace(replace(replace(phone,'+',''),'-',''),' ','') = ?",

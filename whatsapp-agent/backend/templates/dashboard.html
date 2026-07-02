@@ -2502,7 +2502,9 @@ function loadBillingPreview() {
       const ov = it.has_override ? ' <span class="text-purple-500" title="Valor ajustado manualmente">✏️</span>' : '';
       let totalCell;
       if (it.no_price) {
-        totalCell = '—';
+        totalCell = `<button class="text-orange-500 hover:text-brand underline decoration-dotted"
+          title="Definir valor por sessão — fica salvo e passa a ser cobrado"
+          onclick="setPatientPriceInline('${it.phone}','${(it.patient_name||'').replace(/'/g,"\\'")}')">+ valor</button>`;
       } else {
         totalCell = `<button class="text-gray-700 hover:text-brand underline decoration-dotted"
           title="Ajustar valor cobrado deste paciente no mês"
@@ -2810,6 +2812,29 @@ function editBillingValue(phone, name, atual, hasOverride) {
     month, total_amount: v
   })}).then(() => { showToast("Valor ajustado", "success"); loadBillingPreview(); })
     .catch(() => showToast("Erro ao ajustar valor", "warning"));
+}
+
+// Define o valor POR SESSÃO de um paciente que estava "sem valor", direto na
+// prévia. Fica salvo de forma PERMANENTE (não some sozinho no mês seguinte):
+// o paciente passa a ser cobrado automaticamente (total = sessões × valor).
+// Deixe vazio para cancelar sem alterar nada.
+async function setPatientPriceInline(phone, name) {
+  const novo = prompt(
+    `Valor por sessão de ${name} (R$):\n` +
+    `Fica salvo e passa a ser cobrado automaticamente (total = sessões × valor).`,
+    "");
+  if (novo === null) return;
+  const t = String(novo).trim();
+  if (t === "") return;
+  const v = parseFloat(t.replace(",", "."));
+  if (isNaN(v) || v < 0) { showToast("Valor inválido", "warning"); return; }
+  try {
+    await api(`/dashboard/api/patients/${phone}/price`, {
+      method: "PATCH", body: JSON.stringify({ session_price: v })
+    });
+    showToast("Valor salvo — paciente entra na cobrança", "success");
+    loadBillingPreview();
+  } catch (e) { showToast("Erro ao salvar valor", "warning"); }
 }
 
 // Compat: chamadas antigas continuam funcionando apontando para a prévia.
