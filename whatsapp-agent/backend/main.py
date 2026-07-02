@@ -277,6 +277,23 @@ async def _admin_auth_middleware(request: Request, call_next):
             return JSONResponse({"detail": "Acesso negado."}, status_code=403)
     return await call_next(request)
 
+
+@app.middleware("http")
+async def _security_headers_middleware(request: Request, call_next):
+    """Cabeçalhos de segurança aditivos. Não altera lógica de rotas.
+
+    - Referrer-Policy: evita vazar o ?token= das URLs de painel/controle no
+      header Referer ao clicar em links externos.
+    - X-Content-Type-Options: impede MIME sniffing.
+    - X-Frame-Options: impede clickjacking (embed em iframe de terceiros).
+    HSTS deliberadamente OMITIDO enquanto o SSL do domínio custom está pendente.
+    """
+    response = await call_next(request)
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    return response
+
 _STATIC_DIR = Path(__file__).parent / "static"
 _STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
@@ -934,7 +951,8 @@ def _get_tenant_by_token(token: str) -> dict:
 @app.get("/dashboard/stream/{slug}")
 async def dashboard_stream(slug: str, token: str = ""):
     tenant = _get_tenant(slug)
-    if not tenant.get("dashboard_token") or tenant["dashboard_token"] != token:
+    _dt = tenant.get("dashboard_token") or ""
+    if not _dt or not hmac.compare_digest(_dt, token):
         raise HTTPException(status_code=403, detail="Token inválido.")
     return StreamingResponse(
         events.subscribe(tenant["id"]),
@@ -946,7 +964,8 @@ async def dashboard_stream(slug: str, token: str = ""):
 @app.get("/dashboard/{slug}", response_class=HTMLResponse)
 def dashboard(slug: str, request: Request, token: str = ""):
     tenant = _get_tenant(slug)
-    if not tenant.get("dashboard_token") or tenant["dashboard_token"] != token:
+    _dt = tenant.get("dashboard_token") or ""
+    if not _dt or not hmac.compare_digest(_dt, token):
         raise HTTPException(status_code=403, detail="Token inválido.")
     # Redirecionar consultório suspenso para página de reativação
     status = tenant.get("status", "active")
