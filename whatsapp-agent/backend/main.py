@@ -2185,13 +2185,30 @@ def dash_billing_preview(request: Request, month: str | None = None):
         if a.get("patient_name") and (not g["patient_name"] or g["patient_name"] == ph):
             g["patient_name"] = a["patient_name"]
     for g in leftover.values():
-        items.append({
-            "phone": g["phone"], "patient_name": g["patient_name"], "sessions": g["sessions"],
-            "unit_price": 0.0, "total": 0.0, "has_override": False,
-            "paused": False, "already_sent": False, "no_price": True,
-            "paid": db._norm_digits(g["phone"]) in paid_phones,
-            "receipt": pending_receipts.get(db._norm_digits(g["phone"])),
-        })
+        phone = g["phone"]
+        override = db.get_billing_override(tid, phone, month_str)
+        if override is not None:
+            # Paciente sem preço, mas com VALOR TOTAL do mês definido na prévia →
+            # vira uma linha cobrável (entra no total e é disparado).
+            paused = bool(db.is_patient_billing_paused(tid, phone) or db.is_agent_paused(tid, phone))
+            items.append({
+                "phone": phone, "patient_name": g["patient_name"], "sessions": g["sessions"],
+                "unit_price": 0.0, "total": float(override["total_amount"]),
+                "has_override": True,
+                "paused": paused or global_paused,
+                "already_sent": db.billing_already_sent(tid, phone, month_str),
+                "no_price": False,
+                "paid": db._norm_digits(phone) in paid_phones,
+                "receipt": pending_receipts.get(db._norm_digits(phone)),
+            })
+        else:
+            items.append({
+                "phone": phone, "patient_name": g["patient_name"], "sessions": g["sessions"],
+                "unit_price": 0.0, "total": 0.0, "has_override": False,
+                "paused": False, "already_sent": False, "no_price": True,
+                "paid": db._norm_digits(phone) in paid_phones,
+                "receipt": pending_receipts.get(db._norm_digits(phone)),
+            })
 
     items.sort(key=lambda x: (x["no_price"], (x["patient_name"] or "").lower()))
 

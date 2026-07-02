@@ -2503,8 +2503,8 @@ function loadBillingPreview() {
       let totalCell;
       if (it.no_price) {
         totalCell = `<button class="text-orange-500 hover:text-brand underline decoration-dotted"
-          title="Definir valor por sessão — fica salvo e passa a ser cobrado"
-          onclick="setPatientPriceInline('${it.phone}','${(it.patient_name||'').replace(/'/g,"\\'")}')">+ valor</button>`;
+          title="Definir valor total do mês — passa a ser cobrado"
+          onclick="setBillingTotalInline('${it.phone}','${(it.patient_name||'').replace(/'/g,"\\'")}')">+ valor</button>`;
       } else {
         totalCell = `<button class="text-gray-700 hover:text-brand underline decoration-dotted"
           title="Ajustar valor cobrado deste paciente no mês"
@@ -2814,14 +2814,16 @@ function editBillingValue(phone, name, atual, hasOverride) {
     .catch(() => showToast("Erro ao ajustar valor", "warning"));
 }
 
-// Define o valor POR SESSÃO de um paciente que estava "sem valor", direto na
-// prévia. Fica salvo de forma PERMANENTE (não some sozinho no mês seguinte):
-// o paciente passa a ser cobrado automaticamente (total = sessões × valor).
-// Deixe vazio para cancelar sem alterar nada.
-async function setPatientPriceInline(phone, name) {
+// Define o VALOR TOTAL do mês de um paciente que estava "sem valor", direto na
+// prévia (override do mês). Passa a ser cobrado neste mês e fica salvo até você
+// alterar ou limpar (clicando no valor de novo e deixando vazio). Não some
+// sozinho. Deixe vazio agora para cancelar sem mudar nada.
+async function setBillingTotalInline(phone, name) {
+  const month = _currentBillingMonth();
+  if (!month) { showToast("Selecione o mês de referência", "warning"); return; }
   const novo = prompt(
-    `Valor por sessão de ${name} (R$):\n` +
-    `Fica salvo e passa a ser cobrado automaticamente (total = sessões × valor).`,
+    `Valor total de ${name} em ${month} (R$):\n` +
+    `Passa a ser cobrado neste mês. Deixe vazio para cancelar.`,
     "");
   if (novo === null) return;
   const t = String(novo).trim();
@@ -2829,8 +2831,8 @@ async function setPatientPriceInline(phone, name) {
   const v = parseFloat(t.replace(",", "."));
   if (isNaN(v) || v < 0) { showToast("Valor inválido", "warning"); return; }
   try {
-    await api(`/dashboard/api/patients/${phone}/price`, {
-      method: "PATCH", body: JSON.stringify({ session_price: v })
+    await api(`/dashboard/api/patients/${phone}/billing-override`, {
+      method: "POST", body: JSON.stringify({ month, total_amount: v })
     });
     showToast("Valor salvo — paciente entra na cobrança", "success");
     loadBillingPreview();

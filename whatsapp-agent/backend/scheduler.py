@@ -188,6 +188,57 @@ def _billing_message(tenant: dict, patient_name: str, total: float, sessions_cou
     )
 
 
+async def _send_override_only(tenant: dict, month_str: str, month_start: str,
+                              month_end: str, now_str: str,
+                              paid_phones: set, priced_variants: set) -> list[dict]:
+    """Cobra pacientes que NÃO têm preço cadastrado mas tiveram um VALOR TOTAL
+    do mês definido na prévia (override). Sem isso, o valor digitado na linha
+    'sem valor' nunca seria disparado. Respeita pausa/pago/já-enviado e não
+    duplica quem já foi tratado no loop de preço (priced_variants)."""
+    results: list[dict] = []
+    tid = tenant["id"]
+    for ov in db.get_billing_overrides_for_month(tid, month_str):
+        phone = (ov.get("phone") or "").strip()
+        if not phone:
+            continue
+        nd = db._norm_digits(phone)
+        if nd in priced_variants:
+            continue  # já cobrado no loop de preço (override aplicado lá)
+        if db.billing_already_sent(tid, phone, month_str):
+            continue
+        if nd in paid_phones:
+            continue
+        if db.is_agent_paused(tid, phone) or db.is_patient_billing_paused(tid, phone):
+            continue
+        total = float(ov.get("total_amount") or 0)
+        if total <= 0:
+            continue
+        sessions = db.get_valid_sessions_for_month(tid, phone, month_start, month_end, now_str)
+        count = len(sessions)
+        patient_name = sessions[0]["patient_name"] if sessions else phone
+        msg = _billing_message(tenant, patient_name, total, count)
+        sent = await wa.send_message(tenant, phone, msg)
+        if sent:
+            db.save_billing_log(tid, phone, patient_name, month_str, count, total, "whatsapp")
+            logger.info(f"[{tenant['slug']}] ✓ Cobrança {month_str} (valor do mês) → {patient_name} R${total:.2f}")
+        else:
+            logger.warning(f"[{tenant['slug']}] ✗ Falha cobrança (valor do mês) → {phone}")
+        results.append({"phone": phone, "patient_name": patient_name, "sessions": count,
+                        "total": total, "sent": sent})
+    return results
+
+
+def _priced_variants(patients: list[dict]) -> set:
+    """Conjunto de variantes (dígitos) dos telefones dos pacientes com preço —
+    para o loop de override não recobrar quem já foi tratado."""
+    out: set = set()
+    for patient in patients:
+        ph = patient.get("phone") or ""
+        if ph:
+            out |= db._phone_variants(ph) | {db._norm_digits(ph)}
+    return out
+
+
 async def _run_billing():
     """Executa no último dia do mês às 20h."""
     now = datetime.now(_TZ)
@@ -260,6 +311,12 @@ async def _run_billing():
             else:
                 logger.warning(f"[{tenant['slug']}] ✗ Falha cobrança → {phone}")
 
+        # Pacientes sem preço mas com VALOR TOTAL do mês definido na prévia.
+        await _send_override_only(
+            tenant, month_str, month_start, month_end, now_str,
+            paid_phones, _priced_variants(patients),
+        )
+
         # Cobranças avulsas (manuais) do mês — após o loop regular do tenant.
         await _send_manual_billing_entries(tenant, month_str)
 
@@ -321,6 +378,12 @@ async def run_billing_now(tenant_id: int, month_str: str | None = None) -> list[
         if sent:
             db.save_billing_log(tenant_id, phone, patient_name, month_str, count, total, "whatsapp")
         results.append({"phone": phone, "patient_name": patient_name, "sessions": count, "total": total, "sent": sent})
+
+    # Pacientes sem preço mas com VALOR TOTAL do mês definido na prévia (override).
+    results += await _send_override_only(
+        tenant, month_str, month_start, month_end, now_str,
+        paid_phones, _priced_variants(patients),
+    )
 
     # Cobranças avulsas (manuais) do mês — sessão extra/paciente novo.
     results += await _send_manual_billing_entries(tenant, month_str)

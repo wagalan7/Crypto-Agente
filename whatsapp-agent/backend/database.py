@@ -850,6 +850,18 @@ def delete_billing_override(tenant_id: int, phone: str, month: str) -> None:
         )
 
 
+def get_billing_overrides_for_month(tenant_id: int, month: str) -> list[dict]:
+    """Todos os overrides de valor total do mês. Usado no disparo para cobrar
+    pacientes SEM preço cadastrado que tiveram um valor definido na prévia."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT phone, total_amount, note FROM billing_overrides "
+            "WHERE tenant_id = ? AND month = ?",
+            (tenant_id, month),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ── Cobranças avulsas (manuais) ─────────────────────────────────────────────────
 
 def add_manual_billing_entry(tenant_id: int, month: str, patient_name: str,
