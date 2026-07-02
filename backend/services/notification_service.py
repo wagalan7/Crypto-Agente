@@ -221,5 +221,46 @@ def fmt_kill_switch(daily_pnl: float, threshold: float) -> str:
     )
 
 
+def _mech_label(mech: str) -> str:
+    return {
+        "breaker": "Breaker de stops",
+        "regime-guard": "Regime adverso",
+    }.get(mech, mech)
+
+
+def _brt_hhmm(until_ts: float) -> str:
+    """Formata um epoch (UTC) como HH:MM no horário de Brasília (UTC-3)."""
+    from datetime import datetime, timezone, timedelta
+    dt = datetime.fromtimestamp(until_ts, tz=timezone.utc).astimezone(
+        timezone(timedelta(hours=-3))
+    )
+    return dt.strftime("%H:%M")
+
+
+def fmt_direction_paused(mech: str, direction: str, until_ts: float, reason: str) -> str:
+    """Aviso de que uma DIREÇÃO (long/short) foi pausada pelo breaker/guard."""
+    import time
+    side = str(direction).upper()
+    emoji = "\U0001F7E2" if side == "LONG" else "\U0001F534"
+    mins = max(0, int(round((until_ts - time.time()) / 60.0)))
+    return (
+        f"\u23F8\uFE0F *Direção pausada* \u2014 {emoji} `{side}`\n"
+        f"Motivo: {reason}\n"
+        f"Mecanismo: _{_mech_label(mech)}_\n"
+        f"Fica pausada ~`{mins}min` (retoma ~`{_brt_hhmm(until_ts)}` BRT).\n"
+        f"A direção oposta segue operando normalmente."
+    )
+
+
+def fmt_direction_resumed(mech: str, direction: str) -> str:
+    """Aviso de que a direção voltou a operar (pausa expirou)."""
+    side = str(direction).upper()
+    emoji = "\U0001F7E2" if side == "LONG" else "\U0001F534"
+    return (
+        f"\u25B6\uFE0F *Direção retomada* \u2014 {emoji} `{side}`\n"
+        f"A pausa por _{_mech_label(mech)}_ expirou. `{side}` voltou a operar."
+    )
+
+
 def fmt_error(context: str, detail: str) -> str:
     return f"\u26A0\uFE0F *Erro critico* \u2014 `{context}`\n```\n{detail[:500]}\n```"

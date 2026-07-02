@@ -1472,6 +1472,11 @@ async def regime_status():
     try:
         from services import regime_service as rs
         status = await rs.get_regime_status()
+        # Viés de curto prazo (repique) usado pelo breaker direcional regime-aware.
+        try:
+            status = {**status, "market_bias": await rs.get_market_bias()}
+        except Exception:
+            pass
         # Enriquece com TOTAL/TOTAL2/TOTAL3 + USDT.D (observável, não bloqueia).
         try:
             totals = await get_crypto_totals()

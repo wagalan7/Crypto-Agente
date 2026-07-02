@@ -336,6 +336,25 @@ BREAKER_PAUSE_HOURS = float(os.getenv("BREAKER_PAUSE_HOURS", "3"))
 BREAKER_STREAK_SL = int(os.getenv("BREAKER_STREAK_SL", "5"))
 BREAKER_STREAK_WINDOW_HOURS = float(os.getenv("BREAKER_STREAK_WINDOW_HOURS", "24"))
 
+# ── Breaker regime-aware (repique) ──────────────────────────────────────────
+# Quando o BTC está empurrando numa direção (repique de alta → LONG a favor;
+# queda → SHORT a favor), a direção A FAVOR não deve ser pausada por ruído
+# estatístico: o app "entende que pode entrar" no repique. Só falha REAL
+# (stops consecutivos) pausa a direção favorecida — e aí exige mais stops que
+# o normal. A direção CONTRA o momentum continua com o breaker padrão.
+#   BREAKER_REGIME_AWARE      — liga/desliga a lógica (default on).
+#   BREAKER_TREND_SKIP_RATE   — na direção a favor, ignora o gatilho de TAXA de
+#                               SL (só o de streak vale). Default on.
+#   BREAKER_TREND_STREAK_BONUS— stops CONSECUTIVOS extras exigidos p/ pausar a
+#                               direção a favor (5 + bônus). Default 2 → 7.
+BREAKER_REGIME_AWARE = os.getenv("BREAKER_REGIME_AWARE", "true").strip().lower() not in (
+    "0", "false", "no", "off", "",
+)
+BREAKER_TREND_SKIP_RATE = os.getenv("BREAKER_TREND_SKIP_RATE", "true").strip().lower() not in (
+    "0", "false", "no", "off", "",
+)
+BREAKER_TREND_STREAK_BONUS = int(os.getenv("BREAKER_TREND_STREAK_BONUS", "2"))
+
 # ── Entry throttle (postmortem) ────────────────────────────────────────────
 # Cooldown global + max entradas/hora pra prevenir "fome de fila" disparando
 # trades em rajada quando o regime de mercado vira contra.
@@ -1193,20 +1212,42 @@ _REGIME_PAUSE_UNTIL: dict[str, float] = {}
 
 
 async def _regime_blocked(direction: str) -> tuple[bool, str]:
-    """Retorna (blocked, reason). Confere pausa armada + arma nova se preciso."""
+    """Retorna (blocked, reason). Confere pausa armada + arma nova se preciso.
+
+    Regime-aware: se a direção está A FAVOR do momentum atual do BTC (repique),
+    o limiar de SLs pra pausar sobe (BREAKER_TREND_STREAK_BONUS) — o app entende
+    que pode entrar no repique e só pausa se a falha for realmente forte."""
     import time
     now = time.time()
+    await _sweep_resumed_directions()
     until = _REGIME_PAUSE_UNTIL.get(direction, 0)
     if until > now:
         mins = (until - now) / 60.0
         return True, f"pausa ativa há {mins:.0f}min"
+
+    max_sl = REGIME_GUARD_MAX_SL
+    favored = False
+    if BREAKER_REGIME_AWARE:
+        try:
+            from services.regime_service import get_market_bias, direction_favored
+            if direction_favored(direction, await get_market_bias()):
+                favored = True
+                max_sl = REGIME_GUARD_MAX_SL + BREAKER_TREND_STREAK_BONUS
+        except Exception as e:
+            log.warning(f"[regime-guard] bias falhou (fail-open): {e}")
+
     sl_count = await _count_recent_sl_by_direction(direction, REGIME_GUARD_WINDOW_HOURS)
-    if sl_count >= REGIME_GUARD_MAX_SL:
+    if sl_count >= max_sl:
         _REGIME_PAUSE_UNTIL[direction] = now + REGIME_GUARD_PAUSE_HOURS * 3600
-        return True, (
+        reason = (
             f"{sl_count} SLs {direction} em {REGIME_GUARD_WINDOW_HOURS:.0f}h — "
             f"pausa {REGIME_GUARD_PAUSE_HOURS:.0f}h"
+            + (" (a favor do repique, limiar elevado)" if favored else "")
         )
+        await _notify_direction_paused(
+            "regime-guard", direction, _REGIME_PAUSE_UNTIL[direction], reason
+        )
+        return True, reason
     return False, ""
 
 
@@ -1215,6 +1256,56 @@ async def _regime_blocked(direction: str) -> tuple[bool, str]:
 # instante (vira "now" ao armar → começo limpo após a pausa; reseta no dia UTC).
 _DAILY_BREAKER_UNTIL: dict[str, float] = {}
 _DAILY_BREAKER_CUTOFF: dict[str, "datetime"] = {}
+
+# Estado de notificação das pausas direcionais: (mech, direction) -> until_ts
+# já avisado como "pausado". Evita re-avisar a mesma pausa e permite detectar a
+# retomada (quando o until expira, dispara o aviso de "retomada").
+_PAUSE_NOTIFIED: dict[tuple[str, str], float] = {}
+
+
+def _pause_until_for(mech: str, direction: str) -> float:
+    if mech == "breaker":
+        return _DAILY_BREAKER_UNTIL.get(direction, 0.0)
+    if mech == "regime-guard":
+        return _REGIME_PAUSE_UNTIL.get(direction, 0.0)
+    return 0.0
+
+
+async def _notify_direction_paused(mech: str, direction: str, until_ts: float, reason: str) -> None:
+    """Avisa no Telegram que uma direção foi pausada (uma vez por pausa)."""
+    key = (mech, direction)
+    prev = _PAUSE_NOTIFIED.get(key)
+    if prev is not None and prev >= until_ts - 1:
+        return  # já avisamos esta pausa (ou uma que vai até mais tarde)
+    _PAUSE_NOTIFIED[key] = until_ts
+    try:
+        from services.notification_service import send_telegram, fmt_direction_paused
+        await send_telegram(
+            fmt_direction_paused(mech, direction, until_ts, reason),
+            event_type="breaker",
+        )
+    except Exception as e:
+        log.warning(f"[breaker-notify] aviso de pausa {mech}/{direction} falhou: {e}")
+
+
+async def _sweep_resumed_directions() -> None:
+    """Detecta pausas que expiraram e avisa a retomada no Telegram. Chamado no
+    início dos checadores de breaker — roda com frequência suficiente pra
+    notificar em poucos minutos após a pausa expirar."""
+    import time
+    now = time.time()
+    for key in list(_PAUSE_NOTIFIED.keys()):
+        mech, direction = key
+        if _pause_until_for(mech, direction) <= now:
+            del _PAUSE_NOTIFIED[key]
+            try:
+                from services.notification_service import send_telegram, fmt_direction_resumed
+                await send_telegram(
+                    fmt_direction_resumed(mech, direction),
+                    event_type="breaker",
+                )
+            except Exception as e:
+                log.warning(f"[breaker-notify] aviso de retomada {mech}/{direction} falhou: {e}")
 
 
 async def _count_today_decided_by_direction(direction: str, cutoff_dt) -> tuple[int, int]:
@@ -1260,7 +1351,7 @@ async def _trailing_sl_streak(direction: str, cutoff_dt) -> int:
             RS.direction == direction,
             RS.status.in_(("lost",) + won),
             RS.outcome_at >= cutoff_dt,
-        ).order_by(RS.outcome_at.desc()).limit(BREAKER_STREAK_SL + 5)
+        ).order_by(RS.outcome_at.desc()).limit(BREAKER_STREAK_SL + BREAKER_TREND_STREAK_BONUS + 5)
         async with get_session() as session:
             rows = (await session.execute(stmt)).scalars().all()
         streak = 0
@@ -1284,18 +1375,35 @@ async def _daily_sl_breaker(direction: str) -> tuple[bool, str]:
     import time
     from datetime import datetime, timezone, timedelta
     now = time.time()
+    await _sweep_resumed_directions()
     until = _DAILY_BREAKER_UNTIL.get(direction, 0)
     if until > now:
         mins = (until - now) / 60.0
         return True, f"pausa ativa ({mins:.0f}min restantes)"
 
-    def _arm(reason: str) -> tuple[bool, str]:
+    # Regime-aware: se a direção está A FAVOR do momentum do BTC (repique), o app
+    # "entende que pode entrar" — ignora o gatilho de TAXA (só stops consecutivos
+    # pausam) e exige mais stops seguidos (BREAKER_TREND_STREAK_BONUS) pra pausar.
+    favored = False
+    if BREAKER_REGIME_AWARE:
+        try:
+            from services.regime_service import get_market_bias, direction_favored
+            favored = direction_favored(direction, await get_market_bias())
+        except Exception as e:
+            log.warning(f"[daily-breaker] bias falhou (fail-open): {e}")
+
+    async def _arm(reason: str) -> tuple[bool, str]:
         _DAILY_BREAKER_UNTIL[direction] = now + BREAKER_PAUSE_HOURS * 3600
         _DAILY_BREAKER_CUTOFF[direction] = datetime.now(timezone.utc)
+        await _notify_direction_paused(
+            "breaker", direction, _DAILY_BREAKER_UNTIL[direction], reason
+        )
         return True, reason
 
     # ── Gatilho 1: taxa de SL diária ──────────────────────────────────────
-    if BREAKER_MIN_SAMPLE > 0:
+    # Pulado na direção a favor do repique (BREAKER_TREND_SKIP_RATE): ruído
+    # estatístico não deve pausar o lado que o mercado está empurrando.
+    if BREAKER_MIN_SAMPLE > 0 and not (favored and BREAKER_TREND_SKIP_RATE):
         # cutoff = início do dia UTC, ou após a última pausa (o mais recente)
         start_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         cutoff = _DAILY_BREAKER_CUTOFF.get(direction)
@@ -1305,22 +1413,25 @@ async def _daily_sl_breaker(direction: str) -> tuple[bool, str]:
         if total >= BREAKER_MIN_SAMPLE and total > 0:
             rate = sl / total
             if rate >= BREAKER_SL_RATE:
-                return _arm(
+                return await _arm(
                     f"{sl}/{total} SL ({rate*100:.0f}%) {direction} hoje — "
                     f"pausa {BREAKER_PAUSE_HOURS:.0f}h"
                 )
 
     # ── Gatilho 2: sequência de SLs consecutivos ──────────────────────────
+    # Sempre ativo (inclusive na direção a favor): falha REAL pausa mesmo no
+    # repique — mas exigindo mais stops seguidos quando a direção é favorecida.
     if BREAKER_STREAK_SL > 0:
+        streak_needed = BREAKER_STREAK_SL + (BREAKER_TREND_STREAK_BONUS if favored else 0)
         window_start = datetime.now(timezone.utc) - timedelta(hours=BREAKER_STREAK_WINDOW_HOURS)
         streak_cutoff = _DAILY_BREAKER_CUTOFF.get(direction)
         if streak_cutoff is None or streak_cutoff < window_start:
             streak_cutoff = window_start
         streak = await _trailing_sl_streak(direction, streak_cutoff)
-        if streak >= BREAKER_STREAK_SL:
-            return _arm(
-                f"{streak} SL seguidos {direction} — pausa {BREAKER_PAUSE_HOURS:.0f}h "
-                f"(mercado indeciso)"
+        if streak >= streak_needed:
+            suffix = " (a favor do repique, limiar elevado)" if favored else " (mercado indeciso)"
+            return await _arm(
+                f"{streak} SL seguidos {direction} — pausa {BREAKER_PAUSE_HOURS:.0f}h{suffix}"
             )
 
     return False, ""
@@ -1388,9 +1499,18 @@ def env_info() -> dict:
         "breaker_pause_hours": BREAKER_PAUSE_HOURS,
         "breaker_streak_sl": BREAKER_STREAK_SL,
         "breaker_streak_window_hours": BREAKER_STREAK_WINDOW_HOURS,
+        # breaker regime-aware (repique)
+        "breaker_regime_aware": BREAKER_REGIME_AWARE,
+        "breaker_trend_skip_rate": BREAKER_TREND_SKIP_RATE,
+        "breaker_trend_streak_bonus": BREAKER_TREND_STREAK_BONUS,
         "breaker_paused_directions": {
             d: round((u - __import__("time").time()) / 60.0, 1)
             for d, u in _DAILY_BREAKER_UNTIL.items()
+            if u > __import__("time").time()
+        },
+        "regime_guard_paused_directions": {
+            d: round((u - __import__("time").time()) / 60.0, 1)
+            for d, u in _REGIME_PAUSE_UNTIL.items()
             if u > __import__("time").time()
         },
         "note": "Sizing: risk_pct nominal; eleva ao mín notional; capa em margin%/trade e total notional%.",

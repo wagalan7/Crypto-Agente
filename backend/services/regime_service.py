@@ -66,6 +66,15 @@ ALT_RISKOFF_BLOCK = os.getenv("ALT_RISKOFF_BLOCK", "false").strip().lower() in (
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
 CACHE_TTL = 600  # 10min: regime muda devagar
 
+# ── Market bias (repique / momentum de curto prazo) ─────────────────────────
+# Usado pelo breaker direcional: quando o BTC está empurrando numa direção
+# (repique), a direção "a favor" do movimento não deve ser pausada por ruído —
+# só por falha real (stops CONSECUTIVOS). Mede o % do BTC numa janela curta.
+MARKET_BIAS_SHORT_HOURS = int(os.getenv("MARKET_BIAS_SHORT_HOURS", "6"))
+MARKET_BIAS_SHORT_PCT = float(os.getenv("MARKET_BIAS_SHORT_PCT", "1.0"))
+_bias_cache: Dict[str, Any] = {"ts": 0, "data": None}
+BIAS_CACHE_TTL = 300  # 5min: momentum curto muda mais rápido que o regime macro
+
 
 def is_btc_symbol(symbol: str) -> bool:
     """Considera BTC e ETH como 'majors' (não sofrem ALT_DANGER)."""
@@ -209,6 +218,58 @@ async def get_regime_status() -> Dict[str, Any]:
         log.info("[regime] dados indisponíveis — fail-open NORMAL")
 
     return data
+
+
+async def _fetch_btc_short_pct(hours: int) -> Optional[float]:
+    """% de variação do BTC nas últimas `hours` horas (candles 1h)."""
+    try:
+        from services.binance_service import fetch_ohlcv
+        df = await fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=hours + 3)
+        if df is None or len(df) < hours + 1:
+            return None
+        closes = df["close"].tolist()
+        past = float(closes[-(hours + 1)])
+        last = float(closes[-1])
+        if past <= 0:
+            return None
+        return round((last - past) / past * 100.0, 2)
+    except Exception as e:
+        log.warning(f"[regime] btc short {hours}h falhou: {e}")
+        return None
+
+
+async def get_market_bias() -> Dict[str, Any]:
+    """Viés de mercado de curto prazo p/ o breaker direcional. Cache 5min.
+
+    Retorna {"bias": "up"|"down"|"neutral", "btc_short_pct": float|None,
+    "window_hours": int}. 'up' = repique/tendência de alta (LONG a favor);
+    'down' = queda (SHORT a favor). Fail-open → neutral (sem dado, não
+    interfere no breaker)."""
+    now = time.time()
+    if _bias_cache["data"] and (now - _bias_cache["ts"]) < BIAS_CACHE_TTL:
+        return _bias_cache["data"]
+    short = await _fetch_btc_short_pct(MARKET_BIAS_SHORT_HOURS)
+    bias = "neutral"
+    if short is not None:
+        if short >= MARKET_BIAS_SHORT_PCT:
+            bias = "up"
+        elif short <= -MARKET_BIAS_SHORT_PCT:
+            bias = "down"
+    data = {"bias": bias, "btc_short_pct": short, "window_hours": MARKET_BIAS_SHORT_HOURS}
+    if short is not None:
+        _bias_cache["data"] = data
+        _bias_cache["ts"] = now
+    return data
+
+
+def direction_favored(direction: str, bias: Dict[str, Any]) -> bool:
+    """True se a direção está 'a favor' do momentum atual (repique).
+
+    LONG é favorecido em bias 'up', SHORT em bias 'down'. Neutral → ninguém
+    favorecido (breaker age normal nas duas direções)."""
+    b = bias.get("bias")
+    d = (direction or "").strip().lower()
+    return (b == "up" and d == "long") or (b == "down" and d == "short")
 
 
 def should_block_recommendation(regime_status: Dict[str, Any], symbol: str, direction: str) -> Optional[str]:
