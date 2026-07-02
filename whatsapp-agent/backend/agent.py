@@ -130,6 +130,13 @@ async def classify_image(image_url: str) -> str:
         return "unknown"
 
 
+def _is_psychology(tenant: dict) -> bool:
+    """True para o segmento clínico padrão (psicologia). Usado para preservar
+    100% o comportamento atual: quando True, todos os textos/prompts saem
+    exatamente como sempre foram. False = segmento genérico (Track B)."""
+    return (tenant.get('segment') or 'psicologia').strip().lower() in ('', 'psicologia')
+
+
 def _build_system_prompt(tenant: dict) -> str:
     if tenant.get('pix_key'):
         pix_section = (
@@ -144,8 +151,7 @@ def _build_system_prompt(tenant: dict) -> str:
     # Dispatch por segmento (Track B). 'psicologia' (default) devolve o prompt
     # clínico EXATAMENTE como sempre foi — zero mudança para os consultórios
     # atuais. Qualquer outro segmento usa o prompt genérico parametrizado.
-    seg = (tenant.get('segment') or 'psicologia').strip().lower()
-    if seg not in ('', 'psicologia'):
+    if not _is_psychology(tenant):
         return _generic_system_prompt(tenant, pix_section)
 
     return f"""Você é um assistente de consultório de psicologia via WhatsApp.
@@ -919,10 +925,15 @@ def _try_deterministic_decline(tenant: dict, phone: str, text: str):
     if not pedimos:
         return None
     nome = (appt.get("patient_name") or "").split()[0] if appt.get("patient_name") else ""
-    psic = tenant.get("psychologist_name") or "a psicóloga"
     saud = f"Entendi, {nome}! 😊" if nome else "Entendi! 😊"
-    reply = (f"{saud} Sem problema. Vou avisar a {psic} e ela entra em contato "
-             f"com você em breve por aqui. 💖")
+    if _is_psychology(tenant):
+        psic = tenant.get("psychologist_name") or "a psicóloga"
+        reply = (f"{saud} Sem problema. Vou avisar a {psic} e ela entra em contato "
+                 f"com você em breve por aqui. 💖")
+    else:
+        prof = (tenant.get("psychologist_name") or "").strip() or "o responsável"
+        reply = (f"{saud} Sem problema. Vou avisar {prof} e já retornam o contato "
+                 f"com você por aqui. 💖")
     logger.info(f"[{tenant['slug']}][{phone}] NEGATIVA DETERMINÍSTICA à confirmação id={appt['id']}")
     event = {"type": "confirmation_declined", "data": {
         "phone": phone,
@@ -1372,8 +1383,13 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 or "disponibilidade" in low or "horário" in low or "horario" in low
                 or "remarc" in low or "qual dia" in low or "opções" in low or "opcoes" in low):
             saud = f"Entendi, {nome}!" if nome else "Entendi!"
-            reply = (f"{saud} 😊 Vou avisar a {psy} sobre o cancelamento e ela "
-                     f"entra em contato com você em breve. 💖")
+            if _is_psychology(tenant):
+                reply = (f"{saud} 😊 Vou avisar a {psy} sobre o cancelamento e ela "
+                         f"entra em contato com você em breve. 💖")
+            else:
+                prof = (tenant.get("psychologist_name") or "").strip() or "o responsável"
+                reply = (f"{saud} 😊 Vou avisar {prof} sobre o cancelamento e já "
+                         f"retornam o contato com você em breve. 💖")
         return reply, {"type": "appointment_cancelled",
                        "data": {"phone": phone,
                                 "patient_name": (appt or {}).get("patient_name", "")}}
