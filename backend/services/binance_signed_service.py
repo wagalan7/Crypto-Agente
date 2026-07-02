@@ -46,6 +46,23 @@ log = logging.getLogger(__name__)
 _ALGO_MAX_ATTEMPTS = int(os.getenv("BINANCE_ALGO_MAX_ATTEMPTS", "3"))
 _ALGO_RETRY_BASE_DELAY = float(os.getenv("BINANCE_ALGO_RETRY_DELAY", "0.4"))  # s, escala com a tentativa
 
+# ── #1 Runner com trailing pós-TP2 (default OFF) ────────────────────────────
+# Ideia: em vez de o TP2 fechar 100% do restante (closePosition=true), deixar
+# uma FRAÇÃO da posição correndo ("runner") após o TP2, gerida por um stop
+# chandelier (ATR trailing) no trade_manager. Assim capturamos a cauda de
+# tendências fortes que hoje o TP2 fixo corta cedo — sem risco extra, porque o
+# runner só é armado DEPOIS do TP1 (parcial embolsada) e do TP2 (parcial 2
+# embolsada), já em lucro estrutural, com SL no BE ou acima.
+#
+# Implementação de superfície mínima: a divisão do TP2 acontece AQUI dentro,
+# SÓ no bracket de abertura (quando `tp1` E `tp2` vêm juntos = has_partial).
+# Chamadas de auto-cura / transição de BE passam tp1=None ou tp2=None e NÃO
+# disparam o split. Com RUNNER_ENABLED=false o TP2 volta a ser closePosition
+# (comportamento idêntico ao de hoje — zero mudança em produção).
+RUNNER_ENABLED = os.getenv("RUNNER_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+# Fração da posição TOTAL (qty na abertura) que vira runner. 0.20 = 20%.
+RUNNER_QTY_PCT = float(os.getenv("RUNNER_QTY_PCT", "0.20"))
+
 # Códigos de erro Binance que NÃO adianta repetir (problema é o pedido, não o canal).
 _PERMANENT_ALGO_CODES = {
     -2021,  # Order would immediately trigger (preço do gatilho do lado errado do mercado)
@@ -741,6 +758,9 @@ async def place_protection_orders(
         "tp1_ok": True, "tp1_order_id": None, "tp1_msg": None, "tp1_qty": 0.0,
         "tp2_ok": True, "tp2_order_id": None, "tp2_msg": None,
         "tp1_skipped": False,
+        # #1 runner: preenchidos só quando o split do TP2 é aplicado (bracket de
+        # abertura + RUNNER_ENABLED). runner_qty = qty que sobra correndo após o TP2.
+        "is_runner": False, "runner_qty": 0.0,
     }
 
     qty_total = await _round_qty(sym, float(qty))
@@ -885,7 +905,36 @@ async def place_protection_orders(
             out["tp1_msg"] = msg
             out["tp1_qty"] = tp1_qty if ok else 0.0
 
-    # ── TP2 / TP único — fecha o restante (closePosition, sem poeira) ────
+    # ── #1 Runner: decide se o TP2 fecha 100% (closePosition) ou deixa cauda ──
+    # Só divide no BRACKET DE ABERTURA (has_partial = tp1 e tp2 juntos) e com
+    # RUNNER_ENABLED. runner_qty = fração da posição TOTAL que segue correndo
+    # após o TP2; o TP2 fecha (qty_remaining − runner_qty) como reduce-only
+    # parcial. Fallback seguro pro closePosition se o split arredondar pra 0.
+    runner_qty = 0.0
+    tp2_close_qty = qty_remaining
+    tp2_partial = False  # True → TP2 vira reduce-only parcial (deixa runner)
+    if RUNNER_ENABLED and has_partial and RUNNER_QTY_PCT > 0:
+        rq = await _round_qty(sym, float(qty_total) * float(RUNNER_QTY_PCT))
+        close_q = await _round_qty(sym, float(qty_remaining) - float(rq))
+        if rq > 0 and close_q > 0:
+            runner_qty = rq
+            tp2_close_qty = close_q
+            tp2_partial = True
+            out["is_runner"] = True
+            out["runner_qty"] = runner_qty
+            log.info(
+                f"[binance] runner {sym}: TP2 parcial reduce-only qty={tp2_close_qty} "
+                f"(fecha), runner={runner_qty} segue correndo (de {qty_remaining} restante)"
+            )
+        else:
+            log.info(
+                f"[binance] runner {sym}: split arredondou pra 0 "
+                f"(runner={rq}, tp2={close_q}) — mantém TP2 closePosition"
+            )
+
+    # ── TP2 / TP único ──────────────────────────────────────────────────────
+    # Sem runner: fecha o restante (closePosition, sem poeira).
+    # Com runner: fecha só tp2_close_qty (reduce-only), deixando runner_qty vivo.
     tp_final = tp2 if tp2 is not None else tp1
     if tp_final is not None:
         tp_price = await _round_price(sym, float(tp_final))
@@ -895,6 +944,12 @@ async def place_protection_orders(
             out["tp2_ok"] = True
             out["tp2_order_id"] = dup_id
             out["tp2_msg"] = "dedup: já existia"
+        elif tp2_partial:
+            # Runner: TP2 reduce-only parcial (NÃO closePosition — a cauda sobra).
+            ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, tp2_close_qty, "tp2")
+            out["tp2_ok"] = ok
+            out["tp2_order_id"] = oid
+            out["tp2_msg"] = msg
         else:
             ok, oid, msg = await _place_algo("TAKE_PROFIT_MARKET", tp_price, qty_remaining, "tp2", close_position=True)
             if not ok:

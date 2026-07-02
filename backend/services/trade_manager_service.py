@@ -109,6 +109,32 @@ PRE_TP1_PROTECT_ENABLED = os.getenv("PRE_TP1_PROTECT_ENABLED", "false").strip().
 PRE_TP1_PROTECT_TRIGGER_FRAC = float(os.getenv("PRE_TP1_PROTECT_TRIGGER_FRAC", "0.6"))  # 60% rumo ao TP1
 PRE_TP1_PROTECT_LOCK_R = float(os.getenv("PRE_TP1_PROTECT_LOCK_R", "0.5"))  # SL novo a entry ∓ 0.5R
 
+# ── #1 Runner com trailing chandelier pós-TP2 (default OFF) ─────────────────
+# Após o TP2 fechar sua PARCIAL (reduce-only, ver binance_signed_service), sobra
+# um "runner" (~RUNNER_QTY_PCT da posição original) correndo. Aqui, em fase
+# "runner", um stop chandelier (highest_high − k·ATR pra long; lowest_low + k·ATR
+# pra short) é recalculado a cada poll e SÓ APERTA (ratchet) — nunca afrouxa.
+# Reusa o mesmo mecanismo cria-novo→cancela-antigo do SL. Só arma DEPOIS de TP1
+# e TP2 embolsados (lucro estrutural travado): o pior caso do runner é fechar no
+# último SL, que já está no BE ou acima. DEFAULT OFF (dinheiro real).
+#
+# Detecção da transição post_tp1 → runner: em post_tp1 a qty ≈ (1−0.45)=55% da
+# inicial; quando o TP2 parcial preenche, cai pra ~RUNNER_QTY_PCT (20%). O
+# limiar RUNNER_DETECT_FRAC (default 0.35) fica ENTRE os dois níveis.
+RUNNER_ENABLED = os.getenv("RUNNER_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+RUNNER_QTY_PCT = float(os.getenv("RUNNER_QTY_PCT", "0.20"))
+# Fração da qty inicial abaixo da qual (em post_tp1) consideramos o TP2 preenchido.
+RUNNER_DETECT_FRAC = float(os.getenv("RUNNER_DETECT_FRAC", "0.35"))
+# Multiplicador do ATR no chandelier (k). 3.0 é o clássico; menor = trail mais justo.
+RUNNER_ATR_MULT = float(os.getenv("RUNNER_ATR_MULT", "3.0"))
+# Janela (nº de candles) do highest_high/lowest_low do chandelier.
+RUNNER_LOOKBACK = int(os.getenv("RUNNER_LOOKBACK", "22"))
+# TF de fallback pro ATR/OHLC do runner quando a snapshot não tem TF.
+RUNNER_ATR_TF_FALLBACK = os.getenv("RUNNER_ATR_TF_FALLBACK", "15m").strip()
+# Passo mínimo do trail em fração do ATR — evita cancelar/recriar SL por migalha
+# a cada poll (churn de ordens). Só move se o ganho de aperto ≥ isto·ATR.
+RUNNER_MIN_STEP_ATR = float(os.getenv("RUNNER_MIN_STEP_ATR", "0.25"))
+
 
 def _tf_category(tf: str | None) -> str:
     """Mapeia timeframe → 'scalp' | 'day' | 'swing'."""
@@ -536,7 +562,7 @@ async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
     """
     if not TIME_STOP_ENABLED:
         return False
-    if trade.phase == "post_tp1":
+    if trade.phase in ("post_tp1", "runner"):
         return False
     if not trade.opened_at:
         return False
@@ -717,6 +743,16 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     sl_missing = sl_missing or sl_vanished
     tp2_missing = tp2_missing or tp2_vanished
     tp1_missing = tp1_missing or tp1_vanished
+
+    # ── #1 Runner: TP2 parcial que preencheu NÃO é "sumido" ──────────────────
+    # Com runner ligado, em post_tp1, o TP2 é reduce-only parcial. Ao preencher,
+    # a qty cai ao nível do runner e o TP2 some do openAlgoOrders — isso é
+    # execução legítima, não perda de perna. Se recriássemos, re-fecharíamos a
+    # cauda. A transição pra fase "runner" (no _process_trade) cuida do resto.
+    if RUNNER_ENABLED and is_post and bool(trade.planned_tp2):
+        q_init = trade.qty_initial or trade.qty or qty_now
+        if q_init > 0 and qty_now <= q_init * RUNNER_DETECT_FRAC:
+            tp2_missing = False
 
     # ── Anti-race do disparo do SL/TP ────────────────────────────────────────
     # Uma perna pode "sumir" do openAlgoOrders porque DISPAROU (a posição está
@@ -946,6 +982,148 @@ async def _maybe_pre_tp1_protect(trade: RealTrade, qty_now: float) -> bool:
         return False
 
 
+def _runner_should_move(
+    is_long: bool, cur_sl: float, new_sl: float, mark: float, min_step: float
+) -> bool:
+    """Decisão PURA do trail do runner (ratchet). Move SÓ se o novo stop aperta
+    por ≥ min_step E fica do lado seguro do mark (não estopa na hora).
+      long : new_sl deve subir (> cur_sl + min_step) e ficar ABAIXO do mark.
+      short: new_sl deve descer (< cur_sl − min_step) e ficar ACIMA do mark.
+    Nunca afrouxa."""
+    if is_long:
+        if new_sl <= cur_sl + min_step:
+            return False
+        return new_sl < mark
+    else:
+        if new_sl >= cur_sl - min_step:
+            return False
+        return new_sl > mark
+
+
+async def _chandelier_stop(trade: RealTrade) -> tuple[float | None, float | None, float | None]:
+    """Calcula o stop chandelier do runner. Retorna (novo_sl, atr, mark) ou
+    (None, ..) se faltar dado. long: highest_high(lookback) − k·ATR;
+    short: lowest_low(lookback) + k·ATR. Fail-soft."""
+    try:
+        from services.binance_service import fetch_ohlcv
+        from services.indicator_service import calculate_indicators
+        tf = (await _resolve_trade_timeframe(trade)) or RUNNER_ATR_TF_FALLBACK
+        limit = max(RUNNER_LOOKBACK + 30, 60)
+        df = await fetch_ohlcv(trade.symbol, tf, limit)
+        if df is None or df.empty or len(df) < RUNNER_LOOKBACK + 2:
+            return None, None, None
+        ind = calculate_indicators(df)
+        atr = float(getattr(ind, "atr", 0) or 0)
+        if atr <= 0:
+            return None, None, None
+        mark = float(df["close"].iloc[-1])
+        window = df.iloc[-RUNNER_LOOKBACK:]
+        if trade.side == "long":
+            hh = float(window["high"].max())
+            new_sl = hh - RUNNER_ATR_MULT * atr
+        else:
+            ll = float(window["low"].min())
+            new_sl = ll + RUNNER_ATR_MULT * atr
+        return round(new_sl, 8), atr, mark
+    except Exception as e:
+        log.warning(f"[runner] chandelier {trade.symbol} #{trade.id} falhou: {e}")
+        return None, None, None
+
+
+async def _transition_to_runner(trade: RealTrade, qty_now: float) -> None:
+    """TP2 parcial preencheu (post_tp1 → runner): persiste a fase e a qty
+    residual (a cauda). O SL já está no BE/estrutura (closePosition cobre o
+    runner). O trail passa a apertá-lo a partir do próximo ciclo."""
+    async with get_session() as session:
+        fresh = (await session.execute(
+            select(RealTrade).where(RealTrade.id == trade.id)
+        )).scalar_one_or_none()
+        if fresh is None:
+            return
+        fresh.phase = "runner"
+        fresh.qty = qty_now
+        fresh.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+    trade.phase = "runner"
+    trade.qty = qty_now
+    log.info(
+        f"[runner] {trade.symbol} #{trade.id} TP2 parcial preencheu → fase RUNNER "
+        f"(cauda qty={qty_now}, SL atual {trade.sl_current_price})"
+    )
+    try:
+        from services.notification_service import send_telegram
+        side = str(trade.side).upper()
+        emoji = "\U0001F7E2" if side == "LONG" else "\U0001F534"
+        await send_telegram(
+            f"\U0001F3C3 *Runner armado* \u2014 {emoji} `{trade.symbol}` ({side})\n"
+            f"TP1 e TP2 embolsados. Sobra `{qty_now}` correndo com trailing "
+            f"chandelier (ATR×{RUNNER_ATR_MULT}). SL sobe sozinho, nunca desce.",
+            event_type="runner",
+        )
+    except Exception as e:
+        log.warning(f"[notify] telegram runner-armed falhou: {e}")
+
+
+async def _maybe_trail_runner(trade: RealTrade, qty_now: float) -> bool:
+    """Fase runner: aperta o SL pelo chandelier (ratchet). Só move se o novo SL
+    for MAIS APERTADO que o atual por ≥ RUNNER_MIN_STEP_ATR·ATR e ainda estiver
+    do lado seguro do mark (não estopa na hora). Reusa cria-novo→cancela-antigo.
+    Fail-soft total."""
+    if not RUNNER_ENABLED or trade.phase != "runner":
+        return False
+    try:
+        new_sl, atr, mark = await _chandelier_stop(trade)
+        if new_sl is None or atr is None or mark is None:
+            return False
+        is_long = trade.side == "long"
+        cur_sl = float(trade.sl_current_price or trade.entry_price or 0)
+        if cur_sl <= 0:
+            return False
+        min_step = RUNNER_MIN_STEP_ATR * atr
+
+        if not _runner_should_move(is_long, cur_sl, new_sl, mark, min_step):
+            return False
+
+        from services import exchange_service, binance_signed_service
+        entry_side = "Buy" if is_long else "Sell"
+        prot = await binance_signed_service.place_protection_orders(
+            trade.symbol, entry_side, qty=qty_now,
+            stop_loss=new_sl, tp1=None, tp2=None,
+            client_order_id_prefix=f"cw-run-{trade.id}",
+        )
+        if not prot.get("sl_ok"):
+            log.warning(
+                f"[runner] {trade.symbol} #{trade.id} novo SL trail falhou: "
+                f"{prot.get('sl_msg')} — mantém SL atual"
+            )
+            return False
+        new_sl_id = prot.get("sl_order_id")
+        if trade.sl_order_id:
+            try:
+                await exchange_service.cancel_algo_order(trade.sl_order_id)
+            except Exception as e:
+                log.warning(f"[runner] cancel SL antigo #{trade.id}: {e}")
+        async with get_session() as session:
+            fresh = (await session.execute(
+                select(RealTrade).where(RealTrade.id == trade.id)
+            )).scalar_one_or_none()
+            if fresh:
+                fresh.sl_order_id = new_sl_id
+                fresh.sl_current_price = new_sl
+                fresh.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+        trade.sl_order_id = new_sl_id
+        trade.sl_current_price = new_sl
+        log.info(
+            f"[runner] {trade.symbol} #{trade.id} trail SL {cur_sl} → {new_sl} "
+            f"(chandelier hh/ll ∓{RUNNER_ATR_MULT}·ATR={atr:.6g}, mark={mark})"
+        )
+        return True
+    except Exception as e:
+        log.warning(f"[runner] trail #{trade.id} falhou (fail-soft): {e}")
+        return False
+
+
 async def _process_trade(trade: RealTrade) -> None:
     """Avalia um trade aberto e age conforme a fase."""
     qty_now = await _fetch_exchange_qty(trade.symbol)
@@ -994,14 +1172,14 @@ async def _process_trade(trade: RealTrade) -> None:
                 )
             except Exception as e:
                 log.warning(f"[trade-manager] flatten poeira #{trade.id} falhou: {e}")
-            await _close_trade(trade, "tp2" if trade.phase == "post_tp1" else "stop")
+            await _close_trade(trade, "tp2" if trade.phase in ("post_tp1", "runner") else "stop")
             return
 
     # ── Posição fechou totalmente ────────────────────────────────────────
     if qty_now <= 0:
-        # Heurística: se já passou pelo post_tp1, provavelmente bateu TP2 ou BE.
-        # Se ainda em pre_tp1, foi stop direto.
-        if trade.phase == "post_tp1":
+        # Heurística: se já passou pelo post_tp1/runner, provavelmente bateu
+        # TP2/trail (lucro). Se ainda em pre_tp1, foi stop direto.
+        if trade.phase in ("post_tp1", "runner"):
             await _close_trade(trade, "tp2")
         else:
             await _close_trade(trade, "stop")
@@ -1023,6 +1201,31 @@ async def _process_trade(trade: RealTrade) -> None:
                 await session.commit()
                 trade.qty = qty_now
         await _transition_to_post_tp1(trade)
+        return
+
+    # ── #1 Runner: transição post_tp1 → runner (TP2 parcial preencheu) ────
+    # Só quando RUNNER_ENABLED. Em post_tp1 a qty ≈ 55% da inicial; ao preencher
+    # o TP2 parcial cai pra ~RUNNER_QTY_PCT. Cruzou RUNNER_DETECT_FRAC → arma o
+    # runner e já tenta apertar o trail neste ciclo.
+    if RUNNER_ENABLED and trade.phase == "post_tp1" and qty_now <= qty_initial * RUNNER_DETECT_FRAC:
+        log.info(
+            f"[runner] {trade.symbol} #{trade.id} TP2 parcial detectado: "
+            f"qty {qty_initial} → {qty_now} (≤ {qty_initial * RUNNER_DETECT_FRAC:.4f})"
+        )
+        await _transition_to_runner(trade, qty_now)
+        try:
+            await _maybe_trail_runner(trade, qty_now)
+        except Exception as e:
+            log.warning(f"[runner] trail pós-armar #{trade.id} erro: {e}")
+        return
+
+    # ── #1 Runner: já em fase runner → aperta o trailing chandelier ───────
+    if RUNNER_ENABLED and trade.phase == "runner":
+        try:
+            await _maybe_trail_runner(trade, qty_now)
+        except Exception as e:
+            log.warning(f"[runner] trail #{trade.id} erro: {e}")
+        return
 
 
 # ══════════════════════════════════════════════════════════════════════════

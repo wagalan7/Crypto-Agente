@@ -522,6 +522,18 @@ SCORE_ADJUSTER_CAP = float(os.getenv("SCORE_ADJUSTER_CAP", "20"))
 PROXIMITY_GATE_ENABLED = os.getenv("PROXIMITY_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 PROXIMITY_MAX_ATR = float(os.getenv("PROXIMITY_MAX_ATR", "1.0"))
 
+# ── #3 Lane de BREAKOUT com momentum (gated, DEFAULT-OFF) ────────────────────
+# O proximity gate acima corta TODO setup que já andou >=1×ATR a favor — inclui
+# breakouts legítimos de tendência forte (o "trem" que ainda tem pista). Quando
+# a direção está A FAVOR do bias macro (repique/tendência) E há força de
+# tendência (ADX), esta lane AFROUXA o teto do proximity de PROXIMITY_MAX_ATR pra
+# BREAKOUT_LANE_MAX_ATR — nunca ilimitado. FAIL-CLOSED: qualquer sinal ausente →
+# não afrouxa (mantém o teto normal). O anti-chase ESTRUTURAL abaixo continua
+# valendo como trava externa (não pega blowoff desde a base). Só tier A/A+.
+BREAKOUT_LANE_ENABLED = os.getenv("BREAKOUT_LANE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+BREAKOUT_LANE_MAX_ATR = float(os.getenv("BREAKOUT_LANE_MAX_ATR", "2.0"))   # teto afrouxado
+BREAKOUT_LANE_MIN_ADX = float(os.getenv("BREAKOUT_LANE_MIN_ADX", "28"))    # força de tendência mínima
+
 # ── Anti-chase ESTRUTURAL (gated, DEFAULT-OFF) ──────────────────────────────
 # O proximity gate acima mede distância do PLANO de entrada — não pega o setup
 # que nasce esticado (entry≈mercado após pernada longa, caso HYPE). Este mede o
@@ -1493,6 +1505,15 @@ def env_info() -> dict:
         # #6 sizing por regime (DEFAULT OFF)
         "regime_sizing_enabled": REGIME_SIZING_ENABLED,
         "regime_size_mult_alt_long": REGIME_SIZE_MULT_ALT_LONG,
+        # #3 lane de breakout (DEFAULT OFF)
+        "breakout_lane_enabled": BREAKOUT_LANE_ENABLED,
+        "breakout_lane_max_atr": BREAKOUT_LANE_MAX_ATR,
+        "breakout_lane_min_adx": BREAKOUT_LANE_MIN_ADX,
+        "proximity_max_atr": PROXIMITY_MAX_ATR,
+        # #1 runner com trailing pós-TP2 (DEFAULT OFF) — mecânica no trade_manager
+        "runner_enabled": os.getenv("RUNNER_ENABLED", "false").strip().lower() in ("1", "true", "yes"),
+        "runner_qty_pct": float(os.getenv("RUNNER_QTY_PCT", "0.20")),
+        "runner_atr_mult": float(os.getenv("RUNNER_ATR_MULT", "3.0")),
         # daily SL-rate breaker (por direção)
         "breaker_min_sample": BREAKER_MIN_SAMPLE,
         "breaker_sl_rate": BREAKER_SL_RATE,
@@ -2687,6 +2708,72 @@ def _regime_size_mult(rec: dict, regime: dict | None) -> tuple[float, str]:
     return 1.0, f"regime {regime.get('regime', '?')} → cheia (não-alt-long)"
 
 
+def _sizing_stack_report(rec: dict, regime: dict | None, notional_usd: float) -> tuple[float, str]:
+    """#2 — Relatório COMPOSTO do stack de sizing inteligente (auditoria/validação).
+    Chama cada multiplicador (que já retorna 1.0/'off' quando desligado) e devolve
+    o net multiplicativo + um breakdown legível. PURO e sem efeito colateral: não
+    altera nenhuma decisão — só consolida num ponto o que hoje é logado disperso,
+    tornando a composição conviction×edge×damp×liq×regime auditável e validável.
+
+    Nota: conviction/edge escalam risk_pct ANTES do _compute_qty (caps duros
+    entram no meio); damp/liq/regime escalam a qty DEPOIS. O net aqui é um resumo
+    do stack de multiplicadores ATIVOS, não o fator exato pós-caps — serve pra ver
+    quais camadas agiram e com que intensidade, não pra recomputar a qty."""
+    net = 1.0
+    parts: list[str] = []
+    try:
+        for name, (m, _why) in (
+            ("conviction", _conviction_mult(rec)),
+            ("edge", _edge_mult(rec)),
+            ("damp", _exec_size_damp(rec, notional_usd)),
+            ("liq", _liq_tier_mult(rec)),
+            ("regime", _regime_size_mult(rec, regime)),
+        ):
+            try:
+                mf = float(m)
+            except Exception:
+                mf = 1.0
+            if abs(mf - 1.0) > 1e-9:
+                net *= mf
+                parts.append(f"{name}×{mf:.2f}")
+    except Exception as e:
+        return 1.0, f"erro no relatório: {e}"
+    return round(net, 4), (" · ".join(parts) if parts else "todos ×1.00")
+
+
+async def _breakout_lane_qualifies(rec: dict) -> tuple[bool, str]:
+    """#3 — Este setup é um BREAKOUT de tendência forte A FAVOR do bias macro?
+    Se sim, o proximity gate pode usar o teto afrouxado (BREAKOUT_LANE_MAX_ATR).
+    FAIL-CLOSED: qualquer sinal ausente/fraco → (False, motivo). Não decide sozinho
+    a entrada — só LIBERA o teto; os demais gates (struct-chase, RR, ATR) seguem.
+    Retorna (qualifica, motivo)."""
+    if not BREAKOUT_LANE_ENABLED:
+        return False, "off"
+    try:
+        direction = (rec.get("direction") or "").strip().lower()
+        if direction not in ("long", "short"):
+            return False, "direção n/d"
+        if rec.get("tier") not in ("A+", "A"):
+            return False, f"tier {rec.get('tier')} (só A/A+)"
+        # Força de tendência: ADX >= piso. Ausente → fail-closed.
+        adx = _get_rec_feature(rec, "adx")
+        try:
+            adx_f = float(adx) if adx is not None else None
+        except Exception:
+            adx_f = None
+        if adx_f is None or adx_f < BREAKOUT_LANE_MIN_ADX:
+            return False, f"adx {adx_f if adx_f is not None else 'n/d'} < {BREAKOUT_LANE_MIN_ADX}"
+        # Bias macro a favor da direção (repique/tendência alinhada).
+        from services.regime_service import get_market_bias, direction_favored
+        bias = await get_market_bias()
+        if not direction_favored(direction, bias):
+            return False, f"bias {bias.get('bias', '?')} não favorece {direction}"
+        return True, f"breakout {direction} adx={adx_f:.0f} bias={bias.get('bias', '?')}"
+    except Exception as e:
+        log.warning(f"[breakout-lane] {rec.get('symbol')} qualificação falhou (fail-closed): {e}")
+        return False, "erro"
+
+
 async def open_shadow_for_recs(recs: list[dict]) -> int:
     """
     Pra cada rec marcada com `_just_saved=True` e tier A/A+, abre uma RealTrade.
@@ -2763,9 +2850,22 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     _chase_f = float(_chase) if _chase is not None else None
                 except Exception:
                     _chase_f = None
-                if _chase_f is not None and _chase_f >= PROXIMITY_MAX_ATR:
+                # #3 Lane de breakout: em tendência forte a favor, afrouxa o teto
+                # (fail-closed — só sobe o teto se qualificar). O struct-chase gate
+                # abaixo segue como trava externa contra blowoff estrutural.
+                _prox_ceiling = PROXIMITY_MAX_ATR
+                if (BREAKOUT_LANE_ENABLED and _chase_f is not None
+                        and _chase_f >= PROXIMITY_MAX_ATR):
+                    _bl_ok, _bl_reason = await _breakout_lane_qualifies(rec)
+                    if _bl_ok:
+                        _prox_ceiling = BREAKOUT_LANE_MAX_ATR
+                        log.info(
+                            f"[breakout-lane] {rec.get('symbol')} {_bl_reason} → teto "
+                            f"proximity {PROXIMITY_MAX_ATR}→{BREAKOUT_LANE_MAX_ATR}×ATR"
+                        )
+                if _chase_f is not None and _chase_f >= _prox_ceiling:
                     reason = (
-                        f"preço {_chase_f:.2f}×ATR a favor (>= {PROXIMITY_MAX_ATR}) — perdeu o trem"
+                        f"preço {_chase_f:.2f}×ATR a favor (>= {_prox_ceiling}) — perdeu o trem"
                     )
                     log.info(f"[proximity-gate] {rec.get('symbol')} {reason} — skip")
                     _record_skip(rec, "proximity", reason)
@@ -3343,6 +3443,24 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     f"[shadow→live] canary {rec.get('symbol')}: qty {qty_full} → "
                     f"{qty} (×{LIVE_SIZE_MULT}); notional ${notional_effective:.0f}"
                 )
+
+            # ── #2 Auditoria composta do stack de sizing (validável) ─────────
+            # Consolida num único log o que as camadas de sizing inteligente
+            # aplicaram (conviction×edge×damp×liq×regime). Só live; puro, sem
+            # efeito na qty. Facilita validar a composição antes de ligar mais
+            # camadas (ex.: EDGE_SIZING) com confiança.
+            if not SHADOW_ENABLED:
+                try:
+                    _stack_net, _stack_bd = _sizing_stack_report(
+                        rec, _regime_cached, notional_effective
+                    )
+                    log.info(
+                        f"[sizing-stack] {rec.get('symbol')}: net×{_stack_net:.2f} "
+                        f"({_stack_bd}); risk_pct={risk_pct:.2f}% qty={qty} "
+                        f"notional=${notional_effective:.0f}"
+                    )
+                except Exception as _e:
+                    log.warning(f"[sizing-stack] {rec.get('symbol')} relatório falhou: {_e}")
 
             # Cap de exposição agregada — bloqueia se total notional > X% banca
             try:
