@@ -839,6 +839,14 @@ class TenantUpdate(BaseModel):
     evolution_instance: Optional[str] = None
     evolution_key: Optional[str] = None
     evolution_url: Optional[str] = None
+    # Generalização multi-segmento (Track B). segment='psicologia' (default)
+    # mantém o comportamento clínico atual; outro valor ativa o prompt genérico
+    # usando os rótulos abaixo.
+    segment: Optional[str] = None
+    professional_label: Optional[str] = None
+    client_noun: Optional[str] = None
+    service_noun: Optional[str] = None
+    business_type: Optional[str] = None
 
 
 @app.patch("/admin/tenants/{slug}")

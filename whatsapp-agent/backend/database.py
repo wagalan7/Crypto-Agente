@@ -276,6 +276,19 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN billing_paused INTEGER DEFAULT 0",
             # Controle de pagamento das cobranças avulsas (NULL = não pago).
             "ALTER TABLE billing_manual_entries ADD COLUMN paid_at TEXT DEFAULT NULL",
+            # ── Generalização multi-segmento (Track B) ──
+            # segment='psicologia' preserva 100% o comportamento atual (prompt e
+            # textos idênticos). Outros valores ativam o caminho genérico usando
+            # os rótulos abaixo. Rótulos vazios → fallback genérico sensato.
+            #   professional_label: como o profissional é chamado (ex.: "Dentista")
+            #   client_noun: como o cliente é chamado (ex.: "cliente", "paciente")
+            #   service_noun: o serviço prestado (ex.: "atendimento", "consulta")
+            #   business_type: tipo do negócio (ex.: "clínica", "escritório")
+            "ALTER TABLE tenants ADD COLUMN segment TEXT DEFAULT 'psicologia'",
+            "ALTER TABLE tenants ADD COLUMN professional_label TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN client_noun TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN service_noun TEXT DEFAULT ''",
+            "ALTER TABLE tenants ADD COLUMN business_type TEXT DEFAULT ''",
         ]
         for sql in migrations:
             try:
@@ -510,6 +523,8 @@ def update_tenant(slug: str, **fields) -> bool:
         "billing_zip", "billing_address", "billing_number", "billing_complement",
         "billing_neighborhood", "billing_city", "billing_state",
         "accepted_terms_at", "accepted_terms_version",
+        # Generalização multi-segmento (Track B)
+        "segment", "professional_label", "client_noun", "service_noun", "business_type",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
