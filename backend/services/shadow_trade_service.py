@@ -1505,6 +1505,26 @@ def env_info() -> dict:
         # #6 sizing por regime (DEFAULT OFF)
         "regime_sizing_enabled": REGIME_SIZING_ENABLED,
         "regime_size_mult_alt_long": REGIME_SIZE_MULT_ALT_LONG,
+        # ── Stack de sizing inteligente (auditável p/ validação da fase 2) ────
+        # Amplificam risco (>1.0): edge (até EDGE_MULT_MAX), funding-ev-size.
+        # Defensivos (≤1.0): conviction (0.8–1.0), exec_size_damp, liq_tier.
+        "conviction_sizing_enabled": CONVICTION_SIZING_ENABLED,
+        "conviction_mult_range": [CONVICTION_MULT_MIN, CONVICTION_MULT_MAX],
+        "conviction_tp2_weight": CONVICTION_TP2_WEIGHT,
+        "edge_sizing_enabled": EDGE_SIZING_ENABLED,
+        "edge_mult_range": [EDGE_MULT_MIN, EDGE_MULT_MAX],
+        "edge_per_edge": EDGE_PER_EDGE,
+        "edge_aplus_bonus": EDGE_APLUS_BONUS,
+        "edge_noedge_mult": EDGE_NOEDGE_MULT,
+        "funding_ev_enabled": FUNDING_EV_ENABLED,
+        "funding_ev_max_drag_r": FUNDING_EV_MAX_DRAG_R,
+        "funding_ev_size_enabled": FUNDING_EV_SIZE_ENABLED,
+        "funding_ev_size_range": [FUNDING_EV_SIZE_MIN, FUNDING_EV_SIZE_MAX],
+        "exec_size_damp_enabled": EXEC_SIZE_DAMP_ENABLED,
+        "atr_damp_range_pct": [ATR_DAMP_LO, ATR_DAMP_HI],
+        "atr_damp_mult_min": ATR_DAMP_MULT_MIN,
+        "liq_tier_sizing_enabled": LIQ_TIER_SIZING_ENABLED,
+        "liq_tier_mult_min": LIQ_TIER_MULT_MIN,
         # #3 lane de breakout (DEFAULT OFF)
         "breakout_lane_enabled": BREAKOUT_LANE_ENABLED,
         "breakout_lane_max_atr": BREAKOUT_LANE_MAX_ATR,
