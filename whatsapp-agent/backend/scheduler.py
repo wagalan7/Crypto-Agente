@@ -88,6 +88,51 @@ _DEFAULT_BILLING = (
     "Fechamos em R$ {total} 💖"
 )
 
+# ── Defaults genéricos multi-segmento (Track B) ──
+# Usados apenas quando o tenant NÃO é psicologia. Usam "agendamento"
+# (masculino, neutro) para evitar erro de concordância com o gênero de
+# {servico} (que pode ser "consulta"/f, "sessão"/f, "atendimento"/m).
+# O placeholder {servico} continua disponível para templates customizados.
+_GENERIC_CONFIRMATION = (
+    "Oi, {nome}! 😊 Tudo bem?\n\n"
+    "Passando pra lembrar do seu agendamento {quando}:\n\n"
+    "📅 {data_hora}\n\n"
+    "Consegue confirmar sua presença pra mim? É só responder *SIM* 💖 "
+    "Se precisar remarcar, também pode me avisar sem problema.\n\n"
+    "Até breve!\n"
+    "— {profissional}"
+)
+
+_GENERIC_FOLLOWUP = (
+    "Oi, {nome}! 😊 Vi aqui que o seu agendamento de *hoje* ainda não foi confirmado:\n\n"
+    "📅 {data_hora}\n\n"
+    "Consegue confirmar sua presença? É só responder *SIM* 💖 — e se precisar "
+    "cancelar ou remarcar, é só me falar, combinado?\n\n"
+    "⚠️ *Lembrete carinhoso:* como combinamos, o horário fica reservado só pra "
+    "você, então horários não cancelados com antecedência acabam sendo cobrados "
+    "normalmente.\n\n"
+    "Até logo!\n"
+    "— {profissional}"
+)
+
+_GENERIC_BILLING = (
+    "Oi, {nome}! 🌷\n"
+    "Espero que esteja tudo bem por aí.\n\n"
+    "Passando só pra compartilhar o valor do último mês:\n\n"
+    "Fechamos em R$ {total} 💖"
+)
+
+
+def _is_psychology(tenant: dict) -> bool:
+    """True para o segmento clínico padrão (psicologia). Preserva 100% os
+    textos atuais. Espelha agent._is_psychology (duplicado de propósito para
+    evitar dependência de import entre scheduler e agent)."""
+    return (tenant.get("segment") or "psicologia").strip().lower() in ("", "psicologia")
+
+
+def _servico(tenant: dict) -> str:
+    return (tenant.get("service_noun") or "").strip() or "atendimento"
+
 
 def _apply_template(template: str, **kwargs) -> str:
     """Substitui {variavel} no template. Ignora chaves não reconhecidas."""
@@ -109,24 +154,30 @@ def _first_name(patient_name: str | None) -> str:
 
 
 def _confirmation_message(tenant: dict, appt: dict) -> str:
-    tpl = (tenant.get("confirmation_msg_template") or "").strip() or _DEFAULT_CONFIRMATION
+    default = _DEFAULT_CONFIRMATION if _is_psychology(tenant) else _GENERIC_CONFIRMATION
+    tpl = (tenant.get("confirmation_msg_template") or "").strip() or default
     return _apply_template(
         tpl,
         nome=_first_name(appt.get("patient_name")),
         data_hora=cal.format_appointment(appt),
         quando=_quando_label(appt),
         psicologa=tenant["psychologist_name"],
+        profissional=tenant["psychologist_name"],
+        servico=_servico(tenant),
     )
 
 
 def _followup_message(tenant: dict, appt: dict) -> str:
-    tpl = (tenant.get("followup_msg_template") or "").strip() or _DEFAULT_FOLLOWUP
+    default = _DEFAULT_FOLLOWUP if _is_psychology(tenant) else _GENERIC_FOLLOWUP
+    tpl = (tenant.get("followup_msg_template") or "").strip() or default
     return _apply_template(
         tpl,
         nome=_first_name(appt.get("patient_name")),
         data_hora=cal.format_appointment(appt),
         quando="de hoje",
         psicologa=tenant["psychologist_name"],
+        profissional=tenant["psychologist_name"],
+        servico=_servico(tenant),
     )
 
 
@@ -178,13 +229,16 @@ async def _run_confirmations():
 def _billing_message(tenant: dict, patient_name: str, total: float, sessions_count: int) -> str:
     first_name = patient_name.split()[0] if patient_name else "paciente"
     total_fmt = f"{total:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    tpl = (tenant.get("billing_msg_template") or "").strip() or _DEFAULT_BILLING
+    default = _DEFAULT_BILLING if _is_psychology(tenant) else _GENERIC_BILLING
+    tpl = (tenant.get("billing_msg_template") or "").strip() or default
     return _apply_template(
         tpl,
         nome=first_name,
         total=total_fmt,
         sessoes=sessions_count,
         psicologa=tenant.get("psychologist_name", ""),
+        profissional=tenant.get("psychologist_name", ""),
+        servico=_servico(tenant),
     )
 
 
