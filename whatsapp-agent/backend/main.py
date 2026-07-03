@@ -980,7 +980,9 @@ def dashboard(slug: str, request: Request, token: str = ""):
     if status == "suspended" and not db.is_tenant_exempt(tenant):
         setup_token = tenant.get("setup_token", "")
         return RedirectResponse(f"/onboarding/pagamento?token={setup_token}&suspended=1", status_code=303)
-    return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token})
+    import segments as _segments
+    terms = _segments.resolve_terms(tenant)
+    return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token, "terms": terms})
 
 
 @app.get("/dashboard/api/appointments")
@@ -2438,6 +2440,7 @@ def onboarding_form(request: Request):
 
 class OnboardingCreate(BaseModel):
     # Dados do consultório
+    segment: str = "psicologia"
     name: str
     psychologist_name: str
     working_hours_start: int = 8
@@ -2513,11 +2516,21 @@ def onboarding_create(request: Request, body: OnboardingCreate):
 
     slug = tenant["slug"]
 
+    # Termos do segmento (aditivo; psicologia = base, rótulos vazios)
+    import segments as _segments
+    _seg = _segments.normalize_segment(body.segment)
+    _preset = _segments.SEGMENT_PRESETS[_seg]
+
     # Gerar tokens e salvar todos os dados
     dash_token = secrets.token_urlsafe(24)
     setup_token = secrets.token_urlsafe(24)
     db.update_tenant(
         slug,
+        segment=_seg,
+        professional_label=_preset["professional_label"],
+        client_noun=_preset["client_noun"],
+        service_noun=_preset["service_noun"],
+        business_type=_preset["business_type"],
         dashboard_token=dash_token,
         setup_token=setup_token,
         email=body.email,

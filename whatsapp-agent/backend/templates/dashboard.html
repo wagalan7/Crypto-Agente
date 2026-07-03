@@ -318,7 +318,7 @@
           class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
       </div>
       <div>
-        <label class="block text-sm font-medium text-gray-700 mb-1">Nome da psicóloga</label>
+        <label class="block text-sm font-medium text-gray-700 mb-1">Nome {% if terms.segment == 'psicologia' %}da psicóloga{% else %}do(a) {{ terms.professional_label }}{% endif %}</label>
         <input id="cfg-psy" type="text" value="{{ tenant.psychologist_name }}"
           class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
       </div>
@@ -487,12 +487,12 @@
       </div>
       <p class="text-xs text-gray-500 mb-4">
         Personalize os textos enviados automaticamente. Variáveis disponíveis:<br/>
-        <code class="bg-gray-100 px-1 rounded">{nome}</code> primeiro nome do paciente ·
-        <code class="bg-gray-100 px-1 rounded">{data_hora}</code> data e hora da sessão ·
+        <code class="bg-gray-100 px-1 rounded">{nome}</code> primeiro nome do {{ terms.client_noun }} ·
+        <code class="bg-gray-100 px-1 rounded">{data_hora}</code> data e hora da {{ terms.service_noun }} ·
         <code class="bg-gray-100 px-1 rounded">{quando}</code> "de hoje" / "de amanhã" ·
-        <code class="bg-gray-100 px-1 rounded">{psicologa}</code> seu nome ·
+        {% if terms.segment == 'psicologia' %}<code class="bg-gray-100 px-1 rounded">{psicologa}</code>{% else %}<code class="bg-gray-100 px-1 rounded">{profissional}</code>{% endif %} seu nome ·
         <code class="bg-gray-100 px-1 rounded">{total}</code> valor (só na cobrança) ·
-        <code class="bg-gray-100 px-1 rounded">{sessoes}</code> nº sessões (só na cobrança)
+        <code class="bg-gray-100 px-1 rounded">{sessoes}</code> nº {{ terms.service_noun_plural }} (só na cobrança)
       </p>
       <div class="space-y-4">
         <div>
