@@ -25,6 +25,7 @@ tabela aprendida e só então liga.
 """
 from __future__ import annotations
 import os
+import bisect
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -54,6 +55,9 @@ SIZE_MULT_MIN = float(os.getenv("SYMBOL_LEARN_SIZE_MIN", "0.75"))
 SIZE_MULT_MAX = float(os.getenv("SYMBOL_LEARN_SIZE_MAX", "1.15"))
 # Confiança mínima pra o multiplicador AGIR ao vivo (abaixo disto → 1.0 no-op).
 MIN_CONFIDENCE_APPLY = float(os.getenv("SYMBOL_LEARN_MIN_CONF", "0.25"))
+# Faixa MORTA em torno da mediana (percentil 0.5±DEADBAND) onde o mult fica 1.0.
+# Evita churn de quem está no meio do pelotão; só topo/fundo do universo agem.
+REL_DEADBAND = float(os.getenv("SYMBOL_LEARN_DEADBAND", "0.10"))
 
 # Cache em memória: base -> {tf: row_dict}. Populado por refresh_cache().
 _CACHE: dict[str, dict[str, dict]] = {}
@@ -67,18 +71,9 @@ def _base_of(symbol: str) -> str:
     return symbol.split("/")[0].strip().upper()
 
 
-def derive_params(stats: dict) -> Optional[dict]:
-    """PURA. Destila tunáveis por-moeda a partir das métricas de histórico completo
-    de UMA linha de symbol_backtest_stats. Retorna dict pronto pra persistir, ou
-    None se a amostra é pequena/sem edge out-of-sample (→ fallback global ao vivo).
-
-    Racional do size_quality_mult:
-      • Ancorado na edge CALIBRADA de todo o histórico (wf_avg_r × 0.70). Walk-forward
-        (out-of-sample) é o número em que confiar, não o avg_r in-sample.
-      • Edge forte → amplifica LEVE (teto 1.15). Edge fraca/negativa → corta (piso 0.75).
-      • Penaliza expiry alto: se historicamente os alvos raramente eram atingidos a
-        tempo, a moeda é menos confiável mesmo com R médio ok.
-    """
+def _eligible_metrics(stats: dict) -> Optional[dict]:
+    """PURA. Extrai as métricas de histórico se a moeda/TF é elegível (amostra
+    suficiente + edge out-of-sample presente). None → fallback global ao vivo."""
     n = int(stats.get("n_trades") or 0)
     wf = stats.get("wf_avg_r")
     if n < MIN_TRADES or wf is None:
@@ -87,43 +82,56 @@ def derive_params(stats: dict) -> Optional[dict]:
         wf = float(wf)
     except Exception:
         return None
-
     expiry = float(stats.get("expiry_pct") or 0.0)
     wf_n = int(stats.get("wf_n_trades") or 0)
-    calib = wf * CALIB_FACTOR
+    return {"n": n, "wf": wf, "wf_n": wf_n, "expiry": expiry, "calib": wf * CALIB_FACTOR}
 
-    # Degraus monotônicos por edge calibrada.
-    if calib >= 0.90:
-        m = 1.12
-    elif calib >= 0.60:
-        m = 1.06
-    elif calib >= 0.35:
-        m = 1.00
-    elif calib >= 0.15:
-        m = 0.90
+
+def _mult_from_rank(percentile: float, expiry: float) -> float:
+    """PURA. Mapeia a POSIÇÃO RELATIVA da moeda no universo → multiplicador de size.
+    Mediana (percentil 0.5) → 1.0; topo → SIZE_MULT_MAX; fundo → SIZE_MULT_MIN.
+    Faixa morta em torno da mediana mantém neutro. Penalidade por expiry por cima.
+
+    Racional: qualidade é RELATIVA — o backtest só computa moedas com edge positiva,
+    então thresholds absolutos só amplificariam. Ancorar na mediana do universo dá à
+    camada as duas mãos: reforça o terço de cima, alivia o de baixo."""
+    d = percentile - 0.5
+    span = max(1e-6, 0.5 - REL_DEADBAND)
+    if abs(d) <= REL_DEADBAND:
+        m = 1.0
+    elif d > 0:
+        frac = min(1.0, (d - REL_DEADBAND) / span)
+        m = 1.0 + frac * (SIZE_MULT_MAX - 1.0)
     else:
-        m = 0.80
-
+        frac = min(1.0, (-d - REL_DEADBAND) / span)
+        m = 1.0 - frac * (1.0 - SIZE_MULT_MIN)
     # Penalidade por expiry histórico (alvos raramente batidos a tempo).
     if expiry >= 45:
         m *= 0.85
     elif expiry >= 30:
         m *= 0.92
+    return round(max(SIZE_MULT_MIN, min(SIZE_MULT_MAX, m)), 4)
 
-    m = round(max(SIZE_MULT_MIN, min(SIZE_MULT_MAX, m)), 4)
 
+def derive_params(stats: dict, edge_percentile: float) -> Optional[dict]:
+    """PURA. Destila tunáveis por-moeda a partir das métricas de histórico completo
+    de UMA linha + a POSIÇÃO da moeda no universo (edge_percentile ∈ [0,1]). Retorna
+    dict pronto pra persistir, ou None se a amostra é pequena/sem edge out-of-sample."""
+    em = _eligible_metrics(stats)
+    if em is None:
+        return None
+    m = _mult_from_rank(edge_percentile, em["expiry"])
     # Confiança: cresce com amostra total e com o tamanho do braço out-of-sample.
-    conf = (min(1.0, n / 120.0)) * (0.5 + 0.5 * min(1.0, wf_n / 40.0))
+    conf = (min(1.0, em["n"] / 120.0)) * (0.5 + 0.5 * min(1.0, em["wf_n"] / 40.0))
     conf = round(max(0.0, min(1.0, conf)), 3)
-
     return {
         "size_quality_mult": m,
         "confidence": conf,
-        "n_trades": n,
-        "wf_avg_r": round(wf, 4),
-        "wf_n_trades": wf_n,
-        "expiry_pct": round(expiry, 2),
-        "calibrated_edge": round(calib, 4),
+        "n_trades": em["n"],
+        "wf_avg_r": round(em["wf"], 4),
+        "wf_n_trades": em["wf_n"],
+        "expiry_pct": round(em["expiry"], 2),
+        "calibrated_edge": round(em["calib"], 4),
     }
 
 
@@ -145,24 +153,37 @@ async def relearn_all_from_history() -> dict:
             rows = (await session.execute(select(SymbolBacktestStats))).scalars().all()
             summary["scanned"] = len(rows)
 
-            # Melhor (base, tf) por base: maior wf_avg_r elegível.
-            best: dict[str, tuple[float, object, dict]] = {}
+            # 1ª passada — melhor (base, tf) por base pela edge calibrada elegível.
+            best: dict[str, tuple[float, object]] = {}
             for r in rows:
                 if r.error:
                     continue
-                stats = r.to_dict()
-                derived = derive_params(stats)
-                if derived is None:
+                em = _eligible_metrics(r.to_dict())
+                if em is None:
                     summary["skipped_small"] += 1
                     continue
                 base = _base_of(r.symbol)
-                score = float(r.wf_avg_r or 0.0)
-                if base not in best or score > best[base][0]:
-                    best[base] = (score, r, derived)
+                if base not in best or em["calib"] > best[base][0]:
+                    best[base] = (em["calib"], r)
 
             summary["bases"] = len(best)
 
-            for base, (_score, r, derived) in best.items():
+            # Distribuição do universo: percentil da edge calibrada por base.
+            calibs = sorted(v[0] for v in best.values())
+            n_uni = len(calibs)
+
+            def _pct_rank(x: float) -> float:
+                if n_uni <= 1:
+                    return 0.5
+                lo = bisect.bisect_left(calibs, x)
+                hi = bisect.bisect_right(calibs, x)
+                return ((lo + hi) / 2.0) / n_uni
+
+            # 2ª passada — deriva e persiste com a posição relativa no universo.
+            for base, (calib, r) in best.items():
+                derived = derive_params(r.to_dict(), _pct_rank(calib))
+                if derived is None:
+                    continue
                 tf = r.timeframe
                 existing = (await session.execute(
                     select(SymbolLearnedParams).where(
