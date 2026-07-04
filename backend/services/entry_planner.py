@@ -108,6 +108,11 @@ ATR_ENTRY_BAND = 0.4    # tamanho da zona de entrada como múltiplo de ATR
 ATR_BUFFER = 0.3        # folga no stop além da estrutura
 MIN_RR_TP2 = 1.8        # alvo mínimo aceitável pra TP2
 EMA_PULLBACK_MAX_DIST = 0.04   # 4% — distância máxima do preço atual pra considerar pullback ao EMA
+# Separação MÍNIMA entre TPs consecutivos (múltiplo do ATR). Sem isto, quando os
+# swing highs/lows coincidem (cluster de topos/fundos iguais em consolidação),
+# TP1 e TP2 caem no MESMO preço → o split parcial e o runner viram um alvo único.
+# Piso aplicado em plan_trade após a ordenação; só empurra o alvo quando colado.
+MIN_TP_SEP_ATR = float(os.getenv("MIN_TP_SEP_ATR", "0.5"))
 
 # ── Fade na BORDA do padrão (Passo 6 — gated) ────────────────────────────────
 # Entrada ancorada na PRÓPRIA linha do padrão (resistência superior p/ short,
@@ -657,6 +662,22 @@ def plan_trade(
     elif direction == SignalDirection.SHORT:
         prices = sorted([tp1_r.price, tp2_r.price, tp3_r.price], reverse=True)
         tp1_r.price, tp2_r.price, tp3_r.price = prices[0], prices[1], prices[2]
+
+    # ── Separação mínima entre TPs (anti-colapso TP1==TP2==TP3) ────────────
+    # Se dois alvos ficaram colados (swing highs/lows iguais → mesmo preço), empurra
+    # o de cima por MIN_TP_SEP_ATR·ATR pra garantir laddering real (split + runner).
+    # Só age quando a distância é MENOR que o piso; alvos bem separados ficam intactos.
+    min_sep = atr * MIN_TP_SEP_ATR
+    if min_sep > 0 and direction == SignalDirection.LONG:
+        if tp2_r.price < tp1_r.price + min_sep:
+            tp2_r.price = round(tp1_r.price + min_sep, 8)
+        if tp3_r.price < tp2_r.price + min_sep:
+            tp3_r.price = round(tp2_r.price + min_sep, 8)
+    elif min_sep > 0 and direction == SignalDirection.SHORT:
+        if tp2_r.price > tp1_r.price - min_sep:
+            tp2_r.price = round(tp1_r.price - min_sep, 8)
+        if tp3_r.price > tp2_r.price - min_sep:
+            tp3_r.price = round(tp2_r.price - min_sep, 8)
 
     risk = abs(entry - stop_loss)
     rr_tp1 = round(abs(tp1_r.price - entry) / risk, 2) if risk > 0 else 0
