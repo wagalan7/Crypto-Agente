@@ -75,6 +75,7 @@ async def init_db():
     from models import skip_reason_stat  # noqa: F401
     from models import rotation_state  # noqa: F401
     from models import symbol_backtest_stats  # noqa: F401
+    from models import symbol_learned_params  # noqa: F401
     from models import backtest_trade  # noqa: F401
     from models import sweep_progress  # noqa: F401
     from sqlalchemy import text

@@ -3316,6 +3316,25 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     f"[edge-sizing] {rec.get('symbol')} risco {_risk_before_e:.2f}% "
                     f"→ {risk_pct:.2f}% ({_edge_reason})"
                 )
+            # Autoaprimoramento por HISTÓRICO COMPLETO (pós-sweep): multiplicador de
+            # size por-moeda destilado da edge de todo o histórico (symbol_learned_
+            # params). Compõe multiplicativo; caps duros de _compute_qty mandam depois.
+            # Default OFF (SYMBOL_LEARNING_SIZE_ENABLED) — no-op até revisão humana.
+            if not SHADOW_ENABLED:
+                try:
+                    from services import symbol_learning_service as _sls
+                    _hist_m, _hist_reason = _sls.get_size_mult(
+                        rec.get("symbol") or "", rec.get("timeframe")
+                    )
+                    if _hist_m != 1.0:
+                        _risk_before_h = risk_pct
+                        risk_pct = round(risk_pct * _hist_m, 4)
+                        log.info(
+                            f"[symbol-learning] {rec.get('symbol')} risco {_risk_before_h:.2f}% "
+                            f"→ {risk_pct:.2f}% ({_hist_reason})"
+                        )
+                except Exception as _e:
+                    log.warning(f"[symbol-learning] sizing por histórico falhou: {_e}")
             # #1 — tilt de size por Funding-EV: aumenta quem COLETA funding,
             # reduz quem PAGA. Compõe multiplicativo com convicção/edge; caps
             # duros de _compute_qty mandam depois. Default OFF.

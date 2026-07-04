@@ -836,6 +836,15 @@ async def lifespan(app: FastAPI):
             await init_db()
             _snapshot_task = asyncio.create_task(_snapshot_loop())
             logging.info("Snapshot tracker iniciado (intervalo 5 min).")
+            # Carrega params aprendidos por-moeda (pós-sweep) no cache em memória.
+            async def _load_symbol_learning():
+                try:
+                    from services import symbol_learning_service
+                    n = await symbol_learning_service.refresh_cache()
+                    logging.info(f"[symbol-learning] cache carregado: {n} moedas.")
+                except Exception as e:
+                    logging.warning(f"[symbol-learning] refresh de boot falhou: {e}")
+            asyncio.create_task(_load_symbol_learning())
             # go-live #4 — reconciliação posições exchange↔DB no boot (só loga drift)
             async def _reconcile_once():
                 try:
@@ -1618,6 +1627,31 @@ async def rotation_state():
     except Exception as e:
         logging.error(f"rotation state error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Erro ao obter estado da rotação: {e}")
+
+
+@app.get("/api/symbol-params")
+async def symbol_params_status():
+    """Autoaprimoramento por histórico completo (pós-sweep): config + params
+    aprendidos por-moeda (size_quality_mult, edge calibrada, confiança)."""
+    try:
+        from services import symbol_learning_service
+        return await symbol_learning_service.status()
+    except Exception as e:
+        logging.error(f"symbol-params status error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao obter symbol-params: {e}")
+
+
+@app.post("/api/symbol-params/relearn")
+async def symbol_params_relearn():
+    """Dispara manualmente o reaprendizado por-moeda a partir do histórico completo
+    já computado no sweep (symbol_backtest_stats → symbol_learned_params). Seguro:
+    só popula a tabela; não muda nada ao vivo até SYMBOL_LEARNING_SIZE_ENABLED=true."""
+    try:
+        from services import symbol_learning_service
+        return await symbol_learning_service.relearn_all_from_history()
+    except Exception as e:
+        logging.error(f"symbol-params relearn error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Erro ao reaprender symbol-params: {e}")
 
 
 @app.get("/api/score/feature-analysis")

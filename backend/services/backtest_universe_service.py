@@ -705,6 +705,16 @@ async def run_universe_backtest(
         log.info(f"[bt-universe] FIM — {_PROGRESS['computed']} computados, "
                  f"{_PROGRESS['skipped']} pulados, {_PROGRESS['errors']} erros")
         await _persist_progress(force=True)
+        # Autoaprimoramento pós-sweep: destila params por-moeda de TODO o histórico
+        # recém-computado → symbol_learned_params. Só POPULA a tabela (não muda nada
+        # ao vivo até SYMBOL_LEARNING_SIZE_ENABLED=true). Fail-soft: não derruba o sweep.
+        try:
+            from services import symbol_learning_service as _sls
+            if _sls.SYMBOL_LEARNING_LEARN_ON_SWEEP:
+                _rez = await _sls.relearn_all_from_history()
+                log.info(f"[bt-universe] pós-sweep relearn: {_rez}")
+        except Exception as _e:
+            log.warning(f"[bt-universe] pós-sweep relearn falhou: {_e}")
 
     return {"ok": True, "progress": get_universe_status()}
 
