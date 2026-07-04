@@ -1,8 +1,10 @@
 """Presets de segmento (Track B — multi-segmento aditivo).
 
 Fase 1: segmentos de saúde/bem-estar com dinâmica de agendamento parecida com
-psicologia. Psicologia é o comportamento BASE (byte-idêntico) — o preset dela
-mantém os rótulos vazios pra que o código legado siga usando os textos originais.
+psicologia. Fase 2: serviços/negócios (advocacia, contabilidade, salão, barbearia,
+pet shop, oficina) — mesma mecânica de agendamento, só muda a terminologia.
+Psicologia é o comportamento BASE (byte-idêntico) — o preset dela mantém os
+rótulos vazios pra que o código legado siga usando os textos originais.
 
 Cada preset define os termos de UI/linguagem:
   - professional_label: como chamar o profissional (ex.: "Nutricionista")
@@ -61,6 +63,49 @@ SEGMENT_PRESETS: dict[str, dict[str, str]] = {
         "service_noun": "atendimento",
         "business_type": "estúdio",
         "display": "Estética / Massoterapia",
+    },
+    # ── Fase 2: serviços/negócios (mesma dinâmica de agendamento) ──────────────
+    "advocacia": {
+        "professional_label": "Advogado(a)",
+        "client_noun": "cliente",
+        "service_noun": "consulta",
+        "business_type": "escritório",
+        "display": "Advocacia",
+    },
+    "contabilidade": {
+        "professional_label": "Contador(a)",
+        "client_noun": "cliente",
+        "service_noun": "reunião",
+        "business_type": "escritório",
+        "display": "Contabilidade",
+    },
+    "salao": {
+        "professional_label": "Profissional",
+        "client_noun": "cliente",
+        "service_noun": "atendimento",
+        "business_type": "salão",
+        "display": "Salão de beleza",
+    },
+    "barbearia": {
+        "professional_label": "Barbeiro(a)",
+        "client_noun": "cliente",
+        "service_noun": "atendimento",
+        "business_type": "barbearia",
+        "display": "Barbearia",
+    },
+    "petshop": {
+        "professional_label": "Profissional",
+        "client_noun": "tutor",
+        "service_noun": "atendimento",
+        "business_type": "pet shop",
+        "display": "Pet shop",
+    },
+    "oficina": {
+        "professional_label": "Mecânico(a)",
+        "client_noun": "cliente",
+        "service_noun": "serviço",
+        "business_type": "oficina",
+        "display": "Oficina mecânica",
     },
 }
 

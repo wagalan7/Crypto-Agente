@@ -137,6 +137,18 @@ def _is_psychology(tenant: dict) -> bool:
     return (tenant.get('segment') or 'psicologia').strip().lower() in ('', 'psicologia')
 
 
+def _generic_service_noun(tenant: dict) -> str:
+    """Substantivo NEUTRO (masculino, sem concordância de gênero) para respostas
+    determinísticas de segmentos não-psicologia. Usamos 'agendamento' fixo para
+    evitar bugs de concordância ('sessão remarcada' vs 'serviço remarcado')."""
+    return "agendamento"
+
+
+def _generic_professional(tenant: dict) -> str:
+    """Como se referir ao profissional em respostas determinísticas genéricas."""
+    return (tenant.get("psychologist_name") or "").strip() or "o responsável"
+
+
 def _build_system_prompt(tenant: dict) -> str:
     if tenant.get('pix_key'):
         pix_section = (
@@ -1060,7 +1072,10 @@ def _do_reschedule(tenant: dict, phone: str, appt: dict, slot: datetime) -> str:
     nome = patient_name.split()[0] if patient_name else ""
     saud = f"Prontinho, {nome}! ✅" if nome else "Prontinho! ✅"
     logger.info(f"[{tenant['slug']}][{phone}] REMARCAÇÃO DETERMINÍSTICA id={appt_id} → {slot.isoformat()}")
-    return f"{saud} Sua sessão foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+    if _is_psychology(tenant):
+        return f"{saud} Sua sessão foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+    svc = _generic_service_noun(tenant)
+    return f"{saud} Seu {svc} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
 
 
 def _try_deterministic_reschedule(tenant: dict, phone: str, text: str):
@@ -1239,21 +1254,39 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
             )
             # Fallback humanizado — escolhe baseado na intenção provável do texto
             t = (text or "").lower()
-            if any(k in t for k in ("agend", "marc", "horário", "horario", "consult", "sess", "atend")):
-                resp_text = ("Recebi sua mensagem! 😊 Para te ajudar com o agendamento, "
-                             "vou repassar para a psicóloga, que entra em contato em breve.")
-            elif any(k in t for k in ("cancelar", "desmarcar", "não vou poder", "nao vou poder")):
-                resp_text = ("Entendi! 😊 Vou avisar a psicóloga sobre o cancelamento "
-                             "e ela entra em contato com você em breve. 💖")
-            elif any(k in t for k in ("remarcar", "mudar")):
-                resp_text = ("Anotado! 😊 Vou repassar seu pedido para a psicóloga, "
-                             "que retorna em breve para combinar com você.")
-            elif any(k in t for k in ("valor", "preço", "preco", "quanto", "pagar", "pagamento")):
-                resp_text = ("Sobre valores e pagamento, prefiro que a psicóloga te explique "
-                             "diretamente. Já estou avisando ela! 😊")
+            if _is_psychology(tenant):
+                if any(k in t for k in ("agend", "marc", "horário", "horario", "consult", "sess", "atend")):
+                    resp_text = ("Recebi sua mensagem! 😊 Para te ajudar com o agendamento, "
+                                 "vou repassar para a psicóloga, que entra em contato em breve.")
+                elif any(k in t for k in ("cancelar", "desmarcar", "não vou poder", "nao vou poder")):
+                    resp_text = ("Entendi! 😊 Vou avisar a psicóloga sobre o cancelamento "
+                                 "e ela entra em contato com você em breve. 💖")
+                elif any(k in t for k in ("remarcar", "mudar")):
+                    resp_text = ("Anotado! 😊 Vou repassar seu pedido para a psicóloga, "
+                                 "que retorna em breve para combinar com você.")
+                elif any(k in t for k in ("valor", "preço", "preco", "quanto", "pagar", "pagamento")):
+                    resp_text = ("Sobre valores e pagamento, prefiro que a psicóloga te explique "
+                                 "diretamente. Já estou avisando ela! 😊")
+                else:
+                    resp_text = ("Recebi sua mensagem! 😊 Vou repassar para a psicóloga, "
+                                 "que responde assim que puder.")
             else:
-                resp_text = ("Recebi sua mensagem! 😊 Vou repassar para a psicóloga, "
-                             "que responde assim que puder.")
+                _p = _generic_professional(tenant)
+                if any(k in t for k in ("agend", "marc", "horário", "horario", "consult", "sess", "atend")):
+                    resp_text = (f"Recebi sua mensagem! 😊 Para te ajudar com o agendamento, "
+                                 f"vou repassar para {_p}, que entra em contato em breve.")
+                elif any(k in t for k in ("cancelar", "desmarcar", "não vou poder", "nao vou poder")):
+                    resp_text = (f"Entendi! 😊 Vou avisar {_p} sobre o cancelamento "
+                                 f"e já retornam o contato com você em breve. 💖")
+                elif any(k in t for k in ("remarcar", "mudar")):
+                    resp_text = (f"Anotado! 😊 Vou repassar seu pedido para {_p}, "
+                                 f"que retorna em breve para combinar com você.")
+                elif any(k in t for k in ("valor", "preço", "preco", "quanto", "pagar", "pagamento")):
+                    resp_text = (f"Sobre valores e pagamento, prefiro que {_p} te explique "
+                                 f"diretamente. Já estou avisando! 😊")
+                else:
+                    resp_text = (f"Recebi sua mensagem! 😊 Vou repassar para {_p}, "
+                                 f"que responde assim que puder.")
             logger.error(
                 f"[{tenant['slug']}][{phone}] FALLBACK humanizado acionado "
                 f"para texto={text[:80]!r} — verificar logs do LLM acima"
@@ -1277,7 +1310,10 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
             try:
                 dt = _dt.fromisoformat(appt["scheduled_at"])
                 quando = cal.format_slots([dt])[0]
-                agent_resp.response_text = f"Olá! 😊 Tudo bem? Posso ajudar com sua sessão de {quando}?"
+                if _is_psychology(tenant):
+                    agent_resp.response_text = f"Olá! 😊 Tudo bem? Posso ajudar com sua sessão de {quando}?"
+                else:
+                    agent_resp.response_text = f"Olá! 😊 Tudo bem? Posso ajudar com seu {_generic_service_noun(tenant)} de {quando}?"
             except Exception:
                 agent_resp.response_text = "Olá! 😊 Tudo bem? Posso ajudar com algo?"
         else:
@@ -1456,7 +1492,12 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 fixed_text = _PAT.sub(formatted, text or "")
                 reply = fixed_text.replace("[slot]", formatted).replace("[hora]", formatted)
                 if not reply.strip() or formatted not in reply:
-                    reply = f"Prontinho! ✅ {name.split()[0] if name else 'Sua consulta'}, sua sessão ficou marcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                    if _is_psychology(tenant):
+                        reply = f"Prontinho! ✅ {name.split()[0] if name else 'Sua consulta'}, sua sessão ficou marcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                    else:
+                        _nome1 = name.split()[0] if name else ""
+                        _saud = f"Prontinho, {_nome1}! ✅" if _nome1 else "Prontinho! ✅"
+                        reply = f"{_saud} Seu {_generic_service_noun(tenant)} ficou marcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
                 logger.info(f"[{tenant['slug']}] Agendamento criado: {name} | slot_index={idx_raw}(raw)→{idx}(0based) | slot={formatted}")
                 event = {"type": "new_appointment", "data": {"patient_name": name, "slot": formatted, "phone": phone}}
                 return reply, event
@@ -1538,10 +1579,17 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 # menciona o slot canônico, montamos uma confirmação determinística.
                 if not reply.strip() or formatted not in reply:
                     old_fmt = cal.format_appointment(appt) if appt else ""
-                    if old_fmt:
-                        reply = f"Prontinho! ✅ Sua consulta de {old_fmt} foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                    if _is_psychology(tenant):
+                        if old_fmt:
+                            reply = f"Prontinho! ✅ Sua consulta de {old_fmt} foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                        else:
+                            reply = f"Prontinho! ✅ Sua consulta foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
                     else:
-                        reply = f"Prontinho! ✅ Sua consulta foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                        _svc = _generic_service_noun(tenant)
+                        if old_fmt:
+                            reply = f"Prontinho! ✅ Seu {_svc} de {old_fmt} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                        else:
+                            reply = f"Prontinho! ✅ Seu {_svc} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
                 return reply, {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}
         return "Não consegui remarcar. Pode escolher outro horário? 😊", None
 
@@ -1565,10 +1613,11 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                         f"  • {cal.format_appointment(a)} (id={a['id']})"
                         for a in futuras[:5]
                     )
-                    return (
-                        f"Você tem mais de uma sessão agendada. Qual você quer confirmar?\n\n{lista}",
-                        None,
-                    )
+                    if _is_psychology(tenant):
+                        msg = f"Você tem mais de uma sessão agendada. Qual você quer confirmar?\n\n{lista}"
+                    else:
+                        msg = f"Você tem mais de um {_generic_service_noun(tenant)} agendado. Qual você quer confirmar?\n\n{lista}"
+                    return (msg, None)
             except Exception as e:
                 logger.warning(f"[confirm] fallback get_appointments_by_phone falhou: {e}")
         if appt_id:
