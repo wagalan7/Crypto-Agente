@@ -407,6 +407,41 @@
       <div id="cfg-msg" class="text-sm text-center hidden text-green-600"></div>
     </div>
 
+    {% if evolution_enabled %}
+    <!-- Conexão automática (Evolution) — cliente lê só o QR -->
+    <div class="bg-white rounded-xl border-2 border-green-300 p-5 max-w-lg mt-4">
+      <div class="flex items-center justify-between mb-1">
+        <div class="flex items-center gap-2">
+          <span class="text-xl">⚡</span>
+          <h3 class="font-semibold text-gray-800 text-sm">Conectar WhatsApp (automático)</h3>
+        </div>
+        <span id="ev-badge" class="text-xs font-semibold px-2 py-1 rounded-full bg-gray-100 text-gray-500">—</span>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">
+        Jeito mais fácil: clique em <strong>Conectar</strong>, abra o WhatsApp no celular →
+        <em>Aparelhos conectados</em> → <em>Conectar um aparelho</em> e escaneie o código.
+        <strong>Sem colar Instance ID nem Token.</strong>
+      </p>
+      <div id="ev-qr-wrap" class="hidden text-center my-3">
+        <img id="ev-qr-img" alt="QR Code do WhatsApp"
+          class="mx-auto w-56 h-56 border border-gray-200 rounded-lg bg-white"/>
+        <p class="text-xs text-gray-400 mt-2">O código é renovado automaticamente enquanto esta janela está aberta.</p>
+      </div>
+      <div id="ev-connected-box" class="hidden my-3 p-3 bg-green-50 border border-green-200 rounded-xl text-sm text-green-700 text-center">
+        ✅ WhatsApp conectado! Seu agente já está respondendo.
+      </div>
+      <button id="ev-connect-btn" onclick="connectEvolution(this)"
+        class="w-full mt-1 bg-green-600 text-white py-2.5 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        ⚡ Conectar WhatsApp
+      </button>
+      <div id="ev-conn-msg" class="hidden text-sm text-center mt-2"></div>
+      <details class="mt-3">
+        <summary class="text-xs text-gray-400 cursor-pointer">Prefiro usar meu próprio Z-API</summary>
+        <p class="text-xs text-gray-400 mt-1">Use os campos abaixo para conectar via Z-API manualmente.</p>
+      </details>
+    </div>
+    {% endif %}
+
     <!-- WhatsApp Z-API -->
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
       <div class="flex items-center gap-2 mb-1">
@@ -3068,6 +3103,92 @@ async function _zapiInit() {
   } catch (e) { /* silencioso */ }
 }
 window.addEventListener('load', _zapiInit);
+
+// ── Conectar WhatsApp automático (Evolution) ────────────────────────────────────
+let _evPoll = null;
+let _evTicks = 0;
+
+function _evSetBadge(state) {
+  const b = document.getElementById('ev-badge');
+  if (!b) return;
+  if (state === 'connected') { b.className = 'text-xs font-semibold px-2 py-1 rounded-full bg-green-100 text-green-700'; b.textContent = '● Conectado'; }
+  else if (state === 'waiting') { b.className = 'text-xs font-semibold px-2 py-1 rounded-full bg-yellow-100 text-yellow-700'; b.textContent = '● Aguardando leitura'; }
+  else if (state === 'off') { b.className = 'text-xs font-semibold px-2 py-1 rounded-full bg-red-100 text-red-600'; b.textContent = '● Desconectado'; }
+  else { b.className = 'text-xs font-semibold px-2 py-1 rounded-full bg-gray-100 text-gray-500'; b.textContent = '—'; }
+}
+
+function _evStopPoll() { if (_evPoll) { clearInterval(_evPoll); _evPoll = null; } }
+
+function _evShowConnected() {
+  _evStopPoll();
+  const w = document.getElementById('ev-qr-wrap'); if (w) w.classList.add('hidden');
+  const c = document.getElementById('ev-connected-box'); if (c) c.classList.remove('hidden');
+  _evSetBadge('connected');
+  const btn = document.getElementById('ev-connect-btn');
+  if (btn) { btn.disabled = false; btn.textContent = '🔄 Verificar conexão'; }
+}
+
+async function _evTick() {
+  _evTicks++;
+  if (_evTicks > 45) {  // ~3 min
+    _evStopPoll();
+    const btn = document.getElementById('ev-connect-btn');
+    if (btn) { btn.disabled = false; btn.textContent = '⚡ Conectar WhatsApp'; }
+    const m = document.getElementById('ev-conn-msg');
+    m.className = 'text-sm text-center text-gray-500 mt-2';
+    m.textContent = 'Tempo esgotado. Clique em Conectar para gerar um novo código.';
+    m.classList.remove('hidden');
+    return;
+  }
+  try {
+    const d = await api('/dashboard/api/evolution/qr');
+    if (d.enabled === false) {
+      _evStopPoll();
+      const m = document.getElementById('ev-conn-msg');
+      m.className = 'text-sm text-center text-yellow-600 mt-2';
+      m.textContent = d.error || 'Conexão automática indisponível.';
+      m.classList.remove('hidden');
+      return;
+    }
+    if (d.connected) { _evShowConnected(); showToast('WhatsApp conectado ✓', 'success'); return; }
+    if (d.qr) {
+      document.getElementById('ev-qr-img').src = d.qr;
+      document.getElementById('ev-qr-wrap').classList.remove('hidden');
+      document.getElementById('ev-connected-box').classList.add('hidden');
+      _evSetBadge('waiting');
+      document.getElementById('ev-conn-msg').classList.add('hidden');
+    } else {
+      const m = document.getElementById('ev-conn-msg');
+      m.className = 'text-sm text-center text-yellow-600 mt-2';
+      m.textContent = d.error ? ('Aguardando QR: ' + d.error) : 'Gerando código…';
+      m.classList.remove('hidden');
+      _evSetBadge('off');
+    }
+  } catch (e) {
+    const m = document.getElementById('ev-conn-msg');
+    m.className = 'text-sm text-center text-red-600 mt-2';
+    m.textContent = 'Erro: ' + e.message;
+    m.classList.remove('hidden');
+  }
+}
+
+function connectEvolution(btn) {
+  btn.disabled = true; btn.textContent = '⏳ Conectando…';
+  _evTicks = 0;
+  _evStopPoll();
+  _evTick();                                // imediata
+  _evPoll = setInterval(_evTick, 4000);     // renova QR + detecta conexão
+}
+
+// Checagem leve ao abrir: só atualiza o selo (não gera QR).
+async function _evInit() {
+  if (!document.getElementById('ev-connect-btn')) return;  // card só existe se habilitado
+  try {
+    const d = await api('/dashboard/api/evolution/qr?check=1');  // não provisiona
+    if (d.connected) { _evShowConnected(); } else { _evSetBadge('off'); }
+  } catch (e) { /* silencioso */ }
+}
+window.addEventListener('load', _evInit);
 
 // ── Salvar templates de mensagem ───────────────────────────────────────────────
 function saveMsgTemplates(btn) {

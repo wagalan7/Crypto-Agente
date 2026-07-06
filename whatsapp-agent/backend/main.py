@@ -633,6 +633,11 @@ async def _handle_message(tenant: dict, phone: str, text: str):
 @app.post("/webhook/{slug}/evolution")
 async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
+    # Backward-compatible: tenants legados sem webhook_token seguem aceitos
+    # (o validador loga warning e retorna True). Instâncias provisionadas
+    # automaticamente ganham token e passam a ser validadas.
+    if not _validate_webhook_token(tenant, request):
+        raise HTTPException(status_code=403, detail="Token de webhook inválido.")
     payload = await request.json()
     result = wa.extract_message_evolution(payload)
     if not result:
@@ -982,7 +987,12 @@ def dashboard(slug: str, request: Request, token: str = ""):
         return RedirectResponse(f"/onboarding/pagamento?token={setup_token}&suspended=1", status_code=303)
     import segments as _segments
     terms = _segments.resolve_terms(tenant)
-    return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token, "terms": terms})
+    try:
+        from evolution_provisioning import is_enabled as _ev_enabled
+        evolution_enabled = _ev_enabled()
+    except Exception:
+        evolution_enabled = False
+    return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token, "terms": terms, "evolution_enabled": evolution_enabled})
 
 
 @app.get("/dashboard/api/appointments")
@@ -1715,6 +1725,75 @@ async def dash_zapi_qr(request: Request):
             res["webhook"] = await wa.configure_webhook_zapi(tenant, webhook_url)
         except Exception as e:
             logger.warning(f"[{tenant['slug']}] pós-conexão Z-API: {e}")
+    return res
+
+
+@app.get("/dashboard/api/evolution/qr")
+async def dash_evolution_qr(request: Request):
+    """Provisionamento automático via Evolution (cliente lê só o QR).
+
+    Só funciona quando a plataforma tem um servidor Evolution configurado
+    (env vars EVOLUTION_API_URL/KEY). Sem isso, ``enabled=False`` e o painel
+    mantém o fluxo Z-API manual como único caminho — nada muda.
+
+    Idempotente: na 1ª chamada cria a instância (nomeada pelo slug), grava as
+    colunas do tenant + provider=evolution e liga o webhook; nas seguintes só
+    busca o QR / detecta a conexão.
+    """
+    from evolution_provisioning import (
+        is_enabled as _ev_enabled, create_instance as _ev_create,
+        connect as _ev_connect, set_webhook as _ev_setwebhook,
+    )
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    if not _ev_enabled():
+        return {"ok": False, "enabled": False, "connected": None,
+                "error": "Provisionamento automático indisponível — use o Z-API."}
+
+    instance_name = f"tenant-{tenant['slug']}"
+    api_base = config.EVOLUTION_API_URL.rstrip("/")
+    wt = db.ensure_webhook_token(tenant["id"])
+    webhook_url = f"{config.BASE_URL}/webhook/{tenant['slug']}/evolution?token={wt}"
+
+    # Já provisionado nesta plataforma? (mesma URL + instância gravada)
+    provisioned = (
+        (tenant.get("evolution_url") or "").rstrip("/") == api_base
+        and (tenant.get("evolution_instance") or "") == instance_name
+    )
+
+    # check=1 → só consulta status (NUNCA cria instância). Usado no load do painel
+    # para não provisionar por acidente quando o cliente só abre a tela.
+    if request.query_params.get("check") == "1" and not provisioned:
+        return {"ok": True, "enabled": True, "connected": False, "qr": None}
+
+    if not provisioned:
+        created = await _ev_create(instance_name, webhook_url)
+        if not created.get("ok"):
+            return {"ok": False, "enabled": True, "connected": None,
+                    "error": created.get("error") or "Falha ao criar a instância."}
+        updates = {
+            "evolution_url": api_base,
+            "evolution_instance": instance_name,
+            "whatsapp_provider": "evolution",
+        }
+        # token por instância (nunca a chave global); se já existia, mantém.
+        if created.get("instance_token"):
+            updates["evolution_key"] = created["instance_token"]
+        db.update_tenant(tenant["slug"], **updates)
+        await _ev_setwebhook(instance_name, webhook_url)
+        if created.get("qr"):
+            return {"ok": True, "enabled": True, "connected": False, "qr": created["qr"]}
+        # sem QR no create → cai pro connect abaixo
+
+    res = await _ev_connect(instance_name)
+    res["enabled"] = True
+    if res.get("connected"):
+        try:
+            if (tenant.get("whatsapp_provider") or "") != "evolution":
+                db.update_tenant(tenant["slug"], whatsapp_provider="evolution")
+            await _ev_setwebhook(instance_name, webhook_url)
+        except Exception as e:
+            logger.warning(f"[{tenant['slug']}] pós-conexão Evolution: {e}")
     return res
 
 

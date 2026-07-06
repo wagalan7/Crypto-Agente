@@ -25,12 +25,19 @@ async def send_message(tenant: dict, phone: str, text: str) -> bool:
 # ── Evolution API ──────────────────────────────────────────────────────────────
 
 async def _send_evolution(tenant: dict, phone: str, text: str) -> bool:
-    url = f"{tenant['evolution_url']}/message/sendText/{tenant['evolution_instance']}"
+    base = (tenant.get("evolution_url") or "").rstrip("/")
+    url = f"{base}/message/sendText/{tenant['evolution_instance']}"
     headers = {"apikey": tenant["evolution_key"], "Content-Type": "application/json"}
-    payload = {"number": _normalize_phone(phone), "textMessage": {"text": text}}
+    number = _normalize_phone(phone)
+    # Evolution v2 usa {"number","text"}; v1 usa {"number","textMessage":{"text"}}.
+    # Tentamos v2 e, em caso de 400/422 (payload incompatível), caímos p/ v1.
+    payload_v2 = {"number": number, "text": text}
+    payload_v1 = {"number": number, "textMessage": {"text": text}}
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(url, json=payload, headers=headers)
+            r = await client.post(url, json=payload_v2, headers=headers)
+            if r.status_code in (400, 422):
+                r = await client.post(url, json=payload_v1, headers=headers)
             r.raise_for_status()
             return True
     except Exception as e:
