@@ -221,6 +221,13 @@ function applySegment() {
   document.getElementById("lbl-minutes").innerHTML = s.svc;
   document.getElementById("name").placeholder = s.ph;
 }
+// Pré-seleciona o segmento vindo da landing por vertical (?segment=...)
+(function preselectSegment() {
+  const q = new URLSearchParams(location.search).get("segment");
+  if (!q) return;
+  const sel = document.getElementById("segment");
+  if ([...sel.options].some(o => o.value === q)) sel.value = q;
+})();
 applySegment();
 
 // Máscara CEP + ViaCEP autocomplete

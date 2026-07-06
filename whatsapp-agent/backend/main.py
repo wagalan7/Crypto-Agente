@@ -2987,6 +2987,30 @@ def landing(request: Request):
     )
 
 
+@app.get("/p/{segment}", response_class=HTMLResponse)
+def landing_vertical(request: Request, segment: str):
+    """Landing dedicada por vertical (ex.: /p/nutricao, /p/advocacia).
+
+    Psicologia e segmentos inválidos caem na flagship em ``/`` (byte-idêntica).
+    """
+    from landing_content import content_for
+    content = content_for(segment)
+    if content is None:
+        return RedirectResponse("/", status_code=302)
+    # Tracking não-bloqueante (mesma pipeline da landing)
+    try:
+        ip = request.client.host if request.client else ""
+        ua = request.headers.get("user-agent", "")
+        ref = request.headers.get("referer", "")
+        db.record_landing_view(ip=ip, user_agent=ua, referrer=ref)
+    except Exception as e:
+        logger.warning(f"[landing_vertical] tracking falhou: {e}")
+    return templates.TemplateResponse(
+        "landing_vertical.html",
+        {"request": request, "c": content},
+    )
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Painel Admin (login + dashboard + APIs)
 # ════════════════════════════════════════════════════════════════════════════

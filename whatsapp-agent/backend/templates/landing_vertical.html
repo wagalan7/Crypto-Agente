@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>{{ c.seo_title }}</title>
+  <meta name="description" content="{{ c.seo_description }}"/>
+  <meta property="og:title" content="{{ c.seo_title }}"/>
+  <meta property="og:description" content="{{ c.seo_description }}"/>
+  <meta property="og:image" content="/static/hero-agente.jpg"/>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%237c3aed'><path d='M12 2a4 4 0 0 0-4 4 3 3 0 0 0-3 3v1a3 3 0 0 0 0 6 3 3 0 0 0 3 3v1a3 3 0 0 0 4 3 3 3 0 0 0 4-3v-1a3 3 0 0 0 3-3 3 3 0 0 0 0-6V9a3 3 0 0 0-3-3 4 4 0 0 0-4-4z'/></svg>"/>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: '#7c3aed', brandDark: '#5b21b6', brandLight: '#a78bfa', dark: '#1a0b2e' } } } }</script>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/>
+  <style>
+    * { font-family: 'Inter', sans-serif; }
+    .hero-bg { background: linear-gradient(135deg, #1a0b2e 0%, #2d1657 50%, #1a0b2e 100%); }
+    .cta-bg  { background: linear-gradient(135deg, #1a0b2e 0%, #3b1781 100%); }
+    .btn-brand { background: linear-gradient(135deg, #7c3aed, #a855f7); }
+    .glow { box-shadow: 0 0 50px rgba(124,58,237,0.25); }
+    .glow-sm { box-shadow: 0 0 20px rgba(124,58,237,0.18); }
+    .chat-in  { border-radius: 4px 18px 18px 18px; background: #ffffff; color:#374151; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+    .chat-out { border-radius: 18px 4px 18px 18px; background: #ede9fe; color:#4c1d95; }
+    .chat-time { font-size: 10px; color:#9ca3af; margin-top:4px; display:block; }
+    .chat-slot { display:flex; align-items:center; gap:10px; background:#fff; border:1px solid #e9d5ff; border-radius:12px; padding:10px 14px; font-size:13px; color:#4c1d95; transition: all .15s; }
+    .chat-slot:hover { background:#faf5ff; border-color:#c4b5fd; }
+    .chat-slot svg { color:#7c3aed; }
+    @keyframes float  { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
+    @keyframes fadein { from{opacity:0;transform:translateY(24px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes pulse-ring { 0%{transform:scale(1);opacity:1} 100%{transform:scale(1.6);opacity:0} }
+    .float  { animation: float 4s ease-in-out infinite; }
+    .fadein { animation: fadein .7s ease both; }
+    .fadein-2 { animation: fadein .7s .2s ease both; }
+    .pulse-ring::before {
+      content:''; position:absolute; inset:-6px; border-radius:50%;
+      border:2px solid #a855f7;
+      animation: pulse-ring 1.8s ease-out infinite;
+    }
+    .plan-popular { border-color:#7c3aed; transform:scale(1.03); }
+    @media(max-width:768px){ .plan-popular{transform:scale(1); } }
+    details summary { cursor:pointer; list-style:none; }
+    details summary::-webkit-details-marker { display:none; }
+    details[open] .faq-icon { transform:rotate(45deg); }
+    .faq-icon { transition: transform .2s; }
+    .tag-pill { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:100px; padding:6px 14px; font-size:13px; color:#e9d5ff; }
+    .before-card { border-left: 3px solid #f87171; }
+    .after-card  { border-left: 3px solid #34d399; }
+    .whatsapp-float {
+      position:fixed; bottom:24px; right:24px; z-index:999;
+      width:58px; height:58px; border-radius:50%;
+      background:#25d366; display:flex; align-items:center; justify-content:center;
+      box-shadow:0 4px 20px rgba(37,211,102,0.5);
+      transition: transform .2s;
+    }
+    .whatsapp-float:hover { transform:scale(1.1); }
+    .hero-img-wrap { position:relative; }
+    .hero-img-wrap::after {
+      content:''; position:absolute; inset:-20px; z-index:-1;
+      background: radial-gradient(circle at center, rgba(168,85,247,0.35) 0%, rgba(168,85,247,0) 70%);
+      filter: blur(20px);
+    }
+  </style>
+</head>
+<body class="bg-white text-gray-900 overflow-x-hidden">
+
+<!-- WhatsApp flutuante -->
+<a href="https://wa.me/{{ c.whatsapp }}" target="_blank" class="whatsapp-float" title="Fale conosco">
+  <svg width="28" height="28" viewBox="0 0 32 32" fill="white">
+    <path d="M16 0C7.163 0 0 7.163 0 16c0 2.822.737 5.469 2.027 7.773L0 32l8.448-2.007A15.93 15.93 0 0016 32c8.837 0 16-7.163 16-16S24.837 0 16 0zm8.27 22.557c-.343.964-1.998 1.842-2.734 1.96-.698.11-1.576.157-2.542-.16-.585-.19-1.337-.444-2.29-.869-4.02-1.737-6.645-5.806-6.844-6.075-.2-.27-1.626-2.162-1.626-4.125 0-1.963 1.029-2.93 1.394-3.33.366-.4.798-.5 1.063-.5.266 0 .532.003.765.014.245.012.574-.093.9.686.343.804 1.163 2.767 1.264 2.967.1.2.166.433.033.7-.133.266-.2.433-.4.666-.2.234-.42.523-.6.702-.2.2-.408.417-.175.817.233.4 1.035 1.706 2.221 2.764 1.527 1.36 2.814 1.78 3.214 1.98.4.2.633.167.867-.1.233-.266.999-1.166 1.265-1.566.266-.4.533-.333.9-.2.366.134 2.33 1.1 2.73 1.3.4.2.666.3.766.466.1.167.1.967-.243 1.903z"/>
+  </svg>
+</a>
+
+<!-- ── NAV ── -->
+<nav class="sticky top-0 z-50 bg-white/95 backdrop-blur border-b border-gray-100">
+  <div class="max-w-6xl mx-auto px-5 py-3.5 flex items-center justify-between">
+    <div class="flex items-center gap-2.5">
+      <div class="w-9 h-9 btn-brand rounded-xl flex items-center justify-center text-white shadow">
+        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
+          <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
+          <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
+        </svg>
+      </div>
+      <div class="leading-tight">
+        <span class="block font-extrabold text-gray-900 text-sm md:text-base tracking-tight">AGENTE</span>
+        <span class="block font-bold text-brand text-[11px] md:text-xs -mt-1 tracking-[0.18em]">{{ c.brand_line2 }}</span>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <a href="#precos" class="hidden md:block text-sm text-gray-500 hover:text-gray-800 font-medium transition">Preços</a>
+      <a href="{{ c.onboarding_link }}" class="btn-brand text-white text-sm font-bold px-5 py-2.5 rounded-xl hover:opacity-90 transition shadow">
+        Começar grátis →
+      </a>
+    </div>
+  </div>
+</nav>
+
+<!-- ── HERO ── -->
+<section class="hero-bg text-white px-5 py-20 md:py-28 relative overflow-hidden">
+  <div class="absolute top-20 -left-20 w-72 h-72 rounded-full" style="background:radial-gradient(circle,rgba(168,85,247,0.25),transparent 70%);filter:blur(40px)"></div>
+  <div class="absolute bottom-10 -right-10 w-96 h-96 rounded-full" style="background:radial-gradient(circle,rgba(124,58,237,0.2),transparent 70%);filter:blur(50px)"></div>
+
+  <div class="max-w-6xl mx-auto grid md:grid-cols-2 gap-14 items-center relative">
+    <div class="fadein">
+      <div class="tag-pill mb-6">
+        <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse relative pulse-ring"></span>
+        {{ c.hero_pill }}
+      </div>
+      <h1 class="text-4xl md:text-5xl xl:text-6xl font-black leading-[1.1] mb-6">
+        {{ c.hero_title_1 }}<br/>
+        <span style="background:linear-gradient(90deg,#a855f7,#e9d5ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">{{ c.hero_title_2 }}</span>
+      </h1>
+      <p class="text-gray-300 text-lg md:text-xl mb-8 leading-relaxed">
+        {{ c.hero_subtitle }}
+      </p>
+      <div class="flex flex-col sm:flex-row gap-3 mb-6">
+        <a href="{{ c.onboarding_link }}"
+          class="btn-brand text-white font-bold px-8 py-4 rounded-2xl text-base hover:opacity-90 transition text-center shadow-xl glow">
+          {{ c.cta_primary }}
+        </a>
+        <a href="#como-funciona"
+          class="border border-white/25 text-white font-medium px-8 py-4 rounded-2xl text-base hover:bg-white/10 transition text-center">
+          Ver como funciona ↓
+        </a>
+      </div>
+      <div class="flex flex-wrap gap-4 text-sm text-gray-400">
+        <span>✓ Sem contrato</span>
+        <span>✓ Configuração em 2 minutos</span>
+        <span>✓ Suporte incluído</span>
+      </div>
+    </div>
+
+    <div class="float fadein-2 hero-img-wrap">
+      <img src="/static/hero-agente.jpg"
+           alt="{{ c.hero_img_alt }}"
+           class="w-full rounded-3xl shadow-2xl border border-white/10"
+           loading="eager" decoding="async"/>
+    </div>
+  </div>
+</section>
+
+<!-- ── BALÕES CSS ── -->
+<section class="bg-gradient-to-b from-violet-50 via-white to-white py-20 px-5">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-12">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Como suas conversas ficam</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Uma conversa real, no seu WhatsApp</h2>
+      <p class="text-gray-500 text-lg">O {{ c.t_client }} conversa naturalmente. O agente entende, propõe horários e confirma.</p>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-8">
+      <!-- Coluna 1: agendamento -->
+      <div class="bg-white rounded-3xl border border-violet-100 shadow-xl p-6 md:p-7 fadein">
+        <div class="flex items-center gap-2 text-xs text-violet-700 font-semibold mb-4 pb-3 border-b border-violet-50">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2" ry="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>
+          Olá, tudo bem? 😊 Precisa agendar?
+        </div>
+        <div class="space-y-3 text-sm">
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[80%]">Olá! Quero agendar {{ 'um' if c.t_service in ['atendimento','serviço'] else 'uma' }} {{ c.t_service }}. <span class="chat-time">10:31</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[80%]">Claro! Vou te ajudar a agendar. 😊<br/>Deixa eu verificar os horários disponíveis pra você. <span class="chat-time">10:31</span></div></div>
+          <div class="flex justify-start">
+            <div class="chat-in px-4 py-3 max-w-[90%] space-y-2">
+              <p class="text-xs text-violet-700 font-semibold mb-1">Confira os próximos horários:</p>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 09:00</div>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 14:00</div>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quinta-feira, 23/05 – 10:00</div>
+              <span class="chat-time">10:32</span>
+            </div>
+          </div>
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[80%]">Quarta-feira, 22/05 às 14:00. <span class="chat-time">10:33</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[85%]">Pronto! Seu horário foi agendado para quarta-feira, 22/05 às 14:00. 💜<br/>Você receberá um lembrete antes. <span class="chat-time">10:33</span></div></div>
+        </div>
+      </div>
+
+      <!-- Coluna 2: remarcação -->
+      <div class="bg-white rounded-3xl border border-violet-100 shadow-xl p-6 md:p-7 fadein-2">
+        <div class="flex items-center gap-2 text-xs text-violet-700 font-semibold mb-4 pb-3 border-b border-violet-50">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+          Precisa remarcar? Eu também cuido disso pra você!
+        </div>
+        <div class="space-y-3 text-sm">
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[80%]">Olá, preciso remarcar meu horário. <span class="chat-time">11:15</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[85%]">Sem problemas! Vou te ajudar com isso. 😊<br/>Vamos escolher uma nova data. Confira os horários disponíveis: <span class="chat-time">11:15</span></div></div>
+          <div class="flex justify-start">
+            <div class="chat-in px-4 py-3 max-w-[90%] space-y-2">
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Sexta-feira, 24/05 – 09:00</div>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Sexta-feira, 24/05 – 15:00</div>
+              <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Terça-feira, 28/05 – 10:00</div>
+              <span class="chat-time">11:16</span>
+            </div>
+          </div>
+          <div class="flex justify-end"><div class="chat-out px-4 py-2.5 max-w-[80%]">Sexta-feira, 24/05 às 15:00, por favor. <span class="chat-time">11:17</span></div></div>
+          <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[85%]">Pronto! Foi reagendado para sexta-feira, 24/05 às 15:00.<br/>Você receberá um novo lembrete. Qualquer dúvida, estou aqui! 💜 <span class="chat-time">11:17</span></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── NÚMEROS ── -->
+<section class="border-y border-gray-100 bg-gray-50 py-12 px-5">
+  <div class="max-w-4xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-6 text-center">
+    {% for n in c.numbers %}
+    <div>
+      <p class="text-4xl font-black text-brand">{{ n.value }}</p>
+      <p class="text-gray-500 text-sm mt-1">{{ n.label }}</p>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<!-- ── PROBLEMA ── -->
+<section class="py-20 px-5">
+  <div class="max-w-3xl mx-auto text-center">
+    <p class="text-brand font-bold text-sm uppercase tracking-widest mb-4">{{ c.problem_kicker }}</p>
+    <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-6">{{ c.problem_headline }}</h2>
+    <div class="text-gray-600 text-lg leading-relaxed text-left space-y-4 bg-gray-50 rounded-2xl p-8 border border-gray-100">
+      {% for p in c.problem_paragraphs %}<p>{{ p|safe }}</p>{% endfor %}
+      <p class="text-brand font-semibold">{{ c.problem_final }}</p>
+    </div>
+    <div class="mt-8 grid md:grid-cols-3 gap-4 text-left">
+      {% for card in c.pain_cards %}
+      <div class="bg-red-50 border border-red-100 rounded-2xl p-5">
+        <div class="text-2xl mb-2">{{ card.emoji }}</div>
+        <p class="font-bold text-gray-900 text-sm mb-1">{{ card.title }}</p>
+        <p class="text-gray-500 text-sm">{{ card.text }}</p>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<!-- ── SOLUÇÃO / ANTES × DEPOIS ── -->
+<section class="bg-gray-50 py-20 px-5">
+  <div class="max-w-4xl mx-auto">
+    <div class="text-center mb-14">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">A virada</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900">Antes × Depois do seu agente</h2>
+    </div>
+    <div class="grid md:grid-cols-2 gap-5">
+      <div class="space-y-3">
+        <h3 class="text-red-500 font-bold text-sm uppercase tracking-wide mb-4">😰 Antes</h3>
+        {% for item in c.before %}
+        <div class="before-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">{{ item }}</p>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="space-y-3">
+        <h3 class="text-green-500 font-bold text-sm uppercase tracking-wide mb-4">✨ Depois</h3>
+        {% for item in c.after %}
+        <div class="after-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+          <p class="text-sm text-gray-700">{{ item }}</p>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="text-center mt-10">
+      <a href="{{ c.onboarding_link }}" class="btn-brand text-white font-bold px-8 py-4 rounded-2xl text-base hover:opacity-90 transition shadow-lg inline-block">
+        Quero essa mudança →
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ── COMO FUNCIONA ── -->
+<section id="como-funciona" class="py-20 px-5">
+  <div class="max-w-4xl mx-auto">
+    <div class="text-center mb-14">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Simples assim</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Pronto em menos de 2 minutos</h2>
+      <p class="text-gray-500 text-lg">Sem técnica. Sem complicação. Sem precisar de ajuda.</p>
+    </div>
+    <div class="grid md:grid-cols-3 gap-8">
+      {% for s in c.steps %}
+      <div class="text-center group">
+        <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">{{ s.emoji }}</div>
+        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-violet-50 rounded-full mb-3">{{ s.badge }}</div>
+        <h3 class="font-bold text-gray-900 text-lg mb-2">{{ s.title }}</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">{{ s.text }}</p>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<!-- ── RECURSOS ── -->
+<section class="bg-gray-50 py-20 px-5">
+  <div class="max-w-4xl mx-auto">
+    <div class="text-center mb-14">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Tudo incluído</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Sua secretária virtual completa</h2>
+      <p class="text-gray-500 text-lg">{{ c.features_subtitle }}</p>
+    </div>
+    <div class="grid md:grid-cols-3 gap-4">
+      {% for f in c.features %}
+      <div class="bg-white rounded-2xl p-6 border border-gray-100 hover:border-brand hover:glow-sm transition group">
+        <div class="text-3xl mb-3">{{ f.emoji }}</div>
+        <h3 class="font-bold text-gray-900 mb-2 group-hover:text-brand transition">{{ f.title }}</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">{{ f.text }}</p>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+{% if c.testimonials %}
+<!-- ── DEPOIMENTOS ── -->
+<section class="py-20 px-5">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-14">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Quem já usa</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900">O que estão dizendo</h2>
+    </div>
+    <div class="grid md:grid-cols-3 gap-6">
+      {% for t in c.testimonials %}
+      <div class="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm glow-sm">
+        <div class="flex gap-1 text-yellow-400 text-sm mb-4">★★★★★</div>
+        <p class="text-gray-700 text-sm leading-relaxed mb-5">{{ t.text }}</p>
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-full btn-brand flex items-center justify-center text-white font-bold text-sm">{{ t.initial }}</div>
+          <div>
+            <p class="font-semibold text-gray-900 text-sm">{{ t.name }}</p>
+            <p class="text-gray-400 text-xs">{{ t.role }}</p>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+{% else %}
+<!-- ── POR QUE FUNCIONA (sem prova social fabricada) ── -->
+<section class="py-20 px-5">
+  <div class="max-w-4xl mx-auto">
+    <div class="text-center mb-14">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Por que funciona</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900">Feito para o seu dia a dia</h2>
+    </div>
+    <div class="grid md:grid-cols-3 gap-6 text-center">
+      <div class="bg-white rounded-2xl border border-violet-100 p-7 glow-sm">
+        <div class="text-3xl mb-3">⚡</div>
+        <h3 class="font-bold text-gray-900 mb-2">Responde na hora</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Nenhum {{ c.t_client }} fica sem resposta — mesmo fora do horário de expediente.</p>
+      </div>
+      <div class="bg-white rounded-2xl border border-violet-100 p-7 glow-sm">
+        <div class="text-3xl mb-3">🔒</div>
+        <h3 class="font-bold text-gray-900 mb-2">Seu número, seu controle</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">O agente atende pelo seu próprio WhatsApp. Você pausa quando quiser, com 1 clique.</p>
+      </div>
+      <div class="bg-white rounded-2xl border border-violet-100 p-7 glow-sm">
+        <div class="text-3xl mb-3">💜</div>
+        <h3 class="font-bold text-gray-900 mb-2">Tom acolhedor</h3>
+        <p class="text-gray-500 text-sm leading-relaxed">Linguagem natural, com emojis e cuidado — do jeito que você atenderia.</p>
+      </div>
+    </div>
+  </div>
+</section>
+{% endif %}
+
+<!-- ── PREÇOS ── -->
+<section id="precos" class="bg-gray-50 py-20 px-5">
+  <div class="max-w-5xl mx-auto">
+    <div class="text-center mb-14">
+      <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Investimento</p>
+      <h2 class="text-3xl md:text-4xl font-black text-gray-900 mb-3">Planos sem complicação</h2>
+      <p class="text-gray-500 text-lg mb-2">Sem contrato. Cancele quando quiser.</p>
+      <p class="text-sm text-gray-400">Compare: uma secretária custa R$ 1.500–2.500/mês. O plano anual sai por menos de R$ 6/dia.</p>
+    </div>
+
+    <div class="grid md:grid-cols-3 gap-6 items-start">
+      <!-- Mensal -->
+      <div class="bg-white rounded-2xl border border-gray-200 p-7 hover:border-brand transition">
+        <div class="mb-6">
+          <p class="font-bold text-gray-900 text-lg mb-1">🗓️ Mensal</p>
+          <p class="text-gray-400 text-sm">Flexibilidade máxima</p>
+        </div>
+        <div class="mb-6">
+          <div class="flex items-end gap-1">
+            <span class="text-gray-400 text-base">R$</span>
+            <span class="text-5xl font-black text-gray-900">199</span>
+            <span class="text-gray-400 text-base mb-1">/mês</span>
+          </div>
+          <p class="text-gray-400 text-sm mt-1">Cobrado mensalmente</p>
+        </div>
+        <ul class="space-y-2.5 mb-8 text-sm text-gray-600">
+          <li class="flex gap-2"><span class="text-brand">✓</span> Agente WhatsApp ilimitado</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Painel de controle completo</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Google Calendar integrado</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Confirmações automáticas</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Cobrança mensal automática</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Reagendamento pelo painel</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Suporte via WhatsApp</li>
+        </ul>
+        <a href="{{ c.onboarding_link }}" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-violet-50 transition">
+          Começar agora →
+        </a>
+      </div>
+
+      <!-- Semestral -->
+      <div class="bg-white rounded-2xl border-2 border-brand p-7 plan-popular shadow-xl glow relative">
+        <div class="absolute -top-4 left-1/2 -translate-x-1/2">
+          <span class="btn-brand text-white text-xs font-bold px-4 py-1.5 rounded-full shadow">MAIS POPULAR</span>
+        </div>
+        <div class="mb-6">
+          <p class="font-bold text-gray-900 text-lg mb-1">📅 Semestral</p>
+          <p class="text-gray-400 text-sm">Economize R$ 180 no período</p>
+        </div>
+        <div class="mb-6">
+          <p class="text-gray-400 text-sm line-through">R$ 199/mês</p>
+          <div class="flex items-end gap-1">
+            <span class="text-gray-400 text-base">R$</span>
+            <span class="text-5xl font-black text-gray-900">169</span>
+            <span class="text-gray-400 text-base mb-1">/mês</span>
+          </div>
+          <p class="text-gray-400 text-sm mt-1">R$ 1.014 à vista · 3x sem juros</p>
+        </div>
+        <ul class="space-y-2.5 mb-8 text-sm text-gray-600">
+          <li class="flex gap-2"><span class="text-brand">✓</span> Tudo do plano mensal</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> <strong>15% de desconto</strong></li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Parcelamento em 3x s/ juros</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Prioridade no suporte</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Acesso a novas funções</li>
+        </ul>
+        <a href="{{ c.onboarding_link }}" class="block w-full text-center btn-brand text-white font-bold py-3.5 rounded-xl hover:opacity-90 transition shadow-lg">
+          Quero este plano →
+        </a>
+      </div>
+
+      <!-- Anual -->
+      <div class="bg-white rounded-2xl border border-gray-200 p-7 hover:border-brand transition">
+        <div class="mb-6">
+          <p class="font-bold text-gray-900 text-lg mb-1">🏆 Anual</p>
+          <p class="text-gray-400 text-sm">Melhor custo-benefício</p>
+        </div>
+        <div class="mb-6">
+          <p class="text-gray-400 text-sm line-through">R$ 199/mês</p>
+          <div class="flex items-end gap-1">
+            <span class="text-gray-400 text-base">R$</span>
+            <span class="text-5xl font-black text-gray-900">149</span>
+            <span class="text-gray-400 text-base mb-1">/mês</span>
+          </div>
+          <p class="text-gray-400 text-sm mt-1">R$ 1.788 à vista · 3x sem juros</p>
+        </div>
+        <ul class="space-y-2.5 mb-8 text-sm text-gray-600">
+          <li class="flex gap-2"><span class="text-brand">✓</span> Tudo do plano mensal</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> <strong>25% de desconto</strong></li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Economize R$ 600 no ano</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> 7 dias grátis para testar</li>
+          <li class="flex gap-2"><span class="text-brand">✓</span> Parcelamento em 3x s/ juros</li>
+        </ul>
+        <a href="{{ c.onboarding_link }}" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-violet-50 transition">
+          Começar com desconto →
+        </a>
+      </div>
+    </div>
+
+    <p class="text-center text-gray-400 text-sm mt-8">
+      ⚠️ Z-API não incluso — contratado separadamente pelo {{ c.t_business }} (≈ R$ 97–150/mês).
+      Você mantém controle total do seu número.
+    </p>
+  </div>
+</section>
+
+<!-- ── GARANTIA ── -->
+<section class="py-16 px-5">
+  <div class="max-w-2xl mx-auto text-center">
+    <div class="bg-green-50 border border-green-200 rounded-3xl p-10">
+      <div class="text-5xl mb-4">🛡️</div>
+      <h2 class="text-2xl font-black text-gray-900 mb-3">7 dias grátis no plano anual</h2>
+      <p class="text-gray-600 leading-relaxed">
+        Experimente sem compromisso. Se em 7 dias você não ver diferença,
+        cancele sem custo, sem perguntas, sem burocracia.
+        <br/><br/>
+        <strong>O risco é todo nosso. O benefício é todo seu.</strong>
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ── FAQ ── -->
+<section class="bg-gray-50 py-20 px-5">
+  <div class="max-w-2xl mx-auto">
+    <h2 class="text-3xl font-black text-gray-900 text-center mb-12">Perguntas frequentes</h2>
+    <div class="space-y-3">
+      {% for item in c.faq %}
+      <details class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <summary class="px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">{{ item.q }}</span>
+          <span class="faq-icon text-brand text-2xl font-light ml-4 flex-shrink-0">+</span>
+        </summary>
+        <div class="px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed">{{ item.a }}</p>
+        </div>
+      </details>
+      {% endfor %}
+
+      <details class="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        <summary class="px-6 py-5 flex justify-between items-center">
+          <span class="font-semibold text-gray-800 text-sm">Tem dúvidas? Fale antes de assinar.</span>
+          <span class="faq-icon text-brand text-2xl font-light ml-4 flex-shrink-0">+</span>
+        </summary>
+        <div class="px-6 pb-5">
+          <p class="text-gray-500 text-sm leading-relaxed mb-3">Tire suas dúvidas diretamente no WhatsApp antes de qualquer decisão:</p>
+          <a href="https://wa.me/{{ c.whatsapp }}" target="_blank"
+            class="inline-flex items-center gap-2 bg-green-500 text-white text-sm font-semibold px-5 py-2.5 rounded-xl hover:bg-green-600 transition">
+            💬 Falar no WhatsApp
+          </a>
+        </div>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ── CTA FINAL ── -->
+<section class="cta-bg text-white py-24 px-5 text-center">
+  <div class="max-w-2xl mx-auto">
+    <div class="text-6xl mb-6">🚀</div>
+    <h2 class="text-3xl md:text-5xl font-black mb-5 leading-tight">
+      {{ c.final_headline_1 }}<br/>{{ c.final_headline_2 }}
+    </h2>
+    <p class="text-gray-300 text-lg mb-10 leading-relaxed">
+      {{ c.final_subtitle }}
+    </p>
+    <div class="flex flex-col sm:flex-row gap-4 justify-center">
+      <a href="{{ c.onboarding_link }}"
+        class="btn-brand text-white font-bold px-10 py-5 rounded-2xl text-lg hover:opacity-90 transition shadow-2xl glow">
+        🚀 Começar agora →
+      </a>
+      <a href="https://wa.me/{{ c.whatsapp }}" target="_blank"
+        class="border border-white/30 text-white font-medium px-10 py-5 rounded-2xl text-lg hover:bg-white/10 transition">
+        💬 Falar antes de assinar
+      </a>
+    </div>
+    <p class="text-gray-400 text-sm mt-6">Sem contrato · Suporte incluso · Configuração em 2 minutos</p>
+  </div>
+</section>
+
+<!-- ── FOOTER ── -->
+<footer class="bg-gray-950 text-gray-500 py-10 px-5">
+  <div class="max-w-5xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+    <div class="flex items-center gap-2">
+      <div class="w-8 h-8 btn-brand rounded-lg flex items-center justify-center text-white shadow">
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
+          <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
+          <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
+        </svg>
+      </div>
+      <div class="leading-tight">
+        <span class="block font-extrabold text-gray-300 text-xs tracking-tight">AGENTE</span>
+        <span class="block font-bold text-brandLight text-[10px] -mt-0.5 tracking-[0.18em]">{{ c.brand_line2 }}</span>
+      </div>
+    </div>
+    <p class="text-sm text-center">© 2026 Agente Atendimento · Powered by Claude AI · Anthropic</p>
+    <div class="flex items-center gap-4 text-xs">
+      <a href="/termos" class="hover:text-gray-300 transition">Termos</a>
+      <a href="/privacidade" class="hover:text-gray-300 transition">Privacidade</a>
+      <a href="https://wa.me/{{ c.whatsapp }}" target="_blank" class="text-gray-400 hover:text-green-400 transition">
+        💬 (11) 96843-9527
+      </a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
