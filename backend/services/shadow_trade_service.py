@@ -320,6 +320,12 @@ EDGE_MULT_MAX = float(os.getenv("EDGE_MULT_MAX", "1.30"))
 # DEFAULT OFF: dinheiro real → só liga após você revisar. Mudar só muda a entrada;
 # o guard cardinal "sem stop = sem trade" e os TPs seguem idênticos.
 MAKER_ENTRY_ENABLED = os.getenv("MAKER_ENTRY_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+# Fallback do maker: se a LIMIT post-only não preencher no timeout, cair a
+# MERCADO (true) ou DESISTIR da entrada (false). Chasing a mercado após o preço
+# fugir do limit é justamente o que gera "entrada atrasada" (TP1 curto, SL caro);
+# com false, no-fill = sem trade (não persegue). Default true = comportamento
+# atual. Só tem efeito quando MAKER_ENTRY_ENABLED=true.
+MAKER_FALLBACK_MARKET = os.getenv("MAKER_FALLBACK_MARKET", "true").strip().lower() in ("1", "true", "yes")
 
 # ── #2b Orçamento de RISCO aberto agregado (soma do R em risco das posições) ──
 # Diferente dos caps de notional/margem (tamanho/garantia): este soma o RISCO
@@ -625,6 +631,20 @@ STRUCT_CHASE_MAX_ATR = float(os.getenv("STRUCT_CHASE_MAX_ATR", "5.0"))
 RR_GATE_ENABLED = os.getenv("RR_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 MIN_RR_TP1_EXEC = float(os.getenv("MIN_RR_TP1_EXEC", "0.7"))   # TP1 (parcial) >= 0.7R
 MIN_RR_TP2_EXEC = float(os.getenv("MIN_RR_TP2_EXEC", "1.5"))   # TP2 (alvo final) >= 1.5R
+
+# ── Fill-price R:R gate (anti-entrada-atrasada) ─────────────────────────────
+# O RR_GATE acima valida a geometria sobre o PLANO (entry do entry_planner —
+# tipicamente um pullback ABAIXO do preço p/ long). Mas com MAKER_ENTRY off
+# (default) a ordem enche a MERCADO no preço de AGORA, não no pullback planejado.
+# Se o preço já correu a favor entre o sinal e o fill, o TP1 fica colado e o SL
+# caro — R:R real quebrado (caso ETH: entrou 1.773 c/ TP1 em 1.775 e SL em 1.739,
+# arriscando ~1,9% pra ganhar 0,11% no TP1). Este gate REVALIDA o R:R do TP1
+# sobre o current_price (preço de mercado no scan ≈ preço do fill a mercado),
+# logo antes de abrir LIVE. Se ficou abaixo do piso → pula ("perdeu o trem").
+# Piso FROUXO por padrão. Só LIVE (shadow simula fill no entry planejado, por
+# design). Fail-open se current_price ausente (o RR_GATE do plano já passou).
+FILL_RR_GATE_ENABLED = os.getenv("FILL_RR_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+MIN_RR_TP1_FILL = float(os.getenv("MIN_RR_TP1_FILL", "0.5"))   # TP1 no preço REAL de fill >= 0.5R
 
 # ── Liquidity gate (Fase 2) ─────────────────────────────────────────────────
 # A allowlist já restringe execução às mais líquidas, mas é ESTÁTICA: se o
@@ -3751,6 +3771,33 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     except Exception as e:
                         log.warning(f"[adaptive-partials] wiring falhou: {e}")
 
+                # 1e. R:R sobre o preço de EXECUÇÃO (anti-entrada-atrasada) — o
+                #     RR_GATE lá em cima valida o PLANO (entry planejado); aqui
+                #     revalidamos com o preço de mercado REAL (current_price do
+                #     scan ≈ fill a mercado). Se o preço correu a favor e o TP1
+                #     ficou curto / SL caro, pula (perdeu o trem) ANTES de abrir.
+                #     Só LIVE. Fail-open se não houver preço/níveis.
+                if (FILL_RR_GATE_ENABLED and MIN_RR_TP1_FILL > 0
+                        and tp1 is not None and stop is not None):
+                    try:
+                        _cp = rec.get("current_price")
+                        _cp = float(_cp) if _cp is not None else None
+                        if _cp and _cp > 0:
+                            _risk_fill = abs(_cp - float(stop))
+                            _rwd_fill = (float(tp1) - _cp) if side == "long" else (_cp - float(tp1))
+                            _rr1_fill = (_rwd_fill / _risk_fill) if _risk_fill > 0 else -1.0
+                            if _rr1_fill < MIN_RR_TP1_FILL:
+                                _reason = (
+                                    f"R:R TP1 no fill {_rr1_fill:.2f} < mín {MIN_RR_TP1_FILL} "
+                                    f"(preço {_cp:g}, entry_plan {float(entry):g}, "
+                                    f"TP1 {float(tp1):g}, SL {float(stop):g}) — entrada atrasada"
+                                )
+                                log.info(f"[fill-rr-gate] {rec['symbol']} {side}: {_reason} → skip")
+                                _record_skip(rec, "fill-rr", _reason)
+                                continue
+                    except Exception as e:
+                        log.warning(f"[fill-rr-gate] {rec['symbol']} check falhou (fail-open): {e}")
+
                 # 2. Exchange order
                 from services import exchange_service
                 exch_side = "Buy" if side == "long" else "Sell"
@@ -3773,6 +3820,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         tp1_qty_pct=_open_tp1_pct,
                         leverage=int(rec.get("leverage") or 1),
                         client_order_id=client_order_id,
+                        fallback_market=MAKER_FALLBACK_MARKET,
                     )
                     if isinstance(order_res, dict) and order_res.get("ok"):
                         log.info(
@@ -3793,10 +3841,17 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         client_order_id=client_order_id,
                     )
                 if not order_res.get("ok"):
-                    log.error(
-                        f"[shadow→live] place_order falhou {rec['symbol']}: "
-                        f"{order_res.get('msg') or order_res.get('error')}"
-                    )
+                    # no_fill = maker post-only não preencheu e fallback_market=false
+                    # (não perseguiu a mercado). É skip esperado, não erro.
+                    if order_res.get("no_fill"):
+                        _reason = "maker post-only não preencheu (sem chase a mercado)"
+                        log.info(f"[shadow→live] {rec['symbol']} {_reason} — skip")
+                        _record_skip(rec, "maker-no-fill", _reason)
+                    else:
+                        log.error(
+                            f"[shadow→live] place_order falhou {rec['symbol']}: "
+                            f"{order_res.get('msg') or order_res.get('error')}"
+                        )
                     continue
 
                 result = order_res.get("result") or {}
