@@ -91,6 +91,17 @@ class RealTrade(Base):
     # Preço atual do SL ativo na exchange (muda quando vai pra breakeven)
     sl_current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # ── Partials adaptativos (por-trade) ─────────────────────────────────
+    # Overrides decididos na ABERTURA pelo adaptive_partials_service (conforme
+    # convicção/volatilidade da operação). Se None → trade_manager usa a env
+    # global (PROTECTION_TP1_QTY_PCT / RUNNER_ATR_MULT / RUNNER_QTY_PCT).
+    adaptive_tp1_qty_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    adaptive_runner_atr_mult: Mapped[float | None] = mapped_column(Float, nullable=True)
+    adaptive_runner_qty_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Índice do trade de teste adaptativo (1..N) — marca as N primeiras trades
+    # com a tag "🧪 Teste adaptativo N/total" no Telegram. None = não é teste.
+    adaptive_test_idx: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Notas livres
     notes: Mapped[str | None] = mapped_column(String(255), nullable=True)
 

@@ -86,6 +86,20 @@ def _allowlist_line(symbol: Any) -> str:
         return ""
 
 
+def _adaptive_test_tag(trade: Any) -> str:
+    """Tag '🧪 Teste adaptativo N/total' pras N primeiras trades do modo
+    adaptativo (adaptive_test_idx setado). Vazia se não for trade de teste."""
+    idx = _get(trade, "adaptive_test_idx", None)
+    if idx is None:
+        return ""
+    try:
+        from services import adaptive_partials_service
+        total = adaptive_partials_service.test_count()
+    except Exception:
+        total = idx
+    return f"\U0001F9EA *Teste adaptativo {int(idx)}/{int(total)}*\n"
+
+
 def fmt_trade_opened(trade: Any, rec: Optional[Any] = None) -> str:
     """Formata mensagem de trade aberto. Aceita trade dict ou objeto."""
     symbol = _get(trade, "symbol", "?")
@@ -102,12 +116,27 @@ def fmt_trade_opened(trade: Any, rec: Optional[Any] = None) -> str:
     tf = _get(rec, "timeframe", "?")
 
     emoji = "\U0001F7E2" if side == "LONG" else "\U0001F534"
+    # Extras adaptativos (só aparecem se o trade tiver override): fatia do TP1 e
+    # largura do trailing decididas pra esta operação.
+    a_tp1 = _get(trade, "adaptive_tp1_qty_pct", None)
+    a_atr = _get(trade, "adaptive_runner_atr_mult", None)
+    adaptive_line = ""
+    if a_tp1 is not None or a_atr is not None:
+        parts = []
+        if a_tp1 is not None:
+            parts.append(f"TP1 {float(a_tp1):.0%}")
+        if a_atr is not None:
+            parts.append(f"trail {float(a_atr):g}\u00D7ATR")
+        _joined = " \u00B7 ".join(parts)
+        adaptive_line = f"\u2699\uFE0F Adaptativo: `{_joined}`\n"
     return (
+        f"{_adaptive_test_tag(trade)}"
         f"{emoji} *Trade Aberto* \u2014 `{symbol}`\n"
         f"{_allowlist_line(symbol)}"
         f"`{side} {lev}x` \u00B7 TF `{tf}` \u00B7 Tier `{tier}` \u00B7 Score `{score}`\n"
         f"Entry: `{_fmt_num(entry)}`\n"
         f"SL: `{_fmt_num(sl)}` \u00B7 TP1: `{_fmt_num(tp1)}` \u00B7 TP2: `{_fmt_num(tp2)}`\n"
+        f"{adaptive_line}"
         f"Qty: `{qty}`"
     )
 
@@ -169,11 +198,29 @@ def fmt_trade_closed(trade: Any, reason: str = "?", pnl: Optional[float] = None)
 
     motivo = _human_motivo(trade, reason, pnl_f)
 
+    tag = _adaptive_test_tag(trade)
+    # Nas trades de teste, avisa quando a 4ª (última) fecha → hora de decidir.
+    decide_line = ""
+    if tag:
+        try:
+            from services import adaptive_partials_service
+            idx = _get(trade, "adaptive_test_idx", None)
+            total = adaptive_partials_service.test_count()
+            if idx is not None and int(idx) >= int(total):
+                decide_line = (
+                    f"\n\u2705 *Último teste adaptativo ({int(idx)}/{int(total)}) fechado* "
+                    f"\u2014 hora de avaliar e decidir se vamos pro modo agressivo."
+                )
+        except Exception:
+            pass
+
     return (
+        f"{tag}"
         f"{emoji} *{label}* \u2014 `{symbol}` ({side})\n"
         f"{_allowlist_line(symbol)}"
         f"Motivo: `{motivo}`\n"
         f"PnL: `${pnl_f:.2f}`"
+        f"{decide_line}"
     )
 
 

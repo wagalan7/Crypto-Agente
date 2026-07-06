@@ -41,6 +41,7 @@ from typing import Optional
 
 from db import DB_ENABLED
 from services import real_trade_service
+from services import adaptive_partials_service
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +98,77 @@ def _parse_block_hours(raw: str) -> set:
 
 
 TRADE_BLOCK_HOURS_UTC: set = _parse_block_hours(os.getenv("TRADE_BLOCK_HOURS_UTC", ""))
+
+
+# ── Filtro de PREGÃO para moedas lastreadas em ações (go-live) ───────────────
+# Moedas tokenizadas com lastro na bolsa americana (bStocks / stock-perps:
+# TSLA, NVDA, AAPL, STXX, ...) só têm fluxo/price-discovery "de verdade" quando
+# a NYSE/Nasdaq está aberta. Fora do pregão (madrugada, fim de semana) ficam
+# ilíquidas e o sinal degrada — foi o caso do STXX às 04:49 BRT (-1,29R).
+#
+# Este gate bloqueia o AUTO-abrir dessas moedas FORA do pregão regular dos EUA.
+# TODAS as demais criptos seguem 24h (não são afetadas).
+#
+# EQUITY_BACKED_SYMBOLS  — CSV de BASES lastreadas (default = seed conhecido).
+#                          Extensível sem deploy. Vazio = filtro desligado.
+# EQUITY_US_HOURS_ONLY   — "true"/"false" master-toggle (default true).
+# EQUITY_SESSION_ET      — janela do pregão em horário de Nova York, "HH:MM-HH:MM"
+#                          (default "09:30-16:00" = pregão regular). O DST
+#                          (EDT/EST) é resolvido automático via zoneinfo, então
+#                          a janela UTC se ajusta sozinha ao horário de verão.
+# Nota: não considera feriados de bolsa (poucos por ano); numa data de feriado
+#       ainda pode operar no horário. Fail-closed: se não der pra determinar o
+#       horário (erro de tz), a moeda lastreada é BLOQUEADA por segurança.
+def _parse_equity_symbols(raw: str) -> set:
+    out: set = set()
+    for part in (raw or "").split(","):
+        b = part.strip().upper()
+        if b:
+            out.add(b)
+    return out
+
+
+_EQUITY_SEED = "STXX,TSLA,NVDA,AAPL,META,GOOGL,GOOG,MSFT,AMZN,CRCL,MSTR,COIN"
+EQUITY_BACKED_SYMBOLS: set = _parse_equity_symbols(
+    os.getenv("EQUITY_BACKED_SYMBOLS", _EQUITY_SEED)
+)
+EQUITY_US_HOURS_ONLY: bool = os.getenv("EQUITY_US_HOURS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _equity_base_of(symbol: str) -> str:
+    """'STXX/USDT:USDT' → 'STXX' (uppercase). Robusto a formatos sem '/'."""
+    s = (symbol or "").upper().strip()
+    if "/" in s:
+        s = s.split("/", 1)[0]
+    return s.split(":", 1)[0].strip()
+
+
+def _is_equity_backed(symbol: str) -> bool:
+    if not EQUITY_BACKED_SYMBOLS:
+        return False
+    return _equity_base_of(symbol) in EQUITY_BACKED_SYMBOLS
+
+
+def _us_equity_session_open_now() -> bool:
+    """True se o pregão regular dos EUA está aberto AGORA (dia útil + janela ET).
+
+    Usa America/New_York (DST automático). Se o cálculo de timezone falhar,
+    retorna False (fail-closed) — a moeda lastreada fica bloqueada por segurança.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        raw = os.getenv("EQUITY_SESSION_ET", "09:30-16:00").strip()
+        o_s, c_s = raw.split("-", 1)
+        oh, om = (int(x) for x in o_s.split(":"))
+        ch, cm = (int(x) for x in c_s.split(":"))
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if now_et.weekday() >= 5:  # 5=sáb, 6=dom
+            return False
+        mins = now_et.hour * 60 + now_et.minute
+        return (oh * 60 + om) <= mins < (ch * 60 + cm)
+    except Exception as e:  # tz indisponível / parse ruim → fail-closed
+        log.warning(f"[equity-session] falha ao apurar pregão ({e}) — fail-closed")
+        return False
 
 
 def _exchange_is_production() -> bool:
@@ -3603,6 +3675,13 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             # falso (mascara o slippage real). Telemetria fica None até backfill.
             entry_is_real_fill = False
 
+            # Partials adaptativos (por-trade) — defaults no escopo externo; o
+            # cálculo real acontece no passo 1d (só no fluxo live). Em shadow o
+            # fechamento vem do snapshot, não do trade_manager, então não aplica.
+            _adaptive = None
+            _adaptive_idx = None
+            _open_tp1_pct = 0.45  # fração TP1 usada na abertura (default = fixo)
+
             if not SHADOW_ENABLED:
                 # 0. Trava de dinheiro real (go-live #1) — produção exige
                 #    confirmação explícita. Sem ela, NÃO envia ordem real.
@@ -3632,6 +3711,46 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         )
                         continue
 
+                # 1c. Pregão para moedas lastreadas em ações (bStocks/stock-perps)
+                #     — só operam no horário regular da bolsa dos EUA. Demais
+                #     criptos seguem 24h (não caem aqui).
+                if EQUITY_US_HOURS_ONLY and _is_equity_backed(rec["symbol"]):
+                    if not _us_equity_session_open_now():
+                        log.info(
+                            f"[shadow→live] BLOCKED {rec['symbol']} {side}: "
+                            f"moeda lastreada em ação ({_equity_base_of(rec['symbol'])}) "
+                            f"fora do pregão regular EUA "
+                            f"({os.getenv('EQUITY_SESSION_ET', '09:30-16:00')} ET, dia útil)"
+                        )
+                        continue
+
+                # 1d. Partials adaptativos (por-trade) — decide fração do TP1,
+                #     tamanho do runner e largura do trailing conforme a convicção
+                #     e a volatilidade DESTA operação. Precisa ser ANTES da ordem
+                #     pra a fração do TP1 valer na parcial enviada à corretora.
+                if adaptive_partials_service.is_enabled():
+                    try:
+                        _atr_pct = _get_rec_feature(rec, "atr_pct")
+                        _adaptive = adaptive_partials_service.compute(
+                            tier=rec.get("tier"),
+                            score=rec.get("score"),
+                            edge_score=rec.get("edge_score"),
+                            prob_tp2=rec.get("prob_tp2"),
+                            atr_pct=_atr_pct,
+                        )
+                        if _adaptive:
+                            _open_tp1_pct = float(_adaptive.get("tp1_qty_pct") or 0.45)
+                            _tc = adaptive_partials_service.test_count()
+                            _cnt = await real_trade_service.count_adaptive_test_trades()
+                            if _cnt < _tc:
+                                _adaptive_idx = _cnt + 1
+                            log.info(
+                                f"[adaptive-partials] {rec['symbol']}: {_adaptive['reason']}"
+                                + (f" (🧪 teste {_adaptive_idx}/{_tc})" if _adaptive_idx else "")
+                            )
+                    except Exception as e:
+                        log.warning(f"[adaptive-partials] wiring falhou: {e}")
+
                 # 2. Exchange order
                 from services import exchange_service
                 exch_side = "Buy" if side == "long" else "Sell"
@@ -3651,6 +3770,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         stop_loss=stop,
                         take_profit=tp2,
                         tp1=float(tp1) if tp1 is not None else None,
+                        tp1_qty_pct=_open_tp1_pct,
                         leverage=int(rec.get("leverage") or 1),
                         client_order_id=client_order_id,
                     )
@@ -3668,6 +3788,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         stop_loss=stop,
                         take_profit=tp2,  # TP2 — alvo final (closePosition=true)
                         tp1=float(tp1) if tp1 is not None else None,  # bracket 45/55 quando ambos vierem
+                        tp1_qty_pct=_open_tp1_pct,  # fração adaptativa (ou 0.45 fixo)
                         leverage=int(rec.get("leverage") or 1),
                         client_order_id=client_order_id,
                     )
@@ -3785,6 +3906,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 tp1_order_id=_tp1_oid,
                 tp2_order_id=_tp2_oid,
                 sl_current_price=stop,
+                adaptive_tp1_qty_pct=(_adaptive or {}).get("tp1_qty_pct"),
+                adaptive_runner_atr_mult=(_adaptive or {}).get("runner_atr_mult"),
+                adaptive_runner_qty_pct=(_adaptive or {}).get("runner_qty_pct"),
+                adaptive_test_idx=_adaptive_idx,
             )
             if trade is not None:
                 opened += 1

@@ -136,6 +136,46 @@ RUNNER_ATR_TF_FALLBACK = os.getenv("RUNNER_ATR_TF_FALLBACK", "15m").strip()
 RUNNER_MIN_STEP_ATR = float(os.getenv("RUNNER_MIN_STEP_ATR", "0.25"))
 
 
+# ── Partials adaptativos (por-trade) — resolvers ────────────────────────────
+# Se o trade tem override adaptativo (decidido na abertura pelo
+# adaptive_partials_service), usa ele; senão cai no valor FIXO da env global.
+# Guardas mantêm o valor num range são mesmo se o DB trouxer lixo.
+def _tp1_qty_pct_for(trade) -> float:
+    v = getattr(trade, "adaptive_tp1_qty_pct", None)
+    if v is not None:
+        try:
+            fv = float(v)
+            if 0.05 <= fv <= 0.95:
+                return fv
+        except Exception:
+            pass
+    return _TP1_QTY_PCT
+
+
+def _runner_atr_mult_for(trade) -> float:
+    v = getattr(trade, "adaptive_runner_atr_mult", None)
+    if v is not None:
+        try:
+            fv = float(v)
+            if 0.5 <= fv <= 8.0:
+                return fv
+        except Exception:
+            pass
+    return RUNNER_ATR_MULT
+
+
+def _runner_qty_pct_for(trade) -> float:
+    v = getattr(trade, "adaptive_runner_qty_pct", None)
+    if v is not None:
+        try:
+            fv = float(v)
+            if 0.02 <= fv <= 0.60:
+                return fv
+        except Exception:
+            pass
+    return RUNNER_QTY_PCT
+
+
 def _tf_category(tf: str | None) -> str:
     """Mapeia timeframe → 'scalp' | 'day' | 'swing'."""
     if not tf:
@@ -229,9 +269,10 @@ async def _structural_be_stop(trade: RealTrade, entry: float) -> float | None:
 
         # Give-back seguro: com ~45% embolsado no TP1 a R_tp1, o restante (55%)
         # pode devolver no máx (0.45/0.55)·R_tp1 sem o trade virar negativo.
-        rem_frac = max(1e-6, 1.0 - _TP1_QTY_PCT)
+        _tp1_pct = _tp1_qty_pct_for(trade)
+        rem_frac = max(1e-6, 1.0 - _tp1_pct)
         r_tp1 = (abs(planned_tp1 - entry) / R) if planned_tp1 > 0 else 0.0
-        safe_giveback_r = (_TP1_QTY_PCT / rem_frac) * r_tp1 if r_tp1 > 0 else 0.0
+        safe_giveback_r = (_tp1_pct / rem_frac) * r_tp1 if r_tp1 > 0 else 0.0
         giveback_r = min(BE_MAX_GIVEBACK_R, safe_giveback_r)
         if giveback_r <= 0:
             return None  # sem margem segura → BE exato
@@ -355,7 +396,7 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
     try:
         qty_init = trade.qty_initial
         if not qty_init or qty_init <= 0:
-            qty_init = (qty_rem / (1.0 - _TP1_QTY_PCT)) if qty_rem else 0.0
+            qty_init = (qty_rem / (1.0 - _tp1_qty_pct_for(trade))) if qty_rem else 0.0
         filled_tp1 = max(0.0, float(qty_init) - float(qty_rem))
         if filled_tp1 > 0 and entry > 0:
             sign = 1 if trade.side == "long" else -1
@@ -815,7 +856,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
         # Em pre_tp1, se há TP1 parcial, TP2 cobre os 55%. (Com closePosition=true
         # a qty é ignorada de qualquer forma; só importa no fallback reduceOnly.)
         tp1_present = bool(trade.tp1_order_id) or tp1_missing
-        qty_tp2 = qty_now if is_post else (qty_now * (1.0 - _TP1_QTY_PCT) if tp1_present else qty_now)
+        qty_tp2 = qty_now if is_post else (qty_now * (1.0 - _tp1_qty_pct_for(trade)) if tp1_present else qty_now)
         try:
             r = await binance_signed_service.place_protection_orders(
                 sym, entry_side, qty=qty_tp2,
@@ -834,7 +875,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     # ── TP1 parcial (abertura falhou com SL+TP nus, OU TP1 sumiu da exchange
     #    com a posição ainda cheia = deleção manual sem o parcial ter batido) ─
     if tp1_missing:
-        qty_tp1 = qty_now * _TP1_QTY_PCT
+        qty_tp1 = qty_now * _tp1_qty_pct_for(trade)
         try:
             r = await binance_signed_service.place_protection_orders(
                 sym, entry_side, qty=qty_tp1,
@@ -1018,12 +1059,13 @@ async def _chandelier_stop(trade: RealTrade) -> tuple[float | None, float | None
             return None, None, None
         mark = float(df["close"].iloc[-1])
         window = df.iloc[-RUNNER_LOOKBACK:]
+        k = _runner_atr_mult_for(trade)
         if trade.side == "long":
             hh = float(window["high"].max())
-            new_sl = hh - RUNNER_ATR_MULT * atr
+            new_sl = hh - k * atr
         else:
             ll = float(window["low"].min())
-            new_sl = ll + RUNNER_ATR_MULT * atr
+            new_sl = ll + k * atr
         return round(new_sl, 8), atr, mark
     except Exception as e:
         log.warning(f"[runner] chandelier {trade.symbol} #{trade.id} falhou: {e}")
@@ -1057,7 +1099,7 @@ async def _transition_to_runner(trade: RealTrade, qty_now: float) -> None:
         await send_telegram(
             f"\U0001F3C3 *Runner armado* \u2014 {emoji} `{trade.symbol}` ({side})\n"
             f"TP1 e TP2 embolsados. Sobra `{qty_now}` correndo com trailing "
-            f"chandelier (ATR×{RUNNER_ATR_MULT}). SL sobe sozinho, nunca desce.",
+            f"chandelier (ATR×{_runner_atr_mult_for(trade):g}). SL sobe sozinho, nunca desce.",
             event_type="runner",
         )
     except Exception as e:
@@ -1116,7 +1158,7 @@ async def _maybe_trail_runner(trade: RealTrade, qty_now: float) -> bool:
         trade.sl_current_price = new_sl
         log.info(
             f"[runner] {trade.symbol} #{trade.id} trail SL {cur_sl} → {new_sl} "
-            f"(chandelier hh/ll ∓{RUNNER_ATR_MULT}·ATR={atr:.6g}, mark={mark})"
+            f"(chandelier hh/ll ∓{_runner_atr_mult_for(trade):g}·ATR={atr:.6g}, mark={mark})"
         )
         return True
     except Exception as e:

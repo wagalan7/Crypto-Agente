@@ -60,6 +60,11 @@ async def open_trade(
     tp1_order_id: Optional[str] = None,
     tp2_order_id: Optional[str] = None,
     sl_current_price: Optional[float] = None,
+    # Partials adaptativos (por-trade) — None = usa a env global no trade_manager
+    adaptive_tp1_qty_pct: Optional[float] = None,
+    adaptive_runner_atr_mult: Optional[float] = None,
+    adaptive_runner_qty_pct: Optional[float] = None,
+    adaptive_test_idx: Optional[int] = None,
 ) -> Optional[dict]:
     if not DB_ENABLED:
         return None
@@ -115,6 +120,11 @@ async def open_trade(
             tp1_order_id=tp1_order_id,
             tp2_order_id=tp2_order_id,
             sl_current_price=sl_current_price if sl_current_price is not None else planned_stop,
+            # Partials adaptativos (por-trade)
+            adaptive_tp1_qty_pct=adaptive_tp1_qty_pct,
+            adaptive_runner_atr_mult=adaptive_runner_atr_mult,
+            adaptive_runner_qty_pct=adaptive_runner_qty_pct,
+            adaptive_test_idx=adaptive_test_idx,
         )
         session.add(trade)
         await session.flush()
@@ -124,6 +134,23 @@ async def open_trade(
             f"(rec={recommendation_id}, source={source}, slip={slippage}%)"
         )
         return _to_dict(trade)
+
+
+async def count_adaptive_test_trades() -> int:
+    """Quantas trades já foram marcadas como teste adaptativo (adaptive_test_idx
+    != NULL). Usado pra numerar as N primeiras (🧪 Teste N/total). 0 se DB off."""
+    if not DB_ENABLED:
+        return 0
+    try:
+        async with get_session() as session:
+            n = (await session.execute(
+                select(func.count()).select_from(RealTrade)
+                .where(RealTrade.adaptive_test_idx.isnot(None))
+            )).scalar_one()
+            return int(n or 0)
+    except Exception as e:
+        log.warning(f"[real-trade] count_adaptive_test_trades falhou: {e}")
+        return 0
 
 
 async def recompute_entry_slippage(session, trade, fill_price: Optional[float] = None) -> None:
@@ -500,5 +527,10 @@ def _to_dict(t: RealTrade | None) -> dict | None:
         "tp1_order_id": t.tp1_order_id,
         "tp2_order_id": t.tp2_order_id,
         "sl_current_price": t.sl_current_price,
+        # Partials adaptativos (por-trade)
+        "adaptive_tp1_qty_pct": t.adaptive_tp1_qty_pct,
+        "adaptive_runner_atr_mult": t.adaptive_runner_atr_mult,
+        "adaptive_runner_qty_pct": t.adaptive_runner_qty_pct,
+        "adaptive_test_idx": t.adaptive_test_idx,
         "notes": t.notes,
     }

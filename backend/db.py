@@ -136,6 +136,19 @@ async def init_db():
         await conn.execute(text(
             "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS tp1_realized_usd DOUBLE PRECISION"
         ))
+        # Partials adaptativos (por-trade) — overrides decididos na abertura
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS adaptive_tp1_qty_pct DOUBLE PRECISION"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS adaptive_runner_atr_mult DOUBLE PRECISION"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS adaptive_runner_qty_pct DOUBLE PRECISION"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS adaptive_test_idx INTEGER"
+        ))
         # Se a coluna antiga existir (deploy anterior), copia o valor pro novo nome.
         # Em Postgres o IF EXISTS no information_schema é mais seguro:
         await conn.execute(text("""
