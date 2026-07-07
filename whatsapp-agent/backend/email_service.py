@@ -259,3 +259,47 @@ def send_link_recovery_email(
         html=_base_html("Recuperação de acesso — Consultório Inteligente", html_body),
         text=text_body,
     )
+
+
+def send_reactivation_email(
+    email: str,
+    name: str,
+    setup_token: str,
+    status: str = "suspended",
+) -> bool:
+    """
+    E-mail para quem recuperou o acesso mas está com pagamento pendente
+    (cadastro suspenso ou que nunca finalizou o pagamento). Em vez do link do
+    painel, leva à página de pagamento — o dashboard só é liberado após a
+    assinatura ser confirmada. Permite que um cliente antigo reative o MESMO
+    cadastro sem perder histórico.
+    """
+    payment_url = f"{config.BASE_URL}/onboarding/pagamento?token={setup_token}"
+    first_name  = (name or "").split()[0] if name else "Olá"
+
+    html_body = f"""
+<h2>Que bom te ver de volta, {first_name}! 👋</h2>
+<p>Encontramos o seu cadastro. Para reativar o seu agente de atendimento e voltar a
+acessar o painel, falta apenas <strong>concluir o pagamento</strong> da assinatura.</p>
+<p style="text-align:center">
+  <a href="{payment_url}" class="btn">💳 Reativar minha assinatura</a>
+</p>
+<div class="code-box">{payment_url}</div>
+<div class="tip">Assim que o pagamento for confirmado, seu painel é liberado
+automaticamente e o agente volta a responder — com o mesmo cadastro de antes.</div>
+<p>Se você não fez essa solicitação, pode ignorar este e-mail.</p>
+<p>— <strong>Equipe Consultório Inteligente</strong></p>
+"""
+    text_body = (
+        f"Olá {first_name}!\n\n"
+        f"Encontramos seu cadastro. Há um pagamento pendente — conclua para reativar "
+        f"seu agente e acessar o painel:\n{payment_url}\n\n"
+        f"Assim que o pagamento for confirmado, o painel é liberado automaticamente.\n\n"
+        f"Se não solicitou, ignore este e-mail."
+    )
+    return send_email(
+        to=email,
+        subject="💳 Reative seu acesso — Consultório Inteligente",
+        html=_base_html("Reative seu acesso — Consultório Inteligente", html_body),
+        text=text_body,
+    )

@@ -980,11 +980,13 @@ def dashboard(slug: str, request: Request, token: str = ""):
     _dt = tenant.get("dashboard_token") or ""
     if not _dt or not hmac.compare_digest(_dt, token):
         raise HTTPException(status_code=403, detail="Token inválido.")
-    # Redirecionar consultório suspenso para página de reativação
+    # Redirecionar consultório com pagamento pendente (suspenso ou nunca pago)
+    # para a página de pagamento — só libera o painel após a assinatura confirmada.
     status = tenant.get("status", "active")
-    if status == "suspended" and not db.is_tenant_exempt(tenant):
+    if status in ("suspended", "pending_payment") and not db.is_tenant_exempt(tenant):
         setup_token = tenant.get("setup_token", "")
-        return RedirectResponse(f"/onboarding/pagamento?token={setup_token}&suspended=1", status_code=303)
+        _sfx = "&suspended=1" if status == "suspended" else ""
+        return RedirectResponse(f"/onboarding/pagamento?token={setup_token}{_sfx}", status_code=303)
     import segments as _segments
     terms = _segments.resolve_terms(tenant)
     try:
@@ -2687,8 +2689,13 @@ def recuperar_acesso(body: LinkRecoveryBody, request: Request):
         raise HTTPException(status_code=400, detail="E-mail inválido.")
 
     with db.get_conn() as conn:
+        # Inclui cadastros com pagamento pendente (suspensos ou que nunca pagaram),
+        # não só os ativos — assim um cliente antigo recupera o MESMO cadastro.
+        # Prioriza o ativo caso o mesmo e-mail tenha mais de um registro.
         row = conn.execute(
-            "SELECT * FROM tenants WHERE lower(email) = ? AND status = 'active'",
+            "SELECT * FROM tenants WHERE lower(email) = ? AND active = 1 "
+            "AND status IN ('active', 'suspended', 'pending_payment') "
+            "ORDER BY (status = 'active') DESC, id DESC LIMIT 1",
             (email,)
         ).fetchone()
 
@@ -2698,21 +2705,41 @@ def recuperar_acesso(body: LinkRecoveryBody, request: Request):
 
     tenant = dict(row)
     slug = tenant["slug"]
-    dash_token = tenant.get("dashboard_token", "")
+    status = tenant.get("status", "active")
     name = tenant.get("full_name") or tenant.get("psychologist_name") or tenant.get("name") or ""
 
-    if dash_token:
-        try:
-            email_svc.send_link_recovery_email(
+    # Pagamento pendente (cliente suspenso ou que nunca finalizou o pagamento):
+    # em vez do link do painel, enviamos direto para a página de pagamento. O
+    # dashboard só é liberado após a assinatura ser confirmada. Isentos (free)
+    # seguem o fluxo normal de recuperação do link do painel.
+    needs_payment = status in ("suspended", "pending_payment") and not db.is_tenant_exempt(tenant)
+
+    try:
+        if needs_payment:
+            setup_token = tenant.get("setup_token") or ""
+            if not setup_token:
+                setup_token = secrets.token_urlsafe(24)
+                db.update_tenant(slug, setup_token=setup_token)
+            email_svc.send_reactivation_email(
                 email=tenant["email"],
                 name=name,
-                slug=slug,
-                dashboard_token=dash_token,
+                setup_token=setup_token,
+                status=status,
             )
-        except Exception as _e:
-            logger.warning(f"[recuperar-acesso] Falha ao enviar e-mail: {_e}")
+        else:
+            dash_token = tenant.get("dashboard_token", "")
+            if dash_token:
+                email_svc.send_link_recovery_email(
+                    email=tenant["email"],
+                    name=name,
+                    slug=slug,
+                    dashboard_token=dash_token,
+                )
+    except Exception as _e:
+        logger.warning(f"[recuperar-acesso] Falha ao enviar e-mail: {_e}")
 
-    db.audit_log("link_recovery", actor=email, target=slug, ip=_client_ip(request))
+    db.audit_log("link_recovery", actor=email, target=slug, ip=_client_ip(request),
+                 details=f"status={status}")
     return {"status": "ok", "message": "Se o e-mail estiver cadastrado, você receberá as instruções."}
 
 
