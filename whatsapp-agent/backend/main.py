@@ -2496,11 +2496,23 @@ async def diagnose_whatsapp(request: Request):
     except Exception as e:
         logger.warning(f"[diagnose] falha ao listar pendentes: {e}")
 
+    # Diagnóstico do lembrete de vencimento do Z-API (por que não avisou 5 dias antes)
+    zexp = tenant.get("zapi_expires_at") or ""
+    lembrete = {
+        "zapi_expires_at": zexp or None,
+        "psychologist_phone": bool((tenant.get("psychologist_phone") or "").strip()),
+        "problema": (
+            "zapi_expires_at VAZIO — a rotina de aviso de vencimento não tem data "
+            "para comparar, então nunca dispara o lembrete de 5 dias" if not zexp else ""
+        ),
+    }
+
     return {
         "consultorio": tenant.get("slug"),
         "provider": tenant.get("whatsapp_provider"),
         "conexao": conn,  # {ok, connected, error}
         "pendentes_amanha": pendentes,
+        "lembrete_vencimento_zapi": lembrete,
     }
 
 
