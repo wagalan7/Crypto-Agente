@@ -43,7 +43,24 @@ interface Assertiveness {
     win_rate_pct: number | null
     computed_at: string | null
   }
+  gate_counterfactual?: {
+    window_days: number
+    quality_edge?: CfBlock
+    regime_sizing?: CfBlock
+    pre_tp1_protect?: CfBlock
+    conviction_up?: CfBlock
+    edge_sizing?: CfBlock
+  }
+  pyramiding_opportunity?: { verdict?: string | null; continuation_rate_pct?: number | null; tp1_reached?: number }
+  hedge_by_regime?: { verdict?: string | null; short?: { avg_r?: number | null; count?: number }; n_tagged?: number }
   computed_at?: string
+}
+
+// Bloco genérico do contrafactual: o que importa pra UI é enabled_now + verdict.
+interface CfBlock {
+  enabled_now?: boolean
+  verdict?: string | null
+  [k: string]: unknown
 }
 
 // gate → rótulo PT-BR (espelha gateLabel do RecommendationsPanel)
@@ -68,6 +85,17 @@ const GATE_LABEL: Record<string, string> = {
   'daily-sl-breaker': 'breaker diário de stops',
   'flip-advisory': 'flip recente (advisory)',
   'risk-budget': 'orçamento de risco agregado',
+  'news-gate': 'blackout de notícias (FOMC/CPI)',
+  'fill-rr': 'R:R fraco no preço de fill',
+  'maker-no-fill': 'ordem maker não preencheu',
+  'funding-ev': 'funding drena o EV',
+  'struct_chase': 'perna esticada desde a base',
+  'quality-edge-gate': 'score marginal sem edge',
+  'size-damp': 'notional pós-damping abaixo do mínimo',
+  'liq-tier': 'notional pós-tier de liquidez abaixo do mínimo',
+  'regime-size': 'notional pós-regime abaixo do mínimo',
+  'filler-fora': 'filler fora da allowlist sem slot',
+  'ptp-daily-target': 'meta diária de lucro atingida',
 }
 
 function gateLabel(g: string): string {
@@ -115,6 +143,9 @@ export default function AssertivenessPanel({ onClose }: Props) {
   const shadow = data?.shadow
   const gates = data?.gates
   const calib = data?.calibration
+  const cf = data?.gate_counterfactual
+  const pyr = data?.pyramiding_opportunity
+  const hedge = data?.hedge_by_regime
 
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
@@ -294,6 +325,55 @@ export default function AssertivenessPanel({ onClose }: Props) {
                   </p>
                 )}
               </section>
+
+              {/* ── Contrafactual: ligar os gates OFF? ───────────────────── */}
+              {cf && (cf.quality_edge || cf.regime_sizing || cf.pre_tp1_protect) && (
+                <section>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Gauge className="w-4 h-4 text-fuchsia-400" />
+                    <h3 className="text-sm font-bold text-fuchsia-300">Ligar os gates desligados?</h3>
+                    <span className="text-[10px] text-slate-500">· evidência histórica · {cf.window_days ?? data.window_days}d</span>
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <CfRow name="conviction_up" label="Subir o teto de size por convicção (>1.0×)" block={cf.conviction_up} />
+                    <CfRow name="edge_sizing" label="Sizing por edge (A+/funding/padrão/MTF)" block={cf.edge_sizing} />
+                    <CfRow name="quality_edge" label="Gate de score marginal sem edge" block={cf.quality_edge} />
+                    <CfRow name="regime_sizing" label="Reduzir size de alt-long em regime adverso" block={cf.regime_sizing} />
+                    <CfRow name="pre_tp1_protect" label="Proteção pré-TP1 (trava lucro parcial)" block={cf.pre_tp1_protect} />
+                  </div>
+                  <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
+                    Mede sobre o histórico resolvido o que cada gate DESLIGADO teria feito — transforma "ligar ou não" em evidência.
+                  </p>
+                </section>
+              )}
+
+              {/* ── Oportunidades detectadas (evidência, ainda não executadas) ── */}
+              {(pyr || hedge) && (
+                <section>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Target className="w-4 h-4 text-cyan-400" />
+                    <h3 className="text-sm font-bold text-cyan-300">Oportunidades detectadas</h3>
+                    <span className="text-[10px] text-slate-500">· evidência · execução ainda não implementada</span>
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    {pyr?.verdict && (
+                      <div className="p-2 rounded-lg border border-slate-800 bg-slate-900/40">
+                        <span className="text-xs font-bold text-cyan-200">Pyramiding (adicionar em trade vencedor)</span>
+                        <p className="mt-1 text-[10px] text-slate-400 leading-snug">{pyr.verdict}</p>
+                      </div>
+                    )}
+                    {hedge?.verdict && (
+                      <div className="p-2 rounded-lg border border-slate-800 bg-slate-900/40">
+                        <span className="text-xs font-bold text-cyan-200">Hedge em regime adverso</span>
+                        <p className="mt-1 text-[10px] text-slate-400 leading-snug">{hedge.verdict}</p>
+                      </div>
+                    )}
+                  </div>
+                  <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
+                    Estas duas ADICIONAM risco (ordens novas) — a execução fica pra um passo com backtest dedicado. Aqui só a evidência.
+                  </p>
+                </section>
+              )}
             </>
           )}
         </div>
@@ -315,6 +395,27 @@ function StatCard({ label, value, sub, valueCls }: { label: string; value: strin
       <div className="text-[10px] text-slate-500 uppercase">{label}</div>
       <div className={`text-lg font-bold font-mono ${valueCls ?? 'text-white'}`}>{value}</div>
       {sub && <div className="text-[10px] text-slate-600 mt-0.5">{sub}</div>}
+    </div>
+  )
+}
+
+function CfRow({ name, label, block }: { name: string; label: string; block?: CfBlock }) {
+  if (!block) return null
+  const on = block.enabled_now === true
+  return (
+    <div className="p-2 rounded-lg border border-slate-800 bg-slate-900/40">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-bold text-fuchsia-200">{label}</span>
+        <span className="text-[9px] text-slate-600 font-mono">{name}</span>
+        <span className={`ml-auto px-1.5 py-0.5 rounded text-[9px] font-bold border ${
+          on
+            ? 'bg-emerald-500/15 border-emerald-400/50 text-emerald-300'
+            : 'bg-slate-800 border-slate-700 text-slate-400'
+        }`}>{on ? 'LIGADO' : 'DESLIGADO'}</span>
+      </div>
+      {block.verdict && (
+        <p className="mt-1 text-[10px] text-slate-400 leading-snug">{block.verdict}</p>
+      )}
     </div>
   )
 }

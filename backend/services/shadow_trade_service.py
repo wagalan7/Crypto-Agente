@@ -646,6 +646,24 @@ MIN_RR_TP2_EXEC = float(os.getenv("MIN_RR_TP2_EXEC", "1.5"))   # TP2 (alvo final
 FILL_RR_GATE_ENABLED = os.getenv("FILL_RR_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 MIN_RR_TP1_FILL = float(os.getenv("MIN_RR_TP1_FILL", "0.5"))   # TP1 no preço REAL de fill >= 0.5R
 
+# ── News gate (blackout macro FOMC/CPI/NFP) ─────────────────────────────────
+# O news_filter_service já calcula a janela de blackout, mas NÃO estava plugado
+# em lugar nenhum. Este gate PROTETIVO só BLOQUEIA novas entradas durante o
+# blackout (nunca abre nada) — entrar 2min antes de CPI é a forma mais cara de
+# tomar SL por spike. Default OFF pra não mudar comportamento live sem opt-in;
+# RECOMENDADO ligar (NEWS_GATE_ENABLED=true). Fail-open: falha de rede/parse não
+# bloqueia o sistema (o próprio news_filter já é fail-open por dentro).
+NEWS_GATE_ENABLED = os.getenv("NEWS_GATE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+
+# ── Take-profit de portfólio (protege dia verde) ────────────────────────────
+# Quando o R realizado do DIA (UTC, dinheiro real source=auto) atinge a meta,
+# trava NOVAS entradas até a virada do dia — impede devolver um dia bom. NÃO
+# fecha nem aperta posições abertas (isso exige tocar ordens na corretora; fica
+# pra um passo futuro). Só LIVE. Default OFF; ligar com DAILY_PROFIT_TP_ENABLED
+# e ajustar a meta em DAILY_PROFIT_TARGET_R. Fail-open: erro de DB não bloqueia.
+DAILY_PROFIT_TP_ENABLED = os.getenv("DAILY_PROFIT_TP_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+DAILY_PROFIT_TARGET_R = float(os.getenv("DAILY_PROFIT_TARGET_R", "3.0"))  # +3R no dia trava novas entradas
+
 # ── Liquidity gate (Fase 2) ─────────────────────────────────────────────────
 # A allowlist já restringe execução às mais líquidas, mas é ESTÁTICA: se o
 # volume de uma moeda secar ou o spread abrir, o fill sai caro (slippage real).
@@ -1850,6 +1868,27 @@ async def _filler_fora_brake_state() -> tuple[int, float]:
     return streak, pnl
 
 
+async def _daily_realized_r() -> float:
+    """Soma realized_r dos real_trades source=auto FECHADOS hoje (UTC). É o R
+    do dia de DINHEIRO REAL — base do take-profit de portfólio. Propaga erro
+    (o chamador é fail-open: erro NÃO trava as entradas)."""
+    if not DB_ENABLED:
+        return 0.0
+    from datetime import datetime, timezone
+    from sqlalchemy import select, func
+    from db import get_session
+    from models.real_trade import RealTrade
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    async with get_session() as session:
+        total = float((await session.execute(
+            select(func.coalesce(func.sum(RealTrade.realized_r), 0.0))
+            .where(RealTrade.source == "auto")
+            .where(RealTrade.status != "open")
+            .where(RealTrade.closed_at >= start)
+        )).scalar() or 0.0)
+    return total
+
+
 async def _filler_fora_test_opened_count() -> int:
     """Quantos trades FORA (auto [filler]) já foram ABERTOS desde
     FILLER_FORA_TEST_START_AT — conta TODOS (abertos + fechados), pois o teste é
@@ -2944,6 +2983,42 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 key=lambda r: 0 if (_b := _symbol_base(r.get("symbol", ""))) and _b in _allow_sort else 1,
             )
 
+    # ── News gate: blackout macro (FOMC/CPI/NFP). Checa UMA vez por lote (o
+    # status é cacheado 1h dentro do service). Só em LIVE — em shadow deixa
+    # aprender o comportamento em torno do evento. Fail-open: qualquer erro
+    # não bloqueia (não vamos travar o sistema por falha de rede da agenda).
+    _news_blackout: dict | None = None
+    if NEWS_GATE_ENABLED and not SHADOW_ENABLED:
+        try:
+            from services.news_filter_service import get_blackout_status
+            _bl = await get_blackout_status()
+            if _bl.get("active"):
+                _news_blackout = _bl
+                log.info(
+                    f"[news-gate] BLACKOUT ativo: {_bl.get('event')} "
+                    f"({_bl.get('country')}/{_bl.get('impact')}) — "
+                    f"retoma em ~{_bl.get('minutes_until_resume')}min → lote inteiro suprimido"
+                )
+        except Exception as e:
+            log.warning(f"[news-gate] check falhou (fail-open, deixa passar): {e}")
+
+    # ── Take-profit de portfólio: se o R do dia (UTC, dinheiro real) já bateu
+    # a meta, trava novas entradas até a virada. Checa UMA vez por lote. Só
+    # LIVE. Fail-open: erro no cálculo NÃO trava (não vamos perder trades bons
+    # por falha de leitura). Não toca em posições abertas.
+    _daily_tp_hit: float | None = None
+    if DAILY_PROFIT_TP_ENABLED and DAILY_PROFIT_TARGET_R > 0 and not SHADOW_ENABLED:
+        try:
+            _dr = await _daily_realized_r()
+            if _dr >= DAILY_PROFIT_TARGET_R:
+                _daily_tp_hit = _dr
+                log.info(
+                    f"[ptp-daily-target] meta diária atingida: {_dr:+.2f}R >= "
+                    f"{DAILY_PROFIT_TARGET_R}R → novas entradas suprimidas até virada UTC"
+                )
+        except Exception as e:
+            log.warning(f"[ptp-daily-target] check falhou (fail-open, deixa passar): {e}")
+
     opened = 0
     for rec in recs:
         try:
@@ -2951,6 +3026,25 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 continue
             tier = rec.get("tier")
             if tier not in ("A+", "A"):
+                continue
+
+            # ── News gate: durante blackout macro, nenhuma entrada nova.
+            if _news_blackout is not None:
+                reason = (
+                    f"blackout macro: {_news_blackout.get('event')} "
+                    f"({_news_blackout.get('country')}) — retoma em "
+                    f"~{_news_blackout.get('minutes_until_resume')}min"
+                )
+                _record_skip(rec, "news-gate", reason)
+                continue
+
+            # ── Take-profit de portfólio: dia verde já bateu a meta → segura.
+            if _daily_tp_hit is not None:
+                reason = (
+                    f"meta diária de lucro atingida ({_daily_tp_hit:+.2f}R >= "
+                    f"{DAILY_PROFIT_TARGET_R}R) — protege o dia verde, retoma na virada UTC"
+                )
+                _record_skip(rec, "ptp-daily-target", reason)
                 continue
 
             # ── Proximity gate / anti-chase: não persegue preço esticado.

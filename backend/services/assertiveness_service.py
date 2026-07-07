@@ -1040,6 +1040,250 @@ async def _gate_counterfactual(days: int) -> Dict[str, Any]:
         "verdict": (f"{stops_full} stops cheios na janela são o alvo do gate; "
                     f"medir adoção exige instrumentar o caminho pré-TP1 antes"),
     }
+
+    # ── (4) conviction↑ — projeção de subir o TETO do sizing por convicção ─────
+    # Hoje CONVICTION_MULT_MAX limita o multiplicador (default 1.0 = só reduz em
+    # setups fracos, nunca amplia). Se subir o teto (ex.: 1.30), os setups de
+    # ALTA P(TP1) escalam o size. Como R escala LINEAR com o size, projetamos o
+    # delta reconstruindo o multiplicador de cada resolvido a partir do
+    # score→P(TP1) calibrado (mesmo mapa que a calibração usa). Faithful caveat:
+    # ignora o blend de P(TP2) (peso default 0) — aproximação pelo TP1.
+    out["conviction_up"] = await _conviction_up_projection(rows, since)
+
+    # ── (5) edge_sizing — NÃO reconstruível (edge_score não é persistido) ──────
+    try:
+        from services.shadow_trade_service import (
+            EDGE_SIZING_ENABLED, EDGE_MULT_MAX, EDGE_MULT_MIN,
+        )
+    except Exception:
+        EDGE_SIZING_ENABLED, EDGE_MULT_MAX, EDGE_MULT_MIN = False, 1.3, 0.8
+    out["edge_sizing"] = {
+        "enabled_now": bool(EDGE_SIZING_ENABLED),
+        "mult_range": [EDGE_MULT_MIN, EDGE_MULT_MAX],
+        "note": ("edge_score/edge_tags NÃO são persistidos no snapshot → o "
+                 "multiplicador por edge não é reconstruível por outcome."),
+        "verdict": ("não avaliável com o dado atual — pra ter evidência, logar "
+                    "edge_score na features do snapshot e reavaliar em ~2 semanas; "
+                    "até lá, validar só via shadow ao vivo"),
+    }
+    return out
+
+
+def _conviction_mult_at(p_tp1, mult_max, lo, hi, mult_min):
+    """Réplica (TP1-only) de _conviction_mult pra um dado teto. Retorna o
+    multiplicador de size. p_tp1 None → 1.0 (não escala, igual ao runtime)."""
+    if p_tp1 is None:
+        return 1.0
+    frac = (p_tp1 - lo) / (hi - lo) if hi > lo else 0.5
+    frac = max(0.0, min(1.0, frac))
+    return mult_min + frac * (mult_max - mult_min)
+
+
+async def _conviction_up_projection(rows, since) -> Dict[str, Any]:
+    """Projeta o delta de R (soma) ao subir CONVICTION_MULT_MAX para um teto
+    hipotético. Read-only. `rows` são os snapshots resolvidos já lidos pelo
+    caller (symbol, direction, score, status, realized_r, features)."""
+    out: Dict[str, Any] = {
+        "enabled_now_max": None, "projected_max": None,
+        "n_evaluated": 0, "current_sum_r": None, "projected_sum_r": None,
+        "projected_r_delta": None, "verdict": None,
+    }
+    try:
+        from services.shadow_trade_service import (
+            CONVICTION_SIZING_ENABLED, CONVICTION_MULT_MIN, CONVICTION_MULT_MAX,
+            CONVICTION_PROB_LO, CONVICTION_PROB_HI,
+        )
+        import os as _os
+        proj_max = float(_os.getenv("CONVICTION_MULT_MAX_PROJ", "1.30"))
+    except Exception as e:
+        out["verdict"] = f"import falhou: {e}"
+        return out
+    out["enabled_now_max"] = CONVICTION_MULT_MAX
+    out["projected_max"] = proj_max
+    # mapa score→P(TP1) calibrado
+    try:
+        from services import calibration_service as cs
+        calib = await cs.get_calibration()
+        bins = (calib or {}).get("bins") or []
+    except Exception:
+        cs = None
+        bins = []
+    if not bins or cs is None:
+        out["verdict"] = "calibração imatura (sem mapa score→P(TP1)) — projeção indisponível"
+        return out
+
+    def _p(score):
+        if score is None:
+            return None
+        try:
+            bi = cs._bin_index(float(score))
+            if bi < 0 or bi >= len(bins):
+                return None
+            return float(bins[bi].get("p_calibrated") or 0.0)
+        except Exception:
+            return None
+
+    cur_sum = 0.0
+    proj_sum = 0.0
+    n = 0
+    for sym, d, sc, st, r, f in rows:
+        p = _p(sc)
+        if p is None:
+            continue
+        rv = float(r or 0.0)
+        m_now = _conviction_mult_at(p, CONVICTION_MULT_MAX, CONVICTION_PROB_LO,
+                                    CONVICTION_PROB_HI, CONVICTION_MULT_MIN)
+        m_proj = _conviction_mult_at(p, proj_max, CONVICTION_PROB_LO,
+                                     CONVICTION_PROB_HI, CONVICTION_MULT_MIN)
+        # R "atual" já reflete o size real; aqui comparamos a MESMA base
+        # normalizada (m_now) contra a projetada, escalando o R realizado.
+        base = rv / m_now if m_now > 0 else rv
+        cur_sum += base * m_now
+        proj_sum += base * m_proj
+        n += 1
+    delta = proj_sum - cur_sum
+    out.update({
+        "n_evaluated": n,
+        "current_sum_r": round(cur_sum, 2),
+        "projected_sum_r": round(proj_sum, 2),
+        "projected_r_delta": round(delta, 2),
+    })
+    if not CONVICTION_SIZING_ENABLED:
+        out["verdict"] = ("conviction sizing está DESLIGADO — ligar primeiro "
+                          "(CONVICTION_SIZING_ENABLED=true) antes de subir o teto")
+    elif n < 15:
+        out["verdict"] = f"amostra pequena ({n}) — projeção inconclusiva"
+    elif delta > 0:
+        out["verdict"] = (f"subir o teto {CONVICTION_MULT_MAX}→{proj_max} teria somado "
+                          f"{delta:+.1f}R em {n} setups — alta convicção pagou; considerar após backtest")
+    else:
+        out["verdict"] = (f"subir o teto {CONVICTION_MULT_MAX}→{proj_max} teria custado "
+                          f"{delta:+.1f}R em {n} setups — alta convicção NÃO pagou o size extra; manter defensivo")
+    return out
+
+
+async def _pyramiding_opportunity(days: int) -> Dict[str, Any]:
+    """#C — EVIDÊNCIA pró/contra pyramiding (adicionar em trade vencedor). Não
+    executa nada — só mede, sobre o histórico REAL (source=auto), a 'taxa de
+    continuação': dos trades que TOCARAM TP1 (SL já em BE, risco extra ≈ 0),
+    quantos seguiram até TP2. Continuação alta = a perna TP1→TP2 é frequente →
+    piramidar no ponto de BE teria capturado essa perna com risco quase nulo.
+    Read-only / fail-soft."""
+    out: Dict[str, Any] = {
+        "window_days": days, "tp1_reached": 0, "continued_to_tp2": 0,
+        "continuation_rate_pct": None, "avg_r_tp1_reached": None,
+        "avg_r_continued": None, "verdict": None,
+    }
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        from db import get_session
+        from models.real_trade import RealTrade
+        async with get_session() as session:
+            rows = list((await session.execute(
+                select(RealTrade.status, RealTrade.realized_r)
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.status.in_(_REAL_TP1_HIT))
+                .where(RealTrade.opened_at >= since)
+            )).all())
+    except Exception as e:
+        log.warning(f"[assertiveness] pyramiding read falhou: {e}")
+        return out
+    if not rows:
+        out["verdict"] = "sem trades reais que tocaram TP1 na janela — sem base pra avaliar"
+        return out
+    n = len(rows)
+    cont = [r for st, r in rows if st in _REAL_TP2_HIT]
+    n_cont = len(cont)
+    rs_all = [float(r or 0) for _, r in rows]
+    rs_cont = [float(r or 0) for r in cont]
+    rate = n_cont / n * 100
+    out.update({
+        "tp1_reached": n, "continued_to_tp2": n_cont,
+        "continuation_rate_pct": round(rate, 1),
+        "avg_r_tp1_reached": round(sum(rs_all) / n, 3),
+        "avg_r_continued": round(sum(rs_cont) / n_cont, 3) if n_cont else None,
+    })
+    if n < 12:
+        out["verdict"] = f"amostra pequena ({n} tocaram TP1) — inconclusivo"
+    elif rate >= 45:
+        out["verdict"] = (f"{rate:.0f}% dos trades que tocaram TP1 seguiram até TP2 "
+                          f"({n_cont}/{n}) — perna TP1→TP2 frequente; pyramiding no BE "
+                          f"teria edge (risco extra ≈ 0). Vale prototipar + backtestar.")
+    else:
+        out["verdict"] = (f"só {rate:.0f}% seguiram TP1→TP2 ({n_cont}/{n}) — continuação "
+                          f"baixa; pyramiding adicionaria size numa perna que raramente "
+                          f"vem. NÃO recomendado agora.")
+    return out
+
+
+async def _hedge_by_regime(days: int) -> Dict[str, Any]:
+    """#C — EVIDÊNCIA pró/contra hedge em regime adverso. Hoje, em RISK_OFF/
+    ALT_DANGER, o sistema só PARA de abrir long. Esta análise mede, nos regimes
+    de downgrade, como os SHORTS (shadow) se saíram: se tiveram avg_R positivo,
+    um hedge short com parte do budget teria protegido/lucrado na queda. Usa o
+    regime tagueado em features['regime'] (acumula desde o deploy #A). Read-only."""
+    DOWNGRADE = {"RISK_OFF", "ALT_DANGER", "BTC_DOMINANT", "ALT_RISK_OFF"}
+    out: Dict[str, Any] = {
+        "window_days": days, "downgrade_regimes": sorted(DOWNGRADE),
+        "short": {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": 0.0},
+        "long": {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": 0.0},
+        "n_tagged": 0, "verdict": None,
+    }
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        from db import get_session
+        from models.recommendation_snapshot import RecommendationSnapshot
+        async with get_session() as session:
+            rows = list((await session.execute(
+                select(RecommendationSnapshot.direction,
+                       RecommendationSnapshot.status,
+                       RecommendationSnapshot.realized_r,
+                       RecommendationSnapshot.features)
+                .where(RecommendationSnapshot.status.in_(_SNAP_RESOLVED))
+                .where(_calib._not_fast_void())
+                .where(RecommendationSnapshot.outcome_at >= since)
+            )).all())
+    except Exception as e:
+        log.warning(f"[assertiveness] hedge_by_regime read falhou: {e}")
+        return out
+
+    def _agg(items):
+        n = len(items)
+        if n == 0:
+            return {"count": 0, "win_rate_pct": None, "avg_r": None, "sum_r": 0.0}
+        rs = [float(r or 0) for _, r in items]
+        wins = sum(1 for st, _ in items if st in _SNAP_WIN)
+        return {"count": n, "win_rate_pct": round(wins / n * 100, 1),
+                "avg_r": round(sum(rs) / n, 3), "sum_r": round(sum(rs), 2)}
+
+    longs, shorts = [], []
+    tagged = 0
+    for direction, st, r, feats in rows:
+        label = feats.get("regime") if isinstance(feats, dict) else None
+        if label not in DOWNGRADE:
+            continue
+        tagged += 1
+        if str(direction).lower() == "short":
+            shorts.append((st, r))
+        else:
+            longs.append((st, r))
+    out["short"] = _agg(shorts)
+    out["long"] = _agg(longs)
+    out["n_tagged"] = tagged
+    ash = out["short"]["avg_r"]
+    ns = out["short"]["count"]
+    if tagged == 0:
+        out["verdict"] = ("nenhum resolvido com regime de downgrade tagueado ainda — "
+                          "amostra acumula desde o deploy do tagueamento de regime")
+    elif ns < 10 or ash is None:
+        out["verdict"] = f"poucos shorts em regime adverso ({ns}) — inconclusivo"
+    elif ash > 0:
+        out["verdict"] = (f"shorts em regime adverso renderam avg_R {ash:+.2f} em {ns} setups "
+                          f"(soma {out['short']['sum_r']:+.1f}R) — hedge short teria protegido/lucrado. "
+                          f"Vale prototipar com parte do budget + backtestar.")
+    else:
+        out["verdict"] = (f"shorts em regime adverso renderam avg_R {ash:+.2f} em {ns} setups — "
+                          f"hedge short NÃO teve edge na janela; melhor só reduzir long (já feito).")
     return out
 
 
@@ -1095,6 +1339,8 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     regime = await _regime_audit(days)
     gate_counterfactual = await _gate_counterfactual(days)
     trade_journal = await _trade_journal(days)
+    pyramiding = await _pyramiding_opportunity(days)
+    hedge_regime = await _hedge_by_regime(days)
     return {
         "enabled": True,
         "window_days": days,
@@ -1111,5 +1357,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "regime": regime,
         "gate_counterfactual": gate_counterfactual,
         "trade_journal": trade_journal,
+        "pyramiding_opportunity": pyramiding,
+        "hedge_by_regime": hedge_regime,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
