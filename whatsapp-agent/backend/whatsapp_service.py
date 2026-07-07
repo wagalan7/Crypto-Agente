@@ -65,7 +65,8 @@ async def check_connection(tenant: dict) -> dict:
     provider = tenant.get("whatsapp_provider", "mock")
     if provider == "zapi":
         st = await get_zapi_status(tenant)
-        return {"ok": st.get("ok", False), "connected": st.get("connected"), "error": st.get("error", "")}
+        return {"ok": st.get("ok", False), "connected": st.get("connected"),
+                "error": st.get("error", ""), "raw": st.get("raw")}
     if provider == "evolution":
         base = (tenant.get("evolution_url") or "").rstrip("/")
         inst = tenant.get("evolution_instance", "")
