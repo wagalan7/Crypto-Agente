@@ -3296,6 +3296,7 @@ class AdminTenantAction(BaseModel):
     free_until: Optional[str] = None    # ISO date
     plan: Optional[str] = None          # mensal/semestral/anual
     status: Optional[str] = None        # active/suspended
+    zapi_expires_at: Optional[str] = None  # AAAA-MM-DD (vencimento do Z-API) ou "" p/ limpar
 
 
 @app.post("/painel/api/tenant/{slug}/action")
@@ -3316,6 +3317,14 @@ def painel_api_tenant_action(slug: str, body: AdminTenantAction, request: Reques
         updates["plan"] = body.plan
     if body.free_until is not None:
         updates["free_until"] = body.free_until or None
+    if body.zapi_expires_at is not None:
+        val = (body.zapi_expires_at or "").strip() or None
+        if val:
+            try:
+                datetime.fromisoformat(val[:10])
+            except Exception:
+                raise HTTPException(status_code=400, detail="Vencimento Z-API inválido (use AAAA-MM-DD).")
+        updates["zapi_expires_at"] = val
 
     if not updates:
         raise HTTPException(status_code=400, detail="Nada para atualizar.")

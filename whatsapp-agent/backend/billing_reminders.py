@@ -162,6 +162,23 @@ def _zapi_text(tenant: dict, due: date, dias: int) -> str:
     )
 
 
+def _zapi_email(tenant: dict, due: date, dias: int) -> tuple[str, str, str]:
+    nome = (tenant.get("psychologist_name") or "").split()[0] if tenant.get("psychologist_name") else ""
+    saud = f"Olá, {nome}!" if nome else "Olá!"
+    quando = "hoje" if dias == 0 else ("amanhã" if dias == 1 else f"em {dias} dias")
+    subject = f"⏰ Sua assinatura do WhatsApp (Z-API) vence {quando} ({_br_date(due)})"
+    html = (
+        f"<p>{saud}</p>"
+        f"<p>Passando para lembrar que a <strong>assinatura do seu WhatsApp (Z-API)</strong> "
+        f"vence {quando} (<strong>{_br_date(due)}</strong>).</p>"
+        f"<p>Para o seu agente continuar respondendo aos pacientes sem interrupção, "
+        f"renove a assinatura antes do vencimento. 🌸</p>"
+    )
+    text = (f"{saud} Sua assinatura do WhatsApp (Z-API) vence {quando} ({_br_date(due)}). "
+            f"Renove antes do vencimento para não interromper o atendimento.")
+    return subject, html, text
+
+
 # ── Varreduras ────────────────────────────────────────────────────────────────
 
 async def _scan_op_bills(today: date, window: int) -> list[dict]:
@@ -214,18 +231,37 @@ async def _scan_zapi(today: date, window: int) -> list[dict]:
             if db.bill_reminder_already_sent("zapi", tenant["id"], due.isoformat()):
                 continue
             phone = (tenant.get("psychologist_phone") or "").strip()
-            if not phone:
-                logger.warning(f"[billing-reminder] {tenant['slug']}: zapi vence {due} mas sem psychologist_phone")
+            email = (tenant.get("email") or "").strip()
+
+            # Canal 1: WhatsApp da própria psicóloga (ainda ativo — avisamos ANTES).
+            wa_ok = False
+            if phone:
+                try:
+                    wa_ok = await wa.send_message(tenant, phone, _zapi_text(tenant, due, dias))
+                except Exception as e:
+                    logger.warning(f"[billing-reminder] {tenant['slug']}: falha WhatsApp Z-API: {e}")
+
+            # Canal 2: e-mail de BACKUP — não depende do Z-API que está vencendo.
+            mail_ok = False
+            if email:
+                try:
+                    subj, html, txt = _zapi_email(tenant, due, dias)
+                    mail_ok = email_service.send_email(email, subj, html, txt)
+                except Exception as e:
+                    logger.warning(f"[billing-reminder] {tenant['slug']}: falha e-mail Z-API: {e}")
+
+            if not phone and not email:
+                logger.warning(f"[billing-reminder] {tenant['slug']}: zapi vence {due} mas sem WhatsApp nem e-mail")
                 continue
-            try:
-                wa_ok = await wa.send_message(tenant, phone, _zapi_text(tenant, due, dias))
-            except Exception as e:
-                logger.warning(f"[billing-reminder] {tenant['slug']}: falha WhatsApp Z-API: {e}")
-                wa_ok = False
-            if wa_ok:
-                db.mark_bill_reminder_sent("zapi", tenant["id"], due.isoformat(), "whatsapp")
-                logger.info(f"[billing-reminder] ✓ zapi {tenant['slug']} venc {due}")
-                results.append({"kind": "zapi", "tenant": tenant["slug"], "due": due.isoformat(), "whatsapp": True})
+
+            if wa_ok or mail_ok:
+                ch = ("whatsapp" if wa_ok else "") + ("+email" if mail_ok else "")
+                db.mark_bill_reminder_sent("zapi", tenant["id"], due.isoformat(), ch.strip("+"))
+                logger.info(f"[billing-reminder] ✓ zapi {tenant['slug']} venc {due} (wa={wa_ok} mail={mail_ok})")
+                results.append({"kind": "zapi", "tenant": tenant["slug"], "due": due.isoformat(),
+                                "whatsapp": wa_ok, "email": mail_ok})
+            else:
+                logger.warning(f"[billing-reminder] ✗ zapi {tenant['slug']} venc {due} — nenhum canal enviou")
     return results
 
 

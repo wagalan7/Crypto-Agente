@@ -132,6 +132,7 @@
             <th class="p-3">Plano / Status</th>
             <th class="p-3">Vence</th>
             <th class="p-3">Free até</th>
+            <th class="p-3">Z-API vence</th>
             <th class="p-3">Ações</th>
           </tr>
         </thead>
@@ -248,6 +249,11 @@
         <label class="text-sm font-medium text-gray-700">Free até (YYYY-MM-DD)</label>
         <input id="m-free" type="date" class="w-full mt-1 border border-slate-300 rounded-lg p-2 text-sm">
       </div>
+      <div>
+        <label class="text-sm font-medium text-gray-700">Vencimento Z-API</label>
+        <input id="m-zapi" type="date" class="w-full mt-1 border border-slate-300 rounded-lg p-2 text-sm">
+        <p class="text-xs text-slate-400 mt-1">Preencha para ativar o aviso automático 5 dias antes do vencimento.</p>
+      </div>
     </div>
     <div class="flex justify-end gap-2 mt-5">
       <button onclick="closeModal()" class="px-4 py-2 text-sm rounded-lg border border-slate-300">Cancelar</button>
@@ -350,11 +356,12 @@ async function loadTenants() {
       <td class="p-3">${t.plan||'—'}<br>${badge(t.status)}</td>
       <td class="p-3 text-xs">${fmtDate(t.plan_expires_at)}</td>
       <td class="p-3 text-xs">${fmtDate(t.free_until)}</td>
+      <td class="p-3 text-xs">${t.zapi_expires_at ? fmtDate(t.zapi_expires_at) : '<span class="text-amber-600" title="Sem data: o aviso de vencimento nunca dispara">⚠ não definido</span>'}</td>
       <td class="p-3">
-        <button onclick='openModal(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)})' class="text-xs bg-slate-100 hover:bg-slate-200 px-2 py-1 rounded">Editar</button>
+        <button onclick='openModal(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)}, ${JSON.stringify(t.zapi_expires_at||"")})' class="text-xs bg-slate-100 hover:bg-slate-200 px-2 py-1 rounded">Editar</button>
         ${t.dashboard_url ? `<a href="${t.dashboard_url}" target="_blank" class="text-xs text-violet-600 hover:underline ml-2">Dashboard</a>` : ''}
       </td>
-    </tr>`).join('') || '<tr><td colspan="6" class="p-6 text-center text-slate-400">Nenhum consultório.</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="7" class="p-6 text-center text-slate-400">Nenhum consultório.</td></tr>';
 }
 
 async function loadContent() {
@@ -395,13 +402,14 @@ function copyLink(url) {
 }
 
 let currentSlug = null;
-function openModal(slug, name) {
+function openModal(slug, name, zapiExpires) {
   currentSlug = slug;
   document.getElementById('modal-title').textContent = 'Editar ' + name;
   document.getElementById('modal-sub').textContent = slug;
   document.getElementById('m-status').value = '';
   document.getElementById('m-plan').value = '';
   document.getElementById('m-free').value = '';
+  document.getElementById('m-zapi').value = (zapiExpires || '').slice(0, 10);
   document.getElementById('modal').classList.remove('hidden');
 }
 function closeModal() { document.getElementById('modal').classList.add('hidden'); }
@@ -410,10 +418,13 @@ async function saveAction() {
   const st = document.getElementById('m-status').value;
   const pl = document.getElementById('m-plan').value;
   const fr = document.getElementById('m-free').value;
+  const zp = document.getElementById('m-zapi').value;
   if (st) body.status = st;
   if (pl) body.plan = pl;
   if (fr) body.free_until = fr;
-  if (Object.keys(body).length === 0) { alert('Nada para alterar.'); return; }
+  // Sempre envia o vencimento Z-API (permite limpar deixando o campo vazio)
+  body.zapi_expires_at = zp || '';
+  if (!st && !pl && !fr && !zp) { alert('Nada para alterar.'); return; }
   try {
     await api(`/painel/api/tenant/${currentSlug}/action`, {
       method: 'POST',

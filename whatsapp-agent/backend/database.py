@@ -2011,6 +2011,7 @@ def admin_list_all_tenants() -> list[dict]:
         rows = conn.execute("""
             SELECT id, slug, name, full_name, email, phone, cpf_cnpj,
                    psychologist_name, plan, status, plan_expires_at, free_until,
+                   zapi_expires_at,
                    billing_city, billing_state, created_at,
                    stripe_subscription_id, mp_subscription_id, dashboard_token, setup_token
             FROM tenants
