@@ -2237,7 +2237,7 @@ async function dispararConfirmacoes() {
     if (naoEnviados.length) {
       const motivo = (d) => d.skipped === 'paused' ? 'agente pausado p/ este contato'
                           : d.skipped ? d.skipped
-                          : 'falha no envio (WhatsApp)';
+                          : (d.error || 'falha no envio (WhatsApp)');
       extra = '<br><span class="text-amber-700">Não enviadas:</span><br>' +
         naoEnviados.map(d => `• ${d.patient || d.phone}: ${motivo(d)}`).join('<br>');
     }

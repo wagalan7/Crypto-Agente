@@ -181,6 +181,39 @@ def _followup_message(tenant: dict, appt: dict) -> str:
     )
 
 
+async def _notify_owner_failures(tenant: dict, failures: list, kind: str = "confirmação"):
+    """Avisa a psicóloga, no WhatsApp DELA, quais envios falharam e o motivo REAL.
+    Best-effort: se o próprio WhatsApp estiver desconectado, o aviso também não sai
+    (mas o motivo continua visível no painel)."""
+    try:
+        psy_phone = "".join(c for c in (tenant.get("psychologist_phone") or "") if c.isdigit())
+        if not psy_phone or not failures:
+            return
+        linhas = "\n".join(f"• {nome}: {motivo}" for nome, motivo in failures[:15])
+        n = len(failures)
+        msg = (
+            f"⚠️ *Aviso do seu assistente*\n\n"
+            f"{n} {kind}(ões) de consulta não {'foi' if n == 1 else 'foram'} enviada(s):\n\n"
+            f"{linhas}\n\n"
+            f"Resolva o ponto indicado acima e reenvie pelo painel em "
+            f"*Enviar confirmações agora*."
+        )
+        await wa.send_message(tenant, psy_phone, msg)
+        logger.info(f"[{tenant['slug']}] Psicóloga avisada de {n} falha(s) de {kind}")
+    except Exception as e:
+        logger.warning(f"[{tenant.get('slug')}] Falha ao avisar psicóloga sobre erros: {e}")
+
+
+def _dedup_failures(failures: list) -> list:
+    """Remove duplicatas (mesmo paciente com 2 sessões geraria 2 avisos iguais)."""
+    seen, uniq = set(), []
+    for nome, motivo in failures:
+        if (nome, motivo) not in seen:
+            seen.add((nome, motivo))
+            uniq.append((nome, motivo))
+    return uniq
+
+
 async def _run_confirmations():
     now = datetime.now(_TZ)  # sempre no horário de Brasília
 
@@ -196,34 +229,62 @@ async def _run_confirmations():
             logger.info(f"[{tenant['slug']}] Suspenso — confirmações e followups ignorados")
             continue
 
-        # ── Confirmações com 24h de antecedência ──────────────────────────────
+        # ── Coleta o que precisa enviar (confirmações + followups) ────────────
         appts = db.get_appointments_for_confirmation(tenant["id"])
+        do_followup = now.hour >= _FOLLOWUP_HOUR
+        appts_hoje = db.get_appointments_today_unconfirmed(tenant["id"]) if do_followup else []
+
+        # Motivos de falha REAIS deste consultório (para avisar a psicóloga)
+        failures: list = []
+
+        # ── Checa a conexão UMA vez se há algo a enviar ───────────────────────
+        _disc = ""  # motivo pré-computado se a instância estiver desconectada
+        if appts or appts_hoje:
+            conn = await wa.check_connection(tenant)
+            if conn.get("ok") and conn.get("connected") is False:
+                _disc = ("WhatsApp desconectado — é preciso reconectar "
+                         "(reler o QR Code) no painel")
+
+        # ── Confirmações com 24h de antecedência ──────────────────────────────
         for appt in appts:
             if db.is_agent_paused(tenant["id"], appt["phone"]):
                 logger.info(f"[{tenant['slug']}] ⏸ Confirmação pulada (agente pausado) → {appt['phone']}")
                 continue
+            if _disc:
+                failures.append((appt.get("patient_name") or appt["phone"], _disc))
+                logger.warning(f"[{tenant['slug']}] ✗ Falha confirmação → {appt['phone']}: {_disc}")
+                continue
             msg = _confirmation_message(tenant, appt)
-            sent = await wa.send_message(tenant, appt["phone"], msg)
+            sent, reason = await wa.send_message_ex(tenant, appt["phone"], msg)
             if sent:
                 db.mark_confirmation_sent(appt["id"])
                 logger.info(f"[{tenant['slug']}] ✓ Confirmação 24h → {appt['patient_name']} ({appt['scheduled_at']})")
             else:
-                logger.warning(f"[{tenant['slug']}] ✗ Falha confirmação → {appt['phone']}")
+                failures.append((appt.get("patient_name") or appt["phone"], reason))
+                logger.warning(f"[{tenant['slug']}] ✗ Falha confirmação → {appt['phone']}: {reason}")
 
         # ── Followup no dia (não confirmados) ──────────────────────────────────
-        if now.hour >= _FOLLOWUP_HOUR:
-            appts_hoje = db.get_appointments_today_unconfirmed(tenant["id"])
+        if do_followup:
             for appt in appts_hoje:
                 if db.is_agent_paused(tenant["id"], appt["phone"]):
                     logger.info(f"[{tenant['slug']}] ⏸ Followup pulado (agente pausado) → {appt['phone']}")
                     continue
+                if _disc:
+                    failures.append((appt.get("patient_name") or appt["phone"], _disc))
+                    logger.warning(f"[{tenant['slug']}] ✗ Falha followup → {appt['phone']}: {_disc}")
+                    continue
                 msg = _followup_message(tenant, appt)
-                sent = await wa.send_message(tenant, appt["phone"], msg)
+                sent, reason = await wa.send_message_ex(tenant, appt["phone"], msg)
                 if sent:
                     db.mark_followup_sent(appt["id"])
                     logger.info(f"[{tenant['slug']}] ✓ Followup → {appt['patient_name']}")
                 else:
-                    logger.warning(f"[{tenant['slug']}] ✗ Falha followup → {appt['phone']}")
+                    failures.append((appt.get("patient_name") or appt["phone"], reason))
+                    logger.warning(f"[{tenant['slug']}] ✗ Falha followup → {appt['phone']}: {reason}")
+
+        # ── Avisa a psicóloga (no WhatsApp DELA) sobre as falhas reais ─────────
+        if failures:
+            await _notify_owner_failures(tenant, _dedup_failures(failures))
 
 
 def _billing_message(tenant: dict, patient_name: str, total: float, sessions_count: int) -> str:
@@ -489,14 +550,29 @@ async def run_confirmations_now():
     for tenant in tenants:
         # Confirmações: dia inteiro de amanhã (não a janela estrita 23-25h)
         appts = db.get_pending_confirmations_for_tomorrow(tenant["id"])
+        appts_hoje = db.get_appointments_today_unconfirmed(tenant["id"])
+
+        # Checa a conexão UMA vez se há algo a enviar → motivo real na falha
+        _disc = ""
+        if appts or appts_hoje:
+            conn = await wa.check_connection(tenant)
+            if conn.get("ok") and conn.get("connected") is False:
+                _disc = ("WhatsApp desconectado — é preciso reconectar "
+                         "(reler o QR Code) no painel")
+
         for appt in appts:
             if db.is_agent_paused(tenant["id"], appt["phone"]):
                 results.append({"tenant": tenant["slug"], "patient": appt["patient_name"],
                                 "phone": appt["phone"], "sent": False, "type": "confirmation",
                                 "skipped": "paused"})
                 continue
+            if _disc:
+                results.append({"tenant": tenant["slug"], "patient": appt["patient_name"],
+                                "phone": appt["phone"], "sent": False, "type": "confirmation",
+                                "error": _disc})
+                continue
             msg = _confirmation_message(tenant, appt)
-            sent = await wa.send_message(tenant, appt["phone"], msg)
+            sent, reason = await wa.send_message_ex(tenant, appt["phone"], msg)
             if sent:
                 db.mark_confirmation_sent(appt["id"])
             results.append({
@@ -505,17 +581,22 @@ async def run_confirmations_now():
                 "phone": appt["phone"],
                 "sent": sent,
                 "type": "confirmation",
+                "error": ("" if sent else reason),
             })
         # Followup de hoje
-        appts_hoje = db.get_appointments_today_unconfirmed(tenant["id"])
         for appt in appts_hoje:
             if db.is_agent_paused(tenant["id"], appt["phone"]):
                 results.append({"tenant": tenant["slug"], "patient": appt["patient_name"],
                                 "phone": appt["phone"], "sent": False, "type": "followup",
                                 "skipped": "paused"})
                 continue
+            if _disc:
+                results.append({"tenant": tenant["slug"], "patient": appt["patient_name"],
+                                "phone": appt["phone"], "sent": False, "type": "followup",
+                                "error": _disc})
+                continue
             msg = _followup_message(tenant, appt)
-            sent = await wa.send_message(tenant, appt["phone"], msg)
+            sent, reason = await wa.send_message_ex(tenant, appt["phone"], msg)
             if sent:
                 db.mark_followup_sent(appt["id"])
             results.append({
@@ -524,6 +605,7 @@ async def run_confirmations_now():
                 "phone": appt["phone"],
                 "sent": sent,
                 "type": "followup",
+                "error": ("" if sent else reason),
             })
     return results
 

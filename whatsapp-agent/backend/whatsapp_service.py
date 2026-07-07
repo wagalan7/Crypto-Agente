@@ -10,22 +10,90 @@ logger = logging.getLogger(__name__)
 
 
 async def send_message(tenant: dict, phone: str, text: str) -> bool:
+    ok, _reason = await send_message_ex(tenant, phone, text)
+    return ok
+
+
+async def send_message_ex(tenant: dict, phone: str, text: str) -> tuple[bool, str]:
+    """Como send_message, mas devolve (ok, motivo) — o motivo REAL da falha,
+    já traduzido para português, em vez de apenas True/False."""
     provider = tenant.get("whatsapp_provider", "mock")
     if provider == "evolution":
-        return await _send_evolution(tenant, phone, text)
+        return await _send_evolution_ex(tenant, phone, text)
     elif provider == "zapi":
-        return await _send_zapi(tenant, phone, text)
+        return await _send_zapi_ex(tenant, phone, text)
     elif provider == "twilio":
-        return await _send_twilio(tenant, phone, text)
+        ok = await _send_twilio(tenant, phone, text)
+        return ok, ("" if ok else "falha no envio via Twilio")
     else:
         logger.info(f"[MOCK][{tenant['slug']}] → {phone}: {text}")
-        return True
+        return True, ""
+
+
+def _humanize_send_error(code: int, body: str) -> str:
+    """Traduz a resposta crua do provedor (Z-API/Evolution) num motivo claro."""
+    b = (body or "").lower()
+    # WhatsApp desconectado / instância offline
+    if any(k in b for k in (
+        "not connected", "disconnected", "desconect", "não conectado", "nao conectado",
+        "you are not connected", "need to be connected", "phone not connected",
+        "instance not connected", "smartphone", "não está conectado", "not paired",
+    )):
+        return "WhatsApp desconectado — é preciso reconectar (reler o QR) no painel"
+    # Número não é WhatsApp / inválido
+    if any(k in b for k in (
+        "not exist", "does not exist", "not found", "invalid phone", "invalid number",
+        "número inválido", "numero invalido", "nao existe", "não existe", "not a valid",
+        "is not on whatsapp", "not a whatsapp", "phone not exists", "número não existe",
+    )):
+        return "o número do paciente não está no WhatsApp (confira o telefone cadastrado)"
+    # Credenciais
+    if code in (401, 403) or any(k in b for k in ("unauthorized", "forbidden", "invalid token", "apikey")):
+        return "credenciais do WhatsApp inválidas (verifique a conexão no painel)"
+    # Limite / saldo
+    if code == 429 or any(k in b for k in ("limit", "quota", "billing", "payment", "saldo", "expired")):
+        return "limite ou saldo do provedor de WhatsApp atingido (verifique sua conta)"
+    if code == 404:
+        return "instância do WhatsApp não encontrada (verifique a conexão no painel)"
+    snippet = (body or "").strip().replace("\n", " ")[:140]
+    return f"o provedor recusou o envio (HTTP {code})" + (f": {snippet}" if snippet else "")
+
+
+async def check_connection(tenant: dict) -> dict:
+    """Verifica se o WhatsApp do consultório está conectado, de forma read-only.
+    Retorna {"ok": conseguiu falar c/ provedor, "connected": True/False/None, "error": str}."""
+    provider = tenant.get("whatsapp_provider", "mock")
+    if provider == "zapi":
+        st = await get_zapi_status(tenant)
+        return {"ok": st.get("ok", False), "connected": st.get("connected"), "error": st.get("error", "")}
+    if provider == "evolution":
+        base = (tenant.get("evolution_url") or "").rstrip("/")
+        inst = tenant.get("evolution_instance", "")
+        key = tenant.get("evolution_key", "")
+        if not base or not inst or not key:
+            return {"ok": False, "connected": None, "error": "Evolution não configurado"}
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(f"{base}/instance/connectionState/{inst}",
+                                     headers={"apikey": key})
+                if r.status_code >= 400:
+                    return {"ok": False, "connected": None, "error": f"HTTP {r.status_code}"}
+                data = r.json() or {}
+                state = ((data.get("instance") or {}).get("state")) or data.get("state")
+                return {"ok": True, "connected": (state == "open"), "error": ""}
+        except Exception as e:
+            return {"ok": False, "connected": None, "error": str(e)[:120]}
+    if provider == "mock":
+        return {"ok": True, "connected": True, "error": ""}
+    return {"ok": True, "connected": None, "error": ""}
 
 
 # ── Evolution API ──────────────────────────────────────────────────────────────
 
-async def _send_evolution(tenant: dict, phone: str, text: str) -> bool:
+async def _send_evolution_ex(tenant: dict, phone: str, text: str) -> tuple[bool, str]:
     base = (tenant.get("evolution_url") or "").rstrip("/")
+    if not base or not tenant.get("evolution_instance") or not tenant.get("evolution_key"):
+        return False, "WhatsApp (Evolution) não configurado"
     url = f"{base}/message/sendText/{tenant['evolution_instance']}"
     headers = {"apikey": tenant["evolution_key"], "Content-Type": "application/json"}
     number = _normalize_phone(phone)
@@ -38,11 +106,20 @@ async def _send_evolution(tenant: dict, phone: str, text: str) -> bool:
             r = await client.post(url, json=payload_v2, headers=headers)
             if r.status_code in (400, 422):
                 r = await client.post(url, json=payload_v1, headers=headers)
-            r.raise_for_status()
-            return True
+            if r.status_code >= 400:
+                return False, _humanize_send_error(r.status_code, (r.text or "")[:300])
+            return True, ""
+    except httpx.TimeoutException:
+        return False, "o WhatsApp não respondeu a tempo (tente novamente em instantes)"
     except Exception as e:
-        logger.error(f"[{tenant['slug']}] Evolution error: {e}")
-        return False
+        return False, f"erro de conexão com o WhatsApp: {str(e)[:120]}"
+
+
+async def _send_evolution(tenant: dict, phone: str, text: str) -> bool:
+    ok, reason = await _send_evolution_ex(tenant, phone, text)
+    if not ok:
+        logger.error(f"[{tenant['slug']}] Evolution error: {reason}")
+    return ok
 
 
 def extract_message_evolution(payload: dict) -> tuple[str, str] | None:
@@ -70,9 +147,18 @@ async def _send_zapi(tenant: dict, phone: str, text: str) -> bool:
     POST https://api.z-api.io/instances/{instance_id}/token/{token}/send-text
     Body: {"phone": "5511999990000", "message": "texto"}
     """
+    ok, reason = await _send_zapi_ex(tenant, phone, text)
+    if not ok:
+        logger.error(f"[{tenant['slug']}] Z-API error: {reason}")
+    return ok
+
+
+async def _send_zapi_ex(tenant: dict, phone: str, text: str) -> tuple[bool, str]:
     instance_id = tenant.get("evolution_instance", "")
     token = tenant.get("evolution_key", "")
     client_token = tenant.get("evolution_url", "")  # optional security header
+    if not instance_id or not token:
+        return False, "WhatsApp (Z-API) não configurado"
 
     url = f"https://api.z-api.io/instances/{instance_id}/token/{token}/send-text"
     headers = {"Content-Type": "application/json"}
@@ -83,11 +169,21 @@ async def _send_zapi(tenant: dict, phone: str, text: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(url, json=payload, headers=headers)
-            r.raise_for_status()
-            return True
+            body = (r.text or "")[:300]
+            if r.status_code >= 400:
+                return False, _humanize_send_error(r.status_code, body)
+            # A Z-API às vezes responde 200 com um campo "error" no corpo.
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            if isinstance(data, dict) and data.get("error"):
+                return False, _humanize_send_error(200, str(data.get("error")))
+            return True, ""
+    except httpx.TimeoutException:
+        return False, "o WhatsApp não respondeu a tempo (tente novamente em instantes)"
     except Exception as e:
-        logger.error(f"[{tenant['slug']}] Z-API error: {e}")
-        return False
+        return False, f"erro de conexão com o WhatsApp: {str(e)[:120]}"
 
 
 async def get_zapi_status(tenant: dict) -> dict:

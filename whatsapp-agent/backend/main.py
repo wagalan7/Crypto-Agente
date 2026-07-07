@@ -2472,6 +2472,38 @@ async def disparar_confirmacoes(request: Request):
     return {"enviados": len([r for r in results if r["sent"]]), "detalhes": results}
 
 
+@app.get("/dashboard/api/whatsapp/diagnose")
+async def diagnose_whatsapp(request: Request):
+    """Diagnóstico read-only (NÃO envia nada) do WhatsApp de UM consultório.
+    Ação do dashboard: exige token de painel válido. Mostra o motivo REAL por
+    trás de 'falha no envio': provedor, se a instância está conectada, e os
+    números das confirmações pendentes de amanhã (já normalizados)."""
+    token = request.headers.get("X-Dashboard-Token", "") or request.query_params.get("token", "")
+    tenant = _get_tenant_by_token(token)  # 403 se inválido
+
+    conn = await wa.check_connection(tenant)
+
+    pendentes = []
+    try:
+        for appt in db.get_pending_confirmations_for_tomorrow(tenant["id"]):
+            raw = appt.get("phone") or ""
+            pendentes.append({
+                "patient": appt.get("patient_name"),
+                "phone_cadastrado": raw,
+                "phone_normalizado": wa._normalize_phone(raw),
+                "agente_pausado": db.is_agent_paused(tenant["id"], raw),
+            })
+    except Exception as e:
+        logger.warning(f"[diagnose] falha ao listar pendentes: {e}")
+
+    return {
+        "consultorio": tenant.get("slug"),
+        "provider": tenant.get("whatsapp_provider"),
+        "conexao": conn,  # {ok, connected, error}
+        "pendentes_amanha": pendentes,
+    }
+
+
 @app.post("/admin/security/encrypt-existing")
 def encrypt_existing_data(include_conversations: bool = False):
     """Cifra em repouso os dados legados (texto puro) já gravados. Idempotente.
