@@ -721,6 +721,33 @@ LIQ_TIER_MULT_MIN = float(os.getenv("LIQ_TIER_MULT_MIN", "0.35"))   # <$3M (rank
 REGIME_SIZING_ENABLED = os.getenv("REGIME_SIZING_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 REGIME_SIZE_MULT_ALT_LONG = float(os.getenv("REGIME_SIZE_MULT_ALT_LONG", "0.5"))  # long de alt em regime adverso
 
+# ── Feature 5: pyramiding (reforço de winner pós-TP1) ───────────────────────
+# Quando ON, se já existe um trade aberto na MESMA direção JÁ em breakeven
+# (phase=='post_tp1', ou seja bateu TP1 e o SL foi pro BE) e o preço andou a
+# favor ≥ PYRAMIDING_MIN_PROFIT_R, o bot AUMENTA a posição in-place (one-way
+# netting: mesma direção nets/média) em vez de abrir uma duplicata, e re-
+# bracketa a posição combinada. Cada reforço incrementa pyramiding_level; teto
+# PYRAMIDING_MAX_LEVEL. O tamanho do reforço é PYRAMIDING_SIZE_MULT × qty da
+# nova rec. DEFAULT OFF (NO-OP) — hoje o same_dir pós-TP1 só é ignorado.
+PYRAMIDING_ENABLED = os.getenv("PYRAMIDING_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+PYRAMIDING_MAX_LEVEL = int(os.getenv("PYRAMIDING_MAX_LEVEL", "1"))          # reforços máx por trade
+PYRAMIDING_SIZE_MULT = float(os.getenv("PYRAMIDING_SIZE_MULT", "0.5"))      # qty reforço = mult × qty nova rec
+PYRAMIDING_MIN_PROFIT_R = float(os.getenv("PYRAMIDING_MIN_PROFIT_R", "1.0"))  # lucro mín (em R) p/ reforçar
+
+# ── Feature 5: hedge de regime adverso (short de BTC) ───────────────────────
+# Quando ON e o regime está adverso (RISK_OFF / ALT_DANGER) COM longs de alt
+# abertos, o bot abre UM short de BTC como hedge macro (instrumento diferente —
+# one-way netting impede long+short no mesmo símbolo). Size = REGIME_HEDGE_SIZE_PCT
+# do notional agregado dos longs de alt, com teto REGIME_HEDGE_MAX_NOTIONAL_USD.
+# SL/TP fixos em % (REGIME_HEDGE_SL_PCT / _TP_PCT). Um único hedge por vez
+# (marcado por hedge_for). DEFAULT OFF (NO-OP).
+REGIME_HEDGE_ENABLED = os.getenv("REGIME_HEDGE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+REGIME_HEDGE_SYMBOL = os.getenv("REGIME_HEDGE_SYMBOL", "BTC/USDT:USDT").strip()
+REGIME_HEDGE_SIZE_PCT = float(os.getenv("REGIME_HEDGE_SIZE_PCT", "0.3"))    # % do notional agregado de longs de alt
+REGIME_HEDGE_MAX_NOTIONAL_USD = float(os.getenv("REGIME_HEDGE_MAX_NOTIONAL_USD", "500"))
+REGIME_HEDGE_SL_PCT = float(os.getenv("REGIME_HEDGE_SL_PCT", "0.02"))       # 2% acima da entrada (short)
+REGIME_HEDGE_TP_PCT = float(os.getenv("REGIME_HEDGE_TP_PCT", "0.04"))       # 4% abaixo da entrada (short)
+
 # ── Filler FORA da allowlist (modelo de slots) ──────────────────────────────
 # Quando ligado, o bot pode abrir posições FORA da allowlist de execução como
 # FILLER de slot ocioso: só tier A/A+ (tier B já é cortado antes), teto de
@@ -2692,6 +2719,313 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
         return False
 
 
+# ── Feature 5 helpers: pyramiding + hedge de regime ─────────────────────────
+
+
+async def _maybe_pyramid(same_dir, rec: dict) -> bool:
+    """
+    Feature 5 — reforço (pyramiding) de um winner já em breakeven pós-TP1.
+
+    Quando ON (PYRAMIDING_ENABLED) e a nova rec chega na MESMA direção de um
+    trade que JÁ bateu TP1 (phase=='post_tp1') e o preço andou a favor
+    ≥ PYRAMIDING_MIN_PROFIT_R, AUMENTA a posição in-place (one-way netting:
+    mesma direção nets/média) em vez de abrir uma duplicata.
+
+    NÃO re-bracketa: o SL@BE e o TP2 do trade original são STOP_MARKET /
+    TAKE_PROFIT_MARKET com closePosition=true — cobrem automaticamente a
+    posição aumentada. Só incrementa qty + pyramiding_level no DB.
+
+    Nota de contabilidade: entry_price NÃO é misturado (fica o original), então
+    o R do trade piramidado é aproximado — a nota do trade marca isso.
+
+    Retorna True se reforçou (o caller registra e segue sem abrir duplicata);
+    False se não reforçou.
+    """
+    if not PYRAMIDING_ENABLED:
+        return False
+    from services import exchange_service
+    from sqlalchemy import select
+    from datetime import datetime, timezone
+    from db import get_session
+    from models.real_trade import RealTrade
+
+    symbol = same_dir.symbol
+    try:
+        # 1. Só reforça winner já protegido no BE (pós-TP1)
+        if (getattr(same_dir, "phase", None) or "pre_tp1") != "post_tp1":
+            return False
+        level = int(getattr(same_dir, "pyramiding_level", 0) or 0)
+        if level >= PYRAMIDING_MAX_LEVEL:
+            log.debug(f"[pyramid] {symbol} #{same_dir.id} já no teto (level={level})")
+            return False
+
+        # 2. Lucro atual em R (aprox). Risco/unidade = |entry − stop original|;
+        #    se o stop já colou no BE (≈entry), cai pro |entry − stop da nova rec|.
+        entry = float(same_dir.entry_price or 0)
+        mark = await _get_mark_price(symbol)
+        if entry <= 0 or mark <= 0:
+            return False
+        is_long = same_dir.side == "long"
+        profit = (mark - entry) if is_long else (entry - mark)
+        risk_unit = abs(entry - float(same_dir.planned_stop or 0))
+        if risk_unit <= entry * 1e-4:  # stop no BE → usa risco da nova rec
+            r_entry = float(rec.get("entry") or 0)
+            r_stop = float(rec.get("stop_loss") or 0)
+            risk_unit = abs(r_entry - r_stop)
+        if risk_unit <= 0:
+            return False
+        profit_r = profit / risk_unit
+        if profit_r < PYRAMIDING_MIN_PROFIT_R:
+            log.debug(
+                f"[pyramid] {symbol} #{same_dir.id} lucro {profit_r:.2f}R "
+                f"< {PYRAMIDING_MIN_PROFIT_R}R — não reforça"
+            )
+            return False
+
+        # 3. Tamanho do reforço = mult × tamanho ORIGINAL do trade
+        base_qty = float(getattr(same_dir, "qty_initial", None) or same_dir.qty or 0)
+        add_qty = base_qty * PYRAMIDING_SIZE_MULT
+        if add_qty <= 0:
+            return False
+
+        # 4. Ordem a mercado na MESMA direção (nets in-place). SEM stop/tp — o
+        #    SL@BE e o TP2 (closePosition=true) do trade original cobrem tudo.
+        exch_side = "Buy" if is_long else "Sell"
+        order_res = await exchange_service.place_order(
+            symbol=symbol,
+            side=exch_side,
+            qty=add_qty,
+            order_type="Market",
+            leverage=int(same_dir.leverage or 1),
+            client_order_id=f"cw-pyr-{same_dir.id}-{level + 1}",
+        )
+        if not order_res.get("ok"):
+            log.error(
+                f"[pyramid] {symbol} #{same_dir.id} reforço falhou: "
+                f"{order_res.get('msg') or order_res.get('error')}"
+            )
+            return False
+
+        result = order_res.get("result") or {}
+        try:
+            fill = float(result.get("avgPrice") or result.get("avgFillPrice") or 0)
+        except Exception:
+            fill = 0.0
+
+        # 5. Atualiza DB: qty combinada + level + nota. NÃO altera entry_price.
+        new_qty_combined = float(same_dir.qty or 0) + add_qty
+        if DB_ENABLED:
+            async with get_session() as session:
+                fresh = (await session.execute(
+                    select(RealTrade).where(RealTrade.id == same_dir.id)
+                )).scalar_one_or_none()
+                if fresh is not None:
+                    fresh.qty = new_qty_combined
+                    fresh.pyramiding_level = level + 1
+                    tag = (f"pyramid L{level + 1} +{add_qty:g}@{fill or mark:g} "
+                           f"({profit_r:.2f}R; R aprox—entry não misturado)")
+                    fresh.notes = (fresh.notes + " | " + tag) if fresh.notes else tag
+                    fresh.updated_at = datetime.now(timezone.utc)
+                    await session.commit()
+
+        log.info(
+            f"[pyramid] {symbol} #{same_dir.id} REFORÇADO L{level + 1} "
+            f"+{add_qty:g} (lucro {profit_r:.2f}R); SL@BE/TP2 closePosition cobrem a posição maior"
+        )
+        try:
+            from services import push_service
+            _sym = symbol.split("/")[0]
+            await push_service.notify_alert(
+                title=f"🔺 {_sym}: posição reforçada (pyramiding L{level + 1})",
+                body=(f"Winner a +{profit_r:.2f}R reforçado com +{add_qty:g}. "
+                      f"SL segue no BE cobrindo a posição inteira."),
+                tag=f"pyr-{same_dir.id}-{level + 1}",
+            )
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        log.error(
+            f"[pyramid] erro reforçando #{getattr(same_dir, 'id', '?')} {symbol}: {e}",
+            exc_info=True,
+        )
+        return False
+
+
+async def _maybe_regime_hedge(regime: dict) -> bool:
+    """
+    Feature 5 — hedge de regime adverso (short de BTC protegendo longs de alt).
+
+    Quando ON (REGIME_HEDGE_ENABLED) e o regime está adverso (RISK_OFF /
+    ALT_DANGER / ALT_RISK_OFF) COM longs de alt abertos, abre UM short de BTC
+    como hedge macro. one-way netting impede long+short no mesmo símbolo → o
+    hedge é num instrumento diferente (BTC), não nas próprias alts.
+
+    Size = REGIME_HEDGE_SIZE_PCT do notional agregado dos longs de alt, com teto
+    REGIME_HEDGE_MAX_NOTIONAL_USD. SL/TP fixos em %. Um único hedge por vez
+    (marcado por hedge_for). Chamado 1×/lote.
+
+    Retorna True se abriu um hedge, False senão.
+    """
+    if not REGIME_HEDGE_ENABLED or not DB_ENABLED:
+        return False
+    from services import exchange_service
+    from sqlalchemy import select
+    from datetime import datetime, timezone
+    from db import get_session
+    from models.real_trade import RealTrade
+
+    try:
+        state = str((regime or {}).get("regime") or "").upper()
+        if state not in ("RISK_OFF", "ALT_DANGER", "ALT_RISK_OFF"):
+            return False
+
+        hedge_base = _symbol_base(REGIME_HEDGE_SYMBOL)  # normalmente "BTC"
+
+        async with get_session() as session:
+            # 1. Já existe hedge aberto? (um por vez)
+            existing = (await session.execute(
+                select(RealTrade.id)
+                .where(RealTrade.status == "open")
+                .where(RealTrade.hedge_for.isnot(None))
+                .limit(1)
+            )).scalar_one_or_none()
+            if existing is not None:
+                log.debug(f"[regime-hedge] já há hedge aberto #{existing} — skip")
+                return False
+
+            # 2. Longs de alt abertos (exclui o próprio BTC e hedges)
+            rows = (await session.execute(
+                select(
+                    RealTrade.symbol, RealTrade.notional_usd,
+                    RealTrade.qty, RealTrade.entry_price,
+                )
+                .where(RealTrade.status == "open")
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.side == "long")
+                .where(RealTrade.hedge_for.is_(None))
+            )).all()
+
+        agg_notional = 0.0
+        n_alt = 0
+        for sym, notional, q, ep in rows:
+            if _symbol_base(sym or "") == hedge_base:
+                continue  # long de BTC não é "alt" a proteger
+            val = float(notional or 0) or (float(q or 0) * float(ep or 0))
+            if val > 0:
+                agg_notional += val
+                n_alt += 1
+
+        if n_alt == 0 or agg_notional <= 0:
+            log.debug("[regime-hedge] sem longs de alt abertos — nada a proteger")
+            return False
+
+        # 3. Tamanho do hedge (fração do agregado, com teto)
+        hedge_notional = min(
+            agg_notional * REGIME_HEDGE_SIZE_PCT, REGIME_HEDGE_MAX_NOTIONAL_USD
+        )
+        if hedge_notional <= 0:
+            return False
+
+        mark = await _get_mark_price(REGIME_HEDGE_SYMBOL)
+        if mark <= 0:
+            log.warning(f"[regime-hedge] mark de {REGIME_HEDGE_SYMBOL} indisponível — aborta")
+            return False
+        qty = hedge_notional / mark
+        if qty <= 0:
+            return False
+
+        # 4. Níveis do short: SL acima, TP abaixo
+        stop = mark * (1.0 + REGIME_HEDGE_SL_PCT)
+        tp2 = mark * (1.0 - REGIME_HEDGE_TP_PCT)
+
+        # 5. Ordem short com bracket SL/TP (closePosition)
+        client_order_id = f"cw-hedge-{int(datetime.now(timezone.utc).timestamp())}"
+        order_res = await exchange_service.place_order(
+            symbol=REGIME_HEDGE_SYMBOL,
+            side="Sell",
+            qty=qty,
+            order_type="Market",
+            stop_loss=stop,
+            take_profit=tp2,
+            leverage=1,
+            client_order_id=client_order_id,
+        )
+        if not order_res.get("ok"):
+            log.error(
+                f"[regime-hedge] short {REGIME_HEDGE_SYMBOL} falhou: "
+                f"{order_res.get('msg') or order_res.get('error')}"
+            )
+            return False
+        if not order_res.get("sl_ok"):
+            # Regra de ouro: sem stop = sem trade. Fecha o short imediatamente.
+            log.error(f"[regime-hedge] {REGIME_HEDGE_SYMBOL} SEM STOP — fechando por segurança")
+            try:
+                await exchange_service.place_order(
+                    symbol=REGIME_HEDGE_SYMBOL, side="Buy", qty=qty,
+                    order_type="Market", reduce_only=True,
+                    client_order_id=f"{client_order_id}-nostop",
+                )
+            except Exception:
+                pass
+            return False
+
+        result = order_res.get("result") or {}
+        exchange_order_id = str(result.get("orderId") or result.get("orderID") or "")
+        try:
+            avg = float(result.get("avgPrice") or result.get("avgFillPrice") or 0)
+        except Exception:
+            avg = 0.0
+        entry_actual = avg if avg > 0 else mark
+
+        sl_oid = order_res.get("sl_order_id")
+        tp2_oid = order_res.get("tp2_order_id")
+        exchange_name = os.getenv("EXCHANGE", "binance")
+
+        trade = await real_trade_service.open_trade(
+            symbol=REGIME_HEDGE_SYMBOL,
+            side="short",
+            qty=qty,
+            entry_price=entry_actual,
+            leverage=1,
+            planned_stop=stop,
+            planned_tp2=tp2,
+            source="auto",
+            exchange=exchange_name,
+            exchange_order_id=exchange_order_id,
+            client_order_id=client_order_id,
+            notes=(f"hedge regime {state}: short {hedge_base} "
+                   f"({REGIME_HEDGE_SIZE_PCT:.0%} de {agg_notional:.0f}USD em {n_alt} alt longs)"),
+            entry_is_real_fill=bool(avg > 0),
+            sl_order_id=sl_oid,
+            tp2_order_id=tp2_oid,
+            sl_current_price=stop,
+            hedge_for=f"regime:{state}",
+        )
+        if trade is None:
+            return False
+
+        log.info(
+            f"[regime-hedge] ABERTO short {REGIME_HEDGE_SYMBOL} qty={qty:g} "
+            f"notional≈{hedge_notional:.0f}USD (regime {state}, {n_alt} alt longs "
+            f"agg≈{agg_notional:.0f}USD) SL={stop:g} TP2={tp2:g}"
+        )
+        try:
+            from services import push_service
+            await push_service.notify_alert(
+                title=f"🛡️ Hedge de regime aberto ({state})",
+                body=(f"Short {hedge_base} ~{hedge_notional:.0f}USD protegendo "
+                      f"{n_alt} longs de alt (~{agg_notional:.0f}USD)."),
+                tag=f"hedge-{state}",
+            )
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        log.error(f"[regime-hedge] erro abrindo hedge: {e}", exc_info=True)
+        return False
+
+
 def _compute_qty(
     entry: float, stop: float, risk_pct: float, equity_usd: float,
     leverage: int = 1,
@@ -3458,6 +3792,19 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"[tf-upgrade] {rec['symbol']} SKIP upgrade ({reason}); "
                             f"trade existente continua — não abre duplicata"
                         )
+                        # Feature 5 — pyramiding: sem TF upgrade, mas se o trade
+                        # existente já é um winner pós-TP1 (SL no BE) e o preço
+                        # andou a favor ≥ min R, REFORÇA a posição in-place em vez
+                        # de só ignorar a rec. NO-OP quando PYRAMIDING_ENABLED=OFF.
+                        try:
+                            pyr = await _maybe_pyramid(same_dir, rec)
+                            if pyr:
+                                _record_skip(
+                                    rec, "pyramiding",
+                                    f"winner pós-TP1 reforçado (level→{int(getattr(same_dir,'pyramiding_level',0) or 0)+1})",
+                                )
+                        except Exception as _e:
+                            log.warning(f"[pyramid] {rec['symbol']} tentativa falhou (fail-safe): {_e}")
                         # Trade já aberto na mesma direção; não abre paralelo
                         continue
 
@@ -4122,6 +4469,20 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         log.warning(f"[notify] telegram open falhou: {e}")
         except Exception as e:
             log.warning(f"[shadow] falha abrindo trade pra {rec.get('symbol')}: {e}")
+
+    # ── Feature 5 — hedge de regime adverso (1×/lote, pós-processamento das recs).
+    # Se o regime está RISK_OFF/ALT_DANGER/ALT_RISK_OFF e há longs de alt abertos,
+    # abre UM short de BTC como proteção macro. NO-OP quando REGIME_HEDGE_ENABLED=OFF.
+    if not SHADOW_ENABLED and REGIME_HEDGE_ENABLED:
+        try:
+            _hedge_regime = _regime_cached
+            if not _hedge_regime:
+                # regime não foi buscado (REGIME_SIZING_ENABLED off) — busca agora
+                from services.regime_service import get_regime_status
+                _hedge_regime = await get_regime_status()
+            await _maybe_regime_hedge(_hedge_regime)
+        except Exception as e:
+            log.warning(f"[regime-hedge] tentativa de hedge falhou (fail-safe): {e}")
 
     if opened:
         log.info(f"[shadow] trades abertos: {opened}")

@@ -149,6 +149,13 @@ async def init_db():
         await conn.execute(text(
             "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS adaptive_test_idx INTEGER"
         ))
+        # Feature 5 — pyramiding (reforço de winner pós-TP1) + hedge de regime
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS pyramiding_level INTEGER DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS hedge_for VARCHAR(64)"
+        ))
         # Se a coluna antiga existir (deploy anterior), copia o valor pro novo nome.
         # Em Postgres o IF EXISTS no information_schema é mais seguro:
         await conn.execute(text("""

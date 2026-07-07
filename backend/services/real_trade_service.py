@@ -65,6 +65,9 @@ async def open_trade(
     adaptive_runner_atr_mult: Optional[float] = None,
     adaptive_runner_qty_pct: Optional[float] = None,
     adaptive_test_idx: Optional[int] = None,
+    # Feature 5 — hedge de regime (short BTC protegendo longs de alt)
+    hedge_for: Optional[str] = None,
+    pyramiding_level: Optional[int] = None,
 ) -> Optional[dict]:
     if not DB_ENABLED:
         return None
@@ -125,6 +128,8 @@ async def open_trade(
             adaptive_runner_atr_mult=adaptive_runner_atr_mult,
             adaptive_runner_qty_pct=adaptive_runner_qty_pct,
             adaptive_test_idx=adaptive_test_idx,
+            hedge_for=hedge_for,
+            pyramiding_level=pyramiding_level or 0,
         )
         session.add(trade)
         await session.flush()
@@ -532,5 +537,8 @@ def _to_dict(t: RealTrade | None) -> dict | None:
         "adaptive_runner_atr_mult": t.adaptive_runner_atr_mult,
         "adaptive_runner_qty_pct": t.adaptive_runner_qty_pct,
         "adaptive_test_idx": t.adaptive_test_idx,
+        # Feature 5 — pyramiding + hedge de regime
+        "pyramiding_level": getattr(t, "pyramiding_level", None),
+        "hedge_for": getattr(t, "hedge_for", None),
         "notes": t.notes,
     }

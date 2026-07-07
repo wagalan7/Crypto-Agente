@@ -102,6 +102,16 @@ class RealTrade(Base):
     # com a tag "🧪 Teste adaptativo N/total" no Telegram. None = não é teste.
     adaptive_test_idx: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # ── Feature 5: pyramiding + hedge de regime ──────────────────────────
+    # pyramiding_level: quantas vezes ESTE trade foi reforçado (adicionado a um
+    # winner pós-TP1). 0/None = nunca piramidado. A posição é aumentada in-place
+    # (one-way netting) e re-bracketada; não cria linha filha.
+    pyramiding_level: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    # hedge_for: se preenchido, ESTE trade é um hedge de regime adverso (ex.:
+    # short de BTC protegendo longs de alt). Valor = motivo/regime (ex.:
+    # "regime:RISK_OFF"). None = trade normal.
+    hedge_for: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     # Notas livres
     notes: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
