@@ -33,6 +33,14 @@ async def send_message_ex(tenant: dict, phone: str, text: str) -> tuple[bool, st
 def _humanize_send_error(code: int, body: str) -> str:
     """Traduz a resposta crua do provedor (Z-API/Evolution) num motivo claro."""
     b = (body or "").lower()
+    # Instância inexistente / credenciais da conexão desalinhadas (checar ANTES
+    # de "not found", senão cairia no balde de "número inválido").
+    if any(k in b for k in (
+        "instance not found", "instance does not exist", "instância não encontrada",
+        "instance is not", "invalid instance", "instance deleted",
+    )):
+        return ("a conexão do WhatsApp não existe mais (instância Z-API não "
+                "encontrada) — refaça a conexão do WhatsApp no painel")
     # WhatsApp desconectado / instância offline
     if any(k in b for k in (
         "not connected", "disconnected", "desconect", "não conectado", "nao conectado",
