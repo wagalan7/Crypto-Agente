@@ -737,12 +737,21 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
         if patient and patient.get("name"):
             lines.append(f"PACIENTE CONHECIDO: {patient['name']} (já cadastrado, sem consulta futura agendada)")
         else:
-            # Checar histórico de agendamentos passados
+            # Checar histórico de agendamentos passados — casa variantes do número
+            # (com/sem DDI 55 e dígito 9 extra), igual ao painel, para reconhecer
+            # o paciente mesmo se o nome foi gravado noutro formato de telefone.
+            _vars = db._phone_variants(phone) | ({phone} if phone else set())
             with db.get_conn() as conn:
-                past = conn.execute(
-                    "SELECT patient_name FROM appointments WHERE tenant_id=? AND phone=? ORDER BY scheduled_at DESC LIMIT 1",
-                    (tenant_id, phone)
-                ).fetchone()
+                if _vars:
+                    _ph = ",".join("?" * len(_vars))
+                    past = conn.execute(
+                        f"SELECT patient_name FROM appointments WHERE tenant_id=? "
+                        f"AND phone IN ({_ph}) AND COALESCE(patient_name,'') != '' "
+                        f"ORDER BY scheduled_at DESC LIMIT 1",
+                        (tenant_id, *_vars)
+                    ).fetchone()
+                else:
+                    past = None
             if past:
                 lines.append(f"PACIENTE CONHECIDO: {past['patient_name']} (já foi paciente, sem consulta futura agendada)")
 

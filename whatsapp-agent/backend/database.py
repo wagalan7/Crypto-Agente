@@ -1101,15 +1101,22 @@ def get_appointments_by_phone(tenant_id: int, phone: str, now_iso: str | None = 
         except Exception:
             now_dt = datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None)
     threshold = (now_dt - timedelta(minutes=90)).isoformat()
+    # Casa TODAS as variantes plausíveis do número BR (com/sem DDI 55 e dígito 9
+    # extra), igual ao painel — senão o agente deixa de reconhecer o paciente
+    # quando o nome foi gravado num formato e a mensagem chega em outro.
+    variants = _phone_variants(phone) | ({phone} if phone else set())
+    if not variants:
+        return []
+    ph = ",".join("?" * len(variants))
     # Excluir placeholders de "novo paciente aguardando agendamento" (ano 2099)
     # para que o agente não os mostre como consultas reais ao paciente.
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT * FROM appointments
-               WHERE tenant_id = ? AND phone = ? AND scheduled_at >= ?
+            f"""SELECT * FROM appointments
+               WHERE tenant_id = ? AND phone IN ({ph}) AND scheduled_at >= ?
                  AND scheduled_at < '2099-01-01'
                ORDER BY scheduled_at""",
-            (tenant_id, phone, threshold),
+            (tenant_id, *variants, threshold),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -1475,10 +1482,16 @@ def rename_patient_everywhere(tenant_id: int, phone: str, name: str) -> int:
 
 
 def get_patient(tenant_id: int, phone: str) -> dict | None:
+    # Casa variantes do número BR (com/sem DDI 55 e dígito 9 extra) para o agente
+    # reconhecer o paciente mesmo que o cadastro tenha sido gravado noutro formato.
+    variants = _phone_variants(phone) | ({phone} if phone else set())
+    if not variants:
+        return None
+    ph = ",".join("?" * len(variants))
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM patients WHERE tenant_id = ? AND phone = ?",
-            (tenant_id, phone)
+            f"SELECT * FROM patients WHERE tenant_id = ? AND phone IN ({ph})",
+            (tenant_id, *variants)
         ).fetchone()
     return dict(row) if row else None
 

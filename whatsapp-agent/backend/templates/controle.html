@@ -11,6 +11,10 @@
     button:active { transform: scale(0.96); }
     .patient-card { transition: opacity .15s; }
     .patient-card.hidden-search { display: none; }
+    .patient-card.hidden-filter { display: none; }
+    .stat-card { cursor: pointer; }
+    .stat-card:active { transform: scale(0.96); }
+    .stat-card.active { box-shadow: 0 0 0 2px #E91E8C inset; }
   </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -71,18 +75,21 @@
     {% set n_pausados = patients | selectattr('phone', 'in', paused) | list | length %}
     {% set n_sem_nome = patients | rejectattr('patient_name') | list | length %}
     <div class="grid grid-cols-3 gap-2 mb-4 text-center">
-      <div class="bg-white rounded-xl border border-gray-100 py-2.5">
+      <button type="button" data-filter="all" onclick="filterByCategory('all')"
+        class="stat-card bg-white rounded-xl border border-gray-100 py-2.5 transition">
         <p class="text-lg font-bold text-gray-800">{{ total }}</p>
         <p class="text-[10px] text-gray-400">pacientes</p>
-      </div>
-      <div class="bg-yellow-50 rounded-xl border border-yellow-100 py-2.5">
+      </button>
+      <button type="button" data-filter="paused" onclick="filterByCategory('paused')"
+        class="stat-card bg-yellow-50 rounded-xl border border-yellow-100 py-2.5 transition">
         <p class="text-lg font-bold text-yellow-700">{{ n_pausados }}</p>
         <p class="text-[10px] text-yellow-600">pausados</p>
-      </div>
-      <div class="bg-pink-50 rounded-xl border border-pink-100 py-2.5">
+      </button>
+      <button type="button" data-filter="semnome" onclick="filterByCategory('semnome')"
+        class="stat-card bg-pink-50 rounded-xl border border-pink-100 py-2.5 transition">
         <p class="text-lg font-bold text-brand">{{ n_sem_nome }}</p>
         <p class="text-[10px] text-brand">sem nome</p>
-      </div>
+      </button>
     </div>
     {% endif %}
 
@@ -144,7 +151,9 @@
       {% endif %}
       <div class="patient-card bg-white rounded-2xl border p-4
         {{ 'border-yellow-200' if is_paused else 'border-gray-100' }}"
-        data-search="{{ (p.patient_name or '') | lower }} {{ p.phone or '' }}">
+        data-search="{{ (p.patient_name or '') | lower }} {{ p.phone or '' }}"
+        data-paused="{{ '1' if is_paused else '0' }}"
+        data-semnome="{{ '1' if sem_nome else '0' }}">
         <div class="flex items-center gap-3">
 
         <!-- Avatar -->
@@ -246,19 +255,43 @@
   </div>
 
 <script>
-function filterControle() {
+// Filtro por categoria (cards clicáveis): 'all' | 'paused' | 'semnome'.
+// Clicar de novo no card ativo volta para "todos".
+let activeCategory = 'all';
+
+function categoryMatch(card) {
+  if (activeCategory === 'paused')  return card.getAttribute('data-paused') === '1';
+  if (activeCategory === 'semnome') return card.getAttribute('data-semnome') === '1';
+  return true; // 'all'
+}
+
+function applyFilters() {
   const q = (document.getElementById('ctrl-search')?.value || '').trim().toLowerCase();
   const cards = document.querySelectorAll('.patient-card');
   let visible = 0;
   cards.forEach(card => {
     const text = (card.getAttribute('data-search') || '').toLowerCase();
-    const match = !q || text.includes(q);
-    card.classList.toggle('hidden-search', !match);
-    if (match) visible++;
+    const searchOk = !q || text.includes(q);
+    const catOk = categoryMatch(card);
+    card.classList.toggle('hidden-search', !searchOk);
+    card.classList.toggle('hidden-filter', !catOk);
+    if (searchOk && catOk) visible++;
   });
   const noRes = document.getElementById('ctrl-no-results');
   if (noRes) noRes.classList.toggle('hidden', visible > 0);
 }
+
+function filterByCategory(cat) {
+  // Toggle: clicar no card já ativo volta para "todos".
+  activeCategory = (activeCategory === cat && cat !== 'all') ? 'all' : cat;
+  document.querySelectorAll('.stat-card').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-filter') === activeCategory);
+  });
+  applyFilters();
+}
+
+// Compatibilidade: o input de busca chama filterControle().
+function filterControle() { applyFilters(); }
 </script>
 </body>
 </html>

@@ -11,6 +11,10 @@
     @media (min-width: 768px) { body { padding-bottom: 0; } }
     .tab-content { display: none; }
     .tab-content.active { display: block; }
+    .config-section { display: none; }
+    .config-section.active { display: block; }
+    #config-subnav::-webkit-scrollbar { display: none; }
+    #config-subnav { -ms-overflow-style: none; scrollbar-width: none; }
     .toast { animation: slideIn .3s ease; }
     @keyframes slideIn { from { transform: translateY(-20px); opacity:0; } to { transform: translateY(0); opacity:1; } }
     .badge { display:none; }
@@ -292,7 +296,26 @@
 
   <!-- Config -->
   <div id="pane-config" class="tab-content">
-    <h2 class="text-base font-semibold text-gray-800 mb-4 mt-4 md:mt-0">Configurações</h2>
+    <h2 class="text-base font-semibold text-gray-800 mb-3 mt-4 md:mt-0">Configurações</h2>
+
+    <!-- Sub-menu da aba Config (evita rolar a página inteira) -->
+    <div id="config-subnav" class="flex gap-2 overflow-x-auto pb-2 mb-4 max-w-lg">
+      <button type="button" data-sec="geral" onclick="showConfigSection('geral')"
+        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-brand text-white">📊 Geral</button>
+      <button type="button" data-sec="whatsapp" onclick="showConfigSection('whatsapp')"
+        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">📲 WhatsApp</button>
+      <button type="button" data-sec="mensagens" onclick="showConfigSection('mensagens')"
+        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">✏️ Mensagens</button>
+      <button type="button" data-sec="cobranca" onclick="showConfigSection('cobranca')"
+        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">💰 Cobrança</button>
+      <button type="button" data-sec="integracoes" onclick="showConfigSection('integracoes')"
+        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">🔗 Integrações</button>
+      <button type="button" data-sec="conta" onclick="showConfigSection('conta')"
+        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">💳 Conta</button>
+    </div>
+
+    <!-- ═══ Sub-seção: Geral ═══ -->
+    <div class="config-section active" id="cfgsec-geral">
 
     <!-- Indicadores do mês -->
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mb-4">
@@ -407,6 +430,11 @@
       <div id="cfg-msg" class="text-sm text-center hidden text-green-600"></div>
     </div>
 
+    </div><!-- /cfgsec-geral -->
+
+    <!-- ═══ Sub-seção: WhatsApp ═══ -->
+    <div class="config-section" id="cfgsec-whatsapp">
+
     {% if evolution_enabled %}
     <!-- Conexão automática (Evolution) — cliente lê só o QR -->
     <div class="bg-white rounded-xl border-2 border-green-300 p-5 max-w-lg mt-4">
@@ -514,6 +542,11 @@
       <div id="zapi-conn-msg" class="hidden text-sm text-center mt-2"></div>
     </div>
 
+    </div><!-- /cfgsec-whatsapp -->
+
+    <!-- ═══ Sub-seção: Mensagens ═══ -->
+    <div class="config-section" id="cfgsec-mensagens">
+
     <!-- Mensagens personalizáveis -->
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
       <div class="flex items-center gap-2 mb-1">
@@ -555,6 +588,11 @@
         <div id="cfg-tpl-msg" class="hidden text-sm text-center"></div>
       </div>
     </div>
+
+    </div><!-- /cfgsec-mensagens -->
+
+    <!-- ═══ Sub-seção: Conta ═══ -->
+    <div class="config-section" id="cfgsec-conta">
 
     <!-- Assinatura -->
     {% if tenant.stripe_subscription_id or tenant.mp_subscription_id or tenant.free_until %}
@@ -621,6 +659,11 @@
           class="text-xs text-brand font-medium flex-shrink-0">Copiar</button>
       </div>
     </div>
+
+    </div><!-- /cfgsec-conta -->
+
+    <!-- ═══ Sub-seção: Cobrança ═══ -->
+    <div class="config-section" id="cfgsec-cobranca">
 
     <!-- Confirmações -->
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
@@ -734,6 +777,11 @@
         </div>
       </div>
     </div>
+
+    </div><!-- /cfgsec-cobranca -->
+
+    <!-- ═══ Sub-seção: Integrações ═══ -->
+    <div class="config-section" id="cfgsec-integracoes">
 
     <!-- Documentação -->
     <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
@@ -849,6 +897,8 @@
         {% endif %}
       </div>
     </div>
+
+    </div><!-- /cfgsec-integracoes -->
   </div>
 
 </div>
@@ -1120,6 +1170,23 @@ function showTab(name) {
   if (name==="slots")     { loadSlots(); loadWeekly(); renderBlockedHours(); renderBlockedDates(); }
   if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
   if (name==="config")    { loadBillingLogs(); loadStats(); }
+}
+
+// Sub-menu da aba Config: mostra uma seção por vez (evita rolar a página toda).
+function showConfigSection(sec) {
+  document.querySelectorAll(".config-section").forEach(s => s.classList.remove("active"));
+  const el = document.getElementById("cfgsec-"+sec);
+  if (el) el.classList.add("active");
+  document.querySelectorAll(".csub").forEach(b => {
+    const on = b.getAttribute("data-sec") === sec;
+    b.classList.toggle("bg-brand", on);
+    b.classList.toggle("text-white", on);
+    b.classList.toggle("bg-white", !on);
+    b.classList.toggle("text-gray-600", !on);
+  });
+  // Rola o topo da aba Config para a seção escolhida ficar visível.
+  const subnav = document.getElementById("config-subnav");
+  if (subnav) subnav.scrollIntoView({ block: "nearest" });
 }
 
 function api(path, opts={}) {
