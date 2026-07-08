@@ -294,6 +294,28 @@ async def _security_headers_middleware(request: Request, call_next):
     response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     return response
 
+
+# ── Redirect canônico apex → www ────────────────────────────────────────────────
+# Quem chega pelo domínio "pelado" (agenteconsultorio.com.br) é redirecionado, com
+# 301, para o www — que é o host canônico servido pelo Railway. Preserva caminho e
+# query. Só dispara para o host apex EXATO: o www, o domínio *.railway.app e o
+# healthcheck interno passam direto (host não bate). Fica dormente até o apex de
+# fato ser roteado para o app; então é inofensivo enquanto o DNS não estiver pronto.
+_APEX_HOST = "agenteconsultorio.com.br"
+_CANONICAL_HOST = "www.agenteconsultorio.com.br"
+
+
+@app.middleware("http")
+async def _apex_to_www_middleware(request: Request, call_next):
+    host = (request.headers.get("host") or "").split(":")[0].strip().lower()
+    if host == _APEX_HOST:
+        target = f"https://{_CANONICAL_HOST}{request.url.path}"
+        if request.url.query:
+            target += f"?{request.url.query}"
+        return RedirectResponse(target, status_code=301)
+    return await call_next(request)
+
+
 _STATIC_DIR = Path(__file__).parent / "static"
 _STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
