@@ -74,7 +74,7 @@
 <!-- ── NAV ── -->
 <nav class="sticky top-0 z-50 bg-white/95 backdrop-blur border-b border-gray-100">
   <div class="max-w-6xl mx-auto px-5 py-3.5 flex items-center justify-between">
-    <div class="flex items-center gap-2.5">
+    <a href="/" class="flex items-center gap-2.5 hover:opacity-80 transition" title="Voltar para a página inicial">
       <div class="w-9 h-9 btn-brand rounded-xl flex items-center justify-center text-white shadow">
         <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
@@ -86,8 +86,9 @@
         <span class="block font-extrabold text-gray-900 text-sm md:text-base tracking-tight">AGENTE</span>
         <span class="block font-bold text-brand text-[11px] md:text-xs -mt-1 tracking-[0.18em]">{{ c.brand_line2 }}</span>
       </div>
-    </div>
+    </a>
     <div class="flex items-center gap-3">
+      <a href="/#segmentos" class="hidden md:block text-sm text-gray-500 hover:text-gray-800 font-medium transition">Outros segmentos</a>
       <a href="#precos" class="hidden md:block text-sm text-gray-500 hover:text-gray-800 font-medium transition">Preços</a>
       <a href="{{ c.onboarding_link }}" class="btn-brand text-white text-sm font-bold px-5 py-2.5 rounded-xl hover:opacity-90 transition shadow">
         Começar grátis →
