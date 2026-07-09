@@ -109,6 +109,7 @@
         <option value="anual">Anual</option>
       </select>
       <span id="subs-count" class="text-xs text-slate-500"></span>
+      <button id="subs-export" class="text-xs px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-100 ml-auto">⬇ Exportar CSV</button>
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
       <table class="w-full text-sm">
@@ -163,6 +164,7 @@
         <option value="anual">Anual</option>
       </select>
       <span id="tenants-count" class="text-xs text-slate-500"></span>
+      <button id="tenants-export" class="text-xs px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-100 ml-auto">⬇ Exportar CSV</button>
     </div>
     <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
       <table class="w-full text-sm">
@@ -352,6 +354,40 @@ const daysUntil = (s) => {
   return Math.ceil((d.getTime() - Date.now()) / 86400000);
 };
 const norm = (s) => (s||'').toString().toLowerCase();
+
+// ── Toast (notificação flutuante) ───────────────────────────────────────────
+function toast(msg, kind) {
+  let box = document.getElementById('toast-box');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toast-box';
+    box.className = 'fixed bottom-4 right-4 z-50 flex flex-col gap-2';
+    document.body.appendChild(box);
+  }
+  const cls = kind === 'error' ? 'bg-rose-600' : (kind === 'warn' ? 'bg-amber-600' : 'bg-slate-800');
+  const el = document.createElement('div');
+  el.className = `${cls} text-white text-sm px-4 py-2 rounded-lg shadow-lg transition-opacity duration-300`;
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3200);
+}
+
+// ── Exportar CSV ────────────────────────────────────────────────────────────
+function toCSV(rows, cols) {
+  const esc = v => { const s = (v==null?'':''+v); return /[";\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s; };
+  const head = cols.map(c => esc(c.label)).join(';');
+  const body = rows.map(r => cols.map(c => esc(c.get(r))).join(';')).join('\n');
+  return '\uFEFF' + head + '\n' + body; // BOM p/ Excel abrir acentos certos
+}
+function downloadCSV(filename, csv) {
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function stamp() { return new Date().toISOString().slice(0,10); }
 const badge = (status) => {
   const map = {active:'b-active', suspended:'b-suspended', pending_payment:'b-pending'};
   const labels = {active:'Ativo', suspended:'Suspenso', pending_payment:'Pendente'};
@@ -453,7 +489,7 @@ async function loadAlerts() {
     </div>`).join('');
 }
 
-let subsData = [];
+let subsData = [], subsFiltered = [];
 async function loadSubs() {
   const {subscriptions} = await api('/painel/api/subscriptions');
   subsData = subscriptions || [];
@@ -470,6 +506,7 @@ function renderSubs() {
     }
     return true;
   });
+  subsFiltered = rows;
   document.getElementById('subs-count').textContent = `${rows.length} de ${subsData.length}`;
   document.getElementById('subs-body').innerHTML = rows.map(s => `
     <tr class="border-t border-slate-100">
@@ -496,7 +533,7 @@ async function loadAbandoned() {
     </tr>`).join('') || '<tr><td colspan="5" class="p-6 text-center text-slate-400">Nenhum carrinho abandonado.</td></tr>';
 }
 
-let tenantsData = [];
+let tenantsData = [], tenantsFiltered = [];
 async function loadTenants() {
   const {tenants} = await api('/painel/api/tenants');
   tenantsData = tenants || [];
@@ -515,6 +552,7 @@ function renderTenants() {
     }
     return true;
   });
+  tenantsFiltered = rows;
   document.getElementById('tenants-count').textContent = `${rows.length} de ${tenantsData.length}`;
   document.getElementById('tenants-body').innerHTML = rows.map(t => `
     <tr class="border-t border-slate-100">
@@ -565,7 +603,9 @@ document.getElementById('btn-restore').addEventListener('click', async () => {
 });
 
 function copyLink(url) {
-  navigator.clipboard.writeText(url).then(() => alert('Link copiado:\n' + url));
+  navigator.clipboard.writeText(url)
+    .then(() => toast('✓ Link copiado para a área de transferência'))
+    .catch(() => toast('Não foi possível copiar o link', 'error'));
 }
 
 let currentSlug = null;
@@ -591,7 +631,7 @@ async function saveAction() {
   if (fr) body.free_until = fr;
   // Sempre envia o vencimento Z-API (permite limpar deixando o campo vazio)
   body.zapi_expires_at = zp || '';
-  if (!st && !pl && !fr && !zp) { alert('Nada para alterar.'); return; }
+  if (!st && !pl && !fr && !zp) { toast('Nada para alterar.', 'warn'); return; }
   try {
     await api(`/painel/api/tenant/${currentSlug}/action`, {
       method: 'POST',
@@ -600,7 +640,8 @@ async function saveAction() {
     });
     closeModal();
     loadTenants();
-  } catch (e) { alert('Erro: ' + e.message); }
+    toast('✓ Alterações salvas');
+  } catch (e) { toast('Erro: ' + e.message, 'error'); }
 }
 
 function loadTab(tab) {
@@ -710,7 +751,7 @@ document.getElementById('btn-totp-disable-confirm')?.addEventListener('click', a
   if (r.ok) loadSecurity();
   else {
     const j = await r.json().catch(()=>({}));
-    alert(j.detail || 'Falha ao desativar.');
+    toast(j.detail || 'Falha ao desativar.', 'error');
   }
 });
 
@@ -755,6 +796,34 @@ document.getElementById('subs-plan')?.addEventListener('change', renderSubs);
 document.getElementById('tenants-search')?.addEventListener('input', renderTenants);
 document.getElementById('tenants-status')?.addEventListener('change', renderTenants);
 document.getElementById('tenants-plan')?.addEventListener('change', renderTenants);
+// Exportar CSV — Assinaturas
+document.getElementById('subs-export')?.addEventListener('click', () => {
+  if (!subsFiltered.length) { toast('Nada para exportar.', 'warn'); return; }
+  const cols = [
+    {label:'Consultório', get:s=>s.name}, {label:'Slug', get:s=>s.slug},
+    {label:'Responsável', get:s=>s.psychologist_name||s.full_name},
+    {label:'E-mail', get:s=>s.email}, {label:'Telefone', get:s=>s.phone},
+    {label:'Plano', get:s=>s.plan}, {label:'Vence em', get:s=>s.plan_expires_at},
+    {label:'Início', get:s=>s.created_at},
+  ];
+  downloadCSV(`assinaturas_${stamp()}.csv`, toCSV(subsFiltered, cols));
+  toast(`✓ ${subsFiltered.length} assinatura(s) exportada(s)`);
+});
+// Exportar CSV — Usuários
+document.getElementById('tenants-export')?.addEventListener('click', () => {
+  if (!tenantsFiltered.length) { toast('Nada para exportar.', 'warn'); return; }
+  const cols = [
+    {label:'Consultório', get:t=>t.name}, {label:'Slug', get:t=>t.slug},
+    {label:'E-mail', get:t=>t.email}, {label:'Telefone', get:t=>t.phone},
+    {label:'Cidade', get:t=>t.billing_city}, {label:'UF', get:t=>t.billing_state},
+    {label:'Plano', get:t=>t.plan}, {label:'Status', get:t=>t.status},
+    {label:'Plano vence em', get:t=>t.plan_expires_at},
+    {label:'Grátis até', get:t=>t.free_until},
+    {label:'Z-API vence em', get:t=>t.zapi_expires_at},
+  ];
+  downloadCSV(`usuarios_${stamp()}.csv`, toCSV(tenantsFiltered, cols));
+  toast(`✓ ${tenantsFiltered.length} consultório(s) exportado(s)`);
+});
 // Saúde WhatsApp — verificar agora
 document.getElementById('btn-health-check')?.addEventListener('click', async () => {
   const btn = document.getElementById('btn-health-check');
