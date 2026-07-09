@@ -1826,6 +1826,20 @@ def count_landing_views(days: int | None = None) -> int:
     return int(row["n"] or 0)
 
 
+def count_landing_views_since_yesterday() -> int:
+    """Visitas a partir do início de ONTEM no horário de Brasília (UTC-3).
+
+    viewed_at é gravado em UTC; o limiar é o instante UTC que corresponde a
+    ontem 00:00 BRT (= ontem 03:00 UTC).
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM landing_views "
+            "WHERE viewed_at >= datetime('now','-3 hours','start of day','-1 day','+3 hours')"
+        ).fetchone()
+    return int(row["n"] or 0)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Lembretes de vencimento — contas do operador (op_bills) + log idempotente
 # ════════════════════════════════════════════════════════════════════════════
@@ -1979,13 +1993,17 @@ def admin_stats_overview() -> dict:
     views_total = count_landing_views()
     views_7d = count_landing_views(7)
     views_30d = count_landing_views(30)
+    views_since_yesterday = count_landing_views_since_yesterday()
 
     return {
         "tenants": {"total": total, "active": active, "suspended": suspended, "pending_payment": pending},
         "mrr": round(mrr, 2),
         "by_plan": by_plan,
         "signups": {"last_24h": new_24h, "last_7d": new_7d},
-        "landing_views": {"total": views_total, "last_7d": views_7d, "last_30d": views_30d},
+        "landing_views": {
+            "total": views_total, "last_7d": views_7d, "last_30d": views_30d,
+            "since_yesterday": views_since_yesterday,
+        },
         "conversion_30d": round((active / views_30d * 100), 2) if views_30d else 0.0,
     }
 

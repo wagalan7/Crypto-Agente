@@ -69,8 +69,8 @@
         <div class="text-2xl font-bold" id="kpi-s7">—</div>
       </div>
       <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
-        <div class="text-xs text-gray-500">Visitas landing 30d</div>
-        <div class="text-2xl font-bold" id="kpi-v30">—</div>
+        <div class="text-xs text-gray-500">Visitas (desde ontem)</div>
+        <div class="text-2xl font-bold" id="kpi-vyest">—</div>
       </div>
       <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
         <div class="text-xs text-gray-500">Conversão 30d</div>
@@ -308,7 +308,7 @@ async function loadOverview() {
   document.getElementById('kpi-suspended').textContent = s.tenants.suspended;
   document.getElementById('kpi-s24').textContent = s.signups.last_24h;
   document.getElementById('kpi-s7').textContent = s.signups.last_7d;
-  document.getElementById('kpi-v30').textContent = s.landing_views.last_30d;
+  document.getElementById('kpi-vyest').textContent = s.landing_views.since_yesterday;
   const conv = (s.conversion_30d != null) ? s.conversion_30d : (s.landing_views.last_30d ? (100 * s.signups.last_7d / s.landing_views.last_30d) : 0);
   document.getElementById('kpi-conv').textContent = (conv || 0).toFixed(1) + '%';
 
