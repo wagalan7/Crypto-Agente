@@ -383,6 +383,13 @@ async def _flag_receipt_and_notify(tenant: dict, phone: str, kind: str) -> None:
 async def _handle_message(tenant: dict, phone: str, text: str):
     phone = "".join(c for c in phone if c.isdigit())  # normaliza sempre
 
+    # Descarta remetentes sintéticos (grupos/status/canais). Um número real
+    # (E.164) tem no máx. 15 dígitos; acima disso é ID do WhatsApp, não paciente.
+    # Barreira extra à do webhook (cobre Twilio e o endpoint de teste).
+    if not phone or len(phone) > 15 or phone.startswith("120363"):
+        logger.info(f"[{tenant['slug']}] Número inválido/sintético ignorado: {phone!r}")
+        return
+
     # ── Verificar se o consultório está ativo (assinatura em dia) ────────────────
     status = tenant.get("status", "active")
     if status == "suspended" and not db.is_tenant_exempt(tenant):
@@ -708,6 +715,29 @@ def _zapi_already_seen(msg_id: str) -> bool:
         return False
 
 
+def _is_non_patient_sender(payload: dict) -> bool:
+    """True se o webhook NÃO vem de um paciente individual: grupos, listas de
+    transmissão, status/stories ou canais/newsletters. O Z-API às vezes entrega
+    esses eventos com um "phone" sintético (ex.: o caso da Bruna,
+    55119498110271619114823 — 23 dígitos), que virava conversa falsa e disparava
+    a notificação "imagem que não parece comprovante" para a psicóloga sem que
+    houvesse paciente algum. Um número real (E.164) tem no máximo 15 dígitos."""
+    if payload.get("isGroup") or payload.get("isNewsletter") or payload.get("broadcast"):
+        return True
+    raw = str(payload.get("phone") or "")
+    low = raw.lower()
+    if any(tok in low for tok in ("@g.us", "@broadcast", "@newsletter", "@lid", "status")):
+        return True
+    digits = "".join(c for c in raw if c.isdigit())
+    if not digits:
+        return True
+    if digits.startswith("120363"):  # prefixo de ID de grupo do WhatsApp
+        return True
+    if len(digits) > 15:  # acima do máximo E.164 → identificador sintético
+        return True
+    return False
+
+
 @app.post("/webhook/{slug}/zapi")
 async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
@@ -716,6 +746,12 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
     payload = await request.json()
     # Ignorar mensagens enviadas pelo próprio número (ecos, status, etc.)
     if payload.get("fromMe"):
+        return {"status": "ignored"}
+    # Ignorar remetentes que não são pacientes individuais (grupos, transmissão,
+    # status/stories, canais). Evita conversa falsa e a notificação incorreta
+    # "imagem que não parece comprovante" com número sintético (bug da Bruna).
+    if _is_non_patient_sender(payload):
+        logger.info(f"[{slug}] Webhook não-paciente ignorado (grupo/status/broadcast/canal)")
         return {"status": "ignored"}
     # Deduplicação por messageId — Z-API faz retry em caso de timeout e
     # entregava a mesma mensagem 2x, gerando duas respostas do agente.
