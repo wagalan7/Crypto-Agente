@@ -144,6 +144,16 @@ try:
     SCAN_CONCURRENCY = max(1, int(os.getenv("SCAN_CONCURRENCY", "6")))
 except (TypeError, ValueError):
     SCAN_CONCURRENCY = 6
+# Teto de tempo POR SÍMBOLO no server-scan. Um símbolo cujo fetch OHLCV trava
+# (proxy futures lento/throttled) segurava o slot do semáforo até o abort global
+# (SERVER_SCAN_TIMEOUT_S=600) → um punhado de símbolos lentos estrangulava o ciclo
+# inteiro e disparava "timeout na varredura". Com o teto, o símbolo lento é PULADO
+# (retorna None) e o slot é liberado na hora. 0 = desliga o teto (comportamento
+# antigo). Default 25s (folga sobre os 20s de timeout por-request do proxy).
+try:
+    SERVER_SCAN_SYMBOL_TIMEOUT_S = max(0, int(os.getenv("SERVER_SCAN_SYMBOL_TIMEOUT_S", "25")))
+except (TypeError, ValueError):
+    SERVER_SCAN_SYMBOL_TIMEOUT_S = 25
 CACHE_TTL = 15                    # segundos (era 30 — push do scan tava com delay, agora mais fresco)
 MIN_RR = 1.5                      # filtro mínimo absoluto
 MIN_CONFIDENCE_B = 0.55           # tier B mínimo
@@ -1702,7 +1712,24 @@ async def get_recommendations_via_vision(
 
     async def _bounded(sym: str):
         async with sem:
-            return sym, await _best_tf_for_symbol_server(svc, sym)
+            # Teto por-símbolo: se o fetch travar (proxy lento), PULA o símbolo e
+            # libera o slot do semáforo — sem isso, poucos símbolos lentos seguram
+            # os slots até o abort global de 600s e o ciclo inteiro estoura.
+            try:
+                if SERVER_SCAN_SYMBOL_TIMEOUT_S > 0:
+                    best = await asyncio.wait_for(
+                        _best_tf_for_symbol_server(svc, sym),
+                        timeout=SERVER_SCAN_SYMBOL_TIMEOUT_S,
+                    )
+                else:
+                    best = await _best_tf_for_symbol_server(svc, sym)
+            except asyncio.TimeoutError:
+                _log.warning(f"[server-scan] {sym} passou de {SERVER_SCAN_SYMBOL_TIMEOUT_S}s — pulado (slot liberado)")
+                return sym, None
+            except Exception as e:
+                _log.warning(f"[server-scan] {sym} falhou ({e}) — pulado")
+                return sym, None
+            return sym, best
 
     all_results = await asyncio.gather(*[_bounded(s) for s in symbols])
 
