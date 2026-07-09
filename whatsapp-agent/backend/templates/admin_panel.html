@@ -111,8 +111,8 @@
       <span id="subs-count" class="text-xs text-slate-500"></span>
       <button id="subs-export" class="text-xs px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-100 ml-auto">⬇ Exportar CSV</button>
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-      <table class="w-full text-sm">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+      <table class="w-full min-w-[640px] text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
           <tr>
             <th class="p-3">Consultório</th>
@@ -130,8 +130,8 @@
 
   <!-- CARRINHO ABANDONADO -->
   <section id="tab-abandoned" class="tab-pane hidden">
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-      <table class="w-full text-sm">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+      <table class="w-full min-w-[640px] text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
           <tr>
             <th class="p-3">Lead</th>
@@ -166,8 +166,8 @@
       <span id="tenants-count" class="text-xs text-slate-500"></span>
       <button id="tenants-export" class="text-xs px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-100 ml-auto">⬇ Exportar CSV</button>
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-      <table class="w-full text-sm">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+      <table class="w-full min-w-[640px] text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
           <tr>
             <th class="p-3">Consultório</th>
@@ -194,8 +194,8 @@
       <button id="btn-health-check" class="text-sm px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">Verificar agora</button>
     </div>
     <div id="health-summary" class="grid grid-cols-3 gap-3 mb-4 text-sm"></div>
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-      <table class="w-full text-sm">
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+      <table class="w-full min-w-[640px] text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
           <tr>
             <th class="p-3">Consultório</th>
@@ -563,8 +563,13 @@ function renderTenants() {
       <td class="p-3 text-xs">${fmtDate(t.free_until)}</td>
       <td class="p-3 text-xs">${t.zapi_expires_at ? fmtDate(t.zapi_expires_at) : '<span class="text-amber-600" title="Sem data: o aviso de vencimento nunca dispara">⚠ não definido</span>'}</td>
       <td class="p-3">
-        <button onclick='openModal(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)}, ${JSON.stringify(t.zapi_expires_at||"")})' class="text-xs bg-slate-100 hover:bg-slate-200 px-2 py-1 rounded">Editar</button>
-        ${t.dashboard_url ? `<a href="${t.dashboard_url}" target="_blank" class="text-xs text-violet-600 hover:underline ml-2">Dashboard</a>` : ''}
+        <div class="flex flex-wrap items-center gap-1.5">
+          <button onclick='openModal(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)}, ${JSON.stringify(t.zapi_expires_at||"")})' class="text-xs bg-slate-100 hover:bg-slate-200 px-2 py-1 rounded">Editar</button>
+          ${t.status === 'active'
+            ? `<button onclick='quickAction(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)}, "suspended")' class="text-xs bg-rose-100 text-rose-700 hover:bg-rose-200 px-2 py-1 rounded">Suspender</button>`
+            : `<button onclick='quickAction(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)}, "active")' class="text-xs bg-emerald-100 text-emerald-700 hover:bg-emerald-200 px-2 py-1 rounded">Reativar</button>`}
+          ${t.dashboard_url ? `<a href="${t.dashboard_url}" target="_blank" class="text-xs text-violet-600 hover:underline">Dashboard</a>` : ''}
+        </div>
       </td>
     </tr>`).join('') || '<tr><td colspan="7" class="p-6 text-center text-slate-400">Nenhum consultório encontrado.</td></tr>';
 }
@@ -644,7 +649,27 @@ async function saveAction() {
   } catch (e) { toast('Erro: ' + e.message, 'error'); }
 }
 
+// Ação rápida inline (suspender / reativar) direto na linha da tabela.
+async function quickAction(slug, name, newStatus) {
+  const verbo = newStatus === 'suspended' ? 'Suspender' : 'Reativar';
+  if (!confirm(`${verbo} o consultório "${name}"?`)) return;
+  try {
+    await api(`/painel/api/tenant/${slug}/action`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({status: newStatus})
+    });
+    // Atualiza localmente e re-renderiza (mantém filtros ativos), sem refetch.
+    const t = tenantsData.find(x => x.slug === slug);
+    if (t) t.status = newStatus;
+    renderTenants();
+    toast(newStatus === 'suspended' ? '✓ Consultório suspenso' : '✓ Consultório reativado');
+  } catch (e) { toast('Erro: ' + e.message, 'error'); }
+}
+
+let activeTab = 'overview';
 function loadTab(tab) {
+  activeTab = tab;
   if (tab === 'overview') loadOverview();
   else if (tab === 'subs') loadSubs();
   else if (tab === 'abandoned') loadAbandoned();
@@ -654,6 +679,14 @@ function loadTab(tab) {
   else if (tab === 'audit') loadAudit();
   else if (tab === 'security') loadSecurity();
 }
+
+// Auto-refresh: só a aba visível de monitoramento, e só com a página em foco.
+// Overview: recarrega só os alertas (não o KPI inteiro). Health: recarrega a lista.
+setInterval(() => {
+  if (document.hidden) return;
+  if (activeTab === 'overview') loadAlerts().catch(()=>{});
+  else if (activeTab === 'health') loadHealth().catch(()=>{});
+}, 60000);
 
 // ── Saúde WhatsApp ──────────────────────────────────────────────────────────
 async function loadHealth() {
