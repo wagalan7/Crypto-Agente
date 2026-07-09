@@ -3356,6 +3356,125 @@ def painel_api_tenant_action(slug: str, body: AdminTenantAction, request: Reques
     return {"ok": True, "updates": updates}
 
 
+@app.get("/painel/api/tenant/{slug}/overview")
+def painel_api_tenant_overview(slug: str, request: Request):
+    """Drill-down do consultório: indicadores do mês + próximos/últimos agendamentos."""
+    _require_admin(request)
+    from datetime import datetime as _dt, timedelta as _td
+    from zoneinfo import ZoneInfo as _Zi
+    t = db.get_tenant(slug)
+    if not t:
+        raise HTTPException(status_code=404, detail="Consultório não encontrado.")
+    tid = t["id"]
+    now = _dt.now(_Zi("America/Sao_Paulo")).replace(tzinfo=None)
+    y, m = now.year, now.month
+    start = _dt(y, m, 1).isoformat()
+    end = (_dt(y + 1, 1, 1) if m == 12 else _dt(y, m + 1, 1)).isoformat()
+    now_str = now.isoformat()
+    try:
+        stats = db.get_dashboard_stats(tid, start, end, now_str)
+    except Exception as e:
+        logger.warning(f"[admin] overview {slug}: falha stats: {e}")
+        stats = {}
+    # Janela de agendamentos: 30 dias para trás e para frente.
+    win_start = (now - _td(days=30)).isoformat()
+    win_end = (now + _td(days=30)).isoformat()
+    try:
+        appts = db.get_appointments_in_range(tid, win_start, win_end)
+    except Exception as e:
+        logger.warning(f"[admin] overview {slug}: falha appts: {e}")
+        appts = []
+    upcoming, recent = [], []
+    for a in appts:
+        item = {
+            "patient_name": a.get("patient_name"),
+            "phone": a.get("phone"),
+            "scheduled_at": a.get("scheduled_at"),
+            "confirmed": bool(a.get("confirmed")),
+            "cancelled": bool(a.get("cancelled")),
+            "attendance": a.get("attendance") or "pending",
+        }
+        if (a.get("scheduled_at") or "") >= now_str and not a.get("cancelled"):
+            upcoming.append(item)
+        else:
+            recent.append(item)
+    upcoming = upcoming[:12]
+    recent = list(reversed(recent))[:12]  # mais recentes primeiro
+    base = config.BASE_URL
+    dt_ = t.get("dashboard_token") or ""
+    return {
+        "slug": t["slug"],
+        "name": t.get("name"),
+        "psychologist_name": t.get("psychologist_name"),
+        "email": t.get("email"),
+        "phone": t.get("phone"),
+        "plan": t.get("plan"),
+        "status": t.get("status"),
+        "plan_expires_at": t.get("plan_expires_at"),
+        "free_until": t.get("free_until"),
+        "zapi_expires_at": t.get("zapi_expires_at"),
+        "created_at": t.get("created_at"),
+        "whatsapp_provider": t.get("whatsapp_provider"),
+        "dashboard_url": f"{base}/dashboard/{t['slug']}?token={dt_}" if dt_ else "",
+        "month": f"{y:04d}-{m:02d}",
+        "stats": stats,
+        "upcoming": upcoming,
+        "recent": recent,
+    }
+
+
+@app.post("/painel/api/abandoned-carts/{slug}/send-reminder")
+async def painel_api_abandoned_reminder(slug: str, request: Request):
+    """Envia (via WhatsApp do operador) um lembrete ao lead com o link de pagamento.
+    Disparo explícito e individual pelo admin — não é blast automático."""
+    sess = _require_admin(request)
+    lead = db.get_tenant(slug)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead não encontrado.")
+    if (lead.get("status") or "") != "pending_payment":
+        raise HTTPException(status_code=400, detail="Este consultório não está com pagamento pendente.")
+    phone = (lead.get("phone") or "").strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="Lead sem telefone cadastrado.")
+    st = (lead.get("setup_token") or "").strip()
+    if not st:
+        raise HTTPException(status_code=400, detail="Lead sem token de pagamento — não há link para enviar.")
+    payment_url = f"{config.BASE_URL}/onboarding/pagamento?token={st}"
+    # Remetente = mesmo canal WhatsApp do operador usado nos lembretes de cobrança.
+    import billing_reminders
+    sender = billing_reminders._operator_whatsapp_tenant()
+    if not sender:
+        raise HTTPException(
+            status_code=503,
+            detail="Nenhuma instância Z-API ativa para enviar. Configure OPERATOR_WHATSAPP_TENANT_SLUG.",
+        )
+    raw_name = (lead.get("full_name") or lead.get("psychologist_name") or "").strip()
+    nome = raw_name.split()[0] if raw_name else ""
+    saud = f"Olá, {nome}! 😊" if nome else "Olá! 😊"
+    msg = (
+        f"{saud}\n\n"
+        f"Vi que você começou a ativar o seu *Agente de WhatsApp* para o consultório, "
+        f"mas o pagamento ficou pendente. Está tudo certo? 🌸\n\n"
+        f"Para concluir e deixar seu agente já atendendo os pacientes, é só finalizar por aqui:\n"
+        f"{payment_url}\n\n"
+        f"Qualquer dúvida, pode me chamar por aqui. Estou à disposição! 💜"
+    )
+    import whatsapp_service as _wa
+    ok, reason = await _wa.send_message_ex(sender, phone, msg)
+    db.audit_log(
+        "abandoned_reminder_sent",
+        actor=(sess.get("username") if isinstance(sess, dict) else "") or "admin",
+        target=slug,
+        ip=_client_ip(request),
+        details=("ok" if ok else reason)[:512],
+    )
+    if not ok:
+        logger.warning(f"[admin] lembrete carrinho {slug} falhou: {reason}")
+        raise HTTPException(status_code=502, detail=f"Falha ao enviar: {reason}")
+    logger.info(f"[admin] lembrete de carrinho enviado a {slug} ({phone}) via {sender.get('slug')}")
+    return {"ok": True, "phone": phone, "sender": sender.get("slug")}
+
+
 # ── Lembretes de vencimento (contas do operador + Z-API por consultório) ────────
 
 @app.get("/painel/api/op-bills")

@@ -332,6 +332,23 @@
   </div>
 </div>
 
+<!-- MODAL DRILL-DOWN (detalhes do consultório) -->
+<div id="detail-modal" class="hidden fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6 shadow-2xl">
+    <div class="flex items-start justify-between mb-4">
+      <div>
+        <h3 class="font-bold text-gray-900" id="detail-title">Detalhes</h3>
+        <p class="text-xs text-gray-500" id="detail-sub"></p>
+      </div>
+      <button onclick="closeDetail()" class="text-slate-400 hover:text-slate-700 text-xl leading-none">&times;</button>
+    </div>
+    <div id="detail-body"><p class="text-sm text-slate-400">Carregando…</p></div>
+    <div class="flex justify-end mt-5">
+      <button onclick="closeDetail()" class="px-4 py-2 text-sm rounded-lg border border-slate-300">Fechar</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const fmtBRL = (v) => 'R$ ' + (v||0).toLocaleString('pt-BR', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const fmtDate = (s) => {
@@ -528,7 +545,10 @@ async function loadAbandoned() {
       <td class="p-3">${c.plan||'—'}</td>
       <td class="p-3">${timeAgo(c.created_at)}</td>
       <td class="p-3">
-        ${c.payment_url ? `<button onclick="copyLink('${c.payment_url}')" class="text-xs bg-violet-100 text-violet-700 px-2 py-1 rounded hover:bg-violet-200">Copiar link de pagto</button>` : '—'}
+        <div class="flex flex-wrap items-center gap-1.5">
+          ${c.payment_url ? `<button onclick="copyLink('${c.payment_url}')" class="text-xs bg-violet-100 text-violet-700 px-2 py-1 rounded hover:bg-violet-200">Copiar link</button>` : ''}
+          ${c.phone ? `<button onclick='sendCartReminder(${JSON.stringify(c.slug)}, ${JSON.stringify(c.full_name||c.name||c.slug)})' class="text-xs bg-emerald-100 text-emerald-700 px-2 py-1 rounded hover:bg-emerald-200">Lembrete WhatsApp</button>` : '<span class="text-xs text-amber-600" title="Sem telefone cadastrado">sem telefone</span>'}
+        </div>
       </td>
     </tr>`).join('') || '<tr><td colspan="5" class="p-6 text-center text-slate-400">Nenhum carrinho abandonado.</td></tr>';
 }
@@ -564,6 +584,7 @@ function renderTenants() {
       <td class="p-3 text-xs">${t.zapi_expires_at ? fmtDate(t.zapi_expires_at) : '<span class="text-amber-600" title="Sem data: o aviso de vencimento nunca dispara">⚠ não definido</span>'}</td>
       <td class="p-3">
         <div class="flex flex-wrap items-center gap-1.5">
+          <button onclick='openDetail(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)})' class="text-xs bg-violet-100 text-violet-700 hover:bg-violet-200 px-2 py-1 rounded">Detalhes</button>
           <button onclick='openModal(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)}, ${JSON.stringify(t.zapi_expires_at||"")})' class="text-xs bg-slate-100 hover:bg-slate-200 px-2 py-1 rounded">Editar</button>
           ${t.status === 'active'
             ? `<button onclick='quickAction(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)}, "suspended")' class="text-xs bg-rose-100 text-rose-700 hover:bg-rose-200 px-2 py-1 rounded">Suspender</button>`
@@ -613,6 +634,17 @@ function copyLink(url) {
     .catch(() => toast('Não foi possível copiar o link', 'error'));
 }
 
+// Envia lembrete de carrinho por WhatsApp (disparo explícito e individual).
+async function sendCartReminder(slug, name) {
+  if (!confirm(`Enviar lembrete de pagamento por WhatsApp para "${name}"?`)) return;
+  try {
+    const r = await api(`/painel/api/abandoned-carts/${slug}/send-reminder`, {method:'POST'});
+    toast(`✓ Lembrete enviado (${r.phone||''})`);
+  } catch (e) {
+    toast('Falha no envio: ' + e.message, 'error');
+  }
+}
+
 let currentSlug = null;
 function openModal(slug, name, zapiExpires) {
   currentSlug = slug;
@@ -625,6 +657,68 @@ function openModal(slug, name, zapiExpires) {
   document.getElementById('modal').classList.remove('hidden');
 }
 function closeModal() { document.getElementById('modal').classList.add('hidden'); }
+
+// ── Drill-down (detalhes do consultório) ────────────────────────────────────
+const escHtml = (s) => (s==null?'':''+s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ATTEND_LABEL = {pending:'—', attended:'✓ compareceu', missed_no_notice:'✗ faltou', missed_with_notice:'avisou'};
+function fmtDateTime(s) {
+  if (!s) return '—';
+  try { return new Date((''+s).replace(' ','T')).toLocaleString('pt-BR', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}); }
+  catch { return s; }
+}
+function closeDetail() { document.getElementById('detail-modal').classList.add('hidden'); }
+async function openDetail(slug, name) {
+  document.getElementById('detail-title').textContent = name || slug;
+  document.getElementById('detail-sub').textContent = slug;
+  document.getElementById('detail-body').innerHTML = '<p class="text-sm text-slate-400">Carregando…</p>';
+  document.getElementById('detail-modal').classList.remove('hidden');
+  try {
+    const d = await api(`/painel/api/tenant/${slug}/overview`);
+    renderDetail(d);
+  } catch (e) {
+    document.getElementById('detail-body').innerHTML = `<p class="text-sm text-rose-600">Erro ao carregar: ${escHtml(e.message)}</p>`;
+  }
+}
+function apptRow(a) {
+  return `<tr class="border-t border-slate-100">
+    <td class="p-2">${escHtml(a.patient_name||'—')}</td>
+    <td class="p-2 text-xs text-slate-500">${fmtDateTime(a.scheduled_at)}</td>
+    <td class="p-2 text-xs">${a.cancelled ? '<span class="text-rose-500">cancelado</span>' : (a.confirmed ? '<span class="text-emerald-600">confirmado</span>' : '<span class="text-slate-400">pendente</span>')}</td>
+    <td class="p-2 text-xs text-slate-500">${ATTEND_LABEL[a.attendance]||a.attendance||'—'}</td>
+  </tr>`;
+}
+function renderDetail(d) {
+  const s = d.stats || {};
+  const kpi = (v, lbl, cls) => `<div class="rounded-lg border ${cls||'border-slate-200 bg-slate-50'} p-2 text-center"><div class="text-lg font-semibold">${v}</div><div class="text-[11px] text-slate-500">${lbl}</div></div>`;
+  const info = (lbl, val) => `<div><span class="text-slate-400">${lbl}:</span> ${escHtml(val||'—')}</div>`;
+  const apptTable = (title, rows) => `
+    <div class="mt-4">
+      <h4 class="text-xs font-semibold uppercase text-slate-500 mb-1">${title} <span class="text-slate-400">(${rows.length})</span></h4>
+      ${rows.length ? `<div class="border border-slate-200 rounded-lg overflow-x-auto"><table class="w-full text-sm min-w-[420px]"><tbody>${rows.map(apptRow).join('')}</tbody></table></div>`
+                    : '<p class="text-xs text-slate-400">Nenhum.</p>'}
+    </div>`;
+  document.getElementById('detail-body').innerHTML = `
+    <div class="grid grid-cols-2 gap-2 text-xs text-slate-600 mb-4">
+      ${info('Plano', d.plan)} ${info('Status', d.status)}
+      ${info('E-mail', d.email)} ${info('Telefone', d.phone)}
+      ${info('Plano vence', fmtDate(d.plan_expires_at))} ${info('Z-API vence', fmtDate(d.zapi_expires_at))}
+      ${info('Grátis até', fmtDate(d.free_until))} ${info('Criado em', fmtDate(d.created_at))}
+    </div>
+    <h4 class="text-xs font-semibold uppercase text-slate-500 mb-1">Indicadores do mês (${d.month||''})</h4>
+    <div class="grid grid-cols-3 sm:grid-cols-6 gap-2">
+      ${kpi(s.total??0,'Sessões')}
+      ${kpi(s.attended??0,'Compareceu','border-emerald-200 bg-emerald-50')}
+      ${kpi((s.missed_no_notice??0)+(s.missed_with_notice??0),'Faltas','border-rose-200 bg-rose-50')}
+      ${kpi(s.cancelled??0,'Cancel.')}
+      ${kpi(s.active_patients??0,'Pacientes')}
+      ${kpi(fmtBRL(s.revenue??0).replace('R$ ','R$'),'Receita','border-violet-200 bg-violet-50')}
+    </div>
+    ${apptTable('Próximos agendamentos', d.upcoming||[])}
+    ${apptTable('Últimos agendamentos', d.recent||[])}
+    ${d.dashboard_url ? `<div class="mt-4"><a href="${d.dashboard_url}" target="_blank" class="text-sm text-violet-600 hover:underline">Abrir dashboard do consultório →</a></div>` : ''}
+  `;
+}
+
 async function saveAction() {
   const body = {};
   const st = document.getElementById('m-status').value;
