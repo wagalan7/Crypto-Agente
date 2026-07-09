@@ -33,6 +33,7 @@
     <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="subs">Assinaturas</button>
     <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="abandoned">Carrinho Abandonado</button>
     <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="tenants">Usuários</button>
+    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="health">Saúde WhatsApp</button>
     <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="content">Conteúdo do Site</button>
     <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="audit">Auditoria</button>
     <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="security">Segurança</button>
@@ -43,6 +44,18 @@
 
   <!-- VISÃO GERAL -->
   <section id="tab-overview" class="tab-pane">
+    <!-- Painel de alertas (precisa de atenção) -->
+    <div id="alerts-wrap" class="mb-6 hidden">
+      <div class="flex items-center gap-2 mb-2">
+        <h3 class="font-semibold text-gray-900">⚠️ Precisa de atenção</h3>
+        <span id="alerts-count" class="badge b-pending">0</span>
+      </div>
+      <div id="alerts" class="grid grid-cols-1 md:grid-cols-2 gap-3"></div>
+    </div>
+    <div id="alerts-ok" class="mb-6 hidden rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-700">
+      ✓ Tudo em ordem — nenhum vencimento próximo, pendência de pagamento ou instância desconectada.
+    </div>
+
     <div id="kpis" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
       <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
         <div class="text-xs text-gray-500">MRR</div>
@@ -86,6 +99,17 @@
 
   <!-- ASSINATURAS -->
   <section id="tab-subs" class="tab-pane hidden">
+    <div class="flex flex-wrap items-center gap-2 mb-3">
+      <input id="subs-search" type="search" placeholder="Buscar por nome, e-mail, telefone…"
+             class="flex-1 min-w-[200px] text-sm border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500 outline-none">
+      <select id="subs-plan" class="text-sm border border-slate-300 rounded-lg px-2 py-2">
+        <option value="">Todos os planos</option>
+        <option value="mensal">Mensal</option>
+        <option value="semestral">Semestral</option>
+        <option value="anual">Anual</option>
+      </select>
+      <span id="subs-count" class="text-xs text-slate-500"></span>
+    </div>
     <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
       <table class="w-full text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
@@ -123,6 +147,23 @@
 
   <!-- USUÁRIOS -->
   <section id="tab-tenants" class="tab-pane hidden">
+    <div class="flex flex-wrap items-center gap-2 mb-3">
+      <input id="tenants-search" type="search" placeholder="Buscar por nome, e-mail, telefone, slug…"
+             class="flex-1 min-w-[200px] text-sm border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-violet-500 outline-none">
+      <select id="tenants-status" class="text-sm border border-slate-300 rounded-lg px-2 py-2">
+        <option value="">Todos os status</option>
+        <option value="active">Ativo</option>
+        <option value="suspended">Suspenso</option>
+        <option value="pending_payment">Pendente</option>
+      </select>
+      <select id="tenants-plan" class="text-sm border border-slate-300 rounded-lg px-2 py-2">
+        <option value="">Todos os planos</option>
+        <option value="mensal">Mensal</option>
+        <option value="semestral">Semestral</option>
+        <option value="anual">Anual</option>
+      </select>
+      <span id="tenants-count" class="text-xs text-slate-500"></span>
+    </div>
     <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
       <table class="w-full text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
@@ -139,6 +180,33 @@
         <tbody id="tenants-body"></tbody>
       </table>
     </div>
+  </section>
+
+  <!-- SAÚDE WHATSAPP -->
+  <section id="tab-health" class="tab-pane hidden">
+    <div class="flex items-center justify-between mb-3">
+      <div>
+        <h3 class="font-semibold text-gray-900">Saúde das instâncias (Z-API)</h3>
+        <p class="text-xs text-gray-500">Estado da última checagem do monitor. Instâncias desconectadas param de responder pacientes.</p>
+      </div>
+      <button id="btn-health-check" class="text-sm px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">Verificar agora</button>
+    </div>
+    <div id="health-summary" class="grid grid-cols-3 gap-3 mb-4 text-sm"></div>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
+          <tr>
+            <th class="p-3">Consultório</th>
+            <th class="p-3">Status</th>
+            <th class="p-3">Fora do ar há</th>
+            <th class="p-3">Última checagem</th>
+            <th class="p-3">Último erro</th>
+          </tr>
+        </thead>
+        <tbody id="health-body"></tbody>
+      </table>
+    </div>
+    <div id="health-msg" class="mt-2 text-sm"></div>
   </section>
 
   <!-- CONTEÚDO -->
@@ -270,11 +338,20 @@ const fmtDate = (s) => {
 };
 const timeAgo = (s) => {
   if (!s) return '—';
-  const ms = Date.now() - new Date(s).getTime();
+  const ms = Date.now() - new Date((''+s).replace(' ', 'T') + (/[zZ]|[+-]\d\d:?\d\d$/.test(''+s) ? '' : 'Z')).getTime();
   const h = Math.floor(ms/3600000);
+  if (h < 1) return Math.max(0, Math.floor(ms/60000)) + 'min';
   if (h < 24) return h + 'h';
   return Math.floor(h/24) + 'd';
 };
+// Dias até uma data (negativo = já venceu). Retorna null se sem data.
+const daysUntil = (s) => {
+  if (!s) return null;
+  const d = new Date(s);
+  if (isNaN(d)) return null;
+  return Math.ceil((d.getTime() - Date.now()) / 86400000);
+};
+const norm = (s) => (s||'').toString().toLowerCase();
 const badge = (status) => {
   const map = {active:'b-active', suspended:'b-suspended', pending_payment:'b-pending'};
   const labels = {active:'Ativo', suspended:'Suspenso', pending_payment:'Pendente'};
@@ -318,11 +395,83 @@ async function loadOverview() {
       <div class="text-xs uppercase text-slate-500">${p}</div>
       <div class="text-xl font-bold text-violet-700">${bp[p]||0}</div>
     </div>`).join('');
+
+  loadAlerts();
 }
 
+// Painel de alertas: combina tenants + saúde das instâncias
+async function loadAlerts() {
+  let tenants = [], instances = [];
+  try {
+    const [tj, hj] = await Promise.all([
+      api('/painel/api/tenants'),
+      api('/painel/api/instances/health'),
+    ]);
+    tenants = tj.tenants || [];
+    instances = hj.instances || [];
+  } catch (e) { /* silencioso — alertas são best-effort */ }
+
+  const nm = (t) => t.name || t.slug;
+  const venc = (d) => d < 0 ? `vencido há ${-d}d` : (d === 0 ? 'vence hoje' : `vence em ${d}d`);
+  const cards = [];
+
+  const down = instances.filter(i => i.connected === false);
+  if (down.length) cards.push({ sev:'red', icon:'🔴', title:'WhatsApp desconectado',
+    items: down.map(i => `${i.name||i.slug} — fora há ${timeAgo(i.down_since)}`) });
+
+  const pend = tenants.filter(t => t.status === 'pending_payment');
+  if (pend.length) cards.push({ sev:'amber', icon:'💳', title:'Pagamento pendente',
+    items: pend.map(t => `${nm(t)} — desde ${fmtDate(t.created_at)}`) });
+
+  const planExp = tenants.filter(t => t.status==='active')
+    .map(t => ({t, d: daysUntil(t.plan_expires_at)}))
+    .filter(x => x.d !== null && x.d <= 5).sort((a,b)=>a.d-b.d);
+  if (planExp.length) cards.push({ sev: planExp.some(x=>x.d<0)?'red':'amber', icon:'📅', title:'Plano vencendo',
+    items: planExp.map(x => `${nm(x.t)} — ${venc(x.d)}`) });
+
+  const zapiExp = tenants.map(t => ({t, d: daysUntil(t.zapi_expires_at)}))
+    .filter(x => x.d !== null && x.d <= 5).sort((a,b)=>a.d-b.d);
+  if (zapiExp.length) cards.push({ sev: zapiExp.some(x=>x.d<0)?'red':'amber', icon:'🔗', title:'Z-API vencendo',
+    items: zapiExp.map(x => `${nm(x.t)} — ${venc(x.d)}`) });
+
+  const wrap = document.getElementById('alerts-wrap');
+  const okBox = document.getElementById('alerts-ok');
+  if (!cards.length) { wrap.classList.add('hidden'); okBox.classList.remove('hidden'); return; }
+  okBox.classList.add('hidden'); wrap.classList.remove('hidden');
+  document.getElementById('alerts-count').textContent = cards.reduce((n,c)=>n+c.items.length,0);
+  const sevCls = { red:'border-rose-200 bg-rose-50', amber:'border-amber-200 bg-amber-50' };
+  document.getElementById('alerts').innerHTML = cards.map(c => `
+    <div class="rounded-xl border ${sevCls[c.sev]} p-3">
+      <div class="flex items-center justify-between">
+        <span class="font-medium text-gray-800 text-sm">${c.icon} ${c.title}</span>
+        <span class="badge ${c.sev==='red'?'b-suspended':'b-pending'}">${c.items.length}</span>
+      </div>
+      <ul class="mt-1.5 text-xs text-slate-600 space-y-0.5 list-disc list-inside">
+        ${c.items.slice(0,8).map(i=>`<li>${i}</li>`).join('')}
+        ${c.items.length>8?`<li class="list-none text-slate-400">+${c.items.length-8} outros…</li>`:''}
+      </ul>
+    </div>`).join('');
+}
+
+let subsData = [];
 async function loadSubs() {
   const {subscriptions} = await api('/painel/api/subscriptions');
-  document.getElementById('subs-body').innerHTML = subscriptions.map(s => `
+  subsData = subscriptions || [];
+  renderSubs();
+}
+function renderSubs() {
+  const q = norm(document.getElementById('subs-search').value.trim());
+  const plan = document.getElementById('subs-plan').value;
+  const rows = subsData.filter(s => {
+    if (plan && (s.plan||'') !== plan) return false;
+    if (q) {
+      const hay = norm([s.name,s.slug,s.psychologist_name,s.full_name,s.email,s.phone].filter(Boolean).join(' '));
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  document.getElementById('subs-count').textContent = `${rows.length} de ${subsData.length}`;
+  document.getElementById('subs-body').innerHTML = rows.map(s => `
     <tr class="border-t border-slate-100">
       <td class="p-3"><div class="font-medium">${s.name||'—'}</div><div class="text-xs text-slate-500">${s.slug}</div></td>
       <td class="p-3">${s.psychologist_name||s.full_name||'—'}</td>
@@ -330,7 +479,7 @@ async function loadSubs() {
       <td class="p-3">${s.plan||'—'}</td>
       <td class="p-3">${fmtDate(s.plan_expires_at)}</td>
       <td class="p-3 text-xs text-slate-500">${fmtDate(s.created_at)}</td>
-    </tr>`).join('') || '<tr><td colspan="6" class="p-6 text-center text-slate-400">Nenhuma assinatura ativa.</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="6" class="p-6 text-center text-slate-400">Nenhuma assinatura encontrada.</td></tr>';
 }
 
 async function loadAbandoned() {
@@ -347,9 +496,27 @@ async function loadAbandoned() {
     </tr>`).join('') || '<tr><td colspan="5" class="p-6 text-center text-slate-400">Nenhum carrinho abandonado.</td></tr>';
 }
 
+let tenantsData = [];
 async function loadTenants() {
   const {tenants} = await api('/painel/api/tenants');
-  document.getElementById('tenants-body').innerHTML = tenants.map(t => `
+  tenantsData = tenants || [];
+  renderTenants();
+}
+function renderTenants() {
+  const q = norm(document.getElementById('tenants-search').value.trim());
+  const st = document.getElementById('tenants-status').value;
+  const plan = document.getElementById('tenants-plan').value;
+  const rows = tenantsData.filter(t => {
+    if (st && (t.status||'') !== st) return false;
+    if (plan && (t.plan||'') !== plan) return false;
+    if (q) {
+      const hay = norm([t.name,t.slug,t.email,t.phone,t.billing_city,t.billing_state].filter(Boolean).join(' '));
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  document.getElementById('tenants-count').textContent = `${rows.length} de ${tenantsData.length}`;
+  document.getElementById('tenants-body').innerHTML = rows.map(t => `
     <tr class="border-t border-slate-100">
       <td class="p-3"><div class="font-medium">${t.name||'—'}</div><div class="text-xs text-slate-500">${t.slug}</div></td>
       <td class="p-3 text-xs">${t.email||'—'}<br>${t.phone||''}<br><span class="text-slate-400">${[t.billing_city,t.billing_state].filter(Boolean).join('/')}</span></td>
@@ -361,7 +528,7 @@ async function loadTenants() {
         <button onclick='openModal(${JSON.stringify(t.slug)}, ${JSON.stringify(t.name||t.slug)}, ${JSON.stringify(t.zapi_expires_at||"")})' class="text-xs bg-slate-100 hover:bg-slate-200 px-2 py-1 rounded">Editar</button>
         ${t.dashboard_url ? `<a href="${t.dashboard_url}" target="_blank" class="text-xs text-violet-600 hover:underline ml-2">Dashboard</a>` : ''}
       </td>
-    </tr>`).join('') || '<tr><td colspan="7" class="p-6 text-center text-slate-400">Nenhum consultório.</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="7" class="p-6 text-center text-slate-400">Nenhum consultório encontrado.</td></tr>';
 }
 
 async function loadContent() {
@@ -442,8 +609,45 @@ function loadTab(tab) {
   else if (tab === 'abandoned') loadAbandoned();
   else if (tab === 'tenants') loadTenants();
   else if (tab === 'content') loadContent();
+  else if (tab === 'health') loadHealth();
   else if (tab === 'audit') loadAudit();
   else if (tab === 'security') loadSecurity();
+}
+
+// ── Saúde WhatsApp ──────────────────────────────────────────────────────────
+async function loadHealth() {
+  const msg = document.getElementById('health-msg');
+  msg.textContent = 'Carregando…'; msg.className = 'mt-2 text-sm text-slate-500';
+  try {
+    const {instances} = await api('/painel/api/instances/health');
+    renderHealth(instances || []);
+    msg.textContent = '';
+  } catch (e) {
+    msg.textContent = '✗ ' + e.message; msg.className = 'mt-2 text-sm text-red-600';
+  }
+}
+function renderHealth(instances) {
+  // rank: desconectado (false) primeiro, depois sem-dados (null), depois conectado (true)
+  const rank = v => v === false ? 0 : (v == null ? 1 : 2);
+  const list = [...instances].sort((a,b) => rank(a.connected) - rank(b.connected));
+  const down = list.filter(i => i.connected === false).length;
+  const unknown = list.filter(i => i.connected == null).length;
+  const up = list.filter(i => i.connected === true).length;
+  document.getElementById('health-summary').innerHTML = `
+    <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3"><div class="text-2xl font-semibold text-emerald-700">${up}</div><div class="text-xs text-emerald-600">Conectados</div></div>
+    <div class="rounded-xl border border-rose-200 bg-rose-50 p-3"><div class="text-2xl font-semibold text-rose-700">${down}</div><div class="text-xs text-rose-600">Desconectados</div></div>
+    <div class="rounded-xl border border-slate-200 bg-slate-50 p-3"><div class="text-2xl font-semibold text-slate-700">${unknown}</div><div class="text-xs text-slate-500">Sem dados</div></div>`;
+  const statusBadge = v => v === false
+    ? '<span class="badge b-suspended">✗ desconectado</span>'
+    : (v == null ? '<span class="badge b-pending">— sem dados</span>' : '<span class="badge b-active">✓ conectado</span>');
+  document.getElementById('health-body').innerHTML = list.map(i => `
+    <tr class="border-t border-slate-100">
+      <td class="p-3"><div class="font-medium">${i.name||'—'}</div><div class="text-xs text-slate-500">${i.slug}</div></td>
+      <td class="p-3">${statusBadge(i.connected)}</td>
+      <td class="p-3 text-xs">${i.connected === false && i.down_since ? timeAgo(i.down_since) : '—'}</td>
+      <td class="p-3 text-xs text-slate-500">${i.last_checked ? timeAgo(i.last_checked) : '—'}</td>
+      <td class="p-3 text-xs text-slate-500">${i.last_error || '—'}</td>
+    </tr>`).join('') || '<tr><td colspan="5" class="p-6 text-center text-slate-400">Nenhuma instância monitorada.</td></tr>';
 }
 
 // ── Segurança / 2FA ─────────────────────────────────────────────────────────
@@ -543,6 +747,26 @@ async function loadAudit() {
 }
 document.getElementById('btn-audit-refresh')?.addEventListener('click', loadAudit);
 document.getElementById('audit-filter')?.addEventListener('change', loadAudit);
+
+// Filtros — Assinaturas
+document.getElementById('subs-search')?.addEventListener('input', renderSubs);
+document.getElementById('subs-plan')?.addEventListener('change', renderSubs);
+// Filtros — Usuários
+document.getElementById('tenants-search')?.addEventListener('input', renderTenants);
+document.getElementById('tenants-status')?.addEventListener('change', renderTenants);
+document.getElementById('tenants-plan')?.addEventListener('change', renderTenants);
+// Saúde WhatsApp — verificar agora
+document.getElementById('btn-health-check')?.addEventListener('click', async () => {
+  const btn = document.getElementById('btn-health-check');
+  const msg = document.getElementById('health-msg');
+  btn.disabled = true; msg.textContent = 'Verificando instâncias…'; msg.className = 'mt-2 text-sm text-slate-500';
+  try {
+    await api('/painel/api/instances/check', {method:'POST'});
+    await loadHealth();
+  } catch (e) {
+    msg.textContent = '✗ ' + e.message; msg.className = 'mt-2 text-sm text-red-600';
+  } finally { btn.disabled = false; }
+});
 
 loadOverview();
 </script>
