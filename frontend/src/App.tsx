@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react'
 import { Search } from 'lucide-react'
 import TickerBar from './components/TickerBar'
 import ChartPanel from './components/ChartPanel'
+import HomeCockpit from './components/HomeCockpit'
+import NavRail, { type SectionKey } from './components/NavRail'
 import TradeManager from './components/TradeManager'
 import NLPPanel from './components/NLPPanel'
 import RecommendationsPanel from './components/RecommendationsPanel'
@@ -210,6 +212,10 @@ async function fetchFreshTickers(): Promise<BinanceTicker[]> {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
+  // Home é a PORTA DE ENTRADA: abre no cockpit. Fecha (✕) ou clica num par →
+  // vai pro scanner/gráfico de sempre. Trocar p/ useState(false) volta ao
+  // comportamento antigo (app abre no scanner, Home só pelo botão).
+  const [showHome, setShowHome] = useState(true)
   const [showTradeManager, setShowTradeManager] = useState(false)
   const [showNLP, setShowNLP] = useState(false)
   const [showRecommendations, setShowRecommendations] = useState(false)
@@ -520,78 +526,9 @@ export default function App() {
             </span>
           </div>
         </div>
-        <span className="text-slate-500 text-xs flex-shrink-0 hidden sm:block">{assets.length} pares</span>
-        {/* Mobile: fileira de menus em linha própria abaixo do logo, rola na horizontal (todos alcançáveis, sem sobrepor o logo); desktop mantém em linha única alinhado à direita sem scroll */}
-        <div className="flex items-center gap-1.5 w-full sm:w-auto min-w-0 overflow-x-auto justify-start sm:overflow-visible sm:justify-end [&>*]:flex-shrink-0">
-          <button
-            onClick={() => setShowRecommendations(true)}
-            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-yellow-500/20 to-emerald-500/20 hover:from-yellow-500/30 hover:to-emerald-500/30 border border-yellow-500/40 rounded text-xs font-bold text-yellow-300"
-            title="Trades Recomendados — varredura automática"
-          >
-            <span>✨</span>
-            <span className="hidden sm:block">Recomendados</span>
-          </button>
-          <button
-            onClick={() => setShowDailyPnL(true)}
-            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-emerald-500/20 to-teal-500/20 hover:from-emerald-500/30 hover:to-teal-500/30 border border-emerald-500/40 rounded text-xs font-bold text-emerald-300"
-            title="Resultado do Dia — P&L das recomendações"
-          >
-            <span>📊</span>
-            <span className="hidden sm:block">Resultado</span>
-          </button>
-          <button
-            onClick={() => setShowInsights(true)}
-            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-violet-500/20 to-purple-500/20 hover:from-violet-500/30 hover:to-purple-500/30 border border-violet-500/40 rounded text-xs font-bold text-violet-300"
-            title="Insights — o que o sistema aprendeu"
-          >
-            <span>🎓</span>
-            <span className="hidden sm:block">Insights</span>
-          </button>
-          <button
-            onClick={() => setShowDashboard(true)}
-            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-cyan-500/20 to-blue-500/20 hover:from-cyan-500/30 hover:to-blue-500/30 border border-cyan-500/40 rounded text-xs font-bold text-cyan-300"
-            title="Dashboard — performance comparativa"
-          >
-            <span>📈</span>
-            <span className="hidden sm:block">Dashboard</span>
-          </button>
-          <button
-            onClick={() => setShowAssertiveness(true)}
-            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-emerald-500/20 to-green-500/20 hover:from-emerald-500/30 hover:to-green-500/30 border border-emerald-500/40 rounded text-xs font-bold text-emerald-300"
-            title="Assertividade — o quão confiável o bot está sendo"
-          >
-            <span>🛡️</span>
-            <span className="hidden sm:block">Assertividade</span>
-          </button>
-          <button
-            onClick={() => setShowSweep(true)}
-            className="flex items-center gap-1 px-2 py-1 bg-gradient-to-r from-sky-500/20 to-indigo-500/20 hover:from-sky-500/30 hover:to-indigo-500/30 border border-sky-500/40 rounded text-xs font-bold text-sky-300"
-            title="Sweep — backtest massivo do universo (worker)"
-          >
-            <span>📡</span>
-            <span className="hidden sm:block">Sweep</span>
-          </button>
-          <RiskStatusBadge onOpen={() => setShowStatus(true)} />
-          <PushSubscribeButton />
-          <button
-            onClick={() => setShowNLP(v => !v)}
-            className={`flex items-center gap-1 px-2 py-1 border rounded text-xs font-semibold transition-colors ${
-              showNLP
-                ? 'bg-violet-700/40 border-violet-500/60 text-violet-300'
-                : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
-            }`}
-            title="Coach PNL – Gestão Emocional"
-          >
-            <span>🧠</span>
-            <span className="hidden sm:block">PNL</span>
-          </button>
-          <button
-            onClick={() => setShowTradeManager(v => !v)}
-            className="flex items-center gap-1 px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded text-xs font-semibold text-slate-300"
-          >
-            <span>📋</span>
-            <span className="hidden sm:block">Trades</span>
-          </button>
+        {/* Menu agora vive no rail lateral (NavRail). Cabeçalho fica enxuto. */}
+        <div className="flex items-center gap-3 flex-shrink-0 self-end sm:self-auto">
+          <span className="text-slate-500 text-xs hidden md:block">{assets.length} pares</span>
           <span className="text-slate-600 text-xs font-mono tabular-nums">
             {clock.toLocaleTimeString('pt-BR')}
           </span>
@@ -716,8 +653,44 @@ export default function App() {
     </div>
   )
 
+  // ─── Navegação do shell (rail lateral) ────────────────────────────────────
+  const closeAllPanels = () => {
+    setShowHome(false); setShowRecommendations(false); setShowDailyPnL(false)
+    setShowInsights(false); setShowDashboard(false); setShowAssertiveness(false)
+    setShowSweep(false); setShowStatus(false); setShowNLP(false); setShowTradeManager(false)
+  }
+  const navSelect = (key: string) => {
+    closeAllPanels()
+    switch (key) {
+      case 'home': setShowHome(true); break
+      case 'operar': case 'scanner': break // volta pro scanner (tela base)
+      case 'recs': setShowRecommendations(true); break
+      case 'daily': setShowDailyPnL(true); break
+      case 'trades': setShowTradeManager(true); break
+      case 'coach': setShowNLP(true); break
+      case 'insights': setShowInsights(true); break
+      case 'dashboard': setShowDashboard(true); break
+      case 'assert': setShowAssertiveness(true); break
+      case 'sweep': setShowSweep(true); break
+      case 'risco': setShowStatus(true); break
+      // 'notif' → tratado pelo PushSubscribeButton no próprio slot
+    }
+  }
+  const activeSection: SectionKey =
+    showHome ? 'home'
+    : (showInsights || showDashboard || showAssertiveness) ? 'aprender'
+    : (showSweep || showStatus) ? 'sistema'
+    : 'operar'
+
   return (
-    <div className="h-screen bg-[#0a0e1a] text-white flex flex-col overflow-hidden">
+    <div className="h-screen bg-[#0a0e1a] text-white flex flex-col overflow-hidden lg:pl-16 pb-14 lg:pb-0">
+      <NavRail
+        active={activeSection}
+        onSelect={navSelect}
+        riscoSlot={<RiskStatusBadge onOpen={() => { closeAllPanels(); setShowStatus(true) }} />}
+        notifSlot={<PushSubscribeButton />}
+      />
+
       {/* Scrolling ticker — full width at top */}
       <TickerBar />
 
@@ -748,6 +721,20 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {showHome && (
+        <HomeCockpit
+          onClose={() => setShowHome(false)}
+          onSelectSymbol={(sym, tf) => {
+            setSelectedSymbol(sym)
+            setSelectedTimeframe(tf ?? null)
+            setShowHome(false)
+          }}
+          onOpenRecs={() => { setShowHome(false); setShowRecommendations(true) }}
+          onOpenTrades={() => { setShowHome(false); setShowTradeManager(true) }}
+          onOpenStatus={() => { setShowHome(false); setShowStatus(true) }}
+        />
+      )}
 
       {showTradeManager && (
         <TradeManager
