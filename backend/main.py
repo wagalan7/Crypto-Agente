@@ -161,6 +161,19 @@ HEALTH_WATCHDOG_FAIL_STREAK = int(os.getenv("HEALTH_WATCHDOG_FAIL_STREAK", "3"))
 # Tempo mínimo (s) entre re-alertas da MESMA condição ainda ativa.
 HEALTH_WATCHDOG_COOLDOWN_S = int(os.getenv("HEALTH_WATCHDOG_COOLDOWN_S", "1800"))
 
+# (C) Segurança de margem: o teto do CICLO deve ficar ABAIXO da idade-limite do
+# watchdog. Se as duas envs vierem iguais (ex.: ambas 600 no PRD), um ciclo que
+# rasga o teto dispara "loop parado" no mesmo instante em que aborta. Recuo forçado
+# de 60s pra garantir que o abort/heartbeat aconteça ANTES do alerta.
+if HEALTH_WATCHDOG_ENABLED and SERVER_SCAN_TIMEOUT_S >= HEALTH_WATCHDOG_MAX_AGE_S:
+    _adj = max(60, HEALTH_WATCHDOG_MAX_AGE_S - 60)
+    logging.warning(
+        f"[config] SERVER_SCAN_TIMEOUT_S ({SERVER_SCAN_TIMEOUT_S}) >= "
+        f"HEALTH_WATCHDOG_MAX_AGE_S ({HEALTH_WATCHDOG_MAX_AGE_S}) — reduzindo teto do "
+        f"ciclo p/ {_adj}s pra manter a margem de segurança."
+    )
+    SERVER_SCAN_TIMEOUT_S = _adj
+
 # ── #C Digest diário (Telegram) — relato proativo 1x/dia ─────────────────────
 # Resumo da assertividade (equity, win-rate, calibração, viés direcional) enviado
 # uma vez por dia. Reaproveita send_telegram do #9 — no-op se Telegram não
@@ -370,18 +383,23 @@ async def _server_scan_loop():
             # Teto de tempo no ciclo inteiro: se a busca de mercado pendurar (proxy
             # lento), aborta com TimeoutError (cai no except → conta falha, loop
             # segue) em vez de travar o heartbeat e disparar "Scan loop parado".
+            # (B) Heartbeat incremental: cada símbolo que completa refresca o
+            # "último scan" — assim um ciclo lento-mas-vivo não parece "loop parado".
+            def _scan_hb() -> None:
+                _METRICS["last_scan_at"] = datetime.now(timezone.utc).isoformat()
+
             if EXEC_UNIVERSE_DECOUPLE:
                 from services.recommendation_service import _apply_portfolio_guard
                 recs_display = await asyncio.wait_for(
                     get_recommendations_via_vision(
-                        top_n=SERVER_SCAN_TOP_N, apply_guard=False
+                        top_n=SERVER_SCAN_TOP_N, apply_guard=False, heartbeat=_scan_hb
                     ),
                     timeout=SERVER_SCAN_TIMEOUT_S,
                 )
                 recs = await _apply_portfolio_guard(list(recs_display))
             else:
                 recs = await asyncio.wait_for(
-                    get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N),
+                    get_recommendations_via_vision(top_n=SERVER_SCAN_TOP_N, heartbeat=_scan_hb),
                     timeout=SERVER_SCAN_TIMEOUT_S,
                 )
                 recs_display = recs
@@ -570,8 +588,17 @@ async def _server_scan_loop():
             _METRICS["last_scan_error"] = str(e)[:300]
             _METRICS["scans_failed"] += 1
 
+        # (D) Backoff progressivo: se a fonte (proxy) veio degradada no último ciclo,
+        # espera um extra antes do próximo pra não martelar um proxy caído.
         try:
-            await asyncio.sleep(SERVER_SCAN_INTERVAL)
+            from services.recommendation_service import get_source_backoff_s
+            _extra = get_source_backoff_s()
+        except Exception:
+            _extra = 0
+        if _extra:
+            logging.info(f"[server-scan] fonte degradada — backoff extra {_extra}s antes do próximo ciclo")
+        try:
+            await asyncio.sleep(SERVER_SCAN_INTERVAL + _extra)
         except asyncio.CancelledError:
             break
 

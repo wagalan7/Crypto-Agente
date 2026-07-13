@@ -138,22 +138,67 @@ def _score_with_htf_confirm(sig: "TradeSignal", base_score: float, confirm_dirs:
     ):
         return min(100.0, base_score + HIGH_TF_CONFIRM_BONUS)
     return base_score
-# Concorrência do server-scan (símbolos em paralelo). Default 6. Com top_n alto
-# (ex.: 500) via proxy, subir p/ ~14 mantém o ciclo perto de 90s. Env-driven.
+# Concorrência do server-scan (símbolos em paralelo). Default 12 (era 6). É I/O de
+# REDE (fetch de klines via proxy), não CPU — subir a concorrência encurta o ciclo
+# sem risco de GIL (o starvation que preocupava era do SWEEP, CPU-bound, não daqui).
+# Com top_n alto (ex.: 300) via proxy, 12–16 mantém o ciclo dentro do budget. Env.
 try:
-    SCAN_CONCURRENCY = max(1, int(os.getenv("SCAN_CONCURRENCY", "6")))
+    SCAN_CONCURRENCY = max(1, int(os.getenv("SCAN_CONCURRENCY", "12")))
 except (TypeError, ValueError):
-    SCAN_CONCURRENCY = 6
+    SCAN_CONCURRENCY = 12
 # Teto de tempo POR SÍMBOLO no server-scan. Um símbolo cujo fetch OHLCV trava
 # (proxy futures lento/throttled) segurava o slot do semáforo até o abort global
-# (SERVER_SCAN_TIMEOUT_S=600) → um punhado de símbolos lentos estrangulava o ciclo
-# inteiro e disparava "timeout na varredura". Com o teto, o símbolo lento é PULADO
-# (retorna None) e o slot é liberado na hora. 0 = desliga o teto (comportamento
-# antigo). Default 25s (folga sobre os 20s de timeout por-request do proxy).
+# → um punhado de símbolos lentos estrangulava o ciclo. Com o teto, o símbolo lento
+# é PULADO (retorna None) e o slot é liberado na hora. 0 = desliga. Default 12s
+# (era 25s — um fetch saudável é <3s; 25s deixava um símbolo degradado torrar slot).
 try:
-    SERVER_SCAN_SYMBOL_TIMEOUT_S = max(0, int(os.getenv("SERVER_SCAN_SYMBOL_TIMEOUT_S", "25")))
+    SERVER_SCAN_SYMBOL_TIMEOUT_S = max(0, int(os.getenv("SERVER_SCAN_SYMBOL_TIMEOUT_S", "12")))
 except (TypeError, ValueError):
-    SERVER_SCAN_SYMBOL_TIMEOUT_S = 25
+    SERVER_SCAN_SYMBOL_TIMEOUT_S = 12
+# (A) Orçamento de WALL-CLOCK do ciclo inteiro. Quando estoura, o ciclo PARA de
+# despachar novos símbolos e segue com o que já completou — em vez do "tudo-ou-nada"
+# que abortava em SERVER_SCAN_TIMEOUT_S e gerava ZERO recs. Proxy lento → escaneia
+# menos moedas, mas SEMPRE termina e entrega. 0 = desliga. Default 210s (casa com a
+# cadência natural ~210s do tinyproxy e fica < teto de ciclo/watchdog).
+try:
+    SCAN_CYCLE_BUDGET_S = max(0, int(os.getenv("SERVER_SCAN_CYCLE_BUDGET_S", "210")))
+except (TypeError, ValueError):
+    SCAN_CYCLE_BUDGET_S = 210
+# (D) Backoff progressivo quando a fonte degrada. Se a fração de símbolos que
+# falharam/estouraram num ciclo passa deste limiar, o próximo ciclo espera um extra
+# (lido pelo loop em main via get_source_backoff_s) pra não martelar o proxy caído.
+try:
+    SCAN_DEGRADED_FAIL_RATIO = float(os.getenv("SCAN_DEGRADED_FAIL_RATIO", "0.6"))
+except (TypeError, ValueError):
+    SCAN_DEGRADED_FAIL_RATIO = 0.6
+try:
+    SCAN_BACKOFF_STEP_S = max(0, int(os.getenv("SCAN_BACKOFF_STEP_S", "60")))
+except (TypeError, ValueError):
+    SCAN_BACKOFF_STEP_S = 60
+try:
+    SCAN_BACKOFF_MAX_S = max(0, int(os.getenv("SCAN_BACKOFF_MAX_S", "300")))
+except (TypeError, ValueError):
+    SCAN_BACKOFF_MAX_S = 300
+# (E) Cache TTL de OHLCV pra TFs altos — alivia o proxy (o 4h muda 1×/4h; refetchar
+# a cada 90s é desperdício que degrada o proxy). DEFAULT OFF: toca o caminho de
+# geração de sinal (dinheiro real), então fica implementado mas inerte até você
+# revisar e ligar. TTL por-TF via SCAN_OHLCV_TTL (ex.: "4h=600,1h=180").
+SCAN_OHLCV_CACHE_ENABLED = os.getenv("SCAN_OHLCV_CACHE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+def _parse_ohlcv_ttl() -> dict:
+    raw = os.getenv("SCAN_OHLCV_TTL", "4h=600,1h=180,12h=1200,1d=3600").strip()
+    out: dict = {}
+    for part in raw.split(","):
+        if "=" in part:
+            k, _, v = part.partition("=")
+            try:
+                out[k.strip()] = max(0, int(v.strip()))
+            except (TypeError, ValueError):
+                pass
+    return out
+SCAN_OHLCV_TTL = _parse_ohlcv_ttl()
+_OHLCV_CACHE: dict = {}  # (symbol, tf) -> (expires_monotonic, df)
+# Estado de saúde da fonte (D): fração de falha do último ciclo → backoff.
+_SOURCE_HEALTH: dict = {"last_fail_ratio": 0.0, "consecutive_degraded": 0}
 CACHE_TTL = 15                    # segundos (era 30 — push do scan tava com delay, agora mais fresco)
 MIN_RR = 1.5                      # filtro mínimo absoluto
 MIN_CONFIDENCE_B = 0.55           # tier B mínimo
@@ -1597,10 +1642,33 @@ def _get_server_data_source():
     return bs, "okx-perp"
 
 
+async def _fetch_ohlcv_cached(svc, symbol: str, tf: str, limit: int):
+    """(E) Fetch de OHLCV com cache TTL por-TF pra ALIVIAR o proxy. Só age quando
+    SCAN_OHLCV_CACHE_ENABLED e há TTL>0 pro TF (default OFF → passa direto).
+    Barras de TF alto (4h/1d) mudam raramente; refetchar a cada 90s é desperdício."""
+    if not SCAN_OHLCV_CACHE_ENABLED:
+        return await svc.fetch_ohlcv(symbol, tf, limit)
+    ttl = SCAN_OHLCV_TTL.get(tf, 0)
+    if ttl <= 0:
+        return await svc.fetch_ohlcv(symbol, tf, limit)
+    key = (symbol, tf)
+    now = time.monotonic()
+    hit = _OHLCV_CACHE.get(key)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    df = await svc.fetch_ohlcv(symbol, tf, limit)
+    try:
+        if df is not None and not df.empty:
+            _OHLCV_CACHE[key] = (now + ttl, df)
+    except Exception:
+        pass
+    return df
+
+
 async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[TradeSignal]:
     """Análise server-side usando a fonte escolhida (futures via proxy ou spot)."""
     try:
-        df = await svc.fetch_ohlcv(symbol, tf, 300)
+        df = await _fetch_ohlcv_cached(svc, symbol, tf, 300)
         if df.empty or len(df) < 80:
             return None
         ind = calculate_indicators(df)
@@ -1640,8 +1708,18 @@ async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
     return max(scored, key=lambda x: x[1])
 
 
+def get_source_backoff_s() -> int:
+    """(D) Backoff (s) sugerido pro PRÓXIMO ciclo, com base na saúde da fonte no
+    último ciclo. 0 quando saudável. Lido pelo loop de scan (main) pra não martelar
+    o proxy quando ele está caído/degradado."""
+    n = _SOURCE_HEALTH.get("consecutive_degraded", 0)
+    if n <= 0:
+        return 0
+    return min(SCAN_BACKOFF_MAX_S, SCAN_BACKOFF_STEP_S * n)
+
+
 async def get_recommendations_via_vision(
-    top_n: int = 30, apply_guard: bool = True
+    top_n: int = 30, apply_guard: bool = True, heartbeat=None
 ) -> List[Recommendation]:
     """
     Versão server-side pro Railway. Escolhe fonte dinamicamente:
@@ -1710,11 +1788,29 @@ async def get_recommendations_via_vision(
     recommendations: List[Recommendation] = []
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
 
+    # (A) Orçamento de wall-clock: quando estoura, símbolos ainda na fila são
+    # pulados sem bater no proxy → o ciclo SEMPRE termina dentro do budget com o
+    # que já completou, em vez de abortar tudo no teto global e gerar zero recs.
+    _deadline = (time.monotonic() + SCAN_CYCLE_BUDGET_S) if SCAN_CYCLE_BUDGET_S > 0 else None
+    _stats = {"done": 0, "fail": 0, "skipped_budget": 0}
+
+    def _hb():
+        # (B) Heartbeat incremental: mantém o "scan vivo" fresco DURANTE o ciclo,
+        # senão um ciclo lento-mas-progredindo parece "loop parado" pro watchdog.
+        if heartbeat is not None:
+            try:
+                heartbeat()
+            except Exception:
+                pass
+
     async def _bounded(sym: str):
         async with sem:
+            # (A) Estourou o orçamento? Pula sem tocar o proxy (libera a fila rápido).
+            if _deadline is not None and time.monotonic() > _deadline:
+                _stats["skipped_budget"] += 1
+                return sym, None
             # Teto por-símbolo: se o fetch travar (proxy lento), PULA o símbolo e
-            # libera o slot do semáforo — sem isso, poucos símbolos lentos seguram
-            # os slots até o abort global de 600s e o ciclo inteiro estoura.
+            # libera o slot do semáforo na hora.
             try:
                 if SERVER_SCAN_SYMBOL_TIMEOUT_S > 0:
                     best = await asyncio.wait_for(
@@ -1724,14 +1820,36 @@ async def get_recommendations_via_vision(
                 else:
                     best = await _best_tf_for_symbol_server(svc, sym)
             except asyncio.TimeoutError:
+                _stats["fail"] += 1
                 _log.warning(f"[server-scan] {sym} passou de {SERVER_SCAN_SYMBOL_TIMEOUT_S}s — pulado (slot liberado)")
+                _hb()
                 return sym, None
             except Exception as e:
+                _stats["fail"] += 1
                 _log.warning(f"[server-scan] {sym} falhou ({e}) — pulado")
+                _hb()
                 return sym, None
+            _stats["done"] += 1
+            _hb()
             return sym, best
 
     all_results = await asyncio.gather(*[_bounded(s) for s in symbols])
+
+    # (D) Saúde da fonte: fração de símbolos que falharam/estouraram (excl. os
+    # pulados por budget, que não são culpa do proxy). Alimenta o backoff do loop.
+    _attempted = _stats["done"] + _stats["fail"]
+    _fail_ratio = (_stats["fail"] / _attempted) if _attempted > 0 else 0.0
+    _SOURCE_HEALTH["last_fail_ratio"] = round(_fail_ratio, 3)
+    if _fail_ratio >= SCAN_DEGRADED_FAIL_RATIO:
+        _SOURCE_HEALTH["consecutive_degraded"] += 1
+    else:
+        _SOURCE_HEALTH["consecutive_degraded"] = 0
+    if _stats["skipped_budget"] or _fail_ratio >= SCAN_DEGRADED_FAIL_RATIO:
+        _log.info(
+            f"[server-scan] ciclo: ok={_stats['done']} falha={_stats['fail']} "
+            f"pulados_budget={_stats['skipped_budget']} fail_ratio={_fail_ratio:.0%} "
+            f"backoff_próximo={get_source_backoff_s()}s"
+        )
 
     # Macro regime gate
     try:
