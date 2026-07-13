@@ -505,6 +505,24 @@ async def _handle_message(tenant: dict, phone: str, text: str):
             f"Recebi seu áudio! 🎙️ Vou repassar para a {psy_name}, "
             f"que entra em contato em breve para te responder por aqui. 💖",
         )
+        # Notifica a psicóloga que há um áudio aguardando. Prometemos ao paciente
+        # que ela responde — se o número dela for diferente do número do Z-API,
+        # sem este aviso o áudio passaria batido. Só notifica se houver telefone
+        # configurado e diferente do remetente (evita auto-notificação).
+        psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
+        if psy_phone and psy_phone != _norm_phone(phone):
+            try:
+                _pac = db.get_patient(tenant["id"], phone)
+                nome_pac = (_pac.get("name") if _pac else "") or phone
+                await wa.send_message(
+                    tenant, psy_phone,
+                    f"🎙️ *Áudio de paciente aguardando resposta.*\n"
+                    f"Paciente: *{nome_pac}*\n"
+                    f"Número: {phone}\n\n"
+                    f"A IA não interpreta áudios — dê uma olhada e responda quando puder. 💖",
+                )
+            except Exception as e:
+                logger.warning(f"[{tenant['slug']}] Falha ao notificar psicóloga sobre áudio: {e}")
         return
 
     # Detectar se é primeira mensagem de um novo contato (antes de salvar)
