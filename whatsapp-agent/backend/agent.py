@@ -149,6 +149,29 @@ def _generic_professional(tenant: dict) -> str:
     return (tenant.get("psychologist_name") or "").strip() or "o responsável"
 
 
+def _confirm_today_tail(reply: str, slot, tenant: dict, appt_id=None) -> str:
+    """Pós-processa a confirmação de (re)agendamento. Quando a sessão é HOJE não
+    faz sentido prometer "lembro um dia antes" (não há véspera) — remove essa
+    promessa, confirma direto e já marca a consulta como confirmada (dispensa o
+    followup da manhã). Fora o mesmo-dia, o texto volta intacto. Cobre tanto o
+    texto do LLM quanto os fallbacks determinísticos."""
+    try:
+        if slot.date() != datetime.now(_TZ).date():
+            return reply
+    except Exception:
+        return reply
+    if appt_id is not None:
+        try:
+            db.confirm_appointment(tenant["id"], int(appt_id))
+        except Exception as e:
+            logger.warning(f"[{tenant.get('slug')}] confirmação mesmo-dia falhou: {e}")
+    # Remove qualquer promessa de lembrete da véspera, em qualquer variação
+    cleaned = re.sub(
+        r"\s*(?:e\s+)?vou te lembrar um dia antes[,.]?\s*(?:combinado)?\s*[!?]?\s*💖?",
+        "", reply, flags=re.IGNORECASE).rstrip(" .!💖")
+    return f"{cleaned}. Como é para *hoje*, já deixei sua presença confirmada. Até logo! 💖".strip()
+
+
 def _build_system_prompt(tenant: dict) -> str:
     if tenant.get('pix_key'):
         pix_section = (
@@ -440,6 +463,7 @@ EXEMPLOS DE TOM:
 
 Ao marcar / remarcar uma sessão (NÃO peça confirmação de presença agora):
 "Prontinho, [primeiro_nome]! 😊 Sua sessão ficou marcada para [slot]. Vou te lembrar um dia antes, combinado? 💖"
+- ATENÇÃO: se a sessão for para HOJE (mesmo dia), NÃO diga "lembro um dia antes" — não há véspera. Confirme direto, ex.: "Prontinho! ✅ Sua sessão de hoje ficou às [hora]. Como é para hoje, já está confirmada. Até logo! 💖"
 
 Atraso pequeno:
 "Sem problema! 😊 Te esperamos hoje às [hora], pode chegar."
@@ -634,6 +658,7 @@ EXEMPLOS DE TOM:
 
 Ao marcar / remarcar (NÃO peça confirmação de presença agora):
 "Prontinho, [primeiro_nome]! 😊 Seu {svc} ficou marcado para [slot]. Vou te lembrar um dia antes, combinado? 💖"
+- ATENÇÃO: se for para HOJE (mesmo dia), NÃO diga "lembro um dia antes" — confirme direto, ex.: "Prontinho! ✅ Como é para hoje, já está confirmado. Até logo! 💖"
 
 Pedido de agendamento SEM preferência (1ª resposta):
 "Claro! 😊 Qual seria a melhor disponibilidade pra você — algum dia da semana ou período (manhã, tarde ou noite) que prefere?"
@@ -1082,9 +1107,11 @@ def _do_reschedule(tenant: dict, phone: str, appt: dict, slot: datetime) -> str:
     saud = f"Prontinho, {nome}! ✅" if nome else "Prontinho! ✅"
     logger.info(f"[{tenant['slug']}][{phone}] REMARCAÇÃO DETERMINÍSTICA id={appt_id} → {slot.isoformat()}")
     if _is_psychology(tenant):
-        return f"{saud} Sua sessão foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
-    svc = _generic_service_noun(tenant)
-    return f"{saud} Seu {svc} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+        reply = f"{saud} Sua sessão foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+    else:
+        svc = _generic_service_noun(tenant)
+        reply = f"{saud} Seu {svc} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+    return _confirm_today_tail(reply, slot, tenant, appt_id)
 
 
 def _try_deterministic_reschedule(tenant: dict, phone: str, text: str):
@@ -1507,6 +1534,7 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                         _nome1 = name.split()[0] if name else ""
                         _saud = f"Prontinho, {_nome1}! ✅" if _nome1 else "Prontinho! ✅"
                         reply = f"{_saud} Seu {_generic_service_noun(tenant)} ficou marcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                reply = _confirm_today_tail(reply, slot, tenant, appt_id)
                 logger.info(f"[{tenant['slug']}] Agendamento criado: {name} | slot_index={idx_raw}(raw)→{idx}(0based) | slot={formatted}")
                 event = {"type": "new_appointment", "data": {"patient_name": name, "slot": formatted, "phone": phone}}
                 return reply, event
@@ -1599,6 +1627,7 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                             reply = f"Prontinho! ✅ Seu {_svc} de {old_fmt} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
                         else:
                             reply = f"Prontinho! ✅ Seu {_svc} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                reply = _confirm_today_tail(reply, slot, tenant, appt_id)
                 return reply, {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}
         return "Não consegui remarcar. Pode escolher outro horário? 😊", None
 
