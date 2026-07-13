@@ -452,12 +452,20 @@ async def _handle_message(tenant: dict, phone: str, text: str):
             reply = "Obrigada pelo pagamento! 😊 Recebi o comprovante. Em breve enviarei a nota fiscal. Até a sessão!"
             db.save_message(tenant["id"], phone, "user", "[comprovante de pagamento enviado]")
             await _flag_receipt_and_notify(tenant, phone, "imagem")
+        elif kind == "unknown":
+            # Não conseguimos classificar (API de visão fora do ar ou sem URL).
+            # NÃO incomodamos a psicóloga — pode ser ruído (sticker, mídia de
+            # sistema etc.). Só respondemos gentilmente ao paciente.
+            reply = ("Recebi sua imagem! 😊 Se for um comprovante de pagamento ou algo sobre "
+                     "sua consulta, me conta por texto que te ajudo rapidinho. 🙏")
+            db.save_message(tenant["id"], phone, "user", "[imagem enviada — não classificada]")
+            logger.info(f"[{tenant['slug']}][{phone}] Imagem não classificada — psicóloga NÃO notificada")
         else:
             reply = ("Recebi sua imagem! 😊 No momento eu (assistente) não consigo analisar "
                      "imagens em detalhe — vou repassar para a psicóloga, que responde "
                      "assim que puder. Se for sobre agenda ou pagamento, pode me contar por texto que te ajudo. 🙏")
             db.save_message(tenant["id"], phone, "user", "[imagem enviada — não-comprovante]")
-            # Avisar psicóloga
+            # Avisar psicóloga (só quando a imagem foi REALMENTE classificada como não-comprovante)
             psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
             if psy_phone:
                 try:
@@ -755,15 +763,23 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
         return {"status": "ignored"}
     # Deduplicação por messageId — Z-API faz retry em caso de timeout e
     # entregava a mesma mensagem 2x, gerando duas respostas do agente.
+    # Fonte primária: DB (persistente, sobrevive a restart). Fallback: memória,
+    # caso o DB falhe (fail-open não deve virar processamento duplicado).
     msg_id = (
         payload.get("messageId")
         or payload.get("zaapId")
         or payload.get("id")
         or ""
     )
-    if msg_id and _zapi_already_seen(msg_id):
-        logger.info(f"[{slug}] Webhook duplicado ignorado (msg_id={msg_id})")
-        return {"status": "duplicate"}
+    if msg_id:
+        try:
+            is_dup = db.webhook_seen_check_and_mark(msg_id)
+        except Exception as e:
+            logger.warning(f"[{slug}] dedup persistente falhou ({e}) — usando memória")
+            is_dup = _zapi_already_seen(msg_id)
+        if is_dup:
+            logger.info(f"[{slug}] Webhook duplicado ignorado (msg_id={msg_id})")
+            return {"status": "duplicate"}
     result = wa.extract_message_zapi(payload)
     if not result:
         return {"status": "ignored"}
@@ -1062,8 +1078,9 @@ def dash_appointments(request: Request):
     # Inclui consultas a partir do início de hoje — assim sessões que já ocorreram
     # hoje continuam visíveis para a psicóloga marcar comparecimento depois.
     _br = ZoneInfo("America/Sao_Paulo")
-    today_start = datetime.now(_br).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None).isoformat()
-    far = (datetime.now(_br).replace(tzinfo=None).replace(year=datetime.now().year + 1)).isoformat()
+    _now_br = datetime.now(_br).replace(tzinfo=None)
+    today_start = _now_br.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    far = _now_br.replace(year=_now_br.year + 1).isoformat()
     appts = db.get_appointments_in_range(tenant["id"], today_start, far)
     # Esconde canceladas da listagem
     appts = [a for a in appts if not a.get("cancelled")]

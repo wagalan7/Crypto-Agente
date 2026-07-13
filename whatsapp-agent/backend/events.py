@@ -7,13 +7,16 @@ import asyncio
 import json
 from collections import defaultdict
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+_TZ = ZoneInfo("America/Sao_Paulo")
 
 # { tenant_id: [Queue, Queue, ...] }  — uma fila por cliente conectado
 _subscribers: dict[int, list[asyncio.Queue]] = defaultdict(list)
 
 
 def _now() -> str:
-    return datetime.now().strftime("%H:%M")
+    return datetime.now(_TZ).strftime("%H:%M")  # sempre horário de Brasília
 
 
 async def publish(tenant_id: int, event_type: str, data: dict):

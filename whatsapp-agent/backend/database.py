@@ -376,6 +376,15 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_login_attempts_user ON login_attempts(username, attempted_at);
             CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip, attempted_at);
+
+            -- Deduplicação PERSISTENTE de webhooks (Z-API faz retry em timeout).
+            -- O dedup em memória se perdia no restart do container → uma mensagem
+            -- em retry logo após deploy podia ser processada 2x. Persistir resolve.
+            CREATE TABLE IF NOT EXISTS webhook_seen (
+                msg_id  TEXT PRIMARY KEY,
+                seen_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_webhook_seen_at ON webhook_seen(seen_at);
         """)
 
         # Seed do usuário admin padrão (alanmalta) se ainda não existir
@@ -494,9 +503,13 @@ def is_tenant_exempt(tenant: dict) -> bool:
     free_until = tenant.get("free_until")
     if not free_until:
         return False
-    from datetime import date
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
     try:
-        return date.fromisoformat(free_until[:10]) >= date.today()
+        # Usa a data em Brasília (o servidor roda em UTC; date.today() viraria
+        # o dia ~3h antes, expirando o acesso gratuito cedo demais).
+        today_br = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+        return datetime.fromisoformat(free_until[:10]).date() >= today_br
     except ValueError:
         return False
 
@@ -1195,6 +1208,26 @@ def rename_patient(tenant_id: int, appointment_id: int, new_name: str, apply_all
                 (new_name, appointment_id, tenant_id),
             )
         return cur.rowcount
+
+
+def webhook_seen_check_and_mark(msg_id: str) -> bool:
+    """Dedup PERSISTENTE de webhooks. Retorna True se o msg_id JÁ foi visto
+    (duplicata → ignorar); caso contrário registra e retorna False. Atômico via
+    INSERT OR IGNORE, sobrevive a restart do container. Faz uma poda ocasional
+    dos registros com mais de 2 dias para a tabela não crescer sem limite."""
+    if not msg_id:
+        return False
+    import random
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO webhook_seen (msg_id) VALUES (?)", (msg_id,)
+        )
+        already = cur.rowcount == 0  # 0 linhas inseridas → já existia
+        if random.random() < 0.02:  # ~2% das chamadas: limpa registros antigos
+            conn.execute(
+                "DELETE FROM webhook_seen WHERE seen_at < datetime('now', '-2 days')"
+            )
+        return already
 
 
 def confirm_appointment(tenant_id: int, appointment_id: int) -> bool:

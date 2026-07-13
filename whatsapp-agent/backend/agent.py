@@ -1647,14 +1647,17 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                         f"[{tenant['slug']}][{phone}] Action.confirm ambíguo: {len(futuras)} consultas futuras, "
                         f"sem appointment_id do LLM — pedindo desambiguação"
                     )
+                    # Lista amigável e NUMERADA (nunca expor id interno do banco
+                    # ao paciente). O paciente responde com a data/horário e o LLM
+                    # resolve o appointment_id na próxima rodada.
                     lista = "\n".join(
-                        f"  • {cal.format_appointment(a)} (id={a['id']})"
-                        for a in futuras[:5]
+                        f"  {i}. {cal.format_appointment(a)}"
+                        for i, a in enumerate(futuras[:5], start=1)
                     )
                     if _is_psychology(tenant):
-                        msg = f"Você tem mais de uma sessão agendada. Qual você quer confirmar?\n\n{lista}"
+                        msg = f"Você tem mais de uma sessão agendada 😊 Qual você quer confirmar?\n\n{lista}\n\nÉ só me dizer a data. 💖"
                     else:
-                        msg = f"Você tem mais de um {_generic_service_noun(tenant)} agendado. Qual você quer confirmar?\n\n{lista}"
+                        msg = f"Você tem mais de um {_generic_service_noun(tenant)} agendado 😊 Qual você quer confirmar?\n\n{lista}\n\nÉ só me dizer a data. 💖"
                     return (msg, None)
             except Exception as e:
                 logger.warning(f"[confirm] fallback get_appointments_by_phone falhou: {e}")
