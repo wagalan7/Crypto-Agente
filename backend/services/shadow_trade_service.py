@@ -644,7 +644,10 @@ MIN_RR_TP2_EXEC = float(os.getenv("MIN_RR_TP2_EXEC", "1.5"))   # TP2 (alvo final
 # Piso FROUXO por padrão. Só LIVE (shadow simula fill no entry planejado, por
 # design). Fail-open se current_price ausente (o RR_GATE do plano já passou).
 FILL_RR_GATE_ENABLED = os.getenv("FILL_RR_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
-MIN_RR_TP1_FILL = float(os.getenv("MIN_RR_TP1_FILL", "0.5"))   # TP1 no preço REAL de fill >= 0.5R
+# Piso subido 0.5→0.7 (jul/2026): iguala ao MIN_RR_TP1_EXEC do plano. O real
+# stopava ~2× mais que o shadow (53% vs 24%) porque aceitava fills degradados
+# (mercado já correu a favor → TP1 colado, SL caro). 0.7 recusa esses fills.
+MIN_RR_TP1_FILL = float(os.getenv("MIN_RR_TP1_FILL", "0.7"))   # TP1 no preço REAL de fill >= 0.7R
 
 # ── News gate (blackout macro FOMC/CPI/NFP) ─────────────────────────────────
 # O news_filter_service já calcula a janela de blackout, mas NÃO estava plugado
