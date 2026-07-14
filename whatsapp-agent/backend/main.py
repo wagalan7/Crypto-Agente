@@ -479,6 +479,11 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         db.save_message(tenant["id"], phone, "assistant", reply)
         return
 
+    # Flag de notificação da psicóloga NESTE turno. Serve para o catch-all de
+    # "primeiro contato" no fim do handler não notificar em duplicidade quando
+    # um ramo específico (urgência, novo paciente, cancelamento…) já avisou.
+    psy_notified = False
+
     # ── Urgência / crise → notificar psicóloga imediatamente ────────────────────
     _URGENCY_KEYWORDS = ("preciso de ajuda", "socorro", "não aguento", "nao aguento",
                          "me machucar", "suicídio", "suicidio", "desistir de tudo",
@@ -493,6 +498,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                 f"Recomendo entrar em contato o quanto antes."
             )
             await wa.send_message(tenant, psy_phone, urgency_notif)
+            psy_notified = True
             logger.info(f"[{tenant['slug']}] ⚠️ Notificação de urgência enviada para psicóloga")
 
     # ── Áudio: NÃO transcrever mais. Apenas repassar à psicóloga. ───────────────
@@ -575,6 +581,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                     f"de cobrança, entre em contato com o(a) paciente. 💖"
                 )
                 await wa.send_message(tenant, psy_phone, notif)
+                psy_notified = True
                 logger.info(f"[{tenant['slug']}] Notificação de cancelamento enviada para psicóloga")
             try:
                 await events.publish(tenant["id"], "appointment_cancelled",
@@ -627,6 +634,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                     f"Ele(a) está aguardando seu retorno para conhecer o processo. 😊"
                 )
                 await wa.send_message(tenant, psy_phone, notif)
+                psy_notified = True
                 logger.info(f"[{tenant['slug']}] Notificação enviada para psicóloga ({psy_phone})")
 
             # ── Auto-registrar novo paciente na agenda (placeholder) ──────────
@@ -666,6 +674,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                     f"com o(a) paciente. 💖"
                 )
                 await wa.send_message(tenant, psy_phone, notif)
+                psy_notified = True
                 logger.info(f"[{tenant['slug']}] Notificação de NEGATIVA enviada para psicóloga")
             try:
                 await events.publish(tenant["id"], "confirmation_declined",
@@ -675,6 +684,29 @@ async def _handle_message(tenant: dict, phone: str, text: str):
 
         elif event:
             await events.publish(tenant["id"], event["type"], event["data"])
+
+        # ── Catch-all: PRIMEIRO CONTATO sempre notifica a psicóloga ──────────────
+        # Rede de segurança independente do intent do LLM. O caso "novo paciente
+        # perguntou como funciona a terapia" às vezes é classificado como intent
+        # "other" (o próprio prompt permite) — e aí o ramo new_patient acima não
+        # dispara e a psicóloga fica sem saber. Como remetentes não-paciente já
+        # foram filtrados (_is_non_patient_sender) e is_first_message só é True na
+        # primeiríssima mensagem, notificar aqui é seguro e não gera ruído.
+        if is_first_message and not psy_notified:
+            psy_phone = _norm_phone(tenant.get("psychologist_phone", ""))
+            if psy_phone and psy_phone != _norm_phone(phone):
+                try:
+                    notif = (
+                        f"🔔 *Novo contato no WhatsApp!*\n"
+                        f"Número: {_norm_phone(phone)}\n\n"
+                        f"Alguém enviou a primeira mensagem e está aguardando seu "
+                        f"retorno. 😊"
+                    )
+                    await wa.send_message(tenant, psy_phone, notif)
+                    psy_notified = True
+                    logger.info(f"[{tenant['slug']}] Notificação de primeiro contato (catch-all) enviada para psicóloga")
+                except Exception as _e:
+                    logger.warning(f"[{tenant['slug']}] Falha no catch-all de primeiro contato: {_e}")
 
     except Exception as e:
         logger.exception(f"[{tenant['slug']}] Erro ao processar {phone}: {e}")
