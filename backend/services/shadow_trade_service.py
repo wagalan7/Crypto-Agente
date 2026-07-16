@@ -765,10 +765,19 @@ FILLER_FORA_SIZE_MULT = float(os.getenv("FILLER_FORA_SIZE_MULT", "0.75"))  # siz
 FILLER_FORA_OFF_AT = int(os.getenv("FILLER_FORA_OFF_AT", "350"))           # allowlist ≥ isto → desliga filler
 FILLER_TOTAL_SLOTS = int(os.getenv("PORTFOLIO_MAX_OPEN_POSITIONS", "5"))   # espelha portfolio_service
 # Circuit-breaker do FORA: ao acumular N stops do FORA (desde o último TP2 cheio),
-# PAUSA novas entradas FORA. Exceção: se ainda no LUCRO do dia (e sem FORA aberto),
-# libera 1 probe; se o probe der TP1+TP2 (closed_tp2), a contagem zera (despausa).
-# Se o probe falhar e o dia sair do lucro, fica totalmente pausado até o próximo dia.
+# PAUSA novas entradas FORA — mas SÓ quando o dia está no PREJUÍZO. Dia no lucro
+# (ou zerado), mesmo após alguns stops, NÃO bloqueia. Válvulas de escape:
+#   (a) decaimento de FILLER_FORA_DECAY_HOURS sem novo stop → zera o freio;
+#   (b) um trade DENTRO da allowlist bater TP2 → zera o freio e reativa.
+# (ver _filler_fora_brake_state — redesenhado a pedido do usuário).
 FILLER_FORA_STOP_STREAK = int(os.getenv("FILLER_FORA_STOP_STREAK", "4"))
+# Decaimento por tempo do freio: se o ÚLTIMO stop FORA foi há >= estas horas (sem
+# novo stop no meio), a contagem zera sozinha. Corrige o impasse em que 4 stops de
+# dias atrás travavam o FORA indefinidamente enquanto o DENTRO também estava quieto.
+FILLER_FORA_DECAY_HOURS = float(os.getenv("FILLER_FORA_DECAY_HOURS", "36"))
+# Avisa no Telegram (didático) em TODA transição do freio: travou / destravou
+# (por decaimento, vitória DENTRO ou dia no lucro). No-op se Telegram off.
+FILLER_FORA_NOTIFY = os.getenv("FILLER_FORA_NOTIFY", "true").strip().lower() in ("1", "true", "yes")
 # Teste cauteloso de size: os primeiros FILLER_FORA_TEST_N trades FORA abertos a
 # partir de FILLER_FORA_TEST_START_AT usam SIZE_MULT reduzido (TEST_SIZE_MULT);
 # depois de N, volta sozinho ao FILLER_FORA_SIZE_MULT normal. DEFAULT OFF (N=0).
@@ -1863,26 +1872,46 @@ async def _open_auto_counts_by_allowlist() -> tuple[int, int]:
     return n_dentro, n_fora
 
 
-async def _filler_fora_brake_state() -> tuple[int, float]:
-    """(stop_streak, daily_pnl_usd) pro circuit-breaker do filler FORA.
-    stop_streak = nº de stops do FORA desde o último TP2 cheio (closed_tp2 zera;
-    neutros como expiry/BE/TP1-parcial nem contam nem zeram). daily_pnl_usd = soma
-    de pnl_usd dos trades FECHADOS hoje (UTC). Propaga erro pro chamador (o
-    fail-safe lá PAUSA o filler no ciclo)."""
-    if not DB_ENABLED:
-        return 0, 0.0
+async def _filler_fora_brake_state() -> dict:
+    """Estado do circuit-breaker do filler FORA (redesenhado a pedido do usuário).
+
+    Retorna dict com o veredito e o PORQUÊ, pra decisão + Telegram didático.
+
+    Regras:
+      • raw_streak = nº de stops FORA ([filler]) desde o último TP2 cheio FORA
+        (closed_tp2 zera; neutros expiry/BE/TP1-parcial nem contam nem zeram).
+      • DECAIMENTO: se o ÚLTIMO stop FORA foi há >= FILLER_FORA_DECAY_HOURS
+        (sem novo stop no meio) → streak efetivo = 0 (release='decay').
+      • VITÓRIA DENTRO: se um trade DENTRO (não-[filler]) bateu TP2 DEPOIS do
+        último stop FORA → streak efetivo = 0 (release='dentro_win').
+      • BLOQUEIO só com dia no PREJUÍZO: blocked = (effective_streak >= limite)
+        AND (daily_pnl < 0). Dia no lucro/zerado NÃO bloqueia (release='profit').
+    Propaga erro pro chamador (o fail-safe lá PAUSA o filler no ciclo)."""
     from datetime import datetime, timezone
-    from sqlalchemy import select, func, desc
+    from sqlalchemy import select, func, desc, or_
     from db import get_session
     from models.real_trade import RealTrade
-    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    st = {
+        "raw_streak": 0, "effective_streak": 0, "daily_pnl": 0.0,
+        "last_stop_at": None, "hours_since_last_stop": None,
+        "blocked": False, "block_reason": None, "release_reason": None,
+        "dentro_release_symbol": None, "decay_hours": FILLER_FORA_DECAY_HOURS,
+        "limit": FILLER_FORA_STOP_STREAK,
+    }
+    if not DB_ENABLED:
+        return st
+
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     async with get_session() as session:
-        pnl = float((await session.execute(
+        daily_pnl = float((await session.execute(
             select(func.coalesce(func.sum(RealTrade.pnl_usd), 0.0))
             .where(RealTrade.closed_at >= start)
             .where(RealTrade.status != "open")
         )).scalar() or 0.0)
-        rows = (await session.execute(
+        # Trades FORA ([filler]) fechados, mais recentes primeiro.
+        fora_rows = (await session.execute(
             select(RealTrade)
             .where(RealTrade.source == "auto")
             .where(RealTrade.status != "open")
@@ -1890,13 +1919,94 @@ async def _filler_fora_brake_state() -> tuple[int, float]:
             .order_by(desc(RealTrade.closed_at))
             .limit(50)
         )).scalars().all()
-    streak = 0
-    for t in rows:
+        # Trade DENTRO (não-[filler]) mais recente que bateu TP2 cheio.
+        # NULL em notes conta como DENTRO (coalesce p/ "").
+        dentro_tp2 = (await session.execute(
+            select(RealTrade)
+            .where(RealTrade.source == "auto")
+            .where(RealTrade.status == "closed_tp2")
+            .where(or_(
+                RealTrade.notes.is_(None),
+                func.coalesce(RealTrade.notes, "").notlike("%[filler]%"),
+            ))
+            .order_by(desc(RealTrade.closed_at))
+            .limit(1)
+        )).scalar_one_or_none()
+
+    raw_streak = 0
+    last_stop_at = None
+    for t in fora_rows:
         if t.status == "closed_tp2":
             break
         if t.status == "closed_stop":
-            streak += 1
-    return streak, pnl
+            raw_streak += 1
+            if last_stop_at is None:
+                last_stop_at = t.closed_at
+
+    st["raw_streak"] = raw_streak
+    st["daily_pnl"] = round(daily_pnl, 4)
+
+    effective = raw_streak
+    release_reason = None
+    if last_stop_at is not None:
+        _ls = last_stop_at if last_stop_at.tzinfo else last_stop_at.replace(tzinfo=timezone.utc)
+        st["last_stop_at"] = _ls.isoformat()
+        hours_since = (now - _ls).total_seconds() / 3600.0
+        st["hours_since_last_stop"] = round(hours_since, 2)
+        # (a) Decaimento por tempo.
+        if hours_since >= FILLER_FORA_DECAY_HOURS:
+            effective = 0
+            release_reason = "decay"
+        # (b) Vitória DENTRO após o último stop FORA.
+        elif dentro_tp2 is not None and dentro_tp2.closed_at is not None:
+            _dt = dentro_tp2.closed_at if dentro_tp2.closed_at.tzinfo else dentro_tp2.closed_at.replace(tzinfo=timezone.utc)
+            if _dt > _ls:
+                effective = 0
+                release_reason = "dentro_win"
+                st["dentro_release_symbol"] = _symbol_base(dentro_tp2.symbol or "")
+
+    st["effective_streak"] = effective
+    # Decisão final: só bloqueia com streak alto E dia no PREJUÍZO.
+    if effective >= FILLER_FORA_STOP_STREAK and daily_pnl < 0:
+        st["blocked"] = True
+        st["block_reason"] = (
+            f"{raw_streak} stops seguidos FORA + dia no prejuízo (${daily_pnl:.2f})"
+        )
+    else:
+        st["blocked"] = False
+        # Se ESTAVA na zona de freio mas liberou, registra o porquê p/ o Telegram.
+        if raw_streak >= FILLER_FORA_STOP_STREAK and release_reason is None and daily_pnl >= 0:
+            release_reason = "profit"
+        st["release_reason"] = release_reason
+    return st
+
+
+# Estado do freio filler no processo, pra detectar TRANSIÇÕES (evita spam a cada
+# scan de 90s). None = ainda não avaliado neste processo (baseline pós-restart).
+_FILLER_BRAKE_BLOCKED = None
+
+
+async def _maybe_notify_filler_brake(state: dict) -> None:
+    """Manda Telegram DIDÁTICO só quando o freio filler MUDA de estado
+    (livre→travado ou travado→livre). Baseline pós-restart só avisa se JÁ está
+    travado (evita ruído no estado normal). Nunca levanta exceção pro chamador."""
+    global _FILLER_BRAKE_BLOCKED
+    blocked = bool(state.get("blocked"))
+    prev = _FILLER_BRAKE_BLOCKED
+    _FILLER_BRAKE_BLOCKED = blocked
+    if prev is None:
+        if not blocked:
+            return  # baseline em estado normal → silêncio
+        transition = "blocked"
+    elif prev == blocked:
+        return  # sem mudança
+    else:
+        transition = "blocked" if blocked else "released"
+    try:
+        from services.notification_service import send_telegram, fmt_filler_brake
+        await send_telegram(fmt_filler_brake(state, transition), event_type="filler_brake")
+    except Exception as e:
+        log.warning(f"[filler-fora] telegram transição falhou: {e}")
 
 
 async def _daily_realized_r() -> float:
@@ -3294,8 +3404,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
     # (sorted estável). Tudo NO-OP quando FILLER_FORA_ENABLED=OFF.
     _flr_n_dentro = 0
     _flr_n_fora = 0
-    _flr_stop_streak = 0
-    _flr_daily_pnl = 0.0
+    _flr_brake = {"blocked": False, "block_reason": None}
     _flr_test_done = 0
     if not SHADOW_ENABLED and FILLER_FORA_ENABLED:
         try:
@@ -3304,10 +3413,22 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             log.warning(f"[filler-fora] contagem inicial falhou (fail-safe bloqueia filler): {e}")
             _flr_n_dentro, _flr_n_fora = FILLER_TOTAL_SLOTS, FILLER_FORA_MAX
         try:
-            _flr_stop_streak, _flr_daily_pnl = await _filler_fora_brake_state()
+            _flr_brake = await _filler_fora_brake_state()
         except Exception as e:
             log.warning(f"[filler-fora] brake-state falhou (fail-safe PAUSA filler): {e}")
-            _flr_stop_streak, _flr_daily_pnl = FILLER_FORA_STOP_STREAK, 0.0
+            _flr_brake = {
+                "blocked": True,
+                "block_reason": "falha ao ler estado do freio (fail-safe pausa)",
+                "raw_streak": FILLER_FORA_STOP_STREAK, "effective_streak": FILLER_FORA_STOP_STREAK,
+                "daily_pnl": 0.0, "release_reason": None, "hours_since_last_stop": None,
+                "last_stop_at": None, "dentro_release_symbol": None,
+            }
+        # Aviso Telegram só nas TRANSIÇÕES do freio (travou/destravou).
+        if FILLER_FORA_NOTIFY:
+            try:
+                await _maybe_notify_filler_brake(_flr_brake)
+            except Exception as e:
+                log.warning(f"[filler-fora] notify transição falhou: {e}")
         if FILLER_FORA_TEST_N > 0:
             try:
                 _flr_test_done = await _filler_fora_test_opened_count()
@@ -3543,22 +3664,16 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     _flr_cap = 0
                     if FILLER_FORA_ENABLED and len(_exec_allow) < FILLER_FORA_OFF_AT:
                         _flr_cap = min(FILLER_FORA_MAX, FILLER_TOTAL_SLOTS - _flr_n_dentro)
-                        # Circuit-breaker: N stops do FORA → pausa entradas FORA.
-                        # Exceção: ainda no lucro do dia e sem FORA aberto → 1 probe;
-                        # TP1+TP2 (closed_tp2) zera o streak no próximo ciclo (despausa).
-                        if _flr_stop_streak >= FILLER_FORA_STOP_STREAK:
-                            if _flr_daily_pnl > 0 and _flr_n_fora == 0:
-                                _flr_cap = min(_flr_cap, 1)  # 1 probe enquanto no lucro
-                                log.info(
-                                    f"[filler-fora] PAUSADO ({_flr_stop_streak} stops) — "
-                                    f"libera 1 probe (lucro dia ${_flr_daily_pnl:.2f})"
-                                )
-                            else:
-                                _flr_cap = 0  # pausa total
-                                log.info(
-                                    f"[filler-fora] PAUSADO ({_flr_stop_streak} stops, "
-                                    f"pnl dia ${_flr_daily_pnl:.2f}, fora_open={_flr_n_fora}) — bloqueia FORA"
-                                )
+                        # Circuit-breaker do FORA (redesenhado): só PAUSA quando o dia
+                        # está no prejuízo E o streak segue alto após decaimento (36h)
+                        # e destrave por vitória DENTRO. Dia no lucro/zerado → opera.
+                        # Toda a lógica vive em _filler_fora_brake_state → _flr_brake.
+                        if _flr_brake.get("blocked"):
+                            _flr_cap = 0  # pausa total
+                            log.info(
+                                f"[filler-fora] PAUSADO — {_flr_brake.get('block_reason')} "
+                                f"(fora_open={_flr_n_fora})"
+                            )
                         if _flr_n_fora < _flr_cap:
                             _flr_ok = True
                     if _flr_ok:

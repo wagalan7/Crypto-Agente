@@ -352,3 +352,61 @@ def fmt_symbol_rerank(
         extra = f" _+{len(news) - 15}_" if len(news) > 15 else ""
         lines.append(f"\U0001F195 *Novas no aprendizado*: {_names}{extra}")
     return "\n".join(lines)
+
+
+def fmt_filler_brake(state: Any, transition: str) -> str:
+    """Aviso DIDÁTICO das transições do freio do 'filler' (trades fora da
+    allowlist). `transition` ∈ {'blocked','released'}. Explica em português
+    simples o que aconteceu e como/quando reativa."""
+    raw = _get(state, "raw_streak", 0)
+    pnl = _get(state, "daily_pnl", 0.0)
+    hrs = _get(state, "hours_since_last_stop", None)
+    decay_h = _get(state, "decay_hours", 36)
+    try:
+        pnl_f = float(pnl)
+    except (TypeError, ValueError):
+        pnl_f = 0.0
+
+    if transition == "blocked":
+        return (
+            "\U0001F6D1 *Freio de segurança ATIVADO* \u2014 trades fora da allowlist\n\n"
+            f"O bot tomou *{raw} stops seguidos* em operações fora da allowlist "
+            f"(as mais especulativas) e o dia está *no prejuízo* (`${pnl_f:.2f}`).\n\n"
+            "Para proteger a banca, *pausei as novas entradas fora da allowlist*. "
+            "As operações DENTRO da allowlist seguem *normais*.\n\n"
+            "\U0001F513 *Reativa sozinho quando* qualquer um acontecer:\n"
+            f"\u2022 passarem *{decay_h:.0f}h* sem novo stop (decaimento);\n"
+            "\u2022 um trade DENTRO da allowlist bater *TP2*;\n"
+            "\u2022 o dia voltar ao *lucro*."
+        )
+
+    # released
+    reason = _get(state, "release_reason", None)
+    sym = _get(state, "dentro_release_symbol", None)
+    if reason == "decay":
+        why = (
+            f"passaram *~{float(hrs):.0f}h* desde o último stop fora da allowlist "
+            f"(decaimento de {decay_h:.0f}h) \u2014 o freio expirou."
+            if hrs is not None else
+            f"o decaimento de {decay_h:.0f}h zerou a contagem de stops."
+        )
+    elif reason == "dentro_win":
+        why = (
+            f"um trade DENTRO da allowlist (`{sym}`) bateu *TP2* \u2014 "
+            "isso zera o freio e reativa tudo."
+            if sym else
+            "um trade DENTRO da allowlist bateu *TP2* \u2014 zera o freio."
+        )
+    elif reason == "profit":
+        why = (
+            f"o dia voltou ao *lucro* (`${pnl_f:.2f}`) \u2014 com o dia verde o bot "
+            "não bloqueia, mesmo após alguns stops."
+        )
+    else:
+        why = "as condições de bloqueio deixaram de valer."
+    return (
+        "\u2705 *Freio de segurança LIBERADO* \u2014 trades fora da allowlist\n\n"
+        f"Motivo: {why}\n\n"
+        "O bot *voltou a considerar entradas fora da allowlist* como filler de "
+        "slot ocioso (tamanho reduzido, só tier A/A+). As DENTRO seguem normais."
+    )
