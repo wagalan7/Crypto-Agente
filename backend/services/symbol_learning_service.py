@@ -45,6 +45,15 @@ SYMBOL_LEARNING_SIZE_ENABLED = os.getenv(
 SYMBOL_LEARNING_LEARN_ON_SWEEP = os.getenv(
     "SYMBOL_LEARNING_LEARN_ON_SWEEP", "true"
 ).strip().lower() in ("1", "true", "yes")
+# Avisar no Telegram quando o reaprendizado (pós-sweep) muda o tamanho de moedas —
+# quem subiu (aposta maior) / caiu (aposta menor) / entrou novo no aprendizado.
+SYMBOL_LEARNING_NOTIFY = os.getenv(
+    "SYMBOL_LEARNING_NOTIFY", "true"
+).strip().lower() in ("1", "true", "yes")
+# Movimento MÍNIMO no multiplicador pra reportar (evita ruído de arredondamento).
+SYMBOL_LEARNING_NOTIFY_MIN_DELTA = float(
+    os.getenv("SYMBOL_LEARN_NOTIFY_MIN_DELTA", "0.03")
+)
 
 # Amostra mínima pra confiar no histórico daquela moeda/TF.
 MIN_TRADES = int(os.getenv("SYMBOL_LEARN_MIN_TRADES", "30"))
@@ -144,6 +153,9 @@ async def relearn_all_from_history() -> dict:
     from models.symbol_learned_params import SymbolLearnedParams
 
     summary = {"scanned": 0, "learned": 0, "skipped_small": 0, "bases": 0}
+    # Rastreia movimento antigo→novo do size_quality_mult por base (pra avisar no
+    # Telegram quem subiu/caiu/entrou). Cada base tem 1 upsert (melhor TF).
+    changes: list[dict] = []
     if not DB_ENABLED:
         summary["error"] = "db_disabled"
         return summary
@@ -191,9 +203,17 @@ async def relearn_all_from_history() -> dict:
                         SymbolLearnedParams.timeframe == tf,
                     )
                 )).scalar_one_or_none()
+                old_mult = None
                 if existing is None:
                     existing = SymbolLearnedParams(base=base, timeframe=tf)
                     session.add(existing)
+                else:
+                    old_mult = existing.size_quality_mult
+                changes.append({
+                    "base": base,
+                    "old": (round(float(old_mult), 4) if old_mult is not None else None),
+                    "new": derived["size_quality_mult"],
+                })
                 existing.size_quality_mult = derived["size_quality_mult"]
                 existing.confidence = derived["confidence"]
                 existing.source = "backtest_history"
@@ -217,6 +237,34 @@ async def relearn_all_from_history() -> dict:
         f"[symbol-learning] relearn OK: {summary['learned']} moedas aprendidas de "
         f"{summary['scanned']} linhas ({summary['skipped_small']} amostra pequena)"
     )
+
+    # Aviso Telegram: classifica o movimento e manda resumo (no-op se desligado
+    # ou sem credenciais). Falha aqui NUNCA quebra o relearn.
+    if SYMBOL_LEARNING_NOTIFY and changes:
+        try:
+            from services.notification_service import send_telegram, fmt_symbol_rerank
+            ups: list[dict] = []
+            downs: list[dict] = []
+            news: list[dict] = []
+            for c in changes:
+                if c["old"] is None:
+                    news.append(c)
+                    continue
+                delta = c["new"] - c["old"]
+                if delta >= SYMBOL_LEARNING_NOTIFY_MIN_DELTA:
+                    ups.append(c)
+                elif delta <= -SYMBOL_LEARNING_NOTIFY_MIN_DELTA:
+                    downs.append(c)
+            ups.sort(key=lambda c: c["new"] - c["old"], reverse=True)
+            downs.sort(key=lambda c: c["new"] - c["old"])
+            if ups or downs or news:
+                await send_telegram(
+                    fmt_symbol_rerank(summary, ups, downs, news),
+                    event_type="symbol_rerank",
+                )
+        except Exception as _e:
+            log.warning(f"[symbol-learning] notify rerank falhou: {_e}")
+
     return summary
 
 

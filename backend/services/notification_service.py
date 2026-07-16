@@ -311,3 +311,44 @@ def fmt_direction_resumed(mech: str, direction: str) -> str:
 
 def fmt_error(context: str, detail: str) -> str:
     return f"\u26A0\uFE0F *Erro critico* \u2014 `{context}`\n```\n{detail[:500]}\n```"
+
+
+def fmt_symbol_rerank(
+    summary: Any,
+    ups: list,
+    downs: list,
+    news: list,
+) -> str:
+    """Resumo do reaprendizado pós-sweep: quais moedas subiram/caíram de tamanho.
+
+    `ups`/`downs` são dicts {base, old, new} já filtrados/ordenados; `news` são
+    entradas novas (sem valor anterior). Cap de 10 por lista pra caber no Telegram.
+    """
+    bases = _get(summary, "bases", 0)
+    n_changed = len(ups) + len(downs) + len(news)
+
+    def _row(c) -> str:
+        return f"`{c['base']}` {float(c['old']):.2f}\u2192{float(c['new']):.2f}"
+
+    lines = [
+        "\U0001F9E0 *Reaprendizado de moedas* (pós-sweep)",
+        f"{bases} moedas avaliadas \u00B7 {n_changed} mudaram de tamanho",
+    ]
+    if ups:
+        lines.append("")
+        lines.append("\U0001F4C8 *Subiram* (aposta maior):")
+        lines.append(" \u00B7 ".join(_row(c) for c in ups[:10]))
+        if len(ups) > 10:
+            lines.append(f"_+{len(ups) - 10} outras_")
+    if downs:
+        lines.append("")
+        lines.append("\U0001F4C9 *Caíram* (aposta menor):")
+        lines.append(" \u00B7 ".join(_row(c) for c in downs[:10]))
+        if len(downs) > 10:
+            lines.append(f"_+{len(downs) - 10} outras_")
+    if news:
+        lines.append("")
+        _names = ", ".join(f"`{c['base']}`" for c in news[:15])
+        extra = f" _+{len(news) - 15}_" if len(news) > 15 else ""
+        lines.append(f"\U0001F195 *Novas no aprendizado*: {_names}{extra}")
+    return "\n".join(lines)
