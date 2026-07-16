@@ -317,9 +317,10 @@ EDGE_MULT_MAX = float(os.getenv("EDGE_MULT_MAX", "1.30"))
 # não preencher no tempo (mercado fugiu) → cai pra MARKET (fail-safe: prefere
 # entrar a ficar de fora). A proteção (SL/TP) só é colocada APÓS confirmar o fill
 # (helper place_maker_entry_then_protect, desacopla entrada de proteção).
-# DEFAULT OFF: dinheiro real → só liga após você revisar. Mudar só muda a entrada;
-# o guard cardinal "sem stop = sem trade" e os TPs seguem idênticos.
-MAKER_ENTRY_ENABLED = os.getenv("MAKER_ENTRY_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+# DEFAULT ON (revisado): entra no preço planejado = geometria do shadow (stop-rate
+# ~24% vs 51% do market-chase real). Muda só a entrada; o guard cardinal
+# "sem stop = sem trade" e os TPs seguem idênticos. Reversível por env sem deploy.
+MAKER_ENTRY_ENABLED = os.getenv("MAKER_ENTRY_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 # Fallback do maker: se a LIMIT post-only não preencher no timeout, cair a
 # MERCADO (true) ou DESISTIR da entrada (false). Chasing a mercado após o preço
 # fugir do limit é justamente o que gera "entrada atrasada" (TP1 curto, SL caro);

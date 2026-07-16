@@ -103,9 +103,9 @@ BE_MAX_GIVEBACK_R = float(os.getenv("BE_MAX_GIVEBACK_R", "0.5"))
 # SL de pre_tp1 pra entry ∓ PROTECT_LOCK_R·R — reduzindo a perda máxima daquela
 # perna SEM ir ao BE exato (que tomaria pavio). Reusa o mesmo mecanismo de troca
 # de SL do post_tp1 (cria-novo → cancela-antigo: posição nunca fica nua). Só
-# APERTA (nunca afrouxa) e age UMA vez por trade. DEFAULT OFF (dinheiro real):
-# liga via env após revisar. É a mudança mais delicada (mexe em SL ao vivo).
-PRE_TP1_PROTECT_ENABLED = os.getenv("PRE_TP1_PROTECT_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+# APERTA (nunca afrouxa) e age UMA vez por trade. DEFAULT ON (revisado): corta a
+# perna que anda 60-70% rumo ao TP1 e reverte de 1R p/ ~0.5R. Reversível por env.
+PRE_TP1_PROTECT_ENABLED = os.getenv("PRE_TP1_PROTECT_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 PRE_TP1_PROTECT_TRIGGER_FRAC = float(os.getenv("PRE_TP1_PROTECT_TRIGGER_FRAC", "0.6"))  # 60% rumo ao TP1
 PRE_TP1_PROTECT_LOCK_R = float(os.getenv("PRE_TP1_PROTECT_LOCK_R", "0.5"))  # SL novo a entry ∓ 0.5R
 

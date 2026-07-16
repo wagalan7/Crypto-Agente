@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 # ── Flags/tunáveis (env) ─────────────────────────────────────────────────────
 # Mestre: liga a APLICAÇÃO ao vivo do size_quality_mult na stack de sizing.
 SYMBOL_LEARNING_SIZE_ENABLED = os.getenv(
-    "SYMBOL_LEARNING_SIZE_ENABLED", "false"
+    "SYMBOL_LEARNING_SIZE_ENABLED", "true"
 ).strip().lower() in ("1", "true", "yes")
 # Aprender automaticamente quando o sweep concluir (só popula a tabela; seguro).
 SYMBOL_LEARNING_LEARN_ON_SWEEP = os.getenv(
