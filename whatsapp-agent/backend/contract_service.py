@@ -51,7 +51,8 @@ agendados entre as partes. Remarcações devem ser comunicadas com antecedência
 
 ## 3. Valor e pagamento
 O valor de cada sessão e a forma de pagamento são os combinados entre as partes,
-podendo ser reajustados mediante aviso prévio.
+podendo ser reajustados mediante aviso prévio. Pagamentos, preferencialmente, via
+Pix — **Chave Pix:** {{chave_pix}}.
 
 ## 4. Faltas e cancelamentos
 A ausência não comunicada com a antecedência combinada poderá ser cobrada,
@@ -74,20 +75,54 @@ Data: {{data}}
 """
 
 
+# Linha em branco para campos que serão preenchidos manualmente / mais tarde.
+_FILL = "_______________"
+
+
 def _placeholders(tenant: dict, contract: dict, patient: dict | None) -> dict:
-    """Mapa de substituição dos {{campos}} do template."""
+    """Mapa de substituição dos {{campos}} do template.
+
+    Campos do paciente/consultório resolvem sozinhos; os "dados do atendimento"
+    (valor, dia, horário) e a chave PIX vêm, respectivamente, do que a psicóloga
+    preencher no contrato e do cadastro do consultório. Campo vazio vira uma
+    linha ('____') em vez de sumir — assim o contrato serve como formulário."""
     patient = patient or {}
+    contract = contract or {}
     consultorio = tenant.get("name") or "Consultório"
     psicologa = tenant.get("psychologist_name") or "Psicóloga"
     hoje = datetime.now(_TZ).strftime("%d/%m/%Y")
+
+    def v(x, default="—"):
+        x = (x or "").strip() if isinstance(x, str) else (x or "")
+        return str(x).strip() or default
+
+    nome = (contract.get("patient_name") or patient.get("name") or "").strip()
     return {
-        "nome": (contract.get("patient_name") or patient.get("name") or "").strip() or "—",
-        "cpf": (patient.get("cpf") or "").strip() or "—",
-        "endereco": (patient.get("address") or "").strip() or "—",
-        "telefone": (contract.get("phone") or patient.get("phone") or "").strip() or "—",
+        "nome": nome or "—",
+        "nome_paciente": nome or "—",
+        "cpf": v(patient.get("cpf")),
+        "endereco": v(patient.get("address")),
+        "telefone": v(contract.get("phone") or patient.get("phone")),
+        "email": v(patient.get("email")),
         "data": hoje,
         "consultorio": consultorio,
         "psicologa": psicologa,
+        # PIX sempre do cadastro do consultório (regra: usar a chave que ele cadastrou).
+        "chave_pix": v(tenant.get("pix_key"), _FILL),
+        "titular_pix": v(tenant.get("pix_name"), _FILL),
+        # Dados do atendimento — preenchidos pela psicóloga (vazio → linha p/ preencher).
+        "valor": v(contract.get("session_value"), _FILL),
+        "dia": v(contract.get("session_day"), _FILL),
+        "horario": v(contract.get("session_time"), _FILL),
+        "modalidade_pagamento": v(contract.get("payment_mode"), _FILL),
+        "modalidade_atendimento": v(contract.get("attendance_mode"), _FILL),
+        # Assinatura da CONTRATADA (psicóloga). Preenchida quando ela assina (Fase B);
+        # senão, uma linha para assinatura.
+        "assinatura_contratada": (
+            f"Assinado eletronicamente por {v(contract.get('psy_signer_name'), psicologa)} "
+            f"em {v(contract.get('psy_signed_at'))}"
+            if contract.get("psy_signed_at") else _FILL
+        ),
     }
 
 
@@ -221,20 +256,36 @@ def get_or_create_default_template(tenant_id: int) -> dict:
     return db.create_contract_template(tenant_id, DEFAULT_TEMPLATE_BODY)
 
 
-def create_contract_for_patient(tenant: dict, phone: str, patient_name: str = "") -> dict:
+def create_contract_for_patient(tenant: dict, phone: str, patient_name: str = "",
+                                fields: dict | None = None,
+                                psy_sign: bool = False) -> dict:
     """Cria uma instância de contrato 'pendente' para o paciente, usando o
     template vigente. Retorna o contrato criado (com token). NÃO envia nada —
     o envio é responsabilidade da Fase 2. expires_at é calculado a partir da
     config do consultório (expire_days) só quando o contrato for enviado; aqui
-    deixamos nulo (pendente ainda não tem relógio correndo)."""
+    deixamos nulo (pendente ainda não tem relógio correndo).
+
+    `fields` (opcional) traz os dados do atendimento que a psicóloga preencheu
+    no painel: session_value, session_day, session_time, payment_mode,
+    attendance_mode. Se `psy_sign=True`, registra também a assinatura eletrônica
+    da CONTRATADA (a psicóloga está autenticada no painel) — nome do consultório
+    + carimbo de data/hora BRT — que aparece no PDF junto ao aceite do paciente."""
     tenant_id = tenant["id"]
     template = get_or_create_default_template(tenant_id)
     token = secrets.token_urlsafe(24)
     if not patient_name:
         p = db.get_patient(tenant_id, phone)
         patient_name = (p.get("name") if p else "") or ""
-    cid = db.create_contract(tenant_id, phone, patient_name, template, token)
-    logger.info(f"[{tenant.get('slug')}] Contrato #{cid} criado (pendente) p/ {phone}")
+
+    f = dict(fields or {})
+    if psy_sign:
+        psy_name = (tenant.get("psychologist_name") or tenant.get("name") or "Psicóloga").strip()
+        f["psy_signer_name"] = psy_name
+        f["psy_signed_at"] = datetime.now(_TZ).strftime("%d/%m/%Y %H:%M")
+
+    cid = db.create_contract(tenant_id, phone, patient_name, template, token, fields=f)
+    logger.info(f"[{tenant.get('slug')}] Contrato #{cid} criado (pendente) p/ {phone}"
+                + (" [assinado pela CONTRATADA]" if psy_sign else ""))
     return db.get_contract(cid)
 
 

@@ -292,6 +292,14 @@ def init_db():
             # ── Contrato Automático: dados do paciente p/ preencher o contrato ──
             "ALTER TABLE patients ADD COLUMN cpf TEXT DEFAULT ''",
             "ALTER TABLE patients ADD COLUMN address TEXT DEFAULT ''",
+            # Dados do atendimento preenchidos pela psicóloga + assinatura da CONTRATADA
+            "ALTER TABLE contracts ADD COLUMN session_value TEXT DEFAULT ''",
+            "ALTER TABLE contracts ADD COLUMN session_day TEXT DEFAULT ''",
+            "ALTER TABLE contracts ADD COLUMN session_time TEXT DEFAULT ''",
+            "ALTER TABLE contracts ADD COLUMN payment_mode TEXT DEFAULT ''",
+            "ALTER TABLE contracts ADD COLUMN attendance_mode TEXT DEFAULT ''",
+            "ALTER TABLE contracts ADD COLUMN psy_signed_at TEXT DEFAULT ''",
+            "ALTER TABLE contracts ADD COLUMN psy_signer_name TEXT DEFAULT ''",
         ]
         for sql in migrations:
             try:
@@ -425,6 +433,13 @@ def init_db():
                 sign_ip          TEXT DEFAULT '',
                 sign_user_agent  TEXT DEFAULT '',
                 sign_hash        TEXT DEFAULT '',
+                session_value    TEXT DEFAULT '',
+                session_day      TEXT DEFAULT '',
+                session_time     TEXT DEFAULT '',
+                payment_mode     TEXT DEFAULT '',
+                attendance_mode  TEXT DEFAULT '',
+                psy_signed_at    TEXT DEFAULT '',
+                psy_signer_name  TEXT DEFAULT '',
                 created_at       TEXT DEFAULT (datetime('now')),
                 updated_at       TEXT DEFAULT (datetime('now'))
             );
@@ -2359,15 +2374,27 @@ def create_contract_template(tenant_id: int, body: str, title: str = "") -> dict
 # ── Contratos (instância por paciente) ──
 
 def create_contract(tenant_id: int, phone: str, patient_name: str, template: dict,
-                    token: str, expires_at: str | None = None) -> int:
+                    token: str, expires_at: str | None = None,
+                    fields: dict | None = None) -> int:
+    """Cria a instância de contrato. `fields` (opcional) carrega os dados do
+    atendimento preenchidos pela psicóloga e a assinatura da CONTRATADA:
+    session_value, session_day, session_time, payment_mode, attendance_mode,
+    psy_signed_at, psy_signer_name. Ausentes viram '' (retrocompatível)."""
+    f = fields or {}
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO contracts
                  (tenant_id, phone, patient_name, template_id, template_version,
-                  status, token, expires_at)
-               VALUES (?, ?, ?, ?, ?, 'pendente', ?, ?)""",
+                  status, token, expires_at,
+                  session_value, session_day, session_time,
+                  payment_mode, attendance_mode, psy_signed_at, psy_signer_name)
+               VALUES (?, ?, ?, ?, ?, 'pendente', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (tenant_id, phone, patient_name, template.get("id"),
-             template.get("version", 1), token, expires_at),
+             template.get("version", 1), token, expires_at,
+             (f.get("session_value") or ""), (f.get("session_day") or ""),
+             (f.get("session_time") or ""), (f.get("payment_mode") or ""),
+             (f.get("attendance_mode") or ""), (f.get("psy_signed_at") or ""),
+             (f.get("psy_signer_name") or "")),
         )
         return cur.lastrowid
 

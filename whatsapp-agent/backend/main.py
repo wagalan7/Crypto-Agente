@@ -1550,18 +1550,38 @@ def dash_contracts_for_phone(phone: str, request: Request):
 class ContractSendBody(BaseModel):
     phone: str
     patient_name: Optional[str] = ""
+    # Dados do atendimento que a psicóloga preenche no painel (opcionais).
+    session_value: Optional[str] = ""
+    session_day: Optional[str] = ""
+    session_time: Optional[str] = ""
+    payment_mode: Optional[str] = ""
+    attendance_mode: Optional[str] = ""
+    # Se True, registra a assinatura eletrônica da CONTRATADA (psicóloga logada).
+    psy_sign: Optional[bool] = False
 
 
 @app.post("/dashboard/api/contracts/send")
 async def dash_contract_send(body: ContractSendBody, request: Request):
-    """Cria e envia um contrato para um paciente (botão 'Enviar contrato')."""
+    """Cria e envia um contrato para um paciente (botão 'Enviar contrato').
+    A psicóloga pode preencher os dados do atendimento e assinar como CONTRATADA
+    no ato do envio (ela está autenticada no painel)."""
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
     phone = _norm_phone(body.phone)
     if not phone or len(phone) > 15:
         raise HTTPException(status_code=400, detail="Telefone inválido.")
     import contract_service as _cs
-    contract = _cs.create_contract_for_patient(tenant, phone, body.patient_name or "")
+    fields = {
+        "session_value": (body.session_value or "").strip(),
+        "session_day": (body.session_day or "").strip(),
+        "session_time": (body.session_time or "").strip(),
+        "payment_mode": (body.payment_mode or "").strip(),
+        "attendance_mode": (body.attendance_mode or "").strip(),
+    }
+    contract = _cs.create_contract_for_patient(
+        tenant, phone, body.patient_name or "",
+        fields=fields, psy_sign=bool(body.psy_sign),
+    )
     ok, reason = await _cs.send_contract(tenant, contract, wa)
     return {"status": "sent" if ok else "created", "id": contract["id"],
             "sent": ok, "reason": reason if not ok else ""}

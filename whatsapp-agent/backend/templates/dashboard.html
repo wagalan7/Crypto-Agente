@@ -994,6 +994,37 @@
         <input id="ct-send-name" type="text" placeholder="Nome do paciente (opcional)"
           class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
       </div>
+
+      <!-- Dados do atendimento (a psicóloga preenche; ficam no contrato) -->
+      <p class="text-xs font-semibold text-gray-500 mb-2 mt-1">Dados do atendimento (opcional — você preenche e podem já constar no contrato)</p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+        <input id="ct-send-valor" type="text" placeholder="Valor da sessão (ex: 150,00)"
+          class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        <select id="ct-send-pagamento"
+          class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand text-gray-600">
+          <option value="">Modalidade de pagamento…</option>
+          <option value="Por sessão">Por sessão</option>
+          <option value="Mensal">Mensal</option>
+          <option value="Dividido (conforme acordo entre as partes)">Dividido</option>
+        </select>
+        <input id="ct-send-dia" type="text" placeholder="Dia do atendimento (ex: Terça-feira)"
+          class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        <input id="ct-send-horario" type="text" placeholder="Horário (ex: 14h)"
+          class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        <select id="ct-send-atendimento"
+          class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand text-gray-600">
+          <option value="">Modalidade do atendimento…</option>
+          <option value="Presencial">Presencial</option>
+          <option value="Online">Online</option>
+        </select>
+      </div>
+
+      <label class="flex items-start gap-2 mb-3 cursor-pointer select-none">
+        <input id="ct-send-psysign" type="checkbox" class="mt-0.5 accent-brand"/>
+        <span class="text-sm text-gray-700">Assinar como <strong>CONTRATADA</strong> agora
+          (assinatura eletrônica da psicóloga registrada no envio)</span>
+      </label>
+
       <div id="ct-send-msg" class="hidden text-sm rounded-xl px-4 py-2.5 mb-3"></div>
       <button onclick="sendContract()" id="ct-send-btn"
         class="bg-brand text-white py-2.5 px-5 rounded-xl text-sm font-semibold hover:opacity-90 transition">
@@ -1395,7 +1426,16 @@ function sendContract() {
   if (!phone) { _ctMsg("ct-send-msg", "Informe o telefone.", false); return; }
   const btn = document.getElementById("ct-send-btn");
   btn.disabled = true;
-  const payload = {phone: phone, patient_name: document.getElementById("ct-send-name").value.trim()};
+  const payload = {
+    phone: phone,
+    patient_name: document.getElementById("ct-send-name").value.trim(),
+    session_value: document.getElementById("ct-send-valor").value.trim(),
+    session_day: document.getElementById("ct-send-dia").value.trim(),
+    session_time: document.getElementById("ct-send-horario").value.trim(),
+    payment_mode: document.getElementById("ct-send-pagamento").value,
+    attendance_mode: document.getElementById("ct-send-atendimento").value,
+    psy_sign: document.getElementById("ct-send-psysign").checked,
+  };
   api("/dashboard/api/contracts/send", {method:"POST", body: JSON.stringify(payload)})
     .then(d => {
       _ctMsg("ct-send-msg",
@@ -1403,6 +1443,12 @@ function sendContract() {
         d.sent);
       document.getElementById("ct-send-phone").value = "";
       document.getElementById("ct-send-name").value = "";
+      document.getElementById("ct-send-valor").value = "";
+      document.getElementById("ct-send-dia").value = "";
+      document.getElementById("ct-send-horario").value = "";
+      document.getElementById("ct-send-pagamento").value = "";
+      document.getElementById("ct-send-atendimento").value = "";
+      document.getElementById("ct-send-psysign").checked = false;
       loadContractsList();
     })
     .catch(e => _ctMsg("ct-send-msg", "Erro: " + e.message, false))
