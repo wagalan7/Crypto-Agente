@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Contrato — {{ tenant.name }}</title>
+  <style>
+    :root { --brand:#6b4fbb; --ok:#1f9d55; --err:#c0392b; --ink:#2d2d3a; --muted:#6b6b7b; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:#f4f2fa; color:var(--ink);
+           font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+           line-height:1.5; }
+    .wrap { max-width:720px; margin:0 auto; padding:20px 16px 60px; }
+    .card { background:#fff; border-radius:14px; box-shadow:0 6px 24px rgba(60,40,120,.08);
+            padding:22px; margin-top:16px; }
+    header { text-align:center; padding-top:18px; }
+    header .clinic { font-weight:700; font-size:18px; color:var(--brand); }
+    header .sub { color:var(--muted); font-size:13px; }
+    h1 { font-size:19px; margin:.2em 0 .6em; }
+    .doc { max-height:46vh; overflow:auto; border:1px solid #eee; border-radius:10px;
+           padding:14px 16px; background:#fbfaff; font-size:14px; }
+    .doc h2 { font-size:16px; margin:.4em 0 .3em; }
+    .doc h3 { font-size:14px; margin:.8em 0 .2em; color:var(--brand); }
+    .doc p { margin:.35em 0; }
+    .doc li { margin:.2em 0 .2em 1.1em; }
+    label { display:block; font-size:13px; font-weight:600; margin:14px 0 4px; }
+    input[type=text] { width:100%; padding:11px 12px; border:1px solid #d8d4e6;
+            border-radius:9px; font-size:15px; }
+    .check { display:flex; gap:10px; align-items:flex-start; margin:16px 0;
+             font-size:14px; color:var(--ink); }
+    .check input { margin-top:3px; transform:scale(1.25); }
+    button { width:100%; padding:14px; border:0; border-radius:10px; font-size:16px;
+             font-weight:700; cursor:pointer; }
+    .btn-sign { background:var(--brand); color:#fff; }
+    .btn-decline { background:transparent; color:var(--muted); font-weight:600;
+             font-size:13px; margin-top:10px; text-decoration:underline; }
+    .erro { background:#fdecea; color:var(--err); border-radius:9px; padding:10px 12px;
+            font-size:14px; margin-bottom:8px; }
+    .state { text-align:center; padding:12px 0; }
+    .state .ico { font-size:44px; }
+    .state.ok .ico { color:var(--ok); }
+    .badge { display:inline-block; padding:3px 10px; border-radius:999px; font-size:12px;
+             font-weight:700; }
+    .muted { color:var(--muted); font-size:13px; }
+    a.pdf { display:inline-block; margin-top:14px; color:var(--brand); font-weight:700;
+            text-decoration:none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="clinic">{{ tenant.name }}</div>
+      <div class="sub">{{ tenant.psychologist_name }}</div>
+    </header>
+
+    {% if state == "assinar" %}
+    <div class="card">
+      <h1>Contrato de atendimento</h1>
+      <p class="muted">Leia o contrato abaixo. Para assinar, confirme seu nome e CPF
+        e marque o aceite ao final.</p>
+      <div class="doc">{{ body_html | safe }}</div>
+
+      {% if erro %}<div class="erro" style="margin-top:14px">{{ erro }}</div>{% endif %}
+
+      <form method="post" action="/contrato/{{ token }}/assinar">
+        <label for="signer_name">Nome completo</label>
+        <input type="text" id="signer_name" name="signer_name" required
+               autocomplete="name" placeholder="Seu nome completo">
+        <label for="signer_cpf">CPF</label>
+        <input type="text" id="signer_cpf" name="signer_cpf" required
+               inputmode="numeric" placeholder="Somente números">
+        <div class="check">
+          <input type="checkbox" id="aceite" name="aceite" value="1" required>
+          <label for="aceite" style="font-weight:500;margin:0">
+            Li e concordo com os termos deste contrato e assino eletronicamente.</label>
+        </div>
+        <button type="submit" class="btn-sign">Assinar contrato</button>
+      </form>
+      <form method="post" action="/contrato/{{ token }}/recusar"
+            onsubmit="return confirm('Tem certeza que deseja recusar o contrato?');">
+        <button type="submit" class="btn-decline">Não concordo / recusar</button>
+      </form>
+    </div>
+
+    {% elif state == "assinado" %}
+    <div class="card state ok">
+      <div class="ico">✓</div>
+      <h1>Contrato assinado!</h1>
+      <p class="muted">Sua assinatura eletrônica foi registrada com sucesso
+        {% if contract.signed_at %}em {{ contract.signed_at[:16].replace("T", " ") }}{% endif %}.
+        Obrigada!</p>
+      <a class="pdf" href="/contrato/{{ token }}/pdf" target="_blank">📄 Baixar contrato assinado (PDF)</a>
+    </div>
+
+    {% elif state == "recusado" %}
+    <div class="card state">
+      <div class="ico">✕</div>
+      <h1>Contrato recusado</h1>
+      <p class="muted">Você recusou este contrato. Se foi engano ou quiser conversar,
+        entre em contato com o consultório.</p>
+    </div>
+
+    {% elif state == "expirado" %}
+    <div class="card state">
+      <div class="ico">⌛</div>
+      <h1>Link expirado</h1>
+      <p class="muted">O prazo para assinar este contrato expirou. Peça ao
+        consultório para reenviar um novo link.</p>
+    </div>
+    {% endif %}
+
+    <p class="muted" style="text-align:center;margin-top:22px">
+      Assinatura eletrônica — MP 2.200-2/2001 e Marco Civil da Internet.</p>
+  </div>
+</body>
+</html>

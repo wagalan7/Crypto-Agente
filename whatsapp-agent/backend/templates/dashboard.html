@@ -102,6 +102,10 @@
       💬 Conversas
       <span id="badge-msg" class="badge bg-brand text-white text-xs rounded-full w-5 h-5 items-center justify-center">0</span>
     </button>
+    <button onclick="showTab('contratos')" id="dtab-contratos"
+      class="dtab px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
+      📄 Contratos
+    </button>
     <button onclick="showTab('config')" id="dtab-config"
       class="dtab px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
       ⚙️ Config
@@ -901,6 +905,111 @@
     </div><!-- /cfgsec-integracoes -->
   </div>
 
+  <!-- Contratos -->
+  <div id="pane-contratos" class="tab-content">
+    <div class="mt-4 md:mt-0 mb-4">
+      <h2 class="text-base font-semibold text-gray-800">📄 Contrato de atendimento</h2>
+      <p class="text-xs text-gray-500 mt-1">Gere, envie e acompanhe a assinatura eletrônica
+        do contrato dos seus pacientes. Assinatura válida (MP 2.200-2/2001 + Marco Civil).</p>
+    </div>
+
+    <!-- Configurações do contrato -->
+    <div class="bg-white rounded-2xl border border-gray-200 p-4 mb-4">
+      <h3 class="text-sm font-semibold text-gray-800 mb-3">⚙️ Configurações</h3>
+      <label class="flex items-center gap-2 cursor-pointer mb-4">
+        <input type="checkbox" id="ct-enabled" class="accent-brand w-4 h-4"/>
+        <span class="text-sm text-gray-700">Ativar módulo de contrato neste consultório</span>
+      </label>
+
+      <p class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Prazos (dias)</p>
+      <div class="grid grid-cols-3 gap-3 mb-4">
+        <div>
+          <label class="block text-xs text-gray-600 mb-1">1º lembrete</label>
+          <input id="ct-reminder1" type="number" min="0"
+            class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-600 mb-1">2º lembrete</label>
+          <input id="ct-reminder2" type="number" min="0"
+            class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-600 mb-1">Expira em</label>
+          <input id="ct-expire" type="number" min="1"
+            class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+      </div>
+
+      <p class="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">Bloqueios (opcional)</p>
+      <div class="space-y-2 mb-4">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" id="ct-block-sched" class="accent-brand w-4 h-4"/>
+          <span class="text-sm text-gray-700">Exigir contrato assinado para <b>agendar</b></span>
+        </label>
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" id="ct-block-conf" class="accent-brand w-4 h-4"/>
+          <span class="text-sm text-gray-700">Exigir contrato assinado para <b>confirmar</b></span>
+        </label>
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" id="ct-require-version" class="accent-brand w-4 h-4"/>
+          <span class="text-sm text-gray-700">Exigir sempre a <b>versão vigente</b> do contrato</span>
+        </label>
+      </div>
+      <div id="ct-settings-msg" class="hidden text-sm rounded-xl px-4 py-2.5 mb-3"></div>
+      <button onclick="saveContractSettings()" id="ct-settings-btn"
+        class="bg-brand text-white py-2.5 px-5 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        Salvar configurações
+      </button>
+    </div>
+
+    <!-- Modelo do contrato -->
+    <div class="bg-white rounded-2xl border border-gray-200 p-4 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-sm font-semibold text-gray-800">📝 Modelo do contrato</h3>
+        <span id="ct-tpl-version" class="text-xs text-gray-500"></span>
+      </div>
+      <label class="block text-xs text-gray-600 mb-1">Título</label>
+      <input id="ct-tpl-title" type="text"
+        class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm mb-3 focus:outline-none focus:ring-2 focus:ring-brand"/>
+      <label class="block text-xs text-gray-600 mb-1">Texto (use {{nome}}, {{cpf}}, {{endereco}}, {{telefone}}, {{data}})</label>
+      <textarea id="ct-tpl-body" rows="10"
+        class="w-full border border-gray-300 rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-brand"></textarea>
+      <div id="ct-tpl-msg" class="hidden text-sm rounded-xl px-4 py-2.5 my-3"></div>
+      <label class="flex items-center gap-2 cursor-pointer my-3">
+        <input type="checkbox" id="ct-tpl-resend" class="accent-brand w-4 h-4"/>
+        <span class="text-sm text-gray-700">Reenviar a todos os pacientes ativos ao publicar</span>
+      </label>
+      <button onclick="publishContractTemplate()" id="ct-tpl-btn"
+        class="bg-brand text-white py-2.5 px-5 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        Publicar nova versão
+      </button>
+    </div>
+
+    <!-- Enviar contrato -->
+    <div class="bg-white rounded-2xl border border-gray-200 p-4 mb-4">
+      <h3 class="text-sm font-semibold text-gray-800 mb-3">📤 Enviar contrato a um paciente</h3>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+        <input id="ct-send-phone" type="text" placeholder="Telefone (só números)"
+          class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+        <input id="ct-send-name" type="text" placeholder="Nome do paciente (opcional)"
+          class="w-full border border-gray-300 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+      </div>
+      <div id="ct-send-msg" class="hidden text-sm rounded-xl px-4 py-2.5 mb-3"></div>
+      <button onclick="sendContract()" id="ct-send-btn"
+        class="bg-brand text-white py-2.5 px-5 rounded-xl text-sm font-semibold hover:opacity-90 transition">
+        Enviar contrato
+      </button>
+    </div>
+
+    <!-- Lista de contratos -->
+    <div class="bg-white rounded-2xl border border-gray-200 p-4">
+      <h3 class="text-sm font-semibold text-gray-800 mb-3">📋 Contratos</h3>
+      <div id="ct-list" class="space-y-2">
+        <p class="text-sm text-gray-400">Carregando…</p>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <!-- Modal: Nova Consulta -->
@@ -1064,7 +1173,7 @@
 
 <!-- Mobile bottom nav -->
 <nav class="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 z-40">
-  <div class="grid grid-cols-4">
+  <div class="grid grid-cols-5">
     <button onclick="showTab('agenda')" id="mtab-agenda"
       class="mtab flex flex-col items-center py-2 text-brand">
       <span class="text-xl relative">📅
@@ -1083,6 +1192,11 @@
         <span id="mbadge-msg" class="badge absolute -top-1 -right-2 bg-brand text-white text-xs rounded-full w-4 h-4 items-center justify-center text-[10px]">0</span>
       </span>
       <span class="text-xs">Conversas</span>
+    </button>
+    <button onclick="showTab('contratos')" id="mtab-contratos"
+      class="mtab flex flex-col items-center py-2 text-gray-400">
+      <span class="text-xl">📄</span>
+      <span class="text-xs">Contratos</span>
     </button>
     <button onclick="showTab('config')" id="mtab-config"
       class="mtab flex flex-col items-center py-2 text-gray-400">
@@ -1170,6 +1284,7 @@ function showTab(name) {
   if (name==="slots")     { loadSlots(); loadWeekly(); renderBlockedHours(); renderBlockedDates(); }
   if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
   if (name==="config")    { loadBillingLogs(); loadStats(); }
+  if (name==="contratos") { loadContractsTab(); }
 }
 
 // Sub-menu da aba Config: mostra uma seção por vez (evita rolar a página toda).
@@ -1187,6 +1302,172 @@ function showConfigSection(sec) {
   // Rola o topo da aba Config para a seção escolhida ficar visível.
   const subnav = document.getElementById("config-subnav");
   if (subnav) subnav.scrollIntoView({ block: "nearest" });
+}
+
+// ── Contratos ─────────────────────────────────────────────────────────────────
+function _ctMsg(id, text, ok) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text;
+  el.className = "text-sm rounded-xl px-4 py-2.5 " +
+    (ok ? "bg-green-50 text-green-700" : "bg-red-50 text-red-600");
+  el.classList.remove("hidden");
+}
+
+function loadContractsTab() {
+  loadContractSettings();
+  loadContractTemplate();
+  loadContractsList();
+}
+
+function loadContractSettings() {
+  api("/dashboard/api/contracts/settings").then(d => {
+    const s = d.settings || {};
+    document.getElementById("ct-enabled").checked = !!s.enabled;
+    document.getElementById("ct-reminder1").value = s.reminder1_days ?? 2;
+    document.getElementById("ct-reminder2").value = s.reminder2_days ?? 5;
+    document.getElementById("ct-expire").value = s.expire_days ?? 7;
+    document.getElementById("ct-block-sched").checked = !!s.block_scheduling;
+    document.getElementById("ct-block-conf").checked = !!s.block_confirmation;
+    document.getElementById("ct-require-version").checked = !!s.require_current_version;
+  }).catch(e => _ctMsg("ct-settings-msg", "Erro ao carregar: " + e.message, false));
+}
+
+function saveContractSettings() {
+  const btn = document.getElementById("ct-settings-btn");
+  btn.disabled = true;
+  const payload = {
+    enabled: document.getElementById("ct-enabled").checked ? 1 : 0,
+    reminder1_days: parseInt(document.getElementById("ct-reminder1").value) || 2,
+    reminder2_days: parseInt(document.getElementById("ct-reminder2").value) || 5,
+    expire_days: parseInt(document.getElementById("ct-expire").value) || 7,
+    block_scheduling: document.getElementById("ct-block-sched").checked ? 1 : 0,
+    block_confirmation: document.getElementById("ct-block-conf").checked ? 1 : 0,
+    require_current_version: document.getElementById("ct-require-version").checked ? 1 : 0,
+  };
+  api("/dashboard/api/contracts/settings", {method:"POST", body: JSON.stringify(payload)})
+    .then(() => _ctMsg("ct-settings-msg", "Configurações salvas ✓", true))
+    .catch(e => _ctMsg("ct-settings-msg", "Erro ao salvar: " + e.message, false))
+    .finally(() => btn.disabled = false);
+}
+
+function loadContractTemplate() {
+  api("/dashboard/api/contracts/template").then(d => {
+    document.getElementById("ct-tpl-title").value = d.title || "";
+    document.getElementById("ct-tpl-body").value = d.body || "";
+    const v = d.version || 0;
+    document.getElementById("ct-tpl-version").textContent =
+      v ? ("Versão vigente: v" + v) : "Nenhuma versão publicada ainda";
+  }).catch(e => _ctMsg("ct-tpl-msg", "Erro ao carregar: " + e.message, false));
+}
+
+function publishContractTemplate() {
+  const body = document.getElementById("ct-tpl-body").value.trim();
+  if (body.length < 30) { _ctMsg("ct-tpl-msg", "O texto do contrato está muito curto.", false); return; }
+  const resend = document.getElementById("ct-tpl-resend").checked;
+  const warn = resend
+    ? "Publicar nova versão E reenviar para TODOS os pacientes ativos?"
+    : "Publicar nova versão do contrato?";
+  if (!confirm(warn)) return;
+  const btn = document.getElementById("ct-tpl-btn");
+  btn.disabled = true;
+  const payload = {
+    body: body,
+    title: document.getElementById("ct-tpl-title").value.trim(),
+    resend_to_active: resend,
+  };
+  api("/dashboard/api/contracts/template", {method:"POST", body: JSON.stringify(payload)})
+    .then(d => {
+      let msg = "Publicado como v" + d.version + " ✓";
+      if (d.marked_stale) msg += " · " + d.marked_stale + " pendente(s) desatualizado(s)";
+      if (d.resent) msg += " · reenviado a " + d.resent + " paciente(s)";
+      _ctMsg("ct-tpl-msg", msg, true);
+      document.getElementById("ct-tpl-resend").checked = false;
+      loadContractTemplate();
+      loadContractsList();
+    })
+    .catch(e => _ctMsg("ct-tpl-msg", "Erro ao publicar: " + e.message, false))
+    .finally(() => btn.disabled = false);
+}
+
+function sendContract() {
+  const phone = document.getElementById("ct-send-phone").value.trim();
+  if (!phone) { _ctMsg("ct-send-msg", "Informe o telefone.", false); return; }
+  const btn = document.getElementById("ct-send-btn");
+  btn.disabled = true;
+  const payload = {phone: phone, patient_name: document.getElementById("ct-send-name").value.trim()};
+  api("/dashboard/api/contracts/send", {method:"POST", body: JSON.stringify(payload)})
+    .then(d => {
+      _ctMsg("ct-send-msg",
+        d.sent ? "Contrato enviado ✓" : ("Contrato criado, mas envio falhou: " + (d.reason||"")),
+        d.sent);
+      document.getElementById("ct-send-phone").value = "";
+      document.getElementById("ct-send-name").value = "";
+      loadContractsList();
+    })
+    .catch(e => _ctMsg("ct-send-msg", "Erro: " + e.message, false))
+    .finally(() => btn.disabled = false);
+}
+
+const _CT_STATUS = {
+  pendente:      {label:"Pendente",      cls:"bg-gray-100 text-gray-600"},
+  enviado:       {label:"Enviado",       cls:"bg-blue-100 text-blue-700"},
+  assinado:      {label:"Assinado",      cls:"bg-green-100 text-green-700"},
+  recusado:      {label:"Recusado",      cls:"bg-red-100 text-red-700"},
+  expirado:      {label:"Expirado",      cls:"bg-amber-100 text-amber-700"},
+  desatualizado: {label:"Desatualizado", cls:"bg-orange-100 text-orange-700"},
+};
+
+function _ctDate(s) {
+  if (!s) return "—";
+  return String(s).slice(0,16).replace("T"," ");
+}
+
+function loadContractsList() {
+  const el = document.getElementById("ct-list");
+  el.innerHTML = '<p class="text-sm text-gray-400">Carregando…</p>';
+  api("/dashboard/api/contracts").then(d => {
+    const cs = d.contracts || [];
+    if (!cs.length) { el.innerHTML = '<p class="text-sm text-gray-400">Nenhum contrato ainda.</p>'; return; }
+    el.innerHTML = cs.map(c => {
+      const st = _CT_STATUS[c.status] || {label:c.status||"—", cls:"bg-gray-100 text-gray-600"};
+      const nm = c.patient_name || c.phone;
+      const dateInfo = c.status === "assinado"
+        ? ("Assinado em " + _ctDate(c.signed_at))
+        : (c.sent_at ? ("Enviado " + _ctDate(c.sent_at) + (c.expires_at ? (" · expira " + _ctDate(c.expires_at)) : "")) : "Não enviado");
+      const pdfBtn = (c.status === "assinado" && c.has_pdf && c.token)
+        ? `<a href="/contrato/${c.token}/pdf" target="_blank" class="text-xs text-brand font-medium hover:underline">📄 PDF</a>` : "";
+      const resendBtn = (c.status !== "assinado")
+        ? `<button onclick="resendContract(${c.id})" class="text-xs text-brand font-medium hover:underline">Reenviar</button>` : "";
+      const linkBtn = (c.status !== "assinado" && c.token)
+        ? `<button onclick="copyContractLink('${c.token}')" class="text-xs text-gray-500 hover:underline">Copiar link</button>` : "";
+      return `<div class="flex items-center justify-between gap-2 border border-gray-100 rounded-xl px-3 py-2">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-gray-800 truncate">${nm}</span>
+            <span class="text-[11px] px-2 py-0.5 rounded-full ${st.cls}">${st.label}</span>
+            <span class="text-[11px] text-gray-400">v${c.template_version||0}</span>
+          </div>
+          <div class="text-xs text-gray-500">${dateInfo}</div>
+        </div>
+        <div class="flex items-center gap-3 shrink-0">${pdfBtn}${linkBtn}${resendBtn}</div>
+      </div>`;
+    }).join("");
+  }).catch(e => { el.innerHTML = '<p class="text-sm text-red-600">Erro ao carregar: ' + e.message + '</p>'; });
+}
+
+function resendContract(id) {
+  if (!confirm("Reenviar este contrato ao paciente?")) return;
+  api("/dashboard/api/contracts/" + id + "/resend", {method:"POST"})
+    .then(d => { alert(d.sent ? "Contrato reenviado ✓" : ("Falha: " + (d.reason||""))); loadContractsList(); })
+    .catch(e => alert("Erro: " + e.message));
+}
+
+function copyContractLink(token) {
+  const url = location.origin + "/contrato/" + token;
+  navigator.clipboard.writeText(url)
+    .then(() => alert("Link copiado:\n" + url))
+    .catch(() => prompt("Copie o link:", url));
 }
 
 function api(path, opts={}) {

@@ -289,6 +289,9 @@ def init_db():
             "ALTER TABLE tenants ADD COLUMN client_noun TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN service_noun TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN business_type TEXT DEFAULT ''",
+            # ── Contrato Automático: dados do paciente p/ preencher o contrato ──
+            "ALTER TABLE patients ADD COLUMN cpf TEXT DEFAULT ''",
+            "ALTER TABLE patients ADD COLUMN address TEXT DEFAULT ''",
         ]
         for sql in migrations:
             try:
@@ -385,6 +388,73 @@ def init_db():
                 seen_at TEXT DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_webhook_seen_at ON webhook_seen(seen_at);
+
+            -- ── Contrato Automático ────────────────────────────────────────────
+            -- Template de contrato versionado por consultório. version incrementa
+            -- a cada nova versão publicada; só uma fica active=1 (a vigente).
+            CREATE TABLE IF NOT EXISTS contract_templates (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id  INTEGER NOT NULL,
+                version    INTEGER NOT NULL DEFAULT 1,
+                title      TEXT DEFAULT 'Contrato de Prestação de Serviços',
+                body       TEXT NOT NULL DEFAULT '',
+                active     INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(tenant_id, version)
+            );
+
+            -- Instância de contrato de UM paciente. status:
+            -- pendente | enviado | assinado | recusado | expirado | desatualizado
+            CREATE TABLE IF NOT EXISTS contracts (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id        INTEGER NOT NULL,
+                phone            TEXT NOT NULL,
+                patient_name     TEXT DEFAULT '',
+                template_id      INTEGER,
+                template_version INTEGER NOT NULL DEFAULT 1,
+                status           TEXT NOT NULL DEFAULT 'pendente',
+                token            TEXT NOT NULL,
+                sent_at          TEXT DEFAULT NULL,
+                signed_at        TEXT DEFAULT NULL,
+                expires_at       TEXT DEFAULT NULL,
+                declined_at      TEXT DEFAULT NULL,
+                decline_reason   TEXT DEFAULT '',
+                pdf_path         TEXT DEFAULT '',
+                signer_name      TEXT DEFAULT '',
+                signer_cpf       TEXT DEFAULT '',
+                sign_ip          TEXT DEFAULT '',
+                sign_user_agent  TEXT DEFAULT '',
+                sign_hash        TEXT DEFAULT '',
+                created_at       TEXT DEFAULT (datetime('now')),
+                updated_at       TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_contracts_tenant ON contracts(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_contracts_phone  ON contracts(phone);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_contracts_token ON contracts(token);
+
+            -- Configuração do módulo por consultório. Tudo desligado por padrão:
+            -- ligar não muda o comportamento atual até enabled=1.
+            CREATE TABLE IF NOT EXISTS contract_settings (
+                tenant_id               INTEGER PRIMARY KEY,
+                enabled                 INTEGER NOT NULL DEFAULT 0,
+                reminder1_days          INTEGER NOT NULL DEFAULT 2,
+                reminder2_days          INTEGER NOT NULL DEFAULT 5,
+                expire_days             INTEGER NOT NULL DEFAULT 7,
+                block_scheduling        INTEGER NOT NULL DEFAULT 0,
+                block_confirmation      INTEGER NOT NULL DEFAULT 0,
+                require_current_version INTEGER NOT NULL DEFAULT 0,
+                created_at              TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Log idempotente de lembretes de contrato (mesma msg nunca sai 2×).
+            -- kind: 'reminder1' | 'reminder2' | 'expired'
+            CREATE TABLE IF NOT EXISTS contract_reminders_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_id INTEGER NOT NULL,
+                kind        TEXT NOT NULL,
+                sent_at     TEXT DEFAULT (datetime('now')),
+                UNIQUE(contract_id, kind)
+            );
         """)
 
         # Seed do usuário admin padrão (alanmalta) se ainda não existir
@@ -2182,3 +2252,251 @@ def admin_disable_totp(username: str) -> bool:
             (username,),
         )
         return cur.rowcount > 0
+
+
+# ── Contrato Automático ─────────────────────────────────────────────────────────
+
+# Defaults de fábrica das configurações (usados quando o tenant ainda não tem
+# linha em contract_settings). Espelham o CREATE TABLE.
+_CONTRACT_SETTINGS_DEFAULTS = {
+    "enabled": 0,
+    "reminder1_days": 2,
+    "reminder2_days": 5,
+    "expire_days": 7,
+    "block_scheduling": 0,
+    "block_confirmation": 0,
+    "require_current_version": 0,
+}
+
+
+def get_contract_settings(tenant_id: int) -> dict:
+    """Config do módulo de contrato do consultório. Sempre retorna um dict
+    completo (com os defaults) mesmo que a linha ainda não exista — assim quem
+    chama nunca precisa tratar None. enabled=0 por padrão = módulo desligado."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM contract_settings WHERE tenant_id = ?", (tenant_id,)
+        ).fetchone()
+    out = dict(_CONTRACT_SETTINGS_DEFAULTS)
+    out["tenant_id"] = tenant_id
+    if row:
+        out.update({k: row[k] for k in row.keys()})
+    return out
+
+
+def update_contract_settings(tenant_id: int, **fields) -> None:
+    """Cria/atualiza a config do consultório. Só aceita chaves conhecidas."""
+    allowed = set(_CONTRACT_SETTINGS_DEFAULTS.keys())
+    data = dict(_CONTRACT_SETTINGS_DEFAULTS)
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM contract_settings WHERE tenant_id = ?", (tenant_id,)
+        ).fetchone()
+        if row:
+            data.update({k: row[k] for k in row.keys() if k in allowed})
+        for k, v in fields.items():
+            if k in allowed and v is not None:
+                data[k] = int(v)
+        conn.execute(
+            """INSERT INTO contract_settings
+                 (tenant_id, enabled, reminder1_days, reminder2_days, expire_days,
+                  block_scheduling, block_confirmation, require_current_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(tenant_id) DO UPDATE SET
+                  enabled=excluded.enabled,
+                  reminder1_days=excluded.reminder1_days,
+                  reminder2_days=excluded.reminder2_days,
+                  expire_days=excluded.expire_days,
+                  block_scheduling=excluded.block_scheduling,
+                  block_confirmation=excluded.block_confirmation,
+                  require_current_version=excluded.require_current_version""",
+            (tenant_id, data["enabled"], data["reminder1_days"], data["reminder2_days"],
+             data["expire_days"], data["block_scheduling"], data["block_confirmation"],
+             data["require_current_version"]),
+        )
+
+
+# ── Templates de contrato (versionados) ──
+
+def get_active_contract_template(tenant_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM contract_templates WHERE tenant_id = ? AND active = 1 "
+            "ORDER BY version DESC LIMIT 1", (tenant_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_contract_templates(tenant_id: int) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM contract_templates WHERE tenant_id = ? ORDER BY version DESC",
+            (tenant_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_contract_template(tenant_id: int, body: str, title: str = "") -> dict:
+    """Cria uma nova versão do template e a torna a vigente (desativa as antigas).
+    version = maior existente + 1. Retorna o template criado."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) AS v FROM contract_templates WHERE tenant_id = ?",
+            (tenant_id,)
+        ).fetchone()
+        new_version = int(row["v"]) + 1
+        conn.execute("UPDATE contract_templates SET active = 0 WHERE tenant_id = ?", (tenant_id,))
+        cur = conn.execute(
+            "INSERT INTO contract_templates (tenant_id, version, title, body, active) "
+            "VALUES (?, ?, ?, ?, 1)",
+            (tenant_id, new_version, title or "Contrato de Prestação de Serviços", body),
+        )
+        tid = cur.lastrowid
+        created = conn.execute("SELECT * FROM contract_templates WHERE id = ?", (tid,)).fetchone()
+    return dict(created)
+
+
+# ── Contratos (instância por paciente) ──
+
+def create_contract(tenant_id: int, phone: str, patient_name: str, template: dict,
+                    token: str, expires_at: str | None = None) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO contracts
+                 (tenant_id, phone, patient_name, template_id, template_version,
+                  status, token, expires_at)
+               VALUES (?, ?, ?, ?, ?, 'pendente', ?, ?)""",
+            (tenant_id, phone, patient_name, template.get("id"),
+             template.get("version", 1), token, expires_at),
+        )
+        return cur.lastrowid
+
+
+def get_contract(contract_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM contracts WHERE id = ?", (contract_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_contract_by_token(token: str) -> dict | None:
+    if not token:
+        return None
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM contracts WHERE token = ?", (token,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_contracts_for_tenant(tenant_id: int) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM contracts WHERE tenant_id = ? ORDER BY created_at DESC",
+            (tenant_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_contracts_for_phone(tenant_id: int, phone: str) -> list[dict]:
+    """Contratos de um paciente (casa variantes de telefone), mais recente 1º."""
+    variants = _phone_variants(phone) | ({phone} if phone else set())
+    if not variants:
+        return []
+    ph = ",".join("?" * len(variants))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM contracts WHERE tenant_id = ? AND phone IN ({ph}) "
+            f"ORDER BY created_at DESC",
+            (tenant_id, *variants)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def has_signed_contract(tenant_id: int, phone: str, require_version: int | None = None) -> bool:
+    """True se o paciente tem contrato assinado. Se require_version for passado,
+    exige que a versão assinada seja >= essa (usado no bloqueio 'versão vigente')."""
+    for c in get_contracts_for_phone(tenant_id, phone):
+        if c.get("status") == "assinado":
+            if require_version is None or int(c.get("template_version") or 0) >= int(require_version):
+                return True
+    return False
+
+
+def update_contract_status(contract_id: int, status: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE contracts SET status = ?, updated_at = datetime('now') WHERE id = ?",
+            (status, contract_id),
+        )
+
+
+def mark_contract_sent(contract_id: int, expires_at: str | None) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE contracts SET status='enviado', sent_at=datetime('now'), "
+            "expires_at=COALESCE(?, expires_at), updated_at=datetime('now') WHERE id = ?",
+            (expires_at, contract_id),
+        )
+
+
+def mark_contract_signed(contract_id: int, signer_name: str, signer_cpf: str,
+                         sign_ip: str, sign_user_agent: str, sign_hash: str,
+                         pdf_path: str, signed_at: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE contracts SET
+                 status='assinado', signed_at=?, signer_name=?, signer_cpf=?,
+                 sign_ip=?, sign_user_agent=?, sign_hash=?, pdf_path=?,
+                 updated_at=datetime('now')
+               WHERE id = ?""",
+            (signed_at, signer_name, signer_cpf, sign_ip, sign_user_agent,
+             sign_hash, pdf_path, contract_id),
+        )
+
+
+def mark_contract_declined(contract_id: int, reason: str, declined_at: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE contracts SET status='recusado', declined_at=?, decline_reason=?, "
+            "updated_at=datetime('now') WHERE id = ?",
+            (declined_at, (reason or "")[:500], contract_id),
+        )
+
+
+def contract_reminder_already_sent(contract_id: int, kind: str) -> bool:
+    """Marca idempotente: retorna True se o lembrete 'kind' já saiu para este
+    contrato (e registra se ainda não). Mesmo padrão do bill_reminders_log."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO contract_reminders_log (contract_id, kind) VALUES (?, ?)",
+            (contract_id, kind),
+        )
+        return cur.rowcount == 0
+
+
+def contract_reminder_seen(contract_id: int, kind: str) -> bool:
+    """Somente leitura: True se o lembrete 'kind' já foi registrado. Use antes de
+    enviar; registre com contract_reminder_record() só APÓS o envio bem-sucedido
+    (assim uma falha de envio pode ser retentada no próximo ciclo)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM contract_reminders_log WHERE contract_id = ? AND kind = ?",
+            (contract_id, kind),
+        ).fetchone()
+    return row is not None
+
+
+def contract_reminder_record(contract_id: int, kind: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO contract_reminders_log (contract_id, kind) VALUES (?, ?)",
+            (contract_id, kind),
+        )
+
+
+def list_patients(tenant_id: int) -> list[dict]:
+    """Todos os pacientes cadastrados do consultório (usado p/ reenvio em massa
+    ao publicar nova versão do contrato)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM patients WHERE tenant_id = ? ORDER BY name", (tenant_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]

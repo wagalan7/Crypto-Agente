@@ -1467,6 +1467,15 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                                 "patient_name": (appt or {}).get("patient_name", "")}}
 
     if action == Action.create:
+        # ── Fase 4: bloqueio por contrato (opt-in, OFF por padrão, fail-open) ──
+        try:
+            import contract_service as _cs_gate
+            _blocked, _bmsg = _cs_gate.blocks_scheduling(tenant, phone)
+            if _blocked:
+                logger.info(f"[{tenant['slug']}][{phone}] agendamento bloqueado: contrato pendente")
+                return _bmsg, None
+        except Exception:
+            logger.exception("gate scheduling fail-open")
         # slot_index vem do LLM como número do display (1-based).
         # Converter para 0-based antes de indexar offered_slots.
         idx_raw = data.get("slot_index", 1)
@@ -1632,6 +1641,15 @@ def _execute_action(tenant: dict, resp: AgentResponse,
         return "Não consegui remarcar. Pode escolher outro horário? 😊", None
 
     if action == Action.confirm:
+        # ── Fase 4: bloqueio por contrato (opt-in, OFF por padrão, fail-open) ──
+        try:
+            import contract_service as _cs_gate
+            _blocked, _bmsg = _cs_gate.blocks_confirmation(tenant, phone)
+            if _blocked:
+                logger.info(f"[{tenant['slug']}][{phone}] confirmação bloqueada: contrato pendente")
+                return _bmsg, None
+        except Exception:
+            logger.exception("gate confirmation fail-open")
         appt_id = data.get("appointment_id")
         # Fallback: se o LLM não devolveu appointment_id, pega a próxima consulta
         # do paciente — MAS só se for a ÚNICA futura. Se houver 2+ consultas

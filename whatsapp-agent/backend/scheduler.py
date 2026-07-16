@@ -676,10 +676,82 @@ async def _run_billing_reminders():
         logger.exception(f"[scheduler] Erro em lembretes de vencimento: {e}")
 
 
+async def _run_contract_reminders():
+    """Fase 2 do Contrato Automático: lembra pacientes que receberam o contrato
+    mas ainda não assinaram, e expira contratos vencidos.
+
+    - Só age em consultórios com o módulo ligado (contract_settings.enabled=1).
+    - Idade contada a partir de sent_at (BRT). Prazos vêm da config do tenant.
+    - Idempotente: cada lembrete (reminder1/reminder2) sai no máx. 1× por contrato.
+    - Respeita a janela de horário (não envia de madrugada) e o agente pausado.
+    - Fail-open: qualquer erro é logado e não derruba o scheduler.
+    """
+    now = datetime.now(_TZ)
+    if not (_SEND_AFTER_HOUR <= now.hour < _SEND_BEFORE_HOUR + 1):
+        return
+    try:
+        import contract_service as cs
+        import whatsapp_service as wa
+    except Exception as e:
+        logger.warning(f"[contract-reminders] import falhou: {e}")
+        return
+
+    for tenant in db.list_tenants():
+        try:
+            if tenant.get("status") == "suspended" and not db.is_tenant_exempt(tenant):
+                continue
+            cfg = db.get_contract_settings(tenant["id"])
+            if not cfg.get("enabled"):
+                continue  # módulo desligado → nada a fazer (PRD intocado)
+            r1 = int(cfg.get("reminder1_days", 2))
+            r2 = int(cfg.get("reminder2_days", 5))
+            exp = int(cfg.get("expire_days", 7))
+
+            for c in db.list_contracts_for_tenant(tenant["id"]):
+                if c.get("status") != "enviado" or not c.get("sent_at"):
+                    continue
+                try:
+                    sent_dt = datetime.fromisoformat(c["sent_at"])
+                    if sent_dt.tzinfo is None:
+                        sent_dt = sent_dt.replace(tzinfo=_TZ)
+                except Exception:
+                    continue
+                age_days = (now - sent_dt).days
+
+                # 1) Expiração tem precedência.
+                if age_days >= exp:
+                    db.update_contract_status(c["id"], "expirado")
+                    logger.info(f"[{tenant['slug']}] Contrato #{c['id']} expirado ({age_days}d)")
+                    continue
+                # Não incomodar se o agente estiver pausado para este número.
+                if db.is_agent_paused(tenant["id"], c["phone"]):
+                    continue
+                # 2) 2º lembrete.
+                if age_days >= r2 and not db.contract_reminder_seen(c["id"], "reminder2"):
+                    ok, reason = await cs.send_contract(tenant, c, wa, is_reminder=True, reminder_ordinal=2)
+                    if ok:
+                        db.contract_reminder_record(c["id"], "reminder2")
+                        logger.info(f"[{tenant['slug']}] Lembrete 2 de contrato → #{c['id']}")
+                    else:
+                        logger.warning(f"[{tenant['slug']}] Falha lembrete 2 contrato #{c['id']}: {reason}")
+                    continue
+                # 3) 1º lembrete.
+                if age_days >= r1 and not db.contract_reminder_seen(c["id"], "reminder1"):
+                    ok, reason = await cs.send_contract(tenant, c, wa, is_reminder=True, reminder_ordinal=1)
+                    if ok:
+                        db.contract_reminder_record(c["id"], "reminder1")
+                        logger.info(f"[{tenant['slug']}] Lembrete 1 de contrato → #{c['id']}")
+                    else:
+                        logger.warning(f"[{tenant['slug']}] Falha lembrete 1 contrato #{c['id']}: {reason}")
+        except Exception as e:
+            logger.warning(f"[contract-reminders][{tenant.get('slug')}] erro: {e}")
+
+
 async def _run_all():
     await _run_confirmations()
     await _run_billing()
     await _run_billing_reminders()
+    await _run_contract_reminders()
     await _run_backup()
 
 

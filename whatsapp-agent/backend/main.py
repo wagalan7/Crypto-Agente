@@ -1483,6 +1483,163 @@ def dash_patients(request: Request):
     return {"patients": [dict(r) for r in rows]}
 
 
+# ── Contrato Automático — APIs do painel ────────────────────────────────────────
+
+@app.get("/dashboard/api/contracts/settings")
+def dash_contract_settings_get(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    s = db.get_contract_settings(tenant["id"])
+    tpl = db.get_active_contract_template(tenant["id"])
+    return {"settings": s, "active_version": (tpl or {}).get("version", 0)}
+
+
+class ContractSettingsBody(BaseModel):
+    enabled: Optional[int] = None
+    reminder1_days: Optional[int] = None
+    reminder2_days: Optional[int] = None
+    expire_days: Optional[int] = None
+    block_scheduling: Optional[int] = None
+    block_confirmation: Optional[int] = None
+    require_current_version: Optional[int] = None
+
+
+@app.post("/dashboard/api/contracts/settings")
+def dash_contract_settings_set(body: ContractSettingsBody, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    # Sanidade: prazos ≥ 1 e coerentes (r1 ≤ r2 ≤ expire) se enviados juntos.
+    for k in ("reminder1_days", "reminder2_days", "expire_days"):
+        if k in fields:
+            fields[k] = max(1, int(fields[k]))
+    db.update_contract_settings(tenant["id"], **fields)
+    return {"status": "ok", "settings": db.get_contract_settings(tenant["id"])}
+
+
+@app.get("/dashboard/api/contracts")
+def dash_contracts_list(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    out = []
+    for c in db.list_contracts_for_tenant(tenant["id"]):
+        out.append({
+            "id": c["id"], "phone": c["phone"], "patient_name": c.get("patient_name") or "",
+            "status": c.get("status"), "template_version": c.get("template_version"),
+            "sent_at": c.get("sent_at"), "signed_at": c.get("signed_at"),
+            "expires_at": c.get("expires_at"), "token": c.get("token"),
+            "has_pdf": bool(c.get("pdf_path")),
+        })
+    return {"contracts": out}
+
+
+@app.get("/dashboard/api/contracts/for/{phone}")
+def dash_contracts_for_phone(phone: str, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(phone)
+    cs_list = db.get_contracts_for_phone(tenant["id"], phone)
+    return {"contracts": [{
+        "id": c["id"], "status": c.get("status"), "template_version": c.get("template_version"),
+        "sent_at": c.get("sent_at"), "signed_at": c.get("signed_at"),
+        "expires_at": c.get("expires_at"), "token": c.get("token"),
+        "has_pdf": bool(c.get("pdf_path")),
+    } for c in cs_list]}
+
+
+class ContractSendBody(BaseModel):
+    phone: str
+    patient_name: Optional[str] = ""
+
+
+@app.post("/dashboard/api/contracts/send")
+async def dash_contract_send(body: ContractSendBody, request: Request):
+    """Cria e envia um contrato para um paciente (botão 'Enviar contrato')."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    phone = _norm_phone(body.phone)
+    if not phone or len(phone) > 15:
+        raise HTTPException(status_code=400, detail="Telefone inválido.")
+    import contract_service as _cs
+    contract = _cs.create_contract_for_patient(tenant, phone, body.patient_name or "")
+    ok, reason = await _cs.send_contract(tenant, contract, wa)
+    return {"status": "sent" if ok else "created", "id": contract["id"],
+            "sent": ok, "reason": reason if not ok else ""}
+
+
+@app.post("/dashboard/api/contracts/{contract_id}/resend")
+async def dash_contract_resend(contract_id: int, request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    contract = db.get_contract(contract_id)
+    if not contract or contract["tenant_id"] != tenant["id"]:
+        raise HTTPException(status_code=404, detail="Contrato não encontrado.")
+    import contract_service as _cs
+    ok, reason = await _cs.resend_contract(tenant, contract, wa)
+    if not ok and reason == "contrato já assinado":
+        raise HTTPException(status_code=409, detail="Este contrato já foi assinado.")
+    return {"status": "sent" if ok else "fail", "sent": ok, "reason": reason if not ok else ""}
+
+
+class ContractTemplateBody(BaseModel):
+    body: str
+    title: Optional[str] = ""
+    resend_to_active: Optional[bool] = True
+
+
+@app.get("/dashboard/api/contracts/template")
+def dash_contract_template_get(request: Request):
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    import contract_service as _cs
+    tpl = db.get_active_contract_template(tenant["id"])
+    if not tpl:
+        # Não cria ainda; devolve o padrão de fábrica como sugestão editável.
+        return {"version": 0, "title": "Contrato de Prestação de Serviços",
+                "body": _cs.DEFAULT_TEMPLATE_BODY}
+    return {"version": tpl["version"], "title": tpl.get("title") or "", "body": tpl.get("body") or ""}
+
+
+@app.post("/dashboard/api/contracts/template")
+async def dash_contract_template_publish(body: ContractTemplateBody, request: Request):
+    """Fase 3: publica nova versão do template. Marca contratos NÃO assinados de
+    versões antigas como 'desatualizado' (os assinados ficam no histórico) e,
+    opcionalmente, reenvia a nova versão para todos os pacientes ativos."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    text = (body.body or "").strip()
+    if len(text) < 30:
+        raise HTTPException(status_code=400, detail="O corpo do contrato está muito curto.")
+    import contract_service as _cs
+    tpl = db.create_contract_template(tenant["id"], text, body.title or "")
+    new_version = tpl["version"]
+
+    # Marca como 'desatualizado' os contratos ainda não assinados de versões < nova.
+    stale = 0
+    for c in db.list_contracts_for_tenant(tenant["id"]):
+        if int(c.get("template_version") or 0) < new_version and \
+           c.get("status") in ("pendente", "enviado"):
+            db.update_contract_status(c["id"], "desatualizado")
+            stale += 1
+
+    # Reenvia a nova versão para pacientes ativos (opcional).
+    resent = 0
+    if body.resend_to_active:
+        seen = set()
+        for p in db.list_patients(tenant["id"]):
+            ph = _norm_phone(p.get("phone") or "")
+            if not ph or ph in seen or len(ph) > 15:
+                continue
+            seen.add(ph)
+            try:
+                await _cs.create_and_send(tenant, ph, wa, p.get("name") or "")
+                resent += 1
+            except Exception as e:
+                logger.warning(f"[{tenant['slug']}] Falha ao reenviar contrato v{new_version} p/ {ph}: {e}")
+
+    return {"status": "ok", "version": new_version, "marked_stale": stale, "resent": resent}
+
+
 @app.post("/dashboard/api/conversation/{phone}/pause")
 def dash_pause(phone: str, request: Request):
     token = request.headers.get("X-Dashboard-Token", "")
@@ -2672,6 +2829,138 @@ def generate_dashboard_token(slug: str):
 
 
 # ── Onboarding público ─────────────────────────────────────────────────────────
+
+# ── Contrato Automático — página pública de assinatura (aceite eletrônico) ──────
+# Rotas fora do login: o paciente acessa por um token aleatório (24 bytes) que
+# veio no link enviado pelo WhatsApp. Nada aqui toca a agenda.
+
+def _contract_tenant(contract: dict) -> dict:
+    t = db.get_tenant_by_id(contract["tenant_id"])
+    if not t:
+        raise HTTPException(status_code=404, detail="Consultório não encontrado.")
+    return t
+
+
+def _contract_is_expired(contract: dict) -> bool:
+    exp = contract.get("expires_at")
+    if not exp:
+        return False
+    try:
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(exp) < datetime.now(ZoneInfo("America/Sao_Paulo"))
+    except Exception:
+        return False
+
+
+@app.get("/contrato/{token}", response_class=HTMLResponse)
+def contract_sign_page(token: str, request: Request):
+    import contract_service as _cs
+    contract = db.get_contract_by_token(token)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato não encontrado.")
+    tenant = _contract_tenant(contract)
+    status = contract.get("status")
+    # Estados terminais → tela informativa (sem formulário).
+    if status == "assinado":
+        state = "assinado"
+    elif status == "recusado":
+        state = "recusado"
+    elif status == "expirado" or _contract_is_expired(contract):
+        state = "expirado"
+    else:
+        state = "assinar"
+    # Prévia do contrato (HTML simples do corpo renderizado).
+    try:
+        tpl = None
+        for t in db.list_contract_templates(tenant["id"]):
+            if t["version"] == contract.get("template_version"):
+                tpl = t
+                break
+        tpl = tpl or db.get_active_contract_template(tenant["id"]) \
+            or {"body": _cs.DEFAULT_TEMPLATE_BODY, "title": "Contrato"}
+        patient = db.get_patient(tenant["id"], contract.get("phone", ""))
+        ctx = _cs._placeholders(tenant, contract, patient)
+        rendered = _cs.render_body(tpl.get("body") or _cs.DEFAULT_TEMPLATE_BODY, ctx)
+        body_html = _cs.body_to_html(rendered)
+    except Exception as e:
+        logger.warning(f"Falha ao renderizar prévia do contrato {token[:8]}: {e}")
+        body_html = ""
+    return templates.TemplateResponse("contrato_assinatura.html", {
+        "request": request, "state": state, "token": token,
+        "tenant": tenant, "contract": contract, "body_html": body_html,
+    })
+
+
+@app.post("/contrato/{token}/assinar", response_class=HTMLResponse)
+async def contract_sign_submit(token: str, request: Request,
+                               signer_name: str = Form(...),
+                               signer_cpf: str = Form(...),
+                               aceite: str = Form("")):
+    import contract_service as _cs
+    contract = db.get_contract_by_token(token)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato não encontrado.")
+    tenant = _contract_tenant(contract)
+    # Já assinado → mostra confirmação (idempotente).
+    if contract.get("status") == "assinado":
+        return RedirectResponse(f"/contrato/{token}", status_code=303)
+    if contract.get("status") in ("recusado",) or _contract_is_expired(contract):
+        return RedirectResponse(f"/contrato/{token}", status_code=303)
+    # Validação mínima do aceite.
+    name = (signer_name or "").strip()[:120]
+    cpf = "".join(c for c in (signer_cpf or "") if c.isdigit())[:14]
+    if not aceite or not name or len(cpf) < 11:
+        import contract_service as _cs2
+        try:
+            tpl = db.get_active_contract_template(tenant["id"]) \
+                or {"body": _cs2.DEFAULT_TEMPLATE_BODY}
+            patient = db.get_patient(tenant["id"], contract.get("phone", ""))
+            ctx = _cs2._placeholders(tenant, contract, patient)
+            body_html = _cs2.body_to_html(_cs2.render_body(tpl.get("body"), ctx))
+        except Exception:
+            body_html = ""
+        return templates.TemplateResponse("contrato_assinatura.html", {
+            "request": request, "state": "assinar", "token": token,
+            "tenant": tenant, "contract": contract, "body_html": body_html,
+            "erro": "Preencha seu nome completo, um CPF válido e marque o aceite.",
+        }, status_code=400)
+    ip = _client_ip(request)
+    ua = request.headers.get("user-agent", "")
+    try:
+        _cs.sign_contract(tenant, contract, signer_name=name, signer_cpf=cpf,
+                          sign_ip=ip, sign_user_agent=ua)
+    except Exception as e:
+        logger.exception(f"Falha ao assinar contrato {token[:8]}: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao registrar a assinatura.")
+    return RedirectResponse(f"/contrato/{token}", status_code=303)
+
+
+@app.post("/contrato/{token}/recusar", response_class=HTMLResponse)
+def contract_decline_submit(token: str, request: Request, motivo: str = Form("")):
+    contract = db.get_contract_by_token(token)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contrato não encontrado.")
+    if contract.get("status") not in ("assinado",):
+        from datetime import datetime as _dt
+        db.mark_contract_declined(
+            contract["id"], reason=motivo,
+            declined_at=_dt.now(ZoneInfo("America/Sao_Paulo")).isoformat(),
+        )
+    return RedirectResponse(f"/contrato/{token}", status_code=303)
+
+
+@app.get("/contrato/{token}/pdf")
+def contract_pdf(token: str):
+    contract = db.get_contract_by_token(token)
+    if not contract or contract.get("status") != "assinado":
+        raise HTTPException(status_code=404, detail="PDF indisponível.")
+    path = contract.get("pdf_path") or ""
+    if not path or not _os_init.path.exists(path):
+        raise HTTPException(status_code=404, detail="PDF não encontrado.")
+    from fastapi.responses import FileResponse
+    return FileResponse(path, media_type="application/pdf",
+                        filename=f"contrato_{contract['id']}.pdf")
+
 
 @app.get("/termos", response_class=HTMLResponse)
 def termos_de_uso(request: Request):
