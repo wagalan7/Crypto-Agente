@@ -300,6 +300,12 @@ def init_db():
             "ALTER TABLE contracts ADD COLUMN attendance_mode TEXT DEFAULT ''",
             "ALTER TABLE contracts ADD COLUMN psy_signed_at TEXT DEFAULT ''",
             "ALTER TABLE contracts ADD COLUMN psy_signer_name TEXT DEFAULT ''",
+            # Fase 4b: auto-envio + trava de contrato só para pacientes NOVOS.
+            # auto_send_new = flag mestre (OFF por padrão). activation_cutoff =
+            # carimbo UTC gravado ao ligar a flag; serve de marcador "foi ativado /
+            # snapshot tirado" (a decisão novo/existente usa a tabela de isenção).
+            "ALTER TABLE contract_settings ADD COLUMN auto_send_new INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE contract_settings ADD COLUMN activation_cutoff TEXT NOT NULL DEFAULT ''",
         ]
         for sql in migrations:
             try:
@@ -458,6 +464,8 @@ def init_db():
                 block_scheduling        INTEGER NOT NULL DEFAULT 0,
                 block_confirmation      INTEGER NOT NULL DEFAULT 0,
                 require_current_version INTEGER NOT NULL DEFAULT 0,
+                auto_send_new           INTEGER NOT NULL DEFAULT 0,
+                activation_cutoff       TEXT NOT NULL DEFAULT '',
                 created_at              TEXT DEFAULT (datetime('now'))
             );
 
@@ -469,6 +477,19 @@ def init_db():
                 kind        TEXT NOT NULL,
                 sent_at     TEXT DEFAULT (datetime('now')),
                 UNIQUE(contract_id, kind)
+            );
+
+            -- Fase 4b: snapshot dos pacientes JÁ EXISTENTES no instante da ativação
+            -- do auto-envio (auto_send_new 0→1). Quem está aqui é ISENTO — nunca
+            -- recebe contrato automático nem é travado. "Paciente novo" = quem NÃO
+            -- está nesta lista. Congelar a lista (em vez de comparar created_at, que
+            -- a tabela patients nem tem) dá semântica à prova de falha e não mexe
+            -- nos caminhos de cadastro de paciente.
+            CREATE TABLE IF NOT EXISTS contract_new_patient_exempt (
+                tenant_id  INTEGER NOT NULL,
+                phone      TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(tenant_id, phone)
             );
         """)
 
@@ -2281,7 +2302,12 @@ _CONTRACT_SETTINGS_DEFAULTS = {
     "block_scheduling": 0,
     "block_confirmation": 0,
     "require_current_version": 0,
+    "auto_send_new": 0,
+    "activation_cutoff": "",
 }
+
+# Campos de contract_settings que são TEXTO (os demais são inteiros 0/1/N).
+_CONTRACT_SETTINGS_TEXT = {"activation_cutoff"}
 
 
 def get_contract_settings(tenant_id: int) -> dict:
@@ -2300,7 +2326,13 @@ def get_contract_settings(tenant_id: int) -> dict:
 
 
 def update_contract_settings(tenant_id: int, **fields) -> None:
-    """Cria/atualiza a config do consultório. Só aceita chaves conhecidas."""
+    """Cria/atualiza a config do consultório. Só aceita chaves conhecidas.
+
+    Campos inteiros são coeridos com int(); campos de texto (activation_cutoff)
+    são gravados como string. Regra especial: ao LIGAR auto_send_new (0→1) sem um
+    activation_cutoff já definido, carimbamos o cutoff = agora (marcador de "foi
+    ativado") E tiramos o snapshot dos pacientes existentes (isenção) — assim os
+    já existentes ficam intocados e só quem chegar depois é 'novo'."""
     allowed = set(_CONTRACT_SETTINGS_DEFAULTS.keys())
     data = dict(_CONTRACT_SETTINGS_DEFAULTS)
     with get_conn() as conn:
@@ -2309,14 +2341,32 @@ def update_contract_settings(tenant_id: int, **fields) -> None:
         ).fetchone()
         if row:
             data.update({k: row[k] for k in row.keys() if k in allowed})
+        prev_auto = int(data.get("auto_send_new") or 0)
         for k, v in fields.items():
             if k in allowed and v is not None:
-                data[k] = int(v)
+                if k in _CONTRACT_SETTINGS_TEXT:
+                    data[k] = str(v)
+                else:
+                    data[k] = int(v)
+        # Ativação (0→1) sem cutoff prévio: carimba cutoff + snapshot de isenção.
+        activating = (int(data.get("auto_send_new") or 0) == 1 and prev_auto == 0
+                      and not (data.get("activation_cutoff") or ""))
+        if activating:
+            data["activation_cutoff"] = conn.execute(
+                "SELECT datetime('now')"
+            ).fetchone()[0]
+            # Congela os pacientes JÁ existentes como isentos (idempotente).
+            conn.execute(
+                """INSERT OR IGNORE INTO contract_new_patient_exempt (tenant_id, phone)
+                     SELECT tenant_id, phone FROM patients WHERE tenant_id = ?""",
+                (tenant_id,),
+            )
         conn.execute(
             """INSERT INTO contract_settings
                  (tenant_id, enabled, reminder1_days, reminder2_days, expire_days,
-                  block_scheduling, block_confirmation, require_current_version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  block_scheduling, block_confirmation, require_current_version,
+                  auto_send_new, activation_cutoff)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(tenant_id) DO UPDATE SET
                   enabled=excluded.enabled,
                   reminder1_days=excluded.reminder1_days,
@@ -2324,10 +2374,13 @@ def update_contract_settings(tenant_id: int, **fields) -> None:
                   expire_days=excluded.expire_days,
                   block_scheduling=excluded.block_scheduling,
                   block_confirmation=excluded.block_confirmation,
-                  require_current_version=excluded.require_current_version""",
+                  require_current_version=excluded.require_current_version,
+                  auto_send_new=excluded.auto_send_new,
+                  activation_cutoff=excluded.activation_cutoff""",
             (tenant_id, data["enabled"], data["reminder1_days"], data["reminder2_days"],
              data["expire_days"], data["block_scheduling"], data["block_confirmation"],
-             data["require_current_version"]),
+             data["require_current_version"], data["auto_send_new"],
+             data["activation_cutoff"]),
         )
 
 
@@ -2445,6 +2498,36 @@ def has_signed_contract(tenant_id: int, phone: str, require_version: int | None 
             if require_version is None or int(c.get("template_version") or 0) >= int(require_version):
                 return True
     return False
+
+
+def is_patient_exempt(tenant_id: int, phone: str) -> bool:
+    """True se o telefone está na lista de isenção (snapshot dos pacientes que já
+    existiam na ativação). Casa variantes do número BR, igual a get_patient."""
+    variants = _phone_variants(phone) | ({phone} if phone else set())
+    if not variants:
+        return False
+    ph = ",".join("?" * len(variants))
+    with get_conn() as conn:
+        row = conn.execute(
+            f"SELECT 1 FROM contract_new_patient_exempt "
+            f"WHERE tenant_id = ? AND phone IN ({ph}) LIMIT 1",
+            (tenant_id, *variants)
+        ).fetchone()
+    return bool(row)
+
+
+def patient_is_new(tenant_id: int, phone: str, activated: bool) -> bool:
+    """True se o paciente é 'novo' para efeito da Fase 4b (auto-envio de contrato):
+    NÃO está na lista de isenção tirada na ativação.
+
+    Regras de segurança:
+    - `activated` falso (feature nunca ativada / sem cutoff) → ninguém é novo
+      (retorna False): a regra fica inerte, jamais dispara sozinha.
+    - Está na isenção (existia na ativação) → EXISTENTE (False), fica intocado.
+    - Qualquer outro (chegou depois / contato inédito) → NOVO (True)."""
+    if not activated:
+        return False
+    return not is_patient_exempt(tenant_id, phone)
 
 
 def update_contract_status(contract_id: int, status: str) -> None:

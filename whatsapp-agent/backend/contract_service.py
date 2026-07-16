@@ -489,3 +489,63 @@ def blocks_scheduling(tenant: dict, phone: str) -> tuple[bool, str]:
 def blocks_confirmation(tenant: dict, phone: str) -> tuple[bool, str]:
     """Deve bloquear a confirmação de presença deste paciente?"""
     return _is_gated(tenant, phone, "confirmation")
+
+
+# ── Fase 4b: auto-envio + trava SÓ para pacientes NOVOS ──────────────────────
+#
+# Cenário da Bruna: disparar o contrato automaticamente para pacientes NOVOS e
+# travar até assinarem; pacientes JÁ EXISTENTES ficam intocados (nunca recebem,
+# nunca são travados). Tudo atrás da flag auto_send_new (OFF por padrão) e do
+# activation_cutoff (carimbo gravado ao ligar a flag). Fail-open: qualquer erro
+# NUNCA trava o paciente.
+#
+# Como _execute_action do agente é SÍNCRONO, não há envio ativo aqui: o próprio
+# retorno do agente (a mensagem de bloqueio) já leva o link de assinatura ao
+# paciente. Basta garantir que o contrato exista (criação é I/O de banco, síncrono).
+
+def _ensure_new_patient_contract(tenant: dict, phone: str) -> None:
+    """Idempotente: se já existe um contrato em aberto (enviado/pendente) para o
+    telefone, não faz nada (evita spam/duplicata). Senão cria um novo, já assinado
+    pela CONTRATADA (psy_sign), e o marca como 'enviado' — o link chega ao paciente
+    na própria resposta do agente. Os dados do atendimento (valor/dia/horário)
+    ficam em branco: o auto-envio não os conhece; o paciente lê e assina, e a
+    psicóloga pode complementar depois no painel."""
+    try:
+        for c in db.get_contracts_for_phone(tenant["id"], phone):
+            if c.get("status") in ("enviado", "pendente"):
+                return  # já tem link em aberto
+        contract = create_contract_for_patient(tenant, phone, psy_sign=True)
+        db.mark_contract_sent(contract["id"], compute_expires_at(tenant["id"]))
+        logger.info(f"[{tenant.get('slug')}][{phone}] contrato auto-enviado "
+                    f"(paciente novo) #{contract['id']}")
+    except Exception:
+        logger.exception("_ensure_new_patient_contract fail (phone=%s)", phone)
+
+
+def enforce_new_patient(tenant: dict, phone: str, which: str) -> tuple[bool, str]:
+    """Auto-envio + trava para pacientes NOVOS. Retorna (bloqueado, mensagem).
+    which ∈ {'scheduling','confirmation'}.
+
+    Liga só quando auto_send_new=1. Um paciente é 'novo' se NÃO está na lista de
+    isenção congelada na ativação (ver db.patient_is_new). Para um novo que não assinou:
+    garante o contrato enviado (idempotente) e devolve (True, msg_com_link).
+    Pacientes existentes (< cutoff) e quem já assinou passam direto → (False, '').
+    Fail-open: qualquer exceção → (False, '') (nunca trava o paciente)."""
+    try:
+        st = db.get_contract_settings(tenant["id"])
+        if not st.get("auto_send_new"):
+            return (False, "")
+        activated = bool(st.get("activation_cutoff") or "")
+        if not db.patient_is_new(tenant["id"], phone, activated):
+            return (False, "")  # paciente existente (isento) → intocado
+        require_version = None
+        if st.get("require_current_version"):
+            tpl = db.get_active_contract_template(tenant["id"])
+            require_version = int(tpl["version"]) if tpl else None
+        if db.has_signed_contract(tenant["id"], phone, require_version):
+            return (False, "")  # já assinou → liberado
+        _ensure_new_patient_contract(tenant, phone)
+        return (True, _block_message(tenant, phone, which))
+    except Exception:
+        logger.exception("enforce_new_patient fail-open (which=%s)", which)
+        return (False, "")

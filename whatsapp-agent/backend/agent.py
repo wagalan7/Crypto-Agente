@@ -1467,6 +1467,15 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                                 "patient_name": (appt or {}).get("patient_name", "")}}
 
     if action == Action.create:
+        # ── Fase 4b: auto-envio + trava p/ pacientes NOVOS (opt-in, OFF, fail-open) ──
+        try:
+            import contract_service as _cs_gate
+            _bN, _bmsgN = _cs_gate.enforce_new_patient(tenant, phone, "scheduling")
+            if _bN:
+                logger.info(f"[{tenant['slug']}][{phone}] agendamento bloqueado: paciente novo, contrato auto-enviado")
+                return _bmsgN, None
+        except Exception:
+            logger.exception("enforce_new_patient scheduling fail-open")
         # ── Fase 4: bloqueio por contrato (opt-in, OFF por padrão, fail-open) ──
         try:
             import contract_service as _cs_gate
@@ -1641,6 +1650,15 @@ def _execute_action(tenant: dict, resp: AgentResponse,
         return "Não consegui remarcar. Pode escolher outro horário? 😊", None
 
     if action == Action.confirm:
+        # ── Fase 4b: auto-envio + trava p/ pacientes NOVOS (opt-in, OFF, fail-open) ──
+        try:
+            import contract_service as _cs_gate
+            _bN, _bmsgN = _cs_gate.enforce_new_patient(tenant, phone, "confirmation")
+            if _bN:
+                logger.info(f"[{tenant['slug']}][{phone}] confirmação bloqueada: paciente novo, contrato auto-enviado")
+                return _bmsgN, None
+        except Exception:
+            logger.exception("enforce_new_patient confirmation fail-open")
         # ── Fase 4: bloqueio por contrato (opt-in, OFF por padrão, fail-open) ──
         try:
             import contract_service as _cs_gate

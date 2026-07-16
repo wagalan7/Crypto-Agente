@@ -1502,6 +1502,10 @@ class ContractSettingsBody(BaseModel):
     block_scheduling: Optional[int] = None
     block_confirmation: Optional[int] = None
     require_current_version: Optional[int] = None
+    # Fase 4b: auto-envio + trava só para pacientes NOVOS. Ao ligar auto_send_new
+    # (0→1) sem cutoff explícito, o banco carimba activation_cutoff = agora.
+    auto_send_new: Optional[int] = None
+    activation_cutoff: Optional[str] = None
 
 
 @app.post("/dashboard/api/contracts/settings")
