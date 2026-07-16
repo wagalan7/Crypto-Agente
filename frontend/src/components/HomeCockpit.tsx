@@ -10,10 +10,24 @@ interface RiskStatus {
   enabled: boolean
   trading_paused: boolean
   pause_reason: string | null
+  pause_manual?: boolean
+  paused_at?: string | null
   daily_dd_pct: number
   weekly_dd_pct: number
   daily_limit_pct: number
   weekly_limit_pct: number
+}
+interface RegimeStatus {
+  regime: string
+  btc_24h_pct: number | null
+  btc_dominance: number | null
+  btc_trend_pct?: number | null
+  block_all?: boolean
+  block_alt_longs?: boolean
+  downgrade_alt_longs?: boolean
+  downgrade_shorts?: boolean
+  block_shorts?: boolean
+  reasons?: string[]
 }
 interface DailySummary {
   total_trades: number
@@ -120,8 +134,10 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
   const [paper, setPaper] = useState<PaperSummary | null>(null)
   const [health, setHealth] = useState<HealthStatus | null>(null)
   const [macro, setMacro] = useState<MacroData | null>(null)
+  const [regime, setRegime] = useState<RegimeStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [resuming, setResuming] = useState(false)
   const [clock, setClock] = useState(new Date())
   const firstLoad = useRef(true)
 
@@ -136,7 +152,7 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
     // Cada fonte é best-effort: falha de uma não derruba a Home.
     const settle = <T,>(p: Promise<T>) => p.then(v => v).catch(() => null)
 
-    const [riskJson, dailyJson, tradesRes, recsRes, paperJson, healthJson, macroJson] = await Promise.all([
+    const [riskJson, dailyJson, tradesRes, recsRes, paperJson, healthJson, macroJson, regimeJson] = await Promise.all([
       settle(fetch(`${BACKEND}/api/risk/status`).then(r => r.ok ? r.json() : null)),
       settle(fetch(`${BACKEND}/api/daily-pnl?date=${todayUtc()}`).then(r => r.ok ? r.json() : null)),
       settle(api.listRealTrades({ status: 'open', limit: 50 })),
@@ -144,9 +160,11 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
       settle(fetch(`${BACKEND}/api/paper/summary?days=30`).then(r => r.ok ? r.json() : null)),
       settle(fetch(`${BACKEND}/api/admin/health`).then(r => r.ok ? r.json() : null)),
       settle(api.macro('BTC/USDT:USDT')),
+      settle(fetch(`${BACKEND}/api/regime-status`).then(r => r.ok ? r.json() : null)),
     ])
 
     if (riskJson && riskJson.enabled !== false) setRisk(riskJson as RiskStatus)
+    if (regimeJson) setRegime(regimeJson as RegimeStatus)
     if (dailyJson?.summary) setSummary(dailyJson.summary as DailySummary)
     const openTrades = (tradesRes?.trades ?? []) as RealTradeRow[]
     setPositions(openTrades)
@@ -171,9 +189,49 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
     return () => clearInterval(id)
   }, [load])
 
+  // Retomar trading após pausa do circuit breaker (kill switch → paused=false).
+  // Ação sensível: confirma antes. Só o próprio usuário aciona clicando aqui.
+  const resumeTrading = useCallback(async () => {
+    if (!window.confirm('Retomar o trading agora? Isto desliga a pausa do circuit breaker.')) return
+    setResuming(true)
+    try {
+      const res = await fetch(`${BACKEND}/api/risk/kill-switch?paused=false`, { method: 'POST' })
+      if (res.ok) {
+        const j = await res.json().catch(() => null)
+        if (j && j.enabled !== false) setRisk(j as RiskStatus)
+        await load()
+      } else {
+        window.alert('Não consegui retomar agora. Tente pela tela de Risco.')
+      }
+    } catch {
+      window.alert('Falha de rede ao retomar. Tente novamente.')
+    } finally {
+      setResuming(false)
+    }
+  }, [load])
+
   const totalR = summary?.total_r ?? 0
   const pnlPct = summary?.total_pct_banca ?? null
   const pnlPositive = totalR >= 0
+
+  // Split de direção das recomendações visíveis (long vs short)
+  const recsLong = recs.filter(r => r.direction !== 'short').length
+  const recsShort = recs.filter(r => r.direction === 'short').length
+
+  // Freio de regime ativo (trava simétrica de short / downgrade de long)
+  const regimeBrake = !!regime && (
+    regime.block_all || regime.block_alt_longs || regime.downgrade_alt_longs ||
+    regime.downgrade_shorts || regime.block_shorts
+  )
+  const regimeMsg = (() => {
+    if (!regime) return null
+    if (regime.block_shorts) return 'Pernada forte de alta — shorts bloqueados'
+    if (regime.downgrade_shorts) return 'Pernada de alta — shorts rebaixados (não short contra a tendência)'
+    if (regime.block_alt_longs) return 'Capital migrando p/ BTC — longs de alt bloqueados'
+    if (regime.downgrade_alt_longs) return 'Dominância BTC alta — longs de alt rebaixados'
+    if (regime.block_all) return 'Risk-off — novas entradas bloqueadas'
+    return null
+  })()
 
   // Curva de capital → pontos p/ o sparkline
   const curve = paper?.equity?.curve ?? []
@@ -261,6 +319,46 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
               </button>
             </div>
 
+            {/* ── BANNER: TRADING PAUSADO (circuit breaker) ── */}
+            {risk?.trading_paused && (
+              <div className="flex flex-col sm:flex-row sm:items-center gap-3 bg-red-950/40 border border-red-500/40 rounded-2xl px-4 py-3 mb-4">
+                <div className="flex items-start gap-2.5 flex-1 min-w-0">
+                  <span className="text-lg leading-none mt-0.5">🛑</span>
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-bold text-red-200">
+                      Trading pausado {risk.pause_manual ? '(manual)' : '(circuit breaker automático)'}
+                    </div>
+                    <div className="text-[11.5px] text-red-300/80 mt-0.5">
+                      {risk.pause_reason ?? 'Limite de drawdown atingido.'}
+                      {!risk.pause_manual && ' · Retoma sozinho na virada do dia UTC quando o DD recuperar.'}
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={resumeTrading}
+                  disabled={resuming}
+                  className="shrink-0 text-[12px] font-bold px-3.5 py-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 text-red-100 disabled:opacity-50"
+                >
+                  {resuming ? 'Retomando…' : 'Retomar agora'}
+                </button>
+              </div>
+            )}
+
+            {/* ── BANNER: FREIO DE REGIME (trava de short / downgrade de long) ── */}
+            {!risk?.trading_paused && regimeBrake && regimeMsg && (
+              <div className="flex items-start gap-2.5 bg-amber-950/30 border border-amber-500/30 rounded-2xl px-4 py-2.5 mb-4">
+                <span className="text-base leading-none mt-0.5">🧭</span>
+                <div className="min-w-0">
+                  <div className="text-[12.5px] font-semibold text-amber-200">{regimeMsg}</div>
+                  <div className="text-[11px] text-amber-300/70 mt-0.5">
+                    Regime {regime?.regime}
+                    {regime?.btc_trend_pct != null && ` · BTC ${regime.btc_trend_pct >= 0 ? '+' : ''}${regime.btc_trend_pct.toFixed(1)}% multi-dia`}
+                    {regime?.btc_dominance != null && ` · dominância ${regime.btc_dominance.toFixed(1)}%`}
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* ── BENTO GRID ── */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5">
 
@@ -333,6 +431,13 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
               <div className="bg-[#0f1524] border border-slate-800 rounded-2xl p-4 lg:col-span-5">
                 <h2 className="text-[11.5px] uppercase tracking-wider text-slate-500 font-bold mb-3 flex items-center gap-2">
                   ✨ Recomendações agora
+                  {recs.length > 0 && (
+                    <span className="normal-case tracking-normal font-semibold text-[10.5px] flex items-center gap-1.5">
+                      <span className="text-green-300">{recsLong}L</span>
+                      <span className="text-slate-600">·</span>
+                      <span className="text-red-300">{recsShort}S</span>
+                    </span>
+                  )}
                   <button onClick={onOpenRecs} className="ml-auto text-cyan-400 text-[11px] normal-case tracking-normal font-semibold">ver todas ›</button>
                 </h2>
                 {recs.length === 0 ? (

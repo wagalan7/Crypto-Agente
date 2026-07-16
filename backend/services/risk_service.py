@@ -133,7 +133,32 @@ async def update_and_check() -> dict:
         state.daily_trades = daily_trades
         state.weekly_trades = weekly_trades
 
+        # ── Auto-resume do circuit breaker AUTOMÁTICO ───────────────────────
+        # BUGFIX: a virada de DIA atualizava a data mas NÃO despausava — só a
+        # virada de SEMANA fazia. Uma pausa DIÁRIA (DD -3%) ficava presa até
+        # segunda-feira (ou resume manual), deixando o bot parado por dias.
+        # Regra: se a pausa é automática (não manual), disparou num dia UTC
+        # ANTERIOR e AMBOS os DD já voltaram pra dentro do limite → retoma.
+        # Exigir weekly saudável impede soltar uma pausa SEMANAL cedo demais.
+        if state.trading_paused and not state.pause_manual and state.paused_at:
+            _pa = state.paused_at
+            if _pa.tzinfo is None:
+                _pa = _pa.replace(tzinfo=timezone.utc)
+            _pa_day = _pa.astimezone(timezone.utc).strftime("%Y-%m-%d")
+            if (_pa_day != today
+                    and daily_dd > DAILY_DD_LIMIT_PCT
+                    and weekly_dd > WEEKLY_DD_LIMIT_PCT):
+                log.info(
+                    f"[circuit-breaker] AUTO-RESUME: dia virou e DD recuperou "
+                    f"(d={daily_dd:.2f}% w={weekly_dd:.2f}%)"
+                )
+                state.trading_paused = False
+                state.pause_reason = None
+                state.paused_at = None
+                _log_event(session, state, "auto_resume", "Virada de dia UTC + DD recuperado")
+
         # Aciona pausa automática se cruzou limite (e não estava já pausado)
+        _just_auto_paused = False
         if not state.trading_paused:
             if daily_dd <= DAILY_DD_LIMIT_PCT:
                 state.trading_paused = True
@@ -145,6 +170,7 @@ async def update_and_check() -> dict:
                 state.paused_at = datetime.now(timezone.utc)
                 log.warning(f"[circuit-breaker] AUTO-PAUSE: {state.pause_reason}")
                 _log_event(session, state, "auto_pause", state.pause_reason)
+                _just_auto_paused = True
             elif weekly_dd <= WEEKLY_DD_LIMIT_PCT:
                 state.trading_paused = True
                 state.pause_manual = False
@@ -155,11 +181,15 @@ async def update_and_check() -> dict:
                 state.paused_at = datetime.now(timezone.utc)
                 log.warning(f"[circuit-breaker] AUTO-PAUSE: {state.pause_reason}")
                 _log_event(session, state, "auto_pause", state.pause_reason)
+                _just_auto_paused = True
 
         state.updated_at = datetime.now(timezone.utc)
         await session.commit()
 
-        return _to_dict(state)
+        result = _to_dict(state)
+        # Sinaliza a TRANSIÇÃO pra pausa (o scan loop dispara push de alerta).
+        result["just_auto_paused"] = _just_auto_paused
+        return result
 
 
 async def get_status() -> dict:

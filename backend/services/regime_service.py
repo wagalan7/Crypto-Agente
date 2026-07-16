@@ -63,6 +63,24 @@ ALT_RISKOFF_USDT_D = float(os.getenv("ALT_RISKOFF_USDT_D", "5.0"))   # USDT.D >=
 ALT_RISKOFF_DOM = float(os.getenv("ALT_RISKOFF_DOM", "55.0"))        # dominância BTC >= isso
 ALT_RISKOFF_BLOCK = os.getenv("ALT_RISKOFF_BLOCK", "false").strip().lower() in ("1", "true", "yes")
 
+# ── Trava SIMÉTRICA de SHORT (trend-awareness multi-dia) ────────────────────
+# Espelho do downgrade de LONG: quando o BTC está numa PERNADA FORTE DE ALTA
+# multi-dia, shortar contra a tendência sangra (foi a queixa recorrente —
+# "muito short apontado mesmo com BTC subindo"). Os regimes acima só olham
+# BTC% 24h + dominância, cegos a uma tendência de vários dias. Este gate cruza
+# a inclinação multi-dia do BTC e, por default, REBAIXA (não bloqueia) os
+# shorts; bloqueia só se SHORT_BRAKE_BLOCK ligado. Aplica a TODOS os shorts
+# (inclusive BTC) — a queixa incluía short de BTC contra a própria alta.
+# DEFAULT ON: é a correção explicitamente pedida; começa conservador (rebaixa).
+SHORT_BRAKE_ENABLED = os.getenv("SHORT_BRAKE_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off", "",
+)
+SHORT_BRAKE_DAYS = int(os.getenv("SHORT_BRAKE_DAYS", "3"))       # janela da tendência
+SHORT_BRAKE_TREND_PCT = float(os.getenv("SHORT_BRAKE_TREND_PCT", "6.0"))  # alta >= isso = pernada forte
+SHORT_BRAKE_BLOCK = os.getenv("SHORT_BRAKE_BLOCK", "false").strip().lower() in ("1", "true", "yes")
+_trend_cache: Dict[str, Any] = {"ts": 0, "data": None}
+TREND_CACHE_TTL = 1800  # 30min: tendência multi-dia muda devagar
+
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
 CACHE_TTL = 600  # 10min: regime muda devagar
 
@@ -117,12 +135,15 @@ def _classify(
     btc_24h: Optional[float],
     dom: Optional[float],
     usdt_d: Optional[float] = None,
+    btc_trend_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
     reasons = []
     regime = "NORMAL"
     block_all = False
     block_alt_longs = False
     downgrade_alt_longs = False
+    downgrade_shorts = False
+    block_shorts = False
 
     if btc_24h is not None and btc_24h <= RISK_OFF_BTC_24H:
         regime = "RISK_OFF"
@@ -170,16 +191,65 @@ def _classify(
             f"{'bloqueado' if ALT_RISKOFF_BLOCK else 'rebaixado'}"
         )
 
+    # ── Trava simétrica de SHORT: pernada forte de alta multi-dia ───────────
+    # Só age se não estamos em RISK_OFF (que já bloqueia tudo). Espelha o
+    # downgrade de long: numa alta forte, short contra a tendência sangra.
+    if (
+        SHORT_BRAKE_ENABLED and not block_all
+        and btc_trend_pct is not None and btc_trend_pct >= SHORT_BRAKE_TREND_PCT
+    ):
+        if SHORT_BRAKE_BLOCK:
+            block_shorts = True
+        else:
+            downgrade_shorts = True
+        # Não sobrescreve um regime de alt-long já detectado; só anota o de short
+        if regime == "NORMAL":
+            regime = "UPTREND"
+        reasons.append(
+            f"BTC {btc_trend_pct:+.1f}% em {SHORT_BRAKE_DAYS}d (pernada forte de alta) — "
+            f"short {'bloqueado' if SHORT_BRAKE_BLOCK else 'rebaixado'} (não short contra a tendência)"
+        )
+
     return {
         "regime": regime,
         "btc_24h_pct": btc_24h,
         "btc_dominance": dom,
         "usdt_dominance": usdt_d,
+        "btc_trend_pct": btc_trend_pct,
         "block_all": block_all,
         "block_alt_longs": block_alt_longs,
         "downgrade_alt_longs": downgrade_alt_longs,
+        "downgrade_shorts": downgrade_shorts,
+        "block_shorts": block_shorts,
         "reasons": reasons,
     }
+
+
+async def _fetch_btc_trend_pct(days: int) -> Optional[float]:
+    """% de variação do BTC nos últimos `days` dias (candles 1d). Cache 30min.
+
+    Mede a inclinação multi-dia — o que os gates 24h/dominância não enxergam.
+    Fail-open → None (não trava a trava de short)."""
+    now = time.time()
+    if _trend_cache["data"] is not None and (now - _trend_cache["ts"]) < TREND_CACHE_TTL:
+        return _trend_cache["data"]
+    try:
+        from services.binance_service import fetch_ohlcv
+        df = await fetch_ohlcv("BTC/USDT:USDT", timeframe="1d", limit=days + 3)
+        if df is None or len(df) < days + 1:
+            return None
+        closes = df["close"].tolist()
+        past = float(closes[-(days + 1)])
+        last = float(closes[-1])
+        if past <= 0:
+            return None
+        pct = round((last - past) / past * 100.0, 2)
+        _trend_cache["data"] = pct
+        _trend_cache["ts"] = now
+        return pct
+    except Exception as e:
+        log.warning(f"[regime] btc trend {days}d falhou: {e}")
+        return None
 
 
 async def get_regime_status() -> Dict[str, Any]:
@@ -187,8 +257,10 @@ async def get_regime_status() -> Dict[str, Any]:
     if not REGIME_FILTER_ENABLED:
         return {
             "regime": "NORMAL", "btc_24h_pct": None, "btc_dominance": None,
+            "btc_trend_pct": None,
             "block_all": False, "block_alt_longs": False,
-            "downgrade_alt_longs": False, "reasons": ["filter disabled"],
+            "downgrade_alt_longs": False, "downgrade_shorts": False,
+            "block_shorts": False, "reasons": ["filter disabled"],
         }
 
     now = time.time()
@@ -209,7 +281,12 @@ async def get_regime_status() -> Dict[str, Any]:
         except Exception as e:
             log.warning(f"[regime] usdt.d falhou (fail-open): {e}")
 
-    data = _classify(btc_24h, dom, usdt_d)
+    # Tendência multi-dia p/ a trava de short (só busca quando o gate está ON)
+    btc_trend = None
+    if SHORT_BRAKE_ENABLED:
+        btc_trend = await _fetch_btc_trend_pct(SHORT_BRAKE_DAYS)
+
+    data = _classify(btc_24h, dom, usdt_d, btc_trend)
     if btc_24h is not None or dom is not None:
         _cache["data"] = data
         _cache["ts"] = now
@@ -282,4 +359,7 @@ def should_block_recommendation(regime_status: Dict[str, Any], symbol: str, dire
     if regime_status.get("block_alt_longs"):
         if direction == "long" and not is_btc_symbol(symbol):
             return f"regime ALT_DANGER: alt long bloqueado"
+    # Trava simétrica: short contra pernada forte de alta (se em modo block)
+    if regime_status.get("block_shorts") and direction == "short":
+        return f"regime {regime_status.get('regime')}: short bloqueado (pernada de alta)"
     return None

@@ -81,6 +81,7 @@ from services.push_service import (
     save_subscription as push_save_subscription,
     remove_subscription as push_remove_subscription,
     notify_recommendations_batch,
+    notify_alert,
     PUSH_ENABLED,
 )
 from db import init_db, close_db, DB_ENABLED
@@ -536,6 +537,17 @@ async def _server_scan_loop():
                 from services import risk_service
                 risk_snapshot = await risk_service.update_and_check()
                 trading_paused = bool(risk_snapshot.get("trading_paused"))
+                # Alerta o usuário no MOMENTO em que o circuit breaker pausa
+                # (antes descobria dias depois). Fail-soft: erro não trava scan.
+                if risk_snapshot.get("just_auto_paused"):
+                    try:
+                        await notify_alert(
+                            "🛑 Trading pausado (circuit breaker)",
+                            risk_snapshot.get("pause_reason", "Limite de drawdown atingido"),
+                            tag="risk-pause",
+                        )
+                    except Exception as _e:
+                        logging.warning(f"[server-scan] alerta de pausa falhou: {_e}")
             except Exception as e:
                 logging.warning(f"[server-scan] risk_service falhou: {e}")
                 trading_paused = False

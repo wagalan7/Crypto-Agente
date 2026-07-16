@@ -1586,6 +1586,14 @@ async def get_recommendations_from_batch(
                     tier = "B"
                 elif tier == "B":
                     continue  # B downgrade vira reject
+            # Trava simétrica: downgrade de SHORT contra pernada forte de alta
+            if regime.get("downgrade_shorts") and sig.direction == "short":
+                if tier == "A+":
+                    tier = "A"
+                elif tier == "A":
+                    tier = "B"
+                elif tier == "B":
+                    continue  # B downgrade vira reject
         except Exception:
             pass
 
@@ -1917,6 +1925,14 @@ async def get_recommendations_via_vision(
                 _log.info(f"[server-scan] skip {sig.symbol} {sig.direction}: {block_reason}")
                 continue
             if regime.get("downgrade_alt_longs") and sig.direction == "long" and not is_btc_symbol(sig.symbol):
+                if tier == "A+":
+                    tier = "A"
+                elif tier == "A":
+                    tier = "B"
+                elif tier == "B":
+                    continue
+            # Trava simétrica: downgrade de SHORT contra pernada forte de alta
+            if regime.get("downgrade_shorts") and sig.direction == "short":
                 if tier == "A+":
                     tier = "A"
                 elif tier == "A":
