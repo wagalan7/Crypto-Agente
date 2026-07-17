@@ -1591,6 +1591,24 @@ async def dash_contract_send(body: ContractSendBody, request: Request):
             "sent": ok, "reason": reason if not ok else ""}
 
 
+@app.post("/dashboard/api/contracts/send-to-existing")
+async def dash_contract_send_to_existing(request: Request):
+    """Fase 4b — envio (uma vez) do contrato a TODOS os pacientes EXISTENTES
+    (snapshot da ativação), SEM bloquear a agenda deles. Bloqueio segue só para
+    novos. Idempotente (pula assinados / com contrato em aberto). Passe
+    {"dry_run": true} para só contar quem receberia, sem enviar nada."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    dry_run = False
+    try:
+        body = await request.json()
+        dry_run = bool(body.get("dry_run"))
+    except Exception:
+        pass
+    import contract_service as _cs
+    return await _cs.send_to_existing(tenant, wa, dry_run=dry_run)
+
+
 @app.post("/dashboard/api/contracts/{contract_id}/resend")
 async def dash_contract_resend(contract_id: int, request: Request):
     token = request.headers.get("X-Dashboard-Token", "")

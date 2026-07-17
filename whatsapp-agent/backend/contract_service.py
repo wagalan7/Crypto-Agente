@@ -13,6 +13,7 @@ Nada aqui toca a agenda/execução. É aditivo e fica atrás da flag do consult�
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -549,3 +550,67 @@ def enforce_new_patient(tenant: dict, phone: str, which: str) -> tuple[bool, str
     except Exception:
         logger.exception("enforce_new_patient fail-open (which=%s)", which)
         return (False, "")
+
+
+async def send_to_existing(tenant: dict, wa, dry_run: bool = False,
+                           throttle_s: float = 1.2) -> dict:
+    """Envia (uma vez) o contrato a TODOS os pacientes EXISTENTES — o snapshot de
+    isenção congelado na ativação — SEM bloquear a agenda deles. O bloqueio segue
+    valendo só para NOVOS (via enforce_new_patient); estes existentes recebem o
+    link mas continuam agendando/confirmando normalmente.
+
+    Idempotente: pula quem já assinou ou já tem contrato em aberto (enviado/
+    pendente). Assim, rodar de novo não gera envio duplicado. Rate-limited
+    (throttle_s entre envios) para não sobrecarregar a Evolution. Contrato é
+    auto-assinado pela CONTRATADA (igual ao fluxo de novos), com valor/dia/horário
+    em branco. `dry_run=True` só conta quem receberia, sem enviar nada.
+
+    Só faz sentido depois da ativação (auto_send_new=1 + cutoff carimbado): se a
+    feature não está ativada, não há snapshot e retorna zerado."""
+    result = {"exempt_total": 0, "sent": 0, "skipped_signed": 0,
+              "skipped_open": 0, "failed": 0, "dry_run": bool(dry_run),
+              "details": []}
+    try:
+        st = db.get_contract_settings(tenant["id"])
+        if not (st.get("auto_send_new") and (st.get("activation_cutoff") or "")):
+            result["reason"] = "feature não ativada (sem snapshot)"
+            return result
+        phones = db.get_exempt_phones(tenant["id"])
+        result["exempt_total"] = len(phones)
+        for phone in phones:
+            try:
+                if db.has_signed_contract(tenant["id"], phone, None):
+                    result["skipped_signed"] += 1
+                    continue
+                open_c = None
+                for c in db.get_contracts_for_phone(tenant["id"], phone):
+                    if c.get("status") in ("enviado", "pendente"):
+                        open_c = c
+                        break
+                if open_c is not None:
+                    result["skipped_open"] += 1
+                    continue
+                if dry_run:
+                    result["sent"] += 1  # contaria como "enviaria"
+                    continue
+                contract = create_contract_for_patient(tenant, phone, psy_sign=True)
+                ok, reason = await send_contract(tenant, contract, wa)
+                if ok:
+                    result["sent"] += 1
+                else:
+                    result["failed"] += 1
+                    if len(result["details"]) < 20:
+                        result["details"].append({"phone": phone, "reason": reason})
+                if throttle_s:
+                    await asyncio.sleep(throttle_s)
+            except Exception as e:
+                result["failed"] += 1
+                if len(result["details"]) < 20:
+                    result["details"].append({"phone": phone, "reason": str(e)})
+                logger.exception("send_to_existing item fail (phone=%s)", phone)
+        logger.info("[%s] send_to_existing: %s", tenant.get("slug"), result)
+        return result
+    except Exception:
+        logger.exception("send_to_existing fail-open")
+        result["reason"] = "exceção geral (fail-open)"
+        return result

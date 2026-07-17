@@ -2516,6 +2516,19 @@ def is_patient_exempt(tenant_id: int, phone: str) -> bool:
     return bool(row)
 
 
+def get_exempt_phones(tenant_id: int) -> list[str]:
+    """Telefones do snapshot de isenção (= pacientes que já existiam na ativação).
+    Usado pelo envio em massa aos EXISTENTES na Fase 4b (envia contrato uma vez,
+    sem bloquear a agenda deles)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT phone FROM contract_new_patient_exempt WHERE tenant_id = ? "
+            "ORDER BY phone",
+            (tenant_id,)
+        ).fetchall()
+    return [r["phone"] for r in rows if r["phone"]]
+
+
 def patient_is_new(tenant_id: int, phone: str, activated: bool) -> bool:
     """True se o paciente é 'novo' para efeito da Fase 4b (auto-envio de contrato):
     NÃO está na lista de isenção tirada na ativação.
