@@ -3150,8 +3150,13 @@ def _compute_qty(
     Fluxo:
       1. qty_nominal = (equity × risk_pct/100) / |entry−stop|
       2. notional_nominal = qty_nominal × entry
-      3. Se notional_nominal >= MIN_NOTIONAL_USD → usa nominal (status="ok")
-      4. Senão, qty_inflated = MIN_NOTIONAL_USD / entry
+      3. Cap de MARGEM: se notional/lev > max_margin% × equity → reduz qty
+         (protege quando SL é apertado; risk_dist pequeno → qty explode).
+      4. Teto DURO de RISCO (correção #1): se o risco real da qty exceder
+         MAX_RISK_PCT_HARD → reduz qty até bater no teto (status="risk_capped").
+         Aplica em TODOS os caminhos, não só no de inflar mínimo.
+      5. Se notional_nominal >= MIN_NOTIONAL_USD → usa nominal (status="ok")
+      6. Senão, qty_inflated = MIN_NOTIONAL_USD / entry
          - Calcula risco real = qty_inflated × |entry−stop| / equity × 100
          - Se risco_real <= MAX_RISK_PCT_HARD → usa inflated (status="inflated")
          - Senão → status="skip" (rec descartada)
@@ -3186,13 +3191,34 @@ def _compute_qty(
         notional_nominal = qty_capped * entry
         risk_pct = risk_pct_capped  # reflete risco real reduzido
 
+    # --- Teto DURO de risco por trade (aplica em TODOS os caminhos) ---
+    # Correção #1: antes o MAX_RISK_PCT_HARD só era checado no caminho de
+    # "inflar pro mínimo notional". Um trade com stop LARGO + lev alta passava
+    # pelo cap de margem e ainda assim arriscava > teto (ex.: STG −$51 = 8,4×
+    # o risco mediano). Agora, se o risco real da qty exceder o teto, reduz a
+    # qty até bater EXATAMENTE no teto — nenhuma trade pode arriscar mais que
+    # MAX_RISK_PCT_HARD da banca usada no sizing.
+    hard_cap_reason = None
+    if equity_usd > 0:
+        risk_now_pct = (qty_nominal * risk_dist / equity_usd) * 100.0
+        if risk_now_pct > MAX_RISK_PCT_HARD:
+            qty_hardcap = (equity_usd * (MAX_RISK_PCT_HARD / 100.0)) / risk_dist
+            hard_cap_reason = (
+                f"risk cap: risco {risk_now_pct:.2f}% → {MAX_RISK_PCT_HARD:.2f}% "
+                f"(teto duro por trade)"
+            )
+            qty_nominal = qty_hardcap
+            notional_nominal = qty_hardcap * entry
+            risk_pct = MAX_RISK_PCT_HARD
+
     if notional_nominal >= MIN_NOTIONAL_USD:
+        _reasons = [r for r in (capped_reason, hard_cap_reason) if r]
         return {
             "qty": round(qty_nominal, 6),
-            "status": "capped" if capped_reason else "ok",
+            "status": "risk_capped" if hard_cap_reason else ("capped" if capped_reason else "ok"),
             "notional_usd": round(notional_nominal, 2),
             "risk_pct_real": round(risk_pct, 3),
-            "reason": capped_reason or "nominal sizing",
+            "reason": "; ".join(_reasons) if _reasons else "nominal sizing",
         }
 
     # Inflar pro mínimo
