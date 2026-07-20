@@ -697,6 +697,20 @@ LIQ_DAMP_PART_LO = float(os.getenv("LIQ_DAMP_PART_LO", "0.003"))   # 0.3% do vol
 LIQ_DAMP_PART_HI = float(os.getenv("LIQ_DAMP_PART_HI", "0.02"))    # 2% do vol 24h: damp máx
 LIQ_DAMP_MULT_MIN = float(os.getenv("LIQ_DAMP_MULT_MIN", "0.5"))   # size mínimo por participação
 
+# ── Correção #2: SHORT SLIP GUARD ───────────────────────────────────────────
+# O damp acima é SIMÉTRICO (long e short iguais) e limitado a ×0.6. Mas o
+# histórico real mostra que o stop-slippage é ASSIMÉTRICO: 10 dos 19 stops
+# fecharam PIOR que -1R e TODOS eram SHORT (ZEST -2.22R, WLD -1.30R, STXX
+# -1.29R...) — shorts em alta esticada são squeezados pra cima e o stop "gapa".
+# Este guard aplica uma redução EXTRA de size SÓ em SHORTS, graduada por ATR:
+# quanto mais volátil a moeda, menor a mão — assim, quando o stop escorrega, o
+# -1R já era um valor MENOR em dólar. DEFENSIVO (só reduz), fail-soft (ATR
+# ausente = sem guard), compõe multiplicativo após o damp genérico. OFF=NO-OP.
+SHORT_SLIP_GUARD_ENABLED = os.getenv("SHORT_SLIP_GUARD_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+SHORT_SLIP_ATR_LO = float(os.getenv("SHORT_SLIP_ATR_LO", "1.2"))    # %: começa a encolher shorts
+SHORT_SLIP_ATR_HI = float(os.getenv("SHORT_SLIP_ATR_HI", "3.0"))    # %: redução máx (= atr-gate)
+SHORT_SLIP_MULT_MIN = float(os.getenv("SHORT_SLIP_MULT_MIN", "0.6"))   # size mínimo do guard
+
 # ── Sizing por FAIXA de liquidez da moeda ───────────────────────────────────
 # Diferente do size-damp acima (que mira PARTICIPAÇÃO notional/vol, NO-OP em
 # tamanhos pequenos), este olha o VOLUME 24h absoluto da própria moeda e aplica
@@ -1673,6 +1687,10 @@ def env_info() -> dict:
         "exec_size_damp_enabled": EXEC_SIZE_DAMP_ENABLED,
         "atr_damp_range_pct": [ATR_DAMP_LO, ATR_DAMP_HI],
         "atr_damp_mult_min": ATR_DAMP_MULT_MIN,
+        # #2 short slip guard (anti-squeeze; DEFAULT ON)
+        "short_slip_guard_enabled": SHORT_SLIP_GUARD_ENABLED,
+        "short_slip_atr_range_pct": [SHORT_SLIP_ATR_LO, SHORT_SLIP_ATR_HI],
+        "short_slip_mult_min": SHORT_SLIP_MULT_MIN,
         "liq_tier_sizing_enabled": LIQ_TIER_SIZING_ENABLED,
         "liq_tier_mult_min": LIQ_TIER_MULT_MIN,
         # #3 lane de breakout (DEFAULT OFF)
@@ -3284,6 +3302,29 @@ def _exec_size_damp(rec: dict, notional_usd: float) -> tuple[float, str]:
     return round(mult, 4), f"{tag} ⇒ ×{mult:.2f}"
 
 
+def _short_slip_guard(rec: dict) -> tuple[float, str]:
+    """Correção #2: redução de size EXTRA só em SHORTS, graduada por ATR.
+    Ataca o stop-slippage assimétrico (shorts squeezados pra cima gapam o stop
+    além de -1R). Mão menor em short volátil ⇒ o -1R vira menos dólar quando
+    escorrega. Retorna (mult ≤ 1.0, reason). Fail-soft: ATR ausente = sem guard.
+    Flag OFF ou trade não-short = (1.0, 'off'). Compõe após o damp genérico."""
+    if not SHORT_SLIP_GUARD_ENABLED:
+        return 1.0, "off"
+    direction = (rec.get("direction") or "").strip().lower()
+    if direction != "short":
+        return 1.0, "long (sem guard)"
+    atr = _get_rec_feature(rec, "atr_pct")
+    try:
+        a = float(atr) if atr is not None else None
+    except Exception:
+        a = None
+    if a is None or SHORT_SLIP_ATR_HI <= SHORT_SLIP_ATR_LO or a <= SHORT_SLIP_ATR_LO:
+        return 1.0, "atr baixo/ausente (sem guard)"
+    frac = min(1.0, (a - SHORT_SLIP_ATR_LO) / (SHORT_SLIP_ATR_HI - SHORT_SLIP_ATR_LO))
+    mult = 1.0 - frac * (1.0 - SHORT_SLIP_MULT_MIN)
+    return round(mult, 4), f"short atr={a:.2f}% ⇒ ×{mult:.2f}"
+
+
 def _liq_tier_mult(rec: dict) -> tuple[float, str]:
     """Multiplicador de tamanho por FAIXA de volume 24h da moeda (≤1.0).
     Mão menor em moedas magras (liberadas pelo piso de rotação 350). Retorna
@@ -4075,6 +4116,26 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f}"
                         )
                         _record_skip(rec, "size-damp", f"notional pós-damp < mín ({_dmp_reason})")
+                        continue
+
+            # ── #2 Short slip guard — mão menor em SHORT volátil (anti-squeeze).
+            # Só LIVE. DEFENSIVO (só reduz). Compõe após o damp genérico. Se o
+            # short volátil ficar abaixo do mínimo, pula (vol alta demais p/ shortar).
+            if not SHADOW_ENABLED and SHORT_SLIP_GUARD_ENABLED:
+                _ssg, _ssg_reason = _short_slip_guard(rec)
+                if _ssg < 1.0:
+                    _qty_pre_ssg = qty
+                    qty = round(qty * _ssg, 6)
+                    notional_effective = qty * entry
+                    log.info(
+                        f"[short-slip] {rec.get('symbol')} qty {_qty_pre_ssg}→{qty} ({_ssg_reason})"
+                    )
+                    if notional_effective < MIN_NOTIONAL_USD:
+                        log.warning(
+                            f"[short-slip] {rec.get('symbol')} SKIP: notional pós-guard "
+                            f"${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f}"
+                        )
+                        _record_skip(rec, "short-slip", f"notional pós-guard < mín ({_ssg_reason})")
                         continue
 
             # ── Sizing por faixa de liquidez — mão menor em moeda magra.
