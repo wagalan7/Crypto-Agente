@@ -96,6 +96,7 @@ _reminders_task: Optional[asyncio.Task] = None
 _rotation_task: Optional[asyncio.Task] = None
 _health_watchdog_task: Optional[asyncio.Task] = None
 _digest_task: Optional[asyncio.Task] = None
+_rs_report_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
 # Quantos símbolos varrer por ciclo (top-N por volume). Universo maior = mais
@@ -183,6 +184,16 @@ DIGEST_ENABLED = os.getenv("DIGEST_ENABLED", "true").strip().lower() in ("1", "t
 DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", "11"))   # 11 UTC = 08h BRT
 DIGEST_CHECK_INTERVAL = int(os.getenv("DIGEST_CHECK_INTERVAL_SEC", "1800"))
 DIGEST_WINDOW_DAYS = int(os.getenv("DIGEST_WINDOW_DAYS", "30"))
+
+# ── Relatório periódico Real × Shadow no Telegram ───────────────────────────
+# Envia a cada RS_REPORT_INTERVAL_DAYS dias, às RS_REPORT_HOUR_UTC (13 UTC = 10h
+# BRT). Cadência ancorada em date.toordinal() % intervalo → sobrevive a
+# redeploys sem estado persistido. Reaproveita get_assertiveness + send_telegram.
+RS_REPORT_ENABLED = os.getenv("RS_REPORT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+RS_REPORT_HOUR_UTC = int(os.getenv("RS_REPORT_HOUR_UTC", "13"))       # 13 UTC = 10h BRT
+RS_REPORT_INTERVAL_DAYS = max(1, int(os.getenv("RS_REPORT_INTERVAL_DAYS", "5")))
+RS_REPORT_WINDOW_DAYS = int(os.getenv("RS_REPORT_WINDOW_DAYS", "7"))  # janela do relatório
+RS_REPORT_CHECK_INTERVAL = int(os.getenv("RS_REPORT_CHECK_INTERVAL_SEC", "1800"))
 
 # ── Recalibração automática da autoaprendizagem ─────────────────────────────
 # A cada N dias o app reaprende com TODO o histórico (score→P(TP1) + buckets).
@@ -861,9 +872,107 @@ async def _daily_digest_loop():
             break
 
 
+def _fmt_real_vs_shadow(a_win: Dict[str, Any], a30: Dict[str, Any]) -> str:
+    """Monta o relatório periódico Real × Shadow a partir de dois get_assertiveness()
+    (janela curta + 30d de contexto). Tolerante a seções ausentes — nunca lança."""
+    rm = a_win.get("real_money") or {}
+    sh = a_win.get("shadow") or {}
+    gates = a_win.get("gates") or {}
+    win = a_win.get("window_days", RS_REPORT_WINDOW_DAYS)
+
+    lines = [f"📊 *Relatório Real × Shadow* — últimos {win}d (dinheiro real, source=auto)"]
+
+    # Funil: quantos sinais o shadow gerou vs. quantos o real executou
+    sh_n = sh.get("count") or 0
+    rm_n = rm.get("count") or 0
+    lines.append(f"🔻 Funil: shadow *{sh_n}* sinais → real *{rm_n}* trades resolvidos")
+
+    # Shadow (ideal)
+    if sh_n:
+        lines.append(
+            f"🟢 Shadow: WR *{sh.get('win_rate_pct')}%* · avgR *{sh.get('avg_r'):+.2f}* · "
+            f"exp {sh.get('expectancy_r'):+.2f}R · TP2 {sh.get('tp2_hit_rate_pct')}%"
+        )
+    else:
+        lines.append("🟢 Shadow: sem sinais na janela")
+
+    # Real (dinheiro)
+    if rm_n:
+        pnl = rm.get("sum_pnl_usd") or 0.0
+        lines.append(
+            f"🔴 Real: WR *{rm.get('win_rate_pct')}%* ({rm.get('wins')}W/{rm.get('losses')}L) · "
+            f"avgR *{rm.get('avg_r'):+.2f}* · exp {rm.get('expectancy_r'):+.2f}R · PnL *${pnl:+.2f}*"
+        )
+    else:
+        lines.append("🔴 Real: *nenhum trade executado na janela* (gates filtraram tudo)")
+
+    # Top gates (por que o funil apertou)
+    items = (gates.get("items") or [])[:4]
+    if items:
+        gsum = " · ".join(f"{it.get('gate')} {it.get('count')}" for it in items)
+        lines.append(f"🚧 Gates ({gates.get('total_skips', 0)} skips): {gsum}")
+
+    # Contexto 30d
+    rm30 = a30.get("real_money") or {}
+    sh30 = a30.get("shadow") or {}
+    if rm30.get("count"):
+        lines.append(
+            f"📅 30d: real {rm30.get('count')}tr WR {rm30.get('win_rate_pct')}% "
+            f"avgR {rm30.get('avg_r'):+.2f} PnL ${rm30.get('sum_pnl_usd', 0.0):+.2f} | "
+            f"shadow {sh30.get('count')}tr WR {sh30.get('win_rate_pct')}%"
+        )
+
+    # Leitura rápida quando amostra real é minúscula
+    if rm_n <= 3:
+        lines.append("ℹ️ Amostra real minúscula — leitura por *trade-a-trade*, não %/dia. "
+                     "Divergência da janela = funil (gates), não sizing.")
+    return "\n".join(lines)
+
+
+async def _rs_report_loop():
+    """Relatório Real × Shadow no Telegram a cada RS_REPORT_INTERVAL_DAYS dias, às
+    RS_REPORT_HOUR_UTC. Cadência ancorada em toordinal()%intervalo → estável a
+    redeploys. No-op se desativado ou Telegram off."""
+    if not RS_REPORT_ENABLED:
+        logging.info("[rs-report] desativado (RS_REPORT_ENABLED=false).")
+        return
+    await asyncio.sleep(180)  # espera o boot assentar
+    last_sent_date = None
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            due_day = (now.date().toordinal() % RS_REPORT_INTERVAL_DAYS) == 0
+            if now.hour == RS_REPORT_HOUR_UTC and due_day and now.date() != last_sent_date:
+                from services.assertiveness_service import get_assertiveness
+                a_win = await get_assertiveness(days=RS_REPORT_WINDOW_DAYS)
+                a30 = await get_assertiveness(days=30)
+                if a_win.get("enabled"):
+                    text = _fmt_real_vs_shadow(a_win, a30)
+                    try:
+                        from services import notification_service
+                        ok = await notification_service.send_telegram(
+                            text, event_type="rs_report", parse_mode="Markdown"
+                        )
+                        logging.info(f"[rs-report] enviado (telegram ok={ok}).")
+                    except Exception as e:
+                        logging.warning(f"[rs-report] envio falhou: {e}")
+                    last_sent_date = now.date()
+                else:
+                    logging.info("[rs-report] assertiveness desabilitado, pulando.")
+                    last_sent_date = now.date()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.warning(f"[rs-report] ciclo falhou: {e}", exc_info=True)
+        try:
+            await asyncio.sleep(RS_REPORT_CHECK_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task
+    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task, _rs_report_task
     # Banner de segurança go-live — shadow vs live, produção vs demo, canary.
     try:
         from services import shadow_trade_service
@@ -948,8 +1057,16 @@ async def lifespan(app: FastAPI):
         logging.info(f"Digest diário iniciado (enabled={DIGEST_ENABLED}, hora_utc={DIGEST_HOUR_UTC}).")
     except Exception as e:
         logging.warning(f"Falha ao iniciar digest diário: {e}")
+    # Relatório periódico Real × Shadow no Telegram (a cada N dias)
+    try:
+        _rs_report_task = asyncio.create_task(_rs_report_loop())
+        logging.info(f"Relatório Real×Shadow iniciado (enabled={RS_REPORT_ENABLED}, "
+                     f"hora_utc={RS_REPORT_HOUR_UTC}, cada {RS_REPORT_INTERVAL_DAYS}d, "
+                     f"janela {RS_REPORT_WINDOW_DAYS}d).")
+    except Exception as e:
+        logging.warning(f"Falha ao iniciar relatório Real×Shadow: {e}")
     yield
-    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task):
+    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task, _rs_report_task):
         if t:
             t.cancel()
             try:
