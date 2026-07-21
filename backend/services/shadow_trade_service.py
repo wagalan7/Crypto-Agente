@@ -1693,6 +1693,11 @@ def env_info() -> dict:
         "short_slip_mult_min": SHORT_SLIP_MULT_MIN,
         "liq_tier_sizing_enabled": LIQ_TIER_SIZING_ENABLED,
         "liq_tier_mult_min": LIQ_TIER_MULT_MIN,
+        # edge-decay (contraparte viva do symbol-learning; DEFAULT OFF)
+        "edge_decay_enabled": os.getenv("EDGE_DECAY_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"),
+        "edge_decay_window_days": int(os.getenv("EDGE_DECAY_WINDOW_DAYS", "60")),
+        "edge_decay_recent_days": int(os.getenv("EDGE_DECAY_RECENT_DAYS", "14")),
+        "edge_decay_mult_min": float(os.getenv("EDGE_DECAY_MULT_MIN", "0.5")),
         # #3 lane de breakout (DEFAULT OFF)
         "breakout_lane_enabled": BREAKOUT_LANE_ENABLED,
         "breakout_lane_max_atr": BREAKOUT_LANE_MAX_ATR,
@@ -3466,6 +3471,17 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
         except Exception as e:
             log.warning(f"[regime-size] fetch regime falhou (fail-open mão cheia): {e}")
 
+    # Edge-decay: recalcula (TTL-guarded) o mapa de símbolos/direções cujo edge
+    # vivo azedou vs o próprio baseline. Query pesada roda no máx 1×/TTL; leitura
+    # depois é pura de cache. Só LIVE + gated. Fail-soft (mão cheia em erro).
+    if not SHADOW_ENABLED:
+        try:
+            from services import edge_decay_service
+            if edge_decay_service.is_enabled():
+                await edge_decay_service.maybe_refresh()
+        except Exception as e:
+            log.warning(f"[edge-decay] refresh de lote falhou (fail-soft): {e}")
+
     # ── Filler FORA da allowlist: snapshot dos slots ocupados (auto abertos)
     # separando DENTRO/FORA + prioriza recs DENTRO antes de FORA no ciclo
     # (sorted estável). Tudo NO-OP quando FILLER_FORA_ENABLED=OFF.
@@ -4177,6 +4193,33 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         )
                         _record_skip(rec, "regime-size", f"notional pós-regime < mín ({_rg_reason})")
                         continue
+
+            # ── Edge-decay — mão menor em símbolo/direção cujo edge VIVO azedou vs
+            # o próprio baseline (contraparte viva do symbol-learning de backtest).
+            # Só LIVE. DEFENSIVO (só reduz). Leitura pura de cache (refresh no topo
+            # do lote). Se jogar abaixo do mínimo, pula (edge morto + size pequeno).
+            if not SHADOW_ENABLED:
+                try:
+                    from services import edge_decay_service
+                    if edge_decay_service.is_enabled():
+                        _ed, _ed_reason = edge_decay_service.get_mult(
+                            rec.get("symbol"), rec.get("direction"))
+                        if _ed < 1.0:
+                            _qty_pre_ed = qty
+                            qty = round(qty * _ed, 6)
+                            notional_effective = qty * entry
+                            log.info(
+                                f"[edge-decay] {rec.get('symbol')} qty {_qty_pre_ed}→{qty} ({_ed_reason})"
+                            )
+                            if notional_effective < MIN_NOTIONAL_USD:
+                                log.warning(
+                                    f"[edge-decay] {rec.get('symbol')} SKIP: notional pós-decay "
+                                    f"${notional_effective:.0f} < mín ${MIN_NOTIONAL_USD:.0f}"
+                                )
+                                _record_skip(rec, "edge-decay", f"notional pós-decay < mín ({_ed_reason})")
+                                continue
+                except Exception as _e:
+                    log.warning(f"[edge-decay] {rec.get('symbol')} aplicação falhou (fail-soft): {_e}")
 
             # Filler FORA: size reduzido (×FILLER_FORA_SIZE_MULT) só pra posições
             # marcadas como filler de slot ocioso. Aplica ANTES do canary global.

@@ -922,6 +922,23 @@ def _fmt_real_vs_shadow(a_win: Dict[str, Any], a30: Dict[str, Any]) -> str:
             f"shadow {sh30.get('count')}tr WR {sh30.get('win_rate_pct')}%"
         )
 
+    # Gate counterfactual (30d) — qual gate está protegendo vs custando lucro.
+    # Usa a janela de 30d (amostra maior) pra o veredito ser estável.
+    gcf = a30.get("gate_counterfactual") or {}
+    def _short(v, n=140):
+        v = (v or "").strip()
+        return (v[: n - 1] + "…") if len(v) > n else v
+    gcf_lines = []
+    qe_v = _short((gcf.get("quality_edge") or {}).get("verdict"))
+    rgs_v = _short((gcf.get("regime_sizing") or {}).get("verdict"))
+    if qe_v:
+        gcf_lines.append(f"  • quality-edge: {qe_v}")
+    if rgs_v:
+        gcf_lines.append(f"  • regime-size: {rgs_v}")
+    if gcf_lines:
+        lines.append("🔎 Gates (contrafactual 30d):")
+        lines.extend(gcf_lines)
+
     # Leitura rápida quando amostra real é minúscula
     if rm_n <= 3:
         lines.append("ℹ️ Amostra real minúscula — leitura por *trade-a-trade*, não %/dia. "
