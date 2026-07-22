@@ -6,7 +6,9 @@
 <title>Painel — Consultório Inteligente</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
-  .tab-btn.active { background:#7c3aed; color:white; }
+  .tab-btn { background:#fff; color:#475569; font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,.04); transition:all .15s; }
+  .tab-btn:hover:not(.active) { background:#f8fafc; color:#334155; }
+  .tab-btn.active { background:#7c3aed; color:#fff; border-color:#7c3aed; box-shadow:0 2px 8px rgba(124,58,237,.25); }
   .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
   .b-active   { background:#dcfce7; color:#166534; }
   .b-suspended{ background:#fee2e2; color:#991b1b; }
@@ -29,14 +31,14 @@
     </form>
   </div>
   <nav class="max-w-7xl mx-auto px-4 pb-3 flex gap-2 flex-wrap text-sm">
-    <button class="tab-btn active px-4 py-2 rounded-lg border border-slate-200" data-tab="overview">Visão Geral</button>
-    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="subs">Assinaturas</button>
-    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="abandoned">Carrinho Abandonado</button>
-    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="tenants">Usuários</button>
-    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="health">Saúde WhatsApp</button>
-    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="content">Conteúdo do Site</button>
-    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="audit">Auditoria</button>
-    <button class="tab-btn px-4 py-2 rounded-lg border border-slate-200" data-tab="security">Segurança</button>
+    <button class="tab-btn active px-4 py-2 rounded-xl border border-slate-200" data-tab="overview">Visão Geral</button>
+    <button class="tab-btn px-4 py-2 rounded-xl border border-slate-200" data-tab="subs">Assinaturas</button>
+    <button class="tab-btn px-4 py-2 rounded-xl border border-slate-200" data-tab="abandoned">Carrinho Abandonado</button>
+    <button class="tab-btn px-4 py-2 rounded-xl border border-slate-200" data-tab="tenants">Usuários</button>
+    <button class="tab-btn px-4 py-2 rounded-xl border border-slate-200" data-tab="health">Saúde WhatsApp</button>
+    <button class="tab-btn px-4 py-2 rounded-xl border border-slate-200" data-tab="content">Conteúdo do Site</button>
+    <button class="tab-btn px-4 py-2 rounded-xl border border-slate-200" data-tab="audit">Auditoria</button>
+    <button class="tab-btn px-4 py-2 rounded-xl border border-slate-200" data-tab="security">Segurança</button>
   </nav>
 </header>
 
@@ -57,41 +59,41 @@
     </div>
 
     <div id="kpis" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
         <div class="text-xs text-gray-500">MRR</div>
         <div class="text-2xl font-bold text-violet-700" id="kpi-mrr">—</div>
       </div>
-      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
         <div class="text-xs text-gray-500">Assinantes ativos</div>
         <div class="text-2xl font-bold text-emerald-600" id="kpi-active">—</div>
       </div>
-      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
         <div class="text-xs text-gray-500">Pendentes pagto</div>
         <div class="text-2xl font-bold text-amber-600" id="kpi-pending">—</div>
       </div>
-      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
         <div class="text-xs text-gray-500">Suspensos</div>
         <div class="text-2xl font-bold text-rose-600" id="kpi-suspended">—</div>
       </div>
-      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
         <div class="text-xs text-gray-500">Signups 24h</div>
         <div class="text-2xl font-bold" id="kpi-s24">—</div>
       </div>
-      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
         <div class="text-xs text-gray-500">Signups 7d</div>
         <div class="text-2xl font-bold" id="kpi-s7">—</div>
       </div>
-      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
         <div class="text-xs text-gray-500">Visitas (desde ontem)</div>
         <div class="text-2xl font-bold" id="kpi-vyest">—</div>
       </div>
-      <div class="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
+      <div class="bg-white rounded-2xl p-4 shadow-sm border border-slate-100">
         <div class="text-xs text-gray-500">Conversão 30d</div>
         <div class="text-2xl font-bold" id="kpi-conv">—</div>
       </div>
     </div>
 
-    <div class="bg-white rounded-xl p-5 shadow-sm border border-slate-200">
+    <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-100">
       <h3 class="font-semibold text-gray-900 mb-3">Distribuição por plano</h3>
       <div id="byplan" class="grid grid-cols-3 gap-3 text-sm"></div>
     </div>
@@ -111,7 +113,7 @@
       <span id="subs-count" class="text-xs text-slate-500"></span>
       <button id="subs-export" class="text-xs px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-100 ml-auto">⬇ Exportar CSV</button>
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-x-auto">
       <table class="w-full min-w-[640px] text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
           <tr>
@@ -130,7 +132,7 @@
 
   <!-- CARRINHO ABANDONADO -->
   <section id="tab-abandoned" class="tab-pane hidden">
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-x-auto">
       <table class="w-full min-w-[640px] text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
           <tr>
@@ -166,7 +168,7 @@
       <span id="tenants-count" class="text-xs text-slate-500"></span>
       <button id="tenants-export" class="text-xs px-3 py-2 rounded-lg border border-slate-300 hover:bg-slate-100 ml-auto">⬇ Exportar CSV</button>
     </div>
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-x-auto">
       <table class="w-full min-w-[640px] text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
           <tr>
@@ -194,7 +196,7 @@
       <button id="btn-health-check" class="text-sm px-3 py-1.5 rounded-lg bg-violet-600 text-white hover:bg-violet-700">Verificar agora</button>
     </div>
     <div id="health-summary" class="grid grid-cols-3 gap-3 mb-4 text-sm"></div>
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-x-auto">
       <table class="w-full min-w-[640px] text-sm">
         <thead class="bg-slate-100 text-left text-xs uppercase text-slate-600">
           <tr>
@@ -213,7 +215,7 @@
 
   <!-- CONTEÚDO -->
   <section id="tab-content" class="tab-pane hidden">
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="font-semibold text-gray-900">Depoimentos da landing page</h3>
         <div class="flex gap-2">
@@ -228,7 +230,7 @@
   </section>
 
   <section id="tab-security" class="tab-pane hidden">
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5 max-w-2xl">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5 max-w-2xl">
       <h3 class="font-semibold text-gray-900 mb-1">Autenticação em duas etapas (2FA)</h3>
       <p class="text-sm text-gray-500 mb-4">Adiciona uma camada extra ao seu login usando um app autenticador (Google Authenticator, Authy, 1Password, etc).</p>
       <div id="totp-status" class="text-sm mb-4"></div>
@@ -263,7 +265,7 @@
   </section>
 
   <section id="tab-audit" class="tab-pane hidden">
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="font-semibold text-gray-900">Trilha de auditoria</h3>
         <div class="flex items-center gap-2">
