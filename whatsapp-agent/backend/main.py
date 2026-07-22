@@ -976,6 +976,8 @@ class TenantUpdate(BaseModel):
     client_noun: Optional[str] = None
     service_noun: Optional[str] = None
     business_type: Optional[str] = None
+    # Fase 3: liga/desliga a narrativa com IA na Home (0/1). OFF por padrão.
+    ai_narrative_enabled: Optional[int] = None
 
 
 @app.patch("/admin/tenants/{slug}")
@@ -1362,11 +1364,18 @@ async def dash_reschedule(appt_id: int, body: RescheduleBody, request: Request):
 
 
 @app.delete("/dashboard/api/appointments/{appt_id}/cancel")
-def dash_cancel(appt_id: int, request: Request):
+def dash_cancel(appt_id: int, request: Request, reason: str = ""):
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
     # Remover do Google Calendar antes de deletar do banco
     appt = db.get_appointment_by_id(tenant["id"], appt_id)
+    # Fase 4: registra o cancelamento (append-only) ANTES do hard-delete, para
+    # métrica administrativa. Fail-open — nunca bloqueia o cancelamento.
+    if appt:
+        try:
+            db.log_cancellation(tenant["id"], appt, reason=reason)
+        except Exception:
+            logger.warning("[cancel] log_cancellation falhou (ignorado)")
     if appt and appt.get("google_event_id"):
         if tenant.get("google_refresh_token"):
             try:
@@ -2360,6 +2369,26 @@ def dash_insights(request: Request):
         logger.exception("dash_insights fail-open")
         return {"greeting": "", "insights": [], "attention_count": 0,
                 "all_clear": True, "generated_at": ""}
+
+
+@app.get("/dashboard/api/insights/narrative")
+async def dash_insights_narrative(request: Request):
+    """Fase 3 — parágrafo-resumo com IA sobre os indicadores agregados.
+    OFF por padrão (flag por tenant). A IA só vê os NÚMEROS já calculados,
+    nunca conteúdo clínico. Fail-open: retorna narrativa vazia em qualquer erro.
+    O LLM é bloqueante, então roda numa thread para não travar o event loop."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    try:
+        if not tenant.get("ai_narrative_enabled"):
+            return {"narrative": ""}
+        import asyncio
+        import insights_service as _ins
+        narrative = await asyncio.to_thread(_ins.build_home_narrative, tenant)
+        return {"narrative": narrative or ""}
+    except Exception:
+        logger.exception("dash_insights_narrative fail-open")
+        return {"narrative": ""}
 
 
 @app.get("/dashboard/api/billing/export")

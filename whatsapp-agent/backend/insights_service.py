@@ -44,6 +44,12 @@ def _month_bounds(ref: datetime) -> tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 
+def _day_bounds(ref: datetime) -> tuple[str, str]:
+    start = datetime(ref.year, ref.month, ref.day)
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
 def _prev_month_bounds(ref: datetime) -> tuple[str, str]:
     first = datetime(ref.year, ref.month, 1)
     prev_end = first
@@ -251,7 +257,85 @@ def _insight_no_shows(tenant: dict, now: datetime) -> dict | None:
             "value": pct, "missed": missed, "total": total}
 
 
-_BUILDERS_NOW = (_insight_occupancy, _insight_no_return, _insight_revenue, _insight_no_shows)
+# ── Fase 2 — cards adicionais ────────────────────────────────────────────────
+
+def _insight_today(tenant: dict, now: datetime) -> dict | None:
+    """Resumo do dia: quantas sessões hoje e quantas já confirmadas."""
+    d_start, d_end = _day_bounds(now)
+    appts = _active(db.get_appointments_in_range(tenant["id"], d_start, d_end))
+    n = len(appts)
+    if n <= 0:
+        return None
+    conf = sum(1 for a in appts
+               if a.get("confirmed") or (a.get("attendance") == "attended"))
+    plural = "sessões" if n > 1 else "sessão"
+    if conf >= n:
+        extra = " Todas confirmadas ✓"
+    elif conf > 0:
+        extra = f" {conf} já confirmada{'s' if conf > 1 else ''}."
+    else:
+        extra = " Nenhuma confirmada ainda."
+    return {"id": "today", "icon": "📅", "severity": "info",
+            "text": f"Hoje você tem {n} {plural}.{extra}",
+            "count": n, "confirmed": conf}
+
+
+def _insight_reminder_effectiveness(tenant: dict, now: datetime) -> dict | None:
+    """Efetividade dos lembretes no mês: % que confirma após o envio.
+    Só aparece com amostra mínima (dado acumula a partir da ativação da Fase 4)."""
+    m_start, m_end = _month_bounds(now)
+    data = db.get_reminder_effectiveness(tenant["id"], m_start, m_end)
+    sent = data.get("sent") or 0
+    confirmed = data.get("confirmed") or 0
+    if sent < 5:
+        return None  # amostra pequena → não vira ruído
+    pct = round(100 * confirmed / sent)
+    if pct >= 70:
+        sev = "info"
+        txt = (f"Seus lembretes estão funcionando: {pct}% confirmam após o envio "
+               f"({confirmed} de {sent}).")
+    else:
+        sev = "attention"
+        txt = (f"Só {pct}% confirmam após o lembrete ({confirmed} de {sent}) — "
+               f"vale revisar horário ou texto do disparo.")
+    return {"id": "reminder_effectiveness", "icon": "📲", "severity": sev,
+            "text": txt, "value": pct, "sent": sent, "confirmed": confirmed}
+
+
+def _insight_reschedules(tenant: dict, now: datetime) -> dict | None:
+    """Remarcações do mês (sinal operacional; só informativo)."""
+    m_start, m_end = _month_bounds(now)
+    n = db.get_reschedules_in_range(tenant["id"], m_start, m_end)
+    if n <= 0:
+        return None
+    plural = "remarcações" if n > 1 else "remarcação"
+    return {"id": "reschedules", "icon": "🔀", "severity": "info",
+            "text": f"{n} {plural} este mês.", "count": n}
+
+
+def _insight_cancellations(tenant: dict, now: datetime) -> dict | None:
+    """Cancelamentos do mês, destacando os feitos em cima da hora (<24h)."""
+    m_start, m_end = _month_bounds(now)
+    data = db.get_cancellations_in_range(tenant["id"], m_start, m_end)
+    total = data.get("total") or 0
+    late = data.get("late") or 0
+    if total <= 0:
+        return None
+    plural = "cancelamentos" if total > 1 else "cancelamento"
+    if late > 0:
+        sev = "attention"
+        txt = (f"{total} {plural} este mês — {late} em cima da hora "
+               f"(menos de 24h de antecedência).")
+    else:
+        sev = "info"
+        txt = f"{total} {plural} este mês, todos com antecedência."
+    return {"id": "cancellations", "icon": "🚫", "severity": sev,
+            "text": txt, "total": total, "late": late}
+
+
+_BUILDERS_NOW = (_insight_today, _insight_occupancy, _insight_no_return,
+                 _insight_reminder_effectiveness, _insight_reschedules,
+                 _insight_cancellations, _insight_revenue, _insight_no_shows)
 _BUILDERS_SIMPLE = (_insight_confirmations, _insight_contracts)
 
 
@@ -286,3 +370,57 @@ def build_home_insights(tenant: dict) -> dict:
         "attention_count": attention,
         "all_clear": len(insights) == 0,
     }
+
+
+# ── Fase 3 — camada narrativa com IA (opcional, atrás de flag) ────────────────
+#
+# REGRA INEGOCIÁVEL: a IA só recebe os NÚMEROS/frases agregados que este módulo já
+# montou (status, datas, valores). Ela NUNCA vê conversa, nome de paciente por
+# contexto clínico, nem o campo `notes`. Os próprios cards já são livres de
+# conteúdo clínico. A IA só reescreve/prioriza esses fatos em um parágrafo curto.
+
+_NARRATIVE_SYSTEM = (
+    "Você é o assistente de GESTÃO de um consultório de psicologia. Recebe apenas "
+    "indicadores ADMINISTRATIVOS já calculados (agenda, confirmações, faturamento "
+    "previsto, contratos, cancelamentos). Escreva um resumo curto e acolhedor em "
+    "português do Brasil (2 a 4 frases), em tom profissional e leve, para a própria "
+    "psicóloga ler ao abrir o painel.\n"
+    "REGRAS: (1) Use SOMENTE os fatos fornecidos — nunca invente números, nomes ou "
+    "situações. (2) Priorize o que pede atenção. (3) Não repita todos os itens em "
+    "lista; conecte os mais importantes de forma natural. (4) Jamais mencione "
+    "conteúdo clínico, diagnóstico ou detalhe de sessão — você não tem acesso a isso. "
+    "(5) Não use markdown nem títulos; apenas o parágrafo."
+)
+
+
+def build_home_narrative(tenant: dict, payload: dict | None = None) -> str:
+    """Gera um parágrafo-resumo com IA a partir dos indicadores agregados.
+    Fail-open: retorna "" se a flag estiver desligada, sem chave de API, sem
+    indicadores ou em qualquer erro — a Home segue mostrando os cards normais."""
+    try:
+        if not tenant.get("ai_narrative_enabled"):
+            return ""
+        data = payload or build_home_insights(tenant)
+        cards = data.get("insights") or []
+        if not cards:
+            return ""  # nada a narrar; o card "tudo em dia" já cobre
+        greeting = data.get("greeting") or ""
+        linhas = []
+        for c in cards:
+            marca = "[ATENÇÃO] " if c.get("severity") == "attention" else ""
+            linhas.append(f"- {marca}{c.get('text', '')}")
+        contexto = (
+            f"Saudação sugerida: {greeting}\n"
+            f"Indicadores administrativos de hoje:\n" + "\n".join(linhas)
+        )
+        import agent  # import tardio: evita custo/ciclo no boot
+        txt = agent._call_llm(
+            _NARRATIVE_SYSTEM,
+            [{"role": "user", "content": contexto}],
+            max_tokens=320,
+            force_json=False,
+        )
+        return (txt or "").strip()
+    except Exception:
+        logger.exception("narrativa da Home falhou (fail-open)")
+        return ""

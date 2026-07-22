@@ -125,6 +125,8 @@
         <button onclick="loadHomeInsights()" title="Atualizar resumo"
           class="text-xs text-gray-400 hover:text-brand whitespace-nowrap">↻</button>
       </div>
+      <!-- Fase 3: narrativa com IA (só aparece se a flag do tenant estiver ligada) -->
+      <div id="hi-narrative" class="hidden mx-4 mb-2 rounded-xl bg-brand/5 border border-brand/10 px-3 py-2 text-sm text-gray-700 leading-relaxed"></div>
       <div id="hi-body" class="px-4 pb-3 space-y-2"></div>
     </div>
 
@@ -1597,6 +1599,22 @@ function _hiEscape(s) {
     {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
+// Fase 3: busca o parágrafo-resumo com IA (só aparece se a flag do tenant
+// estiver ligada; o backend devolve narrativa vazia caso contrário). Fail-safe.
+function loadHomeNarrative() {
+  const nb = document.getElementById("hi-narrative");
+  if (!nb) return;
+  api("/dashboard/api/insights/narrative").then(data => {
+    const txt = (data && data.narrative || "").trim();
+    if (txt) {
+      nb.innerHTML = '<span class="mr-1">✨</span>' + _hiEscape(txt);
+      nb.classList.remove("hidden");
+    } else {
+      nb.classList.add("hidden");
+    }
+  }).catch(() => { nb.classList.add("hidden"); });
+}
+
 function loadHomeInsights() {
   const box = document.getElementById("home-insights");
   const body = document.getElementById("hi-body");
@@ -1605,6 +1623,7 @@ function loadHomeInsights() {
     if (data && data.greeting) {
       document.getElementById("hi-greeting").textContent = data.greeting;
     }
+    loadHomeNarrative();
     const items = (data && data.insights) || [];
     if (!items.length) {
       body.innerHTML = '<div class="flex items-center gap-2 text-sm text-gray-500 py-1">'

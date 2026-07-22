@@ -8,6 +8,14 @@ import config as _cfg
 import crypto
 DB_PATH = os.path.join(_cfg.DATA_DIR, "consultorio.db")
 
+
+def _now_local_iso() -> str:
+    """Timestamp local (America/Sao_Paulo, naive) no mesmo formato de scheduled_at.
+    Usado no rastreamento administrativo (Fases 2-4)."""
+    from zoneinfo import ZoneInfo
+    return (datetime.now(ZoneInfo("America/Sao_Paulo"))
+            .replace(tzinfo=None).isoformat(timespec="seconds"))
+
 # Campos de tenant cifrados em repouso (credenciais + chave PIX). Ver crypto.py.
 _ENCRYPTED_TENANT_FIELDS = (
     "evolution_key",         # token Z-API / Evolution
@@ -213,6 +221,22 @@ def init_db():
                 UNIQUE(tenant_id, phone, month)
             );
         """)
+        # Log de cancelamentos (append-only). O endpoint do painel APAGA a linha
+        # da consulta (hard-delete); registramos aqui ANTES de apagar para ter
+        # métrica administrativa (cancelamentos, antecedência) sem mudar o
+        # comportamento existente. Só dados de status/horário — nada clínico.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cancellation_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id    INTEGER NOT NULL,
+                phone        TEXT DEFAULT '',
+                patient_name TEXT DEFAULT '',
+                scheduled_at TEXT DEFAULT '',
+                reason       TEXT DEFAULT '',
+                lead_hours   REAL DEFAULT NULL,
+                cancelled_at TEXT DEFAULT (datetime('now'))
+            );
+        """)
         # Migrações incrementais — seguro rodar múltiplas vezes
         migrations = [
             "ALTER TABLE tenants ADD COLUMN dashboard_token TEXT DEFAULT ''",
@@ -306,6 +330,17 @@ def init_db():
             # snapshot tirado" (a decisão novo/existente usa a tabela de isenção).
             "ALTER TABLE contract_settings ADD COLUMN auto_send_new INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE contract_settings ADD COLUMN activation_cutoff TEXT NOT NULL DEFAULT ''",
+            # ── Assistente Inteligente (Fases 2-4): rastreamento administrativo ──
+            # Tudo aditivo e fail-open — só colunas de horário/contagem, nada clínico.
+            # Carimbo de QUANDO o lembrete/confirmação saiu → mede efetividade.
+            "ALTER TABLE appointments ADD COLUMN confirmation_sent_at TEXT DEFAULT NULL",
+            "ALTER TABLE appointments ADD COLUMN followup_sent_at TEXT DEFAULT NULL",
+            # Contagem de remarcações da consulta (in-place move) + último carimbo.
+            "ALTER TABLE appointments ADD COLUMN reschedule_count INTEGER DEFAULT 0",
+            "ALTER TABLE appointments ADD COLUMN last_rescheduled_at TEXT DEFAULT NULL",
+            # Narrativa com IA na Home (OFF por padrão). Quando ligada, a IA só vê
+            # os NÚMEROS agregados dos insights — jamais conteúdo de conversa/notes.
+            "ALTER TABLE tenants ADD COLUMN ai_narrative_enabled INTEGER NOT NULL DEFAULT 0",
         ]
         for sql in migrations:
             try:
@@ -644,6 +679,8 @@ def update_tenant(slug: str, **fields) -> bool:
         "accepted_terms_at", "accepted_terms_version",
         # Generalização multi-segmento (Track B)
         "segment", "professional_label", "client_noun", "service_noun", "business_type",
+        # Fase 3: flag da narrativa com IA na Home
+        "ai_narrative_enabled",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -1267,9 +1304,11 @@ def update_appointment(tenant_id: int, appointment_id: int, scheduled_at: dateti
     with get_conn() as conn:
         cur = conn.execute(
             """UPDATE appointments
-               SET scheduled_at = ?, confirmed = 0, confirmation_sent = 0, followup_sent = 0
+               SET scheduled_at = ?, confirmed = 0, confirmation_sent = 0, followup_sent = 0,
+                   reschedule_count = COALESCE(reschedule_count, 0) + 1,
+                   last_rescheduled_at = ?
                WHERE id = ? AND tenant_id = ?""",
-            (scheduled_at.isoformat(), appointment_id, tenant_id),
+            (scheduled_at.isoformat(), _now_local_iso(), appointment_id, tenant_id),
         )
         return cur.rowcount > 0
 
@@ -1287,6 +1326,92 @@ def cancel_appointment(tenant_id: int, appointment_id: int) -> bool:
             (appointment_id, tenant_id),
         )
         return cur.rowcount > 0
+
+
+def log_cancellation(tenant_id: int, appt: dict, reason: str = "") -> None:
+    """Registra um cancelamento no log append-only (Fase 4). Chamado ANTES do
+    hard-delete do painel, para preservar a métrica sem mudar o comportamento.
+    Fail-open: nunca levanta exceção para quem chama (o cancelamento em si é
+    prioridade). Calcula a antecedência (lead_hours) quando possível."""
+    try:
+        sched = (appt or {}).get("scheduled_at") or ""
+        lead = None
+        if sched and sched < "2099-01-01":
+            try:
+                from zoneinfo import ZoneInfo
+                now = datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None)
+                dt = datetime.fromisoformat(sched)
+                lead = round((dt - now).total_seconds() / 3600.0, 1)
+            except Exception:
+                lead = None
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO cancellation_log "
+                "(tenant_id, phone, patient_name, scheduled_at, reason, lead_hours, cancelled_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (tenant_id, (appt or {}).get("phone") or "",
+                 (appt or {}).get("patient_name") or "", sched,
+                 (reason or "").strip()[:280], lead, _now_local_iso()),
+            )
+    except Exception:
+        pass  # métrica é secundária; nunca atrapalha o cancelamento
+
+
+def get_reminder_effectiveness(tenant_id: int, start: str, end: str) -> dict:
+    """Efetividade dos lembretes/confirmações no período (Fase 2/4). Conta
+    consultas cuja confirmação foi ENVIADA na janela e que acabaram confirmadas
+    ou comparecidas. Só sessões reais (exclui placeholders 2099 e canceladas)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT
+                 COUNT(*) AS sent,
+                 SUM(CASE WHEN (confirmed = 1 OR attendance = 'attended') THEN 1 ELSE 0 END) AS confirmed
+               FROM appointments
+               WHERE tenant_id = ?
+                 AND confirmation_sent_at IS NOT NULL
+                 AND confirmation_sent_at >= ? AND confirmation_sent_at < ?
+                 AND cancelled = 0
+                 AND scheduled_at < '2099-01-01'""",
+            (tenant_id, start, end),
+        ).fetchone()
+    sent = (row["sent"] if row else 0) or 0
+    confirmed = (row["confirmed"] if row else 0) or 0
+    return {"sent": sent, "confirmed": confirmed}
+
+
+def get_reschedules_in_range(tenant_id: int, start: str, end: str) -> int:
+    """Quantas consultas foram remarcadas no período (Fase 2/4). Usa o carimbo
+    da última remarcação; só sessões reais e não canceladas."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) AS n FROM appointments
+               WHERE tenant_id = ?
+                 AND last_rescheduled_at IS NOT NULL
+                 AND last_rescheduled_at >= ? AND last_rescheduled_at < ?
+                 AND cancelled = 0
+                 AND scheduled_at < '2099-01-01'""",
+            (tenant_id, start, end),
+        ).fetchone()
+    return (row["n"] if row else 0) or 0
+
+
+def get_cancellations_in_range(tenant_id: int, start: str, end: str,
+                               late_threshold_h: float = 24.0) -> dict:
+    """Cancelamentos registrados no período (Fase 2/4). `late` = cancelados com
+    menos de `late_threshold_h` horas de antecedência (lead_hours conhecido)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT
+                 COUNT(*) AS total,
+                 SUM(CASE WHEN lead_hours IS NOT NULL AND lead_hours < ? THEN 1 ELSE 0 END) AS late
+               FROM cancellation_log
+               WHERE tenant_id = ?
+                 AND cancelled_at >= ? AND cancelled_at < ?""",
+            (late_threshold_h, tenant_id, start, end),
+        ).fetchone()
+    total = (row["total"] if row else 0) or 0
+    late = (row["late"] if row else 0) or 0
+    return {"total": total, "late": late}
 
 
 def rename_patient(tenant_id: int, appointment_id: int, new_name: str, apply_all: bool = False) -> int:
@@ -1408,16 +1533,18 @@ def set_appointment_google_event_id(appointment_id: int, event_id: str):
 def mark_confirmation_sent(appointment_id: int):
     with get_conn() as conn:
         conn.execute(
-            "UPDATE appointments SET confirmation_sent = 1 WHERE id = ?",
-            (appointment_id,),
+            "UPDATE appointments SET confirmation_sent = 1, "
+            "confirmation_sent_at = COALESCE(confirmation_sent_at, ?) WHERE id = ?",
+            (_now_local_iso(), appointment_id),
         )
 
 
 def mark_followup_sent(appointment_id: int):
     with get_conn() as conn:
         conn.execute(
-            "UPDATE appointments SET followup_sent = 1 WHERE id = ?",
-            (appointment_id,),
+            "UPDATE appointments SET followup_sent = 1, "
+            "followup_sent_at = COALESCE(followup_sent_at, ?) WHERE id = ?",
+            (_now_local_iso(), appointment_id),
         )
 
 
