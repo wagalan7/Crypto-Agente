@@ -331,29 +331,32 @@
 
   <!-- Config -->
   <div id="pane-config" class="tab-content">
-    <h2 class="text-base font-semibold text-gray-800 mb-3 mt-4 md:mt-0">Configurações</h2>
+    <div class="mb-4 mt-4 md:mt-0">
+      <h2 class="text-lg font-extrabold text-slate-800 tracking-tight">Configurações</h2>
+      <p class="text-xs text-slate-400 mt-0.5">Ajuste sua conta por assunto — escolha uma seção abaixo.</p>
+    </div>
 
     <!-- Sub-menu da aba Config (evita rolar a página inteira) -->
-    <div id="config-subnav" class="flex flex-wrap gap-2 overflow-x-auto pb-2 mb-4">
+    <div id="config-subnav" class="flex flex-nowrap gap-2 overflow-x-auto pb-2 mb-5 -mx-1 px-1">
       <button type="button" data-sec="geral" onclick="showConfigSection('geral')"
-        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-brand text-white">📊 Geral</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-brand text-white">📊 Geral</button>
       <button type="button" data-sec="whatsapp" onclick="showConfigSection('whatsapp')"
-        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">📲 WhatsApp</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">📲 WhatsApp</button>
       <button type="button" data-sec="mensagens" onclick="showConfigSection('mensagens')"
-        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">✏️ Mensagens</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">✏️ Mensagens</button>
       <button type="button" data-sec="cobranca" onclick="showConfigSection('cobranca')"
-        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">💰 Cobrança</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">💰 Cobrança</button>
       <button type="button" data-sec="integracoes" onclick="showConfigSection('integracoes')"
-        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">🔗 Integrações</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">🔗 Integrações</button>
       <button type="button" data-sec="conta" onclick="showConfigSection('conta')"
-        class="csub flex-shrink-0 px-3.5 py-1.5 rounded-full text-xs font-semibold border border-gray-200 transition bg-white text-gray-600">💳 Conta</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">💳 Conta</button>
     </div>
 
     <!-- ═══ Sub-seção: Geral ═══ -->
     <div class="config-section active" id="cfgsec-geral">
 
     <!-- Indicadores do mês -->
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mb-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mb-4">
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center gap-2">
           <span class="text-xl">📊</span>
@@ -369,7 +372,7 @@
         <div class="text-gray-400 text-sm text-center py-4">Carregando…</div>
       </div>
     </div>
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg space-y-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg space-y-4">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Nome do consultório</label>
         <input id="cfg-name" type="text" value="{{ tenant.name }}"
@@ -506,7 +509,7 @@
     {% endif %}
 
     <!-- WhatsApp Z-API -->
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center gap-2 mb-1">
         <span class="text-xl">📲</span>
         <h3 class="font-semibold text-gray-800 text-sm">WhatsApp (Z-API)</h3>
@@ -549,7 +552,7 @@
     </div>
 
     <!-- Conectar o WhatsApp (parear via QR no próprio painel) -->
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center justify-between mb-1">
         <div class="flex items-center gap-2">
           <span class="text-xl">🔗</span>
@@ -583,7 +586,7 @@
     <div class="config-section" id="cfgsec-mensagens">
 
     <!-- Mensagens personalizáveis -->
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center gap-2 mb-1">
         <span class="text-xl">✏️</span>
         <h3 class="font-semibold text-gray-800 text-sm">Mensagens do agente</h3>
@@ -631,7 +634,7 @@
 
     <!-- Assinatura -->
     {% if tenant.stripe_subscription_id or tenant.mp_subscription_id or tenant.free_until %}
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">💳</span>
         <div class="flex-1">
@@ -701,7 +704,7 @@
     <div class="config-section" id="cfgsec-cobranca">
 
     <!-- Confirmações -->
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">📨</span>
         <div>
@@ -721,7 +724,7 @@
     </div>
 
     <!-- Cobrança Mensal -->
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">💰</span>
         <div>
@@ -819,7 +822,7 @@
     <div class="config-section" id="cfgsec-integracoes">
 
     <!-- Documentação -->
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center gap-3 mb-4">
         <span class="text-2xl">📚</span>
         <div>
@@ -850,7 +853,7 @@
     </div>
 
     <!-- Google Calendar -->
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">📅</span>
         <div>
@@ -880,7 +883,7 @@
     </div>
 
     <!-- CalDAV (Apple iCloud, Outlook, Nextcloud...) -->
-    <div class="bg-white rounded-xl border border-gray-200 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">🗓️</span>
         <div>

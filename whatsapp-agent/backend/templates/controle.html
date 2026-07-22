@@ -5,35 +5,42 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Controle — {{ tenant.psychologist_name }}</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C' } } } }</script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: {
+    DEFAULT:'#7c3aed', 50:'#f5f3ff',100:'#ede9fe',200:'#ddd6fe',300:'#c4b5fd',400:'#a78bfa',
+    500:'#8b5cf6',600:'#7c3aed',700:'#6d28d9',800:'#5b21b6',900:'#4c1d95',950:'#2e1065'
+  } } } } }</script>
   <style>
     body { -webkit-tap-highlight-color: transparent; }
     button:active { transform: scale(0.96); }
-    .patient-card { transition: opacity .15s; }
+    .patient-card { transition: opacity .15s, box-shadow .15s, border-color .15s; }
     .patient-card.hidden-search { display: none; }
     .patient-card.hidden-filter { display: none; }
     .stat-card { cursor: pointer; }
     .stat-card:active { transform: scale(0.96); }
-    .stat-card.active { box-shadow: 0 0 0 2px #E91E8C inset; }
+    .stat-card.active { box-shadow: 0 0 0 2px #7c3aed inset; }
+    .hero-grad { background:
+      radial-gradient(700px 300px at 12% -40%, #6d28d9 0%, transparent 60%),
+      linear-gradient(135deg, #2e1065 0%, #4c1d95 45%, #2d1657 100%); }
   </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
 
   <!-- Header -->
-  <div class="bg-white border-b border-gray-200 sticky top-0 z-10 px-4 py-3 flex items-center gap-3">
-    <div class="w-9 h-9 rounded-full bg-brand flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
+  <div class="hero-grad sticky top-0 z-10 px-4 py-3.5 flex items-center gap-3 shadow-lg relative overflow-hidden">
+    <div class="absolute -top-12 -right-8 w-40 h-40 rounded-full bg-brand-500/30 blur-3xl pointer-events-none"></div>
+    <div class="w-9 h-9 rounded-2xl bg-white/15 ring-1 ring-white/20 backdrop-blur flex items-center justify-center text-white font-bold text-sm flex-shrink-0 relative">
       {{ tenant.psychologist_name[:1] | upper if tenant.psychologist_name else 'P' }}
     </div>
-    <div class="flex-1 min-w-0">
-      <p class="font-semibold text-gray-900 text-sm leading-tight">Controle do Agente</p>
-      <p class="text-xs text-gray-400 truncate">{{ tenant.psychologist_name }}</p>
+    <div class="flex-1 min-w-0 relative">
+      <p class="font-semibold text-white text-sm leading-tight">Controle do Agente</p>
+      <p class="text-xs text-white/60 truncate">{{ tenant.psychologist_name }}</p>
     </div>
     <a href="/controle/{{ token }}"
-      class="text-xs text-brand font-medium px-3 py-1.5 rounded-full border border-brand">
+      class="relative text-xs text-white/90 font-medium px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/20 ring-1 ring-white/15 transition">
       ↻ Atualizar
     </a>
     <button onclick="document.getElementById('modal-novo').classList.remove('hidden')"
-      class="w-8 h-8 rounded-full bg-brand text-white text-xl font-bold flex items-center justify-center flex-shrink-0">
+      class="relative w-8 h-8 rounded-full bg-white text-brand-700 text-xl font-bold flex items-center justify-center flex-shrink-0 shadow">
       +
     </button>
   </div>
@@ -86,7 +93,7 @@
         <p class="text-[10px] text-yellow-600">pausados</p>
       </button>
       <button type="button" data-filter="semnome" onclick="filterByCategory('semnome')"
-        class="stat-card bg-pink-50 rounded-xl border border-pink-100 py-2.5 transition">
+        class="stat-card bg-violet-50 rounded-xl border border-violet-100 py-2.5 transition">
         <p class="text-lg font-bold text-brand">{{ n_sem_nome }}</p>
         <p class="text-[10px] text-brand">sem nome</p>
       </button>
@@ -149,8 +156,8 @@
       {% if p.phone and p.phone.startswith('55') and p.phone|length >= 12 and not is_group %}
         {% set phone_pretty = '+55 (' ~ p.phone[2:4] ~ ') ' ~ p.phone[4:-4] ~ '-' ~ p.phone[-4:] %}
       {% endif %}
-      <div class="patient-card bg-white rounded-2xl border p-4
-        {{ 'border-yellow-200' if is_paused else 'border-gray-100' }}"
+      <div class="patient-card bg-white rounded-2xl border p-4 shadow-sm hover:shadow-md
+        {{ 'border-yellow-200' if is_paused else 'border-slate-100' }}"
         data-search="{{ (p.patient_name or '') | lower }} {{ p.phone or '' }}"
         data-paused="{{ '1' if is_paused else '0' }}"
         data-semnome="{{ '1' if sem_nome else '0' }}">
