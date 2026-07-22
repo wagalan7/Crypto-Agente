@@ -118,7 +118,17 @@
 
   <!-- Agenda -->
   <div id="pane-agenda" class="tab-content active">
-    <div class="flex items-center justify-between mb-3 mt-4 md:mt-0 gap-2">
+    <!-- Home Inteligente — resumo administrativo (Fase 1) -->
+    <div id="home-insights" class="hidden mb-4 mt-4 md:mt-0 rounded-2xl border border-gray-100 bg-white shadow-sm overflow-hidden">
+      <div class="px-4 pt-3 pb-2 flex items-center justify-between">
+        <h2 id="hi-greeting" class="text-base font-semibold text-gray-800">Resumo da clínica</h2>
+        <button onclick="loadHomeInsights()" title="Atualizar resumo"
+          class="text-xs text-gray-400 hover:text-brand whitespace-nowrap">↻</button>
+      </div>
+      <div id="hi-body" class="px-4 pb-3 space-y-2"></div>
+    </div>
+
+    <div class="flex items-center justify-between mb-3 gap-2">
       <h2 class="text-base font-semibold text-gray-800">Próximas consultas</h2>
       <div class="flex gap-2">
         <button onclick="loadAgenda()" class="text-sm text-brand whitespace-nowrap">↻ Atualizar</button>
@@ -1311,7 +1321,7 @@ function showTab(name) {
   const mtab = document.getElementById("mtab-"+name);
   if (mtab) mtab.classList.replace("text-gray-400","text-brand");
 
-  if (name==="agenda")    { loadAgenda();    newAppointments=0; updateBadge("agenda",0); }
+  if (name==="agenda")    { loadAgenda(); loadHomeInsights(); newAppointments=0; updateBadge("agenda",0); }
   if (name==="slots")     { loadSlots(); loadWeekly(); renderBlockedHours(); renderBlockedDates(); }
   if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
   if (name==="config")    { loadBillingLogs(); loadStats(); }
@@ -1580,6 +1590,40 @@ function filterAgenda() {
     const phone = (card.getAttribute("data-phone") || "").toLowerCase();
     card.style.display = (!q || name.includes(q) || phone.includes(q)) ? "" : "none";
   });
+}
+
+function _hiEscape(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => (
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function loadHomeInsights() {
+  const box = document.getElementById("home-insights");
+  const body = document.getElementById("hi-body");
+  if (!box || !body) return;
+  api("/dashboard/api/insights").then(data => {
+    if (data && data.greeting) {
+      document.getElementById("hi-greeting").textContent = data.greeting;
+    }
+    const items = (data && data.insights) || [];
+    if (!items.length) {
+      body.innerHTML = '<div class="flex items-center gap-2 text-sm text-gray-500 py-1">'
+        + '<span>✅</span><span>Tudo em dia por aqui — nada pedindo sua atenção agora.</span></div>';
+      box.classList.remove("hidden");
+      return;
+    }
+    body.innerHTML = items.map(it => {
+      const attention = it.severity === "attention";
+      const wrap = attention
+        ? "bg-amber-50 border-amber-100 text-amber-900"
+        : "bg-gray-50 border-gray-100 text-gray-700";
+      return '<div class="flex items-start gap-2 rounded-xl border px-3 py-2 text-sm ' + wrap + '">'
+        + '<span class="shrink-0 leading-5">' + _hiEscape(it.icon || "•") + '</span>'
+        + '<span class="leading-5">' + _hiEscape(it.text || "") + '</span>'
+        + '</div>';
+    }).join("");
+    box.classList.remove("hidden");
+  }).catch(() => { /* fail-safe: sem resumo, o painel segue normal */ });
 }
 
 function loadAgenda() {
@@ -3286,6 +3330,7 @@ function checkWelcome() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 connectSSE();
 loadAgenda();
+loadHomeInsights();
 // ── Indicadores ───────────────────────────────────────────────────────────────
 function loadStats() {
   const month = document.getElementById('stats-month')?.value || '';

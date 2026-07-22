@@ -2347,6 +2347,21 @@ def dash_stats(request: Request, month: str | None = None):
     return stats
 
 
+@app.get("/dashboard/api/insights")
+def dash_insights(request: Request):
+    """Home Inteligente (Fase 1) — resumo administrativo de gestão do consultório.
+    Só leitura, determinístico, fail-safe. Não toca conteúdo clínico."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    try:
+        import insights_service as _ins
+        return _ins.build_home_insights(tenant)
+    except Exception:
+        logger.exception("dash_insights fail-open")
+        return {"greeting": "", "insights": [], "attention_count": 0,
+                "all_clear": True, "generated_at": ""}
+
+
 @app.get("/dashboard/api/billing/export")
 def dash_billing_export(request: Request, month: str | None = None):
     """Exporta cobrança do mês como CSV."""
