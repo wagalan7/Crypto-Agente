@@ -5,7 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>{{ tenant.name }} — Painel</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>tailwind.config = { theme: { extend: { colors: { brand: '#E91E8C' } } } }</script>
+  <script>tailwind.config = { theme: { extend: { colors: { brand: {
+    DEFAULT:'#7c3aed', 50:'#f5f3ff',100:'#ede9fe',200:'#ddd6fe',300:'#c4b5fd',400:'#a78bfa',
+    500:'#8b5cf6',600:'#7c3aed',700:'#6d28d9',800:'#5b21b6',900:'#4c1d95',950:'#2e1065'
+  } } } } }</script>
   <style>
     body { padding-bottom: 70px; }
     @media (min-width: 768px) { body { padding-bottom: 0; } }
@@ -19,6 +22,12 @@
     @keyframes slideIn { from { transform: translateY(-20px); opacity:0; } to { transform: translateY(0); opacity:1; } }
     .badge { display:none; }
     .badge.show { display:flex; }
+    .hero-grad { background:
+      radial-gradient(900px 380px at 12% -30%, #6d28d9 0%, transparent 60%),
+      linear-gradient(135deg, #2e1065 0%, #4c1d95 45%, #2d1657 100%); }
+    .shadow-glow { box-shadow: 0 12px 40px -14px rgba(124,58,237,.45); }
+    .hi-rise { animation: hiRise .45s cubic-bezier(.2,.7,.2,1) both; }
+    @keyframes hiRise { from { opacity:0; transform:translateY(8px);} to { opacity:1; transform:none;} }
   </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -32,7 +41,7 @@
     <div class="bg-brand px-6 py-5 text-white text-center">
       <div class="text-4xl mb-2">🎉</div>
       <h2 class="text-xl font-bold">Bem-vinda ao Consultório Inteligente!</h2>
-      <p class="text-pink-100 text-sm mt-1">Seu assistente de IA está pronto para começar</p>
+      <p class="text-violet-100 text-sm mt-1">Seu assistente de IA está pronto para começar</p>
     </div>
     <div class="p-6 space-y-4">
       <p class="text-gray-700 text-sm text-center">Antes de usar o sistema, configure sua conta em <strong>~20 minutos</strong> seguindo o guia de primeiros passos.</p>
@@ -42,7 +51,7 @@
           <span class="text-2xl">🚀</span>
           <div class="text-left">
             <div>Guia de Primeiros Passos</div>
-            <div class="text-pink-200 text-xs font-normal">Z-API, agenda, configuração — comece aqui</div>
+            <div class="text-violet-200 text-xs font-normal">Z-API, agenda, configuração — comece aqui</div>
           </div>
           <span class="ml-auto">↓</span>
         </a>
@@ -77,7 +86,7 @@
   <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
     <div>
       <h1 class="text-white text-base md:text-xl font-bold leading-tight">{{ tenant.name }}</h1>
-      <p class="text-pink-200 text-xs md:text-sm">{{ tenant.psychologist_name }} · {{ '%02d'|format(tenant.working_hours_start) }}:00–{{ '%02d'|format(tenant.working_hours_end) }}:00</p>
+      <p class="text-violet-200 text-xs md:text-sm">{{ tenant.psychologist_name }} · {{ '%02d'|format(tenant.working_hours_start) }}:00–{{ '%02d'|format(tenant.working_hours_end) }}:00</p>
     </div>
     <div class="flex items-center gap-2">
       <span id="status-dot" class="bg-green-400 text-green-900 text-xs font-semibold px-2 py-1 rounded-full">● Online</span>
@@ -119,15 +128,25 @@
   <!-- Agenda -->
   <div id="pane-agenda" class="tab-content active">
     <!-- Home Inteligente — resumo administrativo (Fase 1) -->
-    <div id="home-insights" class="hidden mb-4 mt-4 md:mt-0 rounded-2xl border border-gray-100 bg-white shadow-sm overflow-hidden">
-      <div class="px-4 pt-3 pb-2 flex items-center justify-between">
-        <h2 id="hi-greeting" class="text-base font-semibold text-gray-800">Resumo da clínica</h2>
-        <button onclick="loadHomeInsights()" title="Atualizar resumo"
-          class="text-xs text-gray-400 hover:text-brand whitespace-nowrap">↻</button>
+    <div id="home-insights" class="hidden mb-4 mt-4 md:mt-0">
+      <!-- Hero "briefing do dia" -->
+      <div class="hero-grad rounded-2xl shadow-glow relative overflow-hidden px-5 pt-5 pb-5">
+        <div class="absolute -top-16 -right-10 w-56 h-56 rounded-full bg-brand-500/30 blur-3xl pointer-events-none"></div>
+        <div class="absolute top-8 -left-10 w-40 h-40 rounded-full bg-fuchsia-500/20 blur-3xl pointer-events-none"></div>
+        <div class="relative">
+          <div class="flex items-center justify-between gap-2">
+            <h2 id="hi-greeting" class="text-white text-xl md:text-2xl font-extrabold tracking-tight">Resumo da clínica</h2>
+            <button onclick="loadHomeInsights()" title="Atualizar resumo"
+              class="shrink-0 text-white/70 hover:text-white text-xs bg-white/10 hover:bg-white/20 transition px-2.5 py-1 rounded-full ring-1 ring-white/15 whitespace-nowrap">↻</button>
+          </div>
+          <!-- Fase 3: narrativa com IA (só aparece se a flag do tenant estiver ligada) -->
+          <div id="hi-narrative" class="hidden mt-3 rounded-2xl bg-white/10 backdrop-blur-sm ring-1 ring-white/15 px-4 py-3 text-[13.5px] text-white/90 leading-relaxed hi-rise"></div>
+          <!-- KPIs rápidos (montados via JS a partir dos insights) -->
+          <div id="hi-kpis" class="hidden mt-4 grid grid-cols-3 gap-2"></div>
+        </div>
       </div>
-      <!-- Fase 3: narrativa com IA (só aparece se a flag do tenant estiver ligada) -->
-      <div id="hi-narrative" class="hidden mx-4 mb-2 rounded-xl bg-brand/5 border border-brand/10 px-3 py-2 text-sm text-gray-700 leading-relaxed"></div>
-      <div id="hi-body" class="px-4 pb-3 space-y-2"></div>
+      <!-- Cards de insight (atenção primeiro) -->
+      <div id="hi-body" class="mt-3 space-y-2.5"></div>
     </div>
 
     <div class="flex items-center justify-between mb-3 gap-2">
@@ -259,7 +278,7 @@
             <input id="slot-block-date" type="date"
               class="flex-1 border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-brand"/>
             <button type="button" onclick="addBlockedDate()"
-              class="bg-pink-50 text-brand border border-brand text-sm font-semibold px-3 py-2 rounded-lg active:scale-95 transition">
+              class="bg-violet-50 text-brand border border-brand text-sm font-semibold px-3 py-2 rounded-lg active:scale-95 transition">
               + Bloquear
             </button>
           </div>
@@ -691,7 +710,7 @@
         </div>
       </div>
       <button onclick="exportBilling()" id="btn-export-csv"
-        class="w-full mb-2 border border-brand text-brand py-2.5 rounded-lg text-sm font-semibold hover:bg-pink-50 transition">
+        class="w-full mb-2 border border-brand text-brand py-2.5 rounded-lg text-sm font-semibold hover:bg-violet-50 transition">
         📥 Exportar CSV do mês
       </button>
       <button onclick="dispararConfirmacoes()" id="btn-confirmar"
@@ -810,11 +829,11 @@
       </div>
       <div class="space-y-2">
         <a href="/static/primeiros_passos.pdf" target="_blank"
-          class="flex items-center gap-3 w-full border border-brand/30 bg-pink-50 text-brand px-4 py-3 rounded-xl text-sm font-medium hover:bg-pink-100 transition">
+          class="flex items-center gap-3 w-full border border-brand/30 bg-violet-50 text-brand px-4 py-3 rounded-xl text-sm font-medium hover:bg-violet-100 transition">
           <span class="text-xl">🚀</span>
           <div class="text-left flex-1">
             <div class="font-semibold">Guia de Primeiros Passos</div>
-            <div class="text-xs text-pink-400 font-normal">Z-API, agenda, configuração inicial</div>
+            <div class="text-xs text-violet-400 font-normal">Z-API, agenda, configuração inicial</div>
           </div>
           <span class="text-xs text-brand font-semibold">Baixar PDF</span>
         </a>
@@ -1615,6 +1634,27 @@ function loadHomeNarrative() {
   }).catch(() => { nb.classList.add("hidden"); });
 }
 
+function _hiKpiShort(v) {
+  const n = Number(v) || 0;
+  if (n >= 1000) return (n / 1000).toFixed(1).replace(".", ",") + "k";
+  return String(Math.round(n));
+}
+function _hiKpiTile(val, label) {
+  return '<div class="rounded-xl bg-white/10 ring-1 ring-white/10 px-2 py-2 text-center">'
+    + '<p class="text-white text-lg font-extrabold leading-none">' + val + '</p>'
+    + '<p class="text-white/60 text-[10px] mt-1 leading-tight">' + label + '</p></div>';
+}
+function _hiRenderKpis(items) {
+  const el = document.getElementById("hi-kpis");
+  if (!el) return;
+  const byId = {}; items.forEach(it => { byId[it.id] = it; });
+  const tiles = [];
+  if (byId.today) tiles.push(_hiKpiTile(byId.today.count != null ? byId.today.count : "—", "sessões hoje"));
+  if (byId.occupancy) tiles.push(_hiKpiTile((byId.occupancy.value != null ? byId.occupancy.value : 0) + "%", "ocupação 7d"));
+  if (byId.revenue) tiles.push(_hiKpiTile("R$ " + _hiKpiShort(byId.revenue.value), "previsto/mês"));
+  if (tiles.length) { el.innerHTML = tiles.join(""); el.classList.remove("hidden"); }
+  else { el.classList.add("hidden"); }
+}
 function loadHomeInsights() {
   const box = document.getElementById("home-insights");
   const body = document.getElementById("hi-body");
@@ -1625,21 +1665,27 @@ function loadHomeInsights() {
     }
     loadHomeNarrative();
     const items = (data && data.insights) || [];
+    _hiRenderKpis(items);
     if (!items.length) {
-      body.innerHTML = '<div class="flex items-center gap-2 text-sm text-gray-500 py-1">'
-        + '<span>✅</span><span>Tudo em dia por aqui — nada pedindo sua atenção agora.</span></div>';
+      body.innerHTML = '<div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 flex items-center gap-3 text-sm text-slate-600">'
+        + '<span class="text-lg">✅</span><span>Tudo em dia por aqui — nada pedindo sua atenção agora.</span></div>';
       box.classList.remove("hidden");
       return;
     }
     body.innerHTML = items.map(it => {
       const attention = it.severity === "attention";
-      const wrap = attention
-        ? "bg-amber-50 border-amber-100 text-amber-900"
-        : "bg-gray-50 border-gray-100 text-gray-700";
-      return '<div class="flex items-start gap-2 rounded-xl border px-3 py-2 text-sm ' + wrap + '">'
-        + '<span class="shrink-0 leading-5">' + _hiEscape(it.icon || "•") + '</span>'
-        + '<span class="leading-5">' + _hiEscape(it.text || "") + '</span>'
-        + '</div>';
+      const cardBorder = attention ? "border-amber-200" : "border-slate-100";
+      const iconWrap   = attention ? "bg-amber-50 border-amber-100" : "bg-brand-50 border-brand-100";
+      const badge = attention
+        ? '<span class="text-[10px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded">Atenção</span>'
+        : '';
+      return '<article class="bg-white rounded-2xl border ' + cardBorder + ' shadow-sm p-3.5 flex items-start gap-3">'
+        + '<div class="w-10 h-10 shrink-0 rounded-xl border ' + iconWrap + ' flex items-center justify-center text-lg">'
+        + _hiEscape(it.icon || "•") + '</div>'
+        + '<div class="min-w-0 flex-1">'
+        + (badge ? badge + '<div class="h-1.5"></div>' : '')
+        + '<p class="text-slate-800 text-[14px] font-medium leading-snug">' + _hiEscape(it.text || "") + '</p>'
+        + '</div></article>';
     }).join("");
     box.classList.remove("hidden");
   }).catch(() => { /* fail-safe: sem resumo, o painel segue normal */ });
@@ -1680,7 +1726,7 @@ function loadAgenda() {
     el.innerHTML = _agendaCache.map(a => {
       const sessCount = _agendaCounts[a.phone] || 0;
       const sessTag = sessCount > 0
-        ? `<span class="ml-1 text-xs font-medium text-brand bg-pink-50 px-1.5 py-0.5 rounded-full">(${sessCount})</span>`
+        ? `<span class="ml-1 text-xs font-medium text-brand bg-violet-50 px-1.5 py-0.5 rounded-full">(${sessCount})</span>`
         : '';
       const dt = new Date(a.scheduled_at);
       const label = `${days[dt.getDay()]}, ${String(dt.getDate()).padStart(2,"0")}/${String(dt.getMonth()+1).padStart(2,"0")} às ${String(dt.getHours()).padStart(2,"0")}:${String(dt.getMinutes()).padStart(2,"0")}`;
@@ -1778,7 +1824,7 @@ function openHistory(phone, name) {
       return `<div class="mb-4">
         <div class="flex items-center justify-between mb-1.5">
           <p class="font-semibold text-sm text-gray-800">${title}</p>
-          <span class="text-xs bg-pink-50 text-brand px-2 py-0.5 rounded-full font-medium">${g.billable} cobr.</span>
+          <span class="text-xs bg-violet-50 text-brand px-2 py-0.5 rounded-full font-medium">${g.billable} cobr.</span>
         </div>
         ${items}
       </div>`;
@@ -1891,7 +1937,7 @@ function loadSlots() {
       const safeIso = s.iso.replace(/'/g, "");
       return `<button type="button" onclick="openNewApptAtSlot('${safeIso}')"
         class="bg-white border border-gray-200 rounded-xl px-3 py-3 text-sm text-gray-700 text-center
-               hover:border-brand hover:bg-pink-50 hover:text-brand active:scale-95 transition cursor-pointer">
+               hover:border-brand hover:bg-violet-50 hover:text-brand active:scale-95 transition cursor-pointer">
         <span class="block">${s.label}</span>
         <span class="block text-[10px] text-gray-400 mt-0.5 group-hover:text-brand">toque para agendar</span>
       </button>`;
@@ -2244,7 +2290,7 @@ function loadWeekly() {
             <span class="text-gray-800 truncate">${a.patient_name || a.phone}</span>
           </div>`;
         }).join('');
-        return `<div class="border-l-2 border-pink-100 pl-3 mb-2">
+        return `<div class="border-l-2 border-violet-100 pl-3 mb-2">
           <p class="text-xs font-medium text-brand">${days[d.getDay()]}, ${String(d.getDate()).padStart(2,'0')}/${months[d.getMonth()]}</p>
           ${items}
         </div>`;
@@ -3363,14 +3409,14 @@ function loadStats() {
     const maxWd = Math.max(...s.weekdays, 1);
     const wdBars = s.weekdays.map((n,i) =>
       `<div class="flex flex-col items-center gap-1 flex-1">
-        <div class="w-full rounded-t" style="height:${Math.max(4, Math.round(n/maxWd*40))}px; background:#E91E8C; opacity:${n>0?1:0.15}"></div>
+        <div class="w-full rounded-t" style="height:${Math.max(4, Math.round(n/maxWd*40))}px; background:#7c3aed; opacity:${n>0?1:0.15}"></div>
         <span class="text-[10px] text-gray-500">${days[i]}</span>
         <span class="text-[10px] font-medium text-gray-700">${n}</span>
       </div>`
     ).join('');
     el.innerHTML = `
       <div class="grid grid-cols-2 gap-2 mb-4">
-        <div class="bg-pink-50 rounded-xl p-3 text-center">
+        <div class="bg-violet-50 rounded-xl p-3 text-center">
           <p class="text-xl font-bold text-brand">${s.total}</p>
           <p class="text-[10px] text-gray-500">sessões no mês</p>
         </div>
