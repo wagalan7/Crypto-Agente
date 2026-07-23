@@ -1642,8 +1642,12 @@ function _hiKpiShort(v) {
   if (n >= 1000) return (n / 1000).toFixed(1).replace(".", ",") + "k";
   return String(Math.round(n));
 }
-function _hiKpiTile(val, label) {
-  return '<div class="rounded-xl bg-white/10 ring-1 ring-white/10 px-2 py-2 text-center">'
+function _hiKpiTile(val, label, tab) {
+  const clk = tab
+    ? ' cursor-pointer hover:bg-white/20 transition" role="button" tabindex="0" title="Abrir"'
+      + ' onclick="_hiGoTab(\'' + tab + '\',event)" onkeydown="_hiGoTab(\'' + tab + '\',event)'
+    : '';
+  return '<div class="rounded-xl bg-white/10 ring-1 ring-white/10 px-2 py-2 text-center' + clk + '">'
     + '<p class="text-white text-lg font-extrabold leading-none">' + val + '</p>'
     + '<p class="text-white/60 text-[10px] mt-1 leading-tight">' + label + '</p></div>';
 }
@@ -1652,11 +1656,23 @@ function _hiRenderKpis(items) {
   if (!el) return;
   const byId = {}; items.forEach(it => { byId[it.id] = it; });
   const tiles = [];
-  if (byId.today) tiles.push(_hiKpiTile(byId.today.count != null ? byId.today.count : "—", "sessões hoje"));
-  if (byId.occupancy) tiles.push(_hiKpiTile((byId.occupancy.value != null ? byId.occupancy.value : 0) + "%", "ocupação 7d"));
-  if (byId.revenue) tiles.push(_hiKpiTile("R$ " + _hiKpiShort(byId.revenue.value), "previsto/mês"));
+  if (byId.today) tiles.push(_hiKpiTile(byId.today.count != null ? byId.today.count : "—", "sessões hoje", "agenda"));
+  if (byId.occupancy) tiles.push(_hiKpiTile((byId.occupancy.value != null ? byId.occupancy.value : 0) + "%", "ocupação 7d", "agenda"));
+  if (byId.revenue) tiles.push(_hiKpiTile("R$ " + _hiKpiShort(byId.revenue.value), "previsto/mês", "config"));
   if (tiles.length) { el.innerHTML = tiles.join(""); el.classList.remove("hidden"); }
   else { el.classList.add("hidden"); }
+}
+// Mapa: cada insight da Home leva à aba correspondente ao clicar
+const HI_TAB = {
+  today: "agenda", occupancy: "agenda", no_shows: "agenda",
+  reschedules: "agenda", cancellations: "agenda", confirmations: "agenda",
+  reminder_effectiveness: "agenda", no_return: "conversas",
+  revenue: "config", contracts: "contratos",
+};
+function _hiGoTab(tab, ev) {
+  if (ev && ev.type === "keydown" && ev.key !== "Enter" && ev.key !== " ") return;
+  if (ev) ev.preventDefault();
+  if (typeof showTab === "function") showTab(tab);
 }
 function loadHomeInsights() {
   const box = document.getElementById("home-insights");
@@ -1682,13 +1698,21 @@ function loadHomeInsights() {
       const badge = attention
         ? '<span class="text-[10px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded">Atenção</span>'
         : '';
-      return '<article class="bg-white rounded-2xl border ' + cardBorder + ' shadow-sm p-3.5 flex items-start gap-3">'
+      const tab = HI_TAB[it.id];
+      const clickCls = tab ? ' cursor-pointer hover:shadow-md hover:border-brand-200 transition' : '';
+      const clickAttr = tab
+        ? ' role="button" tabindex="0" title="Abrir" onclick="_hiGoTab(\'' + tab + '\',event)" onkeydown="_hiGoTab(\'' + tab + '\',event)"'
+        : '';
+      const chevron = tab
+        ? '<div class="self-center shrink-0 text-slate-300 text-xl leading-none pl-1">\u203a</div>'
+        : '';
+      return '<article class="bg-white rounded-2xl border ' + cardBorder + ' shadow-sm p-3.5 flex items-start gap-3' + clickCls + '"' + clickAttr + '>'
         + '<div class="w-10 h-10 shrink-0 rounded-xl border ' + iconWrap + ' flex items-center justify-center text-lg">'
         + _hiEscape(it.icon || "•") + '</div>'
         + '<div class="min-w-0 flex-1">'
         + (badge ? badge + '<div class="h-1.5"></div>' : '')
         + '<p class="text-slate-800 text-[14px] font-medium leading-snug">' + _hiEscape(it.text || "") + '</p>'
-        + '</div></article>';
+        + '</div>' + chevron + '</article>';
     }).join("");
     box.classList.remove("hidden");
   }).catch(() => { /* fail-safe: sem resumo, o painel segue normal */ });
