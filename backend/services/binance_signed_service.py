@@ -1004,7 +1004,15 @@ async def place_order(
         log.info(f"[binance] qty arredondado {sym}: {qty} → {qty_rounded}")
 
     if leverage is not None:
-        await set_leverage(sym, leverage)
+        _lev = await set_leverage(sym, leverage)
+        if not _lev.get("ok"):
+            _lev = await set_leverage(sym, leverage)  # 1 retry
+            if not _lev.get("ok"):
+                # Sem alavancagem confirmada NÃO abre: a moeda pode cair no
+                # default da conta (até 20x) e estourar a margem. Fail-safe.
+                return {"ok": False, "error":
+                        f"leverage {leverage}x não confirmada p/ {sym}: "
+                        f"{_lev.get('error') or _lev.get('msg')}"}
 
     binance_side = side.upper()  # BUY | SELL
     binance_type = "MARKET" if order_type == "Market" else "LIMIT"
@@ -1148,7 +1156,14 @@ async def place_maker_entry_then_protect(
         return {"ok": False, "error": f"qty arredondado virou 0 (step={f.get('step')}, min={f.get('min_qty')}, raw={qty})"}
 
     if leverage is not None:
-        await set_leverage(sym, leverage)
+        _lev = await set_leverage(sym, leverage)
+        if not _lev.get("ok"):
+            _lev = await set_leverage(sym, leverage)  # 1 retry
+            if not _lev.get("ok"):
+                # Sem alavancagem confirmada NÃO abre (fail-safe, ver place_order).
+                return {"ok": False, "error":
+                        f"leverage {leverage}x não confirmada p/ {sym}: "
+                        f"{_lev.get('error') or _lev.get('msg')}"}
 
     binance_side = side.upper()  # BUY | SELL
 

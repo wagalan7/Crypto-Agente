@@ -4570,26 +4570,38 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"[shadow→live] ⚠ {rec['symbol']} ABERTO SEM STOP — "
                         f"fechando a mercado por segurança"
                     )
+                    import asyncio
                     close_side = "Sell" if exch_side == "Buy" else "Buy"
                     closed_ok = False
-                    try:
-                        close_res = await exchange_service.place_order(
-                            symbol=rec["symbol"],
-                            side=close_side,
-                            qty=qty,
-                            order_type="Market",
-                            reduce_only=True,
-                            client_order_id=f"cw-nostop-{snap_id}",
-                        )
-                        closed_ok = bool(close_res.get("ok"))
-                        if not closed_ok:
-                            log.critical(
-                                f"[shadow→live] 🚨 {rec['symbol']} FALHA AO FECHAR posição sem stop: "
+                    # 3 tentativas com backoff: um blip de rede numa única
+                    # tentativa não pode deixar posição nua. client_order_id
+                    # único por tentativa evita rejeição por dedup.
+                    for _i in range(3):
+                        try:
+                            close_res = await exchange_service.place_order(
+                                symbol=rec["symbol"],
+                                side=close_side,
+                                qty=qty,
+                                order_type="Market",
+                                reduce_only=True,
+                                client_order_id=f"cw-nostop-{snap_id}-{_i}",
+                            )
+                            if bool(close_res.get("ok")):
+                                closed_ok = True
+                                break
+                            log.warning(
+                                f"[shadow→live] {rec['symbol']} fechar sem-stop tentativa {_i} falhou: "
                                 f"{close_res.get('msg') or close_res.get('error')}"
                             )
-                    except Exception as _e:
+                        except Exception as _e:
+                            log.warning(
+                                f"[shadow→live] {rec['symbol']} erro ao fechar sem-stop tentativa {_i}: {_e}"
+                            )
+                        await asyncio.sleep(0.5 * (_i + 1))
+                    if not closed_ok:
                         log.critical(
-                            f"[shadow→live] 🚨 {rec['symbol']} erro ao fechar posição sem stop: {_e}"
+                            f"[shadow→live] 🚨 {rec['symbol']} FALHA AO FECHAR posição sem stop "
+                            f"após 3 tentativas — AÇÃO MANUAL"
                         )
                     # Alerta push imediato (crítico) — você precisa saber na hora.
                     try:

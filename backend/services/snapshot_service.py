@@ -751,7 +751,9 @@ async def reconcile_snapshot_from_real_trade(
     try:
         async with get_session() as session:
             snap = (await session.execute(
-                select(RecommendationSnapshot).where(RecommendationSnapshot.id == rec_id)
+                select(RecommendationSnapshot)
+                .where(RecommendationSnapshot.id == rec_id)
+                .with_for_update()  # trava a linha vs o sweep de 90s (anti lost-update)
             )).scalar_one_or_none()
             if snap is None or snap.status == snap_status:
                 return False
