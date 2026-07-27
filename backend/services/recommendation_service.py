@@ -138,6 +138,58 @@ def _score_with_htf_confirm(sig: "TradeSignal", base_score: float, confirm_dirs:
     ):
         return min(100.0, base_score + HIGH_TF_CONFIRM_BONUS)
     return base_score
+
+
+# Ordem de timeframes p/ derivar "TFs superiores" de um candidato (custo zero).
+_TF_RANK: Dict[str, int] = {
+    "1m": 1, "3m": 2, "5m": 3, "15m": 4, "30m": 5, "1h": 6, "2h": 7, "4h": 8,
+    "6h": 9, "8h": 10, "12h": 11, "1d": 12, "3d": 13, "1w": 14,
+}
+
+
+def _ema_aligned_label(sig) -> Optional[str]:
+    """'bullish' | 'bearish' | 'mixed' pelo empilhamento EMA9/21/50 do sinal.
+    None se faltar EMA. Tendência PURA (imune ao mean-reversion do determine_direction)."""
+    ind = getattr(sig, "indicators", None)
+    if ind is None or ind.ema9 is None or ind.ema21 is None or ind.ema50 is None:
+        return None
+    if ind.ema9 > ind.ema21 > ind.ema50:
+        return "bullish"
+    if ind.ema9 < ind.ema21 < ind.ema50:
+        return "bearish"
+    return "mixed"
+
+
+def _attach_htf_ema_trend(scored: list) -> None:
+    """Anexa a cada sig um `mtf` sintético {higher_tfs:[{timeframe,ema_aligned}]}
+    com o alinhamento de EMA dos TFs ESTRITAMENTE superiores do MESMO símbolo,
+    derivado dos sinais já computados (sem fetch extra). No-op se o sig já tem
+    MTF real. Fail-open (silencioso). Usado no caminho ao vivo, que não computa
+    MTF — assim a trava de contra-tendência por moeda passa a ter referência."""
+    try:
+        tf_ema: Dict[str, str] = {}
+        for s, _ in scored:
+            lbl = _ema_aligned_label(s)
+            if lbl:
+                tf_ema[s.timeframe] = lbl
+        if not tf_ema:
+            return
+        for s, _ in scored:
+            if getattr(s, "mtf", None):
+                continue
+            rank = _TF_RANK.get(s.timeframe, 0)
+            htfs = [
+                {"timeframe": tf, "ema_aligned": lbl}
+                for tf, lbl in tf_ema.items()
+                if _TF_RANK.get(tf, 0) > rank
+            ]
+            if htfs:
+                try:
+                    s.mtf = {"higher_tfs": htfs}
+                except Exception:
+                    pass
+    except Exception:
+        return
 # Concorrência do server-scan (símbolos em paralelo). Default 12 (era 6). É I/O de
 # REDE (fetch de klines via proxy), não CPU — subir a concorrência encurta o ciclo
 # sem risco de GIL (o starvation que preocupava era do SWEEP, CPU-bound, não daqui).
@@ -924,7 +976,25 @@ async def _best_tf_for_symbol(symbol: str) -> Optional[tuple]:
         scored.append((sig, score))
     if not scored:
         return None
-    return max(scored, key=lambda x: x[1])
+    # Tendência de topo por MOEDA via EMA dos TFs JÁ varridos (custo zero de rede):
+    # o caminho ao vivo não computa MTF, então derivamos o alinhamento de EMA dos
+    # TFs superiores do próprio símbolo e anexamos como mtf sintético. Serve pra
+    # (a) a trava de contra-tendência funcionar aqui e (b) a seleção preferir a
+    # direção A FAVOR da tendência quando o símbolo tem os dois lados (flipa em vez
+    # de derrubar — preserva quantidade). Fail-open ao comportamento antigo.
+    try:
+        _attach_htf_ema_trend(scored)
+        from services.regime_service import (
+            symbol_counter_trend as _sct,
+            CT_BRAKE_SELECT_PENALTY as _ctpen,
+        )
+        def _sel_key(item):
+            s, sc = item
+            return sc - (_ctpen if _sct(getattr(s, "mtf", None), s.direction) else 0.0)
+    except Exception:
+        def _sel_key(item):
+            return item[1]
+    return max(scored, key=_sel_key)
 
 
 # ── Position sizing dinâmico (Issue #4 — Fase 1.2) ───────────────────────────
@@ -1470,7 +1540,24 @@ async def get_recommendations_from_batch(
                 scored.append((sig, _compute_score(sig)))
             if not scored:
                 return None
-            return max(scored, key=lambda x: x[1])
+            # Seleção trend-aware: penaliza (só no desempate do max) candidatos
+            # CONTRA a tendência do próprio ativo (EMA dos TFs superiores). Se o
+            # símbolo tem candidato a favor E contra, o A FAVOR vence e a direção
+            # "flipa" (short→long) em vez de derrubar a moeda — preserva quantidade.
+            # O score armazenado/exibido não muda. Fail-open ao comportamento antigo.
+            try:
+                from services.regime_service import (
+                    symbol_counter_trend as _sct,
+                    CT_BRAKE_SELECT_PENALTY as _ctpen,
+                )
+                def _sel_key(item):
+                    s, sc = item
+                    pen = _ctpen if _sct(getattr(s, "mtf", None), s.direction) else 0.0
+                    return sc - pen
+            except Exception:
+                def _sel_key(item):
+                    return item[1]
+            return max(scored, key=_sel_key)
 
     best_per_symbol = await asyncio.gather(*[
         _process_symbol(sym, tfs) for sym, tfs in per_symbol.items()
@@ -1594,6 +1681,23 @@ async def get_recommendations_from_batch(
                     tier = "B"
                 elif tier == "B":
                     continue  # B downgrade vira reject
+            # Trava de CONTRA-TENDÊNCIA por MOEDA (higher-TF EMA do próprio ativo).
+            # Pega o que o freio macro (BTC) não vê: short em alt subindo sozinha
+            # (ou long em alt caindo). Foi a causa dos 7-8 stops seguidos. Rebaixa
+            # por default; bloqueia só se CT_BRAKE_BLOCK ligado.
+            import logging as _log
+            ct_reason = rs.symbol_counter_trend(getattr(sig, "mtf", None), sig.direction)
+            if ct_reason:
+                if rs.CT_BRAKE_BLOCK:
+                    _log.info(f"[ct-brake] BLOCK {sig.symbol} {sig.direction}: {ct_reason}")
+                    continue
+                if tier == "A+":
+                    tier = "A"
+                elif tier == "A":
+                    tier = "B"
+                elif tier == "B":
+                    continue  # B contra-tendência vira reject
+                _log.info(f"[ct-brake] downgrade {sig.symbol} {sig.direction}→{tier}: {ct_reason}")
         except Exception:
             pass
 
@@ -1713,7 +1817,25 @@ async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
         scored.append((sig, score))
     if not scored:
         return None
-    return max(scored, key=lambda x: x[1])
+    # Tendência de topo por MOEDA via EMA dos TFs JÁ varridos (custo zero de rede):
+    # o caminho ao vivo não computa MTF, então derivamos o alinhamento de EMA dos
+    # TFs superiores do próprio símbolo e anexamos como mtf sintético. Serve pra
+    # (a) a trava de contra-tendência funcionar aqui e (b) a seleção preferir a
+    # direção A FAVOR da tendência quando o símbolo tem os dois lados (flipa em vez
+    # de derrubar — preserva quantidade). Fail-open ao comportamento antigo.
+    try:
+        _attach_htf_ema_trend(scored)
+        from services.regime_service import (
+            symbol_counter_trend as _sct,
+            CT_BRAKE_SELECT_PENALTY as _ctpen,
+        )
+        def _sel_key(item):
+            s, sc = item
+            return sc - (_ctpen if _sct(getattr(s, "mtf", None), s.direction) else 0.0)
+    except Exception:
+        def _sel_key(item):
+            return item[1]
+    return max(scored, key=_sel_key)
 
 
 def get_source_backoff_s() -> int:
@@ -1939,6 +2061,21 @@ async def get_recommendations_via_vision(
                     tier = "B"
                 elif tier == "B":
                     continue
+            # Trava de CONTRA-TENDÊNCIA por MOEDA (higher-TF EMA do próprio ativo).
+            # Mesmo gate do caminho batch — pega short em alt subindo sozinha, que
+            # o freio macro (BTC) não vê. Rebaixa por default; bloqueia se CT_BRAKE_BLOCK.
+            ct_reason = rs.symbol_counter_trend(getattr(sig, "mtf", None), sig.direction)
+            if ct_reason:
+                if rs.CT_BRAKE_BLOCK:
+                    _log.info(f"[server-scan][ct-brake] BLOCK {sig.symbol} {sig.direction}: {ct_reason}")
+                    continue
+                if tier == "A+":
+                    tier = "A"
+                elif tier == "A":
+                    tier = "B"
+                elif tier == "B":
+                    continue
+                _log.info(f"[server-scan][ct-brake] downgrade {sig.symbol} {sig.direction}→{tier}: {ct_reason}")
         except Exception:
             pass
         _rec = _build_recommendation(sig, score, tier)

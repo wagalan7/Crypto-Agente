@@ -78,6 +78,31 @@ SHORT_BRAKE_ENABLED = os.getenv("SHORT_BRAKE_ENABLED", "1").strip().lower() not 
 SHORT_BRAKE_DAYS = int(os.getenv("SHORT_BRAKE_DAYS", "3"))       # janela da tendência
 SHORT_BRAKE_TREND_PCT = float(os.getenv("SHORT_BRAKE_TREND_PCT", "6.0"))  # alta >= isso = pernada forte
 SHORT_BRAKE_BLOCK = os.getenv("SHORT_BRAKE_BLOCK", "false").strip().lower() in ("1", "true", "yes")
+
+# ── Trava de CONTRA-TENDÊNCIA por MOEDA (higher-TF EMA) ──────────────────────
+# O SHORT_BRAKE acima só olha o BTC (pernada macro). Mas a queixa recorrente de
+# "7-8 stops seguidos, todos short" veio de shorts em ALTS que subiam SOZINHAS
+# (ex.: PUMP +16% em 3d) enquanto o BTC ficava de lado (+1.2%/3d) — o freio
+# macro NUNCA disparou. Esta trava olha a tendência da PRÓPRIA moeda usando o
+# alinhamento de EMA dos TFs superiores (já calculado no MTF, custo zero de
+# rede) e rebaixa (default) trades CONTRA a tendência do ativo:
+#   • SHORT com TFs superiores EMA-bullish  → fade de topo de pump (o padrão dos stops)
+#   • LONG  com TFs superiores EMA-bearish  → faca caindo
+# Por que EMA e não a direção-MTF: a direção-MTF usa determine_direction, a MESMA
+# lógica de mean-reversion do sinal — ela pode "concordar" com um short de topo
+# (RSI>70 etc.). O empilhamento de EMA é tendência PURA, imune ao fade. Por isso
+# é o filtro correto. Fail-open. DEFAULT ON (rebaixa; bloqueia só se CT_BRAKE_BLOCK).
+CT_BRAKE_ENABLED = os.getenv("CT_BRAKE_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off", "",
+)
+CT_BRAKE_MIN_TFS = int(os.getenv("CT_BRAKE_MIN_TFS", "1"))   # nº de TFs sup. EMA na mesma direção (e ZERO contra) p/ valer como tendência
+CT_BRAKE_BLOCK = os.getenv("CT_BRAKE_BLOCK", "false").strip().lower() in ("1", "true", "yes")
+# Penalidade de score na SELEÇÃO por-símbolo: quando um símbolo tem candidato
+# a favor E contra a tendência, subtrai isto do score do contra-tendência para
+# que o A FAVOR vença o max() — flipa a direção em vez de derrubar a moeda
+# (preserva quantidade). 0 = desliga só a penalidade de seleção.
+CT_BRAKE_SELECT_PENALTY = float(os.getenv("CT_BRAKE_SELECT_PENALTY", "12.0"))
+
 _trend_cache: Dict[str, Any] = {"ts": 0, "data": None}
 TREND_CACHE_TTL = 1800  # 30min: tendência multi-dia muda devagar
 
@@ -362,4 +387,32 @@ def should_block_recommendation(regime_status: Dict[str, Any], symbol: str, dire
     # Trava simétrica: short contra pernada forte de alta (se em modo block)
     if regime_status.get("block_shorts") and direction == "short":
         return f"regime {regime_status.get('regime')}: short bloqueado (pernada de alta)"
+    return None
+
+
+def symbol_counter_trend(mtf: Optional[Dict[str, Any]], direction: str) -> Optional[str]:
+    """Detecta trade CONTRA a tendência da PRÓPRIA moeda via EMA dos TFs superiores.
+
+    Usa o `ema_aligned` (empilhamento de EMA9/21/50) já computado no MTF de cada
+    TF superior — tendência pura, imune à lógica de mean-reversion do sinal.
+    Retorna a razão (str) se o trade é contra-tendência, None caso contrário.
+    Fail-open: sem MTF/dados ou gate OFF → None (não interfere).
+    """
+    if not CT_BRAKE_ENABLED or not mtf:
+        return None
+    try:
+        htfs = mtf.get("higher_tfs") or []
+        bull = sum(1 for h in htfs if (h or {}).get("ema_aligned") == "bullish")
+        bear = sum(1 for h in htfs if (h or {}).get("ema_aligned") == "bearish")
+        d = (direction or "").strip().lower()
+        # Só trava quando a tendência do ativo é INEQUÍVOCA: N TFs superiores na
+        # mesma direção EMA e NENHUM contra (evita rebaixar em mercado misto).
+        if d == "short" and bull >= CT_BRAKE_MIN_TFS and bear == 0:
+            return (f"contra-tendência: {bull} TF(s) superior(es) EMA-bullish "
+                    f"(não short em alta do próprio ativo)")
+        if d == "long" and bear >= CT_BRAKE_MIN_TFS and bull == 0:
+            return (f"contra-tendência: {bear} TF(s) superior(es) EMA-bearish "
+                    f"(não long em queda do próprio ativo)")
+    except Exception:
+        return None
     return None
