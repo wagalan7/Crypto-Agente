@@ -52,14 +52,42 @@ def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         kwargs: dict = {
-            "timeout": 20.0,
+            # pool=5s: se o pool de conexões travar (conexões vazadas por
+            # cancelamento de scan), a espera falha rápido em PoolTimeout e o
+            # _proxied_get recicla o cliente — em vez de esperar 20s por slot.
+            "timeout": httpx.Timeout(20.0, pool=5.0),
             "headers": {"User-Agent": "CryptoAgent/1.0"},
-            "limits": httpx.Limits(max_keepalive_connections=10, max_connections=30),
+            "limits": httpx.Limits(max_keepalive_connections=20, max_connections=50),
         }
         if PROXY_ENABLED:
             kwargs["proxy"] = PROXY_URL  # forward proxy (mesmo padrão do signed_service)
         _client = httpx.AsyncClient(**kwargs)
     return _client
+
+
+async def _recycle_client(bad: Optional[httpx.AsyncClient]) -> None:
+    """Recria o cliente compartilhado quando o pool de conexões trava
+    (PoolTimeout). Conexões podem vazar do pool quando um ciclo de scan é
+    cancelado no meio de um request (wall-clock budget / gather cancel); com o
+    tempo todas as 50 vazam e TODO fetch passa a dar PoolTimeout — travando o
+    scan indefinidamente (não se recupera sozinho porque o cliente não fica
+    `is_closed`). Aqui reciclamos: fechamos o cliente ruim e o próximo
+    `_get_client()` cria um pool limpo.
+
+    Guard de corrida (compare-and-swap): só recicla se o cliente atual ainda é o
+    `bad` — se várias coroutines estouraram o pool juntas, só a primeira recria e
+    as demais reusam o cliente novo.
+    """
+    global _client
+    if _client is not bad:
+        return  # outra coroutine já reciclou
+    _client = None  # próxima chamada cria um pool novo
+    if bad is not None:
+        try:
+            await bad.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    log.warning("[binance-futures] pool travado (PoolTimeout) — cliente HTTP reciclado")
 
 
 async def _proxied_get(url: str, params: Optional[dict] = None) -> httpx.Response:
@@ -77,7 +105,14 @@ async def _proxied_get(url: str, params: Optional[dict] = None) -> httpx.Respons
     from services import binance_signed_service as _signed
     if not await _signed.await_rate_gate():
         raise RuntimeError("rate-limit ban ativo — pulando chamada pública (anti-escalada)")
-    r = await _get_client().get(url, params=params)
+    try:
+        r = await _get_client().get(url, params=params)
+    except httpx.PoolTimeout:
+        # Pool esgotado/travado: recicla o cliente compartilhado e tenta 1x mais
+        # com pool limpo. Sem isso, o pool wedgeado deixava o scan gerando ZERO
+        # recomendações por dias (todo OHLCV/ticker do futures-proxy expirava).
+        await _recycle_client(_client)
+        r = await _get_client().get(url, params=params)
     try:
         uw = r.headers.get("x-mbx-used-weight-1m") or r.headers.get("X-MBX-USED-WEIGHT-1M")
         _signed.record_external_weight(uw)
