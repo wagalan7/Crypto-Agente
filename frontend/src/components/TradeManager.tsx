@@ -334,6 +334,9 @@ export default function TradeManager({ onClose, onSelectSymbol, initialSignal }:
             const current = prices[t.symbol]
             const pnl = pnlPct(t.side, t.entry_price, current)
             const postTp1 = t.phase === 'post_tp1'
+            const criticalUnprotected =
+              (t.notes ?? '').includes('CRITICAL_EXECUTION_INCIDENT') &&
+              t.sl_current_price == null
             return (
               <div key={t.id} className="border-b border-slate-800/60 p-3">
                 <div className="flex items-start justify-between">
@@ -407,7 +410,9 @@ export default function TradeManager({ onClose, onSelectSymbol, initialSignal }:
                 </div>
 
                 <div className="mt-1.5 flex items-center gap-2 text-xs flex-wrap">
-                  <span className="text-red-400">🛑 {fmtPrice(postTp1 ? (t.sl_current_price ?? t.planned_stop) : t.planned_stop)}</span>
+                  {criticalUnprotected
+                    ? <span className="text-red-300 font-bold animate-pulse">🚨 SEM SL CONFIRMADO</span>
+                    : <span className="text-red-400">🛑 {fmtPrice(postTp1 ? (t.sl_current_price ?? t.planned_stop) : t.planned_stop)}</span>}
                   <span className="text-slate-600">|</span>
                   {t.planned_tp1 != null && <span className="text-emerald-400">🎯 {fmtPrice(t.planned_tp1)}</span>}
                   {t.planned_tp2 != null && <span className="text-green-500">🎯 {fmtPrice(t.planned_tp2)}</span>}

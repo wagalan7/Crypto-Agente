@@ -61,6 +61,77 @@ VIRTUAL_EQUITY_USD = float(os.getenv("EXCHANGE_SHADOW_EQUITY_USD", "5000"))
 _LIVE_CONFIRM_PHRASE = "ENTENDO_RISCO_DINHEIRO_REAL"
 LIVE_TRADING_CONFIRM = os.getenv("LIVE_TRADING_CONFIRM", "").strip()
 
+# Latch fail-closed em memória. A pausa principal é persistida no RiskState,
+# mas uma indisponibilidade do DB não pode liberar a próxima ordem do mesmo
+# processo. A retomada manual limpa ambos (ver risk_service.set_manual_pause).
+_EXECUTION_QUARANTINE_REASON: Optional[str] = None
+
+
+def _arm_execution_quarantine(reason: str) -> None:
+    global _EXECUTION_QUARANTINE_REASON
+    if not _EXECUTION_QUARANTINE_REASON:
+        _EXECUTION_QUARANTINE_REASON = reason
+    log.critical(f"[execution-quarantine] ATIVA: {_EXECUTION_QUARANTINE_REASON}")
+
+
+def clear_execution_quarantine() -> None:
+    global _EXECUTION_QUARANTINE_REASON
+    previous = _EXECUTION_QUARANTINE_REASON
+    _EXECUTION_QUARANTINE_REASON = None
+    if previous:
+        log.warning(f"[execution-quarantine] limpa por retomada manual: {previous}")
+
+
+def execution_quarantine_reason() -> Optional[str]:
+    return _EXECUTION_QUARANTINE_REASON
+
+
+async def _persist_execution_quarantine(reason: str) -> None:
+    """Arma latch local primeiro e persiste a pausa quando o DB responder."""
+    _arm_execution_quarantine(reason)
+    try:
+        from services import risk_service
+        await risk_service.set_manual_pause(True, f"CRÍTICO: {reason}")
+    except Exception as exc:
+        log.critical(f"[execution-quarantine] falha persistindo RiskState: {exc}")
+
+
+async def _open_trade_fail_closed(*, symbol: str, source: str, **kwargs):
+    """Persiste o trade; posição real sem linha no DB bloqueia novas entradas."""
+    from services import real_trade_service
+    try:
+        trade = await real_trade_service.open_trade(
+            symbol=symbol,
+            source=source,
+            **kwargs,
+        )
+    except Exception as exc:
+        trade = None
+        failure = f"{type(exc).__name__}: {exc}"
+    else:
+        failure = "open_trade retornou None"
+
+    if trade is not None:
+        return trade
+    if source == "auto":
+        reason = f"{symbol} executado na exchange, mas persistência falhou: {failure}"
+        await _persist_execution_quarantine(reason)
+        try:
+            from services import push_service
+            await push_service.notify_alert(
+                title=f"🚨 {symbol.split('/')[0]}: posição sem rastreamento no app",
+                body=(
+                    "A ordem foi executada/protegida, mas o registro no banco falhou. "
+                    "Novas entradas foram pausadas; reconcilie a posição manualmente."
+                ),
+                tag=f"trade-persist-failed-{symbol}",
+            )
+        except Exception:
+            pass
+    else:
+        log.warning(f"[shadow] persistência paper falhou {symbol}: {failure}")
+    return None
+
 # ── Canary / ramp de tamanho (go-live #2) ───────────────────────────────────
 # Multiplicador global aplicado ao qty SÓ em modo live. Permite começar a
 # operar dinheiro real com fração do tamanho (ex: 0.1 = 10%) e subir gradual
@@ -202,6 +273,53 @@ def _live_money_guard() -> tuple[bool, str]:
     )
 
 
+def _live_execution_contract_guard() -> tuple[bool, str]:
+    """P02 libera LIVE apenas no cliente com contrato transacional validado."""
+    configured = os.getenv("EXCHANGE", "binance").strip().lower()
+    if configured not in {"binance", "bybit"}:
+        return False, (
+            f"EXCHANGE={configured or 'vazio'} é inválida; fallback silencioso para "
+            "outra conta não é autorizado"
+        )
+    try:
+        from services import exchange_service
+        active = str(getattr(exchange_service, "ACTIVE_EXCHANGE", "") or "").lower()
+    except Exception as exc:
+        return False, f"exchange ativa não pôde ser validada: {exc}"
+    if active != "binance":
+        return False, (
+            f"LIVE bloqueado para exchange={active or 'desconhecida'}: "
+            "entry+SL+rollback transacional ainda não implementado (aguarda P03)"
+        )
+    if configured != active:
+        return False, (
+            f"configuração EXCHANGE={configured} diverge do dispatcher ativo={active}"
+        )
+    return True, "contrato transacional Binance disponível"
+
+
+def _active_exchange_name() -> str:
+    """Nome canônico do dispatcher; nunca persiste a ENV crua com typo."""
+    try:
+        from services import exchange_service
+        return str(getattr(exchange_service, "ACTIVE_EXCHANGE", "") or "").lower()
+    except Exception:
+        return os.getenv("EXCHANGE", "binance").strip().lower()
+
+
+def _trade_active_exchange_guard(trade) -> tuple[bool, str]:
+    """Impede que um registro antigo seja gerido na conta/exchange errada."""
+    try:
+        from services import exchange_service
+        active = str(getattr(exchange_service, "ACTIVE_EXCHANGE", "") or "").lower()
+    except Exception as exc:
+        return False, f"exchange ativa não pôde ser validada: {exc}"
+    recorded = str(getattr(trade, "exchange", None) or active).lower()
+    if recorded != active:
+        return False, f"trade pertence a {recorded}, processo ativo em {active}"
+    return True, f"trade/exchange={active}"
+
+
 def log_boot_safety_banner() -> None:
     """
     Banner gritante no boot resumindo o estado de execução (shadow vs live,
@@ -317,10 +435,10 @@ EDGE_MULT_MAX = float(os.getenv("EDGE_MULT_MAX", "1.30"))
 # não preencher no tempo (mercado fugiu) → cai pra MARKET (fail-safe: prefere
 # entrar a ficar de fora). A proteção (SL/TP) só é colocada APÓS confirmar o fill
 # (helper place_maker_entry_then_protect, desacopla entrada de proteção).
-# DEFAULT ON (revisado): entra no preço planejado = geometria do shadow (stop-rate
-# ~24% vs 51% do market-chase real). Muda só a entrada; o guard cardinal
-# "sem stop = sem trade" e os TPs seguem idênticos. Reversível por env sem deploy.
-MAKER_ENTRY_ENABLED = os.getenv("MAKER_ENTRY_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# DEFAULT OFF no P02: a entrada maker só volta a ser default após a reconciliação
+# persistente de ordem pendente/late-fill do P03. Pode ser ligada explicitamente
+# em ambiente controlado, mas qualquer cancelamento UNKNOWN arma quarentena.
+MAKER_ENTRY_ENABLED = os.getenv("MAKER_ENTRY_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 # Fallback do maker: se a LIMIT post-only não preencher no timeout, cair a
 # MERCADO (true) ou DESISTIR da entrada (false). Chasing a mercado após o preço
 # fugir do limit é justamente o que gera "entrada atrasada" (TP1 curto, SL caro);
@@ -350,7 +468,9 @@ FLIP_COOLDOWN_HOURS = float(os.getenv("FLIP_COOLDOWN_HOURS", "4"))     # min hor
 # ── TF upgrade (Fase 3) ────────────────────────────────────────────────────
 # Mesma direção, TF maior: ajusta SL/TPs do trade aberto se nova rec é de
 # qualidade superior. Pré-TP1 atualiza tudo; pós-TP1 só TP2 (SL fica no BE).
-TF_UPGRADE_ENABLED = os.getenv("TF_UPGRADE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Default OFF enquanto a troca de bracket não tiver persistência transacional
+# completa entre DB e exchange. Pode ser ligada explicitamente para teste.
+TF_UPGRADE_ENABLED = os.getenv("TF_UPGRADE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 TF_UPGRADE_MIN_SCORE_DELTA = float(os.getenv("TF_UPGRADE_MIN_SCORE_DELTA", "10"))
 TF_UPGRADE_MIN_TIER_UPGRADE = int(os.getenv("TF_UPGRADE_MIN_TIER_UPGRADE", "1"))
 TF_UPGRADE_BUFFER_PCT = float(os.getenv("TF_UPGRADE_BUFFER_PCT", "0.5"))   # SL novo precisa estar >= 0.5% do preço
@@ -2290,10 +2410,20 @@ async def reconcile_open_positions() -> dict:
         report["db_open"] = len(db_rows)
 
         # Exchange: posições vivas
-        pos_res = await exchange_service.get_positions()
-        if not pos_res.get("ok"):
+        try:
+            pos_res = await exchange_service.get_positions(force=True)
+        except TypeError:
+            pos_res = await exchange_service.get_positions()
+        if (
+            not pos_res.get("ok")
+            or pos_res.get("stale")
+            or pos_res.get("rate_limited")
+        ):
             report["ok"] = False
-            report["error"] = f"get_positions falhou: {pos_res.get('error') or pos_res.get('msg')}"
+            report["error"] = (
+                "get_positions não-fresco: "
+                f"{pos_res.get('error') or pos_res.get('msg') or 'stale/rate-limited'}"
+            )
             log.warning(f"[reconcile] {report['error']}")
             return report
         positions = pos_res.get("positions") or []
@@ -2344,16 +2474,24 @@ async def _find_opposite_open_trade(symbol: str, new_direction: str):
     if not DB_ENABLED:
         return None
     try:
-        from sqlalchemy import select
+        from sqlalchemy import or_, select
         from db import get_session
         from models.real_trade import RealTrade
+        from services import exchange_service
         opposite_side = "long" if new_direction == "short" else "short"
+        active_exchange = str(
+            getattr(exchange_service, "ACTIVE_EXCHANGE", "") or ""
+        ).lower()
         async with get_session() as session:
             stmt = select(RealTrade).where(
                 RealTrade.symbol == symbol,
                 RealTrade.status == "open",
                 RealTrade.source == "auto",
                 RealTrade.side == opposite_side,
+                or_(
+                    RealTrade.exchange == active_exchange,
+                    RealTrade.exchange.is_(None),
+                ),
             )
             return (await session.execute(stmt)).scalar_one_or_none()
     except Exception as e:
@@ -2396,6 +2534,151 @@ async def _get_mark_price(symbol: str) -> float:
     except Exception as e:
         log.warning(f"[flip] mark_price falhou {symbol}: {e}")
     return 0.0
+
+
+async def _fresh_exchange_position_size(symbol: str) -> tuple[Optional[float], str]:
+    """Leitura fresh da exposição do símbolo; None nunca equivale a flat."""
+    try:
+        from services import exchange_service
+        try:
+            res = await exchange_service.get_positions(symbol=symbol, force=True)
+        except TypeError:
+            res = await exchange_service.get_positions(symbol=symbol)
+    except Exception as exc:
+        return None, f"get_positions exception: {exc}"
+    if not res.get("ok") or res.get("stale") or res.get("rate_limited"):
+        return None, res.get("msg") or res.get("error") or "posição stale/UNKNOWN"
+    try:
+        size = sum(abs(float(p.get("size") or 0.0)) for p in (res.get("positions") or []))
+    except (TypeError, ValueError) as exc:
+        return None, f"posição inválida: {exc}"
+    return size, "posição fresh"
+
+
+async def _verified_legacy_stop_rollback(
+    symbol: str,
+    entry_side: str,
+    qty: float,
+    client_order_id: str,
+) -> dict:
+    """Fallback multi-exchange: uma reduceOnly e confirmação fresh-flat.
+
+    Usado quando o cliente não implementa o contrato transacional da Binance.
+    Não repete cegamente: aceite/timeout sem uma posição fresh não autoriza uma
+    segunda ordem concorrente.
+    """
+    close_side = "Sell" if entry_side.lower() == "buy" else "Buy"
+    try:
+        requested = max(0.0, float(qty))
+    except (TypeError, ValueError):
+        requested = 0.0
+    if requested <= 0:
+        return {
+            "ok": False, "confirmed_flat": False, "attempts": 0,
+            "requested_qty": requested, "remaining_qty": requested,
+            "error": "qty inválida",
+        }
+    try:
+        from services import exchange_service
+        close_res = await exchange_service.place_order(
+            symbol=symbol,
+            side=close_side,
+            qty=requested,
+            order_type="Market",
+            reduce_only=True,
+            client_order_id=client_order_id[:36],
+        )
+    except Exception as exc:
+        close_res = {"ok": False, "error": str(exc)}
+
+    live_size, live_msg = await _fresh_exchange_position_size(symbol)
+    if live_size is not None and live_size <= 1e-12:
+        return {
+            "ok": True, "confirmed_flat": True, "attempts": 1,
+            "requested_qty": requested, "remaining_qty": 0.0,
+            "close_result": close_res, "confirmation": live_msg,
+        }
+    return {
+        "ok": False, "confirmed_flat": False, "attempts": 1,
+        "requested_qty": requested,
+        "remaining_qty": min(requested, live_size) if live_size is not None else requested,
+        "close_result": close_res,
+        "error": (
+            f"posição ainda aberta qty={live_size:g}"
+            if live_size is not None else live_msg
+        ),
+    }
+
+
+def _cancel_result_is_terminal(result: dict) -> bool:
+    """Aceita sucesso ou confirmação explícita de que a ordem já não existe."""
+    if result.get("ok"):
+        return True
+    try:
+        code = int(result.get("code"))
+    except (TypeError, ValueError):
+        code = None
+    msg = str(result.get("msg") or result.get("error") or "").lower()
+    return code in {-2011, -2013} or any(
+        token in msg for token in ("unknown order", "not found", "does not exist")
+    )
+
+
+async def _cleanup_trade_conditionals_after_flat(trade, context: str) -> bool:
+    """Remove o bracket apenas após FLAT e bloqueia reentrada se ficar incerto."""
+    from services import exchange_service
+
+    known = {
+        field: str(getattr(trade, field, None) or "")
+        for field in ("sl_order_id", "tp1_order_id", "tp2_order_id")
+    }
+    failures: list[str] = []
+
+    # Na Binance, o helper também encontra timeout-com-sucesso sem algoId pelo
+    # clientAlgoId exato e confirma a ausência em leituras subsequentes.
+    client_prefix = str(getattr(trade, "client_order_id", None) or "")
+    if getattr(exchange_service, "ACTIVE_EXCHANGE", "") == "binance" and client_prefix:
+        try:
+            from services import binance_signed_service
+            cleanup = await binance_signed_service._cleanup_entry_conditionals(
+                trade.symbol,
+                client_prefix,
+                {
+                    "sl_order_id": known["sl_order_id"] or None,
+                    "tp1_order_id": known["tp1_order_id"] or None,
+                    "tp2_order_id": known["tp2_order_id"] or None,
+                },
+            )
+        except Exception as exc:
+            cleanup = {"confirmed_absent": False, "error": str(exc)}
+        if cleanup.get("confirmed_absent"):
+            return True
+        failures.append(str(cleanup.get("errors") or cleanup.get("error") or cleanup))
+    else:
+        for field, algo_id in known.items():
+            if not algo_id:
+                continue
+            try:
+                result = await exchange_service.cancel_algo_order(algo_id)
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+            if not _cancel_result_is_terminal(result):
+                failures.append(
+                    f"{field}={algo_id}: "
+                    f"{result.get('msg') or result.get('error') or 'incerto'}"
+                )
+
+    if not failures:
+        return True
+
+    reason = f"{context} FLAT com conditionals UNKNOWN: {'; '.join(failures)}"
+    _arm_execution_quarantine(reason)
+    try:
+        from services import risk_service
+        await risk_service.set_manual_pause(True, f"CRÍTICO: {reason}")
+    except Exception as exc:
+        log.critical(f"[{context}] falha ao persistir pausa por cleanup incerto: {exc}")
+    return False
 
 
 async def _get_current_tier_score(rec_id: int) -> tuple[str, float]:
@@ -2467,22 +2750,21 @@ async def _evaluate_flip_gate(current_trade, new_rec: dict) -> tuple[bool, str]:
 
 async def _execute_flip(current_trade) -> bool:
     """
-    Fecha trade atual via market (reduceOnly), cancela ordens condicionais,
+    Fecha trade atual via market (reduceOnly), confirma FLAT, cancela conditionals,
     marca como closed_flip no DB. Retorna True se conseguiu.
     """
     from services import exchange_service, real_trade_service
     symbol = current_trade.symbol
+    trade_ok, trade_why = _trade_active_exchange_guard(current_trade)
+    if not trade_ok:
+        reason = f"flip bloqueado {symbol}: {trade_why}"
+        _arm_execution_quarantine(reason)
+        log.critical(f"[flip] {reason}")
+        return False
     try:
-        # 1. Cancela algo orders pendentes (SL/TP1/TP2)
-        for oid_field in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
-            oid = getattr(current_trade, oid_field, None)
-            if oid:
-                try:
-                    await exchange_service.cancel_algo_order(str(oid))
-                except Exception as e:
-                    log.warning(f"[flip] cancel {oid_field}={oid} falhou: {e}")
-
-        # 2. Market close (reduceOnly)
+        # 1. Market close com o bracket ainda vivo. A combinação é segura
+        # porque todos os caminhos são redutores; cancelar o SL antes abriria
+        # uma janela nua se o MARKET falhasse.
         close_side = "Sell" if current_trade.side == "long" else "Buy"
         close_res = await exchange_service.place_order(
             symbol=symbol,
@@ -2492,8 +2774,18 @@ async def _execute_flip(current_trade) -> bool:
             reduce_only=True,
             client_order_id=f"cw-flip-{current_trade.id}",
         )
-        if not close_res.get("ok"):
-            log.error(f"[flip] market close falhou trade#{current_trade.id}: {close_res.get('msg') or close_res.get('error')}")
+        live_size, live_msg = await _fresh_exchange_position_size(symbol)
+        if live_size is None or live_size > 1e-12:
+            log.error(
+                f"[flip] close não confirmado trade#{current_trade.id}: "
+                f"{close_res.get('msg') or close_res.get('error') or live_msg}; "
+                f"qty={live_size} — mantém bracket/DB"
+            )
+            return False
+
+        # 2. Só após FLAT confirmado remove o bracket. Cleanup incerto bloqueia
+        # a nova entrada oposta para não expô-la a uma conditional órfã.
+        if not await _cleanup_trade_conditionals_after_flat(current_trade, "flip"):
             return False
 
         # 3. Exit price aproximado via avgPrice
@@ -2524,10 +2816,14 @@ async def _find_same_direction_open_trade(symbol: str, new_direction: str):
     if not DB_ENABLED:
         return None
     try:
-        from sqlalchemy import select, desc
+        from sqlalchemy import desc, or_, select
         from db import get_session
         from models.real_trade import RealTrade
+        from services import exchange_service
         same_side = "long" if new_direction == "long" else "short"
+        active_exchange = str(
+            getattr(exchange_service, "ACTIVE_EXCHANGE", "") or ""
+        ).lower()
         async with get_session() as session:
             stmt = (
                 select(RealTrade)
@@ -2535,6 +2831,10 @@ async def _find_same_direction_open_trade(symbol: str, new_direction: str):
                 .where(RealTrade.status == "open")
                 .where(RealTrade.source == "auto")
                 .where(RealTrade.side == same_side)
+                .where(or_(
+                    RealTrade.exchange == active_exchange,
+                    RealTrade.exchange.is_(None),
+                ))
                 .order_by(desc(RealTrade.opened_at))
                 .limit(1)
             )
@@ -2712,6 +3012,20 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
       - post_tp1: cancela só TP2 → recoloca TP2 novo (SL fica no BE intocado)
     Atualiza DB: planned_*, qty, *_order_id, recommendation_id, notes.
     """
+    contract_ok, contract_why = _live_execution_contract_guard()
+    if not contract_ok:
+        log.critical(
+            f"[tf-upgrade] bloqueado trade#{getattr(current_trade, 'id', '?')}: "
+            f"{contract_why}"
+        )
+        return False
+    trade_ok, trade_why = _trade_active_exchange_guard(current_trade)
+    if not trade_ok:
+        reason = f"tf-upgrade bloqueado: {trade_why}"
+        _arm_execution_quarantine(reason)
+        log.critical(f"[tf-upgrade] {reason}")
+        return False
+
     from services import exchange_service, binance_signed_service
     from sqlalchemy import select, desc
     from datetime import datetime, timezone
@@ -2727,6 +3041,7 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
     new_qty = ctx.get("new_qty")
     tf_old = ctx.get("tf_old") or ""
     tf_new = ctx.get("tf_new") or ""
+    bracket_mutated = False
 
     try:
         # 1. Resolve recommendation_id da nova rec (último snapshot do símbolo/dir/tf)
@@ -2746,22 +3061,8 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
             except Exception as e:
                 log.warning(f"[tf-upgrade] resolve new_rec_id falhou {symbol}: {e}")
 
-        # 2. Cancela ordens condicionais conforme a fase
-        cancel_fields = ("sl_order_id", "tp1_order_id", "tp2_order_id") if phase == "pre_tp1" else ("tp2_order_id",)
-        for oid_field in cancel_fields:
-            oid = getattr(current_trade, oid_field, None)
-            if oid:
-                try:
-                    res = await exchange_service.cancel_algo_order(str(oid))
-                    if not res.get("ok"):
-                        log.warning(
-                            f"[tf-upgrade] cancel {oid_field}={oid} {symbol}: "
-                            f"{res.get('msg') or res.get('error')}"
-                        )
-                except Exception as e:
-                    log.warning(f"[tf-upgrade] cancel {oid_field}={oid} falhou: {e}")
-
-        # 3. Recoloca ordens
+        # 2. Cria a proteção nova ANTES de retirar a antiga. Conditionals
+        # reduceOnly podem coexistir por alguns milissegundos; ficar sem SL não.
         entry_side = "Buy" if current_trade.side == "long" else "Sell"
         qty_for_brackets = float(new_qty if (phase == "pre_tp1" and new_qty and new_qty > 0) else current_trade.qty)
 
@@ -2777,12 +3078,13 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
                 tp2=new_tp2,
                 client_order_id_prefix=f"cw-tfu-{current_trade.id}",
             )
-            if not prot.get("sl_ok"):
+            if not prot.get("sl_ok") or not prot.get("sl_order_id"):
                 log.error(
                     f"[tf-upgrade] CRITICAL: novo SL falhou {symbol} #{current_trade.id}: "
-                    f"{prot.get('sl_msg')} — trade pode estar SEM proteção"
+                    f"{prot.get('sl_msg')} — bracket antigo foi preservado"
                 )
                 return False
+            bracket_mutated = True
             new_sl_oid = prot.get("sl_order_id")
             new_tp1_oid = prot.get("tp1_order_id")
             new_tp2_oid = prot.get("tp2_order_id")
@@ -2807,7 +3109,45 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
                     f"{prot.get('tp2_msg')}"
                 )
                 return False
+            bracket_mutated = True
             new_tp2_oid = prot.get("tp2_order_id")
+
+        # 3. Só agora remove o bracket antigo. Se a criação acima falhar, os
+        # IDs antigos permanecem vivos e o trade nunca atravessa janela nua.
+        cancel_fields = (
+            ("sl_order_id", "tp1_order_id", "tp2_order_id")
+            if phase == "pre_tp1" else ("tp2_order_id",)
+        )
+        cancel_failures: list[str] = []
+        for oid_field in cancel_fields:
+            oid = getattr(current_trade, oid_field, None)
+            if oid:
+                try:
+                    res = await exchange_service.cancel_algo_order(str(oid))
+                    if not _cancel_result_is_terminal(res):
+                        cancel_failures.append(
+                            f"{oid_field}={oid}: {res.get('msg') or res.get('error') or 'incerto'}"
+                        )
+                        log.warning(
+                            f"[tf-upgrade] cancel antigo {oid_field}={oid} {symbol}: "
+                            f"{res.get('msg') or res.get('error')}"
+                        )
+                except Exception as e:
+                    cancel_failures.append(f"{oid_field}={oid}: {e}")
+                    log.warning(f"[tf-upgrade] cancel antigo {oid_field}={oid} falhou: {e}")
+
+        if cancel_failures:
+            reason = (
+                f"tf-upgrade {symbol} criou bracket novo, mas cleanup antigo ficou UNKNOWN: "
+                f"{'; '.join(cancel_failures)}"
+            )
+            _arm_execution_quarantine(reason)
+            try:
+                from services import risk_service
+                await risk_service.set_manual_pause(True, f"CRÍTICO: {reason}")
+            except Exception as pause_exc:
+                log.critical(f"[tf-upgrade] falha ao persistir pausa: {pause_exc}")
+            return False
 
         # 4. Atualiza DB
         if DB_ENABLED:
@@ -2816,7 +3156,9 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
                     select(RealTrade).where(RealTrade.id == current_trade.id)
                 )).scalar_one_or_none()
                 if fresh is None:
-                    return False
+                    raise RuntimeError(
+                        f"trade#{current_trade.id} desapareceu antes de persistir bracket novo"
+                    )
                 if phase == "pre_tp1":
                     if new_stop:
                         fresh.planned_stop = new_stop
@@ -2853,6 +3195,16 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
         return True
     except Exception as e:
         log.error(f"[tf-upgrade] erro upgrade trade#{current_trade.id} {symbol}: {e}", exc_info=True)
+        if bracket_mutated:
+            reason = (
+                f"tf-upgrade {symbol} alterou conditionals, mas não concluiu persistência: {e}"
+            )
+            _arm_execution_quarantine(reason)
+            try:
+                from services import risk_service
+                await risk_service.set_manual_pause(True, f"CRÍTICO: {reason}")
+            except Exception as pause_exc:
+                log.critical(f"[tf-upgrade] falha ao persistir pausa: {pause_exc}")
         return False
 
 
@@ -2878,16 +3230,46 @@ async def _maybe_pyramid(same_dir, rec: dict) -> bool:
     Retorna True se reforçou (o caller registra e segue sem abrir duplicata);
     False se não reforçou.
     """
-    if not PYRAMIDING_ENABLED:
+    if not PYRAMIDING_ENABLED or SHADOW_ENABLED:
+        return False
+    if _EXECUTION_QUARANTINE_REASON:
+        log.critical(
+            f"[pyramid] bloqueado por execution quarantine: {_EXECUTION_QUARANTINE_REASON}"
+        )
         return False
     from services import exchange_service
-    from sqlalchemy import select
+    from sqlalchemy import or_, select
     from datetime import datetime, timezone
     from db import get_session
     from models.real_trade import RealTrade
 
     symbol = same_dir.symbol
     try:
+        # O latch crítico bloqueia qualquer aumento de exposição, inclusive
+        # reforços que acontecem antes do gate da entrada normal no fluxo.
+        from services import risk_service
+        if await risk_service.is_paused():
+            log.warning(f"[pyramid] {symbol} bloqueado: RiskState pausado")
+            return False
+        armed, guard_why = _live_money_guard()
+        if not armed:
+            log.error(f"[pyramid] {symbol} bloqueado: {guard_why}")
+            return False
+        contract_ok, contract_why = _live_execution_contract_guard()
+        if not contract_ok:
+            log.error(f"[pyramid] {symbol} bloqueado: {contract_why}")
+            return False
+        trade_ok, trade_why = _trade_active_exchange_guard(same_dir)
+        if not trade_ok:
+            _arm_execution_quarantine(f"pyramid {symbol}: {trade_why}")
+            log.critical(f"[pyramid] bloqueado: {trade_why}")
+            return False
+        from services import kill_switch_service
+        ks = await kill_switch_service.check_can_trade()
+        if not ks.get("allowed"):
+            log.warning(f"[pyramid] {symbol} bloqueado: {ks.get('reason')}")
+            return False
+
         # 1. Só reforça winner já protegido no BE (pós-TP1)
         if (getattr(same_dir, "phase", None) or "pre_tp1") != "post_tp1":
             return False
@@ -3006,18 +3388,47 @@ async def _maybe_regime_hedge(regime: dict) -> bool:
     """
     if not REGIME_HEDGE_ENABLED or not DB_ENABLED:
         return False
+    if _EXECUTION_QUARANTINE_REASON:
+        log.critical(
+            f"[regime-hedge] bloqueado por execution quarantine: "
+            f"{_EXECUTION_QUARANTINE_REASON}"
+        )
+        return False
     from services import exchange_service
-    from sqlalchemy import select
+    from sqlalchemy import or_, select
     from datetime import datetime, timezone
     from db import get_session
     from models.real_trade import RealTrade
 
     try:
+        # Hedge também é uma nova ordem. Uma quarentena por execução UNKNOWN
+        # deve bloquear todas as ampliações até reconciliação humana.
+        from services import risk_service
+        if await risk_service.is_paused():
+            log.warning("[regime-hedge] bloqueado: RiskState pausado")
+            return False
+        armed, guard_why = _live_money_guard()
+        if not armed:
+            log.error(f"[regime-hedge] bloqueado: {guard_why}")
+            return False
+        contract_ok, contract_why = _live_execution_contract_guard()
+        if not contract_ok:
+            log.error(f"[regime-hedge] bloqueado: {contract_why}")
+            return False
+        from services import kill_switch_service
+        ks = await kill_switch_service.check_can_trade()
+        if not ks.get("allowed"):
+            log.warning(f"[regime-hedge] bloqueado: {ks.get('reason')}")
+            return False
+
         state = str((regime or {}).get("regime") or "").upper()
         if state not in ("RISK_OFF", "ALT_DANGER", "ALT_RISK_OFF"):
             return False
 
         hedge_base = _symbol_base(REGIME_HEDGE_SYMBOL)  # normalmente "BTC"
+        active_exchange = str(
+            getattr(exchange_service, "ACTIVE_EXCHANGE", "") or ""
+        ).lower()
 
         async with get_session() as session:
             # 1. Já existe hedge aberto? (um por vez)
@@ -3025,6 +3436,10 @@ async def _maybe_regime_hedge(regime: dict) -> bool:
                 select(RealTrade.id)
                 .where(RealTrade.status == "open")
                 .where(RealTrade.hedge_for.isnot(None))
+                .where(or_(
+                    RealTrade.exchange == active_exchange,
+                    RealTrade.exchange.is_(None),
+                ))
                 .limit(1)
             )).scalar_one_or_none()
             if existing is not None:
@@ -3041,6 +3456,10 @@ async def _maybe_regime_hedge(regime: dict) -> bool:
                 .where(RealTrade.source == "auto")
                 .where(RealTrade.side == "long")
                 .where(RealTrade.hedge_for.is_(None))
+                .where(or_(
+                    RealTrade.exchange == active_exchange,
+                    RealTrade.exchange.is_(None),
+                ))
             )).all()
 
         agg_notional = 0.0
@@ -3088,27 +3507,114 @@ async def _maybe_regime_hedge(regime: dict) -> bool:
             leverage=1,
             client_order_id=client_order_id,
         )
-        if not order_res.get("ok"):
+        _hedge_incident = False
+        _hedge_qty_state = None
+        _hedge_safety_state = order_res.get("safety_state")
+        _hedge_needs_manual = bool(
+            order_res.get("manual_intervention_required")
+            or order_res.get("quarantine_required")
+        )
+        _hedge_emergency = bool(order_res.get("emergency_close_attempted"))
+        if _hedge_emergency or _hedge_needs_manual:
+            _hedge_closed = bool(
+                order_res.get("emergency_close_ok") is True
+                and order_res.get("position_open") is False
+            )
+            if _hedge_needs_manual or not _hedge_closed:
+                _arm_execution_quarantine(
+                    f"hedge {REGIME_HEDGE_SYMBOL} safety={_hedge_safety_state}"
+                )
+                try:
+                    from services import risk_service
+                    await risk_service.set_manual_pause(
+                        True,
+                        f"CRÍTICO: hedge {REGIME_HEDGE_SYMBOL} safety={_hedge_safety_state}",
+                    )
+                except Exception as pause_exc:
+                    log.critical(
+                        f"[regime-hedge] falha ao persistir pausa crítica: {pause_exc}"
+                    )
+            if _hedge_closed:
+                log.critical(
+                    f"[regime-hedge] entrada revertida; state={_hedge_safety_state} "
+                    f"manual={_hedge_needs_manual}"
+                )
+                return False
+            try:
+                _hedge_executed = float(
+                    order_res.get("executed_qty")
+                    or (order_res.get("result") or {}).get("executedQty")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                _hedge_executed = 0.0
+            if order_res.get("position_open") is not False and _hedge_executed > 0:
+                _hedge_incident = True
+                qty = _hedge_executed
+                _close_info = order_res.get("emergency_close") or {}
+                try:
+                    _remaining = float(_close_info.get("remaining_qty"))
+                except (TypeError, ValueError):
+                    _remaining = 0.0
+                if _remaining > 0:
+                    qty = _remaining
+                    _hedge_qty_state = "CONFIRMED_REMAINING"
+                else:
+                    _hedge_qty_state = "UNKNOWN_AFTER_CLOSE_ATTEMPT"
+            else:
+                log.critical(
+                    f"[regime-hedge] estado crítico sem qty auditável: {order_res}"
+                )
+                return False
+
+        if not order_res.get("ok") and not _hedge_incident:
             log.error(
                 f"[regime-hedge] short {REGIME_HEDGE_SYMBOL} falhou: "
                 f"{order_res.get('msg') or order_res.get('error')}"
             )
             return False
-        if not order_res.get("sl_ok"):
-            # Regra de ouro: sem stop = sem trade. Fecha o short imediatamente.
+        if (not order_res.get("sl_ok")
+                and not order_res.get("emergency_close_attempted")
+                and not order_res.get("manual_intervention_required")):
+            # Cliente legado: rollback só conta após posição fresh-flat.
             log.error(f"[regime-hedge] {REGIME_HEDGE_SYMBOL} SEM STOP — fechando por segurança")
+            rollback = await _verified_legacy_stop_rollback(
+                REGIME_HEDGE_SYMBOL, "Sell", qty,
+                f"{client_order_id}-nostop",
+            )
+            if rollback.get("ok") and rollback.get("confirmed_flat"):
+                return False
+            _hedge_incident = True
+            _hedge_safety_state = "LEGACY_STOP_ROLLBACK_UNKNOWN"
+            _hedge_qty_state = "MAX_KNOWN_EXPOSURE"
             try:
-                await exchange_service.place_order(
-                    symbol=REGIME_HEDGE_SYMBOL, side="Buy", qty=qty,
-                    order_type="Market", reduce_only=True,
-                    client_order_id=f"{client_order_id}-nostop",
-                )
-            except Exception:
+                remaining = float(rollback.get("remaining_qty") or 0)
+                if remaining > 0:
+                    qty = remaining
+                    _hedge_qty_state = "CONFIRMED_REMAINING"
+            except (TypeError, ValueError):
                 pass
-            return False
+            _arm_execution_quarantine(
+                f"hedge {REGIME_HEDGE_SYMBOL} legacy rollback UNKNOWN"
+            )
+            try:
+                from services import risk_service
+                await risk_service.set_manual_pause(
+                    True,
+                    f"CRÍTICO: hedge {REGIME_HEDGE_SYMBOL} sem SL; rollback UNKNOWN",
+                )
+            except Exception as pause_exc:
+                log.critical(f"[regime-hedge] pausa crítica falhou: {pause_exc}")
 
         result = order_res.get("result") or {}
         exchange_order_id = str(result.get("orderId") or result.get("orderID") or "")
+        if not _hedge_incident:
+            try:
+                _actual_qty = float(order_res.get("executed_qty") or result.get("executedQty") or 0)
+                if _actual_qty > 0:
+                    qty = _actual_qty
+            except (TypeError, ValueError):
+                pass
         try:
             avg = float(result.get("avgPrice") or result.get("avgFillPrice") or 0)
         except Exception:
@@ -3117,9 +3623,9 @@ async def _maybe_regime_hedge(regime: dict) -> bool:
 
         sl_oid = order_res.get("sl_order_id")
         tp2_oid = order_res.get("tp2_order_id")
-        exchange_name = os.getenv("EXCHANGE", "binance")
+        exchange_name = _active_exchange_name()
 
-        trade = await real_trade_service.open_trade(
+        trade = await _open_trade_fail_closed(
             symbol=REGIME_HEDGE_SYMBOL,
             side="short",
             qty=qty,
@@ -3131,15 +3637,30 @@ async def _maybe_regime_hedge(regime: dict) -> bool:
             exchange=exchange_name,
             exchange_order_id=exchange_order_id,
             client_order_id=client_order_id,
-            notes=(f"hedge regime {state}: short {hedge_base} "
-                   f"({REGIME_HEDGE_SIZE_PCT:.0%} de {agg_notional:.0f}USD em {n_alt} alt longs)"),
+            notes=(
+                f"hedge regime {state}: short {hedge_base} "
+                f"({REGIME_HEDGE_SIZE_PCT:.0%} de {agg_notional:.0f}USD em {n_alt} alt longs)"
+                + (
+                    " [CRITICAL_EXECUTION_INCIDENT: "
+                    f"safety={_hedge_safety_state}; qty_state={_hedge_qty_state}]"
+                    if _hedge_incident else ""
+                )
+            ),
             entry_is_real_fill=bool(avg > 0),
             sl_order_id=sl_oid,
             tp2_order_id=tp2_oid,
-            sl_current_price=stop,
+            sl_current_price=stop if sl_oid else None,
+            unprotected_incident=_hedge_incident,
             hedge_for=f"regime:{state}",
         )
         if trade is None:
+            return False
+
+        if _hedge_incident:
+            log.critical(
+                f"[regime-hedge] INCIDENTE persistido {REGIME_HEDGE_SYMBOL} "
+                f"qty={qty:g} state={_hedge_safety_state}"
+            )
             return False
 
         log.info(
@@ -4377,9 +4898,13 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             # ─── LIVE EXECUTION (kill-switch + exchange call) ────────────
             exchange_order_id = None
             client_order_id = None
-            exchange_name = os.getenv("EXCHANGE", "binance")
+            exchange_name = _active_exchange_name()
             source = "shadow"
             entry_actual = entry
+            _track_unprotected_incident = False
+            _incident_qty_state = None
+            _incident_safety_state = None
+            _pending_entry_order = False
             # entry_actual cai no entry TEÓRICO até a corretora devolver avgPrice
             # real. Só marcamos fill real quando avg>0 — senão o slippage seria 0%
             # falso (mascara o slippage real). Telemetria fica None até backfill.
@@ -4401,9 +4926,27 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"[shadow→live] ⛔ BLOCKED {rec['symbol']} {side}: {guard_why}"
                     )
                     continue
+                contract_ok, contract_why = _live_execution_contract_guard()
+                if not contract_ok:
+                    log.critical(
+                        f"[shadow→live] ⛔ BLOCKED {rec['symbol']} {side}: {contract_why}"
+                    )
+                    continue
 
                 # 1. Kill-switch
-                from services import kill_switch_service
+                from services import kill_switch_service, risk_service
+                if _EXECUTION_QUARANTINE_REASON:
+                    log.critical(
+                        f"[shadow→live] BLOCKED {rec['symbol']} {side}: "
+                        f"execution quarantine={_EXECUTION_QUARANTINE_REASON}"
+                    )
+                    continue
+                if await risk_service.is_paused():
+                    log.warning(
+                        f"[shadow→live] BLOCKED {rec['symbol']} {side}: "
+                        "RiskState pausado (manual/circuit breaker)"
+                    )
+                    continue
                 ks = await kill_switch_service.check_can_trade()
                 if not ks.get("allowed"):
                     log.warning(
@@ -4530,7 +5073,88 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         leverage=int(rec.get("leverage") or 1),
                         client_order_id=client_order_id,
                     )
-                if not order_res.get("ok"):
+                _needs_manual = bool(
+                    order_res.get("manual_intervention_required")
+                    or order_res.get("quarantine_required")
+                )
+                _pending_entry_order = bool(order_res.get("pending_entry_order"))
+                _emergency_attempted = bool(order_res.get("emergency_close_attempted"))
+                if _emergency_attempted or _needs_manual:
+                    # Binance centraliza o fail-safe no mesmo serviço que conhece
+                    # a qty efetivamente preenchida. Aqui apenas notifica e NÃO
+                    # tenta fechar de novo (evita uma segunda reduceOnly concorrente).
+                    _closed = bool(
+                        order_res.get("emergency_close_ok") is True
+                        and order_res.get("position_open") is False
+                    )
+                    _resolved = bool(_closed and not _needs_manual)
+                    _sym = rec["symbol"].split("/")[0]
+                    log.critical(
+                        f"[shadow→live] {rec['symbol']} safety_state={order_res.get('safety_state')} "
+                        f"emergency_close_ok={_closed} manual={_needs_manual}"
+                    )
+                    try:
+                        from services import push_service
+                        await push_service.notify_alert(
+                            title=(
+                                f"🛡️ {_sym}: entrada sem stop foi FECHADA"
+                                if _resolved else f"🚨 {_sym}: INCIDENTE DE EXECUÇÃO — AÇÃO MANUAL"
+                            ),
+                            body=(
+                                "O SL falhou e a posição foi fechada e confirmada pela exchange."
+                                if _resolved else (
+                                    "A posição foi zerada, mas uma ordem condicional pode ter ficado órfã. "
+                                    "Confira e cancele antes de retomar."
+                                    if _closed else
+                                    "Há posição/ordem de entrada em estado desconhecido ou sem proteção confirmada. "
+                                    "Reconcilie manualmente AGORA."
+                                )
+                            ),
+                            tag=f"nostop-central-{snap_id}",
+                        )
+                    except Exception:
+                        pass
+                    if _needs_manual or not _closed:
+                        # Latch persistente: uma exposição sem stop não pode
+                        # coexistir com novas entradas. Retomada exige ação humana.
+                        _arm_execution_quarantine(
+                            f"{rec['symbol']} safety={order_res.get('safety_state')}"
+                        )
+                        try:
+                            from services import risk_service
+                            await risk_service.set_manual_pause(
+                                True,
+                                f"CRÍTICO: {rec['symbol']} safety={order_res.get('safety_state')}",
+                            )
+                        except Exception as _pause_exc:
+                            log.critical(
+                                f"[shadow→live] falha ao persistir pausa crítica: {_pause_exc}"
+                            )
+                    if _resolved:
+                        continue
+                    if _closed:
+                        # Posição flat, mas cleanup/pending order ainda exige
+                        # quarentena. Não cria RealTrade fictício de qty zero.
+                        continue
+                    try:
+                        _known_executed = float(
+                            order_res.get("executed_qty")
+                            or (order_res.get("result") or {}).get("executedQty")
+                            or 0
+                        )
+                    except (TypeError, ValueError):
+                        _known_executed = 0.0
+                    if order_res.get("position_open") is not False and _known_executed > 0:
+                        # Exposição conhecida: registra RealTrade aberto abaixo
+                        # para ficar visível e permitir auto-heal, enquanto o
+                        # latch impede novas entradas.
+                        _track_unprotected_incident = True
+                        _incident_safety_state = order_res.get("safety_state")
+                    else:
+                        # Ordem/posição UNKNOWN sem qty auditável: o latch e o
+                        # alerta são a fonte de verdade; não inventa trade no DB.
+                        continue
+                if not order_res.get("ok") and not _track_unprotected_incident:
                     # no_fill = maker post-only não preencheu e fallback_market=false
                     # (não perseguiu a mercado). É skip esperado, não erro.
                     if order_res.get("no_fill"):
@@ -4546,6 +5170,29 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
 
                 result = order_res.get("result") or {}
                 exchange_order_id = str(result.get("orderId") or result.get("orderID") or "")
+                # Maker parcial: o trade e qualquer recuperação subsequente devem
+                # usar a exposição realmente preenchida, não a qty planejada.
+                try:
+                    _executed_qty = float(
+                        order_res.get("executed_qty") or result.get("executedQty") or 0
+                    )
+                    if _executed_qty > 0:
+                        qty = _executed_qty
+                except (TypeError, ValueError):
+                    pass
+                if _track_unprotected_incident:
+                    _close_info = order_res.get("emergency_close") or {}
+                    try:
+                        _remaining = float(_close_info.get("remaining_qty"))
+                    except (TypeError, ValueError):
+                        _remaining = 0.0
+                    if _remaining > 0:
+                        qty = _remaining
+                        _incident_qty_state = "CONFIRMED_REMAINING"
+                    elif order_res.get("pending_entry_order"):
+                        _incident_qty_state = "KNOWN_MINIMUM_PENDING_ORDER"
+                    else:
+                        _incident_qty_state = "UNKNOWN_AFTER_CLOSE_ATTEMPT"
                 # Binance retorna avgPrice; Bybit retorna em outro campo
                 avg = result.get("avgPrice") or result.get("avgFillPrice")
                 if avg:
@@ -4562,48 +5209,22 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 sl_oid = order_res.get("sl_order_id")
                 tp1_oid = order_res.get("tp1_order_id")
                 tp2_oid = order_res.get("tp2_order_id")
-                if not order_res.get("sl_ok"):
-                    # Dinheiro real NUNCA pode ficar sem stop. Se o SL falhou,
-                    # fecha a posição a mercado imediatamente (reduce_only) em vez
-                    # de deixá-la nua. Regra de ouro: "sem stop = sem trade".
+                if (not order_res.get("sl_ok")
+                        and not order_res.get("emergency_close_attempted")
+                        and not order_res.get("manual_intervention_required")
+                        and not order_res.get("pending_entry_order")):
+                    # Cliente legado (ex.: Bybit) sem contrato transacional:
+                    # uma reduceOnly e confirmação fresh-flat. Aceite HTTP não
+                    # basta e não há retry cego em estado UNKNOWN.
                     log.error(
                         f"[shadow→live] ⚠ {rec['symbol']} ABERTO SEM STOP — "
                         f"fechando a mercado por segurança"
                     )
-                    import asyncio
-                    close_side = "Sell" if exch_side == "Buy" else "Buy"
-                    closed_ok = False
-                    # 3 tentativas com backoff: um blip de rede numa única
-                    # tentativa não pode deixar posição nua. client_order_id
-                    # único por tentativa evita rejeição por dedup.
-                    for _i in range(3):
-                        try:
-                            close_res = await exchange_service.place_order(
-                                symbol=rec["symbol"],
-                                side=close_side,
-                                qty=qty,
-                                order_type="Market",
-                                reduce_only=True,
-                                client_order_id=f"cw-nostop-{snap_id}-{_i}",
-                            )
-                            if bool(close_res.get("ok")):
-                                closed_ok = True
-                                break
-                            log.warning(
-                                f"[shadow→live] {rec['symbol']} fechar sem-stop tentativa {_i} falhou: "
-                                f"{close_res.get('msg') or close_res.get('error')}"
-                            )
-                        except Exception as _e:
-                            log.warning(
-                                f"[shadow→live] {rec['symbol']} erro ao fechar sem-stop tentativa {_i}: {_e}"
-                            )
-                        await asyncio.sleep(0.5 * (_i + 1))
-                    if not closed_ok:
-                        log.critical(
-                            f"[shadow→live] 🚨 {rec['symbol']} FALHA AO FECHAR posição sem stop "
-                            f"após 3 tentativas — AÇÃO MANUAL"
-                        )
-                    # Alerta push imediato (crítico) — você precisa saber na hora.
+                    rollback = await _verified_legacy_stop_rollback(
+                        rec["symbol"], exch_side, qty,
+                        f"cw-nostop-{snap_id}",
+                    )
+                    closed_ok = bool(rollback.get("ok") and rollback.get("confirmed_flat"))
                     try:
                         from services import push_service
                         _sym = rec["symbol"].split("/")[0]
@@ -4621,9 +5242,29 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             )
                     except Exception:
                         pass
-                    # Não registra trade aberto: posição foi fechada (ou exige
-                    # intervenção manual). Pula pro próximo rec.
-                    continue
+                    if closed_ok:
+                        continue
+
+                    _incident_safety_state = "LEGACY_STOP_ROLLBACK_UNKNOWN"
+                    _incident_qty_state = "MAX_KNOWN_EXPOSURE"
+                    _track_unprotected_incident = True
+                    try:
+                        _remaining = float(rollback.get("remaining_qty") or 0)
+                        if _remaining > 0:
+                            qty = _remaining
+                            _incident_qty_state = "CONFIRMED_REMAINING"
+                    except (TypeError, ValueError):
+                        pass
+                    _arm_execution_quarantine(
+                        f"{rec['symbol']} legacy stop rollback não confirmado"
+                    )
+                    try:
+                        await risk_service.set_manual_pause(
+                            True,
+                            f"CRÍTICO: {rec['symbol']} sem SL; rollback legado UNKNOWN",
+                        )
+                    except Exception as pause_exc:
+                        log.critical(f"[shadow→live] pausa crítica falhou: {pause_exc}")
                 if order_res.get("tp1_skipped"):
                     log.warning(f"[shadow→live] {rec['symbol']} TP1 skip (qty parcial=0); 100% no TP2")
                 elif not order_res.get("tp1_ok"):
@@ -4642,7 +5283,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             _tp1_oid = locals().get("tp1_oid") if source == "auto" else None
             _tp2_oid = locals().get("tp2_oid") if source == "auto" else None
 
-            trade = await real_trade_service.open_trade(
+            trade = await _open_trade_fail_closed(
                 symbol=rec["symbol"],
                 side=side,
                 qty=qty,
@@ -4657,18 +5298,36 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 exchange=exchange_name,
                 exchange_order_id=exchange_order_id,
                 client_order_id=client_order_id,
-                notes=f"{source} auto-open (tier {tier})" + (" [filler]" if rec.get("_is_filler") else ""),
+                notes=(
+                    f"{source} auto-open (tier {tier})"
+                    + (" [filler]" if rec.get("_is_filler") else "")
+                    + (
+                        " [CRITICAL_EXECUTION_INCIDENT: "
+                        f"safety={_incident_safety_state}; qty_state={_incident_qty_state}]"
+                        if _track_unprotected_incident else ""
+                    )
+                    + (" [PENDING_ENTRY_ORDER]" if _pending_entry_order else "")
+                ),
                 entry_is_real_fill=entry_is_real_fill,
                 sl_order_id=_sl_oid,
                 tp1_order_id=_tp1_oid,
                 tp2_order_id=_tp2_oid,
-                sl_current_price=stop,
+                sl_current_price=stop if _sl_oid else None,
+                unprotected_incident=_track_unprotected_incident,
                 adaptive_tp1_qty_pct=(_adaptive or {}).get("tp1_qty_pct"),
                 adaptive_runner_atr_mult=(_adaptive or {}).get("runner_atr_mult"),
                 adaptive_runner_qty_pct=(_adaptive or {}).get("runner_qty_pct"),
                 adaptive_test_idx=_adaptive_idx,
             )
             if trade is not None:
+                if _track_unprotected_incident:
+                    log.critical(
+                        f"[shadow→live] INCIDENTE persistido trade#{trade.get('id') if isinstance(trade, dict) else '?'} "
+                        f"{rec['symbol']} qty={qty:g} state={_incident_safety_state}"
+                    )
+                    # Não conta como abertura normal/canário e não envia os
+                    # avisos otimistas de OPEN; o alerta crítico já foi emitido.
+                    continue
                 opened += 1
                 # Atualiza slots do filler DENTRO do batch (DB só reflete pós-commit):
                 # mantém o teto FORA correto entre recs do mesmo ciclo.
@@ -4816,6 +5475,11 @@ async def close_shadow_for_snapshot(snap) -> bool:
     if trade.source == "auto" and snap.status == "expired":
         try:
             from services import exchange_service
+            trade_ok, trade_why = _trade_active_exchange_guard(trade)
+            if not trade_ok:
+                _arm_execution_quarantine(f"expired {trade.symbol}: {trade_why}")
+                log.critical(f"[live] expired bloqueado trade#{trade.id}: {trade_why}")
+                return False
             close_side = "Sell" if trade.side == "long" else "Buy"
             close_res = await exchange_service.place_order(
                 symbol=trade.symbol,
@@ -4825,13 +5489,19 @@ async def close_shadow_for_snapshot(snap) -> bool:
                 reduce_only=True,
                 client_order_id=f"cw-close-{trade.id}",
             )
-            if not close_res.get("ok"):
+            live_size, live_msg = await _fresh_exchange_position_size(trade.symbol)
+            if live_size is None or live_size > 1e-12:
                 log.warning(
-                    f"[live] close_position falhou trade#{trade.id}: "
-                    f"{close_res.get('msg') or close_res.get('error')}"
+                    f"[live] close_position não confirmado trade#{trade.id}: "
+                    f"{close_res.get('msg') or close_res.get('error') or live_msg}; "
+                    f"qty={live_size} — mantém bracket/DB"
                 )
+                return False
+            if not await _cleanup_trade_conditionals_after_flat(trade, "expired"):
+                return False
         except Exception as e:
             log.warning(f"[live] erro fechando posição #{trade.id}: {e}")
+            return False
 
     await real_trade_service.close_trade(
         trade_id=trade.id,

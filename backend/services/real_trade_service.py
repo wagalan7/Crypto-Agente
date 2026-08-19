@@ -60,6 +60,7 @@ async def open_trade(
     tp1_order_id: Optional[str] = None,
     tp2_order_id: Optional[str] = None,
     sl_current_price: Optional[float] = None,
+    unprotected_incident: bool = False,
     # Partials adaptativos (por-trade) — None = usa a env global no trade_manager
     adaptive_tp1_qty_pct: Optional[float] = None,
     adaptive_runner_atr_mult: Optional[float] = None,
@@ -122,7 +123,11 @@ async def open_trade(
             sl_order_id=sl_order_id,
             tp1_order_id=tp1_order_id,
             tp2_order_id=tp2_order_id,
-            sl_current_price=sl_current_price if sl_current_price is not None else planned_stop,
+            sl_current_price=(
+                None if unprotected_incident
+                else sl_current_price if sl_current_price is not None
+                else planned_stop
+            ),
             # Partials adaptativos (por-trade)
             adaptive_tp1_qty_pct=adaptive_tp1_qty_pct,
             adaptive_runner_atr_mult=adaptive_runner_atr_mult,

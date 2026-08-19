@@ -3237,7 +3237,17 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
         igual ao auto — só a posição é sua. (≠ source="manual" do POST /api/real-
         trades, que é advise-only e NÃO coloca ordem.)
     """
-    from services import real_trade_service
+    from services import exchange_service, real_trade_service, shadow_trade_service
+
+    contract_ok, contract_reason = shadow_trade_service._live_execution_contract_guard()
+    if not contract_ok:
+        raise HTTPException(
+            409,
+            f"gerenciamento live bloqueado: {contract_reason}",
+        )
+    active_exchange = str(
+        getattr(exchange_service, "ACTIVE_EXCHANGE", "") or ""
+    ).lower()
 
     # 0. Idempotência: se já existe um trade gerenciado ABERTO pro mesmo
     #    símbolo+lado, NÃO cria duplicado — retorna o existente. Protege contra
@@ -3247,7 +3257,7 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
     try:
         from db import get_session, DB_ENABLED
         if DB_ENABLED:
-            from sqlalchemy import select, desc
+            from sqlalchemy import desc, or_, select
             from models.real_trade import RealTrade
             async with get_session() as session:
                 existing = (await session.execute(
@@ -3256,6 +3266,10 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
                     .where(RealTrade.side == req.side)
                     .where(RealTrade.status == "open")
                     .where(RealTrade.source == "managed")
+                    .where(or_(
+                        RealTrade.exchange == active_exchange,
+                        RealTrade.exchange.is_(None),
+                    ))
                     .order_by(desc(RealTrade.opened_at))
                     .limit(1)
                 )).scalar_one_or_none()
@@ -3339,7 +3353,10 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
         planned_tp2=req.planned_tp2,
         entry_fee=req.entry_fee,
         source="managed",
+        exchange=active_exchange,
         notes=req.notes or f"confirmado do painel (qty {qty_source}) — gerenciado pelo bot",
+        # Só materializa preço de SL na UI depois que a exchange devolver um ID.
+        unprotected_incident=True,
     )
     if result is None:
         raise HTTPException(503, "DB desabilitado")
@@ -3355,35 +3372,75 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
     tp1_lvl = result.get("planned_tp1")
     tp2_lvl = result.get("planned_tp2")
     protection: dict = {"placed": False}
-    if sl_lvl and sl_lvl > 0:
+
+    async def _mark_managed_incident(reason: str) -> None:
+        marker = "[CRITICAL_EXECUTION_INCIDENT: MANAGED_WITHOUT_CONFIRMED_SL]"
+        detail = " ".join(str(reason or "sem detalhe").split())[:120]
         try:
-            from services import binance_signed_service
             from db import get_session
             from sqlalchemy import select
             from models.real_trade import RealTrade
-
-            entry_side = "Buy" if req.side == "long" else "Sell"
-            prot = await binance_signed_service.place_protection_orders(
-                req.symbol, entry_side, qty=qty,
-                stop_loss=sl_lvl, tp1=tp1_lvl, tp2=tp2_lvl,
-                client_order_id_prefix=f"cw-managed-{trade_id}",
-                dedup_live=True,  # anti-dup: pula perna que já exista viva
-            )
             async with get_session() as session:
                 fresh = (await session.execute(
                     select(RealTrade).where(RealTrade.id == trade_id)
                 )).scalar_one_or_none()
                 if fresh:
-                    if prot.get("sl_ok"):
-                        fresh.sl_order_id = prot.get("sl_order_id")
-                        fresh.sl_current_price = sl_lvl
-                    if prot.get("tp1_ok") and tp1_lvl:
+                    fresh.sl_order_id = None
+                    fresh.sl_current_price = None
+                    previous = " ".join(str(fresh.notes or "").split())
+                    # RealTrade.notes é VARCHAR(255): marker crítico vem primeiro
+                    # e nunca pode ser truncado por notes/reason arbitrários.
+                    fresh.notes = f"{marker} {detail} | {previous}"[:255]
+                    await session.commit()
+                    result["notes"] = fresh.notes
+        except Exception as exc:
+            log.critical(
+                f"[confirm-entry] falha marcando incidente managed #{trade_id}: {exc}"
+            )
+        result["sl_order_id"] = None
+        result["sl_current_price"] = None
+        await shadow_trade_service._persist_execution_quarantine(
+            f"managed #{trade_id} {req.symbol} sem SL confirmado: {reason}"
+        )
+
+    if sl_lvl and sl_lvl > 0:
+        try:
+            from db import get_session
+            from sqlalchemy import select
+            from models.real_trade import RealTrade
+
+            entry_side = "Buy" if req.side == "long" else "Sell"
+            prot = await exchange_service.place_protection_orders(
+                req.symbol, entry_side, qty=qty,
+                stop_loss=sl_lvl, tp1=tp1_lvl, tp2=tp2_lvl,
+                client_order_id_prefix=f"cw-managed-{trade_id}",
+                dedup_live=True,  # anti-dup: pula perna que já exista viva
+            )
+            sl_confirmed = bool(prot.get("sl_ok") and prot.get("sl_order_id"))
+            if sl_confirmed:
+                async with get_session() as session:
+                    fresh = (await session.execute(
+                        select(RealTrade).where(RealTrade.id == trade_id)
+                    )).scalar_one_or_none()
+                    if fresh is None:
+                        raise RuntimeError("trade desapareceu antes de persistir bracket")
+                    fresh.sl_order_id = prot.get("sl_order_id")
+                    fresh.sl_current_price = sl_lvl
+                    if prot.get("tp1_ok") and prot.get("tp1_order_id") and tp1_lvl:
                         fresh.tp1_order_id = prot.get("tp1_order_id")
-                    if prot.get("tp2_ok"):
+                    if prot.get("tp2_ok") and prot.get("tp2_order_id"):
                         fresh.tp2_order_id = prot.get("tp2_order_id")
                     await session.commit()
+                result["sl_order_id"] = prot.get("sl_order_id")
+                result["sl_current_price"] = sl_lvl
+                result["tp1_order_id"] = prot.get("tp1_order_id")
+                result["tp2_order_id"] = prot.get("tp2_order_id")
+            else:
+                await _mark_managed_incident(
+                    prot.get("sl_msg") or "exchange não devolveu algoId do SL"
+                )
             protection = {
-                "placed": bool(prot.get("sl_ok")),
+                "placed": sl_confirmed,
                 "sl_ok": prot.get("sl_ok"), "sl_msg": prot.get("sl_msg"),
                 "tp1_ok": prot.get("tp1_ok"), "tp1_msg": prot.get("tp1_msg"),
                 "tp1_skipped": prot.get("tp1_skipped"),
@@ -3396,9 +3453,11 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
             )
         except Exception as e:
             log.error(f"[confirm-entry] colocar proteção #{trade_id} falhou: {e}")
+            await _mark_managed_incident(f"{type(e).__name__}: {e}")
             protection = {"placed": False, "error": str(e)}
     else:
         protection = {"placed": False, "error": "sem planned_stop — bracket não criado"}
+        await _mark_managed_incident("sem planned_stop — bracket não criado")
 
     # 5. Notifica abertura do trade gerenciado (Telegram + push). O caminho
     #    auto/shadow já notifica em shadow_trade_service; o managed (confirmado
@@ -3415,24 +3474,41 @@ async def real_trade_from_recommendation(req: ConfirmEntryRequest):
             "qty": qty,
         }
         _notify_rec = {"timeframe": req.timeframe or result.get("timeframe") or "?"}
-        _bracket = "✅ bracket colocado" if protection.get("placed") else "⚠️ sem bracket (SL pendente)"
-        await send_telegram(
-            fmt_trade_opened(_notify_trade, _notify_rec)
-            + f"\n_Gerenciado · {_bracket}_",
-            event_type="open_managed",
-        )
+        if protection.get("placed"):
+            await send_telegram(
+                fmt_trade_opened(_notify_trade, _notify_rec)
+                + "\n_Gerenciado · ✅ bracket colocado_",
+                event_type="open_managed",
+            )
+        else:
+            await send_telegram(
+                f"🚨 *{req.symbol}: posição gerenciada SEM SL confirmado*\n"
+                f"Trade `#{trade_id}` foi pausado para intervenção. "
+                "Confira a posição e a proteção na corretora antes de retomar.",
+                event_type="managed_without_stop",
+            )
     except Exception as e:
         log.warning(f"[confirm-entry] telegram open falhou: {e}")
     try:
         from services import push_service
-        await push_service.notify_trade_open({
-            **result,
-            "planned_stop": sl_lvl,
-            "planned_tp1": tp1_lvl,
-            "planned_tp2": tp2_lvl,
-            "qty": qty,
-            "source": "managed",
-        })
+        if protection.get("placed"):
+            await push_service.notify_trade_open({
+                **result,
+                "planned_stop": sl_lvl,
+                "planned_tp1": tp1_lvl,
+                "planned_tp2": tp2_lvl,
+                "qty": qty,
+                "source": "managed",
+            })
+        else:
+            await push_service.notify_alert(
+                title=f"🚨 {req.symbol}: posição sem SL confirmado",
+                body=(
+                    "O gerenciamento automático foi pausado. Confira e proteja "
+                    "a posição na corretora antes de retomar."
+                ),
+                tag=f"managed-no-stop-{trade_id}",
+            )
     except Exception as e:
         log.warning(f"[confirm-entry] push open falhou: {e}")
 

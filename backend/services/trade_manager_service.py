@@ -223,8 +223,22 @@ async def _fetch_exchange_position(symbol: str) -> tuple[float | None, float | N
     """Busca (qty, entry_price) atuais da posição na exchange. (None, None) se erro, (0, None) se fechada."""
     try:
         from services import exchange_service
-        res = await exchange_service.get_positions(symbol=symbol)
+        try:
+            # Decidir FLAT exige leitura posterior à ordem. O cache curto da
+            # Binance pode conter o snapshot vazio anterior à entrada e faria o
+            # manager fechar o DB/cancelar SL de uma posição real recém-aberta.
+            res = await exchange_service.get_positions(symbol=symbol, force=True)
+        except TypeError:
+            # Compatibilidade com clientes (ex.: Bybit) cuja assinatura ainda
+            # não expõe ``force``.
+            res = await exchange_service.get_positions(symbol=symbol)
         if not res.get("ok"):
+            return None, None
+        if res.get("stale") or res.get("rate_limited"):
+            log.warning(
+                "[trade-manager] posição %s ignorada: resposta stale/rate_limited",
+                symbol,
+            )
             return None, None
         for p in res.get("positions") or []:
             return float(p.get("size") or 0), float(p.get("entry_price") or 0) or None
@@ -238,6 +252,81 @@ async def _fetch_exchange_qty(symbol: str) -> float | None:
     """Backward-compat wrapper — só retorna qty."""
     qty, _ = await _fetch_exchange_position(symbol)
     return qty
+
+
+def _cancel_result_is_terminal(result: dict) -> bool:
+    if result.get("ok"):
+        return True
+    try:
+        code = int(result.get("code"))
+    except (TypeError, ValueError):
+        code = None
+    msg = str(result.get("msg") or result.get("error") or "").lower()
+    return code in {-2011, -2013} or any(
+        token in msg for token in ("unknown order", "not found", "does not exist")
+    )
+
+
+async def _cleanup_conditionals_after_flat(trade: RealTrade, context: str) -> bool:
+    """Confirma cleanup antes de retirar o trade do acompanhamento do DB."""
+    from services import exchange_service
+
+    known_ids = {
+        field: str(getattr(trade, field, None) or "")
+        for field in ("sl_order_id", "tp1_order_id", "tp2_order_id")
+    }
+    client_prefix = str(getattr(trade, "client_order_id", None) or "")
+    failures: list[str] = []
+
+    if getattr(exchange_service, "ACTIVE_EXCHANGE", "") == "binance" and (
+        client_prefix or any(known_ids.values())
+    ):
+        try:
+            from services import binance_signed_service
+            cleanup = await binance_signed_service._cleanup_entry_conditionals(
+                trade.symbol,
+                client_prefix or None,
+                {
+                    "sl_order_id": known_ids["sl_order_id"] or None,
+                    "tp1_order_id": known_ids["tp1_order_id"] or None,
+                    "tp2_order_id": known_ids["tp2_order_id"] or None,
+                },
+            )
+        except Exception as exc:
+            cleanup = {"confirmed_absent": False, "error": str(exc)}
+        if cleanup.get("confirmed_absent"):
+            return True
+        failures.append(str(cleanup.get("errors") or cleanup.get("error") or cleanup))
+    else:
+        for field, algo_id in known_ids.items():
+            if not algo_id:
+                continue
+            try:
+                result = await exchange_service.cancel_algo_order(algo_id)
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+            if not _cancel_result_is_terminal(result):
+                failures.append(
+                    f"{field}={algo_id}: "
+                    f"{result.get('msg') or result.get('error') or 'incerto'}"
+                )
+
+    if not failures:
+        return True
+
+    reason = f"{context} {trade.symbol} FLAT com conditionals UNKNOWN: {'; '.join(failures)}"
+    log.critical(f"[trade-manager] {reason}")
+    try:
+        from services import shadow_trade_service
+        shadow_trade_service._arm_execution_quarantine(reason)
+    except Exception as exc:
+        log.critical(f"[trade-manager] falha armando quarantine local: {exc}")
+    try:
+        from services import risk_service
+        await risk_service.set_manual_pause(True, f"CRÍTICO: {reason}")
+    except Exception as exc:
+        log.critical(f"[trade-manager] falha persistindo pausa: {exc}")
+    return False
 
 
 async def _structural_be_stop(trade: RealTrade, entry: float) -> float | None:
@@ -473,7 +562,7 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
     return True
 
 
-async def _close_trade(trade: RealTrade, reason: str) -> None:
+async def _close_trade(trade: RealTrade, reason: str) -> bool:
     """Detectou qty=0 na exchange → marca trade fechado. Usa mark price atual como exit."""
     from services import real_trade_service, exchange_service
     exit_price = None
@@ -547,20 +636,11 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
     }
     status = status_map.get(reason, "closed_manual")
 
-    # Limpa algo orders órfãs antes de fechar — SL/TP que não dispararam ficam
-    # pendentes na Binance e poluem o painel (apesar de reduceOnly=true impedir
-    # reentrada real, acumular lixo eventualmente bate o cap de ~200/símbolo).
-    for oid_field in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
-        oid = getattr(trade, oid_field, None)
-        if oid:
-            try:
-                res = await exchange_service.cancel_algo_order(str(oid))
-                if res.get("ok"):
-                    log.info(f"[trade-manager] {trade.symbol} #{trade.id} cancelled orphan {oid_field}={oid}")
-                else:
-                    log.debug(f"[trade-manager] cancel {oid_field}={oid}: {res.get('error') or res.get('msg')}")
-            except Exception as e:
-                log.warning(f"[trade-manager] cancel {oid_field}={oid} falhou: {e}")
+    # A posição já foi lida fresh-flat pelo caller. Sem confirmação do cleanup,
+    # mantém o trade no DB e bloqueia reentrada para que uma conditional órfã
+    # não feche a próxima posição do símbolo.
+    if not await _cleanup_conditionals_after_flat(trade, "close"):
+        return False
 
     try:
         await real_trade_service.close_trade(
@@ -587,8 +667,10 @@ async def _close_trade(trade: RealTrade, reason: str) -> None:
             )
         except Exception as ne:
             log.warning(f"[notify] telegram close falhou: {ne}")
+        return True
     except Exception as e:
         log.error(f"[trade-manager] close_trade {trade.id} erro: {e}")
+        return False
 
 
 async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
@@ -629,34 +711,36 @@ async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
 
     # 1. Fecha posição market (reduce_only pra não inverter)
     try:
-        from services import binance_signed_service, exchange_service
+        from services import exchange_service
         exit_side = "Sell" if trade.side == "long" else "Buy"
-        res = await binance_signed_service.place_order(
+        res = await exchange_service.place_order(
             sym, exit_side, qty=qty_now,
             order_type="Market",
             reduce_only=True,
             client_order_id=f"cw-ts-{trade.id}",
         )
-        if not res.get("ok"):
-            log.warning(f"[time-stop] {sym} close market falhou: {res.get('error')}")
-            # Mesmo assim segue — o ciclo seguinte vai detectar qty=0 ou retry
-            return False
     except Exception as e:
-        log.warning(f"[time-stop] {sym} exchange close erro: {e}")
+        res = {"ok": False, "error": str(e)}
+
+    # Aceite da ordem não prova fill; timeout também pode ser sucesso. Só uma
+    # leitura fresca e zerada autoriza cancelar o bracket e fechar o DB.
+    qty_after, _ = await _fetch_exchange_position(sym)
+    if qty_after is None:
+        log.warning(
+            f"[time-stop] {sym} close não verificável: "
+            f"{res.get('error') or res.get('msg') or 'positionRisk UNKNOWN'}"
+        )
+        return False
+    if qty_after > 0:
+        log.warning(
+            f"[time-stop] {sym} ainda aberto qty={qty_after}; mantém trade/bracket "
+            "para retry no próximo ciclo"
+        )
         return False
 
-    # 2. Cancela algo orders órfãs (SL/TPs ainda pendentes)
-    try:
-        from services import exchange_service
-        for oid_field in ("sl_order_id", "tp1_order_id", "tp2_order_id"):
-            oid = getattr(trade, oid_field, None)
-            if oid:
-                try:
-                    await exchange_service.cancel_algo_order(str(oid))
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    # 2. Cancela e CONFIRMA conditionals órfãs antes de fechar o DB.
+    if not await _cleanup_conditionals_after_flat(trade, "time-stop"):
+        return False
 
     # 3. Marca closed_manual com nota time_stop e exit price = mark atual ou entry
     try:
@@ -726,7 +810,8 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     # Dar uma folga garante que a colocação inicial settle. O dedup_live é a
     # rede principal; isso é cinto + suspensório.
     created = trade.created_at or trade.opened_at
-    if created is not None:
+    critical_incident = "CRITICAL_EXECUTION_INCIDENT" in str(trade.notes or "")
+    if created is not None and not critical_incident:
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         age_s = (datetime.now(timezone.utc) - created).total_seconds()
@@ -815,7 +900,24 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     if not (sl_missing or tp1_missing or tp2_missing):
         return False
 
-    from services import binance_signed_service
+    from services import exchange_service
+    active_exchange = str(getattr(exchange_service, "ACTIVE_EXCHANGE", "") or "").lower()
+    trade_exchange = str(getattr(trade, "exchange", None) or active_exchange).lower()
+    if trade_exchange != active_exchange:
+        log.critical(
+            f"[autoheal] {trade.symbol} #{trade.id} bloqueado: trade pertence a "
+            f"{trade_exchange}, mas processo está em {active_exchange}"
+        )
+        return False
+    protect = getattr(exchange_service, "place_protection_orders", None)
+    if not callable(protect):
+        # Nunca tentar curar uma posição de outra exchange usando a conta
+        # Binance por hardcode. O incidente permanece visível/pausado.
+        log.critical(
+            f"[autoheal] {trade.symbol} #{trade.id} bloqueado: exchange "
+            f"{active_exchange or 'desconhecida'} sem place_protection_orders"
+        )
+        return False
     sym = trade.symbol
     entry_side = "Buy" if trade.side == "long" else "Sell"
 
@@ -833,7 +935,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     # ── SL (perna crítica — sempre primeiro) ─────────────────────────────
     if sl_missing:
         try:
-            r = await binance_signed_service.place_protection_orders(
+            r = await protect(
                 sym, entry_side, qty=qty_now,
                 stop_loss=sl_price, tp1=None, tp2=None,
                 client_order_id_prefix=f"cw-heal-sl-{trade.id}",
@@ -858,7 +960,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
         tp1_present = bool(trade.tp1_order_id) or tp1_missing
         qty_tp2 = qty_now if is_post else (qty_now * (1.0 - _tp1_qty_pct_for(trade)) if tp1_present else qty_now)
         try:
-            r = await binance_signed_service.place_protection_orders(
+            r = await protect(
                 sym, entry_side, qty=qty_tp2,
                 stop_loss=None, tp1=None, tp2=trade.planned_tp2,
                 client_order_id_prefix=f"cw-heal-tp2-{trade.id}",
@@ -877,7 +979,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     if tp1_missing:
         qty_tp1 = qty_now * _tp1_qty_pct_for(trade)
         try:
-            r = await binance_signed_service.place_protection_orders(
+            r = await protect(
                 sym, entry_side, qty=qty_tp1,
                 stop_loss=None, tp1=None, tp2=trade.planned_tp1,
                 client_order_id_prefix=f"cw-heal-tp1-{trade.id}",
@@ -1168,6 +1270,59 @@ async def _maybe_trail_runner(trade: RealTrade, qty_now: float) -> bool:
 
 async def _process_trade(trade: RealTrade) -> None:
     """Avalia um trade aberto e age conforme a fase."""
+    try:
+        from services import exchange_service
+        active_exchange = str(
+            getattr(exchange_service, "ACTIVE_EXCHANGE", "") or ""
+        ).lower()
+        trade_exchange = str(
+            getattr(trade, "exchange", None) or active_exchange
+        ).lower()
+    except Exception as exc:
+        log.critical(f"[trade-manager] exchange guard falhou #{trade.id}: {exc}")
+        return
+    if active_exchange != "binance" or trade_exchange != active_exchange:
+        reason = (
+            f"trade#{trade.id} {trade.symbol} pertence a {trade_exchange}, "
+            f"processo ativo em {active_exchange}; gestão live transacional "
+            "está liberada apenas para Binance no P02"
+        )
+        log.critical(f"[trade-manager] {reason}")
+        try:
+            from services import shadow_trade_service
+            shadow_trade_service._arm_execution_quarantine(reason)
+        except Exception as exc:
+            log.critical(f"[trade-manager] falha armando quarantine local: {exc}")
+        try:
+            from services import risk_service
+            if not await risk_service.is_paused():
+                await risk_service.set_manual_pause(True, f"CRÍTICO: {reason}")
+        except Exception as exc:
+            log.critical(f"[trade-manager] falha persistindo pausa: {exc}")
+        return
+
+    if "PENDING_ENTRY_ORDER" in str(getattr(trade, "notes", None) or ""):
+        # Uma LIMIT maker cujo cancelamento não foi confirmado pode preencher
+        # depois de um snapshot fresh-flat. Até o reconciliador persistente do
+        # P03 provar estado terminal, nunca fecha o registro nem limpa o bracket.
+        reason = (
+            f"trade#{trade.id} {trade.symbol} possui entry maker pendente/UNKNOWN; "
+            "gestão automática congelada até reconciliação terminal"
+        )
+        log.critical(f"[trade-manager] {reason}")
+        try:
+            from services import shadow_trade_service
+            shadow_trade_service._arm_execution_quarantine(reason)
+        except Exception as exc:
+            log.critical(f"[trade-manager] falha armando quarantine local: {exc}")
+        try:
+            from services import risk_service
+            if not await risk_service.is_paused():
+                await risk_service.set_manual_pause(True, f"CRÍTICO: {reason}")
+        except Exception as exc:
+            log.critical(f"[trade-manager] falha persistindo pausa: {exc}")
+        return
+
     qty_now = await _fetch_exchange_qty(trade.symbol)
     if qty_now is None:
         return  # erro de leitura — pula esse ciclo
@@ -1208,12 +1363,26 @@ async def _process_trade(trade: RealTrade) -> None:
             try:
                 from services import exchange_service
                 close_side = "Sell" if trade.side == "long" else "Buy"
-                await exchange_service.place_order(
+                close_res = await exchange_service.place_order(
                     symbol=trade.symbol, side=close_side, qty=qty_now,
                     order_type="Market", reduce_only=True,
                 )
             except Exception as e:
+                close_res = {"ok": False, "error": str(e)}
                 log.warning(f"[trade-manager] flatten poeira #{trade.id} falhou: {e}")
+            qty_after, _ = await _fetch_exchange_position(trade.symbol)
+            if qty_after is None:
+                log.warning(
+                    f"[trade-manager] poeira #{trade.id} close UNKNOWN; mantém DB/bracket "
+                    f"({close_res.get('error') or close_res.get('msg') or 'sem leitura fresca'})"
+                )
+                return
+            if qty_after > 0:
+                log.warning(
+                    f"[trade-manager] poeira #{trade.id} ainda aberta qty={qty_after}; "
+                    "não fecha DB"
+                )
+                return
             await _close_trade(trade, "tp2" if trade.phase in ("post_tp1", "runner") else "stop")
             return
 
@@ -1499,7 +1668,21 @@ async def backfill_protection(force: bool = False) -> dict:
     if not DB_ENABLED:
         return {"ok": False, "error": "DB disabled"}
 
-    from services import binance_signed_service
+    from services import binance_signed_service, exchange_service
+
+    active_exchange = str(
+        getattr(exchange_service, "ACTIVE_EXCHANGE", "") or ""
+    ).lower()
+    if active_exchange != "binance":
+        return {
+            "ok": False,
+            "error": (
+                "backfill live bloqueado: contrato transacional do P02 está "
+                f"liberado apenas para Binance (ativa={active_exchange or 'N/D'})"
+            ),
+            "processed": 0,
+            "results": [],
+        }
 
     results = []
     async with get_session() as session:
@@ -1511,6 +1694,17 @@ async def backfill_protection(force: bool = False) -> dict:
         trades = (await session.execute(stmt)).scalars().all()
 
     for t in trades:
+        trade_exchange = str(getattr(t, "exchange", None) or active_exchange).lower()
+        if trade_exchange != active_exchange:
+            results.append({
+                "trade_id": t.id,
+                "symbol": t.symbol,
+                "skipped": True,
+                "reason": (
+                    f"exchange do trade={trade_exchange}; processo ativo={active_exchange}"
+                ),
+            })
+            continue
         # Já tem SL ativo e não estamos forçando? pula
         if t.sl_order_id and not force:
             results.append({"trade_id": t.id, "symbol": t.symbol, "skipped": True, "reason": "já tem sl_order_id"})

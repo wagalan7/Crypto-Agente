@@ -231,6 +231,14 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
             _log_event(session, state, "manual_resume", reason or "Retomado manualmente")
         await session.commit()
         log.warning(f"[circuit-breaker] MANUAL pause={paused} reason={reason}")
+        if not paused:
+            # A retomada humana explícita também limpa o latch fail-closed em
+            # memória armado quando a persistência do RiskState podia falhar.
+            try:
+                from services import shadow_trade_service
+                shadow_trade_service.clear_execution_quarantine()
+            except Exception as exc:
+                log.error(f"[circuit-breaker] falha limpando execution quarantine: {exc}")
         return _to_dict(state)
 
 
