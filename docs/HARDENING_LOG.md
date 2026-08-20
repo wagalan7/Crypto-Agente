@@ -114,3 +114,55 @@ Defaults fail-closed mantidos no P02:
   após restart; até o P03, o latch cobre o processo atual e o relatório acusa drift.
 - Conta Binance em hedge mode não está suportada explicitamente; o fluxo presume one-way mode.
 - Bybit live permanece bloqueada até receber o mesmo contrato transacional.
+
+## P03 - Reconciliação persistente de execução
+
+- Status: Concluído localmente (não publicado/não ativado em conta real)
+- Branch: `feat/hardening-p03`
+- Base: `d6f05d4c` (P02)
+- Detalhe: `docs/P03_EXECUTION_RECONCILIATION.md`
+
+### Implementação
+
+- Model `ExecutionIncident` (`execution_incidents`) com `incident_key` único
+  (idempotência), identidade de ordem/condicionais, qty planejada, lower-bound de
+  fill, attempts, clean observations, next_retry, last_error, lease/claim e
+  timestamps. Integrado ao `init_db()` (bootstrap `create_all`).
+- Serviço `execution_reconciliation_service.py`: entrada oficial de incidentes
+  idempotente, boot reconcile (arma quarentena ANTES do scan, detecta posição
+  untracked fail-closed), loop periódico integrado ao `lifespan` (sem
+  worker/scheduler/queue paralelo), claim/lease persistente, backoff e a máquina
+  de estados `OPEN→RECONCILING→PROTECTED|FLAT` + `RETRY_PENDING`/`MANUAL_REQUIRED`.
+- Só CONSULTA a exchange e reutiliza as primitivas P02 de leitura/cancelamento
+  (get_order por clientOrderId, positionRisk fresh, get_open_algo_orders,
+  cancel_algo_order). NÃO coloca ordem nova: adota SL vivo válido ou escala
+  MANUAL. Nunca reenvia entry, nunca emite MARKET cego, nunca `no_fill` sem prova.
+- 3 pontos de entrada: safety state P02 inseguro/UNKNOWN, boot com incidente
+  aberto, e falha de persistência (posição real sem `RealTrade`).
+- Endpoint read-only `GET /api/execution-incidents/status`. Sem mutação.
+- `UNKNOWN` nunca vira `FLAT`; `MANUAL_REQUIRED` continua bloqueando entradas;
+  quarentena própria liberada só com prova positiva; pausa manual preservada.
+
+### Configurações novas
+
+- `RECONCILE_INTERVAL_S` (30), `RECONCILE_BACKOFF_BASE_S` (15),
+  `RECONCILE_BACKOFF_MAX_S` (900), `RECONCILE_CLEAN_GRACE` (2),
+  `RECONCILE_LEASE_S` (120), `RECONCILE_MAX_ATTEMPTS` (8),
+  `RECONCILE_MAX_PER_CYCLE` (10). Defaults conservadores, fail-closed.
+
+Defaults fail-closed preservados: `MAKER_ENTRY_ENABLED=false`,
+`TF_UPGRADE_ENABLED=false`, `PYRAMIDING_ENABLED=false`; Bybit live bloqueada.
+
+### Validação
+
+- **37 testes P03** herméticos; suíte crítica completa (P01+P02+P03) = **93
+  testes**, executada **2×**, verde.
+- `py_compile` e `git diff --check` aprovados.
+- Banco e exchange reais não foram acessados; tudo mockado. Nenhum push/deploy.
+- Nota: rodado no Python 3.9 local via shim de teste (fora do repo) para PEP 604;
+  produção é 3.11.
+
+### Fora do escopo (P04)
+
+- Revalidação de preço e política de fallback MARKET maker permanecem para o P04,
+  **não implementado** aqui.

@@ -97,6 +97,7 @@ _rotation_task: Optional[asyncio.Task] = None
 _health_watchdog_task: Optional[asyncio.Task] = None
 _digest_task: Optional[asyncio.Task] = None
 _rs_report_task: Optional[asyncio.Task] = None
+_execution_reconciler_task: Optional[asyncio.Task] = None
 
 SERVER_SCAN_INTERVAL = 90         # 1.5 min entre varreduras server-side (era 3min — push ainda chegava com atraso perceptível quando painel fechado vs aberto)
 # Quantos símbolos varrer por ciclo (top-N por volume). Universo maior = mais
@@ -989,7 +990,7 @@ async def _rs_report_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task, _rs_report_task
+    global _snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task, _rs_report_task, _execution_reconciler_task
     # Banner de segurança go-live — shadow vs live, produção vs demo, canary.
     try:
         from services import shadow_trade_service
@@ -1018,6 +1019,16 @@ async def lifespan(app: FastAPI):
                 except Exception as e:
                     logging.warning(f"Reconciliação de boot falhou: {e}")
             asyncio.create_task(_reconcile_once())
+            # P03 — reconciliação PERSISTENTE de execução. Aguardado SÍNCRONO
+            # aqui de propósito: qualquer incidente aberto/posição untracked
+            # precisa ARMAR a quarentena ANTES do server-scan (que começa depois)
+            # abrir qualquer operação. Sobrevive a restart.
+            try:
+                from services import execution_reconciliation_service as _ers
+                _boot = await _ers.boot_reconcile()
+                logging.info(f"[p03] boot reconcile: {_boot}")
+            except Exception as e:
+                logging.error(f"[p03] boot reconcile falhou (fail-closed no latch): {e}")
         except Exception as e:
             logging.error(f"Falha ao inicializar DB: {e}")
     # Recalibração automática da autoaprendizagem (a cada N dias)
@@ -1042,6 +1053,14 @@ async def lifespan(app: FastAPI):
         logging.info("Trade manager iniciado.")
     except Exception as e:
         logging.warning(f"Falha ao iniciar trade_manager: {e}")
+    # P03 — reconciliador de execução (task periódica no runtime existente; NÃO é
+    # worker/scheduler/queue separado). Reconcilia incidentes UNKNOWN persistidos.
+    try:
+        from services import execution_reconciliation_service as _ers
+        _execution_reconciler_task = asyncio.create_task(_ers.loop())
+        logging.info(f"[p03] reconciliador de execução iniciado (cada {_ers.RECONCILE_INTERVAL_S:.0f}s).")
+    except Exception as e:
+        logging.warning(f"[p03] falha ao iniciar reconciliador: {e}")
     # Lembretes de vencimento (renovações de serviços pagos) via Telegram
     try:
         from services import reminders_service
@@ -1083,7 +1102,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logging.warning(f"Falha ao iniciar relatório Real×Shadow: {e}")
     yield
-    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task, _rs_report_task):
+    for t in (_snapshot_task, _scan_task, _trade_manager_task, _recalibration_task, _reminders_task, _rotation_task, _health_watchdog_task, _digest_task, _rs_report_task, _execution_reconciler_task):
         if t:
             t.cancel()
             try:
@@ -2818,6 +2837,17 @@ async def risk_status():
     """
     from services import risk_service
     return await risk_service.get_status()
+
+
+@app.get("/api/execution-incidents/status")
+async def execution_incidents_status():
+    """P03 — reconciliação persistente de execução (SOMENTE LEITURA).
+
+    Retorna os incidentes UNKNOWN abertos, contadores por estado, se a quarentena
+    está ativa e o estado do reconciliador. Sem mutação: nada de execute/retry-now/
+    resolve/close/enable-live (por contrato do P03)."""
+    from services import execution_reconciliation_service as _ers
+    return await _ers.get_status()
 
 
 @app.post("/api/risk/kill-switch")
