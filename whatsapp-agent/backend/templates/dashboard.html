@@ -1544,17 +1544,20 @@ function renderContractsList() {
       ? `<button onclick="resendContract(${c.id})" class="text-xs text-brand font-medium hover:underline">Reenviar</button>` : "";
     const linkBtn = (c.status !== "assinado" && c.token)
       ? `<button onclick="copyContractLink('${c.token}')" class="text-xs text-gray-500 hover:underline">Copiar link</button>` : "";
+    const editBtn = `<button onclick="editContractName(${c.id})" title="Editar nome" aria-label="Editar nome do paciente" class="text-sm text-gray-300 hover:text-brand leading-none">✏️</button>`;
     const delBtn = `<button onclick="deleteContract(${c.id})" title="Excluir da lista" aria-label="Excluir contrato" class="text-sm text-gray-300 hover:text-red-600 leading-none">🗑</button>`;
+    const noName = !(c.patient_name && c.patient_name.trim());
+    const nameCls = noName ? "text-sm font-medium text-gray-400 truncate italic" : "text-sm font-medium text-gray-800 truncate";
     return `<div class="flex items-center justify-between gap-2 border border-gray-100 rounded-xl px-3 py-2">
       <div class="min-w-0">
         <div class="flex items-center gap-2">
-          <span class="text-sm font-medium text-gray-800 truncate">${nm}</span>
+          <span class="${nameCls}">${nm}</span>
           <span class="text-[11px] px-2 py-0.5 rounded-full ${st.cls}">${st.label}</span>
           <span class="text-[11px] text-gray-400">v${c.template_version||0}</span>
         </div>
         <div class="text-xs text-gray-500">${dateInfo}</div>
       </div>
-      <div class="flex items-center gap-3 shrink-0">${pdfBtn}${linkBtn}${resendBtn}${delBtn}</div>
+      <div class="flex items-center gap-3 shrink-0">${pdfBtn}${linkBtn}${resendBtn}${editBtn}${delBtn}</div>
     </div>`;
   }).join("");
 }
@@ -1564,6 +1567,18 @@ function resendContract(id) {
   api("/dashboard/api/contracts/" + id + "/resend", {method:"POST"})
     .then(d => { alert(d.sent ? "Contrato reenviado ✓" : ("Falha: " + (d.reason||""))); loadContractsList(); })
     .catch(e => alert("Erro: " + e.message));
+}
+
+function editContractName(id) {
+  const c = _ctAll.find(x => x.id === id);
+  const cur = (c && c.patient_name && c.patient_name.trim()) || "";
+  const name = prompt("Nome do paciente para este contrato:", cur);
+  if (name === null) return;               // cancelou
+  const nm = name.trim();
+  if (!nm) { alert("Nome vazio — nada foi alterado."); return; }
+  api("/dashboard/api/contracts/" + id + "/name", {method:"PATCH", body: JSON.stringify({name: nm})})
+    .then(() => loadContractsList())
+    .catch(e => alert("Erro ao salvar o nome: " + e.message));
 }
 
 function deleteContract(id) {

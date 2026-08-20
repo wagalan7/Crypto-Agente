@@ -2627,6 +2627,17 @@ def delete_contract(contract_id: int) -> None:
         conn.execute("DELETE FROM contracts WHERE id = ?", (contract_id,))
 
 
+def set_contract_patient_name(contract_id: int, name: str) -> None:
+    """Grava o nome do paciente no contrato (botão ✏️ da lista). Usado quando o
+    contrato foi criado só com o número — deixa o nome imediato na lista, sem
+    depender do fallback do cadastro."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE contracts SET patient_name = ?, updated_at = datetime('now') WHERE id = ?",
+            (name, contract_id),
+        )
+
+
 def has_signed_contract(tenant_id: int, phone: str, require_version: int | None = None) -> bool:
     """True se o paciente tem contrato assinado. Se require_version for passado,
     exige que a versão assinada seja >= essa (usado no bloqueio 'versão vigente')."""
