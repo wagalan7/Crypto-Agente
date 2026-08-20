@@ -1068,7 +1068,12 @@
 
     <!-- Lista de contratos -->
     <div class="bg-white rounded-2xl border border-gray-200 p-4">
-      <h3 class="text-sm font-semibold text-gray-800 mb-3">📋 Contratos</h3>
+      <div class="flex items-center justify-between gap-2 mb-3">
+        <h3 class="text-sm font-semibold text-gray-800 shrink-0">📋 Contratos</h3>
+        <input id="ct-search" type="search" oninput="renderContractsList()" autocomplete="off"
+          placeholder="🔎 Buscar por nome ou telefone…"
+          class="text-sm border border-gray-200 rounded-lg px-3 py-1.5 w-40 sm:w-64 focus:outline-none focus:ring-2 focus:ring-brand-200 focus:border-brand-300">
+      </div>
       <div id="ct-list" class="space-y-2">
         <p class="text-sm text-gray-400">Carregando…</p>
       </div>
@@ -1503,37 +1508,55 @@ function _ctDate(s) {
   return String(s).slice(0,16).replace("T"," ");
 }
 
+let _ctAll = [];
+
 function loadContractsList() {
   const el = document.getElementById("ct-list");
   el.innerHTML = '<p class="text-sm text-gray-400">Carregando…</p>';
   api("/dashboard/api/contracts").then(d => {
-    const cs = d.contracts || [];
-    if (!cs.length) { el.innerHTML = '<p class="text-sm text-gray-400">Nenhum contrato ainda.</p>'; return; }
-    el.innerHTML = cs.map(c => {
-      const st = _CT_STATUS[c.status] || {label:c.status||"—", cls:"bg-gray-100 text-gray-600"};
-      const nm = c.patient_name || c.phone;
-      const dateInfo = c.status === "assinado"
-        ? ("Assinado em " + _ctDate(c.signed_at))
-        : (c.sent_at ? ("Enviado " + _ctDate(c.sent_at) + (c.expires_at ? (" · expira " + _ctDate(c.expires_at)) : "")) : "Não enviado");
-      const pdfBtn = (c.status === "assinado" && c.has_pdf && c.token)
-        ? `<a href="/contrato/${c.token}/pdf" target="_blank" class="text-xs text-brand font-medium hover:underline">📄 PDF</a>` : "";
-      const resendBtn = (c.status !== "assinado")
-        ? `<button onclick="resendContract(${c.id})" class="text-xs text-brand font-medium hover:underline">Reenviar</button>` : "";
-      const linkBtn = (c.status !== "assinado" && c.token)
-        ? `<button onclick="copyContractLink('${c.token}')" class="text-xs text-gray-500 hover:underline">Copiar link</button>` : "";
-      return `<div class="flex items-center justify-between gap-2 border border-gray-100 rounded-xl px-3 py-2">
-        <div class="min-w-0">
-          <div class="flex items-center gap-2">
-            <span class="text-sm font-medium text-gray-800 truncate">${nm}</span>
-            <span class="text-[11px] px-2 py-0.5 rounded-full ${st.cls}">${st.label}</span>
-            <span class="text-[11px] text-gray-400">v${c.template_version||0}</span>
-          </div>
-          <div class="text-xs text-gray-500">${dateInfo}</div>
-        </div>
-        <div class="flex items-center gap-3 shrink-0">${pdfBtn}${linkBtn}${resendBtn}</div>
-      </div>`;
-    }).join("");
+    _ctAll = d.contracts || [];
+    renderContractsList();
   }).catch(e => { el.innerHTML = '<p class="text-sm text-red-600">Erro ao carregar: ' + e.message + '</p>'; });
+}
+
+function _ctEsc(s) {
+  return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+function renderContractsList() {
+  const el = document.getElementById("ct-list");
+  if (!el) return;
+  if (!_ctAll.length) { el.innerHTML = '<p class="text-sm text-gray-400">Nenhum contrato ainda.</p>'; return; }
+  const q = (document.getElementById("ct-search")?.value || "").trim().toLowerCase();
+  const cs = q
+    ? _ctAll.filter(c => ((c.patient_name||"") + " " + (c.phone||"")).toLowerCase().includes(q))
+    : _ctAll;
+  if (!cs.length) { el.innerHTML = '<p class="text-sm text-gray-400">Nenhum contrato encontrado para "' + _ctEsc(q) + '".</p>'; return; }
+  el.innerHTML = cs.map(c => {
+    const st = _CT_STATUS[c.status] || {label:c.status||"—", cls:"bg-gray-100 text-gray-600"};
+    const nm = _ctEsc(c.patient_name || c.phone);
+    const dateInfo = c.status === "assinado"
+      ? ("Assinado em " + _ctDate(c.signed_at))
+      : (c.sent_at ? ("Enviado " + _ctDate(c.sent_at) + (c.expires_at ? (" · expira " + _ctDate(c.expires_at)) : "")) : "Não enviado");
+    const pdfBtn = (c.status === "assinado" && c.has_pdf && c.token)
+      ? `<a href="/contrato/${c.token}/pdf" target="_blank" class="text-xs text-brand font-medium hover:underline">📄 PDF</a>` : "";
+    const resendBtn = (c.status !== "assinado")
+      ? `<button onclick="resendContract(${c.id})" class="text-xs text-brand font-medium hover:underline">Reenviar</button>` : "";
+    const linkBtn = (c.status !== "assinado" && c.token)
+      ? `<button onclick="copyContractLink('${c.token}')" class="text-xs text-gray-500 hover:underline">Copiar link</button>` : "";
+    const delBtn = `<button onclick="deleteContract(${c.id})" title="Excluir da lista" aria-label="Excluir contrato" class="text-sm text-gray-300 hover:text-red-600 leading-none">🗑</button>`;
+    return `<div class="flex items-center justify-between gap-2 border border-gray-100 rounded-xl px-3 py-2">
+      <div class="min-w-0">
+        <div class="flex items-center gap-2">
+          <span class="text-sm font-medium text-gray-800 truncate">${nm}</span>
+          <span class="text-[11px] px-2 py-0.5 rounded-full ${st.cls}">${st.label}</span>
+          <span class="text-[11px] text-gray-400">v${c.template_version||0}</span>
+        </div>
+        <div class="text-xs text-gray-500">${dateInfo}</div>
+      </div>
+      <div class="flex items-center gap-3 shrink-0">${pdfBtn}${linkBtn}${resendBtn}${delBtn}</div>
+    </div>`;
+  }).join("");
 }
 
 function resendContract(id) {
@@ -1541,6 +1564,15 @@ function resendContract(id) {
   api("/dashboard/api/contracts/" + id + "/resend", {method:"POST"})
     .then(d => { alert(d.sent ? "Contrato reenviado ✓" : ("Falha: " + (d.reason||""))); loadContractsList(); })
     .catch(e => alert("Erro: " + e.message));
+}
+
+function deleteContract(id) {
+  const c = _ctAll.find(x => x.id === id);
+  const nm = (c && (c.patient_name || c.phone)) || "este contrato";
+  if (!confirm("Excluir o contrato de " + nm + " da lista?\n\nRemove o registro do painel. Não notifica o paciente nem apaga o cadastro.")) return;
+  api("/dashboard/api/contracts/" + id, {method:"DELETE"})
+    .then(() => loadContractsList())
+    .catch(e => alert("Erro ao excluir: " + e.message));
 }
 
 function copyContractLink(token) {

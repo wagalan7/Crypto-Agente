@@ -2617,6 +2617,16 @@ def get_contracts_for_phone(tenant_id: int, phone: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def delete_contract(contract_id: int) -> None:
+    """Remove uma instância de contrato (hard delete) e seus lembretes.
+    NÃO apaga o template do consultório nem o cadastro do paciente — só tira
+    aquele contrato da lista do painel. Usado pelo botão 🗑 (ex-paciente que
+    recebeu contrato por engano)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM contract_reminders_log WHERE contract_id = ?", (contract_id,))
+        conn.execute("DELETE FROM contracts WHERE id = ?", (contract_id,))
+
+
 def has_signed_contract(tenant_id: int, phone: str, require_version: int | None = None) -> bool:
     """True se o paciente tem contrato assinado. Se require_version for passado,
     exige que a versão assinada seja >= essa (usado no bloqueio 'versão vigente')."""
