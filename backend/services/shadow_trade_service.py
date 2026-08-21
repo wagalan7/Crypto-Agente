@@ -61,29 +61,46 @@ VIRTUAL_EQUITY_USD = float(os.getenv("EXCHANGE_SHADOW_EQUITY_USD", "5000"))
 _LIVE_CONFIRM_PHRASE = "ENTENDO_RISCO_DINHEIRO_REAL"
 LIVE_TRADING_CONFIRM = os.getenv("LIVE_TRADING_CONFIRM", "").strip()
 
-# Latch fail-closed em memória. A pausa principal é persistida no RiskState,
-# mas uma indisponibilidade do DB não pode liberar a próxima ordem do mesmo
-# processo. A retomada manual limpa ambos (ver risk_service.set_manual_pause).
+# Latch fail-closed em memória, agora com OWNERSHIP (P03.1). A pausa principal é
+# persistida no RiskState, mas uma indisponibilidade do DB não pode liberar a
+# próxima ordem do mesmo processo. Cada owner (P02/"legacy", "p03", ...) segura o
+# latch de forma independente: limpar um owner NÃO libera o latch se outro ainda
+# o segura. A retomada manual do operador (clear sem owner) limpa TODOS — contrato
+# preservado em risk_service.set_manual_pause.
 _EXECUTION_QUARANTINE_REASON: Optional[str] = None
+_EXECUTION_QUARANTINE_OWNERS: set = set()
 
 
-def _arm_execution_quarantine(reason: str) -> None:
+def _arm_execution_quarantine(reason: str, owner: str = "legacy") -> None:
     global _EXECUTION_QUARANTINE_REASON
+    _EXECUTION_QUARANTINE_OWNERS.add(owner)
     if not _EXECUTION_QUARANTINE_REASON:
         _EXECUTION_QUARANTINE_REASON = reason
-    log.critical(f"[execution-quarantine] ATIVA: {_EXECUTION_QUARANTINE_REASON}")
+    log.critical(f"[execution-quarantine] ATIVA (owner={owner}): {_EXECUTION_QUARANTINE_REASON}")
 
 
-def clear_execution_quarantine() -> None:
+def clear_execution_quarantine(owner: Optional[str] = None) -> None:
+    """owner=None → retomada manual: limpa TODOS os owners (contrato existente).
+    owner="p03" → limpa só o latch daquele owner; se outro owner ainda segura, o
+    latch permanece ativo (nunca libera quarentena alheia)."""
     global _EXECUTION_QUARANTINE_REASON
-    previous = _EXECUTION_QUARANTINE_REASON
-    _EXECUTION_QUARANTINE_REASON = None
-    if previous:
-        log.warning(f"[execution-quarantine] limpa por retomada manual: {previous}")
+    if owner is None:
+        _EXECUTION_QUARANTINE_OWNERS.clear()
+    else:
+        _EXECUTION_QUARANTINE_OWNERS.discard(owner)
+    if not _EXECUTION_QUARANTINE_OWNERS:
+        previous = _EXECUTION_QUARANTINE_REASON
+        _EXECUTION_QUARANTINE_REASON = None
+        if previous:
+            log.warning(f"[execution-quarantine] limpa (owner={owner or 'manual'}): {previous}")
 
 
 def execution_quarantine_reason() -> Optional[str]:
     return _EXECUTION_QUARANTINE_REASON
+
+
+def execution_quarantine_owners() -> set:
+    return set(_EXECUTION_QUARANTINE_OWNERS)
 
 
 async def _persist_execution_quarantine(reason: str) -> None:
@@ -118,11 +135,19 @@ async def _open_trade_fail_closed(*, symbol: str, source: str, **kwargs):
         await _persist_execution_quarantine(reason)
         # P03 — incidente persistente: posição real sem RealTrade correspondente.
         # Nunca fecha automaticamente; escala para MANUAL_REQUIRED no reconciler.
+        # Persiste toda identidade/estado que o caller conhece (não só o retorno
+        # da Binance): side, qty, stop, order/client IDs.
         try:
             from services import execution_reconciliation_service as _ers
             await _ers.record_incident(
                 kind=_ers.Kind.PERSISTENCE_FAILURE, symbol=symbol,
-                payload={"open_trade_failure": failure},
+                side=kwargs.get("direction") or kwargs.get("side"),
+                planned_qty=kwargs.get("qty") or kwargs.get("quantity") or kwargs.get("qty_initial"),
+                planned_stop=kwargs.get("stop_loss") or kwargs.get("stop") or kwargs.get("sl_current_price"),
+                entry_order_id=(str(kwargs.get("exchange_order_id")) if kwargs.get("exchange_order_id") else None),
+                client_order_id=kwargs.get("client_order_id"),
+                snapshot_id=(str(kwargs.get("snapshot_id")) if kwargs.get("snapshot_id") else None),
+                payload={"open_trade_failure": failure, "source": source},
             )
         except Exception as _p03_exc:  # noqa: BLE001
             log.critical(f"[p03] incidente de persistência não gravado (latch cobre): {_p03_exc}")
@@ -5142,19 +5167,28 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             )
                         # P03 — persiste o incidente para reconciliação que
                         # sobrevive a restart (o latch acima só cobre este processo).
+                        # Persiste TODA a identidade/estado conhecida pelo caller:
+                        # kind correto (por safety_state), client/entry order IDs,
+                        # prefixo das condicionais (<coid>-sl/-tp1/-tp2), qty
+                        # planejada, lower-bound, side, stop, snapshot e flag maker.
                         try:
                             from services import execution_reconciliation_service as _ers
+                            _coid = order_res.get("client_order_id")
                             await _ers.record_incident(
-                                kind=(_ers.Kind.CLEANUP_PENDING if _closed
-                                      else _ers.Kind.ENTRY_ORDER_UNKNOWN),
+                                kind=_ers.kind_from_safety_state(
+                                    order_res.get("safety_state"), closed=bool(_closed)),
                                 symbol=rec["symbol"],
                                 side=rec.get("direction") or rec.get("side"),
-                                client_order_id=order_res.get("client_order_id"),
+                                client_order_id=_coid,
                                 entry_order_id=str((order_res.get("result") or {}).get("orderId") or "") or None,
+                                conditional_prefix=_coid,   # P02 nomeia <coid>-sl/-tp1/-tp2
+                                planned_qty=(rec.get("qty") or rec.get("position_size")),
                                 planned_stop=rec.get("stop_loss") or rec.get("stop"),
                                 min_known_fill=(float(order_res.get("executed_qty") or 0) or None),
-                                payload={"safety_state": order_res.get("safety_state"),
-                                         "closed": bool(_closed), "snap_id": snap_id},
+                                safety_state=order_res.get("safety_state"),
+                                snapshot_id=(str(snap_id) if snap_id else None),
+                                pending_maker=bool(order_res.get("maker") or order_res.get("is_maker")),
+                                payload={"closed": bool(_closed)},
                             )
                         except Exception as _p03_exc:
                             log.critical(f"[p03] persistência do incidente falhou "

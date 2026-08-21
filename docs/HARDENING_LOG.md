@@ -166,3 +166,34 @@ Defaults fail-closed preservados: `MAKER_ENTRY_ENABLED=false`,
 
 - Revalidação de preço e política de fallback MARKET maker permanecem para o P04,
   **não implementado** aqui.
+
+## P03.1 - Correções de segurança da reconciliação
+
+- Status: Concluído localmente (não publicado/não ativado em conta real)
+- Branch: `feat/hardening-p03-1` (novo commit sobre `62e4150e`)
+- Detalhe: `docs/P03_EXECUTION_RECONCILIATION.md` (seção P03.1)
+
+### Fechou as lacunas da auditoria P03
+
+- **Contrato SL real (snake_case):** adota SL vivo válido (lado/cobertura/trigger)
+  e, sob invariantes estritas, CRIA SL via `place_protection_orders` (assinatura
+  real; sucesso exige `sl_ok` + `sl_order_id`). Nunca TP com qty incerta.
+- **Ownership de quarentena:** latch por owner — P03 arma/limpa só o próprio,
+  não apaga latch P02/legado nem pausa manual; libera só na transição >0→0.
+- **Boot fail-closed real:** falha DB/leitura ou posições stale armam a quarentena
+  antes dos loops live (main.py + boot_reconcile + _detect_untracked).
+- **Cleanup por identidade exata** (`algo_id`/`client_algo_id`/`<prefix>-sl…`),
+  `cancel.ok` exigido + reconfirmação; sem identidade não resolve por ausência.
+- **Maker viva** NEW/PARTIAL cancelada pelo ID, validada e re-consultada; sem MARKET.
+- **Fencing** owner+lease (`update_claimed`/`renew_claim`/`release_claim`); lease
+  vencido não atualiza estado nem muta exchange nem libera claim alheio.
+- **Upsert atômico** `INSERT … ON CONFLICT`; incidente resolvido que reincide reabre.
+- Menores: `_find_exact`+`client_algo_id`; untracked usa `side` real; `cancel
+  ok=False` ≠ sucesso; qty NaN/inf inválida; backoff inicial 15s.
+
+### Validação
+
+- **46 testes P03.1** herméticos; suíte crítica (P01+P02+P03.1) = **102**, verde.
+- `py_compile` e `git diff --check` aprovados. Nenhuma rede/exchange/DB real.
+- Limitação: atomicidade do upsert SQL/fencing exercitada em memória (sem Postgres
+  descartável) — não é teste Postgres real. Sem push/deploy.

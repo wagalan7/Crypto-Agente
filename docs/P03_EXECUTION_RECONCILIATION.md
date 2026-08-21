@@ -25,13 +25,22 @@ Nenhuma nova entrada pode ocorrer enquanto existir incidente não resolvido.
 
 ## Reuso do P02 (sem novo motor de ordens)
 
-Reutiliza as primitivas P02 de **leitura/cancelamento**: `get_order`
-(reconciliação por `clientOrderId`), `_fresh_position_size`/
-`get_positions(force=True)`, `get_open_algo_orders`, `cancel_algo_order`, o
-contrato de SL por `algoId`, o **latch** de `shadow_trade_service`, a pausa do
-`RiskState` e o `RealTrade`. **P03 não coloca ordem nova**: adota um SL vivo que
-cumpra o contrato de cobertura ou escala para `MANUAL_REQUIRED` (a criação de
-proteção na entrada segue sendo do fail-safe P02).
+Reutiliza as primitivas P02: `get_order` (por `clientOrderId`),
+`_fresh_position_size`/`get_positions(force=True)`, `get_open_algo_orders`,
+`cancel_order`, `cancel_algo_order`, `place_protection_orders`, o **latch**
+owner-aware de `shadow_trade_service`, a pausa do `RiskState` e o `RealTrade`.
+
+O que o P03 **faz** (P03.1): consulta ordens/posições; **cancela** maker viva e
+condicionais **exatas** órfãs; **cria SOMENTE SL** sob invariantes estritas
+(posição fresh aberta, lado conhecido, stop válido, qty confirmada, identidade)
+reusando `place_protection_orders(symbol, entry_side, qty, stop_loss=…, tp1=None,
+tp2=None, client_order_id_prefix=…, dedup_live=True)` — sucesso exige
+`sl_ok is True` **e** `sl_order_id`. O que o P03 **nunca faz**: criar entry,
+emitir MARKET (nem fallback), criar **TP** com qty incerta, tratar `UNKNOWN` como
+`FLAT`, cancelar ordem de outro trade, ou liberar latch alheio (P02/operador).
+Consome o formato **snake_case** real de `get_open_algo_orders`
+(`algo_id`/`client_algo_id`/`reduce_only`/`close_position`/`quantity`/`side`/
+`trigger_price`/`type`).
 
 Criados apenas: **1 model** (`ExecutionIncident`), **1 serviço**
 (`execution_reconciliation_service.py`), **1 task** integrada ao `lifespan`
@@ -89,9 +98,39 @@ entry pendente e cleanup confirmado — **nunca** remove a pausa manual do opera
 
 ## Configuração operacional (defaults conservadores, fail-closed)
 
-`RECONCILE_INTERVAL_S=30`, `RECONCILE_BACKOFF_BASE_S=15`,
-`RECONCILE_BACKOFF_MAX_S=900`, `RECONCILE_CLEAN_GRACE=2`,
-`RECONCILE_LEASE_S=120`, `RECONCILE_MAX_ATTEMPTS=8`, `RECONCILE_MAX_PER_CYCLE=10`.
+`RECONCILE_INTERVAL_S=30`, `RECONCILE_BACKOFF_BASE_S=15` (1º retry = 15s),
+`RECONCILE_BACKOFF_MAX_S=900`, `RECONCILE_CLEAN_GRACE=2`, `RECONCILE_LEASE_S=120`,
+`RECONCILE_MAX_ATTEMPTS=8`, `RECONCILE_MAX_PER_CYCLE=10`,
+`RECONCILE_CREATE_SL=1`, `RECONCILE_STOP_TOL_FRAC=0.005` (trigger dentro de 0,5%).
+
+## P03.1 — correções de segurança da reconciliação
+
+Fecha as lacunas da auditoria P03:
+
+- **Contrato SL real:** consome snake_case de `get_open_algo_orders`; adota SL só
+  com lado de fechamento correto + (`close_position`) OU (`reduce_only` e
+  cobertura) + trigger dentro da tolerância; senão **cria** SL sob invariantes.
+- **Ownership de quarentena:** latch por owner — P03 arma/limpa só o próprio; não
+  apaga latch de P02/legado nem pausa manual do operador; libera **só** na
+  transição de ≥1 incidente para 0 (sem clear/log em ciclos comuns).
+- **Boot fail-closed real:** falha de DB/leitura ou posições stale/rate-limited
+  **arma** a quarentena P03 antes dos loops live (não só loga).
+- **Cleanup por identidade:** cancela por IDs exatos (`algo_id`/`client_algo_id`/
+  `<prefix>-sl/-tp1/-tp2`); exige `cancel.ok=True` + reconfirmação; sem identidade
+  **não** resolve por "nenhum match"; reaparecimento reinicia o grace.
+- **Maker viva:** NEW/PARTIALLY_FILLED é cancelada pelo ID, `cancel.ok` validado,
+  re-consultada e exigida terminal; cancel incerto mantém quarentena; sem MARKET.
+- **Fencing:** `claim` atômico + `update_claimed`/`renew_claim`/`release_claim`
+  com owner+lease — processo com lease vencido não atualiza estado, não muta a
+  exchange e não libera claim alheio.
+- **Upsert atômico:** `INSERT … ON CONFLICT DO NOTHING` (Postgres); duas gravações
+  → uma linha; lower-bound monotônico; falha de persistência mantém latch local.
+- **Identidade/persistência:** kind correto por `safety_state`; persiste
+  client/entry order IDs, prefixo, qty, lower-bound, side, stop, snapshot, flag
+  maker; chave sem sufixo genérico `-`; incidente resolvido que reincide **reabre**.
+- Correções menores: `_find_exact` reconhece `client_algo_id`; untracked usa
+  `side` real; `cancel ok=False` não é sucesso; qty NaN/inf inválida; backoff
+  inicial = 15s.
 
 ## API (somente leitura)
 
@@ -102,15 +141,19 @@ resolve/close/enable-live. Frontend inalterado neste P03.
 
 ## Testes
 
-`backend/tests/test_p03_execution_reconciliation.py` — 37 testes herméticos
+`backend/tests/test_p03_execution_reconciliation.py` — **46 testes** herméticos
 (nenhuma rede/Binance/DB real; nenhuma entry criada). Suíte crítica completa
-(P01+P02+P03) = **93 testes**, executada **2×**, verde. `py_compile` e
-`git diff --check` verdes.
+(P01+P02+P03.1) = **102 testes**, verde. `py_compile` e `git diff --check` verdes.
 
-> Nota de ambiente: produção roda Python 3.11 (onde `Mapped[X | None]` dos models
-> resolve nativamente). O único interpretador com deps nesta máquina é o 3.9; as
-> suítes foram executadas com um shim de bootstrap **apenas de teste** (fora do
-> repo) que resolve PEP 604 no 3.9. Nenhum arquivo do projeto foi alterado por isso.
+> Limitação declarada: sem Postgres descartável local, a atomicidade do upsert
+> SQL (`ON CONFLICT`) e o fencing por `UPDATE…WHERE` são exercitados na
+> implementação **em memória equivalente** (mesma semântica) — **não** é um teste
+> Postgres real.
+>
+> Nota de ambiente: produção roda Python 3.11 (onde `Mapped[X | None]` resolve
+> nativamente). O único interpretador com deps nesta máquina é o 3.9; as suítes
+> rodaram com um shim de bootstrap **apenas de teste** (fora do repo) que resolve
+> PEP 604 no 3.9. Nenhum arquivo do projeto foi alterado por isso.
 
 ## Escopo / invariantes
 

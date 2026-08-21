@@ -1028,7 +1028,14 @@ async def lifespan(app: FastAPI):
                 _boot = await _ers.boot_reconcile()
                 logging.info(f"[p03] boot reconcile: {_boot}")
             except Exception as e:
-                logging.error(f"[p03] boot reconcile falhou (fail-closed no latch): {e}")
+                # Fail-closed REAL: se o boot lançar por completo, ARMA o latch P03
+                # antes dos loops live — não basta logar (auditoria P03 F3).
+                logging.error(f"[p03] boot reconcile falhou — armando quarentena P03: {e}")
+                try:
+                    from services import execution_reconciliation_service as _ers2
+                    await _ers2._arm_quarantine(f"boot reconcile lançou: {e}")
+                except Exception as _arm_exc:
+                    logging.critical(f"[p03] falha armando quarentena no boot: {_arm_exc}")
         except Exception as e:
             logging.error(f"Falha ao inicializar DB: {e}")
     # Recalibração automática da autoaprendizagem (a cada N dias)
