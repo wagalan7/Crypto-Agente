@@ -1037,7 +1037,16 @@ async def lifespan(app: FastAPI):
                 except Exception as _arm_exc:
                     logging.critical(f"[p03] falha armando quarentena no boot: {_arm_exc}")
         except Exception as e:
-            logging.error(f"Falha ao inicializar DB: {e}")
+            # Fail-closed REAL: falha de init_db/boot é ANTES dos loops live que
+            # podem aumentar exposição → ARMA a quarentena P03 e marca boot inseguro
+            # (não fica fail-open). Só uma leitura fresh posterior libera.
+            logging.error(f"Falha ao inicializar DB — armando quarentena P03: {e}")
+            try:
+                from services import execution_reconciliation_service as _ers3
+                _ers3._mark_boot_unsafe()
+                await _ers3._arm_quarantine(f"init_db/boot falhou: {e}")
+            except Exception as _arm_exc:
+                logging.critical(f"[p03] falha armando quarentena após init_db: {_arm_exc}")
     # Recalibração automática da autoaprendizagem (a cada N dias)
     try:
         _recalibration_task = asyncio.create_task(_recalibration_loop())

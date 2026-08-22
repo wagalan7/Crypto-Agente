@@ -242,6 +242,30 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
         return _to_dict(state)
 
 
+async def release_p03_pause(marker: str) -> bool:
+    """Resume owner-aware do P03 (P03.1B): remove a pausa persistida SOMENTE se a
+    pausa ATUAL ainda pertencer ao P03 (reason começa com `marker`). CAS dentro da
+    transação: se o operador/circuit-breaker trocou a pausa, o P03 não altera nada.
+    NÃO chama `clear_execution_quarantine()` genérico (isso apaga owners P02/manual);
+    o latch P03 em memória é limpo pelo próprio reconciliador com owner="p03"."""
+    if not DB_ENABLED:
+        return False
+    async with get_session() as session:
+        state = await _get_or_create_state(session)
+        if not state.trading_paused or not (state.pause_reason or "").startswith(marker):
+            await session.commit()
+            return False   # pausa não é P03-owned → não mexe
+        state.trading_paused = False
+        state.pause_manual = False
+        state.pause_reason = None
+        state.paused_at = None
+        state.updated_at = datetime.now(timezone.utc)
+        _log_event(session, state, "p03_resume", "P03: incidentes resolvidos")
+        await session.commit()
+        log.warning("[circuit-breaker] P03 resume (owner-aware) — pausa P03 removida")
+        return True
+
+
 async def list_events(days: int = 30, limit: int = 200) -> list[dict]:
     """Lista eventos do circuit breaker dos últimos N dias (mais recentes primeiro)."""
     if not DB_ENABLED:

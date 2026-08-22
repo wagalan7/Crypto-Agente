@@ -81,12 +81,24 @@ def _install_fake_services():
     async def set_manual_pause(paused, reason=None):
         rs["paused"] = paused
         rs["reason"] = reason if paused else None
+        if not paused:
+            clear(None)            # side effect REAL: resume manual limpa TODOS os owners
         return {"trading_paused": paused, "pause_reason": rs["reason"]}
+
+    async def release_p03_pause(marker):
+        # CAS owner-aware: só remove se a pausa atual ainda é P03. NÃO chama o
+        # clear genérico (não apaga owners P02/manual).
+        if not rs["paused"] or not (rs["reason"] or "").startswith(marker):
+            return False
+        rs["paused"] = False
+        rs["reason"] = None
+        return True
 
     async def get_status():
         return {"enabled": True, "trading_paused": rs["paused"], "pause_reason": rs["reason"]}
 
     risk.set_manual_pause = set_manual_pause
+    risk.release_p03_pause = release_p03_pause
     risk.get_status = get_status
     risk.is_paused = lambda: rs["paused"]
 
@@ -202,14 +214,18 @@ class _AsyncBase(unittest.IsolatedAsyncioTestCase):
         ers.set_repo(InMemoryIncidentRepo())
         ers._prev_open_count = 0
         ers._p03_latch_armed = False
+        ers._boot_scan_safe = True   # testes de reconcile não exercitam o re-scan de boot
         self._arm = patch.object(ers, "_arm_quarantine", AsyncMock())
         self._rel = patch.object(ers, "_maybe_release_quarantine", AsyncMock(return_value=False))
+        self._mrt = patch.object(ers, "_match_real_trade", AsyncMock(return_value={"skip": True}))
         self._arm.start()
         self._rel.start()
+        self._mrt.start()
 
     def tearDown(self):
         self._arm.stop()
         self._rel.stop()
+        self._mrt.stop()
         ers.set_repo(None)
 
     async def _seed(self, **kw):
@@ -506,6 +522,7 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
         ers.set_repo(InMemoryIncidentRepo())
         ers._prev_open_count = 0
         ers._p03_latch_armed = False
+        ers._boot_scan_safe = False
         self.shadow, self.risk, self.st, self.rs, self.owners = _install_fake_services()
 
     def tearDown(self):
@@ -520,8 +537,10 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("legacy", self.owners)
         # P03 tenta liberar (sem incidentes) — NÃO pode apagar o latch legacy
         ers._prev_open_count = 1  # simula transição
+        ers._boot_scan_safe = True
         await ers._maybe_release_quarantine()
         self.assertIn("legacy", self.owners)                 # latch P02 preservado
+        self.assertNotIn("p03", self.owners)                 # só o próprio owner saiu
         self.assertIsNotNone(self.shadow.execution_quarantine_reason())
 
     async def test_arm_does_not_overwrite_manual_pause(self):
@@ -533,6 +552,11 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
         await ers._arm_quarantine("p03 incidente")           # pausa P03-owned
         self.assertTrue(self.rs["paused"])
         ers._prev_open_count = 1
+        # sem boot_scan_safe → NÃO libera (mantém quarentena)
+        self.assertFalse(await ers._maybe_release_quarantine())
+        self.assertTrue(self.rs["paused"])
+        # com boot_scan_safe → libera SÓ o owner p03, via release_p03_pause (sem clear genérico)
+        ers._boot_scan_safe = True
         self.assertTrue(await ers._maybe_release_quarantine())
         self.assertFalse(self.rs["paused"])
         self.assertNotIn("p03", self.owners)
@@ -544,7 +568,8 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.shadow.execution_quarantine_reason())
 
     async def test_boot_arms_before_loops_when_open_incident(self):
-        with patch.object(ers, "_detect_untracked_positions", AsyncMock(return_value=0)), \
+        with patch.object(ers, "_detect_untracked_positions",
+                          AsyncMock(return_value={"status": "FLAT", "count": 0})), \
                 patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
             await ers.record_incident(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT", client_order_id="c1")
             out = await ers.boot_reconcile()
@@ -604,6 +629,225 @@ class ApiArchTests(_AsyncBase):
         self.assertNotEqual(os.getenv("MAKER_ENTRY_ENABLED", "false").lower(), "true")
         self.assertNotEqual(os.getenv("TF_UPGRADE_ENABLED", "false").lower(), "true")
         self.assertNotEqual(os.getenv("PYRAMIDING_ENABLED", "false").lower(), "true")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  P03.1B — QTY/SL/tracking/lease/integração/ownership/boot
+# ════════════════════════════════════════════════════════════════════════════
+class QtyRawTests(unittest.TestCase):
+    def test_terminal_status_without_raw_executedqty_stays_unknown(self):
+        # executed_qty normalizado = 0.0 NÃO pode virar FLAT por ausência.
+        q, _ = terminal_qty({"ok": True, "status": "CANCELED", "raw": {}, "executed_qty": 0.0})
+        self.assertIsNone(q)
+        v, _, _ = classify_entry({"ok": True, "status": "EXPIRED_IN_MATCH", "raw": {}, "executed_qty": 0.0})
+        self.assertEqual(v, "FILL_UNKNOWN")
+
+    def test_terminal_with_raw_executedqty_used(self):
+        q, _ = terminal_qty({"ok": True, "status": "CANCELED", "raw": {"executedQty": "0.7"}, "executed_qty": 0.0})
+        self.assertEqual(q, 0.7)
+
+    def test_string_false_not_true(self):
+        inc = {"side": "buy", "planned_stop": 100.0}
+        listing = {"orders": [_algo(algo_id="A1", side="SELL", reduce_only="false",
+                                    close_position="false", quantity=1.0, trigger_price=100.0)]}
+        self.assertFalse(_adopt_live_stop(inc, 1.0, listing)[0])   # "false" não cobre
+
+    def test_fresh_larger_needs_bigger_coverage(self):
+        inc = {"side": "buy", "planned_stop": 100.0}
+        listing = {"orders": [_algo(algo_id="A1", side="SELL", reduce_only=True, quantity=1.0, trigger_price=100.0)]}
+        self.assertTrue(_adopt_live_stop(inc, 1.0, listing)[0])    # cobre 1.0
+        self.assertFalse(_adopt_live_stop(inc, 2.0, listing)[0])   # posição fresh 2.0 > 1.0
+
+    def test_reject_missing_side_and_dead_status(self):
+        inc = {"side": "buy", "planned_stop": 100.0}
+        self.assertFalse(_adopt_live_stop(inc, 1.0, {"orders": [_algo(algo_id="A1", side="",
+                          close_position=True, trigger_price=100.0)]})[0])          # sem side
+        self.assertFalse(_adopt_live_stop(inc, 1.0, {"orders": [_algo(algo_id="A1", side="SELL",
+                          close_position=True, trigger_price=100.0, status="CANCELED")]})[0])  # morta
+
+    def test_safe_prefix_no_unicode(self):
+        p = ers._safe_prefix("binance:ENTRY:BTC/USDT:USDT:cw-abc")
+        self.assertNotIn("…", p)
+        self.assertTrue(all(c.isalnum() or c == "-" for c in p))
+        self.assertLessEqual(len(p), 20)
+
+
+class IntegrationAssemblyTests(unittest.TestCase):
+    def test_assemble_preserves_caller_client_id_and_maker(self):
+        rec = {"symbol": "BTC/USDT:USDT", "direction": "long", "qty": 1.0, "stop_loss": 100.0}
+        order_res = {"ok": True, "status": "PARTIALLY_FILLED", "was_maker": True,
+                     "executed_qty": 0.3, "safety_state": "ENTRY_SUBMISSION_UNKNOWN",
+                     "sl_order_id": "SL9", "tp1_order_id": "TP1", "result": {"orderId": "E1"}}
+        kw = ers.assemble_entry_incident(order_res, rec, snapshot_id=42,
+                                         local_client_order_id="cw-local")
+        self.assertEqual(kw["client_order_id"], "cw-local")   # fallback do caller
+        self.assertEqual(kw["conditional_prefix"], "cw-local")
+        self.assertTrue(kw["pending_maker"])                  # was_maker + pending
+        self.assertEqual(kw["conditional_ids"], {"sl": "SL9", "tp1": "TP1"})
+        self.assertEqual(kw["entry_order_id"], "E1")
+        self.assertEqual(kw["min_known_fill"], 0.3)
+        self.assertEqual(kw["snapshot_id"], "42")
+
+    def test_assemble_final_fill_qty_unknown_kind(self):
+        kw = ers.assemble_entry_incident({"ok": True, "final_fill_qty_unknown": True},
+                                         {"symbol": "X/USDT:USDT"}, local_client_order_id="c")
+        self.assertEqual(kw["kind"], Kind.FINAL_FILL_QTY_UNKNOWN)
+
+
+class LeaseUpsertTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.repo = InMemoryIncidentRepo()
+
+    async def test_expired_lease_does_not_renew(self):
+        await self.repo.upsert("k", {"kind": Kind.ENTRY_ORDER_UNKNOWN, "symbol": "B"})
+        await self.repo.claim("k", "A", ers._now() - timedelta(seconds=1))   # já vencido
+        self.assertFalse(await self.repo.renew_claim("k", "A", ers._now() + timedelta(seconds=60)))
+
+    async def test_old_owner_cannot_mutate_after_expiry(self):
+        await self.repo.upsert("k", {"kind": Kind.ENTRY_ORDER_UNKNOWN, "symbol": "B"})
+        await self.repo.claim("k", "A", ers._now() - timedelta(seconds=1))
+        self.assertIsNone(await self.repo.update_claimed("k", "A", state=State.FLAT))
+
+    async def test_upsert_merge_keeps_greatest_lb_and_all_ids(self):
+        await self.repo.upsert("k", {"kind": Kind.CLEANUP_PENDING, "symbol": "B",
+                                     "min_known_fill": 0.5, "conditional_ids": {"sl": "S1"}})
+        row, created = await self.repo.upsert("k", {"min_known_fill": 0.2,
+                                                    "conditional_ids": {"tp1": "T1"}, "planned_stop": 9.0})
+        self.assertFalse(created)
+        self.assertEqual(row["min_known_fill"], 0.5)               # GREATEST
+        self.assertEqual(row["conditional_ids"], {"sl": "S1", "tp1": "T1"})  # união
+        self.assertEqual(row["planned_stop"], 9.0)                 # preencheu ausente
+
+    async def test_upsert_reopens_resolved(self):
+        await self.repo.upsert("k", {"kind": Kind.ENTRY_ORDER_UNKNOWN, "symbol": "B"})
+        await self.repo.update("k", state=State.FLAT, resolved_at=ers._now())
+        row, _ = await self.repo.upsert("k", {"kind": Kind.ENTRY_ORDER_UNKNOWN, "symbol": "B"})
+        self.assertIsNone(row["resolved_at"])
+        self.assertEqual(row["state"], State.OPEN)
+
+
+class TrackingTests(_AsyncBase):
+    async def test_protected_without_real_trade_goes_manual_untracked(self):
+        await ers.record_incident(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT",
+                                  client_order_id="c1", side="buy", planned_stop=100.0)
+        key = (await ers._get_repo().list_open())[0]["incident_key"]
+        listing = {"ok": True, "orders": [_algo(algo_id="A1", side="SELL", close_position=True, trigger_price=100.0)]}
+        with patch.object(ers, "_match_real_trade", AsyncMock(return_value=None)), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
+                           get_open_algo_orders=AsyncMock(return_value=listing)):
+            await ers.reconcile_due()
+        row = await ers._get_repo().get(key)
+        self.assertEqual(row["state"], State.MANUAL_REQUIRED)     # protegido sem RealTrade
+        # criou também um incidente UNTRACKED_POSITION
+        kinds = {r["kind"] for r in await ers._get_repo().list_all()}
+        self.assertIn(Kind.UNTRACKED_POSITION, kinds)
+
+    async def test_created_sl_persisted_to_real_trade(self):
+        await ers.record_incident(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT",
+                                  client_order_id="c1", side="buy", planned_stop=100.0, planned_qty=1.0)
+        persist = AsyncMock()
+        with patch.object(ers, "_match_real_trade", AsyncMock(return_value={"id": 7})), \
+                patch.object(ers, "_persist_sl_order_id", persist), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
+                           get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": []}),
+                           place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "S1"})):
+            await ers.reconcile_due()
+        persist.assert_awaited_once_with(7, "S1")               # idempotente no RealTrade
+        self.assertEqual((await ers._get_repo().list_all())[0]["state"], State.PROTECTED)
+
+    async def test_entry_flat_with_conditional_identity_routes_cleanup(self):
+        # fresh-flat mas com prefixo de condicional → NÃO vai direto a FLAT
+        await ers.record_incident(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT",
+                                  client_order_id="cw-x", conditional_prefix="cw-x", side="buy")
+        key = (await ers._get_repo().list_open())[0]["incident_key"]
+        with _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                        _fresh_position_size=AsyncMock(return_value=(0.0, "ok")),
+                        get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": [
+                            _algo(algo_id="A1", client_algo_id="cw-x-sl")]}),
+                        cancel_algo_order=AsyncMock(return_value={"ok": True})):
+            await ers.reconcile_due()
+        row = await ers._get_repo().get(key)
+        self.assertIsNone(row["resolved_at"])                   # não resolveu FLAT — cleanup em curso
+
+
+class OwnershipRaceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ers.set_repo(InMemoryIncidentRepo())
+        ers._prev_open_count = 0
+        ers._p03_latch_armed = False
+        ers._boot_scan_safe = True
+        self.shadow, self.risk, self.st, self.rs, self.owners = _install_fake_services()
+
+    def tearDown(self):
+        ers.set_repo(None)
+        _uninstall_fake_services()
+
+    async def test_release_does_not_use_generic_clear_preserving_p02(self):
+        self.shadow._arm_execution_quarantine("p02", owner="legacy")
+        await ers._arm_quarantine("p03")
+        ers._prev_open_count = 1
+        await ers._maybe_release_quarantine()
+        # legacy preservado E pausa não foi removida (ainda há owner P02)
+        self.assertIn("legacy", self.owners)
+        self.assertTrue(self.rs["paused"])          # não resumiu (outros owners restam)
+
+    async def test_manual_non_p03_pause_not_removed(self):
+        await self.risk.set_manual_pause(True, "Pausa manual via kill switch")
+        await ers._arm_quarantine("p03")            # não sobrescreve reason manual
+        ers._prev_open_count = 1
+        await ers._maybe_release_quarantine()
+        self.assertTrue(self.rs["paused"])          # pausa manual permanece
+
+    async def test_open_incident_rearms_p03_after_improper_resume(self):
+        await ers.record_incident(kind=Kind.UNTRACKED_POSITION, symbol="BTC/USDT:USDT")
+        # resume indevido limpou o latch
+        self.shadow.clear_execution_quarantine(None)
+        self.assertIsNone(self.shadow.execution_quarantine_reason())
+        with patch.object(ers, "_detect_untracked_positions", AsyncMock(return_value={"status": "FLAT", "count": 0})):
+            await ers.reconcile_due()               # ciclo re-arma o owner P03
+        self.assertIn("p03", self.owners)
+
+
+class BootSafeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ers.set_repo(InMemoryIncidentRepo())
+        ers._prev_open_count = 0
+        ers._p03_latch_armed = False
+        ers._boot_scan_safe = False
+        self.shadow, self.risk, self.st, self.rs, self.owners = _install_fake_services()
+
+    def tearDown(self):
+        ers.set_repo(None)
+        _uninstall_fake_services()
+
+    async def test_stale_scan_keeps_boot_unsafe_and_blocks_release(self):
+        with _patch_bss(is_configured=lambda: True,
+                        get_positions=AsyncMock(return_value={"ok": True, "stale": True, "positions": []})), \
+                patch.object(ers, "_open_real_trade_symbols", AsyncMock(return_value=set())):
+            await ers._detect_untracked_positions()
+        self.assertFalse(ers._boot_scan_safe)
+        # com pausa P03 e zero incidentes, ainda NÃO libera (boot inseguro)
+        await ers._arm_quarantine("p03")
+        ers._prev_open_count = 1
+        self.assertFalse(await ers._maybe_release_quarantine())
+
+    async def test_later_fresh_scan_allows_release(self):
+        # 1º scan stale → inseguro; 2º scan fresh-flat → seguro
+        with _patch_bss(is_configured=lambda: True,
+                        get_positions=AsyncMock(return_value={"ok": True, "positions": []})), \
+                patch.object(ers, "_open_real_trade_symbols", AsyncMock(return_value=set())):
+            out = await ers._detect_untracked_positions()
+        self.assertEqual(out["status"], "FLAT")
+        self.assertTrue(ers._boot_scan_safe)
+
+    async def test_fresh_flat_distinct_from_unknown(self):
+        with _patch_bss(is_configured=lambda: True,
+                        get_positions=AsyncMock(return_value={"ok": False, "error": "down"})):
+            out = await ers._detect_untracked_positions()
+        self.assertEqual(out["status"], "UNKNOWN")   # erro ≠ flat
+        self.assertFalse(ers._boot_scan_safe)
 
 
 if __name__ == "__main__":

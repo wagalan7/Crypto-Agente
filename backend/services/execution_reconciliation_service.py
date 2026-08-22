@@ -114,6 +114,7 @@ _last_reconciliation_at: Optional[str] = None
 _reconciler_running = False
 _prev_open_count = 0          # p/ liberar quarentena SÓ na transição >0 → 0
 _p03_latch_armed = False      # P03 realmente armou o latch?
+_boot_scan_safe = False       # leitura fresh de posições/incidentes já teve sucesso?
 
 
 def _now() -> datetime:
@@ -136,6 +137,21 @@ def _finite(x) -> Optional[float]:
     return f if math.isfinite(f) else None
 
 
+def _as_bool(v) -> bool:
+    """Normaliza booleano: a string "false"/"0"/"" NUNCA vira True."""
+    if isinstance(v, bool):
+        return v
+    return str(v if v is not None else "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_prefix(seed: str) -> str:
+    """clientAlgoId de fallback aceito pela Binance: só [A-Za-z0-9-], sem `…`
+    Unicode e dentro de um limite curto."""
+    import re
+    base = re.sub(r"[^A-Za-z0-9]", "", str(seed or ""))[-10:] or uuid.uuid4().hex[:8]
+    return f"p03-{base}"[:20]
+
+
 def _backoff_seconds(attempts: int) -> float:
     # attempts=1 → BASE (casa com a doc: 15s inicial), depois dobra até o teto.
     exp = RECONCILE_BACKOFF_BASE_S * (2 ** max(0, attempts - 1))
@@ -153,6 +169,52 @@ def _norm_entry_side(side) -> Optional[str]:
 
 def _close_side(entry_side: str) -> str:
     return "SELL" if entry_side == "BUY" else "BUY"
+
+
+def _mark_boot_unsafe() -> None:
+    global _boot_scan_safe
+    _boot_scan_safe = False
+
+
+def assemble_entry_incident(order_res: dict, rec: dict, *, closed: bool = False,
+                            snapshot_id=None, local_client_order_id=None) -> dict:
+    """Monta os kwargs de `record_incident` a partir dos dados REAIS do caller.
+    Helper pequeno e testável (não roda fluxo de mercado). Reconhece o contrato
+    maker real (`was_maker`/`pending_entry_order`/`final_fill_qty_unknown`), usa o
+    `client_order_id` local como fallback OBRIGATÓRIO e persiste SL/TP IDs."""
+    order_res = order_res or {}
+    rec = rec or {}
+    coid = (order_res.get("client_order_id") or local_client_order_id
+            or rec.get("client_order_id"))
+    was_maker = _as_bool(order_res.get("was_maker") or order_res.get("maker")
+                         or order_res.get("is_maker"))
+    status = str(order_res.get("status") or "").upper()
+    pending_entry = _as_bool(order_res.get("pending_entry_order")) or status in ("NEW", "PARTIALLY_FILLED")
+    ffqu = _as_bool(order_res.get("final_fill_qty_unknown"))
+    kind = (Kind.FINAL_FILL_QTY_UNKNOWN if ffqu
+            else kind_from_safety_state(order_res.get("safety_state"), closed=closed))
+    result = order_res.get("result") or {}
+    cond_ids = {}
+    for k, src in (("sl", "sl_order_id"), ("tp1", "tp1_order_id"), ("tp2", "tp2_order_id")):
+        v = order_res.get(src) or rec.get(src)
+        if v:
+            cond_ids[k] = str(v)
+    eoid = result.get("orderId") or order_res.get("entry_order_id")
+    return dict(
+        kind=kind, symbol=rec.get("symbol"),
+        side=rec.get("direction") or rec.get("side"),
+        client_order_id=coid,
+        entry_order_id=(str(eoid) if eoid else None),
+        conditional_prefix=coid,                       # P02 nomeia <coid>-sl/-tp1/-tp2
+        conditional_ids=(cond_ids or None),
+        planned_qty=(rec.get("qty") or rec.get("position_size")),
+        planned_stop=rec.get("stop_loss") or rec.get("stop"),
+        min_known_fill=(_finite(order_res.get("executed_qty")) or None),
+        safety_state=order_res.get("safety_state"),
+        snapshot_id=(str(snapshot_id) if snapshot_id else None),
+        pending_maker=bool(was_maker and pending_entry),
+        payload={"closed": bool(closed)},
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -176,9 +238,11 @@ def terminal_qty(order_res: dict) -> tuple[Optional[float], str]:
     if status == "REJECTED":
         return 0.0, "rejected"
     if status in _TERMINAL_ORDER_STATUS:
-        if "executedQty" not in raw and order_res.get("executed_qty") is None:
-            return None, f"{status} sem executedQty explícita"
-        eq = _finite(order_res.get("executed_qty"))
+        # Exige executedQty EXPLÍCITA no raw. O `executed_qty` normalizado vira
+        # 0.0 por ausência — tratá-lo como fill zero viraria FLAT indevidamente.
+        if "executedQty" not in raw:
+            return None, f"{status} sem executedQty no raw (UNKNOWN, não FLAT)"
+        eq = _finite(raw.get("executedQty"))
         if eq is None:
             return None, f"{status} com executedQty inválida"
         return eq, f"{status.lower()}_terminal"
@@ -220,14 +284,30 @@ def _order_identities(o: dict) -> set:
     return ids
 
 
-def _adopt_live_stop(inc: dict, qty: Optional[float], listing: dict) -> tuple[bool, Optional[str], str]:
-    """Adota um SL vivo VÁLIDO (contrato P02). Consome snake_case real.
-    Válido = é STOP, `algo_id` não vazio, lado de fechamento correto, E
-    (`close_position=True`) OU (`reduce_only=True` e `quantity >= qty`); trigger
-    dentro da tolerância quando há `planned_stop`. Retorna (ok, algo_id, detalhe)."""
+def _sym_base(s: str) -> str:
+    import re
+    # "BTC/USDT:USDT" → "BTC"; "BTCUSDT" → "BTC"; "1000PEPEUSDT" → "1000PEPE".
+    head = str(s or "").upper().split("/")[0]
+    b = re.sub(r"[^A-Z0-9]", "", head)
+    return b[:-4] if b.endswith("USDT") and len(b) > 4 else b
+
+
+_DEAD_ALGO_STATUS = {"CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "FILLED", "REJECTED"}
+
+
+def _adopt_live_stop(inc: dict, need_qty: Optional[float], listing: dict) -> tuple[bool, Optional[str], str]:
+    """Adota um SL vivo VÁLIDO (contrato P02), consumindo snake_case real. Exige:
+    side do incidente conhecido; side da ordem PRESENTE e exatamente oposto;
+    símbolo correspondente; status vivo (quando presente); tipo STOP; `algo_id`
+    válido; trigger dentro da tolerância P02; e cobertura por `close_position=True`
+    OU (`reduce_only=True` e `quantity >= need_qty`). `need_qty` já é
+    max(qty_terminal_confirmada, posição_fresh_total). Retorna (ok, algo_id, det)."""
     entry_side = _norm_entry_side(inc.get("side"))
-    want_close = _close_side(entry_side) if entry_side else None
+    if entry_side is None:
+        return False, None, "side do incidente desconhecido — não adota"
+    want_close = _close_side(entry_side)
     planned_stop = _finite(inc.get("planned_stop"))
+    inc_base = _sym_base(inc.get("symbol"))
     for o in (listing.get("orders") or []):
         if not isinstance(o, dict):
             continue
@@ -238,17 +318,23 @@ def _adopt_live_stop(inc: dict, qty: Optional[float], listing: dict) -> tuple[bo
         if not algo_id:
             continue
         oside = str(o.get("side") or "").upper()
-        if want_close and oside and oside != want_close:
-            continue  # lado de fechamento errado
-        close_position = bool(o.get("close_position") if o.get("close_position") is not None
-                              else o.get("closePosition"))
-        reduce_only = bool(o.get("reduce_only") if o.get("reduce_only") is not None
-                           else o.get("reduceOnly"))
+        if oside != want_close:                      # side ausente OU não-oposto → rejeita
+            continue
+        osym = o.get("symbol")
+        if osym and inc_base and _sym_base(osym) != inc_base:
+            continue                                 # símbolo diferente
+        ostatus = str(o.get("status") or o.get("algoStatus") or "").upper()
+        if ostatus and ostatus in _DEAD_ALGO_STATUS:
+            continue                                 # não está vivo
+        close_position = _as_bool(o.get("close_position") if o.get("close_position") is not None
+                                  else o.get("closePosition"))
+        reduce_only = _as_bool(o.get("reduce_only") if o.get("reduce_only") is not None
+                               else o.get("reduceOnly"))
         if close_position:
             covered = True
         elif reduce_only:
             oq = _finite(o.get("quantity") if o.get("quantity") is not None else o.get("origQty"))
-            covered = (qty is None) or (oq is not None and oq + 1e-12 >= float(qty))
+            covered = (need_qty is None) or (oq is not None and oq + 1e-12 >= float(need_qty))
         else:
             covered = False
         if not covered:
@@ -259,7 +345,7 @@ def _adopt_live_stop(inc: dict, qty: Optional[float], listing: dict) -> tuple[bo
             if trig is None or abs(trig - planned_stop) / planned_stop > RECONCILE_STOP_TOL_FRAC:
                 continue  # trigger fora da tolerância P02
         return True, str(algo_id), f"SL vivo adotado ({_mask(algo_id)})"
-    return False, None, "sem SL vivo válido"
+    return False, None, "sem SL vivo válido (lado/cobertura/trigger)"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -279,6 +365,28 @@ def _model_cols() -> set:
     return _EXTRA_COLS
 
 
+def _merge_incident_row(row: dict, incoming: dict) -> None:
+    """Merge monotônico in-place (mesma semântica do ON CONFLICT DO UPDATE):
+    nunca reduz informação conhecida. Reabre reincidência resolvida."""
+    if row.get("resolved_at") is not None:
+        row.update({"state": State.OPEN, "resolved_at": None, "attempts": 0,
+                    "clean_observations": 0, "next_retry_at": _now(),
+                    "last_error": "reaberto: problema reincidiu"})
+    inc_lb = incoming.get("min_known_fill")
+    if inc_lb is not None:
+        row["min_known_fill"] = max(row.get("min_known_fill") or 0.0, inc_lb)
+    for jcol in ("conditional_ids", "payload"):
+        new = incoming.get(jcol)
+        if isinstance(new, dict) and new:
+            merged = dict(row.get(jcol) or {})
+            merged.update(new)               # incorpora novos IDs sem apagar
+            row[jcol] = merged
+    for scol in ("side", "planned_qty", "planned_stop", "client_order_id",
+                 "entry_order_id", "conditional_prefix"):
+        if row.get(scol) is None and incoming.get(scol) is not None:
+            row[scol] = incoming[scol]
+
+
 class InMemoryIncidentRepo:
     """Repositório em memória com a MESMA semântica de claim/lease/upsert do SQL.
     Fallback fail-closed quando DB off; injetado nos testes (sem tocar banco)."""
@@ -289,20 +397,25 @@ class InMemoryIncidentRepo:
         self._lock = asyncio.Lock()
 
     async def upsert(self, key: str, defaults: dict) -> tuple[dict, bool]:
+        """Atômico: no conflito faz merge (GREATEST do lower-bound, união de
+        conditional_ids/payload, preenche IDs/stop/qty/side/prefixo ausentes) e
+        REABRE reincidência — sem reduzir informação conhecida nem duplicar."""
         async with self._lock:
             row = self._rows.get(key)
-            if row is not None:
-                return dict(row), False
-            self._seq += 1
-            row = {
-                "id": self._seq, "incident_key": key, "attempts": 0,
-                "clean_observations": 0, "state": State.OPEN,
-                "claimed_by": None, "claimed_at": None, "lease_expires_at": None,
-                "resolved_at": None, "created_at": _now(), "updated_at": _now(),
-            }
-            row.update({k: v for k, v in defaults.items() if v is not None or k in row})
-            self._rows[key] = row
-            return dict(row), True
+            if row is None:
+                self._seq += 1
+                row = {
+                    "id": self._seq, "incident_key": key, "attempts": 0,
+                    "clean_observations": 0, "state": State.OPEN,
+                    "claimed_by": None, "claimed_at": None, "lease_expires_at": None,
+                    "resolved_at": None, "created_at": _now(), "updated_at": _now(),
+                }
+                row.update({k: v for k, v in defaults.items() if v is not None or k in row})
+                self._rows[key] = row
+                return dict(row), True
+            _merge_incident_row(row, defaults)   # in-place, monotônico
+            row["updated_at"] = _now()
+            return dict(row), False
 
     async def get(self, key: str) -> Optional[dict]:
         row = self._rows.get(key)
@@ -361,6 +474,9 @@ class InMemoryIncidentRepo:
                 return False
             if row.get("claimed_by") != owner:
                 return False
+            exp = row.get("lease_expires_at")
+            if exp is None or exp < _now():
+                return False  # lease vencido NÃO ressuscita o próprio claim
             row["lease_expires_at"] = lease_until
             return True
 
@@ -390,22 +506,47 @@ class _SqlIncidentRepo:
     """Repositório Postgres: upsert atômico (ON CONFLICT) + claim/fencing por UPDATE…WHERE."""
 
     async def upsert(self, key: str, defaults: dict) -> tuple[dict, bool]:
+        """Uma única operação atômica: INSERT … ON CONFLICT DO UPDATE … RETURNING.
+        No conflito: GREATEST do lower-bound, merge de conditional_ids/payload
+        (jsonb ||), COALESCE dos IDs/stop/qty/side/prefixo ausentes e reabertura
+        atômica da reincidência. Nunca reduz informação. (xmax=0 ⇒ inserido.)"""
         from db import get_session
-        from models.execution_incident import ExecutionIncident
-        from sqlalchemy import select
+        from models.execution_incident import ExecutionIncident as EI
+        from sqlalchemy import text, literal_column
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         cols = {k: v for k, v in defaults.items() if k in _model_cols()}
+        T = "execution_incidents"
+
+        def _co(c):   # COALESCE(existente, novo)
+            return text(f"COALESCE({T}.{c}, EXCLUDED.{c})")
+
+        def _jm(c):   # merge jsonb sem apagar anteriores, de volta pro tipo JSON
+            return text(f"(COALESCE({T}.{c}::jsonb,'{{}}'::jsonb) "
+                        f"|| COALESCE(EXCLUDED.{c}::jsonb,'{{}}'::jsonb))::json")
+
+        def _reopen(c, reopened):  # CASE de reabertura
+            return text(f"CASE WHEN {T}.resolved_at IS NOT NULL THEN {reopened} ELSE {T}.{c} END")
+
+        set_ = {
+            "min_known_fill": text(f"GREATEST(COALESCE({T}.min_known_fill,0), "
+                                   f"COALESCE(EXCLUDED.min_known_fill,0))"),
+            "side": _co("side"), "planned_qty": _co("planned_qty"),
+            "planned_stop": _co("planned_stop"), "client_order_id": _co("client_order_id"),
+            "entry_order_id": _co("entry_order_id"), "conditional_prefix": _co("conditional_prefix"),
+            "conditional_ids": _jm("conditional_ids"), "payload": _jm("payload"),
+            "state": _reopen("state", "'OPEN'"), "resolved_at": _reopen("resolved_at", "NULL"),
+            "attempts": _reopen("attempts", "0"), "clean_observations": _reopen("clean_observations", "0"),
+            "updated_at": _now(),
+        }
         async with get_session() as session:
-            stmt = (pg_insert(ExecutionIncident)
-                    .values(incident_key=key, **cols)
-                    .on_conflict_do_nothing(index_elements=["incident_key"]))
-            res = await session.execute(stmt)
+            ins = pg_insert(EI).values(incident_key=key, **cols)
+            stmt = ins.on_conflict_do_update(index_elements=["incident_key"], set_=set_) \
+                      .returning(EI, literal_column("(xmax = 0)"))
+            r = (await session.execute(stmt)).first()
             await session.commit()
-            created = (res.rowcount or 0) == 1
-            row = (await session.execute(
-                select(ExecutionIncident).where(ExecutionIncident.incident_key == key)
-            )).scalar_one_or_none()
-            return (_row_to_dict(row) if row else {"incident_key": key}), created
+            if r is None:
+                return {"incident_key": key}, False
+            return _row_to_dict(r[0]), bool(r[1])
 
     async def get(self, key: str) -> Optional[dict]:
         from db import get_session
@@ -485,6 +626,7 @@ class _SqlIncidentRepo:
         row = await self._apply(key, (
             ExecutionIncident.claimed_by == owner,
             ExecutionIncident.resolved_at.is_(None),
+            ExecutionIncident.lease_expires_at > _now(),   # lease vencido não ressuscita
         ), {"lease_expires_at": lease_until})
         return row is not None
 
@@ -559,35 +701,35 @@ async def _arm_quarantine(reason: str) -> None:
 
 async def _maybe_release_quarantine() -> bool:
     """Libera SOMENTE a quarentena PRÓPRIA do P03. Chamado apenas na transição
-    de ≥1 incidente aberto para 0 (o caller garante). Exige: P03 armou o latch;
-    zero incidentes abertos; pausa persistida é P03-owned. Nunca toca latch/pausa
-    de P02 ou do operador."""
+    de ≥1 incidente para 0 (o caller garante). Exige: P03 armou o latch; zero
+    incidentes abertos; **boot/scan fresh já teve sucesso**; pausa persistida é
+    P03-owned. NUNCA usa clear genérico nem toca latch/pausa de P02 ou operador."""
     global _p03_latch_armed
     if await _get_repo().list_open():
         return False
     if not _p03_latch_armed:
         return False
-    try:
-        from services import risk_service
-        status = await risk_service.get_status()
-    except Exception:
-        return False
-    reason = (status or {}).get("pause_reason") or ""
-    paused = bool(status and status.get("trading_paused"))
-    if paused and not reason.startswith(_PAUSE_MARKER):
-        return False  # pausa trocada por humano/outro subsistema → não mexer
+    if not _boot_scan_safe:
+        return False  # sem leitura fresh confirmada, mantém quarentena
+    # Limpa APENAS o owner p03 do latch em memória.
+    other_owners = True
     try:
         from services import shadow_trade_service
         shadow_trade_service.clear_execution_quarantine(owner=_LATCH_OWNER)
         _p03_latch_armed = False
+        remaining = shadow_trade_service.execution_quarantine_owners()
+        other_owners = bool(remaining)  # P02/legacy/manual ainda segurando?
     except Exception as exc:  # noqa: BLE001
         log.error(f"[p03] falha limpando latch próprio: {exc}")
-    try:
-        from services import risk_service
-        if paused and reason.startswith(_PAUSE_MARKER):
-            await risk_service.set_manual_pause(False, "P03: incidentes resolvidos")
-    except Exception as exc:  # noqa: BLE001
-        log.error(f"[p03] falha resumindo RiskState: {exc}")
+        return False
+    # Só remove a pausa persistida se NÃO restam outros owners locais e a pausa
+    # atual ainda é P03-owned (CAS transacional no RiskState — sem clear genérico).
+    if not other_owners:
+        try:
+            from services import risk_service
+            await risk_service.release_p03_pause(_PAUSE_MARKER)
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[p03] falha resumindo RiskState (owner-aware): {exc}")
     log.warning("[p03] quarentena própria liberada — transição p/ zero incidentes")
     return True
 
@@ -628,6 +770,8 @@ async def record_incident(*, kind: str, symbol: str, exchange: str = EXCHANGE_BI
     created = False
     row = None
     try:
+        # upsert é ATÔMICO: no conflito já faz merge monotônico (GREATEST/união)
+        # e reabre reincidência. Não há read-modify-write separado (evita corrida).
         row, created = await repo.upsert(key, {
             "kind": kind, "symbol": symbol, "exchange": exchange, "side": side,
             "client_order_id": client_order_id, "entry_order_id": entry_order_id,
@@ -636,27 +780,6 @@ async def record_incident(*, kind: str, symbol: str, exchange: str = EXCHANGE_BI
             "conditional_ids": conditional_ids, "payload": full_payload or None,
             "next_retry_at": _now(),
         })
-        if not created and row:
-            if row.get("resolved_at") is not None:
-                # Reincidência do mesmo problema → REABRE (visível, reconciliável).
-                await repo.update(key, state=State.OPEN, resolved_at=None, attempts=0,
-                                  clean_observations=0, next_retry_at=_now(),
-                                  last_error="reaberto: problema reincidiu")
-                log.critical(f"[p03][incident] REABERTO key={key}")
-            else:
-                patch: dict = {}
-                if min_known_fill is not None:
-                    patch["min_known_fill"] = max(row.get("min_known_fill") or 0.0, min_known_fill)
-                if conditional_ids and not row.get("conditional_ids"):
-                    patch["conditional_ids"] = conditional_ids
-                if conditional_prefix and not row.get("conditional_prefix"):
-                    patch["conditional_prefix"] = conditional_prefix
-                if planned_stop is not None and row.get("planned_stop") is None:
-                    patch["planned_stop"] = planned_stop
-                if planned_qty is not None and row.get("planned_qty") is None:
-                    patch["planned_qty"] = planned_qty
-                if patch:
-                    await repo.update(key, **patch)
     except Exception as exc:  # noqa: BLE001
         log.critical(f"[p03] persistência de incidente falhou ({key}): {exc}")
     await _arm_quarantine(f"incidente {kind} {symbol} ({_mask(client_order_id or entry_order_id)})")
@@ -769,41 +892,102 @@ def _matching_orders(listing: dict, exact_ids: list[str]) -> list[dict]:
             if isinstance(o, dict) and (_order_identities(o) & want)]
 
 
-async def _ensure_stop(key: str, owner: str, inc: dict, qty: Optional[float]) -> tuple[bool, str]:
-    """Adota um SL vivo válido (snake_case, lado/cobertura/trigger). Se não houver
-    e as invariantes permitirem, CRIA somente SL via P02 (assinatura real). Nunca
-    TP, nunca MARKET, nunca fecha mais que a qty confirmada. Sucesso de criação
-    exige `sl_ok is True` e `sl_order_id`."""
+async def _ensure_stop(key: str, owner: str, inc: dict, need_qty: Optional[float]) -> tuple[bool, Optional[str], str]:
+    """Adota um SL vivo válido (snake_case, lado/cobertura/trigger) cobrindo
+    `need_qty` = max(qty_terminal_confirmada, posição_fresh_total). Se não houver e
+    as invariantes permitirem, CRIA somente SL via P02 (assinatura real) cobrindo a
+    posição fresh total — não só a qty da entry. Nunca TP, nunca MARKET. Sucesso de
+    criação exige `sl_ok is True` e `sl_order_id`. Retorna (ok, sl_order_id, det)."""
     from services import binance_signed_service as bss
     symbol = inc["symbol"]
     try:
         listing = await bss.get_open_algo_orders(symbol)
     except Exception as exc:  # noqa: BLE001
-        return False, f"listagem algo exceção: {exc}"
+        return False, None, f"listagem algo exceção: {exc}"
     if not listing or not listing.get("ok"):
-        return False, "listagem algo stale/erro"
-    adopted, _aid, detail = _adopt_live_stop(inc, qty, listing)
+        return False, None, "listagem algo stale/erro"
+    adopted, aid, detail = _adopt_live_stop(inc, need_qty, listing)
     if adopted:
-        return True, detail
+        return True, aid, detail
     if not RECONCILE_CREATE_SL:
-        return False, "sem SL vivo válido (criação desabilitada)"
+        return False, None, "sem SL vivo válido (criação desabilitada)"
     entry_side = _norm_entry_side(inc.get("side"))
     planned_stop = _finite(inc.get("planned_stop"))
-    q = _finite(qty)
+    q = _finite(need_qty)
     if entry_side is None or planned_stop is None or planned_stop <= 0 or q is None or q <= 0:
-        return False, "sem lado/stop/qty válidos p/ criar SL"
+        return False, None, "sem lado/stop/qty válidos p/ criar SL"
     if not await _renew_or_abort(key, owner):
-        return False, "claim perdido antes de criar SL — abortado"
+        return False, None, "claim perdido antes de criar SL — abortado"
+    prefix = inc.get("conditional_prefix") or _safe_prefix(key)   # sem `…` Unicode
     try:
         res = await bss.place_protection_orders(
             symbol, entry_side, q, stop_loss=planned_stop, tp1=None, tp2=None,
-            client_order_id_prefix=(inc.get("conditional_prefix") or f"p03-{_mask(key)}"),
-            dedup_live=True)
+            client_order_id_prefix=prefix, dedup_live=True)
     except Exception as exc:  # noqa: BLE001
-        return False, f"criação SL exceção: {exc}"
+        return False, None, f"criação SL exceção: {exc}"
     if res and res.get("sl_ok") is True and res.get("sl_order_id"):
-        return True, f"SL criado ({_mask(res.get('sl_order_id'))})"
-    return False, f"criação SL não confirmada (sl_ok={res.get('sl_ok') if res else None})"
+        return True, str(res.get("sl_order_id")), f"SL criado ({_mask(res.get('sl_order_id'))})"
+    return False, None, f"criação SL não confirmada (sl_ok={res.get('sl_ok') if res else None})"
+
+
+async def _match_real_trade(symbol: str, side: Optional[str]) -> Optional[dict]:
+    """Confirma RealTrade aberto correspondente (exchange binance / símbolo / lado).
+    DB desabilitado → {"skip": True} (não aplicável). Sem match → None."""
+    try:
+        from db import get_session, DB_ENABLED
+    except Exception:
+        return {"skip": True}
+    if not DB_ENABLED:
+        return {"skip": True}
+    from models.real_trade import RealTrade
+    from sqlalchemy import select
+    want = _norm_entry_side(side)
+    async with get_session() as session:
+        rows = (await session.execute(
+            select(RealTrade).where(RealTrade.symbol == symbol, RealTrade.status == "open")
+        )).scalars().all()
+        for r in rows:
+            rside = _norm_entry_side(getattr(r, "direction", None) or getattr(r, "side", None))
+            if want is None or rside is None or rside == want:
+                return {"id": r.id}
+    return None
+
+
+async def _persist_sl_order_id(rt_id, sl_id: str) -> None:
+    """Persiste o sl_order_id no RealTrade de forma IDEMPOTENTE (só se ausente)."""
+    if not rt_id or not sl_id:
+        return
+    try:
+        from db import get_session, DB_ENABLED
+        if not DB_ENABLED:
+            return
+        from models.real_trade import RealTrade
+        from sqlalchemy import update
+        async with get_session() as session:
+            await session.execute(update(RealTrade).where(
+                RealTrade.id == rt_id, RealTrade.sl_order_id.is_(None)
+            ).values(sl_order_id=str(sl_id)))
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[p03] persistir sl_order_id falhou (não bloqueia): {exc}")
+
+
+async def _resolve_protected(key: str, owner: str, inc: dict, sl_id: Optional[str], detail: str) -> None:
+    """Só declara PROTECTED se existir RealTrade aberto correspondente. Protegido
+    mas SEM RealTrade → não libera; escala UNTRACKED_POSITION/MANUAL (não inventa
+    fechamento, não abre nova operação). Persiste sl_order_id idempotente."""
+    rt = await _match_real_trade(inc["symbol"], inc.get("side"))
+    if rt is None:
+        await record_incident(kind=Kind.UNTRACKED_POSITION, symbol=inc["symbol"],
+                              side=inc.get("side"), planned_qty=inc.get("planned_qty"),
+                              payload={"protected_without_real_trade": True})
+        await _fenced(key, owner, state=State.MANUAL_REQUIRED,
+                      manual_reason="posição protegida SEM RealTrade correspondente — untracked/manual")
+        log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED (protegida sem RealTrade)")
+        return
+    if sl_id and rt.get("id"):
+        await _persist_sl_order_id(rt.get("id"), sl_id)
+    await _resolve(key, owner, State.PROTECTED, detail)
 
 
 async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
@@ -817,11 +1001,20 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
         return
     verdict, qty, why = classify_entry(order_res)
 
-    # MAKER viva (NEW/PARTIALLY_FILLED): cancelar pelo ID correto, validar ok,
-    # re-consultar e exigir terminal. NUNCA fallback MARKET. Cancel incerto mantém.
+    # MAKER viva (NEW/PARTIALLY_FILLED): (1) lower-bound monotônico do fill;
+    # (2) posição fresh; (3) proteção PROVISÓRIA da exposição já observada;
+    # (4-5) cancelar pelo ID e validar ok; (6-7) re-consultar e exigir terminal.
+    # NUNCA fallback MARKET. Cancel incerto/ainda-não-terminal mantém quarentena
+    # COM a exposição observada protegida.
     if verdict == "RETRY" and _is_maker(inc):
         status = (order_res.get("status") or "").upper()
         if status in ("NEW", "PARTIALLY_FILLED"):
+            obs = _finite(order_res.get("executed_qty"))
+            if obs and obs > 0:
+                await _fenced(key, owner, min_known_fill=max(_finite(inc.get("min_known_fill")) or 0.0, obs))
+            pv0, size0 = await _fresh_verdict(inc["symbol"])
+            if pv0 == "OPEN":
+                await _ensure_stop(key, owner, inc, max(_finite(size0) or 0.0, obs or 0.0))
             if not await _renew_or_abort(key, owner):
                 return
             try:
@@ -830,7 +1023,7 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
                 cancel = {"ok": False, "error": str(exc)}
             if not (cancel and cancel.get("ok")):
                 await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
-                                      f"cancel maker incerto — mantém quarentena ({cancel.get('error') or cancel.get('msg')})")
+                                      f"cancel maker incerto — quarentena mantida, exposição protegida ({cancel.get('error') or cancel.get('msg')})")
                 return
             try:
                 order_res = await bss.get_order(inc["symbol"], order_id=oid, client_order_id=coid)
@@ -840,7 +1033,7 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
             verdict, qty, why = classify_entry(order_res)
             if verdict == "RETRY":
                 await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
-                                      "maker cancelada mas ainda não-terminal")
+                                      "maker cancelada mas ainda não-terminal — exposição protegida")
                 return
 
     if verdict == "FLAT":
@@ -861,11 +1054,18 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, "posição UNKNOWN pós-fill")
         return
     if pv == "FLAT":
-        await _resolve(key, owner, State.FLAT, "posição fresh-flat pós-terminal")
+        # Terminal sem fill / fresh-flat: se houve tentativa de proteção (há
+        # identidade de condicionais), reconcilia o cleanup ANTES de ir a FLAT —
+        # não resolve FLAT deixando condicional exata possivelmente órfã.
+        if _exact_conditional_ids(inc):
+            await _reconcile_cleanup(key, owner, inc)
+        else:
+            await _resolve(key, owner, State.FLAT, "posição fresh-flat pós-terminal")
         return
-    ok, detail = await _ensure_stop(key, owner, inc, qty)
+    need = max(_finite(qty) or 0.0, _finite(_size) or 0.0)   # cobre a posição fresh total
+    ok, sl_id, detail = await _ensure_stop(key, owner, inc, need)
     if ok:
-        await _resolve(key, owner, State.PROTECTED, f"fill {qty:g} protegido ({detail})")
+        await _resolve_protected(key, owner, inc, sl_id, f"fill {qty:g} protegido ({detail})")
     else:
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, f"sem SL confirmado: {detail}")
 
@@ -877,9 +1077,13 @@ async def _reconcile_cleanup(key: str, owner: str, inc: dict) -> None:
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, "posição/listagem incerta")
         return
     if pv == "OPEN":
-        ok, detail = await _ensure_stop(key, owner, inc, size)
+        # Garante 1 SL cardinal válido cobrindo a posição fresh TOTAL; não cancela
+        # o único SL válido. TP/duplicatas exatas ficam para a via de cleanup.
+        need = max(_finite(size) or 0.0, _finite(inc.get("planned_qty")) or 0.0,
+                   _finite(inc.get("min_known_fill")) or 0.0)
+        ok, sl_id, detail = await _ensure_stop(key, owner, inc, need)
         if ok:
-            await _resolve(key, owner, State.PROTECTED, f"posição aberta re-protegida ({detail})")
+            await _resolve_protected(key, owner, inc, sl_id, f"posição aberta re-protegida ({detail})")
         else:
             await _schedule_retry(key, owner, inc, State.RETRY_PENDING, f"posição aberta sem SL: {detail}")
         return
@@ -981,6 +1185,13 @@ async def reconcile_due() -> dict:
     global _last_reconciliation_at, _prev_open_count
     repo = _get_repo()
     await repo.recover_expired_claims()
+    # Boot inseguro (leitura stale/erro): re-tenta o scan fresh de posições a cada
+    # ciclo — só libera quando `_boot_scan_safe` virar True numa leitura bem-sucedida.
+    if not _boot_scan_safe:
+        try:
+            await _detect_untracked_positions()
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[p03] re-scan de boot falhou: {exc}")
     processed = 0
     for inc in await repo.list_open():
         if processed >= RECONCILE_MAX_PER_CYCLE:
@@ -998,6 +1209,15 @@ async def reconcile_due() -> dict:
             if cur and cur.get("resolved_at") is None:
                 await repo.release_claim(key, owner=_PROCESS_ID)  # só o próprio claim
     open_now = len(await repo.list_open())
+    # Enquanto houver incidente aberto, garante o owner P03 armado (mesmo após uma
+    # tentativa manual de resume que possa ter limpado o latch).
+    if open_now > 0:
+        try:
+            from services import shadow_trade_service
+            if _LATCH_OWNER not in shadow_trade_service.execution_quarantine_owners():
+                await _arm_quarantine(f"re-arm: {open_now} incidente(s) aberto(s)")
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[p03] re-arm do latch falhou: {exc}")
     released = False
     if _prev_open_count > 0 and open_now == 0:
         released = await _maybe_release_quarantine()
@@ -1023,40 +1243,51 @@ async def boot_reconcile() -> dict:
         await _arm_quarantine(f"boot: {len(open_incs)} incidente(s) aberto(s)")
         log.critical(f"[p03][boot] {len(open_incs)} incidente(s) aberto(s) — quarentena armada")
     _prev_open_count = len(open_incs)
-    untracked = await _detect_untracked_positions()
+    scan = await _detect_untracked_positions()
     try:
         await reconcile_due()
     except Exception as exc:  # noqa: BLE001
-        log.error(f"[p03][boot] ciclo inicial falhou: {exc}")
-    return {"open_incidents": len(open_incs), "untracked": untracked}
+        # Ciclo inicial falhou → boot NÃO é seguro; arma latch (não loga como ok).
+        _mark_boot_unsafe()
+        await _arm_quarantine(f"boot: ciclo inicial falhou ({exc})")
+        log.critical(f"[p03][boot] ciclo inicial falhou — quarentena armada (boot inseguro): {exc}")
+    return {"open_incidents": len(open_incs), "untracked": scan.get("count"),
+            "scan_status": scan.get("status"), "boot_scan_safe": _boot_scan_safe}
 
 
-async def _detect_untracked_positions() -> int:
-    """Posições Binance fresh × RealTrade aberto. Posição sem trade →
-    UNTRACKED_POSITION + pausa. Leitura indisponível/stale/rate-limited → NÃO
-    assume flat: ARMA quarentena P03 (fail-closed) e mantém bloqueio."""
+async def _detect_untracked_positions() -> dict:
+    """Posições Binance fresh × RealTrade aberto. Retorna status EXPLÍCITO
+    (NÃO o mesmo `0` para tudo): {"status": FLAT|UNTRACKED|UNKNOWN, "count": n}.
+    Seta `_boot_scan_safe` só quando a leitura fresh tem SUCESSO. Leitura
+    indisponível/stale/rate-limited → UNKNOWN + ARMA quarentena (não assume flat)."""
+    global _boot_scan_safe
     try:
         from services import binance_signed_service as bss
         if not bss.is_configured():
-            return 0
+            _boot_scan_safe = True   # sem exchange real → nada a escanear
+            return {"status": "FLAT", "count": 0}
         res = await bss.get_positions(force=True)
     except Exception as exc:  # noqa: BLE001
+        _boot_scan_safe = False
         await _arm_quarantine(f"boot: leitura de posições indisponível ({exc})")
         log.critical(f"[p03][boot] leitura de posições indisponível — quarentena armada: {exc}")
-        return 0
+        return {"status": "UNKNOWN", "count": 0}
     if not res or not res.get("ok") or res.get("stale") or res.get("rate_limited"):
+        _boot_scan_safe = False
         await _arm_quarantine("boot: posições stale/rate-limited (não assumo flat)")
         log.critical("[p03][boot] posições stale/incertas — quarentena armada (não assumo flat)")
-        return 0
+        return {"status": "UNKNOWN", "count": 0}
     positions = [p for p in (res.get("positions") or []) if abs(_finite(p.get("size")) or 0) > 0]
     if not positions:
-        return 0
+        _boot_scan_safe = True          # leitura fresh confirmou conta flat
+        return {"status": "FLAT", "count": 0}
     try:
         open_symbols = await _open_real_trade_symbols()
     except Exception as exc:  # noqa: BLE001
+        _boot_scan_safe = False
         await _arm_quarantine(f"boot: leitura RealTrade falhou ({exc})")
         log.critical(f"[p03][boot] leitura RealTrade falhou — quarentena armada: {exc}")
-        open_symbols = set()
+        return {"status": "UNKNOWN", "count": 0}
     n = 0
     for p in positions:
         sym = p.get("symbol") or ""
@@ -1069,9 +1300,10 @@ async def _detect_untracked_positions() -> int:
                               min_known_fill=abs(_finite(p.get("size")) or 0),
                               payload={"detected_at_boot": True})
         n += 1
+    _boot_scan_safe = True              # o scan em si teve sucesso (leitura confiável)
     if n:
         log.critical(f"[p03][boot] {n} posição(ões) UNTRACKED → pausa persistente")
-    return n
+    return {"status": ("UNTRACKED" if n else "FLAT"), "count": n}
 
 
 async def _open_real_trade_symbols() -> set:

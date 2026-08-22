@@ -5173,23 +5173,14 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         # planejada, lower-bound, side, stop, snapshot e flag maker.
                         try:
                             from services import execution_reconciliation_service as _ers
-                            _coid = order_res.get("client_order_id")
-                            await _ers.record_incident(
-                                kind=_ers.kind_from_safety_state(
-                                    order_res.get("safety_state"), closed=bool(_closed)),
-                                symbol=rec["symbol"],
-                                side=rec.get("direction") or rec.get("side"),
-                                client_order_id=_coid,
-                                entry_order_id=str((order_res.get("result") or {}).get("orderId") or "") or None,
-                                conditional_prefix=_coid,   # P02 nomeia <coid>-sl/-tp1/-tp2
-                                planned_qty=(rec.get("qty") or rec.get("position_size")),
-                                planned_stop=rec.get("stop_loss") or rec.get("stop"),
-                                min_known_fill=(float(order_res.get("executed_qty") or 0) or None),
-                                safety_state=order_res.get("safety_state"),
-                                snapshot_id=(str(snap_id) if snap_id else None),
-                                pending_maker=bool(order_res.get("maker") or order_res.get("is_maker")),
-                                payload={"closed": bool(_closed)},
-                            )
+                            # Montagem via helper testável: reconhece o contrato
+                            # maker real (was_maker/pending_entry_order/
+                            # final_fill_qty_unknown), usa client_order_id local
+                            # como fallback e persiste SL/TP IDs conhecidos.
+                            _kw = _ers.assemble_entry_incident(
+                                order_res, rec, closed=bool(_closed), snapshot_id=snap_id,
+                                local_client_order_id=order_res.get("client_order_id"))
+                            await _ers.record_incident(**_kw)
                         except Exception as _p03_exc:
                             log.critical(f"[p03] persistência do incidente falhou "
                                          f"(latch cobre o processo): {_p03_exc}")

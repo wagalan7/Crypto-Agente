@@ -132,6 +132,45 @@ Fecha as lacunas da auditoria P03:
   `side` real; `cancel ok=False` não é sucesso; qty NaN/inf inválida; backoff
   inicial = 15s.
 
+## P03.1B — final safety closure
+
+Fecha os gaps não cobertos por testes na auditoria independente:
+
+- **Boot fail-closed total:** o outer `except` do `init_db` no lifespan também
+  arma o latch P03 e marca `boot_scan_safe=False`. Qualquer falha (init_db,
+  boot_reconcile, leitura de incidentes/posições, ciclo inicial) bloqueia
+  exposição. `_detect_untracked_positions` retorna status EXPLÍCITO
+  (`FLAT`/`UNTRACKED`/`UNKNOWN`) — nunca o mesmo `0` para flat vs erro/stale — e a
+  liberação exige `boot_scan_safe=True` (uma leitura fresh bem-sucedida); o loop
+  periódico re-tenta o scan até ficar seguro.
+- **Ownership sem clear genérico:** o P03 nunca chama `set_manual_pause(False)`
+  (que apaga todos os owners). Novo `risk_service.release_p03_pause(marker)` faz
+  CAS transacional (só remove se a pausa ATUAL ainda é P03) e o latch é limpo por
+  owner `p03`; se restam owners P02/legacy, a pausa persistida permanece. Enquanto
+  houver incidente aberto, cada ciclo re-arma o owner P03 (mesmo após resume
+  indevido).
+- **Contrato maker real:** reconhece `was_maker`/`pending_entry_order`/
+  `final_fill_qty_unknown`. Maker NEW/PARTIALLY_FILLED: persiste lower-bound,
+  consulta posição fresh, **protege a exposição observada ANTES** de cancelar,
+  cancela pelo ID, valida `cancel.ok`, re-consulta e exige terminal; cancel
+  incerto/não-terminal mantém quarentena com a exposição protegida; sem MARKET.
+- **Qty terminal:** `CANCELED/EXPIRED/EXPIRED_IN_MATCH` exigem `executedQty`
+  EXPLÍCITA no `raw`; o `0.0` da normalização não vira FLAT.
+- **SL:** adota só com side do incidente conhecido, side da ordem presente e
+  exatamente oposto, símbolo, status vivo, tipo STOP, `algo_id`, trigger na
+  tolerância e cobertura por `close_position` OU `reduce_only`+`quantity ≥
+  max(qty_terminal, posição_fresh)`. Booleanos normalizados (`"false"`≠True).
+  Fallback de `clientAlgoId` só `[A-Za-z0-9-]` (sem `…`), curto.
+- **Tracking:** só declara `PROTECTED` com `RealTrade` aberto correspondente;
+  protegido sem RealTrade → `MANUAL_REQUIRED`/`UNTRACKED_POSITION` (não inventa
+  fechamento, não abre nada). SL adotado/criado persiste `sl_order_id` idempotente
+  no RealTrade. Entrada fresh-flat com identidade de condicional reconcilia o
+  cleanup antes de ir a FLAT.
+- **Fencing/SQL:** `renew_claim` exige `lease_expires_at > now` (lease vencido não
+  ressuscita). `upsert` é uma única op `INSERT … ON CONFLICT DO UPDATE … RETURNING`
+  (GREATEST do lower-bound, merge jsonb de conditional_ids/payload, COALESCE de
+  IDs/stop/qty, reabertura atômica). Merge nunca reduz informação.
+
 ## API (somente leitura)
 
 `GET /api/execution-incidents/status` — total aberto, retry pending, manual
@@ -141,14 +180,14 @@ resolve/close/enable-live. Frontend inalterado neste P03.
 
 ## Testes
 
-`backend/tests/test_p03_execution_reconciliation.py` — **46 testes** herméticos
+`backend/tests/test_p03_execution_reconciliation.py` — **67 testes** herméticos
 (nenhuma rede/Binance/DB real; nenhuma entry criada). Suíte crítica completa
-(P01+P02+P03.1) = **102 testes**, verde. `py_compile` e `git diff --check` verdes.
+(P01+P02+P03.1B) = **123 testes**, verde. `py_compile` e `git diff --check` verdes.
 
 > Limitação declarada: sem Postgres descartável local, a atomicidade do upsert
-> SQL (`ON CONFLICT`) e o fencing por `UPDATE…WHERE` são exercitados na
-> implementação **em memória equivalente** (mesma semântica) — **não** é um teste
-> Postgres real.
+> SQL (`INSERT … ON CONFLICT DO UPDATE`, merge jsonb) e o fencing por `UPDATE…WHERE`
+> (owner+lease) são exercitados na implementação **em memória equivalente** (mesma
+> semântica) — **não** é um teste Postgres real.
 >
 > Nota de ambiente: produção roda Python 3.11 (onde `Mapped[X | None]` resolve
 > nativamente). O único interpretador com deps nesta máquina é o 3.9; as suítes

@@ -197,3 +197,35 @@ Defaults fail-closed preservados: `MAKER_ENTRY_ENABLED=false`,
 - `py_compile` e `git diff --check` aprovados. Nenhuma rede/exchange/DB real.
 - Limitação: atomicidade do upsert SQL/fencing exercitada em memória (sem Postgres
   descartável) — não é teste Postgres real. Sem push/deploy.
+
+## P03.1B - Final safety closure
+
+- Status: Concluído localmente (não publicado/não ativado em conta real)
+- Branch: `feat/hardening-p03-1b` (novo commit sobre `80d95621`)
+- Detalhe: `docs/P03_EXECUTION_RECONCILIATION.md` (seção P03.1B)
+
+### Fechou os gaps da auditoria independente
+
+- **Boot fail-closed total:** outer `except` do init_db arma latch P03 +
+  `boot_scan_safe=False`; `_detect_untracked_positions` retorna status explícito
+  (FLAT/UNTRACKED/UNKNOWN) e a liberação exige `boot_scan_safe=True` (leitura fresh
+  bem-sucedida); loop periódico re-tenta o scan.
+- **Ownership sem clear genérico:** `risk_service.release_p03_pause` (CAS, sem
+  `clear_execution_quarantine()` genérico); latch limpo por owner `p03`; preserva
+  owners P02/legacy e pausa manual; re-arma P03 a cada ciclo com incidente aberto.
+- **Maker real:** reconhece `was_maker`/`pending_entry_order`/
+  `final_fill_qty_unknown`; protege a exposição observada ANTES de cancelar; sem MARKET.
+- **Qty terminal:** exige `executedQty` no `raw` (0.0 normalizado não vira FLAT).
+- **SL:** side oposto presente, símbolo, status vivo, cobertura por
+  max(qty_terminal, posição_fresh), booleanos normalizados, fallback clientAlgoId válido.
+- **Tracking:** PROTECTED só com RealTrade correspondente (senão UNTRACKED/MANUAL);
+  persiste `sl_order_id` idempotente; fresh-flat com condicional reconcilia cleanup.
+- **Fencing/SQL:** `renew_claim` exige lease>now; upsert = `INSERT … ON CONFLICT
+  DO UPDATE … RETURNING` (GREATEST, merge jsonb, COALESCE, reabertura atômica).
+
+### Validação
+
+- **67 testes P03.1B** herméticos; suíte crítica (P01+P02+P03.1B) = **123**, verde.
+- `py_compile` e `git diff --check` aprovados. Nenhuma rede/exchange/DB real.
+- Limitação: upsert SQL/fencing verificados em memória equivalente (sem Postgres
+  descartável) — não é teste Postgres real. Sem push/deploy.
