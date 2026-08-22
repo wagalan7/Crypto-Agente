@@ -28,6 +28,10 @@ from sqlalchemy import select, func
 from db import DB_ENABLED, get_session
 from models.risk_state import RiskState
 from models.risk_event import RiskEvent
+
+# Chave estável do advisory lock transacional que serializa arm/release da pausa
+# P03 (exclusão mútua real no Postgres — P03.1C).
+_P03_PAUSE_LOCK = 917283
 from models.recommendation_snapshot import RecommendationSnapshot
 
 log = logging.getLogger(__name__)
@@ -243,27 +247,32 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
 
 
 async def release_p03_pause(marker: str) -> bool:
-    """Resume owner-aware do P03 (P03.1B): remove a pausa persistida SOMENTE se a
-    pausa ATUAL ainda pertencer ao P03 (reason começa com `marker`). CAS dentro da
-    transação: se o operador/circuit-breaker trocou a pausa, o P03 não altera nada.
-    NÃO chama `clear_execution_quarantine()` genérico (isso apaga owners P02/manual);
-    o latch P03 em memória é limpo pelo próprio reconciliador com owner="p03"."""
+    """Resume owner-aware do P03 (P03.1C): CAS ATÔMICO real — um único
+    `UPDATE risk_state SET trading_paused=false,... WHERE id=1 AND trading_paused
+    AND pause_reason LIKE marker%` sob `pg_advisory_xact_lock` (exclusão mútua com
+    o arm). Se o operador/circuit-breaker/nova geração trocou a pausa (reason não
+    é mais P03), o WHERE não casa → rowcount 0 → NÃO altera nada. NÃO usa
+    `clear_execution_quarantine()` genérico; o latch P03 é limpo por owner="p03"."""
     if not DB_ENABLED:
         return False
+    from sqlalchemy import update, text
+    from models.risk_state import RiskState
+    like = marker.replace("%", r"\%") + "%"
     async with get_session() as session:
-        state = await _get_or_create_state(session)
-        if not state.trading_paused or not (state.pause_reason or "").startswith(marker):
-            await session.commit()
-            return False   # pausa não é P03-owned → não mexe
-        state.trading_paused = False
-        state.pause_manual = False
-        state.pause_reason = None
-        state.paused_at = None
-        state.updated_at = datetime.now(timezone.utc)
-        _log_event(session, state, "p03_resume", "P03: incidentes resolvidos")
+        await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _P03_PAUSE_LOCK})
+        res = await session.execute(
+            update(RiskState).where(
+                RiskState.id == 1,
+                RiskState.trading_paused.is_(True),
+                RiskState.pause_reason.like(like),
+            ).values(trading_paused=False, pause_manual=False, pause_reason=None,
+                     paused_at=None, updated_at=datetime.now(timezone.utc))
+        )
         await session.commit()
-        log.warning("[circuit-breaker] P03 resume (owner-aware) — pausa P03 removida")
-        return True
+        ok = (res.rowcount or 0) == 1
+        if ok:
+            log.warning("[circuit-breaker] P03 resume (CAS atômico) — pausa P03 removida")
+        return ok
 
 
 async def list_events(days: int = 30, limit: int = 200) -> list[dict]:

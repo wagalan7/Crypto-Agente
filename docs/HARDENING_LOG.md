@@ -229,3 +229,36 @@ Defaults fail-closed preservados: `MAKER_ENTRY_ENABLED=false`,
 - `py_compile` e `git diff --check` aprovados. Nenhuma rede/exchange/DB real.
 - Limitação: upsert SQL/fencing verificados em memória equivalente (sem Postgres
   descartável) — não é teste Postgres real. Sem push/deploy.
+
+## P03.1C - Final reconciliation closure
+
+- Status: Concluído localmente (não publicado/não ativado em conta real)
+- Branch: `feat/hardening-p03-1c` (novo commit sobre `67efe7d2`)
+- Detalhe: `docs/P03_EXECUTION_RECONCILIATION.md` (seção P03.1C)
+
+### Fechou os bloqueadores da auditoria do 67efe7d2
+
+- Integração: hook passa `local_client_order_id`/`local_planned_qty` reais; maker
+  ambígua (incl. GTX sem status / `ENTRY_ORDER_STILL_ACTIVE_OR_UNKNOWN`) reconhecida;
+  `entry_order_terminal` impede falso-pending.
+- Cleanup: REJECTED/terminal-zero com identidade → cleanup (não FLAT direto); OPEN
+  preserva SL cardinal e cancela só extras exatos com reconfirmação.
+- Tracking: match RealTrade determinístico (binance/auto|managed/símbolo+quote
+  exato/lado/qty); BTCUSDC≠BTCUSDT; persistência de `sl_order_id` idempotente, sem
+  conflito → sem PROTECTED.
+- SL: só `STOP_MARKET` (rejeita trailing), símbolo exato, status vivo, cobertura
+  por max(qty_terminal, posição_fresh), trigger 0,2%; `SL_NOT_CONFIRMED` honesto.
+- Persistência: latch armado ANTES da persistência; `record_incident.persisted`;
+  UNTRACKED não persistido → boot inseguro/UNKNOWN, sem release.
+- CAS/ownership: `release_p03_pause` = `UPDATE…WHERE LIKE` sob `pg_advisory_xact_lock`
+  (sem clear genérico); recuperação `0→0`; re-arm por ciclo.
+- Upsert: união histórica `conditional_ids.all`; reabertura limpa claim/lease/manual.
+
+### Validação
+
+- **82 testes P03.1C** herméticos (rede/DNS bloqueados); suíte crítica
+  (P01+P02+P03.1C) = **138**, verde, executada **2×**.
+- **PostgreSQL runtime test = PASS**: `backend/tests/pg_runtime_check.sql` via
+  `run_pg_runtime.sh` num cluster PG16 descartável (socket unix, sem rede) —
+  ON CONFLICT/união/reabertura/claim/lease/renew/pausa-CAS. Nunca Railway/produção.
+- `py_compile` e `git diff --check` aprovados. Sem push/deploy.

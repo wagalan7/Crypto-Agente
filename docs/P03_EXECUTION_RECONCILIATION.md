@@ -171,6 +171,39 @@ Fecha os gaps não cobertos por testes na auditoria independente:
   (GREATEST do lower-bound, merge jsonb de conditional_ids/payload, COALESCE de
   IDs/stop/qty, reabertura atômica). Merge nunca reduz informação.
 
+## P03.1C — final reconciliation closure
+
+Fecha os bloqueadores de concorrência/contrato e valida o SQL em Postgres real:
+
+- **Integração:** o hook passa as vars LOCAIS reais (`local_client_order_id`,
+  `local_planned_qty`), não o retorno da exchange. Maker pendente reconhecida por
+  `was_maker` + (`pending_entry_order`/status `NEW|PARTIALLY_FILLED`/
+  `ENTRY_SUBMISSION_UNKNOWN`/`ENTRY_ORDER_STILL_ACTIVE_OR_UNKNOWN`/GTX ambígua sem
+  `status`); `entry_order_terminal=true` impede falso-pending.
+- **Cleanup FLAT/OPEN:** REJECTED/terminal-zero com identidade condicional NÃO vai
+  direto a FLAT (confirma fresh-flat + cancela IDs exatos + grace). OPEN garante um
+  SL cardinal e cancela SÓ extras exatos do incidente (nunca o cardinal nem ordem
+  alheia), com `cancel.ok` + reconfirmação antes de PROTECTED.
+- **Tracking RealTrade:** match determinístico (`status=open`, `exchange=binance`,
+  `source in auto/managed`, símbolo/quote EXATO — `BTCUSDC≠BTCUSDT`, mesmo lado,
+  qty compatível). Sem match → `UNTRACKED_POSITION`/`MANUAL`. Persistência do
+  `sl_order_id` idempotente e só no RealTrade certo; conflito/falha → não PROTECTED.
+- **Validação SL:** só `STOP_MARKET` EXATO (rejeita `TRAILING_STOP_MARKET`),
+  símbolo/quote presente e exato, status vivo, `algo_id`, side oposto, cobertura
+  por `close_position` OU `reduce_only`+qty ≥ max(qty_terminal, posição_fresh),
+  trigger dentro de **0,2%**; booleanos normalizados. Falha real → `SL_NOT_CONFIRMED`
+  (nunca afirma "protegida").
+- **Persistência fail-closed:** latch local armado ANTES da persistência;
+  `record_incident` retorna `persisted`. `UNTRACKED` não persistido → boot inseguro,
+  scan `UNKNOWN`, sem release, tenta de novo.
+- **CAS/ownership:** `release_p03_pause` é `UPDATE … WHERE … LIKE 'P03-QUARANTINE:%'`
+  sob `pg_advisory_xact_lock` (sem SELECT+commit, sem clear genérico). Preserva
+  pausa manual/P02/legacy; owner P03 re-armado a cada ciclo com incidente aberto.
+  Recuperação `0→0`: boot inseguro→seguro com zero incidentes libera a pausa P03.
+- **Upsert/reabertura:** `conditional_ids` mantém união HISTÓRICA (perna atual +
+  lista `all` deduplicada — `{sl:S1}`+`{sl:S2}` preserva ambos). Reabertura limpa
+  claim/lease/manual_reason/backoff (elegível imediatamente).
+
 ## API (somente leitura)
 
 `GET /api/execution-incidents/status` — total aberto, retry pending, manual
@@ -180,14 +213,17 @@ resolve/close/enable-live. Frontend inalterado neste P03.
 
 ## Testes
 
-`backend/tests/test_p03_execution_reconciliation.py` — **67 testes** herméticos
-(nenhuma rede/Binance/DB real; nenhuma entry criada). Suíte crítica completa
-(P01+P02+P03.1B) = **123 testes**, verde. `py_compile` e `git diff --check` verdes.
+`backend/tests/test_p03_execution_reconciliation.py` — **82 testes** herméticos,
+com **rede/DNS bloqueados durante toda a suíte** (qualquer tentativa de socket
+falha o teste; zero chamadas a `demo-fapi.binance.com`). Suíte crítica completa
+(P01+P02+P03.1C) = **138 testes**, verde (executada 2×). `py_compile` e
+`git diff --check` verdes.
 
-> Limitação declarada: sem Postgres descartável local, a atomicidade do upsert
-> SQL (`INSERT … ON CONFLICT DO UPDATE`, merge jsonb) e o fencing por `UPDATE…WHERE`
-> (owner+lease) são exercitados na implementação **em memória equivalente** (mesma
-> semântica) — **não** é um teste Postgres real.
+**PostgreSQL runtime test = PASS.** `backend/tests/pg_runtime_check.sql` roda num
+cluster PostgreSQL 16 **descartável** (socket unix, sem TCP/rede, nunca Railway)
+via `backend/tests/run_pg_runtime.sh`, validando de verdade: `ON CONFLICT DO
+UPDATE` (união `all`/GREATEST), reabertura atômica limpando claim/lease/manual,
+claim/lease/renew (lease vencido não renova) e a pausa CAS sob advisory lock.
 >
 > Nota de ambiente: produção roda Python 3.11 (onde `Mapped[X | None]` resolve
 > nativamente). O único interpretador com deps nesta máquina é o 3.9; as suítes

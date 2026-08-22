@@ -105,7 +105,8 @@ RECONCILE_LEASE_S = _f("RECONCILE_LEASE_S", 120.0)
 RECONCILE_MAX_ATTEMPTS = _i("RECONCILE_MAX_ATTEMPTS", 8)
 RECONCILE_MAX_PER_CYCLE = _i("RECONCILE_MAX_PER_CYCLE", 10)
 RECONCILE_CREATE_SL = _b("RECONCILE_CREATE_SL", True)         # criar SL sob invariantes
-RECONCILE_STOP_TOL_FRAC = _f("RECONCILE_STOP_TOL_FRAC", 0.005)  # trigger dentro de 0,5%
+RECONCILE_STOP_TOL_FRAC = _f("RECONCILE_STOP_TOL_FRAC", 0.002)  # trigger dentro de 0,2% (P02)
+RECONCILE_QTY_MIN_COVER = _f("RECONCILE_QTY_MIN_COVER", 0.5)    # RealTrade qty >= 50% da posição fresh
 
 _PROCESS_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 _PAUSE_MARKER = "P03-QUARANTINE:"
@@ -115,6 +116,7 @@ _reconciler_running = False
 _prev_open_count = 0          # p/ liberar quarentena SÓ na transição >0 → 0
 _p03_latch_armed = False      # P03 realmente armou o latch?
 _boot_scan_safe = False       # leitura fresh de posições/incidentes já teve sucesso?
+_prev_boot_safe = False       # p/ detectar recuperação unsafe→safe (release 0→0)
 
 
 def _now() -> datetime:
@@ -176,20 +178,32 @@ def _mark_boot_unsafe() -> None:
     _boot_scan_safe = False
 
 
+_MAKER_PENDING_STATES = {"ENTRY_SUBMISSION_UNKNOWN", "ENTRY_ORDER_STILL_ACTIVE_OR_UNKNOWN"}
+
+
 def assemble_entry_incident(order_res: dict, rec: dict, *, closed: bool = False,
-                            snapshot_id=None, local_client_order_id=None) -> dict:
+                            snapshot_id=None, local_client_order_id=None,
+                            local_planned_qty=None) -> dict:
     """Monta os kwargs de `record_incident` a partir dos dados REAIS do caller.
-    Helper pequeno e testável (não roda fluxo de mercado). Reconhece o contrato
-    maker real (`was_maker`/`pending_entry_order`/`final_fill_qty_unknown`), usa o
-    `client_order_id` local como fallback OBRIGATÓRIO e persiste SL/TP IDs."""
+    Usa `local_client_order_id`/`local_planned_qty` (vars locais do caller) como
+    fonte primária. Reconhece o contrato maker real (incl. emissão GTX ambígua sem
+    `status`) e evita falso-pending quando `entry_order_terminal=true`."""
     order_res = order_res or {}
     rec = rec or {}
-    coid = (order_res.get("client_order_id") or local_client_order_id
+    coid = (local_client_order_id or order_res.get("client_order_id")
             or rec.get("client_order_id"))
     was_maker = _as_bool(order_res.get("was_maker") or order_res.get("maker")
                          or order_res.get("is_maker"))
-    status = str(order_res.get("status") or "").upper()
-    pending_entry = _as_bool(order_res.get("pending_entry_order")) or status in ("NEW", "PARTIALLY_FILLED")
+    status = str(order_res.get("status") or order_res.get("entry_order_status") or "").upper()
+    ss = str(order_res.get("safety_state") or "").upper()
+    terminal = _as_bool(order_res.get("entry_order_terminal"))
+    pending_signals = (
+        _as_bool(order_res.get("pending_entry_order"))
+        or status in ("NEW", "PARTIALLY_FILLED")
+        or ss in _MAKER_PENDING_STATES
+        or (was_maker and not status)   # GTX ambígua: was_maker sem status = pendente
+    )
+    pending_maker = bool(was_maker and pending_signals and not terminal)
     ffqu = _as_bool(order_res.get("final_fill_qty_unknown"))
     kind = (Kind.FINAL_FILL_QTY_UNKNOWN if ffqu
             else kind_from_safety_state(order_res.get("safety_state"), closed=closed))
@@ -200,6 +214,8 @@ def assemble_entry_incident(order_res: dict, rec: dict, *, closed: bool = False,
         if v:
             cond_ids[k] = str(v)
     eoid = result.get("orderId") or order_res.get("entry_order_id")
+    planned_qty = (local_planned_qty if local_planned_qty is not None
+                   else (rec.get("qty") or rec.get("position_size")))
     return dict(
         kind=kind, symbol=rec.get("symbol"),
         side=rec.get("direction") or rec.get("side"),
@@ -207,12 +223,12 @@ def assemble_entry_incident(order_res: dict, rec: dict, *, closed: bool = False,
         entry_order_id=(str(eoid) if eoid else None),
         conditional_prefix=coid,                       # P02 nomeia <coid>-sl/-tp1/-tp2
         conditional_ids=(cond_ids or None),
-        planned_qty=(rec.get("qty") or rec.get("position_size")),
+        planned_qty=planned_qty,
         planned_stop=rec.get("stop_loss") or rec.get("stop"),
         min_known_fill=(_finite(order_res.get("executed_qty")) or None),
         safety_state=order_res.get("safety_state"),
         snapshot_id=(str(snapshot_id) if snapshot_id else None),
-        pending_maker=bool(was_maker and pending_entry),
+        pending_maker=pending_maker,
         payload={"closed": bool(closed)},
     )
 
@@ -284,14 +300,31 @@ def _order_identities(o: dict) -> set:
     return ids
 
 
-def _sym_base(s: str) -> str:
+_QUOTES = ("USDT", "USDC", "BUSD", "FDUSD", "TUSD")
+
+
+def _sym_key(s: str) -> str:
+    """Chave normalizada base/quote — DISTINGUE quote (BTCUSDC ≠ BTCUSDT).
+    "BTC/USDT:USDT"→"BTC/USDT"; "BTCUSDT"→"BTC/USDT"; "BTCUSDC"→"BTC/USDC"."""
     import re
-    # "BTC/USDT:USDT" → "BTC"; "BTCUSDT" → "BTC"; "1000PEPEUSDT" → "1000PEPE".
-    head = str(s or "").upper().split("/")[0]
-    b = re.sub(r"[^A-Z0-9]", "", head)
-    return b[:-4] if b.endswith("USDT") and len(b) > 4 else b
+    s = re.sub(r"[^A-Z0-9/:]", "", str(s or "").upper())
+    if "/" in s:
+        base = s.split("/")[0]
+        quote = s.split("/")[1].split(":")[0]
+        return f"{base}/{quote}" if base and quote else s
+    for q in _QUOTES:
+        if s.endswith(q) and len(s) > len(q):
+            return f"{s[:-len(q)]}/{q}"
+    return s
 
 
+def _sym_base(s: str) -> str:
+    k = _sym_key(s)
+    return k.split("/")[0] if "/" in k else k
+
+
+# Tipos de STOP aceitos: EXATO STOP_MARKET. TRAILING_STOP_MARKET é REJEITADO.
+_ACCEPTED_STOP_TYPES = {"STOP_MARKET"}
 _DEAD_ALGO_STATUS = {"CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "FILLED", "REJECTED"}
 
 
@@ -307,12 +340,12 @@ def _adopt_live_stop(inc: dict, need_qty: Optional[float], listing: dict) -> tup
         return False, None, "side do incidente desconhecido — não adota"
     want_close = _close_side(entry_side)
     planned_stop = _finite(inc.get("planned_stop"))
-    inc_base = _sym_base(inc.get("symbol"))
+    inc_key = _sym_key(inc.get("symbol"))
     for o in (listing.get("orders") or []):
         if not isinstance(o, dict):
             continue
         otype = str(o.get("type") or o.get("origType") or "").upper()
-        if "STOP" not in otype:
+        if otype not in _ACCEPTED_STOP_TYPES:        # EXATO STOP_MARKET; trailing rejeitado
             continue
         algo_id = o.get("algo_id") or o.get("algoId")
         if not algo_id:
@@ -321,8 +354,8 @@ def _adopt_live_stop(inc: dict, need_qty: Optional[float], listing: dict) -> tup
         if oside != want_close:                      # side ausente OU não-oposto → rejeita
             continue
         osym = o.get("symbol")
-        if osym and inc_base and _sym_base(osym) != inc_base:
-            continue                                 # símbolo diferente
+        if not osym or _sym_key(osym) != inc_key:     # símbolo/contrato/quote exato obrigatório
+            continue
         ostatus = str(o.get("status") or o.get("algoStatus") or "").upper()
         if ostatus and ostatus in _DEAD_ALGO_STATUS:
             continue                                 # não está vivo
@@ -365,22 +398,49 @@ def _model_cols() -> set:
     return _EXTRA_COLS
 
 
+def _merge_conditional_ids(cur: dict, new: dict) -> dict:
+    """União HISTÓRICA: perna atual (sl/tp1/tp2) atualizada + lista `all`
+    deduplicada com TODOS os IDs já vistos. `{sl:S1}` + `{sl:S2}` preserva S1 e S2."""
+    out = dict(cur or {})
+    all_ids = [str(x) for x in (out.get("all") or []) if x]
+    def _add(v):
+        if v and str(v) not in all_ids:
+            all_ids.append(str(v))
+    for leg in ("sl", "tp1", "tp2"):
+        _add(out.get(leg))
+    for leg in ("sl", "tp1", "tp2"):
+        v = (new or {}).get(leg)
+        if v:
+            out[leg] = str(v)
+            _add(v)
+    for v in ((new or {}).get("all") or []):
+        _add(v)
+    for v in ((new or {}).get("ids") or []):
+        _add(v)
+    out["all"] = all_ids
+    return out
+
+
 def _merge_incident_row(row: dict, incoming: dict) -> None:
     """Merge monotônico in-place (mesma semântica do ON CONFLICT DO UPDATE):
-    nunca reduz informação conhecida. Reabre reincidência resolvida."""
+    nunca reduz informação conhecida. Reabre reincidência resolvida (limpa
+    manual_reason, claim/lease e backoff antigo → elegível imediatamente)."""
     if row.get("resolved_at") is not None:
         row.update({"state": State.OPEN, "resolved_at": None, "attempts": 0,
                     "clean_observations": 0, "next_retry_at": _now(),
-                    "last_error": "reaberto: problema reincidiu"})
+                    "manual_reason": None, "claimed_by": None, "claimed_at": None,
+                    "lease_expires_at": None, "last_error": "reaberto: problema reincidiu"})
     inc_lb = incoming.get("min_known_fill")
     if inc_lb is not None:
         row["min_known_fill"] = max(row.get("min_known_fill") or 0.0, inc_lb)
-    for jcol in ("conditional_ids", "payload"):
-        new = incoming.get(jcol)
-        if isinstance(new, dict) and new:
-            merged = dict(row.get(jcol) or {})
-            merged.update(new)               # incorpora novos IDs sem apagar
-            row[jcol] = merged
+    new_cids = incoming.get("conditional_ids")
+    if isinstance(new_cids, dict) and new_cids:
+        row["conditional_ids"] = _merge_conditional_ids(row.get("conditional_ids") or {}, new_cids)
+    new_pl = incoming.get("payload")
+    if isinstance(new_pl, dict) and new_pl:
+        merged = dict(row.get("payload") or {})
+        merged.update(new_pl)
+        row["payload"] = merged
     for scol in ("side", "planned_qty", "planned_stop", "client_order_id",
                  "entry_order_id", "conditional_prefix"):
         if row.get(scol) is None and incoming.get(scol) is not None:
@@ -527,15 +587,29 @@ class _SqlIncidentRepo:
         def _reopen(c, reopened):  # CASE de reabertura
             return text(f"CASE WHEN {T}.resolved_at IS NOT NULL THEN {reopened} ELSE {T}.{c} END")
 
+        # conditional_ids: merge per-perna (||) + união HISTÓRICA da lista 'all'.
+        cond_merge = text(
+            f"((COALESCE({T}.conditional_ids::jsonb,'{{}}'::jsonb) "
+            f"|| COALESCE(EXCLUDED.conditional_ids::jsonb,'{{}}'::jsonb)) "
+            f"|| jsonb_build_object('all', (SELECT COALESCE(jsonb_agg(DISTINCT v),'[]'::jsonb) FROM ("
+            f"  SELECT jsonb_array_elements_text(COALESCE({T}.conditional_ids->'all','[]'::jsonb)) AS v"
+            f"  UNION SELECT jsonb_array_elements_text(COALESCE(EXCLUDED.conditional_ids->'all','[]'::jsonb))"
+            f"  UNION SELECT {T}.conditional_ids->>'sl' UNION SELECT {T}.conditional_ids->>'tp1' UNION SELECT {T}.conditional_ids->>'tp2'"
+            f"  UNION SELECT EXCLUDED.conditional_ids->>'sl' UNION SELECT EXCLUDED.conditional_ids->>'tp1' UNION SELECT EXCLUDED.conditional_ids->>'tp2'"
+            f") s WHERE v IS NOT NULL)))::json")
+
         set_ = {
             "min_known_fill": text(f"GREATEST(COALESCE({T}.min_known_fill,0), "
                                    f"COALESCE(EXCLUDED.min_known_fill,0))"),
             "side": _co("side"), "planned_qty": _co("planned_qty"),
             "planned_stop": _co("planned_stop"), "client_order_id": _co("client_order_id"),
             "entry_order_id": _co("entry_order_id"), "conditional_prefix": _co("conditional_prefix"),
-            "conditional_ids": _jm("conditional_ids"), "payload": _jm("payload"),
+            "conditional_ids": cond_merge, "payload": _jm("payload"),
             "state": _reopen("state", "'OPEN'"), "resolved_at": _reopen("resolved_at", "NULL"),
             "attempts": _reopen("attempts", "0"), "clean_observations": _reopen("clean_observations", "0"),
+            "manual_reason": _reopen("manual_reason", "NULL"),
+            "claimed_by": _reopen("claimed_by", "NULL"), "claimed_at": _reopen("claimed_at", "NULL"),
+            "lease_expires_at": _reopen("lease_expires_at", "NULL"),
             "updated_at": _now(),
         }
         async with get_session() as session:
@@ -677,16 +751,23 @@ def set_repo(repo: Any) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 #  Quarentena com OWNERSHIP — P03 arma/limpa somente o próprio latch
 # ════════════════════════════════════════════════════════════════════════════
-async def _arm_quarantine(reason: str) -> None:
-    """Arma o latch P03 (fail-closed imediato) e persiste a pausa SEM sobrescrever
-    uma pausa manual/não-P03 do operador."""
+def _arm_local_latch(reason: str) -> None:
+    """Arma SÓ o latch local P03 em memória (fail-closed IMEDIATO, síncrono).
+    Chamado ANTES de qualquer persistência — uma falha de DB não pode liberar a
+    próxima ordem do processo."""
     global _p03_latch_armed
     try:
         from services import shadow_trade_service
         shadow_trade_service._arm_execution_quarantine(reason, owner=_LATCH_OWNER)
         _p03_latch_armed = True
     except Exception as exc:  # noqa: BLE001
-        log.critical(f"[p03] falha armando latch: {exc}")
+        log.critical(f"[p03] falha armando latch local: {exc}")
+
+
+async def _arm_quarantine(reason: str) -> None:
+    """Arma o latch P03 (fail-closed imediato) e persiste a pausa SEM sobrescrever
+    uma pausa manual/não-P03 do operador."""
+    _arm_local_latch(reason)
     try:
         from services import risk_service
         status = await risk_service.get_status()
@@ -766,8 +847,12 @@ async def record_incident(*, kind: str, symbol: str, exchange: str = EXCHANGE_BI
                  ("pending_maker", pending_maker)):
         if v is not None:
             full_payload[k] = v
+    # Latch local ARMADO ANTES da persistência (fail-closed imediato): uma falha
+    # de DB não pode liberar a próxima ordem do processo.
+    _arm_local_latch(f"incidente {kind} {symbol} ({_mask(client_order_id or entry_order_id)})")
     repo = _get_repo()
     created = False
+    persisted = False
     row = None
     try:
         # upsert é ATÔMICO: no conflito já faz merge monotônico (GREATEST/união)
@@ -780,12 +865,15 @@ async def record_incident(*, kind: str, symbol: str, exchange: str = EXCHANGE_BI
             "conditional_ids": conditional_ids, "payload": full_payload or None,
             "next_retry_at": _now(),
         })
+        persisted = row is not None and row.get("id") is not None
     except Exception as exc:  # noqa: BLE001
         log.critical(f"[p03] persistência de incidente falhou ({key}): {exc}")
+    # Persiste a pausa (best-effort) — o latch local já bloqueia entradas.
     await _arm_quarantine(f"incidente {kind} {symbol} ({_mask(client_order_id or entry_order_id)})")
     log.critical(f"[p03][incident] key={key} kind={kind} symbol={symbol} created={created} "
-                 f"coid={_mask(client_order_id)} eoid={_mask(entry_order_id)} maker={pending_maker}")
-    return {"incident_key": key, "created": created, "state": (row or {}).get("state", State.OPEN)}
+                 f"persisted={persisted} coid={_mask(client_order_id)} eoid={_mask(entry_order_id)} maker={pending_maker}")
+    return {"incident_key": key, "created": created, "persisted": persisted,
+            "state": (row or {}).get("state", State.OPEN)}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -869,9 +957,10 @@ def _exact_conditional_ids(inc: dict) -> list[str]:
         for k in ("sl", "tp1", "tp2"):
             if cids.get(k):
                 ids.append(str(cids[k]))
-        extra = cids.get("ids")
-        if isinstance(extra, list):
-            ids.extend(str(x) for x in extra if x)
+        for k in ("all", "ids"):                 # união histórica de todos os IDs vistos
+            extra = cids.get(k)
+            if isinstance(extra, list):
+                ids.extend(str(x) for x in extra if x)
     pref = inc.get("conditional_prefix")
     if pref:
         ids.extend([f"{pref}-sl", f"{pref}-tp1", f"{pref}-tp2"])
@@ -930,9 +1019,13 @@ async def _ensure_stop(key: str, owner: str, inc: dict, need_qty: Optional[float
     return False, None, f"criação SL não confirmada (sl_ok={res.get('sl_ok') if res else None})"
 
 
-async def _match_real_trade(symbol: str, side: Optional[str]) -> Optional[dict]:
-    """Confirma RealTrade aberto correspondente (exchange binance / símbolo / lado).
-    DB desabilitado → {"skip": True} (não aplicável). Sem match → None."""
+async def _match_real_trade(symbol: str, side: Optional[str],
+                            fresh_size: Optional[float] = None) -> Optional[dict]:
+    """Confirma RealTrade aberto correspondente por PROVA DETERMINÍSTICA:
+    `status=open`, `exchange=binance`, `source in (auto, managed)`, símbolo/contrato/
+    quote EXATO (BTCUSDC ≠ BTCUSDT), MESMO lado, e qty agregada compatível com a
+    posição fresh (não muito menor). Rejeita Bybit/shadow/manual/exchange ausente/
+    lado oposto/mesmo-base-quote-diferente. DB off → {"skip": True}. Sem prova → None."""
     try:
         from db import get_session, DB_ENABLED
     except Exception:
@@ -941,42 +1034,76 @@ async def _match_real_trade(symbol: str, side: Optional[str]) -> Optional[dict]:
         return {"skip": True}
     from models.real_trade import RealTrade
     from sqlalchemy import select
-    want = _norm_entry_side(side)
     async with get_session() as session:
         rows = (await session.execute(
-            select(RealTrade).where(RealTrade.symbol == symbol, RealTrade.status == "open")
+            select(RealTrade).where(RealTrade.status == "open")
         )).scalars().all()
         for r in rows:
-            rside = _norm_entry_side(getattr(r, "direction", None) or getattr(r, "side", None))
-            if want is None or rside is None or rside == want:
+            if _real_trade_match(r, symbol, side, fresh_size):
                 return {"id": r.id}
     return None
 
 
-async def _persist_sl_order_id(rt_id, sl_id: str) -> None:
-    """Persiste o sl_order_id no RealTrade de forma IDEMPOTENTE (só se ausente)."""
+def _rt_get(r, name):
+    return r.get(name) if isinstance(r, dict) else getattr(r, name, None)
+
+
+def _real_trade_match(r, symbol: str, side: Optional[str], fresh_size: Optional[float]) -> bool:
+    """Preditor PURO (testável) do match determinístico de RealTrade × posição
+    Binance. Aceita ORM ou dict. Exige exchange=binance, source in (auto,managed),
+    símbolo/quote EXATO, mesmo lado, e qty compatível (não muito menor)."""
+    if (_rt_get(r, "status") or "") != "open":
+        return False
+    if (str(_rt_get(r, "exchange") or "").strip().lower()) != EXCHANGE_BINANCE:
+        return False                                      # Bybit/shadow/ausente
+    if (_rt_get(r, "source") or "") not in ("auto", "managed"):
+        return False                                      # manual/shadow
+    if _sym_key(_rt_get(r, "symbol") or "") != _sym_key(symbol):
+        return False                                      # símbolo/quote/contrato exato
+    want = _norm_entry_side(side)
+    rside = _norm_entry_side(_rt_get(r, "side") or _rt_get(r, "direction"))
+    if want is not None and rside is not None and rside != want:
+        return False                                      # lado oposto
+    need = _finite(fresh_size)
+    if need is not None and need > 0:
+        rqty = _finite(_rt_get(r, "qty")) or _finite(_rt_get(r, "qty_initial")) or 0.0
+        if rqty + 1e-9 < need * RECONCILE_QTY_MIN_COVER:
+            return False                                  # qty DB muito menor que a posição real
+    return True
+
+
+async def _persist_sl_order_id(rt_id, sl_id: str) -> bool:
+    """Persiste o sl_order_id no RealTrade CERTO, idempotente. Retorna True se
+    gravou ou já era o mesmo; False em CONFLITO (outro ID) ou falha — nesse caso o
+    caller NÃO resolve PROTECTED (preserva IDs, RETRY/MANUAL, quarentena)."""
     if not rt_id or not sl_id:
-        return
+        return False
     try:
         from db import get_session, DB_ENABLED
         if not DB_ENABLED:
-            return
+            return True
         from models.real_trade import RealTrade
-        from sqlalchemy import update
+        from sqlalchemy import update, or_
         async with get_session() as session:
-            await session.execute(update(RealTrade).where(
-                RealTrade.id == rt_id, RealTrade.sl_order_id.is_(None)
+            # grava só se ausente OU já igual (não sobrescreve ID de outro).
+            res = await session.execute(update(RealTrade).where(
+                RealTrade.id == rt_id,
+                or_(RealTrade.sl_order_id.is_(None), RealTrade.sl_order_id == str(sl_id)),
             ).values(sl_order_id=str(sl_id)))
             await session.commit()
+            return (res.rowcount or 0) == 1     # 0 → conflito (ID diferente já lá)
     except Exception as exc:  # noqa: BLE001
-        log.warning(f"[p03] persistir sl_order_id falhou (não bloqueia): {exc}")
+        log.warning(f"[p03] persistir sl_order_id falhou: {exc}")
+        return False
 
 
-async def _resolve_protected(key: str, owner: str, inc: dict, sl_id: Optional[str], detail: str) -> None:
-    """Só declara PROTECTED se existir RealTrade aberto correspondente. Protegido
-    mas SEM RealTrade → não libera; escala UNTRACKED_POSITION/MANUAL (não inventa
-    fechamento, não abre nova operação). Persiste sl_order_id idempotente."""
-    rt = await _match_real_trade(inc["symbol"], inc.get("side"))
+async def _resolve_protected(key: str, owner: str, inc: dict, sl_id: Optional[str],
+                             detail: str, fresh_size: Optional[float] = None) -> None:
+    """Só declara PROTECTED se existir RealTrade DETERMINISTICAMENTE correspondente
+    (exchange/símbolo/lado/qty). Sem match → UNTRACKED_POSITION/MANUAL (não inventa
+    fechamento, não abre nada). Falha/conflito ao persistir o sl_order_id → NÃO
+    resolve PROTECTED (mantém quarentena)."""
+    rt = await _match_real_trade(inc["symbol"], inc.get("side"), fresh_size)
     if rt is None:
         await record_incident(kind=Kind.UNTRACKED_POSITION, symbol=inc["symbol"],
                               side=inc.get("side"), planned_qty=inc.get("planned_qty"),
@@ -986,7 +1113,10 @@ async def _resolve_protected(key: str, owner: str, inc: dict, sl_id: Optional[st
         log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED (protegida sem RealTrade)")
         return
     if sl_id and rt.get("id"):
-        await _persist_sl_order_id(rt.get("id"), sl_id)
+        if not await _persist_sl_order_id(rt.get("id"), sl_id):
+            await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
+                                  "persistência do sl_order_id falhou/conflito — mantém quarentena")
+            return
     await _resolve(key, owner, State.PROTECTED, detail)
 
 
@@ -1013,8 +1143,11 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
             if obs and obs > 0:
                 await _fenced(key, owner, min_known_fill=max(_finite(inc.get("min_known_fill")) or 0.0, obs))
             pv0, size0 = await _fresh_verdict(inc["symbol"])
+            _prot_ok, _prot = True, "sem exposição observada"     # sem posição → nada a proteger
             if pv0 == "OPEN":
-                await _ensure_stop(key, owner, inc, max(_finite(size0) or 0.0, obs or 0.0))
+                _prot_ok, _psl, _prot = await _ensure_stop(key, owner, inc, max(_finite(size0) or 0.0, obs or 0.0))
+            # rótulo honesto: NÃO afirmar "protegida" se _ensure_stop falhou.
+            _prot_lbl = "exposição protegida" if _prot_ok else f"SL_NOT_CONFIRMED ({_prot})"
             if not await _renew_or_abort(key, owner):
                 return
             try:
@@ -1023,7 +1156,7 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
                 cancel = {"ok": False, "error": str(exc)}
             if not (cancel and cancel.get("ok")):
                 await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
-                                      f"cancel maker incerto — quarentena mantida, exposição protegida ({cancel.get('error') or cancel.get('msg')})")
+                                      f"cancel maker incerto — quarentena mantida ({_prot_lbl}; {cancel.get('error') or cancel.get('msg')})")
                 return
             try:
                 order_res = await bss.get_order(inc["symbol"], order_id=oid, client_order_id=coid)
@@ -1033,11 +1166,16 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
             verdict, qty, why = classify_entry(order_res)
             if verdict == "RETRY":
                 await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
-                                      "maker cancelada mas ainda não-terminal — exposição protegida")
+                                      f"maker cancelada mas ainda não-terminal — {_prot_lbl}")
                 return
 
     if verdict == "FLAT":
-        await _resolve(key, owner, State.FLAT, f"entrada sem fill ({why})")
+        # REJECTED/terminal-zero: NÃO vai direto a FLAT se há identidade condicional
+        # — confirma fresh-flat, cancela IDs exatos e aplica grace via cleanup.
+        if _exact_conditional_ids(inc):
+            await _reconcile_cleanup(key, owner, inc)
+        else:
+            await _resolve(key, owner, State.FLAT, f"entrada sem fill ({why})")
         return
     if verdict == "RETRY":
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, why)
@@ -1065,9 +1203,54 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
     need = max(_finite(qty) or 0.0, _finite(_size) or 0.0)   # cobre a posição fresh total
     ok, sl_id, detail = await _ensure_stop(key, owner, inc, need)
     if ok:
-        await _resolve_protected(key, owner, inc, sl_id, f"fill {qty:g} protegido ({detail})")
+        await _resolve_protected(key, owner, inc, sl_id, f"fill {qty:g} protegido ({detail})", fresh_size=_size)
     else:
-        await _schedule_retry(key, owner, inc, State.RETRY_PENDING, f"sem SL confirmado: {detail}")
+        await _schedule_retry(key, owner, inc, State.RETRY_PENDING, f"SL_NOT_CONFIRMED: {detail}")
+
+
+async def _cancel_extra_conditionals(key: str, owner: str, inc: dict, keep_id: Optional[str]) -> tuple[bool, str]:
+    """Cancela SÓ as condicionais EXATAS do incidente que NÃO são o SL cardinal
+    (`keep_id`) — duplicatas/TP antigos. Nunca toca o SL cardinal, ordem sem
+    identidade exata, ou ordem de outro trade. Exige `cancel.ok` + reconfirmação."""
+    from services import binance_signed_service as bss
+    exact_ids = _exact_conditional_ids(inc)
+    if not exact_ids:
+        return True, "sem condicionais conhecidas"
+    try:
+        listing = await bss.get_open_algo_orders(inc["symbol"])
+    except Exception as exc:  # noqa: BLE001
+        return False, f"listagem exceção: {exc}"
+    if not listing or not listing.get("ok"):
+        return False, "listagem stale/erro"
+    extras = [o for o in _matching_orders(listing, exact_ids)
+              if str(o.get("algo_id") or o.get("algoId") or "") != str(keep_id or "")]
+    if not extras:
+        return True, "nenhum extra exato vivo"
+    if not await _renew_or_abort(key, owner):
+        return False, "claim perdido"
+    all_ok = True
+    for o in extras:
+        aid = o.get("algo_id") or o.get("algoId")
+        if not aid:
+            all_ok = False
+            continue
+        try:
+            res = await bss.cancel_algo_order(str(aid))
+        except Exception as exc:  # noqa: BLE001
+            res = {"ok": False, "error": str(exc)}
+        if not (res and res.get("ok")):   # ok=False NÃO é sucesso
+            all_ok = False
+    try:
+        l2 = await bss.get_open_algo_orders(inc["symbol"])
+    except Exception:  # noqa: BLE001
+        return False, "recheck exceção"
+    if not l2 or not l2.get("ok"):
+        return False, "recheck stale/erro"
+    still = [o for o in _matching_orders(l2, exact_ids)
+             if str(o.get("algo_id") or o.get("algoId") or "") != str(keep_id or "")]
+    if all_ok and not still:
+        return True, "extras cancelados e ausentes"
+    return False, "cancel incerto/extra persiste"
 
 
 async def _reconcile_cleanup(key: str, owner: str, inc: dict) -> None:
@@ -1077,15 +1260,20 @@ async def _reconcile_cleanup(key: str, owner: str, inc: dict) -> None:
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, "posição/listagem incerta")
         return
     if pv == "OPEN":
-        # Garante 1 SL cardinal válido cobrindo a posição fresh TOTAL; não cancela
-        # o único SL válido. TP/duplicatas exatas ficam para a via de cleanup.
+        # (1) garante 1 SL cardinal válido cobrindo a posição fresh TOTAL (nunca
+        # cancela o SL cardinal); (2) cancela SÓ extras exatos do incidente
+        # (duplicatas/TP antigos), reconfirma ausência; (3) só então PROTECTED.
         need = max(_finite(size) or 0.0, _finite(inc.get("planned_qty")) or 0.0,
                    _finite(inc.get("min_known_fill")) or 0.0)
         ok, sl_id, detail = await _ensure_stop(key, owner, inc, need)
-        if ok:
-            await _resolve_protected(key, owner, inc, sl_id, f"posição aberta re-protegida ({detail})")
-        else:
-            await _schedule_retry(key, owner, inc, State.RETRY_PENDING, f"posição aberta sem SL: {detail}")
+        if not ok:
+            await _schedule_retry(key, owner, inc, State.RETRY_PENDING, f"posição aberta SL_NOT_CONFIRMED: {detail}")
+            return
+        cleaned, why2 = await _cancel_extra_conditionals(key, owner, inc, keep_id=sl_id)
+        if not cleaned:
+            await _schedule_retry(key, owner, inc, State.RETRY_PENDING, f"extras exatos não confirmados: {why2}")
+            return
+        await _resolve_protected(key, owner, inc, sl_id, f"posição aberta re-protegida ({detail})", fresh_size=size)
         return
 
     # FLAT. Sem identidade confiável de condicionais → NÃO resolve por "nenhum
@@ -1182,7 +1370,7 @@ async def reconcile_due() -> dict:
     """Um ciclo: recupera claims expirados, processa incidentes elegíveis (claim
     atômico + fencing por owner/lease). Libera a quarentena própria SÓ na transição
     de ≥1 incidente para 0 — nada de clear/log nos ciclos comuns."""
-    global _last_reconciliation_at, _prev_open_count
+    global _last_reconciliation_at, _prev_open_count, _prev_boot_safe
     repo = _get_repo()
     await repo.recover_expired_claims()
     # Boot inseguro (leitura stale/erro): re-tenta o scan fresh de posições a cada
@@ -1219,9 +1407,14 @@ async def reconcile_due() -> dict:
         except Exception as exc:  # noqa: BLE001
             log.error(f"[p03] re-arm do latch falhou: {exc}")
     released = False
-    if _prev_open_count > 0 and open_now == 0:
+    # Libera na transição >0→0 OU na recuperação de boot inseguro→seguro com zero
+    # incidentes (0→0) — sem clear/log nos ciclos comuns já-estáveis.
+    transition_to_zero = _prev_open_count > 0 and open_now == 0
+    boot_recovery = (open_now == 0 and _boot_scan_safe and not _prev_boot_safe and _p03_latch_armed)
+    if transition_to_zero or boot_recovery:
         released = await _maybe_release_quarantine()
     _prev_open_count = open_now
+    _prev_boot_safe = _boot_scan_safe
     _last_reconciliation_at = _now().isoformat()
     return {"processed": processed, "open_now": open_now, "quarantine_released": released}
 
@@ -1289,18 +1482,27 @@ async def _detect_untracked_positions() -> dict:
         log.critical(f"[p03][boot] leitura RealTrade falhou — quarentena armada: {exc}")
         return {"status": "UNKNOWN", "count": 0}
     n = 0
+    all_persisted = True
     for p in positions:
         sym = p.get("symbol") or ""
         norm = sym.replace("USDT", "/USDT:USDT") if "/" not in sym else sym
         if norm in open_symbols or sym in open_symbols:
             continue
         side = str(p.get("side") or "").strip().lower()   # usa o side REAL (não o abs)
-        await record_incident(kind=Kind.UNTRACKED_POSITION, symbol=norm,
-                              side=("sell" if side == "sell" else "buy"),
-                              min_known_fill=abs(_finite(p.get("size")) or 0),
-                              payload={"detected_at_boot": True})
-        n += 1
-    _boot_scan_safe = True              # o scan em si teve sucesso (leitura confiável)
+        res_inc = await record_incident(kind=Kind.UNTRACKED_POSITION, symbol=norm,
+                                        side=("sell" if side == "sell" else "buy"),
+                                        min_known_fill=abs(_finite(p.get("size")) or 0),
+                                        payload={"detected_at_boot": True})
+        if res_inc.get("persisted"):
+            n += 1
+        else:
+            all_persisted = False   # latch armado, mas UNTRACKED não persistiu
+    if not all_persisted:
+        # Não incrementar como persistido, não permitir release, continuar tentando.
+        _boot_scan_safe = False
+        log.critical("[p03][boot] UNTRACKED não persistido — boot inseguro (UNKNOWN)")
+        return {"status": "UNKNOWN", "count": n}
+    _boot_scan_safe = True              # leitura fresh + persistência OK
     if n:
         log.critical(f"[p03][boot] {n} posição(ões) UNTRACKED → pausa persistente")
     return {"status": ("UNTRACKED" if n else "FLAT"), "count": n}

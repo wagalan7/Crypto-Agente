@@ -35,6 +35,28 @@ from services.execution_reconciliation_service import (  # noqa: E402
 )
 
 
+# ── Hermeticidade: bloqueia rede/DNS durante TODA a suíte P03 ────────────────
+import socket as _socket
+
+_REAL_GETADDRINFO = _socket.getaddrinfo
+_REAL_CREATE_CONNECTION = _socket.create_connection
+
+
+def _blocked_net(*a, **k):
+    raise RuntimeError("REDE BLOQUEADA no teste P03 (hermético): tentativa de "
+                       f"resolver/conectar {a[:1]} — mocke a exchange.")
+
+
+def setUpModule():
+    _socket.getaddrinfo = _blocked_net       # DNS bloqueado (httpx/aiohttp resolvem por aqui)
+    _socket.create_connection = _blocked_net  # conexão TCP externa bloqueada
+
+
+def tearDownModule():
+    _socket.getaddrinfo = _REAL_GETADDRINFO
+    _socket.create_connection = _REAL_CREATE_CONNECTION
+
+
 def _algo(**kw):
     """Ordem no FORMATO REAL de get_open_algo_orders (snake_case)."""
     o = {"algo_id": "", "client_algo_id": None, "symbol": "BTCUSDT", "side": "SELL",
@@ -158,31 +180,35 @@ class DecisionCoreTests(unittest.TestCase):
 
     # ── Adoção de SL: consome snake_case real ──
     def test_adopt_valid_snake_case_stop(self):
-        inc = {"side": "buy", "planned_stop": 100.0}   # long → SL SELL
+        inc = {"side": "buy", "planned_stop": 100.0, "symbol": "BTC/USDT:USDT"}   # long → SL SELL
         listing = {"orders": [_algo(algo_id="A1", side="SELL", reduce_only=True,
-                                    quantity=1.0, trigger_price=100.2, type="STOP_MARKET")]}
+                                    quantity=1.0, trigger_price=100.15, type="STOP_MARKET")]}
         ok, aid, _ = _adopt_live_stop(inc, 1.0, listing)
         self.assertTrue(ok)
         self.assertEqual(aid, "A1")
+        # trailing rejeitado mesmo com tudo certo
+        trail = {"orders": [_algo(algo_id="A1", side="SELL", reduce_only=True, quantity=1.0,
+                                  trigger_price=100.1, type="TRAILING_STOP_MARKET")]}
+        self.assertFalse(_adopt_live_stop(inc, 1.0, trail)[0])
 
     def test_adopt_rejects_wrong_side(self):
-        inc = {"side": "buy", "planned_stop": 100.0}
+        inc = {"side": "buy", "planned_stop": 100.0, "symbol": "BTC/USDT:USDT"}
         listing = {"orders": [_algo(algo_id="A1", side="BUY", reduce_only=True, quantity=1.0, trigger_price=100.0)]}
         self.assertFalse(_adopt_live_stop(inc, 1.0, listing)[0])
 
     def test_adopt_rejects_no_reduce_no_close(self):
-        inc = {"side": "buy", "planned_stop": 100.0}
+        inc = {"side": "buy", "planned_stop": 100.0, "symbol": "BTC/USDT:USDT"}
         listing = {"orders": [_algo(algo_id="A1", side="SELL", reduce_only=False,
                                     close_position=False, quantity=1.0, trigger_price=100.0)]}
         self.assertFalse(_adopt_live_stop(inc, 1.0, listing)[0])
 
     def test_adopt_rejects_insufficient_qty(self):
-        inc = {"side": "buy", "planned_stop": 100.0}
+        inc = {"side": "buy", "planned_stop": 100.0, "symbol": "BTC/USDT:USDT"}
         listing = {"orders": [_algo(algo_id="A1", side="SELL", reduce_only=True, quantity=0.4, trigger_price=100.0)]}
         self.assertFalse(_adopt_live_stop(inc, 1.0, listing)[0])
 
     def test_adopt_rejects_empty_algo_id_and_trigger_out_of_tol(self):
-        inc = {"side": "buy", "planned_stop": 100.0}
+        inc = {"side": "buy", "planned_stop": 100.0, "symbol": "BTC/USDT:USDT"}
         self.assertFalse(_adopt_live_stop(inc, 1.0, {"orders": [_algo(algo_id="", side="SELL",
                           close_position=True, trigger_price=100.0)]})[0])
         # trigger fora da tolerância (0,5%)
@@ -190,9 +216,12 @@ class DecisionCoreTests(unittest.TestCase):
                           close_position=True, trigger_price=140.0)]})[0])
 
     def test_adopt_close_position_covers(self):
-        inc = {"side": "sell", "planned_stop": 200.0}  # short → SL BUY
-        listing = {"orders": [_algo(algo_id="A2", side="BUY", close_position=True, trigger_price=200.5)]}
-        self.assertTrue(_adopt_live_stop(inc, None, listing)[0])
+        inc = {"side": "sell", "planned_stop": 200.0, "symbol": "BTC/USDT:USDT"}  # short → SL BUY
+        listing = {"orders": [_algo(algo_id="A2", side="BUY", close_position=True, trigger_price=200.3)]}
+        self.assertTrue(_adopt_live_stop(inc, None, listing)[0])   # 0,15% dentro de 0,2%
+        # trigger fora de 0,2% (0,25%) → rejeitado
+        listing2 = {"orders": [_algo(algo_id="A2", side="BUY", close_position=True, trigger_price=200.5)]}
+        self.assertFalse(_adopt_live_stop(inc, None, listing2)[0])
 
     def test_exact_conditional_ids_from_prefix(self):
         ids = _exact_conditional_ids({"conditional_prefix": "cw-x"})
@@ -647,19 +676,19 @@ class QtyRawTests(unittest.TestCase):
         self.assertEqual(q, 0.7)
 
     def test_string_false_not_true(self):
-        inc = {"side": "buy", "planned_stop": 100.0}
+        inc = {"side": "buy", "planned_stop": 100.0, "symbol": "BTC/USDT:USDT"}
         listing = {"orders": [_algo(algo_id="A1", side="SELL", reduce_only="false",
                                     close_position="false", quantity=1.0, trigger_price=100.0)]}
         self.assertFalse(_adopt_live_stop(inc, 1.0, listing)[0])   # "false" não cobre
 
     def test_fresh_larger_needs_bigger_coverage(self):
-        inc = {"side": "buy", "planned_stop": 100.0}
+        inc = {"side": "buy", "planned_stop": 100.0, "symbol": "BTC/USDT:USDT"}
         listing = {"orders": [_algo(algo_id="A1", side="SELL", reduce_only=True, quantity=1.0, trigger_price=100.0)]}
         self.assertTrue(_adopt_live_stop(inc, 1.0, listing)[0])    # cobre 1.0
         self.assertFalse(_adopt_live_stop(inc, 2.0, listing)[0])   # posição fresh 2.0 > 1.0
 
     def test_reject_missing_side_and_dead_status(self):
-        inc = {"side": "buy", "planned_stop": 100.0}
+        inc = {"side": "buy", "planned_stop": 100.0, "symbol": "BTC/USDT:USDT"}
         self.assertFalse(_adopt_live_stop(inc, 1.0, {"orders": [_algo(algo_id="A1", side="",
                           close_position=True, trigger_price=100.0)]})[0])          # sem side
         self.assertFalse(_adopt_live_stop(inc, 1.0, {"orders": [_algo(algo_id="A1", side="SELL",
@@ -715,7 +744,10 @@ class LeaseUpsertTests(unittest.IsolatedAsyncioTestCase):
                                                     "conditional_ids": {"tp1": "T1"}, "planned_stop": 9.0})
         self.assertFalse(created)
         self.assertEqual(row["min_known_fill"], 0.5)               # GREATEST
-        self.assertEqual(row["conditional_ids"], {"sl": "S1", "tp1": "T1"})  # união
+        self.assertEqual(row["conditional_ids"]["sl"], "S1")
+        self.assertEqual(row["conditional_ids"]["tp1"], "T1")
+        self.assertIn("S1", row["conditional_ids"]["all"])         # união histórica
+        self.assertIn("T1", row["conditional_ids"]["all"])
         self.assertEqual(row["planned_stop"], 9.0)                 # preencheu ausente
 
     async def test_upsert_reopens_resolved(self):
@@ -848,6 +880,136 @@ class BootSafeTests(unittest.IsolatedAsyncioTestCase):
             out = await ers._detect_untracked_positions()
         self.assertEqual(out["status"], "UNKNOWN")   # erro ≠ flat
         self.assertFalse(ers._boot_scan_safe)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  P03.1C — cross-exchange / maker GTX / SL / persist / union / hermeticidade
+# ════════════════════════════════════════════════════════════════════════════
+class CrossExchangeMatchTests(unittest.TestCase):
+    def _rt(self, **kw):
+        base = {"status": "open", "exchange": "binance", "source": "auto",
+                "symbol": "BTC/USDT:USDT", "side": "long", "qty": 1.0, "id": 1}
+        base.update(kw)
+        return base
+
+    def test_binance_auto_correct_matches(self):
+        self.assertTrue(ers._real_trade_match(self._rt(), "BTC/USDT:USDT", "buy", 1.0))
+
+    def test_bybit_and_shadow_and_manual_dont_match(self):
+        self.assertFalse(ers._real_trade_match(self._rt(exchange="bybit"), "BTC/USDT:USDT", "buy", 1.0))
+        self.assertFalse(ers._real_trade_match(self._rt(exchange=None), "BTC/USDT:USDT", "buy", 1.0))
+        self.assertFalse(ers._real_trade_match(self._rt(source="manual"), "BTC/USDT:USDT", "buy", 1.0))
+        self.assertFalse(ers._real_trade_match(self._rt(source="shadow"), "BTC/USDT:USDT", "buy", 1.0))
+
+    def test_opposite_side_and_quote_and_qty(self):
+        self.assertFalse(ers._real_trade_match(self._rt(side="short"), "BTC/USDT:USDT", "buy", 1.0))
+        # BTCUSDC não mascara BTCUSDT
+        self.assertFalse(ers._real_trade_match(self._rt(symbol="BTC/USDC:USDC"), "BTC/USDT:USDT", "buy", 1.0))
+        # qty DB muito menor que a posição fresh
+        self.assertFalse(ers._real_trade_match(self._rt(qty=0.1), "BTC/USDT:USDT", "buy", 1.0))
+        self.assertFalse(ers._real_trade_match(self._rt(status="closed_tp2"), "BTC/USDT:USDT", "buy", 1.0))
+
+
+class MakerGtxTests(unittest.TestCase):
+    def test_gtx_ambiguous_without_status_is_pending(self):
+        kw = ers.assemble_entry_incident({"ok": True, "was_maker": True}, {"symbol": "X/USDT:USDT"},
+                                         local_client_order_id="c")
+        self.assertTrue(kw["pending_maker"])
+
+    def test_entry_order_terminal_prevents_false_pending(self):
+        kw = ers.assemble_entry_incident({"ok": True, "was_maker": True, "entry_order_terminal": True,
+                                          "status": "NEW"}, {"symbol": "X/USDT:USDT"}, local_client_order_id="c")
+        self.assertFalse(kw["pending_maker"])
+
+    def test_still_active_or_unknown_state_is_pending(self):
+        kw = ers.assemble_entry_incident({"ok": True, "was_maker": True,
+                                          "safety_state": "ENTRY_ORDER_STILL_ACTIVE_OR_UNKNOWN"},
+                                         {"symbol": "X/USDT:USDT"}, local_client_order_id="c")
+        self.assertTrue(kw["pending_maker"])
+
+    def test_local_qty_used(self):
+        kw = ers.assemble_entry_incident({"ok": True}, {"symbol": "X/USDT:USDT", "qty": 9},
+                                         local_client_order_id="c", local_planned_qty=3.0)
+        self.assertEqual(kw["planned_qty"], 3.0)         # local vence o rec
+
+
+class ConditionalUnionTests(unittest.TestCase):
+    def test_union_preserves_history(self):
+        merged = ers._merge_conditional_ids({"sl": "S1"}, {"sl": "S2"})
+        self.assertEqual(merged["sl"], "S2")
+        self.assertIn("S1", merged["all"])
+        self.assertIn("S2", merged["all"])
+
+    def test_exact_ids_include_all_and_prefix(self):
+        ids = ers._exact_conditional_ids({"conditional_ids": {"sl": "S2", "all": ["S1", "S2"]},
+                                          "conditional_prefix": "cw-x"})
+        for want in ("S1", "S2", "cw-x-sl", "cw-x-tp1"):
+            self.assertIn(want, ids)
+
+
+class PersistedFlagTests(_AsyncBase):
+    async def test_record_incident_returns_persisted(self):
+        r = await ers.record_incident(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT", client_order_id="c")
+        self.assertTrue(r["persisted"])
+
+
+class Sl1cReconcileTests(_AsyncBase):
+    async def _seed(self, **kw):
+        base = dict(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT", client_order_id="c1",
+                    side="buy", planned_stop=100.0)
+        base.update(kw)
+        await ers.record_incident(**base)
+        return (await ers._get_repo().list_open())[0]["incident_key"]
+
+    async def test_rejected_with_conditional_identity_not_flat(self):
+        key = await self._seed(conditional_prefix="cw-x")
+        with _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "REJECTED", "raw": {}}),
+                        _fresh_position_size=AsyncMock(return_value=(0.0, "ok")),
+                        get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": [
+                            _algo(algo_id="A1", client_algo_id="cw-x-sl")]}),
+                        cancel_algo_order=AsyncMock(return_value={"ok": True})):
+            await ers.reconcile_due()
+        self.assertIsNone((await ers._get_repo().get(key))["resolved_at"])   # cleanup, não FLAT
+
+    async def test_terminal_cancel_without_raw_qty_stays_unknown(self):
+        key = await self._seed()
+        with _patch_bss(get_order=AsyncMock(return_value={
+                "ok": True, "status": "CANCELED", "raw": {}, "executed_qty": 0.0})):
+            await ers.reconcile_due()
+        self.assertEqual((await ers._get_repo().get(key))["kind"], Kind.FINAL_FILL_QTY_UNKNOWN)
+
+    async def test_protected_needs_bigger_coverage_when_fresh_larger(self):
+        # posição fresh 2.0 mas SL cobre só 1.0 → não adota → cria (place_protection)
+        await self._seed(planned_qty=2.0)
+        with patch.object(ers, "_match_real_trade", AsyncMock(return_value={"id": 5})), \
+                patch.object(ers, "_persist_sl_order_id", AsyncMock(return_value=True)), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 2.0}),
+                           _fresh_position_size=AsyncMock(return_value=(2.0, "ok")),
+                           get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": [
+                               _algo(algo_id="A1", side="SELL", reduce_only=True, quantity=1.0, trigger_price=100.0)]}),
+                           place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "S9"})):
+            await ers.reconcile_due()
+            args, kwargs = bss.place_protection_orders.call_args
+            self.assertEqual(args[2], 2.0)               # cobre a posição fresh total
+
+    async def test_sl_persist_conflict_blocks_protected(self):
+        await self._seed(planned_qty=1.0)
+        with patch.object(ers, "_match_real_trade", AsyncMock(return_value={"id": 5})), \
+                patch.object(ers, "_persist_sl_order_id", AsyncMock(return_value=False)), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
+                           get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": [
+                               _algo(algo_id="A1", side="SELL", close_position=True, trigger_price=100.0)]})):
+            await ers.reconcile_due()
+        self.assertEqual((await ers._get_repo().list_all())[0]["state"], State.RETRY_PENDING)
+
+
+class HermeticNetTests(unittest.TestCase):
+    def test_network_is_blocked(self):
+        with self.assertRaises(RuntimeError):
+            _socket.getaddrinfo("demo-fapi.binance.com", 443)
+        with self.assertRaises(RuntimeError):
+            _socket.create_connection(("demo-fapi.binance.com", 443))
 
 
 if __name__ == "__main__":

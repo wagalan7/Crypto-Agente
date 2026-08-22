@@ -5179,7 +5179,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             # como fallback e persiste SL/TP IDs conhecidos.
                             _kw = _ers.assemble_entry_incident(
                                 order_res, rec, closed=bool(_closed), snapshot_id=snap_id,
-                                local_client_order_id=order_res.get("client_order_id"))
+                                local_client_order_id=client_order_id,  # var LOCAL do caller
+                                local_planned_qty=qty)                  # qty LOCAL planejada
                             await _ers.record_incident(**_kw)
                         except Exception as _p03_exc:
                             log.critical(f"[p03] persistência do incidente falhou "
