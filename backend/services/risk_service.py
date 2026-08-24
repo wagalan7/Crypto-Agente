@@ -29,9 +29,10 @@ from db import DB_ENABLED, get_session
 from models.risk_state import RiskState
 from models.risk_event import RiskEvent
 
-# Chave estável do advisory lock transacional que serializa arm/release da pausa
-# P03 (exclusão mútua real no Postgres — P03.1C).
+# Chave estável do advisory lock transacional que serializa arm/release/resume da
+# pausa P03 (exclusão mútua real no Postgres — P03.1C/D).
 _P03_PAUSE_LOCK = 917283
+_P03_PAUSE_MARKER = "P03-QUARANTINE:"
 from models.recommendation_snapshot import RecommendationSnapshot
 
 log = logging.getLogger(__name__)
@@ -220,30 +221,83 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
     """Kill switch manual — usuário liga/desliga via UI."""
     if not DB_ENABLED:
         return {"enabled": False}
+    from sqlalchemy import text, func, select as _sel
     async with get_session() as session:
+        # Serializa com o arm/release do P03 (mesma advisory lock) — sem janela.
+        await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _P03_PAUSE_LOCK})
         state = await _get_or_create_state(session)
         was_paused = bool(state.trading_paused)
-        state.trading_paused = paused
-        state.pause_manual = paused
-        state.pause_reason = (reason or "Pausa manual via kill switch") if paused else None
-        state.paused_at = datetime.now(timezone.utc) if paused else None
+        kept_p03 = False
+        if paused:
+            state.trading_paused = True
+            state.pause_manual = True
+            state.pause_reason = reason or "Pausa manual via kill switch"
+            state.paused_at = datetime.now(timezone.utc)
+        else:
+            # Retomada owner-aware: se há incidente P03 aberto, NÃO libera — re-carimba
+            # como P03-owned (fecha a janela transacionalmente). Invariante:
+            # incidente aberto ⇒ trading_paused permanece true.
+            open_p03 = 0
+            try:
+                from models.execution_incident import ExecutionIncident
+                open_p03 = (await session.execute(_sel(func.count(ExecutionIncident.id))
+                            .where(ExecutionIncident.resolved_at.is_(None)))).scalar() or 0
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"[circuit-breaker] contagem de incidentes P03 falhou (fail-closed): {exc}")
+                open_p03 = 1  # fail-closed: não libera sem confirmar zero
+            if open_p03 > 0:
+                kept_p03 = True
+                state.trading_paused = True
+                state.pause_manual = False
+                state.pause_reason = f"{_P03_PAUSE_MARKER} {open_p03} incidente(s) P03 aberto(s) — resume manual bloqueado"
+                state.paused_at = state.paused_at or datetime.now(timezone.utc)
+            else:
+                state.trading_paused = False
+                state.pause_manual = False
+                state.pause_reason = None
+                state.paused_at = None
         state.updated_at = datetime.now(timezone.utc)
-        # Log apenas em transições reais
         if paused and not was_paused:
             _log_event(session, state, "manual_pause", state.pause_reason)
-        elif (not paused) and was_paused:
+        elif (not paused) and was_paused and not kept_p03:
             _log_event(session, state, "manual_resume", reason or "Retomado manualmente")
         await session.commit()
-        log.warning(f"[circuit-breaker] MANUAL pause={paused} reason={reason}")
-        if not paused:
-            # A retomada humana explícita também limpa o latch fail-closed em
-            # memória armado quando a persistência do RiskState podia falhar.
-            try:
-                from services import shadow_trade_service
-                shadow_trade_service.clear_execution_quarantine()
-            except Exception as exc:
-                log.error(f"[circuit-breaker] falha limpando execution quarantine: {exc}")
+        log.warning(f"[circuit-breaker] MANUAL pause={paused} kept_p03={kept_p03} reason={reason}")
+        # Latch em memória: arma/limpa SOMENTE o owner "manual" — NUNCA o clear
+        # genérico (que apagaria P03/P02/legacy).
+        try:
+            from services import shadow_trade_service
+            if paused:
+                shadow_trade_service._arm_execution_quarantine(
+                    state.pause_reason or "manual", owner="manual")
+            else:
+                shadow_trade_service.clear_execution_quarantine(owner="manual")
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[circuit-breaker] falha ajustando latch manual: {exc}")
         return _to_dict(state)
+
+
+async def arm_p03_pause(reason: str) -> bool:
+    """Arma a pausa P03 ATOMICAMENTE sob `pg_advisory_xact_lock` (sem
+    `get_status→set_manual_pause` sujeito a corrida). Preserva pausa manual/não-P03
+    do operador (não sobrescreve). Retorna True se a pausa P03 ficou persistida."""
+    if not DB_ENABLED:
+        return False
+    from sqlalchemy import text
+    async with get_session() as session:
+        await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _P03_PAUSE_LOCK})
+        state = await _get_or_create_state(session)
+        cur = state.pause_reason or ""
+        if state.trading_paused and not cur.startswith(_P03_PAUSE_MARKER):
+            await session.commit()
+            return False   # pausa não-P03 do operador → preserva, latch P03 já bloqueia
+        state.trading_paused = True
+        state.pause_manual = False
+        state.pause_reason = f"{_P03_PAUSE_MARKER} {reason}"
+        state.paused_at = state.paused_at or datetime.now(timezone.utc)
+        state.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+        return True
 
 
 async def release_p03_pause(marker: str) -> bool:
@@ -255,11 +309,24 @@ async def release_p03_pause(marker: str) -> bool:
     `clear_execution_quarantine()` genérico; o latch P03 é limpo por owner="p03"."""
     if not DB_ENABLED:
         return False
-    from sqlalchemy import update, text
+    from sqlalchemy import update, text, func, select as _sel
     from models.risk_state import RiskState
     like = marker.replace("%", r"\%") + "%"
     async with get_session() as session:
         await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _P03_PAUSE_LOCK})
+        # DENTRO da MESMA transação/lock: confirma zero incidentes não resolvidos.
+        # Invariante: nunca liberar com incidente P03 aberto (sem janela).
+        try:
+            from models.execution_incident import ExecutionIncident
+            open_p03 = (await session.execute(_sel(func.count(ExecutionIncident.id))
+                        .where(ExecutionIncident.resolved_at.is_(None)))).scalar() or 0
+        except Exception as exc:  # noqa: BLE001
+            await session.commit()
+            log.warning(f"[circuit-breaker] release P03: contagem falhou (fail-closed): {exc}")
+            return False
+        if open_p03 > 0:
+            await session.commit()
+            return False   # ainda há incidente aberto → mantém pausa
         res = await session.execute(
             update(RiskState).where(
                 RiskState.id == 1,
@@ -271,7 +338,7 @@ async def release_p03_pause(marker: str) -> bool:
         await session.commit()
         ok = (res.rowcount or 0) == 1
         if ok:
-            log.warning("[circuit-breaker] P03 resume (CAS atômico) — pausa P03 removida")
+            log.warning("[circuit-breaker] P03 resume (CAS atômico, zero incidentes) — pausa removida")
         return ok
 
 

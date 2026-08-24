@@ -340,6 +340,10 @@ def _adopt_live_stop(inc: dict, need_qty: Optional[float], listing: dict) -> tup
         return False, None, "side do incidente desconhecido — não adota"
     want_close = _close_side(entry_side)
     planned_stop = _finite(inc.get("planned_stop"))
+    if planned_stop is None or planned_stop <= 0:
+        # Sem planned_stop válido não há como validar o trigger → NÃO adota stop
+        # existente (poderia ser de outro nível/estratégia). Escala retry/manual.
+        return False, None, "sem planned_stop válido — não adota stop existente"
     inc_key = _sym_key(inc.get("symbol"))
     for o in (listing.get("orders") or []):
         if not isinstance(o, dict):
@@ -587,15 +591,18 @@ class _SqlIncidentRepo:
         def _reopen(c, reopened):  # CASE de reabertura
             return text(f"CASE WHEN {T}.resolved_at IS NOT NULL THEN {reopened} ELSE {T}.{c} END")
 
-        # conditional_ids: merge per-perna (||) + união HISTÓRICA da lista 'all'.
+        # conditional_ids: a COLUNA É `JSON`. Casta os operandos para JSONB ANTES
+        # de qualquer `->`/`->>`/`||` (senão o Postgres não tem operador json ? /
+        # json || jsonb) e converte o resultado final de volta para JSON.
+        CJ = f"(COALESCE({T}.conditional_ids,'{{}}')::jsonb)"
+        EJ = "(COALESCE(EXCLUDED.conditional_ids,'{}')::jsonb)"
         cond_merge = text(
-            f"((COALESCE({T}.conditional_ids::jsonb,'{{}}'::jsonb) "
-            f"|| COALESCE(EXCLUDED.conditional_ids::jsonb,'{{}}'::jsonb)) "
+            f"(({CJ} || {EJ}) "
             f"|| jsonb_build_object('all', (SELECT COALESCE(jsonb_agg(DISTINCT v),'[]'::jsonb) FROM ("
-            f"  SELECT jsonb_array_elements_text(COALESCE({T}.conditional_ids->'all','[]'::jsonb)) AS v"
-            f"  UNION SELECT jsonb_array_elements_text(COALESCE(EXCLUDED.conditional_ids->'all','[]'::jsonb))"
-            f"  UNION SELECT {T}.conditional_ids->>'sl' UNION SELECT {T}.conditional_ids->>'tp1' UNION SELECT {T}.conditional_ids->>'tp2'"
-            f"  UNION SELECT EXCLUDED.conditional_ids->>'sl' UNION SELECT EXCLUDED.conditional_ids->>'tp1' UNION SELECT EXCLUDED.conditional_ids->>'tp2'"
+            f"  SELECT jsonb_array_elements_text(COALESCE({CJ}->'all','[]'::jsonb)) AS v"
+            f"  UNION SELECT jsonb_array_elements_text(COALESCE({EJ}->'all','[]'::jsonb))"
+            f"  UNION SELECT {CJ}->>'sl' UNION SELECT {CJ}->>'tp1' UNION SELECT {CJ}->>'tp2'"
+            f"  UNION SELECT {EJ}->>'sl' UNION SELECT {EJ}->>'tp1' UNION SELECT {EJ}->>'tp2'"
             f") s WHERE v IS NOT NULL)))::json")
 
         set_ = {
@@ -770,12 +777,8 @@ async def _arm_quarantine(reason: str) -> None:
     _arm_local_latch(reason)
     try:
         from services import risk_service
-        status = await risk_service.get_status()
-        r = (status or {}).get("pause_reason") or ""
-        non_p03_pause = bool(status and status.get("trading_paused") and not r.startswith(_PAUSE_MARKER))
-        if not non_p03_pause:
-            await risk_service.set_manual_pause(True, f"{_PAUSE_MARKER} {reason}")
-        # senão: preserva a pausa do operador; o latch P03 já bloqueia entradas.
+        # arm ATÔMICO sob advisory lock — sem get_status→set_manual_pause (corrida).
+        await risk_service.arm_p03_pause(reason)
     except Exception as exc:  # noqa: BLE001
         log.critical(f"[p03] falha persistindo pausa RiskState: {exc}")
 
@@ -847,9 +850,12 @@ async def record_incident(*, kind: str, symbol: str, exchange: str = EXCHANGE_BI
                  ("pending_maker", pending_maker)):
         if v is not None:
             full_payload[k] = v
-    # Latch local ARMADO ANTES da persistência (fail-closed imediato): uma falha
-    # de DB não pode liberar a próxima ordem do processo.
-    _arm_local_latch(f"incidente {kind} {symbol} ({_mask(client_order_id or entry_order_id)})")
+    _reason = f"incidente {kind} {symbol} ({_mask(client_order_id or entry_order_id)})"
+    # Ordem CRÍTICA (invariante "incidente visível ⇒ pausa P03 persistida"):
+    # (1) latch local; (2) pausa P03 PERSISTIDA; só então (3) upsert do incidente.
+    # Assim o incidente nunca fica observável no banco sem a pausa já persistida.
+    _arm_local_latch(_reason)
+    await _arm_quarantine(_reason)      # persiste a pausa P03 ANTES de o incidente existir
     repo = _get_repo()
     created = False
     persisted = False
@@ -868,8 +874,6 @@ async def record_incident(*, kind: str, symbol: str, exchange: str = EXCHANGE_BI
         persisted = row is not None and row.get("id") is not None
     except Exception as exc:  # noqa: BLE001
         log.critical(f"[p03] persistência de incidente falhou ({key}): {exc}")
-    # Persiste a pausa (best-effort) — o latch local já bloqueia entradas.
-    await _arm_quarantine(f"incidente {kind} {symbol} ({_mask(client_order_id or entry_order_id)})")
     log.critical(f"[p03][incident] key={key} kind={kind} symbol={symbol} created={created} "
                  f"persisted={persisted} coid={_mask(client_order_id)} eoid={_mask(entry_order_id)} maker={pending_maker}")
     return {"incident_key": key, "created": created, "persisted": persisted,
@@ -1019,39 +1023,50 @@ async def _ensure_stop(key: str, owner: str, inc: dict, need_qty: Optional[float
     return False, None, f"criação SL não confirmada (sl_ok={res.get('sl_ok') if res else None})"
 
 
-async def _match_real_trade(symbol: str, side: Optional[str],
-                            fresh_size: Optional[float] = None) -> Optional[dict]:
-    """Confirma RealTrade aberto correspondente por PROVA DETERMINÍSTICA:
-    `status=open`, `exchange=binance`, `source in (auto, managed)`, símbolo/contrato/
-    quote EXATO (BTCUSDC ≠ BTCUSDT), MESMO lado, e qty agregada compatível com a
-    posição fresh (não muito menor). Rejeita Bybit/shadow/manual/exchange ausente/
-    lado oposto/mesmo-base-quote-diferente. DB off → {"skip": True}. Sem prova → None."""
+async def _match_real_trade(symbol: str, side: Optional[str], fresh_size: Optional[float] = None,
+                            identity: Optional[list] = None) -> Optional[dict]:
+    """Match DETERMINÍSTICO de RealTrade(s) × posição Binance. `status=open`,
+    `exchange=binance`, `source in (auto,managed)`, símbolo/quote EXATO, lado
+    presente e igual. Prefere linhas por IDENTIDADE (client/exchange order id).
+    Cobertura por AGREGAÇÃO de qty (sem tolerância fixa de 50%; só precisão de lote
+    ~0,1%). Lado do incidente ausente → {"manual": True}. DB off → {"skip": True}.
+    Sem match/cobertura → None (untracked). Retorna {"id": <trade determinístico|None>}."""
     try:
         from db import get_session, DB_ENABLED
     except Exception:
         return {"skip": True}
     if not DB_ENABLED:
         return {"skip": True}
+    if _norm_entry_side(side) is None:
+        return {"manual": True}       # não infere lado silenciosamente
     from models.real_trade import RealTrade
     from sqlalchemy import select
     async with get_session() as session:
-        rows = (await session.execute(
-            select(RealTrade).where(RealTrade.status == "open")
-        )).scalars().all()
-        for r in rows:
-            if _real_trade_match(r, symbol, side, fresh_size):
-                return {"id": r.id}
-    return None
+        rows = (await session.execute(select(RealTrade).where(RealTrade.status == "open"))).scalars().all()
+        matched = [r for r in rows if _real_trade_match(r, symbol, side)]
+        if not matched:
+            return None
+        idvals = {str(x) for x in (identity or []) if x}
+        ident_rows = [r for r in matched if idvals & {
+            str(_rt_get(r, "client_order_id") or ""), str(_rt_get(r, "exchange_order_id") or "")}
+        ] if idvals else []
+        pool = ident_rows or matched
+        need = _finite(fresh_size)
+        if need is not None and need > 0:
+            agg = sum((_finite(_rt_get(r, "qty")) or _finite(_rt_get(r, "qty_initial")) or 0.0) for r in pool)
+            if agg + need * 0.001 + 1e-9 < need:
+                return None           # cobertura agregada insuficiente → untracked
+        target = ident_rows[0] if len(ident_rows) == 1 else (pool[0] if len(pool) == 1 else None)
+        return {"id": (_rt_get(target, "id") if target is not None else None), "covered": True}
 
 
 def _rt_get(r, name):
     return r.get(name) if isinstance(r, dict) else getattr(r, name, None)
 
 
-def _real_trade_match(r, symbol: str, side: Optional[str], fresh_size: Optional[float]) -> bool:
-    """Preditor PURO (testável) do match determinístico de RealTrade × posição
-    Binance. Aceita ORM ou dict. Exige exchange=binance, source in (auto,managed),
-    símbolo/quote EXATO, mesmo lado, e qty compatível (não muito menor)."""
+def _real_trade_match(r, symbol: str, side: Optional[str]) -> bool:
+    """Preditor PURO (testável): exchange=binance, source in (auto,managed),
+    símbolo/quote EXATO, e LADO presente e IGUAL (lado ausente NÃO casa)."""
     if (_rt_get(r, "status") or "") != "open":
         return False
     if (str(_rt_get(r, "exchange") or "").strip().lower()) != EXCHANGE_BINANCE:
@@ -1062,14 +1077,30 @@ def _real_trade_match(r, symbol: str, side: Optional[str], fresh_size: Optional[
         return False                                      # símbolo/quote/contrato exato
     want = _norm_entry_side(side)
     rside = _norm_entry_side(_rt_get(r, "side") or _rt_get(r, "direction"))
-    if want is not None and rside is not None and rside != want:
-        return False                                      # lado oposto
-    need = _finite(fresh_size)
-    if need is not None and need > 0:
-        rqty = _finite(_rt_get(r, "qty")) or _finite(_rt_get(r, "qty_initial")) or 0.0
-        if rqty + 1e-9 < need * RECONCILE_QTY_MIN_COVER:
-            return False                                  # qty DB muito menor que a posição real
+    if want is None or rside is None or rside != want:    # lado presente e igual (obrigatório)
+        return False
     return True
+
+
+async def _fresh_position(symbol: str) -> dict:
+    """Leitura fresh preservando símbolo/quote, LADO real e qty ABSOLUTA, com
+    qualidade FRESH|UNKNOWN. stale/rate-limited/erro → UNKNOWN (nunca assume flat).
+    Lado ambíguo (posições opostas no mesmo símbolo) → side=None."""
+    from services import binance_signed_service as bss
+    try:
+        res = await bss.get_positions(symbol, force=True)
+    except Exception:  # noqa: BLE001
+        return {"quality": "UNKNOWN", "size": None, "side": None}
+    if not res or not res.get("ok") or res.get("stale") or res.get("rate_limited"):
+        return {"quality": "UNKNOWN", "size": None, "side": None}
+    key = _sym_key(symbol)
+    ps = [p for p in (res.get("positions") or [])
+          if abs(_finite(p.get("size")) or 0) > 0 and _sym_key(p.get("symbol") or "") == key]
+    if not ps:
+        return {"quality": "FRESH", "size": 0.0, "side": None}
+    size = sum(abs(_finite(p.get("size")) or 0.0) for p in ps)
+    sides = {("sell" if str(p.get("side") or "").strip().lower() == "sell" else "buy") for p in ps}
+    return {"quality": "FRESH", "size": size, "side": (next(iter(sides)) if len(sides) == 1 else None)}
 
 
 async def _persist_sl_order_id(rt_id, sl_id: str) -> bool:
@@ -1099,11 +1130,26 @@ async def _persist_sl_order_id(rt_id, sl_id: str) -> bool:
 
 async def _resolve_protected(key: str, owner: str, inc: dict, sl_id: Optional[str],
                              detail: str, fresh_size: Optional[float] = None) -> None:
-    """Só declara PROTECTED se existir RealTrade DETERMINISTICAMENTE correspondente
-    (exchange/símbolo/lado/qty). Sem match → UNTRACKED_POSITION/MANUAL (não inventa
-    fechamento, não abre nada). Falha/conflito ao persistir o sl_order_id → NÃO
-    resolve PROTECTED (mantém quarentena)."""
-    rt = await _match_real_trade(inc["symbol"], inc.get("side"), fresh_size)
+    """PROTECTED só com RealTrade DETERMINÍSTICO (exchange/símbolo/lado/qty
+    agregada/identidade) E lado fresh == lado do incidente. Lado ausente/mismatch →
+    MANUAL. Sem match → UNTRACKED_POSITION/MANUAL. Falha/conflito ao persistir o
+    sl_order_id → NÃO PROTECTED (mantém quarentena)."""
+    # Lado fresh deve bater com o incidente (nunca PROTECTED em mismatch).
+    fp = await _fresh_position(inc["symbol"])
+    inc_side = _norm_entry_side(inc.get("side"))
+    fresh_side = _norm_entry_side(fp.get("side"))
+    if inc_side is None or (fresh_side is not None and inc_side is not None and fresh_side != inc_side):
+        await _fenced(key, owner, state=State.MANUAL_REQUIRED,
+                      manual_reason=f"lado fresh/incidente ausente ou divergente (fresh={fp.get('side')} inc={inc.get('side')})")
+        log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED (lado fresh/incidente)")
+        return
+    identity = [inc.get("client_order_id"), inc.get("entry_order_id")]
+    rt = await _match_real_trade(inc["symbol"], inc.get("side"), fresh_size, identity=identity)
+    if isinstance(rt, dict) and rt.get("manual"):
+        await _fenced(key, owner, state=State.MANUAL_REQUIRED,
+                      manual_reason="lado do incidente ausente — RealTrade não pode ser inferido")
+        log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED (lado ausente)")
+        return
     if rt is None:
         await record_incident(kind=Kind.UNTRACKED_POSITION, symbol=inc["symbol"],
                               side=inc.get("side"), planned_qty=inc.get("planned_qty"),
@@ -1112,6 +1158,8 @@ async def _resolve_protected(key: str, owner: str, inc: dict, sl_id: Optional[st
                       manual_reason="posição protegida SEM RealTrade correspondente — untracked/manual")
         log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED (protegida sem RealTrade)")
         return
+    # Persiste o sl_order_id SÓ no RealTrade determinístico (rt['id']); se ambíguo
+    # (múltiplos sem identidade) rt['id'] é None → não grava em trade errado.
     if sl_id and rt.get("id"):
         if not await _persist_sl_order_id(rt.get("id"), sl_id):
             await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
@@ -1143,11 +1191,15 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
             if obs and obs > 0:
                 await _fenced(key, owner, min_known_fill=max(_finite(inc.get("min_known_fill")) or 0.0, obs))
             pv0, size0 = await _fresh_verdict(inc["symbol"])
-            _prot_ok, _prot = True, "sem exposição observada"     # sem posição → nada a proteger
+            # Classificação HONESTA (sem default "protegida"): só afirma proteção
+            # após _ensure_stop confirmar SL válido em posição OPEN.
             if pv0 == "OPEN":
                 _prot_ok, _psl, _prot = await _ensure_stop(key, owner, inc, max(_finite(size0) or 0.0, obs or 0.0))
-            # rótulo honesto: NÃO afirmar "protegida" se _ensure_stop falhou.
-            _prot_lbl = "exposição protegida" if _prot_ok else f"SL_NOT_CONFIRMED ({_prot})"
+                _prot_lbl = f"exposição protegida ({_prot})" if _prot_ok else f"SL_NOT_CONFIRMED ({_prot})"
+            elif pv0 == "UNKNOWN":
+                _prot_lbl = "UNKNOWN_NO_SL (posição pós-fill incerta)"
+            else:  # FLAT com entry ainda pendente/incerta
+                _prot_lbl = "PENDING_ORDER_UNPROTECTED (entry pendente, sem posição)"
             if not await _renew_or_abort(key, owner):
                 return
             try:
@@ -1226,14 +1278,16 @@ async def _cancel_extra_conditionals(key: str, owner: str, inc: dict, keep_id: O
               if str(o.get("algo_id") or o.get("algoId") or "") != str(keep_id or "")]
     if not extras:
         return True, "nenhum extra exato vivo"
-    if not await _renew_or_abort(key, owner):
-        return False, "claim perdido"
     all_ok = True
     for o in extras:
         aid = o.get("algo_id") or o.get("algoId")
         if not aid:
             all_ok = False
             continue
+        # Renova/valida o lease IMEDIATAMENTE antes de CADA mutação (A1, A2, …).
+        # Se expirou após A1, NÃO executa A2 e aborta sem tocar mais nada.
+        if not await _renew_or_abort(key, owner):
+            return False, "lease perdido no meio do cancelamento — abortado"
         try:
             res = await bss.cancel_algo_order(str(aid))
         except Exception as exc:  # noqa: BLE001
@@ -1293,14 +1347,14 @@ async def _reconcile_cleanup(key: str, owner: str, inc: dict) -> None:
         return
     matches = _matching_orders(listing, exact_ids)
     if matches:
-        if not await _renew_or_abort(key, owner):
-            return
         all_ok = True
         for o in matches:
             algo_id = o.get("algo_id") or o.get("algoId")
             if not algo_id:
                 all_ok = False
                 continue
+            if not await _renew_or_abort(key, owner):   # lease por CADA mutação
+                return
             try:
                 res = await bss.cancel_algo_order(str(algo_id))
             except Exception as exc:  # noqa: BLE001
@@ -1475,7 +1529,7 @@ async def _detect_untracked_positions() -> dict:
         _boot_scan_safe = True          # leitura fresh confirmou conta flat
         return {"status": "FLAT", "count": 0}
     try:
-        open_symbols = await _open_real_trade_symbols()
+        open_trades = await _open_real_trades()   # linhas completas p/ o MESMO matcher
     except Exception as exc:  # noqa: BLE001
         _boot_scan_safe = False
         await _arm_quarantine(f"boot: leitura RealTrade falhou ({exc})")
@@ -1486,11 +1540,11 @@ async def _detect_untracked_positions() -> dict:
     for p in positions:
         sym = p.get("symbol") or ""
         norm = sym.replace("USDT", "/USDT:USDT") if "/" not in sym else sym
-        if norm in open_symbols or sym in open_symbols:
+        side = ("sell" if str(p.get("side") or "").strip().lower() == "sell" else "buy")
+        # MESMO matcher rigoroso do reconciliador (exchange/source/símbolo/quote/lado).
+        if any(_real_trade_match(t, norm, side) for t in open_trades):
             continue
-        side = str(p.get("side") or "").strip().lower()   # usa o side REAL (não o abs)
-        res_inc = await record_incident(kind=Kind.UNTRACKED_POSITION, symbol=norm,
-                                        side=("sell" if side == "sell" else "buy"),
+        res_inc = await record_incident(kind=Kind.UNTRACKED_POSITION, symbol=norm, side=side,
                                         min_known_fill=abs(_finite(p.get("size")) or 0),
                                         payload={"detected_at_boot": True})
         if res_inc.get("persisted"):
@@ -1508,17 +1562,23 @@ async def _detect_untracked_positions() -> dict:
     return {"status": ("UNTRACKED" if n else "FLAT"), "count": n}
 
 
-async def _open_real_trade_symbols() -> set:
+async def _open_real_trades() -> list:
+    """Linhas RealTrade abertas (campos p/ o matcher rigoroso). NÃO usa símbolo
+    como prova de tracking — o boot aplica `_real_trade_match` igual ao reconciliador."""
     from db import get_session, DB_ENABLED
     if not DB_ENABLED:
-        return set()
+        return []
     from models.real_trade import RealTrade
     from sqlalchemy import select
     async with get_session() as session:
-        rows = (await session.execute(
-            select(RealTrade.symbol).where(RealTrade.status == "open")
-        )).scalars().all()
-        return set(rows)
+        rows = (await session.execute(select(RealTrade).where(RealTrade.status == "open"))).scalars().all()
+        return [{"status": r.status, "exchange": getattr(r, "exchange", None),
+                 "source": getattr(r, "source", None), "symbol": r.symbol,
+                 "side": getattr(r, "side", None), "qty": getattr(r, "qty", None),
+                 "qty_initial": getattr(r, "qty_initial", None),
+                 "client_order_id": getattr(r, "client_order_id", None),
+                 "exchange_order_id": getattr(r, "exchange_order_id", None), "id": r.id}
+                for r in rows]
 
 
 # ── Task integrada ao lifespan (NÃO é worker/scheduler separado) ─────────────

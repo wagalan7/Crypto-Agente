@@ -35,19 +35,23 @@ from services.execution_reconciliation_service import (  # noqa: E402
 )
 
 
-# ── Hermeticidade: bloqueia rede/DNS durante TODA a suíte P03 ────────────────
+# ── Hermeticidade: bloqueia rede/DNS durante TODA a suíte P03 e CONTABILIZA
+# qualquer tentativa. Mesmo que o código capture a exceção, a tentativa fica
+# registrada e a suíte FALHA no tearDownModule. ─────────────────────────────
 import socket as _socket
 
 _REAL_GETADDRINFO = _socket.getaddrinfo
 _REAL_CREATE_CONNECTION = _socket.create_connection
+_NET_ATTEMPTS = []          # tentativas de rede do CÓDIGO sob teste (não das provas)
 
 
 def _blocked_net(*a, **k):
-    raise RuntimeError("REDE BLOQUEADA no teste P03 (hermético): tentativa de "
-                       f"resolver/conectar {a[:1]} — mocke a exchange.")
+    _NET_ATTEMPTS.append(a[:1])
+    raise RuntimeError(f"REDE BLOQUEADA no teste P03 (hermético): {a[:1]}")
 
 
 def setUpModule():
+    _NET_ATTEMPTS.clear()
     _socket.getaddrinfo = _blocked_net       # DNS bloqueado (httpx/aiohttp resolvem por aqui)
     _socket.create_connection = _blocked_net  # conexão TCP externa bloqueada
 
@@ -55,6 +59,9 @@ def setUpModule():
 def tearDownModule():
     _socket.getaddrinfo = _REAL_GETADDRINFO
     _socket.create_connection = _REAL_CREATE_CONNECTION
+    if _NET_ATTEMPTS:
+        raise RuntimeError(f"HERMETICIDADE VIOLADA: {_NET_ATTEMPTS} tentativa(s) de "
+                           "rede pelo código sob teste (mesmo se capturadas).")
 
 
 def _algo(**kw):
@@ -71,6 +78,24 @@ def _patch_bss(**fns) -> ExitStack:
     for name, val in fns.items():
         stack.enter_context(patch.object(bss, name, val))
     return stack
+
+
+def _bss_guard() -> ExitStack:
+    """Guarda de HERMETICIDADE: mocka TODAS as funções de exchange do
+    binance_signed_service com defaults benignos, para NENHUMA chamada real
+    escapar (asyncio getaddrinfo em thread). Os testes sobrepõem via _patch_bss."""
+    return _patch_bss(
+        get_positions=AsyncMock(return_value={"ok": True, "positions": []}),
+        _fresh_position_size=AsyncMock(return_value=(0.0, "ok")),
+        get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": []}),
+        get_order=AsyncMock(return_value={"ok": False, "error": "guard"}),
+        cancel_order=AsyncMock(return_value={"ok": True}),
+        cancel_algo_order=AsyncMock(return_value={"ok": True}),
+        place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "GUARD"}),
+        place_order=AsyncMock(return_value={"ok": False}),
+        place_maker_entry_then_protect=AsyncMock(return_value={"ok": False}),
+        is_configured=lambda: False,
+    )
 
 
 def _install_fake_services():
@@ -99,18 +124,42 @@ def _install_fake_services():
 
     risk = types.ModuleType("services.risk_service")
     rs = {"paused": False, "reason": None}
+    _MARK = "P03-QUARANTINE:"
+
+    async def _open_p03():
+        try:
+            return len(await ers._get_repo().list_open())
+        except Exception:
+            return 0
+
+    async def arm_p03_pause(reason):
+        # atômico owner-aware: preserva pausa não-P03 do operador
+        cur = rs["reason"] or ""
+        if rs["paused"] and not cur.startswith(_MARK):
+            return False
+        rs["paused"] = True
+        rs["reason"] = f"{_MARK} {reason}"
+        return True
 
     async def set_manual_pause(paused, reason=None):
-        rs["paused"] = paused
-        rs["reason"] = reason if paused else None
-        if not paused:
-            clear(None)            # side effect REAL: resume manual limpa TODOS os owners
-        return {"trading_paused": paused, "pause_reason": rs["reason"]}
+        if paused:
+            rs["paused"] = True
+            rs["reason"] = reason or "Pausa manual via kill switch"
+            arm(rs["reason"], owner="manual")     # latch owner MANUAL (não genérico)
+        else:
+            if await _open_p03() > 0:              # incidente P03 aberto → mantém pausa
+                rs["paused"] = True
+                rs["reason"] = f"{_MARK} incidente P03 aberto"
+            else:
+                rs["paused"] = False
+                rs["reason"] = None
+            clear("manual")                        # limpa SÓ o owner manual (nunca genérico)
+        return {"trading_paused": rs["paused"], "pause_reason": rs["reason"]}
 
     async def release_p03_pause(marker):
-        # CAS owner-aware: só remove se a pausa atual ainda é P03. NÃO chama o
-        # clear genérico (não apaga owners P02/manual).
         if not rs["paused"] or not (rs["reason"] or "").startswith(marker):
+            return False
+        if await _open_p03() > 0:                   # zero incidentes dentro do "lock"
             return False
         rs["paused"] = False
         rs["reason"] = None
@@ -119,6 +168,7 @@ def _install_fake_services():
     async def get_status():
         return {"enabled": True, "trading_paused": rs["paused"], "pause_reason": rs["reason"]}
 
+    risk.arm_p03_pause = arm_p03_pause
     risk.set_manual_pause = set_manual_pause
     risk.release_p03_pause = release_p03_pause
     risk.get_status = get_status
@@ -247,14 +297,22 @@ class _AsyncBase(unittest.IsolatedAsyncioTestCase):
         self._arm = patch.object(ers, "_arm_quarantine", AsyncMock())
         self._rel = patch.object(ers, "_maybe_release_quarantine", AsyncMock(return_value=False))
         self._mrt = patch.object(ers, "_match_real_trade", AsyncMock(return_value={"skip": True}))
+        # fresh position mockada (lado "buy" = lado dos incidentes padrão) — evita
+        # get_positions real (hermeticidade). Testes de mismatch usam classe própria.
+        self._fp = patch.object(ers, "_fresh_position",
+                                AsyncMock(return_value={"quality": "FRESH", "size": 1.0, "side": "buy"}))
+        self._guard = _bss_guard()
         self._arm.start()
         self._rel.start()
         self._mrt.start()
+        self._fp.start()
 
     def tearDown(self):
         self._arm.stop()
         self._rel.stop()
         self._mrt.stop()
+        self._fp.stop()
+        self._guard.close()
         ers.set_repo(None)
 
     async def _seed(self, **kw):
@@ -553,8 +611,10 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
         ers._p03_latch_armed = False
         ers._boot_scan_safe = False
         self.shadow, self.risk, self.st, self.rs, self.owners = _install_fake_services()
+        self._guard = _bss_guard()
 
     def tearDown(self):
+        self._guard.close()
         ers.set_repo(None)
         _uninstall_fake_services()
 
@@ -608,7 +668,7 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
     async def test_boot_stale_positions_arms_latch_failclosed(self):
         with _patch_bss(is_configured=lambda: True,
                         get_positions=AsyncMock(return_value={"ok": True, "stale": True, "positions": []})), \
-                patch.object(ers, "_open_real_trade_symbols", AsyncMock(return_value=set())), \
+                patch.object(ers, "_open_real_trades", AsyncMock(return_value=[])), \
                 patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
             await ers.boot_reconcile()
         self.assertIsNotNone(self.shadow.execution_quarantine_reason())    # armou por stale
@@ -618,7 +678,7 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
         with _patch_bss(is_configured=lambda: True,
                         get_positions=AsyncMock(return_value={"ok": True, "positions": [
                             {"symbol": "BTCUSDT", "size": 0.5, "side": "Sell"}]})), \
-                patch.object(ers, "_open_real_trade_symbols", AsyncMock(return_value=set())), \
+                patch.object(ers, "_open_real_trades", AsyncMock(return_value=[])), \
                 patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
             await ers.boot_reconcile()
         rows = await ers._get_repo().list_open()
@@ -811,8 +871,10 @@ class OwnershipRaceTests(unittest.IsolatedAsyncioTestCase):
         ers._p03_latch_armed = False
         ers._boot_scan_safe = True
         self.shadow, self.risk, self.st, self.rs, self.owners = _install_fake_services()
+        self._guard = _bss_guard()
 
     def tearDown(self):
+        self._guard.close()
         ers.set_repo(None)
         _uninstall_fake_services()
 
@@ -849,15 +911,17 @@ class BootSafeTests(unittest.IsolatedAsyncioTestCase):
         ers._p03_latch_armed = False
         ers._boot_scan_safe = False
         self.shadow, self.risk, self.st, self.rs, self.owners = _install_fake_services()
+        self._guard = _bss_guard()
 
     def tearDown(self):
+        self._guard.close()
         ers.set_repo(None)
         _uninstall_fake_services()
 
     async def test_stale_scan_keeps_boot_unsafe_and_blocks_release(self):
         with _patch_bss(is_configured=lambda: True,
                         get_positions=AsyncMock(return_value={"ok": True, "stale": True, "positions": []})), \
-                patch.object(ers, "_open_real_trade_symbols", AsyncMock(return_value=set())):
+                patch.object(ers, "_open_real_trades", AsyncMock(return_value=[])):
             await ers._detect_untracked_positions()
         self.assertFalse(ers._boot_scan_safe)
         # com pausa P03 e zero incidentes, ainda NÃO libera (boot inseguro)
@@ -869,7 +933,7 @@ class BootSafeTests(unittest.IsolatedAsyncioTestCase):
         # 1º scan stale → inseguro; 2º scan fresh-flat → seguro
         with _patch_bss(is_configured=lambda: True,
                         get_positions=AsyncMock(return_value={"ok": True, "positions": []})), \
-                patch.object(ers, "_open_real_trade_symbols", AsyncMock(return_value=set())):
+                patch.object(ers, "_open_real_trades", AsyncMock(return_value=[])):
             out = await ers._detect_untracked_positions()
         self.assertEqual(out["status"], "FLAT")
         self.assertTrue(ers._boot_scan_safe)
@@ -893,21 +957,22 @@ class CrossExchangeMatchTests(unittest.TestCase):
         return base
 
     def test_binance_auto_correct_matches(self):
-        self.assertTrue(ers._real_trade_match(self._rt(), "BTC/USDT:USDT", "buy", 1.0))
+        self.assertTrue(ers._real_trade_match(self._rt(), "BTC/USDT:USDT", "buy"))
+        self.assertTrue(ers._real_trade_match(self._rt(source="managed"), "BTC/USDT:USDT", "buy"))
 
     def test_bybit_and_shadow_and_manual_dont_match(self):
-        self.assertFalse(ers._real_trade_match(self._rt(exchange="bybit"), "BTC/USDT:USDT", "buy", 1.0))
-        self.assertFalse(ers._real_trade_match(self._rt(exchange=None), "BTC/USDT:USDT", "buy", 1.0))
-        self.assertFalse(ers._real_trade_match(self._rt(source="manual"), "BTC/USDT:USDT", "buy", 1.0))
-        self.assertFalse(ers._real_trade_match(self._rt(source="shadow"), "BTC/USDT:USDT", "buy", 1.0))
+        self.assertFalse(ers._real_trade_match(self._rt(exchange="bybit"), "BTC/USDT:USDT", "buy"))
+        self.assertFalse(ers._real_trade_match(self._rt(exchange=None), "BTC/USDT:USDT", "buy"))
+        self.assertFalse(ers._real_trade_match(self._rt(source="manual"), "BTC/USDT:USDT", "buy"))
+        self.assertFalse(ers._real_trade_match(self._rt(source="shadow"), "BTC/USDT:USDT", "buy"))
 
-    def test_opposite_side_and_quote_and_qty(self):
-        self.assertFalse(ers._real_trade_match(self._rt(side="short"), "BTC/USDT:USDT", "buy", 1.0))
+    def test_opposite_side_and_quote_and_missing_side(self):
+        self.assertFalse(ers._real_trade_match(self._rt(side="short"), "BTC/USDT:USDT", "buy"))
         # BTCUSDC não mascara BTCUSDT
-        self.assertFalse(ers._real_trade_match(self._rt(symbol="BTC/USDC:USDC"), "BTC/USDT:USDT", "buy", 1.0))
-        # qty DB muito menor que a posição fresh
-        self.assertFalse(ers._real_trade_match(self._rt(qty=0.1), "BTC/USDT:USDT", "buy", 1.0))
-        self.assertFalse(ers._real_trade_match(self._rt(status="closed_tp2"), "BTC/USDT:USDT", "buy", 1.0))
+        self.assertFalse(ers._real_trade_match(self._rt(symbol="BTC/USDC:USDC"), "BTC/USDT:USDT", "buy"))
+        # lado ausente no RealTrade não casa
+        self.assertFalse(ers._real_trade_match(self._rt(side=None), "BTC/USDT:USDT", "buy"))
+        self.assertFalse(ers._real_trade_match(self._rt(status="closed_tp2"), "BTC/USDT:USDT", "buy"))
 
 
 class MakerGtxTests(unittest.TestCase):
@@ -1006,10 +1071,137 @@ class Sl1cReconcileTests(_AsyncBase):
 
 class HermeticNetTests(unittest.TestCase):
     def test_network_is_blocked(self):
-        with self.assertRaises(RuntimeError):
-            _socket.getaddrinfo("demo-fapi.binance.com", 443)
-        with self.assertRaises(RuntimeError):
-            _socket.create_connection(("demo-fapi.binance.com", 443))
+        # usa raiser LOCAL (não o _blocked_net contado) para não poluir _NET_ATTEMPTS
+        def _raise(*a, **k):
+            raise RuntimeError("blocked")
+        with patch.object(_socket, "getaddrinfo", _raise), \
+                patch.object(_socket, "create_connection", _raise):
+            with self.assertRaises(RuntimeError):
+                _socket.getaddrinfo("demo-fapi.binance.com", 443)
+            with self.assertRaises(RuntimeError):
+                _socket.create_connection(("demo-fapi.binance.com", 443))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  P03.1D — transacional: arm-before-persist, resume manual, fresh side,
+#  SL/planned_stop, maker states, lease por mutação
+# ════════════════════════════════════════════════════════════════════════════
+class ArmBeforePersistTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ers.set_repo(InMemoryIncidentRepo())
+        ers._prev_open_count = 0
+        ers._p03_latch_armed = False
+        ers._boot_scan_safe = True
+        self.shadow, self.risk, self.st, self.rs, self.owners = _install_fake_services()
+        self._guard = _bss_guard()
+
+    def tearDown(self):
+        self._guard.close()
+        ers.set_repo(None)
+        _uninstall_fake_services()
+
+    async def test_pause_persisted_before_incident_visible(self):
+        # ordem de eventos: quando o upsert grava o incidente, a pausa P03 já está on
+        seen = {}
+
+        class _Repo(InMemoryIncidentRepo):
+            async def upsert(self, key, defaults):
+                seen["paused_at_upsert"] = self.rs_paused()
+                return await super().upsert(key, defaults)
+
+            def rs_paused(_self):
+                return self.rs["paused"]
+        ers.set_repo(_Repo())
+        await ers.record_incident(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT", client_order_id="c1")
+        self.assertTrue(seen["paused_at_upsert"])   # pausa já persistida ANTES do incidente existir
+        self.assertIn("p03", self.owners)
+
+    async def test_manual_resume_with_open_incident_keeps_paused(self):
+        await ers.record_incident(kind=Kind.UNTRACKED_POSITION, symbol="BTC/USDT:USDT")
+        # operador tenta resumir manualmente — como há incidente P03 aberto, NÃO libera
+        res = await self.risk.set_manual_pause(False)
+        self.assertTrue(res["trading_paused"])
+        self.assertIn("p03", self.owners)           # latch P03 preservado
+        self.assertNotIn("manual", self.owners)      # só o owner manual saiu
+
+
+class FreshSideAndSlTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ers.set_repo(InMemoryIncidentRepo())
+        ers._prev_open_count = 0
+        ers._boot_scan_safe = True
+        self._arm = patch.object(ers, "_arm_quarantine", AsyncMock()); self._arm.start()
+        self._rel = patch.object(ers, "_maybe_release_quarantine", AsyncMock(return_value=False)); self._rel.start()
+        self._guard = _bss_guard()
+
+    def tearDown(self):
+        self._arm.stop(); self._rel.stop(); self._guard.close(); ers.set_repo(None)
+
+    async def test_fresh_position_preserves_side(self):
+        with _patch_bss(get_positions=AsyncMock(return_value={"ok": True, "positions": [
+                {"symbol": "BTCUSDT", "size": 0.5, "side": "Sell"}]})):
+            fp = await ers._fresh_position("BTC/USDT:USDT")
+        self.assertEqual(fp["quality"], "FRESH")
+        self.assertEqual(fp["side"], "sell")
+        self.assertEqual(fp["size"], 0.5)
+
+    async def test_fresh_stale_is_unknown(self):
+        with _patch_bss(get_positions=AsyncMock(return_value={"ok": True, "stale": True, "positions": []})):
+            fp = await ers._fresh_position("BTC/USDT:USDT")
+        self.assertEqual(fp["quality"], "UNKNOWN")
+
+    async def test_protected_side_mismatch_goes_manual(self):
+        await ers.record_incident(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT",
+                                  client_order_id="c1", side="buy", planned_stop=100.0)
+        key = (await ers._get_repo().list_open())[0]["incident_key"]
+        with patch.object(ers, "_ensure_stop", AsyncMock(return_value=(True, "SLX", "ok"))), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
+                           get_positions=AsyncMock(return_value={"ok": True, "positions": [
+                               {"symbol": "BTCUSDT", "size": 1.0, "side": "Sell"}]})):  # short vs inc buy
+            await ers.reconcile_due()
+        self.assertEqual((await ers._get_repo().get(key))["state"], State.MANUAL_REQUIRED)
+
+    async def test_adopt_requires_planned_stop(self):
+        inc = {"side": "buy", "symbol": "BTC/USDT:USDT"}    # SEM planned_stop
+        listing = {"orders": [_algo(algo_id="A1", side="SELL", close_position=True, trigger_price=100.0)]}
+        self.assertFalse(_adopt_live_stop(inc, 1.0, listing)[0])
+
+
+class LeasePerMutationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        ers.set_repo(InMemoryIncidentRepo())
+        ers._boot_scan_safe = True
+        self._arm = patch.object(ers, "_arm_quarantine", AsyncMock()); self._arm.start()
+        self._rel = patch.object(ers, "_maybe_release_quarantine", AsyncMock(return_value=False)); self._rel.start()
+        self._mrt = patch.object(ers, "_match_real_trade", AsyncMock(return_value={"skip": True})); self._mrt.start()
+        self._guard = _bss_guard()
+
+    def tearDown(self):
+        self._arm.stop(); self._rel.stop(); self._mrt.stop(); self._guard.close(); ers.set_repo(None)
+
+    async def test_lease_lost_between_cancels_stops_second(self):
+        # cleanup OPEN com 2 extras; renew falha após A1 → A2 NÃO é cancelado
+        await ers.record_incident(kind=Kind.CLEANUP_PENDING, symbol="ETH/USDT:USDT",
+                                  side="buy", planned_stop=50.0,
+                                  conditional_ids={"all": ["EX1", "EX2"]})
+        key = (await ers._get_repo().list_open())[0]["incident_key"]
+        # SL cardinal adotado (A0) + 2 extras EX1/EX2
+        listing = {"ok": True, "orders": [
+            _algo(algo_id="A0", side="SELL", reduce_only=True, quantity=1.0, trigger_price=50.0),
+            _algo(algo_id="EX1", client_algo_id="EX1"), _algo(algo_id="EX2", client_algo_id="EX2")]}
+        cancel = AsyncMock(return_value={"ok": True})
+        renew_calls = {"n": 0}
+
+        async def _renew(k, o):
+            renew_calls["n"] += 1
+            return renew_calls["n"] <= 1    # 1ª renovação ok; a partir da 2ª, lease perdido
+        with patch.object(ers, "_renew_or_abort", _renew), \
+                _patch_bss(_fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
+                           get_open_algo_orders=AsyncMock(return_value=listing),
+                           cancel_algo_order=cancel):
+            await ers.reconcile_due()
+        self.assertLessEqual(cancel.await_count, 1)   # A2 não executou após perder o lease
 
 
 if __name__ == "__main__":

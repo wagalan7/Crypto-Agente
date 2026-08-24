@@ -262,3 +262,42 @@ Defaults fail-closed preservados: `MAKER_ENTRY_ENABLED=false`,
   `run_pg_runtime.sh` num cluster PG16 descartável (socket unix, sem rede) —
   ON CONFLICT/união/reabertura/claim/lease/renew/pausa-CAS. Nunca Railway/produção.
 - `py_compile` e `git diff --check` aprovados. Sem push/deploy.
+
+## P03.1D - Final transactional reconciliation closure
+
+- Status: Concluído localmente (não publicado/não ativado em conta real)
+- Branch: `feat/hardening-p03-1d` (novo commit sobre `3878ce59`)
+- Detalhe: `docs/P03_EXECUTION_RECONCILIATION.md` (seção P03.1D)
+
+### Fechou os bloqueadores transacionais
+
+- **JSON/JSONB**: coluna `conditional_ids` é `JSON`; casts para `JSONB` antes de
+  `->`/`||` e de volta para `JSON`. Validado em Postgres real com as expressões
+  VERBATIM sobre a coluna `JSON`.
+- **Acquire/release atômico**: `arm_p03_pause`/`release_p03_pause` por
+  `pg_advisory_xact_lock`; release confirma zero incidentes não resolvidos NA
+  transação. `record_incident` persiste a pausa ANTES de o incidente existir
+  (invariante "incidente visível ⇒ pausa persistida").
+- **Retomada manual owner-aware**: `set_manual_pause(False)` limpa só o owner
+  `manual`; com incidente P03 aberto re-carimba a pausa como P03 (sem janela);
+  preserva P02/legacy.
+- **Fresh com lado**: `_fresh_position` (símbolo/lado/qty/qualidade); PROTECTED só
+  com lado fresh == incidente; senão MANUAL.
+- **Boot tracking**: `_real_trade_match` (matcher do reconciliador) em vez de símbolo.
+- **RealTrade determinístico**: identidade + agregação de qty (sem 50% fixo); lado
+  ausente → MANUAL; `sl_order_id` só no trade certo.
+- **SL cardinal**: exige `planned_stop` válido; **lease por CADA mutação**.
+- **Maker honesto**: sem default "protegida"; SL_NOT_CONFIRMED/UNKNOWN_NO_SL/
+  PENDING_ORDER_UNPROTECTED; nunca MARKET.
+
+### Validação
+
+- **89 testes P03.1D** herméticos (rede/DNS bloqueados e CONTABILIZADOS — a suíte
+  falha se houver qualquer tentativa). Rodados em **Python 3.9 PURO (sem shim)**,
+  **2×**, verdes; + P02 edge (13) no 3.9 puro.
+- **PostgreSQL SQL-expression runtime = PASS** (coluna `JSON` real, expressões
+  verbatim). **Real-repo via driver async = `POSTGRES_RUNTIME_TEST=BLOCKED`** —
+  ambiente sem `asyncpg`/`psycopg`; não instalado pela rede; NÃO afirmado como passou.
+- Execução completa P01+P02+P03 (145) feita como AUXILIAR sob shim de teste externo
+  (P01/P02 exigem Python ≥3.10; no 3.9 puro ficam BLOCKED). `py_compile` e
+  `git diff --check` aprovados. Sem push/deploy.

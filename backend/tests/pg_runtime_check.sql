@@ -44,19 +44,9 @@ CREATE TABLE risk_state (
     updated_at     TIMESTAMPTZ DEFAULT now()
 );
 
--- Expressão de merge de conditional_ids IDÊNTICA à do serviço (cond_merge).
--- Encapsulada numa função para reusar nos cenários.
-CREATE FUNCTION cond_merge(cur jsonb, inc jsonb) RETURNS json AS $$
-  SELECT ((COALESCE(cur,'{}'::jsonb) || COALESCE(inc,'{}'::jsonb))
-    || jsonb_build_object('all', (SELECT COALESCE(jsonb_agg(DISTINCT v),'[]'::jsonb) FROM (
-         SELECT jsonb_array_elements_text(COALESCE(cur->'all','[]'::jsonb)) AS v
-         UNION SELECT jsonb_array_elements_text(COALESCE(inc->'all','[]'::jsonb))
-         UNION SELECT cur->>'sl' UNION SELECT cur->>'tp1' UNION SELECT cur->>'tp2'
-         UNION SELECT inc->>'sl' UNION SELECT inc->>'tp1' UNION SELECT inc->>'tp2'
-       ) s WHERE v IS NOT NULL)))::json;
-$$ LANGUAGE sql;
-
 -- ── Cenário 1: upsert atômico (ON CONFLICT DO UPDATE) ────────────────────────
+-- Usa as EXPRESSÕES VERBATIM do serviço sobre a coluna JSON real (sem função
+-- auxiliar jsonb) — valida o fix JSON/JSONB no tipo real da coluna.
 -- insere {sl:S1}, lower-bound 0.5, depois faz conflito com {sl:S2}, lower-bound 0.2.
 INSERT INTO execution_incidents (incident_key, kind, symbol, min_known_fill, conditional_ids, state)
 VALUES ('k1','CLEANUP_PENDING','B', 0.5, '{"sl":"S1"}', 'OPEN');
@@ -66,7 +56,18 @@ VALUES ('k1','CLEANUP_PENDING','B', 0.2, '{"sl":"S2"}', 9.0)
 ON CONFLICT (incident_key) DO UPDATE SET
   min_known_fill = GREATEST(COALESCE(execution_incidents.min_known_fill,0), COALESCE(EXCLUDED.min_known_fill,0)),
   planned_stop = COALESCE(execution_incidents.planned_stop, EXCLUDED.planned_stop),
-  conditional_ids = cond_merge(execution_incidents.conditional_ids::jsonb, EXCLUDED.conditional_ids::jsonb),
+  -- EXPRESSÃO VERBATIM do serviço (cond_merge) sobre a coluna JSON real:
+  conditional_ids = (((COALESCE(execution_incidents.conditional_ids,'{}')::jsonb) || (COALESCE(EXCLUDED.conditional_ids,'{}')::jsonb))
+    || jsonb_build_object('all', (SELECT COALESCE(jsonb_agg(DISTINCT v),'[]'::jsonb) FROM (
+         SELECT jsonb_array_elements_text(COALESCE((COALESCE(execution_incidents.conditional_ids,'{}')::jsonb)->'all','[]'::jsonb)) AS v
+         UNION SELECT jsonb_array_elements_text(COALESCE((COALESCE(EXCLUDED.conditional_ids,'{}')::jsonb)->'all','[]'::jsonb))
+         UNION SELECT (COALESCE(execution_incidents.conditional_ids,'{}')::jsonb)->>'sl'
+         UNION SELECT (COALESCE(execution_incidents.conditional_ids,'{}')::jsonb)->>'tp1'
+         UNION SELECT (COALESCE(execution_incidents.conditional_ids,'{}')::jsonb)->>'tp2'
+         UNION SELECT (COALESCE(EXCLUDED.conditional_ids,'{}')::jsonb)->>'sl'
+         UNION SELECT (COALESCE(EXCLUDED.conditional_ids,'{}')::jsonb)->>'tp1'
+         UNION SELECT (COALESCE(EXCLUDED.conditional_ids,'{}')::jsonb)->>'tp2'
+       ) s WHERE v IS NOT NULL)))::json,
   state = CASE WHEN execution_incidents.resolved_at IS NOT NULL THEN 'OPEN' ELSE execution_incidents.state END,
   resolved_at = CASE WHEN execution_incidents.resolved_at IS NOT NULL THEN NULL ELSE execution_incidents.resolved_at END,
   attempts = CASE WHEN execution_incidents.resolved_at IS NOT NULL THEN 0 ELSE execution_incidents.attempts END,

@@ -204,6 +204,40 @@ Fecha os bloqueadores de concorrência/contrato e valida o SQL em Postgres real:
   lista `all` deduplicada — `{sl:S1}`+`{sl:S2}` preserva ambos). Reabertura limpa
   claim/lease/manual_reason/backoff (elegível imediatamente).
 
+## P03.1D — final transactional reconciliation closure
+
+Fecha os bloqueadores transacionais confirmados na P03.1C:
+
+- **JSON/JSONB real:** a coluna `conditional_ids` é `JSON`. O merge castava mal
+  (`json ? / json || jsonb`). Agora casta os operandos para `JSONB` ANTES de
+  `->`/`->>`/`||` e converte o resultado de volta para `JSON` — validado em
+  Postgres 16 real com as EXPRESSÕES VERBATIM do serviço sobre a coluna `JSON`.
+- **Invariante "incidente visível ⇒ pausa P03 persistida":** `record_incident`
+  arma o latch local, **persiste a pausa P03** (`arm_p03_pause`, `UPDATE` condicional
+  sob `pg_advisory_xact_lock`, sem `get_status→set_manual_pause`) e SÓ ENTÃO faz o
+  upsert do incidente. `release_p03_pause` confirma **zero incidentes não resolvidos
+  dentro da mesma transação/lock** antes de liberar.
+- **Retomada manual owner-aware:** `set_manual_pause(False)` não usa mais o
+  `clear_execution_quarantine()` genérico — limpa só o owner `manual` e, se houver
+  incidente P03 aberto, re-carimba a pausa como P03 (sem janela; trading segue
+  pausado). Preserva P02/legacy.
+- **Posição fresh com lado:** `_fresh_position` retorna símbolo/quote, LADO real,
+  qty absoluta e qualidade `FRESH|UNKNOWN`. PROTECTED exige lado fresh == lado do
+  incidente; ausente/divergente → `MANUAL_REQUIRED`.
+- **Boot tracking = matcher do reconciliador:** removido `_open_real_trade_symbols`;
+  o boot usa `_real_trade_match` (exchange/source/símbolo/quote/lado) sobre as linhas
+  RealTrade — símbolo não é mais prova de tracking.
+- **RealTrade determinístico:** `_match_real_trade` prefere IDENTIDADE (client/
+  exchange order id), agrega qty de múltiplos trades para cobrir a posição fresh
+  (tolerância só de lote ~0,1%, sem 50% fixo), lado ausente → MANUAL, e persiste o
+  `sl_order_id` só no trade determinístico (conflito/falha → não PROTECTED).
+- **SL cardinal:** sem `planned_stop` numérico > 0 não adota NEM cria stop.
+- **Lease por mutação:** renova/valida o lease imediatamente antes de CADA
+  `cancel_order`/`cancel_algo_order`/criação de SL; se expirar após A1, A2 não roda.
+- **Maker honesto:** sem `_prot_ok=True` default — só afirma "exposição protegida"
+  após `_ensure_stop` confirmar SL; senão `SL_NOT_CONFIRMED`/`UNKNOWN_NO_SL`/
+  `PENDING_ORDER_UNPROTECTED`. Nunca fallback MARKET.
+
 ## API (somente leitura)
 
 `GET /api/execution-incidents/status` — total aberto, retry pending, manual
@@ -219,11 +253,29 @@ falha o teste; zero chamadas a `demo-fapi.binance.com`). Suíte crítica complet
 (P01+P02+P03.1C) = **138 testes**, verde (executada 2×). `py_compile` e
 `git diff --check` verdes.
 
-**PostgreSQL runtime test = PASS.** `backend/tests/pg_runtime_check.sql` roda num
-cluster PostgreSQL 16 **descartável** (socket unix, sem TCP/rede, nunca Railway)
-via `backend/tests/run_pg_runtime.sh`, validando de verdade: `ON CONFLICT DO
-UPDATE` (união `all`/GREATEST), reabertura atômica limpando claim/lease/manual,
-claim/lease/renew (lease vencido não renova) e a pausa CAS sob advisory lock.
+**PostgreSQL runtime (P03.1D):**
+
+- **SQL-expression runtime = PASS.** `backend/tests/pg_runtime_check.sql` (via
+  `run_pg_runtime.sh`) roda as **expressões VERBATIM do serviço** (incl. o merge
+  `conditional_ids` JSON/JSONB corrigido) sobre a coluna **`JSON` real** num cluster
+  PostgreSQL 16 descartável (socket unix, sem rede, nunca Railway): `ON CONFLICT DO
+  UPDATE` (união `all`/GREATEST), reabertura atômica (limpa claim/lease/manual),
+  claim/lease/renew e pausa CAS sob advisory lock.
+- **Real-repo runtime (`_SqlIncidentRepo.upsert` via driver async) = `POSTGRES_RUNTIME_TEST=BLOCKED`.**
+  O ambiente NÃO tem `asyncpg`/`psycopg` e, por política, **não** se instala pela
+  rede — então o caminho pelo engine async real do projeto **não foi executado** e
+  **não** é afirmado como passando. A validação acima cobre o CONTRATO SQL exato.
+
+**Hermeticidade:** a suíte P03 bloqueia socket/DNS e **contabiliza** qualquer
+tentativa — `tearDownModule` FALHA se o código sob teste tocar a rede (mesmo
+capturada). Zero chamadas a `demo-fapi.binance.com`.
+
+**Reprodutibilidade (sem shim externo):** os **89 testes P03** rodam em **Python
+3.9 puro** (interpretador do sistema), executados **2×**, verdes; + P02 edge (13)
+no 3.9 puro. As suítes P01/P02 que importam models (`Mapped[X | None]`, PEP 604)
+exigem **Python ≥3.10** (produção é 3.11) — no 3.9 puro ficam **BLOCKED**; a
+execução completa (145) foi feita como AUXILIAR sob um shim de teste externo (não
+contado como reprodução sem shim).
 >
 > Nota de ambiente: produção roda Python 3.11 (onde `Mapped[X | None]` resolve
 > nativamente). O único interpretador com deps nesta máquina é o 3.9; as suítes
