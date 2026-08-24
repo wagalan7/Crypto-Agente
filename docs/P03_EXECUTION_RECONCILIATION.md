@@ -328,3 +328,24 @@ permite **AF_UNIX** e bloqueia/conta **AF_INET/AF_INET6/DNS** (zero TCP). Unitte
 herméticos **161** verdes 2× no venv311. `py_compile` e `git diff --check` OK.
 Sem push/deploy. **P04 continua NÃO implementado**; flags MAKER/TF/PYRAMIDING e
 Bybit live preservados.
+
+---
+
+## Atualização P03.1E-FIX (2026-08-24) — corridas de segurança fechadas
+
+- **`update_and_check` sob advisory lock** (917283) desde a 1ª leitura; conta
+  incidentes na mesma txn e força `trading_paused=true` com `open>0`, bloqueando
+  auto-resume diário/semanal. Fecha o bug `open_incidents=1 / trading_paused=false`.
+- **`_arm_quarantine`** compartilha o `_P03_LOCAL_LOCK` de record/release.
+- **Portão fresh pré-mutação** (`_fresh_gate` + `_explicit_side`, sem `else "buy"`):
+  UNKNOWN→RETRY, FLAT→cleanup, lado ausente/divergente→MANUAL (zero mutações). Aplica
+  a entry, maker e cleanup (fim do `_fresh_verdict`).
+- **`_resolve_protected`**: grava sl_id no incidente → 2ª leitura fresh →
+  relista+revalida o SL pelo id EXATO (allowlist de status vivo; rejeita MYSTERY) →
+  RealTrade determinístico (identidade A+só-B ⇒ NO_MATCH) → CAS → PROTECTED. **`skip`
+  (DB off) nunca vira PROTECTED.**
+- **Boot**: lado ausente/ambíguo ⇒ UNKNOWN + quarentena (nunca infere BUY/FLAT).
+
+Validação: 12 cenários PostgreSQL reais (2×), 171 unittests herméticos (2×),
+py_compile e git diff --check. Sem push/deploy. P04 não implementado; flags e Bybit
+live preservados.

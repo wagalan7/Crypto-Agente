@@ -368,3 +368,63 @@ código real, conexões distintas e concorrência real.
   Decimal + stepSize), boot cobertura parcial→untracked / agregada→tracked,
   ambíguo→MANUAL.
 - `py_compile` e `git diff --check` aprovados. Sem push/deploy.
+
+---
+
+## P03.1E-FIX — VERIFIED CLOSURE OF SAFETY RACES (2026-08-24)
+
+Base: commit `5904b963`. Reproduzido em runtime real (Python 3.11 + asyncpg + PG16)
+o bug de PRODUÇÃO `open_incidents=1 / trading_paused=false` e fechadas as corridas
+e brechas remanescentes do caminho PROTECTED.
+
+### Corrida de RiskState (bug de produção)
+- **`update_and_check` agora adquire `pg_advisory_xact_lock(917283)` ANTES da 1ª
+  leitura** de RiskState (os outros writers — `set_manual_pause`, `arm_p03_pause`,
+  `release_p03_pause`, `persist_incident_with_p03_pause` — já adquiriam). Conta os
+  incidentes abertos NA MESMA txn: `>0` ⇒ força `trading_paused=true` (via
+  `ensure_p03_pause_in_session`, que preserva pausa manual/P02/DD) e **bloqueia
+  auto-resume diário e semanal** (`_no_incident = open==0`). Prova em PG real, os
+  dois sentidos (`update||record` e `record||update`) ⇒ `open=1, paused=true`; e o
+  caso determinístico "pausa DD pré-existente + incidente + rollover ⇒ permanece
+  pausado".
+- **`_arm_quarantine` passou a compartilhar o MESMO `_P03_LOCAL_LOCK`** de
+  `record_incident`/`_maybe_release_quarantine` — nenhum interleaving arm↔release
+  deixa pausa persistida com o owner local P03 desligado.
+
+### Caminho PROTECTED (nunca "protegido no escuro")
+- **Portão fresh ANTES de qualquer mutação** (`_fresh_gate`, sobre `_fresh_position`
+  com quality/size/**side**): só muta com FRESH + size>0 + lado fresh == lado do
+  incidente. UNKNOWN → RETRY; FLAT → cleanup/FLAT; lado ausente/divergente → MANUAL,
+  **zero mutações** (nem SL, nem cancel). Substitui o `_fresh_verdict` (removido) nos
+  fluxos maker, entry e cleanup. `LONG × fresh SHORT` e `maker BUY × SHORT` ⇒ zero
+  mutações.
+- **Parsing de lado explícito** (`_explicit_side`): buy/long | sell/short; ausente/
+  inválido/ambíguo → None. **Nunca `else "buy"`** (removido em `_fresh_position` e no
+  boot).
+- **`_resolve_protected` reescrito**: (0) grava o `sl_id` no incidente
+  (`conditional_ids.sl` + união `.all`, fenced) ANTES de resolver; (1) **SEGUNDA
+  leitura fresh** independente (FRESH/size>0/lado==incidente; senão nunca PROTECTED);
+  (2) **RELISTA e revalida o SL pelo id EXATO** (`_revalidate_stop_by_id`: status vivo
+  por allowlist, STOP_MARKET, lado de fechamento, símbolo/quote, cobertura, trigger) —
+  SL ausente pós-POST ⇒ nunca PROTECTED; (3) RealTrade DETERMINÍSTICO com a qty da 2ª
+  leitura; (4) CAS do `sl_order_id`. **Removido o atalho `skip`→PROTECTED**: DB off/
+  erro ⇒ RETRY, jamais PROTECTED.
+- **Allowlist de status vivo do SL** (`_LIVE_ALGO_STATUS`): ausente/`MYSTERY`/
+  não-reconhecido ⇒ **rejeita** (era denylist, que adotava o desconhecido).
+- **Identidade**: incidente com identidade A e só RealTrade B ⇒ **NO_MATCH** (nunca
+  fallback pro único item do pool).
+- **Boot**: posição com lado ausente/ambíguo ⇒ UNKNOWN + `_boot_scan_safe=false` +
+  quarentena (não infere BUY, não retorna FLAT). Cobertura agregada íntegra preservada.
+- **mutation_guard preservado** (guard antes de cada POST/retry/fallback; lease negado/
+  exceção ⇒ zero POST; cada cancel renova lease) — sem regressão.
+
+### Validação (RED→GREEN, Python 3.11 real, sem shim)
+- **10 testes novos** que FALHAM em `5904b963` (provado por stash do serviço, 9/10
+  RED) e passam agora: 2ª leitura UNKNOWN, LONG×SHORT/maker×SHORT zero-mutação, DB
+  off nunca PROTECTED, SL persistido no incidente, SL ausente pós-POST, status
+  MYSTERY rejeitado, lado ausente → None, identidade A+B → NO_MATCH, boot lado
+  ausente → quarentena.
+- **Integração PostgreSQL REAL: 12 cenários** (incl. produção + `update||record` /
+  `record||update` / rollover), `PG_INTEGRATION_OK` **2×**, socket unix, hermeticidade
+  AF_UNIX-only (zero TCP/DNS). **Unittest herméticos 171 verdes 2×**. `py_compile` e
+  `git diff --check` OK. Sem push/deploy.

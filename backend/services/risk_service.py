@@ -118,8 +118,26 @@ async def update_and_check() -> dict:
     if not DB_ENABLED:
         return {"enabled": False}
 
+    from sqlalchemy import text, func, select as _sel
     async with get_session() as session:
+        # Serializa com arm/release/record do P03 (MESMA advisory lock) ANTES da
+        # primeira leitura de RiskState — fecha a corrida read-modify-write que
+        # deixava `open_incidents=1, trading_paused=false`.
+        await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _P03_PAUSE_LOCK})
         state = await _get_or_create_state(session)
+
+        # Conta incidentes P03 abertos NA MESMA txn. Fail-closed: erro → desconhecido
+        # (None) → NUNCA auto-resume e NÃO fabrica pausa (preserva estado).
+        open_p03 = None
+        try:
+            from models.execution_incident import ExecutionIncident
+            open_p03 = (await session.execute(_sel(func.count(ExecutionIncident.id))
+                        .where(ExecutionIncident.resolved_at.is_(None)))).scalar() or 0
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"[circuit-breaker] contagem de incidentes P03 falhou "
+                        f"(fail-closed, sem auto-resume): {exc}")
+            open_p03 = None
+        _no_incident = (open_p03 == 0)   # True SÓ quando CONFIRMADO zero incidentes
 
         # Reset por virada de dia/semana
         today = _today_utc()
@@ -129,8 +147,9 @@ async def update_and_check() -> dict:
             # Não zera weekly aqui — semana tem seu próprio rollover
         if state.current_week_utc != week:
             state.current_week_utc = week
-            # Reseta pausa AUTOMÁTICA se estava ativa (não a manual, NUNCA a P03).
-            if state.trading_paused and not state.pause_manual and not _is_p03_pause(state):
+            # Reseta pausa AUTOMÁTICA só com ZERO incidentes P03 confirmado (nunca a
+            # manual, nunca a P03, nunca enquanto houver incidente aberto).
+            if _no_incident and state.trading_paused and not state.pause_manual and not _is_p03_pause(state):
                 log.info("Virada de semana — pausa automática resetada.")
                 state.trading_paused = False
                 state.pause_reason = None
@@ -152,7 +171,7 @@ async def update_and_check() -> dict:
         # Regra: se a pausa é automática (não manual), disparou num dia UTC
         # ANTERIOR e AMBOS os DD já voltaram pra dentro do limite → retoma.
         # Exigir weekly saudável impede soltar uma pausa SEMANAL cedo demais.
-        if state.trading_paused and not state.pause_manual and state.paused_at and not _is_p03_pause(state):
+        if _no_incident and state.trading_paused and not state.pause_manual and state.paused_at and not _is_p03_pause(state):
             _pa = state.paused_at
             if _pa.tzinfo is None:
                 _pa = _pa.replace(tzinfo=timezone.utc)
@@ -194,6 +213,14 @@ async def update_and_check() -> dict:
                 log.warning(f"[circuit-breaker] AUTO-PAUSE: {state.pause_reason}")
                 _log_event(session, state, "auto_pause", state.pause_reason)
                 _just_auto_paused = True
+
+        # ENFORCEMENT do invariante (mesma txn+lock): incidente P03 aberto ⇒
+        # trading_paused=true. `ensure_p03_pause_in_session` preserva pausa
+        # manual/P02/DD existente (que já bloqueia) e carimba P03 só se estiver
+        # despausado. Nunca libera; nunca sobrescreve owner do operador.
+        if open_p03 and open_p03 > 0:
+            await ensure_p03_pause_in_session(
+                session, f"{open_p03} incidente(s) P03 aberto(s) — trading pausado")
 
         state.updated_at = datetime.now(timezone.utc)
         await session.commit()

@@ -229,6 +229,71 @@ async def scenario_p03_survives_rollover_autoresume():
     ok("pausa P03 sobrevive à virada de dia+semana (sem auto-resume; owner intacto)")
 
 
+async def _set_existing_autopause(reason="DD diário -5.00% atingiu limite -5%", days_ago=2):
+    """Simula uma pausa AUTOMÁTICA de DD pré-existente (não-P03, não-manual)."""
+    async with db.get_session() as s:
+        await rk._get_or_create_state(s)   # garante a linha id=1
+        await s.execute(text("UPDATE risk_state SET trading_paused=true, pause_manual=false, "
+                             "pause_reason=:r, paused_at=now() - make_interval(days => :d) WHERE id=1"),
+                        {"r": reason, "d": days_ago})
+        await s.commit()
+
+
+async def scenario_existing_autopause_incident_rollover():
+    """PRODUÇÃO reproduzida: pausa automática de DD pré-existente + incidente P03
+    aberto (ensure_p03 PRESERVA a pausa DD, não carimba P03) + rollover dia/semana com
+    DD saudável. Em 5904b963 o auto-resume soltava a pausa DD deixando
+    `open_incidents=1, trading_paused=false`. update_and_check deve FORÇAR paused com
+    incidente aberto."""
+    await _reset()
+    await _set_existing_autopause()
+    await ers.record_incident(kind=ers.Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT", client_order_id="ex1")
+    assert (await _open_count()) == 1
+    async with db.get_session() as s:   # força rollover dia+semana
+        await s.execute(text("UPDATE risk_state SET current_day_utc=NULL, current_week_utc=NULL WHERE id=1"))
+        await s.commit()
+    await rk.update_and_check()
+    paused, reason = await _paused()
+    assert (await _open_count()) == 1, "incidente deveria seguir aberto"
+    assert paused is True, "PRODUÇÃO: open_incidents=1 com trading_paused=false (auto-resume soltou a pausa)"
+    ok("pausa DD pré-existente + incidente + rollover ⇒ permanece pausado (open⇒paused)")
+
+
+async def scenario_update_then_record_paused():
+    """Concorrência (update primeiro / record depois): estado final open=1, paused=true."""
+    await _reset()
+
+    async def _upd():
+        return await rk.update_and_check()
+
+    async def _rec():
+        await asyncio.sleep(0.05)
+        return await ers.record_incident(kind=ers.Kind.ENTRY_ORDER_UNKNOWN,
+                                         symbol="ETH/USDT:USDT", client_order_id="ur1")
+
+    await asyncio.gather(_upd(), _rec())
+    assert (await _open_count()) == 1 and (await _paused())[0] is True, "update||record deixou open sem pausa"
+    ok("update||record (update primeiro) ⇒ open=1, paused=true")
+
+
+async def scenario_record_then_update_paused():
+    """Concorrência (record primeiro / update depois): estado final open=1, paused=true.
+    update_and_check com incidente aberto NUNCA solta a pausa (conta na mesma txn)."""
+    await _reset()
+
+    async def _rec():
+        return await ers.record_incident(kind=ers.Kind.ENTRY_ORDER_UNKNOWN,
+                                         symbol="SOL/USDT:USDT", client_order_id="ru1")
+
+    async def _upd():
+        await asyncio.sleep(0.05)
+        return await rk.update_and_check()
+
+    await asyncio.gather(_rec(), _upd())
+    assert (await _open_count()) == 1 and (await _paused())[0] is True, "record||update deixou open sem pausa"
+    ok("record||update (record primeiro) ⇒ open=1, paused=true")
+
+
 async def scenario_rollback_no_partial():
     await _reset()
     # força erro no meio da transação: kind inválido? Não — força via conditional_ids array (rejeitado no build)
@@ -247,7 +312,10 @@ async def main():
     for fn in (scenario_json_tristate_and_union, scenario_reopen_elegible,
                scenario_transaction_and_invariant, scenario_release_first_then_record,
                scenario_two_concurrent_records, scenario_record_vs_manual_resume,
-               scenario_p03_survives_rollover_autoresume, scenario_rollback_no_partial):
+               scenario_p03_survives_rollover_autoresume,
+               scenario_existing_autopause_incident_rollover,
+               scenario_update_then_record_paused, scenario_record_then_update_paused,
+               scenario_rollback_no_partial):
         await fn()
     await db.close_db()
     if _TCP_ATTEMPTS:

@@ -414,26 +414,34 @@ class EntryReconcileTests(_AsyncBase):
         await self._seed_entry()
         listing = {"ok": True, "orders": [_algo(algo_id="A1", side="SELL", reduce_only=True,
                                                 quantity=1.0, trigger_price=100.1)]}
-        with _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
-                        _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
-                        get_open_algo_orders=AsyncMock(return_value=listing),
-                        place_protection_orders=AsyncMock(), place_order=AsyncMock(),
-                        place_maker_entry_then_protect=AsyncMock()):
+        with patch.object(ers, "_match_real_trade",
+                          AsyncMock(return_value={"id": 1, "verdict": ers.Coverage.COVERED})), \
+                patch.object(ers, "_persist_sl_order_id", AsyncMock(return_value=True)), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           get_open_algo_orders=AsyncMock(return_value=listing),   # adota A1 e revalida A1
+                           place_protection_orders=AsyncMock(), place_order=AsyncMock(),
+                           place_maker_entry_then_protect=AsyncMock()):
             await ers.reconcile_due()
             bss.place_order.assert_not_called()
             bss.place_maker_entry_then_protect.assert_not_called()
             bss.place_protection_orders.assert_not_called()     # adotou, não criou
-        self.assertEqual((await ers._get_repo().list_open() or [{}])[0].get("state", State.FLAT), State.FLAT)
         rows = await ers._get_repo().list_all()
         self.assertEqual(rows[0]["state"], State.PROTECTED)
 
     async def test_filled_no_sl_creates_sl_real_signature(self):
         await self._seed_entry(planned_qty=1.0)
-        with _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
-                        _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
-                        get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": []}),
-                        place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "S1"}),
-                        place_order=AsyncMock()):
+        # adopção falha (listagem vazia) → cria S1; a RELISTAGEM em _resolve_protected
+        # DEVE mostrar S1 vivo p/ revalidar (item: "SL criado é relistado e revalidado").
+        listings = [{"ok": True, "orders": []},
+                    {"ok": True, "orders": [_algo(algo_id="S1", side="SELL", close_position=True,
+                                                  trigger_price=100.0)]}]
+        with patch.object(ers, "_match_real_trade",
+                          AsyncMock(return_value={"id": 1, "verdict": ers.Coverage.COVERED})), \
+                patch.object(ers, "_persist_sl_order_id", AsyncMock(return_value=True)), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           get_open_algo_orders=AsyncMock(side_effect=listings),
+                           place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "S1"}),
+                           place_order=AsyncMock()):
             await ers.reconcile_due()
             self.assertTrue(bss.place_protection_orders.await_count == 1)
             args, kwargs = bss.place_protection_orders.call_args
@@ -491,12 +499,15 @@ class MakerTests(_AsyncBase):
             {"ok": True, "status": "NEW"},                       # 1ª consulta: viva
             {"ok": True, "status": "FILLED", "orig_qty": 1.0},   # pós-cancel: terminal
         ])
-        with _patch_bss(get_order=get_order,
-                        cancel_order=AsyncMock(return_value={"ok": True}),
-                        _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
-                        get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": [
-                            _algo(algo_id="A1", side="SELL", close_position=True, trigger_price=50.0)]}),
-                        place_order=AsyncMock()):
+        with patch.object(ers, "_match_real_trade",
+                          AsyncMock(return_value={"id": 1, "verdict": ers.Coverage.COVERED})), \
+                patch.object(ers, "_persist_sl_order_id", AsyncMock(return_value=True)), \
+                _patch_bss(get_order=get_order,
+                           cancel_order=AsyncMock(return_value={"ok": True}),
+                           get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": [
+                               _algo(algo_id="A1", symbol="ETHUSDT", side="SELL",
+                                     close_position=True, trigger_price=50.0)]}),
+                           place_order=AsyncMock()):
             await ers.reconcile_due()
             bss.cancel_order.assert_awaited_once()               # cancelou a maker pelo ID
             bss.place_order.assert_not_called()                  # nunca MARKET
@@ -528,6 +539,15 @@ class MakerTests(_AsyncBase):
 #  6) Cleanup por identidade exata
 # ════════════════════════════════════════════════════════════════════════════
 class CleanupTests(_AsyncBase):
+    def setUp(self):
+        super().setUp()
+        # cleanup opera sobre posição FLAT (limpeza de condicionais órfãs) — a 2ª
+        # leitura fresh padrão é FLAT; testes de OPEN re-protegem via override próprio.
+        self._fp.stop()
+        self._fp = patch.object(ers, "_fresh_position",
+                                AsyncMock(return_value={"quality": "FRESH", "size": 0.0, "side": None}))
+        self._fp.start()
+
     async def _seed_cleanup(self, **kw):
         base = dict(kind=Kind.CONDITIONAL_SUBMISSION_UNKNOWN, symbol="ETH/USDT:USDT",
                     conditional_ids={"sl": "SL1"})
@@ -706,6 +726,19 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], Kind.UNTRACKED_POSITION)   # cobertura parcial ≠ tracked
 
+    async def test_boot_absent_side_is_unknown_and_quarantines(self):
+        # posição fresh com lado ausente/inválido → NÃO infiro BUY, NÃO FLAT:
+        # boot inseguro + quarentena (item 11).
+        with _patch_bss(is_configured=lambda: True,
+                        get_positions=AsyncMock(return_value={"ok": True, "positions": [
+                            {"symbol": "BTCUSDT", "size": 1.0, "side": ""}]})), \
+                patch.object(ers, "_open_real_trades", AsyncMock(return_value=[])), \
+                patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
+            out = await ers.boot_reconcile()
+        self.assertFalse(ers._boot_scan_safe)                       # boot inseguro
+        self.assertIsNotNone(self.shadow.execution_quarantine_reason())  # quarentena armada
+        self.assertEqual(await ers._get_repo().list_open(), [])     # não registrou UNTRACKED com lado inventado
+
     async def test_boot_full_aggregate_coverage_is_tracked(self):
         # cobertura AGREGADA integral (0.5+1.5=2.0) → tracked, sem incidente.
         t1 = {"status": "open", "exchange": "binance", "source": "auto",
@@ -873,12 +906,15 @@ class TrackingTests(_AsyncBase):
     async def test_created_sl_persisted_to_real_trade(self):
         await ers.record_incident(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT",
                                   client_order_id="c1", side="buy", planned_stop=100.0, planned_qty=1.0)
-        persist = AsyncMock()
-        with patch.object(ers, "_match_real_trade", AsyncMock(return_value={"id": 7})), \
+        persist = AsyncMock(return_value=True)
+        listings = [{"ok": True, "orders": []},                 # adopção falha → cria
+                    {"ok": True, "orders": [_algo(algo_id="S1", side="SELL", close_position=True,
+                                                  trigger_price=100.0)]}]   # relist revalida S1
+        with patch.object(ers, "_match_real_trade",
+                          AsyncMock(return_value={"id": 7, "verdict": ers.Coverage.COVERED})), \
                 patch.object(ers, "_persist_sl_order_id", persist), \
                 _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
-                           _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
-                           get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": []}),
+                           get_open_algo_orders=AsyncMock(side_effect=listings),
                            place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "S1"})):
             await ers.reconcile_due()
         persist.assert_awaited_once_with(7, "S1")               # idempotente no RealTrade
@@ -1120,6 +1156,155 @@ class Sl1cReconcileTests(_AsyncBase):
         st = (await ers._get_repo().list_all())[0]["state"]
         self.assertEqual(st, State.MANUAL_REQUIRED)          # nunca PROTECTED sem alvo determinístico
         self.assertNotEqual(st, State.PROTECTED)
+
+
+class VerifiedClosureTests(_AsyncBase):
+    """P03.1E-FIX: reproduções que FALHAVAM em 5904b963, agora fechadas."""
+    async def _seed_entry(self, **kw):
+        base = dict(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="BTC/USDT:USDT",
+                    client_order_id="c1", side="buy", planned_stop=100.0, planned_qty=1.0)
+        base.update(kw)
+        await ers.record_incident(**base)
+        return (await ers._get_repo().list_open())[0]["incident_key"]
+
+    def _set_fresh(self, *reads):
+        """Reprograma o _fresh_position da base (side_effect sequencial ou valor)."""
+        self._fp.stop()
+        val = list(reads)
+        self._fp = patch.object(ers, "_fresh_position",
+                                AsyncMock(side_effect=val) if len(val) > 1
+                                else AsyncMock(return_value=val[0]))
+        self._fp.start()
+
+    async def test_second_read_unknown_never_protected(self):
+        await self._seed_entry()
+        # fp1 (portão) OPEN buy → adota SL; fp2 (_resolve_protected) UNKNOWN → RETRY.
+        self._set_fresh({"quality": "FRESH", "size": 1.0, "side": "buy"},
+                        {"quality": "UNKNOWN", "size": None, "side": None})
+        with patch.object(ers, "_match_real_trade",
+                          AsyncMock(return_value={"id": 1, "verdict": ers.Coverage.COVERED})), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": [
+                               _algo(algo_id="A1", side="SELL", close_position=True, trigger_price=100.0)]})):
+            await ers.reconcile_due()
+        st = (await ers._get_repo().list_all())[0]["state"]
+        self.assertEqual(st, State.RETRY_PENDING)
+        self.assertNotEqual(st, State.PROTECTED)
+
+    async def test_long_incident_fresh_short_zero_mutations(self):
+        await self._seed_entry(side="buy")                          # LONG
+        self._set_fresh({"quality": "FRESH", "size": 1.0, "side": "sell"})  # fresh SHORT
+        place = AsyncMock(return_value={"sl_ok": True, "sl_order_id": "X"})
+        with _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                        get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": []}),
+                        place_protection_orders=place):
+            await ers.reconcile_due()
+        place.assert_not_called()                                   # ZERO mutação de proteção
+        self.assertEqual((await ers._get_repo().list_all())[0]["state"], State.MANUAL_REQUIRED)
+
+    async def test_maker_buy_fresh_short_zero_mutations(self):
+        await ers.record_incident(kind=Kind.ENTRY_ORDER_UNKNOWN, symbol="ETH/USDT:USDT",
+                                  client_order_id="m1", side="buy", planned_stop=50.0,
+                                  planned_qty=1.0, pending_maker=True)
+        self._set_fresh({"quality": "FRESH", "size": 1.0, "side": "sell"})  # fresh SHORT vs maker BUY
+        cancel = AsyncMock(return_value={"ok": True}); place = AsyncMock()
+        with _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "NEW", "executed_qty": 0.0}),
+                        cancel_order=cancel, place_protection_orders=place,
+                        get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": []})):
+            await ers.reconcile_due()
+        cancel.assert_not_called()                                  # nem cancela a maker
+        place.assert_not_called()                                   # nem cria proteção
+        self.assertEqual((await ers._get_repo().list_all())[0]["state"], State.MANUAL_REQUIRED)
+
+    async def test_db_off_skip_never_protected(self):
+        await self._seed_entry()
+        with patch.object(ers, "_match_real_trade", AsyncMock(return_value={"skip": True})), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": [
+                               _algo(algo_id="A1", side="SELL", close_position=True, trigger_price=100.0)]})):
+            await ers.reconcile_due()
+        st = (await ers._get_repo().list_all())[0]["state"]
+        self.assertEqual(st, State.RETRY_PENDING)                   # DB off → nunca PROTECTED
+        self.assertNotEqual(st, State.PROTECTED)
+
+    async def test_sl_absent_after_post_never_protected(self):
+        await self._seed_entry()
+        listings = [{"ok": True, "orders": []},                     # adopt falha → cria
+                    {"ok": True, "orders": []}]                     # relist: SL sumiu
+        with patch.object(ers, "_match_real_trade",
+                          AsyncMock(return_value={"id": 1, "verdict": ers.Coverage.COVERED})), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           get_open_algo_orders=AsyncMock(side_effect=listings),
+                           place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "S1"})):
+            await ers.reconcile_due()
+        st = (await ers._get_repo().list_all())[0]["state"]
+        self.assertEqual(st, State.RETRY_PENDING)                   # SL ausente pós-POST → nunca PROTECTED
+        self.assertNotEqual(st, State.PROTECTED)
+
+    async def test_created_sl_persisted_in_incident(self):
+        key = await self._seed_entry()
+        listings = [{"ok": True, "orders": []},
+                    {"ok": True, "orders": [_algo(algo_id="S1", side="SELL", close_position=True,
+                                                  trigger_price=100.0)]}]
+        with patch.object(ers, "_match_real_trade",
+                          AsyncMock(return_value={"id": 1, "verdict": ers.Coverage.COVERED})), \
+                patch.object(ers, "_persist_sl_order_id", AsyncMock(return_value=True)), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           get_open_algo_orders=AsyncMock(side_effect=listings),
+                           place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "S1"})):
+            await ers.reconcile_due()
+        cids = (await ers._get_repo().get(key)).get("conditional_ids") or {}
+        self.assertEqual(cids.get("sl"), "S1")                      # sl_id gravado no incidente
+        self.assertIn("S1", (cids.get("all") or []))               # união histórica
+
+    async def test_mystery_sl_status_rejected(self):
+        await self._seed_entry()
+        myst = {"ok": True, "orders": [_algo(algo_id="A1", side="SELL", close_position=True,
+                                             trigger_price=100.0, status="MYSTERY")]}
+        with patch.object(ers, "_match_real_trade",
+                          AsyncMock(return_value={"id": 1, "verdict": ers.Coverage.COVERED})), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           get_open_algo_orders=AsyncMock(return_value=myst),
+                           place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "A1"})):
+            await ers.reconcile_due()
+        self.assertNotEqual((await ers._get_repo().list_all())[0]["state"], State.PROTECTED)
+
+    async def test_fresh_position_absent_side_is_none(self):
+        self._fp.stop()                                            # usa o _fresh_position REAL
+        try:
+            with _patch_bss(get_positions=AsyncMock(return_value={"ok": True, "positions": [
+                    {"symbol": "BTCUSDT", "size": 1.0, "side": ""}]})):
+                fp = await ers._fresh_position("BTC/USDT:USDT")
+            self.assertEqual(fp["quality"], "FRESH")
+            self.assertIsNone(fp["side"])                          # lado ausente → None (nunca "buy")
+        finally:
+            self._fp = patch.object(ers, "_fresh_position",
+                                    AsyncMock(return_value={"quality": "FRESH", "size": 1.0, "side": "buy"}))
+            self._fp.start()
+
+    async def test_identity_a_only_trade_b_no_match(self):
+        rt_b = {"status": "open", "exchange": "binance", "source": "auto", "symbol": "BTC/USDT:USDT",
+                "side": "buy", "qty": 1.0, "qty_initial": 1.0, "client_order_id": "B",
+                "exchange_order_id": None, "id": 99}
+
+        class _Res:
+            def scalars(self): return self
+            def all(self): return [types.SimpleNamespace(**rt_b)]
+
+        class _Sess:
+            async def execute(self, *a, **k): return _Res()
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        import db as _db
+        self._mrt.stop()                                          # usa o _match_real_trade REAL
+        try:
+            with patch.object(_db, "DB_ENABLED", True), patch.object(_db, "get_session", lambda: _Sess()):
+                rt = await ers._match_real_trade("BTC/USDT:USDT", "buy", 1.0, identity=["A"])
+            self.assertIsNone(rt)                                 # identidade A + só trade B → NO_MATCH
+        finally:
+            self._mrt = patch.object(ers, "_match_real_trade", AsyncMock(return_value={"skip": True}))
+            self._mrt.start()
 
 
 class CoverageVerdictTests(unittest.TestCase):
