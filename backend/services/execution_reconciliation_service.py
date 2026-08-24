@@ -117,6 +117,11 @@ _prev_open_count = 0          # p/ liberar quarentena SÓ na transição >0 → 
 _p03_latch_armed = False      # P03 realmente armou o latch?
 _boot_scan_safe = False       # leitura fresh de posições/incidentes já teve sucesso?
 _prev_boot_safe = False       # p/ detectar recuperação unsafe→safe (release 0→0)
+# Lock LOCAL (mesmo processo) compartilhado por record_incident/_arm/_maybe_release
+# — o advisory lock protege PROCESSOS diferentes; este protege arm/release
+# concorrentes DENTRO do mesmo processo. Nenhum caminho P03 arma/limpa o latch fora
+# deste protocolo.
+_P03_LOCAL_LOCK = asyncio.Lock()
 
 
 def _now() -> datetime:
@@ -569,38 +574,51 @@ class InMemoryIncidentRepo:
 class _SqlIncidentRepo:
     """Repositório Postgres: upsert atômico (ON CONFLICT) + claim/fencing por UPDATE…WHERE."""
 
-    async def upsert(self, key: str, defaults: dict) -> tuple[dict, bool]:
-        """Uma única operação atômica: INSERT … ON CONFLICT DO UPDATE … RETURNING.
-        No conflito: GREATEST do lower-bound, merge de conditional_ids/payload
-        (jsonb ||), COALESCE dos IDs/stop/qty/side/prefixo ausentes e reabertura
-        atômica da reincidência. Nunca reduz informação. (xmax=0 ⇒ inserido.)"""
-        from db import get_session
+    @staticmethod
+    def _build_upsert_stmt(key: str, defaults: dict):
+        """Constrói o INSERT … ON CONFLICT DO UPDATE … RETURNING (puro, sem sessão).
+        Contrato JSON tri-state: conditional_ids/payload SEMPRE objeto ou SQL NULL —
+        NULLIF(...,'null') normaliza JSON-null, e só se opera sobre objetos jsonb."""
         from models.execution_incident import ExecutionIncident as EI
         from sqlalchemy import text, literal_column
         from sqlalchemy.dialects.postgresql import insert as pg_insert
-        cols = {k: v for k, v in defaults.items() if k in _model_cols()}
+        # aceita SÓ dict ou None (rejeita array/escalar fail-closed); omite None
+        cols = {}
+        for k, v in defaults.items():
+            if k not in _model_cols():
+                continue
+            if k in ("conditional_ids", "payload"):
+                if v is None:
+                    continue                       # omite → SQL NULL (none_as_null)
+                if not isinstance(v, dict):
+                    raise ValueError(f"{k} deve ser dict ou None, não {type(v).__name__}")
+            cols[k] = v
         T = "execution_incidents"
 
-        def _co(c):   # COALESCE(existente, novo)
+        def _co(c):
             return text(f"COALESCE({T}.{c}, EXCLUDED.{c})")
 
-        def _jm(c):   # merge jsonb sem apagar anteriores, de volta pro tipo JSON
-            return text(f"(COALESCE({T}.{c}::jsonb,'{{}}'::jsonb) "
-                        f"|| COALESCE(EXCLUDED.{c}::jsonb,'{{}}'::jsonb))::json")
-
-        def _reopen(c, reopened):  # CASE de reabertura
+        def _reopen(c, reopened):
             return text(f"CASE WHEN {T}.resolved_at IS NOT NULL THEN {reopened} ELSE {T}.{c} END")
 
-        # conditional_ids: a COLUNA É `JSON`. Casta os operandos para JSONB ANTES
-        # de qualquer `->`/`->>`/`||` (senão o Postgres não tem operador json ? /
-        # json || jsonb) e converte o resultado final de volta para JSON.
-        CJ = f"(COALESCE({T}.conditional_ids,'{{}}')::jsonb)"
-        EJ = "(COALESCE(EXCLUDED.conditional_ids,'{}')::jsonb)"
+        def _obj(colexpr):   # NULL/JSON-null/não-objeto → '{}'::jsonb
+            n = f"COALESCE(NULLIF({colexpr}::jsonb,'null'::jsonb),'{{}}'::jsonb)"
+            return f"(CASE WHEN jsonb_typeof({n})='object' THEN {n} ELSE '{{}}'::jsonb END)"
+
+        def _arr(objexpr, k):  # elementos de ->k só quando é array
+            return (f"jsonb_array_elements_text(CASE WHEN jsonb_typeof({objexpr}->'{k}')='array' "
+                    f"THEN {objexpr}->'{k}' ELSE '[]'::jsonb END)")
+
+        def _jm(c):   # merge de objetos (payload): resultado objeto → JSON
+            return text(f"(({_obj(f'{T}.{c}')} || {_obj(f'EXCLUDED.{c}')}))::json")
+
+        CJ = _obj(f"{T}.conditional_ids")
+        EJ = _obj("EXCLUDED.conditional_ids")
         cond_merge = text(
             f"(({CJ} || {EJ}) "
             f"|| jsonb_build_object('all', (SELECT COALESCE(jsonb_agg(DISTINCT v),'[]'::jsonb) FROM ("
-            f"  SELECT jsonb_array_elements_text(COALESCE({CJ}->'all','[]'::jsonb)) AS v"
-            f"  UNION SELECT jsonb_array_elements_text(COALESCE({EJ}->'all','[]'::jsonb))"
+            f"  SELECT {_arr(CJ, 'all')} AS v"
+            f"  UNION SELECT {_arr(EJ, 'all')}"
             f"  UNION SELECT {CJ}->>'sl' UNION SELECT {CJ}->>'tp1' UNION SELECT {CJ}->>'tp2'"
             f"  UNION SELECT {EJ}->>'sl' UNION SELECT {EJ}->>'tp1' UNION SELECT {EJ}->>'tp2'"
             f") s WHERE v IS NOT NULL)))::json")
@@ -614,20 +632,31 @@ class _SqlIncidentRepo:
             "conditional_ids": cond_merge, "payload": _jm("payload"),
             "state": _reopen("state", "'OPEN'"), "resolved_at": _reopen("resolved_at", "NULL"),
             "attempts": _reopen("attempts", "0"), "clean_observations": _reopen("clean_observations", "0"),
-            "manual_reason": _reopen("manual_reason", "NULL"),
+            "manual_reason": _reopen("manual_reason", "NULL"), "last_error": _reopen("last_error", "NULL"),
+            "next_retry_at": _reopen("next_retry_at", "CURRENT_TIMESTAMP"),
             "claimed_by": _reopen("claimed_by", "NULL"), "claimed_at": _reopen("claimed_at", "NULL"),
             "lease_expires_at": _reopen("lease_expires_at", "NULL"),
             "updated_at": _now(),
         }
+        ins = pg_insert(EI).values(incident_key=key, **cols)
+        return ins.on_conflict_do_update(index_elements=["incident_key"], set_=set_) \
+                  .returning(EI, literal_column("(xmax = 0)"))
+
+    async def upsert_in_session(self, session, key: str, defaults: dict) -> tuple[dict, bool]:
+        """Executa o upsert numa sessão JÁ ABERTA (NÃO abre sessão, NÃO faz commit).
+        Usado pelo caminho transacional único pausa+incidente."""
+        r = (await session.execute(self._build_upsert_stmt(key, defaults))).first()
+        if r is None:
+            return {"incident_key": key}, False
+        return _row_to_dict(r[0]), bool(r[1])
+
+    async def upsert(self, key: str, defaults: dict) -> tuple[dict, bool]:
+        """Wrapper que abre sessão + commit (caminho legado/testes diretos)."""
+        from db import get_session
         async with get_session() as session:
-            ins = pg_insert(EI).values(incident_key=key, **cols)
-            stmt = ins.on_conflict_do_update(index_elements=["incident_key"], set_=set_) \
-                      .returning(EI, literal_column("(xmax = 0)"))
-            r = (await session.execute(stmt)).first()
+            res = await self.upsert_in_session(session, key, defaults)
             await session.commit()
-            if r is None:
-                return {"incident_key": key}, False
-            return _row_to_dict(r[0]), bool(r[1])
+            return res
 
     async def get(self, key: str) -> Optional[dict]:
         from db import get_session
@@ -784,38 +813,39 @@ async def _arm_quarantine(reason: str) -> None:
 
 
 async def _maybe_release_quarantine() -> bool:
-    """Libera SOMENTE a quarentena PRÓPRIA do P03. Chamado apenas na transição
-    de ≥1 incidente para 0 (o caller garante). Exige: P03 armou o latch; zero
-    incidentes abertos; **boot/scan fresh já teve sucesso**; pausa persistida é
-    P03-owned. NUNCA usa clear genérico nem toca latch/pausa de P02 ou operador."""
+    """Release owner-aware do P03 sob LOCK LOCAL. Ordem OBRIGATÓRIA: valida
+    boot_scan_safe → chama o release NO BANCO PRIMEIRO (transação + advisory lock,
+    reconfirma zero incidentes lá dentro) → só com RELEASED/SAFE_OTHER_OWNER limpa o
+    latch owner="p03". STILL_OPEN/ERROR/exceção → mantém/rearma o latch, retorna
+    False, NÃO loga sucesso. Nunca limpa antes da resposta do banco; nunca clear
+    genérico; nunca libera só com list_open() fora da transação."""
     global _p03_latch_armed
-    if await _get_repo().list_open():
-        return False
-    if not _p03_latch_armed:
-        return False
-    if not _boot_scan_safe:
-        return False  # sem leitura fresh confirmada, mantém quarentena
-    # Limpa APENAS o owner p03 do latch em memória.
-    other_owners = True
-    try:
-        from services import shadow_trade_service
-        shadow_trade_service.clear_execution_quarantine(owner=_LATCH_OWNER)
-        _p03_latch_armed = False
-        remaining = shadow_trade_service.execution_quarantine_owners()
-        other_owners = bool(remaining)  # P02/legacy/manual ainda segurando?
-    except Exception as exc:  # noqa: BLE001
-        log.error(f"[p03] falha limpando latch próprio: {exc}")
-        return False
-    # Só remove a pausa persistida se NÃO restam outros owners locais e a pausa
-    # atual ainda é P03-owned (CAS transacional no RiskState — sem clear genérico).
-    if not other_owners:
+    async with _P03_LOCAL_LOCK:
+        if not _p03_latch_armed:
+            return False
+        if not _boot_scan_safe:
+            return False
         try:
             from services import risk_service
-            await risk_service.release_p03_pause(_PAUSE_MARKER)
+            result = await risk_service.release_p03_pause(_PAUSE_MARKER)
         except Exception as exc:  # noqa: BLE001
-            log.error(f"[p03] falha resumindo RiskState (owner-aware): {exc}")
-    log.warning("[p03] quarentena própria liberada — transição p/ zero incidentes")
-    return True
+            log.error(f"[p03] release exceção — mantém latch: {exc}")
+            _arm_local_latch("release exceção — re-armado")
+            return False
+        if result in (risk_service.RELEASE_RELEASED, risk_service.RELEASE_SAFE_OTHER_OWNER):
+            # Banco CONFIRMOU (zero incidentes). Só AGORA limpa o latch owner p03.
+            try:
+                from services import shadow_trade_service
+                shadow_trade_service.clear_execution_quarantine(owner=_LATCH_OWNER)
+                _p03_latch_armed = False
+            except Exception as exc:  # noqa: BLE001
+                log.error(f"[p03] falha limpando latch p03 pós-release: {exc}")
+                return False
+            log.warning(f"[p03] quarentena própria liberada ({result})")
+            return True
+        # STILL_OPEN / ERROR → mantém latch, sem sucesso.
+        _arm_local_latch(f"release não concluído ({result}) — latch mantido")
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -828,6 +858,50 @@ def build_incident_key(kind: str, symbol: str, *, exchange: str = EXCHANGE_BINAN
     ident = (client_order_id or entry_order_id or conditional_prefix
              or snapshot_id or identity or symbol)  # sem sufixo genérico "-"
     return f"{exchange}:{kind}:{symbol}:{ident}"
+
+
+async def persist_incident_with_p03_pause(key: str, cols: dict, reason: str) -> tuple:
+    """Caminho de PRODUÇÃO (P03.1E): UMA sessão, UM commit. Pausa P03 e incidente
+    no MESMO commit sob `pg_advisory_xact_lock`. Garante o invariante observável por
+    outra conexão: EXISTE incidente não resolvido ⇒ risk_state.trading_paused=true.
+    Rollback desfaz pausa e incidente juntos. Retorna (row, created, persisted)."""
+    repo = _get_repo()
+    try:
+        from db import DB_ENABLED
+    except Exception:
+        DB_ENABLED = False
+    # DB off ou repo em memória (testes): sem transação real — latch já cobre; usa
+    # upsert em memória + arm best-effort. persisted reflete a gravação.
+    if not DB_ENABLED or not isinstance(repo, _SqlIncidentRepo):
+        # Sem Postgres real não há transação; preserva a ORDEM (pausa ANTES do
+        # incidente visível) armando a pausa primeiro, depois o upsert.
+        try:
+            from services import risk_service
+            await risk_service.arm_p03_pause(reason)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            row, created = await repo.upsert(key, cols)
+        except Exception as exc:  # noqa: BLE001
+            log.critical(f"[p03] persist (memória) falhou ({key}): {exc}")
+            return None, False, False
+        return row, created, (row is not None and row.get("id") is not None)
+    # PostgreSQL real: transação única pausa+incidente.
+    from db import get_session
+    from sqlalchemy import text
+    from services import risk_service
+    try:
+        async with get_session() as session:
+            async with session.begin():                     # BEGIN … COMMIT único
+                await session.execute(text("SELECT pg_advisory_xact_lock(:k)"),
+                                      {"k": risk_service._P03_PAUSE_LOCK})
+                await risk_service.ensure_p03_pause_in_session(session, reason)  # pausa P03
+                row, created = await repo.upsert_in_session(session, key, cols)  # incidente
+            # ao sair de session.begin() o COMMIT já ocorreu (pausa+incidente juntos)
+        return row, created, (row is not None and row.get("id") is not None)
+    except Exception as exc:  # noqa: BLE001
+        log.critical(f"[p03] transação pausa+incidente falhou (rollback, nada parcial): {exc}")
+        return None, False, False
 
 
 async def record_incident(*, kind: str, symbol: str, exchange: str = EXCHANGE_BINANCE,
@@ -851,29 +925,21 @@ async def record_incident(*, kind: str, symbol: str, exchange: str = EXCHANGE_BI
         if v is not None:
             full_payload[k] = v
     _reason = f"incidente {kind} {symbol} ({_mask(client_order_id or entry_order_id)})"
-    # Ordem CRÍTICA (invariante "incidente visível ⇒ pausa P03 persistida"):
-    # (1) latch local; (2) pausa P03 PERSISTIDA; só então (3) upsert do incidente.
-    # Assim o incidente nunca fica observável no banco sem a pausa já persistida.
-    _arm_local_latch(_reason)
-    await _arm_quarantine(_reason)      # persiste a pausa P03 ANTES de o incidente existir
-    repo = _get_repo()
-    created = False
-    persisted = False
-    row = None
-    try:
-        # upsert é ATÔMICO: no conflito já faz merge monotônico (GREATEST/união)
-        # e reabre reincidência. Não há read-modify-write separado (evita corrida).
-        row, created = await repo.upsert(key, {
-            "kind": kind, "symbol": symbol, "exchange": exchange, "side": side,
-            "client_order_id": client_order_id, "entry_order_id": entry_order_id,
-            "planned_qty": planned_qty, "min_known_fill": min_known_fill,
-            "planned_stop": planned_stop, "conditional_prefix": conditional_prefix,
-            "conditional_ids": conditional_ids, "payload": full_payload or None,
-            "next_retry_at": _now(),
-        })
-        persisted = row is not None and row.get("id") is not None
-    except Exception as exc:  # noqa: BLE001
-        log.critical(f"[p03] persistência de incidente falhou ({key}): {exc}")
+    cols = {
+        "kind": kind, "symbol": symbol, "exchange": exchange, "side": side,
+        "client_order_id": client_order_id, "entry_order_id": entry_order_id,
+        "planned_qty": planned_qty, "min_known_fill": min_known_fill,
+        "planned_stop": planned_stop, "conditional_prefix": conditional_prefix,
+        "conditional_ids": (conditional_ids or None), "payload": (full_payload or None),
+        "next_retry_at": _now(),
+    }
+    # Caminho ÚNICO sob lock LOCAL: latch local → 1 transação (advisory lock +
+    # RiskState pausado + upsert do incidente) → 1 commit. Invariante:
+    # incidente visível ⇒ pausa P03 já persistida (mesmo commit). Erro → rollback
+    # (nada parcial) + persisted=False; latch local permanece armado.
+    async with _P03_LOCAL_LOCK:
+        _arm_local_latch(_reason)
+        row, created, persisted = await persist_incident_with_p03_pause(key, cols, _reason)
     log.critical(f"[p03][incident] key={key} kind={kind} symbol={symbol} created={created} "
                  f"persisted={persisted} coid={_mask(client_order_id)} eoid={_mask(entry_order_id)} maker={pending_maker}")
     return {"incident_key": key, "created": created, "persisted": persisted,
@@ -1012,15 +1078,80 @@ async def _ensure_stop(key: str, owner: str, inc: dict, need_qty: Optional[float
     if not await _renew_or_abort(key, owner):
         return False, None, "claim perdido antes de criar SL — abortado"
     prefix = inc.get("conditional_prefix") or _safe_prefix(key)   # sem `…` Unicode
+    # Invariante #6: além do pré-check acima, o lease é REVALIDADO imediatamente antes
+    # de CADA POST interno (SL principal + fallback quantity). Se o claim expirar/mudar
+    # de dono no meio, nenhum POST é enviado (fail-closed).
+    async def _guard() -> bool:
+        return await _renew_or_abort(key, owner)
     try:
         res = await bss.place_protection_orders(
             symbol, entry_side, q, stop_loss=planned_stop, tp1=None, tp2=None,
-            client_order_id_prefix=prefix, dedup_live=True)
+            client_order_id_prefix=prefix, dedup_live=True, mutation_guard=_guard)
     except Exception as exc:  # noqa: BLE001
         return False, None, f"criação SL exceção: {exc}"
     if res and res.get("sl_ok") is True and res.get("sl_order_id"):
         return True, str(res.get("sl_order_id")), f"SL criado ({_mask(res.get('sl_order_id'))})"
     return False, None, f"criação SL não confirmada (sl_ok={res.get('sl_ok') if res else None})"
+
+
+def _symbol_step(symbol: str) -> float:
+    """stepSize do símbolo a partir do cache de exchangeInfo JÁ carregado — leitura
+    PURA (sem rede: nunca dispara `_load_exchange_info`). Cache frio/indisponível →
+    0.0 → tolerância de cobertura zero (exata, fail-closed)."""
+    try:
+        from services import binance_signed_service as bss
+        bsym = bss.to_binance(symbol) if "/" in symbol else symbol
+        cache = getattr(bss, "_filters_cache", None) or {}
+        return float((cache.get(bsym) or {}).get("step") or 0.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+class Coverage:
+    """Estados da cobertura RealTrade × posição fresh (invariante #4)."""
+    COVERED = "COVERED"            # alvo determinístico + agregação ≥ posição (dentro do stepSize)
+    INSUFFICIENT = "INSUFFICIENT"  # alvo determinístico mas soma < posição (exposição descoberta)
+    NO_MATCH = "NO_MATCH"          # nenhum RealTrade determinístico casou (untracked)
+    AMBIGUOUS = "AMBIGUOUS"        # múltiplos sem identidade única → alvo indeterminado
+    UNKNOWN = "UNKNOWN"            # need/qty desconhecidos → cobertura não confirmável
+
+
+def _coverage_verdict(pool: list, ident_rows: list, need_qty: Optional[float],
+                      step: Optional[float]) -> tuple[str, Optional[object]]:
+    """Puro/testável. Decide o alvo DETERMINÍSTICO e a cobertura por AGREGAÇÃO
+    Decimal, com tolerância = stepSize do símbolo (SEM 0,1%/50% arbitrários).
+    Retorna (verdict ∈ Coverage.*, target_id|None). AMBIGUOUS/NO_MATCH → target None.
+    Falta de qty ou need desconhecido → UNKNOWN (nunca COVERED por omissão)."""
+    from decimal import Decimal, InvalidOperation
+    if not pool:
+        return Coverage.NO_MATCH, None
+    # alvo determinístico: 1 por identidade, ou pool unitário; senão ambíguo.
+    if len(ident_rows) == 1:
+        target = ident_rows[0]
+    elif len(pool) == 1:
+        target = pool[0]
+    else:
+        return Coverage.AMBIGUOUS, None
+    target_id = _rt_get(target, "id")
+    need = _finite(need_qty)
+    if need is None or need <= 0:
+        return Coverage.UNKNOWN, target_id       # sem posição fresh conhecida → não confirma
+    try:
+        agg = Decimal("0")
+        for r in pool:
+            q = _finite(_rt_get(r, "qty"))
+            if q is None:
+                q = _finite(_rt_get(r, "qty_initial"))
+            if q is None:
+                return Coverage.UNKNOWN, target_id   # qty ausente em alguma linha → não confirma
+            agg += Decimal(str(q))
+        tol = Decimal(str(step)) if (step and step > 0) else Decimal("0")
+        need_d = Decimal(str(need))
+    except (InvalidOperation, ValueError):
+        return Coverage.UNKNOWN, target_id
+    if agg + tol < need_d:                        # falta mais que um stepSize → descoberto
+        return Coverage.INSUFFICIENT, target_id
+    return Coverage.COVERED, target_id
 
 
 async def _match_real_trade(symbol: str, side: Optional[str], fresh_size: Optional[float] = None,
@@ -1050,14 +1181,16 @@ async def _match_real_trade(symbol: str, side: Optional[str], fresh_size: Option
         ident_rows = [r for r in matched if idvals & {
             str(_rt_get(r, "client_order_id") or ""), str(_rt_get(r, "exchange_order_id") or "")}
         ] if idvals else []
-        pool = ident_rows or matched
-        need = _finite(fresh_size)
-        if need is not None and need > 0:
-            agg = sum((_finite(_rt_get(r, "qty")) or _finite(_rt_get(r, "qty_initial")) or 0.0) for r in pool)
-            if agg + need * 0.001 + 1e-9 < need:
-                return None           # cobertura agregada insuficiente → untracked
-        target = ident_rows[0] if len(ident_rows) == 1 else (pool[0] if len(pool) == 1 else None)
-        return {"id": (_rt_get(target, "id") if target is not None else None), "covered": True}
+        # stepSize do símbolo → tolerância de LOTE p/ cobertura (sem 0,1%/50%).
+        step = _symbol_step(symbol)
+        verdict, target_id = _coverage_verdict(matched, ident_rows, fresh_size, step)
+        if verdict in (Coverage.NO_MATCH, Coverage.INSUFFICIENT):
+            return None                 # untracked/exposição descoberta → sem RealTrade determinístico
+        if verdict == Coverage.AMBIGUOUS:
+            return {"id": None, "verdict": verdict, "ambiguous": True}
+        if verdict == Coverage.UNKNOWN:
+            return {"id": target_id, "verdict": verdict, "unknown": True}
+        return {"id": target_id, "verdict": Coverage.COVERED, "covered": True}
 
 
 def _rt_get(r, name):
@@ -1158,8 +1291,24 @@ async def _resolve_protected(key: str, owner: str, inc: dict, sl_id: Optional[st
                       manual_reason="posição protegida SEM RealTrade correspondente — untracked/manual")
         log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED (protegida sem RealTrade)")
         return
-    # Persiste o sl_order_id SÓ no RealTrade determinístico (rt['id']); se ambíguo
-    # (múltiplos sem identidade) rt['id'] é None → não grava em trade errado.
+    # `skip` = DB indisponível: P03 não consegue consultar RealTrade. Com o SL já
+    # confirmado, mantém o comportamento fail-safe legado (não bloqueia por falta de
+    # banco). Os gates determinísticos abaixo só valem quando há DB pra consultar.
+    if not rt.get("skip"):
+        if rt.get("verdict") == Coverage.UNKNOWN:
+            # cobertura não confirmável (qty/posição desconhecida) → não PROTEGE; mantém
+            # quarentena e reavalia (nunca declara seguro por omissão de dado).
+            await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
+                                  "cobertura RealTrade não confirmável (qty/posição desconhecida) — mantém quarentena")
+            return
+        if not rt.get("id"):
+            # AMBÍGUO: múltiplos RealTrade sem identidade única → alvo indeterminado.
+            # Invariante #4: nunca PROTECTED sem RealTrade DETERMINÍSTICO.
+            await _fenced(key, owner, state=State.MANUAL_REQUIRED,
+                          manual_reason="RealTrade ambíguo (múltiplos sem identidade única) — alvo indeterminado, sem PROTECTED")
+            log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED (RealTrade ambíguo, target_id=None)")
+            return
+    # Persiste o sl_order_id SÓ no RealTrade determinístico (rt['id']).
     if sl_id and rt.get("id"):
         if not await _persist_sl_order_id(rt.get("id"), sl_id):
             await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
@@ -1461,11 +1610,11 @@ async def reconcile_due() -> dict:
         except Exception as exc:  # noqa: BLE001
             log.error(f"[p03] re-arm do latch falhou: {exc}")
     released = False
-    # Libera na transição >0→0 OU na recuperação de boot inseguro→seguro com zero
-    # incidentes (0→0) — sem clear/log nos ciclos comuns já-estáveis.
-    transition_to_zero = _prev_open_count > 0 and open_now == 0
-    boot_recovery = (open_now == 0 and _boot_scan_safe and not _prev_boot_safe and _p03_latch_armed)
-    if transition_to_zero or boot_recovery:
+    # Enquanto houver ZERO incidentes e o latch P03 armado, tenta o release SEGURO
+    # em TODO ciclo elegível (não só na transição) — o próprio _maybe_release_quarantine
+    # é idempotente (retorna cedo se o latch já não está armado) e só age com a
+    # confirmação do banco.
+    if open_now == 0 and _p03_latch_armed and _boot_scan_safe:
         released = await _maybe_release_quarantine()
     _prev_open_count = open_now
     _prev_boot_safe = _boot_scan_safe
@@ -1500,6 +1649,30 @@ async def boot_reconcile() -> dict:
         log.critical(f"[p03][boot] ciclo inicial falhou — quarentena armada (boot inseguro): {exc}")
     return {"open_incidents": len(open_incs), "untracked": scan.get("count"),
             "scan_status": scan.get("status"), "boot_scan_safe": _boot_scan_safe}
+
+
+def _boot_coverage_ok(matched: list, size: Optional[float], step: Optional[float]) -> bool:
+    """Invariante #5: no boot, uma posição só é 'tracked' se o AGREGADO (Decimal) das
+    qty dos RealTrade que casam cobre a posição fresh INTEGRALMENTE (tolerância =
+    stepSize). Fail-closed: sem match, tamanho desconhecido ou qty ausente → False
+    (→ registra UNTRACKED). Cobertura parcial NÃO conta como rastreada."""
+    from decimal import Decimal, InvalidOperation
+    need = _finite(size)
+    if need is None or need <= 0 or not matched:
+        return False
+    try:
+        agg = Decimal("0")
+        for r in matched:
+            q = _finite(_rt_get(r, "qty"))
+            if q is None:
+                q = _finite(_rt_get(r, "qty_initial"))
+            if q is None:
+                return False                 # qty ausente → cobertura não confirmável
+            agg += Decimal(str(q))
+        tol = Decimal(str(step)) if (step and step > 0) else Decimal("0")
+        return agg + tol >= Decimal(str(need))
+    except (InvalidOperation, ValueError):
+        return False
 
 
 async def _detect_untracked_positions() -> dict:
@@ -1541,8 +1714,11 @@ async def _detect_untracked_positions() -> dict:
         sym = p.get("symbol") or ""
         norm = sym.replace("USDT", "/USDT:USDT") if "/" not in sym else sym
         side = ("sell" if str(p.get("side") or "").strip().lower() == "sell" else "buy")
-        # MESMO matcher rigoroso do reconciliador (exchange/source/símbolo/quote/lado).
-        if any(_real_trade_match(t, norm, side) for t in open_trades):
+        # MESMO matcher rigoroso do reconciliador (exchange/source/símbolo/quote/lado)
+        # E cobertura AGREGADA integral (invariante #5): match parcial NÃO é tracked.
+        matched = [t for t in open_trades if _real_trade_match(t, norm, side)]
+        psize = abs(_finite(p.get("size")) or 0)
+        if _boot_coverage_ok(matched, psize, _symbol_step(norm)):
             continue
         res_inc = await record_incident(kind=Kind.UNTRACKED_POSITION, symbol=norm, side=side,
                                         min_known_fill=abs(_finite(p.get("size")) or 0),

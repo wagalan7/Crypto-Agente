@@ -157,17 +157,24 @@ def _install_fake_services():
         return {"trading_paused": rs["paused"], "pause_reason": rs["reason"]}
 
     async def release_p03_pause(marker):
-        if not rs["paused"] or not (rs["reason"] or "").startswith(marker):
-            return False
-        if await _open_p03() > 0:                   # zero incidentes dentro do "lock"
-            return False
+        # resultado ESTRUTURADO (P03.1E), na mesma "transação" lógica
+        if await _open_p03() > 0:
+            return "STILL_OPEN"
+        if not rs["paused"]:
+            return "RELEASED"
+        if not (rs["reason"] or "").startswith(marker):
+            return "SAFE_OTHER_OWNER"
         rs["paused"] = False
         rs["reason"] = None
-        return True
+        return "RELEASED"
 
     async def get_status():
         return {"enabled": True, "trading_paused": rs["paused"], "pause_reason": rs["reason"]}
 
+    risk.RELEASE_RELEASED = "RELEASED"
+    risk.RELEASE_SAFE_OTHER_OWNER = "SAFE_OTHER_OWNER"
+    risk.RELEASE_STILL_OPEN = "STILL_OPEN"
+    risk.RELEASE_ERROR = "ERROR"
     risk.arm_p03_pause = arm_p03_pause
     risk.set_manual_pause = set_manual_pause
     risk.release_p03_pause = release_p03_pause
@@ -685,6 +692,34 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["kind"], Kind.UNTRACKED_POSITION)
         self.assertEqual(rows[0]["side"], "sell")             # side REAL, não abs→buy
 
+    async def test_boot_partial_coverage_is_untracked(self):
+        # invariante #5: posição fresh 2.0 coberta só por RealTrade 0.5 → NÃO é tracked.
+        tracked = {"status": "open", "exchange": "binance", "source": "auto",
+                   "symbol": "BTC/USDT:USDT", "side": "buy", "qty": 0.5, "id": 1}
+        with _patch_bss(is_configured=lambda: True,
+                        get_positions=AsyncMock(return_value={"ok": True, "positions": [
+                            {"symbol": "BTCUSDT", "size": 2.0, "side": "Buy"}]})), \
+                patch.object(ers, "_open_real_trades", AsyncMock(return_value=[tracked])), \
+                patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
+            await ers.boot_reconcile()
+        rows = await ers._get_repo().list_open()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], Kind.UNTRACKED_POSITION)   # cobertura parcial ≠ tracked
+
+    async def test_boot_full_aggregate_coverage_is_tracked(self):
+        # cobertura AGREGADA integral (0.5+1.5=2.0) → tracked, sem incidente.
+        t1 = {"status": "open", "exchange": "binance", "source": "auto",
+              "symbol": "BTC/USDT:USDT", "side": "buy", "qty": 0.5, "id": 1}
+        t2 = {"status": "open", "exchange": "binance", "source": "managed",
+              "symbol": "BTC/USDT:USDT", "side": "buy", "qty": 1.5, "id": 2}
+        with _patch_bss(is_configured=lambda: True,
+                        get_positions=AsyncMock(return_value={"ok": True, "positions": [
+                            {"symbol": "BTCUSDT", "size": 2.0, "side": "Buy"}]})), \
+                patch.object(ers, "_open_real_trades", AsyncMock(return_value=[t1, t2])), \
+                patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
+            await ers.boot_reconcile()
+        self.assertEqual(await ers._get_repo().list_open(), [])       # totalmente coberta
+
     async def test_boot_list_open_failure_arms_latch(self):
         class _BadRepo(InMemoryIncidentRepo):
             async def recover_expired_claims(self):
@@ -883,9 +918,10 @@ class OwnershipRaceTests(unittest.IsolatedAsyncioTestCase):
         await ers._arm_quarantine("p03")
         ers._prev_open_count = 1
         await ers._maybe_release_quarantine()
-        # legacy preservado E pausa não foi removida (ainda há owner P02)
+        # LATCH owner-scoped: legacy (P02) preservado; só o owner p03 saiu (sem clear
+        # genérico). O latch legacy segue bloqueando entradas independentemente.
         self.assertIn("legacy", self.owners)
-        self.assertTrue(self.rs["paused"])          # não resumiu (outros owners restam)
+        self.assertNotIn("p03", self.owners)
 
     async def test_manual_non_p03_pause_not_removed(self):
         await self.risk.set_manual_pause(True, "Pausa manual via kill switch")
@@ -1056,6 +1092,9 @@ class Sl1cReconcileTests(_AsyncBase):
             await ers.reconcile_due()
             args, kwargs = bss.place_protection_orders.call_args
             self.assertEqual(args[2], 2.0)               # cobre a posição fresh total
+            guard = kwargs.get("mutation_guard")         # invariante #6: guard de lease presente
+            self.assertTrue(callable(guard), "place_protection_orders sem mutation_guard")
+            self.assertIsInstance(await guard(), bool)   # revalida o lease (awaitable→bool, fail-closed)
 
     async def test_sl_persist_conflict_blocks_protected(self):
         await self._seed(planned_qty=1.0)
@@ -1067,6 +1106,69 @@ class Sl1cReconcileTests(_AsyncBase):
                                _algo(algo_id="A1", side="SELL", close_position=True, trigger_price=100.0)]})):
             await ers.reconcile_due()
         self.assertEqual((await ers._get_repo().list_all())[0]["state"], State.RETRY_PENDING)
+
+    async def test_ambiguous_real_trade_id_none_never_protected(self):
+        # invariante #4: RealTrade ambíguo (target_id=None) NUNCA vira PROTECTED.
+        await self._seed(planned_qty=1.0)
+        with patch.object(ers, "_match_real_trade", AsyncMock(return_value={"id": None})), \
+                patch.object(ers, "_persist_sl_order_id", AsyncMock(return_value=True)), \
+                _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                           _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
+                           get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": [
+                               _algo(algo_id="A1", side="SELL", close_position=True, trigger_price=100.0)]})):
+            await ers.reconcile_due()
+        st = (await ers._get_repo().list_all())[0]["state"]
+        self.assertEqual(st, State.MANUAL_REQUIRED)          # nunca PROTECTED sem alvo determinístico
+        self.assertNotEqual(st, State.PROTECTED)
+
+
+class CoverageVerdictTests(unittest.TestCase):
+    """invariante #4: cobertura RealTrade por AGREGAÇÃO Decimal + tolerância = stepSize
+    (sem 0,1%/50% arbitrários). 5 estados: COVERED/INSUFFICIENT/NO_MATCH/AMBIGUOUS/UNKNOWN."""
+    def _rt(self, qty, tid=1):
+        return {"id": tid, "qty": qty}
+
+    def test_no_match_when_pool_empty(self):
+        self.assertEqual(ers._coverage_verdict([], [], 1.0, 0.001), (ers.Coverage.NO_MATCH, None))
+
+    def test_ambiguous_when_multiple_without_single_identity(self):
+        v, tid = ers._coverage_verdict([self._rt(0.6, 1), self._rt(0.6, 2)], [], 1.0, 0.001)
+        self.assertEqual(v, ers.Coverage.AMBIGUOUS)
+        self.assertIsNone(tid)                               # alvo indeterminado
+
+    def test_covered_single_identity(self):
+        v, tid = ers._coverage_verdict([self._rt(1.0, 9)], [self._rt(1.0, 9)], 1.0, 0.001)
+        self.assertEqual(v, ers.Coverage.COVERED)
+        self.assertEqual(tid, 9)
+
+    def test_covered_single_pool_no_identity(self):
+        v, tid = ers._coverage_verdict([self._rt(1.0, 4)], [], 1.0, 0.001)
+        self.assertEqual((v, tid), (ers.Coverage.COVERED, 4))
+
+    def test_insufficient_uses_stepsize_not_percentage(self):
+        # falta 0.05 (>> step 0.001) → INSUFFICIENT (com 0,1% antigo 0.95 "passaria")
+        v, tid = ers._coverage_verdict([self._rt(0.95, 3)], [], 1.0, 0.001)
+        self.assertEqual(v, ers.Coverage.INSUFFICIENT)
+        self.assertEqual(tid, 3)
+
+    def test_covered_within_one_stepsize_tolerance(self):
+        # falta só 0.0005 (< step 0.001) → dentro da precisão de lote → COVERED
+        v, _ = ers._coverage_verdict([self._rt(0.9995, 3)], [], 1.0, 0.001)
+        self.assertEqual(v, ers.Coverage.COVERED)
+
+    def test_unknown_when_need_unknown(self):
+        v, tid = ers._coverage_verdict([self._rt(1.0, 5)], [], None, 0.001)
+        self.assertEqual(v, ers.Coverage.UNKNOWN)
+        self.assertEqual(tid, 5)
+
+    def test_unknown_when_a_qty_is_missing(self):
+        v, _ = ers._coverage_verdict([self._rt(None, 5)], [], 1.0, 0.001)
+        self.assertEqual(v, ers.Coverage.UNKNOWN)
+
+    def test_decimal_aggregation_no_float_drift(self):
+        # 0.1+0.2 em float = 0.30000000000000004; Decimal soma exata cobre 0.3
+        v, _ = ers._coverage_verdict([self._rt(0.1, 1), self._rt(0.2, 1)], [self._rt(0.1, 1)], 0.3, 0.0)
+        self.assertIn(v, (ers.Coverage.COVERED,))            # agregação exata, sem drift
 
 
 class HermeticNetTests(unittest.TestCase):

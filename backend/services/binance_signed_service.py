@@ -33,7 +33,7 @@ import os
 import time
 import logging
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 from urllib.parse import urlencode
 
 import httpx
@@ -751,6 +751,7 @@ async def place_protection_orders(
     tp1_qty_pct: float = 0.45,
     client_order_id_prefix: Optional[str] = None,
     dedup_live: bool = False,
+    mutation_guard: Optional[Callable[[], Awaitable[bool]]] = None,
     _progress: Optional[dict] = None,
 ) -> dict:
     """
@@ -924,6 +925,20 @@ async def place_protection_orders(
         last_msg: str | None = None
         submission_unknown = False
         for attempt in range(1, _ALGO_MAX_ATTEMPTS + 1):
+            # Invariante #6 (P03.1E): revalida o lease/claim IMEDIATAMENTE antes de
+            # CADA POST (tentativa, retry e fallback passam por aqui). Guard negando
+            # — ou levantando — aborta ANTES de qualquer mutação na corretora. Como
+            # nada foi enviado, submission_unknown=False (não é ambíguo: é sabidamente
+            # não-enviado). Sem guard, comportamento legado preservado.
+            if mutation_guard is not None:
+                try:
+                    _allowed = await mutation_guard()
+                except Exception as _mg_exc:  # noqa: BLE001
+                    log.error(f"[binance] {label.upper()} ABORTADO {sym}: mutation_guard exceção: {_mg_exc}")
+                    return False, None, f"mutation_guard exceção (fail-closed): {_mg_exc}", False
+                if not _allowed:
+                    log.error(f"[binance] {label.upper()} ABORTADO {sym}: mutation_guard negou (lease inválido) — sem POST")
+                    return False, None, (last_msg or "mutation_guard negou: lease/claim inválido"), False
             res = await _signed_request("POST", "/fapi/v1/algoOrder", params)
             if res.get("ok"):
                 algo_id = str((res.get("result") or {}).get("algoId") or "")

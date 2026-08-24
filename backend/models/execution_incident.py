@@ -46,7 +46,9 @@ class ExecutionIncident(Base):
     entry_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     conditional_prefix: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # IDs EXATOS de SL/TP1/TP2 (algoId/clientAlgoId) — sem prefix match amplo.
-    conditional_ids: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # none_as_null: Python None → SQL NULL (nunca o literal JSON 'null'). O contrato
+    # é SEMPRE objeto ou SQL NULL — nunca array/escalar/JSON-null.
+    conditional_ids: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
 
     side: Mapped[str | None] = mapped_column(String(8), nullable=True)   # buy|sell
     planned_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -54,7 +56,7 @@ class ExecutionIncident(Base):
     min_known_fill: Mapped[float | None] = mapped_column(Float, nullable=True)
     planned_stop: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
 
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     # Observações negativas em ciclos SEPARADOS antes de declarar cleanup.

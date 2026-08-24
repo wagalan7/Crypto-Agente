@@ -301,3 +301,70 @@ Defaults fail-closed preservados: `MAKER_ENTRY_ENABLED=false`,
 - Execução completa P01+P02+P03 (145) feita como AUXILIAR sob shim de teste externo
   (P01/P02 exigem Python ≥3.10; no 3.9 puro ficam BLOCKED). `py_compile` e
   `git diff --check` aprovados. Sem push/deploy.
+
+---
+
+## P03.1E — FINAL INVARIANT CLOSURE (2026-08-24)
+
+Runtime REAL disponível pela primeira vez: **Python 3.11.15** (sem shim),
+**SQLAlchemy 2.0.50 + asyncpg 0.31.0**, **PostgreSQL 16** local. O que em P03.1D
+ficou `POSTGRES_RUNTIME_TEST=BLOCKED` (driver async ausente) agora é **PASS** com
+código real, conexões distintas e concorrência real.
+
+### Os 8 invariantes — fechamento
+
+1. **Incidente aberto ⇒ pausa persistida (transação única).**
+   `record_incident` → `persist_incident_with_p03_pause`: 1 `AsyncSession`,
+   `BEGIN` → `pg_advisory_xact_lock(917283)` → `ensure_p03_pause_in_session` →
+   upsert do incidente → **COMMIT ÚNICO**. `asyncio.Lock` local serializa o mesmo
+   processo; advisory lock serializa entre processos. Provado em PG real com
+   **trigger `BEFORE INSERT` + `pg_sleep(0.6)`** e um `release_p03_pause`
+   concorrente em OUTRA conexão → resultado `STILL_OPEN` (nunca `RELEASED`) e
+   `trading_paused=true`.
+2. **UNKNOWN nunca vira FLAT/PROTECTED.** `_fresh_position` retorna
+   `quality=UNKNOWN` em stale/rate-limit/erro; `_resolve_protected` com cobertura
+   `UNKNOWN` agenda RETRY (não protege). Boot com posições stale → `UNKNOWN` +
+   quarentena.
+3. **Nenhuma mutação antes de validar posição e lado.** As 4 chamadas mutáveis
+   (`place_protection_orders`, `cancel_order`, 2× `cancel_algo_order`) são
+   precedidas por `_renew_or_abort` (lease). Lado fresh vs incidente conferido.
+4. **PROTECTED exige SL cardinal + RealTrade DETERMINÍSTICO.** Novo
+   `_coverage_verdict` (5 estados: COVERED/INSUFFICIENT/NO_MATCH/AMBIGUOUS/UNKNOWN)
+   por **agregação `Decimal` + tolerância = `stepSize`** (removidos 0,1%/50%).
+   **BUG corrigido:** RealTrade ambíguo (`target_id=None`) resolvia PROTECTED
+   silenciosamente — agora → MANUAL_REQUIRED. `stepSize` lido do cache de
+   `exchangeInfo` (leitura pura, sem rede).
+5. **Boot exige cobertura INTEGRAL.** `any(_real_trade_match)` (match parcial
+   contava como rastreado) → `_boot_coverage_ok` (agregação `Decimal` ≥ posição
+   fresh, tolerância `stepSize`). Cobertura parcial → UNTRACKED_POSITION.
+6. **Cada POST interno exige lease válido.** Novo argumento
+   `mutation_guard: Callable[[],Awaitable[bool]]` em `place_protection_orders`,
+   invocado em `_place_algo` **antes de CADA POST** (tentativa, retry e fallback).
+   Negar/lançar ⇒ **nenhum POST** (fail-closed, `submission_unknown=False`). P03
+   passa `mutation_guard=_renew_or_abort`.
+7. **JSON permanece objeto, nunca array/null.** `JSON(none_as_null=True)` em
+   `conditional_ids`/`payload` (Python `None` → SQL `NULL`, nunca JSON `'null'`);
+   guardas `jsonb_typeof`/`NULLIF` no upsert; união de IDs preservada
+   (`jsonb_agg(DISTINCT ...)`), `GREATEST` monotônico. Provado em PG real.
+8. **Owner P03 nunca sofre auto-resume.** `update_and_check` tinha DOIS pontos de
+   auto-resume (virada de semana e de dia) gated só por `not pause_manual` — como
+   a pausa P03 tem `pause_manual=false`, **ambos soltavam a quarentena** no
+   rollover. `_is_p03_pause(state)` agora bloqueia os dois. Provado em PG real
+   (RED→GREEN): pausa P03 sobrevive à virada de dia+semana com DD saudável.
+
+### Testes (RED→GREEN, real 3.11, sem shim)
+
+- **Integração PostgreSQL REAL** (`tests/pg_integration_p03.py` via
+  `tests/run_pg_runtime.sh`): cluster PG16 **descartável, socket unix**
+  (`listen_addresses=''`), **código real** (`record_incident`/`_SqlIncidentRepo`/
+  `risk_service`). **9 cenários** incl. concorrência 2-conexões com trigger+sleep,
+  reabertura, união JSON tri-state, rollback sem parcial, record-vs-resume,
+  sobrevivência ao auto-resume. **Hermeticidade provada**: guarda de socket
+  permite só **AF_UNIX** e bloqueia/conta **AF_INET/AF_INET6/DNS** → zero TCP.
+  `PG_INTEGRATION_OK`, rodado **2×**.
+- **Unittest** (venv311, herméticos): **161** testes (P03=101, P02 edge=16,
+  P02 trade-manager, hardening) verdes **2×**. Novos: `MutationGuardEdgeTests`
+  (guard antes de cada POST/fallback), `CoverageVerdictTests` (5 estados +
+  Decimal + stepSize), boot cobertura parcial→untracked / agregada→tracked,
+  ambíguo→MANUAL.
+- `py_compile` e `git diff --check` aprovados. Sem push/deploy.

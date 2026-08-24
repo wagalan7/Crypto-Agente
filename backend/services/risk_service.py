@@ -101,6 +101,13 @@ async def _compute_window_dd(session, hours: int) -> tuple[float, int]:
     return float(row[0]), int(row[1])
 
 
+def _is_p03_pause(state) -> bool:
+    """Pausa de owner P03 (quarentena de execução). Invariante #8: NUNCA é solta por
+    auto-resume (virada de dia/semana). Só o release estruturado — zero incidentes
+    abertos, mesma transação + advisory lock — pode removê-la."""
+    return (getattr(state, "pause_reason", None) or "").startswith(_P03_PAUSE_MARKER)
+
+
 async def update_and_check() -> dict:
     """
     Atualiza métricas de DD + decide se aciona pausa automática.
@@ -122,8 +129,8 @@ async def update_and_check() -> dict:
             # Não zera weekly aqui — semana tem seu próprio rollover
         if state.current_week_utc != week:
             state.current_week_utc = week
-            # Reseta pausa AUTOMÁTICA se estava ativa (não a manual)
-            if state.trading_paused and not state.pause_manual:
+            # Reseta pausa AUTOMÁTICA se estava ativa (não a manual, NUNCA a P03).
+            if state.trading_paused and not state.pause_manual and not _is_p03_pause(state):
                 log.info("Virada de semana — pausa automática resetada.")
                 state.trading_paused = False
                 state.pause_reason = None
@@ -145,7 +152,7 @@ async def update_and_check() -> dict:
         # Regra: se a pausa é automática (não manual), disparou num dia UTC
         # ANTERIOR e AMBOS os DD já voltaram pra dentro do limite → retoma.
         # Exigir weekly saudável impede soltar uma pausa SEMANAL cedo demais.
-        if state.trading_paused and not state.pause_manual and state.paused_at:
+        if state.trading_paused and not state.pause_manual and state.paused_at and not _is_p03_pause(state):
             _pa = state.paused_at
             if _pa.tzinfo is None:
                 _pa = _pa.replace(tzinfo=timezone.utc)
@@ -277,69 +284,90 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
         return _to_dict(state)
 
 
+async def ensure_p03_pause_in_session(session, reason: str) -> None:
+    """Garante RiskState pausado como P03 DENTRO da sessão/transação do CALLER (que
+    já detém `pg_advisory_xact_lock(_P03_PAUSE_LOCK)`). NÃO faz commit. Preserva
+    pausa manual/não-P03 do operador. Usado no caminho transacional único
+    pausa+incidente (P03.1E)."""
+    state = await _get_or_create_state(session)
+    now = datetime.now(timezone.utc)
+    cur = state.pause_reason or ""
+    if state.trading_paused and not cur.startswith(_P03_PAUSE_MARKER):
+        return   # pausa manual/não-P03 → preserva; o latch/pausa já bloqueia entradas
+    state.trading_paused = True
+    state.pause_manual = False
+    state.pause_reason = f"{_P03_PAUSE_MARKER} {reason}"
+    state.paused_at = state.paused_at or now
+    state.updated_at = now
+
+
 async def arm_p03_pause(reason: str) -> bool:
-    """Arma a pausa P03 ATOMICAMENTE sob `pg_advisory_xact_lock` (sem
-    `get_status→set_manual_pause` sujeito a corrida). Preserva pausa manual/não-P03
-    do operador (não sobrescreve). Retorna True se a pausa P03 ficou persistida."""
+    """Arma a pausa P03 ATOMICAMENTE sob `pg_advisory_xact_lock` (sessão própria)."""
     if not DB_ENABLED:
         return False
     from sqlalchemy import text
     async with get_session() as session:
         await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _P03_PAUSE_LOCK})
-        state = await _get_or_create_state(session)
-        cur = state.pause_reason or ""
-        if state.trading_paused and not cur.startswith(_P03_PAUSE_MARKER):
-            await session.commit()
-            return False   # pausa não-P03 do operador → preserva, latch P03 já bloqueia
-        state.trading_paused = True
-        state.pause_manual = False
-        state.pause_reason = f"{_P03_PAUSE_MARKER} {reason}"
-        state.paused_at = state.paused_at or datetime.now(timezone.utc)
-        state.updated_at = datetime.now(timezone.utc)
+        before = ((await _get_or_create_state(session)).pause_reason or "")
+        await ensure_p03_pause_in_session(session, reason)
         await session.commit()
-        return True
+        return True if not (before and not before.startswith(_P03_PAUSE_MARKER)) else False
 
 
-async def release_p03_pause(marker: str) -> bool:
-    """Resume owner-aware do P03 (P03.1C): CAS ATÔMICO real — um único
-    `UPDATE risk_state SET trading_paused=false,... WHERE id=1 AND trading_paused
-    AND pause_reason LIKE marker%` sob `pg_advisory_xact_lock` (exclusão mútua com
-    o arm). Se o operador/circuit-breaker/nova geração trocou a pausa (reason não
-    é mais P03), o WHERE não casa → rowcount 0 → NÃO altera nada. NÃO usa
-    `clear_execution_quarantine()` genérico; o latch P03 é limpo por owner="p03"."""
+# Resultados estruturados do release (P03.1E)
+RELEASE_RELEASED = "RELEASED"
+RELEASE_SAFE_OTHER_OWNER = "SAFE_OTHER_OWNER"
+RELEASE_STILL_OPEN = "STILL_OPEN"
+RELEASE_ERROR = "ERROR"
+
+
+async def release_p03_pause(marker: str) -> str:
+    """Release do P03 com RESULTADO ESTRUTURADO, tudo na MESMA transação + advisory
+    lock: (1) conta incidentes não resolvidos; falha na contagem → ERROR; (2) >0 →
+    STILL_OPEN; (3) pausa de outro owner (não-P03) → SAFE_OTHER_OWNER (preserva);
+    (4) zero incidentes + pausa P03 → remove SÓ a pausa P03 → RELEASED."""
     if not DB_ENABLED:
-        return False
+        return RELEASE_ERROR
     from sqlalchemy import update, text, func, select as _sel
     from models.risk_state import RiskState
     like = marker.replace("%", r"\%") + "%"
     async with get_session() as session:
-        await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _P03_PAUSE_LOCK})
-        # DENTRO da MESMA transação/lock: confirma zero incidentes não resolvidos.
-        # Invariante: nunca liberar com incidente P03 aberto (sem janela).
         try:
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _P03_PAUSE_LOCK})
             from models.execution_incident import ExecutionIncident
             open_p03 = (await session.execute(_sel(func.count(ExecutionIncident.id))
-                        .where(ExecutionIncident.resolved_at.is_(None)))).scalar() or 0
+                        .where(ExecutionIncident.resolved_at.is_(None)))).scalar()
+            if open_p03 is None:
+                await session.rollback()
+                return RELEASE_ERROR
+            if open_p03 > 0:
+                await session.commit()
+                return RELEASE_STILL_OPEN
+            state = await _get_or_create_state(session)
+            if not state.trading_paused:
+                await session.commit()
+                return RELEASE_RELEASED    # já não pausado
+            if not (state.pause_reason or "").startswith(marker):
+                await session.commit()
+                return RELEASE_SAFE_OTHER_OWNER   # pausa de outro owner → preserva
+            res = await session.execute(
+                update(RiskState).where(
+                    RiskState.id == 1, RiskState.trading_paused.is_(True),
+                    RiskState.pause_reason.like(like),
+                ).values(trading_paused=False, pause_manual=False, pause_reason=None,
+                         paused_at=None, updated_at=datetime.now(timezone.utc)))
+            await session.commit()
+            if (res.rowcount or 0) == 1:
+                log.warning("[circuit-breaker] P03 resume (zero incidentes, mesma txn) — pausa removida")
+                return RELEASE_RELEASED
+            return RELEASE_SAFE_OTHER_OWNER
         except Exception as exc:  # noqa: BLE001
-            await session.commit()
-            log.warning(f"[circuit-breaker] release P03: contagem falhou (fail-closed): {exc}")
-            return False
-        if open_p03 > 0:
-            await session.commit()
-            return False   # ainda há incidente aberto → mantém pausa
-        res = await session.execute(
-            update(RiskState).where(
-                RiskState.id == 1,
-                RiskState.trading_paused.is_(True),
-                RiskState.pause_reason.like(like),
-            ).values(trading_paused=False, pause_manual=False, pause_reason=None,
-                     paused_at=None, updated_at=datetime.now(timezone.utc))
-        )
-        await session.commit()
-        ok = (res.rowcount or 0) == 1
-        if ok:
-            log.warning("[circuit-breaker] P03 resume (CAS atômico, zero incidentes) — pausa removida")
-        return ok
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            log.warning(f"[circuit-breaker] release P03 ERROR (fail-closed): {exc}")
+            return RELEASE_ERROR
 
 
 async def list_events(days: int = 30, limit: int = 200) -> list[dict]:

@@ -412,5 +412,62 @@ class ProtectionProgressEdgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["protection_timeout"])
 
 
+class MutationGuardEdgeTests(unittest.IsolatedAsyncioTestCase):
+    """P03.1E / invariante #6: cada POST interno de proteção exige um lease válido.
+    `place_protection_orders` aceita `mutation_guard` e o invoca IMEDIATAMENTE antes
+    de cada POST (tentativa/retry/fallback). Guard nega (ou levanta) ⇒ NENHUM POST."""
+
+    async def _run(self, guard):
+        post = AsyncMock(return_value={"ok": True, "result": {"algoId": "sl-guarded"}})
+        with patch.object(
+            binance, "get_open_algo_orders", AsyncMock(return_value={"ok": True, "orders": []})
+        ), patch.object(
+            binance, "_round_qty", AsyncMock(side_effect=lambda _s, q: q)
+        ), patch.object(
+            binance, "_round_price", AsyncMock(side_effect=lambda _s, p: p)
+        ), patch.object(binance, "_signed_request", post):
+            result = await binance.place_protection_orders(
+                "BTCUSDT", "BUY", 1.0, stop_loss=90.0, mutation_guard=guard,
+            )
+        return result, post
+
+    async def test_guard_allows_lets_the_post_through_after_checking(self):
+        calls = {"n": 0}
+
+        async def guard():
+            calls["n"] += 1
+            return True
+
+        result, post = await self._run(guard)
+        self.assertTrue(result["sl_ok"])
+        self.assertEqual(result["sl_order_id"], "sl-guarded")
+        post.assert_awaited()                       # POST ocorreu
+        self.assertGreaterEqual(calls["n"], post.await_count)   # guard precedeu cada POST
+
+    async def test_guard_denies_blocks_every_post_and_fallback(self):
+        async def guard():
+            return False
+
+        result, post = await self._run(guard)
+        self.assertFalse(result["sl_ok"])
+        self.assertIsNone(result["sl_order_id"])
+        post.assert_not_awaited()                   # NENHUM POST (nem principal, nem fallback)
+
+    async def test_guard_exception_is_fail_closed_no_post(self):
+        async def guard():
+            raise RuntimeError("lease store indisponível")
+
+        result, post = await self._run(guard)
+        self.assertFalse(result["sl_ok"])
+        self.assertIsNone(result["sl_order_id"])
+        post.assert_not_awaited()                   # exceção do guard ⇒ fail-closed
+
+    async def test_no_guard_preserves_legacy_behavior(self):
+        result, post = await self._run(None)        # sem guard: comportamento inalterado
+        self.assertTrue(result["sl_ok"])
+        self.assertEqual(result["sl_order_id"], "sl-guarded")
+        post.assert_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

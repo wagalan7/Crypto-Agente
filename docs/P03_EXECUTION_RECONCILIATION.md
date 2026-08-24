@@ -290,3 +290,41 @@ contado como reprodução sem shim).
 - **Bybit live continua bloqueada.**
 - Nenhuma entry MARKET adicional criada; nenhuma exchange real acessada.
 - Nenhum push; nenhum deploy.
+
+---
+
+## Atualização P03.1E (2026-08-24) — runtime PostgreSQL real
+
+Com **Python 3.11 real + asyncpg + PostgreSQL 16**, o item antes BLOCKED
+(“real-repo via driver async”) passou a **PASS**. Mudanças de invariante:
+
+- **Transação única pausa+incidente** (`persist_incident_with_p03_pause`): um só
+  `BEGIN` com `pg_advisory_xact_lock(917283)`, pausa P03 e upsert do incidente no
+  **mesmo COMMIT**; `asyncio.Lock` local + advisory lock cobrem intra e
+  inter-processo. Provado com trigger `BEFORE INSERT`+`pg_sleep` e `release`
+  concorrente (→ `STILL_OPEN`).
+- **`release_p03_pause` estruturado**: `RELEASED` / `SAFE_OTHER_OWNER` /
+  `STILL_OPEN` / `ERROR`, contando incidentes não resolvidos NA transação;
+  `_maybe_release_quarantine` chama o release NO BANCO primeiro e só então limpa o
+  latch local do owner p03.
+- **Cobertura RealTrade tipada** (`_coverage_verdict`): COVERED / INSUFFICIENT /
+  NO_MATCH / AMBIGUOUS / UNKNOWN, por **agregação `Decimal` + tolerância
+  `stepSize`** (sem 0,1%/50%). **Ambíguo (`target_id=None`) nunca vira PROTECTED**
+  → MANUAL_REQUIRED. UNKNOWN → RETRY (nunca “seguro por omissão”).
+- **Boot com cobertura integral** (`_boot_coverage_ok`): substitui
+  `any(_real_trade_match)`; posição só é rastreada se o agregado das qty cobre o
+  tamanho fresh (tolerância `stepSize`). Cobertura parcial → UNTRACKED_POSITION.
+- **`mutation_guard` por POST**: `place_protection_orders(..., mutation_guard=…)`
+  revalida o lease em `_place_algo` **antes de cada POST/retry/fallback**; negar/
+  lançar ⇒ nenhum POST (fail-closed). P03 injeta `_renew_or_abort`.
+- **Auto-resume nunca solta P03**: `_is_p03_pause` bloqueia os dois pontos de
+  auto-resume (virada de dia/semana) para pausas de owner P03.
+- **`JSON(none_as_null=True)`** em `conditional_ids`/`payload`: `None` → SQL
+  `NULL` (nunca JSON `'null'`); normalização `jsonb_typeof`/`NULLIF` no upsert.
+
+**Validação:** integração PostgreSQL REAL (9 cenários, `PG_INTEGRATION_OK`, 2×) em
+cluster PG16 descartável por **socket unix**, com guarda de hermeticidade que só
+permite **AF_UNIX** e bloqueia/conta **AF_INET/AF_INET6/DNS** (zero TCP). Unittest
+herméticos **161** verdes 2× no venv311. `py_compile` e `git diff --check` OK.
+Sem push/deploy. **P04 continua NÃO implementado**; flags MAKER/TF/PYRAMIDING e
+Bybit live preservados.
