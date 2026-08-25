@@ -1216,6 +1216,18 @@ class VerifiedClosureTests(_AsyncBase):
         place.assert_not_called()                                   # nem cria proteção
         self.assertEqual((await ers._get_repo().list_all())[0]["state"], State.MANUAL_REQUIRED)
 
+    async def test_maker_unknown_zero_mutations(self):
+        await self._seed_entry(pending_maker=True)
+        self._set_fresh({"quality": "UNKNOWN", "size": None, "side": None})
+        cancel = AsyncMock(return_value={"ok": True}); place = AsyncMock()
+        with _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "NEW", "executed_qty": 0.0}),
+                        cancel_order=cancel, place_protection_orders=place,
+                        get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": []})):
+            await ers.reconcile_due()
+        cancel.assert_not_called()                                  # UNKNOWN não cancela maker
+        place.assert_not_called()                                   # UNKNOWN não cria proteção
+        self.assertEqual((await ers._get_repo().list_all())[0]["state"], State.RETRY_PENDING)
+
     async def test_db_off_skip_never_protected(self):
         await self._seed_entry()
         with patch.object(ers, "_match_real_trade", AsyncMock(return_value={"skip": True})), \
@@ -1256,6 +1268,59 @@ class VerifiedClosureTests(_AsyncBase):
         cids = (await ers._get_repo().get(key)).get("conditional_ids") or {}
         self.assertEqual(cids.get("sl"), "S1")                      # sl_id gravado no incidente
         self.assertIn("S1", (cids.get("all") or []))               # união histórica
+
+    async def test_second_read_flat_cleans_sl_before_resolving(self):
+        key = await self._seed_entry()
+        self._set_fresh({"quality": "FRESH", "size": 1.0, "side": "buy"},
+                        {"quality": "FRESH", "size": 0.0, "side": None})
+        listings = [
+            {"ok": True, "orders": []},                            # cria S1
+            {"ok": True, "orders": [_algo(algo_id="S1", side="SELL", close_position=True,
+                                                  trigger_price=100.0)]},  # cleanup encontra S1
+            {"ok": True, "orders": []},                            # cancel confirmado
+        ]
+        cancel = AsyncMock(return_value={"ok": True})
+        with _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
+                        get_open_algo_orders=AsyncMock(side_effect=listings),
+                        place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "S1"}),
+                        cancel_algo_order=cancel):
+            await ers.reconcile_due()
+        row = await ers._get_repo().get(key)
+        self.assertIsNone(row.get("resolved_at"))                    # quarentena permanece
+        self.assertNotEqual(row.get("state"), State.FLAT)            # aguarda grace de cleanup
+        cancel.assert_awaited_once_with("S1")
+        self.assertEqual((row.get("conditional_ids") or {}).get("sl"), "S1")
+
+    async def test_maker_sl_persisted_before_cancel_failure(self):
+        key = await self._seed_entry(pending_maker=True)
+        cancel = AsyncMock(return_value={"ok": False, "error": "probe"})
+        with _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "NEW", "executed_qty": 0.0}),
+                        get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": []}),
+                        place_protection_orders=AsyncMock(return_value={"sl_ok": True, "sl_order_id": "S-MAKER"}),
+                        cancel_order=cancel):
+            await ers.reconcile_due()
+        row = await ers._get_repo().get(key)
+        cids = row.get("conditional_ids") or {}
+        self.assertEqual(row.get("state"), State.RETRY_PENDING)
+        self.assertEqual(cids.get("sl"), "S-MAKER")                 # persistiu antes do cancel
+        self.assertIn("S-MAKER", cids.get("all") or [])
+
+    async def test_cleanup_sl_persisted_before_extra_cancel_failure(self):
+        await ers.record_incident(kind=Kind.CLEANUP_PENDING, symbol="BTC/USDT:USDT",
+                                  side="buy", planned_stop=100.0, planned_qty=1.0,
+                                  conditional_ids={"all": ["EX1"]})
+        key = (await ers._get_repo().list_open())[0]["incident_key"]
+        with patch.object(ers, "_cancel_extra_conditionals",
+                          AsyncMock(return_value=(False, "probe"))), \
+                _patch_bss(get_open_algo_orders=AsyncMock(return_value={"ok": True, "orders": []}),
+                           place_protection_orders=AsyncMock(return_value={"sl_ok": True,
+                                                                           "sl_order_id": "S-CLEAN"})):
+            await ers.reconcile_due()
+        row = await ers._get_repo().get(key)
+        cids = row.get("conditional_ids") or {}
+        self.assertEqual(row.get("state"), State.RETRY_PENDING)
+        self.assertEqual(cids.get("sl"), "S-CLEAN")                 # persistiu antes do cleanup extra
+        self.assertTrue({"EX1", "S-CLEAN"}.issubset(set(cids.get("all") or [])))
 
     async def test_mystery_sl_status_rejected(self):
         await self._seed_entry()

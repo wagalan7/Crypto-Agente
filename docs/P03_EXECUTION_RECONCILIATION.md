@@ -349,3 +349,12 @@ Bybit live preservados.
 Validação: 12 cenários PostgreSQL reais (2×), 171 unittests herméticos (2×),
 py_compile e git diff --check. Sem push/deploy. P04 não implementado; flags e Bybit
 live preservados.
+
+### Fechamento cirúrgico final
+
+- `FreshGate.UNKNOWN` no maker retorna antes de `cancel_order` (zero mutações).
+- `_ensure_stop` persiste imediatamente todo SL criado/adotado no incidente.
+- Segunda leitura `FLAT` após obter SL executa cleanup exato e grace antes de
+  resolver o incidente.
+- Validação final: **175 testes críticos 2×** e **12 cenários PostgreSQL 2×**,
+  todos aprovados; nenhuma rede/exchange externa, push ou deploy.

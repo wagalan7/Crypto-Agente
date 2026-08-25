@@ -1076,6 +1076,11 @@ async def _ensure_stop(key: str, owner: str, inc: dict, need_qty: Optional[float
         return False, None, "listagem algo stale/erro"
     adopted, aid, detail = _adopt_live_stop(inc, need_qty, listing)
     if adopted:
+        # O ID precisa ficar rastreável ANTES de qualquer ação seguinte do caller
+        # (cancel maker, cleanup de extras, retry ou crash). A gravação dentro de
+        # `_resolve_protected` continua como defesa idempotente.
+        if not await _persist_sl_in_incident(key, owner, inc, str(aid)):
+            return False, str(aid), "SL adotado, mas sl_id não foi persistido no incidente"
         return True, aid, detail
     if not RECONCILE_CREATE_SL:
         return False, None, "sem SL vivo válido (criação desabilitada)"
@@ -1099,7 +1104,12 @@ async def _ensure_stop(key: str, owner: str, inc: dict, need_qty: Optional[float
     except Exception as exc:  # noqa: BLE001
         return False, None, f"criação SL exceção: {exc}"
     if res and res.get("sl_ok") is True and res.get("sl_order_id"):
-        return True, str(res.get("sl_order_id")), f"SL criado ({_mask(res.get('sl_order_id'))})"
+        sl_id = str(res.get("sl_order_id"))
+        # Persistência IMEDIATA: nenhum retorno/cancelamento posterior pode deixar
+        # um SL recém-criado sem identidade no incidente.
+        if not await _persist_sl_in_incident(key, owner, inc, sl_id):
+            return False, sl_id, "SL criado, mas sl_id não foi persistido no incidente"
+        return True, sl_id, f"SL criado ({_mask(sl_id)})"
     return False, None, f"criação SL não confirmada (sl_ok={res.get('sl_ok') if res else None})"
 
 
@@ -1396,7 +1406,10 @@ async def _resolve_protected(key: str, owner: str, inc: dict, sl_id: Optional[st
                               "2ª leitura fresh UNKNOWN — nunca PROTECTED sem confirmar posição")
         return
     if size is None or size <= 0:
-        await _resolve(key, owner, State.FLAT, f"2ª leitura fresh FLAT — posição sumiu ({detail})")
+        # O SL já foi persistido no incidente. Não resolver FLAT enquanto essa
+        # condicional exata puder continuar viva: encaminha diretamente ao cleanup
+        # usando a leitura FLAT que acabamos de confirmar e mantém a quarentena.
+        await _reconcile_cleanup(key, owner, inc, confirmed_flat=True)
         return
     if inc_side is None or fresh_side is None or fresh_side != inc_side:
         await _fenced(key, owner, state=State.MANUAL_REQUIRED,
@@ -1494,7 +1507,10 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
                 _prot_ok, _psl, _prot = await _ensure_stop(key, owner, inc, max(_finite(fp.get("size")) or 0.0, obs or 0.0))
                 _prot_lbl = f"exposição protegida ({_prot})" if _prot_ok else f"SL_NOT_CONFIRMED ({_prot})"
             elif gate == FreshGate.UNKNOWN:
-                _prot_lbl = "UNKNOWN_NO_SL (posição pós-fill incerta)"
+                # UNKNOWN nunca autoriza mutação, inclusive cancelamento da maker.
+                await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
+                                      "posição UNKNOWN com maker viva — zero mutações; mantém quarentena")
+                return
             else:  # FLAT com entry ainda pendente/incerta
                 _prot_lbl = "PENDING_ORDER_UNPROTECTED (entry pendente, sem posição)"
             if not await _renew_or_abort(key, owner):
@@ -1613,9 +1629,18 @@ async def _cancel_extra_conditionals(key: str, owner: str, inc: dict, keep_id: O
     return False, "cancel incerto/extra persiste"
 
 
-async def _reconcile_cleanup(key: str, owner: str, inc: dict) -> None:
+async def _reconcile_cleanup(key: str, owner: str, inc: dict, *, confirmed_flat: bool = False) -> None:
+    """Reconcilia condicionais do incidente.
+
+    `confirmed_flat=True` é usado somente quando `_resolve_protected` acabou de
+    obter a segunda leitura FRESH/FLAT. Isso evita uma nova leitura e, sobretudo,
+    impede resolver FLAT antes de cancelar/reconfirmar as condicionais exatas.
+    """
     from services import binance_signed_service as bss
-    gate, fp = await _fresh_gate(inc)
+    if confirmed_flat:
+        gate, fp = FreshGate.FLAT, {"quality": "FRESH", "size": 0.0, "side": None}
+    else:
+        gate, fp = await _fresh_gate(inc)
     if gate == FreshGate.UNKNOWN:
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, "posição/listagem incerta")
         return

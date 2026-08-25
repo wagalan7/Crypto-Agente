@@ -428,3 +428,15 @@ e brechas remanescentes do caminho PROTECTED.
   `record||update` / rollover), `PG_INTEGRATION_OK` **2×**, socket unix, hermeticidade
   AF_UNIX-only (zero TCP/DNS). **Unittest herméticos 171 verdes 2×**. `py_compile` e
   `git diff --check` OK. Sem push/deploy.
+
+### Fechamento cirúrgico dos três casos adversariais finais
+
+- Maker com posição `UNKNOWN` agora retorna `RETRY_PENDING` antes de qualquer
+  cancelamento ou criação de proteção.
+- Todo SL criado/adotado é persistido imediatamente em `conditional_ids.sl/all`
+  dentro de `_ensure_stop`, antes de cancelamentos, cleanup ou qualquer retorno.
+- Se a segunda leitura pós-SL confirmar `FLAT`, o incidente segue para o cleanup
+  exato da condicional e permanece aberto durante o grace; não resolve mais `FLAT`
+  deixando SL vivo.
+- Quatro regressões novas elevam a suíte crítica para **175 testes, verdes 2×**;
+  os 12 cenários PostgreSQL reais também passaram **2×**.
