@@ -1536,8 +1536,15 @@ def dash_contracts_list(request: Request):
     tenant = _get_tenant_by_token(token)
     out = []
     for c in db.list_contracts_for_tenant(tenant["id"]):
+        # Nome: se o contrato foi criado antes de o cadastro ter nome (ou direto
+        # de um número), o patient_name gravado fica vazio. Puxa o nome ATUAL do
+        # cadastro (casa variações do telefone) para não mostrar só o número.
+        nm = (c.get("patient_name") or "").strip()
+        if not nm:
+            p = db.get_patient(tenant["id"], c["phone"])
+            nm = ((p.get("name") if p else "") or "").strip()
         out.append({
-            "id": c["id"], "phone": c["phone"], "patient_name": c.get("patient_name") or "",
+            "id": c["id"], "phone": c["phone"], "patient_name": nm,
             "status": c.get("status"), "template_version": c.get("template_version"),
             "sent_at": c.get("sent_at"), "signed_at": c.get("signed_at"),
             "expires_at": c.get("expires_at"), "token": c.get("token"),
@@ -1630,6 +1637,48 @@ async def dash_contract_resend(contract_id: int, request: Request):
     if not ok and reason == "contrato já assinado":
         raise HTTPException(status_code=409, detail="Este contrato já foi assinado.")
     return {"status": "sent" if ok else "fail", "sent": ok, "reason": reason if not ok else ""}
+
+
+@app.delete("/dashboard/api/contracts/{contract_id}")
+def dash_contract_delete(contract_id: int, request: Request):
+    """Remove um contrato da lista do painel (ex-paciente que recebeu por engano).
+    Hard delete do registro + lembretes; não notifica o paciente nem toca no
+    template/cadastro."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    contract = db.get_contract(contract_id)
+    if not contract or contract["tenant_id"] != tenant["id"]:
+        raise HTTPException(status_code=404, detail="Contrato não encontrado.")
+    db.delete_contract(contract_id)
+    return {"status": "deleted", "id": contract_id}
+
+
+class ContractRenameBody(BaseModel):
+    name: str
+
+
+@app.patch("/dashboard/api/contracts/{contract_id}/name")
+def dash_contract_rename(contract_id: int, body: ContractRenameBody, request: Request):
+    """Define/corrige o nome do paciente de um contrato criado só com o número.
+    Grava no contrato (efeito imediato na lista) e persiste no cadastro (casa
+    variantes do telefone) para propagar à agenda/cobrança/agente e a futuros
+    contratos."""
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    contract = db.get_contract(contract_id)
+    if not contract or contract["tenant_id"] != tenant["id"]:
+        raise HTTPException(status_code=404, detail="Contrato não encontrado.")
+    new_name = "".join(ch for ch in (body.name or "") if ch.isprintable()).strip()[:100]
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Nome inválido.")
+    db.set_contract_patient_name(contract_id, new_name)
+    # Persiste no cadastro também — assim o nome aparece na agenda/cobrança e o
+    # agente para de tratar como número. Reaproveita a rotina canônica de rename.
+    try:
+        db.rename_patient_everywhere(tenant["id"], contract["phone"], new_name)
+    except Exception:
+        logger.exception(f"[{tenant['slug']}] rename cadastro falhou p/ contrato #{contract_id}")
+    return {"status": "ok", "id": contract_id, "name": new_name}
 
 
 class ContractTemplateBody(BaseModel):
