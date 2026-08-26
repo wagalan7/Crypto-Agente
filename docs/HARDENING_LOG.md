@@ -440,3 +440,46 @@ e brechas remanescentes do caminho PROTECTED.
   deixando SL vivo.
 - Quatro regressões novas elevam a suíte crítica para **175 testes, verdes 2×**;
   os 12 cenários PostgreSQL reais também passaram **2×**.
+
+---
+
+## P04A — REVALIDAÇÃO FAIL-CLOSED PRÉ-MAKER (2026-08-25)
+
+Base: `57938e87` (`origin/main`, P03 final). Implementação isolada em
+`codex/hardening-p04a`, sem push/deploy. Detalhes em
+`docs/P04_ENTRY_REVALIDATION.md`.
+
+### Implementado
+
+- Cotação Binance `bookTicker` sem cache, na mesma BASE/modo/proxy do executor,
+  compartilhando rate gate e cooldown 418/429. O header de peso deste endpoint,
+  documentado como inexato, não contamina o throttle global.
+- Avaliador puro/Decimal para venue/símbolo, bid/ask/qty, freshness local e da
+  exchange, latência, spread, chase/slippage LONG/SHORT, GTX não-cruzada, zona,
+  níveis, R:R TP1/TP2 e qty que nunca aumenta.
+- Callback executado no helper maker depois de arredondar preço/qty e confirmar
+  leverage, imediatamente antes do primeiro POST de entrada. Depois da quote,
+  revalida RiskState, kill switch e quarentena; o POST é o próximo `await` quando
+  aprovado. UNKNOWN/exceção/veto retorna `entry_not_submitted` e produz zero POST
+  de entrada.
+- Reason codes registrados no `_record_skip` existente; nenhuma tabela/API/UI.
+- `MAKER_ENTRY_ENABLED=false` preservado. `MAKER_FALLBACK_MARKET` passou a default
+  false e o caller força zero fallback até a P04B.
+- Maker ligado sem helper maker agora bloqueia, sem downgrade para MARKET. A qty
+  realmente submetida acompanha respostas ambíguas e alimenta o incidente P03.
+
+### Validação
+
+- Testes P04A herméticos, com DNS/TCP bloqueados e contabilizados: LONG/SHORT,
+  favorável/chase, freshness, NaN/infinito, venue/símbolo, spread/slippage/R:R
+  nos limites, qty monotônica, runtime gates, rate-limit, exceção e zero POST de
+  entrada/zero MARKET.
+- **26 testes P04A** verdes. Suíte crítica P01+P02+P03+P04A: **201 testes,
+  verdes 2×**, no Python 3.11 real.
+- `py_compile` e `git diff --check` aprovados; revisão independente sem
+  bloqueadores.
+
+### Fora do escopo
+
+- P04B (MARKET direto/fallback, depth/slippage por qty e freshness contextual);
+  nenhuma estratégia/score/IA; nenhuma ativação de maker/live; nenhum push/deploy.

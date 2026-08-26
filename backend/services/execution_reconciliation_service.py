@@ -190,9 +190,10 @@ def assemble_entry_incident(order_res: dict, rec: dict, *, closed: bool = False,
                             snapshot_id=None, local_client_order_id=None,
                             local_planned_qty=None) -> dict:
     """Monta os kwargs de `record_incident` a partir dos dados REAIS do caller.
-    Usa `local_client_order_id`/`local_planned_qty` (vars locais do caller) como
-    fonte primária. Reconhece o contrato maker real (incl. emissão GTX ambígua sem
-    `status`) e evita falso-pending quando `entry_order_terminal=true`."""
+    Usa a `submitted_qty` confirmada pelo executor antes do fallback local;
+    `local_client_order_id`/`local_planned_qty` cobrem callers legados. Reconhece
+    o contrato maker real (incl. emissão GTX ambígua sem `status`) e evita
+    falso-pending quando `entry_order_terminal=true`."""
     order_res = order_res or {}
     rec = rec or {}
     coid = (local_client_order_id or order_res.get("client_order_id")
@@ -219,8 +220,16 @@ def assemble_entry_incident(order_res: dict, rec: dict, *, closed: bool = False,
         if v:
             cond_ids[k] = str(v)
     eoid = result.get("orderId") or order_res.get("entry_order_id")
-    planned_qty = (local_planned_qty if local_planned_qty is not None
-                   else (rec.get("qty") or rec.get("position_size")))
+    submitted_qty = _finite(order_res.get("submitted_qty"))
+    if submitted_qty is not None and submitted_qty <= 0:
+        submitted_qty = None
+    planned_qty = (
+        submitted_qty if submitted_qty is not None
+        else (
+            local_planned_qty if local_planned_qty is not None
+            else (rec.get("qty") or rec.get("position_size"))
+        )
+    )
     return dict(
         kind=kind, symbol=rec.get("symbol"),
         side=rec.get("direction") or rec.get("side"),

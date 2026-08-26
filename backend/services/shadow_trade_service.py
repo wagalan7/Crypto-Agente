@@ -103,6 +103,53 @@ def execution_quarantine_owners() -> set:
     return set(_EXECUTION_QUARANTINE_OWNERS)
 
 
+async def _p04a_runtime_recheck(risk_service, kill_switch_service) -> dict:
+    """Reusa os gates live no último instante; qualquer incerteza bloqueia."""
+    if _EXECUTION_QUARANTINE_REASON:
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_QUARANTINE_ACTIVE",
+            "reason": f"execution quarantine={_EXECUTION_QUARANTINE_REASON}",
+            "checks": {},
+        }
+    try:
+        if await risk_service.is_paused():
+            return {
+                "ok": False, "quality": "UNKNOWN",
+                "reason_code": "EXEC_RISK_PAUSED",
+                "reason": "RiskState pausado no preflight final",
+                "checks": {},
+            }
+        kill_state = await kill_switch_service.check_can_trade()
+    except Exception as exc:
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_RUNTIME_GUARD_ERROR",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "checks": {},
+        }
+    if not isinstance(kill_state, dict) or kill_state.get("allowed") is not True:
+        reason = (
+            kill_state.get("reason")
+            if isinstance(kill_state, dict) else "resposta inválida"
+        )
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_KILL_SWITCH_BLOCKED",
+            "reason": str(reason or "kill switch bloqueou a entrada"),
+            "checks": {},
+        }
+    # Uma quarentena pode ter sido armada enquanto os gates persistidos eram lidos.
+    if _EXECUTION_QUARANTINE_REASON:
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_QUARANTINE_ACTIVE",
+            "reason": f"execution quarantine={_EXECUTION_QUARANTINE_REASON}",
+            "checks": {},
+        }
+    return {"ok": True, "quality": "FRESH", "checks": {}}
+
+
 async def _persist_execution_quarantine(reason: str) -> None:
     """Arma latch local primeiro e persiste a pausa quando o DB responder."""
     _arm_execution_quarantine(reason)
@@ -477,9 +524,11 @@ MAKER_ENTRY_ENABLED = os.getenv("MAKER_ENTRY_ENABLED", "false").strip().lower() 
 # Fallback do maker: se a LIMIT post-only não preencher no timeout, cair a
 # MERCADO (true) ou DESISTIR da entrada (false). Chasing a mercado após o preço
 # fugir do limit é justamente o que gera "entrada atrasada" (TP1 curto, SL caro);
-# com false, no-fill = sem trade (não persegue). Default true = comportamento
-# atual. Só tem efeito quando MAKER_ENTRY_ENABLED=true.
-MAKER_FALLBACK_MARKET = os.getenv("MAKER_FALLBACK_MARKET", "true").strip().lower() in ("1", "true", "yes")
+# com false, no-fill = sem trade (não persegue). O default agora é seguro:
+# P04A: default seguro é false. A política de revalidação imediatamente antes
+# de um fallback MARKET pertence à P04B; enquanto ela não estiver integrada, a
+# P04A força zero fallback mesmo se uma configuração antiga pedir true.
+MAKER_FALLBACK_MARKET = os.getenv("MAKER_FALLBACK_MARKET", "false").strip().lower() in ("1", "true", "yes")
 
 # ── #2b Orçamento de RISCO aberto agregado (soma do R em risco das posições) ──
 # Diferente dos caps de notional/margem (tamanho/garantia): este soma o RISCO
@@ -832,6 +881,28 @@ DAILY_PROFIT_TARGET_R = float(os.getenv("DAILY_PROFIT_TARGET_R", "3.0"))  # +3R 
 LIQUIDITY_GATE_ENABLED = os.getenv("LIQUIDITY_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 MIN_QUOTE_VOL_24H_USD = float(os.getenv("MIN_QUOTE_VOL_24H_USD", "10000000"))  # $10M/24h
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.25"))                    # 0.25%
+
+# ── P04A: cotação da venue ativa + revalidação pré-maker ───────────────────
+# Só atua no caminho MAKER (que permanece OFF por default). A validação nasce
+# ON para que ligar MAKER_ENTRY_ENABLED não possa contornar o guard por engano.
+# P04B fará a integração equivalente no fallback MARKET; até lá ele é forçado
+# OFF no caller abaixo.
+P04A_ENTRY_REVALIDATION_ENABLED = os.getenv(
+    "P04A_ENTRY_REVALIDATION_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+P04A_QUOTE_TIMEOUT_S = max(0.1, float(os.getenv("P04A_QUOTE_TIMEOUT_S", "1.5")))
+P04A_MAX_QUOTE_AGE_MS = max(0.0, float(os.getenv("P04A_MAX_QUOTE_AGE_MS", "1500")))
+P04A_MAX_FETCH_LATENCY_MS = max(
+    0.0, float(os.getenv("P04A_MAX_FETCH_LATENCY_MS", "1500"))
+)
+P04A_MAX_ADVERSE_SLIPPAGE_PCT = max(
+    0.0, float(os.getenv("P04A_MAX_ADVERSE_SLIPPAGE_PCT", "0.10"))
+)
+_P04A_MAX_CHASE_ATR_RAW = os.getenv("P04A_MAX_CHASE_ATR", "").strip()
+P04A_MAX_CHASE_ATR = (
+    max(0.0, float(_P04A_MAX_CHASE_ATR_RAW))
+    if _P04A_MAX_CHASE_ATR_RAW else None
+)
 
 # ── Exec size damper (liquidez/ATR-aware) ───────────────────────────────────
 # O gate de ATR/liquidez é BINÁRIO (bloqueia ou não). Mas o postmortem (LINK,
@@ -1858,6 +1929,14 @@ def env_info() -> dict:
         "breakout_lane_max_atr": BREAKOUT_LANE_MAX_ATR,
         "breakout_lane_min_adx": BREAKOUT_LANE_MIN_ADX,
         "proximity_max_atr": PROXIMITY_MAX_ATR,
+        "p04a_entry_revalidation_enabled": P04A_ENTRY_REVALIDATION_ENABLED,
+        "p04a_quote_timeout_s": P04A_QUOTE_TIMEOUT_S,
+        "p04a_max_quote_age_ms": P04A_MAX_QUOTE_AGE_MS,
+        "p04a_max_fetch_latency_ms": P04A_MAX_FETCH_LATENCY_MS,
+        "p04a_max_adverse_slippage_pct": P04A_MAX_ADVERSE_SLIPPAGE_PCT,
+        "p04a_max_chase_atr_override": P04A_MAX_CHASE_ATR,
+        "maker_fallback_market_requested": MAKER_FALLBACK_MARKET,
+        "maker_fallback_market_effective": False,  # reservado à P04B
         # #1 runner com trailing pós-TP2 (DEFAULT OFF) — mecânica no trade_manager
         "runner_enabled": os.getenv("RUNNER_ENABLED", "false").strip().lower() in ("1", "true", "yes"),
         "runner_qty_pct": float(os.getenv("RUNNER_QTY_PCT", "0.20")),
@@ -4125,6 +4204,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             tier = rec.get("tier")
             if tier not in ("A+", "A"):
                 continue
+            _p04a_chase_ceiling = (
+                (P04A_MAX_CHASE_ATR if P04A_MAX_CHASE_ATR is not None else PROXIMITY_MAX_ATR)
+                if PROXIMITY_GATE_ENABLED else 0.0
+            )
 
             # ── News gate: durante blackout macro, nenhuma entrada nova.
             if _news_blackout is not None:
@@ -4163,6 +4246,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     _bl_ok, _bl_reason = await _breakout_lane_qualifies(rec)
                     if _bl_ok:
                         _prox_ceiling = BREAKOUT_LANE_MAX_ATR
+                        if P04A_MAX_CHASE_ATR is None:
+                            _p04a_chase_ceiling = _prox_ceiling
                         log.info(
                             f"[breakout-lane] {rec.get('symbol')} {_bl_reason} → teto "
                             f"proximity {PROXIMITY_MAX_ATR}→{BREAKOUT_LANE_MAX_ATR}×ATR"
@@ -4922,7 +5007,13 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 log.warning(f"[shadow] snapshot_id não achado pra {rec.get('symbol')} — pulando")
                 continue
 
-            side = "long" if rec.get("direction") == "long" else "short"
+            from services.entry_revalidation_service import normalize_entry_side
+            side = normalize_entry_side(rec.get("direction"))
+            if side is None:
+                _reason = "direção ausente ou inválida; entrada não pode inferir SELL"
+                log.error(f"[p04a][entry-side] {rec.get('symbol')} {_reason} — skip")
+                _record_skip(rec, "entry-side", f"EXEC_SIDE_INVALID: {_reason}")
+                continue
             tp1 = None
             sig = rec.get("signal") or {}
             if isinstance(sig, dict):
@@ -5072,11 +5163,115 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 client_order_id = f"cw-{snap_id}"  # crypto-win + snap id
                 # #4: entrada MAKER (post-only) quando ligada E o helper existe na
                 # exchange ativa (Binance). Posta LIMIT GTX no entry planejado e só
-                # protege após o fill; se não preencher → fallback MARKET interno.
+                # protege após o fill; sem P04B, no-fill desiste (não persegue).
                 # Mantém o MESMO shape de retorno (sl_ok/tp1_ok/tp2_ok) → o resto do
                 # fluxo (guard "sem stop", captura de IDs) não muda.
                 _maker_fn = getattr(exchange_service, "place_maker_entry_then_protect", None)
-                if MAKER_ENTRY_ENABLED and _maker_fn is not None:
+                from services.entry_revalidation_service import select_entry_route
+                _entry_route = select_entry_route(
+                    maker_enabled=MAKER_ENTRY_ENABLED,
+                    maker_available=_maker_fn is not None,
+                    preflight_enabled=P04A_ENTRY_REVALIDATION_ENABLED,
+                )
+                if _entry_route == "blocked":
+                    _reason = "MAKER_ENTRY_ENABLED=true, mas capability maker está indisponível"
+                    log.error(f"[p04a][entry-route] {rec['symbol']} {_reason} — skip")
+                    _record_skip(rec, "entry-route", f"EXEC_MAKER_UNAVAILABLE: {_reason}")
+                    continue
+                if _entry_route == "blocked-preflight":
+                    _reason = "P04A_ENTRY_REVALIDATION_ENABLED=false com maker ligado"
+                    log.error(f"[p04a][entry-route] {rec['symbol']} {_reason} — skip")
+                    _record_skip(rec, "entry-route", f"EXEC_PREFLIGHT_DISABLED: {_reason}")
+                    continue
+                if _entry_route == "maker":
+                    _entry_preflight = None
+                    if P04A_ENTRY_REVALIDATION_ENABLED:
+                        async def _entry_preflight(final_limit_price: float, final_qty: float) -> dict:
+                            """Roda dentro do helper maker imediatamente antes do POST."""
+                            quote_fn = getattr(exchange_service, "get_execution_quote", None)
+                            if quote_fn is None:
+                                return {
+                                    "ok": False,
+                                    "quality": "UNKNOWN",
+                                    "reason_code": "EXEC_QUOTE_UNSUPPORTED",
+                                    "reason": "exchange ativa não fornece cotação de execução fresca",
+                                    "checks": {},
+                                }
+                            try:
+                                quote = await quote_fn(
+                                    rec["symbol"], timeout_s=P04A_QUOTE_TIMEOUT_S
+                                )
+                            except Exception as exc:
+                                return {
+                                    "ok": False,
+                                    "quality": "UNKNOWN",
+                                    "reason_code": "EXEC_QUOTE_FETCH_ERROR",
+                                    "reason": f"{type(exc).__name__}: {exc}",
+                                    "checks": {},
+                                }
+
+                            runtime_guard = await _p04a_runtime_recheck(
+                                risk_service, kill_switch_service
+                            )
+                            if runtime_guard.get("ok") is not True:
+                                return runtime_guard
+
+                            _sig = rec.get("signal") or {}
+                            _ind = _sig.get("indicators") if isinstance(_sig, dict) else {}
+                            try:
+                                _atr = float((_ind or {}).get("atr"))
+                            except (TypeError, ValueError):
+                                _atr = None
+                            from services.entry_revalidation_service import (
+                                cap_qty_for_revalidated_entry,
+                                evaluate_entry_revalidation,
+                            )
+                            verdict = evaluate_entry_revalidation(
+                                quote=quote,
+                                symbol=rec["symbol"],
+                                side=side,
+                                planned_entry=entry,
+                                stop_loss=stop,
+                                tp1=float(tp1) if tp1 is not None else None,
+                                tp2=float(tp2) if tp2 is not None else None,
+                                atr=_atr,
+                                max_quote_age_ms=P04A_MAX_QUOTE_AGE_MS,
+                                max_fetch_latency_ms=P04A_MAX_FETCH_LATENCY_MS,
+                                max_spread_pct=MAX_SPREAD_PCT,
+                                max_chase_atr=_p04a_chase_ceiling,
+                                min_rr_tp1=max(
+                                    MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
+                                    MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0,
+                                ),
+                                min_rr_tp2=(
+                                    MIN_RR_TP2_EXEC if RR_GATE_ENABLED else 0.0
+                                ),
+                                maker_limit_price=final_limit_price,
+                                entry_zone_low=rec.get("entry_zone_low"),
+                                entry_zone_high=rec.get("entry_zone_high"),
+                                max_adverse_slippage_pct=P04A_MAX_ADVERSE_SLIPPAGE_PCT,
+                                enforce_adverse_slippage=True,
+                            )
+                            checks = verdict.setdefault("checks", {})
+                            # No caminho maker o preço final é a própria LIMIT;
+                            # ainda assim fixa o contrato de que revalidar qty só
+                            # pode manter ou reduzir, nunca ampliar a exposição.
+                            capped_qty = cap_qty_for_revalidated_entry(
+                                final_qty, entry, stop, final_limit_price
+                            )
+                            checks["planned_qty"] = float(final_qty)
+                            checks["capped_qty"] = float(capped_qty)
+                            if capped_qty <= 0 or capped_qty > final_qty:
+                                return {
+                                    "ok": False,
+                                    "quality": "UNKNOWN",
+                                    "reason_code": "EXEC_QTY_REVALIDATION_FAILED",
+                                    "reason": "qty não pôde ser revalidada sem aumentar exposição",
+                                    "checks": checks,
+                                }
+                            verdict["approved_qty"] = float(capped_qty)
+                            return verdict
+
                     order_res = await _maker_fn(
                         symbol=rec["symbol"],
                         side=exch_side,
@@ -5088,14 +5283,17 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         tp1_qty_pct=_open_tp1_pct,
                         leverage=int(rec.get("leverage") or 1),
                         client_order_id=client_order_id,
-                        fallback_market=MAKER_FALLBACK_MARKET,
+                        # P04B ainda não foi implementada: com P04A ativa,
+                        # nenhuma rejeição/timeout maker pode cair a MARKET.
+                        fallback_market=False,
+                        entry_preflight=_entry_preflight,
                     )
                     if isinstance(order_res, dict) and order_res.get("ok"):
                         log.info(
                             f"[shadow→live] entrada {rec['symbol']} via "
                             f"{'MAKER' if order_res.get('was_maker') and not order_res.get('fell_back_to_market') else 'MARKET(fallback)'}"
                         )
-                else:
+                else:  # MARKET direto somente quando MAKER_ENTRY_ENABLED=false
                     order_res = await exchange_service.place_order(
                         symbol=rec["symbol"],
                         side=exch_side,
@@ -5210,6 +5408,14 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         # alerta são a fonte de verdade; não inventa trade no DB.
                         continue
                 if not order_res.get("ok") and not _track_unprotected_incident:
+                    if order_res.get("preflight_failed"):
+                        _code = order_res.get("reason_code") or "EXEC_PREFLIGHT_BLOCKED"
+                        _reason = order_res.get("error") or "revalidação pré-entrada bloqueou"
+                        log.info(
+                            f"[p04a][entry-preflight] {rec['symbol']} {_code}: {_reason} — skip"
+                        )
+                        _record_skip(rec, "entry-preflight", f"{_code}: {_reason}")
+                        continue
                     # no_fill = maker post-only não preencheu e fallback_market=false
                     # (não perseguiu a mercado). É skip esperado, não erro.
                     if order_res.get("no_fill"):

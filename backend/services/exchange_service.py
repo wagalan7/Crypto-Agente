@@ -59,10 +59,12 @@ else:
         return {"ok": False, "error": f"get_open_algo_orders não suportado em {ACTIVE_EXCHANGE}"}
 # place_maker_entry_then_protect (#4) — entrada post-only desacoplada da proteção.
 # Feature da Binance (usa GTX + algo orders). Em outra exchange NÃO existe stub:
-# expomos só se o cliente ativo tiver, e o caller (shadow_trade) faz getattr →
-# se ausente, cai automaticamente no place_order MARKET.
+# expomos só se o cliente ativo tiver. Com MAKER_ENTRY_ENABLED=true, o caller
+# bloqueia se a capability estiver ausente; nunca degrada silenciosamente a MARKET.
 if hasattr(_client, "place_maker_entry_then_protect"):
     place_maker_entry_then_protect = _client.place_maker_entry_then_protect
+if hasattr(_client, "get_execution_quote"):
+    get_execution_quote = _client.get_execution_quote
 if hasattr(_client, "place_protection_orders"):
     place_protection_orders = _client.place_protection_orders
 if hasattr(_client, "get_order"):

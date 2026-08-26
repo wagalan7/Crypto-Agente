@@ -289,7 +289,13 @@ def _build_signed_url(path: str, params: Optional[dict] = None) -> str:
     return f"{BASE}{path}?{qs}&signature={sig}"
 
 
-async def _signed_request(method: str, path: str, params: Optional[dict] = None) -> dict:
+async def _signed_request(
+    method: str,
+    path: str,
+    params: Optional[dict] = None,
+    *,
+    request_preflight: Optional[Callable[[], Awaitable[object]]] = None,
+) -> dict:
     global _ban_until_ms, _throttle_until_ms, _used_weight_1m
     if not is_configured():
         return {
@@ -312,6 +318,49 @@ async def _signed_request(method: str, path: str, params: Optional[dict] = None)
     #    pausa dura de 15s; antes era fixo 2s e não segurava o burst).
     if now_ms < _throttle_until_ms:
         await asyncio.sleep(min(_MAX_THROTTLE_SLEEP_S, max(0.0, (_throttle_until_ms - now_ms) / 1000.0)))
+
+    # Guard opcional de mutação: roda DEPOIS de toda espera já conhecida e
+    # imediatamente antes de assinar/enviar. É essencial para decisões baseadas
+    # em quote/lease: validá-las antes do throttle permitiria usar estado vencido.
+    if request_preflight is not None:
+        try:
+            verdict = await request_preflight()
+        except Exception as exc:  # noqa: BLE001 — mutação essencial falha fechada
+            verdict = {
+                "ok": False,
+                "quality": "UNKNOWN",
+                "reason_code": "EXEC_PREFLIGHT_ERROR",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        approved = verdict is True or (
+            isinstance(verdict, dict) and verdict.get("ok") is True
+        )
+        if not approved:
+            detail = verdict if isinstance(verdict, dict) else {}
+            return {
+                "ok": False,
+                "_preflight": True,
+                "_request_sent": False,
+                "reason_code": str(
+                    detail.get("reason_code") or "EXEC_PREFLIGHT_BLOCKED"
+                ),
+                "error": str(detail.get("reason") or "request preflight bloqueou a mutação"),
+                "preflight": detail,
+            }
+
+        # O próprio preflight pode consultar a exchange e armar ban/throttle.
+        # Nesse caso, não espera com a quote aprovada envelhecendo: aborta este
+        # ciclo e deixa o próximo obter uma nova cotação depois do rate gate.
+        after_guard_ms = time.time() * 1000.0
+        if after_guard_ms < _ban_until_ms or after_guard_ms < _throttle_until_ms:
+            return {
+                "ok": False,
+                "_preflight": True,
+                "_request_sent": False,
+                "reason_code": "EXEC_RATE_GATE_CHANGED",
+                "error": "rate gate mudou durante o preflight final",
+                "preflight": verdict if isinstance(verdict, dict) else {},
+            }
 
     url = _build_signed_url(path, params)
     try:
@@ -648,6 +697,144 @@ def arm_ban_external(status_code: int, retry_after_s=None, origin: str = "públi
         ban_ms = now_ms + _RATE_LIMIT_COOLDOWN_MS
     if ban_ms > 0:
         _arm_ban(ban_ms, origin)
+
+
+async def get_execution_quote(symbol: str, *, timeout_s: float = 2.0) -> dict:
+    """Lê o top-of-book Binance sem cache para uma decisão de entrada.
+
+    Usa a mesma BASE/modo/cliente/proxy do executor e compartilha o rate gate.
+    Não assina a chamada e nunca reaproveita o ticker de scan ou de outra venue.
+    A validade final é decidida pelo avaliador puro da P04A imediatamente antes
+    do POST da entrada.
+    """
+    sym = to_binance(symbol) if "/" in symbol else str(symbol or "").upper()
+    if not sym:
+        return {"ok": False, "reason_code": "EXEC_QUOTE_SYMBOL_INVALID"}
+    try:
+        timeout = float(timeout_s)
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if timeout <= 0:
+        return {"ok": False, "reason_code": "EXEC_QUOTE_TIMEOUT_INVALID", "symbol": sym}
+    if not await await_rate_gate():
+        return {
+            "ok": False,
+            "reason_code": "EXEC_QUOTE_RATE_LIMITED",
+            "symbol": sym,
+            "exchange": "binance",
+        }
+
+    started_at_ms = time.time() * 1000.0
+    started_mono = time.monotonic()
+    try:
+        response = await asyncio.wait_for(
+            _get_client().get(
+                f"{BASE}/fapi/v1/ticker/bookTicker",
+                params={"symbol": sym},
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "reason_code": "EXEC_QUOTE_TIMEOUT",
+            "symbol": sym,
+            "exchange": "binance",
+        }
+    except Exception as exc:  # noqa: BLE001 — leitura essencial falha fechada
+        return {
+            "ok": False,
+            "reason_code": "EXEC_QUOTE_FETCH_ERROR",
+            "symbol": sym,
+            "exchange": "binance",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    received_at_ms = time.time() * 1000.0
+    latency_ms = max(0.0, (time.monotonic() - started_mono) * 1000.0)
+    headers = getattr(response, "headers", {}) or {}
+    # A documentação Binance marca X-MBX-USED-WEIGHT-1M deste endpoint como
+    # inexato. Não contaminamos o throttle global com esse valor; o request ainda
+    # respeita o rate gate já armado e 418/429 continuam compartilhando o cooldown.
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code in (418, 429):
+        arm_ban_external(
+            status_code,
+            headers.get("retry-after"),
+            origin="entry-bookTicker",
+        )
+    if status_code != 200:
+        return {
+            "ok": False,
+            "reason_code": "EXEC_QUOTE_HTTP_ERROR",
+            "status_code": status_code,
+            "symbol": sym,
+            "exchange": "binance",
+            "latency_ms": latency_ms,
+        }
+    try:
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "reason_code": "EXEC_QUOTE_INVALID_JSON",
+            "symbol": sym,
+            "exchange": "binance",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not isinstance(payload, dict):
+        return {
+            "ok": False,
+            "reason_code": "EXEC_QUOTE_INVALID_PAYLOAD",
+            "symbol": sym,
+            "exchange": "binance",
+        }
+
+    def _number(name: str):
+        try:
+            value = Decimal(str(payload.get(name)))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        if not value.is_finite() or value <= 0:
+            return None
+        return float(value)
+
+    bid = _number("bidPrice")
+    ask = _number("askPrice")
+    bid_qty = _number("bidQty")
+    ask_qty = _number("askQty")
+    actual_sym = str(payload.get("symbol") or "").upper()
+    if bid is None or ask is None or actual_sym != sym:
+        return {
+            "ok": False,
+            "reason_code": "EXEC_QUOTE_INVALID_PAYLOAD",
+            "symbol": actual_sym or sym,
+            "exchange": "binance",
+            "latency_ms": latency_ms,
+        }
+    exchange_time_ms = _number("time")
+    if exchange_time_ms is None:
+        return {
+            "ok": False,
+            "reason_code": "EXEC_QUOTE_INVALID_TIMESTAMP",
+            "symbol": actual_sym,
+            "exchange": "binance",
+            "latency_ms": latency_ms,
+        }
+    return {
+        "ok": True,
+        "exchange": "binance",
+        "source": "binance_book_ticker",
+        "symbol": actual_sym,
+        "bid": bid,
+        "ask": ask,
+        "bid_qty": bid_qty,
+        "ask_qty": ask_qty,
+        "request_started_at_ms": started_at_ms,
+        "received_at_ms": received_at_ms,
+        "exchange_time_ms": exchange_time_ms,
+        "latency_ms": latency_ms,
+    }
 
 
 def _filter_positions(data, symbol: Optional[str]):
@@ -2203,7 +2390,7 @@ async def get_order(symbol: str, order_id: Optional[str] = None, client_order_id
 # ── Entrada MAKER (post-only) com proteção desacoplada (#4) ──────────────────
 # Defaults seguros lidos do ambiente. Tudo OFF/curto por default — quem liga é o
 # caller (shadow_trade_service) atrás de MAKER_ENTRY_ENABLED. Mainnet dinheiro
-# real: prefira fail-safe (fallback a market) a ficar pendurado sem entrada.
+# real: sem P04B, prefira desistir do fill a perseguir o preço a MARKET.
 _MAKER_POLL_TIMEOUT_S = float(os.getenv("MAKER_ENTRY_TIMEOUT_S", "8"))
 _MAKER_POLL_INTERVAL_S = float(os.getenv("MAKER_ENTRY_POLL_INTERVAL_S", "0.8"))
 
@@ -2222,7 +2409,8 @@ async def place_maker_entry_then_protect(
     client_order_id: Optional[str] = None,
     poll_timeout_s: Optional[float] = None,
     poll_interval_s: Optional[float] = None,
-    fallback_market: bool = True,
+    fallback_market: bool = False,
+    entry_preflight: Optional[Callable[[float, float], Awaitable[dict]]] = None,
 ) -> dict:
     """
     Entrada MAKER: coloca LIMIT post-only (timeInForce=GTX), faz polling do fill
@@ -2329,6 +2517,7 @@ async def place_maker_entry_then_protect(
             "tp2_ok": prot["tp2_ok"], "tp2_order_id": prot["tp2_order_id"],
             "was_maker": was_maker, "fell_back_to_market": False,
             "entry_fill_price": fill_price, "executed_qty": executed_qty,
+            "submitted_qty": qty_rounded,
             **safety,
         }
 
@@ -2340,7 +2529,82 @@ async def place_maker_entry_then_protect(
     }
     if client_order_id:
         params["newClientOrderId"] = client_order_id
-    entry_res = await _signed_request("POST", "/fapi/v1/order", params)
+    # P04A: o callback é entregue ao transport para rodar DEPOIS de qualquer
+    # throttle e imediatamente antes do request. Assim nenhuma espera assíncrona
+    # separa a quote/runtime guard aprovados do POST de entrada.
+    async def _entry_request_preflight() -> dict:
+        if entry_preflight is None:
+            return {"ok": True}
+        try:
+            preflight = await entry_preflight(float(px), float(qty_rounded))
+        except Exception as exc:  # noqa: BLE001 — essencial, portanto fail-closed
+            preflight = {
+                "ok": False,
+                "quality": "UNKNOWN",
+                "reason_code": "EXEC_PREFLIGHT_ERROR",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        if not isinstance(preflight, dict) or preflight.get("ok") is not True:
+            return preflight if isinstance(preflight, dict) else {
+                "ok": False,
+                "quality": "UNKNOWN",
+                "reason_code": "EXEC_PREFLIGHT_INVALID",
+                "reason": "revalidação da entrada retornou contrato inválido",
+            }
+        approved_qty_raw = preflight.get("approved_qty")
+        if approved_qty_raw is not None:
+            try:
+                approved_qty = float(approved_qty_raw)
+            except (TypeError, ValueError):
+                approved_qty = 0.0
+            if not (approved_qty > 0 and approved_qty <= qty_rounded):
+                return {
+                    "ok": False,
+                    "quality": "UNKNOWN",
+                    "reason_code": "EXEC_QTY_REVALIDATION_FAILED",
+                    "reason": "qty aprovada é inválida ou aumentaria exposição",
+                    "checks": preflight.get("checks") or {},
+                }
+            # P04A maker não redimensiona depois da cotação: qualquer redução
+            # necessária bloqueia e exige novo ciclo. Assim o POST é literalmente
+            # o próximo await após o preflight; P04B fará o resize de MARKET.
+            if abs(approved_qty - qty_rounded) > 1e-12:
+                return {
+                    "ok": False,
+                    "quality": "UNKNOWN",
+                    "reason_code": "EXEC_QTY_REVALIDATION_FAILED",
+                    "reason": "qty exigiria redimensionamento após a cotação final",
+                    "checks": preflight.get("checks") or {},
+                }
+        return preflight
+
+    entry_res = await _signed_request(
+        "POST",
+        "/fapi/v1/order",
+        params,
+        request_preflight=(
+            _entry_request_preflight if entry_preflight is not None else None
+        ),
+    )
+    if entry_res.get("_preflight"):
+        verdict = entry_res.get("preflight") or {}
+        code = str(entry_res.get("reason_code") or "EXEC_PREFLIGHT_BLOCKED")
+        reason = str(entry_res.get("error") or "revalidação da entrada não aprovada")
+        log.warning(f"[p04a][entry-preflight] {sym} BLOCKED {code}: {reason}")
+        return {
+            "ok": False,
+            "error": reason,
+            "reason_code": code,
+            "entry_not_submitted": True,
+            "preflight_failed": True,
+            "preflight": verdict,
+            "no_fill": True,
+            "was_maker": True,
+            "fell_back_to_market": False,
+            "manual_intervention_required": False,
+            "quarantine_required": False,
+            "client_order_id": client_order_id,
+        }
     if not entry_res.get("ok"):
         # Só uma rejeição GTX explícita prova que a LIMIT NÃO foi aceita. Timeout
         # ou erro de transporte pode ser sucesso sem resposta; cair para MARKET
@@ -2378,6 +2642,7 @@ async def place_maker_entry_then_protect(
                 "emergency_close_attempted": False,
                 "emergency_close_ok": None,
                 "client_order_id": client_order_id,
+                "submitted_qty": qty_rounded,
             }
         return {"ok": False, "error": f"GTX rejeitado: {msg}", "no_fill": True, "was_maker": True, "fell_back_to_market": False}
 
@@ -2657,6 +2922,7 @@ async def place_maker_entry_then_protect(
             "emergency_close_ok": None,
             "maker_cancel_result": cancel_res,
             "maker_order_check": terminal_observation or chk,
+            "submitted_qty": qty_rounded,
         }
 
     if not final_fill_qty_confirmed:
@@ -2722,6 +2988,7 @@ async def place_maker_entry_then_protect(
             "emergency_close_ok": None,
             "maker_cancel_result": cancel_res,
             "maker_order_check": terminal_observation,
+            "submitted_qty": qty_rounded,
         }
 
     ex_qty_r = await _round_qty(sym, ex_qty) if ex_qty > 0 else 0.0
