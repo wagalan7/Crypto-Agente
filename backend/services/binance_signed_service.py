@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import hashlib
+import math
 import os
 import time
 import logging
@@ -442,7 +443,7 @@ def to_binance(symbol: str) -> str:
 # e cacheamos os filtros por símbolo — depois truncamos qty/SL/TP antes do
 # submit. ExchangeInfo é público; usa o mesmo BASE.
 
-_filters_cache: dict = {}  # sym → {"step": float, "tick": float, "min_qty": float}
+_filters_cache: dict = {}  # sym → LOT_SIZE + MARKET_LOT_SIZE + notional
 _filters_lock = None  # lazy: criado no primeiro uso pra herdar o loop ativo
 
 
@@ -458,13 +459,33 @@ async def _load_exchange_info() -> dict:
             step = 0.0
             tick = 0.0
             min_qty = 0.0
+            market_step = 0.0
+            market_min_qty = 0.0
+            market_max_qty = 0.0
+            min_notional = 0.0
             for f in (s.get("filters") or []):
                 if f.get("filterType") == "LOT_SIZE":
                     step = float(f.get("stepSize") or 0)
                     min_qty = float(f.get("minQty") or 0)
+                elif f.get("filterType") == "MARKET_LOT_SIZE":
+                    market_step = float(f.get("stepSize") or 0)
+                    market_min_qty = float(f.get("minQty") or 0)
+                    market_max_qty = float(f.get("maxQty") or 0)
+                elif f.get("filterType") in {"MIN_NOTIONAL", "NOTIONAL"}:
+                    min_notional = float(
+                        f.get("notional") or f.get("minNotional") or 0
+                    )
                 elif f.get("filterType") == "PRICE_FILTER":
                     tick = float(f.get("tickSize") or 0)
-            _filters_cache[sym] = {"step": step, "tick": tick, "min_qty": min_qty}
+            _filters_cache[sym] = {
+                "step": step,
+                "tick": tick,
+                "min_qty": min_qty,
+                "market_step": market_step,
+                "market_min_qty": market_min_qty,
+                "market_max_qty": market_max_qty,
+                "min_notional": min_notional,
+            }
         log.info(f"[binance] exchangeInfo carregado: {len(_filters_cache)} símbolos")
     except Exception as e:
         log.warning(f"[binance] exchangeInfo falhou (segue sem precisão): {e}")
@@ -483,7 +504,15 @@ async def _get_symbol_filters(sym: str) -> dict:
             return _filters_cache[sym]
         if not _filters_cache:
             await _load_exchange_info()
-    return _filters_cache.get(sym, {"step": 0.0, "tick": 0.0, "min_qty": 0.0})
+    return _filters_cache.get(sym, {
+        "step": 0.0,
+        "tick": 0.0,
+        "min_qty": 0.0,
+        "market_step": 0.0,
+        "market_min_qty": 0.0,
+        "market_max_qty": 0.0,
+        "min_notional": 0.0,
+    })
 
 
 def _floor_to_step(value: float, step: float) -> float:
@@ -833,6 +862,130 @@ async def get_execution_quote(symbol: str, *, timeout_s: float = 2.0) -> dict:
         "request_started_at_ms": started_at_ms,
         "received_at_ms": received_at_ms,
         "exchange_time_ms": exchange_time_ms,
+        "latency_ms": latency_ms,
+    }
+
+
+async def get_execution_depth(
+    symbol: str, *, limit: int = 50, timeout_s: float = 1.5
+) -> dict:
+    """Snapshot Binance sem cache para estimar o fill integral de uma MARKET."""
+    sym = to_binance(symbol) if "/" in symbol else str(symbol or "").upper()
+    valid_limits = {5, 10, 20, 50, 100, 500, 1000}
+    try:
+        depth_limit = int(limit)
+        timeout = float(timeout_s)
+    except (TypeError, ValueError):
+        depth_limit = 0
+        timeout = 0.0
+    if not sym:
+        return {"ok": False, "reason_code": "EXEC_DEPTH_SYMBOL_INVALID"}
+    if depth_limit not in valid_limits:
+        return {
+            "ok": False, "reason_code": "EXEC_DEPTH_LIMIT_INVALID",
+            "symbol": sym, "exchange": "binance",
+        }
+    if timeout <= 0:
+        return {
+            "ok": False, "reason_code": "EXEC_DEPTH_TIMEOUT_INVALID",
+            "symbol": sym, "exchange": "binance",
+        }
+    if not await await_rate_gate():
+        return {
+            "ok": False, "reason_code": "EXEC_DEPTH_RATE_LIMITED",
+            "symbol": sym, "exchange": "binance",
+        }
+
+    started_at_ms = time.time() * 1000.0
+    started_mono = time.monotonic()
+    try:
+        response = await asyncio.wait_for(
+            _get_client().get(
+                f"{BASE}/fapi/v1/depth",
+                params={"symbol": sym, "limit": depth_limit},
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "ok": False, "reason_code": "EXEC_DEPTH_TIMEOUT",
+            "symbol": sym, "exchange": "binance",
+        }
+    except Exception as exc:  # noqa: BLE001 — leitura essencial falha fechada
+        return {
+            "ok": False, "reason_code": "EXEC_DEPTH_FETCH_ERROR",
+            "symbol": sym, "exchange": "binance",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    received_at_ms = time.time() * 1000.0
+    latency_ms = max(0.0, (time.monotonic() - started_mono) * 1000.0)
+    headers = getattr(response, "headers", {}) or {}
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code in (418, 429):
+        arm_ban_external(
+            status_code, headers.get("retry-after"), origin="entry-depth"
+        )
+    if status_code != 200:
+        return {
+            "ok": False, "reason_code": "EXEC_DEPTH_HTTP_ERROR",
+            "status_code": status_code, "symbol": sym, "exchange": "binance",
+            "latency_ms": latency_ms,
+        }
+    record_external_weight(headers.get("x-mbx-used-weight-1m"))
+    try:
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False, "reason_code": "EXEC_DEPTH_INVALID_JSON",
+            "symbol": sym, "exchange": "binance",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not isinstance(payload, dict):
+        return {
+            "ok": False, "reason_code": "EXEC_DEPTH_INVALID_PAYLOAD",
+            "symbol": sym, "exchange": "binance",
+        }
+
+    def _positive_integer(name: str):
+        try:
+            value = Decimal(str(payload.get(name)))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        if (
+            not value.is_finite()
+            or value <= 0
+            or value != value.to_integral_value()
+        ):
+            return None
+        return int(value)
+
+    update_id = _positive_integer("lastUpdateId")
+    message_time = _positive_integer("E")
+    transaction_time = _positive_integer("T")
+    bids = payload.get("bids")
+    asks = payload.get("asks")
+    if (
+        update_id is None or message_time is None or transaction_time is None
+        or not isinstance(bids, list) or not bids
+        or not isinstance(asks, list) or not asks
+    ):
+        return {
+            "ok": False, "reason_code": "EXEC_DEPTH_INVALID_PAYLOAD",
+            "symbol": sym, "exchange": "binance", "latency_ms": latency_ms,
+        }
+    return {
+        "ok": True,
+        "exchange": "binance",
+        "source": "binance_depth",
+        "symbol": sym,
+        "limit": depth_limit,
+        "last_update_id": update_id,
+        "message_time_ms": message_time,
+        "exchange_time_ms": transaction_time,
+        "bids": bids,
+        "asks": asks,
+        "request_started_at_ms": started_at_ms,
+        "received_at_ms": received_at_ms,
         "latency_ms": latency_ms,
     }
 
@@ -1943,6 +2096,9 @@ async def place_order(
     reduce_only: bool = False,
     leverage: Optional[int] = None,
     client_order_id: Optional[str] = None,
+    entry_preflight: Optional[
+        Callable[[float, dict], Awaitable[dict]]
+    ] = None,
 ) -> dict:
     """
     Cria ordem em futures USDT-M. Aceita "Buy/Sell" (Bybit-style) e traduz pra
@@ -1962,6 +2118,25 @@ async def place_order(
     Retorno enriquecido com sl_ok/tp1_ok/tp2_ok pra caller propagar diagnóstico.
     """
     sym = to_binance(symbol) if "/" in symbol else symbol
+    binance_side = side.upper()  # BUY | SELL
+    binance_type = "MARKET" if order_type == "Market" else "LIMIT"
+    market_entry = binance_type == "MARKET" and not reduce_only
+    if market_entry and entry_preflight is None:
+        return {
+            "ok": False,
+            "error": "abertura MARKET exige preflight P04B",
+            "reason_code": "EXEC_MARKET_PREFLIGHT_REQUIRED",
+            "entry_not_submitted": True,
+            "preflight_failed": True,
+            "no_fill": True,
+            "safety_state": "ENTRY_NOT_SUBMITTED",
+            "entry_state": "NOT_SUBMITTED",
+            "manual_intervention_required": False,
+            "quarantine_required": False,
+            "submitted_qty": 0.0,
+            "planned_qty": qty,
+            "client_order_id": client_order_id,
+        }
 
     # Arredonda qty pro stepSize do símbolo (DOGE só aceita inteiro, etc.).
     qty_rounded = await _round_qty(sym, float(qty))
@@ -1982,8 +2157,6 @@ async def place_order(
                         f"leverage {leverage}x não confirmada p/ {sym}: "
                         f"{_lev.get('error') or _lev.get('msg')}"}
 
-    binance_side = side.upper()  # BUY | SELL
-    binance_type = "MARKET" if order_type == "Market" else "LIMIT"
     terminal_statuses = {
         "FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED",
     }
@@ -2035,7 +2208,137 @@ async def place_order(
     if client_order_id:
         params["newClientOrderId"] = client_order_id
 
-    entry_res = await _signed_request("POST", "/fapi/v1/order", params)
+    market_rules: dict = {}
+    preflight_state: dict = {}
+
+    async def _market_request_preflight() -> dict:
+        # Os filtros também precisam ser lidos dentro da janela crítica: depois
+        # do throttle e imediatamente antes da leitura de profundidade + POST.
+        filters = await _get_symbol_filters(sym)
+        market_rules.update({
+            "step": filters.get("market_step"),
+            "min_qty": filters.get("market_min_qty"),
+            "max_qty": filters.get("market_max_qty"),
+            "min_notional": filters.get("min_notional"),
+        })
+        try:
+            step = float(market_rules.get("step") or 0)
+            min_qty = float(market_rules.get("min_qty") or 0)
+            max_qty = float(market_rules.get("max_qty") or 0)
+            min_notional = float(market_rules.get("min_notional") or 0)
+        except (TypeError, ValueError):
+            step = min_qty = max_qty = min_notional = 0.0
+        if not all(
+            math.isfinite(value) and value > 0
+            for value in (step, min_qty, max_qty, min_notional)
+        ):
+            return {
+                "ok": False, "quality": "UNKNOWN",
+                "reason_code": "EXEC_MARKET_FILTERS_UNKNOWN",
+                "reason": "MARKET_LOT_SIZE/MIN_NOTIONAL não confirmados",
+                "checks": {"market_rules": market_rules},
+            }
+        try:
+            verdict = await entry_preflight(float(qty_rounded), dict(market_rules))
+        except Exception as exc:  # noqa: BLE001 — entrada real falha fechada
+            verdict = {
+                "ok": False, "quality": "UNKNOWN",
+                "reason_code": "EXEC_PREFLIGHT_ERROR",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "checks": {},
+            }
+        if not isinstance(verdict, dict) or verdict.get("ok") is not True:
+            return verdict if isinstance(verdict, dict) else {
+                "ok": False, "quality": "UNKNOWN",
+                "reason_code": "EXEC_PREFLIGHT_INVALID",
+                "reason": "preflight MARKET retornou contrato inválido",
+                "checks": {},
+            }
+        try:
+            approved_raw = float(verdict.get("approved_qty"))
+        except (TypeError, ValueError):
+            approved_raw = 0.0
+        approved = _floor_to_step(approved_raw, step)
+        checks = verdict.setdefault("checks", {})
+        checks.update({
+            "planned_qty": float(qty_rounded),
+            "approved_qty_before_floor": approved_raw,
+            "approved_qty": approved,
+            "market_step": step,
+            "market_min_qty": min_qty,
+            "market_max_qty": max_qty,
+            "min_notional": min_notional,
+        })
+        if not (
+            approved > 0
+            and approved <= qty_rounded
+            and approved >= min_qty
+            and approved <= max_qty
+        ):
+            return {
+                "ok": False, "quality": "UNKNOWN",
+                "reason_code": "EXEC_QTY_REVALIDATION_FAILED",
+                "reason": "qty aprovada viola MARKET_LOT_SIZE ou aumentaria exposição",
+                "checks": checks,
+            }
+        try:
+            price_checks = (
+                float(checks["best_executable_price"]),
+                float(checks["vwap_price"]),
+                float(checks["worst_price"]),
+            )
+            conservative_price = (
+                min(price_checks)
+                if all(math.isfinite(value) and value > 0 for value in price_checks)
+                else 0.0
+            )
+        except (KeyError, TypeError, ValueError):
+            conservative_price = 0.0
+        if conservative_price <= 0 or approved * conservative_price < min_notional:
+            return {
+                "ok": False, "quality": "UNKNOWN",
+                "reason_code": "EXEC_MIN_NOTIONAL_FAILED",
+                "reason": "qty aprovada não confirma o MIN_NOTIONAL",
+                "checks": checks,
+            }
+        params["quantity"] = approved
+        preflight_state.update({
+            "submitted_qty": approved,
+            "verdict": verdict,
+        })
+        return verdict
+
+    entry_res = await _signed_request(
+        "POST",
+        "/fapi/v1/order",
+        params,
+        request_preflight=_market_request_preflight if market_entry else None,
+    )
+    if entry_res.get("_preflight"):
+        verdict = entry_res.get("preflight") or {}
+        return {
+            "ok": False,
+            "error": str(entry_res.get("error") or "preflight MARKET bloqueou"),
+            "reason_code": str(
+                entry_res.get("reason_code") or "EXEC_PREFLIGHT_BLOCKED"
+            ),
+            "entry_not_submitted": True,
+            "preflight_failed": True,
+            "preflight": verdict,
+            "no_fill": True,
+            "safety_state": "ENTRY_NOT_SUBMITTED",
+            "entry_state": "NOT_SUBMITTED",
+            "manual_intervention_required": False,
+            "quarantine_required": False,
+            "submitted_qty": 0.0,
+            "planned_qty": qty_rounded,
+            "client_order_id": client_order_id,
+        }
+    submitted_qty = float(preflight_state.get("submitted_qty") or qty_rounded)
+    submission_meta = {
+        "submitted_qty": submitted_qty,
+        "client_order_id": client_order_id,
+    }
     if not entry_res.get("ok"):
         if _is_ambiguous_order_submission(entry_res):
             try:
@@ -2073,7 +2376,7 @@ async def place_order(
             )
             if query_terminal_confirmed:
                 if query_status == "FILLED" and query_qty <= 0:
-                    query_qty = qty_rounded
+                    query_qty = submitted_qty
                 entry_res = {
                     "ok": True,
                     "result": {
@@ -2094,7 +2397,7 @@ async def place_order(
                         # apenas SL closePosition; TPs e um segundo MARKET ficam
                         # proibidos enquanto a qty/status forem UNKNOWN.
                         protection = await _place_post_fill_protection(
-                            sym, binance_side, query_qty or qty_rounded,
+                            sym, binance_side, query_qty or submitted_qty,
                             stop_loss=stop_loss,
                             client_order_id_prefix=client_order_id,
                         )
@@ -2107,6 +2410,7 @@ async def place_order(
                 )
                 return {
                     **entry_res,
+                    **submission_meta,
                     "ok": False,
                     "result": query_raw or {},
                     "sl_ok": bool(
@@ -2133,7 +2437,7 @@ async def place_order(
                     "entry_order_query": query,
                 }
         if not entry_res.get("ok"):
-            return entry_res
+            return {**entry_res, **submission_meta}
 
     entry_result = entry_res.get("result") or {}
     entry_status = str(entry_result.get("status") or "").upper()
@@ -2193,7 +2497,7 @@ async def place_order(
                     # apenas como fallback quantity; closePosition continua sendo
                     # a primeira opção e reduceOnly impede inversão.
                     protection = await _place_post_fill_protection(
-                        sym, binance_side, executed_qty or qty_rounded,
+                        sym, binance_side, executed_qty or submitted_qty,
                         stop_loss=stop_loss,
                         client_order_id_prefix=client_order_id,
                     )
@@ -2205,6 +2509,7 @@ async def place_order(
                 "entry_confirmation_unknown",
             )
             return {
+                **submission_meta,
                 "ok": False,
                 "error": (
                     "CRÍTICO: entrada aceita, mas status/fill terminal não confirmado"
@@ -2234,6 +2539,7 @@ async def place_order(
 
     if binance_type == "MARKET" and executed_qty <= 0:
         return {
+            **submission_meta,
             "ok": False,
             "error": f"entrada MARKET terminou {entry_status or 'N/D'} sem fill",
             "result": entry_result,
@@ -2249,6 +2555,7 @@ async def place_order(
         executed_qty = await _round_qty(sym, executed_qty)
         if executed_qty <= 0:
             return {
+                **submission_meta,
                 "ok": False,
                 "error": "fill MARKET arredondou para zero; proteção bloqueada",
                 "result": entry_result,
@@ -2329,6 +2636,7 @@ async def place_order(
         "NOT_APPLICABLE",
     }
     return {
+        **submission_meta,
         # Uma entrada revertida por segurança não é uma operação aberta com
         # sucesso; callers devem registrar o incidente, não um RealTrade vivo.
         "ok": trade_survived,
@@ -2411,6 +2719,7 @@ async def place_maker_entry_then_protect(
     poll_interval_s: Optional[float] = None,
     fallback_market: bool = False,
     entry_preflight: Optional[Callable[[float, float], Awaitable[dict]]] = None,
+    market_preflight: Optional[Callable[[float, dict], Awaitable[dict]]] = None,
 ) -> dict:
     """
     Entrada MAKER: coloca LIMIT post-only (timeInForce=GTX), faz polling do fill
@@ -2452,19 +2761,33 @@ async def place_maker_entry_then_protect(
                         f"{_lev.get('error') or _lev.get('msg')}"}
 
     binance_side = side.upper()  # BUY | SELL
+    if not client_order_id:
+        nonce = hashlib.sha1(
+            f"{sym}:{binance_side}:{qty_rounded}:{time.time_ns()}".encode("utf-8")
+        ).hexdigest()[:10]
+        client_order_id = f"cw-maker-{sym[:8].lower()}-{nonce}"[:36]
 
     async def _market_fallback(reason: str) -> dict:
         """Cai pra entrada MARKET reaproveitando place_order (entry+proteção juntos)."""
         log.warning(f"[maker] {sym} fallback MARKET ({reason})")
+        fallback_client_order_id = f"{client_order_id[:32]}-mfb"[:36]
+        if fallback_client_order_id == client_order_id:
+            suffix = hashlib.sha1(
+                f"{client_order_id}:market-fallback".encode("utf-8")
+            ).hexdigest()[:6]
+            fallback_client_order_id = f"{client_order_id[:29]}-{suffix}"[:36]
         res = await place_order(
             sym, side, qty_rounded, order_type="Market",
             stop_loss=stop_loss, take_profit=take_profit, tp1=tp1,
             tp1_qty_pct=tp1_qty_pct, leverage=None,  # leverage já setado acima
-            client_order_id=client_order_id,
+            client_order_id=fallback_client_order_id,
+            entry_preflight=market_preflight,
         )
         if isinstance(res, dict):
             res["was_maker"] = False
             res["fell_back_to_market"] = True
+            res["maker_client_order_id"] = client_order_id
+            res["client_order_id"] = fallback_client_order_id
         return res
 
     async def _protect(
@@ -2518,6 +2841,7 @@ async def place_maker_entry_then_protect(
             "was_maker": was_maker, "fell_back_to_market": False,
             "entry_fill_price": fill_price, "executed_qty": executed_qty,
             "submitted_qty": qty_rounded,
+            "client_order_id": client_order_id,
             **safety,
         }
 

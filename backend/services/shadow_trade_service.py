@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Optional
 
 from db import DB_ENABLED
@@ -525,9 +526,8 @@ MAKER_ENTRY_ENABLED = os.getenv("MAKER_ENTRY_ENABLED", "false").strip().lower() 
 # MERCADO (true) ou DESISTIR da entrada (false). Chasing a mercado após o preço
 # fugir do limit é justamente o que gera "entrada atrasada" (TP1 curto, SL caro);
 # com false, no-fill = sem trade (não persegue). O default agora é seguro:
-# P04A: default seguro é false. A política de revalidação imediatamente antes
-# de um fallback MARKET pertence à P04B; enquanto ela não estiver integrada, a
-# P04A força zero fallback mesmo se uma configuração antiga pedir true.
+# P04B mantém o fallback sob uma segunda flag explícita; configuração antiga
+# isolada nunca o ativa silenciosamente.
 MAKER_FALLBACK_MARKET = os.getenv("MAKER_FALLBACK_MARKET", "false").strip().lower() in ("1", "true", "yes")
 
 # ── #2b Orçamento de RISCO aberto agregado (soma do R em risco das posições) ──
@@ -902,6 +902,34 @@ _P04A_MAX_CHASE_ATR_RAW = os.getenv("P04A_MAX_CHASE_ATR", "").strip()
 P04A_MAX_CHASE_ATR = (
     max(0.0, float(_P04A_MAX_CHASE_ATR_RAW))
     if _P04A_MAX_CHASE_ATR_RAW else None
+)
+
+# ── P04B: depth/VWAP imediatamente antes de toda entrada MARKET normal ─────
+# Nasce ON e fail-closed: desligar a validação bloqueia MARKET, não restaura o
+# caminho antigo. O fallback maker exige DUAS flags e permanece OFF por default.
+P04B_MARKET_REVALIDATION_ENABLED = os.getenv(
+    "P04B_MARKET_REVALIDATION_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+P04B_MAKER_FALLBACK_ENABLED = os.getenv(
+    "P04B_MAKER_FALLBACK_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes")
+P04B_DEPTH_TIMEOUT_S = max(0.1, float(os.getenv("P04B_DEPTH_TIMEOUT_S", "1.5")))
+P04B_MAX_DEPTH_AGE_MS = max(
+    0.0, float(os.getenv("P04B_MAX_DEPTH_AGE_MS", "1500"))
+)
+P04B_MAX_FETCH_LATENCY_MS = max(
+    0.0, float(os.getenv("P04B_MAX_FETCH_LATENCY_MS", "1500"))
+)
+P04B_DEPTH_LIMIT = int(os.getenv("P04B_DEPTH_LIMIT", "50"))
+P04B_MAX_BOOK_IMPACT_PCT = max(
+    0.0, float(os.getenv("P04B_MAX_BOOK_IMPACT_PCT", "0.10"))
+)
+P04B_MAX_MARKET_SLIPPAGE_PCT = max(
+    0.0,
+    float(os.getenv(
+        "P04B_MAX_MARKET_SLIPPAGE_PCT",
+        str(P04A_MAX_ADVERSE_SLIPPAGE_PCT),
+    )),
 )
 
 # ── Exec size damper (liquidez/ATR-aware) ───────────────────────────────────
@@ -1935,8 +1963,20 @@ def env_info() -> dict:
         "p04a_max_fetch_latency_ms": P04A_MAX_FETCH_LATENCY_MS,
         "p04a_max_adverse_slippage_pct": P04A_MAX_ADVERSE_SLIPPAGE_PCT,
         "p04a_max_chase_atr_override": P04A_MAX_CHASE_ATR,
+        "p04b_market_revalidation_enabled": P04B_MARKET_REVALIDATION_ENABLED,
+        "p04b_depth_timeout_s": P04B_DEPTH_TIMEOUT_S,
+        "p04b_max_depth_age_ms": P04B_MAX_DEPTH_AGE_MS,
+        "p04b_max_fetch_latency_ms": P04B_MAX_FETCH_LATENCY_MS,
+        "p04b_depth_limit": P04B_DEPTH_LIMIT,
+        "p04b_max_book_impact_pct": P04B_MAX_BOOK_IMPACT_PCT,
+        "p04b_max_market_slippage_pct": P04B_MAX_MARKET_SLIPPAGE_PCT,
         "maker_fallback_market_requested": MAKER_FALLBACK_MARKET,
-        "maker_fallback_market_effective": False,  # reservado à P04B
+        "p04b_maker_fallback_enabled": P04B_MAKER_FALLBACK_ENABLED,
+        "maker_fallback_market_effective": bool(
+            MAKER_FALLBACK_MARKET
+            and P04B_MAKER_FALLBACK_ENABLED
+            and P04B_MARKET_REVALIDATION_ENABLED
+        ),
         # #1 runner com trailing pós-TP2 (DEFAULT OFF) — mecânica no trade_manager
         "runner_enabled": os.getenv("RUNNER_ENABLED", "false").strip().lower() in ("1", "true", "yes"),
         "runner_qty_pct": float(os.getenv("RUNNER_QTY_PCT", "0.20")),
@@ -5167,6 +5207,175 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 # Mantém o MESMO shape de retorno (sl_ok/tp1_ok/tp2_ok) → o resto do
                 # fluxo (guard "sem stop", captura de IDs) não muda.
                 _maker_fn = getattr(exchange_service, "place_maker_entry_then_protect", None)
+                _depth_fn = getattr(exchange_service, "get_execution_depth", None)
+                _p04b_fallback_effective = bool(
+                    MAKER_FALLBACK_MARKET
+                    and P04B_MAKER_FALLBACK_ENABLED
+                    and P04B_MARKET_REVALIDATION_ENABLED
+                    and _depth_fn is not None
+                )
+
+                async def _market_entry_preflight(
+                    final_qty: float, market_rules: dict
+                ) -> dict:
+                    """Depth/runtime guard executado pelo transport antes do POST."""
+                    if not P04B_MARKET_REVALIDATION_ENABLED:
+                        return {
+                            "ok": False, "quality": "UNKNOWN",
+                            "reason_code": "EXEC_MARKET_REVALIDATION_DISABLED",
+                            "reason": "P04B_MARKET_REVALIDATION_ENABLED=false",
+                            "checks": {},
+                        }
+                    if _depth_fn is None:
+                        return {
+                            "ok": False, "quality": "UNKNOWN",
+                            "reason_code": "EXEC_DEPTH_UNSUPPORTED",
+                            "reason": "exchange ativa não fornece depth de execução",
+                            "checks": {},
+                        }
+                    try:
+                        depth = await _depth_fn(
+                            rec["symbol"],
+                            limit=P04B_DEPTH_LIMIT,
+                            timeout_s=P04B_DEPTH_TIMEOUT_S,
+                        )
+                    except Exception as exc:
+                        return {
+                            "ok": False, "quality": "UNKNOWN",
+                            "reason_code": "EXEC_DEPTH_FETCH_ERROR",
+                            "reason": f"{type(exc).__name__}: {exc}",
+                            "checks": {},
+                        }
+                    runtime_guard = await _p04a_runtime_recheck(
+                        risk_service, kill_switch_service
+                    )
+                    if runtime_guard.get("ok") is not True:
+                        return runtime_guard
+
+                    _sig = rec.get("signal") or {}
+                    _ind = _sig.get("indicators") if isinstance(_sig, dict) else {}
+                    try:
+                        _atr = float((_ind or {}).get("atr"))
+                    except (TypeError, ValueError):
+                        _atr = None
+                    from services.entry_revalidation_service import (
+                        cap_qty_for_revalidated_entry,
+                        estimate_market_depth_fill,
+                        evaluate_market_depth_revalidation,
+                    )
+                    estimate = estimate_market_depth_fill(
+                        depth=depth,
+                        symbol=rec["symbol"],
+                        side=side,
+                        qty=final_qty,
+                        max_depth_age_ms=P04B_MAX_DEPTH_AGE_MS,
+                        max_fetch_latency_ms=P04B_MAX_FETCH_LATENCY_MS,
+                    )
+                    if estimate.get("ok") is not True:
+                        return estimate
+                    estimate_checks = estimate.get("checks") or {}
+                    capped_qty = cap_qty_for_revalidated_entry(
+                        final_qty,
+                        entry,
+                        stop,
+                        estimate_checks.get("worst_price"),
+                    )
+                    try:
+                        step = Decimal(str(market_rules.get("step")))
+                        capped_d = Decimal(str(capped_qty))
+                        if (
+                            not step.is_finite() or step <= 0
+                            or not capped_d.is_finite() or capped_d <= 0
+                        ):
+                            raise InvalidOperation
+                        capped_qty = float(
+                            (capped_d / step).to_integral_value(
+                                rounding=ROUND_FLOOR
+                            ) * step
+                        )
+                        min_qty = float(market_rules.get("min_qty"))
+                        max_qty = float(market_rules.get("max_qty"))
+                        min_notional = float(market_rules.get("min_notional"))
+                    except (InvalidOperation, TypeError, ValueError):
+                        return {
+                            "ok": False, "quality": "UNKNOWN",
+                            "reason_code": "EXEC_MARKET_FILTERS_UNKNOWN",
+                            "reason": "filtros MARKET inválidos",
+                            "checks": {"market_rules": market_rules},
+                        }
+                    if not (
+                        capped_qty > 0
+                        and capped_qty <= final_qty
+                        and capped_qty >= min_qty
+                        and capped_qty <= max_qty
+                        and min_notional > 0
+                    ):
+                        return {
+                            "ok": False, "quality": "UNKNOWN",
+                            "reason_code": "EXEC_QTY_REVALIDATION_FAILED",
+                            "reason": "qty reduzida viola filtros ou aumentaria exposição",
+                            "checks": {
+                                **estimate_checks,
+                                "planned_qty": final_qty,
+                                "capped_qty": capped_qty,
+                                "market_rules": market_rules,
+                            },
+                        }
+                    verdict = evaluate_market_depth_revalidation(
+                        depth=depth,
+                        symbol=rec["symbol"],
+                        side=side,
+                        qty=capped_qty,
+                        planned_entry=entry,
+                        stop_loss=stop,
+                        tp1=float(tp1) if tp1 is not None else None,
+                        tp2=float(tp2) if tp2 is not None else None,
+                        atr=_atr,
+                        max_depth_age_ms=P04B_MAX_DEPTH_AGE_MS,
+                        max_fetch_latency_ms=P04B_MAX_FETCH_LATENCY_MS,
+                        max_spread_pct=MAX_SPREAD_PCT,
+                        max_book_impact_pct=P04B_MAX_BOOK_IMPACT_PCT,
+                        max_adverse_slippage_pct=P04B_MAX_MARKET_SLIPPAGE_PCT,
+                        max_chase_atr=_p04a_chase_ceiling,
+                        min_rr_tp1=max(
+                            MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
+                            MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0,
+                        ),
+                        min_rr_tp2=(
+                            MIN_RR_TP2_EXEC if RR_GATE_ENABLED else 0.0
+                        ),
+                        entry_zone_low=rec.get("entry_zone_low"),
+                        entry_zone_high=rec.get("entry_zone_high"),
+                    )
+                    checks = verdict.setdefault("checks", {})
+                    checks.update({
+                        "planned_qty": float(final_qty),
+                        "capped_qty": float(capped_qty),
+                        "min_notional": min_notional,
+                    })
+                    if verdict.get("ok") is not True:
+                        return verdict
+                    conservative_price = min(
+                        float(checks.get("best_executable_price") or 0),
+                        float(checks.get("vwap_price") or 0),
+                        float(checks.get("worst_price") or 0),
+                    )
+                    checks["conservative_notional"] = (
+                        capped_qty * conservative_price
+                    )
+                    if (
+                        conservative_price <= 0
+                        or checks["conservative_notional"] < min_notional
+                    ):
+                        return {
+                            "ok": False, "quality": "UNKNOWN",
+                            "reason_code": "EXEC_MIN_NOTIONAL_FAILED",
+                            "reason": "qty reduzida ficou abaixo do MIN_NOTIONAL",
+                            "checks": checks,
+                        }
+                    verdict["approved_qty"] = float(capped_qty)
+                    return verdict
+
                 from services.entry_revalidation_service import select_entry_route
                 _entry_route = select_entry_route(
                     maker_enabled=MAKER_ENTRY_ENABLED,
@@ -5283,10 +5492,11 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         tp1_qty_pct=_open_tp1_pct,
                         leverage=int(rec.get("leverage") or 1),
                         client_order_id=client_order_id,
-                        # P04B ainda não foi implementada: com P04A ativa,
-                        # nenhuma rejeição/timeout maker pode cair a MARKET.
-                        fallback_market=False,
+                        # Dupla trava OFF por default; quando explicitamente
+                        # ligada, usa depth NOVO e COID próprio no fallback.
+                        fallback_market=_p04b_fallback_effective,
                         entry_preflight=_entry_preflight,
+                        market_preflight=_market_entry_preflight,
                     )
                     if isinstance(order_res, dict) and order_res.get("ok"):
                         log.info(
@@ -5294,18 +5504,35 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"{'MAKER' if order_res.get('was_maker') and not order_res.get('fell_back_to_market') else 'MARKET(fallback)'}"
                         )
                 else:  # MARKET direto somente quando MAKER_ENTRY_ENABLED=false
-                    order_res = await exchange_service.place_order(
-                        symbol=rec["symbol"],
-                        side=exch_side,
-                        qty=qty,
-                        order_type="Market",
-                        stop_loss=stop,
-                        take_profit=tp2,  # TP2 — alvo final (closePosition=true)
-                        tp1=float(tp1) if tp1 is not None else None,  # bracket 45/55 quando ambos vierem
-                        tp1_qty_pct=_open_tp1_pct,  # fração adaptativa (ou 0.45 fixo)
-                        leverage=int(rec.get("leverage") or 1),
-                        client_order_id=client_order_id,
-                    )
+                    if _depth_fn is None:
+                        order_res = {
+                            "ok": False,
+                            "error": "exchange ativa não fornece depth P04B",
+                            "reason_code": "EXEC_DEPTH_UNSUPPORTED",
+                            "entry_not_submitted": True,
+                            "preflight_failed": True,
+                            "no_fill": True,
+                            "manual_intervention_required": False,
+                            "quarantine_required": False,
+                            "submitted_qty": 0.0,
+                            "client_order_id": client_order_id,
+                        }
+                    else:
+                        order_res = await exchange_service.place_order(
+                            symbol=rec["symbol"],
+                            side=exch_side,
+                            qty=qty,
+                            order_type="Market",
+                            stop_loss=stop,
+                            take_profit=tp2,  # TP2 — alvo final (closePosition=true)
+                            tp1=float(tp1) if tp1 is not None else None,
+                            tp1_qty_pct=_open_tp1_pct,
+                            leverage=int(rec.get("leverage") or 1),
+                            client_order_id=client_order_id,
+                            entry_preflight=_market_entry_preflight,
+                        )
+                if order_res.get("client_order_id"):
+                    client_order_id = str(order_res["client_order_id"])
                 _needs_manual = bool(
                     order_res.get("manual_intervention_required")
                     or order_res.get("quarantine_required")

@@ -23,6 +23,19 @@ from services import shadow_trade_service as shadow  # noqa: E402
 from services import snapshot_service as snapshot  # noqa: E402
 
 
+async def _p04b_market_preflight(qty, _rules):
+    """Contrato explícito para testes legados que mockam o transporte."""
+    return {
+        "ok": True,
+        "approved_qty": qty,
+        "checks": {
+            "best_executable_price": 100.0,
+            "vwap_price": 100.0,
+            "worst_price": 100.0,
+        },
+    }
+
+
 class SizingCharacterizationTests(unittest.TestCase):
     def test_hard_risk_cap_applies_to_nominal_position(self):
         with patch.object(shadow, "MAX_RISK_PCT_HARD", 2.0), patch.object(
@@ -165,6 +178,7 @@ class EntryFailSafeTests(unittest.IsolatedAsyncioTestCase):
             result = await binance.place_order(
                 "BTCUSDT", "Buy", 1.0, stop_loss=90.0, take_profit=120.0,
                 client_order_id="cw-market-fail",
+                entry_preflight=_p04b_market_preflight,
             )
 
         self.assertFalse(result["ok"])
@@ -190,6 +204,7 @@ class EntryFailSafeTests(unittest.IsolatedAsyncioTestCase):
                 "BTCUSDT", "Buy", 1.0, stop_loss=90.0,
                 tp1=110.0, take_profit=120.0,
                 client_order_id="cw-actual-fill",
+                entry_preflight=_p04b_market_preflight,
             )
 
         self.assertTrue(result["ok"])
@@ -216,6 +231,7 @@ class EntryFailSafeTests(unittest.IsolatedAsyncioTestCase):
             result = await binance.place_order(
                 "BTCUSDT", "Buy", 1.0, stop_loss=90.0,
                 client_order_id="cw-exception",
+                entry_preflight=_p04b_market_preflight,
             )
 
         self.assertFalse(result["ok"])
@@ -243,6 +259,7 @@ class EntryFailSafeTests(unittest.IsolatedAsyncioTestCase):
                 "BTCUSDT", "Buy", 1.0, stop_loss=90.0,
                 tp1=110.0, take_profit=120.0,
                 client_order_id="cw-tp-timeout",
+                entry_preflight=_p04b_market_preflight,
             )
 
         self.assertTrue(result["ok"])
@@ -504,6 +521,7 @@ class EntryFailSafeTests(unittest.IsolatedAsyncioTestCase):
             result = await binance.place_order(
                 "BTCUSDT", "Buy", 1.0, stop_loss=90.0,
                 client_order_id="cw-market-unknown",
+                entry_preflight=_p04b_market_preflight,
             )
 
         self.assertFalse(result["ok"])
@@ -533,6 +551,7 @@ class EntryFailSafeTests(unittest.IsolatedAsyncioTestCase):
             result = await binance.place_order(
                 "BTCUSDT", "Buy", 1.0, stop_loss=90.0,
                 client_order_id="cw-filled-no-qty",
+                entry_preflight=_p04b_market_preflight,
             )
 
         self.assertFalse(result["ok"])

@@ -196,7 +196,7 @@ def assemble_entry_incident(order_res: dict, rec: dict, *, closed: bool = False,
     falso-pending quando `entry_order_terminal=true`."""
     order_res = order_res or {}
     rec = rec or {}
-    coid = (local_client_order_id or order_res.get("client_order_id")
+    coid = (order_res.get("client_order_id") or local_client_order_id
             or rec.get("client_order_id"))
     was_maker = _as_bool(order_res.get("was_maker") or order_res.get("maker")
                          or order_res.get("is_maker"))

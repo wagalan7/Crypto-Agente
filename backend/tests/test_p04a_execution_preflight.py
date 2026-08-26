@@ -623,7 +623,15 @@ class ScopeGuardTests(unittest.TestCase):
             'MAKER_ENTRY_ENABLED = os.getenv("MAKER_ENTRY_ENABLED", "false")',
             shadow_source,
         )
-        self.assertIn("fallback_market=False,", shadow_source)
+        self.assertIn(
+            'P04B_MAKER_FALLBACK_ENABLED = os.getenv(',
+            shadow_source,
+        )
+        self.assertIn(
+            '"P04B_MAKER_FALLBACK_ENABLED", "false"',
+            shadow_source,
+        )
+        self.assertIn("fallback_market=_p04b_fallback_effective,", shadow_source)
         self.assertIn("MIN_RR_TP1_EXEC if RR_GATE_ENABLED", shadow_source)
         self.assertEqual(
             select_entry_route(maker_enabled=True, maker_available=False),

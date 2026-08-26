@@ -65,6 +65,8 @@ if hasattr(_client, "place_maker_entry_then_protect"):
     place_maker_entry_then_protect = _client.place_maker_entry_then_protect
 if hasattr(_client, "get_execution_quote"):
     get_execution_quote = _client.get_execution_quote
+if hasattr(_client, "get_execution_depth"):
+    get_execution_depth = _client.get_execution_depth
 if hasattr(_client, "place_protection_orders"):
     place_protection_orders = _client.place_protection_orders
 if hasattr(_client, "get_order"):

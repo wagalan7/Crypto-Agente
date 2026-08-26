@@ -447,3 +447,387 @@ def evaluate_entry_revalidation(
         "reason": None,
         "checks": checks,
     }
+
+
+def _depth_levels(raw_levels, *, descending: bool) -> tuple[Optional[list], str]:
+    """Normaliza um lado do snapshot sem tolerar book ambíguo."""
+    if not isinstance(raw_levels, (list, tuple)) or not raw_levels:
+        return None, "lado do book ausente ou vazio"
+    levels = []
+    previous = None
+    seen = set()
+    for raw in raw_levels:
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            return None, "nível do book não possui [preço, quantidade]"
+        price = _positive(raw[0])
+        quantity = _positive(raw[1])
+        if price is None or quantity is None:
+            return None, "nível do book contém valor inválido"
+        if price in seen:
+            return None, "book contém preço duplicado"
+        if previous is not None:
+            ordered = price < previous if descending else price > previous
+            if not ordered:
+                return None, "book não está estritamente ordenado"
+        seen.add(price)
+        previous = price
+        levels.append((price, quantity))
+    return levels, ""
+
+
+def estimate_market_depth_fill(
+    *,
+    depth: dict,
+    symbol: str,
+    side: str,
+    qty: float,
+    max_depth_age_ms: float,
+    max_fetch_latency_ms: float,
+    now_ms: Optional[float] = None,
+) -> dict:
+    """Estima VWAP/pior preço para 100% da qty usando um snapshot fresco.
+
+    É puro: não consulta rede, não altera o snapshot e não extrapola liquidez
+    além dos níveis recebidos. LONG consome asks; SHORT consome bids.
+    """
+    checks: dict = {}
+    unknown = {"quality": "UNKNOWN", "blocked_by": "depth-unknown"}
+    if not isinstance(depth, dict) or depth.get("ok") is not True:
+        raw_code = str(depth.get("reason_code") or "") if isinstance(depth, dict) else ""
+        code = raw_code if raw_code.startswith("EXEC_DEPTH_") else "EXEC_DEPTH_UNAVAILABLE"
+        return _blocked(
+            code,
+            f"profundidade de execução indisponível: {raw_code or 'resposta inválida'}",
+            checks,
+            **unknown,
+        )
+
+    side_key = _side_key(side)
+    if side_key is None:
+        return _blocked("EXEC_SIDE_INVALID", "lado da entrada inválido", checks, **unknown)
+    expected_symbol = _symbol_key(symbol)
+    actual_symbol = _symbol_key(depth.get("symbol"))
+    if not expected_symbol or actual_symbol != expected_symbol:
+        checks.update({"expected_symbol": expected_symbol, "depth_symbol": actual_symbol})
+        return _blocked(
+            "EXEC_SYMBOL_MISMATCH", "símbolo do depth difere da ordem", checks, **unknown
+        )
+    if str(depth.get("exchange") or "").strip().lower() != "binance":
+        checks["exchange"] = depth.get("exchange")
+        return _blocked(
+            "EXEC_DEPTH_VENUE_MISMATCH", "depth não veio da Binance ativa", checks, **unknown
+        )
+
+    requested = _positive(qty)
+    current_ms = _decimal(now_ms if now_ms is not None else time.time() * 1000.0)
+    max_age = _decimal(max_depth_age_ms)
+    max_latency = _decimal(max_fetch_latency_ms)
+    received_at = _decimal(depth.get("received_at_ms"))
+    exchange_time = _decimal(depth.get("exchange_time_ms"))
+    message_time = _decimal(depth.get("message_time_ms"))
+    latency = _decimal(depth.get("latency_ms"))
+    update_id = _positive(depth.get("last_update_id"))
+    if requested is None:
+        return _blocked("EXEC_QTY_INVALID", "qty MARKET inválida", checks, **unknown)
+    if (
+        current_ms is None or max_age is None or max_age < 0
+        or max_latency is None or max_latency < 0
+        or received_at is None or exchange_time is None or exchange_time <= 0
+        or message_time is None or message_time <= 0
+        or latency is None or latency < 0 or update_id is None
+        or update_id != update_id.to_integral_value()
+    ):
+        return _blocked(
+            "EXEC_DEPTH_TIMESTAMP_INVALID",
+            "timestamps, latência ou update id do depth são inválidos",
+            checks,
+            **unknown,
+        )
+    local_age = current_ms - received_at
+    if local_age < 0:
+        return _blocked(
+            "EXEC_DEPTH_TIMESTAMP_INVALID", "depth local está no futuro", checks, **unknown
+        )
+    exchange_age = current_ms - exchange_time
+    message_age = current_ms - message_time
+    if exchange_age < -max_age or message_age < -max_age:
+        return _blocked(
+            "EXEC_DEPTH_TIMESTAMP_INVALID", "timestamp da exchange está no futuro", checks, **unknown
+        )
+    exchange_age = max(Decimal("0"), exchange_age)
+    message_age = max(Decimal("0"), message_age)
+    checks.update({
+        "requested_qty": float(requested),
+        "age_ms": float(local_age),
+        "exchange_age_ms": float(exchange_age),
+        "message_age_ms": float(message_age),
+        "latency_ms": float(latency),
+        "last_update_id": int(update_id),
+    })
+    if max(local_age, exchange_age, message_age) > max_age:
+        return _blocked(
+            "EXEC_DEPTH_STALE",
+            f"depth excede idade máxima de {float(max_age):.0f}ms",
+            checks,
+            **unknown,
+        )
+    if latency > max_latency:
+        return _blocked(
+            "EXEC_DEPTH_SLOW",
+            f"leitura levou {float(latency):.0f}ms e excede {float(max_latency):.0f}ms",
+            checks,
+            **unknown,
+        )
+
+    bids, bids_error = _depth_levels(depth.get("bids"), descending=True)
+    asks, asks_error = _depth_levels(depth.get("asks"), descending=False)
+    if bids is None or asks is None:
+        return _blocked(
+            "EXEC_DEPTH_INVALID", bids_error or asks_error or "book inválido",
+            checks, **unknown,
+        )
+    best_bid, best_bid_qty = bids[0]
+    best_ask, best_ask_qty = asks[0]
+    if best_ask <= best_bid:
+        return _blocked(
+            "EXEC_BOOK_CROSSED", "book cruzado ou travado", checks, **unknown
+        )
+    mid = (best_bid + best_ask) / Decimal("2")
+    spread_pct = (best_ask - best_bid) / mid * Decimal("100")
+    selected = asks if side_key == "long" else bids
+    remaining = requested
+    notional = Decimal("0")
+    filled = Decimal("0")
+    worst = selected[0][0]
+    levels_used = 0
+    available = sum((level_qty for _, level_qty in selected), Decimal("0"))
+    for price, level_qty in selected:
+        if remaining <= 0:
+            break
+        take = min(remaining, level_qty)
+        notional += take * price
+        filled += take
+        remaining -= take
+        worst = price
+        levels_used += 1
+    checks.update({
+        "best_bid": float(best_bid),
+        "best_ask": float(best_ask),
+        "best_bid_qty": float(best_bid_qty),
+        "best_ask_qty": float(best_ask_qty),
+        "spread_pct": float(spread_pct),
+        "available_qty": float(available),
+        "filled_qty": float(filled),
+        "levels_used": levels_used,
+    })
+    if remaining > 0 or filled != requested:
+        return _blocked(
+            "EXEC_DEPTH_INSUFFICIENT",
+            f"depth cobre {float(filled):g} de {float(requested):g}",
+            checks,
+            quality="FRESH",
+            blocked_by="depth-liquidity",
+        )
+    vwap = notional / requested
+    best = best_ask if side_key == "long" else best_bid
+    impact = (
+        (vwap - best) / best if side_key == "long" else (best - vwap) / best
+    ) * Decimal("100")
+    checks.update({
+        "vwap_price": float(vwap),
+        "worst_price": float(worst),
+        "best_executable_price": float(best),
+        "book_impact_pct": float(max(Decimal("0"), impact)),
+    })
+    return {
+        "ok": True,
+        "quality": "FRESH",
+        "blocked_by": None,
+        "reason_code": "EXEC_DEPTH_ESTIMATE_OK",
+        "reason": None,
+        "checks": checks,
+    }
+
+
+def evaluate_market_depth_revalidation(
+    *,
+    depth: dict,
+    symbol: str,
+    side: str,
+    qty: float,
+    planned_entry: float,
+    stop_loss: float,
+    tp1: Optional[float],
+    tp2: Optional[float],
+    atr: Optional[float],
+    max_depth_age_ms: float,
+    max_fetch_latency_ms: float,
+    max_spread_pct: float,
+    max_book_impact_pct: float,
+    max_adverse_slippage_pct: float,
+    max_chase_atr: float,
+    min_rr_tp1: float,
+    min_rr_tp2: float,
+    entry_zone_low: Optional[float] = None,
+    entry_zone_high: Optional[float] = None,
+    now_ms: Optional[float] = None,
+) -> dict:
+    """Revalida uma abertura MARKET pelo custo conservador do depth inteiro."""
+    estimate = estimate_market_depth_fill(
+        depth=depth,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        max_depth_age_ms=max_depth_age_ms,
+        max_fetch_latency_ms=max_fetch_latency_ms,
+        now_ms=now_ms,
+    )
+    if estimate.get("ok") is not True:
+        return estimate
+    checks = dict(estimate.get("checks") or {})
+    side_key = _side_key(side)
+    planned = _positive(planned_entry)
+    stop = _positive(stop_loss)
+    first_tp = _positive(tp1) if tp1 is not None else None
+    second_tp = _positive(tp2) if tp2 is not None else None
+    atr_d = _positive(atr)
+    vwap = _positive(checks.get("vwap_price"))
+    worst = _positive(checks.get("worst_price"))
+    spread = _decimal(checks.get("spread_pct"))
+    impact = _decimal(checks.get("book_impact_pct"))
+    limits = {
+        "spread": _decimal(max_spread_pct),
+        "impact": _decimal(max_book_impact_pct),
+        "slippage": _decimal(max_adverse_slippage_pct),
+        "chase": _decimal(max_chase_atr),
+        "rr1": _decimal(min_rr_tp1),
+        "rr2": _decimal(min_rr_tp2),
+    }
+    if (
+        side_key is None or planned is None or stop is None or vwap is None or worst is None
+        or spread is None or impact is None
+        or any(value is None or value < 0 for value in limits.values())
+    ):
+        return _blocked(
+            "EXEC_CONFIG_INVALID", "níveis ou limites MARKET inválidos", checks,
+            quality="UNKNOWN", blocked_by="depth-unknown",
+        )
+    if limits["rr1"] > 0 and first_tp is None:
+        return _blocked(
+            "EXEC_LEVELS_INVALID", "TP1 obrigatório ausente", checks,
+            quality="UNKNOWN", blocked_by="levels",
+        )
+    if limits["rr2"] > 0 and second_tp is None:
+        return _blocked(
+            "EXEC_LEVELS_INVALID", "TP2 obrigatório ausente", checks,
+            quality="UNKNOWN", blocked_by="levels",
+        )
+    if limits["spread"] > 0 and spread > limits["spread"]:
+        return _blocked(
+            "EXEC_SPREAD_TOO_WIDE", "spread do depth excede o teto", checks,
+            blocked_by="spread",
+        )
+    if limits["impact"] > 0 and impact > limits["impact"]:
+        return _blocked(
+            "EXEC_BOOK_IMPACT_TOO_HIGH", "impacto VWAP excede o teto", checks,
+            blocked_by="slippage",
+        )
+
+    adverse_vwap = (
+        max(Decimal("0"), vwap - planned)
+        if side_key == "long" else max(Decimal("0"), planned - vwap)
+    ) / planned * Decimal("100")
+    adverse_worst = (
+        max(Decimal("0"), worst - planned)
+        if side_key == "long" else max(Decimal("0"), planned - worst)
+    ) / planned * Decimal("100")
+    checks.update({
+        "adverse_vwap_pct": float(adverse_vwap),
+        "adverse_worst_pct": float(adverse_worst),
+        "execution_price": float(worst),
+    })
+    if limits["slippage"] > 0 and adverse_worst > limits["slippage"]:
+        return _blocked(
+            "EXEC_SLIPPAGE_TOO_HIGH", "pior nível consumido excede o teto", checks,
+            blocked_by="slippage",
+        )
+
+    if limits["chase"] > 0:
+        if atr_d is None:
+            return _blocked(
+                "EXEC_ATR_INVALID", "ATR ausente para revalidar chase", checks,
+                quality="UNKNOWN", blocked_by="depth-unknown",
+            )
+        directional_move = worst - planned if side_key == "long" else planned - worst
+        chase_atr = directional_move / atr_d
+        checks["chase_atr"] = float(chase_atr)
+        if chase_atr >= limits["chase"]:
+            return _blocked(
+                "EXEC_PRICE_CHASE", "pior nível atingiu o teto anti-chase", checks,
+                blocked_by="price-chase",
+            )
+    else:
+        checks["chase_atr"] = None
+
+    zone_low = _positive(entry_zone_low) if entry_zone_low is not None else None
+    zone_high = _positive(entry_zone_high) if entry_zone_high is not None else None
+    if (entry_zone_low is not None or entry_zone_high is not None) and (
+        zone_low is None or zone_high is None or zone_low > zone_high
+    ):
+        return _blocked(
+            "EXEC_ENTRY_ZONE_INVALID", "zona de entrada inválida", checks,
+            quality="UNKNOWN", blocked_by="levels",
+        )
+    if zone_low is not None and zone_high is not None and not (zone_low <= worst <= zone_high):
+        return _blocked(
+            "EXEC_ENTRY_OUTSIDE_ZONE", "pior preço saiu da zona aprovada", checks,
+            blocked_by="levels",
+        )
+
+    if side_key == "long":
+        levels_ok = stop < planned and stop < vwap <= worst
+        levels_ok = levels_ok and (first_tp is None or worst < first_tp)
+        levels_ok = levels_ok and (second_tp is None or worst < second_tp)
+        levels_ok = levels_ok and (
+            first_tp is None or second_tp is None or first_tp <= second_tp
+        )
+        risk = worst - stop
+        reward1 = first_tp - worst if first_tp is not None else None
+        reward2 = second_tp - worst if second_tp is not None else None
+    else:
+        levels_ok = stop > planned and stop > vwap >= worst
+        levels_ok = levels_ok and (first_tp is None or worst > first_tp)
+        levels_ok = levels_ok and (second_tp is None or worst > second_tp)
+        levels_ok = levels_ok and (
+            first_tp is None or second_tp is None or first_tp >= second_tp
+        )
+        risk = stop - worst
+        reward1 = worst - first_tp if first_tp is not None else None
+        reward2 = worst - second_tp if second_tp is not None else None
+    if not levels_ok or risk <= 0:
+        return _blocked(
+            "EXEC_LEVELS_INVALID", "depth invalidou stop ou alvos", checks,
+            blocked_by="levels",
+        )
+    rr1 = reward1 / risk if reward1 is not None else None
+    rr2 = reward2 / risk if reward2 is not None else None
+    checks["rr_tp1"] = float(rr1) if rr1 is not None else None
+    checks["rr_tp2"] = float(rr2) if rr2 is not None else None
+    if rr1 is not None and limits["rr1"] > 0 and rr1 < limits["rr1"]:
+        return _blocked(
+            "EXEC_RR_TP1_TOO_LOW", "R:R TP1 no pior preço ficou abaixo do piso", checks,
+            blocked_by="fill-rr",
+        )
+    if rr2 is not None and limits["rr2"] > 0 and rr2 < limits["rr2"]:
+        return _blocked(
+            "EXEC_RR_TP2_TOO_LOW", "R:R TP2 no pior preço ficou abaixo do piso", checks,
+            blocked_by="fill-rr",
+        )
+    return {
+        "ok": True,
+        "quality": "FRESH",
+        "blocked_by": None,
+        "reason_code": "EXEC_MARKET_REVALIDATION_OK",
+        "reason": None,
+        "checks": checks,
+    }

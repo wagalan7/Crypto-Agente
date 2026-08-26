@@ -483,3 +483,39 @@ Base: `57938e87` (`origin/main`, P03 final). Implementação isolada em
 
 - P04B (MARKET direto/fallback, depth/slippage por qty e freshness contextual);
   nenhuma estratégia/score/IA; nenhuma ativação de maker/live; nenhum push/deploy.
+
+---
+
+## P04B — DEPTH/VWAP FAIL-CLOSED PRÉ-MARKET (2026-08-26)
+
+Base: P04A (`b4027e41`). Detalhes em
+`docs/P04B_MARKET_DEPTH_REVALIDATION.md`.
+
+### Implementado
+
+- Toda abertura MARKET normal Binance exige callback P04B dentro do transporte,
+  depois do throttle e imediatamente antes do POST. Sem callback, zero POST.
+- `GET /fapi/v1/depth` sem cache, na mesma BASE e rate gate do executor. O núcleo
+  puro/Decimal exige identidade, freshness, book válido e cobertura de 100% da
+  qty; calcula melhor preço, VWAP, pior nível, spread e impacto LONG/SHORT.
+- O pior preço revalida slippage, chase, zona, stop/alvos e R:R. A qty pode apenas
+  diminuir por risco/notional, é truncada no MARKET step e validada novamente
+  contra min/max qty e min notional dentro do transporte.
+- `submitted_qty` e o client ID efetivo chegam à proteção, RealTrade/P03 e aos
+  estados ambíguos. Timeout após cap nunca volta à qty original.
+- Fallback maker→MARKET permanece duplamente OFF. Quando explicitamente habilitado,
+  só rejeição GTX comprovada pode usá-lo; timeout/ambiguidade nunca duplica entry.
+  O fallback possui COID distinto e usa o mesmo depth guard.
+- Saídas `reduceOnly` continuam independentes do depth. Caminhos não integrados
+  (teste administrativo, pyramiding/hedge e exchange sem depth) falham fechado.
+- Nenhuma estratégia, score, IA, indicador, funding/OI ou parâmetro de sinal foi
+  alterado; nenhuma capability LIVE foi ligada.
+
+### Validação
+
+- **24 testes P04B herméticos**, incluindo depth multi-level LONG/SHORT, VWAP/worst,
+  cobertura, malformed/NaN, freshness, limites, filtros, qty assinada, timeout,
+  reduceOnly, fallback/COID e propagação P03; DNS/TCP bloqueados.
+- Suíte crítica P01+P02+P03+P04A+P04B: **225 testes verdes 2×** no Python 3.11.
+- `py_compile` e `git diff --check` aprovados. Sem exchange/banco real, push ou
+  deploy.

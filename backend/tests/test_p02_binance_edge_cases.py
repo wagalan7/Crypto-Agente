@@ -15,6 +15,19 @@ if str(BACKEND) not in sys.path:
 from services import binance_signed_service as binance  # noqa: E402
 
 
+async def _p04b_market_preflight(qty, _rules):
+    """Contrato explícito para testes legados que mockam o transporte."""
+    return {
+        "ok": True,
+        "approved_qty": qty,
+        "checks": {
+            "best_executable_price": 100.0,
+            "vwap_price": 100.0,
+            "worst_price": 100.0,
+        },
+    }
+
+
 def _confirmed_stop_only(stop_id: str = "sl-safe") -> dict:
     return {
         "sl_ok": True,
@@ -76,6 +89,7 @@ class MarketSubmissionAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             result = await binance.place_order(
                 "BTCUSDT", "Buy", 1.0, stop_loss=90.0,
                 client_order_id="cw-timeout-filled",
+                entry_preflight=_p04b_market_preflight,
             )
 
         self.assertTrue(result["ok"])
@@ -98,6 +112,7 @@ class MarketSubmissionAmbiguityTests(unittest.IsolatedAsyncioTestCase):
             result = await binance.place_order(
                 "BTCUSDT", "Buy", 1.0, stop_loss=90.0,
                 client_order_id="cw-timeout-unknown",
+                entry_preflight=_p04b_market_preflight,
             )
 
         self.assertFalse(result["ok"])
