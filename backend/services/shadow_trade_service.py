@@ -36,6 +36,7 @@ Quando ativar execução real (futuro #11.4):
 from __future__ import annotations
 import os
 import logging
+import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Optional
@@ -930,6 +931,25 @@ P04B_MAX_MARKET_SLIPPAGE_PCT = max(
         "P04B_MAX_MARKET_SLIPPAGE_PCT",
         str(P04A_MAX_ADVERSE_SLIPPAGE_PCT),
     )),
+)
+
+# ── P04C: validade central dos dados que formaram a recomendação ───────────
+# Nasce ON e fail-closed no LIVE. Desligar a flag bloqueia novas entradas em
+# vez de restaurar o caminho sem prova. Shadow continua coletando aprendizado.
+P04C_DATA_FRESHNESS_ENABLED = os.getenv(
+    "P04C_DATA_FRESHNESS_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+P04C_MAX_CANDLE_LAG_PERIODS = max(
+    0.0, float(os.getenv("P04C_MAX_CANDLE_LAG_PERIODS", "1.25"))
+)
+P04C_MAX_TICKER_AGE_MS = max(
+    0.0, float(os.getenv("P04C_MAX_TICKER_AGE_MS", "300000"))
+)
+P04C_MAX_DERIVATIVES_AGE_MS = max(
+    0.0, float(os.getenv("P04C_MAX_DERIVATIVES_AGE_MS", "300000"))
+)
+P04C_MAX_REGIME_AGE_MS = max(
+    0.0, float(os.getenv("P04C_MAX_REGIME_AGE_MS", "900000"))
 )
 
 # ── Exec size damper (liquidez/ATR-aware) ───────────────────────────────────
@@ -1970,6 +1990,11 @@ def env_info() -> dict:
         "p04b_depth_limit": P04B_DEPTH_LIMIT,
         "p04b_max_book_impact_pct": P04B_MAX_BOOK_IMPACT_PCT,
         "p04b_max_market_slippage_pct": P04B_MAX_MARKET_SLIPPAGE_PCT,
+        "p04c_data_freshness_enabled": P04C_DATA_FRESHNESS_ENABLED,
+        "p04c_max_candle_lag_periods": P04C_MAX_CANDLE_LAG_PERIODS,
+        "p04c_max_ticker_age_ms": P04C_MAX_TICKER_AGE_MS,
+        "p04c_max_derivatives_age_ms": P04C_MAX_DERIVATIVES_AGE_MS,
+        "p04c_max_regime_age_ms": P04C_MAX_REGIME_AGE_MS,
         "maker_fallback_market_requested": MAKER_FALLBACK_MARKET,
         "p04b_maker_fallback_enabled": P04B_MAKER_FALLBACK_ENABLED,
         "maker_fallback_market_effective": bool(
@@ -4120,6 +4145,34 @@ async def _breakout_lane_qualifies(rec: dict) -> tuple[bool, str]:
         return False, "erro"
 
 
+def _p04c_live_data_verdict(rec: dict, regime: dict) -> dict:
+    """Única decisão P04C consumida pelo loop de entrada automática LIVE."""
+    if not P04C_DATA_FRESHNESS_ENABLED:
+        return {
+            "ok": False,
+            "quality": "UNKNOWN",
+            "reason_code": "EXEC_DATA_FRESHNESS_DISABLED",
+            "reason": "P04C_DATA_FRESHNESS_ENABLED=false em modo LIVE",
+        }
+    try:
+        from services.data_freshness_service import evaluate_entry_data_freshness
+        return evaluate_entry_data_freshness(
+            rec,
+            regime,
+            max_candle_lag_periods=P04C_MAX_CANDLE_LAG_PERIODS,
+            max_ticker_age_ms=P04C_MAX_TICKER_AGE_MS,
+            max_derivatives_age_ms=P04C_MAX_DERIVATIVES_AGE_MS,
+            max_regime_age_ms=P04C_MAX_REGIME_AGE_MS,
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "quality": "UNKNOWN",
+            "reason_code": "EXEC_DATA_FRESHNESS_UNKNOWN",
+            "reason": f"falha interna no gate: {type(e).__name__}",
+        }
+
+
 async def open_shadow_for_recs(recs: list[dict]) -> int:
     """
     Pra cada rec marcada com `_just_saved=True` e tier A/A+, abre uma RealTrade.
@@ -4136,15 +4189,21 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
     mode = "shadow" if SHADOW_ENABLED else "live"
     log.debug(f"[shadow] processando {len(recs)} recs em modo={mode}")
 
-    # #6 — busca o regime UMA vez por lote (cache 10min no regime_service).
-    # Só quando o sizing por regime está ligado e em LIVE. Fail-soft.
+    # Busca o regime UMA vez por lote (cache no regime_service). O sizing ainda
+    # é opcional; P04C, porém, precisa provar o contexto em todo lote LIVE.
     _regime_cached: dict = {}
-    if not SHADOW_ENABLED and REGIME_SIZING_ENABLED:
+    if not SHADOW_ENABLED and (REGIME_SIZING_ENABLED or P04C_DATA_FRESHNESS_ENABLED):
         try:
             from services.regime_service import get_regime_status
             _regime_cached = await get_regime_status()
         except Exception as e:
-            log.warning(f"[regime-size] fetch regime falhou (fail-open mão cheia): {e}")
+            _regime_cached = {
+                "filter_enabled": True,
+                "quality": "UNKNOWN",
+                "observed_at_ms": int(time.time() * 1000),
+                "regime": "UNKNOWN",
+            }
+            log.warning(f"[p04c][regime] fetch falhou (LIVE fail-closed): {e}")
 
     # Edge-decay: recalcula (TTL-guarded) o mapa de símbolos/direções cujo edge
     # vivo azedou vs o próprio baseline. Query pesada roda no máx 1×/TTL; leitura
@@ -4248,6 +4307,22 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 (P04A_MAX_CHASE_ATR if P04A_MAX_CHASE_ATR is not None else PROXIMITY_MAX_ATR)
                 if PROXIMITY_GATE_ENABLED else 0.0
             )
+
+            # ── P04C: o plano só pode chegar aos gates de execução se a vela
+            # fechada e todo contexto que o influenciou ainda forem prováveis.
+            # P04A/P04B continuam responsáveis por preço/depth no instante do
+            # POST. Este gate não recalcula nem altera estratégia/score/IA.
+            if not SHADOW_ENABLED:
+                _p04c = _p04c_live_data_verdict(rec, _regime_cached)
+                if not _p04c.get("ok"):
+                    _code = _p04c.get("reason_code") or "EXEC_DATA_FRESHNESS_UNKNOWN"
+                    _reason = _p04c.get("reason") or "validade dos dados não comprovada"
+                    log.info(
+                        f"[p04c][data-freshness] {rec.get('symbol')} "
+                        f"{rec.get('timeframe')} {_code}: {_reason} — skip"
+                    )
+                    _record_skip(rec, "data-freshness", f"{_code}: {_reason}")
+                    continue
 
             # ── News gate: durante blackout macro, nenhuma entrada nova.
             if _news_blackout is not None:

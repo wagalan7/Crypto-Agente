@@ -13,7 +13,8 @@ Regimes detectados:
   - NORMAL: nada bloqueado.
 
 Toggle: REGIME_FILTER_ENABLED env (default "1").
-Fail-open: se fetch falha, retorna NORMAL.
+Classificação continua compatível (NORMAL em falha), mas P04C anexa qualidade
+UNKNOWN para que o último gate LIVE possa falhar fechado sem mudar a estratégia.
 
 API:
   await get_regime_status() -> {
@@ -278,19 +279,29 @@ async def _fetch_btc_trend_pct(days: int) -> Optional[float]:
 
 
 async def get_regime_status() -> Dict[str, Any]:
-    """Status do regime macro. Cache 10min. Fail-open."""
+    """Status do regime macro com identidade temporal auditável.
+
+    A classificação usada pelas recomendações preserva o comportamento
+    histórico. P04C usa ``quality`` e ``observed_at_ms`` para bloquear somente
+    a entrada LIVE quando não é possível provar o contexto essencial (BTC 24h).
+    """
     if not REGIME_FILTER_ENABLED:
+        observed_at_ms = int(time.time() * 1000)
         return {
             "regime": "NORMAL", "btc_24h_pct": None, "btc_dominance": None,
             "btc_trend_pct": None,
             "block_all": False, "block_alt_longs": False,
             "downgrade_alt_longs": False, "downgrade_shorts": False,
             "block_shorts": False, "reasons": ["filter disabled"],
+            "filter_enabled": False, "quality": "DISABLED",
+            "observed_at_ms": observed_at_ms, "cache_age_ms": 0,
         }
 
     now = time.time()
     if _cache["data"] and (now - _cache["ts"]) < CACHE_TTL:
-        return _cache["data"]
+        cached = dict(_cache["data"])
+        cached["cache_age_ms"] = max(0, int((now - _cache["ts"]) * 1000))
+        return cached
 
     btc_24h = await _fetch_btc_24h_pct()
     dom = await _fetch_btc_dominance()
@@ -312,12 +323,25 @@ async def get_regime_status() -> Dict[str, Any]:
         btc_trend = await _fetch_btc_trend_pct(SHORT_BRAKE_DAYS)
 
     data = _classify(btc_24h, dom, usdt_d, btc_trend)
-    if btc_24h is not None or dom is not None:
-        _cache["data"] = data
+    observed_at_ms = int(time.time() * 1000)
+    optional_values = (dom, usdt_d if ALT_RISKOFF_ENABLED else 0.0,
+                       btc_trend if SHORT_BRAKE_ENABLED else 0.0)
+    quality = (
+        "UNKNOWN" if btc_24h is None
+        else ("FRESH" if all(value is not None for value in optional_values) else "DEGRADED")
+    )
+    data.update({
+        "filter_enabled": True,
+        "quality": quality,
+        "observed_at_ms": observed_at_ms,
+        "cache_age_ms": 0,
+    })
+    if btc_24h is not None:
+        _cache["data"] = dict(data)
         _cache["ts"] = now
     else:
-        # Fail-open: tudo None → NORMAL, sem cachear (tenta de novo logo)
-        log.info("[regime] dados indisponíveis — fail-open NORMAL")
+        # Não cacheia contexto cuja segurança essencial não foi comprovada.
+        log.info("[regime] BTC 24h indisponível — classificação NORMAL/quality UNKNOWN")
 
     return data
 

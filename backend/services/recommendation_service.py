@@ -29,10 +29,14 @@ from services.pattern_service import detect_all_patterns, record_breakouts_and_r
 from services.signal_service import build_trade_signal, determine_direction
 from services.derivatives_service import analyze_derivatives
 from services.mtf_service import analyze_mtf
+from services.data_freshness_service import prepare_closed_candles
 from models.trade_signal import TradeSignal, SignalDirection
 
 
 SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
+P04C_MAX_CANDLE_LAG_PERIODS = max(
+    0.0, float(os.getenv("P04C_MAX_CANDLE_LAG_PERIODS", "1.25"))
+)
 
 # ── Chase estrutural (gated) ─────────────────────────────────────────────────
 # Mede o esticamento do preço desde a BASE do movimento (pivot estrutural), não
@@ -167,11 +171,16 @@ def _attach_htf_ema_trend(scored: list) -> None:
     MTF real. Fail-open (silencioso). Usado no caminho ao vivo, que não computa
     MTF — assim a trava de contra-tendência por moeda passa a ter referência."""
     try:
-        tf_ema: Dict[str, str] = {}
+        tf_ema: Dict[str, tuple[str, Optional[dict]]] = {}
         for s, _ in scored:
             lbl = _ema_aligned_label(s)
             if lbl:
-                tf_ema[s.timeframe] = lbl
+                proof = None
+                try:
+                    proof = (getattr(s, "data_freshness", None) or {}).get("candle")
+                except Exception:
+                    proof = None
+                tf_ema[s.timeframe] = (lbl, proof)
         if not tf_ema:
             return
         for s, _ in scored:
@@ -179,8 +188,15 @@ def _attach_htf_ema_trend(scored: list) -> None:
                 continue
             rank = _TF_RANK.get(s.timeframe, 0)
             htfs = [
-                {"timeframe": tf, "ema_aligned": lbl}
-                for tf, lbl in tf_ema.items()
+                {
+                    "timeframe": tf,
+                    "ema_aligned": label_and_proof[0],
+                    "data_freshness": (
+                        {"candle": dict(label_and_proof[1])}
+                        if label_and_proof[1] else None
+                    ),
+                }
+                for tf, label_and_proof in tf_ema.items()
                 if _TF_RANK.get(tf, 0) > rank
             ]
             if htfs:
@@ -908,11 +924,106 @@ def _liquidity_from_ticker(ticker: dict) -> tuple[Optional[float], Optional[floa
         return None, None
 
 
+def _prepare_signal_candles(df, symbol: str, tf: str, source: str):
+    """P04C: usa somente velas comprovadamente fechadas e devolve sua prova.
+
+    A função é deliberadamente anterior a indicadores/padrões. Assim a vela
+    corrente do provedor não contamina direção, score ou níveis do plano.
+    """
+    closed, verdict = prepare_closed_candles(
+        df,
+        tf,
+        max_lag_periods=P04C_MAX_CANDLE_LAG_PERIODS,
+    )
+    if not verdict.get("ok"):
+        try:
+            import logging as _log
+            _log.info(
+                "[p04c][candle] %s %s bloqueado: %s — %s",
+                source, tf, verdict.get("reason_code"), verdict.get("reason"),
+            )
+        except Exception:
+            pass
+        return None, None
+    checks = verdict.get("checks") or {}
+    observed_at_ms = int(time.time() * 1000)
+    return closed, {
+        "candle": {
+            "quality": "FRESH",
+            "source": source,
+            "symbol": symbol,
+            "timeframe": tf,
+            "open_time_ms": checks.get("open_time_ms"),
+            "close_time_ms": checks.get("close_time_ms"),
+            "observed_at_ms": observed_at_ms,
+            "age_ms": checks.get("age_ms"),
+            "dropped_open_candles": checks.get("dropped_open_candles", 0),
+        }
+    }
+
+
+def _ticker_freshness(
+    started_at_ms: int,
+    observed_at_ms: int,
+    liquidity: tuple[Optional[float], Optional[float]],
+    *,
+    symbol: str,
+    source: str = "okx-public",
+) -> Optional[dict]:
+    """Metadado somente quando algum valor do ticker entrou na recomendação."""
+    available = sum(value is not None for value in liquidity)
+    if available == 0:
+        return None
+    return {
+        "quality": "FRESH" if available == 2 else "DEGRADED",
+        "source": source,
+        "symbol": symbol,
+        "observed_at_ms": observed_at_ms,
+        "fetch_latency_ms": max(0, observed_at_ms - started_at_ms),
+    }
+
+
+def _derivatives_freshness(derivatives) -> Optional[dict]:
+    if derivatives is None:
+        return None
+    observed_at_ms = getattr(derivatives, "observed_at_ms", None)
+    if observed_at_ms is None:
+        return None
+    return {
+        "quality": getattr(derivatives, "quality", "UNKNOWN"),
+        "source": getattr(derivatives, "source", "unknown"),
+        "symbol": getattr(derivatives, "symbol", None),
+        "observed_at_ms": observed_at_ms,
+        "fetch_latency_ms": getattr(derivatives, "fetch_latency_ms", None),
+    }
+
+
+def _attach_data_freshness(
+    sig: Optional[TradeSignal],
+    freshness: dict,
+    *,
+    ticker: Optional[dict] = None,
+    derivatives=None,
+) -> None:
+    if sig is None:
+        return
+    proof = dict(freshness or {})
+    if ticker is not None:
+        proof["ticker"] = dict(ticker)
+    derivatives_meta = _derivatives_freshness(derivatives)
+    if derivatives_meta is not None:
+        proof["derivatives"] = derivatives_meta
+    sig.data_freshness = proof
+
+
 async def _analyze_symbol_tf(symbol: str, tf: str) -> Optional[TradeSignal]:
     """Retorna o TradeSignal completo para (symbol, tf) ou None se falhar."""
     try:
         df = await fetch_ohlcv(symbol, tf, 300)
-        if df.empty or len(df) < 80:
+        if df is None or df.empty:
+            return None
+        df, freshness = _prepare_signal_candles(df, symbol, tf, "okx-public")
+        if df is None or len(df) < 80:
             return None
         ind = calculate_indicators(df)
         patterns = detect_all_patterns(df)
@@ -923,10 +1034,19 @@ async def _analyze_symbol_tf(symbol: str, tf: str) -> Optional[TradeSignal]:
 
         # Derivativos + MTF em paralelo
         liq_vol = liq_spread = None
+        ticker_meta = None
         try:
+            ticker_started_at_ms = int(time.time() * 1000)
             ticker = await fetch_ticker(symbol)
+            ticker_observed_at_ms = int(time.time() * 1000)
             change_24h = ticker.get("change", 0.0)
             liq_vol, liq_spread = _liquidity_from_ticker(ticker)
+            ticker_meta = _ticker_freshness(
+                ticker_started_at_ms,
+                ticker_observed_at_ms,
+                (liq_vol, liq_spread),
+                symbol=symbol,
+            )
         except Exception:
             change_24h = 0.0
 
@@ -952,6 +1072,9 @@ async def _analyze_symbol_tf(symbol: str, tf: str) -> Optional[TradeSignal]:
         if sig is not None:
             sig.quote_vol_usd = liq_vol
             sig.spread_pct = liq_spread
+            _attach_data_freshness(
+                sig, freshness, ticker=ticker_meta, derivatives=derivatives,
+            )
         return sig
     except Exception:
         return None
@@ -1420,6 +1543,7 @@ async def _analyze_candles_for_tf(
     derivatives_done: bool = False,
     change_24h_cached: Optional[float] = None,
     liquidity_cached: Optional[tuple] = None,  # (quote_vol_usd, spread_pct) resolvido por símbolo
+    ticker_freshness_cached: Optional[dict] = None,
 ) -> Optional[TradeSignal]:
     """Variante de _analyze_symbol_tf que recebe candles já baixados (frontend).
 
@@ -1428,7 +1552,10 @@ async def _analyze_candles_for_tf(
     quando processa 3 TFs do mesmo símbolo.
     """
     try:
-        if df is None or df.empty or len(df) < 80:
+        if df is None or df.empty:
+            return None
+        df, freshness = _prepare_signal_candles(df, symbol, tf, "client-batch")
+        if df is None or len(df) < 80:
             return None
         ind = calculate_indicators(df)
         patterns = detect_all_patterns(df)
@@ -1438,14 +1565,23 @@ async def _analyze_candles_for_tf(
         primary_dir = determine_direction(ind, patterns, current)
 
         liq_vol, liq_spread = (liquidity_cached or (None, None))
+        ticker_meta = ticker_freshness_cached
 
         # Resolve ticker/derivatives só se o caller não passou (fallback)
         if not derivatives_done:
             try:
                 from services.binance_service import fetch_ticker
+                ticker_started_at_ms = int(time.time() * 1000)
                 ticker = await fetch_ticker(symbol)
+                ticker_observed_at_ms = int(time.time() * 1000)
                 change_24h_cached = ticker.get("change", 0.0)
                 liq_vol, liq_spread = _liquidity_from_ticker(ticker)
+                ticker_meta = _ticker_freshness(
+                    ticker_started_at_ms,
+                    ticker_observed_at_ms,
+                    (liq_vol, liq_spread),
+                    symbol=symbol,
+                )
             except Exception:
                 change_24h_cached = 0.0
             try:
@@ -1466,6 +1602,12 @@ async def _analyze_candles_for_tf(
         if sig is not None:
             sig.quote_vol_usd = liq_vol
             sig.spread_pct = liq_spread
+            _attach_data_freshness(
+                sig,
+                freshness,
+                ticker=ticker_meta,
+                derivatives=derivatives_cached,
+            )
         return sig
     except Exception:
         return None
@@ -1511,11 +1653,20 @@ async def get_recommendations_from_batch(
             # entre todos os TFs do mesmo símbolo (corta ~67% das chamadas
             # externas pesadas quando o batch tem 3 TFs/símbolo).
             liq = (None, None)
+            ticker_meta = None
             try:
                 from services.binance_service import fetch_ticker
+                ticker_started_at_ms = int(time.time() * 1000)
                 ticker = await fetch_ticker(symbol)
+                ticker_observed_at_ms = int(time.time() * 1000)
                 change_24h = ticker.get("change", 0.0)
                 liq = _liquidity_from_ticker(ticker)
+                ticker_meta = _ticker_freshness(
+                    ticker_started_at_ms,
+                    ticker_observed_at_ms,
+                    liq,
+                    symbol=symbol,
+                )
             except Exception:
                 change_24h = 0.0
             try:
@@ -1530,6 +1681,7 @@ async def get_recommendations_from_batch(
                     derivatives_done=True,
                     change_24h_cached=change_24h,
                     liquidity_cached=liq,
+                    ticker_freshness_cached=ticker_meta,
                 )
                 for tf, df in tfs
             ])
@@ -1781,7 +1933,11 @@ async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[Trade
     """Análise server-side usando a fonte escolhida (futures via proxy ou spot)."""
     try:
         df = await _fetch_ohlcv_cached(svc, symbol, tf, 300)
-        if df.empty or len(df) < 80:
+        if df is None or df.empty:
+            return None
+        source = getattr(svc, "__name__", svc.__class__.__name__)
+        df, freshness = _prepare_signal_candles(df, symbol, tf, f"server:{source}")
+        if df is None or len(df) < 80:
             return None
         ind = calculate_indicators(df)
         patterns = detect_all_patterns(df)
@@ -1790,10 +1946,12 @@ async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[Trade
         # Derivativos/MTF: só se a fonte for futures (tem funding/OI)
         derivatives = None
         mtf = None
-        return build_trade_signal(
+        sig = build_trade_signal(
             symbol, tf, df, ind, patterns,
             derivatives=derivatives, mtf=mtf, with_backtest=False,
         )
+        _attach_data_freshness(sig, freshness)
+        return sig
     except Exception:
         return None
 

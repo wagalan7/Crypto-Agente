@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Optional, List
 from pydantic import BaseModel
 import httpx
+import time
 
 from services.binance_service import to_okx, fetch_funding_rate, fetch_open_interest
 
@@ -17,6 +18,7 @@ BASE = "https://www.okx.com"
 
 
 class DerivativesData(BaseModel):
+    symbol: Optional[str] = None
     funding_rate: Optional[float] = None         # ex: 0.0001 (0.01%)
     funding_rate_pct: Optional[float] = None     # já em %
     funding_sentiment: str = "neutral"           # bullish_squeeze | bearish_squeeze | neutral | extreme_long | extreme_short
@@ -25,6 +27,13 @@ class DerivativesData(BaseModel):
     oi_sentiment: str = "neutral"                # bullish | bearish | neutral
     description: str = ""
     warnings: List[str] = []
+    # P04C — observabilidade local da coleta. Os provedores atuais não expõem
+    # um timestamp uniforme neste facade; por isso observed_at_ms representa a
+    # conclusão da chamada direta (sem cache), e quality registra completude.
+    quality: str = "UNKNOWN"                  # FRESH | DEGRADED | UNKNOWN
+    observed_at_ms: Optional[int] = None
+    fetch_latency_ms: Optional[int] = None
+    source: str = "okx-public"
 
 
 async def _fetch_oi_history(symbol: str) -> Optional[float]:
@@ -56,15 +65,24 @@ async def analyze_derivatives(symbol: str, price_change_24h: float = 0.0) -> Der
     Busca funding + OI e interpreta sentimento.
     `price_change_24h` em % é usado para cruzar com OI delta.
     """
+    started_at_ms = int(time.time() * 1000)
     funding = await fetch_funding_rate(symbol)
     oi = await fetch_open_interest(symbol)
     oi_change = await _fetch_oi_history(symbol)
+    observed_at_ms = int(time.time() * 1000)
+
+    available = sum(value is not None for value in (funding, oi, oi_change))
+    quality = "FRESH" if available == 3 else ("DEGRADED" if available else "UNKNOWN")
 
     data = DerivativesData(
+        symbol=symbol,
         funding_rate=funding,
         funding_rate_pct=round(funding * 100, 4) if funding is not None else None,
         open_interest=oi,
         oi_change_24h_pct=round(oi_change, 2) if oi_change is not None else None,
+        quality=quality,
+        observed_at_ms=observed_at_ms,
+        fetch_latency_ms=max(0, observed_at_ms - started_at_ms),
     )
 
     # ── Funding sentiment ─────────────────────────────────────────────────

@@ -519,3 +519,22 @@ Base: P04A (`b4027e41`). Detalhes em
 - Suíte crítica P01+P02+P03+P04A+P04B: **225 testes verdes 2×** no Python 3.11.
 - `py_compile` e `git diff --check` aprovados. Sem exchange/banco real, push ou
   deploy.
+
+---
+
+## P04C — VALIDADE CENTRAL DOS DADOS (2026-08-26)
+
+Detalhes em `docs/P04C_DATA_FRESHNESS.md`.
+
+- Velas abertas são removidas antes de indicadores/padrões; schema, valores,
+  ordem, duplicidade, lacunas, futuro e staleness falham fechado.
+- A recomendação preserva prova de símbolo/timeframe/fonte/idade para candle,
+  ticker, derivativos e cada contexto MTF realmente usado.
+- Regime passa a distinguir `FRESH/DEGRADED/UNKNOWN/DISABLED`; ausência do dado
+  essencial BTC 24h nunca é apresentada ao gate LIVE como contexto seguro.
+- O gate central roda antes de toda entrada automática LIVE e antes de P04A/P04B.
+  Flag OFF, exceção, identidade divergente ou contexto vencido = skip explicável,
+  zero ordem. Shadow não é bloqueado.
+- **18 testes P04C verdes**, `py_compile` aprovado e nenhuma rede/exchange/DB
+  acessada. Estratégia, score, IA, sizing, SL/TP e capabilities permanecem
+  inalterados/desligados conforme a baseline.

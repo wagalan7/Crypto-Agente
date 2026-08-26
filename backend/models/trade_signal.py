@@ -135,5 +135,9 @@ class TradeSignal(BaseModel):
     current_price: Optional[float] = None     # preço de mercado no momento da varredura (≠ entry quando entry_zone é limit)
     quote_vol_usd: Optional[float] = None     # volume 24h em USD (volume_base × last) — alimenta o gate de liquidez
     spread_pct: Optional[float] = None        # spread bid/ask em % no momento da varredura
+    # P04C: prova auditável de que o candle fechado e os contextos que
+    # efetivamente participaram do sinal ainda eram válidos na observação.
+    # O gate LIVE revalida identidade e idade; não altera estratégia/score.
+    data_freshness: Optional[dict] = None
     timestamp: int
     signal_strength: str

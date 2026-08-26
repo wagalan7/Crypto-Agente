@@ -11,11 +11,14 @@ from __future__ import annotations
 from typing import Optional, List, Dict
 from pydantic import BaseModel
 import asyncio
+import os
+import time
 
 from services.binance_service import fetch_ohlcv
 from services.indicator_service import calculate_indicators
 from services.pattern_service import detect_all_patterns
 from models.trade_signal import SignalDirection
+from services.data_freshness_service import prepare_closed_candles
 # NOTA: `determine_direction` é importado lazy dentro de _analyze_tf para
 # evitar import circular (signal_service importa este módulo).
 
@@ -34,6 +37,9 @@ MTF_MAP: Dict[str, List[str]] = {
     "1d":  ["3d"],
     "3d":  ["1d"],
 }
+P04C_MAX_CANDLE_LAG_PERIODS = max(
+    0.0, float(os.getenv("P04C_MAX_CANDLE_LAG_PERIODS", "1.25"))
+)
 
 
 class TFDirection(BaseModel):
@@ -43,6 +49,7 @@ class TFDirection(BaseModel):
     ema_aligned: Optional[str] = None   # bullish | bearish | mixed
     adx: Optional[float] = None
     description: str
+    data_freshness: Optional[dict] = None
 
 
 class MTFAlignment(BaseModel):
@@ -69,7 +76,12 @@ async def _analyze_tf(symbol: str, tf: str) -> Optional[TFDirection]:
     from services.signal_service import determine_direction
     try:
         df = await fetch_ohlcv(symbol, tf, limit=200)
-        if df.empty or len(df) < 50:
+        if df is None or df.empty:
+            return None
+        df, verdict = prepare_closed_candles(
+            df, tf, max_lag_periods=P04C_MAX_CANDLE_LAG_PERIODS,
+        )
+        if df is None or not verdict.get("ok") or len(df) < 50:
             return None
         ind = calculate_indicators(df)
         pats = detect_all_patterns(df)
@@ -104,6 +116,17 @@ async def _analyze_tf(symbol: str, tf: str) -> Optional[TFDirection]:
             ema_aligned=ema_label,
             adx=ind.adx,
             description=desc,
+            data_freshness={
+                "candle": {
+                    "quality": "FRESH",
+                    "source": "okx-public:mtf",
+                    "symbol": symbol,
+                    "timeframe": tf,
+                    "open_time_ms": (verdict.get("checks") or {}).get("open_time_ms"),
+                    "close_time_ms": (verdict.get("checks") or {}).get("close_time_ms"),
+                    "observed_at_ms": int(time.time() * 1000),
+                }
+            },
         )
     except Exception:
         return None
