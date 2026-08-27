@@ -7,8 +7,11 @@ exchange, banco externo, Railway ou Vercel.
 from __future__ import annotations
 
 import ast
+import asyncio
 import math
+import os
 import unittest
+from unittest.mock import AsyncMock, patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -54,6 +57,7 @@ def _raw(**kw) -> dict:
         "realized_r": 1.0,
         "status": "won_tp2",
         "resolved_at": T0,
+        "created_at": T0,
         "symbol": "BTC/USDT:USDT",
         "timeframe": "1h",
         "tier": "A",
@@ -104,6 +108,14 @@ class DatasetTests(unittest.TestCase):
         rows, dq = p05.normalize_outcomes([_raw(key="same"), _raw(key="same")], source="REAL")
         self.assertEqual(len(rows), 1)
         self.assertEqual(dq["excluded_by_reason"]["duplicado"], 1)
+
+    def test_duplicata_invalida_nao_elimina_valida(self):
+        rows, dq = p05.normalize_outcomes(
+            [_raw(key="same", realized_r=None), _raw(key="same", realized_r=1.0)],
+            source="REAL")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["realized_r"], 1.0)
+        self.assertNotIn("duplicado", dq["excluded_by_reason"])
 
     def test_sem_timestamp_de_resolucao_excluido(self):
         rows, dq = p05.normalize_outcomes([_raw(key="a", resolved_at=None)], source="REAL")
@@ -178,6 +190,15 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(p05.bootstrap_mean_ci(vals), p05.bootstrap_mean_ci(vals))
         a, b = vals[:3], vals[3:]
         self.assertEqual(p05.bootstrap_delta_ci(a, b), p05.bootstrap_delta_ci(a, b))
+
+    def test_bootstrap_pareado_deterministico(self):
+        rows = _rows([1.0, -1.0, 2.0, 0.5], features={"chase_atr": 0.5})
+        got = p05.bootstrap_paired_selection_delta_ci(
+            rows, p05.discover_champion_config(), {"PROXIMITY_MAX_ATR": 1.5},
+            ["proximity"], samples=100)
+        self.assertEqual(got, p05.bootstrap_paired_selection_delta_ci(
+            rows, p05.discover_champion_config(), {"PROXIMITY_MAX_ATR": 1.5},
+            ["proximity"], samples=100))
 
     def test_bootstrap_amostra_insuficiente_retorna_none(self):
         self.assertIsNone(p05.bootstrap_mean_ci([1.0]))
@@ -489,6 +510,15 @@ class EligibilityTests(unittest.TestCase):
         self.assertTrue(p05.eligibility(_raw(features={"chase_atr": 0.5}), cfg, ["proximity"]))
         self.assertFalse(p05.eligibility(_raw(features={"chase_atr": 2.0}), cfg, ["proximity"]))
 
+    def test_proximity_igual_bloqueia_e_retest_isenta(self):
+        cfg = dict(self.champ, BREAKOUT_LANE_ENABLED=False)
+        self.assertFalse(p05.eligibility(
+            _raw(features={"chase_atr": cfg["PROXIMITY_MAX_ATR"]}), cfg, ["proximity"]))
+        struct = dict(cfg, STRUCT_CHASE_GATE_ENABLED=True, STRUCT_CHASE_MAX_ATR=2.0)
+        self.assertTrue(p05.eligibility(
+            _raw(features={"struct_chase_atr": 2.0, "retest_armed": True}),
+            struct, ["struct_chase"]))
+
     def test_tf_min_tier(self):
         cfg = dict(self.champ)
         self.assertTrue(p05.eligibility(_raw(tier="A", timeframe="1h"), cfg, ["tf_min_tier"]))
@@ -508,6 +538,13 @@ class EligibilityTests(unittest.TestCase):
         forte = _raw(score=smin + 20, features={"edge_score": 0})
         self.assertFalse(p05.eligibility(marginal, cfg, ["quality_edge"]))
         self.assertTrue(p05.eligibility(forte, cfg, ["quality_edge"]))
+
+    def test_edge_tags_nao_substituem_edge_score(self):
+        cfg = dict(self.champ, QUALITY_EDGE_GATE_ENABLED=True,
+                   QUALITY_EDGE_MARGIN=6.0, QUALITY_EDGE_MIN=1)
+        row = _raw(score=cfg["SCORE_MIN"] + 1,
+                   features={"edge_score": 0, "edge_tags": ["forte"]})
+        self.assertFalse(p05.eligibility(row, cfg, ["quality_edge"]))
 
     def test_comparacao_simetrica_exclui_unknown_dos_dois_lados(self):
         rows = _rows([1.0, -1.0, 1.0])              # sem chase_atr
@@ -614,7 +651,7 @@ class OfflineGateTests(unittest.TestCase):
     def test_more_operations_aprova(self):
         v = _cmp(_mk(100, 0.20, pf=1.5, dd=4.0, sum_r=20.0),
                  _mk(130, 0.18, pf=1.4, dd=4.2, sum_r=23.4))
-        t = _cmp(_mk(50, 0.20), _mk(60, 0.15))
+        t = _cmp(_mk(50, 0.20), _mk(60, 0.20), added_exp=0.1)
         res = p05.evaluate_offline_gate(p05.OBJECTIVE_MORE_OPERATIONS, v, t)
         self.assertEqual(res["verdict"], p05.STATUS_OFFLINE_VALIDATED)
 
@@ -645,6 +682,14 @@ class OfflineGateTests(unittest.TestCase):
         res = p05.evaluate_offline_gate(p05.OBJECTIVE_LOSS_REDUCTION, v, t)
         self.assertEqual(res["verdict"], p05.STATUS_REJECTED)
 
+    def test_teste_final_pf_ou_drawdown_ruim_rejeita(self):
+        v = _cmp(_mk(100, 0.10, pf=1.2, dd=5.0), _mk(80, 0.30, pf=1.8, dd=3.0))
+        t = _cmp(_mk(50, 0.10, pf=2.0, dd=1.0),
+                 _mk(40, 0.30, pf=0.1, dd=100.0))
+        self.assertEqual(
+            p05.evaluate_offline_gate(p05.OBJECTIVE_LOSS_REDUCTION, v, t)["verdict"],
+            p05.STATUS_REJECTED)
+
     def test_nenhum_vencedor_forcado(self):
         """Candidato pior em tudo é REJEITADO — não existe 'melhor dos piores'."""
         v = _cmp(_mk(100, 0.30, pf=2.0, dd=2.0), _mk(60, -0.20, pf=0.5, dd=9.0), delta_low=-0.9)
@@ -661,16 +706,32 @@ class ShadowTests(unittest.TestCase):
         self.champ = p05.discover_champion_config()
 
     def test_anotacao_idempotente_e_por_experimento(self):
-        row = _raw(features={"chase_atr": 0.5})
+        row = _raw(created_at=T0, features={"chase_atr": 0.5})
         a = p05.build_experiment_annotation(row, self.champ, {"PROXIMITY_MAX_ATR": 1.5},
                                             experiment_key="k1", candidate_hash="h1",
                                             active=["proximity"])
         b = p05.build_experiment_annotation(row, self.champ, {"PROXIMITY_MAX_ATR": 1.5},
                                             experiment_key="k1", candidate_hash="h1",
                                             active=["proximity"])
-        for field in ("experiment_key", "candidate_hash", "challenger_status",
-                      "champion_eligible", "challenger_eligible", "reason_code"):
-            self.assertEqual(a[field], b[field])
+        self.assertEqual(a, b)
+        self.assertEqual(a["evaluated_at"], T0.isoformat())
+        self.assertEqual(a["champion_hash"], p05.canonical_hash(self.champ))
+
+    def test_anotacao_prospectiva_respeita_inicio_e_nao_sobrescreve(self):
+        context = {
+            "experiment_key": "e1", "candidate_hash": "c1",
+            "champion_hash": p05.canonical_hash(self.champ), "champion": self.champ,
+            "candidate_config": {"PROXIMITY_MAX_ATR": 1.5},
+            "active_components": ["proximity"], "shadow_started_at": T0,
+        }
+        before = p05.annotate_snapshot_features(
+            {"chase_atr": 0.5}, _raw(created_at=T0 - timedelta(seconds=1)), context)
+        self.assertNotIn("p05_experiment", before)
+        after = p05.annotate_snapshot_features(
+            {"chase_atr": 0.5}, _raw(created_at=T0), context)
+        self.assertEqual(after["p05_experiment"]["experiment_key"], "e1")
+        other = {"p05_experiment": {"experiment_key": "outro"}}
+        self.assertEqual(p05.annotate_snapshot_features(other, _raw(created_at=T0), context), other)
 
     def test_unknown_nunca_vira_blocked_ou_eligible(self):
         ann = p05.build_experiment_annotation(_raw(features={}), self.champ,
@@ -691,32 +752,57 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(ann["challenger_status"], p05.CHALLENGER_ELIGIBLE)
 
     def test_shadow_gate_aguarda_amostra(self):
-        res = p05.evaluate_shadow_gate({"challenger_resolved": 5, "observed_days": 3,
-                                        "coverage_pct": 100.0, "candidate": {"expectancy_r": 0.5}})
+        res = p05.evaluate_shadow_gate({"resolved": 5, "observed_days": 3,
+                                        "coverage_pct": 100.0, "candidate": {"expectancy_r": 0.5},
+                                        "operational_incident": False, "safety_relaxed": False})
         self.assertEqual(res["verdict"], p05.STATUS_INSUFFICIENT)
         self.assertEqual(res["reason_code"], "AGUARDANDO_AMOSTRA")
 
     def test_shadow_gate_aprova(self):
         res = p05.evaluate_shadow_gate({
-            "challenger_resolved": 40, "observed_days": 20, "coverage_pct": 95.0,
+            "resolved": 40, "challenger_resolved": 40, "observed_days": 20, "coverage_pct": 95.0,
             "candidate": {"expectancy_r": 0.3}, "objective_still_met": True,
             "operational_incident": False, "safety_relaxed": False})
         self.assertEqual(res["verdict"], p05.STATUS_ELIGIBLE)
 
     def test_shadow_gate_rejeita_cobertura_baixa(self):
         res = p05.evaluate_shadow_gate({
-            "challenger_resolved": 40, "observed_days": 20, "coverage_pct": 50.0,
-            "candidate": {"expectancy_r": 0.3}, "objective_still_met": True})
+            "resolved": 40, "challenger_resolved": 40, "observed_days": 20, "coverage_pct": 50.0,
+            "candidate": {"expectancy_r": 0.3}, "objective_still_met": True,
+            "operational_incident": False, "safety_relaxed": False})
         self.assertEqual(res["verdict"], p05.STATUS_REJECTED)
         self.assertIn("cobertura_minima", res["detail"])
 
     def test_shadow_gate_rejeita_relaxamento_de_safety(self):
         res = p05.evaluate_shadow_gate({
-            "challenger_resolved": 40, "observed_days": 20, "coverage_pct": 95.0,
+            "resolved": 40, "challenger_resolved": 40, "observed_days": 20, "coverage_pct": 95.0,
             "candidate": {"expectancy_r": 0.3}, "objective_still_met": True,
-            "safety_relaxed": True})
+            "operational_incident": False, "safety_relaxed": True})
         self.assertEqual(res["verdict"], p05.STATUS_REJECTED)
         self.assertIn("sem_relaxamento_p01_p04", res["detail"])
+
+    def test_shadow_gate_fail_closed_em_incidente_ou_safety_unknown(self):
+        base = {"resolved": 40, "observed_days": 20, "coverage_pct": 95.0,
+                "candidate": {"expectancy_r": 0.3}, "objective_still_met": True}
+        for incident, safety in ((True, False), (None, False), (False, None)):
+            got = p05.evaluate_shadow_gate(dict(
+                base, operational_incident=incident, safety_relaxed=safety))
+            self.assertEqual(got["reason_code"], "SHADOW_SAFETY_NOT_PROVEN")
+
+    def test_shadow_producao_aceita_somente_anotacao_exata(self):
+        raw = []
+        for i, key in enumerate(("ok", "wrong")):
+            ann = {"experiment_key": key, "candidate_hash": "c", "champion_hash": "h",
+                   "champion_eligible": True, "challenger_eligible": True}
+            raw.append(_raw(key=key, created_at=T0, resolved_at=T0 + timedelta(days=15, hours=i),
+                            features={"p05_experiment": ann}))
+        rows, _ = p05.normalize_outcomes(raw, source="SHADOW")
+        m = p05.compute_shadow_metrics(
+            rows, self.champ, {}, p05.OBJECTIVE_MORE_OPERATIONS, [], started_at=T0,
+            experiment_key="ok", candidate_hash="c", champion_hash="h",
+            require_annotations=True, operational_incident=False, safety_relaxed=False)
+        self.assertEqual(m["annotation_coverage_pct"], 50.0)
+        self.assertEqual(m["unknown_excluded"], 1)
 
     def test_transicoes_validas(self):
         self.assertTrue(p05.can_transition(p05.STATUS_DRAFT, p05.STATUS_OFFLINE_VALIDATED))
@@ -754,6 +840,8 @@ class ShadowTests(unittest.TestCase):
         self.assertIn("já existe um experimento SHADOW ativo", block)
         self.assertIn("with_for_update", block)
         self.assertIn("idempotent", block)
+        self.assertIn("_P05_SHADOW_LOCK_KEY", block)
+        self.assertIn("IntegrityError", block)
 
     def test_promotion_plan_nao_ativa_nada(self):
         plan = p05.build_promotion_plan(self.champ, {"PROXIMITY_MAX_ATR": 1.25}, {})
@@ -762,6 +850,51 @@ class ShadowTests(unittest.TestCase):
         self.assertIn("valores_rollback", plan)
         self.assertIn("plano_canario", plan)
         self.assertIn("NÃO foi ativado", plan["aviso"])
+
+
+class ShadowFlagTests(unittest.IsolatedAsyncioTestCase):
+    async def test_flags_off_bloqueiam_antes_do_db(self):
+        with patch.object(p05, "P05_CHALLENGER_SHADOW_ENABLED", False):
+            start = await p05.start_shadow(1)
+            evaluate = await p05.evaluate_shadow(1)
+        self.assertEqual(start["reason_code"], "P05_SHADOW_DISABLED")
+        self.assertTrue(evaluate["blocked"])
+
+
+class SafetyGovernanceTests(unittest.TestCase):
+    def test_fingerprint_deterministico_e_detecta_drift(self):
+        with patch.dict(os.environ, {"LIVE_SIZE_MULT": "0.25"}, clear=False):
+            a = p05.safety_guard()
+            b = p05.safety_guard()
+            self.assertEqual(a, b)
+        with patch.dict(os.environ, {"LIVE_SIZE_MULT": "0.50"}, clear=False):
+            c = p05.safety_guard()
+        self.assertNotEqual(a["fingerprint"], c["fingerprint"])
+
+    def test_snapshot_cobre_travas_criticas(self):
+        snap = p05.safety_config_snapshot()
+        expected = {"LIVE_SIZE_MULT", "MAKER_ENTRY_ENABLED", "TF_UPGRADE_ENABLED",
+                    "PYRAMIDING_ENABLED", "P04A_ENTRY_REVALIDATION_ENABLED",
+                    "P04B_MARKET_REVALIDATION_ENABLED", "P04B_MAKER_FALLBACK_ENABLED",
+                    "P04C_DATA_FRESHNESS_ENABLED"}
+        self.assertTrue(expected.issubset(snap))
+
+
+class CacheTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        p05._DIAG_CACHE.clear()
+
+    async def test_cache_singleflight(self):
+        calls = 0
+        async def fake(days):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(0)
+            return {"days": days}
+        with patch.object(p05, "build_diagnosis", side_effect=fake):
+            got = await asyncio.gather(*(p05.get_cached_diagnosis(30) for _ in range(5)))
+        self.assertEqual(calls, 1)
+        self.assertTrue(all(x == {"days": 30} for x in got))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -841,6 +974,13 @@ class ApiTests(unittest.TestCase):
         self.assertIn('"p05": p05', src)
         self.assertIn("async def _p05_section", src)
 
+    def test_shadow_bloqueado_nao_retorna_200(self):
+        for path in ("/api/strategy/p05/experiments/{exp_id}/start-shadow",
+                     "/api/strategy/p05/experiments/{exp_id}/evaluate-shadow"):
+            body = ast.get_source_segment(self.src, self.routes[("post", path)]) or ""
+            self.assertIn('res.get("blocked")', body)
+            self.assertIn("HTTPException(status_code=409", body)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  ARQUITETURA / SEGURANÇA
@@ -861,21 +1001,14 @@ class ArchitectureTests(unittest.TestCase):
             self.assertNotIn(proibido, self.src, f"chamada proibida: {proibido}")
 
     def test_nao_altera_p01_a_p04_nem_defaults_do_live(self):
-        """Não basta não citar: o serviço não pode LER como flag nem ESCREVER
-        nenhuma chave de safety/live. Menção em texto (plano de rollback) é ok."""
-        self.assertNotIn("os.environ[", self.src)
+        """Safety pode ser lida para fingerprint; nunca escrita ou promovida."""
         for proibido in ("LIVE_SIZE_MULT", "MAKER_ENTRY_ENABLED", "TF_UPGRADE_ENABLED",
                          "PYRAMIDING_ENABLED", "KILL_SWITCH"):
-            self.assertNotIn(f'getenv("{proibido}"', self.src, f"lê flag proibida: {proibido}")
-            self.assertNotIn(f"{proibido} =", self.src, f"atribui flag proibida: {proibido}")
             self.assertNotIn(proibido, p05.KNOB_ALLOWLIST, f"knob proibido na allowlist: {proibido}")
 
-    def test_live_size_mult_so_aparece_como_aviso_de_rollback(self):
-        """A única citação permitida é no plano de canário — mantendo-o INALTERADO."""
-        for line in self.src.splitlines():
-            if "LIVE_SIZE_MULT" in line:
-                self.assertIn("inalterado", line.lower(),
-                              f"citação de LIVE_SIZE_MULT fora do aviso: {line.strip()}")
+    def test_safety_e_somente_leitura(self):
+        self.assertIn("def safety_config_snapshot", self.src)
+        self.assertNotIn("os.environ[", self.src)
 
     def test_service_nao_escreve_env(self):
         tree = ast.parse(self.src)
@@ -884,6 +1017,15 @@ class ArchitectureTests(unittest.TestCase):
                 self.assertNotEqual(node.func.attr, "setenv")
                 if node.func.attr == "putenv":
                     self.fail("service não pode escrever env")
+            if isinstance(node, (ast.Assign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if (isinstance(target, ast.Subscript)
+                            and isinstance(target.value, ast.Attribute)
+                            and isinstance(target.value.value, ast.Name)
+                            and target.value.value.id == "os"
+                            and target.value.attr == "environ"):
+                        self.fail("service não pode atribuir os.environ")
 
     def test_defaults_nao_ligam_shadow_challenger(self):
         self.assertIn('_env_bool("P05_CHALLENGER_SHADOW_ENABLED", "false")', self.src)
@@ -903,6 +1045,14 @@ class ArchitectureTests(unittest.TestCase):
         self.assertIn("from models import strategy_experiment",
                       (BACKEND / "db.py").read_text())
 
+    def test_unico_shadow_garantido_no_banco(self):
+        model = (BACKEND / "models/strategy_experiment.py").read_text()
+        db = (BACKEND / "db.py").read_text()
+        self.assertIn('"uq_strategy_exp_single_shadow"', model)
+        self.assertIn("unique=True", model)
+        self.assertIn("status = 'SHADOW'", model)
+        self.assertIn("CREATE UNIQUE INDEX IF NOT EXISTS uq_strategy_exp_single_shadow", db)
+
     def test_snapshot_usa_namespace_versionado_sem_alterar_schema(self):
         src = (BACKEND / "services/snapshot_service.py").read_text()
         self.assertIn('"p05_context": _p05_context(', src)
@@ -911,11 +1061,28 @@ class ArchitectureTests(unittest.TestCase):
         self.assertIn('"schema_version": 1', block)
         self.assertIn("nunca inventa valor", block)
 
+    def test_pipeline_de_snapshot_aplica_anotacao_prospectiva(self):
+        src = (BACKEND / "services/snapshot_service.py").read_text()
+        save = src.split("async def save_recommendations")[1]
+        self.assertIn("_load_p05_shadow_context(session)", save)
+        self.assertIn("_annotate_p05_features(", save)
+        self.assertLess(save.index("_annotate_p05_features("),
+                        save.index("RecommendationSnapshot("))
+
     def test_p05_context_nao_inventa_valor_ausente(self):
         src = (BACKEND / "services/snapshot_service.py").read_text()
         block = src.split("def _p05_context(")[1].split("\nasync def ")[0]
         self.assertNotIn("or 0", block)                 # não substitui ausência por zero
         self.assertNotIn("or False", block)
+        self.assertNotIn('or "binance"', block)
+        self.assertNotIn('or "scan"', block)
+        self.assertNotIn('verdict.get("code")', block)
+
+    def test_read_paths_usam_cache(self):
+        self.assertIn("await get_cached_diagnosis(days)", self.src)
+        assertion = (BACKEND / "services/assertiveness_service.py").read_text()
+        self.assertIn("await p05.get_cached_diagnosis(days)", assertion)
+        self.assertIn('"P05_DIAG_CACHE_TTL_S"', self.src)
 
     def test_mae_mfe_declarado_indisponivel(self):
         self.assertIn('"status": "UNAVAILABLE"', self.src)
@@ -952,6 +1119,11 @@ class FrontendTests(unittest.TestCase):
 
     def test_nao_chama_lucro_perdido(self):
         self.assertNotIn("lucro perdido", self.src.lower())
+
+    def test_eligible_permanece_visivel_apos_shadow(self):
+        self.assertIn("p05?.shadow_experiment ?? p05?.eligible_experiment", self.src)
+        backend = (BACKEND / "services/assertiveness_service.py").read_text()
+        self.assertIn("eligible.to_dict(full=True)", backend)
 
 
 if __name__ == "__main__":

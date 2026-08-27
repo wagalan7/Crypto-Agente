@@ -24,7 +24,7 @@ congelados após o DRAFT — só métricas, status e decisão evoluem.
 from __future__ import annotations
 from datetime import datetime, timezone
 
-from sqlalchemy import String, Integer, DateTime, Index
+from sqlalchemy import String, Integer, DateTime, Index, CheckConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -47,15 +47,15 @@ class StrategyExperiment(Base):
     objective: Mapped[str] = mapped_column(String(24))
 
     # Configuração canônica do candidato (UM knob de diferença vs champion).
-    candidate_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    candidate_config: Mapped[dict] = mapped_column(JSONB(none_as_null=True), nullable=False)
 
     # Amostra usada (fingerprint = SHA-256 do conteúdo; cutoff = borda temporal).
     dataset_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     dataset_cutoff: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    offline_metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    shadow_metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    decision: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    offline_metrics: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    shadow_metrics: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    decision: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
@@ -70,6 +70,24 @@ class StrategyExperiment(Base):
 
     __table_args__ = (
         Index("ix_strategy_exp_status_created", "status", "created_at"),
+        # Defesa no banco: duas requisições concorrentes jamais deixam dois
+        # challengers ativos. O advisory lock do serviço melhora a resposta de
+        # conflito; este índice é a garantia final de integridade.
+        Index(
+            "uq_strategy_exp_single_shadow",
+            "status",
+            unique=True,
+            postgresql_where=text("status = 'SHADOW'"),
+            sqlite_where=text("status = 'SHADOW'"),
+        ),
+        CheckConstraint(
+            "status IN ('DRAFT','INSUFFICIENT_DATA','REJECTED','OFFLINE_VALIDATED','SHADOW','ELIGIBLE')",
+            name="ck_strategy_experiments_status",
+        ),
+        CheckConstraint(
+            "objective IN ('LOSS_REDUCTION','MORE_OPERATIONS')",
+            name="ck_strategy_experiments_objective",
+        ),
     )
 
     def to_dict(self, *, full: bool = False) -> dict:

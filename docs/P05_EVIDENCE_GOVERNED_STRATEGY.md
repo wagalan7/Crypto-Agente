@@ -75,8 +75,8 @@ slippage médio + cobertura · TP1/TP2 hit rate · operações por dia · cobert
 vínculo RealTrade→Snapshot · cobertura de features.
 
 Intervalos de expectancy e de delta usam **bootstrap com seed fixa**
-(`P05_RANDOM_SEED`) — mesma amostra ⇒ mesmo intervalo. Só biblioteca padrão
-(`random`, `math`, `statistics` não são substituídos por dependência nova).
+(`P05_RANDOM_SEED`). O delta champion×candidate é **pareado pela mesma
+oportunidade**, preservando a dependência entre os lados. Só biblioteca padrão.
 
 ## Segmentos
 
@@ -115,7 +115,7 @@ JSONB já existente de `recommendation_snapshots`. Nenhuma coluna nova.
 
 Persiste, quando **realmente disponível** no instante do snapshot: score, tier,
 P(TP1), P(TP2), risk_reward, quote volume, spread, edge_score, edge_tags,
-bot_verdict (ok/reason/code), regime, MTF, funding, ATR%, chase_atr,
+bot_verdict (ok/reason/blocked_by), regime, MTF, funding, ATR%, chase_atr,
 struct_chase_atr, entry_zone_type, resumo de data freshness, exchange/source e
 `observed_at`.
 
@@ -169,10 +169,10 @@ restart não cria experimento duplicado. Config e hashes são **imutáveis** ap�
 
 ## Validação temporal (sem leakage)
 
-Ordem cronológica obrigatória. Corte 50/25/25: **treino** gera hipótese,
-**validação** seleciona, **teste final permanece intocado** (nunca é usado para
-ajustar threshold). Walk-forward com folds cronológicos crescentes como evidência
-adicional.
+Ordem cronológica obrigatória. Corte 50/25/25: **treino** gera candidatos e
+congela cobertura/componentes; **validação** escolhe no máximo um finalista por
+objetivo; somente ele abre o **teste final intocado**. O holdout não cria
+hipótese nem escolhe componentes. Walk-forward cronológico é evidência adicional.
 
 - < `P05_MIN_OFFLINE_RESOLVED` (60) outcomes válidos → `INSUFFICIENT_DATA`
 - 60–119 → 4 folds · ≥120 → 6 folds
@@ -200,7 +200,9 @@ resultado aceitável** — não se força vencedor.
 ## Champion × Challenger em shadow (P05C)
 
 Sem divisão aleatória: os dois são avaliados **sobre a MESMA recomendação
-observada**. O challenger **não** altera score exibido, **não** altera o tier
+observada**, criada depois do início do SHADOW e anotada prospectivamente pelo
+pipeline real. Linha antiga, sem anotação ou com hash diferente não é
+reclassificada. O challenger **não** altera score exibido, **não** altera o tier
 usado pelo LIVE, **não** bloqueia recomendação, **não** abre trade, **não** altera
 sizing e **não** entra no executor — apenas registra o veredito contrafactual em
 `features["p05_experiment"]` (idempotente por `experiment_key`), com
@@ -209,8 +211,14 @@ sizing e **não** entra no executor — apenas registra o veredito contrafactual
 
 **`UNKNOWN` nunca vira `BLOCKED` nem `ELIGIBLE` por fallback.**
 
-Só **um** experimento em `SHADOW` por vez (garantido no serviço com
-`with_for_update` + verificação de conflito).
+Só **um** experimento em `SHADOW` por vez: advisory lock + `FOR UPDATE` no
+serviço e índice parcial único no PostgreSQL (`status='SHADOW'`). A flag
+`P05_CHALLENGER_SHADOW_ENABLED` é obrigatória e nasce `false`.
+
+No start, champion, componentes e fingerprint somente-leitura das proteções
+P01–P04 são congelados; incidente P03 aberto bloqueia a transição. Na decisão,
+drift, incidente desde o início ou falha de comprovação rejeitam de forma
+fail-closed. O P05 nunca escreve env.
 
 ## Decisão governada (P05D)
 
@@ -227,7 +235,7 @@ Sem saltos. Experimento decidido **não reabre** — nova evidência gera nova v
 (cutoff diferente ⇒ `experiment_key` diferente). Mudança de status + métricas
 ocorre em **transação única**.
 
-Gate de shadow (default): ≥30 outcomes do challenger · ≥14 dias · cobertura ≥90% ·
+Gate de shadow (default): ≥30 outcomes na coorte prospectiva · ≥14 dias · cobertura ≥90% ·
 expectancy > 0 · objetivo offline ainda atendido · nenhum incidente operacional ·
 nenhum relaxamento de P01–P04 · métricas **não** podem depender de dados UNKNOWN.
 
@@ -242,7 +250,11 @@ rollback.
 
 Uma única tabela nova: **`strategy_experiments`** (registrada em `init_db()` para
 `Base.metadata.create_all`). Nenhuma coluna foi adicionada a tabelas existentes.
-Índices: `experiment_key` (único), `candidate_hash`, `status`, `created_at`.
+Índices: `experiment_key` (único), `candidate_hash`, `status`, `created_at` e
+índice parcial único que impede dois `SHADOW` simultâneos.
+
+As rotas de leitura reutilizam cache single-flight curto
+(`P05_DIAG_CACHE_TTL_S`, default 300s); avaliações administrativas não usam cache.
 
 ## API
 
@@ -285,6 +297,7 @@ P05_MIN_FEATURE_COVERAGE_PCT=80
 P05_MIN_SHADOW_COVERAGE_PCT=90
 P05_BOOTSTRAP_SAMPLES=1000
 P05_RANDOM_SEED=20260827
+P05_DIAG_CACHE_TTL_S=300
 ```
 
 Expostas em `/api/strategy/p05/status`. **Defaults não alteram o LIVE.** Não

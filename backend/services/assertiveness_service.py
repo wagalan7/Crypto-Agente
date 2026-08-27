@@ -1343,7 +1343,7 @@ async def _p05_section(days: int) -> Dict[str, Any]:
         return {"enabled": False, "reason": "P05_ANALYTICS_ENABLED=false"}
     out: Dict[str, Any] = {"enabled": True, "window_days": days}
     try:
-        diag = await p05.build_diagnosis(days)
+        diag = await p05.get_cached_diagnosis(days)
         segments = diag.get("segments") or {}
         shadow = diag.get("shadow") or {}
         # Só os eixos de maior leitura no painel (payload enxuto).
@@ -1352,11 +1352,20 @@ async def _p05_section(days: int) -> Dict[str, Any]:
                      "by_regime", "by_score_bin", "by_atr_band"):
             block = segments.get(axis) or {}
             items = [it for it in (block.get("items") or [])
-                     if it.get("reliability") != p05.RELIABILITY_INSUFFICIENT]
+                     if it.get("reliability") in
+                     (p05.RELIABILITY_USABLE, p05.RELIABILITY_STRONG)]
             if not items:
                 continue
-            ranked = sorted(items, key=lambda it: it.get("avg_r") or 0.0, reverse=True)
-            best_worst[axis] = {"best": ranked[:3], "worst": ranked[-3:][::-1]}
+            # Só comparamos segmentos já utilizáveis. O pior conjunto exclui os
+            # escolhidos como melhores para não mostrar a mesma faixa nos dois lados.
+            ranked = sorted(items, key=lambda it: (
+                it.get("avg_r") if it.get("avg_r") is not None else -1e18,
+                it.get("count") or 0,
+            ), reverse=True)
+            best = ranked[:3]
+            best_ids = {id(it) for it in best}
+            remaining = [it for it in ranked if id(it) not in best_ids]
+            best_worst[axis] = {"best": best, "worst": remaining[-3:][::-1]}
         out["evidence_quality"] = diag.get("evidence_quality")
         out["shadow_metrics"] = shadow.get("metrics")
         out["real_metrics"] = (diag.get("real") or {}).get("metrics")
@@ -1379,7 +1388,7 @@ async def _p05_section(days: int) -> Dict[str, Any]:
                 .order_by(E.decided_at.desc())
             )).scalars().first()
         out["shadow_experiment"] = exp.to_dict(full=True) if exp else None
-        out["eligible_experiment"] = eligible.to_dict(full=False) if eligible else None
+        out["eligible_experiment"] = eligible.to_dict(full=True) if eligible else None
     except Exception as exc:  # noqa: BLE001
         log.warning(f"[assertiveness] p05 experimentos falhou: {exc}")
         out["shadow_experiment"] = None

@@ -83,6 +83,13 @@ async def init_db():
     from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # P05: defesa adicional para instalações onde a tabela já tenha sido
+        # criada antes do índice parcial entrar no metadata. Se houver mais de
+        # um SHADOW, a inicialização falha em vez de escolher um silenciosamente.
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_strategy_exp_single_shadow "
+            "ON strategy_experiments (status) WHERE status = 'SHADOW'"
+        ))
         # Rotação FASE 2 — coluna do preview semanal (tabela já podia existir)
         await conn.execute(text(
             "ALTER TABLE rotation_universe_state "

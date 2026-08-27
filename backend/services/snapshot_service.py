@@ -265,7 +265,7 @@ def _p05_context(rec: Dict[str, Any], sig: Dict[str, Any], created_at: datetime,
         "edge_tags": rec.get("edge_tags"),
         "bot_verdict_ok": verdict.get("ok"),
         "bot_verdict_reason": verdict.get("reason"),
-        "bot_verdict_code": verdict.get("code"),
+        "bot_verdict_blocked_by": verdict.get("blocked_by"),
         "regime": regime_label,
         "mtf_aligned": mtf.get("aligned_count") if mtf else None,
         "mtf_score": mtf.get("alignment_score") if mtf else None,
@@ -280,10 +280,42 @@ def _p05_context(rec: Dict[str, Any], sig: Dict[str, Any], created_at: datetime,
             if isinstance(sig, dict) else rec.get("entry_zone_type")
         ),
         "data_freshness": fresh_summary,
-        "exchange": rec.get("exchange") or "binance",
-        "source": rec.get("source") or "scan",
+        # Ausente continua ausente: não atribuir exchange/source por suposição.
+        "exchange": rec.get("exchange"),
+        "source": rec.get("source"),
         "observed_at": created_at.isoformat(),
     }
+
+
+async def _load_p05_shadow_context(session) -> Dict[str, Any] | None:
+    """Uma consulta por batch; qualquer falha desliga só a anotação P05."""
+    try:
+        from services import strategy_evidence_service as p05
+        return await p05.get_active_shadow_context(session)
+    except Exception as exc:
+        log.warning(f"[p05] contexto shadow indisponível: {exc}")
+        return None
+
+
+def _annotate_p05_features(features: Dict[str, Any], rec: Dict[str, Any],
+                           created_at: datetime, context: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not context:
+        return features
+    try:
+        from services import strategy_evidence_service as p05
+        row = {
+            "created_at": created_at,
+            "score": rec.get("score"),
+            "tier": rec.get("tier"),
+            "timeframe": rec.get("timeframe"),
+            "direction": rec.get("direction"),
+            "symbol": rec.get("symbol"),
+            "features": features,
+        }
+        return p05.annotate_snapshot_features(features, row, context)
+    except Exception as exc:
+        log.warning(f"[p05] anotação prospectiva falhou: {exc}")
+        return features
 
 
 async def _current_regime_label() -> str | None:
@@ -417,6 +449,7 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     _regime_label = await _current_regime_label()  # 1x por batch (#A — audit por regime)
 
     async with get_session() as session:
+        _p05_shadow_context = await _load_p05_shadow_context(session)
         for rec in recommendations:
             try:
                 # Dedup: existe registro recente do mesmo setup?
@@ -539,6 +572,10 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                 if isinstance(sig, dict):
                     tp1 = sig.get("tp1")
 
+                _features = _extract_features(rec, now, _regime_label)
+                _features = _annotate_p05_features(
+                    _features, rec, now, _p05_shadow_context
+                )
                 snap = RecommendationSnapshot(
                     symbol=rec["symbol"],
                     timeframe=rec["timeframe"],
@@ -555,7 +592,7 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                     stop_distance_pct=float(rec.get("stop_distance_pct", 0.0)),
                     status="open",
                     created_at=now,
-                    features=_extract_features(rec, now, _regime_label),
+                    features=_features,
                 )
                 session.add(snap)
                 rec["_just_saved"] = True

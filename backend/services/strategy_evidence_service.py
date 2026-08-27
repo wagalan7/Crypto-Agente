@@ -34,6 +34,8 @@ import logging
 import math
 import os
 import random
+import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -71,9 +73,74 @@ P05_MIN_FEATURE_COVERAGE_PCT = _env_float("P05_MIN_FEATURE_COVERAGE_PCT", 80.0)
 P05_MIN_SHADOW_COVERAGE_PCT = _env_float("P05_MIN_SHADOW_COVERAGE_PCT", 90.0)
 P05_BOOTSTRAP_SAMPLES = _env_int("P05_BOOTSTRAP_SAMPLES", 1000)
 P05_RANDOM_SEED = _env_int("P05_RANDOM_SEED", 20260827)
+P05_DIAG_CACHE_TTL_S = max(30, _env_int("P05_DIAG_CACHE_TTL_S", 300))
 
 # Teto duro do bootstrap (protege CPU mesmo se a env vier absurda).
 _BOOTSTRAP_HARD_MAX = 5000
+
+# Locks no PostgreSQL: serializam avaliação idempotente e troca do único
+# challenger. O índice parcial no model continua sendo a última barreira.
+_P05_EVALUATE_LOCK_KEY = 505202608
+_P05_SHADOW_LOCK_KEY = 505202609
+# Mesmo lock transacional usado pelo P03 ao persistir incidente+pausa. Assim,
+# start/decisão do P05 não conseguem "passar entre" a criação de um incidente
+# e a quarentena correspondente.
+_P03_SAFETY_LOCK_KEY = 917283
+
+_DIAG_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+_DIAG_CACHE_LOCK = asyncio.Lock()
+
+
+def safety_config_snapshot() -> Dict[str, Any]:
+    """Snapshot somente-leitura das proteções que condicionam o experimento.
+
+    Guardamos os valores normalizados como texto porque são exatamente as envs
+    consumidas pelo executor no boot. Qualquer mudança durante o SHADOW — mesmo
+    uma mudança aparentemente mais conservadora — exige nova avaliação; o P05
+    não tenta interpretar intenção nem escreve nessas variáveis.
+    """
+    defaults = {
+        "LIVE_SIZE_MULT": "1.0",
+        "MAKER_ENTRY_ENABLED": "false",
+        "TF_UPGRADE_ENABLED": "false",
+        "PYRAMIDING_ENABLED": "false",
+        "P04A_ENTRY_REVALIDATION_ENABLED": "true",
+        "P04A_QUOTE_TIMEOUT_S": "1.5",
+        "P04A_MAX_QUOTE_AGE_MS": "1500",
+        "P04A_MAX_FETCH_LATENCY_MS": "1500",
+        "P04A_MAX_ADVERSE_SLIPPAGE_PCT": "0.10",
+        "P04A_MAX_CHASE_ATR": "",
+        "P04B_MARKET_REVALIDATION_ENABLED": "true",
+        "P04B_MAKER_FALLBACK_ENABLED": "false",
+        "P04B_DEPTH_TIMEOUT_S": "1.5",
+        "P04B_MAX_DEPTH_AGE_MS": "1500",
+        "P04B_MAX_FETCH_LATENCY_MS": "1500",
+        "P04B_DEPTH_LIMIT": "50",
+        "P04B_MAX_BOOK_IMPACT_PCT": "0.10",
+        "P04B_MAX_MARKET_SLIPPAGE_PCT": os.getenv(
+            "P04A_MAX_ADVERSE_SLIPPAGE_PCT", "0.10"
+        ).strip(),
+        "P04C_DATA_FRESHNESS_ENABLED": "true",
+        "P04C_MAX_CANDLE_LAG_PERIODS": "1.25",
+        "P04C_MAX_TICKER_AGE_MS": "300000",
+        "P04C_MAX_DERIVATIVES_AGE_MS": "300000",
+        "P04C_MAX_REGIME_AGE_MS": "900000",
+    }
+    boolean_names = {
+        "MAKER_ENTRY_ENABLED", "TF_UPGRADE_ENABLED", "PYRAMIDING_ENABLED",
+        "P04A_ENTRY_REVALIDATION_ENABLED", "P04B_MARKET_REVALIDATION_ENABLED",
+        "P04B_MAKER_FALLBACK_ENABLED", "P04C_DATA_FRESHNESS_ENABLED",
+    }
+    out: Dict[str, Any] = {}
+    for name, default in defaults.items():
+        raw = os.getenv(name, default).strip()
+        out[name] = raw.lower() in ("1", "true", "yes", "on") if name in boolean_names else raw
+    return out
+
+
+def safety_guard() -> Dict[str, Any]:
+    config = safety_config_snapshot()
+    return {"fingerprint": canonical_hash(config), "config": config}
 
 FEATURES_SCHEMA_VERSION = 1
 
@@ -182,13 +249,6 @@ def normalize_outcomes(raw: Sequence[Dict[str, Any]], *, source: str) -> Tuple[L
         excluded[reason] = excluded.get(reason, 0) + 1
 
     for row in raw:
-        ident = row.get("dedupe_key")
-        if ident is not None:
-            if ident in seen:
-                _drop("duplicado")
-                continue
-            seen.add(ident)
-
         if row.get("is_open"):
             _drop("aberto (não resolvido)")
             continue
@@ -206,6 +266,15 @@ def normalize_outcomes(raw: Sequence[Dict[str, Any]], *, source: str) -> Tuple[L
         if resolved_at is None:
             _drop("sem timestamp de resolução")
             continue
+
+        # Só uma linha VÁLIDA reserva a identidade. Assim, uma cópia quebrada
+        # lida primeiro não elimina silenciosamente a versão válida posterior.
+        ident = row.get("dedupe_key")
+        if ident is not None:
+            if ident in seen:
+                _drop("duplicado")
+                continue
+            seen.add(ident)
 
         item = dict(row)
         item["realized_r"] = r
@@ -283,6 +352,103 @@ def bootstrap_delta_ci(a: Sequence[float], b: Sequence[float], *, seed: int = No
     hi = deltas[int(0.975 * (len(deltas) - 1))]
     return {"low": round(lo, 4), "high": round(hi, 4), "point": round(
         sum(va) / na - sum(vb) / nb, 4)}
+
+
+def bootstrap_paired_selection_delta_ci(
+    rows: Sequence[Dict[str, Any]],
+    champion: Dict[str, Any],
+    candidate: Dict[str, Any],
+    active: Sequence[str],
+    *,
+    seed: int = None,
+    samples: int = None,
+) -> Optional[Dict[str, float]]:
+    """IC do delta preservando a dependência entre champion e challenger.
+
+    A unidade reamostrada é a oportunidade original; em cada réplica as duas
+    regras são reaplicadas ao MESMO índice. Isso evita o IC independente (e
+    incorreto) quando um lado é subconjunto do outro.
+    """
+    merged = dict(champion)
+    merged.update(candidate)
+    pairs: List[Tuple[Optional[float], Optional[float]]] = []
+    for row in rows:
+        cv = eligibility(row, champion, active)
+        nv = eligibility(row, merged, active)
+        if cv is None or nv is None:
+            continue
+        r = _finite(row.get("realized_r"))
+        if r is None:
+            continue
+        pairs.append((r if nv else None, r if cv else None))
+    if len(pairs) < 2:
+        return None
+    cand_all = [a for a, _ in pairs if a is not None]
+    champ_all = [b for _, b in pairs if b is not None]
+    if len(cand_all) < 2 or len(champ_all) < 2:
+        return None
+    rng = random.Random(P05_RANDOM_SEED if seed is None else seed)
+    nboot = _bootstrap_samples() if samples is None else max(1, min(samples, _BOOTSTRAP_HARD_MAX))
+    n = len(pairs)
+    deltas: List[float] = []
+    for _ in range(nboot):
+        ca_sum = ch_sum = 0.0
+        ca_n = ch_n = 0
+        for _j in range(n):
+            ca, ch = pairs[rng.randrange(n)]
+            if ca is not None:
+                ca_sum += ca
+                ca_n += 1
+            if ch is not None:
+                ch_sum += ch
+                ch_n += 1
+        if ca_n and ch_n:
+            deltas.append(ca_sum / ca_n - ch_sum / ch_n)
+    if len(deltas) < max(20, nboot // 2):
+        return None
+    deltas.sort()
+    lo = deltas[int(0.025 * (len(deltas) - 1))]
+    hi = deltas[int(0.975 * (len(deltas) - 1))]
+    return {
+        "low": round(lo, 4),
+        "high": round(hi, 4),
+        "point": round(sum(cand_all) / len(cand_all) - sum(champ_all) / len(champ_all), 4),
+        "method": "paired-opportunity-bootstrap",
+    }
+
+
+def bootstrap_paired_membership_delta_ci(
+    rows: Sequence[Dict[str, Any]], champion_ids: set, candidate_ids: set,
+    *, seed: int = None, samples: int = None,
+) -> Optional[Dict[str, float]]:
+    """Versão pareada para memberships já congelados (anotações P05C)."""
+    pairs = [
+        (r["realized_r"] if id(r) in candidate_ids else None,
+         r["realized_r"] if id(r) in champion_ids else None)
+        for r in rows
+    ]
+    cand_all = [a for a, _ in pairs if a is not None]
+    champ_all = [b for _, b in pairs if b is not None]
+    if len(pairs) < 2 or len(cand_all) < 2 or len(champ_all) < 2:
+        return None
+    rng = random.Random(P05_RANDOM_SEED if seed is None else seed)
+    nboot = _bootstrap_samples() if samples is None else max(1, min(samples, _BOOTSTRAP_HARD_MAX))
+    deltas: List[float] = []
+    for _ in range(nboot):
+        sample = [pairs[rng.randrange(len(pairs))] for _j in range(len(pairs))]
+        ca = [a for a, _ in sample if a is not None]
+        ch = [b for _, b in sample if b is not None]
+        if ca and ch:
+            deltas.append(sum(ca) / len(ca) - sum(ch) / len(ch))
+    if len(deltas) < max(20, nboot // 2):
+        return None
+    deltas.sort()
+    return {
+        "low": round(deltas[int(0.025 * (len(deltas) - 1))], 4),
+        "high": round(deltas[int(0.975 * (len(deltas) - 1))], 4),
+        "point": round(sum(cand_all) / len(cand_all) - sum(champ_all) / len(champ_all), 4),
+        "method": "paired-annotation-bootstrap",
+    }
 
 
 def reliability_label(n: int) -> str:
@@ -613,11 +779,23 @@ def discover_champion_config() -> Dict[str, Any]:
         "TF_MIN_TIER": os.getenv("TF_MIN_TIER", "15m:A+,1h:A,4h:B").strip(),
         "QUALITY_EDGE_GATE_ENABLED": _env_bool("QUALITY_EDGE_GATE_ENABLED", "false"),
         "QUALITY_EDGE_MARGIN": _env_float("QUALITY_EDGE_MARGIN", 6.0),
+        "QUALITY_EDGE_MIN": _env_int("QUALITY_EDGE_MIN", 1),
         "MTF_ALIGNED_MODE": os.getenv("MTF_ALIGNED_MODE", "boost").strip().lower(),
         "MTF_ALIGNED_MIN_COUNT": _env_int("MTF_ALIGNED_MIN_COUNT", 2),
+        "SCORE_ADJUSTERS_ENABLED": _env_bool("SCORE_ADJUSTERS_ENABLED", "true"),
+        "SCORE_ADJUSTER_CAP": _env_float("SCORE_ADJUSTER_CAP", 20.0),
+        "PROXIMITY_GATE_ENABLED": _env_bool("PROXIMITY_GATE_ENABLED", "true"),
         "PROXIMITY_MAX_ATR": _env_float("PROXIMITY_MAX_ATR", 1.0),
+        "BREAKOUT_LANE_ENABLED": _env_bool("BREAKOUT_LANE_ENABLED", "false"),
+        "BREAKOUT_LANE_MAX_ATR": _env_float("BREAKOUT_LANE_MAX_ATR", 2.0),
         "STRUCT_CHASE_GATE_ENABLED": _env_bool("STRUCT_CHASE_GATE_ENABLED", "false"),
         "STRUCT_CHASE_MAX_ATR": _env_float("STRUCT_CHASE_MAX_ATR", 5.0),
+        "ATR_GATE_ENABLED": _env_bool("ATR_GATE_ENABLED", "true"),
+        "ATR_BLOCK_THRESHOLD": _env_float("ATR_BLOCK_THRESHOLD", 3.0),
+        "FUNDING_GATE_ENABLED": _env_bool("FUNDING_GATE_ENABLED", "true"),
+        "FUNDING_BLOCK_THRESHOLD": _env_float("FUNDING_BLOCK_THRESHOLD", 0.05),
+        "BLOCK_HOURS_UTC": os.getenv("BLOCK_HOURS_UTC", "").strip(),
+        "BLOCK_DAYS_UTC": os.getenv("BLOCK_DAYS_UTC", "").strip().lower(),
     }
 
 
@@ -727,7 +905,7 @@ def dataset_fingerprint(rows: Sequence[Dict[str, Any]]) -> str:
 
 def build_experiment_key(champion_hash: str, candidate_hash: str, cutoff: datetime) -> str:
     """Identidade lógica: mesmo candidato + champion + cutoff ⇒ MESMO experimento."""
-    return f"{champion_hash[:16]}:{candidate_hash[:16]}:{_utc(cutoff).isoformat()}"
+    return f"{champion_hash}:{candidate_hash}:{_utc(cutoff).isoformat()}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -749,6 +927,71 @@ def _parse_tf_min_tier(spec: str) -> Dict[str, str]:
     return out
 
 
+def _execution_score(row: Dict[str, Any], config: Dict[str, Any]) -> Optional[float]:
+    """Espelha o score efetivamente comparado com SCORE_MIN no executor.
+
+    O executor aplica os adjusters antes do gate. Reproduzimos a fórmula pura
+    usando apenas features persistidas no instante da recomendação; dado ausente
+    conserva delta zero, exatamente como o caminho real.
+    """
+    score = _finite(row.get("score"))
+    if score is None or not config.get("SCORE_ADJUSTERS_ENABLED"):
+        return score
+    f = row.get("features") or {}
+    delta = 0.0
+    atr = _finite(f.get("atr_pct"))
+    if atr is not None:
+        delta += -8 if atr > 3.0 else (6 if atr < 1.0 else 0)
+    conf = _finite(f.get("confluence_pct"))
+    if conf is not None:
+        delta += -4 if conf < 50 else (12 if conf <= 70 else 0)
+    rsi = _finite(f.get("rsi"))
+    if rsi is not None and rsi < 30:
+        delta -= 7
+    adx = _finite(f.get("adx"))
+    if adx is not None:
+        delta += 6 if adx < 20 else (-2 if adx > 30 else 0)
+    mtf = _finite(f.get("mtf_aligned"))
+    if mtf is not None and mtf >= 2:
+        delta += 8
+    if f.get("funding_sentiment") == "neutral":
+        delta += 6
+    funding = _finite(f.get("funding_pct"))
+    if funding is not None and -0.05 <= funding <= 0.05:
+        delta += 6
+    weights = {
+        "descending_channel": 12,
+        "descending_wedge": 10,
+        "inverse_head_and_shoulders": 7,
+        "double_bottom": 6,
+    }
+    patterns = f.get("patterns") or []
+    if isinstance(patterns, list):
+        delta += sum(weights.get(p, 0) for p in patterns)
+    hour = f.get("hour_utc")
+    try:
+        hour = int(hour)
+    except (TypeError, ValueError):
+        hour = None
+    if hour is not None:
+        delta += 6 if 0 <= hour <= 6 else (5 if 14 <= hour <= 21 else 0)
+    cap = abs(_finite(config.get("SCORE_ADJUSTER_CAP")) or 20.0)
+    return score + max(-cap, min(delta, cap))
+
+
+def _csv_set(value: Any, *, ints: bool = False) -> set:
+    out = set()
+    for item in str(value or "").split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        try:
+            out.add(int(item) if ints else item)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def eligibility(row: Dict[str, Any], config: Dict[str, Any],
                 active_components: Sequence[str]) -> Optional[bool]:
     """O setup passaria pelos gates desta configuração?
@@ -763,10 +1006,13 @@ def eligibility(row: Dict[str, Any], config: Dict[str, Any],
     feats = row.get("features") or {}
 
     if "score_min" in active_components:
-        score = _finite(row.get("score"))
+        score = _execution_score(row, config)
         if score is None:
             return None
-        if score < _finite(config.get("SCORE_MIN")):
+        score_min = _finite(config.get("SCORE_MIN"))
+        if score_min is None:
+            return None
+        if score < score_min:
             return False
 
     if "tf_min_tier" in active_components:
@@ -779,19 +1025,35 @@ def eligibility(row: Dict[str, Any], config: Dict[str, Any],
         if required is not None and _TIER_RANK[tier] < _TIER_RANK[required]:
             return False
 
+    if "base_quality" in active_components:
+        verdict_ok = feats.get("bot_verdict_ok")
+        blocked_by = feats.get("bot_verdict_blocked_by") or feats.get("bot_verdict_code")
+        if verdict_ok is None:
+            return None
+        if verdict_ok is False:
+            # Quality-edge pode ser justamente o knob testado; os demais gates
+            # do bot_verdict (RR/P(TP1)/liquidez) permanecem bloqueio simétrico.
+            if blocked_by == "quality-edge-gate":
+                pass
+            elif blocked_by:
+                return False
+            else:
+                return None
+
     if "quality_edge" in active_components and config.get("QUALITY_EDGE_GATE_ENABLED"):
-        score = _finite(row.get("score"))
+        score = _execution_score(row, config)
         smin = _finite(config.get("SCORE_MIN"))
         margin = _finite(config.get("QUALITY_EDGE_MARGIN")) or 0.0
         if score is None or smin is None:
             return None
         if smin <= score < smin + margin:          # banda marginal exige edge
             edge = _finite(feats.get("edge_score"))
-            tags = feats.get("edge_tags")
-            if edge is None and tags is None:
+            if edge is None:
                 return None
-            has_edge = (edge is not None and edge > 0) or bool(tags)
-            if not has_edge:
+            edge_min = _finite(config.get("QUALITY_EDGE_MIN"))
+            if edge_min is None:
+                return None
+            if edge < edge_min:
                 return False
 
     if "mtf" in active_components and (config.get("MTF_ALIGNED_MODE") == "required"):
@@ -802,18 +1064,71 @@ def eligibility(row: Dict[str, Any], config: Dict[str, Any],
         if n_aligned < (_finite(config.get("MTF_ALIGNED_MIN_COUNT")) or 0):
             return False
 
-    if "proximity" in active_components:
+    if "proximity" in active_components and config.get("PROXIMITY_GATE_ENABLED"):
         chase = _finite(feats.get("chase_atr"))
         if chase is None:
             return None
-        if chase > (_finite(config.get("PROXIMITY_MAX_ATR")) or 0.0):
+        ceiling = _finite(config.get("PROXIMITY_MAX_ATR"))
+        if ceiling is None:
+            return None
+        if chase >= ceiling:
+            if config.get("BREAKOUT_LANE_ENABLED"):
+                breakout_ceiling = _finite(config.get("BREAKOUT_LANE_MAX_ATR"))
+                # O bias macro usado pela lane não é reconstruível fielmente.
+                # Acima do teto estendido o bloqueio é certo; na faixa entre os
+                # tetos o veredito é UNKNOWN, nunca um passe inventado.
+                if breakout_ceiling is None or chase < breakout_ceiling:
+                    return None
             return False
 
     if "struct_chase" in active_components and config.get("STRUCT_CHASE_GATE_ENABLED"):
-        struct = _finite(feats.get("struct_chase_atr"))
-        if struct is None:
+        if feats.get("retest_armed") is True:
+            pass
+        else:
+            struct = _finite(feats.get("struct_chase_atr"))
+            if struct is None:
+                return None
+            ceiling = _finite(config.get("STRUCT_CHASE_MAX_ATR"))
+            if ceiling is None:
+                return None
+            if struct >= ceiling:
+                return False
+
+    if "atr_gate" in active_components and config.get("ATR_GATE_ENABLED"):
+        atr = _finite(feats.get("atr_pct"))
+        if atr is None:
             return None
-        if struct > (_finite(config.get("STRUCT_CHASE_MAX_ATR")) or 0.0):
+        threshold = _finite(config.get("ATR_BLOCK_THRESHOLD"))
+        if threshold is None:
+            return None
+        if atr > threshold:
+            return False
+
+    if "funding_gate" in active_components and config.get("FUNDING_GATE_ENABLED"):
+        funding = _finite(feats.get("funding_pct"))
+        direction = (row.get("direction") or "").strip().lower()
+        if funding is None or direction not in ("long", "short"):
+            return None
+        threshold = _finite(config.get("FUNDING_BLOCK_THRESHOLD"))
+        if threshold is None:
+            return None
+        if (direction == "long" and funding > threshold) or (
+            direction == "short" and funding < -threshold
+        ):
+            return False
+
+    if "time_gate" in active_components:
+        hour = feats.get("hour_utc")
+        dow = feats.get("day_of_week")
+        try:
+            hour = int(hour)
+            dow = int(dow)
+        except (TypeError, ValueError):
+            return None
+        if hour in _csv_set(config.get("BLOCK_HOURS_UTC"), ints=True):
+            return False
+        day_names = {0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"}
+        if day_names.get(dow) in _csv_set(config.get("BLOCK_DAYS_UTC")):
             return False
 
     return True
@@ -822,10 +1137,14 @@ def eligibility(row: Dict[str, Any], config: Dict[str, Any],
 _COMPONENT_FEATURES = {
     "score_min": "__score__",
     "tf_min_tier": "__tier__",
+    "base_quality": "bot_verdict_ok",
     "quality_edge": "edge_score",
     "mtf": "mtf_aligned",
     "proximity": "chase_atr",
     "struct_chase": "struct_chase_atr",
+    "atr_gate": "atr_pct",
+    "funding_gate": "funding_pct",
+    "time_gate": "hour_utc",
 }
 _KNOB_COMPONENT = {
     "SCORE_MIN": "score_min",
@@ -850,6 +1169,12 @@ def component_coverage(rows: Sequence[Dict[str, Any]], component: str) -> Option
         present = sum(1 for r in rows if _finite(r.get("score")) is not None)
     elif feat == "__tier__":
         present = sum(1 for r in rows if (r.get("tier") or "") and (r.get("timeframe") or ""))
+    elif component == "time_gate":
+        present = sum(
+            1 for r in rows
+            if (r.get("features") or {}).get("hour_utc") is not None
+            and (r.get("features") or {}).get("day_of_week") is not None
+        )
     else:
         present = sum(1 for r in rows if (r.get("features") or {}).get(feat) is not None)
     return round(present / n * 100, 1)
@@ -887,6 +1212,50 @@ def split_by_config(rows: Sequence[Dict[str, Any]], config: Dict[str, Any],
     return taken, unknown
 
 
+def _material_segment_regressions(
+    champion_rows: Sequence[Dict[str, Any]],
+    candidate_rows: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Detecta bolsões materiais com expectancy negativa no candidato.
+
+    Um segmento só é material com pelo menos 10 casos e 10% da amostra do
+    candidato. Eixos sobrepostos são diagnóstico conservador, não causalidade.
+    """
+    if not candidate_rows:
+        return []
+    min_n = max(10, math.ceil(len(candidate_rows) * 0.10))
+    axes = {
+        "direction": lambda r: r.get("direction"),
+        "timeframe": lambda r: r.get("timeframe"),
+        "tier": lambda r: r.get("tier"),
+        "regime": lambda r: (r.get("features") or {}).get("regime"),
+    }
+    bad: List[Dict[str, Any]] = []
+    for axis, getter in axes.items():
+        cgroups: Dict[str, List[Dict[str, Any]]] = {}
+        hgroups: Dict[str, List[Dict[str, Any]]] = {}
+        for row in candidate_rows:
+            key = getter(row)
+            if key is not None:
+                cgroups.setdefault(str(key), []).append(row)
+        for row in champion_rows:
+            key = getter(row)
+            if key is not None:
+                hgroups.setdefault(str(key), []).append(row)
+        for key, group in cgroups.items():
+            if len(group) < min_n:
+                continue
+            cm = compute_evidence_metrics(group, with_bootstrap=False)
+            hm = compute_evidence_metrics(hgroups.get(key, []), with_bootstrap=False)
+            cexp = cm.get("expectancy_r")
+            hexp = hm.get("expectancy_r")
+            if cexp is not None and cexp < 0 and (hexp is None or cexp < hexp):
+                bad.append({"axis": axis, "segment": key, "count": len(group),
+                            "candidate_expectancy_r": cexp,
+                            "champion_expectancy_r": hexp})
+    return bad
+
+
 def compare_configs(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
                     candidate_cfg: Dict[str, Any], active: Sequence[str]) -> Dict[str, Any]:
     """Compara champion × candidato sobre o MESMO dataset.
@@ -909,8 +1278,7 @@ def compare_configs(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
     added = [r for r in cand_rows if id(r) not in champ_keys]
     avoided = [r for r in champ_rows if id(r) not in cand_keys]
 
-    delta_ci = bootstrap_delta_ci([r["realized_r"] for r in cand_rows],
-                                  [r["realized_r"] for r in champ_rows])
+    delta_ci = bootstrap_paired_selection_delta_ci(rows, champion, candidate_cfg, active)
     return {
         "evaluable": len(evaluable),
         "unknown_excluded": len(rows) - len(evaluable),
@@ -923,6 +1291,7 @@ def compare_configs(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
         "avoided_expectancy_r": (round(sum(r["realized_r"] for r in avoided) / len(avoided), 4)
                                  if avoided else None),
         "delta_expectancy_ci": delta_ci,
+        "material_segment_regressions": _material_segment_regressions(champ_rows, cand_rows),
         "selects_subset": len(cand_rows) < len(champ_rows),
         "note": "champion e candidato avaliados sobre o MESMO dataset; UNKNOWN excluído dos dois lados",
     }
@@ -1000,51 +1369,58 @@ def evaluate_offline_gate(objective: str, validation: Dict[str, Any],
                           f"(< {P05_MIN_OOS_RESOLVED})",
                 "checks": checks}
 
-    exp_v, exp_t = cand_v["expectancy_r"], cand_t["expectancy_r"]
-    _chk("expectancy_candidate_positiva",
-         exp_v is not None and exp_v > 0 and exp_t is not None and exp_t > 0,
-         f"validação={exp_v} teste={exp_t}")
-
-    if objective == OBJECTIVE_LOSS_REDUCTION:
-        dci = validation.get("delta_expectancy_ci")
-        _chk("ci_delta_expectancy_acima_de_zero",
-             bool(dci) and dci["low"] > 0,
-             f"IC do delta={dci}")
-        _chk("profit_factor_nao_pior",
-             _pf(cand_v) >= _pf(champ_v),
-             f"cand={cand_v['profit_factor']} champ={champ_v['profit_factor']}")
-        _chk("drawdown_nao_pior",
-             (cand_v["max_drawdown_r"] or 0) <= (champ_v["max_drawdown_r"] or 0) + 1e-9,
-             f"cand={cand_v['max_drawdown_r']} champ={champ_v['max_drawdown_r']}")
-        _chk("operacoes_min_70pct",
-             champ_v["count"] > 0 and cand_v["count"] >= 0.7 * champ_v["count"],
-             f"cand={cand_v['count']} champ={champ_v['count']}")
-    elif objective == OBJECTIVE_MORE_OPERATIONS:
-        _chk("operacoes_min_110pct",
-             champ_v["count"] > 0 and cand_v["count"] >= 1.1 * champ_v["count"],
-             f"cand={cand_v['count']} champ={champ_v['count']}")
-        eci = cand_v.get("expectancy_ci")
-        _chk("ci_expectancy_acima_de_zero",
-             bool(eci) and eci["low"] > 0, f"IC={eci}")
-        _chk("total_r_maior",
-             (cand_v["sum_r"] or 0) > (champ_v["sum_r"] or 0),
-             f"cand={cand_v['sum_r']} champ={champ_v['sum_r']}")
-        _chk("profit_factor_min_1",
-             _pf(cand_v) >= 1.0, f"cand={cand_v['profit_factor']}")
-        _chk("drawdown_max_110pct",
-             (cand_v["max_drawdown_r"] or 0) <= 1.1 * (champ_v["max_drawdown_r"] or 0) + 1e-9,
-             f"cand={cand_v['max_drawdown_r']} champ={champ_v['max_drawdown_r']}")
-        add_exp = validation.get("added_expectancy_r")
-        _chk("operacoes_adicionais_positivas",
-             add_exp is not None and add_exp > 0,
-             f"expectancy das adicionais={add_exp}")
-    else:
+    if objective not in OBJECTIVES:
         return {"verdict": STATUS_REJECTED, "reason_code": "OBJETIVO_INVALIDO",
                 "detail": objective, "checks": checks}
 
-    _chk("teste_final_positivo",
-         exp_t is not None and exp_t > 0 and (cand_t["sum_r"] or 0) > 0,
-         f"expectancy={exp_t} total_r={cand_t['sum_r']}")
+    # O holdout confirma os MESMOS contratos da validação. Não basta terminar
+    # levemente positivo se PF/drawdown/volume ou as operações adicionais
+    # colapsaram fora da amostra.
+    for stage, comparison in (("validacao", validation), ("teste", test)):
+        cand = comparison["candidate"]
+        champ = comparison["champion"]
+        exp = cand.get("expectancy_r")
+        _chk(f"{stage}_expectancy_candidate_positiva",
+             exp is not None and exp > 0 and (cand.get("sum_r") or 0) > 0,
+             f"expectancy={exp} total_r={cand.get('sum_r')}")
+
+        if objective == OBJECTIVE_LOSS_REDUCTION:
+            dci = comparison.get("delta_expectancy_ci")
+            _chk(f"{stage}_ci_delta_expectancy_acima_de_zero",
+                 bool(dci) and dci.get("low") is not None and dci["low"] > 0,
+                 f"IC do delta={dci}")
+            _chk(f"{stage}_profit_factor_nao_pior",
+                 _pf(cand) >= _pf(champ),
+                 f"cand={cand.get('profit_factor')} champ={champ.get('profit_factor')}")
+            _chk(f"{stage}_drawdown_nao_pior",
+                 (cand.get("max_drawdown_r") or 0) <= (champ.get("max_drawdown_r") or 0) + 1e-9,
+                 f"cand={cand.get('max_drawdown_r')} champ={champ.get('max_drawdown_r')}")
+            _chk(f"{stage}_operacoes_min_70pct",
+                 champ.get("count", 0) > 0 and cand.get("count", 0) >= 0.7 * champ["count"],
+                 f"cand={cand.get('count')} champ={champ.get('count')}")
+        else:
+            _chk(f"{stage}_operacoes_min_110pct",
+                 champ.get("count", 0) > 0 and cand.get("count", 0) >= 1.1 * champ["count"],
+                 f"cand={cand.get('count')} champ={champ.get('count')}")
+            eci = cand.get("expectancy_ci")
+            _chk(f"{stage}_ci_expectancy_acima_de_zero",
+                 bool(eci) and eci.get("low") is not None and eci["low"] > 0, f"IC={eci}")
+            _chk(f"{stage}_total_r_maior",
+                 (cand.get("sum_r") or 0) > (champ.get("sum_r") or 0),
+                 f"cand={cand.get('sum_r')} champ={champ.get('sum_r')}")
+            _chk(f"{stage}_profit_factor_min_1",
+                 _pf(cand) >= 1.0, f"cand={cand.get('profit_factor')}")
+            _chk(f"{stage}_drawdown_max_110pct",
+                 (cand.get("max_drawdown_r") or 0) <= 1.1 * (champ.get("max_drawdown_r") or 0) + 1e-9,
+                 f"cand={cand.get('max_drawdown_r')} champ={champ.get('max_drawdown_r')}")
+            add_exp = comparison.get("added_expectancy_r")
+            _chk(f"{stage}_operacoes_adicionais_positivas",
+                 add_exp is not None and add_exp > 0,
+                 f"expectancy das adicionais={add_exp}")
+
+        regressions = comparison.get("material_segment_regressions") or []
+        _chk(f"{stage}_sem_segmento_material_negativo", not regressions,
+             f"regressões={regressions[:5]}")
 
     failed = [c["check"] for c in checks if not c["passed"]]
     if failed:
@@ -1061,10 +1437,30 @@ def evaluate_shadow_gate(shadow_metrics: Dict[str, Any]) -> Dict[str, Any]:
     def _chk(name: str, passed: bool, detail: str) -> None:
         checks.append({"check": name, "passed": passed, "detail": detail})
 
-    resolved = shadow_metrics.get("challenger_resolved") or 0
+    # Maturidade é medida pela coorte prospectiva total. Usar apenas as linhas
+    # aceitas pelo challenger faria um candidato restritivo esperar para sempre;
+    # a cobertura abaixo é quem reprova anotações/decisões ausentes.
+    resolved = shadow_metrics.get("resolved") or 0
     days = shadow_metrics.get("observed_days") or 0
     coverage = shadow_metrics.get("coverage_pct")
     cand = shadow_metrics.get("candidate") or {}
+
+    # Safety é pré-condição, não depende de maturidade estatística. Incidente,
+    # drift ou falha ao provar integridade rejeitam antes do "aguardando amostra".
+    safety_checks = [
+        ("sem_incidente_operacional",
+         shadow_metrics.get("operational_incident") is False,
+         f"incidente={shadow_metrics.get('operational_incident')}"),
+        ("sem_relaxamento_p01_p04",
+         shadow_metrics.get("safety_relaxed") is False,
+         f"safety_relaxed={shadow_metrics.get('safety_relaxed')}"),
+    ]
+    for name, passed, detail in safety_checks:
+        _chk(name, passed, detail)
+    if any(not passed for _name, passed, _detail in safety_checks):
+        failed = [c["check"] for c in checks if not c["passed"]]
+        return {"verdict": STATUS_REJECTED, "reason_code": "SHADOW_SAFETY_NOT_PROVEN",
+                "detail": f"falhou: {', '.join(failed)}", "checks": checks}
 
     if resolved < P05_MIN_SHADOW_RESOLVED or days < P05_MIN_SHADOW_DAYS:
         return {"verdict": STATUS_INSUFFICIENT, "reason_code": "AGUARDANDO_AMOSTRA",
@@ -1078,11 +1474,6 @@ def evaluate_shadow_gate(shadow_metrics: Dict[str, Any]) -> Dict[str, Any]:
          f"expectancy={cand.get('expectancy_r')}")
     _chk("objetivo_offline_mantido", bool(shadow_metrics.get("objective_still_met")),
          "critério do objetivo continua atendido no shadow")
-    _chk("sem_incidente_operacional", not shadow_metrics.get("operational_incident"),
-         "nenhum incidente operacional registrado")
-    _chk("sem_relaxamento_p01_p04", not shadow_metrics.get("safety_relaxed"),
-         "nenhuma trava P01–P04 relaxada")
-
     failed = [c["check"] for c in checks if not c["passed"]]
     if failed:
         return {"verdict": STATUS_REJECTED, "reason_code": "SHADOW_GATE_NAO_ATENDIDO",
@@ -1133,6 +1524,8 @@ def generate_candidates(champion: Dict[str, Any],
     cobertura ≥ P05_MIN_FEATURE_COVERAGE_PCT e amostra suficiente.
     """
     proposals: List[Tuple[str, Any, str]] = []
+    accepted: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
     smin = _finite(champion.get("SCORE_MIN"))
     if smin is not None:
         proposals.append(("SCORE_MIN", round(smin + 2, 2), OBJECTIVE_LOSS_REDUCTION))
@@ -1156,9 +1549,15 @@ def generate_candidates(champion: Dict[str, Any],
             proposals.append(("MTF_ALIGNED_MIN_COUNT", cnt + 1, OBJECTIVE_LOSS_REDUCTION))
             proposals.append(("MTF_ALIGNED_MIN_COUNT", cnt - 1, OBJECTIVE_MORE_OPERATIONS))
     prox = _finite(champion.get("PROXIMITY_MAX_ATR"))
-    if prox is not None:
+    # A breakout lane consulta bias macro em tempo real; o histórico não permite
+    # reconstruí-lo fielmente. Enquanto ela estiver ON, não se propõe mexer no
+    # teto de proximity com um contrafactual incompleto.
+    if prox is not None and not champion.get("BREAKOUT_LANE_ENABLED"):
         proposals.append(("PROXIMITY_MAX_ATR", round(prox - 0.25, 2), OBJECTIVE_LOSS_REDUCTION))
         proposals.append(("PROXIMITY_MAX_ATR", round(prox + 0.5, 2), OBJECTIVE_MORE_OPERATIONS))
+    elif prox is not None:
+        rejected.append({"knob": "PROXIMITY_MAX_ATR", "value": None,
+                         "objective": None, "reason": "BREAKOUT_BIAS_NOT_RECONSTRUCTIBLE"})
     if not champion.get("STRUCT_CHASE_GATE_ENABLED"):
         proposals.append(("STRUCT_CHASE_GATE_ENABLED", True, OBJECTIVE_LOSS_REDUCTION))
     else:
@@ -1166,8 +1565,6 @@ def generate_candidates(champion: Dict[str, Any],
         if sc is not None:
             proposals.append(("STRUCT_CHASE_MAX_ATR", round(sc + 2, 2), OBJECTIVE_MORE_OPERATIONS))
 
-    accepted: List[Dict[str, Any]] = []
-    rejected: List[Dict[str, Any]] = []
     for knob, value, objective in proposals:
         if len(accepted) >= max(1, min(P05_MAX_CANDIDATES, 12)):
             break
@@ -1210,8 +1607,18 @@ async def _load_real(days: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             .where(RealTrade.closed_at >= since)
         )).scalars().all()
         for t in rows:
+            # Identidade econômica antes do id interno: retry/import duplicado
+            # da mesma ordem ou recommendation não pode inflar o REAL.
+            if t.exchange_order_id:
+                dedupe = f"real-order:{t.exchange or 'unknown'}:{t.exchange_order_id}"
+            elif t.client_order_id:
+                dedupe = f"real-client:{t.exchange or 'unknown'}:{t.client_order_id}"
+            elif t.recommendation_id:
+                dedupe = f"real-rec:{t.recommendation_id}"
+            else:
+                dedupe = f"real:{t.id}"
             raw.append({
-                "dedupe_key": f"real:{t.id}",
+                "dedupe_key": dedupe,
                 "is_open": (t.status or "") == "open" or t.closed_at is None,
                 "realized_r": t.realized_r,
                 "status": t.status,
@@ -1259,6 +1666,7 @@ async def _load_shadow(days: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]
                 "realized_r": s.realized_r,
                 "status": s.status,
                 "resolved_at": s.outcome_at,
+                "created_at": s.created_at,
                 "symbol": s.symbol,
                 "timeframe": s.timeframe,
                 "tier": s.tier,
@@ -1422,7 +1830,9 @@ async def build_diagnosis(days: int = 30) -> Dict[str, Any]:
     try:
         bt_rows, bt_dq = await _load_backtest(days)
         out["backtest"] = {"data_quality": bt_dq,
-                           "metrics": compute_evidence_metrics(bt_rows),
+                           # Evidência secundária pode ter 20k linhas; bootstrap
+                           # completo fica reservado à avaliação admin/offline.
+                           "metrics": compute_evidence_metrics(bt_rows, with_bootstrap=False),
                            "note": "evidência histórica SECUNDÁRIA — não equivale a RealTrade"}
     except Exception as exc:
         log.warning(f"[p05] diagnóstico BACKTEST falhou: {exc}")
@@ -1442,6 +1852,28 @@ async def build_diagnosis(days: int = 30) -> Dict[str, Any]:
     out["evidence_quality"] = _evidence_quality(out, shadow_rows)
     out["computed_at"] = datetime.now(timezone.utc).isoformat()
     return out
+
+
+async def get_cached_diagnosis(days: int = 30) -> Dict[str, Any]:
+    """Cache curto por processo para o dashboard não refazer bootstrap/20k
+    backtests em cada refresh. A avaliação administrativa nunca usa este cache."""
+    days = max(7, min(int(days), 365))
+    now_mono = time.monotonic()
+    cached = _DIAG_CACHE.get(days)
+    if cached and now_mono - cached[0] < P05_DIAG_CACHE_TTL_S:
+        return cached[1]
+    async with _DIAG_CACHE_LOCK:
+        cached = _DIAG_CACHE.get(days)
+        now_mono = time.monotonic()
+        if cached and now_mono - cached[0] < P05_DIAG_CACHE_TTL_S:
+            return cached[1]
+        value = await build_diagnosis(days)
+        _DIAG_CACHE[days] = (now_mono, value)
+        # Limite simples contra cardinalidade acidental de parâmetros.
+        if len(_DIAG_CACHE) > 12:
+            oldest = min(_DIAG_CACHE, key=lambda k: _DIAG_CACHE[k][0])
+            _DIAG_CACHE.pop(oldest, None)
+        return value
 
 
 def _evidence_quality(diag: Dict[str, Any], shadow_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1467,25 +1899,43 @@ def _evidence_quality(diag: Dict[str, Any], shadow_rows: Sequence[Dict[str, Any]
 #  P05B — avaliação offline e persistência idempotente
 # ════════════════════════════════════════════════════════════════════════════
 def evaluate_candidate_offline(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
-                               candidate: Dict[str, Any]) -> Dict[str, Any]:
-    """Roda o pipeline temporal completo de UM candidato."""
+                               candidate: Dict[str, Any], *,
+                               include_holdout: bool = True) -> Dict[str, Any]:
+    """Roda UM candidato. Na seleção, `include_holdout=False` mantém o teste
+    fisicamente fora do cálculo; só o finalista de cada objetivo o abre."""
     knob = candidate["knob"]
-    active, coverage_info = active_components_for(rows, knob)
     split = temporal_split(rows)
     if not split.get("ok"):
         return {"verdict": STATUS_INSUFFICIENT, "reason_code": "INSUFFICIENT_DATA",
                 "detail": f"{split['total']} outcomes válidos (< {split['required']})",
-                "coverage": coverage_info}
+                "coverage": {}}
+
+    # Cobertura e componentes são congelados usando SOMENTE treino. O holdout
+    # não pode ligar/desligar um componente nem criar/remover uma hipótese.
+    active, coverage_info = active_components_for(split["train"], knob)
+    target = _KNOB_COMPONENT[knob]
+    target_cov = (coverage_info.get("coverage_pct") or {}).get(target)
+    if target_cov is None or target_cov < P05_MIN_FEATURE_COVERAGE_PCT:
+        return {"verdict": STATUS_INSUFFICIENT,
+                "reason_code": "TRAIN_FEATURE_COVERAGE_TOO_LOW",
+                "detail": f"cobertura de treino {target_cov}% (< {P05_MIN_FEATURE_COVERAGE_PCT}%)",
+                "coverage": coverage_info, "active_components": active}
 
     cfg = candidate["config"]
     validation = compare_configs(split["validation"], champion, cfg, active)
-    test = compare_configs(split["test"], champion, cfg, active)
     train = compare_configs(split["train"], champion, cfg, active)
-
-    gate = evaluate_offline_gate(candidate["objective"], validation, test)
+    if include_holdout:
+        test: Dict[str, Any] = compare_configs(split["test"], champion, cfg, active)
+        gate = evaluate_offline_gate(candidate["objective"], validation, test)
+    else:
+        test = {"withheld": True, "reason": "finalista ainda não congelado"}
+        gate = evaluate_offline_gate(candidate["objective"], validation, validation)
 
     folds_out = []
-    for fold in walkforward_folds(rows, split["folds"]):
+    # Walk-forward de seleção também termina na validação; nunca atravessa o
+    # início do holdout antes de o finalista ser congelado.
+    selection_rows = list(split["train"]) + list(split["validation"])
+    for fold in walkforward_folds(selection_rows, split["folds"]):
         cmp_fold = compare_configs(fold["test"], champion, cfg, active)
         folds_out.append({
             "fold": fold["fold"],
@@ -1508,12 +1958,43 @@ def evaluate_candidate_offline(rows: Sequence[Dict[str, Any]], champion: Dict[st
         "split": {"total": split["total"], "folds": split["folds"],
                   "train_n": len(split["train"]), "validation_n": len(split["validation"]),
                   "test_n": len(split["test"]), "boundaries": split["boundaries"],
-                  "note": "teste final NUNCA usado para ajustar threshold"},
+                  "holdout_opened": include_holdout,
+                  "note": "teste final só é aberto para o finalista congelado"},
         "train": {"champion": train["champion"], "candidate": train["candidate"]},
         "validation": validation,
         "test": test,
         "walkforward": folds_out,
     }
+
+
+async def _acquire_p05_lock(session, key: int) -> None:
+    """Advisory xact lock PostgreSQL; liberado automaticamente no commit/rollback."""
+    from sqlalchemy import text
+    await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+
+
+async def _open_incident_count(session) -> int:
+    """Incidentes ainda inseguros. MANUAL_REQUIRED continua sendo aberto."""
+    from models.execution_incident import ExecutionIncident
+    from sqlalchemy import func, select
+    count = (await session.execute(
+        select(func.count(ExecutionIncident.id)).where(
+            ExecutionIncident.state.notin_(("PROTECTED", "FLAT"))
+        )
+    )).scalar()
+    return int(count or 0)
+
+
+async def _incident_since_count(session, started_at: datetime) -> int:
+    """Qualquer incidente iniciado durante o SHADOW invalida a promoção."""
+    from models.execution_incident import ExecutionIncident
+    from sqlalchemy import func, select
+    count = (await session.execute(
+        select(func.count(ExecutionIncident.id)).where(
+            ExecutionIncident.created_at >= _utc(started_at)
+        )
+    )).scalar()
+    return int(count or 0)
 
 
 async def _upsert_experiment(session, *, experiment_key: str, champion_hash: str,
@@ -1546,6 +2027,14 @@ async def _upsert_experiment(session, *, experiment_key: str, champion_hash: str
             exp.decided_at = now if verdict in (STATUS_REJECTED, STATUS_INSUFFICIENT) else None
         return exp
 
+    # Mesmo cutoff com conteúdo diferente não pode reaproveitar uma decisão
+    # antiga. Falha explícita em vez de misturar duas versões do dataset.
+    if existing.dataset_fingerprint != fingerprint:
+        raise RuntimeError("DATASET_FINGERPRINT_MISMATCH para experiment_key existente")
+    if (existing.champion_hash != champion_hash or existing.candidate_hash != candidate_hash
+            or existing.candidate_config != config or existing.objective != objective):
+        raise RuntimeError("IMMUTABLE_EXPERIMENT_IDENTITY_MISMATCH")
+
     # Já decidido não reabre; só reaproveita (nova evidência ⇒ nova versão/cutoff).
     if existing.status == STATUS_DRAFT and can_transition(STATUS_DRAFT, verdict):
         existing.offline_metrics = offline
@@ -1572,17 +2061,74 @@ async def evaluate_candidates(days: int = 90) -> Dict[str, Any]:
                 "champion": champion, "data_quality": dq,
                 "candidates": [], "rejected": []}
 
-    accepted, rejected = generate_candidates(champion, rows)
+    split = temporal_split(rows)
+    if not split.get("ok"):
+        return {"ok": True, "status": STATUS_INSUFFICIENT,
+                "reason_code": split.get("reason"), "detail": "split temporal indisponível",
+                "champion": champion, "data_quality": dq, "candidates": [], "rejected": []}
+
+    # Hipóteses e cobertura nascem SOMENTE no treino. O holdout não participa
+    # nem da existência do candidato nem da escolha de componentes.
+    accepted, rejected = generate_candidates(champion, split["train"])
     cutoff = rows[-1]["resolved_at"]
     fingerprint = dataset_fingerprint(rows)
     champion_hash = canonical_hash(champion)
 
+    previews: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for cand in accepted:
+        previews.append((cand, evaluate_candidate_offline(
+            rows, champion, cand, include_holdout=False)))
+
+    def _rank(item: Tuple[Dict[str, Any], Dict[str, Any]]) -> Tuple[float, ...]:
+        cand, offline = item
+        val = offline.get("validation") or {}
+        cm = val.get("candidate") or {}
+        hm = val.get("champion") or {}
+        if cand["objective"] == OBJECTIVE_LOSS_REDUCTION:
+            dci = val.get("delta_expectancy_ci") or {}
+            return (float(dci.get("low") or -1e9),
+                    float(cm.get("expectancy_r") or -1e9),
+                    -float(cm.get("max_drawdown_r") or 1e9))
+        return (float((cm.get("sum_r") or 0) - (hm.get("sum_r") or 0)),
+                float(val.get("added_ops") or 0),
+                float(cm.get("expectancy_r") or -1e9))
+
+    selected_hashes: set = set()
+    for objective in OBJECTIVES:
+        viable = [it for it in previews
+                  if it[0]["objective"] == objective
+                  and it[1].get("verdict") == STATUS_OFFLINE_VALIDATED]
+        if viable:
+            winner = max(viable, key=_rank)[0]
+            selected_hashes.add(canonical_hash(winner["config"]))
+
     from db import get_session
     results: List[Dict[str, Any]] = []
     async with get_session() as session:
-        for cand in accepted:
-            offline = evaluate_candidate_offline(rows, champion, cand)
+        # Torna SELECT→INSERT idempotente também entre processos/restarts.
+        await _acquire_p05_lock(session, _P05_EVALUATE_LOCK_KEY)
+        for cand, preview in previews:
             candidate_hash = canonical_hash(cand["config"])
+            if candidate_hash in selected_hashes:
+                offline = evaluate_candidate_offline(
+                    rows, champion, cand, include_holdout=True)
+                selection = "FINALIST_FROZEN_ON_VALIDATION"
+            elif preview.get("verdict") == STATUS_OFFLINE_VALIDATED:
+                offline = dict(preview)
+                offline.update({
+                    "verdict": STATUS_REJECTED,
+                    "reason_code": "NOT_SELECTED_ON_VALIDATION",
+                    "detail": "outro candidato do mesmo objetivo venceu na validação; holdout não foi aberto",
+                })
+                selection = "NOT_SELECTED_HOLDOUT_UNTOUCHED"
+            else:
+                offline = preview
+                selection = "FAILED_BEFORE_HOLDOUT"
+            # Snapshot imutável do champion que originou o hash. P05C/D nunca
+            # redescobre uma baseline diferente e finge que é a mesma.
+            offline = dict(offline)
+            offline["champion_config"] = champion
+            offline["selection"] = selection
             key = build_experiment_key(champion_hash, candidate_hash, cutoff)
             exp = await _upsert_experiment(
                 session, experiment_key=key, champion_hash=champion_hash,
@@ -1597,6 +2143,7 @@ async def evaluate_candidates(days: int = 90) -> Dict[str, Any]:
                 "verdict": offline.get("verdict"),
                 "reason_code": offline.get("reason_code"),
                 "detail": offline.get("detail"),
+                "selection": selection,
                 "status": exp.status,
             })
         await session.commit()                       # transação única
@@ -1606,6 +2153,7 @@ async def evaluate_candidates(days: int = 90) -> Dict[str, Any]:
         "dataset_fingerprint": fingerprint, "dataset_cutoff": cutoff.isoformat(),
         "data_quality": dq, "sample": len(rows),
         "candidates": results, "rejected": rejected,
+        "finalists": len(selected_hashes),
         "max_candidates": P05_MAX_CANDIDATES,
         "note": "nenhum candidato válido é resultado ACEITÁVEL — não se força vencedor",
     }
@@ -1616,7 +2164,8 @@ async def evaluate_candidates(days: int = 90) -> Dict[str, Any]:
 # ════════════════════════════════════════════════════════════════════════════
 def build_experiment_annotation(row: Dict[str, Any], champion: Dict[str, Any],
                                 candidate_cfg: Dict[str, Any], *, experiment_key: str,
-                                candidate_hash: str, active: Sequence[str]) -> Dict[str, Any]:
+                                candidate_hash: str, active: Sequence[str],
+                                champion_hash: Optional[str] = None) -> Dict[str, Any]:
     """Anotação contrafactual de UM snapshot. Não altera score/tier/execução."""
     merged = dict(champion)
     merged.update(candidate_cfg)
@@ -1630,35 +2179,163 @@ def build_experiment_annotation(row: Dict[str, Any], champion: Dict[str, Any],
         status, reason = CHALLENGER_BLOCKED, "BLOQUEADO_PELO_KNOB"
     feats = row.get("features") or {}
     required = sorted({_COMPONENT_FEATURES[c] for c in active} - {"__score__", "__tier__"})
+    observed = _utc(row.get("created_at")) or datetime.now(timezone.utc)
     return {
         "experiment_key": experiment_key,
         "candidate_hash": candidate_hash,
+        "champion_hash": champion_hash or canonical_hash(champion),
         "champion_eligible": champ_ok,
         "challenger_eligible": chall_ok,
         "challenger_status": status,
         "reason_code": reason,
-        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "evaluated_at": observed.isoformat(),
         "required_features": required,
         "missing_features": [f for f in required if feats.get(f) is None],
         "schema_version": FEATURES_SCHEMA_VERSION,
     }
 
 
+def _frozen_champion(exp: Any) -> Optional[Dict[str, Any]]:
+    offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
+    frozen = offline.get("champion_config")
+    if not isinstance(frozen, dict) or canonical_hash(frozen) != exp.champion_hash:
+        return None
+    return frozen
+
+
+async def get_active_shadow_context(session) -> Optional[Dict[str, Any]]:
+    """Carrega UMA vez por batch o experimento prospectivo ativo.
+
+    Flag OFF, cardinalidade inválida, champion sem snapshot ou drift deixam o
+    fluxo sem anotação (fail-closed). Nunca toca execução/ordens.
+    """
+    if not (P05_ANALYTICS_ENABLED and P05_CHALLENGER_SHADOW_ENABLED):
+        return None
+    from models.strategy_experiment import StrategyExperiment as E
+    from sqlalchemy import select
+    rows = (await session.execute(
+        select(E).where(E.status == STATUS_SHADOW).order_by(E.id).limit(2)
+    )).scalars().all()
+    if len(rows) != 1:
+        if len(rows) > 1:
+            log.error("[p05] cardinalidade inválida: mais de um SHADOW ativo")
+        return None
+    exp = rows[0]
+    champion = _frozen_champion(exp)
+    if champion is None or canonical_hash(discover_champion_config()) != exp.champion_hash:
+        log.error("[p05] champion ausente ou mudou; snapshot não recebe contrafactual")
+        return None
+    shadow_metrics = exp.shadow_metrics if isinstance(exp.shadow_metrics, dict) else {}
+    start_guard = shadow_metrics.get("start_guard")
+    start_safety = start_guard.get("safety") if isinstance(start_guard, dict) else None
+    if (not isinstance(start_safety, dict)
+            or start_safety.get("fingerprint") != safety_guard()["fingerprint"]):
+        log.error("[p05] proteções mudaram ou não foram congeladas; snapshot sem contrafactual")
+        return None
+    offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
+    active = offline.get("active_components")
+    if not isinstance(active, list) or not active:
+        log.error("[p05] experimento SHADOW sem active_components congelados")
+        return None
+    return {
+        "experiment_key": exp.experiment_key,
+        "candidate_hash": exp.candidate_hash,
+        "champion_hash": exp.champion_hash,
+        "champion": champion,
+        "candidate_config": dict(exp.candidate_config or {}),
+        "active_components": list(active),
+        "shadow_started_at": _utc(exp.shadow_started_at),
+    }
+
+
+def annotate_snapshot_features(features: Dict[str, Any], row: Dict[str, Any],
+                               context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Mescla `p05_experiment` sem sobrescrever outra chave/histórico.
+
+    Repetir o save lógico com a mesma experiment_key devolve exatamente a
+    anotação original (inclusive timestamp), garantindo idempotência real.
+    """
+    out = dict(features or {})
+    if not context:
+        return out
+    existing = out.get("p05_experiment")
+    if isinstance(existing, dict):
+        if existing.get("experiment_key") == context.get("experiment_key"):
+            return out
+        log.error("[p05] snapshot já pertence a outro experimento; não sobrescrito")
+        return out
+    created = _utc(row.get("created_at"))
+    started = _utc(context.get("shadow_started_at"))
+    if created is None or started is None or created < started:
+        return out
+    enriched = dict(row)
+    enriched["features"] = out
+    out["p05_experiment"] = build_experiment_annotation(
+        enriched,
+        context["champion"],
+        context["candidate_config"],
+        experiment_key=context["experiment_key"],
+        candidate_hash=context["candidate_hash"],
+        champion_hash=context["champion_hash"],
+        active=context["active_components"],
+    )
+    return out
+
+
 def compute_shadow_metrics(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
                            candidate_cfg: Dict[str, Any], objective: str,
-                           active: Sequence[str], *, started_at: datetime) -> Dict[str, Any]:
-    """Relatório do shadow: os DOIS avaliados sobre a MESMA recomendação."""
+                           active: Sequence[str], *, started_at: datetime,
+                           experiment_key: Optional[str] = None,
+                           candidate_hash: Optional[str] = None,
+                           champion_hash: Optional[str] = None,
+                           require_annotations: bool = False,
+                           operational_incident: Optional[bool] = None,
+                           safety_relaxed: Optional[bool] = None) -> Dict[str, Any]:
+    """Relatório do shadow sobre a MESMA recomendação.
+
+    Em produção (`require_annotations=True`) usa exclusivamente os vereditos
+    congelados na criação do snapshot. O modo recalculado fica apenas para
+    funções puras/testes históricos e nunca decide P05D.
+    """
     merged = dict(champion)
     merged.update(candidate_cfg)
-    evaluable, unknown = [], 0
-    for r in rows:
-        if eligibility(r, champion, active) is None or eligibility(r, merged, active) is None:
-            unknown += 1
-        else:
+    evaluable: List[Dict[str, Any]] = []
+    champ_rows: List[Dict[str, Any]] = []
+    cand_rows: List[Dict[str, Any]] = []
+    annotation_matches = 0
+    unknown = 0
+    if require_annotations:
+        for r in rows:
+            ann = (r.get("features") or {}).get("p05_experiment")
+            exact = (
+                isinstance(ann, dict)
+                and ann.get("experiment_key") == experiment_key
+                and ann.get("candidate_hash") == candidate_hash
+                and ann.get("champion_hash") == champion_hash
+            )
+            if not exact:
+                unknown += 1
+                continue
+            annotation_matches += 1
+            cv = ann.get("champion_eligible")
+            nv = ann.get("challenger_eligible")
+            if not isinstance(cv, bool) or not isinstance(nv, bool):
+                unknown += 1
+                continue
             evaluable.append(r)
+            if cv:
+                champ_rows.append(r)
+            if nv:
+                cand_rows.append(r)
+    else:
+        for r in rows:
+            if eligibility(r, champion, active) is None or eligibility(r, merged, active) is None:
+                unknown += 1
+            else:
+                evaluable.append(r)
+        champ_rows, _ = split_by_config(evaluable, champion, active)
+        cand_rows, _ = split_by_config(evaluable, merged, active)
 
-    champ_rows, _ = split_by_config(evaluable, champion, active)
-    cand_rows, _ = split_by_config(evaluable, merged, active)
     champ_m = compute_evidence_metrics(champ_rows)
     cand_m = compute_evidence_metrics(cand_rows)
     champ_ids = {id(r) for r in champ_rows}
@@ -1686,17 +2363,21 @@ def compute_shadow_metrics(rows: Sequence[Dict[str, Any]], champion: Dict[str, A
         "challenger_resolved": cand_m["count"],
         "observed_days": days,
         "coverage_pct": coverage,
+        "annotation_coverage_pct": (
+            round(annotation_matches / total * 100, 1) if total and require_annotations else None
+        ),
         "unknown_excluded": unknown,
         "champion": champ_m,
         "candidate": cand_m,
         "added_ops": len(added),
         "avoided_ops": len(avoided),
-        "delta_expectancy_ci": bootstrap_delta_ci(
-            [r["realized_r"] for r in cand_rows], [r["realized_r"] for r in champ_rows]),
+        "delta_expectancy_ci": bootstrap_paired_membership_delta_ci(
+            evaluable, champ_ids, cand_ids),
         "objective": objective,
         "objective_still_met": bool(still_met),
-        "operational_incident": False,
-        "safety_relaxed": False,
+        "operational_incident": operational_incident,
+        "safety_relaxed": safety_relaxed,
+        "evidence_mode": "prospective-annotation" if require_annotations else "recomputed-test-only",
         "note": "challenger é CONTRAFACTUAL: não altera score/tier, não bloqueia rec, não abre trade",
     }
 
@@ -1736,40 +2417,93 @@ async def get_experiment(exp_id: int) -> Optional[Dict[str, Any]]:
 
 
 async def start_shadow(exp_id: int) -> Dict[str, Any]:
-    """OFFLINE_VALIDATED → SHADOW. Idempotente; só UM shadow ativo."""
+    """OFFLINE_VALIDATED → SHADOW com baseline/safety congelados."""
+    if not (P05_ANALYTICS_ENABLED and P05_CHALLENGER_SHADOW_ENABLED):
+        return {"ok": False, "blocked": True, "reason_code": "P05_SHADOW_DISABLED",
+                "error": "P05_CHALLENGER_SHADOW_ENABLED=false"}
     from db import get_session
     from models.strategy_experiment import StrategyExperiment as E
     from sqlalchemy import select
-    async with get_session() as session:
-        exp = (await session.execute(
-            select(E).where(E.id == exp_id).with_for_update()
-        )).scalar_one_or_none()
-        if exp is None:
-            return {"ok": False, "error": "experimento não encontrado"}
-        if exp.status == STATUS_SHADOW:
-            return {"ok": True, "idempotent": True, "experiment": exp.to_dict(full=False)}
-        if not can_transition(exp.status, STATUS_SHADOW):
-            return {"ok": False, "error": f"transição inválida {exp.status} → {STATUS_SHADOW}",
-                    "status": exp.status}
-        active = (await session.execute(
-            select(E).where(E.status == STATUS_SHADOW)
-        )).scalars().first()
-        if active is not None and active.id != exp.id:
-            return {"ok": False, "error": "já existe um experimento SHADOW ativo",
-                    "conflict_experiment_id": active.id, "conflict": True}
-        exp.status = STATUS_SHADOW
-        exp.shadow_started_at = datetime.now(timezone.utc)
-        await session.commit()                       # status+métricas: 1 transação
-        return {"ok": True, "idempotent": False, "experiment": exp.to_dict(full=False)}
+    from sqlalchemy.exc import IntegrityError
+    try:
+        async with get_session() as session:
+            # Ordem global: P05 → P03. O P03 não adquire lock P05, portanto não
+            # há ciclo; a contagem e a transição ficam serializadas com incidentes.
+            await _acquire_p05_lock(session, _P05_SHADOW_LOCK_KEY)
+            await _acquire_p05_lock(session, _P03_SAFETY_LOCK_KEY)
+            exp = (await session.execute(
+                select(E).where(E.id == exp_id).with_for_update()
+            )).scalar_one_or_none()
+            if exp is None:
+                return {"ok": False, "error": "experimento não encontrado"}
+            if exp.status == STATUS_SHADOW:
+                return {"ok": True, "idempotent": True,
+                        "experiment": exp.to_dict(full=False)}
+            if not can_transition(exp.status, STATUS_SHADOW):
+                return {"ok": False,
+                        "error": f"transição inválida {exp.status} → {STATUS_SHADOW}",
+                        "status": exp.status}
+
+            champion = _frozen_champion(exp)
+            if champion is None:
+                return {"ok": False, "blocked": True,
+                        "reason_code": "FROZEN_CHAMPION_MISSING",
+                        "error": "baseline imutável do champion ausente ou inválida"}
+            if canonical_hash(discover_champion_config()) != exp.champion_hash:
+                return {"ok": False, "blocked": True,
+                        "reason_code": "CHAMPION_DRIFT",
+                        "error": "champion atual difere do avaliado offline"}
+            offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
+            if not isinstance(offline.get("active_components"), list):
+                return {"ok": False, "blocked": True,
+                        "reason_code": "ACTIVE_COMPONENTS_MISSING",
+                        "error": "componentes avaliados não foram congelados"}
+
+            open_incidents = await _open_incident_count(session)
+            if open_incidents:
+                return {"ok": False, "blocked": True,
+                        "reason_code": "OPEN_EXECUTION_INCIDENT",
+                        "error": f"há {open_incidents} incidente(s) de execução aberto(s)"}
+            active = (await session.execute(
+                select(E).where(E.status == STATUS_SHADOW).with_for_update()
+            )).scalars().first()
+            if active is not None and active.id != exp.id:
+                return {"ok": False, "error": "já existe um experimento SHADOW ativo",
+                        "conflict_experiment_id": active.id, "conflict": True}
+
+            now = datetime.now(timezone.utc)
+            exp.status = STATUS_SHADOW
+            exp.shadow_started_at = now
+            exp.shadow_metrics = {
+                "evidence_mode": "prospective-annotation",
+                "start_guard": {
+                    "started_at": now.isoformat(),
+                    "champion_hash": exp.champion_hash,
+                    "safety": safety_guard(),
+                    "open_incidents": 0,
+                },
+            }
+            await session.commit()
+            return {"ok": True, "idempotent": False,
+                    "experiment": exp.to_dict(full=False)}
+    except IntegrityError:
+        return {"ok": False, "conflict": True,
+                "error": "outro experimento SHADOW foi iniciado simultaneamente"}
 
 
 async def evaluate_shadow(exp_id: int) -> Dict[str, Any]:
     """P05D — decide REJECTED/ELIGIBLE ou segue aguardando amostra."""
+    if not (P05_ANALYTICS_ENABLED and P05_CHALLENGER_SHADOW_ENABLED):
+        return {"ok": False, "blocked": True, "reason_code": "P05_SHADOW_DISABLED",
+                "error": "P05_CHALLENGER_SHADOW_ENABLED=false"}
     from db import get_session
     from models.strategy_experiment import StrategyExperiment as E
     from sqlalchemy import select
-    champion = discover_champion_config()
+
+    # 1) Congela os insumos imutáveis. Nenhuma classificação retrospectiva:
+    # somente snapshots criados depois do start e anotados naquele momento.
     async with get_session() as session:
+        await _acquire_p05_lock(session, _P05_SHADOW_LOCK_KEY)
         exp = (await session.execute(
             select(E).where(E.id == exp_id).with_for_update()
         )).scalar_one_or_none()
@@ -1779,24 +2513,73 @@ async def evaluate_shadow(exp_id: int) -> Dict[str, Any]:
             return {"ok": False, "error": f"experimento não está em SHADOW (status={exp.status})",
                     "status": exp.status}
         started = _utc(exp.shadow_started_at) or _utc(exp.created_at)
-        cfg = exp.candidate_config or {}
-        knob = next(iter(cfg), None)
+        cfg = dict(exp.candidate_config or {})
+        champion = _frozen_champion(exp)
+        offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
+        active = offline.get("active_components")
+        if not isinstance(active, list):
+            active = []
+        previous_shadow = exp.shadow_metrics if isinstance(exp.shadow_metrics, dict) else {}
+        start_guard = previous_shadow.get("start_guard")
+        experiment_key = exp.experiment_key
+        candidate_hash = exp.candidate_hash
+        champion_hash = exp.champion_hash
+        objective = exp.objective
 
     days = max(1, min(365, int((datetime.now(timezone.utc) - started).days) + 1))
     rows, _dq = await _load_shadow(days)
-    rows = [r for r in rows if r["resolved_at"] >= started]
-    active, _cov = active_components_for(rows, knob) if knob else ([], {})
-    metrics = compute_shadow_metrics(rows, champion, cfg, exp.objective, active,
-                                     started_at=started)
-    gate = evaluate_shadow_gate(metrics)
-    now = datetime.now(timezone.utc)
+    rows = [r for r in rows
+            if _utc(r.get("created_at")) is not None and _utc(r.get("created_at")) >= started]
+    integrity_ok = champion is not None and bool(active) and isinstance(start_guard, dict)
+    metrics = compute_shadow_metrics(
+        rows if integrity_ok else [], champion or {}, cfg, objective, active,
+        started_at=started, experiment_key=experiment_key,
+        candidate_hash=candidate_hash, champion_hash=champion_hash,
+        require_annotations=True, operational_incident=None, safety_relaxed=None,
+    )
 
+    # 2) Decide sob os locks P05+P03. O count de incidentes, o fingerprint e a
+    # atualização de estado pertencem à mesma transação; evita TOCTOU.
     async with get_session() as session:
+        await _acquire_p05_lock(session, _P05_SHADOW_LOCK_KEY)
+        await _acquire_p05_lock(session, _P03_SAFETY_LOCK_KEY)
         exp = (await session.execute(
             select(E).where(E.id == exp_id).with_for_update()
         )).scalar_one_or_none()
         if exp is None or exp.status != STATUS_SHADOW:
             return {"ok": False, "error": "experimento mudou de estado durante a avaliação"}
+        if (exp.experiment_key != experiment_key or exp.candidate_hash != candidate_hash
+                or exp.champion_hash != champion_hash):
+            return {"ok": False, "error": "identidade imutável do experimento mudou"}
+
+        incident_count = await _incident_since_count(session, started)
+        current_safety = safety_guard()
+        start_safety = start_guard.get("safety") if isinstance(start_guard, dict) else None
+        start_fingerprint = (start_safety.get("fingerprint")
+                             if isinstance(start_safety, dict) else None)
+        champion_drift = canonical_hash(discover_champion_config()) != champion_hash
+        safety_relaxed: Optional[bool]
+        if not integrity_ok or not start_fingerprint:
+            safety_relaxed = None
+        else:
+            safety_relaxed = bool(
+                current_safety["fingerprint"] != start_fingerprint or champion_drift
+            )
+        metrics["operational_incident"] = incident_count > 0
+        metrics["safety_relaxed"] = safety_relaxed
+        metrics["start_guard"] = start_guard
+        metrics["evaluation_guard"] = {
+            "current_safety_fingerprint": current_safety["fingerprint"],
+            "safety_fingerprint_matches": (
+                current_safety["fingerprint"] == start_fingerprint
+                if start_fingerprint else None
+            ),
+            "champion_drift": champion_drift,
+            "incident_count_since_start": incident_count,
+            "integrity_ok": integrity_ok,
+        }
+        gate = evaluate_shadow_gate(metrics)
+        now = datetime.now(timezone.utc)
         exp.shadow_metrics = metrics
         verdict = gate["verdict"]
         decision = {"verdict": verdict, "reason_code": gate["reason_code"],
@@ -1807,7 +2590,7 @@ async def evaluate_shadow(exp_id: int) -> Dict[str, Any]:
             exp.decided_at = now
             if verdict == STATUS_ELIGIBLE:
                 decision["promotion_plan"] = build_promotion_plan(
-                    champion, cfg,
+                    champion or {}, cfg,
                     {"shadow": {k: metrics.get(k) for k in
                                 ("challenger_resolved", "observed_days", "coverage_pct")},
                      "candidate": metrics.get("candidate"),
@@ -1832,6 +2615,7 @@ def env_snapshot() -> Dict[str, Any]:
         "P05_MIN_SHADOW_COVERAGE_PCT": P05_MIN_SHADOW_COVERAGE_PCT,
         "P05_BOOTSTRAP_SAMPLES": P05_BOOTSTRAP_SAMPLES,
         "P05_RANDOM_SEED": P05_RANDOM_SEED,
+        "P05_DIAG_CACHE_TTL_S": P05_DIAG_CACHE_TTL_S,
     }
 
 
@@ -1849,7 +2633,7 @@ async def get_p05_status(days: int = 30) -> Dict[str, Any]:
         out["reason"] = "P05_ANALYTICS_ENABLED=false"
         return out
     try:
-        out["diagnosis"] = await build_diagnosis(days)
+        out["diagnosis"] = await get_cached_diagnosis(days)
     except Exception as exc:
         log.warning(f"[p05] status/diagnóstico falhou: {exc}")
         out["diagnosis"] = {"error": str(exc)}

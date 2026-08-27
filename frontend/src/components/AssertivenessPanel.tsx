@@ -223,7 +223,9 @@ export default function AssertivenessPanel({ onClose }: Props) {
   const hedge = data?.hedge_by_regime
   const p05 = data?.p05
   const eq = p05?.evidence_quality
-  const exp = p05?.shadow_experiment
+  // Após a decisão o experimento sai de SHADOW; manter o último ELIGIBLE evita
+  // que o resultado e o plano governado desapareçam do painel.
+  const exp = p05?.shadow_experiment ?? p05?.eligible_experiment
   const sm = exp?.shadow_metrics
 
   return (

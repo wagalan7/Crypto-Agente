@@ -3754,7 +3754,7 @@ async def p05_start_shadow(exp_id: int, x_admin_token: Optional[str] = Header(No
     except Exception as e:
         log.error(f"[p05] start-shadow falhou: {e}")
         raise HTTPException(status_code=500, detail=f"start-shadow falhou: {e}")
-    if not res.get("ok") and res.get("conflict"):
+    if not res.get("ok") and (res.get("conflict") or res.get("blocked")):
         raise HTTPException(status_code=409, detail=res.get("error"))
     return res
 
@@ -3767,7 +3767,10 @@ async def p05_evaluate_shadow(exp_id: int, x_admin_token: Optional[str] = Header
         return gate
     from services import strategy_evidence_service as p05
     try:
-        return await p05.evaluate_shadow(int(exp_id))
+        res = await p05.evaluate_shadow(int(exp_id))
+        if not res.get("ok") and (res.get("conflict") or res.get("blocked")):
+            raise HTTPException(status_code=409, detail=res.get("error"))
+        return res
     except Exception as e:
         log.error(f"[p05] evaluate-shadow falhou: {e}")
         raise HTTPException(status_code=500, detail=f"evaluate-shadow falhou: {e}")

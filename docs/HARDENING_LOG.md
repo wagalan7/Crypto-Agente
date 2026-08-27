@@ -578,13 +578,17 @@ shadow → ELIGIBLE/REJECTED → recomendação de ativação MANUAL`.
   limites conservadores; exige valor champion descoberto + cobertura ≥80%.
   Qualquer tentativa de tocar P04A/B/C, stop/TP, qty/leverage/exposição, kill
   switch, portfolio guard, maker/fallback, LIVE ou `LEARNING_AUTO_*` é rejeitada.
-- **Sem leakage**: corte cronológico treino/validação/**teste intocado**,
+- **Sem leakage**: candidatos/componentes nascem no treino, a validação escolhe
+  no máximo um finalista por objetivo e só ele abre o **teste intocado**;
   4 ou 6 folds por tamanho, mínimo de 30 outcomes OOS. Champion e candidato
   comparados sobre o MESMO dataset, UNKNOWN excluído dos dois lados.
-- **Champion × Challenger**: mesma recomendação avalia os dois; challenger é
-  puramente contrafactual (`features["p05_experiment"]`, idempotente) — não altera
+- **Champion × Challenger prospectivo**: o pipeline real anota somente snapshots
+  criados após o start e com hashes exatos; challenger é puramente contrafactual
+  (`features["p05_experiment"]`, idempotente) — não altera
   score/tier, não bloqueia rec, não abre trade. `UNKNOWN` nunca vira ELIGIBLE nem
-  BLOCKED. Só **um** SHADOW ativo.
+  BLOCKED. Só **um** SHADOW ativo, garantido por advisory lock + índice parcial
+  único. Champion, safety P01–P04 e ausência de incidente P03 são congelados e
+  revalidados; UNKNOWN/drift/incidente falham fechado.
 - **Decisão**: `DRAFT → INSUFFICIENT_DATA|REJECTED|OFFLINE_VALIDATED →
   SHADOW → REJECTED|ELIGIBLE`, sem saltos, sem reabrir decidido, status+métricas
   em transação única. `ELIGIBLE` = pode ser APRESENTADO ao usuário; **não** foi
@@ -592,7 +596,7 @@ shadow → ELIGIBLE/REJECTED → recomendação de ativação MANUAL`.
 - **1 tabela nova** (`strategy_experiments`, registrada em `init_db()`); nenhuma
   coluna adicionada a tabelas existentes. 6 endpoints (3 GET fail-soft, 3 POST com
   auth admin). Painel de assertividade ganhou 4 seções — sem botão de promoção.
-- **117 testes P05 verdes 2×** e **suíte crítica P01–P05 (360) verde 2×** no
+- **134 testes P05 verdes 2×** e **suíte crítica P01–P05 (377) verde** no
   Python 3.11 real; `py_compile`, `tsc --noEmit` e `git diff --check` aprovados;
   rede/DNS bloqueados e contabilizados. Estratégia, score, IA, sizing, SL/TP,
   `LIVE_SIZE_MULT` e capabilities permanecem inalterados/desligados.
