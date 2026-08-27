@@ -53,7 +53,82 @@ interface Assertiveness {
   }
   pyramiding_opportunity?: { verdict?: string | null; continuation_rate_pct?: number | null; tp1_reached?: number }
   hedge_by_regime?: { verdict?: string | null; short?: { avg_r?: number | null; count?: number }; n_tagged?: number }
+  p05?: P05Block
   computed_at?: string
+}
+
+// ── P05: evidência governada (somente leitura — nenhuma ação de promoção) ──
+interface P05Segment {
+  key: string
+  count: number
+  avg_r: number | null
+  win_rate_pct: number | null
+  total_r: number | null
+  reliability: string
+}
+
+interface P05Metrics {
+  count?: number
+  expectancy_r?: number | null
+  profit_factor?: number | null
+  max_drawdown_r?: number | null
+  win_rate_pct?: number | null
+}
+
+interface P05Experiment {
+  id?: number
+  status?: string
+  objective?: string
+  candidate_config?: Record<string, unknown> | null
+  shadow_metrics?: {
+    challenger_resolved?: number
+    observed_days?: number
+    coverage_pct?: number | null
+    champion?: P05Metrics
+    candidate?: P05Metrics
+    added_ops?: number
+    avoided_ops?: number
+  } | null
+  decision?: { verdict?: string | null; reason_code?: string | null; detail?: string | null } | null
+}
+
+interface P05Block {
+  enabled?: boolean
+  reason?: string
+  evidence_quality?: {
+    shadow_resolved?: number
+    min_offline_required?: number
+    maturity?: string
+    ready_for_candidates?: boolean
+    features_usable?: string[]
+    features_below_coverage?: string[]
+    excluded_total?: number | null
+  }
+  segments?: Record<string, { best?: P05Segment[]; worst?: P05Segment[] }>
+  gate_events?: {
+    total_events?: number
+    by_phase?: Record<string, { events?: number | null; reason?: string }>
+    disclaimer?: string
+  }
+  shadow_experiment?: P05Experiment | null
+  eligible_experiment?: P05Experiment | null
+}
+
+const RELIABILITY_LABEL: Record<string, string> = {
+  INSUFFICIENT: 'amostra insuficiente',
+  EARLY: 'início',
+  USABLE: 'utilizável',
+  STRONG: 'forte',
+}
+
+const SEGMENT_AXIS_LABEL: Record<string, string> = {
+  by_tier: 'Por tier',
+  by_timeframe: 'Por timeframe',
+  by_direction: 'Por direção',
+  by_session_utc: 'Por sessão (UTC)',
+  by_regime: 'Por regime',
+  by_score_bin: 'Por faixa de score',
+  by_atr_band: 'Por volatilidade (ATR)',
 }
 
 // Bloco genérico do contrafactual: o que importa pra UI é enabled_now + verdict.
@@ -146,6 +221,10 @@ export default function AssertivenessPanel({ onClose }: Props) {
   const cf = data?.gate_counterfactual
   const pyr = data?.pyramiding_opportunity
   const hedge = data?.hedge_by_regime
+  const p05 = data?.p05
+  const eq = p05?.evidence_quality
+  const exp = p05?.shadow_experiment
+  const sm = exp?.shadow_metrics
 
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
@@ -374,6 +453,140 @@ export default function AssertivenessPanel({ onClose }: Props) {
                   </p>
                 </section>
               )}
+
+              {/* ── P05.1 Qualidade da evidência ─────────────────────────── */}
+              {p05?.enabled && eq && (
+                <section>
+                  <div className="flex items-center gap-2 mb-2">
+                    <ShieldCheck className="w-4 h-4 text-teal-400" />
+                    <h3 className="text-sm font-bold text-teal-300">Qualidade da evidência</h3>
+                    <span className="text-[10px] text-slate-500">· dá pra confiar no que está sendo medido?</span>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <StatCard label="Amostra" value={`${eq.shadow_resolved ?? 0}`}
+                      sub={`mín. ${eq.min_offline_required ?? 60} p/ avaliar`} />
+                    <StatCard label="Maturidade" value={RELIABILITY_LABEL[eq.maturity ?? ''] ?? '–'}
+                      valueCls={eq.ready_for_candidates ? 'text-emerald-300' : 'text-yellow-300'}
+                      sub={eq.ready_for_candidates ? 'pronta' : 'ainda juntando dados'} />
+                    <StatCard label="Dados utilizáveis" value={`${eq.features_usable?.length ?? 0}`}
+                      sub={`${eq.features_below_coverage?.length ?? 0} com cobertura baixa`} />
+                    <StatCard label="Descartados" value={`${eq.excluded_total ?? 0}`}
+                      sub="sem resultado válido" />
+                  </div>
+                  <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
+                    Só entra na conta o que tem resultado fechado e número válido. O que falta dado fica de fora — e aparece aqui.
+                  </p>
+                </section>
+              )}
+
+              {/* ── P05.2 Onde ganha / onde perde ────────────────────────── */}
+              {p05?.enabled && p05.segments && Object.keys(p05.segments).length > 0 && (
+                <section>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Target className="w-4 h-4 text-lime-400" />
+                    <h3 className="text-sm font-bold text-lime-300">Onde ganha / onde perde</h3>
+                    <span className="text-[10px] text-slate-500">· por grupo · {data.window_days}d</span>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    {Object.entries(p05.segments).map(([axis, block]) => (
+                      <div key={axis} className="p-2 rounded-lg border border-slate-800 bg-slate-900/40">
+                        <div className="text-[11px] font-bold text-slate-300 mb-1">
+                          {SEGMENT_AXIS_LABEL[axis] ?? axis}
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1">
+                          <div>
+                            <div className="text-[9px] uppercase text-emerald-400/80 mb-0.5">melhores</div>
+                            {(block.best ?? []).map(s => <SegRow key={`b-${s.key}`} s={s} />)}
+                          </div>
+                          <div>
+                            <div className="text-[9px] uppercase text-red-400/80 mb-0.5">piores</div>
+                            {(block.worst ?? []).map(s => <SegRow key={`w-${s.key}`} s={s} />)}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
+                    Grupo com poucos casos não é prova — o rótulo de confiança mostra o quanto dá pra levar a sério.
+                  </p>
+                </section>
+              )}
+
+              {/* ── P05.3 Champion × Challenger ──────────────────────────── */}
+              {p05?.enabled && (
+                <section>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Gauge className="w-4 h-4 text-indigo-400" />
+                    <h3 className="text-sm font-bold text-indigo-300">Champion × Challenger</h3>
+                    <span className="text-[10px] text-slate-500">· teste lado a lado, sem operar</span>
+                  </div>
+                  {exp && sm ? (
+                    <>
+                      <div className="p-2 rounded-lg border border-slate-800 bg-slate-900/40 mb-2 text-[11px] text-slate-300">
+                        <span className="font-bold text-indigo-200">
+                          {exp.objective === 'LOSS_REDUCTION' ? 'Reduzir perdas' : 'Operar mais'}
+                        </span>
+                        <span className="ml-2 text-slate-500">
+                          ajuste: {Object.entries(exp.candidate_config ?? {}).map(([k, v]) => `${k} → ${String(v)}`).join(', ') || '–'}
+                        </span>
+                        <span className="ml-auto float-right font-mono text-slate-400">{exp.status}</span>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        <StatCard label="Operações" value={`${sm.champion?.count ?? 0} → ${sm.candidate?.count ?? 0}`}
+                          sub={`+${sm.added_ops ?? 0} / −${sm.avoided_ops ?? 0}`} />
+                        <StatCard label="Expectancy" value={fmtR(sm.candidate?.expectancy_r)}
+                          valueCls={rColor(sm.candidate?.expectancy_r)}
+                          sub={`atual ${fmtR(sm.champion?.expectancy_r)}`} />
+                        <StatCard label="Profit factor" value={sm.candidate?.profit_factor?.toFixed(2) ?? '–'}
+                          sub={`atual ${sm.champion?.profit_factor?.toFixed(2) ?? '–'}`} />
+                        <StatCard label="Queda máx." value={fmtR(sm.candidate?.max_drawdown_r)}
+                          sub={`atual ${fmtR(sm.champion?.max_drawdown_r)}`} />
+                      </div>
+                      <div className="mt-1.5 p-2 rounded-lg border border-slate-800 bg-slate-900/40 text-[10px] text-slate-400 leading-snug">
+                        Amostra: <span className="font-mono text-slate-300">{sm.challenger_resolved ?? 0}</span> resolvidos ·{' '}
+                        <span className="font-mono text-slate-300">{sm.observed_days ?? 0}</span> dias ·{' '}
+                        cobertura <span className="font-mono text-slate-300">{fmtPct(sm.coverage_pct)}</span>
+                        {exp.decision?.detail && <div className="mt-0.5">Situação: {exp.decision.detail}</div>}
+                      </div>
+                    </>
+                  ) : (
+                    <p className="text-xs text-slate-500 italic px-1">
+                      Nenhum teste em andamento. Quando houver, o comportamento atual e o alternativo aparecem lado a lado aqui.
+                    </p>
+                  )}
+                  <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
+                    O alternativo só é <strong className="text-slate-400">observado</strong>: não muda nota, não bloqueia recomendação e não abre operação.
+                  </p>
+                </section>
+              )}
+
+              {/* ── P05.4 Bloqueios P04 ──────────────────────────────────── */}
+              {p05?.enabled && p05.gate_events && (
+                <section>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Filter className="w-4 h-4 text-orange-400" />
+                    <h3 className="text-sm font-bold text-orange-300">Bloqueios de segurança (P04)</h3>
+                    <span className="text-[10px] text-slate-500">· travas que impediram entrada</span>
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    {Object.entries(p05.gate_events.by_phase ?? {}).map(([phase, info]) => (
+                      <div key={phase} className="p-2 rounded-lg border border-slate-800 bg-slate-900/40 flex items-center gap-2">
+                        <span className="text-xs font-bold text-orange-200">{phase.replace(/_/g, ' ')}</span>
+                        <span className="ml-auto font-mono text-sm font-bold text-white">
+                          {info.events === null || info.events === undefined ? 'n/d' : info.events}
+                        </span>
+                        {info.reason && (
+                          <span className="w-full text-[10px] text-slate-500 leading-snug">{info.reason}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
+                    São contagens de <strong className="text-slate-400">eventos</strong> de bloqueio, não de oportunidades únicas —
+                    e um bloqueio não significa dinheiro deixado na mesa: não dá pra saber o resultado de algo que não aconteceu.
+                  </p>
+                </section>
+              )}
             </>
           )}
         </div>
@@ -385,6 +598,17 @@ export default function AssertivenessPanel({ onClose }: Props) {
           <strong className="text-slate-400">Gates</strong> = motivos de veto persistidos — sobrevivem a redeploy.
         </div>
       </div>
+    </div>
+  )
+}
+
+function SegRow({ s }: { s: P05Segment }) {
+  return (
+    <div className="flex items-center gap-1.5 text-[10px] py-0.5">
+      <span className="text-slate-300 truncate max-w-[7rem]" title={s.key}>{s.key}</span>
+      <span className={`font-mono ${rColor(s.avg_r)}`}>{fmtR(s.avg_r)}</span>
+      <span className="text-slate-600">n={s.count}</span>
+      <span className="ml-auto text-slate-500 truncate">{RELIABILITY_LABEL[s.reliability] ?? s.reliability}</span>
     </div>
   )
 }

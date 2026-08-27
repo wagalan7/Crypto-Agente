@@ -3673,6 +3673,106 @@ async def shadow_assertiveness(days: int = 30, gate_days: int = 7):
     return {"ok": True, **data}
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  P05 — otimização governada por evidência (SOMENTE LEITURA/AVALIAÇÃO)
+#  Não existe endpoint de promote/apply/activate-live/execute por CONTRATO:
+#  `ELIGIBLE` só habilita APRESENTAR o plano ao usuário para ativação manual.
+# ════════════════════════════════════════════════════════════════════════════
+@app.get("/api/strategy/p05/status")
+async def p05_status(days: int = 30):
+    """Diagnóstico consolidado + champion + experimento shadow + gate + flags."""
+    from services import strategy_evidence_service as p05
+    try:
+        days = max(7, min(int(days), 365))
+    except Exception:
+        days = 30
+    data = await p05.get_p05_status(days=days)
+    return {"ok": True, **data}
+
+
+@app.get("/api/strategy/p05/experiments")
+async def p05_experiments(limit: int = 20, offset: int = 0, status: Optional[str] = None):
+    """Lista paginada — sem payloads gigantes por default."""
+    from services import strategy_evidence_service as p05
+    try:
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+    except Exception:
+        limit, offset = 20, 0
+    if status is not None and status not in p05.VALID_TRANSITIONS:
+        return {"ok": False, "error": f"status inválido: {status}"}
+    try:
+        return {"ok": True, **(await p05.list_experiments(limit=limit, offset=offset, status=status))}
+    except Exception as e:
+        log.warning(f"[p05] listagem falhou: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/strategy/p05/experiments/{exp_id}")
+async def p05_experiment_detail(exp_id: int):
+    """Detalhes e métricas completas de UM experimento."""
+    from services import strategy_evidence_service as p05
+    try:
+        data = await p05.get_experiment(int(exp_id))
+    except Exception as e:
+        log.warning(f"[p05] detalhe falhou: {e}")
+        return {"ok": False, "error": str(e)}
+    if data is None:
+        return {"ok": False, "error": "experimento não encontrado"}
+    return {"ok": True, "experiment": data}
+
+
+@app.post("/api/strategy/p05/evaluate")
+async def p05_evaluate(days: int = 90, x_admin_token: Optional[str] = Header(None)):
+    """Gera/avalia candidatos offline. Exige auth admin. NÃO acessa exchange,
+    NÃO altera o LIVE. Falha explícita e sem persistência parcial."""
+    gate = _check_admin_token(x_admin_token)
+    if gate:
+        return gate
+    from services import strategy_evidence_service as p05
+    try:
+        days = max(7, min(int(days), 365))
+    except Exception:
+        days = 90
+    try:
+        return {"ok": True, **(await p05.evaluate_candidates(days=days))}
+    except Exception as e:
+        log.error(f"[p05] avaliação falhou: {e}")
+        raise HTTPException(status_code=500, detail=f"avaliação P05 falhou: {e}")
+
+
+@app.post("/api/strategy/p05/experiments/{exp_id}/start-shadow")
+async def p05_start_shadow(exp_id: int, x_admin_token: Optional[str] = Header(None)):
+    """OFFLINE_VALIDATED → SHADOW. Idempotente; conflito se já houver shadow
+    ativo. NÃO altera o LIVE."""
+    gate = _check_admin_token(x_admin_token)
+    if gate:
+        return gate
+    from services import strategy_evidence_service as p05
+    try:
+        res = await p05.start_shadow(int(exp_id))
+    except Exception as e:
+        log.error(f"[p05] start-shadow falhou: {e}")
+        raise HTTPException(status_code=500, detail=f"start-shadow falhou: {e}")
+    if not res.get("ok") and res.get("conflict"):
+        raise HTTPException(status_code=409, detail=res.get("error"))
+    return res
+
+
+@app.post("/api/strategy/p05/experiments/{exp_id}/evaluate-shadow")
+async def p05_evaluate_shadow(exp_id: int, x_admin_token: Optional[str] = Header(None)):
+    """Calcula REJECTED/ELIGIBLE ou segue aguardando amostra. NÃO altera o LIVE."""
+    gate = _check_admin_token(x_admin_token)
+    if gate:
+        return gate
+    from services import strategy_evidence_service as p05
+    try:
+        return await p05.evaluate_shadow(int(exp_id))
+    except Exception as e:
+        log.error(f"[p05] evaluate-shadow falhou: {e}")
+        raise HTTPException(status_code=500, detail=f"evaluate-shadow falhou: {e}")
+
+
 def _check_admin_token(token: Optional[str]) -> Optional[dict]:
     """
     Auth de endpoints admin que emitem ordem real. Retorna None se liberado, ou

@@ -538,3 +538,61 @@ Detalhes em `docs/P04C_DATA_FRESHNESS.md`.
 - **18 testes P04C verdes**, `py_compile` aprovado e nenhuma rede/exchange/DB
   acessada. Estratégia, score, IA, sizing, SL/TP e capabilities permanecem
   inalterados/desligados conforme a baseline.
+
+---
+
+## P05 — OTIMIZAÇÃO GOVERNADA POR EVIDÊNCIA (2026-08-27)
+
+Detalhes em `docs/P05_EVIDENCE_GOVERNED_STRATEGY.md`.
+
+**ANTES:** métricas, calibração e learning já existiam, mas não havia um ciclo de
+vida único e governado de candidato até a decisão — sem identidade versionada,
+sem validação temporal formal e sem critério de aceite explícito.
+
+**DEPOIS:** `dados → diagnóstico → candidato versionado → teste temporal →
+shadow → ELIGIBLE/REJECTED → recomendação de ativação MANUAL`.
+
+- **Três fontes separadas**: REAL (`RealTrade.source=auto`, janela por
+  `closed_at`), SHADOW (`RecommendationSnapshot`, janela por `outcome_at`, reusa
+  `_not_fast_void()`) e BACKTEST (`BacktestTrade`, evidência secundária). OPEN,
+  `realized_r=None`, NaN/infinito e duplicatas são excluídos **e contabilizados**;
+  breakeven e expired aparecem separados de win/loss.
+- **`pnl_usd` auditado**: já é LÍQUIDO (`close_trade` desconta entry/exit fee) —
+  reportado como líquido, fees só informativas, **sem double-count**.
+- **Métricas com `None` + motivo** quando não calculáveis: Wilson 95%,
+  expectancy/mediana/soma/desvio, downside deviation, profit factor, Sharpe por
+  trade (**não anualizado**), max drawdown, pior streak, slippage e cobertura.
+  IC de expectancy/delta por **bootstrap com seed fixa** (determinístico).
+- **Segmentos** (tier, TF, direção, base, padrão, sessão, regime, score, ATR,
+  MTF…) com rótulo de confiabilidade `INSUFFICIENT/EARLY/USABLE/STRONG`,
+  ordenados por evidência — segmento pequeno não vira edge comprovado.
+- **Funil corrigido**: `executados + skips` NÃO é "candidatos únicos".
+  `skip_reason_stats` guarda EVENTOS por (gate, dia); o campo virou `gate_events`
+  e `candidates_estimated` está marcado como estimativa. P04A/P04B abortam no
+  POST e não têm contador — reportado como `null` + motivo, sem inventar número.
+  Bloqueio **não** é chamado de lucro perdido.
+- **`features["p05_context"]`**: namespace versionado dentro do JSONB existente
+  (sem alterar schema), só com dado disponível no momento do snapshot; ausente
+  permanece `None`. **MAE/MFE = `UNAVAILABLE`** (não é reconstruível com fidelidade).
+- **Candidatos**: máx. 12, **um knob cada**, sem grid search, allowlist restrita,
+  limites conservadores; exige valor champion descoberto + cobertura ≥80%.
+  Qualquer tentativa de tocar P04A/B/C, stop/TP, qty/leverage/exposição, kill
+  switch, portfolio guard, maker/fallback, LIVE ou `LEARNING_AUTO_*` é rejeitada.
+- **Sem leakage**: corte cronológico treino/validação/**teste intocado**,
+  4 ou 6 folds por tamanho, mínimo de 30 outcomes OOS. Champion e candidato
+  comparados sobre o MESMO dataset, UNKNOWN excluído dos dois lados.
+- **Champion × Challenger**: mesma recomendação avalia os dois; challenger é
+  puramente contrafactual (`features["p05_experiment"]`, idempotente) — não altera
+  score/tier, não bloqueia rec, não abre trade. `UNKNOWN` nunca vira ELIGIBLE nem
+  BLOCKED. Só **um** SHADOW ativo.
+- **Decisão**: `DRAFT → INSUFFICIENT_DATA|REJECTED|OFFLINE_VALIDATED →
+  SHADOW → REJECTED|ELIGIBLE`, sem saltos, sem reabrir decidido, status+métricas
+  em transação única. `ELIGIBLE` = pode ser APRESENTADO ao usuário; **não** foi
+  ativado. Não existe endpoint de promote/apply/activate-live.
+- **1 tabela nova** (`strategy_experiments`, registrada em `init_db()`); nenhuma
+  coluna adicionada a tabelas existentes. 6 endpoints (3 GET fail-soft, 3 POST com
+  auth admin). Painel de assertividade ganhou 4 seções — sem botão de promoção.
+- **117 testes P05 verdes 2×** e **suíte crítica P01–P05 (360) verde 2×** no
+  Python 3.11 real; `py_compile`, `tsc --noEmit` e `git diff --check` aprovados;
+  rede/DNS bloqueados e contabilizados. Estratégia, score, IA, sizing, SL/TP,
+  `LIVE_SIZE_MULT` e capabilities permanecem inalterados/desligados.

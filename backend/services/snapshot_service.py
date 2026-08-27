@@ -225,6 +225,64 @@ def _extract_features(
         "chase_atr": rec.get("chase_atr"),
         "struct_chase_atr": rec.get("struct_chase_atr"),
         "retest_armed": rec.get("retest_armed"),
+        # P05 — contexto versionado do MOMENTO da decisão (namespace isolado).
+        "p05_context": _p05_context(rec, sig, created_at, regime_label, atr_pct),
+    }
+
+
+def _p05_context(rec: Dict[str, Any], sig: Dict[str, Any], created_at: datetime,
+                 regime_label: str | None, atr_pct: float | None) -> Dict[str, Any]:
+    """Namespace versionado `features['p05_context']` (P05).
+
+    Só grava o que JÁ EXISTE no instante do snapshot — nunca inventa valor
+    ausente e nunca recomputa pós-fato como se fosse o original. Campo que não
+    veio na rec permanece `None` (o P05 trata isso como UNKNOWN, não como zero).
+    Não altera schema: é apenas mais uma chave dentro do JSONB `features`.
+    """
+    verdict = rec.get("bot_verdict") or {}
+    if not isinstance(verdict, dict):
+        verdict = {}
+    mtf = (sig.get("mtf") or {}) if isinstance(sig, dict) else {}
+    derivatives = (sig.get("derivatives") or {}) if isinstance(sig, dict) else {}
+    freshness = rec.get("data_freshness") or (sig.get("data_freshness") if isinstance(sig, dict) else None)
+    fresh_summary = None
+    if isinstance(freshness, dict):
+        candle = freshness.get("candle") if isinstance(freshness.get("candle"), dict) else {}
+        fresh_summary = {
+            "quality": candle.get("quality") or freshness.get("quality"),
+            "source": candle.get("source") or freshness.get("source"),
+        }
+    return {
+        "schema_version": 1,
+        "score": rec.get("score"),
+        "tier": rec.get("tier"),
+        "p_tp1": rec.get("prob_tp1"),
+        "p_tp2": rec.get("prob_tp2"),
+        "risk_reward": rec.get("risk_reward"),
+        "quote_volume_usd": rec.get("quote_vol_usd"),
+        "spread_pct": rec.get("spread_pct"),
+        "edge_score": rec.get("edge_score"),
+        "edge_tags": rec.get("edge_tags"),
+        "bot_verdict_ok": verdict.get("ok"),
+        "bot_verdict_reason": verdict.get("reason"),
+        "bot_verdict_code": verdict.get("code"),
+        "regime": regime_label,
+        "mtf_aligned": mtf.get("aligned_count") if mtf else None,
+        "mtf_score": mtf.get("alignment_score") if mtf else None,
+        "funding_pct": derivatives.get("funding_rate_pct") if derivatives else None,
+        "funding_sentiment": derivatives.get("funding_sentiment") if derivatives else None,
+        "atr_pct": atr_pct,
+        "chase_atr": rec.get("chase_atr"),
+        "struct_chase_atr": rec.get("struct_chase_atr"),
+        "entry_zone_type": (
+            rec.get("entry_zone_type")
+            or ((sig.get("trade_plan") or {}).get("entry_zone") or {}).get("type")
+            if isinstance(sig, dict) else rec.get("entry_zone_type")
+        ),
+        "data_freshness": fresh_summary,
+        "exchange": rec.get("exchange") or "binance",
+        "source": rec.get("source") or "scan",
+        "observed_at": created_at.isoformat(),
     }
 
 

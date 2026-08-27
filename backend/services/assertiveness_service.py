@@ -295,11 +295,20 @@ async def _opportunity_cost(days: int) -> Dict[str, Any]:
 
 
 async def _funnel(days: int, gates: Dict[str, Any]) -> Dict[str, Any]:
-    """#1 — Funil de execução consolidado (janela = gate_days). Amarra os
-    candidatos tier A/A+ que chegaram ao loop com os drop-offs por gate e os
-    executados de verdade. candidates ≈ executed + total_skips."""
-    out = {"window_days": days, "candidates": None, "executed": 0,
-           "exec_rate_pct": None, "stages": []}
+    """#1 — Funil de execução consolidado (janela = gate_days).
+
+    CORREÇÃO P05: `skip_reason_stats` guarda EVENTOS agregados por (gate, dia) —
+    o MESMO setup pode gerar vários eventos e vários gates podem barrar o mesmo
+    candidato. Portanto `executados + skips` NÃO é o número de candidatos ÚNICOS
+    (não existe identidade única na tabela pra provar isso). O campo passa a se
+    chamar `gate_events` e `candidates_estimated` fica explicitamente marcado
+    como ESTIMATIVA — não como contagem.
+    """
+    out = {"window_days": days, "gate_events": 0, "candidates_estimated": None,
+           "is_estimate": True, "executed": 0, "exec_rate_pct": None, "stages": [],
+           "note": ("skips são EVENTOS por gate/dia, não oportunidades únicas; "
+                    "executados + eventos NÃO é contagem de candidatos"),
+           "candidates": None}
     executed = 0
     try:
         from db import get_session
@@ -314,12 +323,14 @@ async def _funnel(days: int, gates: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning(f"[assertiveness] funnel executed read falhou: {e}")
     total_skips = int(gates.get("total_skips") or 0)
-    candidates = total_skips + executed
+    estimated = total_skips + executed
     out["executed"] = executed
-    out["candidates"] = candidates
-    out["exec_rate_pct"] = round(executed / candidates * 100, 1) if candidates else None
+    out["gate_events"] = total_skips
+    out["candidates_estimated"] = estimated
+    out["candidates"] = estimated          # compat retro (front antigo) — é estimativa
+    out["exec_rate_pct"] = round(executed / estimated * 100, 1) if estimated else None
     # Etapas ordenadas: cada gate como um degrau de queda, executados no fim.
-    stages = [{"stage": "candidatos_tierA", "count": candidates}]
+    stages = [{"stage": "candidatos_estimados", "count": estimated, "is_estimate": True}]
     for it in gates.get("items", []):
         stages.append({"stage": f"barrado:{it['gate']}", "count": it["count"]})
     stages.append({"stage": "executados", "count": executed})
@@ -1320,6 +1331,63 @@ async def _calibration_stats() -> Dict[str, Any]:
     return out
 
 
+async def _p05_section(days: int) -> Dict[str, Any]:
+    """P05 — qualidade da evidência, onde ganha/perde, champion × challenger e
+    bloqueios P04. READ-ONLY e fail-soft: erro aqui não derruba o painel.
+    Só EVIDÊNCIA — nenhuma ação de promoção é exposta."""
+    try:
+        from services import strategy_evidence_service as p05
+    except Exception as exc:  # noqa: BLE001
+        return {"enabled": False, "error": str(exc)}
+    if not p05.P05_ANALYTICS_ENABLED:
+        return {"enabled": False, "reason": "P05_ANALYTICS_ENABLED=false"}
+    out: Dict[str, Any] = {"enabled": True, "window_days": days}
+    try:
+        diag = await p05.build_diagnosis(days)
+        segments = diag.get("segments") or {}
+        shadow = diag.get("shadow") or {}
+        # Só os eixos de maior leitura no painel (payload enxuto).
+        best_worst: Dict[str, Any] = {}
+        for axis in ("by_tier", "by_timeframe", "by_direction", "by_session_utc",
+                     "by_regime", "by_score_bin", "by_atr_band"):
+            block = segments.get(axis) or {}
+            items = [it for it in (block.get("items") or [])
+                     if it.get("reliability") != p05.RELIABILITY_INSUFFICIENT]
+            if not items:
+                continue
+            ranked = sorted(items, key=lambda it: it.get("avg_r") or 0.0, reverse=True)
+            best_worst[axis] = {"best": ranked[:3], "worst": ranked[-3:][::-1]}
+        out["evidence_quality"] = diag.get("evidence_quality")
+        out["shadow_metrics"] = shadow.get("metrics")
+        out["real_metrics"] = (diag.get("real") or {}).get("metrics")
+        out["segments"] = best_worst
+        out["gate_events"] = diag.get("gate_events")
+        out["mae_mfe"] = diag.get("mae_mfe")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[assertiveness] p05 diagnóstico falhou: {exc}")
+        out["diagnosis_error"] = str(exc)
+    try:
+        from db import get_session
+        from models.strategy_experiment import StrategyExperiment as E
+        async with get_session() as session:
+            exp = (await session.execute(
+                select(E).where(E.status == p05.STATUS_SHADOW)
+                .order_by(E.shadow_started_at.desc())
+            )).scalars().first()
+            eligible = (await session.execute(
+                select(E).where(E.status == p05.STATUS_ELIGIBLE)
+                .order_by(E.decided_at.desc())
+            )).scalars().first()
+        out["shadow_experiment"] = exp.to_dict(full=True) if exp else None
+        out["eligible_experiment"] = eligible.to_dict(full=False) if eligible else None
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[assertiveness] p05 experimentos falhou: {exc}")
+        out["shadow_experiment"] = None
+    out["champion_untouched"] = True
+    out["note"] = "P05 é somente evidência — nada aqui altera o LIVE"
+    return out
+
+
 async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any]:
     """Agrega tudo pro painel. days = janela de outcomes; gate_days = janela de
     skips (mais curta porque skips são muito mais frequentes)."""
@@ -1341,6 +1409,7 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     trade_journal = await _trade_journal(days)
     pyramiding = await _pyramiding_opportunity(days)
     hedge_regime = await _hedge_by_regime(days)
+    p05 = await _p05_section(days)
     return {
         "enabled": True,
         "window_days": days,
@@ -1359,5 +1428,6 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "trade_journal": trade_journal,
         "pyramiding_opportunity": pyramiding,
         "hedge_by_regime": hedge_regime,
+        "p05": p05,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
