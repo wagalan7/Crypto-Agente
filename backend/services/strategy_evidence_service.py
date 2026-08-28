@@ -2160,6 +2160,693 @@ async def evaluate_candidates(days: int = 90) -> Dict[str, Any]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  P05.1 — candidatos CONTEXTUAIS (ANALYTICS_ONLY)
+#
+#  Motivação (medida no P05 com 90 dias): os candidatos GLOBAIS de SCORE_MIN
+#  falharam — 57/59 rejeitados em LOSS_REDUCTION, 53 sem +10% de operações, e 51
+#  passou na validação mas o holdout levou o drawdown de 4R para 7R. Baixar o
+#  piso globalmente troca perdas por volume ruim.
+#
+#  O P05.1 pergunta outra coisa: existe CONTEXTO em que vale bloquear, e contexto
+#  em que vale afrouxar 2 pontos? É SOMENTE análise offline — nunca entra no
+#  executor, nunca vai para Shadow, nunca gera plano executável.
+# ════════════════════════════════════════════════════════════════════════════
+P051_PHASE = "P05.1"
+P051_EXECUTION_MODE = "ANALYTICS_ONLY"
+P051_BLOCK_REASON = "P051_ANALYTICS_ONLY"
+
+# Eixos permitidos NESTA fase. Baixa cardinalidade e operáveis; símbolo, base,
+# padrão, direção, hora, dia, score_bin e ATR band ficam de fora de propósito
+# (overfitting, múltiplas comparações e regra difícil de operar).
+P051_CONTEXT_AXES = ("regime", "entry_zone_type")
+P051_ACTIONS = ("BLOCK", "SCORE_DELTA")
+P051_SCORE_DELTA = -2.0                 # único valor aceito nesta fase
+P051_SCHEMA_VERSION = 1
+
+P051_MIN_TRAIN_SEGMENT = 30             # observações do contexto no treino
+P051_MIN_STAGE_SEGMENT = 20             # observações na validação/teste
+P051_MIN_AFFECTED = 20                  # operações realmente afetadas pela regra
+P051_MAX_PER_OBJECTIVE = 4
+P051_MAX_CANDIDATES = 8
+
+CONTEXT_UNKNOWN = "__UNKNOWN__"
+
+
+def context_value(row: Dict[str, Any], axis: str) -> str:
+    """Valor do contexto EXATAMENTE como persistido no snapshot.
+
+    Lê somente `features["regime"]` e `features["entry_zone_type"]`. Ausente,
+    vazio ou eixo não permitido ⇒ `CONTEXT_UNKNOWN` (nunca um valor inventado).
+    """
+    if axis not in P051_CONTEXT_AXES:
+        return CONTEXT_UNKNOWN
+    raw = (row.get("features") or {}).get(axis)
+    if raw is None:
+        return CONTEXT_UNKNOWN
+    value = str(raw).strip()
+    return value or CONTEXT_UNKNOWN
+
+
+def validate_context_rule(rule: Any) -> Dict[str, Any]:
+    """Validador SEPARADO do P05 global — `CONTEXT_RULE` não entra na
+    `KNOB_ALLOWLIST`. Levanta `CandidateValidationError`."""
+    if not isinstance(rule, dict) or not rule:
+        raise CandidateValidationError("CONTEXT_RULE vazio")
+    allowed = {"schema_version", "axis", "value", "action", "score_delta"}
+    extra = set(rule) - allowed
+    if extra:
+        raise CandidateValidationError(f"campos proibidos em CONTEXT_RULE: {sorted(extra)}")
+
+    version = rule.get("schema_version")
+    if version != P051_SCHEMA_VERSION or isinstance(version, bool):
+        raise CandidateValidationError(f"schema_version deve ser {P051_SCHEMA_VERSION}")
+
+    axis = rule.get("axis")
+    if axis not in P051_CONTEXT_AXES:
+        raise CandidateValidationError(
+            f"axis deve ser um de {list(P051_CONTEXT_AXES)} (recebido {axis!r})")
+
+    value = rule.get("value")
+    if not isinstance(value, str) or not value.strip():
+        raise CandidateValidationError("value deve ser string não vazia")
+    if value.strip() == CONTEXT_UNKNOWN:
+        raise CandidateValidationError("value não pode ser o marcador de UNKNOWN")
+
+    action = rule.get("action")
+    if action not in P051_ACTIONS:
+        raise CandidateValidationError(
+            f"action deve ser um de {list(P051_ACTIONS)} (recebido {action!r})")
+
+    canonical: Dict[str, Any] = {
+        "schema_version": P051_SCHEMA_VERSION,
+        "axis": axis,
+        "value": value.strip(),
+        "action": action,
+    }
+    if action == "BLOCK":
+        if "score_delta" in rule:
+            raise CandidateValidationError("BLOCK não aceita score_delta")
+    else:
+        delta = rule.get("score_delta")
+        if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+            raise CandidateValidationError("SCORE_DELTA exige score_delta numérico")
+        num = _finite(delta)
+        if num is None:
+            raise CandidateValidationError("score_delta NaN/infinito rejeitado")
+        if abs(num - P051_SCORE_DELTA) > 1e-9:
+            raise CandidateValidationError(
+                f"score_delta aceito nesta fase é apenas {P051_SCORE_DELTA}")
+        canonical["score_delta"] = P051_SCORE_DELTA
+    return canonical
+
+
+def validate_contextual_candidate_config(config: Any) -> Dict[str, Any]:
+    """Exatamente UMA chave lógica `CONTEXT_RULE`, com o schema completo."""
+    if not isinstance(config, dict) or not config:
+        raise CandidateValidationError("configuração vazia")
+    if set(config) != {"CONTEXT_RULE"}:
+        raise CandidateValidationError(
+            f"configuração contextual aceita apenas CONTEXT_RULE (recebido {sorted(config)})")
+    return {"CONTEXT_RULE": validate_context_rule(config["CONTEXT_RULE"])}
+
+
+def contextual_eligibility(row: Dict[str, Any], champion: Dict[str, Any],
+                           rule: Dict[str, Any],
+                           active_components: Sequence[str]) -> Optional[bool]:
+    """Champion + UMA regra contextual, reaproveitando `eligibility` sem alterá-la.
+
+    * `None` (UNKNOWN) quando o champion não é decidível OU o contexto está
+      ausente — nunca vira BLOCKED nem ELIGIBLE por fallback.
+    * Fora do contexto: o veredito é IDÊNTICO ao do champion.
+    * `BLOCK`: bloqueia somente o contexto correspondente.
+    * `SCORE_DELTA`: baixa o piso de score em exatamente 2 pontos SOMENTE no
+      contexto — e apenas para linhas cujo ÚNICO bloqueio era o score-min. Se
+      outro gate barrou (R:R, P(TP1), liquidez, P04, ATR, funding, proximity,
+      struct-chase, tempo, tier), a regra NÃO reativa a linha.
+    """
+    base = eligibility(row, champion, active_components)
+    if base is None:
+        return None
+
+    ctx = context_value(row, rule.get("axis"))
+    if ctx == CONTEXT_UNKNOWN:
+        return None
+    if ctx != rule.get("value"):
+        return base                       # contexto diferente: intocado
+
+    if rule.get("action") == "BLOCK":
+        return False
+
+    # ── SCORE_DELTA ──────────────────────────────────────────────────────────
+    if "score_min" not in active_components:
+        return None                       # sem o gate de score não há o que afrouxar
+    if base is True:
+        return True                       # já passava; afrouxar não retira nada
+
+    others = [c for c in active_components if c != "score_min"]
+    other_verdict = eligibility(row, champion, others)
+    if other_verdict is None:
+        return None                       # não dá pra provar que só o score barrou
+    if other_verdict is False:
+        return False                      # outro gate barrou → não reativa
+
+    score = _execution_score(row, champion)
+    score_min = _finite(champion.get("SCORE_MIN"))
+    if score is None or score_min is None:
+        return None
+    return score >= score_min + P051_SCORE_DELTA
+
+
+def contextual_active_components(rows: Sequence[Dict[str, Any]]) -> Tuple[List[str], Dict[str, Any]]:
+    """Componentes com cobertura suficiente. A regra contextual não substitui
+    nenhum gate — ela atua POR CIMA do champion."""
+    coverage = {c: component_coverage(rows, c) for c in _COMPONENT_FEATURES}
+    active = [c for c, cov in coverage.items()
+              if cov is not None and cov >= P05_MIN_FEATURE_COVERAGE_PCT]
+    skipped = {c: cov for c, cov in coverage.items() if c not in active}
+    return active, {"coverage_pct": coverage, "skipped_low_coverage": skipped}
+
+
+def axis_coverage(rows: Sequence[Dict[str, Any]], axis: str) -> Optional[float]:
+    """Cobertura (%) do eixo de contexto na amostra."""
+    n = len(rows)
+    if n == 0:
+        return None
+    present = sum(1 for r in rows if context_value(r, axis) != CONTEXT_UNKNOWN)
+    return round(present / n * 100, 1)
+
+
+def compare_contextual(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
+                       rule: Dict[str, Any], active: Sequence[str]) -> Dict[str, Any]:
+    """Champion × champion+regra sobre o MESMO dataset, pareado pela oportunidade.
+
+    UNKNOWN (champion indecidível ou contexto ausente) é excluído dos DOIS lados.
+    """
+    evaluable = [
+        r for r in rows
+        if eligibility(r, champion, active) is not None
+        and contextual_eligibility(r, champion, rule, active) is not None
+    ]
+    champ_rows, _ = split_by_config(evaluable, champion, active)
+    cand_rows = [r for r in evaluable
+                 if contextual_eligibility(r, champion, rule, active)]
+
+    champ_m = compute_evidence_metrics(champ_rows)
+    cand_m = compute_evidence_metrics(cand_rows)
+    champ_ids = {id(r) for r in champ_rows}
+    cand_ids = {id(r) for r in cand_rows}
+    added = [r for r in cand_rows if id(r) not in champ_ids]
+    avoided = [r for r in champ_rows if id(r) not in cand_ids]
+
+    added_r = [r["realized_r"] for r in added]
+    avoided_r = [r["realized_r"] for r in avoided]
+    in_context = [r for r in evaluable if context_value(r, rule["axis"]) == rule["value"]]
+
+    return {
+        "evaluable": len(evaluable),
+        "unknown_excluded": len(rows) - len(evaluable),
+        "in_context": len(in_context),
+        "champion": champ_m,
+        "candidate": cand_m,
+        "added_ops": len(added),
+        "avoided_ops": len(avoided),
+        "affected_ops": len(added) + len(avoided),
+        "added_expectancy_r": round(sum(added_r) / len(added_r), 4) if added_r else None,
+        "avoided_expectancy_r": round(sum(avoided_r) / len(avoided_r), 4) if avoided_r else None,
+        "added_expectancy_ci": bootstrap_mean_ci(added_r),
+        "avoided_expectancy_ci": bootstrap_mean_ci(avoided_r),
+        # Pareado pela MESMA oportunidade — champion e candidato compartilham a
+        # amostra, então IC independente seria incorreto.
+        "delta_expectancy_ci": bootstrap_paired_membership_delta_ci(
+            evaluable, champ_ids, cand_ids),
+        "material_segment_regressions": _material_segment_regressions(champ_rows, cand_rows),
+        "selects_subset": len(cand_rows) < len(champ_rows),
+        "note": ("regra contextual aplicada POR CIMA do champion; UNKNOWN excluído "
+                 "dos dois lados; contexto não é causalidade"),
+    }
+
+
+def evaluate_contextual_gate(objective: str, action: str, validation: Dict[str, Any],
+                             test: Dict[str, Any]) -> Dict[str, Any]:
+    """Gates do P05.1 — aplicados em validação E teste. Nunca força vencedor."""
+    checks: List[Dict[str, Any]] = []
+
+    def _chk(name: str, passed: Optional[bool], detail: str) -> None:
+        checks.append({"check": name, "passed": bool(passed), "detail": detail})
+
+    cand_t = test.get("candidate") or {}
+    if (cand_t.get("count") or 0) < P05_MIN_OOS_RESOLVED:
+        return {"verdict": STATUS_INSUFFICIENT, "reason_code": "OOS_SAMPLE_TOO_SMALL",
+                "detail": (f"teste final tem {cand_t.get('count')} outcomes do candidato "
+                           f"(< {P05_MIN_OOS_RESOLVED})"),
+                "checks": checks}
+    if objective not in OBJECTIVES:
+        return {"verdict": STATUS_REJECTED, "reason_code": "OBJETIVO_INVALIDO",
+                "detail": objective, "checks": checks}
+
+    for stage, cmp_ in (("validacao", validation), ("teste", test)):
+        cand = cmp_.get("candidate") or {}
+        champ = cmp_.get("champion") or {}
+        exp = cand.get("expectancy_r")
+
+        # UNKNOWN nunca aprova: a comparação precisa de amostra avaliável real.
+        _chk(f"{stage}_sem_aprovacao_por_unknown",
+             (cmp_.get("evaluable") or 0) > 0 and (cand.get("count") or 0) > 0,
+             f"evaluable={cmp_.get('evaluable')} unknown_excluded={cmp_.get('unknown_excluded')}")
+        _chk(f"{stage}_amostra_afetada_minima",
+             (cmp_.get("affected_ops") or 0) >= P051_MIN_AFFECTED,
+             f"afetadas={cmp_.get('affected_ops')} (mín {P051_MIN_AFFECTED})")
+        _chk(f"{stage}_expectancy_candidate_positiva",
+             exp is not None and exp > 0 and (cand.get("sum_r") or 0) > 0,
+             f"expectancy={exp} total_r={cand.get('sum_r')}")
+        _chk(f"{stage}_sem_segmento_material_negativo",
+             not (cmp_.get("material_segment_regressions") or []),
+             f"regressões={(cmp_.get('material_segment_regressions') or [])[:5]}")
+
+        dci = cmp_.get("delta_expectancy_ci") or {}
+        if objective == OBJECTIVE_LOSS_REDUCTION:
+            _chk(f"{stage}_ci_delta_pareado_acima_de_zero",
+                 dci.get("low") is not None and dci["low"] > 0, f"IC pareado={dci}")
+            _chk(f"{stage}_profit_factor_nao_pior",
+                 _pf(cand) >= _pf(champ),
+                 f"cand={cand.get('profit_factor')} champ={champ.get('profit_factor')}")
+            _chk(f"{stage}_drawdown_nao_pior",
+                 (cand.get("max_drawdown_r") or 0) <= (champ.get("max_drawdown_r") or 0) + 1e-9,
+                 f"cand={cand.get('max_drawdown_r')} champ={champ.get('max_drawdown_r')}")
+            _chk(f"{stage}_operacoes_min_70pct",
+                 (champ.get("count") or 0) > 0 and (cand.get("count") or 0) >= 0.7 * champ["count"],
+                 f"cand={cand.get('count')} champ={champ.get('count')}")
+            # O contexto bloqueado precisa ser comprovadamente ruim — não basta
+            # a média; o IC superior das evitadas tem que ficar abaixo de zero.
+            avoided_exp = cmp_.get("avoided_expectancy_r")
+            _chk(f"{stage}_contexto_bloqueado_negativo",
+                 avoided_exp is not None and avoided_exp < 0,
+                 f"expectancy das evitadas={avoided_exp}")
+            aci = cmp_.get("avoided_expectancy_ci") or {}
+            _chk(f"{stage}_ci_superior_evitadas_abaixo_de_zero",
+                 aci.get("high") is not None and aci["high"] < 0,
+                 f"IC das evitadas={aci}")
+        else:
+            _chk(f"{stage}_operacoes_min_110pct",
+                 (champ.get("count") or 0) > 0 and (cand.get("count") or 0) >= 1.1 * champ["count"],
+                 f"cand={cand.get('count')} champ={champ.get('count')}")
+            eci = cand.get("expectancy_ci") or {}
+            _chk(f"{stage}_ci_expectancy_acima_de_zero",
+                 eci.get("low") is not None and eci["low"] > 0, f"IC={eci}")
+            _chk(f"{stage}_total_r_maior",
+                 (cand.get("sum_r") or 0) > (champ.get("sum_r") or 0),
+                 f"cand={cand.get('sum_r')} champ={champ.get('sum_r')}")
+            _chk(f"{stage}_profit_factor_min_1", _pf(cand) >= 1.0,
+                 f"cand={cand.get('profit_factor')}")
+            _chk(f"{stage}_drawdown_max_110pct",
+                 (cand.get("max_drawdown_r") or 0) <= 1.1 * (champ.get("max_drawdown_r") or 0) + 1e-9,
+                 f"cand={cand.get('max_drawdown_r')} champ={champ.get('max_drawdown_r')}")
+            add_exp = cmp_.get("added_expectancy_r")
+            _chk(f"{stage}_operacoes_adicionais_positivas",
+                 add_exp is not None and add_exp > 0, f"expectancy das adicionais={add_exp}")
+            adci = cmp_.get("added_expectancy_ci") or {}
+            _chk(f"{stage}_ci_adicionais_acima_de_zero",
+                 adci.get("low") is not None and adci["low"] > 0,
+                 f"IC das adicionais={adci}")
+            _chk(f"{stage}_ci_delta_pareado_nao_negativo",
+                 dci.get("low") is not None and dci["low"] >= 0, f"IC pareado={dci}")
+
+    # Estrutural: BLOCK só remove linhas; SCORE_DELTA só reativa linhas cujo
+    # único bloqueio era o score-min (garantido em `contextual_eligibility`).
+    _chk("nenhum_gate_p01_p04_relaxado", action in P051_ACTIONS,
+         "BLOCK apenas remove; SCORE_DELTA não reativa linha barrada por outro gate")
+
+    failed = [c["check"] for c in checks if not c["passed"]]
+    if failed:
+        return {"verdict": STATUS_REJECTED, "reason_code": "GATE_NAO_ATENDIDO",
+                "detail": f"falhou: {', '.join(failed)}", "checks": checks}
+    return {"verdict": STATUS_OFFLINE_VALIDATED, "reason_code": "GATES_OK",
+            "detail": "validação e teste positivos (resultado ANALÍTICO, não promovível)",
+            "checks": checks}
+
+
+def generate_contextual_candidates(champion: Dict[str, Any],
+                                   train_rows: Sequence[Dict[str, Any]]
+                                   ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Hipóteses derivadas SOMENTE do treino. Ordem determinística, sem grid
+    search, um contexto por candidato. Sem contexto elegível ⇒ sem candidato."""
+    accepted: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    total_cap = min(P051_MAX_CANDIDATES, P05_MAX_CANDIDATES)
+
+    for objective, action in ((OBJECTIVE_LOSS_REDUCTION, "BLOCK"),
+                              (OBJECTIVE_MORE_OPERATIONS, "SCORE_DELTA")):
+        picked = 0
+        for axis in P051_CONTEXT_AXES:
+            cov = axis_coverage(train_rows, axis)
+            if cov is None or cov < P05_MIN_FEATURE_COVERAGE_PCT:
+                rejected.append({"axis": axis, "objective": objective,
+                                 "reason": "AXIS_COVERAGE_TOO_LOW",
+                                 "coverage_pct": cov,
+                                 "required_pct": P05_MIN_FEATURE_COVERAGE_PCT})
+                continue
+
+            groups: Dict[str, List[Dict[str, Any]]] = {}
+            for row in train_rows:
+                value = context_value(row, axis)
+                if value != CONTEXT_UNKNOWN:
+                    groups.setdefault(value, []).append(row)
+
+            scored: List[Tuple[str, Dict[str, Any]]] = []
+            for value, grp in groups.items():
+                metrics = compute_evidence_metrics(grp, with_bootstrap=False)
+                n = metrics["count"]
+                exp = metrics["expectancy_r"]
+                if n < P051_MIN_TRAIN_SEGMENT:
+                    rejected.append({"axis": axis, "value": value, "objective": objective,
+                                     "reason": "TRAIN_SEGMENT_TOO_SMALL",
+                                     "count": n, "required": P051_MIN_TRAIN_SEGMENT})
+                    continue
+                if metrics["reliability"] not in (RELIABILITY_USABLE, RELIABILITY_STRONG):
+                    rejected.append({"axis": axis, "value": value, "objective": objective,
+                                     "reason": "RELIABILITY_BELOW_USABLE",
+                                     "reliability": metrics["reliability"], "count": n})
+                    continue
+                if exp is None:
+                    rejected.append({"axis": axis, "value": value, "objective": objective,
+                                     "reason": "EXPECTANCY_UNAVAILABLE", "count": n})
+                    continue
+                wanted = exp < 0 if objective == OBJECTIVE_LOSS_REDUCTION else exp > 0
+                if not wanted:
+                    rejected.append({"axis": axis, "value": value, "objective": objective,
+                                     "reason": "CONTEXT_DIRECTION_MISMATCH",
+                                     "expectancy_r": exp, "count": n})
+                    continue
+                scored.append((value, metrics))
+
+            # Ordem determinística: pior primeiro (BLOCK) / melhor primeiro
+            # (SCORE_DELTA); desempate por amostra e depois pelo nome do valor.
+            reverse = objective == OBJECTIVE_MORE_OPERATIONS
+            scored.sort(key=lambda it: (it[1]["expectancy_r"], it[1]["count"], it[0]),
+                        reverse=reverse)
+
+            for value, metrics in scored:
+                if picked >= P051_MAX_PER_OBJECTIVE or len(accepted) >= total_cap:
+                    break
+                rule: Dict[str, Any] = {"schema_version": P051_SCHEMA_VERSION,
+                                        "axis": axis, "value": value, "action": action}
+                if action == "SCORE_DELTA":
+                    rule["score_delta"] = P051_SCORE_DELTA
+                try:
+                    config = validate_contextual_candidate_config({"CONTEXT_RULE": rule})
+                except CandidateValidationError as exc:
+                    rejected.append({"axis": axis, "value": value, "objective": objective,
+                                     "reason": "INVALID_CONTEXT_RULE", "detail": str(exc)})
+                    continue
+                accepted.append({
+                    "objective": objective,
+                    "config": config,
+                    "rule": config["CONTEXT_RULE"],
+                    "axis": axis,
+                    "value": value,
+                    "action": action,
+                    "context_evidence": {
+                        "train_count": metrics["count"],
+                        "train_expectancy_r": metrics["expectancy_r"],
+                        "train_win_rate_pct": metrics["win_rate_pct"],
+                        "train_total_r": metrics["sum_r"],
+                        "reliability": metrics["reliability"],
+                        "axis_coverage_pct": cov,
+                    },
+                    "generation_reason": (
+                        f"contexto {axis}={value} com expectancy "
+                        f"{metrics['expectancy_r']:+.4f}R em {metrics['count']} casos de TREINO"),
+                })
+                picked += 1
+    return accepted[:total_cap], rejected
+
+
+def evaluate_contextual_candidate_offline(rows: Sequence[Dict[str, Any]],
+                                          champion: Dict[str, Any],
+                                          candidate: Dict[str, Any], *,
+                                          include_holdout: bool = True) -> Dict[str, Any]:
+    """Pipeline temporal de UMA regra contextual. `include_holdout=False` mantém
+    o teste fisicamente fora do cálculo — só o finalista o abre."""
+    rule = candidate["rule"]
+    split = temporal_split(rows)
+    if not split.get("ok"):
+        return {"verdict": STATUS_INSUFFICIENT, "reason_code": "INSUFFICIENT_DATA",
+                "detail": f"{split['total']} outcomes válidos (< {split['required']})",
+                "coverage": {}}
+
+    # Cobertura e componentes CONGELADOS no treino — o holdout não liga/desliga
+    # componente nem cria/remove hipótese.
+    active, coverage_info = contextual_active_components(split["train"])
+    axis = rule["axis"]
+    train_axis_cov = axis_coverage(split["train"], axis)
+    coverage_info["axis"] = axis
+    coverage_info["axis_coverage_pct"] = {
+        "train": train_axis_cov,
+        "validation": axis_coverage(split["validation"], axis),
+        "test": axis_coverage(split["test"], axis) if include_holdout else None,
+    }
+    if train_axis_cov is None or train_axis_cov < P05_MIN_FEATURE_COVERAGE_PCT:
+        return {"verdict": STATUS_INSUFFICIENT,
+                "reason_code": "TRAIN_AXIS_COVERAGE_TOO_LOW",
+                "detail": f"cobertura de treino do eixo {axis}: {train_axis_cov}%",
+                "coverage": coverage_info, "active_components": active}
+    if rule["action"] == "SCORE_DELTA" and "score_min" not in active:
+        return {"verdict": STATUS_INSUFFICIENT,
+                "reason_code": "SCORE_COMPONENT_UNAVAILABLE",
+                "detail": "sem o gate de score na amostra não há piso para afrouxar",
+                "coverage": coverage_info, "active_components": active}
+
+    # Amostra mínima do contexto em cada estágio.
+    def _stage_n(stage_rows) -> int:
+        return sum(1 for r in stage_rows if context_value(r, axis) == rule["value"])
+
+    stage_counts = {"train": _stage_n(split["train"]),
+                    "validation": _stage_n(split["validation"]),
+                    "test": _stage_n(split["test"]) if include_holdout else None}
+    if stage_counts["validation"] < P051_MIN_STAGE_SEGMENT:
+        return {"verdict": STATUS_INSUFFICIENT,
+                "reason_code": "VALIDATION_SEGMENT_TOO_SMALL",
+                "detail": (f"contexto tem {stage_counts['validation']} casos na validação "
+                           f"(< {P051_MIN_STAGE_SEGMENT})"),
+                "coverage": coverage_info, "active_components": active,
+                "context_stage_counts": stage_counts}
+    if include_holdout and stage_counts["test"] < P051_MIN_STAGE_SEGMENT:
+        return {"verdict": STATUS_INSUFFICIENT,
+                "reason_code": "TEST_SEGMENT_TOO_SMALL",
+                "detail": (f"contexto tem {stage_counts['test']} casos no teste "
+                           f"(< {P051_MIN_STAGE_SEGMENT})"),
+                "coverage": coverage_info, "active_components": active,
+                "context_stage_counts": stage_counts}
+
+    train_cmp = compare_contextual(split["train"], champion, rule, active)
+    validation = compare_contextual(split["validation"], champion, rule, active)
+    if include_holdout:
+        test: Dict[str, Any] = compare_contextual(split["test"], champion, rule, active)
+        gate = evaluate_contextual_gate(candidate["objective"], rule["action"],
+                                        validation, test)
+    else:
+        test = {"withheld": True, "reason": "finalista ainda não congelado"}
+        gate = evaluate_contextual_gate(candidate["objective"], rule["action"],
+                                        validation, validation)
+
+    folds_out = []
+    selection_rows = list(split["train"]) + list(split["validation"])
+    for fold in walkforward_folds(selection_rows, split["folds"]):
+        cmp_fold = compare_contextual(fold["test"], champion, rule, active)
+        folds_out.append({
+            "fold": fold["fold"],
+            "test_count": cmp_fold["candidate"]["count"],
+            "candidate_expectancy_r": cmp_fold["candidate"]["expectancy_r"],
+            "champion_expectancy_r": cmp_fold["champion"]["expectancy_r"],
+        })
+
+    return {
+        "phase": P051_PHASE,
+        "execution_mode": P051_EXECUTION_MODE,
+        "promotable": False,
+        "shadow_supported": False,
+        "verdict": gate["verdict"],
+        "reason_code": gate["reason_code"],
+        "detail": gate["detail"],
+        "checks": gate["checks"],
+        "objective": candidate["objective"],
+        "context_rule": rule,
+        "context_evidence": candidate.get("context_evidence"),
+        "generation_reason": candidate.get("generation_reason"),
+        "context_stage_counts": stage_counts,
+        "active_components": active,
+        "coverage": coverage_info,
+        "split": {"total": split["total"], "folds": split["folds"],
+                  "train_n": len(split["train"]), "validation_n": len(split["validation"]),
+                  "test_n": len(split["test"]), "boundaries": split["boundaries"],
+                  "holdout_opened": include_holdout,
+                  "note": "teste final só é aberto para o finalista congelado"},
+        "train": {"champion": train_cmp["champion"], "candidate": train_cmp["candidate"]},
+        "validation": validation,
+        "test": test,
+        "walkforward": folds_out,
+        "applicability": ("Requer uma fase posterior de integração do contexto ao "
+                          "executor. Não é aplicável ao LIVE."),
+    }
+
+
+def is_contextual_experiment(exp: Any) -> bool:
+    """Experimento P05.1 (analítico) — reconhecido pela config OU pelos marcadores."""
+    config = getattr(exp, "candidate_config", None)
+    if isinstance(config, dict) and "CONTEXT_RULE" in config:
+        return True
+    offline = getattr(exp, "offline_metrics", None)
+    if isinstance(offline, dict):
+        if offline.get("phase") == P051_PHASE:
+            return True
+        if offline.get("execution_mode") == P051_EXECUTION_MODE:
+            return True
+        if offline.get("shadow_supported") is False:
+            return True
+    return False
+
+
+async def evaluate_contextual_candidates(days: int = 90) -> Dict[str, Any]:
+    """P05.1 — candidatos contextuais, validação temporal e persistência
+    idempotente. ANALYTICS_ONLY: não vai para Shadow, não promove, não executa."""
+    if not P05_ANALYTICS_ENABLED:
+        return {"ok": False, "reason": "P05_ANALYTICS_ENABLED=false"}
+
+    champion = discover_champion_config()
+    rows, dq = await _load_shadow(days)
+    base = {
+        "ok": True, "phase": P051_PHASE, "execution_mode": P051_EXECUTION_MODE,
+        "promotable": False, "shadow_supported": False,
+        "champion": champion, "data_quality": dq, "sample": len(rows),
+        "live_untouched": True,
+        "allowed_axes": list(P051_CONTEXT_AXES),
+        "limitations": [
+            "contexto não é causalidade — o eixo pode estar apenas rotulando o regime",
+            "segmento pequeno não é edge; a amostra mínima é exigida em treino, validação e teste",
+            "SCORE_DELTA mantém a banda do quality-edge no piso do champion (gate desligado por padrão)",
+            "resultado é ANALÍTICO: não existe Shadow nem promoção para P05.1",
+        ],
+    }
+
+    if len(rows) < P05_MIN_OFFLINE_RESOLVED:
+        return {**base, "status": STATUS_INSUFFICIENT, "reason_code": "INSUFFICIENT_DATA",
+                "detail": f"{len(rows)} outcomes válidos (< {P05_MIN_OFFLINE_RESOLVED})",
+                "candidates": [], "rejected": [], "finalists": 0}
+
+    split = temporal_split(rows)
+    if not split.get("ok"):
+        return {**base, "status": STATUS_INSUFFICIENT, "reason_code": split.get("reason"),
+                "detail": "split temporal indisponível",
+                "candidates": [], "rejected": [], "finalists": 0}
+
+    accepted, rejected = generate_contextual_candidates(champion, split["train"])
+    if not accepted:
+        return {**base, "status": STATUS_INSUFFICIENT,
+                "reason_code": "NO_CONTEXT_WITH_SUFFICIENT_EVIDENCE",
+                "detail": "nenhum contexto com evidência suficiente no treino",
+                "candidates": [], "rejected": rejected, "finalists": 0}
+
+    cutoff = rows[-1]["resolved_at"]
+    fingerprint = dataset_fingerprint(rows)
+    champion_hash = canonical_hash(champion)
+
+    # Seleção acontece SOMENTE na validação; o holdout fica fechado.
+    previews: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for cand in accepted:
+        previews.append((cand, evaluate_contextual_candidate_offline(
+            rows, champion, cand, include_holdout=False)))
+
+    def _rank(item: Tuple[Dict[str, Any], Dict[str, Any]]) -> Tuple[float, ...]:
+        cand, offline = item
+        val = offline.get("validation") or {}
+        cm = val.get("candidate") or {}
+        hm = val.get("champion") or {}
+        if cand["objective"] == OBJECTIVE_LOSS_REDUCTION:
+            dci = val.get("delta_expectancy_ci") or {}
+            return (float(dci.get("low") or -1e9),
+                    float(cm.get("expectancy_r") or -1e9),
+                    -float(cm.get("max_drawdown_r") or 1e9))
+        return (float((cm.get("sum_r") or 0) - (hm.get("sum_r") or 0)),
+                float(val.get("added_ops") or 0),
+                float(cm.get("expectancy_r") or -1e9))
+
+    selected_hashes: set = set()
+    for objective in OBJECTIVES:
+        viable = [it for it in previews
+                  if it[0]["objective"] == objective
+                  and it[1].get("verdict") == STATUS_OFFLINE_VALIDATED]
+        if viable:
+            selected_hashes.add(canonical_hash(max(viable, key=_rank)[0]["config"]))
+
+    from db import get_session
+    results: List[Dict[str, Any]] = []
+    async with get_session() as session:
+        await _acquire_p05_lock(session, _P05_EVALUATE_LOCK_KEY)
+        for cand, preview in previews:
+            candidate_hash = canonical_hash(cand["config"])
+            if candidate_hash in selected_hashes:
+                offline = evaluate_contextual_candidate_offline(
+                    rows, champion, cand, include_holdout=True)
+                selection = "FINALIST_FROZEN_ON_VALIDATION"
+            elif preview.get("verdict") == STATUS_OFFLINE_VALIDATED:
+                offline = dict(preview)
+                offline.update({
+                    "verdict": STATUS_REJECTED,
+                    "reason_code": "NOT_SELECTED_ON_VALIDATION",
+                    "detail": "outro contexto do mesmo objetivo venceu na validação; holdout não foi aberto",
+                })
+                selection = "NOT_SELECTED_HOLDOUT_UNTOUCHED"
+            else:
+                offline = preview
+                selection = "FAILED_BEFORE_HOLDOUT"
+
+            offline = dict(offline)
+            offline.update({
+                "champion_config": champion,
+                "selection": selection,
+                "phase": P051_PHASE,
+                "execution_mode": P051_EXECUTION_MODE,
+                "promotable": False,
+                "shadow_supported": False,
+            })
+            key = build_experiment_key(champion_hash, candidate_hash, cutoff)
+            exp = await _upsert_experiment(
+                session, experiment_key=key, champion_hash=champion_hash,
+                candidate_hash=candidate_hash, objective=cand["objective"],
+                config=cand["config"], fingerprint=fingerprint, cutoff=cutoff,
+                offline=offline)
+            results.append({
+                "experiment_key": key, "candidate_hash": candidate_hash,
+                "objective": cand["objective"], "axis": cand["axis"],
+                "value": cand["value"], "action": cand["action"],
+                "context_evidence": cand.get("context_evidence"),
+                "generation_reason": cand.get("generation_reason"),
+                "verdict": offline.get("verdict"),
+                "reason_code": offline.get("reason_code"),
+                "detail": offline.get("detail"),
+                "selection": selection,
+                "status": exp.status,
+                "promotable": False,
+                "shadow_supported": False,
+            })
+        await session.commit()                       # transação única
+
+    return {
+        **base,
+        "champion_hash": champion_hash,
+        "dataset_fingerprint": fingerprint,
+        "dataset_cutoff": cutoff.isoformat(),
+        "candidates": results,
+        "rejected": rejected,
+        "finalists": len(selected_hashes),
+        "max_candidates": min(P051_MAX_CANDIDATES, P05_MAX_CANDIDATES),
+        "note": ("nenhum candidato válido é resultado ACEITÁVEL — não se força vencedor. "
+                 "Requer uma fase posterior de integração do contexto ao executor. "
+                 "Não é aplicável ao LIVE."),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  P05C — champion × challenger em shadow
 # ════════════════════════════════════════════════════════════════════════════
 def build_experiment_annotation(row: Dict[str, Any], champion: Dict[str, Any],
@@ -2436,6 +3123,14 @@ async def start_shadow(exp_id: int) -> Dict[str, Any]:
             )).scalar_one_or_none()
             if exp is None:
                 return {"ok": False, "error": "experimento não encontrado"}
+            # P05.1 é ANALYTICS_ONLY: um resultado analítico nunca vira challenger.
+            if is_contextual_experiment(exp):
+                return {"ok": False, "blocked": True,
+                        "reason_code": P051_BLOCK_REASON,
+                        "error": ("experimento P05.1 (regra contextual) é somente análise "
+                                  "offline — requer uma fase posterior de integração do "
+                                  "contexto ao executor. Não é aplicável ao LIVE."),
+                        "status": exp.status}
             if exp.status == STATUS_SHADOW:
                 return {"ok": True, "idempotent": True,
                         "experiment": exp.to_dict(full=False)}
@@ -2509,6 +3204,14 @@ async def evaluate_shadow(exp_id: int) -> Dict[str, Any]:
         )).scalar_one_or_none()
         if exp is None:
             return {"ok": False, "error": "experimento não encontrado"}
+        # P05.1 é ANALYTICS_ONLY: nunca há shadow para avaliar.
+        if is_contextual_experiment(exp):
+            return {"ok": False, "blocked": True,
+                    "reason_code": P051_BLOCK_REASON,
+                    "error": ("experimento P05.1 (regra contextual) é somente análise "
+                              "offline — requer uma fase posterior de integração do "
+                              "contexto ao executor. Não é aplicável ao LIVE."),
+                    "status": exp.status}
         if exp.status != STATUS_SHADOW:
             return {"ok": False, "error": f"experimento não está em SHADOW (status={exp.status})",
                     "status": exp.status}
@@ -2648,12 +3351,34 @@ async def get_p05_status(days: int = 30) -> Dict[str, Any]:
             counts = list((await session.execute(
                 select(E.status, func.count(E.id)).group_by(E.status)
             )).all())
+            # Resumo P05.1: reconhecido pela config contextual, sem coluna nova.
+            contextual = (await session.execute(
+                select(E).where(E.candidate_config.has_key("CONTEXT_RULE"))  # noqa: W601
+            )).scalars().all()
         out["shadow_experiment"] = shadow.to_dict(full=True) if shadow else None
         out["experiments_by_status"] = {s: int(c) for s, c in counts}
+        out["contextual_experiments"] = len(contextual)
+        out["contextual_offline_validated"] = sum(
+            1 for e in contextual if e.status == STATUS_OFFLINE_VALIDATED)
+        out["contextual_rejected"] = sum(
+            1 for e in contextual if e.status in (STATUS_REJECTED, STATUS_INSUFFICIENT))
+        out["contextual_analytics_only"] = len(contextual)
     except Exception as exc:
         log.warning(f"[p05] status/experimentos falhou: {exc}")
         out["shadow_experiment"] = None
         out["experiments_by_status"] = {"error": str(exc)}
+        out["contextual_experiments"] = None
+    out["p051"] = {
+        "phase": P051_PHASE,
+        "execution_mode": P051_EXECUTION_MODE,
+        "promotable": False,
+        "shadow_supported": False,
+        "allowed_axes": list(P051_CONTEXT_AXES),
+        "actions": list(P051_ACTIONS),
+        "score_delta": P051_SCORE_DELTA,
+        "note": ("regras contextuais são SOMENTE análise offline; integração ao "
+                 "executor é uma fase posterior"),
+    }
     out["decision_gate"] = {
         "states": [STATUS_DRAFT, STATUS_INSUFFICIENT, STATUS_REJECTED,
                    STATUS_OFFLINE_VALIDATED, STATUS_SHADOW, STATUS_ELIGIBLE],

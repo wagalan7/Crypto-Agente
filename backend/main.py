@@ -3741,6 +3741,31 @@ async def p05_evaluate(days: int = 90, x_admin_token: Optional[str] = Header(Non
         raise HTTPException(status_code=500, detail=f"avaliação P05 falhou: {e}")
 
 
+@app.post("/api/strategy/p05/contextual-evaluate")
+async def p05_contextual_evaluate(days: int = 90, x_admin_token: Optional[str] = Header(None)):
+    """P05.1 — candidatos CONTEXTUAIS (regime / entry_zone_type).
+
+    ANALYTICS_ONLY: não vai para Shadow, não promove, não executa, não altera o
+    LIVE. Não muda o comportamento de `/api/strategy/p05/evaluate`.
+    """
+    gate = _check_admin_token(x_admin_token)
+    if gate:
+        return gate
+    from services import strategy_evidence_service as p05
+    try:
+        days = max(7, min(int(days), 365))
+    except Exception:
+        days = 90
+    try:
+        result = await p05.evaluate_contextual_candidates(days=days)
+    except Exception as e:
+        log.error(f"[p05.1] avaliação contextual falhou: {e}")
+        raise HTTPException(status_code=500, detail=f"avaliação P05.1 falhou: {e}")
+    # Resposta compacta: sem séries/folds por candidato (detalhe fica no GET
+    # /api/strategy/p05/experiments/{id}).
+    return {"ok": True, **result}
+
+
 @app.post("/api/strategy/p05/experiments/{exp_id}/start-shadow")
 async def p05_start_shadow(exp_id: int, x_admin_token: Optional[str] = Header(None)):
     """OFFLINE_VALIDATED → SHADOW. Idempotente; conflito se já houver shadow

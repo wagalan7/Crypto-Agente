@@ -529,9 +529,15 @@ export default function AssertivenessPanel({ onClose }: Props) {
                           {exp.objective === 'LOSS_REDUCTION' ? 'Reduzir perdas' : 'Operar mais'}
                         </span>
                         <span className="ml-2 text-slate-500">
-                          ajuste: {Object.entries(exp.candidate_config ?? {}).map(([k, v]) => `${k} → ${String(v)}`).join(', ') || '–'}
+                          ajuste: {describeConfig(exp.candidate_config)}
                         </span>
                         <span className="ml-auto float-right font-mono text-slate-400">{exp.status}</span>
+                        {isContextual(exp.candidate_config) && (
+                          <div className="mt-1 text-[10px] text-amber-300/90">
+                            Regra por contexto — <strong>somente análise</strong>: não é aplicada
+                            pelo bot e não pode ser ativada por aqui.
+                          </div>
+                        )}
                       </div>
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                         <StatCard label="Operações" value={`${sm.champion?.count ?? 0} → ${sm.candidate?.count ?? 0}`}
@@ -602,6 +608,46 @@ export default function AssertivenessPanel({ onClose }: Props) {
       </div>
     </div>
   )
+}
+
+// Regra contextual do P05.1 — só análise, nunca aplicada pelo bot.
+interface ContextRule {
+  axis?: string
+  value?: string
+  action?: string
+  score_delta?: number
+}
+
+const AXIS_LABEL: Record<string, string> = {
+  regime: 'regime de mercado',
+  entry_zone_type: 'tipo de entrada',
+}
+
+function isContextual(config?: Record<string, unknown> | null): boolean {
+  return !!config && Object.prototype.hasOwnProperty.call(config, 'CONTEXT_RULE')
+}
+
+/** Descreve a configuração em texto legível — nunca renderiza [object Object]. */
+function describeConfig(config?: Record<string, unknown> | null): string {
+  const entries = Object.entries(config ?? {})
+  if (entries.length === 0) return '–'
+  return entries
+    .map(([key, raw]) => {
+      if (key === 'CONTEXT_RULE' && raw && typeof raw === 'object') {
+        const r = raw as ContextRule
+        const axis = AXIS_LABEL[r.axis ?? ''] ?? r.axis ?? '?'
+        const acao = r.action === 'BLOCK'
+          ? 'não operar'
+          : `exigir ${Math.abs(r.score_delta ?? 0)} ponto(s) a menos de nota`
+        return `quando ${axis} = ${r.value ?? '?'} → ${acao}`
+      }
+      if (raw && typeof raw === 'object') {
+        return `${key} → ${Object.entries(raw as Record<string, unknown>)
+          .map(([k2, v2]) => `${k2}=${String(v2)}`).join(' · ')}`
+      }
+      return `${key} → ${String(raw)}`
+    })
+    .join(', ')
 }
 
 function SegRow({ s }: { s: P05Segment }) {

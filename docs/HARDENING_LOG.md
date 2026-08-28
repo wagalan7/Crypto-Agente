@@ -600,3 +600,62 @@ shadow → ELIGIBLE/REJECTED → recomendação de ativação MANUAL`.
   Python 3.11 real; `py_compile`, `tsc --noEmit` e `git diff --check` aprovados;
   rede/DNS bloqueados e contabilizados. Estratégia, score, IA, sizing, SL/TP,
   `LIVE_SIZE_MULT` e capabilities permanecem inalterados/desligados.
+
+---
+
+## P05.1 — CANDIDATOS CONTEXTUAIS DE EVIDÊNCIA (2026-08-27)
+
+Detalhes em `docs/P05_1_CONTEXTUAL_CANDIDATES.md`.
+
+**ANTES:** os candidatos do P05 eram GLOBAIS (essencialmente `SCORE_MIN`). Com 90
+dias reais: 57/59 rejeitados em LOSS_REDUCTION, 53 não atingiu +10% de operações
+e 51 passou na validação mas o **teste final levou o drawdown de 4R para 7R** —
+os 4 experimentos terminaram `REJECTED`. Baixar o piso globalmente troca perdas
+por volume ruim.
+
+**DEPOIS:** candidatos CONDICIONAIS por contexto — bloquear contexto negativo e
+afrouxar o piso em exatamente 2 pontos apenas no contexto positivo, com teste
+temporal intocado e **nenhuma alteração LIVE**.
+
+- **ANALYTICS_ONLY**: toda regra carrega `phase=P05.1`,
+  `execution_mode=ANALYTICS_ONLY`, `promotable=false`, `shadow_supported=false`.
+  O P05.1 **não executa a regra no bot real**.
+- **Eixos permitidos nesta fase**: apenas `regime` e `entry_zone_type` (valores
+  exatamente como persistidos). Símbolo, base, padrão, direção, hora, dia,
+  score_bin e ATR band ficam fora — overfitting e múltiplas comparações.
+  `ALT_DANGER`/`limit_pullback` são hipóteses observadas, não vencedores fixos.
+- **`CONTEXT_RULE` com validador SEPARADO** (não entra na `KNOB_ALLOWLIST`):
+  exatamente uma regra, ação `BLOCK` ou `SCORE_DELTA`, `score_delta` só −2.0,
+  sem NaN/infinito, sem dois eixos/ações, sem campo de sizing/risco/stop/TP/
+  maker/execução. O hash inclui o schema completo.
+- **Semântica**: `BLOCK` bloqueia só o contexto correspondente; `SCORE_DELTA` usa
+  o **score efetivo** (`_execution_score`, com adjusters) e **não reativa linha
+  barrada por outro gate** — R:R, P(TP1), liquidez, P04A/B/C, ATR, funding,
+  proximity, struct-chase, tempo e tier continuam valendo. UNKNOWN nunca vira
+  BLOCKED nem ELIGIBLE. A `eligibility` do P05 global ficou intacta.
+- **Geração SOMENTE no treino**: máx. 4 por objetivo / 8 no total, um contexto por
+  candidato, ordem determinística, sem grid search. Sem contexto elegível ⇒
+  `NO_CONTEXT_WITH_SUFFICIENT_EVIDENCE`, sem candidato artificial.
+- **Sem leakage**: treino gera e congela cobertura/componentes, validação escolhe
+  no máximo um finalista por objetivo, e só o finalista abre o holdout. Alterar o
+  teste não muda a lista nem os hashes gerados no treino (coberto por teste).
+- **Gates pareados** (validação E teste), com IC pareado pela mesma oportunidade:
+  além dos critérios do P05, exige contexto bloqueado com **IC superior das
+  evitadas < 0** (LOSS_REDUCTION) e **IC inferior das adicionadas > 0**
+  (MORE_OPERATIONS), mais amostra afetada mínima. `SCORE_MIN=51` permanece
+  rejeitado — a regra de drawdown do holdout continua valendo.
+- **Persistência reutilizada**: `StrategyExperiment`, `experiment_key`,
+  `candidate_hash`, `dataset_fingerprint`, advisory lock e upsert idempotente —
+  **nenhuma tabela nova, nenhuma coluna nova, nenhuma flag nova**.
+- **Lifecycle**: P05.1 pode chegar a `OFFLINE_VALIDATED` como resultado analítico,
+  mas `start-shadow` e `evaluate-shadow` rejeitam com **`P051_ANALYTICS_ONLY`**.
+  Não existe `promotion_plan` executável.
+- **API**: adicionado somente `POST /api/strategy/p05/contextual-evaluate` (auth
+  admin, clamp 7–365, sem persistência parcial). `POST /api/strategy/p05/evaluate`
+  inalterado; `GET /status` ganhou o resumo contextual. Painel reutilizado, com
+  descrição legível da regra (nunca `[object Object]`) e aviso "somente análise";
+  `frontend/dist` não editado.
+- **239 testes P05 verdes 2×** e **suíte crítica P01–P05 verde 2×** no Python 3.11
+  real; `py_compile`, `tsc --noEmit` e `git diff --check` aprovados; rede/DNS
+  bloqueados e contabilizados. `P05_CHALLENGER_SHADOW_ENABLED` continua `false`,
+  `LIVE_SIZE_MULT` e P01–P04 inalterados.
