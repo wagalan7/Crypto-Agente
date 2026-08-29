@@ -2847,6 +2847,621 @@ async def evaluate_contextual_candidates(days: int = 90) -> Dict[str, Any]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  P05.1R — monitor de PRONTIDÃO de evidência (SOMENTE LEITURA)
+#
+#  Responde "já dá para reavaliar?" — nunca "o candidato é bom?". Conta
+#  oportunidades que cada regra JÁ CONGELADA afetaria, projeta amostra e estima
+#  quando uma nova avaliação passa a fazer sentido.
+#
+#  GARANTIAS DURAS:
+#   • ZERO escrita: nenhum INSERT/UPDATE/DELETE, nenhum commit, nenhum status
+#     alterado, nenhum experimento criado.
+#   • HOLDOUT SELADO: `realized_r` NUNCA é lido; nenhuma métrica de outcome
+#     (expectancy/PF/drawdown/win rate/IC) é calculada; nenhum gate é executado.
+#     Contar linhas cronológicas NÃO é abrir o holdout.
+# ════════════════════════════════════════════════════════════════════════════
+P051R_PHASE = "P05.1R"
+HOLDOUT_SEALED = "SEALED"
+
+# Prontidão (valores permitidos)
+READINESS_WAITING = "WAITING_FOR_DATA"
+READINESS_READY = "READY_FOR_REEVALUATION"
+READINESS_REFUTED = "REFUTED_LAST_RUN"
+READINESS_MIXED = "MIXED_EVIDENCE"
+READINESS_RETENTION_AT_RISK = "RETENTION_AT_RISK"
+READINESS_NO_METADATA = "INSUFFICIENT_METADATA"
+READINESS_UNKNOWN = "UNKNOWN"
+
+# Classificação da última falha
+FAILURE_SAMPLE_LIMITED = "SAMPLE_LIMITED"
+FAILURE_REFUTED = "REFUTED_LAST_RUN"
+FAILURE_MIXED = "MIXED"
+FAILURE_NO_METADATA = "INSUFFICIENT_METADATA"
+FAILURE_NONE = "NO_FAILURE"
+
+# Veredito de "afetada" por linha
+AFFECTED_YES = "AFFECTED"
+AFFECTED_NO = "NOT_AFFECTED"
+AFFECTED_UNKNOWN = "UNKNOWN"
+
+P051R_MIN_OBSERVED_DAYS_FOR_RATE = 7
+P051R_TARGET_RETENTION_DAYS = 120
+P051R_MAX_UNKNOWN_PCT = 100.0 - P05_MIN_FEATURE_COVERAGE_PCT   # UNKNOWN não pode comer a cobertura
+
+# Falhas que indicam DIREÇÃO ECONÔMICA CONTRARIADA (mais amostra não resolve).
+_SUBSTANTIVE_CHECKS = (
+    "contexto_bloqueado_negativo",        # evitadas tinham expectancy positiva
+    "operacoes_adicionais_positivas",     # adicionadas tinham expectancy negativa
+    "profit_factor_nao_pior",
+    "profit_factor_min_1",
+    "drawdown_nao_pior",
+    "drawdown_max_110pct",
+    "total_r_maior",
+    "expectancy_candidate_positiva",
+    "sem_segmento_material_negativo",
+)
+# Falhas compatíveis com "faltou amostra" (IC largo, poucas afetadas, volume).
+_SAMPLE_CHECKS = (
+    "amostra_afetada_minima",
+    "sem_aprovacao_por_unknown",
+    "operacoes_min_70pct",
+    "operacoes_min_110pct",
+    "ci_delta_pareado_acima_de_zero",
+    "ci_delta_pareado_nao_negativo",
+    "ci_superior_evitadas_abaixo_de_zero",
+    "ci_expectancy_acima_de_zero",
+    "ci_adicionais_acima_de_zero",
+)
+_STAGE_PREFIXES = ("validacao_", "teste_")
+
+
+def _strip_stage(check: str) -> str:
+    """Remove o prefixo de estágio — `teste_` no preview é a validação reavaliada,
+    então tirar o prefixo também DEDUPLICA a classificação."""
+    for prefix in _STAGE_PREFIXES:
+        if check.startswith(prefix):
+            return check[len(prefix):]
+    return check
+
+
+def classify_last_failure(offline_metrics: Any) -> Dict[str, Any]:
+    """Classifica a ÚLTIMA decisão usando SOMENTE os checks já persistidos.
+
+    Nunca reavalia nada. `REFUTED_LAST_RUN` e `MIXED` não recebem ETA: mais
+    quantidade, sozinha, não desfaz uma contradição econômica.
+    """
+    if not isinstance(offline_metrics, dict):
+        return {"classification": FAILURE_NO_METADATA,
+                "reason": "offline_metrics ausente ou inválido",
+                "failed_checks": [], "substantive": [], "sample": []}
+    checks = offline_metrics.get("checks")
+    if not isinstance(checks, list) or not checks:
+        return {"classification": FAILURE_NO_METADATA,
+                "reason": "sem checks persistidos para classificar",
+                "failed_checks": [], "substantive": [], "sample": []}
+
+    failed = sorted({_strip_stage(str(c.get("check") or ""))
+                     for c in checks if isinstance(c, dict) and not c.get("passed")})
+    if not failed:
+        return {"classification": FAILURE_NONE,
+                "reason": "nenhum check falhou na última decisão",
+                "failed_checks": [], "substantive": [], "sample": []}
+
+    substantive = [f for f in failed if f in _SUBSTANTIVE_CHECKS]
+    sample = [f for f in failed if f in _SAMPLE_CHECKS]
+    unclassified = [f for f in failed if f not in _SUBSTANTIVE_CHECKS and f not in _SAMPLE_CHECKS]
+
+    if unclassified and not substantive and not sample:
+        return {"classification": FAILURE_NO_METADATA,
+                "reason": f"checks não reconhecidos: {unclassified}",
+                "failed_checks": failed, "substantive": [], "sample": []}
+    if substantive and sample:
+        classification, reason = FAILURE_MIXED, (
+            "falhas de amostra E de direção econômica ao mesmo tempo — mais "
+            "quantidade, sozinha, não resolve a contradição")
+    elif substantive:
+        classification, reason = FAILURE_REFUTED, (
+            "a direção econômica da hipótese foi contrariada na última avaliação")
+    else:
+        classification, reason = FAILURE_SAMPLE_LIMITED, (
+            "falhou apenas por amostra afetada / IC largo")
+    return {"classification": classification, "reason": reason,
+            "failed_checks": failed, "substantive": substantive, "sample": sample,
+            "unclassified": unclassified}
+
+
+def affected_verdict(row: Dict[str, Any], champion: Dict[str, Any],
+                     rule: Dict[str, Any], active: Sequence[str]) -> str:
+    """A regra MUDARIA o veredito desta linha?
+
+    BLOCK        → afetada só com champion=True  e contextual=False.
+    SCORE_DELTA  → afetada só com champion=False e contextual=True (e
+                   `contextual_eligibility` já garante que a diferença veio
+                   EXCLUSIVAMENTE do score: linha barrada por R:R, P(TP1),
+                   liquidez, P04, ATR, funding, proximity, struct-chase, tempo,
+                   tier, risco ou cooldown nunca é reativada).
+    Qualquer UNKNOWN dos dois lados ⇒ `UNKNOWN` (não conta como afetada).
+    """
+    axis = rule.get("axis")
+    if context_value(row, axis) != rule.get("value"):
+        return AFFECTED_NO
+    champ = eligibility(row, champion, active)
+    cand = contextual_eligibility(row, champion, rule, active)
+    if champ is None or cand is None:
+        return AFFECTED_UNKNOWN
+    action = rule.get("action")
+    if action == "BLOCK":
+        return AFFECTED_YES if (champ is True and cand is False) else AFFECTED_NO
+    if action == "SCORE_DELTA":
+        return AFFECTED_YES if (champ is False and cand is True) else AFFECTED_NO
+    return AFFECTED_UNKNOWN
+
+
+def count_affected(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
+                   rule: Dict[str, Any], active: Sequence[str]) -> Dict[str, Any]:
+    """Contagens puras. NÃO lê `realized_r` e NÃO calcula nenhuma métrica de
+    outcome — só quantas oportunidades cada lado tocaria."""
+    axis = rule.get("axis")
+    total = len(rows)
+    champ_ok = cand_ok = affected = unknown = context_present = 0
+    for row in rows:
+        if context_value(row, axis) != CONTEXT_UNKNOWN:
+            context_present += 1
+        if eligibility(row, champion, active) is True:
+            champ_ok += 1
+        if contextual_eligibility(row, champion, rule, active) is True:
+            cand_ok += 1
+        verdict = affected_verdict(row, champion, rule, active)
+        if verdict == AFFECTED_YES:
+            affected += 1
+        elif verdict == AFFECTED_UNKNOWN:
+            unknown += 1
+
+    oldest = newest = None
+    span = None
+    if rows:
+        stamps = [r["resolved_at"] for r in rows]
+        oldest, newest = min(stamps), max(stamps)
+        span = round((newest - oldest).total_seconds() / 86400.0, 2)
+    return {
+        "total_resolved": total,
+        "champion_eligible": champ_ok,
+        "candidate_eligible": cand_ok,
+        "affected": affected,
+        "unknown": unknown,
+        "context_present": context_present,
+        "context_coverage_pct": round(context_present / total * 100, 1) if total else None,
+        "observed_span_days": span,
+        "oldest_resolved_at": oldest.isoformat() if oldest else None,
+        "newest_resolved_at": newest.isoformat() if newest else None,
+    }
+
+
+def project_prospective(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
+                        rule: Dict[str, Any], active: Sequence[str]) -> Dict[str, Any]:
+    """Projeção 50/25/25 CRONOLÓGICA — apenas contagem de linhas.
+
+    Reproduz a mesma proporção de `temporal_split` para responder "se a avaliação
+    rodasse hoje, quantas linhas cada estágio teria?". Nenhum outcome é lido.
+    """
+    ordered = sorted(rows, key=lambda r: r["resolved_at"])
+    n = len(ordered)
+    i_train, i_valid = int(n * 0.5), int(n * 0.75)
+    train, validation, test = ordered[:i_train], ordered[i_train:i_valid], ordered[i_valid:]
+
+    def _affected(chunk):
+        return sum(1 for r in chunk
+                   if affected_verdict(r, champion, rule, active) == AFFECTED_YES)
+
+    oos = sum(1 for r in test if contextual_eligibility(r, champion, rule, active) is True)
+    return {
+        "prospective_train_affected": _affected(train),
+        "prospective_validation_affected": _affected(validation),
+        "prospective_test_affected": _affected(test),
+        "prospective_candidate_oos_count": oos,
+        "split_counts": {"train": len(train), "validation": len(validation), "test": len(test)},
+        "note": "somente contagem de linhas; nenhum outcome do holdout foi lido",
+    }
+
+
+def estimate_eta(*, affected_since_cutoff: int, observed_days: Optional[float],
+                 missing_to_minimum: int, classification: str) -> Dict[str, Any]:
+    """ETA conservadora. Nunca promete data exata; hipótese contrariada não
+    recebe ETA (mais dado não desfaz contradição)."""
+    if classification in (FAILURE_REFUTED, FAILURE_MIXED):
+        return {"daily_rate": None, "eta_days": None,
+                "eta_reason": ("hipótese contrariada na última avaliação — quantidade "
+                               "sozinha não é critério suficiente")}
+    if observed_days is None or observed_days < P051R_MIN_OBSERVED_DAYS_FOR_RATE:
+        return {"daily_rate": None, "eta_days": None,
+                "eta_reason": (f"menos de {P051R_MIN_OBSERVED_DAYS_FOR_RATE} dias observados "
+                               f"desde o cutoff — taxa não é confiável")}
+    rate = affected_since_cutoff / observed_days
+    if rate <= 0:
+        return {"daily_rate": 0.0, "eta_days": None,
+                "eta_reason": "nenhuma nova oportunidade afetada desde o cutoff"}
+    if missing_to_minimum <= 0:
+        return {"daily_rate": round(rate, 4), "eta_days": 0,
+                "eta_reason": "mínimo de amostra já atingido"}
+    # Só ~25% das novas linhas caem na fatia de validação/teste — divisor
+    # conservador para não prometer prazo curto demais.
+    into_slice = rate * 0.25
+    eta = math.ceil(missing_to_minimum / into_slice) if into_slice > 0 else None
+    return {"daily_rate": round(rate, 4), "eta_days": eta,
+            "eta_reason": ("estimativa conservadora: assume que ~25% das novas "
+                           "oportunidades afetadas caem na fatia de validação/teste; "
+                           "não é data garantida")}
+
+
+async def _load_readiness_rows(days: int) -> List[Dict[str, Any]]:
+    """Linhas resolvidas para CONTAGEM. Seleciona colunas EXPLÍCITAS e **nunca**
+    inclui `realized_r` — o holdout permanece selado por construção."""
+    from db import get_session
+    from models.recommendation_snapshot import RecommendationSnapshot as RS
+    from services import calibration_service as _calib
+    from sqlalchemy import select
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    async with get_session() as session:
+        result = await session.execute(
+            select(RS.id, RS.symbol, RS.timeframe, RS.tier, RS.direction,
+                   RS.score, RS.features, RS.created_at, RS.outcome_at)
+            .where(RS.status.in_(SNAP_RESOLVED))
+            .where(RS.outcome_at.is_not(None))
+            .where(RS.outcome_at >= since)
+            .where(_calib._not_fast_void())
+        )
+        for row in result.all():
+            if row.id in seen:
+                continue
+            seen.add(row.id)
+            resolved_at = _utc(row.outcome_at)
+            if resolved_at is None:
+                continue
+            out.append({
+                "dedupe_key": f"snap:{row.id}",
+                "symbol": row.symbol, "timeframe": row.timeframe, "tier": row.tier,
+                "direction": row.direction, "score": row.score,
+                "features": _merged_features(row.features),
+                "created_at": _utc(row.created_at),
+                "resolved_at": resolved_at,
+                # NOTA: `realized_r` deliberadamente AUSENTE deste dicionário.
+            })
+    out.sort(key=lambda r: r["resolved_at"])
+    return out
+
+
+async def _retention_snapshot(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Retenção observada + política detectada.
+
+    Histórico curto NÃO é prova de deleção. As rotinas de poda encontradas em
+    `snapshot_service` apagam SOMENTE o namespace `wide` (`status == "wide"` e
+    `wide_*`), disjunto dos status resolvidos que o P05 usa — logo não removem
+    evidência do P05. As constantes são lidas por CONTRATO DE ENV (o módulo não é
+    importado: ele carrega `push_service`, que faz rede).
+    """
+    now = datetime.now(timezone.utc)
+    buckets = {}
+    for d in (30, 60, 90, 120):
+        cutoff = now - timedelta(days=d)
+        buckets[f"rows_older_than_{d}d"] = sum(1 for r in rows if r["resolved_at"] < cutoff)
+
+    oldest = min((r["resolved_at"] for r in rows), default=None)
+    observed = round((now - oldest).total_seconds() / 86400.0, 1) if oldest else None
+
+    wide_tracking = _env_bool("WIDE_TRACKING_ENABLED", "false")
+    expiry_hours = _env_float("SNAPSHOT_EXPIRY_HOURS", 168.0)
+    wide_ttl_hours = _env_float("WIDE_DISPLAY_TTL_HOURS", 6.0)
+
+    policy = {
+        "detected": "wide_namespace_prune_only",
+        "applies_to_p05_statuses": False,
+        "p05_statuses": list(SNAP_RESOLVED),
+        "pruned_statuses": ["wide", "wide_*"],
+        "wide_tracking_enabled": wide_tracking,
+        "wide_prune_hours": expiry_hours if wide_tracking else wide_ttl_hours,
+        "evidence": ("snapshot_service poda apenas status 'wide'/'wide_*'; "
+                     "os status resolvidos do P05 são disjuntos e não são apagados"),
+    }
+    # Só há risco se existir política que efetivamente apague linhas do P05.
+    if policy["applies_to_p05_statuses"]:
+        policy_days = policy["wide_prune_hours"] / 24.0
+        at_risk = policy_days < P051R_TARGET_RETENTION_DAYS
+        warning = (f"política de retenção de {policy_days:.0f} dias < "
+                   f"{P051R_TARGET_RETENTION_DAYS} dias alvo") if at_risk else None
+    else:
+        policy_days, at_risk, warning = None, False, None
+
+    if observed is None:
+        history = "UNKNOWN"
+        history_note = "sem linhas resolvidas na janela consultada"
+    elif observed < P051R_TARGET_RETENTION_DAYS:
+        history = "YOUNG_HISTORY"
+        history_note = ("histórico ainda jovem — NÃO é evidência de deleção; "
+                        "nenhuma política apaga os status do P05")
+    else:
+        history = "MATURE"
+        history_note = f"histórico cobre ≥ {P051R_TARGET_RETENTION_DAYS} dias"
+
+    return {
+        **buckets,
+        "observed_retention_days": observed,
+        "oldest_resolved_at": oldest.isoformat() if oldest else None,
+        "retention_policy_detected": policy["detected"],
+        "retention_policy_days": policy_days,
+        "retention_policy_applies_to_p05": policy["applies_to_p05_statuses"],
+        "retention_at_risk": at_risk,
+        "retention_warning": warning,
+        "history_status": history,
+        "history_note": history_note,
+        "policy_detail": policy,
+    }
+
+
+def _readiness_verdict(*, classification: str, coverage_pct: Optional[float],
+                       prospective: Dict[str, Any], unknown_pct: Optional[float],
+                       retention_at_risk: bool) -> Dict[str, Any]:
+    """`READY_FOR_REEVALUATION` significa APENAS "há amostra suficiente para
+    rodar a avaliação de novo" — nunca aprovação, Shadow ou promoção."""
+    blockers: List[str] = []
+    if retention_at_risk:
+        return {"readiness": READINESS_RETENTION_AT_RISK,
+                "blockers": ["retenção insuficiente para a janela alvo"],
+                "means": "dado pode sumir antes de completar a janela"}
+    if classification == FAILURE_NO_METADATA:
+        return {"readiness": READINESS_NO_METADATA,
+                "blockers": ["metadados antigos não permitem classificar a última falha"],
+                "means": "não é possível dizer se falta amostra"}
+    if classification == FAILURE_REFUTED:
+        return {"readiness": READINESS_REFUTED,
+                "blockers": ["direção econômica contrariada na última avaliação"],
+                "means": "mais amostra não desfaz a contradição"}
+    if classification == FAILURE_MIXED:
+        return {"readiness": READINESS_MIXED,
+                "blockers": ["falhas de amostra E substantivas simultâneas"],
+                "means": "quantidade sozinha não resolve a contradição"}
+    if classification == FAILURE_NONE:
+        return {"readiness": READINESS_UNKNOWN,
+                "blockers": ["última avaliação não registrou falhas"],
+                "means": "nada a reavaliar por falta de amostra"}
+
+    # A partir daqui: SAMPLE_LIMITED
+    if coverage_pct is None or coverage_pct < P05_MIN_FEATURE_COVERAGE_PCT:
+        blockers.append(f"cobertura do contexto {coverage_pct}% < {P05_MIN_FEATURE_COVERAGE_PCT}%")
+    if unknown_pct is not None and unknown_pct > P051R_MAX_UNKNOWN_PCT:
+        blockers.append(f"UNKNOWN {unknown_pct}% compromete a cobertura")
+    if (prospective.get("prospective_validation_affected") or 0) < P051_MIN_AFFECTED:
+        blockers.append(f"validação afetada {prospective.get('prospective_validation_affected')} "
+                        f"< {P051_MIN_AFFECTED}")
+    if (prospective.get("prospective_test_affected") or 0) < P051_MIN_AFFECTED:
+        blockers.append(f"teste afetado {prospective.get('prospective_test_affected')} "
+                        f"< {P051_MIN_AFFECTED}")
+    if (prospective.get("prospective_candidate_oos_count") or 0) < P05_MIN_OOS_RESOLVED:
+        blockers.append(f"OOS do candidato {prospective.get('prospective_candidate_oos_count')} "
+                        f"< {P05_MIN_OOS_RESOLVED}")
+    if blockers:
+        return {"readiness": READINESS_WAITING, "blockers": blockers,
+                "means": "ainda não há amostra suficiente para reavaliar"}
+    return {
+        "readiness": READINESS_READY, "blockers": [],
+        "means": "há amostra suficiente para EXECUTAR a avaliação novamente",
+        "does_not_mean": ["candidato aprovado", "Shadow autorizado",
+                          "estratégia pronta", "ganho esperado", "promoção"],
+    }
+
+
+async def _readiness_for_experiment(exp: Any, rows: Sequence[Dict[str, Any]],
+                                    champion: Dict[str, Any],
+                                    retention: Dict[str, Any]) -> Dict[str, Any]:
+    """Prontidão de UM experimento congelado. Não altera nada."""
+    config = exp.candidate_config if isinstance(exp.candidate_config, dict) else {}
+    raw_rule = config.get("CONTEXT_RULE")
+    try:
+        rule = validate_context_rule(raw_rule)
+    except CandidateValidationError as exc:
+        return {"experiment_id": exp.id, "readiness": READINESS_NO_METADATA,
+                "error": f"CONTEXT_RULE inválida: {exc}"}
+
+    offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
+    failure = classify_last_failure(offline)
+
+    # Componentes CONGELADOS na avaliação original — o monitor não redescobre
+    # componentes nem muda o contrato do experimento.
+    active = offline.get("active_components")
+    if not isinstance(active, list) or not active:
+        active, _cov = contextual_active_components(rows)
+        active_source = "recomputado (experimento sem componentes congelados)"
+    else:
+        active_source = "congelado na avaliação original"
+
+    cutoff = _utc(exp.dataset_cutoff)
+    current = count_affected(rows, champion, rule, active)
+    prospective = project_prospective(rows, champion, rule, active)
+
+    since_rows = [r for r in rows if cutoff is None or r["resolved_at"] > cutoff]
+    since = count_affected(since_rows, champion, rule, active)
+    observed_days = None
+    if cutoff is not None:
+        observed_days = max(0.0, (datetime.now(timezone.utc) - cutoff).total_seconds() / 86400.0)
+
+    worst_slice = min(prospective["prospective_validation_affected"],
+                      prospective["prospective_test_affected"])
+    missing = max(0, P051_MIN_AFFECTED - worst_slice)
+    eta = estimate_eta(affected_since_cutoff=since["affected"],
+                       observed_days=observed_days,
+                       missing_to_minimum=missing,
+                       classification=failure["classification"])
+
+    total = current["total_resolved"] or 0
+    unknown_pct = round(current["unknown"] / total * 100, 1) if total else None
+    verdict = _readiness_verdict(
+        classification=failure["classification"],
+        coverage_pct=current["context_coverage_pct"],
+        prospective=prospective,
+        unknown_pct=unknown_pct,
+        retention_at_risk=bool(retention.get("retention_at_risk")),
+    )
+
+    baseline_validation_affected = None
+    val = offline.get("validation")
+    if isinstance(val, dict):
+        baseline_validation_affected = val.get("affected_ops")
+
+    decision = exp.decision if isinstance(exp.decision, dict) else {}
+    return {
+        "experiment_id": exp.id,
+        "objective": exp.objective,
+        "axis": rule["axis"],
+        "value": rule["value"],
+        "action": rule["action"],
+        "score_delta": rule.get("score_delta"),
+        "dataset_cutoff": cutoff.isoformat() if cutoff else None,
+        "status": exp.status,
+        "last_decision_reason": decision.get("reason_code") or offline.get("reason_code"),
+        "failure_classification": failure["classification"],
+        "failure_reason": failure["reason"],
+        "failed_checks": failure["failed_checks"],
+        "substantive_failures": failure.get("substantive"),
+        "sample_failures": failure.get("sample"),
+        "baseline_validation_affected": baseline_validation_affected,
+        "new_since_cutoff": {
+            "total_resolved": since["total_resolved"],
+            "affected": since["affected"],
+            "unknown": since["unknown"],
+            "observed_days": round(observed_days, 1) if observed_days is not None else None,
+        },
+        "current_window": current,
+        "prospective": prospective,
+        "unknown_pct": unknown_pct,
+        "missing_to_minimum": missing,
+        "minimum_affected": P051_MIN_AFFECTED,
+        "active_components": active,
+        "active_components_source": active_source,
+        **eta,
+        **verdict,
+        "holdout_outcomes_read": False,
+        "holdout_metrics_computed": False,
+        "holdout_status": HOLDOUT_SEALED,
+    }
+
+
+_READINESS_CACHE: Dict[Tuple[int, int, Optional[int]], Tuple[float, Dict[str, Any]]] = {}
+_READINESS_CACHE_LOCK = asyncio.Lock()
+
+
+async def _build_readiness(days: int, limit: int,
+                           experiment_id: Optional[int]) -> Dict[str, Any]:
+    """Monta o relatório. Fail-soft por seção; ZERO escrita."""
+    out: Dict[str, Any] = {
+        "phase": P051R_PHASE,
+        "read_only": True,
+        "holdout_status": HOLDOUT_SEALED,
+        "holdout_outcomes_read": False,
+        "holdout_metrics_computed": False,
+        "window_days": days,
+        "champion": discover_champion_config(),
+        "live_untouched": True,
+        "note": ("monitor SOMENTE LEITURA: informa se há amostra para reavaliar, "
+                 "nunca se um candidato é bom"),
+    }
+    try:
+        rows = await _load_readiness_rows(days)
+    except Exception as exc:                                   # fail-soft
+        log.warning(f"[p05.1r] leitura de snapshots falhou: {exc}")
+        return {**out, "error": str(exc), "summary": {}, "retention": {}, "experiments": []}
+
+    try:
+        retention = await _retention_snapshot(rows)
+    except Exception as exc:
+        log.warning(f"[p05.1r] retenção falhou: {exc}")
+        retention = {"error": str(exc), "retention_at_risk": False}
+
+    experiments: List[Dict[str, Any]] = []
+    try:
+        from db import get_session
+        from models.strategy_experiment import StrategyExperiment as E
+        from sqlalchemy import select
+        async with get_session() as session:
+            stmt = (select(E)
+                    .where(E.candidate_config.has_key("CONTEXT_RULE"))   # noqa: W601
+                    .where(E.status.in_((STATUS_REJECTED, STATUS_INSUFFICIENT,
+                                         STATUS_OFFLINE_VALIDATED)))
+                    .order_by(E.created_at.desc()))
+            if experiment_id is not None:
+                stmt = stmt.where(E.id == experiment_id)
+            found = (await session.execute(stmt.limit(limit))).scalars().all()
+            champion = out["champion"]
+            for exp in found:
+                offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
+                # Só monitora o que é declaradamente P05.1 ANALYTICS_ONLY.
+                if not (offline.get("phase") == P051_PHASE
+                        or offline.get("execution_mode") == P051_EXECUTION_MODE
+                        or is_contextual_experiment(exp)):
+                    continue
+                try:
+                    experiments.append(
+                        await _readiness_for_experiment(exp, rows, champion, retention))
+                except Exception as exc:                       # fail-soft por item
+                    log.warning(f"[p05.1r] experimento {exp.id} falhou: {exc}")
+                    experiments.append({"experiment_id": exp.id,
+                                        "readiness": READINESS_UNKNOWN,
+                                        "error": str(exc)})
+    except Exception as exc:
+        log.warning(f"[p05.1r] leitura de experimentos falhou: {exc}")
+        out["experiments_error"] = str(exc)
+
+    by_status: Dict[str, int] = {}
+    for item in experiments:
+        key = item.get("readiness") or READINESS_UNKNOWN
+        by_status[key] = by_status.get(key, 0) + 1
+    etas = [i["eta_days"] for i in experiments
+            if isinstance(i.get("eta_days"), int) and i["eta_days"] > 0]
+
+    out["summary"] = {
+        "monitored": len(experiments),
+        "readiness_by_status": by_status,
+        "next_recommended_check_days": min(etas) if etas else None,
+        "next_recommended_check_reason": (
+            "menor ETA entre hipóteses limitadas por amostra" if etas else
+            "nenhuma hipótese com ETA — refutadas/mistas não recebem prazo"),
+        "total_resolved_in_window": len(rows),
+        "minimum_affected": P051_MIN_AFFECTED,
+        "min_oos_resolved": P05_MIN_OOS_RESOLVED,
+        "min_feature_coverage_pct": P05_MIN_FEATURE_COVERAGE_PCT,
+    }
+    out["retention"] = retention
+    out["experiments"] = experiments
+    out["computed_at"] = datetime.now(timezone.utc).isoformat()
+    return out
+
+
+async def get_readiness(days: int = 120, limit: int = 20,
+                        experiment_id: Optional[int] = None) -> Dict[str, Any]:
+    """Cache single-flight curto, chaveado por (days, limit, experiment_id).
+    Falha NÃO envenena o cache."""
+    days = max(30, min(int(days), 365))
+    limit = max(1, min(int(limit), 100))
+    key = (days, limit, experiment_id)
+    now_mono = time.monotonic()
+    cached = _READINESS_CACHE.get(key)
+    if cached and now_mono - cached[0] < P05_DIAG_CACHE_TTL_S:
+        return cached[1]
+    async with _READINESS_CACHE_LOCK:
+        cached = _READINESS_CACHE.get(key)
+        now_mono = time.monotonic()
+        if cached and now_mono - cached[0] < P05_DIAG_CACHE_TTL_S:
+            return cached[1]
+        value = await _build_readiness(days, limit, experiment_id)
+        if not value.get("error"):                 # erro não entra no cache
+            _READINESS_CACHE[key] = (now_mono, value)
+            if len(_READINESS_CACHE) > 12:
+                oldest = min(_READINESS_CACHE, key=lambda k: _READINESS_CACHE[k][0])
+                _READINESS_CACHE.pop(oldest, None)
+        return value
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  P05C — champion × challenger em shadow
 # ════════════════════════════════════════════════════════════════════════════
 def build_experiment_annotation(row: Dict[str, Any], champion: Dict[str, Any],
@@ -3368,6 +3983,18 @@ async def get_p05_status(days: int = 30) -> Dict[str, Any]:
         out["shadow_experiment"] = None
         out["experiments_by_status"] = {"error": str(exc)}
         out["contextual_experiments"] = None
+    # Resumo PEQUENO do monitor de prontidão (P05.1R) — somente leitura.
+    try:
+        readiness = await get_readiness(days=max(30, min(days, 365)), limit=20)
+        out["readiness_by_status"] = (readiness.get("summary") or {}).get("readiness_by_status")
+        out["next_recommended_check"] = (readiness.get("summary") or {}).get(
+            "next_recommended_check_days")
+        out["retention_warning"] = (readiness.get("retention") or {}).get("retention_warning")
+        out["holdout_status"] = readiness.get("holdout_status")
+    except Exception as exc:
+        log.warning(f"[p05] status/readiness falhou: {exc}")
+        out["readiness_by_status"] = None
+        out["holdout_status"] = HOLDOUT_SEALED
     out["p051"] = {
         "phase": P051_PHASE,
         "execution_mode": P051_EXECUTION_MODE,

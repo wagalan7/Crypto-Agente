@@ -659,3 +659,58 @@ temporal intocado e **nenhuma alteração LIVE**.
   real; `py_compile`, `tsc --noEmit` e `git diff --check` aprovados; rede/DNS
   bloqueados e contabilizados. `P05_CHALLENGER_SHADOW_ENABLED` continua `false`,
   `LIVE_SIZE_MULT` e P01–P04 inalterados.
+
+---
+
+## P05.1R — MONITOR DE PRONTIDÃO DE EVIDÊNCIA (2026-08-28)
+
+Detalhes em `docs/P05_1R_EVIDENCE_READINESS.md`.
+
+**ANTES:** a decisão de reavaliar dependia de estimativa manual; candidatos
+refutados e limitados por amostra apareciam juntos como `REJECTED`, sem ETA e sem
+visibilidade de retenção.
+
+**DEPOIS:** contagem real por hipótese, distinção `SAMPLE_LIMITED`/`REFUTED`/
+`MIXED`, ETA conservadora (ausente quando não cabe), retenção observável, holdout
+selado e zero alteração no LIVE.
+
+- **Holdout SELADO por construção**: `_load_readiness_rows` seleciona colunas
+  EXPLÍCITAS e nunca carrega `realized_r`; os dicionários de linha nem contêm a
+  chave. Nenhuma métrica de outcome é calculada e nenhuma função de avaliação/gate
+  é chamada. Provado por sentinela (`_SealedRow` levanta se `realized_r` for lido)
+  + testes de código que proíbem acesso e chamadas de avaliação no bloco.
+  Toda resposta carrega `holdout_outcomes_read=false`,
+  `holdout_metrics_computed=false`, `holdout_status=SEALED`.
+- **Zero escrita**: nenhum INSERT/UPDATE/DELETE, commit, flush, add ou delete;
+  nenhum experimento criado/alterado/reavaliado. Provado por teste de código E por
+  sessão falsa que levanta exceção em qualquer escrita.
+- **"Afetada" com definição dura**: BLOCK só com champion=True e contextual=False;
+  SCORE_DELTA só com champion=False e contextual=True — e a diferença tem que vir
+  EXCLUSIVAMENTE do score (linha barrada por R:R, P(TP1), liquidez, P04, ATR,
+  funding, proximity, struct-chase, tempo ou tier nunca vira "oportunidade").
+  UNKNOWN é contado separado e nunca conta como afetada.
+- **Classificação só com checks persistidos** (nada é reavaliado), com prefixo de
+  estágio removido (o que também deduplica): 3 dos 5 experimentos reais são MIXED
+  (market, NORMAL, limit_ob — direção econômica contrariada) e 2 são
+  SAMPLE_LIMITED (ALT_RISK_OFF, limit_fvg_fill). **Refutada/mista não recebe ETA.**
+- **Readiness** exige TODOS os mínimos (falha=SAMPLE_LIMITED, cobertura ≥80%,
+  validação ≥20, teste ≥20, OOS ≥30, UNKNOWN não comprometendo, retenção ok) e
+  significa apenas "há amostra para reavaliar" — a própria resposta lista o
+  `does_not_mean` (não é aprovação, Shadow, promoção nem ganho esperado).
+- **ETA conservadora**: exige ≥7 dias observados, arredonda para cima, divide por
+  0,25 (só ~25% das novas linhas caem na fatia de validação/teste), nunca promete
+  data exata e sempre traz `eta_reason`.
+- **Retenção auditada**: as duas rotinas de poda em `snapshot_service` apagam
+  SOMENTE o namespace `wide`/`wide_*`, disjunto dos status do P05 — nenhuma
+  política apaga evidência do P05. Histórico curto é reportado como
+  `YOUNG_HISTORY`, explicitamente **não** como deleção. Retenção não foi alterada.
+- **API**: apenas `GET /api/strategy/p05/readiness` (clamps 30–365 / 1–100,
+  `experiment_id` opcional, sem auth admin, fail-soft, cache single-flight
+  chaveado por parâmetros que não cacheia erro). Nenhum POST criado;
+  `/p05/status` ganhou só um resumo pequeno. Painel reutilizado com a seção
+  "Prontidão para nova avaliação" + selo "holdout protegido", sem botão de ação;
+  `frontend/dist` não editado.
+- **308 testes P05 verdes 2×** e **suíte crítica P01–P05 verde 2×** no Python 3.11
+  real; `py_compile`, `tsc --noEmit` e `git diff --check` aprovados. P05.2 NÃO foi
+  implementado; `P05_CHALLENGER_SHADOW_ENABLED` continua `false`; champion LIVE,
+  `SCORE_MIN`, `LIVE_SIZE_MULT` e P04A/B/C inalterados.

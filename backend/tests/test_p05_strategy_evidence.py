@@ -1977,5 +1977,610 @@ class ContextualFrontendTests(unittest.TestCase):
         self.assertNotIn("frontend/dist/assets", out)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  P05.1R — monitor de prontidão (SOMENTE LEITURA · holdout SELADO)
+# ════════════════════════════════════════════════════════════════════════════
+class _SealedRow(dict):
+    """Sentinela: EXPLODE se alguém ler `realized_r`. Prova que o monitor não
+    abre o holdout — contar linha não é ler outcome."""
+    def __getitem__(self, key):
+        if key == "realized_r":
+            raise AssertionError("HOLDOUT VIOLADO: realized_r foi lido pelo monitor")
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key == "realized_r":
+            raise AssertionError("HOLDOUT VIOLADO: realized_r foi lido pelo monitor")
+        return super().get(key, default)
+
+
+_DEFAULT = object()          # distingue "não informado" de um None EXPLÍCITO
+
+
+def _mon_row(i=0, *, regime="ALT_DANGER", zone=None, score=_DEFAULT, sealed=True, **kw):
+    champ = p05.discover_champion_config()
+    feats = {}
+    if regime is not None:
+        feats["regime"] = regime
+    if zone is not None:
+        feats["entry_zone_type"] = zone
+    base = {
+        "dedupe_key": f"m{i}",
+        "symbol": "BTC/USDT:USDT", "timeframe": "1h", "tier": "A", "direction": "long",
+        "score": (champ["SCORE_MIN"] + 5) if score is _DEFAULT else score,
+        "features": feats,
+        "created_at": T0 + timedelta(hours=i),
+        "resolved_at": T0 + timedelta(hours=i),
+    }
+    base.update(kw)
+    return _SealedRow(base) if sealed else dict(base)
+
+
+class ReadinessCoreTests(unittest.TestCase):
+    def setUp(self):
+        self.champ = p05.discover_champion_config()
+        self.smin = self.champ["SCORE_MIN"]
+
+    def test_block_afetada_so_com_champion_true_e_contextual_false(self):
+        rule = _ctx_rule(value="ALT_DANGER", action="BLOCK")
+        hit = _mon_row(regime="ALT_DANGER", score=self.smin + 5)      # champion opera
+        self.assertEqual(p05.affected_verdict(hit, self.champ, rule, ["score_min"]),
+                         p05.AFFECTED_YES)
+
+    def test_block_nao_afeta_quem_champion_ja_barrava(self):
+        rule = _ctx_rule(value="ALT_DANGER", action="BLOCK")
+        low = _mon_row(regime="ALT_DANGER", score=self.smin - 10)     # champion já barra
+        self.assertEqual(p05.affected_verdict(low, self.champ, rule, ["score_min"]),
+                         p05.AFFECTED_NO)
+
+    def test_contexto_diferente_nao_afeta(self):
+        rule = _ctx_rule(value="ALT_DANGER", action="BLOCK")
+        other = _mon_row(regime="NORMAL", score=self.smin + 5)
+        self.assertEqual(p05.affected_verdict(other, self.champ, rule, ["score_min"]),
+                         p05.AFFECTED_NO)
+
+    def test_score_delta_afetada_so_com_champion_false_e_contextual_true(self):
+        rule = _ctx_rule(axis="regime", value="NORMAL", action="SCORE_DELTA")
+        row = _mon_row(regime="NORMAL", score=self.smin - 1)
+        self.assertEqual(p05.affected_verdict(row, self.champ, rule, ["score_min"]),
+                         p05.AFFECTED_YES)
+
+    def test_score_delta_fora_do_alcance_nao_afeta(self):
+        rule = _ctx_rule(axis="regime", value="NORMAL", action="SCORE_DELTA")
+        row = _mon_row(regime="NORMAL", score=self.smin - 5)          # −2 não alcança
+        self.assertEqual(p05.affected_verdict(row, self.champ, rule, ["score_min"]),
+                         p05.AFFECTED_NO)
+
+    def test_outro_gate_bloqueado_nao_conta_como_oportunidade(self):
+        """R:P(TP1)/liquidez via bot_verdict não viram 'liberável' pelo delta."""
+        rule = _ctx_rule(axis="regime", value="NORMAL", action="SCORE_DELTA")
+        row = _mon_row(regime="NORMAL", score=self.smin - 1)
+        row["features"]["bot_verdict_ok"] = False
+        row["features"]["bot_verdict_blocked_by"] = "rr-gate"
+        self.assertEqual(
+            p05.affected_verdict(row, self.champ, rule, ["score_min", "base_quality"]),
+            p05.AFFECTED_NO)
+
+    def test_unknown_separado_e_nao_conta_como_afetada(self):
+        rule = _ctx_rule(value="ALT_DANGER", action="BLOCK")
+        row = _mon_row(regime=None, score=self.smin + 5)
+        row["features"].pop("regime", None)
+        self.assertEqual(p05.affected_verdict(row, self.champ, rule, ["score_min"]),
+                         p05.AFFECTED_NO)          # contexto ausente ⇒ não corresponde
+        # champion indecidível ⇒ UNKNOWN
+        row2 = _mon_row(regime="ALT_DANGER", score=None)
+        self.assertEqual(p05.affected_verdict(row2, self.champ, rule, ["score_min"]),
+                         p05.AFFECTED_UNKNOWN)
+
+    def test_count_affected_contabiliza_unknown_separado(self):
+        rule = _ctx_rule(value="ALT_DANGER", action="BLOCK")
+        rows = [_mon_row(0, regime="ALT_DANGER", score=self.smin + 5),
+                _mon_row(1, regime="ALT_DANGER", score=None),
+                _mon_row(2, regime="NORMAL", score=self.smin + 5)]
+        c = p05.count_affected(rows, self.champ, rule, ["score_min"])
+        self.assertEqual(c["affected"], 1)
+        self.assertEqual(c["unknown"], 1)
+        self.assertEqual(c["total_resolved"], 3)
+        self.assertEqual(c["context_present"], 3)
+
+    def test_projecao_50_25_25(self):
+        rule = _ctx_rule(value="ALT_DANGER", action="BLOCK")
+        rows = [_mon_row(i, regime="ALT_DANGER", score=self.smin + 5) for i in range(100)]
+        p = p05.project_prospective(rows, self.champ, rule, ["score_min"])
+        self.assertEqual(p["split_counts"], {"train": 50, "validation": 25, "test": 25})
+        self.assertEqual(p["prospective_train_affected"], 50)
+        self.assertEqual(p["prospective_validation_affected"], 25)
+        self.assertEqual(p["prospective_test_affected"], 25)
+
+
+class HoldoutSealedTests(unittest.TestCase):
+    """O holdout NÃO pode ser aberto pelo monitor."""
+    def setUp(self):
+        self.champ = p05.discover_champion_config()
+        self.rule = _ctx_rule(value="ALT_DANGER", action="BLOCK")
+        self.rows = [_mon_row(i, regime="ALT_DANGER") for i in range(40)]
+
+    def test_sentinela_dispara_se_realized_r_for_lido(self):
+        """Meta-teste: a sentinela realmente detecta a violação."""
+        with self.assertRaises(AssertionError):
+            _ = self.rows[0]["realized_r"]
+        with self.assertRaises(AssertionError):
+            _ = self.rows[0].get("realized_r")
+
+    def test_count_affected_nao_le_realized_r(self):
+        c = p05.count_affected(self.rows, self.champ, self.rule, ["score_min"])
+        self.assertEqual(c["total_resolved"], 40)          # não levantou
+
+    def test_project_prospective_nao_le_realized_r(self):
+        p = p05.project_prospective(self.rows, self.champ, self.rule, ["score_min"])
+        self.assertIn("prospective_test_affected", p)      # não levantou
+
+    def test_affected_verdict_nao_le_realized_r(self):
+        for row in self.rows[:5]:
+            p05.affected_verdict(row, self.champ, self.rule, ["score_min"])
+
+    def test_bloco_p051r_nao_chama_avaliacao_nem_gate(self):
+        src = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        block = src.split("#  P05.1R — monitor de PRONTIDÃO")[1].split(
+            "#  P05C — champion × challenger")[0]
+        for proibido in ("evaluate_contextual_candidates", "evaluate_contextual_gate",
+                         "evaluate_contextual_candidate_offline", "compare_contextual",
+                         "evaluate_offline_gate", "compute_evidence_metrics",
+                         "bootstrap_", "temporal_split(", "walkforward_folds(",
+                         "generate_contextual_candidates", "_upsert_experiment"):
+            self.assertNotIn(proibido, block, f"monitor não pode chamar: {proibido}")
+
+    def test_bloco_p051r_nunca_le_realized_r(self):
+        """Menção em prosa é permitida; ACESSO ao valor não."""
+        src = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        block = src.split("#  P05.1R — monitor de PRONTIDÃO")[1].split(
+            "#  P05C — champion × challenger")[0]
+        for acesso in ('["realized_r"]', "['realized_r']", ".realized_r",
+                       'get("realized_r"', "get('realized_r'",
+                       'RS.realized_r', '"realized_r":'):
+            self.assertNotIn(acesso, block, f"ACESSO a realized_r: {acesso}")
+
+    def test_loader_nao_seleciona_realized_r(self):
+        src = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        loader = src.split("async def _load_readiness_rows")[1].split(
+            "async def _retention_snapshot")[0]
+        self.assertIn("RS.outcome_at", loader)
+        self.assertNotIn("RS.realized_r", loader)
+        self.assertIn("select(RS.id", loader)          # colunas explícitas
+
+    def test_marcadores_de_selo(self):
+        self.assertEqual(p05.HOLDOUT_SEALED, "SEALED")
+
+
+class ZeroWriteTests(unittest.IsolatedAsyncioTestCase):
+    """O P05.1R não pode escrever nada."""
+    def test_bloco_nao_contem_escrita(self):
+        """Menção em prosa é permitida; CHAMADA de escrita não."""
+        src = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        block = src.split("#  P05.1R — monitor de PRONTIDÃO")[1].split(
+            "#  P05C — champion × challenger")[0]
+        for proibido in ("session.add(", "session.commit(", "session.flush(",
+                         "session.delete(", "session.merge(", "session.execute(insert",
+                         "insert(", "update(", "delete("):
+            self.assertNotIn(proibido, block, f"escrita proibida: {proibido}")
+
+    async def test_build_readiness_nao_escreve_no_banco(self):
+        """Sessão falsa que EXPLODE em qualquer escrita."""
+        class _Result:
+            def all(self): return []
+            def scalars(self): return self
+
+        class _NoWriteSession:
+            async def execute(self, *a, **k): return _Result()
+            def add(self, *a, **k): raise AssertionError("ESCRITA PROIBIDA: add")
+            def merge(self, *a, **k): raise AssertionError("ESCRITA PROIBIDA: merge")
+            async def commit(self): raise AssertionError("ESCRITA PROIBIDA: commit")
+            async def flush(self, *a, **k): raise AssertionError("ESCRITA PROIBIDA: flush")
+            async def delete(self, *a, **k): raise AssertionError("ESCRITA PROIBIDA: delete")
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        import db as _db
+        with patch.object(_db, "get_session", lambda: _NoWriteSession()):
+            out = await p05._build_readiness(days=120, limit=20, experiment_id=None)
+        self.assertEqual(out["phase"], "P05.1R")
+        self.assertTrue(out["read_only"])
+        self.assertEqual(out["holdout_status"], "SEALED")
+        self.assertFalse(out["holdout_outcomes_read"])
+        self.assertFalse(out["holdout_metrics_computed"])
+
+    def test_endpoint_readiness_e_somente_get(self):
+        src = (BACKEND / "main.py").read_text()
+        self.assertIn('@app.get("/api/strategy/p05/readiness")', src)
+        self.assertNotIn('@app.post("/api/strategy/p05/readiness")', src)
+
+
+class ReadinessClassificationTests(unittest.TestCase):
+    def _om(self, *failed, passed=()):
+        checks = [{"check": c, "passed": False, "detail": ""} for c in failed]
+        checks += [{"check": c, "passed": True, "detail": ""} for c in passed]
+        return {"checks": checks}
+
+    def test_sample_limited(self):
+        r = p05.classify_last_failure(self._om(
+            "validacao_amostra_afetada_minima", "teste_amostra_afetada_minima",
+            "validacao_ci_delta_pareado_nao_negativo"))
+        self.assertEqual(r["classification"], p05.FAILURE_SAMPLE_LIMITED)
+
+    def test_refuted_last_run(self):
+        r = p05.classify_last_failure(self._om(
+            "validacao_operacoes_adicionais_positivas", "teste_total_r_maior"))
+        self.assertEqual(r["classification"], p05.FAILURE_REFUTED)
+
+    def test_mixed(self):
+        r = p05.classify_last_failure(self._om(
+            "validacao_amostra_afetada_minima",
+            "validacao_contexto_bloqueado_negativo"))
+        self.assertEqual(r["classification"], p05.FAILURE_MIXED)
+
+    def test_insufficient_metadata(self):
+        for bad in (None, {}, {"checks": []}, {"checks": "x"}):
+            self.assertEqual(p05.classify_last_failure(bad)["classification"],
+                             p05.FAILURE_NO_METADATA)
+
+    def test_checks_desconhecidos_viram_insufficient_metadata(self):
+        r = p05.classify_last_failure(self._om("validacao_check_que_nao_existe"))
+        self.assertEqual(r["classification"], p05.FAILURE_NO_METADATA)
+
+    def test_sem_falhas(self):
+        r = p05.classify_last_failure(self._om(passed=("validacao_total_r_maior",)))
+        self.assertEqual(r["classification"], p05.FAILURE_NONE)
+
+    def test_prefixo_de_estagio_e_deduplicado(self):
+        r = p05.classify_last_failure(self._om(
+            "validacao_amostra_afetada_minima", "teste_amostra_afetada_minima"))
+        self.assertEqual(r["failed_checks"], ["amostra_afetada_minima"])
+
+    def test_classificacao_reflete_os_5_experimentos_reais(self):
+        """market/NORMAL/limit_ob → MIXED; ALT_RISK_OFF/limit_fvg_fill → SAMPLE."""
+        market = self._om("validacao_amostra_afetada_minima",
+                          "validacao_ci_delta_pareado_acima_de_zero",
+                          "validacao_contexto_bloqueado_negativo",
+                          "validacao_ci_superior_evitadas_abaixo_de_zero")
+        alt_risk_off = self._om("validacao_amostra_afetada_minima",
+                                "validacao_operacoes_min_110pct",
+                                "validacao_ci_adicionais_acima_de_zero",
+                                "validacao_ci_delta_pareado_nao_negativo")
+        normal = self._om("validacao_amostra_afetada_minima",
+                          "validacao_operacoes_min_110pct",
+                          "validacao_total_r_maior",
+                          "validacao_operacoes_adicionais_positivas")
+        self.assertEqual(p05.classify_last_failure(market)["classification"], p05.FAILURE_MIXED)
+        self.assertEqual(p05.classify_last_failure(alt_risk_off)["classification"],
+                         p05.FAILURE_SAMPLE_LIMITED)
+        self.assertEqual(p05.classify_last_failure(normal)["classification"], p05.FAILURE_MIXED)
+
+
+class ReadinessVerdictTests(unittest.TestCase):
+    def _prosp(self, val=25, test=25, oos=40):
+        return {"prospective_validation_affected": val,
+                "prospective_test_affected": test,
+                "prospective_candidate_oos_count": oos}
+
+    def test_ready_exige_todos_os_minimos(self):
+        v = p05._readiness_verdict(classification=p05.FAILURE_SAMPLE_LIMITED,
+                                   coverage_pct=95.0, prospective=self._prosp(),
+                                   unknown_pct=2.0, retention_at_risk=False)
+        self.assertEqual(v["readiness"], p05.READINESS_READY)
+        self.assertIn("candidato aprovado", v["does_not_mean"])
+
+    def test_dezenove_continua_waiting_vinte_libera(self):
+        base = dict(classification=p05.FAILURE_SAMPLE_LIMITED, coverage_pct=95.0,
+                    unknown_pct=2.0, retention_at_risk=False)
+        v19 = p05._readiness_verdict(prospective=self._prosp(val=19), **base)
+        v20 = p05._readiness_verdict(prospective=self._prosp(val=20), **base)
+        self.assertEqual(v19["readiness"], p05.READINESS_WAITING)
+        self.assertEqual(v20["readiness"], p05.READINESS_READY)
+
+    def test_refutada_nunca_fica_ready(self):
+        v = p05._readiness_verdict(classification=p05.FAILURE_REFUTED, coverage_pct=99.0,
+                                   prospective=self._prosp(999, 999, 999),
+                                   unknown_pct=0.0, retention_at_risk=False)
+        self.assertEqual(v["readiness"], p05.READINESS_REFUTED)
+
+    def test_mixed_nunca_fica_ready(self):
+        v = p05._readiness_verdict(classification=p05.FAILURE_MIXED, coverage_pct=99.0,
+                                   prospective=self._prosp(999, 999, 999),
+                                   unknown_pct=0.0, retention_at_risk=False)
+        self.assertEqual(v["readiness"], p05.READINESS_MIXED)
+        self.assertIn("contradição", v["means"])
+
+    def test_cobertura_baixa_bloqueia(self):
+        v = p05._readiness_verdict(classification=p05.FAILURE_SAMPLE_LIMITED,
+                                   coverage_pct=50.0, prospective=self._prosp(),
+                                   unknown_pct=2.0, retention_at_risk=False)
+        self.assertEqual(v["readiness"], p05.READINESS_WAITING)
+
+    def test_unknown_excessivo_bloqueia(self):
+        v = p05._readiness_verdict(classification=p05.FAILURE_SAMPLE_LIMITED,
+                                   coverage_pct=95.0, prospective=self._prosp(),
+                                   unknown_pct=90.0, retention_at_risk=False)
+        self.assertEqual(v["readiness"], p05.READINESS_WAITING)
+        self.assertTrue(any("UNKNOWN" in b for b in v["blockers"]))
+
+    def test_oos_insuficiente_bloqueia(self):
+        v = p05._readiness_verdict(classification=p05.FAILURE_SAMPLE_LIMITED,
+                                   coverage_pct=95.0, prospective=self._prosp(oos=5),
+                                   unknown_pct=2.0, retention_at_risk=False)
+        self.assertEqual(v["readiness"], p05.READINESS_WAITING)
+
+    def test_retencao_em_risco_tem_precedencia(self):
+        v = p05._readiness_verdict(classification=p05.FAILURE_SAMPLE_LIMITED,
+                                   coverage_pct=99.0, prospective=self._prosp(),
+                                   unknown_pct=0.0, retention_at_risk=True)
+        self.assertEqual(v["readiness"], p05.READINESS_RETENTION_AT_RISK)
+
+    def test_metadata_insuficiente(self):
+        v = p05._readiness_verdict(classification=p05.FAILURE_NO_METADATA,
+                                   coverage_pct=99.0, prospective=self._prosp(),
+                                   unknown_pct=0.0, retention_at_risk=False)
+        self.assertEqual(v["readiness"], p05.READINESS_NO_METADATA)
+
+
+class EtaTests(unittest.TestCase):
+    def test_eta_com_taxa_valida(self):
+        e = p05.estimate_eta(affected_since_cutoff=40, observed_days=20.0,
+                             missing_to_minimum=10,
+                             classification=p05.FAILURE_SAMPLE_LIMITED)
+        self.assertEqual(e["daily_rate"], 2.0)
+        self.assertEqual(e["eta_days"], 20)     # 10 / (2.0*0.25) = 20
+        self.assertIn("conservadora", e["eta_reason"])
+
+    def test_eta_arredonda_para_cima(self):
+        e = p05.estimate_eta(affected_since_cutoff=30, observed_days=10.0,
+                             missing_to_minimum=7,
+                             classification=p05.FAILURE_SAMPLE_LIMITED)
+        self.assertEqual(e["eta_days"], 10)     # 7 / 0.75 = 9.33 → 10
+
+    def test_eta_null_com_taxa_zero(self):
+        e = p05.estimate_eta(affected_since_cutoff=0, observed_days=30.0,
+                             missing_to_minimum=10,
+                             classification=p05.FAILURE_SAMPLE_LIMITED)
+        self.assertEqual(e["daily_rate"], 0.0)
+        self.assertIsNone(e["eta_days"])
+
+    def test_eta_null_com_janela_curta(self):
+        e = p05.estimate_eta(affected_since_cutoff=10, observed_days=3.0,
+                             missing_to_minimum=10,
+                             classification=p05.FAILURE_SAMPLE_LIMITED)
+        self.assertIsNone(e["eta_days"])
+        self.assertIn("7 dias", e["eta_reason"])
+
+    def test_eta_null_para_refutada_e_mista(self):
+        for cls in (p05.FAILURE_REFUTED, p05.FAILURE_MIXED):
+            e = p05.estimate_eta(affected_since_cutoff=100, observed_days=30.0,
+                                 missing_to_minimum=1, classification=cls)
+            self.assertIsNone(e["eta_days"], cls)
+            self.assertIsNone(e["daily_rate"], cls)
+            self.assertIn("quantidade", e["eta_reason"])
+
+    def test_eta_zero_quando_minimo_atingido(self):
+        e = p05.estimate_eta(affected_since_cutoff=50, observed_days=20.0,
+                             missing_to_minimum=0,
+                             classification=p05.FAILURE_SAMPLE_LIMITED)
+        self.assertEqual(e["eta_days"], 0)
+
+    def test_missing_nunca_negativo(self):
+        """`_readiness_for_experiment` usa max(0, ...) — contrato do cálculo."""
+        src = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        self.assertIn("missing = max(0, P051_MIN_AFFECTED - worst_slice)", src)
+
+
+class RetentionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_historico_jovem_nao_e_falsa_delecao(self):
+        rows = [_mon_row(i, sealed=False) for i in range(10)]
+        for i, r in enumerate(rows):
+            r["resolved_at"] = datetime.now(timezone.utc) - timedelta(days=i)
+        ret = await p05._retention_snapshot(rows)
+        self.assertEqual(ret["history_status"], "YOUNG_HISTORY")
+        self.assertIn("NÃO é evidência de deleção", ret["history_note"])
+        self.assertFalse(ret["retention_at_risk"])
+        self.assertIsNone(ret["retention_warning"])
+
+    async def test_politica_nao_se_aplica_aos_status_do_p05(self):
+        ret = await p05._retention_snapshot([_mon_row(0, sealed=False)])
+        self.assertFalse(ret["retention_policy_applies_to_p05"])
+        self.assertEqual(ret["retention_policy_detected"], "wide_namespace_prune_only")
+        self.assertIsNone(ret["retention_policy_days"])
+        detail = ret["policy_detail"]
+        self.assertEqual(detail["pruned_statuses"], ["wide", "wide_*"])
+        self.assertNotIn("wide", detail["p05_statuses"])
+
+    async def test_contagens_30_60_90_120(self):
+        now = datetime.now(timezone.utc)
+        rows = []
+        for days_ago in (10, 40, 70, 100, 130):
+            r = _mon_row(days_ago, sealed=False)
+            r["resolved_at"] = now - timedelta(days=days_ago)
+            rows.append(r)
+        ret = await p05._retention_snapshot(rows)
+        self.assertEqual(ret["rows_older_than_30d"], 4)
+        self.assertEqual(ret["rows_older_than_60d"], 3)
+        self.assertEqual(ret["rows_older_than_90d"], 2)
+        self.assertEqual(ret["rows_older_than_120d"], 1)
+
+    async def test_sem_linhas_fica_unknown(self):
+        ret = await p05._retention_snapshot([])
+        self.assertEqual(ret["history_status"], "UNKNOWN")
+        self.assertIsNone(ret["observed_retention_days"])
+
+    async def test_historico_maduro(self):
+        now = datetime.now(timezone.utc)
+        rows = [_mon_row(0, sealed=False)]
+        rows[0]["resolved_at"] = now - timedelta(days=200)
+        ret = await p05._retention_snapshot(rows)
+        self.assertEqual(ret["history_status"], "MATURE")
+
+
+class ReadinessApiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.src = (BACKEND / "main.py").read_text()
+        cls.tree = ast.parse(cls.src)
+        cls.node = None
+        for node in ast.walk(cls.tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    if (isinstance(dec, ast.Call) and dec.args
+                            and isinstance(dec.args[0], ast.Constant)
+                            and dec.args[0].value == "/api/strategy/p05/readiness"):
+                        cls.node = node
+        cls.body = ast.get_source_segment(cls.src, cls.node) if cls.node else ""
+
+    def test_endpoint_existe(self):
+        self.assertIsNotNone(self.node)
+
+    def test_clamps(self):
+        self.assertIn("max(30, min(int(days), 365))", self.body)
+        self.assertIn("max(1, min(int(limit), 100))", self.body)
+
+    def test_experiment_id_opcional(self):
+        self.assertIn("experiment_id", self.body)
+
+    def test_sem_auth_admin(self):
+        self.assertNotIn("_check_admin_token", self.body)
+
+    def test_fail_soft(self):
+        self.assertIn("except Exception", self.body)
+        self.assertIn('"ok": False', self.body)
+        self.assertIn("HOLDOUT_SEALED", self.body)
+
+    def test_status_expoe_resumo_pequeno(self):
+        svc = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        block = svc.split("async def get_p05_status")[1]
+        for field in ("readiness_by_status", "next_recommended_check",
+                      "retention_warning", "holdout_status"):
+            self.assertIn(field, block, f"campo ausente no status: {field}")
+
+    def test_nenhum_endpoint_novo_de_acao(self):
+        for proibido in ("readiness-evaluate", "readiness/run", "reevaluate"):
+            self.assertNotIn(proibido, self.src)
+
+
+class ReadinessCacheTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        p05._READINESS_CACHE.clear()
+
+    def tearDown(self):
+        p05._READINESS_CACHE.clear()
+
+    async def test_chave_inclui_days_limit_experiment_id(self):
+        calls = []
+
+        async def _fake(days, limit, experiment_id):
+            calls.append((days, limit, experiment_id))
+            return {"phase": "P05.1R", "summary": {}}
+
+        with patch.object(p05, "_build_readiness", _fake):
+            await p05.get_readiness(days=120, limit=20)
+            await p05.get_readiness(days=120, limit=20)      # cache hit
+            await p05.get_readiness(days=90, limit=20)       # days diferente
+            await p05.get_readiness(days=120, limit=50)      # limit diferente
+            await p05.get_readiness(days=120, limit=20, experiment_id=7)
+        self.assertEqual(len(calls), 4)
+        self.assertIn((120, 20, None), calls)
+        self.assertIn((90, 20, None), calls)
+        self.assertIn((120, 50, None), calls)
+        self.assertIn((120, 20, 7), calls)
+
+    async def test_erro_nao_envenena_cache(self):
+        calls = []
+
+        async def _fake(days, limit, experiment_id):
+            calls.append(1)
+            return {"phase": "P05.1R", "error": "boom"}
+
+        with patch.object(p05, "_build_readiness", _fake):
+            await p05.get_readiness(days=120, limit=20)
+            await p05.get_readiness(days=120, limit=20)
+        self.assertEqual(len(calls), 2)          # não cacheou o erro
+
+    async def test_clamp_na_chave(self):
+        calls = []
+
+        async def _fake(days, limit, experiment_id):
+            calls.append((days, limit))
+            return {"phase": "P05.1R"}
+
+        with patch.object(p05, "_build_readiness", _fake):
+            await p05.get_readiness(days=5, limit=999)
+        self.assertEqual(calls[0], (30, 100))    # clamps aplicados
+
+
+class ReadinessArchitectureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        src = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        cls.block = src.split("#  P05.1R — monitor de PRONTIDÃO")[1].split(
+            "#  P05C — champion × challenger")[0]
+
+    def test_sem_rede_sdk_ou_exchange(self):
+        """Menção em prosa é permitida; IMPORT não (o monitor é hermético)."""
+        for modulo in ("ccxt", "binance_signed_service", "bybit_signed_service",
+                       "httpx", "aiohttp", "requests", "snapshot_service",
+                       "push_service", "shadow_trade_service", "trade_manager_service"):
+            self.assertNotIn(f"import {modulo}", self.block, f"import proibido: {modulo}")
+            self.assertNotIn(f"from services import {modulo}", self.block,
+                             f"import proibido: {modulo}")
+            self.assertNotIn(f"from services.{modulo}", self.block,
+                             f"import proibido: {modulo}")
+
+    def test_reutiliza_nucleo(self):
+        for reutilizado in ("discover_champion_config", "eligibility(",
+                            "contextual_eligibility(", "context_value(",
+                            "validate_context_rule("):
+            self.assertIn(reutilizado, self.block, f"não reutilizou: {reutilizado}")
+
+    def test_sem_flag_nova(self):
+        env = p05.env_snapshot()
+        self.assertFalse([k for k in env if "P051R" in k or "READINESS" in k.upper()])
+
+    def test_sem_tabela_ou_coluna_nova(self):
+        model = (BACKEND / "models/strategy_experiment.py").read_text()
+        self.assertEqual(model.count("__tablename__"), 1)
+        self.assertNotIn("readiness", model.lower())
+
+    def test_shadow_continua_desligado(self):
+        src = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        self.assertIn('_env_bool("P05_CHALLENGER_SHADOW_ENABLED", "false")', src)
+
+
+class ReadinessFrontendTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.src = (BACKEND.parent / "frontend/src/components/AssertivenessPanel.tsx").read_text()
+
+    def test_secao_presente(self):
+        self.assertIn("Prontidão para nova avaliação", self.src)
+        self.assertIn("holdout protegido", self.src)
+
+    def test_linguagem_correta(self):
+        self.assertIn("amostra suficiente para reavaliar", self.src)
+        low = self.src.lower()
+        for proibido in ("pronto para ativar", "lucro esperado", "oportunidade perdida",
+                         "candidato pronto"):
+            self.assertNotIn(proibido, low, f"linguagem proibida: {proibido}")
+
+    def test_sem_botao_de_acao(self):
+        block = self.src.split("Prontidão para nova avaliação")[1].split("</section>")[0]
+        for proibido in ("<button", "onClick"):
+            self.assertNotIn(proibido, block, f"ação proibida na seção: {proibido}")
+
+    def test_sem_object_object(self):
+        block = self.src.split("Prontidão para nova avaliação")[1].split("</section>")[0]
+        self.assertNotIn("String(e)", block)
+        self.assertNotIn("{e.prospective}", block)
+        self.assertNotIn("{e.blockers}", block)
+
+    def test_usa_endpoint_readonly(self):
+        self.assertIn("/api/strategy/p05/readiness", self.src)
+        self.assertNotIn("contextual-evaluate", self.src)
+
+
 if __name__ == "__main__":
     unittest.main()

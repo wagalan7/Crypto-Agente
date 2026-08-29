@@ -114,6 +114,70 @@ interface P05Block {
   eligible_experiment?: P05Experiment | null
 }
 
+// ── P05.1R: prontidão para NOVA AVALIAÇÃO (somente leitura) ────────────────
+interface ReadinessExperiment {
+  experiment_id?: number
+  axis?: string
+  value?: string
+  action?: string
+  score_delta?: number | null
+  failure_classification?: string
+  failure_reason?: string
+  readiness?: string
+  blockers?: string[]
+  missing_to_minimum?: number
+  minimum_affected?: number
+  daily_rate?: number | null
+  eta_days?: number | null
+  eta_reason?: string
+  unknown_pct?: number | null
+  current_window?: { context_coverage_pct?: number | null; affected?: number }
+  prospective?: {
+    prospective_validation_affected?: number
+    prospective_test_affected?: number
+    prospective_candidate_oos_count?: number
+  }
+}
+
+interface Readiness {
+  ok?: boolean
+  holdout_status?: string
+  summary?: {
+    monitored?: number
+    readiness_by_status?: Record<string, number>
+    next_recommended_check_days?: number | null
+    next_recommended_check_reason?: string
+  }
+  retention?: {
+    observed_retention_days?: number | null
+    retention_warning?: string | null
+    history_status?: string
+    history_note?: string
+    rows_older_than_90d?: number
+  }
+  experiments?: ReadinessExperiment[]
+}
+
+const READINESS_LABEL: Record<string, string> = {
+  WAITING_FOR_DATA: 'juntando dados',
+  READY_FOR_REEVALUATION: 'amostra suficiente para reavaliar',
+  REFUTED_LAST_RUN: 'hipótese contrariada',
+  MIXED_EVIDENCE: 'evidência mista',
+  RETENTION_AT_RISK: 'risco de retenção',
+  INSUFFICIENT_METADATA: 'metadados insuficientes',
+  UNKNOWN: 'indefinido',
+}
+
+const READINESS_COLOR: Record<string, string> = {
+  WAITING_FOR_DATA: 'text-yellow-300',
+  READY_FOR_REEVALUATION: 'text-emerald-300',
+  REFUTED_LAST_RUN: 'text-red-300',
+  MIXED_EVIDENCE: 'text-orange-300',
+  RETENTION_AT_RISK: 'text-red-300',
+  INSUFFICIENT_METADATA: 'text-slate-400',
+  UNKNOWN: 'text-slate-400',
+}
+
 const RELIABILITY_LABEL: Record<string, string> = {
   INSUFFICIENT: 'amostra insuficiente',
   EARLY: 'início',
@@ -194,6 +258,7 @@ function rColor(n: number | null | undefined): string {
 
 export default function AssertivenessPanel({ onClose }: Props) {
   const [data, setData] = useState<Assertiveness | null>(null)
+  const [readiness, setReadiness] = useState<Readiness | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [days, setDays] = useState(30)
@@ -212,7 +277,19 @@ export default function AssertivenessPanel({ onClose }: Props) {
     }
   }, [])
 
+  // P05.1R — monitor de prontidão (GET somente leitura, degrada em silêncio).
+  const loadReadiness = useCallback(async () => {
+    try {
+      const res = await fetch(`${BACKEND}/api/strategy/p05/readiness?days=120&limit=20`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setReadiness(await res.json())
+    } catch {
+      setReadiness(null)
+    }
+  }, [])
+
   useEffect(() => { load(days) }, [load, days])
+  useEffect(() => { loadReadiness() }, [loadReadiness])
 
   const real = data?.real_money
   const shadow = data?.shadow
@@ -592,6 +669,88 @@ export default function AssertivenessPanel({ onClose }: Props) {
                   <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
                     São contagens de <strong className="text-slate-400">eventos</strong> de bloqueio, não de oportunidades únicas —
                     e um bloqueio não significa dinheiro deixado na mesa: não dá pra saber o resultado de algo que não aconteceu.
+                  </p>
+                </section>
+              )}
+
+              {/* ── P05.1R Prontidão para nova avaliação (somente leitura) ── */}
+              {readiness?.experiments && readiness.experiments.length > 0 && (
+                <section>
+                  <div className="flex items-center gap-2 mb-2">
+                    <ShieldCheck className="w-4 h-4 text-sky-400" />
+                    <h3 className="text-sm font-bold text-sky-300">Prontidão para nova avaliação</h3>
+                    <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300">
+                      🔒 holdout protegido
+                    </span>
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    {readiness.experiments.map(e => {
+                      const cls = READINESS_COLOR[e.readiness ?? 'UNKNOWN'] ?? 'text-slate-400'
+                      const pv = e.prospective?.prospective_validation_affected ?? 0
+                      const pt = e.prospective?.prospective_test_affected ?? 0
+                      const min = e.minimum_affected ?? 20
+                      return (
+                        <div key={e.experiment_id} className="p-2 rounded-lg border border-slate-800 bg-slate-900/40">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-bold text-slate-200">
+                              {AXIS_LABEL[e.axis ?? ''] ?? e.axis} = {e.value}
+                            </span>
+                            <span className="text-[9px] font-mono text-slate-500">
+                              {e.action === 'BLOCK' ? 'não operar' : `nota −${Math.abs(e.score_delta ?? 0)}`}
+                            </span>
+                            <span className={`ml-auto text-[10px] font-bold ${cls}`}>
+                              {READINESS_LABEL[e.readiness ?? 'UNKNOWN'] ?? e.readiness}
+                            </span>
+                          </div>
+                          <div className="mt-1 text-[10px] text-slate-400 leading-snug">
+                            Última conclusão: {e.failure_reason || '–'}
+                          </div>
+                          <div className="mt-1 grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-0.5 text-[10px]">
+                            <span className="text-slate-400">
+                              afetadas hoje: <span className="font-mono text-slate-200">{pv} val / {pt} teste</span>
+                            </span>
+                            <span className="text-slate-400">
+                              mínimo: <span className="font-mono text-slate-200">{min}</span>
+                            </span>
+                            <span className="text-slate-400">
+                              falta: <span className="font-mono text-slate-200">{e.missing_to_minimum ?? '–'}</span>
+                            </span>
+                            <span className="text-slate-400">
+                              cobertura: <span className="font-mono text-slate-200">{fmtPct(e.current_window?.context_coverage_pct)}</span>
+                            </span>
+                            <span className="text-slate-400">
+                              ritmo: <span className="font-mono text-slate-200">{e.daily_rate !== null && e.daily_rate !== undefined ? `${e.daily_rate.toFixed(2)}/dia` : '–'}</span>
+                            </span>
+                            <span className="text-slate-400">
+                              previsão: <span className="font-mono text-slate-200">{e.eta_days !== null && e.eta_days !== undefined ? `~${e.eta_days}d` : '–'}</span>
+                            </span>
+                          </div>
+                          {e.eta_reason && (
+                            <div className="mt-0.5 text-[9px] text-slate-500 leading-snug">{e.eta_reason}</div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  {readiness.retention && (
+                    <div className="mt-1.5 p-2 rounded-lg border border-slate-800 bg-slate-900/40 text-[10px] text-slate-400 leading-snug">
+                      Histórico disponível:{' '}
+                      <span className="font-mono text-slate-200">
+                        {readiness.retention.observed_retention_days ?? '–'} dias
+                      </span>
+                      {readiness.retention.history_note && <> · {readiness.retention.history_note}</>}
+                      {readiness.retention.retention_warning && (
+                        <div className="mt-0.5 text-amber-300">⚠ {readiness.retention.retention_warning}</div>
+                      )}
+                    </div>
+                  )}
+
+                  <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
+                    Isto mede apenas se já existe <strong className="text-slate-400">amostra suficiente para reavaliar</strong> —
+                    não diz que a regra funciona, nem que está pronta para ser usada. Os resultados guardados
+                    para o teste final continuam intocados.
                   </p>
                 </section>
               )}

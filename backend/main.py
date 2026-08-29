@@ -3741,6 +3741,29 @@ async def p05_evaluate(days: int = 90, x_admin_token: Optional[str] = Header(Non
         raise HTTPException(status_code=500, detail=f"avaliação P05 falhou: {e}")
 
 
+@app.get("/api/strategy/p05/readiness")
+async def p05_readiness(days: int = 120, limit: int = 20, experiment_id: Optional[int] = None):
+    """P05.1R — monitor de PRONTIDÃO de evidência (SOMENTE LEITURA).
+
+    Responde "já há amostra para reavaliar?", nunca "o candidato é bom?".
+    Zero escrita no banco; o holdout dos experimentos permanece SELADO.
+    """
+    from services import strategy_evidence_service as p05
+    try:
+        days = max(30, min(int(days), 365))
+        limit = max(1, min(int(limit), 100))
+        exp_id = int(experiment_id) if experiment_id is not None else None
+    except Exception:
+        days, limit, exp_id = 120, 20, None
+    try:
+        data = await p05.get_readiness(days=days, limit=limit, experiment_id=exp_id)
+    except Exception as e:
+        log.warning(f"[p05.1r] readiness falhou: {e}")
+        return {"ok": False, "phase": p05.P051R_PHASE, "read_only": True,
+                "holdout_status": p05.HOLDOUT_SEALED, "error": str(e)}
+    return {"ok": True, **data}
+
+
 @app.post("/api/strategy/p05/contextual-evaluate")
 async def p05_contextual_evaluate(days: int = 90, x_admin_token: Optional[str] = Header(None)):
     """P05.1 — candidatos CONTEXTUAIS (regime / entry_zone_type).
