@@ -2951,10 +2951,14 @@ def classify_last_failure(offline_metrics: Any) -> Dict[str, Any]:
     sample = [f for f in failed if f in _SAMPLE_CHECKS]
     unclassified = [f for f in failed if f not in _SUBSTANTIVE_CHECKS and f not in _SAMPLE_CHECKS]
 
-    if unclassified and not substantive and not sample:
+    # Fail-closed: um check desconhecido pode ser substantivo. Misturá-lo com
+    # checks conhecidos e ainda assim concluir "faltou apenas amostra" criaria
+    # uma prontidão falsa quando o contrato de gates evoluir.
+    if unclassified:
         return {"classification": FAILURE_NO_METADATA,
                 "reason": f"checks não reconhecidos: {unclassified}",
-                "failed_checks": failed, "substantive": [], "sample": []}
+                "failed_checks": failed, "substantive": substantive,
+                "sample": sample, "unclassified": unclassified}
     if substantive and sample:
         classification, reason = FAILURE_MIXED, (
             "falhas de amostra E de direção econômica ao mesmo tempo — mais "
@@ -3003,10 +3007,13 @@ def count_affected(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
     outcome — só quantas oportunidades cada lado tocaria."""
     axis = rule.get("axis")
     total = len(rows)
-    champ_ok = cand_ok = affected = unknown = context_present = 0
+    champ_ok = cand_ok = affected = unknown = context_present = context_matched = 0
     for row in rows:
-        if context_value(row, axis) != CONTEXT_UNKNOWN:
+        context = context_value(row, axis)
+        if context != CONTEXT_UNKNOWN:
             context_present += 1
+        if context == rule.get("value"):
+            context_matched += 1
         if eligibility(row, champion, active) is True:
             champ_ok += 1
         if contextual_eligibility(row, champion, rule, active) is True:
@@ -3030,6 +3037,7 @@ def count_affected(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
         "affected": affected,
         "unknown": unknown,
         "context_present": context_present,
+        "context_matched": context_matched,
         "context_coverage_pct": round(context_present / total * 100, 1) if total else None,
         "observed_span_days": span,
         "oldest_resolved_at": oldest.isoformat() if oldest else None,
@@ -3201,10 +3209,15 @@ async def _retention_snapshot(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _readiness_verdict(*, classification: str, coverage_pct: Optional[float],
                        prospective: Dict[str, Any], unknown_pct: Optional[float],
-                       retention_at_risk: bool) -> Dict[str, Any]:
+                       retention_at_risk: bool,
+                       retention_known: bool = True) -> Dict[str, Any]:
     """`READY_FOR_REEVALUATION` significa APENAS "há amostra suficiente para
     rodar a avaliação de novo" — nunca aprovação, Shadow ou promoção."""
     blockers: List[str] = []
+    if not retention_known:
+        return {"readiness": READINESS_NO_METADATA,
+                "blockers": ["auditoria de retenção indisponível"],
+                "means": "não é seguro declarar prontidão sem validar a retenção"}
     if retention_at_risk:
         return {"readiness": READINESS_RETENTION_AT_RISK,
                 "blockers": ["retenção insuficiente para a janela alvo"],
@@ -3252,8 +3265,9 @@ def _readiness_verdict(*, classification: str, coverage_pct: Optional[float],
 
 
 async def _readiness_for_experiment(exp: Any, rows: Sequence[Dict[str, Any]],
-                                    champion: Dict[str, Any],
-                                    retention: Dict[str, Any]) -> Dict[str, Any]:
+                                    current_champion: Dict[str, Any],
+                                    retention: Dict[str, Any],
+                                    window_days: int = 120) -> Dict[str, Any]:
     """Prontidão de UM experimento congelado. Não altera nada."""
     config = exp.candidate_config if isinstance(exp.candidate_config, dict) else {}
     raw_rule = config.get("CONTEXT_RULE")
@@ -3266,24 +3280,54 @@ async def _readiness_for_experiment(exp: Any, rows: Sequence[Dict[str, Any]],
     offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
     failure = classify_last_failure(offline)
 
-    # Componentes CONGELADOS na avaliação original — o monitor não redescobre
-    # componentes nem muda o contrato do experimento.
+    # Reproduz SOMENTE o contrato congelado. Usar o champion atual ou reconstruir
+    # componentes ausentes mudaria a hipótese depois de olhar dados novos.
+    champion = _frozen_champion(exp)
     active = offline.get("active_components")
-    if not isinstance(active, list) or not active:
-        active, _cov = contextual_active_components(rows)
-        active_source = "recomputado (experimento sem componentes congelados)"
-    else:
-        active_source = "congelado na avaliação original"
-
     cutoff = _utc(exp.dataset_cutoff)
+    metadata_errors: List[str] = []
+    if champion is None:
+        metadata_errors.append("champion congelado ausente ou hash divergente")
+    if (not isinstance(active, list) or not active
+            or any(not isinstance(c, str) for c in active)
+            or len(active) != len(set(active))
+            or any(c not in _COMPONENT_FEATURES for c in active)):
+        metadata_errors.append("active_components congelados ausentes ou inválidos")
+    if cutoff is None:
+        metadata_errors.append("dataset_cutoff ausente ou inválido")
+
+    champion_drift = (champion is not None
+                      and canonical_hash(current_champion) != exp.champion_hash)
+    if metadata_errors:
+        return {
+            "experiment_id": exp.id, "objective": exp.objective,
+            "axis": rule["axis"], "value": rule["value"],
+            "action": rule["action"], "score_delta": rule.get("score_delta"),
+            "status": exp.status, "readiness": READINESS_NO_METADATA,
+            "blockers": metadata_errors,
+            "means": "o experimento não pode ser reproduzido com segurança",
+            "failure_classification": failure["classification"],
+            "failed_checks": failure["failed_checks"],
+            "active_components": active if isinstance(active, list) else None,
+            "active_components_source": "indisponível",
+            "champion_drift": champion_drift,
+            "holdout_outcomes_read": False, "holdout_metrics_computed": False,
+            "holdout_status": HOLDOUT_SEALED,
+        }
+
+    active_source = "congelado na avaliação original"
     current = count_affected(rows, champion, rule, active)
     prospective = project_prospective(rows, champion, rule, active)
 
     since_rows = [r for r in rows if cutoff is None or r["resolved_at"] > cutoff]
     since = count_affected(since_rows, champion, rule, active)
-    observed_days = None
-    if cutoff is not None:
-        observed_days = max(0.0, (datetime.now(timezone.utc) - cutoff).total_seconds() / 86400.0)
+    now = datetime.now(timezone.utc)
+    # A taxa só pode usar o período efetivamente carregado. Se o cutoff for mais
+    # antigo que a janela solicitada, não divide eventos de 120d por toda a idade
+    # do experimento (o que inflaria artificialmente a ETA).
+    window_start = now - timedelta(days=max(30, int(window_days)))
+    observation_start = max(cutoff, window_start)
+    observed_days = max(0.0, (now - observation_start).total_seconds() / 86400.0)
 
     worst_slice = min(prospective["prospective_validation_affected"],
                       prospective["prospective_test_affected"])
@@ -3293,15 +3337,25 @@ async def _readiness_for_experiment(exp: Any, rows: Sequence[Dict[str, Any]],
                        missing_to_minimum=missing,
                        classification=failure["classification"])
 
-    total = current["total_resolved"] or 0
-    unknown_pct = round(current["unknown"] / total * 100, 1) if total else None
+    # UNKNOWN só existe dentro do contexto-alvo; usar o total global diluiria a
+    # falta de qualidade quando o segmento é pequeno.
+    context_matched = current["context_matched"] or 0
+    unknown_pct = (round(current["unknown"] / context_matched * 100, 1)
+                   if context_matched else None)
     verdict = _readiness_verdict(
         classification=failure["classification"],
         coverage_pct=current["context_coverage_pct"],
         prospective=prospective,
         unknown_pct=unknown_pct,
         retention_at_risk=bool(retention.get("retention_at_risk")),
+        retention_known=not bool(retention.get("error")),
     )
+    if champion_drift:
+        verdict = {
+            "readiness": READINESS_UNKNOWN,
+            "blockers": ["champion atual diverge do champion congelado"],
+            "means": "gere uma nova hipótese contra o champion atual antes de reavaliar",
+        }
 
     baseline_validation_affected = None
     val = offline.get("validation")
@@ -3338,6 +3392,7 @@ async def _readiness_for_experiment(exp: Any, rows: Sequence[Dict[str, Any]],
         "minimum_affected": P051_MIN_AFFECTED,
         "active_components": active,
         "active_components_source": active_source,
+        "champion_drift": champion_drift,
         **eta,
         **verdict,
         "holdout_outcomes_read": False,
@@ -3375,7 +3430,10 @@ async def _build_readiness(days: int, limit: int,
         retention = await _retention_snapshot(rows)
     except Exception as exc:
         log.warning(f"[p05.1r] retenção falhou: {exc}")
-        retention = {"error": str(exc), "retention_at_risk": False}
+        # Fail-closed: uma falha de auditoria de retenção nunca pode resultar em
+        # READY_FOR_REEVALUATION.
+        retention = {"error": str(exc), "retention_at_risk": False,
+                     "history_status": "UNKNOWN"}
 
     experiments: List[Dict[str, Any]] = []
     try:
@@ -3396,12 +3454,15 @@ async def _build_readiness(days: int, limit: int,
                 offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
                 # Só monitora o que é declaradamente P05.1 ANALYTICS_ONLY.
                 if not (offline.get("phase") == P051_PHASE
-                        or offline.get("execution_mode") == P051_EXECUTION_MODE
-                        or is_contextual_experiment(exp)):
+                        and offline.get("execution_mode") == P051_EXECUTION_MODE
+                        and offline.get("promotable") is False
+                        and offline.get("shadow_supported") is False
+                        and is_contextual_experiment(exp)):
                     continue
                 try:
                     experiments.append(
-                        await _readiness_for_experiment(exp, rows, champion, retention))
+                        await _readiness_for_experiment(
+                            exp, rows, champion, retention, window_days=days))
                 except Exception as exc:                       # fail-soft por item
                     log.warning(f"[p05.1r] experimento {exp.id} falhou: {exc}")
                     experiments.append({"experiment_id": exp.id,
@@ -3453,7 +3514,12 @@ async def get_readiness(days: int = 120, limit: int = 20,
         if cached and now_mono - cached[0] < P05_DIAG_CACHE_TTL_S:
             return cached[1]
         value = await _build_readiness(days, limit, experiment_id)
-        if not value.get("error"):                 # erro não entra no cache
+        has_partial_error = (
+            bool(value.get("experiments_error"))
+            or bool((value.get("retention") or {}).get("error"))
+            or any(bool(item.get("error")) for item in (value.get("experiments") or []))
+        )
+        if not value.get("error") and not has_partial_error:  # erro não entra no cache
             _READINESS_CACHE[key] = (now_mono, value)
             if len(_READINESS_CACHE) > 12:
                 oldest = min(_READINESS_CACHE, key=lambda k: _READINESS_CACHE[k][0])
@@ -3985,7 +4051,11 @@ async def get_p05_status(days: int = 30) -> Dict[str, Any]:
         out["contextual_experiments"] = None
     # Resumo PEQUENO do monitor de prontidão (P05.1R) — somente leitura.
     try:
-        readiness = await get_readiness(days=max(30, min(days, 365)), limit=20)
+        # Diagnóstico pode usar 30d, mas prontidão/retenção precisa enxergar ao
+        # menos a janela-alvo de 120d; do contrário todo status curto pareceria
+        # artificialmente "histórico jovem".
+        readiness = await get_readiness(
+            days=max(P051R_TARGET_RETENTION_DAYS, min(days, 365)), limit=20)
         out["readiness_by_status"] = (readiness.get("summary") or {}).get("readiness_by_status")
         out["next_recommended_check"] = (readiness.get("summary") or {}).get(
             "next_recommended_check_days")

@@ -714,3 +714,25 @@ selado e zero alteração no LIVE.
   real; `py_compile`, `tsc --noEmit` e `git diff --check` aprovados. P05.2 NÃO foi
   implementado; `P05_CHALLENGER_SHADOW_ENABLED` continua `false`; champion LIVE,
   `SCORE_MIN`, `LIVE_SIZE_MULT` e P04A/B/C inalterados.
+
+### Auditoria de fechamento P05.1R (2026-08-29)
+
+- O monitor passou a reproduzir cada hipótese exclusivamente com o **champion** e
+  os `active_components` congelados no experimento. Metadado ausente, hash
+  divergente ou componente inválido agora resulta em `INSUFFICIENT_METADATA`; o
+  contrato não é reconstruído com dados posteriores.
+- Drift entre o champion atual e o congelado bloqueia prontidão e orienta gerar
+  uma hipótese nova. A contagem ainda usa o contrato congelado para manter a
+  auditoria explicável.
+- Check persistido desconhecido falha fechado, mesmo misturado a checks de
+  amostra; não pode mais ser reduzido indevidamente a `SAMPLE_LIMITED`.
+- `UNKNOWN` é medido dentro do contexto-alvo (não diluído pelo dataset global),
+  a ETA usa somente o período realmente carregado e o status consolidado consulta
+  ao menos a janela de retenção de 120 dias.
+- Falha de retenção, erro parcial de leitura ou configuração P05.1 incompleta
+  nunca produz `READY_FOR_REEVALUATION` nem contamina o cache. Somente registros
+  declarados simultaneamente como `P05.1` + `ANALYTICS_ONLY` + não promovíveis +
+  sem Shadow entram no monitor.
+- **318 testes P05 verdes 2×**; **561 testes críticos P01–P05 verdes**;
+  `py_compile` e `git diff --check` aprovados. Holdout permaneceu selado, zero
+  escrita no banco, zero rede/exchange e nenhuma alteração de estratégia LIVE.

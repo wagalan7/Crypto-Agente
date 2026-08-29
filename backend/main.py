@@ -3761,6 +3761,9 @@ async def p05_readiness(days: int = 120, limit: int = 20, experiment_id: Optiona
         log.warning(f"[p05.1r] readiness falhou: {e}")
         return {"ok": False, "phase": p05.P051R_PHASE, "read_only": True,
                 "holdout_status": p05.HOLDOUT_SEALED, "error": str(e)}
+    if (data.get("error") or data.get("experiments_error")
+            or (data.get("retention") or {}).get("error")):
+        return {"ok": False, **data}
     return {"ok": True, **data}
 
 

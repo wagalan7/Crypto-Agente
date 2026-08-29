@@ -2227,6 +2227,13 @@ class ReadinessClassificationTests(unittest.TestCase):
         r = p05.classify_last_failure(self._om("validacao_check_que_nao_existe"))
         self.assertEqual(r["classification"], p05.FAILURE_NO_METADATA)
 
+    def test_check_desconhecido_misturado_tambem_falha_fechado(self):
+        r = p05.classify_last_failure(self._om(
+            "validacao_amostra_afetada_minima",
+            "validacao_check_novo_ainda_nao_classificado"))
+        self.assertEqual(r["classification"], p05.FAILURE_NO_METADATA)
+        self.assertEqual(r["unclassified"], ["check_novo_ainda_nao_classificado"])
+
     def test_sem_falhas(self):
         r = p05.classify_last_failure(self._om(passed=("validacao_total_r_maior",)))
         self.assertEqual(r["classification"], p05.FAILURE_NONE)
@@ -2315,11 +2322,100 @@ class ReadinessVerdictTests(unittest.TestCase):
                                    unknown_pct=0.0, retention_at_risk=True)
         self.assertEqual(v["readiness"], p05.READINESS_RETENTION_AT_RISK)
 
+    def test_auditoria_de_retencao_indisponivel_falha_fechado(self):
+        v = p05._readiness_verdict(
+            classification=p05.FAILURE_SAMPLE_LIMITED, coverage_pct=99.0,
+            prospective=self._prosp(), unknown_pct=0.0,
+            retention_at_risk=False, retention_known=False)
+        self.assertEqual(v["readiness"], p05.READINESS_NO_METADATA)
+        self.assertTrue(any("retenção" in b for b in v["blockers"]))
+
     def test_metadata_insuficiente(self):
         v = p05._readiness_verdict(classification=p05.FAILURE_NO_METADATA,
                                    coverage_pct=99.0, prospective=self._prosp(),
                                    unknown_pct=0.0, retention_at_risk=False)
         self.assertEqual(v["readiness"], p05.READINESS_NO_METADATA)
+
+
+class FrozenReadinessContractTests(unittest.IsolatedAsyncioTestCase):
+    def _exp(self, *, active=("score_min",), rule=None, champion=None,
+             champion_hash=None, cutoff=True):
+        from models.strategy_experiment import StrategyExperiment
+        frozen = dict(champion or p05.discover_champion_config())
+        offline = {
+            "phase": p05.P051_PHASE,
+            "execution_mode": p05.P051_EXECUTION_MODE,
+            "promotable": False,
+            "shadow_supported": False,
+            "champion_config": frozen,
+            "active_components": list(active) if active is not None else None,
+            "checks": [{"check": "validacao_amostra_afetada_minima",
+                        "passed": False, "detail": ""}],
+        }
+        exp = StrategyExperiment(
+            experiment_key="readiness-contract",
+            champion_hash=champion_hash or p05.canonical_hash(frozen),
+            candidate_hash="b" * 64,
+            status=p05.STATUS_REJECTED,
+            objective=p05.OBJECTIVE_LOSS_REDUCTION,
+            candidate_config={"CONTEXT_RULE": rule or _ctx_rule()},
+            dataset_cutoff=(datetime.now(timezone.utc) - timedelta(days=30)
+                            if cutoff else None),
+            offline_metrics=offline,
+            decision={"reason_code": "OFFLINE_GATES_FAILED"},
+        )
+        exp.id = 501
+        return exp
+
+    async def test_contagem_usa_champion_congelado_e_sinaliza_drift(self):
+        frozen = p05.discover_champion_config()
+        current = dict(frozen)
+        current["SCORE_MIN"] = frozen["SCORE_MIN"] + 50
+        rows = [_mon_row(i, regime="ALT_DANGER",
+                         score=frozen["SCORE_MIN"] + 1) for i in range(100)]
+        out = await p05._readiness_for_experiment(
+            self._exp(champion=frozen), rows, current,
+            {"retention_at_risk": False}, window_days=120)
+        self.assertEqual(out["current_window"]["affected"], 100)
+        self.assertTrue(out["champion_drift"])
+        self.assertEqual(out["readiness"], p05.READINESS_UNKNOWN)
+
+    async def test_champion_congelado_ausente_ou_hash_divergente_bloqueia(self):
+        exp = self._exp(champion_hash="0" * 64)
+        out = await p05._readiness_for_experiment(
+            exp, [_mon_row(i) for i in range(100)],
+            p05.discover_champion_config(), {"retention_at_risk": False})
+        self.assertEqual(out["readiness"], p05.READINESS_NO_METADATA)
+        self.assertTrue(any("champion congelado" in b for b in out["blockers"]))
+
+    async def test_componentes_nao_sao_recomputados_quando_ausentes(self):
+        exp = self._exp(active=None)
+        out = await p05._readiness_for_experiment(
+            exp, [_mon_row(i) for i in range(100)],
+            p05.discover_champion_config(), {"retention_at_risk": False})
+        self.assertEqual(out["readiness"], p05.READINESS_NO_METADATA)
+        self.assertNotIn("current_window", out)
+        self.assertEqual(out["active_components_source"], "indisponível")
+
+    async def test_unknown_pct_usa_apenas_contexto_alvo(self):
+        rows = [_mon_row(i, regime="NORMAL") for i in range(98)]
+        rows += [_mon_row(98, regime="ALT_DANGER"),
+                 _mon_row(99, regime="ALT_DANGER", score=None)]
+        out = await p05._readiness_for_experiment(
+            self._exp(), rows, p05.discover_champion_config(),
+            {"retention_at_risk": False})
+        self.assertEqual(out["current_window"]["context_matched"], 2)
+        self.assertEqual(out["unknown_pct"], 50.0)
+
+    async def test_erro_de_retencao_nunca_libera_ready(self):
+        champ = p05.discover_champion_config()
+        rule = _ctx_rule(value="NORMAL", action="SCORE_DELTA")
+        rows = [_mon_row(i, regime="NORMAL", score=champ["SCORE_MIN"] - 1)
+                for i in range(120)]
+        out = await p05._readiness_for_experiment(
+            self._exp(rule=rule), rows, champ,
+            {"error": "retention unavailable", "retention_at_risk": False})
+        self.assertEqual(out["readiness"], p05.READINESS_NO_METADATA)
 
 
 class EtaTests(unittest.TestCase):
@@ -2449,6 +2545,7 @@ class ReadinessApiTests(unittest.TestCase):
         self.assertIn("except Exception", self.body)
         self.assertIn('"ok": False', self.body)
         self.assertIn("HOLDOUT_SEALED", self.body)
+        self.assertIn('(data.get("retention") or {}).get("error")', self.body)
 
     def test_status_expoe_resumo_pequeno(self):
         svc = (BACKEND / "services/strategy_evidence_service.py").read_text()
@@ -2456,6 +2553,11 @@ class ReadinessApiTests(unittest.TestCase):
         for field in ("readiness_by_status", "next_recommended_check",
                       "retention_warning", "holdout_status"):
             self.assertIn(field, block, f"campo ausente no status: {field}")
+
+    def test_status_usa_janela_minima_de_retencao(self):
+        svc = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        block = svc.split("async def get_p05_status")[1]
+        self.assertIn("max(P051R_TARGET_RETENTION_DAYS", block)
 
     def test_nenhum_endpoint_novo_de_acao(self):
         for proibido in ("readiness-evaluate", "readiness/run", "reevaluate"):
@@ -2500,6 +2602,19 @@ class ReadinessCacheTests(unittest.IsolatedAsyncioTestCase):
             await p05.get_readiness(days=120, limit=20)
         self.assertEqual(len(calls), 2)          # não cacheou o erro
 
+    async def test_erro_parcial_nao_envenena_cache(self):
+        calls = []
+
+        async def _fake(days, limit, experiment_id):
+            calls.append(1)
+            return {"phase": "P05.1R", "summary": {},
+                    "retention": {"error": "boom"}, "experiments": []}
+
+        with patch.object(p05, "_build_readiness", _fake):
+            await p05.get_readiness(days=120, limit=20)
+            await p05.get_readiness(days=120, limit=20)
+        self.assertEqual(len(calls), 2)
+
     async def test_clamp_na_chave(self):
         calls = []
 
@@ -2533,8 +2648,11 @@ class ReadinessArchitectureTests(unittest.TestCase):
     def test_reutiliza_nucleo(self):
         for reutilizado in ("discover_champion_config", "eligibility(",
                             "contextual_eligibility(", "context_value(",
-                            "validate_context_rule("):
+                            "validate_context_rule(", "_frozen_champion("):
             self.assertIn(reutilizado, self.block, f"não reutilizou: {reutilizado}")
+
+    def test_nunca_redescobre_componentes_de_experimento_antigo(self):
+        self.assertNotIn("contextual_active_components(", self.block)
 
     def test_sem_flag_nova(self):
         env = p05.env_snapshot()
