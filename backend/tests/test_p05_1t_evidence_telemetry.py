@@ -428,7 +428,17 @@ class FinalizationTests(unittest.TestCase):
         """Fail-soft: setup inválido não pode quebrar a resolução."""
         snap = _snap(entry=None)
         ss._finalize_path(snap, status=ss.PATH_FINAL_PARTIAL, reason="x", now=T0)
-        self.assertEqual(snap.features, {})          # nada escrito, nada explodiu
+        self.assertEqual(snap.features["p05_path"]["status"], "UNAVAILABLE")
+        self.assertIn("entry", snap.features["p05_path"]["unavailable_reason"])
+
+    def test_namespace_nasce_antes_do_primeiro_candle(self):
+        snap = _snap()
+        ss._initialize_path(snap, now=T0)
+        path = snap.features["p05_path"]
+        self.assertEqual(path["status"], "WAITING_FOR_FIRST_CANDLE")
+        self.assertEqual(path["observed_candles"], 0)
+        self.assertIsNone(path["mae_r"])
+        self.assertIsNone(path["mfe_r"])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -529,12 +539,15 @@ def _ctx_row(i, *, regime="NORMAL", zone="limit_ob"):
 class ContextCoverageTests(unittest.TestCase):
     def test_global_alto_com_treino_baixo_continua_collecting(self):
         """Metade ANTIGA sem feature: global passa de 80%, treino não."""
-        rows = [_ctx_row(i, regime=None, zone=None) for i in range(30)]      # treino velho
-        rows += [_ctx_row(100 + i) for i in range(70)]                        # recente ok
+        # 120 linhas: treino (60) tem 42 presentes = 70%; as demais 60 têm
+        # 100%, então a janela global chega a 85% sem poder liberar o treino.
+        rows = [_ctx_row(i, regime="NORMAL" if i < 42 else None,
+                         zone="limit_ob" if i < 42 else None) for i in range(60)]
+        rows += [_ctx_row(100 + i) for i in range(60)]
         out = p05.summarize_context_coverage(rows)
         axis = out["axes"]["regime"]
-        self.assertGreaterEqual(axis["coverage_global_pct"], 60.0)
-        self.assertLess(axis["coverage_train_pct"], 80.0)
+        self.assertEqual(axis["coverage_global_pct"], 85.0)
+        self.assertEqual(axis["coverage_train_pct"], 70.0)
         self.assertEqual(axis["status"], "COLLECTING")
 
     def test_treino_completo_fica_usable(self):
@@ -577,6 +590,45 @@ class ContextCoverageTests(unittest.TestCase):
     def test_global_nao_substitui_treino(self):
         out = p05.summarize_context_coverage([_ctx_row(i) for i in range(100)])
         self.assertIn("não a substitui", out["note"])
+
+
+class TelemetrySectionSealedSourceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cobertura_usa_loader_selado_e_janela_120(self):
+        sealed_rows = [_ctx_row(i) for i in range(120)]
+        calls = []
+
+        async def _sealed_loader(days):
+            calls.append(days)
+            return sealed_rows
+
+        async def _real(_days):
+            return [], {}
+
+        async def _gates(_days):
+            return {"items": [], "by_phase": {}}
+
+        async def _retention(rows):
+            self.assertIs(rows, sealed_rows)
+            return {"observed_retention_days": 120}
+
+        with patch.object(p05, "_load_readiness_rows", _sealed_loader), \
+             patch.object(p05, "_load_real", _real), \
+             patch.object(p05, "_load_gate_events", _gates), \
+             patch.object(p05, "_retention_snapshot", _retention):
+            out = await p05.build_telemetry_section(days=30)
+
+        self.assertEqual(calls, [120])
+        coverage = out["context_coverage"]
+        self.assertEqual(coverage["window_days"], 120)
+        self.assertEqual(coverage["source"], "P05.1R_SEALED_ROWS_WITHOUT_OUTCOME")
+        self.assertEqual(coverage["axes"]["regime"]["coverage_train_pct"], 100.0)
+
+    def test_build_nao_recebe_outcomes_normalizados(self):
+        import inspect
+        signature = inspect.signature(p05.build_telemetry_section)
+        self.assertNotIn("shadow_rows", signature.parameters)
+        source = inspect.getsource(p05.build_telemetry_section)
+        self.assertIn("_load_readiness_rows(P051T_CONTEXT_WINDOW_DAYS)", source)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -681,8 +733,12 @@ class RetentionIsolationTests(unittest.TestCase):
         wide_block = src.split("async def check_wide_snapshots")[1]
         self.assertIn("path_trace=_path", open_block)
         self.assertIn("merge_p05_path", open_block)
+        normal_save = src.split("async def save_recommendations")[1].split(
+            "async def save_wide_display_snapshots")[0]
+        self.assertIn("_initialize_path(snap, now=now)", normal_save)
         self.assertNotIn("path_trace", wide_block)
         self.assertNotIn("merge_p05_path", wide_block)
+        self.assertNotIn("_initialize_path", wide_block)
 
     def test_poda_continua_exclusiva_de_wide(self):
         src = (BACKEND / "services/snapshot_service.py").read_text()

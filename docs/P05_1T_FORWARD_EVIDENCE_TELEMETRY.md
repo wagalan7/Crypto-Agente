@@ -169,6 +169,10 @@ Reutiliza **exatamente** a ordenação cronológica, o `temporal_split` e o
 pela cobertura de **TREINO**: a global nunca a substitui (é exatamente por isso
 que a janela de 90d não gerava candidatos mesmo com 86% global).
 
+Usa sempre a janela operacional de **120 dias** do P05.1R e o loader selado de
+colunas explícitas. Assim o seletor de 30/60 dias do painel não contradiz o
+readiness e a cobertura não fica condicionada ao outcome.
+
 **Não lê `realized_r` e não abre holdout** — só conta presença de feature.
 
 ## Slippage e latência

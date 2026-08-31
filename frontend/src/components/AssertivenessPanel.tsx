@@ -148,6 +148,7 @@ interface AxisCoverage {
 interface TelemetryBlock {
   context_coverage?: {
     min_required_pct?: number
+    window_days?: number
     axes?: Record<string, AxisCoverage>
   }
   slippage?: {
@@ -749,7 +750,7 @@ export default function AssertivenessPanel({ onClose }: Props) {
                                 {AXIS_LABEL[axis] ?? axis}
                               </span>
                               <span className="text-[10px] text-slate-400">
-                                histórico usado no aprendizado:{' '}
+                                treino da janela de {p05.telemetry?.context_coverage?.window_days ?? 120} dias:{' '}
                                 <span className="font-mono text-slate-200">{fmtPct(a.coverage_train_pct)}</span>
                                 {' '}de {min}%
                               </span>

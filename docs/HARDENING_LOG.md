@@ -817,3 +817,17 @@ gates — e **zero efeito sobre a estratégia**.
   contabilizados. `shadow_trade_service`, `trade_manager_service` e signed services
   INTACTOS. P05.2 não implementado; `P05_CHALLENGER_SHADOW_ENABLED` continua
   `false`; champion LIVE, score, tier, gates, stop, TP e sizing inalterados.
+
+### Fechamento da auditoria P05.1T
+
+- `p05_path` passa a nascer junto do snapshot normal, antes do primeiro candle;
+  setup incompatível recebe schema completo `UNAVAILABLE` com motivo, sem ser
+  confundido com histórico anterior à telemetria.
+- A cobertura contextual deixou de usar outcomes normalizados e a janela móvel
+  do painel. Agora usa exclusivamente `_load_readiness_rows(120)`, sem
+  `realized_r`, em paridade com o P05.1R; retenção reutiliza a mesma leitura.
+- A regressão reproduz a condição real: cobertura global 85% e treino 70%
+  continuam `COLLECTING`; a UI explicita a janela operacional de 120 dias.
+- Validação final no Python 3.11 real: **81 testes específicos P05.1T**, **400
+  testes P05 verdes 2×** e **suíte crítica P01–P05 (643) verde 2×**;
+  `py_compile`, `tsc --noEmit` e `git diff --check` aprovados.

@@ -406,6 +406,73 @@ def new_path_trace(snap) -> dict | None:
     }
 
 
+def _path_unavailable_reason(snap) -> str:
+    """Motivo estável quando o setup não permite calcular excursão."""
+    entry = _pt_finite(getattr(snap, "entry", None))
+    stop = _pt_finite(getattr(snap, "stop_loss", None))
+    direction = getattr(snap, "direction", None)
+    if entry is None or entry <= 0:
+        return "entry ausente, não finita ou não positiva"
+    if stop is None or stop <= 0:
+        return "stop_loss ausente, não finito ou não positivo"
+    if abs(entry - stop) <= 0:
+        return "risk_unit zero"
+    if direction not in ("long", "short"):
+        return "direction fora de {long, short}"
+    return "setup incompatível com a telemetria"
+
+
+def _merge_unavailable_path(features, *, reason: str, now: datetime,
+                            finalize: bool = True) -> dict:
+    """Grava o schema completo mesmo quando não é possível criar um trace.
+
+    Se já existe observação válida, preserva-a e apenas marca a finalização como
+    parcial. Assim um campo corrompido posterior nunca apaga evidência anterior.
+    """
+    out = dict(features) if isinstance(features, dict) else {}
+    prev = dict(out.get("p05_path") or {}) if isinstance(out.get("p05_path"), dict) else {}
+    observed = int(prev.get("observed_candles") or 0)
+    if observed > 0:
+        prev["status"] = PATH_FINAL_PARTIAL if finalize else prev.get("status", PATH_COLLECTING)
+        prev["last_updated_at"] = now.isoformat()
+        prev["finalized_at"] = prev.get("finalized_at") or (now.isoformat() if finalize else None)
+        prev["unavailable_reason"] = reason
+        out["p05_path"] = prev
+        return out
+    out["p05_path"] = {
+        "schema_version": P05_PATH_SCHEMA_VERSION,
+        "source": P05_PATH_SOURCE,
+        "resolution": P05_PATH_RESOLUTION,
+        "status": PATH_UNAVAILABLE,
+        "mfe_r": None,
+        "mae_r": None,
+        "best_price": None,
+        "worst_price": None,
+        "risk_unit": None,
+        "observed_candles": 0,
+        "first_candle_ts_ms": None,
+        "last_candle_ts_ms": None,
+        "last_updated_at": now.isoformat(),
+        "finalized_at": now.isoformat() if finalize else None,
+        "unavailable_reason": reason,
+        "limitations": P05_PATH_LIMITATIONS,
+    }
+    return out
+
+
+def _initialize_path(snap, *, now: datetime) -> None:
+    """Inicializa prospectivamente só snapshots normais, antes do primeiro check."""
+    try:
+        trace = new_path_trace(snap)
+        if trace is None:
+            snap.features = _merge_unavailable_path(
+                snap.features, reason=_path_unavailable_reason(snap), now=now)
+            return
+        snap.features = merge_p05_path(snap.features, trace, now=now)
+    except Exception as exc:
+        log.debug(f"[p05.1t] init falhou snapshot={getattr(snap, 'id', '?')}: {exc}")
+
+
 def path_observe_candle(trace: dict, ts_ms, high, low) -> bool:
     """Observa UM candle. Retorna True se contou.
 
@@ -515,6 +582,12 @@ def _finalize_path(snap, *, status: str, reason: str, now: datetime) -> None:
     try:
         trace = new_path_trace(snap)
         if trace is None:
+            snap.features = _merge_unavailable_path(
+                snap.features,
+                reason=f"{reason}; {_path_unavailable_reason(snap)}",
+                now=now,
+                finalize=True,
+            )
             return
         observed = int(trace.get("observed_candles") or 0)
         final = status if observed > 0 else PATH_UNAVAILABLE
@@ -800,6 +873,9 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                     created_at=now,
                     features=_features,
                 )
+                # P05.1T: namespace nasce junto do snapshot normal. Wide não
+                # passa por este caminho e continua totalmente isolado.
+                _initialize_path(snap, now=now)
                 session.add(snap)
                 rec["_just_saved"] = True
                 inserted += 1

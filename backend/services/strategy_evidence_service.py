@@ -1806,6 +1806,7 @@ _FEATURE_NAMES = ("edge_score", "mtf_aligned", "chase_atr", "struct_chase_atr",
 # ════════════════════════════════════════════════════════════════════════════
 P051T_MIN_OBSERVED = 30
 P051T_MIN_COVERAGE_PCT = 80.0
+P051T_CONTEXT_WINDOW_DAYS = 120
 
 TELEMETRY_UNAVAILABLE = "UNAVAILABLE"
 TELEMETRY_COLLECTING = "COLLECTING"
@@ -2021,8 +2022,7 @@ def summarize_gate_availability(gate_events: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-async def build_telemetry_section(shadow_rows: Sequence[Dict[str, Any]],
-                                  days: int) -> Dict[str, Any]:
+async def build_telemetry_section(days: int) -> Dict[str, Any]:
     """Seção compacta de telemetria. Fail-soft por subseção; somente observação."""
     out: Dict[str, Any] = {
         "phase": "P05.1T",
@@ -2030,10 +2030,20 @@ async def build_telemetry_section(shadow_rows: Sequence[Dict[str, Any]],
         "affects_strategy": False,
         "note": "telemetria é subordinada: nunca decide, nunca altera execução",
     }
+    # Cobertura/contexto e retenção usam o MESMO loader selado do P05.1R:
+    # colunas explícitas, sem realized_r, e janela fixa de 120 dias. Usar os
+    # outcomes normalizados do diagnóstico (ou os 30 dias selecionados na UI)
+    # produziria cobertura condicionada ao resultado e divergente do readiness.
+    readiness_rows: Optional[List[Dict[str, Any]]] = None
     try:
-        out["context_coverage"] = summarize_context_coverage(shadow_rows)
+        readiness_rows = await _load_readiness_rows(P051T_CONTEXT_WINDOW_DAYS)
+        coverage = summarize_context_coverage(readiness_rows)
+        coverage["window_days"] = P051T_CONTEXT_WINDOW_DAYS
+        coverage["source"] = "P05.1R_SEALED_ROWS_WITHOUT_OUTCOME"
+        out["context_coverage"] = coverage
     except Exception as exc:
-        out["context_coverage"] = {"error": str(exc)}
+        out["context_coverage"] = {"error": str(exc),
+                                   "window_days": P051T_CONTEXT_WINDOW_DAYS}
     try:
         real_rows, _dq = await _load_real(days)
         out["slippage"] = summarize_slippage(real_rows)
@@ -2046,8 +2056,9 @@ async def build_telemetry_section(shadow_rows: Sequence[Dict[str, Any]],
     except Exception as exc:
         out["gate_availability"] = {"error": str(exc)}
     try:
-        rows = await _load_readiness_rows(days)
-        out["retention"] = await _retention_snapshot(rows)
+        if readiness_rows is None:
+            readiness_rows = await _load_readiness_rows(P051T_CONTEXT_WINDOW_DAYS)
+        out["retention"] = await _retention_snapshot(readiness_rows)
     except Exception as exc:
         out["retention"] = {"error": str(exc)}
     return out
@@ -2104,7 +2115,7 @@ async def build_diagnosis(days: int = 30) -> Dict[str, Any]:
         log.warning(f"[p05.1t] telemetria MAE/MFE falhou: {exc}")
         out["mae_mfe"] = {"status": "UNAVAILABLE", "error": str(exc)}
     try:
-        out["telemetry"] = await build_telemetry_section(shadow_rows, days)
+        out["telemetry"] = await build_telemetry_section(days)
     except Exception as exc:
         log.warning(f"[p05.1t] seção de telemetria falhou: {exc}")
         out["telemetry"] = {"error": str(exc)}
