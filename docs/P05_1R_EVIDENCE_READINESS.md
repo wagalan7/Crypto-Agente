@@ -152,7 +152,8 @@ Valores: `WAITING_FOR_DATA` · `READY_FOR_REEVALUATION` · `REFUTED_LAST_RUN` ·
 `MIXED_EVIDENCE` · `RETENTION_AT_RISK` · `INSUFFICIENT_METADATA` · `UNKNOWN`.
 
 `READY_FOR_REEVALUATION` exige **todos**: última falha = `SAMPLE_LIMITED` ·
-cobertura do contexto ≥ `P05_MIN_FEATURE_COVERAGE_PCT` ·
+cobertura do contexto **na metade cronológica de treino** ≥
+`P05_MIN_FEATURE_COVERAGE_PCT` (mesmo corte usado pela geração P05.1) ·
 `prospective_validation_affected` ≥ 20 · `prospective_test_affected` ≥ 20 ·
 `prospective_candidate_oos_count` ≥ `P05_MIN_OOS_RESOLVED` · `UNKNOWN` não
 compromete a cobertura · retenção suficiente.

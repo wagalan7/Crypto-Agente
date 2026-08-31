@@ -2091,6 +2091,7 @@ class ReadinessCoreTests(unittest.TestCase):
         self.assertEqual(p["prospective_train_affected"], 50)
         self.assertEqual(p["prospective_validation_affected"], 25)
         self.assertEqual(p["prospective_test_affected"], 25)
+        self.assertEqual(p["prospective_train_context_coverage_pct"], 100.0)
 
 
 class HoldoutSealedTests(unittest.TestCase):
@@ -2416,6 +2417,34 @@ class FrozenReadinessContractTests(unittest.IsolatedAsyncioTestCase):
             self._exp(rule=rule), rows, champ,
             {"error": "retention unavailable", "retention_at_risk": False})
         self.assertEqual(out["readiness"], p05.READINESS_NO_METADATA)
+
+    async def test_cobertura_global_nao_compensa_treino_incompleto(self):
+        """Reproduz produção: janela global ≥80%, mas metade de treino <80%.
+
+        O endpoint de reavaliação gera candidatos no treino; logo o monitor não
+        pode anunciar READY com uma cobertura que o próprio avaliador rejeitará.
+        """
+        champ = p05.discover_champion_config()
+        rule = _ctx_rule(value="NORMAL", action="SCORE_DELTA")
+        rows = []
+        # Treino prospectivo (60): 42/60 = 70% de cobertura.
+        for i in range(60):
+            rows.append(_mon_row(
+                i, regime="NORMAL" if i < 42 else None,
+                score=champ["SCORE_MIN"] - 1))
+        # Validação/teste (60): cobertura e amostras suficientes.
+        rows += [_mon_row(i, regime="NORMAL", score=champ["SCORE_MIN"] - 1)
+                 for i in range(60, 120)]
+
+        out = await p05._readiness_for_experiment(
+            self._exp(rule=rule), rows, champ,
+            {"retention_at_risk": False}, window_days=120)
+
+        self.assertEqual(out["current_window"]["context_coverage_pct"], 85.0)
+        self.assertEqual(
+            out["prospective"]["prospective_train_context_coverage_pct"], 70.0)
+        self.assertEqual(out["readiness"], p05.READINESS_WAITING)
+        self.assertTrue(any("treino" in b for b in out["blockers"]))
 
 
 class EtaTests(unittest.TestCase):

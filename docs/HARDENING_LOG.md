@@ -736,3 +736,19 @@ selado e zero alteração no LIVE.
 - **318 testes P05 verdes 2×**; **561 testes críticos P01–P05 verdes**;
   `py_compile` e `git diff --check` aprovados. Holdout permaneceu selado, zero
   escrita no banco, zero rede/exchange e nenhuma alteração de estratégia LIVE.
+
+### Paridade de cobertura treino/readiness (2026-08-31)
+
+- Uma reavaliação real com 5.638 snapshots expôs que a cobertura global podia
+  superar 80% enquanto a metade cronológica de treino ainda tinha apenas 69,3%
+  (`regime`) / 70,7% (`entry_zone_type`). O monitor anunciava READY, mas o
+  gerador corretamente recusava com `AXIS_COVERAGE_TOO_LOW`.
+- `project_prospective` agora publica
+  `prospective_train_context_coverage_pct`, e o readiness usa exatamente esse
+  valor para o gate de 80%, em paridade com `temporal_split` e
+  `generate_contextual_candidates`. Cobertura global continua visível apenas
+  como diagnóstico e nunca libera reavaliação.
+- Auditoria agregada e somente leitura no PostgreSQL confirmou causa histórica:
+  ambos os campos estão em **100% dos snapshots semanais desde 2026-06-29**.
+  Nenhum backfill foi feito, nenhum dado antigo foi inventado e a persistência
+  atual não precisou de alteração.

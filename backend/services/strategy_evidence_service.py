@@ -3067,6 +3067,11 @@ def project_prospective(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any]
         "prospective_validation_affected": _affected(validation),
         "prospective_test_affected": _affected(test),
         "prospective_candidate_oos_count": oos,
+        # O avaliador P05.1 gera candidatos exclusivamente no treino. Medir a
+        # cobertura na janela global pode anunciar READY para uma hipótese que
+        # será imediatamente rejeitada por AXIS_COVERAGE_TOO_LOW.
+        "prospective_train_context_coverage_pct": axis_coverage(
+            train, rule.get("axis")),
         "split_counts": {"train": len(train), "validation": len(validation), "test": len(test)},
         "note": "somente contagem de linhas; nenhum outcome do holdout foi lido",
     }
@@ -3241,7 +3246,9 @@ def _readiness_verdict(*, classification: str, coverage_pct: Optional[float],
 
     # A partir daqui: SAMPLE_LIMITED
     if coverage_pct is None or coverage_pct < P05_MIN_FEATURE_COVERAGE_PCT:
-        blockers.append(f"cobertura do contexto {coverage_pct}% < {P05_MIN_FEATURE_COVERAGE_PCT}%")
+        blockers.append(
+            f"cobertura do contexto no treino {coverage_pct}% "
+            f"< {P05_MIN_FEATURE_COVERAGE_PCT}%")
     if unknown_pct is not None and unknown_pct > P051R_MAX_UNKNOWN_PCT:
         blockers.append(f"UNKNOWN {unknown_pct}% compromete a cobertura")
     if (prospective.get("prospective_validation_affected") or 0) < P051_MIN_AFFECTED:
@@ -3344,7 +3351,9 @@ async def _readiness_for_experiment(exp: Any, rows: Sequence[Dict[str, Any]],
                    if context_matched else None)
     verdict = _readiness_verdict(
         classification=failure["classification"],
-        coverage_pct=current["context_coverage_pct"],
+        # Paridade com o avaliador contextual: geração e seleção começam na
+        # metade cronológica de TREINO, não na janela global.
+        coverage_pct=prospective["prospective_train_context_coverage_pct"],
         prospective=prospective,
         unknown_pct=unknown_pct,
         retention_at_risk=bool(retention.get("retention_at_risk")),
