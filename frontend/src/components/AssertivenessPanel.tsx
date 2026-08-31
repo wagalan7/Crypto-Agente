@@ -112,6 +112,60 @@ interface P05Block {
   }
   shadow_experiment?: P05Experiment | null
   eligible_experiment?: P05Experiment | null
+  mae_mfe?: MaeMfeBlock
+  telemetry?: TelemetryBlock
+}
+
+// ── P05.1T: telemetria prospectiva (observação pura) ───────────────────────
+interface Dist {
+  mean?: number | null
+  median?: number | null
+  p75?: number | null
+  p90?: number | null
+  count?: number
+}
+
+interface MaeMfeBlock {
+  status?: string
+  observed?: number
+  eligible_resolved?: number
+  coverage_pct?: number | null
+  missing?: number
+  min_observed?: number
+  min_coverage_pct?: number
+  mae_r?: Dist
+  mfe_r?: Dist
+}
+
+interface AxisCoverage {
+  coverage_global_pct?: number | null
+  coverage_train_pct?: number | null
+  present?: number
+  missing?: number
+  status?: string
+}
+
+interface TelemetryBlock {
+  context_coverage?: {
+    min_required_pct?: number
+    axes?: Record<string, AxisCoverage>
+  }
+  slippage?: {
+    total_real_closed?: number
+    slippage_valid?: number
+    coverage_pct?: number | null
+    mean?: number | null
+    median?: number | null
+    p90?: number | null
+  }
+  latency?: { status?: string; reason?: string }
+  retention?: { observed_retention_days?: number | null; history_note?: string }
+}
+
+const TELEMETRY_LABEL: Record<string, string> = {
+  UNAVAILABLE: 'sem dados ainda',
+  COLLECTING: 'coletando',
+  USABLE: 'utilizável',
 }
 
 // ── P05.1R: prontidão para NOVA AVALIAÇÃO (somente leitura) ────────────────
@@ -669,6 +723,95 @@ export default function AssertivenessPanel({ onClose }: Props) {
                   <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
                     São contagens de <strong className="text-slate-400">eventos</strong> de bloqueio, não de oportunidades únicas —
                     e um bloqueio não significa dinheiro deixado na mesa: não dá pra saber o resultado de algo que não aconteceu.
+                  </p>
+                </section>
+              )}
+
+              {/* ── P05.1T Qualidade da telemetria (somente observação) ──── */}
+              {p05?.enabled && (p05.telemetry || p05.mae_mfe) && (
+                <section>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Gauge className="w-4 h-4 text-cyan-400" />
+                    <h3 className="text-sm font-bold text-cyan-300">Qualidade da telemetria</h3>
+                    <span className="text-[10px] text-slate-500">· o que já dá pra medir</span>
+                  </div>
+
+                  {/* Cobertura dos contextos — o que decide é o TREINO */}
+                  {p05.telemetry?.context_coverage?.axes && (
+                    <div className="flex flex-col gap-1.5 mb-2">
+                      {Object.entries(p05.telemetry.context_coverage.axes).map(([axis, a]) => {
+                        const train = a.coverage_train_pct ?? 0
+                        const min = p05.telemetry?.context_coverage?.min_required_pct ?? 80
+                        return (
+                          <div key={axis} className="p-2 rounded-lg border border-slate-800 bg-slate-900/40">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="text-xs font-bold text-slate-200">
+                                {AXIS_LABEL[axis] ?? axis}
+                              </span>
+                              <span className="text-[10px] text-slate-400">
+                                histórico usado no aprendizado:{' '}
+                                <span className="font-mono text-slate-200">{fmtPct(a.coverage_train_pct)}</span>
+                                {' '}de {min}%
+                              </span>
+                              <span className={`ml-auto text-[10px] font-bold ${
+                                a.status === 'USABLE' ? 'text-emerald-300' : 'text-yellow-300'}`}>
+                                {TELEMETRY_LABEL[a.status ?? ''] ?? a.status}
+                              </span>
+                            </div>
+                            <div className="mt-1 h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                              <div className={`h-full ${train >= min ? 'bg-emerald-500/60' : 'bg-yellow-500/60'}`}
+                                style={{ width: `${Math.min(100, (train / min) * 100)}%` }} />
+                            </div>
+                            <div className="mt-0.5 text-[9px] text-slate-500">
+                              geral {fmtPct(a.coverage_global_pct)} · {a.present ?? 0} com dado · {a.missing ?? 0} sem
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <StatCard
+                      label="Excursão (MAE/MFE)"
+                      value={TELEMETRY_LABEL[p05.mae_mfe?.status ?? ''] ?? '–'}
+                      valueCls={p05.mae_mfe?.status === 'USABLE' ? 'text-emerald-300' : 'text-yellow-300'}
+                      sub={`${p05.mae_mfe?.observed ?? 0} de ${p05.mae_mfe?.min_observed ?? 30} mín`} />
+                    <StatCard
+                      label="Cobertura MAE/MFE"
+                      value={fmtPct(p05.mae_mfe?.coverage_pct)}
+                      sub={`${p05.mae_mfe?.missing ?? 0} sem registro`} />
+                    <StatCard
+                      label="Deslize de preço"
+                      value={p05.telemetry?.slippage?.mean !== null && p05.telemetry?.slippage?.mean !== undefined
+                        ? `${p05.telemetry.slippage.mean.toFixed(3)}%` : '–'}
+                      sub={`cobertura ${fmtPct(p05.telemetry?.slippage?.coverage_pct)}`} />
+                    <StatCard
+                      label="Histórico guardado"
+                      value={`${p05.telemetry?.retention?.observed_retention_days ?? '–'} d`}
+                      sub="evidência preservada" />
+                  </div>
+
+                  {p05.mae_mfe?.status === 'USABLE' && (
+                    <div className="mt-1.5 p-2 rounded-lg border border-slate-800 bg-slate-900/40 text-[10px] text-slate-400 leading-snug">
+                      Quanto o preço costuma andar contra antes de dar certo (mediana):{' '}
+                      <span className="font-mono text-red-300">{p05.mae_mfe.mae_r?.median ?? '–'}R</span>
+                      {' '}· e a favor:{' '}
+                      <span className="font-mono text-emerald-300">{p05.mae_mfe.mfe_r?.median ?? '–'}R</span>
+                    </div>
+                  )}
+
+                  {p05.telemetry?.latency?.status === 'UNAVAILABLE' && (
+                    <div className="mt-1.5 text-[10px] text-slate-500 leading-snug px-1">
+                      Tempo de execução: <strong className="text-slate-400">não medido</strong> — não há
+                      marcação de horário confiável do pedido até a confirmação da corretora.
+                    </div>
+                  )}
+
+                  <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
+                    Medido em <strong className="text-slate-400">velas de 5 minutos</strong> do setup observado, não
+                    da operação real — a ordem dos preços dentro da vela é desconhecida. Serve só para
+                    acompanhar a qualidade dos dados; não é sugestão de mudança.
                   </p>
                 </section>
               )}

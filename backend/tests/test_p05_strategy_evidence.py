@@ -1084,9 +1084,17 @@ class ArchitectureTests(unittest.TestCase):
         self.assertIn("await p05.get_cached_diagnosis(days)", assertion)
         self.assertIn('"P05_DIAG_CACHE_TTL_S"', self.src)
 
-    def test_mae_mfe_declarado_indisponivel(self):
-        self.assertIn('"status": "UNAVAILABLE"', self.src)
-        self.assertIn("criaria afirmação falsa", self.src)
+    def test_mae_mfe_vem_de_telemetria_prospectiva(self):
+        """P05.1T substituiu o bloco estático: MAE/MFE agora vem de
+        `features['p05_path']`, nunca de reconstrução histórica."""
+        self.assertIn("summarize_path_telemetry", self.src)
+        self.assertIn('"p05_path"', self.src)
+        self.assertIn("SHADOW_SETUP_PATH_5M", self.src)
+        # Sem observação, continua UNAVAILABLE — não vira zero.
+        self.assertIn("TELEMETRY_UNAVAILABLE", self.src)
+        empty = p05.summarize_path_telemetry([])
+        self.assertEqual(empty["status"], "UNAVAILABLE")
+        self.assertIsNone(empty["mae_r"]["mean"])
 
 
 # ════════════════════════════════════════════════════════════════════════════

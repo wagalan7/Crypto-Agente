@@ -318,6 +318,212 @@ def _annotate_p05_features(features: Dict[str, Any], rec: Dict[str, Any],
         return features
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  P05.1T — telemetria PROSPECTIVA do caminho do setup (observação pura)
+#
+#  Acumula MAE/MFE do SETUP SHADOW a partir dos candles de 5m que o resolver JÁ
+#  busca. Não faz chamada nova à exchange, não altera outcome, não decide nada.
+#  Falha de telemetria NUNCA chega ao caminho principal (tudo fail-soft).
+# ════════════════════════════════════════════════════════════════════════════
+import math as _math
+
+P05_PATH_SCHEMA_VERSION = 1
+P05_PATH_SOURCE = "resolver_5m_ohlcv"
+P05_PATH_RESOLUTION = "5m"
+
+PATH_WAITING = "WAITING_FOR_FIRST_CANDLE"
+PATH_COLLECTING = "COLLECTING"
+PATH_FINAL_OBSERVED = "FINAL_OBSERVED"
+PATH_FINAL_PARTIAL = "FINAL_PARTIAL"
+PATH_UNAVAILABLE = "UNAVAILABLE"
+
+P05_PATH_LIMITATIONS = [
+    "MAE/MFE do caminho do SETUP SHADOW — não é execução real",
+    "fonte é OHLCV de 5 minutos; não é trajetória tick a tick",
+    "ordem intravela é desconhecida (high/low sem sequência)",
+    "não representa slippage nem a trajetória após o fill real",
+]
+
+
+def _pt_finite(value) -> float | None:
+    """float finito ou None. NaN/inf nunca passam."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if _math.isnan(f) or _math.isinf(f):
+        return None
+    return f
+
+
+def new_path_trace(snap) -> dict | None:
+    """Semente do trace a partir do que JÁ foi persistido em `p05_path`.
+
+    `None` quando o setup não permite cálculo — entry/stop não finitos ou não
+    positivos, `risk_unit` zero, ou direção fora de {long, short}. Ausência
+    NUNCA vira zero.
+    """
+    entry = _pt_finite(getattr(snap, "entry", None))
+    stop = _pt_finite(getattr(snap, "stop_loss", None))
+    # EXATAMENTE "long"/"short": o classificador compara `snap.direction == "long"`
+    # sem normalizar. Normalizar aqui criaria divergência (ele trataria "LONG "
+    # como short e a telemetria como long).
+    direction = getattr(snap, "direction", None)
+    if entry is None or stop is None or entry <= 0 or stop <= 0:
+        return None
+    if direction not in ("long", "short"):
+        return None
+    risk_unit = abs(entry - stop)
+    if not (risk_unit > 0):
+        return None
+
+    feats = snap.features if isinstance(snap.features, dict) else {}
+    prev = feats.get("p05_path")
+    prev = prev if isinstance(prev, dict) else {}
+    is_long = direction == "long"
+    best = _pt_finite(prev.get("best_price"))
+    worst = _pt_finite(prev.get("worst_price"))
+    created = getattr(snap, "created_at", None)
+    created_ms = None
+    if isinstance(created, datetime):
+        ref = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+        created_ms = int(ref.timestamp() * 1000)
+    return {
+        "status": prev.get("status") or PATH_WAITING,
+        "risk_unit": risk_unit,
+        # Acumuladores partem do entry (contrato: best/worst incluem o entry).
+        "best_price": best if best is not None else entry,
+        "worst_price": worst if worst is not None else entry,
+        "observed_candles": int(prev.get("observed_candles") or 0),
+        "first_candle_ts_ms": prev.get("first_candle_ts_ms"),
+        "last_candle_ts_ms": prev.get("last_candle_ts_ms"),
+        "finalized_at": prev.get("finalized_at"),
+        "unavailable_reason": prev.get("unavailable_reason"),
+        # privados (não serializados)
+        "_entry": entry, "_is_long": is_long, "_created_ts_ms": created_ms,
+    }
+
+
+def path_observe_candle(trace: dict, ts_ms, high, low) -> bool:
+    """Observa UM candle. Retorna True se contou.
+
+    Rejeita (sem apagar nada): timestamp ausente/repetido/retrocedido, candle
+    anterior ao `created_at` do snapshot, high/low não finitos, não positivos ou
+    com `high < low`.
+    """
+    if not isinstance(trace, dict):
+        return False
+    ts = _pt_finite(ts_ms)
+    h = _pt_finite(high)
+    l = _pt_finite(low)
+    if ts is None or h is None or l is None:
+        return False
+    if h <= 0 or l <= 0 or h < l:
+        return False
+    ts = int(ts)
+    created_ms = trace.get("_created_ts_ms")
+    if created_ms is not None and ts < int(created_ms):
+        return False                      # candle anterior ao setup
+    last = trace.get("last_candle_ts_ms")
+    if last is not None and ts <= int(last):
+        return False                      # dedupe + timestamps nunca retrocedem
+
+    if trace.get("_is_long"):
+        trace["best_price"] = max(trace["best_price"], h)
+        trace["worst_price"] = min(trace["worst_price"], l)
+    else:
+        trace["best_price"] = min(trace["best_price"], l)
+        trace["worst_price"] = max(trace["worst_price"], h)
+    trace["observed_candles"] = int(trace.get("observed_candles") or 0) + 1
+    if trace.get("first_candle_ts_ms") is None:
+        trace["first_candle_ts_ms"] = ts
+    trace["last_candle_ts_ms"] = ts
+    if trace.get("status") in (None, PATH_WAITING):
+        trace["status"] = PATH_COLLECTING
+    return True
+
+
+def merge_p05_path(features, trace: dict, *, status: str | None = None,
+                   reason: str | None = None, now: datetime | None = None,
+                   finalize: bool = False) -> dict:
+    """Reatribui um NOVO dict de `features` com `p05_path` atualizado.
+
+    Preserva TODAS as outras chaves (inclusive `p05_context`). Arredondamento
+    só aqui, na serialização — a acumulação usa precisão cheia. Telemetria
+    válida anterior nunca é apagada por uma passagem sem candles.
+    """
+    out = dict(features) if isinstance(features, dict) else {}
+    if not isinstance(trace, dict):
+        return out
+
+    entry = trace.get("_entry")
+    is_long = trace.get("_is_long")
+    risk = _pt_finite(trace.get("risk_unit"))
+    n = int(trace.get("observed_candles") or 0)
+    best = _pt_finite(trace.get("best_price"))
+    worst = _pt_finite(trace.get("worst_price"))
+
+    prev = out.get("p05_path")
+    prev_n = int((prev or {}).get("observed_candles") or 0) if isinstance(prev, dict) else 0
+    if n == 0 and prev_n > 0:
+        return out                        # não apaga telemetria válida anterior
+
+    mfe = mae = None
+    if n > 0 and risk and risk > 0 and entry is not None and best is not None and worst is not None:
+        if is_long:
+            mfe = max(0.0, (best - entry) / risk)
+            mae = max(0.0, (entry - worst) / risk)
+        else:
+            mfe = max(0.0, (entry - best) / risk)
+            mae = max(0.0, (worst - entry) / risk)
+        if not (_math.isfinite(mfe) and _math.isfinite(mae)):
+            mfe = mae = None
+
+    ts_now = now or datetime.now(timezone.utc)
+    final_status = status or trace.get("status") or PATH_WAITING
+    finalized_at = trace.get("finalized_at")
+    if finalize or final_status in (PATH_FINAL_OBSERVED, PATH_FINAL_PARTIAL, PATH_UNAVAILABLE):
+        finalized_at = finalized_at or ts_now.isoformat()
+
+    out["p05_path"] = {
+        "schema_version": P05_PATH_SCHEMA_VERSION,
+        "source": P05_PATH_SOURCE,
+        "resolution": P05_PATH_RESOLUTION,
+        "status": final_status,
+        # Sem candle observado, MAE/MFE permanecem NULL — nunca zero observado.
+        "mfe_r": round(mfe, 4) if mfe is not None else None,
+        "mae_r": round(mae, 4) if mae is not None else None,
+        "best_price": round(best, 10) if (n > 0 and best is not None) else None,
+        "worst_price": round(worst, 10) if (n > 0 and worst is not None) else None,
+        "risk_unit": round(risk, 10) if risk is not None else None,
+        "observed_candles": n,
+        "first_candle_ts_ms": trace.get("first_candle_ts_ms"),
+        "last_candle_ts_ms": trace.get("last_candle_ts_ms"),
+        "last_updated_at": ts_now.isoformat(),
+        "finalized_at": finalized_at,
+        "unavailable_reason": reason or trace.get("unavailable_reason"),
+        "limitations": P05_PATH_LIMITATIONS,
+    }
+    return out
+
+
+def _finalize_path(snap, *, status: str, reason: str, now: datetime) -> None:
+    """Fecha a telemetria de um snapshot que resolveu SEM janela confiável de
+    candles (time-stop, teto, símbolo sem dados). Totalmente fail-soft."""
+    try:
+        trace = new_path_trace(snap)
+        if trace is None:
+            return
+        observed = int(trace.get("observed_candles") or 0)
+        final = status if observed > 0 else PATH_UNAVAILABLE
+        snap.features = merge_p05_path(snap.features, trace, status=final,
+                                       reason=reason, now=now, finalize=True)
+    except Exception as exc:                      # telemetria nunca interrompe
+        log.debug(f"[p05.1t] finalize falhou snapshot={getattr(snap, 'id', '?')}: {exc}")
+
+
 async def _current_regime_label() -> str | None:
     """Rótulo do regime de mercado AGORA (fail-soft, cache de 10min no service).
     Chamado 1x por batch de save — não por rec. None se indisponível."""
@@ -916,7 +1122,8 @@ def _atr_abs(snap: RecommendationSnapshot) -> Optional[float]:
         return None
 
 
-def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Optional[tuple]:
+def _classify_outcome_candles(snap: RecommendationSnapshot, df_window,
+                              path_trace: Optional[dict] = None) -> Optional[tuple]:
     """
     Steps 2a+2b v2: processa candles em ordem cronológica.
 
@@ -956,6 +1163,16 @@ def _classify_outcome_candles(snap: RecommendationSnapshot, df_window) -> Option
         h = float(c["high"])
         l = float(c["low"])
         cl = float(c["close"])
+
+        # P05.1T — telemetria observa ANTES de qualquer decisão: o candle
+        # TERMINAL entra no MAE/MFE e os POSTERIORES não (a função retorna e o
+        # loop encerra). `path_trace=None` reproduz exatamente o comportamento
+        # anterior; qualquer erro aqui é engolido e não altera o outcome.
+        if path_trace is not None:
+            try:
+                path_observe_candle(path_trace, c.get("timestamp"), h, l)
+            except Exception:
+                pass
 
         # Atualiza peak se TP1 já foi (passado ou agora)
         if tp1_already or tp1_hit_now:
@@ -1134,6 +1351,9 @@ async def check_open_snapshots() -> int:
                     snap.realized_r = 0.0
                     snap.outcome_at = now
                     snap.last_check_at = now  # time-stop REAL é outcome avaliado
+                    _finalize_path(snap, status=PATH_FINAL_PARTIAL,
+                                   reason="time-stop sem janela final de candles",
+                                   now=now)
                     log.info(
                         f"[time-stop] {snap.symbol} {snap.timeframe} {snap.direction} "
                         f"expirado: {age.total_seconds()/3600:.1f}h sem TP1 "
@@ -1163,6 +1383,9 @@ async def check_open_snapshots() -> int:
                         # Não notifica expired sem TP1 (não aconteceu nada).
                     snap.outcome_at = now
                     snap.last_check_at = now  # teto absoluto REAL é outcome avaliado
+                    _finalize_path(snap, status=PATH_FINAL_PARTIAL,
+                                   reason="teto de expiração sem janela final de candles",
+                                   now=now)
                     resolved += 1
                     continue
 
@@ -1208,6 +1431,9 @@ async def check_open_snapshots() -> int:
                         snap.realized_r = 0.0
                         snap.outcome_at = now
                         snap.last_check_at = now
+                        _finalize_path(snap, status=PATH_FINAL_PARTIAL,
+                                       reason="símbolo sem dados na fonte (delistado)",
+                                       now=now)
                         log.warning(
                             f"[no-data] {snap.symbol} {snap.timeframe} {snap.direction} "
                             f"encerrado expired: NÃO é perp TRADING na Binance "
@@ -1221,7 +1447,16 @@ async def check_open_snapshots() -> int:
                 if df_window.empty:
                     df_window = df.tail(1)
 
-                outcome = _classify_outcome_candles(snap, df_window)
+                # P05.1T — trace opcional (observação pura). `None` quando o setup
+                # não permite cálculo; erro aqui deixa o trace de fora sem afetar
+                # a classificação.
+                _path = None
+                try:
+                    _path = new_path_trace(snap)
+                except Exception as _pe:
+                    log.debug(f"[p05.1t] trace init falhou {snap.id}: {_pe}")
+
+                outcome = _classify_outcome_candles(snap, df_window, path_trace=_path)
                 if outcome is not None:
                     status, price, r, tp1_just_hit, new_peak = outcome
 
@@ -1278,6 +1513,19 @@ async def check_open_snapshots() -> int:
                             await close_shadow_for_snapshot(snap)
                         except Exception as e:
                             log.warning(f"shadow close falhou: {e}")
+
+                # P05.1T — persiste a telemetria observada nesta janela. Terminal
+                # por candle ⇒ FINAL_OBSERVED; senão segue COLLECTING. Fail-soft.
+                try:
+                    if _path is not None:
+                        _terminal = (outcome is not None
+                                     and outcome[0] not in ("open_after_tp1", "open_update"))
+                        snap.features = merge_p05_path(
+                            snap.features, _path,
+                            status=(PATH_FINAL_OBSERVED if _terminal else None),
+                            now=now, finalize=_terminal)
+                except Exception as _pe:
+                    log.debug(f"[p05.1t] merge falhou {snap.id}: {_pe}")
 
                 snap.last_check_at = now
             except Exception as e:

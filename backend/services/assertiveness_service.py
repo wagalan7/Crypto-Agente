@@ -1372,6 +1372,7 @@ async def _p05_section(days: int) -> Dict[str, Any]:
         out["segments"] = best_worst
         out["gate_events"] = diag.get("gate_events")
         out["mae_mfe"] = diag.get("mae_mfe")
+        out["telemetry"] = diag.get("telemetry")      # P05.1T — só observação
     except Exception as exc:  # noqa: BLE001
         log.warning(f"[assertiveness] p05 diagnóstico falhou: {exc}")
         out["diagnosis_error"] = str(exc)

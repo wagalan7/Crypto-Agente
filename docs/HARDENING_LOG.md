@@ -752,3 +752,68 @@ selado e zero alteração no LIVE.
   ambos os campos estão em **100% dos snapshots semanais desde 2026-06-29**.
   Nenhum backfill foi feito, nenhum dado antigo foi inventado e a persistência
   atual não precisou de alteração.
+
+---
+
+## P05.1T — TELEMETRIA PROSPECTIVA DE EVIDÊNCIA (2026-08-28)
+
+Detalhes em `docs/P05_1T_FORWARD_EVIDENCE_TELEMETRY.md`.
+
+**ANTES:** MAE/MFE indisponível (bloco estático); cobertura contextual só
+parcialmente observável, sem o corte de treino; slippage existia mas sem painel
+consolidado; eventos de gate com limitações não mapeadas.
+
+**DEPOIS:** MAE/MFE prospectivo por candle de 5m, cobertura de coleta explícita
+(global/treino/validação/teste), slippage auditável, disponibilidade honesta dos
+gates — e **zero efeito sobre a estratégia**.
+
+- **`features["p05_path"]`** — namespace novo dentro do JSONB JÁ existente.
+  Nenhuma coluna, tabela, migration, env ou flag. Snapshot novo inicializa sem
+  marcar MAE/MFE como zero observado (sem candle ⇒ `null`). **Sem backfill.**
+  Escrita sempre reatribui novo dict e nunca apaga `p05_context`.
+- **Fórmula** `risk_unit=abs(entry-stop)`, com LONG/SHORT espelhados e
+  `max(0, …)`. MAE/MFE nunca diminuem, timestamps nunca retrocedem, NaN/inf nunca
+  persistidos, dado inválido não apaga telemetria válida, arredondamento só na
+  serialização. `direction` comparado **exatamente** (`long`/`short`) porque o
+  classificador usa `== "long"` sem normalizar — normalizar criaria divergência.
+- **Limite terminal**: a telemetria observa no INÍCIO de cada vela, antes da
+  decisão; como o classificador retorna no terminal, o candle terminal ENTRA e os
+  posteriores NÃO.
+- **Integração opcional e fail-soft**: `_classify_outcome_candles(..., path_trace=None)`.
+  Sem trace = comportamento anterior EXATO; com trace = MESMO outcome. Stop/TP na
+  mesma vela, TP1/BE+/trail e `peak_price_since_tp1` idênticos. Erro no trace é
+  engolido e não altera decisão. Instrumentado só em `check_open_snapshots` —
+  `check_wide_snapshots` (namespace podado) não recebe `p05_path`.
+- **Dedupe** por `last_candle_ts_ms` do próprio `p05_path`: só timestamp
+  estritamente maior, nada anterior ao `created_at`, nada repetido pela
+  sobreposição. O classificador continua recebendo a janela ORIGINAL. Restart
+  continua do último timestamp; retry é idempotente.
+- **Finalização**: `FINAL_OBSERVED` (fechou por candle), `FINAL_PARTIAL`
+  (time-stop/teto/símbolo sem dados — mantém o observado), `UNAVAILABLE` (nunca
+  houve candle). Resolução do snapshot nunca é atrasada por telemetria.
+- **Diagnóstico MAE/MFE** substitui o bloco estático: `SHADOW_SETUP_PATH_5M`,
+  cobertura, missing por motivo, mean/median/p75/p90. `USABLE` só com ≥30
+  observados E ≥80% de cobertura. **Não gera "stop ideal" nem "TP ideal".**
+- **Cobertura contextual** (`regime`, `entry_zone_type`) reutiliza o MESMO
+  `temporal_split`/`axis_coverage` — sem split novo. O status é decidido pela
+  cobertura de **TREINO**; a global nunca a substitui. Não lê `realized_r`, não
+  abre holdout (sentinela em teste).
+- **Slippage** reutiliza `RealTrade.entry_slippage_pct` sem recalcular: cobertura,
+  média, mediana, p75, p90, inválidos por motivo. Ausência nunca vira zero; zero
+  legítimo continua válido. **Latência = `UNAVAILABLE`**: não há timestamp durável
+  decisão→ACK, e fetch latency NÃO é execution latency.
+- **Gates**: mapa de disponibilidade honesto — P04A/P04B `UNAVAILABLE` (abortam no
+  POST), P04C `AVAILABLE`. Eventos seguem sendo eventos, não oportunidades únicas.
+  Nenhum hook no executor; nenhum "lucro perdido" estimado.
+- **Retenção** reutiliza `_retention_snapshot`; teste garante que a poda continua
+  exclusiva de `wide`/`wide_*` e que nenhuma evidência P05 é apagada.
+- **API**: nenhum endpoint novo — só expansão de `/api/shadow/assertiveness` e
+  `/api/strategy/p05/status` (GET, read-only, fail-soft, cache reutilizado).
+  Painel ganhou "Qualidade da telemetria", sem botão, sem `[object Object]`,
+  `frontend/dist` intacto.
+- **397 testes P05 verdes 2×** (78 novos em `test_p05_1t_evidence_telemetry.py`) e
+  **suíte crítica P01–P05 (640) verde 2×** no Python 3.11 real; `py_compile`,
+  `tsc --noEmit` e `git diff --check` aprovados; rede/DNS bloqueados e
+  contabilizados. `shadow_trade_service`, `trade_manager_service` e signed services
+  INTACTOS. P05.2 não implementado; `P05_CHALLENGER_SHADOW_ENABLED` continua
+  `false`; champion LIVE, score, tier, gates, stop, TP e sizing inalterados.

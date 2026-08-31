@@ -1801,6 +1801,258 @@ _FEATURE_NAMES = ("edge_score", "mtf_aligned", "chase_atr", "struct_chase_atr",
                   "patterns", "hour_utc")
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  P05.1T — telemetria prospectiva (observação pura, nunca decide)
+# ════════════════════════════════════════════════════════════════════════════
+P051T_MIN_OBSERVED = 30
+P051T_MIN_COVERAGE_PCT = 80.0
+
+TELEMETRY_UNAVAILABLE = "UNAVAILABLE"
+TELEMETRY_COLLECTING = "COLLECTING"
+TELEMETRY_USABLE = "USABLE"
+
+_PATH_LIMITATIONS = [
+    "MAE/MFE é do caminho do SETUP SHADOW — não é execução REAL",
+    "fonte é OHLCV de 5 minutos; não é trajetória tick a tick",
+    "ordem intravela é desconhecida (high/low sem sequência)",
+    "não representa slippage nem a trajetória após o fill real",
+    "não deve ser atribuído ao RealTrade como se fosse execução real",
+    "não gera 'stop ideal' nem 'TP ideal' — é observação, não recomendação",
+]
+
+
+def _percentile(values: Sequence[float], q: float) -> Optional[float]:
+    """Percentil por interpolação linear. `None` em amostra vazia."""
+    vals = sorted(v for v in (_finite(x) for x in values) if v is not None)
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return round(vals[0], 4)
+    pos = q * (len(vals) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return round(vals[lo], 4)
+    return round(vals[lo] + (vals[hi] - vals[lo]) * (pos - lo), 4)
+
+
+def _distribution(values: Sequence[float]) -> Dict[str, Any]:
+    vals = [v for v in (_finite(x) for x in values) if v is not None]
+    if not vals:
+        return {"mean": None, "median": None, "p75": None, "p90": None, "count": 0}
+    return {
+        "mean": round(sum(vals) / len(vals), 4),
+        "median": _percentile(vals, 0.50),
+        "p75": _percentile(vals, 0.75),
+        "p90": _percentile(vals, 0.90),
+        "count": len(vals),
+    }
+
+
+def summarize_path_telemetry(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Diagnóstico MAE/MFE a partir SOMENTE de `features["p05_path"]`.
+
+    Nunca reconstrói história por aproximação: snapshot sem telemetria conta como
+    `missing`, com motivo. `USABLE` exige ≥30 observados E cobertura ≥80%.
+    """
+    eligible = len(rows)
+    observed = 0
+    missing = 0
+    by_reason: Dict[str, int] = {}
+    mae_values: List[float] = []
+    mfe_values: List[float] = []
+
+    for row in rows:
+        feats = row.get("features") or {}
+        path = feats.get("p05_path")
+        if not isinstance(path, dict):
+            missing += 1
+            by_reason["sem_p05_path (snapshot anterior à telemetria)"] = (
+                by_reason.get("sem_p05_path (snapshot anterior à telemetria)", 0) + 1)
+            continue
+        status = path.get("status")
+        mae = _finite(path.get("mae_r"))
+        mfe = _finite(path.get("mfe_r"))
+        if mae is None or mfe is None:
+            missing += 1
+            reason = path.get("unavailable_reason") or f"sem MAE/MFE (status={status})"
+            by_reason[str(reason)] = by_reason.get(str(reason), 0) + 1
+            continue
+        observed += 1
+        mae_values.append(mae)
+        mfe_values.append(mfe)
+
+    coverage = round(observed / eligible * 100, 1) if eligible else None
+    if observed == 0:
+        status = TELEMETRY_UNAVAILABLE
+    elif observed >= P051T_MIN_OBSERVED and (coverage or 0) >= P051T_MIN_COVERAGE_PCT:
+        status = TELEMETRY_USABLE
+    else:
+        status = TELEMETRY_COLLECTING
+
+    return {
+        "source": "SHADOW_SETUP_PATH_5M",
+        "status": status,
+        "eligible_resolved": eligible,
+        "observed": observed,
+        "coverage_pct": coverage,
+        "missing": missing,
+        "unavailable_by_reason": by_reason,
+        "min_observed": P051T_MIN_OBSERVED,
+        "min_coverage_pct": P051T_MIN_COVERAGE_PCT,
+        "mae_r": _distribution(mae_values),
+        "mfe_r": _distribution(mfe_values),
+        "limitations": _PATH_LIMITATIONS,
+    }
+
+
+def summarize_context_coverage(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Cobertura dos eixos do P05.1 no MESMO corte cronológico da avaliação.
+
+    Reutiliza `temporal_split` e `axis_coverage` — não cria outro split. NÃO lê
+    `realized_r` e NÃO abre holdout: só conta presença de feature.
+    A cobertura GLOBAL nunca substitui a de TREINO (é ela que decide).
+    """
+    ordered = sorted(rows, key=lambda r: r["resolved_at"])
+    split = temporal_split(ordered)
+    if split.get("ok"):
+        train, validation, test = split["train"], split["validation"], split["test"]
+    else:                      # amostra insuficiente para split — reporta global
+        train = validation = test = []
+
+    out: Dict[str, Any] = {
+        "min_required_pct": P05_MIN_FEATURE_COVERAGE_PCT,
+        "split_available": bool(split.get("ok")),
+        "axes": {},
+        "note": ("a cobertura de TREINO é a que decide (mesmo corte da geração "
+                 "P05.1); a global não a substitui"),
+    }
+    for axis in P051_CONTEXT_AXES:
+        present = sum(1 for r in ordered if context_value(r, axis) != CONTEXT_UNKNOWN)
+        global_cov = axis_coverage(ordered, axis)
+        train_cov = axis_coverage(train, axis) if train else None
+        usable = (train_cov is not None and train_cov >= P05_MIN_FEATURE_COVERAGE_PCT)
+        out["axes"][axis] = {
+            "coverage_global_pct": global_cov,
+            "coverage_train_pct": train_cov,
+            "coverage_validation_pct": axis_coverage(validation, axis) if validation else None,
+            "coverage_test_pct": axis_coverage(test, axis) if test else None,
+            "present": present,
+            "missing": len(ordered) - present,
+            "status": TELEMETRY_USABLE if usable else TELEMETRY_COLLECTING,
+        }
+    return out
+
+
+def summarize_slippage(real_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Auditoria do slippage JÁ existente (`RealTrade.entry_slippage_pct`).
+
+    Não recalcula, não altera `RealTrade` e nunca preenche ausência com zero —
+    zero legítimo continua valendo como observação válida.
+    """
+    total = len(real_rows)
+    values: List[float] = []
+    missing = 0
+    invalid_by_reason: Dict[str, int] = {}
+    for row in real_rows:
+        raw = row.get("entry_slippage_pct")
+        if raw is None:
+            missing += 1
+            continue
+        val = _finite(raw)
+        if val is None:
+            invalid_by_reason["NaN/infinito"] = invalid_by_reason.get("NaN/infinito", 0) + 1
+            continue
+        values.append(val)                     # zero legítimo É válido
+    return {
+        "total_real_closed": total,
+        "slippage_valid": len(values),
+        "slippage_missing": missing,
+        "coverage_pct": round(len(values) / total * 100, 1) if total else None,
+        "invalid_excluded_by_reason": invalid_by_reason,
+        **_distribution(values),
+        "note": "reutiliza RealTrade.entry_slippage_pct; ausência nunca vira zero",
+    }
+
+
+def summarize_latency() -> Dict[str, Any]:
+    """Latência de execução ponta a ponta.
+
+    Não existe timestamp durável suficiente para medi-la: `RealTrade` guarda
+    `opened_at`, mas não o instante da DECISÃO nem o do ACK da corretora. Latência
+    de fetch de dados NÃO é latência de execução — usar uma no lugar da outra seria
+    afirmação falsa. Medir exigiria tocar o hot path, o que está fora desta fase.
+    """
+    return {
+        "status": TELEMETRY_UNAVAILABLE,
+        "reason": ("sem timestamp durável de decisão→ACK; fetch latency não é "
+                   "execution latency"),
+        "missing_fields": ["decision_at", "order_ack_at"],
+        "would_require": "instrumentar o hot path de execução — fora do escopo do P05.1T",
+    }
+
+
+def summarize_gate_availability(gate_events: Dict[str, Any]) -> Dict[str, Any]:
+    """Mapa HONESTO de disponibilidade dos contadores de gate.
+
+    `SkipReasonStat` guarda EVENTOS agregados por (gate, dia) — podem repetir o
+    mesmo setup e NÃO são oportunidades únicas. Nunca somar com executados como
+    verdade absoluta, nunca estimar "lucro perdido".
+    """
+    items = (gate_events or {}).get("items") or []
+    found = sorted({str(it.get("gate")) for it in items if it.get("gate")})
+    phases = (gate_events or {}).get("by_phase") or {}
+    availability: Dict[str, Any] = {}
+    for phase, info in phases.items():
+        events = (info or {}).get("events")
+        availability[phase] = {
+            "status": "AVAILABLE" if events is not None else "UNAVAILABLE",
+            "events": events,
+            "reason": (info or {}).get("reason"),
+        }
+    return {
+        "gates_with_counters": found,
+        "gates_without_counters": [p for p, a in availability.items()
+                                   if a["status"] == "UNAVAILABLE"],
+        "by_phase": availability,
+        "semantics": ("são EVENTOS agregados por gate/dia; podem conter repetição; "
+                      "não são oportunidades únicas e não somam com executados"),
+        "no_hooks_added": True,
+    }
+
+
+async def build_telemetry_section(shadow_rows: Sequence[Dict[str, Any]],
+                                  days: int) -> Dict[str, Any]:
+    """Seção compacta de telemetria. Fail-soft por subseção; somente observação."""
+    out: Dict[str, Any] = {
+        "phase": "P05.1T",
+        "read_only": True,
+        "affects_strategy": False,
+        "note": "telemetria é subordinada: nunca decide, nunca altera execução",
+    }
+    try:
+        out["context_coverage"] = summarize_context_coverage(shadow_rows)
+    except Exception as exc:
+        out["context_coverage"] = {"error": str(exc)}
+    try:
+        real_rows, _dq = await _load_real(days)
+        out["slippage"] = summarize_slippage(real_rows)
+    except Exception as exc:
+        out["slippage"] = {"error": str(exc)}
+    out["latency"] = summarize_latency()
+    try:
+        out["gate_availability"] = summarize_gate_availability(
+            await _load_gate_events(min(days, 30)))
+    except Exception as exc:
+        out["gate_availability"] = {"error": str(exc)}
+    try:
+        rows = await _load_readiness_rows(days)
+        out["retention"] = await _retention_snapshot(rows)
+    except Exception as exc:
+        out["retention"] = {"error": str(exc)}
+    return out
+
+
 async def build_diagnosis(days: int = 30) -> Dict[str, Any]:
     """P05A — onde ganha, onde perde, com qualidade de evidência explícita."""
     out: Dict[str, Any] = {"window_days": days}
@@ -1844,11 +2096,18 @@ async def build_diagnosis(days: int = 30) -> Dict[str, Any]:
         log.warning(f"[p05] gate events falhou: {exc}")
         out["gate_events"] = {"error": str(exc)}
 
-    out["mae_mfe"] = {
-        "status": "UNAVAILABLE",
-        "reason": ("o histórico não permite reconstrução fiel de MAE/MFE; aproximar "
-                   "pelo preço final criaria afirmação falsa"),
-    }
+    # P05.1T — MAE/MFE agora vem de telemetria PROSPECTIVA (`features.p05_path`),
+    # não de reconstrução histórica. Fail-soft por seção.
+    try:
+        out["mae_mfe"] = summarize_path_telemetry(shadow_rows)
+    except Exception as exc:
+        log.warning(f"[p05.1t] telemetria MAE/MFE falhou: {exc}")
+        out["mae_mfe"] = {"status": "UNAVAILABLE", "error": str(exc)}
+    try:
+        out["telemetry"] = await build_telemetry_section(shadow_rows, days)
+    except Exception as exc:
+        log.warning(f"[p05.1t] seção de telemetria falhou: {exc}")
+        out["telemetry"] = {"error": str(exc)}
     out["evidence_quality"] = _evidence_quality(out, shadow_rows)
     out["computed_at"] = datetime.now(timezone.utc).isoformat()
     return out
