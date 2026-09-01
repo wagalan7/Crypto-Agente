@@ -1035,7 +1035,11 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   `executable=false`, `promotable=false`, `requires_future_holdout_review=true`,
   holdout `SEALED` e nenhum outcome do teste lido. Qualquer invariante não
   confirmada derruba para `CONTRACT_INVARIANT_BROKEN` — prontidão nunca é
-  declarada por omissão. Significa apenas "pode ser APRESENTADO para uma futura
+  declarada por omissão. Auditoria posterior endureceu esse contrato: campos
+  ausentes não ganham defaults permissivos, os contratos de somente leitura e
+  `shadow_supported=false` são confirmados em diagnóstico, laboratório e
+  candidato, e falhas aparecem em `contract_failures`. Significa apenas "pode
+  ser APRESENTADO para uma futura
   revisão MANUAL do holdout".
 - Cinco trilhas: `stop_pattern` e `offline_lab` (as únicas que liberam o
   P05.2C), mais `forward_path`, `live_execution` e `real_sample`, diagnósticas

@@ -3469,8 +3469,12 @@ def _track_stop_pattern(sd: Dict[str, Any]) -> Dict[str, Any]:
 
 def _track_offline_lab(lab: Dict[str, Any]) -> Dict[str, Any]:
     """Trilha 5.2 — laboratório offline do P05.2B."""
-    candidates = lab.get("candidates") or []
-    rejected = lab.get("rejected") or []
+    raw_candidates = lab.get("candidates")
+    raw_rejected = lab.get("rejected")
+    candidates = [c for c in raw_candidates
+                  if isinstance(c, dict)] if isinstance(raw_candidates, list) else []
+    rejected = [c for c in raw_rejected
+                if isinstance(c, dict)] if isinstance(raw_rejected, list) else []
     supported = [c for c in candidates if c.get("status") == LAB_VALIDATION_SUPPORTED]
     insufficient = [c for c in rejected if c.get("status") == LAB_INSUFFICIENT]
     refuted = [c for c in rejected if c.get("status") == LAB_REJECTED]
@@ -3540,6 +3544,16 @@ def _track_real_sample(real: Dict[str, Any],
 
     REAL e SHADOW nunca são somados e esta trilha nunca libera o P05.2C.
     """
+    if not real or real.get("error"):
+        return {
+            "phase": "P05.2A_REAL",
+            "status": _TRACK_UNAVAILABLE,
+            "ready": False,
+            "gates_p052c": False,
+            "reason": ("amostra REAL indisponível nesta execução"
+                       + (f": {real.get('error')}" if real.get("error") else "")),
+            "note": "REAL e SHADOW nunca são somados; trilha apenas informativa",
+        }
     return {
         "phase": "P05.2A_REAL",
         "status": "INFORMATIONAL",
@@ -3554,6 +3568,64 @@ def _track_real_sample(real: Dict[str, Any],
         "slippage_coverage_pct": (slippage or {}).get("coverage_pct"),
         "note": "REAL e SHADOW nunca são somados; trilha apenas informativa",
     }
+
+
+def _stop_readiness_contract_failures(
+        sd: Dict[str, Any], lab: Dict[str, Any],
+        supported: Sequence[Dict[str, Any]],
+        candidates_well_formed: bool) -> List[str]:
+    """Valida, sem defaults permissivos, o contrato que antecede READY.
+
+    Campo ausente não confirma segurança. Esta validação só governa a passagem
+    para ``READY_FOR_P052C``; estados observacionais anteriores continuam
+    fail-soft e não dependem de telemetria diagnóstica.
+    """
+    failures: List[str] = []
+
+    def _require(block: Dict[str, Any], key: str, expected: Any,
+                 prefix: str) -> None:
+        if key not in block or block.get(key) != expected:
+            failures.append(f"{prefix}.{key}")
+
+    _require(sd, "execution_mode", "ANALYTICS_ONLY", "stop_diagnosis")
+    _require(sd, "read_only", True, "stop_diagnosis")
+    _require(sd, "holdout_status", HOLDOUT_SEALED, "stop_diagnosis")
+    _require(sd, "holdout_outcomes_read", False, "stop_diagnosis")
+    _require(sd, "holdout_metrics_computed", False, "stop_diagnosis")
+
+    _require(lab, "execution_mode", "ANALYTICS_ONLY", "offline_lab")
+    _require(lab, "read_only", True, "offline_lab")
+    _require(lab, "executable", False, "offline_lab")
+    _require(lab, "promotable", False, "offline_lab")
+    _require(lab, "shadow_supported", False, "offline_lab")
+    _require(lab, "requires_future_holdout_review", True, "offline_lab")
+    _require(lab, "holdout_status", HOLDOUT_SEALED, "offline_lab")
+    _require(lab, "holdout_outcomes_read", False, "offline_lab")
+    _require(lab, "holdout_metrics_computed", False, "offline_lab")
+
+    if not candidates_well_formed:
+        failures.append("offline_lab.candidates")
+    if not supported:
+        failures.append("offline_lab.supported_candidate")
+    eligible_pattern_keys = {
+        (str(pattern.get("axis")), str(pattern.get("value")))
+        for pattern in (sd.get("persistent_patterns") or [])
+        if isinstance(pattern, dict)
+        and pattern.get("classification") == STOP_PERSISTENT_ADVERSE
+        and pattern.get("axis") in P052B_ALLOWED_AXES
+    }
+    for index, candidate in enumerate(supported):
+        prefix = f"offline_lab.candidates[{index}]"
+        _require(candidate, "type", P052B_HYPOTHESIS_TYPE, prefix)
+        _require(candidate, "executable", False, prefix)
+        _require(candidate, "promotable", False, prefix)
+        _require(candidate, "shadow_supported", False, prefix)
+        _require(candidate, "requires_future_holdout_review", True, prefix)
+        _require(candidate, "holdout_status", HOLDOUT_SEALED, prefix)
+        candidate_key = (str(candidate.get("axis")), str(candidate.get("value")))
+        if candidate_key not in eligible_pattern_keys:
+            failures.append(f"{prefix}.source_pattern")
+    return failures
 
 
 def _ready_eta(state: str, lab: Dict[str, Any], sd: Dict[str, Any]) -> Dict[str, Any]:
@@ -3637,20 +3709,23 @@ def build_stop_readiness(stop_diagnosis: Optional[Dict[str, Any]] = None,
     out["tracks"] = tracks
 
     pattern_track = tracks["stop_pattern"]
-    supported = [c for c in (lab.get("candidates") or [])
-                 if c.get("status") == LAB_VALIDATION_SUPPORTED]
-    holdout_ok = (
-        str(sd.get("holdout_status") or HOLDOUT_SEALED) == HOLDOUT_SEALED
-        and sd.get("holdout_outcomes_read") is not True
-        and sd.get("holdout_metrics_computed") is not True
-        and str(lab.get("holdout_status") or HOLDOUT_SEALED) == HOLDOUT_SEALED
-        and lab.get("holdout_outcomes_read") is not True
+    raw_candidates = lab.get("candidates")
+    candidates_well_formed = (
+        isinstance(raw_candidates, list)
+        and all(isinstance(c, dict) for c in raw_candidates)
     )
-    candidates_safe = bool(supported) and all(
-        c.get("executable") is False and c.get("promotable") is False
-        and c.get("requires_future_holdout_review") is True
-        and str(c.get("holdout_status") or HOLDOUT_SEALED) == HOLDOUT_SEALED
-        for c in supported)
+    candidates = raw_candidates if candidates_well_formed else []
+    supported = [c for c in candidates
+                 if c.get("status") == LAB_VALIDATION_SUPPORTED]
+    contract_failures = _stop_readiness_contract_failures(
+        sd, lab, supported, candidates_well_formed)
+    contract_ok = not contract_failures
+    tracks["offline_lab"]["contract_confirmed"] = contract_ok
+    if lab.get("status") == LAB_VALIDATION_SUPPORTED and not contract_ok:
+        tracks["offline_lab"]["ready"] = False
+        tracks["offline_lab"]["reason"] = (
+            "contrato de segurança incompleto ou divergente")
+    out["contract_failures"] = contract_failures
 
     # ── Ordem de precedência EXIGIDA ────────────────────────────────────────
     if (sd.get("error") or not sd
@@ -3671,12 +3746,12 @@ def build_stop_readiness(stop_diagnosis: Optional[Dict[str, Any]] = None,
                   "em critério substantivo da validação")
         next_action = ("não insistir na mesma hipótese: mais amostra não desfaz "
                        "reprovação substantiva")
-    elif not supported:
+    elif lab.get("status") == LAB_INSUFFICIENT:
         state, reason_code = READY_INSUFFICIENT, "INSUFFICIENT_EVIDENCE"
         detail = ("existe contexto adverso persistente, mas amostra, cobertura "
                   "ou intervalo de confiança ainda não permitem julgar")
         next_action = "aguardar mais operações afetadas na validação"
-    elif not (candidates_safe and holdout_ok):
+    elif lab.get("status") != LAB_VALIDATION_SUPPORTED or not contract_ok:
         state, reason_code = READY_UNAVAILABLE, "CONTRACT_INVARIANT_BROKEN"
         detail = ("candidato apoiado, mas alguma invariante de segurança não foi "
                   "confirmada; prontidão NÃO é declarada")

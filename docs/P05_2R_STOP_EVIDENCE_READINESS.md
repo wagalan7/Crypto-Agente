@@ -71,7 +71,12 @@ nenhum outcome do holdout foi lido.
 
 Se alguma dessas invariantes não for confirmada, o estado cai para
 `UNAVAILABLE` com `reason_code=CONTRACT_INVARIANT_BROKEN` — prontidão nunca é
-declarada por omissão.
+declarada por omissão. A validação é estrita também para os contratos de
+somente leitura do diagnóstico/laboratório e para `shadow_supported=false`;
+campo ausente não recebe valor seguro por padrão. `contract_failures` informa
+quais confirmações faltaram, sem expor outcomes do holdout. O candidato também
+deve ser uma hipótese oficial `STOP_CONTEXT_BLOCK` ligada ao mesmo padrão
+persistente que originou a avaliação.
 
 **Significa apenas**: "há uma hipótese apoiada pela validação que pode ser
 apresentada para uma futura revisão MANUAL do holdout". Não é aprovação, não é

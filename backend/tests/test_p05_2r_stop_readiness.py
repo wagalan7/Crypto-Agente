@@ -259,6 +259,68 @@ class RegraReady(unittest.TestCase):
         out = p05.build_stop_readiness(sd, _diag())
         self.assertNotEqual(out["state"], "READY_FOR_P052C")
 
+    def test_campos_de_seguranca_ausentes_bloqueiam_fail_closed(self):
+        cases = (
+            ("sd", "holdout_status"),
+            ("sd", "holdout_outcomes_read"),
+            ("sd", "holdout_metrics_computed"),
+            ("lab", "holdout_status"),
+            ("lab", "holdout_outcomes_read"),
+            ("lab", "holdout_metrics_computed"),
+            ("lab", "executable"),
+            ("lab", "promotable"),
+            ("lab", "shadow_supported"),
+            ("lab", "requires_future_holdout_review"),
+            ("candidate", "executable"),
+            ("candidate", "promotable"),
+            ("candidate", "shadow_supported"),
+            ("candidate", "requires_future_holdout_review"),
+            ("candidate", "holdout_status"),
+        )
+        for owner, key in cases:
+            with self.subTest(owner=owner, key=key):
+                candidate = _candidate()
+                lab = _lab(p05.LAB_VALIDATION_SUPPORTED,
+                           candidates=[candidate])
+                sd = _sd(patterns=[_pattern()], lab=lab)
+                {"sd": sd, "lab": lab, "candidate": candidate}[owner].pop(key)
+                out = p05.build_stop_readiness(sd, _diag())
+                self.assertEqual(out["state"], "UNAVAILABLE")
+                self.assertEqual(out["reason_code"],
+                                 "CONTRACT_INVARIANT_BROKEN")
+                self.assertFalse(out["ready_for_p052c"])
+                self.assertTrue(out["contract_failures"])
+
+    def test_status_supported_sem_candidato_e_invariante_quebrada(self):
+        lab = _lab(p05.LAB_VALIDATION_SUPPORTED, candidates=[])
+        out = p05.build_stop_readiness(
+            _sd(patterns=[_pattern()], lab=lab), _diag())
+        self.assertEqual(out["state"], "UNAVAILABLE")
+        self.assertEqual(out["reason_code"], "CONTRACT_INVARIANT_BROKEN")
+        self.assertIn("offline_lab.supported_candidate", out["contract_failures"])
+
+    def test_candidato_malformado_nao_quebra_monitor(self):
+        lab = _lab(p05.LAB_VALIDATION_SUPPORTED, candidates=[None])
+        out = p05.build_stop_readiness(
+            _sd(patterns=[_pattern()], lab=lab), _diag())
+        self.assertEqual(out["state"], "UNAVAILABLE")
+        self.assertEqual(out["reason_code"], "CONTRACT_INVARIANT_BROKEN")
+        self.assertFalse(out["tracks"]["offline_lab"]["ready"])
+
+    def test_candidato_deve_corresponder_ao_padrao_persistente(self):
+        lab = _lab(p05.LAB_VALIDATION_SUPPORTED,
+                   candidates=[_candidate(value="TREND")])
+        out = p05.build_stop_readiness(
+            _sd(patterns=[_pattern(value="CHOP")], lab=lab), _diag())
+        self.assertEqual(out["state"], "UNAVAILABLE")
+        self.assertIn("offline_lab.candidates[0].source_pattern",
+                      out["contract_failures"])
+
+    def test_tipo_da_hipotese_deve_ser_o_oficial(self):
+        out = self._ready(type="OUTRO_TIPO")
+        self.assertEqual(out["state"], "UNAVAILABLE")
+        self.assertIn("offline_lab.candidates[0].type", out["contract_failures"])
+
     def test_ready_significa_apenas_apresentar(self):
         out = self._ready()
         self.assertTrue(out["ready_for_p052c"])
@@ -329,6 +391,13 @@ class Trilhas(unittest.TestCase):
         self.assertIn("nunca são somados", t["note"])
         self.assertFalse(t["gates_p052c"])
         self.assertFalse(t["ready"])
+
+    def test_falha_do_resumo_real_vira_indisponivel(self):
+        t = p05.build_stop_readiness(
+            _sd(real={"error": "db indisponível"}), _diag())["tracks"]["real_sample"]
+        self.assertEqual(t["status"], "UNAVAILABLE")
+        self.assertFalse(t["ready"])
+        self.assertIn("indisponível", t["reason"])
 
     def test_telemetria_sozinha_nao_libera_p052c(self):
         diag = _diag(path_status="USABLE", lat_status="USABLE")
