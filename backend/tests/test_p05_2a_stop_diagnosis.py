@@ -606,6 +606,45 @@ class ApiCacheArchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("get_cached_stop_diagnosis", block)
         self.assertIn("except Exception", block)          # fail-soft
 
+    async def test_agregado_do_painel_repassa_stop_diagnosis_oficial(self):
+        from services import assertiveness_service as a
+
+        async def _diagnosis(_days):
+            return {"segments": {}, "shadow": {}}
+
+        async def _stop(days):
+            return {
+                "phase": "P05.2A",
+                "requested_window_days": days,
+                "holdout_status": p05.HOLDOUT_SEALED,
+                "patterns_verdict": "NO_PERSISTENT_STOP_PATTERN",
+            }
+
+        class _FailingSession:
+            async def __aenter__(self):
+                raise RuntimeError("DB de experimentos indisponível no teste")
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with patch.object(p05, "P05_ANALYTICS_ENABLED", True), \
+                patch.object(p05, "get_cached_diagnosis", side_effect=_diagnosis), \
+                patch.object(p05, "get_cached_stop_diagnosis", side_effect=_stop), \
+                patch("db.get_session", return_value=_FailingSession()):
+            out = await a._p05_section(30)
+
+        self.assertEqual(out["stop_diagnosis"]["phase"], "P05.2A")
+        self.assertEqual(out["stop_diagnosis"]["requested_window_days"], 120)
+        self.assertEqual(out["stop_diagnosis"]["holdout_status"], p05.HOLDOUT_SEALED)
+
+    def test_painel_e_agregado_usam_o_mesmo_contrato_p052a(self):
+        service = (BACKEND / "services/assertiveness_service.py").read_text()
+        block = service.split("async def _p05_section")[1].split(
+            "async def get_assertiveness")[0]
+        self.assertIn('out["stop_diagnosis"]', block)
+        self.assertIn("get_cached_stop_diagnosis", block)
+        self.assertIn("P052A_WINDOW_DAYS", block)
+
     def test_nenhum_endpoint_novo(self):
         main = (BACKEND / "main.py").read_text()
         self.assertNotIn("stop-diagnosis", main)

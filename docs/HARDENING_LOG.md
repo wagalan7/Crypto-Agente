@@ -902,6 +902,12 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
 
 ### Fechamento da auditoria P05.2A
 
+- Integração de produção fechada: o agregado `/api/shadow/assertiveness`, que é
+  a fonte real do `AssertivenessPanel`, agora repassa o mesmo `stop_diagnosis`
+  cacheado exposto por `/api/strategy/p05/status`; antes o backend calculava o
+  P05.2A corretamente, mas o painel não recebia esse campo. Validação após a
+  correção: **75 testes P05.2A**, **475 testes P05 2×** e **718 testes críticos
+  2×**, além de `py_compile`, `tsc --noEmit` e `git diff --check`.
 - `won_tp1_be` não positivo e `expired` diferente de zero agora são tratados
   como `INCONSISTENT`, em coerência com o contrato status/R.
 - O resumo REAL passou a reutilizar a identidade econômica do loader P05

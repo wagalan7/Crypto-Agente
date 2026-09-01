@@ -1476,6 +1476,19 @@ async def _p05_section(days: int) -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         log.warning(f"[assertiveness] p05 diagnóstico falhou: {exc}")
         out["diagnosis_error"] = str(exc)
+    # O AssertivenessPanel consome este agregado (e não /api/strategy/p05/status).
+    # Reutilize o diagnóstico/cache oficial para que o P05.2A chegue ao painel,
+    # sem uma segunda implementação e sem abrir o holdout final.
+    try:
+        out["stop_diagnosis"] = await p05.get_cached_stop_diagnosis(
+            p05.P052A_WINDOW_DAYS)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[assertiveness] p05.2a stop_diagnosis falhou: {exc}")
+        out["stop_diagnosis"] = {
+            "phase": "P05.2A",
+            "error": str(exc),
+            "holdout_status": p05.HOLDOUT_SEALED,
+        }
     try:
         from db import get_session
         from models.strategy_experiment import StrategyExperiment as E

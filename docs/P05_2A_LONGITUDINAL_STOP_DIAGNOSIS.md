@@ -176,6 +176,12 @@ Sem padrão persistente, o veredito é **`NO_PERSISTENT_STOP_PATTERN`**.
 `/api/strategy/p05/status`, preservando todos os campos atuais. Usa cache
 single-flight com o **mesmo TTL** do P05 (erro não envenena o cache) e é
 **fail-soft**: falha do diagnóstico não derruba o restante do status.
+O mesmo objeto oficial também é repassado pelo agregado já consumido pelo
+`AssertivenessPanel` (`/api/shadow/assertiveness`), sem recomputação paralela:
+ambas as rotas reutilizam `get_cached_stop_diagnosis(P052A_WINDOW_DAYS)`.
+O caminho real do painel possui teste de integração dedicado. Fechamento após
+essa correção: **75 testes P05.2A**, **475 testes P05 2×** e **718 testes
+críticos 2×**, com `py_compile`, `tsc --noEmit` e `git diff --check` aprovados.
 O diagnóstico de stop reutiliza também o **mesmo store e lock** do cache P05,
 com namespace próprio de chave; não existe cache paralelo. Falha total ou
 parcial não entra no cache. Falha ao construir hipóteses devolve
