@@ -834,9 +834,9 @@ export default function AssertivenessPanel({ onClose }: Props) {
 
                     {/* SHADOW: treino vs validação */}
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                      <StatCard label="Stop (1ª metade)" value={fmtPct(tr?.stop_rate_pct)}
+                      <StatCard label="Stop no treino" value={fmtPct(tr?.stop_rate_pct)}
                         sub={`${tr?.stops ?? 0} de ${tr?.total_resolved ?? 0}`} />
-                      <StatCard label="Stop (2ª metade)" value={fmtPct(va?.stop_rate_pct)}
+                      <StatCard label="Stop na validação" value={fmtPct(va?.stop_rate_pct)}
                         sub={`${va?.stops ?? 0} de ${va?.total_resolved ?? 0}`} />
                       <StatCard label="Resultado médio" value={fmtR(va?.expectancy_r)}
                         valueCls={rColor(va?.expectancy_r)} sub="por recomendação" />
@@ -862,7 +862,11 @@ export default function AssertivenessPanel({ onClose }: Props) {
                       <div className="text-[11px] font-bold text-slate-300 mb-1">
                         Contextos ruins nos dois períodos
                       </div>
-                      {(sd.persistent_patterns?.length ?? 0) > 0 ? (
+                      {sd.patterns_verdict === 'UNAVAILABLE' ? (
+                        <p className="text-xs text-amber-300/90 italic px-1">
+                          Diagnóstico de padrões temporariamente indisponível; nenhuma conclusão foi emitida.
+                        </p>
+                      ) : (sd.persistent_patterns?.length ?? 0) > 0 ? (
                         <div className="flex flex-col gap-1.5">
                           {sd.persistent_patterns!.map(pt => (
                             <div key={`${pt.axis}-${pt.value}`}
@@ -898,7 +902,7 @@ export default function AssertivenessPanel({ onClose }: Props) {
                     {(sd.non_persistent_patterns?.length ?? 0) > 0 && (
                       <div className="mt-2">
                         <div className="text-[11px] font-bold text-slate-400 mb-1">
-                          Suspeitas que não se confirmaram
+                          Não confirmados ou ainda sem amostra
                         </div>
                         <div className="flex flex-col gap-1">
                           {sd.non_persistent_patterns!.slice(0, 5).map(pt => (

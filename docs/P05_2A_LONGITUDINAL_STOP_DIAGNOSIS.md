@@ -33,9 +33,9 @@ Janela por `outcome_at`, reutilizando `_calib._not_fast_void()`.
 | Status | Classe | É stop? |
 |---|---|---|
 | `lost` (com `R < 0`) | `STOP` | **sim** — stop original antes do TP1 |
-| `won_tp1_be` | `PROTECTED_EXIT` | **não** — saída protetiva pós-TP1 |
+| `won_tp1_be` (com `R > 0`) | `PROTECTED_EXIT` | **não** — saída protetiva pós-TP1 |
 | `won_tp1` / `won_tp2` (com `R > 0`) | `WIN` | não |
-| `expired` | `EXPIRED` | não |
+| `expired` (com `R = 0`) | `EXPIRED` | não |
 | status × sinal de R divergente | `INCONSISTENT` | excluído e contabilizado |
 
 `realized_r = None` **nunca** vira zero — é exclusão contabilizada.
@@ -46,6 +46,9 @@ Só `source="auto"`, janela por **`closed_at`** (nunca `opened_at`).
 `status == "closed_stop"` é o stop real confirmado. `closed_manual` com R negativo
 fica **separado** como `NEGATIVE_MANUAL_EXIT` — nunca se classifica todo
 `realized_r < 0` como stop. Reporta cobertura do vínculo com snapshot.
+Retry/import duplicado é removido pela mesma identidade econômica do loader REAL
+do P05: ordem da exchange, `client_order_id`, `recommendation_id` e, apenas como
+último fallback, id interno.
 
 > **REAL e SHADOW nunca são somados.**
 
@@ -95,6 +98,9 @@ stops · stop rate · **Wilson 95%** · wins · saídas protetivas pós-TP1 · e
 expectancy R · soma R · mediana R · profit factor · pior sequência de stops ·
 duração mediana até o stop · p75/p90 do tempo até o stop · cobertura de contexto ·
 confiabilidade.
+
+A cobertura geral de contexto declara explicitamente `regime` como sua base; a
+cobertura de cada um dos 14 eixos permanece no respectivo bloco segmentado.
 
 **REAL**: total fechado (`source=auto`) · `closed_stop` · stop rate · Wilson 95% ·
 saídas manuais negativas · TP1/TP2/BE · expectancy e soma R quando calculáveis ·
@@ -170,6 +176,11 @@ Sem padrão persistente, o veredito é **`NO_PERSISTENT_STOP_PATTERN`**.
 `/api/strategy/p05/status`, preservando todos os campos atuais. Usa cache
 single-flight com o **mesmo TTL** do P05 (erro não envenena o cache) e é
 **fail-soft**: falha do diagnóstico não derruba o restante do status.
+O diagnóstico de stop reutiliza também o **mesmo store e lock** do cache P05,
+com namespace próprio de chave; não existe cache paralelo. Falha total ou
+parcial não entra no cache. Falha ao construir hipóteses devolve
+`patterns_verdict="UNAVAILABLE"` e nunca é mascarada como ausência comprovada de
+padrão.
 
 **Nenhum endpoint novo, nenhum POST, `main.py` não foi modificado.**
 
@@ -208,3 +219,14 @@ Sem botão, sem promoção, sem ativação, sem configuração técnica, sem
 - Nenhuma tabela, coluna, migration, env, flag ou endpoint novo.
 - P05.1R e P05.1T intactos; champion, score, tier, gates, stop, TP e sizing
   inalterados.
+
+## Fechamento da auditoria
+
+- Divergência status/R também é rejeitada para `won_tp1_be` não positivo e
+  `expired` diferente de zero.
+- O resumo REAL deduplica por identidade econômica, em paridade com `_load_real`.
+- Cache P05.2A reutiliza `_DIAG_CACHE` e `_DIAG_CACHE_LOCK`; erro total ou
+  parcial não envenena.
+- Erro interno de hipótese fica `UNAVAILABLE`, tanto no contrato quanto na tela.
+- A tela nomeia corretamente treino (50%) e validação (25%) e não chama amostra
+  insuficiente de hipótese refutada.

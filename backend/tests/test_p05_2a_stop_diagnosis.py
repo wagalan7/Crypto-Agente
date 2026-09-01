@@ -104,6 +104,12 @@ class StopIdentityTests(unittest.TestCase):
     def test_divergencia_status_r_e_inconsistente(self):
         self.assertEqual(p05.classify_shadow_outcome("lost", 1.0), p05.OUTCOME_INCONSISTENT)
         self.assertEqual(p05.classify_shadow_outcome("won_tp2", -1.0), p05.OUTCOME_INCONSISTENT)
+        self.assertEqual(p05.classify_shadow_outcome("won_tp1_be", -0.5),
+                         p05.OUTCOME_INCONSISTENT)
+        self.assertEqual(p05.classify_shadow_outcome("won_tp1_be", 0.0),
+                         p05.OUTCOME_INCONSISTENT)
+        self.assertEqual(p05.classify_shadow_outcome("expired", -1.0),
+                         p05.OUTCOME_INCONSISTENT)
 
     def test_nan_inf_inconsistente(self):
         for bad in (float("nan"), float("inf")):
@@ -523,9 +529,14 @@ class RealSummaryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(_db, "get_session", lambda: _Session()):
             return await a.real_stop_summary(120)
 
-    def _t(self, i, status, r, rec_id=1):
+    def _t(self, i, status, r, rec_id=..., *, exchange_order_id=None,
+           client_order_id=None, exchange="binance"):
+        if rec_id is ...:
+            rec_id = i + 1
         return SimpleNamespace(id=i, status=status, realized_r=r,
-                               recommendation_id=rec_id)
+                               recommendation_id=rec_id, exchange=exchange,
+                               exchange_order_id=exchange_order_id,
+                               client_order_id=client_order_id)
 
     async def test_closed_stop_e_stop(self):
         out = await self._run([self._t(0, "closed_stop", -1.0),
@@ -561,6 +572,15 @@ class RealSummaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("nunca são somados", out["note"])
         self.assertEqual(out["source"], "RealTrade(source=auto)")
 
+    async def test_dedupe_usa_identidade_economica(self):
+        out = await self._run([
+            self._t(1, "closed_stop", -1.0, rec_id=None, exchange_order_id="E-1"),
+            self._t(2, "closed_stop", -1.0, rec_id=None, exchange_order_id="E-1"),
+        ])
+        self.assertEqual(out["total_closed"], 1)
+        self.assertEqual(out["stops"], 1)
+        self.assertEqual(out["excluded_by_reason"]["duplicata"], 1)
+
     def test_filtra_por_closed_at_e_source_auto(self):
         src = (BACKEND / "services/assertiveness_service.py").read_text()
         block = src.split("async def real_stop_summary")[1].split("async def _gate_counterfactual")[0]
@@ -574,10 +594,10 @@ class RealSummaryTests(unittest.IsolatedAsyncioTestCase):
 # ════════════════════════════════════════════════════════════════════════════
 class ApiCacheArchTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        p05._STOP_DIAG_CACHE.clear()
+        p05._DIAG_CACHE.clear()
 
     def tearDown(self):
-        p05._STOP_DIAG_CACHE.clear()
+        p05._DIAG_CACHE.clear()
 
     def test_status_inclui_stop_diagnosis(self):
         src = (BACKEND / "services/strategy_evidence_service.py").read_text()
@@ -615,6 +635,50 @@ class ApiCacheArchTests(unittest.IsolatedAsyncioTestCase):
             await p05.get_cached_stop_diagnosis(120)
             await p05.get_cached_stop_diagnosis(120)
         self.assertEqual(len(calls), 2)
+
+    async def test_erro_parcial_nao_envenena_cache(self):
+        calls = []
+
+        async def _fake(days):
+            calls.append(days)
+            return {"phase": "P05.2A", "patterns_verdict": "UNAVAILABLE",
+                    "patterns_error": "boom"}
+
+        with patch.object(p05, "build_stop_diagnosis", _fake):
+            await p05.get_cached_stop_diagnosis(120)
+            await p05.get_cached_stop_diagnosis(120)
+        self.assertEqual(len(calls), 2)
+
+    def test_reutiliza_cache_do_p05_sem_cache_paralelo(self):
+        src = (BACKEND / "services/strategy_evidence_service.py").read_text()
+        block = src.split("async def get_cached_stop_diagnosis")[1].split(
+            "async def build_diagnosis")[0]
+        self.assertIn("_DIAG_CACHE", block)
+        self.assertIn("_DIAG_CACHE_LOCK", block)
+        self.assertNotIn("_STOP_DIAG_CACHE", src)
+
+    async def test_falha_de_hipotese_nao_vira_ausencia_de_padrao(self):
+        async def _split(_days):
+            return {
+                "train": [_row(1)], "validation": [_row(2)],
+                "train_count": 1, "validation_count": 1, "test_count": 1,
+                "eligible_total": 3, "observed_span_days": 1,
+                "oldest_resolved_at": T0.isoformat(),
+                "newest_resolved_at": (T0 + timedelta(hours=2)).isoformat(),
+                "young_history": True, "test_bounds": {},
+                "holdout_status": p05.HOLDOUT_SEALED,
+            }
+
+        async def _real(_days):
+            return {"total_closed": 0}
+
+        from services import assertiveness_service as a
+        with patch.object(p05, "load_stop_shadow_split", _split), \
+                patch.object(p05, "build_stop_hypotheses", side_effect=RuntimeError("boom")), \
+                patch.object(a, "real_stop_summary", _real):
+            out = await p05.build_stop_diagnosis(120)
+        self.assertEqual(out["patterns_verdict"], "UNAVAILABLE")
+        self.assertIn("patterns_error", out)
 
     def test_janela_fixa_120(self):
         self.assertEqual(p05.P052A_WINDOW_DAYS, 120)
@@ -681,6 +745,7 @@ class FrontendStopTests(unittest.TestCase):
     def test_avisos_obrigatorios(self):
         self.assertIn("não causas", self.block)
         self.assertIn("Nenhuma alteração foi aplicada à estratégia", self.block)
+        self.assertIn("temporariamente indisponível", self.block)
 
     def test_mostra_wins_removidos(self):
         self.assertIn("blocking_would_remove_wins", self.block)

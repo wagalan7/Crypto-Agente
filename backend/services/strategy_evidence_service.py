@@ -2121,11 +2121,11 @@ def classify_shadow_outcome(status: Any, realized_r: Any) -> str:
     if st == "lost":
         return OUTCOME_STOP if r < 0 else OUTCOME_INCONSISTENT
     if st == "won_tp1_be":
-        return OUTCOME_PROTECTED_EXIT
+        return OUTCOME_PROTECTED_EXIT if r > 0 else OUTCOME_INCONSISTENT
     if st in ("won_tp1", "won_tp2"):
         return OUTCOME_WIN if r > 0 else OUTCOME_INCONSISTENT
     if st == "expired":
-        return OUTCOME_EXPIRED
+        return OUTCOME_EXPIRED if r == 0 else OUTCOME_INCONSISTENT
     return OUTCOME_INCONSISTENT
 
 
@@ -2265,7 +2265,8 @@ def stop_stage_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 "expectancy_r": None, "sum_r": None, "median_r": None,
                 "profit_factor": None, "worst_stop_streak": 0,
                 "time_to_stop_minutes": {"median": None, "p75": None, "p90": None},
-                "context_coverage_pct": None, "reliability": RELIABILITY_INSUFFICIENT,
+                "context_coverage_pct": None, "context_coverage_basis": "regime",
+                "reliability": RELIABILITY_INSUFFICIENT,
                 "excluded_by_reason": excluded, "excluded_total": len(rows)}
 
     classes = [r["outcome_class"] for r in valid]
@@ -2320,6 +2321,7 @@ def stop_stage_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "count": len(minutes),
         },
         "context_coverage_pct": round(with_ctx / n * 100, 1),
+        "context_coverage_basis": "regime",
         "reliability": reliability_label(n),
         "excluded_by_reason": excluded,
         "excluded_total": len(rows) - n,
@@ -2395,7 +2397,9 @@ def stop_segments_for_axis(rows: Sequence[Dict[str, Any]], axis: str) -> Dict[st
             "sum_r": round(sum(rs), 4) if rs else None,
             "reliability": reliability_label(exposure),
         })
-    items.sort(key=lambda it: (-(it["stop_rate_lift_pp"] or -999), -it["exposure"], it["key"]))
+    items.sort(key=lambda it: (
+        -it["stop_rate_lift_pp"] if it["stop_rate_lift_pp"] is not None else float("inf"),
+        -it["exposure"], it["key"]))
     return {
         "axis": axis,
         "stage_stop_rate_pct": round(baseline_rate, 2) if baseline_rate is not None else None,
@@ -2700,7 +2704,11 @@ async def build_stop_diagnosis(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any]:
     except Exception as exc:
         log.warning(f"[p05.2a] hipóteses falharam: {exc}")
         out["persistent_patterns"] = []
-        out["patterns_verdict"] = "NO_PERSISTENT_STOP_PATTERN"
+        out["non_persistent_patterns"] = []
+        out["patterns_verdict"] = "UNAVAILABLE"
+        out["patterns_verdict_reason"] = (
+            "não foi possível concluir se há padrão persistente")
+        out["patterns_error"] = str(exc)
 
     try:
         out["trajectory"] = {
@@ -2721,28 +2729,40 @@ async def build_stop_diagnosis(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any]:
     return out
 
 
-_STOP_DIAG_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
-_STOP_DIAG_CACHE_LOCK = asyncio.Lock()
+def _stop_diagnosis_cacheable(value: Dict[str, Any]) -> bool:
+    """Falha total ou parcial nunca permanece no cache do diagnóstico."""
+    if value.get("error") or value.get("patterns_error"):
+        return False
+    for section in ("shadow", "segments", "trajectory", "real"):
+        block = value.get(section)
+        if isinstance(block, dict) and block.get("error"):
+            return False
+    return True
 
 
 async def get_cached_stop_diagnosis(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any]:
-    """Cache single-flight com o MESMO TTL do P05. Erro não envenena o cache."""
+    """Cache single-flight no store/lock do P05. Erro não envenena o cache.
+
+    Chaves negativas reservam o namespace P05.2A sem criar cache paralelo nem
+    colidir com o diagnóstico P05A, cujas chaves são dias positivos.
+    """
     days = max(30, min(int(days), 365))
+    cache_key = -days
     now_mono = time.monotonic()
-    cached = _STOP_DIAG_CACHE.get(days)
+    cached = _DIAG_CACHE.get(cache_key)
     if cached and now_mono - cached[0] < P05_DIAG_CACHE_TTL_S:
         return cached[1]
-    async with _STOP_DIAG_CACHE_LOCK:
-        cached = _STOP_DIAG_CACHE.get(days)
+    async with _DIAG_CACHE_LOCK:
+        cached = _DIAG_CACHE.get(cache_key)
         now_mono = time.monotonic()
         if cached and now_mono - cached[0] < P05_DIAG_CACHE_TTL_S:
             return cached[1]
         value = await build_stop_diagnosis(days)
-        if not value.get("error"):
-            _STOP_DIAG_CACHE[days] = (now_mono, value)
-            if len(_STOP_DIAG_CACHE) > 12:
-                oldest = min(_STOP_DIAG_CACHE, key=lambda k: _STOP_DIAG_CACHE[k][0])
-                _STOP_DIAG_CACHE.pop(oldest, None)
+        if _stop_diagnosis_cacheable(value):
+            _DIAG_CACHE[cache_key] = (now_mono, value)
+            if len(_DIAG_CACHE) > 12:
+                oldest = min(_DIAG_CACHE, key=lambda k: _DIAG_CACHE[k][0])
+                _DIAG_CACHE.pop(oldest, None)
         return value
 
 

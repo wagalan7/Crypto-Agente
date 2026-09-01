@@ -953,10 +953,24 @@ async def real_stop_summary(days: int) -> Dict[str, Any]:
     seen: set = set()
     total = 0
     for t in rows:
-        if t.id in seen:
+        # Mesma identidade econômica já usada pelo loader REAL do P05. Retry ou
+        # import duplicado da mesma ordem/recomendação não pode inflar a taxa.
+        exchange = getattr(t, "exchange", None) or "unknown"
+        exchange_order_id = getattr(t, "exchange_order_id", None)
+        client_order_id = getattr(t, "client_order_id", None)
+        recommendation_id = getattr(t, "recommendation_id", None)
+        if exchange_order_id:
+            identity = f"real-order:{exchange}:{exchange_order_id}"
+        elif client_order_id:
+            identity = f"real-client:{exchange}:{client_order_id}"
+        elif recommendation_id:
+            identity = f"real-rec:{recommendation_id}"
+        else:
+            identity = f"real:{t.id}"
+        if identity in seen:
             excluded["duplicata"] = excluded.get("duplicata", 0) + 1
             continue
-        seen.add(t.id)
+        seen.add(identity)
         total += 1
         status = (t.status or "").strip()
         if status == "closed_stop":
@@ -971,7 +985,7 @@ async def real_stop_summary(days: int) -> Dict[str, Any]:
             out["closed_tp2"] += 1
         elif status == "closed_be":
             out["closed_be"] += 1
-        if t.recommendation_id:
+        if recommendation_id:
             linked += 1
         r = t.realized_r
         if r is None:

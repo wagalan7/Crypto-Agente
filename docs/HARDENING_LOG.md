@@ -899,3 +899,22 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   tabela/coluna/env/flag. `snapshot_service`, `shadow_trade_service`,
   `trade_manager_service` e signed services INTACTOS. P05.2B não implementado;
   champion, score, tier, gates, stop, TP e sizing inalterados.
+
+### Fechamento da auditoria P05.2A
+
+- `won_tp1_be` não positivo e `expired` diferente de zero agora são tratados
+  como `INCONSISTENT`, em coerência com o contrato status/R.
+- O resumo REAL passou a reutilizar a identidade econômica do loader P05
+  (ordem da exchange → client order → recommendation → id), impedindo retry ou
+  import duplicado de inflar stop rate e expectancy.
+- O diagnóstico reutiliza `_DIAG_CACHE` e `_DIAG_CACHE_LOCK` com namespace de
+  chave próprio; o cache paralelo foi removido e erros totais ou parciais
+  continuam sem cache.
+- Falha na geração das hipóteses agora retorna `UNAVAILABLE` e aparece assim na
+  tela, sem afirmar falsamente que não existe padrão persistente.
+- Ordenação de lift zero e a base `regime` da cobertura geral ficaram explícitas;
+  a tela distingue treino (50%) de validação (25%) e não chama amostra limitada
+  de hipótese refutada.
+- Validação final no Python 3.11 real: **73 testes específicos P05.2A**, **473
+  testes P05 verdes 2×** e **suíte crítica P01–P05 (716) verde 2×**;
+  `py_compile`, `tsc --noEmit` e `git diff --check` aprovados.
