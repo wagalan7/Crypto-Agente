@@ -225,6 +225,46 @@ async def _open_trade_fail_closed(*, symbol: str, source: str, **kwargs):
 LIVE_SIZE_MULT = max(0.0, min(float(os.getenv("LIVE_SIZE_MULT", "1.0")), 1.0))
 
 # ── Filtro de sessão/horário (go-live, opcional) ────────────────────────────
+def _exec_mark(trace, field: str) -> None:
+    """P05.2L — marca um instante do caminho de entrada. No-op e fail-soft."""
+    if trace is None:
+        return
+    try:
+        from services.snapshot_service import exec_trace_mark
+        exec_trace_mark(trace, field)
+    except Exception:                          # telemetria nunca atrasa a entrada
+        pass
+
+
+async def _record_entry_latency(trace, snapshot_id, *, entry_route, order_res,
+                                attempted: bool, trade_persisted=None) -> None:
+    """P05.2L — registra o caminho técnico da entrada LIVE. OBSERVAÇÃO PURA.
+
+    Fail-soft absoluto: qualquer erro aqui é engolido e logado. Nunca altera
+    `order_res`, `qty`, entrada, SL, TP ou o fluxo de controle; nunca faz
+    chamada adicional à exchange; nunca dispara retry ou pausa.
+    """
+    if trace is None or snapshot_id is None:
+        return
+    try:
+        from services import snapshot_service as _snap
+        info = _snap.classify_execution_attempt(
+            order_res, attempted=attempted, trade_persisted=trade_persisted)
+        payload = _snap.build_execution_path(
+            trace,
+            status=info["status"],
+            route=_snap.execution_route(entry_route, order_res),
+            fill_confirmed=info["fill_confirmed"],
+            fill_price_source=info["fill_price_source"],
+            reason_code=info["reason_code"],
+            exchange_event_at=info["exchange_event_at"],
+        )
+        await _snap.persist_execution_path(snapshot_id, payload)
+    except Exception as exc:
+        log.debug(f"[p05.2l] telemetria de latência não registrada "
+                  f"(snapshot={snapshot_id}): {exc}")
+
+
 # Gate de EXECUÇÃO (não esconde recomendações — o painel segue mostrando; só
 # evita o bot AUTO-abrir posição em janelas de horário ruins, ex.: sessão
 # europeia de baixa qualidade ou madrugada ilíquida). CSV de faixas em UTC no
@@ -5109,14 +5149,18 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
 
             async with get_session() as session:
                 stmt = (
-                    select(RecommendationSnapshot.id)
+                    select(RecommendationSnapshot.id,
+                           RecommendationSnapshot.created_at)
                     .where(RecommendationSnapshot.symbol == rec["symbol"])
                     .where(RecommendationSnapshot.direction == rec["direction"])
                     .where(RecommendationSnapshot.timeframe == rec["timeframe"])
                     .order_by(desc(RecommendationSnapshot.created_at))
                     .limit(1)
                 )
-                snap_id = (await session.execute(stmt)).scalar_one_or_none()
+                _snap_row = (await session.execute(stmt)).first()
+                snap_id = _snap_row[0] if _snap_row else None
+                # P05.2L: instante durável da RECOMENDAÇÃO (ponta a ponta).
+                _snap_created_at = _snap_row[1] if _snap_row else None
 
             if snap_id is None:
                 log.warning(f"[shadow] snapshot_id não achado pra {rec.get('symbol')} — pulando")
@@ -5150,6 +5194,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             # real. Só marcamos fill real quando avg>0 — senão o slippage seria 0%
             # falso (mascara o slippage real). Telemetria fica None até backfill.
             entry_is_real_fill = False
+
+            # P05.2L — telemetria do caminho de entrada (observação pura).
+            _exec_trace = None
+            _entry_route = None
 
             # Partials adaptativos (por-trade) — defaults no escopo externo; o
             # cálculo real acontece no passo 1d (só no fluxo live). Em shadow o
@@ -5271,6 +5319,17 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                                 continue
                     except Exception as e:
                         log.warning(f"[fill-rr-gate] {rec['symbol']} check falhou (fail-open): {e}")
+
+                # P05.2L — trace do caminho de entrada: nasce em MEMÓRIA, DEPOIS
+                # dos gates e ANTES da tentativa de ordem. Nenhuma leitura ou
+                # escrita no banco acontece aqui.
+                try:
+                    from services.snapshot_service import new_execution_trace
+                    _exec_trace = new_execution_trace(
+                        snapshot_id=snap_id, snapshot_created_at=_snap_created_at)
+                except Exception as _tex:
+                    _exec_trace = None
+                    log.debug(f"[p05.2l] trace não iniciado: {_tex}")
 
                 # 2. Exchange order
                 from services import exchange_service
@@ -5556,6 +5615,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             verdict["approved_qty"] = float(capped_qty)
                             return verdict
 
+                    _exec_mark(_exec_trace, "attempt_started_at")
                     order_res = await _maker_fn(
                         symbol=rec["symbol"],
                         side=exch_side,
@@ -5593,6 +5653,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             "client_order_id": client_order_id,
                         }
                     else:
+                        _exec_mark(_exec_trace, "attempt_started_at")
                         order_res = await exchange_service.place_order(
                             symbol=rec["symbol"],
                             side=exch_side,
@@ -5606,6 +5667,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             client_order_id=client_order_id,
                             entry_preflight=_market_entry_preflight,
                         )
+                _exec_mark(_exec_trace, "attempt_returned_at")
                 if order_res.get("client_order_id"):
                     client_order_id = str(order_res["client_order_id"])
                 _needs_manual = bool(
@@ -5615,6 +5677,11 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 _pending_entry_order = bool(order_res.get("pending_entry_order"))
                 _emergency_attempted = bool(order_res.get("emergency_close_attempted"))
                 if _emergency_attempted or _needs_manual:
+                    # P05.2L: estado de submissão desconhecido — registrado antes
+                    # das saídas por `continue`. Não altera nada do fail-safe.
+                    await _record_entry_latency(
+                        _exec_trace, snap_id, entry_route=_entry_route,
+                        order_res=order_res, attempted=True)
                     # Binance centraliza o fail-safe no mesmo serviço que conhece
                     # a qty efetivamente preenchida. Aqui apenas notifica e NÃO
                     # tenta fechar de novo (evita uma segunda reduceOnly concorrente).
@@ -5710,6 +5777,11 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         # alerta são a fonte de verdade; não inventa trade no DB.
                         continue
                 if not order_res.get("ok") and not _track_unprotected_incident:
+                    # P05.2L: NOT_SUBMITTED / NO_FILL / UNKNOWN, conforme o
+                    # contrato já devolvido pelo transport. Só observação.
+                    await _record_entry_latency(
+                        _exec_trace, snap_id, entry_route=_entry_route,
+                        order_res=order_res, attempted=True)
                     if order_res.get("preflight_failed"):
                         _code = order_res.get("reason_code") or "EXEC_PREFLIGHT_BLOCKED"
                         _reason = order_res.get("error") or "revalidação pré-entrada bloqueou"
@@ -5840,6 +5912,11 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     f"order_id={exchange_order_id} avg={entry_actual} "
                     f"SL={sl_oid} TP1={tp1_oid} TP2={tp2_oid}"
                 )
+                # P05.2L: resultado crítico já definido (proteções tratadas).
+                # FILL_CONFIRMED só com preço médio e qty auditáveis.
+                await _record_entry_latency(
+                    _exec_trace, snap_id, entry_route=_entry_route,
+                    order_res=order_res, attempted=True)
 
             # IDs das ordens condicionais (só existem no fluxo "auto"; em shadow ficam None)
             _sl_oid = locals().get("sl_oid") if source == "auto" else None
@@ -5882,6 +5959,15 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 adaptive_runner_qty_pct=(_adaptive or {}).get("runner_qty_pct"),
                 adaptive_test_idx=_adaptive_idx,
             )
+            if source == "auto" and _exec_trace is not None:
+                # P05.2L: OPEN_PERSISTED ou PERSISTENCE_FAILED, depois que a
+                # persistência já foi resolvida. Nunca muda o retorno acima.
+                if trade is not None:
+                    _exec_mark(_exec_trace, "real_trade_persisted_at")
+                await _record_entry_latency(
+                    _exec_trace, snap_id, entry_route=_entry_route,
+                    order_res=locals().get("order_res"), attempted=True,
+                    trade_persisted=trade is not None)
             if trade is not None:
                 if _track_unprotected_incident:
                     log.critical(

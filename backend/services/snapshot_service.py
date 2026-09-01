@@ -12,8 +12,10 @@ Como funciona:
   uma janela de 2h pra não inflar com a varredura rodando a cada 2 min.
 """
 from __future__ import annotations
+import json as _json
 import logging
 import os
+import time as _time
 from datetime import datetime, timedelta, timezone, date
 from typing import List, Dict, Any, Optional
 
@@ -595,6 +597,440 @@ def _finalize_path(snap, *, status: str, reason: str, now: datetime) -> None:
                                        reason=reason, now=now, finalize=True)
     except Exception as exc:                      # telemetria nunca interrompe
         log.debug(f"[p05.1t] finalize falhou snapshot={getattr(snap, 'id', '?')}: {exc}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  P05.2L — EXECUTION LATENCY TELEMETRY (observação pura)
+#
+#  Registra PROSPECTIVAMENTE a duração do caminho de entrada LIVE:
+#  decisão → tentativa → retorno da chamada → persistência do RealTrade.
+#
+#  Nunca altera decisão, execução, qty, entrada, SL, TP ou fluxo de controle.
+#  Nunca faz chamada adicional à exchange. Falha é FAIL-SOFT. UNKNOWN nunca
+#  vira zero, sucesso, fill ou ausência comprovada.
+# ════════════════════════════════════════════════════════════════════════════
+P05_EXEC_SCHEMA_VERSION = 1
+P05_EXEC_SOURCE = "LIVE_ENTRY_CALLER"
+P05_EXEC_KEY = "p05_execution_path"
+
+EXEC_NOT_SUBMITTED = "NOT_SUBMITTED"
+EXEC_NO_FILL = "NO_FILL"
+EXEC_SUBMISSION_UNKNOWN = "SUBMISSION_UNKNOWN"
+EXEC_FILL_CONFIRMED = "FILL_CONFIRMED"
+EXEC_OPEN_PERSISTED = "OPEN_PERSISTED"
+EXEC_PERSISTENCE_FAILED = "PERSISTENCE_FAILED"
+EXEC_UNAVAILABLE = "UNAVAILABLE"
+
+EXEC_STATUSES = (
+    EXEC_NOT_SUBMITTED, EXEC_NO_FILL, EXEC_SUBMISSION_UNKNOWN,
+    EXEC_FILL_CONFIRMED, EXEC_OPEN_PERSISTED, EXEC_PERSISTENCE_FAILED,
+    EXEC_UNAVAILABLE,
+)
+
+# Ordem de COMPLETUDE do trace. Um registro mais incompleto NUNCA substitui um
+# mais completo (guarda do UPDATE atômico); rank igual sobrescreve, o que torna
+# o retry idempotente.
+_EXEC_RANK = {
+    EXEC_UNAVAILABLE: 0,
+    EXEC_NOT_SUBMITTED: 1,
+    EXEC_NO_FILL: 2,
+    EXEC_SUBMISSION_UNKNOWN: 3,
+    EXEC_PERSISTENCE_FAILED: 4,
+    EXEC_FILL_CONFIRMED: 5,
+    EXEC_OPEN_PERSISTED: 6,
+}
+
+EXEC_QUALITY_COMPLETE = "COMPLETE"
+EXEC_QUALITY_PARTIAL = "PARTIAL"
+EXEC_QUALITY_UNAVAILABLE = "UNAVAILABLE"
+
+EXEC_ROUTE_MAKER = "maker"
+EXEC_ROUTE_MARKET = "market"
+EXEC_ROUTE_MAKER_FALLBACK = "maker_fallback_market"
+EXEC_ROUTE_UNKNOWN = "unknown"
+
+_EXEC_TIME_FIELDS = ("decision_at", "attempt_started_at", "attempt_returned_at",
+                     "real_trade_persisted_at")
+
+# Janela plausível para um timestamp em ms vindo da exchange (2001 → 2100).
+_EXEC_TS_MIN_MS = 1_000_000_000_000
+_EXEC_TS_MAX_MS = 4_102_444_800_000
+
+P05_EXEC_LIMITATIONS = [
+    "descreve o CAMINHO TÉCNICO da entrada; não prova causa de ganho ou stop",
+    "attempt_roundtrip_ms inclui preflight e processamento interno do helper — "
+    "NÃO é 'tempo de fill'",
+    "exchange_event_at só existe quando a resposta traz timestamp explícito",
+    "fill não auditável fica UNKNOWN (null), nunca é inferido de ok=true",
+    "sem backfill: só entradas posteriores ao P05.2L têm trace",
+]
+
+_EXEC_EXPECTED = {
+    EXEC_NOT_SUBMITTED: ("decision_at",),
+    EXEC_NO_FILL: ("decision_at", "attempt_started_at", "attempt_returned_at",
+                   "decision_to_attempt_ms", "attempt_roundtrip_ms"),
+    EXEC_SUBMISSION_UNKNOWN: ("decision_at", "attempt_started_at",
+                              "attempt_returned_at", "decision_to_attempt_ms",
+                              "attempt_roundtrip_ms"),
+    EXEC_FILL_CONFIRMED: ("decision_at", "attempt_started_at", "attempt_returned_at",
+                          "decision_to_attempt_ms", "attempt_roundtrip_ms",
+                          "fill_confirmed", "fill_price_source"),
+    EXEC_PERSISTENCE_FAILED: ("decision_at", "attempt_started_at",
+                              "attempt_returned_at", "decision_to_attempt_ms",
+                              "attempt_roundtrip_ms", "fill_confirmed"),
+    EXEC_OPEN_PERSISTED: ("decision_at", "attempt_started_at", "attempt_returned_at",
+                          "real_trade_persisted_at", "decision_to_attempt_ms",
+                          "attempt_roundtrip_ms", "attempt_to_persist_ms",
+                          "end_to_end_ms", "fill_confirmed"),
+    EXEC_UNAVAILABLE: (),
+}
+
+
+def _exec_utc(value) -> Optional[datetime]:
+    """Normaliza para datetime UTC. Qualquer coisa inválida vira `None`."""
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _exec_iso(value) -> Optional[str]:
+    dt = _exec_utc(value)
+    return dt.isoformat() if dt else None
+
+
+def new_execution_trace(*, snapshot_id=None, snapshot_created_at=None,
+                        now: datetime | None = None) -> dict:
+    """Semente do trace, criada em MEMÓRIA depois dos gates.
+
+    `decision_at` é o instante em que o fluxo LIVE decidiu tentar a entrada.
+    Timestamps duráveis em UTC; durações medidas por relógio MONOTÔNICO.
+    """
+    ts = _exec_utc(now) or datetime.now(timezone.utc)
+    return {
+        "snapshot_id": snapshot_id,
+        "snapshot_created_at": _exec_iso(snapshot_created_at),
+        "decision_at": ts.isoformat(),
+        "_utc": {"decision_at": ts,
+                 "snapshot_created_at": _exec_utc(snapshot_created_at)},
+        "_mono": {"decision_at": _time.monotonic()},
+    }
+
+
+def exec_trace_mark(trace, field: str, *, now: datetime | None = None) -> None:
+    """Marca UM instante do caminho. No-op se o trace não existe. Nunca levanta."""
+    try:
+        if not isinstance(trace, dict) or field not in _EXEC_TIME_FIELDS:
+            return
+        ts = _exec_utc(now) or datetime.now(timezone.utc)
+        trace[field] = ts.isoformat()
+        trace.setdefault("_utc", {})[field] = ts
+        trace.setdefault("_mono", {})[field] = _time.monotonic()
+    except Exception:                                   # telemetria nunca quebra
+        return
+
+
+def _exec_duration_ms(trace, start: str, end: str) -> Optional[float]:
+    """Duração por relógio MONOTÔNICO (mesmo processo).
+
+    Negativa, NaN, infinita ou com marca ausente ⇒ `None`. NUNCA zero.
+    """
+    mono = (trace or {}).get("_mono") or {}
+    a, b = mono.get(start), mono.get(end)
+    if a is None or b is None:
+        return None
+    delta = (b - a) * 1000.0
+    if not _math.isfinite(delta) or delta < 0:
+        return None
+    return round(delta, 2)
+
+
+def _exec_span_ms(a, b) -> Optional[float]:
+    """Duração entre dois timestamps UTC duráveis. Invertida/inválida ⇒ `None`."""
+    ta, tb = _exec_utc(a), _exec_utc(b)
+    if ta is None or tb is None:
+        return None
+    delta = (tb - ta).total_seconds() * 1000.0
+    if not _math.isfinite(delta) or delta < 0:
+        return None
+    return round(delta, 2)
+
+
+def exchange_event_at_from(order_res) -> Optional[str]:
+    """Timestamp EXPLÍCITO da exchange, quando existir e for plausível.
+
+    Nunca substitui por horário local: sem campo válido devolve `None`.
+    """
+    result = (order_res or {}).get("result") or {}
+    if not isinstance(result, dict):
+        return None
+    for key in ("updateTime", "transactTime", "time", "eventTime"):
+        raw = result.get(key)
+        if raw is None:
+            continue
+        try:
+            ms = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if _EXEC_TS_MIN_MS <= ms <= _EXEC_TS_MAX_MS:
+            return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).isoformat()
+    return None
+
+
+def execution_route(entry_route, order_res) -> str:
+    """Rota efetivamente usada: maker, market ou fallback do maker."""
+    res = order_res or {}
+    if res.get("fell_back_to_market"):
+        return EXEC_ROUTE_MAKER_FALLBACK
+    if res.get("was_maker"):
+        return EXEC_ROUTE_MAKER
+    route = str(entry_route or "").strip().lower()
+    if route == "maker":
+        return EXEC_ROUTE_MAKER
+    if route == "market":
+        return EXEC_ROUTE_MARKET
+    return EXEC_ROUTE_UNKNOWN
+
+
+def _exec_fill_evidence(order_res) -> tuple:
+    """Evidência de fill JÁ usada pelo fluxo: preço médio válido + qty executada.
+
+    `ok=true` NÃO é evidência de fill. Sem preço auditável o fill fica UNKNOWN
+    (`None`), nunca `False` por omissão.
+    """
+    res = order_res or {}
+    result = res.get("result") or {}
+    if not isinstance(result, dict):
+        result = {}
+    price_source = None
+    avg = None
+    for key in ("avgPrice", "avgFillPrice"):
+        raw = result.get(key)
+        if raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if _math.isfinite(val) and val > 0:
+            avg, price_source = val, key
+            break
+    executed = None
+    for raw in (res.get("executed_qty"), result.get("executedQty")):
+        if raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if _math.isfinite(val):
+            executed = val
+            break
+    if avg is not None and executed is not None and executed > 0:
+        return True, price_source
+    return None, price_source
+
+
+def classify_execution_attempt(order_res, *, attempted: bool,
+                               trade_persisted: bool | None = None) -> dict:
+    """Classifica UMA tentativa de entrada LIVE. Função PURA (sem rede/DB).
+
+    Fill nunca é afirmado a partir de `ok=true`: exige preço médio válido e
+    quantidade executada confirmada.
+    """
+    res = order_res or {}
+    fill_confirmed, price_source = _exec_fill_evidence(res)
+    reason_code = res.get("reason_code")
+
+    if not attempted:
+        status = EXEC_NOT_SUBMITTED
+        reason_code = reason_code or "ENTRY_NOT_ATTEMPTED"
+        fill_confirmed = False if fill_confirmed is None else fill_confirmed
+    elif res.get("preflight_failed") or res.get("entry_not_submitted"):
+        status = EXEC_NOT_SUBMITTED
+        reason_code = reason_code or "ENTRY_NOT_SUBMITTED"
+        fill_confirmed = False
+    elif trade_persisted is True:
+        status = EXEC_OPEN_PERSISTED
+    elif trade_persisted is False:
+        status = (EXEC_PERSISTENCE_FAILED if fill_confirmed is True
+                  else EXEC_SUBMISSION_UNKNOWN)
+        reason_code = reason_code or "REAL_TRADE_NOT_PERSISTED"
+    elif res.get("no_fill") and not res.get("ok"):
+        status = EXEC_NO_FILL
+        reason_code = reason_code or "MAKER_NO_FILL"
+        fill_confirmed = False
+    elif (res.get("manual_intervention_required") or res.get("quarantine_required")
+          or res.get("emergency_close_attempted") or res.get("pending_entry_order")
+          or res.get("final_fill_qty_unknown")):
+        status = EXEC_SUBMISSION_UNKNOWN
+        reason_code = reason_code or "EXECUTION_STATE_UNKNOWN"
+    elif fill_confirmed is True:
+        status = EXEC_FILL_CONFIRMED
+    else:
+        # ok=true sem preço/qty auditáveis também é UNKNOWN — nunca fill.
+        status = EXEC_SUBMISSION_UNKNOWN
+        reason_code = reason_code or "FILL_NOT_AUDITABLE"
+
+    return {
+        "status": status,
+        "reason_code": reason_code,
+        "fill_confirmed": fill_confirmed,
+        "fill_price_source": price_source,
+        "exchange_event_at": exchange_event_at_from(res),
+    }
+
+
+def build_execution_path(trace, *, status: str, route: str | None = None,
+                         fill_confirmed=None, fill_price_source=None,
+                         reason_code=None, exchange_event_at=None,
+                         now: datetime | None = None) -> dict:
+    """Normaliza o trace no schema versionado `p05_execution_path`.
+
+    Valor inválido (NaN, infinito, negativo, timestamp invertido) vira `null` e
+    entra em `missing_fields` — nunca zero.
+    """
+    ts_now = _exec_utc(now) or datetime.now(timezone.utc)
+    trace = trace if isinstance(trace, dict) else {}
+    final_status = status if status in EXEC_STATUSES else EXEC_UNAVAILABLE
+
+    utc = trace.get("_utc") or {}
+    payload = {
+        "schema_version": P05_EXEC_SCHEMA_VERSION,
+        "source": P05_EXEC_SOURCE,
+        "status": final_status,
+        "route": route or EXEC_ROUTE_UNKNOWN,
+        "snapshot_created_at": trace.get("snapshot_created_at"),
+        "decision_at": trace.get("decision_at"),
+        "attempt_started_at": trace.get("attempt_started_at"),
+        "attempt_returned_at": trace.get("attempt_returned_at"),
+        "real_trade_persisted_at": trace.get("real_trade_persisted_at"),
+        "exchange_event_at": exchange_event_at,
+        "decision_to_attempt_ms": _exec_duration_ms(
+            trace, "decision_at", "attempt_started_at"),
+        "attempt_roundtrip_ms": _exec_duration_ms(
+            trace, "attempt_started_at", "attempt_returned_at"),
+        "attempt_to_persist_ms": _exec_duration_ms(
+            trace, "attempt_returned_at", "real_trade_persisted_at"),
+        "end_to_end_ms": _exec_span_ms(utc.get("snapshot_created_at"),
+                                       utc.get("real_trade_persisted_at")),
+        "fill_confirmed": fill_confirmed if isinstance(fill_confirmed, bool) else None,
+        "fill_price_source": fill_price_source or None,
+        "reason_code": reason_code or None,
+        "recorded_at": ts_now.isoformat(),
+        "completeness_rank": _EXEC_RANK.get(final_status, 0),
+        "limitations": P05_EXEC_LIMITATIONS,
+    }
+
+    missing = [f for f in _EXEC_EXPECTED.get(final_status, ())
+               if payload.get(f) is None]
+    payload["missing_fields"] = missing
+    if final_status == EXEC_UNAVAILABLE or payload["decision_at"] is None:
+        payload["quality"] = EXEC_QUALITY_UNAVAILABLE
+    elif missing:
+        payload["quality"] = EXEC_QUALITY_PARTIAL
+    else:
+        payload["quality"] = EXEC_QUALITY_COMPLETE
+    return payload
+
+
+def merge_execution_path(features, payload) -> dict:
+    """Reatribui um NOVO dict de `features` com `p05_execution_path` mesclado.
+
+    Preserva TODAS as outras chaves (`p05_path`, `p05_context`, …) e nunca
+    deixa um trace mais incompleto apagar um mais completo.
+    """
+    out = dict(features) if isinstance(features, dict) else {}
+    if not isinstance(payload, dict):
+        return out
+    prev = out.get(P05_EXEC_KEY)
+    if isinstance(prev, dict):
+        try:
+            if int(payload.get("completeness_rank") or 0) < int(
+                    prev.get("completeness_rank") or 0):
+                return out
+        except (TypeError, ValueError):
+            pass
+    out[P05_EXEC_KEY] = dict(payload)
+    return out
+
+
+def _jsonb_namespace_merge(key: str, value):
+    """Expressão SQL `coalesce(features,'{}') || {"<key>": value}`.
+
+    Avaliada no PostgreSQL contra o valor ATUAL da linha: preserva todas as
+    outras chaves de `features` mesmo com gravação concorrente. Substitui o
+    read-modify-write ingênuo do JSON completo.
+    """
+    from sqlalchemy import cast, literal
+    from sqlalchemy.dialects.postgresql import JSONB
+    blob = _json.dumps({key: value}, default=str)
+    current = func.coalesce(RecommendationSnapshot.features,
+                            cast(literal("{}"), JSONB))
+    return current.op("||")(cast(literal(blob), JSONB))
+
+
+async def persist_execution_path(snapshot_id, payload) -> str:
+    """Grava SÓ `features['p05_execution_path']` pelo `snapshot_id` EXATO.
+
+    UPDATE JSONB ATÔMICO com guarda de completude: `p05_path` e `p05_context`
+    nunca são apagados, e um trace mais incompleto não substitui um mais
+    completo. Idempotente. Fail-soft: nunca levanta, nunca chama a exchange.
+    """
+    if not DB_ENABLED or snapshot_id is None or not isinstance(payload, dict):
+        return "SKIPPED"
+    try:
+        from sqlalchemy import Integer, cast, literal
+        from sqlalchemy.dialects.postgresql import JSONB
+        rank = int(payload.get("completeness_rank") or 0)
+        # `jsonb_extract_path_text` em vez de subscript: funciona em qualquer
+        # versão do PostgreSQL e não depende do dialeto detectado.
+        stored = cast(
+            func.jsonb_extract_path_text(
+                func.coalesce(RecommendationSnapshot.features,
+                              cast(literal("{}"), JSONB)),
+                P05_EXEC_KEY, "completeness_rank"),
+            Integer)
+        stmt = (
+            update(RecommendationSnapshot)
+            .where(RecommendationSnapshot.id == snapshot_id)
+            .where(func.coalesce(stored, -1) <= rank)
+            .values(features=_jsonb_namespace_merge(P05_EXEC_KEY, payload))
+            .execution_options(synchronize_session=False)
+        )
+        async with get_session() as session:
+            res = await session.execute(stmt)
+            await session.commit()
+        return "WRITTEN" if (res.rowcount or 0) > 0 else "SKIPPED_NOT_NEWER"
+    except Exception as exc:                       # telemetria nunca interrompe
+        log.warning(f"[p05.2l] persistência do trace falhou "
+                    f"snapshot={snapshot_id}: {exc}")
+        return "FAILED"
+
+
+def stage_feature_namespace_merge(snap, key: str = "p05_path") -> bool:
+    """Converte a reatribuição de `features` já feita pelo P05.1T em um merge
+    JSONB ATÔMICO de UMA chave, sem emitir consulta extra.
+
+    O UPDATE do ORM grava a coluna INTEIRA; entre o SELECT do resolver e o
+    COMMIT do lote, uma gravação concorrente de `p05_execution_path` (P05.2L)
+    seria apagada. Com a expressão `features || {"<key>": …}` o merge acontece
+    no servidor, então nenhum namespace apaga o outro.
+
+    Fail-soft: em qualquer erro devolve `False` e a reatribuição original (o
+    comportamento anterior) permanece.
+    """
+    try:
+        if not DB_ENABLED or getattr(snap, "id", None) is None:
+            return False
+        feats = snap.features
+        if not isinstance(feats, dict) or key not in feats:
+            return False
+        snap.features = _jsonb_namespace_merge(key, feats[key])
+        return True
+    except Exception as exc:
+        log.debug(f"[p05.1t] merge atômico indisponível "
+                  f"snapshot={getattr(snap, 'id', '?')}: {exc}")
+        return False
 
 
 async def _current_regime_label() -> str | None:
@@ -1430,6 +1866,7 @@ async def check_open_snapshots() -> int:
                     _finalize_path(snap, status=PATH_FINAL_PARTIAL,
                                    reason="time-stop sem janela final de candles",
                                    now=now)
+                    stage_feature_namespace_merge(snap)   # P05.2L: não apaga vizinhos
                     log.info(
                         f"[time-stop] {snap.symbol} {snap.timeframe} {snap.direction} "
                         f"expirado: {age.total_seconds()/3600:.1f}h sem TP1 "
@@ -1462,6 +1899,7 @@ async def check_open_snapshots() -> int:
                     _finalize_path(snap, status=PATH_FINAL_PARTIAL,
                                    reason="teto de expiração sem janela final de candles",
                                    now=now)
+                    stage_feature_namespace_merge(snap)   # P05.2L: não apaga vizinhos
                     resolved += 1
                     continue
 
@@ -1510,6 +1948,7 @@ async def check_open_snapshots() -> int:
                         _finalize_path(snap, status=PATH_FINAL_PARTIAL,
                                        reason="símbolo sem dados na fonte (delistado)",
                                        now=now)
+                        stage_feature_namespace_merge(snap)   # P05.2L
                         log.warning(
                             f"[no-data] {snap.symbol} {snap.timeframe} {snap.direction} "
                             f"encerrado expired: NÃO é perp TRADING na Binance "
@@ -1600,6 +2039,9 @@ async def check_open_snapshots() -> int:
                             snap.features, _path,
                             status=(PATH_FINAL_OBSERVED if _terminal else None),
                             now=now, finalize=_terminal)
+                        # P05.2L — grava só a chave `p05_path`, no servidor: a
+                        # latência da entrada não é apagada pelo lote.
+                        stage_feature_namespace_merge(snap)
                 except Exception as _pe:
                     log.debug(f"[p05.1t] merge falhou {snap.id}: {_pe}")
 

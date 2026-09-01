@@ -752,13 +752,25 @@ class ApiCacheArchTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse([k for k in env if "P052" in k or "STOP_DIAG" in k.upper()])
 
     def test_arquivos_proibidos_intactos(self):
+        """O P05.2A não tocou nos arquivos proibidos DA SUA FASE.
+
+        A verificação é feita sobre os commits da fase (3540a699 e 0aabf34b), e
+        não sobre o working tree: fases posteriores (P05.2L) instrumentam
+        `snapshot_service` e `shadow_trade_service` com autorização explícita.
+        """
         import subprocess
-        out = subprocess.run(["git", "status", "--short"], cwd=BACKEND.parent,
-                             capture_output=True, text=True).stdout
-        for proibido in ("snapshot_service.py", "shadow_trade_service.py",
-                         "trade_manager_service.py", "backend/main.py",
-                         "frontend/dist/assets"):
-            self.assertNotIn(proibido, out, f"arquivo proibido alterado: {proibido}")
+        proibidos = ("snapshot_service.py", "shadow_trade_service.py",
+                     "trade_manager_service.py", "backend/main.py",
+                     "frontend/dist/assets")
+        for commit in ("3540a699", "0aabf34b"):
+            res = subprocess.run(
+                ["git", "show", "--name-only", "--pretty=format:", commit],
+                cwd=BACKEND.parent, capture_output=True, text=True)
+            if res.returncode != 0:
+                self.skipTest(f"commit {commit} indisponível neste checkout")
+            for proibido in proibidos:
+                self.assertNotIn(proibido, res.stdout,
+                                 f"P05.2A alterou arquivo proibido: {proibido}")
 
 
 # ════════════════════════════════════════════════════════════════════════════

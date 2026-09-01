@@ -961,3 +961,44 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   `main.py` não foi modificado. Falha do laboratório devolve
   `offline_lab.status="UNAVAILABLE"`, não derruba o P05.2A e não envenena o
   cache.
+
+## P05.2L — Execution Latency Telemetry (observação pura)
+
+- **ANTES**: `summarize_latency()` devolvia um bloco estático `UNAVAILABLE` — não
+  havia timestamp durável de decisão nem de ACK, e latência de *fetch* de dados
+  não é latência de execução.
+- **DEPOIS**: trace prospectivo por entrada LIVE em
+  `RecommendationSnapshot.features["p05_execution_path"]` (schema versionado 1,
+  `source="LIVE_ENTRY_CALLER"`), com resumo analítico real
+  (`UNAVAILABLE` → `COLLECTING` → `USABLE`, limiares 30 observações / 80% de
+  cobertura) e seção própria no painel. Nenhuma mudança de estratégia.
+- Tempos: UTC para timestamps duráveis, relógio **monotônico** para durações.
+  `decision_at` (fim dos gates) · `attempt_started_at` (imediatamente antes do
+  `await` de maker/market) · `attempt_returned_at` · `real_trade_persisted_at`
+  (após `_open_trade_fail_closed`) · `exchange_event_at` só com timestamp
+  explícito e plausível da exchange — nunca substituído por horário local.
+  NaN, infinito, negativo ou timestamp invertido viram `null` com
+  `quality=PARTIAL/UNAVAILABLE`; nunca zero.
+- Fill **nunca** é inferido de `ok=true`: exige preço médio válido
+  (`avgPrice`/`avgFillPrice`) e quantidade executada confirmada. Sem evidência,
+  `fill_confirmed=null` e o campo entra em `missing_fields`.
+- Hot path: instrumentado SOMENTE o caminho de entrada LIVE normal em
+  `shadow_trade_service.py` (shadow puro, hedge, pyramiding, TF upgrade,
+  fechamento, trade manager e autoheal ficam de fora). Montagem em memória,
+  início depois dos gates, nenhuma leitura/escrita no banco antes da tentativa,
+  persistência só depois do resultado crítico. Nunca altera `order_res`, `qty`,
+  entrada, SL, TP, `continue`, retry ou retorno; falha é fail-soft, sem pausa,
+  sem retry e sem segunda chamada à exchange.
+- Merge JSONB **sem perda**: `persist_execution_path` grava só a chave
+  `p05_execution_path` com UPDATE atômico
+  (`features || '{...}'::jsonb`) e guarda de completude no `WHERE`, tornando o
+  retry idempotente e impedindo downgrade. No sentido inverso, os quatro pontos
+  do P05.1T que reatribuíam `snap.features` passam por
+  `stage_feature_namespace_merge`, que converte a reatribuição em merge atômico
+  da chave `p05_path` sem consulta extra — o lote do resolver deixa de apagar
+  uma latência gravada no intervalo. O resolver não foi refatorado.
+- Slippage continua com fonte única `RealTrade.entry_slippage_pct`; latência
+  **não** é correlacionada com lucro ou stop nesta fase.
+- Nenhuma tabela, coluna, migration, env, flag ou endpoint novo; nenhum payload
+  bruto, header, assinatura, credencial, token, proxy ou ID condicional é
+  persistido.

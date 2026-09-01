@@ -674,10 +674,13 @@ class SlippageTests(unittest.TestCase):
         self.assertIsNone(out["mean"])
 
     def test_latencia_nao_e_inventada(self):
-        out = p05.summarize_latency()
+        # P05.2L: sem trace persistido, a latência continua UNAVAILABLE — nunca
+        # é estimada por aproximação nem preenchida com zero.
+        out = p05.summarize_latency([])
         self.assertEqual(out["status"], "UNAVAILABLE")
-        self.assertIn("fetch latency não é", out["reason"])
-        self.assertIn("decision_at", out["missing_fields"])
+        self.assertEqual(out["attempts_observed"], 0)
+        self.assertIsNone(out["coverage_pct"])
+        self.assertIsNone(out["attempt_roundtrip_ms"]["median"])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -795,12 +798,24 @@ class ApiArchitectureTests(unittest.TestCase):
         self.assertFalse([k for k in env if "P051T" in k or "TELEMETRY" in k.upper()])
 
     def test_arquivos_proibidos_intactos(self):
+        """O P05.1T não tocou nos arquivos proibidos DA SUA FASE.
+
+        Verificado sobre os commits da fase (3f140d6b e 25889f23), não sobre o
+        working tree: o P05.2L instrumenta `shadow_trade_service` com
+        autorização explícita.
+        """
         import subprocess
-        out = subprocess.run(["git", "status", "--short"], cwd=BACKEND.parent,
-                             capture_output=True, text=True).stdout
-        for proibido in ("shadow_trade_service.py", "trade_manager_service.py",
-                         "binance_signed_service.py", "frontend/dist/assets"):
-            self.assertNotIn(proibido, out, f"arquivo proibido alterado: {proibido}")
+        proibidos = ("shadow_trade_service.py", "trade_manager_service.py",
+                     "binance_signed_service.py", "frontend/dist/assets")
+        for commit in ("3f140d6b", "25889f23"):
+            res = subprocess.run(
+                ["git", "show", "--name-only", "--pretty=format:", commit],
+                cwd=BACKEND.parent, capture_output=True, text=True)
+            if res.returncode != 0:
+                self.skipTest(f"commit {commit} indisponível neste checkout")
+            for proibido in proibidos:
+                self.assertNotIn(proibido, res.stdout,
+                                 f"P05.1T alterou arquivo proibido: {proibido}")
 
     def test_telemetria_nao_alimenta_avaliacao(self):
         """`p05_path` não pode entrar em nenhum caminho de decisão do P05.1."""

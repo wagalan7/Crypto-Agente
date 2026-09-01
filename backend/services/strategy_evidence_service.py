@@ -1976,20 +1976,136 @@ def summarize_slippage(real_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def summarize_latency() -> Dict[str, Any]:
-    """Latência de execução ponta a ponta.
+P052L_EXEC_KEY = "p05_execution_path"
 
-    Não existe timestamp durável suficiente para medi-la: `RealTrade` guarda
-    `opened_at`, mas não o instante da DECISÃO nem o do ACK da corretora. Latência
-    de fetch de dados NÃO é latência de execução — usar uma no lugar da outra seria
-    afirmação falsa. Medir exigiria tocar o hot path, o que está fora desta fase.
+P052L_LIMITATIONS = [
+    "descreve o CAMINHO TÉCNICO da entrada; não prova causa de ganho ou stop",
+    "duração da chamada inclui preflight e processamento do helper — não é "
+    "'tempo de fill'",
+    "sem backfill: só entradas posteriores ao P05.2L têm trace",
+    "fill não auditável permanece UNKNOWN; ausência nunca vira zero",
+]
+
+
+def summarize_latency(rows: Sequence[Dict[str, Any]] = (),
+                      real_rows: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
+    """P05.2L — latência do caminho de entrada LIVE, a partir dos traces REAIS.
+
+    Lê SOMENTE `features["p05_execution_path"]` já persistido. Sem backfill, sem
+    reconstrução por aproximação e sem correlacionar latência com lucro ou stop.
+    Slippage NÃO é recalculado aqui: a fonte única continua sendo
+    `RealTrade.entry_slippage_pct` (bloco `slippage` da mesma resposta).
     """
+    traces: List[Dict[str, Any]] = []
+    missing_by_reason: Dict[str, int] = {}
+    trace_snapshot_ids: set = set()
+
+    def _miss(reason: str) -> None:
+        missing_by_reason[reason] = missing_by_reason.get(reason, 0) + 1
+
+    for row in rows or ():
+        path = (row.get("features") or {}).get(P052L_EXEC_KEY)
+        if not isinstance(path, dict):
+            continue                      # sem tentativa LIVE registrada
+        if path.get("schema_version") != 1 or path.get("status") not in (
+                "NOT_SUBMITTED", "NO_FILL", "SUBMISSION_UNKNOWN", "FILL_CONFIRMED",
+                "OPEN_PERSISTED", "PERSISTENCE_FAILED", "UNAVAILABLE"):
+            _miss("trace inválido ou de schema desconhecido")
+            continue
+        traces.append(path)
+        if row.get("id") is not None:
+            trace_snapshot_ids.add(row["id"])
+
+    observed = len(traces)
+    if observed == 0:
+        return {
+            "status": TELEMETRY_UNAVAILABLE,
+            "reason": ("nenhuma entrada LIVE com trace de latência na janela "
+                       "(sem backfill: só entradas posteriores ao P05.2L)"),
+            "attempts_observed": 0,
+            "by_status": {}, "by_route": {}, "by_quality": {},
+            "coverage_pct": None,
+            "missing_by_reason": missing_by_reason,
+            "decision_to_attempt_ms": _distribution([]),
+            "attempt_roundtrip_ms": _distribution([]),
+            "attempt_to_persist_ms": _distribution([]),
+            "end_to_end_ms": _distribution([]),
+            "fill_auditable": 0,
+            "without_exchange_timestamp": 0,
+            "linked_real_trades": 0,
+            "min_observed": P051T_MIN_OBSERVED,
+            "min_coverage_pct": P051T_MIN_COVERAGE_PCT,
+            "slippage_source": ("RealTrade.entry_slippage_pct — ver o bloco "
+                                "`slippage` desta mesma resposta"),
+            "limitations": P052L_LIMITATIONS,
+        }
+
+    by_status: Dict[str, int] = {}
+    by_route: Dict[str, int] = {}
+    by_quality: Dict[str, int] = {}
+    d2a: List[float] = []
+    rt: List[float] = []
+    a2p: List[float] = []
+    e2e: List[float] = []
+    fill_auditable = 0
+    no_exchange_ts = 0
+    complete_or_usable = 0
+
+    for path in traces:
+        st = str(path.get("status"))
+        by_status[st] = by_status.get(st, 0) + 1
+        route = str(path.get("route") or "unknown")
+        by_route[route] = by_route.get(route, 0) + 1
+        quality = str(path.get("quality") or "UNAVAILABLE")
+        by_quality[quality] = by_quality.get(quality, 0) + 1
+        if quality == "COMPLETE":
+            complete_or_usable += 1
+        for reason in (path.get("missing_fields") or []):
+            _miss(f"campo ausente: {reason}")
+        for bucket, key in ((d2a, "decision_to_attempt_ms"),
+                            (rt, "attempt_roundtrip_ms"),
+                            (a2p, "attempt_to_persist_ms"),
+                            (e2e, "end_to_end_ms")):
+            val = _finite(path.get(key))
+            if val is not None and val >= 0:
+                bucket.append(val)          # ausência NUNCA vira zero
+        if path.get("fill_confirmed") is True:
+            fill_auditable += 1
+        if not path.get("exchange_event_at"):
+            no_exchange_ts += 1
+
+    coverage = round(complete_or_usable / observed * 100, 1)
+    if observed < P051T_MIN_OBSERVED or coverage < P051T_MIN_COVERAGE_PCT:
+        status = TELEMETRY_COLLECTING
+    else:
+        status = TELEMETRY_USABLE
+
+    linked = sum(1 for r in (real_rows or ())
+                 if r.get("recommendation_id") is not None
+                 and r.get("recommendation_id") in trace_snapshot_ids)
+
     return {
-        "status": TELEMETRY_UNAVAILABLE,
-        "reason": ("sem timestamp durável de decisão→ACK; fetch latency não é "
-                   "execution latency"),
-        "missing_fields": ["decision_at", "order_ack_at"],
-        "would_require": "instrumentar o hot path de execução — fora do escopo do P05.1T",
+        "status": status,
+        "attempts_observed": observed,
+        "by_status": by_status,
+        "by_route": by_route,
+        "by_quality": by_quality,
+        "coverage_pct": coverage,
+        "missing_by_reason": missing_by_reason,
+        "decision_to_attempt_ms": _distribution(d2a),
+        "attempt_roundtrip_ms": _distribution(rt),
+        "attempt_to_persist_ms": _distribution(a2p),
+        "end_to_end_ms": _distribution(e2e),
+        "fill_auditable": fill_auditable,
+        "without_exchange_timestamp": no_exchange_ts,
+        "linked_real_trades": linked,
+        "min_observed": P051T_MIN_OBSERVED,
+        "min_coverage_pct": P051T_MIN_COVERAGE_PCT,
+        "slippage_source": ("RealTrade.entry_slippage_pct — ver o bloco "
+                            "`slippage` desta mesma resposta"),
+        "note": ("mede o caminho TÉCNICO da entrada; nenhuma correlação com "
+                 "lucro ou stop é calculada nesta fase"),
+        "limitations": P052L_LIMITATIONS,
     }
 
 
@@ -2044,12 +2160,20 @@ async def build_telemetry_section(days: int) -> Dict[str, Any]:
     except Exception as exc:
         out["context_coverage"] = {"error": str(exc),
                                    "window_days": P051T_CONTEXT_WINDOW_DAYS}
+    real_rows: List[Dict[str, Any]] = []
     try:
         real_rows, _dq = await _load_real(days)
         out["slippage"] = summarize_slippage(real_rows)
     except Exception as exc:
         out["slippage"] = {"error": str(exc)}
-    out["latency"] = summarize_latency()
+    # P05.2L — latência do caminho de entrada LIVE, dos traces já persistidos.
+    try:
+        if readiness_rows is None:
+            readiness_rows = await _load_readiness_rows(P051T_CONTEXT_WINDOW_DAYS)
+        out["latency"] = summarize_latency(readiness_rows, real_rows)
+    except Exception as exc:
+        log.warning(f"[p05.2l] resumo de latência falhou: {exc}")
+        out["latency"] = {"status": TELEMETRY_UNAVAILABLE, "error": str(exc)}
     try:
         out["gate_availability"] = summarize_gate_availability(
             await _load_gate_events(min(days, 30)))
@@ -4600,6 +4724,7 @@ async def _load_readiness_rows(days: int) -> List[Dict[str, Any]]:
             if resolved_at is None:
                 continue
             out.append({
+                "id": row.id,                 # P05.2L: ligação com RealTrade
                 "dedupe_key": f"snap:{row.id}",
                 "symbol": row.symbol, "timeframe": row.timeframe, "tier": row.tier,
                 "direction": row.direction, "score": row.score,

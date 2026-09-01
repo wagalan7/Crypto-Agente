@@ -286,7 +286,20 @@ interface TelemetryBlock {
     median?: number | null
     p90?: number | null
   }
-  latency?: { status?: string; reason?: string }
+  // P05.2L — latência do caminho de entrada real (observação pura)
+  latency?: {
+    status?: string
+    reason?: string
+    attempts_observed?: number
+    coverage_pct?: number | null
+    by_status?: Record<string, number>
+    by_route?: Record<string, number>
+    by_quality?: Record<string, number>
+    attempt_roundtrip_ms?: Dist
+    end_to_end_ms?: Dist
+    fill_auditable?: number
+    without_exchange_timestamp?: number
+  }
   retention?: { observed_retention_days?: number | null; history_note?: string }
 }
 
@@ -1137,12 +1150,68 @@ export default function AssertivenessPanel({ onClose }: Props) {
                     </div>
                   )}
 
-                  {p05.telemetry?.latency?.status === 'UNAVAILABLE' && (
-                    <div className="mt-1.5 text-[10px] text-slate-500 leading-snug px-1">
-                      Tempo de execução: <strong className="text-slate-400">não medido</strong> — não há
-                      marcação de horário confiável do pedido até a confirmação da corretora.
-                    </div>
-                  )}
+                  {/* ── P05.2L Latência da entrada real ─────────────────── */}
+                  {p05.telemetry?.latency && (() => {
+                    const lat = p05.telemetry!.latency!
+                    const rotas = Object.entries(lat.by_route ?? {})
+                    return (
+                      <div className="mt-1.5 p-2 rounded-lg border border-slate-800 bg-slate-900/40">
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
+                          <div className="text-[11px] font-bold text-slate-300">
+                            Latência da entrada real
+                          </div>
+                          <span className="text-[10px] text-slate-500">
+                            {TELEMETRY_LABEL[lat.status ?? ''] ?? lat.status}
+                            {lat.coverage_pct !== null && lat.coverage_pct !== undefined &&
+                              ` · cobertura ${fmtPct(lat.coverage_pct)}`}
+                          </span>
+                        </div>
+
+                        {(lat.attempts_observed ?? 0) === 0 ? (
+                          <p className="text-[10px] text-slate-500 italic">
+                            Ainda não há entradas reais com medição registrada.
+                          </p>
+                        ) : (
+                          <>
+                            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                              <StatCard label="Entradas medidas" value={`${lat.attempts_observed ?? 0}`}
+                                sub="tentativas observadas" />
+                              <StatCard label="Duração da chamada"
+                                value={lat.attempt_roundtrip_ms?.median !== null && lat.attempt_roundtrip_ms?.median !== undefined
+                                  ? `${Math.round(lat.attempt_roundtrip_ms.median)} ms` : '–'}
+                                sub={`p90 ${lat.attempt_roundtrip_ms?.p90 !== null && lat.attempt_roundtrip_ms?.p90 !== undefined
+                                  ? `${Math.round(lat.attempt_roundtrip_ms.p90)} ms` : '–'}`} />
+                              <StatCard label="Recomendação → registro"
+                                value={lat.end_to_end_ms?.median !== null && lat.end_to_end_ms?.median !== undefined
+                                  ? `${Math.round(lat.end_to_end_ms.median / 1000)} s` : '–'}
+                                sub="mediana" />
+                              <StatCard label="Fills auditáveis" value={`${lat.fill_auditable ?? 0}`}
+                                sub={`${lat.without_exchange_timestamp ?? 0} sem horário da corretora`} />
+                            </div>
+                            {rotas.length > 0 && (
+                              <div className="mt-1 flex flex-wrap gap-1">
+                                {rotas.map(([rota, n]) => (
+                                  <span key={rota}
+                                    className="text-[9px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
+                                    {rota}: {n}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            <div className="mt-1 text-[9px] text-slate-500">
+                              Registros incompletos:{' '}
+                              {(lat.by_quality?.PARTIAL ?? 0) + (lat.by_quality?.UNAVAILABLE ?? 0)}
+                            </div>
+                          </>
+                        )}
+
+                        <p className="mt-1 text-[9px] text-slate-500 leading-snug">
+                          Essa medição descreve o caminho técnico da entrada. Ela ainda não prova que a
+                          latência causou ganho ou stop.
+                        </p>
+                      </div>
+                    )
+                  })()}
 
                   <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
                     Medido em <strong className="text-slate-400">velas de 5 minutos</strong> do setup observado, não
