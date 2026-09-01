@@ -913,6 +913,92 @@ async def _trade_journal(days: int, limit: int = 60) -> Dict[str, Any]:
     return out
 
 
+async def real_stop_summary(days: int) -> Dict[str, Any]:
+    """P05.2A — confirmação SECUNDÁRIA da execução real.
+
+    Só `RealTrade(source="auto")` FECHADO, janela por `closed_at` (nunca
+    `opened_at`). `closed_stop` é o stop real confirmado; `closed_manual` com R
+    negativo fica SEPARADO como `NEGATIVE_MANUAL_EXIT` — nunca se classifica todo
+    `realized_r < 0` como stop. REAL e SHADOW nunca são somados.
+    """
+    from db import get_session
+    from models.real_trade import RealTrade
+    from services.strategy_evidence_service import wilson_interval, reliability_label
+
+    out: Dict[str, Any] = {
+        "source": "RealTrade(source=auto)", "window_days": days,
+        "total_closed": 0, "stops": 0, "stop_rate_pct": None, "stop_rate_ci": None,
+        "negative_manual_exits": 0, "closed_tp1": 0, "closed_tp2": 0, "closed_be": 0,
+        "expectancy_r": None, "sum_r": None, "linked_to_snapshot_pct": None,
+        "reliability": None, "excluded_by_reason": {},
+        "note": ("REAL e SHADOW nunca são somados; amostra real costuma ser "
+                 "pequena e o intervalo reflete isso"),
+    }
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    try:
+        async with get_session() as session:
+            rows = (await session.execute(
+                select(RealTrade)
+                .where(RealTrade.source == "auto")
+                .where(RealTrade.closed_at.is_not(None))
+                .where(RealTrade.closed_at >= since)
+            )).scalars().all()
+    except Exception as e:
+        log.warning(f"[p05.2a] leitura REAL falhou: {e}")
+        return {**out, "error": str(e)}
+
+    excluded: Dict[str, int] = {}
+    rs: List[float] = []
+    linked = 0
+    seen: set = set()
+    total = 0
+    for t in rows:
+        if t.id in seen:
+            excluded["duplicata"] = excluded.get("duplicata", 0) + 1
+            continue
+        seen.add(t.id)
+        total += 1
+        status = (t.status or "").strip()
+        if status == "closed_stop":
+            out["stops"] += 1
+        elif status == "closed_manual":
+            r = t.realized_r
+            if r is not None and isinstance(r, (int, float)) and r == r and abs(r) != float("inf") and r < 0:
+                out["negative_manual_exits"] += 1
+        elif status == "closed_tp1":
+            out["closed_tp1"] += 1
+        elif status == "closed_tp2":
+            out["closed_tp2"] += 1
+        elif status == "closed_be":
+            out["closed_be"] += 1
+        if t.recommendation_id:
+            linked += 1
+        r = t.realized_r
+        if r is None:
+            excluded["realized_r ausente"] = excluded.get("realized_r ausente", 0) + 1
+        else:
+            try:
+                fr = float(r)
+                if fr != fr or abs(fr) == float("inf"):
+                    excluded["realized_r NaN/infinito"] = excluded.get("realized_r NaN/infinito", 0) + 1
+                else:
+                    rs.append(fr)
+            except (TypeError, ValueError):
+                excluded["realized_r inválido"] = excluded.get("realized_r inválido", 0) + 1
+
+    out["total_closed"] = total
+    out["excluded_by_reason"] = excluded
+    if total:
+        out["stop_rate_pct"] = round(out["stops"] / total * 100, 2)
+        out["stop_rate_ci"] = wilson_interval(out["stops"], total)
+        out["linked_to_snapshot_pct"] = round(linked / total * 100, 1)
+        out["reliability"] = reliability_label(total)
+    if rs:
+        out["expectancy_r"] = round(sum(rs) / len(rs), 4)
+        out["sum_r"] = round(sum(rs), 4)
+    return out
+
+
 async def _gate_counterfactual(days: int) -> Dict[str, Any]:
     """#B — Avaliador CONTRAFACTUAL dos gates protetivos que estão OFF. Para cada
     gate desligado, mede sobre o histórico resolvido 'o que ele teria feito',

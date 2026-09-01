@@ -2064,6 +2064,688 @@ async def build_telemetry_section(days: int) -> Dict[str, Any]:
     return out
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  P05.2A — diagnóstico LONGITUDINAL dos stop-losses (ANALYTICS ONLY)
+#
+#  Responde ONDE e EM QUAIS CONTEXTOS as recomendações acumulam stop, separando
+#  volume de TAXA e verificando PERSISTÊNCIA (treino → validação). O teste final
+#  de 25% permanece SELADO: nunca é materializado outcome nem feature dele.
+#
+#  Não otimiza parâmetro, não gera knob/config/threshold, não sugere ampliar
+#  stop e não cria candidato executável.
+# ════════════════════════════════════════════════════════════════════════════
+P052A_WINDOW_DAYS = 120
+
+STOP_PERSISTENT_ADVERSE = "PERSISTENT_ADVERSE"
+STOP_MIXED = "MIXED"
+STOP_SAMPLE_LIMITED = "SAMPLE_LIMITED"
+STOP_LOW_COVERAGE = "LOW_COVERAGE"
+STOP_NOT_ADVERSE = "NOT_ADVERSE"
+
+P052A_MIN_TRAIN_N = 30
+P052A_MIN_VALID_N = 20
+P052A_MIN_TRAIN_STOPS = 10
+P052A_MIN_VALID_STOPS = 5
+P052A_MAX_PATTERNS = 8
+
+# Classes de desfecho SHADOW (stop original é só `lost`).
+OUTCOME_STOP = "STOP"
+OUTCOME_PROTECTED_EXIT = "PROTECTED_EXIT"     # won_tp1_be — saída pós-TP1, NÃO é stop
+OUTCOME_WIN = "WIN"
+OUTCOME_EXPIRED = "EXPIRED"
+OUTCOME_INCONSISTENT = "INCONSISTENT"
+
+P052A_LIMITATIONS = [
+    "correlação não é causalidade — contexto descreve, não explica",
+    "SHADOW é o caminho do SETUP, não o fill real",
+    "REAL pode ter amostra pequena; REAL e SHADOW nunca são somados",
+    "p05_path só existe para snapshots posteriores ao P05.1T (sem backfill)",
+    "candle de 5m não revela a ordem intravela",
+    "bloquear um contexto adverso também removeria os wins daquele contexto",
+    "o diagnóstico NÃO recomenda ampliar, encurtar ou mover o stop",
+]
+
+
+def classify_shadow_outcome(status: Any, realized_r: Any) -> str:
+    """Identidade do desfecho SHADOW.
+
+    `lost` = stop ORIGINAL confirmado antes do TP1. `won_tp1_be` é saída
+    PROTETIVA pós-TP1 e NUNCA conta como stop. `expired` não é stop.
+    Divergência entre status e sinal de R é `INCONSISTENT` (excluída e contada).
+    `realized_r=None` nunca vira zero.
+    """
+    st = str(status or "").strip()
+    r = _finite(realized_r)
+    if r is None:
+        return OUTCOME_INCONSISTENT
+    if st == "lost":
+        return OUTCOME_STOP if r < 0 else OUTCOME_INCONSISTENT
+    if st == "won_tp1_be":
+        return OUTCOME_PROTECTED_EXIT
+    if st in ("won_tp1", "won_tp2"):
+        return OUTCOME_WIN if r > 0 else OUTCOME_INCONSISTENT
+    if st == "expired":
+        return OUTCOME_EXPIRED
+    return OUTCOME_INCONSISTENT
+
+
+async def load_stop_shadow_split(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any]:
+    """Loader SELADO do P05.2A.
+
+    1) conta e ordena as linhas elegíveis por `(outcome_at, id)` SEM selecionar
+       outcome; 2) divide 50/25/25 cronologicamente; 3) materializa outcome e
+       features SOMENTE para treino e validação; 4) do teste, devolve apenas
+       contagem e limites temporais.
+    """
+    from db import get_session
+    from models.recommendation_snapshot import RecommendationSnapshot as RS
+    from services import calibration_service as _calib
+    from sqlalchemy import select
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    async with get_session() as session:
+        # (1) Índice cronológico — nenhuma coluna de outcome é selecionada.
+        index_rows = (await session.execute(
+            select(RS.id, RS.outcome_at)
+            .where(RS.status.in_(SNAP_RESOLVED))
+            .where(RS.outcome_at.is_not(None))
+            .where(RS.outcome_at >= since)
+            .where(_calib._not_fast_void())
+            .order_by(RS.outcome_at.asc(), RS.id.asc())
+        )).all()
+
+        ordered = [(r.id, _utc(r.outcome_at)) for r in index_rows if _utc(r.outcome_at)]
+        n = len(ordered)
+        i_train, i_valid = int(n * 0.5), int(n * 0.75)
+        train_idx = ordered[:i_train]
+        valid_idx = ordered[i_train:i_valid]
+        test_idx = ordered[i_valid:]
+
+        allowed_ids = {rid for rid, _ in train_idx} | {rid for rid, _ in valid_idx}
+        boundary = valid_idx[-1][1] if valid_idx else (train_idx[-1][1] if train_idx else None)
+
+        rows_by_id: Dict[Any, Dict[str, Any]] = {}
+        if boundary is not None and allowed_ids:
+            # (3) Outcome só até a borda da VALIDAÇÃO; ties são aparados pelo
+            # conjunto exato de ids, então nenhuma linha de teste entra.
+            detail = (await session.execute(
+                select(RS.id, RS.symbol, RS.timeframe, RS.tier, RS.direction,
+                       RS.score, RS.status, RS.realized_r, RS.features,
+                       RS.stop_distance_pct, RS.created_at, RS.outcome_at)
+                .where(RS.status.in_(SNAP_RESOLVED))
+                .where(RS.outcome_at.is_not(None))
+                .where(RS.outcome_at >= since)
+                .where(RS.outcome_at <= boundary)
+                .where(_calib._not_fast_void())
+            )).all()
+            for row in detail:
+                if row.id not in allowed_ids:
+                    continue                        # aparo de empate temporal
+                rows_by_id[row.id] = {
+                    "id": row.id, "dedupe_key": f"snap:{row.id}",
+                    "symbol": row.symbol, "timeframe": row.timeframe, "tier": row.tier,
+                    "direction": row.direction, "score": row.score,
+                    "status": row.status, "realized_r": row.realized_r,
+                    "features": _merged_features(row.features),
+                    "stop_distance_pct": row.stop_distance_pct,
+                    "created_at": _utc(row.created_at),
+                    "resolved_at": _utc(row.outcome_at),
+                }
+
+    def _stage(idx) -> List[Dict[str, Any]]:
+        return [rows_by_id[rid] for rid, _ in idx if rid in rows_by_id]
+
+    oldest = ordered[0][1].isoformat() if ordered else None
+    newest = ordered[-1][1].isoformat() if ordered else None
+    observed_days = round((ordered[-1][1] - ordered[0][1]).total_seconds() / 86400.0, 1) if n > 1 else None
+    return {
+        "train": _stage(train_idx),
+        "validation": _stage(valid_idx),
+        "train_count": len(train_idx),
+        "validation_count": len(valid_idx),
+        "test_count": len(test_idx),
+        "eligible_total": n,
+        "requested_window_days": days,
+        "observed_span_days": observed_days,
+        "oldest_resolved_at": oldest,
+        "newest_resolved_at": newest,
+        "young_history": bool(observed_days is not None and observed_days < days),
+        "test_bounds": {
+            "first_resolved_at": test_idx[0][1].isoformat() if test_idx else None,
+            "last_resolved_at": test_idx[-1][1].isoformat() if test_idx else None,
+        },
+        "holdout_status": HOLDOUT_SEALED,
+        "holdout_outcomes_read": False,
+        "holdout_metrics_computed": False,
+    }
+
+
+def _partition_outcomes(rows: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Separa linhas válidas das excluídas, contabilizando o motivo."""
+    valid: List[Dict[str, Any]] = []
+    excluded: Dict[str, int] = {}
+    seen: set = set()
+
+    def _drop(reason: str) -> None:
+        excluded[reason] = excluded.get(reason, 0) + 1
+
+    for row in rows:
+        key = row.get("dedupe_key")
+        if key is not None:
+            if key in seen:
+                _drop("duplicata")
+                continue
+            seen.add(key)
+        if row.get("resolved_at") is None:
+            _drop("sem timestamp de resolução")
+            continue
+        if row.get("realized_r") is None:
+            _drop("realized_r ausente")
+            continue
+        if _finite(row.get("realized_r")) is None:
+            _drop("realized_r NaN/infinito")
+            continue
+        klass = classify_shadow_outcome(row.get("status"), row.get("realized_r"))
+        if klass == OUTCOME_INCONSISTENT:
+            _drop("status/R incoerente")
+            continue
+        item = dict(row)
+        item["outcome_class"] = klass
+        valid.append(item)
+    return valid, excluded
+
+
+def stop_stage_metrics(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Métricas gerais de UM estágio (treino ou validação)."""
+    valid, excluded = _partition_outcomes(rows)
+    n = len(valid)
+    if n == 0:
+        return {"total_resolved": 0, "stops": 0, "stop_rate_pct": None,
+                "stop_rate_ci": None, "wins": 0, "protected_exits": 0, "expired": 0,
+                "expectancy_r": None, "sum_r": None, "median_r": None,
+                "profit_factor": None, "worst_stop_streak": 0,
+                "time_to_stop_minutes": {"median": None, "p75": None, "p90": None},
+                "context_coverage_pct": None, "reliability": RELIABILITY_INSUFFICIENT,
+                "excluded_by_reason": excluded, "excluded_total": len(rows)}
+
+    classes = [r["outcome_class"] for r in valid]
+    stops = classes.count(OUTCOME_STOP)
+    rs = [_finite(r["realized_r"]) for r in valid]
+    rs = [r for r in rs if r is not None]
+    ordered_r = sorted(rs)
+    mid = len(ordered_r) // 2
+    median_r = ordered_r[mid] if len(ordered_r) % 2 else (ordered_r[mid - 1] + ordered_r[mid]) / 2
+
+    gains = sum(r for r in rs if r > 0)
+    losses_abs = abs(sum(r for r in rs if r < 0))
+    pf = round(gains / losses_abs, 3) if losses_abs > 0 else None
+
+    worst = cur = 0
+    for r in valid:
+        if r["outcome_class"] == OUTCOME_STOP:
+            cur += 1
+            worst = max(worst, cur)
+        else:
+            cur = 0
+
+    minutes = []
+    for r in valid:
+        if r["outcome_class"] != OUTCOME_STOP:
+            continue
+        created, resolved = r.get("created_at"), r.get("resolved_at")
+        if created and resolved:
+            delta = (resolved - created).total_seconds() / 60.0
+            if delta >= 0:
+                minutes.append(delta)
+
+    with_ctx = sum(1 for r in valid
+                   if (r.get("features") or {}).get("regime") is not None)
+    return {
+        "total_resolved": n,
+        "stops": stops,
+        "stop_rate_pct": round(stops / n * 100, 2),
+        "stop_rate_ci": wilson_interval(stops, n),
+        "wins": classes.count(OUTCOME_WIN),
+        "protected_exits": classes.count(OUTCOME_PROTECTED_EXIT),
+        "expired": classes.count(OUTCOME_EXPIRED),
+        "expectancy_r": round(sum(rs) / len(rs), 4) if rs else None,
+        "sum_r": round(sum(rs), 4) if rs else None,
+        "median_r": round(median_r, 4) if rs else None,
+        "profit_factor": pf,
+        "worst_stop_streak": worst,
+        "time_to_stop_minutes": {
+            "median": _percentile(minutes, 0.50),
+            "p75": _percentile(minutes, 0.75),
+            "p90": _percentile(minutes, 0.90),
+            "count": len(minutes),
+        },
+        "context_coverage_pct": round(with_ctx / n * 100, 1),
+        "reliability": reliability_label(n),
+        "excluded_by_reason": excluded,
+        "excluded_total": len(rows) - n,
+    }
+
+
+_STOP_AXES = {
+    "tier": lambda r: r.get("tier"),
+    "timeframe": lambda r: r.get("timeframe"),
+    "tier_timeframe": lambda r: (f"{r.get('tier')}·{r.get('timeframe')}"
+                                 if r.get("tier") and r.get("timeframe") else None),
+    "direction": lambda r: r.get("direction"),
+    "base": lambda r: _base_of(r.get("symbol") or "") or None,
+    "patterns": lambda r: (r.get("features") or {}).get("patterns"),
+    "session_utc": lambda r: _session_utc((r.get("features") or {}).get("hour_utc")),
+    "day_of_week": lambda r: (r.get("features") or {}).get("day_of_week"),
+    "regime": lambda r: (r.get("features") or {}).get("regime"),
+    "funding_sentiment": lambda r: (r.get("features") or {}).get("funding_sentiment"),
+    "score_bin": lambda r: _score_bin(r.get("score")),
+    "atr_band": lambda r: _atr_band((r.get("features") or {}).get("atr_pct")),
+    "mtf_aligned": lambda r: (r.get("features") or {}).get("mtf_aligned"),
+    "entry_zone_type": lambda r: (r.get("features") or {}).get("entry_zone_type"),
+}
+
+
+def stop_segments_for_axis(rows: Sequence[Dict[str, Any]], axis: str) -> Dict[str, Any]:
+    """Segmentos de UM eixo, com taxa por EXPOSIÇÃO (nunca contagem absoluta).
+
+    Eixos multi-rótulo (patterns) fazem ATRIBUIÇÃO: o mesmo trade aparece em mais
+    de um segmento, então os segmentos NÃO somam ao total.
+    """
+    getter = _STOP_AXES[axis]
+    valid, _exc = _partition_outcomes(rows)
+    total = len(valid)
+    baseline_stops = sum(1 for r in valid if r["outcome_class"] == OUTCOME_STOP)
+    baseline_rate = (baseline_stops / total * 100) if total else None
+
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    missing = 0
+    for row in valid:
+        key = getter(row)
+        if key is None or key == "":
+            missing += 1
+            continue
+        if isinstance(key, (list, tuple, set)):
+            for k in key:
+                if k:
+                    groups.setdefault(str(k), []).append(row)
+        else:
+            groups.setdefault(str(key), []).append(row)
+
+    items = []
+    for key, grp in groups.items():
+        exposure = len(grp)
+        stops = sum(1 for r in grp if r["outcome_class"] == OUTCOME_STOP)
+        wins = sum(1 for r in grp if r["outcome_class"] == OUTCOME_WIN)
+        rate = round(stops / exposure * 100, 2) if exposure else None
+        rs = [_finite(r["realized_r"]) for r in grp]
+        rs = [r for r in rs if r is not None]
+        items.append({
+            "key": key,
+            "exposure": exposure,
+            "stop_count": stops,
+            "stop_rate_pct": rate,
+            "stop_rate_ci": wilson_interval(stops, exposure),
+            "stage_stop_rate_pct": round(baseline_rate, 2) if baseline_rate is not None else None,
+            "stop_rate_lift_pp": (round(rate - baseline_rate, 2)
+                                  if rate is not None and baseline_rate is not None else None),
+            "share_of_all_stops_pct": (round(stops / baseline_stops * 100, 1)
+                                       if baseline_stops else None),
+            "wins_removed_if_blocked": wins,
+            "expectancy_r": round(sum(rs) / len(rs), 4) if rs else None,
+            "sum_r": round(sum(rs), 4) if rs else None,
+            "reliability": reliability_label(exposure),
+        })
+    items.sort(key=lambda it: (-(it["stop_rate_lift_pp"] or -999), -it["exposure"], it["key"]))
+    return {
+        "axis": axis,
+        "stage_stop_rate_pct": round(baseline_rate, 2) if baseline_rate is not None else None,
+        "coverage_pct": round((total - missing) / total * 100, 1) if total else None,
+        "missing": missing,
+        "overlapping": axis == "patterns",
+        "items": items,
+        "note": ("taxa por EXPOSIÇÃO, não contagem absoluta; eixos sobrepostos são "
+                 "atribuição, não causalidade, e não somam"),
+    }
+
+
+def classify_stop_segment(train_item: Optional[Dict[str, Any]],
+                          valid_item: Optional[Dict[str, Any]],
+                          *, train_coverage: Optional[float],
+                          valid_coverage: Optional[float]) -> Dict[str, Any]:
+    """Classifica a PERSISTÊNCIA de um contexto adverso (treino → validação)."""
+    if train_item is None or valid_item is None:
+        return {"classification": STOP_SAMPLE_LIMITED,
+                "reason": "contexto ausente em um dos estágios"}
+    if (train_coverage is None or train_coverage < P05_MIN_FEATURE_COVERAGE_PCT
+            or valid_coverage is None or valid_coverage < P05_MIN_FEATURE_COVERAGE_PCT):
+        return {"classification": STOP_LOW_COVERAGE,
+                "reason": (f"cobertura do eixo abaixo de {P05_MIN_FEATURE_COVERAGE_PCT}% "
+                           f"(treino={train_coverage}% validação={valid_coverage}%)")}
+    if (train_item["exposure"] < P052A_MIN_TRAIN_N
+            or valid_item["exposure"] < P052A_MIN_VALID_N
+            or train_item["stop_count"] < P052A_MIN_TRAIN_STOPS
+            or valid_item["stop_count"] < P052A_MIN_VALID_STOPS):
+        return {"classification": STOP_SAMPLE_LIMITED,
+                "reason": (f"amostra insuficiente (treino n={train_item['exposure']}/"
+                           f"stops={train_item['stop_count']}, validação "
+                           f"n={valid_item['exposure']}/stops={valid_item['stop_count']})")}
+
+    t_above = (train_item["stop_rate_lift_pp"] or 0) > 0
+    v_above = (valid_item["stop_rate_lift_pp"] or 0) > 0
+    t_neg = (train_item["expectancy_r"] is not None and train_item["expectancy_r"] < 0)
+    v_neg = (valid_item["expectancy_r"] is not None and valid_item["expectancy_r"] < 0)
+
+    if t_above and v_above and t_neg and v_neg:
+        return {"classification": STOP_PERSISTENT_ADVERSE,
+                "reason": ("taxa de stop acima do baseline E expectancy negativa nos "
+                           "DOIS estágios")}
+    if not t_above and not v_above:
+        return {"classification": STOP_NOT_ADVERSE,
+                "reason": "taxa de stop não supera o baseline em nenhum estágio"}
+    return {"classification": STOP_MIXED,
+            "reason": ("efeito não persistiu: adverso em um estágio e não no outro "
+                       f"(treino_acima={t_above}/neg={t_neg}, "
+                       f"validação_acima={v_above}/neg={v_neg})")}
+
+
+def _band(value: Optional[float], edges: Sequence[Tuple[float, float, str]]) -> Optional[str]:
+    v = _finite(value)
+    if v is None:
+        return None
+    for lo, hi, label in edges:
+        if lo <= v < hi:
+            return label
+    return None
+
+
+_TIME_BANDS = [(0, 30, "<30m"), (30, 120, "30m–2h"), (120, 360, "2h–6h"),
+               (360, float("inf"), ">6h")]
+_MFE_BANDS = [(0, 0.25, "<0.25R"), (0.25, 0.50, "0.25–0.50R"),
+              (0.50, 1.00, "0.50–1.00R"), (1.00, float("inf"), ">=1.00R")]
+_STOPDIST_BANDS = [(0, 1.0, "<1%"), (1.0, 2.0, "1–2%"), (2.0, 4.0, "2–4%"),
+                   (4.0, float("inf"), ">=4%")]
+
+
+def stop_trajectory(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Trajetória dos stops: tempo até o stop, MFE antes do stop e faixa de
+    distância do stop.
+
+    MFE vem SOMENTE de `features["p05_path"]` já persistido — sem backfill e sem
+    recálculo de LONG/SHORT. Ausência nunca vira zero.
+
+    As faixas são DESCRITIVAS. É proibido concluir "o stop deveria ser ampliado",
+    "o stop ideal seria X" ou "essa perda teria sido evitada".
+    """
+    valid, _exc = _partition_outcomes(rows)
+    stops = [r for r in valid if r["outcome_class"] == OUTCOME_STOP]
+    total = len(stops)
+
+    time_counts: Dict[str, int] = {}
+    minutes: List[float] = []
+    mfe_counts: Dict[str, int] = {}
+    mfe_values: List[float] = []
+    dist_counts: Dict[str, int] = {}
+    dist_values: List[float] = []
+    missing: Dict[str, int] = {}
+    path_status: Dict[str, int] = {}
+
+    def _miss(reason: str) -> None:
+        missing[reason] = missing.get(reason, 0) + 1
+
+    for row in stops:
+        created, resolved = row.get("created_at"), row.get("resolved_at")
+        if created and resolved:
+            mins = (resolved - created).total_seconds() / 60.0
+            if mins >= 0:
+                minutes.append(mins)
+                band = _band(mins, _TIME_BANDS)
+                if band:
+                    time_counts[band] = time_counts.get(band, 0) + 1
+        else:
+            _miss("sem timestamps para tempo até o stop")
+
+        path = (row.get("features") or {}).get("p05_path")
+        if not isinstance(path, dict):
+            _miss("p05_path ausente (snapshot anterior ao P05.1T)")
+        else:
+            status = str(path.get("status") or "UNKNOWN")
+            path_status[status] = path_status.get(status, 0) + 1
+            mfe = _finite(path.get("mfe_r"))
+            if mfe is None:
+                _miss(f"p05_path sem MFE válido (status={status})")
+            else:
+                mfe_values.append(mfe)
+                band = _band(mfe, _MFE_BANDS)
+                if band:
+                    mfe_counts[band] = mfe_counts.get(band, 0) + 1
+
+        dist = _finite(row.get("stop_distance_pct"))
+        if dist is None:
+            _miss("stop_distance_pct ausente")
+        else:
+            dist_values.append(dist)
+            band = _band(dist, _STOPDIST_BANDS)
+            if band:
+                dist_counts[band] = dist_counts.get(band, 0) + 1
+
+    def _bands(counts: Dict[str, int], order: Sequence[Tuple[float, float, str]],
+               observed: int) -> List[Dict[str, Any]]:
+        return [{"band": label, "count": counts.get(label, 0),
+                 "pct": round(counts.get(label, 0) / observed * 100, 1) if observed else None}
+                for _lo, _hi, label in order]
+
+    return {
+        "total_stops": total,
+        "time_to_stop": {
+            "observed": len(minutes),
+            "coverage_pct": round(len(minutes) / total * 100, 1) if total else None,
+            "bands": _bands(time_counts, _TIME_BANDS, len(minutes)),
+            "median_minutes": _percentile(minutes, 0.50),
+            "p75_minutes": _percentile(minutes, 0.75),
+            "p90_minutes": _percentile(minutes, 0.90),
+        },
+        "mfe_before_stop": {
+            "observed": len(mfe_values),
+            "coverage_pct": round(len(mfe_values) / total * 100, 1) if total else None,
+            "bands": _bands(mfe_counts, _MFE_BANDS, len(mfe_values)),
+            "median_r": _percentile(mfe_values, 0.50),
+            "p75_r": _percentile(mfe_values, 0.75),
+            "p90_r": _percentile(mfe_values, 0.90),
+            "path_status_counts": path_status,
+            "source": "features.p05_path (prospectivo, sem backfill)",
+        },
+        "stop_distance": {
+            "observed": len(dist_values),
+            "coverage_pct": round(len(dist_values) / total * 100, 1) if total else None,
+            "bands": _bands(dist_counts, _STOPDIST_BANDS, len(dist_values)),
+            "median_pct": _percentile(dist_values, 0.50),
+            "p75_pct": _percentile(dist_values, 0.75),
+            "p90_pct": _percentile(dist_values, 0.90),
+        },
+        "missing_by_reason": missing,
+        "descriptive_only": True,
+        "note": ("faixas DESCRITIVAS: MAE/MFE de uma operação perdida não autoriza "
+                 "otimizar o stop; nenhuma conclusão de stop ideal é derivada aqui"),
+    }
+
+
+def build_stop_hypotheses(train_axes: Dict[str, Any], valid_axes: Dict[str, Any]
+                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Hipóteses ANALÍTICAS (máx. 8), ordem determinística. Sem knob, sem config,
+    sem threshold, sem BLOCK/SCORE_DELTA, sem ação executável."""
+    persistent: List[Dict[str, Any]] = []
+    others: List[Dict[str, Any]] = []
+
+    for axis in sorted(train_axes):
+        t_axis, v_axis = train_axes[axis], valid_axes.get(axis) or {}
+        t_items = {it["key"]: it for it in (t_axis.get("items") or [])}
+        v_items = {it["key"]: it for it in (v_axis.get("items") or [])}
+        for key in sorted(t_items):
+            t_it, v_it = t_items[key], v_items.get(key)
+            verdict = classify_stop_segment(
+                t_it, v_it,
+                train_coverage=t_axis.get("coverage_pct"),
+                valid_coverage=v_axis.get("coverage_pct"))
+            entry = {
+                "axis": axis,
+                "value": key,
+                "classification": verdict["classification"],
+                "reason": verdict["reason"],
+                "train": {
+                    "exposure": t_it["exposure"], "stops": t_it["stop_count"],
+                    "stop_rate_pct": t_it["stop_rate_pct"],
+                    "stop_rate_ci": t_it["stop_rate_ci"],
+                    "stage_stop_rate_pct": t_it["stage_stop_rate_pct"],
+                    "stop_rate_lift_pp": t_it["stop_rate_lift_pp"],
+                    "expectancy_r": t_it["expectancy_r"],
+                    "wins_in_context": t_it["wins_removed_if_blocked"],
+                    "reliability": t_it["reliability"],
+                },
+                "validation": ({
+                    "exposure": v_it["exposure"], "stops": v_it["stop_count"],
+                    "stop_rate_pct": v_it["stop_rate_pct"],
+                    "stop_rate_ci": v_it["stop_rate_ci"],
+                    "stage_stop_rate_pct": v_it["stage_stop_rate_pct"],
+                    "stop_rate_lift_pp": v_it["stop_rate_lift_pp"],
+                    "expectancy_r": v_it["expectancy_r"],
+                    "wins_in_context": v_it["wins_removed_if_blocked"],
+                    "reliability": v_it["reliability"],
+                } if v_it else None),
+                "axis_coverage_pct": {"train": t_axis.get("coverage_pct"),
+                                      "validation": v_axis.get("coverage_pct")},
+                "blocking_would_remove_wins": (
+                    (t_it["wins_removed_if_blocked"]
+                     + (v_it["wins_removed_if_blocked"] if v_it else 0))),
+                "temporal_status": ("CONFIRMED_IN_VALIDATION"
+                                    if verdict["classification"] == STOP_PERSISTENT_ADVERSE
+                                    else "NOT_CONFIRMED"),
+                "limitations": P052A_LIMITATIONS,
+                "for_future_phase": "P05.2B",
+                "executable": False,
+            }
+            if verdict["classification"] == STOP_PERSISTENT_ADVERSE:
+                persistent.append(entry)
+            elif verdict["classification"] in (STOP_MIXED, STOP_SAMPLE_LIMITED):
+                others.append(entry)
+
+    # Ordem determinística: maior lift de validação, depois exposição, depois nome.
+    persistent.sort(key=lambda h: (-((h["validation"] or {}).get("stop_rate_lift_pp") or 0),
+                                   -((h["validation"] or {}).get("exposure") or 0),
+                                   h["axis"], h["value"]))
+    others.sort(key=lambda h: (-(h["train"]["stop_rate_lift_pp"] or 0),
+                               -h["train"]["exposure"], h["axis"], h["value"]))
+    return persistent[:P052A_MAX_PATTERNS], others[:P052A_MAX_PATTERNS]
+
+
+async def build_stop_diagnosis(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any]:
+    """P05.2A — orquestra o diagnóstico. Fail-soft por seção; ZERO escrita."""
+    out: Dict[str, Any] = {
+        "phase": "P05.2A",
+        "execution_mode": "ANALYTICS_ONLY",
+        "read_only": True,
+        "requested_window_days": days,
+        "holdout_status": HOLDOUT_SEALED,
+        "holdout_outcomes_read": False,
+        "holdout_metrics_computed": False,
+        "limitations": P052A_LIMITATIONS,
+        "note": ("diagnóstico observacional: nenhuma alteração foi aplicada à "
+                 "estratégia e nenhuma hipótese foi ativada"),
+    }
+    try:
+        split = await load_stop_shadow_split(days)
+    except Exception as exc:
+        log.warning(f"[p05.2a] loader selado falhou: {exc}")
+        return {**out, "error": str(exc)}
+
+    out["sample"] = {k: split[k] for k in (
+        "train_count", "validation_count", "test_count", "eligible_total",
+        "observed_span_days", "oldest_resolved_at", "newest_resolved_at",
+        "young_history", "test_bounds")}
+    out["holdout_status"] = split["holdout_status"]
+
+    train, validation = split["train"], split["validation"]
+    try:
+        out["shadow"] = {
+            "train": stop_stage_metrics(train),
+            "validation": stop_stage_metrics(validation),
+            "source": "RecommendationSnapshot (SHADOW)",
+            "stop_definition": ("status=='lost' com R<0; won_tp1_be é saída "
+                                "PROTETIVA pós-TP1 e NÃO é stop; expired não é stop"),
+        }
+    except Exception as exc:
+        out["shadow"] = {"error": str(exc)}
+
+    train_axes: Dict[str, Any] = {}
+    valid_axes: Dict[str, Any] = {}
+    try:
+        for axis in _STOP_AXES:
+            train_axes[axis] = stop_segments_for_axis(train, axis)
+            valid_axes[axis] = stop_segments_for_axis(validation, axis)
+        out["segments"] = {"train": train_axes, "validation": valid_axes}
+    except Exception as exc:
+        log.warning(f"[p05.2a] segmentos falharam: {exc}")
+        out["segments"] = {"error": str(exc)}
+
+    try:
+        persistent, others = build_stop_hypotheses(train_axes, valid_axes)
+        out["persistent_patterns"] = persistent
+        out["non_persistent_patterns"] = others
+        if not persistent:
+            out["patterns_verdict"] = "NO_PERSISTENT_STOP_PATTERN"
+            out["patterns_verdict_reason"] = (
+                "nenhum contexto manteve taxa de stop acima do baseline E expectancy "
+                "negativa em treino E validação com amostra suficiente")
+        else:
+            out["patterns_verdict"] = "PERSISTENT_PATTERNS_FOUND"
+    except Exception as exc:
+        log.warning(f"[p05.2a] hipóteses falharam: {exc}")
+        out["persistent_patterns"] = []
+        out["patterns_verdict"] = "NO_PERSISTENT_STOP_PATTERN"
+
+    try:
+        out["trajectory"] = {
+            "train": stop_trajectory(train),
+            "validation": stop_trajectory(validation),
+        }
+    except Exception as exc:
+        out["trajectory"] = {"error": str(exc)}
+
+    try:
+        from services import assertiveness_service as _assert
+        out["real"] = await _assert.real_stop_summary(days)
+    except Exception as exc:
+        log.warning(f"[p05.2a] resumo REAL falhou: {exc}")
+        out["real"] = {"error": str(exc)}
+
+    out["computed_at"] = datetime.now(timezone.utc).isoformat()
+    return out
+
+
+_STOP_DIAG_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+_STOP_DIAG_CACHE_LOCK = asyncio.Lock()
+
+
+async def get_cached_stop_diagnosis(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any]:
+    """Cache single-flight com o MESMO TTL do P05. Erro não envenena o cache."""
+    days = max(30, min(int(days), 365))
+    now_mono = time.monotonic()
+    cached = _STOP_DIAG_CACHE.get(days)
+    if cached and now_mono - cached[0] < P05_DIAG_CACHE_TTL_S:
+        return cached[1]
+    async with _STOP_DIAG_CACHE_LOCK:
+        cached = _STOP_DIAG_CACHE.get(days)
+        now_mono = time.monotonic()
+        if cached and now_mono - cached[0] < P05_DIAG_CACHE_TTL_S:
+            return cached[1]
+        value = await build_stop_diagnosis(days)
+        if not value.get("error"):
+            _STOP_DIAG_CACHE[days] = (now_mono, value)
+            if len(_STOP_DIAG_CACHE) > 12:
+                oldest = min(_STOP_DIAG_CACHE, key=lambda k: _STOP_DIAG_CACHE[k][0])
+                _STOP_DIAG_CACHE.pop(oldest, None)
+        return value
+
+
 async def build_diagnosis(days: int = 30) -> Dict[str, Any]:
     """P05A — onde ganha, onde perde, com qualidade de evidência explícita."""
     out: Dict[str, Any] = {"window_days": days}
@@ -4344,6 +5026,14 @@ async def get_p05_status(days: int = 30) -> Dict[str, Any]:
         log.warning(f"[p05] status/readiness falhou: {exc}")
         out["readiness_by_status"] = None
         out["holdout_status"] = HOLDOUT_SEALED
+    # P05.2A — diagnóstico longitudinal dos stops (janela fixa de 120 dias,
+    # independente do seletor do painel). Fail-soft: não derruba o resto.
+    try:
+        out["stop_diagnosis"] = await get_cached_stop_diagnosis(P052A_WINDOW_DAYS)
+    except Exception as exc:
+        log.warning(f"[p05.2a] stop_diagnosis falhou: {exc}")
+        out["stop_diagnosis"] = {"phase": "P05.2A", "error": str(exc),
+                                 "holdout_status": HOLDOUT_SEALED}
     out["p051"] = {
         "phase": P051_PHASE,
         "execution_mode": P051_EXECUTION_MODE,

@@ -114,6 +114,90 @@ interface P05Block {
   eligible_experiment?: P05Experiment | null
   mae_mfe?: MaeMfeBlock
   telemetry?: TelemetryBlock
+  stop_diagnosis?: StopDiagnosis
+}
+
+// ── P05.2A: diagnóstico longitudinal dos stops (somente análise) ───────────
+interface StopStage {
+  total_resolved?: number
+  stops?: number
+  stop_rate_pct?: number | null
+  wins?: number
+  protected_exits?: number
+  expired?: number
+  expectancy_r?: number | null
+  reliability?: string
+  time_to_stop_minutes?: { median?: number | null }
+}
+
+interface StopPattern {
+  axis?: string
+  value?: string
+  classification?: string
+  reason?: string
+  train?: { stop_rate_pct?: number | null; stop_rate_lift_pp?: number | null; exposure?: number; stops?: number; expectancy_r?: number | null }
+  validation?: { stop_rate_pct?: number | null; stop_rate_lift_pp?: number | null; exposure?: number; stops?: number; expectancy_r?: number | null } | null
+  blocking_would_remove_wins?: number
+}
+
+interface StopBand { band?: string; count?: number; pct?: number | null }
+
+interface StopDiagnosis {
+  error?: string
+  requested_window_days?: number
+  holdout_status?: string
+  patterns_verdict?: string
+  patterns_verdict_reason?: string
+  sample?: {
+    train_count?: number
+    validation_count?: number
+    test_count?: number
+    observed_span_days?: number | null
+    young_history?: boolean
+  }
+  shadow?: { train?: StopStage; validation?: StopStage }
+  real?: {
+    total_closed?: number
+    stops?: number
+    stop_rate_pct?: number | null
+    negative_manual_exits?: number
+    linked_to_snapshot_pct?: number | null
+    reliability?: string
+  }
+  persistent_patterns?: StopPattern[]
+  non_persistent_patterns?: StopPattern[]
+  trajectory?: {
+    train?: {
+      total_stops?: number
+      time_to_stop?: { coverage_pct?: number | null; bands?: StopBand[]; median_minutes?: number | null }
+      mfe_before_stop?: { coverage_pct?: number | null; observed?: number; bands?: StopBand[] }
+    }
+  }
+}
+
+const STOP_CLASS_LABEL: Record<string, string> = {
+  PERSISTENT_ADVERSE: 'ruim nos dois períodos',
+  MIXED: 'não se repetiu',
+  SAMPLE_LIMITED: 'amostra insuficiente',
+  LOW_COVERAGE: 'dados insuficientes',
+  NOT_ADVERSE: 'não é pior que a média',
+}
+
+const STOP_AXIS_LABEL: Record<string, string> = {
+  tier: 'tier',
+  timeframe: 'timeframe',
+  tier_timeframe: 'tier × timeframe',
+  direction: 'direção',
+  base: 'moeda',
+  patterns: 'padrão',
+  session_utc: 'sessão (UTC)',
+  day_of_week: 'dia da semana',
+  regime: 'regime de mercado',
+  funding_sentiment: 'funding',
+  score_bin: 'faixa de nota',
+  atr_band: 'volatilidade',
+  mtf_aligned: 'alinhamento MTF',
+  entry_zone_type: 'tipo de entrada',
 }
 
 // ── P05.1T: telemetria prospectiva (observação pura) ───────────────────────
@@ -727,6 +811,145 @@ export default function AssertivenessPanel({ onClose }: Props) {
                   </p>
                 </section>
               )}
+
+              {/* ── P05.2A Por que as recomendações tomam stop ───────────── */}
+              {p05?.enabled && p05.stop_diagnosis && !p05.stop_diagnosis.error && (() => {
+                const sd = p05.stop_diagnosis!
+                const tr = sd.shadow?.train
+                const va = sd.shadow?.validation
+                const traj = sd.trajectory?.train
+                return (
+                  <section>
+                    <div className="flex items-center gap-2 mb-2 flex-wrap">
+                      <Filter className="w-4 h-4 text-rose-400" />
+                      <h3 className="text-sm font-bold text-rose-300">Por que as recomendações tomam stop</h3>
+                      <span className="text-[10px] text-slate-500">
+                        · últimos {sd.requested_window_days ?? 120} dias
+                        {sd.sample?.young_history && ' · histórico ainda curto'}
+                      </span>
+                      <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300">
+                        🔒 protegido
+                      </span>
+                    </div>
+
+                    {/* SHADOW: treino vs validação */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      <StatCard label="Stop (1ª metade)" value={fmtPct(tr?.stop_rate_pct)}
+                        sub={`${tr?.stops ?? 0} de ${tr?.total_resolved ?? 0}`} />
+                      <StatCard label="Stop (2ª metade)" value={fmtPct(va?.stop_rate_pct)}
+                        sub={`${va?.stops ?? 0} de ${va?.total_resolved ?? 0}`} />
+                      <StatCard label="Resultado médio" value={fmtR(va?.expectancy_r)}
+                        valueCls={rColor(va?.expectancy_r)} sub="por recomendação" />
+                      <StatCard label="Guardado p/ teste" value={`${sd.sample?.test_count ?? 0}`}
+                        sub="não analisado ainda" />
+                    </div>
+
+                    {/* REAL, separado do SHADOW */}
+                    {sd.real && (sd.real.total_closed ?? 0) > 0 && (
+                      <div className="mt-1.5 p-2 rounded-lg border border-slate-800 bg-slate-900/40 text-[10px] text-slate-400 leading-snug">
+                        <strong className="text-slate-300">Operações reais</strong> (contadas à parte):{' '}
+                        <span className="font-mono text-slate-200">{sd.real.stops ?? 0}</span> stops em{' '}
+                        <span className="font-mono text-slate-200">{sd.real.total_closed}</span> fechadas
+                        {sd.real.stop_rate_pct !== null && sd.real.stop_rate_pct !== undefined &&
+                          <> · {fmtPct(sd.real.stop_rate_pct)}</>}
+                        {(sd.real.negative_manual_exits ?? 0) > 0 &&
+                          <> · {sd.real.negative_manual_exits} saídas manuais negativas (contadas separado)</>}
+                      </div>
+                    )}
+
+                    {/* Padrões persistentes */}
+                    <div className="mt-2">
+                      <div className="text-[11px] font-bold text-slate-300 mb-1">
+                        Contextos ruins nos dois períodos
+                      </div>
+                      {(sd.persistent_patterns?.length ?? 0) > 0 ? (
+                        <div className="flex flex-col gap-1.5">
+                          {sd.persistent_patterns!.map(pt => (
+                            <div key={`${pt.axis}-${pt.value}`}
+                              className="p-2 rounded-lg border border-rose-500/30 bg-rose-500/5">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-xs font-bold text-rose-200">
+                                  {STOP_AXIS_LABEL[pt.axis ?? ''] ?? pt.axis} = {pt.value}
+                                </span>
+                                <span className="ml-auto text-[10px] text-rose-300">
+                                  {STOP_CLASS_LABEL[pt.classification ?? ''] ?? pt.classification}
+                                </span>
+                              </div>
+                              <div className="mt-0.5 text-[10px] text-slate-400">
+                                stop {fmtPct(pt.train?.stop_rate_pct)} → {fmtPct(pt.validation?.stop_rate_pct)}
+                                {' '}· {pt.train?.stops ?? 0}+{pt.validation?.stops ?? 0} stops
+                                {' '}· resultado {fmtR(pt.validation?.expectancy_r)}
+                              </div>
+                              <div className="mt-0.5 text-[9px] text-amber-300/90">
+                                Evitar esse contexto também removeria{' '}
+                                <strong>{pt.blocking_would_remove_wins ?? 0}</strong> operações que deram certo.
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-slate-500 italic px-1">
+                          Nenhum contexto se manteve pior que a média nos dois períodos com amostra suficiente.
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Mistos / amostra insuficiente */}
+                    {(sd.non_persistent_patterns?.length ?? 0) > 0 && (
+                      <div className="mt-2">
+                        <div className="text-[11px] font-bold text-slate-400 mb-1">
+                          Suspeitas que não se confirmaram
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          {sd.non_persistent_patterns!.slice(0, 5).map(pt => (
+                            <div key={`np-${pt.axis}-${pt.value}`}
+                              className="flex items-center gap-2 text-[10px] px-2 py-1 rounded border border-slate-800 bg-slate-900/40">
+                              <span className="text-slate-300 truncate">
+                                {STOP_AXIS_LABEL[pt.axis ?? ''] ?? pt.axis} = {pt.value}
+                              </span>
+                              <span className="ml-auto text-slate-500 shrink-0">
+                                {STOP_CLASS_LABEL[pt.classification ?? ''] ?? pt.classification}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Trajetória */}
+                    {traj && (traj.total_stops ?? 0) > 0 && (
+                      <div className="mt-2 p-2 rounded-lg border border-slate-800 bg-slate-900/40">
+                        <div className="text-[11px] font-bold text-slate-300 mb-1">Como os stops aconteceram</div>
+                        <div className="text-[10px] text-slate-400">
+                          Tempo até o stop (mediana):{' '}
+                          <span className="font-mono text-slate-200">
+                            {traj.time_to_stop?.median_minutes !== null && traj.time_to_stop?.median_minutes !== undefined
+                              ? `${Math.round(traj.time_to_stop.median_minutes)} min` : '–'}
+                          </span>
+                        </div>
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {(traj.time_to_stop?.bands ?? []).map(b => (
+                            <span key={b.band} className="text-[9px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
+                              {b.band}: {b.count ?? 0}{b.pct !== null && b.pct !== undefined ? ` (${b.pct}%)` : ''}
+                            </span>
+                          ))}
+                        </div>
+                        <div className="mt-1 text-[9px] text-slate-500">
+                          Quanto andaram a favor antes do stop: cobertura {fmtPct(traj.mfe_before_stop?.coverage_pct)}
+                          {' '}({traj.mfe_before_stop?.observed ?? 0} com registro)
+                        </div>
+                      </div>
+                    )}
+
+                    <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
+                      Estes são <strong className="text-slate-400">padrões observados, não causas</strong> — um contexto
+                      aparecer aqui não prova que ele causa o prejuízo. As recomendações mais recentes ficam
+                      reservadas e não entraram nesta análise.{' '}
+                      <strong className="text-slate-400">Nenhuma alteração foi aplicada à estratégia.</strong>
+                    </p>
+                  </section>
+                )
+              })()}
 
               {/* ── P05.1T Qualidade da telemetria (somente observação) ──── */}
               {p05?.enabled && (p05.telemetry || p05.mae_mfe) && (

@@ -831,3 +831,71 @@ gates — e **zero efeito sobre a estratégia**.
 - Validação final no Python 3.11 real: **81 testes específicos P05.1T**, **400
   testes P05 verdes 2×** e **suíte crítica P01–P05 (643) verde 2×**;
   `py_compile`, `tsc --noEmit` e `git diff --check` aprovados.
+
+---
+
+## P05.2A — DIAGNÓSTICO LONGITUDINAL DOS STOP-LOSSES (2026-08-28)
+
+Detalhes em `docs/P05_2A_LONGITUDINAL_STOP_DIAGNOSIS.md`.
+
+**ANTES:** muitos stops observados, mas sem separação robusta entre volume, taxa
+e persistência temporal — um segmento de alto volume parecia "o pior" mesmo com
+taxa abaixo da média.
+
+**DEPOIS:** diagnóstico longitudinal com taxa por exposição, confirmação
+treino→validação, teste final selado, REAL e SHADOW separados, trajetória
+prospectiva quando disponível e hipóteses SOMENTE analíticas.
+
+- **Identidade do stop**: SHADOW `lost` (com R<0) é stop original; `won_tp1_be` é
+  saída PROTETIVA pós-TP1 e NÃO é stop; `expired` não é stop; divergência
+  status/R é `INCONSISTENT` (excluída e contada); `realized_r=None` nunca vira
+  zero. REAL: só `source=auto`, janela por `closed_at`, `closed_stop` é stop e
+  `closed_manual` negativo fica SEPARADO como `NEGATIVE_MANUAL_EXIT`.
+  **REAL e SHADOW nunca são somados.**
+- **Holdout SELADO**: `load_stop_shadow_split` conta e ordena por
+  `(outcome_at, id)` SEM selecionar outcome, divide 50/25/25 e materializa
+  `realized_r`/`status`/`features` APENAS para treino+validação — a 2ª query é
+  limitada pela borda da validação e aparada pelo conjunto exato de ids, então
+  empate de `outcome_at` não deixa linha de teste vazar. Do teste só saem
+  contagem e limites. `holdout_status=SEALED`, `holdout_outcomes_read=false`,
+  `holdout_metrics_computed=false`, com sentinela que explode se o outcome do
+  holdout for lido.
+- **Janela fixa** `P052A_WINDOW_DAYS = 120`, com período realmente observado,
+  timestamps e marcação `young_history` — sem inventar histórico.
+- **Métricas por estágio** (treino e validação separados): stop rate + Wilson
+  95%, wins, saídas protetivas, expired, expectancy/soma/mediana R, profit
+  factor, pior sequência de stops, tempo até o stop (mediana/p75/p90), cobertura
+  e confiabilidade. Contagem absoluta NUNCA é chamada de "pior" sem dividir pela
+  exposição.
+- **Segmentos** nos mesmos 14 eixos do `segment_rows`, com taxa por EXPOSIÇÃO,
+  Wilson, lift em p.p. versus baseline do estágio, participação nos stops,
+  **wins que seriam removidos se o segmento fosse bloqueado**, expectancy e
+  cobertura. Eixos sobrepostos (patterns) são ATRIBUIÇÃO e não somam.
+- **Confirmação temporal**: `PERSISTENT_ADVERSE` exige cobertura ≥80% nos dois
+  estágios, ≥30/≥20 observações, ≥10/≥5 stops, taxa acima do baseline E
+  expectancy negativa NOS DOIS. Caso contrário `MIXED`/`SAMPLE_LIMITED`/
+  `LOW_COVERAGE`/`NOT_ADVERSE`. Alto volume com taxa abaixo do baseline NÃO é
+  adverso (coberto por teste). Máx. 8 padrões, ordem determinística; sem padrão
+  persistente ⇒ `NO_PERSISTENT_STOP_PATTERN`.
+- **Trajetória** (só onde há telemetria válida): tempo até o stop, MFE antes do
+  stop (lido SOMENTE de `features["p05_path"]`, sem backfill e sem recálculo de
+  LONG/SHORT) e faixas de `stop_distance_pct`, todas DESCRITIVAS. É proibido
+  concluir "ampliar o stop", "stop ideal" ou "perda teria sido evitada".
+- **Hipóteses P05.2B**: no máx. 8, com evidência de treino, confirmação/refutação
+  na validação, cobertura, lift, expectancy, wins no contexto e risco de remover
+  operações boas — **sem** knob, config, threshold, BLOCK, SCORE_DELTA, ação
+  executável ou `promotion_plan` (verificado por teste).
+- **Integração**: `stop_diagnosis` acrescentado ao retorno EXISTENTE de
+  `/api/strategy/p05/status`, preservando todos os campos, com cache
+  single-flight do P05 (erro não envenena) e fail-soft. **Nenhum endpoint novo,
+  nenhum POST, `main.py` não foi modificado.** Painel ganhou a seção "Por que as
+  recomendações tomam stop" com selo 🔒 protegido, REAL/SHADOW separados e os
+  avisos de correlação≠causalidade e "nenhuma alteração foi aplicada à
+  estratégia"; sem botão, sem `[object Object]`, `frontend/dist` intacto.
+- **69 testes P05.2A verdes 2×**, suíte P05 completa **verde 2×** e suíte crítica
+  completa (`unittest discover`) **verde 2×** no Python 3.11 real; `py_compile`,
+  `tsc --noEmit` e `git diff --check` aprovados; rede/DNS bloqueados e
+  contabilizados. Zero escrita no banco, zero `StrategyExperiment`, zero
+  tabela/coluna/env/flag. `snapshot_service`, `shadow_trade_service`,
+  `trade_manager_service` e signed services INTACTOS. P05.2B não implementado;
+  champion, score, tier, gates, stop, TP e sizing inalterados.
