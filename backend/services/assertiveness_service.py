@@ -1489,6 +1489,23 @@ async def _p05_section(days: int) -> Dict[str, Any]:
             "error": str(exc),
             "holdout_status": p05.HOLDOUT_SEALED,
         }
+    # P05.2R — monitor de prontidão, calculado sobre os agregados já obtidos
+    # acima. Sem consulta nova, sem cache paralelo e sem abrir o holdout.
+    try:
+        out["stop_readiness"] = p05.build_stop_readiness(
+            stop_diagnosis=out.get("stop_diagnosis"),
+            diagnosis={"mae_mfe": out.get("mae_mfe"),
+                       "telemetry": out.get("telemetry")})
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[assertiveness] p05.2r stop_readiness falhou: {exc}")
+        out["stop_readiness"] = {
+            "phase": p05.P052R_PHASE,
+            "state": p05.READY_UNAVAILABLE,
+            "reason_code": "MONITOR_ERROR",
+            "ready_for_p052c": False,
+            "holdout_status": p05.HOLDOUT_SEALED,
+            "error": str(exc),
+        }
     try:
         from db import get_session
         from models.strategy_experiment import StrategyExperiment as E

@@ -115,6 +115,70 @@ interface P05Block {
   mae_mfe?: MaeMfeBlock
   telemetry?: TelemetryBlock
   stop_diagnosis?: StopDiagnosis
+  stop_readiness?: StopReadiness
+}
+
+// ── P05.2R: monitor de prontidão (somente leitura, nenhuma ação) ───────────
+interface ReadinessTrack {
+  phase?: string
+  status?: string
+  ready?: boolean
+  gates_p052c?: boolean
+  reason?: string
+  patterns_verdict?: string
+  persistent_patterns?: number
+  eligible_patterns?: number
+  non_persistent_patterns?: number
+  hypotheses_evaluated?: number
+  validation_supported?: number
+  rejected?: number
+  insufficient?: number
+  main_reason?: string
+  observed?: number
+  attempts_observed?: number
+  coverage_pct?: number | null
+  fill_auditable?: number
+  total_closed?: number
+  stops?: number
+  stop_rate_pct?: number | null
+  reliability?: string
+}
+
+interface StopReadiness {
+  error?: string
+  state?: string
+  reason_code?: string
+  detail?: string
+  next_action?: string
+  ready_for_p052c?: boolean
+  holdout_status?: string
+  blocked_by?: string[]
+  eta?: { eta_days?: number | null; eta_reason?: string; daily_rate?: number | null }
+  tracks?: Record<string, ReadinessTrack>
+}
+
+const READY_STATE_LABEL: Record<string, string> = {
+  UNAVAILABLE: 'indisponível agora',
+  COLLECTING: 'coletando dados',
+  INSUFFICIENT_EVIDENCE: 'evidência insuficiente',
+  HYPOTHESIS_REJECTED: 'hipótese reprovada',
+  READY_FOR_P052C: 'pronto para a próxima etapa',
+}
+
+const READY_STATE_COLOR: Record<string, string> = {
+  UNAVAILABLE: 'text-slate-400',
+  COLLECTING: 'text-sky-300',
+  INSUFFICIENT_EVIDENCE: 'text-amber-300',
+  HYPOTHESIS_REJECTED: 'text-rose-300',
+  READY_FOR_P052C: 'text-emerald-300',
+}
+
+const READY_TRACK_LABEL: Record<string, string> = {
+  stop_pattern: 'Padrões de stop',
+  offline_lab: 'Laboratório offline',
+  forward_path: 'Trajetória MAE/MFE',
+  live_execution: 'Latência da entrada real',
+  real_sample: 'Amostra real',
 }
 
 // ── P05.2A: diagnóstico longitudinal dos stops (somente análise) ───────────
@@ -727,6 +791,91 @@ export default function AssertivenessPanel({ onClose }: Props) {
                   </p>
                 </section>
               )}
+
+              {/* ── P05.2R Prontidão para a próxima etapa ────────────────── */}
+              {p05?.enabled && p05.stop_readiness && (() => {
+                const rd = p05.stop_readiness!
+                const st = rd.state ?? 'UNAVAILABLE'
+                const tracks = rd.tracks ?? {}
+                const order = ['stop_pattern', 'offline_lab', 'forward_path',
+                               'live_execution', 'real_sample']
+                const detalhe = (k: string, t: ReadinessTrack): string => {
+                  if (k === 'stop_pattern')
+                    return `${t.eligible_patterns ?? 0} contexto(s) confirmado(s)`
+                  if (k === 'offline_lab')
+                    return `${t.validation_supported ?? 0} apoiada(s) · ${t.rejected ?? 0} reprovada(s) · ${t.insufficient ?? 0} sem amostra`
+                  if (k === 'forward_path')
+                    return `${t.observed ?? 0} registros · cobertura ${fmtPct(t.coverage_pct)}`
+                  if (k === 'live_execution')
+                    return `${t.attempts_observed ?? 0} entradas · cobertura ${fmtPct(t.coverage_pct)}`
+                  return `${t.stops ?? 0} stops em ${t.total_closed ?? 0} fechadas${
+                    t.stop_rate_pct !== null && t.stop_rate_pct !== undefined
+                      ? ` · ${fmtPct(t.stop_rate_pct)}` : ''}`
+                }
+                return (
+                  <section>
+                    <div className="flex items-center gap-2 mb-2 flex-wrap">
+                      <ShieldCheck className="w-4 h-4 text-indigo-400" />
+                      <h3 className="text-sm font-bold text-indigo-300">
+                        Prontidão para a próxima etapa
+                      </h3>
+                      <span className={`text-[10px] font-bold ${READY_STATE_COLOR[st] ?? 'text-slate-400'}`}>
+                        {READY_STATE_LABEL[st] ?? st}
+                      </span>
+                      <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300">
+                        🔒 Holdout protegido
+                      </span>
+                    </div>
+
+                    {rd.detail && (
+                      <p className="text-[11px] text-slate-300 leading-snug px-1">{rd.detail}</p>
+                    )}
+
+                    <div className="mt-2 flex flex-col gap-1">
+                      {order.filter(k => tracks[k]).map(k => {
+                        const t = tracks[k]
+                        const cor = t.ready ? 'text-emerald-300'
+                          : t.status === 'UNAVAILABLE' ? 'text-slate-500' : 'text-slate-400'
+                        return (
+                          <div key={k}
+                            className="flex items-center gap-2 text-[10px] px-2 py-1 rounded border border-slate-800 bg-slate-900/40">
+                            <span className="text-slate-300 shrink-0">
+                              {READY_TRACK_LABEL[k] ?? k}
+                            </span>
+                            <span className="text-slate-500 truncate">{detalhe(k, t)}</span>
+                            <span className={`ml-auto shrink-0 ${cor}`}>{t.status}</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+
+                    {rd.eta && (
+                      <div className="mt-1.5 text-[10px] text-slate-400 px-1">
+                        Previsão:{' '}
+                        <span className="font-mono text-slate-200">
+                          {rd.eta.eta_days !== null && rd.eta.eta_days !== undefined
+                            ? `${rd.eta.eta_days} dia(s)` : 'sem estimativa'}
+                        </span>
+                        {rd.eta.eta_reason && (
+                          <span className="text-slate-500"> — {rd.eta.eta_reason}</span>
+                        )}
+                      </div>
+                    )}
+
+                    {rd.next_action && (
+                      <div className="mt-1 text-[10px] text-slate-400 px-1">
+                        Próxima ação: <span className="text-slate-300">{rd.next_action}</span>
+                      </div>
+                    )}
+
+                    <p className="mt-1.5 text-[10px] text-slate-500 leading-snug px-1">
+                      <strong className="text-slate-400">Pronto para P05.2C não significa aprovado.</strong>{' '}
+                      O holdout final continua fechado. Nenhuma alteração foi aplicada à estratégia.{' '}
+                      Telemetria suficiente não prova causalidade.
+                    </p>
+                  </section>
+                )
+              })()}
 
               {/* ── P05.1 Qualidade da evidência ─────────────────────────── */}
               {p05?.enabled && eq && (

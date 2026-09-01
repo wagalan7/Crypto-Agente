@@ -3387,6 +3387,324 @@ async def get_cached_stop_diagnosis(days: int = P052A_WINDOW_DAYS) -> Dict[str, 
         return value
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  P05.2R — STOP EVIDENCE READINESS MONITOR (somente leitura)
+#
+#  Responde, automaticamente: o que já tem evidência suficiente, o que ainda
+#  está coletando, POR QUE o P05.2C continua bloqueado, quando uma hipótese
+#  poderá ser apresentada para revisão do holdout e qual telemetria falta.
+#
+#  Consome APENAS agregados já produzidos (P05.2A, P05.2B, P05.1T, P05.2L) e
+#  telemetria sem outcome. Não carrega dado novo, não escreve, não decide.
+#  `READY_FOR_P052C` significa somente "pode ser APRESENTADO para uma futura
+#  revisão MANUAL do holdout" — nunca aprovação, Shadow ou alteração LIVE.
+# ════════════════════════════════════════════════════════════════════════════
+P052R_PHASE = "P05.2R"
+
+READY_UNAVAILABLE = "UNAVAILABLE"
+READY_COLLECTING = "COLLECTING"
+READY_INSUFFICIENT = "INSUFFICIENT_EVIDENCE"
+READY_REJECTED = "HYPOTHESIS_REJECTED"
+READY_FOR_P052C = "READY_FOR_P052C"
+
+P052R_STATES = (READY_UNAVAILABLE, READY_COLLECTING, READY_INSUFFICIENT,
+                READY_REJECTED, READY_FOR_P052C)
+
+P052R_DOES_NOT_MEAN = [
+    "não significa aprovação",
+    "não significa que a hipótese foi ativada",
+    "não significa Shadow nem challenger",
+    "não significa alteração do champion LIVE",
+    "não abre o holdout final",
+]
+
+P052R_LIMITATIONS = [
+    "monitor observacional: não decide, não promove e não executa",
+    "telemetria suficiente NÃO prova causalidade",
+    "trilhas de trajetória e latência são diagnósticas e, sozinhas, não liberam "
+    "o P05.2C",
+    "ETA é aproximação por contagem, nunca promessa de data",
+    "REAL e SHADOW nunca são somados",
+    "o teste final permanece SELADO e nenhum outcome dele é lido",
+]
+
+_TRACK_UNAVAILABLE = "UNAVAILABLE"
+
+
+def _ready_track_error(name: str, exc: Exception) -> Dict[str, Any]:
+    """Trilha que falhou: indisponível e explicitamente NÃO pronta."""
+    return {"status": _TRACK_UNAVAILABLE, "ready": False,
+            "gates_p052c": name in ("stop_pattern", "offline_lab"),
+            "reason": f"trilha indisponível nesta execução: {exc}"}
+
+
+def _track_stop_pattern(sd: Dict[str, Any]) -> Dict[str, Any]:
+    """Trilha 5.1 — padrões de stop do P05.2A.
+
+    `SAMPLE_LIMITED`, `MIXED` e `LOW_COVERAGE` NUNCA contam como prontos.
+    """
+    persistent = sd.get("persistent_patterns") or []
+    non_persistent = sd.get("non_persistent_patterns") or []
+    eligible = [p for p in persistent
+                if str(p.get("classification")) == STOP_PERSISTENT_ADVERSE
+                and str(p.get("axis")) in P052B_ALLOWED_AXES]
+    verdict = sd.get("patterns_verdict")
+    return {
+        "phase": "P05.2A",
+        "status": (_TRACK_UNAVAILABLE if verdict == "UNAVAILABLE"
+                   else ("READY" if eligible else "COLLECTING")),
+        "ready": bool(eligible),
+        "gates_p052c": True,
+        "patterns_verdict": verdict,
+        "persistent_patterns": len(persistent),
+        "eligible_patterns": len(eligible),
+        "non_persistent_patterns": len(non_persistent),
+        "eligible_axes": list(P052B_ALLOWED_AXES),
+        "reason": (sd.get("patterns_verdict_reason") if not eligible else
+                   "há contexto adverso confirmado em treino E validação"),
+        "note": ("padrões SAMPLE_LIMITED, MIXED ou LOW_COVERAGE nunca contam "
+                 "como prontos"),
+    }
+
+
+def _track_offline_lab(lab: Dict[str, Any]) -> Dict[str, Any]:
+    """Trilha 5.2 — laboratório offline do P05.2B."""
+    candidates = lab.get("candidates") or []
+    rejected = lab.get("rejected") or []
+    supported = [c for c in candidates if c.get("status") == LAB_VALIDATION_SUPPORTED]
+    insufficient = [c for c in rejected if c.get("status") == LAB_INSUFFICIENT]
+    refuted = [c for c in rejected if c.get("status") == LAB_REJECTED]
+    lead = (supported or refuted or insufficient or [None])[0]
+    return {
+        "phase": "P05.2B",
+        "status": lab.get("status"),
+        "ready": bool(supported),
+        "gates_p052c": True,
+        "hypotheses_evaluated": len(candidates) + len(rejected),
+        "validation_supported": len(supported),
+        "rejected": len(refuted),
+        "insufficient": len(insufficient),
+        "main_reason": (lead or {}).get("detail") or lab.get("detail"),
+        "main_reason_code": (lead or {}).get("reason_code") or lab.get("reason_code"),
+        "ready_for_holdout_review": bool(supported),
+        "note": ("validação apoiada é o teto desta fase; não existe aprovação, "
+                 "Shadow ou promoção"),
+    }
+
+
+def _track_forward_path(mae_mfe: Dict[str, Any]) -> Dict[str, Any]:
+    """Trilha 5.3 — trajetória MAE/MFE do P05.1T (diagnóstica).
+
+    Lê SÓ o resumo já produzido de `p05_path`. Sem backfill e sem qualquer
+    leitura de outcome selado. Sozinha, NÃO libera o P05.2C.
+    """
+    return {
+        "phase": "P05.1T",
+        "status": mae_mfe.get("status", _TRACK_UNAVAILABLE),
+        "ready": mae_mfe.get("status") == TELEMETRY_USABLE,
+        "gates_p052c": False,
+        "observed": mae_mfe.get("observed"),
+        "eligible_resolved": mae_mfe.get("eligible_resolved"),
+        "coverage_pct": mae_mfe.get("coverage_pct"),
+        "missing": mae_mfe.get("missing"),
+        "missing_by_reason": mae_mfe.get("unavailable_by_reason"),
+        "min_observed": P051T_MIN_OBSERVED,
+        "min_coverage_pct": P051T_MIN_COVERAGE_PCT,
+        "note": ("trilha diagnóstica: sem backfill e sem leitura do teste; "
+                 "sozinha não libera o P05.2C"),
+    }
+
+
+def _track_live_execution(latency: Dict[str, Any]) -> Dict[str, Any]:
+    """Trilha 5.4 — latência da entrada real do P05.2L (diagnóstica)."""
+    return {
+        "phase": "P05.2L",
+        "status": latency.get("status", _TRACK_UNAVAILABLE),
+        "ready": latency.get("status") == TELEMETRY_USABLE,
+        "gates_p052c": False,
+        "attempts_observed": latency.get("attempts_observed"),
+        "coverage_pct": latency.get("coverage_pct"),
+        "fill_auditable": latency.get("fill_auditable"),
+        "linked_real_trades": latency.get("linked_real_trades"),
+        "missing_by_reason": latency.get("missing_by_reason"),
+        "min_observed": P051T_MIN_OBSERVED,
+        "min_coverage_pct": P051T_MIN_COVERAGE_PCT,
+        "note": ("trilha diagnóstica: descreve o caminho técnico da entrada e, "
+                 "sozinha, não libera o P05.2C"),
+    }
+
+
+def _track_real_sample(real: Dict[str, Any],
+                       slippage: Dict[str, Any]) -> Dict[str, Any]:
+    """Trilha 5.5 — amostra REAL, somente informativa.
+
+    REAL e SHADOW nunca são somados e esta trilha nunca libera o P05.2C.
+    """
+    return {
+        "phase": "P05.2A_REAL",
+        "status": "INFORMATIONAL",
+        "ready": False,
+        "gates_p052c": False,
+        "total_closed": real.get("total_closed"),
+        "stops": real.get("stops"),
+        "stop_rate_pct": real.get("stop_rate_pct"),
+        "expectancy_r": real.get("expectancy_r"),
+        "reliability": real.get("reliability"),
+        "linked_to_snapshot_pct": real.get("linked_to_snapshot_pct"),
+        "slippage_coverage_pct": (slippage or {}).get("coverage_pct"),
+        "note": "REAL e SHADOW nunca são somados; trilha apenas informativa",
+    }
+
+
+def _ready_eta(state: str, lab: Dict[str, Any], sd: Dict[str, Any]) -> Dict[str, Any]:
+    """ETA reutilizando `estimate_eta`. Nunca negativa, nunca promessa."""
+    if state == READY_FOR_P052C:
+        return {"daily_rate": None, "eta_days": 0,
+                "eta_reason": ("hipótese já disponível para revisão MANUAL do "
+                               "holdout — não é aprovação")}
+    if state == READY_UNAVAILABLE:
+        return {"daily_rate": None, "eta_days": None,
+                "eta_reason": "diagnóstico indisponível nesta execução"}
+    if state == READY_COLLECTING:
+        return {"daily_rate": None, "eta_days": None,
+                "eta_reason": ("o surgimento de um contexto adverso persistente "
+                               "não é previsível por contagem de amostra")}
+
+    observed_days = _finite((sd.get("sample") or {}).get("observed_span_days"))
+    rejected = lab.get("rejected") or []
+    if state == READY_REJECTED:
+        return estimate_eta(affected_since_cutoff=0, observed_days=observed_days,
+                            missing_to_minimum=0, classification=FAILURE_REFUTED)
+
+    lead = next((c for c in rejected if c.get("status") == LAB_INSUFFICIENT), None)
+    affected = int(((lead or {}).get("validation") or {}).get("operations_removed") or 0)
+    missing = max(0, P051_MIN_AFFECTED - affected)      # nunca negativo
+    return estimate_eta(affected_since_cutoff=affected, observed_days=observed_days,
+                        missing_to_minimum=missing,
+                        classification=FAILURE_SAMPLE_LIMITED)
+
+
+def build_stop_readiness(stop_diagnosis: Optional[Dict[str, Any]] = None,
+                         diagnosis: Optional[Dict[str, Any]] = None
+                         ) -> Dict[str, Any]:
+    """P05.2R — monitor de prontidão. PURO, somente leitura, fail-soft por trilha.
+
+    Recebe apenas agregados já calculados: nenhuma linha, id, outcome ou
+    métrica do holdout entra aqui — o teste final permanece selado.
+    """
+    sd = stop_diagnosis if isinstance(stop_diagnosis, dict) else {}
+    diag = diagnosis if isinstance(diagnosis, dict) else {}
+    telemetry = diag.get("telemetry") if isinstance(diag.get("telemetry"), dict) else {}
+
+    out: Dict[str, Any] = {
+        "phase": P052R_PHASE,
+        "execution_mode": "ANALYTICS_ONLY",
+        "read_only": True,
+        "holdout_status": HOLDOUT_SEALED,
+        "holdout_outcomes_read": False,
+        "holdout_metrics_computed": False,
+        "does_not_mean": P052R_DOES_NOT_MEAN,
+        "limitations": P052R_LIMITATIONS,
+        "thresholds": {
+            "min_affected_validation": P051_MIN_AFFECTED,
+            "min_axis_coverage_pct": P05_MIN_FEATURE_COVERAGE_PCT,
+            "min_operations_preserved_pct": P052B_MIN_PRESERVED_PCT,
+            "max_hypotheses": P052B_MAX_HYPOTHESES,
+            "telemetry_min_observed": P051T_MIN_OBSERVED,
+            "telemetry_min_coverage_pct": P051T_MIN_COVERAGE_PCT,
+            "min_observed_days_for_rate": P051R_MIN_OBSERVED_DAYS_FOR_RATE,
+        },
+    }
+
+    tracks: Dict[str, Any] = {}
+    lab = sd.get("offline_lab") if isinstance(sd.get("offline_lab"), dict) else {}
+    for name, builder in (
+        ("stop_pattern", lambda: _track_stop_pattern(sd)),
+        ("offline_lab", lambda: _track_offline_lab(lab)),
+        ("forward_path", lambda: _track_forward_path(
+            diag.get("mae_mfe") if isinstance(diag.get("mae_mfe"), dict) else {})),
+        ("live_execution", lambda: _track_live_execution(
+            telemetry.get("latency") if isinstance(telemetry.get("latency"), dict) else {})),
+        ("real_sample", lambda: _track_real_sample(
+            sd.get("real") if isinstance(sd.get("real"), dict) else {},
+            telemetry.get("slippage") if isinstance(telemetry.get("slippage"), dict) else {})),
+    ):
+        try:
+            tracks[name] = builder()
+        except Exception as exc:                       # uma trilha nunca derruba as outras
+            log.warning(f"[p05.2r] trilha {name} falhou: {exc}")
+            tracks[name] = _ready_track_error(name, exc)
+    out["tracks"] = tracks
+
+    pattern_track = tracks["stop_pattern"]
+    supported = [c for c in (lab.get("candidates") or [])
+                 if c.get("status") == LAB_VALIDATION_SUPPORTED]
+    holdout_ok = (
+        str(sd.get("holdout_status") or HOLDOUT_SEALED) == HOLDOUT_SEALED
+        and sd.get("holdout_outcomes_read") is not True
+        and sd.get("holdout_metrics_computed") is not True
+        and str(lab.get("holdout_status") or HOLDOUT_SEALED) == HOLDOUT_SEALED
+        and lab.get("holdout_outcomes_read") is not True
+    )
+    candidates_safe = bool(supported) and all(
+        c.get("executable") is False and c.get("promotable") is False
+        and c.get("requires_future_holdout_review") is True
+        and str(c.get("holdout_status") or HOLDOUT_SEALED) == HOLDOUT_SEALED
+        for c in supported)
+
+    # ── Ordem de precedência EXIGIDA ────────────────────────────────────────
+    if (sd.get("error") or not sd
+            or pattern_track["status"] == _TRACK_UNAVAILABLE
+            or lab.get("status") in (None, LAB_UNAVAILABLE)):
+        state, reason_code = READY_UNAVAILABLE, "DIAGNOSIS_UNAVAILABLE"
+        detail = ("o diagnóstico de stops não pôde ser concluído; nenhuma "
+                  "conclusão de prontidão foi emitida")
+        next_action = "aguardar a próxima execução do diagnóstico"
+    elif not pattern_track["ready"]:
+        state, reason_code = READY_COLLECTING, "NO_PERSISTENT_ADVERSE_PATTERN"
+        detail = ("nenhum contexto se manteve adverso em treino E validação com "
+                  "amostra suficiente; os dados continuam sendo coletados")
+        next_action = "continuar coletando operações resolvidas"
+    elif lab.get("status") == LAB_REJECTED:
+        state, reason_code = READY_REJECTED, "VALIDATION_CHECK_FAILED"
+        detail = ("existe contexto adverso persistente, mas a hipótese reprovou "
+                  "em critério substantivo da validação")
+        next_action = ("não insistir na mesma hipótese: mais amostra não desfaz "
+                       "reprovação substantiva")
+    elif not supported:
+        state, reason_code = READY_INSUFFICIENT, "INSUFFICIENT_EVIDENCE"
+        detail = ("existe contexto adverso persistente, mas amostra, cobertura "
+                  "ou intervalo de confiança ainda não permitem julgar")
+        next_action = "aguardar mais operações afetadas na validação"
+    elif not (candidates_safe and holdout_ok):
+        state, reason_code = READY_UNAVAILABLE, "CONTRACT_INVARIANT_BROKEN"
+        detail = ("candidato apoiado, mas alguma invariante de segurança não foi "
+                  "confirmada; prontidão NÃO é declarada")
+        next_action = "revisar o contrato do laboratório antes de qualquer avanço"
+    else:
+        state, reason_code = READY_FOR_P052C, "VALIDATION_SUPPORTED_CANDIDATE"
+        detail = ("há hipótese apoiada pela validação que pode ser APRESENTADA "
+                  "para uma futura revisão MANUAL do holdout")
+        next_action = ("apresentar a hipótese para revisão manual — o holdout "
+                       "continua fechado e nada foi aplicado")
+
+    out["state"] = state
+    out["reason_code"] = reason_code
+    out["detail"] = detail
+    out["next_action"] = next_action
+    out["ready_for_p052c"] = state == READY_FOR_P052C
+    out["blocked_by"] = [name for name, tr in tracks.items()
+                         if tr.get("gates_p052c") and not tr.get("ready")]
+    try:
+        out["eta"] = _ready_eta(state, lab, sd)
+    except Exception as exc:
+        log.warning(f"[p05.2r] ETA falhou: {exc}")
+        out["eta"] = {"daily_rate": None, "eta_days": None,
+                      "eta_reason": f"ETA indisponível: {exc}"}
+    out["computed_at"] = datetime.now(timezone.utc).isoformat()
+    return out
+
+
 async def build_diagnosis(days: int = 30) -> Dict[str, Any]:
     """P05A — onde ganha, onde perde, com qualidade de evidência explícita."""
     out: Dict[str, Any] = {"window_days": days}
@@ -5676,6 +5994,23 @@ async def get_p05_status(days: int = 30) -> Dict[str, Any]:
         log.warning(f"[p05.2a] stop_diagnosis falhou: {exc}")
         out["stop_diagnosis"] = {"phase": "P05.2A", "error": str(exc),
                                  "holdout_status": HOLDOUT_SEALED}
+    # P05.2R — monitor de prontidão: PURO sobre os agregados já calculados
+    # acima (nenhuma consulta nova, nenhum cache paralelo). Fail-soft.
+    try:
+        out["stop_readiness"] = build_stop_readiness(
+            stop_diagnosis=out.get("stop_diagnosis"),
+            diagnosis=out.get("diagnosis"))
+    except Exception as exc:
+        log.warning(f"[p05.2r] stop_readiness falhou: {exc}")
+        out["stop_readiness"] = {
+            "phase": P052R_PHASE, "execution_mode": "ANALYTICS_ONLY",
+            "read_only": True, "state": READY_UNAVAILABLE,
+            "reason_code": "MONITOR_ERROR", "ready_for_p052c": False,
+            "next_action": "aguardar a próxima execução do monitor",
+            "holdout_status": HOLDOUT_SEALED, "holdout_outcomes_read": False,
+            "tracks": {}, "does_not_mean": P052R_DOES_NOT_MEAN,
+            "limitations": P052R_LIMITATIONS, "error": str(exc),
+        }
     out["p051"] = {
         "phase": P051_PHASE,
         "execution_mode": P051_EXECUTION_MODE,

@@ -1014,3 +1014,43 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   e tem timeout fixo de 1 segundo, sem env/flag/retry.
 - Regressões específicas cobrem a precedência de status e garantem por ordem de
   código que a telemetria não antecede quarentena, incidente ou `RealTrade`.
+
+## P05.2R — Stop Evidence Readiness Monitor (somente leitura)
+
+- **ANTES**: os dados existiam, mas espalhados em seções independentes (P05.2A,
+  P05.2B, P05.1T, P05.2L e amostra REAL). O usuário precisava cruzar tudo
+  manualmente e não havia nenhuma indicação única de prontidão nem de motivo de
+  bloqueio.
+- **DEPOIS**: monitor único `stop_readiness`, com trilhas independentes, motivo
+  explícito do bloqueio, ETA quando matematicamente possível e a indicação
+  `READY_FOR_P052C` — **sem abrir o holdout**.
+- Estados: `UNAVAILABLE`, `COLLECTING`, `INSUFFICIENT_EVIDENCE`,
+  `HYPOTHESIS_REJECTED`, `READY_FOR_P052C`. `APPROVED`, `ELIGIBLE`, `PROMOTED`,
+  `ACTIVE`, `LIVE_READY` e `AUTO_PROMOTE` não existem. Precedência: erro
+  estrutural → sem padrão elegível → reprovação substantiva → evidência
+  insuficiente → candidato validado. Reprovação nunca volta a "coletando";
+  ausência de evidência nunca vira reprovação.
+- `READY_FOR_P052C` exige simultaneamente padrão `PERSISTENT_ADVERSE` em eixo
+  elegível, `offline_lab.status="VALIDATION_SUPPORTED"`, candidato apoiado com
+  `executable=false`, `promotable=false`, `requires_future_holdout_review=true`,
+  holdout `SEALED` e nenhum outcome do teste lido. Qualquer invariante não
+  confirmada derruba para `CONTRACT_INVARIANT_BROKEN` — prontidão nunca é
+  declarada por omissão. Significa apenas "pode ser APRESENTADO para uma futura
+  revisão MANUAL do holdout".
+- Cinco trilhas: `stop_pattern` e `offline_lab` (as únicas que liberam o
+  P05.2C), mais `forward_path`, `live_execution` e `real_sample`, diagnósticas
+  ou informativas. `SAMPLE_LIMITED`, `MIXED` e `LOW_COVERAGE` nunca contam como
+  prontos; REAL e SHADOW nunca são somados; telemetria sozinha não libera nada
+  (coberto por teste).
+- ETA reutiliza `estimate_eta` do P05.1R: mínimo de 7 dias observados,
+  arredondamento para cima, nunca negativo, taxa zero e histórico jovem ⇒
+  `null`, hipótese reprovada ⇒ `null`, `eta_reason` sempre presente. Nenhum
+  outcome do holdout é usado para calcular ETA.
+- Função **pura e síncrona**, sem consulta nova e sem cache paralelo: consome os
+  agregados que `/api/strategy/p05/status` e `/api/shadow/assertiveness` já
+  obtiveram dos caches single-flight existentes. Nenhum endpoint novo, nenhum
+  POST, `main.py` não foi modificado. Fail-soft por trilha: uma trilha que falha
+  vira `UNAVAILABLE` com motivo legível e o status não cai.
+- Zero escrita (sem `session.add`/`commit`/`flush`/`merge`/`delete`/`update`,
+  sem `StrategyExperiment`), zero rede/SDK/exchange, zero
+  scheduler/worker/queue, zero notificação externa, zero tabela/coluna/env/flag.
