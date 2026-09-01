@@ -142,6 +142,40 @@ interface StopPattern {
 
 interface StopBand { band?: string; count?: number; pct?: number | null }
 
+// ── P05.2B: laboratório offline de hipóteses de stop (somente validação) ───
+interface LabCheck { name?: string; passed?: boolean; detail?: string }
+
+interface LabCandidate {
+  hash?: string
+  axis?: string
+  value?: string
+  type?: string
+  status?: string
+  reason_code?: string
+  detail?: string
+  wins_removed?: number
+  stops_avoided?: number
+  operations_preserved_pct?: number | null
+  checks?: LabCheck[]
+  risks?: string[]
+  validation?: {
+    champion?: { stop_rate_pct?: number | null; expectancy_r?: number | null }
+    candidate?: { stop_rate_pct?: number | null; expectancy_r?: number | null }
+    operations_removed?: number
+    evaluable?: number
+  } | null
+}
+
+interface OfflineLab {
+  status?: string
+  reason_code?: string
+  detail?: string
+  holdout_status?: string
+  candidates?: LabCandidate[]
+  rejected?: LabCandidate[]
+  source_patterns?: { axis?: string; value?: string }[]
+}
+
 interface StopDiagnosis {
   error?: string
   requested_window_days?: number
@@ -173,6 +207,15 @@ interface StopDiagnosis {
       mfe_before_stop?: { coverage_pct?: number | null; observed?: number; bands?: StopBand[] }
     }
   }
+  offline_lab?: OfflineLab
+}
+
+const LAB_STATUS_LABEL: Record<string, string> = {
+  NO_ELIGIBLE_HYPOTHESIS: 'nenhuma hipótese elegível',
+  INSUFFICIENT: 'evidência insuficiente',
+  REJECTED: 'reprovada na validação',
+  VALIDATION_SUPPORTED: 'apoiada pela validação',
+  UNAVAILABLE: 'indisponível',
 }
 
 const STOP_CLASS_LABEL: Record<string, string> = {
@@ -944,6 +987,71 @@ export default function AssertivenessPanel({ onClose }: Props) {
                         </div>
                       </div>
                     )}
+
+                    {/* ── P05.2B Laboratório offline de redução de stops ───── */}
+                    {sd.offline_lab && (() => {
+                      const lab = sd.offline_lab!
+                      const shown = [...(lab.candidates ?? []), ...(lab.rejected ?? [])]
+                      return (
+                        <div className="mt-2 p-2 rounded-lg border border-indigo-500/30 bg-indigo-500/5">
+                          <div className="flex items-center gap-2 mb-1 flex-wrap">
+                            <div className="text-[11px] font-bold text-indigo-200">
+                              Laboratório offline de redução de stops
+                            </div>
+                            <span className="text-[10px] text-indigo-300/90">
+                              {LAB_STATUS_LABEL[lab.status ?? ''] ?? lab.status}
+                              {shown.length > 0 && ` · ${shown.length} hipótese(s)`}
+                            </span>
+                            <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300">
+                              🔒 holdout ainda fechado
+                            </span>
+                          </div>
+
+                          {shown.length === 0 ? (
+                            <p className="text-[10px] text-slate-400 italic">
+                              Nenhuma hipótese elegível por enquanto. Os dados continuam sendo coletados.
+                            </p>
+                          ) : (
+                            <div className="flex flex-col gap-1.5">
+                              {shown.map(h => (
+                                <div key={h.hash ?? `${h.axis}-${h.value}`}
+                                  className="p-2 rounded border border-slate-800 bg-slate-900/50">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="text-[11px] font-bold text-slate-200">
+                                      Não selecionar {STOP_AXIS_LABEL[h.axis ?? ''] ?? h.axis} = {h.value}
+                                    </span>
+                                    <span className={`ml-auto text-[10px] ${
+                                      h.status === 'VALIDATION_SUPPORTED' ? 'text-emerald-300' : 'text-slate-400'}`}>
+                                      {LAB_STATUS_LABEL[h.status ?? ''] ?? h.status}
+                                    </span>
+                                  </div>
+                                  <div className="mt-0.5 text-[10px] text-slate-400">
+                                    stops evitados: <strong className="text-slate-200">{h.stops_avoided ?? 0}</strong>
+                                    {' '}· operações vencedoras que sairiam junto:{' '}
+                                    <strong className="text-amber-300">{h.wins_removed ?? 0}</strong>
+                                    {h.operations_preserved_pct !== null && h.operations_preserved_pct !== undefined && (
+                                      <> · preserva {fmtPct(h.operations_preserved_pct)} das operações</>
+                                    )}
+                                  </div>
+                                  <div className="mt-0.5 text-[10px] text-slate-400">
+                                    stop na validação: {fmtPct(h.validation?.champion?.stop_rate_pct)} →{' '}
+                                    {fmtPct(h.validation?.candidate?.stop_rate_pct)}
+                                  </div>
+                                  {h.status !== 'VALIDATION_SUPPORTED' && h.detail && (
+                                    <div className="mt-0.5 text-[9px] text-slate-500 leading-snug">{h.detail}</div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          <p className="mt-1 text-[9px] text-slate-500 leading-snug">
+                            <strong className="text-slate-400">Validação apoiada não significa aprovação.</strong>{' '}
+                            O teste final ainda não foi aberto. Nenhuma alteração foi aplicada à estratégia.
+                          </p>
+                        </div>
+                      )
+                    })()}
 
                     <p className="mt-1 text-[10px] text-slate-500 leading-snug px-1">
                       Estes são <strong className="text-slate-400">padrões observados, não causas</strong> — um contexto

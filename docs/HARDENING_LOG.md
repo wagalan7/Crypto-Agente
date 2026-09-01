@@ -924,3 +924,40 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
 - Validação final no Python 3.11 real: **73 testes específicos P05.2A**, **473
   testes P05 verdes 2×** e **suíte crítica P01–P05 (716) verde 2×**;
   `py_compile`, `tsc --noEmit` e `git diff --check` aprovados.
+
+## P05.2B — Stop Hypothesis Offline Lab (somente validação)
+
+- **ANTES**: o P05.2A já classificava contextos como `PERSISTENT_ADVERSE`, mas
+  não havia avaliação **stop-specific** pronta — a pergunta "e se as
+  recomendações desse contexto não fossem selecionadas?" não tinha resposta com
+  IC, custo em operações vencedoras e confirmação temporal.
+- **DEPOIS**: laboratório de validação pronto e funcionando, **sem holdout e sem
+  execução**. Uma única forma de hipótese (`STOP_CONTEXT_BLOCK`), no máximo 4,
+  originadas SOMENTE de padrão `PERSISTENT_ADVERSE` em eixo permitido
+  (`tier`, `timeframe`, `direction`, `session_utc`, `regime`,
+  `funding_sentiment`, `score_bin`, `atr_band`, `mtf_aligned`,
+  `entry_zone_type`); `base`, `patterns`, `tier_timeframe` e `day_of_week` ficam
+  bloqueados por cardinalidade, sobreposição ou risco de overfitting.
+- Comparação **pareada** sobre as mesmas oportunidades, com contexto
+  ausente/UNKNOWN excluído dos dois lados, bootstrap na seed fixa do P05 e
+  reutilização integral de `load_stop_shadow_split`, `build_stop_hypotheses`,
+  `_STOP_AXES`, `_partition_outcomes`, `compute_evidence_metrics`,
+  `bootstrap_paired_membership_delta_ci`, `_material_segment_regressions`,
+  `wilson_interval`, `P051_MIN_AFFECTED`, `P05_MIN_FEATURE_COVERAGE_PCT` e o
+  cache `_DIAG_CACHE` do P05.2A.
+- Gate **somente de validação**: os únicos status possíveis são
+  `NO_ELIGIBLE_HYPOTHESIS`, `INSUFFICIENT`, `REJECTED` e `VALIDATION_SUPPORTED`.
+  `OFFLINE_VALIDATED`, `SHADOW`, `ELIGIBLE`, `PROMOTED` e `ACTIVE` não existem.
+  São 15 checks obrigatórios; nenhum é afrouxado para produzir candidato.
+- Holdout final **SELADO**: o laboratório recebe apenas treino e validação;
+  `split["test"]`, ids, status, `realized_r` e métricas do teste nunca chegam
+  até ele, nem para um finalista. `requires_future_holdout_review=true`.
+- Com os dados atuais (`NO_PERSISTENT_STOP_PATTERN` em produção) o laboratório
+  devolve `NO_ELIGIBLE_HYPOTHESIS` com zero candidatos, zero vencedores e zero
+  experimentos; o comportamento com padrões persistentes é validado com dados
+  sintéticos herméticos.
+- Read-only: zero `session.add`/`commit`/`flush`/`merge`/`delete`/`update`,
+  zero `StrategyExperiment`, zero tabela/coluna/migration/env/flag/endpoint.
+  `main.py` não foi modificado. Falha do laboratório devolve
+  `offline_lab.status="UNAVAILABLE"`, não derruba o P05.2A e não envenena o
+  cache.

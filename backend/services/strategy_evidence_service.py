@@ -2641,6 +2641,482 @@ def build_stop_hypotheses(train_axes: Dict[str, Any], valid_axes: Dict[str, Any]
     return persistent[:P052A_MAX_PATTERNS], others[:P052A_MAX_PATTERNS]
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  P05.2B — STOP HYPOTHESIS OFFLINE LAB (somente validação, sem execução)
+#
+#  Responde UMA pergunta contrafactual: "como ficariam os resultados históricos
+#  observados se as recomendações de um contexto PERSISTENTEMENTE adverso não
+#  fossem selecionadas?".
+#
+#  O laboratório NÃO promove, NÃO ativa, NÃO cria experimento, NÃO entra em
+#  Shadow e NÃO abre o holdout final. O melhor status possível é
+#  `VALIDATION_SUPPORTED`, que significa APENAS "sobreviveu à validação" — nunca
+#  "aprovado". A revisão no teste selado fica para uma fase futura.
+# ════════════════════════════════════════════════════════════════════════════
+P052B_HYPOTHESIS_TYPE = "STOP_CONTEXT_BLOCK"
+P052B_MAX_HYPOTHESES = 4
+P052B_MIN_PRESERVED_PCT = 70.0
+
+# Eixos permitidos: baixa cardinalidade, exclusivos e sem sobreposição.
+P052B_ALLOWED_AXES = (
+    "tier", "timeframe", "direction", "session_utc", "regime",
+    "funding_sentiment", "score_bin", "atr_band", "mtf_aligned", "entry_zone_type",
+)
+# Bloqueados nesta fase: alta cardinalidade (base), multi-rótulo sobreposto
+# (patterns) ou combinação/estilhaçamento com risco de overfitting.
+P052B_BLOCKED_AXES = ("base", "patterns", "tier_timeframe", "day_of_week")
+
+LAB_NO_ELIGIBLE = "NO_ELIGIBLE_HYPOTHESIS"
+LAB_INSUFFICIENT = "INSUFFICIENT"
+LAB_REJECTED = "REJECTED"
+LAB_VALIDATION_SUPPORTED = "VALIDATION_SUPPORTED"
+LAB_UNAVAILABLE = "UNAVAILABLE"
+
+P052B_LIMITATIONS = [
+    "validação apoiada NÃO é aprovação — o teste final continua selado",
+    "contrafactual assume que remover o contexto não muda o resto do mercado",
+    "bloquear um contexto adverso também remove os wins daquele contexto",
+    "correlação não é causalidade: o contexto pode apenas rotular o regime",
+    "SHADOW é o caminho do SETUP, não o fill real",
+    "nenhuma hipótese é executável, promovível ou elegível a Shadow nesta fase",
+]
+
+# Vocabulário do núcleo P05 (`compute_evidence_metrics`) a partir da identidade
+# de desfecho do P05.2A. `won_tp1_be` tem R>0 por construção, então entra como
+# ganho — nunca como stop.
+_STOP_TO_EVIDENCE_CLASS = {
+    OUTCOME_STOP: "loss",
+    OUTCOME_WIN: "win",
+    OUTCOME_PROTECTED_EXIT: "win",
+    OUTCOME_EXPIRED: "expired",
+}
+
+
+def _lab_metric_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Traduz uma linha do P05.2A para o vocabulário do motor de métricas P05."""
+    r = _finite(row.get("realized_r"))
+    klass = _STOP_TO_EVIDENCE_CLASS.get(row.get("outcome_class"))
+    if r is None or klass is None:
+        return None
+    out = dict(row)
+    out["realized_r"] = float(r)
+    out["outcome_class"] = klass
+    out["stop_class"] = row.get("outcome_class")
+    return out
+
+
+def bootstrap_paired_stop_rate_delta_ci(
+    rows: Sequence[Dict[str, Any]], kept_ids: set,
+    *, seed: int = None, samples: int = None,
+) -> Optional[Dict[str, float]]:
+    """IC 95% do delta de TAXA DE STOP (candidato − champion), pareado.
+
+    A unidade reamostrada é a oportunidade; em cada réplica as duas taxas saem
+    do MESMO índice, preservando a dependência (o candidato é subconjunto do
+    champion). Mesma seed fixa do P05.
+    """
+    pairs = [(1 if r.get("outcome_class") == "loss" else 0, id(r) in kept_ids)
+             for r in rows]
+    if len(pairs) < 2 or not any(k for _s, k in pairs):
+        return None
+    rng = random.Random(P05_RANDOM_SEED if seed is None else seed)
+    nboot = _bootstrap_samples() if samples is None else max(1, min(samples, _BOOTSTRAP_HARD_MAX))
+    n = len(pairs)
+    deltas: List[float] = []
+    for _ in range(nboot):
+        ch_s = ch_n = ca_s = ca_n = 0
+        for _j in range(n):
+            stop, kept = pairs[rng.randrange(n)]
+            ch_s += stop
+            ch_n += 1
+            if kept:
+                ca_s += stop
+                ca_n += 1
+        if ch_n and ca_n:
+            deltas.append(ca_s / ca_n * 100.0 - ch_s / ch_n * 100.0)
+    if len(deltas) < max(20, nboot // 2):
+        return None
+    deltas.sort()
+    ch_all = sum(s for s, _k in pairs) / n * 100.0
+    kept_pairs = [s for s, k in pairs if k]
+    ca_all = sum(kept_pairs) / len(kept_pairs) * 100.0
+    return {
+        "low_pp": round(deltas[int(0.025 * (len(deltas) - 1))], 3),
+        "high_pp": round(deltas[int(0.975 * (len(deltas) - 1))], 3),
+        "point_pp": round(ca_all - ch_all, 3),
+        "method": "paired-opportunity-bootstrap",
+    }
+
+
+def stop_block_comparison(rows: Sequence[Dict[str, Any]], axis: str,
+                          value: Any) -> Dict[str, Any]:
+    """Champion observado × candidato `STOP_CONTEXT_BLOCK` sobre as MESMAS
+    oportunidades.
+
+    Contexto ausente/UNKNOWN é excluído dos DOIS lados (comparação simétrica):
+    ausência nunca vira "não pertence ao contexto".
+    """
+    if axis not in _STOP_AXES:
+        raise KeyError(axis)
+    getter = _STOP_AXES[axis]
+    valid, _exc = _partition_outcomes(rows)
+
+    evaluable: List[Dict[str, Any]] = []
+    unknown_excluded = 0
+    for row in valid:
+        key = getter(row)
+        if key is None or key == "" or isinstance(key, (list, tuple, set)):
+            unknown_excluded += 1          # UNKNOWN nunca vira zero nem ausência
+            continue
+        metric = _lab_metric_row(row)
+        if metric is None:
+            unknown_excluded += 1
+            continue
+        metric["_axis_value"] = str(key)
+        evaluable.append(metric)
+
+    target = str(value)
+    removed = [r for r in evaluable if r["_axis_value"] == target]
+    kept = [r for r in evaluable if r["_axis_value"] != target]
+
+    def _rate(group: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        n = len(group)
+        stops = sum(1 for r in group if r["outcome_class"] == "loss")
+        return {
+            "exposure": n,
+            "stops": stops,
+            "stop_rate_pct": round(stops / n * 100, 2) if n else None,
+            "stop_rate_ci": wilson_interval(stops, n),
+        }
+
+    champ_rate, cand_rate, rem_rate = _rate(evaluable), _rate(kept), _rate(removed)
+    champ_m = compute_evidence_metrics(evaluable)
+    cand_m = compute_evidence_metrics(kept)
+    rem_m = compute_evidence_metrics(removed)
+
+    kept_ids = {id(r) for r in kept}
+    paired = bootstrap_paired_membership_delta_ci(
+        evaluable, {id(r) for r in evaluable}, kept_ids)
+    stop_delta = bootstrap_paired_stop_rate_delta_ci(evaluable, kept_ids)
+
+    total_valid = len(valid)
+    coverage = round(len(evaluable) / total_valid * 100, 1) if total_valid else None
+    preserved = (round(len(kept) / len(evaluable) * 100, 2) if evaluable else None)
+
+    return {
+        "axis": axis,
+        "value": target,
+        "evaluable": len(evaluable),
+        "unknown_excluded": unknown_excluded,
+        "axis_coverage_pct": coverage,
+        "champion": {**champ_rate,
+                     "expectancy_r": champ_m["expectancy_r"],
+                     "sum_r": champ_m["sum_r"],
+                     "median_r": champ_m["median_r"],
+                     "profit_factor": champ_m["profit_factor"],
+                     "max_drawdown_r": champ_m["max_drawdown_r"],
+                     "worst_loss_streak": champ_m["worst_loss_streak"],
+                     "expectancy_ci": champ_m["expectancy_ci"],
+                     "reliability": champ_m["reliability"]},
+        "candidate": {**cand_rate,
+                      "expectancy_r": cand_m["expectancy_r"],
+                      "sum_r": cand_m["sum_r"],
+                      "median_r": cand_m["median_r"],
+                      "profit_factor": cand_m["profit_factor"],
+                      "max_drawdown_r": cand_m["max_drawdown_r"],
+                      "worst_loss_streak": cand_m["worst_loss_streak"],
+                      "expectancy_ci": cand_m["expectancy_ci"],
+                      "reliability": cand_m["reliability"]},
+        "removed": {**rem_rate,
+                    "expectancy_r": rem_m["expectancy_r"],
+                    "sum_r": rem_m["sum_r"],
+                    "expectancy_ci": rem_m["expectancy_ci"],
+                    "reliability": rem_m["reliability"]},
+        "operations_kept": len(kept),
+        "operations_removed": len(removed),
+        "operations_preserved_pct": preserved,
+        "stops_avoided": rem_rate["stops"],
+        "wins_removed": sum(1 for r in removed if r["stop_class"] == OUTCOME_WIN),
+        "protected_exits_removed": sum(1 for r in removed
+                                       if r["stop_class"] == OUTCOME_PROTECTED_EXIT),
+        "expired_removed": sum(1 for r in removed if r["stop_class"] == OUTCOME_EXPIRED),
+        "paired_expectancy_delta_ci": paired,
+        "stop_rate_delta_ci": stop_delta,
+        "stop_rate_delta_pp": (
+            round(cand_rate["stop_rate_pct"] - champ_rate["stop_rate_pct"], 2)
+            if cand_rate["stop_rate_pct"] is not None
+            and champ_rate["stop_rate_pct"] is not None else None),
+        "material_segment_regressions": _material_segment_regressions(evaluable, kept),
+        "note": ("comparação PAREADA sobre as mesmas oportunidades; contexto "
+                 "ausente é excluído dos dois lados"),
+    }
+
+
+def _pf_not_worse(candidate: Optional[float], champion: Optional[float]) -> bool:
+    """Profit factor do candidato não pode ser pior. `None` = indefinido (sem
+    perdas na amostra) e só é aceito quando o champion também é indefinido ou
+    quando o candidato deixou de ter perdas."""
+    if candidate is None:
+        return True                       # candidato sem perdas: não é pior
+    if champion is None:
+        return False                      # champion sem perdas, candidato com
+    return candidate >= champion - 1e-9
+
+
+def _hypothesis_hash(axis: str, value: str) -> str:
+    payload = json.dumps({"type": P052B_HYPOTHESIS_TYPE, "axis": axis,
+                          "value": value}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def evaluate_stop_hypothesis(pattern: Dict[str, Any],
+                             train_rows: Sequence[Dict[str, Any]],
+                             valid_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Avalia UMA hipótese `STOP_CONTEXT_BLOCK`. Gate SOMENTE de validação.
+
+    Nunca devolve `OFFLINE_VALIDATED`, `ELIGIBLE`, `SHADOW`, `PROMOTED` ou
+    `ACTIVE`: o melhor status possível é `VALIDATION_SUPPORTED`.
+    """
+    axis = str(pattern.get("axis") or "")
+    value = str(pattern.get("value") or "")
+    origin = str(pattern.get("classification") or "")
+
+    checks: List[Dict[str, Any]] = []
+    insufficient = False
+
+    def _check(name: str, passed: bool, detail: str, *, soft: bool = False) -> bool:
+        nonlocal insufficient
+        checks.append({"name": name, "passed": bool(passed), "detail": detail})
+        if not passed and soft:
+            insufficient = True
+        return bool(passed)
+
+    ok_origin = _check("origem_persistent_adverse",
+                       origin == STOP_PERSISTENT_ADVERSE,
+                       f"classificação de origem = {origin or 'ausente'}")
+    ok_axis = _check("eixo_permitido", axis in P052B_ALLOWED_AXES,
+                     f"eixo {axis or 'ausente'} "
+                     f"{'permitido' if axis in P052B_ALLOWED_AXES else 'bloqueado nesta fase'}")
+
+    base = {
+        "hash": _hypothesis_hash(axis, value),
+        "type": P052B_HYPOTHESIS_TYPE,
+        "axis": axis,
+        "value": value,
+        "source_evidence": {
+            "classification": origin,
+            "reason": pattern.get("reason"),
+            "train": pattern.get("train"),
+            "validation": pattern.get("validation"),
+            "axis_coverage_pct": pattern.get("axis_coverage_pct"),
+            "blocking_would_remove_wins": pattern.get("blocking_would_remove_wins"),
+        },
+        "executable": False,
+        "promotable": False,
+        "shadow_supported": False,
+        "requires_future_holdout_review": True,
+        "holdout_status": HOLDOUT_SEALED,
+        "limitations": P052B_LIMITATIONS,
+    }
+
+    if not (ok_origin and ok_axis):
+        return {**base, "status": LAB_REJECTED,
+                "reason_code": ("ORIGIN_NOT_PERSISTENT_ADVERSE" if not ok_origin
+                                else "AXIS_NOT_ALLOWED"),
+                "detail": ("só padrão PERSISTENT_ADVERSE em eixo permitido gera "
+                           "hipótese nesta fase"),
+                "checks": checks, "train": None, "validation": None,
+                "risks": ["hipótese não elegível: origem ou eixo fora do contrato"]}
+
+    train = stop_block_comparison(train_rows, axis, value)
+    validation = stop_block_comparison(valid_rows, axis, value)
+
+    _check("cobertura_treino",
+           (train["axis_coverage_pct"] or 0) >= P05_MIN_FEATURE_COVERAGE_PCT,
+           f"cobertura do eixo no treino = {train['axis_coverage_pct']}% "
+           f"(mín {P05_MIN_FEATURE_COVERAGE_PCT}%)", soft=True)
+    _check("cobertura_validacao",
+           (validation["axis_coverage_pct"] or 0) >= P05_MIN_FEATURE_COVERAGE_PCT,
+           f"cobertura do eixo na validação = {validation['axis_coverage_pct']}% "
+           f"(mín {P05_MIN_FEATURE_COVERAGE_PCT}%)", soft=True)
+    _check("amostra_afetada_validacao",
+           validation["operations_removed"] >= P051_MIN_AFFECTED,
+           f"{validation['operations_removed']} operações afetadas na validação "
+           f"(mín {P051_MIN_AFFECTED})", soft=True)
+
+    preserved = validation["operations_preserved_pct"]
+    _check("operacoes_preservadas",
+           preserved is not None and preserved >= P052B_MIN_PRESERVED_PCT,
+           f"preserva {preserved}% das operações do champion "
+           f"(mín {P052B_MIN_PRESERVED_PCT}%)")
+
+    cand, champ, rem = validation["candidate"], validation["champion"], validation["removed"]
+    _check("expectancy_candidato_positiva",
+           cand["expectancy_r"] is not None and cand["expectancy_r"] > 0,
+           f"expectancy do candidato na validação = {cand['expectancy_r']}")
+    _check("soma_r_candidato_positiva",
+           cand["sum_r"] is not None and cand["sum_r"] > 0,
+           f"soma R do candidato na validação = {cand['sum_r']}")
+    _check("profit_factor_nao_pior",
+           _pf_not_worse(cand["profit_factor"], champ["profit_factor"]),
+           f"PF candidato={cand['profit_factor']} vs champion={champ['profit_factor']}")
+    _check("drawdown_nao_pior",
+           (cand["max_drawdown_r"] is not None and champ["max_drawdown_r"] is not None
+            and cand["max_drawdown_r"] <= champ["max_drawdown_r"] + 1e-9),
+           f"drawdown candidato={cand['max_drawdown_r']} vs "
+           f"champion={champ['max_drawdown_r']}")
+    _check("removidas_negativas",
+           rem["expectancy_r"] is not None and rem["expectancy_r"] < 0,
+           f"expectancy das removidas = {rem['expectancy_r']}")
+
+    rem_ci = rem.get("expectancy_ci")
+    _check("ic_superior_removidas_negativo",
+           bool(rem_ci) and rem_ci.get("high") is not None and rem_ci["high"] < 0,
+           f"IC 95% das removidas = {rem_ci}", soft=not rem_ci)
+
+    paired = validation.get("paired_expectancy_delta_ci")
+    _check("ic_inferior_delta_positivo",
+           bool(paired) and paired.get("low") is not None and paired["low"] > 0,
+           f"IC 95% do delta pareado de expectancy = {paired}", soft=not paired)
+
+    _check("stop_rate_menor",
+           (cand["stop_rate_pct"] is not None and champ["stop_rate_pct"] is not None
+            and cand["stop_rate_pct"] < champ["stop_rate_pct"]),
+           f"stop rate candidato={cand['stop_rate_pct']}% vs "
+           f"champion={champ['stop_rate_pct']}%")
+
+    sr_ci = validation.get("stop_rate_delta_ci")
+    _check("ic_superior_delta_stop_negativo",
+           bool(sr_ci) and sr_ci.get("high_pp") is not None and sr_ci["high_pp"] < 0,
+           f"IC 95% do delta de stop rate = {sr_ci}", soft=not sr_ci)
+
+    regressions = validation.get("material_segment_regressions") or []
+    _check("sem_regressao_material", not regressions,
+           f"{len(regressions)} segmento(s) confiável(is) com regressão material")
+
+    failed = [c["name"] for c in checks if not c["passed"]]
+    if not failed:
+        status, reason_code = LAB_VALIDATION_SUPPORTED, "ALL_VALIDATION_CHECKS_PASSED"
+        detail = ("sobreviveu a todos os checks de validação — NÃO é aprovação; "
+                  "o teste final continua selado")
+    elif insufficient:
+        status, reason_code = LAB_INSUFFICIENT, "INSUFFICIENT_EVIDENCE"
+        detail = f"evidência insuficiente para julgar: {', '.join(failed)}"
+    else:
+        status, reason_code = LAB_REJECTED, "VALIDATION_CHECK_FAILED"
+        detail = f"reprovada na validação: {', '.join(failed)}"
+
+    risks = [
+        f"bloquear este contexto removeria {validation['wins_removed']} operações "
+        f"vencedoras na validação",
+        f"removeria {validation['operations_removed']} de {validation['evaluable']} "
+        f"oportunidades avaliáveis da validação",
+    ]
+    if validation["protected_exits_removed"]:
+        risks.append(f"{validation['protected_exits_removed']} saídas protetivas "
+                     f"pós-TP1 também seriam removidas")
+    if regressions:
+        risks.append(f"{len(regressions)} segmento(s) pioraria(m) materialmente")
+
+    return {**base, "status": status, "reason_code": reason_code, "detail": detail,
+            "train": train, "validation": validation, "checks": checks,
+            "wins_removed": validation["wins_removed"],
+            "stops_avoided": validation["stops_avoided"],
+            "operations_preserved_pct": validation["operations_preserved_pct"],
+            "risks": risks}
+
+
+def build_stop_offline_lab(train_rows: Sequence[Dict[str, Any]],
+                           valid_rows: Sequence[Dict[str, Any]],
+                           persistent_patterns: Sequence[Dict[str, Any]]
+                           ) -> Dict[str, Any]:
+    """P05.2B — laboratório offline.
+
+    Recebe SOMENTE treino e validação. Nenhuma linha, id, status, `realized_r`
+    ou métrica do teste chega até aqui; o holdout não é aberto nem para um
+    finalista.
+    """
+    out: Dict[str, Any] = {
+        "phase": "P05.2B",
+        "execution_mode": "ANALYTICS_ONLY",
+        "read_only": True,
+        "executable": False,
+        "promotable": False,
+        "shadow_supported": False,
+        "holdout_status": HOLDOUT_SEALED,
+        "holdout_outcomes_read": False,
+        "holdout_metrics_computed": False,
+        "requires_future_holdout_review": True,
+        "hypothesis_type": P052B_HYPOTHESIS_TYPE,
+        "max_hypotheses": P052B_MAX_HYPOTHESES,
+        "allowed_axes": list(P052B_ALLOWED_AXES),
+        "blocked_axes": list(P052B_BLOCKED_AXES),
+        "limitations": P052B_LIMITATIONS,
+    }
+
+    eligible = [p for p in (persistent_patterns or [])
+                if str(p.get("classification")) == STOP_PERSISTENT_ADVERSE
+                and str(p.get("axis")) in P052B_ALLOWED_AXES]
+    # Força determinística: maior lift de stop na VALIDAÇÃO, depois exposição.
+    eligible.sort(key=lambda p: (-((p.get("validation") or {}).get("stop_rate_lift_pp") or 0),
+                                 -((p.get("validation") or {}).get("exposure") or 0),
+                                 str(p.get("axis")), str(p.get("value"))))
+    selected = eligible[:P052B_MAX_HYPOTHESES]
+
+    out["source_patterns"] = [
+        {"axis": p.get("axis"), "value": p.get("value"),
+         "classification": p.get("classification"),
+         "validation_stop_rate_lift_pp": (p.get("validation") or {}).get("stop_rate_lift_pp")}
+        for p in selected
+    ]
+    out["source_patterns_available"] = len(persistent_patterns or [])
+    out["source_patterns_blocked_axis"] = [
+        {"axis": p.get("axis"), "value": p.get("value"), "reason": "AXIS_NOT_ALLOWED"}
+        for p in (persistent_patterns or [])
+        if str(p.get("classification")) == STOP_PERSISTENT_ADVERSE
+        and str(p.get("axis")) not in P052B_ALLOWED_AXES
+    ]
+
+    if not selected:
+        out.update({
+            "status": LAB_NO_ELIGIBLE,
+            "reason_code": "NO_PERSISTENT_ADVERSE_PATTERN",
+            "detail": ("ainda não há padrão de stop persistente elegível: nenhum "
+                       "contexto de eixo permitido se manteve adverso em treino E "
+                       "validação com amostra suficiente"),
+            "candidates": [],
+            "rejected": [],
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return out
+
+    evaluated = [evaluate_stop_hypothesis(p, train_rows, valid_rows) for p in selected]
+    supported = [h for h in evaluated if h["status"] == LAB_VALIDATION_SUPPORTED]
+    rejected = [h for h in evaluated if h["status"] != LAB_VALIDATION_SUPPORTED]
+
+    if supported:
+        status, reason_code = LAB_VALIDATION_SUPPORTED, "ALL_VALIDATION_CHECKS_PASSED"
+        detail = (f"{len(supported)} hipótese(s) sobreviveu(ram) à validação — "
+                  "validação apoiada NÃO significa aprovação e o teste final "
+                  "continua selado")
+    elif all(h["status"] == LAB_INSUFFICIENT for h in evaluated):
+        status, reason_code = LAB_INSUFFICIENT, "INSUFFICIENT_EVIDENCE"
+        detail = "amostra/cobertura ainda insuficiente para julgar as hipóteses"
+    else:
+        status, reason_code = LAB_REJECTED, "VALIDATION_CHECK_FAILED"
+        detail = "nenhuma hipótese passou em todos os checks de validação"
+
+    out.update({
+        "status": status,
+        "reason_code": reason_code,
+        "detail": detail,
+        "candidates": supported,
+        "rejected": rejected,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return out
+
+
 async def build_stop_diagnosis(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any]:
     """P05.2A — orquestra o diagnóstico. Fail-soft por seção; ZERO escrita."""
     out: Dict[str, Any] = {
@@ -2718,6 +3194,25 @@ async def build_stop_diagnosis(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any]:
     except Exception as exc:
         out["trajectory"] = {"error": str(exc)}
 
+    # P05.2B — laboratório offline. Recebe SOMENTE treino e validação; nenhuma
+    # linha, id ou métrica do teste selado chega até ele. Fail-soft: falha aqui
+    # não derruba o P05.2A.
+    try:
+        out["offline_lab"] = build_stop_offline_lab(
+            train, validation, out.get("persistent_patterns") or [])
+    except Exception as exc:
+        log.warning(f"[p05.2b] laboratório offline falhou: {exc}")
+        out["offline_lab"] = {
+            "phase": "P05.2B", "execution_mode": "ANALYTICS_ONLY", "read_only": True,
+            "executable": False, "promotable": False, "shadow_supported": False,
+            "holdout_status": HOLDOUT_SEALED, "holdout_outcomes_read": False,
+            "holdout_metrics_computed": False, "requires_future_holdout_review": True,
+            "status": LAB_UNAVAILABLE, "reason_code": "LAB_ERROR",
+            "detail": "não foi possível avaliar as hipóteses nesta execução",
+            "source_patterns": [], "candidates": [], "rejected": [],
+            "limitations": P052B_LIMITATIONS, "error": str(exc),
+        }
+
     try:
         from services import assertiveness_service as _assert
         out["real"] = await _assert.real_stop_summary(days)
@@ -2733,7 +3228,7 @@ def _stop_diagnosis_cacheable(value: Dict[str, Any]) -> bool:
     """Falha total ou parcial nunca permanece no cache do diagnóstico."""
     if value.get("error") or value.get("patterns_error"):
         return False
-    for section in ("shadow", "segments", "trajectory", "real"):
+    for section in ("shadow", "segments", "trajectory", "real", "offline_lab"):
         block = value.get(section)
         if isinstance(block, dict) and block.get("error"):
             return False
