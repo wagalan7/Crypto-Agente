@@ -107,8 +107,12 @@ nesta fase (verificado por teste).
 14. IC superior do delta da taxa de stop < 0;
 15. nenhuma regressão material em segmento confiável.
 
-Qualquer falha ⇒ `REJECTED` (ou `INSUFFICIENT` quando o que falta é
-amostra/cobertura). **Nenhum critério é afrouxado para produzir candidato.**
+Qualquer falha ⇒ `REJECTED` (ou `INSUFFICIENT` quando faltam cobertura,
+amostra ou significância estatística e não existe reprovação substantiva).
+Uma reprovação econômica real, como expectancy do candidato negativa,
+prevalece sobre uma insuficiência simultânea de amostra. Cobertura global
+abaixo do piso impede o julgamento dos checks derivados. **Nenhum critério é
+afrouxado para produzir candidato.**
 
 ## Holdout selado
 

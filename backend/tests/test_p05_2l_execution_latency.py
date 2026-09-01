@@ -593,6 +593,18 @@ class HotPath(unittest.TestCase):
         block = self.src.split("async def _record_entry_latency")[1].split("\n\n\n")[0]
         self.assertIn("except Exception", block)
         self.assertIn("log.debug", block)
+        self.assertIn("asyncio.wait_for", block)
+        self.assertIn("timeout=1.0", block)
+
+    def test_telemetria_nao_antecede_quarentena_nem_real_trade(self):
+        critical = self.src.split("if _emergency_attempted or _needs_manual:", 1)[1]
+        first_record = critical.index("await _record_entry_latency(")
+        self.assertLess(critical.index("_arm_execution_quarantine("), first_record)
+        self.assertLess(critical.index("await _ers.record_incident(**_kw)"), first_record)
+
+        success = self.src.split('log.info(\n                    f"[shadow→live] EXECUTED', 1)[1]
+        before_trade = success.split("trade = await _open_trade_fail_closed(", 1)[0]
+        self.assertNotIn("await _record_entry_latency(", before_trade)
 
     def test_nenhuma_chamada_adicional_a_exchange(self):
         block = self.src.split("async def _record_entry_latency")[1].split("\n\n\n")[0]

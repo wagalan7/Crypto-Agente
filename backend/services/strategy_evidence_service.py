@@ -3006,13 +3006,12 @@ def evaluate_stop_hypothesis(pattern: Dict[str, Any],
     origin = str(pattern.get("classification") or "")
 
     checks: List[Dict[str, Any]] = []
-    insufficient = False
+    insufficient_checks: set[str] = set()
 
     def _check(name: str, passed: bool, detail: str, *, soft: bool = False) -> bool:
-        nonlocal insufficient
         checks.append({"name": name, "passed": bool(passed), "detail": detail})
         if not passed and soft:
-            insufficient = True
+            insufficient_checks.add(name)
         return bool(passed)
 
     ok_origin = _check("origem_persistent_adverse",
@@ -3096,12 +3095,12 @@ def evaluate_stop_hypothesis(pattern: Dict[str, Any],
     rem_ci = rem.get("expectancy_ci")
     _check("ic_superior_removidas_negativo",
            bool(rem_ci) and rem_ci.get("high") is not None and rem_ci["high"] < 0,
-           f"IC 95% das removidas = {rem_ci}", soft=not rem_ci)
+           f"IC 95% das removidas = {rem_ci}", soft=True)
 
     paired = validation.get("paired_expectancy_delta_ci")
     _check("ic_inferior_delta_positivo",
            bool(paired) and paired.get("low") is not None and paired["low"] > 0,
-           f"IC 95% do delta pareado de expectancy = {paired}", soft=not paired)
+           f"IC 95% do delta pareado de expectancy = {paired}", soft=True)
 
     _check("stop_rate_menor",
            (cand["stop_rate_pct"] is not None and champ["stop_rate_pct"] is not None
@@ -3112,18 +3111,21 @@ def evaluate_stop_hypothesis(pattern: Dict[str, Any],
     sr_ci = validation.get("stop_rate_delta_ci")
     _check("ic_superior_delta_stop_negativo",
            bool(sr_ci) and sr_ci.get("high_pp") is not None and sr_ci["high_pp"] < 0,
-           f"IC 95% do delta de stop rate = {sr_ci}", soft=not sr_ci)
+           f"IC 95% do delta de stop rate = {sr_ci}", soft=True)
 
     regressions = validation.get("material_segment_regressions") or []
     _check("sem_regressao_material", not regressions,
            f"{len(regressions)} segmento(s) confiável(is) com regressão material")
 
     failed = [c["name"] for c in checks if not c["passed"]]
+    substantive_failed = [name for name in failed if name not in insufficient_checks]
+    coverage_missing = any(name in failed for name in (
+        "cobertura_treino", "cobertura_validacao"))
     if not failed:
         status, reason_code = LAB_VALIDATION_SUPPORTED, "ALL_VALIDATION_CHECKS_PASSED"
         detail = ("sobreviveu a todos os checks de validação — NÃO é aprovação; "
                   "o teste final continua selado")
-    elif insufficient:
+    elif coverage_missing or not substantive_failed:
         status, reason_code = LAB_INSUFFICIENT, "INSUFFICIENT_EVIDENCE"
         detail = f"evidência insuficiente para julgar: {', '.join(failed)}"
     else:

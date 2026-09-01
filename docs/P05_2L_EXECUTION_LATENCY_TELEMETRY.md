@@ -82,12 +82,14 @@ upgrade, fechamento, trade manager e autoheal (verificado por teste).
 
 A telemetria é montada em memória, começa **depois dos gates**, não executa
 leitura nem escrita no banco **antes** da tentativa de ordem, e é persistida
-**depois** que o resultado crítico já está definido. Nunca altera `order_res`,
+**depois** da quarentena/registro do incidente ou depois da persistência do
+`RealTrade`. A espera da gravação é limitada a 1 segundo; banco degradado não
+prende o loop indefinidamente. Nunca altera `order_res`,
 `qty`, entrada, SL, TP, nem um `continue`, retry ou retorno existente; nunca
 captura exceção da execução como se fosse erro da telemetria.
 
-Falha ao persistir: log estruturado, fluxo original preservado, sem pausa, sem
-retry, sem segunda chamada à exchange.
+Falha ou timeout ao persistir: log estruturado, fluxo original preservado, sem
+pausa, sem retry, sem segunda chamada à exchange.
 
 O `snapshot_id` já era lido antes da tentativa; a consulta apenas passou a trazer
 também `created_at`, para o ponta a ponta.

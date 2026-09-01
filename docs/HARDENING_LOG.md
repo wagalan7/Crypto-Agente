@@ -1002,3 +1002,15 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
 - Nenhuma tabela, coluna, migration, env, flag ou endpoint novo; nenhum payload
   bruto, header, assinatura, credencial, token, proxy ou ID condicional é
   persistido.
+
+### Auditoria independente P05.2B/P05.2L
+
+- O status do laboratório agora distingue falta de evidência de reprovação
+  substantiva: cobertura insuficiente impede julgamento; IC/amostra sem força
+  ficam `INSUFFICIENT`; mas uma falha econômica independente (por exemplo,
+  expectancy negativa do candidato) prevalece como `REJECTED`.
+- A gravação P05.2L foi retirada de antes da quarentena/incidente e de antes do
+  `_open_trade_fail_closed`. O trace final só é aguardado depois da ação crítica
+  e tem timeout fixo de 1 segundo, sem env/flag/retry.
+- Regressões específicas cobrem a precedência de status e garantem por ordem de
+  código que a telemetria não antecede quarentena, incidente ou `RealTrade`.

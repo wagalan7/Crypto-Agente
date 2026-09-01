@@ -349,6 +349,17 @@ class GateDeValidacao(unittest.TestCase):
         self.assertIn("amostra_afetada_validacao", nomes)
         self.assertEqual(p05.P051_MIN_AFFECTED, 20)
 
+    def test_reprovacao_substantiva_prevalece_sobre_amostra_insuficiente(self):
+        # A amostra afetada é pequena (soft), mas o candidato sobrevivente é
+        # claramente perdedor (hard). Não pode ser rotulado como se faltassem
+        # apenas dados: a hipótese já falhou substantivamente.
+        rows = _stage(adverse_n=5, win_n=20, loss_n=55)
+        out = p05.evaluate_stop_hypothesis(_pattern(), TRAIN, rows)
+        self.assertEqual(out["status"], p05.LAB_REJECTED)
+        failed = {c["name"] for c in out["checks"] if not c["passed"]}
+        self.assertIn("amostra_afetada_validacao", failed)
+        self.assertIn("expectancy_candidato_positiva", failed)
+
     def test_preservacao_minima_de_70pct(self):
         # 40 removidas em 100 → preserva 60% < 70%
         agressivo = _stage(adverse_n=40, win_n=45, loss_n=15)

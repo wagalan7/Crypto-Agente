@@ -259,7 +259,11 @@ async def _record_entry_latency(trace, snapshot_id, *, entry_route, order_res,
             reason_code=info["reason_code"],
             exchange_event_at=info["exchange_event_at"],
         )
-        await _snap.persist_execution_path(snapshot_id, payload)
+        # Mesmo depois das ações críticas, telemetria não pode prender o loop
+        # operacional indefinidamente se o pool/DB estiver degradado.
+        import asyncio
+        await asyncio.wait_for(
+            _snap.persist_execution_path(snapshot_id, payload), timeout=1.0)
     except Exception as exc:
         log.debug(f"[p05.2l] telemetria de latência não registrada "
                   f"(snapshot={snapshot_id}): {exc}")
@@ -5677,11 +5681,6 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 _pending_entry_order = bool(order_res.get("pending_entry_order"))
                 _emergency_attempted = bool(order_res.get("emergency_close_attempted"))
                 if _emergency_attempted or _needs_manual:
-                    # P05.2L: estado de submissão desconhecido — registrado antes
-                    # das saídas por `continue`. Não altera nada do fail-safe.
-                    await _record_entry_latency(
-                        _exec_trace, snap_id, entry_route=_entry_route,
-                        order_res=order_res, attempted=True)
                     # Binance centraliza o fail-safe no mesmo serviço que conhece
                     # a qty efetivamente preenchida. Aqui apenas notifica e NÃO
                     # tenta fechar de novo (evita uma segunda reduceOnly concorrente).
@@ -5753,10 +5752,18 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             log.critical(f"[p03] persistência do incidente falhou "
                                          f"(latch cobre o processo): {_p03_exc}")
                     if _resolved:
+                        # Telemetria somente DEPOIS da confirmação de fechamento
+                        # e do alerta; nunca antecede ação operacional crítica.
+                        await _record_entry_latency(
+                            _exec_trace, snap_id, entry_route=_entry_route,
+                            order_res=order_res, attempted=True)
                         continue
                     if _closed:
                         # Posição flat, mas cleanup/pending order ainda exige
                         # quarentena. Não cria RealTrade fictício de qty zero.
+                        await _record_entry_latency(
+                            _exec_trace, snap_id, entry_route=_entry_route,
+                            order_res=order_res, attempted=True)
                         continue
                     try:
                         _known_executed = float(
@@ -5775,6 +5782,9 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     else:
                         # Ordem/posição UNKNOWN sem qty auditável: o latch e o
                         # alerta são a fonte de verdade; não inventa trade no DB.
+                        await _record_entry_latency(
+                            _exec_trace, snap_id, entry_route=_entry_route,
+                            order_res=order_res, attempted=True)
                         continue
                 if not order_res.get("ok") and not _track_unprotected_incident:
                     # P05.2L: NOT_SUBMITTED / NO_FILL / UNKNOWN, conforme o
@@ -5912,11 +5922,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     f"order_id={exchange_order_id} avg={entry_actual} "
                     f"SL={sl_oid} TP1={tp1_oid} TP2={tp2_oid}"
                 )
-                # P05.2L: resultado crítico já definido (proteções tratadas).
-                # FILL_CONFIRMED só com preço médio e qty auditáveis.
-                await _record_entry_latency(
-                    _exec_trace, snap_id, entry_route=_entry_route,
-                    order_res=order_res, attempted=True)
+                # P05.2L é persistida somente depois do RealTrade abaixo. Assim,
+                # banco lento na telemetria nunca antecede a fonte de verdade
+                # operacional; o status final será OPEN_PERSISTED ou
+                # PERSISTENCE_FAILED, sem escrita intermediária desnecessária.
 
             # IDs das ordens condicionais (só existem no fluxo "auto"; em shadow ficam None)
             _sl_oid = locals().get("sl_oid") if source == "auto" else None
