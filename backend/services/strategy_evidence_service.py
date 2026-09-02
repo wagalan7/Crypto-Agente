@@ -2138,6 +2138,255 @@ def summarize_gate_availability(gate_events: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  P05.2Q — EVIDENCE COLLECTION HEALTH GUARD (somente observação)
+#
+#  A coleta PROSPECTIVA do P05 está funcionando? Julga por COORTES recentes
+#  (24h e 7d) para que o histórico anterior ao P05.1T — que legitimamente não
+#  tem `p05_path` — nunca faça uma coleta recente e saudável parecer quebrada.
+#
+#  Puro e síncrono: sem banco, rede, Telegram ou exchange; sem `realized_r`,
+#  sem split temporal e sem qualquer acesso ao holdout.
+# ════════════════════════════════════════════════════════════════════════════
+P052Q_MIN_COHORT = 5              # mínimo de resolvidas para JULGAR uma coorte
+P052Q_MIN_REAL_FOR_GATE = 5       # REAL só bloqueia com amostra mínima
+
+HEALTH_HEALTHY = "HEALTHY"
+HEALTH_WARMING_UP = "WARMING_UP"
+HEALTH_IDLE = "IDLE"
+HEALTH_DEGRADED = "DEGRADED"
+HEALTH_STALLED = "STALLED"
+HEALTH_UNAVAILABLE = "UNAVAILABLE"
+
+P052Q_STATES = (HEALTH_HEALTHY, HEALTH_WARMING_UP, HEALTH_IDLE,
+                HEALTH_DEGRADED, HEALTH_STALLED, HEALTH_UNAVAILABLE)
+
+# Rótulos CONTROLADOS dos bloqueios — nada de código interno na apresentação.
+P052Q_BLOCKERS = ("path_presence", "mae_mfe", "regime", "entry_zone_type",
+                  "real_linkage", "retention")
+
+
+def _health_ts(value: Any, now: datetime) -> Optional[datetime]:
+    """Timestamp UTC válido e NÃO futuro. Inválido/futuro ⇒ `None`."""
+    if not isinstance(value, datetime):
+        return None
+    ts = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return None if ts > now else ts
+
+
+def _health_cohort(items: Sequence[Dict[str, Any]], window: str) -> Dict[str, Any]:
+    """Métricas de UMA coorte. Ausência nunca vira zero — vira `None` + motivo."""
+    eligible = len(items)
+    path_present = mae_mfe = regime_ok = zone_ok = 0
+    missing: Dict[str, int] = {}
+    last_resolved: Optional[datetime] = None
+    last_path: Optional[datetime] = None
+
+    def _miss(reason: str) -> None:
+        missing[reason] = missing.get(reason, 0) + 1
+
+    for row in items:
+        ts = row.get("_health_ts")
+        if ts is not None and (last_resolved is None or ts > last_resolved):
+            last_resolved = ts
+        feats = row.get("features") if isinstance(row.get("features"), dict) else {}
+        path = feats.get("p05_path")
+        if isinstance(path, dict):
+            path_present += 1
+            if ts is not None and (last_path is None or ts > last_path):
+                last_path = ts
+            mae, mfe = _finite(path.get("mae_r")), _finite(path.get("mfe_r"))
+            if mae is not None and mfe is not None:
+                mae_mfe += 1
+            else:
+                _miss(str(path.get("unavailable_reason")
+                          or f"sem MAE/MFE (status={path.get('status')})"))
+        else:
+            _miss("sem p05_path (snapshot anterior à telemetria)")
+        # `features` já sanitizado acima: um payload malformado não pode
+        # derrubar o guard.
+        safe = {"features": feats}
+        if context_value(safe, "regime") != CONTEXT_UNKNOWN:
+            regime_ok += 1
+        else:
+            _miss("sem regime")
+        if context_value(safe, "entry_zone_type") != CONTEXT_UNKNOWN:
+            zone_ok += 1
+        else:
+            _miss("sem entry_zone_type")
+
+    def _pct(n: int) -> Optional[float]:
+        return round(n / eligible * 100, 1) if eligible else None
+
+    return {
+        "window": window,
+        "eligible_resolved": eligible,
+        "path_present": path_present,
+        "path_presence_pct": _pct(path_present),
+        "mae_mfe_observed": mae_mfe,
+        "mae_mfe_coverage_pct": _pct(mae_mfe),
+        "regime_coverage_pct": _pct(regime_ok),
+        "entry_zone_type_coverage_pct": _pct(zone_ok),
+        "missing_by_reason": missing,
+        "last_resolved_at": last_resolved.isoformat() if last_resolved else None,
+        "last_path_resolved_at": last_path.isoformat() if last_path else None,
+        "judgeable": eligible >= P052Q_MIN_COHORT,
+    }
+
+
+def _health_real_linkage(real_rows: Any) -> Dict[str, Any]:
+    """Vínculo REAL → recomendação. NÃO lê lucro, R, outcome, direção ou score."""
+    rows = real_rows if isinstance(real_rows, (list, tuple)) else []
+    total = 0
+    linked = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        total += 1
+        rid = row.get("recommendation_id")
+        if rid is None or isinstance(rid, bool):
+            continue
+        if isinstance(rid, str) and not rid.strip():
+            continue
+        linked += 1
+    return {
+        "total_real": total,
+        "linked_to_recommendation": linked,
+        "link_coverage_pct": round(linked / total * 100, 1) if total else None,
+        "gates_health": total >= P052Q_MIN_REAL_FOR_GATE,
+        "min_real_for_gate": P052Q_MIN_REAL_FOR_GATE,
+        "note": ("REAL nunca é somado ao SHADOW; sem operação real o vínculo é "
+                 "apenas informativo e não degrada a coleta"),
+    }
+
+
+def summarize_collection_health(rows: Any, retention: Any = None,
+                                real_rows: Any = None,
+                                now: Optional[datetime] = None) -> Dict[str, Any]:
+    """P05.2Q — saúde da coleta prospectiva, por coortes de 24h e 7d.
+
+    PURA e determinística (`now` injetável). Tolerante a payload inválido; nunca
+    lê `realized_r`, split temporal ou holdout; nunca calcula win rate,
+    expectancy, lucro ou causalidade.
+    """
+    ts_now = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    if ts_now.tzinfo is None:
+        ts_now = ts_now.replace(tzinfo=timezone.utc)
+
+    out: Dict[str, Any] = {
+        "phase": "P05.2Q",
+        "read_only": True,
+        "affects_strategy": False,
+        "thresholds": {
+            "min_cohort": P052Q_MIN_COHORT,
+            "min_coverage_pct": P05_MIN_FEATURE_COVERAGE_PCT,
+            "min_real_for_gate": P052Q_MIN_REAL_FOR_GATE,
+        },
+        "computed_at": ts_now.isoformat(),
+    }
+
+    def _unavailable(reason_code: str, detail: str) -> Dict[str, Any]:
+        return {**out, "status": HEALTH_UNAVAILABLE, "reason_code": reason_code,
+                "detail": detail, "sample_window": None,
+                "last_24h": None, "last_7d": None,
+                "real_linkage": _health_real_linkage(real_rows),
+                "retention": None, "blockers": ["retention"]}
+
+    if not isinstance(rows, (list, tuple)):
+        return _unavailable("LOADER_UNAVAILABLE",
+                            "não foi possível confirmar a integridade da coleta")
+    if not isinstance(retention, dict) or retention.get("error"):
+        return _unavailable("RETENTION_UNAVAILABLE",
+                            "não foi possível confirmar a integridade da coleta")
+
+    cut_24h = ts_now - timedelta(hours=24)
+    cut_7d = ts_now - timedelta(days=7)
+    in_24h: List[Dict[str, Any]] = []
+    in_7d: List[Dict[str, Any]] = []
+    excluded: Dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            excluded["linha inválida"] = excluded.get("linha inválida", 0) + 1
+            continue
+        ts = _health_ts(row.get("resolved_at"), ts_now)
+        if ts is None:
+            excluded["timestamp ausente, inválido ou futuro"] = (
+                excluded.get("timestamp ausente, inválido ou futuro", 0) + 1)
+            continue
+        item = {**row, "_health_ts": ts}
+        if ts >= cut_7d:
+            in_7d.append(item)
+            if ts >= cut_24h:
+                in_24h.append(item)
+
+    c24 = _health_cohort(in_24h, "24h")
+    c7 = _health_cohort(in_7d, "7d")
+    real = _health_real_linkage(real_rows)
+
+    out["last_24h"] = c24
+    out["last_7d"] = c7
+    out["real_linkage"] = real
+    out["retention"] = {
+        "retention_at_risk": bool(retention.get("retention_at_risk")),
+        "retention_warning": retention.get("retention_warning"),
+        "history_status": retention.get("history_status"),
+        "observed_retention_days": retention.get("observed_retention_days"),
+    }
+    out["excluded_by_reason"] = excluded
+
+    # ── Precedência EXIGIDA ─────────────────────────────────────────────────
+    if retention.get("retention_at_risk"):
+        return {**out, "status": HEALTH_DEGRADED,
+                "reason_code": "RETENTION_AT_RISK",
+                "detail": "a política de retenção ameaça a evidência do P05",
+                "sample_window": None, "blockers": ["retention"]}
+
+    cohort = c24 if c24["judgeable"] else (c7 if c7["judgeable"] else None)
+    if cohort is None:
+        if c7["eligible_resolved"] == 0:
+            return {**out, "status": HEALTH_IDLE, "reason_code": "NO_RECENT_RESOLUTIONS",
+                    "detail": ("não há evidência de falha; apenas não houve "
+                               "amostra recente"),
+                    "sample_window": None, "blockers": []}
+        return {**out, "status": HEALTH_WARMING_UP,
+                "reason_code": "COHORT_TOO_SMALL",
+                "detail": ("ainda há poucas recomendações resolvidas para julgar "
+                           "a coleta"),
+                "sample_window": "7d", "blockers": []}
+
+    out["sample_window"] = cohort["window"]
+
+    if cohort["path_present"] == 0:
+        return {**out, "status": HEALTH_STALLED, "reason_code": "NO_PATH_RECORDED",
+                "detail": ("existem recomendações resolvidas, mas nenhuma "
+                           "trajetória foi registrada"),
+                "blockers": ["path_presence"]}
+
+    floor = P05_MIN_FEATURE_COVERAGE_PCT
+    blockers: List[str] = []
+    for nome, chave in (("path_presence", "path_presence_pct"),
+                        ("mae_mfe", "mae_mfe_coverage_pct"),
+                        ("regime", "regime_coverage_pct"),
+                        ("entry_zone_type", "entry_zone_type_coverage_pct")):
+        pct = _finite(cohort.get(chave))
+        if pct is None or pct < floor:
+            blockers.append(nome)
+    if real["gates_health"]:
+        pct = _finite(real.get("link_coverage_pct"))
+        if pct is None or pct < floor:
+            blockers.append("real_linkage")
+
+    if blockers:
+        return {**out, "status": HEALTH_DEGRADED,
+                "reason_code": "COVERAGE_BELOW_FLOOR",
+                "detail": "alguma cobertura obrigatória ficou abaixo do piso",
+                "blockers": blockers}
+
+    return {**out, "status": HEALTH_HEALTHY, "reason_code": "ALL_CHECKS_PASSED",
+            "detail": "a coleta prospectiva está registrando evidência completa",
+            "blockers": []}
+
+
 async def build_telemetry_section(days: int) -> Dict[str, Any]:
     """Seção compacta de telemetria. Fail-soft por subseção; somente observação."""
     out: Dict[str, Any] = {
@@ -2185,6 +2434,20 @@ async def build_telemetry_section(days: int) -> Dict[str, Any]:
         out["retention"] = await _retention_snapshot(readiness_rows)
     except Exception as exc:
         out["retention"] = {"error": str(exc)}
+    # P05.2Q — saúde da coleta prospectiva. Reutiliza EXATAMENTE os mesmos
+    # `readiness_rows`, `real_rows` e o resultado de retenção já calculados
+    # acima: nenhuma query nova. Erro vira UNAVAILABLE sem derrubar o resto.
+    try:
+        out["collection_health"] = summarize_collection_health(
+            readiness_rows, retention=out.get("retention"), real_rows=real_rows)
+    except Exception as exc:
+        log.warning(f"[p05.2q] saúde da coleta falhou: {exc}")
+        out["collection_health"] = {
+            "phase": "P05.2Q", "read_only": True, "affects_strategy": False,
+            "status": HEALTH_UNAVAILABLE, "reason_code": "HEALTH_GUARD_ERROR",
+            "detail": "não foi possível confirmar a integridade da coleta",
+            "error": str(exc),
+        }
     return out
 
 

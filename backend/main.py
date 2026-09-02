@@ -892,6 +892,81 @@ def _fmt_p052_readiness_digest(readiness: Any) -> List[str]:
         return ["⚪ P05.2: status ainda não disponível"]
 
 
+# ── P05.2Q — bloco da saúde da coleta no digest existente ───────────────────
+# Bloqueios traduzidos: código interno NUNCA vai para o Telegram.
+_P052Q_BLOCKER_PT = {
+    "path_presence": "trajetórias não estão sendo registradas",
+    "mae_mfe": "MAE/MFE incompletos",
+    "regime": "contexto de regime incompleto",
+    "entry_zone_type": "tipo de entrada incompleto",
+    "real_linkage": "operações reais sem vínculo com a recomendação",
+    "retention": "retenção de histórico em risco",
+}
+
+
+def _fmt_p052q_collection_health_digest(health: Any) -> List[str]:
+    """P05.2Q — linhas curtas da saúde da coleta para o digest diário.
+
+    PURO e tolerante: sem banco, rede, Telegram ou exchange; sem códigos
+    internos, objetos ou erros no texto; payload ausente nunca derruba o digest.
+    """
+    try:
+        h = health if isinstance(health, dict) else {}
+        status = h.get("status")
+        status = status if isinstance(status, str) else ""
+
+        if status == "WARMING_UP":
+            return ["🟡 Coleta P05 aquecendo",
+                    "• Ainda há poucas recomendações resolvidas para julgar a coleta"]
+        if status == "IDLE":
+            return ["⚪ Coleta P05 sem novas resoluções",
+                    "• Não há evidência de falha; apenas não houve amostra recente"]
+        if status == "STALLED":
+            return ["🔴 Coleta P05 possivelmente parada",
+                    "• Existem recomendações resolvidas, mas nenhuma trajetória foi registrada",
+                    "• Verificar o resolver de telemetria"]
+        if status == "DEGRADED":
+            lines = ["⚠️ Coleta P05 degradada"]
+            blockers = h.get("blockers")
+            nomes = [_P052Q_BLOCKER_PT[b] for b in blockers
+                     if isinstance(b, str) and b in _P052Q_BLOCKER_PT] \
+                if isinstance(blockers, list) else []
+            for nome in nomes[:3]:
+                lines.append(f"• {nome}")
+            lines.append("• Nenhuma estratégia foi alterada")
+            return lines
+        if status == "HEALTHY":
+            janela = h.get("sample_window")
+            janela = janela if janela in ("24h", "7d") else "24h"
+            cohort = h.get("last_24h" if janela == "24h" else "last_7d")
+            cohort = cohort if isinstance(cohort, dict) else {}
+            lines = ["✅ Coleta P05 saudável"]
+            trajetorias = _p052n_num(cohort.get("path_present"))
+            cobertura = _p052n_num(cohort.get("mae_mfe_coverage_pct"))
+            partes = []
+            if trajetorias is not None:
+                partes.append(f"{int(trajetorias)} trajetórias")
+            if cobertura is not None:
+                partes.append(f"cobertura {cobertura:.1f}%".replace(".", ","))
+            if partes:
+                lines.append(f"• {janela}: " + " · ".join(partes))
+            lines.append("• Contextos essenciais completos")
+            real = h.get("real_linkage") if isinstance(h.get("real_linkage"), dict) else {}
+            total = _p052n_num(real.get("total_real"))
+            vinculo = _p052n_num(real.get("link_coverage_pct"))
+            if total is not None and total > 0 and vinculo is not None:
+                lines.append(f"• Vínculo REAL: {vinculo:.0f}% ({int(total)} operações)")
+            return lines
+        if status == "UNAVAILABLE":
+            return ["⚠️ Saúde da coleta P05 indisponível",
+                    "• Não foi possível confirmar a integridade da coleta"]
+        return ["⚠️ Saúde da coleta P05 indisponível",
+                "• Não foi possível confirmar a integridade da coleta"]
+    except Exception:            # apresentação nunca derruba o digest
+        return ["⚠️ Saúde da coleta P05 indisponível",
+                "• Não foi possível confirmar a integridade da coleta"]
+
+
 def _fmt_digest(a: Dict[str, Any]) -> str:
     """Monta o texto do digest diário a partir do get_assertiveness(). Tolerante
     a seções ausentes/None — nunca lança."""
@@ -945,6 +1020,9 @@ def _fmt_digest(a: Dict[str, Any]) -> str:
         lines.append(f"• Últimos: {tail}")
     # P05.2N — prontidão do P05.2R na MESMA mensagem diária (sem envio extra).
     lines.extend(_fmt_p052_readiness_digest(g(a, "p05", "stop_readiness")))
+    # P05.2Q — saúde da coleta prospectiva, logo após o bloco P05.2N.
+    lines.extend(_fmt_p052q_collection_health_digest(
+        g(a, "p05", "telemetry", "collection_health")))
     return "\n".join(lines)
 
 

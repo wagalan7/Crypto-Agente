@@ -271,8 +271,10 @@ class IntegracaoDigest(unittest.TestCase):
         self.assertIn("📊 *Digest diário*", texto)
         self.assertIn("• Equity:", texto)
         self.assertIn("• Real: sem trades resolvidos na janela", texto)
-        # o bloco P05.2 vem no FIM, sem substituir nada
-        self.assertTrue(texto.rstrip().endswith("• A estratégia permanece inalterada"))
+        # o bloco P05.2N vem DEPOIS do digest original, sem substituir nada
+        self.assertLess(texto.index("• Equity:"),
+                        texto.index("⚠️ P05.2: monitor indisponível"))
+        self.assertIn("• A estratégia permanece inalterada", texto)
 
     def test_digest_sem_p05_nao_quebra(self):
         texto = main._fmt_digest(self._a())
@@ -348,9 +350,10 @@ class Arquitetura(unittest.TestCase):
     def test_arquivos_proibidos_intactos(self):
         """O P05.2N não alterou serviços, frontend `src`, modelos ou banco.
 
-        A verificação é feita CAMINHO A CAMINHO desde a baseline, para não
-        confundir arquivo sujo preexistente do usuário (ex.: `frontend/dist`)
-        com alteração desta fase.
+        Verificado sobre o COMMIT da fase (`36a05fc3..ad844219`), não sobre o
+        working tree: fases posteriores (P05.2Q) alteram
+        `strategy_evidence_service` com autorização explícita, e o usuário tem
+        arquivos sujos preexistentes (ex.: `frontend/dist`).
         """
         import subprocess
         proibidos = [
@@ -365,12 +368,12 @@ class Arquitetura(unittest.TestCase):
         ]
         for caminho in proibidos:
             res = subprocess.run(
-                ["git", "diff", "--name-only", "36a05fc3", "--", caminho],
+                ["git", "diff", "--name-only", "36a05fc3", "ad844219", "--", caminho],
                 cwd=BACKEND.parent, capture_output=True, text=True)
             if res.returncode != 0:
-                self.skipTest("baseline 36a05fc3 indisponível neste checkout")
+                self.skipTest("commits da fase indisponíveis neste checkout")
             self.assertEqual(res.stdout.strip(), "",
-                             f"arquivo proibido alterado: {caminho}")
+                             f"P05.2N alterou arquivo proibido: {caminho}")
 
 
 if __name__ == "__main__":

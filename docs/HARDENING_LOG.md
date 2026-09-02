@@ -1091,3 +1091,46 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   Nenhum loop, endpoint, env, flag, tabela ou migration novos;
   `strategy_evidence_service`, `assertiveness_service`, `notification_service`,
   frontend, executor, serviços de exchange e modelos ficaram INTACTOS.
+
+## P05.2Q — Evidence Collection Health Guard
+
+- **ANTES**: a cobertura geral podia parecer baixa por causa do histórico
+  anterior ao P05.1T, que legitimamente não tem `p05_path`. Não havia como
+  distinguir "coleta quebrada" de "histórico antigo sem telemetria".
+- **DEPOIS**: a saúde é julgada por **coortes prospectivas de 24h e 7d**, então
+  amostra antiga nunca contamina uma coleta recente e saudável.
+- `summarize_collection_health(rows, retention, real_rows, now)` é **pura e
+  síncrona**, determinística com `now` injetável e tolerante a payload
+  inválido. Não faz banco, rede, Telegram ou exchange; não lê `realized_r`, não
+  usa split temporal, não acessa o holdout e não calcula win rate, expectancy,
+  lucro ou causalidade.
+- Por coorte: `eligible_resolved`, `path_present`, `path_presence_pct`,
+  `mae_mfe_observed`, `mae_mfe_coverage_pct`, cobertura de `regime` e de
+  `entry_zone_type`, `missing_by_reason`, `last_resolved_at` e
+  `last_path_resolved_at`. `p05_path` presente exige dicionário válido; MAE/MFE
+  observado exige `mae_r` **e** `mfe_r` finitos; ausência nunca vira zero;
+  timestamp inválido ou futuro é excluído e contabilizado.
+- Estados `HEALTHY` · `WARMING_UP` · `IDLE` · `DEGRADED` · `STALLED` ·
+  `UNAVAILABLE`, com precedência: contrato/retenção indisponível → retenção em
+  risco → coorte julgável com zero trajetórias (`STALLED`) → cobertura
+  obrigatória abaixo de `P05_MIN_FEATURE_COVERAGE_PCT` (80%) → vínculo REAL
+  abaixo do piso com ≥5 operações → `HEALTHY`. Coorte: 24h com ≥5, senão 7d com
+  ≥5, senão `IDLE` (zero em 7d) ou `WARMING_UP` (1–4). Ausência de resoluções
+  **nunca** é classificada como `STALLED`.
+- REAL só informa `total_real`, `linked_to_recommendation` e
+  `link_coverage_pct`: sem lucro, `realized_r`, outcome, direção, score, stop ou
+  TP. REAL nunca é somado ao SHADOW e só bloqueia a saúde com pelo menos 5
+  operações reais na amostra.
+- Integrado em `build_telemetry_section` reutilizando **exatamente** os mesmos
+  `readiness_rows`, `real_rows` e o resultado de retenção já calculados — zero
+  query nova, zero cache paralelo. Chega automaticamente por
+  `/api/strategy/p05/status`, `get_assertiveness` e
+  `p05.telemetry.collection_health`. Erro vira `UNAVAILABLE` sem derrubar as
+  demais seções.
+- No Telegram, o bloco entra no **mesmo digest diário**, logo após o P05.2N, por
+  um helper puro com bloqueios traduzidos e números validados — sem segundo
+  `send_telegram`, sem mensagem imediata, sem código interno, objeto, erro,
+  `None`, NaN ou infinito, e com `parse_mode="Markdown"` preservado.
+- Nenhuma tabela, migration, endpoint, env, flag, scheduler, worker ou loop
+  novo; nenhuma chamada à exchange; frontend, modelos, `db.py`,
+  `snapshot_service.py`, executor e `notification_service.py` INTACTOS.
