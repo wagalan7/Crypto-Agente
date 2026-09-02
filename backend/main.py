@@ -781,6 +781,117 @@ async def _health_watchdog_loop():
             break
 
 
+# ── P05.2N — bloco do monitor de prontidão (P05.2R) no digest existente ─────
+# Tradução dos nomes internos das trilhas. Nome desconhecido é OMITIDO: código
+# técnico nunca vai para o Telegram.
+_P052N_TRACK_PT = {
+    "stop_pattern": "padrão persistente",
+    "offline_lab": "hipótese offline",
+    "forward_path": "telemetria futura",
+    "live_execution": "latência da entrada real",
+    "real_sample": "amostra real",
+}
+
+
+def _p052n_num(value: Any) -> Optional[float]:
+    """Número finito e não negativo, ou `None`. NaN, inf, bool e texto caem fora."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    f = float(value)
+    if f != f or f in (float("inf"), float("-inf")) or f < 0:
+        return None
+    return f
+
+
+def _fmt_p052_readiness_digest(readiness: Any) -> List[str]:
+    """P05.2N — linhas curtas do P05.2R para o digest diário.
+
+    PURO e tolerante: não consulta banco, não usa rede, não envia Telegram, não
+    altera estado, não reavalia o P05 e não lê outcomes. Payload ausente,
+    malformado ou de tipo errado nunca lança.
+
+    Somente textos CONTROLADOS e números VALIDADOS entram na mensagem —
+    `detail`, `reason_code`, erros, listas e objetos nunca são interpolados.
+    """
+    try:
+        rd = readiness if isinstance(readiness, dict) else {}
+        state = rd.get("state")
+        state = state if isinstance(state, str) else ""
+
+        if state == "COLLECTING":
+            lines = ["🟡 P05.2: coletando evidências"]
+            fp = rd.get("tracks") if isinstance(rd.get("tracks"), dict) else {}
+            fp = fp.get("forward_path") if isinstance(fp.get("forward_path"), dict) else {}
+            obs = _p052n_num(fp.get("observed"))
+            cov = _p052n_num(fp.get("coverage_pct"))
+            partes = []
+            if obs is not None:
+                partes.append(f"{int(obs)} observações")
+            if cov is not None:
+                partes.append(f"cobertura {cov:.1f}%".replace(".", ","))
+            if partes:
+                lines.append("• Telemetria futura: " + " · ".join(partes))
+            blocked = rd.get("blocked_by")
+            nomes = [_P052N_TRACK_PT[b] for b in blocked
+                     if isinstance(b, str) and b in _P052N_TRACK_PT] \
+                if isinstance(blocked, list) else []
+            if nomes:
+                lines.append("• Aguardando " + " e ".join(nomes))
+            lines.append("• Nenhuma alteração foi aplicada à estratégia")
+            return lines
+
+        if state == "INSUFFICIENT_EVIDENCE":
+            eta = rd.get("eta") if isinstance(rd.get("eta"), dict) else {}
+            dias = _p052n_num(eta.get("eta_days"))
+            return [
+                "🟠 P05.2: evidência ainda insuficiente",
+                "• Existe uma hipótese, mas a amostra ainda não permite julgamento",
+                (f"• ETA: {int(dias)} dias" if dias is not None
+                 else "• ETA ainda indisponível"),
+            ]
+
+        if state == "HYPOTHESIS_REJECTED":
+            return [
+                "⛔ P05.2: hipótese reprovada na validação",
+                "• A hipótese não deve ser forçada nem aprovada por mais amostra",
+                "• Champion permanece inalterado",
+            ]
+
+        if state == "UNAVAILABLE":
+            return [
+                "⚠️ P05.2: monitor indisponível",
+                "• Nenhuma conclusão de prontidão foi emitida",
+                "• A estratégia permanece inalterada",
+            ]
+
+        if state == "READY_FOR_P052C":
+            # FAIL-CLOSED: "pronto" só com TODAS as invariantes confirmadas.
+            # Campo ausente ou divergente nunca recebe valor seguro por padrão.
+            seguro = (
+                rd.get("ready_for_p052c") is True
+                and rd.get("holdout_status") == "SEALED"
+                and rd.get("holdout_outcomes_read") is False
+                and rd.get("holdout_metrics_computed") is False
+            )
+            if not seguro:
+                return [
+                    "⚠️ P05.2: prontidão não confirmada",
+                    "• O contrato de segurança está incompleto ou divergente",
+                    "• Nenhuma alteração deve ser executada",
+                ]
+            return [
+                "🚨 P05.2C PRONTO PARA AUDITORIA MANUAL",
+                "• Uma hipótese foi apoiada na validação",
+                "• 🔒 Holdout final continua selado",
+                "• Nenhuma regra foi ativada",
+                "• Próximo passo: auditoria manual antes de qualquer alteração",
+            ]
+
+        return ["⚪ P05.2: status ainda não disponível"]
+    except Exception:            # apresentação nunca derruba o digest
+        return ["⚪ P05.2: status ainda não disponível"]
+
+
 def _fmt_digest(a: Dict[str, Any]) -> str:
     """Monta o texto do digest diário a partir do get_assertiveness(). Tolerante
     a seções ausentes/None — nunca lança."""
@@ -832,6 +943,8 @@ def _fmt_digest(a: Dict[str, Any]) -> str:
     if pts:
         tail = " · ".join(f"{p.get('base')} {p.get('r'):+.2f}R" for p in pts)
         lines.append(f"• Últimos: {tail}")
+    # P05.2N — prontidão do P05.2R na MESMA mensagem diária (sem envio extra).
+    lines.extend(_fmt_p052_readiness_digest(g(a, "p05", "stop_readiness")))
     return "\n".join(lines)
 
 

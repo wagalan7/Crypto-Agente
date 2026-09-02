@@ -1058,3 +1058,36 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
 - Zero escrita (sem `session.add`/`commit`/`flush`/`merge`/`delete`/`update`,
   sem `StrategyExperiment`), zero rede/SDK/exchange, zero
   scheduler/worker/queue, zero notificação externa, zero tabela/coluna/env/flag.
+
+## P05.2N — Telegram Readiness Digest
+
+- **ANTES**: a prontidão do P05.2R existia apenas no painel e na API — para
+  saber se algo mudou era preciso abrir o `AssertivenessPanel` ou consultar
+  `/api/strategy/p05/status`.
+- **DEPOIS**: o estado é resumido em poucas linhas dentro do **digest diário do
+  Telegram que já existia**, na MESMA mensagem, no mesmo horário e com a mesma
+  deduplicação de uma vez por dia.
+- Helper puro `_fmt_p052_readiness_digest(readiness) -> list[str]` ao lado de
+  `_fmt_digest`: recebe somente o dicionário `stop_readiness`, não consulta
+  banco, não usa rede, não envia Telegram, não altera estado, não reavalia o
+  P05, não lê outcomes e nunca lança com payload ausente ou malformado.
+  `_fmt_digest` apenas acrescenta as linhas retornadas.
+- Estados traduzidos para linguagem simples: `COLLECTING` (com observações,
+  cobertura e bloqueios, traduzindo `stop_pattern` → "padrão persistente" e
+  `offline_lab` → "hipótese offline"), `INSUFFICIENT_EVIDENCE` (ETA só quando
+  `eta_days` é número válido e não negativo, senão "ETA ainda indisponível"),
+  `HYPOTHESIS_REJECTED`, `UNAVAILABLE` e estado ausente/desconhecido.
+- `READY_FOR_P052C` é **fail-closed**: "PRONTO PARA AUDITORIA MANUAL" só sai com
+  `state`, `ready_for_p052c is True`, `holdout_status == "SEALED"`,
+  `holdout_outcomes_read is False` e `holdout_metrics_computed is False`
+  simultaneamente. Qualquer campo ausente ou divergente imprime "prontidão não
+  confirmada" — nunca "pronto".
+- Somente textos controlados e números validados: `detail`, `reason_code`,
+  erros, listas e objetos nunca são interpolados; `None`, `NaN`, `inf` e
+  `[object Object]` são impossíveis por construção, e o bloco não emite
+  caracteres de marcação que quebrem o `parse_mode="Markdown"` existente.
+- **Nenhum envio adicional** (o loop segue com um único `send_telegram` por dia),
+  nenhuma automação estratégica, nenhum holdout aberto, nenhuma mudança no LIVE.
+  Nenhum loop, endpoint, env, flag, tabela ou migration novos;
+  `strategy_evidence_service`, `assertiveness_service`, `notification_service`,
+  frontend, executor, serviços de exchange e modelos ficaram INTACTOS.
