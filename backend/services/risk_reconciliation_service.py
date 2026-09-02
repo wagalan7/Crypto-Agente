@@ -85,10 +85,17 @@ def _finite(value: Any) -> Optional[float]:
 
 
 def _as_utc(value: Any) -> Optional[datetime]:
-    """Timestamp UTC. Naive é tratado EXPLICITAMENTE como UTC; resto ⇒ `None`."""
+    """Timestamp UTC; naive é tratado explicitamente como UTC."""
     if not isinstance(value, datetime):
         return None
-    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _valid_id(value: Any) -> bool:
+    """Identidade inteira positiva. `bool` não é ID apesar de herdar de `int`."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _unavailable(reason_code: str, detail: str) -> Dict[str, Any]:
@@ -150,8 +157,8 @@ def theoretical_window(snapshots: Sequence[Dict[str, Any]], *, since: datetime,
             _bump(excluded, "realized_r ausente, NaN ou infinito")
             continue
         risk = _finite(snap.get("risk_pct"))
-        if risk is None:
-            _bump(excluded, "risk_pct ausente, NaN ou infinito")
+        if risk is None or risk <= 0:
+            _bump(excluded, "risk_pct ausente, NaN, infinito ou não positivo")
             continue
         count += 1
         sum_r += r
@@ -184,7 +191,10 @@ def _empty_cohort(name: str) -> Dict[str, Any]:
         "source": name, "closed_valid": 0,
         "recorded_net_pnl_usd": None, "positive": 0, "negative": 0, "zero": 0,
         "entry_fee_sum_usd": None, "exit_fee_sum_usd": None,
+        "entry_fee_coverage_pct": None, "exit_fee_coverage_pct": None,
+        "fees_complete": False,
         "with_tp1_partial": 0, "closed_manual": 0, "without_recommendation_id": 0,
+        "invalid_recommendation_id": 0,
         "pnl_coverage_pct": None, "recommendation_link_coverage_pct": None,
         "slippage_coverage_pct": None,
         "excluded_by_reason": {}, "closed_total_seen": 0,
@@ -208,6 +218,8 @@ def real_cohorts(trades: Sequence[Dict[str, Any]], *, since: datetime,
     pnl_sums: Dict[str, float] = {}
     seen_pnl: Dict[str, int] = {}
     seen_slip: Dict[str, int] = {}
+    seen_entry_fee: Dict[str, int] = {}
+    seen_exit_fee: Dict[str, int] = {}
 
     def _acc(bucket: Dict[str, Any], key: str, trade: Dict[str, Any],
              pnl: Optional[float]) -> None:
@@ -229,14 +241,18 @@ def real_cohorts(trades: Sequence[Dict[str, Any]], *, since: datetime,
         fees = fee_sums.setdefault(key, [0.0, 0.0])
         if entry_fee is not None:
             fees[0] += entry_fee
+            seen_entry_fee[key] = seen_entry_fee.get(key, 0) + 1
         if exit_fee is not None:
             fees[1] += exit_fee
+            seen_exit_fee[key] = seen_exit_fee.get(key, 0) + 1
         if (_finite(trade.get("tp1_realized_usd")) or 0.0) != 0.0:
             bucket["with_tp1_partial"] += 1
         if str(trade.get("status") or "") == "closed_manual":
             bucket["closed_manual"] += 1
-        if trade.get("recommendation_id") is None:
+        if not _valid_id(trade.get("recommendation_id")):
             bucket["without_recommendation_id"] += 1
+            if trade.get("recommendation_id") is not None:
+                bucket["invalid_recommendation_id"] += 1
         if _finite(trade.get("entry_slippage_pct")) is not None:
             seen_slip[key] = seen_slip.get(key, 0) + 1
 
@@ -261,8 +277,16 @@ def real_cohorts(trades: Sequence[Dict[str, Any]], *, since: datetime,
         bucket["recorded_net_pnl_usd"] = (round(pnl_sums.get(key, 0.0), 4)
                                           if valid else None)
         fees = fee_sums.get(key)
-        bucket["entry_fee_sum_usd"] = round(fees[0], 4) if fees else None
-        bucket["exit_fee_sum_usd"] = round(fees[1], 4) if fees else None
+        entry_fee_n = seen_entry_fee.get(key, 0)
+        exit_fee_n = seen_exit_fee.get(key, 0)
+        bucket["entry_fee_sum_usd"] = (round(fees[0], 4)
+                                        if fees and entry_fee_n else None)
+        bucket["exit_fee_sum_usd"] = (round(fees[1], 4)
+                                       if fees and exit_fee_n else None)
+        bucket["entry_fee_coverage_pct"] = _pct(entry_fee_n, total)
+        bucket["exit_fee_coverage_pct"] = _pct(exit_fee_n, total)
+        bucket["fees_complete"] = bool(total and entry_fee_n == total
+                                       and exit_fee_n == total)
         bucket["pnl_coverage_pct"] = _pct(seen_pnl.get(key, 0), total)
         bucket["recommendation_link_coverage_pct"] = _pct(
             total - bucket["without_recommendation_id"], total)
@@ -317,12 +341,14 @@ def paired_reconciliation(trades: Sequence[Dict[str, Any]],
             continue
         eligible += 1
         rec_id = trade.get("recommendation_id")
-        if rec_id is None:
+        if not _valid_id(rec_id):
             _bump(excluded, "sem recommendation_id")
             continue
         by_rec.setdefault(rec_id, []).append(trade)
 
     deltas_r: List[float] = []
+    abs_deltas_r: List[float] = []
+    abs_deltas_bank: List[float] = []
     delta_bank_sum = 0.0
     theoretical_bank_sum = 0.0
     financial_bank_sum = 0.0
@@ -343,6 +369,7 @@ def paired_reconciliation(trades: Sequence[Dict[str, Any]],
             continue
 
         pnl = _finite(trade.get("pnl_usd"))
+        side = str(trade.get("side") or "").strip().lower()
         entry = _finite(trade.get("entry_price"))
         stop = _finite(trade.get("planned_stop"))
         qty = _finite(trade.get("qty_initial"))
@@ -359,8 +386,15 @@ def paired_reconciliation(trades: Sequence[Dict[str, Any]],
         if entry is None or entry <= 0:
             _bump(excluded, "entry_price inválido")
             continue
+        if side not in ("long", "short"):
+            _bump(excluded, "side ausente ou inválido")
+            continue
         if stop is None or stop <= 0:
             _bump(excluded, "planned_stop inválido")
+            continue
+        # Igual ao entry é tratado abaixo pelo contrato explícito risk_dollar=0.
+        if (side == "long" and stop > entry) or (side == "short" and stop < entry):
+            _bump(excluded, "planned_stop incompatível com o lado")
             continue
         if qty is None or qty <= 0:
             _bump(excluded, "qty inválida")
@@ -388,6 +422,8 @@ def paired_reconciliation(trades: Sequence[Dict[str, Any]],
 
         comparable += 1
         deltas_r.append(delta_r)
+        abs_deltas_r.append(abs(delta_r))
+        abs_deltas_bank.append(abs(delta_bank))
         delta_bank_sum += delta_bank
         theoretical_bank_sum += theoretical_bank
         financial_bank_sum += financial_bank
@@ -398,6 +434,13 @@ def paired_reconciliation(trades: Sequence[Dict[str, Any]],
             persisted_r_mismatch += 1
 
     coverage = _pct(comparable, eligible)
+    material_pair_mismatches = sum(
+        1 for value in abs_deltas_bank if value > ALIGNED_TOLERANCE_BANK_PP)
+    cancellation_risk = (
+        bool(abs_deltas_bank)
+        and sum(abs_deltas_bank) > ALIGNED_TOLERANCE_BANK_PP
+        and abs(delta_bank_sum) <= ALIGNED_TOLERANCE_BANK_PP
+    )
     if eligible == 0 or comparable == 0:
         status, reason = RECON_NOT_COMPARABLE, "NO_COMPARABLE_PAIR"
         detail = "nenhum par elegível e comparável na janela"
@@ -405,6 +448,10 @@ def paired_reconciliation(trades: Sequence[Dict[str, Any]],
         status, reason = RECON_NOT_COMPARABLE, "COVERAGE_BELOW_FLOOR"
         detail = (f"cobertura {coverage}% abaixo do piso "
                   f"{MIN_PAIR_COVERAGE_PCT}% — diferença não é julgada")
+    elif material_pair_mismatches > 0 or sign_mismatch > 0:
+        status, reason = RECON_DIVERGENT, "PAIR_LEVEL_DIVERGENCE"
+        detail = ("há divergência material em um ou mais pares; diferenças "
+                  "opostas não podem se cancelar para produzir ALIGNED")
     elif abs(delta_bank_sum) <= ALIGNED_TOLERANCE_BANK_PP:
         status, reason = RECON_ALIGNED, "WITHIN_TOLERANCE"
         detail = ("diferença agregada dentro da tolerância diagnóstica; "
@@ -426,11 +473,20 @@ def paired_reconciliation(trades: Sequence[Dict[str, Any]],
         "mean_delta_r": (round(sum(deltas_r) / len(deltas_r), 6)
                          if deltas_r else None),
         "median_delta_r": _median(deltas_r),
+        "mean_abs_delta_r": (round(sum(abs_deltas_r) / len(abs_deltas_r), 6)
+                              if abs_deltas_r else None),
+        "median_abs_delta_r": _median(abs_deltas_r),
         "theoretical_bank_pct": (round(theoretical_bank_sum, 6)
                                  if comparable else None),
         "financial_bank_pct_normalized": (round(financial_bank_sum, 6)
                                           if comparable else None),
         "delta_bank_pct": round(delta_bank_sum, 6) if comparable else None,
+        "sum_abs_delta_bank_pct": (round(sum(abs_deltas_bank), 6)
+                                    if comparable else None),
+        "max_abs_delta_bank_pct": (round(max(abs_deltas_bank), 6)
+                                    if abs_deltas_bank else None),
+        "material_pair_mismatch_count": material_pair_mismatches,
+        "cancellation_risk_detected": cancellation_risk,
         "sign_mismatch_count": sign_mismatch,
         "persisted_r_inconsistency_count": persisted_r_mismatch,
         "qty_initial_fallback_count": qty_fallback,
@@ -489,7 +545,7 @@ def open_risk(open_trades: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             continue
 
         sl_id = trade.get("sl_order_id")
-        if sl_id is None or (isinstance(sl_id, str) and not sl_id.strip()):
+        if not isinstance(sl_id, str) or not sl_id.strip():
             b["without_confirmed_stop"] += 1
             continue
         stop = _finite(trade.get("sl_current_price"))

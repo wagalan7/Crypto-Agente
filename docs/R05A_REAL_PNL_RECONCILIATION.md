@@ -211,3 +211,14 @@ objetos ORM completos, sem N+1 (verificado por AST nos testes).
 - Nenhuma tabela, coluna, migration, ENV ou flag criada.
 - Frontend fora deste pacote; arquivos congelados intactos.
 - **R05B continua obrigatório** para qualquer consolidação de fontes.
+
+## Fechamento da auditoria independente
+
+- A classificação de alinhamento agora valida o agregado e cada par:
+  divergências opostas ou de sinal não podem se cancelar e produzir um falso
+  `ALIGNED`.
+- O pareamento rejeita `side` inválido e stop estrutural incompatível com o lado.
+- `risk_pct` zero ou negativo é dado inválido, nunca contribuição financeira.
+- Taxas ausentes permanecem `null`; somas parciais carregam cobertura explícita.
+- IDs de stop malformados não comprovam proteção e timestamps são normalizados
+  para UTC.

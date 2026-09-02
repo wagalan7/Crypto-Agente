@@ -1180,3 +1180,12 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   `RiskState`, circuit breakers, pausas e limites inalterados; nenhuma ordem;
   nenhuma tabela, coluna, migration, ENV ou flag; endpoint admin somente leitura
   e fora de qualquer hot path.
+
+### Auditoria R05A — fechamento matemático
+
+- Impedido falso `ALIGNED` por cancelamento entre divergências opostas: o
+  diagnóstico agora observa o agregado e cada par, incluindo divergência de
+  sinal.
+- Pareamento rejeita lado inválido e stop incompatível com LONG/SHORT.
+- `risk_pct <= 0` é excluído; taxa ausente não vira zero e expõe cobertura.
+- ID de stop malformado não confirma proteção; timestamps são normalizados UTC.

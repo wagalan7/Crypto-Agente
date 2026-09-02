@@ -94,7 +94,17 @@ class Teorico(unittest.TestCase):
         self.assertIsNone(out["sum_realized_r"])
         self.assertIsNone(out["sum_bank_pct"])
         self.assertIn("realized_r ausente, NaN ou infinito", out["excluded_by_reason"])
-        self.assertIn("risk_pct ausente, NaN ou infinito", out["excluded_by_reason"])
+        self.assertIn("risk_pct ausente, NaN, infinito ou não positivo",
+                      out["excluded_by_reason"])
+
+    def test_risk_pct_zero_ou_negativo_e_excluido(self):
+        out = r.theoretical_window(
+            [_snap(1, risk=0.0), _snap(2, risk=-2.0)], since=H24, until=NOW)
+        self.assertEqual(out["resolved_count"], 0)
+        self.assertIsNone(out["sum_bank_pct"])
+        self.assertEqual(
+            out["excluded_by_reason"]
+            ["risk_pct ausente, NaN, infinito ou não positivo"], 2)
 
     def test_janela_24h_e_7d(self):
         snaps = [_snap(1, hours=2), _snap(2, hours=48), _snap(3, hours=24 * 9)]
@@ -210,6 +220,26 @@ class Financeiro(unittest.TestCase):
         auto = r.real_cohorts([_trade(1)], since=H24, until=NOW)["cohorts"]["auto"]
         self.assertIn("funding não reconciliado", auto["pnl_label"])
 
+    def test_fee_ausente_nao_vira_zero_e_expoe_cobertura(self):
+        auto = r.real_cohorts(
+            [_trade(1, entry_fee=None, exit_fee=None)],
+            since=H24, until=NOW)["cohorts"]["auto"]
+        self.assertIsNone(auto["entry_fee_sum_usd"])
+        self.assertIsNone(auto["exit_fee_sum_usd"])
+        self.assertEqual(auto["entry_fee_coverage_pct"], 0.0)
+        self.assertEqual(auto["exit_fee_coverage_pct"], 0.0)
+        self.assertFalse(auto["fees_complete"])
+
+    def test_fee_parcial_expoe_subtotal_e_cobertura(self):
+        trades = [_trade(1, entry_fee=1.0, exit_fee=2.0),
+                  _trade(2, entry_fee=None, exit_fee=None)]
+        auto = r.real_cohorts(trades, since=H24, until=NOW)["cohorts"]["auto"]
+        self.assertEqual(auto["entry_fee_sum_usd"], 1.0)
+        self.assertEqual(auto["exit_fee_sum_usd"], 2.0)
+        self.assertEqual(auto["entry_fee_coverage_pct"], 50.0)
+        self.assertEqual(auto["exit_fee_coverage_pct"], 50.0)
+        self.assertFalse(auto["fees_complete"])
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  PAREAMENTO
@@ -321,6 +351,36 @@ class Pareamento(unittest.TestCase):
         self.assertEqual(acima["status"], "DIVERGENT")
         self.assertEqual(r.ALIGNED_TOLERANCE_BANK_PP, 0.10)
 
+    def test_divergencias_opostas_nao_se_cancelam_em_aligned(self):
+        trades = [_trade(1, rec=1, pnl=20.0),
+                  _trade(2, rec=2, pnl=-20.0)]
+        snaps = [_snap(1, r_val=-1.0, risk=1.0),
+                 _snap(2, r_val=1.0, risk=1.0)]
+        out = self._pair(trades, snaps)
+        self.assertEqual(out["delta_bank_pct"], 0.0)
+        self.assertEqual(out["sign_mismatch_count"], 2)
+        self.assertEqual(out["material_pair_mismatch_count"], 2)
+        self.assertTrue(out["cancellation_risk_detected"])
+        self.assertEqual(out["status"], "DIVERGENT")
+        self.assertEqual(out["reason_code"], "PAIR_LEVEL_DIVERGENCE")
+
+    def test_stop_incompativel_com_lado_invalida_par(self):
+        long = self._pair([_trade(1, rec=1, side="long", entry=100, stop=102)],
+                          [_snap(1)])
+        short = self._pair([_trade(2, rec=2, side="short", entry=100, stop=98)],
+                           [_snap(2)])
+        self.assertEqual(long["comparable_pairs"], 0)
+        self.assertEqual(short["comparable_pairs"], 0)
+        self.assertEqual(long["divergences_by_reason"]
+                         ["planned_stop incompatível com o lado"], 1)
+        self.assertEqual(short["divergences_by_reason"]
+                         ["planned_stop incompatível com o lado"], 1)
+
+    def test_side_invalido_invalida_par(self):
+        out = self._pair([_trade(1, rec=1, side="")], [_snap(1)])
+        self.assertEqual(out["comparable_pairs"], 0)
+        self.assertEqual(out["divergences_by_reason"]["side ausente ou inválido"], 1)
+
     def test_sem_listas_individuais_sensiveis(self):
         out = self._pair([_trade(1, rec=7, pnl=-20.0)],
                          [_snap(7, r_val=-1.0, risk=1.0)])
@@ -358,7 +418,7 @@ class RiscoAberto(unittest.TestCase):
         self.assertEqual(out["cohorts"]["auto"]["planned_stop_fallback"], 1)
 
     def test_sem_sl_order_id_e_desconhecido(self):
-        for sl in (None, "", "   "):
+        for sl in (None, "", "   ", 123, True):
             out = r.open_risk([_open(1, sl_id=sl)])
             auto = out["cohorts"]["auto"]
             self.assertEqual(auto["without_confirmed_stop"], 1, repr(sl))
@@ -506,6 +566,15 @@ class Relatorio(unittest.TestCase):
 
         with patch.object(r, "load_rows", _rows):
             rep = asyncio.run(r.build_reconciliation(NOW.replace(tzinfo=None)))
+        self.assertEqual(rep["as_of_utc"], NOW.isoformat())
+
+    def test_as_of_com_offset_e_normalizado_para_utc(self):
+        async def _rows(as_of):
+            return self._rows()
+
+        local = NOW.astimezone(timezone(timedelta(hours=-3)))
+        with patch.object(r, "load_rows", _rows):
+            rep = asyncio.run(r.build_reconciliation(local))
         self.assertEqual(rep["as_of_utc"], NOW.isoformat())
 
 
