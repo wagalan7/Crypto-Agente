@@ -1134,3 +1134,49 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
 - Nenhuma tabela, migration, endpoint, env, flag, scheduler, worker ou loop
   novo; nenhuma chamada à exchange; frontend, modelos, `db.py`,
   `snapshot_service.py`, executor e `notification_service.py` INTACTOS.
+
+## R05A — reconciliação observacional de P&L e risco real (roadmap ORIGINAL)
+
+- **Baseline**: `main` @ `8bba744c`; commit novo, sem amend, sem push/deploy.
+- **Arquivos**: novos `backend/services/risk_reconciliation_service.py`,
+  `backend/tests/test_r05a_financial_reconciliation.py` e
+  `docs/R05A_REAL_PNL_RECONCILIATION.md`; `backend/main.py` recebeu apenas a
+  rota `GET /api/risk/reconciliation`. `risk_service`, `kill_switch_service`,
+  `real_trade_service`, `shadow_trade_service`, `trade_manager_service`,
+  serviços de exchange, modelos, `db.py`, frontend e os arquivos P05.x ficaram
+  CONGELADOS (verificado por teste contra a baseline).
+- **ANTES**: `risk_service` calculava DD diário/semanal por
+  `realized_r × risk_pct` de `RecommendationSnapshot`; o kill switch diário
+  somava `RealTrade.pnl_usd` sem filtrar `source`; as fontes nunca eram
+  confrontadas. **DEPOIS**: relatório observacional confronta as duas, declara
+  que nenhuma fonte operacional foi trocada, mantém funding indisponível e
+  deixa o R05B como obrigatório para consolidar.
+- **Fórmulas**: `risk_dollar = abs(entry_price - planned_stop) × qty_initial`;
+  `financial_r_from_pnl = pnl_usd / risk_dollar`;
+  `theoretical_bank_pct = snapshot.realized_r × snapshot.risk_pct`;
+  `financial_bank_pct_normalized = financial_r_from_pnl × snapshot.risk_pct`;
+  `delta_r` e `delta_bank_pct` como diferença entre os pares. O `realized_r`
+  persistido do RealTrade só é confrontado para detectar inconsistência interna
+  e NUNCA substitui o cálculo por `pnl_usd`.
+- **Fontes/coortes**: teórico por `outcome_at`; financeiro por `closed_at`,
+  separado em `auto` (primária), `managed`, `manual`, `bybit`, `other` e um
+  total legado explícito — nunca somados silenciosamente. `pnl_usd` é somado uma
+  única vez: taxas não são descontadas de novo, TP1 não é re-somado, slippage só
+  tem cobertura reportada e funding devolve `UNAVAILABLE`.
+- **Cobertura**: pareamento exige 80% e tolerância de 0,10 pp no agregado
+  normalizado, ambas constantes fixas e apenas diagnósticas — não acionam trava.
+  Vínculo duplicado vira `AMBIGUOUS_REAL_LINK` e sai da comparação sem escolha
+  arbitrária. Risco aberto usa `qty` restante e só conta stop com `sl_order_id`
+  + preço válido; posição desconhecida torna o cenário agregado `None`, nunca
+  risco zero.
+- **Limitações**: snapshot é pesquisa de setup, não dinheiro realizado; o P&L é
+  líquido REGISTRADO com funding não reconciliado; o cenário de risco aberto é
+  projeção conservadora, não previsão.
+- **Testes**: 61 testes R05A herméticos, verdes 2×; suítes de risco/proteção
+  P01–P04 verdes (243); suíte completa do backend verde (1044). `py_compile` e
+  `git diff --check` aprovados.
+- **Invariantes**: somente `SELECT`; zero escrita, rede, exchange, Telegram ou
+  push; nenhuma chamada a `update_and_check`, `check_can_trade` ou `status`;
+  `RiskState`, circuit breakers, pausas e limites inalterados; nenhuma ordem;
+  nenhuma tabela, coluna, migration, ENV ou flag; endpoint admin somente leitura
+  e fora de qualquer hot path.

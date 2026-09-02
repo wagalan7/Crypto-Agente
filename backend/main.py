@@ -5123,6 +5123,30 @@ async def risk_events(days: int = 30, limit: int = 200):
     return {"events": items, "count": len(items), "days": days}
 
 
+@app.get("/api/risk/reconciliation")
+async def risk_reconciliation(x_admin_token: Optional[str] = Header(None)):
+    """R05A — reconciliação OBSERVACIONAL de P&L e risco real (somente leitura).
+
+    Confronta o risco teórico dos snapshots com o P&L financeiro registrado e o
+    risco ainda aberto até o stop confirmado. NÃO troca fonte operacional, NÃO
+    altera `RiskState`, circuit breaker, pausa, limite, executor ou estratégia,
+    e NÃO acessa a exchange. Admin, sob demanda: não entra em scan loop, digest
+    nem `/api/risk/status`.
+    """
+    gate = _check_admin_token(x_admin_token)
+    if gate:
+        return gate
+    try:
+        from services import risk_reconciliation_service as recon
+        return await recon.build_reconciliation()
+    except Exception as e:
+        # Fail-soft: sem stack trace, sem ID de ordem, sem dado individual.
+        logging.warning(f"[r05a] reconciliação falhou: {type(e).__name__}")
+        return {"ok": False, "phase": "R05A", "mode": "OBSERVATION_ONLY",
+                "reason_code": "RECONCILIATION_ERROR",
+                "detail": "não foi possível montar a reconciliação"}
+
+
 @app.post("/api/debug/push-broadcast-test")
 async def debug_push_broadcast_test():
     """
