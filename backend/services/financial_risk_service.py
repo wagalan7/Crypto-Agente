@@ -117,17 +117,24 @@ def validate_equity(payload: Any) -> Dict[str, Any]:
     if payload.get("ok") is not True:
         return _unknown("EQUITY_NOT_OK", "exchange não confirmou o equity",
                         total_usd=None, source=payload.get("source"))
-    source = str(payload.get("source") or "")
-    if source == "fallback":
-        return _unknown("EQUITY_FALLBACK", "equity veio do fallback estático",
-                        total_usd=None, source=source)
+    source = str(payload.get("source") or "").strip().lower()
+    # O contrato oficial de exchange_service só possui estas duas fontes
+    # utilizáveis. Fonte vazia/desconhecida não prova que o valor é real.
+    if source not in ("live", "cache"):
+        reason = "EQUITY_FALLBACK" if source == "fallback" else "EQUITY_SOURCE_UNKNOWN"
+        return _unknown(reason, "fonte do equity não é live/cache confirmada",
+                        total_usd=None, source=source or None)
     total = _finite(payload.get("total_usd"))
     if total is None or total <= 0:
         return _unknown("EQUITY_NOT_POSITIVE",
                         "equity ausente, não finita ou não positiva",
                         total_usd=None, source=source)
     age = _finite(payload.get("age_sec"))
-    if age is not None and age > _equity_ttl_s():
+    if age is None or age < 0:
+        return _unknown("EQUITY_AGE_UNKNOWN",
+                        "idade do equity ausente ou inválida",
+                        total_usd=None, source=source)
+    if age >= _equity_ttl_s():
         return _unknown("EQUITY_STALE",
                         f"equity com {age:.0f}s excede o TTL oficial",
                         total_usd=None, source=source)
@@ -327,6 +334,24 @@ def proposed_trade_risk_usd(side: Any, final_entry: Any, stop: Any,
             "value": round(risk, 6)}
 
 
+def adverse_market_entry_price(side: Any, prices: Sequence[Any]) -> Dict[str, Any]:
+    """Preço adverso para calcular o risco de uma MARKET ainda não preenchida.
+
+    LONG perde mais até o stop quanto MAIOR for o fill; SHORT perde mais quanto
+    MENOR for o fill. Todos os preços do depth são obrigatórios e positivos.
+    """
+    s = str(side or "").strip().lower()
+    if s not in ("long", "short"):
+        return _unknown("MARKET_RISK_SIDE_INVALID", "side inválido", value=None)
+    values = [_finite(v) for v in (prices or ())]
+    if not values or any(v is None or v <= 0 for v in values):
+        return _unknown("MARKET_RISK_PRICE_INVALID",
+                        "depth não forneceu todos os preços válidos", value=None)
+    value = max(values) if s == "long" else min(values)
+    return {"quality": QUALITY_OK, "reason_code": None, "detail": None,
+            "value": float(value)}
+
+
 def worst_case_daily_usd(snapshot: Any, proposed_risk_usd: Any) -> Dict[str, Any]:
     """`realizado − risco aberto − taxas abertas − risco da nova entrada`.
 
@@ -408,7 +433,8 @@ def kill_daily_start(as_of: datetime) -> datetime:
     try:
         from services.kill_switch_service import _daily_reset_at
         anchor = _as_utc(_daily_reset_at())
-        if anchor and anchor > start:
+        # Uma âncora futura não pode apagar silenciosamente o P&L do dia.
+        if anchor and start < anchor <= as_of:
             return anchor
     except Exception:
         pass
@@ -576,7 +602,9 @@ async def check_new_entry(*, side: Any, final_entry: Any, stop: Any,
                 "cutover_enabled": False,
                 "reason": "cutover financeiro desligado (comportamento legado)"}
     try:
-        snap = await financial_snapshot()
+        # Gate de ordem nunca usa o cache de status: depois de uma entrada, a
+        # exposição persistida precisa aparecer já na próxima decisão.
+        snap = await financial_snapshot(force=True)
         if snap.get("quality") != QUALITY_OK:
             return {"ok": False, "quality": QUALITY_UNKNOWN,
                     "reason_code": snap.get("reason_code") or "FINANCIAL_QUALITY_UNKNOWN",
@@ -598,7 +626,9 @@ async def check_new_entry(*, side: Any, final_entry: Any, stop: Any,
                     "cutover_enabled": True,
                     "reason": "pior cenário diário não pôde ser calculado"}
 
-        limit = await daily_loss_limit_usd()
+        # O limite usa EXATAMENTE o equity deste snapshot. Uma segunda leitura
+        # poderia decidir com outra banca/fonte ou cair em fallback divergente.
+        limit = await daily_loss_limit_usd(snap)
         if limit.get("quality") != QUALITY_OK:
             return {"ok": False, "quality": QUALITY_UNKNOWN,
                     "reason_code": limit.get("reason_code") or "DAILY_LIMIT_UNAVAILABLE",
@@ -631,7 +661,34 @@ async def check_new_entry(*, side: Any, final_entry: Any, stop: Any,
                 "reason": "erro no gate financeiro — entrada bloqueada"}
 
 
-async def daily_loss_limit_usd() -> Dict[str, Any]:
+def daily_loss_limit_from_snapshot(threshold_values: Any,
+                                   snapshot: Any) -> Dict[str, Any]:
+    """Resolve o limite com o MESMO snapshot que alimenta a decisão."""
+    th = threshold_values if isinstance(threshold_values, dict) else {}
+    floor = _finite(th.get("max_daily_loss_usd"))
+    pct = _finite(th.get("max_daily_loss_pct")) or 0.0
+    if pct > 0:
+        snap = snapshot if isinstance(snapshot, dict) else {}
+        eq = snap.get("equity") if isinstance(snap.get("equity"), dict) else {}
+        if eq.get("quality") != QUALITY_OK:
+            return _unknown(eq.get("reason_code") or "EQUITY_UNAVAILABLE",
+                            "limite percentual exige o equity do snapshot",
+                            value=None)
+        total = _finite(eq.get("total_usd"))
+        if total is None or total <= 0:
+            return _unknown("EQUITY_NOT_POSITIVE",
+                            "equity do snapshot não é positivo", value=None)
+        return {"quality": QUALITY_OK, "reason_code": None,
+                "value": round(total * (pct / 100.0), 4),
+                "source": f"{pct:.1f}% × equity ${total:.0f}"}
+    if floor is None or floor <= 0:
+        return _unknown("DAILY_LIMIT_INVALID",
+                        "limite diário absoluto ausente ou inválido", value=None)
+    return {"quality": QUALITY_OK, "reason_code": None,
+            "value": round(floor, 4), "source": "USD absoluto"}
+
+
+async def daily_loss_limit_usd(snapshot: Any = None) -> Dict[str, Any]:
     """Limite diário em USD pelo contrato existente do kill switch.
 
     Reutiliza `KILL_MAX_DAILY_LOSS_PCT` / `KILL_MAX_DAILY_LOSS_USD` — nenhum
@@ -640,22 +697,8 @@ async def daily_loss_limit_usd() -> Dict[str, Any]:
     try:
         from services.kill_switch_service import thresholds
         th = thresholds() or {}
-        floor = _finite(th.get("max_daily_loss_usd"))
-        pct = _finite(th.get("max_daily_loss_pct")) or 0.0
-        if pct > 0:
-            eq = await fetch_equity()
-            if eq.get("quality") != QUALITY_OK:
-                return _unknown(eq.get("reason_code") or "EQUITY_UNAVAILABLE",
-                                "limite percentual exige equity válida", value=None)
-            total = _finite(eq.get("total_usd")) or 0.0
-            return {"quality": QUALITY_OK, "reason_code": None,
-                    "value": round(total * (pct / 100.0), 4),
-                    "source": f"{pct:.1f}% × equity ${total:.0f}"}
-        if floor is None or floor <= 0:
-            return _unknown("DAILY_LIMIT_INVALID",
-                            "limite diário absoluto ausente ou inválido", value=None)
-        return {"quality": QUALITY_OK, "reason_code": None,
-                "value": round(floor, 4), "source": "USD absoluto"}
+        snap = snapshot if isinstance(snapshot, dict) else await financial_snapshot()
+        return daily_loss_limit_from_snapshot(th, snap)
     except Exception as exc:
         log.warning(f"[r05b] limite diário indisponível: {type(exc).__name__}")
         return _unknown("DAILY_LIMIT_ERROR", "falha ao resolver o limite diário",

@@ -183,9 +183,14 @@ Integrado ao preflight **P04 já existente** — nenhum preflight paralelo.
 
 - **MAKER**: usa `final_limit_price` e `final_qty`; o check financeiro roda
   depois das validações puras, e o POST continua sendo a próxima mutação.
-- **MARKET/fallback**: usa a qty final reduzida e o preço conservador aprovado
-  pelo depth; o check roda depois do depth e antes do POST. Cada retry/fallback
-  revalida.
+- **MARKET/fallback**: usa a qty final reduzida e o preço adverso aprovado pelo
+  depth (maior fill para LONG, menor para SHORT); o check roda depois do depth e
+  antes do POST. Cada retry/fallback força um snapshot financeiro novo, sem
+  reutilizar o cache de status.
+
+O limite percentual usa o equity do próprio snapshot que decidiu a entrada;
+não existe uma segunda leitura de banca capaz de divergir ou cair em fallback.
+Uma âncora de reset futura é ignorada e não apaga o P&L do dia.
 
 Se o check negar, lançar ou devolver contrato inválido: **zero POST, zero
 entry**, com reason code explicável. MAKER e fallback MARKET continuam
@@ -232,8 +237,8 @@ financeira.
 1. `RECORDED_NET_EX_FUNDING`: líquido das taxas persistidas, **sem funding
    reconciliado**.
 2. Funding continua estruturalmente indisponível e nunca é estimado.
-3. O DD percentual depende de equity válida; sem ela a métrica é `UNKNOWN`, não
-   zero.
+3. O DD percentual depende de equity `live/cache`, com idade conhecida e menor
+   que o TTL oficial; sem isso a métrica é `UNKNOWN`, não zero.
 4. O pior cenário é projeção conservadora até o stop confirmado.
 5. O cutover nasce desligado: em produção o comportamento legado só muda por
    decisão explícita.

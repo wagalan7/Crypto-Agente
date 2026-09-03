@@ -5533,11 +5533,13 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     })
                     if verdict.get("ok") is not True:
                         return verdict
-                    conservative_price = min(
-                        float(checks.get("best_executable_price") or 0),
-                        float(checks.get("vwap_price") or 0),
-                        float(checks.get("worst_price") or 0),
+                    _depth_prices = (
+                        checks.get("best_executable_price"),
+                        checks.get("vwap_price"),
+                        checks.get("worst_price"),
                     )
+                    # Para MIN_NOTIONAL, o menor preço continua conservador.
+                    conservative_price = min(float(v or 0) for v in _depth_prices)
                     checks["conservative_notional"] = (
                         capped_qty * conservative_price
                     )
@@ -5554,8 +5556,19 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     # R05B — gate financeiro DEPOIS do depth e ANTES do POST.
                     # Preço conservador aprovado + qty final reduzida. Cada
                     # retry/fallback revalida. Negar ⇒ zero POST.
+                    from services import financial_risk_service as _frs
+                    _risk_entry = _frs.adverse_market_entry_price(
+                        side, _depth_prices)
+                    if _risk_entry.get("quality") != "OK":
+                        return {
+                            "ok": False, "quality": "UNKNOWN",
+                            "reason_code": _risk_entry.get("reason_code"),
+                            "reason": "preço adverso da MARKET não pôde ser validado",
+                            "checks": checks,
+                        }
+                    checks["financial_risk_entry_price"] = _risk_entry["value"]
                     _fin_gate = await _r05b_entry_gate(
-                        side=side, final_entry=conservative_price, stop=stop,
+                        side=side, final_entry=_risk_entry["value"], stop=stop,
                         final_qty=capped_qty, checks=checks)
                     if _fin_gate is not None:
                         return _fin_gate

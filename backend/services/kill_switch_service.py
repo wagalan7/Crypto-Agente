@@ -211,6 +211,7 @@ async def check_can_trade() -> dict:
     # ── R05B: núcleo financeiro ÚNICO (mesmo snapshot do risk_service) ──────
     # Cutover DESLIGADO ⇒ `_fin is None` e todo o caminho legado permanece.
     _fin = None
+    _frs = None
     try:
         from services import financial_risk_service as _frs
         if _frs.cutover_enabled():
@@ -219,6 +220,8 @@ async def check_can_trade() -> dict:
         log.warning(f"[r05b] snapshot financeiro falhou no kill switch "
                     f"(fail-closed): {type(exc).__name__}")
         _fin = {"quality": "UNKNOWN", "reason_code": "FINANCIAL_SNAPSHOT_ERROR"}
+    if _fin is not None and not isinstance(_fin, dict):
+        _fin = {"quality": "UNKNOWN", "reason_code": "FINANCIAL_PAYLOAD_INVALID"}
     checks["metric_source"] = (
         "REAL_TRADE_AUTO_PNL" if _fin is not None else "LEGACY_ALL_SOURCES")
     if _fin is not None:
@@ -257,15 +260,33 @@ async def check_can_trade() -> dict:
         checks["daily_pnl_label"] = "RECORDED_NET_EX_FUNDING"
     else:
         pnl_today = await _daily_pnl_usd()
-    daily_loss_limit, limit_src = await _resolve_daily_loss_limit_usd(th)
+    if _fin is not None and _frs is not None:
+        _limit = _frs.daily_loss_limit_from_snapshot(th, _fin)
+    elif _fin is not None:
+        _limit = {"quality": "UNKNOWN", "value": None,
+                  "reason_code": "FINANCIAL_CORE_UNAVAILABLE"}
+    else:
+        _limit = None
+    if _fin is not None:
+        if _limit.get("quality") == "OK":
+            daily_loss_limit = _limit.get("value")
+            limit_src = _limit.get("source")
+        else:
+            daily_loss_limit = None
+            limit_src = _limit.get("reason_code") or "DAILY_LIMIT_UNAVAILABLE"
+            blocked_reasons.append(
+                f"daily_limit: {limit_src}")
+    else:
+        daily_loss_limit, limit_src = await _resolve_daily_loss_limit_usd(th)
     checks["daily_pnl_usd"] = round(pnl_today, 2) if pnl_today is not None else None
-    checks["daily_loss_limit_usd"] = round(daily_loss_limit, 2)
+    checks["daily_loss_limit_usd"] = (
+        round(daily_loss_limit, 2) if daily_loss_limit is not None else None)
     checks["daily_loss_limit_src"] = limit_src
     _anchor = _daily_reset_at()
     checks["daily_reset_at"] = _anchor.isoformat() if _anchor else None
     if pnl_today is None:
         blocked_reasons.append("daily_pnl: P&L financeiro auto indisponível")
-    elif pnl_today <= -daily_loss_limit:
+    elif daily_loss_limit is not None and pnl_today <= -daily_loss_limit:
         blocked_reasons.append(
             f"daily_loss: ${pnl_today:.2f} <= -${daily_loss_limit:.2f} ({limit_src})"
         )
@@ -303,7 +324,8 @@ async def check_can_trade() -> dict:
     reason = " | ".join(blocked_reasons) if blocked_reasons else None
 
     # Notifica Telegram quando o kill-switch (por daily_loss) ativa, uma vez por dia.
-    if not allowed and pnl_today is not None and pnl_today <= -daily_loss_limit:
+    if (not allowed and pnl_today is not None and daily_loss_limit is not None
+            and pnl_today <= -daily_loss_limit):
         global _KILL_NOTIFIED_DAY
         today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if _KILL_NOTIFIED_DAY != today_key:

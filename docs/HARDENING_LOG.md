@@ -1237,3 +1237,15 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   gate, stop, TP ou sizing alterado; nenhuma ordem criada ou cancelada; nenhuma
   tabela, coluna ou migration; MAKER, fallback MARKET, TF upgrade e pyramiding
   continuam desligados; frontend não alterado.
+
+### Auditoria R05B — fechamento do preflight financeiro
+
+- MARKET calcula risco com o fill adverso correto por lado: maior preço para
+  LONG e menor para SHORT; o menor preço segue separado apenas para validar o
+  `MIN_NOTIONAL`.
+- O gate imediatamente anterior ao POST força leitura financeira fresca, sem
+  reaproveitar os 15 segundos de cache usados pelos endpoints.
+- O limite percentual e o P&L usam o mesmo snapshot/equity; uma segunda leitura
+  divergente ou fallback não participa mais da decisão.
+- Equity exige fonte `live/cache` e idade válida dentro do TTL oficial. Reset
+  futuro não pode zerar silenciosamente a janela do kill switch.

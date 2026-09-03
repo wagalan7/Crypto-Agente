@@ -231,6 +231,18 @@ class Equity(unittest.TestCase):
         self.assertEqual(out["reason_code"], "EQUITY_FALLBACK")
         self.assertIsNone(out["total_usd"])
 
+    def test_fonte_ou_idade_nao_confirmada_bloqueiam(self):
+        casos = [
+            {"ok": True, "total_usd": 500.0, "source": "", "age_sec": 1.0},
+            {"ok": True, "total_usd": 500.0, "source": "inventada", "age_sec": 1.0},
+            {"ok": True, "total_usd": 500.0, "source": "live", "age_sec": None},
+            {"ok": True, "total_usd": 500.0, "source": "cache", "age_sec": -1.0},
+        ]
+        for payload in casos:
+            out = f.validate_equity(payload)
+            self.assertEqual(out["quality"], "UNKNOWN", repr(payload))
+            self.assertIsNone(out["total_usd"])
+
     def test_stale_bloqueado(self):
         out = f.validate_equity({"ok": True, "total_usd": 500.0,
                                  "source": "cache", "age_sec": 99999.0})
@@ -379,6 +391,16 @@ class RiscoAberto(unittest.TestCase):
 # ════════════════════════════════════════════════════════════════════════════
 class PiorCenario(unittest.TestCase):
 
+    def test_market_usa_preco_adverso_por_lado(self):
+        prices = [100.0, 101.0, 102.0]
+        self.assertEqual(f.adverse_market_entry_price("long", prices)["value"], 102.0)
+        self.assertEqual(f.adverse_market_entry_price("short", prices)["value"], 100.0)
+        for side, values in (("x", prices), ("long", [100.0, None, 102.0]),
+                             ("short", [100.0, float("nan"), 102.0])):
+            out = f.adverse_market_entry_price(side, values)
+            self.assertEqual(out["quality"], "UNKNOWN")
+            self.assertIsNone(out["value"])
+
     def test_risco_proposto_long_e_short(self):
         self.assertEqual(f.proposed_trade_risk_usd("long", 100.0, 98.0, 5.0)["value"],
                          10.0)
@@ -409,6 +431,39 @@ class PiorCenario(unittest.TestCase):
                                                 stop=98.0, final_qty=5.0))
         self.assertTrue(out["ok"])
         self.assertEqual(out["worst_case_daily_usd"], -26.0)
+
+    def test_gate_forca_snapshot_fresco_e_reusa_o_mesmo_equity(self):
+        snap = _snap([_closed(1, pnl=-10.0)], [])
+        with _cutover(True), \
+                patch.object(f, "financial_snapshot", return_value=snap) as get_snap, \
+                patch.object(f, "daily_loss_limit_usd",
+                             return_value={"quality": "OK", "value": 100.0}) as get_limit:
+            out = asyncio.run(f.check_new_entry(
+                side="long", final_entry=100.0, stop=98.0, final_qty=1.0))
+        self.assertTrue(out["ok"])
+        get_snap.assert_awaited_once_with(force=True)
+        get_limit.assert_awaited_once_with(snap)
+
+    def test_limite_percentual_usa_equity_do_snapshot(self):
+        snap = _snap([], [], equity={**EQ_OK, "total_usd": 2000.0})
+        out = f.daily_loss_limit_from_snapshot(
+            {"max_daily_loss_pct": 3.0, "max_daily_loss_usd": 999.0}, snap)
+        self.assertEqual(out["quality"], "OK")
+        self.assertEqual(out["value"], 60.0)
+        bad = f.daily_loss_limit_from_snapshot(
+            {"max_daily_loss_pct": 3.0, "max_daily_loss_usd": 999.0},
+            {"equity": {"quality": "UNKNOWN", "total_usd": None}})
+        self.assertEqual(bad["quality"], "UNKNOWN")
+        self.assertIsNone(bad["value"])
+
+    def test_reset_futuro_nao_apaga_o_dia(self):
+        import sys
+        from types import SimpleNamespace
+        future = NOW + timedelta(hours=1)
+        day_start = NOW.replace(hour=0, minute=0, second=0, microsecond=0)
+        fake = SimpleNamespace(_daily_reset_at=lambda: future)
+        with patch.dict(sys.modules, {"services.kill_switch_service": fake}):
+            self.assertEqual(f.kill_daily_start(NOW), day_start)
 
     def test_exatamente_no_limite_bloqueia(self):
         snap = _snap([_closed(1, pnl=-10.0)], [])
@@ -615,6 +670,40 @@ class Integracao(unittest.TestCase):
         self.assertIn('if _fin.get("quality") != "OK":', bloco)
         self.assertIn("blocked_reasons.append", bloco)
 
+    def test_kill_switch_usa_limite_do_mesmo_snapshot_sem_segunda_equity(self):
+        import importlib
+        kill = importlib.import_module("services.kill_switch_service")
+        snap = _snap([_closed(1, pnl=-1.0)], [])
+        th = {"kill_switch": False, "max_open_positions": 5,
+              "max_daily_loss_usd": 999.0, "max_daily_loss_pct": 3.0,
+              "max_consec_losses": 3, "cooldown_hours": 12,
+              "max_daily_trades": 20}
+        with _cutover(True), patch.object(kill, "thresholds", return_value=th), \
+                patch.object(kill, "_count_open", return_value=0), \
+                patch.object(kill, "_daily_opens", return_value=0), \
+                patch.object(f, "financial_snapshot", return_value=snap), \
+                patch.object(kill, "_resolve_daily_loss_limit_usd",
+                             side_effect=AssertionError("legado não pode rodar")) as legacy:
+            out = asyncio.run(kill.check_can_trade())
+        self.assertTrue(out["allowed"])
+        self.assertEqual(out["checks"]["daily_loss_limit_usd"], 30.0)
+        legacy.assert_not_awaited()
+
+    def test_kill_switch_payload_financeiro_malformado_bloqueia_sem_excecao(self):
+        import importlib
+        kill = importlib.import_module("services.kill_switch_service")
+        th = {"kill_switch": False, "max_open_positions": 5,
+              "max_daily_loss_usd": 100.0, "max_daily_loss_pct": 0.0,
+              "max_consec_losses": 3, "cooldown_hours": 12,
+              "max_daily_trades": 20}
+        with _cutover(True), patch.object(kill, "thresholds", return_value=th), \
+                patch.object(kill, "_count_open", return_value=0), \
+                patch.object(kill, "_daily_opens", return_value=0), \
+                patch.object(f, "financial_snapshot", return_value=["inválido"]):
+            out = asyncio.run(kill.check_can_trade())
+        self.assertFalse(out["allowed"])
+        self.assertIn("FINANCIAL_PAYLOAD_INVALID", out["reason"])
+
     def test_caps_nao_financeiros_preservados(self):
         for contrato in ("max_open_positions", "max_daily_trades",
                          "cooldown_hours", "kill_switch_manual",
@@ -629,7 +718,8 @@ class Integracao(unittest.TestCase):
         market = self.shadow.split("async def _market_entry_preflight")[1].split(
             "select_entry_route")[0]
         self.assertIn("_r05b_entry_gate(", market)
-        self.assertIn("final_entry=conservative_price", market)
+        self.assertIn("adverse_market_entry_price", market)
+        self.assertIn('final_entry=_risk_entry["value"]', market)
         # o gate vem ANTES do approved_qty/return de cada preflight
         for bloco in (maker, market):
             self.assertLess(bloco.index("_r05b_entry_gate("),
