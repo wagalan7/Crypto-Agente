@@ -36,7 +36,10 @@ class RecommendationSnapshot(Base):
     stop_distance_pct: Mapped[float] = mapped_column(Float)
 
     # Status / outcome
-    status: Mapped[str] = mapped_column(String(12), default="open", index=True)
+    # Os estados do lane de observação usam o namespace ``wide_*``; hoje os
+    # maiores (``wide_won_tp1_be`` e ``wide_superseded``) têm 15 caracteres.
+    # Mantemos folga para evoluções do lifecycle sem voltar a truncar produção.
+    status: Mapped[str] = mapped_column(String(32), default="open", index=True)
     # "open" | "won_tp1" | "won_tp1_be" | "won_tp2" | "lost" | "expired"
     # won_tp1_be = breakeven após TP1 (Step 2a): TP1 tocou, stop subiu pra entry, depois voltou.
     outcome_price: Mapped[float | None] = mapped_column(Float, nullable=True)

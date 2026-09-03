@@ -6,7 +6,8 @@ Fluxo:
 2. POST /api/push/subscribe envia subscription pro backend → salva no DB.
 3. Quando aparece A+ nova, backend chama notify_new_recommendation()
    que envia push pra cada subscription ativa, usando filtro de tier.
-4. Subscriptions expiradas (HTTP 410) são desativadas.
+4. Subscriptions expiradas (HTTP 404/410) ou presas a uma chave VAPID antiga
+   são desativadas. O frontend registra novamente com a chave atual.
 
 Tudo gracefully degrada se VAPID_* não estiverem definidas.
 """
@@ -156,8 +157,28 @@ async def remove_subscription(endpoint: str) -> bool:
     return True
 
 
+def _permanent_push_failure_reason(error: Exception) -> Optional[str]:
+    """Classifica somente falhas que tornam a subscription inutilizável.
+
+    ``VapidPkHashMismatch`` é devolvido pelo APNs quando o endpoint foi criado
+    com outra chave VAPID. Repetir com a chave atual nunca funcionará: o registro
+    precisa ser desativado e o browser deve gerar uma nova subscription.
+    Timeouts/5xx permanecem transitórios e continuam apenas no ``fail_count``.
+    """
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    body = getattr(response, "text", "") or ""
+    message = f"{error} {body}"
+
+    if status in (404, 410) or "404 Not Found" in message or "410 Gone" in message:
+        return "SUBSCRIPTION_GONE"
+    if "VapidPkHashMismatch" in message:
+        return "VAPID_KEY_MISMATCH"
+    return None
+
+
 async def _send_one(sub: PushSubscription, payload: Dict[str, Any]) -> bool:
-    """Envia para 1 subscription. Retorna False se subscription expirou (410)."""
+    """Envia para 1 subscription; False significa desativação permanente."""
     if not PUSH_ENABLED:
         return False
     try:
@@ -166,9 +187,13 @@ async def _send_one(sub: PushSubscription, payload: Dict[str, Any]) -> bool:
         await loop.run_in_executor(None, _sync_push, sub, payload)
         return True
     except Exception as e:
-        msg = str(e)
-        # 410 Gone = subscription cancelada pelo usuário → desativar
-        if "410" in msg or "404" in msg:
+        permanent_reason = _permanent_push_failure_reason(e)
+        if permanent_reason:
+            log.info(
+                "Push subscription desativada (%s): %s",
+                permanent_reason,
+                sub.endpoint[:50],
+            )
             return False
         log.warning(f"Push falhou para {sub.endpoint[:50]}: {e}")
         raise
@@ -181,7 +206,7 @@ async def _fanout_push(subs: List[PushSubscription], payload: Dict[str, Any]) ->
 
     Trata por subscription:
       - True  → sucesso (conta)
-      - False → expirou (410/404) → desativa
+      - False → expirou (410/404) ou VAPID incompatível → desativa
       - Exception → erro transitório → incrementa fail_count
 
     Retorna quantos envios bem-sucedidos.

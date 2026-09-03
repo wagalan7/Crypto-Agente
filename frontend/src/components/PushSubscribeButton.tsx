@@ -15,6 +15,60 @@ function urlBase64ToUint8Array(base64String: string): Uint8Array {
   return arr
 }
 
+function subscriptionUsesVapidKey(sub: PushSubscription, publicKey: string): boolean {
+  const current = sub.options?.applicationServerKey
+  if (!current) return false
+  const expected = urlBase64ToUint8Array(publicKey)
+  const actual = new Uint8Array(current)
+  if (actual.length !== expected.length) return false
+  return actual.every((value, index) => value === expected[index])
+}
+
+async function persistSubscription(sub: PushSubscription): Promise<void> {
+  const subJson = sub.toJSON() as { endpoint?: string; keys?: Record<string, string> }
+  const response = await fetch(`${BACKEND}/api/push/subscribe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      endpoint: subJson.endpoint,
+      keys: subJson.keys,
+      user_agent: navigator.userAgent.slice(0, 250),
+      filters: { notify_a_plus: true, notify_a: true, notify_b: true },
+    }),
+  })
+  if (!response.ok) throw new Error(`push subscribe failed: ${response.status}`)
+}
+
+async function unregisterEndpoint(endpoint: string): Promise<void> {
+  await fetch(`${BACKEND}/api/push/unsubscribe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ endpoint }),
+  }).catch(() => {})
+}
+
+async function ensureCurrentVapidSubscription(
+  reg: ServiceWorkerRegistration,
+  publicKey: string,
+): Promise<PushSubscription | null> {
+  let sub = await reg.pushManager.getSubscription()
+  if (sub && !subscriptionUsesVapidKey(sub, publicKey)) {
+    const staleEndpoint = sub.endpoint
+    const removed = await sub.unsubscribe()
+    if (!removed) throw new Error('stale push subscription could not be removed')
+    await unregisterEndpoint(staleEndpoint)
+    sub = null
+  }
+  if (!sub && Notification.permission === 'granted') {
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey).buffer as ArrayBuffer,
+    })
+  }
+  if (sub) await persistSubscription(sub)
+  return sub
+}
+
 export default function PushSubscribeButton() {
   const [state, setState] = useState<State>('loading')
   const [vapidKey, setVapidKey] = useState<string>('')
@@ -46,7 +100,8 @@ export default function PushSubscribeButton() {
           return
         }
         const reg = await navigator.serviceWorker.ready
-        const sub = await reg.pushManager.getSubscription()
+        const sub = await ensureCurrentVapidSubscription(reg, data.public_key)
+        if (sub) localStorage.setItem(LS_KEY, '1')
         setState(sub ? 'subscribed' : 'unsubscribed')
       } catch (e) {
         console.warn('Push setup error:', e)
@@ -65,24 +120,14 @@ export default function PushSubscribeButton() {
         return
       }
       const reg = await navigator.serviceWorker.ready
-      let sub = await reg.pushManager.getSubscription()
+      let sub = await ensureCurrentVapidSubscription(reg, vapidKey)
       if (!sub) {
         sub = await reg.pushManager.subscribe({
           userVisibleOnly: true,
           applicationServerKey: urlBase64ToUint8Array(vapidKey).buffer as ArrayBuffer,
         })
+        await persistSubscription(sub)
       }
-      const subJson = sub.toJSON() as { endpoint?: string; keys?: Record<string, string> }
-      await fetch(`${BACKEND}/api/push/subscribe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          endpoint: subJson.endpoint,
-          keys: subJson.keys,
-          user_agent: navigator.userAgent.slice(0, 250),
-          filters: { notify_a_plus: true, notify_a: true, notify_b: true },
-        }),
-      })
       localStorage.setItem(LS_KEY, '1')
       setState('subscribed')
     } catch (e) {
@@ -99,11 +144,7 @@ export default function PushSubscribeButton() {
       if (sub) {
         const endpoint = sub.endpoint
         await sub.unsubscribe()
-        await fetch(`${BACKEND}/api/push/unsubscribe`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ endpoint }),
-        }).catch(() => {})
+        await unregisterEndpoint(endpoint)
       }
       localStorage.removeItem(LS_KEY)
       setState('unsubscribed')

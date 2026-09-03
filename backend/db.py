@@ -115,6 +115,13 @@ async def init_db():
             "ALTER TABLE recommendation_snapshots "
             "ADD COLUMN IF NOT EXISTS peak_price_since_tp1 DOUBLE PRECISION"
         ))
+        # O namespace de observação inclui estados com mais de 12 caracteres
+        # (ex.: ``wide_superseded``). create_all não amplia coluna existente,
+        # portanto a migração precisa ser explícita e idempotente.
+        await conn.execute(text(
+            "ALTER TABLE recommendation_snapshots "
+            "ALTER COLUMN status TYPE VARCHAR(32)"
+        ))
         # #11.x: real_trades virou exchange-agnostic (era bybit-only)
         await conn.execute(text(
             "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS exchange VARCHAR(20)"

@@ -837,13 +837,18 @@ class Arquitetura(unittest.TestCase):
 
     def test_estrategia_intacta(self):
         import subprocess
+        # Audita o pacote R05B fechado, não o working tree de fases futuras.
+        # Isso mantém a prova de escopo sem proibir migrações legítimas depois
+        # do commit final auditado do R05B.
         for caminho in ("backend/services/strategy_evidence_service.py",
                         "backend/services/snapshot_service.py",
                         "backend/models", "backend/db.py", "frontend/src"):
-            res = subprocess.run(["git", "diff", "--name-only", "d0952be4", "--", caminho],
+            res = subprocess.run([
+                "git", "diff", "--name-only", "d0952be4..572652fa", "--", caminho
+            ],
                                  cwd=BACKEND.parent, capture_output=True, text=True)
             if res.returncode != 0:
-                self.skipTest("baseline d0952be4 indisponível neste checkout")
+                self.skipTest("range R05B d0952be4..572652fa indisponível neste checkout")
             self.assertEqual(res.stdout.strip(), "",
                              f"arquivo fora do escopo alterado: {caminho}")
 

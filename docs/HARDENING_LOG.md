@@ -1249,3 +1249,18 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   divergente ou fallback não participa mais da decisão.
 - Equity exige fonte `live/cache` e idade válida dentro do TTL oficial. Reset
   futuro não pode zerar silenciosamente a janela do kill switch.
+
+## Reparo operacional pós-R05B — snapshots wide e renovação Web Push
+
+- **Snapshot**: `RecommendationSnapshot.status` passou de `VARCHAR(12)` para
+  `VARCHAR(32)`, com migração explícita no `init_db()`. Estados válidos como
+  `wide_superseded` e `wide_won_tp1_be` deixam de abortar a transação do ciclo.
+- **Web Push**: HTTP 404/410 e `VapidPkHashMismatch` são classificados como
+  falhas permanentes e desativam apenas a assinatura inválida; timeout/5xx
+  continuam transitórios e preservam a assinatura.
+- **Renovação**: ao abrir o app, o frontend compara a chave VAPID da assinatura
+  do navegador com a chave pública atual. Se divergir, remove o endpoint antigo,
+  cria uma assinatura nova e a persiste; assinaturas atuais apenas são
+  reafirmadas de forma idempotente.
+- **Invariantes**: nenhuma estratégia, trava financeira, ordem, score, stop, TP
+  ou sizing foi alterado; `R05_FINANCIAL_BREAKER_ENABLED` permanece desligada.
