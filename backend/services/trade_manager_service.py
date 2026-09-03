@@ -24,6 +24,7 @@ Env:
 """
 from __future__ import annotations
 import asyncio
+import time
 import logging
 import os
 from datetime import datetime, timezone
@@ -1637,7 +1638,12 @@ async def _tick() -> None:
     # contabilidade nunca atrasa SL, fechamento de emergência ou limpeza.
     # Lote pequeno (<=5), somente GET, somente registros aderentes ao schema
     # novo e ainda pendentes; nenhum registro legado é varrido. Sem loop novo.
-    await _reconcile_pending_accounting()
+    try:
+        # Total wall-clock cap includes DB waits; HTTP budget is shared by the
+        # batch. Cancellation propagates and rolls back any active transaction.
+        await asyncio.wait_for(_reconcile_pending_accounting(), timeout=3.0)
+    except asyncio.TimeoutError:
+        log.info("[r05c] orçamento do ciclo encerrado; proteção mantém prioridade")
 
 
 async def _reconcile_pending_accounting(limit: int = 5) -> None:
@@ -1649,10 +1655,13 @@ async def _reconcile_pending_accounting(limit: int = 5) -> None:
     """
     try:
         from services import execution_accounting_service as _ea
+        budget = _ea.ReadBudget(seconds=2.0, calls=8)
         pending = await _ea.pending_trade_ids(limit=limit)
         for trade_id in pending:
+            if budget.stopped or budget.calls <= 0 or time.monotonic() >= budget.deadline:
+                break
             try:
-                res = await _ea.reconcile_trade(trade_id)
+                res = await _ea.reconcile_trade(trade_id, budget=budget)
                 log.info(f"[r05c] reconciliação #{trade_id}: "
                          f"{res.get('state') or res.get('reason_code')}")
             except Exception as exc:  # noqa: BLE001

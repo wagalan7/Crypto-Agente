@@ -12,12 +12,31 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import socket
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 FAILURES: list = []
+
+# This process may connect only to the disposable Unix socket. No TCP or DNS,
+# including accidental calls introduced by imported production services.
+_Socket = socket.socket
+class UnixOnlySocket(_Socket):
+    def connect(self, address):
+        if self.family != socket.AF_UNIX:
+            raise AssertionError("TCP forbidden in accounting integration")
+        return super().connect(address)
+    def connect_ex(self, address):
+        if self.family != socket.AF_UNIX:
+            raise AssertionError("TCP forbidden in accounting integration")
+        return super().connect_ex(address)
+socket.socket = UnixOnlySocket
+def no_dns(*a, **kw):
+    raise AssertionError("DNS forbidden in accounting integration")
+socket.getaddrinfo = no_dns
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -47,6 +66,7 @@ async def main() -> None:
 
     # ── 2. Trade novo NASCE no contrato R05C, em PENDING ────────────────────
     opened = datetime.now(timezone.utc) - timedelta(hours=2)
+    closed = opened + timedelta(hours=1)
     created = await real_trade_service.open_trade(
         symbol="ALFA/USDT:USDT", side="long", qty=1.0, entry_price=100.0,
         source="auto", exchange="binance", exchange_order_id="100",
@@ -57,6 +77,11 @@ async def main() -> None:
         row = (await session.execute(
             select(RealTrade).where(RealTrade.id == trade_id))).scalar_one()
         acc = row.execution_accounting
+        row.opened_at = opened
+        row.closed_at = closed
+        row.status = "closed_manual"
+        row.execution_accounting = {**acc, "identity": {**acc["identity"], "account_scope": "synthetic-account"}}
+        await session.commit()
     check("novo_trade_no_contrato", isinstance(acc, dict)
           and acc.get("schema_version") == ea.SCHEMA_VERSION
           and acc.get("state") == ea.STATE_PENDING, str(acc)[:80])
@@ -78,11 +103,12 @@ async def main() -> None:
         raw = {"id": exec_id, "orderId": order_id, "symbol": "ALFAUSDT",
                "side": side, "positionSide": "BOTH", "price": price, "qty": qty,
                "realizedPnl": realized, "commission": commission,
-               "commissionAsset": "USDT", "time": "1700000000000"}
+               "commissionAsset": "USDT", "time": str(int((opened + timedelta(minutes=10 if side == "BUY" else 20)).timestamp()*1000))}
         return ea.normalize_fill(raw, exchange="binance")[0]
 
     identity = ea.build_identity(exchange="binance", symbol="ALFA/USDT:USDT",
-                                 side="long", entry_order_id="100")
+                                 side="long", entry_order_id="100", entry_client_order_id="cw-1")
+    identity["account_scope"] = "synthetic-account"
     entrada = fill("1", "100", "BUY", "100", "1", "0", "0.04")
     saida = fill("2", "200", "SELL", "110", "1", "10", "0.04")
     order = ea.normalize_order({"orderId": "200", "clientOrderId": "cw-1-sl",
@@ -93,13 +119,17 @@ async def main() -> None:
                                 "updateTime": "1700000000000"})
 
     def payload(fills):
+        entry_order = {**order, "order_id": "100", "side": "BUY", "role": "entry",
+                       "client_order_id": "cw-1", "reduce_only": False}
         acc = ea.merge_accounting(None, identity=identity, fills=fills,
-                                  orders=[order])
+                                  orders=[entry_order, {**order, "role": "exit"}])
         acc = ea.finalize_accounting(
             acc, entry_order_ids=["100"], exit_order_ids=["200"],
             fills_window_complete=True, funding_window_complete=True,
             planned_stop=95.0)
         acc["orders"]["200"]["role"] = "exit"
+        acc["exclusive_exposure"] = True
+        acc["execution_proof"] = {"window_key": str(ea._ms(closed)), "complete": True}
         return acc
 
     # workers concorrentes, cada um com METADE dos eventos
@@ -122,6 +152,33 @@ async def main() -> None:
           str(row.entry_price))
     check("projecao_qty_initial", abs((row.qty_initial or 0) - 1.0) < 1e-9,
           str(row.qty_initial))
+    check("projecao_notional", row.notional_usd == 100.0)
+
+    # Real collector -> real ORM -> real financial reader, no external service.
+    from tests.test_r05c_execution_accounting import _FakeClient
+    raw_fills = [{"id": f["exec_id"], "orderId": f["order_id"], "symbol": f["symbol"],
+                  "side": f["side"], "positionSide": f["position_side"], "price": f["price"],
+                  "qty": f["qty"], "commission": f["commission"], "commissionAsset": "USDT",
+                  "realizedPnl": f["realized_pnl"], "time": f["time"]} for f in (entrada, saida)]
+    raw_orders = {"100": {"orderId": "100", "clientOrderId": "cw-1", "symbol": "ALFAUSDT",
+                          "side": "BUY", "positionSide": "BOTH", "status": "FILLED", "executedQty": "1"},
+                  "200": {"orderId": "200", "clientOrderId": "cw-1-sl", "symbol": "ALFAUSDT",
+                          "side": "SELL", "positionSide": "BOTH", "status": "FILLED", "executedQty": "1", "reduceOnly": True}}
+    client = _FakeClient(fills=raw_fills, orders=raw_orders, income=[])
+    result = await ea.reconcile_trade(trade_id, client=client)
+    check("collector_real_orm", result.get("state") == "CONFIRMED", str(result))
+    async with get_session() as session:
+        fresh = (await session.execute(select(RealTrade).where(RealTrade.id == trade_id))).scalar_one()
+        check("funding_retry_independente", fresh.execution_accounting["funding_state"] == "CONFIRMED")
+        before = fresh.execution_accounting
+    wrong = {**payload([entrada, saida]), "identity": {**identity, "symbol": "BETAUSDT"}}
+    result = await ea.apply_accounting(trade_id, wrong)
+    check("identidade_divergente_recusada", result.get("reason_code") == "IDENTITY_OR_SCHEMA_MISMATCH")
+    stale = payload([entrada])
+    stale["updated_at"] = opened.isoformat()
+    stale["execution_proof"]["complete"] = False
+    result = await ea.apply_accounting(trade_id, stale)
+    check("stale_nao_regride", result.get("state") == "CONFIRMED", str(result))
 
     # ── 5. Reaplicar o MESMO conjunto é idempotente (não duplica) ───────────
     await ea.apply_accounting(trade_id, payload([entrada, saida]))
@@ -145,12 +202,15 @@ async def main() -> None:
     check("conflito_preserva_primeiro", guardado.get("price") == "110",
           str(guardado.get("price")))
     check("conflito_marcado", bool(acc3.get("conflicts")), str(acc3.get("conflicts")))
+    check("conflito_retira_pnl_publico", row.pnl_usd is None)
 
     # ── 7. `close_trade` legado NÃO sobrescreve contabilidade confirmada ────
     async with get_session() as session:
         row = (await session.execute(
             select(RealTrade).where(RealTrade.id == trade_id))).scalar_one()
         row.execution_accounting = {**acc2}          # volta ao estado CONFIRMED
+        row.pnl_usd = 9.92
+        row.exit_price = 110.0
         row.status = "open"
         await session.commit()
     antes_pnl, antes_exit = 9.92, 110.0
@@ -185,6 +245,39 @@ async def main() -> None:
     check("pendente_estado_explicavel",
           row.execution_accounting.get("state") in (ea.STATE_PENDING, ea.STATE_PARTIAL),
           str(row.execution_accounting.get("state")))
+
+    # Closing a formerly exhausted OPEN observation must be eligible again,
+    # and cannot fabricate zero at the requested entry/exit price.
+    async with get_session() as session:
+        row = (await session.execute(select(RealTrade).where(RealTrade.id == pendente["id"]))).scalar_one()
+        row.execution_accounting = {**row.execution_accounting, "state": "FAILED", "attempts": 6}
+        await session.commit()
+    result = await real_trade_service.close_trade(pendente["id"], exit_price=50.0, status="closed_stop")
+    check("close_pending_pnl_null", result["pnl_usd"] is None)
+    check("api_mostra_estado", result["execution_accounting"]["state"] == "PENDING")
+    pending = await ea.pending_trade_ids(limit=5)
+    check("close_reabre_orcamento", pendente["id"] in pending)
+    from services.financial_risk_service import load_rows, financial_window
+    now = datetime.now(timezone.utc)
+    data = await load_rows(now)
+    financial = financial_window(data["closed"], since=now-timedelta(days=1), until=now, kind="daily")
+    check("reader_unknown_nao_zero", financial["quality"] == "UNKNOWN", str(financial.get("quality")))
+
+    # SQL filters eligibility BEFORE LIMIT: many terminal rows cannot hide an
+    # older pending one. Foreign exchange and NULL legacy remain excluded.
+    async with get_session() as session:
+        for n in range(105):
+            session.add(RealTrade(symbol="ZETAUSDT", side="long", source="auto", exchange="binance",
+                        qty=1, entry_price=1, status="closed_manual", opened_at=opened, closed_at=closed,
+                        execution_accounting={"schema_version": 1, "state": "CONFIRMED", "funding_state": "CONFIRMED"}))
+        bybit = RealTrade(symbol="GAMAUSDT", side="short", source="auto", exchange="bybit",
+                          qty=1, entry_price=1, status="open", execution_accounting=ea.empty_accounting())
+        session.add(bybit)
+        await session.commit()
+        bybit_id = bybit.id
+    pending = await ea.pending_trade_ids(limit=5)
+    check("pending_nao_escondido_por_105_confirmados", pendente["id"] in pending)
+    check("bybit_nao_varrida", bybit_id not in pending)
 
     print()
     if FAILURES:

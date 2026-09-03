@@ -3,6 +3,81 @@
 > Corrige a **origem** dos números financeiros das novas operações `auto`.
 > Nenhuma linha histórica foi alterada e nenhuma rotina de backfill foi criada.
 
+## Correção da auditoria — 03/09/2026 (sobre `cfbca929`)
+
+Esta seção substitui as afirmações de confirmação/retry do relatório inicial.
+Os testes antigos validavam a aritmética, mas não demonstravam todos os
+contratos de coleta, identidade e persistência.
+
+- **Fechamento e dinheiro separados:** um trade pode fechar operacionalmente
+  com contabilidade pendente. Nesse caso `pnl_usd`, `pnl_pct` e `realized_r`
+  continuam `null`. Não se usa preço solicitado, entry ou taxa default para
+  fabricar resultado. Uma entrada terminal comprovada já pode corrigir
+  preço, quantidade inicial, notional e slippage, sem publicar P&L parcial.
+- **Prova de execução:** entrada consultada por order ID ou client ID; estado
+  terminal, símbolo/quote, lado/positionSide e executedQty compatíveis com os
+  fills. Saídas exigem GET da ordem real, reduceOnly booleano válido, quantidade
+  terminal, conservação e exposição exclusiva. `algoId` não é `orderId`.
+  OPEN explícito nunca vira confirmação financeira por soma de quantidades.
+- **Conta correta:** somente Binance USD-M; vínculo local por fingerprint da
+  credencial e base configuradas. Liquidação suportada: USDT; outra quote fica
+  indisponível, sem misturar unidades monetárias. Não contém a chave, não sai na API. Conta
+  divergente, fingerprint ausente ou troca de credencial exige revisão; nunca
+  há vinculação automática de um ledger antigo a uma conta nova.
+- **Persistência:** valida a identidade do payload contra o RealTrade sob
+  bloqueio de linha. Fills, ordens e conflitos são preservados; resposta
+  incompleta atrasada não apaga prova completa de uma janela fechada. Conflito
+  invalida o P&L publicado. Ordens rejeitadas na atribuição não são promovidas
+  pelo simples fato de terem sido gravadas. Close e apply usam bloqueio de linha.
+- **Tentativas:** observar uma posição aberta saudável não gasta o orçamento
+  de falhas. O fechamento libera uma nova reconciliação; conflito continua
+  bloqueado. Funding tem orçamento independente; sua indisponibilidade não
+  invalida execuções confirmadas. SQL filtra elegibilidade antes do LIMIT,
+  excluindo legado e Bybit; os registros mais novos não escondem os pendentes.
+- **Funding:** somente intervalo efetivo entre fills de entrada/saída, com
+  símbolo, ativo e exclusividade comprovados. Sobreposição é conservadoramente
+  indisponível. Janela vazia sem prova de exposição não prova funding zero.
+  Não é somado a `pnl_usd`.
+- **Proteção primeiro:** mesmo loop existente; até 5 operações, orçamento
+  compartilhado de 8 GETs/2s e limite externo de 3s incluindo espera de banco.
+  Rate limit interrompe o lote. Cancelamento propaga e a transação é revertida.
+  Observações já coletadas são persistidas quando há tempo; nenhuma ordem nova.
+- **Leitores:** API de trades publica um resumo sem eventos/identidade. Somatórios
+  financeiros, pareamento, R05B e kill switch não aceitam número de ledger
+  pendente/conflitante como confirmado. Resumo diferencia subtotal conhecido de
+  total desconhecido. Cache financeiro é invalidado após commit. Limites e flags
+  não foram alterados; a indisponibilidade da fonte segue o bloqueio existente.
+
+Compatibilidade: a coluna legada `exit_fee` é NOT NULL. Seu default existente
+não é reescrito nem interpretado como comissão confirmada; leitores devolvem
+indisponível até haver prova. Não foi necessária migration adicional.
+
+### Evidência e limites desta correção
+
+`tests/test_r05c_safety_closure.py` cobre respostas atrasadas, conflitos, conta e
+identidade erradas, ACK, quantidade divergente, bool/string, entrada por client
+ID, funding separado, exposição sobreposta, fill tardio, prazo e cancelamento.
+O teste PostgreSQL usa o código real, driver async e duas conexões, com TCP/DNS
+bloqueados no processo de teste. Não é apenas uma cópia do SQL em memória.
+
+As sete fixtures históricas continuam validando os totais aritméticos, mas **não
+são chamadas de CONFIRMED**: não contêm todas as provas de ordem de entrada.
+Os testes novos possuem respostas completas e explicitamente sintéticas.
+
+Não houve validação contra uma exchange real nem reparação histórica. Comissão
+em ativo diferente continua sem conversão; sobreposição/funding sem evidência
+continuam indisponíveis. Mudança de credencial exige verificação manual. Páginas
+cheias no mesmo milissegundo não provam completude; a coleta permanece pendente
+ou esgota suas tentativas, nunca inventa confirmação. Uma janela muito extensa
+pode exigir intervenção por exceder o orçamento limitado de coleta.
+
+Sem push/deploy, alteração de estratégia, sizing ou flags LIVE nesta correção.
+
+Verificação local: 102 testes R05C (78 existentes + 24 regressões de auditoria),
+1.245 testes na suíte completa do backend e 31 verificações de integração
+PostgreSQL 16/asyncpg aprovadas. O teste PG também detectou a restrição NOT NULL
+de `exit_fee`; a correção manteve o schema e suprimiu o default nos leitores.
+
 ## Antes
 
 Os números financeiros vinham de estimativas do executor, não das execuções:

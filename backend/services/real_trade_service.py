@@ -139,7 +139,7 @@ async def open_trade(
         # R05C — todo trade NOVO nasce no contrato de contabilidade por
         # execuções reais, em PENDING. Nenhuma consulta à exchange acontece
         # aqui: a coleta é feita depois, pelo ciclo do trade manager.
-        if source == "auto":
+        if source == "auto" and (exchange or "binance") == "binance":
             try:
                 from services import execution_accounting_service as _ea
                 trade.execution_accounting = _ea.empty_accounting(
@@ -148,6 +148,8 @@ async def open_trade(
                         entry_order_id=exchange_order_id,
                         entry_client_order_id=client_order_id),
                     reason_code="AWAITING_FILL_RECONCILIATION")
+                from services.binance_signed_service import accounting_scope
+                trade.execution_accounting["identity"]["account_scope"] = accounting_scope()
             except Exception as _exc:  # noqa: BLE001
                 log.warning(f"[r05c] semente contábil falhou {symbol}: {_exc}")
 
@@ -219,12 +221,33 @@ async def close_trade(
         return None
     async with get_session() as session:
         trade = (await session.execute(
-            select(RealTrade).where(RealTrade.id == trade_id)
+            select(RealTrade).where(RealTrade.id == trade_id).with_for_update()
         )).scalar_one_or_none()
         if trade is None:
             return None
         if trade.status != "open":
             log.warning(f"[real-trade] close skip #{trade_id}: já está {trade.status}")
+            return _to_dict(trade)
+
+        # Operational closure is independent of financial confirmation. New
+        # ledgers must NEVER fall through to the legacy estimated-price formula.
+        from services import execution_accounting_service as _ea
+        if isinstance(trade.execution_accounting, dict):
+            acc = dict(trade.execution_accounting)
+            trade.closed_at = datetime.now(timezone.utc)
+            trade.status = status
+            if notes:
+                trade.notes = (trade.notes + " | " + notes) if trade.notes else notes
+            if not _ea.accounting_is_confirmed(acc):
+                trade.pnl_usd = trade.pnl_pct = trade.realized_r = None
+                trade.exit_price = None  # exit_fee is NOT NULL in the legacy schema
+                if acc.get("state") != _ea.STATE_CONFLICT:
+                    acc.update(state=_ea.STATE_PENDING, attempts=0, next_retry_at=None,
+                               reason_code="AWAITING_CLOSED_EXECUTIONS")
+                acc["closed_seen_at"] = trade.closed_at.isoformat()
+            trade.execution_accounting = acc
+            await session.commit()
+            _ea.invalidate_financial_cache()
             return _to_dict(trade)
 
         # R05C — contabilidade CONFIRMADA por execuções reais não pode ser
@@ -437,7 +460,13 @@ async def summary(days: int = 30) -> dict:
     by_tier: dict[str, list] = defaultdict(list)
     total_pnl_usd = 0.0
     by_tier_pnl_usd: dict[str, float] = defaultdict(float)
+    from services.execution_accounting_service import financial_value_usable
+    incomplete = sum(1 for trade, _ in rows
+                     if not financial_value_usable(getattr(trade, "execution_accounting", None))
+                     or trade.pnl_usd is None)
     for trade, tier in rows:
+        if not financial_value_usable(getattr(trade, "execution_accounting", None)):
+            continue
         if trade.closed_at is None or trade.pnl_pct is None:
             continue
         day = trade.closed_at.strftime("%Y-%m-%d")
@@ -537,8 +566,11 @@ async def summary(days: int = 30) -> dict:
             "days": days,
             "curve": curve,
             "trades_total": total,
-            "final_pnl_pct": round(acc, 3),
-            "final_pnl_usd": round(total_pnl_usd, 2),
+            "final_pnl_pct": round(acc, 3) if not incomplete else None,
+            "final_pnl_usd": round(total_pnl_usd, 2) if not incomplete else None,
+            "known_subtotal_pnl_usd": round(total_pnl_usd, 2),
+            "financial_quality": "UNKNOWN" if incomplete else "OK",
+            "unconfirmed_trades": incomplete,
             "open_positions": open_count,
         },
         "tier_stats": tier_summary,
@@ -551,6 +583,9 @@ async def summary(days: int = 30) -> dict:
 def _to_dict(t: RealTrade | None) -> dict | None:
     if t is None:
         return None
+    from services import execution_accounting_service as _ea
+    accounting = getattr(t, "execution_accounting", None)
+    usable = _ea.financial_value_usable(accounting)
     return {
         "id": t.id,
         "symbol": t.symbol,
@@ -564,18 +599,19 @@ def _to_dict(t: RealTrade | None) -> dict | None:
         "leverage": t.leverage,
         "notional_usd": t.notional_usd,
         "entry_price": t.entry_price,
-        "entry_fee": t.entry_fee,
+        "entry_fee": t.entry_fee if usable else None,
         "opened_at": t.opened_at.isoformat() if t.opened_at else None,
         "planned_stop": t.planned_stop,
         "planned_tp1": t.planned_tp1,
         "planned_tp2": t.planned_tp2,
         "exit_price": t.exit_price,
-        "exit_fee": t.exit_fee,
+        "exit_fee": t.exit_fee if usable else None,
         "closed_at": t.closed_at.isoformat() if t.closed_at else None,
         "status": t.status,
-        "realized_r": t.realized_r,
-        "pnl_usd": t.pnl_usd,
-        "pnl_pct": t.pnl_pct,
+        "realized_r": t.realized_r if usable else None,
+        "pnl_usd": t.pnl_usd if usable else None,
+        "pnl_pct": t.pnl_pct if usable else None,
+        "execution_accounting": _ea.public_summary(accounting),
         "tp1_realized_usd": t.tp1_realized_usd,
         "entry_slippage_pct": t.entry_slippage_pct,
         # ── Bracket / proteção (diagnóstico: ver se SL/TP foram criados) ──

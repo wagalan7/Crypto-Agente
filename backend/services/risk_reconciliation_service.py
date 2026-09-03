@@ -233,6 +233,10 @@ def real_cohorts(trades: Sequence[Dict[str, Any]], *, since: datetime,
 
     def _acc(bucket: Dict[str, Any], key: str, trade: Dict[str, Any],
              pnl: Optional[float]) -> None:
+        from services.execution_accounting_service import financial_value_usable
+        if not financial_value_usable(trade.get("execution_accounting")):
+            pnl = None
+            _bump(bucket["excluded_by_reason"], "EXECUTION_ACCOUNTING_UNCONFIRMED")
         bucket["closed_total_seen"] += 1
         if pnl is None:
             _bump(bucket["excluded_by_reason"], "pnl_usd ausente, NaN ou infinito")
@@ -246,8 +250,9 @@ def real_cohorts(trades: Sequence[Dict[str, Any]], *, since: datetime,
                 bucket["negative"] += 1
             else:
                 bucket["zero"] += 1
-        entry_fee = _finite(trade.get("entry_fee"))
-        exit_fee = _finite(trade.get("exit_fee"))
+        usable = financial_value_usable(trade.get("execution_accounting"))
+        entry_fee = _finite(trade.get("entry_fee")) if usable else None
+        exit_fee = _finite(trade.get("exit_fee")) if usable else None
         fees = fee_sums.setdefault(key, [0.0, 0.0])
         if entry_fee is not None:
             fees[0] += entry_fee
@@ -410,7 +415,8 @@ def paired_reconciliation(trades: Sequence[Dict[str, Any]],
             _bump(excluded, "recomendação vinculada não encontrada")
             continue
 
-        pnl = _finite(trade.get("pnl_usd"))
+        from services.execution_accounting_service import financial_value_usable
+        pnl = _finite(trade.get("pnl_usd")) if financial_value_usable(trade.get("execution_accounting")) else None
         side = str(trade.get("side") or "").strip().lower()
         entry = _finite(trade.get("entry_price"))
         stop = _finite(trade.get("planned_stop"))

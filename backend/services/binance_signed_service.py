@@ -182,6 +182,13 @@ def is_configured() -> bool:
     return bool(_API_KEY and _API_SECRET)
 
 
+def accounting_scope() -> Optional[str]:
+    """Local binding to this credential/market; never publish the key or hash."""
+    if not is_configured():
+        return None
+    return hashlib.sha256(f"{BASE}|usdm|{_API_KEY}".encode()).hexdigest()
+
+
 def _proxy_masked() -> Optional[str]:
     """Host:porta do proxy sem credenciais (pra logar/expor sem vazar segredo)."""
     if not _PROXY_URL:

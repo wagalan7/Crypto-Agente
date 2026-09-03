@@ -103,7 +103,7 @@ async def _count_open() -> int:
         return int((await session.execute(stmt)).scalar() or 0)
 
 
-async def _daily_pnl_usd() -> float:
+async def _daily_pnl_usd() -> Optional[float]:
     """Soma de pnl_usd de trades FECHADOS hoje (UTC)."""
     if not DB_ENABLED:
         return 0.0
@@ -113,11 +113,15 @@ async def _daily_pnl_usd() -> float:
         start = anchor
     async with get_session() as session:
         stmt = (
-            select(func.coalesce(func.sum(RealTrade.pnl_usd), 0.0))
+            select(RealTrade.pnl_usd, RealTrade.execution_accounting)
             .where(RealTrade.closed_at >= start)
             .where(RealTrade.status != "open")
         )
-        return float((await session.execute(stmt)).scalar() or 0.0)
+        rows = (await session.execute(stmt)).all()
+        from services.execution_accounting_service import financial_value_usable, to_decimal
+        if any(not financial_value_usable(r.execution_accounting) or to_decimal(r.pnl_usd) is None for r in rows):
+            return None
+        return sum(float(r.pnl_usd) for r in rows)
 
 
 async def _daily_opens() -> int:
@@ -130,7 +134,7 @@ async def _daily_opens() -> int:
         return int((await session.execute(stmt)).scalar() or 0)
 
 
-async def _recent_losses_streak(hours: int) -> tuple[int, Optional[datetime]]:
+async def _recent_losses_streak(hours: int) -> tuple[Optional[int], Optional[datetime]]:
     """
     Conta losses CONSECUTIVOS nas últimas `hours` horas, partindo do mais recente.
     Retorna (count, last_close_time). Para na primeira win.
@@ -152,6 +156,9 @@ async def _recent_losses_streak(hours: int) -> tuple[int, Optional[datetime]]:
         rows = (await session.execute(stmt)).scalars().all()
     streak = 0
     last_close = None
+    from services.execution_accounting_service import financial_value_usable
+    if any(not financial_value_usable(getattr(t, "execution_accounting", None)) for t in rows):
+        return None, None
     for t in rows:
         # Um trade que EMBOLSOU o TP1 (tp1_realized_usd>0) NÃO é loss pro streak:
         # o SL já subiu pro BE estrutural, então fechar a sobra em stop/BE é um
@@ -304,6 +311,8 @@ async def check_can_trade() -> dict:
         checks["last_loss_close"] = last_close
     else:
         streak, last_close = await _recent_losses_streak(th["cooldown_hours"])
+        if streak is None:
+            blocked_reasons.append("consec_losses: contabilidade de execução indisponível")
         checks["consec_losses"] = streak
         checks["last_loss_close"] = last_close.isoformat() if last_close else None
     if streak is not None and streak >= th["max_consec_losses"]:

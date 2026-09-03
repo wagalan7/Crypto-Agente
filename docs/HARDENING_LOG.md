@@ -1316,3 +1316,21 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   suíte completa do backend verde (1221); PG real `R05C_PG_INTEGRATION_OK`;
   `py_compile` e `git diff --check` aprovados. A fixture versionada é sintética
   e anônima; a auditada roda apenas localmente.
+
+## R05C — correção da auditoria (03/09/2026; base cfbca929)
+
+- Fechamento novo deixa P&L pendente em NULL; sem fórmula estimada de fallback.
+- Provas de ordem terminal/quantidade, conta e identidade exatas; client-ID GET;
+  reduceOnly estrito; algo ID não é usado como order ID.
+- Merge sob bloqueio preserva conflitos e prova completa contra respostas
+  atrasadas; identidade incompatível é recusada. Close também bloqueia a linha.
+- Funding separado, janela de exposição efetiva e exclusividade; retry próprio.
+  Observação aberta normal não esgota tentativas; SQL filtra antes do LIMIT.
+- Coleta limitada no loop existente (8 GETs/2s compartilhados; limite externo
+  de 3s). Propagação de cancelamento, interrupção por rate limit, zero ordens.
+- Metadados de entrada/notional/slippage corrigidos por prova; leitores e cache
+  financeiro reconhecem UNKNOWN, inclusive no caminho legado do kill switch.
+- Sem histórico/flags/estratégia alterados, sem exchange/DB externo/push/deploy.
+- Validação: 102 R05C (78 + 24 novos), 1.245 backend e 31 verificações no
+  PostgreSQL 16/asyncpg descartável aprovadas. Sem TCP/DNS no teste PG.
+  Ver docs/R05C_EXECUTION_ACCOUNTING.md.

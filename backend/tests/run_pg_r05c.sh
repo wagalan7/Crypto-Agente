@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# R05C — roda a INTEGRAÇÃO PostgreSQL REAL (código real: record_incident /
-# _SqlIncidentRepo / risk_service via SQLAlchemy+asyncpg) num cluster PostgreSQL 16
+# R05C — execução contábil real (collector / apply / close / financial readers
+# via SQLAlchemy+asyncpg) num cluster PostgreSQL 16
 # DESCARTÁVEL (socket unix, listen_addresses='', sem TCP/rede, nunca Railway).
 # Usa o Python 3.11 real com asyncpg. Sai 0 só se R05C_PG_INTEGRATION_OK.
 set -euo pipefail
 export LC_ALL=C LANG=C
+export PYTHONDONTWRITEBYTECODE=1
 PGBIN="${PGBIN:-/opt/homebrew/bin}"
 PY311="${PY311:-/Users/alanmalta/Agente de IA Crypto/backend/.venv311/bin/python}"
 HERE="$(cd "$(dirname "$0")" && pwd)"

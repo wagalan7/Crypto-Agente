@@ -232,7 +232,8 @@ def loss_streak(closed: Sequence[Dict[str, Any]], *, since: datetime,
             continue
         if not (since <= ts <= until):
             continue
-        if _finite(trade.get("pnl_usd")) is None:
+        from services.execution_accounting_service import financial_value_usable
+        if _finite(trade.get("pnl_usd")) is None or not financial_value_usable(trade.get("execution_accounting")):
             invalid += 1
             continue
         rows.append({"ts": ts, "pnl": _finite(trade.get("pnl_usd"))})
@@ -397,7 +398,8 @@ async def load_rows(as_of: datetime) -> Dict[str, Any]:
         closed = (await session.execute(
             select(RT.id, RT.source, RT.status, RT.side, RT.pnl_usd,
                    RT.tp1_realized_usd, RT.entry_fee, RT.exit_fee,
-                   RT.entry_slippage_pct, RT.recommendation_id, RT.closed_at)
+                   RT.entry_slippage_pct, RT.recommendation_id, RT.closed_at,
+                   RT.execution_accounting)
             .where(RT.source == PRIMARY_SOURCE)
             .where(RT.status != "open")
             .where(RT.closed_at.is_not(None))
@@ -418,7 +420,8 @@ async def load_rows(as_of: datetime) -> Dict[str, Any]:
                     "entry_fee": c.entry_fee, "exit_fee": c.exit_fee,
                     "entry_slippage_pct": c.entry_slippage_pct,
                     "recommendation_id": c.recommendation_id,
-                    "closed_at": c.closed_at} for c in closed],
+                    "closed_at": c.closed_at,
+                    "execution_accounting": c.execution_accounting} for c in closed],
         "open": [{"id": o.id, "source": o.source, "side": o.side,
                   "entry_price": o.entry_price, "qty": o.qty,
                   "planned_stop": o.planned_stop, "sl_order_id": o.sl_order_id,
