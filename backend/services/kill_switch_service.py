@@ -208,6 +208,32 @@ async def check_can_trade() -> dict:
     checks = {}
     blocked_reasons = []
 
+    # ── R05B: núcleo financeiro ÚNICO (mesmo snapshot do risk_service) ──────
+    # Cutover DESLIGADO ⇒ `_fin is None` e todo o caminho legado permanece.
+    _fin = None
+    try:
+        from services import financial_risk_service as _frs
+        if _frs.cutover_enabled():
+            _fin = await _frs.financial_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[r05b] snapshot financeiro falhou no kill switch "
+                    f"(fail-closed): {type(exc).__name__}")
+        _fin = {"quality": "UNKNOWN", "reason_code": "FINANCIAL_SNAPSHOT_ERROR"}
+    checks["metric_source"] = (
+        "REAL_TRADE_AUTO_PNL" if _fin is not None else "LEGACY_ALL_SOURCES")
+    if _fin is not None:
+        checks["financial_quality"] = _fin.get("quality")
+        checks["financial_reason_code"] = _fin.get("reason_code")
+        checks["financial_as_of_utc"] = _fin.get("as_of_utc")
+        checks["funding"] = _fin.get("funding")
+        _exp = _fin.get("open_exposure") if isinstance(_fin.get("open_exposure"), dict) else {}
+        checks["open_risk_usd"] = _exp.get("open_price_risk_usd")
+        checks["open_risk_complete"] = bool(_exp.get("open_risk_complete"))
+        if _fin.get("quality") != "OK":
+            # FAIL-CLOSED: qualquer incerteza financeira bloqueia nova exposição.
+            blocked_reasons.append(
+                f"financial_quality: {_fin.get('reason_code') or 'UNKNOWN'}")
+
     # 1. Manual kill-switch
     if th["kill_switch"]:
         blocked_reasons.append("KILL_SWITCH=true (manual override)")
@@ -222,23 +248,44 @@ async def check_can_trade() -> dict:
         )
 
     # 3. P&L diário (limite escala com equity se KILL_MAX_DAILY_LOSS_PCT > 0)
-    pnl_today = await _daily_pnl_usd()
+    if _fin is not None:
+        _kd = _fin.get("kill_daily") if isinstance(_fin.get("kill_daily"), dict) else {}
+        _pnl = _kd.get("pnl_usd")
+        # Sem P&L financeiro utilizável NÃO existe zero: bloqueia e não compara.
+        pnl_today = float(_pnl) if isinstance(_pnl, (int, float)) else None
+        checks["daily_pnl_source"] = 'RealTrade(source="auto").pnl_usd'
+        checks["daily_pnl_label"] = "RECORDED_NET_EX_FUNDING"
+    else:
+        pnl_today = await _daily_pnl_usd()
     daily_loss_limit, limit_src = await _resolve_daily_loss_limit_usd(th)
-    checks["daily_pnl_usd"] = round(pnl_today, 2)
+    checks["daily_pnl_usd"] = round(pnl_today, 2) if pnl_today is not None else None
     checks["daily_loss_limit_usd"] = round(daily_loss_limit, 2)
     checks["daily_loss_limit_src"] = limit_src
     _anchor = _daily_reset_at()
     checks["daily_reset_at"] = _anchor.isoformat() if _anchor else None
-    if pnl_today <= -daily_loss_limit:
+    if pnl_today is None:
+        blocked_reasons.append("daily_pnl: P&L financeiro auto indisponível")
+    elif pnl_today <= -daily_loss_limit:
         blocked_reasons.append(
             f"daily_loss: ${pnl_today:.2f} <= -${daily_loss_limit:.2f} ({limit_src})"
         )
 
     # 4. Losses consecutivos (cooldown)
-    streak, last_close = await _recent_losses_streak(th["cooldown_hours"])
-    checks["consec_losses"] = streak
-    checks["last_loss_close"] = last_close.isoformat() if last_close else None
-    if streak >= th["max_consec_losses"]:
+    if _fin is not None:
+        _ls = _fin.get("loss_streak") if isinstance(_fin.get("loss_streak"), dict) else {}
+        if _ls.get("quality") == "OK" and isinstance(_ls.get("streak"), int):
+            streak = int(_ls["streak"])
+            last_close = _ls.get("last_loss_close")
+        else:
+            streak, last_close = None, None
+            blocked_reasons.append("consec_losses: streak financeiro indisponível")
+        checks["consec_losses"] = streak
+        checks["last_loss_close"] = last_close
+    else:
+        streak, last_close = await _recent_losses_streak(th["cooldown_hours"])
+        checks["consec_losses"] = streak
+        checks["last_loss_close"] = last_close.isoformat() if last_close else None
+    if streak is not None and streak >= th["max_consec_losses"]:
         blocked_reasons.append(
             f"consec_losses: {streak}/{th['max_consec_losses']} "
             f"(cooldown {th['cooldown_hours']}h)"
@@ -256,7 +303,7 @@ async def check_can_trade() -> dict:
     reason = " | ".join(blocked_reasons) if blocked_reasons else None
 
     # Notifica Telegram quando o kill-switch (por daily_loss) ativa, uma vez por dia.
-    if not allowed and pnl_today <= -daily_loss_limit:
+    if not allowed and pnl_today is not None and pnl_today <= -daily_loss_limit:
         global _KILL_NOTIFIED_DAY
         today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if _KILL_NOTIFIED_DAY != today_key:
@@ -279,5 +326,28 @@ async def check_can_trade() -> dict:
 
 
 async def status() -> dict:
-    """Endpoint-friendly: estado atual sem efeito colateral."""
-    return await check_can_trade()
+    """Endpoint-friendly: estado atual sem efeito colateral.
+
+    R05B: acrescenta o MESMO snapshot financeiro consumido pelo `risk_service`
+    e pelo `check_can_trade` — sem fórmula independente.
+    """
+    out = await check_can_trade()
+    try:
+        from services import financial_risk_service as _frs
+        snap = await _frs.financial_snapshot() if _frs.cutover_enabled() else None
+        if snap is None:
+            out["financial"] = {
+                "metric_source": _frs.METRIC_SOURCE_LEGACY,
+                "cutover_enabled": False,
+                "financial_quality": None,
+                "financial_reason_code": "CUTOVER_DISABLED",
+                "funding": dict(_frs.FUNDING_BLOCK),
+            }
+        else:
+            out["financial"] = _frs.status_block(snap)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[r05b] bloco financeiro do kill switch indisponível: "
+                    f"{type(exc).__name__}")
+        out["financial"] = {"financial_quality": "UNKNOWN",
+                            "financial_reason_code": "FINANCIAL_FIELDS_ERROR"}
+    return out

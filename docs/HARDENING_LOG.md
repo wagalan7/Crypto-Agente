@@ -1189,3 +1189,51 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
 - Pareamento rejeita lado inválido e stop incompatível com LONG/SHORT.
 - `risk_pct <= 0` é excluído; taxa ausente não vira zero e expõe cobertura.
 - ID de stop malformado não confirma proteção; timestamps são normalizados UTC.
+
+## R05B — consolidação financeira dos circuit breakers (cutover reversível)
+
+- **Baseline**: `main` @ `d0952be4` (R05A `b22a0799` + auditoria `d0952be4`);
+  commit novo, sem amend, sem push/deploy.
+- **Arquivos**: novos `backend/services/financial_risk_service.py`,
+  `backend/tests/test_r05b_financial_circuit_breaker.py` e
+  `docs/R05B_FINANCIAL_CIRCUIT_BREAKER_CUTOVER.md`; alterados
+  `risk_service.py`, `kill_switch_service.py`, `shadow_trade_service.py`
+  (apenas os dois preflights P04) e `risk_reconciliation_service.py` (somente
+  `current_control_sources`). Estratégia, modelos, `db.py`, `snapshot_service` e
+  frontend INTACTOS.
+- **ANTES**: `risk_service` por snapshot teórico; kill switch diário misturando
+  todas as sources; risco aberto fora do limite diário. **DEPOIS com a flag
+  ligada**: `RealTrade(auto).pnl_usd`, equity real validada, risco aberto
+  conhecido, risco da entrada proposta, fail-closed em incerteza e rollback pela
+  flag.
+- **Núcleo único** alimenta `risk_service`, `kill_switch_service`,
+  `/api/risk/status` e `/api/kill-switch/status`, IMPORTANDO as fórmulas puras
+  já aprovadas no R05A (`real_cohorts`, `open_risk`, `_finite`, `_as_utc`) — sem
+  cópia e sem alterar a resposta pública do R05A.
+- **Flag ÚNICA** `R05_FINANCIAL_BREAKER_ENABLED`, default `false`; nenhum
+  threshold novo (reutiliza `DAILY_DD_LIMIT_PCT`, `WEEKLY_DD_LIMIT_PCT`,
+  `KILL_MAX_DAILY_LOSS_PCT`, `KILL_MAX_DAILY_LOSS_USD`).
+- **Fonte**: só `source="auto"`, `closed_manual` de auto incluído, janela por
+  `closed_at`, só `pnl_usd` finito, zero legítimo preservado, sem fallback para
+  snapshot, `realized_r` ou status. Taxas e TP1 nunca são re-aplicados; rótulo
+  `RECORDED_NET_EX_FUNDING`. **Funding permanece `null`/
+  `FUNDING_FIELD_UNAVAILABLE` — nunca estimado nem tratado como zero.**
+- **Equity** só é válida com `ok`, total finito > 0, `source != "fallback"` e
+  idade dentro do TTL oficial; `financial_dd_pct = pnl / equity × 100`.
+  Inválida/stale/fallback/exceção ⇒ `UNKNOWN`: não grava zero, não auto-resume e
+  bloqueia nova exposição com a flag ligada.
+- **Pior cenário** `realizado − risco aberto − taxas abertas − risco proposto`
+  bloqueia ao ATINGIR o limite (`FINANCIAL_WORST_CASE_LIMIT`), dentro dos
+  preflights P04 maker (LIMIT final) e market (preço conservador + qty
+  reduzida), depois das validações puras e ANTES do POST; cada retry revalida e
+  a negação garante zero POST.
+- **Preservados**: advisory lock P03, incidente P03 ⇒ pausa, pausa manual,
+  ownership, rollover, `RiskEvent`, caps não financeiros, Telegram e sua
+  deduplicação. Uma pausa R05B nunca libera pausa de outro owner.
+- **Testes**: 78 testes R05B herméticos verdes 2×; 68 testes R05A verdes 2×;
+  regressão P01–P04 verde (243); suíte completa do backend verde (1129).
+  `py_compile` e `git diff --check` aprovados.
+- **Invariantes**: cutover DESLIGADO por default; nenhuma estratégia, score,
+  gate, stop, TP ou sizing alterado; nenhuma ordem criada ou cancelada; nenhuma
+  tabela, coluna ou migration; MAKER, fallback MARKET, TF upgrade e pyramiding
+  continuam desligados; frontend não alterado.

@@ -410,6 +410,12 @@ class Arquitetura(unittest.TestCase):
                           or "p05.2q" in r.lower()])
 
     def test_arquivos_proibidos_intactos(self):
+        """O P05.2Q não alterou os arquivos proibidos DA SUA FASE.
+
+        Verificado sobre o commit da fase (`ad844219..8bba744c`), não sobre o
+        working tree: o R05B altera `shadow_trade_service` com autorização
+        explícita.
+        """
         import subprocess
         proibidos = ["backend/services/snapshot_service.py",
                      "backend/services/notification_service.py",
@@ -417,12 +423,12 @@ class Arquitetura(unittest.TestCase):
                      "backend/models", "backend/db.py", "frontend/src"]
         for caminho in proibidos:
             res = subprocess.run(
-                ["git", "diff", "--name-only", "ad844219", "--", caminho],
+                ["git", "diff", "--name-only", "ad844219", "8bba744c", "--", caminho],
                 cwd=BACKEND.parent, capture_output=True, text=True)
             if res.returncode != 0:
-                self.skipTest("baseline ad844219 indisponível neste checkout")
+                self.skipTest("commits da fase P05.2Q indisponíveis neste checkout")
             self.assertEqual(res.stdout.strip(), "",
-                             f"arquivo proibido alterado: {caminho}")
+                             f"P05.2Q alterou arquivo proibido: {caminho}")
 
 
 # ════════════════════════════════════════════════════════════════════════════

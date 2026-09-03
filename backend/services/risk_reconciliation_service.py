@@ -619,13 +619,48 @@ def stop_scenario(recorded_net_pnl_usd_auto_24h: Any, open_risk_block: Any
 # ════════════════════════════════════════════════════════════════════════════
 #  5) Fontes de controle HOJE (declaração honesta)
 # ════════════════════════════════════════════════════════════════════════════
+def _r05b_cutover_enabled() -> bool:
+    """Estado do cutover R05B, sem acoplar o R05A ao núcleo financeiro."""
+    try:
+        from services import financial_risk_service
+        return bool(financial_risk_service.cutover_enabled())
+    except Exception:
+        return False
+
+
 def current_control_sources() -> Dict[str, Any]:
     """O que ACIONA hoje — lido do código, não presumido.
 
-    `risk_service._compute_window_dd` soma `realized_r * risk_pct` de
-    `RecommendationSnapshot`; `kill_switch_service._daily_pnl_usd` soma
-    `RealTrade.pnl_usd` de trades fechados hoje SEM filtrar `source`.
+    Com o cutover R05B DESLIGADO (default): `risk_service._compute_window_dd`
+    soma `realized_r * risk_pct` de `RecommendationSnapshot` e
+    `kill_switch_service._daily_pnl_usd` soma `RealTrade.pnl_usd` de trades
+    fechados hoje SEM filtrar `source`. Com o cutover LIGADO, ambos passam a ler
+    o mesmo núcleo financeiro (`RealTrade(source="auto").pnl_usd`).
+
+    As demais métricas do relatório R05A permanecem inalteradas.
     """
+    cutover = _r05b_cutover_enabled()
+    if cutover:
+        return {
+            "risk_service_daily_weekly": {
+                "source": 'RealTrade(source="auto")',
+                "unit": "percent_of_equity_from_recorded_pnl",
+                "detail": ("P&L financeiro registrado da coorte auto sobre o "
+                           "equity real validado (24h / 7d)"),
+            },
+            "kill_switch_daily": {
+                "source": 'RealTrade(source="auto")',
+                "scope": "auto_only",
+                "unit": "recorded_pnl_usd",
+                "detail": ("soma pnl_usd dos fechamentos auto no dia do kill "
+                           "switch, sem misturar outras sources"),
+            },
+            "unified_financial_source": True,
+            "authoritative_source_changed": True,
+            "enforcement_changed": True,
+            "observation_only": False,
+            "r05b_cutover_enabled": True,
+        }
     return {
         "risk_service_daily_weekly": {
             "source": "RecommendationSnapshot",
@@ -642,6 +677,7 @@ def current_control_sources() -> Dict[str, Any]:
         "authoritative_source_changed": False,
         "enforcement_changed": False,
         "observation_only": True,
+        "r05b_cutover_enabled": False,
     }
 
 

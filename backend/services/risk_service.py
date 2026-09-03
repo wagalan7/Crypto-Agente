@@ -101,6 +101,45 @@ async def _compute_window_dd(session, hours: int) -> tuple[float, int]:
     return float(row[0]), int(row[1])
 
 
+def _financial_fields(snapshot, state) -> dict:
+    """R05B — campos financeiros expostos por `/api/risk/status`.
+
+    Backward-compatible: apenas ACRESCENTA. `last_confirmed` carrega o último
+    valor persistido, marcado como `stale` quando a métrica atual é UNKNOWN —
+    nunca é zero fabricado.
+    """
+    try:
+        from services import financial_risk_service as _frs
+        last = {
+            "daily_dd_pct": getattr(state, "daily_dd_pct", None),
+            "weekly_dd_pct": getattr(state, "weekly_dd_pct", None),
+            "daily_trades": getattr(state, "daily_trades", None),
+            "weekly_trades": getattr(state, "weekly_trades", None),
+            "updated_at": (getattr(state, "updated_at", None).isoformat()
+                           if getattr(state, "updated_at", None) else None),
+            "stale": bool(snapshot is not None
+                          and (not isinstance(snapshot, dict)
+                               or snapshot.get("quality") != "OK")),
+        }
+        if snapshot is None:
+            # Cutover desligado: declara a fonte legada sem calcular nada novo.
+            return {
+                "metric_source": _frs.METRIC_SOURCE_LEGACY,
+                "cutover_enabled": False,
+                "financial_quality": None,
+                "financial_reason_code": "CUTOVER_DISABLED",
+                "financial_as_of_utc": None,
+                "funding": dict(_frs.FUNDING_BLOCK),
+                "last_confirmed": last,
+            }
+        return _frs.status_block(snapshot, last_confirmed=last)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[r05b] campos financeiros indisponíveis: {type(exc).__name__}")
+        return {"metric_source": None, "cutover_enabled": None,
+                "financial_quality": "UNKNOWN",
+                "financial_reason_code": "FINANCIAL_FIELDS_ERROR"}
+
+
 def _is_p03_pause(state) -> bool:
     """Pausa de owner P03 (quarentena de execução). Invariante #8: NUNCA é solta por
     auto-resume (virada de dia/semana). Só o release estruturado — zero incidentes
@@ -117,6 +156,31 @@ async def update_and_check() -> dict:
     """
     if not DB_ENABLED:
         return {"enabled": False}
+
+    # R05B — snapshot financeiro calculado ANTES de abrir a transação com o
+    # advisory lock (evita segurar a lock enquanto se lê equity/fechamentos).
+    # Com o cutover DESLIGADO fica apenas como diagnóstico; nada muda.
+    _fin = None
+    try:
+        from services import financial_risk_service as _frs
+        if _frs.cutover_enabled():
+            _fin = await _frs.financial_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[r05b] snapshot financeiro indisponível "
+                    f"(fail-closed, sem auto-resume): {type(exc).__name__}")
+        _fin = {"quality": "UNKNOWN", "reason_code": "FINANCIAL_SNAPSHOT_ERROR"}
+
+    _financial_mode = _fin is not None
+    # Métrica financeira incerta ⇒ FAIL-CLOSED: nada de auto-resume e nada de
+    # nova pausa a partir de número velho. A pausa existente é preservada.
+    _financial_unknown = bool(
+        _financial_mode and (
+            not isinstance(_fin, dict)
+            or _fin.get("quality") != "OK"
+            or not isinstance((_fin.get("rolling_24h") or {}).get("dd_pct"), (int, float))
+            or not isinstance((_fin.get("rolling_7d") or {}).get("dd_pct"), (int, float))
+        )
+    )
 
     from sqlalchemy import text, func, select as _sel
     async with get_session() as session:
@@ -149,20 +213,44 @@ async def update_and_check() -> dict:
             state.current_week_utc = week
             # Reseta pausa AUTOMÁTICA só com ZERO incidentes P03 confirmado (nunca a
             # manual, nunca a P03, nunca enquanto houver incidente aberto).
-            if _no_incident and state.trading_paused and not state.pause_manual and not _is_p03_pause(state):
+            if (_no_incident and not _financial_unknown and state.trading_paused
+                    and not state.pause_manual and not _is_p03_pause(state)):
                 log.info("Virada de semana — pausa automática resetada.")
                 state.trading_paused = False
                 state.pause_reason = None
                 state.paused_at = None
                 _log_event(session, state, "auto_resume", "Virada de semana UTC")
 
-        # Recalcula DD
-        daily_dd, daily_trades = await _compute_window_dd(session, hours=24)
-        weekly_dd, weekly_trades = await _compute_window_dd(session, hours=24 * 7)
-        state.daily_dd_pct = daily_dd
-        state.weekly_dd_pct = weekly_dd
-        state.daily_trades = daily_trades
-        state.weekly_trades = weekly_trades
+        # Recalcula DD — R05B: com o cutover LIGADO a fonte é o P&L financeiro
+        # registrado da coorte `auto`; com ele desligado, o legado por snapshot.
+        if _financial_mode and not _financial_unknown:
+            _d24 = _fin.get("rolling_24h") or {}
+            _d7 = _fin.get("rolling_7d") or {}
+            daily_dd = float(_d24["dd_pct"])
+            weekly_dd = float(_d7["dd_pct"])
+            daily_trades = int(_d24.get("valid_count") or 0)
+            weekly_trades = int(_d7.get("valid_count") or 0)
+            state.daily_dd_pct = daily_dd
+            state.weekly_dd_pct = weekly_dd
+            state.daily_trades = daily_trades
+            state.weekly_trades = weekly_trades
+        elif _financial_mode:
+            # FAIL-CLOSED: não grava zero, não sobrescreve o último valor
+            # confirmado e NUNCA libera pausa automática.
+            daily_dd = float(state.daily_dd_pct or 0.0)
+            weekly_dd = float(state.weekly_dd_pct or 0.0)
+            daily_trades = int(state.daily_trades or 0)
+            weekly_trades = int(state.weekly_trades or 0)
+            log.warning("[r05b] métrica financeira UNKNOWN "
+                        f"({(_fin or {}).get('reason_code')}) — valores "
+                        "anteriores preservados como last_confirmed")
+        else:
+            daily_dd, daily_trades = await _compute_window_dd(session, hours=24)
+            weekly_dd, weekly_trades = await _compute_window_dd(session, hours=24 * 7)
+            state.daily_dd_pct = daily_dd
+            state.weekly_dd_pct = weekly_dd
+            state.daily_trades = daily_trades
+            state.weekly_trades = weekly_trades
 
         # ── Auto-resume do circuit breaker AUTOMÁTICO ───────────────────────
         # BUGFIX: a virada de DIA atualizava a data mas NÃO despausava — só a
@@ -171,7 +259,9 @@ async def update_and_check() -> dict:
         # Regra: se a pausa é automática (não manual), disparou num dia UTC
         # ANTERIOR e AMBOS os DD já voltaram pra dentro do limite → retoma.
         # Exigir weekly saudável impede soltar uma pausa SEMANAL cedo demais.
-        if _no_incident and state.trading_paused and not state.pause_manual and state.paused_at and not _is_p03_pause(state):
+        if (_no_incident and not _financial_unknown and state.trading_paused
+                and not state.pause_manual and state.paused_at
+                and not _is_p03_pause(state)):
             _pa = state.paused_at
             if _pa.tzinfo is None:
                 _pa = _pa.replace(tzinfo=timezone.utc)
@@ -190,13 +280,16 @@ async def update_and_check() -> dict:
 
         # Aciona pausa automática se cruzou limite (e não estava já pausado)
         _just_auto_paused = False
-        if not state.trading_paused:
+        # R05B: métrica financeira UNKNOWN não fabrica pausa a partir de
+        # valor velho — o bloqueio de nova exposição fica com o kill switch.
+        if not state.trading_paused and not _financial_unknown:
+            _src = (" (P&L financeiro registrado)" if _financial_mode else "")
             if daily_dd <= DAILY_DD_LIMIT_PCT:
                 state.trading_paused = True
                 state.pause_manual = False
                 state.pause_reason = (
                     f"DD diário {daily_dd:.2f}% atingiu limite "
-                    f"{DAILY_DD_LIMIT_PCT}%"
+                    f"{DAILY_DD_LIMIT_PCT}%{_src}"
                 )
                 state.paused_at = datetime.now(timezone.utc)
                 log.warning(f"[circuit-breaker] AUTO-PAUSE: {state.pause_reason}")
@@ -207,7 +300,7 @@ async def update_and_check() -> dict:
                 state.pause_manual = False
                 state.pause_reason = (
                     f"DD semanal {weekly_dd:.2f}% atingiu limite "
-                    f"{WEEKLY_DD_LIMIT_PCT}%"
+                    f"{WEEKLY_DD_LIMIT_PCT}%{_src}"
                 )
                 state.paused_at = datetime.now(timezone.utc)
                 log.warning(f"[circuit-breaker] AUTO-PAUSE: {state.pause_reason}")
@@ -228,17 +321,32 @@ async def update_and_check() -> dict:
         result = _to_dict(state)
         # Sinaliza a TRANSIÇÃO pra pausa (o scan loop dispara push de alerta).
         result["just_auto_paused"] = _just_auto_paused
+        result.update(_financial_fields(_fin, state))
         return result
 
 
 async def get_status() -> dict:
-    """Lê estado atual sem recomputar (rápido, pra endpoint público)."""
+    """Lê estado atual sem recomputar (rápido, pra endpoint público).
+
+    R05B: acrescenta o MESMO snapshot financeiro consumido pelo kill switch —
+    sem fórmula independente e aproveitando o cache curto do núcleo.
+    """
     if not DB_ENABLED:
         return {"enabled": False}
+    _fin = None
+    try:
+        from services import financial_risk_service as _frs
+        if _frs.cutover_enabled():
+            _fin = await _frs.financial_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[r05b] status financeiro indisponível: {type(exc).__name__}")
+        _fin = {"quality": "UNKNOWN", "reason_code": "FINANCIAL_SNAPSHOT_ERROR"}
     async with get_session() as session:
         state = await _get_or_create_state(session)
         await session.commit()
-        return _to_dict(state)
+        out = _to_dict(state)
+        out.update(_financial_fields(_fin, state))
+        return out
 
 
 async def is_paused() -> bool:

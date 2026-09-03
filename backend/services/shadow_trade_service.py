@@ -225,6 +225,46 @@ async def _open_trade_fail_closed(*, symbol: str, source: str, **kwargs):
 LIVE_SIZE_MULT = max(0.0, min(float(os.getenv("LIVE_SIZE_MULT", "1.0")), 1.0))
 
 # ── Filtro de sessão/horário (go-live, opcional) ────────────────────────────
+async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
+                           checks: dict):
+    """R05B — gate financeiro de uma NOVA entrada normal, dentro do preflight P04.
+
+    Devolve `None` quando a entrada pode seguir (inclusive com o cutover
+    desligado) e um verdict de PREFLIGHT BLOQUEADO quando não pode. Nenhuma
+    ordem é enviada em caso de negação; exceção também nega (fail-closed).
+    """
+    try:
+        from services import financial_risk_service as _frs
+        gate = await _frs.check_new_entry(
+            side=side, final_entry=final_entry, stop=stop, final_qty=final_qty)
+    except Exception as exc:                      # exceção NUNCA libera entrada
+        log.warning(f"[r05b] gate financeiro indisponível: {type(exc).__name__}")
+        gate = {"ok": False, "quality": "UNKNOWN",
+                "reason_code": "FINANCIAL_CHECK_ERROR",
+                "reason": "erro no gate financeiro — entrada bloqueada"}
+    if isinstance(gate, dict) and gate.get("ok") is True:
+        checks["r05b_financial"] = {
+            "cutover_enabled": gate.get("cutover_enabled"),
+            "worst_case_daily_usd": gate.get("worst_case_daily_usd"),
+            "daily_loss_limit_usd": gate.get("daily_loss_limit_usd"),
+        }
+        return None
+    gate = gate if isinstance(gate, dict) else {}
+    checks["r05b_financial"] = {
+        "cutover_enabled": gate.get("cutover_enabled"),
+        "reason_code": gate.get("reason_code"),
+        "worst_case_daily_usd": gate.get("worst_case_daily_usd"),
+        "daily_loss_limit_usd": gate.get("daily_loss_limit_usd"),
+    }
+    return {
+        "ok": False,
+        "quality": gate.get("quality") or "UNKNOWN",
+        "reason_code": gate.get("reason_code") or "FINANCIAL_CHECK_ERROR",
+        "reason": gate.get("reason") or "gate financeiro bloqueou a entrada",
+        "checks": checks,
+    }
+
+
 def _exec_mark(trace, field: str) -> None:
     """P05.2L — marca um instante do caminho de entrada. No-op e fail-soft."""
     if trace is None:
@@ -5511,6 +5551,14 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             "reason": "qty reduzida ficou abaixo do MIN_NOTIONAL",
                             "checks": checks,
                         }
+                    # R05B — gate financeiro DEPOIS do depth e ANTES do POST.
+                    # Preço conservador aprovado + qty final reduzida. Cada
+                    # retry/fallback revalida. Negar ⇒ zero POST.
+                    _fin_gate = await _r05b_entry_gate(
+                        side=side, final_entry=conservative_price, stop=stop,
+                        final_qty=capped_qty, checks=checks)
+                    if _fin_gate is not None:
+                        return _fin_gate
                     verdict["approved_qty"] = float(capped_qty)
                     return verdict
 
@@ -5616,6 +5664,14 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                                     "reason": "qty não pôde ser revalidada sem aumentar exposição",
                                     "checks": checks,
                                 }
+                            # R05B — gate financeiro DEPOIS das validações
+                            # puras e ANTES do POST, com a LIMIT final e a qty
+                            # final. Negar ⇒ zero POST, zero entry.
+                            _fin_gate = await _r05b_entry_gate(
+                                side=side, final_entry=final_limit_price,
+                                stop=stop, final_qty=capped_qty, checks=checks)
+                            if _fin_gate is not None:
+                                return _fin_gate
                             verdict["approved_qty"] = float(capped_qty)
                             return verdict
 

@@ -629,12 +629,16 @@ class Arquitetura(unittest.TestCase):
         aparece no texto das invariantes: a checagem é sobre import/atributo,
         não sobre a substring solta.
         """
+        import re
+
         codigo = self._codigo(self.src)
         for proibido in ("update_and_check", "check_can_trade", "set_manual_pause",
-                         "import risk_service", "import kill_switch_service",
-                         "risk_service.", "kill_switch_service.",
                          "models.risk_state", "import RiskState", "RiskState."):
             self.assertNotIn(proibido, codigo, proibido)
+        # Fronteira de palavra: `financial_risk_service` (R05B) é permitido e
+        # NÃO deve casar com `risk_service`.
+        for proibido in (r"\brisk_service\b", r"\bkill_switch_service\b"):
+            self.assertIsNone(re.search(proibido, codigo), proibido)
 
     def test_sem_scheduler_worker_ou_loop(self):
         codigo = self._codigo(self.src)
@@ -719,6 +723,12 @@ class Arquitetura(unittest.TestCase):
             self.assertNotIn("risk_reconciliation", bloco, fn)
 
     def test_arquivos_congelados_intactos(self):
+        """O R05A não alterou os arquivos congelados DA SUA FASE.
+
+        Verificado sobre os commits da fase (`8bba744c..d0952be4`), não sobre o
+        working tree: o R05B altera `risk_service`, `kill_switch_service` e
+        `shadow_trade_service` com autorização explícita.
+        """
         import subprocess
         congelados = [
             "backend/services/risk_service.py",
@@ -732,12 +742,12 @@ class Arquitetura(unittest.TestCase):
         ]
         for caminho in congelados:
             res = subprocess.run(
-                ["git", "diff", "--name-only", "8bba744c", "--", caminho],
+                ["git", "diff", "--name-only", "8bba744c", "d0952be4", "--", caminho],
                 cwd=BACKEND.parent, capture_output=True, text=True)
             if res.returncode != 0:
-                self.skipTest("baseline 8bba744c indisponível neste checkout")
+                self.skipTest("commits da fase R05A indisponíveis neste checkout")
             self.assertEqual(res.stdout.strip(), "",
-                             f"arquivo congelado alterado: {caminho}")
+                             f"R05A alterou arquivo congelado: {caminho}")
 
 
 if __name__ == "__main__":
