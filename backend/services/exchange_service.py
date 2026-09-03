@@ -74,6 +74,9 @@ if hasattr(_client, "get_order"):
 set_leverage = _client.set_leverage
 get_order_history = _client.get_order_history
 get_executions = _client.get_executions
+# R05C — leitura de funding (GET). Só existe no cliente Binance USD-M.
+if hasattr(_client, "get_income"):
+    get_income = _client.get_income
 close_client = _client.close_client
 
 

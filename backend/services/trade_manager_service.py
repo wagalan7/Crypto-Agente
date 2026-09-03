@@ -1632,6 +1632,34 @@ async def _tick() -> None:
             except Exception as e:
                 log.warning(f"[manual-monitor] processar #{t.id} {t.symbol} erro: {e}", exc_info=True)
 
+    # ── R05C: reconciliação contábil por EXECUÇÕES REAIS ────────────────────
+    # Roda no FIM do tick, DEPOIS da proteção das posições abertas — a
+    # contabilidade nunca atrasa SL, fechamento de emergência ou limpeza.
+    # Lote pequeno (<=5), somente GET, somente registros aderentes ao schema
+    # novo e ainda pendentes; nenhum registro legado é varrido. Sem loop novo.
+    await _reconcile_pending_accounting()
+
+
+async def _reconcile_pending_accounting(limit: int = 5) -> None:
+    """Fecha a contabilidade de até `limit` operações pendentes por ciclo.
+
+    FAIL-SOFT absoluto: qualquer erro é engolido. Não envia mensagem de
+    fechamento, não reexecuta reconciliação de snapshot/outcome e não cria
+    nem cancela ordem.
+    """
+    try:
+        from services import execution_accounting_service as _ea
+        pending = await _ea.pending_trade_ids(limit=limit)
+        for trade_id in pending:
+            try:
+                res = await _ea.reconcile_trade(trade_id)
+                log.info(f"[r05c] reconciliação #{trade_id}: "
+                         f"{res.get('state') or res.get('reason_code')}")
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"[r05c] reconciliação #{trade_id} erro: {type(exc).__name__}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[r05c] ciclo contábil indisponível: {type(exc).__name__}")
+
 
 async def loop() -> None:
     """Loop principal — chamar via asyncio.create_task no startup."""

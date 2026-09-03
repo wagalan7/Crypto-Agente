@@ -1264,3 +1264,55 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   reafirmadas de forma idempotente.
 - **Invariantes**: nenhuma estratégia, trava financeira, ordem, score, stop, TP
   ou sizing foi alterado; `R05_FINANCIAL_BREAKER_ENABLED` permanece desligada.
+
+## R05C — contabilização por EXECUÇÕES REAIS
+
+- **Baseline**: `main` @ `59a9448f`; commit novo, sem amend, sem push/deploy.
+- **Arquivos**: novos `backend/services/execution_accounting_service.py`,
+  `backend/tests/test_r05c_execution_accounting.py`,
+  `backend/tests/pg_integration_r05c.py`, `backend/tests/run_pg_r05c.sh`,
+  `backend/tests/fixtures/r05c_synthetic_cases.json` e
+  `docs/R05C_EXECUTION_ACCOUNTING.md`; alterados `real_trade_service.py`,
+  `trade_manager_service.py`, `binance_signed_service.py`,
+  `exchange_service.py`, `risk_reconciliation_service.py`,
+  `models/real_trade.py` e `db.py`.
+- **ANTES**: entrada teórica podia sobreviver a `avgPrice=0`, `entry_fee=0.0`
+  fixo, `qty` planejada quando faltava `executedQty`, parcial TP1 aproximada,
+  segunda parcial do runner não contabilizada, fechamento pelo "último fill do
+  lado" sem vínculo nem média ponderada, time-stop usando o `entry` como saída e
+  `get_executions` perdendo `commissionAsset`/`realizedPnl`. Nos 7 casos
+  auditados o app registrava **+1,3896** contra **−0,81641839** de execuções
+  reais (sem funding).
+- **DEPOIS**: fills confirmados como origem única — `entry_price` por média
+  ponderada, `qty_initial` executada, todas as parciais, comissões por ativo
+  uma vez por `exec_id`, `gross` de `realizedPnl` e funding SEPARADO. Os 7 casos
+  e os totais são reproduzidos pelo núcleo real com tolerância `1e-8` USDT.
+- **`pnl_usd` preserva o contrato legado**: líquido de execuções/comissões e
+  EXCLUINDO funding; ativo registrado como `USDT`, sem afirmar conversão
+  cambial. Funding e total-com-funding são campos distintos; a fonte e a
+  semântica operacional do R05B não mudaram.
+- **Ausência ≠ zero**: comissão ausente, ativo de taxa não convertível, funding
+  não consultado, paginação incompleta, atribuição ambígua e conjunto vazio de
+  fills produzem `PENDING`/`PARTIAL`/`AMBIGUOUS` com `reason_code` — nunca zero.
+  Janela de funding consultada e vazia É prova de zero.
+- **Schema**: UMA coluna nullable `real_trades.execution_accounting` (JSONB),
+  migração aditiva idempotente; `NULL` = `LEGACY_UNVERIFIED`, nunca confirmação
+  retroativa. Sem tabela paralela, sem backfill, sem DDL em produção.
+- **Idempotência/concorrência**: merge transacional com `FOR UPDATE`,
+  acumulados recalculados do conjunto deduplicado, `exec_id` divergente vira
+  `CONFLICT` preservando o primeiro confirmado, e `close_trade` legado não
+  sobrescreve contabilidade confirmada. Validado em **PostgreSQL real
+  descartável** pelo código real (19 checks).
+- **Coleta**: somente `GET` (`userTrades`, `order`, `income FUNDING_FEE`),
+  janelas ≤7 dias, `fromId` nunca com `startTime/endTime`, página cheia não
+  prova completude, orçamento de 12 chamadas por operação e no máximo 6
+  tentativas com backoff persistido. Reconciliação no `_tick` existente do trade
+  manager, DEPOIS da proteção, em lote ≤5, sem varrer legado e sem loop novo.
+- **Histórico intocado**: as 7 linhas antigas não foram atualizadas e nenhuma
+  rotina de apply/backfill foi criada. `R05_FINANCIAL_BREAKER_ENABLED`, LIVE,
+  MAKER, fallback MARKET, TF upgrade, pyramiding e challenger continuam como
+  estavam; frontend não alterado.
+- **Testes**: 78 R05C herméticos verdes 2×; P01–P04 + R05A/R05B verdes (396);
+  suíte completa do backend verde (1221); PG real `R05C_PG_INTEGRATION_OK`;
+  `py_compile` e `git diff --check` aprovados. A fixture versionada é sintética
+  e anônima; a auditada roda apenas localmente.

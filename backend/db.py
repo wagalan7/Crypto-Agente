@@ -172,6 +172,12 @@ async def init_db():
         await conn.execute(text(
             "ALTER TABLE real_trades ADD COLUMN IF NOT EXISTS hedge_for VARCHAR(64)"
         ))
+        # R05C — contabilidade por execuções reais (aditiva, idempotente).
+        # NULL = LEGACY_UNVERIFIED; sem default que marque legado confirmado.
+        await conn.execute(text(
+            "ALTER TABLE real_trades "
+            "ADD COLUMN IF NOT EXISTS execution_accounting JSONB"
+        ))
         # Se a coluna antiga existir (deploy anterior), copia o valor pro novo nome.
         # Em Postgres o IF EXISTS no information_schema é mais seguro:
         await conn.execute(text("""

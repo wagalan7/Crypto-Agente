@@ -3437,11 +3437,25 @@ async def get_order_history(symbol: Optional[str] = None, limit: int = 50) -> di
     return {"ok": True, "orders": orders, "count": len(orders)}
 
 
-async def get_executions(symbol: Optional[str] = None, limit: int = 50) -> dict:
+async def get_executions(symbol: Optional[str] = None, limit: int = 50,
+                         start_time: Optional[int] = None,
+                         end_time: Optional[int] = None) -> dict:
+    """GET /fapi/v1/userTrades — SOMENTE leitura.
+
+    R05C: `raw` preserva o payload da exchange (incl. `commissionAsset`,
+    `realizedPnl`, `positionSide`) para a contabilidade por execuções reais. Os
+    campos legados (`fee` float) continuam iguais para não quebrar chamadores.
+    `fromId` NUNCA é enviado junto com `startTime`/`endTime` (a API recusa).
+    """
     if not symbol:
         return {"ok": False, "error": "Binance userTrades exige symbol"}
     sym = to_binance(symbol) if "/" in symbol else symbol
-    res = await _signed_request("GET", "/fapi/v1/userTrades", {"symbol": sym, "limit": limit})
+    params: dict = {"symbol": sym, "limit": max(1, min(int(limit or 50), 1000))}
+    if start_time is not None:
+        params["startTime"] = int(start_time)
+    if end_time is not None:
+        params["endTime"] = int(end_time)
+    res = await _signed_request("GET", "/fapi/v1/userTrades", params)
     if not res.get("ok"):
         return res
     rows = res["result"] or []
@@ -3456,10 +3470,38 @@ async def get_executions(symbol: Optional[str] = None, limit: int = 50) -> dict:
             "fee": float(e.get("commission") or 0),
             "is_maker": e.get("maker"),
             "time": str(e.get("time")),
+            # R05C: payload íntegro — comissão ausente NÃO vira zero aqui.
+            "raw": e,
         }
         for e in rows
     ]
-    return {"ok": True, "fills": fills, "count": len(fills)}
+    return {"ok": True, "fills": fills, "count": len(fills),
+            "limit": params["limit"], "raw": rows}
+
+
+async def get_income(symbol: Optional[str] = None, *, income_type: str = "FUNDING_FEE",
+                     start_time: Optional[int] = None,
+                     end_time: Optional[int] = None, limit: int = 1000) -> dict:
+    """GET /fapi/v1/income — SOMENTE leitura, janelas explícitas.
+
+    Usado pelo R05C para funding. Uma página cheia NÃO prova completude: o
+    caller decide paginar e só declara a janela completa com evidência.
+    """
+    params: dict = {"limit": max(1, min(int(limit or 1000), 1000))}
+    if symbol:
+        params["symbol"] = to_binance(symbol) if "/" in symbol else symbol
+    if income_type:
+        params["incomeType"] = income_type
+    if start_time is not None:
+        params["startTime"] = int(start_time)
+    if end_time is not None:
+        params["endTime"] = int(end_time)
+    res = await _signed_request("GET", "/fapi/v1/income", params)
+    if not res.get("ok"):
+        return res
+    rows = res["result"] or []
+    return {"ok": True, "income": rows, "count": len(rows),
+            "limit": params["limit"]}
 
 
 async def close_client():

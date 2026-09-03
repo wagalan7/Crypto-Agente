@@ -16,6 +16,7 @@ Status fluxo: open → closed_tp1 | closed_tp2 | closed_be | closed_stop | close
 from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import String, Float, Integer, DateTime, Index, ForeignKey
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db import Base
@@ -114,6 +115,12 @@ class RealTrade(Base):
 
     # Notas livres
     notes: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # R05C — contabilidade por EXECUÇÕES REAIS (fills confirmados, comissões por
+    # ativo, funding separado, proveniência e idempotência). NULL em registro
+    # antigo significa LEGACY_UNVERIFIED — nunca confirmação retroativa.
+    execution_accounting: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, default=None)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow, index=True

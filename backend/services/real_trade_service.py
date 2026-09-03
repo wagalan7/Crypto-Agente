@@ -136,6 +136,21 @@ async def open_trade(
             hedge_for=hedge_for,
             pyramiding_level=pyramiding_level or 0,
         )
+        # R05C — todo trade NOVO nasce no contrato de contabilidade por
+        # execuções reais, em PENDING. Nenhuma consulta à exchange acontece
+        # aqui: a coleta é feita depois, pelo ciclo do trade manager.
+        if source == "auto":
+            try:
+                from services import execution_accounting_service as _ea
+                trade.execution_accounting = _ea.empty_accounting(
+                    identity=_ea.build_identity(
+                        exchange=exchange or "binance", symbol=symbol, side=side,
+                        entry_order_id=exchange_order_id,
+                        entry_client_order_id=client_order_id),
+                    reason_code="AWAITING_FILL_RECONCILIATION")
+            except Exception as _exc:  # noqa: BLE001
+                log.warning(f"[r05c] semente contábil falhou {symbol}: {_exc}")
+
         session.add(trade)
         await session.flush()
         await session.commit()
@@ -212,10 +227,22 @@ async def close_trade(
             log.warning(f"[real-trade] close skip #{trade_id}: já está {trade.status}")
             return _to_dict(trade)
 
-        trade.exit_price = exit_price
-        trade.exit_fee = exit_fee
+        # R05C — contabilidade CONFIRMADA por execuções reais não pode ser
+        # sobrescrita por exit estimado, taxa default ou parcial duplicada. O
+        # fechamento OPERACIONAL segue normalmente; só os números financeiros
+        # ficam preservados.
+        _r05c_locked = False
+        try:
+            from services import execution_accounting_service as _ea
+            _r05c_locked = _ea.accounting_is_confirmed(trade.execution_accounting)
+        except Exception as _exc:  # noqa: BLE001
+            log.warning(f"[r05c] checagem de contabilidade #{trade_id} falhou: {_exc}")
+
         trade.closed_at = datetime.now(timezone.utc)
         trade.status = status
+        if not _r05c_locked:
+            trade.exit_price = exit_price
+            trade.exit_fee = exit_fee
         if notes:
             trade.notes = (trade.notes + " | " + notes) if trade.notes else notes
 
@@ -284,9 +311,30 @@ async def close_trade(
             if risk_dollar > 0:
                 realized_r = round(pnl_usd / risk_dollar, 3)
 
-        trade.pnl_usd = round(pnl_usd, 4)
-        trade.pnl_pct = round(pnl_pct, 4)
-        trade.realized_r = realized_r
+        if _r05c_locked:
+            # Preserva os valores vindos dos fills confirmados e apenas informa.
+            pnl_usd = float(trade.pnl_usd if trade.pnl_usd is not None else pnl_usd)
+            realized_r = trade.realized_r
+            log.info(f"[r05c] close #{trade.id}: contabilidade confirmada "
+                     f"preservada (exit/pnl não sobrescritos)")
+        else:
+            trade.pnl_usd = round(pnl_usd, 4)
+            trade.pnl_pct = round(pnl_pct, 4)
+            trade.realized_r = realized_r
+
+        # R05C — fechou: libera a reconciliação imediata no próximo ciclo do
+        # trade manager (sem I/O aqui). Contabilidade confirmada não é mexida.
+        if trade.source == "auto" and not _r05c_locked:
+            try:
+                from services import execution_accounting_service as _ea
+                _acc = trade.execution_accounting
+                if isinstance(_acc, dict) and _acc.get("schema_version") == _ea.SCHEMA_VERSION:
+                    _acc = dict(_acc)
+                    _acc["next_retry_at"] = None
+                    _acc["closed_seen_at"] = trade.closed_at.isoformat()
+                    trade.execution_accounting = _acc
+            except Exception as _exc:  # noqa: BLE001
+                log.warning(f"[r05c] marcação pós-close #{trade.id} falhou: {_exc}")
 
         await session.commit()
         log.info(

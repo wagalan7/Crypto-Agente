@@ -193,6 +193,11 @@ def _empty_cohort(name: str) -> Dict[str, Any]:
         "entry_fee_sum_usd": None, "exit_fee_sum_usd": None,
         "entry_fee_coverage_pct": None, "exit_fee_coverage_pct": None,
         "fees_complete": False,
+        # R05C — "valor REGISTRADO" != "execução RECONCILIADA".
+        "execution_reconciled": 0, "execution_reconciled_pct": None,
+        "execution_states": {}, "fees_reconciled": False,
+        "funding_reconciled_usd": None, "funding_reconciled_pct": None,
+        "legacy_unverified": 0,
         "with_tp1_partial": 0, "closed_manual": 0, "without_recommendation_id": 0,
         "invalid_recommendation_id": 0,
         "pnl_coverage_pct": None, "recommendation_link_coverage_pct": None,
@@ -220,6 +225,11 @@ def real_cohorts(trades: Sequence[Dict[str, Any]], *, since: datetime,
     seen_slip: Dict[str, int] = {}
     seen_entry_fee: Dict[str, int] = {}
     seen_exit_fee: Dict[str, int] = {}
+    recon_ok: Dict[str, int] = {}
+    recon_states: Dict[str, Dict[str, int]] = {}
+    legacy_n: Dict[str, int] = {}
+    funding_sum: Dict[str, float] = {}
+    funding_n: Dict[str, int] = {}
 
     def _acc(bucket: Dict[str, Any], key: str, trade: Dict[str, Any],
              pnl: Optional[float]) -> None:
@@ -255,6 +265,23 @@ def real_cohorts(trades: Sequence[Dict[str, Any]], *, since: datetime,
                 bucket["invalid_recommendation_id"] += 1
         if _finite(trade.get("entry_slippage_pct")) is not None:
             seen_slip[key] = seen_slip.get(key, 0) + 1
+        # R05C — proveniência: CONFIRMED prova execução reconciliada; ausência
+        # ou schema desconhecido é LEGACY_UNVERIFIED, nunca confirmação.
+        acc = trade.get("execution_accounting")
+        state = "LEGACY_UNVERIFIED"
+        if isinstance(acc, dict) and acc.get("schema_version") == 1:
+            state = str(acc.get("state") or "PENDING")
+            totals = acc.get("totals") if isinstance(acc.get("totals"), dict) else {}
+            fnet = _finite(totals.get("funding_net"))
+            if state == "CONFIRMED":
+                recon_ok[key] = recon_ok.get(key, 0) + 1
+            if fnet is not None and totals.get("funding_state") == "CONFIRMED":
+                funding_sum[key] = funding_sum.get(key, 0.0) + fnet
+                funding_n[key] = funding_n.get(key, 0) + 1
+        else:
+            legacy_n[key] = legacy_n.get(key, 0) + 1
+        states = recon_states.setdefault(key, {})
+        states[state] = states.get(state, 0) + 1
 
     for trade in trades or ():
         if not isinstance(trade, dict):
@@ -285,8 +312,20 @@ def real_cohorts(trades: Sequence[Dict[str, Any]], *, since: datetime,
                                        if fees and exit_fee_n else None)
         bucket["entry_fee_coverage_pct"] = _pct(entry_fee_n, total)
         bucket["exit_fee_coverage_pct"] = _pct(exit_fee_n, total)
+        # R05C — `fees_complete` NUNCA pode ser true por causa de `0.0` default:
+        # exige presença registrada E execução reconciliada em todas as linhas.
+        recon = recon_ok.get(key, 0)
+        bucket["execution_reconciled"] = recon
+        bucket["execution_reconciled_pct"] = _pct(recon, total)
+        bucket["execution_states"] = dict(sorted((recon_states.get(key) or {}).items()))
+        bucket["legacy_unverified"] = legacy_n.get(key, 0)
+        bucket["fees_reconciled"] = bool(total and recon == total)
+        bucket["funding_reconciled_usd"] = (round(funding_sum.get(key, 0.0), 8)
+                                            if funding_n.get(key) else None)
+        bucket["funding_reconciled_pct"] = _pct(funding_n.get(key, 0), total)
         bucket["fees_complete"] = bool(total and entry_fee_n == total
-                                       and exit_fee_n == total)
+                                       and exit_fee_n == total
+                                       and recon == total)
         bucket["pnl_coverage_pct"] = _pct(seen_pnl.get(key, 0), total)
         bucket["recommendation_link_coverage_pct"] = _pct(
             total - bucket["without_recommendation_id"], total)
@@ -303,6 +342,9 @@ def real_cohorts(trades: Sequence[Dict[str, Any]], *, since: datetime,
         "funding": _unavailable(
             "FUNDING_FIELD_UNAVAILABLE",
             "não existe campo financeiro confiável de funding; não é estimado"),
+        "provenance_note": ("`fees_complete` exige execução RECONCILIADA (R05C), "
+                            "não apenas `entry_fee`/`exit_fee` presentes; funding "
+                            "reconciliado aparece separado e NUNCA é somado ao P&L"),
         "fees_note": ("`pnl_usd` já inclui entry_fee, exit_fee e o parcial de "
                       "TP1 — taxas e TP1 NÃO são descontados/somados de novo; as "
                       "somas de taxa abaixo são apenas informativas"),
@@ -698,7 +740,8 @@ async def load_rows(as_of: datetime) -> Dict[str, Any]:
             select(RT.id, RT.source, RT.status, RT.side, RT.recommendation_id,
                    RT.entry_price, RT.planned_stop, RT.qty, RT.qty_initial,
                    RT.pnl_usd, RT.realized_r, RT.entry_fee, RT.exit_fee,
-                   RT.tp1_realized_usd, RT.entry_slippage_pct, RT.closed_at)
+                   RT.tp1_realized_usd, RT.entry_slippage_pct, RT.closed_at,
+                   RT.execution_accounting)
             .where(RT.status != "open")
             .where(RT.closed_at.is_not(None))
             .where(RT.closed_at >= since)
@@ -711,6 +754,7 @@ async def load_rows(as_of: datetime) -> Dict[str, Any]:
             "realized_r": r.realized_r, "entry_fee": r.entry_fee,
             "exit_fee": r.exit_fee, "tp1_realized_usd": r.tp1_realized_usd,
             "entry_slippage_pct": r.entry_slippage_pct, "closed_at": r.closed_at,
+            "execution_accounting": r.execution_accounting,
         } for r in closed]
 
         rec_ids = {r["recommendation_id"] for r in closed_rows
