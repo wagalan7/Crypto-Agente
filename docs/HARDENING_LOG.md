@@ -1334,3 +1334,48 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
 - Validação: 102 R05C (78 + 24 novos), 1.245 backend e 31 verificações no
   PostgreSQL 16/asyncpg descartável aprovadas. Sem TCP/DNS no teste PG.
   Ver docs/R05C_EXECUTION_ACCOUNTING.md.
+
+## R06A — auditoria de EMAs e semântica de scores/probabilidades
+
+- **Baseline**: `main` @ `61265ed1`; commit novo, sem amend, sem push/deploy.
+- **Arquivos**: novos `backend/tests/test_r06a_indicator_score_contracts.py` e
+  `docs/R06A_EMA_SCORE_AUDIT.md`; alterado apenas o TEXTO de
+  `frontend/src/components/SignalPanel/SignalPanel.tsx`. Nenhum serviço de
+  cálculo, score, calibração ou execução foi tocado (verificado por teste
+  contra a baseline).
+- **F1 (ALTA, confirmado)**: o campo `ema9` recebe `EMAIndicator(window=12)` e
+  `ema21` recebe `window=26`; `ema50`/`ema200` conferem. Provado com referência
+  EMA independente (`alpha=2/(N+1)`). O MACD 12/26/9 é legítimo e não foi
+  tocado. Impacto medido só em série sintética: o rótulo de alinhamento muda
+  0% em tendência, 3% em reversão e **21% em oscilação** ao usar 9/21/50.
+  **Não** há evidência ligando isso aos stops observados.
+- **F2 (MÉDIA)**: `_safe` filtra `NaN` mas devolve `±inf` como número.
+  **F3 (MÉDIA)**: `close` NaN no candle mais recente é ignorado em silêncio e o
+  indicador parece atual.
+- **F4 (ALTA, CORRIGIDO)**: `confidence` (= `confluence.pct/100`) era exibido
+  como "Probabilidade … abaixo do mínimo de 75%". Texto trocado por
+  "Força do sinal: X/100 — referência desta tela: 75/100" +
+  "Este indicador não representa probabilidade de lucro.". Valor, limite 0.75,
+  condições de renderização, barra, botão, ordenação e chamadas de API
+  preservados; regressão coberta por teste.
+- **F5 (ALTA)**: fallback V2→legado é silencioso e as escalas diferem (V2
+  ≈18–71 vs legado 55–100), com os bins da calibração seguindo a mesma flag.
+  Score legado sob bins V2 cai fora do range → `prob_tp1` vira `p_global`,
+  perdendo diferenciação e alimentando o Kelly do sizing.
+- **F6 (MÉDIA)**: `_load_real_pairs` lê `RecommendationSnapshot` (SHADOW), não
+  `RealTrade` — o nome e a docstring dizem "trades REAIS".
+- **F7 (ALTA)**: `_compute_dynamic_size` usa Kelly com `p = prob_tp1` (tocar o
+  TP1) e `b = risk_reward` (alvo final); como `P(TP1) ≥ P(alvo final)`, a
+  fração é otimista. Atenuado por `KELLY_FRACTION`, `score_mult`, `vol_mult` e
+  o cap de tamanho. **Sizing não foi alterado.**
+- **Convenção que NÃO é defeito**: a lib `ta` usa `ewm(alpha=2/(N+1),
+  adjust=False)` desde o primeiro ponto, sem semente SMA, mascarando o warm-up.
+- **Testes**: 44 testes R06A herméticos verdes; suíte completa do backend verde
+  (1.289); `py_compile`, `tsc --noEmit` e `git diff --check` aprovados.
+  Vários testes são de CARACTERIZAÇÃO: travam o comportamento atual e **não**
+  significam defeito corrigido.
+- **Plano R06B** (priorizado, no doc): renomear `ema12`/`ema26` (ou decidir
+  9/21 como mudança de estratégia) → endurecer `_safe`/candle inválido →
+  registrar a fórmula do score e travar a binagem → renomear
+  `_load_shadow_pairs` → corrigir a semântica do Kelly. **Nenhum defeito
+  aritmético de EMA foi comprovado.**

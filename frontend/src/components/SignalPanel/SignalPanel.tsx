@@ -176,7 +176,12 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
           <span className="text-yellow-400 text-lg">⚠️</span>
           <div>
             <p className="text-xs font-bold text-yellow-400">AGUARDAR CONFLUÊNCIA</p>
-            <p className="text-xs text-yellow-300/70">Probabilidade {(signal.confidence * 100).toFixed(0)}% abaixo do mínimo de 75% para operar</p>
+            {/* R06A: `confidence` é uma pontuação heurística de confluência,
+                NÃO uma probabilidade calibrada de lucro. O valor, o limite de
+                0.75 e a condição de renderização seguem inalterados — só o
+                texto foi corrigido. */}
+            <p className="text-xs text-yellow-300/70">Força do sinal: {(signal.confidence * 100).toFixed(0)}/100 — referência desta tela: 75/100</p>
+            <p className="text-[10px] text-yellow-300/50 mt-0.5">Este indicador não representa probabilidade de lucro.</p>
           </div>
         </div>
       )}

@@ -923,18 +923,24 @@ class Arquitetura(unittest.TestCase):
         self.assertIn("recon == total", bloco)
 
     def test_flags_de_producao_intactas(self):
+        """O R05C não alterou os arquivos fora do escopo DA SUA FASE.
+
+        Verificado sobre os commits da fase (`59a9448f..61265ed1`), não sobre o
+        working tree: fases posteriores (R06A) alteram `frontend/src` com
+        autorização explícita — no caso, apenas texto de tela.
+        """
         import subprocess
         for caminho in ("backend/services/shadow_trade_service.py",
                         "backend/services/risk_service.py",
                         "backend/services/strategy_evidence_service.py",
                         "frontend/src"):
             res = subprocess.run(
-                ["git", "diff", "--name-only", "59a9448f", "--", caminho],
+                ["git", "diff", "--name-only", "59a9448f", "61265ed1", "--", caminho],
                 cwd=BACKEND.parent, capture_output=True, text=True)
             if res.returncode != 0:
-                self.skipTest("baseline 59a9448f indisponível neste checkout")
+                self.skipTest("commits da fase R05C indisponíveis neste checkout")
             self.assertEqual(res.stdout.strip(), "",
-                             f"arquivo fora do escopo alterado: {caminho}")
+                             f"R05C alterou arquivo fora do escopo: {caminho}")
 
 
 class ReadersEIntegracao(unittest.IsolatedAsyncioTestCase):
