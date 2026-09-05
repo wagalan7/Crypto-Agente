@@ -445,14 +445,22 @@ class SemanticaProbabilidades(unittest.TestCase):
             if i + 1 < len(calib.SCORE_BINS):
                 self.assertEqual(calib._bin_index(hi), i + 1, f"hi={hi}")
 
-    def test_fora_do_range_cai_no_global(self):
+    def test_CORRIGIDO_fora_do_range_nao_cai_mais_no_global(self):
+        """R06B2: o defeito de contrato do R06A está corrigido.
+
+        Antes, score sem bin compatível devolvia `p_global` — uma estatística
+        AGREGADA usada como probabilidade INDIVIDUAL, que seguia para os gates
+        e para o sizing. Agora devolve ausência.
+        """
         self.assertEqual(calib._bin_index(calib.SCORE_BINS[0][0] - 1), -1)
         self.assertEqual(calib._bin_index(calib.SCORE_BINS[-1][1] + 1), -1)
         calib._cache["data"] = {"bins": [{"p_calibrated": 0.9,
                                           "p_tp2_calibrated": 0.5}],
                                 "p_global": 0.42, "p_tp2_global": 0.21}
-        self.assertEqual(calib.prob_tp1_for_score_sync(-999.0), 0.42)
-        self.assertEqual(calib.prob_tp2_for_score_sync(-999.0), 0.21)
+        self.assertIsNone(calib.prob_tp1_for_score_sync(-999.0))
+        self.assertIsNone(calib.prob_tp2_for_score_sync(-999.0))
+        # p_global segue existindo como estatística agregada da calibração
+        self.assertEqual(calib._cache["data"]["p_global"], 0.42)
 
     def test_minimo_de_amostra_e_do_chamador(self):
         self.assertEqual(calib.MIN_SAMPLE_TOTAL, 30)

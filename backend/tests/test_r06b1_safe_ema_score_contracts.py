@@ -569,7 +569,7 @@ class ProvenienciaDoScore(unittest.TestCase):
     def test_proveniencia_nao_cria_coluna_nem_flag_nem_endpoint(self):
         import subprocess
         res = subprocess.run(
-            ["git", "diff", "--unified=0", "1f336a0f", "--",
+            ["git", "diff", "--unified=0", "1f336a0f", "14102771", "--",
              "backend/db.py", "backend/models", "backend/main.py"],
             cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
@@ -673,8 +673,12 @@ class Frontend(unittest.TestCase):
 class EscopoDoPacote(unittest.TestCase):
 
     def _diff(self, *caminhos):
+        """Escopo do R06B1 = o RANGE de commits do R06B1 (1f336a0f..14102771).
+        Comparar com a árvore de trabalho faria uma fase posterior autorizada
+        (R06B2) quebrar esta garantia retroativamente."""
         import subprocess
-        res = subprocess.run(["git", "diff", "--name-only", "1f336a0f", "--", *caminhos],
+        res = subprocess.run(["git", "diff", "--name-only", "1f336a0f", "14102771",
+                              "--", *caminhos],
                              cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
             self.skipTest("baseline 1f336a0f indisponível neste checkout")

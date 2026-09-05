@@ -865,6 +865,32 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                           )}
                         </div>
                       )}
+                      {/* R06B2: sem percentual quando o contrato não permite o
+                          lookup. Payload antigo (sem probability_provenance)
+                          não mostra nada — comportamento anterior preservado. */}
+                      {r.prob_tp1 == null && (() => {
+                        const st = r.probability_provenance?.status
+                        if (st == null) return null
+                        if (st === 'CALIBRATION_UNAVAILABLE') {
+                          return (
+                            <div
+                              className="text-[10px] text-slate-400 mt-0.5"
+                              title="A calibração score → P(TP1) ainda não tem amostra suficiente. Não é incompatibilidade; o bot segue operando com os demais gates."
+                            >
+                              Calibração ainda indisponível
+                            </div>
+                          )
+                        }
+                        if (st === 'READY') return null
+                        return (
+                          <div
+                            className="text-[10px] text-amber-300 mt-0.5"
+                            title="O score desta recomendação foi gerado por uma fórmula que os bins da calibração atual não aceitam, ou caiu fora da faixa coberta. Sem probabilidade confiável, o bot não abre esta entrada sozinho."
+                          >
+                            Calibração incompatível com a fórmula deste score.
+                          </div>
+                        )
+                      })()}
                       <div className="text-[10px] text-emerald-300 mt-1 font-mono">{fmtRR(r.risk_reward)}</div>
                       <div className="text-[11px] text-orange-300 mt-0.5 font-mono font-bold">{r.leverage}x</div>
                       {(() => {

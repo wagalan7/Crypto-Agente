@@ -294,6 +294,19 @@ export interface Recommendation {
   prob_tp1?: number | null
   // P(TP2) calibrada — prob de correr até o TP2 (subconjunto de P(TP1), sempre ≤)
   prob_tp2?: number | null
+  // R06B2 — contrato score ↔ calibração ↔ probabilidade. Só `READY` traz
+  // prob_tp1/prob_tp2 preenchidos. `CALIBRATION_UNAVAILABLE` é calibração
+  // imatura (não é incompatibilidade). Ausente em payload antigo.
+  probability_provenance?: {
+    contract_version?: string | null
+    status?: string | null
+    reason_code?: string | null
+    score_formula_effective?: string | null
+    calibration_formula?: string | null
+    bins_version?: string | null
+    bin_index?: number | null
+    fallback_used?: boolean | null
+  } | null
   // Edges (sinais que historicamente elevam o win-rate): A+/funding/padrão/MTF.
   // Tags legíveis + contagem. Read-only — transparência do que o bot valoriza.
   edge_tags?: string[]

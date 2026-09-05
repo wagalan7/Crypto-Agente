@@ -1264,6 +1264,27 @@ def get_skip_reasons() -> list[dict]:
         return list(_LAST_SKIP_REASONS.values())
 
 
+def _calibration_contract_verdict(rec) -> dict:
+    """Ponte para o helper ÚNICO do R06B2 (`calibration_service`). Fail-CLOSED
+    no import: se o contrato não pode ser avaliado, a rec não vira ordem.
+
+    A regra NÃO é reimplementada aqui — `exec_verdict`, a avaliação de qualidade
+    do app e o loop oficial de autoexecução chamam este mesmo caminho.
+    """
+    try:
+        from services.calibration_service import calibration_contract_verdict
+    except Exception:
+        return {"ok": False, "blocked_by": "calibration-contract",
+                "reason": "contrato de calibração indisponível para avaliação",
+                "status": "INVALID_CALIBRATION_CONTRACT", "reason_code": None}
+    try:
+        return calibration_contract_verdict(rec)
+    except Exception:
+        return {"ok": False, "blocked_by": "calibration-contract",
+                "reason": "contrato de calibração indisponível para avaliação",
+                "status": "INVALID_CALIBRATION_CONTRACT", "reason_code": None}
+
+
 def exec_verdict(rec: dict) -> dict:
     """Avaliador READ-ONLY dos gates de QUALIDADE do bot (R:R, P(TP1), liquidez)
     — MESMA lógica e MESMOS limites do loop de execução, sem tocar no loop real
@@ -1313,6 +1334,13 @@ def exec_verdict(rec: dict) -> dict:
         "quote_vol_usd": qvol,
         "spread_pct": round(spread, 4) if spread is not None else None,
     }
+
+    # ── Contrato score↔calibração (R06B2) ── MESMO helper do executor.
+    _cc = _calibration_contract_verdict(rec)
+    if not _cc.get("ok"):
+        checks["calibration_contract"] = _cc.get("status")
+        return {"ok": False, "blocked_by": _cc.get("blocked_by"),
+                "reason": _cc.get("reason"), "checks": checks}
 
     # ── R:R gate (geometria) ──
     if RR_GATE_ENABLED:
@@ -4487,6 +4515,19 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             continue
                     except Exception:
                         pass
+
+            # ── Contrato score↔calibração (R06B2): score de uma fórmula não
+            # pode ser lido pelos bins de outra. Fórmula incompatível, score
+            # fora dos bins ou contrato inválido ⇒ ordem NÃO nasce. Roda ANTES
+            # de qualquer criação de ordem e usa o MESMO helper do exec_verdict.
+            # `CALIBRATION_UNAVAILABLE` (calibração imatura) NÃO bloqueia.
+            _cc = _calibration_contract_verdict(rec)
+            if not _cc.get("ok"):
+                reason = (f"{_cc.get('status')}: {_cc.get('reason')}"
+                          if _cc.get("status") else str(_cc.get("reason")))
+                log.info(f"[calibration-contract] {rec.get('symbol')} {reason} — skip")
+                _record_skip(rec, "calibration-contract", reason)
+                continue
 
             # ── R:R gate (geometria estrutural): stop longe + alvo perto =
             # expectância ruim. Exige R:R mínimo a TP1 e TP2 medido sobre o

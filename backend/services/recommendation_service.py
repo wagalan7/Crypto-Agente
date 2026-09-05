@@ -414,6 +414,15 @@ class Recommendation(BaseModel):
     # score BASE da fórmula; `Recommendation.score` pode trazer, além dele, o
     # bônus aditivo de confirmação HTF.
     score_provenance: Optional[dict] = None
+    # ── Contrato score ↔ calibração ↔ probabilidade (R06B2) ───────────────
+    # {contract_version, status, reason_code, score_formula_effective,
+    #  calibration_formula, bins_version, bin_index, fallback_used}.
+    # `status=READY` é a ÚNICA situação em que prob_tp1/prob_tp2 vêm
+    # preenchidos. FORMULA_MISMATCH / SCORE_OUT_OF_RANGE / INVALID_SCORE /
+    # INVALID_CALIBRATION_CONTRACT zeram a probabilidade (ausência, não zero) e
+    # bloqueiam a autoexecução. CALIBRATION_UNAVAILABLE é calibração imatura —
+    # NÃO é incompatibilidade e preserva o comportamento operacional anterior.
+    probability_provenance: Optional[dict] = None
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -1285,6 +1294,8 @@ def _compute_dynamic_size(
     risk_reward: float,
     prob_tp1: Optional[float],
     atr_pct: Optional[float],
+    *,
+    probability_status: Optional[str] = None,
 ) -> tuple[Optional[float], str]:
     """
     Position sizing dinâmico via Kelly fracionado × score × volatilidade.
@@ -1299,7 +1310,20 @@ def _compute_dynamic_size(
     Returns (size_pct, rationale_text). Retorna (None, motivo) se inputs
     insuficientes — caller pode optar por usar risk_pct fixo como fallback.
     """
-    # p_win: prob calibrada, ou fallback por tier
+    # R06B2: contrato de probabilidade quebrado ⇒ sem sizing. Aqui NÃO vale o
+    # fallback por tier: ele existe para calibração IMATURA (ainda sem amostra),
+    # não para score cuja probabilidade é inválida ou de outra fórmula. A
+    # fórmula de Kelly abaixo não muda; ela apenas não é alcançada.
+    if probability_status is not None:
+        try:
+            from services.calibration_service import BLOCKING_PROB_STATUSES
+        except Exception:
+            BLOCKING_PROB_STATUSES = frozenset()
+        if probability_status in BLOCKING_PROB_STATUSES:
+            return None, ("Calibração incompatível com a fórmula deste score — "
+                          "sizing dinâmico suspenso")
+
+    # p_win: prob calibrada, ou fallback por tier (calibração ainda imatura)
     p = prob_tp1 if prob_tp1 is not None else _TIER_WR_FALLBACK.get(tier)
     if p is None or risk_reward <= 0:
         return None, "Dados insuficientes para sizing dinâmico"
@@ -1492,22 +1516,36 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
             f"⚠ Preço {struct_chase_atr}×ATR acima da base do movimento — pernada esticada, risco de comprar topo."
         ]
 
-    # P(TP1)/P(TP2) calibradas — lookup sync no cache (None se calib não pronta)
-    try:
-        from services.calibration_service import (
-            prob_tp1_for_score_sync, prob_tp2_for_score_sync,
-        )
-        prob_tp1 = prob_tp1_for_score_sync(score)
-        prob_tp2 = prob_tp2_for_score_sync(score)
-    except Exception:
-        prob_tp1 = None
-        prob_tp2 = None
-
     # Proveniência da fórmula do score (R06B1) — read-only, fail-soft, pura.
+    # Precisa vir ANTES do lookup: é a fórmula EFETIVA (não a flag global) que
+    # governa qual conjunto de bins pode interpretar este score.
     try:
         score_prov = compute_score_with_provenance(sig).as_dict()
     except Exception:
         score_prov = None
+
+    # P(TP1)/P(TP2) calibradas — R06B2: lookup com cerca de contrato. Fórmula
+    # incompatível, score fora dos bins ou contrato inválido ⇒ ausência de
+    # probabilidade (nunca `p_global`) + bloqueio da autoexecução afetada.
+    try:
+        from services.calibration_service import (
+            cached_calibration, probability_for_score,
+        )
+        prob_result = probability_for_score(
+            score,
+            (score_prov or {}).get("formula_effective"),
+            cached_calibration(),
+            fallback_used=bool((score_prov or {}).get("fallback_used")),
+        )
+        prob_tp1 = prob_result.prob_tp1
+        prob_tp2 = prob_result.prob_tp2
+        prob_prov = prob_result.as_provenance()
+        prob_status = prob_result.status
+    except Exception:
+        prob_tp1 = None
+        prob_tp2 = None
+        prob_prov = None
+        prob_status = None
 
     # Edges (A+/funding/padrão/MTF) — computados ANTES do sizing/veredito pra
     # alimentar ambos (read-only, alimenta exibição no app + sizing no bot).
@@ -1524,6 +1562,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         risk_reward=sig.risk_reward,
         prob_tp1=prob_tp1,
         atr_pct=atr_pct_val,
+        probability_status=prob_status,
     )
     # Espelha o EDGE_SIZING do bot no tamanho EXIBIDO (app conta a mesma história
     # que o bot). Gated: NO-OP quando EDGE_SIZING_ENABLED=false. Re-clampa ao teto
@@ -1566,6 +1605,10 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
             "spread_pct": sp_pct,
             "score": score,
             "edge_score": edge_score,
+            # R06B2: o veredito do app precisa enxergar o MESMO contrato que o
+            # executor — fonte única, sem regra duplicada.
+            "probability_provenance": prob_prov,
+            "score_provenance": score_prov,
         })
     except Exception:
         bot_verdict = None
@@ -1621,6 +1664,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         edge_tags=edge_tags,
         edge_score=edge_score,
         score_provenance=score_prov,
+        probability_provenance=prob_prov,
     )
 
 

@@ -1425,3 +1425,50 @@ comprovados** no R06A. Doc: `docs/R06B1_SAFE_EMA_SCORE_CONTRACTS.md`.
 - **Limites**: 9/21 **não** foi testado como challenger; **12/26 continua sendo
   o champion**; nenhuma conclusão de lucratividade; F5 (binagem) e F7 (Kelly)
   seguem abertos.
+
+## R06B2 — cerca entre score, calibração e autoexecução
+
+Base `14102771` (R06B1), branch `main`. Fecha a parte operacional do F5 do R06A.
+Doc: `docs/R06B2_SCORE_CALIBRATION_FENCING.md`.
+
+- **ANTES**: `SCORE_V2` pedida → V2 indisponível → fallback `LEGACY_V1` → bins
+  continuam V2 → o lookup devolvia `p_global` e esse número entrava no gate de
+  P(TP1) e no Kelly como se fosse probabilidade calibrada daquele score.
+- **DEPOIS**: score, fórmula, bins e probabilidade têm contrato explícito;
+  incompatibilidade bloqueia **somente a autoexecução afetada**.
+- **Contrato do lookup**: `CalibrationProbabilityResult` (`prob_tp1`,
+  `prob_tp2`, `status`, `reason_code`, `score`, `score_formula_effective`,
+  `calibration_formula`, `bins_version`, `bin_index`, `fallback_used`) via
+  `probability_for_score(...)` — função **pura**, sem banco/rede/ENV/exchange.
+  Estados: `READY`, `CALIBRATION_UNAVAILABLE`, `FORMULA_MISMATCH`,
+  `SCORE_OUT_OF_RANGE`, `INVALID_SCORE`, `INVALID_CALIBRATION_CONTRACT`.
+- **Identidade dos bins**: a calibração declara `contract_version`,
+  `calibration_formula`, `bins_version`, `score_range`, `source`,
+  `total_resolved`. Registrado honestamente que pares anteriores ao R06B1 não
+  têm proveniência individual (`pairs_formula_provenance`); a fórmula NÃO é
+  inferida pelo valor do score e nenhum snapshot histórico foi reescrito.
+- **`p_global`**: removido dos três lookups como fallback de score fora do
+  range (sync e async). Continua válido como estatística AGREGADA da tabela.
+- **Recomendação**: `ScoreProvenance` calculado ANTES do lookup; é o
+  `formula_effective` (não a flag global) que governa a leitura dos bins.
+  Novo `probability_provenance` no JSON já serializado — sem coluna.
+- **Autoexecução**: helper único `calibration_contract_verdict`, definido uma
+  vez em `calibration_service` e reusado por `exec_verdict`, pela avaliação de
+  qualidade e pelo loop oficial. Bloqueio com código `calibration-contract`,
+  antes de qualquer criação de ordem; ponte no shadow é **fail-closed**.
+  Também bloqueia `fallback_used=true` sem proveniência legível.
+  `CALIBRATION_UNAVAILABLE` e `READY` não bloqueiam.
+- **Sizing**: estado bloqueante ⇒ sem `prob_tp1`, sem `_TIER_WR_FALLBACK`,
+  `size=None` com rationale controlada. `READY` e `CALIBRATION_UNAVAILABLE`
+  preservam o resultado anterior. Kelly, caps, `KELLY_FRACTION` e
+  `CONVICTION_MULT_MAX` inalterados; nenhuma flag ativada.
+- **Frontend**: sem percentual em estado bloqueante (texto curto em PT-BR),
+  "Calibração ainda indisponível" para calibração imatura, payload antigo
+  inalterado. Sem código interno, sem `[object Object]`, sem bloquear botão.
+- **Testes**: 70 testes R06B2 herméticos verdes; suíte completa do backend
+  **1.418 verdes** (2 skips pré-existentes do R05C — fixture privada fora do
+  repo). `py_compile`, `tsc --noEmit` e `git diff --check` aprovados.
+- **Limites**: `CALIBRATION_UNAVAILABLE` != `FORMULA_MISMATCH`; `p_global` não
+  substitui probabilidade individual; histórico pré-R06B1 sem proveniência
+  garantida; semântica do Kelly pendente para o R06B3; nenhuma conclusão de
+  lucratividade produzida.
