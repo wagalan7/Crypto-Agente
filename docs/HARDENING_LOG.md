@@ -1519,3 +1519,15 @@ revisão do R06B2. Doc: `docs/R06B2_1_FINAL_CONTRACT_CLOSURE.md`.
   exibir ausência em vez de número recalculado — é a correção, não efeito
   colateral); `CALIBRATION_UNAVAILABLE` segue distinto; `p_global` segue só como
   agregado; Kelly pendente para o R06B3; nenhuma conclusão de lucratividade.
+
+### R06B2.1 — hotfix pós-deploy do veredito READY
+
+- A validação funcional em produção mostrou que `_build_recommendation` enviava
+  `prob_tp1`, mas não `prob_tp2`, ao `exec_verdict`. Como o contrato READY exige
+  as duas probabilidades, o painel marcava recomendações válidas como
+  `INVALID_CALIBRATION_CONTRACT` e snapshots novos poderiam congelar esse
+  veredito incorreto. O executor recebia o modelo completo e não estava
+  globalmente travado.
+- Corrigido passando também `prob_tp2` ao veredito único. Teste comportamental
+  garante que uma recomendação READY completa não seja bloqueada pelo gate de
+  calibração. Fórmulas, probabilidades, estratégia e sizing permanecem iguais.

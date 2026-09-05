@@ -196,6 +196,15 @@ class FalhaDeConstrucao(unittest.TestCase):
         self.assertEqual(rec.bot_verdict["blocked_by"],
                          calib.CALIBRATION_CONTRACT_GATE)
 
+    def test_ready_chega_com_tp2_ao_bot_verdict(self):
+        rec = self._constroi()
+        self.assertEqual(rec.probability_provenance["status"],
+                         calib.PROB_STATUS_READY)
+        self.assertIsNotNone(rec.prob_tp2)
+        self.assertIsNotNone(rec.bot_verdict)
+        self.assertNotEqual(rec.bot_verdict.get("blocked_by"),
+                            calib.CALIBRATION_CONTRACT_GATE)
+
     def test_falha_bloqueia_a_autoexecucao(self):
         with self._com_lookup_quebrado():
             rec = self._constroi()

@@ -1623,6 +1623,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
             "tp1": sig.tp1,
             "tp2": sig.tp2,
             "prob_tp1": prob_tp1,
+            "prob_tp2": prob_tp2,
             "quote_vol_usd": q_vol,
             "spread_pct": sp_pct,
             "score": score,
