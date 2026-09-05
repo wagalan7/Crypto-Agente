@@ -157,12 +157,26 @@ def _extract_features(
     único jeito de auditar desempenho por regime DEPOIS — o regime não é
     reconstruível com fidelidade pós-fato. Só novos snapshots terão; antigos
     saem como None (a auditoria de regime acumula a partir do deploy)."""
+    # R06B2.1 — contrato de probabilidade CONGELADO no instante da recomendação.
+    # Sem isto, exibir P(TP1) de um snapshot antigo exigia recalcular com o cache
+    # de HOJE, que pode estar em outra fórmula/partição de bins. Namespace
+    # versionado dentro do `features` que já existe: nenhuma coluna nova, nenhum
+    # registro histórico reescrito (só snapshots novos passam a ter).
+    prob_contract = {
+        "schema_version": 1,
+        "score_provenance": rec.get("score_provenance"),
+        "probability_provenance": rec.get("probability_provenance"),
+        "prob_tp1": rec.get("prob_tp1"),
+        "prob_tp2": rec.get("prob_tp2"),
+    }
+
     sig = rec.get("signal") or {}
     if not isinstance(sig, dict):
         return {
             "hour_utc": created_at.hour,
             "day_of_week": created_at.weekday(),
             "regime": regime_label,
+            "probability_contract": prob_contract,
         }
 
     ind = sig.get("indicators") or {}
@@ -227,6 +241,8 @@ def _extract_features(
         "chase_atr": rec.get("chase_atr"),
         "struct_chase_atr": rec.get("struct_chase_atr"),
         "retest_armed": rec.get("retest_armed"),
+        # R06B2.1 — probabilidade e proveniência congeladas (ver acima).
+        "probability_contract": prob_contract,
         # P05 — contexto versionado do MOMENTO da decisão (namespace isolado).
         "p05_context": _p05_context(rec, sig, created_at, regime_label, atr_pct),
     }
@@ -2314,30 +2330,27 @@ async def get_daily_pnl(
         except Exception:
             return None
 
-    # Calibração score→P(TP1)/P(TP2) — sync, lê do cache, fail-soft (None se
-    # calib imatura). Mesma fonte do "P 70%" das Recomendações; expõe a métrica
-    # no card de abertos pra dar paridade de decisão. risk_reward já é coluna;
-    # confluence_pct vem do vetor de features. Tudo opcional no front.
+    # Calibração score→P(TP1)/P(TP2) — R06B2.1: lê a probabilidade PERSISTIDA
+    # no instante da recomendação, nunca recalcula com o cache de hoje. Os
+    # wrappers `prob_tp*_for_score_sync` não conhecem a fórmula que gerou o
+    # score histórico e por isso saíram deste caminho. Snapshot sem o contrato
+    # (registro anterior ao R06B2.1) ou com contrato não-READY ⇒ ausência.
     try:
-        from services.calibration_service import (
-            get_calibration, prob_tp1_for_score_sync, prob_tp2_for_score_sync,
-        )
-        # Aquece o cache de calibração (sync lê só dele). Barato: guardado por
-        # TTL — quase sempre hit. Sem isso, num processo recém-deployado o
-        # cache pode estar frio e P(TP1) sairia None pra todos os abertos.
-        await get_calibration()
+        from services.calibration_service import probabilities_from_contract
     except Exception:  # pragma: no cover — fail-soft
-        prob_tp1_for_score_sync = lambda _s: None  # noqa: E731
-        prob_tp2_for_score_sync = lambda _s: None  # noqa: E731
+        def probabilities_from_contract(_payload):
+            return None, None
 
     def _decision_fields(s):
         """Campos de auxílio à decisão (paridade com o painel de Recomendações)."""
         feat = s.features or {}
+        contrato = feat.get("probability_contract") if isinstance(feat, dict) else None
+        p1, p2 = probabilities_from_contract(contrato)
         return {
             "risk_reward": s.risk_reward,
-            "prob_tp1": prob_tp1_for_score_sync(s.score),
-            "prob_tp2": prob_tp2_for_score_sync(s.score),
-            "confluence_pct": feat.get("confluence_pct"),
+            "prob_tp1": p1,
+            "prob_tp2": p2,
+            "confluence_pct": feat.get("confluence_pct") if isinstance(feat, dict) else None,
         }
 
     # Detalhe por trade (resolvido + aberto, em listas separadas)

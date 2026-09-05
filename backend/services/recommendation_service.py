@@ -527,6 +527,13 @@ SCORE_FORMULA_LEGACY_ID = "LEGACY_V1"
 SCORE_FALLBACK_V2_NO_COMPONENTS = "V2_NO_COMPONENTS"
 SCORE_FALLBACK_REASONS = frozenset({SCORE_FALLBACK_V2_NO_COMPONENTS})
 
+# R06B2.1 — literais do contrato de probabilidade usados no caminho de FALHA,
+# onde nem o import de `calibration_service` pode ser assumido. Um teste trava
+# a igualdade com as constantes de lá (mesma técnica dos IDs de fórmula).
+_CALIB_CONTRACT_VERSION = "r06b2.1"
+_CALIB_STATUS_INVALID = "INVALID_CALIBRATION_CONTRACT"
+_CALIB_REASON_LOOKUP_FAILED = "PROBABILITY_LOOKUP_FAILED"
+
 
 class ScoreProvenance(NamedTuple):
     """Qual fórmula foi pedida, qual de fato produziu o número, e por quê.
@@ -1295,7 +1302,7 @@ def _compute_dynamic_size(
     prob_tp1: Optional[float],
     atr_pct: Optional[float],
     *,
-    probability_status: Optional[str] = None,
+    probability_contract_blocking: bool = False,
 ) -> tuple[Optional[float], str]:
     """
     Position sizing dinâmico via Kelly fracionado × score × volatilidade.
@@ -1314,14 +1321,13 @@ def _compute_dynamic_size(
     # fallback por tier: ele existe para calibração IMATURA (ainda sem amostra),
     # não para score cuja probabilidade é inválida ou de outra fórmula. A
     # fórmula de Kelly abaixo não muda; ela apenas não é alcançada.
-    if probability_status is not None:
-        try:
-            from services.calibration_service import BLOCKING_PROB_STATUSES
-        except Exception:
-            BLOCKING_PROB_STATUSES = frozenset()
-        if probability_status in BLOCKING_PROB_STATUSES:
-            return None, ("Calibração incompatível com a fórmula deste score — "
-                          "sizing dinâmico suspenso")
+    #
+    # R06B2.1: o chamador decide e passa o booleano. A versão anterior importava
+    # `BLOCKING_PROB_STATUSES` aqui e caía num conjunto VAZIO se o import
+    # falhasse — um erro interno virava, silenciosamente, sizing por tier.
+    if probability_contract_blocking:
+        return None, ("Calibração incompatível com a fórmula deste score — "
+                      "sizing dinâmico suspenso")
 
     # p_win: prob calibrada, ou fallback por tier (calibração ainda imatura)
     p = prob_tp1 if prob_tp1 is not None else _TIER_WR_FALLBACK.get(tier)
@@ -1527,6 +1533,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
     # P(TP1)/P(TP2) calibradas — R06B2: lookup com cerca de contrato. Fórmula
     # incompatível, score fora dos bins ou contrato inválido ⇒ ausência de
     # probabilidade (nunca `p_global`) + bloqueio da autoexecução afetada.
+    _fb_usado = bool((score_prov or {}).get("fallback_used"))
     try:
         from services.calibration_service import (
             cached_calibration, probability_for_score,
@@ -1535,17 +1542,32 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
             score,
             (score_prov or {}).get("formula_effective"),
             cached_calibration(),
-            fallback_used=bool((score_prov or {}).get("fallback_used")),
+            fallback_used=_fb_usado,
         )
         prob_tp1 = prob_result.prob_tp1
         prob_tp2 = prob_result.prob_tp2
         prob_prov = prob_result.as_provenance()
-        prob_status = prob_result.status
+        prob_blocking = prob_result.blocking
     except Exception:
+        # R06B2.1 — FALHA FECHADA. Antes, uma exceção aqui deixava
+        # `probability_provenance=None`; se o score não tivesse vindo de
+        # fallback, o gate deixava a rec passar sem contrato nenhum. Agora a
+        # falha vira um contrato INVÁLIDO explícito: sem probabilidade, sem
+        # sizing e bloqueada na autoexecução. Nenhuma mensagem da exceção é
+        # propagada — só o código controlado.
         prob_tp1 = None
         prob_tp2 = None
-        prob_prov = None
-        prob_status = None
+        prob_prov = {
+            "contract_version": _CALIB_CONTRACT_VERSION,
+            "status": _CALIB_STATUS_INVALID,
+            "reason_code": _CALIB_REASON_LOOKUP_FAILED,
+            "score_formula_effective": (score_prov or {}).get("formula_effective"),
+            "calibration_formula": None,
+            "bins_version": None,
+            "bin_index": None,
+            "fallback_used": _fb_usado,
+        }
+        prob_blocking = True
 
     # Edges (A+/funding/padrão/MTF) — computados ANTES do sizing/veredito pra
     # alimentar ambos (read-only, alimenta exibição no app + sizing no bot).
@@ -1562,7 +1584,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         risk_reward=sig.risk_reward,
         prob_tp1=prob_tp1,
         atr_pct=atr_pct_val,
-        probability_status=prob_status,
+        probability_contract_blocking=prob_blocking,
     )
     # Espelha o EDGE_SIZING do bot no tamanho EXIBIDO (app conta a mesma história
     # que o bot). Gated: NO-OP quando EDGE_SIZING_ENABLED=false. Re-clampa ao teto

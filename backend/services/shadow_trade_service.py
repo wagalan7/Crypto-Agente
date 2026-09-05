@@ -1264,12 +1264,14 @@ def get_skip_reasons() -> list[dict]:
         return list(_LAST_SKIP_REASONS.values())
 
 
-def _calibration_contract_verdict(rec) -> dict:
+def _calibration_contract_verdict(rec, *, require_current_contract: bool = False) -> dict:
     """Ponte para o helper ÚNICO do R06B2 (`calibration_service`). Fail-CLOSED
     no import: se o contrato não pode ser avaliado, a rec não vira ordem.
 
     A regra NÃO é reimplementada aqui — `exec_verdict`, a avaliação de qualidade
-    do app e o loop oficial de autoexecução chamam este mesmo caminho.
+    do app e o loop oficial de autoexecução chamam este mesmo caminho. O loop
+    oficial passa `require_current_contract=True` (R06B2.1): payload sem
+    proveniência é legível em histórico, mas não vira ordem nova.
     """
     try:
         from services.calibration_service import calibration_contract_verdict
@@ -1278,7 +1280,8 @@ def _calibration_contract_verdict(rec) -> dict:
                 "reason": "contrato de calibração indisponível para avaliação",
                 "status": "INVALID_CALIBRATION_CONTRACT", "reason_code": None}
     try:
-        return calibration_contract_verdict(rec)
+        return calibration_contract_verdict(
+            rec, require_current_contract=require_current_contract)
     except Exception:
         return {"ok": False, "blocked_by": "calibration-contract",
                 "reason": "contrato de calibração indisponível para avaliação",
@@ -4521,7 +4524,9 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             # fora dos bins ou contrato inválido ⇒ ordem NÃO nasce. Roda ANTES
             # de qualquer criação de ordem e usa o MESMO helper do exec_verdict.
             # `CALIBRATION_UNAVAILABLE` (calibração imatura) NÃO bloqueia.
-            _cc = _calibration_contract_verdict(rec)
+            # R06B2.1: aqui o contrato ATUAL é obrigatório — rec sem
+            # proveniência é legível em histórico, mas não vira ordem nova.
+            _cc = _calibration_contract_verdict(rec, require_current_contract=True)
             if not _cc.get("ok"):
                 reason = (f"{_cc.get('status')}: {_cc.get('reason')}"
                           if _cc.get("status") else str(_cc.get("reason")))

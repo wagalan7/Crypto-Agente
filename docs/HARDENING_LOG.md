@@ -1472,3 +1472,50 @@ Doc: `docs/R06B2_SCORE_CALIBRATION_FENCING.md`.
   substitui probabilidade individual; histórico pré-R06B1 sem proveniência
   garantida; semântica do Kelly pendente para o R06B3; nenhuma conclusão de
   lucratividade produzida.
+
+## R06B2.1 — fechamento do contrato de score/calibração
+
+Base `8ae87567` (R06B2), branch `main`. Corrige as QUATRO lacunas comprovadas na
+revisão do R06B2. Doc: `docs/R06B2_1_FINAL_CONTRACT_CLOSURE.md`.
+
+- **1. Construção falhava ABERTA**: exceção no import/lookup deixava
+  `probability_provenance=None`; sem `fallback_used`, o gate liberava a rec.
+  Agora vira contrato explícito `INVALID_CALIBRATION_CONTRACT` +
+  `PROBABILITY_LOOKUP_FAILED` (novo código no vocabulário fechado), sem
+  probabilidade, com sizing suspenso, `bot_verdict` bloqueado e autoexecução
+  barrada. Nenhuma mensagem da exceção é propagada (teste com sentinela).
+  **Nenhuma Recommendation nova fica sem proveniência.**
+- **2. `status` isolado simulava contrato válido**: `{"status": "READY"}` era
+  aceito. Agora `READY` exige envelope (`contract_version` suportada,
+  `reason_code` reconhecido), fórmulas conhecidas e IGUAIS, `bins_version`
+  válida, `bin_index` int não-bool ≥ 0, `fallback_used` exatamente `false`, e
+  probabilidades finitas em [0,1] com `TP2 <= TP1`. `CALIBRATION_UNAVAILABLE`
+  exige ausência de probabilidade e de bin. Loop oficial usa o MESMO helper com
+  `require_current_contract=True`; payload legado segue legível em histórico,
+  mas não vira ordem nova.
+- **3. Versão dos bins não cobria bordas internas**: era fórmula + quantidade +
+  extremos. Agora `bins_fingerprint` = SHA-256 do JSON canônico com
+  `calibration_formula` + lista completa de `[score_lo, score_hi]` (sem data,
+  probabilidade ou amostra). `probability_for_score` recomputa o fingerprint e
+  valida contrato inteiro: versão suportada, `total_resolved` finito não-bool,
+  bins ordenados e sem overlap, `score_range` coerente. Divergência ⇒
+  `INVALID_CALIBRATION_CONTRACT`. **Bordas atuais não mudaram.**
+- **4. Snapshot recalculava histórico**: `snapshot_service` usava os wrappers
+  sem fórmula. Agora `_extract_features` congela o namespace versionado
+  `probability_contract` (proveniências + prob_tp1/prob_tp2) dentro do
+  `features` existente, e a exibição lê via `probabilities_from_contract` —
+  só devolve valor se o contrato GRAVADO valida como READY. Histórico sem
+  proveniência ⇒ ausência; zero legítimo permanece zero. Sem coluna, sem
+  backfill, sem reescrita, P05 intocado. Varredura prova que nenhum caminho
+  operacional usa mais os wrappers.
+- **Extra (sizing)**: `_compute_dynamic_size` importava `BLOCKING_PROB_STATUSES`
+  e caía em conjunto VAZIO se o import falhasse — erro interno virava fallback
+  por tier. Agora o chamador passa `probability_contract_blocking: bool`.
+  Kelly, caps e o fallback legítimo de calibração imatura seguem intactos.
+- **Testes**: 65 testes R06B2.1 herméticos e COMPORTAMENTAIS verdes; suíte
+  completa do backend **1.483 verdes** (2 skips pré-existentes do R05C).
+  `py_compile` e `git diff --check` aprovados; frontend não foi alterado.
+- **Limites**: o congelamento vale só para snapshots NOVOS (antigos passam a
+  exibir ausência em vez de número recalculado — é a correção, não efeito
+  colateral); `CALIBRATION_UNAVAILABLE` segue distinto; `p_global` segue só como
+  agregado; Kelly pendente para o R06B3; nenhuma conclusão de lucratividade.

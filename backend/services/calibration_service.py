@@ -24,6 +24,7 @@ Fallback: enquanto não houver >= MIN_SAMPLE_TOTAL trades, retorna None
 e o frontend não mostra prob calibrada.
 """
 from __future__ import annotations
+import hashlib
 import json
 import logging
 import math
@@ -88,6 +89,7 @@ CALIBRATION_FORMULA_LEGACY = "LEGACY_V1"
 KNOWN_FORMULAS = frozenset({CALIBRATION_FORMULA_V2, CALIBRATION_FORMULA_LEGACY})
 PAIRS_PROVENANCE_UNVERSIONED = "UNVERSIONED_PRE_R06B1"
 CALIBRATION_CONTRACT_VERSION = "r06b2.1"
+SUPPORTED_CONTRACT_VERSIONS = frozenset({"r06b2.1"})
 
 
 def active_calibration_formula() -> str:
@@ -95,22 +97,62 @@ def active_calibration_formula() -> str:
     return CALIBRATION_FORMULA_V2 if _SCORE_FORMULA_V2 else CALIBRATION_FORMULA_LEGACY
 
 
-def _num_tag(v) -> str:
-    return f"{int(v)}" if float(v) == int(v) else f"{float(v):g}"
+def _bin_pairs(bins) -> List[Tuple[float, float]]:
+    """Normaliza `[(lo, hi), ...]` ou `[{score_lo, score_hi}, ...]` em pares."""
+    out: List[Tuple[float, float]] = []
+    for b in bins:
+        if isinstance(b, dict):
+            lo, hi = b.get("score_lo"), b.get("score_hi")
+        else:
+            lo, hi = b[0], b[1]
+        out.append((float(lo), float(hi)))
+    return out
+
+
+def bins_fingerprint(bins=None, formula: Optional[str] = None) -> str:
+    """SHA-256 do JSON canônico da configuração INTEIRA dos bins.
+
+    R06B2.1: a versão anterior resumia fórmula + quantidade + extremos, então
+    mover uma divisão INTERNA mantinha a mesma string — um score podia ser lido
+    por uma partição diferente daquela em que a tabela foi treinada. O hash
+    cobre todas as bordas.
+
+    Entram no hash apenas `calibration_formula` e a lista ordenada completa de
+    `[score_lo, score_hi]`. Nada de data, probabilidade ou dado de amostra —
+    caso contrário o fingerprint mudaria a cada recalibração.
+    """
+    pares = _bin_pairs(SCORE_BINS if bins is None else bins)
+    formula = active_calibration_formula() if formula is None else formula
+    canonico = json.dumps(
+        {"calibration_formula": formula,
+         "bins": [[lo, hi] for lo, hi in pares]},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    return hashlib.sha256(canonico.encode("utf-8")).hexdigest()
 
 
 def bins_version(bins=None, formula: Optional[str] = None) -> str:
-    """Identificador ESTÁVEL da configuração de bins: fórmula, quantidade e
-    faixa coberta. Muda se e somente se a configuração dos bins mudar."""
-    bins = SCORE_BINS if bins is None else bins
+    """Identificador estável da configuração de bins: `<FÓRMULA>:sha256:<hex>`."""
     formula = active_calibration_formula() if formula is None else formula
-    return (f"{formula}:n{len(bins)}:"
-            f"{_num_tag(bins[0][0])}-{_num_tag(bins[-1][1])}")
+    return f"{formula}:sha256:{bins_fingerprint(bins, formula)}"
+
+
+def is_valid_bins_version(value) -> bool:
+    """Forma sintática de uma `bins_version` — não verifica o conteúdo."""
+    if not isinstance(value, str):
+        return False
+    partes = value.split(":")
+    if len(partes) != 3:
+        return False
+    formula, algoritmo, digest = partes
+    return (formula in KNOWN_FORMULAS and algoritmo == "sha256"
+            and len(digest) == 64
+            and all(c in "0123456789abcdef" for c in digest))
 
 
 def bins_score_range(bins=None) -> List[float]:
-    bins = SCORE_BINS if bins is None else bins
-    return [float(bins[0][0]), float(bins[-1][1])]
+    pares = _bin_pairs(SCORE_BINS if bins is None else bins)
+    return [pares[0][0], pares[-1][1]]
 
 
 # Estados considerados vitória pra P(TP1)
@@ -558,6 +600,17 @@ PROB_REASON_BINS_AMBIGUOUS = "BINS_AMBIGUOUS"
 PROB_REASON_PROB_OUT_OF_UNIT = "PROBABILITY_OUT_OF_UNIT_RANGE"
 PROB_REASON_TP2_ABOVE_TP1 = "TP2_ABOVE_TP1"
 PROB_REASON_PROVENANCE_MISSING = "PROBABILITY_PROVENANCE_MISSING"
+# ── R06B2.1 ────────────────────────────────────────────────────────────────
+PROB_REASON_LOOKUP_FAILED = "PROBABILITY_LOOKUP_FAILED"
+PROB_REASON_CONTRACT_VERSION_UNSUPPORTED = "CONTRACT_VERSION_UNSUPPORTED"
+PROB_REASON_TOTAL_RESOLVED_INVALID = "TOTAL_RESOLVED_INVALID"
+PROB_REASON_BINS_VERSION_MISMATCH = "BINS_VERSION_MISMATCH"
+PROB_REASON_SCORE_RANGE_MISMATCH = "SCORE_RANGE_MISMATCH"
+PROB_REASON_BINS_UNSORTED = "BINS_UNSORTED"
+PROB_REASON_PROVENANCE_MALFORMED = "PROBABILITY_PROVENANCE_MALFORMED"
+PROB_REASON_READY_INCOMPLETE = "READY_CONTRACT_INCOMPLETE"
+PROB_REASON_UNAVAILABLE_WITH_PROB = "UNAVAILABLE_WITH_PROBABILITY"
+PROB_REASON_STATUS_UNKNOWN = "STATUS_UNKNOWN"
 
 PROB_REASON_CODES = frozenset({
     PROB_REASON_OK, PROB_REASON_NO_CALIBRATION, PROB_REASON_NO_BINS,
@@ -568,6 +621,11 @@ PROB_REASON_CODES = frozenset({
     PROB_REASON_BINS_VERSION_MISSING, PROB_REASON_BINS_MALFORMED,
     PROB_REASON_BINS_AMBIGUOUS, PROB_REASON_PROB_OUT_OF_UNIT,
     PROB_REASON_TP2_ABOVE_TP1, PROB_REASON_PROVENANCE_MISSING,
+    PROB_REASON_LOOKUP_FAILED, PROB_REASON_CONTRACT_VERSION_UNSUPPORTED,
+    PROB_REASON_TOTAL_RESOLVED_INVALID, PROB_REASON_BINS_VERSION_MISMATCH,
+    PROB_REASON_SCORE_RANGE_MISMATCH, PROB_REASON_BINS_UNSORTED,
+    PROB_REASON_PROVENANCE_MALFORMED, PROB_REASON_READY_INCOMPLETE,
+    PROB_REASON_UNAVAILABLE_WITH_PROB, PROB_REASON_STATUS_UNKNOWN,
 })
 
 # Folga numérica para a comparação P(TP2) <= P(TP1). As duas tabelas saem de
@@ -684,11 +742,6 @@ def probability_for_score(
     if not bins:
         return _result(PROB_STATUS_CALIBRATION_UNAVAILABLE,
                        PROB_REASON_NO_BINS, **common)
-    total = calibration.get("total_resolved")
-    if isinstance(total, numbers.Real) and not isinstance(total, bool):
-        if float(total) < MIN_SAMPLE_TOTAL:
-            return _result(PROB_STATUS_CALIBRATION_UNAVAILABLE,
-                           PROB_REASON_SAMPLE_BELOW_MINIMUM, **common)
 
     calib_formula = calibration.get("calibration_formula")
     calib_bins_version = calibration.get("bins_version")
@@ -696,7 +749,23 @@ def probability_for_score(
         calib_formula if isinstance(calib_formula, str) else None),
         bins_version=(calib_bins_version if isinstance(calib_bins_version, str) else None))
 
-    # 3. Contrato da calibração precisa estar bem formado e identificado.
+    # 3. Versão do contrato: uma tabela que não se identifica não é confiável
+    #    nem para reportar o próprio tamanho de amostra.
+    if calibration.get("contract_version") not in SUPPORTED_CONTRACT_VERSIONS:
+        return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+                       PROB_REASON_CONTRACT_VERSION_UNSUPPORTED, **common)
+
+    # 4. Amostra: ausente/malformada invalida; abaixo do mínimo é IMATURA.
+    total = calibration.get("total_resolved")
+    total_f = _finite_number(total)
+    if total_f is None:
+        return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+                       PROB_REASON_TOTAL_RESOLVED_INVALID, **common)
+    if total_f < MIN_SAMPLE_TOTAL:
+        return _result(PROB_STATUS_CALIBRATION_UNAVAILABLE,
+                       PROB_REASON_SAMPLE_BELOW_MINIMUM, **common)
+
+    # 5. Contrato da calibração precisa estar bem formado e identificado.
     if not isinstance(calib_formula, str) or calib_formula not in KNOWN_FORMULAS:
         return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
                        PROB_REASON_CALIB_FORMULA_UNKNOWN, **common)
@@ -721,12 +790,34 @@ def probability_for_score(
                            PROB_REASON_BINS_MALFORMED, **common)
         faixas.append((lo, hi))
 
-    # 4. A fórmula que gerou o score precisa ser a que os bins aceitam.
+    # 6. Partição: ordenada, sem sobreposição, com a faixa que ela declara.
+    for anterior, atual in zip(faixas, faixas[1:]):
+        if atual[0] < anterior[0]:
+            return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+                           PROB_REASON_BINS_UNSORTED, **common)
+        if atual[0] < anterior[1]:
+            return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+                           PROB_REASON_BINS_AMBIGUOUS, **common)
+    faixa_declarada = calibration.get("score_range")
+    if (not isinstance(faixa_declarada, (list, tuple))
+            or len(faixa_declarada) != 2
+            or _finite_number(faixa_declarada[0]) != faixas[0][0]
+            or _finite_number(faixa_declarada[1]) != faixas[-1][1]):
+        return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+                       PROB_REASON_SCORE_RANGE_MISMATCH, **common)
+
+    # 7. Fingerprint recomputado sobre TODAS as bordas — pega repartição
+    #    interna que a versão anterior (fórmula + n + extremos) não via.
+    if calib_bins_version != bins_version(faixas, calib_formula):
+        return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+                       PROB_REASON_BINS_VERSION_MISMATCH, **common)
+
+    # 8. A fórmula que gerou o score precisa ser a que os bins aceitam.
     if formula != calib_formula:
         return _result(PROB_STATUS_FORMULA_MISMATCH,
                        PROB_REASON_FORMULA_NOT_ACCEPTED, **common)
 
-    # 5. O score precisa cair em EXATAMENTE um bin.
+    # 9. O score precisa cair em EXATAMENTE um bin.
     achados = [i for i, (lo, hi) in enumerate(faixas) if lo <= score_f < hi]
     if len(achados) > 1:
         return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
@@ -739,7 +830,7 @@ def probability_for_score(
     idx = achados[0]
     common = dict(common, bin_index=idx)
 
-    # 6. As probabilidades do bin precisam ser finitas, em [0,1] e ordenadas.
+    # 10. As probabilidades do bin precisam ser finitas, em [0,1] e ordenadas.
     p1 = _unit_prob(bins[idx].get("p_calibrated"))
     p2 = _unit_prob(bins[idx].get("p_tp2_calibrated"))
     if p1 is None or p2 is None:
@@ -779,37 +870,151 @@ def _rec_field(rec, name):
     return getattr(rec, name, None)
 
 
-def calibration_contract_verdict(recommendation) -> Dict[str, Any]:
+def _bloqueia(reason: str, code: str,
+              status: str = PROB_STATUS_INVALID_CALIBRATION_CONTRACT) -> Dict[str, Any]:
+    return {"ok": False, "blocked_by": CALIBRATION_CONTRACT_GATE,
+            "reason": reason, "status": status, "reason_code": code}
+
+
+def _envelope_ok(prov: Dict[str, Any]) -> bool:
+    """Casca comum a qualquer estado: versão e reason_code reconhecidos."""
+    return (prov.get("contract_version") in SUPPORTED_CONTRACT_VERSIONS
+            and isinstance(prov.get("reason_code"), str)
+            and prov.get("reason_code") in PROB_REASON_CODES)
+
+
+def _ready_consistente(prov: Dict[str, Any], p1, p2) -> bool:
+    """READY só passa com o contrato INTEIRO coerente.
+
+    R06B2.1: antes bastava `status == "READY"`. Um dicionário incompleto —
+    `{"status": "READY"}` — era aceito como se tivesse sido produzido pelo
+    lookup, e a rec passava direto pelos gates.
+    """
+    if prov.get("score_formula_effective") not in KNOWN_FORMULAS:
+        return False
+    if prov.get("calibration_formula") not in KNOWN_FORMULAS:
+        return False
+    if prov.get("score_formula_effective") != prov.get("calibration_formula"):
+        return False
+    if not is_valid_bins_version(prov.get("bins_version")):
+        return False
+    idx = prov.get("bin_index")
+    if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
+        return False
+    if prov.get("fallback_used") is not False:
+        return False
+    v1, v2 = _unit_prob(p1), _unit_prob(p2)
+    if v1 is None or v2 is None:
+        return False
+    return v2 <= v1 + _TP2_TOLERANCE
+
+
+def _unavailable_consistente(prov: Dict[str, Any], p1, p2) -> bool:
+    """Imaturo tem que ser imaturo: sem bin e sem probabilidade vazada."""
+    if p1 is not None or p2 is not None:
+        return False
+    return prov.get("bin_index") is None
+
+
+def calibration_contract_verdict(
+    recommendation, *, require_current_contract: bool = False,
+) -> Dict[str, Any]:
     """Fonte ÚNICA da decisão "esta rec pode virar ordem?" quanto ao contrato
     score↔calibração. Pura, sem I/O; aceita dict ou objeto.
+
+    `require_current_contract=True` (caminho oficial de execução) exige um
+    contrato ATUAL: payload sem proveniência nenhuma deixa de passar. Com
+    `False` (leitura/exibição de histórico) o payload realmente legado segue
+    legível — o que nunca passa, nos dois modos, é contrato presente e
+    malformado.
 
     Retorna {ok, blocked_by, reason, status, reason_code}. `ok=True` significa
     apenas que ESTE contrato não bloqueia — os demais gates continuam valendo.
     """
     prov = _rec_field(recommendation, "probability_provenance")
-    status = prov.get("status") if isinstance(prov, dict) else None
-    if isinstance(status, str) and status in PROB_STATUSES:
-        code = prov.get("reason_code")
-        code = code if isinstance(code, str) and code in PROB_REASON_CODES else None
-        if status in BLOCKING_PROB_STATUSES:
-            return {"ok": False, "blocked_by": CALIBRATION_CONTRACT_GATE,
-                    "reason": _CONTRACT_REASON_PT[status],
-                    "status": status, "reason_code": code}
+    score_prov = _rec_field(recommendation, "score_provenance")
+    p1 = _rec_field(recommendation, "prob_tp1")
+    p2 = _rec_field(recommendation, "prob_tp2")
+
+    if prov is None:
+        # Sem proveniência de probabilidade nenhuma.
+        if isinstance(score_prov, dict) and score_prov.get("fallback_used") is True:
+            return _bloqueia("score veio de fallback de fórmula e o contrato de "
+                             "probabilidade está ausente",
+                             PROB_REASON_PROVENANCE_MISSING)
+        if require_current_contract:
+            return _bloqueia("recomendação sem contrato de probabilidade — o "
+                             "caminho de execução exige contrato atual",
+                             PROB_REASON_PROVENANCE_MISSING)
+        return {"ok": True, "blocked_by": None, "reason": None,
+                "status": None, "reason_code": None}
+
+    if not isinstance(prov, dict):
+        return _bloqueia("contrato de probabilidade malformado",
+                         PROB_REASON_PROVENANCE_MALFORMED)
+
+    status = prov.get("status")
+    if not isinstance(status, str) or status not in PROB_STATUSES:
+        return _bloqueia("estado do contrato de probabilidade desconhecido",
+                         PROB_REASON_STATUS_UNKNOWN)
+
+    code = prov.get("reason_code")
+    code = code if isinstance(code, str) and code in PROB_REASON_CODES else None
+
+    if status in BLOCKING_PROB_STATUSES:
+        return {"ok": False, "blocked_by": CALIBRATION_CONTRACT_GATE,
+                "reason": _CONTRACT_REASON_PT[status],
+                "status": status, "reason_code": code}
+
+    if not _envelope_ok(prov):
+        return _bloqueia("contrato de probabilidade sem versão ou motivo "
+                         "reconhecidos", PROB_REASON_PROVENANCE_MALFORMED)
+
+    if status == PROB_STATUS_CALIBRATION_UNAVAILABLE:
+        if not _unavailable_consistente(prov, p1, p2):
+            return _bloqueia("contrato declara calibração indisponível mas traz "
+                             "probabilidade preenchida",
+                             PROB_REASON_UNAVAILABLE_WITH_PROB)
         return {"ok": True, "blocked_by": None, "reason": None,
                 "status": status, "reason_code": code}
 
-    # Sem proveniência legível. Payload antigo (pré-R06B2) segue passando; mas
-    # uma rec NOVA cujo score veio de fallback de fórmula e que não conseguiu
-    # declarar o contrato não pode virar ordem.
-    score_prov = _rec_field(recommendation, "score_provenance")
-    if isinstance(score_prov, dict) and score_prov.get("fallback_used") is True:
-        return {"ok": False, "blocked_by": CALIBRATION_CONTRACT_GATE,
-                "reason": ("score veio de fallback de fórmula e o contrato de "
-                           "probabilidade está ausente ou malformado"),
-                "status": PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
-                "reason_code": PROB_REASON_PROVENANCE_MISSING}
+    # status == READY
+    if not _ready_consistente(prov, p1, p2):
+        return _bloqueia("contrato declara READY mas está incompleto ou "
+                         "inconsistente", PROB_REASON_READY_INCOMPLETE)
     return {"ok": True, "blocked_by": None, "reason": None,
-            "status": None, "reason_code": None}
+            "status": status, "reason_code": code}
+
+
+def contract_is_blocking(recommendation, *, require_current_contract: bool = False) -> bool:
+    """Atalho booleano do MESMO helper — para quem só precisa do sim/não."""
+    return not calibration_contract_verdict(
+        recommendation, require_current_contract=require_current_contract)["ok"]
+
+
+def probabilities_from_contract(payload) -> Tuple[Optional[float], Optional[float]]:
+    """Probabilidades PERSISTIDAS, devolvidas só se o contrato gravado era READY.
+
+    R06B2.1: histórico não é recalculado com o cache de hoje. Sem proveniência
+    (registro legado) ou com contrato não-READY ⇒ ausência nos dois valores.
+    Zero legítimo continua zero — a checagem é por `None`, não por falsidade.
+    """
+    if not isinstance(payload, dict):
+        return None, None
+    prov = payload.get("probability_provenance")
+    if not isinstance(prov, dict) or prov.get("status") != PROB_STATUS_READY:
+        return None, None
+    p1 = payload.get("prob_tp1")
+    p2 = payload.get("prob_tp2")
+    veredito = calibration_contract_verdict(
+        {"probability_provenance": prov,
+         "score_provenance": payload.get("score_provenance"),
+         "prob_tp1": p1, "prob_tp2": p2},
+        require_current_contract=True,
+    )
+    if not veredito["ok"]:
+        return None, None
+    return _unit_prob(p1), _unit_prob(p2)
 
 
 # ── Lookups LEGADOS ─────────────────────────────────────────────────────────

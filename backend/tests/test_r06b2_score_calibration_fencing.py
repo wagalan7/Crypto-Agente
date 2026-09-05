@@ -555,17 +555,27 @@ class IntegracaoNaRecomendacao(unittest.TestCase):
 class BloqueioDaAutoexecucao(unittest.TestCase):
 
     def _rec(self, status=None, *, fallback_used=False, reason_code=None, **extra):
+        """Rec com contrato BEM FORMADO por padrão (o R06B2.1 exige envelope
+        íntegro e coerência entre status, bin e probabilidade)."""
         rec = {"symbol": "TESTUSDT", "entry": 100.0, "stop_loss": 98.0,
                "tp1": 104.0, "tp2": 108.0, "score": 70.0, "edge_score": 2,
                "score_provenance": {"formula_effective": V2,
                                     "fallback_used": fallback_used}}
         if status is not None:
+            pronto = status == calib.PROB_STATUS_READY
+            if reason_code is None:
+                reason_code = (calib.PROB_REASON_OK if pronto
+                               else calib.PROB_REASON_NO_CALIBRATION)
             rec["probability_provenance"] = {
                 "contract_version": calib.CALIBRATION_CONTRACT_VERSION,
                 "status": status, "reason_code": reason_code,
                 "score_formula_effective": V2, "calibration_formula": V2,
-                "bins_version": "x", "bin_index": 1, "fallback_used": fallback_used,
+                "bins_version": calib.bins_version(),
+                "bin_index": 1 if pronto else None,
+                "fallback_used": fallback_used,
             }
+            if pronto:
+                rec["prob_tp1"], rec["prob_tp2"] = 0.55, 0.25
         rec.update(extra)
         return rec
 
@@ -643,12 +653,12 @@ class BloqueioDaAutoexecucao(unittest.TestCase):
                       shadow_src)
         # ponte única no shadow, usada pelos dois caminhos
         self.assertEqual(shadow_src.count("def _calibration_contract_verdict("), 1)
-        self.assertEqual(shadow_src.count("= _calibration_contract_verdict(rec)"), 2)
+        self.assertEqual(shadow_src.count("= _calibration_contract_verdict(rec"), 2)
 
     def test_bloqueio_ocorre_antes_de_qualquer_ordem(self):
         fonte = _fonte_de_funcao("services/shadow_trade_service.py",
                                  "open_shadow_for_recs")
-        gate = fonte.index("_calibration_contract_verdict(rec)")
+        gate = fonte.index("_calibration_contract_verdict(rec")
         self.assertLess(gate, fonte.index("await exchange_service.place_order"))
         self.assertLess(gate, fonte.index("place_maker_entry_then_protect"))
         self.assertLess(gate, fonte.index("[rr-gate]"))
@@ -671,7 +681,7 @@ class BloqueioDaAutoexecucao(unittest.TestCase):
     def test_skip_e_explicavel_e_sem_segredo(self):
         fonte = _fonte_de_funcao("services/shadow_trade_service.py",
                                  "open_shadow_for_recs")
-        trecho = fonte.split("_calibration_contract_verdict(rec)")[1][:600]
+        trecho = fonte.split("_calibration_contract_verdict(rec")[1][:600]
         self.assertIn("_record_skip", trecho)
         self.assertIn("continue", trecho)
         for proibido in ("API_KEY", "SECRET", "token", "Traceback"):
@@ -688,7 +698,7 @@ class Sizing(unittest.TestCase):
             with self.subTest(status=status):
                 tamanho, motivo = rs._compute_dynamic_size(
                     score=80.0, tier="A", risk_reward=2.0, prob_tp1=None,
-                    atr_pct=0.02, probability_status=status)
+                    atr_pct=0.02, probability_contract_blocking=True)
                 self.assertIsNone(tamanho)
                 self.assertIn("Calibração incompatível", motivo)
                 self.assertNotIn("Kelly", motivo)
@@ -698,7 +708,7 @@ class Sizing(unittest.TestCase):
         """Defesa em profundidade: nem uma prob presente reabre o sizing."""
         tamanho, motivo = rs._compute_dynamic_size(
             score=80.0, tier="A", risk_reward=2.0, prob_tp1=0.9, atr_pct=0.02,
-            probability_status=calib.PROB_STATUS_FORMULA_MISMATCH)
+            probability_contract_blocking=True)
         self.assertIsNone(tamanho)
         self.assertIn("Calibração incompatível", motivo)
 
@@ -707,7 +717,7 @@ class Sizing(unittest.TestCase):
             score=80.0, tier="A", risk_reward=2.0, prob_tp1=0.7, atr_pct=0.02)
         depois = rs._compute_dynamic_size(
             score=80.0, tier="A", risk_reward=2.0, prob_tp1=0.7, atr_pct=0.02,
-            probability_status=calib.PROB_STATUS_READY)
+            probability_contract_blocking=False)
         self.assertEqual(antes, depois)
 
     def test_calibracao_indisponivel_preserva_o_fallback_por_tier(self):
@@ -715,7 +725,7 @@ class Sizing(unittest.TestCase):
             score=80.0, tier="A", risk_reward=2.0, prob_tp1=None, atr_pct=0.02)
         depois = rs._compute_dynamic_size(
             score=80.0, tier="A", risk_reward=2.0, prob_tp1=None, atr_pct=0.02,
-            probability_status=calib.PROB_STATUS_CALIBRATION_UNAVAILABLE)
+            probability_contract_blocking=False)
         self.assertEqual(antes, depois)
         self.assertIsNotNone(depois[0])
         self.assertIn(f"p={rs._TIER_WR_FALLBACK['A']*100:.0f}%", depois[1])
@@ -744,7 +754,11 @@ class Sizing(unittest.TestCase):
 class RegressaoEEscopo(unittest.TestCase):
 
     def _diff(self, *caminhos):
-        res = subprocess.run(["git", "diff", "--name-only", "14102771", "--", *caminhos],
+        """Escopo do R06B2 = o RANGE de commits do R06B2 (14102771..8ae87567).
+        Comparar com a árvore de trabalho faria uma fase posterior autorizada
+        (R06B2.1) quebrar esta garantia retroativamente."""
+        res = subprocess.run(["git", "diff", "--name-only", "14102771", "8ae87567",
+                              "--", *caminhos],
                              cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
             self.skipTest("baseline 14102771 indisponível neste checkout")
@@ -788,7 +802,7 @@ class RegressaoEEscopo(unittest.TestCase):
 
     def test_sem_coluna_migration_env_flag_ou_endpoint(self):
         res = subprocess.run(
-            ["git", "diff", "--unified=0", "14102771", "--",
+            ["git", "diff", "--unified=0", "14102771", "8ae87567", "--",
              "backend/db.py", "backend/models", "backend/main.py"],
             cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
@@ -798,7 +812,7 @@ class RegressaoEEscopo(unittest.TestCase):
         for arquivo in ("calibration_service.py", "recommendation_service.py",
                         "shadow_trade_service.py"):
             novo = subprocess.run(
-                ["git", "diff", "--unified=0", "14102771", "--",
+                ["git", "diff", "--unified=0", "14102771", "8ae87567", "--",
                  f"backend/services/{arquivo}"],
                 cwd=BACKEND.parent, capture_output=True, text=True).stdout
             adicionadas = [ln for ln in novo.splitlines()
