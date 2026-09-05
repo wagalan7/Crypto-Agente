@@ -2,7 +2,7 @@
 Entry Planner — Sprint B:
 
 1) Entradas inteligentes (limit orders, não market):
-   - Pullback ao EMA21 / VWAP / OrderBlock / FVG / VAL-VAH
+   - Pullback ao EMA26 / VWAP / OrderBlock / FVG / VAL-VAH
    - Retest de breakout
 
 2) Stops estruturais (não ATR cego):
@@ -35,7 +35,7 @@ from models.trade_signal import (
 class LevelReasoning(BaseModel):
     price: float
     reason: str             # PT-BR
-    source: str             # ex: "ema21" | "pivot_low" | "order_block" | "fvg" | "vah" | "atr_fallback"
+    source: str             # ex: "ema26" | "pivot_low" | "order_block" | "fvg" | "vah" | "atr_fallback"
 
 
 class EntryZone(BaseModel):
@@ -210,15 +210,15 @@ def _pick_entry_zone_long(
     if fade:
         candidates.append(fade)
 
-    # EMA21 pullback
-    ema21 = ind.ema21
-    if ema21 and ema21 < current_price * 0.999:
-        dist_pct = (current_price - ema21) / current_price
+    # EMA26 pullback
+    ema26 = ind.ema26
+    if ema26 and ema26 < current_price * 0.999:
+        dist_pct = (current_price - ema26) / current_price
         if dist_pct <= EMA_PULLBACK_MAX_DIST:
             candidates.append(EntryZone(
-                top=ema21 + band / 2, bottom=ema21 - band / 2, mid=ema21,
+                top=ema26 + band / 2, bottom=ema26 - band / 2, mid=ema26,
                 type="limit_pullback",
-                description=f"Pullback à EMA21 ({ema21:.6g}) — média dinâmica como suporte.",
+                description=f"Pullback à EMA26 ({ema26:.6g}) — média dinâmica como suporte.",
             ))
 
     # VWAP pullback
@@ -292,14 +292,14 @@ def _pick_entry_zone_short(
     if fade:
         candidates.append(fade)
 
-    ema21 = ind.ema21
-    if ema21 and ema21 > current_price * 1.001:
-        dist_pct = (ema21 - current_price) / current_price
+    ema26 = ind.ema26
+    if ema26 and ema26 > current_price * 1.001:
+        dist_pct = (ema26 - current_price) / current_price
         if dist_pct <= EMA_PULLBACK_MAX_DIST:
             candidates.append(EntryZone(
-                top=ema21 + band / 2, bottom=ema21 - band / 2, mid=ema21,
+                top=ema26 + band / 2, bottom=ema26 - band / 2, mid=ema26,
                 type="limit_pullback",
-                description=f"Pullback à EMA21 ({ema21:.6g}) — média dinâmica como resistência.",
+                description=f"Pullback à EMA26 ({ema26:.6g}) — média dinâmica como resistência.",
             ))
 
     if vp_vwap:

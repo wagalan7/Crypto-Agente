@@ -204,17 +204,17 @@ def calculate_confluence(
             ))
 
     # ── 2. Trend: EMAs ────────────────────────────────────────────────────────
-    if ind.ema9 and ind.ema21 and ind.ema50:
-        if direction == SignalDirection.LONG and ind.ema9 > ind.ema21 > ind.ema50:
+    if ind.ema12 and ind.ema26 and ind.ema50:
+        if direction == SignalDirection.LONG and ind.ema12 > ind.ema26 > ind.ema50:
             factors.append(ConfluenceFactor(
-                name="EMAs alinhadas em alta (9>21>50)",
+                name="EMAs alinhadas em alta (12>26>50)",
                 category="trend",
                 points=18, max_points=18, aligned=True,
                 description="Estrutura de médias confirma tendência de alta em múltiplas janelas."
             ))
-        elif direction == SignalDirection.SHORT and ind.ema9 < ind.ema21 < ind.ema50:
+        elif direction == SignalDirection.SHORT and ind.ema12 < ind.ema26 < ind.ema50:
             factors.append(ConfluenceFactor(
-                name="EMAs alinhadas em baixa (9<21<50)",
+                name="EMAs alinhadas em baixa (12<26<50)",
                 category="trend",
                 points=18, max_points=18, aligned=True,
                 description="Estrutura de médias confirma tendência de baixa em múltiplas janelas."

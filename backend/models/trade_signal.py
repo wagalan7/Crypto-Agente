@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing import Optional, List
 from enum import Enum
 
@@ -70,10 +70,19 @@ class Indicator(BaseModel):
     bb_upper: Optional[float] = None
     bb_middle: Optional[float] = None
     bb_lower: Optional[float] = None
-    ema9: Optional[float] = None
-    ema21: Optional[float] = None
+    # ── EMAs ──────────────────────────────────────────────────────────────
+    # R06B1: os nomes canônicos carregam o PERÍODO REALMENTE calculado. O
+    # histórico gravava EMA(12) em `ema9` e EMA(26) em `ema21` — nome errado,
+    # VALOR correto (é o comportamento champion e ele NÃO muda aqui).
+    # `ema9`/`ema21` continuam publicados como ALIAS legado: espelho puro dos
+    # canônicos, nunca um segundo cálculo. Invariante: ema9 == ema12 e
+    # ema21 == ema26, em qualquer caminho de construção ou desserialização.
+    ema12: Optional[float] = None
+    ema26: Optional[float] = None
     ema50: Optional[float] = None
     ema200: Optional[float] = None
+    ema9: Optional[float] = None    # alias legado de ema12 — NÃO é EMA(9)
+    ema21: Optional[float] = None   # alias legado de ema26 — NÃO é EMA(21)
     atr: Optional[float] = None
     adx: Optional[float] = None
     stoch_k: Optional[float] = None
@@ -89,6 +98,22 @@ class Indicator(BaseModel):
     supertrend_direction: Optional[int] = None
     pivot_high: Optional[float] = None
     pivot_low: Optional[float] = None
+
+    @model_validator(mode="after")
+    def _mirror_legacy_ema_aliases(self) -> "Indicator":
+        """Mantém o alias legado colado no canônico — sem recalcular nada.
+
+        Construção pelo nome legado (código/payload antigo) preenche o canônico;
+        depois o canônico passa a ser a única fonte da verdade e o legado é
+        reescrito como cópia dele. Idempotente: roda igual na desserialização.
+        """
+        if self.ema12 is None and self.ema9 is not None:
+            self.ema12 = self.ema9
+        if self.ema26 is None and self.ema21 is not None:
+            self.ema26 = self.ema21
+        self.ema9 = self.ema12
+        self.ema21 = self.ema26
+        return self
 
 
 class ConfluenceFactor(BaseModel):

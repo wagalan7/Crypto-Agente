@@ -145,19 +145,27 @@ class PeriodosDeEma(unittest.TestCase):
         self.assertTrue(all(pd.isna(v) for v in lib[:4]))
         self.assertFalse(pd.isna(lib.iloc[4]))
 
-    def test_campo_ema9_carrega_periodo_12(self):
-        """DEFEITO (nomenclatura): o campo `ema9` NÃO é uma EMA de 9 períodos."""
+    def test_campo_ema12_carrega_periodo_12(self):
+        """R06B1: o campo canônico `ema12` carrega a EMA de 12 períodos."""
         closes = _oscilacao(120)
         out = ind_svc.calculate_indicators(_df(closes))
-        self.assertAlmostEqual(out.ema9, round(ema_reference(closes, 12)[-1], 6), places=5)
-        self.assertNotAlmostEqual(out.ema9, ema_reference(closes, 9)[-1], places=3)
+        self.assertAlmostEqual(out.ema12, round(ema_reference(closes, 12)[-1], 6), places=5)
+        self.assertNotAlmostEqual(out.ema12, ema_reference(closes, 9)[-1], places=3)
 
-    def test_campo_ema21_carrega_periodo_26(self):
-        """DEFEITO (nomenclatura): o campo `ema21` NÃO é uma EMA de 21 períodos."""
+    def test_campo_ema26_carrega_periodo_26(self):
+        """R06B1: o campo canônico `ema26` carrega a EMA de 26 períodos."""
         closes = _oscilacao(120)
         out = ind_svc.calculate_indicators(_df(closes))
-        self.assertAlmostEqual(out.ema21, round(ema_reference(closes, 26)[-1], 6), places=5)
-        self.assertNotAlmostEqual(out.ema21, ema_reference(closes, 21)[-1], places=3)
+        self.assertAlmostEqual(out.ema26, round(ema_reference(closes, 26)[-1], 6), places=5)
+        self.assertNotAlmostEqual(out.ema26, ema_reference(closes, 21)[-1], places=3)
+
+    def test_alias_legado_espelha_o_canonico(self):
+        """R06B1: `ema9`/`ema21` sobrevivem como ALIAS — mesmo valor, sem
+        recálculo. Continuam NÃO sendo EMA(9)/EMA(21)."""
+        closes = _oscilacao(120)
+        out = ind_svc.calculate_indicators(_df(closes))
+        self.assertEqual(out.ema9, out.ema12)
+        self.assertEqual(out.ema21, out.ema26)
 
     def test_ema50_e_ema200_conferem_com_o_nome(self):
         closes = _oscilacao(260)
@@ -180,43 +188,47 @@ class PeriodosDeEma(unittest.TestCase):
         for n in (0, 1, 20, 49):
             out = ind_svc.calculate_indicators(_df(_tendencia(max(n, 1))[:n] or [1.0]))
             if n < 50:
-                self.assertIsNone(out.ema9, f"n={n}")
+                self.assertIsNone(out.ema12, f"n={n}")
                 self.assertIsNone(out.rsi, f"n={n}")
 
     def test_serie_constante_produz_emas_iguais(self):
         out = ind_svc.calculate_indicators(_df(_constante(120, 250.0)))
-        for campo in ("ema9", "ema21", "ema50"):
+        for campo in ("ema12", "ema26", "ema50"):
             self.assertAlmostEqual(getattr(out, campo), 250.0, places=6, msg=campo)
 
     def test_precos_muito_pequenos_nao_colapsam(self):
         closes = _precos_pequenos(120)
         out = ind_svc.calculate_indicators(_df(closes, high_pad=1e-9, low_pad=1e-9))
-        self.assertIsNotNone(out.ema9)
-        self.assertGreater(out.ema9, 0.0)
+        self.assertIsNotNone(out.ema12)
+        self.assertGreater(out.ema12, 0.0)
         # o arredondamento de saída não pode zerar um preço de 1e-6
-        self.assertNotEqual(out.ema9, 0.0)
+        self.assertNotEqual(out.ema12, 0.0)
 
-    def test_DEFEITO_nan_no_ultimo_close_e_ignorado_silenciosamente(self):
-        """DEFEITO (robustez): um `close` NaN no candle mais recente NÃO
-        invalida o indicador — `ewm` carrega o último valor válido e `_safe`
-        devolve um número que parece atual. O consumidor não tem como saber
-        que o candle mais novo estava corrompido."""
+    def test_CORRIGIDO_nan_no_ultimo_close_falha_fechado(self):
+        """R06B1: o defeito F3 do R06A está corrigido.
+
+        Antes, um `close` NaN no candle mais recente era ignorado — `ewm`
+        carregava o último valor válido e o indicador saía com cara de atual.
+        Agora o contrato é vazio: nada de indicador para candle corrompido.
+        """
         closes = _tendencia(120)
         closes[-1] = float("nan")
         out = ind_svc.calculate_indicators(_df(closes))
-        self.assertIsNotNone(out.ema9)          # comportamento ATUAL
+        self.assertIsNone(out.ema12)
+        self.assertIsNone(out.ema9)
+        self.assertIsNone(out.rsi)
+        self.assertIsNone(out.atr)
+        # e NÃO o valor da série sem o candle corrompido (o antigo comportamento)
         limpo = ind_svc.calculate_indicators(_df(_tendencia(120)[:-1]))
-        # o valor devolvido é o da série SEM o candle corrompido
-        self.assertAlmostEqual(out.ema9, limpo.ema9, places=6)
+        self.assertIsNotNone(limpo.ema12)
 
-    def test_DEFEITO_safe_deixa_passar_infinito(self):
-        """DEFEITO: `_safe` filtra NaN mas devolve `inf` como se fosse número."""
+    def test_CORRIGIDO_safe_rejeita_infinito(self):
+        """R06B1: o defeito F2 do R06A está corrigido — `_safe` só aceita finito."""
         self.assertIsNone(ind_svc._safe(pd.Series([1.0, float("nan")])))
         self.assertIsNone(ind_svc._safe(None))
         self.assertIsNone(ind_svc._safe(pd.Series([], dtype=float)))
-        # Comportamento ATUAL, caracterizado e NÃO corrigido neste pacote:
-        self.assertEqual(ind_svc._safe(pd.Series([1.0, float("inf")])), float("inf"))
-        self.assertEqual(ind_svc._safe(pd.Series([1.0, float("-inf")])), float("-inf"))
+        self.assertIsNone(ind_svc._safe(pd.Series([1.0, float("inf")])))
+        self.assertIsNone(ind_svc._safe(pd.Series([1.0, float("-inf")])))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -224,27 +236,29 @@ class PeriodosDeEma(unittest.TestCase):
 # ════════════════════════════════════════════════════════════════════════════
 class ConsumidoresDeEma(unittest.TestCase):
 
-    def test_alinhamento_usa_os_campos_com_nome_9_21_50(self):
+    def test_alinhamento_usa_os_campos_canonicos(self):
+        """R06B1: consumidores internos migraram para ema12/ema26."""
         fonte = (BACKEND / "services" / "indicator_service.py").read_text()
-        self.assertIn("if ind.ema9 > ind.ema21 > ind.ema50:", fonte)
+        self.assertIn("if ind.ema12 > ind.ema26 > ind.ema50:", fonte)
         for arquivo in ("mtf_service.py", "confluence_service.py",
                         "recommendation_backtest.py"):
             texto = (BACKEND / "services" / arquivo).read_text()
-            self.assertIn("ema9", texto, arquivo)
-            self.assertIn("ema21", texto, arquivo)
+            self.assertIn("ind.ema12", texto, arquivo)
+            self.assertIn("ind.ema26", texto, arquivo)
 
-    def test_documentacao_do_regime_afirma_9_21_50(self):
-        """O comentário do `regime_service` descreve EMA9/21/50 — o que o código
-        realmente empilha é 12/26/50. Divergência de DOCUMENTAÇÃO."""
+    def test_documentacao_do_regime_afirma_12_26_50(self):
+        """R06B1: o comentário do `regime_service` agora descreve o que o código
+        realmente empilha."""
         texto = (BACKEND / "services" / "regime_service.py").read_text()
-        self.assertIn("EMA9/21/50", texto)
+        self.assertIn("EMA12/26/50", texto)
+        self.assertNotIn("EMA9/21/50", texto)
 
-    def test_entry_planner_ancora_no_campo_ema21(self):
-        """A zona de pullback é rotulada `EMA21` mas usa a EMA de 26 períodos."""
+    def test_entry_planner_ancora_no_campo_ema26(self):
+        """R06B1: a zona de pullback passa a se chamar pelo período que usa."""
         texto = (BACKEND / "services" / "entry_planner.py").read_text()
-        self.assertIn("ema21 = ind.ema21", texto)
-        self.assertIn("Pullback à EMA21", texto)
-        self.assertIn("# EMA21 pullback", texto)
+        self.assertIn("ema26 = ind.ema26", texto)
+        self.assertIn("Pullback à EMA26", texto)
+        self.assertIn("# EMA26 pullback", texto)
 
     def _rotulo(self, e_curta, e_media, e_longa):
         if e_curta > e_media > e_longa:
@@ -291,8 +305,8 @@ class SemanticaConfidence(unittest.TestCase):
         from models.trade_signal import DetectedPattern, SignalDirection
         from services import signal_service
 
-        ind = Indicator(rsi=25.0, macd=1.0, macd_signal=0.5, ema9=3.0,
-                        ema21=2.0, ema50=1.0, bb_upper=110.0, bb_lower=90.0,
+        ind = Indicator(rsi=25.0, macd=1.0, macd_signal=0.5, ema12=3.0,
+                        ema26=2.0, ema50=1.0, bb_upper=110.0, bb_lower=90.0,
                         stoch_k=10.0, stoch_d=10.0, adx=30.0)
         valor = signal_service.calculate_confidence(
             ind, [], SignalDirection.LONG, 89.0)
@@ -339,16 +353,15 @@ class SemanticaScore(unittest.TestCase):
         from services import recommendation_service as rs
         self.assertIsNone(rs._compute_score_v2(None, None, None))
 
-    def test_fallback_para_legado_muda_a_escala(self):
-        """DEFEITO DE CONTRATO: V2 e legado vivem em escalas diferentes, e o
-        fallback é silencioso — o consumidor não sabe qual fórmula produziu o
-        número que ele vai binar."""
+    def test_fallback_para_legado_deixou_de_ser_silencioso(self):
+        """R06B1: V2 e legado seguem em escalas diferentes (isso é o R06B2),
+        mas o fallback agora REGISTRA qual fórmula produziu o número."""
         fonte = (BACKEND / "services" / "recommendation_service.py").read_text()
-        bloco = fonte.split("def _compute_score(")[1].split("\ndef ")[0]
+        bloco = fonte.split("def compute_score_with_provenance(")[1].split("\ndef ")[0]
         self.assertIn("if v2 is not None:", bloco)
         self.assertIn("SCORE_FORMULA_V2", bloco)
-        # nenhum campo registra qual fórmula gerou o score
-        self.assertNotIn("score_formula_used", fonte)
+        self.assertIn("formula_effective", bloco)
+        self.assertIn("score_provenance: Optional[dict] = None", fonte)
 
     def test_bins_da_calibracao_seguem_a_mesma_flag(self):
         fonte = (BACKEND / "services" / "calibration_service.py").read_text()
@@ -448,14 +461,17 @@ class SemanticaProbabilidades(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertEqual(out["total_resolved"], 1)
 
-    def test_DEFEITO_fonte_e_shadow_apesar_do_nome_real(self):
-        """DEFEITO (nomenclatura): `_load_real_pairs` lê `RecommendationSnapshot`
-        (SHADOW / resultado de setup), não `RealTrade` (dinheiro executado)."""
+    def test_CORRIGIDO_fonte_shadow_tem_nome_shadow(self):
+        """R06B1: o defeito F6 do R06A está corrigido — o loader diz SHADOW,
+        e continua lendo `RecommendationSnapshot` (nunca `RealTrade`)."""
         fonte = (BACKEND / "services" / "calibration_service.py").read_text()
-        bloco = fonte.split("async def _load_real_pairs")[1].split("\nasync def ")[0]
+        bloco = fonte.split("async def _load_shadow_pairs")[1].split("\nasync def ")[0]
         self.assertIn("RecommendationSnapshot", bloco)
-        self.assertNotIn("RealTrade", bloco)
-        self.assertIn("trades REAIS", bloco)     # texto atual, impreciso
+        self.assertIn("SHADOW", bloco)
+        self.assertNotIn("trades REAIS", bloco)
+        # a query em si não toca no financeiro
+        query = bloco.split('"""')[2]
+        self.assertNotIn("RealTrade", query)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -557,7 +573,11 @@ class EscopoDoPacote(unittest.TestCase):
                         "backend/services/confluence_service.py",
                         "backend/services/mtf_service.py",
                         "backend/services/regime_service.py"):
-            res = subprocess.run(["git", "diff", "--name-only", "61265ed1", "--", caminho],
+            # Escopo do R06A = o RANGE de commits do R06A (61265ed1..1f336a0f).
+            # Comparar com a árvore de trabalho faria fases posteriores
+            # autorizadas (R06B1) quebrarem esta garantia retroativamente.
+            res = subprocess.run(["git", "diff", "--name-only", "61265ed1", "1f336a0f",
+                                  "--", caminho],
                                  cwd=BACKEND.parent, capture_output=True, text=True)
             if res.returncode != 0:
                 self.skipTest("baseline 61265ed1 indisponível neste checkout")
@@ -566,8 +586,8 @@ class EscopoDoPacote(unittest.TestCase):
 
     def test_dist_do_frontend_intacto(self):
         import subprocess
-        res = subprocess.run(["git", "diff", "--name-only", "61265ed1", "--",
-                              "frontend/dist"],
+        res = subprocess.run(["git", "diff", "--name-only", "61265ed1", "1f336a0f",
+                              "--", "frontend/dist"],
                              cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
             self.skipTest("baseline indisponível")

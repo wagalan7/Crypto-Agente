@@ -1379,3 +1379,49 @@ prospectiva quando disponível e hipóteses SOMENTE analíticas.
   registrar a fórmula do score e travar a binagem → renomear
   `_load_shadow_pairs` → corrigir a semântica do Kelly. **Nenhum defeito
   aritmético de EMA foi comprovado.**
+
+## R06B1 — contratos seguros de EMA, dados finitos e proveniência do score
+
+Base `1f336a0f` (R06A), branch `main`. Corrige quatro contratos **já
+comprovados** no R06A. Doc: `docs/R06B1_SAFE_EMA_SCORE_CONTRACTS.md`.
+
+- **EMA canônica (F1)**: `ema12`/`ema26`/`ema50`/`ema200` passam a nomear o
+  período realmente calculado. `ema9`/`ema21` sobrevivem como **alias legado**
+  espelhado por um `model_validator` no `Indicator` — `ema9 == ema12` e
+  `ema21 == ema26` sempre, sem recálculo, com os seis campos serializados.
+  Consumidores internos migrados (`indicator_service`, `mtf_service`,
+  `confluence_service`, `recommendation_service`, `recommendation_backtest`,
+  `entry_planner`, `ai_service`, comentário do `regime_service`). Textos
+  corrigidos: `(9>21>50)` → `(12>26>50)`, `Pullback à EMA21` → `EMA26`.
+  **MACD 12/26/9 intocado.**
+- **Finitude (F2)**: novo `_finite` escalar; `_safe` só aceita número real e
+  finito — `NaN`/`±inf`/`bool`/`str`/objeto viram **ausência**, nunca zero.
+  Aplicado também a `volume_*`, `displacement_*`, `atr_pct`, `pivot_*` e à
+  banda final do Supertrend (banda não finita anula preço **e** direção).
+- **Candle inválido (F3)**: `close` mais recente ausente/`NaN`/infinito agora
+  devolve o **contrato vazio já existente** (`Indicator()`), em vez de deixar a
+  lib `ta` propagar o candle anterior como se fosse atual. Sem pipeline
+  paralelo de candles; reutiliza o fail-closed do P04.
+- **Proveniência do score (F5, parte observável)**: `ScoreProvenance`
+  (`score`, `formula_requested`, `formula_effective`, `fallback_used`,
+  `fallback_reason`) com IDs `SCORE_V2`/`LEGACY_V1` e motivo de vocabulário
+  fechado (`V2_NO_COMPONENTS`). Gravada em `Recommendation.score_provenance`,
+  **dentro do JSON já serializado** — sem coluna, migration, ENV, flag,
+  endpoint, worker ou scheduler. `_compute_score` continua devolvendo o mesmo
+  float. **Score, bins, probabilidade, Kelly e sizing inalterados** — bloquear
+  a binagem incompatível é o R06B2.
+- **Calibração (F6)**: `_load_real_pairs` → `_load_shadow_pairs`; o nome antigo
+  vira wrapper que delega, sem duplicar query. Fonte, filtros e amostra
+  idênticos; nenhuma consulta a `RealTrade` introduzida.
+- **Frontend**: tipos declaram canônico + legado; `SignalPanel` lê
+  `ema12 ?? ema9` / `ema26 ?? ema21`. Rótulo já era EMA 12/26/50. `confidence`,
+  limite `0.75`, `ConfidenceBar` e botões preservados.
+- **Testes**: 58 testes R06B1 herméticos verdes (EMA canônica, paridade,
+  finitude, candle inválido, proveniência, calibração, frontend, escopo); os
+  testes de caracterização de F2/F3/F6 no R06A viraram `test_CORRIGIDO_*`.
+  Suíte completa do backend **1.348 verdes** (2 skips pré-existentes do R05C —
+  fixture privada fora do repo). `py_compile`, `tsc --noEmit` e
+  `git diff --check` aprovados.
+- **Limites**: 9/21 **não** foi testado como challenger; **12/26 continua sendo
+  o champion**; nenhuma conclusão de lucratividade; F5 (binagem) e F7 (Kelly)
+  seguem abertos.

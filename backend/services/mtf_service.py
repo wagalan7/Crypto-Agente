@@ -91,10 +91,10 @@ async def _analyze_tf(symbol: str, tf: str) -> Optional[TFDirection]:
 
         # EMAs alignment label
         ema_label = None
-        if ind.ema9 and ind.ema21 and ind.ema50:
-            if ind.ema9 > ind.ema21 > ind.ema50:
+        if ind.ema12 and ind.ema26 and ind.ema50:
+            if ind.ema12 > ind.ema26 > ind.ema50:
                 ema_label = "bullish"
-            elif ind.ema9 < ind.ema21 < ind.ema50:
+            elif ind.ema12 < ind.ema26 < ind.ema50:
                 ema_label = "bearish"
             else:
                 ema_label = "mixed"

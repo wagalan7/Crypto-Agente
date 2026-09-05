@@ -33,6 +33,11 @@ export interface Indicator {
   bb_upper?: number
   bb_middle?: number
   bb_lower?: number
+  // R06B1: nomes canônicos = período real da média. `ema9`/`ema21` são alias
+  // LEGADOS do backend (ema9 === ema12, ema21 === ema26, nunca recalculados) e
+  // seguem chegando durante a transição — ler o canônico, cair no legado.
+  ema12?: number
+  ema26?: number
   ema9?: number
   ema21?: number
   ema50?: number

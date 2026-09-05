@@ -288,8 +288,15 @@ def _load_seed_pairs() -> List[Tuple[float, str]]:
         return []
 
 
-async def _load_real_pairs() -> List[Tuple[float, str]]:
-    """Pares (score, status) dos trades REAIS resolvidos (RecommendationSnapshot)."""
+async def _load_shadow_pairs() -> List[Tuple[float, str]]:
+    """Pares (score, status) dos snapshots SHADOW resolvidos.
+
+    R06B1 (nomenclatura): a fonte é `RecommendationSnapshot` — o registro de
+    RECOMENDAÇÕES do bot, não o financeiro. Trade real com dinheiro vive em
+    `RealTrade` e NÃO é lido aqui. O nome antigo (`_load_real_pairs`) dizia o
+    contrário e induzia a ler a calibração como se fosse P&L executado.
+    Amostra, filtros e resultado são exatamente os de antes.
+    """
     pairs: List[Tuple[float, str]] = []
     if not DB_ENABLED:
         return pairs
@@ -309,8 +316,17 @@ async def _load_real_pairs() -> List[Tuple[float, str]]:
             for sc, st in rows:
                 pairs.append((float(sc), st))
     except Exception as e:
-        log.warning(f"[calibration] DB read (real) falhou: {e}")
+        log.warning(f"[calibration] DB read (shadow) falhou: {e}")
     return pairs
+
+
+async def _load_real_pairs() -> List[Tuple[float, str]]:
+    """Alias LEGADO de `_load_shadow_pairs` — delega, não duplica a query.
+
+    Mantido só pra não quebrar consumidores/testes que ainda chamam o nome
+    antigo. O nome é enganoso (a fonte é SHADOW, não financeira); use o novo.
+    """
+    return await _load_shadow_pairs()
 
 
 async def _load_backtest_pairs(cap: Optional[int]) -> List[Tuple[float, str]]:
@@ -352,7 +368,7 @@ async def _compute_calibration(include_backtest: Optional[bool] = None) -> Optio
     if include_backtest is None:
         include_backtest = _include_backtest_live()
 
-    real_pairs = await _load_real_pairs()
+    real_pairs = await _load_shadow_pairs()
     real_count = len(real_pairs)
     pairs: List[Tuple[float, str]] = list(real_pairs)
 

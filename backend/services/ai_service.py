@@ -104,7 +104,7 @@ Acionável (≥75%): {"SIM" if is_actionable else "NÃO — aguardar confluênci
 === INDICADORES TÉCNICOS ===
   RSI(14): {ind.rsi}
   MACD: {ind.macd} | Sinal: {ind.macd_signal} | Histograma: {ind.macd_hist}
-  EMA12: {ind.ema9} | EMA26: {ind.ema21} | EMA50: {ind.ema50} | EMA200: {ind.ema200}
+  EMA12: {ind.ema12} | EMA26: {ind.ema26} | EMA50: {ind.ema50} | EMA200: {ind.ema200}
   BB Superior: {ind.bb_upper} | Médio: {ind.bb_middle} | Inferior: {ind.bb_lower}
   ATR(14): {ind.atr}
   ADX(14): {ind.adx}
@@ -281,7 +281,7 @@ def _fallback_analysis(signal: TradeSignal) -> str:
     parts.append(
         "3–5. MACRO (DXY/SP500/Nasdaq): Ative a análise IA para contexto macro completo com dados em tempo real."
     )
-    ind_text = f"EMA12={ind.ema9} | EMA26={ind.ema21} | RSI={ind.rsi} | ADX={ind.adx} | Supertrend={'Alta' if ind.supertrend_direction == 1 else 'Baixa' if ind.supertrend_direction == -1 else 'N/D'}"
+    ind_text = f"EMA12={ind.ema12} | EMA26={ind.ema26} | RSI={ind.rsi} | ADX={ind.adx} | Supertrend={'Alta' if ind.supertrend_direction == 1 else 'Baixa' if ind.supertrend_direction == -1 else 'N/D'}"
     pat_text = "; ".join(p.description for p in signal.patterns[:2]) if signal.patterns else "Nenhum padrão detectado"
     parts.append(f"6. PAR BTC: {ind_text}. Padrões ({signal.timeframe}): {pat_text}.")
     type_map = {TradeType.SCALP: "Scalp", TradeType.DAY_TRADE: "Day Trade",

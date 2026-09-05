@@ -670,7 +670,7 @@ class SignalAndOutcomeCharacterizationTests(unittest.TestCase):
         def signal(tf, e1, e2, e3):
             return SimpleNamespace(
                 timeframe=tf,
-                indicators=SimpleNamespace(ema9=e1, ema21=e2, ema50=e3),
+                indicators=SimpleNamespace(ema12=e1, ema26=e2, ema50=e3),
                 mtf=None,
             )
 

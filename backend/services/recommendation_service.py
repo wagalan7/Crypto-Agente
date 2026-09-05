@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, NamedTuple, Optional, Dict, Any, Tuple
 from pydantic import BaseModel
 
 from services.binance_service import fetch_top_volume_symbols, fetch_ohlcv, fetch_ticker
@@ -152,14 +152,14 @@ _TF_RANK: Dict[str, int] = {
 
 
 def _ema_aligned_label(sig) -> Optional[str]:
-    """'bullish' | 'bearish' | 'mixed' pelo empilhamento EMA9/21/50 do sinal.
+    """'bullish' | 'bearish' | 'mixed' pelo empilhamento EMA12/26/50 do sinal.
     None se faltar EMA. Tendência PURA (imune ao mean-reversion do determine_direction)."""
     ind = getattr(sig, "indicators", None)
-    if ind is None or ind.ema9 is None or ind.ema21 is None or ind.ema50 is None:
+    if ind is None or ind.ema12 is None or ind.ema26 is None or ind.ema50 is None:
         return None
-    if ind.ema9 > ind.ema21 > ind.ema50:
+    if ind.ema12 > ind.ema26 > ind.ema50:
         return "bullish"
-    if ind.ema9 < ind.ema21 < ind.ema50:
+    if ind.ema12 < ind.ema26 < ind.ema50:
         return "bearish"
     return "mixed"
 
@@ -406,6 +406,14 @@ class Recommendation(BaseModel):
     # edge na execução (shadow_trade_service) e a transparência no app/push.
     edge_tags: List[str] = []
     edge_score: int = 0
+    # ── Proveniência da fórmula do score (R06B1) ──────────────────────────
+    # {score, formula_requested, formula_effective, fallback_used, fallback_reason}
+    # com vocabulário fechado. Puramente OBSERVACIONAL: não altera score, tier,
+    # probabilidade, Kelly nem sizing — existe para o fallback silencioso
+    # V2→legado deixar rastro no JSON que já é serializado. `score` aqui é o
+    # score BASE da fórmula; `Recommendation.score` pode trazer, além dele, o
+    # bônus aditivo de confirmação HTF.
+    score_provenance: Optional[dict] = None
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -498,6 +506,89 @@ def _compute_score_v2(
     return round(max(0.0, min(100.0, num / den)), 1)
 
 
+# ── Proveniência da fórmula de score (R06B1) ─────────────────────────────────
+# O R06A comprovou que a V2 pode cair EM SILÊNCIO na fórmula legada — escala
+# diferente, mesma variável `score` — e nada no sistema registrava qual fórmula
+# produziu aquele número. Aqui a fórmula PEDIDA e a EFETIVA viram dado explícito
+# e testável. Isto não muda o score, os bins, a probabilidade, o Kelly nem o
+# sizing: só torna a incompatibilidade observável para o R06B2 poder bloqueá-la.
+SCORE_FORMULA_V2_ID = "SCORE_V2"
+SCORE_FORMULA_LEGACY_ID = "LEGACY_V1"
+# Vocabulário FECHADO de motivos (nunca mensagem livre de exceção / dado pessoal).
+SCORE_FALLBACK_V2_NO_COMPONENTS = "V2_NO_COMPONENTS"
+SCORE_FALLBACK_REASONS = frozenset({SCORE_FALLBACK_V2_NO_COMPONENTS})
+
+
+class ScoreProvenance(NamedTuple):
+    """Qual fórmula foi pedida, qual de fato produziu o número, e por quê.
+
+    `score` é o score BASE (antes do bônus de confirmação HTF, que é aditivo e
+    independente de fórmula). `fallback_reason` é None quando não houve queda.
+    """
+    score: float
+    formula_requested: str
+    formula_effective: str
+    fallback_used: bool
+    fallback_reason: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "score": self.score,
+            "formula_requested": self.formula_requested,
+            "formula_effective": self.formula_effective,
+            "fallback_used": self.fallback_used,
+            "fallback_reason": self.fallback_reason,
+        }
+
+
+def compute_score_with_provenance(sig: TradeSignal) -> ScoreProvenance:
+    """`_compute_score` + identidade da fórmula. Mesma aritmética, zero desvio."""
+    requested = SCORE_FORMULA_V2_ID if SCORE_FORMULA_V2 else SCORE_FORMULA_LEGACY_ID
+    if SCORE_FORMULA_V2:
+        v2 = _compute_score_v2_for(sig)
+        if v2 is not None:
+            return ScoreProvenance(
+                score=_finish_score(v2, sig.timeframe),
+                formula_requested=requested,
+                formula_effective=SCORE_FORMULA_V2_ID,
+                fallback_used=False,
+                fallback_reason=None,
+            )
+        return ScoreProvenance(
+            score=_compute_score_legacy(sig),
+            formula_requested=requested,
+            formula_effective=SCORE_FORMULA_LEGACY_ID,
+            fallback_used=True,
+            fallback_reason=SCORE_FALLBACK_V2_NO_COMPONENTS,
+        )
+    return ScoreProvenance(
+        score=_compute_score_legacy(sig),
+        formula_requested=requested,
+        formula_effective=SCORE_FORMULA_LEGACY_ID,
+        fallback_used=False,
+        fallback_reason=None,
+    )
+
+
+def _finish_score(raw: float, timeframe: str) -> float:
+    """Relevância por TF (gated, no-op quando off) + clamp/arredondamento finais."""
+    return round(max(0.0, min(100.0, raw * _htf_relevance_mult(timeframe))), 1)
+
+
+def _compute_score_v2_for(sig: TradeSignal) -> Optional[float]:
+    """Extrai os componentes da V2 do sinal. None ⇒ V2 não computável."""
+    conf_pct = sig.confluence.pct if sig.confluence else None
+    adx_raw = sig.indicators.adx if sig.indicators else None
+    der = sig.derivatives
+    funding_pct = None
+    if der:
+        funding_pct = (
+            der.get("funding_rate_pct") if isinstance(der, dict)
+            else getattr(der, "funding_rate_pct", None)
+        )
+    return _compute_score_v2(conf_pct, adx_raw, funding_pct)
+
+
 def _compute_score(sig: TradeSignal) -> float:
     """
     Score 0–100. Combina confluence + MTF + R:R + win-rate histórico + derivatives.
@@ -513,23 +604,16 @@ def _compute_score(sig: TradeSignal) -> float:
 
     V2 (flag SCORE_FORMULA_V2): usa só confluence+ADX+derivatives renormalizados.
     Fallback transparente pra fórmula legada se V2 não for computável.
-    """
-    if SCORE_FORMULA_V2:
-        conf_pct = sig.confluence.pct if sig.confluence else None
-        adx_raw = sig.indicators.adx if sig.indicators else None
-        der = sig.derivatives
-        funding_pct = None
-        if der:
-            funding_pct = (
-                der.get("funding_rate_pct") if isinstance(der, dict)
-                else getattr(der, "funding_rate_pct", None)
-            )
-        v2 = _compute_score_v2(conf_pct, adx_raw, funding_pct)
-        if v2 is not None:
-            # Relevância por TF (gated, no-op quando off) também na fórmula V2.
-            return round(max(0.0, min(100.0, v2 * _htf_relevance_mult(sig.timeframe))), 1)
-        # V2 não computável → cai na fórmula legada abaixo.
 
+    R06B1: o número é o mesmo de sempre; quem precisa saber QUAL fórmula o
+    produziu usa `compute_score_with_provenance`. Este wrapper existe pra não
+    quebrar os consumidores que só querem o float.
+    """
+    return compute_score_with_provenance(sig).score
+
+
+def _compute_score_legacy(sig: TradeSignal) -> float:
+    """Fórmula legada (LEGACY_V1) — aritmética idêntica à de antes do R06B1."""
     conf_score = (sig.confluence.pct if sig.confluence else sig.confidence * 100)
     mtf_score = 50.0
     if sig.mtf:
@@ -573,8 +657,7 @@ def _compute_score(sig: TradeSignal) -> float:
     )
     # Relevância por TF (gated): TF maior = mais relevante. Mult 1.0 (no-op)
     # quando HIGH_TF_PATTERNS_ENABLED off ou TF base. Cap final em 100.
-    score = score * _htf_relevance_mult(sig.timeframe)
-    return round(max(0.0, min(100.0, score)), 1)
+    return _finish_score(score, sig.timeframe)
 
 
 def _derivatives_score(sig: TradeSignal) -> float:
@@ -1420,6 +1503,12 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         prob_tp1 = None
         prob_tp2 = None
 
+    # Proveniência da fórmula do score (R06B1) — read-only, fail-soft, pura.
+    try:
+        score_prov = compute_score_with_provenance(sig).as_dict()
+    except Exception:
+        score_prov = None
+
     # Edges (A+/funding/padrão/MTF) — computados ANTES do sizing/veredito pra
     # alimentar ambos (read-only, alimenta exibição no app + sizing no bot).
     try:
@@ -1531,6 +1620,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         entry_grade=entry_grade,
         edge_tags=edge_tags,
         edge_score=edge_score,
+        score_provenance=score_prov,
     )
 
 

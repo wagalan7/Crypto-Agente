@@ -72,11 +72,13 @@ function generateAnalysis(signal: TradeSignal): string {
     else lines.push(`ADX ${a.toFixed(1)}: Tendência fraca — mercado lateral, maior risco de falso sinal.`)
   }
 
-  // EMAs
-  if (ind.ema9 != null && ind.ema21 != null && ind.ema50 != null) {
-    const [e9, e21, e50] = [ind.ema9, ind.ema21, ind.ema50]
-    if (e9 > e21 && e21 > e50) lines.push(`EMAs alinhadas em alta (12 > 26 > 50) — tendência bullish confirmada.`)
-    else if (e9 < e21 && e21 < e50) lines.push(`EMAs alinhadas em baixa (12 < 26 < 50) — tendência bearish confirmada.`)
+  // EMAs — R06B1: campo canônico primeiro, alias legado como fallback.
+  const ema12 = ind.ema12 ?? ind.ema9
+  const ema26 = ind.ema26 ?? ind.ema21
+  if (ema12 != null && ema26 != null && ind.ema50 != null) {
+    const [e12, e26, e50] = [ema12, ema26, ind.ema50]
+    if (e12 > e26 && e26 > e50) lines.push(`EMAs alinhadas em alta (12 > 26 > 50) — tendência bullish confirmada.`)
+    else if (e12 < e26 && e26 < e50) lines.push(`EMAs alinhadas em baixa (12 < 26 < 50) — tendência bearish confirmada.`)
     else lines.push(`EMAs sem alinhamento claro — mercado em transição ou lateral.`)
   }
 
@@ -158,6 +160,10 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
   const DirIcon = dir.icon
   const tt = TRADE_TYPE_CONFIG[signal.trade_type]
   const currentPrice = livePrice ?? signal.entry
+  // R06B1: `ema12`/`ema26` são os campos canônicos (período real da média).
+  // `ema9`/`ema21` ficam como fallback do payload legado durante a transição.
+  const ema12 = signal.indicators.ema12 ?? signal.indicators.ema9
+  const ema26 = signal.indicators.ema26 ?? signal.indicators.ema21
 
   return (
     <div className="flex flex-col gap-3 h-full overflow-y-auto pr-1">
@@ -324,13 +330,13 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
               </span>
             </>
           )}
-          {signal.indicators.ema9 != null && (
+          {ema12 != null && (
             <>
               <span className="text-xs text-slate-500">EMA 12/26/50</span>
               <span className={`text-xs font-mono font-semibold ${
-                signal.indicators.ema9 > (signal.indicators.ema21 ?? 0) ? 'text-green-400' : 'text-red-400'
+                ema12 > (ema26 ?? 0) ? 'text-green-400' : 'text-red-400'
               }`}>
-                {fmt(signal.indicators.ema9)}
+                {fmt(ema12)}
               </span>
             </>
           )}

@@ -417,7 +417,7 @@ def should_block_recommendation(regime_status: Dict[str, Any], symbol: str, dire
 def symbol_counter_trend(mtf: Optional[Dict[str, Any]], direction: str) -> Optional[str]:
     """Detecta trade CONTRA a tendência da PRÓPRIA moeda via EMA dos TFs superiores.
 
-    Usa o `ema_aligned` (empilhamento de EMA9/21/50) já computado no MTF de cada
+    Usa o `ema_aligned` (empilhamento de EMA12/26/50) já computado no MTF de cada
     TF superior — tendência pura, imune à lógica de mean-reversion do sinal.
     Retorna a razão (str) se o trade é contra-tendência, None caso contrário.
     Fail-open: sem MTF/dados ou gate OFF → None (não interfere).

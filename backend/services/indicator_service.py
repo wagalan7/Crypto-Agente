@@ -1,19 +1,62 @@
 from __future__ import annotations
+import math
+import numbers
 import pandas as pd
 import numpy as np
 import ta
 from models.trade_signal import Indicator
 
 
-def _safe(series: pd.Series) -> float | None:
-    if series is None or series.empty:
+def _finite(value) -> float | None:
+    """Escalar → float SOMENTE se for número real e finito; senão AUSÊNCIA.
+
+    R06B1 (contrato de finitude): NaN, +inf e -inf viram `None`, nunca 0.0 —
+    ausência de indicador não é "indicador zerado". `bool`, `str`, `Decimal`,
+    listas e objetos não são indicadores válidos e também viram ausência.
+    """
+    if value is None or isinstance(value, bool):
         return None
-    v = series.iloc[-1]
-    return float(v) if pd.notna(v) else None
+    if not isinstance(value, (numbers.Real, np.floating, np.integer)):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _safe(series: pd.Series) -> float | None:
+    """Último valor da série como float finito, ou None."""
+    if series is None:
+        return None
+    try:
+        if len(series) == 0:
+            return None
+        last = series.iloc[-1]
+    except (AttributeError, TypeError, IndexError, KeyError):
+        return None
+    return _finite(last)
+
+
+def _last_close_is_valid(df: pd.DataFrame) -> bool:
+    """O candle MAIS RECENTE precisa ter `close` numérico e finito.
+
+    R06B1 (fail-closed): a lib `ta` ignora o furo e propaga o valor do candle
+    anterior, então o indicador SAI com cara de atual e vira falsa confirmação
+    de sinal. Sem close válido no último candle, não se emite indicador.
+    """
+    try:
+        return _finite(df["close"].iloc[-1]) is not None
+    except (AttributeError, TypeError, IndexError, KeyError):
+        return False
 
 
 def calculate_indicators(df: pd.DataFrame) -> Indicator:
     if len(df) < 50:
+        return Indicator()
+
+    # Fail-closed: mesmo contrato vazio já usado para histórico insuficiente.
+    if not _last_close_is_valid(df):
         return Indicator()
 
     close = df["close"]
@@ -37,8 +80,11 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
     bb_lower  = _safe(bb.bollinger_lband())
 
     # ── EMAs ─────────────────────────────────────────────
-    ema9   = _safe(ta.trend.EMAIndicator(close, window=12).ema_indicator())
-    ema21  = _safe(ta.trend.EMAIndicator(close, window=26).ema_indicator())
+    # R06B1: nome canônico = período real. Os períodos 12/26/50/200 são os
+    # do champion e continuam EXATAMENTE os mesmos; só o rótulo foi corrigido.
+    # `ema9`/`ema21` seguem publicados como alias legado (espelho no Indicator).
+    ema12  = _safe(ta.trend.EMAIndicator(close, window=12).ema_indicator())
+    ema26  = _safe(ta.trend.EMAIndicator(close, window=26).ema_indicator())
     ema50  = _safe(ta.trend.EMAIndicator(close, window=50).ema_indicator())
     ema200 = _safe(ta.trend.EMAIndicator(close, window=200).ema_indicator()) if len(df) >= 200 else None
 
@@ -57,9 +103,13 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
     obv = _safe(ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume())
 
     # ── Volume médio 20 períodos + ratio do último candle ────────
-    volume_avg = float(volume.tail(20).mean())
-    volume_last = float(volume.iloc[-1]) if len(volume) > 0 else 0.0
-    volume_ratio = (volume_last / volume_avg) if volume_avg > 0 else None
+    volume_avg = _finite(volume.tail(20).mean())
+    volume_last = _safe(volume)
+    volume_ratio = (
+        (volume_last / volume_avg)
+        if (volume_last is not None and volume_avg is not None and volume_avg > 0)
+        else None
+    )
 
     # ── Displacement das últimas 3 velas (anti-chase) ────────────
     # Mede o quanto o preço já se moveu. Se setup já correu muito
@@ -67,9 +117,9 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
     displacement_3c = None
     displacement_3c_atr = None
     if len(close) >= 4 and atr and atr > 0:
-        c_now = float(close.iloc[-1])
-        c_prev3 = float(close.iloc[-4])
-        if c_prev3 > 0:
+        c_now = _finite(close.iloc[-1])
+        c_prev3 = _finite(close.iloc[-4])
+        if c_now is not None and c_prev3 is not None and c_prev3 > 0:
             displacement_3c = (c_now - c_prev3) / c_prev3
             displacement_3c_atr = (c_now - c_prev3) / atr
 
@@ -78,16 +128,16 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
     # paga slippage demais. Filtro upstream usa isso pra rejeitar.
     atr_pct = None
     if atr and len(close) > 0:
-        c_now_ = float(close.iloc[-1])
-        if c_now_ > 0:
+        c_now_ = _finite(close.iloc[-1])
+        if c_now_ is not None and c_now_ > 0:
             atr_pct = atr / c_now_
 
     # ── Supertrend (implementação manual) ────────────────
     supertrend, supertrend_dir = _calc_supertrend(high, low, close, atr)
 
     # ── Pivot High / Low ─────────────────────────────────
-    pivot_high = float(high.tail(20).max())
-    pivot_low  = float(low.tail(20).min())
+    pivot_high = _finite(high.tail(20).max())
+    pivot_low  = _finite(low.tail(20).min())
 
     def r(v, n=6):
         return round(v, n) if v is not None else None
@@ -100,8 +150,8 @@ def calculate_indicators(df: pd.DataFrame) -> Indicator:
         bb_upper=r(bb_upper),
         bb_middle=r(bb_middle),
         bb_lower=r(bb_lower),
-        ema9=r(ema9),
-        ema21=r(ema21),
+        ema12=r(ema12),
+        ema26=r(ema26),
         ema50=r(ema50),
         ema200=r(ema200),
         atr=r(atr),
@@ -163,7 +213,11 @@ def _calc_supertrend(
                 direction[i] = direction[i - 1]
 
         last_dir = int(direction[-1])
-        last_st = float(lower[-1]) if last_dir == 1 else float(upper[-1])
+        last_st = _finite(lower[-1] if last_dir == 1 else upper[-1])
+        # R06B1: banda não finita ⇒ ausência total (nem preço nem direção).
+        # Publicar só a direção daria confirmação de tendência sem a evidência.
+        if last_st is None:
+            return None, None
         return last_st, last_dir
     except Exception:
         return None, None
@@ -179,10 +233,10 @@ def get_indicator_signals(ind: Indicator, current_price: float) -> dict:
     if ind.macd is not None and ind.macd_signal is not None:
         signals["macd"] = 1 if ind.macd > ind.macd_signal else -1
 
-    if ind.ema9 is not None and ind.ema21 is not None and ind.ema50 is not None:
-        if ind.ema9 > ind.ema21 > ind.ema50:
+    if ind.ema12 is not None and ind.ema26 is not None and ind.ema50 is not None:
+        if ind.ema12 > ind.ema26 > ind.ema50:
             signals["ema_trend"] = 1
-        elif ind.ema9 < ind.ema21 < ind.ema50:
+        elif ind.ema12 < ind.ema26 < ind.ema50:
             signals["ema_trend"] = -1
         else:
             signals["ema_trend"] = 0
