@@ -311,9 +311,29 @@ export interface Recommendation {
   // Tags legíveis + contagem. Read-only — transparência do que o bot valoriza.
   edge_tags?: string[]
   edge_score?: number
-  // Position sizing dinâmico (Kelly fracionado × score × vol) — % da banca sugerido
+  // R06B3 — REFERÊNCIA CONSULTIVA de risco até o TP1, em % da banca. NÃO é o
+  // tamanho da posição, nem notional, nem margem, e NÃO define as ordens do
+  // bot (o executor dimensiona por risk_pct → multiplicadores → qty).
+  // Zero é uma resposta válida (sem edge no modelo); null é ausência.
   suggested_size_pct?: number | null
   size_rationale?: string | null
+  // Proveniência do modelo consultivo. Ausente em payload legado — nesse caso
+  // o valor antigo NÃO deve ser atribuído a este modelo.
+  sizing_provenance?: {
+    version?: string | null
+    model?: string | null
+    mode?: string | null
+    unit?: string | null
+    status?: 'READY' | 'ZERO_REFERENCE' | 'NO_POSITIVE_EDGE' | 'UNAVAILABLE' | string | null
+    reason_code?: string | null
+    probability_used?: number | null
+    rr_tp1?: number | null
+    kelly_full?: number | null
+    raw_pct?: number | null
+    final_pct?: number | null
+    source?: string | null
+    limitations?: string[] | null
+  } | null
   // Liquidez do ticker da varredura (alimenta o gate de liquidez do bot)
   quote_vol_usd?: number | null
   spread_pct?: number | null

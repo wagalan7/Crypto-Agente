@@ -18,6 +18,8 @@ Cache: 30s.
 """
 from __future__ import annotations
 import asyncio
+import math
+import numbers
 import os
 import time
 from typing import List, NamedTuple, Optional, Dict, Any, Tuple
@@ -385,6 +387,12 @@ class Recommendation(BaseModel):
     # Cap [0.25%, 1.0%]. None se não foi possível computar (calib não pronta etc).
     suggested_size_pct: Optional[float] = None
     size_rationale: Optional[str] = None      # explicação curta PT-BR (UI tooltip)
+    # ── Proveniência da referência consultiva de risco (R06B3) ────────────
+    # {version, model, mode, unit, status, reason_code, probability_used,
+    #  rr_tp1, kelly_full, raw_pct, final_pct, source, limitations}.
+    # `final_pct` acompanha o valor final (pós edge/liq) e é igual a
+    # `suggested_size_pct`. ADVISORY_ONLY: nada disso dimensiona ordem real.
+    sizing_provenance: Optional[dict] = None
     # ── Liquidez (do ticker da varredura) + veredito de execução do bot ───
     quote_vol_usd: Optional[float] = None     # volume 24h em USD (alimenta o gate de liquidez)
     spread_pct: Optional[float] = None        # spread bid/ask em %
@@ -1295,71 +1303,300 @@ def _compute_edges(sig: TradeSignal, tier: str) -> tuple[list[str], int]:
     return tags, len(tags)
 
 
+# ── Referência CONSULTIVA de risco até o TP1 (R06B3) ────────────────────────
+# O que esta função é: uma referência TEÓRICA de quanto por cento da banca
+# arriscar, sob um modelo binário deliberadamente simples.
+# O que ela NÃO é: o tamanho das ordens do bot. O executor dimensiona por
+# `risk_pct` → multiplicadores → `_compute_qty` → `LIVE_SIZE_MULT`, e nunca leu
+# `suggested_size_pct`. Espelhar edge/liq no número EXIBIDO não muda isso.
+#
+# Modelo TP1_BINARY_PROXY_V1 (ver docs/R06B3_KELLY_SEMANTICS.md):
+#   • p  = P(TP1) do contrato de probabilidade vigente e válido;
+#   • +b = RR medido até o TP1 (não até o alvo final);
+#   • −1 = perda de 1R quando o stop bate;
+#   • kelly_full = p − (1 − p)/b        (Kelly binário, unidade = fração da banca)
+#
+# Hipóteses ASSUMIDAS, não observadas: encerramento integral no TP1 (o bot real
+# tem parciais, runner e trailing) e expirações tratadas como −1R (a calibração
+# as inclui no conjunto resolvido, mas o resultado financeiro delas não é −1R).
+# Custos, funding e slippage estão FORA. Isto não é resultado líquido, vantagem
+# comprovada nem posição ótima.
+ADVISORY_SIZING_VERSION = "r06b3.1"
+ADVISORY_SIZING_MODEL = "TP1_BINARY_PROXY_V1"
+ADVISORY_SIZING_MODE = "ADVISORY_ONLY"
+ADVISORY_SIZING_UNIT = "BANKROLL_RISK_PCT"
+ADVISORY_SIZING_SOURCE = "prob_tp1 (contrato vigente) + geometria entry/stop_loss/tp1"
+ADVISORY_SIZING_LIMITATIONS = (
+    "assume saída integral no TP1",
+    "expiração tratada como -1R por hipótese do modelo",
+    "sem custos, funding ou slippage",
+    "score, volatilidade e caps são ajustes heurísticos sobre o Kelly puro",
+    "não dimensiona ordens reais",
+)
+
+ADVISORY_STATUS_READY = "READY"
+ADVISORY_STATUS_ZERO_REFERENCE = "ZERO_REFERENCE"
+ADVISORY_STATUS_NO_POSITIVE_EDGE = "NO_POSITIVE_EDGE"
+ADVISORY_STATUS_UNAVAILABLE = "UNAVAILABLE"
+ADVISORY_STATUSES = frozenset({
+    ADVISORY_STATUS_READY, ADVISORY_STATUS_ZERO_REFERENCE,
+    ADVISORY_STATUS_NO_POSITIVE_EDGE, ADVISORY_STATUS_UNAVAILABLE,
+})
+
+# Vocabulário FECHADO. Nunca mensagem crua de exceção, caminho ou dado pessoal.
+ADV_REASON_OK = "OK"
+ADV_REASON_KELLY_NOT_POSITIVE = "KELLY_NOT_POSITIVE"
+ADV_REASON_ZERO_AFTER_HEURISTICS = "ZERO_AFTER_HEURISTICS"
+ADV_REASON_CONTRACT_BLOCKING = "PROBABILITY_CONTRACT_BLOCKING"
+ADV_REASON_PROB_UNAVAILABLE = "PROBABILITY_UNAVAILABLE"
+ADV_REASON_PROB_INVALID = "PROBABILITY_INVALID"
+ADV_REASON_DIRECTION_UNKNOWN = "DIRECTION_UNKNOWN"
+ADV_REASON_PRICES_INVALID = "PRICES_INVALID"
+ADV_REASON_GEOMETRY_INVALID = "GEOMETRY_INVALID"
+ADV_REASON_SCORE_INVALID = "SCORE_INVALID"
+ADV_REASON_ATR_INVALID = "ATR_INVALID"
+ADV_REASON_MULTIPLIER_INVALID = "MULTIPLIER_INVALID"
+ADV_REASON_INTERNAL_ERROR = "INTERNAL_ERROR"
+ADVISORY_REASON_CODES = frozenset({
+    ADV_REASON_OK, ADV_REASON_KELLY_NOT_POSITIVE, ADV_REASON_ZERO_AFTER_HEURISTICS,
+    ADV_REASON_CONTRACT_BLOCKING, ADV_REASON_PROB_UNAVAILABLE,
+    ADV_REASON_PROB_INVALID, ADV_REASON_DIRECTION_UNKNOWN,
+    ADV_REASON_PRICES_INVALID, ADV_REASON_GEOMETRY_INVALID,
+    ADV_REASON_SCORE_INVALID, ADV_REASON_ATR_INVALID,
+    ADV_REASON_MULTIPLIER_INVALID, ADV_REASON_INTERNAL_ERROR,
+})
+
+_ADV_REASON_PT = {
+    ADV_REASON_CONTRACT_BLOCKING: "contrato de probabilidade bloqueante",
+    ADV_REASON_PROB_UNAVAILABLE: "sem P(TP1) calibrada",
+    ADV_REASON_PROB_INVALID: "P(TP1) fora de [0,1]",
+    ADV_REASON_DIRECTION_UNKNOWN: "direção do sinal desconhecida",
+    ADV_REASON_PRICES_INVALID: "preços do plano inválidos",
+    ADV_REASON_GEOMETRY_INVALID: "geometria entry/stop/TP1 incoerente",
+    ADV_REASON_SCORE_INVALID: "score fora de 0–100",
+    ADV_REASON_ATR_INVALID: "ATR% presente mas inválido",
+    ADV_REASON_MULTIPLIER_INVALID: "multiplicador de exibição inválido",
+    ADV_REASON_INTERNAL_ERROR: "falha interna ao calcular a referência",
+}
+
+
+class AdvisoryRisk(NamedTuple):
+    """Referência consultiva + a proveniência que a explica.
+
+    `pct` é `None` só em UNAVAILABLE. Em NO_POSITIVE_EDGE e ZERO_REFERENCE ele é
+    `0.0` — zero é uma resposta, não ausência.
+    """
+    pct: Optional[float]
+    rationale: str
+    provenance: Dict[str, Any]
+
+
+def _adv_finite(value) -> Optional[float]:
+    """Número real e finito, ou None. `bool` nunca é preço, score ou prob."""
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, numbers.Real):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _adv_provenance(status: str, reason_code: str, *, probability_used=None,
+                    rr_tp1=None, kelly_full=None, raw_pct=None,
+                    final_pct=None) -> Dict[str, Any]:
+    """Campo não calculável vira `null` — nunca zero fabricado."""
+    return {
+        "version": ADVISORY_SIZING_VERSION,
+        "model": ADVISORY_SIZING_MODEL,
+        "mode": ADVISORY_SIZING_MODE,
+        "unit": ADVISORY_SIZING_UNIT,
+        "status": status,
+        "reason_code": reason_code,
+        "probability_used": _adv_finite(probability_used),
+        "rr_tp1": _adv_finite(rr_tp1),
+        "kelly_full": _adv_finite(kelly_full),
+        "raw_pct": _adv_finite(raw_pct),
+        "final_pct": _adv_finite(final_pct),
+        "source": ADVISORY_SIZING_SOURCE,
+        "limitations": list(ADVISORY_SIZING_LIMITATIONS),
+    }
+
+
+def _adv_unavailable(reason_code: str, **campos) -> AdvisoryRisk:
+    motivo = _ADV_REASON_PT.get(reason_code, "dados insuficientes")
+    return AdvisoryRisk(
+        None,
+        f"Referência de risco indisponível — {motivo}.",
+        _adv_provenance(ADVISORY_STATUS_UNAVAILABLE, reason_code, **campos),
+    )
+
+
+def _adv_hard_failure() -> AdvisoryRisk:
+    """Contenção de último recurso: dicionário literal, sem chamar nenhum helper.
+
+    O `except` externo não pode depender do mesmo código que acabou de falhar —
+    senão a exceção escapa e derruba a recomendação inteira.
+    """
+    return AdvisoryRisk(
+        None,
+        ("Referência de risco indisponível — "
+         + _ADV_REASON_PT[ADV_REASON_INTERNAL_ERROR] + "."),
+        {
+            "version": ADVISORY_SIZING_VERSION,
+            "model": ADVISORY_SIZING_MODEL,
+            "mode": ADVISORY_SIZING_MODE,
+            "unit": ADVISORY_SIZING_UNIT,
+            "status": ADVISORY_STATUS_UNAVAILABLE,
+            "reason_code": ADV_REASON_INTERNAL_ERROR,
+            "probability_used": None,
+            "rr_tp1": None,
+            "kelly_full": None,
+            "raw_pct": None,
+            "final_pct": None,
+            "source": ADVISORY_SIZING_SOURCE,
+            "limitations": list(ADVISORY_SIZING_LIMITATIONS),
+        },
+    )
+
+
 def _compute_dynamic_size(
-    score: float,
-    tier: str,
-    risk_reward: float,
+    *,
+    direction,
+    entry,
+    stop_loss,
+    tp1,
+    score,
     prob_tp1: Optional[float],
     atr_pct: Optional[float],
-    *,
     probability_contract_blocking: bool = False,
-) -> tuple[Optional[float], str]:
+) -> AdvisoryRisk:
+    """Referência CONSULTIVA de risco (% da banca) até o TP1. Não é o tamanho
+    das ordens reais — ver o bloco de comentário acima.
+
+        b           = |tp1 − entry| / |entry − stop_loss|
+        kelly_full  = p − (1 − p) / b
+        raw_pct     = 100 × kelly_full × KELLY_FRACTION × score_mult × vol_mult
+
+    `score_mult`, `vol_mult` e os caps são AJUSTES HEURÍSTICOS: o resultado
+    ajustado não é o Kelly puro. Não há piso artificial em `b` — RR real abaixo
+    de 0.5 continua real, e um Kelly negativo continua negativo.
     """
-    Position sizing dinâmico via Kelly fracionado × score × volatilidade.
+    try:
+        # 1. Contrato de probabilidade. Bloqueante ⇒ nada de referência, e aqui
+        #    NÃO existe fallback por tier: presumir p por tier era inventar
+        #    probabilidade. A política operacional de risco por tier segue
+        #    intacta em `_compute_leverage` / `risk_pct`.
+        if probability_contract_blocking:
+            return _adv_unavailable(ADV_REASON_CONTRACT_BLOCKING)
 
-    Fórmula:
-        kelly = (p × b − (1−p)) / b   onde b = RR
-        size  = kelly × KELLY_FRACTION × (score/100) × vol_mult
-        vol_mult = clamp(ATR_REF / atr_pct, FLOOR, CEIL)
+        # 2. Direção precisa ser explícita — não se infere LONG por omissão.
+        lado = getattr(direction, "value", direction)
+        lado = lado.lower() if isinstance(lado, str) else None
+        if lado not in ("long", "short"):
+            return _adv_unavailable(ADV_REASON_DIRECTION_UNKNOWN)
 
-    Cap final [SIZE_MIN, SIZE_MAX].
+        # 3. Preços numéricos, finitos e positivos.
+        e = _adv_finite(entry)
+        s = _adv_finite(stop_loss)
+        t = _adv_finite(tp1)
+        if e is None or s is None or t is None or min(e, s, t) <= 0:
+            return _adv_unavailable(ADV_REASON_PRICES_INVALID)
 
-    Returns (size_pct, rationale_text). Retorna (None, motivo) se inputs
-    insuficientes — caller pode optar por usar risk_pct fixo como fallback.
-    """
-    # R06B2: contrato de probabilidade quebrado ⇒ sem sizing. Aqui NÃO vale o
-    # fallback por tier: ele existe para calibração IMATURA (ainda sem amostra),
-    # não para score cuja probabilidade é inválida ou de outra fórmula. A
-    # fórmula de Kelly abaixo não muda; ela apenas não é alcançada.
-    #
-    # R06B2.1: o chamador decide e passa o booleano. A versão anterior importava
-    # `BLOCKING_PROB_STATUSES` aqui e caía num conjunto VAZIO se o import
-    # falhasse — um erro interno virava, silenciosamente, sizing por tier.
-    if probability_contract_blocking:
-        return None, ("Calibração incompatível com a fórmula deste score — "
-                      "sizing dinâmico suspenso")
+        # 4. Geometria coerente com o lado. TP1 inválido NÃO vira TP2.
+        if lado == "long":
+            coerente = s < e < t
+        else:
+            coerente = t < e < s
+        if not coerente:
+            return _adv_unavailable(ADV_REASON_GEOMETRY_INVALID)
 
-    # p_win: prob calibrada, ou fallback por tier (calibração ainda imatura)
-    p = prob_tp1 if prob_tp1 is not None else _TIER_WR_FALLBACK.get(tier)
-    if p is None or risk_reward <= 0:
-        return None, "Dados insuficientes para sizing dinâmico"
+        risk_distance = abs(e - s)
+        reward_distance = abs(t - e)
+        if risk_distance <= 0 or reward_distance <= 0:
+            return _adv_unavailable(ADV_REASON_GEOMETRY_INVALID)
+        b = _adv_finite(reward_distance / risk_distance)
+        if b is None or b <= 0:
+            return _adv_unavailable(ADV_REASON_GEOMETRY_INVALID)
 
-    # Kelly cheio
-    b = max(risk_reward, 0.5)  # RR muito baixo torna Kelly negativo → clamp
-    kelly = (p * b - (1.0 - p)) / b
-    if kelly <= 0:
-        return None, f"Kelly negativo (p={p:.2f}, RR={b:.1f}) — setup sem edge esperado"
+        # 5. Probabilidade: ausência é ausência; zero é um valor legítimo.
+        if prob_tp1 is None:
+            return _adv_unavailable(ADV_REASON_PROB_UNAVAILABLE, rr_tp1=b)
+        p = _adv_finite(prob_tp1)
+        if p is None or p < 0.0 or p > 1.0:
+            return _adv_unavailable(ADV_REASON_PROB_INVALID, rr_tp1=b)
 
-    # Multiplicador de volatilidade (ATR menor → posição maior; ATR maior → menor)
-    if atr_pct is None or atr_pct <= 0:
-        vol_mult = 1.0
-        vol_note = "ATR n/d"
-    else:
-        raw_mult = ATR_REFERENCE_PCT / atr_pct
-        vol_mult = max(ATR_MULT_FLOOR, min(ATR_MULT_CEIL, raw_mult))
-        vol_note = f"ATR {atr_pct*100:.1f}% → mult {vol_mult:.2f}"
+        # 6. Score finito em [0, 100]; zero é legítimo.
+        sc = _adv_finite(score)
+        if sc is None or sc < 0.0 or sc > 100.0:
+            return _adv_unavailable(ADV_REASON_SCORE_INVALID,
+                                    probability_used=p, rr_tp1=b)
 
-    score_mult = max(0.0, min(1.0, score / 100.0))
+        # 7. ATR ausente ⇒ multiplicador neutro explícito. ATR presente e
+        #    inválido/não positivo ⇒ a referência de volatilidade não existe.
+        if atr_pct is None:
+            vol_mult, vol_note = 1.0, "ATR n/d (mult neutro 1.00)"
+        else:
+            a = _adv_finite(atr_pct)
+            if a is None or a <= 0:
+                return _adv_unavailable(ADV_REASON_ATR_INVALID,
+                                        probability_used=p, rr_tp1=b)
+            vol_mult = max(ATR_MULT_FLOOR, min(ATR_MULT_CEIL, ATR_REFERENCE_PCT / a))
+            vol_note = f"ATR {a*100:.1f}% → mult {vol_mult:.2f}"
 
-    raw_size = kelly * KELLY_FRACTION * score_mult * vol_mult * 100.0  # em %
-    final_size = max(SIZE_MIN_PCT, min(SIZE_MAX_PCT, raw_size))
+        # 8. Kelly binário sobre o payoff do TP1.
+        kelly_full = _adv_finite(p - (1.0 - p) / b)
+        if kelly_full is None:
+            return _adv_unavailable(ADV_REASON_INTERNAL_ERROR,
+                                    probability_used=p, rr_tp1=b)
+        if kelly_full <= 0:
+            return AdvisoryRisk(
+                0.0,
+                (f"Sem referência positiva de risco neste modelo "
+                 f"(p={p*100:.0f}%, RR até TP1 {b:.2f} → Kelly {kelly_full*100:.1f}%)."),
+                _adv_provenance(ADVISORY_STATUS_NO_POSITIVE_EDGE,
+                                ADV_REASON_KELLY_NOT_POSITIVE,
+                                probability_used=p, rr_tp1=b,
+                                kelly_full=kelly_full, raw_pct=0.0, final_pct=0.0),
+            )
 
-    rationale = (
-        f"p={p*100:.0f}% × RR {b:.1f} → Kelly {kelly*100:.1f}% × "
-        f"{KELLY_FRACTION:.0%} × score {score_mult:.2f} × {vol_note} "
-        f"= {raw_size:.2f}% (cap → {final_size:.2f}%)"
-    )
-    return round(final_size, 3), rationale
+        score_mult = max(0.0, min(1.0, sc / 100.0))
+        raw_pct = _adv_finite(100.0 * kelly_full * KELLY_FRACTION * score_mult * vol_mult)
+        if raw_pct is None:
+            return _adv_unavailable(ADV_REASON_INTERNAL_ERROR,
+                                    probability_used=p, rr_tp1=b, kelly_full=kelly_full)
+
+        # 9. Piso/teto SÓ mordem referência estritamente positiva — o piso nunca
+        #    pode ressuscitar um zero em 0,25%.
+        if raw_pct <= 0:
+            return AdvisoryRisk(
+                0.0,
+                (f"Referência zerada pelos ajustes heurísticos "
+                 f"(score {score_mult:.2f} × {vol_note})."),
+                _adv_provenance(ADVISORY_STATUS_ZERO_REFERENCE,
+                                ADV_REASON_ZERO_AFTER_HEURISTICS,
+                                probability_used=p, rr_tp1=b,
+                                kelly_full=kelly_full, raw_pct=0.0, final_pct=0.0),
+            )
+
+        final_pct = round(max(SIZE_MIN_PCT, min(SIZE_MAX_PCT, raw_pct)), 3)
+        rationale = (
+            f"p(TP1)={p*100:.0f}% × RR até TP1 {b:.2f} → Kelly {kelly_full*100:.1f}% × "
+            f"{KELLY_FRACTION:.0%} × score {score_mult:.2f} × {vol_note} "
+            f"= {raw_pct:.2f}% (cap → {final_pct:.2f}%) — risco teórico, não tamanho de ordem"
+        )
+        return AdvisoryRisk(
+            final_pct, rationale,
+            _adv_provenance(ADVISORY_STATUS_READY, ADV_REASON_OK,
+                            probability_used=p, rr_tp1=b, kelly_full=kelly_full,
+                            raw_pct=raw_pct, final_pct=final_pct),
+        )
+    except Exception:
+        # Suprime só ESTA referência — nunca aborta a recomendação, nunca
+        # converte indisponibilidade em zero, nunca vaza a exceção.
+        return _adv_hard_failure()
 
 
 def _compute_leverage(entry: float, stop_loss: float, tier: str) -> dict:
@@ -1576,38 +1813,72 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
     except Exception:
         edge_tags, edge_score = [], 0
 
-    # Position sizing dinâmico (Issue #4) — Kelly fracionado × score × volatilidade
+    # ── Referência CONSULTIVA de risco até o TP1 (R06B3) ──────────────────
+    # Não alimenta o executor: o bot dimensiona por `risk_pct` → multiplicadores
+    # → `_compute_qty` → `LIVE_SIZE_MULT`, e nunca leu `suggested_size_pct`.
+    #
+    # A probabilidade só entra se o contrato COMPLETO validar — não basta
+    # `status == READY`. `CALIBRATION_UNAVAILABLE` passa no gate operacional mas
+    # não entrega probabilidade, e aí a referência fica indisponível (jamais
+    # presumida por tier).
+    _adv_payload = {
+        "score": score,
+        "score_provenance": score_prov,
+        "probability_provenance": prob_prov,
+        "prob_tp1": prob_tp1,
+        "prob_tp2": prob_tp2,
+    }
+    try:
+        from services.calibration_service import calibration_contract_verdict
+        _adv_blocking = not calibration_contract_verdict(
+            _adv_payload, require_current_contract=True).get("ok")
+    except Exception:
+        _adv_blocking = True
+
     atr_pct_val = sig.indicators.atr_pct if sig.indicators else None
-    suggested_size_pct, size_rationale = _compute_dynamic_size(
+    _advisory = _compute_dynamic_size(
+        direction=sig.direction,
+        entry=sig.entry,
+        stop_loss=sig.stop_loss,
+        tp1=sig.tp1,
         score=score,
-        tier=tier,
-        risk_reward=sig.risk_reward,
         prob_tp1=prob_tp1,
         atr_pct=atr_pct_val,
-        probability_contract_blocking=prob_blocking,
+        probability_contract_blocking=_adv_blocking or prob_blocking,
     )
-    # Espelha o EDGE_SIZING do bot no tamanho EXIBIDO (app conta a mesma história
-    # que o bot). Gated: NO-OP quando EDGE_SIZING_ENABLED=false. Re-clampa ao teto
-    # documentado [0.25%, 1.0%]. Fail-soft — qualquer erro mantém o size original.
-    if suggested_size_pct is not None:
-        try:
-            from services.shadow_trade_service import _edge_mult
-            _em, _ = _edge_mult({"edge_tags": edge_tags, "edge_score": edge_score})
-            if _em != 1.0:
-                suggested_size_pct = round(min(max(suggested_size_pct * _em, 0.25), 1.0), 2)
-                size_rationale = (size_rationale or "size dinâmico") + f" · edge ×{_em:.2f}"
-        except Exception:
-            pass
-        # Espelha o LIQ_TIER_SIZING do bot — mão menor em moeda magra. Mesma
-        # história no app. Gated: NO-OP quando LIQ_TIER_SIZING_ENABLED=false.
-        try:
-            from services.shadow_trade_service import _liq_tier_mult
-            _lm, _ = _liq_tier_mult({"quote_vol_usd": getattr(sig, "quote_vol_usd", None)})
-            if _lm != 1.0:
-                suggested_size_pct = round(min(max(suggested_size_pct * _lm, 0.25), 1.0), 2)
-                size_rationale = (size_rationale or "size dinâmico") + f" · liq ×{_lm:.2f}"
-        except Exception:
-            pass
+    suggested_size_pct = _advisory.pct
+    size_rationale = _advisory.rationale
+    sizing_prov = dict(_advisory.provenance)
+
+    # Espelha EDGE_SIZING e LIQ_TIER_SIZING do bot no número EXIBIDO, para o app
+    # contar a mesma história. Espelhar multiplicador NÃO torna esta referência
+    # igual ao tamanho executado. Gated: NO-OP com as flags off.
+    # Só mordem referência ESTRITAMENTE positiva: `None` continua `None` e zero
+    # continua zero — nenhum piso pode ressuscitar um zero.
+    if suggested_size_pct is not None and suggested_size_pct > 0:
+        for _nome, _importa, _args in (
+            ("edge", "_edge_mult", {"edge_tags": edge_tags, "edge_score": edge_score}),
+            ("liq", "_liq_tier_mult", {"quote_vol_usd": getattr(sig, "quote_vol_usd", None)}),
+        ):
+            try:
+                import importlib
+                _fn = getattr(importlib.import_module("services.shadow_trade_service"), _importa)
+                _mult = _adv_finite(_fn(_args)[0])
+            except Exception:
+                _mult = None
+            if _mult is None or _mult < 0:
+                # Multiplicador quebrado não pode virar NaN nem referência
+                # inventada: suprime a referência com motivo controlado.
+                _advisory = _adv_unavailable(ADV_REASON_MULTIPLIER_INVALID)
+                suggested_size_pct, size_rationale = _advisory.pct, _advisory.rationale
+                sizing_prov = dict(_advisory.provenance)
+                break
+            if _mult != 1.0:
+                suggested_size_pct = round(min(max(suggested_size_pct * _mult, 0.25), 1.0), 2)
+                size_rationale = f"{size_rationale} · {_nome} ×{_mult:.2f}"
+
+    # A proveniência acompanha o valor FINAL, depois de edge/liq e arredondamento.
+    sizing_prov["final_pct"] = _adv_finite(suggested_size_pct)
 
     # Veredito do bot (mesma lógica/limites do loop de execução — fonte única).
     # Read-only: NÃO toca no loop real; só anexa "o bot operaria / não operaria"
@@ -1680,6 +1951,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         prob_tp2=prob_tp2,
         suggested_size_pct=suggested_size_pct,
         size_rationale=size_rationale,
+        sizing_provenance=sizing_prov,
         quote_vol_usd=q_vol,
         spread_pct=sp_pct,
         bot_verdict=bot_verdict,

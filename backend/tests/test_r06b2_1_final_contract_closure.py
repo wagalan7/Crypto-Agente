@@ -184,7 +184,9 @@ class FalhaDeConstrucao(unittest.TestCase):
         with self._com_lookup_quebrado():
             rec = self._constroi()
         self.assertIsNone(rec.suggested_size_pct)
-        self.assertIn("Calibração incompatível", rec.size_rationale)
+        self.assertEqual(rec.sizing_provenance["status"], rs.ADVISORY_STATUS_UNAVAILABLE)
+        self.assertEqual(rec.sizing_provenance["reason_code"],
+                         rs.ADV_REASON_CONTRACT_BLOCKING)
         # e NÃO caiu no fallback por tier
         self.assertNotIn("Kelly", rec.size_rationale)
 
@@ -603,7 +605,7 @@ class SnapshotImutavel(unittest.TestCase):
     def test_r06b2_1_nao_introduziu_escrita_em_features(self):
         """O pacote só ACRESCENTA o namespace em snapshots novos."""
         novo = subprocess.run(
-            ["git", "diff", "--unified=0", "8ae87567", "--",
+            ["git", "diff", "--unified=0", "8ae87567", "eab20a5b", "--",
              "backend/services/snapshot_service.py"],
             cwd=BACKEND.parent, capture_output=True, text=True)
         if novo.returncode != 0:
@@ -662,21 +664,22 @@ class ExecucaoESizing(unittest.TestCase):
         self.assertEqual(v["blocked_by"], calib.CALIBRATION_CONTRACT_GATE)
 
     def test_sizing_bloqueante_nao_usa_fallback_por_tier(self):
-        tamanho, motivo = rs._compute_dynamic_size(
-            score=80.0, tier="A", risk_reward=2.0, prob_tp1=None, atr_pct=0.02,
+        r = rs._compute_dynamic_size(
+            direction="long", entry=100.0, stop_loss=99.0, tp1=102.0,
+            score=80.0, prob_tp1=None, atr_pct=0.02,
             probability_contract_blocking=True)
-        self.assertIsNone(tamanho)
-        self.assertNotIn(f"p={rs._TIER_WR_FALLBACK['A']*100:.0f}%", motivo)
-        self.assertIn("Calibração incompatível", motivo)
+        self.assertIsNone(r.pct)
+        self.assertNotIn(f"p={rs._TIER_WR_FALLBACK['A']*100:.0f}%", r.rationale)
+        self.assertEqual(r.provenance["reason_code"], rs.ADV_REASON_CONTRACT_BLOCKING)
 
-    def test_sizing_nao_bloqueante_preserva_o_r06b2(self):
+    def test_flag_de_bloqueio_falsa_e_no_op(self):
         for prob in (0.7, None):
             with self.subTest(prob=prob):
+                comum = dict(direction="long", entry=100.0, stop_loss=99.0,
+                             tp1=102.0, score=80.0, prob_tp1=prob, atr_pct=0.02)
                 self.assertEqual(
-                    rs._compute_dynamic_size(score=80.0, tier="A", risk_reward=2.0,
-                                             prob_tp1=prob, atr_pct=0.02),
-                    rs._compute_dynamic_size(score=80.0, tier="A", risk_reward=2.0,
-                                             prob_tp1=prob, atr_pct=0.02,
+                    rs._compute_dynamic_size(**comum),
+                    rs._compute_dynamic_size(**comum,
                                              probability_contract_blocking=False))
 
     def test_sizing_nao_depende_mais_de_import_interno(self):
@@ -685,15 +688,26 @@ class ExecucaoESizing(unittest.TestCase):
                                          "_compute_dynamic_size"))
         self.assertNotIn("BLOCKING_PROB_STATUSES", fonte)
         self.assertNotIn("import", fonte)          # nenhum import no corpo
-        self.assertNotIn("except", fonte)          # nem except silencioso
         self.assertIn("probability_contract_blocking", fonte)
+        self.assertNotIn("_TIER_WR_FALLBACK", fonte)
+        # R06B3 introduziu um except de contenção. Comportamental: ele SUPRIME a
+        # referência com motivo controlado — nunca fallback por tier, nunca zero.
+        with patch.object(rs, "_adv_finite", side_effect=RuntimeError("boom")):
+            r = rs._compute_dynamic_size(
+                direction="long", entry=100.0, stop_loss=99.0, tp1=102.0,
+                score=80.0, prob_tp1=0.7, atr_pct=0.02)
+        self.assertIsNone(r.pct)
+        self.assertEqual(r.provenance["status"], rs.ADVISORY_STATUS_UNAVAILABLE)
+        self.assertEqual(r.provenance["reason_code"], rs.ADV_REASON_INTERNAL_ERROR)
+        self.assertNotIn("boom", json.dumps(r.provenance) + r.rationale)
 
     def test_kelly_e_caps_inalterados(self):
         self.assertEqual(rs.KELLY_FRACTION, 0.25)
         self.assertEqual((rs.SIZE_MIN_PCT, rs.SIZE_MAX_PCT), (0.25, 1.0))
         self.assertEqual(rs._TIER_WR_FALLBACK, {"A+": 0.62, "A": 0.55, "B": 0.50})
         fonte = (BACKEND / "services" / "recommendation_service.py").read_text()
-        self.assertIn("kelly = (p * b - (1.0 - p)) / b", fonte)
+        # R06B3 trocou a semântica do Kelly consultivo; os caps não mudaram.
+        self.assertIn("kelly_full = _adv_finite(p - (1.0 - p) / b)", fonte)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -705,7 +719,11 @@ class Escopo(unittest.TestCase):
     PREEXISTENTES = {"frontend/dist/index.html"}
 
     def _diff(self, *caminhos):
-        res = subprocess.run(["git", "diff", "--name-only", "8ae87567", "--", *caminhos],
+        """Escopo do R06B2.1 = o RANGE de commits do R06B2.1 (8ae87567..eab20a5b).
+        Comparar com a árvore de trabalho faria uma fase posterior autorizada
+        (R06B3) quebrar esta garantia retroativamente."""
+        res = subprocess.run(["git", "diff", "--name-only", "8ae87567", "eab20a5b",
+                              "--", *caminhos],
                              cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
             self.skipTest("baseline 8ae87567 indisponível neste checkout")
@@ -734,7 +752,7 @@ class Escopo(unittest.TestCase):
         for arquivo in ("calibration_service.py", "recommendation_service.py",
                         "shadow_trade_service.py", "snapshot_service.py"):
             novo = subprocess.run(
-                ["git", "diff", "--unified=0", "8ae87567", "--",
+                ["git", "diff", "--unified=0", "8ae87567", "eab20a5b", "--",
                  f"backend/services/{arquivo}"],
                 cwd=BACKEND.parent, capture_output=True, text=True).stdout
             for ln in [l for l in novo.splitlines()

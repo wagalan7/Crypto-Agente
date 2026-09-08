@@ -956,20 +956,51 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                     </div>
                   </div>
 
-                  {/* Size sugerido — Kelly fracionado × score × volatilidade.
-                      Diferente de risk_pct (perda aceitável se stop bater).
-                      Esse aqui é o TAMANHO da posição em % da banca. */}
-                  {r.suggested_size_pct != null && (
-                    <div
-                      className="mt-2 flex items-center justify-between gap-2 text-[10px] rounded px-2 py-1 border border-sky-500/30 bg-sky-500/10"
-                      title={r.size_rationale ?? ''}
-                    >
-                      <span className="text-sky-300">
-                        💰 Size sugerido <span className="font-mono font-bold">{r.suggested_size_pct.toFixed(2)}%</span> da banca
-                      </span>
-                      <span className="text-[9px] text-slate-400">Kelly·score·vol</span>
-                    </div>
-                  )}
+                  {/* R06B3 — REFERÊNCIA de risco até o TP1. É uma fração
+                      TEÓRICA de risco da banca, não o tamanho da posição, não
+                      notional e não margem. Não define as ordens do bot. */}
+                  {(() => {
+                    const sp = r.sizing_provenance
+                    const st = sp?.status
+                    const legado = sp == null
+                    const nota = 'Modelo simplificado. Este valor não define o tamanho das ordens do bot.'
+                    const caixa = 'mt-2 flex items-center justify-between gap-2 text-[10px] rounded px-2 py-1 border'
+                    if (st === 'UNAVAILABLE') {
+                      return (
+                        <div className={`${caixa} border-slate-600/40 bg-slate-700/20`} title={r.size_rationale ?? nota}>
+                          <span className="text-slate-400">
+                            📐 Referência de risco até o TP1 indisponível
+                          </span>
+                          <span className="text-[9px] text-slate-500">{nota}</span>
+                        </div>
+                      )
+                    }
+                    if (st === 'NO_POSITIVE_EDGE') {
+                      return (
+                        <div className={`${caixa} border-amber-500/30 bg-amber-500/10`} title={r.size_rationale ?? nota}>
+                          <span className="text-amber-300">
+                            📐 Sem referência positiva de risco neste modelo
+                          </span>
+                          <span className="text-[9px] text-slate-400">{nota}</span>
+                        </div>
+                      )
+                    }
+                    if (r.suggested_size_pct == null) return null
+                    return (
+                      <div
+                        className={`${caixa} border-sky-500/30 bg-sky-500/10`}
+                        title={r.size_rationale ?? nota}
+                      >
+                        <span className="text-sky-300">
+                          📐 {legado ? 'Referência legada' : 'Referência de risco até o TP1'}{' '}
+                          <span className="font-mono font-bold">{r.suggested_size_pct.toFixed(2)}%</span> da banca
+                        </span>
+                        <span className="text-[9px] text-slate-400">
+                          {legado ? 'modelo anterior — não recalculado' : nota}
+                        </span>
+                      </div>
+                    )
+                  })()}
 
                   {/* Preço atual vs entry — mostra delta sempre que houver current_price.
                       Ajuda usuário a julgar se rec ainda é "fresca" ou se preço já fugiu. */}

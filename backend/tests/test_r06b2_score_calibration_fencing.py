@@ -512,8 +512,11 @@ class IntegracaoNaRecomendacao(unittest.TestCase):
         self.assertEqual(rec.probability_provenance["status"],
                          calib.PROB_STATUS_CALIBRATION_UNAVAILABLE)
         self.assertIsNone(rec.prob_tp1)
-        # sizing segue usando o fallback por tier (calibração imatura)
-        self.assertIsNotNone(rec.suggested_size_pct)
+        # R06B3: sem probabilidade não há referência consultiva — e ela NÃO é
+        # presumida por tier. O contrato de probabilidade em si não mudou.
+        self.assertIsNone(rec.suggested_size_pct)
+        self.assertEqual(rec.sizing_provenance["status"],
+                         rs.ADVISORY_STATUS_UNAVAILABLE)
 
     def test_bot_verdict_recebe_os_dois_contratos(self):
         fonte = _fonte_de_funcao("services/recommendation_service.py",
@@ -696,39 +699,42 @@ class Sizing(unittest.TestCase):
     def test_mismatch_nao_usa_fallback_por_tier_e_nao_dimensiona(self):
         for status in sorted(calib.BLOCKING_PROB_STATUSES):
             with self.subTest(status=status):
-                tamanho, motivo = rs._compute_dynamic_size(
-                    score=80.0, tier="A", risk_reward=2.0, prob_tp1=None,
-                    atr_pct=0.02, probability_contract_blocking=True)
-                self.assertIsNone(tamanho)
-                self.assertIn("Calibração incompatível", motivo)
-                self.assertNotIn("Kelly", motivo)
-                self.assertNotIn("p=", motivo)
+                r = rs._compute_dynamic_size(
+                    direction="long", entry=100.0, stop_loss=99.0, tp1=102.0,
+                    score=80.0, prob_tp1=None, atr_pct=0.02,
+                    probability_contract_blocking=True)
+                self.assertIsNone(r.pct)
+                self.assertEqual(r.provenance["reason_code"],
+                                 rs.ADV_REASON_CONTRACT_BLOCKING)
+                self.assertNotIn("Kelly", r.rationale)
+                self.assertNotIn("p(TP1)", r.rationale)
 
     def test_mismatch_ignora_ate_uma_prob_que_tenha_vazado(self):
         """Defesa em profundidade: nem uma prob presente reabre o sizing."""
-        tamanho, motivo = rs._compute_dynamic_size(
-            score=80.0, tier="A", risk_reward=2.0, prob_tp1=0.9, atr_pct=0.02,
+        r = rs._compute_dynamic_size(
+            direction="long", entry=100.0, stop_loss=99.0, tp1=102.0,
+            score=80.0, prob_tp1=0.9, atr_pct=0.02,
             probability_contract_blocking=True)
-        self.assertIsNone(tamanho)
-        self.assertIn("Calibração incompatível", motivo)
+        self.assertIsNone(r.pct)
+        self.assertEqual(r.provenance["reason_code"], rs.ADV_REASON_CONTRACT_BLOCKING)
 
-    def test_ready_preserva_o_resultado_anterior(self):
-        antes = rs._compute_dynamic_size(
-            score=80.0, tier="A", risk_reward=2.0, prob_tp1=0.7, atr_pct=0.02)
-        depois = rs._compute_dynamic_size(
-            score=80.0, tier="A", risk_reward=2.0, prob_tp1=0.7, atr_pct=0.02,
-            probability_contract_blocking=False)
-        self.assertEqual(antes, depois)
+    def test_ready_nao_e_afetado_pela_flag_de_bloqueio(self):
+        comum = dict(direction="long", entry=100.0, stop_loss=99.0, tp1=102.0,
+                     score=80.0, prob_tp1=0.7, atr_pct=0.02)
+        self.assertEqual(rs._compute_dynamic_size(**comum),
+                         rs._compute_dynamic_size(**comum,
+                                                  probability_contract_blocking=False))
 
-    def test_calibracao_indisponivel_preserva_o_fallback_por_tier(self):
-        antes = rs._compute_dynamic_size(
-            score=80.0, tier="A", risk_reward=2.0, prob_tp1=None, atr_pct=0.02)
-        depois = rs._compute_dynamic_size(
-            score=80.0, tier="A", risk_reward=2.0, prob_tp1=None, atr_pct=0.02,
+    def test_calibracao_indisponivel_nao_gera_referencia_consultiva(self):
+        """R06B3: sem P(TP1) não há Kelly. O fallback por tier saiu daqui; a
+        política operacional de risco por tier continua existindo."""
+        r = rs._compute_dynamic_size(
+            direction="long", entry=100.0, stop_loss=99.0, tp1=102.0,
+            score=80.0, prob_tp1=None, atr_pct=0.02,
             probability_contract_blocking=False)
-        self.assertEqual(antes, depois)
-        self.assertIsNotNone(depois[0])
-        self.assertIn(f"p={rs._TIER_WR_FALLBACK['A']*100:.0f}%", depois[1])
+        self.assertIsNone(r.pct)
+        self.assertEqual(r.provenance["reason_code"], rs.ADV_REASON_PROB_UNAVAILABLE)
+        self.assertEqual(rs._TIER_WR_FALLBACK, {"A+": 0.62, "A": 0.55, "B": 0.50})
 
     def test_conviction_nao_contorna_o_bloqueio(self):
         """Sem prob, o multiplicador por convicção é NO-OP (1.0); e a entrada
@@ -745,7 +751,9 @@ class Sizing(unittest.TestCase):
         self.assertEqual(rs._TIER_WR_FALLBACK,
                          {"A+": 0.62, "A": 0.55, "B": 0.50})
         fonte = (BACKEND / "services" / "recommendation_service.py").read_text()
-        self.assertIn("kelly = (p * b - (1.0 - p)) / b", fonte)
+        # R06B3: a expressão do Kelly consultivo mudou de semântica (payoff do
+        # TP1); as CONSTANTES de sizing, objeto desta garantia, não.
+        self.assertIn("kelly_full = _adv_finite(p - (1.0 - p) / b)", fonte)
 
 
 # ════════════════════════════════════════════════════════════════════════════

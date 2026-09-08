@@ -713,11 +713,13 @@ class EscopoDoPacote(unittest.TestCase):
         self.assertIn("KELLY_FRACTION = 0.25", fonte)
         self.assertIn("ATR_REFERENCE_PCT = 0.02", fonte)
         self.assertIn('_TIER_WR_FALLBACK = {"A+": 0.62, "A": 0.55, "B": 0.50}', fonte)
-        tamanho, motivo = rs._compute_dynamic_size(
-            score=100.0, tier="A", risk_reward=3.0, prob_tp1=0.7, atr_pct=None)
-        kelly = (0.7 * 3.0 - 0.3) / 3.0
-        self.assertIn(f"Kelly {kelly*100:.1f}%", motivo)
-        self.assertIsNotNone(tamanho)
+        # R06B3 trocou a SEMÂNTICA do Kelly consultivo (payoff do TP1) — as
+        # constantes de sizing, que são o objeto desta garantia, seguem iguais.
+        r = rs._compute_dynamic_size(
+            direction="long", entry=100.0, stop_loss=99.0, tp1=101.0,
+            score=100.0, prob_tp1=0.7, atr_pct=None)
+        self.assertIsNotNone(r.pct)
+        self.assertAlmostEqual(r.provenance["kelly_full"], 0.7 - 0.3 / 1.0, places=9)
 
 
 # ── Fábrica de sinais sintéticos (sem rede, sem exchange) ───────────────────

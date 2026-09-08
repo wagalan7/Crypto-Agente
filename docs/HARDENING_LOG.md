@@ -1531,3 +1531,46 @@ revisão do R06B2. Doc: `docs/R06B2_1_FINAL_CONTRACT_CLOSURE.md`.
 - Corrigido passando também `prob_tp2` ao veredito único. Teste comportamental
   garante que uma recomendação READY completa não seja bloqueada pelo gate de
   calibração. Fórmulas, probabilidades, estratégia e sizing permanecem iguais.
+
+## R06B3 — Kelly consultivo, unidades e sugestão de risco
+
+Base `eab20a5b`, branch `main`. Fecha o F7 do R06A. Modelo `TP1_BINARY_PROXY_V1`,
+modo `ADVISORY_ONLY`, unidade `BANKROLL_RISK_PCT`.
+Doc: `docs/R06B3_KELLY_SEMANTICS.md`.
+
+- **ANTES**: `p = P(TP1)` casado com `b = RR do ALVO FINAL`; piso artificial
+  `b >= 0.5`; probabilidade ausente presumida por tier; Kelly não positivo
+  devolvia `None` (confundindo "sem edge" com "sem dado"); o piso de 0,25%
+  ressuscitava zero; e o app chamava o resultado de "tamanho da posição".
+- **DEPOIS**: `b = |tp1 − entry| / |entry − stop_loss|`,
+  `kelly_full = p − (1 − p)/b`, sem piso em `b`. Sem fallback por tier no
+  caminho consultivo (a política operacional de risco por tier segue intacta).
+  Kelly ≤ 0 ⇒ `0.0` (`NO_POSITIVE_EDGE`); `raw_pct == 0` ⇒ `0.0`
+  (`ZERO_REFERENCE`); dado ausente/inválido ⇒ `None` (`UNAVAILABLE`).
+  Rótulo passou a "Referência de risco até o TP1".
+- **Contrato**: novo `Recommendation.sizing_provenance` (JSON já serializado,
+  sem coluna) com version/model/mode/unit/status/reason_code/probability_used/
+  rr_tp1/kelly_full/raw_pct/final_pct/source/limitations. `final_pct` acompanha
+  o valor FINAL após edge/liq: `final_pct == suggested_size_pct`.
+- **Probabilidade**: entra só se `calibration_contract_verdict(...,
+  require_current_contract=True)` aprovar o payload completo — não basta
+  `status == READY`. `CALIBRATION_UNAVAILABLE` não vira probabilidade.
+- **Pós-multiplicadores**: só mordem valor estritamente positivo; `None` fica
+  `None`, zero fica zero, nenhum piso ressuscita zero; multiplicador inválido
+  suprime a referência com motivo controlado.
+- **Independência operacional** (comportamental, não só grep): variar só os
+  campos consultivos entre positivo/zero/ausente não move `exec_verdict`,
+  `_edge_mult`, `_liq_tier_mult`, `_conviction_mult`, `risk_pct`,
+  `_compute_leverage` nem a `qty` de `_compute_qty`.
+- **Números** (score 80, ATR 2%): `p=.52`/RR1=1/RRfinal=3 → raw 7,20% → **0,80%**;
+  `p=.70` → raw 12,00% → **8,00%** (ambos capados em 1,00% — o cap esconde a
+  correção); `p=.50`/RR1=1 → **zero**; `p=.70`/RR1=0,40 → Kelly **−0,05** → zero;
+  `score=0` → **zero** (antes 0,25%).
+- **Testes**: 50 testes R06B3 herméticos verdes; suíte completa do backend
+  **1.534 verdes** com **2 skips pré-existentes** do R05C
+  (`fixture auditada indisponível (esperado no repo)`). `py_compile`,
+  `tsc --noEmit` e `git diff --check` aprovados.
+- **Limites**: calibração é de setups (parciais/expirações), expiração como −1R
+  é hipótese, sem custos/funding/slippage, histórico sem proveniência
+  individual, nenhuma comprovação de lucro ou de redução de stops, e nenhuma
+  integração nova ao dimensionamento real.

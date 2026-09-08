@@ -493,46 +493,54 @@ class UnidadesEConsumo(unittest.TestCase):
         self.assertIn("prob_tp1: Optional[float] = None", fonte)
         self.assertIn("0..1", fonte.split("prob_tp1: Optional[float] = None")[1][:60])
 
-    def test_sizing_usa_prob_tp1_com_fallback_por_tier(self):
+    def test_CORRIGIDO_sizing_consultivo_nao_presume_prob_por_tier(self):
+        """R06B3: o fallback por tier saiu do cálculo CONSULTIVO — presumir
+        probabilidade por tier era inventar a entrada do Kelly. A política
+        operacional de risco por tier segue intacta (`_TIER_WR_FALLBACK` existe
+        e é usada fora deste caminho)."""
         from services import recommendation_service as rs
 
-        tamanho, motivo = rs._compute_dynamic_size(
-            score=80.0, tier="A", risk_reward=2.0, prob_tp1=0.7, atr_pct=0.02)
-        self.assertIsNotNone(tamanho)
-        self.assertIn("p=70%", motivo)
-        # None NÃO vira zero: cai no fallback por tier
-        t2, m2 = rs._compute_dynamic_size(
-            score=80.0, tier="A", risk_reward=2.0, prob_tp1=None, atr_pct=0.02)
-        self.assertIsNotNone(t2)
-        self.assertNotEqual(m2, motivo)
+        r = rs._compute_dynamic_size(
+            direction="long", entry=100.0, stop_loss=99.0, tp1=102.0,
+            score=80.0, prob_tp1=0.7, atr_pct=0.02)
+        self.assertIsNotNone(r.pct)
+        self.assertIn("p(TP1)=70%", r.rationale)
+        # ausência de probabilidade continua ausência — nunca vira tier nem zero
+        sem = rs._compute_dynamic_size(
+            direction="long", entry=100.0, stop_loss=99.0, tp1=102.0,
+            score=80.0, prob_tp1=None, atr_pct=0.02)
+        self.assertIsNone(sem.pct)
+        self.assertEqual(sem.provenance["status"], rs.ADVISORY_STATUS_UNAVAILABLE)
+        self.assertEqual(sem.provenance["reason_code"], rs.ADV_REASON_PROB_UNAVAILABLE)
+        self.assertEqual(rs._TIER_WR_FALLBACK, {"A+": 0.62, "A": 0.55, "B": 0.50})
 
-    def test_DEFEITO_kelly_mistura_evento_tp1_com_rr_do_alvo_final(self):
-        """DEFEITO (semântico): Kelly usa `b = risk_reward` (RR até o alvo
-        final) com `p = prob_tp1` (probabilidade de tocar o TP1).
-
-        Kelly pressupõe que `p` é a chance de ganhar `b` unidades. Como
-        P(TP1) >= P(alvo final), a fração resultante é OTIMISTA. O teste
-        caracteriza a fórmula atual; NÃO altera o sizing.
-        """
+    def test_CORRIGIDO_kelly_usa_o_payoff_do_proprio_tp1(self):
+        """R06B3: o defeito F7 do R06A está corrigido. `p = P(TP1)` agora anda
+        com `b = RR até o TP1`; o RR do alvo final não entra mais."""
         from services import recommendation_service as rs
 
-        p, b = 0.7, 3.0
-        kelly_esperado = (p * b - (1 - p)) / b
-        tamanho, motivo = rs._compute_dynamic_size(
-            score=100.0, tier="A", risk_reward=b, prob_tp1=p, atr_pct=None)
-        self.assertIn(f"Kelly {kelly_esperado*100:.1f}%", motivo)
-        self.assertIsNotNone(tamanho)
-        # se o evento fosse o alvo final, p seria menor e Kelly cairia
-        p_alvo_final = 0.45
-        kelly_correto = (p_alvo_final * b - (1 - p_alvo_final)) / b
-        self.assertGreater(kelly_esperado, kelly_correto)
+        p = 0.7
+        # RR1 = 1 (TP1 a 1R), RR do alvo final = 3 (TP2/TP3 bem mais longe)
+        r = rs._compute_dynamic_size(
+            direction="long", entry=100.0, stop_loss=99.0, tp1=101.0,
+            score=100.0, prob_tp1=p, atr_pct=None)
+        self.assertAlmostEqual(r.provenance["rr_tp1"], 1.0, places=9)
+        self.assertAlmostEqual(r.provenance["kelly_full"], p - (1 - p) / 1.0, places=9)
+        # a fórmula antiga, com b = RR do alvo final, dava um Kelly bem maior
+        kelly_antigo = (p * 3.0 - (1 - p)) / 3.0
+        self.assertGreater(kelly_antigo, r.provenance["kelly_full"])
 
-    def test_kelly_negativo_nao_vira_tamanho_zero(self):
+    def test_CORRIGIDO_kelly_negativo_vira_zero_e_nao_ausencia(self):
+        """R06B3: sem edge o modelo tem uma resposta — zero. `None` fica
+        reservado para ausência de dado, que é outra coisa."""
         from services import recommendation_service as rs
-        tamanho, motivo = rs._compute_dynamic_size(
-            score=50.0, tier="C", risk_reward=1.0, prob_tp1=0.2, atr_pct=0.02)
-        self.assertIsNone(tamanho)
-        self.assertIn("Kelly negativo", motivo)
+        r = rs._compute_dynamic_size(
+            direction="long", entry=100.0, stop_loss=99.0, tp1=101.0,
+            score=50.0, prob_tp1=0.2, atr_pct=0.02)
+        self.assertEqual(r.pct, 0.0)
+        self.assertIsNotNone(r.pct)
+        self.assertEqual(r.provenance["status"], rs.ADVISORY_STATUS_NO_POSITIVE_EDGE)
+        self.assertLess(r.provenance["kelly_full"], 0)
 
 
 # ════════════════════════════════════════════════════════════════════════════
