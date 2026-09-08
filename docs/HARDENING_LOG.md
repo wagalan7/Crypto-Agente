@@ -1574,3 +1574,20 @@ Doc: `docs/R06B3_KELLY_SEMANTICS.md`.
   é hipótese, sem custos/funding/slippage, histórico sem proveniência
   individual, nenhuma comprovação de lucro ou de redução de stops, e nenhuma
   integração nova ao dimensionamento real.
+
+### R06B3 — revisão de integração antes da publicação
+
+- Base revisada: `b575fb99`. Multiplicador consultivo zero/underflow voltava
+  ao piso positivo; agora encerra a cadeia em `ZERO_REFERENCE`, preservando
+  `raw_pct` e gravando `final_pct=0`.
+- Intermediários de ATR não finitos são rejeitados antes de clamp/formatação.
+  A contenção de falhas cobre a montagem completa da referência em
+  `_build_recommendation`, inclusive pós-multiplicadores e proveniência.
+- Reprodução antes do ajuste: seis subcasos falharam e uma exceção escapou.
+  Depois: 54 testes R06B3 e 293 direcionados R06 aprovados.
+  Suíte completa: 1.538 executados, zero falhas, 2 skips preexistentes R05C.
+- Provas reforçadas: independência do TP2 com calibração READY e valores brutos;
+  construção real com referência positiva/zero/ausente; multiplicadores
+  operacionais exercitados com flags ligadas nos testes.
+- TypeScript, py_compile, diff-check e build Vite aprovados. Build temporário
+  preservou frontend/dist. Dimensionamento real, flags e histórico inalterados.

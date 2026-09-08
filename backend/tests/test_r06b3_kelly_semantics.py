@@ -191,8 +191,14 @@ class FormulaEGeometria(unittest.TestCase):
         self.assertGreater(kelly_antigo(0.70, 0.40), 0)
 
     def test_alterar_apenas_o_alvo_final_nao_muda_a_referencia(self):
-        base = _constroi(_sinal(tp2=103.0, risk_reward=3.0))
-        longe = _constroi(_sinal(tp2=140.0, risk_reward=40.0))
+        with patch.dict(calib._cache, {"data": _calibracao(V2)}):
+            base = _constroi(_sinal(tp2=103.0, risk_reward=3.0))
+            longe = _constroi(_sinal(tp2=140.0, risk_reward=40.0))
+        self.assertEqual(base.sizing_provenance["status"], rs.ADVISORY_STATUS_READY)
+        self.assertIsNotNone(base.suggested_size_pct)
+        self.assertAlmostEqual(base.sizing_provenance["kelly_full"], kelly_tp1(.52, 1))
+        self.assertEqual(base.sizing_provenance["raw_pct"],
+                         longe.sizing_provenance["raw_pct"])
         self.assertEqual(base.suggested_size_pct, longe.suggested_size_pct)
         self.assertEqual(base.sizing_provenance["rr_tp1"],
                          longe.sizing_provenance["rr_tp1"])
@@ -300,6 +306,13 @@ class FormulaEGeometria(unittest.TestCase):
         self.assertEqual(rs.ATR_REFERENCE_PCT, 0.02)
         self.assertEqual((rs.ATR_MULT_FLOOR, rs.ATR_MULT_CEIL), (0.5, 2.0))
         self.assertEqual((rs.SIZE_MIN_PCT, rs.SIZE_MAX_PCT), (0.25, 1.0))
+
+    def test_atr_finito_com_intermediario_infinito_fica_indisponivel(self):
+        for atr in (5e-324, 1e308):
+            with self.subTest(atr=atr):
+                result = _calc(atr_pct=atr)
+                self.assertIsNone(result.pct)
+                self.assertEqual(result.provenance["reason_code"], rs.ADV_REASON_ATR_INVALID)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -481,6 +494,49 @@ class IntegracaoCompleta(unittest.TestCase):
         self.assertIsNone(rec.suggested_size_pct)
         self.assertIsNone(rec.sizing_provenance["final_pct"])
 
+    def test_zero_produzido_por_multiplicador_nao_ressuscita_no_piso(self):
+        for nome in ("_edge_mult", "_liq_tier_mult"):
+            for mult in (0.0, 5e-324):
+                with self.subTest(nome=nome, mult=mult):
+                    with patch.object(sts, "_edge_mult", return_value=(1.0, "neutro")), \
+                         patch.object(sts, "_liq_tier_mult", return_value=(2.0, "posterior")), \
+                         patch.object(sts, nome, return_value=(mult, "zero")):
+                        rec = _constroi(_sinal(), score=50.0)
+                    self.assertEqual(rec.suggested_size_pct, 0.0)
+                    self.assertEqual(rec.sizing_provenance["final_pct"], 0.0)
+                    self.assertEqual(rec.sizing_provenance["status"], rs.ADVISORY_STATUS_ZERO_REFERENCE)
+                    self.assertGreater(rec.sizing_provenance["raw_pct"], 0)
+
+    def test_falha_do_helper_numerico_nao_derruba_a_recomendacao(self):
+        with patch.object(rs, "_adv_finite", side_effect=RuntimeError(SEGREDO)):
+            rec = _constroi(_sinal(), score=50.0)
+        self.assertIsNone(rec.suggested_size_pct)
+        self.assertEqual(rec.sizing_provenance["reason_code"], rs.ADV_REASON_INTERNAL_ERROR)
+        self.assertIsNone(rec.sizing_provenance["final_pct"])
+        self.assertIsNotNone(rec.bot_verdict)
+        self.assertNotIn(SEGREDO, rec.model_dump_json())
+
+    def test_variar_so_referencia_preserva_operacao_na_construcao_real(self):
+        referencias = (_calc(), _calc(prob_tp1=.5), _calc(prob_tp1=None))
+        recs = []
+        for referencia in referencias:
+            with patch.object(rs, "_compute_dynamic_size", return_value=referencia):
+                recs.append(_constroi(_sinal(), score=50.0))
+        self.assertEqual([r.sizing_provenance["status"] for r in recs],
+                         [rs.ADVISORY_STATUS_READY, rs.ADVISORY_STATUS_NO_POSITIVE_EDGE,
+                          rs.ADVISORY_STATUS_UNAVAILABLE])
+        self.assertIsNotNone(recs[0].bot_verdict)
+        campos = ("risk_pct", "leverage", "margin_pct", "stop_distance_pct", "entry_grade", "bot_verdict")
+        esperado = [getattr(recs[0], c) for c in campos]
+        quantidades = []
+        for rec in recs:
+            self.assertEqual([getattr(rec, c) for c in campos], esperado)
+            sizing = sts._compute_qty(rec.entry, rec.stop_loss, rec.risk_pct,
+                                      1000.0, leverage=rec.leverage)
+            self.assertIsNotNone(sizing)
+            quantidades.append(sizing)
+        self.assertTrue(all(q == quantidades[0] for q in quantidades))
+
     def test_multiplicador_positivo_move_valor_e_proveniencia_juntos(self):
         with patch.object(sts, "_edge_mult", return_value=(0.5, "teste")):
             rec = _constroi(_sinal(), score=50.0)
@@ -550,11 +606,15 @@ class IndependenciaOperacional(unittest.TestCase):
             self.assertEqual(v, vereditos[0])
 
     def test_multiplicadores_reais_nao_olham_a_referencia(self):
-        for fn in (sts._edge_mult, sts._liq_tier_mult, sts._conviction_mult):
-            with self.subTest(fn=fn.__name__):
-                saidas = [fn(self._rec_operacional(**v)) for v in self.VARIANTES]
-                for s in saidas[1:]:
-                    self.assertEqual(s, saidas[0])
+        with patch.object(sts, "EDGE_SIZING_ENABLED", True), \
+             patch.object(sts, "LIQ_TIER_SIZING_ENABLED", True), \
+             patch.object(sts, "CONVICTION_SIZING_ENABLED", True):
+            for fn in (sts._edge_mult, sts._liq_tier_mult, sts._conviction_mult):
+                with self.subTest(fn=fn.__name__):
+                    saidas = [fn(self._rec_operacional(**v)) for v in self.VARIANTES]
+                    self.assertNotIn(saidas[0][1], ("disabled", "off"))
+                    for s in saidas[1:]:
+                        self.assertEqual(s, saidas[0])
 
     def test_risk_pct_e_quantidade_nao_mudam(self):
         for v in self.VARIANTES:

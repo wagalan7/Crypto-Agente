@@ -130,7 +130,7 @@ Sem tabela, coluna ou migration.
 |---|---|---|---|---|---|
 | `p=.52`, RR1 = 1, RRfinal = 3 | 0,36 | **7,20%** | 0,04 | **0,80%** | 0,80% |
 | `p=.70`, RR1 = 1, RRfinal = 3 | 0,60 | **12,00%** | 0,40 | **8,00%** | **1,00%** |
-| `p=.50`, RR1 = 1 | +0,167 | 3,33% | 0,00 | 0,00% | **0,00%** |
+| `p=.50`, RR1 = 1, RRfinal = 3 | +0,333 | 6,67% | 0,00 | 0,00% | **0,00%** |
 | `p=.70`, RR1 = 0,40 | +0,10 (piso `b=0,5`) | 2,00% | **−0,05** | 0,00% | **0,00%** |
 | `score = 0`, `p=.70`, RR1 = 1 | 0,40 | 0,00% | 0,40 | 0,00% | **0,00%** (antes 0,25%) |
 
@@ -142,12 +142,12 @@ correção real pode ficar invisível se só o número exibido for comparado.
 
 ## 7. Testes
 
-`backend/tests/test_r06b3_kelly_semantics.py` — **50 testes herméticos**
+`backend/tests/test_r06b3_kelly_semantics.py` — **54 testes herméticos**
 (rede/DNS bloqueados e contabilizados; sem exchange, banco, credencial, holdout
 ou ordem real), com a matemática de referência reimplementada dentro do teste.
 
-Blocos: fórmula e geometria (18) · contrato e ausência (9) · integração completa
-(8) · independência operacional (6) · frontend e rotulagem (8). A integração
+Blocos: fórmula e geometria · contrato e ausência · integração completa
+· independência operacional · frontend e rotulagem. A integração
 exercita `_build_recommendation` **real** e valida o retorno serializado
 inteiro, não um helper isolado.
 
@@ -194,3 +194,25 @@ de isolamento preexistente naquele arquivo, contornada aqui, não corrigida lá.
 - **Nenhuma integração nova ao dimensionamento real** foi criada, e o zero
   consultivo **não** é bloqueio operacional.
 - Testes travam contratos; não provam ausência de bugs.
+
+## 9. Revisão de integração antes da publicação
+
+Na revisão de `b575fb99`, três lacunas foram reproduzidas e corrigidas:
+
+- Multiplicador de exibição zero (ou produto que arredonda a zero por underflow)
+  voltava ao piso de 0,25%; agora encerra a cadeia em `ZERO_REFERENCE`, preserva
+  `raw_pct` do núcleo e grava `final_pct=0`. Um multiplicador posterior não reativa
+  a referência.
+- ATR finito extremo podia produzir intermediários infinitos, depois escondidos
+  pelo clamp; a razão de volatilidade e a conversão em percentual são validadas
+  antes de usar ou formatar o resultado.
+- A contenção de falhas do núcleo não cobria a montagem final da proveniência;
+  agora cálculo, pós-multiplicadores e proveniência ficam contidos dentro da
+  construção real da recomendação. Falhar na referência não derruba `bot_verdict`.
+
+Os testes adicionais falharam antes da correção (seis subcasos e uma exceção) e
+passaram depois. O teste de independência do TP2 agora exige calibração READY e
+compara valores brutos calculados; o teste de independência operacional atravessa
+`_build_recommendation` com referências positiva, zero e ausente, comparando os
+campos operacionais e a quantidade derivada deles. Os multiplicadores reais também
+são exercitados com suas flags ligadas. Não é um teste de envio de ordens.

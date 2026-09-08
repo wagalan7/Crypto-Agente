@@ -381,10 +381,9 @@ class Recommendation(BaseModel):
     # prob_tp1 (sempre <=). Usada no sizing por convicção (#2a) como sinal
     # aditivo. None se calib imatura.
     prob_tp2: Optional[float] = None          # 0..1
-    # ── Position sizing dinâmico (Issue #4 — Kelly fracionado) ────────────
-    # Tamanho sugerido em % da banca, baseado em prob_tp1 × RR × score × volatilidade.
-    # Diferente de risk_pct (que é o % de PERDA aceitável se o stop bater).
-    # Cap [0.25%, 1.0%]. None se não foi possível computar (calib não pronta etc).
+    # ── Referência consultiva de risco (Kelly até o TP1) ─────────────────
+    # Fração teórica de risco da banca, não notional/margem nem risk_pct do bot.
+    # Positiva: cap [0.25%, 1.0%]; zero: resposta do modelo; None: indisponível.
     suggested_size_pct: Optional[float] = None
     size_rationale: Optional[str] = None      # explicação curta PT-BR (UI tooltip)
     # ── Proveniência da referência consultiva de risco (R06B3) ────────────
@@ -1233,7 +1232,7 @@ async def _best_tf_for_symbol(symbol: str) -> Optional[tuple]:
 #    drawdowns brutais; fracionário reduz variância. Indústria usa 25-50%.
 #  - ATR de referência 2%: típico de cripto liquid; size cresce/encolhe em
 #    proporção inversa. Cap em [0.5, 2.0] pra evitar explosão.
-#  - WR fallback por tier quando prob_tp1 não está pronta (calib < 30 trades).
+#  - Probabilidade indisponível: referência consultiva indisponível.
 KELLY_FRACTION = 0.25
 ATR_REFERENCE_PCT = 0.02
 ATR_MULT_FLOOR = 0.5
@@ -1241,8 +1240,7 @@ ATR_MULT_CEIL = 2.0
 SIZE_MIN_PCT = 0.25
 SIZE_MAX_PCT = 1.0
 
-# Fallback de WR por tier (alinhado com backtests recentes).
-# Usado quando prob_tp1 está None (calibração ainda imatura).
+# Constante legada preservada para caracterização; não alimenta o Kelly consultivo.
 _TIER_WR_FALLBACK = {"A+": 0.62, "A": 0.55, "B": 0.50}
 
 
@@ -1399,7 +1397,7 @@ def _adv_finite(value) -> Optional[float]:
         return None
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return f if math.isfinite(f) else None
 
@@ -1543,8 +1541,13 @@ def _compute_dynamic_size(
             if a is None or a <= 0:
                 return _adv_unavailable(ADV_REASON_ATR_INVALID,
                                         probability_used=p, rr_tp1=b)
-            vol_mult = max(ATR_MULT_FLOOR, min(ATR_MULT_CEIL, ATR_REFERENCE_PCT / a))
-            vol_note = f"ATR {a*100:.1f}% → mult {vol_mult:.2f}"
+            vol_raw = _adv_finite(ATR_REFERENCE_PCT / a)
+            atr_percent = _adv_finite(a * 100.0)
+            if vol_raw is None or atr_percent is None:
+                return _adv_unavailable(ADV_REASON_ATR_INVALID,
+                                        probability_used=p, rr_tp1=b)
+            vol_mult = max(ATR_MULT_FLOOR, min(ATR_MULT_CEIL, vol_raw))
+            vol_note = f"ATR {atr_percent:.1f}% → mult {vol_mult:.2f}"
 
         # 8. Kelly binário sobre o payoff do TP1.
         kelly_full = _adv_finite(p - (1.0 - p) / b)
@@ -1836,49 +1839,58 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         _adv_blocking = True
 
     atr_pct_val = sig.indicators.atr_pct if sig.indicators else None
-    _advisory = _compute_dynamic_size(
-        direction=sig.direction,
-        entry=sig.entry,
-        stop_loss=sig.stop_loss,
-        tp1=sig.tp1,
-        score=score,
-        prob_tp1=prob_tp1,
-        atr_pct=atr_pct_val,
-        probability_contract_blocking=_adv_blocking or prob_blocking,
-    )
-    suggested_size_pct = _advisory.pct
-    size_rationale = _advisory.rationale
-    sizing_prov = dict(_advisory.provenance)
+    try:
+        _advisory = _compute_dynamic_size(
+            direction=sig.direction,
+            entry=sig.entry,
+            stop_loss=sig.stop_loss,
+            tp1=sig.tp1,
+            score=score,
+            prob_tp1=prob_tp1,
+            atr_pct=atr_pct_val,
+            probability_contract_blocking=_adv_blocking or prob_blocking,
+        )
+        suggested_size_pct = _advisory.pct
+        size_rationale = _advisory.rationale
+        sizing_prov = dict(_advisory.provenance)
 
-    # Espelha EDGE_SIZING e LIQ_TIER_SIZING do bot no número EXIBIDO, para o app
-    # contar a mesma história. Espelhar multiplicador NÃO torna esta referência
-    # igual ao tamanho executado. Gated: NO-OP com as flags off.
-    # Só mordem referência ESTRITAMENTE positiva: `None` continua `None` e zero
-    # continua zero — nenhum piso pode ressuscitar um zero.
-    if suggested_size_pct is not None and suggested_size_pct > 0:
-        for _nome, _importa, _args in (
-            ("edge", "_edge_mult", {"edge_tags": edge_tags, "edge_score": edge_score}),
-            ("liq", "_liq_tier_mult", {"quote_vol_usd": getattr(sig, "quote_vol_usd", None)}),
-        ):
-            try:
-                import importlib
-                _fn = getattr(importlib.import_module("services.shadow_trade_service"), _importa)
-                _mult = _adv_finite(_fn(_args)[0])
-            except Exception:
-                _mult = None
-            if _mult is None or _mult < 0:
-                # Multiplicador quebrado não pode virar NaN nem referência
-                # inventada: suprime a referência com motivo controlado.
-                _advisory = _adv_unavailable(ADV_REASON_MULTIPLIER_INVALID)
-                suggested_size_pct, size_rationale = _advisory.pct, _advisory.rationale
-                sizing_prov = dict(_advisory.provenance)
-                break
-            if _mult != 1.0:
-                suggested_size_pct = round(min(max(suggested_size_pct * _mult, 0.25), 1.0), 2)
-                size_rationale = f"{size_rationale} · {_nome} ×{_mult:.2f}"
+        # Multiplicadores apenas consultivos. Um produto zero encerra a cadeia;
+        # os pisos e multiplicadores seguintes não podem reativar a referência.
+        if suggested_size_pct is not None and suggested_size_pct > 0:
+            for _nome, _importa, _args in (
+                ("edge", "_edge_mult", {"edge_tags": edge_tags, "edge_score": edge_score}),
+                ("liq", "_liq_tier_mult", {"quote_vol_usd": getattr(sig, "quote_vol_usd", None)}),
+            ):
+                try:
+                    import importlib
+                    _fn = getattr(importlib.import_module("services.shadow_trade_service"), _importa)
+                    _mult = _adv_finite(_fn(_args)[0])
+                except Exception:
+                    _mult = None
+                _scaled = (_adv_finite(suggested_size_pct * _mult)
+                           if _mult is not None and _mult >= 0 else None)
+                if _scaled is None:
+                    _advisory = _adv_unavailable(ADV_REASON_MULTIPLIER_INVALID)
+                    suggested_size_pct, size_rationale = _advisory.pct, _advisory.rationale
+                    sizing_prov = dict(_advisory.provenance)
+                    break
+                if _scaled == 0:
+                    suggested_size_pct = 0.0
+                    sizing_prov["status"] = ADVISORY_STATUS_ZERO_REFERENCE
+                    sizing_prov["reason_code"] = ADV_REASON_ZERO_AFTER_HEURISTICS
+                    size_rationale = f"Referência zerada pelo multiplicador de exibição {_nome}."
+                    break
+                if _mult != 1.0:
+                    suggested_size_pct = round(min(max(_scaled, SIZE_MIN_PCT), SIZE_MAX_PCT), 2)
+                    size_rationale = f"{size_rationale} · {_nome} ×{_mult:.2f}"
 
-    # A proveniência acompanha o valor FINAL, depois de edge/liq e arredondamento.
-    sizing_prov["final_pct"] = _adv_finite(suggested_size_pct)
+        sizing_prov["final_pct"] = _adv_finite(suggested_size_pct)
+    except Exception:
+        # A contenção inclui integração, pós-multiplicadores e proveniência.
+        # A referência pode falhar sem derrubar a recomendação operacional.
+        _advisory = _adv_hard_failure()
+        suggested_size_pct, size_rationale = _advisory.pct, _advisory.rationale
+        sizing_prov = dict(_advisory.provenance)
 
     # Veredito do bot (mesma lógica/limites do loop de execução — fonte única).
     # Read-only: NÃO toca no loop real; só anexa "o bot operaria / não operaria"
