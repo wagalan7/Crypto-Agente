@@ -272,6 +272,60 @@ interface StopDiagnosis {
     }
   }
   offline_lab?: OfflineLab
+  regime_playbooks?: RegimePlaybooks
+}
+
+/** R07A — playbooks por regime. Somente análise: nada aqui altera estratégia. */
+interface R07Hypothesis {
+  id?: string
+  label?: string | null
+  hash?: string | null
+  status?: string
+  reason_code?: string | null
+  detail?: string | null
+  stops_avoided?: number | null
+  wins_removed?: number | null
+  operations_preserved_pct?: number | null
+  risks?: string[]
+  validation?: {
+    evaluable?: number
+    coverage_pct?: number | null
+    operations_removed?: number
+    excluded_total?: number
+    unknown_reasons?: Record<string, number>
+  } | null
+}
+
+interface RegimePlaybooks {
+  status?: string
+  reason_code?: string | null
+  error?: string
+  baseline_name?: string
+  limitations?: string[]
+  temporal_purge?: { applied?: boolean; purged?: number; kept?: number } | null
+  scenarios?: {
+    train?: R07ScenarioDist
+    validation?: R07ScenarioDist
+  }
+  hypotheses?: R07Hypothesis[]
+}
+
+interface R07ScenarioDist {
+  total?: number
+  with_r07_context?: number
+  legacy_without_context?: number
+  context_coverage_pct?: number | null
+  macro?: Record<string, number>
+  trend?: Record<string, number>
+  structure?: Record<string, number>
+}
+
+const R07_STATUS_LABEL: Record<string, string> = {
+  VALIDATION_SUPPORTED: 'sustentada só na validação',
+  NOT_SUPPORTED: 'não sustentada',
+  INSUFFICIENT_EVIDENCE: 'evidência insuficiente',
+  NO_INCREMENTAL_CHANGE: 'sem efeito além do baseline',
+  UNAVAILABLE: 'indisponível',
 }
 
 const LAB_STATUS_LABEL: Record<string, string> = {
@@ -1211,6 +1265,87 @@ export default function AssertivenessPanel({ onClose }: Props) {
                             <strong className="text-slate-400">Validação apoiada não significa aprovação.</strong>{' '}
                             O teste final ainda não foi aberto. Nenhuma alteração foi aplicada à estratégia.
                           </p>
+                        </div>
+                      )
+                    })()}
+
+                    {/* ── R07A Playbooks por regime (somente análise) ──────── */}
+                    {sd.regime_playbooks && (() => {
+                      const pb = sd.regime_playbooks!
+                      const cen = pb.scenarios?.validation
+                      const hips = pb.hypotheses ?? []
+                      return (
+                        <div className="mt-2 p-2 rounded-lg border border-teal-500/30 bg-teal-500/5">
+                          <div className="flex items-center gap-2 mb-1 flex-wrap">
+                            <div className="text-[11px] font-bold text-teal-200">
+                              Playbooks por regime (R07A)
+                            </div>
+                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-slate-700/60 text-slate-300">
+                              {R07_STATUS_LABEL[pb.status ?? ''] ?? (pb.status ?? '—')}
+                            </span>
+                          </div>
+                          {pb.error || pb.status === 'UNAVAILABLE' ? (
+                            <div className="text-[10px] text-slate-400">
+                              Seção indisponível nesta execução. As demais análises seguem válidas.
+                            </div>
+                          ) : (
+                            <>
+                              <div className="text-[10px] text-slate-400 mb-1">
+                                Cobertura de contexto na validação:{' '}
+                                <span className="font-mono text-slate-200">
+                                  {cen?.context_coverage_pct ?? '—'}%
+                                </span>
+                                {' '}({cen?.with_r07_context ?? 0} com contexto ·{' '}
+                                {cen?.legacy_without_context ?? 0} legado sem contexto)
+                                {pb.temporal_purge?.applied
+                                  ? ` · ${pb.temporal_purge.purged ?? 0} purgadas por cronologia`
+                                  : ''}
+                              </div>
+                              {cen?.trend && Object.keys(cen.trend).length > 0 && (
+                                <div className="text-[10px] text-slate-400 mb-1">
+                                  Cenários de tendência:{' '}
+                                  {Object.entries(cen.trend)
+                                    .map(([k, v]) => `${k}: ${v}`)
+                                    .join(' · ')}
+                                </div>
+                              )}
+                              <div className="flex flex-col gap-1">
+                                {hips.map((h) => (
+                                  <div key={h.id} className="text-[10px] text-slate-300 leading-snug">
+                                    <span className="font-semibold text-teal-200">{h.label ?? h.id}</span>
+                                    {' — '}
+                                    <span className="text-slate-400">
+                                      {R07_STATUS_LABEL[h.status ?? ''] ?? (h.status ?? '—')}
+                                    </span>
+                                    {h.status !== 'UNAVAILABLE' && h.status !== 'NO_INCREMENTAL_CHANGE' && (
+                                      <span className="text-slate-400">
+                                        {' '}· stops removidos:{' '}
+                                        <span className="font-mono text-slate-200">{h.stops_avoided ?? '—'}</span>
+                                        {' '}· wins removidos:{' '}
+                                        <span className="font-mono text-amber-300">{h.wins_removed ?? '—'}</span>
+                                        {' '}· desconhecidos excluídos:{' '}
+                                        <span className="font-mono text-slate-200">
+                                          {h.validation?.excluded_total ?? '—'}
+                                        </span>
+                                      </span>
+                                    )}
+                                  </div>
+                                ))}
+                                {hips.length === 0 && (
+                                  <div className="text-[10px] text-slate-500">
+                                    Nenhuma hipótese pôde ser avaliada nesta execução.
+                                  </div>
+                                )}
+                              </div>
+                              <div className="mt-1 text-[9px] text-slate-500 leading-snug">
+                                {pb.baseline_name ?? 'baseline reconstruído sobre setups SHADOW'}.{' '}
+                                Linhas excluídas por dado desconhecido não são operações evitadas.
+                              </div>
+                            </>
+                          )}
+                          <div className="mt-1 text-[10px] font-semibold text-teal-300">
+                            Somente análise — nenhuma estratégia foi alterada.
+                          </div>
                         </div>
                       )
                     })()}

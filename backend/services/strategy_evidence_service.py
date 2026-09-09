@@ -2555,6 +2555,12 @@ async def load_stop_shadow_split(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any
         if boundary is not None and allowed_ids:
             # (3) Outcome só até a borda da VALIDAÇÃO; ties são aparados pelo
             # conjunto exato de ids, então nenhuma linha de teste entra.
+            # R07A: o filtro por `allowed_ids` entra no PRÓPRIO SELECT. Antes ele
+            # só era aplicado depois de `.all()`, então uma linha do TESTE que
+            # empatasse no timestamp da borda tinha seu outcome e suas features
+            # materializados no processo — o descarte vinha tarde demais para
+            # manter o holdout selado. O aparo por id continua no retorno como
+            # segunda defesa; o split e os demais filtros não mudam.
             detail = (await session.execute(
                 select(RS.id, RS.symbol, RS.timeframe, RS.tier, RS.direction,
                        RS.score, RS.status, RS.realized_r, RS.features,
@@ -2563,6 +2569,7 @@ async def load_stop_shadow_split(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any
                 .where(RS.outcome_at.is_not(None))
                 .where(RS.outcome_at >= since)
                 .where(RS.outcome_at <= boundary)
+                .where(RS.id.in_(allowed_ids))
                 .where(_calib._not_fast_void())
             )).all()
             for row in detail:
@@ -3602,6 +3609,24 @@ async def build_stop_diagnosis(days: int = P052A_WINDOW_DAYS) -> Dict[str, Any]:
             "limitations": P052B_LIMITATIONS, "error": str(exc),
         }
 
+    # R07A — playbooks por regime. Recebe as MESMAS linhas de treino/validação
+    # já carregadas: nenhum loader, consulta ou cache paralelo. Fail-soft — o
+    # erro deixa só esta seção UNAVAILABLE e não afeta stop_readiness.
+    try:
+        from services import regime_playbook_service as _r07
+        out["regime_playbooks"] = _r07.build_regime_playbooks(train, validation)
+    except Exception as exc:
+        log.warning(f"[r07a] playbooks por regime falharam: {exc}")
+        out["regime_playbooks"] = {
+            "phase": "R07A", "execution_mode": "ANALYTICS_ONLY", "read_only": True,
+            "executable": False, "promotable": False, "opens_holdout": False,
+            "holdout_status": HOLDOUT_SEALED, "holdout_outcomes_read": False,
+            "holdout_metrics_computed": False,
+            "status": "UNAVAILABLE", "reason_code": "SECTION_ERROR",
+            "detail": "não foi possível montar os playbooks nesta execução",
+            "hypotheses": [], "error": str(exc),
+        }
+
     try:
         from services import assertiveness_service as _assert
         out["real"] = await _assert.real_stop_summary(days)
@@ -3617,7 +3642,8 @@ def _stop_diagnosis_cacheable(value: Dict[str, Any]) -> bool:
     """Falha total ou parcial nunca permanece no cache do diagnóstico."""
     if value.get("error") or value.get("patterns_error"):
         return False
-    for section in ("shadow", "segments", "trajectory", "real", "offline_lab"):
+    for section in ("shadow", "segments", "trajectory", "real", "offline_lab",
+                    "regime_playbooks"):
         block = value.get(section)
         if isinstance(block, dict) and block.get("error"):
             return False

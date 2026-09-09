@@ -1591,3 +1591,63 @@ Doc: `docs/R06B3_KELLY_SEMANTICS.md`.
   operacionais exercitados com flags ligadas nos testes.
 - TypeScript, py_compile, diff-check e build Vite aprovados. Build temporário
   preservou frontend/dist. Dimensionamento real, flags e histórico inalterados.
+
+## R07A — playbooks por regime: contratos e comparação offline
+
+Base `a50a206c`, branch `main`. ANALYTICS_ONLY, non-promotable, sem ligação com
+o executor. Doc: `docs/R07A_REGIME_PLAYBOOKS_OFFLINE.md`.
+
+- **Mapa das regras**: `block_all`, `block_alt_longs`, `downgrade_alt_longs`,
+  `downgrade_shorts`/`block_shorts`, `symbol_counter_trend`, penalidade
+  contratendência na seleção e breakout/retest, separados em três dimensões
+  (macro / tendência EMA do ativo / estrutura do setup). Registrado: `NORMAL`
+  não é lateralidade e pode vir com `quality` UNKNOWN/DISABLED; `aligned_count`
+  não substitui `higher_tfs[].ema_aligned`; nome de padrão não prova rompimento;
+  `retest_armed=None` não prova ausência; `is_btc_symbol` é a política vigente
+  (e só reconhece major com separador no símbolo — observado, não alterado).
+- **Contexto prospectivo**: novo `regime_playbook_service.py` com adaptador PURO
+  e allowlist estrita; `features["r07_context"]` gravado só em snapshots NOVOS,
+  dentro da escrita existente. Sem tabela/coluna/migration/ENV/flag/endpoint/
+  worker. `_current_regime_label` virou wrapper de `_current_regime_state` — a
+  MESMA consulta macro por batch, sem chamada extra. `captured_at`,
+  `observed_at_ms` e `created_at` ficam separados; observação posterior à
+  captura torna a macro `UNKNOWN`, sem retrodatar nada. Anotação tolerante:
+  falha não impede o save e preserva p05_context/p05_path/probability_contract.
+- **Classificador + catálogo**: dimensões, evidências, faltantes e motivos
+  controlados; TF duplicado não conta duas vezes; conflito no mesmo TF vira
+  incerto; `horizontal_channel` só afirma canal DETECTADO. Catálogo é
+  informativo, não regra executável. Histórico sem contexto aparece como LEGACY,
+  sem reconstrução por proxy e sem backfill.
+- **Três hipóteses congeladas** (H1 contratendência EMA, H2 shorts rebaixados,
+  H3 alt longs rebaixados), com config versionada e hash SHA-256 determinístico;
+  nenhuma combina regras nem usa range/rompimento.
+- **CORREÇÃO DO HOLDOUT**: `load_stop_shadow_split` passou a filtrar por
+  `RS.id.in_(allowed_ids)` NO PRÓPRIO SELECT de detalhes. Antes o descarte só
+  ocorria depois de `.all()`, então um empate de timestamp na borda
+  materializava outcome/features de linha do TESTE. Split, demais filtros e a
+  defesa por id no retorno permanecem.
+- **Cronologia**: purga R07 exclui da validação setups cujo `created_at` não é
+  posterior ao último `resolved_at` do treino (sem timestamp ⇒ purgado). Não
+  altera as partições dos consumidores P05.
+- **Comparação**: reutiliza as primitivas do P05 (`_partition_outcomes`,
+  `_lab_metric_row`, `compute_evidence_metrics`, bootstrap pareado, wilson,
+  regressões por segmento). Baseline nomeado "baseline de seleção reconstruído
+  sobre setups SHADOW". UNKNOWN excluído simetricamente ANTES do resultado;
+  `baseline=False` nunca vira True; stops removidos sempre acompanhados dos wins
+  removidos; linhas excluídas não são operações evitadas.
+- **Estados** no namespace R07: UNAVAILABLE / INSUFFICIENT_EVIDENCE /
+  NO_INCREMENTAL_CHANGE / NOT_SUPPORTED / VALIDATION_SUPPORTED. Reutiliza os
+  CHECKS de redução de perdas, não o wrapper que exige `PERSISTENT_ADVERSE` —
+  esse marcador não foi falsificado. `VALIDATION_SUPPORTED` não abre holdout,
+  não libera P05.2C, não cria experimento e não autoriza execução.
+- **Integração**: `regime_playbooks` entra no diagnóstico de stops existente com
+  os mesmos dados e o mesmo cache; erro deixa só a seção UNAVAILABLE, não fica
+  cacheado como sucesso e não afeta `stop_readiness`. Seção pequena no
+  `AssertivenessPanel`; sem rota nova, sem `main.py`, sem `frontend/dist`.
+- **Testes**: 53 testes R07A herméticos e comportamentais verdes; suíte completa
+  do backend **1.591 verdes** com 2 skips pré-existentes do R05C
+  (`fixture auditada indisponível (esperado no repo)`). `py_compile`,
+  `tsc --noEmit` e `git diff --check` aprovados.
+- **Limites**: snapshots são pós-filtro/pós-seleção; contexto é o do SAVE;
+  baseline é reconstrução, não replay; nenhuma redução real de stops ou de lucro
+  foi demonstrada; cobertura em produção NÃO foi consultada.

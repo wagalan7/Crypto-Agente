@@ -148,7 +148,8 @@ TRAIL_ACTIVATION_BUFFER_ATR = 0.5
 
 
 def _extract_features(
-    rec: Dict[str, Any], created_at: datetime, regime_label: str | None = None
+    rec: Dict[str, Any], created_at: datetime, regime_label: str | None = None,
+    regime_state: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Captura vetor de features pro learning loop. Robust a campos ausentes.
 
@@ -177,6 +178,7 @@ def _extract_features(
             "day_of_week": created_at.weekday(),
             "regime": regime_label,
             "probability_contract": prob_contract,
+            **_r07_annotation(rec, {}, regime_state, created_at),
         }
 
     ind = sig.get("indicators") or {}
@@ -245,6 +247,8 @@ def _extract_features(
         "probability_contract": prob_contract,
         # P05 — contexto versionado do MOMENTO da decisão (namespace isolado).
         "p05_context": _p05_context(rec, sig, created_at, regime_label, atr_pct),
+        # R07A — contexto prospectivo (ANALYTICS_ONLY), namespace próprio.
+        **_r07_annotation(rec, sig, regime_state, created_at),
     }
 
 
@@ -1051,13 +1055,66 @@ def stage_feature_namespace_merge(snap, key: str = "p05_path") -> bool:
 
 async def _current_regime_label() -> str | None:
     """Rótulo do regime de mercado AGORA (fail-soft, cache de 10min no service).
-    Chamado 1x por batch de save — não por rec. None se indisponível."""
+    Chamado 1x por batch de save — não por rec. None se indisponível.
+
+    Wrapper LEGADO preservado: quem só quer o rótulo continua chamando isto.
+    Quem precisa do payload completo usa `_current_regime_state`, que faz a
+    MESMA consulta única — nenhuma chamada macro extra por batch.
+    """
+    return (await _current_regime_state())[0]
+
+
+async def _current_regime_state() -> tuple[str | None, dict | None]:
+    """(rótulo, payload macro) numa ÚNICA consulta por batch.
+
+    O R07A precisa das flags, da `quality` e do `observed_at_ms` para montar o
+    contexto prospectivo; reaproveitar este resultado evita uma segunda ida ao
+    `regime_service`. Fail-soft: erro devolve (None, None).
+    """
     try:
         from services.regime_service import get_regime_status
         rg = await get_regime_status()
-        return (rg or {}).get("regime")
+        if not isinstance(rg, dict):
+            return None, None
+        return rg.get("regime"), rg
     except Exception as e:
-        log.debug(f"[snapshot] regime label indisponível: {e}")
+        log.debug(f"[snapshot] regime state indisponível: {e}")
+        return None, None
+
+
+def _r07_annotation(rec: Dict[str, Any], sig: Any,
+                    regime_state: Dict[str, Any] | None,
+                    captured_at: datetime) -> Dict[str, Any]:
+    """Namespace R07A do contexto prospectivo. Anotação TOLERANTE.
+
+    Qualquer falha devolve `{}` — a recomendação é salva do mesmo jeito, a
+    deduplicação/outcome/classificação não mudam, nenhum snapshot histórico é
+    regravado e os demais namespaces (p05_context, p05_path,
+    probability_contract) ficam intactos.
+    """
+    try:
+        from services import regime_playbook_service as r07
+        return {r07.R07_CONTEXT_KEY: r07.build_r07_context(
+            rec, sig if isinstance(sig, dict) else {}, regime_state,
+            captured_at=captured_at,
+            is_major=_r07_is_major(rec.get("symbol")),
+            ct_brake=r07.ct_brake_config(),
+        )}
+    except Exception as e:
+        log.debug(f"[r07] anotação de contexto indisponível: {e}")
+        return {}
+
+
+def _r07_is_major(symbol: Any) -> bool | None:
+    """Política de majors VIGENTE (`regime_service.is_btc_symbol`).
+
+    Não recriamos uma lista paralela: se o serviço não puder responder, o campo
+    fica `None` e o classificador trata como desconhecido.
+    """
+    try:
+        from services.regime_service import is_btc_symbol
+        return bool(is_btc_symbol(str(symbol))) if symbol else None
+    except Exception:
         return None
 
 
@@ -1177,7 +1234,8 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
     inserted = 0
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=DEDUP_WINDOW_HOURS)
-    _regime_label = await _current_regime_label()  # 1x por batch (#A — audit por regime)
+    # 1x por batch (#A — audit por regime; R07A reaproveita o MESMO payload)
+    _regime_label, _regime_state = await _current_regime_state()
 
     async with get_session() as session:
         _p05_shadow_context = await _load_p05_shadow_context(session)
@@ -1303,7 +1361,7 @@ async def save_recommendations(recommendations: List[Dict[str, Any]]) -> int:
                 if isinstance(sig, dict):
                     tp1 = sig.get("tp1")
 
-                _features = _extract_features(rec, now, _regime_label)
+                _features = _extract_features(rec, now, _regime_label, _regime_state)
                 _features = _annotate_p05_features(
                     _features, rec, now, _p05_shadow_context
                 )
@@ -1364,7 +1422,8 @@ async def save_wide_display_snapshots(recommendations: List[Dict[str, Any]]) -> 
 
     inserted = 0
     now = datetime.now(timezone.utc)
-    _regime_label = await _current_regime_label()  # 1x por batch (#A — audit por regime)
+    # 1x por batch (#A — audit por regime; R07A reaproveita o MESMO payload)
+    _regime_label, _regime_state = await _current_regime_state()
     # Sem rastreio (Opção B OFF): poda 'wide' aos WIDE_DISPLAY_TTL_HOURS — só a
     # dedup importa, não há outcome a guardar. Com rastreio ON: NÃO podar aos 6h,
     # senão mataríamos snapshots ainda EM VOO antes do outcome. Deixa viver até o
@@ -1487,7 +1546,7 @@ async def save_wide_display_snapshots(recommendations: List[Dict[str, Any]]) -> 
                     stop_distance_pct=float(rec.get("stop_distance_pct", 0.0)),
                     status=WIDE_DISPLAY_STATUS,
                     created_at=now,
-                    features=_extract_features(rec, now, _regime_label),
+                    features=_extract_features(rec, now, _regime_label, _regime_state),
                 )
                 session.add(snap)
                 rec["_just_saved"] = True
