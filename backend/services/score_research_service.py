@@ -50,12 +50,13 @@ REASON_WEIGHTS_NOT_NUMERIC = "WEIGHTS_NOT_NUMERIC"
 REASON_WEIGHTS_NEGATIVE = "WEIGHTS_NEGATIVE"
 REASON_WEIGHTS_SUM_ZERO = "WEIGHTS_SUM_NOT_POSITIVE"
 REASON_WEIGHTS_MISSING_KEY = "WEIGHTS_MISSING_KEY"
+REASON_WEIGHTS_OVERFLOW = "WEIGHTS_ARITHMETIC_OVERFLOW"
 REASON_COMPARISON_UNAVAILABLE = "COMPARISON_UNAVAILABLE"
 LAB_REASON_CODES = frozenset({
     REASON_OK, REASON_NO_COMPONENT, REASON_NO_CONFLUENCE, REASON_NOT_NUMERIC,
     REASON_NOT_FINITE, REASON_OUT_OF_DOMAIN, REASON_WEIGHTS_NOT_NUMERIC,
     REASON_WEIGHTS_NEGATIVE, REASON_WEIGHTS_SUM_ZERO,
-    REASON_WEIGHTS_MISSING_KEY, REASON_COMPARISON_UNAVAILABLE,
+    REASON_WEIGHTS_MISSING_KEY, REASON_WEIGHTS_OVERFLOW, REASON_COMPARISON_UNAVAILABLE,
 })
 
 #: Domínios DOCUMENTADOS das entradas. Fora deles o laboratório RECUSA em vez de
@@ -118,7 +119,10 @@ def validate_weights(weights: Any) -> Tuple[Optional[Dict[str, float]], Optional
         if valor < 0:
             return None, REASON_WEIGHTS_NEGATIVE
         limpos[chave] = valor
-    if sum(limpos.values()) <= 0:
+    total = sum(limpos.values())
+    if not math.isfinite(total):
+        return None, REASON_WEIGHTS_OVERFLOW
+    if total <= 0:
         return None, REASON_WEIGHTS_SUM_ZERO
     return limpos, None
 
@@ -230,7 +234,16 @@ def score_v2_raw(*, confluence_pct=None, adx=None, funding_pct=None,
         return _resultado(FORMULA_V2_RAW, STATUS_UNAVAILABLE, REASON_NO_COMPONENT,
                           components=normalizados, missing=ausentes, config=cfg)
 
-    score = round(max(0.0, min(100.0, num / den)), 1)
+    # Pesos individuais finitos não garantem soma/produto finito. Não deixar
+    # o clamp converter overflow/NaN em score 100; preservar a fórmula normal.
+    if not math.isfinite(num) or not math.isfinite(den):
+        return _resultado(FORMULA_V2_RAW, STATUS_INVALID_CONFIG, REASON_WEIGHTS_OVERFLOW,
+                          components=normalizados, missing=ausentes, config=cfg)
+    raw_score = num / den
+    if not math.isfinite(raw_score):
+        return _resultado(FORMULA_V2_RAW, STATUS_INVALID_CONFIG, REASON_WEIGHTS_OVERFLOW,
+                          components=normalizados, missing=ausentes, config=cfg)
+    score = round(max(0.0, min(100.0, raw_score)), 1)
     ativo = {k: (pesos[k] > 0 and normalizados[k] is not None) for k in WEIGHT_KEYS}
     efetivos = {k: (pesos[k] / den if ativo[k] else 0.0) for k in WEIGHT_KEYS}
     contrib = {k: (round(pesos[k] * normalizados[k] / den, 6) if ativo[k] else 0.0)

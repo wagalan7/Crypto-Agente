@@ -20,18 +20,30 @@ produção.
 | 1 | confluência | indicadores, padrões, SMC, derivativos, MTF | soma de fatores, `clamp(0, MAX_TOTAL)`, `pct = total/MAX_TOTAL×100` | `confluence.pct` 0–100 | fórmula V2 e legada | `confluence_service.WEIGHTS` | `features.confluence_pct` |
 | 2 | **score bruto** | `confluence_pct`, `adx`, `funding_pct` | `_compute_score_v2`: normaliza, renormaliza sobre presentes, `clamp`, `round(1)` | 0–100 | `_finish_score` | `SCORE_V2_W_CONF/ADX/DER` | os três insumos existem |
 | 2b | fallback legado | confluence, MTF, RR, win-rate, derivativos, breakout | `_compute_score_legacy` | 0–100 (outra escala) | `_finish_score` | pesos fixos no código | **componentes não persistidos** |
-| 3 | **score-base** | score bruto | `_finish_score`: `×_htf_relevance_mult(tf)`, `clamp`, `round(1)` | 0–100 | seleção, `Recommendation.score` | `_HTF_WEIGHT`, `HIGH_TF_PATTERNS_ENABLED` | só o resultado |
-| 4 | bônus HTF | score-base + direções confirmadas | `_score_with_htf_confirm`: `+HIGH_TF_CONFIRM_BONUS`, teto 100 | 0–100 | seleção | `HIGH_TF_CONFIRM_BONUS` | **não persistido separadamente** |
-| 5 | pontuação de **seleção** | score do passo 4 | `_sel_key`: `− CT_BRAKE_SELECT_PENALTY` se contratendência | ordenação | `_pick_best_signal` | `CT_BRAKE_*` | **não persistida** |
-| 6 | tier | score-base + gates | `_classify_tier` | `A+/A/B/None` | recomendação | cortes 75/65/52 ou V2 65/46/18 | `snapshot.tier` |
-| 7 | **ajuste de execução** | `rec.score` + features | `_compute_score_adjustment`: soma deltas, `clamp(±SCORE_ADJUSTER_CAP)` | score efetivo | comparado a `SCORE_MIN` | `SCORE_ADJUSTERS_ENABLED`, `SCORE_ADJUSTER_CAP` | espelhado em `_execution_score` |
+| 3 | **score-base** | score bruto | `_finish_score`: `×_htf_relevance_mult(tf)`, `clamp`, `round(1)` | 0–100, antes do bônus HTF | passo 4 | `_HTF_WEIGHT`, `HIGH_TF_PATTERNS_ENABLED` | **não isolado em `snapshot.score`** |
+| 4 | bônus HTF | score-base + direções confirmadas | `_score_with_htf_confirm`: `+HIGH_TF_CONFIRM_BONUS`, teto 100 | score do candidato | seleção e candidato escolhido | `HIGH_TF_CONFIRM_BONUS` | **não persistido separadamente** |
+| 5 | pontuação de **seleção** | score do passo 4 | `_sel_key`: `− CT_BRAKE_SELECT_PENALTY` se contratendência | chave para escolher o candidato, sem alterar seu score | `max(scored, key=_sel_key)` nos caminhos batch/server | `CT_BRAKE_*` | **não persistida** |
+| 5b | **auto-learning multiplicativo** | score do candidato escolhido + tier provisório para lookup | `apply_score_adjustment`: multiplicador por buckets; pode bloquear o candidato | score ajustado antes do tier final | passo 6 e `Recommendation.score` | configuração de `learning_service` | resultado agregado em `snapshot.score`, **sem decomposição do ajuste** |
+| 6 | tier final | score após passo 5b + gates | `_classify_tier` / `_classify_tier_vision` e gates posteriores | `A+/A/B/None` | recomendação | cortes 75/65/52 ou V2 65/46/18 | `snapshot.tier` |
+| 7 | **ajuste aditivo de execução** | `rec.score` + features | `_compute_score_adjustment`: soma deltas, `clamp(±SCORE_ADJUSTER_CAP)` no delta | `rec.score + delta` | comparado a `SCORE_MIN` | `SCORE_ADJUSTERS_ENABLED`, `SCORE_ADJUSTER_CAP` | espelhado em `_execution_score` |
 
 **Separação explícita pedida:** (1) score bruto = passo 2; (2) score-base = passo
-3; (3) bônus HTF e auto-learning = passos 4 e 7; (4) pontuação de seleção =
-passo 5; (5) corte de execução = passo 7 comparado a `SCORE_MIN`.
+3; (3) bônus HTF e auto-learning multiplicativo = passos 4 e 5b; (4) pontuação
+de seleção = passo 5, uma chave penalizada que não substitui o score do
+candidato; (5) corte de execução = passo 7 comparado a `SCORE_MIN`.
 
-O `snapshot.score` guarda o **score-base** (passo 3). Ele **não** é o número
-comparado com `SCORE_MIN`, e não é a pontuação usada na ordenação.
+O `snapshot.score` guarda **`rec.score`**, que já pode incluir o bônus HTF e o
+auto-learning multiplicativo aplicado **antes do tier final**. Não representa
+necessariamente nem o score bruto (passo 2), nem o score-base (passo 3). Esse
+score também participa da ordenação final das recomendações por tier/score,
+mas não armazena a chave penalizada da seleção do passo 5. O executor parte de
+`rec.score` e depois soma os adjusters do passo 7: o número comparado a
+`SCORE_MIN` pode ser diferente (ou igual, se o ajuste estiver desligado/zerado).
+
+Rastreabilidade no checkout: `recommendation_service.py:1204,2415` (bônus HTF),
+`:2222–2243,2618–2635` (auto-learning antes do tier final), `:1937,2680`
+(construção da recomendação) e `snapshot_service.py:1377,1542`
+(`score=float(rec["score"])`). Os arquivos estão em `backend/services/`.
 
 > Os valores de configuração citados são os do **checkout local**. Não são, e
 > não devem ser apresentados como, configuração confirmada de produção — a
@@ -50,37 +62,64 @@ Reutilizar o mesmo indicador **não é, por si, defeito**.
 
 ### A1 — ADX: camadas com sinais opostos · *assimetria comprovada*
 
-O ADX entra três vezes: na confluência (`ADX>35 → +18`, `ADX>25 → +12`,
-`ADX<20 → penalidade`), como componente externo da V2 (linear, mais é melhor) e
-no ajuste de execução (`adx < 20 → +6`, `adx > 30 → −2`).
+O ADX entra três vezes: na confluência (`ADX>35 → +10`, `25<ADX≤35 → +6`,
+`ADX<20 → −3`, em pontos do agregado antes da normalização;
+`confluence_service.py:256–276`), como componente externo da V2 (linear até a
+saturação, mais é melhor) e no ajuste de execução
+(`adx < 20 → +6`, `adx > 30 → −2`).
 
 ```
-conf=70, sem funding:
-  ADX  5 → V2 bruta 50.0  |  score de execução (base 60) = 66.0
-  ADX 45 → V2 bruta 76.7  |  score de execução (base 60) = 58.0
+Dois cálculos independentes (não encadeados):
+  V2: conf=70, sem funding      |  ajuste isolado: entrada fixa 60, só ADX
+  ADX  5 → V2 bruta 50.0       |  60 + 6 = 66.0
+  ADX 45 → V2 bruta 76.7       |  60 − 2 = 58.0
 ```
 
-A fórmula bruta sobe **+26,7 pontos** com ADX alto; o ajuste que decide a
-execução **desce 8 pontos** no mesmo movimento. Efeito operacional: um setup com
-tendência forte precisa de um score-base bem maior para sobreviver ao mesmo
-`SCORE_MIN`. Que isso *cause* prejuízo é **hipótese não demonstrada** — os pesos
-do ajuste vêm de um estudo de lift (N=237) citado no código, que não foi
-reauditado aqui.
+Os pesos explícitos da V2 são `conf=0.60, adx=0.30, der=0.10`. No teste isolado,
+`_exec(adx=...)` **não recebe confluência**, apesar de a V2 usar `conf=70`;
+as demais features, inclusive horário, também estão ausentes. A entrada 60 é
+fixada artificialmente e o cap do delta é 20. A fórmula bruta sobe **+26,7
+pontos** com ADX alto; o ajuste isolado cai **8 pontos**. Isso comprova sinais
+opostos entre essas camadas, **não** uma queda do score final do bot. Mantida a
+mesma entrada e sem outros deltas, o ADX alto exige 8 pontos a mais dessa entrada
+para atingir o mesmo `SCORE_MIN`.
+
+Como contraste, um exemplo local **acoplado de apenas duas etapas** alimenta o
+espelho do executor (`_execution_score`) com a V2 bruta e passa `conf=70` e ADX
+nas duas etapas, mantendo os pesos acima, cap 20 e demais features ausentes:
+
+```
+ADX  5 → V2 50.0 + confluência 12 + ADX 6 = 68.0
+ADX 45 → V2 76.7 + confluência 12 − ADX 2 = 86.7
+```
+
+Nesse recorte o resultado **sobe 18,7 pontos**. A confluência permanece fixa,
+sem recalcular seu ADX interno; HTF, seleção, auto-learning, tiers e demais gates
+ficam de fora. **Não é replay completo do bot nem evidência de lucro/prejuízo.**
+Que a oposição entre camadas *cause* prejuízo é **hipótese não demonstrada** —
+os pesos do ajuste vêm de um estudo de lift (N=237) citado no código, que não
+foi reauditado aqui.
 
 ### A2 — Confluência não-monotônica no ajuste · *assimetria comprovada*
 
 `conf < 50 → −4`; `50 ≤ conf ≤ 70 → +12`; `conf > 70 → 0`.
 
+Aqui também se isola o ajuste: entrada fixa em 60, cap 20 e apenas
+`confluence_pct` presente, sem ADX, funding, horário ou demais features. Os
+valores abaixo **não** usam a V2 bruta como entrada:
+
 ```
-conf 49.9 → score de execução 56.0
-conf 50.0 → score de execução 72.0     (+16 num passo de 0,1)
-conf 70.0 → score de execução 72.0
-conf 70.1 → score de execução 60.0     (−12 num passo de 0,1)
+conf 49.9 → 60 + ajuste = 56.0
+conf 50.0 → 60 + ajuste = 72.0     (+16 num passo de 0,1)
+conf 70.0 → 60 + ajuste = 72.0
+conf 70.1 → 60 + ajuste = 60.0     (−12 num passo de 0,1)
 ```
 
-Entre 70,0 e 70,1 **mais** confluência produz **menos** score efetivo, enquanto a
-V2 bruta anda no sentido contrário (70,0 → 70,1). São dois degraus de borda, um
-deles com inversão de sentido.
+Entre 70,0 e 70,1 **mais** confluência produz **menos** score nesse cálculo
+isolado, enquanto a V2 bruta, calculada separadamente só com confluência, anda
+no sentido contrário (70,0 → 70,1). São dois degraus de borda do adjuster, um
+deles com inversão de sentido. Isso não mede o pipeline completo nem o efeito
+econômico; outros deltas e o cap podem mudar o efeito observado no executor.
 
 ### A3 — Funding: três camadas e uma assimetria de lado · *sobreposição + assimetria*
 
@@ -132,12 +171,16 @@ diz) e está correto. Registrado aqui porque muda a interpretação: dois snapsh
 com a mesma confluência podem ter scores diferentes só pela presença dos outros
 componentes.
 
-### A7 — Score-base ≠ score do gate · *sobreposição estrutural*
+### A7 — Score persistido e score do gate são etapas distintas · *sobreposição estrutural*
 
-O passo 4 soma `HIGH_TF_CONFIRM_BONUS` e o passo 7 soma até `±SCORE_ADJUSTER_CAP`.
-`snapshot.score` guarda o passo 3. Comparar `snapshot.score` com `SCORE_MIN`
-seria comparar coisas diferentes — é exatamente por isso que
-`strategy_evidence_service._execution_score` existe.
+O passo 4 pode somar `HIGH_TF_CONFIRM_BONUS` e o passo 5b pode aplicar um
+multiplicador de auto-learning, **antes** do tier final. `snapshot.score`
+persiste esse `rec.score`, não o passo 3 isolado. A penalidade de seleção do
+passo 5 afeta a escolha, mas não é deduzida do score persistido. Só depois o
+executor soma até `±SCORE_ADJUSTER_CAP` (passo 7), se habilitado. Portanto,
+comparar diretamente `snapshot.score` com `SCORE_MIN` ignora esse ajuste
+posterior — é por isso que `strategy_evidence_service._execution_score`
+existe. Com delta zero/desligado, os números podem coincidir.
 
 ### A8 — RSI/Stochastic de reversão vs. tendência EMA · *hipótese não demonstrada*
 
@@ -169,6 +212,13 @@ numérica, `NaN` e infinito são recusados; valores fora dos domínios documenta
 (`confluence_pct` e `adx` em 0–100, `funding_pct` em −100–100) são recusados.
 Pesos precisam ser finitos, não negativos e com soma positiva — configuração
 inválida **não** é corrigida em silêncio.
+
+Mesmo pesos individualmente finitos podem causar overflow: a soma dos pesos,
+o acumulador ponderado e o quociente bruto precisam permanecer finitos **antes
+do clamp**. Caso contrário, o laboratório retorna `INVALID_CONFIG` /
+`WEIGHTS_ARITHMETIC_OVERFLOW`, `score=None` e nenhuma contribuição, sem fabricar
+score 100. A comparação fica indisponível, com `delta=None`. Esse reforço é
+local ao laboratório e não altera a fórmula de produção.
 
 **Saída:** `schema_version`, `formula_id`, `status`, `reason_code`, `score` ou
 `None`, componentes normalizados, pesos efetivos, contribuições, componentes

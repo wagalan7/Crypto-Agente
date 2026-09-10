@@ -1683,14 +1683,17 @@ o executor. Doc: `docs/R07A_REGIME_PLAYBOOKS_OFFLINE.md`.
 Base `7d202144`, branch `main`. `LOCAL_RESEARCH_ONLY`: nenhum caminho de produção
 importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
 
-- **Mapa do pipeline** (7 etapas, com entrada/transformação/saída/consumidor/
-  configuração/dado histórico), separando score bruto → score-base → bônus HTF e
-  auto-learning → pontuação de seleção → corte de execução. Registrado que
-  `snapshot.score` guarda o SCORE-BASE e **não** é o número comparado a
-  `SCORE_MIN`. Config citada é a LOCAL, não confirmada de produção.
+- **Mapa do pipeline** (entrada/transformação/saída/consumidor/configuração/dado
+  histórico), separando score bruto → score-base → bônus HTF → seleção →
+  auto-learning → tier final → corte de execução. Registrado que
+  `snapshot.score` guarda a pontuação da RECOMENDAÇÃO (pode incluir HTF e
+  auto-learning) antes dos adjusters, **não** necessariamente o score-base puro
+  nem o número comparado a `SCORE_MIN`. Mapa retificado na revisão abaixo.
+  Config citada é a LOCAL, não confirmada de produção.
 - **Achados comprovados** (com exemplo numérico determinístico):
   A1 ADX sobe a V2 bruta (+26,7 com conf=70, ADX 5→45) e DESCE no ajuste de
-  execução (66,0 → 58,0) — camadas com sinais opostos;
+  execução ISOLADO (base fixa 60: 66,0 → 58,0, demais features ausentes) — camadas
+  com sinais opostos, não queda líquida comprovada no pipeline;
   A2 confluência não-monotônica no ajuste: 70,0 → 72,0 mas 70,1 → 60,0, e
   degrau de +16 na borda de 50;
   A3 funding em três camadas e a V2 bruta ignora o lado (long e short = 74,3
@@ -1699,7 +1702,7 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
   A5 arredondamento absorve < 0,05 ponto;
   A6 ausência renormaliza (peso efetivo da confluência 0,600 → 1,000) — isto é
   deliberado e está correto;
-  A7 score-base ≠ score do gate.
+  A7 score persistido e score do gate são etapas distintas.
   Marcados como **hipótese não demonstrada**: RSI/Stoch de reversão vs. tendência
   EMA (A8) e MTF em duas camadas (A9).
 - **Laboratório** `score_research_service.py`: baseline "V2 bruta sob
@@ -1717,10 +1720,35 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
 - **Proposta por cenário** documentada SEM inventar multiplicador ou peso por
   regime, sem combinar com H1/H2/H3 e sem virar veto ou score operacional.
 - **Testes**: 37 testes R08A herméticos verdes; 400 verdes nas regressões
-  R06/R07/R08; suíte completa do backend **1.645 verdes** com 2 skips
+  R06/R07/R08; suíte completa do backend **1.645 executados** com 2 skips
   pré-existentes do R05C (`fixture auditada indisponível (esperado no repo)`).
   `py_compile` e `git diff --check` aprovados; frontend não mudou.
 - **Limites**: nenhum dado de produção carregado, sem loader, coleta ou
   backfill; holdout não acessado; diferença de pontuação NÃO estima lucro, stops
   evitados ou volume real; A1 e A2 são contradições de CAMADA — mexer na V2 sem
   mexer no ajuste de execução pode não alterar nada no gate.
+
+## R08A — revisão pontual: finitude e precisão do mapa
+
+- **Base:** `4cb46da7`, checkout principal/main. Só laboratório, testes e
+  documentação; nenhum serviço operacional, frontend ou configuração alterado.
+- **Overflow:** pesos individuais finitos podiam gerar acumulados `inf`, score
+  fabricado 100 e contribuições `NaN`/`inf`. Soma dos pesos, acumulados e quociente
+  agora exigem finitude antes do clamp. Recusa explícita
+  `INVALID_CONFIG / WEIGHTS_ARITHMETIC_OVERFLOW`, score ausente; comparação fica
+  indisponível com delta ausente. Sem normalização corretiva silenciosa.
+- **Paridade:** pesos altos mas computáveis continuam aceitos; fórmula, clamp e
+  arredondamento normais preservados e comparados com a V2 real.
+- **Mapa corrigido:** snapshot guarda `rec.score`, incluindo HTF/auto-learning
+  quando aplicados. Auto-learning multiplicativo precede o tier final; não é o
+  ajuste aditivo do executor. Confluência ADX corrigida para +10/+6/−3.
+- **A1/A2:** exemplos identificam base fixa e features ausentes. A composição
+  local V2 + adjusters com conf=70 e ADX 5→45 resulta em 68→86,7: oposição entre
+  parcelas não demonstra queda do score combinado. Não é replay integral nem
+  evidência de lucro ou de redução de stops.
+- **Validação:** cinco cenários de overflow + comparação reproduzidos RED→GREEN;
+  **41 testes R08A aprovados**. Suíte completa: **1.649 executados, 1.647 aprovados,
+  2 skips R05C preexistentes**, sem falhas/erros. `py_compile` e `git diff --check`
+  aprovados. Sem banco/exchange real.
+- **Invariantes:** laboratório continua isolado, nenhuma estratégia ou ordem
+  alterada, holdout preservado; sem push/deploy, R08B não iniciado.

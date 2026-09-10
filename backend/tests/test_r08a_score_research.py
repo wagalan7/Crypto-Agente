@@ -309,6 +309,46 @@ class Contratos(unittest.TestCase):
         self.assertEqual(len(a["config_hash"]), 64)
         self.assertNotIn("score", json.dumps(a["config"]))
 
+    def test_overflow_de_pesos_finitos_nao_produz_score_ou_json_invalido(self):
+        casos = [
+            # Soma dos pesos, produto individual e soma dos produtos, respectivamente.
+            ({"conf": 1e308, "adx": 1e308, "der": 1e308}, 70., 30., 0.),
+            ({"conf": 1e307, "adx": 0., "der": 0.}, 70., None, None),
+            ({"conf": 0., "adx": 1e307, "der": 0.}, 70., 35., None),
+            ({"conf": 0., "adx": 0., "der": 1e307}, 70., None, 0.),
+            ({"conf": 1e306, "adx": 1e306, "der": 1e306}, 100., 50., -.05),
+        ]
+        for pesos, conf, adx, funding in casos:
+            with self.subTest(pesos=pesos):
+                self.assertTrue(all(math.isfinite(w) for w in pesos.values()))
+                out = lab.score_v2_raw(confluence_pct=conf, adx=adx,
+                                       funding_pct=funding, weights=pesos)
+                self.assertEqual(out["status"], lab.STATUS_INVALID_CONFIG)
+                self.assertEqual(out["reason_code"], "WEIGHTS_ARITHMETIC_OVERFLOW")
+                self.assertIsNone(out["score"])
+                self.assertEqual(out["contributions"], {})
+                self.assertEqual(out["effective_weights"], {})
+                json.dumps(out, allow_nan=False)
+
+    def test_comparacao_com_overflow_nao_fabrica_delta(self):
+        out = lab.compare_formulas(confluence_pct=70.,
+                                   weights={"conf": 1e307, "adx": 0., "der": 0.})
+        self.assertFalse(out["comparable"])
+        self.assertIsNone(out["delta"])
+        self.assertEqual(out["baseline"]["status"], lab.STATUS_INVALID_CONFIG)
+        self.assertEqual(out["ablation"]["score"], 70.)
+        json.dumps(out, allow_nan=False)
+
+    def test_peso_alto_sem_overflow_preserva_paridade(self):
+        pesos = {"conf": 1e300, "adx": 1e300, "der": 1e300}
+        out = lab.score_v2_raw(confluence_pct=70., adx=30., funding_pct=0.,
+                               weights=pesos)
+        self.assertEqual(out["status"], lab.STATUS_OK)
+        self.assertEqual(out["score"], _v2_real(70., 30., 0., pesos))
+        self.assertAlmostEqual(sum(out["effective_weights"].values()), 1.)
+        self.assertAlmostEqual(sum(out["contributions"].values()), 60., places=5)
+        json.dumps(out, allow_nan=False)
+
     def test_entradas_nao_sao_mutadas(self):
         pesos = dict(W)
         copia = dict(pesos)
@@ -403,7 +443,7 @@ class Auditoria(unittest.TestCase):
                                     self.CFG_EXEC)
 
     def test_A1_adx_sobe_a_formula_bruta_e_desce_no_ajuste_de_execucao(self):
-        """ADX alto AUMENTA a V2 bruta e DIMINUI o score comparado ao SCORE_MIN."""
+        """Camadas isoladas: V2 sobe; adjuster cai com base FIXA, sem confluência."""
         v2_baixo = lab.score_v2_raw(confluence_pct=70.0, adx=5.0, funding_pct=None,
                                     weights=W)["score"]
         v2_alto = lab.score_v2_raw(confluence_pct=70.0, adx=45.0, funding_pct=None,
@@ -415,8 +455,17 @@ class Auditoria(unittest.TestCase):
         self.assertAlmostEqual(v2_alto - v2_baixo, 26.7, places=1)
         self.assertAlmostEqual(exec_baixo - exec_alto, 8.0, places=6)
 
+    def test_A1_composicao_local_nao_confunde_ajuste_com_efeito_liquido(self):
+        # Apenas V2 bruta + adjusters, não replay do bot com HTF/learning/seleção.
+        scores = []
+        for adx in (5., 45.):
+            base = lab.score_v2_raw(confluence_pct=70., adx=adx, weights=W)["score"]
+            scores.append(self._exec(score=base, confluence_pct=70., adx=adx))
+        self.assertEqual(scores, [68., 86.7])
+        self.assertGreater(scores[1], scores[0])
+
     def test_A2_confluencia_nao_monotonica_no_ajuste_de_execucao(self):
-        """70.0 → 72.0, mas 70.1 → 60.0: MAIS confluência, MENOS score efetivo."""
+        """Ajuste isolado: base FIXA 60, demais features ausentes; não replay."""
         self.assertEqual(self._exec(confluence_pct=70.0), 72.0)
         self.assertEqual(self._exec(confluence_pct=70.1), 60.0)
         self.assertLess(self._exec(confluence_pct=70.1),
@@ -465,8 +514,8 @@ class Auditoria(unittest.TestCase):
         self.assertNotEqual(completo["score"], so_conf["score"])
         self.assertEqual(so_conf["missing_components"], ["adx", "der"])
 
-    def test_A7_score_base_nao_e_o_score_comparado_ao_score_min(self):
-        """Existem etapas depois da fórmula bruta: HTF, auto-learning e ajuste."""
+    def test_A7_score_da_recomendacao_ainda_recebe_ajuste_de_execucao(self):
+        """Snapshot guarda rec.score (pode conter HTF/learning), antes de adjusters."""
         base = 60.0
         self.assertNotEqual(self._exec(score=base, confluence_pct=60.0), base)
         # e o bônus de confirmação HTF é aditivo sobre o score-base
