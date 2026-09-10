@@ -10,9 +10,12 @@ experimento ou toca no executor.
 from __future__ import annotations
 
 import json
+import asyncio
+from copy import deepcopy
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 BACKEND = Path(__file__).resolve().parents[1]
@@ -61,10 +64,17 @@ def _macro(**over):
     return base
 
 
-def _sig(*, tfs=(("4h", "bearish"), ("1d", "bearish")), patterns=(), timestamp=1):
-    return {"mtf": {"higher_tfs": [{"timeframe": tf, "ema_aligned": al}
+def _sig(*, tfs=(("4h", "bearish"), ("1d", "bearish")), patterns=(), timestamp=None,
+         captured_at=AGORA):
+    ms = int(captured_at.timestamp() * 1000)
+    fresh = {"candle": {"quality": "FRESH", "source": "rest",
+                         "close_time_ms": ms - 10_000,
+                         "observed_at_ms": ms - 5_000}}
+    return {"mtf": {"higher_tfs": [{"timeframe": tf, "ema_aligned": al,
+                                    "data_freshness": deepcopy(fresh)}
                                    for tf, al in tfs]},
-            "patterns": list(patterns), "timestamp": timestamp}
+            "data_freshness": fresh,
+            "patterns": list(patterns), "timestamp": ms - 1_000 if timestamp is None else timestamp}
 
 
 def _ctx(direction="long", *, tfs=(("4h", "bearish"), ("1d", "bearish")),
@@ -72,19 +82,36 @@ def _ctx(direction="long", *, tfs=(("4h", "bearish"), ("1d", "bearish")),
          symbol="SOLUSDT"):
     return r07.build_r07_context(
         {"direction": direction, "symbol": symbol, "entry_zone_type": "limit_pullback"},
-        _sig(tfs=tfs, patterns=patterns),
-        macro if macro is not None else _macro(),
+        _sig(tfs=tfs, patterns=patterns, captured_at=captured_at),
+        macro if macro is not None else _macro(
+            observed_at_ms=int(captured_at.timestamp() * 1000) - 5_000),
         captured_at=captured_at, is_major=is_major, ct_brake=ct)
 
 
 def _row(i, direction, status, r, ctx, *, created=None, resolved=None):
+    context_created = (datetime.fromisoformat(ctx["captured_at"])
+                       if isinstance(ctx, dict) and ctx.get("captured_at") else AGORA)
+    created = created or context_created
     return {"id": i, "dedupe_key": f"snap:{i}", "symbol": "SOLUSDT",
             "timeframe": "4h", "tier": "A", "direction": direction, "score": 80.0,
             "status": status, "realized_r": r, "stop_distance_pct": 1.0,
-            "created_at": created or (AGORA - timedelta(days=10)),
-            "resolved_at": resolved or (AGORA - timedelta(days=9)),
+            "created_at": created,
+            "resolved_at": resolved or (created + timedelta(hours=1)),
             "features": {"regime": "NORMAL", "bot_verdict_ok": True,
                          "edge_score": 2, r07.R07_CONTEXT_KEY: ctx}}
+
+
+def _stage(n=100, affected=20, *, at=AGORA, offset=0):
+    """Instantes coerentes: 20 vetos perdedores + 70 wins/10 stops mantidos."""
+    rows = []
+    for i in range(n):
+        veto = i < affected
+        loss = veto or i >= max(affected, n - 10)
+        ctx = _ctx("long", tfs=(("4h", "bearish" if veto else "bullish"),),
+                   captured_at=at)
+        rows.append(_row(offset+i, "long", "lost" if loss else "won_tp1",
+                         -1.0 if loss else 2.0, ctx))
+    return rows
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -158,6 +185,62 @@ class ContextoProspectivo(unittest.TestCase):
         cls = r07.classify_context(ctx)
         self.assertEqual(cls["macro"], [r07.DIM_UNKNOWN])
         self.assertIn(r07.REASON_MACRO_STALE_OBSERVATION, cls["reasons"])
+
+    def test_macro_exige_fresh_timestamp_positivo_e_flags_explicitas(self):
+        hyp = "H2_ABSTAIN_DOWNGRADED_SHORTS"
+        cases = [("quality", x) for x in (None, "MYSTERY", "DEGRADED", "STALE")]
+        cases += [("observed_at_ms", x) for x in
+                  (None, 0, -1, True, "123", float("inf"), float("nan"))]
+        cases += [("filter_enabled", x) for x in (None, 1, "true", False)]
+        cases += [("downgrade_shorts", x) for x in (None, 0, "false")]
+        for key, value in cases:
+            with self.subTest(key=key, value=repr(value)):
+                ctx = _ctx("short", macro=_macro(**{key: value}))
+                self.assertEqual(r07.decide(hyp, ctx)["decision"], r07.UNKNOWN)
+        ctx = _ctx("short")
+        del ctx["macro"]["downgrade_shorts"]
+        self.assertEqual(r07.decide(hyp, ctx)["decision"], r07.UNKNOWN)
+        self.assertEqual(r07.decide(hyp, _ctx("short"))["decision"], r07.KEEP)
+
+    def test_macro_e_captura_precisam_provar_instante(self):
+        for value in (None, "", "invalid", "1970-01-01T00:00:00+00:00"):
+            with self.subTest(captured_at=value):
+                ctx = _ctx("short")
+                ctx["captured_at"] = value
+                self.assertEqual(r07.decide("H2_ABSTAIN_DOWNGRADED_SHORTS", ctx)
+                                 ["decision"], r07.UNKNOWN)
+
+    def test_allowlist_preserva_proveniencia_dos_tfs(self):
+        sig = _sig()
+        ctx = r07.build_r07_context({"direction": "long", "symbol": "SOLUSDT"},
+                                    sig, _macro(), captured_at=AGORA,
+                                    is_major=False, ct_brake=CT)
+        actual = ctx["higher_tfs"][0]["data_freshness"]["candle"]
+        expected = sig["mtf"]["higher_tfs"][0]["data_freshness"]["candle"]
+        self.assertEqual({key: actual[key] for key in expected}, expected)
+        self.assertNotIn("open", json.dumps(ctx["higher_tfs"]))
+
+    def test_h1_recusa_tf_sem_freshness_ou_futuro(self):
+        for key, value in (("quality", None), ("quality", "UNKNOWN"),
+                           ("quality", "MYSTERY"), ("source", None),
+                           ("observed_at_ms", None), ("close_time_ms", None),
+                           ("observed_at_ms", int(AGORA.timestamp()*1000)+1),
+                           ("close_time_ms", int(AGORA.timestamp()*1000)+1),
+                           ("observed_at_ms", 0), ("close_time_ms", True)):
+            with self.subTest(key=key, value=value):
+                sig = _sig(tfs=(("4h", "bearish"),))
+                sig["mtf"]["higher_tfs"][0]["data_freshness"]["candle"][key] = value
+                ctx = r07.build_r07_context({"direction": "long"}, sig, _macro(),
+                                            captured_at=AGORA, is_major=False,
+                                            ct_brake=CT)
+                self.assertEqual(r07.decide("H1_ABSTAIN_COUNTER_TREND", ctx)
+                                 ["decision"], r07.UNKNOWN)
+        sig = _sig(tfs=(("4h", "bearish"),))
+        del sig["mtf"]["higher_tfs"][0]["data_freshness"]
+        ctx = r07.build_r07_context({"direction": "long"}, sig, _macro(),
+                                    captured_at=AGORA, is_major=False, ct_brake=CT)
+        self.assertEqual(r07.decide("H1_ABSTAIN_COUNTER_TREND", ctx)["decision"],
+                         r07.UNKNOWN)
 
     def test_anotacao_falha_sem_interromper_o_save(self):
         with patch.object(r07, "build_r07_context", side_effect=RuntimeError("boom")):
@@ -263,6 +346,14 @@ class Classificacao(unittest.TestCase):
     def test_tendencia_mista_nao_e_inequivoca(self):
         ctx = _ctx(tfs=(("4h", "bullish"), ("1d", "bearish")))
         self.assertEqual(r07.classify_context(ctx)["trend"], r07.TREND_MIXED)
+
+    def test_schema_booleano_e_tf_mixed_conflitante_nao_passam(self):
+        ctx = _ctx()
+        ctx["schema_version"] = True
+        self.assertEqual(r07.decide("H1_ABSTAIN_COUNTER_TREND", ctx)["decision"], r07.UNKNOWN)
+        ctx = _ctx(tfs=(("4h", "bullish"), ("4h", "mixed")))
+        self.assertEqual(r07.classify_context(ctx)["trend"], r07.TREND_UNCERTAIN)
+        self.assertEqual(r07.decide("H1_ABSTAIN_COUNTER_TREND", ctx)["decision"], r07.UNKNOWN)
 
     def test_ausencia_de_tf_nao_vira_alinhamento_favoravel(self):
         for tfs in ((), (("4h", None),), (("4h", "neutral"),)):
@@ -417,6 +508,81 @@ class HipotesesOffline(unittest.TestCase):
         self.assertEqual(comp["excluded"]["baseline_blocked"], 1)
         self.assertEqual(comp["champion"]["exposure"], 1)
 
+    def test_cobertura_nao_confunde_bloqueio_conhecido_com_unknown(self):
+        rows = _stage()
+        for row in rows[:75]:
+            row["features"]["bot_verdict_ok"] = False
+            row["features"]["bot_verdict_blocked_by"] = "rr-gate"
+        out = self._comparacao(rows)
+        self.assertEqual(out["coverage_pct"], 100.0)
+        self.assertEqual(out["known_baseline_blocked"], 75)
+        self.assertEqual(out["evaluable"], 25)
+        self.assertEqual(out["excluded"]["baseline_unknown"], 0)
+        self.assertEqual(out["excluded"]["rule_unknown"], 0)
+
+    def test_comparacao_recusa_contexto_de_outro_lado_ou_instante(self):
+        for kind in ("direction", "capture_future", "macro_future", "tf_future",
+                     "missing_created", "signal_future"):
+            with self.subTest(kind=kind):
+                ctx = _ctx("long", tfs=(("4h", "bearish"),))
+                row = _row(1, "long", "lost", -1.0, ctx)
+                hyp = "H1_ABSTAIN_COUNTER_TREND"
+                if kind == "direction":
+                    row["direction"] = "short"
+                elif kind == "capture_future":
+                    row["created_at"] = AGORA - timedelta(seconds=10)
+                elif kind == "macro_future":
+                    ctx["macro"]["observed_at_ms"] = int(AGORA.timestamp()*1000)+1
+                    hyp = "H2_ABSTAIN_DOWNGRADED_SHORTS"
+                    row["direction"] = ctx["direction"] = "short"
+                elif kind == "tf_future":
+                    ctx["higher_tfs"][0].setdefault("data_freshness", {}).setdefault(
+                        "candle", {})["observed_at_ms"] = int(AGORA.timestamp()*1000)+1
+                elif kind == "missing_created":
+                    row["created_at"] = None
+                else:
+                    ctx["signal_timestamp_ms"] = int(AGORA.timestamp()*1000)+1
+                out = self._comparacao([row], hyp)
+                self.assertEqual(out["evaluable"], 0)
+                self.assertEqual(out["excluded"]["rule_unknown"], 1)
+
+    def test_bloqueios_nao_escondem_falta_de_contexto_nas_elegiveis(self):
+        train = _stage()
+        valid = _stage(at=AGORA+timedelta(days=1), offset=1000)
+        for group in (train, valid):
+            for row in group[:99]:
+                row["features"]["bot_verdict_ok"] = False
+                row["features"]["bot_verdict_blocked_by"] = "rr-gate"
+            group[-1]["features"][r07.R07_CONTEXT_KEY] = None
+        out = r07.build_regime_playbooks(train, valid)["hypotheses"][0]
+        self.assertEqual(out["train"]["coverage_pct"], 99.0)
+        self.assertEqual(out["train"]["eligible_rule_coverage_pct"], 0.0)
+        self.assertEqual(out["status"], r07.R07_INSUFFICIENT)
+
+    def test_cobertura_de_decisoes_independe_da_qualidade_do_outcome(self):
+        rows = _stage()
+        original = self._comparacao(rows)
+        damaged = deepcopy(rows)
+        for row in damaged[:25]:
+            row["realized_r"] = float("nan")
+        current = self._comparacao(damaged)
+        self.assertEqual(original["known_decisions"], current["known_decisions"])
+        self.assertEqual(current["coverage_pct"], 100.0)
+        self.assertEqual(current["eligible_rule_coverage_pct"], 100.0)
+        self.assertEqual(current["metric_coverage_pct"], 75.0)
+        self.assertEqual(current["excluded"]["metric_unavailable"], 25)
+
+    def test_desconhecido_nao_le_outcome_para_decidir_exclusao(self):
+        class SealedOutcome(dict):
+            def get(self, key, *default):
+                if key in ("realized_r", "status", "outcome_class"):
+                    raise AssertionError("outcome consultado antes do membership")
+                return super().get(key, *default)
+        row = SealedOutcome(_row(1, "long", "lost", -1.0, None))
+        comp = self._comparacao([row])
+        self.assertEqual(comp["unknown_total"], 1)
+        self.assertEqual(comp["evaluable"], 0)
+
     def test_stops_evitados_vem_acompanhados_dos_wins_removidos(self):
         vetados = ([_row(i, "long", "lost", -1.0, _ctx("long", tfs=(("4h", "bearish"),)))
                     for i in range(8)]
@@ -430,9 +596,9 @@ class HipotesesOffline(unittest.TestCase):
         self.assertEqual(comp["wins_removed"], 3)   # o custo aparece junto
 
     def test_regra_sem_impacto_nao_recebe_credito(self):
-        linhas = [_row(i, "long", "lost", -1.0, _ctx("long", tfs=(("4h", "bullish"),)))
-                  for i in range(30)]
-        out = r07.build_regime_playbooks(linhas, linhas)
+        train = _stage(30, 0)
+        valid = _stage(30, 0, at=AGORA+timedelta(days=1), offset=100)
+        out = r07.build_regime_playbooks(train, valid)
         h1 = next(h for h in out["hypotheses"] if h["id"] == "H1_ABSTAIN_COUNTER_TREND")
         self.assertEqual(h1["status"], r07.R07_NO_INCREMENTAL_CHANGE)
         self.assertEqual(h1["validation"]["operations_removed"], 0)
@@ -441,8 +607,49 @@ class HipotesesOffline(unittest.TestCase):
     def test_amostra_vazia_nao_vira_zero_nem_suporte(self):
         out = r07.build_regime_playbooks([], [])
         for h in out["hypotheses"]:
-            self.assertNotEqual(h["status"], r07.R07_VALIDATION_SUPPORTED)
+            self.assertEqual(h["status"], r07.R07_INSUFFICIENT)
         self.assertIsNone(out["scenarios"]["train"]["context_coverage_pct"])
+
+    def test_validacao_purgada_nao_prova_ausencia_de_efeito(self):
+        rows = _stage(100, 0)
+        out = r07.build_regime_playbooks(rows, rows)
+        self.assertEqual(out["temporal_purge"]["kept"], 0)
+        self.assertTrue(all(h["status"] == r07.R07_INSUFFICIENT for h in out["hypotheses"]))
+
+    def test_unknown_total_e_zero_impacto_sem_cobertura_sao_insuficientes(self):
+        for total_unknown in (True, False):
+            with self.subTest(total_unknown=total_unknown):
+                train = _stage(100, 0)
+                valid = _stage(100, 0, at=AGORA+timedelta(days=1), offset=1000)
+                for group in (train, valid):
+                    for row in group[:100 if total_unknown else 21]:
+                        row["features"][r07.R07_CONTEXT_KEY] = None
+                out = r07.build_regime_playbooks(train, valid)
+                self.assertEqual(out["hypotheses"][0]["status"], r07.R07_INSUFFICIENT)
+
+    def test_treino_insuficiente_nao_vira_suporte_por_validacao_forte(self):
+        for n, affected in ((1, 0), (100, 19)):
+            with self.subTest(train_n=n, affected=affected):
+                train = _stage(n, affected)
+                valid = _stage(at=AGORA+timedelta(days=1), offset=1000)
+                out = r07.build_regime_playbooks(train, valid)["hypotheses"][0]
+                self.assertEqual(out["status"], r07.R07_INSUFFICIENT)
+
+    def test_preservacao_treino_obrigatoria_mesmo_validacao_forte(self):
+        train = _stage(100, 40)
+        valid = _stage(at=AGORA+timedelta(days=1), offset=1000)
+        out = r07.build_regime_playbooks(train, valid)["hypotheses"][0]
+        self.assertEqual(out["train"]["operations_preserved_pct"], 60.0)
+        self.assertNotEqual(out["status"], r07.R07_VALIDATION_SUPPORTED)
+        self.assertTrue(any(not c["passed"] and "treino" in c["name"]
+                            and "preserv" in c["name"] for c in out["checks"]))
+
+    def test_dois_estagios_fortes_podem_sustentar_sem_forcar_vencedor(self):
+        train = _stage()
+        valid = _stage(at=AGORA+timedelta(days=1), offset=1000)
+        out = r07.build_regime_playbooks(train, valid)["hypotheses"][0]
+        self.assertEqual(out["status"], r07.R07_VALIDATION_SUPPORTED,
+                         [(c["name"], c["detail"]) for c in out["checks"] if not c["passed"]])
 
     def test_amostra_pequena_nao_sustenta(self):
         linhas = [_row(i, "long", "lost", -1.0, _ctx("long", tfs=(("4h", "bearish"),)))
@@ -493,11 +700,98 @@ class HipotesesOffline(unittest.TestCase):
         self.assertEqual(info["purged_missing_created_at"], 1)
         self.assertTrue(info["applied"])
 
+    def test_purga_sem_borda_completa_do_treino_falha_fechado(self):
+        valid = _stage(at=AGORA+timedelta(days=1))
+        for train in ([], _stage(2, 1)):
+            if train:
+                train[0]["resolved_at"] = None
+            with self.subTest(train_size=len(train)):
+                kept, info = r07.temporal_purge(train, valid)
+                self.assertEqual(kept, [])
+                self.assertEqual(info["purged"], len(valid))
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  D. HOLDOUT
 # ════════════════════════════════════════════════════════════════════════════
 class Holdout(unittest.TestCase):
+
+    def _run_real_loader(self, sealed_value):
+        """Executa loader de produção; a sessão só aceita SQL com ids selados."""
+        from sqlalchemy.sql import operators, visitors
+
+        owner = self
+        calls, materialized = [], []
+        allowed = set(range(1, 10))
+        boundary = AGORA + timedelta(days=7)
+        index = [SimpleNamespace(id=i, outcome_at=(AGORA+timedelta(days=i)
+                                                  if i < 7 else boundary))
+                 for i in range(1, 13)]
+
+        class SealedRow:
+            def __init__(self, row_id):
+                self.id = row_id
+                self.stored_but_sealed = sealed_value
+
+            def __getattr__(self, name):
+                raise AssertionError(f"holdout materializado: {self.id}.{name}")
+
+        details = {}
+        for item in index:
+            if item.id not in allowed:
+                details[item.id] = SealedRow(item.id)
+                continue
+            ctx = _ctx(captured_at=AGORA)
+            details[item.id] = SimpleNamespace(
+                id=item.id, symbol="SOLUSDT", timeframe="4h", tier="A",
+                direction="long", score=80.0, status="lost", realized_r=-1.0,
+                features={r07.R07_CONTEXT_KEY: ctx, "bot_verdict_ok": True},
+                stop_distance_pct=1.0, created_at=AGORA, outcome_at=item.outcome_at)
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def execute(self, stmt):
+                columns = tuple(c.key for c in stmt.selected_columns)
+                calls.append(columns)
+                if len(calls) == 1:
+                    owner.assertEqual(columns, ("id", "outcome_at"))
+                    return SimpleNamespace(all=lambda: index)
+                owner.assertEqual(len(calls), 2, "loader não deve criar consulta extra")
+                owner.assertIn("realized_r", columns)
+                owner.assertIn("features", columns)
+                id_sets = []
+                for predicate in stmt._where_criteria:
+                    for node in visitors.iterate(predicate):
+                        if (getattr(node, "operator", None) is operators.in_op
+                                and getattr(getattr(node, "left", None), "key", None) == "id"):
+                            id_sets.append(set(node.right.value))
+                owner.assertEqual(id_sets, [allowed],
+                                  "IDs devem ser limitados no SELECT, antes de .all()")
+                # Inspeciona binds compilados do statement real, não string construída no teste.
+                owner.assertTrue(any(isinstance(v, (list, tuple, set)) and set(v) == allowed
+                                     for v in stmt.compile().params.values()))
+                requested = set.intersection(*id_sets)
+                owner.assertTrue(requested.isdisjoint({10, 11, 12}))
+
+                def all_details():
+                    for row_id in sorted(requested):
+                        row = details[row_id]
+                        for col in columns:
+                            getattr(row, col)  # sentinela falha mesmo se filtro posterior descartasse
+                        materialized.append(row_id)
+                    return [details[i] for i in sorted(requested)]
+                return SimpleNamespace(all=all_details)
+
+        with patch("db.get_session", return_value=FakeSession()):
+            loaded = asyncio.run(p05.load_stop_shadow_split(days=365))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(materialized, sorted(allowed))
+        return loaded
 
     def test_select_de_detalhes_filtra_por_id_antes_de_materializar(self):
         """O predicado por id tem que estar NA CONSULTA, não só no laço."""
@@ -516,39 +810,22 @@ class Holdout(unittest.TestCase):
         self.assertIn("if row.id not in allowed_ids:", fonte)
 
     def test_empate_na_borda_nao_materializa_o_teste(self):
-        """Sentinela: se o SELECT pedir uma linha fora de allowed_ids, falha."""
-        capturado = {}
-
-        class _FakeSelect:
-            def __init__(self):
-                self.ids = None
-
-            def where(self, cond):
-                texto = str(cond)
-                if "recommendation_snapshots.id IN" in texto:
-                    self.ids = texto
-                return self
-
-            def order_by(self, *a):
-                return self
-
-        sel = _FakeSelect()
-        sel.where("recommendation_snapshots.id IN (...)")
-        capturado["ids"] = sel.ids
-        self.assertIsNotNone(capturado["ids"])
+        loaded = self._run_real_loader(sealed_value=-999)
+        self.assertEqual([r["id"] for r in loaded["train"]], list(range(1, 7)))
+        self.assertEqual([r["id"] for r in loaded["validation"]], [7, 8, 9])
+        self.assertEqual(loaded["test_count"], 3)
+        self.assertEqual(loaded["holdout_status"], p05.HOLDOUT_SEALED)
+        self.assertFalse(loaded["holdout_outcomes_read"])
+        self.assertEqual(loaded["test_bounds"]["first_resolved_at"],
+                         loaded["validation"][-1]["resolved_at"].isoformat())
 
     def test_alterar_o_holdout_nao_muda_a_saida_r07(self):
-        """R07 só enxerga treino/validação: o teste selado não entra."""
-        train = [_row(i, "long", "lost", -1.0, _ctx("long", tfs=(("4h", "bearish"),)))
-                 for i in range(10)]
-        valid = [_row(100 + i, "long", "won_tp1", 1.0,
-                      _ctx("long", tfs=(("4h", "bullish"),))) for i in range(10)]
-        a = r07.build_regime_playbooks(train, valid)
-        # "holdout" com desfechos opostos — não é passado, e nada muda
-        b = r07.build_regime_playbooks(train, valid)
-        self.assertEqual(json.dumps(a["status_counts"], sort_keys=True),
-                         json.dumps(b["status_counts"], sort_keys=True))
-        self.assertEqual(a["hypothesis_hashes"], b["hypothesis_hashes"])
+        first = self._run_real_loader(sealed_value=-999)
+        changed = self._run_real_loader(sealed_value=999)
+        self.assertEqual(first, changed)
+        a = r07.build_regime_playbooks(first["train"], first["validation"])
+        b = r07.build_regime_playbooks(changed["train"], changed["validation"])
+        self.assertEqual(a, b)
 
     def test_r07_nao_usa_loaders_que_reabrem_dados(self):
         fonte = (BACKEND / "services" / "regime_playbook_service.py").read_text()
@@ -567,6 +844,23 @@ class Holdout(unittest.TestCase):
 #  E. INTEGRAÇÃO
 # ════════════════════════════════════════════════════════════════════════════
 class Integracao(unittest.TestCase):
+
+    def test_erro_interno_de_hipotese_nao_e_cacheavel(self):
+        original = r07.r07_rule_comparison
+
+        def partly_failed(rows, hyp, config, components):
+            if hyp == "H1_ABSTAIN_COUNTER_TREND":
+                raise ValueError("failure sintética")
+            return original(rows, hyp, config, components)
+
+        with patch.object(r07, "r07_rule_comparison", side_effect=partly_failed):
+            section = r07.build_regime_playbooks(
+                _stage(), _stage(at=AGORA+timedelta(days=1), offset=1000))
+        self.assertEqual(section["hypotheses"][0]["status"], r07.R07_UNAVAILABLE)
+        self.assertFalse(p05._stop_diagnosis_cacheable({"shadow": {"total_resolved": 200},
+                                                       "regime_playbooks": section}))
+        # Seções independentes sobrevivem: o erro não deve eliminar H2/H3.
+        self.assertEqual(len(section["hypotheses"]), 3)
 
     def test_erro_da_secao_nao_derruba_o_diagnostico_nem_envenena_o_cache(self):
         ruim = {"shadow": {"total_resolved": 5},

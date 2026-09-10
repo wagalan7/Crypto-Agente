@@ -292,6 +292,7 @@ interface R07Hypothesis {
     coverage_pct?: number | null
     operations_removed?: number
     excluded_total?: number
+    unknown_total?: number
     unknown_reasons?: Record<string, number>
   } | null
 }
@@ -1325,7 +1326,7 @@ export default function AssertivenessPanel({ onClose }: Props) {
                                         <span className="font-mono text-amber-300">{h.wins_removed ?? '—'}</span>
                                         {' '}· desconhecidos excluídos:{' '}
                                         <span className="font-mono text-slate-200">
-                                          {h.validation?.excluded_total ?? '—'}
+                                          {h.validation?.unknown_total ?? '—'}
                                         </span>
                                       </span>
                                     )}

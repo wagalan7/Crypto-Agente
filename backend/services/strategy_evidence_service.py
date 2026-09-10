@@ -3647,6 +3647,11 @@ def _stop_diagnosis_cacheable(value: Dict[str, Any]) -> bool:
         block = value.get(section)
         if isinstance(block, dict) and block.get("error"):
             return False
+        if section == "regime_playbooks" and isinstance(block, dict):
+            hypotheses = block.get("hypotheses", [])
+            if (not isinstance(hypotheses, list)
+                    or any(isinstance(h, dict) and h.get("error") for h in hypotheses)):
+                return False
     return True
 
 

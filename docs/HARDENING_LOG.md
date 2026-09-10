@@ -1651,3 +1651,29 @@ o executor. Doc: `docs/R07A_REGIME_PLAYBOOKS_OFFLINE.md`.
 - **Limites**: snapshots são pós-filtro/pós-seleção; contexto é o do SAVE;
   baseline é reconstrução, não replay; nenhuma redução real de stops ou de lucro
   foi demonstrada; cobertura em produção NÃO foi consultada.
+
+## 2026-09-09 — R07A: fechamento dos achados da auditoria
+
+- **Base:** `e0ebc9f4`, checkout principal/main. Alterações pessoais preexistentes
+  preservadas; nenhuma alteração em executor, seleção, score, stop, TP ou sizing.
+- **Proveniência:** macro exige qualidade FRESH, timestamps válidos e flags
+  booleanas explícitas. UNKNOWN/DEGRADED/qualidade desconhecida não viram KEEP.
+  Preservada a prova temporal de cada TF já produzida pelo MTF, sem nova chamada
+  de rede. H1 não usa TF incerto/futuro, contexto posterior à linha ou lado divergente.
+- **Comparação:** memberships congelados antes dos outcomes; cobertura conta
+  decisões conhecidas, não operações selecionadas. Recusas conhecidas do baseline
+  ficam separadas de UNKNOWN. Coberturas da regra nas elegíveis e das métricas
+  evitam esconder falta de dados atrás de muitas recusas.
+- **Critérios:** amostra afetada e preservação exigidas nos dois estágios.
+  Reprodução corrigida: treino com 1 operação/0 afetadas não pode mais ser
+  VALIDATION_SUPPORTED pela validação forte. Vazio/UNKNOWN/validação purgada
+  são insuficiência, não prova de NO_INCREMENTAL_CHANGE. Borda de treino ausente
+  mantém a validação indisponível para comparação.
+- **Cache:** erro interno de hipótese invalida o cache sem eliminar as demais.
+- **Testes:** 70 R07A aprovados (antes 53); fixtures temporais corrigidas e
+  testes vacuos de holdout substituídos por execução do loader real com sessão
+  controlada, statement SQLAlchemy, binds e sentinela em empate de timestamp.
+  Regressão: **1.608 executados / 1.606 aprovados / 2 skips R05C preexistentes**,
+  zero falhas/erros e zero tentativas de rede. `py_compile`, `tsc --noEmit` e
+  `git diff --check` aprovados. Sem teste em PostgreSQL/produção nesta revisão.
+- **Publicação:** sem push/deploy; nenhum R07B iniciado, holdout preservado.

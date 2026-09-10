@@ -79,18 +79,26 @@ REASON_DIRECTION_UNKNOWN = "DIRECTION_UNKNOWN"
 REASON_NO_PATTERNS = "NO_PATTERNS"
 REASON_CT_CONFIG_MISSING = "CT_BRAKE_CONFIG_MISSING"
 REASON_MAJOR_UNKNOWN = "MAJOR_POLICY_UNKNOWN"
+REASON_TIME_INVALID = "CONTEXT_TIME_UNPROVEN"
+REASON_TF_TIME_INVALID = "TIMEFRAME_EVIDENCE_UNPROVEN"
+REASON_MACRO_FLAGS_UNKNOWN = "MACRO_FLAGS_UNPROVEN"
+REASON_CONTEXT_MISMATCH = "CONTEXT_ROW_MISMATCH"
 R07_REASON_CODES = frozenset({
     REASON_OK, REASON_NO_CONTEXT, REASON_LEGACY_CONTEXT, REASON_MALFORMED,
     REASON_SCHEMA_UNSUPPORTED, REASON_MACRO_NOT_OBSERVED,
     REASON_MACRO_STALE_OBSERVATION, REASON_NO_HIGHER_TFS, REASON_TF_CONFLICT,
     REASON_DIRECTION_UNKNOWN, REASON_NO_PATTERNS, REASON_CT_CONFIG_MISSING,
     REASON_MAJOR_UNKNOWN,
+    REASON_TIME_INVALID, REASON_TF_TIME_INVALID, REASON_MACRO_FLAGS_UNKNOWN,
+    REASON_CONTEXT_MISMATCH,
 })
 
 #: Qualidades do regime macro que NÃO sustentam uma leitura de contexto. Um
 #: `regime == "NORMAL"` acompanhado de `DISABLED`/`UNKNOWN` significa "não sei",
 #: não "mercado tranquilo" — e nunca pode virar contexto válido.
-MACRO_UNUSABLE_QUALITY = ("DISABLED", "UNKNOWN", "STALE", "MISSING")
+# Contrato positivo: DEGRADED pode esconder a falha do dado que governa o
+# downgrade. Sem prova por componente, não há como transformá-lo em False.
+MACRO_USABLE_QUALITY = frozenset({"FRESH"})
 
 R07_LIMITATIONS = [
     "os snapshots são POSTERIORES a filtros e seleção: não representam todos os "
@@ -118,7 +126,7 @@ def _num(value) -> Optional[float]:
         return None
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return f if math.isfinite(f) else None
 
@@ -147,11 +155,45 @@ def _iso_to_ms(value: Optional[str]) -> Optional[float]:
         return None
     try:
         dt = datetime.fromisoformat(value.strip())
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.timestamp() * 1000.0
+    try:
+        result = dt.timestamp() * 1000.0
+    except (ValueError, OverflowError, OSError):
+        return None
+    return result if math.isfinite(result) and result > 0 else None
+
+
+def _utc_time(value: Any) -> Optional[datetime]:
+    """Instante explícito; legado naive é UTC, nunca o fuso da máquina."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except (ValueError, OverflowError):
+            return None
+    if not isinstance(value, datetime):
+        return None
+    try:
+        dt = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        return dt if _iso_to_ms(dt.isoformat()) is not None else None
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _candle_evidence(freshness: Any) -> Optional[Dict[str, Any]]:
+    """Preserva só a prova temporal já fornecida pelo produtor do TF."""
+    candle = freshness.get("candle") if isinstance(freshness, dict) else None
+    if not isinstance(candle, dict):
+        return None
+    return {"candle": {
+        "quality": _text(candle.get("quality")),
+        "source": _text(candle.get("source")),
+        "timeframe": _text(candle.get("timeframe")),
+        "close_time_ms": _num(candle.get("close_time_ms")),
+        "observed_at_ms": _num(candle.get("observed_at_ms")),
+    }}
 
 
 def _dedupe_reasons(reasons: Sequence[str]) -> List[str]:
@@ -206,6 +248,7 @@ def build_r07_context(rec: Dict[str, Any], sig: Dict[str, Any],
         higher.append({
             "timeframe": _text(h.get("timeframe")),
             "ema_aligned": _text(h.get("ema_aligned")),
+            "data_freshness": _candle_evidence(h.get("data_freshness")),
         })
 
     padroes: List[Dict[str, Any]] = []
@@ -232,7 +275,8 @@ def build_r07_context(rec: Dict[str, Any], sig: Dict[str, Any],
     return {
         "schema_version": R07_CONTEXT_SCHEMA_VERSION,
         "source": R07_CONTEXT_SOURCE,
-        "captured_at": captured_at.astimezone(timezone.utc).isoformat(),
+        "captured_at": (_utc_time(captured_at).isoformat()
+                        if _utc_time(captured_at) is not None else None),
         "direction": _side(rec.get("direction")) or _side(sig.get("direction")),
         # Política de majors VIGENTE (`regime_service.is_btc_symbol`), resolvida
         # pelo chamador. Não recriamos uma lista paralela aqui.
@@ -273,7 +317,7 @@ def ct_brake_config() -> Dict[str, Any]:
 # ════════════════════════════════════════════════════════════════════════════
 #  2. CLASSIFICADOR
 # ════════════════════════════════════════════════════════════════════════════
-def classify_context(context: Any) -> Dict[str, Any]:
+def classify_context(context: Any, *, evaluated_at: Optional[datetime] = None) -> Dict[str, Any]:
     """Dimensões do cenário a partir do contexto PRÉ-outcome.
 
     Cenários se sobrepõem: as três dimensões são independentes e nenhuma é
@@ -287,8 +331,23 @@ def classify_context(context: Any) -> Dict[str, Any]:
         return _classificacao_vazia(REASON_NO_CONTEXT, legacy=True)
     if not isinstance(context, dict):
         return _classificacao_vazia(REASON_MALFORMED)
-    if context.get("schema_version") != R07_CONTEXT_SCHEMA_VERSION:
+    if (type(context.get("schema_version")) is not int
+            or context.get("schema_version") != R07_CONTEXT_SCHEMA_VERSION):
         return _classificacao_vazia(REASON_SCHEMA_UNSUPPORTED)
+
+    captured_ms = _iso_to_ms(context.get("captured_at"))
+    evaluation = _utc_time(evaluated_at) if evaluated_at is not None else None
+    evaluated_ms = (_iso_to_ms(evaluation.isoformat()) if evaluation is not None
+                    else captured_ms if evaluated_at is None else None)
+    if captured_ms is None or evaluated_ms is None or captured_ms > evaluated_ms:
+        return _classificacao_vazia(REASON_TIME_INVALID)
+    # A prova deve existir tanto no save quanto no instante avaliado. Jamais
+    # aceitar uma observação futura porque o contexto foi capturado mais tarde.
+    cutoff_ms = min(captured_ms, evaluated_ms)
+    signal_ms = _num(context.get("signal_timestamp_ms"))
+    if (context.get("signal_timestamp_ms") is not None
+            and (signal_ms is None or not (0 < signal_ms <= cutoff_ms))):
+        return _classificacao_vazia(REASON_TIME_INVALID)
 
     direction = _side(context.get("direction"))
     if direction is None:
@@ -299,7 +358,7 @@ def classify_context(context: Any) -> Dict[str, Any]:
         context.get("macro"), direction, _flag(context.get("is_major")),
         captured_at=_text(context.get("captured_at")))
     trend_dim, trend_ev, trend_falta, trend_motivos = _classify_trend(
-        context.get("higher_tfs"), context.get("ct_brake"))
+        context.get("higher_tfs"), context.get("ct_brake"), cutoff_ms=cutoff_ms)
     struct_dims, struct_ev, struct_falta, struct_motivos = _classify_structure(
         context.get("patterns"), context.get("entry_zone_type"), direction)
 
@@ -352,16 +411,24 @@ def _classify_macro(macro: Any, direction: Optional[str],
     }
 
     # NORMAL com filtro desligado ou qualidade desconhecida é "não sei".
-    if filter_enabled is not True or quality is None or quality in MACRO_UNUSABLE_QUALITY:
+    if filter_enabled is not True or quality not in MACRO_USABLE_QUALITY:
         return [DIM_UNKNOWN], ev, ["macro.quality"], [REASON_MACRO_NOT_OBSERVED]
 
     # Observação POSTERIOR ao instante avaliado não podia ter informado aquela
     # decisão. Não se retrodata a observação nem se mexe no created_at: a
     # dimensão macro simplesmente não é utilizável nesta linha.
     capt_ms = _iso_to_ms(captured_at)
-    if observed_ms is not None and capt_ms is not None and observed_ms > capt_ms:
+    if observed_ms is None or observed_ms <= 0 or capt_ms is None:
+        return [DIM_UNKNOWN], ev, ["macro.observed_at_ms"], [REASON_MACRO_NOT_OBSERVED]
+    if observed_ms > capt_ms:
         ev["observation_after_capture"] = True
         return [DIM_UNKNOWN], ev, ["macro.observed_at_ms"], [REASON_MACRO_STALE_OBSERVATION]
+
+    flags = ("block_all", "block_alt_longs", "downgrade_alt_longs",
+             "block_shorts", "downgrade_shorts")
+    missing_flags = [name for name in flags if _flag(macro.get(name)) is None]
+    if missing_flags:
+        return [DIM_UNKNOWN], ev, [f"macro.{name}" for name in missing_flags], [REASON_MACRO_FLAGS_UNKNOWN]
 
     dims: List[str] = []
     if _flag(macro.get("block_all")) is True:
@@ -387,7 +454,7 @@ def _classify_macro(macro: Any, direction: Optional[str],
     return (dims or [MACRO_UNRESTRICTED]), ev, falta, motivos
 
 
-def _classify_trend(higher_tfs: Any, ct: Any) -> Tuple[str, Dict[str, Any],
+def _classify_trend(higher_tfs: Any, ct: Any, *, cutoff_ms: float) -> Tuple[str, Dict[str, Any],
                                                        List[str], List[str]]:
     """Tendência EMA dos TFs superiores, com a semântica REAL do freio.
 
@@ -398,7 +465,7 @@ def _classify_trend(higher_tfs: Any, ct: Any) -> Tuple[str, Dict[str, Any],
     if not isinstance(ct, dict):
         return DIM_UNKNOWN, {}, ["ct_brake"], [REASON_CT_CONFIG_MISSING]
     min_tfs = _num(ct.get("min_tfs"))
-    if min_tfs is None or min_tfs < 1:
+    if min_tfs is None or min_tfs < 1 or not min_tfs.is_integer():
         return DIM_UNKNOWN, {"ct_brake": ct}, ["ct_brake.min_tfs"], [REASON_CT_CONFIG_MISSING]
 
     if not isinstance(higher_tfs, list) or not higher_tfs:
@@ -408,16 +475,25 @@ def _classify_trend(higher_tfs: Any, ct: Any) -> Tuple[str, Dict[str, Any],
     sem_tf = 0
     for h in higher_tfs:
         if not isinstance(h, dict):
-            continue
+            return DIM_UNKNOWN, {}, ["higher_tfs"], [REASON_TF_TIME_INVALID]
         tf = _text(h.get("timeframe"))
         alinhado = _text(h.get("ema_aligned"))
         if tf is None:
-            sem_tf += 1
-            continue
+            return DIM_UNKNOWN, {}, ["higher_tfs.timeframe"], [REASON_NO_HIGHER_TFS]
+        proof = _candle_evidence(h.get("data_freshness"))
+        candle = (proof or {}).get("candle", {})
+        closed = _num(candle.get("close_time_ms"))
+        observed = _num(candle.get("observed_at_ms"))
+        if (candle.get("quality") != "FRESH" or not candle.get("source")
+                or candle.get("timeframe") not in (None, tf)
+                or closed is None or observed is None
+                or not (0 < closed <= observed <= cutoff_ms)):
+            return DIM_UNKNOWN, {}, [f"higher_tfs.{tf}.data_freshness"], [REASON_TF_TIME_INVALID]
+        if alinhado not in ("bullish", "bearish", "mixed"):
+            return DIM_UNKNOWN, {}, [f"higher_tfs.{tf}.ema_aligned"], [REASON_NO_HIGHER_TFS]
         por_tf.setdefault(tf, set()).add(alinhado)
 
-    conflito = [tf for tf, vals in por_tf.items()
-                if len({v for v in vals if v in ("bullish", "bearish")}) > 1]
+    conflito = [tf for tf, vals in por_tf.items() if len(vals) > 1]
     ev = {
         "timeframes": sorted(por_tf),
         "distinct_timeframes": len(por_tf),
@@ -443,8 +519,6 @@ def _classify_trend(higher_tfs: Any, ct: Any) -> Tuple[str, Dict[str, Any],
         return TREND_BULLISH, ev, [], []
     if bear >= min_tfs and bull == 0:
         return TREND_BEARISH, ev, [], []
-    if bull == 0 and bear == 0:
-        return DIM_UNKNOWN, ev, ["higher_tfs.ema_aligned"], [REASON_NO_HIGHER_TFS]
     return TREND_MIXED, ev, [], []
 
 
@@ -659,12 +733,13 @@ def hypothesis_hashes() -> Dict[str, str]:
     return {h["id"]: _hypothesis_hash(h["id"], h["config"]) for h in R07_HYPOTHESES}
 
 
-def decide(hypothesis_id: str, context: Any) -> Dict[str, Any]:
+def decide(hypothesis_id: str, context: Any, *,
+           evaluated_at: Optional[datetime] = None) -> Dict[str, Any]:
     """Decisão da regra para UM setup. Só campos pré-outcome entram aqui."""
     hyp = next((h for h in R07_HYPOTHESES if h["id"] == hypothesis_id), None)
     if hyp is None:
         return {"decision": UNKNOWN, "reason_code": REASON_MALFORMED}
-    cls = classify_context(context)
+    cls = classify_context(context, evaluated_at=evaluated_at)
     if cls.get("legacy") or cls.get("schema_version") is None:
         return {"decision": UNKNOWN,
                 "reason_code": (cls.get("reasons") or [REASON_NO_CONTEXT])[0]}
@@ -709,18 +784,18 @@ def temporal_purge(train_rows: Sequence[Dict[str, Any]],
     impede confirmar a separação, então a linha é purgada — não presumida boa.
     As partições dos consumidores P05 NÃO são alteradas: a purga vive aqui.
     """
-    resolvidos = [r.get("resolved_at") for r in train_rows if r.get("resolved_at")]
-    corte = max(resolvidos) if resolvidos else None
-    if corte is None:
-        return list(valid_rows), {
-            "applied": False, "cutoff": None, "kept": len(valid_rows),
-            "purged": 0, "purged_missing_created_at": 0,
+    resolvidos = [_utc_time(r.get("resolved_at")) for r in train_rows]
+    if not resolvidos or any(t is None for t in resolvidos):
+        return [], {
+            "applied": False, "cutoff": None, "kept": 0,
+            "purged": len(valid_rows), "purged_missing_created_at": 0,
             "reason": "treino sem resolved_at — separação temporal não verificável",
         }
+    corte = max(resolvidos)
     mantidos: List[Dict[str, Any]] = []
     purgadas = sem_ts = 0
     for row in valid_rows:
-        criado = row.get("created_at")
+        criado = _utc_time(row.get("created_at"))
         if criado is None:
             sem_ts += 1
             purgadas += 1
@@ -751,34 +826,60 @@ def r07_rule_comparison(rows: Sequence[Dict[str, Any]], hypothesis_id: str,
     qualquer consulta a resultado.
     """
     p05 = _p05()
-    valid, _exc = p05._partition_outcomes(rows)
-
     champion: List[Dict[str, Any]] = []
     excluidos = {"baseline_unknown": 0, "rule_unknown": 0,
                  "baseline_blocked": 0, "metric_unavailable": 0}
     motivos_unknown: Dict[str, int] = {}
+    known_rules: List[Dict[str, Any]] = []
+    total_rows = baseline_eligible = duplicates = 0
+    seen: set = set()
 
-    for row in valid:
+    # Congela memberships sem consultar status/R. Até a qualidade dos outcomes
+    # é avaliada só depois; cobertura de decisão não depende de lucro ou perda.
+    for row in rows:
+        key = row.get("dedupe_key")
+        if key is not None and key in seen:
+            duplicates += 1
+            continue
+        if key is not None:
+            seen.add(key)
+        total_rows += 1
         veredito = p05.eligibility(row, config, active_components)
-        if veredito is None:
+        if type(veredito) is not bool:
             excluidos["baseline_unknown"] += 1
             continue
-        contexto = (row.get("features") or {}).get(R07_CONTEXT_KEY)
-        regra = decide(hypothesis_id, contexto)
+        if veredito is False:
+            # Recusa conhecida não é falta de dados. False AND UNKNOWN também
+            # é False; não precisamos do contexto da regra para abrir operação.
+            excluidos["baseline_blocked"] += 1
+            continue
+        baseline_eligible += 1
+        features = row.get("features")
+        contexto = features.get(R07_CONTEXT_KEY) if isinstance(features, dict) else None
+        created = _utc_time(row.get("created_at"))
+        if created is None:
+            regra = {"decision": UNKNOWN, "reason_code": REASON_TIME_INVALID}
+        elif (isinstance(contexto, dict)
+              and (_side(row.get("direction")) is None
+                   or _side(contexto.get("direction")) != _side(row.get("direction")))):
+            regra = {"decision": UNKNOWN, "reason_code": REASON_CONTEXT_MISMATCH}
+        else:
+            regra = decide(hypothesis_id, contexto, evaluated_at=created)
         if regra["decision"] == UNKNOWN:
             # Simetria: sai dos dois lados, e sai ANTES de olhar o desfecho.
             excluidos["rule_unknown"] += 1
             code = regra.get("reason_code") or REASON_MALFORMED
             motivos_unknown[code] = motivos_unknown.get(code, 0) + 1
             continue
-        if veredito is False:
-            excluidos["baseline_blocked"] += 1
-            continue
+        known_rules.append({**row, "_r07_decision": regra["decision"]})
+
+    valid, outcome_exclusions = p05._partition_outcomes(known_rules)
+    excluidos["metric_unavailable"] = len(known_rules) - len(valid)
+    for row in valid:
         metric = p05._lab_metric_row(row)
         if metric is None:
             excluidos["metric_unavailable"] += 1
             continue
-        metric["_r07_decision"] = regra["decision"]
         champion.append(metric)
 
     kept = [r for r in champion if r["_r07_decision"] != VETO]
@@ -796,8 +897,12 @@ def r07_rule_comparison(rows: Sequence[Dict[str, Any]], hypothesis_id: str,
     rem_m = p05.compute_evidence_metrics(removed)
     kept_ids = {id(r) for r in kept}
 
-    total_valid = len(valid)
-    cobertura = round(len(champion) / total_valid * 100, 1) if total_valid else None
+    known_decisions = len(known_rules) + excluidos["baseline_blocked"]
+    cobertura = round(known_decisions / total_rows * 100, 1) if total_rows else None
+    rule_coverage = (round(len(known_rules) / baseline_eligible * 100, 1)
+                     if baseline_eligible else None)
+    metric_coverage = (round(len(champion) / len(known_rules) * 100, 1)
+                       if known_rules else None)
     preservadas = round(len(kept) / len(champion) * 100, 2) if champion else None
 
     def _bloco(rate: Dict[str, Any], m: Dict[str, Any]) -> Dict[str, Any]:
@@ -809,11 +914,22 @@ def r07_rule_comparison(rows: Sequence[Dict[str, Any]], hypothesis_id: str,
 
     return {
         "hypothesis_id": hypothesis_id,
-        "universe_valid": total_valid,
+        "universe_valid": total_rows,
+        "universe_total": total_rows,
+        "duplicates_excluded": duplicates,
+        "known_decisions": known_decisions,
+        "known_baseline_blocked": excluidos["baseline_blocked"],
+        "baseline_eligible": baseline_eligible,
         "evaluable": len(champion),
         "coverage_pct": cobertura,
+        "coverage_basis": "known_selection_decisions_before_outcomes",
+        "eligible_rule_coverage_pct": rule_coverage,
+        "metric_coverage_pct": metric_coverage,
+        "outcome_exclusions": outcome_exclusions,
         "excluded": excluidos,
-        "excluded_total": sum(excluidos.values()),
+        "unknown_total": excluidos["baseline_unknown"] + excluidos["rule_unknown"],
+        "excluded_total": (excluidos["baseline_unknown"] + excluidos["rule_unknown"]
+                           + excluidos["metric_unavailable"]),
         "unknown_reasons": motivos_unknown,
         "champion": _bloco(_rate(champion), champ_m),
         "candidate": _bloco(_rate(kept), cand_m),
@@ -865,13 +981,20 @@ def evaluate_r07_hypothesis(hypothesis: Dict[str, Any],
                 "detail": "não foi possível comparar esta hipótese nesta execução",
                 "train": None, "validation": None, "checks": [], "error": str(exc)}
 
-    # Regra já integralmente aplicada pelo baseline ⇒ nada a creditar.
-    if validation["operations_removed"] == 0 and train["operations_removed"] == 0:
+    def _covered(stage: Dict[str, Any]) -> bool:
+        return (stage["evaluable"] > 0 and all(
+            (stage.get(key) or 0) >= p05.P05_MIN_FEATURE_COVERAGE_PCT
+            for key in ("coverage_pct", "eligible_rule_coverage_pct", "metric_coverage_pct")))
+
+    # Ausência de observações não prova ausência de efeito. O resultado só é
+    # descritivo do universo conhecido com cobertura suficiente NOS DOIS lados.
+    if (_covered(train) and _covered(validation)
+            and validation["operations_removed"] == 0 and train["operations_removed"] == 0):
         return {**base, "status": R07_NO_INCREMENTAL_CHANGE,
                 "reason_code": "NO_INCREMENTAL_CHANGE",
-                "detail": ("a regra não remove nenhuma operação além do que o "
-                           "baseline reconstruído já recusa — nenhum benefício "
-                           "pode ser atribuído a ela"),
+                "detail": ("no universo comparável de treino e validação, a regra "
+                           "não remove operações adicionais — nenhum benefício "
+                           "é demonstrado; desconhecidos permanecem fora da conclusão"),
                 "train": train, "validation": validation, "checks": [],
                 "risks": []}
 
@@ -884,24 +1007,25 @@ def evaluate_r07_hypothesis(hypothesis: Dict[str, Any],
             insuficientes.add(name)
         return bool(passed)
 
-    _check("cobertura_treino",
-           (train["coverage_pct"] or 0) >= p05.P05_MIN_FEATURE_COVERAGE_PCT,
-           f"cobertura avaliável no treino = {train['coverage_pct']}% "
-           f"(mín {p05.P05_MIN_FEATURE_COVERAGE_PCT}%)", soft=True)
-    _check("cobertura_validacao",
-           (validation["coverage_pct"] or 0) >= p05.P05_MIN_FEATURE_COVERAGE_PCT,
-           f"cobertura avaliável na validação = {validation['coverage_pct']}% "
-           f"(mín {p05.P05_MIN_FEATURE_COVERAGE_PCT}%)", soft=True)
-    _check("amostra_afetada_validacao",
-           validation["operations_removed"] >= p05.P051_MIN_AFFECTED,
-           f"{validation['operations_removed']} operações afetadas na validação "
-           f"(mín {p05.P051_MIN_AFFECTED})", soft=True)
-
-    preservadas = validation["operations_preserved_pct"]
-    _check("operacoes_preservadas",
-           preservadas is not None and preservadas >= p05.P052B_MIN_PRESERVED_PCT,
-           f"preserva {preservadas}% das operações do champion "
-           f"(mín {p05.P052B_MIN_PRESERVED_PCT}%)")
+    data_prerequisites: set = set()
+    for name, stage in (("treino", train), ("validacao", validation)):
+        for prefix, field in (("cobertura", "coverage_pct"),
+                              ("cobertura_regra", "eligible_rule_coverage_pct"),
+                              ("cobertura_metricas", "metric_coverage_pct")):
+            check_name = f"{prefix}_{name}"
+            data_prerequisites.add(check_name)
+            _check(check_name, (stage[field] or 0) >= p05.P05_MIN_FEATURE_COVERAGE_PCT,
+                   f"{field} em {name} = {stage[field]}% "
+                   f"(mín {p05.P05_MIN_FEATURE_COVERAGE_PCT}%)", soft=True)
+        check_name = f"amostra_afetada_{name}"
+        data_prerequisites.add(check_name)
+        _check(check_name, stage["operations_removed"] >= p05.P051_MIN_AFFECTED,
+               f"{stage['operations_removed']} operações afetadas em {name} "
+               f"(mín {p05.P051_MIN_AFFECTED})", soft=True)
+        preserved = stage["operations_preserved_pct"]
+        _check(f"operacoes_preservadas_{name}",
+               preserved is not None and preserved >= p05.P052B_MIN_PRESERVED_PCT,
+               f"preserva {preserved}% em {name} (mín {p05.P052B_MIN_PRESERVED_PCT}%)")
 
     cand, champ, rem = validation["candidate"], validation["champion"], validation["removed"]
     _check("expectancy_candidato_positiva",
@@ -944,12 +1068,12 @@ def evaluate_r07_hypothesis(hypothesis: Dict[str, Any],
 
     falhas = [c["name"] for c in checks if not c["passed"]]
     substantivas = [n for n in falhas if n not in insuficientes]
-    cobertura_faltando = any(n in falhas for n in ("cobertura_treino", "cobertura_validacao"))
+    dados_faltando = bool(data_prerequisites.intersection(falhas))
     if not falhas:
         status, code = R07_VALIDATION_SUPPORTED, "ALL_VALIDATION_CHECKS_PASSED"
         detalhe = ("sobreviveu a todos os checks de validação — NÃO é aprovação, "
                    "não abre o holdout e não autoriza execução")
-    elif cobertura_faltando or not substantivas:
+    elif dados_faltando or not substantivas:
         status, code = R07_INSUFFICIENT, "INSUFFICIENT_EVIDENCE"
         detalhe = f"evidência insuficiente para julgar: {', '.join(falhas)}"
     else:
@@ -961,7 +1085,7 @@ def evaluate_r07_hypothesis(hypothesis: Dict[str, Any],
         f"na validação",
         f"removeria {validation['operations_removed']} de {validation['evaluable']} "
         f"oportunidades avaliáveis da validação",
-        f"{validation['excluded_total']} linhas saíram do universo por baseline ou "
+        f"{validation['unknown_total']} linhas saíram do universo por baseline ou "
         f"regra desconhecidos — não são operações evitadas",
     ]
     if validation["protected_exits_removed"]:
@@ -1077,6 +1201,9 @@ def build_regime_playbooks(train_rows: Sequence[Dict[str, Any]],
                 "error": str(exc),
             })
     out["hypotheses"] = avaliadas
+    if any(h.get("error") for h in avaliadas):
+        # O cache externo precisa enxergar também falhas parciais internas.
+        out["error"] = "HYPOTHESIS_EVALUATION_FAILED"
     contagem: Dict[str, int] = {}
     for h in avaliadas:
         contagem[h["status"]] = contagem.get(h["status"], 0) + 1

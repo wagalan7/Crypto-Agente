@@ -194,8 +194,9 @@ são operações evitadas** e redução por falta de dados **não é melhora**.
 Estados: `UNAVAILABLE`, `INSUFFICIENT_EVIDENCE`, `NO_INCREMENTAL_CHANGE`,
 `NOT_SUPPORTED`, `VALIDATION_SUPPORTED`.
 
-`VALIDATION_SUPPORTED` exige todos os checks: cobertura mínima do P05, amostra
-afetada mínima vigente, preservação mínima do laboratório de stops, expectancy
+`VALIDATION_SUPPORTED` exige cobertura mínima do P05, amostra afetada mínima
+vigente e preservação mínima do laboratório de stops **no treino e na validação**.
+Na validação também exige todos os checks de resultado: expectancy
 das removidas negativa com IC superior < 0, delta pareado com IC inferior > 0,
 redução de stop rate sustentada pelo IC, expectancy e soma R positivas, profit
 factor e drawdown não piores, e nenhuma regressão material nos segmentos
@@ -252,3 +253,46 @@ sobre uma janela relevante (o contrato só existe a partir daqui, sem backfill);
 uma hipótese com `VALIDATION_SUPPORTED` estável em execuções sucessivas; e uma
 decisão explícita sobre o holdout, que continua selado. Nada disso foi iniciado
 neste pacote.
+
+---
+
+## 11. Fechamento da auditoria R07A — 2026-09-09
+
+Correções sobre `e0ebc9f4`, sem alteração das regras LIVE:
+
+- **Proveniência fail-closed:** macro só é utilizável com `FRESH`, filtro ativo,
+  flags booleanas explícitas e timestamps válidos. `DEGRADED` não prova que um
+  downgrade seja falso. Cada TF preserva a allowlist `data_freshness.candle`
+  (qualidade, fonte, timeframe, fechamento e observação). Exige-se
+  `0 < close_time_ms <= observed_at_ms <= captured_at <= created_at` na comparação.
+  Sinal futuro, lados divergentes, versão booleana e TFs conflitantes são
+  desconhecidos; não há backfill nem nova consulta externa. Contextos antigos
+  sem a prova temporal continuam insuficientes para H1.
+- **Cobertura não é taxa de seleção:** primeiro congelam-se as decisões,
+  sem ler outcomes. A cobertura global conta decisões conhecidas, incluindo
+  recusas do baseline. Coberturas adicionais da regra entre as entradas elegíveis
+  e das métricas impedem que muitos bloqueios escondam falta de evidência.
+  Exemplo sintético: 100 decisões conhecidas, 75 bloqueadas e 25 aceitas = 100%
+  de cobertura, não 25%. Recusas conhecidas e UNKNOWN são exibidos separadamente.
+- **Amostra e estados:** treino e validação exigem os mesmos pisos de amostra
+  afetada e operações preservadas. Vazio, UNKNOWN ou validação integralmente
+  purgada retornam `INSUFFICIENT_EVIDENCE`. `NO_INCREMENTAL_CHANGE` só descreve
+  universos comparáveis presentes nos dois estágios, com cobertura suficiente.
+  Uma borda incompleta de treino não libera validação.
+- **Cache:** erro de qualquer hipótese é propagado como falha parcial e não
+  é cacheado como sucesso. As outras hipóteses e seções permanecem disponíveis.
+- **Holdout:** testes executam `load_stop_shadow_split` com uma sessão controlada,
+  inspecionam o statement SQLAlchemy e seus parâmetros reais, e usam sentinelas
+  para proibir a materialização de detalhes do teste em empates de timestamp.
+  Alterar os dados selados não muda treino, validação nem a saída R07. Não se
+  trata de teste contra PostgreSQL: não houve acesso a banco externo.
+
+Os testes anteriores de comparação usavam contexto posterior à linha. As
+fixtures agora respeitam a cronologia, sem enfraquecer a checagem de produção.
+Os antigos testes de holdout que não executavam o loader foram substituídos.
+Não há comprovação de lucratividade; as provas de correção são sintéticas.
+
+Verificação: 70 testes R07A aprovados; regressão completa com 1.608 executados,
+1.606 aprovados e 2 skips preexistentes do R05C (fixture privada indisponível).
+Zero falhas/erros e zero tentativas de rede no processo protegido.
+`py_compile`, TypeScript `--noEmit` e `git diff --check` aprovados.
