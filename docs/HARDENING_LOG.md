@@ -1677,3 +1677,50 @@ o executor. Doc: `docs/R07A_REGIME_PLAYBOOKS_OFFLINE.md`.
   zero falhas/erros e zero tentativas de rede. `py_compile`, `tsc --noEmit` e
   `git diff --check` aprovados. Sem teste em PostgreSQL/produção nesta revisão.
 - **Publicação:** sem push/deploy; nenhum R07B iniciado, holdout preservado.
+
+## R08A — auditoria do score e laboratório local do Score V3
+
+Base `7d202144`, branch `main`. `LOCAL_RESEARCH_ONLY`: nenhum caminho de produção
+importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
+
+- **Mapa do pipeline** (7 etapas, com entrada/transformação/saída/consumidor/
+  configuração/dado histórico), separando score bruto → score-base → bônus HTF e
+  auto-learning → pontuação de seleção → corte de execução. Registrado que
+  `snapshot.score` guarda o SCORE-BASE e **não** é o número comparado a
+  `SCORE_MIN`. Config citada é a LOCAL, não confirmada de produção.
+- **Achados comprovados** (com exemplo numérico determinístico):
+  A1 ADX sobe a V2 bruta (+26,7 com conf=70, ADX 5→45) e DESCE no ajuste de
+  execução (66,0 → 58,0) — camadas com sinais opostos;
+  A2 confluência não-monotônica no ajuste: 70,0 → 72,0 mas 70,1 → 60,0, e
+  degrau de +16 na borda de 50;
+  A3 funding em três camadas e a V2 bruta ignora o lado (long e short = 74,3
+  com funding −0,10), enquanto a confluência lê funding COM direção;
+  A4 saturação (ADX ≥ 50 e |funding| ≥ 0,05 colapsam);
+  A5 arredondamento absorve < 0,05 ponto;
+  A6 ausência renormaliza (peso efetivo da confluência 0,600 → 1,000) — isto é
+  deliberado e está correto;
+  A7 score-base ≠ score do gate.
+  Marcados como **hipótese não demonstrada**: RSI/Stoch de reversão vs. tendência
+  EMA (A8) e MTF em duas camadas (A9).
+- **Laboratório** `score_research_service.py`: baseline "V2 bruta sob
+  configuração explícita" com paridade verificada contra `_compute_score_v2`
+  REAL (matriz de entradas, 8 combinações de ausência, 4 conjuntos de pesos,
+  bordas de clamp/arredondamento) e UMA ablação `SCORE_V3_CONF_ONLY_ABLATION`.
+  Saída com `schema_version`, `formula_id`, status/reason_code controlados,
+  componentes, pesos efetivos, contribuições, ausentes, `config_hash` SHA-256,
+  `execution_mode=LOCAL_RESEARCH_ONLY`, `promotable=false`, `calibrated=false`.
+  Sem ENV, relógio, banco, arquivo ou rede na matemática; sem probabilidade,
+  tier, Kelly, bins ou sizing.
+- **Ablação NÃO é o Score V3 aprovado**: é estrutural e provisória, não prova
+  que a dupla contagem foi eliminada nem que a confluência isolada opera melhor.
+  Sem busca de pesos, grade, variante por símbolo ou outro candidato.
+- **Proposta por cenário** documentada SEM inventar multiplicador ou peso por
+  regime, sem combinar com H1/H2/H3 e sem virar veto ou score operacional.
+- **Testes**: 37 testes R08A herméticos verdes; 400 verdes nas regressões
+  R06/R07/R08; suíte completa do backend **1.645 verdes** com 2 skips
+  pré-existentes do R05C (`fixture auditada indisponível (esperado no repo)`).
+  `py_compile` e `git diff --check` aprovados; frontend não mudou.
+- **Limites**: nenhum dado de produção carregado, sem loader, coleta ou
+  backfill; holdout não acessado; diferença de pontuação NÃO estima lucro, stops
+  evitados ou volume real; A1 e A2 são contradições de CAMADA — mexer na V2 sem
+  mexer no ajuste de execução pode não alterar nada no gate.
