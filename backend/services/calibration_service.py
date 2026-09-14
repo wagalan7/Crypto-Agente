@@ -71,7 +71,12 @@ SCORE_BINS_LEGACY = [(55, 60), (60, 65), (65, 70), (70, 75),
 # Derivados da distribuição V2 medida (/api/score/tier-sim): min 18, p25 36,
 # p50 46, p75 53, p90 59, max 71. Bins ~equipopulados cobrindo a faixa + margem.
 SCORE_BINS_V2 = [(15, 31), (31, 36), (36, 40), (40, 44), (44, 48),
-                 (48, 52), (52, 57), (57, 63), (63, 75)]
+                 (48, 52), (52, 57), (57, 63), (63, 75),
+                 (75, 80), (80, 85), (85, 90), (90, 95), (95, 100.1)]
+# A cauda V2 exige amostra PRÓPRIA, além do mínimo global. Os bins anteriores
+# e a partição LEGACY não mudam. 100.1 é só a borda exclusiva para incluir 100.
+V2_HIGH_SCORE_MIN = 75
+V2_HIGH_SCORE_MIN_SAMPLE = 30
 SCORE_BINS = SCORE_BINS_V2 if _SCORE_FORMULA_V2 else SCORE_BINS_LEGACY
 
 # ── R06B2: identidade da calibração ─────────────────────────────────────────
@@ -195,6 +200,8 @@ _cache: Dict[str, Any] = {"ts": 0, "data": None}
 
 def _bin_index(score: float) -> int:
     """Retorna índice do bin pro score. -1 se fora do range."""
+    if _SCORE_FORMULA_V2 and score > 100:
+        return -1
     for i, (lo, hi) in enumerate(SCORE_BINS):
         if lo <= score < hi:
             return i
@@ -272,7 +279,11 @@ def _calibrate_for_win_set(
             bin_p_raw.append(p_obs)
             bin_p_shrunk.append(p_shr)
 
-    weights = [max(1.0, float(n)) for n in bin_total]
+    # Bins novos vazios não são observações do prior: dar peso1 a eles mudaria
+    # até as probabilidades antigas sem qualquer dado novo na cauda.
+    weights = [0.0 if (_SCORE_FORMULA_V2 and lo >= V2_HIGH_SCORE_MIN and n == 0)
+               else max(1.0, float(n))
+               for (lo, _), n in zip(SCORE_BINS, bin_total)]
     bin_p_calibrated = _pav_isotonic(bin_p_shrunk, weights)
     return {
         "wins_global": wins_global,
@@ -561,6 +572,7 @@ PROB_STATUS_FORMULA_MISMATCH = "FORMULA_MISMATCH"
 PROB_STATUS_SCORE_OUT_OF_RANGE = "SCORE_OUT_OF_RANGE"
 PROB_STATUS_INVALID_SCORE = "INVALID_SCORE"
 PROB_STATUS_INVALID_CALIBRATION_CONTRACT = "INVALID_CALIBRATION_CONTRACT"
+PROB_STATUS_INSUFFICIENT_BIN_EVIDENCE = "INSUFFICIENT_BIN_EVIDENCE"
 
 PROB_STATUSES = frozenset({
     PROB_STATUS_READY,
@@ -569,6 +581,7 @@ PROB_STATUSES = frozenset({
     PROB_STATUS_SCORE_OUT_OF_RANGE,
     PROB_STATUS_INVALID_SCORE,
     PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+    PROB_STATUS_INSUFFICIENT_BIN_EVIDENCE,
 })
 
 # Estados que BLOQUEIAM a autoexecução. `CALIBRATION_UNAVAILABLE` fica de fora
@@ -579,6 +592,7 @@ BLOCKING_PROB_STATUSES = frozenset({
     PROB_STATUS_SCORE_OUT_OF_RANGE,
     PROB_STATUS_INVALID_SCORE,
     PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+    PROB_STATUS_INSUFFICIENT_BIN_EVIDENCE,
 })
 
 # Vocabulário FECHADO de motivos. Nunca mensagem crua de exceção, caminho de
@@ -611,6 +625,8 @@ PROB_REASON_PROVENANCE_MALFORMED = "PROBABILITY_PROVENANCE_MALFORMED"
 PROB_REASON_READY_INCOMPLETE = "READY_CONTRACT_INCOMPLETE"
 PROB_REASON_UNAVAILABLE_WITH_PROB = "UNAVAILABLE_WITH_PROBABILITY"
 PROB_REASON_STATUS_UNKNOWN = "STATUS_UNKNOWN"
+PROB_REASON_BIN_SAMPLE_BELOW_MINIMUM = "BIN_SAMPLE_BELOW_MINIMUM"
+PROB_REASON_BIN_SAMPLE_INVALID = "BIN_SAMPLE_INVALID"
 
 PROB_REASON_CODES = frozenset({
     PROB_REASON_OK, PROB_REASON_NO_CALIBRATION, PROB_REASON_NO_BINS,
@@ -626,6 +642,7 @@ PROB_REASON_CODES = frozenset({
     PROB_REASON_SCORE_RANGE_MISMATCH, PROB_REASON_BINS_UNSORTED,
     PROB_REASON_PROVENANCE_MALFORMED, PROB_REASON_READY_INCOMPLETE,
     PROB_REASON_UNAVAILABLE_WITH_PROB, PROB_REASON_STATUS_UNKNOWN,
+    PROB_REASON_BIN_SAMPLE_BELOW_MINIMUM, PROB_REASON_BIN_SAMPLE_INVALID,
 })
 
 # Folga numérica para a comparação P(TP2) <= P(TP1). As duas tabelas saem de
@@ -650,6 +667,7 @@ class CalibrationProbabilityResult(NamedTuple):
     bins_version: Optional[str]
     bin_index: Optional[int]
     fallback_used: bool
+    bin_sample_count: Optional[int] = None
 
     @property
     def ok(self) -> bool:
@@ -670,6 +688,7 @@ class CalibrationProbabilityResult(NamedTuple):
             "bins_version": self.bins_version,
             "bin_index": self.bin_index,
             "fallback_used": self.fallback_used,
+            "bin_sample_count": self.bin_sample_count,
         }
 
 
@@ -681,7 +700,7 @@ def _finite_number(value) -> Optional[float]:
         return None
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return f if math.isfinite(f) else None
 
@@ -691,6 +710,18 @@ def _unit_prob(value) -> Optional[float]:
     if f is None or f < 0.0 or f > 1.0:
         return None
     return f
+
+
+def _high_v2_score(score, formula) -> bool:
+    value = _finite_number(score)
+    return formula == CALIBRATION_FORMULA_V2 and value is not None and value >= V2_HIGH_SCORE_MIN
+
+
+def _sample_count(value) -> Optional[int]:
+    count = _finite_number(value)
+    if count is None or count < 0 or not count.is_integer():
+        return None
+    return int(count)
 
 
 def _result(status, reason_code, **kw) -> CalibrationProbabilityResult:
@@ -734,14 +765,25 @@ def probability_for_score(
     common = {"score": score_f, "score_formula_effective": formula,
               "fallback_used": fallback_used}
 
+    high_v2 = _high_v2_score(score_f, formula)
+    if high_v2 and score_f > 100:
+        return _result(PROB_STATUS_SCORE_OUT_OF_RANGE,
+                       PROB_REASON_SCORE_OUTSIDE_BINS, **common)
+
+    def _unavailable(reason):
+        # Na extensão não se herda o fail-open de calibração ausente: sem
+        # tabela/bin/amostra global também não se prova o mínimo de cada faixa.
+        if high_v2:
+            return _result(PROB_STATUS_INSUFFICIENT_BIN_EVIDENCE,
+                           PROB_REASON_BIN_SAMPLE_BELOW_MINIMUM, **common)
+        return _result(PROB_STATUS_CALIBRATION_UNAVAILABLE, reason, **common)
+
     # 2. Calibração ausente/imatura — NÃO é incompatibilidade.
     if not isinstance(calibration, dict):
-        return _result(PROB_STATUS_CALIBRATION_UNAVAILABLE,
-                       PROB_REASON_NO_CALIBRATION, **common)
+        return _unavailable(PROB_REASON_NO_CALIBRATION)
     bins = calibration.get("bins")
     if not bins:
-        return _result(PROB_STATUS_CALIBRATION_UNAVAILABLE,
-                       PROB_REASON_NO_BINS, **common)
+        return _unavailable(PROB_REASON_NO_BINS)
 
     calib_formula = calibration.get("calibration_formula")
     calib_bins_version = calibration.get("bins_version")
@@ -762,8 +804,7 @@ def probability_for_score(
         return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
                        PROB_REASON_TOTAL_RESOLVED_INVALID, **common)
     if total_f < MIN_SAMPLE_TOTAL:
-        return _result(PROB_STATUS_CALIBRATION_UNAVAILABLE,
-                       PROB_REASON_SAMPLE_BELOW_MINIMUM, **common)
+        return _unavailable(PROB_REASON_SAMPLE_BELOW_MINIMUM)
 
     # 5. Contrato da calibração precisa estar bem formado e identificado.
     if not isinstance(calib_formula, str) or calib_formula not in KNOWN_FORMULAS:
@@ -830,6 +871,20 @@ def probability_for_score(
     idx = achados[0]
     common = dict(common, bin_index=idx)
 
+    if high_v2:
+        # Uma partição antiga ampla não prova amostra na faixa NOVA.
+        if faixas != _bin_pairs(SCORE_BINS_V2):
+            return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+                           PROB_REASON_BINS_MALFORMED, **common)
+        count = _sample_count(bins[idx].get("n_total"))
+        if count is None or count > total_f:
+            return _result(PROB_STATUS_INVALID_CALIBRATION_CONTRACT,
+                           PROB_REASON_BIN_SAMPLE_INVALID, **common)
+        common = dict(common, bin_sample_count=count)
+        if count < V2_HIGH_SCORE_MIN_SAMPLE:
+            return _result(PROB_STATUS_INSUFFICIENT_BIN_EVIDENCE,
+                           PROB_REASON_BIN_SAMPLE_BELOW_MINIMUM, **common)
+
     # 10. As probabilidades do bin precisam ser finitas, em [0,1] e ordenadas.
     p1 = _unit_prob(bins[idx].get("p_calibrated"))
     p2 = _unit_prob(bins[idx].get("p_tp2_calibrated"))
@@ -853,6 +908,8 @@ def cached_calibration() -> Optional[Dict[str, Any]]:
 CALIBRATION_CONTRACT_GATE = "calibration-contract"
 
 _CONTRACT_REASON_PT = {
+    PROB_STATUS_INSUFFICIENT_BIN_EVIDENCE:
+        "faixa de score sem pelo menos 30 observações resolvidas; entrada bloqueada",
     PROB_STATUS_FORMULA_MISMATCH:
         "calibração incompatível com a fórmula que gerou este score",
     PROB_STATUS_SCORE_OUT_OF_RANGE:
@@ -901,6 +958,14 @@ def _ready_consistente(prov: Dict[str, Any], p1, p2) -> bool:
     idx = prov.get("bin_index")
     if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
         return False
+    if (prov.get("calibration_formula") == CALIBRATION_FORMULA_V2
+            and prov.get("bins_version") == bins_version(SCORE_BINS_V2, CALIBRATION_FORMULA_V2)):
+        if idx >= len(SCORE_BINS_V2):
+            return False
+        if SCORE_BINS_V2[idx][0] >= V2_HIGH_SCORE_MIN:
+            count = _sample_count(prov.get("bin_sample_count"))
+            if count is None or count < V2_HIGH_SCORE_MIN_SAMPLE:
+                return False
     if prov.get("fallback_used") is not False:
         return False
     v1, v2 = _unit_prob(p1), _unit_prob(p2)
@@ -971,6 +1036,11 @@ def calibration_contract_verdict(
                          "reconhecidos", PROB_REASON_PROVENANCE_MALFORMED)
 
     if status == PROB_STATUS_CALIBRATION_UNAVAILABLE:
+        if (require_current_contract and _high_v2_score(
+                _rec_field(recommendation, "score"), prov.get("score_formula_effective"))):
+            return _bloqueia(_CONTRACT_REASON_PT[PROB_STATUS_INSUFFICIENT_BIN_EVIDENCE],
+                             PROB_REASON_BIN_SAMPLE_BELOW_MINIMUM,
+                             PROB_STATUS_INSUFFICIENT_BIN_EVIDENCE)
         if not _unavailable_consistente(prov, p1, p2):
             return _bloqueia("contrato declara calibração indisponível mas traz "
                              "probabilidade preenchida",
@@ -982,6 +1052,18 @@ def calibration_contract_verdict(
     if not _ready_consistente(prov, p1, p2):
         return _bloqueia("contrato declara READY mas está incompleto ou "
                          "inconsistente", PROB_REASON_READY_INCOMPLETE)
+    if require_current_contract and _high_v2_score(
+            _rec_field(recommendation, "score"), prov.get("score_formula_effective")):
+        # O executor não refaz o lookup. Um READY antigo, ou copiado de outra
+        # faixa, não comprova cobertura do score alto que está sendo executado.
+        score = _finite_number(_rec_field(recommendation, "score"))
+        idx = prov["bin_index"]  # tipo já validado acima
+        if (score > 100 or prov.get("bins_version") != bins_version(
+                SCORE_BINS_V2, CALIBRATION_FORMULA_V2)
+                or idx >= len(SCORE_BINS_V2)
+                or not SCORE_BINS_V2[idx][0] <= score < SCORE_BINS_V2[idx][1]):
+            return _bloqueia("contrato não comprova a faixa V2 atual deste score",
+                             PROB_REASON_BINS_VERSION_MISMATCH)
     return {"ok": True, "blocked_by": None, "reason": None,
             "status": status, "reason_code": code}
 
@@ -1024,42 +1106,19 @@ def probabilities_from_contract(payload) -> Tuple[Optional[float], Optional[floa
 # deve depender deles — use `probability_for_score`.
 
 async def prob_tp1_for_score(score: float) -> Optional[float]:
-    """P(TP1) calibrada [0..1] ou None. Sem fórmula efetiva ⇒ sem cerca."""
-    if score is None:
-        return None
+    """Compatibilidade: presume fórmula ativa, mas aplica o contrato completo."""
     calib = await get_calibration()
-    if not calib or not calib.get("bins"):
-        return None
-    bi = _bin_index(float(score))
-    if bi < 0:
-        return None
-    return calib["bins"][bi]["p_calibrated"]
+    return probability_for_score(score, active_calibration_formula(), calib).prob_tp1
 
 
 def prob_tp1_for_score_sync(score: float) -> Optional[float]:
     """Versão sync que só lê do cache. Retorna None se cache vazio."""
-    if score is None:
-        return None
-    calib = _cache.get("data")
-    if not calib or not calib.get("bins"):
-        return None
-    bi = _bin_index(float(score))
-    if bi < 0:
-        return None
-    return calib["bins"][bi]["p_calibrated"]
+    return probability_for_score(score, active_calibration_formula(), _cache.get("data")).prob_tp1
 
 
 def prob_tp2_for_score_sync(score: float) -> Optional[float]:
     """Igual a prob_tp1_for_score_sync, mas pra P(TP2)."""
-    if score is None:
-        return None
-    calib = _cache.get("data")
-    if not calib or not calib.get("bins"):
-        return None
-    bi = _bin_index(float(score))
-    if bi < 0:
-        return None
-    return calib["bins"][bi].get("p_tp2_calibrated")
+    return probability_for_score(score, active_calibration_formula(), _cache.get("data")).prob_tp2
 
 
 def invalidate_cache() -> None:

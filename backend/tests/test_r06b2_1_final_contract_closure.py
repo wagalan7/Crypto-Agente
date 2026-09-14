@@ -485,11 +485,12 @@ class FingerprintDosBins(unittest.TestCase):
              "prob_tp1": r.prob_tp1, "prob_tp2": r.prob_tp2},
             require_current_contract=True)["ok"])
 
-    def test_bordas_atuais_nao_mudaram(self):
+    def test_bordas_legadas_e_prefixo_v2_preservados(self):
         self.assertEqual(calib.SCORE_BINS_LEGACY[0], (55, 60))
         self.assertEqual(calib.SCORE_BINS_LEGACY[-1], (95, 100.1))
         self.assertEqual(calib.SCORE_BINS_V2[0], (15, 31))
-        self.assertEqual(calib.SCORE_BINS_V2[-1], (63, 75))
+        self.assertEqual(calib.SCORE_BINS_V2[8], (63, 75))
+        self.assertEqual(calib.SCORE_BINS_V2[-1], (95, 100.1))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -767,7 +768,10 @@ class Escopo(unittest.TestCase):
         self.assertIn("p_shr = (SHRINKAGE_K * p_global + n * p_obs) / (SHRINKAGE_K + n)",
                       fonte)
         self.assertEqual(calib.MIN_SAMPLE_TOTAL, 30)
-        self.assertEqual(len(calib.SCORE_BINS_V2), 9)
+        self.assertEqual(calib.SCORE_BINS_V2[:9], [
+            (15, 31), (31, 36), (36, 40), (40, 44), (44, 48),
+            (48, 52), (52, 57), (57, 63), (63, 75)])
+        self.assertEqual(len(calib.SCORE_BINS_V2), 14)
         self.assertEqual(len(calib.SCORE_BINS_LEGACY), 9)
 
 

@@ -474,7 +474,7 @@ class IntegracaoNaRecomendacao(unittest.TestCase):
         r = calib.probability_for_score(50.0, V2, _calibracao(V2))
         d = r.as_provenance()
         self.assertEqual(sorted(d), [
-            "bin_index", "bins_version", "calibration_formula", "contract_version",
+            "bin_index", "bin_sample_count", "bins_version", "calibration_formula", "contract_version",
             "fallback_used", "reason_code", "score_formula_effective", "status",
         ])
         self.assertEqual(json.loads(json.dumps(d)), d)   # serializável
@@ -851,7 +851,7 @@ class Frontend(unittest.TestCase):
         self.assertIn("status?: string | null", self.tipos)
 
     def test_incompativel_mostra_texto_e_nao_percentual(self):
-        bloco = self.painel.split("probability_provenance?.status")[1][:1400]
+        bloco = self.painel.split("probability_provenance?.status", 1)[1].split("})()}", 1)[0]
         self.assertIn("Calibração incompatível com a fórmula deste score.", bloco)
         self.assertNotIn("toFixed", bloco)
 
@@ -860,7 +860,7 @@ class Frontend(unittest.TestCase):
         self.assertIn("CALIBRATION_UNAVAILABLE", self.painel)
 
     def test_nao_expoe_codigo_interno_nem_objeto(self):
-        bloco = self.painel.split("probability_provenance?.status")[1][:1400]
+        bloco = self.painel.split("probability_provenance?.status", 1)[1].split("})()}", 1)[0]
         for proibido in ("reason_code", "bins_version", "[object Object]",
                          "{st}", "JSON.stringify"):
             self.assertNotIn(proibido, bloco, proibido)

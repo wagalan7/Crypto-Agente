@@ -305,6 +305,7 @@ export interface Recommendation {
     calibration_formula?: string | null
     bins_version?: string | null
     bin_index?: number | null
+    bin_sample_count?: number | null
     fallback_used?: boolean | null
   } | null
   // Edges (sinais que historicamente elevam o win-rate): A+/funding/padrão/MTF.

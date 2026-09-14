@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -369,13 +370,14 @@ class SemanticaScore(unittest.TestCase):
                       fonte)
         self.assertNotEqual(calib.SCORE_BINS_V2, calib.SCORE_BINS_LEGACY)
 
-    def test_score_legado_fora_dos_bins_v2(self):
-        """Um score legado (55–100) cai FORA dos bins V2 no topo da faixa."""
-        v2_hi = calib.SCORE_BINS_V2[-1][1]
-        self.assertLess(v2_hi, 100.0)
-        fora = [s for s in (80.0, 90.0, 99.0)
-                if not any(lo <= s < hi for lo, hi in calib.SCORE_BINS_V2)]
-        self.assertEqual(len(fora), 3)
+    def test_score_legado_continua_incompativel_com_v2_estendida(self):
+        """Cobertura numérica ampliada não autoriza misturar fórmulas."""
+        with patch.object(calib, "_SCORE_FORMULA_V2", True), patch.object(
+                calib, "SCORE_BINS", calib.SCORE_BINS_V2):
+            for score in (80., 90., 99.):
+                table = calib.compute_calibration_from_pairs([(score, "won_tp1")] * 30)
+                result = calib.probability_for_score(score, calib.CALIBRATION_FORMULA_LEGACY, table)
+                self.assertEqual(result.status, calib.PROB_STATUS_FORMULA_MISMATCH)
 
 
 # ════════════════════════════════════════════════════════════════════════════

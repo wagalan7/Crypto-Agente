@@ -881,6 +881,16 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                             </div>
                           )
                         }
+                        if (st === 'INSUFFICIENT_BIN_EVIDENCE') {
+                          return (
+                            <div
+                              className="text-[10px] text-amber-300 mt-0.5"
+                              title="Esta faixa de score precisa de pelo menos 30 observações resolvidas antes de fornecer uma probabilidade. Sem essa amostra, a entrada automática permanece bloqueada."
+                            >
+                              Amostra insuficiente nesta faixa — mínimo de 30 observações; entrada automática bloqueada.
+                            </div>
+                          )
+                        }
                         if (st === 'READY') return null
                         return (
                           <div

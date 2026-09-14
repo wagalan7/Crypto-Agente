@@ -1776,3 +1776,32 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
   de liquidez não elimina bloqueios legítimos de sizing/calibração.
 - **Entrega:** sem push/deploy nesta etapa. Detalhes em
   `docs/LIQUIDITY_EXECUTION_GUARD_FIX.md`.
+
+## Calibração V2 — scores 75–100 com evidência por faixa
+
+- **Base:** `c85fc76e`, main/checkout principal. Autorização explícita do usuário
+  para mudança LIVE, incluindo efeito de probabilidades em entradas/sizing pela
+  política existente, sem aumentar limites financeiros ou alavancagem.
+- **Cobertura:** prefixo original preservado; bins 75–80, 80–85, 85–90, 90–95
+  e 95–100. Cada novo bin exige >=30 observações próprias. Cache ausente,
+  bin vazio ou imaturo → `INSUFFICIENT_BIN_EVIDENCE`, probabilidade ausente e
+  entrada bloqueada. Contagem malformada ou incompatibilidade → contrato inválido.
+- **Contrato:** fingerprint completo reutilizado; `bin_sample_count` no JSON.
+  READY antigo, de outro bin ou sem contagem válida não autoriza score alto.
+  Helpers async/sync legados delegam o lookup validado; nenhum índice global
+  reinterpretando tabela antiga. Nenhuma alteração retroativa do histórico.
+- **Matemática:** shrinkage/PAV existentes; cauda vazia com peso zero para não
+  deslocar bins antigos sem dados novos. Dados na cauda podem alterar os ajustes
+  monotônicos existentes; não é promessa de lucro, independência ou menos stops.
+- **UI:** mensagem de amostra insuficiente com mínimo30 e bloqueio explícito;
+  sem botão de execução, sem modificação de `frontend/dist`.
+- **Validação:** 16 testes específicos sintéticos aprovados; suíte completa 2×,
+  1.679 executados, 1.677 aprovados e 2 skips R05C preexistentes. `py_compile`,
+  `tsc --noEmit` e `git diff --check` aprovados. Testes antigos atualizados apenas
+  nos contratos substituídos, documentados no relatório da correção.
+- **Invariantes:** limites/risco/alavancagem, fórmulas de sizing, score, stop/TP,
+  ENV/flags, executor, schema, endpoints e loops intactos. LEGACY preservado.
+  Nenhuma exchange, ordem, banco externo, holdout ou recalibração remota acessada.
+- **Publicação:** ainda não realizada. Sem push/deploy; cobertura de produção
+  não consultada. Outros bloqueios de sizing/liquidez continuam independentes.
+  Doc: `docs/CALIBRATION_HIGH_SCORE_COVERAGE.md`.
