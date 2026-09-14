@@ -1752,3 +1752,27 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
   aprovados. Sem banco/exchange real.
 - **Invariantes:** laboratório continua isolado, nenhuma estratégia ou ordem
   alterada, holdout preservado; sem push/deploy, R08B não iniciado.
+
+## Correção pontual — liquidez Binance no LIVE (14/09/2026)
+
+- **Base:** `892d53f2`, checkout principal/main. Fonte anterior do gate era OKX
+  apesar do nome `binance_service`; resposta vazia gerava `IndexError` ignorado.
+- **Correção:** volume Futures Binance validado, sem dupla conversão de
+  `quoteVolume`; spread do bookTicker da exchange ativa. Fonte, símbolo e
+  números validados; dado indisponível bloqueia nova entrada LIVE antes do
+  sizing. Reusa cache/rate gate; sem fallback para outra exchange.
+- **Compatibilidade:** gate OFF e SHADOW preservados; nenhum limite, score,
+  calibração, risco, alavancagem, sizing, flag ou proteção de posição alterado.
+  Mudança intencional: LIVE deixa de ignorar falhas de leitura de liquidez.
+- **Testes:** 14 direcionados aprovados. Suíte completa 2×: 1.663 executados,
+  1.661 aprovados e 2 skips preexistentes R05C; sem falhas/erros.
+  `py_compile` e `git diff --check` aprovados. Teste de escopo R08A corrigido
+  para auditar seu range de commits, não alterações futuras no worktree.
+- **Limitações:** volume usa proxy/Futures mainnet e cache 60s; sem proxy
+  bloqueia. Não valida volume específico de testnet/demo. Nenhuma chamada a
+  exchange/banco real nos testes; nenhum dado atual de produção afirmado.
+- **Pendente separado:** ampliar calibração 75–100 não foi implementado;
+  rascunho de teste fora da suíte, aguardando autorização explícita. A correção
+  de liquidez não elimina bloqueios legítimos de sizing/calibração.
+- **Entrega:** sem push/deploy nesta etapa. Detalhes em
+  `docs/LIQUIDITY_EXECUTION_GUARD_FIX.md`.

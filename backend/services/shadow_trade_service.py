@@ -35,6 +35,7 @@ Quando ativar execução real (futuro #11.4):
 """
 from __future__ import annotations
 import os
+import math
 import logging
 import time
 from datetime import datetime, timezone
@@ -960,9 +961,9 @@ DAILY_PROFIT_TARGET_R = float(os.getenv("DAILY_PROFIT_TARGET_R", "3.0"))  # +3R 
 # ── Liquidity gate (Fase 2) ─────────────────────────────────────────────────
 # A allowlist já restringe execução às mais líquidas, mas é ESTÁTICA: se o
 # volume de uma moeda secar ou o spread abrir, o fill sai caro (slippage real).
-# Este gate mede no momento da execução: volume 24h em USD (volume_base × preço)
-# e o spread bid/ask. Fail-soft — erro de dado NÃO bloqueia (allowlist+sizing
-# ainda protegem). 0 desliga cada piso/teto. Aplica shadow+live.
+# LIVE: volume 24h em USD da Binance Futures + bookTicker da exchange ativa.
+# Dado indisponível/inválido bloqueia novas entradas LIVE. Shadow mantém a
+# fonte/comportamento legado. 0 desliga cada piso/teto. Aplica shadow+live.
 LIQUIDITY_GATE_ENABLED = os.getenv("LIQUIDITY_GATE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 MIN_QUOTE_VOL_24H_USD = float(os.getenv("MIN_QUOTE_VOL_24H_USD", "10000000"))  # $10M/24h
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.25"))                    # 0.25%
@@ -4288,6 +4289,53 @@ def _p04c_live_data_verdict(rec: dict, regime: dict) -> dict:
         }
 
 
+async def _check_live_liquidity(symbol: str) -> tuple[bool, str]:
+    """Liquidez Binance comprovada; não usa o fallback OKX/spot do scan.
+
+    Reusa ticker Futures (cache/rate-gate existentes). Só consulta bookTicker
+    se o piso de volume passou e o teto de spread está ligado.
+    """
+    try:
+        from services import binance_futures_service, exchange_service
+
+        if exchange_service.ACTIVE_EXCHANGE != "binance":
+            raise ValueError("exchange ativa sem fonte de liquidez validada")
+
+        def _number(data: dict, field: str, *, allow_zero: bool = False) -> float:
+            raw = data.get(field)
+            value = float(raw)
+            if isinstance(raw, bool) or not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+                raise ValueError(f"{field} inválido")
+            return value
+
+        if MIN_QUOTE_VOL_24H_USD > 0:
+            ticker = await binance_futures_service.fetch_ticker(symbol)
+            if (not isinstance(ticker, dict) or ticker.get("source") != "binance_futures"
+                    or ticker.get("exchange") != "binance" or ticker.get("symbol") != symbol):
+                raise ValueError("ticker sem fonte/símbolo Binance comprovados")
+            _number(ticker, "last")
+            usd_vol = _number(ticker, "volume", allow_zero=True)
+            if usd_vol < MIN_QUOTE_VOL_24H_USD:
+                return False, f"vol 24h ${usd_vol/1e6:.1f}M < mín ${MIN_QUOTE_VOL_24H_USD/1e6:.1f}M"
+
+        if MAX_SPREAD_PCT > 0:
+            quote = await exchange_service.get_execution_quote(symbol, timeout_s=P04A_QUOTE_TIMEOUT_S)
+            if (not isinstance(quote, dict) or quote.get("ok") is not True
+                    or quote.get("source") != "binance_book_ticker"
+                    or quote.get("exchange") != "binance"
+                    or quote.get("symbol") != binance_futures_service.to_fut(symbol)):
+                raise ValueError("bid/ask sem fonte/símbolo Binance comprovados")
+            bid, ask = _number(quote, "bid"), _number(quote, "ask")
+            if ask < bid:
+                raise ValueError("bid/ask cruzados")
+            spread_pct = (ask - bid) / (bid / 2 + ask / 2) * 100
+            if spread_pct > MAX_SPREAD_PCT:
+                return False, f"spread {spread_pct:.3f}% > máx {MAX_SPREAD_PCT}%"
+        return True, "liquidez Binance validada"
+    except Exception as exc:
+        return False, f"liquidez indisponível ({type(exc).__name__}); LIVE bloqueado"
+
+
 async def open_shadow_for_recs(recs: list[dict]) -> int:
     """
     Pra cada rec marcada com `_just_saved=True` e tier A/A+, abre uma RealTrade.
@@ -4668,8 +4716,15 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
 
             # ── Liquidity gate (Fase 2): volume 24h em USD + spread bid/ask no
             # momento da execução. Protege o fill em moedas que secaram ou com
-            # spread largo (slippage real). Fail-soft: erro de dado não bloqueia.
+            # spread largo (slippage real). LIVE falha fechado; shadow legado.
             if LIQUIDITY_GATE_ENABLED and (MIN_QUOTE_VOL_24H_USD > 0 or MAX_SPREAD_PCT > 0):
+                if not SHADOW_ENABLED:
+                    allowed, reason = await _check_live_liquidity(rec["symbol"])
+                    if not allowed:
+                        log.warning(f"[liquidity-gate] {rec['symbol']} {reason} — skip")
+                        _record_skip(rec, "liquidity-gate", reason)
+                        continue
+            if SHADOW_ENABLED and LIQUIDITY_GATE_ENABLED and (MIN_QUOTE_VOL_24H_USD > 0 or MAX_SPREAD_PCT > 0):
                 try:
                     from services.binance_service import fetch_ticker as _fetch_ticker
                     _t = await _fetch_ticker(rec["symbol"])

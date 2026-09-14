@@ -17,6 +17,7 @@ Símbolos: CCXT "BTC/USDT:USDT" ↔ Binance Futures "BTCUSDT".
 """
 from __future__ import annotations
 import os
+import math
 import time
 import logging
 import httpx
@@ -234,11 +235,26 @@ async def fetch_ticker(symbol: str) -> Dict:
         f"{FAPI_BASE}/fapi/v1/ticker/24hr", params={"symbol": fut_sym}
     )
     j = r.json()
+    if not isinstance(j, dict) or j.get("symbol") != fut_sym:
+        raise ValueError("ticker Binance vazio, inválido ou de outro símbolo")
+
+    def _number(name: str, *, allow_zero: bool = False) -> float:
+        raw = j.get(name)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"ticker Binance: {name} ausente ou inválido") from None
+        if isinstance(raw, bool) or not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+            raise ValueError(f"ticker Binance: {name} fora do domínio")
+        return value
+
     out = {
         "symbol": symbol,
-        "last": float(j.get("lastPrice", 0)),
+        "exchange": "binance",
+        "source": "binance_futures",
+        "last": _number("lastPrice"),
         "change": float(j.get("priceChangePercent", 0)),
-        "volume": float(j.get("quoteVolume", 0)),
+        "volume": _number("quoteVolume", allow_zero=True),  # já em USDT; não multiplicar pelo preço
         "high": float(j.get("highPrice", 0)),
         "low": float(j.get("lowPrice", 0)),
     }

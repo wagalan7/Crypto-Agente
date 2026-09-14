@@ -558,15 +558,18 @@ class Isolamento(unittest.TestCase):
                              caminho.name)
 
     def test_servicos_operacionais_permanecem_intactos(self):
-        """Nenhum arquivo RASTREADO de produção foi modificado — o laboratório
-        entra como arquivo novo, sem tocar em serviço existente."""
+        """O pacote R08A concluído não alterou serviços existentes.
+
+        Audita os commits da fase, sem confundir correções operacionais futuras
+        no checkout com mudanças feitas pelo laboratório.
+        """
         import subprocess
         alvos = ["backend/services", "backend/models", "backend/main.py",
                  "backend/db.py", "frontend/src"]
-        res = subprocess.run(["git", "diff", "--name-only", "7d202144", "--", *alvos],
+        res = subprocess.run(["git", "diff", "--name-only", "7d202144..892d53f2", "--", *alvos],
                              cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
-            self.skipTest("baseline 7d202144 indisponível neste checkout")
+            self.skipTest("range R08A 7d202144..892d53f2 indisponível neste checkout")
         # o próprio laboratório é ARQUIVO NOVO: depois do commit ele passa a
         # aparecer neste diff, e isso não é alteração de serviço existente.
         alterados = [ln for ln in res.stdout.splitlines()
