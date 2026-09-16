@@ -224,6 +224,34 @@ async def set_webhook(instance_name: str, webhook_url: str) -> dict:
         return {"ok": False, "error": str(e)[:200]}
 
 
+async def get_webhook(instance_name: str) -> dict:
+    """Webhook ATUALMENTE configurado na instância (consulta com a chave global).
+
+    Existe para diagnóstico: o ``set_webhook`` devolve ok=False num HTTP 400 sem
+    levantar exceção, e o chamador historicamente ignorava esse retorno — então
+    um webhook que nunca foi gravado passava despercebido e as mensagens
+    simplesmente não chegavam. Retorna {ok, url, enabled, events, error}.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.get(f"{_base()}/webhook/find/{instance_name}",
+                                 headers=_admin_headers())
+            if r.status_code >= 400:
+                return {"ok": False, "url": "", "enabled": None, "events": [],
+                        "error": f"HTTP {r.status_code}: {r.text[:160]}"}
+            d = r.json() or {}
+            inner = d.get("webhook") if isinstance(d.get("webhook"), dict) else d
+            return {
+                "ok": True,
+                "url": inner.get("url") or "",
+                "enabled": inner.get("enabled"),
+                "events": inner.get("events") or [],
+                "error": None,
+            }
+    except Exception as e:
+        return {"ok": False, "url": "", "enabled": None, "events": [], "error": str(e)[:200]}
+
+
 async def delete_instance(instance_name: str) -> dict:
     """Remove a instância (logout + delete). Usado em limpeza/troca de número."""
     try:

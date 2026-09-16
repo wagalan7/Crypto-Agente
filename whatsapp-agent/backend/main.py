@@ -2239,7 +2239,16 @@ async def dash_evolution_qr(request: Request):
         try:
             if (tenant.get("whatsapp_provider") or "") != "evolution":
                 db.update_tenant(tenant["slug"], whatsapp_provider="evolution")
-            await _ev_setwebhook(instance_name, webhook_url)
+            # O retorno do set_webhook era IGNORADO: num HTTP 400 (payload que a
+            # versão da Evolution não aceita) o webhook nunca era gravado e as
+            # mensagens não chegavam, sem nenhum sinal. Agora loga e reporta.
+            _wh = await _ev_setwebhook(instance_name, webhook_url)
+            res["webhook_set"] = _wh
+            if not _wh.get("ok"):
+                logger.error(
+                    f"[{tenant['slug']}] FALHA ao gravar webhook na instância "
+                    f"{instance_name}: {_wh.get('error')} — as mensagens recebidas "
+                    f"NÃO vão chegar no app.")
             # AUTOCURA DO TOKEN DA INSTÂNCIA — o connect acima autentica com a
             # chave GLOBAL, então o painel pode dizer "conectado" enquanto o
             # ENVIO (que usa o token da instância) devolve HTTP 401 e o agente
@@ -3007,10 +3016,45 @@ async def diagnose_whatsapp(request: Request):
         ),
     }
 
+    # Webhook REALMENTE gravado na instância (só Evolution). Sem isto, uma
+    # gravação que falhou passa despercebida: o painel diz "conectado", o envio
+    # funciona, e as mensagens recebidas simplesmente nunca chegam no app.
+    webhook_info = None
+    if (tenant.get("whatsapp_provider") or "") == "evolution":
+        try:
+            from evolution_provisioning import (
+                is_enabled as _ev_enabled, get_webhook as _ev_getwebhook,
+            )
+            if _ev_enabled():
+                inst = tenant.get("evolution_instance") or ""
+                atual = await _ev_getwebhook(inst)
+                wt = db.ensure_webhook_token(tenant["id"])
+                esperado = f"{_public_base(request)}/webhook/{tenant['slug']}/evolution?token={wt}"
+                url_atual = atual.get("url") or ""
+                # Não devolve o token em claro: só o que importa pro diagnóstico.
+                def _mask(u: str) -> str:
+                    if not u or "token=" not in u:
+                        return u or ""
+                    head, _sep, tail = u.partition("token=")
+                    parts = tail.split("&", 1)
+                    return head + "token=***" + ("&" + parts[1] if len(parts) > 1 else "")
+                webhook_info = {
+                    "gravado_no_provedor": _mask(url_atual),
+                    "esperado_agora": _mask(esperado),
+                    "habilitado": atual.get("enabled"),
+                    "eventos": atual.get("events"),
+                    "tem_token": "token=" in url_atual,
+                    "confere": url_atual == esperado,
+                    "erro_ao_consultar": atual.get("error"),
+                }
+        except Exception as e:
+            webhook_info = {"erro_ao_consultar": str(e)[:160]}
+
     return {
         "consultorio": tenant.get("slug"),
         "provider": tenant.get("whatsapp_provider"),
         "conexao": conn,  # {ok, connected, error}
+        "webhook": webhook_info,
         "pendentes_amanha": pendentes,
         "lembrete_vencimento_zapi": lembrete,
     }
