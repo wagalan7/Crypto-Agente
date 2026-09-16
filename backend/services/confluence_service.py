@@ -799,10 +799,22 @@ def calculate_confluence(
     total = max(0, min(total, MAX_TOTAL))
     pct = round((total / MAX_TOTAL) * 100, 1) if MAX_TOTAL > 0 else 0.0
 
-    return ConfluenceScore(
+    result = ConfluenceScore(
         total=round(total, 1),
         max_total=float(MAX_TOTAL),
         pct=pct,
         factors=factors,
         warnings=warnings,
     )
+    # R08B: congela a configuração efetiva junto aos fatores calculados.
+    # Sem IO, sem recomputar confluência, sem alterar qualquer número.
+    try:
+        from services.score_trace_service import capture_confluence
+        result.r08_capture = capture_confluence(
+            result, weights=WEIGHTS, pattern_empirical=PATTERN_EMPIRICAL_WEIGHT,
+            pattern_calibration=PATTERN_WEIGHT_CALIBRATION,
+            pattern_override=_PATTERN_CALIBRATION_OVERRIDE,
+        )
+    except Exception:
+        pass
+    return result

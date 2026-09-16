@@ -1,0 +1,495 @@
+{
+ "bars_by_id": {
+  "tr-maxhold-S": [
+   {
+    "close": 100.0,
+    "high": 101.0,
+    "low": 99.0,
+    "open": 100.0,
+    "timestamp_ms": 1760015400000,
+    "volume": 10.0
+   },
+   {
+    "close": 96.0,
+    "high": 100.5,
+    "low": 94.5,
+    "open": 100.0,
+    "timestamp_ms": 1760015700000,
+    "volume": 10.0
+   },
+   {
+    "close": 96.0,
+    "high": 98.0,
+    "low": 95.0,
+    "open": 96.0,
+    "timestamp_ms": 1760016000000,
+    "volume": 10.0
+   },
+   {
+    "close": 96.0,
+    "high": 98.0,
+    "low": 95.0,
+    "open": 96.0,
+    "timestamp_ms": 1760016300000,
+    "volume": 10.0
+   },
+   {
+    "close": 96.0,
+    "high": 98.0,
+    "low": 95.0,
+    "open": 96.0,
+    "timestamp_ms": 1760016600000,
+    "volume": 10.0
+   },
+   {
+    "close": 97.0,
+    "high": 98.0,
+    "low": 95.0,
+    "open": 96.0,
+    "timestamp_ms": 1760016900000,
+    "volume": 10.0
+   }
+  ],
+  "tr-nofill-L": [
+   {
+    "close": 102.0,
+    "high": 103.0,
+    "low": 101.0,
+    "open": 102.0,
+    "timestamp_ms": 1760012400000,
+    "volume": 10.0
+   },
+   {
+    "close": 103.0,
+    "high": 104.0,
+    "low": 102.0,
+    "open": 103.0,
+    "timestamp_ms": 1760012700000,
+    "volume": 10.0
+   }
+  ],
+  "tr-purged-L": [
+   {
+    "close": 100.5,
+    "high": 101.0,
+    "low": 99.5,
+    "open": 100.0,
+    "timestamp_ms": 1760019600000,
+    "volume": 10.0
+   },
+   {
+    "close": 105.5,
+    "high": 106.0,
+    "low": 100.5,
+    "open": 101.0,
+    "timestamp_ms": 1760019900000,
+    "volume": 10.0
+   },
+   {
+    "close": 110.0,
+    "high": 111.0,
+    "low": 105.5,
+    "open": 106.0,
+    "timestamp_ms": 1760020200000,
+    "volume": 10.0
+   }
+  ],
+  "tr-runner-L": [
+   {
+    "close": 100.0,
+    "high": 101.0,
+    "low": 99.0,
+    "open": 100.0,
+    "timestamp_ms": 1760006400000,
+    "volume": 10.0
+   },
+   {
+    "close": 105.0,
+    "high": 106.0,
+    "low": 99.5,
+    "open": 100.0,
+    "timestamp_ms": 1760006700000,
+    "volume": 10.0
+   },
+   {
+    "close": 101.0,
+    "high": 105.5,
+    "low": 100.8,
+    "open": 105.0,
+    "timestamp_ms": 1760007000000,
+    "volume": 10.0
+   }
+  ],
+  "tr-stop-L": [
+   {
+    "close": 100.0,
+    "high": 101.0,
+    "low": 99.0,
+    "open": 100.0,
+    "timestamp_ms": 1760000400000,
+    "volume": 10.0
+   },
+   {
+    "close": 95.0,
+    "high": 99.5,
+    "low": 94.0,
+    "open": 99.0,
+    "timestamp_ms": 1760000700000,
+    "volume": 10.0
+   }
+  ],
+  "tr-time-S": [
+   {
+    "close": 100.0,
+    "high": 101.0,
+    "low": 99.0,
+    "open": 100.0,
+    "timestamp_ms": 1760009400000,
+    "volume": 10.0
+   },
+   {
+    "close": 99.0,
+    "high": 102.0,
+    "low": 98.0,
+    "open": 100.0,
+    "timestamp_ms": 1760009700000,
+    "volume": 10.0
+   },
+   {
+    "close": 98.0,
+    "high": 101.0,
+    "low": 97.0,
+    "open": 99.0,
+    "timestamp_ms": 1760010000000,
+    "volume": 10.0
+   },
+   {
+    "close": 97.0,
+    "high": 100.0,
+    "low": 96.0,
+    "open": 98.0,
+    "timestamp_ms": 1760010300000,
+    "volume": 10.0
+   }
+  ],
+  "tr-tp2-S": [
+   {
+    "close": 99.5,
+    "high": 100.5,
+    "low": 99.0,
+    "open": 100.0,
+    "timestamp_ms": 1760003400000,
+    "volume": 10.0
+   },
+   {
+    "close": 94.5,
+    "high": 99.5,
+    "low": 94.0,
+    "open": 99.0,
+    "timestamp_ms": 1760003700000,
+    "volume": 10.0
+   },
+   {
+    "close": 90.0,
+    "high": 94.5,
+    "low": 89.0,
+    "open": 94.0,
+    "timestamp_ms": 1760004000000,
+    "volume": 10.0
+   }
+  ],
+  "va-ambig-L": [
+   {
+    "close": 97.0,
+    "high": 103.0,
+    "low": 94.0,
+    "open": 102.0,
+    "timestamp_ms": 1760027400000,
+    "volume": 10.0
+   }
+  ],
+  "va-maxhold-L": [
+   {
+    "close": 100.0,
+    "high": 101.0,
+    "low": 99.0,
+    "open": 100.0,
+    "timestamp_ms": 1760030400000,
+    "volume": 10.0
+   },
+   {
+    "close": 104.0,
+    "high": 105.5,
+    "low": 99.5,
+    "open": 100.0,
+    "timestamp_ms": 1760030700000,
+    "volume": 10.0
+   },
+   {
+    "close": 104.0,
+    "high": 105.0,
+    "low": 102.0,
+    "open": 104.0,
+    "timestamp_ms": 1760031000000,
+    "volume": 10.0
+   },
+   {
+    "close": 104.0,
+    "high": 105.0,
+    "low": 102.0,
+    "open": 104.0,
+    "timestamp_ms": 1760031300000,
+    "volume": 10.0
+   },
+   {
+    "close": 104.0,
+    "high": 105.0,
+    "low": 102.0,
+    "open": 104.0,
+    "timestamp_ms": 1760031600000,
+    "volume": 10.0
+   },
+   {
+    "close": 103.0,
+    "high": 105.0,
+    "low": 102.0,
+    "open": 104.0,
+    "timestamp_ms": 1760031900000,
+    "volume": 10.0
+   }
+  ],
+  "va-runner-S": [
+   {
+    "close": 100.0,
+    "high": 101.0,
+    "low": 99.0,
+    "open": 100.0,
+    "timestamp_ms": 1760021400000,
+    "volume": 10.0
+   },
+   {
+    "close": 95.0,
+    "high": 100.5,
+    "low": 94.0,
+    "open": 100.0,
+    "timestamp_ms": 1760021700000,
+    "volume": 10.0
+   },
+   {
+    "close": 99.0,
+    "high": 99.2,
+    "low": 94.5,
+    "open": 95.0,
+    "timestamp_ms": 1760022000000,
+    "volume": 10.0
+   }
+  ],
+  "va-stop-L": [
+   {
+    "close": 100.0,
+    "high": 101.0,
+    "low": 99.0,
+    "open": 100.0,
+    "timestamp_ms": 1760024400000,
+    "volume": 10.0
+   },
+   {
+    "close": 95.0,
+    "high": 99.5,
+    "low": 94.0,
+    "open": 99.0,
+    "timestamp_ms": 1760024700000,
+    "volume": 10.0
+   }
+  ]
+ },
+ "baseline_config": {
+  "bar_ms": 300000,
+  "be_lock_fraction": 0.2,
+  "entry_window_bars": 2,
+  "max_bars": 16,
+  "max_holding_bars": 6,
+  "pre_tp1_time_stop_bars": 4,
+  "tp1_fraction": 0.45,
+  "trail_activation_atr": 0.5,
+  "trail_atr_multiple": 2.2
+ },
+ "bootstrap": {
+  "block_size": 2,
+  "samples": 200,
+  "seed": 20260916
+ },
+ "candidate": {
+  "candidate_id": "R10A-SYNTH-TP1-030",
+  "kind": "MANAGEMENT_ONLY",
+  "registered_at_ms": 1760000099999,
+  "replay_config": {
+   "bar_ms": 300000,
+   "be_lock_fraction": 0.2,
+   "entry_window_bars": 2,
+   "max_bars": 16,
+   "max_holding_bars": 6,
+   "pre_tp1_time_stop_bars": 4,
+   "tp1_fraction": 0.3,
+   "trail_activation_atr": 0.5,
+   "trail_atr_multiple": 2.2
+  }
+ },
+ "costs": {
+  "fee_bps_per_side": 4.0,
+  "funding_bps_per_bar": 1.0,
+  "slippage_bps_per_side": 2.0
+ },
+ "mode": "compare",
+ "opportunities": [
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760000101000,
+   "direction": "long",
+   "entry": 100.0,
+   "opportunity_id": "tr-stop-L",
+   "stop_loss": 95.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 105.0,
+   "tp2": 110.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760003101000,
+   "direction": "short",
+   "entry": 100.0,
+   "opportunity_id": "tr-tp2-S",
+   "stop_loss": 105.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 95.0,
+   "tp2": 90.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760006101000,
+   "direction": "long",
+   "entry": 100.0,
+   "opportunity_id": "tr-runner-L",
+   "stop_loss": 95.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 105.0,
+   "tp2": 110.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760009101000,
+   "direction": "short",
+   "entry": 100.0,
+   "opportunity_id": "tr-time-S",
+   "stop_loss": 105.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 95.0,
+   "tp2": 90.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760012101000,
+   "direction": "long",
+   "entry": 100.0,
+   "opportunity_id": "tr-nofill-L",
+   "stop_loss": 95.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 105.0,
+   "tp2": 110.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760015101000,
+   "direction": "short",
+   "entry": 100.0,
+   "opportunity_id": "tr-maxhold-S",
+   "stop_loss": 105.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 95.0,
+   "tp2": 90.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760019301000,
+   "direction": "long",
+   "entry": 100.0,
+   "opportunity_id": "tr-purged-L",
+   "stop_loss": 95.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 105.0,
+   "tp2": 110.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760021101000,
+   "direction": "short",
+   "entry": 100.0,
+   "opportunity_id": "va-runner-S",
+   "stop_loss": 105.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 95.0,
+   "tp2": 90.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760024101000,
+   "direction": "long",
+   "entry": 100.0,
+   "opportunity_id": "va-stop-L",
+   "stop_loss": 95.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 105.0,
+   "tp2": 110.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760027101000,
+   "direction": "long",
+   "entry": 100.0,
+   "opportunity_id": "va-ambig-L",
+   "stop_loss": 95.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 105.0,
+   "tp2": 110.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760030101000,
+   "direction": "long",
+   "entry": 100.0,
+   "opportunity_id": "va-maxhold-L",
+   "stop_loss": 95.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 105.0,
+   "tp2": 110.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760036101000,
+   "direction": "long",
+   "entry": 100.0,
+   "opportunity_id": "ho-stop-L",
+   "stop_loss": 95.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 105.0,
+   "tp2": 110.0
+  },
+  {
+   "atr": 2.0,
+   "decision_ts_ms": 1760039101000,
+   "direction": "short",
+   "entry": 100.0,
+   "opportunity_id": "ho-tp2-S",
+   "stop_loss": 105.0,
+   "symbol": "SYNTH/USDT:USDT",
+   "tp1": 95.0,
+   "tp2": 90.0
+  }
+ ],
+ "split": {
+  "holdout_start_ms": 1760036100000,
+  "purge_bars": 1,
+  "train_start_ms": 1760000100000,
+  "validation_start_ms": 1760021100000
+ }
+}

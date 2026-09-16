@@ -535,6 +535,12 @@ class Auditoria(unittest.TestCase):
 # ════════════════════════════════════════════════════════════════════════════
 #  E. ISOLAMENTO
 # ════════════════════════════════════════════════════════════════════════════
+#: Única fronteira autorizada (R10A): o comparador OFFLINE importa o
+#: laboratório tardiamente, dentro de `compare_registered_candidate`.
+FRONTEIRA_R10A = "backend/services/offline_replay_service.py"
+FUNCAO_R10A = "compare_registered_candidate"
+
+
 class Isolamento(unittest.TestCase):
 
     def test_nenhum_consumidor_de_producao_importa_o_laboratorio(self):
@@ -545,10 +551,77 @@ class Isolamento(unittest.TestCase):
                 continue
             if rel.endswith("services/score_research_service.py"):
                 continue
-            if "score_research_service" in caminho.read_text(encoding="utf-8",
-                                                             errors="ignore"):
-                achados.append(rel)
+            fonte = caminho.read_text(encoding="utf-8", errors="ignore")
+            if "score_research_service" not in fonte:
+                continue
+            if rel == FRONTEIRA_R10A and self._so_import_tardio_do_comparador(fonte):
+                continue
+            achados.append(rel)
         self.assertEqual(achados, [], str(achados))
+
+    @staticmethod
+    def _so_import_tardio_do_comparador(fonte: str) -> bool:
+        """Toda menção em CÓDIGO é um import dentro da função do comparador."""
+        import ast
+        arvore = ast.parse(fonte)
+        permitidos = set()
+        for no in ast.walk(arvore):
+            if isinstance(no, ast.FunctionDef) and no.name == FUNCAO_R10A:
+                for filho in ast.walk(no):
+                    if (isinstance(filho, ast.ImportFrom)
+                            and filho.module == "services.score_research_service"):
+                        permitidos.add(filho.lineno)
+        if not permitidos:
+            return False
+        for no in ast.walk(arvore):
+            texto = None
+            if isinstance(no, ast.ImportFrom):
+                texto = no.module or ""
+            elif isinstance(no, ast.Import):
+                texto = " ".join(a.name for a in no.names)
+            elif isinstance(no, ast.Constant) and isinstance(no.value, str):
+                texto = no.value
+            elif isinstance(no, ast.Name):
+                texto = no.id
+            elif isinstance(no, ast.Attribute):
+                texto = no.attr
+            if texto and "score_research_service" in texto and no.lineno not in permitidos:
+                return False
+        return True
+
+    def test_fronteira_r10a_e_realmente_tardia(self):
+        """Importar o replay e executar replay de preços não carrega o lab."""
+        import subprocess
+        import sys
+        codigo = (
+            "import sys\n"
+            "from services import offline_replay_service as r\n"
+            "from services import decision_observation_service\n"
+            "c = r.ReplayConfig()\n"
+            "o = r.Opportunity(opportunity_id='x', symbol='S', direction='long',"
+            " decision_ts_ms=0, entry=100.0, stop_loss=95.0, tp1=105.0, tp2=110.0)\n"
+            "r.replay_opportunity(o, (r.Candle(0, 100.0, 101.0, 99.0, 100.5, 1.0),), c, r.CostConfig())\n"
+            "assert 'services.score_research_service' not in sys.modules\n"
+            "print('SEM_LAB')\n"
+        )
+        res = subprocess.run([sys.executable, "-B", "-c", codigo], cwd=BACKEND,
+                             capture_output=True, text=True,
+                             env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/bin:/bin"})
+        self.assertEqual(res.returncode, 0, res.stderr[-800:])
+        self.assertIn("SEM_LAB", res.stdout)
+
+    def test_fronteira_r10a_rejeita_import_no_topo(self):
+        """O verificador não é permissivo: import de módulo continua proibido."""
+        ruim = ("from services.score_research_service import score_v2_raw\n"
+                "def compare_registered_candidate():\n"
+                "    from services.score_research_service import score_v3_conf_only\n")
+        self.assertFalse(self._so_import_tardio_do_comparador(ruim))
+        outra = ("def outra():\n"
+                 "    from services.score_research_service import score_v2_raw\n")
+        self.assertFalse(self._so_import_tardio_do_comparador(outra))
+        ok = ("def compare_registered_candidate():\n"
+              "    from services.score_research_service import score_v2_raw\n")
+        self.assertTrue(self._so_import_tardio_do_comparador(ok))
 
     def test_frontend_nao_conhece_o_laboratorio(self):
         base = BACKEND.parent / "frontend" / "src"

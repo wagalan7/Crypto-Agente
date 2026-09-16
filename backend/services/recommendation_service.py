@@ -32,7 +32,22 @@ from services.signal_service import build_trade_signal, determine_direction
 from services.derivatives_service import analyze_derivatives
 from services.mtf_service import analyze_mtf
 from services.data_freshness_service import prepare_closed_candles
+from services import score_trace_service as _score_trace_service
 from models.trade_signal import TradeSignal, SignalDirection
+
+
+class _FailSoftScoreTrace:
+    """Fronteira de observabilidade: até uma falha do helper não toca a decisão."""
+    def __getattr__(self, name):
+        def annotate(*args, **kwargs):
+            try:
+                return getattr(_score_trace_service, name)(*args, **kwargs)
+            except Exception:
+                return None
+        return annotate
+
+
+_score_trace = _FailSoftScoreTrace()
 
 
 SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
@@ -142,7 +157,12 @@ def _score_with_htf_confirm(sig: "TradeSignal", base_score: float, confirm_dirs:
         and sig.timeframe not in HIGH_TF_LIST
         and sig.direction in confirm_dirs
     ):
-        return min(100.0, base_score + HIGH_TF_CONFIRM_BONUS)
+        score = min(100.0, base_score + HIGH_TF_CONFIRM_BONUS)
+        _score_trace.record_signal_stage(sig, "htf_score", value=score, input_score=base_score,
+                                        bonus=HIGH_TF_CONFIRM_BONUS, configured_bonus=HIGH_TF_CONFIRM_BONUS)
+        return score
+    _score_trace.record_signal_stage(sig, "htf_score", value=base_score, input_score=base_score,
+                                    bonus=0.0, configured_bonus=HIGH_TF_CONFIRM_BONUS, status="NOT_APPLIED")
     return base_score
 
 
@@ -421,6 +441,7 @@ class Recommendation(BaseModel):
     # score BASE da fórmula; `Recommendation.score` pode trazer, além dele, o
     # bônus aditivo de confirmação HTF.
     score_provenance: Optional[dict] = None
+    r08_score_trace: Optional[dict] = None  # trace prospectivo, não decisório
     # ── Contrato score ↔ calibração ↔ probabilidade (R06B2) ───────────────
     # {contract_version, status, reason_code, score_formula_effective,
     #  calibration_formula, bins_version, bin_index, fallback_used}.
@@ -499,6 +520,7 @@ def _compute_score_v2(
     conf_pct: Optional[float],
     adx_raw: Optional[float],
     funding_pct: Optional[float],
+    *, _trace: Optional[dict] = None,
 ) -> Optional[float]:
     """Score 0–100 V2. Renormaliza sobre componentes presentes. Retorna None
     quando nada é computável (sem confluence E sem adx E sem funding) → o caller
@@ -519,7 +541,12 @@ def _compute_score_v2(
             den += w
     if den == 0:
         return None
-    return round(max(0.0, min(100.0, num / den)), 1)
+    raw = round(max(0.0, min(100.0, num / den)), 1)
+    _score_trace.record_stage(_trace, "raw_score", value=raw, conf_input=conf_pct,
+                             adx_input=adx_raw, funding_input=funding_pct,
+                             conf_component=conf_n, adx_component=adx_n,
+                             der_component=der_n, numerator=num, denominator=den)
+    return raw
 
 
 # ── Proveniência da fórmula de score (R06B1) ─────────────────────────────────
@@ -564,41 +591,58 @@ class ScoreProvenance(NamedTuple):
         }
 
 
-def compute_score_with_provenance(sig: TradeSignal) -> ScoreProvenance:
+def compute_score_with_provenance(sig: TradeSignal, *, capture_trace: bool = True) -> ScoreProvenance:
     """`_compute_score` + identidade da fórmula. Mesma aritmética, zero desvio."""
     requested = SCORE_FORMULA_V2_ID if SCORE_FORMULA_V2 else SCORE_FORMULA_LEGACY_ID
+    if capture_trace:
+        _score_trace.clear_signal_trace(sig)
+    trace = _score_trace.new_trace(sig, {
+        "v2_w_conf": SCORE_V2_W_CONF, "v2_w_adx": SCORE_V2_W_ADX, "v2_w_der": SCORE_V2_W_DER,
+        "legacy_w_conf": 0.35, "legacy_w_mtf": 0.25, "legacy_w_rr": 0.25,
+        "legacy_w_der": 0.10, "legacy_w_win": 0.5,
+        "tier_aplus": SCORE_V2_TIER_APLUS if SCORE_FORMULA_V2 else 75.0,
+        "tier_a": SCORE_V2_TIER_A if SCORE_FORMULA_V2 else 65.0,
+        "tier_b": SCORE_V2_TIER_B if SCORE_FORMULA_V2 else 52.0,
+        "high_tf_patterns_enabled": HIGH_TF_PATTERNS_ENABLED,
+        "high_tf_confirm_enabled": HIGH_TF_CONFIRM_ENABLED,
+        "high_tf_confirm_bonus": HIGH_TF_CONFIRM_BONUS,
+    }) if capture_trace else None
     if SCORE_FORMULA_V2:
-        v2 = _compute_score_v2_for(sig)
+        v2 = _compute_score_v2_for(sig, _trace=trace)
         if v2 is not None:
-            return ScoreProvenance(
-                score=_finish_score(v2, sig.timeframe),
+            result = ScoreProvenance(
+                score=_finish_score(v2, sig.timeframe, _trace=trace),
                 formula_requested=requested,
                 formula_effective=SCORE_FORMULA_V2_ID,
                 fallback_used=False,
                 fallback_reason=None,
             )
-        return ScoreProvenance(
-            score=_compute_score_legacy(sig),
-            formula_requested=requested,
-            formula_effective=SCORE_FORMULA_LEGACY_ID,
-            fallback_used=True,
-            fallback_reason=SCORE_FALLBACK_V2_NO_COMPONENTS,
+        else:
+            result = ScoreProvenance(
+                score=_compute_score_legacy(sig, _trace=trace), formula_requested=requested,
+                formula_effective=SCORE_FORMULA_LEGACY_ID, fallback_used=True,
+                fallback_reason=SCORE_FALLBACK_V2_NO_COMPONENTS,
+            )
+    else:
+        result = ScoreProvenance(
+            score=_compute_score_legacy(sig, _trace=trace), formula_requested=requested,
+            formula_effective=SCORE_FORMULA_LEGACY_ID, fallback_used=False, fallback_reason=None,
         )
-    return ScoreProvenance(
-        score=_compute_score_legacy(sig),
-        formula_requested=requested,
-        formula_effective=SCORE_FORMULA_LEGACY_ID,
-        fallback_used=False,
-        fallback_reason=None,
-    )
+    if capture_trace:
+        _score_trace.finish_trace(sig, trace, result.as_dict())
+    return result
 
 
-def _finish_score(raw: float, timeframe: str) -> float:
+def _finish_score(raw: float, timeframe: str, *, _trace: Optional[dict] = None) -> float:
     """Relevância por TF (gated, no-op quando off) + clamp/arredondamento finais."""
-    return round(max(0.0, min(100.0, raw * _htf_relevance_mult(timeframe))), 1)
+    mult = _htf_relevance_mult(timeframe)
+    score = round(max(0.0, min(100.0, raw * mult)), 1)
+    _score_trace.record_stage(_trace, "base_score", value=score, input_score=raw,
+                             relevance_multiplier=mult)
+    return score
 
 
-def _compute_score_v2_for(sig: TradeSignal) -> Optional[float]:
+def _compute_score_v2_for(sig: TradeSignal, *, _trace: Optional[dict] = None) -> Optional[float]:
     """Extrai os componentes da V2 do sinal. None ⇒ V2 não computável."""
     conf_pct = sig.confluence.pct if sig.confluence else None
     adx_raw = sig.indicators.adx if sig.indicators else None
@@ -609,7 +653,7 @@ def _compute_score_v2_for(sig: TradeSignal) -> Optional[float]:
             der.get("funding_rate_pct") if isinstance(der, dict)
             else getattr(der, "funding_rate_pct", None)
         )
-    return _compute_score_v2(conf_pct, adx_raw, funding_pct)
+    return _compute_score_v2(conf_pct, adx_raw, funding_pct, _trace=_trace)
 
 
 def _compute_score(sig: TradeSignal) -> float:
@@ -635,7 +679,26 @@ def _compute_score(sig: TradeSignal) -> float:
     return compute_score_with_provenance(sig).score
 
 
-def _compute_score_legacy(sig: TradeSignal) -> float:
+def _record_learning_trace(sig, before, after, adjustments, result=None, *, status="OBSERVED"):
+    """Somente resultado agregado observado; nenhum lookup de buckets adicional."""
+    try:
+        from services.learning_service import ADJUST_CAP, AUTO_ADJUST_ENABLED, AUTO_BLOCK_ENABLED
+        result = result or {}
+        thresholds = adjustments.get("thresholds") or {}
+        _score_trace.record_signal_stage(
+            sig, "learning_score", status=status, value=after, input_score=before,
+            multiplier=result.get("multiplier", 1.0 if status == "NOT_APPLIED" else None),
+            matched_count=len(result.get("matched_buckets") or []),
+            enabled=bool(adjustments.get("enabled")), blocked=result.get("blocked", False),
+            cap=ADJUST_CAP, auto_adjust=AUTO_ADJUST_ENABLED, auto_block=AUTO_BLOCK_ENABLED,
+            **{key: thresholds.get(key) for key in ("min_sample_adjust", "min_sample_block",
+                "block_wr_max", "boost_wr_min", "adjust_cap_pct")},
+        )
+    except Exception:
+        pass
+
+
+def _compute_score_legacy(sig: TradeSignal, *, _trace: Optional[dict] = None) -> float:
     """Fórmula legada (LEGACY_V1) — aritmética idêntica à de antes do R06B1."""
     conf_score = (sig.confluence.pct if sig.confluence else sig.confidence * 100)
     mtf_score = 50.0
@@ -680,7 +743,10 @@ def _compute_score_legacy(sig: TradeSignal) -> float:
     )
     # Relevância por TF (gated): TF maior = mais relevante. Mult 1.0 (no-op)
     # quando HIGH_TF_PATTERNS_ENABLED off ou TF base. Cap final em 100.
-    return _finish_score(score, sig.timeframe)
+    _score_trace.record_stage(_trace, "raw_score", value=score, conf_component=conf_score,
+                             mtf_component=mtf_score, rr_component=rr_score,
+                             der_component=der_score, win_bonus=win_bonus, breakout_bonus=breakout_bonus)
+    return _finish_score(score, sig.timeframe, _trace=_trace)
 
 
 def _derivatives_score(sig: TradeSignal) -> float:
@@ -1219,9 +1285,15 @@ async def _best_tf_for_symbol(symbol: str) -> Optional[tuple]:
         )
         def _sel_key(item):
             s, sc = item
-            return sc - (_ctpen if _sct(getattr(s, "mtf", None), s.direction) else 0.0)
+            pen = _ctpen if _sct(getattr(s, "mtf", None), s.direction) else 0.0
+            value = sc - pen
+            _score_trace.record_signal_stage(s, "selection_score", value=value, input_score=sc,
+                                            penalty=pen, configured_penalty=_ctpen)
+            return value
     except Exception:
         def _sel_key(item):
+            _score_trace.record_signal_stage(item[0], "selection_score", value=item[1],
+                                            input_score=item[1], penalty=0.0, status="UNAVAILABLE")
             return item[1]
     return max(scored, key=_sel_key)
 
@@ -1766,7 +1838,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
     # Precisa vir ANTES do lookup: é a fórmula EFETIVA (não a flag global) que
     # governa qual conjunto de bins pode interpretar este score.
     try:
-        score_prov = compute_score_with_provenance(sig).as_dict()
+        score_prov = compute_score_with_provenance(sig, capture_trace=False).as_dict()
     except Exception:
         score_prov = None
 
@@ -1971,6 +2043,7 @@ def _build_recommendation(sig: TradeSignal, score: float, tier: str) -> Optional
         edge_tags=edge_tags,
         edge_score=edge_score,
         score_provenance=score_prov,
+        r08_score_trace=_score_trace.recommendation_trace(sig, score, tier),
         probability_provenance=prob_prov,
     )
 
@@ -2130,7 +2203,10 @@ async def get_recommendations_from_batch(
             for sig in results:
                 if sig is None or sig.direction == SignalDirection.NEUTRAL:
                     continue
-                scored.append((sig, _compute_score(sig)))
+                score = _compute_score(sig)
+                _score_trace.record_signal_stage(sig, "htf_score", value=score, input_score=score,
+                                                bonus=0.0, status="NOT_APPLIED")
+                scored.append((sig, score))
             if not scored:
                 return None
             # Seleção trend-aware: penaliza (só no desempate do max) candidatos
@@ -2146,9 +2222,14 @@ async def get_recommendations_from_batch(
                 def _sel_key(item):
                     s, sc = item
                     pen = _ctpen if _sct(getattr(s, "mtf", None), s.direction) else 0.0
-                    return sc - pen
+                    value = sc - pen
+                    _score_trace.record_signal_stage(s, "selection_score", value=value, input_score=sc,
+                                                    penalty=pen, configured_penalty=_ctpen)
+                    return value
             except Exception:
                 def _sel_key(item):
+                    _score_trace.record_signal_stage(item[0], "selection_score", value=item[1],
+                                                    input_score=item[1], penalty=0.0, status="UNAVAILABLE")
                     return item[1]
             return max(scored, key=_sel_key)
 
@@ -2219,11 +2300,14 @@ async def get_recommendations_from_batch(
         tier_prov = _classify_tier(sig, score)
 
         # Aplica auto-learning: multiplica score, checa block list
+        _record_learning_trace(sig, score, score, auto_adj, status="NOT_APPLIED")
+        learning_input_score = score
         if auto_adj.get("enabled"):
             try:
                 from services.learning_service import apply_score_adjustment
                 adj_res = apply_score_adjustment(sig, score, auto_adj, tier_provisional=tier_prov)
                 if adj_res.get("blocked"):
+                    _record_learning_trace(sig, learning_input_score, None, auto_adj, adj_res, status="BLOCKED")
                     import logging as _log
                     _log.info(f"[learning] BLOCK {sig.symbol}: {adj_res.get('block_reason')}")
                     continue
@@ -2235,7 +2319,9 @@ async def get_recommendations_from_batch(
                         f"score×{adj_res['multiplier']:.2f} → {score:.1f} "
                         f"({', '.join(adj_res.get('matched_buckets') or [])})"
                     )
+                _record_learning_trace(sig, learning_input_score, score, auto_adj, adj_res)
             except Exception as e:
+                _record_learning_trace(sig, learning_input_score, score, auto_adj, status="UNAVAILABLE")
                 import logging as _log
                 _log.warning(f"[learning] apply_score_adjustment falhou (fail-open): {e}")
 
@@ -2430,9 +2516,15 @@ async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
         )
         def _sel_key(item):
             s, sc = item
-            return sc - (_ctpen if _sct(getattr(s, "mtf", None), s.direction) else 0.0)
+            pen = _ctpen if _sct(getattr(s, "mtf", None), s.direction) else 0.0
+            value = sc - pen
+            _score_trace.record_signal_stage(s, "selection_score", value=value, input_score=sc,
+                                            penalty=pen, configured_penalty=_ctpen)
+            return value
     except Exception:
         def _sel_key(item):
+            _score_trace.record_signal_stage(item[0], "selection_score", value=item[1],
+                                            input_score=item[1], penalty=0.0, status="UNAVAILABLE")
             return item[1]
     return max(scored, key=_sel_key)
 
@@ -2615,11 +2707,14 @@ async def get_recommendations_via_vision(
         tier_prov = _classify_tier_vision(sig, score)
 
         # Auto-learning: bloqueia bucket catastrófico + ajusta score
+        _record_learning_trace(sig, score, score, auto_adj, status="NOT_APPLIED")
+        learning_input_score = score
         if auto_adj.get("enabled"):
             try:
                 from services.learning_service import apply_score_adjustment
                 adj_res = apply_score_adjustment(sig, score, auto_adj, tier_provisional=tier_prov)
                 if adj_res.get("blocked"):
+                    _record_learning_trace(sig, learning_input_score, None, auto_adj, adj_res, status="BLOCKED")
                     _log.info(f"[server-scan][learning] BLOCK {sig.symbol}: {adj_res.get('block_reason')}")
                     continue
                 if adj_res.get("multiplier", 1.0) != 1.0:
@@ -2629,7 +2724,9 @@ async def get_recommendations_via_vision(
                         f"×{adj_res['multiplier']:.2f} → {score:.1f} "
                         f"({', '.join(adj_res.get('matched_buckets') or [])})"
                     )
+                _record_learning_trace(sig, learning_input_score, score, auto_adj, adj_res)
             except Exception as e:
+                _record_learning_trace(sig, learning_input_score, score, auto_adj, status="UNAVAILABLE")
                 _log.warning(f"[learning] apply falhou (fail-open): {e}")
 
         tier = _classify_tier_vision(sig, score)

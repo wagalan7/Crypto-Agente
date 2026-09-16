@@ -1805,3 +1805,47 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
 - **Publicação:** ainda não realizada. Sem push/deploy; cobertura de produção
   não consultada. Outros bloqueios de sizing/liquidez continuam independentes.
   Doc: `docs/CALIBRATION_HIGH_SCORE_COVERAGE.md`.
+
+## Lote R08B · R09 · R10A — fechamento local para revisão (16/09/2026)
+
+- **Base:** `b0d52a80`, checkout principal/main. Continuação do checkpoint
+  parcial (R08B pronto; R09 sem tetos de banco e com mapa de status incorreto;
+  R10A sem guarda, testes e doc; falha de arquitetura R08A em aberto).
+- **R08B:** trace prospectivo inalterado em comportamento; hook `ATTEMPTED`
+  movido para fora da janela de latência do P05.2L (falha apontada pela suíte
+  completa, teste antigo preservado). Tamanho medido do trace documentado.
+- **R09:** mapa explícito dos 9 status do replay; terminais `RESOLVED`,
+  `NOT_FILLED`, `AMBIGUOUS`, `INVALID`, `DATA_GAP_FINAL`, `EXPIRED_INCOMPLETE`
+  não são reprocessados; lacuna/horizonte só viram finais quando a vela sai da
+  janela de 50 velas do resolver. Tetos fixos 50.000/100.000/50.000 checados por
+  lote na mesma transação, sob `pg_try_advisory_xact_lock(0x52303943)` (≠ 917283);
+  descarte, capacidade e contenção contados; resolver segue com admissão lotada.
+  Timeout/cancelamento contados; admissão commitada antes do replay. Semântica
+  "primeiro" = primeira tentativa persistida, `first_seen_at` = mais antiga,
+  `out_of_order_first` contado. Endpoint `/api/recommendations` agora sela o
+  lote (antes deixaria tentativas abertas até lotar o buffer); handles `_r09_*`
+  removidos da rec na selagem. Filtro de símbolos desejados para as janelas;
+  velas com OHLC incoerente ou sem volume recusadas.
+- **R10A:** import do laboratório R08A tardio e exclusivo do comparador;
+  `MANAGEMENT_ONLY` limitado a um parâmetro comportamental (controle A/A ok);
+  só o horizonte é materializado; barra que cruza fronteira é erro; CLI recusa
+  qualquer barra do holdout. 47 testes, fixtures sintéticas pequenas e doc.
+- **Painel/API:** seção existente mostra oportunidades, reavaliações, trajetória
+  das vetadas, lacunas e aviso de capacidade. Sem botão, fetch ou endpoint novo.
+- **Validação:** direcionados R08B 12, R09 42, R10A 47, integração 11, R08A 43.
+  Suíte completa: 1.793 executados, 1.791 aprovados, **2 skips R05C históricos**
+  (fixture privada ausente, não fabricada); a primeira execução falhou 1 teste
+  (P05.2L), corrigido no código. PostgreSQL 16 descartável, só socket Unix,
+  TCP/DNS bloqueados: schema 2×, lote ativo/selado, dedupe, concorrência, ordem
+  fora de sequência, replay resolvido, terminal único, inválido, capacidade,
+  contenção, lock do risco livre, GET sem economia, todas as tabelas
+  operacionais inalteradas. `tsc`, `py_compile` e `git diff --check` aprovados.
+  CLI `--manifest` e fixtures replay/compare executados.
+- **Invariantes:** nenhuma regra/limite LIVE alterado; holdout não acessado;
+  sem promoção; sem exchange, banco externo, produção ou ordens nos testes;
+  `frontend/dist` não regenerado. Sem push/deploy.
+- **Limitações:** replay ≠ executor; horizonte curto das vetadas; fonte de velas
+  sem rótulo por vela; custos das vetadas desconhecidos (`net_r` nulo); trace
+  também na resposta da API. Nada disso demonstra redução de stops ou lucro.
+  Docs: `R08B_SCORE_TRACE.md`, `R09_DECISION_OBSERVATION.md`,
+  `R10A_OFFLINE_REPLAY.md`, `R08_R10_BATCH.md`.

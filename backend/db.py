@@ -80,6 +80,7 @@ async def init_db():
     from models import sweep_progress  # noqa: F401
     from models import execution_incident  # noqa: F401  (P03 — reconciliação persistente)
     from models import strategy_experiment  # noqa: F401  (P05 — candidatos governados)
+    from models import decision_observation  # noqa: F401  (R09 — observação segregada)
     from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

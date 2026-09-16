@@ -54,7 +54,69 @@ interface Assertiveness {
   pyramiding_opportunity?: { verdict?: string | null; continuation_rate_pct?: number | null; tp1_reached?: number }
   hedge_by_regime?: { verdict?: string | null; short?: { avg_r?: number | null; count?: number }; n_tagged?: number }
   p05?: P05Block
+  research_batch?: ResearchBatch
   computed_at?: string
+}
+
+interface ResearchBatch {
+  holdout_status?: string
+  decision_funnel?: {
+    state?: string
+    scope?: string
+    unique_opportunities?: number | null
+    attempts?: number | null
+    reevaluations?: number | null
+    first_blockers?: Record<string, number>
+    trace_coverage?: { recommendation?: number; execution?: number }
+    rejected_shadow?: { total?: number | null; coverage?: Record<string, number> }
+    capacity?: { state?: string; admission_blocked?: boolean | null }
+    telemetry?: Record<string, number | string | null | undefined>
+  }
+  offline_lab?: { state?: string; promotable?: boolean }
+}
+
+const RESEARCH_GATE_LABEL: Record<string, string> = {
+  'calibration-contract': 'Amostra ou contrato da probabilidade',
+  'prob-gate': 'Probabilidade abaixo do mínimo',
+  'score-min': 'Pontuação abaixo do mínimo',
+  'liquidity-gate': 'Liquidez ou spread',
+  'rr-gate': 'Relação entre retorno e risco',
+  'fill-rr': 'Retorno e risco no preço atual',
+  'data-freshness': 'Dados desatualizados',
+  'entry-preflight': 'Revalidação da entrada',
+  'proximity': 'Distância da entrada',
+  'struct_chase': 'Preço afastado da estrutura',
+  'risk-budget': 'Limite de risco',
+  'funding-gate': 'Custo de financiamento',
+}
+
+function researchGateLabel(gate: string, index: number): string {
+  if (gate.startsWith('P04A_MAKER:')) return 'Revalidação da entrada (ordem limitada)'
+  if (gate.startsWith('P04B_MARKET:')) return 'Revalidação da entrada (ordem a mercado)'
+  return RESEARCH_GATE_LABEL[gate] ?? `Outro filtro registrado (${index + 1})`
+}
+
+// Contadores de perda da coleta (processo atual). Qualquer valor > 0 = lacuna.
+const RESEARCH_GAP_KEYS = [
+  'identity_missing', 'buffer_dropped', 'flush_errors', 'flush_timeouts', 'flush_cancelled',
+  'persistence_dropped', 'contention_dropped', 'capacity_dropped_opportunities',
+  'capacity_dropped_attempts', 'capacity_dropped_rejected', 'candle_symbols_dropped',
+]
+
+function researchPositive(value: unknown): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+function researchSum(values: Record<string, number> | undefined, keys: string[]): number {
+  return keys.reduce((total, key) => {
+    const value = values?.[key]
+    return total + (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0)
+  }, 0)
+}
+
+function researchCount(value: unknown): string {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.floor(value).toLocaleString('pt-BR') : '—'
 }
 
 // ── P05: evidência governada (somente leitura — nenhuma ação de promoção) ──
@@ -846,6 +908,82 @@ export default function AssertivenessPanel({ onClose }: Props) {
                   </p>
                 </section>
               )}
+
+              {data?.research_batch && (() => {
+                const research = data.research_batch
+                const funnel = research.decision_funnel
+                const available = funnel?.state === 'AVAILABLE'
+                const blockers = Object.entries(funnel?.first_blockers ?? {})
+                  .filter(([, count]) => typeof count === 'number' && Number.isFinite(count) && count > 0)
+                  .sort((a, b) => b[1] - a[1]).slice(0, 5)
+                const coverage = funnel?.rejected_shadow?.coverage
+                const trajectories = {
+                  done: researchSum(coverage, ['RESOLVED', 'NOT_FILLED']),
+                  waiting: researchSum(coverage, ['PENDING', 'UNAVAILABLE', 'GAP_PENDING']),
+                  unusable: researchSum(coverage, ['AMBIGUOUS', 'INVALID', 'DATA_GAP_FINAL', 'EXPIRED_INCOMPLETE']),
+                }
+                const hasGaps = RESEARCH_GAP_KEYS.some((key) => researchPositive(funnel?.telemetry?.[key]))
+                const capacityState = funnel?.capacity?.state
+                return (
+                  <section className="rounded-xl border border-cyan-900/50 bg-cyan-950/10 p-4 space-y-3">
+                    <h3 className="text-sm font-bold text-cyan-200">Decisões e laboratório de estratégias</h3>
+                    <p className="text-xs text-slate-400">
+                      {available ? 'Coleta de oportunidades entregues ao executor.' : 'Coleta ainda indisponível.'}
+                      {' '}São recomendações já selecionadas, não todos os sinais do mercado.
+                      {' '}Quando a mesma oportunidade volta em outro ciclo, conta como reavaliação, não como nova.
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                      {[
+                        ['Oportunidades únicas', funnel?.unique_opportunities],
+                        ['Reavaliações', funnel?.reevaluations],
+                        ['Score registrado', funnel?.trace_coverage?.recommendation],
+                        ['Vetadas em observação', funnel?.rejected_shadow?.total],
+                      ].map(([label, value]) => (
+                        <div key={String(label)} className="rounded-lg bg-slate-900/70 p-2">
+                          <div className="text-slate-400">{label}</div>
+                          <div className="text-lg text-slate-100">{researchCount(available ? value : undefined)}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {blockers.length > 0 && (
+                      <div className="space-y-1 text-xs text-slate-300">
+                        <p className="text-slate-400">Primeiro bloqueio de cada oportunidade:</p>
+                        {blockers.map(([gate, count], index) => (
+                          <div key={gate} className="flex justify-between gap-2">
+                            <span>{researchGateLabel(gate, index)}</span>
+                            <span>{researchCount(count)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {available && (funnel?.rejected_shadow?.total ?? 0) > 0 && (
+                      <p className="text-xs text-slate-300">
+                        Trajetória das vetadas: {researchCount(trajectories.done)} concluídas
+                        {' · '}{researchCount(trajectories.waiting)} aguardando velas
+                        {' · '}{researchCount(trajectories.unusable)} sem trajetória confiável (lacuna, ambiguidade ou dado inválido).
+                      </p>
+                    )}
+                    {hasGaps && (
+                      <p className="text-xs text-amber-300">Há lacunas na coleta; os totais podem estar incompletos.</p>
+                    )}
+                    {capacityState === 'NEAR_LIMIT' && (
+                      <p className="text-xs text-amber-300">A coleta está perto do limite de armazenamento.</p>
+                    )}
+                    {capacityState === 'AT_LIMIT' && (
+                      <p className="text-xs text-rose-300">
+                        Limite de armazenamento atingido: novas decisões não estão sendo registradas.
+                        As vetadas já registradas continuam sendo acompanhadas.
+                      </p>
+                    )}
+                    <p className="text-xs text-slate-400">
+                      Replay offline com custos explícitos; não reproduz a execução real.
+                      Sinais vetados ficam separados: não alimentam calibração, aprendizado, risco nem resultados.
+                      Nenhuma estratégia foi ativada por este laboratório.
+                      {research.holdout_status === 'SEALED' && ' 🔒 Teste final protegido.'}
+                    </p>
+                  </section>
+                )
+              })()}
 
               {/* ── P05.2R Prontidão para a próxima etapa ────────────────── */}
               {p05?.enabled && p05.stop_readiness && (() => {

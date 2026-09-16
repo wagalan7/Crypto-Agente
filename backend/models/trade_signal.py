@@ -1,4 +1,4 @@
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List
 from enum import Enum
 
@@ -131,6 +131,7 @@ class ConfluenceScore(BaseModel):
     pct: float                       # 0–100
     factors: List[ConfluenceFactor]
     warnings: List[str] = []         # red-flags (ex: "divergência baixista no RSI")
+    r08_capture: Optional[dict] = Field(default=None, exclude=True)  # interno; publicado só no trace da rec
 
 
 class TradeSignal(BaseModel):
@@ -164,5 +165,6 @@ class TradeSignal(BaseModel):
     # efetivamente participaram do sinal ainda eram válidos na observação.
     # O gate LIVE revalida identidade e idade; não altera estratégia/score.
     data_freshness: Optional[dict] = None
+    r08_score_trace: Optional[dict] = Field(default=None, exclude=True)  # evita duplicar o JSON da rec
     timestamp: int
     signal_strength: str

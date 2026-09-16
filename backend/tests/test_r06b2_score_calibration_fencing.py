@@ -482,7 +482,8 @@ class IntegracaoNaRecomendacao(unittest.TestCase):
     def test_proveniencia_do_score_e_calculada_antes_do_lookup(self):
         fonte = _fonte_de_funcao("services/recommendation_service.py",
                                  "_build_recommendation")
-        self.assertLess(fonte.index("compute_score_with_provenance(sig)"),
+        # R08B: recompute da proveniência não sobrescreve trace prospectivo.
+        self.assertLess(fonte.index("compute_score_with_provenance(sig, capture_trace=False)"),
                         fonte.index("probability_for_score("))
         # e é a fórmula EFETIVA que governa o lookup, não a flag global
         trecho = fonte.split("probability_for_score(")[1][:300]

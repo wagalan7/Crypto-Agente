@@ -1550,6 +1550,8 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
     pyramiding = await _pyramiding_opportunity(days)
     hedge_regime = await _hedge_by_regime(days)
     p05 = await _p05_section(days)
+    from services.research_batch_service import get_research_status
+    research_batch = await get_research_status(days=days)
     return {
         "enabled": True,
         "window_days": days,
@@ -1569,5 +1571,6 @@ async def get_assertiveness(days: int = 30, gate_days: int = 7) -> Dict[str, Any
         "pyramiding_opportunity": pyramiding,
         "hedge_by_regime": hedge_regime,
         "p05": p05,
+        "research_batch": research_batch,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }

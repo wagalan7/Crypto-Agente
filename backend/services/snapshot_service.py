@@ -163,6 +163,11 @@ def _extract_features(
     # de HOJE, que pode estar em outra fórmula/partição de bins. Namespace
     # versionado dentro do `features` que já existe: nenhuma coluna nova, nenhum
     # registro histórico reescrito (só snapshots novos passam a ter).
+    try:
+        from services.score_trace_service import snapshot_annotation
+        score_trace_annotation = snapshot_annotation(rec)
+    except Exception:
+        score_trace_annotation = {}
     prob_contract = {
         "schema_version": 1,
         "score_provenance": rec.get("score_provenance"),
@@ -178,6 +183,7 @@ def _extract_features(
             "day_of_week": created_at.weekday(),
             "regime": regime_label,
             "probability_contract": prob_contract,
+            **score_trace_annotation,
             **_r07_annotation(rec, {}, regime_state, created_at),
         }
 
@@ -245,6 +251,7 @@ def _extract_features(
         "retest_armed": rec.get("retest_armed"),
         # R06B2.1 — probabilidade e proveniência congeladas (ver acima).
         "probability_contract": prob_contract,
+        **score_trace_annotation,
         # P05 — contexto versionado do MOMENTO da decisão (namespace isolado).
         "p05_context": _p05_context(rec, sig, created_at, regime_label, atr_pct),
         # R07A — contexto prospectivo (ANALYTICS_ONLY), namespace próprio.
@@ -1983,6 +1990,13 @@ async def check_open_snapshots() -> int:
                 # Resolver cross-exchange: OKX, com fallback Binance (ver
                 # _resolver_fetch_ohlcv) — evita void falso de alts só-Binance.
                 df = await _resolver_fetch_ohlcv(snap.symbol, "5m", 50)
+                # R09 somente reutiliza a janela original; nunca a cauda/fallback
+                # do paper, nunca fetch extra. Persiste no ciclo observacional.
+                try:
+                    from services.decision_observation_service import observe_candles
+                    await observe_candles(snap.symbol, df, as_of=now)
+                except Exception:
+                    pass
                 if df.empty:
                     # Sem candles. Pode ser falha transitória OU o par sumiu da
                     # fonte (ex.: símbolo que só existia na exchange anterior e
@@ -2225,6 +2239,11 @@ async def check_wide_snapshots() -> int:
                     continue
 
                 df = await _resolver_fetch_ohlcv(snap.symbol, "5m", 50)
+                try:
+                    from services.decision_observation_service import observe_candles
+                    await observe_candles(snap.symbol, df, as_of=now)
+                except Exception:
+                    pass
                 if df.empty:
                     # Símbolo fora do universo da fonte → encerra como expired obs.
                     unavailable = False

@@ -233,6 +233,13 @@ async def _snapshot_loop():
                 await check_wide_snapshots()
             except Exception as e:
                 logging.warning(f"wide_track error: {e}")
+            # R09 reutiliza exclusivamente velas já carregadas pelo resolver.
+            # Flush de lotes selados não precisa haver nova recomendação.
+            try:
+                from services.decision_observation_service import flush_pending
+                await asyncio.wait_for(flush_pending(), timeout=3.0)
+            except Exception:
+                logging.warning("[r09] coleta de trajetórias indisponível")
             # Teste canário 0.50: marco de TEMPO (janela de dias) + rede de
             # segurança do marco de contagem. Idempotente. No-op se desligado.
             try:
@@ -505,6 +512,15 @@ async def _server_scan_loop():
                     await open_shadow_for_recs(recs_dict)
                 except Exception as e:
                     logging.warning(f"[server-scan] shadow open falhou: {e}")
+                finally:
+                    # R09: observação segregada, depois do caminho de execução.
+                    # Falha/timeout da telemetria jamais muda a decisão do bot.
+                    try:
+                        from services.decision_observation_service import flush_pending, seal_batch
+                        seal_batch(recs_dict)
+                        await asyncio.wait_for(flush_pending(), timeout=3.0)
+                    except Exception:
+                        logging.warning("[r09] observação indisponível; execução preservada")
 
                 # Coerência push↔painel: open_shadow_for_recs (acima) pode ter
                 # EXPIRADO no mesmo ciclo recs opostas a uma posição aberta com
@@ -1814,6 +1830,14 @@ async def recommendations_batch(body: RecommendationBatchRequest):
                 await open_shadow_for_recs(pushable_recs)
             except Exception as e:
                 logging.warning(f"shadow open falhou: {e}")
+            finally:
+                # R09: só sela (sem IO nesta requisição); o ciclo de snapshots
+                # persiste. Sem isso o buffer encheria com tentativas abertas.
+                try:
+                    from services.decision_observation_service import seal_batch
+                    seal_batch(pushable_recs)
+                except Exception:
+                    logging.warning("[r09] selagem indisponível; execução preservada")
         # Push notifications (só dispara pra recs novas — dedup feito por tag)
         if PUSH_ENABLED and newly_saved > 0:
             try:
@@ -3878,7 +3902,9 @@ async def p05_status(days: int = 30):
     except Exception:
         days = 30
     data = await p05.get_p05_status(days=days)
-    return {"ok": True, **data}
+    from services.research_batch_service import get_research_status
+    return {"ok": True, **data,
+            "research_batch": await get_research_status(days=days)}
 
 
 @app.get("/api/strategy/p05/experiments")

@@ -1,0 +1,48 @@
+{
+ "bars": [
+  {
+   "close": 100.0,
+   "high": 101.0,
+   "low": 99.0,
+   "open": 100.0,
+   "timestamp_ms": 1760000400000,
+   "volume": 10.0
+  },
+  {
+   "close": 95.0,
+   "high": 99.5,
+   "low": 94.0,
+   "open": 99.0,
+   "timestamp_ms": 1760000700000,
+   "volume": 10.0
+  }
+ ],
+ "config": {
+  "bar_ms": 300000,
+  "be_lock_fraction": 0.2,
+  "entry_window_bars": 2,
+  "max_bars": 16,
+  "max_holding_bars": 6,
+  "pre_tp1_time_stop_bars": 4,
+  "tp1_fraction": 0.45,
+  "trail_activation_atr": 0.5,
+  "trail_atr_multiple": 2.2
+ },
+ "costs": {
+  "fee_bps_per_side": 4.0,
+  "funding_bps_per_bar": 1.0,
+  "slippage_bps_per_side": 2.0
+ },
+ "mode": "replay",
+ "opportunity": {
+  "atr": 2.0,
+  "decision_ts_ms": 1760000101000,
+  "direction": "long",
+  "entry": 100.0,
+  "opportunity_id": "single-stop-L",
+  "stop_loss": 95.0,
+  "symbol": "SYNTH/USDT:USDT",
+  "tp1": 105.0,
+  "tp2": 110.0
+ }
+}

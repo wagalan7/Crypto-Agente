@@ -1178,8 +1178,26 @@ _LAST_SKIP_REASONS: dict[str, dict] = {}
 _SKIP_REASONS_MAX = 200
 
 
+def _observe_decision(rec: dict, decision: str, reason_code=None) -> None:
+    """R09: só buffer limitado em memória; observação nunca altera um gate."""
+    try:
+        from services import decision_observation_service as obs
+        obs.stage_decision(rec, decision, reason_code)
+    except Exception:
+        pass
+
+
+def _observe_transport(rec: dict, result) -> None:
+    try:
+        from services import decision_observation_service as obs
+        obs.stage_result(rec, result)
+    except Exception:
+        pass
+
+
 def _record_skip(rec: dict, gate: str, reason: str) -> None:
     """Registra por que uma rec (tier A/A+) não virou trade. Best-effort."""
+    _observe_decision(rec, "NO_FILL" if gate == "maker-no-fill" else "REJECTED", gate)
     try:
         from datetime import datetime as _dt, timezone as _tz
         sym = rec.get("symbol") or "?"
@@ -4347,7 +4365,20 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
 
     Idempotente: snapshot_service.save_recommendations dedupa antes.
     """
+    # Antes até dos gates de DB/_just_saved/tier: denominador POST_SELECTION,
+    # nunca o scan completo. Flush é feito no finally do ciclo existente.
+    try:
+        from services import decision_observation_service as _r09
+        _r09.begin_batch(recs, mode="SHADOW" if SHADOW_ENABLED else "LIVE", config={
+            "score_min": SCORE_MIN, "score_adjuster_cap": SCORE_ADJUSTER_CAP,
+            "min_prob_tp1": MIN_PROB_TP1_EXEC, "min_rr_tp1": MIN_RR_TP1_EXEC,
+            "min_rr_tp2": MIN_RR_TP2_EXEC,
+        })
+    except Exception:
+        pass
     if not DB_ENABLED or not recs:
+        for rec in recs:
+            _observe_decision(rec, "UNKNOWN", "DB_DISABLED")
         return 0
     mode = "shadow" if SHADOW_ENABLED else "live"
     log.debug(f"[shadow] processando {len(recs)} recs em modo={mode}")
@@ -4462,9 +4493,11 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
     for rec in recs:
         try:
             if not rec.get("_just_saved"):
+                _observe_decision(rec, "INELIGIBLE", "NOT_JUST_SAVED")
                 continue
             tier = rec.get("tier")
             if tier not in ("A+", "A"):
+                _observe_decision(rec, "INELIGIBLE", "TIER_NOT_EXECUTABLE")
                 continue
             _p04a_chase_ceiling = (
                 (P04A_MAX_CHASE_ATR if P04A_MAX_CHASE_ATR is not None else PROXIMITY_MAX_ATR)
@@ -4629,6 +4662,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 rec_score = float(rec.get("score") or 0)
             except Exception:
                 rec_score = 0.0
+            _r09_recommendation_score = rec_score
 
             # Score adjusters (Fase B Lite): aplica delta calibrado.
             if SCORE_ADJUSTERS_ENABLED:
@@ -4641,6 +4675,15 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"[{', '.join(_reasons)}]"
                     )
                     rec_score += _delta
+
+            try:
+                from services.score_trace_service import append_execution_score
+                rec["_r09_score_trace"] = append_execution_score(
+                    rec.get("r08_score_trace"), recommendation_score=_r09_recommendation_score,
+                    execution_score=rec_score, delta=rec_score - _r09_recommendation_score,
+                    enabled=SCORE_ADJUSTERS_ENABLED, cap=SCORE_ADJUSTER_CAP, score_min=SCORE_MIN)
+            except Exception:
+                pass
 
             if rec_score < SCORE_MIN:
                 reason = f"score {rec_score:.0f} < mínimo {SCORE_MIN:.0f}"
@@ -4891,6 +4934,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         ok = await _execute_flip(opposite)
                         if not ok:
                             log.warning(f"[flip] {rec['symbol']} falhou — pulando entrada nova")
+                            _observe_decision(rec, "REJECTED", "FLIP_FAILED")
                             continue
                         # flip executado — segue fluxo abrindo a nova direção
                     else:
@@ -4929,6 +4973,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             )
                         # Seja sucesso ou falha do upgrade, NÃO abre um segundo trade
                         # na mesma direção. Pula pra próxima rec.
+                        _observe_decision(rec, "INELIGIBLE", "TF_UPGRADE_PATH")
                         continue
                     else:
                         log.info(
@@ -5034,11 +5079,13 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     f"indisponível (fallback estático ${equity_usd:.0f}) — não "
                     f"dimensiona dinheiro real com equity fictício"
                 )
+                _observe_decision(rec, "REJECTED", "LIVE_EQUITY_UNAVAILABLE")
                 continue
             lev = int(rec.get("leverage") or 1)
             sizing = _compute_qty(entry, stop, risk_pct, equity_usd, leverage=lev)
             if sizing is None:
                 log.warning(f"[shadow] {rec.get('symbol')} risk_dist=0 — pulando")
+                _observe_decision(rec, "REJECTED", "SIZING_INVALID")
                 continue
             log.info(
                 f"[shadow] sizing {rec.get('symbol')}: equity=${equity_usd:.2f} "
@@ -5050,6 +5097,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     f"[shadow] {rec.get('symbol')} SKIP: {sizing['reason']} "
                     f"(would-be notional=${sizing['notional_usd']})"
                 )
+                _observe_decision(rec, "REJECTED", "SIZING_SKIP")
                 continue
             qty = sizing["qty"]
             notional_effective = float(sizing["notional_usd"])
@@ -5200,6 +5248,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"size×{LIVE_SIZE_MULT} → notional ${notional_effective:.0f} "
                         f"< mín ${MIN_NOTIONAL_USD:.0f} (qty cheio {qty_full})"
                     )
+                    _observe_decision(rec, "REJECTED", "CANARY_NOTIONAL_MIN")
                     continue
                 log.info(
                     f"[shadow→live] canary {rec.get('symbol')}: qty {qty_full} → "
@@ -5237,6 +5286,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"${total_after:.0f} > cap ${cap_usd:.0f} "
                         f"({MAX_TOTAL_NOTIONAL_PCT}% × equity ${equity_usd:.0f})"
                     )
+                    _observe_decision(rec, "REJECTED", "TOTAL_NOTIONAL_CAP")
                     continue
             except Exception as e:
                 log.warning(f"[shadow] total-notional check falhou: {e}")
@@ -5257,6 +5307,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"${margin_after:.0f} > cap ${margin_cap:.0f} "
                             f"({MAX_TOTAL_MARGIN_PCT}% × equity ${equity_usd:.0f})"
                         )
+                        _observe_decision(rec, "REJECTED", "TOTAL_MARGIN_CAP")
                         continue
                 except Exception as e:
                     log.warning(f"[shadow] total-margin check falhou: {e}")
@@ -5309,6 +5360,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
 
             if snap_id is None:
                 log.warning(f"[shadow] snapshot_id não achado pra {rec.get('symbol')} — pulando")
+                _observe_decision(rec, "UNKNOWN", "SNAPSHOT_ID_UNAVAILABLE")
                 continue
 
             from services.entry_revalidation_service import normalize_entry_side
@@ -5359,12 +5411,14 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     log.error(
                         f"[shadow→live] ⛔ BLOCKED {rec['symbol']} {side}: {guard_why}"
                     )
+                    _observe_decision(rec, "REJECTED", "LIVE_MONEY_GUARD")
                     continue
                 contract_ok, contract_why = _live_execution_contract_guard()
                 if not contract_ok:
                     log.critical(
                         f"[shadow→live] ⛔ BLOCKED {rec['symbol']} {side}: {contract_why}"
                     )
+                    _observe_decision(rec, "REJECTED", "LIVE_CONTRACT_GUARD")
                     continue
 
                 # 1. Kill-switch
@@ -5374,18 +5428,21 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"[shadow→live] BLOCKED {rec['symbol']} {side}: "
                         f"execution quarantine={_EXECUTION_QUARANTINE_REASON}"
                     )
+                    _observe_decision(rec, "REJECTED", "EXECUTION_QUARANTINE")
                     continue
                 if await risk_service.is_paused():
                     log.warning(
                         f"[shadow→live] BLOCKED {rec['symbol']} {side}: "
                         "RiskState pausado (manual/circuit breaker)"
                     )
+                    _observe_decision(rec, "REJECTED", "RISK_PAUSED")
                     continue
                 ks = await kill_switch_service.check_can_trade()
                 if not ks.get("allowed"):
                     log.warning(
                         f"[shadow→live] BLOCKED {rec['symbol']} {side}: {ks.get('reason')}"
                     )
+                    _observe_decision(rec, "REJECTED", "KILL_SWITCH")
                     continue
 
                 # 1b. Filtro de sessão/horário (opcional, off por padrão)
@@ -5396,6 +5453,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"[shadow→live] BLOCKED {rec['symbol']} {side}: "
                             f"sessão UTC {_hr}h em janela bloqueada {sorted(TRADE_BLOCK_HOURS_UTC)}"
                         )
+                        _observe_decision(rec, "REJECTED", "BLOCKED_HOUR")
                         continue
 
                 # 1c. Pregão para moedas lastreadas em ações (bStocks/stock-perps)
@@ -5409,6 +5467,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             f"fora do pregão regular EUA "
                             f"({os.getenv('EQUITY_SESSION_ET', '09:30-16:00')} ET, dia útil)"
                         )
+                        _observe_decision(rec, "REJECTED", "EQUITY_SESSION")
                         continue
 
                 # 1d. Partials adaptativos (por-trade) — decide fração do TP1,
@@ -5789,6 +5848,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             verdict["approved_qty"] = float(capped_qty)
                             return verdict
 
+                    _observe_decision(rec, "ATTEMPTED")  # fora da janela medida (P05.2L)
                     _exec_mark(_exec_trace, "attempt_started_at")
                     order_res = await _maker_fn(
                         symbol=rec["symbol"],
@@ -5827,6 +5887,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             "client_order_id": client_order_id,
                         }
                     else:
+                        _observe_decision(rec, "ATTEMPTED")  # fora da janela medida (P05.2L)
                         _exec_mark(_exec_trace, "attempt_started_at")
                         order_res = await exchange_service.place_order(
                             symbol=rec["symbol"],
@@ -5842,6 +5903,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             entry_preflight=_market_entry_preflight,
                         )
                 _exec_mark(_exec_trace, "attempt_returned_at")
+                _observe_transport(rec, order_res)
                 if order_res.get("client_order_id"):
                     client_order_id = str(order_res["client_order_id"])
                 _needs_manual = bool(
@@ -6058,6 +6120,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     except Exception:
                         pass
                     if closed_ok:
+                        _observe_decision(rec, "INCIDENT", "LEGACY_STOP_ROLLBACK")
                         continue
 
                     _incident_safety_state = "LEGACY_STOP_ROLLBACK_UNKNOWN"
@@ -6138,6 +6201,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 adaptive_runner_qty_pct=(_adaptive or {}).get("runner_qty_pct"),
                 adaptive_test_idx=_adaptive_idx,
             )
+            _observe_decision(rec, (
+                "INCIDENT" if _track_unprotected_incident else
+                ("PAPER_OPENED" if source == "shadow" else "OPENED")
+            ) if trade is not None else "PERSISTENCE_FAILED")
             if source == "auto" and _exec_trace is not None:
                 # P05.2L: OPEN_PERSISTED ou PERSISTENCE_FAILED, depois que a
                 # persistência já foi resolvida. Nunca muda o retorno acima.
@@ -6216,6 +6283,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     except Exception as e:
                         log.warning(f"[notify] telegram open falhou: {e}")
         except Exception as e:
+            _observe_decision(rec, "UNKNOWN", "EXECUTION_EXCEPTION")
             log.warning(f"[shadow] falha abrindo trade pra {rec.get('symbol')}: {e}")
 
     # ── Feature 5 — hedge de regime adverso (1×/lote, pós-processamento das recs).
