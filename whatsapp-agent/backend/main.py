@@ -1100,6 +1100,21 @@ async def dashboard_stream(slug: str, token: str = ""):
     )
 
 
+def _looks_like_evolution(instance: str | None, url: str | None) -> bool:
+    """True quando os dados de WhatsApp são da CONEXÃO AUTOMÁTICA (Evolution),
+    e não de uma conta Z-API do cliente.
+
+    As duas integrações compartilham as mesmas 3 colunas do tenant
+    (evolution_instance/key/url), então o card Z-API do painel aparece
+    pré-preenchido com os dados do Evolution. Heurística segura:
+    um 'Client Token' de Z-API NUNCA é uma URL, e as instâncias provisionadas
+    automaticamente são nomeadas 'tenant-<slug>'.
+    """
+    u = (url or "").strip().lower()
+    i = (instance or "").strip().lower()
+    return u.startswith(("http://", "https://")) or i.startswith("tenant-")
+
+
 @app.get("/dashboard/{slug}", response_class=HTMLResponse)
 def dashboard(slug: str, request: Request, token: str = ""):
     tenant = _get_tenant(slug)
@@ -1120,7 +1135,14 @@ def dashboard(slug: str, request: Request, token: str = ""):
         evolution_enabled = _ev_enabled()
     except Exception:
         evolution_enabled = False
-    return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token, "terms": terms, "evolution_enabled": evolution_enabled})
+    # Conta que usa a conexão automática: os cards de Z-API ficam recolhidos
+    # (evita que o cliente salve por engano e troque o provider — o que derruba
+    # o envio de mensagens do agente).
+    on_evolution = (
+        (tenant.get("whatsapp_provider") or "") == "evolution"
+        or _looks_like_evolution(tenant.get("evolution_instance"), tenant.get("evolution_url"))
+    )
+    return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token, "terms": terms, "evolution_enabled": evolution_enabled, "on_evolution": on_evolution})
 
 
 @app.get("/dashboard/api/appointments")
@@ -2070,6 +2092,18 @@ async def dash_config(request: Request, body: TenantUpdate):
             detail="A URL do CalDAV precisa começar com https:// (suas credenciais não podem trafegar em texto puro).",
         )
     saving_zapi = fields.get("evolution_instance") and fields.get("evolution_key")
+    # GUARDA ANTI-ARMADILHA: o card Z-API do painel vem PRÉ-PREENCHIDO com os
+    # dados da conexão automática (Evolution), pois as 3 colunas são as mesmas.
+    # Salvar ali NÃO pode virar o provider para 'zapi' — isso mantém o WhatsApp
+    # "conectado" mas quebra o ENVIO (o agente recebe e não consegue responder).
+    # Nesse caso ignoramos os 3 campos: o card Z-API não mexe em conta Evolution.
+    ignored_zapi = False
+    if saving_zapi and _looks_like_evolution(fields.get("evolution_instance"), fields.get("evolution_url")):
+        saving_zapi = False
+        ignored_zapi = True
+        for _f in ("evolution_instance", "evolution_key", "evolution_url"):
+            fields.pop(_f, None)
+        logger.info(f"[{tenant['slug']}] Save do card Z-API ignorado — conta usa a conexão automática (Evolution).")
     # Auto-set provider to zapi when Z-API credentials are provided
     if saving_zapi:
         fields["whatsapp_provider"] = "zapi"
@@ -2084,6 +2118,11 @@ async def dash_config(request: Request, body: TenantUpdate):
         webhook_url = f"{config.BASE_URL}/webhook/{updated_tenant['slug']}/zapi?token={wt}"
         webhook_result = await wa.configure_webhook_zapi(updated_tenant, webhook_url)
 
+    if ignored_zapi:
+        return {"status": "updated", "webhook": None, "ignored_zapi": True,
+                "note": "Sua conta usa a conexão automática do WhatsApp — "
+                        "os campos de Z-API não se aplicam e foram ignorados. "
+                        "Use o card verde “Conectar WhatsApp (automático)”."}
     return {"status": "updated", "webhook": webhook_result}
 
 

@@ -508,6 +508,19 @@
     </div>
     {% endif %}
 
+    {% if on_evolution %}
+    <!-- Conta na conexão automática: Z-API fica recolhido (evita salvar por
+         engano e trocar o provider, o que derruba o envio do agente). -->
+    <details class="max-w-lg mt-4">
+      <summary class="text-xs text-gray-400 cursor-pointer select-none">
+        Opções avançadas — usar meu próprio Z-API
+      </summary>
+      <div class="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800">
+        Sua conta usa a <strong>conexão automática</strong> (card verde acima). Os campos abaixo
+        são só para quem tem uma conta própria de Z-API — <strong>você não precisa mexer neles</strong>.
+      </div>
+    {% endif %}
+
     <!-- WhatsApp Z-API -->
     <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
       <div class="flex items-center gap-2 mb-1">
@@ -579,6 +592,10 @@
       </button>
       <div id="zapi-conn-msg" class="hidden text-sm text-center mt-2"></div>
     </div>
+
+    {% if on_evolution %}
+    </details>
+    {% endif %}
 
     </div><!-- /cfgsec-whatsapp -->
 
@@ -3672,6 +3689,12 @@ function connectZapi(btn) {
 
 // Checagem leve ao abrir: só atualiza o selo (não fica gerando QR).
 async function _zapiInit() {
+  {% if on_evolution %}
+  // Conta usa a conexão automática (Evolution): não consultar a Z-API — os
+  // campos estão preenchidos com dados do Evolution e a chamada só falharia.
+  _zapiSetBadge(null);
+  return;
+  {% endif %}
   const instEl = document.getElementById('cfg-zapi-instance');
   const tokEl = document.getElementById('cfg-zapi-token');
   if (!instEl || !tokEl || !instEl.value.trim() || !tokEl.value.trim()) { _zapiSetBadge(null); return; }
