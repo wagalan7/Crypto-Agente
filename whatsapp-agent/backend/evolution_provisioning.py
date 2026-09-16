@@ -252,6 +252,70 @@ async def get_webhook(instance_name: str) -> dict:
         return {"ok": False, "url": "", "enabled": None, "events": [], "error": str(e)[:200]}
 
 
+async def get_instance_info(instance_name: str) -> dict:
+    """Dados da instância no servidor (chave global): número pareado, nome do
+    perfil, status e a ÚLTIMA desconexão registrada pela Evolution.
+
+    Diagnóstico de "conectado mas não recebe": mostra se o QR foi lido com o
+    número certo e se houve queda de sessão (ex.: 440 = sessão aberta em outro
+    lugar; 500 = sessão corrompida). Campos do model Instance da Evolution v2.
+    """
+    vazio = {"ok": False, "owner_jid": "", "profile_name": "", "connection_status": None,
+             "disconnection_code": None, "disconnection_at": None}
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.get(f"{_base()}/instance/fetchInstances",
+                                 params={"instanceName": instance_name},
+                                 headers=_admin_headers())
+            if r.status_code >= 400:
+                return {**vazio, "error": f"HTTP {r.status_code}: {r.text[:160]}"}
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                inner = it.get("instance") if isinstance(it.get("instance"), dict) else it
+                name = inner.get("instanceName") or inner.get("name") or it.get("name")
+                if name and name != instance_name:
+                    continue
+                return {
+                    "ok": True,
+                    "owner_jid": inner.get("ownerJid") or inner.get("owner") or "",
+                    "profile_name": inner.get("profileName") or "",
+                    "connection_status": inner.get("connectionStatus") or inner.get("status"),
+                    "disconnection_code": inner.get("disconnectionReasonCode"),
+                    "disconnection_at": inner.get("disconnectionAt"),
+                    "error": None,
+                }
+            return {**vazio, "error": "instância não veio na resposta"}
+    except Exception as e:
+        return {**vazio, "error": str(e)[:200]}
+
+
+async def logout_instance(instance_name: str) -> dict:
+    """Desconecta o WhatsApp e APAGA as chaves de criptografia da sessão,
+    MANTENDO a instância (token e webhook continuam valendo). Em seguida o
+    ``connect`` gera um QR novo, com chaves novas.
+
+    Conserto da sessão "conectada mas surda": quando as chaves dessincronizam,
+    as mensagens recebidas chegam como stub ('Bad MAC', 'No session record',
+    'Invalid PreKey ID'...) e a Evolution as DESCARTA sem disparar webhook
+    (whatsapp.baileys.service.ts, handler messages.upsert). Um restart não
+    resolve: as chaves corrompidas persistem. No servidor, o logout só marca a
+    instância como 'close' e remove as linhas de session (monitor.cleaningUp).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.delete(f"{_base()}/instance/logout/{instance_name}",
+                                    headers=_admin_headers())
+            if r.status_code >= 400:
+                return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            return {"ok": True, "error": None}
+    except Exception as e:
+        logger.warning(f"[evolution] logout_instance({instance_name}) falhou: {e}")
+        return {"ok": False, "error": str(e)[:200]}
+
+
 async def delete_instance(instance_name: str) -> dict:
     """Remove a instância (logout + delete). Usado em limpeza/troca de número."""
     try:

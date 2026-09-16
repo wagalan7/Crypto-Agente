@@ -739,6 +739,21 @@ async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
     return {"status": "queued"}
 
 
+# Códigos de desconexão do Baileys (DisconnectReason) gravados pela Evolution em
+# Instance.disconnectionReasonCode — traduzidos para o diagnóstico do painel.
+_DISCONNECT_PT = {
+    401: "desconectado pelo celular (o aparelho foi removido em 'Aparelhos conectados')",
+    403: "acesso negado pelo WhatsApp (número restrito ou bloqueado)",
+    408: "conexão perdida por instabilidade de rede",
+    411: "incompatibilidade de multi-dispositivo — refazer a conexão",
+    428: "conexão encerrada",
+    440: "sessão SUBSTITUÍDA: este número foi conectado em outro lugar",
+    500: "sessão CORROMPIDA — refazer a conexão (novo QR)",
+    503: "serviço do WhatsApp indisponível no momento",
+    515: "reinício necessário (normal logo após ler o QR)",
+}
+
+
 # Último webhook recebido por consultório — instrumento de diagnóstico.
 # Guarda SÓ a ESTRUTURA do payload (nomes de chaves, domínio do JID, fromMe).
 # NUNCA o texto da mensagem: é conteúdo clínico do paciente. Vive em memória
@@ -2269,6 +2284,24 @@ async def dash_evolution_qr(request: Request):
         # sem QR no create → cai pro connect abaixo
 
     res = await _ev_connect(instance_name)
+    # A instância sumiu do servidor (ex.: DEL_INSTANCE da Evolution remove
+    # instâncias que ficam deslogadas). Recria — o create grava o webhook e o
+    # token. Só num clique do cliente; o check=1 do load NUNCA cria instância.
+    if (not res.get("ok") and "HTTP 404" in (res.get("error") or "")
+            and request.query_params.get("check") != "1"):
+        logger.warning(f"[{tenant['slug']}] instância {instance_name} não existe mais "
+                       f"no servidor — recriando.")
+        created = await _ev_create(instance_name, webhook_url)
+        if created.get("ok"):
+            _tok = created.get("instance_token") or await _ev_fetch_token(instance_name)
+            if _tok:
+                db.update_tenant(tenant["slug"], evolution_key=_tok)
+                tenant["evolution_key"] = _tok
+            await _ev_setwebhook(instance_name, webhook_url)
+            if created.get("qr"):
+                return {"ok": True, "enabled": True, "connected": False,
+                        "qr": created["qr"], "recreated": True}
+            res = await _ev_connect(instance_name)
     res["enabled"] = True
     if res.get("connected"):
         try:
@@ -2306,6 +2339,36 @@ async def dash_evolution_qr(request: Request):
         except Exception as e:
             logger.warning(f"[{tenant['slug']}] pós-conexão Evolution: {e}")
     return res
+
+
+@app.post("/dashboard/api/evolution/reset-session")
+async def dash_evolution_reset_session(request: Request):
+    """Refaz a conexão do WhatsApp (conexão automática): logout + apaga as chaves
+    da sessão, MANTENDO instância, token e webhook. O painel então gera um QR
+    novo. Conserto para "conectado mas não recebe mensagens" (chaves de sessão
+    dessincronizadas → a Evolution descarta as mensagens sem webhook).
+
+    Só age sobre a instância DESTE consultório; não afeta os outros.
+    """
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    from evolution_provisioning import (
+        is_enabled as _ev_enabled, logout_instance as _ev_logout,
+    )
+    if not _ev_enabled():
+        raise HTTPException(status_code=400, detail="Conexão automática indisponível.")
+    instance_name = f"tenant-{tenant['slug']}"
+    if (tenant.get("evolution_instance") or "") != instance_name:
+        raise HTTPException(status_code=400,
+                            detail="Este consultório não usa a conexão automática.")
+    res = await _ev_logout(instance_name)
+    # "not connected" = já estava desconectada: nada a desfazer, segue pro QR.
+    if not res.get("ok") and "not connected" not in (res.get("error") or ""):
+        raise HTTPException(status_code=502,
+                            detail=f"Não foi possível desconectar: {res.get('error')}")
+    logger.warning(f"[{tenant['slug']}] Sessão do WhatsApp REINICIADA pelo painel "
+                   f"(logout + novo QR).")
+    return {"status": "ok"}
 
 
 # ── Cobrança ────────────────────────────────────────────────────────────────────
@@ -3055,13 +3118,29 @@ async def diagnose_whatsapp(request: Request):
     # gravação que falhou passa despercebida: o painel diz "conectado", o envio
     # funciona, e as mensagens recebidas simplesmente nunca chegam no app.
     webhook_info = None
+    instancia_info = None
     if (tenant.get("whatsapp_provider") or "") == "evolution":
         try:
             from evolution_provisioning import (
                 is_enabled as _ev_enabled, get_webhook as _ev_getwebhook,
+                get_instance_info as _ev_getinfo,
             )
             if _ev_enabled():
                 inst = tenant.get("evolution_instance") or ""
+                # Qual número está pareado + saúde da sessão (mascarado).
+                info = await _ev_getinfo(inst)
+                _dig = "".join(c for c in (info.get("owner_jid") or "").split("@")[0] if c.isdigit())
+                _num = (_dig[:4] + "*" * (len(_dig) - 8) + _dig[-4:]) if len(_dig) > 8 else ("****" if _dig else None)
+                _code = info.get("disconnection_code")
+                instancia_info = {
+                    "numero_pareado": _num,
+                    "nome_do_perfil": info.get("profile_name") or None,
+                    "status_no_servidor": info.get("connection_status"),
+                    "ultima_desconexao_codigo": _code,
+                    "ultima_desconexao_em": info.get("disconnection_at"),
+                    "ultima_desconexao_significa": _DISCONNECT_PT.get(_code) if _code else None,
+                    "erro_ao_consultar": info.get("error"),
+                }
                 atual = await _ev_getwebhook(inst)
                 wt = db.ensure_webhook_token(tenant["id"])
                 esperado = f"{_public_base(request)}/webhook/{tenant['slug']}/evolution?token={wt}"
@@ -3089,6 +3168,7 @@ async def diagnose_whatsapp(request: Request):
         "consultorio": tenant.get("slug"),
         "provider": tenant.get("whatsapp_provider"),
         "conexao": conn,  # {ok, connected, error}
+        "instancia": instancia_info,
         "webhook": webhook_info,
         "ultimo_webhook_recebido": _LAST_WEBHOOK.get(tenant["id"])
             or "NENHUM webhook chegou desde o último restart do app",
