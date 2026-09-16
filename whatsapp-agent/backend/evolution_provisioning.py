@@ -316,6 +316,48 @@ async def logout_instance(instance_name: str) -> dict:
         return {"ok": False, "error": str(e)[:200]}
 
 
+async def restart_instance(instance_name: str) -> dict:
+    """POST /instance/restart/{nome}.
+
+    Na Evolution 2.3.7 com Baileys (que não tem ``restart()``) o controller cai
+    no fallback: fecha o socket, chama ``client.end()`` e reconecta com as
+    credenciais salvas. Ele NÃO chama ``client.logout()`` — por isso funciona
+    mesmo quando o websocket está morto e o logout falha com "Connection Closed".
+    Atenção: erros vêm no CORPO ({error: true, message}) com HTTP 200.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.post(f"{_base()}/instance/restart/{instance_name}",
+                                  headers=_admin_headers())
+            if r.status_code >= 400:
+                return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            try:
+                d = r.json()
+            except Exception:
+                d = {}
+            if isinstance(d, dict) and d.get("error"):
+                return {"ok": False, "error": str(d.get("message") or d)[:200]}
+            return {"ok": True, "error": None}
+    except Exception as e:
+        logger.warning(f"[evolution] restart_instance({instance_name}) falhou: {e}")
+        return {"ok": False, "error": str(e)[:200]}
+
+
+async def connection_state(instance_name: str) -> str | None:
+    """Estado da sessão na Evolution: 'open' | 'connecting' | 'close' | None
+    (None = não consegui consultar)."""
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.get(f"{_base()}/instance/connectionState/{instance_name}",
+                                 headers=_admin_headers())
+            if r.status_code >= 400:
+                return None
+            d = r.json() or {}
+            return ((d.get("instance") or {}).get("state")) or d.get("state")
+    except Exception:
+        return None
+
+
 async def delete_instance(instance_name: str) -> dict:
     """Remove a instância (logout + delete). Usado em limpeza/troca de número."""
     try:

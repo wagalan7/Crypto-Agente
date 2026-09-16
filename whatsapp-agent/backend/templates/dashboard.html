@@ -3791,7 +3791,7 @@ async function resetEvolutionSession(btn) {
   if (!ok) return;
   const orig = btn.textContent;
   const m = document.getElementById('ev-conn-msg');
-  btn.disabled = true; btn.textContent = '⏳ Desconectando…';
+  btn.disabled = true; btn.textContent = '⏳ Reiniciando a sessão… (até 15 segundos)';
   try {
     _evStopPoll();
     await api('/dashboard/api/evolution/reset-session', { method: 'POST' });

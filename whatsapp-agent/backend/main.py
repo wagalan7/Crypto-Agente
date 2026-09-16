@@ -2354,6 +2354,7 @@ async def dash_evolution_reset_session(request: Request):
     tenant = _get_tenant_by_token(token)
     from evolution_provisioning import (
         is_enabled as _ev_enabled, logout_instance as _ev_logout,
+        restart_instance as _ev_restart, connection_state as _ev_state,
     )
     if not _ev_enabled():
         raise HTTPException(status_code=400, detail="Conexão automática indisponível.")
@@ -2361,14 +2362,42 @@ async def dash_evolution_reset_session(request: Request):
     if (tenant.get("evolution_instance") or "") != instance_name:
         raise HTTPException(status_code=400,
                             detail="Este consultório não usa a conexão automática.")
+
+    def _ok_ou_ja_desconectada(r: dict) -> bool:
+        # "not connected" = a sessão já estava fechada: nada a desfazer.
+        return bool(r.get("ok")) or "not connected" in (r.get("error") or "")
+
+    caminho = "logout"
     res = await _ev_logout(instance_name)
-    # "not connected" = já estava desconectada: nada a desfazer, segue pro QR.
-    if not res.get("ok") and "not connected" not in (res.get("error") or ""):
-        raise HTTPException(status_code=502,
-                            detail=f"Não foi possível desconectar: {res.get('error')}")
+    if not _ok_ou_ja_desconectada(res):
+        # SESSÃO ZUMBI: a Evolution diz "open", mas o websocket morreu — o
+        # logout falha com "Connection Closed" ANTES de apagar as chaves. O
+        # restart recria o socket sem chamar logout; então acompanhamos o
+        # estado real e, se a sessão voltar, fazemos o logout de novo.
+        caminho = "restart"
+        rs = await _ev_restart(instance_name)
+        logger.warning(f"[{tenant['slug']}] logout falhou ({(res.get('error') or '')[:80]}) "
+                       f"— restart da instância: {rs}")
+        estado = None
+        for _ in range(8):  # até ~12s
+            await asyncio.sleep(1.5)
+            estado = await _ev_state(instance_name)
+            if estado in ("open", "close"):
+                break
+        if estado == "open":
+            res2 = await _ev_logout(instance_name)
+            if not _ok_ou_ja_desconectada(res2):
+                raise HTTPException(
+                    status_code=502,
+                    detail=("A sessão do WhatsApp travou no servidor Evolution e não "
+                            "respondeu nem ao reinício. Reinicie o serviço Evolution na "
+                            "Railway (Deployments → ⋮ → Restart) e tente de novo. "
+                            f"Detalhe: {(res2.get('error') or '')[:120]}"))
+            caminho = "restart+logout"
+        # 'close' / 'connecting' / sem resposta → o painel segue para o QR novo.
     logger.warning(f"[{tenant['slug']}] Sessão do WhatsApp REINICIADA pelo painel "
-                   f"(logout + novo QR).")
-    return {"status": "ok"}
+                   f"(caminho={caminho}).")
+    return {"status": "ok", "caminho": caminho}
 
 
 # ── Cobrança ────────────────────────────────────────────────────────────────────
