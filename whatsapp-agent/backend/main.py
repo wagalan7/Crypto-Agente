@@ -2166,6 +2166,7 @@ async def dash_evolution_qr(request: Request):
     from evolution_provisioning import (
         is_enabled as _ev_enabled, create_instance as _ev_create,
         connect as _ev_connect, set_webhook as _ev_setwebhook,
+        fetch_instance_token as _ev_fetch_token,
     )
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
@@ -2202,6 +2203,12 @@ async def dash_evolution_qr(request: Request):
         # token por instância (nunca a chave global); se já existia, mantém.
         if created.get("instance_token"):
             updates["evolution_key"] = created["instance_token"]
+        elif created.get("already_exists"):
+            # A instância já existia → o create volta SEM hash. Sem isto o tenant
+            # ficaria com um token velho (ou vazio) e todo ENVIO daria HTTP 401.
+            _tok = await _ev_fetch_token(instance_name)
+            if _tok:
+                updates["evolution_key"] = _tok
         db.update_tenant(tenant["slug"], **updates)
         await _ev_setwebhook(instance_name, webhook_url)
         if created.get("qr"):
@@ -2215,6 +2222,25 @@ async def dash_evolution_qr(request: Request):
             if (tenant.get("whatsapp_provider") or "") != "evolution":
                 db.update_tenant(tenant["slug"], whatsapp_provider="evolution")
             await _ev_setwebhook(instance_name, webhook_url)
+            # AUTOCURA DO TOKEN DA INSTÂNCIA — o connect acima autentica com a
+            # chave GLOBAL, então o painel pode dizer "conectado" enquanto o
+            # ENVIO (que usa o token da instância) devolve HTTP 401 e o agente
+            # fica mudo. Testa o token gravado e, se não autenticar, regrava o
+            # token real buscado no servidor.
+            probe = await wa.check_connection({
+                "whatsapp_provider": "evolution",
+                "evolution_url": api_base,
+                "evolution_instance": instance_name,
+                "evolution_key": tenant.get("evolution_key") or "",
+            })
+            if not probe.get("ok"):
+                real = await _ev_fetch_token(instance_name)
+                if real and real != (tenant.get("evolution_key") or ""):
+                    db.update_tenant(tenant["slug"], evolution_key=real)
+                    res["token_fixed"] = True
+                    logger.info(
+                        f"[{tenant['slug']}] evolution_key curado — o envio estava "
+                        f"falhando com {probe.get('error')}.")
         except Exception as e:
             logger.warning(f"[{tenant['slug']}] pós-conexão Evolution: {e}")
     return res

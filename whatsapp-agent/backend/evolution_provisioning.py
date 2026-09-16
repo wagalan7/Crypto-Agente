@@ -147,6 +147,51 @@ async def connect(instance_name: str) -> dict:
         return {"ok": False, "connected": False, "qr": None, "error": str(e)[:200]}
 
 
+async def fetch_instance_token(instance_name: str) -> str:
+    """Token ATUAL da instância, consultado com a chave GLOBAL.
+
+    Cura o caso em que o ``evolution_key`` gravado no tenant ficou
+    desatualizado. Sintoma: o painel mostra "WhatsApp conectado" (o connect/QR
+    usa a chave global) mas o agente não envia nada — porque o ENVIO usa o
+    token da INSTÂNCIA, e um token errado devolve HTTP 401.
+
+    Acontece quando o ``create`` encontrou a instância já existente (a resposta
+    vem sem ``hash``, então nada era gravado) ou quando a instância foi
+    recriada no servidor Evolution.
+
+    Retorna '' se não conseguir descobrir (nunca levanta exceção).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.get(
+                f"{_base()}/instance/fetchInstances",
+                params={"instanceName": instance_name},
+                headers=_admin_headers(),
+            )
+            if r.status_code >= 400:
+                logger.warning(
+                    f"[evolution] fetch_instance_token({instance_name}): HTTP {r.status_code}")
+                return ""
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                inner = it.get("instance") if isinstance(it.get("instance"), dict) else it
+                name = inner.get("instanceName") or inner.get("name") or it.get("name")
+                if name and name != instance_name:
+                    continue
+                for src in (inner, it):
+                    tok = src.get("token") or src.get("apikey") or src.get("hash")
+                    if isinstance(tok, dict):
+                        tok = tok.get("apikey") or tok.get("hash") or ""
+                    if tok:
+                        return str(tok)
+    except Exception as e:
+        logger.warning(f"[evolution] fetch_instance_token({instance_name}) falhou: {e}")
+    return ""
+
+
 async def set_webhook(instance_name: str, webhook_url: str) -> dict:
     """(Re)configura o webhook de mensagens da instância. Idempotente."""
     payload = {
