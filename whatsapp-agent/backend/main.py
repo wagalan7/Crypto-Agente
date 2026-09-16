@@ -724,14 +724,49 @@ async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
     # (o validador loga warning e retorna True). Instâncias provisionadas
     # automaticamente ganham token e passam a ser validadas.
     if not _validate_webhook_token(tenant, request):
+        _note_webhook(tenant["id"], "evolution", {}, False,
+                      "REJEITADO com 403 — token do webhook não confere")
         raise HTTPException(status_code=403, detail="Token de webhook inválido.")
     payload = await request.json()
     result = wa.extract_message_evolution(payload)
+    _note_webhook(tenant["id"], "evolution", payload, bool(result),
+                  "" if result else "recebido, mas o formato não foi reconhecido "
+                                    "(mensagem descartada)")
     if not result:
         return {"status": "ignored"}
     phone, text = result
     bg.add_task(_handle_message, tenant, phone, text)
     return {"status": "queued"}
+
+
+# Último webhook recebido por consultório — instrumento de diagnóstico.
+# Guarda SÓ a ESTRUTURA do payload (nomes de chaves, domínio do JID, fromMe).
+# NUNCA o texto da mensagem: é conteúdo clínico do paciente. Vive em memória
+# (zera no restart), o suficiente para responder "chegou? foi reconhecido?".
+_LAST_WEBHOOK: dict[int, dict] = {}
+
+
+def _note_webhook(tenant_id: int, provider: str, payload, reconhecido: bool, obs: str = "") -> None:
+    try:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        key = data.get("key") if isinstance(data, dict) and isinstance(data.get("key"), dict) else None
+        msg = data.get("message") if isinstance(data, dict) and isinstance(data.get("message"), dict) else None
+        jid = key.get("remoteJid") if key else None
+        _LAST_WEBHOOK[tenant_id] = {
+            "em": datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds"),
+            "provider": provider,
+            "evento": payload.get("event") if isinstance(payload, dict) else None,
+            "chaves_topo": sorted(payload.keys())[:12] if isinstance(payload, dict) else type(payload).__name__,
+            "data_eh_lista": isinstance(data, list),
+            "chaves_data": sorted(data.keys())[:14] if isinstance(data, dict) else None,
+            "tipos_de_message": sorted(msg.keys())[:12] if msg else None,
+            "jid_dominio": jid.split("@")[-1] if isinstance(jid, str) and "@" in jid else None,
+            "from_me": key.get("fromMe") if key else None,
+            "reconhecido": reconhecido,
+            "obs": obs,
+        }
+    except Exception:
+        pass
 
 
 def _validate_webhook_token(tenant: dict, request: Request) -> bool:
@@ -3055,6 +3090,8 @@ async def diagnose_whatsapp(request: Request):
         "provider": tenant.get("whatsapp_provider"),
         "conexao": conn,  # {ok, connected, error}
         "webhook": webhook_info,
+        "ultimo_webhook_recebido": _LAST_WEBHOOK.get(tenant["id"])
+            or "NENHUM webhook chegou desde o último restart do app",
         "pendentes_amanha": pendentes,
         "lembrete_vencimento_zapi": lembrete,
     }
