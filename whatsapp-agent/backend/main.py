@@ -1100,6 +1100,22 @@ async def dashboard_stream(slug: str, token: str = ""):
     )
 
 
+def _public_base(request: Request) -> str:
+    """Base pública REAL desta requisição — o host pelo qual o painel foi aberto.
+
+    Usada para REGISTRAR WEBHOOKS. Se o consultório conseguiu abrir o painel
+    neste host, o provedor de WhatsApp também consegue entregar aqui. Evita
+    depender do BASE_URL, que pode apontar para um domínio sem certificado
+    válido: nesse caso a entrega falha em silêncio e o agente nunca recebe as
+    mensagens (fica "conectado" e mudo). Cai no BASE_URL se não houver Host.
+    """
+    host = (request.headers.get("host") or "").strip()
+    if not host:
+        return (config.BASE_URL or "").rstrip("/")
+    proto = (request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip()
+    return f"{proto}://{host}"
+
+
 def _looks_like_evolution(instance: str | None, url: str | None) -> bool:
     """True quando os dados de WhatsApp são da CONEXÃO AUTOMÁTICA (Evolution),
     e não de uma conta Z-API do cliente.
@@ -2177,7 +2193,9 @@ async def dash_evolution_qr(request: Request):
     instance_name = f"tenant-{tenant['slug']}"
     api_base = config.EVOLUTION_API_URL.rstrip("/")
     wt = db.ensure_webhook_token(tenant["id"])
-    webhook_url = f"{config.BASE_URL}/webhook/{tenant['slug']}/evolution?token={wt}"
+    # Host REAL desta requisição (não o BASE_URL) — garante que o webhook fica
+    # num endereço comprovadamente alcançável: é por ele que o painel abriu.
+    webhook_url = f"{_public_base(request)}/webhook/{tenant['slug']}/evolution?token={wt}"
 
     # Já provisionado nesta plataforma? (mesma URL + instância gravada)
     provisioned = (
