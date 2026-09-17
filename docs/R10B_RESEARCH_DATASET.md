@@ -129,7 +129,12 @@ sobrescrito por defaults/ENV atuais), `OPPORTUNITY_ROW_MISSING`,
 `MALFORMED_CANDLE_JSON`, `INVALID_CANDLE_DATA`.
 
 Cobertura relatada: com/sem velas, janelas completas, incompletas, truncadas
-pelo cutoff e não contíguas. Rejeição terminal no R09 para de acumular velas,
+pelo cutoff e não contíguas. Uma janela completa exige todo o horizonte na
+grade cronológica exata, desde a primeira barra e com passo `bar_ms`; só ter
+a quantidade esperada de velas não basta. Duplicatas, lacunas no início/interior,
+timestamps fora da grade ou fora de ordem contam como incompletos e não
+contíguos, sem filtrar nem reordenar o payload. Uma grade parcial contígua
+(inclusive no cutoff) permanece incompleta. Rejeição terminal no R09 para de acumular velas,
 então `RESOLVED` lá **não** garante horizonte para um candidato diferente — as
 lacunas continuam explícitas nos resultados do R10A, com denominadores.
 
@@ -143,7 +148,7 @@ aprovada" ou "dataset economicamente suficiente".
 
 ## Validação
 
-`backend/tests/test_r10b_research_dataset.py` (41 testes herméticos):
+`backend/tests/test_r10b_research_dataset.py` (45 testes herméticos):
 requisição e schema fechado, candidato de um parâmetro, janelas/empates/ordem,
 paridade da purga com o comparador REAL, limites, conversão, exclusões,
 violações de contrato, determinismo e sensibilidade dos fingerprints, estados

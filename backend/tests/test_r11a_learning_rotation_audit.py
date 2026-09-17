@@ -633,11 +633,13 @@ def _calls(node):
 class Wiring(unittest.TestCase):
     MAIN = ast.parse((BACKEND / "main.py").read_text())
 
-    def test_R9_mutating_routes_have_no_admin_check(self):
+    def test_R9_mutating_routes_require_admin_check_after_r11b1(self):
+        # R11A caracterizou a ausência; R11B1 corrige somente esse contrato.
+        # Testes ASGI comportamentais estão em test_r11b1_admin_routes.py.
         for path in ("/api/rotation/apply", "/api/symbol-params/relearn"):
             node = _route(self.MAIN, path)
-            self.assertNotIn("_check_admin_token", _calls(node), path)
-            self.assertEqual([a.arg for a in node.args.args], [], path)
+            self.assertIn("_check_admin_token", _calls(node), path)
+            self.assertEqual([a.arg for a in node.args.args], ["x_admin_token"], path)
         self.assertIn("_check_admin_token", _calls(_route(self.MAIN, "/api/admin/force-test-trade")))
         cors = [n for n in ast.walk(self.MAIN) if isinstance(n, ast.Call)
                 and getattr(n.func, "attr", "") == "add_middleware"][0]

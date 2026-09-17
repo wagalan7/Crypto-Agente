@@ -2004,14 +2004,18 @@ async def rotation_plan(days: int = 0):
 
 
 @app.post("/api/rotation/apply")
-async def rotation_apply():
+async def rotation_apply(x_admin_token: Optional[str] = Header(None)):
     """
     Dispara um ciclo do motor de rotação (FASE 2) manualmente.
       • ROTATION_AUTO_APPLY=off (default) → devolve só PREVIEW, não muta nada.
       • on → aplica promote/demote com histerese + piso de liquidez + teto e
         persiste a allowlist no DB. Mesma lógica do loop automático.
     Inspeção/validação. NÃO abre trades — só ajusta quais bases PODEM ser operadas.
+    Exige X-Admin-Token conforme o guard administrativo existente.
     """
+    gate = _check_admin_token(x_admin_token)
+    if gate:
+        return gate
     try:
         from services.rotation_service import apply_rotation_plan
         return await apply_rotation_plan()
@@ -2065,10 +2069,14 @@ async def symbol_params_status():
 
 
 @app.post("/api/symbol-params/relearn")
-async def symbol_params_relearn():
+async def symbol_params_relearn(x_admin_token: Optional[str] = Header(None)):
     """Dispara manualmente o reaprendizado por-moeda a partir do histórico completo
     já computado no sweep (symbol_backtest_stats → symbol_learned_params). Seguro:
-    só popula a tabela; não muda nada ao vivo até SYMBOL_LEARNING_SIZE_ENABLED=true."""
+    só popula a tabela; não muda nada ao vivo até SYMBOL_LEARNING_SIZE_ENABLED=true.
+    Exige X-Admin-Token conforme o guard administrativo existente."""
+    gate = _check_admin_token(x_admin_token)
+    if gate:
+        return gate
     try:
         from services import symbol_learning_service
         return await symbol_learning_service.relearn_all_from_history()

@@ -37,6 +37,15 @@ CORS é `allow_origins=["*"]`. O primeiro pode mudar a allowlist de execução; 
 segundo escreve `symbol_learned_params` e dispara Telegram.
 **R11B:** exigir o mesmo guard dos endpoints admin. **Muda entradas: sim.**
 
+**Acompanhamento R11B1 — 2026-09-17:** corrigido nas duas rotas com
+`X-Admin-Token` e `_check_admin_token` antes de importar/chamar os serviços.
+Token configurado exige correspondência; token ausente em produção ou falha
+ao determinar o ambiente bloqueia. A política preexistente de demo/testnet sem
+token e o formato de erro `{ok:false}` foram preservados. Loops internos,
+learning, allowlist e sizing não foram alterados. Testes ASGI locais usam as
+funções reais das rotas com serviços falsos; nenhum POST mutante foi feito em
+produção. O teste R9 passou de caracterizar a falha a exigir a proteção.
+
 ### A2 · Histerese conta chamadas, não evidência nova — A, confirmado (`R2`)
 Três chamadas de `apply_rotation_plan` com **os mesmos** dados promovem; o
 plano vem do histórico completo, então nenhum trade novo é necessário. Com A1,
@@ -130,11 +139,12 @@ inclui `expired` e exige `realized_r` não nulo. Ambos usam SHADOW/papel —
 
 ## Prioridade sugerida para o R11B
 
-1. A1 (autenticação) — risco imediato e correção isolada.
+1. A1 (autenticação) — corrigido no acompanhamento R11B1 acima.
 2. A2 + M5 (unidade da histerese e fonte do universo).
 3. A3 (janela do edge decay) antes de a flag ser ligada em produção.
 4. A4/A5/M2 (dados não finitos e R desconhecido).
 5. M1/M3/M4/M6/M7 e depois B1–B3.
 
-Nada disso foi corrigido aqui, e nenhum item acima demonstra, por si, redução
-de stops ou aumento de lucro.
+O pacote original R11A não corrigiu políticas. No acompanhamento R11B1,
+somente A1 foi corrigido; os demais achados continuam pendentes. Nenhum item
+acima demonstra, por si, redução de stops ou aumento de lucro.

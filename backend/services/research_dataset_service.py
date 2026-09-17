@@ -367,12 +367,14 @@ def build_artifacts(request: ExportRequest, plan: SelectionPlan, detail_rows: It
         exported[planned.split] += 1
         expected = (planned.window_end_ms - planned.first_ms) // bar
         stamps = [b["timestamp_ms"] for b in bars]
+        non_contiguous = any(
+            b - a != bar for a, b in zip([planned.first_ms - bar] + stamps, stamps))
+        complete = len(bars) == expected == request.horizon_bars and not non_contiguous
         coverage["with_candles" if bars else "without_candles"] += 1
         coverage["candles_exported"] += len(bars)
-        coverage["complete_windows" if len(bars) == expected == request.horizon_bars else "incomplete_windows"] += 1
+        coverage["complete_windows" if complete else "incomplete_windows"] += 1
         coverage["cutoff_truncated_windows"] += planned.cutoff_truncated
-        coverage["non_contiguous_windows"] += any(
-            b - a != bar for a, b in zip([planned.first_ms - bar] + stamps, stamps))
+        coverage["non_contiguous_windows"] += non_contiguous
         source_rows.append({"key": planned.key, "version": version, "setup": setup,
                             "config": config, "bars": bars})
     dataset = {**request.payload_head(), "opportunities": opportunities, "bars_by_id": bars_by_id}

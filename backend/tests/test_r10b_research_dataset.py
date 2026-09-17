@@ -408,6 +408,65 @@ class Artifacts(unittest.TestCase):
             self.assertIn(required, text)
         json.dumps(manifest, allow_nan=False)
 
+    def test_full_length_invalid_grid_is_incomplete_without_filtering(self):
+        full = candles(T0 + BAR, [(100, 101, 99, 100)] * HORIZON)
+        duplicate_missing = deepcopy(full)
+        duplicate_missing[-1] = dict(duplicate_missing[-2])
+        off_grid = deepcopy(full)
+        off_grid[10]["timestamp"] += 1
+        misaligned_start = deepcopy(full)
+        misaligned_start[0]["timestamp"] += 1
+        out_of_order = deepcopy(full)
+        out_of_order[10], out_of_order[11] = out_of_order[11], out_of_order[10]
+        for name, source in (("duplicate_missing", duplicate_missing), ("off_grid", off_grid),
+                             ("misaligned_start", misaligned_start), ("out_of_order", out_of_order)):
+            with self.subTest(name):
+                dataset, manifest = build([detail("k", T0 + 500, candles=source)])
+                cov = manifest["coverage"]
+                self.assertEqual((cov["complete_windows"], cov["incomplete_windows"]), (0, 1))
+                self.assertEqual(cov["non_contiguous_windows"], 1)
+                self.assertEqual(cov["cutoff_truncated_windows"], 0)
+                self.assertEqual(cov["candles_exported"], HORIZON)
+                self.assertEqual(manifest["counts"]["exported"], {"training": 1, "validation": 0})
+                self.assertEqual(sum(manifest["counts"]["excluded"].values()), 0)
+                expected_bars = [{"timestamp_ms": bar["timestamp"],
+                                  **{key: value for key, value in bar.items() if key != "timestamp"}}
+                                 for bar in source]
+                self.assertEqual(dataset["bars_by_id"], {"k": expected_bars})
+
+    def test_exact_full_grid_is_complete(self):
+        source = candles(T0 + BAR, [(100, 101, 99, 100)] * HORIZON)
+        _, manifest = build([detail("k", T0 + 500, candles=source)])
+        self.assertEqual(manifest["coverage"], {
+            "with_candles": 1, "without_candles": 0, "candles_exported": HORIZON,
+            "complete_windows": 1, "incomplete_windows": 0,
+            "cutoff_truncated_windows": 0, "non_contiguous_windows": 0,
+        })
+
+    def test_empty_and_partial_grids_remain_incomplete(self):
+        for count in (0, HORIZON - 1):
+            with self.subTest(count):
+                source = candles(T0 + BAR, [(100, 101, 99, 100)] * count)
+                dataset, manifest = build([detail("k", T0 + 500, candles=source)])
+                self.assertEqual(manifest["coverage"], {
+                    "with_candles": int(count > 0), "without_candles": int(count == 0),
+                    "candles_exported": count, "complete_windows": 0, "incomplete_windows": 1,
+                    "cutoff_truncated_windows": 0, "non_contiguous_windows": 0,
+                })
+                self.assertEqual(len(dataset["opportunities"]), 1)
+
+    def test_exact_cutoff_grid_remains_incomplete_and_truncated(self):
+        cutoff = dt(T0 + 10 * BAR).isoformat().replace("+00:00", "Z")
+        req = ds.parse_request(request(as_of_utc=cutoff))
+        source = candles(T0 + BAR, [(100, 101, 99, 100)] * 9)
+        dataset, manifest = build([detail("k", T0 + 500, candles=source)], req)
+        self.assertEqual(manifest["coverage"], {
+            "with_candles": 1, "without_candles": 0, "candles_exported": 9,
+            "complete_windows": 0, "incomplete_windows": 1,
+            "cutoff_truncated_windows": 1, "non_contiguous_windows": 0,
+        })
+        self.assertEqual(dataset["bars_by_id"]["k"][-1]["timestamp_ms"] + BAR, req.as_of_ms)
+
     def test_empty_and_all_purged_states(self):
         req = ds.parse_request(request())
         empty = ds.build_artifacts(req, ds.plan_selection(req, []), [], {"holdout_sealed": 4})

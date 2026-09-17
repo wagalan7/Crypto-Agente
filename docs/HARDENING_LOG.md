@@ -1908,3 +1908,28 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
 - **Invariantes:** nenhuma regra, limite, flag ou política LIVE alterada; holdout
   preservado; nenhum dado real exportado; sem ordens, rede externa, mensagens,
   push ou deploy. R11B, R12 e promoção não foram implementados.
+
+## 2026-09-17 — R11B1 auth administrativa + correção de cobertura R10B
+
+- Base: `15a043e4`. Escopo autorizado: proteger os POSTs de aplicação de
+  rotação/relearn e corrigir a classificação de janelas do exportador.
+- As duas rotas exigem `X-Admin-Token` conforme `_check_admin_token`, antes
+  de importar/chamar serviços. Nenhum token configurado em produção ou
+  ambiente desconhecido => bloqueio. Mantidos contrato de erro e política
+  demo/testnet do guard existente; sem nova ENV ou mudança em loops internos.
+- Sete testes novos ASGI, sem boot/serviços reais: ausência, token inválido,
+  branco/query, header válido, produção sem token, ambiente desconhecido,
+  política demo e parâmetro no OpenAPI. RED antes da correção, GREEN depois.
+  A caracterização R9 do R11A agora exige proteção, sem mudar outros achados.
+- R10B: janela completa exige horizonte integral E grade contígua desde
+  `first_ms`. Duplicatas, lacunas e desalinhamento não podem contar como
+  completas. Quatro testes adicionais, incluindo cutoff e controles; os
+  quatro subcasos defeituosos foram demonstrados RED→GREEN. Payload, seleção,
+  custos, replay e holdout inalterados.
+- Validação: 1.886 testes executados, 1.884 aprovados, 2 skips R05C históricos;
+  `py_compile` e `git diff --check` limpos. Integração R10B PostgreSQL real
+  descartável aprovada após a correção, via socket Unix com TCP/DNS bloqueados;
+  cluster encerrado ao final. Frontend inalterado.
+- Histerese, edge decay, sanitização do learning/sizing e demais achados R11A
+  não foram corrigidos neste pacote. Nenhuma estratégia, risco ou flag LIVE
+  alterada. Arquivos pessoais preservados e fora do commit.
