@@ -1865,3 +1865,46 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
   sem TCP/DNS nem acesso a banco externo. Cluster do teste encerrado.
 - Nenhuma decisão, score, tier, stop, TP, sizing, flag ou limite LIVE alterado
   por estas correções. Arquivos pessoais preexistentes preservados.
+
+## Lote R10B + R11A — dados para pesquisa offline e auditoria do aprendizado (17/09/2026)
+
+- **Base:** `51c992c2`, checkout principal/main (HEAD conferido antes de editar).
+  Novos: `services/research_dataset_service.py`, `scripts/research_dataset.py`,
+  `tests/test_r10b_research_dataset.py`, `tests/pg_integration_r10b.py`,
+  `tests/test_r11a_learning_rotation_audit.py`, `docs/R10B_RESEARCH_DATASET.md`,
+  `docs/R11A_LEARNING_ROTATION_AUDIT.md`. Alterado só o teste de fronteira R10A.
+- **R10B:** exportação local somente leitura da coorte `R09_REJECTED_POST_SELECTION`
+  para o comparador R10A. Núcleo puro (requisição de schema fechado, seleção,
+  conversão, manifesto) separado do loader com sessão injetada; CLI valida antes
+  de abrir sessão, exige `--read-db` + `--out-dir`, não aceita DSN em argumento,
+  não lê `.env`, não chama `init_db`, não sobrescreve e grava o manifesto por
+  último (sem par parcial). Só `MANAGEMENT_ONLY`; controle A/A permitido;
+  candidato precisa anteceder o treino, com a limitação declarada de que o
+  timestamp é do operador. Exportar não roda a comparação.
+- **Holdout e SQL:** transação `REPEATABLE READ READ ONLY` verificada por
+  `current_setting`, sempre encerrada em rollback; índice só com id/decisão,
+  `LIMIT` do R10A + 1 (excedeu → falha, sem truncar); purga pelo maior horizonte
+  antes de ler JSON; velas filtradas no PostgreSQL por início, horizonte,
+  fronteira do split e cutoff; `outcome`/`coverage` nunca lidos; do holdout só a
+  contagem. Fingerprints mudam com versão/velas e não com outcome.
+- **R11A:** auditoria dos quatro serviços (learning, symbol learning, edge decay,
+  rotação) com matriz por mecanismo e 15 achados priorizados — entre eles dois
+  endpoints mutantes sem token de admin, histerese que conta chamadas em vez de
+  evidência, e a janela do edge decay que contém a janela recente (decaimento
+  severo deixa de cortar). **Nenhuma política foi corrigida**; os quatro serviços
+  estão intactos no diff, conforme o escopo do lote.
+- **Validação:** 41 testes R10B + 38 R11A; suíte completa **1.875 executados,
+  1.873 aprovados e os mesmos 2 skips R05C** por fixture privada ausente (não
+  fabricada). PostgreSQL 16 descartável, só socket Unix, TCP/DNS bloqueados,
+  schema criado pelo harness: transação sem XID, escrita injetada recusada
+  (`read-only transaction`), cauda/holdout nunca materializados no Python,
+  exportação pelo CLI idêntica à leitura direta e CLI R10A rodando no arquivo.
+  `py_compile` e `git diff --check` aprovados; frontend congelado (sem TSC).
+- **Correções durante a validação:** o teste de fronteira do R10A listava quem
+  pode importar o replay e grepava prosa — passou a nomear o exportador offline
+  e a checar identificadores por AST, mantendo a proibição de chamar o
+  comparador. Um teste meu do R11A usava `patch.dict(sys.modules)`, que removia
+  módulos importados durante o teste; virou substituição pontual da chave.
+- **Invariantes:** nenhuma regra, limite, flag ou política LIVE alterada; holdout
+  preservado; nenhum dado real exportado; sem ordens, rede externa, mensagens,
+  push ou deploy. R11B, R12 e promoção não foram implementados.

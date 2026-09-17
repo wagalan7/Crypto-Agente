@@ -675,19 +675,39 @@ class Isolation(unittest.TestCase):
         self.assertIn("LAZY_OK", result.stdout)
 
     def test_live_paths_do_not_use_the_comparator(self):
+        """Quem importa o replay é nominal, e nenhum deles chama o comparador.
+
+        `research_dataset_service` (R10B) é exportador OFFLINE: usa os contratos
+        (Opportunity/Candle/ReplayConfig/management_diff), nunca a comparação —
+        e nenhum serviço LIVE o importa (teste próprio do R10B).
+        """
         users = []
         for path in (BACKEND / "services").glob("*.py"):
             if path.name == "offline_replay_service.py":
                 continue
             text = path.read_text(encoding="utf-8")
-            if "offline_replay_service" in text:
-                users.append(path.name)
-                self.assertNotIn("compare_registered_candidate", text)
-                self.assertNotIn("run_payload", text)
-        self.assertEqual(sorted(users), ["decision_observation_service.py", "research_batch_service.py"])
+            if "offline_replay_service" not in text:
+                continue
+            users.append(path.name)
+            # CÓDIGO, não prosa: nomes chamados, atributos e importados.
+            tree = ast.parse(text)
+            usados = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+            usados |= {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    usados |= {a.asname or a.name for a in node.names}
+            for proibido in ("compare_registered_candidate", "run_payload"):
+                self.assertNotIn(proibido, usados, f"{path.name}: {proibido}")
+        self.assertEqual(sorted(users), ["decision_observation_service.py",
+                                         "research_batch_service.py",
+                                         "research_dataset_service.py"])
         main = (BACKEND / "main.py").read_text()
         self.assertNotIn("offline_replay_service", main)
         self.assertNotIn("research_replay", main)
+        self.assertNotIn("research_dataset", main)
+        # A menção em prosa é permitida; a chamada é que não pode existir.
+        exporter = (BACKEND / "services" / "research_dataset_service.py").read_text()
+        self.assertIn("run_payload", exporter)
 
     def test_no_network_attempted(self):
         self.assertEqual(_NET_ATTEMPTS, [])
