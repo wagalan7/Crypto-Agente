@@ -724,14 +724,64 @@ async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
     # (o validador loga warning e retorna True). Instâncias provisionadas
     # automaticamente ganham token e passam a ser validadas.
     if not _validate_webhook_token(tenant, request):
+        _note_webhook(tenant["id"], "evolution", {}, False,
+                      "REJEITADO com 403 — token do webhook não confere")
         raise HTTPException(status_code=403, detail="Token de webhook inválido.")
     payload = await request.json()
     result = wa.extract_message_evolution(payload)
+    _note_webhook(tenant["id"], "evolution", payload, bool(result),
+                  "" if result else "recebido, mas o formato não foi reconhecido "
+                                    "(mensagem descartada)")
     if not result:
         return {"status": "ignored"}
     phone, text = result
     bg.add_task(_handle_message, tenant, phone, text)
     return {"status": "queued"}
+
+
+# Códigos de desconexão do Baileys (DisconnectReason) gravados pela Evolution em
+# Instance.disconnectionReasonCode — traduzidos para o diagnóstico do painel.
+_DISCONNECT_PT = {
+    401: "desconectado pelo celular (o aparelho foi removido em 'Aparelhos conectados')",
+    403: "acesso negado pelo WhatsApp (número restrito ou bloqueado)",
+    408: "conexão perdida por instabilidade de rede",
+    411: "incompatibilidade de multi-dispositivo — refazer a conexão",
+    428: "conexão encerrada",
+    440: "sessão SUBSTITUÍDA: este número foi conectado em outro lugar",
+    500: "sessão CORROMPIDA — refazer a conexão (novo QR)",
+    503: "serviço do WhatsApp indisponível no momento",
+    515: "reinício necessário (normal logo após ler o QR)",
+}
+
+
+# Último webhook recebido por consultório — instrumento de diagnóstico.
+# Guarda SÓ a ESTRUTURA do payload (nomes de chaves, domínio do JID, fromMe).
+# NUNCA o texto da mensagem: é conteúdo clínico do paciente. Vive em memória
+# (zera no restart), o suficiente para responder "chegou? foi reconhecido?".
+_LAST_WEBHOOK: dict[int, dict] = {}
+
+
+def _note_webhook(tenant_id: int, provider: str, payload, reconhecido: bool, obs: str = "") -> None:
+    try:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        key = data.get("key") if isinstance(data, dict) and isinstance(data.get("key"), dict) else None
+        msg = data.get("message") if isinstance(data, dict) and isinstance(data.get("message"), dict) else None
+        jid = key.get("remoteJid") if key else None
+        _LAST_WEBHOOK[tenant_id] = {
+            "em": datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds"),
+            "provider": provider,
+            "evento": payload.get("event") if isinstance(payload, dict) else None,
+            "chaves_topo": sorted(payload.keys())[:12] if isinstance(payload, dict) else type(payload).__name__,
+            "data_eh_lista": isinstance(data, list),
+            "chaves_data": sorted(data.keys())[:14] if isinstance(data, dict) else None,
+            "tipos_de_message": sorted(msg.keys())[:12] if msg else None,
+            "jid_dominio": jid.split("@")[-1] if isinstance(jid, str) and "@" in jid else None,
+            "from_me": key.get("fromMe") if key else None,
+            "reconhecido": reconhecido,
+            "obs": obs,
+        }
+    except Exception:
+        pass
 
 
 def _validate_webhook_token(tenant: dict, request: Request) -> bool:
@@ -1100,6 +1150,37 @@ async def dashboard_stream(slug: str, token: str = ""):
     )
 
 
+def _public_base(request: Request) -> str:
+    """Base pública REAL desta requisição — o host pelo qual o painel foi aberto.
+
+    Usada para REGISTRAR WEBHOOKS. Se o consultório conseguiu abrir o painel
+    neste host, o provedor de WhatsApp também consegue entregar aqui. Evita
+    depender do BASE_URL, que pode apontar para um domínio sem certificado
+    válido: nesse caso a entrega falha em silêncio e o agente nunca recebe as
+    mensagens (fica "conectado" e mudo). Cai no BASE_URL se não houver Host.
+    """
+    host = (request.headers.get("host") or "").strip()
+    if not host:
+        return (config.BASE_URL or "").rstrip("/")
+    proto = (request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip()
+    return f"{proto}://{host}"
+
+
+def _looks_like_evolution(instance: str | None, url: str | None) -> bool:
+    """True quando os dados de WhatsApp são da CONEXÃO AUTOMÁTICA (Evolution),
+    e não de uma conta Z-API do cliente.
+
+    As duas integrações compartilham as mesmas 3 colunas do tenant
+    (evolution_instance/key/url), então o card Z-API do painel aparece
+    pré-preenchido com os dados do Evolution. Heurística segura:
+    um 'Client Token' de Z-API NUNCA é uma URL, e as instâncias provisionadas
+    automaticamente são nomeadas 'tenant-<slug>'.
+    """
+    u = (url or "").strip().lower()
+    i = (instance or "").strip().lower()
+    return u.startswith(("http://", "https://")) or i.startswith("tenant-")
+
+
 @app.get("/dashboard/{slug}", response_class=HTMLResponse)
 def dashboard(slug: str, request: Request, token: str = ""):
     tenant = _get_tenant(slug)
@@ -1120,7 +1201,14 @@ def dashboard(slug: str, request: Request, token: str = ""):
         evolution_enabled = _ev_enabled()
     except Exception:
         evolution_enabled = False
-    return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token, "terms": terms, "evolution_enabled": evolution_enabled})
+    # Conta que usa a conexão automática: os cards de Z-API ficam recolhidos
+    # (evita que o cliente salve por engano e troque o provider — o que derruba
+    # o envio de mensagens do agente).
+    on_evolution = (
+        (tenant.get("whatsapp_provider") or "") == "evolution"
+        or _looks_like_evolution(tenant.get("evolution_instance"), tenant.get("evolution_url"))
+    )
+    return templates.TemplateResponse("dashboard.html", {"request": request, "tenant": tenant, "token": token, "terms": terms, "evolution_enabled": evolution_enabled, "on_evolution": on_evolution})
 
 
 @app.get("/dashboard/api/appointments")
@@ -2070,6 +2158,18 @@ async def dash_config(request: Request, body: TenantUpdate):
             detail="A URL do CalDAV precisa começar com https:// (suas credenciais não podem trafegar em texto puro).",
         )
     saving_zapi = fields.get("evolution_instance") and fields.get("evolution_key")
+    # GUARDA ANTI-ARMADILHA: o card Z-API do painel vem PRÉ-PREENCHIDO com os
+    # dados da conexão automática (Evolution), pois as 3 colunas são as mesmas.
+    # Salvar ali NÃO pode virar o provider para 'zapi' — isso mantém o WhatsApp
+    # "conectado" mas quebra o ENVIO (o agente recebe e não consegue responder).
+    # Nesse caso ignoramos os 3 campos: o card Z-API não mexe em conta Evolution.
+    ignored_zapi = False
+    if saving_zapi and _looks_like_evolution(fields.get("evolution_instance"), fields.get("evolution_url")):
+        saving_zapi = False
+        ignored_zapi = True
+        for _f in ("evolution_instance", "evolution_key", "evolution_url"):
+            fields.pop(_f, None)
+        logger.info(f"[{tenant['slug']}] Save do card Z-API ignorado — conta usa a conexão automática (Evolution).")
     # Auto-set provider to zapi when Z-API credentials are provided
     if saving_zapi:
         fields["whatsapp_provider"] = "zapi"
@@ -2084,6 +2184,11 @@ async def dash_config(request: Request, body: TenantUpdate):
         webhook_url = f"{config.BASE_URL}/webhook/{updated_tenant['slug']}/zapi?token={wt}"
         webhook_result = await wa.configure_webhook_zapi(updated_tenant, webhook_url)
 
+    if ignored_zapi:
+        return {"status": "updated", "webhook": None, "ignored_zapi": True,
+                "note": "Sua conta usa a conexão automática do WhatsApp — "
+                        "os campos de Z-API não se aplicam e foram ignorados. "
+                        "Use o card verde “Conectar WhatsApp (automático)”."}
     return {"status": "updated", "webhook": webhook_result}
 
 
@@ -2127,6 +2232,7 @@ async def dash_evolution_qr(request: Request):
     from evolution_provisioning import (
         is_enabled as _ev_enabled, create_instance as _ev_create,
         connect as _ev_connect, set_webhook as _ev_setwebhook,
+        fetch_instance_token as _ev_fetch_token,
     )
     token = request.headers.get("X-Dashboard-Token", "")
     tenant = _get_tenant_by_token(token)
@@ -2137,7 +2243,9 @@ async def dash_evolution_qr(request: Request):
     instance_name = f"tenant-{tenant['slug']}"
     api_base = config.EVOLUTION_API_URL.rstrip("/")
     wt = db.ensure_webhook_token(tenant["id"])
-    webhook_url = f"{config.BASE_URL}/webhook/{tenant['slug']}/evolution?token={wt}"
+    # Host REAL desta requisição (não o BASE_URL) — garante que o webhook fica
+    # num endereço comprovadamente alcançável: é por ele que o painel abriu.
+    webhook_url = f"{_public_base(request)}/webhook/{tenant['slug']}/evolution?token={wt}"
 
     # Já provisionado nesta plataforma? (mesma URL + instância gravada)
     provisioned = (
@@ -2163,6 +2271,12 @@ async def dash_evolution_qr(request: Request):
         # token por instância (nunca a chave global); se já existia, mantém.
         if created.get("instance_token"):
             updates["evolution_key"] = created["instance_token"]
+        elif created.get("already_exists"):
+            # A instância já existia → o create volta SEM hash. Sem isto o tenant
+            # ficaria com um token velho (ou vazio) e todo ENVIO daria HTTP 401.
+            _tok = await _ev_fetch_token(instance_name)
+            if _tok:
+                updates["evolution_key"] = _tok
         db.update_tenant(tenant["slug"], **updates)
         await _ev_setwebhook(instance_name, webhook_url)
         if created.get("qr"):
@@ -2170,15 +2284,120 @@ async def dash_evolution_qr(request: Request):
         # sem QR no create → cai pro connect abaixo
 
     res = await _ev_connect(instance_name)
+    # A instância sumiu do servidor (ex.: DEL_INSTANCE da Evolution remove
+    # instâncias que ficam deslogadas). Recria — o create grava o webhook e o
+    # token. Só num clique do cliente; o check=1 do load NUNCA cria instância.
+    if (not res.get("ok") and "HTTP 404" in (res.get("error") or "")
+            and request.query_params.get("check") != "1"):
+        logger.warning(f"[{tenant['slug']}] instância {instance_name} não existe mais "
+                       f"no servidor — recriando.")
+        created = await _ev_create(instance_name, webhook_url)
+        if created.get("ok"):
+            _tok = created.get("instance_token") or await _ev_fetch_token(instance_name)
+            if _tok:
+                db.update_tenant(tenant["slug"], evolution_key=_tok)
+                tenant["evolution_key"] = _tok
+            await _ev_setwebhook(instance_name, webhook_url)
+            if created.get("qr"):
+                return {"ok": True, "enabled": True, "connected": False,
+                        "qr": created["qr"], "recreated": True}
+            res = await _ev_connect(instance_name)
     res["enabled"] = True
     if res.get("connected"):
         try:
             if (tenant.get("whatsapp_provider") or "") != "evolution":
                 db.update_tenant(tenant["slug"], whatsapp_provider="evolution")
-            await _ev_setwebhook(instance_name, webhook_url)
+            # O retorno do set_webhook era IGNORADO: num HTTP 400 (payload que a
+            # versão da Evolution não aceita) o webhook nunca era gravado e as
+            # mensagens não chegavam, sem nenhum sinal. Agora loga e reporta.
+            _wh = await _ev_setwebhook(instance_name, webhook_url)
+            res["webhook_set"] = _wh
+            if not _wh.get("ok"):
+                logger.error(
+                    f"[{tenant['slug']}] FALHA ao gravar webhook na instância "
+                    f"{instance_name}: {_wh.get('error')} — as mensagens recebidas "
+                    f"NÃO vão chegar no app.")
+            # AUTOCURA DO TOKEN DA INSTÂNCIA — o connect acima autentica com a
+            # chave GLOBAL, então o painel pode dizer "conectado" enquanto o
+            # ENVIO (que usa o token da instância) devolve HTTP 401 e o agente
+            # fica mudo. Testa o token gravado e, se não autenticar, regrava o
+            # token real buscado no servidor.
+            probe = await wa.check_connection({
+                "whatsapp_provider": "evolution",
+                "evolution_url": api_base,
+                "evolution_instance": instance_name,
+                "evolution_key": tenant.get("evolution_key") or "",
+            })
+            if not probe.get("ok"):
+                real = await _ev_fetch_token(instance_name)
+                if real and real != (tenant.get("evolution_key") or ""):
+                    db.update_tenant(tenant["slug"], evolution_key=real)
+                    res["token_fixed"] = True
+                    logger.info(
+                        f"[{tenant['slug']}] evolution_key curado — o envio estava "
+                        f"falhando com {probe.get('error')}.")
         except Exception as e:
             logger.warning(f"[{tenant['slug']}] pós-conexão Evolution: {e}")
     return res
+
+
+@app.post("/dashboard/api/evolution/reset-session")
+async def dash_evolution_reset_session(request: Request):
+    """Refaz a conexão do WhatsApp (conexão automática): logout + apaga as chaves
+    da sessão, MANTENDO instância, token e webhook. O painel então gera um QR
+    novo. Conserto para "conectado mas não recebe mensagens" (chaves de sessão
+    dessincronizadas → a Evolution descarta as mensagens sem webhook).
+
+    Só age sobre a instância DESTE consultório; não afeta os outros.
+    """
+    token = request.headers.get("X-Dashboard-Token", "")
+    tenant = _get_tenant_by_token(token)
+    from evolution_provisioning import (
+        is_enabled as _ev_enabled, logout_instance as _ev_logout,
+        restart_instance as _ev_restart, connection_state as _ev_state,
+    )
+    if not _ev_enabled():
+        raise HTTPException(status_code=400, detail="Conexão automática indisponível.")
+    instance_name = f"tenant-{tenant['slug']}"
+    if (tenant.get("evolution_instance") or "") != instance_name:
+        raise HTTPException(status_code=400,
+                            detail="Este consultório não usa a conexão automática.")
+
+    def _ok_ou_ja_desconectada(r: dict) -> bool:
+        # "not connected" = a sessão já estava fechada: nada a desfazer.
+        return bool(r.get("ok")) or "not connected" in (r.get("error") or "")
+
+    caminho = "logout"
+    res = await _ev_logout(instance_name)
+    if not _ok_ou_ja_desconectada(res):
+        # SESSÃO ZUMBI: a Evolution diz "open", mas o websocket morreu — o
+        # logout falha com "Connection Closed" ANTES de apagar as chaves. O
+        # restart recria o socket sem chamar logout; então acompanhamos o
+        # estado real e, se a sessão voltar, fazemos o logout de novo.
+        caminho = "restart"
+        rs = await _ev_restart(instance_name)
+        logger.warning(f"[{tenant['slug']}] logout falhou ({(res.get('error') or '')[:80]}) "
+                       f"— restart da instância: {rs}")
+        estado = None
+        for _ in range(8):  # até ~12s
+            await asyncio.sleep(1.5)
+            estado = await _ev_state(instance_name)
+            if estado in ("open", "close"):
+                break
+        if estado == "open":
+            res2 = await _ev_logout(instance_name)
+            if not _ok_ou_ja_desconectada(res2):
+                raise HTTPException(
+                    status_code=502,
+                    detail=("A sessão do WhatsApp travou no servidor Evolution e não "
+                            "respondeu nem ao reinício. Reinicie o serviço Evolution na "
+                            "Railway (Deployments → ⋮ → Restart) e tente de novo. "
+                            f"Detalhe: {(res2.get('error') or '')[:120]}"))
+            caminho = "restart+logout"
+        # 'close' / 'connecting' / sem resposta → o painel segue para o QR novo.
+    logger.warning(f"[{tenant['slug']}] Sessão do WhatsApp REINICIADA pelo painel "
+                   f"(caminho={caminho}).")
+    return {"status": "ok", "caminho": caminho}
 
 
 # ── Cobrança ────────────────────────────────────────────────────────────────────
@@ -2924,10 +3143,64 @@ async def diagnose_whatsapp(request: Request):
         ),
     }
 
+    # Webhook REALMENTE gravado na instância (só Evolution). Sem isto, uma
+    # gravação que falhou passa despercebida: o painel diz "conectado", o envio
+    # funciona, e as mensagens recebidas simplesmente nunca chegam no app.
+    webhook_info = None
+    instancia_info = None
+    if (tenant.get("whatsapp_provider") or "") == "evolution":
+        try:
+            from evolution_provisioning import (
+                is_enabled as _ev_enabled, get_webhook as _ev_getwebhook,
+                get_instance_info as _ev_getinfo,
+            )
+            if _ev_enabled():
+                inst = tenant.get("evolution_instance") or ""
+                # Qual número está pareado + saúde da sessão (mascarado).
+                info = await _ev_getinfo(inst)
+                _dig = "".join(c for c in (info.get("owner_jid") or "").split("@")[0] if c.isdigit())
+                _num = (_dig[:4] + "*" * (len(_dig) - 8) + _dig[-4:]) if len(_dig) > 8 else ("****" if _dig else None)
+                _code = info.get("disconnection_code")
+                instancia_info = {
+                    "numero_pareado": _num,
+                    "nome_do_perfil": info.get("profile_name") or None,
+                    "status_no_servidor": info.get("connection_status"),
+                    "ultima_desconexao_codigo": _code,
+                    "ultima_desconexao_em": info.get("disconnection_at"),
+                    "ultima_desconexao_significa": _DISCONNECT_PT.get(_code) if _code else None,
+                    "erro_ao_consultar": info.get("error"),
+                }
+                atual = await _ev_getwebhook(inst)
+                wt = db.ensure_webhook_token(tenant["id"])
+                esperado = f"{_public_base(request)}/webhook/{tenant['slug']}/evolution?token={wt}"
+                url_atual = atual.get("url") or ""
+                # Não devolve o token em claro: só o que importa pro diagnóstico.
+                def _mask(u: str) -> str:
+                    if not u or "token=" not in u:
+                        return u or ""
+                    head, _sep, tail = u.partition("token=")
+                    parts = tail.split("&", 1)
+                    return head + "token=***" + ("&" + parts[1] if len(parts) > 1 else "")
+                webhook_info = {
+                    "gravado_no_provedor": _mask(url_atual),
+                    "esperado_agora": _mask(esperado),
+                    "habilitado": atual.get("enabled"),
+                    "eventos": atual.get("events"),
+                    "tem_token": "token=" in url_atual,
+                    "confere": url_atual == esperado,
+                    "erro_ao_consultar": atual.get("error"),
+                }
+        except Exception as e:
+            webhook_info = {"erro_ao_consultar": str(e)[:160]}
+
     return {
         "consultorio": tenant.get("slug"),
         "provider": tenant.get("whatsapp_provider"),
         "conexao": conn,  # {ok, connected, error}
+        "instancia": instancia_info,
+        "webhook": webhook_info,
+        "ultimo_webhook_recebido": _LAST_WEBHOOK.get(tenant["id"])
+            or "NENHUM webhook chegou desde o último restart do app",
         "pendentes_amanha": pendentes,
         "lembrete_vencimento_zapi": lembrete,
     }

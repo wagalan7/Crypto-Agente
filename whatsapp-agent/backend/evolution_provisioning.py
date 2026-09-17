@@ -147,6 +147,51 @@ async def connect(instance_name: str) -> dict:
         return {"ok": False, "connected": False, "qr": None, "error": str(e)[:200]}
 
 
+async def fetch_instance_token(instance_name: str) -> str:
+    """Token ATUAL da instância, consultado com a chave GLOBAL.
+
+    Cura o caso em que o ``evolution_key`` gravado no tenant ficou
+    desatualizado. Sintoma: o painel mostra "WhatsApp conectado" (o connect/QR
+    usa a chave global) mas o agente não envia nada — porque o ENVIO usa o
+    token da INSTÂNCIA, e um token errado devolve HTTP 401.
+
+    Acontece quando o ``create`` encontrou a instância já existente (a resposta
+    vem sem ``hash``, então nada era gravado) ou quando a instância foi
+    recriada no servidor Evolution.
+
+    Retorna '' se não conseguir descobrir (nunca levanta exceção).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.get(
+                f"{_base()}/instance/fetchInstances",
+                params={"instanceName": instance_name},
+                headers=_admin_headers(),
+            )
+            if r.status_code >= 400:
+                logger.warning(
+                    f"[evolution] fetch_instance_token({instance_name}): HTTP {r.status_code}")
+                return ""
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                inner = it.get("instance") if isinstance(it.get("instance"), dict) else it
+                name = inner.get("instanceName") or inner.get("name") or it.get("name")
+                if name and name != instance_name:
+                    continue
+                for src in (inner, it):
+                    tok = src.get("token") or src.get("apikey") or src.get("hash")
+                    if isinstance(tok, dict):
+                        tok = tok.get("apikey") or tok.get("hash") or ""
+                    if tok:
+                        return str(tok)
+    except Exception as e:
+        logger.warning(f"[evolution] fetch_instance_token({instance_name}) falhou: {e}")
+    return ""
+
+
 async def set_webhook(instance_name: str, webhook_url: str) -> dict:
     """(Re)configura o webhook de mensagens da instância. Idempotente."""
     payload = {
@@ -177,6 +222,140 @@ async def set_webhook(instance_name: str, webhook_url: str) -> dict:
     except Exception as e:
         logger.warning(f"[evolution] set_webhook({instance_name}) falhou: {e}")
         return {"ok": False, "error": str(e)[:200]}
+
+
+async def get_webhook(instance_name: str) -> dict:
+    """Webhook ATUALMENTE configurado na instância (consulta com a chave global).
+
+    Existe para diagnóstico: o ``set_webhook`` devolve ok=False num HTTP 400 sem
+    levantar exceção, e o chamador historicamente ignorava esse retorno — então
+    um webhook que nunca foi gravado passava despercebido e as mensagens
+    simplesmente não chegavam. Retorna {ok, url, enabled, events, error}.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.get(f"{_base()}/webhook/find/{instance_name}",
+                                 headers=_admin_headers())
+            if r.status_code >= 400:
+                return {"ok": False, "url": "", "enabled": None, "events": [],
+                        "error": f"HTTP {r.status_code}: {r.text[:160]}"}
+            d = r.json() or {}
+            inner = d.get("webhook") if isinstance(d.get("webhook"), dict) else d
+            return {
+                "ok": True,
+                "url": inner.get("url") or "",
+                "enabled": inner.get("enabled"),
+                "events": inner.get("events") or [],
+                "error": None,
+            }
+    except Exception as e:
+        return {"ok": False, "url": "", "enabled": None, "events": [], "error": str(e)[:200]}
+
+
+async def get_instance_info(instance_name: str) -> dict:
+    """Dados da instância no servidor (chave global): número pareado, nome do
+    perfil, status e a ÚLTIMA desconexão registrada pela Evolution.
+
+    Diagnóstico de "conectado mas não recebe": mostra se o QR foi lido com o
+    número certo e se houve queda de sessão (ex.: 440 = sessão aberta em outro
+    lugar; 500 = sessão corrompida). Campos do model Instance da Evolution v2.
+    """
+    vazio = {"ok": False, "owner_jid": "", "profile_name": "", "connection_status": None,
+             "disconnection_code": None, "disconnection_at": None}
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.get(f"{_base()}/instance/fetchInstances",
+                                 params={"instanceName": instance_name},
+                                 headers=_admin_headers())
+            if r.status_code >= 400:
+                return {**vazio, "error": f"HTTP {r.status_code}: {r.text[:160]}"}
+            data = r.json()
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                inner = it.get("instance") if isinstance(it.get("instance"), dict) else it
+                name = inner.get("instanceName") or inner.get("name") or it.get("name")
+                if name and name != instance_name:
+                    continue
+                return {
+                    "ok": True,
+                    "owner_jid": inner.get("ownerJid") or inner.get("owner") or "",
+                    "profile_name": inner.get("profileName") or "",
+                    "connection_status": inner.get("connectionStatus") or inner.get("status"),
+                    "disconnection_code": inner.get("disconnectionReasonCode"),
+                    "disconnection_at": inner.get("disconnectionAt"),
+                    "error": None,
+                }
+            return {**vazio, "error": "instância não veio na resposta"}
+    except Exception as e:
+        return {**vazio, "error": str(e)[:200]}
+
+
+async def logout_instance(instance_name: str) -> dict:
+    """Desconecta o WhatsApp e APAGA as chaves de criptografia da sessão,
+    MANTENDO a instância (token e webhook continuam valendo). Em seguida o
+    ``connect`` gera um QR novo, com chaves novas.
+
+    Conserto da sessão "conectada mas surda": quando as chaves dessincronizam,
+    as mensagens recebidas chegam como stub ('Bad MAC', 'No session record',
+    'Invalid PreKey ID'...) e a Evolution as DESCARTA sem disparar webhook
+    (whatsapp.baileys.service.ts, handler messages.upsert). Um restart não
+    resolve: as chaves corrompidas persistem. No servidor, o logout só marca a
+    instância como 'close' e remove as linhas de session (monitor.cleaningUp).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.delete(f"{_base()}/instance/logout/{instance_name}",
+                                    headers=_admin_headers())
+            if r.status_code >= 400:
+                return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            return {"ok": True, "error": None}
+    except Exception as e:
+        logger.warning(f"[evolution] logout_instance({instance_name}) falhou: {e}")
+        return {"ok": False, "error": str(e)[:200]}
+
+
+async def restart_instance(instance_name: str) -> dict:
+    """POST /instance/restart/{nome}.
+
+    Na Evolution 2.3.7 com Baileys (que não tem ``restart()``) o controller cai
+    no fallback: fecha o socket, chama ``client.end()`` e reconecta com as
+    credenciais salvas. Ele NÃO chama ``client.logout()`` — por isso funciona
+    mesmo quando o websocket está morto e o logout falha com "Connection Closed".
+    Atenção: erros vêm no CORPO ({error: true, message}) com HTTP 200.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.post(f"{_base()}/instance/restart/{instance_name}",
+                                  headers=_admin_headers())
+            if r.status_code >= 400:
+                return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            try:
+                d = r.json()
+            except Exception:
+                d = {}
+            if isinstance(d, dict) and d.get("error"):
+                return {"ok": False, "error": str(d.get("message") or d)[:200]}
+            return {"ok": True, "error": None}
+    except Exception as e:
+        logger.warning(f"[evolution] restart_instance({instance_name}) falhou: {e}")
+        return {"ok": False, "error": str(e)[:200]}
+
+
+async def connection_state(instance_name: str) -> str | None:
+    """Estado da sessão na Evolution: 'open' | 'connecting' | 'close' | None
+    (None = não consegui consultar)."""
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            r = await client.get(f"{_base()}/instance/connectionState/{instance_name}",
+                                 headers=_admin_headers())
+            if r.status_code >= 400:
+                return None
+            d = r.json() or {}
+            return ((d.get("instance") or {}).get("state")) or d.get("state")
+    except Exception:
+        return None
 
 
 async def delete_instance(instance_name: str) -> dict:

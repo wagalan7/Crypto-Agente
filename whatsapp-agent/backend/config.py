@@ -30,7 +30,12 @@ WORKING_HOURS_START = int(os.getenv("WORKING_HOURS_START", "7"))
 WORKING_HOURS_END = int(os.getenv("WORKING_HOURS_END", "21"))
 
 MASTER_KEY = os.getenv("MASTER_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "https://agenteconsultorio.com.br")
+# Domínio público do app. ATENÇÃO: usar o host que realmente tem certificado.
+# O domínio RAIZ (agenteconsultorio.com.br) aponta para a Railway mas nunca foi
+# cadastrado lá como custom domain — o TLS falha ("CN=*.up.railway.app"), então
+# webhooks e links de contrato montados com ele ficam inacessíveis. O 'www' está
+# configurado corretamente e responde 200.
+BASE_URL = os.getenv("BASE_URL", "https://www.agenteconsultorio.com.br")
 
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")

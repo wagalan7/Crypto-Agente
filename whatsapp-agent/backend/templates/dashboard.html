@@ -501,11 +501,28 @@
         ⚡ Conectar WhatsApp
       </button>
       <div id="ev-conn-msg" class="hidden text-sm text-center mt-2"></div>
+      <button id="ev-reset-btn" type="button" onclick="resetEvolutionSession(this)"
+        class="w-full mt-2 bg-white border border-gray-200 text-gray-600 py-2 rounded-xl text-xs font-medium hover:bg-gray-50 transition">
+        🔁 Conectado mas não recebe mensagens? Refazer conexão (novo QR)
+      </button>
       <details class="mt-3">
         <summary class="text-xs text-gray-400 cursor-pointer">Prefiro usar meu próprio Z-API</summary>
         <p class="text-xs text-gray-400 mt-1">Use os campos abaixo para conectar via Z-API manualmente.</p>
       </details>
     </div>
+    {% endif %}
+
+    {% if on_evolution %}
+    <!-- Conta na conexão automática: Z-API fica recolhido (evita salvar por
+         engano e trocar o provider, o que derruba o envio do agente). -->
+    <details class="max-w-lg mt-4">
+      <summary class="text-xs text-gray-400 cursor-pointer select-none">
+        Opções avançadas — usar meu próprio Z-API
+      </summary>
+      <div class="mt-2 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800">
+        Sua conta usa a <strong>conexão automática</strong> (card verde acima). Os campos abaixo
+        são só para quem tem uma conta própria de Z-API — <strong>você não precisa mexer neles</strong>.
+      </div>
     {% endif %}
 
     <!-- WhatsApp Z-API -->
@@ -579,6 +596,10 @@
       </button>
       <div id="zapi-conn-msg" class="hidden text-sm text-center mt-2"></div>
     </div>
+
+    {% if on_evolution %}
+    </details>
+    {% endif %}
 
     </div><!-- /cfgsec-whatsapp -->
 
@@ -3672,6 +3693,12 @@ function connectZapi(btn) {
 
 // Checagem leve ao abrir: só atualiza o selo (não fica gerando QR).
 async function _zapiInit() {
+  {% if on_evolution %}
+  // Conta usa a conexão automática (Evolution): não consultar a Z-API — os
+  // campos estão preenchidos com dados do Evolution e a chamada só falharia.
+  _zapiSetBadge(null);
+  return;
+  {% endif %}
   const instEl = document.getElementById('cfg-zapi-instance');
   const tokEl = document.getElementById('cfg-zapi-token');
   if (!instEl || !tokEl || !instEl.value.trim() || !tokEl.value.trim()) { _zapiSetBadge(null); return; }
@@ -3747,6 +3774,40 @@ async function _evTick() {
     m.className = 'text-sm text-center text-red-600 mt-2';
     m.textContent = 'Erro: ' + e.message;
     m.classList.remove('hidden');
+  }
+}
+
+// Refaz a sessão: logout (apaga as chaves corrompidas) e gera QR novo.
+// Conserto para "conectado mas as mensagens não chegam".
+async function resetEvolutionSession(btn) {
+  const ok = confirm(
+    "Refazer a conexão do WhatsApp?\n\n" +
+    "Isso DESCONECTA o WhatsApp do agente e gera um QR code novo. " +
+    "Tenha o celular do consultório em mãos para escanear em seguida.\n\n" +
+    "Antes de escanear, no celular: WhatsApp → Aparelhos conectados → " +
+    "remova as conexões antigas deste agente.\n\n" +
+    "Use quando o painel mostra 'conectado' mas as mensagens não chegam."
+  );
+  if (!ok) return;
+  const orig = btn.textContent;
+  const m = document.getElementById('ev-conn-msg');
+  btn.disabled = true; btn.textContent = '⏳ Reiniciando a sessão… (até 15 segundos)';
+  try {
+    _evStopPoll();
+    await api('/dashboard/api/evolution/reset-session', { method: 'POST' });
+    _evSetBadge('off');
+    const c = document.getElementById('ev-connected-box'); if (c) c.classList.add('hidden');
+    m.className = 'text-sm text-center text-gray-600 mt-2';
+    m.textContent = 'Sessão reiniciada. Gerando um QR novo…';
+    m.classList.remove('hidden');
+    // pequena pausa para o servidor fechar a sessão antiga antes de pedir o QR
+    setTimeout(() => connectEvolution(document.getElementById('ev-connect-btn')), 3000);
+  } catch (e) {
+    m.className = 'text-sm text-center text-red-600 mt-2';
+    m.textContent = 'Não foi possível refazer a conexão: ' + e.message;
+    m.classList.remove('hidden');
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
   }
 }
 
