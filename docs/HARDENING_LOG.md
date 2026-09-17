@@ -1849,3 +1849,19 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
   também na resposta da API. Nada disso demonstra redução de stops ou lucro.
   Docs: `R08B_SCORE_TRACE.md`, `R09_DECISION_OBSERVATION.md`,
   `R10A_OFFLINE_REPLAY.md`, `R08_R10_BATCH.md`.
+
+## 2026-09-17 — revisão final R09/R10A antes da publicação
+
+- R09: a assinatura inclui todos os símbolos pendentes (limitada pela
+  capacidade da tabela); o teto de 64 continua exclusivo das janelas em
+  memória. Mais de 64 símbolos antigos sem velas não bloqueiam um novo
+  símbolo com dados. Regressão RED→GREEN no PostgreSQL real local.
+- R10A: a CLI valida a configuração antes das fronteiras, rejeita velas cujo
+  fim invade o holdout e constrói `Candle` sob demanda, só até o horizonte.
+  Três regressões RED→GREEN; defesa de fronteira no comparador preservada.
+- Validação local: 1.796 testes executados, 1.794 aprovados e os mesmos
+  2 skips R05C por fixture privada ausente; TypeScript e diff-check limpos.
+  Integração R09 real passou 2× em PostgreSQL descartável via socket Unix,
+  sem TCP/DNS nem acesso a banco externo. Cluster do teste encerrado.
+- Nenhuma decisão, score, tier, stop, TP, sizing, flag ou limite LIVE alterado
+  por estas correções. Arquivos pessoais preexistentes preservados.

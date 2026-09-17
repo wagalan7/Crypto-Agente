@@ -16,6 +16,7 @@ import socket as _socket
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 BACKEND = Path(__file__).resolve().parents[1]
 FIXTURES = BACKEND / "tests" / "fixtures"
@@ -506,6 +507,15 @@ class PayloadAndCli(unittest.TestCase):
     def load(self, name):
         return json.loads((FIXTURES / name).read_text())
 
+    def compare_with_full_horizon(self):
+        payload = self.load("r10a_synthetic_compare.json")
+        configs = (payload["baseline_config"], payload["candidate"]["replay_config"])
+        horizon = max(c["entry_window_bars"] + c["max_holding_bars"] - 1 for c in configs)
+        rows = next(iter(payload["bars_by_id"].values()))
+        while len(rows) < horizon:
+            rows.append(dict(rows[-1], timestamp_ms=rows[-1]["timestamp_ms"] + configs[0]["bar_ms"]))
+        return payload, rows
+
     def test_fixture_replay_numbers(self):
         out = r.run_payload(self.load("r10a_synthetic_replay.json"))
         self.assertEqual(out["status"], "CLOSED_STOP")
@@ -553,6 +563,43 @@ class PayloadAndCli(unittest.TestCase):
             r.run_payload(dict(self.load("r10a_synthetic_replay.json"), extra=1))
         with self.assertRaises(ValueError):
             r.run_payload({"mode": "sweep"})
+
+    def test_payload_rejects_bar_ending_in_holdout_even_beyond_horizon(self):
+        payload, rows = self.compare_with_full_horizon()
+        old_boundary = payload["split"]["holdout_start_ms"]
+        payload["split"]["holdout_start_ms"] = old_boundary + 1000
+        rows.append(dict(timestamp_ms=old_boundary, open=100.0, high=101.0,
+                         low=99.0, close=100.0, volume=1.0))
+        with patch.object(r.Candle, "__post_init__", side_effect=AssertionError("Candle materializada")):
+            with self.assertRaisesRegex(ValueError, "holdout"):
+                r.run_payload(payload)
+
+    def test_payload_allows_bar_ending_exactly_at_holdout_without_decoding_tail(self):
+        payload, rows = self.compare_with_full_horizon()
+        tail_stamp = payload["split"]["holdout_start_ms"] - payload["baseline_config"]["bar_ms"]
+        rows.append(dict(timestamp_ms=tail_stamp, open=100.0, high=101.0,
+                         low=99.0, close=100.0, volume=1.0))
+        materialized = []
+        validate = r.Candle.__post_init__
+
+        def guard(candle):
+            self.assertNotEqual(candle.timestamp_ms, tail_stamp, "barra além do horizonte materializada")
+            materialized.append(candle.timestamp_ms)
+            validate(candle)
+
+        with patch.object(r.Candle, "__post_init__", new=guard):
+            out = r.run_payload(payload)
+        self.assertTrue(materialized)
+        self.assertNotIn(tail_stamp, materialized)
+        self.assertFalse(out["holdout_outcomes_loaded"])
+        self.assertEqual(out["counts"]["holdout_sealed"], 2)
+
+    def test_payload_validates_baseline_before_checking_bar_boundaries(self):
+        payload = self.load("r10a_synthetic_compare.json")
+        payload["baseline_config"]["bar_ms"] = True
+        payload["bars_by_id"]["tr-stop-L"][0]["timestamp_ms"] = "invalid"
+        with self.assertRaisesRegex(ValueError, "bar_ms"):
+            r.run_payload(payload)
 
     def cli(self, *args):
         return subprocess.run([sys.executable, "-B", str(BACKEND / "scripts" / "research_replay.py"), *args],

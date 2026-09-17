@@ -568,10 +568,13 @@ async def _resolve(session, windows) -> None:
                      version=row.version + 1, updated_at=shared["as_of"]))
             if result.rowcount != 1:
                 _stats["resolver_cas_conflicts"] += 1
+    # MAX_SYMBOLS limita janelas de velas, não a assinatura. Os símbolos
+    # sem velas podem ficar antigos indefinidamente; selecionar só os 64
+    # primeiros impediria observar os demais mesmo com memória disponível.
+    # A lista distinta continua limitada pela capacidade da tabela R09.
     wanted = (await session.execute(select(RejectedRow.symbol).where(
         RejectedRow.coverage.notin_(TERMINAL_COVERAGE),
-    ).group_by(RejectedRow.symbol).order_by(func.min(RejectedRow.updated_at))
-        .limit(MAX_SYMBOLS))).scalars().all()
+    ).distinct())).scalars().all()
     staged = {row["symbol"] for row in _pending.values() if row["rejected_at"]}
     _wanted_symbols = set(wanted) | staged
 

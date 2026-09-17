@@ -134,6 +134,11 @@ nenhum dado do holdout. Sem rota mutante nova e sem botão de ativação.
   resolução com admissão lotada, nenhuma órfã, contenção com lock ocupado,
   lock do risco livre, GET sem economia e **todas** as tabelas operacionais
   com contagem inalterada.
+- Regressão de assinatura: mais de 64 símbolos antigos sem velas não impedem
+  a coleta/resolução do próximo símbolo com dados. A assinatura inclui todos
+  os símbolos pendentes (limitados pela capacidade da tabela); `MAX_SYMBOLS=64`
+  continua limitando somente as janelas de velas em memória. O caso falhou
+  antes da correção e passou depois em PostgreSQL local real.
 
 ```sh
 R09_TEST_SOCKET=/tmp/cw-r09-sock.XXXX backend/.venv311/bin/python -B backend/tests/pg_integration_r09.py

@@ -12,7 +12,7 @@ from itertools import islice
 import json
 import math
 import random
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 # O laboratório estrutural do R08A NÃO é importado aqui: o replay de preços
 # também roda no processo live (resolver R09). Só o comparador offline o
@@ -450,7 +450,7 @@ def _paired_ci(pairs: Sequence[tuple[float, float]], config: BootstrapConfig) ->
 
 
 def compare_registered_candidate(opportunities: Sequence[Opportunity],
-                                 bars_by_id: Mapping[str, Sequence[Candle]],
+                                 bars_by_id: Mapping[str, Iterable[Candle]],
                                  baseline_config: ReplayConfig,
                                  candidate: CandidateRegistration,
                                  costs: CostConfig, split: ChronologicalSplit,
@@ -571,6 +571,7 @@ def run_payload(payload: dict) -> dict:
         raise ValueError("oportunidades excedem limite ou formato inválido")
     opportunities = [Opportunity(**row) for row in raw_opportunities]
     split = ChronologicalSplit(**payload["split"])
+    baseline = ReplayConfig(**payload.get("baseline_config", {}))
     raw_bars = payload.get("bars_by_id", {})
     if not isinstance(raw_bars, dict) or len(raw_bars) > MAX_OPPORTUNITIES:
         raise ValueError("bars_by_id inválido")
@@ -586,9 +587,8 @@ def run_payload(payload: dict) -> dict:
             stamp = bar.get("timestamp_ms") if isinstance(bar, dict) else None
             if isinstance(stamp, bool) or not isinstance(stamp, int):
                 raise ValueError("timestamp_ms inteiro obrigatório")
-            if stamp >= split.holdout_start_ms:
+            if stamp >= split.holdout_start_ms or stamp + baseline.bar_ms > split.holdout_start_ms:
                 raise ValueError("payload não pode conter barras do período holdout")
-    baseline = ReplayConfig(**payload.get("baseline_config", {}))
     raw_candidate = dict(payload["candidate"])
     if raw_candidate.get("replay_config") is not None:
         raw_candidate["replay_config"] = ReplayConfig(**raw_candidate["replay_config"])
@@ -601,7 +601,9 @@ def run_payload(payload: dict) -> dict:
             rows = raw_bars[key]
             if len(rows) > baseline.max_bars:
                 raise ValueError("barras excedem limite")
-            return tuple(Candle(**bar) for bar in rows)
+            # O islice do comparador limita também a construção/validação de
+            # Candle, não apenas a leitura de uma tupla já materializada.
+            return (Candle(**bar) for bar in rows)
 
         def __iter__(self):
             return iter(raw_bars)

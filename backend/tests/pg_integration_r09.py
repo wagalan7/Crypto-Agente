@@ -277,6 +277,34 @@ async def run():
     assert (await scalar(select(func.count()).select_from(A))) == attempts_before + 1
     assert obs._stats["persistence_dropped"] == 0, dict(obs._stats)
 
+    # Símbolos antigos sem velas não podem monopolizar a assinatura.
+    starved = [{**deepcopy(rec), "symbol": f"STALE{i}/USDT:USDT",
+                "_snapshot_id": 20000 + i} for i in range(obs.MAX_SYMBOLS + 1)]
+    arriving = {**deepcopy(rec), "symbol": "ARRIVING/USDT:USDT", "_snapshot_id": 30000}
+    obs.begin_batch(starved + [arriving], mode="SHADOW")
+    for item in starved + [arriving]:
+        obs.stage_decision(item, "REJECTED", "score-min")
+    obs.seal_batch(starved + [arriving])
+    arriving_key = obs.opportunity_identity(arriving)[0]
+    await obs.flush_pending()
+    async with db.get_session() as session:
+        await session.execute(update(R).where(R.symbol.in_([r["symbol"] for r in starved]))
+                              .values(updated_at=now - timedelta(days=1)))
+        await session.execute(update(R).where(R.opportunity_key == arriving_key).values(decision_at=past))
+        await obs._resolve(session, {})
+        await session.commit()
+    assert arriving["symbol"] in obs._wanted_symbols, "64 símbolos sem velas bloqueiam os demais"
+    await obs.observe_candles(arriving["symbol"], stop_path, as_of=now)
+    assert arriving["symbol"] in obs._windows
+    await obs.flush_pending()
+    assert (await rejected(arriving_key)).coverage == "RESOLVED"
+    # A assinatura completa não amplia o limite de memória das velas.
+    for item in starved:
+        await obs.observe_candles(item["symbol"], stop_path, as_of=now)
+    assert len(obs._windows) == obs.MAX_SYMBOLS
+    assert obs._stats["candle_symbols_dropped"] == 1
+    obs._windows.clear()
+
     # GET: coleta/cobertura, nunca métricas econômicas.
     report = await obs.get_status(7)
     serialized = json.dumps(report, default=str, allow_nan=False)
@@ -287,7 +315,8 @@ async def run():
     await db._engine.dispose()
     print("R09_PG_INTEGRATION_OK: schema2x, sealed-batch, dedupe, frozen-setup, concurrency, "
           "out-of-order, replay-resolved, terminal-once, invalid-terminal, capacity, "
-          "resolve-at-capacity, contention, lock-isolation, no-economics, isolation")
+          "resolve-at-capacity, contention, lock-isolation, no-symbol-starvation, "
+          "window-cap, no-economics, isolation")
 
 
 if __name__ == "__main__":

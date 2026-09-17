@@ -90,6 +90,11 @@ recusadas), não carrega `.env`, não acessa rede nem banco. Entrada inválida �
 código 2 e mensagem genérica, sem traceback. `compare` recusa chaves
 desconhecidas, barras de ids não declarados, barras para oportunidades do
 holdout e **qualquer** barra com `timestamp_ms ≥ holdout_start_ms`.
+Também recusa barras cuja abertura anteceda o holdout, mas cujo fim
+(`timestamp_ms + baseline_config.bar_ms`) ultrapasse essa fronteira, inclusive
+fora do horizonte de replay. Fim exatamente na fronteira é permitido. Essa
+checagem usa a configuração já validada; a construção de `Candle` é preguiçosa
+e limitada pelo `islice` do comparador, após a purga.
 
 ### Fixtures sintéticas (dados inventados, não mercado)
 
@@ -103,7 +108,7 @@ holdout e **qualquer** barra com `timestamp_ms ≥ holdout_start_ms`.
 
 ## Validação
 
-`backend/tests/test_r10a_offline_replay.py` (47 testes): contratos e tipos;
+`backend/tests/test_r10a_offline_replay.py` (50 testes): contratos e tipos;
 LONG/SHORT simétricos; stop, TP1+TP2, BE só na vela seguinte, trail ATR
 causal nos dois lados; não-preenchimento; entrada intrabar tardia; ambiguidade
 de entrada e de stop/alvo; gap adverso; time-stop e horizonte; lacuna,
@@ -114,7 +119,9 @@ promovido; purga pelo maior horizonte; **sentinela do holdout** (Mapping que
 falha se lido) com controle negativo provando que ela dispara; barras além do
 horizonte não materializadas; barra que cruza fronteira; candidato estrutural
 sem economia; custos compartilhados e hash; bootstrap determinístico; payload
-e CLI (`--manifest`, fixtures, NaN, holdout); isolamento de imports/IO.
+e CLI (`--manifest`, fixtures, NaN, holdout); fronteira pelo fim da barra,
+inclusive além do horizonte, igualdade permitida e sentinela de construção
+preguiçosa no adaptador JSON; isolamento de imports/IO.
 
 ## Limitações
 
