@@ -1933,3 +1933,51 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
 - Histerese, edge decay, sanitização do learning/sizing e demais achados R11A
   não foram corrigidos neste pacote. Nenhuma estratégia, risco ou flag LIVE
   alterada. Arquivos pessoais preservados e fora do commit.
+
+## R11B2 — integridade numérica do aprendizado e do multiplicador (18/09/2026)
+
+- **Base:** `ec5c2fd9`, checkout principal/main (HEAD conferido antes de editar).
+  Alterados: `services/learning_service.py`, `services/symbol_learning_service.py`,
+  `tests/test_r11a_learning_rotation_audit.py` (asserts que caracterizavam os
+  defeitos corrigidos), `docs/R11A_LEARNING_ROTATION_AUDIT.md`. Novos:
+  `tests/test_r11b2_learning_numeric_safety.py`, `docs/R11B2_LEARNING_NUMERIC_SAFETY.md`.
+- **Escopo:** A4, A5 e M2 do R11A mais a origem numérica do A4. Dado válido
+  preserva fórmula, limite, arredondamento e decisão; dado inválido deixa de
+  contribuir — ajustes, bloqueios, multiplicadores e veredictos que antes usavam
+  lixo PODEM mudar. Não se afirma que toda decisão LIVE segue idêntica.
+- **Contrato:** aceita `int`/`float` finitos; recusa `bool`, string numérica,
+  objeto, `None`, NaN e ±inf ANTES de converter, comparar, rankear, somar ou
+  clampar. Zero legítimo continua valendo; `value or 0` saiu das leituras.
+  Contagens inteiras não negativas; confiança/percentil em [0,1]; expiry em
+  [0,100]; `wf_avg_r` pode ser ≤ 0. Resultado derivado também tem de ser finito.
+- **Estatísticas:** um particionador único nos quatro caminhos de leitura, antes
+  de denominadores/buckets/médias/amostra/veredicto, com diagnóstico aditivo
+  conciliável (`total_raw`, `total_valid`, `excluded_total`, `excluded_by_reason`
+  com ausente/tipo/não finito). Grupo sem válidos vira ausência (`None`), não
+  performance zero. Nenhuma query, fonte, janela ou status novo;
+  `_resolved_conditions` intacto; cache mantém chave/TTL/invalidação e erro de
+  banco continua não sendo cacheado.
+- **Size:** `get_size_mult` valida confiança e multiplicador antes do clamp,
+  inclusive em linhas antigas do banco/cache; TF exato inválido é no-op sem
+  fallback; fallback por confiança só entre linhas válidas; limites não finitos
+  ou incoerentes ⇒ no-op. Fallback é sempre 1.0 = camada não aplicada — não é
+  risco zero e não desliga outras proteções. `status()` devolve cópia segura.
+- **Relearn:** linhas inválidas são excluídas antes do ranking e contadas em
+  `skipped_invalid` (separado de `skipped_small`); uma linha ruim não derruba o
+  lote; multiplicador anterior inválido vira `old=None`, sem delta inventado.
+  Upsert/commit/fórmulas preservados e NÃO executados contra banco real.
+- **Exemplos (antes → agora):** mult NaN 1,15 → 1,0; confiança NaN aplicava →
+  no-op; 6 wins + 6 R ausentes n=12/0,5R/promote → n=6/1,0R/amostra pequena;
+  12 perdas + NaN média NaN/neutro → n=12/−1,0R/demote; 30 resolvidos sem R
+  bloqueavam `A_4h` → sem bloqueio; 30 perdas válidas continuam bloqueando;
+  clamps 2,0→1,15 e 0,10→0,75 preservados.
+- **Testes:** 31 do pacote RED (37 falhas + 9 erros) → GREEN; R11A e R11B1
+  verdes; suíte completa **1.917 executados, 1.915 aprovados, 2 skips R05C**
+  históricos por fixture privada ausente. Três falhas finais foram expectativas
+  minhas erradas no teste (confiança com n trocado, cache não invalidado entre
+  leituras da mesma janela e percentis de um universo de 2 moedas), corrigidas
+  no teste. `py_compile` e `git diff --check` aprovados; frontend intacto.
+- **Fora do escopo/pendências:** M3 continua aberto (linha finita antiga segue
+  válida e elegível ao fallback entre timeframes); A2, A3, M1, M4–M8 e B1–B3
+  seguem pendentes. Calibração, score, tier, stop, TP, risco, flags, histerese e
+  edge decay não foram tocados. Sem push, deploy, endpoint, ordem ou mensagem.

@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import bisect
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -80,31 +81,91 @@ def _base_of(symbol: str) -> str:
     return symbol.split("/")[0].strip().upper()
 
 
+# ── R11B2: contrato numérico das linhas aprendidas ──────────────────────────
+# Número inválido nunca vira ranking, multiplicador ou amplificação de risco.
+# O fallback é sempre 1.0 = NÃO aplicar esta camada. Isso não significa risco
+# zero, não garante a segurança da operação e não desliga outras proteções.
+_ELIGIBLE_SMALL, _ELIGIBLE_INVALID = "amostra_pequena", "numerico"
+
+
+def _finite(value) -> Optional[float]:
+    """Número real finito. bool, string (mesmo numérica), objeto e None → None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _count(value, default=None) -> Optional[int]:
+    """Contagem inteira não negativa. Ausente → default legado; bool não conta."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    number = _finite(value)
+    if number is None or number < 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _bounded(value, lo: float, hi: float, default=None) -> Optional[float]:
+    """Número finito dentro de [lo, hi]. Ausente → default legado."""
+    if value is None:
+        return default
+    number = _finite(value)
+    return number if number is not None and lo <= number <= hi else None
+
+
+def _eligible_with_reason(stats):
+    """(métricas, None) ou (None, motivo ∈ {amostra_pequena, numerico})."""
+    if not isinstance(stats, dict):
+        return None, _ELIGIBLE_INVALID
+    n = _count(stats.get("n_trades"), default=0)
+    if n is None:
+        return None, _ELIGIBLE_INVALID
+    wf = _finite(stats.get("wf_avg_r"))
+    if wf is None:
+        # Ausência de edge out-of-sample é inelegibilidade; valor presente e
+        # inválido (string, bool, NaN, ±inf) é rejeição numérica.
+        return None, (_ELIGIBLE_SMALL if stats.get("wf_avg_r") is None else _ELIGIBLE_INVALID)
+    if n < MIN_TRADES:
+        return None, _ELIGIBLE_SMALL
+    # Metadados legados AUSENTES conservam os defaults da fórmula (0), sem
+    # serem apresentados como observação comprovada. Presente e inválido, não.
+    wf_n = _count(stats.get("wf_n_trades"), default=0)
+    expiry = _bounded(stats.get("expiry_pct"), 0.0, 100.0, default=0.0)
+    if wf_n is None or expiry is None:
+        return None, _ELIGIBLE_INVALID
+    calib = _finite(wf * CALIB_FACTOR)
+    if calib is None:
+        return None, _ELIGIBLE_INVALID
+    return {"n": n, "wf": wf, "wf_n": wf_n, "expiry": expiry, "calib": calib}, None
+
+
 def _eligible_metrics(stats: dict) -> Optional[dict]:
     """PURA. Extrai as métricas de histórico se a moeda/TF é elegível (amostra
-    suficiente + edge out-of-sample presente). None → fallback global ao vivo."""
-    n = int(stats.get("n_trades") or 0)
-    wf = stats.get("wf_avg_r")
-    if n < MIN_TRADES or wf is None:
-        return None
-    try:
-        wf = float(wf)
-    except Exception:
-        return None
-    expiry = float(stats.get("expiry_pct") or 0.0)
-    wf_n = int(stats.get("wf_n_trades") or 0)
-    return {"n": n, "wf": wf, "wf_n": wf_n, "expiry": expiry, "calib": wf * CALIB_FACTOR}
+    suficiente + edge out-of-sample presente E numérica). None → fallback."""
+    return _eligible_with_reason(stats)[0]
 
 
-def _mult_from_rank(percentile: float, expiry: float) -> float:
+def _mult_from_rank(percentile: float, expiry: float) -> Optional[float]:
     """PURA. Mapeia a POSIÇÃO RELATIVA da moeda no universo → multiplicador de size.
     Mediana (percentil 0.5) → 1.0; topo → SIZE_MULT_MAX; fundo → SIZE_MULT_MIN.
     Faixa morta em torno da mediana mantém neutro. Penalidade por expiry por cima.
 
     Racional: qualidade é RELATIVA — o backtest só computa moedas com edge positiva,
     então thresholds absolutos só amplificariam. Ancorar na mediana do universo dá à
-    camada as duas mãos: reforça o terço de cima, alivia o de baixo."""
-    d = percentile - 0.5
+    camada as duas mãos: reforça o terço de cima, alivia o de baixo.
+
+    R11B2: entrada fora do domínio ([0,1] e [0,100]) ou resultado não finito ⇒
+    None — a camada não é aplicada em vez de devolver um multiplicador fictício."""
+    rank = _bounded(percentile, 0.0, 1.0)
+    penalty = _bounded(expiry, 0.0, 100.0)
+    if rank is None or penalty is None:
+        return None
+    d = rank - 0.5
     span = max(1e-6, 0.5 - REL_DEADBAND)
     if abs(d) <= REL_DEADBAND:
         m = 1.0
@@ -115,11 +176,12 @@ def _mult_from_rank(percentile: float, expiry: float) -> float:
         frac = min(1.0, (-d - REL_DEADBAND) / span)
         m = 1.0 - frac * (1.0 - SIZE_MULT_MIN)
     # Penalidade por expiry histórico (alvos raramente batidos a tempo).
-    if expiry >= 45:
+    if penalty >= 45:
         m *= 0.85
-    elif expiry >= 30:
+    elif penalty >= 30:
         m *= 0.92
-    return round(max(SIZE_MULT_MIN, min(SIZE_MULT_MAX, m)), 4)
+    clamped = _finite(round(max(SIZE_MULT_MIN, min(SIZE_MULT_MAX, m)), 4))
+    return clamped
 
 
 def derive_params(stats: dict, edge_percentile: float) -> Optional[dict]:
@@ -130,10 +192,14 @@ def derive_params(stats: dict, edge_percentile: float) -> Optional[dict]:
     if em is None:
         return None
     m = _mult_from_rank(edge_percentile, em["expiry"])
+    if m is None:
+        return None
     # Confiança: cresce com amostra total e com o tamanho do braço out-of-sample.
     conf = (min(1.0, em["n"] / 120.0)) * (0.5 + 0.5 * min(1.0, em["wf_n"] / 40.0))
-    conf = round(max(0.0, min(1.0, conf)), 3)
-    return {
+    conf = _bounded(round(max(0.0, min(1.0, conf)), 3), 0.0, 1.0)
+    if conf is None:
+        return None
+    derived = {
         "size_quality_mult": m,
         "confidence": conf,
         "n_trades": em["n"],
@@ -142,6 +208,11 @@ def derive_params(stats: dict, edge_percentile: float) -> Optional[dict]:
         "expiry_pct": round(em["expiry"], 2),
         "calibrated_edge": round(em["calib"], 4),
     }
+    # Saída derivada também precisa ser finita: nunca dicionário meio válido.
+    if any(_finite(derived[field]) is None for field in
+           ("size_quality_mult", "confidence", "wf_avg_r", "expiry_pct", "calibrated_edge")):
+        return None
+    return derived
 
 
 async def relearn_all_from_history() -> dict:
@@ -152,7 +223,7 @@ async def relearn_all_from_history() -> dict:
     from models.symbol_backtest_stats import SymbolBacktestStats
     from models.symbol_learned_params import SymbolLearnedParams
 
-    summary = {"scanned": 0, "learned": 0, "skipped_small": 0, "bases": 0}
+    summary = {"scanned": 0, "learned": 0, "skipped_small": 0, "skipped_invalid": 0, "bases": 0}
     # Rastreia movimento antigo→novo do size_quality_mult por base (pra avisar no
     # Telegram quem subiu/caiu/entrou). Cada base tem 1 upsert (melhor TF).
     changes: list[dict] = []
@@ -170,9 +241,15 @@ async def relearn_all_from_history() -> dict:
             for r in rows:
                 if r.error:
                     continue
-                em = _eligible_metrics(r.to_dict())
+                # R11B2: uma linha numericamente ruim não derruba o lote nem
+                # envenena o ranking — é contada à parte e ignorada.
+                try:
+                    em, reason = _eligible_with_reason(r.to_dict())
+                except Exception:
+                    em, reason = None, _ELIGIBLE_INVALID
                 if em is None:
-                    summary["skipped_small"] += 1
+                    summary["skipped_invalid" if reason == _ELIGIBLE_INVALID
+                            else "skipped_small"] += 1
                     continue
                 base = _base_of(r.symbol)
                 if base not in best or em["calib"] > best[base][0]:
@@ -208,10 +285,11 @@ async def relearn_all_from_history() -> dict:
                     existing = SymbolLearnedParams(base=base, timeframe=tf)
                     session.add(existing)
                 else:
-                    old_mult = existing.size_quality_mult
+                    # Valor anterior inválido não vira delta financeiro inventado.
+                    old_mult = _finite(existing.size_quality_mult)
                 changes.append({
                     "base": base,
-                    "old": (round(float(old_mult), 4) if old_mult is not None else None),
+                    "old": (round(old_mult, 4) if old_mult is not None else None),
                     "new": derived["size_quality_mult"],
                 })
                 existing.size_quality_mult = derived["size_quality_mult"]
@@ -235,7 +313,8 @@ async def relearn_all_from_history() -> dict:
     await refresh_cache()
     log.info(
         f"[symbol-learning] relearn OK: {summary['learned']} moedas aprendidas de "
-        f"{summary['scanned']} linhas ({summary['skipped_small']} amostra pequena)"
+        f"{summary['scanned']} linhas ({summary['skipped_small']} amostra pequena, "
+        f"{summary['skipped_invalid']} numérico inválido)"
     )
 
     # Aviso Telegram: classifica o movimento e manda resumo (no-op se desligado
@@ -290,35 +369,106 @@ async def refresh_cache() -> int:
         return 0
 
 
+def _size_limits():
+    """Limites desta camada. Não finitos ou incoerentes ⇒ no-op (sem consertar ENV)."""
+    lo, hi = _finite(SIZE_MULT_MIN), _finite(SIZE_MULT_MAX)
+    min_conf = _bounded(MIN_CONFIDENCE_APPLY, 0.0, 1.0)
+    if lo is None or hi is None or min_conf is None or not 0.0 < lo <= hi:
+        return None
+    return lo, hi, min_conf
+
+
+#: Metadados opcionais: ausentes em linha legada é OK; presentes e inválidos não.
+_OPTIONAL_METADATA = (("n_trades", "count"), ("wf_n_trades", "count"),
+                      ("wf_avg_r", "finite"), ("calibrated_edge", "finite"),
+                      ("expiry_pct", "percent"))
+
+
+def _checked_field(value, kind: str):
+    if kind == "count":
+        return _count(value)
+    if kind == "percent":
+        return _bounded(value, 0.0, 100.0)
+    if kind == "unit":
+        return _bounded(value, 0.0, 1.0)
+    return _finite(value)
+
+
+def _row_numbers(row):
+    """(mult, confiança) de uma linha aprendida íntegra; None se algo não fecha."""
+    if not isinstance(row, dict):
+        return None
+    mult = _finite(row.get("size_quality_mult"))
+    conf = _bounded(row.get("confidence"), 0.0, 1.0)
+    if mult is None or mult <= 0.0 or conf is None:
+        return None
+    for field, kind in _OPTIONAL_METADATA:
+        value = row.get(field)
+        if value is not None and _checked_field(value, kind) is None:
+            return None
+    return mult, conf
+
+
 def get_size_mult(symbol_or_base: str, timeframe: Optional[str] = None) -> tuple[float, str]:
     """SÍNCRONO. Multiplicador de size aprendido pra (base, tf). Ordem de resolução:
     (base, tf exato) → melhor tf da base → 1.0. Respeita a flag mestre e a confiança
-    mínima. NO-OP-SAFE: flag OFF, cache vazio ou confiança baixa → (1.0, motivo)."""
+    mínima. NO-OP-SAFE: flag OFF, cache vazio ou confiança baixa → (1.0, motivo).
+
+    R11B2: valida os números ANTES do clamp, inclusive em linhas antigas do DB
+    ou injetadas no cache. Inválido ⇒ (1.0, motivo) = camada não aplicada."""
     if not SYMBOL_LEARNING_SIZE_ENABLED:
         return 1.0, "off"
+    limits = _size_limits()
+    if limits is None:
+        return 1.0, "limites de size inválidos"
+    lo, hi, min_conf = limits
     base = _base_of(symbol_or_base) if "/" in (symbol_or_base or "") else (symbol_or_base or "").strip().upper()
     by_tf = _CACHE.get(base)
     if not by_tf:
         return 1.0, "sem histórico aprendido"
 
-    row = None
     if timeframe and timeframe in by_tf:
+        # TF exato inválido é no-op: não se troca de TF para contornar a invalidez.
         row = by_tf[timeframe]
+        numbers = _row_numbers(row)
+        if numbers is None:
+            return 1.0, "linha aprendida inválida"
     else:
-        # Melhor linha da base (maior confiança).
-        row = max(by_tf.values(), key=lambda x: x.get("confidence") or 0.0)
+        # Fallback preexistente (maior confiança), agora só entre linhas válidas;
+        # `max` mantém a primeira em caso de empate, como antes.
+        candidates = [(candidate, _row_numbers(candidate)) for candidate in by_tf.values()]
+        candidates = [item for item in candidates if item[1] is not None]
+        if not candidates:
+            return 1.0, "sem linha aprendida válida"
+        row, numbers = max(candidates, key=lambda item: item[1][1])
+    mult, conf = numbers
 
-    conf = float(row.get("confidence") or 0.0)
-    if conf < MIN_CONFIDENCE_APPLY:
-        return 1.0, f"confiança {conf:.2f} < {MIN_CONFIDENCE_APPLY:.2f}"
-    mult = float(row.get("size_quality_mult") or 1.0)
-    mult = round(max(SIZE_MULT_MIN, min(SIZE_MULT_MAX, mult)), 4)
+    if conf < min_conf:
+        return 1.0, f"confiança {conf:.2f} < {min_conf:.2f}"
+    mult = round(max(lo, min(hi, mult)), 4)
     if abs(mult - 1.0) < 1e-9:
         return 1.0, "neutro"
     return mult, (
         f"hist {row.get('timeframe')} calib={row.get('calibrated_edge')} "
         f"conf={conf:.2f}→×{mult:.2f}"
     )
+
+
+def _safe_status_row(row: dict) -> dict:
+    """Cópia SEGURA para exibição: campo inválido → None + diagnóstico.
+    Não altera modelo, banco nem cache."""
+    safe = dict(row) if isinstance(row, dict) else {}
+    invalid = []
+    for field, kind in (("size_quality_mult", "finite"), ("confidence", "unit"),
+                        *_OPTIONAL_METADATA):
+        value = safe.get(field)
+        if value is None:
+            continue
+        if _checked_field(value, kind) is None:
+            safe[field] = None
+            invalid.append(field)
+    safe["invalid_fields"] = invalid
+    return safe
 
 
 async def status() -> dict:
@@ -344,7 +494,8 @@ async def status() -> dict:
                 )
             )).scalars().all()
         out["count"] = len(rows)
-        out["learned"] = [r.to_dict() for r in rows]
+        out["learned"] = [_safe_status_row(r.to_dict()) for r in rows]
+        out["invalid_rows"] = sum(1 for r in out["learned"] if r["invalid_fields"])
     except Exception as e:
         log.warning(f"[symbol-learning] status falhou: {e}")
     return out

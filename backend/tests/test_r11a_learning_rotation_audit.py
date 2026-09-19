@@ -150,22 +150,30 @@ class LearningService(AuditCase):
         with patch.object(ls, "DB_ENABLED", True), patch.object(ls, "get_session", factory):
             return await ls.compute_symbol_stats(days=days), session
 
-    async def test_L1_none_realized_r_counts_as_zero_in_sample_and_as_loss(self):
+    async def test_L1_unknown_r_is_excluded_after_r11b2(self):
+        """CORRIGIDO no R11B2 (A5/M2). ANTES: 12 trades, 6 "derrotas" de R
+        ausente, média 0,5R e amostra mínima completada → veredicto promote.
+        AGORA: só a evidência utilizável entra, e a qualidade é reportada."""
         rows = [snap(r=1.0)] * 6 + [snap(r=None)] * 6
         stats, _ = await self.symbol_stats(rows)
         btc = stats["BTC"]
-        self.assertEqual((btc["trades"], btc["wins"], btc["losses"]), (12, 6, 6))
-        self.assertEqual(btc["avg_r"], 0.5)           # 6/12, não 6/6
-        self.assertTrue(btc["sample_ok"])             # amostra completada por R desconhecido
-        self.assertEqual(btc["verdict"], "promote")
+        self.assertEqual((btc["trades"], btc["wins"], btc["losses"]), (6, 6, 0))
+        self.assertEqual(btc["avg_r"], 1.0)
+        self.assertFalse(btc["sample_ok"])
+        self.assertEqual(btc["verdict"], "amostra_pequena")
+        self.assertEqual(btc["data_quality"]["excluded_by_reason"]["ausente"], 6)
 
-    async def test_L2_non_finite_r_neutralizes_verdict(self):
-        rows = [snap(r=-1.0)] * 11 + [snap(r=float("nan"))]
+    async def test_L2_non_finite_r_no_longer_neutralises_verdict(self):
+        """CORRIGIDO no R11B2 (M2). ANTES: um NaN tornava a média não finita,
+        o veredicto virava "neutro" (um símbolo a −1R não era rebaixado) e o
+        JSON não serializava. AGORA: o NaN sai da amostra e o resto é julgado."""
+        rows = [snap(r=-1.0)] * 12 + [snap(r=float("nan"))]
         stats, _ = await self.symbol_stats(rows)
-        self.assertTrue(math.isnan(stats["BTC"]["avg_r"]))
-        self.assertEqual(stats["BTC"]["verdict"], "neutro")   # -1R sustentado não é "demote"
-        with self.assertRaises(ValueError):
-            json.dumps(stats, allow_nan=False)
+        self.assertEqual(stats["BTC"]["trades"], 12)
+        self.assertEqual(stats["BTC"]["avg_r"], -1.0)
+        self.assertEqual(stats["BTC"]["verdict"], "demote")
+        self.assertEqual(stats["BTC"]["data_quality"]["excluded_by_reason"]["nao_finito"], 1)
+        json.dumps(stats, allow_nan=False)
 
     async def test_L3_status_and_time_window(self):
         conds = ls._resolved_conditions(0)
@@ -201,19 +209,23 @@ class LearningService(AuditCase):
         with patch.object(ls, "DB_ENABLED", True), patch.object(ls, "get_session", factory):
             return await ls.compute_stats_by_bucket(days=0)
 
-    async def test_L6_unknown_r_lowers_win_rate_and_can_block_a_live_bucket(self):
+    async def test_L6_unknown_r_no_longer_blocks_a_live_bucket(self):
+        """CORRIGIDO no R11B2 (A5). ANTES: 30 resolvidos sem R davam WR 0% em
+        A_4h, o bucket era bloqueado e toda rec dele era descartada (score 0).
+        AGORA: sem evidência utilizável não há bucket, bloqueio nem descarte."""
         stats = await self.bucket_stats([snap(r=None) for _ in range(30)])
-        self.assertEqual(stats["by_tier_timeframe"]["A_4h"]["win_rate"], 0.0)
+        self.assertEqual(stats["total_trades"], 0)
+        self.assertEqual(stats.get("by_tier_timeframe", {}), {})
+        self.assertEqual(stats["data_quality"]["excluded_by_reason"]["ausente"], 30)
         with patch.object(ls, "compute_stats_by_bucket", AsyncMock(return_value=stats)), \
                 patch.object(ls, "AUTO_BLOCK_ENABLED", True), patch.object(ls, "AUTO_ADJUST_ENABLED", True), \
                 patch.object(ls, "MIN_SAMPLE_BLOCK", 30), patch.object(ls, "BLOCK_WR_MAX", 30.0):
             adj = await ls.compute_auto_adjustments()
-        self.assertIn({"category": "tier_tf", "key": "A_4h"},
-                      [{k: b[k] for k in ("category", "key")} for b in adj["blocked_buckets"]])
+        self.assertEqual(adj["blocked_buckets"], [])
         sig = NS(timeframe="4h", timestamp=None, patterns=[], derivatives=None)
         res = ls.apply_score_adjustment(sig, 80.0, adj, tier_provisional="A")
-        self.assertTrue(res["blocked"])
-        self.assertEqual(res["score"], 0.0)
+        self.assertFalse(res["blocked"])
+        self.assertEqual(res["score"], 80.0)
 
     async def test_L7_adjustment_bands_and_dormant_label(self):
         def bucket(n, wr):
@@ -281,14 +293,16 @@ class LearningService(AuditCase):
 
 # ── S: symbol_learning_service ──────────────────────────────────────────────
 class SymbolLearning(AuditCase):
-    def test_S2_eligibility_accepts_nan_and_bool(self):
+    def test_S2_eligibility_rejects_nan_and_bool_after_r11b2(self):
+        """CORRIGIDO no R11B2 (origem de A4). ANTES: `"nan"` virava float NaN e
+        `True` virava 1.0, entrando no ranking e na edge calibrada. AGORA: os
+        dois são inelegíveis e a derivação devolve None, não dicionário sujo."""
         self.assertIsNone(sls._eligible_metrics({"n_trades": 29, "wf_avg_r": 0.5}))
         self.assertIsNone(sls._eligible_metrics({"n_trades": 40, "wf_avg_r": None}))
-        nan = sls._eligible_metrics({"n_trades": 40, "wf_avg_r": "nan"})
-        self.assertTrue(math.isnan(nan["calib"]))
-        self.assertEqual(sls._eligible_metrics({"n_trades": 40, "wf_avg_r": True})["wf"], 1.0)
-        derived = sls.derive_params({"n_trades": 40, "wf_avg_r": "nan"}, 0.5)
-        self.assertTrue(math.isnan(derived["calibrated_edge"]))
+        self.assertIsNone(sls._eligible_metrics({"n_trades": 40, "wf_avg_r": "nan"}))
+        self.assertIsNone(sls._eligible_metrics({"n_trades": 40, "wf_avg_r": True}))
+        self.assertIsNone(sls.derive_params({"n_trades": 40, "wf_avg_r": "nan"}, 0.5))
+        self.assertEqual(sls._eligible_metrics({"n_trades": 40, "wf_avg_r": 0.5})["wf"], 0.5)
 
     def test_S3_rank_mapping_and_expiry_penalty(self):
         with patch.multiple(sls, SIZE_MULT_MIN=0.75, SIZE_MULT_MAX=1.15, REL_DEADBAND=0.10):
@@ -319,9 +333,15 @@ class SymbolLearning(AuditCase):
             self.assertEqual(sls.get_size_mult("AAA/USDT:USDT", "15m")[0], 0.8)   # outro TF (maior confiança)
             self.assertEqual(sls.get_size_mult("AAA/USDT:USDT", None)[0], 0.8)
             self.assertEqual(sls.get_size_mult("LOW/USDT:USDT", "4h")[0], 1.0)
-            self.assertEqual(sls.get_size_mult("ZERO/USDT:USDT", "4h"), (1.0, "neutro"))
-            self.assertEqual(sls.get_size_mult("NANM/USDT:USDT", "4h")[0], 1.15)   # NaN → teto
-            self.assertEqual(sls.get_size_mult("NANC/USDT:USDT", "4h")[0], 0.8)    # conf NaN aplica
+            # CORRIGIDO no R11B2 (A4). ANTES: mult 0.0 era tratado como 1.0
+            # "neutro", NaN no multiplicador virava o TETO 1.15 (amplificava a
+            # mão) e confiança NaN passava no corte mínimo. AGORA: no-op.
+            self.assertEqual(sls.get_size_mult("ZERO/USDT:USDT", "4h"),
+                             (1.0, "linha aprendida inválida"))
+            self.assertEqual(sls.get_size_mult("NANM/USDT:USDT", "4h"),
+                             (1.0, "linha aprendida inválida"))
+            self.assertEqual(sls.get_size_mult("NANC/USDT:USDT", "4h"),
+                             (1.0, "linha aprendida inválida"))
             self.assertEqual(sls.get_size_mult("AAAUSDT", "4h")[0], 1.0)           # formato sem "/"
             self.assertEqual(sls.get_size_mult("AAA", "4h")[0], 1.1)
         with patch.object(sls, "_CACHE", cache), patch.object(sls, "SYMBOL_LEARNING_SIZE_ENABLED", False):
@@ -692,6 +712,8 @@ class Wiring(unittest.TestCase):
             self.assertIn("≥15 trades", agents.read_text())
 
     def test_audited_services_untouched(self):
+        """R11B2 corrigiu A4/A5/M2 nos dois serviços de aprendizado. Edge decay
+        e rotação seguem intactos: A2, A3, M3 e demais achados continuam abertos."""
         res = subprocess.run(["git", "diff", "--name-only", "51c992c2", "--",
                               "backend/services/learning_service.py",
                               "backend/services/symbol_learning_service.py",
@@ -700,7 +722,9 @@ class Wiring(unittest.TestCase):
                              cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
             self.skipTest("baseline 51c992c2 indisponível neste checkout")
-        self.assertEqual(res.stdout.strip(), "")
+        self.assertEqual(sorted(res.stdout.split()),
+                         ["backend/services/learning_service.py",
+                          "backend/services/symbol_learning_service.py"])
 
     def test_no_network(self):
         self.assertEqual(_NET, [])

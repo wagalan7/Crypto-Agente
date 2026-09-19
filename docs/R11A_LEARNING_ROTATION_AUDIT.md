@@ -68,11 +68,29 @@ decay" → **sem corte**. A proteção é não monotônica no pior caso.
 o efeito é aumentar a mão.
 **R11B:** validar finitude antes do clamp; não finito → 1,0.
 
+**Acompanhamento R11B2 — 2026-09-18:** corrigido no acessor e na origem.
+`get_size_mult` valida confiança finita em [0,1] e multiplicador finito
+positivo ANTES do clamp; inválido, ausente, zero ou negativo ⇒ `(1.0, motivo)`.
+TF exato inválido é no-op (não se troca de TF para contornar), e o fallback por
+confiança só considera linhas válidas. Metadado opcional presente e inválido
+desqualifica a linha; ausente em linha legada, não. Limites não finitos ou
+incoerentes ⇒ no-op. Na origem, `_eligible_metrics`/`derive_params` recusam
+`"nan"`, `True`, contagem fracionária e percentil fora de [0,1]. Clamps,
+fórmula e arredondamento dos dados válidos ficaram idênticos.
+
 ### A5 · `realized_r` desconhecido pode bloquear um bucket LIVE — A, confirmado (`L6`)
 `realized_r=None` entra como 0 e não conta como vitória: 30 snapshots
 resolvidos sem R dão WR 0% e bloqueiam `A_4h`; toda rec do bucket é
 descartada. Não verifiquei se isso ocorre hoje em produção.
 **R11B:** excluir R desconhecido da amostra e expor a contagem.
+
+**Acompanhamento R11B2 — 2026-09-18:** corrigido. Um particionador único
+remove o R inválido nos quatro caminhos de leitura antes de denominador,
+bucket, média, amostra e veredicto, e publica `data_quality` conciliável
+(`total_raw`, `total_valid`, `excluded_total`, `excluded_by_reason`).
+30 resolvidos sem R deixam de virar WR 0% e não bloqueiam mais o bucket;
+30 perdas válidas continuam bloqueando. `compute_auto_adjustments` também
+ignora bucket com `n`/WR inválidos (contados em `invalid_buckets`).
 
 ### M1 · Sessão/dia aprendidos e aplicados em relógios diferentes — M, confirmado (`L9`)
 As estatísticas usam `features.hour_utc` = hora de **criação do snapshot**;
@@ -87,6 +105,15 @@ média não finita, o veredicto vira "neutro" (um símbolo a −1R sustentado
 **não** é rebaixado) e o JSON deixa de ser serializável com `allow_nan=False`.
 **R11B:** sanitizar a leitura e separar "sem R" de "R zero".
 
+**Acompanhamento R11B2 — 2026-09-18:** corrigido em `compute_symbol_stats`.
+6 vitórias + 6 R ausentes passam de n=12/0,5R/promote para n=6/1,0R/amostra
+pequena; 12 perdas + 1 NaN passam de média não finita e veredicto "neutro"
+para n=12, −1,0R e **demote** pelo critério existente. Grupo sem evidência
+utilizável devolve `trades=0` com médias `None` (ausência, não zero) e
+qualidade dentro do próprio stat — nunca uma chave global. O zero REALMENTE
+registrado continua na amostra. O plano de rotação pode mudar onde a evidência
+era inválida; algoritmo, histerese, allowlist e liquidez não foram tocados.
+
 ### M3 · Linhas aprendidas ficam obsoletas — M, confirmado (`S7`)
 `relearn_all_from_history` faz upsert só do **melhor TF** por base. Linhas de
 outros TFs e de bases que ficaram inelegíveis continuam na tabela e no cache,
@@ -94,6 +121,11 @@ e `get_size_mult` ainda as usa (inclusive o fallback "melhor TF por
 confiança", que aplica a edge de um timeframe diferente).
 **R11B:** expirar/marcar linhas não reaprendidas e decidir explicitamente se o
 fallback entre timeframes é desejado.
+
+**Status após R11B2 — AINDA ABERTO.** O pacote passou a recusar linhas
+numericamente inválidas (inclusive no fallback), mas uma linha **finita e
+antiga** continua válida, continua no cache e continua elegível ao fallback
+entre timeframes, que não foi alterado.
 
 ### M4 · Direção inválida conta em dobro no edge decay — M, confirmado (`E5`)
 Linhas com direção fora de {long, short} são acumuladas duas vezes na chave
@@ -142,9 +174,11 @@ inclui `expired` e exige `realized_r` não nulo. Ambos usam SHADOW/papel —
 1. A1 (autenticação) — corrigido no acompanhamento R11B1 acima.
 2. A2 + M5 (unidade da histerese e fonte do universo).
 3. A3 (janela do edge decay) antes de a flag ser ligada em produção.
-4. A4/A5/M2 (dados não finitos e R desconhecido).
+4. A4/A5/M2 (dados não finitos e R desconhecido) — corrigidos no R11B2.
 5. M1/M3/M4/M6/M7 e depois B1–B3.
 
-O pacote original R11A não corrigiu políticas. No acompanhamento R11B1,
-somente A1 foi corrigido; os demais achados continuam pendentes. Nenhum item
-acima demonstra, por si, redução de stops ou aumento de lucro.
+O pacote original R11A não corrigiu políticas. Nos acompanhamentos, R11B1
+corrigiu A1 e R11B2 corrigiu A4, A5 e M2 (detalhes em
+`R11B2_LEARNING_NUMERIC_SAFETY.md`); os demais achados, incluindo A2, A3 e M3,
+continuam pendentes. Nenhum item acima demonstra, por si, redução de stops ou
+aumento de lucro.

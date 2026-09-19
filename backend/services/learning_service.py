@@ -14,6 +14,7 @@ Ativar quando houver >= 50 trades por bucket.
 """
 from __future__ import annotations
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -120,6 +121,63 @@ def _dow_name(dow: int) -> str:
     return ["Seg", "Ter", "Qua", "Qui", "Sex", "Sab", "Dom"][dow] if 0 <= dow <= 6 else "?"
 
 
+# ── R11B2: contrato numérico do R realizado ─────────────────────────────────
+# Resultado DESCONHECIDO não é zero: não completa amostra, não dilui média,
+# não vira derrota e não bloqueia bucket. Zero REALMENTE registrado continua
+# valendo. Motivos fechados; nenhuma linha individual é exposta.
+R_MISSING, R_TYPE, R_NOT_FINITE = "ausente", "tipo_invalido", "nao_finito"
+
+
+def _valid_r(value):
+    """(número finito, None) quando o R é utilizável; (None, motivo) caso contrário."""
+    if value is None:
+        return None, R_MISSING
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, R_TYPE
+    number = float(value)
+    if not math.isfinite(number):
+        return None, R_NOT_FINITE
+    return number, None
+
+
+def _empty_quality() -> Dict[str, Any]:
+    return {"total_raw": 0, "total_valid": 0, "excluded_total": 0,
+            "excluded_by_reason": {R_MISSING: 0, R_TYPE: 0, R_NOT_FINITE: 0}}
+
+
+def _partition_r(snaps):
+    """Separa (snapshot, r) utilizáveis e conta cada linha excluída UMA vez."""
+    valid, quality = [], _empty_quality()
+    for snap in snaps:
+        quality["total_raw"] += 1
+        number, reason = _valid_r(getattr(snap, "realized_r", None))
+        if reason is None:
+            valid.append((snap, number))
+            quality["total_valid"] += 1
+        else:
+            quality["excluded_total"] += 1
+            quality["excluded_by_reason"][reason] += 1
+    return valid, quality
+
+
+def _valid_count(value):
+    """Contagem inteira não negativa. Bool não é contagem; float integral normaliza."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    number = float(value)
+    return int(number) if math.isfinite(number) and number >= 0 and number.is_integer() else None
+
+
+def _valid_rate(value):
+    """Taxa de acerto em pontos percentuais [0, 100]."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and 0.0 <= number <= 100.0 else None
+
+
 async def compute_stats_by_bucket(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[str, Any]:
     """
     Agrupa trades resolvidos em vários buckets. Se days <= 0 usa TODO o
@@ -138,10 +196,12 @@ async def compute_stats_by_bucket(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[st
         stmt = select(RecommendationSnapshot).where(and_(*_resolved_conditions(days)))
         snaps = (await session.execute(stmt)).scalars().all()
 
-    total = len(snaps)
+    # R11B2: R inválido sai ANTES de denominador, bucket, média e veredicto.
+    valid, quality = _partition_r(snaps)
+    total = len(valid)
     if total == 0:
         result = {
-            "enabled": True, "total_trades": 0, "days": days,
+            "enabled": True, "total_trades": 0, "days": days, "data_quality": quality,
             "message": "Sem trades resolvidos ainda. Aguarde recomendações fecharem (~horas a dias)."
         }
         _cache[cache_key] = {"ts": now, "data": result}
@@ -158,8 +218,7 @@ async def compute_stats_by_bucket(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[st
     by_funding = defaultdict(_empty_stat)
     by_symbol = defaultdict(_empty_stat)
 
-    for s in snaps:
-        r = s.realized_r if s.realized_r is not None else 0
+    for s, r in valid:
         feats = s.features or {}
 
         _update_stat(by_tier[s.tier], r)
@@ -231,13 +290,14 @@ async def compute_stats_by_bucket(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[st
     )[:8]
 
     # ── Edge total do sistema ────────────────────────────────────────────
-    total_r = sum(s.realized_r or 0 for s in snaps)
-    overall_win_rate = sum(1 for s in snaps if (s.realized_r or 0) > 0) / total * 100
+    total_r = sum(r for _, r in valid)
+    overall_win_rate = sum(1 for _, r in valid if r > 0) / total * 100
 
     result = {
         "enabled": True,
         "days": days,
         "total_trades": total,
+        "data_quality": quality,
         "overall": {
             "win_rate_pct": round(overall_win_rate, 1),
             "total_r": round(total_r, 2),
@@ -290,13 +350,14 @@ async def lookup_historical_for(
         )
         snaps = (await session.execute(stmt)).scalars().all()
 
-    if not snaps:
+    valid, quality = _partition_r(snaps)
+    if not valid:
         return {"trades": 0, "win_rate": None, "avg_r": None,
-                "sample_ok": False, "verdict": "sem_historico"}
+                "sample_ok": False, "verdict": "sem_historico", "data_quality": quality}
 
-    wins = sum(1 for s in snaps if (s.realized_r or 0) > 0)
-    total_r = sum(s.realized_r or 0 for s in snaps)
-    n = len(snaps)
+    wins = sum(1 for _, r in valid if r > 0)
+    total_r = sum(r for _, r in valid)
+    n = len(valid)
     wr = wins / n * 100
     avg_r = total_r / n
 
@@ -317,6 +378,7 @@ async def lookup_historical_for(
         "avg_r": round(avg_r, 2),
         "sample_ok": n >= MIN_SAMPLE_BUCKET,
         "verdict": verdict,
+        "data_quality": quality,
     }
 
 
@@ -334,20 +396,22 @@ async def lookup_historical_batch(
         stmt = select(RecommendationSnapshot).where(and_(*_resolved_conditions(days)))
         snaps = (await session.execute(stmt)).scalars().all()
 
-    # Indexa por (tier, tf, dir)
+    # Indexa por (tier, tf, dir); a partição do R acontece por GRUPO pedido.
     by_key = defaultdict(list)
     for s in snaps:
         k = f"{s.tier}_{s.timeframe}_{s.direction}"
-        by_key[k].append(s.realized_r or 0)
+        by_key[k].append(s)
 
     result = {}
     for k_obj in keys:
         k = f"{k_obj['tier']}_{k_obj['timeframe']}_{k_obj['direction']}"
-        rs = by_key.get(k, [])
+        valid, quality = _partition_r(by_key.get(k, []))
+        rs = [r for _, r in valid]
         n = len(rs)
         if n == 0:
             result[k] = {"trades": 0, "win_rate": None, "avg_r": None,
-                         "sample_ok": False, "verdict": "sem_historico"}
+                         "sample_ok": False, "verdict": "sem_historico",
+                         "data_quality": quality}
             continue
         wins = sum(1 for r in rs if r > 0)
         wr = wins / n * 100
@@ -364,6 +428,7 @@ async def lookup_historical_batch(
             "trades": n, "wins": wins, "losses": n - wins,
             "win_rate": round(wr, 1), "avg_r": round(avg_r, 2),
             "sample_ok": n >= MIN_SAMPLE_BUCKET, "verdict": verdict,
+            "data_quality": quality,
         }
     return result
 
@@ -407,14 +472,26 @@ async def compute_symbol_stats(
     for s in snaps:
         base = _base_symbol(s.symbol)
         if base:
-            by_sym[base].append(s.realized_r or 0)
+            by_sym[base].append(s)
 
     result: Dict[str, Dict[str, Any]] = {}
-    for base, rs in by_sym.items():
+    for base, rows in by_sym.items():
+        # R11B2: a qualidade fica DENTRO do stat da moeda — nunca uma chave
+        # global que a rotação confundiria com um símbolo.
+        valid, quality = _partition_r(rows)
+        rs = [r for _, r in valid]
         n = len(rs)
+        if n == 0:
+            # Sem evidência utilizável: ausência, não performance zero.
+            result[base] = {
+                "trades": 0, "wins": 0, "losses": 0, "win_rate": None,
+                "avg_r": None, "total_r": None, "sample_ok": False,
+                "verdict": "amostra_pequena", "data_quality": quality,
+            }
+            continue
         wins = sum(1 for r in rs if r > 0)
-        wr = wins / n * 100 if n else 0.0
-        avg_r = sum(rs) / n if n else 0.0
+        wr = wins / n * 100
+        avg_r = sum(rs) / n
         sample_ok = n >= ROTATION_MIN_SAMPLE
         if not sample_ok:
             verdict = "amostra_pequena"
@@ -433,6 +510,7 @@ async def compute_symbol_stats(
             "total_r": round(sum(rs), 2),
             "sample_ok": sample_ok,
             "verdict": verdict,
+            "data_quality": quality,
         }
     return result
 
@@ -507,10 +585,17 @@ async def compute_auto_adjustments(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[s
         "funding": "by_funding",
     }
 
+    invalid_buckets = 0
     for category, field in category_to_field.items():
-        for key, stat in stats.get(field, {}).items():
-            n = stat["trades"]
-            wr = stat["win_rate"]
+        for key, stat in (stats.get(field) or {}).items():
+            # R11B2: estatística com n/WR inválidos (inclusive injetada por
+            # cache ou teste) não vira boost nem block.
+            stat = stat if isinstance(stat, dict) else {}
+            n = _valid_count(stat.get("trades"))
+            wr = _valid_rate(stat.get("win_rate"))
+            if n is None or wr is None:
+                invalid_buckets += 1
+                continue
 
             # Auto-block tem prioridade — bucket catastrófico nunca contribui pro multiplicador
             if AUTO_BLOCK_ENABLED and n >= MIN_SAMPLE_BLOCK and wr <= BLOCK_WR_MAX:
@@ -549,6 +634,8 @@ async def compute_auto_adjustments(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[s
         "blocked_buckets": blocked,
         "active_buckets": active,
         "dormant_buckets": dormant,
+        "invalid_buckets": invalid_buckets,
+        "data_quality": stats.get("data_quality"),
         "total_trades": total_trades,
         "thresholds": {
             "min_sample_adjust": MIN_SAMPLE_ADJUST,
