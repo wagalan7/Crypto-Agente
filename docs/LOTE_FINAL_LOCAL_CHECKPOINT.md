@@ -14,9 +14,44 @@ primeiro bloco que não estiver `LOCAL_VERIFIED`. Não reiniciar blocos prontos.
 | C · R11 política robusta | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativa) | `services/robust_policy_service.py`, `tests/test_lote_r11c_robust_policy.py`, `docs/R11A_LEARNING_ROTATION_AUDIT.md` | 32 herméticos + R11A/R11B2 preservados | `1e8eec4e` (+ `02c578b4`, escopo R11B2) | Persistência da progressão e ligação com rotação ficam para o bloco G (simulação) |
 | D · R07+R08 estratégias | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/strategy_core_service.py`, `services/score_v3_service.py`, `tests/test_lote_d_strategy_core.py`, `tests/test_lote_d_score_v3.py` | 53 + 35 herméticos; paridade do laboratório V2 do R08A | `154411d9` | Ligar núcleo ao replay é o bloco F; evidência pré-seleção é o bloco E |
 | E · R09 evidência | `LOCAL_VERIFIED` | `OBSERVATION_ONLY` (coleta desligada) | `services/preselection_observation_service.py`, `tests/test_lote_e_preselection.py` | 36 herméticos + R09/R10A/R10B preservados (137) | `da607ea0` | Exposição do resumo em endpoint existente fica no bloco H |
-| F · R10 replay/walk-forward | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/research_dataset_scopes.py`, `services/research_dataset_service.py` (escopo), `services/portfolio_replay_service.py`, `services/walk_forward_service.py`, `tests/test_lote_f_dataset_scopes.py`, `tests/test_lote_f_portfolio_walk_forward.py`, `tests/test_r10a_offline_replay.py` (lista de importadores) | 17 + 47 herméticos; R09/R10A/R10B preservados (325 no conjunto) | `ee0f5ebd` + `<F>` | Carteira consome oportunidades já formadas; ligar o núcleo D ao replay ponta a ponta é trabalho do bloco G/H |
-| G · R12 simulação/go-no-go | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Tipo de experimento pré-seleção sobre `StrategyExperiment` |
+| F · R10 replay/walk-forward | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/research_dataset_scopes.py`, `services/research_dataset_service.py` (escopo), `services/portfolio_replay_service.py`, `services/walk_forward_service.py`, `tests/test_lote_f_dataset_scopes.py`, `tests/test_lote_f_portfolio_walk_forward.py`, `tests/test_r10a_offline_replay.py` (lista de importadores) | 17 + 47 herméticos; R09/R10A/R10B preservados (325 no conjunto) | `ee0f5ebd` + `113fe67c` | Carteira consome oportunidades já formadas; ligar o núcleo D ao replay ponta a ponta é trabalho do bloco G/H |
+| G · R12 simulação/go-no-go | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/preselection_experiment_service.py`, `tests/test_lote_g_preselection_experiment.py` | 36 herméticos; P05/P05.1 preservados | `<G>` | Coleta prospectiva e canário dependem de autorização humana — fora deste lote |
 | H · Integração/documentação | `NOT_STARTED` | — | — | — | — | Resumo em endpoint existente, docs e suíte completa |
+
+## Bloco G — detalhe (concluído)
+
+Tipo de experimento PRÉ-SELEÇÃO versionado gravado dentro de `candidate_config`
+do `StrategyExperiment` que já existe: sem segundo catálogo, bus ou painel de
+promoção, sem DDL. Config legada continua sendo pós-seleção, e os contratos NÃO
+são intercambiáveis — o comparador de um tipo recusa o outro, porque as
+populações são diferentes. `P051_ANALYTICS_ONLY` e os demais bloqueios antigos
+seguem valendo; nada foi liberado como efeito colateral.
+
+Exclusividade: um challenger prospectivo no ciclo oficial (o índice único de
+`SHADOW` continua sendo a garantia final), demais candidatos sequenciais no
+laboratório; repetir a chamada é idempotente e o ciclo de vida não tem salto nem
+reabertura. Baseline, candidato, config, custos e proteções são congelados com
+hash. Drift de champion, mudança de config, incidente P03 aberto ou cobertura
+insuficiente impedem avançar — e o incidente NUNCA é limpo para o teste passar.
+A/A com a mesma configuração dos dois lados tem de dar diferença nula.
+
+Gate go/no-go congelado com hash: 100 trades shadow no total, 30 por playbook
+habilitado, 14 dias corridos, 10 dias úteis, 90% de cobertura — e, além da
+amostra, EV líquido, incerteza, drawdown, estabilidade, falhas operacionais,
+zero duplicata econômica, nenhuma falha de proteção em aberto, nenhuma lacuna
+essencial e discrepância de fidelidade dentro do teto. Ausência não vira zero:
+evidência vazia é NO_GO. Passar no gate mantém `live_approval=UNAVAILABLE`.
+
+Canário: manifest com versão, diff, evidência, critérios, pré-condições,
+responsáveis e rollback — `applied=False`, sem endpoint de aplicação. Teto do
+projeto não autoriza subir o vigente: vale o menor dos dois, e proposta acima do
+vigente é recusada. Ensaio local de rollback preserva posições, proteções,
+intenções, ledgers, histórico e incidentes, recusando DDL destrutivo, restauração
+de dado inválido e regressão de segurança. Relatório separa `implementation_status`,
+`evidence_status` e `live_approval`.
+
+Pendências do bloco G: a coleta prospectiva e o canário em si dependem de
+autorização humana e de ambiente real — fora do escopo deste lote.
 
 ## Bloco F — detalhe (concluído)
 
