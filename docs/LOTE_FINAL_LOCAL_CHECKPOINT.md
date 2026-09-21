@@ -10,13 +10,44 @@ primeiro bloco que não estiver `LOCAL_VERIFIED`. Não reiniciar blocos prontos.
 | Bloco | Status | Contrato | Arquivos | Testes | Commit | Próximo passo |
 | --- | --- | --- | --- | --- | --- | --- |
 | A · P03 entrada idempotente | `LOCAL_VERIFIED` | `SAFETY_FIX` | `models/entry_intent.py`, `services/entry_intent_service.py`, `services/shadow_trade_service.py`, `db.py`, `tests/test_lote_p03_entry_intent.py`, `tests/pg_integration_p03_intent.py`, `tests/test_p05_2l_execution_latency.py` (janela) | 20 herméticos + integração PostgreSQL real (14 cenários) + P02/P03/P04A/P05.2L | `73099fd7` | — |
-| B · R05 contrato financeiro | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (fonte nova inativa) | `services/financial_total_service.py`, `services/shadow_trade_service.py` (gate R05D), `tests/test_lote_r05d_financial_total.py` | 24 herméticos + R05A/R05B/R05C (187, 2 skips históricos) | `<B>` | — |
-| C · R11 política robusta | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativa) | `services/robust_policy_service.py`, `tests/test_lote_r11c_robust_policy.py`, `docs/R11A_LEARNING_ROTATION_AUDIT.md` | 32 herméticos + R11A/R11B2 preservados | `<C>` | Persistência da progressão e ligação com rotação ficam para o bloco G (simulação) |
-| D · R07+R08 estratégias | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Núcleo puro + 3 playbooks + Score V3 de pesquisa |
+| B · R05 contrato financeiro | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (fonte nova inativa) | `services/financial_total_service.py`, `services/shadow_trade_service.py` (gate R05D), `tests/test_lote_r05d_financial_total.py` | 24 herméticos + R05A/R05B/R05C (187, 2 skips históricos) | `aad86d41` | — |
+| C · R11 política robusta | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativa) | `services/robust_policy_service.py`, `tests/test_lote_r11c_robust_policy.py`, `docs/R11A_LEARNING_ROTATION_AUDIT.md` | 32 herméticos + R11A/R11B2 preservados | `1e8eec4e` (+ `02c578b4`, escopo R11B2) | Persistência da progressão e ligação com rotação ficam para o bloco G (simulação) |
+| D · R07+R08 estratégias | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/strategy_core_service.py`, `services/score_v3_service.py`, `tests/test_lote_d_strategy_core.py`, `tests/test_lote_d_score_v3.py` | 53 + 35 herméticos; paridade do laboratório V2 do R08A | `<D>` | Ligar núcleo ao replay é o bloco F; evidência pré-seleção é o bloco E |
 | E · R09 evidência | `NOT_STARTED` | `OBSERVATION_ONLY` | — | — | — | Escopo pré-seleção versionado, aceitas + vetadas |
 | F · R10 replay/walk-forward | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Replay usando o núcleo D, carteira compartilhada e validação por janelas |
 | G · R12 simulação/go-no-go | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Tipo de experimento pré-seleção sobre `StrategyExperiment` |
 | H · Integração/documentação | `NOT_STARTED` | — | — | — | — | Resumo em endpoint existente, docs e suíte completa |
+
+## Bloco D — detalhe (concluído)
+
+Núcleo PURO (`strategy_core_service`): estado ponto-no-tempo validado, config
+explícita com hash e procedência por parâmetro, relógio injetado. Decisão sempre
+com motivos, features ausentes, playbook/versão e trace. Vela aberta, barra
+fora de ordem, buraco na série, estado velho e evidência HTF do futuro não
+decidem. Três playbooks espelhados long/short: `TREND_PULLBACK` (oscilador é
+filtro e não inverte o lado), `TREND_BREAKOUT` (fechamento além da referência +
+volume; nome de padrão não é evidência; reteste vira obrigatório quando a config
+o exige) e `RANGE_REVERSION` (range provado por bordas, toques, largura e ADX —
+`NORMAL` não prova lateralidade). Stop sempre estrutural: R:R abaixo do piso
+reprova o setup e o stop NÃO é alargado. Conflito HTF confirmado bloqueia,
+inclusive a reversão de range; força HTF desconhecida é tratada como conflito.
+Arbitragem determinística: lados opostos bloqueiam, mesmo lado resolve por
+prioridade declarada. `opportunity_key` casa com a identidade do P03 — a mesma
+vela de gatilho é uma única entrada econômica.
+
+Score V3 (`score_v3_service`): allowlist com unidade, domínio, sentido, peso,
+cap e chave de evidência única por feature; seis categorias com cap somando 100.
+ADX é força e muda de sentido conforme o playbook, sem nunca definir lado;
+funding é direcional em parcela única; o composto de confluência fica fora por
+padrão e, quando ligado, SUBSTITUI estrutura e gatilho com normalização
+contínua (sem os degraus da V2). Ausência sai da escala, valor inválido não vira
+evidência, cobertura abaixo do piso indisponibiliza o score. Sem calibração V3
+do mesmo fingerprint não há probabilidade, tier, aprovação econômica nem
+elegibilidade LIVE — e bins/p_global da V2 são recusados explicitamente.
+
+Pendências do bloco D: a integração com replay/carteira é do bloco F; o
+adaptador de seleção existe, é testado e devolve sempre `executable=False`,
+com `R07_STRATEGY_CORE_MODE`/`R08_SCORE_V3_MODE` em `inactive` por padrão.
 
 ## Bloco A — detalhe (concluído)
 
