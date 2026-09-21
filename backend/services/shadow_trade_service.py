@@ -249,7 +249,7 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
             "worst_case_daily_usd": gate.get("worst_case_daily_usd"),
             "daily_loss_limit_usd": gate.get("daily_loss_limit_usd"),
         }
-        return None
+        return await _r05d_total_gate(checks)
     gate = gate if isinstance(gate, dict) else {}
     checks["r05b_financial"] = {
         "cutover_enabled": gate.get("cutover_enabled"),
@@ -264,6 +264,39 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
         "reason": gate.get("reason") or "gate financeiro bloqueou a entrada",
         "checks": checks,
     }
+
+
+async def _r05d_total_gate(checks: dict):
+    """R05D — total COM funding. INATIVO por default (fonte `legacy`).
+
+    Com a fonte completa selecionada, insuficiência essencial impede AUMENTAR
+    exposição; nunca bloqueia proteção, redução ou fechamento, e não mexe em
+    pausa de outro owner. Snapshot é fresco: nunca o cache de apresentação.
+    """
+    try:
+        from services import financial_total_service as _fts
+        if not _fts.accounting_total_enabled():
+            return None                     # comportamento legado preservado
+        from datetime import timedelta
+        from db import get_session
+        from services.binance_signed_service import accounting_scope
+        until = datetime.now(timezone.utc)
+        payload = await _fts.fresh_total(get_session, account_scope=accounting_scope(),
+                                         since=until - timedelta(days=1), until=until)
+        verdict = _fts.exposure_verdict(payload)
+        checks["r05d_total"] = {"state": payload.get("state"),
+                                "rows_confirmed": payload.get("rows_confirmed"),
+                                "reason_code": verdict.get("reason_code")}
+    except Exception as exc:                 # fail-closed: sem total, sem aumento
+        log.warning(f"[r05d] total financeiro indisponível: {type(exc).__name__}")
+        return {"ok": False, "quality": "UNKNOWN", "reason_code": "R05D_TOTAL_ERROR",
+                "reason": "contrato financeiro completo indisponível", "checks": checks}
+    if verdict.get("allow_exposure_increase"):
+        return None
+    return {"ok": False, "quality": "UNKNOWN",
+            "reason_code": verdict.get("reason_code") or "R05D_TOTAL_UNAVAILABLE",
+            "reason": "total com funding insuficiente para aumentar exposição",
+            "checks": checks}
 
 
 def _exec_mark(trace, field: str) -> None:

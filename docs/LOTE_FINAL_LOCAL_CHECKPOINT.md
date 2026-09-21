@@ -9,8 +9,8 @@ primeiro bloco que não estiver `LOCAL_VERIFIED`. Não reiniciar blocos prontos.
 
 | Bloco | Status | Contrato | Arquivos | Testes | Commit | Próximo passo |
 | --- | --- | --- | --- | --- | --- | --- |
-| A · P03 entrada idempotente | `LOCAL_VERIFIED` | `SAFETY_FIX` | `models/entry_intent.py`, `services/entry_intent_service.py`, `services/shadow_trade_service.py`, `db.py`, `tests/test_lote_p03_entry_intent.py`, `tests/pg_integration_p03_intent.py`, `tests/test_p05_2l_execution_latency.py` (janela) | 20 herméticos + integração PostgreSQL real (14 cenários) + P02/P03/P04A/P05.2L | `<A>` | — |
-| B · R05 contrato financeiro | `NOT_STARTED` | `CANDIDATE_POLICY` + `OBSERVATION_ONLY` | — | — | — | Ler `R05B`/`R05C` e serviços contábeis; criar contrato versionado inativo por padrão |
+| A · P03 entrada idempotente | `LOCAL_VERIFIED` | `SAFETY_FIX` | `models/entry_intent.py`, `services/entry_intent_service.py`, `services/shadow_trade_service.py`, `db.py`, `tests/test_lote_p03_entry_intent.py`, `tests/pg_integration_p03_intent.py`, `tests/test_p05_2l_execution_latency.py` (janela) | 20 herméticos + integração PostgreSQL real (14 cenários) + P02/P03/P04A/P05.2L | `73099fd7` | — |
+| B · R05 contrato financeiro | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (fonte nova inativa) | `services/financial_total_service.py`, `services/shadow_trade_service.py` (gate R05D), `tests/test_lote_r05d_financial_total.py` | 24 herméticos + R05A/R05B/R05C (187, 2 skips históricos) | `<B>` | — |
 | C · R11 política robusta | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Política versionada com histerese persistente, decay disjunto, geração atômica |
 | D · R07+R08 estratégias | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Núcleo puro + 3 playbooks + Score V3 de pesquisa |
 | E · R09 evidência | `NOT_STARTED` | `OBSERVATION_ONLY` | — | — | — | Escopo pré-seleção versionado, aceitas + vetadas |
@@ -37,3 +37,23 @@ risco/slot — só uma entra; nenhuma intenção apagada; zero chamada de exchan
 Pendências do bloco A: rotas manuais do app ainda não passam pela intenção
 (apenas o caminho automático do executor); ordens abertas fora do app seguem
 externas por contrato.
+
+## Bloco B — detalhe (concluído)
+
+`financial_total_service` agrega o ledger R05C já persistido em um total
+versionado COM funding (`R05D_TOTAL_WITH_FUNDING_V1`). `pnl_usd` continua
+líquido de execuções EX-funding; nada é reescrito e nenhum fetch novo existe.
+`COMPLETE` exige, para TODAS as linhas da janela: estado `CONFIRMED`, funding
+`CONFIRMED`, taxas completas sem ativo não convertido, mesma conta e mesmo
+ativo de liquidação, sem conflito de ledger, e coleta com paginação/overlap
+provados. Qualquer falha mantém `PENDING`/`UNKNOWN` com subtotal separado.
+
+Seleção pelo seletor NOVO `R05_FINANCIAL_TOTAL_SOURCE` (default `legacy`): a
+flag do cutover R05B segue com o significado dela e não ativa o R05D. Com o
+default, o gate de entrada não consulta nada e o comportamento legado é
+idêntico (testado). Com a fonte nova, insuficiência essencial impede apenas
+AUMENTAR exposição — nunca proteção, redução ou fechamento.
+
+Pendências do bloco B: o total real depende de funding confirmado pelo
+coletor R05C em produção (evidência externa); a conversão de comissão em outro
+ativo continua indisponível por falta de prova de taxa/par/fonte/instante.
