@@ -12,11 +12,34 @@ primeiro bloco que não estiver `LOCAL_VERIFIED`. Não reiniciar blocos prontos.
 | A · P03 entrada idempotente | `LOCAL_VERIFIED` | `SAFETY_FIX` | `models/entry_intent.py`, `services/entry_intent_service.py`, `services/shadow_trade_service.py`, `db.py`, `tests/test_lote_p03_entry_intent.py`, `tests/pg_integration_p03_intent.py`, `tests/test_p05_2l_execution_latency.py` (janela) | 20 herméticos + integração PostgreSQL real (14 cenários) + P02/P03/P04A/P05.2L | `73099fd7` | — |
 | B · R05 contrato financeiro | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (fonte nova inativa) | `services/financial_total_service.py`, `services/shadow_trade_service.py` (gate R05D), `tests/test_lote_r05d_financial_total.py` | 24 herméticos + R05A/R05B/R05C (187, 2 skips históricos) | `aad86d41` | — |
 | C · R11 política robusta | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativa) | `services/robust_policy_service.py`, `tests/test_lote_r11c_robust_policy.py`, `docs/R11A_LEARNING_ROTATION_AUDIT.md` | 32 herméticos + R11A/R11B2 preservados | `1e8eec4e` (+ `02c578b4`, escopo R11B2) | Persistência da progressão e ligação com rotação ficam para o bloco G (simulação) |
-| D · R07+R08 estratégias | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/strategy_core_service.py`, `services/score_v3_service.py`, `tests/test_lote_d_strategy_core.py`, `tests/test_lote_d_score_v3.py` | 53 + 35 herméticos; paridade do laboratório V2 do R08A | `<D>` | Ligar núcleo ao replay é o bloco F; evidência pré-seleção é o bloco E |
-| E · R09 evidência | `NOT_STARTED` | `OBSERVATION_ONLY` | — | — | — | Escopo pré-seleção versionado, aceitas + vetadas |
+| D · R07+R08 estratégias | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/strategy_core_service.py`, `services/score_v3_service.py`, `tests/test_lote_d_strategy_core.py`, `tests/test_lote_d_score_v3.py` | 53 + 35 herméticos; paridade do laboratório V2 do R08A | `154411d9` | Ligar núcleo ao replay é o bloco F; evidência pré-seleção é o bloco E |
+| E · R09 evidência | `LOCAL_VERIFIED` | `OBSERVATION_ONLY` (coleta desligada) | `services/preselection_observation_service.py`, `tests/test_lote_e_preselection.py` | 36 herméticos + R09/R10A/R10B preservados (137) | `<E>` | Exposição do resumo em endpoint existente fica no bloco H |
 | F · R10 replay/walk-forward | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Replay usando o núcleo D, carteira compartilhada e validação por janelas |
 | G · R12 simulação/go-no-go | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Tipo de experimento pré-seleção sobre `StrategyExperiment` |
 | H · Integração/documentação | `NOT_STARTED` | — | — | — | — | Resumo em endpoint existente, docs e suíte completa |
+
+## Bloco E — detalhe (concluído)
+
+Escopo `PRE_SELECTION` versionado (`r09.pre.v1`) ADITIVO: `POST_SELECTION` e as
+linhas antigas mantêm significado, e a evidência nova mora nas tabelas, no flush
+e no resolver que já existem — sem tabela, scheduler, worker, fila ou cliente de
+exchange novos, e sem alterar retenção. A coleta é opcional e desligada por
+padrão (`R09_PRESELECTION_MODE=inactive`), então nada do scan depende dela.
+
+Funil observado na ordem REAL (candidato → playbook → candle → geometria/RR →
+liquidez → MTF/regime → seleção → risco → execução): etapa que não rodou fica
+`NOT_EVALUATED` e nunca `PASSED`; `UNKNOWN` não é rejeição; a primeira rejeição é
+registrada como fato, com `causal_claim=NONE` e sem lista contrafactual. Aceitas
+e vetadas usam a MESMA identidade (símbolo, TF, lado, vela de gatilho, playbook e
+versão), com tentativa derivada da oportunidade. Horizonte vem do timeframe e do
+maior horizonte entre os candidatos registrados — o baseline resolver não encerra
+a janela — com truncamento reportado quando excede o buffer. Origem, mercado,
+símbolo e resolução viajam com a janela: divergência vira `SOURCE_MISMATCH` e
+ausência vira `UNLABELED`, nunca Binance por omissão. Falha e completude são
+cobertura, com `pnl_assumption=None` em todos os casos.
+
+Pendências do bloco E: nenhuma coleta é ligada aqui; a exposição somente-leitura
+do resumo e a ligação com o endpoint existente ficam no bloco H.
 
 ## Bloco D — detalhe (concluído)
 
