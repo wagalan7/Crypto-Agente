@@ -433,16 +433,21 @@ FORMATO DE RESPOSTA (OBRIGATÓRIO — responda APENAS com JSON válido, sem mark
 
 CAMPOS data ESPERADOS POR AÇÃO:
 - list_slots: {{}}
-- create: {{"patient_name": "...", "slot_index": 1}}   ← número exibido ao paciente (1 = primeiro, 2 = segundo, etc.)
-- update: {{"appointment_id": 1, "slot_index": 1}}     ← mesmo padrão: número do item na lista
+- create: {{"patient_name": "...", "slot_id": "2026-09-21T15:00"}}
+- update: {{"appointment_id": 1, "slot_id": "2026-09-21T15:00"}}
 - confirm: {{"appointment_id": 1}}
 - cancel: {{"appointment_id": 1}}     ← cancelar a consulta (NÃO oferecer outro horário)
 - none: {{}}
 
-REGRA CRÍTICA — slot_index:
-Use EXATAMENTE o número que aparece na lista de horários (1, 2, 3...).
-Se o paciente escolheu "o 5" ou "o horário 5", use slot_index: 5.
-NUNCA subtraia 1 ou faça qualquer conversão — use o número exato do display.
+REGRA CRÍTICA — slot_id (como dizer QUAL horário o paciente escolheu):
+Cada item de HORÁRIOS DISPONÍVEIS vem com um id entre colchetes. Copie o id do
+item escolhido, EXATAMENTE como está. Ex.: se a lista tem
+"  7. Segunda, 21/09 às 15:00  [id=2026-09-21T15:00]" e o paciente escolheu esse
+horário, envie "slot_id": "2026-09-21T15:00".
+NUNCA use a posição/numeração que VOCÊ mostrou ao paciente. Você mostra uma
+lista filtrada (4-5 opções), então o "1" que ele vê quase nunca é o "1" da lista
+acima — mandar a posição marca o paciente no horário ERRADO.
+NUNCA invente um id: use somente ids que aparecem na lista.
 
 SITUAÇÕES ESPECIAIS:
 
@@ -643,16 +648,21 @@ FORMATO DE RESPOSTA (OBRIGATÓRIO — responda APENAS com JSON válido, sem mark
 
 CAMPOS data ESPERADOS POR AÇÃO:
 - list_slots: {{}}
-- create: {{"patient_name": "...", "slot_index": 1}}   ← número exibido ao {cli} (1 = primeiro, 2 = segundo, etc.)
-- update: {{"appointment_id": 1, "slot_index": 1}}     ← mesmo padrão: número do item na lista
+- create: {{"patient_name": "...", "slot_id": "2026-09-21T15:00"}}
+- update: {{"appointment_id": 1, "slot_id": "2026-09-21T15:00"}}
 - confirm: {{"appointment_id": 1}}
 - cancel: {{"appointment_id": 1}}     ← cancelar o agendamento (NÃO oferecer outro horário)
 - none: {{}}
 
-REGRA CRÍTICA — slot_index:
-Use EXATAMENTE o número que aparece na lista de horários (1, 2, 3...).
-Se o {cli} escolheu "o 5" ou "o horário 5", use slot_index: 5.
-NUNCA subtraia 1 ou faça qualquer conversão — use o número exato do display.
+REGRA CRÍTICA — slot_id (como dizer QUAL horário o {cli} escolheu):
+Cada item de HORÁRIOS DISPONÍVEIS vem com um id entre colchetes. Copie o id do
+item escolhido, EXATAMENTE como está. Ex.: se a lista tem
+"  7. Segunda, 21/09 às 15:00  [id=2026-09-21T15:00]" e o {cli} escolheu esse
+horário, envie "slot_id": "2026-09-21T15:00".
+NUNCA use a posição/numeração que VOCÊ mostrou ao {cli}. Você mostra uma lista
+filtrada (4-5 opções), então o "1" que ele vê quase nunca é o "1" da lista
+acima — mandar a posição marca o {cli} no horário ERRADO.
+NUNCA invente um id: use somente ids que aparecem na lista.
 
 EXEMPLOS DE TOM:
 
@@ -782,8 +792,12 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
 
     if offered_slots:
         lines.append("HORÁRIOS DISPONÍVEIS (use apenas estes):")
-        for i, s in enumerate(cal.format_slots(offered_slots), 1):
-            lines.append(f"  {i}. {s}")
+        # O [id=...] é o que o agente devolve em slot_id. A numeração NÃO serve
+        # para identificar o horário: o agente mostra ao paciente uma lista
+        # filtrada (4-5 opções), então o "1" que o paciente vê raramente é o
+        # "1" desta lista — usar a posição marcava o paciente noutro horário.
+        for i, (s, raw) in enumerate(zip(cal.format_slots(offered_slots), offered_slots), 1):
+            lines.append(f"  {i}. {s}  [id={raw.strftime('%Y-%m-%dT%H:%M')}]")
 
     now = datetime.now(_TZ)
     amanha = now + timedelta(days=1)
@@ -1107,10 +1121,10 @@ def _do_reschedule(tenant: dict, phone: str, appt: dict, slot: datetime) -> str:
     saud = f"Prontinho, {nome}! ✅" if nome else "Prontinho! ✅"
     logger.info(f"[{tenant['slug']}][{phone}] REMARCAÇÃO DETERMINÍSTICA id={appt_id} → {slot.isoformat()}")
     if _is_psychology(tenant):
-        reply = f"{saud} Sua sessão foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+        reply = f"{saud} Sua sessão foi remarcada para *{formatted}*. Vou te lembrar um dia antes, combinado? 💖"
     else:
         svc = _generic_service_noun(tenant)
-        reply = f"{saud} Seu {svc} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+        reply = f"{saud} Seu {svc} foi remarcado para *{formatted}*. Vou te lembrar um dia antes, combinado? 💖"
     return _confirm_today_tail(reply, slot, tenant, appt_id)
 
 
@@ -1399,6 +1413,40 @@ def _strip_forbidden_phrases(text: str) -> str:
     return out or "Olá! 😊 Vou repassar sua mensagem. 💖"
 
 
+def _resolve_slot(data: dict, offered_slots: list, tenant: dict, phone: str):
+    """Resolve o horário escolhido pelo paciente. Retorna (slot | None, origem).
+
+    Prioriza `slot_id` — o carimbo [id=...] que acompanha cada item de HORÁRIOS
+    DISPONÍVEIS no contexto. `slot_index` é AMBÍGUO e não deve ser a fonte da
+    verdade: o número que o paciente vê é o da lista que o agente mostrou
+    (filtrada, 4-5 opções), enquanto o backend indexa a lista COMPLETA — seguir
+    a posição podia marcar o paciente noutro dia/horário, em silêncio, porque a
+    confirmação é montada com o horário que o backend escolheu. Fica só como
+    reserva, para não quebrar caso o modelo não mande o id.
+    """
+    sid = str(data.get("slot_id") or "").strip().replace(" ", "T")[:16]
+    if sid:
+        for s in offered_slots:
+            if s.strftime("%Y-%m-%dT%H:%M") == sid:
+                return s, "slot_id"
+        logger.warning(f"[{tenant.get('slug')}][{phone}] slot_id {sid!r} não está "
+                       f"entre os horários livres — ignorando")
+    raw = data.get("slot_index")
+    if raw is not None:
+        try:
+            idx = int(raw) - 1
+        except (TypeError, ValueError):
+            logger.warning(f"[{tenant.get('slug')}][{phone}] slot_index inválido: {raw!r}")
+            return None, "invalido"
+        if 0 <= idx < len(offered_slots):
+            logger.warning(f"[{tenant.get('slug')}][{phone}] sem slot_id — caindo no "
+                           f"slot_index={raw} (posição pode não ser a que o paciente viu)")
+            return offered_slots[idx], "slot_index"
+        logger.warning(f"[{tenant.get('slug')}][{phone}] slot_index {raw} fora da faixa "
+                       f"(total={len(offered_slots)})")
+    return None, "invalido"
+
+
 def _execute_action(tenant: dict, resp: AgentResponse,
                     offered_slots: list, phone: str = "") -> tuple[str, dict | None]:
     """Executa a ação e retorna (reply_text, evento_opcional)."""
@@ -1485,17 +1533,9 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 return _bmsg, None
         except Exception:
             logger.exception("gate scheduling fail-open")
-        # slot_index vem do LLM como número do display (1-based).
-        # Converter para 0-based antes de indexar offered_slots.
-        idx_raw = data.get("slot_index", 1)
-        try:
-            idx = int(idx_raw) - 1  # 1-based → 0-based
-        except (TypeError, ValueError):
-            logger.warning(f"[{tenant['slug']}][{phone}] slot_index inválido do LLM: {idx_raw!r}")
-            return "Não consegui identificar o horário escolhido. Pode repetir, por favor? 😊", None
         name = data.get("patient_name", "Paciente")
-        if 0 <= idx < len(offered_slots):
-            slot = offered_slots[idx]
+        slot, _origem = _resolve_slot(data, offered_slots, tenant, phone)
+        if slot is not None:
             duration = tenant.get("session_minutes", 50)
             # ── GUARDA ANTI-DUPLICATA (reagendamento silencioso) ─────────────────
             # Se o paciente JÁ tem UMA consulta futura real e o LLM escolheu
@@ -1553,22 +1593,17 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                         _saud = f"Prontinho, {_nome1}! ✅" if _nome1 else "Prontinho! ✅"
                         reply = f"{_saud} Seu {_generic_service_noun(tenant)} ficou marcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
                 reply = _confirm_today_tail(reply, slot, tenant, appt_id)
-                logger.info(f"[{tenant['slug']}] Agendamento criado: {name} | slot_index={idx_raw}(raw)→{idx}(0based) | slot={formatted}")
+                logger.info(f"[{tenant['slug']}] Agendamento criado: {name} | origem={_origem} | slot={formatted}")
                 event = {"type": "new_appointment", "data": {"patient_name": name, "slot": formatted, "phone": phone}}
                 return reply, event
-        logger.warning(f"[{tenant['slug']}] slot_index inválido: {idx_raw}(raw)→{idx}(0based) | total slots={len(offered_slots)}")
+        logger.warning(f"[{tenant['slug']}] agendamento não realizado | data={data!r} "
+                       f"| total slots={len(offered_slots)}")
         return "Desculpe, não consegui realizar o agendamento. Pode escolher outro horário? 😊", None
 
     if action == Action.update:
         appt_id = data.get("appointment_id")
-        idx_raw = data.get("slot_index", 1)
-        try:
-            idx = int(idx_raw) - 1  # 1-based (display) → 0-based
-        except (TypeError, ValueError):
-            logger.warning(f"[{tenant['slug']}][{phone}] slot_index inválido (update): {idx_raw!r}")
-            return "Não consegui identificar o horário escolhido. Pode repetir, por favor? 😊", None
-        if appt_id and 0 <= idx < len(offered_slots):
-            slot = offered_slots[idx]
+        slot, _origem = _resolve_slot(data, offered_slots, tenant, phone)
+        if appt_id and slot is not None:
             duration = tenant.get("session_minutes", 50)
             if not db.has_conflict(tenant_id, slot, duration, exclude_id=int(appt_id)):
                 # Buscar google_event_id antes de atualizar
@@ -1633,18 +1668,20 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 # Se o texto da LLM veio vazio ou mesmo após substituição não
                 # menciona o slot canônico, montamos uma confirmação determinística.
                 if not reply.strip() or formatted not in reply:
+                    # O horário NOVO vem primeiro e em negrito; o antigo fica num
+                    # parêntese no fim. Antes a frase abria com o horário antigo
+                    # ("Sua consulta de 10:00 foi remarcada para 15:00") e o
+                    # paciente lia o antigo como se fosse o novo — ainda por cima
+                    # um horário que nunca tinha sido oferecido a ele.
                     old_fmt = cal.format_appointment(appt) if appt else ""
                     if _is_psychology(tenant):
-                        if old_fmt:
-                            reply = f"Prontinho! ✅ Sua consulta de {old_fmt} foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
-                        else:
-                            reply = f"Prontinho! ✅ Sua consulta foi remarcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                        reply = f"Prontinho! ✅ Sua consulta foi remarcada para *{formatted}*."
                     else:
                         _svc = _generic_service_noun(tenant)
-                        if old_fmt:
-                            reply = f"Prontinho! ✅ Seu {_svc} de {old_fmt} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
-                        else:
-                            reply = f"Prontinho! ✅ Seu {_svc} foi remarcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
+                        reply = f"Prontinho! ✅ Seu {_svc} foi remarcado para *{formatted}*."
+                    if old_fmt:
+                        reply += f" (Antes era {old_fmt}.)"
+                    reply += " Vou te lembrar um dia antes, combinado? 💖"
                 reply = _confirm_today_tail(reply, slot, tenant, appt_id)
                 return reply, {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}
         return "Não consegui remarcar. Pode escolher outro horário? 😊", None
