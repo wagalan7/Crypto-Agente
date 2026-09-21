@@ -36,6 +36,13 @@ def _pre_filter(alias: str = "") -> str:
     return f"({prefix}frozen_config -> {_PRE_MARK} ->> 'scope') = 'PRE_SELECTION'"
 
 
+def _outcome_filter(outcome: str, alias: str = "") -> str:
+    """Discriminador do DESFECHO congelado: a tabela de oportunidades guarda
+    aceitas E vetadas; sem isto, o escopo de aceitas traria as duas."""
+    prefix = f"{alias}." if alias else ""
+    return f"({prefix}frozen_config -> {_PRE_MARK} ->> 'outcome') = '{outcome}'"
+
+
 def _structural_filter(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
     return (f"{_pre_filter(alias)} AND "
@@ -52,6 +59,8 @@ class Scope:
     unit: str
     exports_trajectory: bool
     comparable_with_r10a: bool
+    #: Desfecho exigido no payload congelado (None = não discrimina).
+    required_outcome: Optional[str] = None
     index_filter: str = ""
     detail_filter: str = ""
     absent_fields: Tuple[Tuple[str, str], ...] = ()
@@ -66,6 +75,7 @@ class Scope:
                 "decision_time": f"{self.source_table}.{self.decision_column}",
                 "exports_trajectory": self.exports_trajectory,
                 "comparable_with_r10a": self.comparable_with_r10a,
+                "required_outcome": self.required_outcome,
                 "absent_fields": self.absent_map()}
 
 
@@ -91,8 +101,9 @@ PRE_VETOED = Scope(
     unit="ONE_PRE_SELECTION_VETOED_OPPORTUNITY",
     exports_trajectory=True,
     comparable_with_r10a=True,
-    index_filter=_pre_filter(),
-    detail_filter=_pre_filter("r"),
+    required_outcome="VETOED",
+    index_filter=f"{_pre_filter()} AND {_outcome_filter('VETOED')}",
+    detail_filter=f"{_pre_filter('r')} AND {_outcome_filter('VETOED', 'r')}",
     absent_fields=(("observed_costs", COST_NOT_OBSERVED),
                    ("universe_snapshot", UNIVERSE_NOT_POINT_IN_TIME)),
 )
@@ -123,8 +134,9 @@ PRE_ACCEPTED = Scope(
     # caminho do preço. Exportar mesmo assim seria inventar resultado.
     exports_trajectory=False,
     comparable_with_r10a=False,
-    index_filter="scope = 'PRE_SELECTION'",
-    detail_filter="o.scope = 'PRE_SELECTION'",
+    required_outcome="ACCEPTED",
+    index_filter=f"scope = 'PRE_SELECTION' AND {_outcome_filter('ACCEPTED')}",
+    detail_filter=f"o.scope = 'PRE_SELECTION' AND {_outcome_filter('ACCEPTED', 'o')}",
     absent_fields=(("candles", TRAJECTORY_NOT_COLLECTED),
                    ("outcome", OUTCOME_NOT_COLLECTED),
                    ("observed_costs", COST_NOT_OBSERVED)),

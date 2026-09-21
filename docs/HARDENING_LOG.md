@@ -2003,3 +2003,45 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
   Nenhuma ordem, notificação real, backfill ou alteração histórica. M3 e demais
   pendências R11A continuam fora deste fechamento. Publicação não executada
   nesta validação local.
+
+## Lote final local — blocos A–H (21/09/2026)
+
+- Baseline `e3878238`, checkout principal/main; alterações pessoais preservadas.
+  Sem push, deploy, ordem, mensagem, acesso externo ou ativação LIVE.
+- **A (`SAFETY_FIX`, único ativo por padrão):** intenção de entrada econômica
+  persistida e commitada ANTES da primeira mutação de ordem, com
+  `client_order_id` derivado dela, lease por dono e capacidade sob a advisory
+  lock de risco. Provado em PostgreSQL descartável (14 cenários) e 20 testes
+  herméticos: mesma decisão em snapshots distintos ou em duas conexões gera UM
+  envio; crash depois do envio vira `UNKNOWN` e nunca reenvia.
+- **B a G (inativos por padrão):** total financeiro com funding (R05D), política
+  robusta (R11C), núcleo puro de estratégia com três playbooks e Score V3 de
+  pesquisa (R07D/R08D), evidência pré-seleção versionada (r09.pre.v1), escopos
+  do exportador + replay de carteira sobre o motor R10A + walk-forward real
+  (R10B/R10D/R10E) e experimento pré-seleção com gate go/no-go congelado (R12).
+  Cada um atrás de um seletor cujo default é `legacy`/`inactive`; valor
+  desconhecido — inclusive `live` — resolve para inativo.
+- **H:** resumo `lote_final` no endpoint existente `/api/strategy/p05/status`
+  (somente leitura, fail-soft por bloco, sem rota/painel/botão novo) e fluxo
+  sintético ponta a ponta com as funções reais: candidato → seleção → evidência
+  → simulação de carteira → comparação → go/no-go, terminando em NO_GO por falta
+  de amostra, como esperado.
+- **Achado do PostgreSQL real:** o escopo de aceitas lia
+  `decision_observations` por `scope='PRE_SELECTION'` e trazia também as
+  oportunidades das VETADAS (o acervo guarda as duas). Corrigido com
+  discriminador de desfecho congelado no SQL e no construtor
+  (`OUTCOME_SCOPE_MISMATCH`), com regressão hermética e prova em banco real.
+- **Fronteiras ajustadas com justificativa:** a lista de importadores do motor
+  R10A passou a incluir `portfolio_replay_service` (reuso do motor, não segundo
+  backtest) e o teste de isolamento do R11C passou a permitir o compositor
+  somente-leitura como LEITOR DE MANIFESTO, com checagem AST de que ele não toca
+  nenhuma função de decisão. O teste de escopo do R11B2 foi fixado ao range do
+  próprio commit, em vez do worktree.
+- **Testes:** suíte completa **2.246 executados, 2.244 aprovados, 2 skips R05C
+  preexistentes** (fixture auditada ausente no repositório). Integrações reais em
+  PostgreSQL 16 descartável: P03, R09 e R10B (esta última cobrindo os escopos
+  novos). `py_compile` e `git diff --check` aprovados; nenhum arquivo TS/TSX
+  alterado, logo TSC não se aplica.
+- **Pendências externas:** coleta prospectiva, validação econômica com custos de
+  conta, calibração própria da V3, aprovação humana e canário continuam
+  pendentes. Holdout real segue selado; nenhuma quarentena foi liberada.

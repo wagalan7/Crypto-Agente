@@ -330,13 +330,32 @@ class DefaultsAndIsolation(unittest.TestCase):
         with patch.dict(os.environ, {rp.POLICY_SELECTOR_ENV: rp.POLICY_VERSION}):
             self.assertTrue(rp.robust_policy_enabled())
 
+    #: Leitor de manifesto permitido: compõe o resumo somente-leitura do lote
+    #: (mesmo papel que já tem para o laboratório R10A). Só pode ler versão e
+    #: seletor — nunca as funções de decisão.
+    MANIFEST_READERS = {"research_batch_service.py"}
+    DECISION_FUNCTIONS = ("merit_verdict", "reduction_verdict", "learned_multiplier",
+                          "advance_hysteresis", "decay_multiplier", "liquidity_verdict",
+                          "build_sample", "cache_verdict")
+
     def test_no_live_consumer_imports_the_new_policy(self):
+        import ast
+
         offenders = []
         for path in (BACKEND / "services").glob("*.py"):
             if path.name == "robust_policy_service.py":
                 continue
-            if "robust_policy_service" in path.read_text(encoding="utf-8"):
+            source = path.read_text(encoding="utf-8")
+            if "robust_policy_service" not in source:
+                continue
+            if path.name not in self.MANIFEST_READERS:
                 offenders.append(path.name)
+                continue
+            # CÓDIGO, não prosa: o leitor só toca versão/seletor.
+            tree = ast.parse(source)
+            usados = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+            for proibida in self.DECISION_FUNCTIONS:
+                self.assertNotIn(proibida, usados, f"{path.name}: {proibida}")
         self.assertEqual(offenders, [])
         self.assertNotIn("robust_policy_service", (BACKEND / "main.py").read_text())
 

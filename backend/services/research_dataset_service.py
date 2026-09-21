@@ -458,7 +458,7 @@ def build_artifacts(request: ExportRequest, plan: SelectionPlan, detail_rows: It
 # ── Escopos sem trajetória (aceitas pré-seleção) ────────────────────────────
 FEATURE_EXCLUSION_REASONS = ("SOURCE_CONTRACT_MISMATCH", "IDENTITY_MISMATCH",
                              "INVALID_SETUP", "PRE_SELECTION_PAYLOAD_MISSING",
-                             "TEMPORAL_INCONSISTENCY")
+                             "TEMPORAL_INCONSISTENCY", "OUTCOME_SCOPE_MISMATCH")
 FEATURE_SETUP_KEYS = ("symbol", "timeframe", "side", "playbook", "playbook_version",
                       "trigger_candle_ms", "entry", "stop_loss", "tp1", "tp2", "atr")
 PRE_SOURCE_SCHEMA = "r09.pre.v1"
@@ -508,6 +508,11 @@ def build_feature_artifacts(request: ExportRequest, plan: SelectionPlan,
         payload, reason = _pre_payload(config)
         if reason is None and row.get("opportunity_scope") != scope.opportunity_scope:
             reason = "IDENTITY_MISMATCH"
+        if (reason is None and scope.required_outcome
+                and payload.get("outcome") != scope.required_outcome):
+            # A tabela de oportunidades guarda aceitas E vetadas: o desfecho
+            # congelado é o que separa as duas coortes.
+            reason = "OUTCOME_SCOPE_MISMATCH"
         if reason is None and not isinstance(setup, Mapping):
             reason = "INVALID_SETUP"
         frozen = payload.get("setup") if reason is None and isinstance(payload.get("setup"), Mapping) else None

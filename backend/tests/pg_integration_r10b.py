@@ -59,8 +59,8 @@ REPLAY = {"bar_ms": BAR, "entry_window_bars": 3, "pre_tp1_time_stop_bars": 12,
 SENTINELS = ("5555.5", "7777.5", "8888.5", "999.5", "6666.5")
 
 
-def request(as_of="2026-01-01T00:00:00Z"):
-    return {
+def request(as_of="2026-01-01T00:00:00Z", scope=None):
+    body = {
         "as_of_utc": as_of,
         "split": {"train_start_ms": T0, "validation_start_ms": VAL,
                   "holdout_start_ms": HOLD, "purge_bars": 1},
@@ -70,6 +70,9 @@ def request(as_of="2026-01-01T00:00:00Z"):
         "costs": {"fee_bps_per_side": 4.0, "slippage_bps_per_side": 2.0, "funding_bps_per_bar": 1.0},
         "bootstrap": {"seed": 3, "samples": 100, "block_size": 1},
     }
+    if scope is not None:
+        body["scope"] = scope
+    return body
 
 
 def first_bar(ms):
@@ -127,7 +130,8 @@ class Spy:
                     "UPDATE rejected_setup_observations SET version = version + 1"))
             except Exception as exc:
                 self.write_error = str(exc)
-        if sql.startswith("WITH") or sql.startswith("SELECT opportunity_key"):
+        if (sql.startswith("WITH") or sql.startswith("SELECT opportunity_key")
+                or sql.startswith("SELECT o.opportunity_key")):
             rows = [dict(row) for row in result.mappings().all()]
             self.fetched.extend(rows)
             return _Rows(rows)
@@ -349,6 +353,90 @@ async def run():
         except ds.DatasetLimitError:
             pass
     assert (await dump())[0] == before[0]
+
+
+    # ── Escopos do lote final: filtro no SERVIDOR, legado intacto ───────────
+    from services import research_dataset_scopes as scopes
+
+    def pre_payload(**over):
+        payload = {"schema_version": "r09.pre.v1", "scope": "PRE_SELECTION",
+                   "policy": "OBSERVATION_ONLY", "outcome": "VETOED",
+                   "decision_ts_ms": T0 + 40 * BAR,
+                   "setup": {"symbol": "SYN/USDT:USDT", "timeframe": "15m",
+                             "side": "long", "playbook": "TREND_PULLBACK",
+                             "playbook_version": "TREND_PULLBACK_V1",
+                             "trigger_candle_ms": T0 + 39 * BAR, "entry": 100.0,
+                             "stop_loss": 95.0, "tp1": 105.0, "tp2": 110.0, "atr": 2.0},
+                   "funnel": {"first_blocker": "LIQUIDITY", "blockers_observed": ["LIQUIDITY"],
+                              "stages_not_evaluated": ["RISK", "EXECUTION"],
+                              "out_of_order": False},
+                   "availability": {"depth": False}, "source": {"label": "binance"},
+                   "learning_eligible": False}
+        payload.update(over)
+        return payload
+
+    legacy_ids_before = set(ids)
+    async with db.get_session() as session:
+        # Vetada PRÉ-seleção (mesma tabela, marcador no frozen_config).
+        session.add(rejected("pre-veto", T0 + 40 * BAR, bars(T0 + 40 * BAR, 3),
+                             frozen_config={**config(), "r09_pre_selection": pre_payload()}))
+        session.add(opportunity("pre-veto", T0 + 40 * BAR, scope="PRE_SELECTION",
+                                frozen_config={**config(), "r09_pre_selection": pre_payload()}))
+        # Vetada PRÉ-seleção SEM playbook: fora do escopo estrutural.
+        sem_playbook = pre_payload(decision_ts_ms=T0 + 42 * BAR)
+        sem_playbook["setup"] = {k: v for k, v in sem_playbook["setup"].items()
+                                 if k != "playbook"}
+        session.add(rejected("pre-nopb", T0 + 42 * BAR, bars(T0 + 42 * BAR, 3),
+                             frozen_config={**config(), "r09_pre_selection": sem_playbook}))
+        session.add(opportunity("pre-nopb", T0 + 42 * BAR, scope="PRE_SELECTION",
+                                frozen_config={**config(), "r09_pre_selection": sem_playbook}))
+        # Aceita PRÉ-seleção: só decisão, sem trajetória coletada.
+        aceita = pre_payload(decision_ts_ms=T0 + 41 * BAR, outcome="ACCEPTED")
+        aceita["setup"] = {**aceita["setup"], "trigger_candle_ms": T0 + 40 * BAR}
+        session.add(opportunity("pre-acc", T0 + 41 * BAR, scope="PRE_SELECTION",
+                                first_decision="ACCEPTED",
+                                frozen_config={**config(), "r09_pre_selection": aceita}))
+        await session.commit()
+
+    # Legado: a linha pré-seleção é FETCHADA mas excluída por identidade — nunca
+    # entra no artefato antigo misturada com a coorte pós-seleção.
+    legacy_ds, legacy_manifest, legacy_spy = await export(request())
+    legacy_ids = [o["opportunity_id"] for o in legacy_ds["opportunities"]]
+    assert set(legacy_ids) == legacy_ids_before, legacy_ids
+    assert legacy_manifest["counts"]["excluded"]["IDENTITY_MISMATCH"] == 3, legacy_manifest["counts"]
+    assert legacy_manifest["source"]["scope"] == scopes.SCOPE_REJECTED_POST
+    assert legacy_manifest["source"]["cohort"] == "R09_REJECTED_POST_SELECTION"
+
+    # Vetadas pré-seleção: o filtro roda no servidor; pós-seleção não chega.
+    veto_ds, veto_manifest, veto_spy = await export(request(scope=scopes.SCOPE_PRE_VETOED),
+                                                    check_xid=True)
+    veto_ids = [o["opportunity_id"] for o in veto_ds["opportunities"]]
+    assert veto_ids == ["pre-veto", "pre-nopb"], veto_ids
+    assert {row["opportunity_key"] for row in veto_spy.fetched} == {"pre-veto", "pre-nopb"}
+    assert veto_manifest["source"]["cohort"] == "R09_PRE_SELECTION_VETOED"
+    assert veto_manifest["counts"]["exported"] == {"training": 2, "validation": 0}
+    assert veto_spy.xid is None
+
+    # Candidatos estruturais: exige playbook no payload congelado.
+    est_ds, est_manifest, est_spy = await export(request(scope=scopes.SCOPE_STRUCTURAL))
+    assert [o["opportunity_id"] for o in est_ds["opportunities"]] == ["pre-veto"]
+    assert {row["opportunity_key"] for row in est_spy.fetched} == {"pre-veto"}
+    assert est_manifest["source"]["cohort"] == "R10_STRUCTURAL_CANDIDATES"
+
+    # Aceitas: sem trajetória, sem outcome, e não comparável no R10A.
+    acc_ds, acc_manifest, acc_spy = await export(request(scope=scopes.SCOPE_PRE_ACCEPTED),
+                                                 check_xid=True)
+    assert acc_ds["mode"] == "features_only", acc_ds["mode"]
+    assert [row["opportunity_key"] for row in acc_ds["rows"]] == ["pre-acc"], acc_ds["rows"]
+    linha = acc_ds["rows"][0]
+    assert linha["outcome"] is None and linha["playbook"] == "TREND_PULLBACK", linha
+    assert linha["outcome_reason"] == scopes.OUTCOME_NOT_COLLECTED, linha
+    assert "bars_by_id" not in acc_ds
+    assert all("candles" not in row for row in acc_spy.fetched), acc_spy.fetched
+    assert acc_manifest["source"]["comparable_with_r10a"] is False
+    assert acc_manifest["analysis_command"] is None
+    assert acc_manifest["costs"]["status"] == "UNKNOWN"
+    assert acc_spy.xid is None
 
     # CLI ponta a ponta (thread própria) + CLI R10A separado sobre o arquivo.
     workdir = Path(tempfile.mkdtemp(prefix="r10b-pg-cli-"))

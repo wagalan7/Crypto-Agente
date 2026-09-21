@@ -1,7 +1,8 @@
 """R08D — Score V3 de PESQUISA: allowlist, categorias, caps e decomposição.
 
-Não é a ablação conf-only do R08A (`score_research_service`), que continua
-existindo e intocada. Aqui há uma fórmula própria, versionada e inativa por
+Não é a ablação conf-only do laboratório local do R08A, que continua existindo
+e intocada (o teste de isolamento daquele laboratório exige que nenhum outro
+módulo sequer o mencione). Aqui há uma fórmula própria, versionada e inativa por
 padrão, organizada por categorias com cap explícito e decomposição verificável.
 
 Regras que o contrato impõe, e que os testes cobram:

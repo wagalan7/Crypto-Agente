@@ -15,8 +15,33 @@ primeiro bloco que não estiver `LOCAL_VERIFIED`. Não reiniciar blocos prontos.
 | D · R07+R08 estratégias | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/strategy_core_service.py`, `services/score_v3_service.py`, `tests/test_lote_d_strategy_core.py`, `tests/test_lote_d_score_v3.py` | 53 + 35 herméticos; paridade do laboratório V2 do R08A | `154411d9` | Ligar núcleo ao replay é o bloco F; evidência pré-seleção é o bloco E |
 | E · R09 evidência | `LOCAL_VERIFIED` | `OBSERVATION_ONLY` (coleta desligada) | `services/preselection_observation_service.py`, `tests/test_lote_e_preselection.py` | 36 herméticos + R09/R10A/R10B preservados (137) | `da607ea0` | Exposição do resumo em endpoint existente fica no bloco H |
 | F · R10 replay/walk-forward | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/research_dataset_scopes.py`, `services/research_dataset_service.py` (escopo), `services/portfolio_replay_service.py`, `services/walk_forward_service.py`, `tests/test_lote_f_dataset_scopes.py`, `tests/test_lote_f_portfolio_walk_forward.py`, `tests/test_r10a_offline_replay.py` (lista de importadores) | 17 + 47 herméticos; R09/R10A/R10B preservados (325 no conjunto) | `ee0f5ebd` + `113fe67c` | Carteira consome oportunidades já formadas; ligar o núcleo D ao replay ponta a ponta é trabalho do bloco G/H |
-| G · R12 simulação/go-no-go | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/preselection_experiment_service.py`, `tests/test_lote_g_preselection_experiment.py` | 36 herméticos; P05/P05.1 preservados | `<G>` | Coleta prospectiva e canário dependem de autorização humana — fora deste lote |
-| H · Integração/documentação | `NOT_STARTED` | — | — | — | — | Resumo em endpoint existente, docs e suíte completa |
+| G · R12 simulação/go-no-go | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/preselection_experiment_service.py`, `tests/test_lote_g_preselection_experiment.py` | 36 herméticos; P05/P05.1 preservados | `14ffb61d` | Coleta prospectiva e canário dependem de autorização humana — fora deste lote |
+| H · Integração/documentação | `LOCAL_VERIFIED` | `OBSERVATION_ONLY` | `services/research_batch_service.py` (`lote_final`), `tests/test_lote_h_integracao.py`, `tests/pg_integration_r10b.py` (escopos), `tests/test_r08a_score_research.py`/`tests/test_lote_r11c_robust_policy.py` (fronteiras), `docs/LOTE_FINAL_LOCAL_CONTRATOS.md`, `docs/LOTE_FINAL_LOCAL_PUBLICACAO.md`, `docs/HARDENING_LOG.md` | 12 de integração + suíte completa 2.246 (2 skips R05C) + PG real P03/R09/R10B | `<H>` | Coleta prospectiva, calibração V3, aprovação humana e canário — todos externos |
+
+## Bloco H — detalhe (concluído)
+
+Resumo `lote_final` acrescentado ao payload do endpoint existente
+`/api/strategy/p05/status` (via `research_batch_service`): versões, modo,
+cobertura, bloqueios, evidência e próximo passo, somente leitura e fail-soft por
+bloco — um módulo quebrado degrada a própria linha, não o GET. Sem rota nova,
+sem painel, sem botão, e o significado de "bot opera" não muda: candidato em
+simulação não é operação.
+
+Fluxo sintético ponta a ponta com as funções REAIS (nada reimplementado no
+teste): núcleo decide → adaptador de seleção em simulação → Score V3 sem
+probabilidade → identidade e funil pré-seleção → carteira sobre o motor R10A →
+pareamento e IC → go/no-go. Termina em `INSUFFICIENT_EVIDENCE` e `NO_GO`, que é
+o resultado honesto para uma amostra de um trade. Com os seletores ausentes, o
+resumo mostra o bloco A como único ativo.
+
+O PostgreSQL real encontrou um defeito de projeto do bloco F: o escopo de
+aceitas trazia também as oportunidades das vetadas, porque `decision_observations`
+guarda as duas. Corrigido com discriminador de desfecho congelado (SQL e
+construtor, `OUTCOME_SCOPE_MISMATCH`), com regressão hermética e prova em banco.
+
+Pendências do bloco H: nenhuma local. O que falta é externo — coleta
+prospectiva, calibração própria da V3, custos observados de conta, aprovação
+humana e canário.
 
 ## Bloco G — detalhe (concluído)
 

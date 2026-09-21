@@ -168,6 +168,15 @@ class DescritoresDeEscopo(unittest.TestCase):
         self.assertIn("PRE_SELECTION", sql)
         self.assertTrue(scopes.detail_needs_window_params(scopes.STRUCTURAL))
 
+    def test_desfecho_separa_aceitas_de_vetadas(self):
+        """`decision_observations` guarda as duas coortes: o desfecho decide."""
+        self.assertEqual(scopes.PRE_ACCEPTED.required_outcome, "ACCEPTED")
+        self.assertEqual(scopes.PRE_VETOED.required_outcome, "VETOED")
+        self.assertIsNone(scopes.LEGACY.required_outcome)
+        for scope in (scopes.PRE_ACCEPTED, scopes.PRE_VETOED):
+            self.assertIn("'outcome'", scopes.index_sql(scope))
+            self.assertIn(scope.required_outcome, scopes.detail_sql(scope))
+
     def test_vetadas_pre_selecao_usam_a_mesma_tabela(self):
         self.assertEqual(scopes.PRE_VETOED.source_table, scopes.REJECTED_TABLE)
         self.assertEqual(scopes.PRE_VETOED.opportunity_scope, "PRE_SELECTION")
@@ -223,6 +232,14 @@ class ArtefatoSemTrajetoria(unittest.TestCase):
             self.assertEqual(dataset["rows"], [], esperado)
             self.assertEqual(manifest["counts"]["excluded"][esperado], 1, esperado)
             self.assertEqual(manifest["state"], "UNUSABLE_ALL_EXCLUDED", esperado)
+
+    def test_vetada_nao_entra_no_escopo_de_aceitas(self):
+        linha = {**accepted_row(), "frozen_config": {
+            "r09_pre_selection": pre_payload(outcome="VETOED")}}
+        plan = accepted_plan(self.request, [("pre-aaa", T0)])
+        dataset, manifest = ds.build_feature_artifacts(self.request, plan, [linha], {})
+        self.assertEqual(dataset["rows"], [])
+        self.assertEqual(manifest["counts"]["excluded"]["OUTCOME_SCOPE_MISMATCH"], 1)
 
     def test_detalhe_precisa_bater_com_o_plano(self):
         plan = accepted_plan(self.request, [("pre-aaa", T0)])
