@@ -90,7 +90,9 @@ def _empty_stat() -> Dict[str, Any]:
 
 def _update_stat(stat: Dict[str, Any], r: float) -> None:
     stat["trades"] += 1
-    stat["total_r"] += r
+    # An overflowed aggregate stays unavailable; later cancellation cannot
+    # resurrect it as evidence. Other independent buckets remain usable.
+    stat["total_r"] = _add_r(stat["total_r"], r)
     if r > 0:
         stat["wins"] += 1
     elif r < 0:
@@ -99,6 +101,9 @@ def _update_stat(stat: Dict[str, Any], r: float) -> None:
 
 def _finalize_stat(stat: Dict[str, Any]) -> Dict[str, Any]:
     n = stat["trades"]
+    if stat["total_r"] is None:
+        stat.update(win_rate=None, avg_r=None, numeric_error="aggregate_not_finite")
+        return stat
     if n > 0:
         stat["win_rate"] = round(stat["wins"] / n * 100, 1)
         stat["avg_r"] = round(stat["total_r"] / n, 2)
@@ -134,10 +139,38 @@ def _valid_r(value):
         return None, R_MISSING
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None, R_TYPE
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None, R_NOT_FINITE
     if not math.isfinite(number):
         return None, R_NOT_FINITE
     return number, None
+
+
+def _add_r(total, r):
+    """Keep the original addition order, but never retain a non-finite sum."""
+    if total is None:
+        return None
+    return _valid_r(total + r)[0]
+
+
+def _total_r(values):
+    total = 0.0
+    for r in values:
+        total = _add_r(total, r)
+        if total is None:
+            break
+    return total
+
+
+def _unavailable_aggregate(n, wins, quality):
+    # Keep observed counts, not a fabricated empty sample. Existing consumers
+    # rely on sample_ok/verdict, so an unusable aggregate cannot gain merit.
+    return {"trades": n, "wins": wins, "losses": n - wins,
+            "win_rate": None, "avg_r": None, "total_r": None,
+            "sample_ok": False, "verdict": "amostra_pequena",
+            "numeric_error": "aggregate_not_finite", "data_quality": quality}
 
 
 def _empty_quality() -> Dict[str, Any]:
@@ -162,20 +195,18 @@ def _partition_r(snaps):
 
 def _valid_count(value):
     """Contagem inteira não negativa. Bool não é contagem; float integral normaliza."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    number, reason = _valid_r(value)
+    if reason is not None:
         return None
     if isinstance(value, int):
         return value if value >= 0 else None
-    number = float(value)
     return int(number) if math.isfinite(number) and number >= 0 and number.is_integer() else None
 
 
 def _valid_rate(value):
     """Taxa de acerto em pontos percentuais [0, 100]."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    number = float(value)
-    return number if math.isfinite(number) and 0.0 <= number <= 100.0 else None
+    number, reason = _valid_r(value)
+    return number if reason is None and 0.0 <= number <= 100.0 else None
 
 
 async def compute_stats_by_bucket(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[str, Any]:
@@ -269,7 +300,7 @@ async def compute_stats_by_bucket(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[st
         ("pattern", patterns), ("funding", fundings),
     ]:
         for key, stat in bucket.items():
-            if stat["trades"] < MIN_SAMPLE_BUCKET:
+            if stat["trades"] < MIN_SAMPLE_BUCKET or stat["win_rate"] is None:
                 continue
             all_combos.append({
                 "category": label,
@@ -290,19 +321,19 @@ async def compute_stats_by_bucket(days: int = LEARNING_LOOKBACK_DAYS) -> Dict[st
     )[:8]
 
     # ── Edge total do sistema ────────────────────────────────────────────
-    total_r = sum(r for _, r in valid)
+    total_r = _total_r(r for _, r in valid)
     overall_win_rate = sum(1 for _, r in valid if r > 0) / total * 100
+    overall = ({"win_rate_pct": None, "total_r": None, "avg_r": None,
+                "numeric_error": "aggregate_not_finite"} if total_r is None else {
+                    "win_rate_pct": round(overall_win_rate, 1),
+                    "total_r": round(total_r, 2), "avg_r": round(total_r / total, 2)})
 
     result = {
         "enabled": True,
         "days": days,
         "total_trades": total,
         "data_quality": quality,
-        "overall": {
-            "win_rate_pct": round(overall_win_rate, 1),
-            "total_r": round(total_r, 2),
-            "avg_r": round(total_r / total, 2),
-        },
+        "overall": overall,
         "by_tier": tiers,
         "by_timeframe": tfs,
         "by_direction": directions,
@@ -356,8 +387,10 @@ async def lookup_historical_for(
                 "sample_ok": False, "verdict": "sem_historico", "data_quality": quality}
 
     wins = sum(1 for _, r in valid if r > 0)
-    total_r = sum(r for _, r in valid)
+    total_r = _total_r(r for _, r in valid)
     n = len(valid)
+    if total_r is None:
+        return _unavailable_aggregate(n, wins, quality)
     wr = wins / n * 100
     avg_r = total_r / n
 
@@ -414,8 +447,12 @@ async def lookup_historical_batch(
                          "data_quality": quality}
             continue
         wins = sum(1 for r in rs if r > 0)
+        total_r = _total_r(rs)
+        if total_r is None:
+            result[k] = _unavailable_aggregate(n, wins, quality)
+            continue
         wr = wins / n * 100
-        avg_r = sum(rs) / n
+        avg_r = total_r / n
         if n < MIN_SAMPLE_BUCKET:
             verdict = "amostra_pequena"
         elif wr >= WINNING_THRESHOLD * 100:
@@ -490,8 +527,12 @@ async def compute_symbol_stats(
             }
             continue
         wins = sum(1 for r in rs if r > 0)
+        total_r = _total_r(rs)
+        if total_r is None:
+            result[base] = _unavailable_aggregate(n, wins, quality)
+            continue
         wr = wins / n * 100
-        avg_r = sum(rs) / n
+        avg_r = total_r / n
         sample_ok = n >= ROTATION_MIN_SAMPLE
         if not sample_ok:
             verdict = "amostra_pequena"
@@ -507,7 +548,7 @@ async def compute_symbol_stats(
             "losses": n - wins,
             "win_rate": round(wr, 1),
             "avg_r": round(avg_r, 3),
-            "total_r": round(sum(rs), 2),
+            "total_r": round(total_r, 2),
             "sample_ok": sample_ok,
             "verdict": verdict,
             "data_quality": quality,

@@ -5,9 +5,9 @@ interface BucketStat {
   trades: number
   wins: number
   losses: number
-  win_rate: number
-  avg_r: number
-  total_r: number
+  win_rate: number | null
+  avg_r: number | null
+  total_r: number | null
 }
 
 interface Combo {
@@ -24,7 +24,7 @@ interface Insights {
   message?: string
   days?: number
   total_trades?: number
-  overall?: { win_rate_pct: number; total_r: number; avg_r: number }
+  overall?: { win_rate_pct: number | null; total_r: number | null; avg_r: number | null }
   by_tier?: Record<string, BucketStat>
   by_timeframe?: Record<string, BucketStat>
   by_direction?: Record<string, BucketStat>
@@ -48,11 +48,20 @@ const CATEGORY_LABEL: Record<string, string> = {
   session: 'Sessão', dow: 'Dia', pattern: 'Padrão', funding: 'Funding',
 }
 
-function colorForRate(rate: number, baseline: number): string {
+function colorForRate(rate: number | null, baseline: number): string {
+  if (rate == null) return 'text-slate-500'
   if (rate >= 60) return 'text-emerald-300'
   if (rate >= baseline) return 'text-green-400'
   if (rate >= 40) return 'text-yellow-300'
   return 'text-red-300'
+}
+
+function colorForR(value: number | null): string {
+  return value == null ? 'text-slate-500' : value >= 0 ? 'text-emerald-300' : 'text-red-300'
+}
+
+function formatR(value: number | null, digits: number): string {
+  return value == null ? '—' : `${value >= 0 ? '+' : ''}${value.toFixed(digits)}R`
 }
 
 function BucketTable({ title, data, baseline }: { title: string; data: Record<string, BucketStat> | undefined; baseline: number }) {
@@ -66,10 +75,10 @@ function BucketTable({ title, data, baseline }: { title: string; data: Record<st
             <span className="text-slate-300 truncate flex-1">{k}</span>
             <span className="text-slate-500 mr-2 font-mono">{s.trades}</span>
             <span className={`font-mono font-bold w-12 text-right ${colorForRate(s.win_rate, baseline)}`}>
-              {s.win_rate.toFixed(0)}%
+              {s.win_rate == null ? '—' : `${s.win_rate.toFixed(0)}%`}
             </span>
-            <span className={`font-mono w-14 text-right ${s.avg_r >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>
-              {s.avg_r >= 0 ? '+' : ''}{s.avg_r.toFixed(2)}R
+            <span className={`font-mono w-14 text-right ${colorForR(s.avg_r)}`}>
+              {formatR(s.avg_r, 2)}
             </span>
           </div>
         ))}
@@ -164,21 +173,21 @@ export default function InsightsPanel({ onClose }: Props) {
                 <div className="bg-violet-500/10 border border-violet-500/30 rounded-lg p-3">
                   <div className="text-[10px] text-slate-500 uppercase">Win Rate Geral</div>
                   <div className={`text-2xl font-bold font-mono ${colorForRate(data.overall.win_rate_pct, baseline)}`}>
-                    {data.overall.win_rate_pct.toFixed(1)}%
+                    {data.overall.win_rate_pct == null ? '—' : `${data.overall.win_rate_pct.toFixed(1)}%`}
                   </div>
                   <div className="text-[10px] text-slate-600">baseline {baseline}%</div>
                 </div>
                 <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3">
                   <div className="text-[10px] text-slate-500 uppercase">R Total</div>
-                  <div className={`text-2xl font-bold font-mono ${data.overall.total_r >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>
-                    {data.overall.total_r >= 0 ? '+' : ''}{data.overall.total_r.toFixed(1)}R
+                  <div className={`text-2xl font-bold font-mono ${colorForR(data.overall.total_r)}`}>
+                    {formatR(data.overall.total_r, 1)}
                   </div>
                   <div className="text-[10px] text-slate-600">{totalTrades} trades</div>
                 </div>
                 <div className="bg-slate-700/20 border border-slate-600/30 rounded-lg p-3">
                   <div className="text-[10px] text-slate-500 uppercase">R Médio/Trade</div>
-                  <div className={`text-2xl font-bold font-mono ${data.overall.avg_r >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>
-                    {data.overall.avg_r >= 0 ? '+' : ''}{data.overall.avg_r.toFixed(2)}R
+                  <div className={`text-2xl font-bold font-mono ${colorForR(data.overall.avg_r)}`}>
+                    {formatR(data.overall.avg_r, 2)}
                   </div>
                   <div className="text-[10px] text-slate-600">expectativa por trade</div>
                 </div>

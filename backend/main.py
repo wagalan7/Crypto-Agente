@@ -1966,7 +1966,10 @@ async def rotation_symbol_stats(days: int = 0):
         stats = await compute_symbol_stats(days=d)
         rows = sorted(
             ({"symbol": k, **v} for k, v in stats.items()),
-            key=lambda r: (r["sample_ok"], r["avg_r"]),
+            # Missing evidence sorts last within its sample class; the payload
+            # keeps None (not a fabricated zero-R result).
+            key=lambda r: (r["sample_ok"], r["avg_r"] is not None,
+                           r["avg_r"] if r["avg_r"] is not None else 0.0),
             reverse=True,
         )
         return {

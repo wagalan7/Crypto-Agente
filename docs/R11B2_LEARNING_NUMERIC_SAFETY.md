@@ -91,7 +91,7 @@ relearn nem limpeza de tabela:
 | `confidence = NaN` | passava no corte e aplicava 0,8 | `1.0` |
 | `size_quality_mult = 0.0` | virava 1,0 rotulado "neutro" | `1.0` — inválido explícito |
 | `mult = 2.0` / `0.10` | 1,15 / 0,75 | 1,15 / 0,75 (clamp preservado) |
-| TF exato NaN + outro TF 1,15 | usava o outro (1,15) | `1.0`, sem fallback |
+| TF exato com mult NaN + outro TF 1,15 | clamp do próprio NaN produzia 1,15 | `1.0`, sem fallback |
 
 ## Relearn: não contaminar de novo
 
@@ -147,3 +147,44 @@ usada, inclusive pelo fallback entre timeframes — que não foi alterado.
 Também seguem abertos do R11A: A2 (histerese contando chamadas), A3 (janela do
 edge decay que contém a janela recente), M1, M4–M8 e B1–B3. Nada aqui
 demonstra redução de stops ou aumento de lucro.
+
+## Fechamento da revisão — 20/09/2026
+
+Base da correção: `da472b9c`. Os três apontamentos reproduzidos na revisão
+foram corrigidos no mesmo patch, sem nova fase operacional:
+
+1. **Compatibilidade da API:** `/api/rotation/symbol-stats` ordena médias
+   ausentes depois das médias conhecidas dentro da classe de amostra. O JSON
+   continua com `None`; zero registrado permanece zero. O teste ASGI usa a
+   função real da rota sem importar o boot nem abrir banco/rede.
+2. **Configuração numérica:** deadband em `[0, 0.5]`, limites de size e
+   intermediários são validados antes dos clamps, tanto na derivação quanto
+   no accessor. `NaN` não pode produzir `1.15` disfarçado de resultado finito.
+   O extremo 0.5 permanece válido (faixa neutra completa antes da penalidade).
+   CALIB_FACTOR é validado na derivação; não virou dependência nova da leitura
+   de linhas históricas. Nenhuma ENV/default foi alterada.
+3. **Conversões e agregados:** inteiro sem representação float finita é
+   rejeitado com motivo; uma linha assim não aborta o lote do relearn. As
+   somas conservam a ordem aritmética anterior, mas overflow fica marcado
+   como `aggregate_not_finite`, com métricas `None` e sem mérito/boost/block.
+   Contagens de entradas individualmente finitas permanecem informativas:
+   não são reclassificadas como linhas inválidas nem viram amostra vazia.
+   Um agregado que estourou não volta a ser válido por cancelamento posterior.
+   Buckets independentes válidos continuam funcionando normalmente.
+
+**Compatibilidade da tela:** `InsightsPanel` passou a aceitar e mostrar `—`
+para as métricas indisponíveis, preservando a exibição de zero, positivos e
+negativos. Mudança mínima de apresentação necessária ao retorno seguro de
+overflow; nenhum botão, painel ou decisão nova. `frontend/dist` não foi tocado.
+
+**Evidência:** 8 testes novos de API/learning (RED: 8 falhas + 1 erro) e 7 de
+símbolos (RED: 28 falhas + 16 erros em subcasos), todos GREEN. A matriz de
+símbolos inclui 100 combinações válidas, defaults opcionais, configuração e
+linhas extremas no relearn. Suíte completa: **1.932 executados, 1.930 aprovados,
+2 skips R05C preexistentes**. TypeScript sem erros. Teste Node renderiza o
+TSX real com React, estado sintético e efeitos desativados:
+`cd frontend && node scripts/test-r11b2-insights.cjs`.
+
+Nenhum acesso a produção/banco externo/exchange, ordem ou mensagem real.
+Histerese, edge decay, limites operacionais e demais pendências acima intactos.
+Testes não demonstram rentabilidade nem ausência de todo defeito possível.

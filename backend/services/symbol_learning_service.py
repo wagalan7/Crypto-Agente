@@ -92,7 +92,10 @@ def _finite(value) -> Optional[float]:
     """Número real finito. bool, string (mesmo numérica), objeto e None → None."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
     return number if math.isfinite(number) else None
 
 
@@ -103,7 +106,9 @@ def _count(value, default=None) -> Optional[int]:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value if value >= 0 else None
+        # A confiança usa aritmética float; inteiro sem representação finita
+        # não pode entrar no ranking e abortar a segunda passada do relearn.
+        return value if value >= 0 and _finite(value) is not None else None
     number = _finite(value)
     if number is None or number < 0 or not number.is_integer():
         return None
@@ -122,6 +127,10 @@ def _eligible_with_reason(stats):
     """(métricas, None) ou (None, motivo ∈ {amostra_pequena, numerico})."""
     if not isinstance(stats, dict):
         return None, _ELIGIBLE_INVALID
+    min_trades = _count(MIN_TRADES)
+    calib_factor = _finite(CALIB_FACTOR)
+    if min_trades is None or calib_factor is None:
+        return None, _ELIGIBLE_INVALID
     n = _count(stats.get("n_trades"), default=0)
     if n is None:
         return None, _ELIGIBLE_INVALID
@@ -130,7 +139,7 @@ def _eligible_with_reason(stats):
         # Ausência de edge out-of-sample é inelegibilidade; valor presente e
         # inválido (string, bool, NaN, ±inf) é rejeição numérica.
         return None, (_ELIGIBLE_SMALL if stats.get("wf_avg_r") is None else _ELIGIBLE_INVALID)
-    if n < MIN_TRADES:
+    if n < min_trades:
         return None, _ELIGIBLE_SMALL
     # Metadados legados AUSENTES conservam os defaults da fórmula (0), sem
     # serem apresentados como observação comprovada. Presente e inválido, não.
@@ -138,7 +147,7 @@ def _eligible_with_reason(stats):
     expiry = _bounded(stats.get("expiry_pct"), 0.0, 100.0, default=0.0)
     if wf_n is None or expiry is None:
         return None, _ELIGIBLE_INVALID
-    calib = _finite(wf * CALIB_FACTOR)
+    calib = _finite(wf * calib_factor)
     if calib is None:
         return None, _ELIGIBLE_INVALID
     return {"n": n, "wf": wf, "wf_n": wf_n, "expiry": expiry, "calib": calib}, None
@@ -163,24 +172,33 @@ def _mult_from_rank(percentile: float, expiry: float) -> Optional[float]:
     None — a camada não é aplicada em vez de devolver um multiplicador fictício."""
     rank = _bounded(percentile, 0.0, 1.0)
     penalty = _bounded(expiry, 0.0, 100.0)
-    if rank is None or penalty is None:
+    limits = _rank_limits()
+    if rank is None or penalty is None or limits is None:
         return None
+    lo, hi, deadband = limits
     d = rank - 0.5
-    span = max(1e-6, 0.5 - REL_DEADBAND)
-    if abs(d) <= REL_DEADBAND:
+    span = max(1e-6, 0.5 - deadband)
+    if abs(d) <= deadband:
         m = 1.0
     elif d > 0:
-        frac = min(1.0, (d - REL_DEADBAND) / span)
-        m = 1.0 + frac * (SIZE_MULT_MAX - 1.0)
+        frac = _finite((d - deadband) / span)
+        if frac is None:
+            return None
+        m = 1.0 + min(1.0, frac) * (hi - 1.0)
     else:
-        frac = min(1.0, (-d - REL_DEADBAND) / span)
-        m = 1.0 - frac * (1.0 - SIZE_MULT_MIN)
+        frac = _finite((-d - deadband) / span)
+        if frac is None:
+            return None
+        m = 1.0 - min(1.0, frac) * (1.0 - lo)
     # Penalidade por expiry histórico (alvos raramente batidos a tempo).
     if penalty >= 45:
         m *= 0.85
     elif penalty >= 30:
         m *= 0.92
-    clamped = _finite(round(max(SIZE_MULT_MIN, min(SIZE_MULT_MAX, m)), 4))
+    # min/max podem mascarar NaN/inf; validar o intermediário antes do clamp.
+    if _finite(m) is None:
+        return None
+    clamped = _finite(round(max(lo, min(hi, m)), 4))
     return clamped
 
 
@@ -196,6 +214,8 @@ def derive_params(stats: dict, edge_percentile: float) -> Optional[dict]:
         return None
     # Confiança: cresce com amostra total e com o tamanho do braço out-of-sample.
     conf = (min(1.0, em["n"] / 120.0)) * (0.5 + 0.5 * min(1.0, em["wf_n"] / 40.0))
+    if _finite(conf) is None:
+        return None
     conf = _bounded(round(max(0.0, min(1.0, conf)), 3), 0.0, 1.0)
     if conf is None:
         return None
@@ -369,12 +389,23 @@ async def refresh_cache() -> int:
         return 0
 
 
+def _rank_limits():
+    """Configuração do ranking, validada também ao aplicar linhas do cache."""
+    lo, hi = _finite(SIZE_MULT_MIN), _finite(SIZE_MULT_MAX)
+    deadband = _bounded(REL_DEADBAND, 0.0, 0.5)
+    if lo is None or hi is None or deadband is None or not 0.0 < lo <= hi:
+        return None
+    # 0.5 é legítimo: toda a faixa de percentis fica neutra antes da penalidade.
+    return lo, hi, deadband
+
+
 def _size_limits():
     """Limites desta camada. Não finitos ou incoerentes ⇒ no-op (sem consertar ENV)."""
-    lo, hi = _finite(SIZE_MULT_MIN), _finite(SIZE_MULT_MAX)
+    limits = _rank_limits()
     min_conf = _bounded(MIN_CONFIDENCE_APPLY, 0.0, 1.0)
-    if lo is None or hi is None or min_conf is None or not 0.0 < lo <= hi:
+    if limits is None or min_conf is None:
         return None
+    lo, hi, _ = limits
     return lo, hi, min_conf
 
 

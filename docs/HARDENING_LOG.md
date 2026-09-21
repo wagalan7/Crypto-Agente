@@ -1981,3 +1981,25 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
   válida e elegível ao fallback entre timeframes); A2, A3, M1, M4–M8 e B1–B3
   seguem pendentes. Calibração, score, tier, stop, TP, risco, flags, histerese e
   edge decay não foram tocados. Sem push, deploy, endpoint, ordem ou mensagem.
+
+## R11B2 — fechamento dos três apontamentos da revisão (20/09/2026)
+
+- Base `da472b9c`, checkout principal/main; alterações pessoais preservadas.
+- API de estatísticas da rotação: ordenação aceita média ausente sem erro 500,
+  sem converter a evidência ausente em zero; teste ASGI da rota real.
+- Size por moeda: deadband `[0,0.5]` e configuração/intermediários finitos antes
+  dos clamps. Inteiros não representáveis são rejeitados sem exceção nem
+  interrupção das demais linhas válidas do relearn; accessor cobre cache antigo.
+- Learning: overflow de agregado => `numeric_error=aggregate_not_finite`,
+  métricas ausentes, sem boost/block/promote/demote. Contagens preservadas,
+  mesmo ordenamento aritmético para dados válidos, sem recuperação fictícia por
+  cancelamento posterior. Conversões extremas não escapam dos validadores.
+- InsightsPanel: adaptação mínima para renderizar `—` em métricas ausentes;
+  zero/valores válidos preservados. Sem alterar `frontend/dist`.
+- Testes: 15 novos métodos RED→GREEN; suíte completa **1.932 executados,
+  1.930 aprovados, 2 skips R05C conhecidos**. TypeScript e renderização React
+  real com dados sintéticos aprovados. Sem dependências instaladas nem DB real.
+- Nenhuma mudança em estratégia, limites, flags, histerese ou edge decay.
+  Nenhuma ordem, notificação real, backfill ou alteração histórica. M3 e demais
+  pendências R11A continuam fora deste fechamento. Publicação não executada
+  nesta validação local.
