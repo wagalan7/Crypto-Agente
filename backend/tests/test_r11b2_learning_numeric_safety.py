@@ -570,11 +570,14 @@ class ValidDataParity(SafetyCase):
 
 class Architecture(unittest.TestCase):
     def test_only_the_two_services_changed(self):
+        """Escopo do PACOTE R11B2: audita o range do próprio commit, não o
+        worktree — lotes posteriores acrescentam serviços legitimamente."""
         import subprocess
-        res = subprocess.run(["git", "diff", "--name-only", "ec5c2fd9", "--", "backend/services"],
+        res = subprocess.run(["git", "diff", "--name-only", "ec5c2fd9..da472b9c",
+                              "--", "backend/services"],
                              cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
-            self.skipTest("baseline ec5c2fd9 indisponível neste checkout")
+            self.skipTest("range ec5c2fd9..da472b9c indisponível neste checkout")
         self.assertEqual(sorted(res.stdout.split()),
                          ["backend/services/learning_service.py",
                           "backend/services/symbol_learning_service.py"])
