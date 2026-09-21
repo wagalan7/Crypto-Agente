@@ -621,7 +621,10 @@ class HotPath(unittest.TestCase):
             self.assertNotIn("new_execution_trace", block, fn)
 
     def test_persistencia_marcada_apos_open_trade(self):
-        block = self.src.split("trade = await _open_trade_fail_closed(")[-1][:2600]
+        # Janela ampliada no lote final: o fechamento da intenção P03 entra
+        # entre a persistência e a telemetria. As duas marcas continuam DEPOIS
+        # do open_trade, que é o que este teste protege.
+        block = self.src.split("trade = await _open_trade_fail_closed(")[-1][:3200]
         self.assertIn('_exec_mark(_exec_trace, "real_trade_persisted_at")', block)
         self.assertIn("trade_persisted=trade is not None", block)
         self.assertIn('source == "auto"', block)

@@ -1195,6 +1195,150 @@ def _observe_transport(rec: dict, result) -> None:
         pass
 
 
+# ── P03: UMA entrada econômica por decisão (SAFETY_FIX) ────────────────────
+# A intenção é reservada e COMMITADA antes do primeiro POST; o `client_order_id`
+# vem dela, então a mesma decisão reapresentada com outro snapshot não vira uma
+# segunda ordem. Sem banco/identidade não há envio (fail-closed).
+_INTENT_OWNER = f"{os.getpid()}-{int(time.time())}"
+
+
+def _entry_account_ref() -> str:
+    """Conta/exchange sem expor segredo: exchange ativa + ambiente."""
+    try:
+        environment = "mainnet" if _exchange_is_production() else "testnet"
+    except Exception:
+        environment = "mainnet"
+    return f"{_active_exchange_name()}:{environment}"
+
+
+def _entry_intent_identity(rec: dict, side: str, purpose: str = "ENTRY"):
+    """Identidade estável da decisão. None quando falta vela/gatilho."""
+    try:
+        from services.entry_intent_service import EntryIdentity
+        symbol = str(rec.get("symbol") or "")
+        quote = symbol.split("/")[1].split(":")[0] if "/" in symbol else "USDT"
+        signal = rec.get("signal") if isinstance(rec.get("signal"), dict) else {}
+        proof = rec.get("data_freshness") or signal.get("data_freshness") or {}
+        candle = proof.get("candle") if isinstance(proof, dict) else {}
+        provenance = rec.get("score_provenance") if isinstance(rec.get("score_provenance"), dict) else {}
+        return EntryIdentity(
+            account_ref=_entry_account_ref(), exchange=_active_exchange_name(),
+            symbol=symbol.replace("/", "-").replace(":", "-"), quote=quote, side=side,
+            position_side="BOTH", timeframe=str(rec.get("timeframe") or "na"),
+            playbook=str(rec.get("playbook") or "CHAMPION_LEGACY"),
+            playbook_version=str(provenance.get("formula_effective") or "LEGACY"),
+            purpose=purpose,
+            trigger_candle_ms=int((candle or {}).get("close_time_ms") or 0))
+    except Exception:
+        return None
+
+
+async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: float,
+                                tp1, tp2, qty: float, equity_usd: float) -> dict:
+    """Reserva a intenção ANTES de qualquer mutação de ordem."""
+    from services import entry_intent_service as intents
+    from db import get_session
+    blocked = {"granted": False, "decision": intents.UNAVAILABLE, "reason": "IDENTITY_UNAVAILABLE",
+               "dispatched": False}
+    identity = _entry_intent_identity(rec, side)
+    if identity is None:
+        return blocked
+    try:
+        payload = {"entry": float(entry), "stop_loss": float(stop),
+                   "tp1": float(tp1) if tp1 is not None else None,
+                   "tp2": float(tp2) if tp2 is not None else None,
+                   "leverage": int(rec.get("leverage") or 1)}
+        capacity = intents.Capacity(
+            risk_usd=abs(float(entry) - float(stop)) * float(qty),
+            max_open_positions=None,
+            max_open_risk_usd=(float(equity_usd) * MAX_TOTAL_OPEN_RISK_PCT / 100.0
+                               if MAX_TOTAL_OPEN_RISK_PCT > 0 and equity_usd else None),
+            open_risk_usd=(await _open_risk_usd() if MAX_TOTAL_OPEN_RISK_PCT > 0 else 0.0))
+    except Exception as exc:
+        log.warning(f"[p03-intent] payload/capacidade indisponível: {exc}")
+        return blocked
+    reservation = await intents.reserve(get_session, identity, payload, owner=_INTENT_OWNER,
+                                        capacity=capacity)
+    return {"granted": reservation.granted, "decision": reservation.decision,
+            "reason": reservation.reason, "intent_key": reservation.intent_key,
+            "client_order_id": reservation.client_order_id, "state": reservation.state,
+            "dispatched": False}
+
+
+async def _intent_dispatch_guard(intent) -> bool:
+    """Guard antes de CADA POST: só o dono do lease vivo em SENDING despacha."""
+    if not isinstance(intent, dict) or not intent.get("granted"):
+        return False
+    from services import entry_intent_service as intents
+    from db import get_session
+    key = intent.get("intent_key")
+    if not intent.get("dispatched"):
+        if not await intents.mark_sending(get_session, key, owner=_INTENT_OWNER):
+            return False
+        intent["dispatched"] = True
+        intent["state"] = "SENDING"
+    return await intents.may_dispatch(get_session, key, owner=_INTENT_OWNER)
+
+
+async def _settle_entry_intent(intent, order_res) -> None:
+    """Classifica o desfecho do envio. ACK não prova fill; dúvida vira UNKNOWN."""
+    if not isinstance(intent, dict) or not intent.get("granted") or not intent.get("dispatched"):
+        return
+    from services import entry_intent_service as intents
+    from db import get_session
+    key = intent.get("intent_key")
+    result = order_res if isinstance(order_res, dict) else {}
+    if (result.get("manual_intervention_required") or result.get("quarantine_required")
+            or result.get("emergency_close_attempted")
+            or str(result.get("safety_state") or "").upper().endswith("UNKNOWN")):
+        await intents.mark_unknown(get_session, key, reason="SAFETY_STATE_UNKNOWN")
+        intent["state"] = "UNKNOWN"
+        return
+    if result.get("entry_not_submitted") is True:
+        await intents.mark_terminal(get_session, key, reason="ENTRY_NOT_SUBMITTED")
+        intent["state"] = "TERMINAL"
+        return
+    if result.get("ok") is True:
+        return   # confirmação só com o RealTrade persistido
+    if result.get("no_fill") is True:
+        await intents.mark_terminal(get_session, key, reason="NO_FILL")
+        intent["state"] = "TERMINAL"
+        return
+    await intents.mark_unknown(get_session, key, reason="DISPATCH_OUTCOME_UNKNOWN")
+    intent["state"] = "UNKNOWN"
+
+
+async def _close_entry_intent(intent, trade, *, pending_entry: bool = False) -> None:
+    """Fecha a intenção após a persistência: vínculo idempotente com o RealTrade."""
+    if not isinstance(intent, dict) or not intent.get("granted"):
+        return
+    from services import entry_intent_service as intents
+    from db import get_session
+    key = intent.get("intent_key")
+    if not intent.get("dispatched"):
+        await intents.release_reserved(get_session, key, owner=_INTENT_OWNER,
+                                       reason="NOT_DISPATCHED")
+        intent["state"] = "TERMINAL"
+        return
+    if intent.get("state") in ("UNKNOWN", "TERMINAL"):
+        return
+    trade_id = None
+    if isinstance(trade, dict):
+        trade_id = trade.get("id")
+    elif trade is not None:
+        trade_id = getattr(trade, "id", None)
+    if trade_id is None:
+        await intents.mark_unknown(get_session, key, reason="PERSISTENCE_FAILED")
+        intent["state"] = "UNKNOWN"
+        return
+    if pending_entry:
+        await intents.mark_unknown(get_session, key, reason="PENDING_ENTRY_ORDER")
+        intent["state"] = "UNKNOWN"
+        return
+    await intents.mark_confirmed(get_session, key, real_trade_id=int(trade_id))
+    intent["state"] = "CONFIRMED"
+
+
 def _record_skip(rec: dict, gate: str, reason: str) -> None:
     """Registra por que uma rec (tier A/A+) não virou trade. Best-effort."""
     _observe_decision(rec, "NO_FILL" if gate == "maker-no-fill" else "REJECTED", gate)
@@ -5395,6 +5539,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
             # P05.2L — telemetria do caminho de entrada (observação pura).
             _exec_trace = None
             _entry_route = None
+            _intent = None      # P03: intenção econômica desta decisão
 
             # Partials adaptativos (por-trade) — defaults no escopo externo; o
             # cálculo real acontece no passo 1d (só no fluxo live). Em shadow o
@@ -5539,6 +5684,20 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 from services import exchange_service
                 exch_side = "Buy" if side == "long" else "Sell"
                 client_order_id = f"cw-{snap_id}"  # crypto-win + snap id
+                # P03: reserva COMMITADA antes de qualquer mutação de ordem.
+                # O client id passa a vir da INTENÇÃO (mesma decisão em outro
+                # snapshot = mesma intenção). Sem reserva não há POST.
+                _intent = await _reserve_entry_intent(
+                    rec, side=side, entry=entry, stop=stop, tp1=tp1, tp2=tp2,
+                    qty=qty, equity_usd=equity_usd)
+                if not _intent.get("granted"):
+                    log.warning(
+                        f"[p03-intent] {rec.get('symbol')} SEM entrada: "
+                        f"{_intent.get('decision')} ({_intent.get('reason')})"
+                    )
+                    _record_skip(rec, "entry-intent", str(_intent.get("decision")))
+                    continue
+                client_order_id = _intent["client_order_id"]
                 # #4: entrada MAKER (post-only) quando ligada E o helper existe na
                 # exchange ativa (Binance). Posta LIMIT GTX no entry planejado e só
                 # protege após o fill; sem P04B, no-fill desiste (não persegue).
@@ -5848,6 +6007,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             verdict["approved_qty"] = float(capped_qty)
                             return verdict
 
+                    if not await _intent_dispatch_guard(_intent):
+                        log.error(f"[p03-intent] {rec.get('symbol')} maker BLOQUEADO — zero POST")
+                        _record_skip(rec, "entry-intent", "DISPATCH_GUARD")
+                        continue
                     _observe_decision(rec, "ATTEMPTED")  # fora da janela medida (P05.2L)
                     _exec_mark(_exec_trace, "attempt_started_at")
                     order_res = await _maker_fn(
@@ -5887,6 +6050,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             "client_order_id": client_order_id,
                         }
                     else:
+                        if not await _intent_dispatch_guard(_intent):
+                            log.error(f"[p03-intent] {rec.get('symbol')} market BLOQUEADO — zero POST")
+                            _record_skip(rec, "entry-intent", "DISPATCH_GUARD")
+                            continue
                         _observe_decision(rec, "ATTEMPTED")  # fora da janela medida (P05.2L)
                         _exec_mark(_exec_trace, "attempt_started_at")
                         order_res = await exchange_service.place_order(
@@ -5904,6 +6071,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         )
                 _exec_mark(_exec_trace, "attempt_returned_at")
                 _observe_transport(rec, order_res)
+                await _settle_entry_intent(_intent, order_res)
                 if order_res.get("client_order_id"):
                     client_order_id = str(order_res["client_order_id"])
                 _needs_manual = bool(
@@ -6201,6 +6369,9 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 adaptive_runner_qty_pct=(_adaptive or {}).get("runner_qty_pct"),
                 adaptive_test_idx=_adaptive_idx,
             )
+            if source == "auto":
+                # P03: vínculo idempotente intenção ↔ RealTrade (ou UNKNOWN).
+                await _close_entry_intent(_intent, trade, pending_entry=_pending_entry_order)
             _observe_decision(rec, (
                 "INCIDENT" if _track_unprotected_incident else
                 ("PAPER_OPENED" if source == "shadow" else "OPENED")
@@ -6284,6 +6455,11 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         log.warning(f"[notify] telegram open falhou: {e}")
         except Exception as e:
             _observe_decision(rec, "UNKNOWN", "EXECUTION_EXCEPTION")
+            # P03: exceção depois do despacho pode ter enviado ordem → UNKNOWN.
+            try:
+                await _close_entry_intent(_intent, None)
+            except Exception:
+                pass
             log.warning(f"[shadow] falha abrindo trade pra {rec.get('symbol')}: {e}")
 
     # ── Feature 5 — hedge de regime adverso (1×/lote, pós-processamento das recs).
