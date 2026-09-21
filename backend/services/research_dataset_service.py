@@ -21,6 +21,7 @@ import tempfile
 from typing import Any, Iterable, Mapping
 
 from services import offline_replay_service as r10a
+from services import research_dataset_scopes as scopes
 
 EXPORTER_SCHEMA = "R10B_RESEARCH_DATASET_V1"
 COHORT = "R09_REJECTED_POST_SELECTION"
@@ -129,6 +130,8 @@ class ExportRequest:
     costs: r10a.CostConfig
     bootstrap: r10a.BootstrapConfig
     changed: tuple
+    #: Coorte exportada. O default reproduz EXATAMENTE o export antigo.
+    scope: scopes.Scope = scopes.LEGACY
 
     @property
     def bar_ms(self) -> int:
@@ -155,8 +158,12 @@ class ExportRequest:
         }
 
     def normalized(self) -> dict:
-        return {"exporter_schema": EXPORTER_SCHEMA, "cohort": COHORT,
-                "as_of_ms": self.as_of_ms, **self.payload_head()}
+        payload = {"exporter_schema": EXPORTER_SCHEMA, "cohort": self.scope.cohort,
+                   "as_of_ms": self.as_of_ms, **self.payload_head()}
+        if self.scope.scope_id != scopes.DEFAULT_SCOPE:
+            # Requisição legada continua com o MESMO hash de antes.
+            payload["scope"] = self.scope.scope_id
+        return payload
 
     def request_hash(self) -> str:
         return _sha(self.normalized())
@@ -164,6 +171,15 @@ class ExportRequest:
 
 def parse_request(raw: Any) -> ExportRequest:
     """Schema fechado; validadores R10A; nada escolhido pelo resultado."""
+    if isinstance(raw, Mapping) and "scope" in raw:
+        raw = dict(raw)
+        raw_scope = raw.pop("scope")
+    else:
+        raw_scope = None
+    try:
+        scope = scopes.resolve(raw_scope)
+    except ValueError as exc:
+        raise DatasetError(str(exc)) from None
     body = _closed(raw, REQUEST_KEYS, "requisição")
     as_of_ms = _as_of(body["as_of_utc"])
     try:
@@ -188,7 +204,8 @@ def parse_request(raw: Any) -> ExportRequest:
         raise DatasetError("candidato deve estar registrado antes do início do treino")
     if as_of_ms <= split.train_start_ms:
         raise DatasetError("as_of_utc deve ser posterior ao início do treino")
-    return ExportRequest(as_of_ms, split, baseline, candidate, costs, bootstrap, changed)
+    return ExportRequest(as_of_ms, split, baseline, candidate, costs, bootstrap, changed,
+                         scope=scope)
 
 
 @dataclass(frozen=True)
@@ -264,7 +281,7 @@ def _source_mismatch(config: Any, baseline: r10a.ReplayConfig) -> str | None:
     return None
 
 
-def _setup(row: Mapping, decision_ms: int):
+def _setup(row: Mapping, decision_ms: int, expected_scope: str = "POST_SELECTION"):
     setup = row.get("frozen_setup")
     if not isinstance(setup, Mapping):
         return None, "INVALID_SETUP"
@@ -272,7 +289,7 @@ def _setup(row: Mapping, decision_ms: int):
         return None, "OPPORTUNITY_ROW_MISSING"
     symbol = row.get("symbol")
     if (setup.get("symbol") != symbol or row.get("opportunity_symbol") != symbol
-            or row.get("opportunity_scope") != "POST_SELECTION"):
+            or row.get("opportunity_scope") != expected_scope):
         return None, "IDENTITY_MISMATCH"
     close_ms = setup.get("candle_close_ms")
     if close_ms is not None and (not _plain_number(close_ms) or close_ms > decision_ms):
@@ -322,6 +339,8 @@ def _json(value: Any) -> Any:
 def build_artifacts(request: ExportRequest, plan: SelectionPlan, detail_rows: Iterable[Mapping],
                     sealed: Mapping[str, int]) -> tuple:
     """Dataset `compare` + manifesto. Detalhes vêm SÓ dos ids admitidos."""
+    if not request.scope.exports_trajectory:
+        raise DatasetError("escopo sem trajetória: use build_feature_artifacts")
     details = {}
     for row in detail_rows:
         key = row.get("opportunity_key")
@@ -347,7 +366,8 @@ def build_artifacts(request: ExportRequest, plan: SelectionPlan, detail_rows: It
         reason = _source_mismatch(config, request.baseline)
         opportunity = None
         if reason is None:
-            opportunity, reason = _setup(row, planned.decision_ms)
+            opportunity, reason = _setup(row, planned.decision_ms,
+                                         request.scope.opportunity_scope)
         bars = None
         if reason is None:
             if row.get("candles_malformed"):
@@ -392,10 +412,9 @@ def build_artifacts(request: ExportRequest, plan: SelectionPlan, detail_rows: It
         "mode": "LOCAL_RESEARCH_ONLY", "promotable": False, "live_equivalent": False,
         "approval": None, "economic_sufficiency": "NOT_ASSESSED",
         "state": state,
-        "source": {"cohort": COHORT, "tables": [REJECTED_TABLE, OPPORTUNITY_TABLE],
+        "source": {**request.scope.manifest(),
                    "source_schema": SOURCE_SCHEMA, "source_policy": SOURCE_POLICY,
-                   "price_source": SOURCE_PRICE, "unit": "ONE_REJECTED_OPPORTUNITY",
-                   "decision_time": f"{REJECTED_TABLE}.decision_at",
+                   "price_source": SOURCE_PRICE,
                    "transaction": "REPEATABLE READ READ ONLY",
                    "outcome_or_coverage_read": False},
         "cutoff": {"as_of_ms": request.as_of_ms,
@@ -433,6 +452,142 @@ def build_artifacts(request: ExportRequest, plan: SelectionPlan, detail_rows: It
         "limitations": LIMITATIONS,
     }
     # Mesma forma em memória e em disco (tuplas viram listas; NaN é recusado).
+    return json.loads(dataset_bytes), json.loads(canonical_bytes(manifest))
+
+
+# ── Escopos sem trajetória (aceitas pré-seleção) ────────────────────────────
+FEATURE_EXCLUSION_REASONS = ("SOURCE_CONTRACT_MISMATCH", "IDENTITY_MISMATCH",
+                             "INVALID_SETUP", "PRE_SELECTION_PAYLOAD_MISSING",
+                             "TEMPORAL_INCONSISTENCY")
+FEATURE_SETUP_KEYS = ("symbol", "timeframe", "side", "playbook", "playbook_version",
+                      "trigger_candle_ms", "entry", "stop_loss", "tp1", "tp2", "atr")
+PRE_SOURCE_SCHEMA = "r09.pre.v1"
+
+
+def _pre_payload(config: Any) -> tuple:
+    """Payload pré-seleção congelado, ou o motivo de não existir."""
+    if not isinstance(config, Mapping):
+        return None, "SOURCE_CONTRACT_MISMATCH"
+    payload = config.get("r09_pre_selection")
+    if not isinstance(payload, Mapping):
+        return None, "PRE_SELECTION_PAYLOAD_MISSING"
+    if payload.get("schema_version") != PRE_SOURCE_SCHEMA or payload.get("scope") != "PRE_SELECTION":
+        return None, "SOURCE_CONTRACT_MISMATCH"
+    return payload, None
+
+
+def build_feature_artifacts(request: ExportRequest, plan: SelectionPlan,
+                            detail_rows: Iterable[Mapping], sealed: Mapping[str, int]) -> tuple:
+    """Dataset SEM trajetória: decisão, funil e disponibilidade — sem outcome.
+
+    Aceitas não têm caminho de preço coletado. Exportar um outcome aqui seria
+    inventá-lo: os campos ausentes viajam com reason code e o artefato declara
+    que NÃO é comparável no R10A.
+    """
+    scope = request.scope
+    if scope.exports_trajectory:
+        raise DatasetError("escopo com trajetória: use build_artifacts")
+    details = {}
+    for row in detail_rows:
+        key = row.get("opportunity_key")
+        if key in details:
+            raise DatasetError("detalhe duplicado para a mesma oportunidade")
+        details[key] = row
+    if set(details) != set(plan.keys):
+        raise DatasetError("detalhes não correspondem exatamente aos ids admitidos")
+    exclusions = {reason: 0 for reason in FEATURE_EXCLUSION_REASONS}
+    exported = {"training": 0, "validation": 0}
+    coverage = {"with_funnel": 0, "without_funnel": 0, "with_availability": 0,
+                "outcome_available": 0}
+    rows, source_rows = [], []
+    for planned in plan.rows:
+        row = details[planned.key]
+        if not isinstance(row.get("decision_at"), datetime) or utc_ms(row["decision_at"]) != planned.decision_ms:
+            raise DatasetError("decisão mudou entre índice e detalhe")
+        setup, config = _json(row.get("frozen_setup")), _json(row.get("frozen_config"))
+        payload, reason = _pre_payload(config)
+        if reason is None and row.get("opportunity_scope") != scope.opportunity_scope:
+            reason = "IDENTITY_MISMATCH"
+        if reason is None and not isinstance(setup, Mapping):
+            reason = "INVALID_SETUP"
+        frozen = payload.get("setup") if reason is None and isinstance(payload.get("setup"), Mapping) else None
+        if reason is None and frozen is None:
+            reason = "INVALID_SETUP"
+        if reason is None and frozen.get("symbol") != row.get("symbol"):
+            reason = "IDENTITY_MISMATCH"
+        if reason is None:
+            decided = payload.get("decision_ts_ms")
+            candle = frozen.get("trigger_candle_ms")
+            if not _plain_number(decided) or (candle is not None and not _plain_number(candle)):
+                reason = "TEMPORAL_INCONSISTENCY"
+            elif candle is not None and candle > decided:
+                reason = "TEMPORAL_INCONSISTENCY"
+        if reason is not None:
+            exclusions[reason] += 1
+            source_rows.append({"key": planned.key, "excluded": reason})
+            continue
+        funnel = payload.get("funnel") if isinstance(payload.get("funnel"), Mapping) else None
+        availability = payload.get("availability") if isinstance(payload.get("availability"), Mapping) else None
+        record = {"opportunity_key": planned.key, "decision_ts_ms": planned.decision_ms,
+                  "split": planned.split,
+                  **{key: frozen.get(key) for key in FEATURE_SETUP_KEYS},
+                  "funnel": {"first_blocker": (funnel or {}).get("first_blocker"),
+                             "blockers_observed": list((funnel or {}).get("blockers_observed") or []),
+                             "stages_not_evaluated": list((funnel or {}).get("stages_not_evaluated") or []),
+                             "out_of_order": bool((funnel or {}).get("out_of_order"))}
+                  if funnel else None,
+                  "availability": dict(availability) if availability else None,
+                  "source": dict(payload.get("source") or {}),
+                  # Ausência declarada: não existe outcome zero aqui.
+                  "outcome": None,
+                  "outcome_reason": scope.absent_map().get("outcome")}
+        rows.append(record)
+        exported[planned.split] += 1
+        coverage["with_funnel" if funnel else "without_funnel"] += 1
+        coverage["with_availability"] += bool(availability)
+        source_rows.append({"key": planned.key, "setup": frozen, "funnel": funnel})
+    dataset = {"mode": "features_only", "scope": scope.scope_id,
+               "exporter_schema": EXPORTER_SCHEMA, "rows": rows}
+    dataset_bytes = canonical_bytes(dataset)
+    if len(dataset_bytes) > MAX_ARTIFACT_BYTES:
+        raise DatasetLimitError("dataset acima de 16 MiB; estreite a janela")
+    candidates = plan.counts["training_candidates"] + plan.counts["validation_candidates"]
+    state = ("EXPORTED" if rows else
+             "EMPTY" if candidates == 0 else
+             "UNUSABLE_ALL_PURGED" if candidates == plan.counts["purged"] else "UNUSABLE_ALL_EXCLUDED")
+    manifest = {
+        "schema_version": EXPORTER_SCHEMA,
+        "mode": "LOCAL_RESEARCH_ONLY", "promotable": False, "live_equivalent": False,
+        "approval": None, "economic_sufficiency": "NOT_ASSESSED",
+        "state": state,
+        "source": {**scope.manifest(), "source_schema": PRE_SOURCE_SCHEMA,
+                   "source_policy": "OBSERVATION_ONLY",
+                   "transaction": "REPEATABLE READ READ ONLY",
+                   "outcome_or_coverage_read": False},
+        "cutoff": {"as_of_ms": request.as_of_ms,
+                   "as_of_utc": ms_datetime(request.as_of_ms).isoformat().replace("+00:00", "Z"),
+                   "decision_rule": "decision_at < min(holdout_start, as_of)",
+                   "candle_rule": "sem trajetória neste escopo"},
+        "request_hash": request.request_hash(),
+        "configs": {"split": asdict(request.split), "horizon_bars": request.horizon_bars,
+                    "registration_evidence": "OPERATOR_SUPPLIED_TIMESTAMP_NOT_INDEPENDENT_PROOF"},
+        "costs": {"status": "UNKNOWN", "observed_account_costs": False,
+                  "net_r_comparable": False},
+        "counts": {**plan.counts, "before_training": int(sealed.get("before_training", 0)),
+                   "holdout_sealed": int(sealed.get("holdout_sealed", 0)),
+                   "after_cutoff": int(sealed.get("after_cutoff", 0)),
+                   "excluded": exclusions, "exported": exported},
+        "coverage": coverage,
+        "absent_fields": scope.absent_map(),
+        "fingerprints": {"dataset_sha256": hashlib.sha256(dataset_bytes).hexdigest(),
+                         "source_sha256": _sha(source_rows)},
+        "holdout": {"policy": "SEALED", "details_read": False},
+        "analysis_command": None,
+        "limitations": LIMITATIONS + [
+            "Escopo sem trajetória: não há outcome, R, PF ou EV — nem zero.",
+            "Não é comparável no CLI R10A; serve a delta de política e turnover.",
+        ],
+    }
     return json.loads(dataset_bytes), json.loads(canonical_bytes(manifest))
 
 
@@ -499,11 +654,11 @@ async def load_dataset(session, request: ExportRequest) -> tuple:
         if (mode["read_only"], mode["isolation"]) != ("on", "repeatable read"):
             raise DatasetError("transação não está em REPEATABLE READ READ ONLY")
         as_of = ms_datetime(request.as_of_ms)
-        sealed = (await session.execute(text(_COUNTS_SQL), {
+        sealed = (await session.execute(text(scopes.counts_sql(request.scope)), {
             "train_start": ms_datetime(split.train_start_ms),
             "holdout_start": ms_datetime(split.holdout_start_ms), "as_of": as_of,
         })).mappings().one()
-        index = (await session.execute(text(_INDEX_SQL), {
+        index = (await session.execute(text(scopes.index_sql(request.scope)), {
             "train_start": ms_datetime(split.train_start_ms),
             "index_end": ms_datetime(min(split.holdout_start_ms, request.as_of_ms)),
             "row_limit": r10a.MAX_OPPORTUNITIES + 1,
@@ -511,13 +666,16 @@ async def load_dataset(session, request: ExportRequest) -> tuple:
         plan = plan_selection(request, [(row["opportunity_key"], row["decision_at"]) for row in index])
         details = []
         if plan.rows:
-            details = (await session.execute(text(_DETAIL_SQL), {
-                "keys": [row.key for row in plan.rows],
-                "los": [row.first_ms for row in plan.rows],
-                "his": [row.window_end_ms for row in plan.rows],
-                "bar_ms": request.bar_ms,
-            })).mappings().all()
-        return build_artifacts(request, plan, details, dict(sealed))
+            params = {"keys": [row.key for row in plan.rows]}
+            if scopes.detail_needs_window_params(request.scope):
+                params.update(los=[row.first_ms for row in plan.rows],
+                              his=[row.window_end_ms for row in plan.rows],
+                              bar_ms=request.bar_ms)
+            details = (await session.execute(
+                text(scopes.detail_sql(request.scope)), params)).mappings().all()
+        builder = (build_artifacts if request.scope.exports_trajectory
+                   else build_feature_artifacts)
+        return builder(request, plan, details, dict(sealed))
     finally:
         await session.rollback()
 
