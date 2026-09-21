@@ -698,7 +698,10 @@ class Isolation(unittest.TestCase):
                     usados |= {a.asname or a.name for a in node.names}
             for proibido in ("compare_registered_candidate", "run_payload"):
                 self.assertNotIn(proibido, usados, f"{path.name}: {proibido}")
+        # `portfolio_replay_service` (R10D) reutiliza o MOTOR de trajetória em
+        # vez de criar um segundo backtest; como os demais, não toca o comparador.
         self.assertEqual(sorted(users), ["decision_observation_service.py",
+                                         "portfolio_replay_service.py",
                                          "research_batch_service.py",
                                          "research_dataset_service.py"])
         main = (BACKEND / "main.py").read_text()

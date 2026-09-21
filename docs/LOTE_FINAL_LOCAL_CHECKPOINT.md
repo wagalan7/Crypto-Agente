@@ -13,10 +13,45 @@ primeiro bloco que não estiver `LOCAL_VERIFIED`. Não reiniciar blocos prontos.
 | B · R05 contrato financeiro | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (fonte nova inativa) | `services/financial_total_service.py`, `services/shadow_trade_service.py` (gate R05D), `tests/test_lote_r05d_financial_total.py` | 24 herméticos + R05A/R05B/R05C (187, 2 skips históricos) | `aad86d41` | — |
 | C · R11 política robusta | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativa) | `services/robust_policy_service.py`, `tests/test_lote_r11c_robust_policy.py`, `docs/R11A_LEARNING_ROTATION_AUDIT.md` | 32 herméticos + R11A/R11B2 preservados | `1e8eec4e` (+ `02c578b4`, escopo R11B2) | Persistência da progressão e ligação com rotação ficam para o bloco G (simulação) |
 | D · R07+R08 estratégias | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/strategy_core_service.py`, `services/score_v3_service.py`, `tests/test_lote_d_strategy_core.py`, `tests/test_lote_d_score_v3.py` | 53 + 35 herméticos; paridade do laboratório V2 do R08A | `154411d9` | Ligar núcleo ao replay é o bloco F; evidência pré-seleção é o bloco E |
-| E · R09 evidência | `LOCAL_VERIFIED` | `OBSERVATION_ONLY` (coleta desligada) | `services/preselection_observation_service.py`, `tests/test_lote_e_preselection.py` | 36 herméticos + R09/R10A/R10B preservados (137) | `<E>` | Exposição do resumo em endpoint existente fica no bloco H |
-| F · R10 replay/walk-forward | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Replay usando o núcleo D, carteira compartilhada e validação por janelas |
+| E · R09 evidência | `LOCAL_VERIFIED` | `OBSERVATION_ONLY` (coleta desligada) | `services/preselection_observation_service.py`, `tests/test_lote_e_preselection.py` | 36 herméticos + R09/R10A/R10B preservados (137) | `da607ea0` | Exposição do resumo em endpoint existente fica no bloco H |
+| F · R10 replay/walk-forward | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/research_dataset_scopes.py`, `services/research_dataset_service.py` (escopo), `services/portfolio_replay_service.py`, `services/walk_forward_service.py`, `tests/test_lote_f_dataset_scopes.py`, `tests/test_lote_f_portfolio_walk_forward.py`, `tests/test_r10a_offline_replay.py` (lista de importadores) | 17 + 47 herméticos; R09/R10A/R10B preservados (325 no conjunto) | `ee0f5ebd` + `<F>` | Carteira consome oportunidades já formadas; ligar o núcleo D ao replay ponta a ponta é trabalho do bloco G/H |
 | G · R12 simulação/go-no-go | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Tipo de experimento pré-seleção sobre `StrategyExperiment` |
 | H · Integração/documentação | `NOT_STARTED` | — | — | — | — | Resumo em endpoint existente, docs e suíte completa |
+
+## Bloco F — detalhe (concluído)
+
+Exportador (`ee0f5ebd`): escopos aceitas / vetadas / candidatos estruturais em
+cima do R10B existente. O escopo legado gera SQL BYTE A BYTE igual e mantém o
+mesmo `request_hash` quando nenhum escopo é informado. Aceitas não têm
+trajetória coletada: o artefato delas sai sem outcome, com reason code por campo
+ausente e declarando que NÃO é comparável no CLI R10A — nada de resultado
+inventado. Tudo com fixtures sintéticas, sem banco, sem `.env`, sem rede.
+
+Replay de carteira (`portfolio_replay_service`): não é um segundo backtest — a
+trajetória continua no motor R10A, identificável. Em volta dele entram universo
+ponto-no-tempo (o universo de hoje não substitui o de ontem), latência de
+scan/envio, preço executável com gate revalidado nesse instante, maker sem fill,
+parcial e fallback SOMENTE quando habilitados (default desligado), carteira
+compartilhada com capital, reservas, exposição, slots e um por símbolo — trade
+impossível não entra na soma —, custos separados por componente (ausência deixa
+a economia indisponível, nunca zero), regra conservadora para stop e alvo na
+mesma barra, gap e barra incompleta, e matriz de fidelidade por dimensão com
+`live_equivalent` sempre falso.
+
+Validação (`walk_forward_service`): janelas rolantes de verdade (mínimo de três
+dobras que avançam e não se sobrepõem — metade recente é recusada), purga pelo
+maior horizonte e embargo, disciplina de dobra (preprocessamento, seleção,
+normalização e calibração só no treino; teste final não escolhe candidato),
+pareamento que preserva as aceitas de um lado só no delta de política e no
+turnover, guarda contra exclusão seletiva, IC por blocos determinístico com
+correção de multiplicidade e métricas por janela/playbook/TF/lado/regime. Custo,
+horizonte, cobertura ou intervalo insuficientes ⇒ evidência insuficiente e
+NENHUM vencedor; vencer na validação não promove. Holdout real continua selado
+(nem carregado, nem avaliado); a fronteira é testada com holdout SINTÉTICO, com
+pré-registro anterior aos resultados e sem hash como prova de independência.
+
+Pendências do bloco F: a carteira consome oportunidades já formadas — ligar o
+núcleo D ponta a ponta no replay e expor o resumo ficam para G/H.
 
 ## Bloco E — detalhe (concluído)
 
