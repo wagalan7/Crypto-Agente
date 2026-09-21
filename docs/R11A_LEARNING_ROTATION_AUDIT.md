@@ -179,6 +179,21 @@ inclui `expired` e exige `realized_r` não nulo. Ambos usam SHADOW/papel —
 
 O pacote original R11A não corrigiu políticas. Nos acompanhamentos, R11B1
 corrigiu A1 e R11B2 corrigiu A4, A5 e M2 (detalhes em
-`R11B2_LEARNING_NUMERIC_SAFETY.md`); os demais achados, incluindo A2, A3 e M3,
-continuam pendentes. Nenhum item acima demonstra, por si, redução de stops ou
-aumento de lucro.
+`R11B2_LEARNING_NUMERIC_SAFETY.md`).
+
+**Acompanhamento R11C — 2026-09-21 (lote final local).** A2/M5, A3/M4/M7, M1,
+M3, M6, M8/B3 e os rótulos B1/B2 passaram a ter tratamento em uma política
+VERSIONADA e separada (`services/robust_policy_service.py`, versão
+`R11C_ROBUST_V1`), avaliável apenas em simulação: histerese que só avança com
+período elegível E evidência nova, baseline e janela recente disjuntos, cache
+vazio distinto de erro, referência temporal causal única com cobertura
+declarada, elegibilidade por geração de aprendizado, liquidez indisponível que
+não promove, identidade/dedupe por oportunidade e populações REAL/SHADOW/
+backtest separadas. **O default operacional continua na política anterior**: o
+seletor `R11_POLICY_VERSION` nasce em `legacy`, nenhum serviço LIVE importa o
+módulo novo e nenhum limite de risco foi alterado. Como `1.0` significa camada
+NÃO aplicada, trocar de política pode AUMENTAR o tamanho onde a camada antiga
+reduzia — por isso a ativação exige decisão humana e evidência.
+
+Os achados ainda sem tratamento nenhum permanecem listados acima. Nenhum item
+demonstra, por si, redução de stops ou aumento de lucro.

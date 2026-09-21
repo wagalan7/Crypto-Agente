@@ -11,7 +11,7 @@ primeiro bloco que não estiver `LOCAL_VERIFIED`. Não reiniciar blocos prontos.
 | --- | --- | --- | --- | --- | --- | --- |
 | A · P03 entrada idempotente | `LOCAL_VERIFIED` | `SAFETY_FIX` | `models/entry_intent.py`, `services/entry_intent_service.py`, `services/shadow_trade_service.py`, `db.py`, `tests/test_lote_p03_entry_intent.py`, `tests/pg_integration_p03_intent.py`, `tests/test_p05_2l_execution_latency.py` (janela) | 20 herméticos + integração PostgreSQL real (14 cenários) + P02/P03/P04A/P05.2L | `73099fd7` | — |
 | B · R05 contrato financeiro | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (fonte nova inativa) | `services/financial_total_service.py`, `services/shadow_trade_service.py` (gate R05D), `tests/test_lote_r05d_financial_total.py` | 24 herméticos + R05A/R05B/R05C (187, 2 skips históricos) | `<B>` | — |
-| C · R11 política robusta | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Política versionada com histerese persistente, decay disjunto, geração atômica |
+| C · R11 política robusta | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativa) | `services/robust_policy_service.py`, `tests/test_lote_r11c_robust_policy.py`, `docs/R11A_LEARNING_ROTATION_AUDIT.md` | 32 herméticos + R11A/R11B2 preservados | `<C>` | Persistência da progressão e ligação com rotação ficam para o bloco G (simulação) |
 | D · R07+R08 estratégias | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Núcleo puro + 3 playbooks + Score V3 de pesquisa |
 | E · R09 evidência | `NOT_STARTED` | `OBSERVATION_ONLY` | — | — | — | Escopo pré-seleção versionado, aceitas + vetadas |
 | F · R10 replay/walk-forward | `NOT_STARTED` | `CANDIDATE_POLICY` | — | — | — | Replay usando o núcleo D, carteira compartilhada e validação por janelas |
@@ -57,3 +57,22 @@ AUMENTAR exposição — nunca proteção, redução ou fechamento.
 Pendências do bloco B: o total real depende de funding confirmado pelo
 coletor R05C em produção (evidência externa); a conversão de comissão em outro
 ativo continua indisponível por falta de prova de taxa/par/fonte/instante.
+
+## Bloco C — detalhe (concluído)
+
+Núcleo PURO `R11C_ROBUST_V1`, sem I/O e com instante injetado: histerese que
+exige período elegível E evidência nova (chamada repetida, preview, restart e
+concorrência não aceleram; evidência contrária reinicia; troca da fonte do
+universo reinicia), decay com baseline e janela recente DISJUNTOS (o prejuízo
+recente não derruba a própria referência: −1,0R recente agora corta até o piso),
+cache vazio válido × erro, referência temporal causal única com cobertura
+declarada, elegibilidade por geração de aprendizado (sem aplicar o melhor TF em
+outro timeframe), liquidez indisponível que não promove, identidade por
+oportunidade com dedupe e populações separadas, e mérito com EV líquido
+descontado no tempo, estabilidade por janelas, incerteza e correção por número
+de candidatos.
+
+Pendência do bloco C: a progressão da histerese ainda não tem persistência
+transacional própria (o núcleo é puro e recebe/devolve o estado); isso entra na
+simulação do bloco G, junto do plano de rotação simulado. Nenhum serviço LIVE
+importa o módulo, e o seletor `R11_POLICY_VERSION` nasce em `legacy`.
