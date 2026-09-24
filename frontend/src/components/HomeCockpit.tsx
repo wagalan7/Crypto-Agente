@@ -210,6 +210,13 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
     }
   }, [load])
 
+  // Pausa de propriedade do P03 (incidente de execução aberto). Enquanto ela
+  // durar, o kill switch NÃO retoma — o backend re-carimba a pausa — e o
+  // auto-resume da virada de dia/semana também não dispara. Prometer retomada
+  // automática aqui foi o que fez o operador clicar em "Retomar agora" por dias.
+  const p03Blocked = !!risk?.trading_paused && !risk?.pause_manual
+    && (risk?.pause_reason ?? '').startsWith('P03-QUARANTINE:')
+
   const totalR = summary?.total_r ?? 0
   const pnlPct = summary?.total_pct_banca ?? null
   const pnlPositive = totalR >= 0
@@ -330,16 +337,21 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                     </div>
                     <div className="text-[11.5px] text-red-300/80 mt-0.5">
                       {risk.pause_reason ?? 'Limite de drawdown atingido.'}
-                      {!risk.pause_manual && ' · Retoma sozinho na virada do dia UTC quando o DD recuperar.'}
+                      {p03Blocked
+                        ? ' · Só destrava quando o incidente de execução encerrar: nem o botão, nem a virada de dia UTC retomam antes disso.'
+                        : (!risk.pause_manual && ' · Retoma sozinho na virada do dia UTC quando o DD recuperar.')}
                     </div>
                   </div>
                 </div>
                 <button
-                  onClick={resumeTrading}
-                  disabled={resuming}
+                  onClick={p03Blocked ? onOpenStatus : resumeTrading}
+                  disabled={resuming || (p03Blocked && !onOpenStatus)}
+                  title={p03Blocked
+                    ? 'Incidente de execução aberto: o backend recusa a retomada manual até ele encerrar.'
+                    : undefined}
                   className="shrink-0 text-[12px] font-bold px-3.5 py-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 text-red-100 disabled:opacity-50"
                 >
-                  {resuming ? 'Retomando…' : 'Retomar agora'}
+                  {p03Blocked ? 'Ver incidente' : (resuming ? 'Retomando…' : 'Retomar agora')}
                 </button>
               </div>
             )}
