@@ -314,5 +314,36 @@ class LegacyInvariants(unittest.TestCase):
         self.assertEqual(_NET, [])
 
 
+class JanelaVaziaComprovada(unittest.TestCase):
+    """Zero conhecido ≠ consulta desconhecida — senão a 1ª operação nunca sai."""
+
+    def test_janela_consultada_e_vazia_permite_aumentar_exposicao(self):
+        payload = fts.aggregate([], account_scope="conta",
+                                collection={"pagination_complete": True,
+                                            "overlap_resolved": True})
+        self.assertEqual(payload["state"], fts.STATE_UNKNOWN)
+        verdict = fts.exposure_verdict(payload)
+        self.assertTrue(verdict["allow_exposure_increase"])
+        self.assertTrue(verdict.get("known_empty_window"))
+        self.assertIsNone(verdict["reason_code"])
+
+    def test_coleta_nao_provada_continua_bloqueando(self):
+        payload = fts.aggregate([], account_scope="conta")
+        verdict = fts.exposure_verdict(payload)
+        self.assertFalse(verdict["allow_exposure_increase"])
+        self.assertIn("COLLECTION_UNPROVEN", verdict["reason_code"])
+
+    def test_linha_excluida_nao_e_janela_vazia(self):
+        row = {"schema_version": 1, "state": "PENDING", "funding_state": "CONFIRMED",
+               "settlement_asset": "USDT", "identity": {"account_scope": "conta"},
+               "totals": {"fees_complete": True, "net_including_funding": "1.0"}}
+        payload = fts.aggregate([row], account_scope="conta",
+                                collection={"pagination_complete": True,
+                                            "overlap_resolved": True})
+        verdict = fts.exposure_verdict(payload)
+        self.assertFalse(verdict["allow_exposure_increase"])
+        self.assertFalse(verdict.get("known_empty_window", False))
+
+
 if __name__ == "__main__":
     unittest.main()

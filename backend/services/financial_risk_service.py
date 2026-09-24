@@ -540,6 +540,135 @@ def unavailable_snapshot(reason_code: str, detail: str, *,
     }
 
 
+# ── R05D: o TOTAL COM FUNDING participando da fórmula única dos limites ─────
+PNL_LABEL_TOTAL = "NET_INCLUDING_FUNDING"
+
+
+def _window_known_zero(block: Any) -> bool:
+    """Janela comprovadamente SEM operações (não é consulta desconhecida)."""
+    if not isinstance(block, dict) or block.get("quality") != QUALITY_OK:
+        return False
+    return (int(block.get("valid_count") or 0) == 0
+            and int(block.get("excluded_count") or 0) == 0
+            and block.get("data_complete") is True)
+
+
+def _apply_total_block(block: Dict[str, Any], payload: Dict[str, Any],
+                       equity: Any) -> Dict[str, Any]:
+    """Substitui o P&L da janela pelo TOTAL COM FUNDING da mesma janela.
+
+    Completo ⇒ o total vira o número da fórmula. Janela vazia comprovada ⇒ zero
+    conhecido (senão a primeira operação ficaria bloqueada para sempre).
+    Qualquer outra insuficiência ⇒ UNKNOWN: com a fonte completa selecionada
+    NÃO existe fallback silencioso para o resultado EX-funding.
+    """
+    from services import financial_total_service as fts
+    state = (payload or {}).get("state")
+    reasons = (payload or {}).get("exclusion_reasons") or {}
+    block = dict(block)
+    block["financial_source"] = fts.SOURCE_ACCOUNTING
+    block["total_contract_version"] = fts.CONTRACT_VERSION
+    if state == fts.STATE_COMPLETE:
+        total = _finite(payload.get("total_net_including_funding"))
+    elif (state == fts.STATE_UNKNOWN and set(reasons) <= {fts.NO_ROWS}
+            and _window_known_zero(block)):
+        total = 0.0
+    else:
+        dominant = next(iter(sorted(reasons, key=lambda name: (-reasons[name], name))),
+                        "TOTAL_UNAVAILABLE")
+        block.update(_unknown(f"R05D_{dominant}",
+                              "total com funding insuficiente para a janela"))
+        block["pnl_usd"] = None
+        block["dd_pct"] = None
+        block["pnl_label"] = PNL_LABEL_TOTAL
+        return block
+    if total is None:
+        block.update(_unknown("R05D_TOTAL_NOT_NUMERIC", "total com funding não numérico"))
+        block["pnl_usd"] = None
+        block["dd_pct"] = None
+        block["pnl_label"] = PNL_LABEL_TOTAL
+        return block
+    block["quality"] = QUALITY_OK
+    block["reason_code"] = None
+    block["detail"] = None
+    block["pnl_usd"] = total
+    block["pnl_label"] = PNL_LABEL_TOTAL
+    block["funding"] = {"value": "INCLUDED_IN_TOTAL", "reason_code": None,
+                        "detail": "funding provado pelo ledger R05C entra no total"}
+    eq = equity if isinstance(equity, dict) else {}
+    total_equity = _finite(eq.get("total_usd")) if eq.get("quality") == QUALITY_OK else None
+    if total_equity is None or total_equity <= 0:
+        block["dd_pct"] = None
+        block["dd_reason_code"] = eq.get("reason_code") or "EQUITY_UNAVAILABLE"
+    else:
+        block["dd_pct"] = round(total / total_equity * 100.0, 4)
+        block["dd_reason_code"] = None
+        block["equity_usd"] = round(total_equity, 4)
+    return block
+
+
+async def apply_total_source(snap: Dict[str, Any], *, as_of: datetime) -> Dict[str, Any]:
+    """Seleciona a FONTE do P&L usado pelos limites, breakers e apresentação.
+
+    Com `R05_FINANCIAL_TOTAL_SOURCE=legacy` (default) nada muda. Selecionada a
+    fonte completa, as MESMAS janelas passam a carregar o total com funding —
+    não apenas uma checagem extra de completude ao lado do número antigo.
+    """
+    try:
+        from services import financial_total_service as fts
+        if not fts.accounting_total_enabled():
+            return snap
+        from db import get_session
+        scope = fts.current_account_scope()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[r05d] fonte completa indisponível: {type(exc).__name__}")
+        return _mark_total_unavailable(snap, "R05D_SOURCE_UNAVAILABLE")
+    equity = snap.get("equity")
+    windows = {
+        "kill_daily": kill_daily_start(as_of),
+        "rolling_24h": as_of - timedelta(hours=24),
+        "rolling_7d": as_of - timedelta(days=7),
+    }
+    for name, since in windows.items():
+        block = snap.get(name)
+        if not isinstance(block, dict):
+            continue
+        try:
+            payload = await fts.fresh_total(get_session, account_scope=scope,
+                                            since=since, until=as_of)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"[r05d] total de {name} falhou: {type(exc).__name__}")
+            payload = {"state": fts.STATE_UNKNOWN,
+                       "exclusion_reasons": {"LEDGER_UNAVAILABLE": 1}}
+        snap[name] = _apply_total_block(block, payload, equity)
+    snap["financial_source"] = "R05D_TOTAL_WITH_FUNDING"
+    snap["pnl_label"] = PNL_LABEL_TOTAL
+    blockers = [name for name in ("rolling_24h", "rolling_7d", "kill_daily", "loss_streak")
+                if (snap.get(name) or {}).get("quality") != QUALITY_OK]
+    if (snap.get("equity") or {}).get("quality") != QUALITY_OK:
+        blockers.append("equity")
+    if (snap.get("open_exposure") or {}).get("quality") != QUALITY_OK:
+        blockers.append("open_exposure")
+    snap["blockers"] = blockers
+    return snap
+
+
+def _mark_total_unavailable(snap: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    """Fonte completa selecionada e indisponível: nenhuma janela vira legado."""
+    for name in ("kill_daily", "rolling_24h", "rolling_7d"):
+        block = snap.get(name)
+        if not isinstance(block, dict):
+            continue
+        block = dict(block)
+        block.update(_unknown(reason, "fonte completa selecionada e indisponível"))
+        block["pnl_usd"] = None
+        block["dd_pct"] = None
+        snap[name] = block
+    snap["blockers"] = sorted(set(list(snap.get("blockers") or [])
+                                  + ["kill_daily", "rolling_24h", "rolling_7d"]))
+    return snap
+
+
 async def financial_snapshot(as_of_utc: Optional[datetime] = None, *,
                              force: bool = False) -> Dict[str, Any]:
     """Leitura financeira completa: 2 SELECTs + 1 equity, com cache curto.
@@ -574,6 +703,9 @@ async def financial_snapshot(as_of_utc: Optional[datetime] = None, *,
             return unavailable_snapshot(
                 "FINANCIAL_PAYLOAD_INVALID",
                 "payload financeiro inválido", as_of=as_of)
+        # A fonte do P&L é escolhida ANTES de cachear: breakers, preflight e
+        # apresentação leem o mesmo contrato e a mesma janela.
+        snap = await apply_total_source(snap, as_of=as_of)
         if as_of_utc is None:
             _snapshot_cache["ts"] = _time.monotonic()
             _snapshot_cache["data"] = snap

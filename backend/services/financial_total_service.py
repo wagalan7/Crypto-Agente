@@ -199,10 +199,34 @@ def exposure_verdict(total_payload: Any) -> Dict[str, Any]:
         return {"allow_exposure_increase": True, "reason_code": None,
                 "blocks_protection": False, "blocks_close": False}
     reasons = payload.get("exclusion_reasons") if isinstance(payload.get("exclusion_reasons"), dict) else {}
+    if (state == STATE_UNKNOWN and set(reasons) == {NO_ROWS}
+            and payload.get("collection_proven") is True):
+        # Janela CONSULTADA e vazia é zero conhecido — diferente de consulta que
+        # não aconteceu. Sem isto, a primeira operação ficaria bloqueada para
+        # sempre por não existir histórico ainda.
+        return {"allow_exposure_increase": True, "reason_code": None,
+                "known_empty_window": True,
+                "blocks_protection": False, "blocks_close": False}
     dominant = next(iter(sorted(reasons, key=lambda name: (-reasons[name], name))), "TOTAL_UNAVAILABLE")
     return {"allow_exposure_increase": False,
             "reason_code": f"R05D_{dominant}",
             "blocks_protection": False, "blocks_close": False}
+
+
+def current_account_scope() -> Optional[str]:
+    """Conta vigente segundo o MESMO contrato do ledger R05C.
+
+    Quem consome o total não precisa conhecer o dispatcher: a pergunta "de qual
+    conta é este total?" pertence a este contrato. Sem credencial comprovada
+    devolve None — e um total sem conta é `ACCOUNT_DIVERGENT`, nunca a conta
+    atual assumida por conveniência.
+    """
+    try:
+        from services.binance_signed_service import accounting_scope
+        scope = accounting_scope()
+    except Exception:  # noqa: BLE001
+        return None
+    return scope if isinstance(scope, str) and scope.strip() else None
 
 
 async def fresh_total(session_factory, *, account_scope: Optional[str], since, until,

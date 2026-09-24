@@ -279,9 +279,11 @@ async def _r05d_total_gate(checks: dict):
             return None                     # comportamento legado preservado
         from datetime import timedelta
         from db import get_session
-        from services.binance_signed_service import accounting_scope
         until = datetime.now(timezone.utc)
-        payload = await _fts.fresh_total(get_session, account_scope=accounting_scope(),
+        # A conta vem do MESMO contrato do total (R05D), não de um import solto
+        # do dispatcher: quem pergunta pelo total pergunta pela conta dele.
+        payload = await _fts.fresh_total(get_session,
+                                         account_scope=_fts.current_account_scope(),
                                          since=until - timedelta(days=1), until=until)
         verdict = _fts.exposure_verdict(payload)
         checks["r05d_total"] = {"state": payload.get("state"),
@@ -1246,8 +1248,9 @@ def _entry_account_ref():
     try:
         if _active_exchange_name() != "binance":
             return None
-        from services.binance_signed_service import accounting_scope
-        scope = accounting_scope()
+        # Mesmo contrato de conta do total financeiro (R05D/R05C).
+        from services.financial_total_service import current_account_scope
+        scope = current_account_scope()
     except Exception:
         return None
     return scope if isinstance(scope, str) and scope.strip() else None

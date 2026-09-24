@@ -30,11 +30,37 @@ REESCRITO pelo rebase sobre `origin/main` de 24/09 e equivale a `e64b5fab`
 | Bloco | Estado | Evidência |
 | --- | --- | --- |
 | 1 · P03 caminho operacional | `INTEGRADO` | 19 herméticos + 19 cenários PostgreSQL real |
-| 2 · R05 total no limite | `PENDENTE` | — |
+| 2 · R05 total no limite | `INTEGRADO` | 27 herméticos + 16 verificações PostgreSQL com ledger R05C real |
 | 3 · R09+R07/R08 coleta real | `PENDENTE` | — |
 | 4 · R11/R12 estado e catálogo | `PENDENTE` | — |
 | 5 · R10 execução e walk-forward | `PENDENTE` | — |
 | 6 · Encerramento verificável | `PENDENTE` | — |
+
+### Bloco 2 — o total com funding dentro da fórmula do limite
+
+Reprodução confirmada com ledger produzido pelo CÓDIGO do R05C: `net_trade`
+`+9,92`, funding `-250`, total `-240,08`, estado `COMPLETE`. Com limite de perda
+100 e risco proposto 5, o gate real liberava usando pior cenário `+4,92`.
+
+- A fonte selecionada passou a escolher o P&L da FÓRMULA ÚNICA
+  (`apply_total_source`): com `R05_FINANCIAL_TOTAL_SOURCE=accounting_total`, as
+  janelas `kill_daily`, `rolling_24h` e `rolling_7d` carregam o total com
+  funding — breakers, preflight e apresentação leem o mesmo contrato e a mesma
+  janela, antes do cache. Agora o pior cenário é `-245,08` e o gate bloqueia.
+- `pnl_usd` do ledger continua EX-funding: nada é somado duas vezes.
+- Insuficiência não cai em silêncio para o número antigo: com a fonte completa
+  selecionada, janela incompleta/ilegível vira `UNKNOWN` com `R05D_*`.
+- Janela CONSULTADA e vazia é zero conhecido (`known_empty_window`), então a
+  primeira operação não fica bloqueada para sempre; coleta não provada continua
+  bloqueando.
+- A pergunta "de qual conta é este total?" passou a ter um dono único
+  (`financial_total_service.current_account_scope`), reutilizado pelo gate, pelo
+  snapshot e pela identidade da intenção — sem import solto do dispatcher no
+  núcleo R05B.
+
+Evidência: `tests/pg_integration_r05d_gate.py` (16 verificações, ledger R05C
+real + gate real, sem exchange) e 27 herméticos do R05D.
+
 
 ### Bloco 1 — o que estava quebrado e o que passou a valer
 
