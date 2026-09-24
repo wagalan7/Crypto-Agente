@@ -18,6 +18,58 @@ primeiro bloco que não estiver `LOCAL_VERIFIED`. Não reiniciar blocos prontos.
 | G · R12 simulação/go-no-go | `LOCAL_VERIFIED` | `CANDIDATE_POLICY` (inativo) | `services/preselection_experiment_service.py`, `tests/test_lote_g_preselection_experiment.py` | 36 herméticos; P05/P05.1 preservados | `14ffb61d` | Coleta prospectiva e canário dependem de autorização humana — fora deste lote |
 | H · Integração/documentação | `LOCAL_VERIFIED` | `OBSERVATION_ONLY` | `services/research_batch_service.py` (`lote_final`), `tests/test_lote_h_integracao.py`, `tests/pg_integration_r10b.py` (escopos), `tests/test_r08a_score_research.py`/`tests/test_lote_r11c_robust_policy.py` (fronteiras), `docs/LOTE_FINAL_LOCAL_CONTRATOS.md`, `docs/LOTE_FINAL_LOCAL_PUBLICACAO.md`, `docs/HARDENING_LOG.md` | 12 de integração + suíte completa 2.246 (2 skips R05C) + PG real P03/R09/R10B | `4ed10875` | Coleta prospectiva, calibração V3, aprovação humana e canário — todos externos |
 
+## Fechamento das integrações (prompt de correção) — 24/09/2026
+
+HEAD ao iniciar: `75095d34`. O HEAD pedido pelo prompt (`6efb724b`) foi
+REESCRITO pelo rebase sobre `origin/main` de 24/09 e equivale a `e64b5fab`
+(`git diff 6efb724b e64b5fab -- backend docs frontend` é vazio). Além dele, a
+árvore tem os quatro commits documentados de 24/09: a saída para o incidente
+`UNTRACKED_POSITION` (`5d17b1db`, já em produção), o banner honesto da pausa P03
+(`a8131f9f`) e dois de manutenção.
+
+| Bloco | Estado | Evidência |
+| --- | --- | --- |
+| 1 · P03 caminho operacional | `INTEGRADO` | 19 herméticos + 19 cenários PostgreSQL real |
+| 2 · R05 total no limite | `PENDENTE` | — |
+| 3 · R09+R07/R08 coleta real | `PENDENTE` | — |
+| 4 · R11/R12 estado e catálogo | `PENDENTE` | — |
+| 5 · R10 execução e walk-forward | `PENDENTE` | — |
+| 6 · Encerramento verificável | `PENDENTE` | — |
+
+### Bloco 1 — o que estava quebrado e o que passou a valer
+
+- **Slots desligados.** O chamador passava `max_open_positions=None`: a admissão
+  atômica não tinha teto de posições. Agora usa `FILLER_TOTAL_SLOTS` (mesmo
+  `PORTFOLIO_MAX_OPEN_POSITIONS` do `portfolio_guard`) e conta a mesma população
+  (`RealTrade` aberto da coorte `auto`).
+- **Risco lido fora da lock.** `_open_risk_usd()` do chamador era um snapshot
+  anterior à `pg_advisory_xact_lock`. O risco aberto passou a ser lido DENTRO da
+  transação de admissão; o valor do chamador vale apenas como piso.
+- **Risco desconhecido virava zero.** Linha aberta sem entry/qty/stop utilizável
+  era ignorada. Agora marca a leitura como incompleta e a reserva falha fechada
+  com `OPEN_RISK_UNKNOWN`.
+- **Conta não identificada.** `account_ref` era `exchange:ambiente` — duas
+  credenciais colidiam na mesma decisão. Passou a usar a referência OPACA do
+  contrato contábil R05C (`accounting_scope()`, sha256 de 64); sem credencial
+  comprovada não há identidade e a decisão não é enviada.
+- **Callback atrasado rebaixava confirmação.** `mark_unknown`/`mark_terminal`
+  sobrescreviam `CONFIRMED` e encerravam tentativa de outro dono. Agora nenhum
+  desfecho rebaixa confirmação e só o dono do lease vivo (ou lease livre/vencido)
+  encerra a decisão — o executor passou a se identificar ao encerrar.
+- **Recuperação solta.** `recover_stale` existia sem chamador. Entrou no boot e
+  no ciclo do P03 que já rodam (sem worker novo), e cada intenção com desfecho de
+  envio incerto abre/mantém incidente pelo MESMO `client_order_id`. Ordem maker
+  viva (`PENDING_ENTRY_ORDER`) não é desfecho incerto e não abre incidente.
+- **Guard antes do helper, não de cada POST.** O guard virou parte do
+  `entry_preflight`/`market_preflight`, que o transport executa imediatamente
+  antes de cada request — POST maker, POST market e o fallback `-mfb`. Cada id
+  efetivo é gravado ANTES do envio (coluna aditiva `dispatch_ids`); id
+  desconhecido não despacha.
+
+Pendência técnica do bloco 1: rotas manuais do app continuam fora da intenção
+(só o caminho automático do executor submete ordem por ela).
+
+
 ## Bloco H — detalhe (concluído)
 
 Resumo `lote_final` acrescentado ao payload do endpoint existente

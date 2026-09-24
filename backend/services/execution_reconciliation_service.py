@@ -1802,6 +1802,72 @@ async def recheck_untracked_manual() -> dict:
     return {"checked": checked, "resolved": resolved, "kept": kept}
 
 
+# ── Intenções de entrada (P03) dentro do ciclo de reconciliação ─────────────
+def _intent_symbol(stored: Optional[str]) -> Optional[str]:
+    """`BTC-USDT-USDT` (forma da identidade) → `BTC/USDT:USDT` (forma do mercado).
+
+    Forma inesperada volta como está: um símbolo irreconhecível faz a leitura
+    falhar e o incidente permanece — nunca vira "flat" presumido.
+    """
+    if not isinstance(stored, str) or not stored:
+        return None
+    if "/" in stored or ":" in stored:
+        return stored
+    parts = stored.rsplit("-", 1)
+    if len(parts) != 2 or "-" not in parts[0]:
+        return stored
+    return parts[0].replace("-", "/", 1) + ":" + parts[1]
+
+
+async def recover_entry_intents() -> dict:
+    """Liga as INTENÇÕES pendentes (P03) à recuperação/reconciliação operacional.
+
+    Sem worker novo: roda dentro do boot e do ciclo que já existem.
+      1. lease vencido em SENDING vira UNKNOWN (nunca reenvio automático);
+      2. cada intenção com desfecho de ENVIO incerto abre/mantém incidente pelo
+         MESMO `client_order_id`, então a quarentena só cai quando a
+         reconciliação provar o desfecho — não por TTL.
+    """
+    try:
+        from db import DB_ENABLED, get_session
+        from services import entry_intent_service as intents
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"import: {exc}"}
+    if not DB_ENABLED:
+        return {"skipped": "DB_DISABLED"}
+    summary = {"to_unknown": 0, "reserved_released": 0, "incidents": 0, "skipped_identity": 0}
+    try:
+        recovered = await intents.recover_stale(get_session)
+        summary["to_unknown"] = int(recovered.get("to_unknown") or 0)
+        summary["reserved_released"] = int(recovered.get("reserved_released") or 0)
+        pending = await intents.list_needing_reconciliation(get_session)
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03][intents] recuperação falhou: {exc}")
+        return {**summary, "error": str(exc)}
+    for row in pending:
+        symbol = _intent_symbol(row.get("symbol"))
+        client_order_id = row.get("client_order_id")
+        if not symbol or not client_order_id:
+            summary["skipped_identity"] += 1
+            continue
+        try:
+            result = await record_incident(
+                kind=Kind.ENTRY_SUBMISSION_UNKNOWN, symbol=symbol,
+                exchange=row.get("exchange") or EXCHANGE_BINANCE,
+                client_order_id=client_order_id,
+                side=_norm_entry_side(row.get("side")),
+                payload={"source": "entry_intent", "intent_key": row.get("intent_key"),
+                         "account_ref": row.get("account_ref"), "reason": row.get("reason")})
+            if result.get("persisted"):
+                summary["incidents"] += 1
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[p03][intents] incidente de {client_order_id} falhou: {exc}")
+            summary["skipped_identity"] += 1
+    if summary["to_unknown"] or summary["incidents"]:
+        log.warning(f"[p03][intents] recuperação: {summary}")
+    return summary
+
+
 async def _reconcile_one(key: str, owner: str) -> None:
     repo = _get_repo()
     inc = await repo.get(key)
@@ -1865,6 +1931,11 @@ async def reconcile_due() -> dict:
         await recheck_untracked_manual()
     except Exception as exc:  # noqa: BLE001
         log.error(f"[p03] re-check de untracked falhou (incidentes mantidos): {exc}")
+    # Intenções de entrada pendentes entram no MESMO ciclo (sem worker novo).
+    try:
+        await recover_entry_intents()
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03] recuperação de intenções falhou: {exc}")
     open_now = len(await repo.list_open())
     # Enquanto houver incidente aberto, garante o owner P03 armado (mesmo após uma
     # tentativa manual de resume que possa ter limpado o latch).
@@ -1905,6 +1976,10 @@ async def boot_reconcile() -> dict:
         await _arm_quarantine(f"boot: {len(open_incs)} incidente(s) aberto(s)")
         log.critical(f"[p03][boot] {len(open_incs)} incidente(s) aberto(s) — quarentena armada")
     _prev_open_count = len(open_incs)
+    try:
+        await recover_entry_intents()   # intenções pendentes ANTES do scan
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03][boot] recuperação de intenções falhou: {exc}")
     scan = await _detect_untracked_positions()
     try:
         await reconcile_due()

@@ -102,6 +102,10 @@ async def init_db():
             "ALTER TABLE rotation_universe_state "
             "ADD COLUMN IF NOT EXISTS seeded JSON DEFAULT '{}'"
         ))
+        # P03 — ids efetivos de despacho da intenção de entrada (aditiva).
+        await conn.execute(text(
+            "ALTER TABLE entry_intents ADD COLUMN IF NOT EXISTS dispatch_ids JSONB"
+        ))
         # Migrações incrementais
         await conn.execute(text(
             "ALTER TABLE recommendation_snapshots "

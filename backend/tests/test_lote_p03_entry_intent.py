@@ -240,15 +240,16 @@ class SettlementContract(unittest.IsolatedAsyncioTestCase):
         rec = {"symbol": "BTC/USDT:USDT", "timeframe": "4h", "leverage": 3,
                "score_provenance": {"formula_effective": "SCORE_V2"},
                "signal": {"data_freshness": {"candle": {"close_time_ms": TRIGGER}}}}
-        with patch.object(sts, "_active_exchange_name", lambda: "binance"), \
-                patch.object(sts, "_exchange_is_production", lambda: True):
+        # A conta agora é a referência OPACA do contrato contábil (R05C):
+        # sem credencial comprovada não há identidade (ver test_p03_closure).
+        scope = patch("services.binance_signed_service.accounting_scope", lambda: "c" * 64)
+        with patch.object(sts, "_active_exchange_name", lambda: "binance"), scope:
             first = sts._entry_intent_identity(rec, "long")
             same_decision_other_snapshot = sts._entry_intent_identity(dict(rec, _snapshot_id=999), "long")
         self.assertIsNotNone(first)
         self.assertEqual(first.intent_key, same_decision_other_snapshot.intent_key)
         self.assertEqual(first.quote, "USDT")
-        with patch.object(sts, "_active_exchange_name", lambda: "binance"), \
-                patch.object(sts, "_exchange_is_production", lambda: True):
+        with patch.object(sts, "_active_exchange_name", lambda: "binance"), scope:
             self.assertIsNone(sts._entry_intent_identity({"symbol": "BTC/USDT:USDT"}, "long"))
 
     def test_no_network(self):

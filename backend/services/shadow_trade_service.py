@@ -1235,13 +1235,22 @@ def _observe_transport(rec: dict, result) -> None:
 _INTENT_OWNER = f"{os.getpid()}-{int(time.time())}"
 
 
-def _entry_account_ref() -> str:
-    """Conta/exchange sem expor segredo: exchange ativa + ambiente."""
+def _entry_account_ref():
+    """Referência OPACA da CONTA, no mesmo contrato do ledger R05C.
+
+    `exchange:ambiente` não identifica uma conta — duas credenciais no mesmo
+    mercado colidiriam na mesma identidade de decisão. Sem credencial
+    comprovada (ou fora do dispatcher com contrato equivalente) não existe
+    conta: devolve None e a decisão NÃO pode ser enviada.
+    """
     try:
-        environment = "mainnet" if _exchange_is_production() else "testnet"
+        if _active_exchange_name() != "binance":
+            return None
+        from services.binance_signed_service import accounting_scope
+        scope = accounting_scope()
     except Exception:
-        environment = "mainnet"
-    return f"{_active_exchange_name()}:{environment}"
+        return None
+    return scope if isinstance(scope, str) and scope.strip() else None
 
 
 def _entry_intent_identity(rec: dict, side: str, purpose: str = "ENTRY"):
@@ -1254,8 +1263,11 @@ def _entry_intent_identity(rec: dict, side: str, purpose: str = "ENTRY"):
         proof = rec.get("data_freshness") or signal.get("data_freshness") or {}
         candle = proof.get("candle") if isinstance(proof, dict) else {}
         provenance = rec.get("score_provenance") if isinstance(rec.get("score_provenance"), dict) else {}
+        account_ref = _entry_account_ref()
+        if account_ref is None:
+            return None
         return EntryIdentity(
-            account_ref=_entry_account_ref(), exchange=_active_exchange_name(),
+            account_ref=account_ref, exchange=_active_exchange_name(),
             symbol=symbol.replace("/", "-").replace(":", "-"), quote=quote, side=side,
             position_side="BOTH", timeframe=str(rec.get("timeframe") or "na"),
             playbook=str(rec.get("playbook") or "CHAMPION_LEGACY"),
@@ -1283,7 +1295,9 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
                    "leverage": int(rec.get("leverage") or 1)}
         capacity = intents.Capacity(
             risk_usd=abs(float(entry) - float(stop)) * float(qty),
-            max_open_positions=None,
+            # Teto real de posições simultâneas (o mesmo do portfolio_guard):
+            # desativá-lo aqui deixaria a admissão atômica sem limite de slot.
+            max_open_positions=FILLER_TOTAL_SLOTS if FILLER_TOTAL_SLOTS > 0 else None,
             max_open_risk_usd=(float(equity_usd) * MAX_TOTAL_OPEN_RISK_PCT / 100.0
                                if MAX_TOTAL_OPEN_RISK_PCT > 0 and equity_usd else None),
             open_risk_usd=(await _open_risk_usd() if MAX_TOTAL_OPEN_RISK_PCT > 0 else 0.0))
@@ -1313,6 +1327,57 @@ async def _intent_dispatch_guard(intent) -> bool:
     return await intents.may_dispatch(get_session, key, owner=_INTENT_OWNER)
 
 
+async def _register_intent_dispatch(intent, dispatch_id) -> bool:
+    """Grava o id EFETIVO do despacho ANTES do POST (mesmo id não duplica)."""
+    if not isinstance(intent, dict) or not intent.get("granted"):
+        return False
+    from services import entry_intent_service as intents
+    from db import get_session
+    return await intents.register_dispatch(get_session, intent.get("intent_key"),
+                                           owner=_INTENT_OWNER, dispatch_id=dispatch_id)
+
+
+def _market_fallback_coid(client_order_id: str):
+    """ID do fallback MARKET conforme o transport que realmente vai enviá-lo."""
+    try:
+        from services.binance_signed_service import market_fallback_client_order_id
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return market_fallback_client_order_id(str(client_order_id))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _intent_guarded_preflight(intent, inner, *, dispatch_id_fn):
+    """Compõe o guard da intenção IMEDIATAMENTE antes de CADA POST de entrada.
+
+    O transport executa o preflight depois de throttle, espera e retry — e o
+    helper maker usa o mesmo contrato no fallback MARKET. Um check feito só
+    antes de chamar o helper não cobriria esses POSTs internos.
+
+    Id efetivo desconhecido ⇒ NÃO despacha: um envio invisível ao ledger não
+    poderia ser reconciliado pelo client id.
+    """
+    async def _guarded(*args, **kwargs):
+        if not await _intent_dispatch_guard(intent):
+            return {"ok": False, "quality": "UNKNOWN",
+                    "reason_code": "EXEC_INTENT_GUARD_DENIED",
+                    "reason": "intenção de entrada não autoriza este POST",
+                    "checks": {}}
+        dispatch_id = dispatch_id_fn()
+        if not dispatch_id or not await _register_intent_dispatch(intent, dispatch_id):
+            return {"ok": False, "quality": "UNKNOWN",
+                    "reason_code": "EXEC_INTENT_DISPATCH_UNRECORDED",
+                    "reason": "id efetivo do despacho não pôde ser registrado",
+                    "checks": {}}
+        if inner is None:
+            return {"ok": True, "quality": "OK", "reason_code": None, "checks": {}}
+        return await inner(*args, **kwargs)
+
+    return _guarded
+
+
 async def _settle_entry_intent(intent, order_res) -> None:
     """Classifica o desfecho do envio. ACK não prova fill; dúvida vira UNKNOWN."""
     if not isinstance(intent, dict) or not intent.get("granted") or not intent.get("dispatched"):
@@ -1324,20 +1389,23 @@ async def _settle_entry_intent(intent, order_res) -> None:
     if (result.get("manual_intervention_required") or result.get("quarantine_required")
             or result.get("emergency_close_attempted")
             or str(result.get("safety_state") or "").upper().endswith("UNKNOWN")):
-        await intents.mark_unknown(get_session, key, reason="SAFETY_STATE_UNKNOWN")
+        await intents.mark_unknown(get_session, key, owner=_INTENT_OWNER,
+                                   reason="SAFETY_STATE_UNKNOWN")
         intent["state"] = "UNKNOWN"
         return
     if result.get("entry_not_submitted") is True:
-        await intents.mark_terminal(get_session, key, reason="ENTRY_NOT_SUBMITTED")
+        await intents.mark_terminal(get_session, key, owner=_INTENT_OWNER,
+                                    reason="ENTRY_NOT_SUBMITTED")
         intent["state"] = "TERMINAL"
         return
     if result.get("ok") is True:
         return   # confirmação só com o RealTrade persistido
     if result.get("no_fill") is True:
-        await intents.mark_terminal(get_session, key, reason="NO_FILL")
+        await intents.mark_terminal(get_session, key, owner=_INTENT_OWNER, reason="NO_FILL")
         intent["state"] = "TERMINAL"
         return
-    await intents.mark_unknown(get_session, key, reason="DISPATCH_OUTCOME_UNKNOWN")
+    await intents.mark_unknown(get_session, key, owner=_INTENT_OWNER,
+                               reason="DISPATCH_OUTCOME_UNKNOWN")
     intent["state"] = "UNKNOWN"
 
 
@@ -1361,11 +1429,13 @@ async def _close_entry_intent(intent, trade, *, pending_entry: bool = False) -> 
     elif trade is not None:
         trade_id = getattr(trade, "id", None)
     if trade_id is None:
-        await intents.mark_unknown(get_session, key, reason="PERSISTENCE_FAILED")
+        await intents.mark_unknown(get_session, key, owner=_INTENT_OWNER,
+                                   reason="PERSISTENCE_FAILED")
         intent["state"] = "UNKNOWN"
         return
     if pending_entry:
-        await intents.mark_unknown(get_session, key, reason="PENDING_ENTRY_ORDER")
+        await intents.mark_unknown(get_session, key, owner=_INTENT_OWNER,
+                                   reason="PENDING_ENTRY_ORDER")
         intent["state"] = "UNKNOWN"
         return
     await intents.mark_confirmed(get_session, key, real_trade_id=int(trade_id))
@@ -6060,8 +6130,14 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         # Dupla trava OFF por default; quando explicitamente
                         # ligada, usa depth NOVO e COID próprio no fallback.
                         fallback_market=_p04b_fallback_effective,
-                        entry_preflight=_entry_preflight,
-                        market_preflight=_market_entry_preflight,
+                        # O guard da intenção viaja DENTRO do preflight: assim
+                        # ele roda antes do POST maker e antes do fallback.
+                        entry_preflight=_intent_guarded_preflight(
+                            _intent, _entry_preflight,
+                            dispatch_id_fn=lambda: client_order_id),
+                        market_preflight=_intent_guarded_preflight(
+                            _intent, _market_entry_preflight,
+                            dispatch_id_fn=lambda: _market_fallback_coid(client_order_id)),
                     )
                     if isinstance(order_res, dict) and order_res.get("ok"):
                         log.info(
@@ -6100,7 +6176,9 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             tp1_qty_pct=_open_tp1_pct,
                             leverage=int(rec.get("leverage") or 1),
                             client_order_id=client_order_id,
-                            entry_preflight=_market_entry_preflight,
+                            entry_preflight=_intent_guarded_preflight(
+                                _intent, _market_entry_preflight,
+                                dispatch_id_fn=lambda: client_order_id),
                         )
                 _exec_mark(_exec_trace, "attempt_returned_at")
                 _observe_transport(rec, order_res)

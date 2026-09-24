@@ -2710,6 +2710,20 @@ _MAKER_POLL_TIMEOUT_S = float(os.getenv("MAKER_ENTRY_TIMEOUT_S", "8"))
 _MAKER_POLL_INTERVAL_S = float(os.getenv("MAKER_ENTRY_POLL_INTERVAL_S", "0.8"))
 
 
+def market_fallback_client_order_id(client_order_id: str) -> str:
+    """ID EFETIVO do fallback MARKET, derivado do id da entrada maker.
+
+    Exposto para que o ledger/reconciliador registre o id ANTES do POST — um
+    despacho com id desconhecido ficaria invisível para a reconciliação.
+    """
+    fallback = f"{client_order_id[:32]}-mfb"[:36]
+    if fallback == client_order_id:
+        suffix = hashlib.sha1(
+            f"{client_order_id}:market-fallback".encode("utf-8")).hexdigest()[:6]
+        fallback = f"{client_order_id[:29]}-{suffix}"[:36]
+    return fallback
+
+
 async def place_maker_entry_then_protect(
     symbol: str,
     side: str,                 # "Buy" | "Sell"
@@ -2777,12 +2791,7 @@ async def place_maker_entry_then_protect(
     async def _market_fallback(reason: str) -> dict:
         """Cai pra entrada MARKET reaproveitando place_order (entry+proteção juntos)."""
         log.warning(f"[maker] {sym} fallback MARKET ({reason})")
-        fallback_client_order_id = f"{client_order_id[:32]}-mfb"[:36]
-        if fallback_client_order_id == client_order_id:
-            suffix = hashlib.sha1(
-                f"{client_order_id}:market-fallback".encode("utf-8")
-            ).hexdigest()[:6]
-            fallback_client_order_id = f"{client_order_id[:29]}-{suffix}"[:36]
+        fallback_client_order_id = market_fallback_client_order_id(client_order_id)
         res = await place_order(
             sym, side, qty_rounded, order_type="Market",
             stop_loss=stop_loss, take_profit=take_profit, tp1=tp1,

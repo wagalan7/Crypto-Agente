@@ -19,9 +19,9 @@ import hashlib
 import json
 import math
 import re
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, or_, select, text, update
 
 from models.entry_intent import (
     EntryIntent, PENDING_STATES, STATE_CONFIRMED, STATE_RESERVED,
@@ -85,7 +85,11 @@ class EntryIdentity:
     trigger_candle_ms: int
 
     def __post_init__(self) -> None:
-        for field in ("account_ref", "exchange", "symbol", "quote", "side",
+        # `account_ref` carrega a referência OPACA da conta (sha256 hex do
+        # contrato contábil R05C): 64 caracteres, sem truncar nem colidir.
+        if _label(self.account_ref, 64) is None:
+            raise ValueError("identidade inválida: account_ref")
+        for field in ("exchange", "symbol", "quote", "side",
                       "position_side", "timeframe", "playbook", "playbook_version", "purpose"):
             if _label(getattr(self, field), 50) is None:
                 raise ValueError(f"identidade inválida: {field}")
@@ -171,10 +175,39 @@ async def _pending_usage(session, account_ref: str, exchange: str):
 
 
 async def _open_positions(session) -> int:
-    """Posições abertas contadas DENTRO da mesma transação da admissão."""
+    """Posições abertas contadas DENTRO da mesma transação da admissão.
+
+    Mesma população do teto de slots em produção (`portfolio_service`): trades
+    reais da coorte automática ainda abertos.
+    """
     from models.real_trade import RealTrade
     return int((await session.execute(
-        select(func.count(RealTrade.id)).where(RealTrade.status == "open"))).scalar() or 0)
+        select(func.count(RealTrade.id))
+        .where(RealTrade.status == "open", RealTrade.source == "auto"))).scalar() or 0)
+
+
+async def _open_risk_usd(session) -> Tuple[float, bool]:
+    """Risco aberto persistido, lido DENTRO da transação/lock de admissão.
+
+    Snapshot lido antes da lock envelhece: duas decisões concorrentes podem
+    admitir a mesma capacidade. Devolve `(risco, completo)`; linha sem entry,
+    qty ou stop utilizável marca INCOMPLETO — desconhecido nunca vira zero.
+    """
+    from models.real_trade import RealTrade
+    rows = (await session.execute(
+        select(RealTrade.entry_price, RealTrade.qty, RealTrade.sl_current_price,
+               RealTrade.planned_stop, RealTrade.side)
+        .where(RealTrade.status == "open", RealTrade.source == "auto"))).all()
+    total, complete = 0.0, True
+    for entry_price, qty, sl_current, planned_stop, side in rows:
+        price, quantity = _finite(entry_price), _finite(qty)
+        stop = _finite(sl_current if sl_current is not None else planned_stop)
+        if price is None or quantity is None or stop is None or price <= 0 or quantity <= 0:
+            complete = False
+            continue
+        adverse = (price - stop) if str(side or "long").lower() == "long" else (stop - price)
+        total += max(0.0, adverse) * quantity
+    return total, complete
 
 
 def _capacity_reason(capacity: Capacity, pending_count: int, pending_risk: float) -> Optional[str]:
@@ -213,10 +246,17 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                         session, identity.account_ref, identity.exchange)
                     open_positions = max(int(capacity.open_positions or 0),
                                          await _open_positions(session))
+                    persisted_risk, risk_complete = await _open_risk_usd(session)
+                    caller_risk = _finite(capacity.open_risk_usd)
+                    open_risk = max(persisted_risk, caller_risk if caller_risk is not None else 0.0)
                     capacity = Capacity(
                         risk_usd=capacity.risk_usd, max_open_positions=capacity.max_open_positions,
                         max_open_risk_usd=capacity.max_open_risk_usd,
-                        open_positions=open_positions, open_risk_usd=capacity.open_risk_usd)
+                        open_positions=open_positions, open_risk_usd=open_risk)
+                    if capacity.max_open_risk_usd is not None and not risk_complete:
+                        # Risco aberto incompleto: nada de fabricar zero para caber.
+                        await session.rollback()
+                        return Reservation(BLOCKED_CAPACITY, key, coid, None, "OPEN_RISK_UNKNOWN")
                     denial = _capacity_reason(capacity, pending_count, pending_risk)
                     if denial:
                         await session.rollback()
@@ -333,9 +373,18 @@ async def _resolve(session_factory, intent_key: str, *, owner: Optional[str], st
             conditions = [EntryIntent.intent_key == intent_key]
             if require_owner and owner is not None:
                 conditions.append(EntryIntent.lease_owner == owner)
-            if state == STATE_CONFIRMED:
-                # Vínculo idempotente: um fill confirmado não é sobrescrito.
-                conditions.append(EntryIntent.state != STATE_CONFIRMED)
+            # Vínculo idempotente: um fill confirmado NUNCA é sobrescrito — nem
+            # por uma reconfirmação, nem por um callback atrasado que chegaria
+            # para rebaixá-lo a UNKNOWN/TERMINAL.
+            conditions.append(EntryIntent.state != STATE_CONFIRMED)
+            if state in (STATE_UNKNOWN, STATE_TERMINAL):
+                # Encerrar tentativa ALHEIA em curso é proibido: só o dono do
+                # lease vivo (ou um lease livre/vencido) fecha a decisão.
+                conditions.append(or_(
+                    EntryIntent.lease_owner.is_(None),
+                    EntryIntent.lease_expires_at.is_(None),
+                    EntryIntent.lease_expires_at <= moment,
+                    *( [EntryIntent.lease_owner == owner] if owner is not None else [] )))
             result = await session.execute(update(EntryIntent).where(*conditions).values(**values))
             await session.commit()
             return result.rowcount == 1
@@ -353,7 +402,10 @@ async def mark_confirmed(session_factory, intent_key: str, *, owner: Optional[st
 async def mark_unknown(session_factory, intent_key: str, *, owner: Optional[str] = None,
                        reason: str = "DISPATCH_OUTCOME_UNKNOWN",
                        now: Optional[datetime] = None) -> bool:
-    """Desfecho incerto: exige reconciliação P03 pelo mesmo client id."""
+    """Desfecho incerto: exige reconciliação P03 pelo mesmo client id.
+
+    Não rebaixa confirmação nem encerra tentativa viva de outro dono.
+    """
     return await _resolve(session_factory, intent_key, owner=owner, state=STATE_UNKNOWN,
                           reason=reason, now=now, require_owner=False)
 
@@ -361,7 +413,10 @@ async def mark_unknown(session_factory, intent_key: str, *, owner: Optional[str]
 async def mark_terminal(session_factory, intent_key: str, *, owner: Optional[str] = None,
                         reason: str = "NO_ECONOMIC_ENTRY",
                         now: Optional[datetime] = None) -> bool:
-    """Encerra a decisão SEM entrada econômica (não preenchida, recusada...)."""
+    """Encerra a decisão SEM entrada econômica (não preenchida, recusada...).
+
+    Não rebaixa confirmação nem encerra tentativa viva de outro dono.
+    """
     return await _resolve(session_factory, intent_key, owner=owner, state=STATE_TERMINAL,
                           reason=reason, now=now, require_owner=False)
 
@@ -383,6 +438,45 @@ async def release_reserved(session_factory, intent_key: str, *, owner: str,
             return result.rowcount == 1
     except Exception:
         return False
+
+
+async def register_dispatch(session_factory, intent_key: str, *, owner: str,
+                            dispatch_id: str, now: Optional[datetime] = None) -> bool:
+    """Registra o ID EFETIVO que está prestes a ser despachado.
+
+    Roda ANTES do POST e sob o mesmo fencing do guard: só o dono do lease vivo
+    em `SENDING` registra. Idempotente — o mesmo id não duplica (retry do mesmo
+    envio não vira um despacho novo).
+    """
+    moment = now or _now()
+    identifier = _label(dispatch_id, MAX_CLIENT_ORDER_ID)
+    if identifier is None:
+        return False
+    try:
+        async with session_factory() as session:
+            row = (await session.execute(
+                select(EntryIntent).where(EntryIntent.intent_key == intent_key)
+                .with_for_update())).scalar_one_or_none()
+            if row is None or row.state != STATE_SENDING or row.lease_owner != owner:
+                await session.rollback()
+                return False
+            if row.lease_expires_at is None or row.lease_expires_at <= moment:
+                await session.rollback()
+                return False
+            current = list(row.dispatch_ids or [])
+            if identifier not in current:
+                current.append(identifier)
+                row.dispatch_ids = current
+                row.updated_at = moment
+            await session.commit()
+            return True
+    except Exception:
+        return False
+
+
+async def dispatch_ids(session_factory, intent_key: str) -> list:
+    row = await get_intent(session_factory, intent_key)
+    return list(getattr(row, "dispatch_ids", None) or []) if row is not None else []
 
 
 async def recover_stale(session_factory, *, now: Optional[datetime] = None, limit: int = 100) -> dict:
@@ -412,6 +506,35 @@ async def recover_stale(session_factory, *, now: Optional[datetime] = None, limi
     except Exception:
         summary["error"] = "DB_UNAVAILABLE"
     return summary
+
+
+#: Motivos de UNKNOWN que EXIGEM reconciliação pelo MESMO client id: a ordem
+#: pode existir na exchange. `PENDING_ENTRY_ORDER` NÃO entra — ali a ordem é
+#: conhecida e viva, não um desfecho incerto.
+RECONCILE_REASONS = ("DISPATCH_OUTCOME_UNKNOWN", "SAFETY_STATE_UNKNOWN",
+                     "PERSISTENCE_FAILED", "LEASE_EXPIRED_AFTER_DISPATCH")
+
+
+async def list_needing_reconciliation(session_factory, *, limit: int = 50) -> list:
+    """Intenções cujo desfecho de ENVIO continua incerto e sem RealTrade.
+
+    Devolve dicionários simples (a sessão fecha antes do uso): quem consome é o
+    ciclo de reconciliação, que trabalha pelo `client_order_id` e pela conta.
+    """
+    try:
+        async with session_factory() as session:
+            rows = (await session.execute(
+                select(EntryIntent)
+                .where(EntryIntent.state == STATE_UNKNOWN,
+                       EntryIntent.real_trade_id.is_(None),
+                       EntryIntent.reason.in_(RECONCILE_REASONS))
+                .order_by(EntryIntent.updated_at).limit(limit))).scalars().all()
+            return [{"intent_key": row.intent_key, "client_order_id": row.client_order_id,
+                     "account_ref": row.account_ref, "exchange": row.exchange,
+                     "symbol": row.symbol, "side": row.side, "reason": row.reason,
+                     "updated_at": row.updated_at} for row in rows]
+    except Exception:
+        return []
 
 
 async def get_intent(session_factory, intent_key: str):

@@ -90,12 +90,17 @@ async def run():
         if not await intents.may_dispatch(db.get_session, reservation.intent_key, owner=owner):
             return "GUARD_REFUSED", None
         result = await fake_dispatch(reservation.client_order_id, outcome)
+        # O executor real se IDENTIFICA ao encerrar: sem dono, um callback
+        # anônimo poderia fechar a tentativa viva de outro processo.
         if result.get("ok"):
-            await intents.mark_confirmed(db.get_session, reservation.intent_key, real_trade_id=result.get("trade_id"))
+            await intents.mark_confirmed(db.get_session, reservation.intent_key,
+                                         owner=owner, real_trade_id=result.get("trade_id"))
         elif result.get("no_fill"):
-            await intents.mark_terminal(db.get_session, reservation.intent_key, reason="NO_FILL")
+            await intents.mark_terminal(db.get_session, reservation.intent_key,
+                                        owner=owner, reason="NO_FILL")
         else:
-            await intents.mark_unknown(db.get_session, reservation.intent_key, reason="DISPATCH_OUTCOME_UNKNOWN")
+            await intents.mark_unknown(db.get_session, reservation.intent_key,
+                                       owner=owner, reason="DISPATCH_OUTCOME_UNKNOWN")
         return reservation.decision, reservation.client_order_id
 
     # Migração aditiva idempotente (2×), criada apenas pelo harness.
@@ -224,13 +229,139 @@ async def run():
 
     # 11. Slots: posição aberta real conta DENTRO da transação de admissão.
     async with db.get_session() as session:
+        # Com stop planejado: é uma posição NORMAL (o caso sem stop vira o
+        # cenário 14, de risco desconhecido).
         session.add(RealTrade(symbol="ZZZ/USDT:USDT", side="long", qty=1.0, entry_price=10.0,
-                              status="open", source="auto", opened_at=datetime.now(timezone.utc)))
+                              planned_stop=9.0, status="open", source="auto",
+                              opened_at=datetime.now(timezone.utc)))
         await session.commit()
     slot = await intents.reserve(db.get_session, identity(trigger_candle_ms=TRIGGER + 129_600_000),
                                  payload(), owner="c3",
                                  capacity=intents.Capacity(max_open_positions=1))
     assert slot.decision == intents.BLOCKED_CAPACITY and slot.reason == "MAX_OPEN_POSITIONS", slot
+
+
+    # 13. Risco aberto é lido SOB a lock: snapshot velho do chamador não vale.
+    async with db.get_session() as session:
+        session.add(RealTrade(symbol="RSK/USDT:USDT", side="long", qty=10.0, entry_price=100.0,
+                              planned_stop=95.0, status="open", source="auto",
+                              opened_at=datetime.now(timezone.utc)))
+        await session.commit()
+    stale = await intents.reserve(
+        db.get_session, identity(trigger_candle_ms=TRIGGER + 144_000_000), payload(), owner="c4",
+        capacity=intents.Capacity(risk_usd=1.0, max_open_risk_usd=40.0, open_risk_usd=0.0))
+    assert stale.decision == intents.BLOCKED_CAPACITY and stale.reason == "MAX_OPEN_RISK", stale
+
+    # 13b. Dentro do teto, a mesma leitura sob a lock autoriza.
+    ok_risk = await intents.reserve(
+        db.get_session, identity(trigger_candle_ms=TRIGGER + 147_600_000), payload(), owner="c4",
+        capacity=intents.Capacity(risk_usd=1.0, max_open_risk_usd=500.0, open_risk_usd=0.0))
+    assert ok_risk.decision == intents.RESERVED_NEW, ok_risk
+
+    # 14. Risco aberto INCOMPLETO não vira zero: admissão falha fechada.
+    async with db.get_session() as session:
+        session.add(RealTrade(symbol="UNK/USDT:USDT", side="long", qty=5.0, entry_price=50.0,
+                              planned_stop=None, sl_current_price=None, status="open",
+                              source="auto", opened_at=datetime.now(timezone.utc)))
+        await session.commit()
+    unknown_risk = await intents.reserve(
+        db.get_session, identity(trigger_candle_ms=TRIGGER + 151_200_000), payload(), owner="c5",
+        capacity=intents.Capacity(risk_usd=1.0, max_open_risk_usd=10_000.0, open_risk_usd=0.0))
+    assert unknown_risk.decision == intents.BLOCKED_CAPACITY, unknown_risk
+    assert unknown_risk.reason == "OPEN_RISK_UNKNOWN", unknown_risk
+    async with db.get_session() as session:   # limpa a linha incompleta do ensaio
+        await session.execute(update(RealTrade).where(RealTrade.symbol == "UNK/USDT:USDT")
+                              .values(status="closed"))
+        await session.commit()
+
+    # 15. Callback ATRASADO não rebaixa uma confirmação.
+    late = identity(trigger_candle_ms=TRIGGER + 154_800_000)
+    await intents.reserve(db.get_session, late, payload(), owner="w-late")
+    await intents.mark_sending(db.get_session, late.intent_key, owner="w-late")
+    await intents.mark_confirmed(db.get_session, late.intent_key, real_trade_id=99)
+    assert await intents.mark_unknown(db.get_session, late.intent_key,
+                                      owner="w-late", reason="DISPATCH_OUTCOME_UNKNOWN") is False
+    assert await intents.mark_terminal(db.get_session, late.intent_key,
+                                       owner="outro", reason="NO_FILL") is False
+    row = await state_of(late.intent_key)
+    assert row.state == "CONFIRMED" and row.real_trade_id == 99, (row.state, row.real_trade_id)
+
+    # 16. Tentativa VIVA de outro dono não é encerrada por callback alheio.
+    busy = identity(trigger_candle_ms=TRIGGER + 158_400_000)
+    await intents.reserve(db.get_session, busy, payload(), owner="dono")
+    await intents.mark_sending(db.get_session, busy.intent_key, owner="dono")
+    assert await intents.mark_terminal(db.get_session, busy.intent_key,
+                                       owner="estranho", reason="NO_FILL") is False
+    assert (await state_of(busy.intent_key)).state == "SENDING"
+    assert await intents.mark_terminal(db.get_session, busy.intent_key,
+                                       owner="dono", reason="NO_FILL") is True
+    assert (await state_of(busy.intent_key)).state == "TERMINAL"
+
+
+    # 17. IDs efetivos: registrados ANTES do POST, sob o mesmo fencing.
+    ids = identity(trigger_candle_ms=TRIGGER + 162_000_000)
+    await intents.reserve(db.get_session, ids, payload(), owner="w-ids")
+    # Em RESERVED ainda não há despacho: registrar é recusado.
+    assert await intents.register_dispatch(db.get_session, ids.intent_key,
+                                           owner="w-ids", dispatch_id="cw-x") is False
+    await intents.mark_sending(db.get_session, ids.intent_key, owner="w-ids")
+    assert await intents.register_dispatch(db.get_session, ids.intent_key,
+                                           owner="w-ids", dispatch_id=ids.client_order_id) is True
+    # Mesmo id de novo (retry do MESMO envio) não duplica.
+    assert await intents.register_dispatch(db.get_session, ids.intent_key,
+                                           owner="w-ids", dispatch_id=ids.client_order_id) is True
+    fallback_id = f"{ids.client_order_id[:32]}-mfb"[:36]
+    assert await intents.register_dispatch(db.get_session, ids.intent_key,
+                                           owner="w-ids", dispatch_id=fallback_id) is True
+    # Outro dono não registra despacho na tentativa alheia.
+    assert await intents.register_dispatch(db.get_session, ids.intent_key,
+                                           owner="estranho", dispatch_id="cw-zzz") is False
+    registrados = await intents.dispatch_ids(db.get_session, ids.intent_key)
+    assert registrados == [ids.client_order_id, fallback_id], registrados
+
+    # 18. Intenção incerta entra na lista de reconciliação; maker pendente não.
+    await intents.mark_unknown(db.get_session, ids.intent_key, owner="w-ids",
+                               reason="DISPATCH_OUTCOME_UNKNOWN")
+    pendente = identity(trigger_candle_ms=TRIGGER + 165_600_000)
+    await intents.reserve(db.get_session, pendente, payload(), owner="w-pend")
+    await intents.mark_sending(db.get_session, pendente.intent_key, owner="w-pend")
+    await intents.mark_unknown(db.get_session, pendente.intent_key, owner="w-pend",
+                               reason="PENDING_ENTRY_ORDER")
+    fila = await intents.list_needing_reconciliation(db.get_session)
+    chaves = {linha["intent_key"] for linha in fila}
+    assert ids.intent_key in chaves, chaves
+    assert pendente.intent_key not in chaves, "ordem maker viva não é desfecho incerto"
+
+
+    # 19. Transferência reserva → RealTrade sem janela em que NINGUÉM conta.
+    async def usage_now(ident):
+        async with db.get_session() as session:
+            pend = await intents._pending_usage(session, ident.account_ref, ident.exchange)
+            risk, complete = await intents._open_risk_usd(session)
+            return pend, risk, complete
+
+    transfer = identity(trigger_candle_ms=TRIGGER + 169_200_000)
+    await intents.reserve(db.get_session, transfer, payload(), owner="w-tr",
+                          capacity=intents.Capacity(risk_usd=25.0, max_open_risk_usd=10_000.0))
+    (pend_count, pend_risk), open_risk_before, _c = await usage_now(transfer)
+    assert pend_count >= 1 and pend_risk >= 25.0, (pend_count, pend_risk)
+    await intents.mark_sending(db.get_session, transfer.intent_key, owner="w-tr")
+    async with db.get_session() as session:      # o RealTrade nasce ANTES do confirm
+        trade = RealTrade(symbol="TRF/USDT:USDT", side="long", qty=5.0, entry_price=100.0,
+                          planned_stop=95.0, status="open", source="auto",
+                          opened_at=datetime.now(timezone.utc))
+        session.add(trade)
+        await session.commit()
+        trade_id = trade.id
+    (mid_count, mid_risk), open_risk_mid, _c = await usage_now(transfer)
+    # Janela conservadora: os dois contam; nunca existe instante com zero.
+    assert mid_count >= 1 and mid_risk >= 25.0, (mid_count, mid_risk)
+    assert open_risk_mid >= open_risk_before + 25.0, (open_risk_before, open_risk_mid)
+    assert await intents.mark_confirmed(db.get_session, transfer.intent_key,
+                                        owner="w-tr", real_trade_id=trade_id) is True
+    (after_count, after_risk), open_risk_after, _c = await usage_now(transfer)
+    assert after_count == mid_count - 1, (mid_count, after_count)
+    assert open_risk_after >= open_risk_before + 25.0, (open_risk_before, open_risk_after)
 
     # 12. Nenhuma intenção apagada em todo o ensaio.
     async with db.get_session() as session:
@@ -240,7 +371,9 @@ async def run():
     await db._engine.dispose()
     print("P03_INTENT_PG_OK: schema2x, mesma-decisao-um-envio, concorrencia, conflito, "
           "crash-antes, crash-depois, lease-vencido, callback-tardio, no-fill-terminal, "
-          "novo-gatilho, restart-preserva, corrida-de-capacidade, slots, sem-exchange")
+          "novo-gatilho, restart-preserva, corrida-de-capacidade, slots, risco-sob-lock, "
+          "risco-incompleto-fail-closed, callback-nao-rebaixa, tentativa-alheia, "
+          "ids-efetivos, fila-de-reconciliacao, transferencia-sem-janela, sem-exchange")
 
 
 if __name__ == "__main__":

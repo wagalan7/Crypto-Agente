@@ -11,6 +11,7 @@ pendente permanece pendente até ser reconciliada pelo MESMO `client_order_id`.
 from datetime import datetime
 
 from sqlalchemy import BigInteger, DateTime, Float, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db import Base
@@ -53,6 +54,9 @@ class EntryIntent(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     dispatches: Mapped[int] = mapped_column(Integer, default=0)
     reserved_risk_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    #: IDs EFETIVOS já despachados (entrada e eventual fallback), gravados
+    #: ANTES de cada POST — um id desconhecido ficaria invisível à reconciliação.
+    dispatch_ids: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     real_trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
