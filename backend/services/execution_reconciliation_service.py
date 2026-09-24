@@ -1740,6 +1740,68 @@ async def _reconcile_manual_kind(key: str, owner: str, inc: dict) -> None:
     log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED ({inc.get('kind')})")
 
 
+# ── Re-checagem de UNTRACKED_POSITION preso em MANUAL_REQUIRED ──────────────
+#: Intervalo mínimo entre duas leituras fresh do MESMO incidente (não martela a
+#: exchange: o operador leva minutos/horas para fechar a posição dele).
+UNTRACKED_RECHECK_S = _f("P03_UNTRACKED_RECHECK_S", 900.0)
+_untracked_recheck_at: dict = {}
+
+
+async def recheck_untracked_manual() -> dict:
+    """Reavalia a CAUSA de incidentes `UNTRACKED_POSITION` em `MANUAL_REQUIRED`.
+
+    Motivo: `_eligible` exclui `MANUAL_REQUIRED` e nenhum fluxo resolvia este
+    kind, então o incidente ficava aberto para sempre — mesmo depois de o
+    operador fechar a posição. Como qualquer incidente aberto mantém a
+    quarentena e bloqueia o resume manual, o bot ficava parado por dias com a
+    causa já extinta (observado em produção em 21–24/09/2026).
+
+    Regra: leitura FRESH do PRÓPRIO símbolo do incidente; só `FLAT` comprovado
+    resolve, como `FLAT` e com motivo auditável. Stale, erro, lado ambíguo ou
+    posição ainda aberta MANTÊM o incidente (fail-closed). Nada é fechado ou
+    cancelado na exchange, e posições não rastreadas de OUTROS símbolos (as
+    manuais do operador) não interferem neste veredicto.
+    """
+    repo = _get_repo()
+    try:
+        rows = await repo.list_open()
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03][untracked-recheck] leitura de incidentes falhou: {exc}")
+        return {"checked": 0, "resolved": 0, "kept": {}, "error": str(exc)}
+    now = _now()
+    checked = resolved = 0
+    kept: dict = {}
+    for inc in rows:
+        if (inc.get("kind") != Kind.UNTRACKED_POSITION
+                or inc.get("state") != State.MANUAL_REQUIRED):
+            continue
+        key = inc.get("incident_key")
+        if not key:
+            continue
+        last = _untracked_recheck_at.get(key)
+        if last is not None and (now - last).total_seconds() < UNTRACKED_RECHECK_S:
+            continue
+        _untracked_recheck_at[key] = now
+        checked += 1
+        gate, _fp = await _fresh_gate(inc)
+        if gate != FreshGate.FLAT:
+            # Continua havendo (ou não dá para afirmar que não há) posição.
+            kept[key] = gate
+            await repo.update(key, last_error=f"re-check untracked: {gate}")
+            continue
+        if not await repo.claim(key, _PROCESS_ID,
+                                _now() + timedelta(seconds=RECONCILE_LEASE_S)):
+            kept[key] = "CLAIM_PERDIDO"
+            continue
+        await _resolve(key, _PROCESS_ID, State.FLAT,
+                       "untracked: símbolo confirmado fresh-flat na re-checagem")
+        resolved += 1
+    if resolved:
+        log.warning(f"[p03][untracked-recheck] {resolved} incidente(s) resolvido(s) "
+                    f"por posição inexistente; {len(kept)} mantido(s)")
+    return {"checked": checked, "resolved": resolved, "kept": kept}
+
+
 async def _reconcile_one(key: str, owner: str) -> None:
     repo = _get_repo()
     inc = await repo.get(key)
@@ -1797,6 +1859,12 @@ async def reconcile_due() -> dict:
             cur = await repo.get(key)
             if cur and cur.get("resolved_at") is None:
                 await repo.release_claim(key, owner=_PROCESS_ID)  # só o próprio claim
+    # ANTES de contar: reavalia untracked preso em MANUAL_REQUIRED, para que a
+    # liberação aconteça no MESMO ciclo em que a causa deixa de existir.
+    try:
+        await recheck_untracked_manual()
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03] re-check de untracked falhou (incidentes mantidos): {exc}")
     open_now = len(await repo.list_open())
     # Enquanto houver incidente aberto, garante o owner P03 armado (mesmo após uma
     # tentativa manual de resume que possa ter limpado o latch).

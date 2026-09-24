@@ -967,11 +967,19 @@ class OwnershipRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.rs["paused"])          # pausa manual permanece
 
     async def test_open_incident_rearms_p03_after_improper_resume(self):
-        await ers.record_incident(kind=Kind.UNTRACKED_POSITION, symbol="BTC/USDT:USDT")
+        await ers.record_incident(kind=Kind.UNTRACKED_POSITION, symbol="BTC/USDT:USDT",
+                                  side="buy")
         # resume indevido limpou o latch
         self.shadow.clear_execution_quarantine(None)
         self.assertIsNone(self.shadow.execution_quarantine_reason())
-        with patch.object(ers, "_detect_untracked_positions", AsyncMock(return_value={"status": "FLAT", "count": 0})):
+        # A posição não rastreada CONTINUA na conta: é isso que mantém o incidente
+        # aberto. (Conta comprovadamente flat resolve o incidente pela re-checagem
+        # do untracked — cenário coberto em test_p03_untracked_recheck.)
+        with patch.object(ers, "_detect_untracked_positions",
+                          AsyncMock(return_value={"status": "UNTRACKED", "count": 1})), \
+             patch.object(ers, "_fresh_position",
+                          AsyncMock(return_value={"quality": "FRESH", "size": 0.032,
+                                                  "side": "buy"})):
             await ers.reconcile_due()               # ciclo re-arma o owner P03
         self.assertIn("p03", self.owners)
 
