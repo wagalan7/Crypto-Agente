@@ -31,10 +31,45 @@ REESCRITO pelo rebase sobre `origin/main` de 24/09 e equivale a `e64b5fab`
 | --- | --- | --- |
 | 1 · P03 caminho operacional | `INTEGRADO` | 19 herméticos + 19 cenários PostgreSQL real |
 | 2 · R05 total no limite | `INTEGRADO` | 27 herméticos + 16 verificações PostgreSQL com ledger R05C real |
-| 3 · R09+R07/R08 coleta real | `PENDENTE` | — |
+| 3 · R09+R07/R08 coleta real | `INTEGRADO` | 18 verificações PostgreSQL (scanner→flush→export) + entrypoint executável |
 | 4 · R11/R12 estado e catálogo | `PENDENTE` | — |
-| 5 · R10 execução e walk-forward | `PENDENTE` | — |
+| 5 · R10 execução e walk-forward | `INTEGRADO` | 12 + 11 herméticos de regressão dos defeitos reproduzidos |
 | 6 · Encerramento verificável | `PENDENTE` | — |
+
+### Blocos 3 e 5 — coleta real, entrypoint executável e execução simulada
+
+**R09 pré-seleção (bloco 3).** `observe` deixou de ser rótulo: o escopo viaja
+até o INSERT (`begin_batch(scope=...)` → `_opportunity_values`), o coletor
+`observe_preselection` admite aceitas e vetadas no MESMO buffer/flush/resolver
+do R09 e o scanner de produção (`get_recommendations_via_vision`) passou a
+registrar cada candidato nos pontos reais do funil — tier, cooldown, regime,
+freio de contratendência e geometria — com a ORDEM real e motivos efetivos.
+Desligado é no-op absoluto. Provado ponta a ponta em PostgreSQL
+(`pg_integration_r09_preselection.py`, 18 verificações): coleta → flush real →
+persistência com escopo `PRE_SELECTION` → exportação R10B nos escopos novos
+trazendo as MESMAS linhas, com o funil antigo e o legado intocados.
+
+**Entrypoint de pesquisa.** `backend/scripts/research_pipeline.py` executa a
+montagem com os componentes reais: dados sintéticos → núcleo → score V3 →
+observação → persistência opcional → replay de carteira → walk-forward. O
+relatório declara `live_adapter=LIVE_ADAPTER_NOT_IMPLEMENTED` — falta de código,
+não "pendência externa".
+
+**R10 execução e capital (bloco 5.1).** Corrigidos os quatro defeitos
+reproduzidos: o preço e o instante EFETIVOS passaram a alimentar a trajetória e
+a contabilidade (ask 100 e 100,4 já não dão o mesmo R); a trajetória começa na
+primeira barra após o fill, então não existe saída antes da entrada; maker só
+abre quando a barra atravessa o limite; e o capital recebe o resultado
+realizado, de modo que duas perdas sequenciais não arriscam o capital inicial
+duas vezes. Resultado desconhecido não libera capital presumido.
+
+**R10 walk-forward (bloco 5.2).** `run_walk_forward` EXECUTA cada dobra —
+separação temporal com purga/embargo, seleção só no treino, avaliação fora da
+amostra e agregação — e o veredito passou a exigir o delta da política INTEIRA
+(incluindo aceitas de um lado só) concordando com o IC e estudo realmente
+executado. A repro da revisão (candidato globalmente pior vencendo pelo IC
+pareado) virou regressão.
+
 
 ### Bloco 2 — o total com funding dentro da fórmula do limite
 

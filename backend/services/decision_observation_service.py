@@ -196,8 +196,13 @@ def _evict_stale_unsealed(now: datetime) -> None:
         _stats["stale_unsealed_evicted"] += 1
 
 
-def begin_batch(recs: list[dict], *, mode="UNKNOWN", config: dict | None = None) -> None:
-    """Denominador é EXATAMENTE a lista entregue à execução, antes dos gates."""
+def begin_batch(recs: list[dict], *, mode="UNKNOWN", config: dict | None = None,
+                scope: str = "POST_SELECTION") -> None:
+    """Denominador é EXATAMENTE a lista entregue à execução, antes dos gates.
+
+    `scope` viaja até o INSERT: o funil antigo continua `POST_SELECTION` e a
+    coorte nova não é gravada com o rótulo dele.
+    """
     for rec in recs:
         try:
             if not isinstance(rec, dict):
@@ -226,6 +231,7 @@ def begin_batch(recs: list[dict], *, mode="UNKNOWN", config: dict | None = None)
             }
             cfg["version_hash"] = _digest(cfg)
             _pending[attempt] = {
+                "scope": scope,
                 "opportunity_key": key, "identity_source": source,
                 "symbol": setup.get("symbol") or "UNKNOWN", "observed_at": now,
                 "mode": mode if mode in {"LIVE", "SHADOW"} else "UNKNOWN",
@@ -237,6 +243,81 @@ def begin_batch(recs: list[dict], *, mode="UNKNOWN", config: dict | None = None)
             rec["_r09_attempt_id"] = attempt
         except Exception:
             _stats["stage_errors"] += 1
+
+
+# ── Coleta PRÉ-SELEÇÃO (escopo novo, mesmo armazenamento/flush/resolver) ────
+def observe_preselection(candidates: list[dict]) -> dict:
+    """Registra candidatos ANTES da seleção, no acervo que já existe.
+
+    Desligado (`R09_PRESELECTION_MODE != observe`) é no-op absoluto: não toca o
+    buffer, não muda decisão e não grava nada. Ligado, cada candidato vira uma
+    linha `PRE_SELECTION` — aceita ou vetada — com identidade, funil congelado e
+    disponibilidade, respeitando o orçamento e o teto do buffer existentes.
+    """
+    summary = {"accepted": 0, "vetoed": 0, "skipped": 0}
+    try:
+        from services import preselection_observation_service as pre
+    except Exception:  # noqa: BLE001
+        summary["skipped"] = len(candidates or [])
+        return summary
+    if not pre.collection_enabled():
+        return {**summary, "enabled": False}
+    budget = pre.budget_verdict(batch_records=len(candidates or []),
+                               buffered_records=len(_pending))
+    if not budget["within_budget"]:
+        _stats["buffer_dropped"] += len(candidates or [])
+        return {**summary, "reason_code": budget["reason_code"]}
+    now = datetime.now(timezone.utc)
+    for candidate in candidates or []:
+        try:
+            if not isinstance(candidate, dict):
+                summary["skipped"] += 1
+                continue
+            setup = candidate.get("setup") if isinstance(candidate.get("setup"), dict) else {}
+            key, why = pre.pre_selection_identity(
+                symbol=setup.get("symbol"), timeframe=setup.get("timeframe"),
+                side=setup.get("side"), trigger_candle_ms=setup.get("trigger_candle_ms"),
+                playbook=setup.get("playbook"), playbook_version=setup.get("playbook_version"))
+            if key is None:
+                _stats["identity_missing"] += 1
+                summary["skipped"] += 1
+                continue
+            if len(_pending) >= MAX_PENDING:
+                _evict_stale_unsealed(now)
+            if len(_pending) >= MAX_PENDING:
+                _stats["buffer_dropped"] += 1
+                summary["skipped"] += 1
+                continue
+            funnel = pre.record_funnel(candidate.get("stages") or [])
+            outcome = (pre.OUTCOME_ACCEPTED if candidate.get("accepted")
+                       else pre.OUTCOME_VETOED)
+            decision_ms = int(candidate.get("decision_ts_ms") or int(now.timestamp() * 1000))
+            payload = pre.frozen_decision(
+                identity=key, outcome=outcome, decision_ts_ms=decision_ms, setup=setup,
+                funnel=funnel, availability=candidate.get("availability") or {},
+                source=candidate.get("source") or {},
+                config={"schema_version": pre.PRE_SCHEMA_VERSION})
+            cfg = pre.merge_into_config({**_CONFIG, "scope": pre.SCOPE}, payload)
+            frozen = {key_name: setup.get(key_name) for key_name in
+                      ("symbol", "timeframe", "side", "playbook", "playbook_version",
+                       "entry", "stop_loss", "tp1", "tp2", "atr", "trigger_candle_ms")}
+            frozen["direction"] = setup.get("side")
+            attempt = str(uuid4())
+            _pending[attempt] = {
+                "scope": pre.SCOPE,
+                "opportunity_key": key, "identity_source": "PRE_SELECTION_SETUP",
+                "symbol": setup.get("symbol") or "UNKNOWN", "observed_at": now,
+                "mode": "SHADOW", "frozen_setup": frozen, "frozen_config": cfg,
+                "result": outcome, "first_blocker": funnel.get("first_blocker"),
+                "submit_evidence": "NOT_OBSERVED", "score_trace": None,
+                "rejected_at": None if outcome == pre.OUTCOME_ACCEPTED else now,
+                "sealed": True, "admission_retries": 0,
+            }
+            summary["accepted" if outcome == pre.OUTCOME_ACCEPTED else "vetoed"] += 1
+        except Exception:
+            _stats["stage_errors"] += 1
+            summary["skipped"] += 1
+    return summary
 
 
 def stage_decision(rec: dict, decision: str, reason_code: str | None = None) -> None:
@@ -363,7 +444,8 @@ def seal_batch(recs: list[dict]) -> None:
 def _opportunity_values(row):
     return dict(
         opportunity_key=row["opportunity_key"], identity_source=row["identity_source"],
-        scope="POST_SELECTION", symbol=row["symbol"], first_seen_at=row["observed_at"],
+        scope=row.get("scope") or "POST_SELECTION",
+        symbol=row["symbol"], first_seen_at=row["observed_at"],
         last_seen_at=row["observed_at"], first_decision=row["result"],
         first_decision_observed_at=row["observed_at"],
         first_blocker=row["first_blocker"], frozen_setup=row["frozen_setup"],
@@ -461,6 +543,7 @@ def _group(batch):
         key = row["opportunity_key"]
         if key not in opportunities:
             opportunities[key] = dict(row)
+            opportunities[key]["scope"] = row.get("scope") or "POST_SELECTION"
         elif not opportunities[key]["first_blocker"]:
             opportunities[key]["first_blocker"] = row["first_blocker"]
         # Retry guarda só estágio de execução (~400 bytes), nunca a confluência.

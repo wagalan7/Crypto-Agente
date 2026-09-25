@@ -344,11 +344,146 @@ def slice_metrics(rows: Sequence[Mapping[str, Any]], *, by: str) -> Dict[str, An
     return out
 
 
+# ── Runner: EXECUTAR cada dobra, não apenas descrever janelas ───────────────
+POLICY_DELTA_UNKNOWN = "POLICY_DELTA_UNKNOWN"
+STUDIES_NOT_EXECUTED = "STUDIES_NOT_EXECUTED"
+DELTA_DISAGREES_WITH_CI = "DELTA_DISAGREES_WITH_CI"
+
+
+def _rows_by_time(rows: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    out = []
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        stamp = _int(row.get("decision_ts_ms"))
+        if stamp is None or not str(row.get("opportunity_id") or ""):
+            continue
+        out.append(row)
+    return sorted(out, key=lambda item: (item["decision_ts_ms"], item["opportunity_id"]))
+
+
+def policy_delta_r(paired: Mapping[str, Any]) -> Dict[str, Any]:
+    """Delta da POLÍTICA INTEIRA: pares + o que só um lado aceitou.
+
+    Ausência de resultado conhecido em qualquer parcela torna o delta `None` —
+    zero de não-exposição comprovada não é zero de dado desconhecido.
+    """
+    paired = paired if isinstance(paired, Mapping) else {}
+    total = 0.0
+    for item in paired.get("paired") or ():
+        base = _finite((item or {}).get("baseline_net_r"))
+        cand = _finite((item or {}).get("candidate_net_r"))
+        if base is None or cand is None:
+            return {"available": False, "reason_code": POLICY_DELTA_UNKNOWN, "value": None}
+        total += cand - base
+    delta = paired.get("policy_delta") or {}
+    if int(delta.get("removed_unknown") or 0) or int(delta.get("added_unknown") or 0):
+        return {"available": False, "reason_code": POLICY_DELTA_UNKNOWN, "value": None}
+    added = _finite(delta.get("added_net_r"))
+    removed = _finite(delta.get("removed_net_r"))
+    if added is None or removed is None:
+        return {"available": False, "reason_code": POLICY_DELTA_UNKNOWN, "value": None}
+    total += added - removed
+    return {"available": True, "reason_code": OK, "value": total,
+            "paired_n": len(paired.get("paired") or ()),
+            "only_baseline_n": len(paired.get("only_baseline") or ()),
+            "only_candidate_n": len(paired.get("only_candidate") or ())}
+
+
+def run_walk_forward(*, baseline: Sequence[Mapping[str, Any]],
+                     candidate: Sequence[Mapping[str, Any]],
+                     folds: Sequence[Fold], bar_ms: int = 300_000,
+                     horizon_bars: int = 0, embargo_bars: int = 0,
+                     costs_complete: bool = False, horizon_sufficient: bool = False,
+                     coverage: Optional[Mapping[str, Any]] = None,
+                     seed: int = 7, samples: int = 500, block_size: int = 5,
+                     alpha: float = DEFAULT_ALPHA, comparisons: int = 1) -> Dict[str, Any]:
+    """Executa CADA dobra e devolve resultados rastreáveis ao veredito.
+
+    Em cada dobra: separação temporal com purga/embargo, escolha do candidato
+    SOMENTE com o treino, avaliação fora da amostra e agregação. O veredito
+    consome o que saiu daqui — uma string "train" e uma lista de janelas não
+    provam que isso aconteceu.
+    """
+    base_rows = _rows_by_time(baseline)
+    cand_rows = _rows_by_time(candidate)
+    executed: List[Dict[str, Any]] = []
+    test_deltas: List[float] = []
+    all_base: List[Mapping[str, Any]] = []
+    all_cand: List[Mapping[str, Any]] = []
+    for fold in folds or ():
+        window = apply_purge_embargo(fold, horizon_bars=horizon_bars, bar_ms=bar_ms,
+                                     embargo_bars=embargo_bars)
+        if not window["usable"]:
+            executed.append({"fold": fold.index, "reason_code": window["reason_code"],
+                             "train_n": 0, "test_n": 0, "delta_net_r": None})
+            continue
+
+        def _slice(rows, start, end):
+            return [row for row in rows if start <= row["decision_ts_ms"] < end]
+
+        train_base = _slice(base_rows, window["train_start_ms"], window["train_end_ms"])
+        train_cand = _slice(cand_rows, window["train_start_ms"], window["train_end_ms"])
+        test_base = _slice(base_rows, window["test_start_ms"], window["test_end_ms"])
+        test_cand = _slice(cand_rows, window["test_start_ms"], window["test_end_ms"])
+        # Seleção do candidato: SOMENTE com o treino desta dobra.
+        train_pair = pair_opportunities(train_base, train_cand)
+        train_delta = policy_delta_r(train_pair)
+        selected = bool(train_delta["available"] and train_delta["value"] > 0)
+        # Avaliação FORA DA AMOSTRA.
+        test_pair = pair_opportunities(test_base, test_cand)
+        test_delta = policy_delta_r(test_pair)
+        executed.append({
+            "fold": fold.index, "reason_code": OK,
+            "train_n": len(train_base) + len(train_cand),
+            "test_n": len(test_base) + len(test_cand),
+            "candidate_selected_on_train": selected,
+            "train_delta_net_r": train_delta["value"],
+            "delta_net_r": test_delta["value"],
+            "delta_reason_code": test_delta["reason_code"],
+            "window": window,
+        })
+        if test_delta["available"] and (len(test_base) + len(test_cand)) > 0:
+            test_deltas.append(test_delta["value"])
+        all_base.extend(test_base)
+        all_cand.extend(test_cand)
+
+    folds_executed = sum(1 for item in executed if item["reason_code"] == OK
+                         and item["test_n"] > 0)
+    paired = pair_opportunities(all_base, all_cand)
+    delta = policy_delta_r(paired)
+    # Bootstrap sobre os DELTAS de dobra (diferenças de carteira fora da
+    # amostra), nunca sobre o R absoluto de uma única execução.
+    ci = block_bootstrap_ci(test_deltas, seed=seed, samples=samples,
+                            block_size=block_size, alpha=alpha, comparisons=comparisons)
+    discipline = fold_discipline({stage: "train" for stage in FITTED_STAGES}
+                                 | {"candidate_selected_on": "validation"})
+    guard = coverage if isinstance(coverage, Mapping) else coverage_guard(
+        {"considered": len(all_base), "resolved": len(all_base)},
+        {"considered": len(all_cand), "resolved": len(all_cand)})
+    result = verdict(folds=folds, discipline=discipline, coverage=guard,
+                     costs_complete=costs_complete, horizon_sufficient=horizon_sufficient,
+                     paired=paired, ci=ci, policy_delta=delta,
+                     studies_executed=folds_executed > 0)
+    return {"wf_version": WF_VERSION, "folds_executed": folds_executed,
+            "folds": executed, "policy_delta": delta, "ci": ci,
+            "paired": paired, "verdict": result,
+            "live_equivalent": False, "promotable": False}
+
+
 def verdict(*, folds: Sequence[Fold], discipline: Mapping[str, Any],
             coverage: Mapping[str, Any], costs_complete: bool,
             horizon_sufficient: bool, paired: Mapping[str, Any],
-            ci: Mapping[str, Any]) -> Dict[str, Any]:
-    """Sem custo, horizonte, cobertura ou evidência: NENHUM vencedor."""
+            ci: Mapping[str, Any],
+            policy_delta: Optional[Mapping[str, Any]] = None,
+            studies_executed: bool = False) -> Dict[str, Any]:
+    """Sem custo, horizonte, cobertura ou evidência: NENHUM vencedor.
+
+    O IC da subamostra pareada NÃO decide sozinho: ele precisa concordar com o
+    delta da POLÍTICA INTEIRA (incluindo o que só um lado aceitou) e existir
+    estudo realmente executado por trás. Sem isso, um candidato globalmente pior
+    venceria por um intervalo pareado positivo.
+    """
     reasons: List[str] = []
     wf = is_walk_forward(folds)
     if not wf["walk_forward"]:
@@ -363,6 +498,14 @@ def verdict(*, folds: Sequence[Fold], discipline: Mapping[str, Any],
         reasons.append(HORIZON_INSUFFICIENT)
     if not (ci or {}).get("available"):
         reasons.append((ci or {}).get("reason_code", SAMPLE_INSUFFICIENT))
+    if not studies_executed:
+        reasons.append(STUDIES_NOT_EXECUTED)
+    delta = policy_delta if isinstance(policy_delta, Mapping) else {}
+    if not delta.get("available"):
+        reasons.append(delta.get("reason_code", POLICY_DELTA_UNKNOWN))
+    elif not (delta.get("paired_n") or delta.get("only_baseline_n")
+              or delta.get("only_candidate_n")):
+        reasons.append(SAMPLE_INSUFFICIENT)
     reasons = [code for code in dict.fromkeys(reasons) if code != OK]
     if reasons:
         return {"winner": None, "state": INSUFFICIENT_EVIDENCE,
@@ -374,10 +517,22 @@ def verdict(*, folds: Sequence[Fold], discipline: Mapping[str, Any],
         return {"winner": None, "state": INSUFFICIENT_EVIDENCE,
                 "reason_codes": (CI_INCLUDES_ZERO,),
                 "policy_delta": (paired or {}).get("policy_delta"),
+                "policy_delta_r": delta.get("value"),
                 "promotable": False}
-    return {"winner": "CANDIDATE" if low > 0 else "BASELINE",
+    total = delta.get("value")
+    ci_winner = "CANDIDATE" if low > 0 else "BASELINE"
+    delta_winner = "CANDIDATE" if total > 0 else ("BASELINE" if total < 0 else None)
+    if delta_winner is None or delta_winner != ci_winner:
+        # Candidato globalmente pior não vence por IC pareado favorável.
+        return {"winner": None, "state": INSUFFICIENT_EVIDENCE,
+                "reason_codes": (DELTA_DISAGREES_WITH_CI,),
+                "policy_delta": (paired or {}).get("policy_delta"),
+                "policy_delta_r": total, "ci_winner": ci_winner,
+                "promotable": False}
+    return {"winner": ci_winner,
             "state": "EVIDENCE_AVAILABLE", "reason_codes": (OK,),
             "policy_delta": (paired or {}).get("policy_delta"),
+            "policy_delta_r": total,
             # Vencer na validação NÃO promove: isso é o bloco G (simulação,
             # aprovação humana e canário).
             "promotable": False}

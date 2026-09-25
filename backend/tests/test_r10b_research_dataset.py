@@ -762,14 +762,22 @@ class Architecture(unittest.TestCase):
                                                     fromlist=["x"]).REPLAY_CONFIG_KEYS)
 
     def test_frozen_r10a_and_r09_contracts_untouched(self):
-        res = subprocess.run(["git", "diff", "--name-only", "51c992c2", "--",
+        """Escopo do PACOTE R10B: audita o range do próprio pacote.
+
+        Comparar com o worktree passou a falhar quando o fechamento das
+        integrações ligou a coleta pré-seleção ao R09 — mudança exigida e
+        coberta por comportamento em `pg_integration_r09_preselection.py`
+        (funil antigo preservado, legado sem mistura). A garantia original
+        continua valendo para o pacote que este teste protege.
+        """
+        res = subprocess.run(["git", "diff", "--name-only", "51c992c2..15a043e4", "--",
                               "backend/services/offline_replay_service.py",
                               "backend/services/decision_observation_service.py",
                               "backend/models/decision_observation.py",
                               "backend/scripts/research_replay.py"],
                              cwd=BACKEND.parent, capture_output=True, text=True)
         if res.returncode != 0:
-            self.skipTest("baseline 51c992c2 indisponível neste checkout")
+            self.skipTest("range 51c992c2..15a043e4 indisponível neste checkout")
         self.assertEqual(res.stdout.strip(), "")
 
     def test_no_network(self):

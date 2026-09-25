@@ -414,12 +414,18 @@ class VereditoEHoldout(unittest.TestCase):
     def _base(self, **over):
         disciplina = {stage: "train" for stage in wf.FITTED_STAGES}
         disciplina["candidate_selected_on"] = "validation"
+        # Par mínimo COERENTE: o veredito exige delta da política inteira e
+        # estudo executado — IC sozinho não decide (ver test_wf_runner_closure).
+        base = [{"opportunity_id": "a", "net_r": 0.0, "decision_ts_ms": T0}]
+        cand = [{"opportunity_id": "a", "net_r": 0.3, "decision_ts_ms": T0}]
+        pareado = wf.pair_opportunities(base, cand)
         payload = dict(
             folds=self._folds(), discipline=wf.fold_discipline(disciplina),
             coverage=wf.coverage_guard({"considered": 100, "resolved": 90},
                                        {"considered": 100, "resolved": 89}),
             costs_complete=True, horizon_sufficient=True,
-            paired=wf.pair_opportunities([], []),
+            paired=pareado,
+            policy_delta=wf.policy_delta_r(pareado), studies_executed=True,
             ci={"available": True, "low": 0.1, "high": 0.4})
         payload.update(over)
         return payload

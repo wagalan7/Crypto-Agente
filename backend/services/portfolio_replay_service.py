@@ -56,6 +56,7 @@ SYMBOL_SLOT_TAKEN = "SYMBOL_SLOT_TAKEN"
 NO_CAPITAL = "NO_CAPITAL"
 EXPOSURE_LIMIT = "EXPOSURE_LIMIT"
 BARS_UNAVAILABLE = "BARS_UNAVAILABLE"
+GEOMETRY_INVALID_AFTER_FILL = "GEOMETRY_INVALID_AFTER_FILL"
 COST_COMPONENT_UNKNOWN = "COST_COMPONENT_UNKNOWN"
 ECONOMICS_UNAVAILABLE = "ECONOMICS_UNAVAILABLE"
 SAME_BAR_CONSERVATIVE_STOP = "SAME_BAR_CONSERVATIVE_STOP"
@@ -67,6 +68,7 @@ REASON_CODES = frozenset({
     QUOTE_BEFORE_DECISION, QUOTE_STALE, SPREAD_TOO_WIDE, CHASE_TOO_FAR, ATR_UNKNOWN,
     MAKER_NOT_FILLED, PARTIAL_NOT_ALLOWED, FALLBACK_NOT_ALLOWED, NO_SLOT,
     SYMBOL_SLOT_TAKEN, NO_CAPITAL, EXPOSURE_LIMIT, BARS_UNAVAILABLE,
+    GEOMETRY_INVALID_AFTER_FILL,
     COST_COMPONENT_UNKNOWN, ECONOMICS_UNAVAILABLE, SAME_BAR_CONSERVATIVE_STOP,
     GAP_FILL_AT_OPEN, BAR_INCOMPLETE, REPLAY_INACTIVE,
 })
@@ -324,6 +326,38 @@ class PortfolioState:
     open_positions: List[Dict[str, Any]] = field(default_factory=list)
     used_risk_usd: float = 0.0
     exposure_usd: float = 0.0
+    #: Capital CORRENTE: recebe o resultado realizado de cada trade fechado.
+    #: Sem isto, duas perdas sequenciais arriscariam o capital inicial duas
+    #: vezes e a carteira perderia mais do que tem.
+    capital_usd: Optional[float] = None
+    realized_pnl_usd: float = 0.0
+    unknown_results: int = 0
+
+    def __post_init__(self) -> None:
+        if self.capital_usd is None:
+            self.capital_usd = float(self.config.capital_usd)
+
+    @property
+    def available_capital_usd(self) -> float:
+        return max(0.0, float(self.capital_usd) - float(self.config.reserve_usd))
+
+    def risk_budget_usd(self) -> float:
+        """Risco por trade sobre o capital CORRENTE, nunca o inicial."""
+        return max(0.0, float(self.capital_usd)) * self.config.risk_per_trade_pct / 100.0
+
+    def settle(self, *, risk_usd: float, net_r: Optional[float]) -> None:
+        """Aplica o resultado realizado ao capital.
+
+        Resultado desconhecido NÃO libera capital presumido nem zera prejuízo:
+        fica contado como desconhecido e o risco segue reservado.
+        """
+        value = _finite(net_r)
+        if value is None:
+            self.unknown_results += 1
+            return
+        realized = value * float(risk_usd)
+        self.realized_pnl_usd += realized
+        self.capital_usd = float(self.capital_usd) + realized
 
     def release(self, now_ms: int) -> None:
         """Fecha posições cujo horizonte já terminou ANTES de admitir a próxima."""
@@ -347,8 +381,8 @@ class PortfolioState:
             return {"admitted": False, "reason_code": SYMBOL_SLOT_TAKEN}
         if len(self.open_positions) >= cfg.max_concurrent:
             return {"admitted": False, "reason_code": NO_SLOT}
-        risk = cfg.risk_usd
-        if self.used_risk_usd + risk > cfg.capital_usd - cfg.reserve_usd + 1e-9:
+        risk = self.risk_budget_usd()
+        if risk <= 0 or self.used_risk_usd + risk > self.available_capital_usd + 1e-9:
             return {"admitted": False, "reason_code": NO_CAPITAL}
         if self.exposure_usd + exposure_usd > cfg.max_exposure_usd + 1e-9:
             return {"admitted": False, "reason_code": EXPOSURE_LIMIT}
@@ -460,20 +494,59 @@ def run_portfolio(candidates: Sequence[Mapping[str, Any]], *,
             reject(key, BARS_UNAVAILABLE)
             continue
         try:
-            opportunity = r10a.Opportunity(
-                opportunity_id=key, symbol=str(symbol), direction=side,
-                decision_ts_ms=decision_ms, entry=raw.get("entry"),
-                stop_loss=raw.get("stop_loss"), tp1=raw.get("tp1"), tp2=raw.get("tp2"),
-                atr=raw.get("atr"))
             candles = tuple(r10a.Candle(**dict(bar)) for bar in bars)
         except (TypeError, ValueError):
             reject(key, BARS_UNAVAILABLE)
             continue
+        # A ENTRADA EFETIVA e o INSTANTE efetivo alimentam a trajetória: o
+        # replay começa depois do fill (nunca uma saída antes dele) e o R sai do
+        # preço realmente simulado, não do preço planejado.
+        effective_price = _finite(entry_verdict["price"])
+        effective_ts = _int(entry_verdict["effective_ts_ms"])
+        if effective_price is None or effective_ts is None:
+            reject(key, QUOTE_UNAVAILABLE)
+            continue
+        if model.maker_enabled:
+            # Maker só abre quando a barra da janela realmente atravessou o
+            # limite; toque sem prova de fila não vira posição.
+            entry_bar = next((bar for bar in bars
+                              if (_int(bar.get("timestamp_ms")) or -1) >= effective_ts), None)
+            fill = maker_outcome(limit_price=effective_price, side=side,
+                                 bar=entry_bar, model=model)
+            if not fill["filled"]:
+                reject(key, fill["reason_code"])
+                continue
+            entry_verdict = {**entry_verdict, "fill_type": fill["fill_type"],
+                             "fill_fraction": fill["fraction"]}
+        try:
+            opportunity = r10a.Opportunity(
+                opportunity_id=key, symbol=str(symbol), direction=side,
+                decision_ts_ms=effective_ts, entry=effective_price,
+                stop_loss=raw.get("stop_loss"), tp1=raw.get("tp1"), tp2=raw.get("tp2"),
+                atr=raw.get("atr"))
+        except (TypeError, ValueError):
+            # Preço efetivo rompeu a geometria (stop/alvo) — não existe trade.
+            reject(key, GEOMETRY_INVALID_AFTER_FILL)
+            continue
         risk_price = abs(opportunity.entry - opportunity.stop_loss)
-        exposure = (portfolio.risk_usd / risk_price * opportunity.entry
-                    if risk_price > 0 else float("inf"))
-        result = r10a.replay_opportunity(opportunity, candles, replay_config, costs)
-        admission = state.admit(symbol=str(symbol), side=side, decision_ts_ms=decision_ms,
+        if risk_price <= 0:
+            reject(key, GEOMETRY_INVALID_AFTER_FILL)
+            continue
+        risk_budget = state.risk_budget_usd()
+        fraction = _finite(entry_verdict.get("fill_fraction"))
+        fraction = 1.0 if fraction is None else max(0.0, min(1.0, fraction))
+        qty = (risk_budget / risk_price) * fraction
+        exposure = qty * opportunity.entry
+        # A trajetória começa na PRIMEIRA barra completa depois do fill: barra
+        # anterior ao instante efetivo não pode produzir saída.
+        bar_ms = replay_config.bar_ms
+        first_ms = ((effective_ts + bar_ms - 1) // bar_ms) * bar_ms
+        window = tuple(candle for candle in candles if candle.timestamp_ms >= first_ms)
+        if not window:
+            reject(key, BARS_UNAVAILABLE)
+            continue
+        result = r10a.replay_opportunity(opportunity, window, replay_config, costs)
+        admission = state.admit(symbol=str(symbol), side=side, decision_ts_ms=effective_ts,
                                 exposure_usd=exposure, exit_ts_ms=result.get("exit_ts_ms"))
         if not admission["admitted"]:
             # Trade impossível pela carteira NÃO entra na soma.
@@ -484,6 +557,8 @@ def run_portfolio(candidates: Sequence[Mapping[str, Any]], *,
             economics_unavailable += 1
         else:
             net_values.append(net)
+        risk_usd = admission["risk_usd"] * fraction
+        state.settle(risk_usd=risk_usd, net_r=net)
         trades.append({"opportunity_id": key, "admitted": True, "reason_code": OK,
                        "status": result.get("status"), "net_r": net,
                        "gross_r": _finite(result.get("gross_r")),
@@ -491,11 +566,18 @@ def run_portfolio(candidates: Sequence[Mapping[str, Any]], *,
                        "slippage_r": _finite(result.get("slippage_r")),
                        "funding_r": _finite(result.get("funding_r")),
                        "entry_fill_type": entry_verdict["fill_type"],
-                       "effective_ts_ms": entry_verdict["effective_ts_ms"],
+                       "entry_fill_price": opportunity.entry,
+                       "fill_fraction": fraction,
+                       "effective_ts_ms": effective_ts,
                        "exit_ts_ms": result.get("exit_ts_ms"),
-                       "risk_usd": admission["risk_usd"], "exposure_usd": exposure})
+                       "risk_usd": risk_usd, "qty": qty, "exposure_usd": exposure,
+                       "capital_after_usd": state.capital_usd})
     costs_view = cost_status(costs)
     metrics = portfolio_metrics(net_values)
+    metrics = {**metrics, "capital_start_usd": portfolio.capital_usd,
+               "capital_end_usd": state.capital_usd,
+               "realized_pnl_usd": state.realized_pnl_usd,
+               "unknown_results": state.unknown_results}
     if not costs_view["complete"]:
         metrics = {**metrics, "economics": ECONOMICS_UNAVAILABLE}
     return {

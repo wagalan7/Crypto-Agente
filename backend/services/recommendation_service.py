@@ -2539,6 +2539,50 @@ def get_source_backoff_s() -> int:
     return min(SCAN_BACKOFF_MAX_S, SCAN_BACKOFF_STEP_S * n)
 
 
+# ── R09 pré-seleção: candidato observado ANTES da seleção (default OFF) ─────
+def _preselection_candidate(sig, score, *, stages, accepted: bool) -> Optional[dict]:
+    """Monta a linha de observação de UM candidato do scan.
+
+    Só campos ponto-no-tempo que o núcleo/score/replay precisam depois; nada é
+    reconstruído com dado futuro. Ausência essencial fica `None` e o coletor
+    trata como identidade insuficiente.
+    """
+    try:
+        freshness = getattr(sig, "data_freshness", None) or {}
+        candle = freshness.get("candle") if isinstance(freshness, dict) else {}
+        trigger = (candle or {}).get("close_time_ms")
+        direction = str(getattr(sig, "direction", "") or "").lower()
+        side = "long" if direction == "long" else ("short" if direction == "short" else None)
+        setup = {
+            "symbol": str(getattr(sig, "symbol", "") or ""),
+            "timeframe": str(getattr(sig, "timeframe", "") or ""),
+            "side": side,
+            "playbook": "CHAMPION_LEGACY",
+            "playbook_version": "SCORE_V2",
+            "trigger_candle_ms": int(trigger) if isinstance(trigger, (int, float)) else None,
+            "entry": getattr(sig, "entry", None),
+            "stop_loss": getattr(sig, "stop_loss", None),
+            "tp1": getattr(sig, "tp1", None),
+            "tp2": getattr(sig, "tp2", None),
+            "atr": (getattr(sig, "indicators", None) or {}).get("atr")
+            if isinstance(getattr(sig, "indicators", None), dict) else None,
+        }
+        return {
+            "setup": setup, "stages": stages, "accepted": accepted,
+            "decision_ts_ms": int(time.time() * 1000),
+            "availability": {"score": score is not None,
+                             "candle": trigger is not None,
+                             "depth": False},
+            "source": {"decision_source": "server_scan", "resolution": setup["timeframe"]},
+        }
+    except Exception:
+        return None
+
+
+def _stage(name: str, verdict: str, reason: Optional[str] = None) -> dict:
+    return {"stage": name, "verdict": verdict, "reason_code": reason}
+
+
 async def get_recommendations_via_vision(
     top_n: int = 30, apply_guard: bool = True, heartbeat=None
 ) -> List[Recommendation]:
@@ -2700,10 +2744,25 @@ async def get_recommendations_via_vision(
     except Exception as e:
         _log.warning(f"[learning] auto-adjust falhou (fail-open): {e}")
 
+    _pre_rows: List[dict] = []
+
+    def _observe_pre(sig_obj, score_value, stages, *, accepted: bool) -> None:
+        row = _preselection_candidate(sig_obj, score_value, stages=stages, accepted=accepted)
+        if row is not None:
+            _pre_rows.append(row)
+
     for _symbol, best in all_results:
         if best is None:
             continue
         sig, score = best
+        # Etapas comuns a qualquer desfecho deste candidato, na ordem REAL.
+        _pre_stages = [
+            _stage("CANDIDATE", "PASSED"),
+            _stage("PLAYBOOK", "PASSED"),
+            _stage("CANDLE", "PASSED" if (getattr(sig, "data_freshness", None) or {})
+                   else "UNKNOWN", None if (getattr(sig, "data_freshness", None) or {})
+                   else "FRESHNESS_UNAVAILABLE"),
+        ]
         tier_prov = _classify_tier_vision(sig, score)
 
         # Auto-learning: bloqueia bucket catastrófico + ajusta score
@@ -2731,9 +2790,13 @@ async def get_recommendations_via_vision(
 
         tier = _classify_tier_vision(sig, score)
         if tier is None:
+            _observe_pre(sig, score, _pre_stages + [
+                _stage("SELECTION", "REJECTED", "TIER_BELOW_MINIMUM")], accepted=False)
             continue
         if sig.symbol in cooldown_symbols:
             _log.info(f"[server-scan] cooldown skip {sig.symbol}")
+            _observe_pre(sig, score, _pre_stages + [
+                _stage("SELECTION", "REJECTED", "SYMBOL_COOLDOWN")], accepted=False)
             continue
         # Regime filter
         try:
@@ -2741,6 +2804,9 @@ async def get_recommendations_via_vision(
             block_reason = should_block_recommendation(regime, sig.symbol, sig.direction)
             if block_reason:
                 _log.info(f"[server-scan] skip {sig.symbol} {sig.direction}: {block_reason}")
+                _observe_pre(sig, score, _pre_stages + [
+                    _stage("SELECTION", "PASSED"),
+                    _stage("MTF_REGIME", "REJECTED", "REGIME_BLOCK")], accepted=False)
                 continue
             if regime.get("downgrade_alt_longs") and sig.direction == "long" and not is_btc_symbol(sig.symbol):
                 if tier == "A+":
@@ -2764,6 +2830,9 @@ async def get_recommendations_via_vision(
             if ct_reason:
                 if rs.CT_BRAKE_BLOCK:
                     _log.info(f"[server-scan][ct-brake] BLOCK {sig.symbol} {sig.direction}: {ct_reason}")
+                    _observe_pre(sig, score, _pre_stages + [
+                        _stage("SELECTION", "PASSED"),
+                        _stage("MTF_REGIME", "REJECTED", "COUNTER_TREND_BRAKE")], accepted=False)
                     continue
                 if tier == "A+":
                     tier = "A"
@@ -2775,8 +2844,21 @@ async def get_recommendations_via_vision(
         except Exception:
             pass
         _rec = _build_recommendation(sig, score, tier)
+        _observe_pre(sig, score, _pre_stages + [
+            _stage("SELECTION", "PASSED"),
+            _stage("MTF_REGIME", "PASSED"),
+            _stage("GEOMETRY_RR", "PASSED" if _rec is not None else "REJECTED",
+                   None if _rec is not None else "GEOMETRY_UNAVAILABLE")],
+            accepted=_rec is not None)
         if _rec is not None:
             recommendations.append(_rec)
+
+    # Observação PRÉ-seleção (no-op quando o modo está desligado).
+    try:
+        from services import decision_observation_service as _r09obs
+        _r09obs.observe_preselection(_pre_rows)
+    except Exception as exc:   # observação nunca altera a decisão
+        _log.debug(f"[r09-pre] observação indisponível: {exc}")
 
     # BTC correlation throttle (idem batch)
     _apply_btc_correlation_throttle(recommendations, regime)
