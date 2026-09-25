@@ -227,17 +227,24 @@ LIVE_SIZE_MULT = max(0.0, min(float(os.getenv("LIVE_SIZE_MULT", "1.0")), 1.0))
 
 # ── Filtro de sessão/horário (go-live, opcional) ────────────────────────────
 async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
-                           checks: dict):
+                           checks: dict, intent: dict = None):
     """R05B — gate financeiro de uma NOVA entrada normal, dentro do preflight P04.
 
     Devolve `None` quando a entrada pode seguir (inclusive com o cutover
     desligado) e um verdict de PREFLIGHT BLOQUEADO quando não pode. Nenhuma
     ordem é enviada em caso de negação; exceção também nega (fail-closed).
+
+    A intenção desta decisão entra pela IDENTIDADE: a reserva dela já está no
+    banco e seria contada duas vezes. Aprovado o cenário, o risco FINAL
+    (preço/qty revalidados) passa pela admissão serializada — o valor antigo,
+    menor, não vale como autorização.
     """
+    intent = intent if isinstance(intent, dict) else {}
     try:
         from services import financial_risk_service as _frs
         gate = await _frs.check_new_entry(
-            side=side, final_entry=final_entry, stop=stop, final_qty=final_qty)
+            side=side, final_entry=final_entry, stop=stop, final_qty=final_qty,
+            intent_key=intent.get("intent_key"), account_ref=intent.get("account_ref"))
     except Exception as exc:                      # exceção NUNCA libera entrada
         log.warning(f"[r05b] gate financeiro indisponível: {type(exc).__name__}")
         gate = {"ok": False, "quality": "UNKNOWN",
@@ -247,14 +254,19 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
         checks["r05b_financial"] = {
             "cutover_enabled": gate.get("cutover_enabled"),
             "worst_case_daily_usd": gate.get("worst_case_daily_usd"),
+            "reserved_risk_usd": gate.get("reserved_risk_usd"),
             "daily_loss_limit_usd": gate.get("daily_loss_limit_usd"),
         }
+        recusa = await _admit_final_entry_risk(gate, intent, checks)
+        if recusa is not None:
+            return recusa
         return await _r05d_total_gate(checks)
     gate = gate if isinstance(gate, dict) else {}
     checks["r05b_financial"] = {
         "cutover_enabled": gate.get("cutover_enabled"),
         "reason_code": gate.get("reason_code"),
         "worst_case_daily_usd": gate.get("worst_case_daily_usd"),
+        "reserved_risk_usd": gate.get("reserved_risk_usd"),
         "daily_loss_limit_usd": gate.get("daily_loss_limit_usd"),
     }
     return {
@@ -264,6 +276,50 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
         "reason": gate.get("reason") or "gate financeiro bloqueou a entrada",
         "checks": checks,
     }
+
+
+async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict):
+    """Admissão SERIALIZADA do risco final, sob a mesma lock da reserva.
+
+    Duas decisões que checaram o orçamento antes de reservar poderiam consumir
+    juntas a última margem; aqui o veredicto e a gravação da reserva acontecem
+    na MESMA transação. Sem orçamento (cutover desligado) não há veredicto
+    novo. Dúvida NEGA — nenhuma ordem é enviada.
+    """
+    orcamento = gate.get("budget") if isinstance(gate.get("budget"), dict) else None
+    key = intent.get("intent_key")
+    if not orcamento or not key:
+        return None
+    try:
+        from db import get_session
+        from services import entry_intent_service as intents
+        risco = gate.get("proposed_trade_risk_usd")
+        if not isinstance(risco, (int, float)) or isinstance(risco, bool):
+            veredicto = intents.Reservation(intents.BLOCKED_CAPACITY, key, None, None,
+                                            "PROPOSED_RISK_UNKNOWN")
+        else:
+            veredicto = await intents.admit_final_risk(
+                get_session, key, owner=_INTENT_OWNER, risk_usd=float(risco),
+                capacity=intent.get("capacity"),
+                budget=intents.DailyBudget(base_usd=orcamento.get("base_usd"),
+                                           limit_usd=orcamento.get("limit_usd"),
+                                           complete=bool(orcamento.get("complete"))))
+    except Exception as exc:                      # exceção NUNCA libera entrada
+        log.warning(f"[r05] admissão final indisponível: {type(exc).__name__}: {exc}")
+        checks["r05_admission"] = {"granted": False, "reason": "ADMISSION_ERROR"}
+        return {"ok": False, "quality": "UNKNOWN", "reason_code": "ADMISSION_ERROR",
+                "reason": "admissão serializada do risco final falhou", "checks": checks}
+    checks["r05_admission"] = {"granted": bool(veredicto.granted),
+                               "decision": veredicto.decision,
+                               "reason": veredicto.reason}
+    if veredicto.granted:
+        return None
+    log.warning(f"[r05] entrada BLOQUEADA na admissão final: "
+                f"{veredicto.decision} ({veredicto.reason})")
+    return {"ok": False, "quality": "OK" if veredicto.reason == "DAILY_LOSS_LIMIT" else "UNKNOWN",
+            "reason_code": veredicto.reason or veredicto.decision,
+            "reason": "orçamento/capacidade não admitiram o risco final",
+            "checks": checks}
 
 
 async def _r05d_total_gate(checks: dict):
@@ -1296,6 +1352,8 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
                    "tp1": float(tp1) if tp1 is not None else None,
                    "tp2": float(tp2) if tp2 is not None else None,
                    "leverage": int(rec.get("leverage") or 1)}
+        from services import financial_risk_service as _frs
+        orcamento = await _frs.daily_budget()
         capacity = intents.Capacity(
             risk_usd=abs(float(entry) - float(stop)) * float(qty),
             # Teto real de posições simultâneas (o mesmo do portfolio_guard):
@@ -1307,11 +1365,18 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
     except Exception as exc:
         log.warning(f"[p03-intent] payload/capacidade indisponível: {exc}")
         return blocked
+    # Orçamento diário JUNTO da admissão: duas decisões concorrentes não podem
+    # consumir a mesma margem por terem checado o limite antes de reservar.
+    budget = (intents.DailyBudget(base_usd=orcamento.get("base_usd"),
+                                  limit_usd=orcamento.get("limit_usd"),
+                                  complete=bool(orcamento.get("complete")))
+              if orcamento.get("enabled") else None)
     reservation = await intents.reserve(get_session, identity, payload, owner=_INTENT_OWNER,
-                                        capacity=capacity)
+                                        capacity=capacity, budget=budget)
     return {"granted": reservation.granted, "decision": reservation.decision,
             "reason": reservation.reason, "intent_key": reservation.intent_key,
             "client_order_id": reservation.client_order_id, "state": reservation.state,
+            "account_ref": identity.account_ref, "capacity": capacity,
             "dispatched": False}
 
 
@@ -5994,7 +6059,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                     checks["financial_risk_entry_price"] = _risk_entry["value"]
                     _fin_gate = await _r05b_entry_gate(
                         side=side, final_entry=_risk_entry["value"], stop=stop,
-                        final_qty=capped_qty, checks=checks)
+                        final_qty=capped_qty, checks=checks, intent=_intent)
                     if _fin_gate is not None:
                         return _fin_gate
                     verdict["approved_qty"] = float(capped_qty)
@@ -6107,7 +6172,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             # final. Negar ⇒ zero POST, zero entry.
                             _fin_gate = await _r05b_entry_gate(
                                 side=side, final_entry=final_limit_price,
-                                stop=stop, final_qty=capped_qty, checks=checks)
+                                stop=stop, final_qty=capped_qty, checks=checks,
+                                intent=_intent)
                             if _fin_gate is not None:
                                 return _fin_gate
                             verdict["approved_qty"] = float(capped_qty)

@@ -52,6 +52,19 @@ def _cutover(on: bool):
     return patch.dict(os.environ, {f.CUTOVER_ENV: "true" if on else "false"})
 
 
+#: Reservas de OUTRAS intenções. O componente passou a ser OBRIGATÓRIO no pior
+#: cenário (uma decisão já admitida consome o mesmo orçamento do dia), então os
+#: casos que medem as demais parcelas declaram explicitamente "nenhuma reserva
+#: pendente, e isso está PROVADO" — ausência continua sendo UNKNOWN, não zero.
+SEM_RESERVAS = {"quality": "OK", "reason_code": None, "value": 0.0, "intents": 0}
+
+
+def _reservas(valor=0.0, *, intents=0, quality="OK", reason_code=None):
+    payload = {"quality": quality, "reason_code": reason_code,
+               "value": valor if quality == "OK" else None, "intents": intents}
+    return patch.object(f, "reserved_risk_usd", return_value=payload)
+
+
 def _closed(i=1, *, source="auto", status="closed_stop", pnl=-20.0, hours=2,
             tp1=None, entry_fee=0.5, exit_fee=0.5, closed_at="auto", rec=1):
     ts = NOW - timedelta(hours=hours) if closed_at == "auto" else closed_at
@@ -356,7 +369,7 @@ class RiscoAberto(unittest.TestCase):
         snap = _snap([_closed(1, pnl=-10.0)], [_openpos(1, entry=100.0,
                                                         sl_price=97.0, qty=2.0,
                                                         fee=0.7)])
-        worst = f.worst_case_daily_usd(snap, 5.0)
+        worst = f.worst_case_daily_usd(snap, 5.0, reservations=SEM_RESERVAS)
         self.assertEqual(worst["value"], -10.0 - 6.0 - 0.7 - 5.0)
 
     def test_stop_ausente_ou_malformado_e_unknown(self):
@@ -424,7 +437,7 @@ class PiorCenario(unittest.TestCase):
         snap = _snap([_closed(1, pnl=-10.0)], [_openpos(1, entry=100.0,
                                                         sl_price=97.0, qty=2.0,
                                                         fee=0.0)])
-        with _cutover(True), patch.object(f, "financial_snapshot", return_value=snap), \
+        with _cutover(True), _reservas(), patch.object(f, "financial_snapshot", return_value=snap), \
                 patch.object(f, "daily_loss_limit_usd",
                              return_value={"quality": "OK", "value": 100.0}):
             out = asyncio.run(f.check_new_entry(side="long", final_entry=100.0,
@@ -434,7 +447,7 @@ class PiorCenario(unittest.TestCase):
 
     def test_gate_forca_snapshot_fresco_e_reusa_o_mesmo_equity(self):
         snap = _snap([_closed(1, pnl=-10.0)], [])
-        with _cutover(True), \
+        with _cutover(True), _reservas(), \
                 patch.object(f, "financial_snapshot", return_value=snap) as get_snap, \
                 patch.object(f, "daily_loss_limit_usd",
                              return_value={"quality": "OK", "value": 100.0}) as get_limit:
@@ -467,7 +480,7 @@ class PiorCenario(unittest.TestCase):
 
     def test_exatamente_no_limite_bloqueia(self):
         snap = _snap([_closed(1, pnl=-10.0)], [])
-        with _cutover(True), patch.object(f, "financial_snapshot", return_value=snap), \
+        with _cutover(True), _reservas(), patch.object(f, "financial_snapshot", return_value=snap), \
                 patch.object(f, "daily_loss_limit_usd",
                              return_value={"quality": "OK", "value": 20.0}):
             out = asyncio.run(f.check_new_entry(side="long", final_entry=100.0,
@@ -478,7 +491,7 @@ class PiorCenario(unittest.TestCase):
 
     def test_acima_do_limite_bloqueia(self):
         snap = _snap([_closed(1, pnl=-30.0)], [])
-        with _cutover(True), patch.object(f, "financial_snapshot", return_value=snap), \
+        with _cutover(True), _reservas(), patch.object(f, "financial_snapshot", return_value=snap), \
                 patch.object(f, "daily_loss_limit_usd",
                              return_value={"quality": "OK", "value": 20.0}):
             out = asyncio.run(f.check_new_entry(side="long", final_entry=100.0,
@@ -488,7 +501,7 @@ class PiorCenario(unittest.TestCase):
 
     def test_qty_reduzida_do_market_usa_qty_reduzida(self):
         snap = _snap([_closed(1, pnl=0.0)], [])
-        with _cutover(True), patch.object(f, "financial_snapshot", return_value=snap), \
+        with _cutover(True), _reservas(), patch.object(f, "financial_snapshot", return_value=snap), \
                 patch.object(f, "daily_loss_limit_usd",
                              return_value={"quality": "OK", "value": 15.0}):
             cheia = asyncio.run(f.check_new_entry(side="long", final_entry=100.0,
@@ -502,14 +515,77 @@ class PiorCenario(unittest.TestCase):
         # risco aberto e risco proposto SOMAM ao prejuízo, nunca se compensam
         snap = _snap([_closed(1, pnl=50.0)],
                      [_openpos(1, entry=100.0, sl_price=90.0, qty=3.0, fee=0.0)])
-        worst = f.worst_case_daily_usd(snap, 10.0)
+        worst = f.worst_case_daily_usd(snap, 10.0, reservations=SEM_RESERVAS)
         self.assertEqual(worst["value"], 50.0 - 30.0 - 0.0 - 10.0)
 
     def test_parcela_desconhecida_torna_cenario_none(self):
         snap = _snap([_closed(1, pnl=-10.0)], [_openpos(1, sl_id=None)])
-        worst = f.worst_case_daily_usd(snap, 5.0)
+        worst = f.worst_case_daily_usd(snap, 5.0, reservations=SEM_RESERVAS)
         self.assertIsNone(worst["value"])
         self.assertEqual(worst["reason_code"], "OPEN_RISK_INCOMPLETE")
+
+    def test_reserva_de_outra_intencao_entra_no_cenario(self):
+        # Repro R05: P&L -92, sem exposição aberta, reserva alheia 6, proposta 3.
+        # Sem a reserva o gate via -95 e AUTORIZAVA; o correto é -101 e bloqueio.
+        snap = _snap([_closed(1, pnl=-92.0, entry_fee=0.0, exit_fee=0.0)], [])
+        sem = f.worst_case_daily_usd(snap, 3.0, reservations=SEM_RESERVAS)
+        self.assertEqual(sem["value"], -95.0)
+        com = f.worst_case_daily_usd(
+            snap, 3.0, reservations={"quality": "OK", "value": 6.0, "intents": 1})
+        self.assertEqual(com["value"], -101.0)
+        self.assertEqual(com["reserved_risk_usd"], 6.0)
+        self.assertEqual(com["base_usd"], -92.0)
+
+    def test_reserva_desconhecida_nao_vira_zero(self):
+        snap = _snap([_closed(1, pnl=-10.0)], [])
+        for reservas in (None, {}, {"quality": "UNKNOWN", "value": None},
+                         {"quality": "OK", "value": None},
+                         {"quality": "OK", "value": float("nan")}):
+            worst = f.worst_case_daily_usd(snap, 1.0, reservations=reservas)
+            self.assertIsNone(worst["value"], repr(reservas))
+            self.assertEqual(worst["quality"], "UNKNOWN", repr(reservas))
+
+    def test_gate_bloqueia_pelo_limite_por_causa_da_reserva_alheia(self):
+        snap = _snap([_closed(1, pnl=-92.0, entry_fee=0.0, exit_fee=0.0)], [])
+        with _cutover(True), patch.object(f, "financial_snapshot", return_value=snap), \
+                patch.object(f, "daily_loss_limit_usd",
+                             return_value={"quality": "OK", "value": 100.0}):
+            with _reservas(0.0):
+                livre = asyncio.run(f.check_new_entry(
+                    side="long", final_entry=100.0, stop=99.0, final_qty=3.0))
+            with _reservas(6.0, intents=1):
+                travado = asyncio.run(f.check_new_entry(
+                    side="long", final_entry=100.0, stop=99.0, final_qty=3.0))
+        self.assertTrue(livre["ok"])
+        self.assertEqual(livre["worst_case_daily_usd"], -95.0)
+        self.assertEqual(livre["budget"], {"base_usd": -92.0, "limit_usd": 100.0,
+                                           "complete": True})
+        self.assertFalse(travado["ok"])
+        self.assertEqual(travado["reason_code"], "FINANCIAL_WORST_CASE_LIMIT")
+        self.assertEqual(travado["worst_case_daily_usd"], -101.0)
+
+    def test_gate_bloqueia_com_reserva_desconhecida(self):
+        snap = _snap([_closed(1, pnl=-1.0)], [])
+        with _cutover(True), _reservas(quality="UNKNOWN", reason_code="RESERVATIONS_UNAVAILABLE"), \
+                patch.object(f, "financial_snapshot", return_value=snap), \
+                patch.object(f, "daily_loss_limit_usd",
+                             return_value={"quality": "OK", "value": 100.0}):
+            out = asyncio.run(f.check_new_entry(side="long", final_entry=100.0,
+                                                stop=98.0, final_qty=1.0))
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["reason_code"], "RESERVATIONS_UNAVAILABLE")
+        self.assertIsNone(out.get("budget"))
+
+    def test_gate_exclui_a_propria_reserva_pela_identidade(self):
+        snap = _snap([_closed(1, pnl=-1.0)], [])
+        with _cutover(True), _reservas() as lendo, \
+                patch.object(f, "financial_snapshot", return_value=snap), \
+                patch.object(f, "daily_loss_limit_usd",
+                             return_value={"quality": "OK", "value": 100.0}):
+            asyncio.run(f.check_new_entry(side="long", final_entry=100.0, stop=98.0,
+                                          final_qty=1.0, intent_key="k-1",
+                                          account_ref="conta-a"))
+        lendo.assert_awaited_once_with(account_ref="conta-a", exclude_intent_key="k-1")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -585,7 +661,7 @@ class SnapshotFailClosed(unittest.TestCase):
 
     def test_gate_bloqueia_com_limite_indisponivel(self):
         snap = _snap([_closed(1, pnl=-1.0)], [])
-        with _cutover(True), patch.object(f, "financial_snapshot", return_value=snap), \
+        with _cutover(True), _reservas(), patch.object(f, "financial_snapshot", return_value=snap), \
                 patch.object(f, "daily_loss_limit_usd",
                              return_value={"quality": "UNKNOWN",
                                            "reason_code": "EQUITY_STALE",

@@ -62,6 +62,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 async def run():
     from unittest.mock import AsyncMock, patch
     import db
+    from models.entry_intent import EntryIntent          # reservas do orçamento
     from models.real_trade import RealTrade
     from models.recommendation_snapshot import RecommendationSnapshot   # FK
     from services import execution_accounting_service as ea
@@ -72,7 +73,8 @@ async def run():
     for _ in range(2):      # migração aditiva idempotente
         async with db._engine.begin() as conn:
             await conn.run_sync(db.Base.metadata.create_all,
-                                tables=[RecommendationSnapshot.__table__, RealTrade.__table__])
+                                tables=[RecommendationSnapshot.__table__, RealTrade.__table__,
+                                        EntryIntent.__table__])
 
     now = datetime.now(timezone.utc)
     opened = now - timedelta(hours=3)

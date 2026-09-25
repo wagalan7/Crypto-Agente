@@ -147,6 +147,23 @@ class Capacity:
 
 
 @dataclass(frozen=True)
+class DailyBudget:
+    """Orçamento de PERDA do dia, medido FORA da transação e verificado DENTRO
+    dela, junto com a admissão das reservas.
+
+    `base_usd` é o pior cenário SEM reservas e SEM a proposta (P&L da fonte
+    selecionada − exposição aberta − custos já conhecidos). As reservas de
+    OUTRAS intenções são lidas sob a mesma lock, então duas decisões não
+    consomem juntas a última margem. `complete=False` (ou parcela ausente)
+    BLOQUEIA: desconhecido nunca vira zero.
+    """
+
+    base_usd: Optional[float] = None
+    limit_usd: Optional[float] = None
+    complete: bool = False
+
+
+@dataclass(frozen=True)
 class Reservation:
     decision: str
     intent_key: Optional[str] = None
@@ -163,14 +180,23 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _pending_usage(session, account_ref: str, exchange: str):
+async def _pending_usage(session, account_ref: str, exchange: str, *,
+                         exclude_intent_key: Optional[str] = None):
     """Reservas ainda não resolvidas — capacidade não é liberada só porque o
-    RealTrade ainda não nasceu."""
+    RealTrade ainda não nasceu.
+
+    `exclude_intent_key` tira a PRÓPRIA decisão da soma: quem já está reservado
+    seria contado duas vezes ao reavaliar a própria tentativa. Intenção já
+    vinculada a RealTrade também fica de fora (o risco dela já é exposição
+    aberta), e a conta/exchange delimitam a população — reserva de outra conta
+    não consome este orçamento."""
+    filtros = [EntryIntent.account_ref == account_ref, EntryIntent.exchange == exchange,
+               EntryIntent.state.in_(PENDING_STATES), EntryIntent.real_trade_id.is_(None)]
+    if exclude_intent_key:
+        filtros.append(EntryIntent.intent_key != exclude_intent_key)
     row = (await session.execute(
         select(func.count(EntryIntent.intent_key), func.coalesce(func.sum(EntryIntent.reserved_risk_usd), 0.0))
-        .where(EntryIntent.account_ref == account_ref, EntryIntent.exchange == exchange,
-               EntryIntent.state.in_(PENDING_STATES), EntryIntent.real_trade_id.is_(None))
-    )).one()
+        .where(*filtros))).one()
     return int(row[0] or 0), float(row[1] or 0.0)
 
 
@@ -210,6 +236,28 @@ async def _open_risk_usd(session) -> Tuple[float, bool]:
     return total, complete
 
 
+def _budget_reason(budget: Optional[DailyBudget], pending_risk: float,
+                   proposed_risk: float) -> Optional[str]:
+    """Limite DIÁRIO com as reservas das OUTRAS intenções incluídas.
+
+    Atingir o limite já bloqueia (>=, não >), como no gate financeiro. Sem
+    orçamento informado não há veredicto aqui (contrato legado/cutover
+    desligado); orçamento informado e incompleto BLOQUEIA."""
+    if budget is None:
+        return None
+    base, limit = _finite(budget.base_usd), _finite(budget.limit_usd)
+    if not budget.complete or base is None or limit is None or limit <= 0:
+        return "DAILY_BUDGET_UNKNOWN"
+    proposto = _finite(proposed_risk)
+    if proposto is None or proposto < 0:
+        return "DAILY_BUDGET_UNKNOWN"
+    pendente = _finite(pending_risk)
+    if pendente is None:
+        return "DAILY_BUDGET_UNKNOWN"
+    worst = base - abs(pendente) - proposto
+    return "DAILY_LOSS_LIMIT" if worst <= -limit else None
+
+
 def _capacity_reason(capacity: Capacity, pending_count: int, pending_risk: float) -> Optional[str]:
     if capacity.max_open_positions is not None:
         if capacity.open_positions + pending_count + 1 > capacity.max_open_positions:
@@ -223,8 +271,14 @@ def _capacity_reason(capacity: Capacity, pending_count: int, pending_risk: float
 
 async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                   owner: str, lease_seconds: int = DEFAULT_LEASE_SECONDS,
-                  capacity: Optional[Capacity] = None, now: Optional[datetime] = None) -> Reservation:
+                  capacity: Optional[Capacity] = None,
+                  budget: Optional[DailyBudget] = None,
+                  now: Optional[datetime] = None) -> Reservation:
     """Reserva (ou recupera) a intenção em UMA transação, antes de qualquer POST.
+
+    A admissão de capacidade E o orçamento diário são decididos sob a MESMA
+    lock/transação em que a reserva é gravada: duas decisões concorrentes não
+    podem consumir juntas a última margem por terem checado antes de reservar.
 
     Falha de banco ⇒ `UNAVAILABLE`: o chamador NÃO pode enviar ordem.
     """
@@ -241,9 +295,12 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
             )).scalar_one_or_none()
             if row is None:
                 # Decisão nova: admissão de capacidade sob a mesma lock.
-                if capacity is not None:
+                pending_count = pending_risk = 0
+                if capacity is not None or budget is not None:
                     pending_count, pending_risk = await _pending_usage(
-                        session, identity.account_ref, identity.exchange)
+                        session, identity.account_ref, identity.exchange,
+                        exclude_intent_key=key)
+                if capacity is not None:
                     open_positions = max(int(capacity.open_positions or 0),
                                          await _open_positions(session))
                     persisted_risk, risk_complete = await _open_risk_usd(session)
@@ -258,6 +315,13 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, "OPEN_RISK_UNKNOWN")
                     denial = _capacity_reason(capacity, pending_count, pending_risk)
+                    if denial:
+                        await session.rollback()
+                        return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
+                # Orçamento diário com as reservas das OUTRAS intenções incluídas.
+                if budget is not None:
+                    proposto = max(0.0, _finite(capacity.risk_usd) or 0.0) if capacity else 0.0
+                    denial = _budget_reason(budget, pending_risk, proposto)
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
@@ -312,6 +376,18 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     and lease_expires_at is not None and lease_expires_at > moment):
                 await session.rollback()
                 return Reservation(BLOCKED_IN_FLIGHT, key, coid, current_state, "LEASE_HELD")
+            # Retomada da MESMA decisão: se a tentativa agora carrega risco
+            # MAIOR (preço/qty adversos), a diferença passa pela mesma admissão —
+            # confiar no valor antigo, menor, admitiria risco nunca aprovado.
+            if capacity is not None or budget is not None:
+                novo = max(0.0, _finite(capacity.risk_usd) or 0.0) if capacity else 0.0
+                antigo = max(0.0, _finite(row.reserved_risk_usd) or 0.0)
+                if novo > antigo + 1e-9:
+                    denial = await _readmit(session, identity, key, capacity, budget, novo)
+                    if denial:
+                        await session.rollback()
+                        return Reservation(BLOCKED_CAPACITY, key, coid, current_state, denial)
+                    row.reserved_risk_usd = novo
             row.lease_owner, row.lease_expires_at = owner, deadline
             row.attempts = int(row.attempts or 0) + 1
             row.updated_at = moment
@@ -319,6 +395,80 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
             return Reservation(RESERVED_RESUMED, key, coid, STATE_RESERVED)
     except Exception:
         return Reservation(UNAVAILABLE, key, coid, None, "DB_UNAVAILABLE")
+
+
+async def _readmit(session, identity: EntryIdentity, key: str,
+                   capacity: Optional[Capacity], budget: Optional[DailyBudget],
+                   risk_usd: float) -> Optional[str]:
+    """Reavalia capacidade e orçamento para um risco MAIOR da MESMA decisão,
+    dentro da transação/lock já abertas. Devolve o motivo da negação ou None."""
+    pending_count, pending_risk = await _pending_usage(
+        session, identity.account_ref, identity.exchange, exclude_intent_key=key)
+    if capacity is not None:
+        open_positions = max(int(capacity.open_positions or 0), await _open_positions(session))
+        persisted_risk, risk_complete = await _open_risk_usd(session)
+        caller_risk = _finite(capacity.open_risk_usd)
+        open_risk = max(persisted_risk, caller_risk if caller_risk is not None else 0.0)
+        if capacity.max_open_risk_usd is not None and not risk_complete:
+            return "OPEN_RISK_UNKNOWN"
+        # A decisão JÁ ocupa um slot: o teto de posições não conta mais um.
+        alvo = Capacity(risk_usd=risk_usd, max_open_positions=capacity.max_open_positions,
+                        max_open_risk_usd=capacity.max_open_risk_usd,
+                        open_positions=open_positions, open_risk_usd=open_risk)
+        denial = _capacity_reason(alvo, max(0, pending_count - 1), pending_risk)
+        if denial:
+            return denial
+    return _budget_reason(budget, pending_risk, risk_usd)
+
+
+async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
+                           risk_usd: float, capacity: Optional[Capacity] = None,
+                           budget: Optional[DailyBudget] = None,
+                           now: Optional[datetime] = None) -> Reservation:
+    """Admissão FINAL, imediatamente antes do POST, com o risco realmente
+    proposto (preço/qty já revalidados).
+
+    Roda sob a MESMA lock da reserva, exclui a própria reserva da soma (senão
+    contaria duas vezes) e, quando aprovado, ATUALIZA o risco reservado — o
+    valor antigo, menor, deixaria de refletir o que será enviado. Dúvida ou
+    falha de banco NEGA: nada é enviado sem admissão."""
+    moment = now or _now()
+    try:
+        async with session_factory() as session:
+            await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": RISK_LOCK_KEY})
+            row = (await session.execute(
+                select(EntryIntent).where(EntryIntent.intent_key == intent_key).with_for_update()
+            )).scalar_one_or_none()
+            if row is None:
+                await session.rollback()
+                return Reservation(UNAVAILABLE, intent_key, None, None, "INTENT_NOT_FOUND")
+            state, coid = row.state, row.client_order_id
+            lease_owner, lease_expires_at = row.lease_owner, row.lease_expires_at
+            if state not in (STATE_RESERVED, STATE_SENDING) or lease_owner != owner \
+                    or lease_expires_at is None or lease_expires_at <= moment:
+                await session.rollback()
+                return Reservation(BLOCKED_IN_FLIGHT, intent_key, coid, state, "LEASE_NOT_HELD")
+            identity = EntryIdentity(
+                account_ref=row.account_ref, exchange=row.exchange, symbol=row.symbol,
+                quote=row.quote, side=row.side, position_side=row.position_side,
+                timeframe=row.timeframe, playbook=row.playbook,
+                playbook_version=row.playbook_version, purpose=row.purpose,
+                trigger_candle_ms=int(row.trigger_candle_ms or 0))
+            proposto = _finite(risk_usd)
+            if proposto is None or proposto < 0:
+                await session.rollback()
+                return Reservation(BLOCKED_CAPACITY, intent_key, coid, state, "PROPOSED_RISK_UNKNOWN")
+            denial = await _readmit(session, identity, intent_key, capacity, budget, proposto)
+            if denial:
+                await session.rollback()
+                return Reservation(BLOCKED_CAPACITY, intent_key, coid, state, denial)
+            if proposto > (_finite(row.reserved_risk_usd) or 0.0) + 1e-9:
+                row.reserved_risk_usd = proposto
+                row.updated_at = moment
+            await session.commit()
+            return Reservation(RESERVED_RESUMED, intent_key, coid, state)
+    except Exception:
+        return Reservation(UNAVAILABLE, intent_key, None, None, "DB_UNAVAILABLE")
 
 
 async def mark_sending(session_factory, intent_key: str, *, owner: str,

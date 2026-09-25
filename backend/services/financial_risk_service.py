@@ -353,12 +353,20 @@ def adverse_market_entry_price(side: Any, prices: Sequence[Any]) -> Dict[str, An
             "value": float(value)}
 
 
-def worst_case_daily_usd(snapshot: Any, proposed_risk_usd: Any) -> Dict[str, Any]:
-    """`realizado − risco aberto − taxas abertas − risco da nova entrada`.
+def worst_case_daily_usd(snapshot: Any, proposed_risk_usd: Any, *,
+                         reservations: Any = None) -> Dict[str, Any]:
+    """`realizado − risco aberto − taxas abertas − reservas − nova entrada`.
 
-    Qualquer parcela desconhecida torna o cenário `None` — nunca zero.
+    `reservations` é o contrato das reservas de OUTRAS intenções ainda não
+    viradas trade (`{"quality", "value"}`); ele é OBRIGATÓRIO porque uma
+    decisão já admitida consome o mesmo orçamento do dia. Ausência, erro ou
+    qualidade desconhecida tornam o cenário `None` — nunca zero.
     """
     snap = snapshot if isinstance(snapshot, dict) else {}
+    reserved = reservations if isinstance(reservations, dict) else {}
+    if reserved.get("quality") != QUALITY_OK:
+        return _unknown(reserved.get("reason_code") or "RESERVATIONS_UNAVAILABLE",
+                        "reservas de outras intenções desconhecidas", value=None)
     daily = snap.get("kill_daily") if isinstance(snap.get("kill_daily"), dict) else {}
     exposure = snap.get("open_exposure") if isinstance(snap.get("open_exposure"), dict) else {}
 
@@ -372,15 +380,24 @@ def worst_case_daily_usd(snapshot: Any, proposed_risk_usd: Any) -> Dict[str, Any
     open_risk_usd = _finite(exposure.get("open_price_risk_usd"))
     open_fees = _finite(exposure.get("open_entry_fees_usd"))
     proposed = _finite(proposed_risk_usd)
+    reserved_usd = _finite(reserved.get("value"))
     if realized is None or open_risk_usd is None or open_fees is None \
-            or proposed is None or proposed < 0:
+            or proposed is None or proposed < 0 or reserved_usd is None:
         return _unknown("WORST_CASE_NOT_COMPUTABLE",
                         "alguma parcela do pior cenário é desconhecida", value=None)
+    reserved_usd = abs(reserved_usd)
+    # Base = tudo o que já é fato (P&L, exposição aberta e custos conhecidos).
+    # Reservas e proposta são o que AINDA pode ser admitido — por isso saem
+    # separadas: a admissão sob lock recalcula as reservas frescas sobre a base.
+    base = realized - open_risk_usd - open_fees
     return {"quality": QUALITY_OK, "reason_code": None, "detail": None,
-            "value": round(realized - open_risk_usd - open_fees - proposed, 6),
+            "value": round(base - reserved_usd - proposed, 6),
             "realized_daily_pnl_usd": realized,
             "open_price_risk_usd": open_risk_usd,
             "open_entry_fees_usd": open_fees,
+            "reserved_risk_usd": reserved_usd,
+            "reserved_intents": reserved.get("intents"),
+            "base_usd": round(base, 6),
             "proposed_trade_risk_usd": proposed}
 
 
@@ -724,13 +741,102 @@ def reset_cache() -> None:
 BLOCK_REASON = "FINANCIAL_WORST_CASE_LIMIT"
 
 
+async def daily_budget() -> Dict[str, Any]:
+    """Base do orçamento do dia para a admissão SERIALIZADA da reserva.
+
+    Devolve o pior cenário SEM reservas e SEM proposta (`base_usd`) e o limite,
+    medidos AQUI (com I/O de exchange, fora de qualquer transação). Quem admite
+    soma, sob a lock, as reservas frescas e o risco proposto. Cutover desligado
+    ⇒ `enabled=False` e nenhum veredicto novo (comportamento legado). Qualquer
+    parcela desconhecida ⇒ `complete=False`, que BLOQUEIA na admissão.
+    """
+    if not cutover_enabled():
+        return {"enabled": False, "complete": False,
+                "base_usd": None, "limit_usd": None, "reason_code": None}
+    try:
+        snap = await financial_snapshot(force=True)
+        if snap.get("quality") != QUALITY_OK:
+            return {"enabled": True, "complete": False, "base_usd": None, "limit_usd": None,
+                    "reason_code": snap.get("reason_code") or "FINANCIAL_QUALITY_UNKNOWN"}
+        # MESMA fórmula do gate: reservas e proposta entram depois, sob a lock.
+        base = worst_case_daily_usd(snap, 0.0, reservations={
+            "quality": QUALITY_OK, "reason_code": None, "value": 0.0, "intents": 0})
+        limit = await daily_loss_limit_usd(snap)
+        if base.get("quality") != QUALITY_OK or limit.get("quality") != QUALITY_OK:
+            return {"enabled": True, "complete": False, "base_usd": None, "limit_usd": None,
+                    "reason_code": (base.get("reason_code") if base.get("quality") != QUALITY_OK
+                                    else limit.get("reason_code")) or "DAILY_BUDGET_UNKNOWN"}
+        base_usd, limit_usd = _finite(base.get("base_usd")), _finite(limit.get("value"))
+        if base_usd is None or limit_usd is None or limit_usd <= 0:
+            return {"enabled": True, "complete": False, "base_usd": None, "limit_usd": None,
+                    "reason_code": "DAILY_BUDGET_UNKNOWN"}
+        return {"enabled": True, "complete": True, "reason_code": None,
+                "base_usd": base_usd, "limit_usd": limit_usd}
+    except Exception as exc:                       # erro NUNCA libera admissão
+        log.warning(f"[r05b] orçamento diário indisponível: {type(exc).__name__}: {exc}")
+        return {"enabled": True, "complete": False, "base_usd": None, "limit_usd": None,
+                "reason_code": "DAILY_BUDGET_ERROR"}
+
+
+async def reserved_risk_usd(*, account_ref: Any = None,
+                            exclude_intent_key: Any = None) -> Dict[str, Any]:
+    """Risco RESERVADO por outras intenções da MESMA conta, ainda pendentes e
+    ainda não viradas RealTrade.
+
+    Uma decisão já admitida consome o orçamento do dia mesmo antes de existir
+    trade: deixá-la de fora autoriza a última margem duas vezes. Intenção já
+    vinculada a RealTrade fica de fora (vira exposição aberta) e `exclude_intent_key`
+    tira a própria proposta (que seria contada duas vezes). Conta não
+    identificada, banco indisponível ou erro ⇒ UNKNOWN — nunca zero.
+    """
+    try:
+        from db import DB_ENABLED
+        if not DB_ENABLED:
+            return _unknown("RESERVATIONS_DB_DISABLED",
+                            "banco desligado — reservas desconhecidas", value=None)
+        scope = account_ref
+        if not (isinstance(scope, str) and scope.strip()):
+            from services.financial_total_service import current_account_scope
+            scope = current_account_scope()
+        if not (isinstance(scope, str) and scope.strip()):
+            return _unknown("RESERVATIONS_ACCOUNT_UNIDENTIFIED",
+                            "conta não identificada — reservas desconhecidas", value=None)
+        from db import get_session
+        from models.entry_intent import EntryIntent, PENDING_STATES
+        from sqlalchemy import func, select
+        filtros = [EntryIntent.account_ref == scope,
+                   EntryIntent.state.in_(PENDING_STATES),
+                   EntryIntent.real_trade_id.is_(None)]
+        if isinstance(exclude_intent_key, str) and exclude_intent_key.strip():
+            filtros.append(EntryIntent.intent_key != exclude_intent_key)
+        async with get_session() as session:
+            row = (await session.execute(
+                select(func.count(EntryIntent.intent_key),
+                       func.coalesce(func.sum(EntryIntent.reserved_risk_usd), 0.0))
+                .where(*filtros))).one()
+        total = _finite(float(row[1] or 0.0))
+        if total is None:
+            return _unknown("RESERVATIONS_NOT_NUMERIC",
+                            "soma das reservas não é numérica", value=None)
+        return {"quality": QUALITY_OK, "reason_code": None, "detail": None,
+                "value": abs(round(total, 6)), "intents": int(row[0] or 0),
+                "account_ref": scope}
+    except Exception as exc:                       # erro NUNCA vira zero
+        log.warning(f"[r05b] reservas indisponíveis: {type(exc).__name__}: {exc}")
+        return _unknown("RESERVATIONS_UNAVAILABLE",
+                        "falha ao ler as reservas pendentes", value=None)
+
+
 async def check_new_entry(*, side: Any, final_entry: Any, stop: Any,
-                          final_qty: Any) -> Dict[str, Any]:
+                          final_qty: Any, intent_key: Any = None,
+                          account_ref: Any = None) -> Dict[str, Any]:
     """Gate financeiro de UMA nova entrada normal. FAIL-CLOSED.
 
     Com o cutover desligado é um no-op permissivo (diagnóstico). Ligado, nega
-    quando o pior cenário diário atinge OU ultrapassa o limite, e também quando
-    qualquer parcela é desconhecida. Nenhuma ordem é enviada em caso de negação.
+    quando o pior cenário diário — JÁ INCLUINDO as reservas de outras intenções
+    — atinge ou ultrapassa o limite, e também quando qualquer parcela é
+    desconhecida. `intent_key` identifica a própria proposta para que a reserva
+    dela não seja somada duas vezes. Nenhuma ordem é enviada em caso de negação.
     """
     if not cutover_enabled():
         return {"ok": True, "quality": QUALITY_OK, "reason_code": None,
@@ -754,7 +860,11 @@ async def check_new_entry(*, side: Any, final_entry: Any, stop: Any,
                     "cutover_enabled": True,
                     "reason": "risco da entrada proposta não pôde ser calculado"}
 
-        worst = worst_case_daily_usd(snap, proposed.get("value"))
+        # Reservas de OUTRAS intenções: lidas do banco, sem I/O de exchange.
+        reservations = await reserved_risk_usd(account_ref=account_ref,
+                                               exclude_intent_key=intent_key)
+        worst = worst_case_daily_usd(snap, proposed.get("value"),
+                                     reservations=reservations)
         if worst.get("quality") != QUALITY_OK:
             return {"ok": False, "quality": QUALITY_UNKNOWN,
                     "reason_code": worst.get("reason_code") or "WORST_CASE_NOT_COMPUTABLE",
@@ -784,11 +894,18 @@ async def check_new_entry(*, side: Any, final_entry: Any, stop: Any,
                     "reason": (f"pior cenário diário ${worst_value:.2f} atinge o "
                                f"limite ${limit_usd:.2f}"),
                     "worst_case_daily_usd": worst_value,
+                    "reserved_risk_usd": worst.get("reserved_risk_usd"),
                     "daily_loss_limit_usd": limit_usd}
         return {"ok": True, "quality": QUALITY_OK, "reason_code": None,
                 "cutover_enabled": True,
                 "worst_case_daily_usd": worst_value,
-                "daily_loss_limit_usd": limit_usd}
+                "reserved_risk_usd": worst.get("reserved_risk_usd"),
+                "proposed_trade_risk_usd": worst.get("proposed_trade_risk_usd"),
+                "daily_loss_limit_usd": limit_usd,
+                # Base SEM reservas e SEM proposta: a admissão sob lock soma as
+                # reservas FRESCAS sobre ela, sem repetir I/O de exchange.
+                "budget": {"base_usd": worst.get("base_usd"),
+                           "limit_usd": limit_usd, "complete": True}}
     except Exception as exc:                       # exceção NUNCA libera entrada
         log.warning(f"[r05b] gate financeiro falhou: {type(exc).__name__}: {exc}")
         return {"ok": False, "quality": QUALITY_UNKNOWN,
