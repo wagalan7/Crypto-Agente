@@ -532,6 +532,9 @@ async def list_needing_reconciliation(session_factory, *, limit: int = 50) -> li
             return [{"intent_key": row.intent_key, "client_order_id": row.client_order_id,
                      "account_ref": row.account_ref, "exchange": row.exchange,
                      "symbol": row.symbol, "side": row.side, "reason": row.reason,
+                     # TODOS os ids efetivamente despachados (inclui a filha
+                     # `-mfb`): primária rejeitada não prova ausência de fill.
+                     "dispatch_ids": list(row.dispatch_ids or []),
                      "updated_at": row.updated_at} for row in rows]
     except Exception:
         return []

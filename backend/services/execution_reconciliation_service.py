@@ -509,6 +509,15 @@ class InMemoryIncidentRepo:
     async def list_all(self) -> list[dict]:
         return [dict(r) for r in self._rows.values()]
 
+    async def list_by_client_ids(self, ids) -> list[dict]:
+        """Incidentes de ids EFETIVAMENTE despachados, de QUALQUER kind — a prova
+        do desfecho não depende de como o incidente foi classificado."""
+        want = {str(i) for i in (ids or []) if i}
+        if not want:
+            return []
+        return [dict(r) for r in self._rows.values()
+                if str(r.get("client_order_id") or "") in want]
+
     async def update(self, key: str, **fields) -> Optional[dict]:
         async with self._lock:
             row = self._rows.get(key)
@@ -697,6 +706,21 @@ class _SqlIncidentRepo:
         from sqlalchemy import select
         async with get_session() as session:
             rows = (await session.execute(select(ExecutionIncident))).scalars().all()
+            return [_row_to_dict(r) for r in rows]
+
+    async def list_by_client_ids(self, ids) -> list[dict]:
+        """Incidentes de ids EFETIVAMENTE despachados, de QUALQUER kind — a prova
+        do desfecho não depende de como o incidente foi classificado."""
+        from db import get_session
+        from models.execution_incident import ExecutionIncident
+        from sqlalchemy import select
+        want = sorted({str(i) for i in (ids or []) if i})
+        if not want:
+            return []
+        async with get_session() as session:
+            rows = (await session.execute(
+                select(ExecutionIncident)
+                .where(ExecutionIncident.client_order_id.in_(want)))).scalars().all()
             return [_row_to_dict(r) for r in rows]
 
     async def _apply(self, key, where_extra, fields) -> Optional[dict]:
@@ -1819,6 +1843,90 @@ def _intent_symbol(stored: Optional[str]) -> Optional[str]:
     return parts[0].replace("-", "/", 1) + ":" + parts[1]
 
 
+async def _real_trade_for_dispatch(dispatch_ids, *, symbol: str) -> Optional[int]:
+    """RealTrade vinculado a QUALQUER id efetivamente despachado desta decisão."""
+    try:
+        from db import DB_ENABLED, get_session
+        from models.real_trade import RealTrade
+        from sqlalchemy import select
+    except Exception:  # noqa: BLE001
+        return None
+    if not DB_ENABLED or not dispatch_ids:
+        return None
+    try:
+        async with get_session() as session:
+            rows = (await session.execute(
+                select(RealTrade.id, RealTrade.symbol)
+                .where(RealTrade.client_order_id.in_(list(dispatch_ids)))
+                .order_by(RealTrade.id))).all()
+    except Exception:  # noqa: BLE001
+        return None
+    # Símbolo EXATO: id de outro símbolo não vincula (nunca adota trade alheio).
+    alvo = _sym_key(symbol)
+    ids = {int(rid) for rid, rsym in rows if _sym_key(rsym or "") == alvo}
+    if len(ids) != 1:
+        return None            # 0 → sem vínculo; >1 → ambíguo, nunca escolhe
+    return ids.pop()
+
+
+async def _settle_intent_from_proof(row: dict) -> dict:
+    """Resolve a INTENÇÃO quando a reconciliação já provou o desfecho econômico.
+
+    A prova é o incidente RESOLVIDO de cada id efetivamente despachado — de
+    QUALQUER kind, porque quem classificou o incidente (executor ou ciclo) não
+    muda o desfecho econômico:
+      • todos `FLAT`  ⇒ não houve execução ⇒ intenção TERMINAL;
+      • algum `PROTECTED` ⇒ houve execução ⇒ intenção CONFIRMED vinculada ao
+        RealTrade correspondente (reserva vira exposição real).
+    Faltando prova de QUALQUER id (inclusive a filha `-mfb`), nada é resolvido:
+    primária rejeitada não prova ausência de fill na filha. Consulta incerta,
+    ordem viva, ACK e MANUAL_REQUIRED também não provam desfecho.
+    """
+    from services import entry_intent_service as intents
+    from db import get_session
+    repo = _get_repo()
+    symbol = _intent_symbol(row.get("symbol"))
+    ids = [i for i in (row.get("dispatch_ids") or []) if i]
+    if not ids and row.get("client_order_id"):
+        ids = [row["client_order_id"]]
+    if not symbol or not ids:
+        return {"resolved": False, "unproven_ids": [], "reason": "IDENTITY_INCOMPLETE"}
+    try:
+        incidents = await repo.list_by_client_ids(ids)
+    except Exception as exc:  # noqa: BLE001
+        # Sem leitura da prova não se afirma nada (nunca "resolvido por falta de banco").
+        log.warning(f"[p03][intents] prova indisponível ({exc})")
+        return {"resolved": False, "unproven_ids": ids, "reason": "PROOF_UNAVAILABLE"}
+    por_id: dict[str, list] = {str(i): [] for i in ids}
+    sym_key = _sym_key(symbol)
+    for incident in incidents:
+        coid = str(incident.get("client_order_id") or "")
+        if coid not in por_id:
+            continue
+        if _sym_key(incident.get("symbol") or "") != sym_key:
+            continue                      # id de outro símbolo não prova este
+        por_id[coid].append(incident)
+    unproven = [i for i, found in por_id.items()
+                if not found or any(x.get("resolved_at") is None for x in found)]
+    if unproven:
+        return {"resolved": False, "unproven_ids": unproven, "reason": "PROOF_MISSING"}
+    states = {str(x.get("state")) for found in por_id.values() for x in found}
+    if states <= {State.FLAT}:
+        ok = await intents.mark_terminal(get_session, row["intent_key"],
+                                         reason="RECONCILED_NO_EXECUTION")
+        return {"resolved": bool(ok), "unproven_ids": [], "reason": "NO_EXECUTION"}
+    if State.PROTECTED in states and states <= _TERMINAL_SAFE:
+        trade_id = await _real_trade_for_dispatch(ids, symbol=symbol)
+        if trade_id is None:
+            # Execução comprovada sem vínculo: NÃO inventa trade nem encerra.
+            return {"resolved": False, "unproven_ids": ids, "reason": "TRADE_LINK_MISSING"}
+        ok = await intents.mark_confirmed(get_session, row["intent_key"],
+                                          real_trade_id=trade_id,
+                                          reason="RECONCILED_EXECUTION")
+        return {"resolved": bool(ok), "unproven_ids": [], "reason": "EXECUTION_LINKED"}
+    return {"resolved": False, "unproven_ids": ids, "reason": "PROOF_INCONCLUSIVE"}
+
+
 async def recover_entry_intents() -> dict:
     """Liga as INTENÇÕES pendentes (P03) à recuperação/reconciliação operacional.
 
@@ -1844,6 +1952,7 @@ async def recover_entry_intents() -> dict:
     except Exception as exc:  # noqa: BLE001
         log.error(f"[p03][intents] recuperação falhou: {exc}")
         return {**summary, "error": str(exc)}
+    summary["resolved"] = 0
     for row in pending:
         symbol = _intent_symbol(row.get("symbol"))
         client_order_id = row.get("client_order_id")
@@ -1851,19 +1960,30 @@ async def recover_entry_intents() -> dict:
             summary["skipped_identity"] += 1
             continue
         try:
-            result = await record_incident(
-                kind=Kind.ENTRY_SUBMISSION_UNKNOWN, symbol=symbol,
-                exchange=row.get("exchange") or EXCHANGE_BINANCE,
-                client_order_id=client_order_id,
-                side=_norm_entry_side(row.get("side")),
-                payload={"source": "entry_intent", "intent_key": row.get("intent_key"),
-                         "account_ref": row.get("account_ref"), "reason": row.get("reason")})
-            if result.get("persisted"):
-                summary["incidents"] += 1
+            # 1. A reconciliação já provou o desfecho? Então a intenção FECHA —
+            # reapresentá-la reabriria o incidente pela MESMA prova, em ciclo.
+            verdict = await _settle_intent_from_proof(row)
+            if verdict["resolved"]:
+                summary["resolved"] += 1
+                continue
+            # 2. Sem prova: garante incidente para CADA id ainda não provado.
+            for dispatch_id in (verdict["unproven_ids"] or [client_order_id]):
+                result = await record_incident(
+                    kind=Kind.ENTRY_SUBMISSION_UNKNOWN, symbol=symbol,
+                    exchange=row.get("exchange") or EXCHANGE_BINANCE,
+                    client_order_id=dispatch_id,
+                    side=_norm_entry_side(row.get("side")),
+                    payload={"source": "entry_intent", "intent_key": row.get("intent_key"),
+                             "account_ref": row.get("account_ref"),
+                             "reason": row.get("reason"),
+                             "dispatch_ids": list(row.get("dispatch_ids") or []),
+                             "settle_reason": verdict.get("reason")})
+                if result.get("persisted"):
+                    summary["incidents"] += 1
         except Exception as exc:  # noqa: BLE001
             log.error(f"[p03][intents] incidente de {client_order_id} falhou: {exc}")
             summary["skipped_identity"] += 1
-    if summary["to_unknown"] or summary["incidents"]:
+    if summary["to_unknown"] or summary["incidents"] or summary["resolved"]:
         log.warning(f"[p03][intents] recuperação: {summary}")
     return summary
 
