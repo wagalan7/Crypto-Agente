@@ -34,7 +34,35 @@ REESCRITO pelo rebase sobre `origin/main` de 24/09 e equivale a `e64b5fab`
 | 3 · R09+R07/R08 coleta real | `INTEGRADO` | 18 verificações PostgreSQL (scanner→flush→export) + entrypoint executável |
 | 4 · R11/R12 estado e catálogo | `INTEGRADO` | 17 herméticos + 11 verificações PostgreSQL (restart, concorrência, histerese) |
 | 5 · R10 execução e walk-forward | `INTEGRADO` | 12 + 11 herméticos de regressão dos defeitos reproduzidos |
-| 6 · Encerramento verificável | `PENDENTE` | — |
+| 6 · Encerramento verificável | `INTEGRADO` | H chama o entrypoint real; suíte completa + 8 harnesses PostgreSQL |
+
+### Bloco 6 — encerramento verificável
+
+- O teste H deixou de montar o fluxo à mão: ele EXECUTA
+  `backend/scripts/research_pipeline.py` como subprocesso — o mesmo entrypoint
+  que outra pessoa roda — e verifica o relatório que a aplicação produz.
+- Documentos corrigidos com estado real: contratos do fechamento e o que uma
+  publicação futura precisaria (duas migrações aditivas, nenhuma variável nova,
+  e as quatro mudanças de comportamento do caminho P03).
+- Fronteiras antigas ajustadas com justificativa e substituto comportamental:
+  escopo do pacote R10B fixado ao próprio range (a ligação da coleta ao R09 é
+  provada em `pg_integration_r09_preselection.py`) e o isolamento do R11C passou
+  a permitir a camada de persistência do próprio pacote, com checagem AST de que
+  ela não usa função de decisão.
+
+### Verificação final (24/09/2026)
+
+| Verificação | Resultado |
+| --- | --- |
+| Suíte completa | 2.321 executados, 2.319 aprovados, 2 skips R05C históricos |
+| PostgreSQL real | P03 intent (20 cenários), P03.1E, R09, R09 pré-seleção (18), R10B, R05C, R05D gate (16), R11 estado (11) |
+| `py_compile` | aprovado em todos os arquivos alterados |
+| TSC | não se aplica — nenhum TS/TSX alterado |
+| `git diff --check` | limpo |
+
+Skips honestos: os 2 do R05C são os históricos por fixture auditada ausente no
+repositório — não foram introduzidos aqui.
+
 
 ### Bloco 4 — catálogo oficial, estado persistente e corte temporal
 

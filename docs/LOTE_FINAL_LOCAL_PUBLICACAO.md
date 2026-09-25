@@ -101,3 +101,30 @@ sem inventar histórico.
    entrar no gate.
 5. Aprovação humana e canário — nenhum dos dois foi solicitado ou preparado
    para aplicação.
+
+## 8. Fechamento das integrações — o que muda numa publicação futura
+
+Migrações ADITIVAS novas (criadas no boot por `init_db`, sem passo manual):
+
+- `entry_intents.dispatch_ids JSONB` — ids efetivos de despacho gravados antes
+  do envio (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`).
+- tabela `policy_simulation_state` — histerese/geração da simulação R11/R12.
+
+Nenhuma variável de ambiente NOVA. Os seletores continuam os mesmos e com o
+mesmo default inativo; `R09_PRESELECTION_MODE=observe` agora realmente coleta,
+então ligá-lo é uma decisão operacional com efeito (linhas `PRE_SELECTION` no
+acervo existente, dentro do orçamento já declarado).
+
+Mudanças de comportamento com os defaults atuais (todas do caminho P03, que é
+`SAFETY_FIX` e já estava ativo):
+
+1. a admissão passa a respeitar o teto de posições configurado e o risco aberto
+   lido sob a lock — entradas que antes passavam por um limite desligado podem
+   ser recusadas com `MAX_OPEN_POSITIONS`/`MAX_OPEN_RISK`;
+2. risco aberto ilegível bloqueia nova entrada (`OPEN_RISK_UNKNOWN`);
+3. sem credencial comprovada não há identidade de decisão e nada é enviado;
+4. cada POST de entrada exige o guard da intenção e o id efetivo registrado.
+
+Rollback: desligar os seletores restaura o legado dos blocos B–H; o caminho P03
+não tem flag — reverter exigiria reverter os commits e reconciliar as intenções
+abertas, com decisão humana explícita.

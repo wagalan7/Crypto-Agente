@@ -122,3 +122,31 @@ observada, e compartilhar função não transforma um no outro.
   75–100 seguem como estavam.
 - Com todos os seletores ausentes, o resumo do lote mostra o bloco A como único
   ativo — e ele é a correção de segurança.
+
+## 6. Fechamento das integrações (24/09/2026)
+
+O lote entregou bibliotecas e manifestos; este fechamento ligou os caminhos.
+
+| Contrato | O que passou a valer |
+| --- | --- |
+| P03 admissão | Limite real de slots + risco aberto lido DENTRO da transação; risco ilegível ⇒ `OPEN_RISK_UNKNOWN` |
+| P03 identidade | `account_ref` é a referência OPACA do ledger R05C; sem credencial não há decisão |
+| P03 desfecho | Nenhum callback rebaixa `CONFIRMED`; só o dono do lease vivo encerra |
+| P03 despacho | Guard dentro do preflight, antes de CADA POST; `dispatch_ids` grava o id efetivo antes do envio |
+| P03 recuperação | `recover_stale` + incidente por `client_order_id` dentro do boot/ciclo existente |
+| R05 limite | Fonte selecionada escolhe o P&L da fórmula única (`kill_daily`, `rolling_24h`, `rolling_7d`) |
+| R05 janela vazia | Consultada e vazia = zero conhecido (`known_empty_window`); coleta não provada continua bloqueando |
+| R09 escopo | `scope` viaja até o INSERT; `PRE_SELECTION` só quando o modo está ligado |
+| R09 coleta | Scanner de produção registra cada candidato no funil real, na ordem real |
+| R10 execução | Preço/instante efetivos alimentam trajetória, sizing e custo; maker sem toque não abre |
+| R10 capital | Resultado realizado volta ao capital; desconhecido não libera capital presumido |
+| R10 validação | `run_walk_forward` executa dobras; veredito exige delta da política + IC + estudo executado |
+| R11 estado | `policy_simulation_state` com histerese e geração por experimento/versão/universo |
+| R11 tempo | Resultado resolvido depois da decisão não entra em janela nem mérito |
+| R12 catálogo | Envelope versionado despacha por schema; regra de um knob intacta no payload |
+| R12 gate | Evidência derivada do replay/estudo; aprovar no gate não libera LIVE |
+
+Entrypoint executável: `backend/scripts/research_pipeline.py` (dados → núcleo →
+score V3 → observação → persistência → replay → walk-forward → go/no-go).
+Estado do adaptador operacional: `LIVE_ADAPTER_NOT_IMPLEMENTED` — código por
+terminar, não pendência externa.

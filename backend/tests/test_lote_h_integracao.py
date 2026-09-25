@@ -55,148 +55,80 @@ def rising_bars(start_ms, count=40):
             for i in range(count)]
 
 
-class FluxoSintetico(unittest.TestCase):
-    """candidato → seleção → evidência → simulação → comparação → go/no-go."""
+class OrquestracaoReal(unittest.TestCase):
+    """O fluxo é exercitado pelo ENTRYPOINT oficial, não montado no teste.
 
-    def setUp(self):
-        self.decision = core.decide(market_state())
+    O teste não fornece decisões nem métricas: ele executa
+    `backend/scripts/research_pipeline.py` — o mesmo caminho que outra pessoa
+    roda — e verifica o relatório que a aplicação produz.
+    """
 
-    def test_1_candidato_do_nucleo(self):
-        self.assertEqual(self.decision["state"], core.STATE_ELIGIBLE)
-        self.assertEqual(self.decision["playbook"], core.PLAYBOOK_TREND_PULLBACK)
-        self.assertFalse(self.decision["executable"])
-        self.assertIsNotNone(self.decision["opportunity_key"])
+    @classmethod
+    def setUpClass(cls):
+        import json
+        import subprocess
+        script = BACKEND / "scripts" / "research_pipeline.py"
+        cls.proc = subprocess.run(
+            [sys.executable, "-B", str(script), "--symbols", "8", "--seed", "7"],
+            capture_output=True, text=True, cwd=str(BACKEND),
+            env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1",
+                 "PYTHONPATH": str(BACKEND)})
+        saida = cls.proc.stdout
+        cls.report = json.loads(saida[saida.index("{"):]) if "{" in saida else None
 
-    def test_2_selecao_so_em_simulacao(self):
-        envelope = core.selection_adapter(self.decision, mode="simulation")
-        self.assertEqual(envelope["route"], "SIMULATION")
-        self.assertFalse(envelope["executable"])
-        self.assertEqual(envelope["live_route"], "UNAVAILABLE")
-        self.assertEqual(envelope["candidate"]["opportunity_key"],
-                         self.decision["opportunity_key"])
+    def test_entrypoint_executa_e_devolve_relatorio(self):
+        self.assertEqual(self.proc.returncode, 0, self.proc.stderr[-800:])
+        self.assertIsNotNone(self.report)
+        self.assertEqual(self.report["entrypoint"], "research_pipeline")
+        self.assertEqual(self.report["mode"], "LOCAL_RESEARCH_ONLY")
 
-    def test_3_score_tecnico_sem_probabilidade(self):
-        levels = self.decision["levels"]
-        risco = levels["entry"] - levels["stop_loss"]
-        payload = s3.score({
-            "adx": 30.0, "htf_alignment_ratio": 1.0, "structure_quality": 0.8,
-            "level_distance_atr": 0.5, "trigger_body_ratio": 0.7,
-            "trigger_follow_through_atr": 0.4,
-            "rr_tp2": (levels["tp2"] - levels["entry"]) / risco,
-            "entry_distance_atr": 0.1, "volume_ratio": 1.1, "spread_pct": 0.03,
-            "funding_pct": 0.0,
-        }, playbook=self.decision["playbook"], side=self.decision["side"])
-        self.assertEqual(payload["state"], s3.STATE_OK)
-        self.assertIsNone(payload["probability"])
-        self.assertEqual(s3.economic_verdict(payload)["live_eligibility"],
-                         s3.STATE_UNAVAILABLE)
+    def test_nucleo_decide_e_nada_e_executavel(self):
+        candidatos = self.report["candidates"]
+        self.assertGreater(candidatos["evaluated"], 0)
+        self.assertGreaterEqual(candidatos["evaluated"], candidatos["eligible"])
+        self.assertFalse(self.report["live_equivalent"])
+        self.assertFalse(self.report["promotable"])
 
-    def test_4_evidencia_pre_selecao_com_a_mesma_vela(self):
-        chave, motivo = pre.pre_selection_identity(
-            symbol=self.decision["symbol"], timeframe=self.decision["timeframe"],
-            side=self.decision["side"],
-            trigger_candle_ms=self.decision["trigger_candle_ms"],
-            playbook=self.decision["playbook"],
-            playbook_version=self.decision["playbook_version"])
-        self.assertEqual(motivo, pre.OK)
-        funil = pre.record_funnel([
-            {"stage": pre.STAGE_CANDIDATE, "verdict": pre.VERDICT_PASSED},
-            {"stage": pre.STAGE_PLAYBOOK, "verdict": pre.VERDICT_PASSED},
-            {"stage": pre.STAGE_CANDLE, "verdict": pre.VERDICT_PASSED},
-            {"stage": pre.STAGE_GEOMETRY_RR, "verdict": pre.VERDICT_PASSED},
-            {"stage": pre.STAGE_LIQUIDITY, "verdict": pre.VERDICT_UNKNOWN,
-             "reason_code": "DEPTH_UNAVAILABLE"}])
-        congelada = pre.frozen_decision(
-            identity=chave, outcome=pre.OUTCOME_ACCEPTED,
-            decision_ts_ms=self.decision["decision_ts_ms"],
-            setup={**self.decision["levels"], "symbol": self.decision["symbol"],
-                   "timeframe": self.decision["timeframe"],
-                   "side": self.decision["side"],
-                   "playbook": self.decision["playbook"],
-                   "playbook_version": self.decision["playbook_version"],
-                   "trigger_candle_ms": self.decision["trigger_candle_ms"]},
-            funnel=funil, availability={"depth": False},
-            source=pre.window_source("binance", "binance",
-                                     symbol=self.decision["symbol"], resolution="5m"))
-        self.assertEqual(congelada["setup"]["trigger_candle_ms"],
-                         self.decision["trigger_candle_ms"])
-        self.assertFalse(congelada["learning_eligible"])
-        # Etapas posteriores à liquidez não foram avaliadas — e não viram aprovação.
-        self.assertIn(pre.STAGE_RISK, funil["stages_not_evaluated"])
+    def test_score_v3_nao_entrega_probabilidade(self):
+        self.assertFalse(self.report["score_v3"]["probability_available"])
+        self.assertEqual(self.report["score_v3"]["economic_approval"], "UNAVAILABLE")
 
-    def _simular(self):
-        levels = self.decision["levels"]
-        decisao_ms = self.decision["decision_ts_ms"]
-        primeiro = ((decisao_ms + BAR5 - 1) // BAR5) * BAR5
-        candidato = {"opportunity_id": self.decision["opportunity_key"],
-                     "symbol": self.decision["symbol"],
-                     "direction": self.decision["side"],
-                     "decision_ts_ms": decisao_ms,
-                     "entry": levels["entry"], "stop_loss": levels["stop_loss"],
-                     "tp1": levels["tp1"], "tp2": levels["tp2"], "atr": 1.0}
-        return pf.run_portfolio(
-            [candidato], bars_by_id={candidato["opportunity_id"]: rising_bars(primeiro)},
-            quotes_by_id={candidato["opportunity_id"]: {
-                "bid": 100.99, "ask": 101.01, "ts_ms": decisao_ms, "source": "binance"}},
-            costs=r10a.CostConfig(fee_bps_per_side=4.0, slippage_bps_per_side=2.0,
-                                  funding_bps_per_bar=1.0))
+    def test_observacao_desligada_por_padrao(self):
+        self.assertFalse(self.report["observation"]["enabled"])
+        self.assertEqual(self.report["observation"]["accepted"], 0)
+        self.assertEqual(self.report["observation"]["vetoed"], 0)
 
-    def test_5_simulacao_de_carteira_usa_o_candidato_do_nucleo(self):
-        resultado = self._simular()
-        self.assertEqual(resultado["admitted"], 1)
-        trade = resultado["trades"][0]
-        self.assertEqual(trade["opportunity_id"], self.decision["opportunity_key"])
-        self.assertIn(trade["status"], r10a.REPLAY_STATUSES)
-        self.assertFalse(resultado["live_equivalent"])
-        self.assertFalse(resultado["promotable"])
+    def test_carteira_compartilhada_limita_a_simulacao(self):
+        replay = self.report["replay"]
+        self.assertGreaterEqual(replay["admitted"], 1)
+        self.assertLessEqual(replay["admitted"], self.report["candidates"]["eligible"])
+        self.assertFalse(replay["live_equivalent"])
+        self.assertIn("queue_position", replay["fidelity_unavailable"])
+        self.assertIsNotNone(replay["metrics"]["capital_end_usd"])
 
-    def test_6_comparacao_nao_declara_vencedor_com_uma_amostra(self):
-        resultado = self._simular()
-        trade = resultado["trades"][0]
-        pareado = wf.pair_opportunities(
-            [{"opportunity_id": trade["opportunity_id"], "net_r": trade["net_r"]}],
-            [{"opportunity_id": trade["opportunity_id"], "net_r": trade["net_r"]}])
-        ci = wf.block_bootstrap_ci([trade["net_r"]], seed=1, block_size=5)
-        disciplina = {stage: "train" for stage in wf.FITTED_STAGES}
-        disciplina["candidate_selected_on"] = "validation"
-        veredicto = wf.verdict(
-            folds=wf.rolling_windows(start_ms=T0, end_ms=T0 + 200 * BAR5, bar_ms=BAR5,
-                                     train_bars=40, test_bars=10)["folds"],
-            discipline=wf.fold_discipline(disciplina),
-            coverage=wf.coverage_guard({"considered": 1, "resolved": 1},
-                                       {"considered": 1, "resolved": 1}),
-            costs_complete=True, horizon_sufficient=True, paired=pareado, ci=ci)
-        self.assertIsNone(veredicto["winner"])
-        self.assertEqual(veredicto["state"], wf.INSUFFICIENT_EVIDENCE)
-        self.assertIn(wf.SAMPLE_INSUFFICIENT, veredicto["reason_codes"])
-        self.assertFalse(veredicto["promotable"])
+    def test_walk_forward_executa_dobras_e_nao_promove(self):
+        wf_report = self.report["walk_forward"]
+        self.assertGreaterEqual(wf_report["folds_executed"], 1)
+        self.assertFalse(wf_report["promotable"])
+        if wf_report["winner"] is not None:
+            self.assertEqual(wf_report["state"], "EVIDENCE_AVAILABLE")
 
-    def test_7_go_no_go_recusa_a_amostra_do_fluxo(self):
-        resultado = self._simular()
-        gate = r12.go_no_go({
-            "total_shadow_trades": resultado["admitted"],
-            "trades_per_playbook": {self.decision["playbook"]: resultado["admitted"]},
-            "enabled_playbooks": (self.decision["playbook"],),
-            "calendar_days": 1, "business_days": 1, "coverage_pct": 100.0,
-            "net_ev_r": resultado["metrics"]["net_expectancy_r"],
-            "uncertainty_r": None, "drawdown_r": resultado["metrics"]["max_drawdown_r"],
-            "stability_ratio": None, "operational_failures": 0,
-            "economic_duplicates": 0, "unresolved_protection_failures": 0,
-            "essential_gaps": ["prospective_sample"], "fidelity_discrepancy_pct": None,
-        })
-        self.assertEqual(gate["verdict"], "NO_GO")
+    def test_gate_vem_do_resultado_e_nao_libera_live(self):
+        gate = self.report["gate"]
+        self.assertTrue(gate["evidence_from_computed_results"])
         self.assertEqual(gate["live_approval"], "UNAVAILABLE")
-        for motivo in (r12.SAMPLE_INSUFFICIENT, r12.DURATION_INSUFFICIENT,
-                       r12.BUSINESS_DAYS_INSUFFICIENT, r12.ESSENTIAL_GAP):
-            self.assertIn(motivo, gate["reason_codes"])
+        self.assertIn(gate["verdict"], ("NO_GO", "GO_CANDIDATE"))
+        self.assertTrue(gate["criteria_hash"])
 
-    def test_8_identidade_atravessa_o_fluxo_inteiro(self):
-        envelope = core.selection_adapter(self.decision, mode="simulation")
-        resultado = self._simular()
-        self.assertEqual(envelope["candidate"]["opportunity_key"],
-                         resultado["trades"][0]["opportunity_id"])
-        repetida = core.decide(market_state())
-        self.assertEqual(repetida["opportunity_key"], self.decision["opportunity_key"])
+    def test_adaptador_operacional_declara_o_que_falta(self):
+        """Falta de código não é renomeada para pendência externa."""
+        self.assertEqual(self.report["live_adapter"], "LIVE_ADAPTER_NOT_IMPLEMENTED")
+
+    def test_nenhuma_ordem_ou_chamada_externa_no_caminho(self):
+        proibidos = ("place_order", "kill-switch", "telegram", "binance.com")
+        blob = (self.proc.stdout + self.proc.stderr).lower()
+        for termo in proibidos:
+            self.assertNotIn(termo, blob, termo)
 
 
 class DefaultsPreservados(unittest.TestCase):
