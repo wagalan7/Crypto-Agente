@@ -830,14 +830,48 @@ class CandidateValidationError(ValueError):
     """Configuração de candidato inválida — rejeitada sem persistência."""
 
 
+#: Envelope VERSIONADO do tipo de experimento. São metadados de schema, não
+#: knobs: entram no despacho e saem antes da regra de um knob — que continua
+#: valendo integralmente para o payload.
+CANDIDATE_ENVELOPE_KEYS = ("experiment_type", "experiment_type_version")
+KNOWN_EXPERIMENT_TYPES = ("POST_SELECTION_KNOB", "PRE_SELECTION_STRUCTURAL")
+
+
+def split_candidate_envelope(config: Any) -> tuple:
+    """Separa envelope (tipo/versão) do payload de configuração."""
+    if not isinstance(config, dict):
+        return {}, config
+    envelope = {key: config[key] for key in CANDIDATE_ENVELOPE_KEYS if key in config}
+    payload = {key: value for key, value in config.items()
+               if key not in CANDIDATE_ENVELOPE_KEYS}
+    return envelope, payload
+
+
 def validate_candidate_config(champion: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     """Valida a config canônica do candidato. Levanta `CandidateValidationError`.
 
     Regras duras: exatamente UM knob; knob na allowlist; tipo correto; sem
     NaN/infinito; dentro dos limites; delta conservador; nada de safety/live.
+
+    Config com envelope versionado (`experiment_type`) despacha por schema: o
+    envelope é metadado e o PAYLOAD continua sujeito à mesma regra de um knob.
     """
     if not isinstance(config, dict) or not config:
         raise CandidateValidationError("configuração vazia")
+    envelope, payload = split_candidate_envelope(config)
+    if envelope:
+        if len(envelope) != len(CANDIDATE_ENVELOPE_KEYS):
+            raise CandidateValidationError(
+                "envelope versionado incompleto: tipo e versão são obrigatórios")
+        tipo = envelope.get("experiment_type")
+        if tipo not in KNOWN_EXPERIMENT_TYPES:
+            raise CandidateValidationError(f"tipo de experimento desconhecido: {tipo}")
+        if not isinstance(envelope.get("experiment_type_version"), str) \
+                or not envelope["experiment_type_version"].strip():
+            raise CandidateValidationError("versão do tipo de experimento obrigatória")
+        validated = validate_candidate_config(champion, payload)
+        return {**validated, **envelope}
+    config = payload
     if len(config) != 1:
         raise CandidateValidationError(
             f"exatamente 1 knob por candidato (recebidos {len(config)}: {sorted(config)})")

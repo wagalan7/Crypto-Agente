@@ -227,6 +227,25 @@ async def run(args) -> dict:
                               "reason_codes": list(study["verdict"]["reason_codes"]),
                               "folds_executed": study["folds_executed"],
                               "promotable": study["verdict"]["promotable"]}
+    # 7. Go/no-go alimentado pelos RESULTADOS calculados (nunca números soltos).
+    from services import preselection_experiment_service as r12
+    trades_com_playbook = []
+    playbook_por_chave = {item["opportunity_key"]: item["playbook"] for item in eligible}
+    for trade in replay["trades"]:
+        trades_com_playbook.append({**trade,
+                                    "playbook": playbook_por_chave.get(trade["opportunity_id"])})
+    evidencia = r12.gate_evidence_from_study(
+        replay=replay, study=study, trades=trades_com_playbook,
+        enabled_playbooks=sorted({item["playbook"] for item in eligible}),
+        window_start_ms=min((item["decision_ts_ms"] for item in candidates), default=None),
+        window_end_ms=max((item["decision_ts_ms"] for item in candidates), default=None),
+        essential_gaps=["prospective_sample"])
+    gate = r12.go_no_go(evidencia)
+    report["gate"] = {"verdict": gate["verdict"], "live_approval": gate["live_approval"],
+                      "reason_codes": list(gate["reason_codes"]),
+                      "criteria_hash": gate["criteria_hash"][:12],
+                      "evidence_from_computed_results":
+                          evidencia["source"]["derived_from_computed_results"]}
     report["next_step"] = ("Acumular amostra prospectiva pelo coletor ligado antes de "
                            "qualquer go/no-go; o adaptador operacional continua por implementar.")
     return report

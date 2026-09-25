@@ -82,6 +82,7 @@ async def init_db():
     from models import strategy_experiment  # noqa: F401  (P05 — candidatos governados)
     from models import decision_observation  # noqa: F401  (R09 — observação segregada)
     from models import entry_intent  # noqa: F401  (P03 — intenção de entrada econômica)
+    from models import policy_simulation_state  # noqa: F401  (R11/R12 — estado da simulação)
     from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -101,6 +102,12 @@ async def init_db():
         await conn.execute(text(
             "ALTER TABLE rotation_universe_state "
             "ADD COLUMN IF NOT EXISTS seeded JSON DEFAULT '{}'"
+        ))
+        # R11/R12 — estado persistente da simulação (tabela nova, aditiva).
+        # `create_all` cria a tabela; aqui só garantimos a coluna de payload
+        # quando a tabela já existir de uma versão anterior.
+        await conn.execute(text(
+            "ALTER TABLE policy_simulation_state ADD COLUMN IF NOT EXISTS payload JSONB"
         ))
         # P03 — ids efetivos de despacho da intenção de entrada (aditiva).
         await conn.execute(text(

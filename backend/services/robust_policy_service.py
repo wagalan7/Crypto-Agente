@@ -89,6 +89,9 @@ class Sample:
     observations: Tuple[Observation, ...] = ()
     duplicates_dropped: int = 0
     invalid_dropped: int = 0
+    #: Resultados resolvidos DEPOIS do instante da decisão. Nunca entram na
+    #: janela; ficam contados para que a exclusão seja visível.
+    future_dropped: int = 0
 
     @property
     def n(self) -> int:
@@ -190,13 +193,21 @@ class DecayConfig:
 
 def split_windows(sample: Sample, *, now_ms: int, config: DecayConfig) -> Tuple[Sample, Sample]:
     """Baseline ANTERIOR e janela recente DISJUNTOS (A3): o prejuízo recente
-    não contamina a própria referência."""
+    não contamina a própria referência.
+
+    Corte superior obrigatório: resultado resolvido DEPOIS de `now_ms` não
+    existe na decisão de agora. Sem ele, uma perda que só se resolve amanhã já
+    derrubaria a exposição hoje.
+    """
     recent_start = now_ms - config.recent_days * 86_400_000
     baseline_start = now_ms - config.baseline_days * 86_400_000
-    recent = tuple(o for o in sample.observations if o.resolved_at_ms >= recent_start)
-    baseline = tuple(o for o in sample.observations
+    future = tuple(o for o in sample.observations if o.resolved_at_ms > now_ms)
+    visible = tuple(o for o in sample.observations if o.resolved_at_ms <= now_ms)
+    recent = tuple(o for o in visible if o.resolved_at_ms >= recent_start)
+    baseline = tuple(o for o in visible
                      if baseline_start <= o.resolved_at_ms < recent_start)
-    return (Sample(sample.population, baseline), Sample(sample.population, recent))
+    return (Sample(sample.population, baseline, future_dropped=len(future)),
+            Sample(sample.population, recent, future_dropped=len(future)))
 
 
 def decay_multiplier(sample: Sample, *, now_ms: int, config: DecayConfig = DecayConfig()):
@@ -327,6 +338,8 @@ def learned_multiplier(rows: Dict[str, Any], *, timeframe: str, current_generati
 
 
 # ── M6: liquidez indisponível não promove ──────────────────────────────────
+
+
 def liquidity_verdict(base: str, *, liquidity_universe: Optional[Sequence[str]],
                       available: bool) -> Tuple[bool, str]:
     if not available or liquidity_universe is None:
@@ -373,8 +386,25 @@ def bonferroni_threshold(config: MeritConfig) -> float:
 def merit_verdict(*, windows: Sequence[Sample], net_ev_r: Optional[float],
                   uncertainty_r: Optional[float], costs_known: bool,
                   liquidity_ok: bool, quarantine_done: bool,
+                  now_ms: Optional[int] = None,
                   config: MeritConfig = MeritConfig()) -> Dict[str, Any]:
-    """Veredicto de mérito. Reduzir pode responder antes; aumentar exige mais."""
+    """Veredicto de mérito. Reduzir pode responder antes; aumentar exige mais.
+
+    Com `now_ms`, resultado resolvido DEPOIS da decisão é removido da janela
+    antes de qualquer conta — não existe mérito calculado com o futuro.
+    """
+    future_dropped = 0
+    if now_ms is not None:
+        cortadas = []
+        for window in windows or ():
+            visiveis = tuple(o for o in window.observations if o.resolved_at_ms <= now_ms)
+            future_dropped += window.n - len(visiveis)
+            cortadas.append(Sample(window.population, visiveis,
+                                   duplicates_dropped=window.duplicates_dropped,
+                                   invalid_dropped=window.invalid_dropped,
+                                   future_dropped=window.future_dropped
+                                   + (window.n - len(visiveis))))
+        windows = cortadas
     total = sum(window.n for window in windows or ())
     per_window = [window.n for window in windows or ()]
     means = [window.mean_r for window in windows or ()]
@@ -389,6 +419,8 @@ def merit_verdict(*, windows: Sequence[Sample], net_ev_r: Optional[float],
         reasons.append("SAMPLE_BELOW_MINIMUM")
     if len(per_window) < config.min_windows_stable or any(n < config.min_per_window for n in per_window):
         reasons.append("WINDOW_SAMPLE_INSUFFICIENT")
+    if future_dropped:
+        reasons.append("FUTURE_RESULTS_EXCLUDED")
     discounted = discounted_ev(means, config=config)
     threshold = bonferroni_threshold(config)
     value = _finite(net_ev_r)

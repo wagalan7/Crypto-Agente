@@ -32,9 +32,37 @@ REESCRITO pelo rebase sobre `origin/main` de 24/09 e equivale a `e64b5fab`
 | 1 · P03 caminho operacional | `INTEGRADO` | 19 herméticos + 19 cenários PostgreSQL real |
 | 2 · R05 total no limite | `INTEGRADO` | 27 herméticos + 16 verificações PostgreSQL com ledger R05C real |
 | 3 · R09+R07/R08 coleta real | `INTEGRADO` | 18 verificações PostgreSQL (scanner→flush→export) + entrypoint executável |
-| 4 · R11/R12 estado e catálogo | `PENDENTE` | — |
+| 4 · R11/R12 estado e catálogo | `INTEGRADO` | 17 herméticos + 11 verificações PostgreSQL (restart, concorrência, histerese) |
 | 5 · R10 execução e walk-forward | `INTEGRADO` | 12 + 11 herméticos de regressão dos defeitos reproduzidos |
 | 6 · Encerramento verificável | `PENDENTE` | — |
+
+### Bloco 4 — catálogo oficial, estado persistente e corte temporal
+
+- **Validador do catálogo.** `validate_candidate_config` ganhou despacho por
+  SCHEMA VERSIONADO: o envelope (`experiment_type` + versão) é metadado e sai
+  antes da regra de um knob, que continua valendo integralmente no payload.
+  A repro (`tag_config({'SCORE_MIN': 75})` recusado por três chaves) virou
+  regressão; knob de segurança e envelope incompleto seguem recusados, e
+  `P051_ANALYTICS_ONLY` continua intocado.
+- **Estado persistente.** `services/policy_state_service.py` grava histerese e
+  geração por experimento/versão/universo/população em `policy_simulation_state`
+  (tabela nova, aditiva), com chave única, compare-and-set e advisory lock
+  próprio. Publicar exige período NOVO **e** evidência NOVA; o cache cai depois
+  do commit. Provado em PostgreSQL real: restart preserva a geração, duas
+  simulações concorrentes publicam UMA vez, identidades diferentes não se
+  misturam e nenhuma tabela operacional é criada. O núcleo R11C continua PURO —
+  por isso a persistência mora fora dele.
+- **Corte temporal superior.** `split_windows` e `merit_verdict` passaram a
+  excluir resultado resolvido DEPOIS do instante da decisão, contando a exclusão
+  em `future_dropped`. A repro (perdas de amanhã derrubando a exposição hoje com
+  `EDGE_DECAYED`) virou regressão: hoje o multiplicador fica 1.0 e, quando o
+  tempo chega, a mesma perda passa a contar.
+- **Go/no-go a partir do resultado.** `gate_evidence_from_study` deriva amostra,
+  EV, incerteza, drawdown, estabilidade e discrepância de fidelidade dos
+  artefatos calculados (replay + estudo + linhas de trade). O entrypoint de
+  pesquisa já entrega o gate assim; métrica ausente vira insuficiência, nunca
+  zero, e passar no gate mantém `live_approval=UNAVAILABLE`.
+
 
 ### Blocos 3 e 5 — coleta real, entrypoint executável e execução simulada
 

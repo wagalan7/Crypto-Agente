@@ -371,6 +371,81 @@ def go_no_go(evidence: Mapping[str, Any], *,
 
 
 # ── Manifest de canário (sem aplicar) ───────────────────────────────────────
+
+def gate_evidence_from_study(*, replay: Mapping[str, Any], study: Mapping[str, Any],
+                             trades: Sequence[Mapping[str, Any]],
+                             enabled_playbooks: Sequence[str],
+                             window_start_ms: Optional[int] = None,
+                             window_end_ms: Optional[int] = None,
+                             coverage_pct: Optional[float] = None,
+                             operational_failures: Optional[int] = None,
+                             economic_duplicates: Optional[int] = None,
+                             unresolved_protection_failures: Optional[int] = None,
+                             essential_gaps: Sequence[str] = (),
+                             fidelity_discrepancy_pct: Optional[float] = None
+                             ) -> Dict[str, Any]:
+    """Evidência do gate a partir dos RESULTADOS calculados, não de números soltos.
+
+    Cada campo vem do artefato que o produziu — replay de carteira, estudo
+    walk-forward e as próprias linhas de trade. O que não foi medido entra como
+    `None` e o gate trata como insuficiência, nunca como zero.
+    """
+    replay = replay if isinstance(replay, Mapping) else {}
+    study = study if isinstance(study, Mapping) else {}
+    metrics = replay.get("metrics") if isinstance(replay.get("metrics"), Mapping) else {}
+    admitidos = [row for row in (trades or ()) if isinstance(row, Mapping)
+                 and row.get("admitted")]
+    por_playbook: Dict[str, int] = {}
+    for row in admitidos:
+        nome = row.get("playbook")
+        nome = nome.strip()[:40] if isinstance(nome, str) and nome.strip() else None
+        if nome:
+            por_playbook[nome] = por_playbook.get(nome, 0) + 1
+    dobras = [item for item in (study.get("folds") or ())
+              if isinstance(item, Mapping) and item.get("reason_code") == "OK"
+              and _finite(item.get("delta_net_r")) is not None]
+    positivas = sum(1 for item in dobras if float(item["delta_net_r"]) > 0)
+    estabilidade = (positivas / len(dobras)) if dobras else None
+    ci = study.get("ci") if isinstance(study.get("ci"), Mapping) else {}
+    incerteza = None
+    if ci.get("available"):
+        alto, baixo = _finite(ci.get("high")), _finite(ci.get("low"))
+        if alto is not None and baixo is not None:
+            incerteza = abs(alto - baixo) / 2.0
+    dias = None
+    uteis = None
+    if window_start_ms is not None and window_end_ms is not None:
+        inicio = datetime.fromtimestamp(window_start_ms / 1000.0, tz=timezone.utc)
+        fim = datetime.fromtimestamp(window_end_ms / 1000.0, tz=timezone.utc)
+        dias = max(0.0, (fim - inicio).total_seconds() / 86_400.0)
+        uteis = business_days(inicio, fim)
+    fidelidade = fidelity_discrepancy_pct
+    if fidelidade is None:
+        matriz = replay.get("fidelity") if isinstance(replay.get("fidelity"), Mapping) else {}
+        dimensoes = matriz.get("dimensions") if isinstance(matriz.get("dimensions"), Mapping) else {}
+        indisponiveis = sum(1 for valor in dimensoes.values() if valor == "UNAVAILABLE")
+        fidelidade = (100.0 * indisponiveis / len(dimensoes)) if dimensoes else None
+    return {
+        "total_shadow_trades": len(admitidos),
+        "trades_per_playbook": por_playbook,
+        "enabled_playbooks": tuple(enabled_playbooks or ()),
+        "calendar_days": dias,
+        "business_days": uteis,
+        "coverage_pct": coverage_pct,
+        "net_ev_r": _finite(metrics.get("net_expectancy_r")),
+        "uncertainty_r": incerteza,
+        "drawdown_r": _finite(metrics.get("max_drawdown_r")),
+        "stability_ratio": estabilidade,
+        "operational_failures": operational_failures,
+        "economic_duplicates": economic_duplicates,
+        "unresolved_protection_failures": unresolved_protection_failures,
+        "essential_gaps": list(essential_gaps or ()),
+        "fidelity_discrepancy_pct": fidelidade,
+        "source": {"replay_version": replay.get("portfolio_version"),
+                   "walk_forward_version": study.get("wf_version"),
+                   "derived_from_computed_results": True},
+    }
+
 def canary_limits(current: Mapping[str, Any],
                   project_ceiling: Mapping[str, Any],
                   proposed: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:

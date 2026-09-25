@@ -330,10 +330,11 @@ class DefaultsAndIsolation(unittest.TestCase):
         with patch.dict(os.environ, {rp.POLICY_SELECTOR_ENV: rp.POLICY_VERSION}):
             self.assertTrue(rp.robust_policy_enabled())
 
-    #: Leitor de manifesto permitido: compõe o resumo somente-leitura do lote
-    #: (mesmo papel que já tem para o laboratório R10A). Só pode ler versão e
-    #: seletor — nunca as funções de decisão.
-    MANIFEST_READERS = {"research_batch_service.py"}
+    #: Leitores permitidos: o compositor do resumo somente-leitura (mesmo papel
+    #: que já tem para o laboratório R10A) e a camada de PERSISTÊNCIA do próprio
+    #: pacote R11 — que existe justamente porque o núcleo continua puro. Ambos
+    #: só podem ler versão/população/seletor, nunca as funções de decisão.
+    MANIFEST_READERS = {"research_batch_service.py", "policy_state_service.py"}
     DECISION_FUNCTIONS = ("merit_verdict", "reduction_verdict", "learned_multiplier",
                           "advance_hysteresis", "decay_multiplier", "liquidity_verdict",
                           "build_sample", "cache_verdict")
