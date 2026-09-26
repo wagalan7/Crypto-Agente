@@ -81,14 +81,18 @@ async def run():
                                         RealTrade.__table__, EntryIntent.__table__])
 
     agora = datetime.now(timezone.utc)
-    fechado = agora - timedelta(hours=2)
+    # O P&L do dia é do DIA (janela calendário do kill switch): ancorar o
+    # fechamento dentro da janela vigente deixa o ensaio independente da hora
+    # em que ele roda — perto da meia-noite, `agora - 2h` cairia ontem.
+    fechado = max(frs.kill_daily_start(agora) + timedelta(minutes=1),
+                  agora - timedelta(hours=2))
     # P&L diário de -92 (EX-funding, fonte legado preservada), sem posição aberta.
     async with db.get_session() as session:
         session.add(RealTrade(symbol="ALFA/USDT:USDT", exchange="binance", side="long",
                               qty=1.0, entry_price=100.0, planned_stop=95.0,
                               status="closed_stop", source="auto", pnl_usd=-92.0,
                               entry_fee=0.0, exit_fee=0.0,
-                              opened_at=fechado - timedelta(hours=1), closed_at=fechado))
+                              opened_at=fechado - timedelta(minutes=30), closed_at=fechado))
         await session.commit()
 
     equity = {"quality": "OK", "total_usd": 1000.0, "reason_code": None}

@@ -24,12 +24,23 @@ Todo o resto do lote nasce desligado e não muda nada sem ação explícita.
 
 ## 2. Migrações
 
-- Bloco A: tabela `entry_intents` (aditiva). Já criada e exercitada no
-  PostgreSQL descartável; nenhuma coluna existente foi alterada.
-- Blocos B–H: **nenhuma migração**. A evidência pré-seleção reutiliza
+Todas **aditivas e idempotentes** (`CREATE TABLE IF NOT EXISTS` /
+`ADD COLUMN IF NOT EXISTS`), aplicadas pelo `init_db` e exercitadas no
+PostgreSQL descartável. Nenhuma coluna existente foi alterada ou removida.
+
+| O quê | Onde | Bloco |
+| --- | --- | --- |
+| tabela `entry_intents` | nova | A (P03) |
+| coluna `entry_intents.dispatch_ids` (JSONB) | aditiva | A (P03) |
+| tabela `policy_simulation_state` | nova | C (R11) |
+| coluna `policy_simulation_state.payload` (JSONB) | aditiva | C (R11) |
+
+- A evidência pré-seleção **não** cria tabela: reutiliza
   `decision_observations`, `rejected_setup_observations` e
-  `decision_observation_attempts`; o experimento pré-seleção reutiliza
-  `strategy_experiments` gravando o tipo dentro de `candidate_config`.
+  `decision_observation_attempts`, separando a coorte pelo campo `scope`.
+- O experimento pré-seleção **não** cria tabela: reutiliza
+  `strategy_experiments` gravando o TIPO versionado dentro de
+  `candidate_config` (envelope `experiment_type`/`experiment_type_version`).
 - Retenção, índices e histórico existentes não foram alterados.
 
 ## 3. Configurações NOVAS (todas com default inativo)
@@ -128,3 +139,42 @@ Mudanças de comportamento com os defaults atuais (todas do caminho P03, que é
 Rollback: desligar os seletores restaura o legado dos blocos B–H; o caminho P03
 não tem flag — reverter exigiria reverter os commits e reconciliar as intenções
 abertas, com decisão humana explícita.
+
+## 9. Correção integrada (25/09/2026) — o que muda numa publicação
+
+### Segurança ATIVA por default × pesquisa INATIVA por default
+
+- **Ativo sempre** (não tem seletor): P03 (intenção/reconciliação) e o gate
+  financeiro R05B quando o cutover já estiver ligado. São correções de
+  segurança: só podem ADIAR ou RECUSAR uma entrada, nunca criar uma.
+- **Inativo por default** (só liga por variável de ambiente): R05D, R07/R08,
+  R09, R10 e R11/R12. Nenhum deles decide entrada com o default atual; o
+  entrypoint de pesquisa é local e declara `LIVE_ADAPTER_NOT_IMPLEMENTED`.
+- Nenhuma variável de ambiente NOVA nesta correção.
+
+### Impactos esperados de P03 (segurança, já ativa)
+
+1. Intenção com desfecho PROVADO agora ENCERRA no mesmo ciclo: o incidente não
+   reabre pela mesma prova e o slot/risco voltam — antes a intenção ficava
+   `UNKNOWN` para sempre, segurando capacidade e quarentena.
+2. Fill comprovado e protegido vincula o RealTrade (`CONFIRMED`) e a reserva
+   vira exposição. Sem prova de QUALQUER id despachado (inclusive a filha
+   `-mfb`), nada encerra — continua bloqueando, como antes.
+
+### Impactos esperados de R05 (limite diário)
+
+1. O pior cenário do dia passa a incluir as reservas de OUTRAS intenções
+   pendentes. Com o cutover ligado, entradas que antes passavam por pouco podem
+   ser recusadas com `FINANCIAL_WORST_CASE_LIMIT` — o caso de referência é
+   P&L −92, reserva alheia 6 e proposta 3 contra limite 100: −95 passava, −101
+   bloqueia.
+2. Reserva ilegível, conta não identificada ou banco indisponível ⇒
+   `RESERVATIONS_UNAVAILABLE`/`DAILY_BUDGET_UNKNOWN` e a entrada é bloqueada.
+   Desconhecido não vira zero.
+3. Duas decisões concorrentes não consomem mais a mesma margem: a admissão e o
+   orçamento são decididos sob a MESMA lock transacional.
+4. O risco FINAL (preço/qty revalidados antes do POST) é readmitido; se ele não
+   couber, a entrada é recusada mesmo com a reserva menor já concedida.
+
+Nada disso aumenta limite, alavancagem ou exposição, e nenhuma trava foi
+afrouxada para o teste passar.

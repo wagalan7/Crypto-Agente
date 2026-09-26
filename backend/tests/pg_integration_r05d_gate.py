@@ -77,8 +77,12 @@ async def run():
                                         EntryIntent.__table__])
 
     now = datetime.now(timezone.utc)
-    opened = now - timedelta(hours=3)
-    closed_at = now - timedelta(hours=2)
+    # A janela do P&L diário é CALENDÁRIO: ancorar o fechamento dentro da janela
+    # vigente deixa o ensaio independente da hora em que ele roda (perto da
+    # meia-noite UTC, `now - 2h` cairia no dia anterior e o total sumiria).
+    closed_at = max(frs.kill_daily_start(now) + timedelta(minutes=2),
+                    now - timedelta(hours=2))
+    opened = closed_at - timedelta(minutes=1)
 
     def ms(moment):
         return str(int(moment.timestamp() * 1000))

@@ -137,6 +137,39 @@ class OrquestracaoReal(unittest.TestCase):
         self.assertIn(gate["verdict"], ("NO_GO", "GO_CANDIDATE"))
         self.assertTrue(gate["criteria_hash"])
 
+    def test_capital_liquida_no_instante_da_saida(self):
+        """O relatório mostra o capital de ENTRADA e o da SAÍDA de cada trade."""
+        linha = self.report["replay"]["capital_timeline"]
+        self.assertTrue(linha, "nenhum trade admitido para inspecionar")
+        for trade in linha:
+            self.assertIsNotNone(trade["capital_at_entry_usd"], str(trade))
+            self.assertLessEqual(trade["effective_ts_ms"], trade["exit_ts_ms"], str(trade))
+        # Nenhuma entrada foi dimensionada com capital de trade que saiu DEPOIS.
+        for trade in linha:
+            posteriores = [outro for outro in linha
+                           if outro["exit_ts_ms"] > trade["effective_ts_ms"]
+                           and outro["opportunity_id"] != trade["opportunity_id"]]
+            for outro in posteriores:
+                self.assertNotEqual(trade["capital_at_entry_usd"],
+                                    outro["capital_after_usd"],
+                                    f"{trade['opportunity_id']} usou saída futura de "
+                                    f"{outro['opportunity_id']}")
+
+    def test_selecao_governa_a_politica_no_walk_forward(self):
+        wf_report = self.report["walk_forward"]
+        self.assertTrue(wf_report["selection_governs_evaluation"])
+        self.assertLessEqual(wf_report["folds_running_candidate"],
+                             wf_report["folds_executed"])
+
+    def test_simulacao_r11_declara_o_que_fez(self):
+        """Sem banco declarado a etapa diz que foi PULADA — não finge rodar."""
+        simulacao = self.report["policy_simulation"]
+        self.assertEqual(simulacao["state"], "SKIPPED")
+        self.assertEqual(simulacao["reason_code"], "PERSISTENCE_NOT_REQUESTED")
+        self.assertFalse(simulacao["persisted"])
+        self.assertEqual(simulacao["identity"]["population"], "SHADOW")
+        self.assertTrue(simulacao["evidence_key"])
+
     def test_adaptador_operacional_declara_o_que_falta(self):
         """Falta de código não é renomeada para pendência externa."""
         self.assertEqual(self.report["live_adapter"], "LIVE_ADAPTER_NOT_IMPLEMENTED")

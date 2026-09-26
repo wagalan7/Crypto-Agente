@@ -390,7 +390,41 @@ oportunidade com dedupe e populações separadas, e mérito com EV líquido
 descontado no tempo, estabilidade por janelas, incerteza e correção por número
 de candidatos.
 
-Pendência do bloco C: a progressão da histerese ainda não tem persistência
-transacional própria (o núcleo é puro e recebe/devolve o estado); isso entra na
-simulação do bloco G, junto do plano de rotação simulado. Nenhum serviço LIVE
-importa o módulo, e o seletor `R11_POLICY_VERSION` nasce em `legacy`.
+Pendência do bloco C — RESOLVIDA em 25/09/2026: a progressão da histerese tem
+persistência transacional própria (`policy_simulation_state`, lock `0x52313143`)
+e é CONSUMIDA pelo entrypoint de pesquisa, que carrega o estado, avança a
+histerese real com a evidência calculada na rodada, publica a geração e retoma
+em processo novo. O núcleo segue PURO (sem I/O); nenhum serviço LIVE importa o
+módulo, e o seletor `R11_POLICY_VERSION` continua nascendo em `legacy`.
+
+## Correção integrada (25/09/2026)
+
+Baseline `8a425831`. Seis blocos, cada um com o defeito reproduzido antes da
+correção e o aceite em PostgreSQL 16 DESCARTÁVEL (socket Unix, TCP/DNS
+bloqueados e contados), exchange/dispatcher FALSOS e zero produção:
+
+1. **P03 — ciclo único.** Intenção `UNKNOWN` com ordem REJECTED (qty 0) tinha o
+   incidente resolvido e REABERTO pela mesma prova (`open_now=1` para sempre).
+   Agora a prova de TODOS os `dispatch_ids`, de qualquer kind, encerra a
+   intenção no mesmo ciclo. 21 verificações.
+2. **R05 — reservas no limite diário.** P&L −92, reserva alheia 6 e proposta 3
+   contra limite 100 autorizavam −95; o correto é −101. A admissão e o
+   orçamento passaram a ser decididos sob a mesma lock. 31 verificações.
+3. **R09 — modelos reais do scanner.** `str(SignalDirection.LONG)` produzia
+   `signaldirection.long` e o coletor recebia `side=None`; a fixture com
+   `SimpleNamespace` mascarava. O teste PG agora roda o SCANNER real sobre
+   fonte de mercado sintética. 28 verificações.
+4. **R10/H — cronologia e comparação.** Capital só liquida no instante da saída
+   (repro 980,00, não 980,10); a seleção do treino governa a política avaliada
+   (seis dobras FALSE não elegem candidato); o pipeline executa um candidato de
+   verdade em vez de somar 0,05R ao baseline.
+5. **R11/R12 — estado consumido e populações isoladas.** O estado deixou de ser
+   chamado só por teste; falha de leitura não é mais confundida com primeiro
+   estado; o comparador pós-seleção recusa o tipo pré-seleção antes de ler
+   outcome. 35 verificações.
+6. **Fechamento.** H roda pelo entrypoint, inclusive em modo persistido, onde a
+   entrada do replay volta do banco pelo exportador R10B. 23 verificações.
+
+Skips honestos: `test_r05c_execution_accounting` pula 2 casos que dependem de
+fixture auditada privada, indisponível no repositório — nenhuma fixture foi
+fabricada para forçar o verde.

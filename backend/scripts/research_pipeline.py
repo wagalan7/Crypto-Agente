@@ -172,6 +172,7 @@ async def run(args) -> dict:
 
     # 4. Persistência + exportação (só com banco declarado pelo operador).
     report["persistence"] = {"attempted": bool(args.persist), "state": "SKIPPED"}
+    exportadas = []
     if args.persist:
         try:
             import db
@@ -181,22 +182,32 @@ async def run(args) -> dict:
                 await db.init_db()
                 await obs.flush_pending()
                 report["persistence"]["state"] = "FLUSHED"
+                # O banco não é escrito e esquecido: as MESMAS linhas voltam
+                # pelo EXPORTADOR real e alimentam a entrada do replay.
+                exportadas, export_info = await exportar_observadas(eligible)
+                report["persistence"]["export"] = export_info
         except Exception as exc:  # noqa: BLE001
             report["persistence"] = {"attempted": True, "state": "ERROR", "error": str(exc)}
 
     # 5. Replay de carteira com o candidato do núcleo (motor R10A).
+    # Em modo persistido a entrada vem do EXPORT (banco), não da memória.
+    entrada = exportadas or [
+        {"opportunity_key": decision["opportunity_key"], "symbol": decision["symbol"],
+         "side": decision["side"], "decision_ts_ms": decision["decision_ts_ms"],
+         **decision["levels"]} for decision in eligible]
+    report["replay_input"] = {"source": "R10B_EXPORT" if exportadas else "IN_MEMORY_DECISIONS",
+                              "rows": len(entrada)}
     candidates, bars_by_id, quotes = [], {}, {}
-    for decision in eligible:
-        levels = decision["levels"]
-        key = decision["opportunity_key"]
-        decision_ms = decision["decision_ts_ms"]
+    for linha in entrada:
+        key = linha["opportunity_key"]
+        decision_ms = linha["decision_ts_ms"]
         first = ((decision_ms + BAR5 - 1) // BAR5) * BAR5
-        candidates.append({"opportunity_id": key, "symbol": decision["symbol"],
-                           "direction": decision["side"], "decision_ts_ms": decision_ms,
-                           "entry": levels["entry"], "stop_loss": levels["stop_loss"],
-                           "tp1": levels["tp1"], "tp2": levels["tp2"], "atr": 1.0})
-        bars_by_id[key] = rising_bars(first, levels["entry"])
-        quotes[key] = {"bid": levels["entry"] - 0.01, "ask": levels["entry"] + 0.01,
+        candidates.append({"opportunity_id": key, "symbol": linha["symbol"],
+                           "direction": linha["side"], "decision_ts_ms": decision_ms,
+                           "entry": linha["entry"], "stop_loss": linha["stop_loss"],
+                           "tp1": linha["tp1"], "tp2": linha["tp2"], "atr": 1.0})
+        bars_by_id[key] = rising_bars(first, linha["entry"])
+        quotes[key] = {"bid": linha["entry"] - 0.01, "ask": linha["entry"] + 0.01,
                        "ts_ms": decision_ms, "source": "synthetic"}
     custos = r10a.CostConfig(fee_bps_per_side=4.0, slippage_bps_per_side=2.0,
                              funding_bps_per_bar=1.0)
@@ -210,8 +221,18 @@ async def run(args) -> dict:
     candidate_replay = pf.run_portfolio(candidates, bars_by_id=bars_by_id,
                                         quotes_by_id=quotes,
                                         replay_config=candidate_config, costs=custos)
+    # Linha do tempo do capital: prova de que o sizing usou o capital do
+    # INSTANTE da entrada e o resultado entrou no instante da saída.
+    linha_do_tempo = [{"opportunity_id": trade["opportunity_id"],
+                       "effective_ts_ms": trade["effective_ts_ms"],
+                       "exit_ts_ms": trade["exit_ts_ms"],
+                       "risk_usd": trade["risk_usd"],
+                       "capital_at_entry_usd": trade["capital_at_entry_usd"],
+                       "capital_after_usd": trade["capital_after_usd"]}
+                      for trade in replay["trades"] if trade["admitted"]]
     report["replay"] = {"admitted": replay["admitted"], "rejected": replay["rejected"],
                         "metrics": replay["metrics"],
+                        "capital_timeline": linha_do_tempo,
                         "fidelity_unavailable": replay["fidelity"]["unavailable"],
                         "live_equivalent": replay["live_equivalent"]}
     report["candidate_replay"] = {
@@ -249,6 +270,9 @@ async def run(args) -> dict:
                               "winner": study["verdict"]["winner"],
                               "reason_codes": list(study["verdict"]["reason_codes"]),
                               "folds_executed": study["folds_executed"],
+                              # A seleção do treino governa a política avaliada.
+                              "folds_running_candidate": study["folds_running_candidate"],
+                              "selection_governs_evaluation": study["selection_governs_evaluation"],
                               "promotable": study["verdict"]["promotable"]}
     # 7. Go/no-go alimentado pelos RESULTADOS calculados (nunca números soltos).
     from services import preselection_experiment_service as r12
@@ -280,6 +304,56 @@ async def run(args) -> dict:
     report["next_step"] = ("Acumular amostra prospectiva pelo coletor ligado antes de "
                            "qualquer go/no-go; o adaptador operacional continua por implementar.")
     return report
+
+
+async def exportar_observadas(eligible) -> tuple:
+    """Relê do BANCO, pelo exportador R10B real, as linhas pré-seleção aceitas.
+
+    Sem coleta ligada o export vem vazio — e isso é DECLARADO; a entrada do
+    replay então continua sendo a decisão em memória, nunca uma linha inventada.
+    """
+    import time
+    from db import get_session
+    from services import research_dataset_scopes as scopes
+    from services import research_dataset_service as ds
+    if not eligible:
+        return [], {"state": "NO_DECISIONS", "rows": 0}
+    # A coorte aceita é indexada pelo instante em que foi OBSERVADA (o acervo
+    # guarda a decisão, não o caminho do preço), então a janela acompanha o
+    # relógio da observação — não o t0 sintético da série.
+    agora = int(time.time() * 1000)
+    inicio = (agora // BAR5) * BAR5 - 400 * BAR5
+    as_of_ms = agora + BAR5
+    replay_cfg = {"bar_ms": BAR5, "entry_window_bars": 3, "pre_tp1_time_stop_bars": 12,
+                  "max_holding_bars": 24, "tp1_fraction": 0.45, "be_lock_fraction": 0.2,
+                  "trail_atr_multiple": 2.2, "trail_activation_atr": 0.5, "max_bars": 96}
+    pedido = {
+        "as_of_utc": ds.ms_datetime(as_of_ms).isoformat().replace("+00:00", "Z"),
+        "split": {"train_start_ms": inicio, "validation_start_ms": inicio + 200 * BAR5,
+                  "holdout_start_ms": agora + 400 * BAR5, "purge_bars": 1},
+        "baseline_config": dict(replay_cfg), "scope": scopes.SCOPE_PRE_ACCEPTED,
+        "candidate": {"candidate_id": "RESEARCH-PIPELINE", "registered_at_ms": inicio - BAR5,
+                      "kind": "MANAGEMENT_ONLY", "replay_config": dict(replay_cfg)},
+        "costs": {"fee_bps_per_side": 4.0, "slippage_bps_per_side": 2.0,
+                  "funding_bps_per_bar": 1.0},
+        "bootstrap": {"seed": 5, "samples": 100, "block_size": 1}}
+    try:
+        async with get_session() as session:
+            dataset, manifest = await ds.load_dataset(session, ds.parse_request(pedido))
+    except Exception as exc:  # noqa: BLE001
+        return [], {"state": "ERROR", "rows": 0, "error": type(exc).__name__}
+    linhas = []
+    for row in dataset.get("rows") or ():
+        if any(row.get(campo) is None for campo in
+               ("symbol", "side", "entry", "stop_loss", "tp1", "tp2", "decision_ts_ms")):
+            continue      # linha incompleta não vira candidato
+        linhas.append({"opportunity_key": row["opportunity_key"], "symbol": row["symbol"],
+                       "side": row["side"], "decision_ts_ms": row["decision_ts_ms"],
+                       "entry": row["entry"], "stop_loss": row["stop_loss"],
+                       "tp1": row["tp1"], "tp2": row["tp2"]})
+    return linhas, {"state": manifest["state"], "rows": len(linhas),
+                    "scope": manifest["source"]["cohort"],
+                    "exporter_schema": dataset["exporter_schema"]}
 
 
 def evidence_key_of(*parts) -> str:

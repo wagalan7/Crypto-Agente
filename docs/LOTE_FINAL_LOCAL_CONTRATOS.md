@@ -147,6 +147,26 @@ O lote entregou bibliotecas e manifestos; este fechamento ligou os caminhos.
 | R12 gate | Evidência derivada do replay/estudo; aprovar no gate não libera LIVE |
 
 Entrypoint executável: `backend/scripts/research_pipeline.py` (dados → núcleo →
-score V3 → observação → persistência → replay → walk-forward → go/no-go).
+score V3 → observação → persistência → EXPORT → replay → walk-forward →
+go/no-go → simulação R11).
 Estado do adaptador operacional: `LIVE_ADAPTER_NOT_IMPLEMENTED` — código por
 terminar, não pendência externa.
+
+## 7. Correção integrada (25/09/2026)
+
+Os caminhos existiam; este lote corrigiu o que eles realmente faziam.
+
+| Contrato | O que passou a valer |
+| --- | --- |
+| P03 ciclo | Intenção e incidente resolvem no MESMO ciclo: prova de TODOS os `dispatch_ids` (inclusive a filha `-mfb`) e de QUALQUER kind; FLAT ⇒ `TERMINAL`, PROTECTED ⇒ `CONFIRMED` com RealTrade de símbolo único; sem prova, nada resolve |
+| R05 pior cenário | `worst_case_daily_usd` EXIGE o contrato `reservations` (reservas de outras intenções pendentes, sem trade vinculado); ausência/erro ⇒ UNKNOWN, nunca zero |
+| R05 admissão | `DailyBudget` (base + limite) verificado DENTRO da transação/lock da reserva; `admit_final_risk` readmite o risco FINAL antes do POST e atualiza o valor reservado |
+| R05 identidade | A própria proposta sai da soma por `intent_key`; conta diferente e intenção já virada trade não consomem este orçamento |
+| R09 transporte | Lado vem do VALOR do enum (`SignalDirection.LONG` → `long`) e ATR do modelo `Indicator`; níveis só finitos |
+| R10 cronologia | Resultado fica A LIQUIDAR e entra no capital no instante da saída; cada trade declara `capital_at_entry_usd` e `capital_after_usd`; desconhecido mantém o risco reservado |
+| R10 seleção | A escolha do treino governa a política avaliada: sem escolha, a dobra roda o fallback declarado (`BASELINE_FALLBACK`) e permanece na evidência com delta zero |
+| H candidato | O lado candidato é um SEGUNDO replay com configuração MANAGEMENT_ONLY declarada — nunca baseline mais um bônus |
+| H persistência | Em modo persistido a entrada do replay volta do banco pelo exportador R10B (`replay_input.source = R10B_EXPORT`) |
+| R11 estado | `read_state` distingue AUSÊNCIA (`found=False`) de FALHA (`available=False`); o entrypoint carrega, avança a histerese real, publica a geração e retoma após restart |
+| R11 identidade | Experimento = política candidata; universo = conjunto de símbolos; relógio = instante da evidência (nunca o relógio de parede) |
+| R12 despacho | `experiment_type_guard` aplicado em comparador, avaliação offline (antes de abrir o dataset), anotação, criação e `start_shadow`; PRE_SELECTION nunca entra no ciclo pós-seleção |
