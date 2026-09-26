@@ -2540,6 +2540,35 @@ def get_source_backoff_s() -> int:
 
 
 # ── R09 pré-seleção: candidato observado ANTES da seleção (default OFF) ─────
+def _enum_value(raw) -> Optional[str]:
+    """Valor REAL de um enum do scanner (`SignalDirection.LONG` → "long").
+
+    Enums mistos com `str` imprimem "SignalDirection.LONG" em `str()`; quem
+    consome o valor precisa do `.value`. Desconhecido continua desconhecido.
+    """
+    value = getattr(raw, "value", raw)
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _finite_num(raw) -> Optional[float]:
+    """Número finito ou None — ausência nunca vira zero, NaN/inf nunca passam."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) else None
+
+
+def _indicator_field(indicators, name: str):
+    """Campo do bloco de indicadores, que é `Indicator` (modelo) no scanner real
+    e dict em caminhos serializados. Ausente ⇒ None (nada é fabricado)."""
+    if isinstance(indicators, dict):
+        return indicators.get(name)
+    return getattr(indicators, name, None)
+
+
 def _preselection_candidate(sig, score, *, stages, accepted: bool) -> Optional[dict]:
     """Monta a linha de observação de UM candidato do scan.
 
@@ -2551,8 +2580,13 @@ def _preselection_candidate(sig, score, *, stages, accepted: bool) -> Optional[d
         freshness = getattr(sig, "data_freshness", None) or {}
         candle = freshness.get("candle") if isinstance(freshness, dict) else {}
         trigger = (candle or {}).get("close_time_ms")
-        direction = str(getattr(sig, "direction", "") or "").lower()
-        side = "long" if direction == "long" else ("short" if direction == "short" else None)
+        # `TradeSignal.direction` é `SignalDirection`, não string: `str(enum)`
+        # produziria "signaldirection.long" e o lado viraria None (candidato
+        # descartado por identidade). O VALOR do enum é o contrato.
+        side = _enum_value(getattr(sig, "direction", None))
+        side = side if side in ("long", "short") else None
+        # `TradeSignal.indicators` é `Indicator` (modelo), não dict. Exigir dict
+        # perderia o ATR real; nada é fabricado quando ele não existe.
         setup = {
             "symbol": str(getattr(sig, "symbol", "") or ""),
             "timeframe": str(getattr(sig, "timeframe", "") or ""),
@@ -2560,12 +2594,11 @@ def _preselection_candidate(sig, score, *, stages, accepted: bool) -> Optional[d
             "playbook": "CHAMPION_LEGACY",
             "playbook_version": "SCORE_V2",
             "trigger_candle_ms": int(trigger) if isinstance(trigger, (int, float)) else None,
-            "entry": getattr(sig, "entry", None),
-            "stop_loss": getattr(sig, "stop_loss", None),
-            "tp1": getattr(sig, "tp1", None),
-            "tp2": getattr(sig, "tp2", None),
-            "atr": (getattr(sig, "indicators", None) or {}).get("atr")
-            if isinstance(getattr(sig, "indicators", None), dict) else None,
+            "entry": _finite_num(getattr(sig, "entry", None)),
+            "stop_loss": _finite_num(getattr(sig, "stop_loss", None)),
+            "tp1": _finite_num(getattr(sig, "tp1", None)),
+            "tp2": _finite_num(getattr(sig, "tp2", None)),
+            "atr": _finite_num(_indicator_field(getattr(sig, "indicators", None), "atr")),
         }
         return {
             "setup": setup, "stages": stages, "accepted": accepted,

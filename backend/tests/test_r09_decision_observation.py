@@ -455,5 +455,84 @@ class RejectedReplayMapTests(unittest.TestCase):
         self.assertIsNone(outcome["status"])
 
 
+class AdaptadorDoScanner(unittest.TestCase):
+    """O adaptador consome os MODELOS REAIS do scanner (enums e `Indicator`).
+
+    Fixtures passam pela validação normal do pydantic — `model_construct` não
+    entra aqui: ele deixaria passar um contrato que o scanner nunca produz.
+    """
+
+    @staticmethod
+    def sinal(**kw):
+        from models.trade_signal import (Indicator, SignalDirection, TradeSignal,
+                                         TradeType)
+        campos = {"symbol": "BTC/USDT:USDT", "timeframe": "15m",
+                  "direction": SignalDirection.LONG, "trade_type": TradeType.DAY_TRADE,
+                  "confidence": 0.7, "entry": 100.0, "stop_loss": 95.0, "tp1": 105.0,
+                  "tp2": 110.0, "tp3": 115.0, "risk_reward": 2.0, "patterns": [],
+                  "indicators": Indicator(atr=2.0, rsi=55.0), "timestamp": TS,
+                  "signal_strength": "strong"}
+        campos.update(kw)
+        sinal = TradeSignal(**campos)
+        sinal.data_freshness = {"candle": {"close_time_ms": TS}}
+        return sinal
+
+    def linha(self, **kw):
+        from services import recommendation_service as rs
+        return rs._preselection_candidate(self.sinal(**kw), 71.5,
+                                          stages=[rs._stage("CANDIDATE", "PASSED")],
+                                          accepted=True)
+
+    def test_enum_real_vira_lado_real(self):
+        from models.trade_signal import SignalDirection
+        # `str(SignalDirection.LONG)` é "SignalDirection.LONG": quem consome
+        # precisa do VALOR do enum, senão o lado vira None e o candidato some.
+        self.assertEqual(str(SignalDirection.LONG), "SignalDirection.LONG")
+        self.assertEqual(self.linha()["setup"]["side"], "long")
+        self.assertEqual(
+            self.linha(direction=SignalDirection.SHORT, stop_loss=105.0, tp1=95.0,
+                       tp2=90.0, tp3=85.0)["setup"]["side"], "short")
+
+    def test_neutro_e_desconhecido_continuam_sem_lado(self):
+        from models.trade_signal import SignalDirection
+        self.assertIsNone(self.linha(direction=SignalDirection.NEUTRAL)["setup"]["side"])
+
+    def test_atr_vem_do_modelo_indicator(self):
+        from models.trade_signal import Indicator
+        self.assertEqual(self.linha()["setup"]["atr"], 2.0)
+        # Ausente continua ausente — nada de ATR fabricado.
+        self.assertIsNone(self.linha(indicators=Indicator(rsi=55.0))["setup"]["atr"])
+
+    def test_indicadores_em_dict_continuam_funcionando(self):
+        from services import recommendation_service as rs
+        self.assertEqual(rs._indicator_field({"atr": 3.5}, "atr"), 3.5)
+        self.assertIsNone(rs._indicator_field(None, "atr"))
+
+    def test_numero_nao_finito_nao_passa(self):
+        from services import recommendation_service as rs
+        for ruim in (float("nan"), float("inf"), "2.0", True, None):
+            self.assertIsNone(rs._finite_num(ruim), repr(ruim))
+
+    def test_identidade_e_niveis_preservados(self):
+        linha = self.linha()
+        setup = linha["setup"]
+        self.assertEqual((setup["symbol"], setup["timeframe"]), ("BTC/USDT:USDT", "15m"))
+        self.assertEqual(setup["trigger_candle_ms"], TS)
+        self.assertEqual((setup["entry"], setup["stop_loss"], setup["tp1"], setup["tp2"]),
+                         (100.0, 95.0, 105.0, 110.0))
+        self.assertEqual(linha["source"]["decision_source"], "server_scan")
+
+    def test_coletor_aceita_a_linha_do_modelo_real(self):
+        from services import preselection_observation_service as pre
+        obs._pending.clear()
+        with patch.object(pre, "collection_enabled", return_value=True):
+            resumo = obs.observe_preselection([self.linha()])
+        try:
+            self.assertEqual((resumo["accepted"], resumo["skipped"]), (1, 0), resumo)
+            self.assertEqual(len(obs._pending), 1)
+        finally:
+            obs._pending.clear()
+
+
 if __name__ == "__main__":
     unittest.main()
