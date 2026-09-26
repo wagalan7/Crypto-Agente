@@ -1290,6 +1290,28 @@ def _material_segment_regressions(
     return bad
 
 
+#: Tipo que ESTE comparador sabe avaliar: a coorte pós-seleção (recomendações
+#: que já passaram pela seleção). A coorte pré-seleção é outra população e tem
+#: caminho próprio (observações R09 + export R10B + runner walk-forward).
+POST_SELECTION_COMPARATOR_TYPE = "POST_SELECTION_KNOB"
+
+
+def experiment_type_guard(candidate_cfg: Any,
+                          *, expected_type: str = POST_SELECTION_COMPARATOR_TYPE) -> Dict[str, Any]:
+    """Despacha pelo TIPO versionado antes de qualquer leitura de outcome.
+
+    Aceitar as mesmas chaves não torna os contratos intercambiáveis: um
+    candidato pré-seleção avaliado aqui compararia populações diferentes.
+    """
+    try:
+        from services import preselection_experiment_service as r12
+        return r12.comparator_guard(expected_type=expected_type,
+                                    candidate_config=candidate_cfg)
+    except ImportError:   # contrato do tipo indisponível ⇒ não presume compatível
+        return {"ok": False, "reason_code": "EXPERIMENT_TYPE_UNAVAILABLE",
+                "expected": expected_type, "found": None, "interchangeable": False}
+
+
 def compare_configs(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
                     candidate_cfg: Dict[str, Any], active: Sequence[str]) -> Dict[str, Any]:
     """Compara champion × candidato sobre o MESMO dataset.
@@ -1297,7 +1319,23 @@ def compare_configs(rows: Sequence[Dict[str, Any]], champion: Dict[str, Any],
     Linhas com dado ausente para algum componente ativo são excluídas dos DOIS
     lados (comparação simétrica), e o subconjunto selecionado por cada lado fica
     EXPLÍCITO — correlação aqui não é causalidade.
+
+    Tipo divergente é RECUSADO antes de ler qualquer outcome: comparar a coorte
+    pré-seleção aqui mediria populações diferentes com as mesmas chaves.
     """
+    guard = experiment_type_guard(candidate_cfg)
+    if not guard["ok"]:
+        return {"refused": True, "reason_code": guard["reason_code"],
+                "expected_type": guard["expected"], "found_type": guard["found"],
+                "evaluable": 0, "unknown_excluded": 0,
+                "champion": None, "candidate": None,
+                "added_ops": None, "avoided_ops": None,
+                "added_expectancy_r": None, "avoided_expectancy_r": None,
+                "delta_expectancy_ci": None, "material_segment_regressions": None,
+                "selects_subset": None,
+                "note": "comparador pós-seleção recusa outro tipo de experimento"}
+    # O envelope é METADADO: não entra na configuração comparada.
+    _, candidate_cfg = split_candidate_envelope(candidate_cfg)
     merged = dict(champion)
     merged.update(candidate_cfg)
     evaluable = [r for r in rows if eligibility(r, champion, active) is not None
@@ -4217,6 +4255,14 @@ def evaluate_candidate_offline(rows: Sequence[Dict[str, Any]], champion: Dict[st
                                include_holdout: bool = True) -> Dict[str, Any]:
     """Roda UM candidato. Na seleção, `include_holdout=False` mantém o teste
     fisicamente fora do cálculo; só o finalista de cada objetivo o abre."""
+    # Tipo primeiro: recusa ANTES de abrir o dataset (nem split, nem outcome).
+    guard = experiment_type_guard(candidate.get("config"))
+    if not guard["ok"]:
+        return {"verdict": STATUS_REJECTED, "reason_code": guard["reason_code"],
+                "detail": (f"candidato do tipo {guard['found']} não é avaliável pelo "
+                           f"comparador {guard['expected']} — populações diferentes"),
+                "expected_type": guard["expected"], "found_type": guard["found"],
+                "coverage": {}, "outcomes_read": False}
     knob = candidate["knob"]
     split = temporal_split(rows)
     if not split.get("ok"):
@@ -4316,7 +4362,15 @@ async def _upsert_experiment(session, *, experiment_key: str, champion_hash: str
                              fingerprint: str, cutoff: datetime,
                              offline: Dict[str, Any]) -> Any:
     """Idempotente por `experiment_key`. Config/hash IMUTÁVEIS após o DRAFT —
-    processo concorrente não sobrescreve identidade."""
+    processo concorrente não sobrescreve identidade.
+
+    CRIAÇÃO também despacha por tipo: o ciclo oficial pós-seleção não abre linha
+    para candidato de outra população.
+    """
+    guard = experiment_type_guard(config)
+    if not guard["ok"]:
+        raise RuntimeError(f"{guard['reason_code']}: {guard['found']} não entra no "
+                           f"ciclo {guard['expected']}")
     from models.strategy_experiment import StrategyExperiment
     from sqlalchemy import select
     existing = (await session.execute(
@@ -5858,7 +5912,20 @@ def build_experiment_annotation(row: Dict[str, Any], champion: Dict[str, Any],
                                 candidate_cfg: Dict[str, Any], *, experiment_key: str,
                                 candidate_hash: str, active: Sequence[str],
                                 champion_hash: Optional[str] = None) -> Dict[str, Any]:
-    """Anotação contrafactual de UM snapshot. Não altera score/tier/execução."""
+    """Anotação contrafactual de UM snapshot. Não altera score/tier/execução.
+
+    Tipo divergente não é anotado: a linha pós-seleção não representa a coorte
+    pré-seleção nem serve de evidência para ela.
+    """
+    guard = experiment_type_guard(candidate_cfg)
+    if not guard["ok"]:
+        return {"experiment_key": experiment_key, "candidate_hash": candidate_hash,
+                "champion_hash": champion_hash or canonical_hash(champion),
+                "refused": True, "reason_code": guard["reason_code"],
+                "expected_type": guard["expected"], "found_type": guard["found"],
+                "challenger_status": CHALLENGER_UNKNOWN,
+                "schema_version": FEATURES_SCHEMA_VERSION}
+    _, candidate_cfg = split_candidate_envelope(candidate_cfg)
     merged = dict(champion)
     merged.update(candidate_cfg)
     champ_ok = eligibility(row, champion, active)
@@ -6128,6 +6195,16 @@ async def start_shadow(exp_id: int) -> Dict[str, Any]:
             )).scalar_one_or_none()
             if exp is None:
                 return {"ok": False, "error": "experimento não encontrado"}
+            # Tipo versionado: candidato pré-seleção NUNCA entra no SHADOW
+            # pós-seleção (nem por reaproveitar as mesmas chaves de config).
+            guard = experiment_type_guard(exp.candidate_config)
+            if not guard["ok"]:
+                return {"ok": False, "blocked": True,
+                        "reason_code": guard["reason_code"],
+                        "error": (f"experimento do tipo {guard['found']} tem caminho "
+                                  f"próprio de simulação pré-seleção — não entra no "
+                                  f"ciclo {guard['expected']}"),
+                        "status": exp.status}
             # P05.1 é ANALYTICS_ONLY: um resultado analítico nunca vira challenger.
             if is_contextual_experiment(exp):
                 return {"ok": False, "blocked": True,

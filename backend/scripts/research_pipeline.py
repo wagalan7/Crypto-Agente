@@ -38,6 +38,11 @@ BAR5 = 300_000
 #: Estado do adaptador operacional: existe contrato e simulação, NÃO existe
 #: rota de execução. Isto não é "pendência externa" — é código por fazer.
 LIVE_ADAPTER_STATUS = "LIVE_ADAPTER_NOT_IMPLEMENTED"
+#: Simulação R11: escopo de carteira (a política não é por símbolo aqui),
+#: período diário e quantos períodos com evidência nova a histerese exige.
+POLICY_SCOPE = "PORTFOLIO"
+PERIOD_SECONDS = 86_400
+REQUIRED_PERIODS = 2
 
 
 def synthetic_states(core, *, symbols: int, seed: int, t0: int):
@@ -264,9 +269,111 @@ async def run(args) -> dict:
                       "criteria_hash": gate["criteria_hash"][:12],
                       "evidence_from_computed_results":
                           evidencia["source"]["derived_from_computed_results"]}
+    # 8. R11 — estado da simulação CONSUMIDO: carrega, avança a histerese real
+    # com a evidência calculada acima e publica a geração. Sem banco declarado,
+    # a etapa diz que foi pulada (nunca finge que rodou).
+    report["policy_simulation"] = await simulate_policy_state(
+        args, study=study, replay=replay, candidate_replay=candidate_replay,
+        candidate_config_diff=report["candidate_replay"]["config_diff"],
+        gate=gate, candidates=candidates)
+
     report["next_step"] = ("Acumular amostra prospectiva pelo coletor ligado antes de "
                            "qualquer go/no-go; o adaptador operacional continua por implementar.")
     return report
+
+
+def evidence_key_of(*parts) -> str:
+    """Chave da EVIDÊNCIA: muda quando o resultado calculado muda, e só então."""
+    import hashlib
+    blob = json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+async def simulate_policy_state(args, *, study, replay, candidate_replay,
+                                candidate_config_diff, gate, candidates) -> dict:
+    """Executa a política/histerese REAL sobre a evidência recém-calculada.
+
+    A identidade é (experimento, versão da política, universo, população) e o
+    relógio é o INSTANTE DA EVIDÊNCIA — a última decisão da janela —, nunca o
+    relógio de parede: resultado futuro não entra em decisão passada. Estado
+    ilegível NÃO é primeiro estado: nesse caso nada avança.
+    """
+    from services import policy_state_service as ps
+    from services import robust_policy_service as rp
+
+    # UNIVERSO = quais símbolos existem. A semente muda a realização de mercado
+    # (a evidência), não o universo — senão cada rodada seria outro universo e a
+    # histerese nunca acumularia período.
+    universe_version = f"SYN-{args.symbols}"
+    # O experimento é a POLÍTICA candidata, não o instante da rodada: incluir o
+    # relógio na identidade criaria um experimento novo a cada execução e a
+    # histerese nunca retomaria.
+    experiment_key = f"research-{evidence_key_of(candidate_config_diff)[:12]}"
+    evidence_key = evidence_key_of(
+        study["verdict"]["state"], study["verdict"]["winner"],
+        study["policy_delta"]["value"], replay["metrics"]["net_total_r"],
+        candidate_replay["metrics"]["net_total_r"], gate["verdict"])
+    now_ms = max((item["decision_ts_ms"] for item in candidates), default=int(args.t0))
+    identidade = {"experiment_key": experiment_key, "universe_version": universe_version,
+                  "population": rp.POPULATION_SHADOW}
+    resumo = {"identity": {**identidade, "policy_version": rp.POLICY_VERSION},
+              "evidence_key": evidence_key,
+              "period_key": rp.period_key(now_ms, period_seconds=PERIOD_SECONDS),
+              "persisted": False}
+    if not args.persist:
+        return {**resumo, "state": "SKIPPED", "reason_code": "PERSISTENCE_NOT_REQUESTED"}
+    try:
+        import db
+        if not db.DB_ENABLED:
+            return {**resumo, "state": "SKIPPED", "reason_code": "DB_DISABLED"}
+        await db.init_db()
+        leitura = await ps.read_state(db.get_session, **identidade)
+        if not leitura["available"]:
+            # Falha de leitura NUNCA vira "primeiro estado": não avança nada.
+            return {**resumo, "state": "UNAVAILABLE", "reason_code": leitura["reason_code"]}
+        anterior = (leitura["state"] or {}).get("payload") or {}
+        guardado = anterior.get("hysteresis") if isinstance(anterior, dict) else None
+        progresso = None
+        if isinstance(guardado, dict) and guardado.get("symbol"):
+            progresso = rp.HysteresisProgress(
+                symbol=guardado.get("symbol"), action=guardado.get("action"),
+                periods=int(guardado.get("periods") or 0),
+                last_period=guardado.get("last_period"),
+                last_evidence=guardado.get("last_evidence"),
+                universe_source=guardado.get("universe_source"))
+        acao = ("PROMOTE_CANDIDATE" if study["verdict"]["winner"] == "CANDIDATE"
+                else "HOLD")
+        avancado, veredito = rp.advance_hysteresis(
+            progresso, symbol=POLICY_SCOPE, action=acao, now_ms=now_ms,
+            period_seconds=PERIOD_SECONDS, evidence_key=evidence_key,
+            required_periods=REQUIRED_PERIODS, universe_source=universe_version)
+        payload = {"hysteresis": {"symbol": avancado.symbol, "action": avancado.action,
+                                  "periods": avancado.periods,
+                                  "last_period": avancado.last_period,
+                                  "last_evidence": avancado.last_evidence,
+                                  "universe_source": avancado.universe_source},
+                   "ready": bool(veredito["ready"]),
+                   "gate_verdict": gate["verdict"],
+                   "study_winner": study["verdict"]["winner"]}
+        publicacao = await ps.publish_generation(
+            db.get_session, period_key=rp.period_key(now_ms, period_seconds=PERIOD_SECONDS),
+            evidence_key=evidence_key, now_ms=now_ms, payload=payload, **identidade)
+        return {**resumo,
+                "state": "EXECUTED",
+                "resumed_from_state": bool(progresso is not None),
+                "previous_generation": (leitura["state"] or {}).get("generation"),
+                "periods": veredito["periods"],
+                "hysteresis_reason_code": veredito["reason_code"],
+                "ready": bool(veredito["ready"]),
+                "required_periods": REQUIRED_PERIODS,
+                "published": bool(publicacao["published"]),
+                "generation": publicacao["generation"],
+                "publication_reason_code": publicacao["reason_code"],
+                "persisted": bool(publicacao["published"]),
+                "applies_live": False}
+    except Exception as exc:  # noqa: BLE001
+        return {**resumo, "state": "ERROR", "reason_code": type(exc).__name__,
+                "error": str(exc)[:200]}
 
 
 def main(argv=None) -> int:

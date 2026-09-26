@@ -25,9 +25,15 @@ def state_key(*, experiment_key: str, universe_version: str,
     return f"{experiment_key}|{POLICY_VERSION}|{universe_version}|{population}"
 
 
-async def load_state(session_factory, *, experiment_key: str, universe_version: str,
-                     population: str = POPULATION_SHADOW) -> Optional[Dict[str, Any]]:
-    """Estado publicado, como está no banco. Sem linha ⇒ None (nunca zero)."""
+async def read_state(session_factory, *, experiment_key: str, universe_version: str,
+                     population: str = POPULATION_SHADOW) -> Dict[str, Any]:
+    """Leitura EXPLÍCITA do estado publicado.
+
+    `available=False` é FALHA DE LEITURA — não é "primeiro estado". Confundir os
+    dois reiniciaria a histerese em silêncio a cada erro de banco. Ausência de
+    linha é `available=True, found=False` (nunca zero implícito). A identidade
+    gravada é conferida: linha de outra política/universo/população não vale.
+    """
     from sqlalchemy import select
     from models.policy_simulation_state import PolicySimulationState
     key = state_key(experiment_key=experiment_key, universe_version=universe_version,
@@ -37,16 +43,35 @@ async def load_state(session_factory, *, experiment_key: str, universe_version: 
             row = (await session.execute(
                 select(PolicySimulationState)
                 .where(PolicySimulationState.state_key == key))).scalar_one_or_none()
-            if row is None:
-                return None
-            return {"state_key": row.state_key, "generation": int(row.generation or 0),
-                    "evidence_key": row.evidence_key, "period_key": row.period_key,
-                    "published_at_ms": row.published_at_ms, "payload": row.payload,
-                    "policy_version": row.policy_version,
-                    "universe_version": row.universe_version,
-                    "population": row.population}
-    except Exception:
-        return None
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "found": None, "state": None,
+                "reason_code": "STATE_READ_ERROR", "error": type(exc).__name__}
+    if row is None:
+        return {"available": True, "found": False, "state": None,
+                "reason_code": "NO_STATE"}
+    if (row.policy_version != POLICY_VERSION or row.universe_version != universe_version
+            or row.population != population):
+        return {"available": True, "found": False, "state": None,
+                "reason_code": "STATE_IDENTITY_MISMATCH"}
+    return {"available": True, "found": True, "reason_code": "STATE_LOADED",
+            "state": {"state_key": row.state_key, "generation": int(row.generation or 0),
+                      "evidence_key": row.evidence_key, "period_key": row.period_key,
+                      "published_at_ms": row.published_at_ms, "payload": row.payload,
+                      "policy_version": row.policy_version,
+                      "universe_version": row.universe_version,
+                      "population": row.population}}
+
+
+async def load_state(session_factory, *, experiment_key: str, universe_version: str,
+                     population: str = POPULATION_SHADOW) -> Optional[Dict[str, Any]]:
+    """Estado publicado, como está no banco. Sem linha ⇒ None (nunca zero).
+
+    Conveniência de leitura: quem precisa DISTINGUIR ausência de falha usa
+    `read_state` — aqui as duas devolvem None de propósito.
+    """
+    verdict = await read_state(session_factory, experiment_key=experiment_key,
+                              universe_version=universe_version, population=population)
+    return verdict.get("state")
 
 
 async def publish_generation(session_factory, *, experiment_key: str,
