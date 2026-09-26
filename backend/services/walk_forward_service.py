@@ -180,7 +180,9 @@ def fold_discipline(record: Mapping[str, Any]) -> Dict[str, Any]:
         if fitted_on != "train":
             problems.append(FIT_OUTSIDE_TRAIN)
             break
-    if record.get("candidate_selected_on") not in ("validation", None):
+    # Escolher no TREINO é ainda mais restritivo que escolher na validação —
+    # o que não pode, em hipótese alguma, é escolher olhando o teste.
+    if record.get("candidate_selected_on") not in ("train", "validation", None):
         problems.append(TEST_LEAKAGE)
     if record.get("test_used_for_selection") is True:
         problems.append(TEST_LEAKAGE)
@@ -346,6 +348,10 @@ def slice_metrics(rows: Sequence[Mapping[str, Any]], *, by: str) -> Dict[str, An
 
 # ── Runner: EXECUTAR cada dobra, não apenas descrever janelas ───────────────
 POLICY_DELTA_UNKNOWN = "POLICY_DELTA_UNKNOWN"
+#: Política efetivamente executada na dobra. Sem escolha do candidato no
+#: treino, o contrato manda rodar o FALLBACK declarado — nunca o candidato.
+POLICY_CANDIDATE = "CANDIDATE"
+POLICY_BASELINE_FALLBACK = "BASELINE_FALLBACK"
 STUDIES_NOT_EXECUTED = "STUDIES_NOT_EXECUTED"
 DELTA_DISAGREES_WITH_CI = "DELTA_DISAGREES_WITH_CI"
 
@@ -430,14 +436,24 @@ def run_walk_forward(*, baseline: Sequence[Mapping[str, Any]],
         train_pair = pair_opportunities(train_base, train_cand)
         train_delta = policy_delta_r(train_pair)
         selected = bool(train_delta["available"] and train_delta["value"] > 0)
-        # Avaliação FORA DA AMOSTRA.
-        test_pair = pair_opportunities(test_base, test_cand)
+        # A SELEÇÃO GOVERNA A POLÍTICA AVALIADA: dobra sem escolha do candidato
+        # roda o FALLBACK declarado (baseline), não o candidato. Rotular a
+        # seleção e avaliar o candidato assim mesmo mede uma política que o
+        # treino nunca escolheu — e a dobra continua na evidência (delta zero),
+        # porque descartá-la inflaria o resultado.
+        evaluated = test_cand if selected else test_base
+        policy = POLICY_CANDIDATE if selected else POLICY_BASELINE_FALLBACK
+        # Avaliação FORA DA AMOSTRA, da política efetivamente executada.
+        test_pair = pair_opportunities(test_base, evaluated)
         test_delta = policy_delta_r(test_pair)
         executed.append({
             "fold": fold.index, "reason_code": OK,
             "train_n": len(train_base) + len(train_cand),
             "test_n": len(test_base) + len(test_cand),
             "candidate_selected_on_train": selected,
+            "evaluated_policy": policy,
+            "fallback_contract": POLICY_BASELINE_FALLBACK,
+            "candidate_test_n": len(test_cand),
             "train_delta_net_r": train_delta["value"],
             "delta_net_r": test_delta["value"],
             "delta_reason_code": test_delta["reason_code"],
@@ -446,7 +462,7 @@ def run_walk_forward(*, baseline: Sequence[Mapping[str, Any]],
         if test_delta["available"] and (len(test_base) + len(test_cand)) > 0:
             test_deltas.append(test_delta["value"])
         all_base.extend(test_base)
-        all_cand.extend(test_cand)
+        all_cand.extend(evaluated)
 
     folds_executed = sum(1 for item in executed if item["reason_code"] == OK
                          and item["test_n"] > 0)
@@ -457,7 +473,7 @@ def run_walk_forward(*, baseline: Sequence[Mapping[str, Any]],
     ci = block_bootstrap_ci(test_deltas, seed=seed, samples=samples,
                             block_size=block_size, alpha=alpha, comparisons=comparisons)
     discipline = fold_discipline({stage: "train" for stage in FITTED_STAGES}
-                                 | {"candidate_selected_on": "validation"})
+                                 | {"candidate_selected_on": "train"})
     guard = coverage if isinstance(coverage, Mapping) else coverage_guard(
         {"considered": len(all_base), "resolved": len(all_base)},
         {"considered": len(all_cand), "resolved": len(all_cand)})
@@ -465,9 +481,13 @@ def run_walk_forward(*, baseline: Sequence[Mapping[str, Any]],
                      costs_complete=costs_complete, horizon_sufficient=horizon_sufficient,
                      paired=paired, ci=ci, policy_delta=delta,
                      studies_executed=folds_executed > 0)
+    selected_folds = sum(1 for item in executed
+                         if item.get("evaluated_policy") == POLICY_CANDIDATE)
     return {"wf_version": WF_VERSION, "folds_executed": folds_executed,
             "folds": executed, "policy_delta": delta, "ci": ci,
             "paired": paired, "verdict": result,
+            "folds_running_candidate": selected_folds,
+            "selection_governs_evaluation": True,
             "live_equivalent": False, "promotable": False}
 
 

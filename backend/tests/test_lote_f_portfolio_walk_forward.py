@@ -177,24 +177,24 @@ class CarteiraCompartilhada(unittest.TestCase):
     def test_slots_simultaneidade_e_simbolo(self):
         estado = pf.PortfolioState(config=pf.PortfolioConfig(max_concurrent=2,
                                                              max_per_symbol=1))
-        primeiro = estado.admit(symbol="SYN", side="long", decision_ts_ms=T0,
+        primeiro = estado.admit(key="p1", symbol="SYN", side="long", decision_ts_ms=T0,
                                 exposure_usd=100.0, exit_ts_ms=T0 + 10 * BAR)
         self.assertTrue(primeiro["admitted"])
-        mesmo = estado.admit(symbol="SYN", side="long", decision_ts_ms=T0 + BAR,
+        mesmo = estado.admit(key="p2", symbol="SYN", side="long", decision_ts_ms=T0 + BAR,
                              exposure_usd=100.0, exit_ts_ms=T0 + 10 * BAR)
         self.assertEqual(mesmo["reason_code"], pf.SYMBOL_SLOT_TAKEN)
-        segundo = estado.admit(symbol="OUT", side="long", decision_ts_ms=T0 + BAR,
+        segundo = estado.admit(key="p3", symbol="OUT", side="long", decision_ts_ms=T0 + BAR,
                                exposure_usd=100.0, exit_ts_ms=T0 + 10 * BAR)
         self.assertTrue(segundo["admitted"])
-        terceiro = estado.admit(symbol="TER", side="long", decision_ts_ms=T0 + 2 * BAR,
+        terceiro = estado.admit(key="p4", symbol="TER", side="long", decision_ts_ms=T0 + 2 * BAR,
                                 exposure_usd=100.0, exit_ts_ms=T0 + 10 * BAR)
         self.assertEqual(terceiro["reason_code"], pf.NO_SLOT)
 
     def test_posicao_encerrada_libera_slot(self):
         estado = pf.PortfolioState(config=pf.PortfolioConfig(max_concurrent=1))
-        estado.admit(symbol="SYN", side="long", decision_ts_ms=T0, exposure_usd=100.0,
+        estado.admit(key="p1", symbol="SYN", side="long", decision_ts_ms=T0, exposure_usd=100.0,
                      exit_ts_ms=T0 + 2 * BAR)
-        depois = estado.admit(symbol="OUT", side="long", decision_ts_ms=T0 + 3 * BAR,
+        depois = estado.admit(key="p2", symbol="OUT", side="long", decision_ts_ms=T0 + 3 * BAR,
                               exposure_usd=100.0, exit_ts_ms=None)
         self.assertTrue(depois["admitted"])
 
@@ -202,11 +202,11 @@ class CarteiraCompartilhada(unittest.TestCase):
         estado = pf.PortfolioState(config=pf.PortfolioConfig(
             capital_usd=100.0, risk_per_trade_pct=60.0, reserve_usd=50.0,
             max_concurrent=5, max_exposure_usd=10_000.0))
-        self.assertEqual(estado.admit(symbol="SYN", side="long", decision_ts_ms=T0,
+        self.assertEqual(estado.admit(key="p1", symbol="SYN", side="long", decision_ts_ms=T0,
                                       exposure_usd=1.0, exit_ts_ms=None)["reason_code"],
                          pf.NO_CAPITAL)
         limitado = pf.PortfolioState(config=pf.PortfolioConfig(max_exposure_usd=50.0))
-        self.assertEqual(limitado.admit(symbol="SYN", side="long", decision_ts_ms=T0,
+        self.assertEqual(limitado.admit(key="p1", symbol="SYN", side="long", decision_ts_ms=T0,
                                         exposure_usd=100.0,
                                         exit_ts_ms=None)["reason_code"],
                          pf.EXPOSURE_LIMIT)

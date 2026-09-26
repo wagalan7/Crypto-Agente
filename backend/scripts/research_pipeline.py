@@ -193,24 +193,42 @@ async def run(args) -> dict:
         bars_by_id[key] = rising_bars(first, levels["entry"])
         quotes[key] = {"bid": levels["entry"] - 0.01, "ask": levels["entry"] + 0.01,
                        "ts_ms": decision_ms, "source": "synthetic"}
+    custos = r10a.CostConfig(fee_bps_per_side=4.0, slippage_bps_per_side=2.0,
+                             funding_bps_per_bar=1.0)
+    # Configuração BASELINE e a do CANDIDATO — MANAGEMENT_ONLY, declarada aqui e
+    # executada pelo MESMO motor sobre as MESMAS barras/cotações.
+    baseline_config = r10a.ReplayConfig()
+    candidate_config = r10a.ReplayConfig(tp1_fraction=0.60, trail_atr_multiple=1.6,
+                                         be_lock_fraction=0.30)
     replay = pf.run_portfolio(candidates, bars_by_id=bars_by_id, quotes_by_id=quotes,
-                              costs=r10a.CostConfig(fee_bps_per_side=4.0,
-                                                    slippage_bps_per_side=2.0,
-                                                    funding_bps_per_bar=1.0))
+                              replay_config=baseline_config, costs=custos)
+    candidate_replay = pf.run_portfolio(candidates, bars_by_id=bars_by_id,
+                                        quotes_by_id=quotes,
+                                        replay_config=candidate_config, costs=custos)
     report["replay"] = {"admitted": replay["admitted"], "rejected": replay["rejected"],
                         "metrics": replay["metrics"],
                         "fidelity_unavailable": replay["fidelity"]["unavailable"],
                         "live_equivalent": replay["live_equivalent"]}
+    report["candidate_replay"] = {
+        "kind": "MANAGEMENT_ONLY",
+        "admitted": candidate_replay["admitted"],
+        "metrics": candidate_replay["metrics"],
+        "config_diff": {campo: [getattr(baseline_config, campo), getattr(candidate_config, campo)]
+                        for campo in ("tp1_fraction", "trail_atr_multiple", "be_lock_fraction")
+                        if getattr(baseline_config, campo) != getattr(candidate_config, campo)},
+        "executed": True}
 
     # 6. Comparação da política inteira pelo runner de walk-forward.
     decision_at = {item["opportunity_id"]: item["decision_ts_ms"] for item in candidates}
     baseline = [{"opportunity_id": trade["opportunity_id"], "net_r": trade["net_r"],
                  "decision_ts_ms": decision_at.get(trade["opportunity_id"])}
                 for trade in replay["trades"] if trade["admitted"]]
-    candidate_side = [{"opportunity_id": item["opportunity_id"],
-                       "decision_ts_ms": item["decision_ts_ms"],
-                       "net_r": (item["net_r"] + 0.05) if item["net_r"] is not None else None}
-                      for item in baseline]
+    # O lado CANDIDATO vem do replay do candidato — resultado EXECUTADO, não
+    # baseline mais um bônus inventado. Delta positivo, negativo ou zero é o que
+    # o motor produzir; nada aqui garante vantagem ao candidato.
+    candidate_side = [{"opportunity_id": trade["opportunity_id"], "net_r": trade["net_r"],
+                       "decision_ts_ms": decision_at.get(trade["opportunity_id"])}
+                      for trade in candidate_replay["trades"] if trade["admitted"]]
     # As dobras cobrem o período em que as decisões realmente aconteceram.
     if baseline:
         janela_inicio = min(item["decision_ts_ms"] for item in baseline) - 40 * BAR5

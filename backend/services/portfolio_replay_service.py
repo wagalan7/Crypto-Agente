@@ -332,6 +332,10 @@ class PortfolioState:
     capital_usd: Optional[float] = None
     realized_pnl_usd: float = 0.0
     unknown_results: int = 0
+    #: Capital observado no instante da ENTRADA e no instante da SAÍDA de cada
+    #: trade — a prova de que o sizing não usou resultado que ainda não ocorreu.
+    capital_at_entry: Dict[str, float] = field(default_factory=dict)
+    capital_at_exit: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.capital_usd is None:
@@ -345,8 +349,24 @@ class PortfolioState:
         """Risco por trade sobre o capital CORRENTE, nunca o inicial."""
         return max(0.0, float(self.capital_usd)) * self.config.risk_per_trade_pct / 100.0
 
-    def settle(self, *, risk_usd: float, net_r: Optional[float]) -> None:
-        """Aplica o resultado realizado ao capital.
+    def schedule_settlement(self, *, key: str, risk_usd: float,
+                            net_r: Optional[float]) -> None:
+        """Guarda o resultado A LIQUIDAR da posição aberta `key`.
+
+        O resultado existe na simulação assim que a trajetória é calculada, mas
+        só pode tocar o capital no instante COMPROVADO da saída: aplicá-lo agora
+        financiaria a próxima entrada com dinheiro do futuro.
+        """
+        for position in self.open_positions:
+            if position["key"] == key:
+                position["settle_risk_usd"] = float(risk_usd)
+                position["net_r"] = _finite(net_r)
+                position["result_known"] = _finite(net_r) is not None
+                return
+
+    def settle(self, *, risk_usd: float, net_r: Optional[float],
+               key: Optional[str] = None) -> None:
+        """Aplica o resultado realizado ao capital, NO instante da saída.
 
         Resultado desconhecido NÃO libera capital presumido nem zera prejuízo:
         fica contado como desconhecido e o risco segue reservado.
@@ -354,25 +374,42 @@ class PortfolioState:
         value = _finite(net_r)
         if value is None:
             self.unknown_results += 1
+            if key is not None:
+                self.capital_at_exit[key] = float(self.capital_usd)
             return
         realized = value * float(risk_usd)
         self.realized_pnl_usd += realized
         self.capital_usd = float(self.capital_usd) + realized
+        if key is not None:
+            self.capital_at_exit[key] = float(self.capital_usd)
 
-    def release(self, now_ms: int) -> None:
-        """Fecha posições cujo horizonte já terminou ANTES de admitir a próxima."""
-        still_open = []
+    def release(self, now_ms: Optional[int]) -> None:
+        """Fecha — e LIQUIDA — posições cujo horizonte terminou até `now_ms`.
+
+        Ordem temporal determinística (saída, depois identidade): o capital de
+        uma nova decisão é o que existia no instante dela, nem um dólar do que
+        ainda vai acontecer. `now_ms=None` drena tudo (fim do replay).
+        """
+        fechando, ainda_abertas = [], []
         for position in self.open_positions:
-            if position["exit_ts_ms"] is not None and position["exit_ts_ms"] <= now_ms:
+            saida = position["exit_ts_ms"]
+            encerrada = saida is not None and (now_ms is None or saida <= now_ms)
+            (fechando if encerrada else ainda_abertas).append(position)
+        self.open_positions = ainda_abertas
+        for position in sorted(fechando, key=lambda p: (p["exit_ts_ms"], p["key"])):
+            self.exposure_usd -= position["exposure_usd"]
+            conhecido = bool(position.get("result_known"))
+            if conhecido:
+                # Resultado provado: o risco reservado volta e o P&L entra.
                 self.used_risk_usd -= position["risk_usd"]
-                self.exposure_usd -= position["exposure_usd"]
-            else:
-                still_open.append(position)
-        self.open_positions = still_open
+            self.settle(risk_usd=position.get("settle_risk_usd", position["risk_usd"]),
+                        net_r=position.get("net_r"), key=position["key"])
+            self.used_risk_usd = max(0.0, self.used_risk_usd)
+            self.exposure_usd = max(0.0, self.exposure_usd)
         self.used_risk_usd = max(0.0, self.used_risk_usd)
         self.exposure_usd = max(0.0, self.exposure_usd)
 
-    def admit(self, *, symbol: str, side: str, decision_ts_ms: int,
+    def admit(self, *, key: str, symbol: str, side: str, decision_ts_ms: int,
               exposure_usd: float, exit_ts_ms: Optional[int]) -> Dict[str, Any]:
         cfg = self.config
         self.release(decision_ts_ms)
@@ -386,12 +423,15 @@ class PortfolioState:
             return {"admitted": False, "reason_code": NO_CAPITAL}
         if self.exposure_usd + exposure_usd > cfg.max_exposure_usd + 1e-9:
             return {"admitted": False, "reason_code": EXPOSURE_LIMIT}
-        self.open_positions.append({"symbol": symbol, "side": side,
+        self.open_positions.append({"key": key, "symbol": symbol, "side": side,
                                     "risk_usd": risk, "exposure_usd": exposure_usd,
                                     "entry_ts_ms": decision_ts_ms,
-                                    "exit_ts_ms": exit_ts_ms})
+                                    "exit_ts_ms": exit_ts_ms,
+                                    "settle_risk_usd": risk, "net_r": None,
+                                    "result_known": False})
         self.used_risk_usd += risk
         self.exposure_usd += exposure_usd
+        self.capital_at_entry[key] = float(self.capital_usd)
         return {"admitted": True, "reason_code": OK, "risk_usd": risk}
 
 
@@ -532,6 +572,9 @@ def run_portfolio(candidates: Sequence[Mapping[str, Any]], *,
         if risk_price <= 0:
             reject(key, GEOMETRY_INVALID_AFTER_FILL)
             continue
+        # Estado CAUSAL antes de dimensionar: tudo que já saiu até este
+        # instante liquida agora; o que sai depois não financia esta entrada.
+        state.release(effective_ts)
         risk_budget = state.risk_budget_usd()
         fraction = _finite(entry_verdict.get("fill_fraction"))
         fraction = 1.0 if fraction is None else max(0.0, min(1.0, fraction))
@@ -546,8 +589,9 @@ def run_portfolio(candidates: Sequence[Mapping[str, Any]], *,
             reject(key, BARS_UNAVAILABLE)
             continue
         result = r10a.replay_opportunity(opportunity, window, replay_config, costs)
-        admission = state.admit(symbol=str(symbol), side=side, decision_ts_ms=effective_ts,
-                                exposure_usd=exposure, exit_ts_ms=result.get("exit_ts_ms"))
+        admission = state.admit(key=key, symbol=str(symbol), side=side,
+                                decision_ts_ms=effective_ts, exposure_usd=exposure,
+                                exit_ts_ms=result.get("exit_ts_ms"))
         if not admission["admitted"]:
             # Trade impossível pela carteira NÃO entra na soma.
             reject(key, admission["reason_code"])
@@ -558,7 +602,8 @@ def run_portfolio(candidates: Sequence[Mapping[str, Any]], *,
         else:
             net_values.append(net)
         risk_usd = admission["risk_usd"] * fraction
-        state.settle(risk_usd=risk_usd, net_r=net)
+        # Resultado fica A LIQUIDAR: entra no capital no instante da saída.
+        state.schedule_settlement(key=key, risk_usd=risk_usd, net_r=net)
         trades.append({"opportunity_id": key, "admitted": True, "reason_code": OK,
                        "status": result.get("status"), "net_r": net,
                        "gross_r": _finite(result.get("gross_r")),
@@ -571,7 +616,13 @@ def run_portfolio(candidates: Sequence[Mapping[str, Any]], *,
                        "effective_ts_ms": effective_ts,
                        "exit_ts_ms": result.get("exit_ts_ms"),
                        "risk_usd": risk_usd, "qty": qty, "exposure_usd": exposure,
-                       "capital_after_usd": state.capital_usd})
+                       "capital_at_entry_usd": state.capital_at_entry.get(key)})
+    # Fim do replay: o que ainda estava aberto liquida em ordem temporal.
+    state.release(None)
+    for row in trades:
+        if row.get("admitted"):
+            # Capital DEPOIS deste trade = capital no instante da SAÍDA dele.
+            row["capital_after_usd"] = state.capital_at_exit.get(row["opportunity_id"])
     costs_view = cost_status(costs)
     metrics = portfolio_metrics(net_values)
     metrics = {**metrics, "capital_start_usd": portfolio.capital_usd,

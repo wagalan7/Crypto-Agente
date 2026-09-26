@@ -207,6 +207,139 @@ class CapitalRecebeOResultado(unittest.TestCase):
         self.assertEqual(resultado["metrics"]["realized_pnl_usd"], 0.0)
 
 
+class CapitalSoLiquidaQuandoOResultadoOcorre(unittest.TestCase):
+    """4.1 — o resultado só toca o capital no instante COMPROVADO da saída.
+
+    Repro: capital 1000, risco 1%. `a` entra em T0-2 e perde 1R só em T0+600000;
+    `b` entra em T0-1, antes da perda existir. Liquidando cedo, `b` recebia
+    risco 9,90 e o final virava 980,10 — dinheiro do futuro financiando a
+    entrada anterior.
+    """
+
+    PERDE = [barra(T0, 100.0, 100.2, 99.9, 100.0),
+             barra(T0 + BAR, 100.0, 100.2, 99.9, 100.0),
+             barra(T0 + 2 * BAR, 100.0, 100.2, 98.0, 98.5)]
+    GANHA = [barra(T0, 100.0, 100.2, 99.9, 100.0),
+             barra(T0 + BAR, 100.0, 100.2, 99.9, 100.0),
+             barra(T0 + 2 * BAR, 100.0, 104.0, 99.9, 103.8),
+             barra(T0 + 3 * BAR, 103.8, 107.0, 103.5, 106.5)]
+
+    @staticmethod
+    def cand(key, symbol, decision_ms):
+        return candidato(key, stop=99.0, decision_ms=decision_ms, symbol=symbol)
+
+    def rodar(self, candidatos, barras, *, capital=1000.0, risco=1.0, custos=SEM_CUSTO):
+        cotacoes = {}
+        for item in candidatos:
+            cotacoes.update(quote(item["opportunity_id"], ts_ms=item["decision_ts_ms"]))
+        return pf.run_portfolio(
+            candidatos, bars_by_id=barras, quotes_by_id=cotacoes,
+            portfolio=pf.PortfolioConfig(capital_usd=capital, risk_per_trade_pct=risco,
+                                         max_concurrent=5, max_per_symbol=1,
+                                         max_exposure_usd=100_000.0),
+            replay_config=r10a.ReplayConfig(bar_ms=BAR), costs=custos)
+
+    def linhas(self, resultado):
+        return {row["opportunity_id"]: row for row in resultado["trades"]}
+
+    def test_sobreposta_nao_financia_a_entrada_anterior(self):
+        resultado = self.rodar([self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", T0 - 1)],
+                               {"a": self.PERDE, "b": self.PERDE})
+        linhas = self.linhas(resultado)
+        self.assertEqual(linhas["b"]["capital_at_entry_usd"], 1000.0)
+        self.assertEqual(linhas["b"]["risk_usd"], 10.0)      # não 9,90
+        self.assertEqual(resultado["metrics"]["capital_end_usd"], 980.0)
+
+    def test_ganho_futuro_tambem_nao_aumenta_a_proxima(self):
+        resultado = self.rodar([self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", T0 - 1)],
+                               {"a": self.GANHA, "b": self.PERDE})
+        linhas = self.linhas(resultado)
+        self.assertEqual(linhas["b"]["capital_at_entry_usd"], 1000.0)
+        self.assertEqual(linhas["b"]["risk_usd"], 10.0)
+
+    def test_sequenciais_usam_o_capital_ja_liquidado(self):
+        tarde = [barra(T0 + 3 * BAR, 100.0, 100.2, 99.9, 100.0),
+                 barra(T0 + 4 * BAR, 100.0, 100.2, 98.0, 98.5)]
+        resultado = self.rodar([self.cand("a", "AAA", T0 - 2),
+                                self.cand("b", "BBB", T0 + 3 * BAR - 1)],
+                               {"a": self.PERDE, "b": tarde})
+        linhas = self.linhas(resultado)
+        # `a` sai em T0+2BAR, antes da decisão de `b`: o capital dela já caiu.
+        self.assertEqual(linhas["a"]["capital_after_usd"], 990.0)
+        self.assertEqual(linhas["b"]["capital_at_entry_usd"], 990.0)
+        self.assertAlmostEqual(linhas["b"]["risk_usd"], 9.9, places=9)
+        self.assertAlmostEqual(resultado["metrics"]["capital_end_usd"], 980.1, places=9)
+
+    def test_saida_empatada_com_entrada_ja_liquidou(self):
+        # `b` decide EXATAMENTE no instante da saída de `a`: o resultado de `a`
+        # já ocorreu e vale; o de `b` ainda não.
+        saida_a = T0 + 2 * BAR
+        tarde = [barra(saida_a, 100.0, 100.2, 99.9, 100.0),
+                 barra(saida_a + BAR, 100.0, 100.2, 98.0, 98.5)]
+        resultado = self.rodar([self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", saida_a)],
+                               {"a": self.PERDE, "b": tarde})
+        linhas = self.linhas(resultado)
+        self.assertEqual(linhas["b"]["capital_at_entry_usd"], 990.0)
+        self.assertAlmostEqual(linhas["b"]["risk_usd"], 9.9, places=9)
+
+    def test_ordem_de_execucao_segue_o_instante_efetivo(self):
+        # Decisões em ordem inversa à da lista: a ordenação é temporal, não de
+        # inserção — o mesmo conjunto dá o mesmo resultado em qualquer ordem.
+        direta = self.rodar([self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", T0 - 1)],
+                            {"a": self.PERDE, "b": self.PERDE})
+        invertida = self.rodar([self.cand("b", "BBB", T0 - 1), self.cand("a", "AAA", T0 - 2)],
+                               {"a": self.PERDE, "b": self.PERDE})
+        self.assertEqual([row["opportunity_id"] for row in direta["trades"]],
+                         [row["opportunity_id"] for row in invertida["trades"]])
+        self.assertEqual(direta["metrics"]["capital_end_usd"],
+                         invertida["metrics"]["capital_end_usd"])
+
+    def test_barra_posterior_nao_muda_decisao_anterior(self):
+        outro_final = self.PERDE[:2] + [barra(T0 + 2 * BAR, 100.0, 109.0, 99.95, 108.0)]
+        base = self.rodar([self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", T0 - 1)],
+                          {"a": self.PERDE, "b": self.PERDE})
+        mudado = self.rodar([self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", T0 - 1)],
+                            {"a": outro_final, "b": self.PERDE})
+        for chave in ("risk_usd", "qty", "exposure_usd", "capital_at_entry_usd", "admitted"):
+            self.assertEqual(self.linhas(base)["b"][chave], self.linhas(mudado)["b"][chave], chave)
+
+    def test_resultado_desconhecido_nao_libera_capacidade(self):
+        incompleto = r10a.CostConfig(fee_bps_per_side=4.0)
+        resultado = self.rodar([self.cand("a", "AAA", T0 - 2)], {"a": self.PERDE},
+                               custos=incompleto)
+        linha = self.linhas(resultado)["a"]
+        self.assertIsNone(linha["net_r"])
+        self.assertEqual(resultado["metrics"]["unknown_results"], 1)
+        self.assertEqual(resultado["metrics"]["capital_end_usd"], 1000.0)
+        self.assertEqual(resultado["metrics"]["realized_pnl_usd"], 0.0)
+
+    def test_caixa_concilia(self):
+        resultado = self.rodar([self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", T0 - 1)],
+                               {"a": self.GANHA, "b": self.PERDE})
+        metricas = resultado["metrics"]
+        realizados = [row for row in resultado["trades"]
+                      if row["admitted"] and row["net_r"] is not None]
+        soma = sum(row["net_r"] * row["risk_usd"] for row in realizados)
+        self.assertAlmostEqual(metricas["realized_pnl_usd"], soma, places=9)
+        self.assertAlmostEqual(metricas["capital_end_usd"],
+                               metricas["capital_start_usd"] + metricas["realized_pnl_usd"],
+                               places=9)
+        # Cada trade declara o capital no instante da própria saída.
+        self.assertEqual([row["capital_after_usd"] is not None for row in realizados],
+                         [True] * len(realizados))
+
+    def test_custos_entram_uma_vez_so(self):
+        com_custo = r10a.CostConfig(fee_bps_per_side=4.0, slippage_bps_per_side=2.0,
+                                    funding_bps_per_bar=1.0)
+        resultado = self.rodar([self.cand("a", "AAA", T0 - 2)], {"a": self.PERDE},
+                               custos=com_custo)
+        linha = self.linhas(resultado)["a"]
+        bruto = linha["gross_r"] - (linha["fee_r"] + linha["slippage_r"] + linha["funding_r"])
+        self.assertAlmostEqual(linha["net_r"], bruto, places=9)
+        self.assertAlmostEqual(resultado["metrics"]["realized_pnl_usd"],
+                               linha["net_r"] * linha["risk_usd"], places=9)
+
+
 class SemRede(unittest.TestCase):
     def test_nenhuma_tentativa_de_rede(self):
         self.assertEqual(_NET, [])

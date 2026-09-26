@@ -113,6 +113,23 @@ class OrquestracaoReal(unittest.TestCase):
         if wf_report["winner"] is not None:
             self.assertEqual(wf_report["state"], "EVIDENCE_AVAILABLE")
 
+    def test_candidato_e_executado_e_nao_fabricado(self):
+        """O lado candidato sai do MOTOR, não de baseline mais um bônus."""
+        candidato = self.report["candidate_replay"]
+        self.assertTrue(candidato["executed"])
+        self.assertEqual(candidato["kind"], "MANAGEMENT_ONLY")
+        # A diferença entre as políticas é declarada em configuração.
+        self.assertTrue(candidato["config_diff"], str(candidato))
+        for campo, (antes, depois) in candidato["config_diff"].items():
+            self.assertNotEqual(antes, depois, campo)
+        base_total = self.report["replay"]["metrics"]["net_total_r"]
+        cand_total = candidato["metrics"]["net_total_r"]
+        if base_total is not None and cand_total is not None:
+            # Nada garante vantagem ao candidato: a diferença é o que o motor
+            # produziu, nunca um acréscimo constante por oportunidade.
+            admitidos = max(1, int(self.report["replay"]["admitted"]))
+            self.assertNotAlmostEqual(cand_total - base_total, 0.05 * admitidos, places=9)
+
     def test_gate_vem_do_resultado_e_nao_libera_live(self):
         gate = self.report["gate"]
         self.assertTrue(gate["evidence_from_computed_results"])

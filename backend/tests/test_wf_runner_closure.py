@@ -168,6 +168,93 @@ class RunnerExecutaAsDobras(unittest.TestCase):
         self.assertFalse(estudo["promotable"])
 
 
+class SelecaoGovernaAPoliticaAvaliada(unittest.TestCase):
+    """4.2 — a escolha do treino decide QUAL política é executada no teste.
+
+    Repro: seis dobras independentes (20 barras de treino, 5 de teste, passo
+    25), baseline 0R e candidato −1R por barra no treino e +1R no teste. As
+    seis seleções são FALSE; ainda assim o agregado declarava winner CANDIDATE
+    com delta +30R e IC [5,5] — porque `selected` era só um rótulo.
+    """
+
+    TREINO, TESTE, PASSO, DOBRAS = 20, 5, 25, 6
+
+    def serie(self, treino_r, teste_r):
+        base, cand = [], []
+        for dobra in range(self.DOBRAS):
+            inicio = dobra * self.PASSO
+            for i in range(self.TREINO):
+                base.append(linha(f"d{dobra}-tr{i}", 0.0, inicio + i))
+                cand.append(linha(f"d{dobra}-tr{i}", treino_r, inicio + i))
+            for i in range(self.TESTE):
+                pos = inicio + self.TREINO + i
+                base.append(linha(f"d{dobra}-te{i}", 0.0, pos))
+                cand.append(linha(f"d{dobra}-te{i}", teste_r, pos))
+        return base, cand
+
+    def folds(self):
+        return [wf.Fold(index=d,
+                        train_start_ms=T0 + d * self.PASSO * BAR,
+                        train_end_ms=T0 + (d * self.PASSO + self.TREINO) * BAR,
+                        test_start_ms=T0 + (d * self.PASSO + self.TREINO) * BAR,
+                        test_end_ms=T0 + (d + 1) * self.PASSO * BAR)
+                for d in range(self.DOBRAS)]
+
+    def estudo(self, treino_r, teste_r):
+        base, cand = self.serie(treino_r, teste_r)
+        return wf.run_walk_forward(baseline=base, candidate=cand, folds=self.folds(),
+                                   bar_ms=BAR, costs_complete=True,
+                                   horizon_sufficient=True, seed=3)
+
+    def test_treino_ruim_nao_vira_vencedor_pelo_teste_bom(self):
+        estudo = self.estudo(-1.0, +1.0)
+        executadas = [item for item in estudo["folds"] if item["reason_code"] == wf.OK]
+        self.assertEqual(len(executadas), self.DOBRAS)
+        self.assertEqual([item["candidate_selected_on_train"] for item in executadas],
+                         [False] * self.DOBRAS)
+        self.assertEqual([item["evaluated_policy"] for item in executadas],
+                         [wf.POLICY_BASELINE_FALLBACK] * self.DOBRAS)
+        self.assertEqual([item["delta_net_r"] for item in executadas], [0.0] * self.DOBRAS)
+        self.assertEqual(estudo["policy_delta"]["value"], 0.0)
+        self.assertEqual(estudo["folds_running_candidate"], 0)
+        self.assertIsNone(estudo["verdict"]["winner"])
+
+    def test_dobra_sem_selecao_nao_e_descartada(self):
+        estudo = self.estudo(-1.0, +1.0)
+        # As dobras continuam na evidência com delta ZERO — descartá-las
+        # deixaria só o que favorece o candidato.
+        self.assertEqual(estudo["folds_executed"], self.DOBRAS)
+        self.assertTrue(all(item["test_n"] > 0 for item in estudo["folds"]))
+
+    def test_treino_bom_executa_o_candidato(self):
+        estudo = self.estudo(+1.0, +1.0)
+        executadas = [item for item in estudo["folds"] if item["reason_code"] == wf.OK]
+        self.assertEqual([item["evaluated_policy"] for item in executadas],
+                         [wf.POLICY_CANDIDATE] * self.DOBRAS)
+        self.assertEqual(estudo["folds_running_candidate"], self.DOBRAS)
+        self.assertGreater(estudo["policy_delta"]["value"], 0.0)
+
+    def test_treino_bom_e_teste_ruim_mede_o_teste_ruim(self):
+        estudo = self.estudo(+1.0, -1.0)
+        executadas = [item for item in estudo["folds"] if item["reason_code"] == wf.OK]
+        self.assertEqual([item["evaluated_policy"] for item in executadas],
+                         [wf.POLICY_CANDIDATE] * self.DOBRAS)
+        self.assertLess(estudo["policy_delta"]["value"], 0.0)
+        # Candidato pior fora da amostra: o vencedor é o BASELINE, nunca ele.
+        self.assertEqual(estudo["verdict"]["winner"], "BASELINE")
+
+    def test_selecao_no_treino_nao_e_vazamento(self):
+        estudo = self.estudo(+1.0, +1.0)
+        self.assertTrue(estudo["selection_governs_evaluation"])
+        self.assertEqual(estudo["verdict"]["reason_codes"] and True, True)
+        disciplina = wf.fold_discipline({stage: "train" for stage in wf.FITTED_STAGES}
+                                        | {"candidate_selected_on": "train"})
+        self.assertTrue(disciplina["ok"], disciplina)
+        vazando = wf.fold_discipline({stage: "train" for stage in wf.FITTED_STAGES}
+                                     | {"candidate_selected_on": "test"})
+        self.assertIn(wf.TEST_LEAKAGE, vazando["reason_codes"])
+
+
 class SemRede(unittest.TestCase):
     def test_nenhuma_tentativa_de_rede(self):
         self.assertEqual(_NET, [])
