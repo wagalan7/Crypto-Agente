@@ -229,26 +229,31 @@ def current_account_scope() -> Optional[str]:
     return scope if isinstance(scope, str) and scope.strip() else None
 
 
-async def fresh_total(session_factory, *, account_scope: Optional[str], since, until,
-                      limit: int = 500) -> Dict[str, Any]:
-    """Snapshot FRESCO da janela (sem cache de apresentação).
+def _window_label(since, until) -> Dict[str, Any]:
+    return {"since": since.isoformat() if hasattr(since, "isoformat") else since,
+            "until": until.isoformat() if hasattr(until, "isoformat") else until}
 
-    Lê apenas o ledger R05C já persistido em `real_trades.execution_accounting`;
-    não faz fetch novo, não pagina exchange e não abre transação longa.
-    """
+
+def _ledger_query(since, until, limit: int):
     from sqlalchemy import select
     from models.real_trade import RealTrade
-    window = {"since": since.isoformat() if hasattr(since, "isoformat") else since,
-              "until": until.isoformat() if hasattr(until, "isoformat") else until}
+    return (select(RealTrade.execution_accounting)
+            .where(RealTrade.source == "auto", RealTrade.status != "open",
+                   RealTrade.closed_at.is_not(None),
+                   RealTrade.closed_at >= since, RealTrade.closed_at < until)
+            .order_by(RealTrade.closed_at).limit(limit + 1))
+
+
+async def total_in_session(session, *, account_scope: Optional[str], since, until,
+                           limit: int = 500) -> Dict[str, Any]:
+    """Mesmo total, lido na transação JÁ ABERTA por quem chamou.
+
+    Existe para a admissão sob lock: P&L, exposição e reservas precisam vir do
+    MESMO instante transacional, senão a transferência reserva→posição escapa.
+    """
+    window = _window_label(since, until)
     try:
-        async with session_factory() as session:
-            rows = (await session.execute(
-                select(RealTrade.execution_accounting)
-                .where(RealTrade.source == "auto", RealTrade.status != "open",
-                       RealTrade.closed_at.is_not(None),
-                       RealTrade.closed_at >= since, RealTrade.closed_at < until)
-                .order_by(RealTrade.closed_at).limit(limit + 1)
-            )).scalars().all()
+        rows = (await session.execute(_ledger_query(since, until, limit))).scalars().all()
     except Exception:
         payload = aggregate([], account_scope=account_scope, window=window)
         payload["exclusion_reasons"]["LEDGER_UNAVAILABLE"] = 1
@@ -257,3 +262,21 @@ async def fresh_total(session_factory, *, account_scope: Optional[str], since, u
     collection = {"pagination_complete": not truncated, "overlap_resolved": True}
     return aggregate(rows[:limit], account_scope=account_scope, window=window,
                      collection=collection)
+
+
+async def fresh_total(session_factory, *, account_scope: Optional[str], since, until,
+                      limit: int = 500) -> Dict[str, Any]:
+    """Snapshot FRESCO da janela (sem cache de apresentação).
+
+    Lê apenas o ledger R05C já persistido em `real_trades.execution_accounting`;
+    não faz fetch novo, não pagina exchange e não abre transação longa.
+    """
+    window = _window_label(since, until)
+    try:
+        async with session_factory() as session:
+            return await total_in_session(session, account_scope=account_scope,
+                                          since=since, until=until, limit=limit)
+    except Exception:
+        payload = aggregate([], account_scope=account_scope, window=window)
+        payload["exclusion_reasons"]["LEDGER_UNAVAILABLE"] = 1
+        return payload

@@ -236,18 +236,44 @@ async def _open_risk_usd(session) -> Tuple[float, bool]:
     return total, complete
 
 
+async def _daily_base_in_session(session) -> tuple:
+    """Base do dia RECALCULADA na transação da admissão.
+
+    Devolve `(base, motivo)`: a base antiga, lida fora da lock, envelhece —
+    entre ela e a lock uma reserva pode virar posição (sai do pending sem
+    nunca entrar na base) ou um resultado pode ser persistido. Leitura
+    indisponível ⇒ base None e motivo explícito (nunca zero).
+    """
+    try:
+        from services import financial_risk_service as frs
+        verdict = await frs.daily_base_in_session(session)
+    except Exception:  # noqa: BLE001
+        return None, "DAILY_BASE_UNAVAILABLE"
+    if verdict.get("quality") != "OK":
+        return None, (verdict.get("reason_code") or "DAILY_BASE_UNAVAILABLE")
+    base = _finite(verdict.get("value"))
+    return (base, None) if base is not None else (None, "DAILY_BASE_UNAVAILABLE")
+
+
 def _budget_reason(budget: Optional[DailyBudget], pending_risk: float,
-                   proposed_risk: float) -> Optional[str]:
+                   proposed_risk: float, base_usd: Any = None) -> Optional[str]:
     """Limite DIÁRIO com as reservas das OUTRAS intenções incluídas.
 
-    Atingir o limite já bloqueia (>=, não >), como no gate financeiro. Sem
-    orçamento informado não há veredicto aqui (contrato legado/cutover
-    desligado); orçamento informado e incompleto BLOQUEIA."""
+    `base_usd` é a base RECALCULADA sob a lock; sem ela o veredicto usa a base
+    informada pelo caller, que pode estar velha. Atingir o limite já bloqueia
+    (>=, não >), como no gate financeiro. Sem orçamento informado não há
+    veredicto aqui (contrato legado/cutover desligado); orçamento informado e
+    incompleto BLOQUEIA."""
     if budget is None:
         return None
     base, limit = _finite(budget.base_usd), _finite(budget.limit_usd)
+    # Contrato do caller primeiro: orçamento declarado incompleto (ou sem base/
+    # limite) continua BLOQUEANDO, mesmo que a base seja recalculável aqui.
     if not budget.complete or base is None or limit is None or limit <= 0:
         return "DAILY_BUDGET_UNKNOWN"
+    recalculada = _finite(base_usd)
+    if recalculada is not None:
+        base = recalculada          # a base da transação manda sobre a antiga
     proposto = _finite(proposed_risk)
     if proposto is None or proposto < 0:
         return "DAILY_BUDGET_UNKNOWN"
@@ -334,10 +360,13 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
-                # Orçamento diário com as reservas das OUTRAS intenções incluídas.
+                # Orçamento diário com as reservas das OUTRAS intenções incluídas
+                # e a base do dia RECALCULADA nesta transação.
                 if budget is not None:
                     proposto = max(0.0, _finite(capacity.risk_usd) or 0.0) if capacity else 0.0
-                    denial = _budget_reason(budget, pending_risk, proposto)
+                    base_atual, motivo_base = await _daily_base_in_session(session)
+                    denial = motivo_base or _budget_reason(budget, pending_risk,
+                                                           proposto, base_atual)
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
@@ -444,7 +473,10 @@ async def _readmit(session, identity: EntryIdentity, key: str,
         denial = _capacity_reason(alvo, max(0, pending_count - 1), pending_risk)
         if denial:
             return denial
-    return _budget_reason(budget, pending_risk, risk_usd)
+    if budget is None:
+        return None
+    base_atual, motivo_base = await _daily_base_in_session(session)
+    return motivo_base or _budget_reason(budget, pending_risk, risk_usd, base_atual)
 
 
 async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
