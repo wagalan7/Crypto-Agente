@@ -303,7 +303,8 @@ def replay_opportunity(opportunity: Opportunity, bars: Sequence[Candle],
         "cost_config_hash": costs.manifest()["config_hash"],
         "status": "INSUFFICIENT_DATA", "reason_codes": [], "filled": False,
         "entry_reference_price": None, "entry_fill_price": None, "entry_ts_ms": None,
-        "exit_ts_ms": None, "tp1_hit": False, "bars_observed": 0, "bars_held": 0,
+        "exit_ts_ms": None, "result_available_ts_ms": None,
+        "tp1_hit": False, "bars_observed": 0, "bars_held": 0,
         "gross_r": None, "net_r": None, "fee_r": None, "slippage_r": None,
         "funding_r": None, "risk_price_units": risk, "exits": [],
         "cost_status": "KNOWN_SCENARIO" if costs.manifest()["complete"] else "UNKNOWN",
@@ -316,6 +317,16 @@ def replay_opportunity(opportunity: Opportunity, bars: Sequence[Candle],
     peak = None
     slip = None if costs.slippage_bps_per_side is None else costs.slippage_bps_per_side / 10_000
 
+    def available_at(timestamp: int) -> int:
+        """Instante em que o desfecho daquela vela passa a ser CONHECÍVEL.
+
+        Dentro da vela não existe sequência observável: stop e alvo podem ter
+        acontecido em qualquer ordem, e TIME_STOP/MAX_HOLD consomem o `close`,
+        que só existe no fim dela. A hipótese conservadora — e a única que não
+        financia uma decisão anterior com preço futuro — é o FECHAMENTO da vela.
+        """
+        return int(timestamp) + int(config.bar_ms)
+
     def close_fraction(price: float, quantity: float, reason: str, timestamp: int) -> None:
         nonlocal remaining, realized
         realized += quantity * direction * (price - o.entry) / risk
@@ -323,11 +334,15 @@ def replay_opportunity(opportunity: Opportunity, bars: Sequence[Candle],
         result["exits"].append({"reason": reason, "fraction": quantity,
                                 "reference_price": price,
                                 "fill_price": None if slip is None else price * (1 - direction * slip),
-                                "timestamp_ms": timestamp})
+                                "timestamp_ms": timestamp,
+                                "available_ts_ms": available_at(timestamp)})
 
     def finish(status: str, timestamp: int) -> dict:
         result["status"] = status
         result["exit_ts_ms"] = timestamp
+        # Saída (a vela do evento) e DISPONIBILIDADE do resultado são coisas
+        # diferentes: quem consome capital/slot usa a segunda.
+        result["result_available_ts_ms"] = available_at(timestamp)
         result["gross_r"] = realized
         if slip is not None:
             exit_notional = sum(x["fraction"] * x["reference_price"] for x in result["exits"])

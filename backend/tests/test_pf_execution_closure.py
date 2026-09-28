@@ -258,29 +258,40 @@ class CapitalSoLiquidaQuandoOResultadoOcorre(unittest.TestCase):
         self.assertEqual(linhas["b"]["risk_usd"], 10.0)
 
     def test_sequenciais_usam_o_capital_ja_liquidado(self):
+        # A saída de `a` acontece NA vela T0+2BAR e o resultado fica disponível
+        # quando ela FECHA (T0+3BAR). `b` decide depois disso.
         tarde = [barra(T0 + 3 * BAR, 100.0, 100.2, 99.9, 100.0),
                  barra(T0 + 4 * BAR, 100.0, 100.2, 98.0, 98.5)]
         resultado = self.rodar([self.cand("a", "AAA", T0 - 2),
-                                self.cand("b", "BBB", T0 + 3 * BAR - 1)],
+                                self.cand("b", "BBB", T0 + 3 * BAR)],
                                {"a": self.PERDE, "b": tarde})
         linhas = self.linhas(resultado)
-        # `a` sai em T0+2BAR, antes da decisão de `b`: o capital dela já caiu.
         self.assertEqual(linhas["a"]["capital_after_usd"], 990.0)
         self.assertEqual(linhas["b"]["capital_at_entry_usd"], 990.0)
         self.assertAlmostEqual(linhas["b"]["risk_usd"], 9.9, places=9)
         self.assertAlmostEqual(resultado["metrics"]["capital_end_usd"], 980.1, places=9)
 
-    def test_saida_empatada_com_entrada_ja_liquidou(self):
-        # `b` decide EXATAMENTE no instante da saída de `a`: o resultado de `a`
-        # já ocorreu e vale; o de `b` ainda não.
+    def test_empate_e_com_a_disponibilidade_nao_com_a_saida(self):
+        """Substituto comportamental do antigo empate por `exit_ts_ms`.
+
+        A caracterização anterior liquidava no instante da SAÍDA. Isso usava o
+        `close` da vela antes de ela fechar (achado D): o empate correto é com a
+        DISPONIBILIDADE do resultado.
+        """
         saida_a = T0 + 2 * BAR
-        tarde = [barra(saida_a, 100.0, 100.2, 99.9, 100.0),
-                 barra(saida_a + BAR, 100.0, 100.2, 98.0, 98.5)]
-        resultado = self.rodar([self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", saida_a)],
-                               {"a": self.PERDE, "b": tarde})
-        linhas = self.linhas(resultado)
-        self.assertEqual(linhas["b"]["capital_at_entry_usd"], 990.0)
-        self.assertAlmostEqual(linhas["b"]["risk_usd"], 9.9, places=9)
+        disponivel_a = saida_a + BAR
+        def cenario(decisao_b, primeira_barra):
+            tarde = [barra(primeira_barra, 100.0, 100.2, 99.9, 100.0),
+                     barra(primeira_barra + BAR, 100.0, 100.2, 98.0, 98.5)]
+            return self.linhas(self.rodar(
+                [self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", decisao_b)],
+                {"a": self.PERDE, "b": tarde}))["b"]
+        no_evento = cenario(saida_a, saida_a)
+        self.assertEqual(no_evento["capital_at_entry_usd"], 1000.0)
+        self.assertAlmostEqual(no_evento["risk_usd"], 10.0, places=9)
+        na_disponibilidade = cenario(disponivel_a, disponivel_a)
+        self.assertEqual(na_disponibilidade["capital_at_entry_usd"], 990.0)
+        self.assertAlmostEqual(na_disponibilidade["risk_usd"], 9.9, places=9)
 
     def test_ordem_de_execucao_segue_o_instante_efetivo(self):
         # Decisões em ordem inversa à da lista: a ordenação é temporal, não de
@@ -338,6 +349,111 @@ class CapitalSoLiquidaQuandoOResultadoOcorre(unittest.TestCase):
         self.assertAlmostEqual(linha["net_r"], bruto, places=9)
         self.assertAlmostEqual(resultado["metrics"]["realized_pnl_usd"],
                                linha["net_r"] * linha["risk_usd"], places=9)
+
+
+class ResultadoSoExisteQuandoAVelaFecha(unittest.TestCase):
+    """D — o motor consome o CLOSE de uma vela, mas carimbava a saída no
+    timestamp de ABERTURA dela; o portfólio então realizava esse resultado antes
+    de o fechamento existir.
+
+    Repro: capital 1000, risco 1%. `a` encerra pelo close da vela T+BAR; `b`
+    decide em T+BAR+1ms. Mudar SOMENTE o close futuro de `a` (101 → 99) mudava o
+    risco de `b` de 10,05 para 9,95 — informação que ainda não existia.
+    """
+
+    @staticmethod
+    def cand(key, symbol, decision_ms):
+        return candidato(key, stop=99.0, decision_ms=decision_ms, symbol=symbol)
+
+    def barras_de_a(self, close_futuro):
+        # Vela T: neutra (entra). Vela T+BAR: sem stop/alvo, encerra por MAX_HOLD
+        # consumindo o CLOSE — que só existe no fim dela.
+        return [barra(T0, 100.0, 100.4, 99.6, 100.0),
+                barra(T0 + BAR, 100.0, max(100.4, close_futuro), min(99.6, close_futuro),
+                      close_futuro)]
+
+    def rodar(self, close_futuro):
+        candidatos = [self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", T0 + BAR + 1)]
+        cotacoes = {}
+        for item in candidatos:
+            cotacoes.update(quote(item["opportunity_id"], ts_ms=item["decision_ts_ms"]))
+        return pf.run_portfolio(
+            candidatos,
+            bars_by_id={"a": self.barras_de_a(close_futuro),
+                        "b": [barra(T0 + 2 * BAR, 100.0, 100.4, 99.6, 100.0),
+                              barra(T0 + 3 * BAR, 100.0, 100.4, 98.0, 98.5)]},
+            quotes_by_id=cotacoes,
+            portfolio=pf.PortfolioConfig(capital_usd=1000.0, risk_per_trade_pct=1.0,
+                                         max_concurrent=5, max_per_symbol=1,
+                                         max_exposure_usd=100_000.0),
+            replay_config=r10a.ReplayConfig(bar_ms=BAR, max_holding_bars=2,
+                                            pre_tp1_time_stop_bars=2),
+            costs=SEM_CUSTO)
+
+    def linhas(self, resultado):
+        return {row["opportunity_id"]: row for row in resultado["trades"]}
+
+    def test_close_futuro_nao_muda_decisao_anterior(self):
+        alto = self.linhas(self.rodar(101.0))["b"]
+        baixo = self.linhas(self.rodar(99.0))["b"]
+        self.assertEqual(alto["risk_usd"], baixo["risk_usd"])
+        self.assertEqual(alto["capital_at_entry_usd"], baixo["capital_at_entry_usd"])
+        self.assertEqual(alto["qty"], baixo["qty"])
+
+    def test_resultado_fica_disponivel_no_fechamento_da_vela(self):
+        linha = self.linhas(self.rodar(101.0))["a"]
+        # A saída acontece NA vela T+BAR; o resultado só é utilizável quando ela
+        # fecha — um bar_ms depois da abertura dessa vela.
+        self.assertEqual(linha["exit_ts_ms"], T0 + BAR)
+        self.assertEqual(linha["result_available_ts_ms"], T0 + 2 * BAR)
+
+    def test_motor_declara_disponibilidade_separada_da_saida(self):
+        resultado = r10a.replay_opportunity(
+            r10a.Opportunity(opportunity_id="x", symbol="SYN", direction="long",
+                             decision_ts_ms=T0 - 1, entry=100.0, stop_loss=99.0,
+                             tp1=103.0, tp2=106.0, atr=1.0),
+            tuple(r10a.Candle(**b) for b in self.barras_de_a(101.0)),
+            r10a.ReplayConfig(bar_ms=BAR, max_holding_bars=2, pre_tp1_time_stop_bars=2),
+            SEM_CUSTO)
+        self.assertEqual(resultado["exit_ts_ms"], T0 + BAR)
+        self.assertEqual(resultado["result_available_ts_ms"], T0 + 2 * BAR)
+        for saida in resultado["exits"]:
+            self.assertGreaterEqual(saida["available_ts_ms"], saida["timestamp_ms"] + BAR)
+
+    def test_evento_intravela_tambem_espera_o_fechamento(self):
+        # Stop tocado DENTRO da vela: sem sequência conhecida, a hipótese
+        # conservadora é que só o fechamento dela torna o desfecho utilizável.
+        barras = [barra(T0, 100.0, 100.4, 99.6, 100.0),
+                  barra(T0 + BAR, 100.0, 100.4, 98.0, 98.5)]
+        resultado = r10a.replay_opportunity(
+            r10a.Opportunity(opportunity_id="x", symbol="SYN", direction="long",
+                             decision_ts_ms=T0 - 1, entry=100.0, stop_loss=99.0,
+                             tp1=103.0, tp2=106.0, atr=1.0),
+            tuple(r10a.Candle(**b) for b in barras),
+            r10a.ReplayConfig(bar_ms=BAR), SEM_CUSTO)
+        self.assertEqual(resultado["status"], "CLOSED_STOP")
+        self.assertEqual(resultado["exit_ts_ms"], T0 + BAR)
+        self.assertEqual(resultado["result_available_ts_ms"], T0 + 2 * BAR)
+
+    def test_slot_so_libera_quando_o_resultado_existe(self):
+        # Um único slot: `b` decide DEPOIS da saída de `a`, mas ANTES do
+        # fechamento da vela que a produziu — a carteira ainda não pode usá-lo.
+        candidatos = [self.cand("a", "AAA", T0 - 2), self.cand("b", "BBB", T0 + BAR + 1)]
+        cotacoes = {}
+        for item in candidatos:
+            cotacoes.update(quote(item["opportunity_id"], ts_ms=item["decision_ts_ms"]))
+        resultado = pf.run_portfolio(
+            candidatos,
+            bars_by_id={"a": self.barras_de_a(101.0),
+                        "b": [barra(T0 + 2 * BAR, 100.0, 100.4, 99.6, 100.0)]},
+            quotes_by_id=cotacoes,
+            portfolio=pf.PortfolioConfig(capital_usd=1000.0, risk_per_trade_pct=1.0,
+                                         max_concurrent=1, max_per_symbol=1,
+                                         max_exposure_usd=100_000.0),
+            replay_config=r10a.ReplayConfig(bar_ms=BAR, max_holding_bars=2,
+                                            pre_tp1_time_stop_bars=2),
+            costs=SEM_CUSTO)
+        self.assertEqual(self.linhas(resultado)["b"]["reason_code"], pf.NO_SLOT)
 
 
 class SemRede(unittest.TestCase):

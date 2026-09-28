@@ -352,6 +352,45 @@ POLICY_DELTA_UNKNOWN = "POLICY_DELTA_UNKNOWN"
 #: treino, o contrato manda rodar o FALLBACK declarado — nunca o candidato.
 POLICY_CANDIDATE = "CANDIDATE"
 POLICY_BASELINE_FALLBACK = "BASELINE_FALLBACK"
+#: Motivos de exclusão de LABEL no treino da dobra.
+LABEL_NOT_AVAILABLE = "LABEL_NOT_AVAILABLE_AT_CUT"
+LABEL_TIMESTAMP_MISSING = "LABEL_AVAILABILITY_TIMESTAMP_MISSING"
+HORIZON_BELOW_OBSERVED = "HORIZON_BELOW_OBSERVED"
+#: Etapas: o que REALMENTE rodou, em vez de uma string "train" declarada.
+STAGE_EXECUTED_ON_TRAIN = "EXECUTED_ON_TRAIN"
+STAGE_NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+def label_available_ms(row: Mapping[str, Any]) -> Optional[int]:
+    """Instante em que o RESULTADO daquela oportunidade passou a ser conhecível.
+
+    `decision_ts_ms` é quando a decisão foi tomada — não quando o desfecho
+    existiu. Sem um instante confiável, o label não entra no treino.
+    """
+    row = row if isinstance(row, Mapping) else {}
+    for campo in ("result_available_ts_ms", "available_ts_ms", "resolved_at_ms"):
+        valor = _int(row.get(campo))
+        if valor is not None:
+            return valor
+    return None
+
+
+def split_train_labels(rows: Sequence[Mapping[str, Any]], *, cut_ms: int) -> Dict[str, Any]:
+    """Separa o que o treino PODE usar do que ainda não existia no corte."""
+    usable, withheld, reasons = [], 0, set()
+    for row in rows or ():
+        disponivel = label_available_ms(row)
+        if disponivel is None:
+            withheld += 1
+            reasons.add(LABEL_TIMESTAMP_MISSING)
+            continue
+        if disponivel > cut_ms:
+            withheld += 1
+            reasons.add(LABEL_NOT_AVAILABLE)
+            continue
+        usable.append(row)
+    return {"rows": usable, "available": len(usable), "withheld": withheld,
+            "reason_codes": sorted(reasons)}
 STUDIES_NOT_EXECUTED = "STUDIES_NOT_EXECUTED"
 DELTA_DISAGREES_WITH_CI = "DELTA_DISAGREES_WITH_CI"
 
@@ -366,6 +405,21 @@ def _rows_by_time(rows: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
             continue
         out.append(row)
     return sorted(out, key=lambda item: (item["decision_ts_ms"], item["opportunity_id"]))
+
+
+def observed_horizon_bars(rows: Sequence[Mapping[str, Any]], *,
+                          bar_ms: int) -> Optional[int]:
+    """Horizonte REAL observado: maior distância decisão → disponibilidade."""
+    if bar_ms <= 0:
+        return None
+    maior = None
+    for row in rows or ():
+        decidido, disponivel = _int(row.get("decision_ts_ms")), label_available_ms(row)
+        if decidido is None or disponivel is None:
+            continue
+        barras = max(0, -(-(disponivel - decidido) // bar_ms))   # ceil
+        maior = barras if maior is None else max(maior, barras)
+    return maior
 
 
 def policy_delta_r(paired: Mapping[str, Any]) -> Dict[str, Any]:
@@ -428,14 +482,28 @@ def run_walk_forward(*, baseline: Sequence[Mapping[str, Any]],
         def _slice(rows, start, end):
             return [row for row in rows if start <= row["decision_ts_ms"] < end]
 
-        train_base = _slice(base_rows, window["train_start_ms"], window["train_end_ms"])
-        train_cand = _slice(cand_rows, window["train_start_ms"], window["train_end_ms"])
+        janela_base = _slice(base_rows, window["train_start_ms"], window["train_end_ms"])
+        janela_cand = _slice(cand_rows, window["train_start_ms"], window["train_end_ms"])
         test_base = _slice(base_rows, window["test_start_ms"], window["test_end_ms"])
         test_cand = _slice(cand_rows, window["test_start_ms"], window["test_end_ms"])
-        # Seleção do candidato: SOMENTE com o treino desta dobra.
+        # Só entra no treino o LABEL que já existia no corte da dobra: decidir
+        # em T não é saber o desfecho em T. Sem instante confiável, o label fica
+        # de fora — insuficiência explícita, nunca resolução presumida.
+        corte = int(window["train_end_ms"])
+        rotulos_base = split_train_labels(janela_base, cut_ms=corte)
+        rotulos_cand = split_train_labels(janela_cand, cut_ms=corte)
+        train_base, train_cand = rotulos_base["rows"], rotulos_cand["rows"]
+        train_reasons = sorted(set(rotulos_base["reason_codes"])
+                               | set(rotulos_cand["reason_codes"]))
+        horizonte = observed_horizon_bars(janela_base + janela_cand + test_base + test_cand,
+                                          bar_ms=bar_ms)
+        if horizonte is not None and horizonte > max(0, int(horizon_bars)):
+            train_reasons = sorted(set(train_reasons) | {HORIZON_BELOW_OBSERVED})
+        # Seleção do candidato: SOMENTE com o treino disponível desta dobra.
         train_pair = pair_opportunities(train_base, train_cand)
         train_delta = policy_delta_r(train_pair)
-        selected = bool(train_delta["available"] and train_delta["value"] > 0)
+        selected = bool(train_delta["available"] and train_delta["value"] > 0
+                        and (rotulos_base["available"] or rotulos_cand["available"]))
         # A SELEÇÃO GOVERNA A POLÍTICA AVALIADA: dobra sem escolha do candidato
         # roda o FALLBACK declarado (baseline), não o candidato. Rotular a
         # seleção e avaliar o candidato assim mesmo mede uma política que o
@@ -454,6 +522,10 @@ def run_walk_forward(*, baseline: Sequence[Mapping[str, Any]],
             "evaluated_policy": policy,
             "fallback_contract": POLICY_BASELINE_FALLBACK,
             "candidate_test_n": len(test_cand),
+            "train_labels_available": rotulos_base["available"] + rotulos_cand["available"],
+            "train_labels_withheld": rotulos_base["withheld"] + rotulos_cand["withheld"],
+            "train_reason_codes": train_reasons,
+            "observed_horizon_bars": horizonte,
             "train_delta_net_r": train_delta["value"],
             "delta_net_r": test_delta["value"],
             "delta_reason_code": test_delta["reason_code"],
@@ -474,6 +546,11 @@ def run_walk_forward(*, baseline: Sequence[Mapping[str, Any]],
                             block_size=block_size, alpha=alpha, comparisons=comparisons)
     discipline = fold_discipline({stage: "train" for stage in FITTED_STAGES}
                                  | {"candidate_selected_on": "train"})
+    # Etapas REALMENTE executadas: este runner faz a seleção no treino e não
+    # tem calibrador/preprocessador próprio — dizer "treinado" sem rodar seria
+    # declarar etapa inexistente.
+    stages = {stage: STAGE_NOT_APPLICABLE for stage in FITTED_STAGES}
+    stages["candidate_selection"] = STAGE_EXECUTED_ON_TRAIN
     guard = coverage if isinstance(coverage, Mapping) else coverage_guard(
         {"considered": len(all_base), "resolved": len(all_base)},
         {"considered": len(all_cand), "resolved": len(all_cand)})
@@ -485,7 +562,7 @@ def run_walk_forward(*, baseline: Sequence[Mapping[str, Any]],
                          if item.get("evaluated_policy") == POLICY_CANDIDATE)
     return {"wf_version": WF_VERSION, "folds_executed": folds_executed,
             "folds": executed, "policy_delta": delta, "ci": ci,
-            "paired": paired, "verdict": result,
+            "paired": paired, "verdict": result, "stages": stages,
             "folds_running_candidate": selected_folds,
             "selection_governs_evaluation": True,
             "live_equivalent": False, "promotable": False}

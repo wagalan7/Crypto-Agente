@@ -476,11 +476,17 @@ def _safe_outcome(outcome, reason=None):
     if reason:
         codes.append(reason)
     observed = outcome.get("bars_observed")
+    saida = outcome.get("exit_ts_ms")
+    disponivel = outcome.get("result_available_ts_ms")
+    inteiro = lambda v: v if isinstance(v, int) and not isinstance(v, bool) else None
     return {"policy": POLICY, "replay_schema": REPLAY_SCHEMA, "status": status,
             "reason_codes": codes, "filled": outcome.get("filled") is True,
             "tp1_hit": outcome.get("tp1_hit") is True,
             "bars_observed": observed if isinstance(observed, int) and not isinstance(observed, bool) else None,
             "gross_r": _number(outcome.get("gross_r")) if status in CLOSED_STATUSES else None,
+            # A vela do EVENTO e o instante em que o resultado ficou conhecível
+            # são campos distintos — quem consome o desfecho usa o segundo.
+            "exit_ts_ms": inteiro(saida), "result_available_ts_ms": inteiro(disponivel),
             "net_r": None, "cost_status": "UNKNOWN", "learning_eligible": False,
             "price_source": PRICE_SOURCE}
 

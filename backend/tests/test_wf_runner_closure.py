@@ -46,8 +46,14 @@ BAR = 300_000
 T0 = 1_760_000_100_000
 
 
-def linha(key, net_r, passo):
-    return {"opportunity_id": key, "net_r": net_r, "decision_ts_ms": T0 + passo * BAR}
+def linha(key, net_r, passo, *, disponivel_em=None):
+    """Linha de resultado como o replay corrigido a produz: além do instante da
+    DECISÃO, o instante em que o resultado ficou DISPONÍVEL (uma vela depois,
+    por default — o fechamento da vela que produziu a saída)."""
+    decidido = T0 + passo * BAR
+    return {"opportunity_id": key, "net_r": net_r, "decision_ts_ms": decidido,
+            "result_available_ts_ms": (T0 + disponivel_em * BAR
+                                       if disponivel_em is not None else decidido + BAR)}
 
 
 class CandidatoGlobalmentePior(unittest.TestCase):
@@ -253,6 +259,96 @@ class SelecaoGovernaAPoliticaAvaliada(unittest.TestCase):
         vazando = wf.fold_discipline({stage: "train" for stage in wf.FITTED_STAGES}
                                      | {"candidate_selected_on": "test"})
         self.assertIn(wf.TEST_LEAKAGE, vazando["reason_codes"])
+
+
+class TreinoSoUsaLabelDisponivel(unittest.TestCase):
+    """E — resultado ainda não conhecido não pode selecionar candidato.
+
+    Repro: seis dobras 20/5, baseline 0R e candidato +1R, com TODOS os
+    `result_available_ts_ms` em T0+1000BAR — depois de TODOS os cortes de
+    treino. A seleção olhava só `decision_ts_ms` e dava seis seleções TRUE,
+    EVIDENCE_AVAILABLE, winner=CANDIDATE, delta +30R e IC [5,5].
+    """
+
+    TREINO, TESTE, PASSO, DOBRAS = 20, 5, 25, 6
+    TARDE = 1000
+
+    def serie(self, *, disponivel_em=None, cand_r=1.0):
+        base, cand = [], []
+        for dobra in range(self.DOBRAS):
+            inicio = dobra * self.PASSO
+            for rotulo, quantos in (("tr", self.TREINO), ("te", self.TESTE)):
+                for i in range(quantos):
+                    pos = inicio + (0 if rotulo == "tr" else self.TREINO) + i
+                    disponivel = (T0 + disponivel_em * BAR if disponivel_em is not None
+                                  else T0 + (pos + 1) * BAR)
+                    base.append({**linha(f"d{dobra}-{rotulo}{i}", 0.0, pos),
+                                 "result_available_ts_ms": disponivel})
+                    cand.append({**linha(f"d{dobra}-{rotulo}{i}", cand_r, pos),
+                                 "result_available_ts_ms": disponivel})
+        return base, cand
+
+    def folds(self):
+        return [wf.Fold(index=d,
+                        train_start_ms=T0 + d * self.PASSO * BAR,
+                        train_end_ms=T0 + (d * self.PASSO + self.TREINO) * BAR,
+                        test_start_ms=T0 + (d * self.PASSO + self.TREINO) * BAR,
+                        test_end_ms=T0 + (d + 1) * self.PASSO * BAR)
+                for d in range(self.DOBRAS)]
+
+    def estudo(self, **kw):
+        base, cand = self.serie(**kw)
+        return wf.run_walk_forward(baseline=base, candidate=cand, folds=self.folds(),
+                                   bar_ms=BAR, costs_complete=True,
+                                   horizon_sufficient=True, seed=3)
+
+    def test_label_posterior_ao_corte_nao_seleciona(self):
+        estudo = self.estudo(disponivel_em=self.TARDE)
+        executadas = [item for item in estudo["folds"] if item["reason_code"] == wf.OK]
+        self.assertEqual([item["candidate_selected_on_train"] for item in executadas],
+                         [False] * self.DOBRAS)
+        self.assertEqual([item["evaluated_policy"] for item in executadas],
+                         [wf.POLICY_BASELINE_FALLBACK] * self.DOBRAS)
+        self.assertIsNone(estudo["verdict"]["winner"])
+        self.assertEqual(estudo["policy_delta"]["value"], 0.0)
+
+    def test_dobra_registra_quantos_labels_ficaram_de_fora(self):
+        estudo = self.estudo(disponivel_em=self.TARDE)
+        executada = next(item for item in estudo["folds"] if item["reason_code"] == wf.OK)
+        self.assertEqual(executada["train_labels_available"], 0)
+        self.assertGreater(executada["train_labels_withheld"], 0)
+        self.assertIn(wf.LABEL_NOT_AVAILABLE, executada["train_reason_codes"])
+
+    def test_label_disponivel_no_corte_seleciona_normalmente(self):
+        estudo = self.estudo()
+        executadas = [item for item in estudo["folds"] if item["reason_code"] == wf.OK]
+        self.assertEqual([item["candidate_selected_on_train"] for item in executadas],
+                         [True] * self.DOBRAS)
+        self.assertEqual([item["evaluated_policy"] for item in executadas],
+                         [wf.POLICY_CANDIDATE] * self.DOBRAS)
+        self.assertGreater(estudo["policy_delta"]["value"], 0.0)
+
+    def test_sem_timestamp_confiavel_e_insuficiencia_nao_selecao(self):
+        base, cand = self.serie()
+        for linha_sem in base + cand:
+            linha_sem.pop("result_available_ts_ms", None)
+        estudo = wf.run_walk_forward(baseline=base, candidate=cand, folds=self.folds(),
+                                     bar_ms=BAR, costs_complete=True,
+                                     horizon_sufficient=True, seed=3)
+        executadas = [item for item in estudo["folds"] if item["reason_code"] == wf.OK]
+        self.assertEqual([item["candidate_selected_on_train"] for item in executadas],
+                         [False] * self.DOBRAS)
+        self.assertIn(wf.LABEL_TIMESTAMP_MISSING, executadas[0]["train_reason_codes"])
+        self.assertIsNone(estudo["verdict"]["winner"])
+
+    def test_disciplina_declara_as_etapas_realmente_executadas(self):
+        estudo = self.estudo()
+        etapas = estudo["stages"]
+        self.assertEqual(etapas["candidate_selection"], "EXECUTED_ON_TRAIN")
+        for nome in wf.FITTED_STAGES:
+            self.assertIn(etapas[nome], ("EXECUTED_ON_TRAIN", "NOT_APPLICABLE"))
+        # Nada é declarado "treinado" sem ter rodado.
+        self.assertNotIn("train", set(etapas.values()))
 
 
 class SemRede(unittest.TestCase):

@@ -246,15 +246,19 @@ async def run(args) -> dict:
 
     # 6. Comparação da política inteira pelo runner de walk-forward.
     decision_at = {item["opportunity_id"]: item["decision_ts_ms"] for item in candidates}
-    baseline = [{"opportunity_id": trade["opportunity_id"], "net_r": trade["net_r"],
-                 "decision_ts_ms": decision_at.get(trade["opportunity_id"])}
-                for trade in replay["trades"] if trade["admitted"]]
+    def lado_do_estudo(execucao):
+        """Linhas do estudo com a DISPONIBILIDADE do resultado, não só a decisão:
+        o treino de cada dobra só pode consumir label que já existia no corte."""
+        return [{"opportunity_id": trade["opportunity_id"], "net_r": trade["net_r"],
+                 "decision_ts_ms": decision_at.get(trade["opportunity_id"]),
+                 "result_available_ts_ms": trade.get("result_available_ts_ms")}
+                for trade in execucao["trades"] if trade["admitted"]]
+
+    baseline = lado_do_estudo(replay)
     # O lado CANDIDATO vem do replay do candidato — resultado EXECUTADO, não
     # baseline mais um bônus inventado. Delta positivo, negativo ou zero é o que
     # o motor produzir; nada aqui garante vantagem ao candidato.
-    candidate_side = [{"opportunity_id": trade["opportunity_id"], "net_r": trade["net_r"],
-                       "decision_ts_ms": decision_at.get(trade["opportunity_id"])}
-                      for trade in candidate_replay["trades"] if trade["admitted"]]
+    candidate_side = lado_do_estudo(candidate_replay)
     # As dobras cobrem o período em que as decisões realmente aconteceram.
     if baseline:
         janela_inicio = min(item["decision_ts_ms"] for item in baseline) - 40 * BAR5
@@ -273,6 +277,10 @@ async def run(args) -> dict:
                               # A seleção do treino governa a política avaliada.
                               "folds_running_candidate": study["folds_running_candidate"],
                               "selection_governs_evaluation": study["selection_governs_evaluation"],
+                              "stages": study["stages"],
+                              "train_labels_withheld": sum(
+                                  int(item.get("train_labels_withheld") or 0)
+                                  for item in study["folds"]),
                               "promotable": study["verdict"]["promotable"]}
     # 7. Go/no-go alimentado pelos RESULTADOS calculados (nunca números soltos).
     from services import preselection_experiment_service as r12

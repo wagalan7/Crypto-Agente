@@ -410,7 +410,8 @@ class PortfolioState:
         self.exposure_usd = max(0.0, self.exposure_usd)
 
     def admit(self, *, key: str, symbol: str, side: str, decision_ts_ms: int,
-              exposure_usd: float, exit_ts_ms: Optional[int]) -> Dict[str, Any]:
+              exposure_usd: float, exit_ts_ms: Optional[int],
+              event_ts_ms: Optional[int] = None) -> Dict[str, Any]:
         cfg = self.config
         self.release(decision_ts_ms)
         same_symbol = sum(1 for p in self.open_positions if p["symbol"] == symbol)
@@ -426,7 +427,10 @@ class PortfolioState:
         self.open_positions.append({"key": key, "symbol": symbol, "side": side,
                                     "risk_usd": risk, "exposure_usd": exposure_usd,
                                     "entry_ts_ms": decision_ts_ms,
+                                    # `exit_ts_ms` aqui é o instante de
+                                    # DISPONIBILIDADE; o evento fica à parte.
                                     "exit_ts_ms": exit_ts_ms,
+                                    "event_ts_ms": event_ts_ms,
                                     "settle_risk_usd": risk, "net_r": None,
                                     "result_known": False})
         self.used_risk_usd += risk
@@ -589,9 +593,14 @@ def run_portfolio(candidates: Sequence[Mapping[str, Any]], *,
             reject(key, BARS_UNAVAILABLE)
             continue
         result = r10a.replay_opportunity(opportunity, window, replay_config, costs)
+        # O slot e o capital só voltam quando o resultado É CONHECÍVEL — a vela
+        # que produziu a saída precisa ter fechado. Usar a abertura dela
+        # financiaria uma decisão anterior com preço que ainda não existia.
+        disponivel = _int(result.get("result_available_ts_ms"))
         admission = state.admit(key=key, symbol=str(symbol), side=side,
                                 decision_ts_ms=effective_ts, exposure_usd=exposure,
-                                exit_ts_ms=result.get("exit_ts_ms"))
+                                exit_ts_ms=disponivel,
+                                event_ts_ms=_int(result.get("exit_ts_ms")))
         if not admission["admitted"]:
             # Trade impossível pela carteira NÃO entra na soma.
             reject(key, admission["reason_code"])
@@ -615,6 +624,7 @@ def run_portfolio(candidates: Sequence[Mapping[str, Any]], *,
                        "fill_fraction": fraction,
                        "effective_ts_ms": effective_ts,
                        "exit_ts_ms": result.get("exit_ts_ms"),
+                       "result_available_ts_ms": result.get("result_available_ts_ms"),
                        "risk_usd": risk_usd, "qty": qty, "exposure_usd": exposure,
                        "capital_at_entry_usd": state.capital_at_entry.get(key)})
     # Fim do replay: o que ainda estava aberto liquida em ordem temporal.
