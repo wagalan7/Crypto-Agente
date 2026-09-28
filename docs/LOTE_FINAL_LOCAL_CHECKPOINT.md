@@ -460,6 +460,18 @@ achado virou regressão que FALHA na baseline e roda pelo caller real.
 | G — geração obsoleta publicando por cima | CORRIGIDO | `pg_integration_r11_r12_pipeline.py` (59) |
 | H — tipo pré-seleção sem caminho próprio | CORRIGIDO | idem, criação/avaliação/transição no catálogo oficial |
 
+### Fechamento A/C/H (28/09/2026) — checkpoint
+
+| Achado | Commit | RED → GREEN | Prova |
+| --- | --- | --- | --- |
+| A | `9e972bb5` | `('TERMINAL', None, 'RECONCILED_NO_EXECUTION')` sem consultar a entry → prova terminal por dispatch | `pg_integration_p03_proof.py` (20) |
+| C | `44397ca9` | `RESERVED_NEW` com −95 na corrida entre leituras → `DAILY_LOSS_LIMIT` com −98/−101 | `pg_integration_r05_snapshot.py` (14) |
+| H | `b0601cc5` | métricas avulsas validando + sentinela `POST_SELECTION_OUTCOMES_READ` → estudo vinculado e despacho por tipo | `pg_integration_r11_r12_pipeline.py` (77) |
+
+Próximo passo: decidir o par congelado de F (baseline × candidata × escopo/
+custos). B/D/E/G permanecem como estavam; adaptador LIVE e promoção
+pré-seleção continuam fora.
+
 **F exige decisão externa**: os contratos declaram o champion LIVE e as
 políticas novas como INATIVAS e `approved_for_production=false`, mas nenhum
 registra o PAR congelado (baseline × candidata) a ser comparado. Enquanto isso

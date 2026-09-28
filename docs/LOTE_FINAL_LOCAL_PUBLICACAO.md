@@ -227,3 +227,29 @@ sem o campo — e continua fail-closed, sem estimativa.
 
 Nenhum default foi ligado, nenhuma estratégia nova foi criada e o adaptador
 LIVE continua ausente.
+
+## 11. Fechamento A + C + H (28/09/2026)
+
+Sem migração nova neste pacote: A usa o `payload` JSONB que o incidente já tem
+e H reutiliza `policy_simulation_state`.
+
+Impactos na ADMISSÃO (segurança, ativa por default):
+
+1. **A — mais pendências explícitas.** Um incidente resolvido por cleanup (ou
+   legado) sem consulta terminal da entry NÃO encerra mais a intenção: o id
+   volta para a fila, o reconciliador consulta a identidade exata e, até lá,
+   slot, reserva e quarentena continuam ocupados. Encerrar como "não executou"
+   agora exige zero comprovado em TODOS os dispatches.
+2. **C — bloqueio correto em corrida.** As parcelas do dia vêm de uma única
+   leitura pós-lock. Uma posição que fecha entre leituras deixa de sumir da
+   conta, então entradas que antes passavam por pouco podem ser recusadas com
+   `DAILY_LOSS_LIMIT`; leitura indisponível recusa com
+   `ADMISSION_SNAPSHOT_UNAVAILABLE`. Continua valendo só com o cutover R05B
+   ligado — este pacote NÃO o liga.
+
+Impacto na PESQUISA (inativa por default):
+
+3. **H — aprovação só com estudo vinculado.** Criar/avaliar um experimento
+   pré-seleção exige o estudo persistido com identidade conferida; números
+   soltos não conferem OFFLINE_VALIDATED e a avaliação oficial nunca lê a
+   coorte pós-seleção. Promoção continua declarada como não implementada.

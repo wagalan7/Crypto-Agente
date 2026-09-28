@@ -2045,3 +2045,45 @@ importa o módulo novo. Doc: `docs/R08A_SCORE_AUDIT_AND_LOCAL_LAB.md`.
 - **Pendências externas:** coleta prospectiva, validação econômica com custos de
   conta, calibração própria da V3, aprovação humana e canário continuam
   pendentes. Holdout real segue selado; nenhuma quarentena foi liberada.
+
+## Fechamento A + C + H (28/09/2026, baseline `8617b101`)
+
+Pacote restrito às três pendências da auditoria `AUDITORIA_8617b101_PENDENCIAS_A_C_H`.
+Cada uma virou regressão que FALHA na baseline e roda pelo caller real.
+
+- **A — ausência de prova de quantidade não é execução zero.** RED em PG: um
+  incidente `CLEANUP_PENDING` (montado pelo `assemble_entry_incident(closed=True)`
+  sem `executed_qty`) resolvia FLAT pelo grace e, com o lease expirando depois,
+  a intenção era encerrada como `RECONCILED_NO_EXECUTION` sem NUNCA consultar a
+  ordem — que estava FILLED. Agora o desfecho é POR DISPATCH
+  (`POSITIVE`/`TERMINAL_ZERO`/`UNKNOWN`), a prova terminal é gravada em
+  `payload.entry_proof` (identidade, status, qty, instante) pela consulta da
+  própria identidade, e `RECONCILED_NO_EXECUTION` exige zero comprovado em
+  TODOS os dispatches, inclusive `-mfb`. Sem prova, o id volta para a fila e o
+  reconciliador oficial consulta a entry. Sem migração: o `payload` já existia.
+- **C — visão consistente na admissão.** RED em PG com duas conexões e barreira
+  ENTRE as leituras: a posição que fechava no intervalo sumia das DUAS parcelas
+  e a proposta passava com −95 em vez de bloquear com −101. Agora as parcelas
+  (P&L do dia, exposição, custos e reservas) vêm de UMA instrução SQL executada
+  DEPOIS da advisory lock — um snapshot só. `daily_base_in_session` e
+  `_admission_view` consomem essa leitura na reserva e na readmissão final;
+  leitura indisponível ⇒ `ADMISSION_SNAPSHOT_UNAVAILABLE` (bloqueia aumento,
+  nunca proteção/saída). Cutover R05B e fontes legacy/total preservados.
+- **H — avaliação oficial ligada ao estudo real.** RED em PG: métricas avulsas
+  com `fingerprint="NO_DATASET"` conferiam OFFLINE_VALIDATED e permitiam
+  SHADOW; e `evaluate_shadow` de uma linha PRE_SELECTION disparava a sentinela
+  `POST_SELECTION_OUTCOMES_READ`. Agora o estudo é persistido pela simulação em
+  `policy_simulation_state` com identidade verificável (população, hashes,
+  custos, dataset, corte, evidência), recuperado e CONFERIDO na criação e na
+  avaliação; divergência recusa antes de ler outcomes. `evaluate_shadow`
+  despacha por tipo e a coorte pré-seleção nunca toca `_load_shadow`. Sem
+  ELIGIBLE, promoção ou LIVE; exclusividade e P051_ANALYTICS_ONLY intactos.
+- **Testes:** suíte completa **2.363 executados, 2.361 aprovados, 2 skips R05C**
+  (fixture auditada ausente no repositório — nada foi fabricado). 14 harnesses
+  PostgreSQL 16 descartáveis UTF-8 (driver real, socket Unix, TCP/DNS
+  bloqueados), incluindo os novos `pg_integration_p03_proof.py` (20) e
+  `pg_integration_r05_snapshot.py` (14), mais `pg_integration_r11_r12_pipeline.py`
+  (77). `py_compile` e diff-check aprovados; nenhum TS/TSX alterado.
+- **Fora do pacote:** F segue `BLOCKED_MISSING_DECISION` (baseline/candidata
+  congeladas não decididas), adaptador LIVE e promoção pré-seleção continuam
+  não implementados, e B/D/E/G não foram retrabalhados.

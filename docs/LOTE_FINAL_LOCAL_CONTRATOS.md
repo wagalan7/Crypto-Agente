@@ -186,3 +186,15 @@ Os caminhos existiam; este lote corrigiu o que eles realmente faziam.
 | H comparação (F) | Escopo MANAGEMENT_ONLY explícito com o que NÃO prova, hashes dos dois lados e `bundle_hash` antes do resultado; hipótese autorizada `BLOCKED_MISSING_DECISION` |
 | R11 geração (G) | `publish_generation(expected_generation=...)` é CAS; cálculo de geração antiga é recusado (`GENERATION_STALE`) e o caller recalcula, limitado e idempotente |
 | R12 pré-seleção (H) | Criação, avaliação (população própria, `outcomes_read=False`), transições DRAFT→OFFLINE_VALIDATED→SHADOW e exclusividade no catálogo OFICIAL; `ELIGIBLE` fechado e promoção declarada `PRE_SELECTION_PROMOTION_NOT_IMPLEMENTED` |
+
+## 9. Fechamento A + C + H (28/09/2026)
+
+| Contrato | O que passou a valer |
+| --- | --- |
+| P03 prova por dispatch (A) | `POSITIVE` / `TERMINAL_ZERO` / `UNKNOWN` por id. `TERMINAL_ZERO` só pela consulta terminal da PRÓPRIA identidade, gravada em `payload.entry_proof` (id, status, qty, instante) antes de resolver |
+| P03 encerramento (A) | `RECONCILED_NO_EXECUTION` exige zero comprovado em TODOS os dispatches e nenhuma prova positiva; FLAT de cleanup prova limpeza, não ausência de execução |
+| P03 sem prova (A) | O id volta como não provado e o reconciliador OFICIAL consulta a entry; prova positiva nunca é apagada por consulta posterior |
+| R05 snapshot (C) | P&L, exposição, custos e reservas de UMA instrução SQL executada depois da advisory lock; `as_of` é o `now()` do próprio snapshot |
+| R05 admissão (C) | Reserva e readmissão final consomem a MESMA visão; leitura indisponível ⇒ `ADMISSION_SNAPSHOT_UNAVAILABLE`, que bloqueia aumento e não afeta proteção/saída |
+| R12 estudo (H) | Experimento pré-seleção vinculado ao estudo persistido e CONFERIDO (população, hash da candidata, dataset, corte); divergência recusa antes de ler outcomes |
+| R12 avaliação (H) | `evaluate_shadow` despacha por tipo antes do loader; a coorte pré-seleção usa `evaluate_preselection_shadow` e nunca `_load_shadow` |
