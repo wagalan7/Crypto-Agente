@@ -1372,7 +1372,13 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
                                   complete=bool(orcamento.get("complete")))
               if orcamento.get("enabled") else None)
     reservation = await intents.reserve(get_session, identity, payload, owner=_INTENT_OWNER,
-                                        capacity=capacity, budget=budget)
+                                        capacity=capacity, budget=budget,
+                                        # Stop/qty planejados ficam gravados ANTES
+                                        # do POST: depois do envio não há de onde
+                                        # recuperá-los para adotar o SL existente.
+                                        decision={"entry": float(entry),
+                                                  "stop_loss": float(stop),
+                                                  "qty": float(qty)})
     return {"granted": reservation.granted, "decision": reservation.decision,
             "reason": reservation.reason, "intent_key": reservation.intent_key,
             "client_order_id": reservation.client_order_id, "state": reservation.state,

@@ -1586,6 +1586,14 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
 
     # PROTECTED tentativo: fill terminal confirmado. Portão fresh ANTES de mutar:
     # exige quality FRESH, size>0 e LADO fresh == lado do incidente.
+    # A quantidade EXECUTADA fica gravada ANTES de qualquer desfecho: sem ela,
+    # resolver FLAT (posição já encerrada) seria indistinguível de "não houve
+    # execução" e a intenção encerraria sem rastro contábil.
+    _qty_terminal = _finite(qty)
+    if _qty_terminal is not None and _qty_terminal > 0:
+        _lower = max(_finite(inc.get("min_known_fill")) or 0.0, _qty_terminal)
+        if await _fenced(key, owner, min_known_fill=_lower):
+            inc["min_known_fill"] = _lower
     gate, fp = await _fresh_gate(inc)
     if gate == FreshGate.UNKNOWN:
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, "posição UNKNOWN pós-fill — sem mutação")
@@ -1843,8 +1851,16 @@ def _intent_symbol(stored: Optional[str]) -> Optional[str]:
     return parts[0].replace("-", "/", 1) + ":" + parts[1]
 
 
-async def _real_trade_for_dispatch(dispatch_ids, *, symbol: str) -> Optional[int]:
-    """RealTrade vinculado a QUALQUER id efetivamente despachado desta decisão."""
+async def _real_trade_for_dispatch(dispatch_ids, *, symbol: str,
+                                   exchange: Optional[str] = None,
+                                   side: Optional[str] = None) -> Optional[int]:
+    """RealTrade vinculado a QUALQUER id efetivamente despachado desta decisão.
+
+    O `client_order_id` é a identidade da conta que despachou, mas ele sozinho
+    não basta: símbolo, exchange e LADO precisam bater, e o alvo precisa ser
+    ÚNICO. Trade ABERTO ou já FECHADO vale igual — o que importa é existir
+    rastro contábil do que foi executado.
+    """
     try:
         from db import DB_ENABLED, get_session
         from models.real_trade import RealTrade
@@ -1856,14 +1872,23 @@ async def _real_trade_for_dispatch(dispatch_ids, *, symbol: str) -> Optional[int
     try:
         async with get_session() as session:
             rows = (await session.execute(
-                select(RealTrade.id, RealTrade.symbol)
+                select(RealTrade.id, RealTrade.symbol, RealTrade.exchange, RealTrade.side)
                 .where(RealTrade.client_order_id.in_(list(dispatch_ids)))
                 .order_by(RealTrade.id))).all()
     except Exception:  # noqa: BLE001
         return None
-    # Símbolo EXATO: id de outro símbolo não vincula (nunca adota trade alheio).
-    alvo = _sym_key(symbol)
-    ids = {int(rid) for rid, rsym in rows if _sym_key(rsym or "") == alvo}
+    alvo_sym = _sym_key(symbol)
+    alvo_exc = str(exchange or EXCHANGE_BINANCE).strip().lower()
+    alvo_lado = _norm_entry_side(side)
+    ids = set()
+    for rid, rsym, rexc, rside in rows:
+        if _sym_key(rsym or "") != alvo_sym:
+            continue                                   # símbolo/quote/contrato
+        if str(rexc or "").strip().lower() != alvo_exc:
+            continue                                   # outra corretora
+        if alvo_lado is not None and _norm_entry_side(rside) != alvo_lado:
+            continue                                   # lado divergente
+        ids.add(int(rid))
     if len(ids) != 1:
         return None            # 0 → sem vínculo; >1 → ambíguo, nunca escolhe
     return ids.pop()
@@ -1910,21 +1935,70 @@ async def _settle_intent_from_proof(row: dict) -> dict:
                 if not found or any(x.get("resolved_at") is None for x in found)]
     if unproven:
         return {"resolved": False, "unproven_ids": unproven, "reason": "PROOF_MISSING"}
-    states = {str(x.get("state")) for found in por_id.values() for x in found}
-    if states <= {State.FLAT}:
+    provas = [x for found in por_id.values() for x in found]
+    states = {str(x.get("state")) for x in provas}
+    if not states <= _TERMINAL_SAFE:
+        return {"resolved": False, "unproven_ids": ids, "reason": "PROOF_INCONCLUSIVE"}
+    executado = _executed_qty_from_proofs(provas)
+    if executado <= 0 and states <= {State.FLAT}:
+        # Zero executado COMPROVADO em todos os ids: aí sim não houve entrada.
         ok = await intents.mark_terminal(get_session, row["intent_key"],
                                          reason="RECONCILED_NO_EXECUTION")
         return {"resolved": bool(ok), "unproven_ids": [], "reason": "NO_EXECUTION"}
-    if State.PROTECTED in states and states <= _TERMINAL_SAFE:
-        trade_id = await _real_trade_for_dispatch(ids, symbol=symbol)
-        if trade_id is None:
-            # Execução comprovada sem vínculo: NÃO inventa trade nem encerra.
-            return {"resolved": False, "unproven_ids": ids, "reason": "TRADE_LINK_MISSING"}
-        ok = await intents.mark_confirmed(get_session, row["intent_key"],
-                                          real_trade_id=trade_id,
-                                          reason="RECONCILED_EXECUTION")
-        return {"resolved": bool(ok), "unproven_ids": [], "reason": "EXECUTION_LINKED"}
-    return {"resolved": False, "unproven_ids": ids, "reason": "PROOF_INCONCLUSIVE"}
+    # Houve execução (posição protegida AGORA ou fill já encerrado antes da
+    # recuperação). FLAT descreve ausência de posição NESTE instante — nunca
+    # ausência de execução. Sem vínculo contábil, nada encerra.
+    trade_id = await _real_trade_for_dispatch(
+        ids, symbol=symbol, exchange=row.get("exchange"), side=row.get("side"))
+    if trade_id is None:
+        await _escalate_untracked_execution(provas, executed_qty=executado)
+        return {"resolved": False, "unproven_ids": ids, "reason": "TRADE_LINK_MISSING"}
+    ok = await intents.mark_confirmed(get_session, row["intent_key"],
+                                      real_trade_id=trade_id,
+                                      reason="RECONCILED_EXECUTION")
+    return {"resolved": bool(ok), "unproven_ids": [], "reason": "EXECUTION_LINKED"}
+
+
+def _executed_qty_from_proofs(proofs) -> float:
+    """Quantidade EXECUTADA comprovada pelos incidentes resolvidos.
+
+    `min_known_fill` é o lower-bound monotônico do fill, gravado pelo ciclo antes
+    de resolver. Incidente PROTECTED implica execução mesmo sem número.
+    """
+    total = 0.0
+    for incident in proofs or ():
+        if str(incident.get("state")) == State.PROTECTED:
+            total = max(total, _finite(incident.get("min_known_fill")) or 0.0, 1e-12)
+            continue
+        total = max(total, _finite(incident.get("min_known_fill")) or 0.0)
+    return total
+
+
+async def _escalate_untracked_execution(proofs, *, executed_qty: float) -> None:
+    """Execução comprovada SEM RealTrade: vira pendência humana explícita.
+
+    Não fabrica preço, P&L nem vínculo, não devolve reserva e não libera a
+    quarentena — a intenção continua ocupando o slot até alguém reconciliar.
+    """
+    repo = _get_repo()
+    motivo = (f"execução comprovada (qty≥{executed_qty:g}) sem RealTrade "
+              f"correspondente — vínculo contábil ausente")
+    for incident in proofs or ():
+        key = incident.get("incident_key")
+        if not key or str(incident.get("state")) == State.MANUAL_REQUIRED:
+            continue
+        try:
+            await repo.update(key, state=State.MANUAL_REQUIRED, resolved_at=None,
+                              manual_reason=motivo, last_error=motivo)
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[p03][intents] escalonamento manual falhou ({key}): {exc}")
+        else:
+            log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED ({motivo})")
+    try:
+        from services import risk_service
+        await risk_service.arm_p03_pause(motivo)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def recover_entry_intents() -> dict:
@@ -1966,17 +2040,25 @@ async def recover_entry_intents() -> dict:
             if verdict["resolved"]:
                 summary["resolved"] += 1
                 continue
-            # 2. Sem prova: garante incidente para CADA id ainda não provado.
+            # 2. Sem prova: garante incidente para CADA id ainda não provado,
+            # COM os dados point-in-time da decisão — sem planned_stop nem
+            # planned_qty o incidente não consegue adotar o SL vivo que já
+            # existe, e a pendência nunca fecharia.
+            decisao = row.get("decision_payload") if isinstance(
+                row.get("decision_payload"), dict) else {}
             for dispatch_id in (verdict["unproven_ids"] or [client_order_id]):
                 result = await record_incident(
                     kind=Kind.ENTRY_SUBMISSION_UNKNOWN, symbol=symbol,
                     exchange=row.get("exchange") or EXCHANGE_BINANCE,
                     client_order_id=dispatch_id,
                     side=_norm_entry_side(row.get("side")),
+                    planned_stop=_finite(decisao.get("stop_loss")),
+                    planned_qty=_finite(decisao.get("qty")),
                     payload={"source": "entry_intent", "intent_key": row.get("intent_key"),
                              "account_ref": row.get("account_ref"),
                              "reason": row.get("reason"),
                              "dispatch_ids": list(row.get("dispatch_ids") or []),
+                             "decision_payload": dict(decisao) or None,
                              "settle_reason": verdict.get("reason")})
                 if result.get("persisted"):
                     summary["incidents"] += 1

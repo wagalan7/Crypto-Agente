@@ -57,6 +57,11 @@ class EntryIntent(Base):
     #: IDs EFETIVOS já despachados (entrada e eventual fallback), gravados
     #: ANTES de cada POST — um id desconhecido ficaria invisível à reconciliação.
     dispatch_ids: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    #: Dados POINT-IN-TIME da decisão (entry/stop/qty), gravados ANTES do envio.
+    #: A reconciliação precisa deles para ADOTAR um SL existente: `payload_fingerprint`
+    #: prova que o conteúdo não mudou, mas não devolve stop nem qty. Linha antiga
+    #: (sem este campo) permanece sem prova — e, portanto, fail-closed.
+    decision_payload: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     real_trade_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

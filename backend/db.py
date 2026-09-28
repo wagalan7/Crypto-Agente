@@ -113,6 +113,11 @@ async def init_db():
         await conn.execute(text(
             "ALTER TABLE entry_intents ADD COLUMN IF NOT EXISTS dispatch_ids JSONB"
         ))
+        # P03 — dados point-in-time da decisão (entry/stop/qty) para a
+        # recuperação conseguir ADOTAR o SL existente (aditiva).
+        await conn.execute(text(
+            "ALTER TABLE entry_intents ADD COLUMN IF NOT EXISTS decision_payload JSONB"
+        ))
         # Migrações incrementais
         await conn.execute(text(
             "ALTER TABLE recommendation_snapshots "

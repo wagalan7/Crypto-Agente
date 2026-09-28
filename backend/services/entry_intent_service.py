@@ -19,7 +19,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Any, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from sqlalchemy import func, or_, select, text, update
 
@@ -269,10 +269,26 @@ def _capacity_reason(capacity: Capacity, pending_count: int, pending_risk: float
     return None
 
 
+def decision_snapshot(payload: Any, *, qty: Any = None) -> Optional[dict]:
+    """Dados POINT-IN-TIME que a reconciliação precisa depois: entrada, stop e
+    quantidade planejada. Só números finitos entram — parcela inválida some, e
+    a ausência continua sendo ausência (nada é estimado depois)."""
+    source = payload if isinstance(payload, Mapping) else {}
+    snapshot = {}
+    for chave, bruto in (("entry", source.get("entry")),
+                         ("stop_loss", source.get("stop_loss")),
+                         ("qty", qty if qty is not None else source.get("qty"))):
+        valor = _finite(bruto)
+        if valor is not None:
+            snapshot[chave] = valor
+    return snapshot or None
+
+
 async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                   owner: str, lease_seconds: int = DEFAULT_LEASE_SECONDS,
                   capacity: Optional[Capacity] = None,
                   budget: Optional[DailyBudget] = None,
+                  decision: Optional[dict] = None,
                   now: Optional[datetime] = None) -> Reservation:
     """Reserva (ou recupera) a intenção em UMA transação, antes de qualquer POST.
 
@@ -335,6 +351,10 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     payload_fingerprint=fingerprint, state=STATE_RESERVED, reason=None,
                     lease_owner=owner, lease_expires_at=deadline, attempts=1, dispatches=0,
                     reserved_risk_usd=max(0.0, float(capacity.risk_usd) if capacity else 0.0),
+                    # Gravado ANTES de qualquer POST: depois do envio não há de
+                    # onde recuperar stop/qty da decisão que originou a ordem.
+                    decision_payload=decision_snapshot(decision if decision is not None
+                                                       else payload),
                     real_trade_id=None, created_at=moment, updated_at=moment, resolved_at=None))
                 await session.commit()
                 return Reservation(RESERVED_NEW, key, coid, STATE_RESERVED)
@@ -388,6 +408,12 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, current_state, denial)
                     row.reserved_risk_usd = novo
+            if not row.decision_payload:
+                # Linha antiga (ou criada sem os dados): completa sem sobrescrever
+                # o que já estiver gravado — a decisão em si não mudou (mesmo
+                # fingerprint), só passou a ser recuperável.
+                row.decision_payload = decision_snapshot(
+                    decision if decision is not None else payload)
             row.lease_owner, row.lease_expires_at = owner, deadline
             row.attempts = int(row.attempts or 0) + 1
             row.updated_at = moment
@@ -685,6 +711,9 @@ async def list_needing_reconciliation(session_factory, *, limit: int = 50) -> li
                      # TODOS os ids efetivamente despachados (inclui a filha
                      # `-mfb`): primária rejeitada não prova ausência de fill.
                      "dispatch_ids": list(row.dispatch_ids or []),
+                     # Stop/qty da decisão: sem eles a recuperação não consegue
+                     # nem ADOTAR um SL vivo e válido já existente.
+                     "decision_payload": dict(row.decision_payload or {}) or None,
                      "updated_at": row.updated_at} for row in rows]
     except Exception:
         return []
