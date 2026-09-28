@@ -6211,11 +6211,79 @@ def can_transition_for(config: Any, current: str, target: str) -> bool:
     return can_transition(current, target)
 
 
+#: Identidade do ESTUDO que o experimento pré-seleção avalia. A criação e a
+#: avaliação oficiais recuperam o estudo REALMENTE executado (persistido pela
+#: simulação em `policy_simulation_state`) e conferem estes campos: métricas
+#: avulsas do chamador não conferem OFFLINE_VALIDATED.
+STUDY_REQUIRED_FIELDS = ("population", "candidate_config_hash", "dataset_fingerprint",
+                         "cutoff_ms", "evidence")
+STUDY_MISSING = "PRESELECTION_STUDY_MISSING"
+STUDY_MISMATCH = "PRESELECTION_STUDY_MISMATCH"
+POST_SELECTION_LOADER_BLOCKED = "POST_SELECTION_LOADER_NOT_FOR_PRE_SELECTION"
+
+
+async def load_preselection_study(*, experiment_key: str, universe_version: str,
+                                  population: str = "SHADOW") -> Dict[str, Any]:
+    """Recupera o ESTUDO persistido pela simulação pré-seleção.
+
+    Reutiliza a persistência que já existe (`policy_simulation_state`): nada de
+    catálogo ou motor paralelo. Estado ilegível NÃO é "sem estudo" — é falha de
+    leitura, e bloqueia igual.
+    """
+    try:
+        from db import get_session
+        from services import policy_state_service as ps
+        leitura = await ps.read_state(get_session, experiment_key=experiment_key,
+                                      universe_version=universe_version,
+                                      population=population)
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "reason_code": STUDY_MISSING,
+                "error": type(exc).__name__, "study": None}
+    if not leitura.get("available"):
+        return {"available": False, "reason_code": leitura.get("reason_code")
+                or STUDY_MISSING, "study": None}
+    estado = leitura.get("state") or {}
+    payload = estado.get("payload") if isinstance(estado.get("payload"), dict) else {}
+    estudo = payload.get("study") if isinstance(payload.get("study"), dict) else None
+    if not estudo:
+        return {"available": False, "reason_code": STUDY_MISSING, "study": None}
+    return {"available": True, "reason_code": "STUDY_LOADED", "study": estudo,
+            "generation": estado.get("generation"),
+            "state_key": estado.get("state_key")}
+
+
+def verify_study_identity(study: Any, *, candidate_config: Any, fingerprint: Any,
+                          cutoff: Any) -> Dict[str, Any]:
+    """Confere que o estudo recuperado é O DESTE experimento.
+
+    População, hash da configuração candidata, dataset e corte precisam
+    coincidir. Divergência recusa ANTES de qualquer leitura de outcome.
+    """
+    estudo = study if isinstance(study, Mapping) else {}
+    faltando = [campo for campo in STUDY_REQUIRED_FIELDS if estudo.get(campo) in (None, "")]
+    if faltando:
+        return {"ok": False, "reason_code": STUDY_MISSING, "missing": faltando}
+    divergentes = []
+    if str(estudo.get("population")) != "SHADOW":
+        divergentes.append("population")
+    if str(estudo.get("candidate_config_hash") or "") != canonical_hash(candidate_config):
+        divergentes.append("candidate_config_hash")
+    if str(estudo.get("dataset_fingerprint") or "") != str(fingerprint or ""):
+        divergentes.append("dataset_fingerprint")
+    corte = estudo.get("cutoff_ms")
+    esperado = int(_utc(cutoff).timestamp() * 1000) if _utc(cutoff) else None
+    if esperado is None or not isinstance(corte, (int, float)) or int(corte) != esperado:
+        divergentes.append("cutoff_ms")
+    if divergentes:
+        return {"ok": False, "reason_code": STUDY_MISMATCH, "diverged": divergentes}
+    return {"ok": True, "reason_code": "STUDY_VERIFIED", "diverged": []}
+
+
 def evaluate_preselection_candidate(evidence: Any) -> Dict[str, Any]:
     """Avaliação offline do tipo PRÉ-SELEÇÃO, com o runner/população dele.
 
-    Não lê outcomes pós-seleção: consome a evidência calculada pelo caminho
-    próprio (observações R09 → export R10B → walk-forward → go/no-go do R12).
+    Não lê outcomes pós-seleção: consome a evidência PRODUZIDA pelo estudo
+    recuperado (observações R09 → export R10B → walk-forward → go/no-go do R12).
     Sem evidência suficiente o veredito é INSUFFICIENT_DATA — nunca aprovação.
     """
     from services import preselection_experiment_service as r12
@@ -6241,13 +6309,18 @@ def evaluate_preselection_candidate(evidence: Any) -> Dict[str, Any]:
 
 async def create_preselection_experiment(*, champion: Dict[str, Any],
                                          config: Dict[str, Any], objective: str,
-                                         evidence: Any, cutoff: datetime,
+                                         study_ref: Mapping[str, Any],
+                                         cutoff: datetime,
                                          fingerprint: str) -> Dict[str, Any]:
     """CRIAÇÃO oficial de um experimento do tipo pré-seleção.
 
     Mesma tabela, mesmo lock, mesma chave de identidade e mesma exclusividade do
-    ciclo oficial — só a população avaliada e o fim do ciclo mudam. Nada aqui
-    promove, libera LIVE ou toca execução.
+    ciclo oficial — só a população avaliada e o fim do ciclo mudam.
+
+    A evidência NÃO vem do chamador: `study_ref` aponta o estudo persistido pela
+    simulação pré-seleção, que é recuperado e tem a identidade conferida
+    (população, hash da candidata, dataset e corte) ANTES de qualquer veredito.
+    Nada aqui promove, libera LIVE ou toca execução.
     """
     if not P05_ANALYTICS_ENABLED:
         return {"ok": False, "blocked": True, "reason_code": "P05_ANALYTICS_DISABLED"}
@@ -6264,7 +6337,32 @@ async def create_preselection_experiment(*, champion: Dict[str, Any],
     except CandidateValidationError as exc:
         return {"ok": False, "blocked": True, "reason_code": "INVALID_CANDIDATE_CONFIG",
                 "error": str(exc)}
-    offline = evaluate_preselection_candidate(evidence)
+    referencia = study_ref if isinstance(study_ref, Mapping) else {}
+    recuperado = await load_preselection_study(
+        experiment_key=str(referencia.get("experiment_key") or ""),
+        universe_version=str(referencia.get("universe_version") or ""),
+        population=str(referencia.get("population") or "SHADOW"))
+    if not recuperado["available"]:
+        return {"ok": False, "blocked": True, "reason_code": recuperado["reason_code"],
+                "study_ref": dict(referencia)}
+    conferencia = verify_study_identity(recuperado["study"], candidate_config=validated,
+                                        fingerprint=fingerprint, cutoff=cutoff)
+    if not conferencia["ok"]:
+        return {"ok": False, "blocked": True, "reason_code": conferencia["reason_code"],
+                "diverged": conferencia.get("diverged"),
+                "missing": conferencia.get("missing"), "study_ref": dict(referencia)}
+    estudo = recuperado["study"]
+    offline = {**evaluate_preselection_candidate(estudo.get("evidence")),
+               "study": {campo: estudo.get(campo) for campo in
+                         ("population", "study_kind", "policy_version",
+                          "universe_version", "baseline_config_hash",
+                          "candidate_config_hash", "comparison_scope", "bundle_hash",
+                          "costs_hash", "dataset_fingerprint", "cutoff_ms",
+                          "evidence_key", "gate_verdict", "criteria_hash",
+                          "wf_state", "wf_winner", "folds_executed",
+                          "replay_admitted")},
+               "study_ref": dict(referencia),
+               "study_generation": recuperado.get("generation")}
     from db import get_session
     champion_hash = canonical_hash(champion)
     candidate_hash = canonical_hash(validated)
@@ -6279,6 +6377,7 @@ async def create_preselection_experiment(*, champion: Dict[str, Any],
         await session.commit()
         return {"ok": True, "experiment_key": key, "status": exp.status,
                 "experiment_type": PRE_SELECTION_TYPE, "offline": offline,
+                "study_bound": True, "study_ref": dict(referencia),
                 "promotable": False, "live_approval": "UNAVAILABLE"}
 
 
@@ -6328,6 +6427,80 @@ async def start_preselection_shadow(exp_id: int) -> Dict[str, Any]:
         return {"ok": True, "status": exp.status, "experiment_key": exp.experiment_key,
                 "population": "PRE_SELECTION", "simulation_only": True,
                 "promotable": False}
+
+
+async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
+    """Avaliação oficial do SHADOW do tipo pré-seleção.
+
+    Recupera o MESMO estudo vinculado na criação, reconfere a identidade e só
+    então lê a evidência dele. NUNCA chama `_load_shadow` (coorte pós-seleção):
+    são populações diferentes e os outcomes de uma não descrevem a outra.
+    """
+    if not (P05_ANALYTICS_ENABLED and P05_CHALLENGER_SHADOW_ENABLED):
+        return {"ok": False, "blocked": True, "reason_code": "P05_SHADOW_DISABLED"}
+    from db import get_session
+    from models.strategy_experiment import StrategyExperiment as E
+    from sqlalchemy import select
+    async with get_session() as session:
+        await _acquire_p05_lock(session, _P05_SHADOW_LOCK_KEY)
+        exp = (await session.execute(
+            select(E).where(E.id == exp_id).with_for_update())).scalar_one_or_none()
+        if exp is None:
+            return {"ok": False, "error": "experimento não encontrado"}
+        if not is_pre_selection_experiment(exp):
+            return {"ok": False, "blocked": True, "reason_code": "EXPERIMENT_TYPE_MISMATCH",
+                    "error": "este caminho é do tipo pré-seleção", "status": exp.status}
+        if exp.status != STATUS_SHADOW:
+            return {"ok": False, "error": f"experimento não está em SHADOW (status={exp.status})",
+                    "status": exp.status}
+        offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
+        referencia = offline.get("study_ref") if isinstance(offline.get("study_ref"), dict) else {}
+        config_congelada = dict(exp.candidate_config or {})
+        fingerprint, corte = exp.dataset_fingerprint, exp.dataset_cutoff
+        experiment_key, status_atual = exp.experiment_key, exp.status
+    recuperado = await load_preselection_study(
+        experiment_key=str(referencia.get("experiment_key") or ""),
+        universe_version=str(referencia.get("universe_version") or ""),
+        population=str(referencia.get("population") or "SHADOW"))
+    if not recuperado["available"]:
+        return {"ok": False, "blocked": True, "reason_code": recuperado["reason_code"],
+                "outcomes_read": False, "status": status_atual}
+    conferencia = verify_study_identity(recuperado["study"],
+                                        candidate_config=config_congelada,
+                                        fingerprint=fingerprint, cutoff=corte)
+    if not conferencia["ok"]:
+        return {"ok": False, "blocked": True, "reason_code": conferencia["reason_code"],
+                "diverged": conferencia.get("diverged"), "outcomes_read": False,
+                "status": status_atual}
+    estudo = recuperado["study"]
+    veredito = evaluate_preselection_candidate(estudo.get("evidence"))
+    async with get_session() as session:
+        await _acquire_p05_lock(session, _P05_SHADOW_LOCK_KEY)
+        exp = (await session.execute(
+            select(E).where(E.id == exp_id).with_for_update())).scalar_one_or_none()
+        if exp is None or exp.status != STATUS_SHADOW \
+                or exp.experiment_key != experiment_key:
+            return {"ok": False, "error": "experimento mudou de estado durante a avaliação"}
+        exp.shadow_metrics = {**(exp.shadow_metrics if isinstance(exp.shadow_metrics, dict) else {}),
+                              "population": "PRE_SELECTION", "simulation_only": True,
+                              "study_generation": recuperado.get("generation"),
+                              "gate_verdict": veredito.get("gate_verdict"),
+                              "reason_codes": veredito.get("reason_codes"),
+                              "live_approval": "UNAVAILABLE"}
+        # Sem promoção: o ciclo do tipo termina aqui. REJECTED continua possível.
+        if veredito["verdict"] == STATUS_REJECTED and can_transition_for(
+                exp.candidate_config, exp.status, STATUS_REJECTED):
+            exp.status = STATUS_REJECTED
+            exp.decided_at = datetime.now(timezone.utc)
+        status_final = exp.status
+        await session.commit()
+    return {"ok": True, "status": status_final, "experiment_key": experiment_key,
+            "population": "PRE_SELECTION", "outcomes_read": False,
+            "post_selection_loader_used": False,
+            "study_generation": recuperado.get("generation"),
+            "gate_verdict": veredito.get("gate_verdict"),
+            "verdict": veredito["verdict"], "promotable": False,
+            "live_approval": "UNAVAILABLE"}
 
 
 async def promote_preselection(exp_id: int) -> Dict[str, Any]:
@@ -6454,8 +6627,14 @@ async def evaluate_shadow(exp_id: int) -> Dict[str, Any]:
         )).scalar_one_or_none()
         if exp is None:
             return {"ok": False, "error": "experimento não encontrado"}
+        # DESPACHO POR TIPO antes de carregar qualquer outcome: a coorte
+        # pré-seleção tem avaliação própria e NUNCA passa pelo `_load_shadow`.
+        if is_pre_selection_experiment(exp):
+            tipo_pre = True
+        else:
+            tipo_pre = False
         # P05.1 é ANALYTICS_ONLY: nunca há shadow para avaliar.
-        if is_contextual_experiment(exp):
+        if not tipo_pre and is_contextual_experiment(exp):
             return {"ok": False, "blocked": True,
                     "reason_code": P051_BLOCK_REASON,
                     "error": ("experimento P05.1 (regra contextual) é somente análise "
@@ -6465,6 +6644,10 @@ async def evaluate_shadow(exp_id: int) -> Dict[str, Any]:
         if exp.status != STATUS_SHADOW:
             return {"ok": False, "error": f"experimento não está em SHADOW (status={exp.status})",
                     "status": exp.status}
+        if tipo_pre:
+            desviar = True
+        else:
+            desviar = False
         started = _utc(exp.shadow_started_at) or _utc(exp.created_at)
         cfg = dict(exp.candidate_config or {})
         champion = _frozen_champion(exp)
@@ -6479,6 +6662,9 @@ async def evaluate_shadow(exp_id: int) -> Dict[str, Any]:
         champion_hash = exp.champion_hash
         objective = exp.objective
 
+    if desviar:
+        # Caminho OFICIAL do tipo — sai ANTES do loader pós-seleção.
+        return await evaluate_preselection_shadow(exp_id)
     days = max(1, min(365, int((datetime.now(timezone.utc) - started).days) + 1))
     rows, _dq = await _load_shadow(days)
     rows = [r for r in rows

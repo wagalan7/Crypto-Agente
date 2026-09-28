@@ -198,7 +198,12 @@ async def run(args) -> dict:
          "side": decision["side"], "decision_ts_ms": decision["decision_ts_ms"],
          **decision["levels"]} for decision in eligible]
     report["replay_input"] = {"source": "R10B_EXPORT" if exportadas else "IN_MEMORY_DECISIONS",
-                              "rows": len(entrada)}
+                              "rows": len(entrada),
+                              # Identidade do dataset que alimentou o replay —
+                              # o experimento oficial confere isso depois.
+                              "fingerprint": evidence_key_of(
+                                  sorted(linha["opportunity_key"] for linha in entrada),
+                                  "R10B_EXPORT" if exportadas else "IN_MEMORY_DECISIONS")}
     candidates, bars_by_id, quotes = [], {}, {}
     for linha in entrada:
         key = linha["opportunity_key"]
@@ -316,7 +321,9 @@ async def run(args) -> dict:
     report["policy_simulation"] = await simulate_policy_state(
         args, study=study, replay=replay, candidate_replay=candidate_replay,
         candidate_config_diff=report["candidate_replay"]["config_diff"],
-        gate=gate, candidates=candidates)
+        gate=gate, candidates=candidates, evidence=evidencia,
+        comparison=report["comparison"],
+        dataset_fingerprint=report.get("replay_input", {}).get("fingerprint"))
 
     report["next_step"] = ("Acumular amostra prospectiva pelo coletor ligado antes de "
                            "qualquer go/no-go; o adaptador operacional continua por implementar.")
@@ -440,7 +447,9 @@ def evidence_key_of(*parts) -> str:
 
 
 async def simulate_policy_state(args, *, study, replay, candidate_replay,
-                                candidate_config_diff, gate, candidates) -> dict:
+                                candidate_config_diff, gate, candidates,
+                                evidence=None, comparison=None,
+                                dataset_fingerprint=None) -> dict:
     """Executa a política/histerese REAL sobre a evidência recém-calculada.
 
     A identidade é (experimento, versão da política, universo, população) e o
@@ -448,6 +457,7 @@ async def simulate_policy_state(args, *, study, replay, candidate_replay,
     relógio de parede: resultado futuro não entra em decisão passada. Estado
     ilegível NÃO é primeiro estado: nesse caso nada avança.
     """
+    from services import offline_replay_service as r10a
     from services import policy_state_service as ps
     from services import robust_policy_service as rp
 
@@ -497,6 +507,33 @@ async def simulate_policy_state(args, *, study, replay, candidate_replay,
             progresso, symbol=POLICY_SCOPE, action=acao, now_ms=now_ms,
             period_seconds=PERIOD_SECONDS, evidence_key=evidence_key,
             required_periods=REQUIRED_PERIODS, universe_source=universe_version)
+        # O ESTUDO fica persistido junto do estado: quem avaliar o experimento
+        # depois precisa verificar QUAL estudo produziu a evidência — população,
+        # configurações, custos, dataset, corte e o resultado calculado.
+        estudo = {
+            "population": rp.POPULATION_SHADOW,
+            "study_kind": "PRE_SELECTION",
+            "policy_version": rp.POLICY_VERSION,
+            "universe_version": universe_version,
+            "baseline_config_hash": (comparison or {}).get("baseline_config_hash"),
+            "candidate_config_hash": (comparison or {}).get("candidate_config_hash"),
+            "comparison_scope": (comparison or {}).get("scope"),
+            "bundle_hash": (comparison or {}).get("bundle_hash"),
+            "costs_hash": r10a.CostConfig(fee_bps_per_side=4.0,
+                                          slippage_bps_per_side=2.0,
+                                          funding_bps_per_bar=1.0
+                                          ).manifest()["config_hash"],
+            "dataset_fingerprint": dataset_fingerprint or evidence_key,
+            "cutoff_ms": now_ms,
+            "evidence_key": evidence_key,
+            "gate_verdict": gate["verdict"],
+            "criteria_hash": gate.get("criteria_hash"),
+            "wf_state": study["verdict"]["state"],
+            "wf_winner": study["verdict"]["winner"],
+            "folds_executed": study["folds_executed"],
+            "replay_admitted": replay["admitted"],
+            "evidence": dict(evidence or {}),
+        }
         payload = {"hysteresis": {"symbol": avancado.symbol, "action": avancado.action,
                                   "periods": avancado.periods,
                                   "last_period": avancado.last_period,
@@ -504,7 +541,8 @@ async def simulate_policy_state(args, *, study, replay, candidate_replay,
                                   "universe_source": avancado.universe_source},
                    "ready": bool(veredito["ready"]),
                    "gate_verdict": gate["verdict"],
-                   "study_winner": study["verdict"]["winner"]}
+                   "study_winner": study["verdict"]["winner"],
+                   "study": estudo}
         # A publicação é um CAS pela geração que este cálculo LEU: se outro
         # processo avançou o estado no meio, a escrita é recusada e a rodada
         # recalcula a partir da geração nova (uma vez, sem contar evidência

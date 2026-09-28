@@ -13,7 +13,7 @@ o comparador legado ignorava o tipo versionado, aceitando um candidato
 PRE_SELECTION porque as chaves eram as mesmas.
 """
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -338,7 +338,7 @@ async def run():
 
     # ── 9b. H: caminho PERMITIDO do tipo pré-seleção no CATÁLOGO OFICIAL ──
     from models.strategy_experiment import StrategyExperiment as E
-    from sqlalchemy import select as sql_select
+    from sqlalchemy import select as sql_select, text as sql_text
     async with db._engine.begin() as conn:
         await conn.run_sync(db.Base.metadata.create_all, tables=[E.__table__])
     os.environ["P05_ANALYTICS_ENABLED"] = "true"
@@ -360,12 +360,93 @@ async def run():
         "fidelity_discrepancy_pct": 0.0,
     }
     corte = datetime(2026, 9, 20, tzinfo=timezone.utc)
+    corte_ms = int(corte.timestamp() * 1000)
+    fingerprint_estudo = "fp-pre-1"
+
+    # SENTINELA: o loader pós-seleção NÃO pode ser tocado pelo tipo pré-seleção.
+    LOADER_POS = []
+
+    async def loader_sentinela(days):
+        LOADER_POS.append(("POST_SELECTION_OUTCOMES_READ", days))
+        raise AssertionError("POST_SELECTION_OUTCOMES_READ")
+
+    # O ESTUDO é persistido pela simulação (mesma tabela do R11), com a
+    # identidade que o catálogo oficial vai conferir: métricas avulsas do
+    # chamador não entram mais.
+    async def publicar_estudo(*, candidato_config, fingerprint, cutoff_ms,
+                              evidencia, experimento="estudo-pre-1",
+                              universo="SYN-6", periodo="P-ESTUDO", chave="ev-estudo"):
+        estudo = {
+            "population": "SHADOW", "study_kind": "PRE_SELECTION",
+            "policy_version": rp.POLICY_VERSION, "universe_version": universo,
+            "baseline_config_hash": "base-hash", "comparison_scope": "MANAGEMENT_ONLY",
+            "candidate_config_hash": evid.canonical_hash(candidato_config),
+            "bundle_hash": "bundle-hash", "costs_hash": "costs-hash",
+            "dataset_fingerprint": fingerprint, "cutoff_ms": cutoff_ms,
+            "evidence_key": chave, "gate_verdict": "GO_CANDIDATE",
+            "criteria_hash": "crit", "wf_state": "EVIDENCE_AVAILABLE",
+            "wf_winner": None, "folds_executed": 6, "replay_admitted": 3,
+            "evidence": dict(evidencia),
+        }
+        publicado = await ps.publish_generation(
+            db.get_session, experiment_key=experimento, universe_version=universo,
+            population=rp.POPULATION_SHADOW, period_key=periodo, evidence_key=chave,
+            now_ms=cutoff_ms, payload={"hysteresis": {}, "study": estudo})
+        return {"experiment_key": experimento, "universe_version": universo,
+                "population": "SHADOW"}, publicado
+
+    validada = evid.validate_candidate_config(champion, pre_config)
+    referencia, publicado = await publicar_estudo(
+        candidato_config=validada, fingerprint=fingerprint_estudo,
+        cutoff_ms=corte_ms, evidencia=evidencia_ok)
+    check("estudo_pre_selecao_persistido", publicado["published"], str(publicado))
+
+    # 1. Métricas avulsas + estudo AUSENTE não validam nada.
+    sem_estudo = await evid.create_preselection_experiment(
+        champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        study_ref={"experiment_key": "nao-existe", "universe_version": "SYN-6"},
+        cutoff=corte, fingerprint="NO_DATASET")
+    check("sem_estudo_nao_cria",
+          sem_estudo["ok"] is False
+          and sem_estudo["reason_code"] in (evid.STUDY_MISSING, "NO_STATE"),
+          str(sem_estudo)[:200])
+
+    # 2. Estudo existente mas com dataset/corte divergentes é recusado.
+    divergente = await evid.create_preselection_experiment(
+        champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        study_ref=referencia, cutoff=corte, fingerprint="OUTRO_DATASET")
+    check("dataset_divergente_recusa",
+          divergente["ok"] is False and divergente["reason_code"] == evid.STUDY_MISMATCH
+          and "dataset_fingerprint" in (divergente.get("diverged") or []),
+          str(divergente)[:220])
+    outro_corte = await evid.create_preselection_experiment(
+        champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        study_ref=referencia, cutoff=corte + timedelta(days=1),
+        fingerprint=fingerprint_estudo)
+    check("corte_divergente_recusa",
+          outro_corte["ok"] is False and "cutoff_ms" in (outro_corte.get("diverged") or []),
+          str(outro_corte)[:200])
+    outra_config = await evid.create_preselection_experiment(
+        champion=champion, config=r12.tag_config({"SCORE_MIN": 72}),
+        objective=evid.OBJECTIVE_MORE_OPERATIONS, study_ref=referencia, cutoff=corte,
+        fingerprint=fingerprint_estudo)
+    check("config_divergente_recusa",
+          outra_config["ok"] is False
+          and "candidate_config_hash" in (outra_config.get("diverged") or []),
+          str(outra_config)[:200])
+
+    # 3. Criação LEGÍTIMA: vinculada ao estudo recuperado e conferido.
     criacao = await evid.create_preselection_experiment(
         champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
-        evidence=evidencia_ok, cutoff=corte, fingerprint="fp-pre-1")
+        study_ref=referencia, cutoff=corte, fingerprint=fingerprint_estudo)
     check("criacao_oficial_do_tipo_pre_selecao",
           criacao["ok"] and criacao["experiment_type"] == evid.PRE_SELECTION_TYPE,
           str(criacao)[:220])
+    check("criacao_vinculada_ao_estudo",
+          criacao["study_bound"] is True
+          and criacao["offline"]["study"]["dataset_fingerprint"] == fingerprint_estudo
+          and criacao["offline"]["study"]["candidate_config_hash"]
+          == evid.canonical_hash(validada), str(criacao["offline"].get("study"))[:220])
     check("criacao_nao_promove",
           criacao["promotable"] is False and criacao["live_approval"] == "UNAVAILABLE",
           str(criacao)[:200])
@@ -409,10 +490,14 @@ async def run():
           and depois_restart[1]["population"] == "PRE_SELECTION", str(depois_restart))
 
     # Concorrência indevida: um segundo challenger do MESMO tipo é recusado.
-    outra_config = r12.tag_config({"SCORE_MIN": 74})
+    cfg2 = r12.tag_config({"SCORE_MIN": 74})
+    ref2, _ = await publicar_estudo(
+        candidato_config=evid.validate_candidate_config(champion, cfg2),
+        fingerprint="fp-pre-2", cutoff_ms=corte_ms, evidencia=evidencia_ok,
+        experimento="estudo-pre-2", periodo="P-ESTUDO-2", chave="ev-estudo-2")
     criacao2 = await evid.create_preselection_experiment(
-        champion=champion, config=outra_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
-        evidence=evidencia_ok, cutoff=corte, fingerprint="fp-pre-2")
+        champion=champion, config=cfg2, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        study_ref=ref2, cutoff=corte, fingerprint="fp-pre-2")
     async with db.get_session() as session:
         exp2 = (await session.execute(
             sql_select(E.id).where(E.experiment_key == criacao2["experiment_key"]))).scalar_one()
@@ -423,10 +508,14 @@ async def run():
           str(segunda_sombra)[:200])
 
     # Config congelada não muda: mesma chave com conteúdo diferente é recusada.
+    ref_outro, _ = await publicar_estudo(
+        candidato_config=validada, fingerprint="fp-OUTRO", cutoff_ms=corte_ms,
+        evidencia=evidencia_ok, experimento="estudo-pre-outro",
+        periodo="P-ESTUDO-3", chave="ev-estudo-3")
     try:
         await evid.create_preselection_experiment(
             champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
-            evidence=evidencia_ok, cutoff=corte, fingerprint="fp-OUTRO")
+            study_ref=ref_outro, cutoff=corte, fingerprint="fp-OUTRO")
         alterou = True
     except RuntimeError as exc:
         alterou = "FINGERPRINT" not in str(exc)
@@ -443,6 +532,87 @@ async def run():
         contexto = await evid.get_active_shadow_context(session)
     check("shadow_pre_selecao_nao_anota_pos_selecao", contexto is None, str(contexto))
 
+    # ── H: avaliação OFICIAL despacha por tipo ANTES de carregar outcomes ─
+    from unittest.mock import patch as _patch
+    with _patch.object(evid, "_load_shadow", loader_sentinela):
+        oficial = await evid.evaluate_shadow(exp_id)
+    check("avaliacao_oficial_despacha_o_tipo",
+          oficial["ok"] is True and oficial["population"] == "PRE_SELECTION",
+          str(oficial)[:220])
+    check("sentinela_do_loader_pos_selecao_nao_disparou",
+          LOADER_POS == [], str(LOADER_POS))
+    check("avaliacao_declara_que_nao_leu_outcomes_pos",
+          oficial["outcomes_read"] is False
+          and oficial["post_selection_loader_used"] is False, str(oficial)[:200])
+    check("avaliacao_usa_a_geracao_do_estudo",
+          oficial["study_generation"] == publicado["generation"], str(oficial)[:200])
+    check("avaliacao_nao_promove",
+          oficial["promotable"] is False
+          and oficial["live_approval"] == "UNAVAILABLE", str(oficial)[:200])
+
+    # Reavaliação (repetição) conserva o MESMO estudo e não promove.
+    with _patch.object(evid, "_load_shadow", loader_sentinela):
+        de_novo = await evid.evaluate_shadow(exp_id)
+    check("reavaliacao_conserva_o_estudo",
+          de_novo["ok"] and de_novo["study_generation"] == oficial["study_generation"]
+          and de_novo["verdict"] == oficial["verdict"], str(de_novo)[:200])
+    check("reavaliacao_nao_toca_loader_pos_selecao", LOADER_POS == [], str(LOADER_POS))
+
+    # Restart: processo novo (pool derrubado) mantém vínculo e avaliação.
+    await db._engine.dispose()
+    with _patch.object(evid, "_load_shadow", loader_sentinela):
+        pos_restart = await evid.evaluate_shadow(exp_id)
+    check("restart_mantem_estudo_e_veredito",
+          pos_restart["ok"] and pos_restart["study_generation"] == oficial["study_generation"],
+          str(pos_restart)[:200])
+
+    # Estudo que some depois: a avaliação BLOQUEIA (não lê outcomes alheios).
+    async with db.get_session() as session:
+        await session.execute(sql_text(
+            "UPDATE policy_simulation_state SET payload = payload - 'study' "
+            "WHERE experiment_key = 'estudo-pre-1'"))
+        await session.commit()
+    with _patch.object(evid, "_load_shadow", loader_sentinela):
+        sem_estudo_depois = await evid.evaluate_shadow(exp_id)
+    check("estudo_ausente_bloqueia_avaliacao",
+          sem_estudo_depois["ok"] is False
+          and sem_estudo_depois["outcomes_read"] is False, str(sem_estudo_depois)[:200])
+    check("bloqueio_nao_toca_loader_pos_selecao", LOADER_POS == [], str(LOADER_POS))
+    # Restaura o estudo para os passos seguintes.
+    _, republicado = await publicar_estudo(
+        candidato_config=validada, fingerprint=fingerprint_estudo, cutoff_ms=corte_ms,
+        evidencia=evidencia_ok, periodo="P-ESTUDO-REPUB", chave="ev-estudo-repub")
+    check("estudo_republicado", republicado["published"], str(republicado))
+
+    # Legado pós-seleção continua usando o caminho dele (loader real).
+    # O catálogo oficial admite UM SHADOW por vez (índice único legado), então
+    # a linha pré-seleção sai de SHADOW antes — a exclusividade é preservada.
+    async with db.get_session() as session:
+        await session.execute(sql_text(
+            "UPDATE strategy_experiments SET status = 'REJECTED' WHERE id = :i"),
+            {"i": exp_id})
+        await session.commit()
+    async with db.get_session() as session:
+        legado_row = E(experiment_key="legado-pos-1", champion_hash="h-champ",
+                       candidate_hash="h-cand", status=evid.STATUS_SHADOW,
+                       objective=evid.OBJECTIVE_MORE_OPERATIONS,
+                       candidate_config={"SCORE_MIN": 72.0},
+                       dataset_fingerprint="fp-legado", dataset_cutoff=corte,
+                       offline_metrics={}, created_at=datetime.now(timezone.utc),
+                       updated_at=datetime.now(timezone.utc))
+        session.add(legado_row)
+        await session.commit()
+        legado_id = legado_row.id
+    with _patch.object(evid, "_load_shadow", loader_sentinela):
+        try:
+            await evid.evaluate_shadow(legado_id)
+        except AssertionError:
+            pass
+    check("legado_pos_selecao_ainda_usa_o_loader_dele",
+          LOADER_POS and LOADER_POS[0][0] == "POST_SELECTION_OUTCOMES_READ",
+          str(LOADER_POS))
+    LOADER_POS.clear()
+
     # Promoção declarada como NÃO IMPLEMENTADA (código por terminar).
     promocao = await evid.promote_preselection(exp_id)
     check("promocao_do_tipo_declarada_nao_implementada",
@@ -451,10 +621,15 @@ async def run():
           and promocao["live_approval"] == "UNAVAILABLE", str(promocao)[:200])
 
     # Evidência insuficiente NÃO valida o candidato.
+    cfg_fraca = r12.tag_config({"SCORE_MIN": 75})
+    ref_fraca, _ = await publicar_estudo(
+        candidato_config=evid.validate_candidate_config(champion, cfg_fraca),
+        fingerprint="fp-pre-3", cutoff_ms=corte_ms,
+        evidencia={"total_shadow_trades": 1},
+        experimento="estudo-pre-fraco", periodo="P-ESTUDO-4", chave="ev-estudo-4")
     fraca = await evid.create_preselection_experiment(
-        champion=champion, config=r12.tag_config({"SCORE_MIN": 75}), objective=evid.OBJECTIVE_MORE_OPERATIONS,
-        evidence={"sample": {"resolved": 1}, "source": {"derived_from_computed_results": True}},
-        cutoff=corte, fingerprint="fp-pre-3")
+        champion=champion, config=cfg_fraca, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        study_ref=ref_fraca, cutoff=corte, fingerprint="fp-pre-3")
     check("evidencia_fraca_nao_valida",
           fraca["offline"]["verdict"] in (evid.STATUS_INSUFFICIENT, evid.STATUS_REJECTED),
           str(fraca["offline"])[:200])
