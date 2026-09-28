@@ -43,6 +43,8 @@ LIVE_ADAPTER_STATUS = "LIVE_ADAPTER_NOT_IMPLEMENTED"
 POLICY_SCOPE = "PORTFOLIO"
 PERIOD_SECONDS = 86_400
 REQUIRED_PERIODS = 2
+#: Reprocessamento idempotente LIMITADO após conflito de geração.
+MAX_RECALCULOS = 3
 
 
 def synthetic_states(core, *, symbols: int, seed: int, t0: int):
@@ -500,11 +502,52 @@ async def simulate_policy_state(args, *, study, replay, candidate_replay,
                    "ready": bool(veredito["ready"]),
                    "gate_verdict": gate["verdict"],
                    "study_winner": study["verdict"]["winner"]}
+        # A publicação é um CAS pela geração que este cálculo LEU: se outro
+        # processo avançou o estado no meio, a escrita é recusada e a rodada
+        # recalcula a partir da geração nova (uma vez, sem contar evidência
+        # duas vezes).
+        lida = int((leitura["state"] or {}).get("generation") or 0)
         publicacao = await ps.publish_generation(
             db.get_session, period_key=rp.period_key(now_ms, period_seconds=PERIOD_SECONDS),
-            evidence_key=evidence_key, now_ms=now_ms, payload=payload, **identidade)
+            evidence_key=evidence_key, now_ms=now_ms, payload=payload,
+            expected_generation=lida, **identidade)
+        recalculos = 0
+        while (publicacao.get("reason_code") == "GENERATION_STALE"
+               and recalculos < MAX_RECALCULOS):
+            recalculos += 1
+            releitura = await ps.read_state(db.get_session, **identidade)
+            if not releitura["available"]:
+                return {**resumo, "state": "UNAVAILABLE",
+                        "reason_code": releitura["reason_code"],
+                        "recalculations": recalculos}
+            atual = releitura["state"] or {}
+            guardado = (atual.get("payload") or {}).get("hysteresis")
+            progresso = (rp.HysteresisProgress(
+                symbol=guardado.get("symbol"), action=guardado.get("action"),
+                periods=int(guardado.get("periods") or 0),
+                last_period=guardado.get("last_period"),
+                last_evidence=guardado.get("last_evidence"),
+                universe_source=guardado.get("universe_source"))
+                if isinstance(guardado, dict) and guardado.get("symbol") else None)
+            avancado, veredito = rp.advance_hysteresis(
+                progresso, symbol=POLICY_SCOPE, action=acao, now_ms=now_ms,
+                period_seconds=PERIOD_SECONDS, evidence_key=evidence_key,
+                required_periods=REQUIRED_PERIODS, universe_source=universe_version)
+            payload = {**payload,
+                       "hysteresis": {"symbol": avancado.symbol, "action": avancado.action,
+                                      "periods": avancado.periods,
+                                      "last_period": avancado.last_period,
+                                      "last_evidence": avancado.last_evidence,
+                                      "universe_source": avancado.universe_source},
+                       "ready": bool(veredito["ready"])}
+            publicacao = await ps.publish_generation(
+                db.get_session,
+                period_key=rp.period_key(now_ms, period_seconds=PERIOD_SECONDS),
+                evidence_key=evidence_key, now_ms=now_ms, payload=payload,
+                expected_generation=int(atual.get("generation") or 0), **identidade)
         return {**resumo,
                 "state": "EXECUTED",
+                "recalculations": recalculos,
                 "resumed_from_state": bool(progresso is not None),
                 "previous_generation": (leitura["state"] or {}).get("generation"),
                 "periods": veredito["periods"],

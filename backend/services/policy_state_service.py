@@ -77,8 +77,14 @@ async def load_state(session_factory, *, experiment_key: str, universe_version: 
 async def publish_generation(session_factory, *, experiment_key: str,
                              universe_version: str, period_key: str, evidence_key: str,
                              now_ms: int, population: str = POPULATION_SHADOW,
-                             payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                             payload: Optional[Dict[str, Any]] = None,
+                             expected_generation: Optional[int] = None) -> Dict[str, Any]:
     """Publica uma geração NOVA de forma atômica e com histerese persistente.
+
+    `expected_generation` é a geração sobre a qual o CÁLCULO foi feito: se o
+    estado avançou desde a leitura, a escrita é RECUSADA (`GENERATION_STALE`) —
+    período diferente não autoriza publicar um cálculo de versão antiga por
+    cima do avanço de outro processo. Quem for recusado relê e recalcula.
 
     Exige período NOVO **e** evidência NOVA — repetir a chamada no mesmo período
     ou com a mesma evidência é no-op idempotente, não uma geração a mais. A
@@ -101,6 +107,13 @@ async def publish_generation(session_factory, *, experiment_key: str,
                 .where(PolicySimulationState.state_key == key)
                 .with_for_update())).scalar_one_or_none()
             if row is None:
+                if expected_generation not in (None, 0):
+                    # O cálculo dizia partir de uma geração que não existe aqui.
+                    await session.rollback()
+                    return {"published": False, "generation": 0,
+                            "reason_code": "GENERATION_STALE",
+                            "expected_generation": expected_generation,
+                            "current_generation": 0}
                 row = PolicySimulationState(
                     state_key=key, experiment_key=experiment_key,
                     policy_version=POLICY_VERSION, universe_version=universe_version,
@@ -113,6 +126,13 @@ async def publish_generation(session_factory, *, experiment_key: str,
                 return {"published": True, "generation": 1, "reason_code": "FIRST_GENERATION"}
             current_period, current_evidence = row.period_key, row.evidence_key
             generation = int(row.generation or 0)
+            if expected_generation is not None and int(expected_generation) != generation:
+                # CAS pela geração LIDA: o cálculo é de uma versão superada.
+                await session.rollback()
+                return {"published": False, "generation": generation,
+                        "reason_code": "GENERATION_STALE",
+                        "expected_generation": int(expected_generation),
+                        "current_generation": generation}
             if current_period == period_key:
                 await session.rollback()
                 return {"published": False, "generation": generation,

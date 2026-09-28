@@ -176,6 +176,77 @@ async def run():
           obsoleta["published"] is False and obsoleta["reason_code"] == "PERIOD_UNCHANGED",
           str(obsoleta))
 
+    # ── 7b. G: cálculo feito sobre geração ANTIGA, em período DIFERENTE ────
+    # A e B leem a geração N com progresso P. A publica período X (geração N+1,
+    # progresso P+1). B, que calculou a partir de N, tenta período Y: precisa
+    # ser RECUSADO (ou recalcular), nunca publicar N+2 com o progresso velho.
+    leitura_ab = await ps.read_state(db.get_session, **identidade)
+    geracao_lida = int(leitura_ab["state"]["generation"])
+    progresso_lido = {"symbol": "PORTFOLIO", "action": "HOLD", "periods": 1,
+                      "last_period": "P-LIDO", "last_evidence": "ev-lido",
+                      "universe_source": identidade["universe_version"]}
+    publicou_a = await ps.publish_generation(
+        db.get_session, period_key="P-A", evidence_key="ev-a", now_ms=T0 + 10 * DIA,
+        payload={"hysteresis": {**progresso_lido, "periods": 2, "last_period": "P-A",
+                                "last_evidence": "ev-a"}},
+        expected_generation=geracao_lida, **identidade)
+    check("a_publica_a_partir_da_geracao_lida",
+          publicou_a["published"] and publicou_a["generation"] == geracao_lida + 1,
+          str(publicou_a))
+    publicou_b = await ps.publish_generation(
+        db.get_session, period_key="P-B", evidence_key="ev-b", now_ms=T0 + 11 * DIA,
+        payload={"hysteresis": {**progresso_lido, "periods": 2, "last_period": "P-B",
+                                "last_evidence": "ev-b"}},
+        expected_generation=geracao_lida, **identidade)
+    check("b_com_calculo_obsoleto_e_recusado",
+          publicou_b["published"] is False
+          and publicou_b["reason_code"] == "GENERATION_STALE",
+          str(publicou_b))
+    depois_de_b = await ps.read_state(db.get_session, **identidade)
+    check("avanco_de_a_nao_foi_perdido",
+          int(depois_de_b["state"]["generation"]) == geracao_lida + 1
+          and depois_de_b["state"]["payload"]["hysteresis"]["last_period"] == "P-A",
+          str(depois_de_b["state"]["generation"]))
+    # Recalculando a partir da geração NOVA, B publica progresso 3 (não 2).
+    atual_b = int(depois_de_b["state"]["generation"])
+    recalculado = await ps.publish_generation(
+        db.get_session, period_key="P-B", evidence_key="ev-b", now_ms=T0 + 11 * DIA,
+        payload={"hysteresis": {**progresso_lido, "periods": 3, "last_period": "P-B",
+                                "last_evidence": "ev-b"}},
+        expected_generation=atual_b, **identidade)
+    check("b_recalculado_publica_progresso_seguinte",
+          recalculado["published"] and recalculado["generation"] == atual_b + 1,
+          str(recalculado))
+    final_g = await ps.read_state(db.get_session, **identidade)
+    check("progresso_nao_regrediu",
+          final_g["state"]["payload"]["hysteresis"]["periods"] == 3,
+          str(final_g["state"]["payload"]["hysteresis"]))
+
+    # ── 7c. Duas conexões concorrentes com períodos diferentes ────────────
+    partida = int(final_g["state"]["generation"])
+    concorrentes = await asyncio.gather(
+        ps.publish_generation(db.get_session, period_key="P-X", evidence_key="ev-x",
+                              now_ms=T0 + 12 * DIA,
+                              payload={"hysteresis": {**progresso_lido, "periods": 4,
+                                                      "last_period": "P-X",
+                                                      "last_evidence": "ev-x"}},
+                              expected_generation=partida, **identidade),
+        ps.publish_generation(db.get_session, period_key="P-Y", evidence_key="ev-y",
+                              now_ms=T0 + 12 * DIA,
+                              payload={"hysteresis": {**progresso_lido, "periods": 4,
+                                                      "last_period": "P-Y",
+                                                      "last_evidence": "ev-y"}},
+                              expected_generation=partida, **identidade))
+    publicadas_xy = [item for item in concorrentes if item["published"]]
+    check("periodos_diferentes_da_mesma_geracao_so_um_publica",
+          len(publicadas_xy) == 1, str(concorrentes))
+    check("o_outro_declara_geracao_obsoleta",
+          any(item.get("reason_code") == "GENERATION_STALE" for item in concorrentes),
+          str(concorrentes))
+    apos_xy = await ps.read_state(db.get_session, **identidade)
+    check("geracao_avancou_uma_vez_so",
+          int(apos_xy["state"]["generation"]) == partida + 1, str(apos_xy["state"]["generation"]))
+
     # ── 8. Erro de leitura NÃO é primeiro estado ───────────────────────────
     async def sessao_quebrada():
         raise RuntimeError("banco fora do ar")
@@ -264,6 +335,129 @@ async def run():
     check("guarda_aceita_o_proprio_tipo",
           r12.comparator_guard(expected_type=r12.TYPE_PRE_SELECTION,
                                candidate_config=pre_config)["ok"] is True)
+
+    # ── 9b. H: caminho PERMITIDO do tipo pré-seleção no CATÁLOGO OFICIAL ──
+    from models.strategy_experiment import StrategyExperiment as E
+    from sqlalchemy import select as sql_select
+    async with db._engine.begin() as conn:
+        await conn.run_sync(db.Base.metadata.create_all, tables=[E.__table__])
+    os.environ["P05_ANALYTICS_ENABLED"] = "true"
+    os.environ["P05_CHALLENGER_SHADOW_ENABLED"] = "true"
+    import importlib
+    importlib.reload(evid)
+
+    # Evidência no CONTRATO do gate R12 (nada de número solto: são os campos
+    # que `gate_evidence_from_study` produz a partir de replay/estudo reais).
+    evidencia_ok = {
+        "total_shadow_trades": 400,
+        "trades_per_playbook": {"TREND_PULLBACK": 200, "TREND_BREAKOUT": 200},
+        "enabled_playbooks": ["TREND_PULLBACK", "TREND_BREAKOUT"],
+        "calendar_days": 45.0, "business_days": 32,
+        "coverage_pct": 98.0, "net_ev_r": 0.25, "uncertainty_r": 0.02,
+        "drawdown_r": 3.0, "stability_ratio": 0.8,
+        "operational_failures": 0, "economic_duplicates": 0,
+        "unresolved_protection_failures": 0, "essential_gaps": [],
+        "fidelity_discrepancy_pct": 0.0,
+    }
+    corte = datetime(2026, 9, 20, tzinfo=timezone.utc)
+    criacao = await evid.create_preselection_experiment(
+        champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        evidence=evidencia_ok, cutoff=corte, fingerprint="fp-pre-1")
+    check("criacao_oficial_do_tipo_pre_selecao",
+          criacao["ok"] and criacao["experiment_type"] == evid.PRE_SELECTION_TYPE,
+          str(criacao)[:220])
+    check("criacao_nao_promove",
+          criacao["promotable"] is False and criacao["live_approval"] == "UNAVAILABLE",
+          str(criacao)[:200])
+    check("avaliacao_usa_a_populacao_certa",
+          criacao["offline"]["population"] == "PRE_SELECTION"
+          and criacao["offline"]["outcomes_read"] is False, str(criacao["offline"])[:220])
+
+    async with db.get_session() as session:
+        linha_exp = (await session.execute(
+            sql_select(E).where(E.experiment_key == criacao["experiment_key"]))).scalar_one()
+        exp_id, status_inicial = linha_exp.id, linha_exp.status
+        config_congelada = dict(linha_exp.candidate_config)
+    check("linha_gravada_no_catalogo_oficial", exp_id > 0 and status_inicial in
+          (evid.STATUS_OFFLINE_VALIDATED, evid.STATUS_DRAFT), str(status_inicial))
+    check("tipo_viaja_na_config_congelada",
+          config_congelada.get("experiment_type") == r12.TYPE_PRE_SELECTION,
+          str(config_congelada))
+
+    # Transições: só as permitidas para ESTE tipo; ELIGIBLE fica fechado.
+    check("transicao_para_shadow_permitida",
+          evid.can_transition_for(config_congelada, evid.STATUS_OFFLINE_VALIDATED,
+                                  evid.STATUS_SHADOW))
+    check("transicao_para_elegivel_bloqueada",
+          not evid.can_transition_for(config_congelada, evid.STATUS_SHADOW,
+                                      evid.STATUS_ELIGIBLE))
+    sombra = await evid.start_preselection_shadow(exp_id)
+    check("shadow_do_tipo_pre_selecao_avanca",
+          sombra["ok"] and sombra["status"] == evid.STATUS_SHADOW
+          and sombra["simulation_only"] is True, str(sombra)[:200])
+    repetida_sombra = await evid.start_preselection_shadow(exp_id)
+    check("shadow_e_idempotente", repetida_sombra.get("idempotent") is True,
+          str(repetida_sombra)[:160])
+
+    # Recarrega após "restart" (pool derrubado) e continua no mesmo estado.
+    await db._engine.dispose()
+    async with db.get_session() as session:
+        depois_restart = (await session.execute(
+            sql_select(E.status, E.shadow_metrics).where(E.id == exp_id))).one()
+    check("estado_sobrevive_restart",
+          depois_restart[0] == evid.STATUS_SHADOW
+          and depois_restart[1]["population"] == "PRE_SELECTION", str(depois_restart))
+
+    # Concorrência indevida: um segundo challenger do MESMO tipo é recusado.
+    outra_config = r12.tag_config({"SCORE_MIN": 74})
+    criacao2 = await evid.create_preselection_experiment(
+        champion=champion, config=outra_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        evidence=evidencia_ok, cutoff=corte, fingerprint="fp-pre-2")
+    async with db.get_session() as session:
+        exp2 = (await session.execute(
+            sql_select(E.id).where(E.experiment_key == criacao2["experiment_key"]))).scalar_one()
+    segunda_sombra = await evid.start_preselection_shadow(exp2)
+    check("exclusividade_do_ciclo_preservada",
+          segunda_sombra["ok"] is False
+          and segunda_sombra["reason_code"] == "CHALLENGER_ALREADY_ACTIVE",
+          str(segunda_sombra)[:200])
+
+    # Config congelada não muda: mesma chave com conteúdo diferente é recusada.
+    try:
+        await evid.create_preselection_experiment(
+            champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+            evidence=evidencia_ok, cutoff=corte, fingerprint="fp-OUTRO")
+        alterou = True
+    except RuntimeError as exc:
+        alterou = "FINGERPRINT" not in str(exc)
+    check("config_congelada_nao_e_alterada", alterou is False, "fingerprint aceito")
+
+    # O caminho pós-seleção continua fechado para este tipo — e agora aponta o certo.
+    errado = await evid.start_shadow(exp_id)
+    check("pos_selecao_continua_recusando_o_tipo",
+          errado["ok"] is False and errado["reason_code"] == r12.TYPE_MISMATCH
+          and errado["dispatch_to"] == "start_preselection_shadow", str(errado)[:220])
+
+    # SHADOW pré-seleção NÃO anota snapshot pós-seleção (populações separadas).
+    async with db.get_session() as session:
+        contexto = await evid.get_active_shadow_context(session)
+    check("shadow_pre_selecao_nao_anota_pos_selecao", contexto is None, str(contexto))
+
+    # Promoção declarada como NÃO IMPLEMENTADA (código por terminar).
+    promocao = await evid.promote_preselection(exp_id)
+    check("promocao_do_tipo_declarada_nao_implementada",
+          promocao["ok"] is False
+          and promocao["reason_code"] == evid.PRE_SELECTION_PROMOTION_BLOCK
+          and promocao["live_approval"] == "UNAVAILABLE", str(promocao)[:200])
+
+    # Evidência insuficiente NÃO valida o candidato.
+    fraca = await evid.create_preselection_experiment(
+        champion=champion, config=r12.tag_config({"SCORE_MIN": 75}), objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        evidence={"sample": {"resolved": 1}, "source": {"derived_from_computed_results": True}},
+        cutoff=corte, fingerprint="fp-pre-3")
+    check("evidencia_fraca_nao_valida",
+          fraca["offline"]["verdict"] in (evid.STATUS_INSUFFICIENT, evid.STATUS_REJECTED),
+          str(fraca["offline"])[:200])
 
     # ── 10. Caminho PERMITIDO da pré-seleção: runner próprio, sem promoção ─
     relatorio = rodar_pipeline(t0=T0 + 12 * DIA, seed=13)

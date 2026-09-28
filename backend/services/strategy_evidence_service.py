@@ -37,7 +37,7 @@ import random
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -4360,14 +4360,15 @@ async def _incident_since_count(session, started_at: datetime) -> int:
 async def _upsert_experiment(session, *, experiment_key: str, champion_hash: str,
                              candidate_hash: str, objective: str, config: Dict[str, Any],
                              fingerprint: str, cutoff: datetime,
-                             offline: Dict[str, Any]) -> Any:
+                             offline: Dict[str, Any],
+                             expected_type: str = POST_SELECTION_COMPARATOR_TYPE) -> Any:
     """Idempotente por `experiment_key`. Config/hash IMUTÁVEIS após o DRAFT —
     processo concorrente não sobrescreve identidade.
 
     CRIAÇÃO também despacha por tipo: o ciclo oficial pós-seleção não abre linha
     para candidato de outra população.
     """
-    guard = experiment_type_guard(config)
+    guard = experiment_type_guard(config, expected_type=expected_type)
     if not guard["ok"]:
         raise RuntimeError(f"{guard['reason_code']}: {guard['found']} não entra no "
                            f"ciclo {guard['expected']}")
@@ -5973,8 +5974,10 @@ async def get_active_shadow_context(session) -> Optional[Dict[str, Any]]:
     from models.strategy_experiment import StrategyExperiment as E
     from sqlalchemy import select
     rows = (await session.execute(
-        select(E).where(E.status == STATUS_SHADOW).order_by(E.id).limit(2)
+        select(E).where(E.status == STATUS_SHADOW).order_by(E.id).limit(4)
     )).scalars().all()
+    # Coorte PRÉ-SELEÇÃO não anota snapshot pós-seleção: populações diferentes.
+    rows = [row for row in rows if not is_pre_selection_experiment(row)][:2]
     if len(rows) != 1:
         if len(rows) > 1:
             log.error("[p05] cardinalidade inválida: mais de um SHADOW ativo")
@@ -6175,6 +6178,169 @@ async def get_experiment(exp_id: int) -> Optional[Dict[str, Any]]:
         return exp.to_dict(full=True) if exp else None
 
 
+# ── Tipo PRÉ-SELEÇÃO: caminho PERMITIDO no catálogo/lifecycle oficiais ──────
+#: O tipo estrutural usa a MESMA tabela e o MESMO lock. O que muda é a
+#: população avaliada (coorte pré-seleção, via observações/export/runner R09-R10)
+#: e o fim do ciclo: SHADOW aqui é SIMULAÇÃO — `ELIGIBLE` não é alcançável,
+#: porque promover exige adaptador LIVE que não existe.
+PRE_SELECTION_TYPE = "PRE_SELECTION_STRUCTURAL"
+PRE_SELECTION_TRANSITIONS: Dict[str, Tuple[str, ...]] = {
+    STATUS_DRAFT: (STATUS_INSUFFICIENT, STATUS_REJECTED, STATUS_OFFLINE_VALIDATED),
+    STATUS_OFFLINE_VALIDATED: (STATUS_SHADOW,),
+    STATUS_SHADOW: (STATUS_REJECTED,),
+    STATUS_INSUFFICIENT: (),
+    STATUS_REJECTED: (),
+    STATUS_ELIGIBLE: (),
+}
+PRE_SELECTION_PROMOTION_BLOCK = "PRE_SELECTION_PROMOTION_NOT_IMPLEMENTED"
+
+
+def is_pre_selection_experiment(exp: Any) -> bool:
+    """Linha do catálogo cujo `candidate_config` carrega o tipo pré-seleção."""
+    config = getattr(exp, "candidate_config", None) if not isinstance(exp, dict) else exp.get("candidate_config")
+    return experiment_type_guard(config, expected_type=PRE_SELECTION_TYPE)["ok"]
+
+
+def can_transition_for(config: Any, current: str, target: str) -> bool:
+    """Transição permitida PARA O TIPO do experimento.
+
+    Pré-seleção termina em SHADOW (simulação); `ELIGIBLE` continua fechado.
+    """
+    if experiment_type_guard(config, expected_type=PRE_SELECTION_TYPE)["ok"]:
+        return target in PRE_SELECTION_TRANSITIONS.get(current, ())
+    return can_transition(current, target)
+
+
+def evaluate_preselection_candidate(evidence: Any) -> Dict[str, Any]:
+    """Avaliação offline do tipo PRÉ-SELEÇÃO, com o runner/população dele.
+
+    Não lê outcomes pós-seleção: consome a evidência calculada pelo caminho
+    próprio (observações R09 → export R10B → walk-forward → go/no-go do R12).
+    Sem evidência suficiente o veredito é INSUFFICIENT_DATA — nunca aprovação.
+    """
+    from services import preselection_experiment_service as r12
+    gate = r12.go_no_go(evidence) if isinstance(evidence, Mapping) else {}
+    verdict = gate.get("verdict")
+    codes = list(gate.get("reason_codes") or ())
+    if verdict == "GO_CANDIDATE":
+        status = STATUS_OFFLINE_VALIDATED
+    elif r12.SAMPLE_INSUFFICIENT in codes or not codes:
+        status = STATUS_INSUFFICIENT
+    else:
+        status = STATUS_REJECTED
+    return {"verdict": status, "reason_code": (codes[0] if codes else "OK"),
+            # ASCII no payload persistido: o campo é lido por máquina e alguns
+            # clusters (SQL_ASCII) recusam escape unicode em coluna JSON.
+            "detail": f"PRE_SELECTION go/no-go: {verdict}",
+            "population": "PRE_SELECTION", "outcomes_read": False,
+            "gate_verdict": verdict, "reason_codes": codes,
+            "criteria_hash": gate.get("criteria_hash"),
+            "live_approval": gate.get("live_approval", "UNAVAILABLE"),
+            "promotable": False}
+
+
+async def create_preselection_experiment(*, champion: Dict[str, Any],
+                                         config: Dict[str, Any], objective: str,
+                                         evidence: Any, cutoff: datetime,
+                                         fingerprint: str) -> Dict[str, Any]:
+    """CRIAÇÃO oficial de um experimento do tipo pré-seleção.
+
+    Mesma tabela, mesmo lock, mesma chave de identidade e mesma exclusividade do
+    ciclo oficial — só a população avaliada e o fim do ciclo mudam. Nada aqui
+    promove, libera LIVE ou toca execução.
+    """
+    if not P05_ANALYTICS_ENABLED:
+        return {"ok": False, "blocked": True, "reason_code": "P05_ANALYTICS_DISABLED"}
+    guard = experiment_type_guard(config, expected_type=PRE_SELECTION_TYPE)
+    if not guard["ok"]:
+        return {"ok": False, "blocked": True, "reason_code": guard["reason_code"],
+                "expected": guard["expected"], "found": guard["found"]}
+    if objective not in OBJECTIVES:
+        # Vocabulário do catálogo OFICIAL: o tipo novo não cria objetivo novo.
+        return {"ok": False, "blocked": True, "reason_code": "INVALID_OBJECTIVE",
+                "allowed": list(OBJECTIVES)}
+    try:
+        validated = validate_candidate_config(champion, config)
+    except CandidateValidationError as exc:
+        return {"ok": False, "blocked": True, "reason_code": "INVALID_CANDIDATE_CONFIG",
+                "error": str(exc)}
+    offline = evaluate_preselection_candidate(evidence)
+    from db import get_session
+    champion_hash = canonical_hash(champion)
+    candidate_hash = canonical_hash(validated)
+    key = build_experiment_key(champion_hash, candidate_hash, cutoff)
+    async with get_session() as session:
+        await _acquire_p05_lock(session, _P05_EVALUATE_LOCK_KEY)
+        exp = await _upsert_experiment(
+            session, experiment_key=key, champion_hash=champion_hash,
+            candidate_hash=candidate_hash, objective=objective, config=validated,
+            fingerprint=fingerprint, cutoff=cutoff, offline=offline,
+            expected_type=PRE_SELECTION_TYPE)
+        await session.commit()
+        return {"ok": True, "experiment_key": key, "status": exp.status,
+                "experiment_type": PRE_SELECTION_TYPE, "offline": offline,
+                "promotable": False, "live_approval": "UNAVAILABLE"}
+
+
+async def start_preselection_shadow(exp_id: int) -> Dict[str, Any]:
+    """OFFLINE_VALIDATED → SHADOW do tipo pré-seleção (SIMULAÇÃO).
+
+    Usa o MESMO lock e a MESMA exclusividade do ciclo oficial; o SHADOW daqui
+    não anota snapshot pós-seleção nem habilita qualquer caminho LIVE.
+    """
+    if not (P05_ANALYTICS_ENABLED and P05_CHALLENGER_SHADOW_ENABLED):
+        return {"ok": False, "blocked": True, "reason_code": "P05_SHADOW_DISABLED"}
+    from db import get_session
+    from models.strategy_experiment import StrategyExperiment as E
+    from sqlalchemy import select
+    now = datetime.now(timezone.utc)
+    async with get_session() as session:
+        await _acquire_p05_lock(session, _P05_SHADOW_LOCK_KEY)
+        exp = (await session.execute(
+            select(E).where(E.id == exp_id).with_for_update())).scalar_one_or_none()
+        if exp is None:
+            return {"ok": False, "error": "experimento não encontrado"}
+        if not is_pre_selection_experiment(exp):
+            return {"ok": False, "blocked": True, "reason_code": "EXPERIMENT_TYPE_MISMATCH",
+                    "error": "este caminho é do tipo pré-seleção", "status": exp.status}
+        if exp.status == STATUS_SHADOW:
+            return {"ok": True, "idempotent": True, "status": exp.status,
+                    "experiment_key": exp.experiment_key}
+        if not can_transition_for(exp.candidate_config, exp.status, STATUS_SHADOW):
+            return {"ok": False, "error": f"transição inválida {exp.status} → {STATUS_SHADOW}",
+                    "status": exp.status}
+        # UM challenger prospectivo do MESMO tipo por vez (exclusividade oficial).
+        ativos = (await session.execute(
+            select(E).where(E.status == STATUS_SHADOW))).scalars().all()
+        concorrentes = [row for row in ativos if is_pre_selection_experiment(row)
+                        and row.id != exp.id]
+        if concorrentes:
+            return {"ok": False, "blocked": True,
+                    "reason_code": "CHALLENGER_ALREADY_ACTIVE",
+                    "active_keys": [row.experiment_key for row in concorrentes],
+                    "status": exp.status}
+        exp.status = STATUS_SHADOW
+        exp.shadow_started_at = now
+        exp.shadow_metrics = {**(exp.shadow_metrics if isinstance(exp.shadow_metrics, dict) else {}),
+                              "population": "PRE_SELECTION", "simulation_only": True,
+                              "live_approval": "UNAVAILABLE"}
+        await session.commit()
+        return {"ok": True, "status": exp.status, "experiment_key": exp.experiment_key,
+                "population": "PRE_SELECTION", "simulation_only": True,
+                "promotable": False}
+
+
+async def promote_preselection(exp_id: int) -> Dict[str, Any]:
+    """Promoção do tipo pré-seleção: NÃO IMPLEMENTADA, e declarada como tal.
+
+    Falta o adaptador operacional; chamar isto nunca aciona LIVE nem muda estado.
+    """
+    return {"ok": False, "blocked": True, "reason_code": PRE_SELECTION_PROMOTION_BLOCK,
+            "error": ("promover a coorte pré-seleção exige adaptador operacional "
+                      "inexistente — código por terminar, não pendência de dados"),
+            "live_approval": "UNAVAILABLE", "promotable": False}
+
+
 async def start_shadow(exp_id: int) -> Dict[str, Any]:
     """OFFLINE_VALIDATED → SHADOW com baseline/safety congelados."""
     if not (P05_ANALYTICS_ENABLED and P05_CHALLENGER_SHADOW_ENABLED):
@@ -6197,6 +6363,7 @@ async def start_shadow(exp_id: int) -> Dict[str, Any]:
                 return {"ok": False, "error": "experimento não encontrado"}
             # Tipo versionado: candidato pré-seleção NUNCA entra no SHADOW
             # pós-seleção (nem por reaproveitar as mesmas chaves de config).
+            # O caminho dele existe e é outro: `start_preselection_shadow`.
             guard = experiment_type_guard(exp.candidate_config)
             if not guard["ok"]:
                 return {"ok": False, "blocked": True,
@@ -6204,6 +6371,7 @@ async def start_shadow(exp_id: int) -> Dict[str, Any]:
                         "error": (f"experimento do tipo {guard['found']} tem caminho "
                                   f"próprio de simulação pré-seleção — não entra no "
                                   f"ciclo {guard['expected']}"),
+                        "dispatch_to": "start_preselection_shadow",
                         "status": exp.status}
             # P05.1 é ANALYTICS_ONLY: um resultado analítico nunca vira challenger.
             if is_contextual_experiment(exp):
