@@ -231,6 +231,9 @@ async def run(args) -> dict:
     linha_do_tempo = [{"opportunity_id": trade["opportunity_id"],
                        "effective_ts_ms": trade["effective_ts_ms"],
                        "exit_ts_ms": trade["exit_ts_ms"],
+                       # Vela do EVENTO e instante em que o resultado ficou
+                       # conhecível são campos distintos (achado D).
+                       "result_available_ts_ms": trade["result_available_ts_ms"],
                        "risk_usd": trade["risk_usd"],
                        "capital_at_entry_usd": trade["capital_at_entry_usd"],
                        "capital_after_usd": trade["capital_after_usd"]}

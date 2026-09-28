@@ -170,3 +170,19 @@ Os caminhos existiam; este lote corrigiu o que eles realmente faziam.
 | R11 estado | `read_state` distingue AUSÊNCIA (`found=False`) de FALHA (`available=False`); o entrypoint carrega, avança a histerese real, publica a geração e retoma após restart |
 | R11 identidade | Experimento = política candidata; universo = conjunto de símbolos; relógio = instante da evidência (nunca o relógio de parede) |
 | R12 despacho | `experiment_type_guard` aplicado em comparador, avaliação offline (antes de abrir o dataset), anotação, criação e `start_shadow`; PRE_SELECTION nunca entra no ciclo pós-seleção |
+
+## 8. Fechamento dos oito achados (28/09/2026)
+
+| Contrato | O que passou a valer |
+| --- | --- |
+| P03 desfecho (A) | FLAT descreve ausência de posição AGORA. `RECONCILED_NO_EXECUTION` só com zero executado COMPROVADO em todos os ids; execução provada exige RealTrade (aberto ou fechado) com símbolo, exchange, lado e alvo ÚNICO |
+| P03 sem vínculo (A) | Execução comprovada sem RealTrade ⇒ MANUAL_REQUIRED com motivo, pausa rearmada, slot/reserva mantidos; nada de preço, P&L ou vínculo fabricado |
+| P03 decisão (B) | `entry_intents.decision_payload` grava entry/stop/qty ANTES do POST; a recuperação transmite `planned_stop`/`planned_qty` a cada dispatch id (inclusive `-mfb`), e o SL vivo válido é ADOTADO |
+| P03 legado (B) | Linha sem `decision_payload` continua sem prova: UNKNOWN/MANUAL, nunca stop estimado |
+| R05 base (C) | Base do dia (P&L − exposição − custos) recalculada DENTRO da transação da admissão, pela mesma fórmula e janela; a fonte com funding também é agregada em sessão |
+| R05 consistência (C) | Reserva que vira posição entre leitura e lock conta; base ilegível ⇒ `DAILY_BASE_UNAVAILABLE`; contrato incompleto do caller continua bloqueando; zero I/O de exchange sob a lock |
+| R10 disponibilidade (D) | `result_available_ts_ms` = fechamento da vela do evento; capital, slot e exposição seguem a DISPONIBILIDADE, `exit_ts_ms` fica como a vela do evento |
+| R10 treino (E) | Dobra treina só com label disponível no corte; sem instante confiável, fallback baseline e motivo explícito; `stages` declara o que realmente rodou |
+| H comparação (F) | Escopo MANAGEMENT_ONLY explícito com o que NÃO prova, hashes dos dois lados e `bundle_hash` antes do resultado; hipótese autorizada `BLOCKED_MISSING_DECISION` |
+| R11 geração (G) | `publish_generation(expected_generation=...)` é CAS; cálculo de geração antiga é recusado (`GENERATION_STALE`) e o caller recalcula, limitado e idempotente |
+| R12 pré-seleção (H) | Criação, avaliação (população própria, `outcomes_read=False`), transições DRAFT→OFFLINE_VALIDATED→SHADOW e exclusividade no catálogo OFICIAL; `ELIGIBLE` fechado e promoção declarada `PRE_SELECTION_PROMOTION_NOT_IMPLEMENTED` |

@@ -428,3 +428,29 @@ bloqueados e contados), exchange/dispatcher FALSOS e zero produção:
 Skips honestos: `test_r05c_execution_accounting` pula 2 casos que dependem de
 fixture auditada privada, indisponível no repositório — nenhuma fixture foi
 fabricada para forçar o verde.
+
+## Fechamento dos oito achados da auditoria (28/09/2026)
+
+Baseline `46c7d7f0`; relatório `docs/AUDITORIA_LOTE_FINAL_46c7d7f0.md`. Cada
+achado virou regressão que FALHA na baseline e roda pelo caller real.
+
+| Achado | Estado | Prova |
+| --- | --- | --- |
+| A — FLAT não prova ausência de execução | CORRIGIDO | `pg_integration_p03_settlement.py` (22) |
+| B — recuperação sem stop/qty | CORRIGIDO | idem, com SL vivo adotado e crash antes do incidente |
+| C — base diária inconsistente na transferência | CORRIGIDO | `pg_integration_r05_transferencia.py` (16), duas conexões |
+| D — close usado antes de existir | CORRIGIDO | `test_pf_execution_closure.py` + `pg_integration_h_persisted.py` |
+| E — label futuro selecionando candidato | CORRIGIDO | `test_wf_runner_closure.py` (seis dobras) |
+| F — objeto da comparação trocado | **BLOQUEADO POR DECISÃO/CONTRATO AUSENTE** | escopo MANAGEMENT_ONLY declarado + hipótese autorizada pendente |
+| G — geração obsoleta publicando por cima | CORRIGIDO | `pg_integration_r11_r12_pipeline.py` (59) |
+| H — tipo pré-seleção sem caminho próprio | CORRIGIDO | idem, criação/avaliação/transição no catálogo oficial |
+
+**F exige decisão externa**: os contratos declaram o champion LIVE e as
+políticas novas como INATIVAS e `approved_for_production=false`, mas nenhum
+registra o PAR congelado (baseline × candidata) a ser comparado. Enquanto isso
+não for decidido, o pipeline executa e rotula apenas o contraste de GESTÃO —
+sem inventar hipótese e sem reaproveitar métricas com outro rótulo.
+
+Continuam FORA deste fechamento, como antes: adaptador LIVE
+(`LIVE_ADAPTER_NOT_IMPLEMENTED`), evidência prospectiva real, calibração V3 e
+aprovação humana.

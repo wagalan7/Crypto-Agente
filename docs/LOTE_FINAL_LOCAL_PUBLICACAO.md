@@ -34,6 +34,7 @@ PostgreSQL descartável. Nenhuma coluna existente foi alterada ou removida.
 | coluna `entry_intents.dispatch_ids` (JSONB) | aditiva | A (P03) |
 | tabela `policy_simulation_state` | nova | C (R11) |
 | coluna `policy_simulation_state.payload` (JSONB) | aditiva | C (R11) |
+| coluna `entry_intents.decision_payload` (JSONB) | aditiva | A (P03) |
 
 - A evidência pré-seleção **não** cria tabela: reutiliza
   `decision_observations`, `rejected_setup_observations` e
@@ -178,3 +179,51 @@ abertas, com decisão humana explícita.
 
 Nada disso aumenta limite, alavancagem ou exposição, e nenhuma trava foi
 afrouxada para o teste passar.
+
+## 10. Fechamento dos oito achados (28/09/2026)
+
+Baseline `46c7d7f0`. Cada achado foi reproduzido (RED) antes da correção.
+
+### Migração NOVA
+
+`entry_intents.decision_payload JSONB` (aditiva, idempotente, criada pelo
+`init_db`): entry/stop/qty da decisão gravados ANTES do primeiro POST. Sem eles
+a reconciliação não consegue nem ADOTAR um stop já existente. Linha antiga fica
+sem o campo — e continua fail-closed, sem estimativa.
+
+### Impactos de SEGURANÇA (P03/R05, ativos por default)
+
+1. **Fim sem rastro deixou de existir.** Uma entrada preenchida e já encerrada
+   não vira mais `RECONCILED_NO_EXECUTION`: exige RealTrade correspondente
+   (símbolo, exchange, lado e alvo único). Sem vínculo, o incidente vai a
+   MANUAL_REQUIRED, a pausa P03 é rearmada e o slot continua ocupado — mais
+   pendências humanas explícitas do que antes, por desenho.
+2. **Recuperação com dados.** Incidentes da recuperação passam a nascer com
+   `planned_stop`/`planned_qty`, então um SL vivo e válido é ADOTADO em vez de
+   ficar em RETRY_PENDING eterno.
+3. **Orçamento diário consistente.** A base do dia é recalculada DENTRO da
+   transação da admissão. Uma reserva que virou posição entre a leitura e a
+   lock agora conta: entradas que antes passavam por pouco podem ser recusadas
+   com `DAILY_LOSS_LIMIT`. Base ilegível bloqueia (`DAILY_BASE_UNAVAILABLE`).
+   Continua valendo só com o cutover R05B ligado — a correção NÃO o liga.
+
+### Impactos de PESQUISA (inativa por default)
+
+4. **Cronologia.** O motor publica `result_available_ts_ms`: dentro da vela não
+   há sequência observável e TIME_STOP/MAX_HOLD consomem o `close`, então o
+   resultado só é utilizável quando a vela FECHA. Capital, slot e exposição
+   seguem essa disponibilidade — números de replays anteriores mudam.
+5. **Walk-forward.** O treino de cada dobra só consome label disponível no
+   corte; sem instante confiável, a dobra roda o fallback baseline. As etapas
+   publicadas passam a dizer o que REALMENTE rodou.
+6. **Comparação.** O contraste executado é MANAGEMENT_ONLY e o relatório diz o
+   que ele NÃO prova. A hipótese autorizada (baseline × candidata congeladas)
+   está `BLOCKED_MISSING_DECISION`: falta decisão registrada em contrato.
+7. **Simulação R11.** Publicação por CAS de geração; cálculo obsoleto é
+   recusado e recalculado.
+8. **Catálogo R12.** O tipo pré-seleção ganhou criação, avaliação e transições
+   próprias na tabela oficial, terminando em SHADOW de simulação. Promoção
+   declarada `PRE_SELECTION_PROMOTION_NOT_IMPLEMENTED`.
+
+Nenhum default foi ligado, nenhuma estratégia nova foi criada e o adaptador
+LIVE continua ausente.

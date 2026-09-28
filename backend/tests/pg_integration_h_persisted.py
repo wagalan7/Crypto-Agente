@@ -111,6 +111,29 @@ async def run():
           str(simulacao))
     check("simulacao_nao_toca_live", simulacao["applies_live"] is False, str(simulacao))
 
+    # ── 2b. Cronologia D/E no caminho REAL e persistido ───────────────────
+    for trade in relatorio["replay"]["capital_timeline"]:
+        check(f"disponibilidade_depois_da_saida_{trade['opportunity_id'][:6]}",
+              trade["result_available_ts_ms"] > trade["exit_ts_ms"], str(trade))
+    wf_report = relatorio["walk_forward"]
+    check("estudo_declara_etapas_executadas",
+          wf_report["stages"]["candidate_selection"] == "EXECUTED_ON_TRAIN"
+          and "train" not in set(wf_report["stages"].values()), str(wf_report["stages"]))
+    check("estudo_declara_labels_retidos",
+          isinstance(wf_report["train_labels_withheld"], int), str(wf_report))
+
+    # ── 2c. F: escopo da comparação e hipótese autorizada ─────────────────
+    comparacao = relatorio["comparison"]
+    check("comparacao_declara_escopo_de_gestao",
+          comparacao["scope"] == "MANAGEMENT_ONLY"
+          and "Score V3" in comparacao["does_not_prove"], str(comparacao["scope"]))
+    check("hipotese_autorizada_declarada_bloqueada",
+          comparacao["authorized_hypothesis"]["state"] == "BLOCKED_MISSING_DECISION",
+          str(comparacao["authorized_hypothesis"]["reason_code"]))
+    check("identidade_registrada_antes_do_resultado",
+          comparacao["identity_registered_before_results"] is True
+          and comparacao["bundle_hash"], str(comparacao)[:160])
+
     # ── 3. Capital liquidado na saída também no caminho persistido ─────────
     linha_do_tempo = relatorio["replay"]["capital_timeline"]
     check("capital_de_entrada_declarado",
