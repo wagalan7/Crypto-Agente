@@ -335,10 +335,12 @@ async def run():
 
     # 19. Transferência reserva → RealTrade sem janela em que NINGUÉM conta.
     async def usage_now(ident):
+        # Mesma garantia de antes, agora pela leitura CONSISTENTE da admissão
+        # (uma instrução): reservas e exposição vêm do mesmo snapshot.
         async with db.get_session() as session:
-            pend = await intents._pending_usage(session, ident.account_ref, ident.exchange)
-            risk, complete = await intents._open_risk_usd(session)
-            return pend, risk, complete
+            visao = await intents._admission_view(session, ident, "")
+            return ((visao["pending_count"], visao["pending_risk"]),
+                    visao["open_risk_usd"], visao["open_risk_complete"])
 
     transfer = identity(trigger_candle_ms=TRIGGER + 169_200_000)
     await intents.reserve(db.get_session, transfer, payload(), owner="w-tr",

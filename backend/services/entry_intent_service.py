@@ -212,28 +212,52 @@ async def _open_positions(session) -> int:
         .where(RealTrade.status == "open", RealTrade.source == "auto"))).scalar() or 0)
 
 
-async def _open_risk_usd(session) -> Tuple[float, bool]:
-    """Risco aberto persistido, lido DENTRO da transação/lock de admissão.
+def _open_risk_from_rows(rows) -> Tuple[float, bool]:
+    """Risco aberto a partir das linhas JÁ LIDAS (mesmo snapshot da admissão).
 
-    Snapshot lido antes da lock envelhece: duas decisões concorrentes podem
-    admitir a mesma capacidade. Devolve `(risco, completo)`; linha sem entry,
-    qty ou stop utilizável marca INCOMPLETO — desconhecido nunca vira zero.
+    Devolve `(risco, completo)`; linha sem entry, qty ou stop utilizável marca
+    INCOMPLETO — desconhecido nunca vira zero.
     """
-    from models.real_trade import RealTrade
-    rows = (await session.execute(
-        select(RealTrade.entry_price, RealTrade.qty, RealTrade.sl_current_price,
-               RealTrade.planned_stop, RealTrade.side)
-        .where(RealTrade.status == "open", RealTrade.source == "auto"))).all()
     total, complete = 0.0, True
-    for entry_price, qty, sl_current, planned_stop, side in rows:
-        price, quantity = _finite(entry_price), _finite(qty)
+    for row in rows or ():
+        price, quantity = _finite(row.get("entry_price")), _finite(row.get("qty"))
+        sl_current, planned_stop = row.get("sl_current_price"), row.get("planned_stop")
         stop = _finite(sl_current if sl_current is not None else planned_stop)
         if price is None or quantity is None or stop is None or price <= 0 or quantity <= 0:
             complete = False
             continue
-        adverse = (price - stop) if str(side or "long").lower() == "long" else (stop - price)
+        lado = str(row.get("side") or "long").lower()
+        adverse = (price - stop) if lado == "long" else (stop - price)
         total += max(0.0, adverse) * quantity
     return total, complete
+
+
+async def _admission_view(session, identity: EntryIdentity, key: str) -> Optional[dict]:
+    """Visão ÚNICA e consistente da admissão (P&L, exposição, custos, reservas).
+
+    Uma instrução, executada DEPOIS da advisory lock: posição que fecha entre
+    leituras não pode sumir das duas parcelas. Falha de leitura ⇒ None, e quem
+    chama BLOQUEIA — nunca admite sobre base obsoleta.
+    """
+    try:
+        from services import financial_risk_service as frs
+        visao = await frs.admission_snapshot(
+            session, account_ref=identity.account_ref, exchange=identity.exchange,
+            exclude_intent_key=key)
+    except Exception:  # noqa: BLE001
+        return None
+    if visao.get("open_rows") is None:
+        return None
+    risco, completo = _open_risk_from_rows(visao["open_rows"])
+    base = visao.get("base") if isinstance(visao.get("base"), dict) else {}
+    return {"pending_count": int(visao.get("pending_count") or 0),
+            "pending_risk": float(visao.get("pending_risk_usd") or 0.0),
+            "open_positions": int(visao.get("open_positions") or 0),
+            "open_risk_usd": risco, "open_risk_complete": completo,
+            "base_usd": (_finite(base.get("value")) if base.get("quality") == "OK"
+                         else None),
+            "base_reason": (None if base.get("quality") == "OK"
+                            else (base.get("reason_code") or "DAILY_BASE_UNAVAILABLE"))}
 
 
 async def _daily_base_in_session(session) -> tuple:
@@ -337,36 +361,39 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
             )).scalar_one_or_none()
             if row is None:
                 # Decisão nova: admissão de capacidade sob a mesma lock.
-                pending_count = pending_risk = 0
+                visao = None
                 if capacity is not None or budget is not None:
-                    pending_count, pending_risk = await _pending_usage(
-                        session, identity.account_ref, identity.exchange,
-                        exclude_intent_key=key)
+                    # UMA leitura consistente para capacidade E orçamento.
+                    visao = await _admission_view(session, identity, key)
+                    if visao is None:
+                        await session.rollback()
+                        return Reservation(BLOCKED_CAPACITY, key, coid, None,
+                                           "ADMISSION_SNAPSHOT_UNAVAILABLE")
                 if capacity is not None:
                     open_positions = max(int(capacity.open_positions or 0),
-                                         await _open_positions(session))
-                    persisted_risk, risk_complete = await _open_risk_usd(session)
+                                         visao["open_positions"])
                     caller_risk = _finite(capacity.open_risk_usd)
-                    open_risk = max(persisted_risk, caller_risk if caller_risk is not None else 0.0)
+                    open_risk = max(visao["open_risk_usd"],
+                                    caller_risk if caller_risk is not None else 0.0)
                     capacity = Capacity(
                         risk_usd=capacity.risk_usd, max_open_positions=capacity.max_open_positions,
                         max_open_risk_usd=capacity.max_open_risk_usd,
                         open_positions=open_positions, open_risk_usd=open_risk)
-                    if capacity.max_open_risk_usd is not None and not risk_complete:
+                    if capacity.max_open_risk_usd is not None and not visao["open_risk_complete"]:
                         # Risco aberto incompleto: nada de fabricar zero para caber.
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, "OPEN_RISK_UNKNOWN")
-                    denial = _capacity_reason(capacity, pending_count, pending_risk)
+                    denial = _capacity_reason(capacity, visao["pending_count"],
+                                              visao["pending_risk"])
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
                 # Orçamento diário com as reservas das OUTRAS intenções incluídas
-                # e a base do dia RECALCULADA nesta transação.
+                # e a base do dia do MESMO snapshot desta transação.
                 if budget is not None:
                     proposto = max(0.0, _finite(capacity.risk_usd) or 0.0) if capacity else 0.0
-                    base_atual, motivo_base = await _daily_base_in_session(session)
-                    denial = motivo_base or _budget_reason(budget, pending_risk,
-                                                           proposto, base_atual)
+                    denial = visao["base_reason"] or _budget_reason(
+                        budget, visao["pending_risk"], proposto, visao["base_usd"])
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
@@ -457,26 +484,27 @@ async def _readmit(session, identity: EntryIdentity, key: str,
                    risk_usd: float) -> Optional[str]:
     """Reavalia capacidade e orçamento para um risco MAIOR da MESMA decisão,
     dentro da transação/lock já abertas. Devolve o motivo da negação ou None."""
-    pending_count, pending_risk = await _pending_usage(
-        session, identity.account_ref, identity.exchange, exclude_intent_key=key)
+    visao = await _admission_view(session, identity, key)
+    if visao is None:
+        return "ADMISSION_SNAPSHOT_UNAVAILABLE"
     if capacity is not None:
-        open_positions = max(int(capacity.open_positions or 0), await _open_positions(session))
-        persisted_risk, risk_complete = await _open_risk_usd(session)
+        open_positions = max(int(capacity.open_positions or 0), visao["open_positions"])
         caller_risk = _finite(capacity.open_risk_usd)
-        open_risk = max(persisted_risk, caller_risk if caller_risk is not None else 0.0)
-        if capacity.max_open_risk_usd is not None and not risk_complete:
+        open_risk = max(visao["open_risk_usd"],
+                        caller_risk if caller_risk is not None else 0.0)
+        if capacity.max_open_risk_usd is not None and not visao["open_risk_complete"]:
             return "OPEN_RISK_UNKNOWN"
         # A decisão JÁ ocupa um slot: o teto de posições não conta mais um.
         alvo = Capacity(risk_usd=risk_usd, max_open_positions=capacity.max_open_positions,
                         max_open_risk_usd=capacity.max_open_risk_usd,
                         open_positions=open_positions, open_risk_usd=open_risk)
-        denial = _capacity_reason(alvo, max(0, pending_count - 1), pending_risk)
+        denial = _capacity_reason(alvo, visao["pending_count"], visao["pending_risk"])
         if denial:
             return denial
     if budget is None:
         return None
-    base_atual, motivo_base = await _daily_base_in_session(session)
-    return motivo_base or _budget_reason(budget, pending_risk, risk_usd, base_atual)
+    return visao["base_reason"] or _budget_reason(
+        budget, visao["pending_risk"], risk_usd, visao["base_usd"])
 
 
 async def admit_final_risk(session_factory, intent_key: str, *, owner: str,

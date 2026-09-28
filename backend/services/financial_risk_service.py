@@ -752,42 +752,157 @@ async def daily_base_in_session(session, *, as_of: Optional[datetime] = None) ->
     Sem I/O de exchange: equity (e, portanto, o LIMITE) continua fora daqui.
     Qualquer parcela desconhecida ⇒ `quality=UNKNOWN` — nunca zero.
     """
-    from models.real_trade import RealTrade as RT
-    from sqlalchemy import select
-    moment = _as_utc(as_of) or datetime.now(timezone.utc)
-    since = moment - timedelta(days=LOAD_DAYS)
-    try:
-        closed = (await session.execute(
-            select(RT.id, RT.source, RT.status, RT.side, RT.pnl_usd,
-                   RT.tp1_realized_usd, RT.entry_fee, RT.exit_fee,
-                   RT.entry_slippage_pct, RT.recommendation_id, RT.closed_at,
-                   RT.execution_accounting)
-            .where(RT.source == PRIMARY_SOURCE, RT.status != "open",
-                   RT.closed_at.is_not(None), RT.closed_at >= since))).all()
-        opens = (await session.execute(
-            select(RT.id, RT.source, RT.side, RT.entry_price, RT.qty,
-                   RT.planned_stop, RT.sl_order_id, RT.sl_current_price,
-                   RT.entry_fee)
-            .where(RT.source == PRIMARY_SOURCE, RT.status == "open"))).all()
-    except Exception as exc:  # noqa: BLE001
-        log.warning(f"[r05b] base diária transacional indisponível: {type(exc).__name__}")
+    snapshot = await _read_admission_snapshot(session, as_of=as_of)
+    if snapshot.get("error"):
         return _unknown("DAILY_BASE_UNAVAILABLE",
                         "parcelas persistidas do dia não puderam ser lidas", value=None)
-    fechadas = [{"id": c.id, "source": c.source, "status": c.status, "side": c.side,
-                 "pnl_usd": c.pnl_usd, "tp1_realized_usd": c.tp1_realized_usd,
-                 "entry_fee": c.entry_fee, "exit_fee": c.exit_fee,
-                 "entry_slippage_pct": c.entry_slippage_pct,
-                 "recommendation_id": c.recommendation_id, "closed_at": c.closed_at,
-                 "execution_accounting": c.execution_accounting} for c in closed]
-    abertas = [{"id": o.id, "source": o.source, "side": o.side,
-                "entry_price": o.entry_price, "qty": o.qty,
-                "planned_stop": o.planned_stop, "sl_order_id": o.sl_order_id,
-                "sl_current_price": o.sl_current_price,
-                "entry_fee": o.entry_fee} for o in opens]
+    moment = snapshot["as_of"]
+    fechadas, abertas = snapshot["fechadas"], snapshot["abertas"]
     janela = financial_window(fechadas, since=kill_daily_start(moment), until=moment,
                               kind=WINDOW_CALENDAR)
-    janela = await _apply_source_in_session(session, janela, as_of=moment)
-    exposure = open_exposure(abertas)
+    janela = _apply_source_to_window(janela, fechadas, as_of=moment)
+    return _base_from_parts(janela, open_exposure(abertas))
+
+
+#: Leitura ÚNICA das parcelas da admissão. Uma instrução = UM snapshot no
+#: PostgreSQL: fechadas, abertas e reservas vêm do mesmo instante, mesmo sob
+#: READ COMMITTED. Executada DEPOIS da advisory lock, ela também já enxerga
+#: tudo que foi commitado enquanto a admissão esperava pela lock.
+_ADMISSION_SNAPSHOT_SQL = """
+WITH agora AS (SELECT now() AS as_of),
+fechadas AS (
+    SELECT id, source, status, side, pnl_usd, tp1_realized_usd, entry_fee,
+           exit_fee, entry_slippage_pct, recommendation_id, closed_at,
+           execution_accounting
+    FROM real_trades
+    WHERE source = :source AND status <> 'open' AND closed_at IS NOT NULL
+      AND closed_at >= (SELECT as_of FROM agora) - (:load_days * INTERVAL '1 day')
+),
+abertas AS (
+    SELECT id, source, side, entry_price, qty, planned_stop, sl_order_id,
+           sl_current_price, entry_fee
+    FROM real_trades
+    WHERE source = :source AND status = 'open'
+),
+reservas AS (
+    SELECT intent_key, reserved_risk_usd
+    FROM entry_intents
+    WHERE (:account_ref)::text IS NOT NULL
+      AND account_ref = :account_ref
+      AND ((:exchange)::text IS NULL OR exchange = :exchange)
+      AND state = ANY(:pending_states)
+      AND real_trade_id IS NULL
+      AND ((:exclude_key)::text IS NULL OR intent_key <> :exclude_key)
+)
+SELECT (SELECT as_of FROM agora) AS as_of,
+       (SELECT COALESCE(json_agg(to_jsonb(f)), '[]'::json) FROM fechadas f) AS fechadas,
+       (SELECT COALESCE(json_agg(to_jsonb(a)), '[]'::json) FROM abertas a) AS abertas,
+       (SELECT COALESCE(json_agg(to_jsonb(r)), '[]'::json) FROM reservas r) AS reservas
+"""
+
+
+def _as_datetime(value):
+    """`closed_at` volta do JSON como texto ISO; a janela compara datetimes."""
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if isinstance(value, str) and value:
+        try:
+            return _as_utc(datetime.fromisoformat(value))
+        except ValueError:
+            return None
+    return None
+
+
+async def _read_admission_snapshot(session, *, account_ref=None, exchange=None,
+                                   exclude_intent_key=None,
+                                   as_of: Optional[datetime] = None) -> Dict[str, Any]:
+    """Executa a leitura ÚNICA e devolve as parcelas decodificadas."""
+    from models.entry_intent import PENDING_STATES
+    from sqlalchemy import text
+    try:
+        row = (await session.execute(text(_ADMISSION_SNAPSHOT_SQL), {
+            "source": PRIMARY_SOURCE, "load_days": LOAD_DAYS,
+            "account_ref": account_ref, "exchange": exchange,
+            "pending_states": list(PENDING_STATES),
+            "exclude_key": exclude_intent_key,
+        })).mappings().one()
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[r05b] snapshot de admissão indisponível: {type(exc).__name__}: {exc}")
+        return {"error": type(exc).__name__, "as_of": None, "fechadas": [],
+                "abertas": [], "reservas": []}
+    fechadas = [{**linha, "closed_at": _as_datetime(linha.get("closed_at"))}
+                for linha in (row["fechadas"] or [])]
+    momento = _as_utc(as_of) or _as_datetime(row["as_of"]) or datetime.now(timezone.utc)
+    reservas = list(row["reservas"] or [])
+    return {"error": None, "as_of": momento, "fechadas": fechadas,
+            "abertas": list(row["abertas"] or []), "reservas": reservas}
+
+
+def _apply_source_to_window(window: Dict[str, Any], fechadas, *,
+                            as_of: datetime) -> Dict[str, Any]:
+    """Aplica a FONTE selecionada à janela do dia SEM nova instrução.
+
+    Fonte legado ⇒ a janela já está certa. Fonte completa ⇒ o total COM funding
+    é agregado do ledger R05C que veio no MESMO snapshot; indisponível ⇒ a
+    janela vira UNKNOWN e a admissão bloqueia (nunca "zero por falta de dado").
+    """
+    try:
+        from services import financial_total_service as fts
+        if not fts.accounting_total_enabled():
+            return window
+        scope = fts.current_account_scope()
+        desde = kill_daily_start(as_of)
+        ledgers = [linha.get("execution_accounting") for linha in fechadas
+                   if (linha.get("closed_at") is not None
+                       and desde <= linha["closed_at"] < as_of)]
+        payload = fts.aggregate(ledgers, account_scope=scope,
+                                window={"since": desde.isoformat(),
+                                        "until": as_of.isoformat()},
+                                collection={"pagination_complete": True,
+                                            "overlap_resolved": True})
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[r05d] total do snapshot indisponível: {type(exc).__name__}")
+        return {**window, "quality": QUALITY_UNKNOWN,
+                "reason_code": "R05D_SOURCE_UNAVAILABLE", "pnl_usd": None}
+    return _apply_total_block(window, payload, None)
+
+
+async def admission_snapshot(session, *, account_ref=None, exchange=None,
+                             exclude_intent_key=None,
+                             as_of: Optional[datetime] = None) -> Dict[str, Any]:
+    """Visão CONSISTENTE da admissão: base do dia, exposição e reservas.
+
+    Todas as parcelas vêm da MESMA instrução (um snapshot), executada depois da
+    lock. Uma posição que fecha entre leituras não pode sumir das duas parcelas.
+    """
+    snapshot = await _read_admission_snapshot(
+        session, account_ref=account_ref, exchange=exchange,
+        exclude_intent_key=exclude_intent_key, as_of=as_of)
+    if snapshot.get("error"):
+        return {"quality": QUALITY_UNKNOWN, "reason_code": "ADMISSION_SNAPSHOT_UNAVAILABLE",
+                "base": None, "open_rows": None, "pending_count": None,
+                "pending_risk_usd": None, "as_of": None}
+    moment = snapshot["as_of"]
+    janela = financial_window(snapshot["fechadas"], since=kill_daily_start(moment),
+                              until=moment, kind=WINDOW_CALENDAR)
+    janela = _apply_source_to_window(janela, snapshot["fechadas"], as_of=moment)
+    exposure = open_exposure(snapshot["abertas"])
+    base = _base_from_parts(janela, exposure)
+    reservas = snapshot["reservas"]
+    risco_reservado = 0.0
+    for linha in reservas:
+        valor = _finite(linha.get("reserved_risk_usd"))
+        risco_reservado += abs(valor) if valor is not None else 0.0
+    return {"quality": base.get("quality"), "reason_code": base.get("reason_code"),
+            "base": base, "as_of": moment,
+            "open_rows": snapshot["abertas"],
+            "open_positions": len(snapshot["abertas"]),
+            "pending_count": len(reservas),
+            "pending_risk_usd": round(risco_reservado, 6)}
+
+
+def _base_from_parts(janela: Dict[str, Any], exposure: Dict[str, Any]) -> Dict[str, Any]:
+    """Base = P&L do dia − risco aberto − custos conhecidos. PURO."""
     if janela.get("quality") != QUALITY_OK:
         return _unknown(janela.get("reason_code") or "PNL_UNAVAILABLE",
                         "P&L do dia indisponível na transação", value=None)
@@ -800,35 +915,13 @@ async def daily_base_in_session(session, *, as_of: Optional[datetime] = None) ->
     if realized is None or open_risk is None or open_fees is None:
         return _unknown("DAILY_BASE_UNAVAILABLE",
                         "alguma parcela da base diária é desconhecida", value=None)
+    fonte = janela.get("financial_source") or FINANCIAL_SOURCE
     return {"quality": QUALITY_OK, "reason_code": None, "detail": None,
             "value": round(realized - open_risk - open_fees, 6),
             "realized_daily_pnl_usd": realized,
             "open_price_risk_usd": open_risk,
             "open_entry_fees_usd": open_fees,
-            "source": (snap_source := janela.get("financial_source") or FINANCIAL_SOURCE),
-            "financial_source": snap_source}
-
-
-async def _apply_source_in_session(session, window: Dict[str, Any], *,
-                                   as_of: datetime) -> Dict[str, Any]:
-    """Aplica a FONTE selecionada à janela do dia, sem sair da transação.
-
-    Fonte legado ⇒ a janela já está certa. Fonte completa ⇒ o total COM funding
-    é agregado do ledger R05C persistido, na mesma transação; indisponível ⇒
-    a janela vira UNKNOWN e a admissão bloqueia.
-    """
-    try:
-        from services import financial_total_service as fts
-        if not fts.accounting_total_enabled():
-            return window
-        scope = fts.current_account_scope()
-        payload = await fts.total_in_session(session, account_scope=scope,
-                                             since=kill_daily_start(as_of), until=as_of)
-    except Exception as exc:  # noqa: BLE001
-        log.warning(f"[r05d] total transacional indisponível: {type(exc).__name__}")
-        return {**window, "quality": QUALITY_UNKNOWN,
-                "reason_code": "R05D_SOURCE_UNAVAILABLE", "pnl_usd": None}
-    return _apply_total_block(window, payload, None)
+            "source": fonte, "financial_source": fonte}
 
 
 async def daily_budget() -> Dict[str, Any]:

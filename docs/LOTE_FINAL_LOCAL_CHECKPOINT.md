@@ -429,6 +429,21 @@ Skips honestos: `test_r05c_execution_accounting` pula 2 casos que dependem de
 fixture auditada privada, indisponível no repositório — nenhuma fixture foi
 fabricada para forçar o verde.
 
+## Contrato de consistência da admissão (C — 28/09/2026)
+
+1. Parcelas lidas: P&L do dia (coorte `auto`, janela calendário), exposição
+   aberta (risco + taxas), posições abertas e reservas pendentes da conta.
+2. Snapshot: UMA instrução SQL, executada DEPOIS da `pg_advisory_xact_lock`
+   da admissão — PostgreSQL dá a ela um único snapshot para todas as CTEs.
+3. Escritores: não precisam de contrato novo; o snapshot é tomado após a lock,
+   então fechamento/vínculo commitados antes dela já estão visíveis.
+4. Ordem de locks: advisory (917283) → `SELECT … FOR UPDATE` da intenção →
+   leitura única. Nenhuma lock nova, nenhuma inversão.
+5. `as_of` é capturado NA instrução (`now()` do próprio snapshot) e usado na
+   janela do dia — trade fechado durante a espera aparece nas duas parcelas.
+6. Equity/rede ficam fora da transação; leitura incerta bloqueia AUMENTO de
+   exposição, nunca proteção/saída.
+
 ## Fechamento dos oito achados da auditoria (28/09/2026)
 
 Baseline `46c7d7f0`; relatório `docs/AUDITORIA_LOTE_FINAL_46c7d7f0.md`. Cada
