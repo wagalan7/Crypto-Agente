@@ -56,6 +56,12 @@ class State:
 
 
 _TERMINAL_SAFE = {State.PROTECTED, State.FLAT}
+#: Desfecho COMPROVADO de um id despachado. `TERMINAL_ZERO` exige consulta
+#: terminal da própria identidade com quantidade final zero — FLAT, ausência de
+#: campo e lower-bound zero continuam sendo DESCONHECIDO.
+PROOF_POSITIVE = "POSITIVE"
+PROOF_TERMINAL_ZERO = "TERMINAL_ZERO"
+PROOF_UNKNOWN = "UNKNOWN"
 _ENTRY_KINDS = {Kind.ENTRY_SUBMISSION_UNKNOWN, Kind.ENTRY_ORDER_UNKNOWN, Kind.FINAL_FILL_QTY_UNKNOWN}
 _CLEANUP_KINDS = {Kind.CONDITIONAL_SUBMISSION_UNKNOWN, Kind.CLEANUP_PENDING}
 _MANUAL_KINDS = {Kind.UNTRACKED_POSITION, Kind.PERSISTENCE_FAILURE}
@@ -1568,6 +1574,12 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
                 return
 
     if verdict == "FLAT":
+        # Zero FINAL comprovado pela consulta da PRÓPRIA identidade: a prova é
+        # gravada ANTES de resolver, porque é ela (não o FLAT da posição) que
+        # autoriza encerrar a intenção como "não executou".
+        await _persist_entry_proof(key, owner, inc, state=PROOF_TERMINAL_ZERO,
+                                   client_order_id=coid, qty=0.0,
+                                   status=(order_res or {}).get("status"))
         # REJECTED/terminal-zero: NÃO vai direto a FLAT se há identidade condicional
         # — confirma fresh-flat, cancela IDs exatos e aplica grace via cleanup.
         if _exact_conditional_ids(inc):
@@ -1594,6 +1606,9 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
         _lower = max(_finite(inc.get("min_known_fill")) or 0.0, _qty_terminal)
         if await _fenced(key, owner, min_known_fill=_lower):
             inc["min_known_fill"] = _lower
+        await _persist_entry_proof(key, owner, inc, state=PROOF_POSITIVE,
+                                   client_order_id=coid, qty=_qty_terminal,
+                                   status=(order_res or {}).get("status"))
     gate, fp = await _fresh_gate(inc)
     if gate == FreshGate.UNKNOWN:
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, "posição UNKNOWN pós-fill — sem mutação")
@@ -1939,39 +1954,94 @@ async def _settle_intent_from_proof(row: dict) -> dict:
     states = {str(x.get("state")) for x in provas}
     if not states <= _TERMINAL_SAFE:
         return {"resolved": False, "unproven_ids": ids, "reason": "PROOF_INCONCLUSIVE"}
-    executado = _executed_qty_from_proofs(provas)
-    if executado <= 0 and states <= {State.FLAT}:
-        # Zero executado COMPROVADO em todos os ids: aí sim não houve entrada.
-        ok = await intents.mark_terminal(get_session, row["intent_key"],
-                                         reason="RECONCILED_NO_EXECUTION")
-        return {"resolved": bool(ok), "unproven_ids": [], "reason": "NO_EXECUTION"}
-    # Houve execução (posição protegida AGORA ou fill já encerrado antes da
-    # recuperação). FLAT descreve ausência de posição NESTE instante — nunca
-    # ausência de execução. Sem vínculo contábil, nada encerra.
-    trade_id = await _real_trade_for_dispatch(
-        ids, symbol=symbol, exchange=row.get("exchange"), side=row.get("side"))
-    if trade_id is None:
-        await _escalate_untracked_execution(provas, executed_qty=executado)
-        return {"resolved": False, "unproven_ids": ids, "reason": "TRADE_LINK_MISSING"}
-    ok = await intents.mark_confirmed(get_session, row["intent_key"],
-                                      real_trade_id=trade_id,
-                                      reason="RECONCILED_EXECUTION")
-    return {"resolved": bool(ok), "unproven_ids": [], "reason": "EXECUTION_LINKED"}
+    # Desfecho POR DISPATCH: cleanup/legado resolvido FLAT prova limpeza, não
+    # ausência de execução. Sem prova terminal da PRÓPRIA identidade, o id volta
+    # para a fila do reconciliador — que consulta a entry pelo caminho oficial.
+    desfechos = {dispatch_id: _dispatch_outcome(dispatch_id, found)
+                 for dispatch_id, found in por_id.items()}
+    sem_prova = [i for i, desfecho in desfechos.items() if desfecho == PROOF_UNKNOWN]
+    positivos = [i for i, desfecho in desfechos.items() if desfecho == PROOF_POSITIVE]
+    if positivos and sem_prova:
+        # Uma perna executou e outra é desconhecida: nada encerra, nada libera.
+        return {"resolved": False, "unproven_ids": sem_prova,
+                "reason": "EXECUTION_WITH_UNPROVEN_LEG"}
+    if positivos:
+        # Houve execução (posição protegida AGORA ou fill já encerrado antes da
+        # recuperação). Sem vínculo contábil, nada encerra.
+        trade_id = await _real_trade_for_dispatch(
+            ids, symbol=symbol, exchange=row.get("exchange"), side=row.get("side"))
+        if trade_id is None:
+            await _escalate_untracked_execution(provas, executed_qty=0.0)
+            return {"resolved": False, "unproven_ids": ids, "reason": "TRADE_LINK_MISSING"}
+        ok = await intents.mark_confirmed(get_session, row["intent_key"],
+                                          real_trade_id=trade_id,
+                                          reason="RECONCILED_EXECUTION")
+        return {"resolved": bool(ok), "unproven_ids": [], "reason": "EXECUTION_LINKED"}
+    if sem_prova:
+        return {"resolved": False, "unproven_ids": sem_prova,
+                "reason": "ENTRY_PROOF_MISSING"}
+    # TODOS os ids (inclusive a filha `-mfb`) com zero FINAL comprovado.
+    ok = await intents.mark_terminal(get_session, row["intent_key"],
+                                     reason="RECONCILED_NO_EXECUTION")
+    return {"resolved": bool(ok), "unproven_ids": [], "reason": "NO_EXECUTION"}
 
 
-def _executed_qty_from_proofs(proofs) -> float:
-    """Quantidade EXECUTADA comprovada pelos incidentes resolvidos.
+def _entry_proof_of(incident) -> Optional[dict]:
+    """Prova TERMINAL da entry gravada por este incidente, se houver."""
+    payload = incident.get("payload") if isinstance(incident.get("payload"), dict) else {}
+    proof = payload.get("entry_proof")
+    return proof if isinstance(proof, dict) else None
 
-    `min_known_fill` é o lower-bound monotônico do fill, gravado pelo ciclo antes
-    de resolver. Incidente PROTECTED implica execução mesmo sem número.
+
+def _dispatch_outcome(dispatch_id: str, incidents) -> str:
+    """Desfecho COMPROVADO de UM id despachado.
+
+    `PROOF_POSITIVE` (houve execução), `PROOF_TERMINAL_ZERO` (a consulta da
+    PRÓPRIA identidade provou quantidade final zero) ou `PROOF_UNKNOWN`.
+    Ausência de campo, lower-bound zero, posição FLAT e ausência de SL NÃO
+    provam zero final: FLAT descreve a posição de agora, não o que foi enviado.
+    Prova positiva domina prova de zero — conflito nunca vira "não executou".
     """
-    total = 0.0
-    for incident in proofs or ():
+    positivo = zero = False
+    for incident in incidents or ():
+        proof = _entry_proof_of(incident)
+        if proof and str(proof.get("client_order_id") or "") == str(dispatch_id):
+            estado = str(proof.get("state") or "")
+            positivo = positivo or estado == PROOF_POSITIVE
+            zero = zero or estado == PROOF_TERMINAL_ZERO
         if str(incident.get("state")) == State.PROTECTED:
-            total = max(total, _finite(incident.get("min_known_fill")) or 0.0, 1e-12)
-            continue
-        total = max(total, _finite(incident.get("min_known_fill")) or 0.0)
-    return total
+            positivo = True
+        if (_finite(incident.get("min_known_fill")) or 0.0) > 0:
+            positivo = True
+    if positivo:
+        return PROOF_POSITIVE
+    return PROOF_TERMINAL_ZERO if zero else PROOF_UNKNOWN
+
+
+async def _persist_entry_proof(key: str, owner: str, inc: dict, *, state: str,
+                               client_order_id: Optional[str], qty: Optional[float],
+                               status: Optional[str]) -> None:
+    """Grava no incidente a prova TERMINAL da entry, com identidade e origem.
+
+    Roda FENCED (owner+lease) e ANTES de qualquer resolução: quem liquida a
+    intenção depois precisa saber se aquele id teve zero COMPROVADO ou se
+    simplesmente nunca foi consultado.
+    """
+    if not client_order_id:
+        return
+    atual = dict(inc.get("payload") or {}) if isinstance(inc.get("payload"), dict) else {}
+    proof = {"state": state, "source": "get_order",
+             "client_order_id": str(client_order_id),
+             "status": str(status or "").upper() or None,
+             "executed_qty": _finite(qty),
+             "observed_at_ms": int(_now().timestamp() * 1000)}
+    anterior = atual.get("entry_proof")
+    if isinstance(anterior, dict) and anterior.get("state") == PROOF_POSITIVE \
+            and state != PROOF_POSITIVE:
+        return          # prova positiva anterior NÃO é apagada por consulta nova
+    merged = {**atual, "entry_proof": proof}
+    if await _fenced(key, owner, payload=merged):
+        inc["payload"] = merged
 
 
 async def _escalate_untracked_execution(proofs, *, executed_qty: float) -> None:
