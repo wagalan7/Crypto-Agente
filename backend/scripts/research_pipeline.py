@@ -211,11 +211,14 @@ async def run(args) -> dict:
                        "ts_ms": decision_ms, "source": "synthetic"}
     custos = r10a.CostConfig(fee_bps_per_side=4.0, slippage_bps_per_side=2.0,
                              funding_bps_per_bar=1.0)
-    # Configuração BASELINE e a do CANDIDATO — MANAGEMENT_ONLY, declarada aqui e
-    # executada pelo MESMO motor sobre as MESMAS barras/cotações.
+    # QUAL hipótese está sendo comparada? A identidade dos dois lados é
+    # registrada ANTES de qualquer resultado, e o ESCOPO do contraste fica
+    # explícito: gestão de saídas não prova núcleo/Score V3.
     baseline_config = r10a.ReplayConfig()
     candidate_config = r10a.ReplayConfig(tp1_fraction=0.60, trail_atr_multiple=1.6,
                                          be_lock_fraction=0.30)
+    report["comparison"] = comparacao_declarada(
+        baseline_config, candidate_config, custos=custos, core=core, score=s3)
     replay = pf.run_portfolio(candidates, bars_by_id=bars_by_id, quotes_by_id=quotes,
                               replay_config=baseline_config, costs=custos)
     candidate_replay = pf.run_portfolio(candidates, bars_by_id=bars_by_id,
@@ -237,6 +240,7 @@ async def run(args) -> dict:
                         "live_equivalent": replay["live_equivalent"]}
     report["candidate_replay"] = {
         "kind": "MANAGEMENT_ONLY",
+        "comparison_scope": report["comparison"]["scope"],
         "admitted": candidate_replay["admitted"],
         "metrics": candidate_replay["metrics"],
         "config_diff": {campo: [getattr(baseline_config, campo), getattr(candidate_config, campo)]
@@ -362,6 +366,65 @@ async def exportar_observadas(eligible) -> tuple:
     return linhas, {"state": manifest["state"], "rows": len(linhas),
                     "scope": manifest["source"]["cohort"],
                     "exporter_schema": dataset["exporter_schema"]}
+
+
+#: Hipótese AUTORIZADA a ser comparada (baseline × candidata congeladas). Os
+#: contratos do lote declaram o champion LIVE e as políticas novas como
+#: INATIVAS e `approved_for_production=false`; nenhum deles declara um PAR
+#: autorizado para a comparação econômica. Sem essa decisão registrada, o
+#: pipeline NÃO escolhe uma hipótese por conta própria.
+AUTHORIZED_PAIR_REASON = "AUTHORIZED_CANDIDATE_NOT_DECLARED"
+AUTHORIZED_PAIR_DECISION = [
+    "Qual baseline congelada: champion LIVE (CHAMPION_LEGACY/SCORE_V2) ou a "
+    "configuração default do núcleo R07D?",
+    "Qual candidata congelada: núcleo R07D + Score V3 (hoje inativos) ou outra "
+    "política já versionada?",
+    "Qual escopo/população e quais custos comparáveis valem para o par.",
+]
+
+
+def authorized_comparison() -> dict:
+    """Par AUTORIZADO declarado nos contratos — ou a ausência dele, explícita.
+
+    Enquanto nenhum contrato registrar o par, esta função devolve BLOQUEADO com
+    a decisão necessária. Inventar uma hipótese aqui trocaria silenciosamente o
+    objeto da comparação, que é exatamente o defeito relatado.
+    """
+    return {"available": False, "state": "BLOCKED_MISSING_DECISION",
+            "reason_code": AUTHORIZED_PAIR_REASON,
+            "decision_required": list(AUTHORIZED_PAIR_DECISION)}
+
+
+def comparacao_declarada(baseline_config, candidate_config, *, custos, core, score) -> dict:
+    """Identidade e ESCOPO do contraste executado, registrados antes do resultado."""
+    from services import preselection_experiment_service as r12
+    baseline_manifest = baseline_config.manifest()
+    candidate_manifest = candidate_config.manifest()
+    bundle = r12.freeze_bundle({
+        "baseline": baseline_manifest["config_hash"],
+        "candidate": candidate_manifest["config_hash"],
+        "config": {"core_version": core.CORE_VERSION,
+                   "core_config_hash": core.DEFAULT_CONFIG.config_hash(),
+                   "score_version": score.SCORE_VERSION},
+        "costs": custos.manifest()["config_hash"],
+        "protections": {"stop": "STRUCTURAL", "tp1_fraction_from_config": True}})
+    return {
+        "scope": "MANAGEMENT_ONLY",
+        "baseline_config_hash": baseline_manifest["config_hash"],
+        "candidate_config_hash": candidate_manifest["config_hash"],
+        "config_diff": {campo: [getattr(baseline_config, campo),
+                                getattr(candidate_config, campo)]
+                        for campo in ("tp1_fraction", "trail_atr_multiple",
+                                      "be_lock_fraction")
+                        if getattr(baseline_config, campo) != getattr(candidate_config, campo)},
+        "bundle_hash": bundle.get("bundle_hash"),
+        "identity_registered_before_results": True,
+        "proves": ["efeito da GESTÃO DE SAÍDAS sobre as MESMAS oportunidades"],
+        "does_not_prove": ["núcleo R07D", "Score V3", "playbooks",
+                           "seleção de oportunidades"],
+        "decision_source_both_sides": "strategy_core_service.decide (mesma lista)",
+        "authorized_hypothesis": authorized_comparison(),
+    }
 
 
 def evidence_key_of(*parts) -> str:

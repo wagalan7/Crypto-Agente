@@ -113,6 +113,54 @@ class OrquestracaoReal(unittest.TestCase):
         if wf_report["winner"] is not None:
             self.assertEqual(wf_report["state"], "EVIDENCE_AVAILABLE")
 
+    def test_comparacao_declara_escopo_e_hipotese_bloqueada(self):
+        """F — o contraste executado é de GESTÃO; a hipótese autorizada não
+        existe nos contratos, então ela aparece BLOQUEADA, não substituída."""
+        comparacao = self.report["comparison"]
+        self.assertEqual(comparacao["scope"], "MANAGEMENT_ONLY")
+        self.assertIn("Score V3", comparacao["does_not_prove"])
+        self.assertIn("núcleo R07D", comparacao["does_not_prove"])
+        self.assertTrue(comparacao["identity_registered_before_results"])
+        self.assertTrue(comparacao["baseline_config_hash"])
+        self.assertTrue(comparacao["candidate_config_hash"])
+        self.assertNotEqual(comparacao["baseline_config_hash"],
+                            comparacao["candidate_config_hash"])
+        self.assertTrue(comparacao["bundle_hash"])
+        autorizada = comparacao["authorized_hypothesis"]
+        self.assertFalse(autorizada["available"])
+        self.assertEqual(autorizada["state"], "BLOCKED_MISSING_DECISION")
+        self.assertEqual(autorizada["reason_code"], "AUTHORIZED_CANDIDATE_NOT_DECLARED")
+        self.assertGreaterEqual(len(autorizada["decision_required"]), 2)
+        # O lado candidato declara o mesmo escopo — nada de rótulo trocado.
+        self.assertEqual(self.report["candidate_replay"]["comparison_scope"],
+                         "MANAGEMENT_ONLY")
+
+    def test_mesma_configuracao_dos_dois_lados_da_o_mesmo_resultado(self):
+        """Igual decisão/execução sob igual configuração ⇒ igual resultado."""
+        from services import offline_replay_service as r10a
+        from services import portfolio_replay_service as pf
+        import importlib, sys as _sys
+        pipeline = importlib.import_module("scripts.research_pipeline")
+        self.assertTrue(hasattr(pipeline, "comparacao_declarada"))
+        config = r10a.ReplayConfig()
+        candidatos = [{"opportunity_id": "a", "symbol": "SYN/USDT:USDT",
+                       "direction": "long", "decision_ts_ms": 1_000_000,
+                       "entry": 100.0, "stop_loss": 99.0, "tp1": 103.0,
+                       "tp2": 106.0, "atr": 1.0}]
+        barras = [{"timestamp_ms": 1_200_000 + i * 300_000, "open": 100.0 + i,
+                   "high": 100.5 + i, "low": 99.5 + i, "close": 100.2 + i,
+                   "volume": 10.0} for i in range(6)]
+        cotacao = {"a": {"bid": 99.99, "ask": 100.0, "ts_ms": 1_000_000,
+                         "source": "synthetic"}}
+        custos = r10a.CostConfig(fee_bps_per_side=4.0, slippage_bps_per_side=2.0,
+                                 funding_bps_per_bar=1.0)
+        um = pf.run_portfolio(candidatos, bars_by_id={"a": barras},
+                              quotes_by_id=cotacao, replay_config=config, costs=custos)
+        outro = pf.run_portfolio(candidatos, bars_by_id={"a": barras},
+                                 quotes_by_id=cotacao, replay_config=config, costs=custos)
+        self.assertEqual(um["metrics"]["net_total_r"], outro["metrics"]["net_total_r"])
+        self.assertEqual(um["config_hash"], outro["config_hash"])
+
     def test_candidato_e_executado_e_nao_fabricado(self):
         """O lado candidato sai do MOTOR, não de baseline mais um bônus."""
         candidato = self.report["candidate_replay"]
