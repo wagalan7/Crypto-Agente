@@ -768,8 +768,13 @@ async def daily_base_in_session(session, *, as_of: Optional[datetime] = None) ->
 #: PostgreSQL: fechadas, abertas e reservas vêm do mesmo instante, mesmo sob
 #: READ COMMITTED. Executada DEPOIS da advisory lock, ela também já enxerga
 #: tudo que foi commitado enquanto a admissão esperava pela lock.
+#:
+#: O corte temporal é `statement_timestamp()`, o relógio DESTA instrução —
+#: `now()` é o início da TRANSAÇÃO e ficaria parado no instante ANTERIOR à
+#: espera pela lock: a admissão enxergaria a posição já fechada sumindo das
+#: ABERTAS e, ao mesmo tempo, o prejuízo dela caindo fora da janela do dia.
 _ADMISSION_SNAPSHOT_SQL = """
-WITH agora AS (SELECT now() AS as_of),
+WITH agora AS (SELECT statement_timestamp() AS as_of),
 fechadas AS (
     SELECT id, source, status, side, pnl_usd, tp1_realized_usd, entry_fee,
            exit_fee, entry_slippage_pct, recommendation_id, closed_at,
