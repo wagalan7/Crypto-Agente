@@ -2087,3 +2087,41 @@ Cada uma virou regressão que FALHA na baseline e roda pelo caller real.
 - **Fora do pacote:** F segue `BLOCKED_MISSING_DECISION` (baseline/candidata
   congeladas não decididas), adaptador LIVE e promoção pré-seleção continuam
   não implementados, e B/D/E/G não foram retrabalhados.
+
+## Resíduos C / A / H (29/09/2026, baseline `7878ffd1`)
+
+Três pontos residuais da auditoria `AUDITORIA_7878ffd1_ACEITES_RESIDUAIS`.
+Nenhuma migração; nenhum default, limite ou flag alterado.
+
+- **C — o corte era o da transação.** `now()` no PostgreSQL congela no início
+  da transação: a admissão que ESPERAVA a advisory lock enxergava os commits
+  novos, mas filtrava o P&L por um `until` anterior à espera. A posição fechada
+  nesse intervalo sumia das ABERTAS e o prejuízo ficava fora da JANELA.
+  Correção mínima: `statement_timestamp()` no CTE `agora` da instrução única,
+  que roda DEPOIS da lock. RED/GREEN em PG com espera real medida em
+  `pg_locks`, em `reserve` e em `admit_final_risk`.
+  Alcance: fonte legacy; a fonte com funding só está coberta pelo bloqueio por
+  ledger ausente — não é validação de contabilidade total.
+- **A — contradição no MESMO dispatch era descartada.** `CANCELED` com qty 1
+  seguido de `CANCELED` com qty 0 (mesma ordem) apagava a observação nova para
+  preservar a positiva e o incidente resolvia FLAT, liquidando a intenção.
+  Agora as DUAS observações ficam em `payload.entry_proof_conflict`, o incidente
+  vai a MANUAL_REQUIRED (`ENTRY_PROOF_CONFLICT`) e a liquidação recusa — sem
+  devolver reserva/slot, sem liberar quarentena, sem cancelar SL nem reenviar
+  entrada. Ordens DIFERENTES (primária zero + filha positiva) seguem
+  reconciliando.
+- **H — produtor e consumidor falavam de objetos diferentes.** O pipeline
+  gravava o hash de um `ReplayConfig` e o catálogo comparava com o hash da
+  config P05 (um knob + envelope) — `PRESELECTION_STUDY_MISMATCH` garantido.
+  Agora existe um contrato CANÔNICO do tipo (`PRE_SELECTION_CONTRACT_V1`) com
+  baseline, candidata, custos, bundle, dataset, corte, população, escopo e
+  versões; os dois lados usam a MESMA função e o catálogo RECALCULA o hash.
+  A configuração que governou o replay passa por um schema FECHADO do tipo; a
+  regra legada de um knob do POST_SELECTION continua intacta.
+- **Testes:** suíte completa **2.363 executados, 2.361 aprovados, 2 skips R05C**
+  (fixture auditada privada — informada, não fabricada). Novos harnesses PG:
+  `pg_integration_r05_clock.py` (10) e `pg_integration_p03_conflict.py` (21);
+  `pg_integration_r11_r12_pipeline.py` foi de 77 para 93 verificações e a
+  integração positiva passou a usar os MOTORES reais (replay + walk-forward +
+  gate) sobre fixture sintética congelada, sem métricas prontas.
+  `py_compile` e `git diff --check` aprovados; nenhum TS/TSX alterado.

@@ -198,3 +198,12 @@ Os caminhos existiam; este lote corrigiu o que eles realmente faziam.
 | R05 admissão (C) | Reserva e readmissão final consomem a MESMA visão; leitura indisponível ⇒ `ADMISSION_SNAPSHOT_UNAVAILABLE`, que bloqueia aumento e não afeta proteção/saída |
 | R12 estudo (H) | Experimento pré-seleção vinculado ao estudo persistido e CONFERIDO (população, hash da candidata, dataset, corte); divergência recusa antes de ler outcomes |
 | R12 avaliação (H) | `evaluate_shadow` despacha por tipo antes do loader; a coorte pré-seleção usa `evaluate_preselection_shadow` e nunca `_load_shadow` |
+
+## 10. Resíduos C / A / H (29/09/2026)
+
+| Contrato | O que passou a valer |
+| --- | --- |
+| R05 corte (C) | O snapshot usa `statement_timestamp()` — o relógio da INSTRUÇÃO que roda depois da lock, não o `now()` do início da transação. Fechamento ocorrido durante a espera entra nas DUAS parcelas |
+| P03 conflito (A) | Duas respostas TERMINAIS incompatíveis do MESMO dispatch preservam o fill positivo E registram `entry_proof_conflict`; o incidente vai a MANUAL_REQUIRED e a liquidação recusa (`ENTRY_PROOF_CONFLICT`), sem liberar reserva/slot/pausa e sem tocar proteção |
+| R12 contrato (H) | `PRE_SELECTION_CONTRACT_V1`: população, study_kind, versões, escopo, baseline/candidata/custos (manifestos completos), bundle, dataset e corte. Produtor e catálogo usam a MESMA função; o consumidor RECALCULA o hash — copiar campo não passa |
+| R12 schema (H) | A configuração que governou o replay é validada por schema FECHADO do tipo; a regra legada de UM KNOB do POST_SELECTION permanece |

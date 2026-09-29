@@ -468,6 +468,17 @@ achado virou regressão que FALHA na baseline e roda pelo caller real.
 | C | `44397ca9` | `RESERVED_NEW` com −95 na corrida entre leituras → `DAILY_LOSS_LIMIT` com −98/−101 | `pg_integration_r05_snapshot.py` (14) |
 | H | `b0601cc5` | métricas avulsas validando + sentinela `POST_SELECTION_OUTCOMES_READ` → estudo vinculado e despacho por tipo | `pg_integration_r11_r12_pipeline.py` (77) |
 
+### Resíduos C/A/H (29/09/2026) — checkpoint
+
+| Resíduo | Commit | RED → GREEN | Prova |
+| --- | --- | --- | --- |
+| C | `0db1a27b` | `RESERVED_NEW` após espera pela lock → `DAILY_LOSS_LIMIT` | `pg_integration_r05_clock.py` (10), espera medida em `pg_locks` |
+| A | `7f731d4c` | contradição descartada e FLAT resolvido → conflito persistido + MANUAL_REQUIRED | `pg_integration_p03_conflict.py` (21) |
+| H | `2b5302f9` | `PRESELECTION_STUDY_MISMATCH ['candidate_config_hash']` → contrato canônico recalculado | `pg_integration_r11_r12_pipeline.py` (93), estudo dos motores reais |
+
+O contrato de consistência da admissão (acima) continua valendo, agora com o
+corte da INSTRUÇÃO (`statement_timestamp()`) em vez do início da transação.
+
 Próximo passo: decidir o par congelado de F (baseline × candidata × escopo/
 custos). B/D/E/G permanecem como estavam; adaptador LIVE e promoção
 pré-seleção continuam fora.
