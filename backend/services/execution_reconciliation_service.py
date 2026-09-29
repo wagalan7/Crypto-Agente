@@ -62,6 +62,10 @@ _TERMINAL_SAFE = {State.PROTECTED, State.FLAT}
 PROOF_POSITIVE = "POSITIVE"
 PROOF_TERMINAL_ZERO = "TERMINAL_ZERO"
 PROOF_UNKNOWN = "UNKNOWN"
+#: Duas respostas TERMINAIS incompatíveis para a MESMA ordem (fill positivo e
+#: zero final). Nenhuma das duas é descartada e NADA é liquidado em cima disso.
+PROOF_CONFLICT = "CONFLICT"
+CONFLICT_REASON = "ENTRY_PROOF_CONFLICT"
 _ENTRY_KINDS = {Kind.ENTRY_SUBMISSION_UNKNOWN, Kind.ENTRY_ORDER_UNKNOWN, Kind.FINAL_FILL_QTY_UNKNOWN}
 _CLEANUP_KINDS = {Kind.CONDITIONAL_SUBMISSION_UNKNOWN, Kind.CLEANUP_PENDING}
 _MANUAL_KINDS = {Kind.UNTRACKED_POSITION, Kind.PERSISTENCE_FAILURE}
@@ -1577,9 +1581,13 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
         # Zero FINAL comprovado pela consulta da PRÓPRIA identidade: a prova é
         # gravada ANTES de resolver, porque é ela (não o FLAT da posição) que
         # autoriza encerrar a intenção como "não executou".
-        await _persist_entry_proof(key, owner, inc, state=PROOF_TERMINAL_ZERO,
-                                   client_order_id=coid, qty=0.0,
-                                   status=(order_res or {}).get("status"))
+        registrada = await _persist_entry_proof(
+            key, owner, inc, state=PROOF_TERMINAL_ZERO, client_order_id=coid,
+            qty=0.0, status=(order_res or {}).get("status"))
+        if registrada == PROOF_CONFLICT:
+            # Esta MESMA ordem já provou fill: contradição não resolve nada.
+            await _halt_on_proof_conflict(key, owner, inc)
+            return
         # REJECTED/terminal-zero: NÃO vai direto a FLAT se há identidade condicional
         # — confirma fresh-flat, cancela IDs exatos e aplica grace via cleanup.
         if _exact_conditional_ids(inc):
@@ -1606,9 +1614,13 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
         _lower = max(_finite(inc.get("min_known_fill")) or 0.0, _qty_terminal)
         if await _fenced(key, owner, min_known_fill=_lower):
             inc["min_known_fill"] = _lower
-        await _persist_entry_proof(key, owner, inc, state=PROOF_POSITIVE,
-                                   client_order_id=coid, qty=_qty_terminal,
-                                   status=(order_res or {}).get("status"))
+        registrada = await _persist_entry_proof(
+            key, owner, inc, state=PROOF_POSITIVE, client_order_id=coid,
+            qty=_qty_terminal, status=(order_res or {}).get("status"))
+        if registrada == PROOF_CONFLICT:
+            # Esta MESMA ordem já provou zero final: contradição não resolve nada.
+            await _halt_on_proof_conflict(key, owner, inc)
+            return
     gate, fp = await _fresh_gate(inc)
     if gate == FreshGate.UNKNOWN:
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, "posição UNKNOWN pós-fill — sem mutação")
@@ -1959,6 +1971,11 @@ async def _settle_intent_from_proof(row: dict) -> dict:
     # para a fila do reconciliador — que consulta a entry pelo caminho oficial.
     desfechos = {dispatch_id: _dispatch_outcome(dispatch_id, found)
                  for dispatch_id, found in por_id.items()}
+    conflitantes = [i for i, desfecho in desfechos.items() if desfecho == PROOF_CONFLICT]
+    if conflitantes:
+        # Prova contraditória do MESMO dispatch: nada encerra, nada é liberado.
+        return {"resolved": False, "unproven_ids": conflitantes,
+                "reason": CONFLICT_REASON}
     sem_prova = [i for i, desfecho in desfechos.items() if desfecho == PROOF_UNKNOWN]
     positivos = [i for i, desfecho in desfechos.items() if desfecho == PROOF_POSITIVE]
     if positivos and sem_prova:
@@ -1997,13 +2014,19 @@ def _dispatch_outcome(dispatch_id: str, incidents) -> str:
     """Desfecho COMPROVADO de UM id despachado.
 
     `PROOF_POSITIVE` (houve execução), `PROOF_TERMINAL_ZERO` (a consulta da
-    PRÓPRIA identidade provou quantidade final zero) ou `PROOF_UNKNOWN`.
+    PRÓPRIA identidade provou quantidade final zero), `PROOF_CONFLICT` (duas
+    respostas terminais incompatíveis para a MESMA ordem) ou `PROOF_UNKNOWN`.
     Ausência de campo, lower-bound zero, posição FLAT e ausência de SL NÃO
     provam zero final: FLAT descreve a posição de agora, não o que foi enviado.
-    Prova positiva domina prova de zero — conflito nunca vira "não executou".
+    Conflito NUNCA vira "não executou" e também não autoriza liquidar.
     """
     positivo = zero = False
     for incident in incidents or ():
+        conflito = (incident.get("payload") or {}).get("entry_proof_conflict") \
+            if isinstance(incident.get("payload"), dict) else None
+        if isinstance(conflito, dict) \
+                and str(conflito.get("client_order_id") or "") == str(dispatch_id):
+            return PROOF_CONFLICT
         proof = _entry_proof_of(incident)
         if proof and str(proof.get("client_order_id") or "") == str(dispatch_id):
             estado = str(proof.get("state") or "")
@@ -2020,15 +2043,20 @@ def _dispatch_outcome(dispatch_id: str, incidents) -> str:
 
 async def _persist_entry_proof(key: str, owner: str, inc: dict, *, state: str,
                                client_order_id: Optional[str], qty: Optional[float],
-                               status: Optional[str]) -> None:
+                               status: Optional[str]) -> str:
     """Grava no incidente a prova TERMINAL da entry, com identidade e origem.
 
     Roda FENCED (owner+lease) e ANTES de qualquer resolução: quem liquida a
     intenção depois precisa saber se aquele id teve zero COMPROVADO ou se
     simplesmente nunca foi consultado.
+
+    Duas respostas TERMINAIS incompatíveis para a MESMA ordem (positiva e zero)
+    NÃO se sobrescrevem: o fill positivo é preservado, a observação nova fica
+    registrada em `entry_proof_conflict` e o retorno é `PROOF_CONFLICT` — quem
+    chamou precisa PARAR, não resolver.
     """
     if not client_order_id:
-        return
+        return state
     atual = dict(inc.get("payload") or {}) if isinstance(inc.get("payload"), dict) else {}
     proof = {"state": state, "source": "get_order",
              "client_order_id": str(client_order_id),
@@ -2036,12 +2064,53 @@ async def _persist_entry_proof(key: str, owner: str, inc: dict, *, state: str,
              "executed_qty": _finite(qty),
              "observed_at_ms": int(_now().timestamp() * 1000)}
     anterior = atual.get("entry_proof")
+    mesmo_id = (isinstance(anterior, dict)
+                and str(anterior.get("client_order_id") or "") == str(client_order_id))
+    estados = {str((anterior or {}).get("state")), state} if mesmo_id else set()
+    if mesmo_id and estados == {PROOF_POSITIVE, PROOF_TERMINAL_ZERO}:
+        # CONTRADIÇÃO na mesma ordem: preserva a positiva, registra a outra.
+        mantida = anterior if anterior.get("state") == PROOF_POSITIVE else proof
+        observada = proof if anterior.get("state") == PROOF_POSITIVE else anterior
+        conflito = {"client_order_id": str(client_order_id),
+                    "kept_state": PROOF_POSITIVE,
+                    "observed_state": PROOF_TERMINAL_ZERO,
+                    "kept": dict(mantida), "observed": dict(observada),
+                    "first_seen_at_ms": (atual.get("entry_proof_conflict") or {})
+                    .get("first_seen_at_ms") or int(_now().timestamp() * 1000),
+                    "last_seen_at_ms": int(_now().timestamp() * 1000)}
+        merged = {**atual, "entry_proof": dict(mantida),
+                  "entry_proof_conflict": conflito}
+        if await _fenced(key, owner, payload=merged):
+            inc["payload"] = merged
+        return PROOF_CONFLICT
+    if isinstance(atual.get("entry_proof_conflict"), dict):
+        return PROOF_CONFLICT      # conflito já registrado continua valendo
     if isinstance(anterior, dict) and anterior.get("state") == PROOF_POSITIVE \
             and state != PROOF_POSITIVE:
-        return          # prova positiva anterior NÃO é apagada por consulta nova
+        return PROOF_POSITIVE      # positiva anterior NÃO é apagada
     merged = {**atual, "entry_proof": proof}
     if await _fenced(key, owner, payload=merged):
         inc["payload"] = merged
+    return state
+
+
+async def _halt_on_proof_conflict(key: str, owner: str, inc: dict) -> None:
+    """Conflito terminal ⇒ pendência HUMANA pelo fluxo oficial.
+
+    Não resolve, não devolve reserva, não libera slot nem quarentena — e não
+    toca proteção: nenhum SL é cancelado e nenhuma entrada é reenviada por
+    causa do conflito. Repetir é idempotente (o estado já é MANUAL_REQUIRED).
+    """
+    conflito = (inc.get("payload") or {}).get("entry_proof_conflict") or {}
+    motivo = (f"{CONFLICT_REASON}: respostas terminais incompatíveis para "
+              f"{_mask(conflito.get('client_order_id'))} "
+              f"(mantida {conflito.get('kept_state')}, observada "
+              f"{conflito.get('observed_state')}) — exige conferência humana")
+    if str(inc.get("state")) == State.MANUAL_REQUIRED:
+        return
+    if await _fenced(key, owner, state=State.MANUAL_REQUIRED, manual_reason=motivo,
+                     last_error=motivo):
+        log.critical(f"[p03][transition] {key} → MANUAL_REQUIRED ({CONFLICT_REASON})")
 
 
 async def _escalate_untracked_execution(proofs, *, executed_qty: float) -> None:
