@@ -6215,8 +6215,8 @@ def can_transition_for(config: Any, current: str, target: str) -> bool:
 #: avaliação oficiais recuperam o estudo REALMENTE executado (persistido pela
 #: simulação em `policy_simulation_state`) e conferem estes campos: métricas
 #: avulsas do chamador não conferem OFFLINE_VALIDATED.
-STUDY_REQUIRED_FIELDS = ("population", "candidate_config_hash", "dataset_fingerprint",
-                         "cutoff_ms", "evidence")
+STUDY_REQUIRED_FIELDS = ("population", "contract", "contract_hash",
+                         "dataset_fingerprint", "cutoff_ms", "evidence")
 STUDY_MISSING = "PRESELECTION_STUDY_MISSING"
 STUDY_MISMATCH = "PRESELECTION_STUDY_MISMATCH"
 POST_SELECTION_LOADER_BLOCKED = "POST_SELECTION_LOADER_NOT_FOR_PRE_SELECTION"
@@ -6256,27 +6256,70 @@ def verify_study_identity(study: Any, *, candidate_config: Any, fingerprint: Any
                           cutoff: Any) -> Dict[str, Any]:
     """Confere que o estudo recuperado é O DESTE experimento.
 
-    População, hash da configuração candidata, dataset e corte precisam
-    coincidir. Divergência recusa ANTES de qualquer leitura de outcome.
+    O contrato canônico PRE_SELECTION é RECALCULADO aqui (mesmo objeto, mesma
+    versão, mesma função do produtor): adulterar baseline, candidata, custos,
+    bundle, dataset, corte, população, escopo ou versões quebra o hash. Além
+    disso, a configuração que governou o replay passa pelo schema FECHADO do
+    tipo — a regra legada de um knob continua valendo para o POST_SELECTION —
+    e o tipo do experimento é conferido pelo guard versionado. Divergência
+    recusa ANTES de qualquer leitura de outcome.
     """
+    from services import preselection_experiment_service as r12
     estudo = study if isinstance(study, Mapping) else {}
     faltando = [campo for campo in STUDY_REQUIRED_FIELDS if estudo.get(campo) in (None, "")]
     if faltando:
         return {"ok": False, "reason_code": STUDY_MISSING, "missing": faltando}
+    contrato = estudo.get("contract")
+    if not isinstance(contrato, Mapping):
+        return {"ok": False, "reason_code": STUDY_MISSING, "missing": ["contract"]}
+    # 1. Integridade do contrato: hash refeito sobre o corpo inteiro.
+    recalculado = r12.contract_hash_of(contrato)
+    if not recalculado or recalculado != str(estudo.get("contract_hash") or "") \
+            or recalculado != str(contrato.get("contract_hash") or ""):
+        return {"ok": False, "reason_code": r12.CONTRACT_INVALID,
+                "diverged": ["contract_hash"]}
+    # 2. A configuração aceita é a que governou o replay, pelo schema do tipo.
+    schema = r12.validate_preselection_study_config(contrato.get("candidate_config"))
+    if not schema["ok"]:
+        return {"ok": False, "reason_code": schema["reason_code"],
+                "detail": schema.get("detail"), "diverged": ["candidate_config"]}
+    base_schema = r12.validate_preselection_study_config(contrato.get("baseline_config"))
+    if not base_schema["ok"]:
+        return {"ok": False, "reason_code": base_schema["reason_code"],
+                "detail": base_schema.get("detail"), "diverged": ["baseline_config"]}
+    # 3. O experimento do catálogo é do TIPO certo (envelope versionado).
+    tipo = experiment_type_guard(candidate_config, expected_type=PRE_SELECTION_TYPE)
+    if not tipo["ok"]:
+        return {"ok": False, "reason_code": tipo["reason_code"],
+                "diverged": ["experiment_type"]}
+    # 4. As identidades declaradas batem com o contrato E com o experimento.
     divergentes = []
-    if str(estudo.get("population")) != "SHADOW":
+    if str(contrato.get("population")) != "SHADOW" \
+            or str(estudo.get("population")) != str(contrato.get("population")):
         divergentes.append("population")
-    if str(estudo.get("candidate_config_hash") or "") != canonical_hash(candidate_config):
-        divergentes.append("candidate_config_hash")
-    if str(estudo.get("dataset_fingerprint") or "") != str(fingerprint or ""):
+    if str(contrato.get("study_kind")) != "PRE_SELECTION":
+        divergentes.append("study_kind")
+    if str(contrato.get("comparison_scope") or "") != "MANAGEMENT_ONLY":
+        divergentes.append("comparison_scope")
+    if not contrato.get("costs_config"):
+        divergentes.append("costs_config")
+    if not contrato.get("bundle_hash"):
+        divergentes.append("bundle_hash")
+    if str(contrato.get("dataset_fingerprint") or "") != str(fingerprint or "") \
+            or str(estudo.get("dataset_fingerprint") or "") != str(fingerprint or ""):
         divergentes.append("dataset_fingerprint")
-    corte = estudo.get("cutoff_ms")
     esperado = int(_utc(cutoff).timestamp() * 1000) if _utc(cutoff) else None
-    if esperado is None or not isinstance(corte, (int, float)) or int(corte) != esperado:
+    corte_contrato, corte_estudo = contrato.get("cutoff_ms"), estudo.get("cutoff_ms")
+    if (esperado is None or not isinstance(corte_contrato, (int, float))
+            or int(corte_contrato) != esperado
+            or not isinstance(corte_estudo, (int, float))
+            or int(corte_estudo) != esperado):
         divergentes.append("cutoff_ms")
     if divergentes:
         return {"ok": False, "reason_code": STUDY_MISMATCH, "diverged": divergentes}
-    return {"ok": True, "reason_code": "STUDY_VERIFIED", "diverged": []}
+    return {"ok": True, "reason_code": "STUDY_VERIFIED", "diverged": [],
+            "contract_hash": recalculado,
+            "verified_fields": list(r12.PRE_SELECTION_CONTRACT_FIELDS)}
 
 
 def evaluate_preselection_candidate(evidence: Any) -> Dict[str, Any]:
@@ -6355,12 +6398,12 @@ async def create_preselection_experiment(*, champion: Dict[str, Any],
     offline = {**evaluate_preselection_candidate(estudo.get("evidence")),
                "study": {campo: estudo.get(campo) for campo in
                          ("population", "study_kind", "policy_version",
-                          "universe_version", "baseline_config_hash",
-                          "candidate_config_hash", "comparison_scope", "bundle_hash",
-                          "costs_hash", "dataset_fingerprint", "cutoff_ms",
+                          "universe_version", "comparison_scope", "bundle_hash",
+                          "contract_hash", "dataset_fingerprint", "cutoff_ms",
                           "evidence_key", "gate_verdict", "criteria_hash",
                           "wf_state", "wf_winner", "folds_executed",
                           "replay_admitted")},
+               "study_verified_fields": conferencia.get("verified_fields"),
                "study_ref": dict(referencia),
                "study_generation": recuperado.get("generation")}
     from db import get_session

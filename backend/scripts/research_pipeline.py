@@ -422,6 +422,10 @@ def comparacao_declarada(baseline_config, candidate_config, *, custos, core, sco
         "protections": {"stop": "STRUCTURAL", "tp1_fraction_from_config": True}})
     return {
         "scope": "MANAGEMENT_ONLY",
+        # Manifestos COMPLETOS: é o objeto que governou o replay, não só o hash.
+        "baseline_config": dict(baseline_manifest),
+        "candidate_config": dict(candidate_manifest),
+        "costs_config": dict(custos.manifest()),
         "baseline_config_hash": baseline_manifest["config_hash"],
         "candidate_config_hash": candidate_manifest["config_hash"],
         "config_diff": {campo: [getattr(baseline_config, campo),
@@ -507,33 +511,23 @@ async def simulate_policy_state(args, *, study, replay, candidate_replay,
             progresso, symbol=POLICY_SCOPE, action=acao, now_ms=now_ms,
             period_seconds=PERIOD_SECONDS, evidence_key=evidence_key,
             required_periods=REQUIRED_PERIODS, universe_source=universe_version)
-        # O ESTUDO fica persistido junto do estado: quem avaliar o experimento
-        # depois precisa verificar QUAL estudo produziu a evidência — população,
-        # configurações, custos, dataset, corte e o resultado calculado.
-        estudo = {
-            "population": rp.POPULATION_SHADOW,
-            "study_kind": "PRE_SELECTION",
-            "policy_version": rp.POLICY_VERSION,
-            "universe_version": universe_version,
-            "baseline_config_hash": (comparison or {}).get("baseline_config_hash"),
-            "candidate_config_hash": (comparison or {}).get("candidate_config_hash"),
-            "comparison_scope": (comparison or {}).get("scope"),
-            "bundle_hash": (comparison or {}).get("bundle_hash"),
-            "costs_hash": r10a.CostConfig(fee_bps_per_side=4.0,
-                                          slippage_bps_per_side=2.0,
-                                          funding_bps_per_bar=1.0
-                                          ).manifest()["config_hash"],
-            "dataset_fingerprint": dataset_fingerprint or evidence_key,
-            "cutoff_ms": now_ms,
-            "evidence_key": evidence_key,
-            "gate_verdict": gate["verdict"],
-            "criteria_hash": gate.get("criteria_hash"),
-            "wf_state": study["verdict"]["state"],
-            "wf_winner": study["verdict"]["winner"],
-            "folds_executed": study["folds_executed"],
-            "replay_admitted": replay["admitted"],
-            "evidence": dict(evidence or {}),
-        }
+        # O ESTUDO fica persistido junto do estado, com o CONTRATO CANÔNICO do
+        # tipo: o catálogo recalcula o hash desse mesmo objeto (mesma função,
+        # mesma versão) e valida a configuração que REALMENTE governou o replay.
+        from services import preselection_experiment_service as r12
+        contrato = r12.preselection_contract(
+            population=rp.POPULATION_SHADOW, study_kind="PRE_SELECTION",
+            policy_version=rp.POLICY_VERSION, universe_version=universe_version,
+            comparison_scope=(comparison or {}).get("scope") or "MANAGEMENT_ONLY",
+            baseline_config=(comparison or {}).get("baseline_config") or {},
+            candidate_config=(comparison or {}).get("candidate_config") or {},
+            costs_config=(comparison or {}).get("costs_config") or {},
+            bundle_hash=(comparison or {}).get("bundle_hash"),
+            dataset_fingerprint=dataset_fingerprint or evidence_key,
+            cutoff_ms=now_ms)
+        estudo = r12.study_payload(contract=contrato, evidence=evidence or {},
+                                   gate=gate, study=study, replay=replay,
+                                   evidence_key=evidence_key)
         payload = {"hysteresis": {"symbol": avancado.symbol, "action": avancado.action,
                                   "periods": avancado.periods,
                                   "last_period": avancado.last_period,

@@ -372,6 +372,143 @@ def go_no_go(evidence: Mapping[str, Any], *,
 
 # ── Manifest de canário (sem aplicar) ───────────────────────────────────────
 
+# ── Contrato CANÔNICO do estudo PRE_SELECTION ───────────────────────────────
+#: Um objeto só, calculado pelo PRODUTOR do estudo e RECALCULADO pelo catálogo.
+#: Copiar campos para o JSON não é validá-los: o hash é refeito sobre o corpo,
+#: então adulterar baseline, candidata, custos, bundle, dataset, corte,
+#: população, escopo ou versões quebra a conferência.
+PRE_SELECTION_CONTRACT_VERSION = "R12_PRE_SELECTION_CONTRACT_V1"
+PRE_SELECTION_CONTRACT_FIELDS = (
+    "contract_version", "population", "study_kind", "policy_version",
+    "universe_version", "comparison_scope", "baseline_config", "candidate_config",
+    "costs_config", "bundle_hash", "dataset_fingerprint", "cutoff_ms",
+)
+#: Schema FECHADO da configuração que governa o replay do laboratório. A regra
+#: legada de UM KNOB continua valendo para o POST_SELECTION; ela não descreve
+#: uma configuração de replay, então o tipo PRE_SELECTION valida a sua.
+PRE_SELECTION_REPLAY_FIELDS = {
+    "bar_ms": (int, 1, 86_400_000),
+    "entry_window_bars": (int, 1, 4096),
+    "pre_tp1_time_stop_bars": (int, 1, 4096),
+    "max_holding_bars": (int, 1, 4096),
+    "tp1_fraction": (float, 0.0, 1.0),
+    "be_lock_fraction": (float, 0.0, 1.0),
+    "trail_atr_multiple": (float, 0.0, 100.0),
+    "trail_activation_atr": (float, 0.0, 100.0),
+    "max_bars": (int, 1, 100_000),
+    "schema_version": (str, None, None),
+    "config_hash": (str, None, None),
+}
+CONTRACT_INVALID = "PRE_SELECTION_CONTRACT_INVALID"
+CONFIG_SCHEMA_INVALID = "PRE_SELECTION_CONFIG_SCHEMA_INVALID"
+
+
+def validate_preselection_study_config(config: Any) -> Dict[str, Any]:
+    """Valida a configuração que REALMENTE governou o replay (schema fechado).
+
+    Não afrouxa nada do legado: o POST_SELECTION continua com a regra de um
+    knob; aqui o tipo versionado tem o schema do laboratório que já existe.
+    """
+    if not isinstance(config, Mapping) or not config:
+        return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                "detail": "configuração vazia"}
+    desconhecidos = [chave for chave in config if chave not in PRE_SELECTION_REPLAY_FIELDS]
+    if desconhecidos:
+        return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                "detail": f"campos fora do schema: {sorted(desconhecidos)}"}
+    faltando = [chave for chave in ("bar_ms", "max_holding_bars", "tp1_fraction",
+                                    "schema_version", "config_hash")
+                if config.get(chave) is None]
+    if faltando:
+        return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                "detail": f"campos obrigatórios ausentes: {faltando}"}
+    for chave, valor in config.items():
+        tipo, minimo, maximo = PRE_SELECTION_REPLAY_FIELDS[chave]
+        if tipo is str:
+            if not isinstance(valor, str) or not valor.strip():
+                return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                        "detail": f"{chave}: texto obrigatório"}
+            continue
+        numero = _finite(valor)
+        if numero is None or (tipo is int and float(numero) != int(numero)):
+            return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                    "detail": f"{chave}: número {tipo.__name__} obrigatório"}
+        if minimo is not None and numero < minimo:
+            return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                    "detail": f"{chave}: abaixo de {minimo}"}
+        if maximo is not None and numero > maximo:
+            return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                    "detail": f"{chave}: acima de {maximo}"}
+    return {"ok": True, "reason_code": OK, "detail": None}
+
+
+def preselection_contract(*, population: str, study_kind: str, policy_version: str,
+                          universe_version: str, comparison_scope: str,
+                          baseline_config: Mapping[str, Any],
+                          candidate_config: Mapping[str, Any],
+                          costs_config: Mapping[str, Any],
+                          bundle_hash: Optional[str],
+                          dataset_fingerprint: str, cutoff_ms: int) -> Dict[str, Any]:
+    """Contrato CONGELADO antes dos resultados, com hash sobre o corpo inteiro."""
+    corpo = {
+        "contract_version": PRE_SELECTION_CONTRACT_VERSION,
+        "population": str(population), "study_kind": str(study_kind),
+        "policy_version": str(policy_version),
+        "universe_version": str(universe_version),
+        "comparison_scope": str(comparison_scope),
+        "baseline_config": dict(baseline_config or {}),
+        "candidate_config": dict(candidate_config or {}),
+        "costs_config": dict(costs_config or {}),
+        "bundle_hash": (str(bundle_hash) if bundle_hash else None),
+        "dataset_fingerprint": str(dataset_fingerprint),
+        "cutoff_ms": int(cutoff_ms),
+    }
+    return {**corpo, "contract_hash": _hash(corpo)}
+
+
+def contract_hash_of(contract: Any) -> Optional[str]:
+    """Recalcula o hash do corpo do contrato (sem o próprio hash)."""
+    if not isinstance(contract, Mapping):
+        return None
+    corpo = {campo: contract.get(campo) for campo in PRE_SELECTION_CONTRACT_FIELDS}
+    if corpo.get("contract_version") != PRE_SELECTION_CONTRACT_VERSION:
+        return None
+    return _hash(corpo)
+
+
+def study_payload(*, contract: Mapping[str, Any], evidence: Mapping[str, Any],
+                  gate: Mapping[str, Any], study: Mapping[str, Any],
+                  replay: Mapping[str, Any], evidence_key: str) -> Dict[str, Any]:
+    """Estudo PERSISTIDO pelo produtor: contrato + evidência REALMENTE calculada.
+
+    Quem consome recalcula o hash do contrato e reavalia o gate sobre esta
+    evidência — nada de métricas prontas nem de hash copiado.
+    """
+    contrato = dict(contract or {})
+    veredito = dict(gate or {})
+    resultado = dict(study or {})
+    return {
+        "contract": contrato,
+        "contract_hash": contrato.get("contract_hash"),
+        "population": contrato.get("population"),
+        "study_kind": contrato.get("study_kind"),
+        "policy_version": contrato.get("policy_version"),
+        "universe_version": contrato.get("universe_version"),
+        "comparison_scope": contrato.get("comparison_scope"),
+        "bundle_hash": contrato.get("bundle_hash"),
+        "dataset_fingerprint": contrato.get("dataset_fingerprint"),
+        "cutoff_ms": contrato.get("cutoff_ms"),
+        "evidence_key": str(evidence_key),
+        "gate_verdict": veredito.get("verdict"),
+        "criteria_hash": veredito.get("criteria_hash"),
+        "wf_state": (resultado.get("verdict") or {}).get("state"),
+        "wf_winner": (resultado.get("verdict") or {}).get("winner"),
+        "folds_executed": resultado.get("folds_executed"),
+        "replay_admitted": (replay or {}).get("admitted"),
+        "evidence": dict(evidence or {}),
+    }
+
+
 def gate_evidence_from_study(*, replay: Mapping[str, Any], study: Mapping[str, Any],
                              trades: Sequence[Mapping[str, Any]],
                              enabled_playbooks: Sequence[str],
