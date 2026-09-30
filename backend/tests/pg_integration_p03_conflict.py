@@ -557,6 +557,91 @@ async def run():
                       kind=ers.Kind.ENTRY_SUBMISSION_UNKNOWN)[0] is not None,
           "marcador sumiu")
 
+    # A8. Conflito que NASCE na consulta atual: conferir ANTES do fim do ciclo,
+    # pois a recuperação posterior pode ocultar cleanup/proteção já executados.
+    async def conflito_na_consulta(trigger, *, order_id, nova_positiva):
+        ident = await intencao_unknown(trigger)
+        kwargs = ers.assemble_entry_incident(
+            {"client_order_id": ident.client_order_id,
+             "safety_state": "FINAL_FILL_QTY_UNKNOWN",
+             "final_fill_qty_unknown": True, "entry_order_terminal": True,
+             "submitted_qty": 1.0, "result": {"orderId": order_id}},
+            {"symbol": SIMBOLO, "direction": "long", "stop_loss": 95.0, "qty": 1.0},
+            local_client_order_id=ident.client_order_id)
+        primeira = await ers.record_incident(**kwargs)
+        await ers.recover_entry_intents()       # segundo produtor oficial
+        chave = ers.build_incident_key(
+            ers.Kind.ENTRY_SUBMISSION_UNKNOWN, SIMBOLO, exchange="binance",
+            client_order_id=ident.client_order_id)
+        sl_id = "sl-preservado-" + order_id
+        if not nova_positiva:
+            await ers.record_incident(
+                kind=ers.Kind.ENTRY_SUBMISSION_UNKNOWN, symbol=SIMBOLO,
+                client_order_id=ident.client_order_id, conditional_ids={"sl": sl_id})
+        POR_ORDER_ID[order_id] = cancelada(0.0 if nova_positiva else 1.0)
+        ORDENS[ident.client_order_id] = cancelada(1.0 if nova_positiva else 0.0)
+        POSICOES.clear()
+        POSICOES["stale"] = True
+        ALGOS["orders"] = []
+
+        async def reconciliar(chave_incidente):
+            repo_atual = ers._get_repo()
+            owner = "p03-prova-nova"
+            assert await repo_atual.claim(
+                chave_incidente, owner, datetime.now(timezone.utc) + timedelta(minutes=2))
+            try:
+                await ers._reconcile_one(chave_incidente, owner)
+            finally:
+                await repo_atual.release_claim(chave_incidente, owner=owner)
+
+        await reconciliar(primeira["incident_key"])
+        POSICOES.clear()
+        POSICOES["positions"] = ([{"symbol": SIMBOLO, "size": 1.0, "side": "long"}]
+                                  if nova_positiva else [])
+        sl_esperado = [] if nova_positiva else [{
+            "algo_id": sl_id, "symbol": SIMBOLO, "side": "SELL",
+            "type": "STOP_MARKET", "status": "NEW", "trigger_price": 95.0,
+            "quantity": 1.0, "reduce_only": True, "close_position": False}]
+        ALGOS["orders"] = [dict(order) for order in sl_esperado]
+        await reconciliar(chave)
+        prefixo = "nova_positiva" if nova_positiva else "novo_zero"
+
+        async def conferir(etapa):
+            rotulo = prefixo + "_" + etapa
+            linhas = await incidentes_de(ident.client_order_id)
+            conflito, portador = conflito_de(
+                linhas, ident.client_order_id, kind=ers.Kind.ENTRY_SUBMISSION_UNKNOWN)
+            check(rotulo + "_sem_mutacao", MUTACOES == [], str(MUTACOES))
+            check(rotulo + "_manual_imediato",
+                  conflito is not None and portador[1] == ers.State.MANUAL_REQUIRED
+                  and portador[2] is None, str(portador))
+            check(rotulo + "_provas_preservadas",
+                  len(linhas) == 2 and {"POSITIVE", "TERMINAL_ZERO"} <= {
+                      (linha[5] or {}).get("entry_proof", {}).get("state")
+                      for linha in linhas}, str(linhas))
+            row = await intents.get_intent(db.get_session, ident.intent_key)
+            check(rotulo + "_reserva_slot_pausa",
+                  row.state == "UNKNOWN" and row.real_trade_id is None
+                  and row.reserved_risk_usd == 5.0 and await pausado(),
+                  str((row.state, row.real_trade_id, row.reserved_risk_usd)))
+            check(rotulo + "_sl_preservado", ALGOS["orders"] == sl_esperado,
+                  str(ALGOS["orders"]))
+
+        await conferir("apos_segunda_consulta")
+        # Reconexão + reconstrução do repositório; não simula restart de processo.
+        await db._engine.dispose()
+        ers.set_repo(None)
+        for _ in range(2):
+            await adiantar_retries()
+            await ers.reconcile_due()
+            await ers.recover_entry_intents()
+        await conferir("apos_reconexao")
+        POSICOES["positions"] = []
+        ALGOS["orders"] = []
+
+    await conflito_na_consulta(1_760_000_900_000, order_id="9004", nova_positiva=False)
+    await conflito_na_consulta(1_760_001_000_000, order_id="9005", nova_positiva=True)
+
     # ═══════════════════════════════════════════════════════════════════════
     #  A4. Casos já verdes continuam verdes
     # ═══════════════════════════════════════════════════════════════════════

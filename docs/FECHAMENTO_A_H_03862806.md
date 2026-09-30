@@ -259,10 +259,10 @@ cd backend && PYTHONDONTWRITEBYTECODE=1 \
 
 ## Limitações declaradas
 
-- A: bordas de exchange, persistência da intenção e lookup RealTrade são
-  simulados; repositório de incidentes, transação incidente+pausa, claim/fencing
-  e ciclo são reais em PostgreSQL. Não foi demonstrada liberação financeira em
-  PG por este contraexemplo.
+- A: exchange/mercado são simulados. No harness PostgreSQL, EntryIntent,
+  reserva e RealTrade sintético são persistidos pelo código real, assim como
+  incidentes, transação incidente+pausa e claim/fencing. Os testes em memória
+  não substituem essa prova SQL. Não há operação real nem prova de rentabilidade.
 - H: mercado é fixture sintética congelada; replay de carteira, walk-forward,
   gate, contrato canônico, catálogo, locks e persistência são reais. O RED foi
   medido revertendo temporariamente os dois serviços H para `03862806` no
@@ -279,3 +279,32 @@ cd backend && PYTHONDONTWRITEBYTECODE=1 \
   segredo, Telegram, push ou deploy. Cluster descartável encerrado.
 - Não se declara ausência de bugs: o que este documento afirma é o que os
   harnesses acima executaram.
+
+## Complemento — bloqueio após a prova nova (base 99a4c21b)
+
+A revisão encontrou uma lacuna de ordem: `_halt_if_conflicting` rodava antes de
+consultar a ordem, mas uma prova nova podia contradizer um incidente irmão e
+alcançar cleanup/proteção antes da recuperação ao fim do ciclo.
+
+Correção mínima: repetir o mesmo guard após `_persist_entry_proof` nos ramos
+terminal-zero e positivo, antes de resolver ou alterar proteção. Se a leitura
+das provas irmãs falhar, manter `RETRY_PENDING` sem mutação, em vez de aceitar
+somente a visão local. H e C não foram alterados.
+
+Quatro testes novos falharam antes da correção e passaram depois: nova prova
+zero não cancela SL; nova positiva não cancela SL nem cria proteção; erro ao
+reler os irmãos também não permite cleanup. No harness PG, 20 verificações
+adicionais conferem o estado imediatamente após a segunda consulta (antes da
+recuperação final), e após descarte do pool/reconstrução do repositório e novos
+ciclos: conflito manual, duas provas preservadas, intenção UNKNOWN sem vínculo,
+risco reservado de US$5, pausa ativa e zero mutações na exchange simulada.
+Essa reconexão não é apresentada como reinício completo do processo.
+
+Validação deste complemento: 2.382 testes unitários executados, 2.380 aprovados,
+2 skips históricos R05C, nenhuma falha/erro e nenhuma tentativa de rede na
+execução monitorada. Harness P03: 66 verificações aprovadas em PostgreSQL 16
+descartável UTF-8, socket Unix, driver real. A suíte emitiu um RuntimeWarning
+de coroutine não aguardada no teste preexistente de indisponibilidade do banco
+(`IdentityContract.test_reserve_without_database_never_authorises_a_post`);
+não houve falha e esse teste não foi alterado. Testes executados antes da
+interrupção por limite de uso; a retomada não repetiu a suíte completa.

@@ -1588,6 +1588,10 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
             # Esta MESMA ordem já provou fill: contradição não resolve nada.
             await _halt_on_proof_conflict(key, owner, inc)
             return
+        # A consulta atual pode ter criado conflito com OUTRO incidente do
+        # mesmo dispatch. Reconfere antes de limpar/cancelar qualquer proteção.
+        if await _halt_if_conflicting(key, owner, inc):
+            return
         # REJECTED/terminal-zero: NÃO vai direto a FLAT se há identidade condicional
         # — confirma fresh-flat, cancela IDs exatos e aplica grace via cleanup.
         if _exact_conditional_ids(inc):
@@ -1621,6 +1625,8 @@ async def _reconcile_entry(key: str, owner: str, inc: dict) -> None:
             # Esta MESMA ordem já provou zero final: contradição não resolve nada.
             await _halt_on_proof_conflict(key, owner, inc)
             return
+        if await _halt_if_conflicting(key, owner, inc):
+            return  # prova positiva nova também pode contradizer um irmão
     gate, fp = await _fresh_gate(inc)
     if gate == FreshGate.UNKNOWN:
         await _schedule_retry(key, owner, inc, State.RETRY_PENDING, "posição UNKNOWN pós-fill — sem mutação")
@@ -2256,7 +2262,11 @@ async def _halt_if_conflicting(key: str, owner: str, inc: dict) -> bool:
     try:
         irmaos = await repo.list_by_client_ids([coid])
     except Exception:  # noqa: BLE001
-        irmaos = [inc]
+        # Sem leitura dos irmãos não há prova de ausência de conflito. Não
+        # prossegue só com a visão local, principalmente após uma prova nova.
+        await _schedule_retry(key, owner, inc, State.RETRY_PENDING,
+                              "provas do dispatch indisponíveis — sem mutação")
+        return True
     if not any(str(x.get("incident_key")) == str(key) for x in irmaos):
         irmaos = list(irmaos) + [inc]
     provas = collect_dispatch_proofs(coid, irmaos, symbol=inc.get("symbol"),

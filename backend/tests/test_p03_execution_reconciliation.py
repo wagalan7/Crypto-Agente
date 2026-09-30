@@ -1565,6 +1565,107 @@ class LeasePerMutationTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(cancel.await_count, 1)   # A2 não executou após perder o lease
 
 
+class PostProofConflictTests(_AsyncBase):
+    """A contradição descoberta AGORA bloqueia antes de tocar a proteção."""
+
+    async def _run_new_conflict(self, *, positive_first, position_open=False):
+        repo = ers._get_repo()
+        coid, symbol = "cw-new-proof", "BTC/USDT:USDT"
+        assembled = ers.assemble_entry_incident(
+            {"client_order_id": coid, "safety_state": "FINAL_FILL_QTY_UNKNOWN",
+             "final_fill_qty_unknown": True, "entry_order_terminal": True,
+             "submitted_qty": 1.0, "result": {"orderId": "9001"}},
+            {"symbol": symbol, "direction": "long", "stop_loss": 95.0, "qty": 1.0},
+            local_client_order_id=coid)
+        first = await ers.record_incident(**assembled)
+        second = await ers.record_incident(
+            kind=Kind.ENTRY_SUBMISSION_UNKNOWN, symbol=symbol,
+            client_order_id=coid, side="long", planned_stop=95.0, planned_qty=1.0,
+            conditional_ids={"sl": "existing-sl"})
+
+        def terminal(qty):
+            return {"ok": True, "status": "CANCELED", "executed_qty": qty,
+                    "raw": {"executedQty": str(qty)}}
+
+        quantities = (1.0, 0.0) if positive_first else (0.0, 1.0)
+        cancel = AsyncMock(return_value={"ok": True})
+        protect = AsyncMock(return_value={"sl_ok": True, "sl_order_id": "new-sl"})
+        sl = _algo(algo_id="existing-sl", trigger_price=95.0,
+                   quantity=1.0, reduce_only=True)
+        fresh = {"quality": "FRESH", "size": 1.0 if position_open else 0.0,
+                 "side": "buy" if position_open else None}
+        with _patch_bss(
+                get_order=AsyncMock(side_effect=[terminal(q) for q in quantities]),
+                get_open_algo_orders=AsyncMock(return_value={
+                    "ok": True, "orders": [] if position_open else [sl]}),
+                cancel_algo_order=cancel, place_protection_orders=protect):
+            with patch.object(ers, "_fresh_position", AsyncMock(return_value={
+                    "quality": "UNKNOWN", "size": None, "side": None})):
+                key = first["incident_key"]
+                self.assertTrue(await repo.claim(key, "test", ers._now() + timedelta(minutes=2)))
+                await ers._reconcile_one(key, "test")
+            with patch.object(ers, "_fresh_position", AsyncMock(return_value=fresh)):
+                key = second["incident_key"]
+                self.assertTrue(await repo.claim(key, "test", ers._now() + timedelta(minutes=2)))
+                await ers._reconcile_one(key, "test")
+
+        # Assert imediato: não vale bloquear só na recuperação/ciclo seguinte.
+        cancel.assert_not_awaited()
+        protect.assert_not_awaited()
+        row = await repo.get(second["incident_key"])
+        self.assertEqual(row["state"], State.MANUAL_REQUIRED)
+        self.assertIsNone(row["resolved_at"])
+        self.assertEqual(row["conditional_ids"]["sl"], "existing-sl")
+        self.assertEqual(row["payload"]["entry_proof_conflict"]["client_order_id"], coid)
+        self.assertEqual(ers._dispatch_outcome(coid, await repo.list_all(),
+                                               symbol=symbol, exchange="binance"),
+                         ers.PROOF_CONFLICT)
+
+    async def test_new_zero_does_not_cancel_existing_sl(self):
+        await self._run_new_conflict(positive_first=True)
+
+    async def test_new_positive_does_not_cancel_existing_sl(self):
+        await self._run_new_conflict(positive_first=False)
+
+    async def test_new_positive_does_not_create_protection(self):
+        await self._run_new_conflict(positive_first=False, position_open=True)
+
+    async def test_sibling_read_failure_after_proof_blocks_cleanup(self):
+        repo = ers._get_repo()
+        result = await ers.record_incident(
+            kind=Kind.ENTRY_SUBMISSION_UNKNOWN, symbol="BTC/USDT:USDT",
+            client_order_id="cw-read-failure", side="long",
+            conditional_ids={"sl": "existing-sl"})
+        key = result["incident_key"]
+        calls = 0
+        original = repo.list_by_client_ids
+
+        async def read_siblings(ids):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("leitura indisponível após nova prova")
+            return await original(ids)
+
+        cancel = AsyncMock(return_value={"ok": True})
+        with patch.object(repo, "list_by_client_ids", read_siblings), \
+                patch.object(ers, "_fresh_position", AsyncMock(return_value={
+                    "quality": "FRESH", "size": 0.0, "side": None})), \
+                _patch_bss(get_order=AsyncMock(return_value={
+                    "ok": True, "status": "CANCELED", "executed_qty": 0.0,
+                    "raw": {"executedQty": "0"}}),
+                    get_open_algo_orders=AsyncMock(return_value={
+                        "ok": True, "orders": [_algo(algo_id="existing-sl")]}),
+                    cancel_algo_order=cancel):
+            self.assertTrue(await repo.claim(key, "test", ers._now() + timedelta(minutes=2)))
+            await ers._reconcile_one(key, "test")
+        cancel.assert_not_awaited()
+        self.assertEqual(calls, 2)
+        row = await repo.get(key)
+        self.assertEqual(row["state"], State.RETRY_PENDING)
+        self.assertIsNone(row["resolved_at"])
+
+
 class AgregacaoPorDispatch(unittest.TestCase):
     """A precedência do desfecho não pode depender da ORDEM da lista nem do
     kind: dois incidentes do MESMO dispatch com provas opostas são CONFLITO."""

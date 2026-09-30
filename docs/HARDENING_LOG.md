@@ -2183,3 +2183,19 @@ coluna, ENV, flag, endpoint, scheduler ou fila nova; C intocado.
   posição BTC manual e arquivos pessoais preservados. Nenhum acesso a
   produção/exchange, segredo, Telegram, push ou deploy. Não se declara ausência de
   bugs.
+
+## A — bloquear conflito recém-descoberto antes de mutar proteção (base 99a4c21b)
+
+- Guard de provas irmãs repetido após persistir terminal-zero ou fill positivo,
+  antes de cleanup/resolução/proteção. Falha de leitura mantém retry sem mutação.
+- RED→GREEN: quatro testes novos reproduziram cancelamento/criação indevidos e
+  falta de rechecagem; todos passaram com a correção.
+- PG real descartável: 66 verificações, incluindo 20 novas sobre bloqueio
+  imediato após a segunda consulta, SL intacto, intenção pendente, reserva exata
+  e pausa; reconexão do pool e reconstrução do repositório preservam o estado.
+- Suíte completa: 2.382 executados, 2.380 aprovados, 2 skips históricos R05C;
+  zero falhas/erros, zero tentativas de rede na execução monitorada. RuntimeWarning
+  preexistente de coroutine não aguardada no teste de banco indisponível registrado
+  no documento do fechamento, sem alteração desse teste.
+- H/C, estratégia, risco, defaults e arquivos pessoais preservados. Sem acesso
+  a produção/exchange, push ou deploy. Não é declaração de ausência de bugs.
