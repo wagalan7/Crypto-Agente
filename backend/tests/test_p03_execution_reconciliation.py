@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import types
 import asyncio
+import itertools
 import unittest
 from pathlib import Path
 from datetime import timedelta
@@ -1562,6 +1563,100 @@ class LeasePerMutationTests(unittest.IsolatedAsyncioTestCase):
                            cancel_algo_order=cancel):
             await ers.reconcile_due()
         self.assertLessEqual(cancel.await_count, 1)   # A2 não executou após perder o lease
+
+
+class AgregacaoPorDispatch(unittest.TestCase):
+    """A precedência do desfecho não pode depender da ORDEM da lista nem do
+    kind: dois incidentes do MESMO dispatch com provas opostas são CONFLITO."""
+
+    SIMBOLO = "ALFA/USDT:USDT"
+    COID = "cw-conflito"
+
+    def incidente(self, chave, kind, estado, proof=None, *, lower=None,
+                  conflito=None, coid=None, symbol=None, resolvido=True):
+        payload = {}
+        if proof:
+            payload["entry_proof"] = {"state": proof, "client_order_id": coid or self.COID,
+                                      "source": "get_order"}
+        if conflito:
+            payload["entry_proof_conflict"] = {"client_order_id": coid or self.COID,
+                                               "kept_state": "POSITIVE",
+                                               "observed_state": "TERMINAL_ZERO"}
+        return {"incident_key": chave, "kind": kind, "state": estado,
+                "client_order_id": coid or self.COID,
+                "symbol": symbol or self.SIMBOLO, "exchange": "binance",
+                "min_known_fill": lower, "payload": payload or None,
+                "resolved_at": "2026-09-29T00:00:00+00:00" if resolvido else None}
+
+    def desfecho(self, incidentes, **kw):
+        return ers._dispatch_outcome(self.COID, incidentes, symbol=self.SIMBOLO,
+                                     exchange="binance", **kw)
+
+    def test_positiva_e_zero_em_incidentes_distintos_e_conflito(self):
+        positiva = self.incidente("k-ffq", ers.Kind.FINAL_FILL_QTY_UNKNOWN,
+                                  ers.State.FLAT, "POSITIVE", lower=1.0)
+        zero = self.incidente("k-sub", ers.Kind.ENTRY_SUBMISSION_UNKNOWN,
+                              ers.State.FLAT, "TERMINAL_ZERO")
+        for permutacao in itertools.permutations([positiva, zero]):
+            self.assertEqual(self.desfecho(list(permutacao)), ers.PROOF_CONFLICT,
+                             [i["incident_key"] for i in permutacao])
+
+    def test_marcador_persistido_vence_qualquer_ordem(self):
+        marcado = self.incidente("k-sub", ers.Kind.ENTRY_SUBMISSION_UNKNOWN,
+                                 ers.State.MANUAL_REQUIRED, "POSITIVE",
+                                 conflito=True, resolvido=False)
+        outro = self.incidente("k-ffq", ers.Kind.FINAL_FILL_QTY_UNKNOWN,
+                               ers.State.FLAT, "POSITIVE", lower=2.0)
+        for permutacao in itertools.permutations([marcado, outro]):
+            self.assertEqual(self.desfecho(list(permutacao)), ers.PROOF_CONFLICT)
+
+    def test_lower_bound_positivo_conflita_com_zero_terminal(self):
+        lower = self.incidente("k-a", ers.Kind.ENTRY_ORDER_UNKNOWN, ers.State.FLAT,
+                               None, lower=3.0)
+        zero = self.incidente("k-b", ers.Kind.ENTRY_SUBMISSION_UNKNOWN,
+                              ers.State.FLAT, "TERMINAL_ZERO")
+        self.assertEqual(self.desfecho([lower, zero]), ers.PROOF_CONFLICT)
+
+    def test_somente_positiva_ou_somente_zero(self):
+        positiva = self.incidente("k-a", ers.Kind.FINAL_FILL_QTY_UNKNOWN,
+                                  ers.State.PROTECTED, "POSITIVE", lower=1.0)
+        zero = self.incidente("k-b", ers.Kind.ENTRY_SUBMISSION_UNKNOWN,
+                              ers.State.FLAT, "TERMINAL_ZERO")
+        self.assertEqual(self.desfecho([positiva]), ers.PROOF_POSITIVE)
+        self.assertEqual(self.desfecho([zero]), ers.PROOF_TERMINAL_ZERO)
+
+    def test_flat_lower_zero_e_sem_sl_nao_provam_zero(self):
+        vazio = self.incidente("k-a", ers.Kind.CLEANUP_PENDING, ers.State.FLAT,
+                               None, lower=0.0)
+        self.assertEqual(self.desfecho([vazio]), ers.PROOF_UNKNOWN)
+
+    def test_outro_dispatch_ou_outro_simbolo_nao_entra(self):
+        filha = self.incidente("k-mfb", ers.Kind.ENTRY_SUBMISSION_UNKNOWN,
+                               ers.State.FLAT, "TERMINAL_ZERO",
+                               coid=f"{self.COID}-mfb")
+        outro_simbolo = self.incidente("k-out", ers.Kind.ENTRY_SUBMISSION_UNKNOWN,
+                                       ers.State.FLAT, "TERMINAL_ZERO",
+                                       symbol="BETA/USDT:USDT")
+        positiva = self.incidente("k-a", ers.Kind.FINAL_FILL_QTY_UNKNOWN,
+                                  ers.State.FLAT, "POSITIVE", lower=1.0)
+        self.assertEqual(self.desfecho([positiva, filha, outro_simbolo]),
+                         ers.PROOF_POSITIVE)
+
+    def test_payload_do_conflito_e_deterministico_e_nao_cresce(self):
+        positiva = self.incidente("k-a", ers.Kind.FINAL_FILL_QTY_UNKNOWN,
+                                  ers.State.FLAT, "POSITIVE", lower=1.0)
+        zero = self.incidente("k-b", ers.Kind.ENTRY_SUBMISSION_UNKNOWN,
+                              ers.State.FLAT, "TERMINAL_ZERO")
+        provas = ers.collect_dispatch_proofs(self.COID, [positiva, zero],
+                                             symbol=self.SIMBOLO, exchange="binance")
+        invertidas = ers.collect_dispatch_proofs(self.COID, [zero, positiva],
+                                                 symbol=self.SIMBOLO, exchange="binance")
+        um = ers.cross_conflict_payload(provas)
+        dois = ers.cross_conflict_payload(invertidas)
+        self.assertEqual(um, dois)
+        self.assertEqual(len(um["sources"]), 2)
+        self.assertEqual(um["kept_state"], "POSITIVE")
+        self.assertEqual(um["observed_state"], "TERMINAL_ZERO")
 
 
 if __name__ == "__main__":

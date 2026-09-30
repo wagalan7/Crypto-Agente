@@ -50,6 +50,7 @@ socket.getaddrinfo = no_dns
 
 CHECKS: list = []
 MUTACOES: list = []
+POR_ORDER_ID: dict = {}
 SIMBOLO = "ALFA/USDT:USDT"
 GUARDADO = "ALFA-USDT-USDT"
 
@@ -86,6 +87,11 @@ async def run():
     ALGOS: dict = {"orders": []}
 
     async def fake_get_order(symbol, order_id=None, client_order_id=None, **kwargs):
+        # Duas rotas de consulta da MESMA ordem: por order ID e por client ID.
+        # `POR_ORDER_ID` permite responder DIFERENTE em cada rota, que é o
+        # contraexemplo cruzado (dois incidentes, dois kinds, um dispatch).
+        if order_id is not None and str(order_id) in POR_ORDER_ID:
+            return POR_ORDER_ID[str(order_id)]
         resposta = ORDENS.get(client_order_id)
         return resposta if resposta is not None else {"ok": False, "error": "sem resposta"}
 
@@ -129,7 +135,12 @@ async def run():
             db.get_session, ident,
             {"entry": entry, "stop_loss": stop, "tp1": entry + 5, "tp2": entry + 10,
              "leverage": 3},
-            owner="w1", decision={"entry": entry, "stop_loss": stop, "qty": qty})
+            owner="w1", decision={"entry": entry, "stop_loss": stop, "qty": qty},
+            # Reserva com risco REAL: o aceite exige provar que ela não é
+            # liberada no conflito.
+            capacity=intents.Capacity(risk_usd=abs(entry - stop) * qty,
+                                      max_open_positions=20,
+                                      max_open_risk_usd=10_000.0))
         assert reserva.granted, reserva
         assert await intents.mark_sending(db.get_session, ident.intent_key, owner="w1")
         for dispatch_id in (ids or [ident.client_order_id]):
@@ -342,6 +353,209 @@ async def run():
           estado_c[0] == "CONFIRMED" and estado_c[1] == trade_c, str(estado_c))
     POSICOES["positions"] = []
     ALGOS["orders"] = []
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  A5/A6. CRUZADO: dois kinds OFICIAIS, MESMO dispatch, provas opostas
+    # ═══════════════════════════════════════════════════════════════════════
+    async def cenario_cruzado(trigger, *, order_id, positivo_por_order_id=True,
+                              com_realtrade=True):
+        """Dois incidentes oficiais do MESMO dispatch, um com prova positiva e
+        outro com zero terminal — cada um pela sua rota de consulta."""
+        ident = await intencao_unknown(trigger, entry=100.0, stop=95.0, qty=1.0)
+        if com_realtrade:
+            async with db.get_session() as session:
+                trade = RealTrade(symbol=SIMBOLO, exchange="binance", side="long",
+                                  qty=1.0, entry_price=100.0, planned_stop=95.0,
+                                  status="open", source="auto",
+                                  client_order_id=ident.client_order_id,
+                                  opened_at=agora)
+                session.add(trade)
+                await session.commit()
+                trade_id = trade.id
+        else:
+            trade_id = None
+        # Produtor REAL #1: `FINAL_FILL_QTY_UNKNOWN` com order ID e client ID.
+        kwargs = ers.assemble_entry_incident(
+            {"client_order_id": ident.client_order_id,
+             "safety_state": "FINAL_FILL_QTY_UNKNOWN",
+             "final_fill_qty_unknown": True, "entry_order_terminal": True,
+             "submitted_qty": 1.0, "result": {"orderId": order_id}},
+            {"symbol": SIMBOLO, "direction": "long", "stop_loss": 95.0, "qty": 1.0},
+            local_client_order_id=ident.client_order_id)
+        assert kwargs["kind"] == ers.Kind.FINAL_FILL_QTY_UNKNOWN, kwargs["kind"]
+        assert str(kwargs["entry_order_id"]) == str(order_id), kwargs["entry_order_id"]
+        await ers.record_incident(**kwargs)
+        # Produtor REAL #2: a recuperação cria ENTRY_SUBMISSION_UNKNOWN do mesmo id.
+        await ers.recover_entry_intents()
+        # Rotas com respostas OPOSTAS para a MESMA ordem.
+        qtd_order, qtd_client = ((1.0, 0.0) if positivo_por_order_id else (0.0, 1.0))
+        POR_ORDER_ID[str(order_id)] = cancelada(qtd_order)
+        ORDENS[ident.client_order_id] = cancelada(qtd_client)
+        POSICOES.clear()
+        POSICOES["stale"] = True                  # 1ª leitura: posição UNKNOWN
+        await adiantar_retries()
+        await ers.reconcile_due()
+        POSICOES.clear()
+        POSICOES["positions"] = []                # depois: fresh-FLAT
+        for _ in range(3):
+            await adiantar_retries()
+            await ers.reconcile_due()
+            await ers.recover_entry_intents()
+        return ident, trade_id
+
+    async def kinds_de(coid):
+        async with db.get_session() as session:
+            return {linha[0] for linha in (await session.execute(
+                select(ExecutionIncident.kind)
+                .where(ExecutionIncident.client_order_id == coid))).all()}
+
+    def conflito_de(linhas, coid, *, kind=None):
+        """Marcador de conflito; `kind` filtra o PORTADOR oficial."""
+        for linha in linhas:
+            if kind is not None and linha[0] != kind:
+                continue
+            payload = linha[5] if isinstance(linha[5], dict) else {}
+            conflito = payload.get("entry_proof_conflict")
+            if isinstance(conflito, dict) \
+                    and str(conflito.get("client_order_id") or "") == coid:
+                return conflito, linha
+        return None, None
+
+    ident_f, trade_f = await cenario_cruzado(1_760_000_600_000, order_id="9001")
+    check("dois_kinds_oficiais_para_o_mesmo_dispatch",
+          await kinds_de(ident_f.client_order_id) >= {ers.Kind.FINAL_FILL_QTY_UNKNOWN,
+                                                     ers.Kind.ENTRY_SUBMISSION_UNKNOWN},
+          str(await kinds_de(ident_f.client_order_id)))
+    linhas_f = await incidentes_de(ident_f.client_order_id)
+    provas_f = {(l[5] or {}).get("entry_proof", {}).get("state") for l in linhas_f
+                if isinstance(l[5], dict)}
+    check("provas_opostas_em_incidentes_distintos",
+          {"POSITIVE", "TERMINAL_ZERO"} <= provas_f, str(provas_f))
+    conflito_f, portador_f = conflito_de(linhas_f, ident_f.client_order_id,
+                                         kind=ers.Kind.ENTRY_SUBMISSION_UNKNOWN)
+    check("conflito_cruzado_persistido",
+          conflito_f is not None
+          and {conflito_f.get("kept_state"), conflito_f.get("observed_state")}
+          == {"POSITIVE", "TERMINAL_ZERO"}, str(conflito_f)[:220])
+    check("portador_do_conflito_e_o_incidente_oficial",
+          portador_f is not None
+          and portador_f[0] == ers.Kind.ENTRY_SUBMISSION_UNKNOWN, str(portador_f)[:200])
+    check("payload_do_conflito_cita_as_duas_fontes",
+          len(conflito_f.get("sources") or []) >= 2
+          and {f["kind"] for f in conflito_f["sources"]}
+          >= {ers.Kind.FINAL_FILL_QTY_UNKNOWN, ers.Kind.ENTRY_SUBMISSION_UNKNOWN},
+          str(conflito_f.get("sources")))
+    check("portador_nao_resolvido_e_manual",
+          portador_f[2] is None and portador_f[1] == ers.State.MANUAL_REQUIRED
+          and portador_f[4], str(portador_f)[:200])
+    check("incidente_irmao_tambem_para_no_manual",
+          all(l[1] == ers.State.MANUAL_REQUIRED and l[2] is None for l in linhas_f
+              if l[0] in (ers.Kind.FINAL_FILL_QTY_UNKNOWN,
+                          ers.Kind.ENTRY_SUBMISSION_UNKNOWN)),
+          str([(l[0], l[1], l[2] is not None) for l in linhas_f]))
+    estado_f = await estado(ident_f.intent_key)
+    check("cruzado_nao_confirma_a_intencao",
+          estado_f[0] == "UNKNOWN" and estado_f[1] is None
+          and estado_f[2] != "RECONCILED_EXECUTION", str(estado_f))
+    check("cruzado_com_vinculo_ainda_bloqueia", trade_f is not None, str(trade_f))
+    check("cruzado_mantem_slot_e_reserva", await pendentes() >= 1 and
+          await reservado() > 0.0, f"{await pendentes()} / {await reservado()}")
+    check("cruzado_mantem_pausa", await pausado(), "pausa caiu no conflito cruzado")
+    # Repetição e restart: sem incidentes infinitos, sem apagar prova, sem liberar.
+    quantos_antes = len(linhas_f)
+    await db._engine.dispose()
+    for _ in range(3):
+        await adiantar_retries()
+        await ers.reconcile_due()
+        await ers.recover_entry_intents()
+    linhas_f2 = await incidentes_de(ident_f.client_order_id)
+    conflito_f2, portador_f2 = conflito_de(linhas_f2, ident_f.client_order_id,
+                                           kind=ers.Kind.ENTRY_SUBMISSION_UNKNOWN)
+    check("restart_preserva_conflito_cruzado",
+          conflito_f2 is not None and portador_f2[1] == ers.State.MANUAL_REQUIRED
+          and portador_f2[2] is None, str(portador_f2))
+    check("repeticao_nao_cria_incidente_infinito",
+          len(linhas_f2) == quantos_antes, f"{quantos_antes} → {len(linhas_f2)}")
+    check("estado_commitado_segue_pendente",
+          (await estado(ident_f.intent_key))[0] == "UNKNOWN",
+          str(await estado(ident_f.intent_key)))
+    check("pausa_permanece_apos_restart", await pausado(), "pausa caiu no restart")
+
+    # A6. Ordem INVERSA das observações (zero pelo order ID, positiva pelo client
+    # ID) e SEM RealTrade: mesmo bloqueio.
+    ident_g, trade_g = await cenario_cruzado(1_760_000_700_000, order_id="9002",
+                                             positivo_por_order_id=False,
+                                             com_realtrade=False)
+    linhas_g = await incidentes_de(ident_g.client_order_id)
+    conflito_g, portador_g = conflito_de(linhas_g, ident_g.client_order_id,
+                                         kind=ers.Kind.ENTRY_SUBMISSION_UNKNOWN)
+    check("ordem_inversa_tambem_conflita", conflito_g is not None, str(linhas_g)[:220])
+    estado_g = await estado(ident_g.intent_key)
+    check("inversa_sem_vinculo_nao_encerra",
+          estado_g[0] == "UNKNOWN" and estado_g[2] != "RECONCILED_NO_EXECUTION",
+          str(estado_g))
+    check("inversa_mantem_portador_manual",
+          portador_g[1] == ers.State.MANUAL_REQUIRED and portador_g[2] is None,
+          str(portador_g))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  A7. Claim alheio / falha de persistência NÃO liberam a liquidação
+    # ═══════════════════════════════════════════════════════════════════════
+    ident_h, trade_h = await cenario_cruzado(1_760_000_800_000, order_id="9003")
+    portador_chave = ers.build_incident_key(
+        ers.Kind.ENTRY_SUBMISSION_UNKNOWN, SIMBOLO, exchange="binance",
+        client_order_id=ident_h.client_order_id)
+    repo = ers._get_repo()
+    # Devolve o portador ao estado "aberto" e entrega o claim a OUTRO dono.
+    await repo.update(portador_chave, state=ers.State.OPEN, manual_reason=None,
+                      claimed_by=None, claimed_at=None, lease_expires_at=None)
+    assert await repo.claim(portador_chave, "outro-processo",
+                            datetime.now(timezone.utc) + timedelta(minutes=10))
+    veredito = await ers._settle_intent_from_proof({
+        "intent_key": ident_h.intent_key, "client_order_id": ident_h.client_order_id,
+        "account_ref": "c" * 64, "exchange": "binance", "symbol": GUARDADO,
+        "side": "long", "reason": "DISPATCH_OUTCOME_UNKNOWN",
+        "dispatch_ids": [ident_h.client_order_id], "decision_payload": None})
+    check("claim_alheio_nao_libera_liquidacao",
+          veredito["resolved"] is False and veredito["reason"] == ers.CONFLICT_REASON
+          and veredito.get("conflict_persisted") is False, str(veredito)[:200])
+    check("claim_alheio_mantem_intencao_pendente",
+          (await estado(ident_h.intent_key))[0] == "UNKNOWN",
+          str(await estado(ident_h.intent_key)))
+    check("claim_alheio_mantem_pausa", await pausado(), "pausa caiu com claim alheio")
+    # Ciclo seguinte (lease do outro dono vencido) conclui o bloqueio.
+    await repo.update(portador_chave,
+                      lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1))
+    await ers.recover_entry_intents()
+    linhas_h = await incidentes_de(ident_h.client_order_id)
+    conflito_h, portador_h = conflito_de(linhas_h, ident_h.client_order_id,
+                                         kind=ers.Kind.ENTRY_SUBMISSION_UNKNOWN)
+    check("ciclo_seguinte_conclui_o_bloqueio",
+          portador_h[1] == ers.State.MANUAL_REQUIRED and portador_h[2] is None,
+          str(portador_h)[:200])
+    check("intencao_segue_pendente_apos_bloqueio",
+          (await estado(ident_h.intent_key))[0] == "UNKNOWN",
+          str(await estado(ident_h.intent_key)))
+
+    # Falha de PERSISTÊNCIA do conflito: liquidação continua barrada.
+    with patch.object(ers, "record_incident",
+                      side_effect=RuntimeError("banco fora")):
+        veredito_falha = await ers._settle_intent_from_proof({
+            "intent_key": ident_h.intent_key,
+            "client_order_id": ident_h.client_order_id,
+            "account_ref": "c" * 64, "exchange": "binance", "symbol": GUARDADO,
+            "side": "long", "reason": "DISPATCH_OUTCOME_UNKNOWN",
+            "dispatch_ids": [ident_h.client_order_id], "decision_payload": None})
+    check("falha_de_persistencia_nao_libera",
+          veredito_falha["resolved"] is False
+          and veredito_falha["reason"] == ers.CONFLICT_REASON
+          and veredito_falha.get("conflict_persisted") is False,
+          str(veredito_falha)[:200])
+    check("falha_de_persistencia_preserva_marcador",
+          conflito_de(await incidentes_de(ident_h.client_order_id),
+                      ident_h.client_order_id,
+                      kind=ers.Kind.ENTRY_SUBMISSION_UNKNOWN)[0] is not None,
+          "marcador sumiu")
 
     # ═══════════════════════════════════════════════════════════════════════
     #  A4. Casos já verdes continuam verdes

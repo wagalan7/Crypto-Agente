@@ -28,7 +28,7 @@ import uuid
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any
+from typing import Any, Dict, Mapping, Optional
 
 log = logging.getLogger(__name__)
 
@@ -1951,6 +1951,7 @@ async def _settle_intent_from_proof(row: dict) -> dict:
         return {"resolved": False, "unproven_ids": ids, "reason": "PROOF_UNAVAILABLE"}
     por_id: dict[str, list] = {str(i): [] for i in ids}
     sym_key = _sym_key(symbol)
+    exchange = row.get("exchange") or EXCHANGE_BINANCE
     for incident in incidents:
         coid = str(incident.get("client_order_id") or "")
         if coid not in por_id:
@@ -1958,6 +1959,27 @@ async def _settle_intent_from_proof(row: dict) -> dict:
         if _sym_key(incident.get("symbol") or "") != sym_key:
             continue                      # id de outro símbolo não prova este
         por_id[coid].append(incident)
+    # CONFLITO PRIMEIRO: contradição terminal do MESMO dispatch bloqueia ANTES
+    # de qualquer retorno por incidente aberto/estado inconclusivo e ANTES de
+    # consultar vínculo. RealTrade não desempata contradição, e posição FLAT
+    # agora também não.
+    coletas = {dispatch_id: collect_dispatch_proofs(dispatch_id, found,
+                                                   symbol=symbol, exchange=exchange)
+               for dispatch_id, found in por_id.items()}
+    desfechos = {dispatch_id: _dispatch_outcome(dispatch_id, found, symbol=symbol,
+                                                exchange=exchange)
+                 for dispatch_id, found in por_id.items()}
+    conflitantes = [i for i, desfecho in desfechos.items() if desfecho == PROOF_CONFLICT]
+    if conflitantes:
+        bloqueado = True
+        for dispatch_id in conflitantes:
+            if not await _persist_cross_dispatch_conflict(
+                    coletas[dispatch_id], symbol=symbol, exchange=exchange,
+                    side=row.get("side"), row=row):
+                bloqueado = False
+        return {"resolved": False, "unproven_ids": conflitantes,
+                "reason": CONFLICT_REASON, "conflict_persisted": bloqueado,
+                "conflict_handled": True}
     unproven = [i for i, found in por_id.items()
                 if not found or any(x.get("resolved_at") is None for x in found)]
     if unproven:
@@ -1966,16 +1988,6 @@ async def _settle_intent_from_proof(row: dict) -> dict:
     states = {str(x.get("state")) for x in provas}
     if not states <= _TERMINAL_SAFE:
         return {"resolved": False, "unproven_ids": ids, "reason": "PROOF_INCONCLUSIVE"}
-    # Desfecho POR DISPATCH: cleanup/legado resolvido FLAT prova limpeza, não
-    # ausência de execução. Sem prova terminal da PRÓPRIA identidade, o id volta
-    # para a fila do reconciliador — que consulta a entry pelo caminho oficial.
-    desfechos = {dispatch_id: _dispatch_outcome(dispatch_id, found)
-                 for dispatch_id, found in por_id.items()}
-    conflitantes = [i for i, desfecho in desfechos.items() if desfecho == PROOF_CONFLICT]
-    if conflitantes:
-        # Prova contraditória do MESMO dispatch: nada encerra, nada é liberado.
-        return {"resolved": False, "unproven_ids": conflitantes,
-                "reason": CONFLICT_REASON}
     sem_prova = [i for i, desfecho in desfechos.items() if desfecho == PROOF_UNKNOWN]
     positivos = [i for i, desfecho in desfechos.items() if desfecho == PROOF_POSITIVE]
     if positivos and sem_prova:
@@ -2010,35 +2022,172 @@ def _entry_proof_of(incident) -> Optional[dict]:
     return proof if isinstance(proof, dict) else None
 
 
-def _dispatch_outcome(dispatch_id: str, incidents) -> str:
-    """Desfecho COMPROVADO de UM id despachado.
+def collect_dispatch_proofs(dispatch_id: str, incidents, *, symbol: Optional[str] = None,
+                           exchange: Optional[str] = None) -> Dict[str, Any]:
+    """Coletor ÚNICO de provas de UM id despachado, em TODOS os incidentes.
 
-    `PROOF_POSITIVE` (houve execução), `PROOF_TERMINAL_ZERO` (a consulta da
-    PRÓPRIA identidade provou quantidade final zero), `PROOF_CONFLICT` (duas
-    respostas terminais incompatíveis para a MESMA ordem) ou `PROOF_UNKNOWN`.
-    Ausência de campo, lower-bound zero, posição FLAT e ausência de SL NÃO
-    provam zero final: FLAT descreve a posição de agora, não o que foi enviado.
-    Conflito NUNCA vira "não executou" e também não autoriza liquidar.
+    Agrega independentemente do kind, da ordem da lista e de estarem resolvidos.
+    Filtra pela identidade EFETIVA: client id exato e, quando informados,
+    símbolo/exchange da intenção — prova de outro símbolo/conta não conta aqui.
+    `-mfb` não é unida por prefixo: é outro dispatch.
     """
-    positivo = zero = False
+    alvo = str(dispatch_id)
+    sym = _sym_key(symbol) if symbol else None
+    exc = str(exchange).strip().lower() if exchange else None
+    positivas, zeros, fontes = [], [], []
+    conflito_persistido = None
     for incident in incidents or ():
-        conflito = (incident.get("payload") or {}).get("entry_proof_conflict") \
-            if isinstance(incident.get("payload"), dict) else None
-        if isinstance(conflito, dict) \
-                and str(conflito.get("client_order_id") or "") == str(dispatch_id):
-            return PROOF_CONFLICT
+        if str(incident.get("client_order_id") or "") != alvo:
+            continue
+        if sym is not None and _sym_key(incident.get("symbol") or "") != sym:
+            continue
+        if exc is not None and str(incident.get("exchange") or "").strip().lower() != exc:
+            continue
+        chave = incident.get("incident_key")
+        fontes.append({"incident_key": chave, "kind": incident.get("kind"),
+                       "state": incident.get("state"),
+                       "resolved": incident.get("resolved_at") is not None})
+        payload = incident.get("payload") if isinstance(incident.get("payload"), dict) else {}
+        marcador = payload.get("entry_proof_conflict")
+        if isinstance(marcador, dict) \
+                and str(marcador.get("client_order_id") or "") == alvo:
+            conflito_persistido = conflito_persistido or {**marcador,
+                                                          "incident_key": chave}
         proof = _entry_proof_of(incident)
-        if proof and str(proof.get("client_order_id") or "") == str(dispatch_id):
+        if proof and str(proof.get("client_order_id") or "") == alvo:
             estado = str(proof.get("state") or "")
-            positivo = positivo or estado == PROOF_POSITIVE
-            zero = zero or estado == PROOF_TERMINAL_ZERO
-        if str(incident.get("state")) == State.PROTECTED:
-            positivo = True
-        if (_finite(incident.get("min_known_fill")) or 0.0) > 0:
-            positivo = True
-    if positivo:
+            if estado == PROOF_POSITIVE:
+                positivas.append({**proof, "incident_key": chave,
+                                  "kind": incident.get("kind")})
+            elif estado == PROOF_TERMINAL_ZERO:
+                zeros.append({**proof, "incident_key": chave,
+                              "kind": incident.get("kind")})
+        # Lower-bound positivo e posição PROTEGIDA são evidência POSITIVA;
+        # lower-bound zero/ausente e FLAT nunca são zero TERMINAL.
+        lower = _finite(incident.get("min_known_fill")) or 0.0
+        if str(incident.get("state")) == State.PROTECTED or lower > 0:
+            positivas.append({"state": PROOF_POSITIVE, "source": "incident_state",
+                              "client_order_id": alvo, "executed_qty": lower or None,
+                              "incident_key": chave, "kind": incident.get("kind")})
+    return {"dispatch_id": alvo, "positive": positivas, "zero": zeros,
+            "conflict": conflito_persistido, "sources": fontes}
+
+
+def _dispatch_outcome(dispatch_id: str, incidents, *, symbol: Optional[str] = None,
+                      exchange: Optional[str] = None) -> str:
+    """Desfecho COMPROVADO de UM id despachado, pela precedência do contrato:
+
+        marcador de conflito persistido                  → CONFLICT
+        prova positiva + zero terminal do MESMO dispatch → CONFLICT
+        somente prova positiva                           → POSITIVE
+        somente prova de zero terminal                   → TERMINAL_ZERO
+        nenhuma prova suficiente                         → UNKNOWN
+
+    Duas respostas terminais incompatíveis para a MESMA ordem valem conflito
+    mesmo vindo de incidentes (e kinds) DIFERENTES. Ausência de campo,
+    lower-bound zero, posição FLAT e ausência de SL NÃO provam zero final.
+    """
+    provas = collect_dispatch_proofs(dispatch_id, incidents, symbol=symbol,
+                                     exchange=exchange)
+    if provas["conflict"]:
+        return PROOF_CONFLICT
+    if provas["positive"] and provas["zero"]:
+        return PROOF_CONFLICT
+    if provas["positive"]:
         return PROOF_POSITIVE
-    return PROOF_TERMINAL_ZERO if zero else PROOF_UNKNOWN
+    return PROOF_TERMINAL_ZERO if provas["zero"] else PROOF_UNKNOWN
+
+
+def cross_conflict_payload(provas: Mapping[str, Any]) -> Optional[dict]:
+    """Payload DETERMINÍSTICO do conflito entre incidentes do mesmo dispatch.
+
+    Guarda as duas provas (positiva preservada e zero observada), as fontes
+    (chave + kind) e a identidade. Repetir NÃO faz o payload crescer: as listas
+    são as mesmas provas, deduplicadas por incidente.
+    """
+    if not isinstance(provas, Mapping):
+        return None
+    positivas, zeros = provas.get("positive") or [], provas.get("zero") or []
+    if not positivas or not zeros:
+        return None
+
+    def _menor(itens):
+        return sorted(itens, key=lambda p: (str(p.get("incident_key") or ""),
+                                            str(p.get("state") or "")))[0]
+
+    mantida, observada = _menor(positivas), _menor(zeros)
+    fontes = sorted({(str(p.get("incident_key") or ""), str(p.get("kind") or ""))
+                     for p in list(positivas) + list(zeros)})
+    return {"client_order_id": str(provas.get("dispatch_id") or ""),
+            "kept_state": PROOF_POSITIVE, "observed_state": PROOF_TERMINAL_ZERO,
+            "kept": dict(mantida), "observed": dict(observada),
+            "scope": "CROSS_INCIDENT",
+            "sources": [{"incident_key": chave, "kind": kind} for chave, kind in fontes]}
+
+
+async def _persist_cross_dispatch_conflict(provas: Mapping[str, Any], *, symbol: str,
+                                          exchange: str, side: Optional[str],
+                                          row: Mapping[str, Any]) -> bool:
+    """Persiste o conflito ENTRE incidentes no portador OFICIAL e bloqueia.
+
+    Portador: o incidente `ENTRY_SUBMISSION_UNKNOWN` daquela identidade, pela
+    chave estável — `record_incident` arma o latch local ANTES da gravação e usa
+    a transação `persist_incident_with_p03_pause` (incidente visível e pausa no
+    MESMO commit). Depois, com claim válido, `_halt_on_proof_conflict` deixa o
+    portador em MANUAL_REQUIRED com `resolved_at=None`.
+
+    Devolve True só quando o bloqueio ficou persistido. Falha de claim ou de
+    gravação NÃO libera nada: a liquidação continua bloqueada, o latch armado e
+    o ciclo seguinte conclui.
+    """
+    dispatch_id = str(provas.get("dispatch_id") or "")
+    payload_conflito = cross_conflict_payload(provas)
+    if not dispatch_id or not payload_conflito:
+        return False
+    if provas.get("conflict") and str(provas["conflict"].get("scope") or "") \
+            == "CROSS_INCIDENT":
+        payload_conflito = {**payload_conflito,
+                            "first_seen_at_ms": provas["conflict"].get("first_seen_at_ms")}
+    payload_conflito.setdefault("first_seen_at_ms", int(_now().timestamp() * 1000))
+    payload_conflito["last_seen_at_ms"] = int(_now().timestamp() * 1000)
+    chave = build_incident_key(Kind.ENTRY_SUBMISSION_UNKNOWN, symbol,
+                              exchange=exchange, client_order_id=dispatch_id)
+    decisao = row.get("decision_payload") if isinstance(row.get("decision_payload"), dict) else {}
+    try:
+        # Reaproveita o registro existente pela chave estável (reabertura oficial
+        # quando já estiver resolvido); nenhum kind, tabela ou reconciliador novo.
+        resultado = await record_incident(
+            kind=Kind.ENTRY_SUBMISSION_UNKNOWN, symbol=symbol, exchange=exchange,
+            client_order_id=dispatch_id, side=_norm_entry_side(side),
+            planned_stop=_finite(decisao.get("stop_loss")),
+            planned_qty=_finite(decisao.get("qty")),
+            payload={"source": "entry_intent", "intent_key": row.get("intent_key"),
+                     "account_ref": row.get("account_ref"),
+                     "settle_reason": CONFLICT_REASON,
+                     "entry_proof_conflict": payload_conflito})
+    except Exception as exc:  # noqa: BLE001
+        log.critical(f"[p03][conflict] persistência do conflito falhou ({dispatch_id}): {exc}")
+        return False
+    if not resultado.get("persisted"):
+        return False
+    repo = _get_repo()
+    portador = await repo.get(chave)
+    if not portador:
+        return False
+    if str(portador.get("state")) == State.MANUAL_REQUIRED \
+            and portador.get("resolved_at") is None:
+        return True                       # já bloqueado: repetir é idempotente
+    if not await repo.claim(chave, _PROCESS_ID,
+                            _now() + timedelta(seconds=RECONCILE_LEASE_S)):
+        # Claim de outro dono/lease vivo: NÃO rouba lease. O ciclo seguinte
+        # conclui o bloqueio; a liquidação segue barrada e o latch armado.
+        log.warning(f"[p03][conflict] claim indisponível para {chave}; bloqueio no próximo ciclo")
+        return False
+    portador = await repo.get(chave) or portador
+    await _halt_on_proof_conflict(chave, _PROCESS_ID, portador)
+    final = await repo.get(chave) or {}
+    return (str(final.get("state")) == State.MANUAL_REQUIRED
+            and final.get("resolved_at") is None)
 
 
 async def _persist_entry_proof(key: str, owner: str, inc: dict, *, state: str,
@@ -2092,6 +2241,42 @@ async def _persist_entry_proof(key: str, owner: str, inc: dict, *, state: str,
     if await _fenced(key, owner, payload=merged):
         inc["payload"] = merged
     return state
+
+
+async def _halt_if_conflicting(key: str, owner: str, inc: dict) -> bool:
+    """Para no caminho manual quando há contradição terminal desta identidade.
+
+    Confere o marcador do próprio incidente E as provas IRMÃS (outros incidentes
+    do mesmo dispatch, de qualquer kind). Devolve True quando parou.
+    """
+    coid = inc.get("client_order_id")
+    if not coid or inc.get("kind") not in _ENTRY_KINDS:
+        return False
+    repo = _get_repo()
+    try:
+        irmaos = await repo.list_by_client_ids([coid])
+    except Exception:  # noqa: BLE001
+        irmaos = [inc]
+    if not any(str(x.get("incident_key")) == str(key) for x in irmaos):
+        irmaos = list(irmaos) + [inc]
+    provas = collect_dispatch_proofs(coid, irmaos, symbol=inc.get("symbol"),
+                                     exchange=inc.get("exchange"))
+    if not provas["conflict"] and not (provas["positive"] and provas["zero"]):
+        return False
+    payload = cross_conflict_payload(provas) or provas["conflict"]
+    if payload:
+        atual = dict(inc.get("payload") or {}) if isinstance(inc.get("payload"), dict) else {}
+        anterior = atual.get("entry_proof_conflict")
+        if isinstance(anterior, dict):
+            payload.setdefault("first_seen_at_ms", anterior.get("first_seen_at_ms"))
+        payload.setdefault("first_seen_at_ms", int(_now().timestamp() * 1000))
+        payload["last_seen_at_ms"] = int(_now().timestamp() * 1000)
+        if anterior != payload:
+            merged = {**atual, "entry_proof_conflict": payload}
+            if await _fenced(key, owner, payload=merged):
+                inc["payload"] = merged
+    await _halt_on_proof_conflict(key, owner, inc)
+    return True
 
 
 async def _halt_on_proof_conflict(key: str, owner: str, inc: dict) -> None:
@@ -2179,6 +2364,11 @@ async def recover_entry_intents() -> dict:
             if verdict["resolved"]:
                 summary["resolved"] += 1
                 continue
+            if verdict.get("conflict_handled"):
+                # Conflito já tratado no portador oficial: NÃO cai no caminho
+                # genérico que o transformaria em retry sem motivo.
+                summary["conflicts"] = int(summary.get("conflicts") or 0) + 1
+                continue
             # 2. Sem prova: garante incidente para CADA id ainda não provado,
             # COM os dados point-in-time da decisão — sem planned_stop nem
             # planned_qty o incidente não consegue adotar o SL vivo que já
@@ -2223,6 +2413,11 @@ async def _reconcile_one(key: str, owner: str) -> None:
         return  # claim perdido (lease vencido / outro dono) → não processa
     inc = await repo.get(key) or inc
     kind = inc.get("kind")
+    # ANTES de qualquer resolução/cleanup/mutação: marcador de conflito já
+    # persistido (neste incidente ou em irmão do MESMO dispatch) para no
+    # caminho manual. A recuperação não reabre para depois limpar sozinha.
+    if await _halt_if_conflicting(key, owner, inc):
+        return
     try:
         if kind in _ENTRY_KINDS:
             await _reconcile_entry(key, owner, inc)
