@@ -403,6 +403,116 @@ CONTRACT_INVALID = "PRE_SELECTION_CONTRACT_INVALID"
 CONFIG_SCHEMA_INVALID = "PRE_SELECTION_CONFIG_SCHEMA_INVALID"
 
 
+#: Envelope FECHADO do candidato PRE_SELECTION no catálogo. Não é um knob P05:
+#: é o manifesto da configuração que REALMENTE governou o replay, mais o hash do
+#: contrato esperado. Schema fechado — campo extra, knob-placeholder
+#: (`SCORE_MIN` e afins) ou contrato ausente são recusados.
+PRE_SELECTION_ENVELOPE_FIELDS = ("experiment_type", "experiment_type_version",
+                                 "replay_config", "contract_hash")
+ENVELOPE_INVALID = "PRE_SELECTION_ENVELOPE_INVALID"
+#: Campos DERIVADOS dos manifestos: vêm do motor, não da entrada.
+REPLAY_DERIVED_FIELDS = ("config_hash", "schema_version")
+COSTS_DERIVED_FIELDS = ("config_hash", "complete", "funding_model")
+COSTS_INPUT_FIELDS = ("fee_bps_per_side", "slippage_bps_per_side", "funding_bps_per_bar")
+
+
+def build_preselection_envelope(*, replay_config: Mapping[str, Any],
+                                contract_hash: str) -> Dict[str, Any]:
+    """Monta o envelope fechado do tipo. Único construtor — o catálogo usa este."""
+    if not isinstance(replay_config, Mapping) or not replay_config:
+        raise ValueError("replay_config: manifesto obrigatório")
+    if not isinstance(contract_hash, str) or not contract_hash.strip():
+        raise ValueError("contract_hash obrigatório")
+    return {TYPE_KEY: TYPE_PRE_SELECTION, TYPE_VERSION_KEY: TYPE_VERSION,
+            "replay_config": dict(replay_config),
+            "contract_hash": contract_hash.strip()}
+
+
+def validate_replay_manifest(manifest: Any) -> Dict[str, Any]:
+    """Confere que o manifesto é de um `ReplayConfig` REAL, reconstruindo-o.
+
+    Não basta `config_hash` ser string: os campos de entrada são reinjetados no
+    motor e o `manifest()` resultante tem de bater inteiro. Isso também mantém
+    as validações numéricas do próprio motor.
+    """
+    schema = validate_preselection_study_config(manifest)
+    if not schema["ok"]:
+        return schema
+    try:
+        from services import offline_replay_service as r10a
+        entradas = {chave: valor for chave, valor in dict(manifest).items()
+                    if chave not in REPLAY_DERIVED_FIELDS}
+        refeito = r10a.ReplayConfig(**entradas).manifest()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                "detail": f"manifesto não reconstrói no motor: {type(exc).__name__}: {exc}"}
+    if refeito != dict(manifest):
+        return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                "detail": "manifesto divergente do recalculado pelo motor"}
+    return {"ok": True, "reason_code": OK, "detail": None, "manifest": refeito}
+
+
+def validate_costs_manifest(manifest: Any) -> Dict[str, Any]:
+    """Mesma ideia para `CostConfig`: entradas reinjetadas, derivados conferidos."""
+    if not isinstance(manifest, Mapping) or not manifest:
+        return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                "detail": "custos ausentes"}
+    permitidos = set(COSTS_INPUT_FIELDS) | set(COSTS_DERIVED_FIELDS)
+    desconhecidos = [chave for chave in manifest if chave not in permitidos]
+    if desconhecidos:
+        return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                "detail": f"custos com campos fora do schema: {sorted(desconhecidos)}"}
+    try:
+        from services import offline_replay_service as r10a
+        entradas = {chave: manifest.get(chave) for chave in COSTS_INPUT_FIELDS}
+        refeito = r10a.CostConfig(**entradas).manifest()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                "detail": f"custos não reconstroem no motor: {type(exc).__name__}"}
+    if refeito != dict(manifest):
+        return {"ok": False, "reason_code": CONFIG_SCHEMA_INVALID,
+                "detail": "custos divergentes do recalculado pelo motor"}
+    return {"ok": True, "reason_code": OK, "detail": None, "manifest": refeito}
+
+
+def validate_preselection_envelope(envelope: Any) -> Dict[str, Any]:
+    """Valida o envelope FECHADO do catálogo para o tipo PRE_SELECTION.
+
+    Recusa knob-placeholder, campo extra, versão inválida, contrato ausente e
+    manifesto que não se reconstrói no motor. NÃO preenche defaults: manifesto
+    incompleto é recusado, nunca completado para fingir execução.
+    """
+    if not isinstance(envelope, Mapping) or not envelope:
+        return {"ok": False, "reason_code": ENVELOPE_INVALID,
+                "detail": "envelope ausente"}
+    extras = [chave for chave in envelope if chave not in PRE_SELECTION_ENVELOPE_FIELDS]
+    if extras:
+        return {"ok": False, "reason_code": ENVELOPE_INVALID,
+                "detail": f"campos fora do envelope: {sorted(extras)}"}
+    faltando = [chave for chave in PRE_SELECTION_ENVELOPE_FIELDS
+                if envelope.get(chave) in (None, "")]
+    if faltando:
+        return {"ok": False, "reason_code": ENVELOPE_INVALID,
+                "detail": f"campos obrigatórios ausentes: {faltando}"}
+    if envelope.get(TYPE_KEY) != TYPE_PRE_SELECTION:
+        return {"ok": False, "reason_code": TYPE_MISMATCH,
+                "detail": f"tipo {envelope.get(TYPE_KEY)}"}
+    if envelope.get(TYPE_VERSION_KEY) != TYPE_VERSION:
+        return {"ok": False, "reason_code": ENVELOPE_INVALID,
+                "detail": f"versão do tipo inválida: {envelope.get(TYPE_VERSION_KEY)}"}
+    if not isinstance(envelope.get("contract_hash"), str) \
+            or not envelope["contract_hash"].strip():
+        return {"ok": False, "reason_code": ENVELOPE_INVALID,
+                "detail": "contract_hash obrigatório"}
+    manifesto = validate_replay_manifest(envelope.get("replay_config"))
+    if not manifesto["ok"]:
+        return {"ok": False, "reason_code": manifesto["reason_code"],
+                "detail": manifesto.get("detail")}
+    return {"ok": True, "reason_code": OK, "detail": None,
+            "replay_config": manifesto["manifest"],
+            "contract_hash": envelope["contract_hash"].strip()}
+
+
 def validate_preselection_study_config(config: Any) -> Dict[str, Any]:
     """Valida a configuração que REALMENTE governou o replay (schema fechado).
 

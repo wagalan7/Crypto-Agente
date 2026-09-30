@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from copy import deepcopy
 import math
 import os
 import random
@@ -4403,6 +4404,20 @@ async def _upsert_experiment(session, *, experiment_key: str, champion_hash: str
     if (existing.champion_hash != champion_hash or existing.candidate_hash != candidate_hash
             or existing.candidate_config != config or existing.objective != objective):
         raise RuntimeError("IMMUTABLE_EXPERIMENT_IDENTITY_MISMATCH")
+    # PRE_SELECTION: idempotência é REPETIR o MESMO contrato, não substituir o
+    # que já está congelado — inclusive num registro ainda em DRAFT, cujo
+    # `offline_metrics` seria reescrito abaixo.
+    if expected_type == PRE_SELECTION_TYPE:
+        anterior = existing.offline_metrics if isinstance(existing.offline_metrics, dict) else {}
+        congelado = anterior.get("study") if isinstance(anterior.get("study"), dict) else {}
+        novo = offline.get("study") if isinstance(offline.get("study"), dict) else {}
+        if congelado.get("contract") is not None or congelado.get("contract_hash"):
+            if (str(congelado.get("contract_hash") or "")
+                    != str(novo.get("contract_hash") or "")
+                    or canonical_hash(congelado.get("contract"))
+                    != canonical_hash(novo.get("contract"))):
+                raise RuntimeError("PRESELECTION_FROZEN_CONTRACT_MISMATCH para "
+                                   "experiment_key existente")
 
     # Já decidido não reabre; só reaproveita (nova evidência ⇒ nova versão/cutoff).
     if existing.status == STATUS_DRAFT and can_transition(STATUS_DRAFT, verdict):
@@ -6252,8 +6267,49 @@ async def load_preselection_study(*, experiment_key: str, universe_version: str,
             "state_key": estado.get("state_key")}
 
 
+FROZEN_MISSING = "PRESELECTION_FROZEN_CONTRACT_MISSING"
+FROZEN_MISMATCH = "PRESELECTION_FROZEN_CONTRACT_MISMATCH"
+
+
+def verify_study_against_frozen(study: Any, *, frozen: Any, candidate_config: Any,
+                                fingerprint: Any, cutoff: Any) -> Dict[str, Any]:
+    """Confere o estudo recuperado CONTRA o contrato congelado na criação.
+
+    Integridade interna (hash refeito sobre o próprio corpo) não é vínculo: outro
+    contrato BEM FORMADO, com candidata/custos diferentes e todos os hashes
+    recalculados, é válido em si e ainda assim NÃO é o desta linha. Sem
+    congelamento verificável, bloqueia — nada de completar registro antigo com o
+    estudo encontrado agora.
+    """
+    from services import preselection_experiment_service as r12
+    congelado = frozen if isinstance(frozen, Mapping) else {}
+    contrato_congelado = congelado.get("contract")
+    hash_congelado = str(congelado.get("contract_hash") or "")
+    if not isinstance(contrato_congelado, Mapping) or not hash_congelado:
+        return {"ok": False, "reason_code": FROZEN_MISSING, "diverged": ["frozen_contract"]}
+    # O congelado também precisa fechar consigo mesmo (não foi adulterado).
+    if r12.contract_hash_of(contrato_congelado) != hash_congelado:
+        return {"ok": False, "reason_code": FROZEN_MISSING,
+                "diverged": ["frozen_contract_hash"]}
+    # VÍNCULO primeiro: outro contrato válido divergindo do congelado é
+    # rejeitado por identidade, antes de qualquer conferência interna.
+    recuperado = (study or {}).get("contract") if isinstance(study, Mapping) else None
+    divergentes = [campo for campo in r12.PRE_SELECTION_CONTRACT_FIELDS
+                   if canonical_hash((recuperado or {}).get(campo))
+                   != canonical_hash(contrato_congelado.get(campo))]
+    if divergentes:
+        return {"ok": False, "reason_code": FROZEN_MISMATCH, "diverged": divergentes}
+    base = verify_study_identity(study, candidate_config=candidate_config,
+                                 fingerprint=fingerprint, cutoff=cutoff,
+                                 expected_contract_hash=hash_congelado)
+    if not base["ok"]:
+        return base
+    return {**base, "frozen_contract_hash": hash_congelado}
+
+
 def verify_study_identity(study: Any, *, candidate_config: Any, fingerprint: Any,
-                          cutoff: Any) -> Dict[str, Any]:
+                          cutoff: Any,
+                          expected_contract_hash: Any = None) -> Dict[str, Any]:
     """Confere que o estudo recuperado é O DESTE experimento.
 
     O contrato canônico PRE_SELECTION é RECALCULADO aqui (mesmo objeto, mesma
@@ -6278,20 +6334,39 @@ def verify_study_identity(study: Any, *, candidate_config: Any, fingerprint: Any
             or recalculado != str(contrato.get("contract_hash") or ""):
         return {"ok": False, "reason_code": r12.CONTRACT_INVALID,
                 "diverged": ["contract_hash"]}
-    # 2. A configuração aceita é a que governou o replay, pelo schema do tipo.
-    schema = r12.validate_preselection_study_config(contrato.get("candidate_config"))
+    # 2. Os manifestos do contrato são de motores REAIS (reconstruídos), e os
+    # custos separam entradas de derivados.
+    schema = r12.validate_replay_manifest(contrato.get("candidate_config"))
     if not schema["ok"]:
         return {"ok": False, "reason_code": schema["reason_code"],
                 "detail": schema.get("detail"), "diverged": ["candidate_config"]}
-    base_schema = r12.validate_preselection_study_config(contrato.get("baseline_config"))
+    base_schema = r12.validate_replay_manifest(contrato.get("baseline_config"))
     if not base_schema["ok"]:
         return {"ok": False, "reason_code": base_schema["reason_code"],
                 "detail": base_schema.get("detail"), "diverged": ["baseline_config"]}
-    # 3. O experimento do catálogo é do TIPO certo (envelope versionado).
-    tipo = experiment_type_guard(candidate_config, expected_type=PRE_SELECTION_TYPE)
-    if not tipo["ok"]:
-        return {"ok": False, "reason_code": tipo["reason_code"],
-                "diverged": ["experiment_type"]}
+    custos_schema = r12.validate_costs_manifest(contrato.get("costs_config"))
+    if not custos_schema["ok"]:
+        return {"ok": False, "reason_code": custos_schema["reason_code"],
+                "detail": custos_schema.get("detail"), "diverged": ["costs_config"]}
+    # 3. O candidato do catálogo é o ENVELOPE FECHADO do tipo — não um knob P05.
+    envelope = r12.validate_preselection_envelope(candidate_config)
+    if not envelope["ok"]:
+        return {"ok": False, "reason_code": envelope["reason_code"],
+                "detail": envelope.get("detail"), "diverged": ["candidate_config"]}
+    # 3b. O `replay_config` aceito é canonicamente IGUAL à candidata do contrato.
+    if canonical_hash(envelope["replay_config"]) != \
+            canonical_hash(contrato.get("candidate_config")):
+        return {"ok": False, "reason_code": STUDY_MISMATCH,
+                "diverged": ["replay_config"]}
+    # 3c. O hash esperado declarado no envelope (e, na reavaliação, o do contrato
+    # ORIGINAL congelado) tem de bater com o recalculado.
+    if envelope["contract_hash"] != recalculado:
+        return {"ok": False, "reason_code": STUDY_MISMATCH,
+                "diverged": ["envelope_contract_hash"]}
+    if expected_contract_hash is not None \
+            and str(expected_contract_hash) != recalculado:
+        return {"ok": False, "reason_code": FROZEN_MISMATCH,
+                "diverged": ["contract_hash"]}
     # 4. As identidades declaradas batem com o contrato E com o experimento.
     divergentes = []
     if str(contrato.get("population")) != "SHADOW" \
@@ -6375,11 +6450,20 @@ async def create_preselection_experiment(*, champion: Dict[str, Any],
         # Vocabulário do catálogo OFICIAL: o tipo novo não cria objetivo novo.
         return {"ok": False, "blocked": True, "reason_code": "INVALID_OBJECTIVE",
                 "allowed": list(OBJECTIVES)}
-    try:
-        validated = validate_candidate_config(champion, config)
-    except CandidateValidationError as exc:
-        return {"ok": False, "blocked": True, "reason_code": "INVALID_CANDIDATE_CONFIG",
-                "error": str(exc)}
+    # PRE_SELECTION usa o validador DO TIPO (envelope fechado), não a regra
+    # legada de um knob — que permanece intacta para o POST_SELECTION.
+    from services import preselection_experiment_service as _r12
+    envelope = _r12.validate_preselection_envelope(config)
+    if not envelope["ok"]:
+        return {"ok": False, "blocked": True, "reason_code": envelope["reason_code"],
+                "error": envelope.get("detail")}
+    validated = dict(config)
+    # `champion`, para este tipo, é o MANIFESTO BASELINE executado pelo replay —
+    # nunca o champion do ambiente.
+    baseline_ok = _r12.validate_replay_manifest(champion)
+    if not baseline_ok["ok"]:
+        return {"ok": False, "blocked": True, "reason_code": baseline_ok["reason_code"],
+                "error": f"baseline: {baseline_ok.get('detail')}"}
     referencia = study_ref if isinstance(study_ref, Mapping) else {}
     recuperado = await load_preselection_study(
         experiment_key=str(referencia.get("experiment_key") or ""),
@@ -6395,6 +6479,11 @@ async def create_preselection_experiment(*, champion: Dict[str, Any],
                 "diverged": conferencia.get("diverged"),
                 "missing": conferencia.get("missing"), "study_ref": dict(referencia)}
     estudo = recuperado["study"]
+    # O baseline SOLICITADO tem de ser o do contrato executado.
+    if canonical_hash(champion) != canonical_hash(
+            (estudo.get("contract") or {}).get("baseline_config")):
+        return {"ok": False, "blocked": True, "reason_code": STUDY_MISMATCH,
+                "diverged": ["baseline_config"], "study_ref": dict(referencia)}
     offline = {**evaluate_preselection_candidate(estudo.get("evidence")),
                "study": {campo: estudo.get(campo) for campo in
                          ("population", "study_kind", "policy_version",
@@ -6406,6 +6495,8 @@ async def create_preselection_experiment(*, champion: Dict[str, Any],
                "study_verified_fields": conferencia.get("verified_fields"),
                "study_ref": dict(referencia),
                "study_generation": recuperado.get("generation")}
+    # Cópia COMPLETA e independente do contrato validado fica congelada aqui.
+    offline["study"]["contract"] = deepcopy(estudo.get("contract"))
     from db import get_session
     champion_hash = canonical_hash(champion)
     candidate_hash = canonical_hash(validated)
@@ -6445,6 +6536,13 @@ async def start_preselection_shadow(exp_id: int) -> Dict[str, Any]:
         if not is_pre_selection_experiment(exp):
             return {"ok": False, "blocked": True, "reason_code": "EXPERIMENT_TYPE_MISMATCH",
                     "error": "este caminho é do tipo pré-seleção", "status": exp.status}
+        vinculo = _frozen_study_of(exp)
+        if not vinculo["ok"]:
+            # Vínculo ausente/inválido recusa SEMPRE — inclusive no retorno
+            # idempotente de quem já está em SHADOW.
+            return {"ok": False, "blocked": True, "reason_code": vinculo["reason_code"],
+                    "error": "vínculo do estudo ausente ou inválido",
+                    "status": exp.status}
         if exp.status == STATUS_SHADOW:
             return {"ok": True, "idempotent": True, "status": exp.status,
                     "experiment_key": exp.experiment_key}
@@ -6498,9 +6596,16 @@ async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
                     "status": exp.status}
         offline = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
         referencia = offline.get("study_ref") if isinstance(offline.get("study_ref"), dict) else {}
+        congelado = offline.get("study") if isinstance(offline.get("study"), dict) else {}
         config_congelada = dict(exp.candidate_config or {})
         fingerprint, corte = exp.dataset_fingerprint, exp.dataset_cutoff
         experiment_key, status_atual = exp.experiment_key, exp.status
+        candidate_hash_atual, champion_hash_atual = exp.candidate_hash, exp.champion_hash
+    # Sem congelamento VERIFICÁVEL não se avalia: nada de completar o registro
+    # antigo copiando o estudo encontrado agora (sem backfill de identidade).
+    if not isinstance(congelado.get("contract"), dict) or not congelado.get("contract_hash"):
+        return {"ok": False, "blocked": True, "reason_code": FROZEN_MISSING,
+                "outcomes_read": False, "status": status_atual}
     recuperado = await load_preselection_study(
         experiment_key=str(referencia.get("experiment_key") or ""),
         universe_version=str(referencia.get("universe_version") or ""),
@@ -6508,13 +6613,15 @@ async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
     if not recuperado["available"]:
         return {"ok": False, "blocked": True, "reason_code": recuperado["reason_code"],
                 "outcomes_read": False, "status": status_atual}
-    conferencia = verify_study_identity(recuperado["study"],
-                                        candidate_config=config_congelada,
-                                        fingerprint=fingerprint, cutoff=corte)
+    # O estudo recuperado é conferido CONTRA o contrato ORIGINAL congelado: outro
+    # contrato válido na mesma referência dá mismatch e nada é atualizado.
+    conferencia = verify_study_against_frozen(
+        recuperado["study"], frozen=congelado, candidate_config=config_congelada,
+        fingerprint=fingerprint, cutoff=corte)
     if not conferencia["ok"]:
         return {"ok": False, "blocked": True, "reason_code": conferencia["reason_code"],
                 "diverged": conferencia.get("diverged"), "outcomes_read": False,
-                "status": status_atual}
+                "status": status_atual, "frozen_preserved": True}
     estudo = recuperado["study"]
     veredito = evaluate_preselection_candidate(estudo.get("evidence"))
     async with get_session() as session:
@@ -6524,6 +6631,19 @@ async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
         if exp is None or exp.status != STATUS_SHADOW \
                 or exp.experiment_key != experiment_key:
             return {"ok": False, "error": "experimento mudou de estado durante a avaliação"}
+        # Reconfere IDENTIDADE e CONTRATO no segundo lock: se mudaram desde a
+        # leitura, nada é gravado (resultado obsoleto não entra).
+        offline_agora = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
+        congelado_agora = offline_agora.get("study") if isinstance(
+            offline_agora.get("study"), dict) else {}
+        if (exp.candidate_hash != candidate_hash_atual
+                or exp.champion_hash != champion_hash_atual
+                or canonical_hash(dict(exp.candidate_config or {})) != canonical_hash(config_congelada)
+                or str(congelado_agora.get("contract_hash") or "")
+                != str(congelado.get("contract_hash") or "")):
+            return {"ok": False, "blocked": True, "reason_code": FROZEN_MISMATCH,
+                    "error": "identidade/contrato mudaram durante a avaliação",
+                    "outcomes_read": False, "status": exp.status}
         exp.shadow_metrics = {**(exp.shadow_metrics if isinstance(exp.shadow_metrics, dict) else {}),
                               "population": "PRE_SELECTION", "simulation_only": True,
                               "study_generation": recuperado.get("generation"),
@@ -6544,6 +6664,27 @@ async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
             "gate_verdict": veredito.get("gate_verdict"),
             "verdict": veredito["verdict"], "promotable": False,
             "live_approval": "UNAVAILABLE"}
+
+
+def _frozen_study_of(exp: Any) -> Dict[str, Any]:
+    """Vínculo congelado do experimento pré-seleção, conferido consigo mesmo."""
+    from services import preselection_experiment_service as r12
+    offline = getattr(exp, "offline_metrics", None)
+    offline = offline if isinstance(offline, dict) else {}
+    congelado = offline.get("study") if isinstance(offline.get("study"), dict) else {}
+    contrato = congelado.get("contract")
+    esperado = str(congelado.get("contract_hash") or "")
+    if not isinstance(contrato, dict) or not esperado:
+        return {"ok": False, "reason_code": FROZEN_MISSING}
+    if r12.contract_hash_of(contrato) != esperado:
+        return {"ok": False, "reason_code": FROZEN_MISSING}
+    envelope = r12.validate_preselection_envelope(getattr(exp, "candidate_config", None))
+    if not envelope["ok"]:
+        return {"ok": False, "reason_code": envelope["reason_code"]}
+    if envelope["contract_hash"] != esperado:
+        return {"ok": False, "reason_code": FROZEN_MISMATCH}
+    return {"ok": True, "reason_code": "FROZEN_OK", "contract_hash": esperado,
+            "contract": contrato}
 
 
 async def promote_preselection(exp_id: int) -> Dict[str, Any]:

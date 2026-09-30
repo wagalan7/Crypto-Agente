@@ -290,6 +290,9 @@ async def run():
     # ══════════════════════════════════════════════════════════════════════
     #  R12 — despacho por TIPO no serviço oficial
     # ══════════════════════════════════════════════════════════════════════
+    # Knobs do comparador LEGADO (POST_SELECTION): ficam SÓ nos testes de guarda
+    # de TIPO. O catálogo pré-seleção passa a receber o ENVELOPE FECHADO com o
+    # manifesto ReplayConfig REALMENTE executado — sem knob-placeholder.
     champion = {"SCORE_MIN": 70}
     pre_config = r12.tag_config({"SCORE_MIN": 73})
     pos_config = {"SCORE_MIN": 73}
@@ -416,14 +419,23 @@ async def run():
         return candidatos, barras, cotacoes, playbooks
 
     def rodar_estudo_real(*, oportunidades=140, espacamento_barras=48,
-                          universo="SYN-FIXTURE"):
+                          universo="SYN-FIXTURE", cfg_base=None, cfg_cand=None,
+                          custos=None):
+        """Mesmo conjunto de oportunidades ⇒ MESMO dataset/corte.
+
+        Variar só candidata, baseline ou custos produz OUTRO contrato BEM
+        FORMADO (todos os hashes recalculados pelos motores) sobre o MESMO
+        dataset — é o material do segundo contraexemplo.
+        """
         candidatos, barras, cotacoes, playbooks = fixture_sintetica(
             oportunidades=oportunidades, espacamento_barras=espacamento_barras)
-        custos = r10a.CostConfig(fee_bps_per_side=4.0, slippage_bps_per_side=2.0,
-                                 funding_bps_per_bar=1.0)
-        cfg_base = r10a.ReplayConfig(bar_ms=BAR)
-        cfg_cand = r10a.ReplayConfig(bar_ms=BAR, tp1_fraction=0.60,
-                                     trail_atr_multiple=1.6, be_lock_fraction=0.30)
+        custos = custos or r10a.CostConfig(fee_bps_per_side=4.0,
+                                           slippage_bps_per_side=2.0,
+                                           funding_bps_per_bar=1.0)
+        cfg_base = cfg_base or r10a.ReplayConfig(bar_ms=BAR)
+        cfg_cand = cfg_cand or r10a.ReplayConfig(bar_ms=BAR, tp1_fraction=0.60,
+                                                 trail_atr_multiple=1.6,
+                                                 be_lock_fraction=0.30)
         carteira = pf.PortfolioConfig(capital_usd=100_000.0, risk_per_trade_pct=0.5,
                                       max_concurrent=50, max_per_symbol=50,
                                       max_exposure_usd=10_000_000.0)
@@ -504,6 +516,28 @@ async def run():
         return {"experiment_key": experimento, "universe_version": universo,
                 "population": "SHADOW"}, publicado
 
+    def envelope_de(estudo):
+        """Envelope FECHADO do tipo, com o manifesto REALMENTE executado.
+
+        Mesmo construtor do serviço do tipo: `replay_config` é a candidata do
+        contrato e `contract_hash` amarra o envelope AO contrato daquele estudo.
+        """
+        return r12.build_preselection_envelope(
+            replay_config=estudo["contract"]["candidate_config"],
+            contract_hash=estudo["contract_hash"])
+
+    def baseline_de(estudo):
+        """`champion`, neste tipo, é o MANIFESTO BASELINE executado pelo replay."""
+        return dict(estudo["contract"]["baseline_config"])
+
+    #: SENTINELA do AVALIADOR: divergência de contrato bloqueia ANTES de avaliar
+    #: evidência — o gate econômico não pode nem ser consultado.
+    AVALIADOR = []
+
+    def avaliador_sentinela(evidencia):
+        AVALIADOR.append("PRESELECTION_EVALUATOR_CALLED")
+        raise AssertionError("avaliador chamado apesar do bloqueio de contrato")
+
     estudo_real, gate_real, replay_real = rodar_estudo_real()
     check("runner_real_produziu_amostra",
           int(estudo_real["evidence"]["total_shadow_trades"]) >= 100
@@ -523,9 +557,63 @@ async def run():
                                                    experimento="estudo-real-1")
     check("estudo_pre_selecao_persistido", publicado["published"], str(publicado))
 
+    # ── Contrato ÚNICO do runner ao catálogo: envelope FECHADO ─────────────
+    envelope_a = envelope_de(estudo_real)
+    baseline_a = baseline_de(estudo_real)
+    check("envelope_fechado_leva_o_manifesto_executado",
+          r12.validate_preselection_envelope(envelope_a)["ok"]
+          and envelope_a["replay_config"]["config_hash"]
+          == estudo_real["contract"]["candidate_config"]["config_hash"]
+          and envelope_a["contract_hash"] == estudo_real["contract_hash"],
+          str(envelope_a.get("contract_hash")))
+    # RED 1 fechado: o MESMO estudo já não é aceito com knob arbitrário.
+    knobs_aceitos = []
+    for valor in (71, 73, 74):
+        tentativa = await evid.create_preselection_experiment(
+            champion=baseline_a, config=r12.tag_config({"SCORE_MIN": valor}),
+            objective=evid.OBJECTIVE_MORE_OPERATIONS, study_ref=referencia,
+            cutoff=corte, fingerprint=fingerprint_estudo)
+        if tentativa.get("ok"):
+            knobs_aceitos.append(valor)
+    check("knob_placeholder_nao_vale_por_candidata", knobs_aceitos == [],
+          str(knobs_aceitos))
+    # Envelope MALFORMADO é recusado sem preencher default nenhum.
+    malformados = {
+        "manifesto_incompleto": {**envelope_a,
+                                 "replay_config": {"tp1_fraction": 0.6}},
+        "versao_invalida": {**envelope_a, "experiment_type_version": 999},
+        "hash_interno_errado": {
+            **envelope_a,
+            "replay_config": {**envelope_a["replay_config"],
+                              "config_hash": "hash-trocado"}},
+        "campo_extra": {**envelope_a, "SCORE_MIN": 73},
+        "sem_contrato": {campo: valor for campo, valor in envelope_a.items()
+                         if campo != "contract_hash"},
+    }
+    for nome, corpo in malformados.items():
+        recusa = await evid.create_preselection_experiment(
+            champion=baseline_a, config=corpo,
+            objective=evid.OBJECTIVE_MORE_OPERATIONS, study_ref=referencia,
+            cutoff=corte, fingerprint=fingerprint_estudo)
+        check(f"envelope_recusado_{nome}",
+              recusa["ok"] is False
+              and recusa["reason_code"] in (r12.ENVELOPE_INVALID,
+                                            r12.CONFIG_SCHEMA_INVALID,
+                                            r12.TYPE_MISMATCH),
+              f"{nome}: {str(recusa)[:170]}")
+    # `champion` do AMBIENTE não substitui o manifesto baseline executado.
+    baseline_do_ambiente = await evid.create_preselection_experiment(
+        champion=evid.discover_champion_config(), config=envelope_a,
+        objective=evid.OBJECTIVE_MORE_OPERATIONS, study_ref=referencia,
+        cutoff=corte, fingerprint=fingerprint_estudo)
+    check("champion_do_ambiente_nao_e_baseline_do_replay",
+          baseline_do_ambiente["ok"] is False,
+          str(baseline_do_ambiente)[:200])
+
     # 1. Métricas avulsas + estudo AUSENTE não validam nada.
     sem_estudo = await evid.create_preselection_experiment(
-        champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        champion=baseline_a, config=envelope_a,
+        objective=evid.OBJECTIVE_MORE_OPERATIONS,
         study_ref={"experiment_key": "nao-existe", "universe_version": "SYN-6"},
         cutoff=corte, fingerprint="NO_DATASET")
     check("sem_estudo_nao_cria",
@@ -535,14 +623,16 @@ async def run():
 
     # 2. Estudo existente mas com dataset/corte divergentes é recusado.
     divergente = await evid.create_preselection_experiment(
-        champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        champion=baseline_a, config=envelope_a,
+        objective=evid.OBJECTIVE_MORE_OPERATIONS,
         study_ref=referencia, cutoff=corte, fingerprint="OUTRO_DATASET")
     check("dataset_divergente_recusa",
           divergente["ok"] is False and divergente["reason_code"] == evid.STUDY_MISMATCH
           and "dataset_fingerprint" in (divergente.get("diverged") or []),
           str(divergente)[:220])
     outro_corte = await evid.create_preselection_experiment(
-        champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        champion=baseline_a, config=envelope_a,
+        objective=evid.OBJECTIVE_MORE_OPERATIONS,
         study_ref=referencia, cutoff=corte + timedelta(days=1),
         fingerprint=fingerprint_estudo)
     check("corte_divergente_recusa",
@@ -564,7 +654,7 @@ async def run():
                                         universo=f"SYN-ADULT-{campo}",
                                         periodo=f"P-{campo}", chave=f"ev-{campo}")
         return await evid.create_preselection_experiment(
-            champion=champion, config=pre_config,
+            champion=baseline_a, config=envelope_a,
             objective=evid.OBJECTIVE_MORE_OPERATIONS, study_ref=ref,
             cutoff=datetime.fromtimestamp(int(estudo["cutoff_ms"]) / 1000.0,
                                           tz=timezone.utc),
@@ -595,7 +685,7 @@ async def run():
     # 2c. Estudo de OUTRO experimento não empresta evidência: contrato bate,
     # mas dataset/corte declarados pelo catálogo não são os dele.
     emprestado = await evid.create_preselection_experiment(
-        champion=champion, config=pre_config,
+        champion=baseline_a, config=envelope_a,
         objective=evid.OBJECTIVE_MORE_OPERATIONS, study_ref=referencia,
         cutoff=corte, fingerprint="dataset-de-outro-estudo")
     check("evidencia_de_outro_estudo_nao_serve",
@@ -618,7 +708,8 @@ async def run():
 
     # 3. Criação LEGÍTIMA: vinculada ao estudo recuperado e conferido.
     criacao = await evid.create_preselection_experiment(
-        champion=champion, config=pre_config, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        champion=baseline_a, config=envelope_a,
+        objective=evid.OBJECTIVE_MORE_OPERATIONS,
         study_ref=referencia, cutoff=corte, fingerprint=fingerprint_estudo)
     check("criacao_oficial_do_tipo_pre_selecao",
           criacao["ok"] and criacao["experiment_type"] == evid.PRE_SELECTION_TYPE,
@@ -639,11 +730,30 @@ async def run():
           criacao["offline"]["population"] == "PRE_SELECTION"
           and criacao["offline"]["outcomes_read"] is False, str(criacao["offline"])[:220])
 
+    # Repetir o MESMO contrato é idempotente: chave, envelope e contrato
+    # congelado continuam os mesmos (idempotência ≠ substituir o congelado).
+    repeticao = await evid.create_preselection_experiment(
+        champion=baseline_a, config=envelope_a,
+        objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        study_ref=referencia, cutoff=corte, fingerprint=fingerprint_estudo)
+    check("mesmo_contrato_repetido_preserva_identidade",
+          repeticao["ok"] and repeticao["experiment_key"] == criacao["experiment_key"]
+          and repeticao["offline"]["study"]["contract_hash"]
+          == criacao["offline"]["study"]["contract_hash"], str(repeticao)[:200])
     async with db.get_session() as session:
         linha_exp = (await session.execute(
             sql_select(E).where(E.experiment_key == criacao["experiment_key"]))).scalar_one()
         exp_id, status_inicial = linha_exp.id, linha_exp.status
         config_congelada = dict(linha_exp.candidate_config)
+        contrato_congelado = dict(linha_exp.offline_metrics["study"]["contract"])
+        hash_congelado = linha_exp.offline_metrics["study"]["contract_hash"]
+    check("contrato_congelado_no_experimento",
+          r12.contract_hash_of(contrato_congelado) == hash_congelado
+          and hash_congelado == estudo_real["contract_hash"], str(hash_congelado))
+    check("envelope_congelado_e_o_do_manifesto",
+          config_congelada.get("replay_config", {}).get("config_hash")
+          == estudo_real["contract"]["candidate_config"]["config_hash"]
+          and "SCORE_MIN" not in config_congelada, str(sorted(config_congelada)))
     check("linha_gravada_no_catalogo_oficial", exp_id > 0 and status_inicial in
           (evid.STATUS_OFFLINE_VALIDATED, evid.STATUS_DRAFT), str(status_inicial))
     check("tipo_viaja_na_config_congelada",
@@ -675,13 +785,14 @@ async def run():
           and depois_restart[1]["population"] == "PRE_SELECTION", str(depois_restart))
 
     # Concorrência indevida: um segundo challenger do MESMO tipo é recusado.
-    cfg2 = r12.tag_config({"SCORE_MIN": 74})
     estudo2, _g2, _r2 = rodar_estudo_real(oportunidades=120, universo="SYN-FIXTURE-2")
+    cfg2 = envelope_de(estudo2)
     ref2, _ = await persistir_estudo(estudo2, experimento="estudo-real-2",
                                      universo="SYN-FIXTURE-2", periodo="P-FX2",
                                      chave="ev-fx2")
     criacao2 = await evid.create_preselection_experiment(
-        champion=champion, config=cfg2, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        champion=baseline_de(estudo2), config=cfg2,
+        objective=evid.OBJECTIVE_MORE_OPERATIONS,
         study_ref=ref2, cutoff=datetime.fromtimestamp(int(estudo2["cutoff_ms"]) / 1000.0,
                                                       tz=timezone.utc),
         fingerprint=estudo2["dataset_fingerprint"])
@@ -697,7 +808,7 @@ async def run():
     # Config congelada não muda: mesma chave com conteúdo diferente é recusada.
     try:
         recriado = await evid.create_preselection_experiment(
-            champion=champion, config=pre_config,
+            champion=baseline_a, config=envelope_a,
             objective=evid.OBJECTIVE_MORE_OPERATIONS, study_ref=referencia,
             cutoff=corte, fingerprint="fp-OUTRO")
         alterou = recriado.get("ok") is True
@@ -750,6 +861,156 @@ async def run():
           pos_restart["ok"] and pos_restart["study_generation"] == oficial["study_generation"],
           str(pos_restart)[:200])
 
+    # ══════════════════════════════════════════════════════════════════════
+    #  H, 2º contraexemplo: OUTRO contrato BEM FORMADO na MESMA referência
+    #  (todos os hashes recalculados) NÃO substitui o contrato congelado.
+    # ══════════════════════════════════════════════════════════════════════
+    variantes = (
+        ("candidata", {"cfg_cand": r10a.ReplayConfig(bar_ms=BAR, tp1_fraction=0.70,
+                                                     trail_atr_multiple=2.5,
+                                                     be_lock_fraction=0.10)}),
+        ("custos", {"custos": r10a.CostConfig(fee_bps_per_side=7.0,
+                                              slippage_bps_per_side=2.0,
+                                              funding_bps_per_bar=1.0)}),
+        ("baseline", {"cfg_base": r10a.ReplayConfig(bar_ms=BAR, tp1_fraction=0.30,
+                                                    trail_activation_atr=0.8)}),
+    )
+    for nome, mudanca in variantes:
+        estudo_b, _gb, _rb = rodar_estudo_real(**mudanca)
+        env_b = envelope_de(estudo_b)
+        check(f"contrato_b_{nome}_recalcula_todos_os_hashes",
+              r12.contract_hash_of(estudo_b["contract"]) == estudo_b["contract_hash"]
+              and estudo_b["contract_hash"] != estudo_real["contract_hash"]
+              and estudo_b["dataset_fingerprint"] == fingerprint_estudo
+              and int(estudo_b["cutoff_ms"]) == corte_ms,
+              f"{nome}: {estudo_b['contract_hash'][:16]}")
+        # B é ÍNTEGRO EM SI: a recusa vem do VÍNCULO, não de corrupção.
+        isolado = evid.verify_study_identity(estudo_b, candidate_config=env_b,
+                                            fingerprint=fingerprint_estudo,
+                                            cutoff=corte)
+        check(f"contrato_b_{nome}_valido_isoladamente",
+              isolado["ok"] and isolado["reason_code"] == "STUDY_VERIFIED",
+              f"{nome}: {str(isolado)[:170]}")
+        # Publicado na MESMA referência de A, com o MESMO dataset/corte.
+        _, geracao_b = await persistir_estudo(estudo_b, experimento="estudo-real-1",
+                                              periodo=f"P-B-{nome}",
+                                              chave=f"ev-b-{nome}")
+        check(f"contrato_b_{nome}_publicado_na_referencia_de_a",
+              geracao_b["published"], str(geracao_b)[:160])
+        AVALIADOR.clear()
+        with _patch.object(evid, "_load_shadow", loader_sentinela), \
+                _patch.object(evid, "evaluate_preselection_candidate",
+                              avaliador_sentinela):
+            bloqueio = await evid.evaluate_shadow(exp_id)
+        check(f"reavaliacao_bloqueia_contrato_b_{nome}",
+              bloqueio["ok"] is False
+              and bloqueio["reason_code"] == evid.FROZEN_MISMATCH
+              and nome.replace("candidata", "candidate_config").replace(
+                  "custos", "costs_config").replace("baseline", "baseline_config")
+              in (bloqueio.get("diverged") or []),
+              f"{nome}: {str(bloqueio)[:200]}")
+        check(f"bloqueio_b_{nome}_nao_avalia_evidencia",
+              AVALIADOR == [] and LOADER_POS == []
+              and bloqueio["outcomes_read"] is False,
+              f"{nome}: {AVALIADOR} {LOADER_POS}")
+        async with db.get_session() as session:
+            linha_b = (await session.execute(sql_select(
+                E.status, E.candidate_config, E.offline_metrics, E.shadow_metrics)
+                .where(E.id == exp_id))).one()
+        check(f"bloqueio_b_{nome}_preserva_status_config_e_congelado",
+              linha_b[0] == evid.STATUS_SHADOW and linha_b[1] == config_congelada
+              and linha_b[2]["study"]["contract_hash"] == hash_congelado
+              and evid.canonical_hash(linha_b[2]["study"]["contract"])
+              == evid.canonical_hash(contrato_congelado),
+              f"{nome}: {linha_b[0]} {str(linha_b[2].get('study', {}).get('contract_hash'))[:16]}")
+        # B criado SEPARADAMENTE tem identidade PRÓPRIA: não colide com A.
+        ref_b, _ = await persistir_estudo(estudo_b, experimento=f"estudo-b-{nome}",
+                                          periodo=f"P-BB-{nome}",
+                                          chave=f"ev-bb-{nome}")
+        criacao_b = await evid.create_preselection_experiment(
+            champion=baseline_de(estudo_b), config=env_b,
+            objective=evid.OBJECTIVE_MORE_OPERATIONS, study_ref=ref_b,
+            cutoff=corte, fingerprint=fingerprint_estudo)
+        check(f"contrato_b_{nome}_tem_identidade_propria",
+              criacao_b["ok"]
+              and criacao_b["experiment_key"] != criacao["experiment_key"],
+              f"{nome}: {str(criacao_b)[:170]}")
+        if nome == "custos":
+            check("custos_isolados_mudam_a_identidade_do_experimento",
+                  env_b["replay_config"] == envelope_a["replay_config"]
+                  and env_b["contract_hash"] != envelope_a["contract_hash"],
+                  str(env_b["contract_hash"])[:16])
+
+    # Escopo/versões/universo: contrato BEM FORMADO, hash refeito, e ainda assim
+    # divergente do congelado.
+    def recontratar(estudo, **mudancas):
+        """OUTRO contrato ÍNTEGRO (hash REFEITO sobre o corpo novo)."""
+        atual = estudo["contract"]
+        campos = {campo: atual[campo] for campo in
+                  ("population", "study_kind", "policy_version", "universe_version",
+                   "comparison_scope", "baseline_config", "candidate_config",
+                   "costs_config", "bundle_hash", "dataset_fingerprint", "cutoff_ms")}
+        campos.update(mudancas)
+        novo = r12.preselection_contract(**campos)
+        return {**estudo, "contract": novo, "contract_hash": novo["contract_hash"]}
+
+    for nome, mudanca in (("universo", {"universe_version": "SYN-OUTRO-UNIVERSO"}),
+                          ("politica", {"policy_version": "OUTRA_POLITICA_V9"}),
+                          ("escopo", {"comparison_scope": "FULL_STRATEGY"})):
+        estudo_c = recontratar(estudo_real, **mudanca)
+        check(f"contrato_{nome}_e_integro_em_si",
+              r12.contract_hash_of(estudo_c["contract"]) == estudo_c["contract_hash"]
+              and estudo_c["contract_hash"] != hash_congelado, nome)
+        await persistir_estudo(estudo_c, experimento="estudo-real-1",
+                               periodo=f"P-C-{nome}", chave=f"ev-c-{nome}")
+        AVALIADOR.clear()
+        with _patch.object(evid, "_load_shadow", loader_sentinela), \
+                _patch.object(evid, "evaluate_preselection_candidate",
+                              avaliador_sentinela):
+            bloqueio_c = await evid.evaluate_shadow(exp_id)
+        check(f"divergencia_de_{nome}_bloqueia_antes_do_avaliador",
+              bloqueio_c["ok"] is False
+              and bloqueio_c["reason_code"] == evid.FROZEN_MISMATCH
+              and AVALIADOR == [] and LOADER_POS == [],
+              f"{nome}: {str(bloqueio_c)[:180]}")
+
+    # Repetir o contrato ORIGINAL na referência volta a avaliar (o bloqueio era
+    # do vínculo, não do mecanismo).
+    _, volta = await persistir_estudo(estudo_real, experimento="estudo-real-1",
+                                      periodo="P-FX-VOLTA", chave="ev-fx-volta")
+    with _patch.object(evid, "_load_shadow", loader_sentinela):
+        de_volta = await evid.evaluate_shadow(exp_id)
+    check("contrato_original_de_volta_avalia",
+          volta["published"] and de_volta["ok"]
+          and de_volta["verdict"] == oficial["verdict"], str(de_volta)[:200])
+
+    # Congelado TROCADO fora de banda: a criação idempotente não aceita
+    # substituir o contrato já congelado (vale inclusive para DRAFT).
+    async with db.get_session() as session:
+        exp2_id = (await session.execute(
+            sql_select(E.id).where(E.experiment_key == criacao2["experiment_key"]))).scalar_one()
+        await session.execute(sql_text(
+            "UPDATE strategy_experiments SET offline_metrics = "
+            "jsonb_set(offline_metrics, '{study,contract_hash}', "
+            "to_jsonb(cast(:h as text))) WHERE id = :i"),
+            {"h": hash_congelado, "i": exp2_id})
+        await session.commit()
+    try:
+        await evid.create_preselection_experiment(
+            champion=baseline_de(estudo2), config=cfg2,
+            objective=evid.OBJECTIVE_MORE_OPERATIONS, study_ref=ref2,
+            cutoff=datetime.fromtimestamp(int(estudo2["cutoff_ms"]) / 1000.0,
+                                          tz=timezone.utc),
+            fingerprint=estudo2["dataset_fingerprint"])
+        trocou = True
+        motivo = "criação aceitou contrato congelado divergente"
+    except RuntimeError as exc:
+        trocou = False
+        motivo = str(exc)
+    check("congelado_divergente_bloqueia_a_idempotencia",
+          trocou is False and "PRESELECTION_FROZEN_CONTRACT_MISMATCH" in motivo,
+          motivo[:200])
+
     # Estudo que some depois: a avaliação BLOQUEIA (não lê outcomes alheios).
     async with db.get_session() as session:
         await session.execute(sql_text(
@@ -797,6 +1058,60 @@ async def run():
           str(LOADER_POS))
     LOADER_POS.clear()
 
+    # ── Vínculo AUSENTE: linha pré-seleção LEGADA, sem contrato congelado ──
+    async with db.get_session() as session:
+        await session.execute(sql_text(
+            "UPDATE strategy_experiments SET status = 'REJECTED' WHERE id = :i"),
+            {"i": legado_id})
+        legado_pre = E(experiment_key="legado-pre-sem-contrato",
+                       champion_hash="h-champ-pre", candidate_hash="h-cand-pre",
+                       status=evid.STATUS_OFFLINE_VALIDATED,
+                       objective=evid.OBJECTIVE_MORE_OPERATIONS,
+                       candidate_config=dict(envelope_a),
+                       dataset_fingerprint=fingerprint_estudo, dataset_cutoff=corte,
+                       offline_metrics={}, created_at=datetime.now(timezone.utc),
+                       updated_at=datetime.now(timezone.utc))
+        session.add(legado_pre)
+        await session.commit()
+        legado_pre_id = legado_pre.id
+    sem_vinculo = await evid.start_preselection_shadow(legado_pre_id)
+    check("shadow_recusa_vinculo_ausente",
+          sem_vinculo["ok"] is False
+          and sem_vinculo["reason_code"] == evid.FROZEN_MISSING,
+          str(sem_vinculo)[:200])
+    # O retorno IDEMPOTENTE também recusa: estar em SHADOW não dispensa vínculo.
+    async with db.get_session() as session:
+        await session.execute(sql_text(
+            "UPDATE strategy_experiments SET status = 'SHADOW' WHERE id = :i"),
+            {"i": legado_pre_id})
+        await session.commit()
+    idem_sem_vinculo = await evid.start_preselection_shadow(legado_pre_id)
+    check("idempotencia_nao_dispensa_o_vinculo",
+          idem_sem_vinculo["ok"] is False
+          and idem_sem_vinculo.get("idempotent") is None
+          and idem_sem_vinculo["reason_code"] == evid.FROZEN_MISSING,
+          str(idem_sem_vinculo)[:200])
+    AVALIADOR.clear()
+    with _patch.object(evid, "_load_shadow", loader_sentinela), \
+            _patch.object(evid, "evaluate_preselection_candidate",
+                          avaliador_sentinela):
+        avaliacao_legada = await evid.evaluate_shadow(legado_pre_id)
+    check("legado_sem_contrato_congelado_bloqueia_com_motivo",
+          avaliacao_legada["ok"] is False
+          and avaliacao_legada["reason_code"] == evid.FROZEN_MISSING
+          and avaliacao_legada["outcomes_read"] is False
+          and AVALIADOR == [] and LOADER_POS == [], str(avaliacao_legada)[:200])
+    async with db.get_session() as session:
+        offline_legado = (await session.execute(
+            sql_select(E.offline_metrics).where(E.id == legado_pre_id))).scalar_one()
+    check("bloqueio_nao_faz_backfill_de_identidade",
+          not (offline_legado or {}).get("study"), str(offline_legado)[:160])
+    async with db.get_session() as session:
+        await session.execute(sql_text(
+            "UPDATE strategy_experiments SET status = 'REJECTED' WHERE id = :i"),
+            {"i": legado_pre_id})
+        await session.commit()
+
     # Promoção declarada como NÃO IMPLEMENTADA (código por terminar).
     promocao = await evid.promote_preselection(exp_id)
     check("promocao_do_tipo_declarada_nao_implementada",
@@ -805,14 +1120,15 @@ async def run():
           and promocao["live_approval"] == "UNAVAILABLE", str(promocao)[:200])
 
     # Evidência insuficiente NÃO valida o candidato.
-    cfg_fraca = r12.tag_config({"SCORE_MIN": 75})
     estudo_fraco, _gf, _rf = rodar_estudo_real(oportunidades=8,
                                                universo="SYN-FIXTURE-FRACO")
+    cfg_fraca = envelope_de(estudo_fraco)
     ref_fraca, _ = await persistir_estudo(estudo_fraco, experimento="estudo-real-fraco",
                                           universo="SYN-FIXTURE-FRACO",
                                           periodo="P-FX-FRACO", chave="ev-fx-fraco")
     fraca = await evid.create_preselection_experiment(
-        champion=champion, config=cfg_fraca, objective=evid.OBJECTIVE_MORE_OPERATIONS,
+        champion=baseline_de(estudo_fraco), config=cfg_fraca,
+        objective=evid.OBJECTIVE_MORE_OPERATIONS,
         study_ref=ref_fraca,
         cutoff=datetime.fromtimestamp(int(estudo_fraco["cutoff_ms"]) / 1000.0,
                                       tz=timezone.utc),

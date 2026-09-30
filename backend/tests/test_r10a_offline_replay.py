@@ -700,8 +700,12 @@ class Isolation(unittest.TestCase):
                 self.assertNotIn(proibido, usados, f"{path.name}: {proibido}")
         # `portfolio_replay_service` (R10D) reutiliza o MOTOR de trajetória em
         # vez de criar um segundo backtest; como os demais, não toca o comparador.
+        # `preselection_experiment_service` (R12) reconstrói ReplayConfig/CostConfig
+        # para VALIDAR manifesto — é caminho OFFLINE, e a asserção acima já
+        # garante que nenhum deles chama o comparador.
         self.assertEqual(sorted(users), ["decision_observation_service.py",
                                          "portfolio_replay_service.py",
+                                         "preselection_experiment_service.py",
                                          "research_batch_service.py",
                                          "research_dataset_service.py"])
         main = (BACKEND / "main.py").read_text()

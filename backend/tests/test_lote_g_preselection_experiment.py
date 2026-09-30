@@ -360,15 +360,24 @@ class RelatorioEFronteiras(unittest.TestCase):
     def test_modulo_e_puro(self):
         arvore = ast.parse((BACKEND / "services" /
                             "preselection_experiment_service.py").read_text())
-        importados = set()
+        importados, de_servicos = set(), set()
         for node in ast.walk(arvore):
             if isinstance(node, ast.Import):
                 importados.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 importados.add(node.module.split(".")[0])
+                if node.module.split(".")[0] == "services":
+                    de_servicos.update(alias.name for alias in node.names)
+        # `services` entra por UM motivo só: validar manifesto reconstruindo o
+        # MOTOR offline (ReplayConfig/CostConfig) em vez de duplicar schema.
         self.assertEqual(importados - {"__future__"},
                          {"dataclasses", "datetime", "hashlib", "json", "math", "os",
-                          "typing"})
+                          "services", "typing"})
+        self.assertEqual(de_servicos, {"offline_replay_service"})
+        # Pureza preservada: nada de banco, exchange, rede ou execução.
+        for proibido in ("db", "httpx", "requests", "aiohttp", "binance",
+                         "order_service", "trade_manager_service"):
+            self.assertNotIn(proibido, importados, proibido)
 
     def test_modo_inativo_por_padrao(self):
         anterior = os.environ.pop(r12.MODE_ENV, None)
@@ -377,6 +386,130 @@ class RelatorioEFronteiras(unittest.TestCase):
         finally:
             if anterior is not None:
                 os.environ[r12.MODE_ENV] = anterior
+
+
+class EnvelopeFechadoDoTipo(unittest.TestCase):
+    """Contrato ÚNICO do runner ao catálogo: manifesto executado, não knob."""
+
+    def setUp(self):
+        from services import offline_replay_service as r10a
+        from services import strategy_evidence_service as evid
+        self.r10a, self.evid = r10a, evid
+        self.base = r10a.ReplayConfig()
+        self.cand = r10a.ReplayConfig(tp1_fraction=0.60, trail_atr_multiple=1.6,
+                                      be_lock_fraction=0.30)
+        self.custos = r10a.CostConfig(fee_bps_per_side=4.0, slippage_bps_per_side=2.0,
+                                      funding_bps_per_bar=1.0)
+        self.corte = datetime(2026, 9, 20, tzinfo=timezone.utc)
+
+    def contrato(self, *, candidata=None, custos=None, baseline=None,
+                 fingerprint="fp-1"):
+        return r12.preselection_contract(
+            population="SHADOW", study_kind="PRE_SELECTION",
+            policy_version="R11C_ROBUST_V1", universe_version="SYN-UNIT",
+            comparison_scope="MANAGEMENT_ONLY",
+            baseline_config=(baseline or self.base).manifest(),
+            candidate_config=(candidata or self.cand).manifest(),
+            costs_config=(custos or self.custos).manifest(),
+            bundle_hash="bundle-unit", dataset_fingerprint=fingerprint,
+            cutoff_ms=int(self.corte.timestamp() * 1000))
+
+    def estudo(self, contrato):
+        return {"population": "SHADOW", "study_kind": "PRE_SELECTION",
+                "contract": contrato, "contract_hash": contrato["contract_hash"],
+                "dataset_fingerprint": contrato["dataset_fingerprint"],
+                "cutoff_ms": contrato["cutoff_ms"],
+                "evidence": {"total_shadow_trades": 140}}
+
+    def envelope(self, contrato, candidata=None):
+        return r12.build_preselection_envelope(
+            replay_config=(candidata or self.cand).manifest(),
+            contract_hash=contrato["contract_hash"])
+
+    def test_envelope_com_manifesto_real_e_aceito(self):
+        contrato = self.contrato()
+        self.assertTrue(r12.validate_preselection_envelope(
+            self.envelope(contrato))["ok"])
+
+    def test_knob_placeholder_nao_e_candidata(self):
+        for valor in (71, 73, 74):
+            veredito = r12.validate_preselection_envelope(
+                r12.tag_config({"SCORE_MIN": valor}))
+            self.assertFalse(veredito["ok"], valor)
+            self.assertEqual(veredito["reason_code"], r12.ENVELOPE_INVALID)
+
+    def test_envelope_recusa_corpo_fora_do_schema(self):
+        contrato = self.contrato()
+        bom = self.envelope(contrato)
+        casos = {
+            "campo_extra": {**bom, "SCORE_MIN": 73},
+            "sem_contrato": {c: v for c, v in bom.items() if c != "contract_hash"},
+            "versao": {**bom, "experiment_type_version": 999},
+            "manifesto_parcial": {**bom, "replay_config": {"tp1_fraction": 0.6}},
+            "hash_interno": {**bom, "replay_config": {**bom["replay_config"],
+                                                      "config_hash": "trocado"}},
+        }
+        for nome, corpo in casos.items():
+            veredito = r12.validate_preselection_envelope(corpo)
+            self.assertFalse(veredito["ok"], nome)
+            self.assertIn(veredito["reason_code"],
+                          (r12.ENVELOPE_INVALID, r12.CONFIG_SCHEMA_INVALID), nome)
+
+    def test_manifesto_nao_recebe_default_silencioso(self):
+        parcial = {c: v for c, v in self.cand.manifest().items()
+                   if c not in ("tp1_fraction", "config_hash")}
+        self.assertFalse(r12.validate_replay_manifest(parcial)["ok"])
+        custos_parciais = {c: v for c, v in self.custos.manifest().items()
+                           if c != "fee_bps_per_side"}
+        self.assertFalse(r12.validate_costs_manifest(custos_parciais)["ok"])
+
+    def test_custos_separam_entrada_de_derivado(self):
+        manifesto = self.custos.manifest()
+        self.assertTrue(r12.validate_costs_manifest(manifesto)["ok"])
+        self.assertFalse(r12.validate_costs_manifest(
+            {**manifesto, "complete": not manifesto["complete"]})["ok"])
+        self.assertFalse(r12.validate_costs_manifest(
+            {**manifesto, "knob": 1})["ok"])
+
+    def test_outro_contrato_valido_nao_substitui_o_congelado(self):
+        a = self.contrato()
+        b = self.contrato(candidata=self.r10a.ReplayConfig(tp1_fraction=0.70,
+                                                           trail_atr_multiple=2.5),
+                          custos=self.r10a.CostConfig(fee_bps_per_side=7.0,
+                                                      slippage_bps_per_side=2.0,
+                                                      funding_bps_per_bar=1.0))
+        # B fecha consigo mesmo (todos os hashes refeitos): é ÍNTEGRO, não é o A.
+        self.assertEqual(r12.contract_hash_of(b), b["contract_hash"])
+        self.assertTrue(self.evid.verify_study_identity(
+            self.estudo(b), candidate_config=self.envelope(
+                b, self.r10a.ReplayConfig(tp1_fraction=0.70, trail_atr_multiple=2.5)),
+            fingerprint="fp-1", cutoff=self.corte)["ok"])
+        contra = self.evid.verify_study_against_frozen(
+            self.estudo(b), frozen={"contract": a, "contract_hash": a["contract_hash"]},
+            candidate_config=self.envelope(a), fingerprint="fp-1", cutoff=self.corte)
+        self.assertFalse(contra["ok"])
+        self.assertEqual(contra["reason_code"], self.evid.FROZEN_MISMATCH)
+        self.assertEqual(sorted(contra["diverged"]),
+                         ["candidate_config", "costs_config"])
+
+    def test_mesmo_contrato_confere_contra_si(self):
+        a = self.contrato()
+        veredito = self.evid.verify_study_against_frozen(
+            self.estudo(a), frozen={"contract": a, "contract_hash": a["contract_hash"]},
+            candidate_config=self.envelope(a), fingerprint="fp-1", cutoff=self.corte)
+        self.assertTrue(veredito["ok"], veredito)
+        self.assertEqual(veredito["frozen_contract_hash"], a["contract_hash"])
+
+    def test_sem_congelamento_verificavel_bloqueia(self):
+        a = self.contrato()
+        for congelado in ({}, {"contract": a}, {"contract_hash": a["contract_hash"]},
+                          {"contract": a, "contract_hash": "outro"}):
+            veredito = self.evid.verify_study_against_frozen(
+                self.estudo(a), frozen=congelado,
+                candidate_config=self.envelope(a), fingerprint="fp-1",
+                cutoff=self.corte)
+            self.assertFalse(veredito["ok"], congelado)
+            self.assertEqual(veredito["reason_code"], self.evid.FROZEN_MISSING)
 
 
 if __name__ == "__main__":

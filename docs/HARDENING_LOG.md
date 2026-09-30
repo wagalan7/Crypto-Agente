@@ -2125,3 +2125,61 @@ Nenhuma migração; nenhum default, limite ou flag alterado.
   integração positiva passou a usar os MOTORES reais (replay + walk-forward +
   gate) sobre fixture sintética congelada, sem métricas prontas.
   `py_compile` e `git diff --check` aprovados; nenhum TS/TSX alterado.
+
+## Fechamento A / H (29/09/2026, baseline `03862806`)
+
+Os dois achados da revisão dirigida eram VÍNCULOS entre componentes, não motores
+isolados. Detalhe em `docs/FECHAMENTO_A_H_03862806.md`. Nenhuma migração, tabela,
+coluna, ENV, flag, endpoint, scheduler ou fila nova; C intocado.
+
+- **A — o agregador olhava um incidente por vez.** Dois produtores OFICIAIS do
+  mesmo `client_order_id` (`FINAL_FILL_QTY_UNKNOWN` por `assemble_entry_incident`
+  e `ENTRY_SUBMISSION_UNKNOWN` por `recover_entry_intents`) podiam gravar provas
+  opostas — `POSITIVE` e `TERMINAL_ZERO` — sem marcador em nenhum dos dois, e o
+  positivo vencia: a intenção era liquidada como confirmada. Agora um coletor
+  único varre TODAS as provas daquele dispatch (ID exato; `-mfb` não é unida por
+  prefixo) e positivo + zero terminal dá `CONFLICT`. O bloqueio acontece ANTES de
+  consultar o vínculo RealTrade e de `mark_confirmed`/`mark_terminal`: o payload
+  determinístico vai para o incidente OFICIAL `ENTRY_SUBMISSION_UNKNOWN` daquela
+  identidade, com latch local, incidente e pausa P03 no MESMO commit, claim válido
+  e `MANUAL_REQUIRED` com `resolved_at=None`. Falha de claim/persistência mantém a
+  liquidação bloqueada e o latch armado — o ciclo seguinte conclui. Nada de kind,
+  tabela ou reconciliador novo; nada de criar/cancelar ordem, apagar SL ou
+  reenviar entrada. Primária zero + filha `-mfb` positiva segue reconciliando.
+- **H — integridade interna não era vínculo.** O catálogo validava/gravava um knob
+  P05: o MESMO estudo de replay era `STUDY_VERIFIED` com `SCORE_MIN=71`, `73` ou
+  `74`, e o manifesto `ReplayConfig` verdadeiro era recusado pela regra legada de
+  um knob. E a reavaliação não comparava o contrato recuperado com o congelado na
+  criação: outro contrato BEM FORMADO, com candidata/custos diferentes e TODOS os
+  hashes recalculados, passava e trocava a política avaliada. Agora existe um
+  envelope FECHADO — `{experiment_type, experiment_type_version, replay_config,
+  contract_hash}` — com o manifesto REALMENTE executado, produzido e conferido por
+  um par único de funções no serviço do tipo; manifestos são validados
+  RECONSTRUINDO `ReplayConfig`/`CostConfig` (entradas separadas dos derivados) e o
+  `contract_hash` dentro do envelope faz o `build_experiment_key` existente
+  distinguir mudança só de custos ou só de escopo. A criação congela uma cópia
+  independente do contrato; a reavaliação, o `start` do SHADOW e a idempotência do
+  upsert conferem o contrato ORIGINAL — sem congelamento verificável, bloqueiam
+  (`PRESELECTION_FROZEN_CONTRACT_MISSING`), sem backfill de identidade e sem
+  chamar avaliador, gate ou loader pós-seleção. Regra de um knob, knobs
+  permitidos, rejeição de múltiplos knobs e bloqueios cruzados do POST_SELECTION
+  ficaram intactos.
+- **RED medido na baseline:** A — `provas_opostas_em_incidentes_distintos` passa e
+  `conflito_cruzado_persistido` é `None`; H — knobs `[71, 73, 74]` aceitos para o
+  MESMO estudo, manifesto real recusado (`INVALID_CANDIDATE_CONFIG`) e contrato B
+  íntegro publicado na referência de A aceito pela reavaliação
+  (`OFFLINE_VALIDATED`) com hash congelado diferente. Os dois serviços foram
+  revertidos apenas no checkout local para a medição; nada commitado nesse estado.
+- **Testes:** suíte completa **2.378 executados, 2.376 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada, não fabricada); zero falhas/erros.
+  Harnesses PG (PostgreSQL 16 descartável UTF-8, socket Unix, driver real,
+  TCP/DNS bloqueados): `pg_integration_p03_conflict.py` 21 → **46**,
+  `pg_integration_r11_r12_pipeline.py` 93 → **138**, `pg_integration_r05_clock.py`
+  **10** (C, sem alteração). Segunda execução dos dois harnesses novos verde.
+  `py_compile` e `git diff --check` aprovados; nenhum TS/TSX alterado; cluster
+  descartável encerrado.
+- **Fora do escopo, sem mudança:** F continua `BLOCKED_MISSING_DECISION`,
+  adaptador LIVE e promoção pré-seleção não implementados, `ELIGIBLE` fechado,
+  posição BTC manual e arquivos pessoais preservados. Nenhum acesso a
+  produção/exchange, segredo, Telegram, push ou deploy. Não se declara ausência de
+  bugs.
