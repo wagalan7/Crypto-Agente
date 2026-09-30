@@ -140,11 +140,16 @@ async def _signed_post(path: str, body: dict) -> dict:
 # ─── High-level endpoints ──────────────────────────────────────────────────────
 
 
-async def get_wallet_balance(account_type: str = "UNIFIED") -> dict:
+async def get_wallet_balance(account_type: str = "UNIFIED", *,
+                             force: bool = False) -> dict:
     """
     Saldo da carteira. Bybit V5 unified margin (default).
     Retorna {ok, equity_usd, available_usd, raw}.
+
+    `force` é aceito por COMPATIBILIDADE de assinatura (este cliente não tem
+    cache local de saldo, então toda leitura já é direta).
     """
+    _ = force
     res = await _signed_get("/v5/account/wallet-balance", {"accountType": account_type})
     if not res.get("ok"):
         return res

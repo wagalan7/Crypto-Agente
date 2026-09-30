@@ -27,14 +27,29 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from db import Base
 
-#: Estados do reconhecimento. Só `ACTIVE` isenta o símbolo do orçamento BOT e
-#: permite encerrar o incidente UNTRACKED correspondente.
+#: Estados do reconhecimento. VALIDADE do reconhecimento e BLOQUEIO do símbolo
+#: são coisas diferentes: "não está ACTIVE" NUNCA significa "símbolo livre".
+#: Posição manual reconhecida e compatível. Símbolo bloqueado.
 STATE_ACTIVE = "ACTIVE"
-#: Identidade divergiu (qty/lado/versão temporal/conta) — autorização caiu.
+#: Identidade mudou/não corresponde mais. Símbolo CONTINUA bloqueado: é preciso
+#: nova confirmação administrativa ou encerramento comprovado.
 STATE_INVALIDATED = "INVALIDATED"
-#: Posição comprovadamente fechada — histórico preservado.
+#: Posição comprovadamente flat, mas restam ordens (ou não foi possível provar
+#: a ausência delas). Símbolo CONTINUA bloqueado.
+STATE_WAITING_ORDERS = "WAITING_ORDERS"
+#: Flat E ausência fresca de ordens comuns E condicionais, comprovadas antes da
+#: transição. Só aqui o símbolo volta a ficar livre.
 STATE_CLOSED = "CLOSED"
-ACK_STATES = (STATE_ACTIVE, STATE_INVALIDATED, STATE_CLOSED)
+#: Registro antigo substituído por NOVA confirmação administrativa explícita,
+#: atomicamente. É histórico — nunca transição automática por mudança de posição.
+STATE_SUPERSEDED = "SUPERSEDED"
+ACK_STATES = (STATE_ACTIVE, STATE_INVALIDATED, STATE_WAITING_ORDERS,
+              STATE_CLOSED, STATE_SUPERSEDED)
+#: Estados que BLOQUEIAM o símbolo. Mesmo predicado usado no transporte, na
+#: admissão, no reconciliador e no índice de unicidade.
+BLOCKING_STATES = (STATE_ACTIVE, STATE_INVALIDATED, STATE_WAITING_ORDERS)
+#: Estados ENCERRADOS (histórico). Não bloqueiam nem contam para unicidade.
+ENDED_STATES = (STATE_CLOSED, STATE_SUPERSEDED)
 
 #: Versão do contrato de identidade. Mudar a fórmula do fingerprint exige
 #: subir esta versão: reconhecimento de contrato antigo não vale para o novo.
@@ -70,6 +85,15 @@ class ManualPositionAcknowledgement(Base):
     incident_key: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
     #: Observações auditáveis do momento do reconhecimento (sem segredo).
     evidence: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    #: CAS: toda mudança de estado incrementa a revisão. Um scan atrasado não
+    #: pode fechar um reconhecimento mais novo.
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    #: Prova de VALIDAÇÃO: instante (ms), escopo e conta da última observação
+    #: fresca e completa que confirmou este registro. Nova exposição exige prova
+    #: válida e atual — ausência/expiração NEGA.
+    validated_at_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    validation_scope: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    validation_account: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     #: Quando saiu de ACTIVE (invalidado ou fechado). ACTIVE ⇒ NULL.
@@ -80,11 +104,13 @@ class ManualPositionAcknowledgement(Base):
         # Defesa NO BANCO: duas confirmações concorrentes jamais deixam dois
         # reconhecimentos ativos para a mesma posição.
         Index(
-            "uq_manual_ack_active",
+            "uq_manual_ack_open",
             "account_scope", "exchange", "market", "symbol",
             unique=True,
-            postgresql_where=text("state = 'ACTIVE'"),
-            sqlite_where=text("state = 'ACTIVE'"),
+            postgresql_where=text(
+                "state IN ('ACTIVE','INVALIDATED','WAITING_ORDERS')"),
+            sqlite_where=text(
+                "state IN ('ACTIVE','INVALIDATED','WAITING_ORDERS')"),
         ),
         Index("ix_manual_ack_state_symbol", "state", "symbol"),
     )
@@ -106,6 +132,11 @@ class ManualPositionAcknowledgement(Base):
             "fingerprint": self.fingerprint,
             "contract_version": self.contract_version,
             "state": self.state,
+            "revision": int(self.revision or 0),
+            "validated_at_ms": (int(self.validated_at_ms)
+                                if self.validated_at_ms is not None else None),
+            "validation_scope": self.validation_scope,
+            "validation_account": self.validation_account,
             "reason": self.reason,
             "identity_note": self.identity_note,
             "incident_key": self.incident_key,

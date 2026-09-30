@@ -2285,3 +2285,93 @@ nenhuma pausa real liberada.
 - **Fora do escopo, sem mudança:** estratégia, score, calibração, tier, filtros,
   stop/TP automático, sizing, limites, universo, alavancagem e flags existentes.
   Nada foi ativado. Não se declara ausência de bugs.
+
+## Correção integrada da convivência manual/bot (30/09/2026, baseline `69fd090a`)
+
+Sete defeitos da revisão `docs/REVISAO_69fd090a_MANUAL_BOT.md` corrigidos juntos.
+Os testes foram escritos ANTES (falhando na baseline) e viraram permanentes;
+nenhum serviço foi revertido para medir RED. Contrato de negócio inalterado:
+manual reconhecida fica fora do orçamento NOMINAL do bot, mas usa saldo/margem da
+MESMA conta — não há isolamento financeiro nem garantia de novas entradas.
+
+- **T1 — leitura parcial não prova ausência global.** `_manual_ack_outcome`
+  passava uma consulta FILTRADA de um símbolo ao validador que percorre todos os
+  reconhecimentos: consultar ALFA encerrava BETA e liberava o símbolo dela. Agora
+  a revalidação consome uma OBSERVAÇÃO com contrato explícito (conta,
+  exchange/mercado, escopo `ACCOUNT`/`SYMBOL`, completude/qualidade, janela real
+  da obtenção); `SYMBOL=ALFA` só altera ALFA, e varrer tudo exige observação de
+  CONTA completa. Linha malformada torna a observação INCOMPLETA em vez de ser
+  descartada em silêncio.
+- **T2 — flat encerrava sem conferir ordens.** `symbol_has_live_orders` só via
+  condicionais, e o fechamento acontecia sem consultá-las. Agora há
+  `get_open_orders` (`/fapi/v1/openOrders`, ordens COMUNS — `allOrders` com
+  `limit` é histórico truncado e não serve como prova) e as DUAS fontes são
+  exigidas: erro em qualquer uma mantém bloqueio. O estado `WAITING_ORDERS`
+  (posição flat, ordens presentes ou não confirmadas) BLOQUEIA o símbolo, e só
+  `CLOSED` — flat + duas listagens completas e vazias — libera. Nenhuma ordem do
+  operador é cancelada para alcançar ausência.
+- **T3 — sem incidente aberto, ninguém revalidava.** `reconcile_due` só
+  escaneava com `_boot_scan_safe=False` e a re-checagem só via incidentes
+  abertos. A revalidação passou a rodar em TODO ciclo (mesmo loop, sem scheduler
+  novo) e a gravar uma PROVA de validação (`validated_at_ms`, escopo, conta). O
+  guard exige prova fresca (`VALIDATION_MAX_AGE_S=900s`) antes de NOVA exposição;
+  manutenção protetiva de posição BOT em outro símbolo é isenta, para não deixar
+  posição comprovada sem stop. Transições usam CAS de `revision` sob a lock
+  `917283`: scan atrasado não fecha reconhecimento mais novo, e falha de
+  persistência propaga UNKNOWN em vez de lista vazia com sucesso.
+- **Estados separados de validade e bloqueio.** `ACTIVE`, `INVALIDATED`,
+  `WAITING_ORDERS` bloqueiam; `CLOSED` e `SUPERSEDED` não. O mesmo predicado
+  vale no transporte, na admissão, no reconciliador e no índice
+  (`uq_manual_ack_open` substitui `uq_manual_ack_active`, criado ANTES de o
+  antigo cair e sem apagar linha). Legado ambíguo fica fail-closed
+  (`MANUAL_ACK_REGISTRY_AMBIGUOUS`). Uma confirmação NOVA sobre um registro
+  invalidado grava `SUPERSEDED` no anterior e o novo `ACTIVE` na MESMA transação
+  — com fingerprint atual e `confirm` literal, nunca autoack.
+- **T4 — saldo de dez minutos aparecia como `live`.** `force` não chegava ao
+  cliente e o instante era regenerado. Agora `force` atravessa os dois caches,
+  cooldown com cache vira indisponível para quem pediu leitura fresca, e o
+  instante ORIGINAL + a qualidade (`live`/`cache`/`stale`) são preservados em
+  todas as camadas. A margem exige `available_usd` presente, finito, não-bool e
+  ≥ 0, fonte `live` e carimbo coerente — zero legítimo bloqueia proposta
+  positiva, ausente não vira zero, horário futuro não passa —, e a idade é
+  medida com o relógio obtido DEPOIS da espera pela lock.
+- **T5 — a carteira anterior ao fill autorizava outra proposta.** Criada a
+  tabela `account_margin_epochs` (contador monotônico por conta/exchange/mercado,
+  protegido pela lock existente): a carteira carrega a geração vigente e a
+  admissão recusa observação superada com `MARGIN_OBSERVATION_SUPERSEDED`.
+  Incrementam a geração NA MESMA TRANSAÇÃO: `reserve` (criação/aumento),
+  `admit_final_risk` (quando altera a própria reserva), `_resolve` com
+  `CONFIRMED`/`TERMINAL` e `release_reserved`. NÃO incrementam `mark_sending`,
+  `register_dispatch`, `mark_unknown` e `recover_stale` — não mudam a soma de
+  pendentes. A readmissão devolve a geração RESULTANTE, gravada em
+  `entry_intents.margin_generation`, e o `_intent_dispatch_guard` confere esse
+  token antes de CADA POST: readmissão concorrente exige nova admissão.
+- **T6 — o POST saía depois do reconhecimento.** O guard antecipado ficava antes
+  do throttle. `_signed_request` passou a receber um contexto INTERNO de mutação
+  e a COMPOR ownership com o `request_preflight` existente de lease/risco/quote,
+  reconferindo imediatamente antes de assinar — inclusive quando o caller não
+  fornece preflight e em cada retry/fallback. Cobertos `set_leverage`,
+  `cancel_order`, `cancel_algo_order`, `_place_algo` de cada perna de proteção,
+  `place_order` (MARKET/LIMIT/redução), maker + fallback e o fechamento
+  emergencial. Negação ⇒ `_request_sent=False` e nenhum POST/DELETE.
+- **T7 — `reserve` criava intenção em símbolo reconhecido.** Novo
+  `check_ownership_in_session` (somente banco, sem sessão própria e sem
+  exchange) roda em `reserve` E `admit_final_risk` depois da lock `917283` e
+  antes de conceder/gravar capacidade, para intenção nova E retomada, com conta,
+  exchange/mercado e símbolo/quote canônicos e todos os estados bloqueantes.
+- **Testes:** suíte completa **2.434 executados, 2.432 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada, não fabricada). Novos:
+  `tests/test_manual_bot_integrity.py` (24) e
+  `tests/pg_integration_manual_margin.py` (**43** verificações, inclui migração
+  vinda de `69fd090a`, barreiras reais em `pg_locks`, restart e caminho positivo
+  ponta a ponta com cliente HTTP falso). `pg_integration_manual_coexistence.py`
+  foi de 104 para **128**. Regressões PG: P03-conflito 66, R05-relógio 10,
+  R11/R12 138. Dirigidos executados 2×. `py_compile` e `git diff --check`
+  aprovados; nenhum TS/TSX alterado; clusters encerrados.
+- **Fora do escopo, sem mudança:** estratégia, calibração, limites, alavancagem
+  configurada, filtros, universo e defaults. Nenhum worker, fila, scheduler,
+  dashboard, ENV ou flag nova. Nenhum acesso à conta real, ordem, Telegram, push
+  ou deploy; nenhuma posição real reconhecida e nenhuma pausa real liberada.
+  Limite externo que permanece: mudanças feitas direto na corretora não
+  incrementam a geração local — a leitura fresca continua obrigatória e não há
+  atomicidade com a exchange. Não se declara ausência de bugs.

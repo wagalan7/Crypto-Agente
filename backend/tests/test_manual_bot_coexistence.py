@@ -97,6 +97,13 @@ class IdentidadeDaPosicao(unittest.TestCase):
 class GuardDePropriedade(unittest.IsolatedAsyncioTestCase):
     """Fail-closed: dúvida nunca libera mutação."""
 
+    @staticmethod
+    def _ack(**extra):
+        base = {"id": 1, "symbol": ALFA, "side": "buy", "state": "ACTIVE",
+                "account_scope": ESCOPO, "validated_at_ms": mps._now_ms()}
+        base.update(extra)
+        return base
+
     async def _guard(self, registro, symbol=ALFA):
         async def fake():
             return registro
@@ -109,7 +116,7 @@ class GuardDePropriedade(unittest.IsolatedAsyncioTestCase):
 
     async def test_simbolo_reconhecido_bloqueia_nos_dois_lados(self):
         registro = {"ok": True, "reason_code": "REGISTRY_READ",
-                    "acks": [{"id": 1, "symbol": ALFA, "side": "buy"}]}
+                    "acks": [self._ack()]}
         for alvo in (ALFA, "ALFAUSDT", "ALFA-USDT-USDT"):
             v = await self._guard(registro, alvo)
             self.assertFalse(v["allowed"], alvo)
@@ -117,7 +124,7 @@ class GuardDePropriedade(unittest.IsolatedAsyncioTestCase):
 
     async def test_outro_simbolo_continua_liberado(self):
         registro = {"ok": True, "reason_code": "REGISTRY_READ",
-                    "acks": [{"id": 1, "symbol": ALFA, "side": "buy"}]}
+                    "acks": [self._ack()]}
         v = await self._guard(registro, "BETA/USDT:USDT")
         self.assertTrue(v["allowed"])
 
@@ -129,7 +136,7 @@ class GuardDePropriedade(unittest.IsolatedAsyncioTestCase):
 
     async def test_simbolo_desconhecido_com_reconhecimento_ativo_bloqueia(self):
         registro = {"ok": True, "reason_code": "REGISTRY_READ",
-                    "acks": [{"id": 1, "symbol": ALFA, "side": "buy"}]}
+                    "acks": [self._ack()]}
         v = await self._guard(registro, None)
         self.assertFalse(v["allowed"])
         self.assertEqual(v["reason_code"], mps.GUARD_SYMBOL_UNKNOWN)
@@ -147,7 +154,9 @@ class TransporteNaoMutaSimboloManual(unittest.IsolatedAsyncioTestCase):
 
         async def registro():
             return {"ok": True, "reason_code": "REGISTRY_READ",
-                    "acks": [{"id": 1, "symbol": ALFA, "side": "buy"}]}
+                    "acks": [{"id": 1, "symbol": ALFA, "side": "buy",
+                              "state": "ACTIVE", "account_scope": ESCOPO,
+                              "validated_at_ms": mps._now_ms()}]}
 
         self._p = [patch.object(bss, "_signed_request", fake_signed),
                    patch.object(mps, "active_acknowledgements", registro),

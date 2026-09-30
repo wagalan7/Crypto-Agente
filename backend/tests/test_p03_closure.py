@@ -14,6 +14,7 @@ A exclusividade transacional e o fencing de desfecho ficam no PostgreSQL real
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import socket as _socket
 import unittest
 from pathlib import Path
@@ -71,8 +72,21 @@ class CapacidadeReal(unittest.IsolatedAsyncioTestCase):
             return intents.Reservation(intents.RESERVED_NEW, identity.intent_key,
                                        identity.client_order_id, "RESERVED")
 
+        # O gate de MARGEM real exige banco (geração) e carteira fresca; aqui a
+        # característica sob teste é a CAPACIDADE que chega à admissão, então a
+        # observação de margem é fornecida pronta — sem afrouxar o gate real.
+        async def fake_margin_gate(identity, *, entry, qty, leverage):
+            self.capturado["margin_identity"] = identity
+            return intents.MarginGate(
+                available_usd=1_000_000.0, required_usd=0.0,
+                as_of_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+                complete=True, account_ref=identity.account_ref,
+                exchange=identity.exchange, market="usdm_futures",
+                generation=0, quality="live")
+
         self._patches = [
             patch.object(intents, "reserve", fake_reserve),
+            patch.object(sts, "_margin_gate_for", fake_margin_gate),
             patch.object(sts, "_open_risk_usd", AsyncMock(return_value=0.0)),
             patch("services.binance_signed_service.accounting_scope", lambda: SCOPE_A),
         ]

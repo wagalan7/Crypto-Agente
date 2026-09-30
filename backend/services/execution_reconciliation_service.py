@@ -1824,18 +1824,42 @@ UNTRACKED_RECHECK_S = _f("P03_UNTRACKED_RECHECK_S", 900.0)
 _untracked_recheck_at: dict = {}
 
 
-async def _revalidate_manual_acks(raw_positions) -> dict:
-    """Revalida reconhecimentos manuais com a leitura fresca JÁ feita no ciclo.
+async def _revalidate_manual_acks(raw_positions, *, source_ok: bool = True) -> dict:
+    """Revalida reconhecimentos com a leitura de CONTA já feita no ciclo.
 
-    Nunca gasta uma segunda chamada à exchange e nunca converte erro em "sem
-    reconhecimento": `ok=False` mantém o bloqueio.
+    A observação é montada com escopo/completude explícitos: uma leitura
+    filtrada jamais revalida a conta inteira. Nunca gasta uma segunda chamada à
+    exchange e nunca converte erro em "sem reconhecimento": `ok=False` mantém o
+    bloqueio.
     """
     try:
         from services import manual_position_service as mps
-        return await mps.revalidate_active(
-            positions=mps.normalize_positions(raw_positions), observed_ok=True)
+        observacao = mps.observation_from_rows(raw_positions, source_ok=source_ok)
+        return await mps.revalidate_active(observation=observacao)
     except Exception as exc:  # noqa: BLE001
         log.error(f"[p03][manual-ack] revalidação falhou: {type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": "MANUAL_ACK_REVALIDATION_ERROR"}
+
+
+async def _revalidate_manual_acks_fresh() -> dict:
+    """Observação de CONTA própria, para o ciclo que não fez leitura de posições.
+
+    Integrada ao `reconcile_due` SEM depender de `_boot_scan_safe` nem da
+    existência de incidentes abertos: é essa revalidação recorrente que renova a
+    prova exigida antes de nova exposição.
+    """
+    try:
+        from services import manual_position_service as mps
+        registro = await mps.active_acknowledgements()
+        if not registro["ok"]:
+            return {"ok": False, "reason_code": registro["reason_code"]}
+        if not registro["acks"]:
+            return {"ok": True, "reason_code": "NO_BLOCKING_ACKS", "valid": []}
+        observacao = await mps.observe_positions()
+        return await mps.revalidate_active(observation=observacao)
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03][manual-ack] revalidação periódica falhou: "
+                  f"{type(exc).__name__}: {exc}")
         return {"ok": False, "reason_code": "MANUAL_ACK_REVALIDATION_ERROR"}
 
 
@@ -1856,11 +1880,18 @@ async def _manual_ack_outcome(inc: dict) -> dict:
         ack = vinculo["ack"]
         if ack is None:
             return {"state": None, "reason": "sem reconhecimento manual para o símbolo"}
-        leitura = await mps.observe_positions(mps.canonical_symbol(simbolo))
-        if not leitura["ok"]:
-            return {"state": None, "reason": f"leitura fresca indisponível ({leitura['reason_code']})"}
-        confere = await mps.revalidate_active(positions=leitura["positions"],
-                                              observed_ok=True)
+        if str(ack.get("state")) != "ACTIVE":
+            # INVALIDATED/WAITING_ORDERS continuam bloqueando o símbolo, mas
+            # NÃO encerram o incidente: falta confirmação nova.
+            return {"state": None,
+                    "reason": f"reconhecimento em {ack.get('state')} — não encerra a causa"}
+        # A observação usada aqui é do SÍMBOLO do incidente e só pode revalidar
+        # ELE. Nunca se passa uma leitura filtrada ao validador de conta.
+        observacao = await mps.observe_positions(mps.canonical_symbol(simbolo))
+        if not observacao["ok"]:
+            return {"state": None,
+                    "reason": f"leitura fresca indisponível ({observacao['reason_code']})"}
+        confere = await mps.revalidate_active(observation=observacao)
         if not confere["ok"]:
             return {"state": None, "reason": f"revalidação indisponível ({confere['reason_code']})"}
         if ack.get("id") not in (confere.get("valid") or []):
@@ -2566,6 +2597,18 @@ async def reconcile_due() -> dict:
             await _detect_untracked_positions()
         except Exception as exc:  # noqa: BLE001
             log.error(f"[p03] re-scan de boot falhou: {exc}")
+    else:
+        # Reconhecimentos manuais são revalidados em TODO ciclo, mesmo com boot
+        # seguro e ZERO incidentes abertos: é essa prova recorrente que o guard
+        # exige antes de nova exposição. Quando o bloco acima já rodou, a
+        # revalidação aconteceu lá com a MESMA leitura (sem chamada dupla).
+        try:
+            veredito = await _revalidate_manual_acks_fresh()
+            if not veredito.get("ok"):
+                log.warning("[p03][manual-ack] revalidação periódica incompleta: "
+                            f"{veredito.get('reason_code')}")
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[p03][manual-ack] revalidação periódica falhou: {exc}")
     processed = 0
     for inc in await repo.list_open():
         if processed >= RECONCILE_MAX_PER_CYCLE:

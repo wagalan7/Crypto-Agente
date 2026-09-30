@@ -70,7 +70,7 @@ class ProtectionCharacterizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_protection_creates_stop_and_two_take_profits(self):
         requests = []
 
-        async def signed_request(method, path, params=None):
+        async def signed_request(method, path, params=None, **kwargs):
             requests.append((method, path, dict(params or {})))
             return {"ok": True, "result": {"algoId": str(len(requests))}}
 
@@ -294,7 +294,7 @@ class EntryFailSafeTests(unittest.IsolatedAsyncioTestCase):
     async def test_partial_emergency_close_retries_only_remaining_qty(self):
         posts = []
 
-        async def post(_method, _path, params):
+        async def post(_method, _path, params, **kwargs):
             posts.append(dict(params))
             if len(posts) == 1:
                 return {"ok": True, "result": {
@@ -323,7 +323,7 @@ class EntryFailSafeTests(unittest.IsolatedAsyncioTestCase):
     async def test_decimal_remaining_never_drops_a_step_after_partial_fill(self):
         posts = []
 
-        async def post(_method, _path, params):
+        async def post(_method, _path, params, **kwargs):
             posts.append(dict(params))
             if len(posts) == 1:
                 return {"ok": True, "result": {

@@ -112,12 +112,13 @@ async def run():
             "SELECT indexname FROM pg_indexes WHERE tablename = 'manual_position_acks'"))).all()}
     check("migracao_idempotente_adiciona_margem_reservada",
           "reserved_margin_usd" in colunas, str(sorted(colunas))[:160])
-    check("indice_unico_parcial_do_reconhecimento",
-          "uq_manual_ack_active" in indices, str(sorted(indices)))
+    check("indice_unico_cobre_os_estados_bloqueantes",
+          "uq_manual_ack_open" in indices
+          and "uq_manual_ack_active" not in indices, str(sorted(indices)))
 
     # ── Exchange FALSA ────────────────────────────────────────────────────
     EXCHANGE = {"positions": [posicao()], "quality": "ok", "algos": [],
-                "algos_ok": True}
+                "algos_ok": True, "common": [], "common_ok": True}
     MUTACOES: list = []
 
     async def fake_get_positions(symbol=None, force=False, **kwargs):
@@ -142,6 +143,16 @@ async def run():
             linhas = [o for o in linhas if mps.symbol_key(o.get("symbol")) == alvo]
         return {"ok": True, "orders": linhas, "count": len(linhas)}
 
+    async def fake_open_orders(symbol=None, **kwargs):
+        """Ordens COMUNS — segunda fonte obrigatória da prova de ausência."""
+        if not EXCHANGE.get("common_ok", True):
+            return {"ok": False, "error": "openOrders indisponível"}
+        linhas = EXCHANGE.get("common", [])
+        if symbol:
+            alvo = mps.symbol_key(symbol)
+            linhas = [o for o in linhas if mps.symbol_key(o.get("symbol")) == alvo]
+        return {"ok": True, "orders": linhas, "count": len(linhas)}
+
     async def fake_signed_request(method, path, params=None, **kwargs):
         MUTACOES.append((method, path, dict(params or {})))
         return {"ok": True, "result": {}}
@@ -157,6 +168,7 @@ async def run():
     patches = [patch.object(exs, "get_positions", fake_get_positions),
                patch.object(bss, "get_positions", fake_get_positions),
                patch.object(bss, "get_open_algo_orders", fake_algo_orders),
+               patch.object(bss, "get_open_orders", fake_open_orders),
                patch.object(bss, "_signed_request", fake_signed_request),
                patch.object(bss, "_round_qty", fake_round_qty),
                patch.object(bss, "_get_symbol_filters", fake_filters)]
@@ -487,13 +499,23 @@ async def run():
             playbook="CHAMPION_LEGACY", playbook_version="SCORE_V2",
             purpose="ENTRY", trigger_candle_ms=trigger)
         agora_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        # Observação de carteira no contrato novo: identidade + geração vigente.
+        async with db.get_session() as session:
+            geracao = await intents.current_margin_generation(
+                session, account_ref=ident.account_ref, exchange=ident.exchange,
+                market="usdm_futures")
+            await session.commit()
         reserva = await intents.reserve(
             db.get_session, ident,
             {"entry": 100.0, "stop_loss": 95.0, "leverage": 5}, owner="w1",
             capacity=intents.Capacity(risk_usd=risco, max_open_positions=20,
                                       max_open_risk_usd=max_risk),
             margin=intents.MarginGate(available_usd=disponivel, required_usd=margem,
-                                      as_of_ms=agora_ms - idade_ms, complete=True))
+                                      as_of_ms=agora_ms - idade_ms, complete=True,
+                                      account_ref=ident.account_ref,
+                                      exchange=ident.exchange,
+                                      market="usdm_futures", generation=geracao,
+                                      quality="live"))
         return ident, reserva
 
     # A posição manual tem risco nominal MAIOR que o teto do bot e mesmo assim
@@ -517,10 +539,19 @@ async def run():
         account_ref=escopo, exchange="binance", symbol="EPS-USDT-USDT", quote="USDT",
         side="long", position_side="BOTH", timeframe="4h", playbook="CHAMPION_LEGACY",
         playbook_version="SCORE_V2", purpose="ENTRY", trigger_candle_ms=4)
+    async with db.get_session() as session:
+        g_x = await intents.current_margin_generation(
+            session, account_ref=ident_x.account_ref, exchange=ident_x.exchange,
+            market="usdm_futures")
+        await session.commit()
     desconhecida = await intents.reserve(
         db.get_session, ident_x, {"entry": 100.0, "stop_loss": 95.0, "leverage": 5},
-        owner="w1", margin=intents.MarginGate(available_usd=None, required_usd=10.0,
-                                              as_of_ms=1, complete=False))
+        owner="w1", margin=intents.MarginGate(
+            available_usd=None, required_usd=10.0,
+            as_of_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+            complete=False, account_ref=ident_x.account_ref,
+            exchange=ident_x.exchange, market="usdm_futures", generation=g_x,
+            quality="live"))
     check("margem_desconhecida_nao_vira_zero",
           desconhecida.granted is False
           and desconhecida.reason == "FREE_MARGIN_UNKNOWN", str(desconhecida))
@@ -598,11 +629,22 @@ async def run():
     # Dispatch FINAL maior que a reserva original é readmitido — e bloqueia se
     # não couber (nada de intervalo sem reserva na transição).
     vencedora = [r for r in (r_a, r_b) if r.granted][0]
+    async def gate_para(intent_key, disponivel, requerido):
+        async with db.get_session() as session:
+            linha = await intents.get_intent(db.get_session, intent_key)
+            g = await intents.current_margin_generation(
+                session, account_ref=linha.account_ref, exchange=linha.exchange,
+                market="usdm_futures")
+            await session.commit()
+        return intents.MarginGate(
+            available_usd=disponivel, required_usd=requerido,
+            as_of_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+            complete=True, account_ref=linha.account_ref, exchange=linha.exchange,
+            market="usdm_futures", generation=g, quality="live")
+
     maior = await intents.admit_final_risk(
         db.get_session, vencedora.intent_key, owner="w1", risk_usd=0.5,
-        margin=intents.MarginGate(
-            available_usd=100.0, required_usd=95.0,
-            as_of_ms=int(datetime.now(timezone.utc).timestamp() * 1000), complete=True))
+        margin=await gate_para(vencedora.intent_key, 100.0, 95.0))
     check("dispatch_final_maior_que_a_reserva_e_readmitido", maior.granted, str(maior))
     async with db.get_session() as session:
         atual = float((await session.execute(select(EntryIntent.reserved_margin_usd)
@@ -611,9 +653,7 @@ async def run():
     check("reserva_final_substitui_a_menor", abs(atual - 95.0) < 1e-6, str(atual))
     estourou = await intents.admit_final_risk(
         db.get_session, vencedora.intent_key, owner="w1", risk_usd=0.5,
-        margin=intents.MarginGate(
-            available_usd=100.0, required_usd=150.0,
-            as_of_ms=int(datetime.now(timezone.utc).timestamp() * 1000), complete=True))
+        margin=await gate_para(vencedora.intent_key, 100.0, 150.0))
     check("dispatch_que_nao_cabe_e_bloqueado",
           estourou.granted is False
           and estourou.reason == "INSUFFICIENT_FREE_MARGIN", str(estourou))
@@ -698,13 +738,15 @@ async def run():
         atual = [a for a in await acks() if a.id == registro.id][0]
         check(f"identidade_divergente_invalida_{nome}",
               registro.id in veredito["invalidated"]
-              and atual.state == STATE_INVALIDATED and atual.ended_at is not None,
+              and atual.state == STATE_INVALIDATED and atual.ended_at is None,
               f"{nome}: {atual.state}")
-        # Contenção reaberta: o símbolo volta a ficar livre do isento e a nova
-        # varredura recria o UNTRACKED.
-        livre_de_novo = await mps.ownership_guard(ALFA, action="entry")
-        check(f"apos_invalidar_o_simbolo_sai_da_isencao_{nome}",
-              livre_de_novo["allowed"] is True, str(livre_de_novo))
+        # INVALIDATED continua BLOQUEANDO: "não está ACTIVE" não significa
+        # "símbolo livre". É preciso nova confirmação ou encerramento provado.
+        ainda_bloqueado = await mps.ownership_guard(ALFA, action="entry")
+        check(f"apos_invalidar_o_simbolo_continua_bloqueado_{nome}",
+              ainda_bloqueado["allowed"] is False
+              and ainda_bloqueado["reason_code"] == mps.GUARD_MANUAL_SYMBOL,
+              str(ainda_bloqueado))
         scan_novo = await ers._detect_untracked_positions()
         check(f"contencao_reaberta_{nome}", scan_novo["status"] == "UNTRACKED",
               str(scan_novo))
@@ -712,7 +754,9 @@ async def run():
         async with db.get_session() as session:
             await session.execute(sql_update(Ack).where(Ack.id == registro.id)
                                   .values(state=STATE_ACTIVE, ended_at=None,
-                                          ended_reason=None))
+                                          ended_reason=None,
+                                          validated_at_ms=int(
+                                              datetime.now(timezone.utc).timestamp() * 1000)))
             await session.execute(text(
                 "UPDATE execution_incidents SET resolved_at = now(), "
                 "state = 'MANUAL_ACKNOWLEDGED' WHERE symbol = :s"), {"s": ALFA})
@@ -886,6 +930,211 @@ async def run():
     guard_miu = await mps.ownership_guard("MIU/USDT:USDT", action="entry")
     check("simbolo_sem_registro_nao_fica_isento", guard_miu["allowed"] is True,
           str(guard_miu))
+
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  16. Escopo da observação, estados bloqueantes e substituição explícita
+    # ══════════════════════════════════════════════════════════════════════
+    async with db.get_session() as session:
+        await session.execute(text("DELETE FROM manual_position_acks"))
+        await session.execute(text("DELETE FROM execution_incidents"))
+        await session.commit()
+    EXCHANGE["quality"] = "ok"
+    EXCHANGE["algos"], EXCHANGE["common"] = [], []
+    EXCHANGE["algos_ok"] = EXCHANGE["common_ok"] = True
+    EXCHANGE["positions"] = [posicao(), posicao(symbol="BETAUSDT")]
+    cand_alfa = await candidato_de(ALFA)
+    cand_beta = await candidato_de(BETA)
+    ack_alfa = await mps.acknowledge(symbol=ALFA,
+                                     expected_fingerprint=cand_alfa["fingerprint"],
+                                     confirm=True, reason="manual alfa")
+    ack_beta = await mps.acknowledge(symbol=BETA,
+                                     expected_fingerprint=cand_beta["fingerprint"],
+                                     confirm=True, reason="manual beta")
+    check("duas_posicoes_manuais_reconhecidas",
+          ack_alfa["ok"] and ack_beta["ok"], f"{ack_alfa.get('reason_code')} "
+          f"{ack_beta.get('reason_code')}")
+    id_beta = ack_beta["acknowledgement"]["id"]
+
+    # T1 no fluxo persistido: consulta só ALFA não altera BETA.
+    EXCHANGE["positions"] = [posicao(), posicao(symbol="BETAUSDT")]
+    observacao_alfa = await mps.observe_positions(ALFA)
+    check("observacao_declara_escopo_e_completude",
+          observacao_alfa["scope"] == mps.SCOPE_SYMBOL
+          and observacao_alfa["complete"] is True
+          and observacao_alfa["symbol_key"] == mps.symbol_key(ALFA),
+          str({k: observacao_alfa[k] for k in ("scope", "complete", "symbol_key")}))
+    await mps.revalidate_active(observation=observacao_alfa)
+    async with db.get_session() as session:
+        estado_beta = (await session.execute(
+            select(Ack.state).where(Ack.id == id_beta))).scalar()
+    check("consulta_de_alfa_nao_encerra_beta", estado_beta == STATE_ACTIVE,
+          str(estado_beta))
+    guarda_beta = await mps.ownership_guard(BETA, action="entry")
+    check("beta_continua_bloqueada_apos_consulta_de_alfa",
+          guarda_beta["allowed"] is False, str(guarda_beta))
+
+    # Observação de CONTA incompleta (linha malformada) não prova ausência.
+    EXCHANGE["positions"] = [posicao(), "linha-invalida"]
+    incompleta = await mps.observe_positions()
+    check("linha_malformada_torna_a_observacao_incompleta",
+          incompleta["ok"] is False and incompleta["complete"] is False,
+          str(incompleta)[:160])
+    veredito_incompleto = await mps.revalidate_active(observation=incompleta)
+    check("observacao_incompleta_nao_muda_nada",
+          veredito_incompleto["ok"] is False, str(veredito_incompleto)[:160])
+    async with db.get_session() as session:
+        ainda_ativos = int((await session.execute(
+            select(func.count(Ack.id)).where(Ack.state == STATE_ACTIVE))).scalar() or 0)
+    check("nenhum_reconhecimento_encerrado_por_leitura_incompleta",
+          ainda_ativos == 2, str(ainda_ativos))
+
+    # Flat + ordem COMUM do operador: não encerra; símbolo segue bloqueado.
+    EXCHANGE["positions"] = [posicao(symbol="BETAUSDT")]     # ALFA fechou
+    EXCHANGE["common"] = [{"symbol": ALFA_EX, "order_id": "77",
+                           "client_order_id": "operador-limit"}]
+    obs_conta = await mps.observe_positions()
+    await mps.revalidate_active(observation=obs_conta)
+    async with db.get_session() as session:
+        estado_alfa = (await session.execute(
+            select(Ack.state).where(Ack.symbol == ALFA,
+                                    Ack.state.in_(list(mps.BLOCKING_STATES)))
+        )).scalar()
+    check("flat_com_limit_manual_nao_encerra",
+          estado_alfa == "WAITING_ORDERS", str(estado_alfa))
+    guarda_alfa = await mps.ownership_guard(ALFA, action="entry")
+    check("waiting_orders_continua_bloqueando",
+          guarda_alfa["allowed"] is False
+          and guarda_alfa["reason_code"] == mps.GUARD_MANUAL_SYMBOL,
+          str(guarda_alfa))
+    check("nenhuma_ordem_do_operador_foi_cancelada",
+          all(p[1] != "/fapi/v1/order" and p[1] != "/fapi/v1/algoOrder"
+              for p in MUTACOES), str(MUTACOES)[:200])
+
+    # Falha numa das listagens também mantém o bloqueio.
+    EXCHANGE["common"], EXCHANGE["common_ok"] = [], False
+    obs_conta = await mps.observe_positions()
+    await mps.revalidate_active(observation=obs_conta)
+    async with db.get_session() as session:
+        estado_alfa = (await session.execute(
+            select(Ack.state).where(Ack.symbol == ALFA,
+                                    Ack.state.in_(list(mps.BLOCKING_STATES)))
+        )).scalar()
+    check("falha_de_listagem_nao_encerra", estado_alfa == "WAITING_ORDERS",
+          str(estado_alfa))
+    EXCHANGE["common_ok"] = True
+
+    # Duas listagens completas e vazias: agora encerra.
+    obs_conta = await mps.observe_positions()
+    await mps.revalidate_active(observation=obs_conta)
+    async with db.get_session() as session:
+        linha_alfa_final = (await session.execute(
+            select(Ack).where(Ack.symbol == ALFA).order_by(Ack.id.desc())
+        )).scalars().first()
+    check("duas_listagens_vazias_encerram",
+          linha_alfa_final.state == STATE_CLOSED
+          and linha_alfa_final.ended_at is not None, str(linha_alfa_final.state))
+    guarda_livre = await mps.ownership_guard(ALFA, action="entry")
+    check("simbolo_liberado_so_com_ausencia_comprovada",
+          guarda_livre["allowed"] is True, str(guarda_livre))
+
+    # Nova confirmação explícita substitui INVALIDATED atomicamente.
+    EXCHANGE["positions"] = [posicao(symbol="BETAUSDT", size="9.0")]
+    obs_conta = await mps.observe_positions()
+    await mps.revalidate_active(observation=obs_conta)
+    async with db.get_session() as session:
+        beta_estado = (await session.execute(
+            select(Ack.state).where(Ack.id == id_beta))).scalar()
+    check("identidade_divergente_invalida_sem_encerrar",
+          beta_estado == STATE_INVALIDATED, str(beta_estado))
+    cand_beta2 = await candidato_de(BETA)
+    ack_beta2 = await mps.acknowledge(symbol=BETA,
+                                      expected_fingerprint=cand_beta2["fingerprint"],
+                                      confirm=True, reason="nova confirmação")
+    check("nova_confirmacao_substitui_o_invalidado", ack_beta2["ok"],
+          str(ack_beta2)[:200])
+    async with db.get_session() as session:
+        linhas_beta = (await session.execute(
+            select(Ack.id, Ack.state).where(Ack.symbol == BETA)
+            .order_by(Ack.id))).all()
+    bloqueantes_beta = [l for l in linhas_beta if l[1] in mps.BLOCKING_STATES]
+    check("substituicao_nao_cria_duas_linhas_bloqueantes",
+          len(bloqueantes_beta) == 1 and len(linhas_beta) == 2,
+          str(linhas_beta))
+    check("historico_do_anterior_preservado_como_superseded",
+          any(l[0] == id_beta and l[1] == "SUPERSEDED" for l in linhas_beta),
+          str(linhas_beta))
+
+    # Scan ATRASADO (revisão antiga) não sobrescreve o reconhecimento novo.
+    novo_id = ack_beta2["acknowledgement"]["id"]
+    async with db.get_session() as session:
+        revisao_atual = (await session.execute(
+            select(Ack.revision).where(Ack.id == novo_id))).scalar()
+    atrasado = await mps._transition_acks([(novo_id, int(revisao_atual) - 1,
+                                            STATE_CLOSED, "scan atrasado")])
+    async with db.get_session() as session:
+        estado_novo = (await session.execute(
+            select(Ack.state).where(Ack.id == novo_id))).scalar()
+    check("scan_atrasado_nao_sobrescreve_ack_novo",
+          estado_novo == STATE_ACTIVE and novo_id in atrasado["stale"],
+          f"{estado_novo} {atrasado}")
+
+    # Falha de persistência propaga UNKNOWN (não vira lista vazia com ok=True).
+    async def transicao_quebrada(*args, **kwargs):
+        return {"ok": False, "changed": [], "by_state": [], "stale": [],
+                "detail": "RuntimeError"}
+
+    EXCHANGE["positions"] = [posicao(symbol="BETAUSDT", size="3.0")]
+    obs_conta = await mps.observe_positions()
+    with patch.object(mps, "_transition_acks", transicao_quebrada):
+        falha = await mps.revalidate_active(observation=obs_conta)
+    check("falha_de_persistencia_propaga_unknown",
+          falha["ok"] is False
+          and falha["reason_code"] == "MANUAL_ACK_PERSISTENCE_FAILED", str(falha))
+    async with db.get_session() as session:
+        beta_apos = (await session.execute(
+            select(Ack.state).where(Ack.id == novo_id))).scalar()
+    check("falha_de_persistencia_nao_libera_o_simbolo",
+          beta_apos in mps.BLOCKING_STATES, str(beta_apos))
+
+    # T3 persistido: ciclo oficial revalida mesmo com ZERO incidentes abertos.
+    async with db.get_session() as session:
+        await session.execute(text("DELETE FROM execution_incidents"))
+        await session.execute(text(
+            "UPDATE manual_position_acks SET validated_at_ms = 1 "
+            "WHERE state = ANY(:s)"), {"s": list(mps.BLOCKING_STATES)})
+        await session.commit()
+    # Identidade IGUAL à reconhecida em `ack_beta2` (size 9.0): o ciclo tem de
+    # revalidar e RENOVAR a prova, sem depender de incidente aberto.
+    EXCHANGE["positions"] = [posicao(symbol="BETAUSDT", size="9.0")]
+    ers._boot_scan_safe = True
+    ers._p03_latch_armed = False
+    await ers.reconcile_due()
+    async with db.get_session() as session:
+        prova = (await session.execute(
+            select(Ack.validated_at_ms).where(Ack.id == novo_id))).scalar()
+    check("ciclo_revalida_sem_incidente_aberto",
+          prova is not None and int(prova) > 1, str(prova))
+    guarda_nova = await mps.ownership_guard("OUTRO/USDT:USDT", action="entry",
+                                            require_fresh_proof=True)
+    check("prova_fresca_autoriza_outro_simbolo", guarda_nova["allowed"] is True,
+          str(guarda_nova))
+    async with db.get_session() as session:
+        await session.execute(text(
+            "UPDATE manual_position_acks SET validated_at_ms = 1 "
+            "WHERE state = ANY(:s)"), {"s": list(mps.BLOCKING_STATES)})
+        await session.commit()
+    guarda_velha = await mps.ownership_guard("OUTRO/USDT:USDT", action="entry",
+                                             require_fresh_proof=True)
+    check("prova_vencida_nao_autoriza_nova_exposicao",
+          guarda_velha["allowed"] is False
+          and guarda_velha["reason_code"] == mps.GUARD_PROOF_STALE,
+          str(guarda_velha))
+    protetiva = await mps.ownership_guard("OUTRO/USDT:USDT",
+                                          action="place_protection_orders",
+                                          require_fresh_proof=True)
+    check("protecao_de_outro_simbolo_nao_depende_da_prova",
+          protetiva["allowed"] is True, str(protetiva))
 
     await db._engine.dispose()
     print(f"MANUAL_BOT_PG_OK: {len(CHECKS)} verificações — reconhecimento explícito, "

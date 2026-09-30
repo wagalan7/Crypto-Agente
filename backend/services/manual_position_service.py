@@ -67,6 +67,41 @@ GUARD_OK = "OWNERSHIP_OK"
 GUARD_MANUAL_SYMBOL = "MANUAL_POSITION_SYMBOL_BLOCKED"
 GUARD_REGISTRY_UNAVAILABLE = "MANUAL_ACK_REGISTRY_UNAVAILABLE"
 GUARD_SYMBOL_UNKNOWN = "MANUAL_OWNERSHIP_SYMBOL_UNKNOWN"
+#: A prova de validação do reconhecimento venceu (ou nunca existiu). NOVA
+#: exposição exige prova fresca; manutenção protetiva de posição BOT não exige.
+GUARD_PROOF_STALE = "MANUAL_ACK_PROOF_STALE"
+GUARD_AMBIGUOUS_REGISTRY = "MANUAL_ACK_REGISTRY_AMBIGUOUS"
+
+#: Estados do reconhecimento que BLOQUEIAM o símbolo. Importados do modelo para
+#: que transporte, admissão, reconciliador e índice usem o MESMO predicado.
+try:  # pragma: no cover - fallback só para import parcial em ferramentas
+    from models.manual_position_ack import (BLOCKING_STATES, ENDED_STATES,
+                                            STATE_ACTIVE, STATE_CLOSED,
+                                            STATE_INVALIDATED, STATE_SUPERSEDED,
+                                            STATE_WAITING_ORDERS)
+except Exception:  # noqa: BLE001
+    STATE_ACTIVE, STATE_INVALIDATED = "ACTIVE", "INVALIDATED"
+    STATE_WAITING_ORDERS, STATE_CLOSED = "WAITING_ORDERS", "CLOSED"
+    STATE_SUPERSEDED = "SUPERSEDED"
+    BLOCKING_STATES = (STATE_ACTIVE, STATE_INVALIDATED, STATE_WAITING_ORDERS)
+    ENDED_STATES = (STATE_CLOSED, STATE_SUPERSEDED)
+
+#: Idade MÁXIMA (s) da PROVA DE VALIDAÇÃO de um reconhecimento para autorizar
+#: NOVA exposição. O ciclo oficial renova essa prova; vencida, nega e deixa o
+#: ciclo atualizar — sem HTTP recursivo dentro do transporte.
+VALIDATION_MAX_AGE_S = 900.0
+
+#: Escopos possíveis de uma OBSERVAÇÃO de posições.
+SCOPE_ACCOUNT = "ACCOUNT"
+SCOPE_SYMBOL = "SYMBOL"
+
+#: Ações que NÃO são nova exposição: manutenção protetiva/redutora de uma
+#: posição BOT já existente. Elas continuam exigindo ownership do símbolo, mas
+#: não exigem prova de validação fresca — travá-las deixaria posição BOT
+#: comprovada sem stop por causa de um reconhecimento de OUTRO símbolo.
+PROTECTIVE_ACTIONS = ("place_protection_orders", "cancel_order",
+                      "cancel_algo_order", "trade_manager", "emergency_close",
+                      "reduce_only")
 
 _QUOTES = ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH", "BNB")
 
@@ -239,49 +274,93 @@ def current_account_scope() -> Optional[str]:
     return escopo if isinstance(escopo, str) and escopo.strip() else None
 
 
-async def observe_positions(symbol: Optional[str] = None) -> Dict[str, Any]:
-    """Leitura FRESCA das posições, normalizada para a identidade.
+def _observation(*, ok: bool, reason_code: str, positions: List[dict],
+                 scope: str, symbol: Optional[str], complete: bool,
+                 started_ms: Optional[int] = None, ended_ms: Optional[int] = None,
+                 account_scope: Optional[str] = None,
+                 detail: Optional[str] = None) -> Dict[str, Any]:
+    """Contrato EXPLÍCITO de uma observação de posições.
 
-    Stale, rate-limited, erro ou fonte não configurada ⇒ `ok=False` com motivo:
-    fonte incerta NUNCA autoriza reconhecimento nem liberação.
+    Lista vazia só prova ausência quando a resposta é COMPLETA e FRESCA para o
+    alvo declarado. Uma observação `SYMBOL=ALFA` não diz nada sobre BETA.
     """
+    fim = ended_ms if ended_ms is not None else _now_ms()
+    return {"ok": bool(ok), "reason_code": reason_code,
+            "positions": list(positions), "scope": scope,
+            "symbol": (canonical_symbol(symbol) if symbol else None),
+            "symbol_key": (symbol_key(symbol) if symbol else None),
+            "complete": bool(complete and ok),
+            "observed_start_ms": started_ms if started_ms is not None else fim,
+            "observed_end_ms": fim, "observed_at_ms": fim,
+            "account_scope": account_scope, "exchange": EXCHANGE_BINANCE,
+            "market": MARKET_USDM_FUTURES, "detail": detail}
+
+
+async def observe_positions(symbol: Optional[str] = None) -> Dict[str, Any]:
+    """Leitura FRESCA das posições, com escopo e completude EXPLÍCITOS.
+
+    Stale, rate-limited, erro, fonte não configurada, formato desconhecido ou
+    linha com campo essencial inválido ⇒ `ok=False`/`complete=False`: fonte
+    incerta NUNCA autoriza reconhecimento nem liberação, e nenhuma linha
+    inválida é descartada em silêncio para depois concluir flat.
+    """
+    escopo = SCOPE_SYMBOL if symbol else SCOPE_ACCOUNT
+    conta = current_account_scope()
+    inicio = _now_ms()
+
+    def falha(reason_code, detalhe):
+        return _observation(ok=False, reason_code=reason_code, positions=[],
+                            scope=escopo, symbol=symbol, complete=False,
+                            started_ms=inicio, account_scope=conta,
+                            detail=detalhe)
+
     try:
         from services import binance_signed_service as bss
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason_code": ACK_POSITION_UNKNOWN,
-                "detail": type(exc).__name__, "positions": [], "observed_at_ms": None}
+        return falha(ACK_POSITION_UNKNOWN, type(exc).__name__)
     try:
         if not bss.is_configured():
-            return {"ok": False, "reason_code": ACK_POSITION_UNKNOWN,
-                    "detail": "exchange não configurada", "positions": [],
-                    "observed_at_ms": None}
+            return falha(ACK_POSITION_UNKNOWN, "exchange não configurada")
         res = await bss.get_positions(symbol, force=True)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason_code": ACK_POSITION_UNKNOWN,
-                "detail": type(exc).__name__, "positions": [], "observed_at_ms": None}
+        return falha(ACK_POSITION_UNKNOWN, type(exc).__name__)
     if not isinstance(res, dict) or not res.get("ok") or res.get("stale") \
             or res.get("rate_limited"):
-        return {"ok": False, "reason_code": ACK_POSITION_UNKNOWN,
-                "detail": "leitura stale/rate-limited/indisponível", "positions": [],
-                "observed_at_ms": None}
-    linhas = normalize_positions(res.get("positions"))
-    return {"ok": True, "reason_code": "POSITIONS_FRESH", "positions": linhas,
-            "observed_at_ms": _now_ms()}
+        return falha(ACK_POSITION_UNKNOWN, "leitura stale/rate-limited/indisponível")
+    linhas, completo = normalize_positions(res.get("positions"))
+    if not completo:
+        return falha(ACK_POSITION_UNKNOWN, "linha de posição malformada na resposta")
+    if escopo == SCOPE_SYMBOL:
+        alvo = symbol_key(symbol)
+        linhas = [p for p in linhas if p.get("symbol_key") == alvo]
+    return _observation(ok=True, reason_code="POSITIONS_FRESH", positions=linhas,
+                        scope=escopo, symbol=symbol, complete=True,
+                        started_ms=inicio, account_scope=conta)
 
 
-def normalize_positions(raw: Any) -> List[dict]:
-    """Normaliza linhas JÁ lidas de `get_positions` (sem nova chamada HTTP).
+def normalize_positions(raw: Any) -> tuple:
+    """`(linhas, completo)` a partir de linhas JÁ lidas de `get_positions`.
 
-    Reaproveitado pelo reconciliador: ele já fez a leitura fresca do ciclo e
-    não pode gastar outra chamada só para revalidar reconhecimentos.
+    Reaproveitado pelo reconciliador, que já fez a leitura fresca do ciclo. Uma
+    linha em formato desconhecido ou com qty inválida marca a normalização como
+    INCOMPLETA — descartá-la em silêncio permitiria concluir "flat" a partir de
+    uma resposta que não foi entendida.
     """
-    linhas = []
-    for bruta in (raw or ()):
+    linhas, completo = [], True
+    if raw is None:
+        return linhas, completo
+    if not isinstance(raw, (list, tuple)):
+        return linhas, False
+    for bruta in raw:
         if not isinstance(bruta, Mapping):
+            completo = False
             continue
         quantidade = canonical_decimal(bruta.get("size"))
-        if quantidade is None or quantidade <= 0:
+        if quantidade is None:
+            completo = False
             continue
+        if quantidade <= 0:
+            continue                      # posição zerada não é linha inválida
         linhas.append({
             "symbol": canonical_symbol(bruta.get("symbol")),
             "symbol_key": symbol_key(bruta.get("symbol")),
@@ -292,7 +371,25 @@ def normalize_positions(raw: Any) -> List[dict]:
             "entry_price": canonical_decimal(bruta.get("entry_price")),
             "update_time_ms": canonical_update_time_ms(bruta.get("update_time_ms")),
         })
-    return linhas
+    return linhas, completo
+
+
+def observation_from_rows(raw: Any, *, symbol: Optional[str] = None,
+                          source_ok: bool = True,
+                          started_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Observação a partir de linhas JÁ lidas no ciclo (sem nova chamada HTTP)."""
+    escopo = SCOPE_SYMBOL if symbol else SCOPE_ACCOUNT
+    linhas, completo = normalize_positions(raw)
+    if not source_ok or not completo:
+        return _observation(ok=False, reason_code=ACK_POSITION_UNKNOWN,
+                            positions=[], scope=escopo, symbol=symbol,
+                            complete=False, started_ms=started_ms,
+                            account_scope=current_account_scope(),
+                            detail="leitura incompleta ou malformada")
+    return _observation(ok=True, reason_code="POSITIONS_FRESH", positions=linhas,
+                        scope=escopo, symbol=symbol, complete=True,
+                        started_ms=started_ms,
+                        account_scope=current_account_scope())
 
 
 def _leg_for_symbol(positions: List[dict], chave: str) -> Dict[str, Any]:
@@ -343,10 +440,12 @@ def _contract_version() -> str:
 #  Registro persistido (leitura) e GUARD de propriedade
 # ════════════════════════════════════════════════════════════════════════════
 async def active_acknowledgements() -> Dict[str, Any]:
-    """Reconhecimentos ACTIVE persistidos.
+    """Reconhecimentos em estado BLOQUEANTE (ACTIVE/INVALIDATED/WAITING_ORDERS).
 
-    Erro de leitura devolve `ok=False` — registro inacessível NÃO vira lista
-    vazia (isso liberaria o símbolo manual) nem exceção solta no chamador.
+    "Não está ACTIVE" NÃO significa "símbolo livre": só `CLOSED` (flat provado
+    + ausência fresca de ordens) e `SUPERSEDED` (substituído por confirmação
+    nova) deixam de bloquear. Erro de leitura devolve `ok=False` — registro
+    inacessível não vira lista vazia nem exceção solta no chamador.
     """
     try:
         from db import DB_ENABLED, get_session
@@ -359,11 +458,10 @@ async def active_acknowledgements() -> Dict[str, Any]:
         return {"ok": True, "reason_code": "REGISTRY_DISABLED", "acks": []}
     try:
         from models.manual_position_ack import ManualPositionAcknowledgement as Ack
-        from models.manual_position_ack import STATE_ACTIVE
         from sqlalchemy import select
         async with get_session() as session:
             linhas = (await session.execute(
-                select(Ack).where(Ack.state == STATE_ACTIVE))).scalars().all()
+                select(Ack).where(Ack.state.in_(list(BLOCKING_STATES))))).scalars().all()
             return {"ok": True, "reason_code": "REGISTRY_READ",
                     "acks": [linha.to_public() for linha in linhas]}
     except Exception as exc:  # noqa: BLE001
@@ -372,17 +470,41 @@ async def active_acknowledgements() -> Dict[str, Any]:
                 "detail": type(exc).__name__, "acks": []}
 
 
-async def ownership_guard(symbol: Any = None, *, action: str = "mutate") -> Dict[str, Any]:
+def validation_proof_age_s(ack: Mapping) -> Optional[float]:
+    """Idade (s) da prova de validação. `None` quando não há prova."""
+    carimbo = (ack or {}).get("validated_at_ms")
+    if carimbo in (None, "") or isinstance(carimbo, bool):
+        return None
+    try:
+        valor = int(carimbo)
+    except (TypeError, ValueError):
+        return None
+    if valor <= 0:
+        return None
+    return max(0.0, (_now_ms() - valor) / 1000.0)
+
+
+def _proof_is_fresh(ack: Mapping) -> bool:
+    idade = validation_proof_age_s(ack)
+    return idade is not None and idade <= VALIDATION_MAX_AGE_S
+
+
+async def ownership_guard(symbol: Any = None, *, action: str = "mutate",
+                          require_fresh_proof: bool = False) -> Dict[str, Any]:
     """GUARD ÚNICO: o bot pode tocar neste símbolo/conta?
 
     Contrato fail-closed:
 
     - registro ilegível ⇒ BLOQUEIA (não sabemos se o símbolo é manual);
-    - símbolo reconhecido como manual ⇒ BLOQUEIA (inclusive direção contrária
-      e hedge — neste pacote o símbolo inteiro fica indisponível);
-    - símbolo DESCONHECIDO pelo chamador, havendo algum reconhecimento ativo
+    - símbolo em estado BLOQUEANTE ⇒ BLOQUEIA (inclusive direção contrária e
+      hedge — neste pacote o símbolo inteiro fica indisponível);
+    - símbolo DESCONHECIDO pelo chamador, havendo registro bloqueante
       ⇒ BLOQUEIA (prova inconclusiva não autoriza mutação);
-    - sem reconhecimento ativo ⇒ LIBERA (comportamento anterior preservado).
+    - `require_fresh_proof` (NOVA exposição): algum registro bloqueante sem
+      prova de validação fresca ⇒ BLOQUEIA. Manutenção protetiva de posição BOT
+      em OUTRO símbolo não exige essa prova, senão um reconhecimento alheio
+      deixaria a posição do bot sem stop;
+    - sem registro bloqueante ⇒ LIBERA (comportamento anterior preservado).
 
     NÃO consulta a exchange: é chamado de dentro de locks/semáforos do próprio
     transporte, onde I/O HTTP recursivo é proibido.
@@ -401,12 +523,28 @@ async def ownership_guard(symbol: Any = None, *, action: str = "mutate") -> Dict
         return {"allowed": False, "reason_code": GUARD_SYMBOL_UNKNOWN,
                 "action": action, "symbol": None,
                 "detail": "símbolo não identificado com reconhecimento manual ativo"}
-    for ack in acks:
-        if symbol_key(ack.get("symbol")) == chave:
-            return {"allowed": False, "reason_code": GUARD_MANUAL_SYMBOL,
-                    "action": action, "symbol": ack.get("symbol"),
-                    "ack_id": ack.get("id"), "side": ack.get("side"),
-                    "detail": "símbolo com posição manual reconhecida"}
+    do_simbolo = [a for a in acks if symbol_key(a.get("symbol")) == chave]
+    if len(do_simbolo) > 1:
+        # Legado ambíguo: NÃO se escolhe uma linha. Fail-closed e visível.
+        return {"allowed": False, "reason_code": GUARD_AMBIGUOUS_REGISTRY,
+                "action": action, "symbol": canonical_symbol(symbol),
+                "detail": f"{len(do_simbolo)} registros bloqueantes no símbolo"}
+    if do_simbolo:
+        ack = do_simbolo[0]
+        return {"allowed": False, "reason_code": GUARD_MANUAL_SYMBOL,
+                "action": action, "symbol": ack.get("symbol"),
+                "ack_id": ack.get("id"), "side": ack.get("side"),
+                "ack_state": ack.get("state"),
+                "detail": "símbolo com posição manual reconhecida"}
+    if require_fresh_proof and str(action) not in PROTECTIVE_ACTIONS:
+        vencidos = [a for a in acks if not _proof_is_fresh(a)]
+        if vencidos:
+            return {"allowed": False, "reason_code": GUARD_PROOF_STALE,
+                    "action": action, "symbol": canonical_symbol(symbol),
+                    "ack_ids": [a.get("id") for a in vencidos],
+                    "detail": ("reconhecimento manual sem validação fresca — "
+                               "o ciclo oficial precisa revalidar antes de nova "
+                               "exposição")}
     return {"allowed": True, "reason_code": GUARD_OK, "action": action,
             "symbol": canonical_symbol(symbol)}
 
@@ -580,25 +718,53 @@ async def _open_bot_orders(chave: str, identities: Mapping) -> Dict[str, Any]:
 
 
 async def symbol_has_live_orders(symbol: Any) -> Dict[str, Any]:
-    """Há ordens/condicionais VIVAS naquele símbolo? Incerteza ⇒ `ok=False`.
+    """Há ordens VIVAS naquele símbolo? DUAS fontes reais; incerteza ⇒ `ok=False`.
 
-    Usado após o fechamento comprovado da posição manual: enquanto restarem
-    ordens do operador, o símbolo continua indisponível para o bot — e elas
-    NÃO são canceladas.
+    Fontes: ordens COMUNS abertas (`openOrders`) e ALGO/condicionais
+    (`openAlgoOrders`). O banco do bot não conhece as LIMIT abertas pelo
+    operador, então provar ausência exige a corretora.
+
+    Erro em QUALQUER fonte, resposta incompleta ou formato desconhecido =
+    ausência NÃO comprovada. Nenhuma ordem é cancelada para alcançar ausência.
     """
     chave = symbol_key(symbol)
+    canonico = canonical_symbol(chave)
     try:
         from services import binance_signed_service as bss
-        res = await bss.get_open_algo_orders(canonical_symbol(chave))
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN, "detail": type(exc).__name__}
-    if not isinstance(res, dict) or not res.get("ok"):
         return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
-                "detail": "listagem de condicionais indisponível"}
-    vivas = [o for o in (res.get("orders") or [])
-             if isinstance(o, Mapping) and symbol_key(o.get("symbol")) == chave]
-    return {"ok": True, "reason_code": "ORDERS_READ", "live": len(vivas) > 0,
-            "count": len(vivas)}
+                "detail": type(exc).__name__}
+    fontes = {"algo": getattr(bss, "get_open_algo_orders", None),
+              "common": getattr(bss, "get_open_orders", None)}
+    total, detalhes = 0, {}
+    for nome, leitor in fontes.items():
+        if leitor is None:
+            # Capability ausente é INCERTEZA: o símbolo continua bloqueado.
+            return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
+                    "detail": f"fonte de ordens ausente: {nome}"}
+        try:
+            res = await leitor(canonico)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
+                    "detail": f"{nome}: {type(exc).__name__}"}
+        if not isinstance(res, dict) or not res.get("ok"):
+            return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
+                    "detail": f"{nome}: listagem indisponível"}
+        linhas = res.get("orders")
+        if not isinstance(linhas, (list, tuple)):
+            return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
+                    "detail": f"{nome}: formato desconhecido"}
+        vivas = 0
+        for ordem in linhas:
+            if not isinstance(ordem, Mapping):
+                return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
+                        "detail": f"{nome}: linha em formato desconhecido"}
+            if symbol_key(ordem.get("symbol")) == chave:
+                vivas += 1
+        detalhes[nome] = vivas
+        total += vivas
+    return {"ok": True, "reason_code": "ORDERS_READ", "live": total > 0,
+            "count": total, "by_source": detalhes}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -740,7 +906,7 @@ async def _persist_acknowledgement(*, account_scope: str, chave: str, posicao: M
                                    open_orders: Optional[int]) -> Dict[str, Any]:
     from db import get_session
     from models.execution_incident import ExecutionIncident
-    from models.manual_position_ack import (ACK_CONTRACT_VERSION, STATE_ACTIVE,
+    from models.manual_position_ack import (ACK_CONTRACT_VERSION,
                                             ManualPositionAcknowledgement as Ack)
     from services.entry_intent_service import RISK_LOCK_KEY
     from sqlalchemy import select, text
@@ -763,22 +929,45 @@ async def _persist_acknowledgement(*, account_scope: str, chave: str, posicao: M
                 if motivo:
                     raise _AckRefused(motivo, {k: v for k, v in detalhe.items()
                                                if k != "identities"})
-                existente = (await session.execute(
+                # TODOS os registros BLOQUEANTES daquela identidade, não só os
+                # ACTIVE: um INVALIDATED/WAITING_ORDERS continua bloqueando e
+                # precisa ser substituído explicitamente.
+                bloqueantes = (await session.execute(
                     select(Ack).where(Ack.account_scope == account_scope,
                                       Ack.exchange == EXCHANGE_BINANCE,
                                       Ack.market == MARKET_USDM_FUTURES,
                                       Ack.symbol == canonical_symbol(chave),
-                                      Ack.state == STATE_ACTIVE)
-                    .with_for_update())).scalar_one_or_none()
-                if existente is not None:
-                    if existente.fingerprint == fingerprint:
+                                      Ack.state.in_(list(BLOCKING_STATES)))
+                    .with_for_update())).scalars().all()
+                if len(bloqueantes) > 1:
+                    # Legado ambíguo: NÃO se escolhe uma linha. Fail-closed.
+                    raise _AckRefused(GUARD_AMBIGUOUS_REGISTRY,
+                                      {"blocking_rows": len(bloqueantes)})
+                anterior = bloqueantes[0] if bloqueantes else None
+                if anterior is not None:
+                    if (anterior.state == STATE_ACTIVE
+                            and anterior.fingerprint == fingerprint):
                         # Repetir a MESMA confirmação é idempotente.
                         return {"ok": True, "acknowledged": True, "idempotent": True,
                                 "reason_code": ACK_IDEMPOTENT,
-                                "acknowledgement": existente.to_public(),
+                                "acknowledgement": anterior.to_public(),
                                 "note": _POST_NOTE}
-                    raise _AckRefused(ACK_CONFLICTING_ACTIVE,
-                                      {"active_fingerprint": existente.fingerprint})
+                    if anterior.state == STATE_ACTIVE:
+                        # Registro ATIVO com identidade diferente: substituir
+                        # exigiria invalidar antes. Recusa explícita.
+                        raise _AckRefused(ACK_CONFLICTING_ACTIVE,
+                                          {"active_fingerprint": anterior.fingerprint})
+                    # INVALIDATED/WAITING_ORDERS: esta confirmação NOVA (com
+                    # fingerprint atual e `confirm` literal) substitui o anterior
+                    # como SUPERSEDED — histórico preservado, sem duas linhas
+                    # bloqueantes e sem autoack.
+                    anterior.state = STATE_SUPERSEDED
+                    anterior.revision = int(anterior.revision or 0) + 1
+                    anterior.ended_at = agora
+                    anterior.updated_at = agora
+                    anterior.ended_reason = _short(
+                        "substituído por nova confirmação administrativa", 120)
+                    await session.flush()
                 # Vínculo ATÔMICO com a causa UNTRACKED daquele símbolo.
                 untracked = [linha for linha in (detalhe.get("untracked") or ())]
                 incident_key = untracked[0]["incident_key"] if len(untracked) == 1 else None
@@ -796,8 +985,15 @@ async def _persist_acknowledgement(*, account_scope: str, chave: str, posicao: M
                     evidence={"observed_at_ms": int(observed_at_ms),
                               "read_age_s": round(idade_s, 2),
                               "open_conditional_orders": open_orders,
+                              "superseded_ack_id": (anterior.id if anterior is not None
+                                                    else None),
                               "untracked_incidents": [l["incident_key"] for l in untracked]},
-                    created_at=agora, updated_at=agora, ended_at=None, ended_reason=None)
+                    created_at=agora, updated_at=agora, ended_at=None,
+                    ended_reason=None, revision=1,
+                    # A própria confirmação é uma validação fresca do símbolo.
+                    validated_at_ms=int(observed_at_ms),
+                    validation_scope=SCOPE_SYMBOL,
+                    validation_account=account_scope)
                 session.add(registro)
                 if incident_key:
                     incidente = (await session.execute(
@@ -851,54 +1047,101 @@ def _short(value: Any, limit: int) -> Optional[str]:
 # ════════════════════════════════════════════════════════════════════════════
 #  Revalidação — chamada pelo reconciliador oficial (boot e ciclos)
 # ════════════════════════════════════════════════════════════════════════════
-async def revalidate_active(*, positions: Optional[List[dict]] = None,
+async def revalidate_active(*, observation: Optional[Dict[str, Any]] = None,
+                            positions: Optional[List[dict]] = None,
                             observed_ok: Optional[bool] = None) -> Dict[str, Any]:
-    """Confere cada reconhecimento ACTIVE contra a leitura FRESCA da conta.
+    """Confere os reconhecimentos BLOQUEANTES contra uma OBSERVAÇÃO explícita.
 
-    - identidade idêntica ⇒ permanece ACTIVE;
-    - qty/lado/positionSide/versão temporal/conta divergentes ⇒ INVALIDATED
-      (a autorização anterior cai; é preciso novo reconhecimento);
-    - posição comprovadamente ausente ⇒ CLOSED, preservando histórico e sem
-      cancelar nenhuma ordem do operador;
-    - leitura incerta ou registro ilegível ⇒ NADA muda e `ok=False`: UNKNOWN
-      mantém o bloqueio, nunca libera.
+    A observação declara escopo (`ACCOUNT`/`SYMBOL`), completude e instante.
+    Regras:
+
+    - observação `SYMBOL=X` só pode alterar X. Percorrer todos os registros
+      exige observação `ACCOUNT` completa — uma consulta filtrada NUNCA prova
+      ausência de um símbolo que não foi consultado;
+    - observação incompleta/stale/malformada ⇒ `ok=False`, nada muda;
+    - identidade idêntica ⇒ permanece ACTIVE e ganha prova de validação;
+    - identidade divergente ⇒ `INVALIDATED` — o símbolo CONTINUA bloqueado até
+      nova confirmação administrativa ou encerramento comprovado;
+    - posição ausente ⇒ só vira `CLOSED` com ausência FRESCA de ordens comuns
+      E condicionais; qualquer incerteza vira `WAITING_ORDERS` (bloqueado);
+    - atualização sob a advisory lock `917283` com CAS de revisão: um scan
+      atrasado não fecha um reconhecimento mais novo.
     """
+    if observation is None:
+        # Compatibilidade com chamadores antigos: lista nua é tratada como
+        # observação de CONTA e sua completude tem de ser declarada.
+        if positions is None:
+            observation = await observe_positions()
+        else:
+            observation = observation_from_rows(
+                positions, source_ok=(observed_ok is not False))
+    if not isinstance(observation, Mapping):
+        return {"ok": False, "reason_code": ACK_POSITION_UNKNOWN, "valid": [],
+                "invalidated": [], "closed": [], "waiting": []}
+    if not observation.get("ok") or not observation.get("complete"):
+        return {"ok": False, "reason_code": observation.get("reason_code")
+                or ACK_POSITION_UNKNOWN, "valid": [], "invalidated": [],
+                "closed": [], "waiting": []}
+    idade_s = max(0.0, (_now_ms() - int(observation.get("observed_end_ms")
+                                        or _now_ms())) / 1000.0)
+    if idade_s > ACK_MAX_READ_AGE_S:
+        return {"ok": False, "reason_code": ACK_READ_TOO_OLD, "valid": [],
+                "invalidated": [], "closed": [], "waiting": []}
     registro = await active_acknowledgements()
     if not registro["ok"]:
         return {"ok": False, "reason_code": registro["reason_code"],
-                "valid": [], "invalidated": [], "closed": []}
+                "valid": [], "invalidated": [], "closed": [], "waiting": []}
     if not registro["acks"]:
-        return {"ok": True, "reason_code": "NO_ACTIVE_ACKS", "valid": [],
-                "invalidated": [], "closed": []}
-    if positions is None:
-        leitura = await observe_positions()
-        if not leitura["ok"]:
-            return {"ok": False, "reason_code": leitura["reason_code"],
-                    "valid": [], "invalidated": [], "closed": []}
-        positions = leitura["positions"]
-    elif observed_ok is False:
-        return {"ok": False, "reason_code": ACK_POSITION_UNKNOWN,
-                "valid": [], "invalidated": [], "closed": []}
+        return {"ok": True, "reason_code": "NO_BLOCKING_ACKS", "valid": [],
+                "invalidated": [], "closed": [], "waiting": []}
     escopo = current_account_scope()
     if not escopo:
-        # Conta/credencial trocada invalida TODAS as autorizações anteriores.
-        alterados = await _end_acks([a["id"] for a in registro["acks"]],
-                                    state_final="INVALIDATED",
-                                    reason="conta/credencial não comprovada")
+        # Conta/credencial não comprovada: nenhuma autorização anterior vale.
+        resultado = await _transition_acks(
+            [(a["id"], a.get("revision"), STATE_INVALIDATED,
+              "conta/credencial não comprovada") for a in registro["acks"]])
         return {"ok": False, "reason_code": ACK_NO_ACCOUNT, "valid": [],
-                "invalidated": alterados, "closed": []}
-    validos, invalidados, fechados = [], [], []
-    for ack in registro["acks"]:
+                "invalidated": resultado["changed"], "closed": [], "waiting": [],
+                "persisted": resultado["ok"]}
+    # A chave do alvo é derivada quando o chamador só declarou o símbolo.
+    alvo = observation.get("symbol_key") or symbol_key(observation.get("symbol"))
+    escopo_obs = str(observation.get("scope") or SCOPE_ACCOUNT)
+    if escopo_obs == SCOPE_SYMBOL and not alvo:
+        # Escopo SYMBOL sem alvo identificável não revalida nada.
+        return {"ok": False, "reason_code": ACK_POSITION_UNKNOWN, "valid": [],
+                "invalidated": [], "closed": [], "waiting": []}
+    do_escopo = [a for a in registro["acks"]
+                 if escopo_obs == SCOPE_ACCOUNT
+                 or symbol_key(a.get("symbol")) == alvo]
+    fora_do_escopo = [a["id"] for a in registro["acks"] if a not in do_escopo]
+    posicoes = observation.get("positions") or []
+    validos, transicoes = [], []
+    for ack in do_escopo:
         chave = symbol_key(ack.get("symbol"))
         if str(ack.get("account_scope") or "") != escopo:
-            invalidados.append((ack["id"], "conta divergente"))
+            transicoes.append((ack["id"], ack.get("revision"), STATE_INVALIDATED,
+                               "conta divergente"))
             continue
-        perna = _leg_for_symbol(positions, chave)
+        perna = _leg_for_symbol(posicoes, chave)
         if not perna["ok"]:
-            if perna["reason_code"] == ACK_POSITION_ABSENT:
-                fechados.append((ack["id"], "posição ausente em leitura fresca"))
+            if perna["reason_code"] != ACK_POSITION_ABSENT:
+                transicoes.append((ack["id"], ack.get("revision"),
+                                   STATE_INVALIDATED, "pernas ambíguas no símbolo"))
+                continue
+            # Flat COMPROVADO. Encerrar exige ausência fresca de ordens; nada é
+            # cancelado para conseguir isso.
+            ordens = await symbol_has_live_orders(ack.get("symbol"))
+            if not ordens.get("ok"):
+                transicoes.append((ack["id"], ack.get("revision"),
+                                   STATE_WAITING_ORDERS,
+                                   "ordens do símbolo não confirmadas"))
+            elif ordens.get("live"):
+                transicoes.append((ack["id"], ack.get("revision"),
+                                   STATE_WAITING_ORDERS,
+                                   f"{ordens.get('count')} ordem(ns) do operador viva(s)"))
             else:
-                invalidados.append((ack["id"], "pernas ambíguas no símbolo"))
+                transicoes.append((ack["id"], ack.get("revision"), STATE_CLOSED,
+                                   "posição e ordens ausentes em leitura fresca"))
             continue
         posicao = perna["position"]
         atual = position_fingerprint(
@@ -908,56 +1151,223 @@ async def revalidate_active(*, positions: Optional[List[dict]] = None,
             entry_price=posicao["entry_price"],
             update_time_ms=posicao["update_time_ms"],
             contract_version=ack.get("contract_version") or _contract_version())
-        if atual is not None and atual == ack.get("fingerprint"):
+        if atual is not None and atual == ack.get("fingerprint") \
+                and ack.get("state") == STATE_ACTIVE:
+            validos.append(ack["id"])
+        elif atual is not None and atual == ack.get("fingerprint"):
+            # Compatível, mas o registro já não está ACTIVE (INVALIDATED/
+            # WAITING_ORDERS): só uma NOVA confirmação administrativa reativa.
             validos.append(ack["id"])
         else:
-            invalidados.append((ack["id"], "identidade divergente da reconhecida"))
-    mudou_inv = await _end_acks([i for i, _ in invalidados], state_final="INVALIDATED",
-                                reasons=dict(invalidados))
-    mudou_fech = await _end_acks([i for i, _ in fechados], state_final="CLOSED",
-                                 reasons=dict(fechados))
-    return {"ok": True, "reason_code": "REVALIDATED", "valid": validos,
-            "invalidated": mudou_inv, "closed": mudou_fech}
+            transicoes.append((ack["id"], ack.get("revision"), STATE_INVALIDATED,
+                               "identidade divergente da reconhecida"))
+    aplicadas = await _transition_acks(transicoes)
+    prova = await record_validation_proof(
+        validos, account_scope=escopo, scope=str(observation.get("scope")),
+        validated_at_ms=int(observation.get("observed_end_ms") or _now_ms()))
+    persistiu = aplicadas["ok"] and prova.get("ok", True)
+    return {"ok": persistiu, "reason_code": ("REVALIDATED" if persistiu
+                                             else "MANUAL_ACK_PERSISTENCE_FAILED"),
+            "valid": validos,
+            "invalidated": [i for i, s in aplicadas["by_state"] if s == STATE_INVALIDATED],
+            "closed": [i for i, s in aplicadas["by_state"] if s == STATE_CLOSED],
+            "waiting": [i for i, s in aplicadas["by_state"] if s == STATE_WAITING_ORDERS],
+            "out_of_scope": fora_do_escopo, "scope": observation.get("scope"),
+            "persisted": persistiu}
+
+
+async def _transition_acks(transicoes: List[tuple]) -> Dict[str, Any]:
+    """Aplica transições com CAS de revisão, sob a advisory lock `917283`.
+
+    `transicoes` = [(id, revisao_lida, estado_final, motivo)]. A linha só muda
+    se a revisão no banco ainda for a lida: um scan atrasado não sobrescreve um
+    reconhecimento mais novo. Falha de persistência devolve `ok=False` — nunca
+    lista vazia com `ok=True`.
+    """
+    if not transicoes:
+        return {"ok": True, "changed": [], "by_state": [], "stale": []}
+    try:
+        from db import get_session
+        from models.manual_position_ack import ManualPositionAcknowledgement as Ack
+        from services.entry_intent_service import RISK_LOCK_KEY
+        from sqlalchemy import select, text
+        agora = _now()
+        alterados, por_estado, obsoletos = [], [], []
+        async with get_session() as session:
+            async with session.begin():
+                await session.execute(text("SELECT pg_advisory_xact_lock(:k)"),
+                                      {"k": RISK_LOCK_KEY})
+                ids = [int(i) for i, _r, _s, _m in transicoes]
+                linhas = {linha.id: linha for linha in (await session.execute(
+                    select(Ack).where(Ack.id.in_(ids))
+                    .with_for_update())).scalars().all()}
+                for identificador, revisao, estado_final, motivo in transicoes:
+                    linha = linhas.get(int(identificador))
+                    if linha is None:
+                        obsoletos.append(int(identificador))
+                        continue
+                    if revisao is not None and int(linha.revision or 0) != int(revisao):
+                        obsoletos.append(int(identificador))   # CAS perdido
+                        continue
+                    if linha.state in ENDED_STATES:
+                        obsoletos.append(int(identificador))
+                        continue
+                    linha.state = estado_final
+                    linha.revision = int(linha.revision or 0) + 1
+                    linha.updated_at = agora
+                    linha.ended_reason = _short(motivo, 120)
+                    linha.ended_at = agora if estado_final in ENDED_STATES else None
+                    alterados.append(linha.id)
+                    por_estado.append((linha.id, estado_final))
+        return {"ok": True, "changed": alterados, "by_state": por_estado,
+                "stale": obsoletos}
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[manual-ack] transição falhou: {type(exc).__name__}: {exc}")
+        return {"ok": False, "changed": [], "by_state": [], "stale": [],
+                "detail": type(exc).__name__}
+
+
+async def record_validation_proof(ids: List[int], *, account_scope: str,
+                                  scope: str, validated_at_ms: int) -> Dict[str, Any]:
+    """Grava a PROVA de validação dos reconhecimentos confirmados agora.
+
+    É essa prova que o guard consulta antes de autorizar NOVA exposição — ele
+    apenas LÊ e compara, sem HTTP recursivo. Falha devolve `ok=False`.
+    """
+    if not ids:
+        return {"ok": True, "updated": []}
+    try:
+        from db import get_session
+        from models.manual_position_ack import ManualPositionAcknowledgement as Ack
+        from sqlalchemy import select
+        agora = _now()
+        atualizados = []
+        async with get_session() as session:
+            async with session.begin():
+                linhas = (await session.execute(
+                    select(Ack).where(Ack.id.in_([int(i) for i in ids]))
+                    .with_for_update())).scalars().all()
+                for linha in linhas:
+                    if linha.state in ENDED_STATES:
+                        continue
+                    linha.validated_at_ms = int(validated_at_ms)
+                    linha.validation_scope = str(scope)[:16]
+                    linha.validation_account = str(account_scope)[:64]
+                    linha.updated_at = agora
+                    atualizados.append(linha.id)
+        return {"ok": True, "updated": atualizados}
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[manual-ack] prova de validação falhou: "
+                  f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "updated": [], "detail": type(exc).__name__}
 
 
 async def _end_acks(ids: List[int], *, state_final: str,
                     reason: Optional[str] = None,
-                    reasons: Optional[dict] = None) -> List[int]:
-    """Encerra reconhecimentos preservando histórico (nunca apaga a linha)."""
-    if not ids:
-        return []
+                    reasons: Optional[dict] = None) -> Dict[str, Any]:
+    """Compat: encerra reconhecimentos sem CAS (chamadores antigos).
+
+    Devolve o MESMO contrato de `_transition_acks`: falha de persistência é
+    `ok=False`, nunca lista vazia com sucesso.
+    """
+    return await _transition_acks([
+        (int(i), None, state_final, (reasons or {}).get(i) or reason or state_final)
+        for i in (ids or ())])
+
+
+def ownership_from_rows(rows: Any, *, account_scope: Any, exchange: Any,
+                        market: Any, symbol: Any, action: str = "mutate",
+                        require_fresh_proof: bool = False) -> Dict[str, Any]:
+    """Veredicto de ownership a partir de linhas JÁ lidas NA transação.
+
+    PURO: não abre sessão, não chama exchange e não consulta cache de processo.
+    É o núcleo de `check_ownership_in_session`.
+    """
+    chave = symbol_key(symbol)
+    conta = str(account_scope or "").strip()
+    if not conta or "/" not in chave:
+        return {"allowed": False, "reason_code": GUARD_SYMBOL_UNKNOWN,
+                "action": action,
+                "detail": "conta/símbolo canônicos indisponíveis"}
+    alvo = []
+    for linha in (rows or ()):
+        dados = linha if isinstance(linha, Mapping) else getattr(linha, "__dict__", {})
+        if str(dados.get("account_scope") or "") != conta:
+            continue
+        if str(dados.get("exchange") or "").lower() != str(exchange or "").lower():
+            continue
+        if str(dados.get("market") or "").lower() != str(market or "").lower():
+            continue
+        if str(dados.get("state")) not in BLOCKING_STATES:
+            continue
+        if symbol_key(dados.get("symbol")) != chave:
+            continue
+        alvo.append(dados)
+    if len(alvo) > 1:
+        return {"allowed": False, "reason_code": GUARD_AMBIGUOUS_REGISTRY,
+                "action": action, "symbol": canonical_symbol(chave),
+                "detail": f"{len(alvo)} registros bloqueantes no símbolo"}
+    if alvo:
+        return {"allowed": False, "reason_code": GUARD_MANUAL_SYMBOL,
+                "action": action, "symbol": canonical_symbol(chave),
+                "ack_id": alvo[0].get("id"), "ack_state": alvo[0].get("state"),
+                "detail": "símbolo com posição manual reconhecida"}
+    if require_fresh_proof and str(action) not in PROTECTIVE_ACTIONS:
+        vencidos = []
+        for linha in (rows or ()):
+            dados = linha if isinstance(linha, Mapping) else getattr(linha, "__dict__", {})
+            if str(dados.get("state")) not in BLOCKING_STATES:
+                continue
+            if str(dados.get("account_scope") or "") != conta:
+                continue
+            if not _proof_is_fresh(dados):
+                vencidos.append(dados.get("id"))
+        if vencidos:
+            return {"allowed": False, "reason_code": GUARD_PROOF_STALE,
+                    "action": action, "symbol": canonical_symbol(chave),
+                    "ack_ids": vencidos,
+                    "detail": "reconhecimento manual sem validação fresca"}
+    return {"allowed": True, "reason_code": GUARD_OK, "action": action,
+            "symbol": canonical_symbol(chave)}
+
+
+async def check_ownership_in_session(session, *, account_scope: Any,
+                                     exchange: Any, market: Any, symbol: Any,
+                                     action: str = "reserve",
+                                     require_fresh_proof: bool = True
+                                     ) -> Dict[str, Any]:
+    """Ownership DENTRO da transação da admissão (só banco).
+
+    Roda DEPOIS de adquirir a lock `917283` e ANTES de conceder/gravar
+    capacidade. Não abre sessão própria, não chama exchange e não confia em
+    cache de processo. Registro/prova indisponível = NEGAÇÃO.
+    """
     try:
-        from db import get_session
-        from models.manual_position_ack import STATE_ACTIVE
         from models.manual_position_ack import ManualPositionAcknowledgement as Ack
         from sqlalchemy import select
-        agora = _now()
-        alterados = []
-        async with get_session() as session:
-            async with session.begin():
-                linhas = (await session.execute(
-                    select(Ack).where(Ack.id.in_(list(ids)), Ack.state == STATE_ACTIVE)
-                    .with_for_update())).scalars().all()
-                for linha in linhas:
-                    linha.state = state_final
-                    linha.ended_at = agora
-                    linha.updated_at = agora
-                    linha.ended_reason = _short(
-                        (reasons or {}).get(linha.id) or reason or state_final, 120)
-                    alterados.append(linha.id)
-        return alterados
+        linhas = (await session.execute(
+            select(Ack).where(Ack.state.in_(list(BLOCKING_STATES))))).scalars().all()
     except Exception as exc:  # noqa: BLE001
-        log.error(f"[manual-ack] encerramento falhou: {type(exc).__name__}: {exc}")
-        return []
+        log.error(f"[manual-ack] ownership na transação falhou: "
+                  f"{type(exc).__name__}: {exc}")
+        return {"allowed": False, "reason_code": GUARD_REGISTRY_UNAVAILABLE,
+                "action": action, "detail": type(exc).__name__}
+    return ownership_from_rows(
+        [linha.to_public() for linha in linhas], account_scope=account_scope,
+        exchange=exchange, market=market, symbol=symbol, action=action,
+        require_fresh_proof=require_fresh_proof)
 
 
 async def ack_for_symbol(symbol: Any) -> Dict[str, Any]:
-    """Reconhecimento ACTIVE daquele símbolo (ou None). Erro ⇒ `ok=False`."""
+    """Reconhecimento BLOQUEANTE daquele símbolo (ou None). Erro ⇒ `ok=False`."""
     registro = await active_acknowledgements()
     if not registro["ok"]:
         return {"ok": False, "reason_code": registro["reason_code"], "ack": None}
     chave = symbol_key(symbol)
-    for ack in registro["acks"]:
-        if symbol_key(ack.get("symbol")) == chave:
-            return {"ok": True, "reason_code": "ACK_FOUND", "ack": ack}
+    encontrados = [a for a in registro["acks"]
+                   if symbol_key(a.get("symbol")) == chave]
+    if len(encontrados) > 1:
+        return {"ok": False, "reason_code": GUARD_AMBIGUOUS_REGISTRY, "ack": None}
+    if encontrados:
+        return {"ok": True, "reason_code": "ACK_FOUND", "ack": encontrados[0]}
     return {"ok": True, "reason_code": "ACK_ABSENT", "ack": None}

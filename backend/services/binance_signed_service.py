@@ -303,8 +303,40 @@ async def _signed_request(
     params: Optional[dict] = None,
     *,
     request_preflight: Optional[Callable[[], Awaitable[object]]] = None,
+    mutation: Optional[dict] = None,
 ) -> dict:
+    """`mutation` é um contexto INTERNO (conta/símbolo/ação) — nunca vai para a
+    Binance. Quando presente, a propriedade do símbolo é reconferida DEPOIS do
+    throttle e imediatamente antes de assinar/enviar, COMPONDO (nunca
+    substituindo) o `request_preflight` existente de lease/risco/quote.
+
+    Isso é obrigatório mesmo quando o caller não fornece `request_preflight`: o
+    transporte não pode pular ownership por falta de guard financeiro.
+    """
     global _ban_until_ms, _throttle_until_ms, _used_weight_1m
+    if mutation is not None:
+        _original_preflight = request_preflight
+
+        async def _com_ownership() -> object:
+            # 1. Preflights EXISTENTES primeiro, preservando resultado/erro.
+            verdict: object = True
+            if _original_preflight is not None:
+                verdict = await _original_preflight()
+                aprovado = verdict is True or (
+                    isinstance(verdict, dict) and verdict.get("ok") is True)
+                if not aprovado:
+                    return verdict
+            # 2. Ownership IMEDIATAMENTE antes de assinar/enviar.
+            bloqueio = await _manual_ownership_block(
+                mutation.get("symbol"), str(mutation.get("action") or "mutate"))
+            if bloqueio is not None:
+                return {"ok": False, "quality": "UNKNOWN",
+                        "reason_code": bloqueio.get("reason_code"),
+                        "reason": bloqueio.get("error"),
+                        "manual_ownership_blocked": True}
+            return verdict
+
+        request_preflight = _com_ownership
     if not is_configured():
         return {
             "ok": False,
@@ -556,22 +588,39 @@ async def _round_price(sym: str, price: float) -> float:
 # ─── High-level endpoints (mesma interface do bybit_signed_service) ───────────
 
 
-async def get_wallet_balance(account_type: str = "UNIFIED") -> dict:
+async def get_wallet_balance(account_type: str = "UNIFIED", *,
+                             force: bool = False) -> dict:
     """
     Saldo Futures USDT-M. Binance não tem o conceito 'UNIFIED' como Bybit —
     parâmetro é aceito por compat mas ignorado. Retorna mesmo shape.
+
+    `force=True` ignora o cache local e exige leitura nova. Estar em cooldown de
+    ban significa INDISPONÍVEL para quem pediu leitura fresca — não autorização
+    para usar saldo antigo. A resposta carrega SEMPRE `as_of_ms` (instante
+    ORIGINAL da obtenção) e `source` (`live`/`cache`/`stale`); um valor servido
+    do cache nunca recebe carimbo novo.
     """
     _ = account_type
     now = time.time()
     # Cache curto: saldo/conta também consome peso assinado e era chamado sem
     # throttle. Durante cooldown de ban, serve o último saldo conhecido (stale).
-    if (_account_cache["data"] is not None
+    if (not force and _account_cache["data"] is not None
             and (now - _account_cache["ts"]) < _ACCOUNT_CACHE_TTL):
-        return dict(_account_cache["data"])
+        servido = dict(_account_cache["data"])
+        servido["source"] = "cache"
+        servido["age_sec"] = round(now - _account_cache["ts"], 3)
+        return servido
     res = await _signed_request("GET", "/fapi/v2/account")
     if not res.get("ok"):
         if res.get("_cooldown") and _account_cache["data"] is not None:
-            stale = dict(_account_cache["data"]); stale["stale"] = True
+            stale = dict(_account_cache["data"])
+            stale["stale"] = True
+            stale["source"] = "stale"
+            stale["age_sec"] = round(now - _account_cache["ts"], 3)
+            if force:
+                # Quem pediu leitura FRESCA não pode receber cache disfarçado.
+                stale["ok"] = False
+                stale["reason_code"] = "WALLET_COOLDOWN_STALE"
             return stale
         return res
     acc = res["result"] or {}
@@ -594,6 +643,10 @@ async def get_wallet_balance(account_type: str = "UNIFIED") -> dict:
         ],
         "testnet": _TESTNET,
         "exchange": "binance",
+        # Instante ORIGINAL da obtenção — preservado no cache e nas respostas.
+        "as_of_ms": int(now * 1000),
+        "source": "live",
+        "age_sec": 0.0,
     }
     _account_cache["data"] = out
     _account_cache["ts"] = now
@@ -1130,10 +1183,18 @@ async def get_positions(symbol: Optional[str] = None, *, force: bool = False) ->
 #  própria requisição, onde I/O HTTP recursivo é proibido. A prova é o registro
 #  persistido de reconhecimento, e registro ilegível BLOQUEIA (fail-closed).
 async def _manual_ownership_block(symbol, action: str) -> Optional[dict]:
-    """Devolve o motivo do bloqueio, ou None quando o bot pode mutar."""
+    """Devolve o motivo do bloqueio, ou None quando o bot pode mutar.
+
+    `require_fresh_proof=True`: NOVA exposição exige prova de validação atual do
+    reconhecimento. Ações PROTETIVAS/redutoras (proteção, cancelamento,
+    fechamento, reduceOnly) são isentas dessa exigência dentro do próprio
+    `ownership_guard` — travá-las deixaria posição BOT comprovada sem stop por
+    causa de um reconhecimento de OUTRO símbolo.
+    """
     try:
         from services import manual_position_service as mps
-        verdict = await mps.ownership_guard(symbol, action=action)
+        verdict = await mps.ownership_guard(symbol, action=action,
+                                            require_fresh_proof=True)
     except Exception as exc:  # noqa: BLE001 — dúvida NUNCA libera mutação
         return {"ok": False, "reason_code": "MANUAL_OWNERSHIP_GUARD_ERROR",
                 "error": f"guard de propriedade indisponível: {type(exc).__name__}",
@@ -1356,7 +1417,9 @@ async def place_protection_orders(
                 if not _allowed:
                     log.error(f"[binance] {label.upper()} ABORTADO {sym}: mutation_guard negou (lease inválido) — sem POST")
                     return False, None, (last_msg or "mutation_guard negou: lease/claim inválido"), False
-            res = await _signed_request("POST", "/fapi/v1/algoOrder", params)
+            res = await _signed_request(
+                "POST", "/fapi/v1/algoOrder", params,
+                mutation={"symbol": symbol, "action": "place_protection_orders"})
             if res.get("ok"):
                 algo_id = str((res.get("result") or {}).get("algoId") or "")
                 if algo_id:
@@ -1637,7 +1700,9 @@ async def _emergency_close_after_stop_failure(
             "newOrderRespType": "RESULT",
             "newClientOrderId": cid,
         }
-        res = await _signed_request("POST", "/fapi/v1/order", params)
+        res = await _signed_request(
+            "POST", "/fapi/v1/order", params,
+            mutation={"symbol": symbol, "action": "emergency_close"})
         result = res.get("result") or {}
         status = str(result.get("status") or "").upper()
         close_terminal_statuses = {
@@ -2407,6 +2472,12 @@ async def place_order(
         "/fapi/v1/order",
         params,
         request_preflight=_market_request_preflight if market_entry else None,
+        # Ownership é obrigatório TAMBÉM nos caminhos LIMIT e de redução, em que
+        # `request_preflight` é None.
+        mutation={"symbol": symbol,
+                  # Redução/fechamento não é NOVA exposição: não exige prova
+                  # fresca, mas continua exigindo ownership do símbolo.
+                  "action": "reduce_only" if reduce_only else "place_order"},
     )
     if entry_res.get("_preflight"):
         verdict = entry_res.get("preflight") or {}
@@ -3029,6 +3100,7 @@ async def place_maker_entry_then_protect(
         request_preflight=(
             _entry_request_preflight if entry_preflight is not None else None
         ),
+        mutation={"symbol": symbol, "action": "maker_entry"},
     )
     if entry_res.get("_preflight"):
         verdict = entry_res.get("preflight") or {}
@@ -3468,7 +3540,9 @@ async def cancel_order(symbol: str, order_id: Optional[str] = None, client_order
         params["origClientOrderId"] = client_order_id
     else:
         return {"ok": False, "error": "informe order_id ou client_order_id"}
-    return await _signed_request("DELETE", "/fapi/v1/order", params)
+    return await _signed_request(
+        "DELETE", "/fapi/v1/order", params,
+        mutation={"symbol": symbol, "action": "cancel_order"})
 
 
 async def cancel_algo_order(algo_id: str, *, symbol: Optional[str] = None) -> dict:
@@ -3483,7 +3557,9 @@ async def cancel_algo_order(algo_id: str, *, symbol: Optional[str] = None) -> di
     bloqueio = await _manual_ownership_block(symbol, "cancel_algo_order")
     if bloqueio is not None:
         return bloqueio
-    return await _signed_request("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id})
+    return await _signed_request(
+        "DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id},
+        mutation={"symbol": symbol, "action": "cancel_algo_order"})
 
 
 async def get_open_algo_orders(symbol: Optional[str] = None) -> dict:
@@ -3534,15 +3610,67 @@ async def get_open_algo_orders(symbol: Optional[str] = None) -> dict:
     return {"ok": True, "orders": orders, "count": len(orders)}
 
 
+async def get_open_orders(symbol: Optional[str] = None) -> dict:
+    """Ordens COMUNS abertas (LIMIT/STOP/MARKET pendentes) via
+    GET /fapi/v1/openOrders. `symbol` opcional (omitido = todos os símbolos).
+
+    Existe porque o banco do bot NÃO conhece as LIMIT abertas manualmente pelo
+    operador: para provar que um símbolo está livre é preciso consultar a
+    corretora. `allOrders` com `limit` NÃO serve — ele lista histórico truncado,
+    não o conjunto das abertas.
+
+    Retorno: {"ok": True, "orders": [{order_id, client_order_id, symbol, side,
+    type, price, stop_price, quantity, reduce_only, close_position, status}],
+    "count": int}. Em falha devolve a resposta de erro — o caller DEVE tratar
+    como INCERTO e nunca concluir ausência.
+    """
+    params = {}
+    if symbol:
+        params["symbol"] = to_binance(symbol) if "/" in symbol else symbol
+    res = await _signed_request("GET", "/fapi/v1/openOrders", params or None)
+    if not res.get("ok"):
+        return res
+    rows = res.get("result") or []
+    if not isinstance(rows, (list, tuple)):
+        # Formato desconhecido é INCERTEZA, não "zero ordens".
+        return {"ok": False, "error": "openOrders em formato inesperado",
+                "testnet": _TESTNET, "exchange": "binance"}
+
+    def _api_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes"}
+
+    orders = []
+    for o in rows:
+        if not isinstance(o, dict):
+            return {"ok": False, "error": "linha de openOrders inesperada",
+                    "testnet": _TESTNET, "exchange": "binance"}
+        orders.append({
+            "order_id": str(o.get("orderId") or ""),
+            "client_order_id": o.get("clientOrderId"),
+            "symbol": o.get("symbol"),
+            "side": o.get("side"),
+            "type": o.get("type") or o.get("origType"),
+            "price": float(o.get("price") or 0),
+            "stop_price": float(o.get("stopPrice") or 0),
+            "quantity": float(o.get("origQty") or 0),
+            "reduce_only": _api_bool(o.get("reduceOnly")),
+            "close_position": _api_bool(o.get("closePosition")),
+            "status": o.get("status"),
+        })
+    return {"ok": True, "orders": orders, "count": len(orders)}
+
+
 async def set_leverage(symbol: str, leverage: int) -> dict:
     # Alavancagem é ALTERAÇÃO DE POSIÇÃO: num símbolo manual reconhecido ela
     # mexeria na posição do operador ANTES de qualquer POST de entrada.
     bloqueio = await _manual_ownership_block(symbol, "set_leverage")
     if bloqueio is not None:
         return bloqueio
-    res = await _signed_request("POST", "/fapi/v1/leverage", {
-        "symbol": symbol, "leverage": leverage,
-    })
+    res = await _signed_request(
+        "POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage},
+        mutation={"symbol": symbol, "action": "set_leverage"})
     return res
 
 

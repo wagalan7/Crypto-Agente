@@ -114,7 +114,10 @@ async def get_equity(force: bool = False) -> dict:
     if not force and _equity_cache["data"] is not None and age < _EQUITY_CACHE_TTL:
         out = dict(_equity_cache["data"])
         out["source"] = "cache"
-        out["age_sec"] = round(age, 1)
+        # Idade medida do instante ORIGINAL da obtenção, não do embrulho.
+        original = out.get("as_of_ms")
+        out["age_sec"] = (round(max(0.0, now - (int(original) / 1000.0)), 3)
+                          if original is not None else round(age, 1))
         return out
 
     async with _equity_lock:
@@ -124,11 +127,15 @@ async def get_equity(force: bool = False) -> dict:
         if not force and _equity_cache["data"] is not None and age < _EQUITY_CACHE_TTL:
             out = dict(_equity_cache["data"])
             out["source"] = "cache"
-            out["age_sec"] = round(age, 1)
+            original = out.get("as_of_ms")
+            out["age_sec"] = (round(max(0.0, now - (int(original) / 1000.0)), 3)
+                              if original is not None else round(age, 1))
             return out
 
         try:
-            res = await _client.get_wallet_balance()
+            # `force` ATRAVESSA os dois caches: quem pede leitura fresca não
+            # pode receber saldo antigo com carimbo novo.
+            res = await _client.get_wallet_balance(force=force)
         except Exception as e:
             log.warning(f"[equity] get_wallet_balance falhou: {e}")
             return {
@@ -150,6 +157,16 @@ async def get_equity(force: bool = False) -> dict:
                 "error": res.get("error") or res.get("msg"),
             }
 
+        # Qualidade e instante ORIGINAL vêm do cliente e NÃO são regenerados:
+        # um saldo servido do cache/cooldown continua marcado como tal.
+        origem = str(res.get("source") or "live")
+        if res.get("stale") or res.get("rate_limited"):
+            origem = "stale"
+        as_of_ms = res.get("as_of_ms")
+        try:
+            as_of_ms = int(as_of_ms) if as_of_ms is not None else int(now * 1000)
+        except (TypeError, ValueError):
+            as_of_ms = None
         data = {
             "ok": True,
             "total_usd": float(res.get("equity_usd") or 0),
@@ -157,10 +174,15 @@ async def get_equity(force: bool = False) -> dict:
             "wallet_usd": float(res.get("wallet_balance_usd") or 0),
             "margin_used_usd": float(res.get("margin_used_usd") or 0),
             "exchange": ACTIVE_EXCHANGE,
+            "as_of_ms": as_of_ms,
+            "quality": origem,
+            "stale": bool(res.get("stale")),
+            "rate_limited": bool(res.get("rate_limited")),
         }
         _equity_cache["data"] = data
         _equity_cache["ts"] = now
         out = dict(data)
-        out["source"] = "live"
-        out["age_sec"] = 0.0
+        out["source"] = origem
+        out["age_sec"] = (round(max(0.0, now - (as_of_ms / 1000.0)), 3)
+                          if as_of_ms is not None else None)
         return out

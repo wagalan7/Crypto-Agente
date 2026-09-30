@@ -297,16 +297,17 @@ async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict, *,
     # A MARGEM final é readmitida mesmo com o cutover de orçamento desligado:
     # os limites são independentes, e o tamanho pode ter mudado no arredondamento.
     margem = None
-    if final_entry is not None and final_qty is not None:
-        carteira = await _free_margin_snapshot()
-        requerida = _proposed_margin_usd(entry=final_entry, qty=final_qty,
-                                         leverage=intent.get("leverage"))
-        from services import entry_intent_service as _intents_mod
-        margem = _intents_mod.MarginGate(
-            available_usd=(carteira or {}).get("available_usd"),
-            required_usd=requerida if requerida is not None else 0.0,
-            as_of_ms=(carteira or {}).get("as_of_ms"),
-            complete=bool(carteira is not None and requerida is not None))
+    if final_entry is not None and final_qty is not None and intent.get("identity"):
+        margem = await _margin_gate_for(intent["identity"], entry=final_entry,
+                                        qty=final_qty,
+                                        leverage=intent.get("leverage"))
+        if margem is None:
+            checks["r05_admission"] = {"granted": False,
+                                       "reason": "FREE_MARGIN_UNKNOWN"}
+            return {"ok": False, "quality": "UNKNOWN",
+                    "reason_code": "FREE_MARGIN_UNKNOWN",
+                    "reason": "margem livre real não pôde ser comprovada",
+                    "checks": checks}
     if not orcamento and margem is None:
         return None
     try:
@@ -339,6 +340,9 @@ async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict, *,
                                "decision": veredicto.decision,
                                "reason": veredicto.reason}
     if veredicto.granted:
+        # O dispatch passa a conferir ESTA geração antes de enviar.
+        if veredicto.generation is not None:
+            intent["margin_generation"] = veredicto.generation
         return None
     log.warning(f"[r05] entrada BLOQUEADA na admissão final: "
                 f"{veredicto.decision} ({veredicto.reason})")
@@ -1393,12 +1397,19 @@ def _proposed_margin_usd(*, entry: float, qty: float, leverage) -> Optional[floa
 
 
 async def _free_margin_snapshot():
-    """Carteira FRESCA da conta compartilhada, com prova temporal.
+    """Carteira FRESCA da conta compartilhada, com prova temporal e qualidade.
 
-    Leitura feita FORA de qualquer transação/lock; a idade é conferida dentro
-    da admissão. `available_usd` já desconta a margem em uso na conta —
-    inclusive a da posição manual — e NÃO é somada de volta.
+    Leitura feita FORA de qualquer transação/lock; idade, qualidade e geração
+    são conferidas DENTRO da admissão. `available_usd` já desconta a margem em
+    uso na conta — inclusive a da posição manual — e NÃO é somada de volta.
+
+    Exigências (ausência nunca vira zero nem estimativa favorável):
+    `ok=True`, qualidade `live`, `available_usd` numérico finito não-booleano
+    e >= 0, e `as_of_ms` presente e coerente. Cache, cooldown/stale,
+    rate-limited, carimbo ausente ou horário futuro devolvem `None` e a
+    proposta é bloqueada.
     """
+    inicio_ms = int(time.time() * 1000)
     try:
         from services import exchange_service
         carteira = await exchange_service.get_equity(force=True)
@@ -1407,18 +1418,80 @@ async def _free_margin_snapshot():
         return None
     if not isinstance(carteira, dict) or not carteira.get("ok"):
         return None
+    if carteira.get("stale") or carteira.get("rate_limited"):
+        return None
+    qualidade = str(carteira.get("quality") or carteira.get("source") or "")
+    if qualidade.lower() != "live":
+        # Cache/stale não é prova de saldo atual para ABRIR exposição.
+        log.warning(f"[margem] carteira de qualidade {qualidade!r} não autoriza")
+        return None
     disponivel = carteira.get("available_usd")
+    if isinstance(disponivel, bool):
+        return None
     try:
         disponivel = float(disponivel)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(disponivel):
+    if not math.isfinite(disponivel) or disponivel < 0:
         return None
-    idade = carteira.get("age_sec")
-    idade = float(idade) if isinstance(idade, (int, float)) and not isinstance(idade, bool) else 0.0
-    return {"available_usd": disponivel,
-            "as_of_ms": int(time.time() * 1000) - int(max(0.0, idade) * 1000),
-            "source": carteira.get("source")}
+    carimbo = carteira.get("as_of_ms")
+    if carimbo is None or isinstance(carimbo, bool):
+        return None
+    try:
+        carimbo = int(carimbo)
+    except (TypeError, ValueError):
+        return None
+    fim_ms = int(time.time() * 1000)
+    if carimbo <= 0 or carimbo > fim_ms + 2_000:
+        return None            # carimbo ausente ou no futuro: incoerente
+    return {"available_usd": disponivel, "as_of_ms": carimbo,
+            "observed_start_ms": inicio_ms, "observed_end_ms": fim_ms,
+            "quality": "live", "source": carteira.get("source")}
+
+
+async def _margin_gate_for(identity, *, entry, qty, leverage):
+    """Monta o `MarginGate` seguindo o algoritmo obrigatório da geração.
+
+    1. sob a lock `917283`, obter a geração `g` e ENCERRAR a transação;
+    2. FORA da transação, obter carteira realmente fresca;
+    3. anexar conta/mercado, `g`, janela da leitura e qualidade ao gate.
+
+    A admissão confere `g` depois de readquirir a lock: se mudou, nega sem POST.
+    """
+    from services import entry_intent_service as intents
+    from db import get_session
+    from sqlalchemy import text as _sql_text
+    try:
+        async with get_session() as session:
+            async with session.begin():
+                await session.execute(
+                    _sql_text("SELECT pg_advisory_xact_lock(:k)"),
+                    {"k": intents.RISK_LOCK_KEY})
+                geracao = await intents.current_margin_generation(
+                    session, account_ref=identity.account_ref,
+                    exchange=identity.exchange, market="usdm_futures")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[margem] geração indisponível: {type(exc).__name__}")
+        return None
+    carteira = await _free_margin_snapshot()
+    requerida = _proposed_margin_usd(entry=entry, qty=qty, leverage=leverage)
+    if carteira is None or requerida is None:
+        # Incompleto BLOQUEIA: o gate é criado com `complete=False`.
+        return intents.MarginGate(
+            available_usd=(carteira or {}).get("available_usd"),
+            required_usd=requerida if requerida is not None else 0.0,
+            as_of_ms=(carteira or {}).get("as_of_ms"), complete=False,
+            account_ref=identity.account_ref, exchange=identity.exchange,
+            market="usdm_futures", generation=geracao,
+            quality=(carteira or {}).get("quality"))
+    return intents.MarginGate(
+        available_usd=carteira["available_usd"], required_usd=requerida,
+        as_of_ms=carteira["as_of_ms"], complete=True,
+        account_ref=identity.account_ref, exchange=identity.exchange,
+        market="usdm_futures", generation=geracao,
+        observed_start_ms=carteira.get("observed_start_ms"),
+        observed_end_ms=carteira.get("observed_end_ms"),
+        quality=carteira.get("quality"))
 
 
 async def _manual_entry_block(symbol) -> Optional[dict]:
@@ -1429,7 +1502,10 @@ async def _manual_entry_block(symbol) -> Optional[dict]:
     """
     try:
         from services import manual_position_service as mps
-        verdict = await mps.ownership_guard(symbol, action="entry")
+        # Entrada é NOVA exposição: exige prova de validação atual do
+        # reconhecimento, além das pausas existentes.
+        verdict = await mps.ownership_guard(symbol, action="entry",
+                                            require_fresh_proof=True)
     except Exception as exc:  # noqa: BLE001
         return {"reason_code": "MANUAL_OWNERSHIP_GUARD_ERROR", "detail": type(exc).__name__}
     if verdict.get("allowed"):
@@ -1477,14 +1553,11 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
               if orcamento.get("enabled") else None)
     # Margem REAL: limite INDEPENDENTE do orçamento nominal do bot. A posição
     # manual não devolve margem nenhuma — ela já saiu do `available_usd`.
-    carteira = await _free_margin_snapshot()
-    requerida = _proposed_margin_usd(entry=entry, qty=qty,
-                                     leverage=rec.get("leverage"))
-    margin = intents.MarginGate(
-        available_usd=(carteira or {}).get("available_usd"),
-        required_usd=requerida if requerida is not None else 0.0,
-        as_of_ms=(carteira or {}).get("as_of_ms"),
-        complete=bool(carteira is not None and requerida is not None))
+    margin = await _margin_gate_for(identity, entry=entry, qty=qty,
+                                    leverage=rec.get("leverage"))
+    if margin is None:
+        return {**blocked, "decision": intents.BLOCKED_CAPACITY,
+                "reason": "FREE_MARGIN_UNKNOWN"}
     reservation = await intents.reserve(get_session, identity, payload, owner=_INTENT_OWNER,
                                         capacity=capacity, budget=budget, margin=margin,
                                         # Stop/qty planejados ficam gravados ANTES
@@ -1497,11 +1570,20 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
             "reason": reservation.reason, "intent_key": reservation.intent_key,
             "client_order_id": reservation.client_order_id, "state": reservation.state,
             "account_ref": identity.account_ref, "capacity": capacity,
-            "leverage": rec.get("leverage"), "dispatched": False}
+            "leverage": rec.get("leverage"), "identity": identity,
+            # Token de admissão: o dispatch confere a geração RESULTANTE antes
+            # de enviar. Mudança concorrente exige nova admissão.
+            "margin_generation": reservation.generation,
+            "dispatched": False}
 
 
 async def _intent_dispatch_guard(intent) -> bool:
-    """Guard antes de CADA POST: só o dono do lease vivo em SENDING despacha."""
+    """Guard antes de CADA POST: só o dono do lease vivo em SENDING despacha.
+
+    Confere também o TOKEN de admissão (geração de margem resultante gravado na
+    própria intenção): se uma readmissão concorrente mudou a reserva desta
+    decisão, o envio exige NOVA admissão — não se despacha com prova anterior.
+    """
     if not isinstance(intent, dict) or not intent.get("granted"):
         return False
     from services import entry_intent_service as intents
@@ -1512,7 +1594,21 @@ async def _intent_dispatch_guard(intent) -> bool:
             return False
         intent["dispatched"] = True
         intent["state"] = "SENDING"
-    return await intents.may_dispatch(get_session, key, owner=_INTENT_OWNER)
+    if not await intents.may_dispatch(get_session, key, owner=_INTENT_OWNER):
+        return False
+    esperado = intent.get("margin_generation")
+    if esperado is not None:
+        try:
+            linha = await intents.get_intent(get_session, key)
+        except Exception as exc:  # noqa: BLE001 — dúvida NÃO despacha
+            log.warning(f"[p03-intent] token de admissão ilegível: {type(exc).__name__}")
+            return False
+        atual = getattr(linha, "margin_generation", None) if linha else None
+        if atual is not None and int(atual) != int(esperado):
+            log.warning("[p03-intent] token de admissão mudou "
+                        f"({esperado} → {atual}) — exige nova admissão")
+            return False
+    return True
 
 
 async def _register_intent_dispatch(intent, dispatch_id) -> bool:

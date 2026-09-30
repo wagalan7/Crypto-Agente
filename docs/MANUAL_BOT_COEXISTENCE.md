@@ -1,8 +1,13 @@
 # Convivência manual/bot na MESMA conta
 
-Baseline: `8565903e`. Esta entrega **não** liga nada e **não** autoriza operar a
-conta. Ela remove UM impedimento específico (posição manual travando o bot por
-inteiro) e cria a contenção que torna essa convivência segura.
+Baseline original: `8565903e`. **Correção integrada aplicada sobre `69fd090a`**
+(revisão em `docs/REVISAO_69fd090a_MANUAL_BOT.md`): sete defeitos corrigidos em
+escopo de observação, estados de bloqueio, revalidação recorrente, freshness e
+geração da margem, e ownership no ponto final das mutações.
+
+Esta entrega **não** liga nada e **não** autoriza operar a conta. Ela remove UM
+impedimento específico (posição manual travando o bot por inteiro) e cria a
+contenção que torna essa convivência segura.
 
 ## 1. Contrato de negócio (decidido pelo usuário)
 
@@ -55,23 +60,63 @@ reconhecimento.
 
 ### 2.2 Registro dedicado (`manual_position_acks`)
 
-Tabela nova, pequena e **separada de `RealTrade`** — justamente para o trade
-manager não assumir a gestão da posição. Guarda: escopo opaco da conta,
-exchange/mercado, símbolo/quote canônicos, lado, `positionSide`, `qty` e preço
-de entrada em `NUMERIC(38,18)`, `exchange_update_time_ms`, fingerprint, versão do
-contrato (`MANUAL_ACK_V1`), estado `ACTIVE|INVALIDATED|CLOSED`, motivo e
+Tabela pequena e **separada de `RealTrade`** — justamente para o trade manager
+não assumir a gestão da posição. Guarda: escopo opaco da conta, exchange/mercado,
+símbolo/quote canônicos, lado, `positionSide`, `qty` e preço de entrada em
+`NUMERIC(38,18)`, `exchange_update_time_ms`, fingerprint, versão do contrato
+(`MANUAL_ACK_V1`), estado, `revision` (CAS), prova de validação
+(`validated_at_ms`, `validation_scope`, `validation_account`), motivo e
 identidade administrativa **não secreta**, chave do incidente vinculado,
 evidências e timestamps.
 
-Migração **aditiva e idempotente** pelo caminho oficial (`db.init_db`):
-`create_all` + `CREATE UNIQUE INDEX IF NOT EXISTS uq_manual_ack_active … WHERE
-state = 'ACTIVE'` + `ALTER TABLE entry_intents ADD COLUMN IF NOT EXISTS
-reserved_margin_usd`. Nenhuma linha é sobrescrita ou apagada: invalidar/encerrar
-carimba `state`, `ended_at` e `ended_reason`.
+**VALIDADE do reconhecimento e BLOQUEIO do símbolo são coisas diferentes.**
+"Não está `ACTIVE`" NUNCA significa "símbolo livre":
+
+| Estado | Significado | Símbolo |
+|---|---|---|
+| `ACTIVE` | posição manual reconhecida e compatível | **bloqueado** |
+| `INVALIDATED` | identidade mudou / não corresponde mais | **bloqueado** (exige nova confirmação ou encerramento provado) |
+| `WAITING_ORDERS` | posição flat, mas restam ordens (ou não foi possível provar ausência) | **bloqueado** |
+| `CLOSED` | flat **E** ausência fresca de ordens comuns **E** condicionais | livre |
+| `SUPERSEDED` | substituído por NOVA confirmação administrativa, atomicamente | livre (histórico) |
+
+O predicado `BLOCKING_STATES = (ACTIVE, INVALIDATED, WAITING_ORDERS)` é o MESMO
+no transporte, na admissão, no reconciliador e no índice de unicidade.
+
+Migração **aditiva e idempotente** pelo caminho oficial (`db.init_db`), testada
+em schema novo **e** vindo de `69fd090a`: `create_all`, `ALTER TABLE … ADD COLUMN
+IF NOT EXISTS` para `revision`/`validated_at_ms`/`validation_scope`/
+`validation_account` (acks), `reserved_margin_usd`/`margin_generation`
+(`entry_intents`), a tabela `account_margin_epochs` e a troca do índice parcial
+`uq_manual_ack_active` → `uq_manual_ack_open` (que cobre TODOS os estados
+bloqueantes). O índice novo é criado ANTES de o antigo ser removido e **nenhuma
+linha é apagada**. Se houver legado ambíguo (duas linhas bloqueantes para a
+mesma identidade), a criação do índice falha, o fato é logado como crítico e o
+serviço fica **fail-closed**: o guard recusa com
+`MANUAL_ACK_REGISTRY_AMBIGUOUS` em vez de escolher uma linha.
+
+Uma confirmação NOVA sobre um registro `INVALIDATED`/`WAITING_ORDERS` encerra o
+anterior como `SUPERSEDED` e grava o novo `ACTIVE` **na mesma transação e sob a
+mesma lock** — com fingerprint atual e `confirm` literal. Nunca há autoack, nunca
+ficam duas linhas bloqueantes e o histórico é preservado.
 
 Não há allowlist permanente de símbolos nem ticker hardcoded. **Múltiplas pernas
 ambíguas no mesmo símbolo são RECUSADAS**, nunca condensadas numa posição
 fictícia.
+
+### 2.2b Observação de posições: escopo e completude explícitos
+
+Toda revalidação consome uma **observação** com contrato declarado: conta opaca,
+exchange/mercado, escopo (`ACCOUNT` ou `SYMBOL` + símbolo), indicador de
+completude/qualidade, início/fim reais da obtenção e as posições normalizadas.
+
+- uma observação `SYMBOL=ALFA` só pode alterar ALFA — **ausência numa consulta
+  filtrada não prova ausência de BETA**;
+- percorrer todos os registros exige observação `ACCOUNT` completa;
+- resposta parcial, malformada, stale, rate-limited ou com campo essencial
+  inválido é `UNKNOWN`: **nenhuma linha inválida é descartada em silêncio** para
+  depois concluir flat;
+- o ciclo oficial obtém UM batch completo de conta e o reutiliza.
 
 ### 2.3 API administrativa (dois endpoints, nada genérico)
 
@@ -117,7 +162,20 @@ diz isso explicitamente.
 - No boot (`_detect_untracked_positions`), os reconhecimentos são revalidados
   contra a leitura fresca **antes** de o scan ser considerado seguro. Registro
   ilegível ou leitura incerta ⇒ `UNKNOWN` + quarentena.
-- Identidade divergente ⇒ `INVALIDATED` e a contenção reabre no ciclo seguinte.
+- **Em TODO ciclo** (`reconcile_due`), mesmo com boot seguro e **zero incidentes
+  abertos**, os registros bloqueantes são revalidados com uma observação de
+  CONTA e a **prova de validação** é renovada. Não há scheduler novo: é o loop
+  que já existia.
+- Essa prova (`validated_at_ms`, escopo e conta) é o que o guard exige antes de
+  **nova exposição** (`VALIDATION_MAX_AGE_S = 900s`). O preflight do transporte
+  apenas LÊ e compara — nunca faz HTTP recursivo para revalidá-la. Expirada:
+  nega e deixa o ciclo atualizar.
+- Atualização/encerramento acontecem sob a advisory lock `917283` com **CAS de
+  revisão**: um scan atrasado não fecha um reconhecimento mais novo.
+- Falha de persistência **não** vira lista vazia com sucesso: propaga `ok=False`
+  (`MANUAL_ACK_PERSISTENCE_FAILED`), mantém o bloqueio e não libera pausa.
+- Identidade divergente ⇒ `INVALIDATED` (símbolo continua bloqueado) e a
+  contenção reabre no ciclo seguinte.
 - A liberação da pausa continua sendo a do P03 (`_maybe_release_quarantine`),
   owner-aware: pausa manual e owners P02/legacy são preservados.
 - Fechamento comprovado encerra o registro (`CLOSED`) **somente** depois de
@@ -134,6 +192,23 @@ antes da primeira mutação:
 
 `set_leverage`, `place_order`, `place_maker_entry_then_protect`,
 `place_protection_orders`, `cancel_order` e `cancel_algo_order`.
+
+**Ponto final obrigatório.** Além do guard antecipado, `_signed_request` recebe
+um contexto INTERNO de mutação (`{"symbol", "action"}` — nunca enviado à
+Binance) e **compõe** ownership com o `request_preflight` existente de
+lease/risco/quote: os preflights atuais rodam primeiro, preservando seus
+resultados/erros, e a propriedade é reconferida **imediatamente antes de assinar
+e enviar**, DEPOIS de todo throttle e em **cada retry/fallback**. Isso vale mesmo
+quando o caller não fornece `entry_preflight` — o transporte não pula ownership
+por falta de guard financeiro. Negação ⇒ `_request_sent=False`, nenhum
+POST/DELETE, e o vocabulário de resultado dos callers é preservado (bloqueio
+nunca vira fill zero, proteção instalada ou cancelamento confirmado).
+
+Pontos cobertos: `set_leverage`; `cancel_order`/`cancel_algo_order`;
+`_place_algo` dentro de `place_protection_orders` (cada tentativa/fallback,
+mantendo o `mutation_guard` de lease); `place_order` nos caminhos MARKET, LIMIT
+e de redução; `place_maker_entry_then_protect` e seu fallback MARKET; e o
+fechamento emergencial/reduceOnly que chama `_signed_request` direto.
 
 Isso cobre entrada normal e maker, fallback MARKET, flip, hedge, pyramiding, TF
 upgrade, instalação/substituição/cancelamento de proteção, fechamento,
@@ -168,7 +243,52 @@ tratamento de `managed` e das demais fontes ficou intacto, e um trade
 `source=auto` encerrado manualmente **continua automático**. Nenhuma fórmula,
 denominador de equity, limite ou default foi alterado.
 
-Gate de margem REAL, novo e **independente** do orçamento nominal:
+**Freshness ponta a ponta.** `force` atravessa os dois caches
+(`_free_margin_snapshot` → `exchange_service.get_equity` → `get_wallet_balance`).
+Estar em cooldown significa **indisponível** para esta admissão, não autorização
+para usar saldo antigo. O instante ORIGINAL da obtenção (`as_of_ms`) e a
+qualidade (`live`/`cache`/`stale`, flags de erro/rate-limit) são preservados em
+todas as camadas — um valor servido do cache **não** recebe carimbo novo nem
+`age=0`. No caminho de margem exige-se `available_usd` presente, numérico,
+finito, não-booleano e ≥ 0, com fonte `live` e carimbo coerente: zero legítimo
+BLOQUEIA proposta positiva; ausente **não** vira zero; horário futuro, NaN ou
+fonte não comprovada não passam. A idade é validada com o relógio obtido
+**depois** da espera pela lock.
+
+**Geração persistida (`account_margin_epochs`).** A soma de margem reservada só
+conta intenções pendentes; quando uma vira posição, a parcela SAI da soma e uma
+carteira lida antes disso ainda pareceria ter saldo. Reduzir TTL não resolve.
+Um contador monotônico por conta/exchange/mercado, protegido pela lock `917283`,
+identifica mudança local de interpretação:
+
+1. sob a lock, obter a geração `g` e encerrar a transação;
+2. fora da transação, obter carteira realmente fresca; anexar conta/mercado,
+   `g`, janela da leitura e qualidade ao `MarginGate`;
+3. na reserva/readmissão, depois da lock, exigir geração atual == `g`,
+   identidade compatível e idade válida. Diferente ⇒
+   `MARGIN_OBSERVATION_SUPERSEDED`, sem POST;
+4. a margem é calculada com a carteira válida e as reservas concorrentes do
+   snapshot oficial; conceder e persistir a reserva é atômico;
+5. **escritores que incrementam a geração na MESMA transação da mudança**:
+   `reserve` (criação e aumento da reserva), `admit_final_risk` (quando altera a
+   própria reserva), `_resolve` com `CONFIRMED` (a intenção sai da soma ao ganhar
+   `real_trade_id`) e com `TERMINAL`, e `release_reserved`. **Não** incrementam:
+   `mark_sending`, `register_dispatch`, `mark_unknown` e `recover_stale` — nenhum
+   deles muda a soma de pendentes (operação idempotente sem efeito econômico não
+   incrementa, para não gerar retentativa sem fim);
+6. `admit_final_risk` devolve a geração RESULTANTE (não invalida a si mesma) e
+   ela é gravada em `entry_intents.margin_generation`. Antes de CADA POST, o
+   `_intent_dispatch_guard` confere esse token junto do lease: readmissão
+   concorrente da mesma intenção exige **nova admissão**, nunca envio com prova
+   anterior.
+
+Enquanto envio/fill estiver incerto a margem continua reservada (timeout não
+solta reserva). Reservas pendentes ainda não refletidas na leitura da exchange
+são contadas conservadoramente. Registro legado sem margem conhecida não
+contribui zero silenciosamente: `COALESCE` só cobre linhas sem exposição
+possível, e o gate exige o campo presente para admitir.
+
+Gate de margem REAL, **independente** do orçamento nominal:
 
 - `entry_intent_service.MarginGate` (disponível, requerido, `as_of_ms`, idade
   máxima, `complete`) e `_margin_reason`;
@@ -214,6 +334,10 @@ os outros.
 | `MANUAL_ACK_DB_UNAVAILABLE` | persistência indisponível |
 | `MANUAL_POSITION_SYMBOL_BLOCKED` | símbolo com posição manual reconhecida |
 | `MANUAL_ACK_REGISTRY_UNAVAILABLE` | registro ilegível (fail-closed) |
+| `MANUAL_ACK_REGISTRY_AMBIGUOUS` | legado com duas linhas bloqueantes na mesma identidade |
+| `MANUAL_ACK_PROOF_STALE` | reconhecimento sem validação fresca (nova exposição) |
+| `MANUAL_ACK_PERSISTENCE_FAILED` | transição/prova não persistiu — mantém bloqueio |
+| `MARGIN_OBSERVATION_SUPERSEDED` | carteira observada antes de mudança local de margem |
 | `MANUAL_OWNERSHIP_SYMBOL_UNKNOWN` | mutação sem símbolo com ack ativo |
 | `FREE_MARGIN_UNKNOWN` / `FREE_MARGIN_STALE` / `INSUFFICIENT_FREE_MARGIN` | gate de margem real |
 
@@ -236,9 +360,11 @@ os outros.
    valendo nos demais símbolos.
 
 **Rollback não é liberar pausa.** Para desfazer: invalidar o reconhecimento (a
-identidade divergir já faz isso sozinho) — a posição volta a ser `UNTRACKED`, a
-contenção reabre e o bot para de operar novos símbolos até o fluxo P03 liberar.
-Nenhum histórico é apagado.
+identidade divergir já faz isso sozinho). O registro vai a `INVALIDATED` — o
+**símbolo continua bloqueado**, a posição volta a ser `UNTRACKED` e a contenção
+reabre até o fluxo P03 liberar. Para reativar é preciso uma confirmação NOVA
+(que grava `SUPERSEDED` no anterior) ou o encerramento comprovado. Nenhum
+registro é apagado e nenhuma pausa é liberada por esse caminho.
 
 ## 5. Teste local
 
@@ -258,9 +384,13 @@ cd backend && MANUALBOT_TEST_SOCKET="$SOCK" PYTHONDONTWRITEBYTECODE=1 \
 $PGBIN/pg_ctl -D "$DATA" -m immediate stop; rm -rf "$DATA" "$SOCK"
 ```
 
+O mesmo molde vale para `tests/pg_integration_manual_margin.py`, trocando a
+variável para `MANUALMARGIN_TEST_SOCKET=/tmp/cw-mmargin-sock.*` (usuário/banco
+`mmargin`/`mmargindb`).
+
 ```bash
-cd backend && PYTHONDONTWRITEBYTECODE=1 \
-  .venv311/bin/python -B -m unittest tests.test_manual_bot_coexistence -v
+cd backend && PYTHONDONTWRITEBYTECODE=1 .venv311/bin/python -B -m unittest \
+  tests.test_manual_bot_coexistence tests.test_manual_bot_integrity -v
 ```
 
 ## 6. TOCTOU e limites assumidos
@@ -279,6 +409,13 @@ cd backend && PYTHONDONTWRITEBYTECODE=1 \
 - **Margem:** o custo reservado é um **limite superior conservador**, não um
   número de contabilidade. O gate protege o saldo livre; ele não substitui
   R05/R05D nem a contabilidade com funding.
+- **A geração é LOCAL.** Mudanças feitas pelo operador direto na corretora
+  **não** incrementam `account_margin_epochs` — por isso a leitura fresca
+  continua obrigatória e a janela externa residual permanece. Não existe
+  atomicidade com a exchange, e este pacote não promete isso.
+- **Ordens comuns** passaram a ser lidas por `openOrders`. `allOrders` com
+  `limit` continua sendo histórico truncado e **não** é usado como prova de
+  ausência.
 - **Reconhecer não protege.** A posição manual pode estar sem SL: isso é
   decisão do operador e o bot não instala nem cancela proteção dela.
 - Esta entrega não foi executada contra a conta real, não emitiu ordem, não

@@ -59,6 +59,10 @@ class EntryIntent(Base):
     #: orçamento não prova que há saldo livre para abrir. Linha antiga sem o
     #: campo vale 0 e obriga o caller a recalcular antes de aumentar exposição.
     reserved_margin_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    #: Geração (época) de margem RESULTANTE da última admissão desta intenção.
+    #: O dispatch confere este token antes de enviar: mudança concorrente exige
+    #: nova admissão em vez de enviar com prova anterior.
+    margin_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     #: IDs EFETIVOS já despachados (entrada e eventual fallback), gravados
     #: ANTES de cada POST — um id desconhecido ficaria invisível à reconciliação.
     dispatch_ids: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
