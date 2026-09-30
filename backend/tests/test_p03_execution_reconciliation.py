@@ -592,7 +592,9 @@ class CleanupTests(_AsyncBase):
                         get_open_algo_orders=AsyncMock(side_effect=listings),
                         cancel_algo_order=cancel):
             await ers.reconcile_due()
-        cancel.assert_awaited_once_with("A1")           # cancela pelo algo_id real
+        # Cancela pelo algo_id REAL e com o símbolo do incidente: sem símbolo o
+        # guard de propriedade não conseguiria proteger uma posição manual.
+        cancel.assert_awaited_once_with("A1", symbol="ETH/USDT:USDT")
         row = await ers._get_repo().get(key)
         self.assertEqual(row["clean_observations"], 0)  # grace reiniciado
         self.assertIsNone(row["resolved_at"])
@@ -1297,7 +1299,7 @@ class VerifiedClosureTests(_AsyncBase):
         row = await ers._get_repo().get(key)
         self.assertIsNone(row.get("resolved_at"))                    # quarentena permanece
         self.assertNotEqual(row.get("state"), State.FLAT)            # aguarda grace de cleanup
-        cancel.assert_awaited_once_with("S1")
+        cancel.assert_awaited_once_with("S1", symbol="BTC/USDT:USDT")
         self.assertEqual((row.get("conditional_ids") or {}).get("sl"), "S1")
 
     async def test_maker_sl_persisted_before_cancel_failure(self):

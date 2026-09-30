@@ -593,7 +593,9 @@ class EntryFailSafeTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["state"], "CONFIRMED")
-        cancel.assert_awaited_once_with("late-sl")
+        # O símbolo viaja junto do cancel: é ele que permite ao guard de
+        # propriedade recusar mutação em posição manual reconhecida.
+        cancel.assert_awaited_once_with("late-sl", symbol="BTCUSDT")
 
     async def test_reduce_only_partial_fill_is_not_reported_as_closed(self):
         entry = {"ok": True, "result": {

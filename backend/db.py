@@ -83,6 +83,7 @@ async def init_db():
     from models import decision_observation  # noqa: F401  (R09 — observação segregada)
     from models import entry_intent  # noqa: F401  (P03 — intenção de entrada econômica)
     from models import policy_simulation_state  # noqa: F401  (R11/R12 — estado da simulação)
+    from models import manual_position_ack  # noqa: F401  (convivência manual/bot)
     from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -117,6 +118,21 @@ async def init_db():
         # recuperação conseguir ADOTAR o SL existente (aditiva).
         await conn.execute(text(
             "ALTER TABLE entry_intents ADD COLUMN IF NOT EXISTS decision_payload JSONB"
+        ))
+        # Convivência manual/bot — margem RESERVADA pela intenção (aditiva).
+        # Sem esta parcela duas propostas concorrentes poderiam consumir o
+        # MESMO saldo livre da conta compartilhada.
+        await conn.execute(text(
+            "ALTER TABLE entry_intents "
+            "ADD COLUMN IF NOT EXISTS reserved_margin_usd DOUBLE PRECISION DEFAULT 0"
+        ))
+        # Convivência manual/bot — reconhecimento explícito de posição manual.
+        # `create_all` cria a tabela; o índice parcial é a defesa FINAL contra
+        # dois reconhecimentos ativos para a mesma conta/mercado/símbolo.
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_manual_ack_active "
+            "ON manual_position_acks (account_scope, exchange, market, symbol) "
+            "WHERE state = 'ACTIVE'"
         ))
         # Migrações incrementais
         await conn.execute(text(

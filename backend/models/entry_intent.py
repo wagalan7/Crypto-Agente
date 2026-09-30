@@ -54,6 +54,11 @@ class EntryIntent(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     dispatches: Mapped[int] = mapped_column(Integer, default=0)
     reserved_risk_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    #: MARGEM (+ custos conservadores) reservada na conta COMPARTILHADA. O risco
+    #: nominal do bot e a margem real são limites INDEPENDENTES: caber no
+    #: orçamento não prova que há saldo livre para abrir. Linha antiga sem o
+    #: campo vale 0 e obriga o caller a recalcular antes de aumentar exposição.
+    reserved_margin_usd: Mapped[float] = mapped_column(Float, default=0.0)
     #: IDs EFETIVOS já despachados (entrada e eventual fallback), gravados
     #: ANTES de cada POST — um id desconhecido ficaria invisível à reconciliação.
     dispatch_ids: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)

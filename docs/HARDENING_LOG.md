@@ -2214,3 +2214,74 @@ coluna, ENV, flag, endpoint, scheduler ou fila nova; C intocado.
   A suíte completa anterior não foi repetida para esta alteração de empacotamento.
 - Sem mudança de flags, limites ou schema neste hotfix; validação final de
   migrações, boot e saúde depende da nova publicação, não só do status Railway.
+
+## Convivência manual/bot na mesma conta (30/09/2026, baseline `8565903e`)
+
+Decisão do usuário: reconhecer explicitamente uma posição aberta MANUALMENTE e
+deixar o bot operar OUTROS símbolos pelos próprios limites, sem consumir o
+orçamento nominal do bot com ela. Contrato, runbook e limites em
+`docs/MANUAL_BOT_COEXISTENCE.md`. Nada foi ligado, nenhuma ordem emitida,
+nenhuma pausa real liberada.
+
+- **Identidade da posição não existia.** `get_positions` descartava
+  `positionSide` e `updateTime` — sem eles nenhum reconhecimento seria
+  revalidável depois. Agora os dois campos são preservados ADITIVAMENTE (ausente
+  vira `None`, nunca `BOTH` nem relógio local) e o fingerprint determinístico
+  cobre conta, mercado, símbolo/quote, lado, perna, qty, entrada e versão
+  temporal, com decimais canônicos. Mark price e P&L ficam FORA: oscilação não
+  exige novo reconhecimento. Limitação declarada: a Binance não expõe id de
+  posição, então `updateTime` prova alteração, não continuidade.
+- **O manager escolhia a PRIMEIRA posição do símbolo.** Um trade long do bot
+  lia a perna short de 9 unidades do operador e agiria sobre ela. Agora
+  `_fetch_exchange_position` exige lado/perna compatíveis e trata pernas
+  ambíguas como leitura INCERTA — que os chamadores já tratam sem mutar nada.
+- **Não havia autorização de propriedade antes de mutar.** `set_leverage` já
+  alteraria a posição manual antes de qualquer POST. O guard único
+  (`manual_position_service.ownership_guard`) foi composto na BORDA DO
+  TRANSPORTE — `set_leverage`, `place_order`, maker, proteção, `cancel_order` e
+  `cancel_algo_order` — e roda de novo no preflight final, depois do throttle,
+  inclusive em retry e no fallback MARKET. Registro ilegível, símbolo
+  reconhecido e símbolo desconhecido com reconhecimento ativo BLOQUEIAM. O guard
+  não faz I/O de exchange (ele roda dentro de locks da própria requisição).
+- **Não havia gate de margem REAL.** Duas admissões podiam reservar o mesmo
+  saldo livre. Agora `MarginGate` + `entry_intents.reserved_margin_usd` entram
+  no snapshot ÚNICO de admissão, sob a MESMA advisory lock `917283`; a carteira
+  é lida fora da transação e a IDADE dela é validada dentro; ausência vira
+  `FREE_MARGIN_UNKNOWN` e carteira velha vira `FREE_MARGIN_STALE`. A margem
+  final é readmitida antes do dispatch. Nenhuma fórmula, limite, default ou
+  alavancagem foi alterada, e `available_usd` não é "devolvido" pela manual.
+- **Reconhecimento**: tabela nova `manual_position_acks`, SEPARADA de
+  `RealTrade` (para o trade manager não assumir a gestão), com índice parcial
+  único por conta/mercado/símbolo ativo e histórico preservado. Dois endpoints
+  administrativos com `_check_admin_token` e schema estrito (`confirm` booleano
+  LITERAL); nada de `resolve`/`clear-pause`/`enable-live`/`execute` e sem UI.
+  A confirmação relê a posição fresca, confere o fingerprint e, sob a lock da
+  admissão, exige ausência de `RealTrade` BOT/`managed`, de intenção pendente
+  (ou tocada após a leitura), de incidente conflitante e de condicional do bot —
+  listagem indisponível é prova INCONCLUSIVA e bloqueia. Registro e vínculo com
+  a causa `UNTRACKED_POSITION` nascem no MESMO commit.
+- **Reconciliação**: estado terminal novo `MANUAL_ACKNOWLEDGED`, exclusivo do
+  incidente `UNTRACKED_POSITION` da posição manual comprovada — posição aberta
+  nunca vira `FLAT`/`PROTECTED`, e ele NÃO entra em `_TERMINAL_SAFE` (não prova
+  desfecho de ordem do bot nem liquida intenção). O boot revalida os
+  reconhecimentos contra a leitura fresca antes de considerar o scan seguro;
+  identidade divergente invalida e reabre a contenção; a liberação continua pelo
+  P03 owner-aware. Fechamento só encerra o registro depois de provar ausência
+  fresca de ordens do operador — que nunca são canceladas. Conflito com adoção
+  `managed` é recusado explicitamente.
+- **Coortes**: a posição manual não é `RealTrade`, então já não entrava em slot,
+  risco, notional, P&L diário, streak ou contagem diária; `managed` e demais
+  fontes ficaram intactas e `auto` encerrada manualmente continua automática.
+- **Testes:** suíte completa **2.413 executados, 2.411 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada, não fabricada). Harness PG novo
+  `pg_integration_manual_coexistence.py` com **104 verificações** (duas
+  execuções verdes), incluindo migração idempotente, índice parcial, ack
+  idempotente, reconhecimento × reserva concorrente nos DOIS sentidos, duas
+  confirmações simultâneas, invalidação por identidade, restart, disputa de
+  margem com barreira e transição reserva→dispatch. Regressões PG:
+  `pg_integration_p03_conflict.py` 66 e `pg_integration_r05_clock.py` 10.
+  Novo `tests/test_manual_bot_coexistence.py` com 31 testes. `py_compile` e
+  `git diff --check` aprovados; nenhum TS/TSX alterado; cluster encerrado.
+- **Fora do escopo, sem mudança:** estratégia, score, calibração, tier, filtros,
+  stop/TP automático, sizing, limites, universo, alavancagem e flags existentes.
+  Nada foi ativado. Não se declara ausência de bugs.

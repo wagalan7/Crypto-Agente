@@ -257,7 +257,9 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
             "reserved_risk_usd": gate.get("reserved_risk_usd"),
             "daily_loss_limit_usd": gate.get("daily_loss_limit_usd"),
         }
-        recusa = await _admit_final_entry_risk(gate, intent, checks)
+        recusa = await _admit_final_entry_risk(gate, intent, checks,
+                                               final_entry=final_entry,
+                                               final_qty=final_qty)
         if recusa is not None:
             return recusa
         return await _r05d_total_gate(checks)
@@ -278,32 +280,56 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
     }
 
 
-async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict):
-    """Admissão SERIALIZADA do risco final, sob a mesma lock da reserva.
+async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict, *,
+                                  final_entry=None, final_qty=None):
+    """Admissão SERIALIZADA do risco e da MARGEM finais, sob a lock da reserva.
 
     Duas decisões que checaram o orçamento antes de reservar poderiam consumir
     juntas a última margem; aqui o veredicto e a gravação da reserva acontecem
-    na MESMA transação. Sem orçamento (cutover desligado) não há veredicto
-    novo. Dúvida NEGA — nenhuma ordem é enviada.
+    na MESMA transação. Sem orçamento (cutover desligado) o veredicto de
+    orçamento/capacidade continua não existindo — só o gate de MARGEM REAL
+    roda, porque os limites são independentes. Dúvida NEGA.
     """
     orcamento = gate.get("budget") if isinstance(gate.get("budget"), dict) else None
     key = intent.get("intent_key")
-    if not orcamento or not key:
+    if not key:
+        return None
+    # A MARGEM final é readmitida mesmo com o cutover de orçamento desligado:
+    # os limites são independentes, e o tamanho pode ter mudado no arredondamento.
+    margem = None
+    if final_entry is not None and final_qty is not None:
+        carteira = await _free_margin_snapshot()
+        requerida = _proposed_margin_usd(entry=final_entry, qty=final_qty,
+                                         leverage=intent.get("leverage"))
+        from services import entry_intent_service as _intents_mod
+        margem = _intents_mod.MarginGate(
+            available_usd=(carteira or {}).get("available_usd"),
+            required_usd=requerida if requerida is not None else 0.0,
+            as_of_ms=(carteira or {}).get("as_of_ms"),
+            complete=bool(carteira is not None and requerida is not None))
+    if not orcamento and margem is None:
         return None
     try:
         from db import get_session
         from services import entry_intent_service as intents
         risco = gate.get("proposed_trade_risk_usd")
-        if not isinstance(risco, (int, float)) or isinstance(risco, bool):
+        risco_conhecido = isinstance(risco, (int, float)) and not isinstance(risco, bool)
+        if orcamento and not risco_conhecido:
             veredicto = intents.Reservation(intents.BLOCKED_CAPACITY, key, None, None,
                                             "PROPOSED_RISK_UNKNOWN")
         else:
+            # Cutover desligado: capacidade/orçamento seguem sem veredicto novo
+            # (comportamento legado preservado) e o risco reservado não é
+            # rebaixado — só a margem real é readmitida.
             veredicto = await intents.admit_final_risk(
-                get_session, key, owner=_INTENT_OWNER, risk_usd=float(risco),
-                capacity=intent.get("capacity"),
-                budget=intents.DailyBudget(base_usd=orcamento.get("base_usd"),
-                                           limit_usd=orcamento.get("limit_usd"),
-                                           complete=bool(orcamento.get("complete"))))
+                get_session, key, owner=_INTENT_OWNER,
+                risk_usd=float(risco) if risco_conhecido else 0.0,
+                capacity=intent.get("capacity") if orcamento else None,
+                margin=margem,
+                budget=(intents.DailyBudget(base_usd=orcamento.get("base_usd"),
+                                            limit_usd=orcamento.get("limit_usd"),
+                                            complete=bool(orcamento.get("complete")))
+                        if orcamento else None))
     except Exception as exc:                      # exceção NUNCA libera entrada
         log.warning(f"[r05] admissão final indisponível: {type(exc).__name__}: {exc}")
         checks["r05_admission"] = {"granted": False, "reason": "ADMISSION_ERROR"}
@@ -318,7 +344,10 @@ async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict):
                 f"{veredicto.decision} ({veredicto.reason})")
     return {"ok": False, "quality": "OK" if veredicto.reason == "DAILY_LOSS_LIMIT" else "UNKNOWN",
             "reason_code": veredicto.reason or veredicto.decision,
-            "reason": "orçamento/capacidade não admitiram o risco final",
+            "reason": ("margem livre real não cobre a proposta"
+                       if str(veredicto.reason or "").startswith(("INSUFFICIENT_FREE_MARGIN",
+                                                                 "FREE_MARGIN"))
+                       else "orçamento/capacidade não admitiram o risco final"),
             "checks": checks}
 
 
@@ -1337,6 +1366,77 @@ def _entry_intent_identity(rec: dict, side: str, purpose: str = "ENTRY"):
         return None
 
 
+#: Custo conservador de ida e volta reservado JUNTO da margem, em bps sobre o
+#: notional. É uma MARGEM DE SEGURANÇA (limite superior da taxa taker da
+#: Binance USD-M), não um número de contabilidade: ela só torna o gate mais
+#: severo e nunca faz uma proposta caber.
+MARGIN_COST_BPS_PER_SIDE = 5.0
+
+
+def _proposed_margin_usd(*, entry: float, qty: float, leverage) -> Optional[float]:
+    """Margem incremental + custos conservadores da proposta.
+
+    `notional / leverage` é a MESMA fórmula do cap de margem já existente —
+    nada de política nova. Parcela ausente/não-finita devolve None, e o caller
+    BLOQUEIA: desconhecido não vira zero nem estimativa favorável.
+    """
+    try:
+        preco, quantidade = float(entry), float(qty)
+        alavancagem = max(int(leverage or 1), 1)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (preco, quantidade)) or preco <= 0 or quantidade <= 0:
+        return None
+    notional = preco * quantidade
+    custos = notional * (2.0 * MARGIN_COST_BPS_PER_SIDE / 10_000.0)
+    return (notional / alavancagem) + custos
+
+
+async def _free_margin_snapshot():
+    """Carteira FRESCA da conta compartilhada, com prova temporal.
+
+    Leitura feita FORA de qualquer transação/lock; a idade é conferida dentro
+    da admissão. `available_usd` já desconta a margem em uso na conta —
+    inclusive a da posição manual — e NÃO é somada de volta.
+    """
+    try:
+        from services import exchange_service
+        carteira = await exchange_service.get_equity(force=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[margem] carteira indisponível: {type(exc).__name__}")
+        return None
+    if not isinstance(carteira, dict) or not carteira.get("ok"):
+        return None
+    disponivel = carteira.get("available_usd")
+    try:
+        disponivel = float(disponivel)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(disponivel):
+        return None
+    idade = carteira.get("age_sec")
+    idade = float(idade) if isinstance(idade, (int, float)) and not isinstance(idade, bool) else 0.0
+    return {"available_usd": disponivel,
+            "as_of_ms": int(time.time() * 1000) - int(max(0.0, idade) * 1000),
+            "source": carteira.get("source")}
+
+
+async def _manual_entry_block(symbol) -> Optional[dict]:
+    """Símbolo indisponível por posição manual reconhecida (ou prova incerta).
+
+    Roda ANTES da reserva — e, portanto, antes da primeira mutação de conta
+    (o `set_leverage` da entrada).
+    """
+    try:
+        from services import manual_position_service as mps
+        verdict = await mps.ownership_guard(symbol, action="entry")
+    except Exception as exc:  # noqa: BLE001
+        return {"reason_code": "MANUAL_OWNERSHIP_GUARD_ERROR", "detail": type(exc).__name__}
+    if verdict.get("allowed"):
+        return None
+    return {"reason_code": verdict.get("reason_code"), "detail": verdict.get("detail")}
+
+
 async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: float,
                                 tp1, tp2, qty: float, equity_usd: float) -> dict:
     """Reserva a intenção ANTES de qualquer mutação de ordem."""
@@ -1344,6 +1444,10 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
     from db import get_session
     blocked = {"granted": False, "decision": intents.UNAVAILABLE, "reason": "IDENTITY_UNAVAILABLE",
                "dispatched": False}
+    impedimento = await _manual_entry_block(rec.get("symbol"))
+    if impedimento is not None:
+        return {**blocked, "decision": intents.BLOCKED_CAPACITY,
+                "reason": impedimento.get("reason_code")}
     identity = _entry_intent_identity(rec, side)
     if identity is None:
         return blocked
@@ -1371,8 +1475,18 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
                                   limit_usd=orcamento.get("limit_usd"),
                                   complete=bool(orcamento.get("complete")))
               if orcamento.get("enabled") else None)
+    # Margem REAL: limite INDEPENDENTE do orçamento nominal do bot. A posição
+    # manual não devolve margem nenhuma — ela já saiu do `available_usd`.
+    carteira = await _free_margin_snapshot()
+    requerida = _proposed_margin_usd(entry=entry, qty=qty,
+                                     leverage=rec.get("leverage"))
+    margin = intents.MarginGate(
+        available_usd=(carteira or {}).get("available_usd"),
+        required_usd=requerida if requerida is not None else 0.0,
+        as_of_ms=(carteira or {}).get("as_of_ms"),
+        complete=bool(carteira is not None and requerida is not None))
     reservation = await intents.reserve(get_session, identity, payload, owner=_INTENT_OWNER,
-                                        capacity=capacity, budget=budget,
+                                        capacity=capacity, budget=budget, margin=margin,
                                         # Stop/qty planejados ficam gravados ANTES
                                         # do POST: depois do envio não há de onde
                                         # recuperá-los para adotar o SL existente.
@@ -1383,7 +1497,7 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
             "reason": reservation.reason, "intent_key": reservation.intent_key,
             "client_order_id": reservation.client_order_id, "state": reservation.state,
             "account_ref": identity.account_ref, "capacity": capacity,
-            "dispatched": False}
+            "leverage": rec.get("leverage"), "dispatched": False}
 
 
 async def _intent_dispatch_guard(intent) -> bool:
@@ -3293,7 +3407,8 @@ async def _cleanup_trade_conditionals_after_flat(trade, context: str) -> bool:
             if not algo_id:
                 continue
             try:
-                result = await exchange_service.cancel_algo_order(algo_id)
+                result = await exchange_service.cancel_algo_order(
+                    algo_id, symbol=getattr(trade, "symbol", None))
             except Exception as exc:
                 result = {"ok": False, "error": str(exc)}
             if not _cancel_result_is_terminal(result):
@@ -3757,7 +3872,8 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
             oid = getattr(current_trade, oid_field, None)
             if oid:
                 try:
-                    res = await exchange_service.cancel_algo_order(str(oid))
+                    res = await exchange_service.cancel_algo_order(
+                        str(oid), symbol=getattr(current_trade, "symbol", None))
                     if not _cancel_result_is_terminal(res):
                         cancel_failures.append(
                             f"{oid_field}={oid}: {res.get('msg') or res.get('error') or 'incerto'}"

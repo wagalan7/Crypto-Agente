@@ -164,6 +164,27 @@ class DailyBudget:
 
 
 @dataclass(frozen=True)
+class MarginGate:
+    """MARGEM realmente disponível na conta COMPARTILHADA com o operador.
+
+    Limite INDEPENDENTE do orçamento nominal do bot: caber no risco aprovado
+    não prova que há saldo livre para abrir. `available_usd` já reflete a
+    margem usada na conta (inclusive a da posição manual) — ela NÃO é somada de
+    volta, e a margem das posições abertas NÃO é descontada de novo.
+
+    `as_of_ms` é a prova temporal da leitura feita FORA da transação; ela é
+    conferida DENTRO dela. Parcela ausente/incompleta BLOQUEIA: desconhecido
+    nunca vira zero nem estimativa favorável.
+    """
+
+    available_usd: Optional[float] = None
+    required_usd: float = 0.0
+    as_of_ms: Optional[int] = None
+    max_age_s: float = 30.0
+    complete: bool = False
+
+
+@dataclass(frozen=True)
 class Reservation:
     decision: str
     intent_key: Optional[str] = None
@@ -252,6 +273,7 @@ async def _admission_view(session, identity: EntryIdentity, key: str) -> Optiona
     base = visao.get("base") if isinstance(visao.get("base"), dict) else {}
     return {"pending_count": int(visao.get("pending_count") or 0),
             "pending_risk": float(visao.get("pending_risk_usd") or 0.0),
+            "pending_margin": float(visao.get("pending_margin_usd") or 0.0),
             "open_positions": int(visao.get("open_positions") or 0),
             "open_risk_usd": risco, "open_risk_complete": completo,
             "base_usd": (_finite(base.get("value")) if base.get("quality") == "OK"
@@ -308,6 +330,39 @@ def _budget_reason(budget: Optional[DailyBudget], pending_risk: float,
     return "DAILY_LOSS_LIMIT" if worst <= -limit else None
 
 
+def _margin_reason(margin: Optional[MarginGate], pending_margin: float,
+                   *, now_ms: Optional[int] = None) -> Optional[str]:
+    """Bloqueia quando a margem livre REAL não cobre esta proposta.
+
+    As margens já reservadas por OUTRAS intenções pendentes entram na conta —
+    lidas sob a MESMA lock —, então duas propostas concorrentes não gastam o
+    mesmo saldo livre. Sem gate informado não há veredicto (contrato legado).
+    """
+    if margin is None:
+        return None
+    disponivel = _finite(margin.available_usd)
+    if not margin.complete or disponivel is None:
+        return "FREE_MARGIN_UNKNOWN"
+    if margin.as_of_ms is None:
+        return "FREE_MARGIN_UNKNOWN"
+    agora = int(now_ms if now_ms is not None else _now().timestamp() * 1000)
+    idade_s = max(0.0, (agora - int(margin.as_of_ms)) / 1000.0)
+    limite = _finite(margin.max_age_s)
+    if limite is None or limite <= 0 or idade_s > limite:
+        # Carteira lida antes da transição intenção → ordem → posição não vale
+        # como atual: o caller refaz a leitura ou bloqueia.
+        return "FREE_MARGIN_STALE"
+    requerido = _finite(margin.required_usd)
+    if requerido is None or requerido < 0:
+        return "FREE_MARGIN_UNKNOWN"
+    reservado = _finite(pending_margin)
+    if reservado is None:
+        return "FREE_MARGIN_UNKNOWN"
+    if disponivel - abs(reservado) - requerido < 0:
+        return "INSUFFICIENT_FREE_MARGIN"
+    return None
+
+
 def _capacity_reason(capacity: Capacity, pending_count: int, pending_risk: float) -> Optional[str]:
     if capacity.max_open_positions is not None:
         if capacity.open_positions + pending_count + 1 > capacity.max_open_positions:
@@ -338,6 +393,7 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                   owner: str, lease_seconds: int = DEFAULT_LEASE_SECONDS,
                   capacity: Optional[Capacity] = None,
                   budget: Optional[DailyBudget] = None,
+                  margin: Optional[MarginGate] = None,
                   decision: Optional[dict] = None,
                   now: Optional[datetime] = None) -> Reservation:
     """Reserva (ou recupera) a intenção em UMA transação, antes de qualquer POST.
@@ -362,7 +418,7 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
             if row is None:
                 # Decisão nova: admissão de capacidade sob a mesma lock.
                 visao = None
-                if capacity is not None or budget is not None:
+                if capacity is not None or budget is not None or margin is not None:
                     # UMA leitura consistente para capacidade E orçamento.
                     visao = await _admission_view(session, identity, key)
                     if visao is None:
@@ -397,6 +453,14 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
+                # Margem REAL da conta compartilhada: limite independente do
+                # orçamento nominal. Passar em um não dispensa o outro.
+                if margin is not None:
+                    denial = _margin_reason(margin, visao["pending_margin"],
+                                            now_ms=int(moment.timestamp() * 1000))
+                    if denial:
+                        await session.rollback()
+                        return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
                 session.add(EntryIntent(
                     intent_key=key, client_order_id=coid, account_ref=identity.account_ref,
                     exchange=identity.exchange, symbol=identity.symbol, quote=identity.quote,
@@ -407,6 +471,8 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     payload_fingerprint=fingerprint, state=STATE_RESERVED, reason=None,
                     lease_owner=owner, lease_expires_at=deadline, attempts=1, dispatches=0,
                     reserved_risk_usd=max(0.0, float(capacity.risk_usd) if capacity else 0.0),
+                    reserved_margin_usd=max(0.0, _finite(margin.required_usd) or 0.0)
+                    if margin is not None else 0.0,
                     # Gravado ANTES de qualquer POST: depois do envio não há de
                     # onde recuperar stop/qty da decisão que originou a ordem.
                     decision_payload=decision_snapshot(decision if decision is not None
@@ -455,15 +521,20 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
             # Retomada da MESMA decisão: se a tentativa agora carrega risco
             # MAIOR (preço/qty adversos), a diferença passa pela mesma admissão —
             # confiar no valor antigo, menor, admitiria risco nunca aprovado.
-            if capacity is not None or budget is not None:
+            if capacity is not None or budget is not None or margin is not None:
                 novo = max(0.0, _finite(capacity.risk_usd) or 0.0) if capacity else 0.0
                 antigo = max(0.0, _finite(row.reserved_risk_usd) or 0.0)
-                if novo > antigo + 1e-9:
-                    denial = await _readmit(session, identity, key, capacity, budget, novo)
+                nova_margem = (max(0.0, _finite(margin.required_usd) or 0.0)
+                               if margin is not None else 0.0)
+                margem_antiga = max(0.0, _finite(row.reserved_margin_usd) or 0.0)
+                if novo > antigo + 1e-9 or nova_margem > margem_antiga + 1e-9:
+                    denial = await _readmit(session, identity, key, capacity, budget,
+                                            max(novo, antigo), margin=margin)
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, current_state, denial)
-                    row.reserved_risk_usd = novo
+                    row.reserved_risk_usd = max(novo, antigo)
+                    row.reserved_margin_usd = max(nova_margem, margem_antiga)
             if not row.decision_payload:
                 # Linha antiga (ou criada sem os dados): completa sem sobrescrever
                 # o que já estiver gravado — a decisão em si não mudou (mesmo
@@ -481,12 +552,18 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
 
 async def _readmit(session, identity: EntryIdentity, key: str,
                    capacity: Optional[Capacity], budget: Optional[DailyBudget],
-                   risk_usd: float) -> Optional[str]:
-    """Reavalia capacidade e orçamento para um risco MAIOR da MESMA decisão,
-    dentro da transação/lock já abertas. Devolve o motivo da negação ou None."""
+                   risk_usd: float, *,
+                   margin: Optional[MarginGate] = None) -> Optional[str]:
+    """Reavalia capacidade, orçamento e MARGEM para um risco/margem MAIORES da
+    MESMA decisão, dentro da transação/lock já abertas. Devolve o motivo da
+    negação ou None."""
     visao = await _admission_view(session, identity, key)
     if visao is None:
         return "ADMISSION_SNAPSHOT_UNAVAILABLE"
+    if margin is not None:
+        denial = _margin_reason(margin, visao["pending_margin"])
+        if denial:
+            return denial
     if capacity is not None:
         open_positions = max(int(capacity.open_positions or 0), visao["open_positions"])
         caller_risk = _finite(capacity.open_risk_usd)
@@ -510,6 +587,7 @@ async def _readmit(session, identity: EntryIdentity, key: str,
 async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
                            risk_usd: float, capacity: Optional[Capacity] = None,
                            budget: Optional[DailyBudget] = None,
+                           margin: Optional[MarginGate] = None,
                            now: Optional[datetime] = None) -> Reservation:
     """Admissão FINAL, imediatamente antes do POST, com o risco realmente
     proposto (preço/qty já revalidados).
@@ -544,13 +622,22 @@ async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
             if proposto is None or proposto < 0:
                 await session.rollback()
                 return Reservation(BLOCKED_CAPACITY, intent_key, coid, state, "PROPOSED_RISK_UNKNOWN")
-            denial = await _readmit(session, identity, intent_key, capacity, budget, proposto)
+            denial = await _readmit(session, identity, intent_key, capacity, budget,
+                                    proposto, margin=margin)
             if denial:
                 await session.rollback()
                 return Reservation(BLOCKED_CAPACITY, intent_key, coid, state, denial)
             if proposto > (_finite(row.reserved_risk_usd) or 0.0) + 1e-9:
                 row.reserved_risk_usd = proposto
                 row.updated_at = moment
+            if margin is not None:
+                # A margem FINAL (após arredondamentos) substitui a reservada
+                # quando for maior: o valor antigo, menor, deixaria um intervalo
+                # sem reserva entre a intenção e a posição.
+                final = max(0.0, _finite(margin.required_usd) or 0.0)
+                if final > (_finite(row.reserved_margin_usd) or 0.0) + 1e-9:
+                    row.reserved_margin_usd = final
+                    row.updated_at = moment
             await session.commit()
             return Reservation(RESERVED_RESUMED, intent_key, coid, state)
     except Exception:

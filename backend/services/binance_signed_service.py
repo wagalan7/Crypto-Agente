@@ -1004,6 +1004,30 @@ def _filter_positions(data, symbol: Optional[str]):
     return [p for p in data if p.get("symbol") == norm]
 
 
+def _explicit_position_side(raw) -> Optional[str]:
+    """`BOTH`/`LONG`/`SHORT` conforme a Binance devolveu. Ausente/desconhecido
+    → None: em conta hedge, assumir `BOTH` trocaria a perna identificada."""
+    valor = str(raw or "").strip().upper()
+    return valor if valor in ("BOTH", "LONG", "SHORT") else None
+
+
+def _exchange_update_time_ms(raw) -> Optional[int]:
+    """`updateTime` da posição, em ms. Ausente/inválido/<=0 → None.
+
+    Limitação do provedor (documentada): a Binance NÃO expõe um id de posição;
+    `updateTime` é a única versão temporal observável e muda a cada alteração
+    da posição. Sem ele não há como demonstrar continuidade — e o consumidor
+    mantém UNKNOWN em vez de inventar um relógio local.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        valor = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return valor if valor > 0 else None
+
+
 async def get_positions(symbol: Optional[str] = None, *, force: bool = False) -> dict:
     """Leitura de posições com cache curto + cooldown anti-ban.
 
@@ -1081,10 +1105,48 @@ async def get_positions(symbol: Optional[str] = None, *, force: bool = False) ->
             "position_value": float(p.get("notional") or 0),
             "take_profit": None,  # Binance não retorna TP/SL nesse endpoint
             "stop_loss": None,
+            # ADITIVOS (convivência manual/bot): identidade da perna e versão
+            # temporal REAL da posição. Campo ausente/inválido vira None — NÃO
+            # vira "BOTH" nem horário local, porque isso fabricaria identidade.
+            "position_side": _explicit_position_side(p.get("positionSide")),
+            "update_time_ms": _exchange_update_time_ms(p.get("updateTime")),
         })
     _positions_cache["data"] = positions
     _positions_cache["ts"] = now
     return _ok(positions)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Guard de PROPRIEDADE (convivência manual/bot) no TRANSPORTE
+# ════════════════════════════════════════════════════════════════════════════
+#  Uma posição manual RECONHECIDA deixa o símbolo inteiro indisponível para o
+#  bot. Bloquear só o POST de entrada seria insuficiente: `set_leverage` já
+#  alteraria a posição do operador. Por isso o guard vive na borda do
+#  transporte — todo caminho (entrada normal/maker, fallback, flip, hedge,
+#  pyramiding, TF upgrade, proteção, fechamento, time-stop, BE/trailing,
+#  autoheal/backfill e poeira) passa por uma destas funções.
+#
+#  O guard NÃO consulta a exchange: ele roda dentro de locks/semáforos da
+#  própria requisição, onde I/O HTTP recursivo é proibido. A prova é o registro
+#  persistido de reconhecimento, e registro ilegível BLOQUEIA (fail-closed).
+async def _manual_ownership_block(symbol, action: str) -> Optional[dict]:
+    """Devolve o motivo do bloqueio, ou None quando o bot pode mutar."""
+    try:
+        from services import manual_position_service as mps
+        verdict = await mps.ownership_guard(symbol, action=action)
+    except Exception as exc:  # noqa: BLE001 — dúvida NUNCA libera mutação
+        return {"ok": False, "reason_code": "MANUAL_OWNERSHIP_GUARD_ERROR",
+                "error": f"guard de propriedade indisponível: {type(exc).__name__}",
+                "manual_ownership_blocked": True, "action": action}
+    if verdict.get("allowed"):
+        return None
+    log.warning(f"[manual-ack] {action} BLOQUEADO em {symbol}: "
+                f"{verdict.get('reason_code')}")
+    return {"ok": False, "reason_code": verdict.get("reason_code"),
+            "error": (verdict.get("detail")
+                      or "símbolo indisponível: posição manual reconhecida"),
+            "manual_ownership_blocked": True, "action": action,
+            "symbol": verdict.get("symbol")}
 
 
 async def place_protection_orders(
@@ -1120,6 +1182,14 @@ async def place_protection_orders(
         "tp1_skipped": bool,  # true se qty*0.45 arredondou pra 0 → manda 100% no TP2
       }
     """
+    bloqueio = await _manual_ownership_block(symbol, "place_protection_orders")
+    if bloqueio is not None:
+        # Nunca instalamos/substituímos proteção numa posição manual: o
+        # reconhecimento NÃO certifica proteção e não autoriza inventar um SL.
+        return {**bloqueio, "sl_ok": False, "tp1_ok": False, "tp2_ok": False,
+                "sl_order_id": None, "tp1_order_id": None, "tp2_order_id": None,
+                "sl_msg": bloqueio.get("error"), "tp1_qty": 0.0,
+                "tp1_skipped": False}
     sym = to_binance(symbol) if "/" in symbol else symbol
     binance_entry_side = entry_side.upper()
     counter_side = "SELL" if binance_entry_side == "BUY" else "BUY"
@@ -1760,7 +1830,7 @@ async def _cleanup_entry_conditionals(
 
     for algo_id in sorted(known_ids):
         try:
-            res = await cancel_algo_order(algo_id)
+            res = await cancel_algo_order(algo_id, symbol=symbol)
         except Exception as exc:
             res = {"ok": False, "error": str(exc)}
         if _algo_cancel_is_terminal(res):
@@ -1843,7 +1913,7 @@ async def _cleanup_entry_conditionals(
                 )
                 continue
             try:
-                cancel_res = await cancel_algo_order(algo_id)
+                cancel_res = await cancel_algo_order(algo_id, symbol=symbol)
             except Exception as exc:
                 cancel_res = {"ok": False, "error": str(exc)}
             if _algo_cancel_is_terminal(cancel_res):
@@ -2124,6 +2194,15 @@ async def place_order(
 
     Retorno enriquecido com sl_ok/tp1_ok/tp2_ok pra caller propagar diagnóstico.
     """
+    bloqueio = await _manual_ownership_block(symbol, "place_order")
+    if bloqueio is not None:
+        return {**bloqueio, "entry_not_submitted": True, "no_fill": True,
+                "submitted_qty": 0.0, "planned_qty": qty,
+                "safety_state": "ENTRY_NOT_SUBMITTED",
+                "entry_state": "NOT_SUBMITTED",
+                "manual_intervention_required": False,
+                "quarantine_required": False,
+                "client_order_id": client_order_id}
     sym = to_binance(symbol) if "/" in symbol else symbol
     binance_side = side.upper()  # BUY | SELL
     binance_type = "MARKET" if order_type == "Market" else "LIMIT"
@@ -2245,6 +2324,14 @@ async def place_order(
                 "reason": "MARKET_LOT_SIZE/MIN_NOTIONAL não confirmados",
                 "checks": {"market_rules": market_rules},
             }
+        # Reconfirmação DEPOIS do throttle/espera: entre o guard de entrada e
+        # este ponto a posição manual pode ter sido reconhecida.
+        tardio = await _manual_ownership_block(symbol, "place_order_preflight")
+        if tardio is not None:
+            return {"ok": False, "quality": "UNKNOWN",
+                    "reason_code": tardio.get("reason_code"),
+                    "reason": tardio.get("error"), "checks": {},
+                    "manual_ownership_blocked": True}
         try:
             verdict = await entry_preflight(float(qty_rounded), dict(market_rules))
         except Exception as exc:  # noqa: BLE001 — entrada real falha fechada
@@ -2762,6 +2849,16 @@ async def place_maker_entry_then_protect(
       was_maker (bool), fell_back_to_market (bool), entry_fill_price,
       executed_qty, no_fill (bool).
     """
+    bloqueio = await _manual_ownership_block(symbol, "maker_entry")
+    if bloqueio is not None:
+        return {**bloqueio, "entry_not_submitted": True, "no_fill": True,
+                "submitted_qty": 0.0, "planned_qty": qty, "was_maker": True,
+                "fell_back_to_market": False,
+                "safety_state": "ENTRY_NOT_SUBMITTED",
+                "entry_state": "NOT_SUBMITTED",
+                "manual_intervention_required": False,
+                "quarantine_required": False,
+                "client_order_id": client_order_id}
     sym = to_binance(symbol) if "/" in symbol else symbol
     poll_timeout_s = _MAKER_POLL_TIMEOUT_S if poll_timeout_s is None else poll_timeout_s
     poll_interval_s = _MAKER_POLL_INTERVAL_S if poll_interval_s is None else poll_interval_s
@@ -2873,6 +2970,13 @@ async def place_maker_entry_then_protect(
     # throttle e imediatamente antes do request. Assim nenhuma espera assíncrona
     # separa a quote/runtime guard aprovados do POST de entrada.
     async def _entry_request_preflight() -> dict:
+        # Reconfirmação DEPOIS do throttle, imediatamente antes do POST.
+        tardio = await _manual_ownership_block(symbol, "maker_entry_preflight")
+        if tardio is not None:
+            return {"ok": False, "quality": "UNKNOWN",
+                    "reason_code": tardio.get("reason_code"),
+                    "reason": tardio.get("error"),
+                    "manual_ownership_blocked": True}
         if entry_preflight is None:
             return {"ok": True}
         try:
@@ -3353,6 +3457,9 @@ async def place_maker_entry_then_protect(
 
 
 async def cancel_order(symbol: str, order_id: Optional[str] = None, client_order_id: Optional[str] = None) -> dict:
+    bloqueio = await _manual_ownership_block(symbol, "cancel_order")
+    if bloqueio is not None:
+        return bloqueio
     sym = to_binance(symbol) if "/" in symbol else symbol
     params = {"symbol": sym}
     if order_id:
@@ -3364,10 +3471,18 @@ async def cancel_order(symbol: str, order_id: Optional[str] = None, client_order
     return await _signed_request("DELETE", "/fapi/v1/order", params)
 
 
-async def cancel_algo_order(algo_id: str) -> dict:
-    """Cancela uma ordem CONDITIONAL (SL/TP) criada via /fapi/v1/algoOrder."""
+async def cancel_algo_order(algo_id: str, *, symbol: Optional[str] = None) -> dict:
+    """Cancela uma ordem CONDITIONAL (SL/TP) criada via /fapi/v1/algoOrder.
+
+    `symbol` é ADITIVO e existe para o guard de propriedade: sem ele, havendo
+    QUALQUER reconhecimento manual ativo, a prova é inconclusiva e o cancel é
+    bloqueado — nunca se cancela condicional de posição alheia por omissão.
+    """
     if not algo_id:
         return {"ok": False, "error": "algo_id vazio"}
+    bloqueio = await _manual_ownership_block(symbol, "cancel_algo_order")
+    if bloqueio is not None:
+        return bloqueio
     return await _signed_request("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id})
 
 
@@ -3420,6 +3535,11 @@ async def get_open_algo_orders(symbol: Optional[str] = None) -> dict:
 
 
 async def set_leverage(symbol: str, leverage: int) -> dict:
+    # Alavancagem é ALTERAÇÃO DE POSIÇÃO: num símbolo manual reconhecido ela
+    # mexeria na posição do operador ANTES de qualquer POST de entrada.
+    bloqueio = await _manual_ownership_block(symbol, "set_leverage")
+    if bloqueio is not None:
+        return bloqueio
     res = await _signed_request("POST", "/fapi/v1/leverage", {
         "symbol": symbol, "leverage": leverage,
     })

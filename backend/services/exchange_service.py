@@ -48,7 +48,7 @@ cancel_order = _client.cancel_order
 if hasattr(_client, "cancel_algo_order"):
     cancel_algo_order = _client.cancel_algo_order
 else:
-    async def cancel_algo_order(algo_id: str) -> dict:  # type: ignore
+    async def cancel_algo_order(algo_id: str, *, symbol=None) -> dict:  # type: ignore
         return {"ok": False, "error": f"cancel_algo_order não suportado em {ACTIVE_EXCHANGE}"}
 # get_open_algo_orders idem — só Binance. Stub retorna ok=False (caller trata
 # como "incerto" e NÃO recria ordens, evitando duplicação).

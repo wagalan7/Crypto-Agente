@@ -53,9 +53,21 @@ class State:
     FLAT = "FLAT"                    # terminal seguro
     RETRY_PENDING = "RETRY_PENDING"  # segurança (continua pausado)
     MANUAL_REQUIRED = "MANUAL_REQUIRED"  # segurança (continua pausado)
+    #: Terminal ESPECÍFICO: posição aberta do operador, reconhecida
+    #: explicitamente. NÃO é FLAT (a posição existe) e NÃO é PROTECTED
+    #: (reconhecer não certifica proteção). Só o incidente
+    #: `UNTRACKED_POSITION` daquela posição pode terminar assim.
+    MANUAL_ACKNOWLEDGED = "MANUAL_ACKNOWLEDGED"
 
 
+#: Estados que PROVAM segurança de uma observação de ENTRADA. Note que
+#: `MANUAL_ACKNOWLEDGED` NÃO entra aqui: reconhecer uma posição do operador não
+#: diz NADA sobre o desfecho de uma ordem despachada pelo bot — usá-lo como
+#: prova liquidaria intenção sem evidência.
 _TERMINAL_SAFE = {State.PROTECTED, State.FLAT}
+#: Estados em que o incidente está ENCERRADO com desfecho conhecido (inclui o
+#: reconhecimento manual). Só para contabilidade de ciclo/escalonamento.
+_TERMINAL_CLOSED = _TERMINAL_SAFE | {State.MANUAL_ACKNOWLEDGED}
 #: Desfecho COMPROVADO de um id despachado. `TERMINAL_ZERO` exige consulta
 #: terminal da própria identidade com quantidade final zero — FLAT, ausência de
 #: campo e lower-bound zero continuam sendo DESCONHECIDO.
@@ -1037,7 +1049,7 @@ async def _renew_or_abort(key: str, owner: str) -> bool:
 
 async def _schedule_retry(key: str, owner: str, inc: dict, state: str, reason: str) -> None:
     attempts = int(inc.get("attempts") or 0) + 1
-    if attempts >= RECONCILE_MAX_ATTEMPTS and state not in _TERMINAL_SAFE:
+    if attempts >= RECONCILE_MAX_ATTEMPTS and state not in _TERMINAL_CLOSED:
         ok = await _fenced(key, owner, state=State.MANUAL_REQUIRED, attempts=attempts,
                            last_error=reason,
                            manual_reason=f"máx. tentativas ({attempts}) sem prova de segurança: {reason}")
@@ -1685,7 +1697,7 @@ async def _cancel_extra_conditionals(key: str, owner: str, inc: dict, keep_id: O
         if not await _renew_or_abort(key, owner):
             return False, "lease perdido no meio do cancelamento — abortado"
         try:
-            res = await bss.cancel_algo_order(str(aid))
+            res = await bss.cancel_algo_order(str(aid), symbol=inc.get("symbol"))
         except Exception as exc:  # noqa: BLE001
             res = {"ok": False, "error": str(exc)}
         if not (res and res.get("ok")):   # ok=False NÃO é sucesso
@@ -1768,7 +1780,7 @@ async def _reconcile_cleanup(key: str, owner: str, inc: dict, *, confirmed_flat:
             if not await _renew_or_abort(key, owner):   # lease por CADA mutação
                 return
             try:
-                res = await bss.cancel_algo_order(str(algo_id))
+                res = await bss.cancel_algo_order(str(algo_id), symbol=inc.get("symbol"))
             except Exception as exc:  # noqa: BLE001
                 res = {"ok": False, "error": str(exc)}
             if not (res and res.get("ok")):     # ok=False NÃO é sucesso
@@ -1812,6 +1824,76 @@ UNTRACKED_RECHECK_S = _f("P03_UNTRACKED_RECHECK_S", 900.0)
 _untracked_recheck_at: dict = {}
 
 
+async def _revalidate_manual_acks(raw_positions) -> dict:
+    """Revalida reconhecimentos manuais com a leitura fresca JÁ feita no ciclo.
+
+    Nunca gasta uma segunda chamada à exchange e nunca converte erro em "sem
+    reconhecimento": `ok=False` mantém o bloqueio.
+    """
+    try:
+        from services import manual_position_service as mps
+        return await mps.revalidate_active(
+            positions=mps.normalize_positions(raw_positions), observed_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03][manual-ack] revalidação falhou: {type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": "MANUAL_ACK_REVALIDATION_ERROR"}
+
+
+async def _manual_ack_outcome(inc: dict) -> dict:
+    """Desfecho do incidente UNTRACKED à luz do reconhecimento manual.
+
+    Só devolve `MANUAL_ACKNOWLEDGED` quando: existe reconhecimento ACTIVE para
+    AQUELE símbolo, a leitura fresca mostra UMA perna e a identidade observada
+    é IDÊNTICA à reconhecida. Qualquer dúvida mantém o incidente aberto — e
+    posição aberta jamais vira FLAT ou PROTECTED por este caminho.
+    """
+    simbolo = inc.get("symbol")
+    try:
+        from services import manual_position_service as mps
+        vinculo = await mps.ack_for_symbol(simbolo)
+        if not vinculo["ok"]:
+            return {"state": None, "reason": f"registro manual ilegível ({vinculo['reason_code']})"}
+        ack = vinculo["ack"]
+        if ack is None:
+            return {"state": None, "reason": "sem reconhecimento manual para o símbolo"}
+        leitura = await mps.observe_positions(mps.canonical_symbol(simbolo))
+        if not leitura["ok"]:
+            return {"state": None, "reason": f"leitura fresca indisponível ({leitura['reason_code']})"}
+        confere = await mps.revalidate_active(positions=leitura["positions"],
+                                              observed_ok=True)
+        if not confere["ok"]:
+            return {"state": None, "reason": f"revalidação indisponível ({confere['reason_code']})"}
+        if ack.get("id") not in (confere.get("valid") or []):
+            return {"state": None,
+                    "reason": "identidade manual divergente — autorização invalidada"}
+        return {"state": State.MANUAL_ACKNOWLEDGED,
+                "reason": (f"posição manual reconhecida (ack #{ack.get('id')}, "
+                           f"fingerprint {str(ack.get('fingerprint'))[:12]}…); "
+                           "o bot não administra esta posição")}
+    except Exception as exc:  # noqa: BLE001
+        return {"state": None, "reason": f"verificação manual falhou ({type(exc).__name__})"}
+
+
+async def _manual_ack_for_symbol(symbol) -> dict:
+    """Reconhecimento ACTIVE daquele símbolo. Erro ⇒ `ok=False` (mantém bloqueio)."""
+    try:
+        from services import manual_position_service as mps
+        return await mps.ack_for_symbol(symbol)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason_code": "MANUAL_ACK_REGISTRY_ERROR",
+                "detail": type(exc).__name__, "ack": None}
+
+
+async def _manual_symbol_free_of_orders(symbol) -> dict:
+    """Ausência FRESCA de ordens/condicionais do operador naquele símbolo."""
+    try:
+        from services import manual_position_service as mps
+        return await mps.symbol_has_live_orders(symbol)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason_code": "MANUAL_ORDERS_UNKNOWN",
+                "detail": type(exc).__name__}
+
+
 async def recheck_untracked_manual() -> dict:
     """Reavalia a CAUSA de incidentes `UNTRACKED_POSITION` em `MANUAL_REQUIRED`.
 
@@ -1850,10 +1932,39 @@ async def recheck_untracked_manual() -> dict:
         checked += 1
         gate, _fp = await _fresh_gate(inc)
         if gate != FreshGate.FLAT:
-            # Continua havendo (ou não dá para afirmar que não há) posição.
-            kept[key] = gate
-            await repo.update(key, last_error=f"re-check untracked: {gate}")
+            # Posição ABERTA (ou incerta). Único desfecho possível aqui é o
+            # reconhecimento manual explícito — nunca FLAT, nunca PROTECTED.
+            desfecho = await _manual_ack_outcome(inc)
+            if desfecho["state"] is None:
+                kept[key] = gate
+                await repo.update(key, last_error=f"re-check untracked: {gate}")
+                continue
+            if not await repo.claim(key, _PROCESS_ID,
+                                    _now() + timedelta(seconds=RECONCILE_LEASE_S)):
+                kept[key] = "CLAIM_PERDIDO"
+                continue
+            await _resolve(key, _PROCESS_ID, desfecho["state"], desfecho["reason"])
+            resolved += 1
             continue
+        # FLAT comprovado. Havendo reconhecimento manual ATIVO, o registro só é
+        # encerrado depois de provar que NÃO restam ordens/condicionais do
+        # operador — e nenhuma delas é cancelada pelo bot. Sem reconhecimento,
+        # o caminho legado segue igual.
+        vinculo = await _manual_ack_for_symbol(inc.get("symbol"))
+        if not vinculo.get("ok"):
+            kept[key] = "MANUAL_ACK_UNVERIFIED"
+            await repo.update(key, last_error="re-check untracked: registro manual ilegível")
+            continue
+        if vinculo.get("ack") is not None:
+            ordens = await _manual_symbol_free_of_orders(inc.get("symbol"))
+            if not ordens.get("ok"):
+                kept[key] = "MANUAL_ORDERS_UNKNOWN"
+                await repo.update(key, last_error="re-check untracked: ordens do símbolo incertas")
+                continue
+            if ordens.get("live"):
+                kept[key] = "MANUAL_ORDERS_LIVE"
+                await repo.update(key, last_error="re-check untracked: ordens manuais ainda vivas")
+                continue
         if not await repo.claim(key, _PROCESS_ID,
                                 _now() + timedelta(seconds=RECONCILE_LEASE_S)):
             kept[key] = "CLAIM_PERDIDO"
@@ -2585,6 +2696,17 @@ async def _detect_untracked_positions() -> dict:
         log.critical("[p03][boot] posições stale/incertas — quarentena armada (não assumo flat)")
         return {"status": "UNKNOWN", "count": 0}
     positions = [p for p in (res.get("positions") or []) if abs(_finite(p.get("size")) or 0) > 0]
+    # Reconhecimentos manuais são revalidados contra ESTA leitura fresca antes
+    # de o scan ser considerado seguro: identidade divergente invalida a
+    # autorização e reabre a contenção; registro ilegível mantém bloqueio.
+    revalidacao = await _revalidate_manual_acks(positions)
+    if not revalidacao["ok"]:
+        _boot_scan_safe = False
+        await _arm_quarantine(
+            f"boot: reconhecimento manual não revalidado ({revalidacao['reason_code']})")
+        log.critical("[p03][boot] reconhecimento manual não revalidado "
+                     f"({revalidacao['reason_code']}) — quarentena armada")
+        return {"status": "UNKNOWN", "count": 0}
     if not positions:
         _boot_scan_safe = True          # leitura fresh confirmou conta flat
         return {"status": "FLAT", "count": 0}

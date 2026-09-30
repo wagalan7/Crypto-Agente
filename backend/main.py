@@ -39,7 +39,8 @@ else:
 import pandas as pd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, StrictBool
 
 from config import TIMEFRAMES, DEFAULT_TIMEFRAME, DEFAULT_LIMIT, ANTHROPIC_API_KEY, GROQ_API_KEY
 from services.binance_service import (
@@ -3092,6 +3093,61 @@ async def execution_incidents_status():
     return await _ers.get_status()
 
 
+# ── Convivência manual/bot — reconhecimento EXPLÍCITO de posição manual ─────
+#  Dois endpoints administrativos e nada mais: nenhum `resolve`, `clear-pause`,
+#  `enable-live` ou `execute` genérico, e nenhuma UI nova. Reconhecer NÃO
+#  autoriza entrada: o reconciliador oficial ainda valida segurança no ciclo
+#  dele antes de qualquer liberação pelo fluxo P03.
+@app.get("/api/admin/manual-positions/candidates")
+async def manual_positions_candidates(x_admin_token: Optional[str] = Header(None)):
+    """Posições FRESCAS da conta e o fingerprint que a confirmação vai exigir.
+
+    Somente leitura. Não devolve segredo, credencial nem stack trace.
+    """
+    gate = _check_admin_token(x_admin_token)
+    if gate is not None:
+        raise HTTPException(status_code=403, detail=gate["error"])
+    from services import manual_position_service as mps
+    return await mps.list_candidates()
+
+
+class ManualPositionAckRequest(BaseModel):
+    """Schema ESTRITO: campo extra é recusado, e `confirm` precisa ser o
+    booleano literal `true` (a string "true" ou 1 não valem)."""
+
+    model_config = {"extra": "forbid"}
+
+    symbol: str
+    fingerprint: str
+    confirm: StrictBool
+    reason: Optional[str] = None
+    identity_note: Optional[str] = None
+
+
+@app.post("/api/admin/manual-positions/acknowledge")
+async def manual_positions_acknowledge(
+    req: ManualPositionAckRequest,
+    x_admin_token: Optional[str] = Header(None),
+):
+    """Reconhece EXPLICITAMENTE uma posição aberta manualmente.
+
+    Relê a posição fresca, exige o fingerprint esperado e, sob a MESMA advisory
+    lock da admissão de entrada, confere ausência de rastro do BOT naquele
+    símbolo antes de gravar. Sucesso NÃO libera entrada nem pausa: o
+    reconciliador oficial ainda precisa validar segurança.
+    """
+    gate = _check_admin_token(x_admin_token)
+    if gate is not None:
+        raise HTTPException(status_code=403, detail=gate["error"])
+    from services import manual_position_service as mps
+    resultado = await mps.acknowledge(
+        symbol=req.symbol, expected_fingerprint=req.fingerprint,
+        confirm=req.confirm, reason=req.reason, identity_note=req.identity_note)
+    if not resultado.get("ok"):
+        return JSONResponse(status_code=409, content=resultado)
+    return resultado
+
+
 @app.post("/api/risk/kill-switch")
 async def risk_kill_switch(paused: bool = True, reason: str | None = None):
     """
@@ -3358,7 +3414,8 @@ async def admin_dedup_protection(req: DedupProtectionRequest):
     if not req.dry_run:
         for d in to_cancel:
             try:
-                r = await binance_signed_service.cancel_algo_order(d["algo_id"])
+                r = await binance_signed_service.cancel_algo_order(
+                    d["algo_id"], symbol=req.symbol)
                 cancelled.append({**d, "ok": bool(r.get("ok")), "msg": r.get("msg") or r.get("error")})
             except Exception as e:
                 cancelled.append({**d, "ok": False, "msg": str(e)})

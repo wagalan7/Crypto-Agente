@@ -790,7 +790,8 @@ abertas AS (
     WHERE source = :source AND status = 'open'
 ),
 reservas AS (
-    SELECT intent_key, reserved_risk_usd
+    SELECT intent_key, reserved_risk_usd,
+           COALESCE(reserved_margin_usd, 0) AS reserved_margin_usd
     FROM entry_intents
     WHERE (:account_ref)::text IS NOT NULL
       AND account_ref = :account_ref
@@ -895,15 +896,21 @@ async def admission_snapshot(session, *, account_ref=None, exchange=None,
     base = _base_from_parts(janela, exposure)
     reservas = snapshot["reservas"]
     risco_reservado = 0.0
+    margem_reservada = 0.0
     for linha in reservas:
         valor = _finite(linha.get("reserved_risk_usd"))
         risco_reservado += abs(valor) if valor is not None else 0.0
+        # MARGEM já reservada por outras intenções pendentes: lida na MESMA
+        # instrução, para que duas propostas não gastem o mesmo saldo livre.
+        margem = _finite(linha.get("reserved_margin_usd"))
+        margem_reservada += abs(margem) if margem is not None else 0.0
     return {"quality": base.get("quality"), "reason_code": base.get("reason_code"),
             "base": base, "as_of": moment,
             "open_rows": snapshot["abertas"],
             "open_positions": len(snapshot["abertas"]),
             "pending_count": len(reservas),
-            "pending_risk_usd": round(risco_reservado, 6)}
+            "pending_risk_usd": round(risco_reservado, 6),
+            "pending_margin_usd": round(margem_reservada, 6)}
 
 
 def _base_from_parts(janela: Dict[str, Any], exposure: Dict[str, Any]) -> Dict[str, Any]:
