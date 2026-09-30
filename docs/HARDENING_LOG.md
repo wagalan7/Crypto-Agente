@@ -2199,3 +2199,18 @@ coluna, ENV, flag, endpoint, scheduler ou fila nova; C intocado.
   no documento do fechamento, sem alteração desse teste.
 - H/C, estratégia, risco, defaults e arquivos pessoais preservados. Sem acesso
   a produção/exchange, push ou deploy. Não é declaração de ausência de bugs.
+
+## Publicação consolidada — dependência assíncrona (2026-09-30)
+
+- O deploy de `d44be9a9` instalou SQLAlchemy 2.1.1 pela faixa aberta
+  `sqlalchemy>=2.0.0`, sem `greenlet`. Ambos os serviços falharam no import
+  assíncrono antes de `init_db`, embora Railway inicialmente exibisse SUCCESS.
+- Fixado `sqlalchemy[asyncio]==2.0.50`: versão da suíte local já validada,
+  com dependência assíncrona explícita. Sem alteração dos serviços ou estratégias.
+- Dockerfile verifica importação, `greenlet_spawn` e construção do engine
+  assíncrono durante o build; não abre conexão nem requer credencial/banco.
+- Smoke no ambiente existente e em venv Python 3.11 limpo aprovados; instalação
+  limpa resolveu SQLAlchemy 2.0.50, asyncpg 0.31.0 e greenlet 3.5.6.
+  A suíte completa anterior não foi repetida para esta alteração de empacotamento.
+- Sem mudança de flags, limites ou schema neste hotfix; validação final de
+  migrações, boot e saúde depende da nova publicação, não só do status Railway.
