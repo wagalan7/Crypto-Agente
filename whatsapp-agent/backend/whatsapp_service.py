@@ -557,7 +557,24 @@ def extract_message_twilio(form: dict) -> tuple[str, str] | None:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _normalize_phone(phone: str) -> str:
-    digits = "".join(c for c in phone if c.isdigit())
-    if not digits.startswith("55"):
-        digits = "55" + digits
+    """Normaliza o telefone para o formato dos provedores (só dígitos, com DDI).
+
+    - 10 dígitos → BR local (DDD + fixo de 8): acrescenta o DDI 55.
+    - 11 dígitos COM '9' logo após o DDD → BR celular: acrescenta o DDI 55.
+      O '9' é o desempate: 11 dígitos também é o tamanho de um número dos EUA
+      (+1 e 10 dígitos), e lá o 3º dígito dificilmente é 9.
+    - qualquer outro tamanho → já traz o código do país: devolve como está.
+    - zeros à esquerda (0 de operadora, 00 internacional) são removidos.
+
+    Antes a regra era "se não começa com 55, prefixa 55", o que quebrava
+    pacientes do exterior: +351 968035444 (Portugal) virava 55351968035444 e o
+    WhatsApp respondia exists:false. De quebra, a regra por COMPRIMENTO conserta
+    o DDD 55 (Santa Maria/RS): '55987654321' era enviado como se o 55 fosse o
+    DDI, sem DDD; agora vira '5555987654321', que é o número certo.
+    """
+    digits = "".join(c for c in (phone or "") if c.isdigit()).lstrip("0")
+    if not digits:
+        return ""
+    if len(digits) == 10 or (len(digits) == 11 and digits[2] == "9"):
+        return "55" + digits
     return digits
