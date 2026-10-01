@@ -874,6 +874,23 @@ async def _arm_quarantine(reason: str) -> None:
             log.critical(f"[p03] falha persistindo pausa RiskState: {exc}")
 
 
+async def _manual_cause_pending() -> bool:
+    """Há causa MANUAL pendente (conta bloqueada ou falha local não persistida)?
+
+    Zero incidentes NÃO remove essa causa: ela é estado durável próprio.
+    """
+    try:
+        from services import manual_position_service as mps
+        if mps.pending_validation_failure() is not None:
+            return True
+        estado = await mps.account_validation_state()
+        return bool(estado.get("blocked"))
+    except Exception as exc:  # noqa: BLE001 — dúvida mantém a contenção
+        log.error(f"[p03][manual-ack] estado de validação ilegível: "
+                  f"{type(exc).__name__}: {exc}")
+        return True
+
+
 async def _maybe_release_quarantine() -> bool:
     """Release owner-aware do P03 sob LOCK LOCAL. Ordem OBRIGATÓRIA: valida
     boot_scan_safe → chama o release NO BANCO PRIMEIRO (transação + advisory lock,
@@ -886,6 +903,10 @@ async def _maybe_release_quarantine() -> bool:
         if not _p03_latch_armed:
             return False
         if not _boot_scan_safe:
+            return False
+        # Causa MANUAL pendente mantém a contenção mesmo com zero incidentes.
+        if await _manual_cause_pending():
+            _arm_local_latch("validação manual pendente — contenção mantida")
             return False
         try:
             from services import risk_service
@@ -1824,18 +1845,34 @@ UNTRACKED_RECHECK_S = _f("P03_UNTRACKED_RECHECK_S", 900.0)
 _untracked_recheck_at: dict = {}
 
 
-async def _revalidate_manual_acks(raw_positions, *, source_ok: bool = True) -> dict:
+async def capture_manual_context(*, scope=None, symbol=None):
+    """Captura a identidade ANTES de qualquer leitura externa do ciclo.
+
+    Chamada SEMPRE antes de `get_positions(force=True)`/listagens: o resultado
+    de um GET não pode fechar/validar o que mudou depois dele.
+    """
+    try:
+        from services import manual_position_service as mps
+        return await mps.capture_validation_context(
+            scope=scope or mps.SCOPE_ACCOUNT, symbol=symbol)
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03][manual-ack] captura de contexto falhou: "
+                  f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": "MANUAL_ACK_CONTEXT_ERROR"}
+
+
+async def _revalidate_manual_acks(raw_positions, *, source_ok: bool = True,
+                                  context=None) -> dict:
     """Revalida reconhecimentos com a leitura de CONTA já feita no ciclo.
 
-    A observação é montada com escopo/completude explícitos: uma leitura
-    filtrada jamais revalida a conta inteira. Nunca gasta uma segunda chamada à
-    exchange e nunca converte erro em "sem reconhecimento": `ok=False` mantém o
-    bloqueio.
+    `context` é a captura ANTERIOR à leitura; sem ela nada é publicado ou
+    encerrado (novo ciclo é agendado). Nunca gasta uma segunda chamada à
+    exchange e nunca converte erro em "sem reconhecimento".
     """
     try:
         from services import manual_position_service as mps
         observacao = mps.observation_from_rows(raw_positions, source_ok=source_ok)
-        return await mps.revalidate_active(observation=observacao)
+        return await mps.revalidate_active(observation=observacao, context=context)
     except Exception as exc:  # noqa: BLE001
         log.error(f"[p03][manual-ack] revalidação falhou: {type(exc).__name__}: {exc}")
         return {"ok": False, "reason_code": "MANUAL_ACK_REVALIDATION_ERROR"}
@@ -1845,18 +1882,23 @@ async def _revalidate_manual_acks_fresh() -> dict:
     """Observação de CONTA própria, para o ciclo que não fez leitura de posições.
 
     Integrada ao `reconcile_due` SEM depender de `_boot_scan_safe` nem da
-    existência de incidentes abertos: é essa revalidação recorrente que renova a
-    prova exigida antes de nova exposição.
+    existência de incidentes abertos. Antes de recuperar qualquer autorização,
+    uma falha PENDENTE local é persistida (§7.1.5).
     """
     try:
         from services import manual_position_service as mps
+        if mps.pending_validation_failure() is not None:
+            await mps.flush_pending_validation_failure()
         registro = await mps.active_acknowledgements()
         if not registro["ok"]:
             return {"ok": False, "reason_code": registro["reason_code"]}
-        if not registro["acks"]:
+        estado = await mps.account_validation_state()
+        if not registro["acks"] and not estado.get("blocked"):
             return {"ok": True, "reason_code": "NO_BLOCKING_ACKS", "valid": []}
+        # Captura ANTES do GET; a transação fecha antes da rede.
+        contexto = await mps.capture_validation_context(scope=mps.SCOPE_ACCOUNT)
         observacao = await mps.observe_positions()
-        return await mps.revalidate_active(observation=observacao)
+        return await mps.revalidate_active(observation=observacao, context=contexto)
     except Exception as exc:  # noqa: BLE001
         log.error(f"[p03][manual-ack] revalidação periódica falhou: "
                   f"{type(exc).__name__}: {exc}")
@@ -1885,13 +1927,21 @@ async def _manual_ack_outcome(inc: dict) -> dict:
             # NÃO encerram o incidente: falta confirmação nova.
             return {"state": None,
                     "reason": f"reconhecimento em {ack.get('state')} — não encerra a causa"}
-        # A observação usada aqui é do SÍMBOLO do incidente e só pode revalidar
-        # ELE. Nunca se passa uma leitura filtrada ao validador de conta.
+        # Captura ANTES do GET: um desfecho não pode encerrar a causa de um
+        # reconhecimento criado/alterado depois da leitura.
+        contexto = await mps.capture_validation_context(
+            scope=mps.SCOPE_SYMBOL, symbol=mps.canonical_symbol(simbolo))
+        if not contexto.get("ok"):
+            return {"state": None,
+                    "reason": f"contexto indisponível ({contexto.get('reason_code')})"}
         observacao = await mps.observe_positions(mps.canonical_symbol(simbolo))
         if not observacao["ok"]:
             return {"state": None,
                     "reason": f"leitura fresca indisponível ({observacao['reason_code']})"}
-        confere = await mps.revalidate_active(observation=observacao)
+        confere = await mps.revalidate_active(observation=observacao,
+                                              context=contexto)
+        if confere.get("reason_code") == mps.STALE_CONTEXT:
+            return {"state": None, "reason": "contexto vencido — novo ciclo"}
         if not confere["ok"]:
             return {"state": None, "reason": f"revalidação indisponível ({confere['reason_code']})"}
         if ack.get("id") not in (confere.get("valid") or []):
@@ -1961,6 +2011,10 @@ async def recheck_untracked_manual() -> dict:
             continue
         _untracked_recheck_at[key] = now
         checked += 1
+        # Contexto capturado ANTES da leitura de flat e das duas consultas de
+        # ordens: nenhuma delas pode encerrar um reconhecimento mais novo.
+        contexto_ciclo = await capture_manual_context(
+            scope=None, symbol=None)
         gate, _fp = await _fresh_gate(inc)
         if gate != FreshGate.FLAT:
             # Posição ABERTA (ou incerta). Único desfecho possível aqui é o
@@ -1985,6 +2039,10 @@ async def recheck_untracked_manual() -> dict:
         if not vinculo.get("ok"):
             kept[key] = "MANUAL_ACK_UNVERIFIED"
             await repo.update(key, last_error="re-check untracked: registro manual ilegível")
+            continue
+        if not contexto_ciclo.get("ok"):
+            kept[key] = "MANUAL_ACK_CONTEXT_UNAVAILABLE"
+            await repo.update(key, last_error="re-check untracked: contexto indisponível")
             continue
         if vinculo.get("ack") is not None:
             ordens = await _manual_symbol_free_of_orders(inc.get("symbol"))
@@ -2727,6 +2785,7 @@ async def _detect_untracked_positions() -> dict:
         if not bss.is_configured():
             _boot_scan_safe = True   # sem exchange real → nada a escanear
             return {"status": "FLAT", "count": 0}
+        contexto_manual = await capture_manual_context()
         res = await bss.get_positions(force=True)
     except Exception as exc:  # noqa: BLE001
         _boot_scan_safe = False
@@ -2742,7 +2801,7 @@ async def _detect_untracked_positions() -> dict:
     # Reconhecimentos manuais são revalidados contra ESTA leitura fresca antes
     # de o scan ser considerado seguro: identidade divergente invalida a
     # autorização e reabre a contenção; registro ilegível mantém bloqueio.
-    revalidacao = await _revalidate_manual_acks(positions)
+    revalidacao = await _revalidate_manual_acks(positions, context=contexto_manual)
     if not revalidacao["ok"]:
         _boot_scan_safe = False
         await _arm_quarantine(

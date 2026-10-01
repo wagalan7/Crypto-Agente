@@ -19,7 +19,10 @@ import hashlib
 import json
 import math
 import re
-from typing import Any, Mapping, Optional, Tuple
+import logging
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 from sqlalchemy import func, or_, select, text, update
 
@@ -234,13 +237,29 @@ def _margin_identity(account_ref, exchange, market) -> tuple:
             str(market or "usdm_futures").lower())
 
 
-async def current_margin_generation(session, *, account_ref: str, exchange: str,
-                                    market: str = "usdm_futures") -> int:
-    """Geração (época) vigente da interpretação de margem daquela conta.
+#: ORDEM ÚNICA DE LOCKS deste protocolo (evita a inversão que o PostgreSQL
+#: detectava como `deadlock detected`):
+#:
+#:   1. latch local (quando houver) ANTES de abrir a transação;
+#:   2. `BEGIN` → `pg_advisory_xact_lock(917283)` ANTES de qualquer leitura
+#:      decisória ou row lock;
+#:   3. linha da ÉPOCA da conta antes das linhas de intenção;
+#:   4. linhas de reconhecimento/intenção em ordem determinística de id/chave;
+#:   5. escrita/prova/CAS → commit único → liberação.
+#:
+#: Helpers internos recebem a sessão JÁ aberta: nenhum deles pode abrir outra
+#: conexão enquanto esta segura a advisory lock.
+_LOCK_SQL = text("SELECT pg_advisory_xact_lock(:k)")
 
-    Cria a linha com geração 0 na primeira consulta. DEVE ser chamada sob a
-    lock `917283` quando o valor for usado para decidir.
-    """
+
+async def acquire_risk_lock(session) -> None:
+    """Passo 2 da ordem única. Idempotente dentro da mesma transação."""
+    await session.execute(_LOCK_SQL, {"k": RISK_LOCK_KEY})
+
+
+async def _lock_epoch_row(session, *, account_ref: str, exchange: str,
+                          market: str = "usdm_futures"):
+    """Passo 3: trava (ou cria) a linha da época ANTES das intenções."""
     from models.account_margin_epoch import AccountMarginEpoch as Epoch
     conta, corretora, mercado = _margin_identity(account_ref, exchange, market)
     linha = (await session.execute(
@@ -248,9 +267,22 @@ async def current_margin_generation(session, *, account_ref: str, exchange: str,
                             Epoch.market == mercado).with_for_update())).scalar_one_or_none()
     if linha is None:
         linha = Epoch(account_scope=conta, exchange=corretora, market=mercado,
-                      generation=0, updated_at=_now())
+                      generation=0, manual_validation_generation=0,
+                      manual_validation_blocked=True, updated_at=_now())
         session.add(linha)
         await session.flush()
+    return linha
+
+
+async def current_margin_generation(session, *, account_ref: str, exchange: str,
+                                    market: str = "usdm_futures") -> int:
+    """Geração (época) vigente da interpretação de margem daquela conta.
+
+    Cria a linha com geração 0 na primeira consulta. DEVE ser chamada sob a
+    lock `917283` quando o valor for usado para decidir.
+    """
+    linha = await _lock_epoch_row(session, account_ref=account_ref,
+                                  exchange=exchange, market=market)
     return int(linha.generation or 0)
 
 
@@ -262,21 +294,48 @@ async def _bump_margin_generation(session, *, account_ref: str, exchange: str,
     o vínculo que impede gastar duas vezes o mesmo saldo livre quando a reserva
     sai da soma de pendentes ao virar posição.
     """
-    from models.account_margin_epoch import AccountMarginEpoch as Epoch
-    conta, corretora, mercado = _margin_identity(account_ref, exchange, market)
-    linha = (await session.execute(
-        select(Epoch).where(Epoch.account_scope == conta, Epoch.exchange == corretora,
-                            Epoch.market == mercado).with_for_update())).scalar_one_or_none()
-    if linha is None:
-        linha = Epoch(account_scope=conta, exchange=corretora, market=mercado,
-                      generation=1, updated_at=_now())
-        session.add(linha)
-        await session.flush()
-        return 1
+    linha = await _lock_epoch_row(session, account_ref=account_ref,
+                                  exchange=exchange, market=market)
     linha.generation = int(linha.generation or 0) + 1
     linha.updated_at = _now()
     await session.flush()
     return int(linha.generation)
+
+
+async def current_manual_generation(session, *, account_scope: str, exchange: str,
+                                    market: str = "usdm_futures") -> int:
+    """Época da VALIDAÇÃO MANUAL daquela conta (contador INDEPENDENTE do
+    financeiro). Renovar prova manual não mexe na geração financeira, e uma
+    carteira financeira recente não mascara falha de validação manual."""
+    linha = await _lock_epoch_row(session, account_ref=account_scope,
+                                  exchange=exchange, market=market)
+    return int(linha.manual_validation_generation or 0)
+
+
+async def bump_manual_generation(session, *, account_scope: str, exchange: str,
+                                 market: str = "usdm_futures",
+                                 blocked: bool = True) -> int:
+    """Avança a época manual e (por padrão) BLOQUEIA a conta, na transação atual."""
+    linha = await _lock_epoch_row(session, account_ref=account_scope,
+                                  exchange=exchange, market=market)
+    linha.manual_validation_generation = int(linha.manual_validation_generation or 0) + 1
+    linha.manual_validation_blocked = bool(blocked)
+    linha.updated_at = _now()
+    await session.flush()
+    return int(linha.manual_validation_generation)
+
+
+async def set_manual_validation_blocked(session, *, account_scope: str,
+                                        exchange: str,
+                                        market: str = "usdm_futures",
+                                        blocked: bool) -> bool:
+    """Marca/limpa o bloqueio DURÁVEL de validação manual na transação atual."""
+    linha = await _lock_epoch_row(session, account_ref=account_scope,
+                                  exchange=exchange, market=market)
+    linha.manual_validation_blocked = bool(blocked)
+    linha.updated_at = _now()
+    await session.flush()
+    return bool(linha.manual_validation_blocked)
 
 
 async def bump_margin_generation_for(session_factory, *, account_ref: str,
@@ -291,6 +350,7 @@ async def bump_margin_generation_for(session_factory, *, account_ref: str,
     try:
         async with session_factory() as session:
             async with session.begin():
+                await acquire_risk_lock(session)
                 return await _bump_margin_generation(
                     session, account_ref=account_ref, exchange=exchange, market=market)
     except Exception:  # noqa: BLE001
@@ -625,7 +685,7 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
-                session.add(EntryIntent(
+                nova_linha = EntryIntent(
                     intent_key=key, client_order_id=coid, account_ref=identity.account_ref,
                     exchange=identity.exchange, symbol=identity.symbol, quote=identity.quote,
                     side=identity.side, position_side=identity.position_side,
@@ -641,14 +701,18 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     # onde recuperar stop/qty da decisão que originou a ordem.
                     decision_payload=decision_snapshot(decision if decision is not None
                                                        else payload),
-                    real_trade_id=None, created_at=moment, updated_at=moment, resolved_at=None))
+                    real_trade_id=None, created_at=moment, updated_at=moment,
+                    resolved_at=None)
+                session.add(nova_linha)
                 # A reserva MUDA a margem representada no banco: toda carteira
-                # observada antes deste commit fica obsoleta.
-                nova_geracao = None
-                if margin is not None or (capacity and capacity.risk_usd):
-                    nova_geracao = await _bump_margin_generation(
-                        session, account_ref=identity.account_ref,
-                        exchange=identity.exchange, market="usdm_futures")
+                # observada antes deste commit fica obsoleta. A geração
+                # RESULTANTE é GRAVADA na própria linha antes do commit — o
+                # valor devolvido é exatamente o persistido.
+                nova_geracao = await _bump_margin_generation(
+                    session, account_ref=identity.account_ref,
+                    exchange=identity.exchange, market="usdm_futures")
+                nova_linha.margin_generation = nova_geracao
+                await session.flush()
                 await session.commit()
                 return Reservation(RESERVED_NEW, key, coid, STATE_RESERVED,
                                    generation=nova_geracao)
@@ -707,7 +771,14 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                         return Reservation(BLOCKED_CAPACITY, key, coid, current_state, denial)
                     row.reserved_risk_usd = max(novo, antigo)
                     row.reserved_margin_usd = max(nova_margem, margem_antiga)
+                    # A PRÓPRIA reserva aumentou: incrementa e usa o valor novo.
                     row.margin_generation = await _bump_margin_generation(
+                        session, account_ref=identity.account_ref,
+                        exchange=identity.exchange, market="usdm_futures")
+                elif margin is not None:
+                    # Só renovou a prova: usa a época ATUAL, sem bump — mas
+                    # GRAVA, para o token devolvido ser o persistido.
+                    row.margin_generation = await current_margin_generation(
                         session, account_ref=identity.account_ref,
                         exchange=identity.exchange, market="usdm_futures")
             if not row.decision_payload:
@@ -838,14 +909,125 @@ async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
                     resultante = await _bump_margin_generation(
                         session, account_ref=identity.account_ref,
                         exchange=identity.exchange, market="usdm_futures")
-                    row.margin_generation = resultante
-                elif resultante is None:
-                    resultante = atual_gen
+                else:
+                    # SEM aumento: a prova vale a época ATUAL, não a antiga.
+                    resultante = await current_margin_generation(
+                        session, account_ref=identity.account_ref,
+                        exchange=identity.exchange, market="usdm_futures")
+                row.margin_generation = resultante
+                row.updated_at = moment
+            await session.flush()
             await session.commit()
             return Reservation(RESERVED_RESUMED, intent_key, coid, state,
                                generation=resultante)
     except Exception:
         return Reservation(UNAVAILABLE, intent_key, None, None, "DB_UNAVAILABLE")
+
+
+def _finite_token(value) -> Optional[int]:
+    """Token inteiro finito. `bool`, texto, NaN/inf e ausência NÃO são token."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not (value == value) or value in (float("inf"), float("-inf")):
+            return None
+        if value != int(value):
+            return None
+        return int(value)
+    if isinstance(value, int):
+        return int(value)
+    return None
+
+
+async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
+                             expected_token, dispatch_id: Optional[str] = None,
+                             now: Optional[datetime] = None) -> Dict[str, Any]:
+    """AUTORIZAÇÃO FINAL do envio, em transação CURTA sob a lock `917283`.
+
+    Lê a intenção E a época vigente da conta na MESMA transação e exige:
+
+    - intenção existente, estado `SENDING`, owner correto e lease válido pelo
+      relógio obtido DEPOIS da espera pela lock;
+    - `dispatch_id` já registrado (o id EFETIVO desta tentativa);
+    - `expected_token` presente, inteiro, igual à coluna da intenção;
+    - essa coluna igual à geração FINANCEIRA vigente da conta;
+    - validação manual da conta NÃO bloqueada e ownership do símbolo coerente.
+
+    Erro, linha ausente, token NULL/bool/texto, identidade divergente ou lease
+    vencido NEGAM. `may_dispatch` isolado não substitui este contrato, e uma
+    época inexistente não é recriada aqui como se fosse autorização.
+    """
+    esperado = _finite_token(expected_token)
+    if esperado is None:
+        return {"ok": False, "reason_code": "DISPATCH_TOKEN_INVALID"}
+    try:
+        async with session_factory() as session:
+            await acquire_risk_lock(session)
+            agora = now or _now()
+            row = (await session.execute(
+                select(EntryIntent).where(EntryIntent.intent_key == intent_key)
+                .with_for_update())).scalar_one_or_none()
+            if row is None:
+                await session.rollback()
+                return {"ok": False, "reason_code": "INTENT_NOT_FOUND"}
+            if row.state != STATE_SENDING or row.lease_owner != owner:
+                await session.rollback()
+                return {"ok": False, "reason_code": "LEASE_NOT_HELD",
+                        "state": row.state}
+            if row.lease_expires_at is None or row.lease_expires_at <= agora:
+                await session.rollback()
+                return {"ok": False, "reason_code": "LEASE_EXPIRED"}
+            if dispatch_id is not None:
+                registrados = [str(x) for x in (row.dispatch_ids or ())]
+                if str(dispatch_id) not in registrados:
+                    await session.rollback()
+                    return {"ok": False, "reason_code": "DISPATCH_NOT_REGISTERED"}
+            persistido = _finite_token(row.margin_generation)
+            # Atributos capturados ANTES de qualquer rollback: depois dele o ORM
+            # expira a instância e reler dispararia IO fora do greenlet.
+            identity = EntryIdentity(
+                account_ref=row.account_ref, exchange=row.exchange, symbol=row.symbol,
+                quote=row.quote, side=row.side, position_side=row.position_side,
+                timeframe=row.timeframe, playbook=row.playbook,
+                playbook_version=row.playbook_version, purpose=row.purpose,
+                trigger_candle_ms=int(row.trigger_candle_ms or 0))
+            if persistido is None:
+                await session.rollback()
+                return {"ok": False, "reason_code": "DISPATCH_TOKEN_MISSING"}
+            if persistido != esperado:
+                await session.rollback()
+                return {"ok": False, "reason_code": MARGIN_SUPERSEDED,
+                        "persisted": persistido, "expected": esperado}
+            # Época da CONTA lida na MESMA transação: mudança ALHEIA entre a
+            # admissão e este ponto supera o token.
+            from models.account_margin_epoch import AccountMarginEpoch as Epoch
+            conta, corretora, mercado = _margin_identity(
+                identity.account_ref, identity.exchange, "usdm_futures")
+            epoca = (await session.execute(
+                select(Epoch.generation, Epoch.manual_validation_blocked)
+                .where(Epoch.account_scope == conta, Epoch.exchange == corretora,
+                       Epoch.market == mercado))).one_or_none()
+            if epoca is None:
+                # Época inexistente NÃO é autorização: não se cria aqui.
+                await session.rollback()
+                return {"ok": False, "reason_code": "MARGIN_EPOCH_MISSING"}
+            geracao_conta, conta_bloqueada = int(epoca[0] or 0), bool(epoca[1])
+            if geracao_conta != persistido:
+                await session.rollback()
+                return {"ok": False, "reason_code": MARGIN_SUPERSEDED,
+                        "account_generation": geracao_conta, "expected": esperado}
+            if conta_bloqueada:
+                await session.rollback()
+                return {"ok": False, "reason_code": "MANUAL_ACCOUNT_VALIDATION_BLOCKED"}
+            negado = await _ownership_denial(session, identity, "dispatch")
+            await session.rollback()        # leitura decisória: nada a gravar
+            if negado:
+                return {"ok": False, "reason_code": negado}
+            return {"ok": True, "reason_code": "DISPATCH_AUTHORIZED",
+                    "token": persistido}
+    except Exception as exc:  # noqa: BLE001 — dúvida NÃO autoriza
+        log.warning(f"[p03-intent] autorização final indisponível: {type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": "DISPATCH_CHECK_UNAVAILABLE"}
 
 
 async def mark_sending(session_factory, intent_key: str, *, owner: str,
@@ -856,6 +1038,7 @@ async def mark_sending(session_factory, intent_key: str, *, owner: str,
     deadline = moment + timedelta(seconds=max(1, int(lease_seconds)))
     try:
         async with session_factory() as session:
+            await acquire_risk_lock(session)
             result = await session.execute(
                 update(EntryIntent)
                 .where(EntryIntent.intent_key == intent_key,
@@ -897,11 +1080,17 @@ async def _resolve(session_factory, intent_key: str, *, owner: Optional[str], st
         values["real_trade_id"] = int(real_trade_id)
     try:
         async with session_factory() as session:
+            # Ordem ÚNICA: advisory lock ANTES de qualquer leitura decisória.
+            await acquire_risk_lock(session)
             # Identidade lida ANTES do update: a geração de margem precisa ser
             # incrementada na MESMA transação da mudança econômica.
             atual = (await session.execute(
                 select(EntryIntent.account_ref, EntryIntent.exchange)
                 .where(EntryIntent.intent_key == intent_key))).one_or_none()
+            if atual is not None and state in (STATE_CONFIRMED, STATE_TERMINAL):
+                # Época ANTES da linha de intenção (passo 3 da ordem).
+                await _lock_epoch_row(session, account_ref=atual[0],
+                                      exchange=atual[1], market="usdm_futures")
             conditions = [EntryIntent.intent_key == intent_key]
             if require_owner and owner is not None:
                 conditions.append(EntryIntent.lease_owner == owner)
@@ -967,9 +1156,13 @@ async def release_reserved(session_factory, intent_key: str, *, owner: str,
     moment = now or _now()
     try:
         async with session_factory() as session:
+            await acquire_risk_lock(session)
             atual = (await session.execute(
                 select(EntryIntent.account_ref, EntryIntent.exchange)
                 .where(EntryIntent.intent_key == intent_key))).one_or_none()
+            if atual is not None:
+                await _lock_epoch_row(session, account_ref=atual[0],
+                                      exchange=atual[1], market="usdm_futures")
             result = await session.execute(
                 update(EntryIntent)
                 .where(EntryIntent.intent_key == intent_key, EntryIntent.state == STATE_RESERVED,
@@ -1003,6 +1196,7 @@ async def register_dispatch(session_factory, intent_key: str, *, owner: str,
         return False
     try:
         async with session_factory() as session:
+            await acquire_risk_lock(session)
             row = (await session.execute(
                 select(EntryIntent).where(EntryIntent.intent_key == intent_key)
                 .with_for_update())).scalar_one_or_none()
@@ -1037,10 +1231,12 @@ async def recover_stale(session_factory, *, now: Optional[datetime] = None, limi
     summary = {"to_unknown": 0, "reserved_released": 0}
     try:
         async with session_factory() as session:
+            await acquire_risk_lock(session)
             rows = (await session.execute(
                 select(EntryIntent).where(EntryIntent.state.in_((STATE_SENDING, STATE_RESERVED)),
                                           EntryIntent.lease_expires_at.is_not(None),
-                                          EntryIntent.lease_expires_at <= moment).limit(limit)
+                                          EntryIntent.lease_expires_at <= moment)
+                .order_by(EntryIntent.intent_key).limit(limit)
             )).scalars().all()
             for row in rows:
                 if row.state == STATE_SENDING:

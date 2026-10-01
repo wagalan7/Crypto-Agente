@@ -20,7 +20,7 @@ exchange.
 """
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Index, Integer, String
+from sqlalchemy import BigInteger, Boolean, DateTime, Index, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db import Base
@@ -33,8 +33,18 @@ class AccountMarginEpoch(Base):
     account_scope: Mapped[str] = mapped_column(String(64))
     exchange: Mapped[str] = mapped_column(String(20))
     market: Mapped[str] = mapped_column(String(20))
-    #: Contador MONOTÔNICO. Nunca volta; nunca é relógio.
+    #: Contador MONOTÔNICO da interpretação FINANCEIRA. Nunca volta; nunca é
+    #: relógio.
     generation: Mapped[int] = mapped_column(BigInteger, default=0)
+    #: Contador MONOTÔNICO da VALIDAÇÃO MANUAL daquela conta. Finalidade
+    #: independente da financeira: renovar prova manual não mexe no contador
+    #: financeiro, e carteira financeira recente não mascara falha manual.
+    manual_validation_generation: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0", nullable=False)
+    #: Estado DURÁVEL de validação (não é feature flag): linha nova nasce
+    #: BLOQUEADA e só uma leitura COMPLETA de conta, commitada, libera.
+    manual_validation_blocked: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (

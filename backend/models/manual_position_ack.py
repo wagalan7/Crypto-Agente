@@ -88,6 +88,14 @@ class ManualPositionAcknowledgement(Base):
     #: CAS: toda mudança de estado incrementa a revisão. Um scan atrasado não
     #: pode fechar um reconhecimento mais novo.
     revision: Mapped[int] = mapped_column(Integer, default=0)
+    #: Revisão EXATA do reconhecimento que foi validada. Prova só autoriza
+    #: quando `revision == validated_revision`: qualquer mudança de identidade,
+    #: estado ou conta sobe a revisão e derruba a autorização no mesmo commit.
+    validated_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    #: Época da VALIDAÇÃO DE CONTA que governa esta prova (não é a geração
+    #: FINANCEIRA). Falha de validação avança a época da conta e invalida todas
+    #: as provas publicadas sob a época anterior.
+    validated_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     #: Prova de VALIDAÇÃO: instante (ms), escopo e conta da última observação
     #: fresca e completa que confirmou este registro. Nova exposição exige prova
     #: válida e atual — ausência/expiração NEGA.
@@ -133,6 +141,10 @@ class ManualPositionAcknowledgement(Base):
             "contract_version": self.contract_version,
             "state": self.state,
             "revision": int(self.revision or 0),
+            "validated_revision": (int(self.validated_revision)
+                                   if self.validated_revision is not None else None),
+            "validated_generation": (int(self.validated_generation)
+                                     if self.validated_generation is not None else None),
             "validated_at_ms": (int(self.validated_at_ms)
                                 if self.validated_at_ms is not None else None),
             "validation_scope": self.validation_scope,

@@ -334,6 +334,26 @@ async def _signed_request(
                         "reason_code": bloqueio.get("reason_code"),
                         "reason": bloqueio.get("error"),
                         "manual_ownership_blocked": True}
+            # 3. AUTORIZAÇÃO FINAL (lease/token/idade das provas) DEPOIS do
+            #    await de ownership — nenhuma espera nova é introduzida entre
+            #    esta verificação e a assinatura.
+            final = mutation.get("final_check")
+            if final is not None:
+                try:
+                    decisao = await final()
+                except Exception as exc:  # noqa: BLE001 — mutação falha fechada
+                    return {"ok": False, "quality": "UNKNOWN",
+                            "reason_code": "EXEC_FINAL_AUTHORIZATION_ERROR",
+                            "reason": f"{type(exc).__name__}: {exc}"}
+                aprovado = decisao is True or (
+                    isinstance(decisao, dict) and decisao.get("ok") is True)
+                if not aprovado:
+                    detalhe = decisao if isinstance(decisao, dict) else {}
+                    return {"ok": False, "quality": "UNKNOWN",
+                            "reason_code": str(detalhe.get("reason_code")
+                                               or "EXEC_FINAL_AUTHORIZATION_DENIED"),
+                            "reason": str(detalhe.get("reason")
+                                          or "autorização final negou o envio")}
             return verdict
 
         request_preflight = _com_ownership
@@ -1210,6 +1230,28 @@ async def _manual_ownership_block(symbol, action: str) -> Optional[dict]:
             "symbol": verdict.get("symbol")}
 
 
+def classify_order_action(*, reduce_only) -> str:
+    """Classifica a ordem UMA única vez, a partir do contrato validado.
+
+    `reduce_only` precisa ser o booleano LITERAL `True`: string, número ou
+    objeto NÃO recebem a isenção de redução. A classificação resultante é usada
+    no guard inicial, no preflight e no guard final — nunca derivada de novo.
+    """
+    return "reduce_only" if reduce_only is True else "place_order"
+
+
+def _reduce_only_payload_conflict(*, leverage, stop_loss, tp1, tp2,
+                                  take_profit) -> Optional[str]:
+    """Redução NÃO altera alavancagem nem instala bracket de abertura."""
+    if leverage is not None:
+        return "reduce_only com leverage de abertura"
+    for nome, valor in (("stop_loss", stop_loss), ("tp1", tp1), ("tp2", tp2),
+                        ("take_profit", take_profit)):
+        if valor is not None:
+            return f"reduce_only com {nome} de abertura"
+    return None
+
+
 async def place_protection_orders(
     symbol: str,
     entry_side: str,        # lado da ENTRADA ("Buy" | "Sell" ou "BUY" | "SELL")
@@ -1417,9 +1459,22 @@ async def place_protection_orders(
                 if not _allowed:
                     log.error(f"[binance] {label.upper()} ABORTADO {sym}: mutation_guard negou (lease inválido) — sem POST")
                     return False, None, (last_msg or "mutation_guard negou: lease/claim inválido"), False
+            # O `mutation_guard` de lease roda TAMBÉM na fronteira pós-throttle
+            # de CADA POST/retry/fallback, composto com ownership. Negação não
+            # vira SL instalado nem cancelamento confirmado.
+            async def _lease_na_fronteira():
+                if mutation_guard is None:
+                    return True
+                try:
+                    return bool(await mutation_guard())
+                except Exception as _exc:  # noqa: BLE001
+                    return {"ok": False, "reason_code": "EXEC_LEASE_GUARD_ERROR",
+                            "reason": f"{type(_exc).__name__}: {_exc}"}
+
             res = await _signed_request(
                 "POST", "/fapi/v1/algoOrder", params,
-                mutation={"symbol": symbol, "action": "place_protection_orders"})
+                mutation={"symbol": symbol, "action": "place_protection_orders",
+                          "final_check": _lease_na_fronteira})
             if res.get("ok"):
                 algo_id = str((res.get("result") or {}).get("algoId") or "")
                 if algo_id:
@@ -2236,6 +2291,9 @@ async def place_order(
     tp1: Optional[float] = None,           # TP1 parcial — quando setado junto com take_profit, dispara bracket
     tp1_qty_pct: float = 0.45,
     reduce_only: bool = False,
+    # Callback INTERNO de autorização final (lease/token/idade das provas).
+    # Nunca é enviado à Binance: roda na fronteira pós-throttle.
+    final_authorization: Optional[Callable[[], Awaitable[object]]] = None,
     leverage: Optional[int] = None,
     client_order_id: Optional[str] = None,
     entry_preflight: Optional[
@@ -2259,7 +2317,27 @@ async def place_order(
 
     Retorno enriquecido com sl_ok/tp1_ok/tp2_ok pra caller propagar diagnóstico.
     """
-    bloqueio = await _manual_ownership_block(symbol, "place_order")
+    # Classificação ÚNICA da operação (guard inicial, preflight e guard final
+    # usam ESTA mesma `acao`).
+    acao = classify_order_action(reduce_only=reduce_only)
+    e_reducao = acao == "reduce_only"
+    if e_reducao:
+        conflito = _reduce_only_payload_conflict(
+            leverage=leverage, stop_loss=stop_loss, tp1=tp1, tp2=None,
+            take_profit=take_profit)
+        if conflito is not None:
+            # Recusa ANTES de qualquer mutação: rótulo de redução não isenta
+            # uma ordem que de fato abriria/alteraria exposição.
+            return {"ok": False, "reason_code": "EXEC_REDUCE_ONLY_CONTRADICTORY",
+                    "error": f"payload contraditório: {conflito}",
+                    "entry_not_submitted": True, "no_fill": True,
+                    "submitted_qty": 0.0, "planned_qty": qty,
+                    "safety_state": "ENTRY_NOT_SUBMITTED",
+                    "entry_state": "NOT_SUBMITTED",
+                    "manual_intervention_required": False,
+                    "quarantine_required": False,
+                    "client_order_id": client_order_id}
+    bloqueio = await _manual_ownership_block(symbol, acao)
     if bloqueio is not None:
         return {**bloqueio, "entry_not_submitted": True, "no_fill": True,
                 "submitted_qty": 0.0, "planned_qty": qty,
@@ -2271,7 +2349,7 @@ async def place_order(
     sym = to_binance(symbol) if "/" in symbol else symbol
     binance_side = side.upper()  # BUY | SELL
     binance_type = "MARKET" if order_type == "Market" else "LIMIT"
-    market_entry = binance_type == "MARKET" and not reduce_only
+    market_entry = binance_type == "MARKET" and not e_reducao
     if market_entry and entry_preflight is None:
         return {
             "ok": False,
@@ -2354,7 +2432,7 @@ async def place_order(
             return {"ok": False, "error": "LIMIT exige price"}
         params["price"] = await _round_price(sym, float(price))
         params["timeInForce"] = "GTC"
-    if reduce_only:
+    if e_reducao:
         params["reduceOnly"] = "true"
     if client_order_id:
         params["newClientOrderId"] = client_order_id
@@ -2391,7 +2469,7 @@ async def place_order(
             }
         # Reconfirmação DEPOIS do throttle/espera: entre o guard de entrada e
         # este ponto a posição manual pode ter sido reconhecida.
-        tardio = await _manual_ownership_block(symbol, "place_order_preflight")
+        tardio = await _manual_ownership_block(symbol, acao)
         if tardio is not None:
             return {"ok": False, "quality": "UNKNOWN",
                     "reason_code": tardio.get("reason_code"),
@@ -2477,7 +2555,7 @@ async def place_order(
         mutation={"symbol": symbol,
                   # Redução/fechamento não é NOVA exposição: não exige prova
                   # fresca, mas continua exigindo ownership do símbolo.
-                  "action": "reduce_only" if reduce_only else "place_order"},
+                  "action": acao, "final_check": final_authorization},
     )
     if entry_res.get("_preflight"):
         verdict = entry_res.get("preflight") or {}
@@ -2898,6 +2976,8 @@ async def place_maker_entry_then_protect(
     poll_interval_s: Optional[float] = None,
     fallback_market: bool = False,
     entry_preflight: Optional[Callable[[float, float], Awaitable[dict]]] = None,
+    # Autorização FINAL interna (lease/token). Nunca vai para a Binance.
+    final_authorization: Optional[Callable[[], Awaitable[object]]] = None,
     market_preflight: Optional[Callable[[float, dict], Awaitable[dict]]] = None,
 ) -> dict:
     """
@@ -2966,6 +3046,8 @@ async def place_maker_entry_then_protect(
             tp1_qty_pct=tp1_qty_pct, leverage=None,  # leverage já setado acima
             client_order_id=fallback_client_order_id,
             entry_preflight=market_preflight,
+            # A filha `-mfb` passa pela MESMA autorização final.
+            final_authorization=final_authorization,
         )
         if isinstance(res, dict):
             res["was_maker"] = False
@@ -3100,7 +3182,8 @@ async def place_maker_entry_then_protect(
         request_preflight=(
             _entry_request_preflight if entry_preflight is not None else None
         ),
-        mutation={"symbol": symbol, "action": "maker_entry"},
+        mutation={"symbol": symbol, "action": "maker_entry",
+                  "final_check": final_authorization},
     )
     if entry_res.get("_preflight"):
         verdict = entry_res.get("preflight") or {}

@@ -107,7 +107,9 @@ class GuardDePropriedade(unittest.IsolatedAsyncioTestCase):
     async def _guard(self, registro, symbol=ALFA):
         async def fake():
             return registro
-        with patch.object(mps, "active_acknowledgements", fake):
+        with patch.object(mps, "active_acknowledgements", fake), \
+                patch.object(mps, "current_account_scope",
+                             return_value=ESCOPO):
             return await mps.ownership_guard(symbol, action="entry")
 
     async def test_sem_reconhecimento_libera(self):
@@ -153,13 +155,23 @@ class TransporteNaoMutaSimboloManual(unittest.IsolatedAsyncioTestCase):
             return {"ok": True, "result": {}}
 
         async def registro():
+            # Prova COMPLETA e coerente (estado/revisão/conta/época/contrato):
+            # é o estado normal com o ciclo oficial rodando.
             return {"ok": True, "reason_code": "REGISTRY_READ",
                     "acks": [{"id": 1, "symbol": ALFA, "side": "buy",
                               "state": "ACTIVE", "account_scope": ESCOPO,
+                              "exchange": "binance", "market": "usdm_futures",
+                              "contract_version": "MANUAL_ACK_V1",
+                              "revision": 1, "validated_revision": 1,
+                              "validated_generation": 0,
+                              "validation_scope": "ACCOUNT",
+                              "validation_account": ESCOPO,
                               "validated_at_ms": mps._now_ms()}]}
 
         self._p = [patch.object(bss, "_signed_request", fake_signed),
-                   patch.object(mps, "active_acknowledgements", registro),
+                   patch.object(mps, "active_acknowledgements", registro), \
+                patch.object(mps, "current_account_scope",
+                             return_value=ESCOPO),
                    patch.object(bss, "_round_qty", AsyncMock(return_value=1.0))]
         for item in self._p:
             item.start()
@@ -188,9 +200,25 @@ class TransporteNaoMutaSimboloManual(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(res.get("ok"))
         self.assertEqual(self.enviados, [])
 
-    async def test_outro_simbolo_continua_mutando(self):
-        res = await bss.set_leverage("BETAUSDT", 5)
-        self.assertTrue(res.get("ok"))
+    async def test_outro_simbolo_mantem_manutencao_protetiva(self):
+        """Cancelamento/proteção de OUTRO símbolo continua passando."""
+        res = await bss.cancel_order("BETA/USDT:USDT", order_id="9")
+        self.assertTrue(res.get("ok"), str(res)[:160])
+        self.assertEqual(self.enviados, [("DELETE", "/fapi/v1/order")])
+
+    async def test_nova_exposicao_em_outro_simbolo_exige_prova_completa(self):
+        """O ack do fixture tem prova de ACCOUNT fresca: a entrada passa.
+
+        Sem a época/revisão coerentes a entrada seria negada — é o que o
+        `tests/test_manual_bot_integrity.py` cobre explicitamente.
+        """
+        async def estado(account_scope=None):
+            return {"blocked": False, "generation": 0, "pending_failure": False,
+                    "reason_code": "ACCOUNT_VALIDATED"}
+
+        with patch.object(mps, "account_validation_state", estado):
+            res = await bss.set_leverage("BETAUSDT", 5)
+        self.assertTrue(res.get("ok"), str(res)[:200])
         self.assertEqual(self.enviados, [("POST", "/fapi/v1/leverage")])
 
 
@@ -369,7 +397,9 @@ class RegistroIndisponivel(unittest.IsolatedAsyncioTestCase):
         async def quebrado():
             return {"ok": False, "reason_code": mps.GUARD_REGISTRY_UNAVAILABLE,
                     "acks": []}
-        with patch.object(mps, "active_acknowledgements", quebrado):
+        with patch.object(mps, "active_acknowledgements", quebrado), \
+                patch.object(mps, "current_account_scope",
+                             return_value=ESCOPO):
             v = await mps.ownership_guard("QUALQUER/USDT:USDT", action="entry")
         self.assertFalse(v["allowed"])
 

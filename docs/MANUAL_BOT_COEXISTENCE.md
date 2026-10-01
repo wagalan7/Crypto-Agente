@@ -5,6 +5,13 @@ Baseline original: `8565903e`. **Correção integrada aplicada sobre `69fd090a`*
 escopo de observação, estados de bloqueio, revalidação recorrente, freshness e
 geração da margem, e ownership no ponto final das mutações.
 
+**Fechamento aplicado sobre `20580139`** (revisão em
+`docs/REVISAO_20580139_MANUAL_BOT.md`, oito probes T1–T8): ordem única de locks,
+token financeiro persistido e conferido na fronteira de envio, contexto de
+validação capturado ANTES do GET com CAS, prova publicada/revogada atomicamente,
+estado durável de validação de conta e classificação única da redução. Detalhes
+em `docs/FECHAMENTO_MANUAL_BOT_20580139.md`.
+
 Esta entrega **não** liga nada e **não** autoriza operar a conta. Ela remove UM
 impedimento específico (posição manual travando o bot por inteiro) e cria a
 contenção que torna essa convivência segura.
@@ -68,6 +75,21 @@ símbolo/quote canônicos, lado, `positionSide`, `qty` e preço de entrada em
 (`validated_at_ms`, `validation_scope`, `validation_account`), motivo e
 identidade administrativa **não secreta**, chave do incidente vinculado,
 evidências e timestamps.
+
+**Prova de validação completa.** Desde o fechamento `20580139`, idade sozinha
+não autoriza: `proof_is_valid` exige, em conjunto, `ACTIVE`,
+`revision == validated_revision`, conta de validação igual à atual, época da
+prova igual a `manual_validation_generation` vigente, contrato/exchange/mercado
+corretos, escopo reconhecido e aplicável, e carimbo inteiro positivo **não
+futuro** dentro de `VALIDATION_MAX_AGE_S`. Uma prova `SYMBOL` sustenta o
+reconhecimento daquele símbolo e **nunca** limpa o bloqueio de conta.
+
+**Estado durável de validação de conta.** `account_margin_epochs` ganhou
+`manual_validation_generation` e `manual_validation_blocked`. A conta nasce
+BLOQUEADA; só uma observação `ACCOUNT` completa e commitada libera. Falha externa
+(stale/erro/incompleta/persistência) avança a época manual, marca `blocked` e
+revoga as provas alcançadas — com fence LOCAL avançado ANTES da tentativa de
+persistir, para que um commit que não aconteceu não seja tratado como conhecido.
 
 **VALIDADE do reconhecimento e BLOQUEIO do símbolo são coisas diferentes.**
 "Não está `ACTIVE`" NUNCA significa "símbolo livre":
@@ -194,11 +216,14 @@ antes da primeira mutação:
 `place_protection_orders`, `cancel_order` e `cancel_algo_order`.
 
 **Ponto final obrigatório.** Além do guard antecipado, `_signed_request` recebe
-um contexto INTERNO de mutação (`{"symbol", "action"}` — nunca enviado à
-Binance) e **compõe** ownership com o `request_preflight` existente de
+um contexto INTERNO de mutação (`{"symbol", "action", "final_check"}` — nunca
+enviado à Binance) e **compõe** ownership com o `request_preflight` existente de
 lease/risco/quote: os preflights atuais rodam primeiro, preservando seus
-resultados/erros, e a propriedade é reconferida **imediatamente antes de assinar
-e enviar**, DEPOIS de todo throttle e em **cada retry/fallback**. Isso vale mesmo
+resultados/erros, a propriedade é reconferida **imediatamente antes de assinar e
+enviar**, DEPOIS de todo throttle e em **cada retry/fallback**, e logo após esse
+await roda a **AUTORIZAÇÃO FINAL** (lease, token de admissão e idade das provas).
+`_intent_dispatch_guard` é apenas PREPARAÇÃO: quem libera o POST é
+`_intent_final_authorization` → `authorize_dispatch`. Isso vale mesmo
 quando o caller não fornece `entry_preflight` — o transporte não pula ownership
 por falta de guard financeiro. Negação ⇒ `_request_sent=False`, nenhum
 POST/DELETE, e o vocabulário de resultado dos callers é preservado (bloqueio
@@ -338,6 +363,14 @@ os outros.
 | `MANUAL_ACK_PROOF_STALE` | reconhecimento sem validação fresca (nova exposição) |
 | `MANUAL_ACK_PERSISTENCE_FAILED` | transição/prova não persistiu — mantém bloqueio |
 | `MARGIN_OBSERVATION_SUPERSEDED` | carteira observada antes de mudança local de margem |
+| `MANUAL_ACK_STALE_CONTEXT` | contexto capturado antes de mudança concorrente — novo ciclo |
+| `MANUAL_ACCOUNT_VALIDATION_BLOCKED` | validação de conta bloqueada (durável) |
+| `MANUAL_VALIDATION_FAILED` | falha externa conhecida de validação |
+| `MANUAL_VALIDATION_INERT` | sem conta comprovada: subsistema inerte |
+| `DISPATCH_TOKEN_MISSING` / `DISPATCH_TOKEN_INVALID` | token ausente/não inteiro |
+| `DISPATCH_NOT_REGISTERED` / `LEASE_EXPIRED` | dispatch ou lease inválidos na fronteira |
+| `MARGIN_EPOCH_MISSING` | época inexistente não é autorização |
+| `EXEC_REDUCE_ONLY_CONTRADICTORY` | redução com payload de abertura |
 | `MANUAL_OWNERSHIP_SYMBOL_UNKNOWN` | mutação sem símbolo com ack ativo |
 | `FREE_MARGIN_UNKNOWN` / `FREE_MARGIN_STALE` / `INSUFFICIENT_FREE_MARGIN` | gate de margem real |
 
@@ -416,6 +449,12 @@ cd backend && PYTHONDONTWRITEBYTECODE=1 .venv311/bin/python -B -m unittest \
 - **Ordens comuns** passaram a ser lidas por `openOrders`. `allOrders` com
   `limit` continua sendo histórico truncado e **não** é usado como prova de
   ausência.
+- **Perda de corrida ≠ falha externa.** `MANUAL_ACK_STALE_CONTEXT` descarta o
+  resultado e pede novo ciclo: não arma pausa, não incrementa épocas e não revoga
+  a prova de quem ganhou a corrida.
+- **Boot começa fechado.** TTL antigo não recupera permissão; é preciso captura,
+  GET e commit novos. Reconhecimento legado sem prova completa segue sem
+  autorização, e legado ambíguo fica fail-closed.
 - **Reconhecer não protege.** A posição manual pode estar sem SL: isso é
   decisão do operador e o bot não instala nem cancela proteção dela.
 - Esta entrega não foi executada contra a conta real, não emitiu ordem, não

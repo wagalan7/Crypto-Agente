@@ -470,25 +470,6 @@ async def active_acknowledgements() -> Dict[str, Any]:
                 "detail": type(exc).__name__, "acks": []}
 
 
-def validation_proof_age_s(ack: Mapping) -> Optional[float]:
-    """Idade (s) da prova de validação. `None` quando não há prova."""
-    carimbo = (ack or {}).get("validated_at_ms")
-    if carimbo in (None, "") or isinstance(carimbo, bool):
-        return None
-    try:
-        valor = int(carimbo)
-    except (TypeError, ValueError):
-        return None
-    if valor <= 0:
-        return None
-    return max(0.0, (_now_ms() - valor) / 1000.0)
-
-
-def _proof_is_fresh(ack: Mapping) -> bool:
-    idade = validation_proof_age_s(ack)
-    return idade is not None and idade <= VALIDATION_MAX_AGE_S
-
-
 async def ownership_guard(symbol: Any = None, *, action: str = "mutate",
                           require_fresh_proof: bool = False) -> Dict[str, Any]:
     """GUARD ÚNICO: o bot pode tocar neste símbolo/conta?
@@ -500,21 +481,37 @@ async def ownership_guard(symbol: Any = None, *, action: str = "mutate",
       hedge — neste pacote o símbolo inteiro fica indisponível);
     - símbolo DESCONHECIDO pelo chamador, havendo registro bloqueante
       ⇒ BLOQUEIA (prova inconclusiva não autoriza mutação);
-    - `require_fresh_proof` (NOVA exposição): algum registro bloqueante sem
-      prova de validação fresca ⇒ BLOQUEIA. Manutenção protetiva de posição BOT
-      em OUTRO símbolo não exige essa prova, senão um reconhecimento alheio
-      deixaria a posição do bot sem stop;
-    - sem registro bloqueante ⇒ LIBERA (comportamento anterior preservado).
+    - `require_fresh_proof` (NOVA exposição): validação de conta BLOQUEADA, ou
+      registro bloqueante sem prova COMPLETA (estado/revisão/conta/época/
+      contrato/escopo/tempo), ⇒ BLOQUEIA. Manutenção protetiva/redutora de
+      posição BOT em OUTRO símbolo não exige essa prova, senão um
+      reconhecimento alheio deixaria a posição do bot sem stop;
+    - sem registro bloqueante ⇒ LIBERA, exceto se a validação de conta estiver
+      bloqueada e a ação for de NOVA exposição.
 
     NÃO consulta a exchange: é chamado de dentro de locks/semáforos do próprio
     transporte, onde I/O HTTP recursivo é proibido.
     """
+    nova_exposicao = (require_fresh_proof
+                      and str(action) not in PROTECTIVE_ACTIONS)
+    estado_conta = None
+    if nova_exposicao:
+        estado_conta = await account_validation_state()
+        if estado_conta.get("blocked"):
+            return {"allowed": False, "reason_code": GUARD_ACCOUNT_BLOCKED,
+                    "action": action,
+                    "symbol": (canonical_symbol(symbol) if symbol else None),
+                    "detail": estado_conta.get("reason_code")}
     registro = await active_acknowledgements()
     if not registro["ok"]:
         return {"allowed": False, "reason_code": GUARD_REGISTRY_UNAVAILABLE,
                 "action": action, "symbol": None,
                 "detail": registro.get("detail")}
-    acks = registro["acks"]
+    # Só a conta VIGENTE importa: reconhecimento de outra conta/credencial não
+    # bloqueia nem autoriza nada aqui.
+    conta_atual = str(current_account_scope() or "")
+    acks = [a for a in registro["acks"]
+            if str(a.get("account_scope") or "") == conta_atual]
     if not acks:
         return {"allowed": True, "reason_code": GUARD_OK, "action": action,
                 "symbol": (canonical_symbol(symbol) if symbol else None)}
@@ -536,13 +533,17 @@ async def ownership_guard(symbol: Any = None, *, action: str = "mutate",
                 "ack_id": ack.get("id"), "side": ack.get("side"),
                 "ack_state": ack.get("state"),
                 "detail": "símbolo com posição manual reconhecida"}
-    if require_fresh_proof and str(action) not in PROTECTIVE_ACTIONS:
-        vencidos = [a for a in acks if not _proof_is_fresh(a)]
+    if nova_exposicao:
+        conta = conta_atual
+        epoca = (estado_conta or {}).get("generation")
+        vencidos = [a.get("id") for a in acks
+                    if not proof_is_valid(a, account_scope=conta,
+                                          manual_generation=epoca)]
         if vencidos:
             return {"allowed": False, "reason_code": GUARD_PROOF_STALE,
                     "action": action, "symbol": canonical_symbol(symbol),
-                    "ack_ids": [a.get("id") for a in vencidos],
-                    "detail": ("reconhecimento manual sem validação fresca — "
+                    "ack_ids": vencidos,
+                    "detail": ("reconhecimento manual sem validação completa — "
                                "o ciclo oficial precisa revalidar antes de nova "
                                "exposição")}
     return {"allowed": True, "reason_code": GUARD_OK, "action": action,
@@ -908,17 +909,16 @@ async def _persist_acknowledgement(*, account_scope: str, chave: str, posicao: M
     from models.execution_incident import ExecutionIncident
     from models.manual_position_ack import (ACK_CONTRACT_VERSION,
                                             ManualPositionAcknowledgement as Ack)
-    from services.entry_intent_service import RISK_LOCK_KEY
-    from sqlalchemy import select, text
+    from services.entry_intent_service import acquire_risk_lock, bump_manual_generation
+    from sqlalchemy import select
 
     agora = _now()
     try:
         async with get_session() as session:
             async with session.begin():
                 # MESMA lock da admissão: reconhecimento e reserva de entrada
-                # são mutuamente exclusivos.
-                await session.execute(text("SELECT pg_advisory_xact_lock(:k)"),
-                                      {"k": RISK_LOCK_KEY})
+                # são mutuamente exclusivos (ordem única de locks).
+                await acquire_risk_lock(session)
                 # Idade da leitura validada DENTRO da transação: leitura velha
                 # (ou anterior a uma reserva concorrente) não autoriza nada.
                 idade_s = max(0.0, (_now_ms() - int(observed_at_ms)) / 1000.0)
@@ -989,11 +989,21 @@ async def _persist_acknowledgement(*, account_scope: str, chave: str, posicao: M
                                                     else None),
                               "untracked_incidents": [l["incident_key"] for l in untracked]},
                     created_at=agora, updated_at=agora, ended_at=None,
-                    ended_reason=None, revision=1,
-                    # A própria confirmação é uma validação fresca do símbolo.
-                    validated_at_ms=int(observed_at_ms),
-                    validation_scope=SCOPE_SYMBOL,
-                    validation_account=account_scope)
+                    ended_reason=None, revision=1)
+                # Confirmação administrativa AVANÇA o fence manual e deixa a
+                # conta aguardando o próximo ciclo COMPLETO (§7.1): ela valida
+                # o SÍMBOLO, não a conta.
+                epoca_manual = await bump_manual_generation(
+                    session, account_scope=account_scope,
+                    exchange=EXCHANGE_BINANCE, market=MARKET_USDM_FUTURES,
+                    blocked=True)
+                # A própria confirmação é uma validação fresca DESTE símbolo,
+                # com todos os componentes da prova.
+                registro.validated_at_ms = int(observed_at_ms)
+                registro.validation_scope = SCOPE_SYMBOL
+                registro.validation_account = account_scope
+                registro.validated_revision = 1
+                registro.validated_generation = int(epoca_manual)
                 session.add(registro)
                 if incident_key:
                     incidente = (await session.execute(
@@ -1047,159 +1057,598 @@ def _short(value: Any, limit: int) -> Optional[str]:
 # ════════════════════════════════════════════════════════════════════════════
 #  Revalidação — chamada pelo reconciliador oficial (boot e ciclos)
 # ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+#  Contexto de validação, prova com CAS, falha e recuperação
+# ════════════════════════════════════════════════════════════════════════════
+#  Regra central: a identidade é capturada ANTES da leitura externa (GET) e
+#  conferida no commit. Um resultado que nasceu antes de uma mudança não pode
+#  encerrar, invalidar ou validar o que mudou depois dele.
+#
+#  `STALE_CONTEXT` (perda de corrida) NÃO arma pausa, NÃO incrementa épocas e
+#  NÃO revoga a prova do vencedor: descarta o resultado e pede novo ciclo. É
+#  diferente de falha EXTERNA (stale/erro/incompleto/persistência), tratada em
+#  `register_validation_failure`.
+STALE_CONTEXT = "MANUAL_ACK_STALE_CONTEXT"
+GUARD_ACCOUNT_BLOCKED = "MANUAL_ACCOUNT_VALIDATION_BLOCKED"
+VALIDATION_FAILURE = "MANUAL_VALIDATION_FAILED"
+
+#: Fence LOCAL monotônico de falha, por processo. Ele avança ANTES de tentar
+#: persistir: se o commit falhar, o publicador ainda recusa contextos anteriores
+#: à falha — não se afirma que uma falha sem commit já é conhecida por outro
+#: processo.
+_LOCAL_VALIDATION: Dict[str, Any] = {"fence": 0, "pending": None}
+
+
+def reset_local_validation_state() -> None:
+    """Simula processo NOVO (boot). Boot começa fechado: o estado durável manda."""
+    _LOCAL_VALIDATION["fence"] = 0
+    _LOCAL_VALIDATION["pending"] = None
+
+
+def local_validation_fence() -> int:
+    return int(_LOCAL_VALIDATION["fence"])
+
+
+def _advance_local_fence(reason: str) -> int:
+    _LOCAL_VALIDATION["fence"] = int(_LOCAL_VALIDATION["fence"]) + 1
+    _LOCAL_VALIDATION["pending"] = {"reason": _short(reason, 120),
+                                    "fence": _LOCAL_VALIDATION["fence"],
+                                    "at_ms": _now_ms()}
+    return _LOCAL_VALIDATION["fence"]
+
+
+def pending_validation_failure() -> Optional[dict]:
+    pendente = _LOCAL_VALIDATION.get("pending")
+    return dict(pendente) if pendente else None
+
+
+def proof_is_valid(ack: Mapping, *, account_scope: Any, manual_generation: Any,
+                   now_ms: Optional[int] = None) -> bool:
+    """A prova deste reconhecimento autoriza NOVA exposição agora?
+
+    Idade sozinha NÃO é prova. Exige, em conjunto: estado ACTIVE,
+    `revision == validated_revision`, conta de validação igual à atual, época da
+    prova igual à época manual vigente, contrato/exchange/mercado corretos,
+    escopo reconhecido e aplicável, carimbo inteiro positivo e NÃO futuro, e
+    idade dentro do limite. Nada de `max(0, idade)` validando futuro.
+    """
+    dados = ack if isinstance(ack, Mapping) else {}
+    if str(dados.get("state")) != STATE_ACTIVE:
+        return False
+    revisao, validada = dados.get("revision"), dados.get("validated_revision")
+    if validada is None or isinstance(validada, bool):
+        return False
+    try:
+        if int(revisao) != int(validada):
+            return False
+    except (TypeError, ValueError):
+        return False
+    conta = str(account_scope or "")
+    if not conta or str(dados.get("validation_account") or "") != conta:
+        return False
+    epoca = dados.get("validated_generation")
+    if epoca is None or isinstance(epoca, bool):
+        return False
+    try:
+        if int(epoca) != int(manual_generation):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if str(dados.get("contract_version") or "") != _contract_version():
+        return False
+    if dados.get("exchange") is not None \
+            and str(dados.get("exchange")).lower() != EXCHANGE_BINANCE:
+        return False
+    if dados.get("market") is not None \
+            and str(dados.get("market")).lower() != MARKET_USDM_FUTURES:
+        return False
+    escopo = str(dados.get("validation_scope") or "")
+    if escopo not in (SCOPE_ACCOUNT, SCOPE_SYMBOL):
+        return False
+    if escopo == SCOPE_SYMBOL:
+        # Prova de SÍMBOLO vale para o reconhecimento DAQUELE símbolo.
+        alvo = dados.get("validation_symbol") or dados.get("symbol")
+        if symbol_key(alvo) != symbol_key(dados.get("symbol")):
+            return False
+    carimbo = dados.get("validated_at_ms")
+    if carimbo is None or isinstance(carimbo, bool):
+        return False
+    try:
+        carimbo = int(carimbo)
+    except (TypeError, ValueError):
+        return False
+    if carimbo <= 0:
+        return False
+    agora = int(now_ms if now_ms is not None else _now_ms())
+    if carimbo > agora + _CLOCK_SKEW_MS:
+        return False                      # futuro incoerente nunca é prova
+    return (agora - carimbo) / 1000.0 <= VALIDATION_MAX_AGE_S
+
+
+#: Tolerância de relógio ao comparar carimbos (ms).
+_CLOCK_SKEW_MS = 2_000
+
+
+def _proof_is_fresh(ack: Mapping) -> bool:
+    """Compat: idade bruta. O predicado COMPLETO é `proof_is_valid`."""
+    carimbo = (ack or {}).get("validated_at_ms")
+    if carimbo in (None, "") or isinstance(carimbo, bool):
+        return False
+    try:
+        valor = int(carimbo)
+    except (TypeError, ValueError):
+        return False
+    agora = _now_ms()
+    if valor <= 0 or valor > agora + _CLOCK_SKEW_MS:
+        return False
+    return (agora - valor) / 1000.0 <= VALIDATION_MAX_AGE_S
+
+
+async def account_validation_state(account_scope: Any = None) -> Dict[str, Any]:
+    """Estado DURÁVEL da validação manual daquela conta.
+
+    Falha pendente LOCAL (commit que não aconteceu) também bloqueia: não se
+    afirma que uma falha sem commit já é conhecida por outro processo.
+    """
+    conta = str(account_scope or current_account_scope() or "")
+    pendente = pending_validation_failure()
+    if not conta:
+        # SEM conta comprovada não existe reconhecimento manual: o subsistema é
+        # inerte. Não é liberação disfarçada — sem credencial o transporte
+        # recusa (`is_configured`) e nenhuma intenção pode ser reservada
+        # (`_entry_account_ref` devolve None).
+        return {"blocked": bool(pendente), "generation": 0,
+                "pending_failure": bool(pendente),
+                "reason_code": ("MANUAL_VALIDATION_INERT" if not pendente
+                                else GUARD_ACCOUNT_BLOCKED)}
+    try:
+        from db import DB_ENABLED, get_session
+    except Exception as exc:  # noqa: BLE001
+        return {"blocked": True, "generation": 0, "pending_failure": True,
+                "reason_code": GUARD_REGISTRY_UNAVAILABLE, "detail": type(exc).__name__}
+    if not DB_ENABLED:
+        # Sem banco não existe reconhecimento nem bloqueio manual.
+        return {"blocked": False, "generation": 0, "pending_failure": False,
+                "reason_code": "REGISTRY_DISABLED"}
+    try:
+        from models.account_margin_epoch import AccountMarginEpoch as Epoch
+        from sqlalchemy import select
+        async with get_session() as session:
+            linha = (await session.execute(
+                select(Epoch).where(Epoch.account_scope == conta,
+                                    Epoch.exchange == EXCHANGE_BINANCE,
+                                    Epoch.market == MARKET_USDM_FUTURES))).scalar_one_or_none()
+    except Exception as exc:  # noqa: BLE001
+        return {"blocked": True, "generation": 0, "pending_failure": True,
+                "reason_code": GUARD_REGISTRY_UNAVAILABLE, "detail": type(exc).__name__}
+    if linha is None:
+        # Conta sem linha nasce BLOQUEADA: só ciclo completo real libera.
+        return {"blocked": True, "generation": 0, "pending_failure": bool(pendente),
+                "reason_code": GUARD_ACCOUNT_BLOCKED}
+    bloqueada = bool(linha.manual_validation_blocked) or bool(pendente)
+    return {"blocked": bloqueada,
+            "generation": int(linha.manual_validation_generation or 0),
+            "pending_failure": bool(pendente),
+            "reason_code": (GUARD_ACCOUNT_BLOCKED if bloqueada else "ACCOUNT_VALIDATED")}
+
+
+async def capture_validation_context(*, scope: str = SCOPE_ACCOUNT,
+                                     symbol: Any = None) -> Dict[str, Any]:
+    """Captura a identidade ANTES da leitura externa, sob a lock `917283`.
+
+    A transação fecha ANTES do GET: nenhuma lock é mantida durante rede.
+    """
+    conta = current_account_scope()
+    base = {"ok": False, "scope": scope,
+            "symbol": (canonical_symbol(symbol) if symbol else None),
+            "symbol_key": (symbol_key(symbol) if symbol else None),
+            "account_scope": conta, "exchange": EXCHANGE_BINANCE,
+            "market": MARKET_USDM_FUTURES, "acks": [], "ack_ids": [],
+            "manual_generation": None, "local_fence": local_validation_fence(),
+            "started_at_ms": _now_ms(), "reason_code": None}
+    if not conta:
+        # Subsistema INERTE (sem credencial comprovada não há reconhecimento
+        # daquela conta). Contexto válido e vazio: nada a validar ou encerrar.
+        return {**base, "ok": True, "manual_generation": 0, "inert": True,
+                "reason_code": "MANUAL_VALIDATION_INERT"}
+    try:
+        from db import DB_ENABLED, get_session
+    except Exception as exc:  # noqa: BLE001
+        return {**base, "reason_code": GUARD_REGISTRY_UNAVAILABLE,
+                "detail": type(exc).__name__}
+    if not DB_ENABLED:
+        return {**base, "ok": True, "manual_generation": 0,
+                "reason_code": "REGISTRY_DISABLED"}
+    try:
+        from models.manual_position_ack import ManualPositionAcknowledgement as Ack
+        from services.entry_intent_service import (acquire_risk_lock,
+                                                   current_manual_generation)
+        from sqlalchemy import select
+        async with get_session() as session:
+            async with session.begin():
+                await acquire_risk_lock(session)
+                epoca = await current_manual_generation(
+                    session, account_scope=conta, exchange=EXCHANGE_BINANCE,
+                    market=MARKET_USDM_FUTURES)
+                consulta = select(Ack).where(
+                    Ack.account_scope == conta,
+                    Ack.exchange == EXCHANGE_BINANCE,
+                    Ack.market == MARKET_USDM_FUTURES,
+                    Ack.state.in_(list(BLOCKING_STATES))).order_by(Ack.id)
+                linhas = (await session.execute(consulta)).scalars().all()
+        if scope == SCOPE_SYMBOL:
+            alvo = symbol_key(symbol)
+            linhas = [l for l in linhas if symbol_key(l.symbol) == alvo]
+        instantaneo = [{"id": int(l.id), "revision": int(l.revision or 0),
+                        "fingerprint": l.fingerprint, "state": l.state,
+                        "symbol": l.symbol,
+                        "contract_version": l.contract_version} for l in linhas]
+        return {**base, "ok": True, "manual_generation": int(epoca),
+                "acks": instantaneo, "ack_ids": [l["id"] for l in instantaneo],
+                "reason_code": "CONTEXT_CAPTURED", "started_at_ms": _now_ms()}
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[manual-ack] captura de contexto falhou: {type(exc).__name__}: {exc}")
+        return {**base, "reason_code": GUARD_REGISTRY_UNAVAILABLE,
+                "detail": type(exc).__name__}
+
+
+async def register_validation_failure(*, reason: str,
+                                      context: Optional[Dict[str, Any]] = None
+                                      ) -> Dict[str, Any]:
+    """Falha EXTERNA conhecida: bloqueia IMEDIATAMENTE e tenta persistir.
+
+    1. avança o fence LOCAL e registra a causa pendente ANTES de tentar gravar;
+    2. sob `917283`, avança `manual_validation_generation`, marca `blocked` e
+       revoga as provas alcançadas;
+    3. erro de banco mantém latch/causa pendente e devolve UNKNOWN — o commit
+       pode NÃO ter acontecido.
+    """
+    _advance_local_fence(reason)
+    resultado = await _persist_validation_failure(context=context, reason=reason)
+    if resultado.get("ok"):
+        _LOCAL_VALIDATION["pending"] = None
+    return {"ok": bool(resultado.get("ok")), "reason_code": VALIDATION_FAILURE,
+            "detail": _short(reason, 120),
+            "generation": resultado.get("generation"),
+            "pending_failure": pending_validation_failure() is not None}
+
+
+async def flush_pending_validation_failure() -> Dict[str, Any]:
+    """Persiste a falha pendente quando o banco volta, ANTES de recuperar."""
+    pendente = pending_validation_failure()
+    if not pendente:
+        return {"ok": True, "reason_code": "NO_PENDING_FAILURE"}
+    resultado = await _persist_validation_failure(
+        context=None, reason=str(pendente.get("reason") or VALIDATION_FAILURE))
+    if resultado.get("ok"):
+        _LOCAL_VALIDATION["pending"] = None
+    return {"ok": bool(resultado.get("ok")), "reason_code": VALIDATION_FAILURE,
+            "generation": resultado.get("generation")}
+
+
+async def _persist_validation_failure(*, context: Optional[Dict[str, Any]],
+                                      reason: str) -> Dict[str, Any]:
+    """Avança a época manual, bloqueia a conta e revoga provas — UM commit."""
+    conta = str((context or {}).get("account_scope")
+                or current_account_scope() or "")
+    if not conta:
+        return {"ok": False, "reason_code": ACK_NO_ACCOUNT}
+    try:
+        from db import DB_ENABLED, get_session
+        if not DB_ENABLED:
+            return {"ok": True, "reason_code": "REGISTRY_DISABLED", "generation": 0}
+        from models.manual_position_ack import ManualPositionAcknowledgement as Ack
+        from services.entry_intent_service import (acquire_risk_lock,
+                                                   bump_manual_generation)
+        from sqlalchemy import select
+        agora = _now()
+        async with get_session() as session:
+            async with session.begin():
+                await acquire_risk_lock(session)
+                nova = await bump_manual_generation(
+                    session, account_scope=conta, exchange=EXCHANGE_BINANCE,
+                    market=MARKET_USDM_FUTURES, blocked=True)
+                linhas = (await session.execute(
+                    select(Ack).where(Ack.account_scope == conta,
+                                      Ack.exchange == EXCHANGE_BINANCE,
+                                      Ack.market == MARKET_USDM_FUTURES,
+                                      Ack.validated_at_ms.is_not(None))
+                    .order_by(Ack.id).with_for_update())).scalars().all()
+                for linha in linhas:
+                    _revoke_proof(linha, agora)
+        return {"ok": True, "reason_code": VALIDATION_FAILURE, "generation": int(nova)}
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[manual-ack] persistir falha de validação: "
+                  f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": GUARD_REGISTRY_UNAVAILABLE,
+                "detail": type(exc).__name__}
+
+
+def _revoke_proof(linha, agora) -> None:
+    """Revoga a prova DENTRO da transação corrente (sem reabrir sessão)."""
+    linha.validated_at_ms = None
+    linha.validation_scope = None
+    linha.validation_account = None
+    linha.validated_revision = None
+    linha.validated_generation = None
+    linha.updated_at = agora
+
+
 async def revalidate_active(*, observation: Optional[Dict[str, Any]] = None,
+                            context: Optional[Dict[str, Any]] = None,
                             positions: Optional[List[dict]] = None,
                             observed_ok: Optional[bool] = None) -> Dict[str, Any]:
-    """Confere os reconhecimentos BLOQUEANTES contra uma OBSERVAÇÃO explícita.
+    """Revalida os reconhecimentos BLOQUEANTES com CONTEXTO anterior ao GET.
 
-    A observação declara escopo (`ACCOUNT`/`SYMBOL`), completude e instante.
-    Regras:
-
-    - observação `SYMBOL=X` só pode alterar X. Percorrer todos os registros
-      exige observação `ACCOUNT` completa — uma consulta filtrada NUNCA prova
-      ausência de um símbolo que não foi consultado;
-    - observação incompleta/stale/malformada ⇒ `ok=False`, nada muda;
-    - identidade idêntica ⇒ permanece ACTIVE e ganha prova de validação;
-    - identidade divergente ⇒ `INVALIDATED` — o símbolo CONTINUA bloqueado até
-      nova confirmação administrativa ou encerramento comprovado;
-    - posição ausente ⇒ só vira `CLOSED` com ausência FRESCA de ordens comuns
-      E condicionais; qualquer incerteza vira `WAITING_ORDERS` (bloqueado);
-    - atualização sob a advisory lock `917283` com CAS de revisão: um scan
-      atrasado não fecha um reconhecimento mais novo.
+    Fluxo: contexto capturado sob lock → GET fresco fora do banco → decisão e
+    commit único sob lock, conferindo revisão/estado/fingerprint de CADA linha e
+    a época manual. Observação parcial/stale/incompleta é FALHA (bloqueia a
+    conta); perda de corrida é `STALE_CONTEXT` (apenas descarta e pede ciclo).
     """
     if observation is None:
-        # Compatibilidade com chamadores antigos: lista nua é tratada como
-        # observação de CONTA e sua completude tem de ser declarada.
         if positions is None:
+            if context is None:
+                context = await capture_validation_context(scope=SCOPE_ACCOUNT)
             observation = await observe_positions()
         else:
             observation = observation_from_rows(
                 positions, source_ok=(observed_ok is not False))
-    if not isinstance(observation, Mapping):
-        return {"ok": False, "reason_code": ACK_POSITION_UNKNOWN, "valid": [],
-                "invalidated": [], "closed": [], "waiting": []}
-    if not observation.get("ok") or not observation.get("complete"):
-        return {"ok": False, "reason_code": observation.get("reason_code")
-                or ACK_POSITION_UNKNOWN, "valid": [], "invalidated": [],
+    if context is None:
+        # Sem captura anterior à leitura não se publica prova nem se encerra
+        # reconhecimento: agenda novo ciclo.
+        return {"ok": False, "reason_code": STALE_CONTEXT, "valid": [],
+                "invalidated": [], "closed": [], "waiting": [],
+                "detail": "observação sem contexto anterior ao GET"}
+    if not context.get("ok"):
+        return {"ok": False, "reason_code": context.get("reason_code")
+                or GUARD_REGISTRY_UNAVAILABLE, "valid": [], "invalidated": [],
                 "closed": [], "waiting": []}
+    if not isinstance(observation, Mapping) or not observation.get("ok") \
+            or not observation.get("complete"):
+        # Falha EXTERNA: bloqueia a conta imediatamente.
+        falha = await register_validation_failure(
+            reason=str((observation or {}).get("reason_code") or ACK_POSITION_UNKNOWN),
+            context=context)
+        return {"ok": False, "reason_code": (observation or {}).get("reason_code")
+                or ACK_POSITION_UNKNOWN, "valid": [], "invalidated": [],
+                "closed": [], "waiting": [], "failure_persisted": falha["ok"]}
+    if int(context.get("local_fence") or 0) != local_validation_fence():
+        # Houve falha conhecida DEPOIS da captura: este GET não repara nada.
+        return {"ok": False, "reason_code": STALE_CONTEXT, "valid": [],
+                "invalidated": [], "closed": [], "waiting": [],
+                "detail": "fence local avançou após a captura"}
+    if pending_validation_failure() is not None:
+        return {"ok": False, "reason_code": VALIDATION_FAILURE, "valid": [],
+                "invalidated": [], "closed": [], "waiting": [],
+                "detail": "falha pendente precisa ser persistida antes"}
     idade_s = max(0.0, (_now_ms() - int(observation.get("observed_end_ms")
                                         or _now_ms())) / 1000.0)
     if idade_s > ACK_MAX_READ_AGE_S:
+        falha = await register_validation_failure(reason=ACK_READ_TOO_OLD,
+                                                  context=context)
         return {"ok": False, "reason_code": ACK_READ_TOO_OLD, "valid": [],
-                "invalidated": [], "closed": [], "waiting": []}
-    registro = await active_acknowledgements()
-    if not registro["ok"]:
-        return {"ok": False, "reason_code": registro["reason_code"],
-                "valid": [], "invalidated": [], "closed": [], "waiting": []}
-    if not registro["acks"]:
-        return {"ok": True, "reason_code": "NO_BLOCKING_ACKS", "valid": [],
-                "invalidated": [], "closed": [], "waiting": []}
-    escopo = current_account_scope()
-    if not escopo:
-        # Conta/credencial não comprovada: nenhuma autorização anterior vale.
-        resultado = await _transition_acks(
-            [(a["id"], a.get("revision"), STATE_INVALIDATED,
-              "conta/credencial não comprovada") for a in registro["acks"]])
-        return {"ok": False, "reason_code": ACK_NO_ACCOUNT, "valid": [],
-                "invalidated": resultado["changed"], "closed": [], "waiting": [],
-                "persisted": resultado["ok"]}
-    # A chave do alvo é derivada quando o chamador só declarou o símbolo.
-    alvo = observation.get("symbol_key") or symbol_key(observation.get("symbol"))
+                "invalidated": [], "closed": [], "waiting": [],
+                "failure_persisted": falha["ok"]}
     escopo_obs = str(observation.get("scope") or SCOPE_ACCOUNT)
-    if escopo_obs == SCOPE_SYMBOL and not alvo:
-        # Escopo SYMBOL sem alvo identificável não revalida nada.
-        return {"ok": False, "reason_code": ACK_POSITION_UNKNOWN, "valid": [],
+    if escopo_obs != str(context.get("scope")):
+        return {"ok": False, "reason_code": STALE_CONTEXT, "valid": [],
+                "invalidated": [], "closed": [], "waiting": [],
+                "detail": "escopo da observação difere do contexto"}
+    conta = str(context.get("account_scope") or "")
+    if str(observation.get("account_scope") or conta) != conta:
+        return {"ok": False, "reason_code": ACK_NO_ACCOUNT, "valid": [],
                 "invalidated": [], "closed": [], "waiting": []}
-    do_escopo = [a for a in registro["acks"]
-                 if escopo_obs == SCOPE_ACCOUNT
-                 or symbol_key(a.get("symbol")) == alvo]
-    fora_do_escopo = [a["id"] for a in registro["acks"] if a not in do_escopo]
+    atual = current_account_scope()
+    if atual != conta:
+        falha = await register_validation_failure(reason=ACK_NO_ACCOUNT,
+                                                  context=context)
+        return {"ok": False, "reason_code": ACK_NO_ACCOUNT, "valid": [],
+                "invalidated": [], "closed": [], "waiting": [],
+                "failure_persisted": falha["ok"]}
+
+    # ── Decisão (fora da transação; ordens consultadas aqui) ──────────────
     posicoes = observation.get("positions") or []
-    validos, transicoes = [], []
-    for ack in do_escopo:
-        chave = symbol_key(ack.get("symbol"))
-        if str(ack.get("account_scope") or "") != escopo:
-            transicoes.append((ack["id"], ack.get("revision"), STATE_INVALIDATED,
-                               "conta divergente"))
-            continue
+    planejadas, candidatos_prova = [], []
+    for instantaneo in context.get("acks") or ():
+        chave = symbol_key(instantaneo.get("symbol"))
         perna = _leg_for_symbol(posicoes, chave)
         if not perna["ok"]:
             if perna["reason_code"] != ACK_POSITION_ABSENT:
-                transicoes.append((ack["id"], ack.get("revision"),
-                                   STATE_INVALIDATED, "pernas ambíguas no símbolo"))
+                planejadas.append((instantaneo, STATE_INVALIDATED,
+                                   "pernas ambíguas no símbolo"))
                 continue
-            # Flat COMPROVADO. Encerrar exige ausência fresca de ordens; nada é
-            # cancelado para conseguir isso.
-            ordens = await symbol_has_live_orders(ack.get("symbol"))
+            ordens = await symbol_has_live_orders(instantaneo.get("symbol"))
             if not ordens.get("ok"):
-                transicoes.append((ack["id"], ack.get("revision"),
-                                   STATE_WAITING_ORDERS,
+                planejadas.append((instantaneo, STATE_WAITING_ORDERS,
                                    "ordens do símbolo não confirmadas"))
             elif ordens.get("live"):
-                transicoes.append((ack["id"], ack.get("revision"),
-                                   STATE_WAITING_ORDERS,
+                planejadas.append((instantaneo, STATE_WAITING_ORDERS,
                                    f"{ordens.get('count')} ordem(ns) do operador viva(s)"))
             else:
-                transicoes.append((ack["id"], ack.get("revision"), STATE_CLOSED,
+                planejadas.append((instantaneo, STATE_CLOSED,
                                    "posição e ordens ausentes em leitura fresca"))
             continue
         posicao = perna["position"]
-        atual = position_fingerprint(
-            account_scope=escopo, exchange=EXCHANGE_BINANCE, market=MARKET_USDM_FUTURES,
-            symbol=posicao["symbol"], side=posicao["side"],
-            position_side=posicao["position_side"], qty=posicao["qty"],
-            entry_price=posicao["entry_price"],
+        impressao = position_fingerprint(
+            account_scope=conta, exchange=EXCHANGE_BINANCE,
+            market=MARKET_USDM_FUTURES, symbol=posicao["symbol"],
+            side=posicao["side"], position_side=posicao["position_side"],
+            qty=posicao["qty"], entry_price=posicao["entry_price"],
             update_time_ms=posicao["update_time_ms"],
-            contract_version=ack.get("contract_version") or _contract_version())
-        if atual is not None and atual == ack.get("fingerprint") \
-                and ack.get("state") == STATE_ACTIVE:
-            validos.append(ack["id"])
-        elif atual is not None and atual == ack.get("fingerprint"):
-            # Compatível, mas o registro já não está ACTIVE (INVALIDATED/
-            # WAITING_ORDERS): só uma NOVA confirmação administrativa reativa.
-            validos.append(ack["id"])
+            contract_version=instantaneo.get("contract_version") or _contract_version())
+        if impressao is not None and impressao == instantaneo.get("fingerprint"):
+            if str(instantaneo.get("state")) == STATE_ACTIVE:
+                candidatos_prova.append(instantaneo)
+            # INVALIDATED/WAITING com fingerprint coincidente NÃO reativam:
+            # só nova confirmação administrativa reativa.
         else:
-            transicoes.append((ack["id"], ack.get("revision"), STATE_INVALIDATED,
+            planejadas.append((instantaneo, STATE_INVALIDATED,
                                "identidade divergente da reconhecida"))
-    aplicadas = await _transition_acks(transicoes)
-    prova = await record_validation_proof(
-        validos, account_scope=escopo, scope=str(observation.get("scope")),
-        validated_at_ms=int(observation.get("observed_end_ms") or _now_ms()))
-    persistiu = aplicadas["ok"] and prova.get("ok", True)
-    return {"ok": persistiu, "reason_code": ("REVALIDATED" if persistiu
-                                             else "MANUAL_ACK_PERSISTENCE_FAILED"),
-            "valid": validos,
-            "invalidated": [i for i, s in aplicadas["by_state"] if s == STATE_INVALIDATED],
-            "closed": [i for i, s in aplicadas["by_state"] if s == STATE_CLOSED],
-            "waiting": [i for i, s in aplicadas["by_state"] if s == STATE_WAITING_ORDERS],
-            "out_of_scope": fora_do_escopo, "scope": observation.get("scope"),
-            "persisted": persistiu}
+
+    return await _commit_validation(context=context, observation=observation,
+                                    transitions=planejadas,
+                                    proof_candidates=candidatos_prova)
+
+
+async def _commit_validation(*, context, observation, transitions,
+                             proof_candidates) -> Dict[str, Any]:
+    """Transições, revogações, provas e recuperação em UM commit, com CAS."""
+    try:
+        from db import DB_ENABLED, get_session
+        if not DB_ENABLED:
+            return {"ok": True, "reason_code": "REGISTRY_DISABLED", "valid": [],
+                    "invalidated": [], "closed": [], "waiting": []}
+        from models.manual_position_ack import ManualPositionAcknowledgement as Ack
+        from services.entry_intent_service import (acquire_risk_lock,
+                                                   current_manual_generation,
+                                                   set_manual_validation_blocked)
+        from sqlalchemy import select
+        conta = str(context.get("account_scope"))
+        agora = _now()
+        carimbo = int(observation.get("observed_end_ms") or _now_ms())
+        escopo = str(context.get("scope"))
+        validos, invalidados, fechados, esperando, perdidos = [], [], [], [], []
+        async with get_session() as session:
+            async with session.begin():
+                await acquire_risk_lock(session)
+                epoca = await current_manual_generation(
+                    session, account_scope=conta, exchange=EXCHANGE_BINANCE,
+                    market=MARKET_USDM_FUTURES)
+                capturada = context.get("manual_generation")
+                if capturada is None or int(epoca) != int(capturada):
+                    return {"ok": False, "reason_code": STALE_CONTEXT, "valid": [],
+                            "invalidated": [], "closed": [], "waiting": [],
+                            "detail": "época manual avançou após a captura"}
+                ids = sorted({int(i["id"]) for i in (context.get("acks") or ())})
+                linhas = {}
+                if ids:
+                    linhas = {int(l.id): l for l in (await session.execute(
+                        select(Ack).where(Ack.id.in_(ids)).order_by(Ack.id)
+                        .with_for_update())).scalars().all()}
+                # Linha BLOQUEANTE criada/alterada DEPOIS da captura invalida o
+                # ciclo inteiro: ela não pertence a esta observação.
+                atuais = (await session.execute(
+                    select(Ack).where(Ack.account_scope == conta,
+                                      Ack.exchange == EXCHANGE_BINANCE,
+                                      Ack.market == MARKET_USDM_FUTURES,
+                                      Ack.state.in_(list(BLOCKING_STATES)))
+                    .order_by(Ack.id))).scalars().all()
+                if escopo == SCOPE_SYMBOL:
+                    alvo = context.get("symbol_key")
+                    atuais = [l for l in atuais if symbol_key(l.symbol) == alvo]
+                if {int(l.id) for l in atuais} != set(ids):
+                    return {"ok": False, "reason_code": STALE_CONTEXT, "valid": [],
+                            "invalidated": [], "closed": [], "waiting": [],
+                            "detail": "conjunto de reconhecimentos mudou durante o GET"}
+
+                def cas_ok(instantaneo) -> bool:
+                    linha = linhas.get(int(instantaneo["id"]))
+                    return (linha is not None
+                            and int(linha.revision or 0) == int(instantaneo["revision"])
+                            and str(linha.state) == str(instantaneo["state"])
+                            and str(linha.fingerprint) == str(instantaneo["fingerprint"]))
+
+                for instantaneo, destino, motivo in transitions:
+                    if not cas_ok(instantaneo):
+                        perdidos.append(int(instantaneo["id"]))
+                        continue
+                    linha = linhas[int(instantaneo["id"])]
+                    linha.state = destino
+                    linha.revision = int(linha.revision or 0) + 1
+                    linha.updated_at = agora
+                    linha.ended_reason = _short(motivo, 120)
+                    linha.ended_at = agora if destino in ENDED_STATES else None
+                    # Mudança de estado/identidade REVOGA a prova no MESMO commit.
+                    _revoke_proof(linha, agora)
+                    (fechados if destino == STATE_CLOSED else
+                     esperando if destino == STATE_WAITING_ORDERS else
+                     invalidados).append(int(instantaneo["id"]))
+
+                for instantaneo in proof_candidates:
+                    if not cas_ok(instantaneo):
+                        perdidos.append(int(instantaneo["id"]))
+                        continue
+                    linha = linhas[int(instantaneo["id"])]
+                    if str(linha.state) != STATE_ACTIVE:
+                        perdidos.append(int(linha.id))
+                        continue
+                    linha.validated_at_ms = carimbo
+                    linha.validation_scope = escopo
+                    linha.validation_account = conta
+                    linha.validated_revision = int(linha.revision or 0)
+                    linha.validated_generation = int(epoca)
+                    linha.updated_at = agora
+                    validos.append(int(linha.id))
+
+                recuperou = False
+                if escopo == SCOPE_ACCOUNT and not perdidos:
+                    # Recuperação só com TUDO coerente: nenhuma linha bloqueante
+                    # sem prova commitada e nenhum CAS perdido.
+                    restantes = [l for l in atuais
+                                 if str(l.state) in BLOCKING_STATES
+                                 and int(l.id) not in validos
+                                 and int(l.id) not in invalidados + esperando]
+                    pendentes = [l for l in atuais if str(l.state) == STATE_ACTIVE
+                                 and int(l.id) not in validos]
+                    bloqueantes_restantes = [l for l in atuais
+                                             if int(l.id) in invalidados + esperando]
+                    if not restantes and not pendentes and not bloqueantes_restantes:
+                        await set_manual_validation_blocked(
+                            session, account_scope=conta, exchange=EXCHANGE_BINANCE,
+                            market=MARKET_USDM_FUTURES, blocked=False)
+                        recuperou = True
+        return {"ok": True, "reason_code": "REVALIDATED", "valid": validos,
+                "invalidated": invalidados, "closed": fechados,
+                "waiting": esperando, "stale": perdidos, "scope": escopo,
+                "account_unblocked": recuperou, "persisted": True}
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[manual-ack] commit de validação falhou: "
+                  f"{type(exc).__name__}: {exc}")
+        falha = await register_validation_failure(
+            reason=f"persistência: {type(exc).__name__}", context=context)
+        return {"ok": False, "reason_code": "MANUAL_ACK_PERSISTENCE_FAILED",
+                "valid": [], "invalidated": [], "closed": [], "waiting": [],
+                "failure_persisted": falha["ok"]}
+
+
+async def publish_validation_proof(*, context, observation, validated_ids,
+                                   validated_at_ms) -> Dict[str, Any]:
+    """Publica prova SOMENTE para ACTIVE cujo CAS do contexto ainda vale.
+
+    Substitui a autorização por lista nua de IDs: sem contexto/evidência não há
+    publicação, e `valid` contém apenas linhas efetivamente COMMITADAS.
+    """
+    alvo = {int(i) for i in (validated_ids or ())}
+    candidatos = [i for i in (context.get("acks") or ())
+                  if int(i["id"]) in alvo and str(i.get("state")) == STATE_ACTIVE]
+    if not candidatos:
+        return {"ok": True, "valid": [], "stale": sorted(alvo),
+                "reason_code": "NO_PROOF_CANDIDATES"}
+    return await _commit_validation(context=context, observation=observation,
+                                    transitions=[], proof_candidates=candidatos)
 
 
 async def _transition_acks(transicoes: List[tuple]) -> Dict[str, Any]:
-    """Aplica transições com CAS de revisão, sob a advisory lock `917283`.
+    """Transições diretas com CAS (uso interno/administrativo).
 
-    `transicoes` = [(id, revisao_lida, estado_final, motivo)]. A linha só muda
-    se a revisão no banco ainda for a lida: um scan atrasado não sobrescreve um
-    reconhecimento mais novo. Falha de persistência devolve `ok=False` — nunca
-    lista vazia com `ok=True`.
+    `transicoes` = [(id, revisao_lida, estado_final, motivo)]. Mudança de estado
+    SEMPRE revoga a prova no mesmo commit.
     """
     if not transicoes:
         return {"ok": True, "changed": [], "by_state": [], "stale": []}
     try:
         from db import get_session
         from models.manual_position_ack import ManualPositionAcknowledgement as Ack
-        from services.entry_intent_service import RISK_LOCK_KEY
-        from sqlalchemy import select, text
+        from services.entry_intent_service import acquire_risk_lock
+        from sqlalchemy import select
         agora = _now()
         alterados, por_estado, obsoletos = [], [], []
         async with get_session() as session:
             async with session.begin():
-                await session.execute(text("SELECT pg_advisory_xact_lock(:k)"),
-                                      {"k": RISK_LOCK_KEY})
-                ids = [int(i) for i, _r, _s, _m in transicoes]
+                await acquire_risk_lock(session)
+                ids = sorted({int(i) for i, _r, _s, _m in transicoes})
                 linhas = {linha.id: linha for linha in (await session.execute(
-                    select(Ack).where(Ack.id.in_(ids))
+                    select(Ack).where(Ack.id.in_(ids)).order_by(Ack.id)
                     .with_for_update())).scalars().all()}
                 for identificador, revisao, estado_final, motivo in transicoes:
                     linha = linhas.get(int(identificador))
@@ -1207,7 +1656,7 @@ async def _transition_acks(transicoes: List[tuple]) -> Dict[str, Any]:
                         obsoletos.append(int(identificador))
                         continue
                     if revisao is not None and int(linha.revision or 0) != int(revisao):
-                        obsoletos.append(int(identificador))   # CAS perdido
+                        obsoletos.append(int(identificador))
                         continue
                     if linha.state in ENDED_STATES:
                         obsoletos.append(int(identificador))
@@ -1217,6 +1666,7 @@ async def _transition_acks(transicoes: List[tuple]) -> Dict[str, Any]:
                     linha.updated_at = agora
                     linha.ended_reason = _short(motivo, 120)
                     linha.ended_at = agora if estado_final in ENDED_STATES else None
+                    _revoke_proof(linha, agora)
                     alterados.append(linha.id)
                     por_estado.append((linha.id, estado_final))
         return {"ok": True, "changed": alterados, "by_state": por_estado,
@@ -1227,49 +1677,10 @@ async def _transition_acks(transicoes: List[tuple]) -> Dict[str, Any]:
                 "detail": type(exc).__name__}
 
 
-async def record_validation_proof(ids: List[int], *, account_scope: str,
-                                  scope: str, validated_at_ms: int) -> Dict[str, Any]:
-    """Grava a PROVA de validação dos reconhecimentos confirmados agora.
-
-    É essa prova que o guard consulta antes de autorizar NOVA exposição — ele
-    apenas LÊ e compara, sem HTTP recursivo. Falha devolve `ok=False`.
-    """
-    if not ids:
-        return {"ok": True, "updated": []}
-    try:
-        from db import get_session
-        from models.manual_position_ack import ManualPositionAcknowledgement as Ack
-        from sqlalchemy import select
-        agora = _now()
-        atualizados = []
-        async with get_session() as session:
-            async with session.begin():
-                linhas = (await session.execute(
-                    select(Ack).where(Ack.id.in_([int(i) for i in ids]))
-                    .with_for_update())).scalars().all()
-                for linha in linhas:
-                    if linha.state in ENDED_STATES:
-                        continue
-                    linha.validated_at_ms = int(validated_at_ms)
-                    linha.validation_scope = str(scope)[:16]
-                    linha.validation_account = str(account_scope)[:64]
-                    linha.updated_at = agora
-                    atualizados.append(linha.id)
-        return {"ok": True, "updated": atualizados}
-    except Exception as exc:  # noqa: BLE001
-        log.error(f"[manual-ack] prova de validação falhou: "
-                  f"{type(exc).__name__}: {exc}")
-        return {"ok": False, "updated": [], "detail": type(exc).__name__}
-
-
 async def _end_acks(ids: List[int], *, state_final: str,
                     reason: Optional[str] = None,
                     reasons: Optional[dict] = None) -> Dict[str, Any]:
-    """Compat: encerra reconhecimentos sem CAS (chamadores antigos).
-
-    Devolve o MESMO contrato de `_transition_acks`: falha de persistência é
-    `ok=False`, nunca lista vazia com sucesso.
-    """
+    """Compat: encerra sem CAS (chamadores antigos). Mesmo contrato de retorno."""
     return await _transition_acks([
         (int(i), None, state_final, (reasons or {}).get(i) or reason or state_final)
         for i in (ids or ())])
@@ -1277,19 +1688,17 @@ async def _end_acks(ids: List[int], *, state_final: str,
 
 def ownership_from_rows(rows: Any, *, account_scope: Any, exchange: Any,
                         market: Any, symbol: Any, action: str = "mutate",
-                        require_fresh_proof: bool = False) -> Dict[str, Any]:
-    """Veredicto de ownership a partir de linhas JÁ lidas NA transação.
-
-    PURO: não abre sessão, não chama exchange e não consulta cache de processo.
-    É o núcleo de `check_ownership_in_session`.
-    """
+                        require_fresh_proof: bool = False,
+                        manual_generation: Any = None,
+                        account_blocked: bool = False) -> Dict[str, Any]:
+    """Veredicto de ownership a partir de linhas JÁ lidas NA transação. PURO."""
     chave = symbol_key(symbol)
     conta = str(account_scope or "").strip()
     if not conta or "/" not in chave:
         return {"allowed": False, "reason_code": GUARD_SYMBOL_UNKNOWN,
-                "action": action,
-                "detail": "conta/símbolo canônicos indisponíveis"}
+                "action": action, "detail": "conta/símbolo canônicos indisponíveis"}
     alvo = []
+    bloqueantes = []
     for linha in (rows or ()):
         dados = linha if isinstance(linha, Mapping) else getattr(linha, "__dict__", {})
         if str(dados.get("account_scope") or "") != conta:
@@ -1300,9 +1709,9 @@ def ownership_from_rows(rows: Any, *, account_scope: Any, exchange: Any,
             continue
         if str(dados.get("state")) not in BLOCKING_STATES:
             continue
-        if symbol_key(dados.get("symbol")) != chave:
-            continue
-        alvo.append(dados)
+        bloqueantes.append(dados)
+        if symbol_key(dados.get("symbol")) == chave:
+            alvo.append(dados)
     if len(alvo) > 1:
         return {"allowed": False, "reason_code": GUARD_AMBIGUOUS_REGISTRY,
                 "action": action, "symbol": canonical_symbol(chave),
@@ -1313,20 +1722,18 @@ def ownership_from_rows(rows: Any, *, account_scope: Any, exchange: Any,
                 "ack_id": alvo[0].get("id"), "ack_state": alvo[0].get("state"),
                 "detail": "símbolo com posição manual reconhecida"}
     if require_fresh_proof and str(action) not in PROTECTIVE_ACTIONS:
-        vencidos = []
-        for linha in (rows or ()):
-            dados = linha if isinstance(linha, Mapping) else getattr(linha, "__dict__", {})
-            if str(dados.get("state")) not in BLOCKING_STATES:
-                continue
-            if str(dados.get("account_scope") or "") != conta:
-                continue
-            if not _proof_is_fresh(dados):
-                vencidos.append(dados.get("id"))
+        if account_blocked:
+            return {"allowed": False, "reason_code": GUARD_ACCOUNT_BLOCKED,
+                    "action": action, "symbol": canonical_symbol(chave),
+                    "detail": "validação manual da conta bloqueada"}
+        vencidos = [d.get("id") for d in bloqueantes
+                    if not proof_is_valid(d, account_scope=conta,
+                                          manual_generation=manual_generation)]
         if vencidos:
             return {"allowed": False, "reason_code": GUARD_PROOF_STALE,
                     "action": action, "symbol": canonical_symbol(chave),
                     "ack_ids": vencidos,
-                    "detail": "reconhecimento manual sem validação fresca"}
+                    "detail": "reconhecimento manual sem validação completa"}
     return {"allowed": True, "reason_code": GUARD_OK, "action": action,
             "symbol": canonical_symbol(chave)}
 
@@ -1336,26 +1743,44 @@ async def check_ownership_in_session(session, *, account_scope: Any,
                                      action: str = "reserve",
                                      require_fresh_proof: bool = True
                                      ) -> Dict[str, Any]:
-    """Ownership DENTRO da transação da admissão (só banco).
-
-    Roda DEPOIS de adquirir a lock `917283` e ANTES de conceder/gravar
-    capacidade. Não abre sessão própria, não chama exchange e não confia em
-    cache de processo. Registro/prova indisponível = NEGAÇÃO.
-    """
+    """Ownership DENTRO da transação da admissão (só banco)."""
     try:
         from models.manual_position_ack import ManualPositionAcknowledgement as Ack
+        from services.entry_intent_service import current_manual_generation
         from sqlalchemy import select
         linhas = (await session.execute(
-            select(Ack).where(Ack.state.in_(list(BLOCKING_STATES))))).scalars().all()
+            select(Ack).where(Ack.state.in_(list(BLOCKING_STATES)))
+            .order_by(Ack.id))).scalars().all()
+        epoca, bloqueada = await _manual_state_in_session(
+            session, account_scope=account_scope, exchange=exchange, market=market)
     except Exception as exc:  # noqa: BLE001
         log.error(f"[manual-ack] ownership na transação falhou: "
                   f"{type(exc).__name__}: {exc}")
         return {"allowed": False, "reason_code": GUARD_REGISTRY_UNAVAILABLE,
                 "action": action, "detail": type(exc).__name__}
+    if pending_validation_failure() is not None and require_fresh_proof \
+            and str(action) not in PROTECTIVE_ACTIONS:
+        return {"allowed": False, "reason_code": GUARD_ACCOUNT_BLOCKED,
+                "action": action, "detail": "falha de validação pendente"}
     return ownership_from_rows(
         [linha.to_public() for linha in linhas], account_scope=account_scope,
         exchange=exchange, market=market, symbol=symbol, action=action,
-        require_fresh_proof=require_fresh_proof)
+        require_fresh_proof=require_fresh_proof, manual_generation=epoca,
+        account_blocked=bloqueada)
+
+
+async def _manual_state_in_session(session, *, account_scope, exchange, market):
+    """(época manual, bloqueada) lidas NA transação corrente."""
+    from models.account_margin_epoch import AccountMarginEpoch as Epoch
+    from sqlalchemy import select
+    linha = (await session.execute(
+        select(Epoch).where(Epoch.account_scope == str(account_scope or ""),
+                            Epoch.exchange == str(exchange or "").lower(),
+                            Epoch.market == str(market or "").lower()))).scalar_one_or_none()
+    if linha is None:
+        return 0, True
+    return (int(linha.manual_validation_generation or 0),
+            bool(linha.manual_validation_blocked))
 
 
 async def ack_for_symbol(symbol: Any) -> Dict[str, Any]:

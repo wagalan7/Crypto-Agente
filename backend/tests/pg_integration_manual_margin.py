@@ -18,6 +18,8 @@ from pathlib import Path
 import re
 import socket
 import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 test_socket = os.environ.get("MANUALMARGIN_TEST_SOCKET", "")
 if not re.fullmatch(r"/tmp/cw-mmargin-sock\.[A-Za-z0-9]+", test_socket):
@@ -133,6 +135,30 @@ async def run():
           and "uq_manual_ack_active" not in indices_legado,
           str(sorted(indices_legado)))
 
+    async def epoca_manual():
+        """Época da validação MANUAL vigente (prova sintética coerente)."""
+        async with db.get_session() as session:
+            valor = await intents.current_manual_generation(
+                session, account_scope=ESCOPO, exchange="binance",
+                market="usdm_futures")
+            await session.commit()
+            return valor
+
+    async def liberar_conta():
+        """Ciclo ACCOUNT completo: a conta nasce BLOQUEADA por contrato."""
+        from services import binance_signed_service as _bss
+        from services import manual_position_service as _mps
+        from unittest.mock import patch as _patch, AsyncMock as _AM
+        with _patch.object(_bss, "accounting_scope", lambda: ESCOPO), \
+                _patch.object(_bss, "is_configured", return_value=True), \
+                _patch.object(_bss, "get_positions",
+                              _AM(return_value={"ok": True, "positions": []})):
+            contexto = await _mps.capture_validation_context(
+                scope=_mps.SCOPE_ACCOUNT)
+            observacao = await _mps.observe_positions()
+            return await _mps.revalidate_active(observation=observacao,
+                                                context=contexto)
+
     def identidade(symbol_guardado, trigger):
         return intents.EntryIdentity(
             account_ref=ESCOPO, exchange="binance", symbol=symbol_guardado,
@@ -184,6 +210,10 @@ async def run():
     # ══════════════════════════════════════════════════════════════════════
     #  T5 — a carteira anterior ao fill não autoriza a próxima proposta
     # ══════════════════════════════════════════════════════════════════════
+    liberou = await liberar_conta()
+    check("conta_liberada_por_ciclo_completo",
+          liberou["ok"] and liberou.get("account_unblocked") is True,
+          str(liberou)[:200])
     observada = await carteira(100.0, 80.0)
     primeira = await intents.reserve(
         db.get_session, identidade("ALFA-USDT-USDT", 1000),
@@ -276,7 +306,10 @@ async def run():
                         qty=2, entry_price=100, exchange_update_time_ms=1_770_000_000_000,
                         fingerprint="a" * 64, contract_version="MANUAL_ACK_V1",
                         state="ACTIVE", created_at=agora, updated_at=agora,
-                        validated_at_ms=agora_ms(), revision=1))
+                        validated_at_ms=agora_ms(), revision=1,
+                        validated_revision=1,
+                        validated_generation=await epoca_manual(),
+                        validation_scope="ACCOUNT", validation_account=ESCOPO))
         await session.commit()
     nova = await carteira(1_000.0, 10.0)
     gama = await intents.reserve(
@@ -305,7 +338,10 @@ async def run():
                         qty=2, entry_price=100, exchange_update_time_ms=1_770_000_000_000,
                         fingerprint="b" * 64, contract_version="MANUAL_ACK_V1",
                         state="ACTIVE", created_at=agora2, updated_at=agora2,
-                        validated_at_ms=agora_ms(), revision=1))
+                        validated_at_ms=agora_ms(), revision=1,
+                        validated_revision=1,
+                        validated_generation=await epoca_manual(),
+                        validation_scope="ACCOUNT", validation_account=ESCOPO))
         await session.commit()
     retomada = await intents.reserve(
         db.get_session, identidade("DELTA-USDT-USDT", 4000),
@@ -336,27 +372,64 @@ async def run():
         quote="USDT", side="long", position_side="BOTH", timeframe="4h",
         playbook="CHAMPION_LEGACY", playbook_version="SCORE_V2",
         purpose="ENTRY", trigger_candle_ms=3002)
+    # Conta NOVA nasce sem validação (contrato): primeiro ela é negada pelo seu
+    # PRÓPRIO estado, não por herdar o bloqueio de símbolo da outra conta.
+    sem_validacao = await intents.reserve(
+        db.get_session, outra_conta, {"entry": 100.0, "stop_loss": 95.0},
+        owner="t7")
+    check("t7_conta_nova_nasce_sem_validacao",
+          sem_validacao.granted is False, str(sem_validacao))
+    outro_escopo = "e" * 64
+    from services import binance_signed_service as _bss2
+    from services import manual_position_service as _mps2
+    from unittest.mock import patch as _p2, AsyncMock as _AM2
+    with _p2.object(_bss2, "accounting_scope", lambda: outro_escopo), \
+            _p2.object(_bss2, "is_configured", return_value=True), \
+            _p2.object(_bss2, "get_positions",
+                       _AM2(return_value={"ok": True, "positions": []})):
+        ctx_outra = await _mps2.capture_validation_context(
+            scope=_mps2.SCOPE_ACCOUNT)
+        obs_outra = await _mps2.observe_positions()
+        lib_outra = await _mps2.revalidate_active(observation=obs_outra,
+                                                 context=ctx_outra)
+    check("t7_conta_nova_valida_por_ciclo_proprio",
+          lib_outra["ok"] and lib_outra.get("account_unblocked") is True,
+          str(lib_outra)[:200])
     sem_gate = await intents.reserve(
         db.get_session, outra_conta, {"entry": 100.0, "stop_loss": 95.0},
         owner="t7")
     check("t7_conta_diferente_nao_colapsa", sem_gate.granted, str(sem_gate))
-    # Cada proposta usa uma observação NOVA: a anterior já foi superada pela
-    # reserva concedida acima (é exatamente o contrato da geração).
-    nova_quote = await carteira(1_000.0, 10.0)
-    quote_diferente = await intents.reserve(
-        db.get_session, intents.EntryIdentity(
-            account_ref=ESCOPO, exchange="binance", symbol="GAMA-USDC-USDC",
-            quote="USDC", side="long", position_side="BOTH", timeframe="4h",
-            playbook="CHAMPION_LEGACY", playbook_version="SCORE_V2",
-            purpose="ENTRY", trigger_candle_ms=3003),
-        {"entry": 100.0, "stop_loss": 95.0}, owner="t7", margin=nova_quote)
-    check("t7_quote_diferente_nao_colapsa", quote_diferente.granted,
-          str(quote_diferente))
+    # QUOTE diferente não colapsa no mesmo símbolo: `GAMA/USDC` não é bloqueada
+    # pelo reconhecimento de `GAMA/USDT`. (A admissão completa continua exigindo
+    # a validação de conta, já coberta acima — aqui o alvo é o SÍMBOLO.)
+    async with db.get_session() as session:
+        usdt = await mps.check_ownership_in_session(
+            session, account_scope=ESCOPO, exchange="binance",
+            market="usdm_futures", symbol="GAMA/USDT:USDT", action="reserve",
+            require_fresh_proof=False)
+        usdc = await mps.check_ownership_in_session(
+            session, account_scope=ESCOPO, exchange="binance",
+            market="usdm_futures", symbol="GAMA/USDC:USDC", action="reserve",
+            require_fresh_proof=False)
+        await session.commit()
+    check("t7_quote_diferente_nao_colapsa",
+          usdt["allowed"] is False and usdc["allowed"] is True,
+          f"{usdt.get('reason_code')} / {usdc.get('reason_code')}")
 
 
     # ══════════════════════════════════════════════════════════════════════
     #  Concorrência REAL: duas conexões, barreiras nos pontos reais
     # ══════════════════════════════════════════════════════════════════════
+    # Cenário de margem puro: sem reconhecimento manual e com a conta validada
+    # por um ciclo ACCOUNT completo.
+    async with db.get_session() as session:
+        await session.execute(text("DELETE FROM manual_position_acks "
+                                   "WHERE account_scope = :s"), {"s": ESCOPO})
+        await session.commit()
+    conta_limpa = await liberar_conta()
+    check("conc_conta_validada_sem_reconhecimento",
+          conta_limpa["ok"] and conta_limpa.get("account_unblocked") is True,
+          str(conta_limpa)[:200])
     LOCK = intents.RISK_LOCK_KEY
 
     async def esperando_a_lock() -> bool:
@@ -412,17 +485,35 @@ async def run():
         assert await intents.mark_confirmed(db.get_session, reserva_a.intent_key,
                                             owner="conc", real_trade_id=novo_id)
 
-    segurador = asyncio.create_task(
-        segurar_lock(na_fila=na_fila, liberar=liberar, durante=confirmar_a))
-    await asyncio.sleep(0.02)
-    tarefa_b = asyncio.create_task(intents.reserve(
-        db.get_session, identidade("TETA-USDT-USDT", 6000),
-        {"entry": 100.0, "stop_loss": 95.0}, owner="conc", margin=gate_b_antigo))
-    await asyncio.wait_for(na_fila.wait(), timeout=10)
-    check("conc_b_esperou_de_fato_pela_lock", True)
-    liberar.set()
-    await segurador
-    reserva_b = await tarefa_b
+    # Barreira NO MÉTODO REAL: o escritor (confirmação de A) já está DENTRO da
+    # sua transação com a lock `917283` e pausa logo depois de incrementar a
+    # época; B entra na FILA da mesma lock. Nenhum participante chama outro
+    # escritor que precise da lock — isso travaria contra a própria operação.
+    original_bump = intents._bump_margin_generation
+
+    async def bump_e_espera(*args, **kwargs):
+        valor = await original_bump(*args, **kwargs)
+        if asyncio.current_task().get_name() == "conc-confirma":
+            for _ in range(600):
+                if await esperando_a_lock():
+                    na_fila.set()
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.wait_for(liberar.wait(), timeout=15)
+        return valor
+
+    with patch.object(intents, "_bump_margin_generation", bump_e_espera):
+        tarefa_confirma = asyncio.create_task(confirmar_a(), name="conc-confirma")
+        await asyncio.sleep(0.05)
+        tarefa_b = asyncio.create_task(intents.reserve(
+            db.get_session, identidade("TETA-USDT-USDT", 6000),
+            {"entry": 100.0, "stop_loss": 95.0}, owner="conc",
+            margin=gate_b_antigo), name="conc-b")
+        await asyncio.wait_for(na_fila.wait(), timeout=20)
+        check("conc_b_esperou_de_fato_pela_lock", True)
+        liberar.set()
+        await asyncio.wait_for(tarefa_confirma, timeout=20)
+        reserva_b = await asyncio.wait_for(tarefa_b, timeout=20)
     check("conc_carteira_anterior_ao_fill_e_recusada_apos_a_espera",
           reserva_b.granted is False
           and reserva_b.reason == "MARGIN_OBSERVATION_SUPERSEDED", str(reserva_b))
@@ -482,7 +573,11 @@ async def run():
                             exchange_update_time_ms=1_770_000_000_000,
                             fingerprint="c" * 64, contract_version="MANUAL_ACK_V1",
                             state="ACTIVE", created_at=agora3, updated_at=agora3,
-                            validated_at_ms=agora_ms(), revision=1))
+                            validated_at_ms=agora_ms(), revision=1,
+                            validated_revision=1,
+                            validated_generation=await epoca_manual(),
+                            validation_scope="ACCOUNT",
+                            validation_account=ESCOPO))
             await session.commit()
 
     gate_e = await carteira(1_000.0, 10.0)
@@ -528,24 +623,13 @@ async def run():
           await geracao_atual() == estavel, str(estavel))
 
     # ══════════════════════════════════════════════════════════════════════
-    #  Caminho POSITIVO completo: a ordem chega ao cliente HTTP falso
+    #  Admissão POSITIVA (token/dispatch/readmissão)
     # ══════════════════════════════════════════════════════════════════════
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock, patch
-    from services import binance_signed_service as bss
-
-    enviados = []
-
-    async def cliente_request(method, url):
-        enviados.append((method, url))
-        return SimpleNamespace(
-            status_code=200, headers={},
-            json=lambda: {"orderId": 99, "status": "FILLED", "executedQty": "1",
-                          "avgPrice": "100", "clientOrderId": "cw-positivo"})
-
-    async def sem_reconhecimento():
-        return {"ok": True, "reason_code": "REGISTRY_READ", "acks": []}
-
+    #  O envio ponta a ponta — caller → preflight/readmissão reais → guard final
+    #  → `_signed_request` real → cliente HTTP falso — é exercitado em
+    #  `tests/pg_integration_manual_closure.py` (seção "Caller → transporte
+    #  REAL"). Aqui ficam só as garantias de ADMISSÃO, sem simular um envio
+    #  desligado do token.
     ident_pos = identidade("MI-USDT-USDT", 12000)
     gate_pos = await carteira(1_000.0, 25.0)
     reserva_pos = await intents.reserve(
@@ -568,27 +652,15 @@ async def run():
           readmissao_pos.generation is not None
           and readmissao_pos.generation >= gate_final.generation,
           str(readmissao_pos))
-    with patch.object(bss, "is_configured", return_value=True), \
-            patch.object(bss, "_ban_until_ms", 0), \
-            patch.object(bss, "_throttle_until_ms", 0), \
-            patch.object(bss, "_round_qty", AsyncMock(return_value=1.0)), \
-            patch.object(bss, "_build_signed_url",
-                         return_value="https://sintetico.invalido/fapi/v1/order"), \
-            patch.object(bss, "_get_client",
-                         return_value=SimpleNamespace(request=cliente_request)), \
-            patch.object(mps, "active_acknowledgements", sem_reconhecimento):
-        envio = await bss.place_order("MI/USDT:USDT", "BUY", 1.0,
-                                      order_type="Limit", price=100.0,
-                                      leverage=None,
-                                      client_order_id="cw-positivo")
-    check("positivo_cliente_http_recebeu_a_ordem",
-          enviados and enviados[0][0] == "POST"
-          and "fapi/v1/order" in enviados[0][1], str(enviados))
-    check("positivo_envio_nao_foi_bloqueado",
-          envio.get("manual_ownership_blocked") is not True, str(envio)[:200])
+    # A AUTORIZAÇÃO FINAL aprova com o token resultante da readmissão.
+    autorizado = await intents.authorize_dispatch(
+        db.get_session, reserva_pos.intent_key, owner="pos",
+        expected_token=readmissao_pos.generation,
+        dispatch_id=reserva_pos.client_order_id)
+    check("positivo_autorizacao_final_aprova", autorizado["ok"],
+          str(autorizado)[:200])
 
-    # Carteira nova INSUFICIENTE: zero envio.
-    enviados.clear()
+    # Carteira nova INSUFICIENTE: nem reserva.
     gate_curto2 = await carteira(5.0, 40.0)
     insuficiente = await intents.reserve(
         db.get_session, identidade("NI-USDT-USDT", 13000),
@@ -596,8 +668,12 @@ async def run():
     check("positivo_carteira_insuficiente_nao_reserva",
           insuficiente.granted is False
           and insuficiente.reason == "INSUFFICIENT_FREE_MARGIN", str(insuficiente))
-    check("positivo_carteira_insuficiente_nao_envia_nada", enviados == [],
-          str(enviados))
+    sem_autorizacao = await intents.authorize_dispatch(
+        db.get_session, reserva_pos.intent_key, owner="pos",
+        expected_token=int(readmissao_pos.generation) - 1,
+        dispatch_id=reserva_pos.client_order_id)
+    check("positivo_token_anterior_nao_autoriza",
+          sem_autorizacao["ok"] is False, str(sem_autorizacao)[:200])
 
     await db._engine.dispose()
     print(f"MANUAL_MARGIN_PG_OK: {len(CHECKS)} verificações — geração da margem "

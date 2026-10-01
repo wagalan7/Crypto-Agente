@@ -2375,3 +2375,91 @@ MESMA conta — não há isolamento financeiro nem garantia de novas entradas.
   Limite externo que permanece: mudanças feitas direto na corretora não
   incrementam a geração local — a leitura fresca continua obrigatória e não há
   atomicidade com a exchange. Não se declara ausência de bugs.
+
+## Fechamento manual/BOT (01/10/2026, baseline `20580139`)
+
+Cinco achados de `docs/REVISAO_20580139_MANUAL_BOT.md` (oito probes T1–T8)
+corrigidos juntos. Os testes de aceite foram escritos ANTES e falhavam na
+baseline; nenhum serviço foi revertido para medir RED. Detalhes de contrato em
+`docs/FECHAMENTO_MANUAL_BOT_20580139.md`.
+
+- **T4 — inversão de locks.** `reserve` tomava a advisory lock e travava a época
+  enquanto `_resolve` travava a intenção e depois pedia a época: o PostgreSQL
+  acusava `deadlock detected`. Agora há ORDEM ÚNICA — latch local, `BEGIN` +
+  `pg_advisory_xact_lock(917283)` antes de qualquer leitura decisória, época da
+  conta antes das intenções, linhas em ordem de id/chave, commit único. Entram
+  nela `_resolve`, `release_reserved`, `mark_sending`, `register_dispatch`,
+  `recover_stale`, `bump_margin_generation_for`, as transições/provas de
+  reconhecimento e a confirmação administrativa. Helpers recebem a sessão aberta:
+  nenhum abre outra conexão sob a lock.
+- **T1/T2/T3 — token financeiro.** A reserva devolvia geração mas gravava NULL e
+  o guard liberava; mudança ALHEIA da época passava sem detecção; readmissão sem
+  aumento devolvia o token ANTIGO. Agora `reserve` grava a geração resultante na
+  própria linha antes do commit e devolve o valor PERSISTIDO; toda admissão
+  aprovada grava a época resultante (com bump quando a própria reserva aumenta,
+  sem bump quando só renova); e `authorize_dispatch` — transação curta sob a lock
+  — exige intenção/estado/owner/lease com relógio posterior à espera, dispatch
+  registrado, token inteiro igual à coluna da intenção E igual à geração vigente
+  da conta, validação manual não bloqueada e ownership coerente. Época
+  inexistente não é recriada como autorização.
+- **Preparação × autorização final.** `_intent_dispatch_guard` virou PREPARAÇÃO
+  (não exige token vigente, para permitir renovar); `_intent_guarded_preflight`
+  grava o dispatch, roda quote/carteira/readmissão e só então chama a
+  AUTORIZAÇÃO FINAL. O transporte recebe esse callback por contexto interno e o
+  executa em `_signed_request` depois do throttle e DEPOIS do await de ownership,
+  imediatamente antes de assinar — inclusive em maker, MARKET e filha `-mfb`.
+- **T8 — observação antiga fechava reconhecimento novo.** `capture_validation_
+  context` captura conta/escopo/alvo, época manual, fence local e o instantâneo
+  (id, revisão, fingerprint, estado, símbolo, contrato) ANTES do GET, e fecha a
+  transação antes da rede. No commit há CAS por linha e comparação da época;
+  conjunto de reconhecimentos diferente do capturado devolve
+  `MANUAL_ACK_STALE_CONTEXT`, que descarta o resultado e pede novo ciclo — sem
+  armar pausa, incrementar épocas ou revogar a prova do vencedor. Corrigidos
+  também `_detect_untracked_positions`, `_revalidate_manual_acks(_fresh)`,
+  `_manual_ack_outcome` e `recheck_untracked_manual`.
+- **T5/T6 — prova de reconhecimento invalidado.** Transição de identidade/estado/
+  conta agora incrementa `revision` e limpa `validated_at_ms`,
+  `validation_scope`, `validation_account`, `validated_revision` e
+  `validated_generation` NO MESMO commit. `record_validation_proof([ids])` saiu:
+  `publish_validation_proof` exige contexto/evidência, só publica para `ACTIVE` e
+  devolve em `valid` apenas o que foi COMMITADO. `proof_is_valid` passou a exigir
+  estado, revisão, conta, época manual, contrato, escopo e carimbo não futuro —
+  idade sozinha não autoriza, e fingerprint coincidente não reativa
+  `INVALIDATED`/`WAITING_ORDERS`.
+- **Falha e recuperação duráveis.** `account_margin_epochs` ganhou
+  `manual_validation_generation` e `manual_validation_blocked`. Falha externa
+  avança o fence LOCAL antes de tentar persistir, então avança a época manual,
+  marca `blocked` e revoga provas; erro de commit mantém a causa pendente e
+  devolve UNKNOWN, e o publicador recusa contexto anterior à falha. Quando o
+  banco volta, a falha pendente é persistida ANTES de qualquer recuperação, e só
+  um GET NOVO recupera. Boot começa fechado. Zero incidentes NÃO remove causa
+  manual: `reconcile_due`, boot e `_maybe_release_quarantine` consultam esse
+  estado, e a recuperação remove apenas o owner/causa deste pacote.
+- **T7 — redução barrada como entrada.** `classify_order_action` exige o booleano
+  LITERAL e a classificação é derivada UMA vez em `place_order`, valendo no guard
+  inicial, no preflight e no guard final; o payload carrega `reduceOnly=true`
+  coerente. Payload contraditório (redução com leverage/SL/TP de abertura) é
+  recusado antes de qualquer mutação. Redução/proteção BOT em OUTRO símbolo deixou
+  de depender de prova manual alheia, e o `mutation_guard` de lease passou a rodar
+  também na fronteira pós-throttle de cada POST/retry/fallback.
+- **Migrações:** quatro colunas novas, aditivas e idempotentes, testadas em
+  schema novo, em upgrade vindo de `20580139` e com `init_db` repetido; nenhuma
+  linha apagada e índices de unicidade preservados.
+- **Testes:** suíte completa **2.460 executados, 2.458 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada, não fabricada). Novos:
+  `tests/test_manual_bot_final_closure.py` (20) e
+  `tests/pg_integration_manual_closure.py` (**75** verificações: T1–T8, três
+  corridas com barreiras em métodos reais e `pg_locks`, falha/restart/recuperação
+  e caller → transporte real → cliente HTTP falso).
+  `pg_integration_manual_margin.py` 43 → **46** e
+  `pg_integration_manual_coexistence.py` 128 → **131**. Regressões PG:
+  P03-conflito 66, R05-relógio 10, R11/R12 138. Concorrência e envio integrado
+  executados 2×. `py_compile` e `git diff --check` aprovados; nenhum TS/TSX
+  alterado; clusters encerrados em trap.
+- **Fora do escopo, sem mudança:** estratégia, calibração, limites, alavancagem,
+  filtros, universo, defaults, holdout, histórico e posição manual. Nenhum
+  worker, fila, scheduler, dashboard, ENV ou flag nova. Nenhum acesso à conta
+  real, ordem, Telegram, push ou deploy; nenhum reconhecimento real e nenhuma
+  pausa real liberada. Limite externo que permanece: a geração é LOCAL —
+  mudanças feitas direto na corretora não a incrementam, a leitura fresca segue
+  obrigatória e não há atomicidade com a exchange.

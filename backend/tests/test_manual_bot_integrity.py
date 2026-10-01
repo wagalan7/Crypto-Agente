@@ -54,7 +54,14 @@ def registro_ack(numero, symbol, **mudancas):
              # Prova de validação FRESCA por padrão: é o estado normal com o
              # ciclo oficial rodando. Os testes de T3 sobrescrevem com uma
              # prova vencida de propósito.
-             "validated_at_ms": mps._now_ms(), "revision": 1}
+             "validated_at_ms": mps._now_ms(), "revision": 1,
+             "validated_revision": 1,
+             "validated_generation": 7,
+             "validation_scope": "ACCOUNT",
+             "validation_account": ESCOPO,
+             "exchange": "binance",
+             "market": "usdm_futures",
+             "contract_version": "MANUAL_ACK_V1"}
     linha.update(mudancas)
     return linha
 
@@ -109,116 +116,100 @@ class RegistroFalso:
 
 
 class T1ObservacaoParcial(unittest.IsolatedAsyncioTestCase):
-    """Uma leitura de ALFA não pode encerrar o reconhecimento de BETA."""
+    """Uma leitura de ALFA não pode encerrar o reconhecimento de BETA.
 
-    async def test_consulta_de_alfa_nao_encerra_beta(self):
-        registro = RegistroFalso([registro_ack(1, "ALFAUSDT"),
-                                  registro_ack(2, "BETAUSDT")])
+    O contrato ficou mais forte depois do fechamento: a identidade é CAPTURADA
+    antes do GET e conferida com CAS no commit. Os cenários persistidos (duas
+    posições, duas conexões, mudança durante o GET e durante cada consulta de
+    ordens) estão em `tests/pg_integration_manual_closure.py` (T8) e em
+    `tests/pg_integration_manual_coexistence.py`. Aqui ficam as invariantes
+    PURAS do contrato, que não dependem de banco.
+    """
 
-        async def observar(symbol=None):
-            # A resposta é FILTRADA: BETA nem foi consultada.
-            return {"ok": True, "reason_code": "POSITIONS_FRESH",
-                    "positions": [posicao("ALFAUSDT")],
-                    "observed_at_ms": mps._now_ms(),
-                    "scope": "SYMBOL", "symbol": mps.canonical_symbol(symbol),
-                    "complete": True}
-
-        with patch.object(mps, "active_acknowledgements", registro.active), \
-                patch.object(mps, "_transition_acks", registro.transition), \
-                patch.object(mps, "record_validation_proof", registro.proof), \
-                patch.object(mps, "current_account_scope", return_value=ESCOPO), \
-                patch.object(mps, "observe_positions", observar):
-            desfecho = await ers._manual_ack_outcome({"symbol": "ALFA/USDT:USDT"})
-            guarda_beta = await mps.ownership_guard("BETAUSDT", action="entry")
-
-        self.assertEqual(desfecho["state"], ers.State.MANUAL_ACKNOWLEDGED,
-                         "ALFA reconhecida continua reconhecida")
-        self.assertEqual(registro.estado(2), "ACTIVE",
-                         "BETA não participou da consulta e não pode ser encerrada")
-        self.assertFalse(guarda_beta["allowed"], "BETA continua bloqueada")
-
-    async def test_observacao_filtrada_so_revalida_o_proprio_simbolo(self):
-        registro = RegistroFalso([registro_ack(1, "ALFAUSDT"),
-                                  registro_ack(2, "BETAUSDT")])
-        observacao = {"ok": True, "reason_code": "POSITIONS_FRESH",
-                      "positions": [], "observed_at_ms": mps._now_ms(),
-                      "scope": "SYMBOL", "symbol": "ALFA/USDT:USDT",
-                      "complete": True}
-        with patch.object(mps, "active_acknowledgements", registro.active), \
-                patch.object(mps, "_transition_acks", registro.transition), \
-                patch.object(mps, "record_validation_proof", registro.proof), \
-                patch.object(mps, "current_account_scope", return_value=ESCOPO), \
-                patch.object(mps, "symbol_has_live_orders",
-                             AsyncMock(return_value={"ok": True, "live": False,
-                                                     "count": 0})):
-            await mps.revalidate_active(observation=observacao)
-        self.assertEqual(registro.estado(2), "ACTIVE",
-                         "símbolo fora do escopo da observação não muda")
-
-    async def test_observacao_incompleta_nao_prova_ausencia(self):
-        registro = RegistroFalso([registro_ack(1, "ALFAUSDT")])
-        observacao = {"ok": False, "reason_code": mps.ACK_POSITION_UNKNOWN,
-                      "positions": [], "observed_at_ms": mps._now_ms(),
-                      "scope": "ACCOUNT", "symbol": None, "complete": False}
-        with patch.object(mps, "active_acknowledgements", registro.active), \
-                patch.object(mps, "_transition_acks", registro.transition), \
-                patch.object(mps, "record_validation_proof", registro.proof), \
-                patch.object(mps, "current_account_scope", return_value=ESCOPO):
-            veredito = await mps.revalidate_active(observation=observacao)
+    async def test_observacao_sem_contexto_nao_encerra_nada(self):
+        observacao = {"ok": True, "complete": True, "positions": [],
+                      "scope": mps.SCOPE_ACCOUNT, "symbol": None,
+                      "observed_end_ms": mps._now_ms(),
+                      "reason_code": "POSITIONS_FRESH"}
+        veredito = await mps.revalidate_active(observation=observacao)
         self.assertFalse(veredito["ok"])
-        self.assertEqual(registro.estado(1), "ACTIVE")
+        self.assertEqual(veredito["reason_code"], mps.STALE_CONTEXT)
+        self.assertEqual(veredito["closed"], [])
 
+    async def test_escopo_divergente_do_contexto_e_recusado(self):
+        contexto = {"ok": True, "scope": mps.SCOPE_SYMBOL,
+                    "symbol": "ALFA/USDT:USDT", "symbol_key": "ALFA/USDT",
+                    "account_scope": ESCOPO, "acks": [], "ack_ids": [],
+                    "manual_generation": 0,
+                    "local_fence": mps.local_validation_fence(),
+                    "started_at_ms": mps._now_ms()}
+        observacao = {"ok": True, "complete": True, "positions": [],
+                      "scope": mps.SCOPE_ACCOUNT, "symbol": None,
+                      "account_scope": ESCOPO,
+                      "observed_end_ms": mps._now_ms(),
+                      "reason_code": "POSITIONS_FRESH"}
+        with patch.object(mps, "current_account_scope", return_value=ESCOPO):
+            veredito = await mps.revalidate_active(observation=observacao,
+                                                   context=contexto)
+        self.assertFalse(veredito["ok"])
+        self.assertEqual(veredito["reason_code"], mps.STALE_CONTEXT)
+
+    async def test_observacao_incompleta_registra_falha_e_nao_encerra(self):
+        contexto = {"ok": True, "scope": mps.SCOPE_ACCOUNT, "symbol": None,
+                    "symbol_key": None, "account_scope": ESCOPO, "acks": [],
+                    "ack_ids": [], "manual_generation": 0,
+                    "local_fence": mps.local_validation_fence(),
+                    "started_at_ms": mps._now_ms()}
+        observacao = {"ok": False, "complete": False, "positions": [],
+                      "scope": mps.SCOPE_ACCOUNT, "symbol": None,
+                      "account_scope": ESCOPO,
+                      "observed_end_ms": mps._now_ms(),
+                      "reason_code": mps.ACK_POSITION_UNKNOWN}
+        registrada = {}
+
+        async def falha(*, reason, context=None):
+            registrada.update({"reason": reason})
+            return {"ok": True, "reason_code": mps.VALIDATION_FAILURE}
+
+        with patch.object(mps, "current_account_scope", return_value=ESCOPO), \
+                patch.object(mps, "register_validation_failure", falha):
+            veredito = await mps.revalidate_active(observation=observacao,
+                                                   context=contexto)
+        self.assertFalse(veredito["ok"])
+        self.assertEqual(veredito["closed"], [])
+        self.assertEqual(registrada.get("reason"), mps.ACK_POSITION_UNKNOWN)
+
+    async def test_fence_local_posterior_a_captura_invalida_o_resultado(self):
+        contexto = {"ok": True, "scope": mps.SCOPE_ACCOUNT, "symbol": None,
+                    "symbol_key": None, "account_scope": ESCOPO, "acks": [],
+                    "ack_ids": [], "manual_generation": 0,
+                    "local_fence": mps.local_validation_fence() - 1,
+                    "started_at_ms": mps._now_ms()}
+        observacao = {"ok": True, "complete": True, "positions": [],
+                      "scope": mps.SCOPE_ACCOUNT, "symbol": None,
+                      "account_scope": ESCOPO,
+                      "observed_end_ms": mps._now_ms(),
+                      "reason_code": "POSITIONS_FRESH"}
+        with patch.object(mps, "current_account_scope", return_value=ESCOPO):
+            veredito = await mps.revalidate_active(observation=observacao,
+                                                   context=contexto)
+        self.assertFalse(veredito["ok"])
+        self.assertEqual(veredito["reason_code"], mps.STALE_CONTEXT)
 
 class T2FlatComOrdensRestantes(unittest.IsolatedAsyncioTestCase):
-    """Flat sem prova de ausência de ordens não libera o símbolo."""
+    """Flat sem prova de ausência de ordens não libera o símbolo.
 
-    def _observacao_flat(self):
-        return {"ok": True, "reason_code": "POSITIONS_FRESH", "positions": [],
-                "observed_at_ms": mps._now_ms(), "scope": "ACCOUNT",
-                "symbol": None, "complete": True}
-
-    async def _revalidar(self, registro, ordens):
-        with patch.object(mps, "active_acknowledgements", registro.active), \
-                patch.object(mps, "_transition_acks", registro.transition), \
-                patch.object(mps, "record_validation_proof", registro.proof), \
-                patch.object(mps, "current_account_scope", return_value=ESCOPO), \
-                patch.object(mps, "symbol_has_live_orders", ordens):
-            return await mps.revalidate_active(observation=self._observacao_flat())
-
-    async def test_ordem_viva_mantem_o_simbolo_bloqueado(self):
-        registro = RegistroFalso([registro_ack(1, "ALFAUSDT")])
-        ordens = AsyncMock(return_value={"ok": True, "live": True, "count": 1})
-        await self._revalidar(registro, ordens)
-        self.assertGreaterEqual(ordens.await_count, 1,
-                                "ordens precisam ser consultadas antes de encerrar")
-        self.assertNotEqual(registro.estado(1), "CLOSED")
-        with patch.object(mps, "active_acknowledgements", registro.active):
-            guarda = await mps.ownership_guard("ALFAUSDT", action="entry")
-        self.assertFalse(guarda["allowed"])
-
-    async def test_listagem_indisponivel_mantem_bloqueio(self):
-        registro = RegistroFalso([registro_ack(1, "ALFAUSDT")])
-        ordens = AsyncMock(return_value={"ok": False,
-                                         "reason_code": mps.ACK_ORDERS_UNKNOWN})
-        await self._revalidar(registro, ordens)
-        self.assertNotEqual(registro.estado(1), "CLOSED")
-        with patch.object(mps, "active_acknowledgements", registro.active):
-            guarda = await mps.ownership_guard("ALFAUSDT", action="entry")
-        self.assertFalse(guarda["allowed"], "prova incompleta não libera")
-
-    async def test_flat_com_duas_listagens_vazias_encerra(self):
-        registro = RegistroFalso([registro_ack(1, "ALFAUSDT")])
-        ordens = AsyncMock(return_value={"ok": True, "live": False, "count": 0})
-        await self._revalidar(registro, ordens)
-        self.assertEqual(registro.estado(1), "CLOSED")
-        with patch.object(mps, "active_acknowledgements", registro.active):
-            guarda = await mps.ownership_guard("ALFAUSDT", action="entry")
-        self.assertTrue(guarda["allowed"], "ausência comprovada libera o símbolo")
+    O ciclo persistido (flat + LIMIT manual, flat + condicional, falha numa
+    listagem e duas listagens vazias) está em
+    `tests/pg_integration_manual_coexistence.py`. Aqui ficam o predicado dos
+    estados bloqueantes e o contrato das DUAS fontes de ordens.
+    """
 
     async def test_estado_de_espera_continua_bloqueando(self):
         registro = RegistroFalso([registro_ack(1, "ALFAUSDT",
                                                state="WAITING_ORDERS")])
-        with patch.object(mps, "active_acknowledgements", registro.active):
+        with patch.object(mps, "active_acknowledgements", registro.active), \
+                patch.object(mps, "current_account_scope", return_value=ESCOPO):
             guarda = await mps.ownership_guard("ALFAUSDT", action="entry")
         self.assertFalse(guarda["allowed"])
         self.assertIn("WAITING_ORDERS", mps.BLOCKING_STATES)
@@ -247,74 +238,73 @@ class T2FlatComOrdensRestantes(unittest.IsolatedAsyncioTestCase):
             verdict = await mps.symbol_has_live_orders("ALFA/USDT:USDT")
         self.assertFalse(verdict["ok"], "falha numa fonte não prova ausência")
 
+    async def test_mudanca_de_estado_revoga_a_prova(self):
+        """Transição SEMPRE limpa os cinco componentes da prova."""
+        linha = SimpleNamespace(validated_at_ms=1, validation_scope="ACCOUNT",
+                                validation_account=ESCOPO, validated_revision=3,
+                                validated_generation=7, updated_at=None)
+        mps._revoke_proof(linha, "agora")
+        self.assertIsNone(linha.validated_at_ms)
+        self.assertIsNone(linha.validation_scope)
+        self.assertIsNone(linha.validation_account)
+        self.assertIsNone(linha.validated_revision)
+        self.assertIsNone(linha.validated_generation)
 
 class T3RevalidacaoRecorrente(unittest.IsolatedAsyncioTestCase):
-    """O ciclo oficial revalida mesmo sem incidente aberto."""
+    """O ciclo oficial revalida mesmo sem incidente aberto.
 
-    async def test_ciclo_revalida_com_zero_incidentes(self):
-        repo = ers.InMemoryIncidentRepo()
-        registro = RegistroFalso([registro_ack(1, "ALFAUSDT")])
-        leituras = []
+    A versão persistida (`ciclo_revalida_sem_incidente_aberto`) está em
+    `tests/pg_integration_manual_coexistence.py`. Aqui fica a exigência de
+    prova COMPLETA antes de nova exposição e a isenção das ações protetivas.
+    """
 
-        async def observar(symbol=None):
-            leituras.append(symbol)
-            return {"ok": True, "reason_code": "POSITIONS_FRESH",
-                    "positions": [posicao("ALFAUSDT")],
-                    "observed_at_ms": mps._now_ms(),
-                    "scope": "SYMBOL" if symbol else "ACCOUNT",
-                    "symbol": mps.canonical_symbol(symbol) if symbol else None,
-                    "complete": True}
+    def _estado(self, *, blocked=False, generation=7):
+        async def _state(account_scope=None):
+            return {"blocked": blocked, "generation": generation,
+                    "pending_failure": False,
+                    "reason_code": ("MANUAL_ACCOUNT_VALIDATION_BLOCKED"
+                                    if blocked else "ACCOUNT_VALIDATED")}
+        return _state
 
-        with patch.object(ers, "_get_repo", return_value=repo), \
-                patch.object(ers, "_boot_scan_safe", True), \
-                patch.object(ers, "_p03_latch_armed", False), \
-                patch.object(ers, "recover_entry_intents",
-                             AsyncMock(return_value={})), \
-                patch.object(mps, "active_acknowledgements", registro.active), \
-                patch.object(mps, "_transition_acks", registro.transition), \
-                patch.object(mps, "record_validation_proof", registro.proof), \
+    async def _guard(self, registro, **kwargs):
+        with patch.object(mps, "active_acknowledgements", registro.active), \
                 patch.object(mps, "current_account_scope", return_value=ESCOPO), \
-                patch.object(mps, "observe_positions", observar), \
-                patch.object(mps, "symbol_has_live_orders",
-                             AsyncMock(return_value={"ok": True, "live": False,
-                                                     "count": 0})), \
-                patch.object(mps, "record_validation_proof",
-                             AsyncMock(return_value={"ok": True})):
-            await ers.reconcile_due()
-
-        self.assertGreaterEqual(len(leituras), 1,
-                                "o ciclo precisa obter observação fresca")
-        self.assertIn(None, leituras, "a varredura completa é de CONTA")
+                patch.object(mps, "account_validation_state", self._estado()):
+            return await mps.ownership_guard("BETA/USDT:USDT", **kwargs)
 
     async def test_prova_de_validacao_vencida_nao_autoriza_exposicao(self):
         antigo = mps._now_ms() - int((mps.VALIDATION_MAX_AGE_S + 60) * 1000)
         registro = RegistroFalso([registro_ack(1, "ALFAUSDT",
                                                validated_at_ms=antigo)])
-        with patch.object(mps, "active_acknowledgements", registro.active):
-            guarda = await mps.ownership_guard("BETA/USDT:USDT", action="entry",
-                                               require_fresh_proof=True)
-        self.assertFalse(guarda["allowed"],
-                         "prova antiga não autoriza NOVA exposição")
+        guarda = await self._guard(registro, action="entry",
+                                   require_fresh_proof=True)
+        self.assertFalse(guarda["allowed"])
         self.assertEqual(guarda["reason_code"], mps.GUARD_PROOF_STALE)
 
     async def test_prova_fresca_autoriza_outro_simbolo(self):
-        registro = RegistroFalso([registro_ack(1, "ALFAUSDT",
-                                               validated_at_ms=mps._now_ms())])
-        with patch.object(mps, "active_acknowledgements", registro.active):
-            guarda = await mps.ownership_guard("BETA/USDT:USDT", action="entry",
-                                               require_fresh_proof=True)
-        self.assertTrue(guarda["allowed"])
+        registro = RegistroFalso([registro_ack(1, "ALFAUSDT")])
+        guarda = await self._guard(registro, action="entry",
+                                   require_fresh_proof=True)
+        self.assertTrue(guarda["allowed"], str(guarda))
 
     async def test_manutencao_protetiva_nao_exige_prova_nova(self):
         """SL/saída de posição BOT em outro símbolo não é NOVA exposição."""
         antigo = mps._now_ms() - int((mps.VALIDATION_MAX_AGE_S + 60) * 1000)
         registro = RegistroFalso([registro_ack(1, "ALFAUSDT",
                                                validated_at_ms=antigo)])
-        with patch.object(mps, "active_acknowledgements", registro.active):
-            guarda = await mps.ownership_guard("BETA/USDT:USDT",
-                                               action="place_protection_orders")
+        guarda = await self._guard(registro, action="place_protection_orders")
         self.assertTrue(guarda["allowed"])
 
+    async def test_conta_bloqueada_nega_nova_exposicao(self):
+        registro = RegistroFalso([registro_ack(1, "ALFAUSDT")])
+        with patch.object(mps, "active_acknowledgements", registro.active), \
+                patch.object(mps, "current_account_scope", return_value=ESCOPO), \
+                patch.object(mps, "account_validation_state",
+                             self._estado(blocked=True)):
+            guarda = await mps.ownership_guard("BETA/USDT:USDT", action="entry",
+                                               require_fresh_proof=True)
+        self.assertFalse(guarda["allowed"])
+        self.assertEqual(guarda["reason_code"], mps.GUARD_ACCOUNT_BLOCKED)
 
 class T4CarteiraStale(unittest.IsolatedAsyncioTestCase):
     """Cache antigo não pode virar leitura `live` com idade zero."""
@@ -400,6 +390,8 @@ class T6OwnershipNoPontoFinal(unittest.IsolatedAsyncioTestCase):
                     "acks": [dict(x) for x in ativos]}
 
         with patch.object(mps, "active_acknowledgements", registro), \
+                patch.object(mps, "current_account_scope",
+                             return_value=ESCOPO), \
                 patch.object(bss, "is_configured", return_value=True), \
                 patch.object(bss, "_ban_until_ms", 0), \
                 patch.object(bss, "_throttle_until_ms", time.time() * 1000 + 1000), \
@@ -444,44 +436,68 @@ class T6OwnershipNoPontoFinal(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(enviados, [])
         self.assertFalse(res.get("sl_ok"))
 
-    async def test_outro_simbolo_continua_enviando(self):
-        """O guard final não pode bloquear a manutenção legítima do bot."""
+    async def test_outro_simbolo_continua_com_manutencao_protetiva(self):
+        """Manutenção protetiva/redutora de OUTRO símbolo continua passando.
+
+        O reconhecimento nasce no throttle SEM prova publicada: nova exposição
+        (alavancagem) é negada, mas cancelamento/proteção do bot não pode ser
+        travado por reconhecimento alheio.
+        """
+        ativos, enviados = [], []
+        cancelamento = await self._com_throttle(
+            lambda: bss.cancel_order("BETA/USDT:USDT", order_id="9"),
+            ativos, enviados)
+        self.assertTrue(ativos)
+        self.assertTrue(cancelamento.get("ok"), str(cancelamento)[:160])
+        self.assertEqual(enviados, [("DELETE", "https://sintetico.invalido/x")])
+
+    async def test_nova_exposicao_em_outro_simbolo_exige_prova(self):
+        """Reconhecimento novo sem prova publicada barra NOVA exposição."""
         ativos, enviados = [], []
         res = await self._com_throttle(
             lambda: bss.set_leverage("BETAUSDT", 5), ativos, enviados)
         self.assertTrue(ativos)
-        self.assertEqual(enviados, [("POST", "https://sintetico.invalido/x")])
-        self.assertTrue(res.get("ok"))
+        self.assertFalse(res.get("ok"))
+        self.assertEqual(res.get("reason_code"), mps.GUARD_PROOF_STALE)
+        self.assertEqual(enviados, [])
 
 
 class TokenDeAdmissaoAntesDoEnvio(unittest.IsolatedAsyncioTestCase):
     """§4.2.7 — o dispatch confere a geração RESULTANTE da própria admissão."""
 
-    async def _guard(self, token_admitido, token_no_banco):
+    async def _autorizacao(self, token_admitido, veredito):
+        """A AUTORIZAÇÃO FINAL é quem compara o token (a preparação não)."""
         from services import entry_intent_service as eis
         intent = {"granted": True, "intent_key": "k", "dispatched": True,
-                  "state": "SENDING", "margin_generation": token_admitido}
-        linha = SimpleNamespace(margin_generation=token_no_banco)
-        with patch.object(eis, "mark_sending", AsyncMock(return_value=True)), \
-                patch.object(eis, "may_dispatch", AsyncMock(return_value=True)), \
-                patch.object(eis, "get_intent", AsyncMock(return_value=linha)):
-            return await sts._intent_dispatch_guard(intent)
+                  "state": "SENDING", "margin_generation": token_admitido,
+                  "last_dispatch_id": "cw-1"}
+        with patch.object(eis, "authorize_dispatch",
+                          AsyncMock(return_value=veredito)):
+            return await sts._intent_final_authorization(intent)()
 
     async def test_token_igual_libera_o_envio(self):
-        self.assertTrue(await self._guard(7, 7))
+        resultado = await self._autorizacao(7, {"ok": True, "token": 7})
+        self.assertTrue(resultado["ok"])
 
     async def test_token_mudou_exige_nova_admissao(self):
-        self.assertFalse(await self._guard(7, 8))
+        resultado = await self._autorizacao(
+            7, {"ok": False, "reason_code": "MARGIN_OBSERVATION_SUPERSEDED"})
+        self.assertFalse(resultado["ok"])
+        self.assertEqual(resultado["reason_code"], "MARGIN_OBSERVATION_SUPERSEDED")
 
     async def test_token_ilegivel_nao_despacha(self):
+        resultado = await self._autorizacao(
+            7, {"ok": False, "reason_code": "DISPATCH_CHECK_UNAVAILABLE"})
+        self.assertFalse(resultado["ok"])
+
+    async def test_preparacao_nao_exige_token_vigente(self):
+        """A PREPARAÇÃO deixa renovar: ela não compara token financeiro."""
         from services import entry_intent_service as eis
         intent = {"granted": True, "intent_key": "k", "dispatched": True,
                   "state": "SENDING", "margin_generation": 7}
         with patch.object(eis, "mark_sending", AsyncMock(return_value=True)), \
-                patch.object(eis, "may_dispatch", AsyncMock(return_value=True)), \
-                patch.object(eis, "get_intent",
-                             AsyncMock(side_effect=RuntimeError("banco fora"))):
-            self.assertFalse(await sts._intent_dispatch_guard(intent))
+                patch.object(eis, "may_dispatch", AsyncMock(return_value=True)):
+            self.assertTrue(await sts._intent_dispatch_guard(intent))
 
 
 if __name__ == "__main__":

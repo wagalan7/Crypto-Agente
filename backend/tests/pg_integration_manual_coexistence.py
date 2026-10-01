@@ -427,13 +427,31 @@ async def run():
               f"{nome}: {str(res)[:160]}")
     check("zero_requisicoes_assinadas_em_alfa", MUTACOES == [], str(MUTACOES)[:200])
 
-    # BETA continua operando: proteção legítima do bot não é desativada.
+    # BETA continua com manutenção PROTETIVA/redutora: ela não depende da prova
+    # manual alheia nem do ciclo de conta.
+    MUTACOES.clear()
+    cancel_beta = await bss.cancel_order(BETA, order_id="9")
+    check("beta_mantem_cancelamento_protetivo", cancel_beta.get("ok"),
+          str(cancel_beta)[:200])
+    check("beta_protetivo_chegou_no_transporte", len(MUTACOES) == 1,
+          str(MUTACOES)[:160])
+    # NOVA exposição em BETA exige o ciclo COMPLETO de conta: a confirmação
+    # administrativa avança o fence manual e deixa a conta aguardando.
+    MUTACOES.clear()
+    lev_bloqueado = await bss.set_leverage(BETA_EX, 5)
+    check("nova_exposicao_espera_o_ciclo_de_conta",
+          lev_bloqueado.get("ok") is False and MUTACOES == [],
+          f"{str(lev_bloqueado)[:160]} {MUTACOES}")
+    # Depois de um ciclo ACCOUNT completo, a alavancagem de BETA volta a passar.
+    contexto_lib = await mps.capture_validation_context(scope=mps.SCOPE_ACCOUNT)
+    obs_lib = await mps.observe_positions()
+    liberacao = await mps.revalidate_active(observation=obs_lib,
+                                           context=contexto_lib)
     MUTACOES.clear()
     lev_beta = await bss.set_leverage(BETA_EX, 5)
-    cancel_beta = await bss.cancel_order(BETA, order_id="9")
-    check("beta_mantem_alavancagem_e_cancel", lev_beta.get("ok") and cancel_beta.get("ok"),
-          f"{lev_beta} {cancel_beta}")
-    check("beta_chegou_no_transporte", len(MUTACOES) == 2, str(MUTACOES)[:160])
+    check("ciclo_completo_libera_nova_exposicao",
+          liberacao["ok"] and lev_beta.get("ok") and len(MUTACOES) == 1,
+          f"{str(liberacao)[:160]} {str(lev_beta)[:120]}")
 
     # Registro ILEGÍVEL bloqueia (não vira lista vazia).
     async def registro_quebrado():
@@ -763,18 +781,29 @@ async def run():
             await session.commit()
         EXCHANGE["positions"][0] = posicao()
 
-    # Conta/credencial diferente derruba TODAS as autorizações.
+    # Conta/credencial diferente: as autorizações da conta ANTIGA não valem
+    # para a nova, e o histórico da antiga é preservado (nada é apagado).
     with patch.object(bss, "_API_KEY", "outra-credencial"):
-        troca = await mps.revalidate_active()
-    check("conta_diferente_invalida_tudo",
-          # Credencial nova ⇒ OUTRA conta: nenhuma autorização anterior vale.
-          (troca["ok"] is False and troca["reason_code"] == mps.ACK_NO_ACCOUNT)
-          or (troca.get("valid") == [] and troca.get("invalidated")),
-          str(troca)[:200])
+        contexto_outra = await mps.capture_validation_context(
+            scope=mps.SCOPE_ACCOUNT)
+        troca = await mps.revalidate_active(
+            observation=await mps.observe_positions(), context=contexto_outra)
+        guarda_outra_conta = await mps.ownership_guard(ALFA, action="entry",
+                                                       require_fresh_proof=True)
+    check("conta_nova_nao_herda_autorizacao_da_antiga",
+          troca.get("valid") == []
+          and guarda_outra_conta["reason_code"] != mps.GUARD_MANUAL_SYMBOL,
+          f"{str(troca)[:160]} {str(guarda_outra_conta)[:160]}")
     async with db.get_session() as session:
         sobraram = int((await session.execute(
-            select(func.count(Ack.id)).where(Ack.state == STATE_ACTIVE))).scalar() or 0)
-    check("nenhum_reconhecimento_sobrevive_a_troca_de_conta", sobraram == 0, str(sobraram))
+            select(func.count(Ack.id)).where(Ack.state == STATE_ACTIVE,
+                                             Ack.account_scope == escopo))).scalar() or 0)
+    check("historico_da_conta_antiga_preservado", sobraram >= 1, str(sobraram))
+    # E a prova da conta antiga não autoriza nada sob a credencial nova.
+    with patch.object(bss, "_API_KEY", "outra-credencial"):
+        estado_outra = await mps.account_validation_state()
+    check("conta_nova_tem_estado_proprio",
+          estado_outra.get("generation") is not None, str(estado_outra))
     # Reconhece de novo para os passos seguintes.
     EXCHANGE["positions"] = [posicao()]
     cand2 = await candidato_de()
@@ -958,13 +987,16 @@ async def run():
 
     # T1 no fluxo persistido: consulta só ALFA não altera BETA.
     EXCHANGE["positions"] = [posicao(), posicao(symbol="BETAUSDT")]
+    contexto_alfa = await mps.capture_validation_context(
+        scope=mps.SCOPE_SYMBOL, symbol=ALFA)
     observacao_alfa = await mps.observe_positions(ALFA)
     check("observacao_declara_escopo_e_completude",
           observacao_alfa["scope"] == mps.SCOPE_SYMBOL
           and observacao_alfa["complete"] is True
           and observacao_alfa["symbol_key"] == mps.symbol_key(ALFA),
           str({k: observacao_alfa[k] for k in ("scope", "complete", "symbol_key")}))
-    await mps.revalidate_active(observation=observacao_alfa)
+    await mps.revalidate_active(observation=observacao_alfa,
+                                context=contexto_alfa)
     async with db.get_session() as session:
         estado_beta = (await session.execute(
             select(Ack.state).where(Ack.id == id_beta))).scalar()
@@ -976,11 +1008,14 @@ async def run():
 
     # Observação de CONTA incompleta (linha malformada) não prova ausência.
     EXCHANGE["positions"] = [posicao(), "linha-invalida"]
+    contexto_incompleto = await mps.capture_validation_context(
+        scope=mps.SCOPE_ACCOUNT)
     incompleta = await mps.observe_positions()
     check("linha_malformada_torna_a_observacao_incompleta",
           incompleta["ok"] is False and incompleta["complete"] is False,
           str(incompleta)[:160])
-    veredito_incompleto = await mps.revalidate_active(observation=incompleta)
+    veredito_incompleto = await mps.revalidate_active(
+        observation=incompleta, context=contexto_incompleto)
     check("observacao_incompleta_nao_muda_nada",
           veredito_incompleto["ok"] is False, str(veredito_incompleto)[:160])
     async with db.get_session() as session:
@@ -993,8 +1028,9 @@ async def run():
     EXCHANGE["positions"] = [posicao(symbol="BETAUSDT")]     # ALFA fechou
     EXCHANGE["common"] = [{"symbol": ALFA_EX, "order_id": "77",
                            "client_order_id": "operador-limit"}]
+    contexto_conta = await mps.capture_validation_context(scope=mps.SCOPE_ACCOUNT)
     obs_conta = await mps.observe_positions()
-    await mps.revalidate_active(observation=obs_conta)
+    await mps.revalidate_active(observation=obs_conta, context=contexto_conta)
     async with db.get_session() as session:
         estado_alfa = (await session.execute(
             select(Ack.state).where(Ack.symbol == ALFA,
@@ -1013,8 +1049,9 @@ async def run():
 
     # Falha numa das listagens também mantém o bloqueio.
     EXCHANGE["common"], EXCHANGE["common_ok"] = [], False
+    contexto_conta = await mps.capture_validation_context(scope=mps.SCOPE_ACCOUNT)
     obs_conta = await mps.observe_positions()
-    await mps.revalidate_active(observation=obs_conta)
+    await mps.revalidate_active(observation=obs_conta, context=contexto_conta)
     async with db.get_session() as session:
         estado_alfa = (await session.execute(
             select(Ack.state).where(Ack.symbol == ALFA,
@@ -1025,8 +1062,9 @@ async def run():
     EXCHANGE["common_ok"] = True
 
     # Duas listagens completas e vazias: agora encerra.
+    contexto_conta = await mps.capture_validation_context(scope=mps.SCOPE_ACCOUNT)
     obs_conta = await mps.observe_positions()
-    await mps.revalidate_active(observation=obs_conta)
+    await mps.revalidate_active(observation=obs_conta, context=contexto_conta)
     async with db.get_session() as session:
         linha_alfa_final = (await session.execute(
             select(Ack).where(Ack.symbol == ALFA).order_by(Ack.id.desc())
@@ -1040,8 +1078,9 @@ async def run():
 
     # Nova confirmação explícita substitui INVALIDATED atomicamente.
     EXCHANGE["positions"] = [posicao(symbol="BETAUSDT", size="9.0")]
+    contexto_conta = await mps.capture_validation_context(scope=mps.SCOPE_ACCOUNT)
     obs_conta = await mps.observe_positions()
-    await mps.revalidate_active(observation=obs_conta)
+    await mps.revalidate_active(observation=obs_conta, context=contexto_conta)
     async with db.get_session() as session:
         beta_estado = (await session.execute(
             select(Ack.state).where(Ack.id == id_beta))).scalar()
@@ -1081,13 +1120,17 @@ async def run():
 
     # Falha de persistência propaga UNKNOWN (não vira lista vazia com ok=True).
     async def transicao_quebrada(*args, **kwargs):
-        return {"ok": False, "changed": [], "by_state": [], "stale": [],
+        # Falha de PERSISTÊNCIA no commit da validação.
+        return {"ok": False, "reason_code": "MANUAL_ACK_PERSISTENCE_FAILED",
+                "valid": [], "invalidated": [], "closed": [], "waiting": [],
                 "detail": "RuntimeError"}
 
     EXCHANGE["positions"] = [posicao(symbol="BETAUSDT", size="3.0")]
+    contexto_conta = await mps.capture_validation_context(scope=mps.SCOPE_ACCOUNT)
     obs_conta = await mps.observe_positions()
-    with patch.object(mps, "_transition_acks", transicao_quebrada):
-        falha = await mps.revalidate_active(observation=obs_conta)
+    with patch.object(mps, "_commit_validation", transicao_quebrada):
+        falha = await mps.revalidate_active(observation=obs_conta,
+                                            context=contexto_conta)
     check("falha_de_persistencia_propaga_unknown",
           falha["ok"] is False
           and falha["reason_code"] == "MANUAL_ACK_PERSISTENCE_FAILED", str(falha))

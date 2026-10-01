@@ -175,6 +175,29 @@ async def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_margin_epoch_identity "
             "ON account_margin_epochs (account_scope, exchange, market)"
         ))
+        # Prova de validação manual: revisão exata validada e época da
+        # validação de conta que a governa (aditivas e idempotentes).
+        await conn.execute(text(
+            "ALTER TABLE manual_position_acks "
+            "ADD COLUMN IF NOT EXISTS validated_revision BIGINT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE manual_position_acks "
+            "ADD COLUMN IF NOT EXISTS validated_generation BIGINT"
+        ))
+        # Estado DURÁVEL da validação manual por conta/mercado. Linha existente
+        # começa BLOQUEADA: só um ciclo completo real libera (nada de backfill
+        # com o relógio local).
+        await conn.execute(text(
+            "ALTER TABLE account_margin_epochs "
+            "ADD COLUMN IF NOT EXISTS manual_validation_generation BIGINT "
+            "NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE account_margin_epochs "
+            "ADD COLUMN IF NOT EXISTS manual_validation_blocked BOOLEAN "
+            "NOT NULL DEFAULT true"
+        ))
         # Migrações incrementais
         await conn.execute(text(
             "ALTER TABLE recommendation_snapshots "

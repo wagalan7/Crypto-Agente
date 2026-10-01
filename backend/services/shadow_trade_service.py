@@ -1578,11 +1578,12 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
 
 
 async def _intent_dispatch_guard(intent) -> bool:
-    """Guard antes de CADA POST: só o dono do lease vivo em SENDING despacha.
+    """PREPARAÇÃO do despacho (não autoriza enviar por si só).
 
-    Confere também o TOKEN de admissão (geração de margem resultante gravado na
-    própria intenção): se uma readmissão concorrente mudou a reserva desta
-    decisão, o envio exige NOVA admissão — não se despacha com prova anterior.
+    Confere identidade/estado/owner/lease e passa a `SENDING`. NÃO exige token
+    financeiro ainda vigente: a etapa seguinte (quote/carteira/readmissão) é
+    justamente quem pode renová-lo. A AUTORIZAÇÃO FINAL é
+    `_intent_final_authorization`, executada na fronteira pós-throttle.
     """
     if not isinstance(intent, dict) or not intent.get("granted"):
         return False
@@ -1594,21 +1595,34 @@ async def _intent_dispatch_guard(intent) -> bool:
             return False
         intent["dispatched"] = True
         intent["state"] = "SENDING"
-    if not await intents.may_dispatch(get_session, key, owner=_INTENT_OWNER):
-        return False
-    esperado = intent.get("margin_generation")
-    if esperado is not None:
-        try:
-            linha = await intents.get_intent(get_session, key)
-        except Exception as exc:  # noqa: BLE001 — dúvida NÃO despacha
-            log.warning(f"[p03-intent] token de admissão ilegível: {type(exc).__name__}")
-            return False
-        atual = getattr(linha, "margin_generation", None) if linha else None
-        if atual is not None and int(atual) != int(esperado):
-            log.warning("[p03-intent] token de admissão mudou "
-                        f"({esperado} → {atual}) — exige nova admissão")
-            return False
-    return True
+    return await intents.may_dispatch(get_session, key, owner=_INTENT_OWNER)
+
+
+def _intent_final_authorization(intent, *, dispatch_id_fn=None):
+    """AUTORIZAÇÃO FINAL: só ela libera o POST.
+
+    Roda DEPOIS do throttle e de todos os awaits de preflight/readmissão, numa
+    transação CURTA sob `917283`. Exige lease vivo, dispatch registrado, token
+    igual ao persistido na intenção E igual à geração FINANCEIRA vigente da
+    conta, validação manual não bloqueada e ownership coerente.
+    """
+    async def _autoriza():
+        if not isinstance(intent, dict) or not intent.get("granted"):
+            return {"ok": False, "reason_code": "EXEC_INTENT_GUARD_DENIED"}
+        from services import entry_intent_service as intents
+        from db import get_session
+        dispatch_id = (dispatch_id_fn() if dispatch_id_fn is not None
+                       else intent.get("last_dispatch_id"))
+        veredito = await intents.authorize_dispatch(
+            get_session, intent.get("intent_key"), owner=_INTENT_OWNER,
+            expected_token=intent.get("margin_generation"),
+            dispatch_id=dispatch_id)
+        if not veredito.get("ok"):
+            log.warning("[p03-intent] autorização final negou o envio: "
+                        f"{veredito.get('reason_code')}")
+        return veredito
+
+    return _autoriza
 
 
 async def _register_intent_dispatch(intent, dispatch_id) -> bool:
@@ -1644,20 +1658,39 @@ def _intent_guarded_preflight(intent, inner, *, dispatch_id_fn):
     poderia ser reconciliado pelo client id.
     """
     async def _guarded(*args, **kwargs):
+        # 1. PREPARAÇÃO: identidade/estado/owner/lease e SENDING.
         if not await _intent_dispatch_guard(intent):
             return {"ok": False, "quality": "UNKNOWN",
                     "reason_code": "EXEC_INTENT_GUARD_DENIED",
                     "reason": "intenção de entrada não autoriza este POST",
                     "checks": {}}
+        # 2. Dispatch EXATO desta tentativa gravado ANTES do POST.
         dispatch_id = dispatch_id_fn()
         if not dispatch_id or not await _register_intent_dispatch(intent, dispatch_id):
             return {"ok": False, "quality": "UNKNOWN",
                     "reason_code": "EXEC_INTENT_DISPATCH_UNRECORDED",
                     "reason": "id efetivo do despacho não pôde ser registrado",
                     "checks": {}}
+        intent["last_dispatch_id"] = dispatch_id
+        # 3. Quote/carteira/gates e readmissão — podem RENOVAR o token.
         if inner is None:
-            return {"ok": True, "quality": "OK", "reason_code": None, "checks": {}}
-        return await inner(*args, **kwargs)
+            resultado = {"ok": True, "quality": "OK", "reason_code": None,
+                         "checks": {}}
+        else:
+            resultado = await inner(*args, **kwargs)
+        aprovado = resultado is True or (isinstance(resultado, dict)
+                                         and resultado.get("ok") is True)
+        if not aprovado:
+            return resultado
+        # 4. AUTORIZAÇÃO FINAL depois do `inner`: token/lease/ownership atuais.
+        veredito = await _intent_final_authorization(intent)()
+        if not veredito.get("ok"):
+            base = resultado if isinstance(resultado, dict) else {}
+            return {**base, "ok": False, "quality": "UNKNOWN",
+                    "reason_code": str(veredito.get("reason_code")
+                                       or "EXEC_FINAL_AUTHORIZATION_DENIED"),
+                    "reason": "autorização final da intenção negou o envio"}
+        return resultado
 
     return _guarded
 
@@ -6425,6 +6458,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         market_preflight=_intent_guarded_preflight(
                             _intent, _market_entry_preflight,
                             dispatch_id_fn=lambda: _market_fallback_coid(client_order_id)),
+                        # Autorização FINAL interna, também na filha `-mfb`.
+                        final_authorization=_intent_final_authorization(_intent),
                     )
                     if isinstance(order_res, dict) and order_res.get("ok"):
                         log.info(
@@ -6463,6 +6498,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             tp1_qty_pct=_open_tp1_pct,
                             leverage=int(rec.get("leverage") or 1),
                             client_order_id=client_order_id,
+                            # Autorização FINAL interna: roda depois do await
+                            # de ownership, imediatamente antes de assinar.
+                            final_authorization=_intent_final_authorization(
+                                _intent, dispatch_id_fn=lambda: client_order_id),
                             entry_preflight=_intent_guarded_preflight(
                                 _intent, _market_entry_preflight,
                                 dispatch_id_fn=lambda: client_order_id),
