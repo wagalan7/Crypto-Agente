@@ -114,6 +114,15 @@ async def _send_evolution_ex(tenant: dict, phone: str, text: str) -> tuple[bool,
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(url, json=payload_v2, headers=headers)
             if r.status_code in (400, 422):
+                body_v2 = (r.text or "")[:300]
+                # Só repetir no formato v1 quando o servidor PEDE 'textMessage'
+                # (servidor antigo de verdade). Antes repetíamos em QUALQUER 400:
+                # num servidor v2 a 2ª tentativa sempre falha com
+                # 'requires property "text"', e essa recusa sobrescrevia o motivo
+                # REAL da 1ª (número sem WhatsApp, instância caída, etc.),
+                # deixando um erro indecifrável no painel.
+                if "textmessage" not in body_v2.lower():
+                    return False, _humanize_send_error(r.status_code, body_v2)
                 r = await client.post(url, json=payload_v1, headers=headers)
             if r.status_code >= 400:
                 return False, _humanize_send_error(r.status_code, (r.text or "")[:300])
