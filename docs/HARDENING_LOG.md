@@ -2598,3 +2598,28 @@ mesma árvore pelos callers reais. Contrato em
 - **Sem mudança:** schema, estratégia, calibração, sizing, limites, alavancagem,
   defaults (maker/fallback seguem OFF), ENV/flag, scheduler/worker/endpoint.
   Nenhum acesso a conta real, exchange, Telegram ou deploy.
+
+## A03 — parser positionRisk e autoridade do cache (02/10/2026)
+
+Baseline `efd3dfe9`, no mesmo worktree de entrega. Correção localizada da perda
+de informação ANTES da normalização manual: corpo HTTP ausente e `positionAmt`
+ausente/booleano não podem se tornar lista vazia/zero. Contrato e provas em
+`docs/FECHAMENTO_CORRECAO_001a6685.md`, seção A03.
+
+- `binance_signed_service.get_positions` exige lista/linhas/quantidades válidas,
+  recusa leitura parcial, conserva zeros explícitos e LONG/SHORT finitos. Erro
+  de parsing invalida o frescor do cache anterior; cooldown só pode servir
+  snapshot stale; diagnóstico não emite Infinity.
+- `_detect_untracked_positions` encaminha `POSITION_RISK_INVALID_PAYLOAD` ao
+  caminho manual oficial com a janela original, revogando autorização anterior
+  e persistindo a causa antes de retornar UNKNOWN. Recuperação é provada pelo
+  ciclo oficial, sem clear manual de latch/pausa/época.
+- RED na baseline: primeiros 12 testes de parser, 23 falhas e 7 erros. GREEN:
+  14 testes novos; 166 focais 2×; suíte completa 2.500 executados / 2.498 aprovados
+  / 2 skips históricos R05C (fixture privada ausente, não fabricada). PG16 local
+  real, socket Unix, TCP/DNS bloqueados: 46 boot + 32 dispatch + 73 fechamento,
+  total 151 verificações 2×. Compilação dos quatro Python e diff-check OK.
+- Sem migração/schema/ENV/flag, estratégia, sizing, limites, defaults, frontend
+  ou histórico alterado. Nenhuma conta real, ordem externa, mensagem, merge,
+  push ou deploy. Main preservado; fence local e TOCTOU com a exchange continuam
+  sendo limitações externas declaradas.

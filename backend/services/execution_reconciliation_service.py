@@ -3038,6 +3038,14 @@ async def _detect_untracked_positions() -> dict:
         return {"status": "UNKNOWN", "count": 0}
     if not res or not res.get("ok") or res.get("stale") or res.get("rate_limited"):
         _boot_scan_safe = False
+        if isinstance(res, dict) and res.get("reason_code") == "POSITION_RISK_INVALID_PAYLOAD":
+            # A incompletude foi detectada ANTES da normalização manual. Levar
+            # a mesma janela ao caminho oficial revoga fence/provas e persiste
+            # a causa; não basta apenas pausar o scan enquanto uma autorização
+            # local anterior continua viva. Sem novo GET nem lock sob HTTP.
+            await _revalidate_manual_acks(
+                None, source_ok=False, context=contexto_manual,
+                started_ms=inicio_leitura_ms, ended_ms=fim_leitura_ms)
         await _arm_quarantine("boot: posições stale/rate-limited (não assumo flat)")
         log.critical("[p03][boot] posições stale/incertas — quarentena armada (não assumo flat)")
         return {"status": "UNKNOWN", "count": 0}

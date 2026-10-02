@@ -143,7 +143,8 @@ async def run():
                 "manual": int(linha.manual_validation_generation or 0),
                 "blocked": bool(linha.manual_validation_blocked)}
 
-    async def semear(*, symbol=ALFA, state="ACTIVE", revision=3):
+    async def semear(*, symbol=ALFA, state="ACTIVE", revision=3,
+                     side="buy", position_side="long"):
         """Fixture INDEPENDENTE: ack saudável, conta liberada, latch limpo."""
         mps.reset_local_validation_state()
         relogio["offset_ms"] = 0
@@ -171,7 +172,7 @@ async def run():
             impressao = mps.position_fingerprint(
                 account_scope=ESCOPO, exchange="binance",
                 market="usdm_futures", symbol=mps.canonical_symbol(symbol),
-                side="buy", position_side="long",
+                side=side, position_side=position_side,
                 qty=mps.canonical_decimal("1"),
                 entry_price=mps.canonical_decimal("100"),
                 update_time_ms=1_700_000_000_000,
@@ -179,7 +180,7 @@ async def run():
             linha = Ack(account_scope=ESCOPO, exchange="binance",
                         market="usdm_futures",
                         symbol=mps.canonical_symbol(symbol), quote="USDT",
-                        side="buy", position_side="long", qty="1",
+                        side=side, position_side=position_side, qty="1",
                         entry_price="100",
                         exchange_update_time_ms=1_700_000_000_000,
                         fingerprint=impressao,
@@ -221,8 +222,10 @@ async def run():
         """Executa o caller REAL e devolve (scan, estado, guarda, época)."""
         ack_id = await semear(symbol=symbol)
         await precondicao_saudavel(ack_id, rotulo)
+        # A borda HTTP precisa entregar o corpo EXATO, inclusive None/string/
+        # objeto malformado. list("nada") esconderia o formato original.
         CENARIO.update(latencia_ms=latencia_ms, linhas=list(linhas)
-                       if linhas is not None else None)
+                       if isinstance(linhas, (list, tuple)) else linhas)
         scan = await ers._detect_untracked_positions()
         return (scan, await estado(ack_id), await guarda_de_entrada(symbol),
                 await epoca())
@@ -279,6 +282,13 @@ async def run():
     # (a) Pelo parser REAL de `get_positions`: incompletude ⇒ UNKNOWN.
     casos_parser = [
         ("inf", [linha_raw(amt="Infinity")]),
+        ("amt_none", [linha_raw(amt=None)]),
+        ("amt_bool_false", [linha_raw(amt=False)]),
+        ("amt_bool_true", [linha_raw(amt=True)]),
+        ("corpo_none", None),
+        ("corpo_string", "nada"),
+        ("corpo_objeto", {"positionAmt": "1"}),
+        ("linha_none", [None]),
         ("linha_malformada", ["texto"]),
         ("sem_update_time", [linha_raw(updateTime=0)]),
         ("sem_position_side", [linha_raw(positionSide="")]),
@@ -296,42 +306,11 @@ async def run():
               f"{rotulo}: {scan} {depois} {guarda} {ep} "
               f"latch={sts._EXECUTION_QUARANTINE_REASON}")
 
-    # (b) `positionAmt` booleano: o parser REAL converte True→1.0, então a linha
-    #     é uma posição LEGÍTIMA de 1 unidade. O invariante aqui é "nunca FLAT":
-    #     o reconhecimento continua ACTIVE e o símbolo segue bloqueado.
-    scan_bool, depois_bool, guarda_bool, _ = await caso_inseguro(
-        "a03_bool", linhas=[linha_raw(amt=True)])
-    check("a03_bool_virou_posicao_real_e_nao_flat",
-          scan_bool["status"] != "FLAT" and depois_bool["state"] == "ACTIVE"
-          and guarda_bool["allowed"] is False,
-          f"{scan_bool} {depois_bool} {guarda_bool}")
-
-    # (c) Contrato INTERNO da resposta (None/coleção malformada/qty negativa não
-    #     chegam pelo parser real; aqui a BORDA devolve o payload malformado).
-    get_positions_real = bss.get_positions
-    for rotulo, payload in (("none", None), ("colecao_malformada", "nada"),
-                            ("qty_negativa", [{**linha_raw(), "size": -1.0}])):
-        ack_id = await semear()
-        await precondicao_saudavel(ack_id, f"a03_{rotulo}")
-
-        async def get_malformado(symbol=None, force=False, _p=payload):
-            return {"ok": True, "positions": _p, "count": 0,
-                    "exchange": "binance"}
-
-        with patch.object(bss, "get_positions", get_malformado):
-            scan = await ers._detect_untracked_positions()
-        depois = await estado(ack_id)
-        guarda = await guarda_de_entrada()
-        ep = await epoca()
-        contido = (ep["blocked"] is True
-                   or sts._EXECUTION_QUARANTINE_REASON is not None)
-        check(f"a03_{rotulo}_nunca_vira_flat",
-              scan["status"] == "UNKNOWN" and depois["state"] == "ACTIVE"
-              and ers._boot_scan_safe is False and guarda["allowed"] is False
-              and contido,
-              f"{rotulo}: {scan} {depois} {guarda} {ep} "
-              f"latch={sts._EXECUTION_QUARANTINE_REASON}")
-    assert bss.get_positions is get_positions_real
+    # Quantidade NEGATIVA no esquema INTERNO `size` é impossível: esse módulo
+    # vem do parser. Defesa pura complementar, sem fabricar get_positions/SQL.
+    # A quantidade HTTP negativa legítima (short) é exercitada abaixo.
+    check("a03_size_negativo_interno_e_incompleto",
+          mps.normalize_positions([{"size": -1.0}])[1] is False)
 
     # ══════════════════════════════════════════════════════════════════════
     #  A04 — [] válida + janela fresca ⇒ fechamento oficial correto
@@ -387,6 +366,25 @@ async def run():
           f"{scan_a05} {estado_a05} manual={guarda_manual} bot={guarda_bot} "
           f"protecao={protecao_bot}")
 
+    # Amount NEGATIVO finito é short legítimo na borda HTTP; o parser REAL
+    # mantém módulo positivo e lado SELL, sem inventar flat/UNKNOWN.
+    ack_short = await semear(symbol=ALFA, side="sell", position_side="short")
+    await precondicao_saudavel(ack_short, "a05_short")
+    CENARIO.update(latencia_ms=0, linhas=[
+        linha_raw(ALFA, amt="-1", positionSide="SHORT")])
+    scan_short = await ers._detect_untracked_positions()
+    estado_short = await estado(ack_short)
+    guarda_short = await guarda_de_entrada(ALFA)
+    guarda_outro_short = await guarda_de_entrada(BETA)
+    check("a05_short_legitimo_preserva_manual_e_outro_simbolo",
+          scan_short["status"] == "UNTRACKED"
+          and estado_short["state"] == "ACTIVE"
+          and guarda_short["allowed"] is False
+          and guarda_short["reason_code"] == mps.GUARD_MANUAL_SYMBOL
+          and guarda_outro_short["allowed"] is True,
+          f"{scan_short} {estado_short} manual={guarda_short} "
+          f"outro={guarda_outro_short}")
+
     # ══════════════════════════════════════════════════════════════════════
     #  A06 — leitura fresca envelhece esperando ordens/lock
     # ══════════════════════════════════════════════════════════════════════
@@ -409,6 +407,43 @@ async def run():
           and ers._boot_scan_safe is False and epoca_a06["blocked"] is True
           and guarda_a06["allowed"] is False,
           f"{scan_a06} {estado_a06} {epoca_a06} {guarda_a06}")
+
+    # A03 recuperação: None HTTP deixa UNKNOWN e contenção oficial. SEM
+    # reset/clear de latch/pausa/epoch entre as fases, [] fresca recupera pelo
+    # ciclo REAL, fecha somente o próprio ack e libera somente o owner P03.
+    ack_rec = await semear()
+    await precondicao_saudavel(ack_rec, "a03_recuperacao")
+    CENARIO.update(latencia_ms=0, linhas=None)
+    scan_rec = await ers._detect_untracked_positions()
+    estado_rec_bloqueado = await estado(ack_rec)
+    async with db.get_session() as session:
+        pausa_rec_bloqueada = bool((await session.execute(select(
+            RiskState.trading_paused).where(RiskState.id == 1))).scalar())
+    check("a03_none_arma_contencao_antes_da_recuperacao",
+          scan_rec["status"] == "UNKNOWN"
+          and estado_rec_bloqueado["state"] == "ACTIVE"
+          and estado_rec_bloqueado["revision"] == 3
+          and ers._boot_scan_safe is False and pausa_rec_bloqueada
+          and "p03" in sts.execution_quarantine_owners(),
+          f"{scan_rec} {estado_rec_bloqueado} "
+          f"pausado={pausa_rec_bloqueada} "
+          f"owners={sts.execution_quarantine_owners()}")
+    CENARIO.update(latencia_ms=0, linhas=[])
+    ciclo_rec = await ers.reconcile_due()
+    estado_rec = await estado(ack_rec)
+    epoca_rec = await epoca()
+    guarda_rec = await guarda_de_entrada()
+    async with db.get_session() as session:
+        pausa_rec = bool((await session.execute(select(
+            RiskState.trading_paused).where(RiskState.id == 1))).scalar())
+    check("a03_unknown_para_flat_recupera_pelo_ciclo_sem_clear",
+          ciclo_rec["quarantine_released"] is True
+          and estado_rec["state"] == "CLOSED" and estado_rec["revision"] == 4
+          and ers._boot_scan_safe is True and epoca_rec["blocked"] is False
+          and guarda_rec["allowed"] is True and pausa_rec is False
+          and "p03" not in sts.execution_quarantine_owners(),
+          f"{ciclo_rec} {estado_rec} {epoca_rec} {guarda_rec} "
+          f"pausado={pausa_rec} owners={sts.execution_quarantine_owners()}")
 
     # Idempotência: reexecutar o caso seguro não duplica ack nem incidente.
     ack_idem = await semear()

@@ -69,3 +69,44 @@ seguem outro contrato e não passam pela whitelist de entrada.
   conhecida por outro processo.
 - Não há atomicidade com a exchange; a leitura fresca continua obrigatória.
 - Nada aqui liga operação real, reconhece posição real ou libera pausa real.
+
+## A03 — fechamento do parser HTTP sobre `efd3dfe9` (02/10/2026)
+
+A defesa anterior no formato normalizado não bastava: o parser real usava
+`res["result"] or []` e `positionAmt or 0`. Um corpo HTTP `null`, uma quantidade
+ausente ou `false` desapareciam ANTES da validação manual e podiam fechar um
+reconhecimento ACTIVE como se a conta estivesse comprovadamente flat.
+
+- `get_positions` agora exige uma lista explícita e valida TODAS as linhas e
+  quantidades antes de filtrar zero/símbolo. Ausência, booleano, tipo inválido,
+  NaN/infinito, overflow ou conversão de quantidade não-zero para zero devolvem
+  `ok=false`, `quality=UNKNOWN`, `complete=false`, `positions=null` e
+  `POSITION_RISK_INVALID_PAYLOAD`. Nenhum subconjunto é publicado.
+- Lista vazia explícita e quantidade zero finita continuam válidas. Quantidade
+  HTTP negativa finita continua SHORT legítimo; o `size` normalizado é positivo.
+  Campos ativos que não podem ser convertidos também recusam a leitura inteira.
+- Uma resposta inválida expira a autoridade fresh do cache anterior. O último
+  snapshot fica disponível apenas pelo caminho stale já existente de cooldown;
+  um GET completo válido restaura o cache. A sentinela interna de expiração não
+  aparece como Infinity no diagnóstico público (`cache_age_s=null`).
+- No boot, o motivo do parser percorre `_revalidate_manual_acks(source_ok=False)`
+  com o contexto e a janela ORIGINAIS: revoga a autoridade local e persiste a
+  causa pelo fluxo oficial, antes de retornar UNKNOWN e armar a quarentena.
+  Não há segundo GET. Recuperação ocorre somente pelo ciclo oficial após nova
+  leitura válida; não há limpeza manual de latch/pausa/época nos testes.
+
+Prova RED: os primeiros 12 testes de parser na baseline produziram 23 falhas e
+7 erros. A suíte final inclui 14 testes novos com HTTP sintético passando pelo
+transporte/parser reais, controles saudáveis, invalidação de cache e recuperação.
+O harness do boot deixou de fabricar a resposta normalizada para esses casos.
+
+Validação após a última alteração de código: 166 testes focais aprovados 2×;
+suíte completa 2.500 executados, 2.498 aprovados e os 2 skips históricos R05C por
+fixture privada ausente. PostgreSQL 16 real descartável, socket Unix e TCP/DNS
+bloqueados: boot 46 + dispatch 32 + fechamento 73 = 151 verificações, todas
+aprovadas 2×. Compilação dos quatro arquivos Python e diff-check aprovados.
+
+Escopo: dois serviços, teste novo, harness do boot e documentação. Sem schema,
+flag, ENV, estratégia, sizing, limite, frontend ou default novo. Main não foi
+alterado; nenhum merge, push, deploy ou acesso à conta real nesta correção.
+As limitações externas de fence local/TOCTOU descritas acima permanecem.

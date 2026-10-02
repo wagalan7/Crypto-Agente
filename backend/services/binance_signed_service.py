@@ -776,11 +776,14 @@ def _parse_ban_until_ms(res: dict) -> float:
 def get_positions_ban_status() -> dict:
     """Diagnóstico: estado do cooldown anti-ban + throttle por peso."""
     now_ms = time.time() * 1000.0
+    age = now_ms / 1000.0 - _positions_cache["ts"]
+    cache_age = (round(age, 1) if _positions_cache["data"] is not None
+                 and math.isfinite(age) else None)
     return {
         "banned": now_ms < _ban_until_ms,
         "ban_until_ms": _ban_until_ms,
         "seconds_left": max(0.0, round((_ban_until_ms - now_ms) / 1000.0, 1)),
-        "cache_age_s": round(time.time() - _positions_cache["ts"], 1) if _positions_cache["data"] is not None else None,
+        "cache_age_s": cache_age,
         "cache_ttl_s": _POSITIONS_CACHE_TTL,
         "used_weight_1m": _used_weight_1m,
         "weight_soft_limit": _WEIGHT_SOFT_LIMIT,
@@ -1144,6 +1147,26 @@ def _exchange_update_time_ms(raw) -> Optional[int]:
     return valor if valor > 0 else None
 
 
+def _position_amount_float(value) -> Optional[float]:
+    """Quantidade SIGNED do JSON positionRisk, sem fabricar zero/posição.
+
+    Zero explícito é válido; negativos são shorts legítimos. Ausência, bool,
+    tipo inesperado, não finito ou perda para zero na conversão são UNKNOWN.
+    """
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    try:
+        amount = Decimal(str(value))
+        if not amount.is_finite():
+            return None
+        result = float(amount)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(result) or (amount != 0 and result == 0):
+        return None
+    return result
+
+
 async def get_positions(symbol: Optional[str] = None, *, force: bool = False) -> dict:
     """Leitura de posições com cache curto + cooldown anti-ban.
 
@@ -1202,31 +1225,54 @@ async def get_positions(symbol: Optional[str] = None, *, force: bool = False) ->
             return _ok(_positions_cache["data"], stale=True, banned=True)
         return res
 
-    rows = res["result"] or []
+    def invalid_payload(detail: str) -> dict:
+        # Mantém o último snapshot para o caminho stale de cooldown, mas revoga
+        # sua autoridade fresh até um GET/parse COMPLETO válido. Não publica
+        # subconjunto nem usa ausência/bool como zero. -inf é só sentinela
+        # interna de expiração; não é emitido no payload/API.
+        _positions_cache["ts"] = float("-inf")
+        return {"ok": False, "quality": "UNKNOWN", "complete": False,
+                "positions": None, "reason_code": "POSITION_RISK_INVALID_PAYLOAD",
+                "error": detail, "testnet": _TESTNET, "exchange": "binance"}
+
+    rows = res.get("result")
+    if not isinstance(rows, list):
+        return invalid_payload("positionRisk sem lista explícita válida")
+    # Validar TODAS as quantidades antes de filtrar zero/símbolo ou construir
+    # qualquer snapshot. Um erro numa outra linha invalida a leitura da conta.
+    parsed = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            return invalid_payload(f"positionRisk com linha inválida ({index})")
+        amount = _position_amount_float(row.get("positionAmt"))
+        if amount is None:
+            return invalid_payload(f"positionRisk com quantidade inválida ({index})")
+        parsed.append((row, amount))
     positions = []
-    for p in rows:
-        size = abs(float(p.get("positionAmt") or 0))
+    for p, amt in parsed:
+        size = abs(amt)
         if size <= 0:
             continue
-        amt = float(p.get("positionAmt") or 0)
         side = "Buy" if amt > 0 else "Sell"
-        positions.append({
-            "symbol": p.get("symbol"),
-            "side": side,
-            "size": size,
-            "entry_price": float(p.get("entryPrice") or 0),
-            "mark_price": float(p.get("markPrice") or 0),
-            "unrealized_pnl": float(p.get("unRealizedProfit") or 0),
-            "leverage": float(p.get("leverage") or 0),
-            "position_value": float(p.get("notional") or 0),
-            "take_profit": None,  # Binance não retorna TP/SL nesse endpoint
-            "stop_loss": None,
-            # ADITIVOS (convivência manual/bot): identidade da perna e versão
-            # temporal REAL da posição. Campo ausente/inválido vira None — NÃO
-            # vira "BOTH" nem horário local, porque isso fabricaria identidade.
-            "position_side": _explicit_position_side(p.get("positionSide")),
-            "update_time_ms": _exchange_update_time_ms(p.get("updateTime")),
-        })
+        try:
+            position = {
+                "symbol": p.get("symbol"),
+                "side": side,
+                "size": size,
+                "entry_price": float(p.get("entryPrice") or 0),
+                "mark_price": float(p.get("markPrice") or 0),
+                "unrealized_pnl": float(p.get("unRealizedProfit") or 0),
+                "leverage": float(p.get("leverage") or 0),
+                "position_value": float(p.get("notional") or 0),
+                "take_profit": None,  # Binance não retorna TP/SL neste endpoint
+                "stop_loss": None,
+                # Identidade REAL da perna; não inventa BOTH nem relógio local.
+                "position_side": _explicit_position_side(p.get("positionSide")),
+                "update_time_ms": _exchange_update_time_ms(p.get("updateTime")),
+            }
+        except (TypeError, ValueError, OverflowError):
+            return invalid_payload("positionRisk com campos não normalizáveis")
+        positions.append(position)
     _positions_cache["data"] = positions
     _positions_cache["ts"] = now
     return _ok(positions)
