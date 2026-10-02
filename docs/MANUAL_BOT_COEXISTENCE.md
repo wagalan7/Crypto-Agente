@@ -12,6 +12,15 @@ validação capturado ANTES do GET com CAS, prova publicada/revogada atomicament
 estado durável de validação de conta e classificação única da redução. Detalhes
 em `docs/FECHAMENTO_MANUAL_BOT_20580139.md`.
 
+**Fechamento ÚNICO aplicado sobre `61920156`** (sete defeitos em seis frentes,
+F1–F7): classificação da redução validada como booleano LITERAL na entrada do
+serviço, fence local preservado através de ordens/SQL/commit com compensação da
+publicação, carimbos ORIGINAIS da observação reconferidos depois de cada espera,
+proposta financeira CONGELADA por despacho com último exame SÍNCRONO antes de
+assinar, causa manual decidida DENTRO da transação de release/retomada, recheck
+com CAS e resolução no MESMO commit, e `TERMINAL` idêntico como no-op econômico.
+Detalhes, riscos e runbook em `docs/FECHAMENTO_UNICO_MANUAL_BOT_61920156.md`.
+
 Esta entrega **não** liga nada e **não** autoriza operar a conta. Ela remove UM
 impedimento específico (posição manual travando o bot por inteiro) e cria a
 contenção que torna essa convivência segura.
@@ -457,5 +466,20 @@ cd backend && PYTHONDONTWRITEBYTECODE=1 .venv311/bin/python -B -m unittest \
   autorização, e legado ambíguo fica fail-closed.
 - **Reconhecer não protege.** A posição manual pode estar sem SL: isso é
   decisão do operador e o bot não instala nem cancela proteção dela.
+- **Rótulo de redução é booleano LITERAL.** `"true"`, `1` ou objeto são RECUSA
+  explícita (`EXEC_REDUCE_ONLY_INVALID`) na entrada do serviço, antes de
+  alavancagem, arredondamento com I/O, POST ou cancelamento — não existe
+  normalização para bool em nenhum ponto do percurso.
+- **Contenção local é por PROCESSO.** Quando uma tentativa de fechamento fica
+  insegura (fence avançado durante o commit), o símbolo é contido NESTE processo
+  e a causa durável é gravada; outro processo só conhece a causa depois dessa
+  persistência. Falha local não commitada não é durável nem compartilhada.
+- **Proposta congelada vale para UM despacho.** A prova de uma maker nunca
+  autoriza a filha `-mfb` (COID/hash diferentes), e saídas/proteções usam o
+  guard próprio — nunca a proposta de abertura.
+- **Retomada pode ser recusada.** Zero incidentes não basta: validação manual
+  bloqueada/pendente/ilegível mantém a contenção e devolve resultado
+  estruturado (`MANUAL_CAUSE_PENDING`). O ciclo oficial de revalidação é o que
+  reabre o caminho positivo.
 - Esta entrega não foi executada contra a conta real, não emitiu ordem, não
   liberou pausa de produção e não fez deploy.

@@ -354,6 +354,16 @@ async def _signed_request(
                                                or "EXEC_FINAL_AUTHORIZATION_DENIED"),
                             "reason": str(detalhe.get("reason")
                                           or "autorização final negou o envio")}
+                # A autorização ASSÍNCRONA entrega o último exame SÍNCRONO
+                # (proposta congelada × params finais). Só um veredito POSITIVO
+                # produz esse exame: negativa anterior nunca é ignorada.
+                sincrono = (decisao.get("sync_check")
+                            if isinstance(decisao, dict) else None)
+                if sincrono is not None:
+                    if isinstance(verdict, dict):
+                        verdict = {**verdict, "sync_check": sincrono}
+                    else:
+                        verdict = {"ok": True, "sync_check": sincrono}
             return verdict
 
         request_preflight = _com_ownership
@@ -422,6 +432,35 @@ async def _signed_request(
                 "preflight": verdict if isinstance(verdict, dict) else {},
             }
 
+    # ── ÚLTIMO exame antes de assinar: SÍNCRONO por contrato ───────────────
+    # Entre este bloco e `_build_signed_url`/`request` não existe `await`: é a
+    # única forma de garantir que a proposta aprovada é a que vai no payload.
+    # Ele só existe quando a autorização assíncrona ACIMA aprovou e devolveu o
+    # validador; sem proposta válida não há POST.
+    exame_sincrono = None
+    if request_preflight is not None and isinstance(verdict, dict):
+        exame_sincrono = verdict.get("sync_check")
+    if exame_sincrono is not None:
+        try:
+            decisao_final = exame_sincrono(dict(params or {}))
+        except Exception as exc:  # noqa: BLE001 — mutação falha fechada
+            decisao_final = {"ok": False,
+                             "reason_code": "EXEC_FINAL_SYNC_CHECK_ERROR",
+                             "reason": f"{type(exc).__name__}: {exc}"}
+        aprovado_final = decisao_final is True or (
+            isinstance(decisao_final, dict) and decisao_final.get("ok") is True)
+        if not aprovado_final:
+            detalhe = decisao_final if isinstance(decisao_final, dict) else {}
+            return {
+                "ok": False,
+                "_preflight": True,
+                "_request_sent": False,
+                "reason_code": str(detalhe.get("reason_code")
+                                   or "EXEC_FINAL_SYNC_CHECK_DENIED"),
+                "error": str(detalhe.get("reason")
+                             or "exame síncrono final recusou o envio"),
+                "preflight": detalhe,
+            }
     url = _build_signed_url(path, params)
     try:
         r = await _get_client().request(method, url)
@@ -1228,6 +1267,18 @@ async def _manual_ownership_block(symbol, action: str) -> Optional[dict]:
                       or "símbolo indisponível: posição manual reconhecida"),
             "manual_ownership_blocked": True, "action": action,
             "symbol": verdict.get("symbol")}
+
+
+def reduce_only_flag_is_valid(value) -> bool:
+    """`reduce_only` é um booleano LITERAL — nada é normalizado para bool.
+
+    Aceitar `"true"`, `1` ou um objeto qualquer produziria DUAS leituras do
+    mesmo argumento no percurso (a classificação olha a identidade, os
+    ramos antigos olhavam a veracidade), e foi exatamente isso que deixou uma
+    abertura MARKET sair sem `reduceOnly` e sem SL. `bool(value)` não resolve:
+    adivinhar a intenção de um contrato quebrado é pior que recusar.
+    """
+    return type(value) is bool
 
 
 def classify_order_action(*, reduce_only) -> str:
@@ -2317,8 +2368,26 @@ async def place_order(
 
     Retorno enriquecido com sl_ok/tp1_ok/tp2_ok pra caller propagar diagnóstico.
     """
-    # Classificação ÚNICA da operação (guard inicial, preflight e guard final
-    # usam ESTA mesma `acao`).
+    # Contrato do rótulo de redução ANTES de qualquer efeito: nada de
+    # `set_leverage`, arredondamento com I/O, POST ou cancelamento até aqui.
+    if not reduce_only_flag_is_valid(reduce_only):
+        return {"ok": False, "reason_code": "EXEC_REDUCE_ONLY_INVALID",
+                "error": ("reduce_only exige booleano literal; recebido "
+                          f"{type(reduce_only).__name__}"),
+                "entry_not_submitted": True, "no_fill": True,
+                "submitted_qty": 0.0, "planned_qty": qty,
+                "safety_state": "ENTRY_NOT_SUBMITTED",
+                "entry_state": "NOT_SUBMITTED",
+                # Proteção NÃO foi instalada: o caller não pode ler ausência
+                # de SL como SL pronto.
+                "sl_ok": False, "sl_order_id": None,
+                "sl_msg": "entrada não submetida: contrato de reduce_only inválido",
+                "manual_intervention_required": False,
+                "quarantine_required": False,
+                "client_order_id": client_order_id}
+    # Classificação ÚNICA da operação (guard inicial, preflight, payload,
+    # proteção pós-fill e guard final usam ESTA mesma `acao`/`e_reducao`;
+    # nenhum ramo volta a olhar o argumento bruto).
     acao = classify_order_action(reduce_only=reduce_only)
     e_reducao = acao == "reduce_only"
     if e_reducao:
@@ -2411,7 +2480,7 @@ async def place_order(
     # reconciliado sem repetir a ordem. O caller pode fornecer um id estável;
     # nos demais caminhos geramos um id único dentro do limite de 36 caracteres.
     if not client_order_id:
-        scope = "close" if reduce_only else "entry"
+        scope = "close" if e_reducao else "entry"
         nonce = hashlib.sha1(
             f"{sym}:{binance_side}:{qty_rounded}:{time.time_ns()}".encode("utf-8")
         ).hexdigest()[:10]
@@ -2634,7 +2703,7 @@ async def place_order(
                 }
             else:
                 protection = _protection_not_requested_result()
-                if stop_loss is not None and not reduce_only:
+                if stop_loss is not None and not e_reducao:
                     try:
                         # A entry pode ter sido aceita e preencher depois. Arma
                         # apenas SL closePosition; TPs e um segundo MARKET ficam
@@ -2732,7 +2801,7 @@ async def place_order(
         )
         if entry_status not in terminal_statuses or terminal_qty_unknown:
             protection = _protection_not_requested_result()
-            if stop_loss is not None and not reduce_only:
+            if stop_loss is not None and not e_reducao:
                 try:
                     # Só o SL closePosition: protege a exposição conhecida (e um
                     # eventual fill tardio) sem criar TPs de qty incerta. Quando
@@ -2814,8 +2883,9 @@ async def place_order(
         executed_qty = max(0.0, executed_qty)
 
     # ── Ordens de proteção (SL + TP1 parcial + TP2) ─────────────────────
-    protection = _protection_not_requested_result()
-    if not reduce_only and binance_type == "MARKET":
+    nao_tentada = _protection_not_requested_result()
+    protection = nao_tentada
+    if not e_reducao and binance_type == "MARKET":
         try:
             protection = await _place_post_fill_protection(
                 sym, binance_side, executed_qty,
@@ -2827,6 +2897,13 @@ async def place_order(
             )
         except Exception as exc:
             protection = _protection_exception_result(exc)
+    if (stop_loss is not None and not e_reducao
+            and protection is nao_tentada):
+        # Invariante: numa ENTRADA com SL pedido, "não tentei" JAMAIS pode sair
+        # como `sl_ok=True`. Se a instalação não foi nem tentada, a exposição
+        # está desprotegida e o safety abaixo precisa tratar como falha de SL.
+        protection = {**nao_tentada, "sl_ok": False,
+                      "sl_msg": "proteção não foi tentada para uma entrada"}
     resolved_entry_state = (
         "PARTIALLY_FILLED"
         if binance_type == "MARKET" and entry_status != "FILLED" and executed_qty > 0
@@ -2837,12 +2914,12 @@ async def place_order(
         client_order_id_prefix=client_order_id,
         entry_state=resolved_entry_state,
         operation_kind=(
-            "REDUCE_ONLY" if reduce_only
+            "REDUCE_ONLY" if e_reducao
             else "ORDER_SUBMISSION" if binance_type == "LIMIT"
             else "ENTRY"
         ),
     )
-    if reduce_only and binance_type == "MARKET":
+    if e_reducao and binance_type == "MARKET":
         live_size, live_msg = await _fresh_position_size(sym)
         if live_size is None or live_size > 1e-12:
             safety = {

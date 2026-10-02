@@ -4,6 +4,17 @@ Correção integrada dos cinco achados de `docs/REVISAO_20580139_MANUAL_BOT.md`
 (oito probes, T1–T8). Pronta para **um único deploy**. Nada foi publicado,
 nenhuma posição real reconhecida e nenhuma pausa real liberada nesta execução.
 
+> **Superado em parte pelo fechamento ÚNICO sobre `61920156`.** Sete defeitos
+> remanescentes (F1–F7) foram corrigidos depois deste documento: validação do
+> rótulo de redução na entrada do serviço, fence local preservado com
+> compensação da publicação, carimbos originais reconferidos após cada espera,
+> proposta congelada com exame SÍNCRONO pré-assinatura, causa manual decidida
+> dentro da transação de release/retomada, recheck com CAS no mesmo commit e
+> `TERMINAL` idêntico como no-op econômico. O contrato VIGENTE desses pontos
+> está em `docs/FECHAMENTO_UNICO_MANUAL_BOT_61920156.md`; o resto deste
+> documento (ordem de locks, token financeiro, contexto/CAS, prova, estado
+> durável) continua valendo.
+
 ## 1. Ordem única de locks
 
 Todos os escritores deste protocolo seguem a MESMA sequência — foi a inversão

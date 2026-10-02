@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 import hashlib
 import json
 import math
@@ -218,6 +220,8 @@ class Reservation:
     #: Geração de margem RESULTANTE desta operação. O dispatch confere este
     #: token antes de enviar: mudança concorrente exige nova admissão.
     generation: Optional[int] = None
+    #: Proposta CONGELADA vinculada ao despacho nesta mesma transação (F4).
+    proposal: Optional[dict] = None
 
     @property
     def granted(self) -> bool:
@@ -837,6 +841,7 @@ async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
                            risk_usd: float, capacity: Optional[Capacity] = None,
                            budget: Optional[DailyBudget] = None,
                            margin: Optional[MarginGate] = None,
+                           proposal: Optional[Mapping] = None,
                            now: Optional[datetime] = None) -> Reservation:
     """Admissão FINAL, imediatamente antes do POST, com o risco realmente
     proposto (preço/qty já revalidados).
@@ -916,12 +921,170 @@ async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
                         exchange=identity.exchange, market="usdm_futures")
                 row.margin_generation = resultante
                 row.updated_at = moment
+            vinculo = None
+            if proposal is not None:
+                # Vínculo/token na MESMA transação serializada que autoriza a
+                # qty final. Entra como CHAVE NOVA no JSON existente: plano e
+                # identidade imutáveis da decisão ficam intactos.
+                vinculo = _bind_proposal_in_session(
+                    row, proposal, token=resultante, moment=moment,
+                    lease_expires_at=lease_expires_at)
+                if vinculo is None:
+                    await session.rollback()
+                    return Reservation(BLOCKED_CAPACITY, intent_key, coid, state,
+                                       PROPOSAL_INVALID)
             await session.flush()
             await session.commit()
             return Reservation(RESERVED_RESUMED, intent_key, coid, state,
-                               generation=resultante)
+                               generation=resultante, proposal=vinculo)
     except Exception:
         return Reservation(UNAVAILABLE, intent_key, None, None, "DB_UNAVAILABLE")
+
+
+def _bind_proposal_in_session(row, proposal: Mapping, *, token,
+                              moment: datetime,
+                              lease_expires_at) -> Optional[dict]:
+    """Grava a proposta CONGELADA deste despacho no JSON da decisão.
+
+    Recebe a linha JÁ travada pela admissão: nada aqui abre conexão nova. O
+    token de readmissão e o deadline do lease entram nos campos canônicos, de
+    modo que o hash cobre a autorização inteira.
+    """
+    despacho = proposal.get("dispatch_id") if isinstance(proposal, Mapping) else None
+    if not despacho or _label(str(despacho), MAX_CLIENT_ORDER_ID) is None:
+        return None
+    deadline_ms = None
+    if isinstance(lease_expires_at, datetime):
+        deadline_ms = int(lease_expires_at.timestamp() * 1000)
+    congelada = freeze_dispatch_proposal(
+        **{campo: proposal.get(campo) for campo in PROPOSAL_FIELDS
+           if campo not in ("token", "lease_expires_at_ms", "created_at_ms")},
+        token=_finite_token(token),
+        lease_expires_at_ms=deadline_ms,
+        created_at_ms=int(moment.timestamp() * 1000))
+    if not congelada.get("ok"):
+        return None
+    payload = dict(row.decision_payload or {})
+    propostas = dict(payload.get("proposals") or {})
+    propostas[str(despacho)] = congelada
+    # Teto defensivo: uma decisão não acumula despachos indefinidamente.
+    if len(propostas) > 8:
+        mais_novas = sorted(propostas.items(),
+                            key=lambda kv: int((kv[1] or {}).get("created_at_ms") or 0))
+        propostas = dict(mais_novas[-8:])
+    payload["proposals"] = propostas
+    row.decision_payload = payload
+    row.updated_at = moment
+    return congelada
+
+
+#: Campos CANÔNICOS da proposta de despacho. O hash cobre exatamente estes —
+#: nada de resultado futuro (fill, orderId, status) entra aqui.
+PROPOSAL_FIELDS = (
+    "account_ref", "exchange", "market", "intent_key", "symbol", "side",
+    "position_side", "order_type", "time_in_force", "reduce_only",
+    "dispatch_id", "qty", "price", "stop", "reference_price", "leverage",
+    "token", "created_at_ms", "lease_expires_at_ms", "evidence", "limits",
+)
+PROPOSAL_INVALID = "EXEC_PROPOSAL_INVALID"
+PROPOSAL_MISSING = "EXEC_PROPOSAL_MISSING"
+PROPOSAL_TAMPERED = "EXEC_PROPOSAL_TAMPERED"
+
+
+def _canonical_value(value):
+    """Forma canônica e ESTÁVEL no ida-e-volta do JSONB.
+
+    Números viram string decimal normalizada porque o JSONB guarda `numeric`:
+    `100.0` poderia voltar como `100` e quebrar o hash de uma proposta legítima.
+    `bool` é marcado explicitamente para nunca colidir com 0/1. Tipo inesperado
+    (objeto, NaN, infinito) devolve `None`, e `None` em campo canônico invalida
+    a proposta — não existe conversão silenciosa aqui.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return f"bool:{'true' if value else 'false'}"
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            numero = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
+        if not numero.is_finite():
+            return None
+        return f"num:{format(numero.normalize(), 'f')}"
+    if isinstance(value, str):
+        return f"str:{value}"
+    if isinstance(value, Mapping):
+        saida = {}
+        for chave in sorted(str(k) for k in value.keys()):
+            saida[chave] = _canonical_value(value[chave])
+        return saida
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    return None
+
+
+def canonical_proposal_hash(proposal: Mapping) -> Optional[str]:
+    """Hash determinístico dos campos canônicos (ou None se não der para calcular)."""
+    if not isinstance(proposal, Mapping):
+        return None
+    try:
+        corpo = {campo: _canonical_value(proposal.get(campo))
+                 for campo in PROPOSAL_FIELDS}
+        texto = json.dumps(corpo, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+
+def freeze_dispatch_proposal(**campos) -> Dict[str, Any]:
+    """Proposta IMUTÁVEL de UM despacho, com os campos canônicos apenas.
+
+    Devolve `{"ok": False, "reason_code": ...}` quando um campo essencial é
+    ausente/não finito/de tipo inválido — a proposta não nasce "mais ou menos".
+    Nenhum segredo entra: só identidade, plano quantizado, evidência temporal
+    ORIGINAL, limites vigentes e o token de readmissão.
+    """
+    proposta: Dict[str, Any] = {campo: campos.get(campo) for campo in PROPOSAL_FIELDS}
+    obrigatorios = ("account_ref", "exchange", "intent_key", "symbol", "side",
+                    "order_type", "dispatch_id", "qty", "created_at_ms")
+    for campo in obrigatorios:
+        if _canonical_value(proposta.get(campo)) is None:
+            return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                    "detail": f"campo canônico ausente ou inválido: {campo}"}
+    for campo in ("qty", "price", "stop", "reference_price"):
+        valor = proposta.get(campo)
+        if valor is None:
+            continue
+        if isinstance(valor, bool) or _canonical_value(valor) is None:
+            return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                    "detail": f"valor não finito em {campo}"}
+    proposta["hash"] = canonical_proposal_hash(proposta)
+    if proposta["hash"] is None:
+        return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                "detail": "proposta não pôde ser canonicalizada"}
+    proposta["ok"] = True
+    # MappingProxy: adulteração acidental levanta em vez de passar batido. O
+    # hash continua sendo a prova (cópia mutável também seria detectada).
+    return dict(MappingProxyType(proposta))
+
+
+def proposal_matches_stored(stored: Any) -> Dict[str, Any]:
+    """A proposta persistida é íntegra? (hash recalculado sobre os canônicos)"""
+    if not isinstance(stored, Mapping):
+        return {"ok": False, "reason_code": PROPOSAL_MISSING}
+    esperado = stored.get("hash")
+    if not isinstance(esperado, str) or not esperado:
+        return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                "detail": "proposta sem hash"}
+    calculado = canonical_proposal_hash(stored)
+    if calculado is None:
+        return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                "detail": "proposta não canonicalizável"}
+    if calculado != esperado:
+        return {"ok": False, "reason_code": PROPOSAL_TAMPERED}
+    return {"ok": True, "reason_code": "PROPOSAL_INTACT", "hash": calculado}
 
 
 def _finite_token(value) -> Optional[int]:
@@ -941,6 +1104,7 @@ def _finite_token(value) -> Optional[int]:
 
 async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
                              expected_token, dispatch_id: Optional[str] = None,
+                             require_proposal: bool = False,
                              now: Optional[datetime] = None) -> Dict[str, Any]:
     """AUTORIZAÇÃO FINAL do envio, em transação CURTA sob a lock `917283`.
 
@@ -982,6 +1146,15 @@ async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
                 if str(dispatch_id) not in registrados:
                     await session.rollback()
                     return {"ok": False, "reason_code": "DISPATCH_NOT_REGISTERED"}
+            # Proposta CONGELADA deste despacho, lida sob a MESMA lock. É ela
+            # que o exame SÍNCRONO pré-assinatura vai comparar com os params.
+            propostas = (row.decision_payload or {}).get("proposals") \
+                if isinstance(row.decision_payload, Mapping) else None
+            proposta = None
+            if dispatch_id is not None and isinstance(propostas, Mapping):
+                proposta = propostas.get(str(dispatch_id))
+            deadline_ms = (int(row.lease_expires_at.timestamp() * 1000)
+                           if row.lease_expires_at is not None else None)
             persistido = _finite_token(row.margin_generation)
             # Atributos capturados ANTES de qualquer rollback: depois dele o ORM
             # expira a instância e reler dispararia IO fora do greenlet.
@@ -1023,8 +1196,22 @@ async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
             await session.rollback()        # leitura decisória: nada a gravar
             if negado:
                 return {"ok": False, "reason_code": negado}
+            if require_proposal:
+                integra = proposal_matches_stored(proposta)
+                if not integra.get("ok"):
+                    return {"ok": False,
+                            "reason_code": str(integra.get("reason_code")),
+                            "detail": integra.get("detail")}
+                if _finite_token(proposta.get("token")) != persistido:
+                    return {"ok": False, "reason_code": MARGIN_SUPERSEDED,
+                            "detail": "token da proposta não é o persistido"}
+                if str(proposta.get("dispatch_id")) != str(dispatch_id):
+                    return {"ok": False, "reason_code": PROPOSAL_TAMPERED,
+                            "detail": "proposta de outro despacho"}
             return {"ok": True, "reason_code": "DISPATCH_AUTHORIZED",
-                    "token": persistido}
+                    "token": persistido, "proposal": proposta,
+                    "lease_expires_at_ms": deadline_ms,
+                    "authorized_at_ms": int(agora.timestamp() * 1000)}
     except Exception as exc:  # noqa: BLE001 — dúvida NÃO autoriza
         log.warning(f"[p03-intent] autorização final indisponível: {type(exc).__name__}: {exc}")
         return {"ok": False, "reason_code": "DISPATCH_CHECK_UNAVAILABLE"}
@@ -1069,6 +1256,40 @@ async def may_dispatch(session_factory, intent_key: str, *, owner: str,
         return False
 
 
+RESOLUTION_EFFECTIVE = "EFFECTIVE"
+RESOLUTION_ALREADY_APPLIED = "ALREADY_APPLIED"
+RESOLUTION_CONTRADICTORY = "CONTRADICTORY"
+RESOLUTION_FORBIDDEN = "FORBIDDEN"
+
+
+def classify_resolution(*, current_state: Optional[str], target_state: str,
+                        current_trade_id: Optional[int] = None,
+                        real_trade_id: Optional[int] = None) -> str:
+    """Classifica UMA vez o que a resolução pedida significa para a linha atual.
+
+    - ``EFFECTIVE``: a intenção realmente MUDA de estado — é o único caso em que
+      há evento econômico (e, portanto, bump de geração financeira).
+    - ``ALREADY_APPLIED``: o estado-alvo já está aplicado. Repetir não é evento:
+      reserva, época, vínculo, carimbos, razão e lease de outra tentativa ficam
+      exatamente como estão, e o chamador recebe sucesso idempotente.
+    - ``CONTRADICTORY``: mesmo estado com vínculo contábil DIFERENTE. Não é
+      no-op nem sobrescrita: exige reconciliação/intervenção.
+    - ``FORBIDDEN``: rebaixar ``CONFIRMED`` ou reabrir ``TERMINAL`` como
+      ``UNKNOWN`` (callback atrasado). Nunca acontece em silêncio.
+    """
+    if current_state is None:
+        return RESOLUTION_EFFECTIVE
+    if current_state == target_state:
+        if real_trade_id is not None and current_trade_id != int(real_trade_id):
+            return RESOLUTION_CONTRADICTORY
+        return RESOLUTION_ALREADY_APPLIED
+    if current_state == STATE_CONFIRMED:
+        return RESOLUTION_FORBIDDEN
+    if current_state == STATE_TERMINAL and target_state == STATE_UNKNOWN:
+        return RESOLUTION_FORBIDDEN
+    return RESOLUTION_EFFECTIVE
+
+
 async def _resolve(session_factory, intent_key: str, *, owner: Optional[str], state: str,
                    reason: Optional[str], real_trade_id: Optional[int] = None,
                    now: Optional[datetime] = None, require_owner: bool = True) -> bool:
@@ -1085,8 +1306,26 @@ async def _resolve(session_factory, intent_key: str, *, owner: Optional[str], st
             # Identidade lida ANTES do update: a geração de margem precisa ser
             # incrementada na MESMA transação da mudança econômica.
             atual = (await session.execute(
-                select(EntryIntent.account_ref, EntryIntent.exchange)
+                select(EntryIntent.account_ref, EntryIntent.exchange,
+                       EntryIntent.state, EntryIntent.real_trade_id)
                 .where(EntryIntent.intent_key == intent_key))).one_or_none()
+            # Tudo em locais ANTES de qualquer rollback (instância expirada
+            # faria I/O preguiçoso fora do greenlet).
+            estado_atual = atual[2] if atual is not None else None
+            vinculo_atual = atual[3] if atual is not None else None
+            veredito = classify_resolution(
+                current_state=estado_atual, target_state=state,
+                current_trade_id=vinculo_atual, real_trade_id=real_trade_id)
+            if veredito in (RESOLUTION_FORBIDDEN, RESOLUTION_CONTRADICTORY):
+                # Nem sobrescreve nem finge sucesso: a decisão volta pro
+                # reconciliador/intervenção com a linha intacta.
+                await session.rollback()
+                return False
+            if veredito == RESOLUTION_ALREADY_APPLIED:
+                # NO-OP econômico: sem UPDATE, sem época nova, sem tocar
+                # reserva/vínculo/carimbos/owner. Idempotente por contrato.
+                await session.rollback()
+                return True
             if atual is not None and state in (STATE_CONFIRMED, STATE_TERMINAL):
                 # Época ANTES da linha de intenção (passo 3 da ordem).
                 await _lock_epoch_row(session, account_ref=atual[0],
@@ -1098,6 +1337,12 @@ async def _resolve(session_factory, intent_key: str, *, owner: Optional[str], st
             # por uma reconfirmação, nem por um callback atrasado que chegaria
             # para rebaixá-lo a UNKNOWN/TERMINAL.
             conditions.append(EntryIntent.state != STATE_CONFIRMED)
+            # Mesmo veredito do classificador, agora como backstop de CORRIDA:
+            # o estado-alvo já aplicado (ou um TERMINAL que um callback atrasado
+            # tentaria reabrir) não casa com o UPDATE.
+            conditions.append(EntryIntent.state != state)
+            if state == STATE_UNKNOWN:
+                conditions.append(EntryIntent.state != STATE_TERMINAL)
             if state in (STATE_UNKNOWN, STATE_TERMINAL):
                 # Encerrar tentativa ALHEIA em curso é proibido: só o dono do
                 # lease vivo (ou um lease livre/vencido) fecha a decisão.

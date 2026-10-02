@@ -257,9 +257,13 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
             "reserved_risk_usd": gate.get("reserved_risk_usd"),
             "daily_loss_limit_usd": gate.get("daily_loss_limit_usd"),
         }
+        proposta = _entry_proposal_fields(intent, checks, side=side,
+                                          final_entry=final_entry,
+                                          final_qty=final_qty, stop=stop)
         recusa = await _admit_final_entry_risk(gate, intent, checks,
                                                final_entry=final_entry,
-                                               final_qty=final_qty)
+                                               final_qty=final_qty,
+                                               proposal=proposta)
         if recusa is not None:
             return recusa
         return await _r05d_total_gate(checks)
@@ -280,8 +284,68 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
     }
 
 
+def _p04_evidence_of(checks: dict) -> Optional[dict]:
+    """Evidência P04 ORIGINAL que o callback congelou (quote/depth + limites)."""
+    evidencia = (checks or {}).get("p04_evidence")
+    return evidencia if isinstance(evidencia, dict) else None
+
+
+def _entry_proposal_fields(intent: dict, checks: dict, *, side, final_entry,
+                           final_qty, stop) -> Optional[dict]:
+    """Campos CANÔNICOS da proposta desta tentativa (sem token/hash ainda).
+
+    Só o necessário: identidade, plano JÁ quantizado, evidência temporal
+    ORIGINAL de quote/profundidade/carteira e os limites vigentes. Nenhum
+    segredo, nenhum resultado futuro, nenhum carimbo renovado.
+    """
+    identity = intent.get("identity")
+    despacho = intent.get("last_dispatch_id")
+    evidencia = _p04_evidence_of(checks)
+    if identity is None or not despacho or evidencia is None:
+        return None
+    tipo = str(evidencia.get("order_type") or "").upper()
+    if tipo not in ("MARKET", "LIMIT"):
+        return None
+    # O lado gravado é o lado da EXCHANGE (o que vai no payload), derivado do
+    # normalizador real da decisão — `long/short` nunca é comparado com
+    # `BUY/SELL` por coincidência de texto.
+    try:
+        from services.entry_revalidation_service import normalize_entry_side
+        decisao = normalize_entry_side(side)
+    except Exception:  # noqa: BLE001
+        decisao = None
+    lado_exchange = {"long": "BUY", "short": "SELL"}.get(str(decisao or ""))
+    if lado_exchange is None:
+        return None
+    return {
+        "account_ref": getattr(identity, "account_ref", None),
+        "exchange": getattr(identity, "exchange", None),
+        "market": "usdm_futures",
+        "intent_key": intent.get("intent_key"),
+        "symbol": getattr(identity, "symbol", None),
+        "side": lado_exchange,
+        "position_side": getattr(identity, "position_side", None),
+        "order_type": tipo,
+        "time_in_force": evidencia.get("time_in_force"),
+        "reduce_only": False,
+        "dispatch_id": str(despacho),
+        "qty": float(final_qty) if final_qty is not None else None,
+        "price": (float(final_entry) if tipo == "LIMIT" and final_entry is not None
+                  else None),
+        # MARKET não leva preço no POST: a referência fica como EVIDÊNCIA do
+        # risco admitido, nunca como campo da ordem.
+        "reference_price": (float(final_entry) if tipo == "MARKET"
+                            and final_entry is not None else None),
+        "stop": float(stop) if stop is not None else None,
+        "leverage": intent.get("leverage"),
+        "evidence": evidencia,
+        "limits": evidencia.get("limits"),
+    }
+
+
 async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict, *,
-                                  final_entry=None, final_qty=None):
+                                  final_entry=None, final_qty=None,
+                                  proposal: Optional[dict] = None):
     """Admissão SERIALIZADA do risco e da MARGEM finais, sob a lock da reserva.
 
     Duas decisões que checaram o orçamento antes de reservar poderiam consumir
@@ -301,6 +365,22 @@ async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict, *,
         margem = await _margin_gate_for(intent["identity"], entry=final_entry,
                                         qty=final_qty,
                                         leverage=intent.get("leverage"))
+        if margem is not None:
+            # Carimbos ORIGINAIS da carteira (não renovados): a janela de
+            # margem é reconferida no exame síncrono pré-assinatura.
+            evidencia_margem = {
+                "observed_start_ms": getattr(margem, "observed_start_ms", None),
+                "observed_end_ms": getattr(margem, "observed_end_ms", None),
+                "quality": getattr(margem, "quality", None),
+                "required_usd": getattr(margem, "required_usd", None),
+                "free_usd": getattr(margem, "free_usd", None),
+                "generation": getattr(margem, "generation", None)}
+            checks["margin_evidence"] = evidencia_margem
+            if proposal is not None and isinstance(proposal.get("evidence"), dict):
+                # A proposta carrega a evidência da carteira que a admitiu.
+                proposal = {**proposal,
+                            "evidence": {**proposal["evidence"],
+                                         "margin": evidencia_margem}}
         if margem is None:
             checks["r05_admission"] = {"granted": False,
                                        "reason": "FREE_MARGIN_UNKNOWN"}
@@ -326,7 +406,7 @@ async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict, *,
                 get_session, key, owner=_INTENT_OWNER,
                 risk_usd=float(risco) if risco_conhecido else 0.0,
                 capacity=intent.get("capacity") if orcamento else None,
-                margin=margem,
+                margin=margem, proposal=proposal,
                 budget=(intents.DailyBudget(base_usd=orcamento.get("base_usd"),
                                             limit_usd=orcamento.get("limit_usd"),
                                             complete=bool(orcamento.get("complete")))
@@ -343,6 +423,21 @@ async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict, *,
         # O dispatch passa a conferir ESTA geração antes de enviar.
         if veredicto.generation is not None:
             intent["margin_generation"] = veredicto.generation
+        if proposal is not None:
+            if veredicto.proposal is None:
+                # Proposta exigida e NÃO vinculada: sem ela o exame síncrono
+                # não tem com o que comparar — nada é enviado.
+                checks["r05_admission"] = {"granted": False,
+                                           "reason": intents.PROPOSAL_INVALID}
+                return {"ok": False, "quality": "UNKNOWN",
+                        "reason_code": intents.PROPOSAL_INVALID,
+                        "reason": "proposta do despacho não pôde ser congelada",
+                        "checks": checks}
+            intent["proposal"] = veredicto.proposal
+            checks["dispatch_proposal"] = {
+                "dispatch_id": veredicto.proposal.get("dispatch_id"),
+                "hash": veredicto.proposal.get("hash"),
+                "token": veredicto.proposal.get("token")}
         return None
     log.warning(f"[r05] entrada BLOQUEADA na admissão final: "
                 f"{veredicto.decision} ({veredicto.reason})")
@@ -1598,7 +1693,212 @@ async def _intent_dispatch_guard(intent) -> bool:
     return await intents.may_dispatch(get_session, key, owner=_INTENT_OWNER)
 
 
-def _intent_final_authorization(intent, *, dispatch_id_fn=None):
+#: Tolerância de comparação da qty/preço entre proposta e payload (float repr).
+_PROPOSAL_NUM_TOL = 1e-9
+
+
+def _proposal_age_limit_ms(evidencia) -> Optional[float]:
+    """Teto de idade da proposta = a TTL que o PRÓPRIO P04 já declarou.
+
+    Nenhum limite novo é inventado aqui: usa-se `max_quote_age_ms` (P04A) ou
+    `max_depth_age_ms` (P04B), os mesmos que aprovaram a evidência. Limite
+    ausente/inválido NÃO vira default permissivo — a proposta é recusada.
+    """
+    limites = (evidencia or {}).get("limits") if isinstance(evidencia, dict) else None
+    if not isinstance(limites, dict):
+        return None
+    for campo in ("max_quote_age_ms", "max_depth_age_ms"):
+        valor = limites.get(campo)
+        if isinstance(valor, bool) or valor is None:
+            continue
+        try:
+            numero = float(valor)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numero) and numero > 0:
+            return numero
+    return None
+
+
+def _num_close(a, b) -> bool:
+    try:
+        x, y = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    if x != x or y != y:                      # NaN nunca casa
+        return False
+    return abs(x - y) <= max(_PROPOSAL_NUM_TOL, abs(y) * _PROPOSAL_NUM_TOL)
+
+
+def _revalidate_frozen_p04(evidencia: dict, *, now_ms: float) -> dict:
+    """Roda o avaliador P04 REAL sobre a evidência ORIGINAL, no relógio ATUAL.
+
+    Nada é recalculado nem renovado: o payload de quote/depth e os limites são
+    os congelados na aprovação. É exatamente o mesmo contrato do preflight —
+    por isso uma cotação/profundidade vencida reprova aqui.
+    """
+    if not isinstance(evidencia, dict):
+        return {"ok": False, "reason_code": "EXEC_PROPOSAL_EVIDENCE_MISSING"}
+    tipo = str(evidencia.get("evaluator") or "")
+    args = evidencia.get("args")
+    limites = evidencia.get("limits")
+    if not isinstance(args, dict) or not isinstance(limites, dict):
+        return {"ok": False, "reason_code": "EXEC_PROPOSAL_EVIDENCE_MISSING"}
+    try:
+        from services.entry_revalidation_service import (
+            evaluate_entry_revalidation, evaluate_market_depth_revalidation)
+        if tipo == "quote":
+            veredito = evaluate_entry_revalidation(
+                quote=args.get("quote"), symbol=args.get("symbol"),
+                side=args.get("side"), planned_entry=args.get("planned_entry"),
+                stop_loss=args.get("stop_loss"), tp1=args.get("tp1"),
+                tp2=args.get("tp2"), atr=args.get("atr"),
+                max_quote_age_ms=limites.get("max_quote_age_ms"),
+                max_fetch_latency_ms=limites.get("max_fetch_latency_ms"),
+                max_spread_pct=limites.get("max_spread_pct"),
+                max_chase_atr=limites.get("max_chase_atr"),
+                min_rr_tp1=limites.get("min_rr_tp1"),
+                min_rr_tp2=limites.get("min_rr_tp2"),
+                maker_limit_price=args.get("maker_limit_price"),
+                entry_zone_low=args.get("entry_zone_low"),
+                entry_zone_high=args.get("entry_zone_high"),
+                max_adverse_slippage_pct=limites.get("max_adverse_slippage_pct") or 0.0,
+                enforce_adverse_slippage=bool(limites.get("enforce_adverse_slippage")),
+                now_ms=now_ms)
+        elif tipo == "depth":
+            veredito = evaluate_market_depth_revalidation(
+                depth=args.get("depth"), symbol=args.get("symbol"),
+                side=args.get("side"), qty=args.get("qty"),
+                planned_entry=args.get("planned_entry"),
+                stop_loss=args.get("stop_loss"), tp1=args.get("tp1"),
+                tp2=args.get("tp2"), atr=args.get("atr"),
+                max_depth_age_ms=limites.get("max_depth_age_ms"),
+                max_fetch_latency_ms=limites.get("max_fetch_latency_ms"),
+                max_spread_pct=limites.get("max_spread_pct"),
+                max_book_impact_pct=limites.get("max_book_impact_pct"),
+                max_adverse_slippage_pct=limites.get("max_adverse_slippage_pct"),
+                max_chase_atr=limites.get("max_chase_atr"),
+                min_rr_tp1=limites.get("min_rr_tp1"),
+                min_rr_tp2=limites.get("min_rr_tp2"),
+                entry_zone_low=args.get("entry_zone_low"),
+                entry_zone_high=args.get("entry_zone_high"),
+                now_ms=now_ms)
+        else:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_EVIDENCE_MISSING"}
+    except Exception as exc:  # noqa: BLE001 — dúvida NÃO envia
+        return {"ok": False, "reason_code": "EXEC_PROPOSAL_RECHECK_ERROR",
+                "reason": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(veredito, dict) or veredito.get("ok") is not True:
+        detalhe = veredito if isinstance(veredito, dict) else {}
+        return {"ok": False,
+                "reason_code": str(detalhe.get("reason_code")
+                                   or "EXEC_PROPOSAL_RECHECK_DENIED"),
+                "reason": detalhe.get("reason")}
+    return {"ok": True, "reason_code": "PROPOSAL_EVIDENCE_FRESH"}
+
+
+def _sync_final_check_for(autorizacao: dict):
+    """Exame SÍNCRONO final: proposta congelada × params que vão ser assinados.
+
+    Roda DEPOIS do último await decisivo (a própria autorização assíncrona) e
+    imediatamente antes de assinar — sem nenhum await no meio. Confere, nesta
+    ordem: existência/integridade da proposta, identidade do despacho, idade da
+    autorização, deadline do lease, quote/profundidade e janela de margem pelos
+    contratos REAIS, e por fim a igualdade campo a campo com o payload.
+    """
+    def _exame(params: dict) -> dict:
+        proposta = (autorizacao or {}).get("proposal")
+        if not isinstance(proposta, dict):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_MISSING",
+                    "reason": "sem proposta congelada para este despacho"}
+        from services import entry_intent_service as intents
+        integra = intents.proposal_matches_stored(proposta)
+        if not integra.get("ok"):
+            return {"ok": False, "reason_code": str(integra.get("reason_code")),
+                    "reason": "proposta adulterada ou não canonicalizável"}
+        agora_ms = time.time() * 1000.0
+        # 1. Idade da autorização e deadline do lease (relógio ATUAL).
+        autorizado_ms = (autorizacao or {}).get("authorized_at_ms")
+        if not isinstance(autorizado_ms, (int, float)) or isinstance(autorizado_ms, bool):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_INVALID",
+                    "reason": "carimbo da autorização ausente"}
+        limite_idade_ms = _proposal_age_limit_ms(proposta.get("evidence"))
+        if limite_idade_ms is None:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_INVALID",
+                    "reason": "proposta sem limite de idade declarado"}
+        idade_ms = agora_ms - float(autorizado_ms)
+        if idade_ms < 0 or idade_ms > limite_idade_ms:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_EXPIRED",
+                    "reason": (f"autorização com {idade_ms:.0f}ms excede "
+                               f"{limite_idade_ms:.0f}ms")}
+        deadline_ms = proposta.get("lease_expires_at_ms")
+        if deadline_ms is not None and float(deadline_ms) <= agora_ms:
+            return {"ok": False, "reason_code": "EXEC_LEASE_EXPIRED",
+                    "reason": "lease da intenção venceu antes de assinar"}
+        # 2. Quote/profundidade: avaliadores REAIS sobre a evidência original.
+        frescor = _revalidate_frozen_p04(proposta.get("evidence"),
+                                         now_ms=agora_ms)
+        if not frescor.get("ok"):
+            return frescor
+        # 3. Janela da carteira/margem com o limite vigente.
+        # Contrato EXISTENTE da carteira: qualidade `live`, carimbo inteiro
+        # coerente (não futuro) e geração declarada — a concorrência em si é
+        # provada pelo token/época reconferido na autorização assíncrona. Nenhum
+        # TTL novo é introduzido para a carteira.
+        margem = ((proposta.get("evidence") or {}).get("margin")
+                  if isinstance(proposta.get("evidence"), dict) else None)
+        if isinstance(margem, dict):
+            fim = margem.get("observed_end_ms")
+            if (not isinstance(fim, (int, float)) or isinstance(fim, bool)
+                    or float(fim) <= 0 or float(fim) > agora_ms + 2_000):
+                return {"ok": False, "reason_code": "FREE_MARGIN_UNKNOWN",
+                        "reason": "janela de margem sem evidência temporal"}
+            if str(margem.get("quality") or "").lower() != "live":
+                return {"ok": False, "reason_code": "FREE_MARGIN_UNKNOWN",
+                        "reason": "carteira admitida não é leitura live"}
+            if margem.get("generation") is None:
+                return {"ok": False, "reason_code": "FREE_MARGIN_UNKNOWN",
+                        "reason": "carteira admitida sem geração declarada"}
+        # 4. Identidade e payload: o que vai ser assinado é o admitido.
+        recebidos = params if isinstance(params, dict) else {}
+        esperado_coid = str(proposta.get("dispatch_id") or "")
+        if str(recebidos.get("newClientOrderId") or "") != esperado_coid:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": "client id do payload não é o do despacho admitido"}
+        if str(recebidos.get("type") or "").upper() != str(proposta.get("order_type") or ""):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": "tipo da ordem diverge da proposta"}
+        if str(recebidos.get("side") or "").upper() != str(proposta.get("side") or ""):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": "lado da ordem diverge da proposta"}
+        if not _num_close(recebidos.get("quantity"), proposta.get("qty")):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": "qty do payload não é a admitida"}
+        if recebidos.get("reduceOnly"):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": "abertura admitida não carrega reduceOnly"}
+        if str(proposta.get("order_type")) == "LIMIT":
+            if not _num_close(recebidos.get("price"), proposta.get("price")):
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "preço do payload não é o admitido"}
+            tif = proposta.get("time_in_force")
+            if tif and str(recebidos.get("timeInForce") or "") != str(tif):
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "timeInForce diverge da proposta"}
+        else:
+            # MARKET não leva preço nem stop artificiais no POST de entrada.
+            if recebidos.get("price") is not None \
+                    or recebidos.get("stopPrice") is not None:
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "MARKET de entrada não leva price/stopPrice"}
+        return {"ok": True, "reason_code": "PROPOSAL_MATCHES_PAYLOAD",
+                "dispatch_id": esperado_coid}
+
+    return _exame
+
+
+def _intent_final_authorization(intent, *, dispatch_id_fn=None,
+                                require_proposal: bool = True):
     """AUTORIZAÇÃO FINAL: só ela libera o POST.
 
     Roda DEPOIS do throttle e de todos os awaits de preflight/readmissão, numa
@@ -1616,10 +1916,16 @@ def _intent_final_authorization(intent, *, dispatch_id_fn=None):
         veredito = await intents.authorize_dispatch(
             get_session, intent.get("intent_key"), owner=_INTENT_OWNER,
             expected_token=intent.get("margin_generation"),
-            dispatch_id=dispatch_id)
+            dispatch_id=dispatch_id, require_proposal=require_proposal)
         if not veredito.get("ok"):
             log.warning("[p03-intent] autorização final negou o envio: "
                         f"{veredito.get('reason_code')}")
+            return veredito
+        if require_proposal:
+            # A autorização assíncrona ENTREGA o exame síncrono. Só um veredito
+            # positivo produz o validador — negativa nunca é ignorada depois.
+            veredito = {**veredito,
+                        "sync_check": _sync_final_check_for(veredito)}
         return veredito
 
     return _autoriza
@@ -6308,6 +6614,39 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             "checks": checks,
                         }
                     checks["financial_risk_entry_price"] = _risk_entry["value"]
+                    # Evidência P04B ORIGINAL congelada para o exame SÍNCRONO
+                    # pré-assinatura: mesmos payload e limites, avaliador real.
+                    checks["p04_evidence"] = {
+                        "evaluator": "depth",
+                        "order_type": "MARKET",
+                        "time_in_force": None,
+                        "args": {
+                            "depth": depth,
+                            "symbol": rec["symbol"],
+                            "side": side,
+                            "qty": float(capped_qty),
+                            "planned_entry": float(entry),
+                            "stop_loss": float(stop),
+                            "tp1": float(tp1) if tp1 is not None else None,
+                            "tp2": float(tp2) if tp2 is not None else None,
+                            "atr": _atr,
+                            "entry_zone_low": rec.get("entry_zone_low"),
+                            "entry_zone_high": rec.get("entry_zone_high"),
+                        },
+                        "limits": {
+                            "max_depth_age_ms": P04B_MAX_DEPTH_AGE_MS,
+                            "max_fetch_latency_ms": P04B_MAX_FETCH_LATENCY_MS,
+                            "max_spread_pct": MAX_SPREAD_PCT,
+                            "max_book_impact_pct": P04B_MAX_BOOK_IMPACT_PCT,
+                            "max_adverse_slippage_pct": P04B_MAX_MARKET_SLIPPAGE_PCT,
+                            "max_chase_atr": _p04a_chase_ceiling,
+                            "min_rr_tp1": max(
+                                MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
+                                MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0),
+                            "min_rr_tp2": (MIN_RR_TP2_EXEC if RR_GATE_ENABLED else 0.0),
+                            "min_notional": min_notional,
+                        },
+                    }
                     _fin_gate = await _r05b_entry_gate(
                         side=side, final_entry=_risk_entry["value"], stop=stop,
                         final_qty=capped_qty, checks=checks, intent=_intent)
@@ -6421,6 +6760,38 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             # R05B — gate financeiro DEPOIS das validações
                             # puras e ANTES do POST, com a LIMIT final e a qty
                             # final. Negar ⇒ zero POST, zero entry.
+                            # Evidência P04A ORIGINAL congelada (quote + limites)
+                            # para o exame SÍNCRONO imediatamente antes do POST.
+                            checks["p04_evidence"] = {
+                                "evaluator": "quote",
+                                "order_type": "LIMIT",
+                                "time_in_force": "GTX",
+                                "args": {
+                                    "quote": quote,
+                                    "symbol": rec["symbol"],
+                                    "side": side,
+                                    "planned_entry": float(entry),
+                                    "stop_loss": float(stop),
+                                    "tp1": float(tp1) if tp1 is not None else None,
+                                    "tp2": float(tp2) if tp2 is not None else None,
+                                    "atr": _atr,
+                                    "maker_limit_price": float(final_limit_price),
+                                    "entry_zone_low": rec.get("entry_zone_low"),
+                                    "entry_zone_high": rec.get("entry_zone_high"),
+                                },
+                                "limits": {
+                                    "max_quote_age_ms": P04A_MAX_QUOTE_AGE_MS,
+                                    "max_fetch_latency_ms": P04A_MAX_FETCH_LATENCY_MS,
+                                    "max_spread_pct": MAX_SPREAD_PCT,
+                                    "max_chase_atr": _p04a_chase_ceiling,
+                                    "min_rr_tp1": max(
+                                        MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
+                                        MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0),
+                                    "min_rr_tp2": (MIN_RR_TP2_EXEC if RR_GATE_ENABLED else 0.0),
+                                    "max_adverse_slippage_pct": P04A_MAX_ADVERSE_SLIPPAGE_PCT,
+                                    "enforce_adverse_slippage": True,
+                                },
+                            }
                             _fin_gate = await _r05b_entry_gate(
                                 side=side, final_entry=final_limit_price,
                                 stop=stop, final_qty=capped_qty, checks=checks,

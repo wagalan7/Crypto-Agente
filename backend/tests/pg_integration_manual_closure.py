@@ -821,10 +821,47 @@ async def run():
             dispatch_id = intent["client_order_id"]
 
             async def preflight(qty, regras):
-                # Readmissão REAL com carteira nova (renova o token).
+                # Readmissão REAL com carteira nova (renova o token). A partir
+                # do fechamento único (F4) a admissão também CONGELA a proposta
+                # do despacho: a evidência P04 original vai junto, como o caller
+                # de produção faz.
+                agora_ms = ms()
+                checks_p04 = {
+                    "best_executable_price": 100.0, "vwap_price": 100.0,
+                    "worst_price": 100.0,
+                    "p04_evidence": {
+                        "evaluator": "depth", "order_type": "MARKET",
+                        "time_in_force": None,
+                        "args": {
+                            "depth": {"ok": True, "exchange": "binance",
+                                      "source": "binance_depth",
+                                      "symbol": symbol, "last_update_id": 1,
+                                      "message_time_ms": float(agora_ms),
+                                      "exchange_time_ms": float(agora_ms),
+                                      "received_at_ms": float(agora_ms),
+                                      "latency_ms": 20.0,
+                                      "bids": [["99.95", "5000"]],
+                                      "asks": [["100.05", "5000"]]},
+                            "symbol": symbol, "side": "long",
+                            "qty": float(qty), "planned_entry": 100.0,
+                            "stop_loss": 95.0, "tp1": 105.0, "tp2": 110.0,
+                            "atr": 2.0, "entry_zone_low": None,
+                            "entry_zone_high": None},
+                        "limits": {"max_depth_age_ms": 1500.0,
+                                   "max_fetch_latency_ms": 400.0,
+                                   "max_spread_pct": 0.5,
+                                   "max_book_impact_pct": 5.0,
+                                   "max_adverse_slippage_pct": 5.0,
+                                   "max_chase_atr": 5.0, "min_rr_tp1": 0.0,
+                                   "min_rr_tp2": 0.0, "min_notional": 5.0},
+                    },
+                }
                 recusa = await sts._admit_final_entry_risk(
-                    {"ok": True, "budget": None}, intent, {},
-                    final_entry=100.0, final_qty=float(qty))
+                    {"ok": True, "budget": None}, intent, checks_p04,
+                    final_entry=100.0, final_qty=float(qty),
+                    proposal=sts._entry_proposal_fields(
+                        intent, checks_p04, side="long", final_entry=100.0,
+                        final_qty=float(qty), stop=95.0))
                 if recusa is not None:
                     return recusa
                 if mudar_epoca_no_preflight:
@@ -836,8 +873,7 @@ async def run():
                         margin=await carteira(1.0))
                 # Preços do P04B que o transporte confere no MIN_NOTIONAL.
                 return {"ok": True, "quality": "OK", "approved_qty": float(qty),
-                        "checks": {"best_executable_price": 100.0,
-                                   "vwap_price": 100.0, "worst_price": 100.0}}
+                        "checks": checks_p04}
 
             # ROTA REAL: preparação + dispatch + preflight/readmissão dentro do
             # `_intent_guarded_preflight`, e AUTORIZAÇÃO FINAL interna composta

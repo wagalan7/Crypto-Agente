@@ -25,6 +25,7 @@ conter NOVAS entradas e nunca "corrigir" fechando/alterando posição alheia.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -61,6 +62,20 @@ ACK_BOT_ORDERS_PRESENT = "MANUAL_ACK_BOT_ORDERS_PRESENT"
 ACK_ORDERS_UNKNOWN = "MANUAL_ACK_ORDERS_UNKNOWN"
 ACK_DB_UNAVAILABLE = "MANUAL_ACK_DB_UNAVAILABLE"
 ACK_CONFLICTING_ACTIVE = "MANUAL_ACK_CONFLICTING_ACTIVE"
+#: Carimbo temporal da observação ausente, não inteiro, bool, zero/negativo ou
+#: no futuro. NUNCA é substituído por `now`: sem evidência temporal legítima a
+#: observação não autoriza nada.
+ACK_READ_TIMESTAMP_INVALID = "MANUAL_ACK_READ_TIMESTAMP_INVALID"
+#: A janela da observação é mais longa que o limite de frescor (a leitura levou
+#: tempo demais para ser evidência de um instante).
+ACK_READ_WINDOW_TOO_LONG = "MANUAL_ACK_READ_WINDOW_TOO_LONG"
+#: A prova de ausência de ordens envelheceu entre a consulta e o commit.
+ACK_ORDERS_TOO_OLD = "MANUAL_ACK_ORDERS_TOO_OLD"
+#: O fence local avançou entre a decisão e o commit: a publicação inteira é
+#: desfeita/compensada e os símbolos afetados ficam contidos localmente.
+PUBLICATION_FENCE_LOST = "MANUAL_ACK_PUBLICATION_FENCE_LOST"
+#: Compensação de uma publicação indevida não pôde ser concluída.
+COMPENSATION_UNKNOWN = "MANUAL_ACK_COMPENSATION_UNKNOWN"
 
 #: Motivos do GUARD de propriedade.
 GUARD_OK = "OWNERSHIP_OK"
@@ -71,6 +86,10 @@ GUARD_SYMBOL_UNKNOWN = "MANUAL_OWNERSHIP_SYMBOL_UNKNOWN"
 #: exposição exige prova fresca; manutenção protetiva de posição BOT não exige.
 GUARD_PROOF_STALE = "MANUAL_ACK_PROOF_STALE"
 GUARD_AMBIGUOUS_REGISTRY = "MANUAL_ACK_REGISTRY_AMBIGUOUS"
+#: Contenção LOCAL do símbolo: uma tentativa de fechamento ficou insegura neste
+#: processo (fence avançou durante a publicação, compensação pendente). Vale
+#: mesmo que a linha durável pareça saudável — e não é prova de ausência.
+GUARD_LOCAL_CONTAINMENT = "MANUAL_SYMBOL_LOCAL_CONTAINMENT"
 
 #: Estados do reconhecimento que BLOQUEIAM o símbolo. Importados do modelo para
 #: que transporte, admissão, reconciliador e índice usem o MESMO predicado.
@@ -492,6 +511,16 @@ async def ownership_guard(symbol: Any = None, *, action: str = "mutate",
     NÃO consulta a exchange: é chamado de dentro de locks/semáforos do próprio
     transporte, onde I/O HTTP recursivo é proibido.
     """
+    # Contenção LOCAL primeiro: é síncrona, não depende do banco e vale mesmo
+    # que a linha durável pareça saudável (foi exatamente o caso em que um
+    # CLOSED indevido ficou gravado com o fence já avançado).
+    contencao = local_symbol_block(symbol)
+    if contencao is not None:
+        return {"allowed": False, "reason_code": GUARD_LOCAL_CONTAINMENT,
+                "action": action,
+                "symbol": (canonical_symbol(symbol) if symbol else None),
+                "detail": contencao.get("reason"),
+                "local_fence": contencao.get("fence")}
     nova_exposicao = (require_fresh_proof
                       and str(action) not in PROTECTIVE_ACTIONS)
     estado_conta = None
@@ -730,11 +759,19 @@ async def symbol_has_live_orders(symbol: Any) -> Dict[str, Any]:
     """
     chave = symbol_key(symbol)
     canonico = canonical_symbol(chave)
+    inicio_ms = _now_ms()
+
+    def _janela(**extra) -> Dict[str, Any]:
+        # Carimbos da PRÓPRIA evidência de ordens: o commit reconfere a idade
+        # desta leitura, não a da leitura de posições.
+        return {"observed_start_ms": inicio_ms, "observed_end_ms": _now_ms(),
+                "symbol_key": chave, **extra}
+
     try:
         from services import binance_signed_service as bss
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
-                "detail": type(exc).__name__}
+                "detail": type(exc).__name__, **_janela()}
     fontes = {"algo": getattr(bss, "get_open_algo_orders", None),
               "common": getattr(bss, "get_open_orders", None)}
     total, detalhes = 0, {}
@@ -742,30 +779,33 @@ async def symbol_has_live_orders(symbol: Any) -> Dict[str, Any]:
         if leitor is None:
             # Capability ausente é INCERTEZA: o símbolo continua bloqueado.
             return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
-                    "detail": f"fonte de ordens ausente: {nome}"}
+                    "detail": f"fonte de ordens ausente: {nome}", **_janela()}
         try:
             res = await leitor(canonico)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
-                    "detail": f"{nome}: {type(exc).__name__}"}
+                    "detail": f"{nome}: {type(exc).__name__}", **_janela()}
         if not isinstance(res, dict) or not res.get("ok"):
             return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
-                    "detail": f"{nome}: listagem indisponível"}
+                    "detail": f"{nome}: listagem indisponível", **_janela()}
         linhas = res.get("orders")
         if not isinstance(linhas, (list, tuple)):
             return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
-                    "detail": f"{nome}: formato desconhecido"}
+                    "detail": f"{nome}: formato desconhecido", **_janela()}
         vivas = 0
         for ordem in linhas:
             if not isinstance(ordem, Mapping):
                 return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN,
-                        "detail": f"{nome}: linha em formato desconhecido"}
+                        "detail": f"{nome}: linha em formato desconhecido",
+                        **_janela()}
             if symbol_key(ordem.get("symbol")) == chave:
                 vivas += 1
         detalhes[nome] = vivas
         total += vivas
     return {"ok": True, "reason_code": "ORDERS_READ", "live": total > 0,
-            "count": total, "by_source": detalhes}
+            "count": total, "by_source": detalhes,
+            # Completude EXPLÍCITA: as duas fontes responderam nesta janela.
+            "complete": set(detalhes) == set(fontes), **_janela()}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1076,13 +1116,39 @@ VALIDATION_FAILURE = "MANUAL_VALIDATION_FAILED"
 #: persistir: se o commit falhar, o publicador ainda recusa contextos anteriores
 #: à falha — não se afirma que uma falha sem commit já é conhecida por outro
 #: processo.
-_LOCAL_VALIDATION: Dict[str, Any] = {"fence": 0, "pending": None}
+_LOCAL_VALIDATION: Dict[str, Any] = {"fence": 0, "pending": None,
+                                     "blocked_symbols": {}}
+
+#: Mutex LOCAL dos escritores manuais. Serializa decisão→publicação no processo
+#: para que duas tentativas não publiquem a partir de leituras cruzadas. É
+#: tomado SOMENTE nas entradas públicas (`revalidate_active`,
+#: `publish_validation_proof`, retomadas de pausa) e NUNCA é reaquirido por
+#: helper interno — não é reentrante. Jamais é mantido durante GET da exchange.
+_WRITER_LOCKS: Dict[Any, "asyncio.Lock"] = {}
+
+
+def manual_writer_lock() -> "asyncio.Lock":
+    """Mutex dos escritores manuais do loop corrente (um processo = um loop)."""
+    laco = asyncio.get_running_loop()
+    lock = _WRITER_LOCKS.get(laco)
+    if lock is None:
+        if len(_WRITER_LOCKS) > 8:
+            # Loops de teste encerrados: nada a serializar com eles.
+            _WRITER_LOCKS.clear()
+        lock = asyncio.Lock()
+        _WRITER_LOCKS[laco] = lock
+    return lock
 
 
 def reset_local_validation_state() -> None:
-    """Simula processo NOVO (boot). Boot começa fechado: o estado durável manda."""
+    """Simula processo NOVO (boot). Boot começa fechado: o estado durável manda.
+
+    Zerar o estado local NÃO é prova de nada: a autoridade manual de um processo
+    novo exige leitura fresca e completa da conta antes de nova exposição.
+    """
     _LOCAL_VALIDATION["fence"] = 0
     _LOCAL_VALIDATION["pending"] = None
+    _LOCAL_VALIDATION["blocked_symbols"] = {}
 
 
 def local_validation_fence() -> int:
@@ -1100,6 +1166,114 @@ def _advance_local_fence(reason: str) -> int:
 def pending_validation_failure() -> Optional[dict]:
     pendente = _LOCAL_VALIDATION.get("pending")
     return dict(pendente) if pendente else None
+
+
+def _clear_pending_if_version(versao: int) -> bool:
+    """Limpa a causa pendente SÓ se a versão persistida ainda é a vigente."""
+    pendente = _LOCAL_VALIDATION.get("pending")
+    if pendente and int(pendente.get("fence") or 0) == int(versao):
+        _LOCAL_VALIDATION["pending"] = None
+        return True
+    return False
+
+
+def block_symbol_locally(symbol: Any, *, reason: str) -> Dict[str, Any]:
+    """Contém o símbolo NESTE processo, de forma síncrona (sem await).
+
+    Usado quando uma tentativa de fechamento fica insegura: a linha durável pode
+    ter sido escrita indevidamente e a compensação ainda não terminou.
+    """
+    chave = symbol_key(symbol)
+    if not chave:
+        return {"ok": False, "reason_code": GUARD_SYMBOL_UNKNOWN}
+    registro = {"reason": _short(reason, 120), "fence": local_validation_fence(),
+                "at_ms": _now_ms()}
+    _LOCAL_VALIDATION["blocked_symbols"][chave] = registro
+    return {"ok": True, "reason_code": GUARD_LOCAL_CONTAINMENT,
+            "symbol_key": chave, **registro}
+
+
+def local_symbol_block(symbol: Any) -> Optional[Dict[str, Any]]:
+    chave = symbol_key(symbol)
+    if not chave:
+        return None
+    registro = _LOCAL_VALIDATION["blocked_symbols"].get(chave)
+    return dict(registro) if registro else None
+
+
+def locally_blocked_symbols() -> Dict[str, Dict[str, Any]]:
+    return {k: dict(v) for k, v in
+            _LOCAL_VALIDATION["blocked_symbols"].items()}
+
+
+def clear_local_symbol_block(symbol: Any) -> bool:
+    """Libera a contenção local. Só o caminho que COMPROVOU segurança chama."""
+    chave = symbol_key(symbol)
+    if not chave:
+        return False
+    return _LOCAL_VALIDATION["blocked_symbols"].pop(chave, None) is not None
+
+
+def _finite_ms(value: Any) -> Optional[int]:
+    """Carimbo em ms legítimo: inteiro > 0, não bool, finito e não futuro.
+
+    Ausente, bool, NaN, zero, negativo ou futuro devolvem None — e None NUNCA é
+    substituído por `now` nem por zero rio abaixo.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    try:
+        carimbo = int(value)
+    except (TypeError, ValueError):
+        return None
+    if carimbo <= 0 or carimbo > _now_ms() + _CLOCK_SKEW_MS:
+        return None
+    return carimbo
+
+
+def observation_window(observation: Any) -> Dict[str, Any]:
+    """Janela ORIGINAL da observação, validada como evidência temporal.
+
+    Devolve início/fim ORIGINAIS (nunca o relógio do commit), idade medida com o
+    relógio ATUAL e duração da leitura. `ok=False` quando a evidência é
+    ilegítima — e aí nada autoriza encerramento, prova ou desbloqueio.
+    """
+    if not isinstance(observation, Mapping):
+        return {"ok": False, "reason_code": ACK_READ_TIMESTAMP_INVALID,
+                "detail": "observação sem mapeamento"}
+    fim = _finite_ms(observation.get("observed_end_ms"))
+    if fim is None:
+        return {"ok": False, "reason_code": ACK_READ_TIMESTAMP_INVALID,
+                "detail": "observed_end_ms não é carimbo legítimo"}
+    bruto_inicio = observation.get("observed_start_ms")
+    inicio = fim if bruto_inicio is None else _finite_ms(bruto_inicio)
+    if inicio is None or inicio > fim:
+        return {"ok": False, "reason_code": ACK_READ_TIMESTAMP_INVALID,
+                "detail": "observed_start_ms inválido ou posterior ao fim"}
+    duracao_s = (fim - inicio) / 1000.0
+    if duracao_s > ACK_MAX_READ_AGE_S:
+        return {"ok": False, "reason_code": ACK_READ_WINDOW_TOO_LONG,
+                "start_ms": inicio, "end_ms": fim, "duration_s": duracao_s}
+    return {"ok": True, "reason_code": "OBSERVATION_WINDOW",
+            "start_ms": inicio, "end_ms": fim, "duration_s": duracao_s,
+            "age_s": max(0.0, (_now_ms() - fim) / 1000.0),
+            "quality": observation.get("reason_code"),
+            "complete": bool(observation.get("complete")),
+            "scope": observation.get("scope"),
+            "account_scope": observation.get("account_scope")}
+
+
+def window_age_ok(janela: Mapping) -> Dict[str, Any]:
+    """Reconfere a idade da janela com o relógio ATUAL (pós-espera/pós-lock)."""
+    fim = _finite_ms((janela or {}).get("end_ms"))
+    if fim is None:
+        return {"ok": False, "reason_code": ACK_READ_TIMESTAMP_INVALID}
+    idade_s = max(0.0, (_now_ms() - fim) / 1000.0)
+    if idade_s > ACK_MAX_READ_AGE_S:
+        return {"ok": False, "reason_code": ACK_READ_TOO_OLD, "age_s": idade_s}
+    return {"ok": True, "reason_code": "OBSERVATION_FRESH", "age_s": idade_s}
 
 
 def proof_is_valid(ack: Mapping, *, account_scope: Any, manual_generation: Any,
@@ -1303,10 +1477,12 @@ async def register_validation_failure(*, reason: str,
     3. erro de banco mantém latch/causa pendente e devolve UNKNOWN — o commit
        pode NÃO ter acontecido.
     """
-    _advance_local_fence(reason)
+    versao = _advance_local_fence(reason)
     resultado = await _persist_validation_failure(context=context, reason=reason)
+    # Só limpa o pendente se a versão persistida AINDA é a vigente: uma falha
+    # NOVA registrada durante o await não pode ser apagada por este sucesso.
     if resultado.get("ok"):
-        _LOCAL_VALIDATION["pending"] = None
+        _clear_pending_if_version(versao)
     return {"ok": bool(resultado.get("ok")), "reason_code": VALIDATION_FAILURE,
             "detail": _short(reason, 120),
             "generation": resultado.get("generation"),
@@ -1318,12 +1494,15 @@ async def flush_pending_validation_failure() -> Dict[str, Any]:
     pendente = pending_validation_failure()
     if not pendente:
         return {"ok": True, "reason_code": "NO_PENDING_FAILURE"}
+    versao = int(pendente.get("fence") or 0)
     resultado = await _persist_validation_failure(
         context=None, reason=str(pendente.get("reason") or VALIDATION_FAILURE))
+    limpou = False
     if resultado.get("ok"):
-        _LOCAL_VALIDATION["pending"] = None
+        limpou = _clear_pending_if_version(versao)
     return {"ok": bool(resultado.get("ok")), "reason_code": VALIDATION_FAILURE,
-            "generation": resultado.get("generation")}
+            "generation": resultado.get("generation"), "cleared": limpou,
+            "pending_failure": pending_validation_failure() is not None}
 
 
 async def _persist_validation_failure(*, context: Optional[Dict[str, Any]],
@@ -1362,6 +1541,32 @@ async def _persist_validation_failure(*, context: Optional[Dict[str, Any]],
                   f"{type(exc).__name__}: {exc}")
         return {"ok": False, "reason_code": GUARD_REGISTRY_UNAVAILABLE,
                 "detail": type(exc).__name__}
+
+
+def orders_evidence_ok(evidencia: Any, *, symbol: Any) -> Dict[str, Any]:
+    """A ausência de ordens está PROVADA, para ESTE símbolo, e ainda fresca?
+
+    Exige leitura bem-sucedida das DUAS fontes, do próprio símbolo, com janela
+    temporal legítima e idade dentro do limite medida no relógio do commit.
+    """
+    if not isinstance(evidencia, Mapping):
+        return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN}
+    if not evidencia.get("ok") or evidencia.get("live"):
+        return {"ok": False, "reason_code": str(evidencia.get("reason_code")
+                                                or ACK_ORDERS_UNKNOWN)}
+    if not evidencia.get("complete"):
+        return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN}
+    if symbol_key(evidencia.get("symbol_key")) != symbol_key(symbol):
+        return {"ok": False, "reason_code": ACK_ORDERS_UNKNOWN}
+    janela = observation_window(evidencia)
+    if not janela["ok"]:
+        return {"ok": False, "reason_code": str(janela["reason_code"])}
+    frescor = window_age_ok(janela)
+    if not frescor["ok"]:
+        return {"ok": False, "reason_code": ACK_ORDERS_TOO_OLD,
+                "age_s": frescor.get("age_s")}
+    return {"ok": True, "reason_code": "ORDERS_ABSENT_PROVEN",
+            "age_s": frescor.get("age_s")}
 
 
 def _revoke_proof(linha, agora) -> None:
@@ -1421,13 +1626,23 @@ async def revalidate_active(*, observation: Optional[Dict[str, Any]] = None,
         return {"ok": False, "reason_code": VALIDATION_FAILURE, "valid": [],
                 "invalidated": [], "closed": [], "waiting": [],
                 "detail": "falha pendente precisa ser persistida antes"}
-    idade_s = max(0.0, (_now_ms() - int(observation.get("observed_end_ms")
-                                        or _now_ms())) / 1000.0)
-    if idade_s > ACK_MAX_READ_AGE_S:
-        falha = await register_validation_failure(reason=ACK_READ_TOO_OLD,
-                                                  context=context)
-        return {"ok": False, "reason_code": ACK_READ_TOO_OLD, "valid": [],
+    # Janela ORIGINAL da observação (início/fim/qualidade/completude). Carimbo
+    # ilegítimo NÃO vira `now` nem zero: é falha externa.
+    janela = observation_window(observation)
+    if not janela["ok"]:
+        falha = await register_validation_failure(
+            reason=str(janela.get("reason_code")), context=context)
+        return {"ok": False, "reason_code": janela["reason_code"], "valid": [],
                 "invalidated": [], "closed": [], "waiting": [],
+                "detail": janela.get("detail"),
+                "failure_persisted": falha["ok"]}
+    frescor = window_age_ok(janela)
+    if not frescor["ok"]:
+        falha = await register_validation_failure(
+            reason=str(frescor.get("reason_code")), context=context)
+        return {"ok": False, "reason_code": frescor["reason_code"], "valid": [],
+                "invalidated": [], "closed": [], "waiting": [],
+                "age_s": frescor.get("age_s"),
                 "failure_persisted": falha["ok"]}
     escopo_obs = str(observation.get("scope") or SCOPE_ACCOUNT)
     if escopo_obs != str(context.get("scope")):
@@ -1460,13 +1675,17 @@ async def revalidate_active(*, observation: Optional[Dict[str, Any]] = None,
             ordens = await symbol_has_live_orders(instantaneo.get("symbol"))
             if not ordens.get("ok"):
                 planejadas.append((instantaneo, STATE_WAITING_ORDERS,
-                                   "ordens do símbolo não confirmadas"))
+                                   "ordens do símbolo não confirmadas", ordens))
             elif ordens.get("live"):
                 planejadas.append((instantaneo, STATE_WAITING_ORDERS,
-                                   f"{ordens.get('count')} ordem(ns) do operador viva(s)"))
+                                   f"{ordens.get('count')} ordem(ns) do operador viva(s)",
+                                   ordens))
             else:
+                # A evidência de ordens vai junto: o commit reconfere a idade
+                # DELA antes de aceitar um CLOSED.
                 planejadas.append((instantaneo, STATE_CLOSED,
-                                   "posição e ordens ausentes em leitura fresca"))
+                                   "posição e ordens ausentes em leitura fresca",
+                                   ordens))
             continue
         posicao = perna["position"]
         impressao = position_fingerprint(
@@ -1485,9 +1704,168 @@ async def revalidate_active(*, observation: Optional[Dict[str, Any]] = None,
             planejadas.append((instantaneo, STATE_INVALIDATED,
                                "identidade divergente da reconhecida"))
 
-    return await _commit_validation(context=context, observation=observation,
-                                    transitions=planejadas,
-                                    proof_candidates=candidatos_prova)
+    # As consultas de ordens levaram tempo real: reconfere a idade da janela com
+    # o relógio ATUAL e o fence local ANTES de abrir a transação de publicação.
+    frescor = window_age_ok(janela)
+    if not frescor["ok"]:
+        falha = await register_validation_failure(
+            reason=str(frescor.get("reason_code")), context=context)
+        return {"ok": False, "reason_code": frescor["reason_code"], "valid": [],
+                "invalidated": [], "closed": [], "waiting": [],
+                "age_s": frescor.get("age_s"), "stage": "after_order_reads",
+                "failure_persisted": falha["ok"]}
+    if int(context.get("local_fence") or 0) != local_validation_fence():
+        return {"ok": False, "reason_code": STALE_CONTEXT, "valid": [],
+                "invalidated": [], "closed": [], "waiting": [],
+                "detail": "fence local avançou durante as consultas de ordens"}
+    return await _publish_validation(context=context, observation=observation,
+                                     transitions=planejadas,
+                                     proof_candidates=candidatos_prova)
+
+
+async def _publish_validation(*, context, observation, transitions,
+                              proof_candidates) -> Dict[str, Any]:
+    """Publicação SERIALIZADA localmente, com confirmação DEPOIS do commit.
+
+    O mutex local impede que duas tentativas do MESMO processo publiquem a
+    partir de leituras cruzadas. Ele é tomado depois de toda leitura de exchange
+    (nunca durante um GET) e cobre: revalidação final → commit → reconferência
+    do fence → compensação. Helpers internos não o reaquirem.
+    """
+    async with manual_writer_lock():
+        fence_antes = local_validation_fence()
+        if int(context.get("local_fence") or 0) != fence_antes:
+            return {"ok": False, "reason_code": STALE_CONTEXT, "valid": [],
+                    "invalidated": [], "closed": [], "waiting": [],
+                    "detail": "fence local avançou antes da publicação"}
+        if pending_validation_failure() is not None:
+            return {"ok": False, "reason_code": VALIDATION_FAILURE, "valid": [],
+                    "invalidated": [], "closed": [], "waiting": [],
+                    "detail": "falha pendente precisa ser persistida antes"}
+        resultado = await _commit_validation(
+            context=context, observation=observation, transitions=transitions,
+            proof_candidates=proof_candidates)
+        if resultado.get("needs_failure"):
+            # A causa foi detectada DENTRO da transação (latch já armado lá);
+            # a persistência acontece agora, com a sessão anterior FECHADA.
+            falha = await register_validation_failure(
+                reason=str(resultado["needs_failure"]), context=context)
+            resultado = {**resultado, "failure_persisted": falha["ok"]}
+        if not resultado.get("ok") or not resultado.get("persisted"):
+            return resultado
+        # O COMMIT é assíncrono: entre o `flush` e o retorno outra corrotina
+        # pode ter registrado uma falha conhecida. Reconfere ANTES de devolver
+        # sucesso/autoridade.
+        if (local_validation_fence() == fence_antes
+                and pending_validation_failure() is None):
+            return resultado
+        return await _compensate_publication(
+            context=context, resultado=resultado, fence_antes=fence_antes)
+
+
+async def _compensate_publication(*, context, resultado,
+                                  fence_antes: int) -> Dict[str, Any]:
+    """Desfaz APENAS as escritas desta tentativa e contém os símbolos.
+
+    Vale quando uma falha local conhecida apareceu DURANTE o commit: a linha
+    durável pode ter sido gravada a partir de evidência que já não vale. O CAS
+    casa id + revisão + estado ESCRITOS por esta tentativa, então nada aqui
+    sobrescreve o vencedor de outra tentativa, apaga fechamento legítimo de
+    outro contexto nem reativa `INVALIDATED`/`WAITING_ORDERS` como `ACTIVE` (o
+    estado restaurado é exatamente o anterior, com prova revogada).
+    """
+    escritas = list(resultado.get("written") or ())
+    # 1. Contenção local SÍNCRONA (antes de qualquer await): o guard daquele
+    #    símbolo fica fechado enquanto a compensação não terminar.
+    contidos = []
+    for escrita in escritas:
+        if block_symbol_locally(escrita.get("symbol"),
+                                reason=PUBLICATION_FENCE_LOST).get("ok"):
+            contidos.append(escrita.get("symbol"))
+    for publicado in (resultado.get("proven") or ()):
+        if block_symbol_locally(publicado.get("symbol"),
+                                reason=PUBLICATION_FENCE_LOST).get("ok"):
+            contidos.append(publicado.get("symbol"))
+    conta = str(context.get("account_scope") or "")
+    desfeitas, revogadas, erro = [], [], None
+    try:
+        from db import DB_ENABLED, get_session
+        if not DB_ENABLED:
+            return {"ok": False, "reason_code": COMPENSATION_UNKNOWN,
+                    "valid": [], "invalidated": [], "closed": [], "waiting": [],
+                    "detail": "sem banco para compensar", "contained": contidos}
+        from models.manual_position_ack import ManualPositionAcknowledgement as Ack
+        from services.entry_intent_service import (acquire_risk_lock,
+                                                   bump_manual_generation)
+        from sqlalchemy import select
+        agora = _now()
+        async with get_session() as session:
+            async with session.begin():
+                # Ordem ÚNICA: lock local (já detido) → advisory → época →
+                # linhas por id.
+                await acquire_risk_lock(session)
+                await bump_manual_generation(
+                    session, account_scope=conta, exchange=EXCHANGE_BINANCE,
+                    market=MARKET_USDM_FUTURES, blocked=True)
+                ids = sorted({int(e["id"]) for e in escritas} |
+                             {int(p["id"]) for p in
+                              (resultado.get("proven") or ())})
+                linhas = {}
+                if ids:
+                    linhas = {int(l.id): l for l in (await session.execute(
+                        select(Ack).where(Ack.id.in_(ids)).order_by(Ack.id)
+                        .with_for_update())).scalars().all()}
+                for escrita in sorted(escritas, key=lambda e: int(e["id"])):
+                    linha = linhas.get(int(escrita["id"]))
+                    if linha is None:
+                        continue
+                    # CAS da PRÓPRIA escrita: revisão e estado que ESTA
+                    # tentativa gravou. Qualquer outra coisa fica intacta.
+                    if (int(linha.revision or 0) != int(escrita["to_revision"])
+                            or str(linha.state) != str(escrita["to_state"])):
+                        continue
+                    linha.state = str(escrita["from_state"])
+                    linha.revision = int(escrita["to_revision"]) + 1
+                    linha.updated_at = agora
+                    linha.ended_at = (agora if str(escrita["from_state"])
+                                      in ENDED_STATES else None)
+                    linha.ended_reason = _short(
+                        f"compensação {PUBLICATION_FENCE_LOST}: publicação "
+                        f"revertida (rev {escrita['to_revision']})", 120)
+                    _revoke_proof(linha, agora)
+                    desfeitas.append(int(escrita["id"]))
+                # Toda prova desta tentativa é revogada, inclusive a de linhas
+                # que não sofreram transição.
+                for publicado in (resultado.get("proven") or ()):
+                    linha = linhas.get(int(publicado["id"]))
+                    if linha is None:
+                        continue
+                    if int(linha.validated_at_ms or 0) != int(
+                            publicado.get("validated_at_ms") or 0):
+                        continue
+                    _revoke_proof(linha, agora)
+                    linha.revision = int(linha.revision or 0) + 1
+                    revogadas.append(int(publicado["id"]))
+    except Exception as exc:  # noqa: BLE001
+        erro = f"{type(exc).__name__}: {exc}"
+        log.error(f"[manual-ack] compensação da publicação falhou: {erro}")
+    if erro is not None:
+        # Contenção local PERMANECE; o desfecho é UNKNOWN, não sucesso.
+        return {"ok": False, "reason_code": COMPENSATION_UNKNOWN, "valid": [],
+                "invalidated": [], "closed": [], "waiting": [],
+                "detail": erro, "contained": contidos,
+                "undone": desfeitas, "revoked": revogadas,
+                "manual_intervention_required": True}
+    # Causa durável gravada: a contenção local pode sair, pois a conta está
+    # bloqueada e as linhas voltaram ao estado bloqueante anterior.
+    for simbolo in contidos:
+        clear_local_symbol_block(simbolo)
+    _clear_pending_if_version(local_validation_fence())
+    return {"ok": False, "reason_code": PUBLICATION_FENCE_LOST, "valid": [],
+            "invalidated": [], "closed": [], "waiting": [],
+            "compensated": True, "undone": desfeitas, "revoked": revogadas,
+            "fence_before": fence_antes, "fence_after": local_validation_fence(),
+            "detail": "publicação revertida: fence local avançou durante o commit"}
 
 
 async def _commit_validation(*, context, observation, transitions,
@@ -1505,12 +1883,48 @@ async def _commit_validation(*, context, observation, transitions,
         from sqlalchemy import select
         conta = str(context.get("account_scope"))
         agora = _now()
-        carimbo = int(observation.get("observed_end_ms") or _now_ms())
+        # Carimbo ORIGINAL da observação (nunca o relógio do commit). Janela
+        # ilegítima não publica nada.
+        janela = observation_window(observation)
+        if not janela["ok"]:
+            falha = await register_validation_failure(
+                reason=str(janela.get("reason_code")), context=context)
+            return {"ok": False, "reason_code": janela["reason_code"],
+                    "valid": [], "invalidated": [], "closed": [], "waiting": [],
+                    "detail": janela.get("detail"),
+                    "failure_persisted": falha["ok"]}
+        carimbo = int(janela["end_ms"])
         escopo = str(context.get("scope"))
         validos, invalidados, fechados, esperando, perdidos = [], [], [], [], []
+        escritas, provadas = [], []
         async with get_session() as session:
             async with session.begin():
                 await acquire_risk_lock(session)
+                # DEPOIS da espera pela lock: a evidência precisa continuar
+                # fresca e o contexto local intacto.
+                frescor = window_age_ok(janela)
+                if not frescor["ok"]:
+                    # Falha EXTERNA detectada JÁ sob a lock: o latch local é
+                    # armado aqui (síncrono), mas a PERSISTÊNCIA fica para
+                    # depois do commit — abrir outra conexão agora pediria a
+                    # mesma `917283` que esta transação detém.
+                    _advance_local_fence(str(frescor.get("reason_code")))
+                    return {"ok": False, "reason_code": frescor["reason_code"],
+                            "valid": [], "invalidated": [], "closed": [],
+                            "waiting": [], "age_s": frescor.get("age_s"),
+                            "stage": "after_lock_wait",
+                            "needs_failure": str(frescor.get("reason_code"))}
+                if int(context.get("local_fence") or 0) != local_validation_fence() \
+                        or pending_validation_failure() is not None:
+                    return {"ok": False, "reason_code": STALE_CONTEXT,
+                            "valid": [], "invalidated": [], "closed": [],
+                            "waiting": [],
+                            "detail": "fence/pendência mudaram na espera da lock"}
+                if str(current_account_scope() or "") != conta:
+                    return {"ok": False, "reason_code": ACK_NO_ACCOUNT,
+                            "valid": [], "invalidated": [], "closed": [],
+                            "waiting": [],
+                            "detail": "conta vigente mudou na espera da lock"}
                 epoca = await current_manual_generation(
                     session, account_scope=conta, exchange=EXCHANGE_BINANCE,
                     market=MARKET_USDM_FUTURES)
@@ -1548,18 +1962,38 @@ async def _commit_validation(*, context, observation, transitions,
                             and str(linha.state) == str(instantaneo["state"])
                             and str(linha.fingerprint) == str(instantaneo["fingerprint"]))
 
-                for instantaneo, destino, motivo in transitions:
+                for planejada in transitions:
+                    instantaneo, destino, motivo = planejada[0], planejada[1], planejada[2]
+                    evidencia = planejada[3] if len(planejada) > 3 else None
                     if not cas_ok(instantaneo):
                         perdidos.append(int(instantaneo["id"]))
                         continue
+                    if destino == STATE_CLOSED:
+                        # Encerrar exige flat do PRÓPRIO símbolo E ausência de
+                        # ordens PROVADA dentro da janela validada. Evidência
+                        # velha/incompleta mantém a causa e pede nova leitura.
+                        prova_ordens = orders_evidence_ok(
+                            evidencia, symbol=instantaneo.get("symbol"))
+                        if not prova_ordens["ok"]:
+                            destino = STATE_WAITING_ORDERS
+                            motivo = (f"ausência de ordens não provada: "
+                                      f"{prova_ordens['reason_code']}")
                     linha = linhas[int(instantaneo["id"])]
+                    revisao_anterior = int(linha.revision or 0)
+                    estado_anterior = str(linha.state)
                     linha.state = destino
-                    linha.revision = int(linha.revision or 0) + 1
+                    linha.revision = revisao_anterior + 1
                     linha.updated_at = agora
                     linha.ended_reason = _short(motivo, 120)
                     linha.ended_at = agora if destino in ENDED_STATES else None
                     # Mudança de estado/identidade REVOGA a prova no MESMO commit.
                     _revoke_proof(linha, agora)
+                    escritas.append({"id": int(instantaneo["id"]),
+                                     "symbol": instantaneo.get("symbol"),
+                                     "from_state": estado_anterior,
+                                     "to_state": destino,
+                                     "from_revision": revisao_anterior,
+                                     "to_revision": revisao_anterior + 1})
                     (fechados if destino == STATE_CLOSED else
                      esperando if destino == STATE_WAITING_ORDERS else
                      invalidados).append(int(instantaneo["id"]))
@@ -1579,6 +2013,9 @@ async def _commit_validation(*, context, observation, transitions,
                     linha.validated_generation = int(epoca)
                     linha.updated_at = agora
                     validos.append(int(linha.id))
+                    provadas.append({"id": int(linha.id),
+                                     "symbol": instantaneo.get("symbol"),
+                                     "validated_at_ms": carimbo})
 
                 recuperou = False
                 if escopo == SCOPE_ACCOUNT and not perdidos:
@@ -1600,7 +2037,13 @@ async def _commit_validation(*, context, observation, transitions,
         return {"ok": True, "reason_code": "REVALIDATED", "valid": validos,
                 "invalidated": invalidados, "closed": fechados,
                 "waiting": esperando, "stale": perdidos, "scope": escopo,
-                "account_unblocked": recuperou, "persisted": True}
+                "account_unblocked": recuperou, "persisted": True,
+                # Identidade EXATA do que esta tentativa gravou — é o que a
+                # compensação usa como CAS para desfazer só o próprio.
+                "written": escritas, "proven": provadas,
+                "observed_start_ms": int(janela["start_ms"]),
+                "observed_end_ms": int(janela["end_ms"]),
+                "recorded_at_ms": _now_ms()}
     except Exception as exc:  # noqa: BLE001
         log.error(f"[manual-ack] commit de validação falhou: "
                   f"{type(exc).__name__}: {exc}")
@@ -1624,8 +2067,9 @@ async def publish_validation_proof(*, context, observation, validated_ids,
     if not candidatos:
         return {"ok": True, "valid": [], "stale": sorted(alvo),
                 "reason_code": "NO_PROOF_CANDIDATES"}
-    return await _commit_validation(context=context, observation=observation,
-                                    transitions=[], proof_candidates=candidatos)
+    return await _publish_validation(context=context, observation=observation,
+                                     transitions=[],
+                                     proof_candidates=candidatos)
 
 
 async def _transition_acks(transicoes: List[tuple]) -> Dict[str, Any]:
@@ -1744,6 +2188,13 @@ async def check_ownership_in_session(session, *, account_scope: Any,
                                      require_fresh_proof: bool = True
                                      ) -> Dict[str, Any]:
     """Ownership DENTRO da transação da admissão (só banco)."""
+    # Contenção LOCAL vale aqui também: é síncrona, não abre conexão e o símbolo
+    # pode ter ficado inseguro depois da última leitura durável.
+    contencao = local_symbol_block(symbol)
+    if contencao is not None:
+        return {"allowed": False, "reason_code": GUARD_LOCAL_CONTAINMENT,
+                "action": action, "detail": contencao.get("reason"),
+                "local_fence": contencao.get("fence")}
     try:
         from models.manual_position_ack import ManualPositionAcknowledgement as Ack
         from services.entry_intent_service import current_manual_generation
@@ -1769,18 +2220,68 @@ async def check_ownership_in_session(session, *, account_scope: Any,
         account_blocked=bloqueada)
 
 
-async def _manual_state_in_session(session, *, account_scope, exchange, market):
-    """(época manual, bloqueada) lidas NA transação corrente."""
+async def _manual_state_in_session(session, *, account_scope, exchange, market,
+                                   lock_row: bool = False):
+    """(época manual, bloqueada) lidas NA transação corrente.
+
+    `lock_row=True` trava a linha da época até o COMMIT do caller: é o que
+    impede que outra conexão grave `blocked=true` entre a decisão e a liberação.
+    """
     from models.account_margin_epoch import AccountMarginEpoch as Epoch
     from sqlalchemy import select
-    linha = (await session.execute(
-        select(Epoch).where(Epoch.account_scope == str(account_scope or ""),
-                            Epoch.exchange == str(exchange or "").lower(),
-                            Epoch.market == str(market or "").lower()))).scalar_one_or_none()
+    consulta = select(Epoch).where(
+        Epoch.account_scope == str(account_scope or ""),
+        Epoch.exchange == str(exchange or "").lower(),
+        Epoch.market == str(market or "").lower())
+    if lock_row:
+        consulta = consulta.with_for_update()
+    linha = (await session.execute(consulta)).scalar_one_or_none()
     if linha is None:
         return 0, True
     return (int(linha.manual_validation_generation or 0),
             bool(linha.manual_validation_blocked))
+
+
+async def manual_cause_in_session(session, *, account_scope: Any,
+                                  exchange: str = EXCHANGE_BINANCE,
+                                  market: str = MARKET_USDM_FUTURES,
+                                  lock_row: bool = True) -> Dict[str, Any]:
+    """Causa MANUAL decidida DENTRO da transação de quem vai liberar algo.
+
+    Recebe a sessão JÁ aberta (sob a advisory lock do caller) e nunca abre outra
+    conexão: a leitura da época, o bloqueio durável e a causa local pendente
+    entram na MESMA transação da liberação. Com `lock_row=True` a linha da época
+    fica travada até o commit, então uma gravação concorrente de
+    `manual_validation_blocked=true` não pode se esconder entre a decisão e a
+    liberação.
+
+    Contratos preservados: conta sem identidade comprovada continua INERTE (não
+    se inventa pausa universal) e erro de leitura é CAUSA, nunca ausência dela.
+    """
+    pendente = pending_validation_failure()
+    conta = str(account_scope or "")
+    if not conta:
+        return {"ok": True, "inert": True, "blocked": pendente is not None,
+                "generation": 0, "pending_failure": pendente is not None,
+                "reason_code": ("MANUAL_VALIDATION_FAILURE_PENDING"
+                                if pendente else "MANUAL_VALIDATION_INERT")}
+    try:
+        epoca, bloqueada = await _manual_state_in_session(
+            session, account_scope=conta, exchange=exchange, market=market,
+            lock_row=lock_row)
+    except Exception as exc:  # noqa: BLE001 — erro é causa, não ausência
+        log.error(f"[manual-ack] causa manual na transação falhou: "
+                  f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "inert": False, "blocked": True, "generation": None,
+                "pending_failure": pendente is not None,
+                "reason_code": GUARD_REGISTRY_UNAVAILABLE,
+                "detail": type(exc).__name__}
+    bloqueada = bool(bloqueada) or pendente is not None
+    return {"ok": True, "inert": False, "blocked": bloqueada,
+            "generation": int(epoca), "pending_failure": pendente is not None,
+            "local_fence": local_validation_fence(),
+            "reason_code": (GUARD_ACCOUNT_BLOCKED if bloqueada
+                            else "ACCOUNT_VALIDATED")}
 
 
 async def ack_for_symbol(symbol: Any) -> Dict[str, Any]:

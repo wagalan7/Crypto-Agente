@@ -2463,3 +2463,91 @@ baseline; nenhum serviço foi revertido para medir RED. Detalhes de contrato em
   pausa real liberada. Limite externo que permanece: a geração é LOCAL —
   mudanças feitas direto na corretora não a incrementam, a leitura fresca segue
   obrigatória e não há atomicidade com a exchange.
+
+## Fechamento ÚNICO manual/BOT (02/10/2026, baseline `61920156`)
+
+Sete defeitos em seis frentes (F1–F7) corrigidos juntos, com o RED medido ANTES
+na própria baseline (árvore `git archive 61920156` em fixture descartável fora do
+repositório, PostgreSQL real, oito presenças de defeito). Detalhes, riscos,
+limitações e runbook em `docs/FECHAMENTO_UNICO_MANUAL_BOT_61920156.md`.
+
+- **F1 — classificação única da redução.** `classify_order_action` exigia o
+  booleano literal, mas `scope` do client id, proteção pós-fill, `operation_kind`
+  e a confirmação de fechamento ainda liam a VERACIDADE do argumento bruto:
+  `reduce_only="true"` abria MARKET **sem** `reduceOnly`, **sem** SL, e devolvia
+  `ok=True, sl_ok=True, safety_state=NOT_APPLICABLE`. Agora o rótulo é validado
+  como booleano LITERAL na ENTRADA do serviço (`reduce_only_flag_is_valid`) antes
+  de `set_leverage`, arredondamento com I/O, POST ou cancelamento — inválido é
+  `EXEC_REDUCE_ONLY_INVALID` com zero mutação — e a classificação canônica passou
+  a valer em TODOS os ramos. Entrada com SL pedido e proteção não tentada nunca
+  mais reporta `sl_ok=True`.
+- **F2 — fence local através de ordens/SQL/commit.** Fence e pendência eram
+  conferidos uma única vez, antes das consultas de ordens; uma falha que NÃO
+  conseguiu persistir (timeout real de 500 ms na advisory `917283`) deixava o
+  `CLOSED` passar. Agora há mutex LOCAL dos escritores manuais (nunca durante GET
+  da exchange), reconferência depois das consultas, depois da espera pela lock e
+  **depois do commit**, com compensação em transação NOVA: a transição desta
+  tentativa é desfeita por CAS de `id + revisão + estado ESCRITOS`, a prova é
+  revogada, a conta é bloqueada e o símbolo fica contido localmente.
+  Compensação que falha devolve UNKNOWN e MANTÉM a contenção.
+- **F3 — carimbos originais e idade reconferida.** `observed_end_ms` ausente,
+  zero ou bool virava o relógio do commit, e a idade era medida só uma vez: uma
+  observação de 21 s (limite 20 s) encerrava o reconhecimento e desbloqueava a
+  conta. Agora `observation_window`/`window_age_ok` validam início/fim como
+  inteiros legítimos e reconferem a idade com o relógio ATUAL depois das
+  consultas de ordens e depois da espera pela lock; a prova usa o carimbo da
+  OBSERVAÇÃO (`recorded_at_ms` é separado), e `CLOSED` exige ausência de ordens
+  provada pelas DUAS fontes dentro da janela — evidência velha rebaixa para
+  `WAITING_ORDERS` com a causa.
+- **F4 — proposta congelada + exame SÍNCRONO antes de assinar.** A autorização
+  final reconferia token/lease/ownership, não quote/profundidade: com a carteira
+  levando 1,7 s, o POST saía com evidência de ~1704 ms contra TTL de 1500 ms. A
+  admissão serializada passou a CONGELAR uma proposta por despacho (identidade,
+  plano quantizado, evidência temporal ORIGINAL, limites vigentes, token e
+  deadline do lease) com hash determinístico, gravada como chave NOVA no JSON
+  existente da decisão; `authorize_dispatch` devolve a proposta PERSISTIDA e, com
+  ela, o exame SÍNCRONO que o transporte roda imediatamente antes de assinar —
+  re-executando os avaliadores P04 REAIS sobre a evidência original e comparando
+  o payload campo a campo. Ausência/vencimento/adulteração ⇒ `_request_sent=False`
+  e ZERO POST. A filha `-mfb` tem dispatch e proposta PRÓPRIOS.
+- **F5 — causa manual dentro da transação.** `release_p03_pause` e
+  `set_manual_pause(False)` liberavam a pausa com zero incidentes mesmo com
+  `manual_validation_blocked=true` (a causa era lida em OUTRA conexão). Agora
+  `manual_cause_in_session` recebe a sessão aberta e lê época/bloqueio/pendência
+  DENTRO da transação, travando a linha da época até o commit: causa manual
+  devolve `MANUAL_CAUSE_PENDING`/`kept_manual_cause`, mantém a pausa com marcador
+  próprio e não limpa o latch do operador. Ordem desta fronteira: latch local →
+  `_P03_PAUSE_LOCK` → época (FOR UPDATE) → `risk_state` → UM commit.
+- **F6 — recheck com CAS no mesmo commit.** O caminho FLAT conferia só `.ok`, e
+  o CAS do contexto ficava em transação diferente da resolução: um
+  reconhecimento criado DURANTE o GET era encerrado pela observação velha. Agora
+  `update_claimed_guarded` avalia a conferência (fence, pendência, contenção,
+  conta/escopo, época manual, conjunto e revisão/estado/fingerprint de cada
+  reconhecimento, evidência de ordens) na MESMA sessão do UPDATE fencado; CAS
+  perdido mantém o incidente, devolve o claim de forma fencada e agenda ciclo.
+- **F7 — TERMINAL idêntico é no-op.** `_resolve` excluía só `CONFIRMED`, então
+  `TERMINAL→TERMINAL` reescrevia evidência e incrementava a geração financeira
+  (11 → 12 → 13). `classify_resolution` passou a distinguir transição EFETIVA de
+  estado-alvo JÁ aplicado, evidência CONTRADITÓRIA e transição PROIBIDA:
+  repetição idêntica é sucesso idempotente sem época nova, `CONFIRMED` não é
+  rebaixado e `TERMINAL` não reabre como `UNKNOWN`.
+- **Schema:** NENHUMA mudança. A proposta entra como chave nova dentro do
+  `decision_payload` (JSONB já existente), sem tocar plano/identidade imutáveis;
+  `init_db` repetido não cria nada.
+- **Testes:** suíte completa **2.485 executados, 2.483 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada, não fabricada). Novos:
+  `tests/test_manual_bot_single_closure.py` (25) e
+  `tests/pg_integration_manual_single.py` (**70** verificações: F1–F7, matriz
+  integrada pelo caller REAL `open_shadow_for_recs`, corridas com `pg_locks`,
+  timeout real de statement, compensação e restart). Regressões PG: fechamento
+  manual 75, coexistência 131, margem 46, P03-conflito 66, R05-relógio 10,
+  R11/R12 138. `py_compile` e `git diff --check` aprovados; nenhum TS/TSX
+  alterado; clusters encerrados em trap.
+- **Fora do escopo, sem mudança:** estratégia, calibração, limites, alavancagem,
+  filtros, universo, defaults de execução, holdout, histórico e posição manual.
+  Nenhum worker, fila, scheduler, dashboard, ENV ou flag nova. Nenhum acesso à
+  conta real, ordem, Telegram, push ou deploy; nenhum reconhecimento real e
+  nenhuma pausa real liberada. Limites externos que permanecem: falha local não
+  commitada não é durável nem conhecida por outro processo, e o TOCTOU com a
+  exchange continua (mudança feita direto na corretora não incrementa época
+  alguma).
