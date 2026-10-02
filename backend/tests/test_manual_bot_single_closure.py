@@ -350,12 +350,54 @@ class F4PropostaCongeladaEExameSincrono(unittest.TestCase):
     def setUp(self):
         self.agora_ms = time.time() * 1000.0
 
-    def _exame(self, proposta, *, autorizado_ms=None):
+    def _autoridade(self, proposta):
+        """Token de autoridade LOCAL coerente com a proposta (fence atual)."""
+        if not isinstance(proposta, dict):
+            return None
+        return {"fence": intents.local_validation_fence_atual(),
+                "pending": False, "intent_key": proposta.get("intent_key"),
+                "symbol": proposta.get("symbol"),
+                "account_ref": proposta.get("account_ref"),
+                "exchange": proposta.get("exchange"),
+                "captured_at_ms": int(self.agora_ms)}
+
+    def _exame(self, proposta, *, autorizado_ms=None, autoridade=...):
         autorizacao = {"ok": True, "proposal": proposta, "token": 7,
                        "authorized_at_ms": (autorizado_ms
                                             if autorizado_ms is not None
-                                            else self.agora_ms)}
-        return sts._sync_final_check_for(autorizacao)
+                                            else self.agora_ms),
+                       "local_authority": (self._autoridade(proposta)
+                                           if autoridade is ... else autoridade)}
+        return sts._sync_final_check_for(autorizacao, self._intent(proposta))
+
+    def _intent(self, proposta):
+        if not isinstance(proposta, dict):
+            return {}
+        return {"granted": True, "intent_key": proposta.get("intent_key"),
+                "identity": SimpleNamespace(
+                    account_ref=proposta.get("account_ref"),
+                    exchange=proposta.get("exchange"),
+                    symbol=proposta.get("symbol"),
+                    intent_key=proposta.get("intent_key"))}
+
+    def test_autoridade_local_ausente_ou_vencida_nega(self):
+        """Sem token de autoridade local NÃO existe envio (ausência nega)."""
+        proposta = proposta_de_teste(agora_ms=self.agora_ms)
+        sem_token = self._exame(proposta, autoridade=None)
+        self.assertFalse(sem_token(self._payload())["ok"])
+        self.assertEqual(sem_token(self._payload())["reason_code"],
+                         intents.LOCAL_AUTHORITY_INVALID)
+        fence_adiantado = self._exame(
+            proposta, autoridade={**self._autoridade(proposta),
+                                  "fence": intents.local_validation_fence_atual() - 1})
+        veredito = fence_adiantado(self._payload())
+        self.assertFalse(veredito["ok"])
+        self.assertEqual(veredito["reason_code"], intents.LOCAL_AUTHORITY_FENCE)
+        pendente = self._exame(proposta,
+                              autoridade={**self._autoridade(proposta),
+                                          "pending": True})
+        self.assertEqual(pendente(self._payload())["reason_code"],
+                         intents.LOCAL_AUTHORITY_PENDING)
 
     def _payload(self, **mudancas) -> dict:
         base = {"symbol": "DELTAUSDT", "side": "BUY", "type": "LIMIT",

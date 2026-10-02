@@ -1797,7 +1797,71 @@ def _revalidate_frozen_p04(evidencia: dict, *, now_ms: float) -> dict:
     return {"ok": True, "reason_code": "PROPOSAL_EVIDENCE_FRESH"}
 
 
-def _sync_final_check_for(autorizacao: dict):
+#: Campos que uma ENTRADA emitida pelo builder saudável NUNCA carrega. A
+#: rejeição é por PRESENÇA (contrato), não por veracidade do valor: um
+#: `reduceOnly=False` no payload de abertura é payload diferente do admitido.
+_CAMPOS_PROIBIDOS_NA_ENTRADA = ("reduceOnly", "closePosition", "stopPrice")
+
+
+def _wire_symbol(valor) -> Optional[str]:
+    """Símbolo na forma WIRE usando a conversão REAL do transporte.
+
+    `DELTA/USDT:USDT` e `DELTAUSDT` são a MESMA ordem; `DELTAUSDC` não é. Nada
+    de remover quote ou trechos arbitrários para forçar igualdade.
+    """
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+    try:
+        from services.binance_signed_service import to_binance
+        from services.entry_intent_service import identity_symbol_to_market
+        if "/" in texto:                      # forma de mercado (CCXT)
+            return to_binance(texto).upper()
+        if "-" in texto:                      # forma da IDENTIDADE persistida
+            mercado = identity_symbol_to_market(texto)
+            if mercado is None:
+                return None
+            return to_binance(mercado).upper()
+        return texto.upper()                  # já é a forma WIRE
+    except Exception:  # noqa: BLE001 — sem conversão real, não há igualdade
+        return None
+
+
+def _identidade_do_contexto_bate(proposta: dict, intent: dict) -> Optional[str]:
+    """Conta/exchange/mercado/símbolo da proposta × identidade IMUTÁVEL.
+
+    Esses campos não vão no payload da Binance, então são conferidos contra o
+    contexto interno. Devolve o motivo da divergência, ou None quando casa.
+    """
+    identidade = (intent or {}).get("identity")
+    if identidade is None:
+        return "intenção sem identidade imutável"
+    pares = (
+        ("account_ref", getattr(identidade, "account_ref", None)),
+        ("exchange", getattr(identidade, "exchange", None)),
+        ("intent_key", getattr(identidade, "intent_key", None)),
+    )
+    for campo, esperado in pares:
+        if esperado is None:
+            return f"identidade sem {campo}"
+        if str(proposta.get(campo) or "").lower() != str(esperado).lower():
+            return f"{campo} divergente da identidade"
+    if str(proposta.get("market") or "").lower() != "usdm_futures":
+        return "mercado divergente"
+    if _wire_symbol(proposta.get("symbol")) != _wire_symbol(
+            getattr(identidade, "symbol", None)):
+        return "símbolo da proposta divergente da identidade"
+    try:
+        from services import manual_position_service as mps
+        conta_vigente = mps.current_account_scope()
+    except Exception:  # noqa: BLE001
+        return "conta vigente ilegível"
+    if conta_vigente and str(proposta.get("account_ref")) != str(conta_vigente):
+        return "conta vigente divergente da proposta"
+    return None
+
+
+def _sync_final_check_for(autorizacao: dict, intent: Optional[dict] = None):
     """Exame SÍNCRONO final: proposta congelada × params que vão ser assinados.
 
     Roda DEPOIS do último await decisivo (a própria autorização assíncrona) e
@@ -1816,6 +1880,15 @@ def _sync_final_check_for(autorizacao: dict):
         if not integra.get("ok"):
             return {"ok": False, "reason_code": str(integra.get("reason_code")),
                     "reason": "proposta adulterada ou não canonicalizável"}
+        # 0. AUTORIDADE LOCAL ATUAL com o token ORIGINAL da autorização: uma
+        #    falha manual conhecida por ESTE processo (fence/pending/contenção)
+        #    impede o envio, mesmo que o resto da proposta esteja íntegro.
+        autoridade = (autorizacao or {}).get("local_authority")
+        local = intents.local_authority_still_valid(
+            autoridade, identity=(autorizacao or {}).get("identity"))
+        if not local.get("ok"):
+            return {"ok": False, "reason_code": str(local.get("reason_code")),
+                    "reason": f"autoridade local perdida: {local.get('detail')}"}
         agora_ms = time.time() * 1000.0
         # 1. Idade da autorização e deadline do lease (relógio ATUAL).
         autorizado_ms = (autorizacao or {}).get("authorized_at_ms")
@@ -1861,6 +1934,31 @@ def _sync_final_check_for(autorizacao: dict):
                         "reason": "carteira admitida sem geração declarada"}
         # 4. Identidade e payload: o que vai ser assinado é o admitido.
         recebidos = params if isinstance(params, dict) else {}
+        # 4a. Contexto interno (conta/exchange/mercado/símbolo da intenção).
+        divergencia = _identidade_do_contexto_bate(proposta, intent or {})
+        if divergencia is not None:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": f"identidade interna: {divergencia}"}
+        # 4b. Símbolo WIRE efetivo × símbolo derivado da proposta.
+        esperado_symbol = _wire_symbol(proposta.get("symbol"))
+        recebido_symbol = _wire_symbol(recebidos.get("symbol"))
+        if esperado_symbol is None or recebido_symbol != esperado_symbol:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": (f"símbolo do payload ({recebidos.get('symbol')!r}) "
+                               f"não é o admitido ({proposta.get('symbol')!r})")}
+        # 4c. Campos que uma ENTRADA saudável não carrega — por PRESENÇA.
+        for campo in _CAMPOS_PROIBIDOS_NA_ENTRADA:
+            if campo in recebidos:
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": f"abertura admitida não carrega {campo}"}
+        # 4d. `positionSide`: só o modo/identidade realmente admitidos. One-way
+        #     (BOTH) omite o campo — a omissão saudável é aceita; LONG/SHORT num
+        #     contrato BOTH é incompatível e nega.
+        if "positionSide" in recebidos:
+            esperado_ps = str(proposta.get("position_side") or "").upper()
+            if str(recebidos.get("positionSide") or "").upper() != esperado_ps:
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "positionSide incompatível com o admitido"}
         esperado_coid = str(proposta.get("dispatch_id") or "")
         if str(recebidos.get("newClientOrderId") or "") != esperado_coid:
             return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
@@ -1874,9 +1972,6 @@ def _sync_final_check_for(autorizacao: dict):
         if not _num_close(recebidos.get("quantity"), proposta.get("qty")):
             return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
                     "reason": "qty do payload não é a admitida"}
-        if recebidos.get("reduceOnly"):
-            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
-                    "reason": "abertura admitida não carrega reduceOnly"}
         if str(proposta.get("order_type")) == "LIMIT":
             if not _num_close(recebidos.get("price"), proposta.get("price")):
                 return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
@@ -1886,11 +1981,14 @@ def _sync_final_check_for(autorizacao: dict):
                 return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
                         "reason": "timeInForce diverge da proposta"}
         else:
-            # MARKET não leva preço nem stop artificiais no POST de entrada.
-            if recebidos.get("price") is not None \
-                    or recebidos.get("stopPrice") is not None:
+            # MARKET não leva preço nem stop artificiais no POST de entrada
+            # (`stopPrice` já foi recusado por presença acima).
+            if "price" in recebidos:
                 return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
-                        "reason": "MARKET de entrada não leva price/stopPrice"}
+                        "reason": "MARKET de entrada não leva price"}
+            if "timeInForce" in recebidos:
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "MARKET de entrada não leva timeInForce"}
         return {"ok": True, "reason_code": "PROPOSAL_MATCHES_PAYLOAD",
                 "dispatch_id": esperado_coid}
 
@@ -1925,7 +2023,7 @@ def _intent_final_authorization(intent, *, dispatch_id_fn=None,
             # A autorização assíncrona ENTREGA o exame síncrono. Só um veredito
             # positivo produz o validador — negativa nunca é ignorada depois.
             veredito = {**veredito,
-                        "sync_check": _sync_final_check_for(veredito)}
+                        "sync_check": _sync_final_check_for(veredito, intent)}
         return veredito
 
     return _autoriza

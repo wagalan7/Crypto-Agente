@@ -1425,42 +1425,118 @@ async def run():
           and chamadas_guard["n"] >= 2,
           f"{str(protecao_vencida)[:200]} {ENVIADOS} {chamadas_guard}")
 
-    # ── m9: fonte de funding indisponível ⇒ fail-closed preservado ───────
+    # ── Fixture INDEPENDENTE para m9/m10: nenhuma causa residual dos casos
+    #    anteriores pode ser o motivo do bloqueio (era a lacuna apontada).
+    async def fixture_limpa():
+        await limpar_incidentes()
+        await limpar_acks()
+        await limpar_trades()
+        await limpar_pausa()
+        await desbloquear_conta()
+        EXCHANGE["positions"] = []
+        for dono in ("manual", "p03", "legacy"):
+            sts.clear_execution_quarantine(owner=dono)
+        ers._p03_latch_armed = False
+        mps.reset_local_validation_state()
+        async with db.get_session() as session:
+            pausado = bool((await session.execute(select(
+                RiskState.trading_paused).where(RiskState.id == 1))).scalar())
+        epoca_atual = await epoca_conta()
+        return {"pausado": pausado, "latch": sts._EXECUTION_QUARANTINE_REASON,
+                "blocked": epoca_atual["blocked"],
+                "pending": mps.pending_validation_failure() is not None}
+
+    # ── m9: fonte de funding indisponível ⇒ verificador REAL chamado e razão
+    #        de funding (sem herdar quarentena de caso anterior)
     from services import financial_total_service as fts
+    saudavel_m9 = await fixture_limpa()
+    check("m9_precondicao_sem_causa_residual",
+          saudavel_m9 == {"pausado": False, "latch": None, "blocked": False,
+                          "pending": False},
+          str(saudavel_m9))
     funding_sym = await simbolo_fresco("FND")
+    chamadas_funding = {"n": 0}
+    fresh_total_real = fts.fresh_total
+
+    async def funding_indisponivel(*args, **kwargs):
+        chamadas_funding["n"] += 1
+        raise RuntimeError("fonte de funding caiu")
+
     abertos_funding = await rodar_ciclo(
         [rec_sintetica(funding_sym)],
         extra_patches=[
             patch.object(fts, "accounting_total_enabled", return_value=True),
-            patch.object(fts, "fresh_total",
-                         AsyncMock(side_effect=RuntimeError("fonte caiu"))),
+            patch.object(fts, "fresh_total", funding_indisponivel),
         ])
-    check("m9_funding_indisponivel_mantem_fail_closed",
-          abertos_funding == 0 and posts_de_entrada() == [],
-          f"{abertos_funding} {ENVIADOS} {SKIPS}")
+    razoes_m9 = " ".join(str(r) for _, r in SKIPS)
+    check("m9_funding_chama_o_verificador_real_e_nega_pelo_motivo_proprio",
+          abertos_funding == 0 and posts_de_entrada() == []
+          and chamadas_funding["n"] >= 1
+          and "R05D_TOTAL" in razoes_m9
+          and fts.fresh_total is fresh_total_real,
+          f"{abertos_funding} chamadas={chamadas_funding['n']} {SKIPS}")
+    # Controle POSITIVO do mesmo gate: fonte disponível ⇒ entrada autorizada.
+    await fixture_limpa()
+    funding_ok_sym = await simbolo_fresco("FNDOK")
 
-    # ── m10: falha/recuperação/boot ⇒ sem auto-resume falso nem bloqueio
-    #        eterno do caminho positivo
-    await limpar_trades()
-    await mps.register_validation_failure(reason="fonte caiu (m10)", context=None)
+    async def funding_disponivel(*args, **kwargs):
+        chamadas_funding["n"] += 1
+        return {"state": "COMPLETE", "rows_confirmed": 3,
+                "total_usd": 10_000.0, "funding_usd": 0.0}
+
+    abertos_funding_ok = await rodar_ciclo(
+        [rec_sintetica(funding_ok_sym)],
+        extra_patches=[
+            patch.object(fts, "accounting_total_enabled", return_value=True),
+            patch.object(fts, "fresh_total", funding_disponivel),
+            patch.object(fts, "exposure_verdict",
+                         lambda payload: {"allow_exposure_increase": True,
+                                          "reason_code": "R05D_TOTAL_OK"}),
+        ])
+    check("m9_controle_positivo_com_funding_disponivel",
+          abertos_funding_ok == 1 and len(posts_de_entrada()) == 1,
+          f"{abertos_funding_ok} {SKIPS}")
+
+    # ── m10: falha/recuperação/boot ⇒ motivo PRÓPRIO e recuperação pelo
+    #        ciclo OFICIAL, sem limpeza manual de latch/pausa na prova
+    saudavel_m10 = await fixture_limpa()
+    check("m10_precondicao_sem_causa_residual",
+          saudavel_m10 == {"pausado": False, "latch": None, "blocked": False,
+                           "pending": False},
+          str(saudavel_m10))
+    falha_m10 = await mps.register_validation_failure(
+        reason="fonte de posições caiu (m10)", context=None)
     epoca_falha = await epoca_conta()
     bloq_sym = await simbolo_fresco("BOOT")
     abertos_falha = await rodar_ciclo([rec_sintetica(bloq_sym)])
-    check("m10_falha_bloqueia_entradas_novas",
-          epoca_falha["blocked"] is True and abertos_falha == 0
-          and posts_de_entrada() == [],
-          f"{epoca_falha} {abertos_falha} {SKIPS}")
+    estado_falha = await mps.account_validation_state()
+    # Motivo PRÓPRIO: o caller que negou é a reserva (`entry-intent`) e a causa
+    # é a manual — comprovada pelo MESMO guard em sessão que a reserva usa.
+    async with db.get_session() as session:
+        guard_na_reserva = await mps.check_ownership_in_session(
+            session, account_scope=ESCOPO, exchange="binance",
+            market="usdm_futures", symbol=bloq_sym, action="reserve")
+    estagios_m10 = [s for s, _ in SKIPS]
+    check("m10_falha_bloqueia_pelo_motivo_manual_proprio",
+          falha_m10["ok"] is True and epoca_falha["blocked"] is True
+          and abertos_falha == 0 and posts_de_entrada() == []
+          and estado_falha.get("reason_code") == mps.GUARD_ACCOUNT_BLOCKED
+          and "entry-intent" in estagios_m10
+          and guard_na_reserva["allowed"] is False
+          and guard_na_reserva["reason_code"] == mps.GUARD_ACCOUNT_BLOCKED,
+          f"{falha_m10} {epoca_falha} {abertos_falha} {SKIPS} {estado_falha} "
+          f"{guard_na_reserva}")
+    # "Restart": estado local zerado NÃO é prova — o durável manda.
     mps.reset_local_validation_state()
     recuperado = await rodar_ciclo([rec_sintetica(bloq_sym)])
+    epoca_boot = await epoca_conta()
     check("m10_boot_zerado_nao_auto_resume",
-          recuperado == 0 and posts_de_entrada() == [],
-          f"{recuperado} {ENVIADOS} {SKIPS}")
-    # Ciclo oficial completo (captura → GET fresco → validação) recupera. O
-    # latch/pausa que a falha armou é liberado pelos próprios owners.
-    for dono in ("manual", "p03", "legacy"):
-        sts.clear_execution_quarantine(owner=dono)
-    ers._p03_latch_armed = False
-    await limpar_pausa()
+          recuperado == 0 and posts_de_entrada() == []
+          and epoca_boot["blocked"] is True,
+          f"{recuperado} {ENVIADOS} {SKIPS} {epoca_boot}")
+    # Recuperação APENAS pelo ciclo oficial: captura → GET fresco → validação.
+    # Nenhum latch/pausa é limpo aqui (a causa foi durável, não latch local).
+    latch_antes = sts._EXECUTION_QUARANTINE_REASON
     contexto_rec = await mps.capture_validation_context(scope=mps.SCOPE_ACCOUNT)
     observacao_rec = await mps.observe_positions()
     veredito_rec = await mps.revalidate_active(observation=observacao_rec,
@@ -1468,12 +1544,14 @@ async def run():
     epoca_rec = await epoca_conta()
     pos_sym = await simbolo_fresco("POS")
     abertos_rec = await rodar_ciclo([rec_sintetica(pos_sym)])
-    check("m10_ciclo_oficial_recupera_o_caminho_positivo",
+    check("m10_ciclo_oficial_recupera_sem_limpeza_manual",
           veredito_rec["ok"] is True
           and veredito_rec.get("account_unblocked") is True
           and epoca_rec["blocked"] is False and abertos_rec == 1
-          and len(posts_de_entrada()) == 1,
-          f"{veredito_rec} {epoca_rec} {abertos_rec} {SKIPS}")
+          and len(posts_de_entrada()) == 1
+          and latch_antes is None
+          and sts._EXECUTION_QUARANTINE_REASON is None,
+          f"{veredito_rec} {epoca_rec} {abertos_rec} latch={latch_antes} {SKIPS}")
 
     # ── m11: F4 — carteira de 1,7 s envelhece a evidência ⇒ ZERO POST ────
     f4_sym = await simbolo_fresco("TTL")

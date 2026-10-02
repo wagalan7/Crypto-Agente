@@ -2551,3 +2551,50 @@ limitações e runbook em `docs/FECHAMENTO_UNICO_MANUAL_BOT_61920156.md`.
   commitada não é durável nem conhecida por outro processo, e o TOCTOU com a
   exchange continua (mudança feita direto na corretora não incrementa época
   alguma).
+
+## Correção integrada manual/BOT (02/10/2026, baseline `001a6685`)
+
+Quatro defeitos reproduzidos na revisão de `001a6685`, com RED medido ANTES na
+mesma árvore pelos callers reais. Contrato em
+`docs/FECHAMENTO_CORRECAO_001a6685.md`.
+
+- **R1/R2 — observação do boot/batch.** `_detect_untracked_positions` reusava a
+  leitura do ciclo sem a janela do GET (o processamento carimbava início/fim) e
+  eliminava quantidade `NaN` com `_finite(size) or 0` ANTES de validar
+  completude: um GET de 21 s (limite 20 s) e um `positionAmt="NaN"` terminavam
+  como FLAT, fechavam reconhecimento ACTIVE rev3 → CLOSED rev4, deixavam
+  `manual_validation_blocked=false` e liberavam `ownership_guard(entry)`. Agora a
+  janela ORIGINAL é medida em volta do GET e propagada por
+  `observation_from_rows`/`revalidate_active`; `normalize_positions` trata
+  `None`/coleção desconhecida/linha malformada/qty inválida ou negativa como
+  INCOMPLETUDE (zero finito continua legítimo) e exige identidade verificável da
+  linha ATIVA; a seleção de exposições não-zero acontece só depois da validação,
+  pela quantidade canônica. Incompletude ⇒ UNKNOWN + `_boot_scan_safe=False` +
+  contenção. O inventário administrativo continua mostrando a linha incompleta
+  como INELEGÍVEL em vez de esconder a posição.
+- **R3 — autoridade local até o handoff.** `authorize_dispatch` captura um token
+  imutável (fence/pendência/símbolo) ANTES de qualquer await, vincula a
+  identidade validada sem recapturar o fence e reconfere o token ORIGINAL
+  **depois de sair totalmente do contexto da sessão** (rollback e
+  `close`/`__aexit__` suspendem — era aí que uma falha manual nova passava). O
+  token viaja no veredito e é reconferido no exame SÍNCRONO pré-assinatura.
+  Persistir/limpar a pendência não ressuscita a autorização antiga.
+- **R4 — identidade e payload.** O exame síncrono passou a comparar o símbolo
+  WIRE efetivo com o derivado da proposta pela conversão REAL do transporte
+  (identidade `BASE-QUOTE-SETTLE` → mercado → `to_binance`), além de
+  conta/exchange/mercado/intenção, `positionSide` compatível e recusa por
+  PRESENÇA de `reduceOnly`/`closePosition`/`stopPrice`. O transporte valida e
+  assina a MESMA cópia local dos params finais.
+- **Matriz:** m9 passou a provar a chamada ao verificador de funding REAL e a
+  razão `R05D_TOTAL` (com controle positivo), e m10 a causa manual própria com
+  recuperação apenas pelo ciclo OFICIAL, sem limpeza manual de latch/pausa.
+- **Testes:** suíte completa **2.486 executados, 2.484 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada). Novos harnesses PG:
+  `pg_integration_manual_boot.py` (**34** verificações) e
+  `pg_integration_manual_dispatch.py` (**32**), ambos 2×;
+  `pg_integration_manual_single.py` 70 → **73**, 2×. Regressões PG: fechamento
+  manual 75, coexistência 131, margem 46, P03-conflito 66. `py_compile` e
+  `git diff --check` aprovados; nenhum TS/TSX alterado; clusters encerrados.
+- **Sem mudança:** schema, estratégia, calibração, sizing, limites, alavancagem,
+  defaults (maker/fallback seguem OFF), ENV/flag, scheduler/worker/endpoint.
+  Nenhum acesso a conta real, exchange, Telegram ou deploy.

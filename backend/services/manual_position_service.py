@@ -348,7 +348,15 @@ async def observe_positions(symbol: Optional[str] = None) -> Dict[str, Any]:
         return falha(ACK_POSITION_UNKNOWN, "leitura stale/rate-limited/indisponível")
     linhas, completo = normalize_positions(res.get("positions"))
     if not completo:
-        return falha(ACK_POSITION_UNKNOWN, "linha de posição malformada na resposta")
+        # Observação INCOMPLETA: nenhuma decisão sai dela (todo consumidor
+        # decisório confere `ok`/`complete` antes de olhar `positions`). As
+        # linhas que deram para normalizar seguem anexadas apenas para o
+        # INVENTÁRIO administrativo — esconder a posição do operador seria pior.
+        return _observation(ok=False, reason_code=ACK_POSITION_UNKNOWN,
+                            positions=linhas, scope=escopo, symbol=symbol,
+                            complete=False, started_ms=inicio,
+                            account_scope=conta,
+                            detail="linha de posição malformada na resposta")
     if escopo == SCOPE_SYMBOL:
         alvo = symbol_key(symbol)
         linhas = [p for p in linhas if p.get("symbol_key") == alvo]
@@ -360,27 +368,36 @@ async def observe_positions(symbol: Optional[str] = None) -> Dict[str, Any]:
 def normalize_positions(raw: Any) -> tuple:
     """`(linhas, completo)` a partir de linhas JÁ lidas de `get_positions`.
 
-    Reaproveitado pelo reconciliador, que já fez a leitura fresca do ciclo. Uma
-    linha em formato desconhecido ou com qty inválida marca a normalização como
-    INCOMPLETA — descartá-la em silêncio permitiria concluir "flat" a partir de
-    uma resposta que não foi entendida.
+    Reaproveitado pelo reconciliador, que já fez a leitura fresca do ciclo.
+    Contrato de COMPLETUDE (uma resposta que não foi entendida nunca prova
+    flat):
+
+    - `None` ou coleção de tipo desconhecido ⇒ INCOMPLETA. Ausência de dados não
+      é lista vazia; só uma `[]` EXPLÍCITA de uma resposta válida prova flat;
+    - linha em formato desconhecido ⇒ INCOMPLETA;
+    - `size` bool/NaN/inf/ausente/tipo indevido ⇒ INCOMPLETA. No formato
+      normalizado por `get_positions` a quantidade é o módulo da posição, então
+      valor NEGATIVO é impossível: também é incompletude, nunca "zero";
+    - `size` ZERO finito é legítimo (não é exposição e não exige os campos de
+      posição ativa);
+    - linha ATIVA (qty > 0) sem símbolo, lado, perna, preço de entrada ou
+      `updateTime` verificáveis ⇒ INCOMPLETA: nada é inferido e o relógio local
+      não preenche ausência.
     """
     linhas, completo = [], True
-    if raw is None:
-        return linhas, completo
-    if not isinstance(raw, (list, tuple)):
+    if raw is None or not isinstance(raw, (list, tuple)):
         return linhas, False
     for bruta in raw:
         if not isinstance(bruta, Mapping):
             completo = False
             continue
         quantidade = canonical_decimal(bruta.get("size"))
-        if quantidade is None:
+        if quantidade is None or quantidade < 0:
             completo = False
             continue
-        if quantidade <= 0:
-            continue                      # posição zerada não é linha inválida
-        linhas.append({
+        if quantidade == 0:
+            continue              # zero finito registrado: não é exposição
+        linha = {
             "symbol": canonical_symbol(bruta.get("symbol")),
             "symbol_key": symbol_key(bruta.get("symbol")),
             "quote": quote_of(bruta.get("symbol")),
@@ -389,25 +406,53 @@ def normalize_positions(raw: Any) -> tuple:
             "qty": quantidade,
             "entry_price": canonical_decimal(bruta.get("entry_price")),
             "update_time_ms": canonical_update_time_ms(bruta.get("update_time_ms")),
-        })
+        }
+        if not linha["symbol_key"]:
+            # Sem símbolo não há como vincular a linha a nada.
+            completo = False
+            continue
+        if any(linha[campo] is None for campo in
+               ("side", "position_side", "entry_price", "update_time_ms")):
+            # Identidade de posição ATIVA não verificável: a OBSERVAÇÃO vira
+            # incompleta (nenhuma decisão/flat/prova sai dela), mas a linha
+            # continua visível para o inventário administrativo — que a mostra
+            # como INELEGÍVEL em vez de esconder a posição do operador.
+            completo = False
+        linhas.append(linha)
     return linhas, completo
 
 
 def observation_from_rows(raw: Any, *, symbol: Optional[str] = None,
                           source_ok: bool = True,
-                          started_ms: Optional[int] = None) -> Dict[str, Any]:
-    """Observação a partir de linhas JÁ lidas no ciclo (sem nova chamada HTTP)."""
+                          started_ms: Optional[int] = None,
+                          ended_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Observação a partir de linhas JÁ lidas no ciclo (sem nova chamada HTTP).
+
+    A janela ORIGINAL do GET é obrigatória aqui: quem reaproveita uma leitura
+    tem de informar `started_ms` E `ended_ms` medidos em volta da chamada. Sem
+    eles o tempo de PROCESSAMENTO viraria prova de frescor — foi exatamente isso
+    que deixou um GET de 21 s encerrar reconhecimento. Ausência/incoerência é
+    observação INCOMPLETA/UNKNOWN, nunca evidência fresca.
+    """
     escopo = SCOPE_SYMBOL if symbol else SCOPE_ACCOUNT
+    inicio = _finite_ms(started_ms)
+    fim = _finite_ms(ended_ms)
+    if inicio is None or fim is None or inicio > fim:
+        return _observation(ok=False, reason_code=ACK_READ_TIMESTAMP_INVALID,
+                            positions=[], scope=escopo, symbol=symbol,
+                            complete=False, started_ms=inicio, ended_ms=fim,
+                            account_scope=current_account_scope(),
+                            detail="janela original do GET ausente ou incoerente")
     linhas, completo = normalize_positions(raw)
     if not source_ok or not completo:
         return _observation(ok=False, reason_code=ACK_POSITION_UNKNOWN,
                             positions=[], scope=escopo, symbol=symbol,
-                            complete=False, started_ms=started_ms,
+                            complete=False, started_ms=inicio, ended_ms=fim,
                             account_scope=current_account_scope(),
                             detail="leitura incompleta ou malformada")
     return _observation(ok=True, reason_code="POSITIONS_FRESH", positions=linhas,
                         scope=escopo, symbol=symbol, complete=True,
-                        started_ms=started_ms,
+                        started_ms=inicio, ended_ms=fim,
                         account_scope=current_account_scope())
 
 
@@ -824,11 +869,6 @@ async def list_candidates() -> Dict[str, Any]:
     leitura = await observe_positions()
     registro = await active_acknowledgements()
     ativos = registro["acks"] if registro["ok"] else []
-    if not leitura["ok"]:
-        return {"ok": False, "reason_code": leitura["reason_code"],
-                "detail": leitura.get("detail"), "candidates": [],
-                "active": ativos, "registry_ok": registro["ok"],
-                "account_scope": escopo}
     por_simbolo: Dict[str, List[dict]] = {}
     for posicao in leitura["positions"]:
         por_simbolo.setdefault(posicao["symbol_key"], []).append(posicao)
@@ -846,6 +886,17 @@ async def list_candidates() -> Dict[str, Any]:
         if not descricao["eligible"]:
             descricao["reason_code"] = ACK_IDENTITY_INCOMPLETE
         candidatos.append(descricao)
+    if not leitura["ok"]:
+        # Leitura incerta/incompleta: o inventário é informativo e NENHUM
+        # candidato é elegível (o POST de reconhecimento continua recusado).
+        for item in candidatos:
+            item["eligible"] = False
+            item["reason_code"] = str(leitura["reason_code"])
+        return {"ok": False, "reason_code": leitura["reason_code"],
+                "detail": leitura.get("detail"), "candidates": candidatos,
+                "active": ativos, "registry_ok": registro["ok"],
+                "account_scope": escopo,
+                "observed_at_ms": leitura.get("observed_at_ms")}
     return {"ok": True, "reason_code": "CANDIDATES_FRESH", "account_scope": escopo,
             "observed_at_ms": leitura["observed_at_ms"], "candidates": candidatos,
             "active": ativos, "registry_ok": registro["ok"],
@@ -1582,7 +1633,9 @@ def _revoke_proof(linha, agora) -> None:
 async def revalidate_active(*, observation: Optional[Dict[str, Any]] = None,
                             context: Optional[Dict[str, Any]] = None,
                             positions: Optional[List[dict]] = None,
-                            observed_ok: Optional[bool] = None) -> Dict[str, Any]:
+                            observed_ok: Optional[bool] = None,
+                            observed_start_ms: Optional[int] = None,
+                            observed_end_ms: Optional[int] = None) -> Dict[str, Any]:
     """Revalida os reconhecimentos BLOQUEANTES com CONTEXTO anterior ao GET.
 
     Fluxo: contexto capturado sob lock → GET fresco fora do banco → decisão e
@@ -1596,8 +1649,10 @@ async def revalidate_active(*, observation: Optional[Dict[str, Any]] = None,
                 context = await capture_validation_context(scope=SCOPE_ACCOUNT)
             observation = await observe_positions()
         else:
+            # Quem passa linhas tem de passar a janela ORIGINAL do GET.
             observation = observation_from_rows(
-                positions, source_ok=(observed_ok is not False))
+                positions, source_ok=(observed_ok is not False),
+                started_ms=observed_start_ms, ended_ms=observed_end_ms)
     if context is None:
         # Sem captura anterior à leitura não se publica prova nem se encerra
         # reconhecimento: agenda novo ciclo.

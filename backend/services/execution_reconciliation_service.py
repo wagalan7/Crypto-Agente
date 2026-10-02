@@ -2040,17 +2040,47 @@ async def _manual_context_still_valid(session, contexto, *, symbol,
             "manual_generation": int(epoca)}
 
 
+def _exposicoes_nao_zero(brutas):
+    """Linhas RAW com exposição não-zero, pela quantidade CANÔNICA validada.
+
+    Devolve `None` quando alguma quantidade não é canonicalizável — incerteza,
+    nunca "zero". As linhas devolvidas continuam no formato RAW de
+    `get_positions` (o scan consome `size`/`symbol` desse formato); a adaptação
+    para o esquema normalizado (`qty`) é feita onde ele é realmente consumido.
+    """
+    from services import manual_position_service as mps
+    if brutas is None or not isinstance(brutas, (list, tuple)):
+        return None
+    saida = []
+    for bruta in brutas:
+        if not isinstance(bruta, dict):
+            return None
+        quantidade = mps.canonical_decimal(bruta.get("size"))
+        if quantidade is None or quantidade < 0:
+            return None
+        if quantidade > 0:
+            saida.append(bruta)
+    return saida
+
+
 async def _revalidate_manual_acks(raw_positions, *, source_ok: bool = True,
-                                  context=None) -> dict:
+                                  context=None, started_ms=None,
+                                  ended_ms=None) -> dict:
     """Revalida reconhecimentos com a leitura de CONTA já feita no ciclo.
 
     `context` é a captura ANTERIOR à leitura; sem ela nada é publicado ou
     encerrado (novo ciclo é agendado). Nunca gasta uma segunda chamada à
     exchange e nunca converte erro em "sem reconhecimento".
+
+    `started_ms`/`ended_ms` são a janela ORIGINAL medida em volta do GET deste
+    ciclo. Sem ela, o tempo de PROCESSAMENTO seria carimbado como prova fresca —
+    e um GET lento encerraria reconhecimento. Ausência ⇒ observação incompleta.
     """
     try:
         from services import manual_position_service as mps
-        observacao = mps.observation_from_rows(raw_positions, source_ok=source_ok)
+        observacao = mps.observation_from_rows(
+            raw_positions, source_ok=source_ok, started_ms=started_ms,
+            ended_ms=ended_ms)
         return await mps.revalidate_active(observation=observacao, context=context)
     except Exception as exc:  # noqa: BLE001
         log.error(f"[p03][manual-ack] revalidação falhou: {type(exc).__name__}: {exc}")
@@ -2994,7 +3024,13 @@ async def _detect_untracked_positions() -> dict:
             _boot_scan_safe = True   # sem exchange real → nada a escanear
             return {"status": "FLAT", "count": 0}
         contexto_manual = await capture_manual_context()
+        # Janela ORIGINAL do GET: medida IMEDIATAMENTE antes e depois da
+        # chamada, no mesmo relógio em ms do contrato manual. O tempo de
+        # processamento posterior NÃO pode substituí-la.
+        from services import manual_position_service as _mps_clock
+        inicio_leitura_ms = _mps_clock._now_ms()
         res = await bss.get_positions(force=True)
+        fim_leitura_ms = _mps_clock._now_ms()
     except Exception as exc:  # noqa: BLE001
         _boot_scan_safe = False
         await _arm_quarantine(f"boot: leitura de posições indisponível ({exc})")
@@ -3005,17 +3041,32 @@ async def _detect_untracked_positions() -> dict:
         await _arm_quarantine("boot: posições stale/rate-limited (não assumo flat)")
         log.critical("[p03][boot] posições stale/incertas — quarentena armada (não assumo flat)")
         return {"status": "UNKNOWN", "count": 0}
-    positions = [p for p in (res.get("positions") or []) if abs(_finite(p.get("size")) or 0) > 0]
-    # Reconhecimentos manuais são revalidados contra ESTA leitura fresca antes
-    # de o scan ser considerado seguro: identidade divergente invalida a
-    # autorização e reabre a contenção; registro ilegível mantém bloqueio.
-    revalidacao = await _revalidate_manual_acks(positions, context=contexto_manual)
+    # A resposta INTEGRAL vai para a normalização/validação: nenhum filtro pode
+    # anteceder a prova de completude. `_finite(size) or 0` transformava NaN em
+    # zero e apagava a linha ANTES de qualquer validação.
+    brutas = res.get("positions")
+    # Reconhecimentos manuais são revalidados contra ESTA leitura fresca (mesma
+    # janela e identidade) antes de o scan ser considerado seguro: identidade
+    # divergente invalida a autorização e reabre a contenção; registro ilegível
+    # ou resposta incompleta mantém bloqueio.
+    revalidacao = await _revalidate_manual_acks(
+        brutas, context=contexto_manual, started_ms=inicio_leitura_ms,
+        ended_ms=fim_leitura_ms)
     if not revalidacao["ok"]:
         _boot_scan_safe = False
         await _arm_quarantine(
             f"boot: reconhecimento manual não revalidado ({revalidacao['reason_code']})")
         log.critical("[p03][boot] reconhecimento manual não revalidado "
                      f"({revalidacao['reason_code']}) — quarentena armada")
+        return {"status": "UNKNOWN", "count": 0}
+    # Só DEPOIS de resposta completa e temporalmente válida: selecionar as
+    # exposições não-zero. Mantém as linhas RAW (o scan abaixo consome `size`),
+    # mas decide pela quantidade CANÔNICA já validada.
+    positions = _exposicoes_nao_zero(brutas)
+    if positions is None:
+        _boot_scan_safe = False
+        await _arm_quarantine("boot: quantidade de posição não canonicalizável")
+        log.critical("[p03][boot] quantidade não canonicalizável — UNKNOWN + quarentena")
         return {"status": "UNKNOWN", "count": 0}
     if not positions:
         _boot_scan_safe = True          # leitura fresh confirmou conta flat

@@ -1102,6 +1102,127 @@ def _finite_token(value) -> Optional[int]:
     return None
 
 
+LOCAL_AUTHORITY_INVALID = "LOCAL_AUTHORITY_TOKEN_INVALID"
+LOCAL_AUTHORITY_FENCE = "LOCAL_AUTHORITY_FENCE_ADVANCED"
+LOCAL_AUTHORITY_PENDING = "LOCAL_AUTHORITY_FAILURE_PENDING"
+LOCAL_AUTHORITY_CONTAINED = "LOCAL_AUTHORITY_SYMBOL_CONTAINED"
+LOCAL_AUTHORITY_IDENTITY = "LOCAL_AUTHORITY_IDENTITY_CHANGED"
+
+
+def identity_symbol_to_market(stored: Any) -> Optional[str]:
+    """`BASE-QUOTE-SETTLE` (forma da IDENTIDADE) → `BASE/QUOTE:SETTLE`.
+
+    Inverso EXATO da construção da identidade (`symbol.replace("/", "-")
+    .replace(":", "-")`). Forma irreconhecível devolve None: ninguém deve
+    adivinhar um símbolo para produzir igualdade.
+    """
+    if not isinstance(stored, str) or not stored:
+        return None
+    if "/" in stored:
+        return stored
+    partes = stored.rsplit("-", 1)
+    if len(partes) != 2 or "-" not in partes[0]:
+        return None
+    return partes[0].replace("-", "/", 1) + ":" + partes[1]
+
+
+def local_validation_fence_atual() -> int:
+    """Fence manual LOCAL vigente (atalho para testes/diagnóstico)."""
+    try:
+        from services import manual_position_service as mps
+        return int(mps.local_validation_fence())
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def capture_local_authority(*, intent_key: str,
+                            symbol: Optional[str] = None) -> Dict[str, Any]:
+    """Token IMUTÁVEL da autoridade manual LOCAL, lido ANTES de qualquer await.
+
+    É o que permite negar um envio quando ESTE processo já conhece uma falha
+    manual nova — situação diferente do TOCTOU inevitável de uma ação externa na
+    corretora. O token guarda o fence do instante da captura; ele NUNCA é
+    recapturado depois (recapturar “autorizaria” exatamente a falha nova).
+    """
+    try:
+        from services import manual_position_service as mps
+        return {"fence": int(mps.local_validation_fence()),
+                "pending": mps.pending_validation_failure() is not None,
+                "intent_key": str(intent_key or ""),
+                "symbol": (str(symbol) if symbol else None),
+                "account_ref": None, "exchange": None,
+                "captured_at_ms": int(_now().timestamp() * 1000)}
+    except Exception as exc:  # noqa: BLE001 — sem leitura local não há autoridade
+        log.warning(f"[p03-intent] autoridade local ilegível: {type(exc).__name__}")
+        return {"fence": None, "pending": True, "intent_key": str(intent_key or ""),
+                "symbol": (str(symbol) if symbol else None),
+                "account_ref": None, "exchange": None,
+                "captured_at_ms": None, "unreadable": str(type(exc).__name__)}
+
+
+def bind_local_authority_identity(token: Mapping, *, account_ref: str,
+                                  exchange: str,
+                                  symbol: str) -> Dict[str, Any]:
+    """Vincula a identidade IMUTÁVEL já validada ao token, sem mexer no fence."""
+    base = dict(token or {})
+    base.update({"account_ref": str(account_ref or "") or None,
+                 "exchange": str(exchange or "") or None,
+                 "symbol": str(symbol or "") or base.get("symbol")})
+    return base
+
+
+def local_authority_still_valid(token: Any,
+                                *, identity: Optional["EntryIdentity"] = None
+                                ) -> Dict[str, Any]:
+    """Helper SÍNCRONO e puro: o token original ainda vale NESTE instante?
+
+    Confere token completo/coerente, fence original == atual, ausência de causa
+    pendente, símbolo sem contenção local e identidade igual à autorizada.
+    Dúvida, exceção ou ausência NEGAM — nunca existe default positivo aqui.
+    """
+    if not isinstance(token, Mapping):
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_INVALID,
+                "detail": "token ausente"}
+    fence = token.get("fence")
+    if not isinstance(fence, int) or isinstance(fence, bool):
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_INVALID,
+                "detail": "fence do token inválido"}
+    if token.get("pending") is not False:
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_PENDING,
+                "detail": "causa manual pendente já na captura"}
+    if not token.get("intent_key"):
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_INVALID,
+                "detail": "token sem intenção"}
+    if identity is not None:
+        esperados = ((token.get("account_ref"), getattr(identity, "account_ref", None)),
+                     (token.get("exchange"), getattr(identity, "exchange", None)),
+                     (token.get("symbol"), getattr(identity, "symbol", None)),
+                     (token.get("intent_key"), getattr(identity, "intent_key", None)))
+        for gravado, atual in esperados:
+            if gravado is None or str(gravado) != str(atual or ""):
+                return {"ok": False, "reason_code": LOCAL_AUTHORITY_IDENTITY,
+                        "detail": "identidade divergente do token"}
+    try:
+        from services import manual_position_service as mps
+        atual_fence = int(mps.local_validation_fence())
+        pendente = mps.pending_validation_failure() is not None
+        contido = (mps.local_symbol_block(token.get("symbol")) is not None
+                   if token.get("symbol") else False)
+    except Exception as exc:  # noqa: BLE001 — dúvida NEGA
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_INVALID,
+                "detail": type(exc).__name__}
+    if atual_fence != fence:
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_FENCE,
+                "detail": f"fence {fence} → {atual_fence}"}
+    if pendente:
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_PENDING,
+                "detail": "falha manual conhecida pendente"}
+    if contido:
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_CONTAINED,
+                "detail": "símbolo contido localmente"}
+    return {"ok": True, "reason_code": "LOCAL_AUTHORITY_HELD", "fence": fence}
+
+
 async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
                              expected_token, dispatch_id: Optional[str] = None,
                              require_proposal: bool = False,
@@ -1124,6 +1245,14 @@ async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
     esperado = _finite_token(expected_token)
     if esperado is None:
         return {"ok": False, "reason_code": "DISPATCH_TOKEN_INVALID"}
+    # Autoridade manual LOCAL capturada ANTES de qualquer await, e conferida já
+    # aqui: uma causa conhecida na entrada nem chega ao banco.
+    autoridade = capture_local_authority(intent_key=intent_key)
+    inicial = local_authority_still_valid(autoridade)
+    if not inicial.get("ok"):
+        return {"ok": False, "reason_code": str(inicial.get("reason_code")),
+                "detail": inicial.get("detail")}
+    aprovado: Optional[Dict[str, Any]] = None
     try:
         async with session_factory() as session:
             await acquire_risk_lock(session)
@@ -1192,6 +1321,11 @@ async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
             if conta_bloqueada:
                 await session.rollback()
                 return {"ok": False, "reason_code": "MANUAL_ACCOUNT_VALIDATION_BLOCKED"}
+            # Identidade IMUTÁVEL validada vinculada ao token — sem recapturar
+            # o fence (recapturar aqui esconderia a falha nova).
+            autoridade = bind_local_authority_identity(
+                autoridade, account_ref=identity.account_ref,
+                exchange=identity.exchange, symbol=identity.symbol)
             negado = await _ownership_denial(session, identity, "dispatch")
             await session.rollback()        # leitura decisória: nada a gravar
             if negado:
@@ -1208,13 +1342,29 @@ async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
                 if str(proposta.get("dispatch_id")) != str(dispatch_id):
                     return {"ok": False, "reason_code": PROPOSAL_TAMPERED,
                             "detail": "proposta de outro despacho"}
-            return {"ok": True, "reason_code": "DISPATCH_AUTHORIZED",
-                    "token": persistido, "proposal": proposta,
-                    "lease_expires_at_ms": deadline_ms,
-                    "authorized_at_ms": int(agora.timestamp() * 1000)}
+            aprovado = {"ok": True, "reason_code": "DISPATCH_AUTHORIZED",
+                        "token": persistido, "proposal": proposta,
+                        "lease_expires_at_ms": deadline_ms,
+                        "authorized_at_ms": int(agora.timestamp() * 1000),
+                        "local_authority": autoridade,
+                        "identity": identity}
     except Exception as exc:  # noqa: BLE001 — dúvida NÃO autoriza
         log.warning(f"[p03-intent] autorização final indisponível: {type(exc).__name__}: {exc}")
         return {"ok": False, "reason_code": "DISPATCH_CHECK_UNAVAILABLE"}
+    if aprovado is None:
+        # Caminho negativo já devolvido dentro do contexto.
+        return {"ok": False, "reason_code": "DISPATCH_CHECK_UNAVAILABLE"}
+    # DEPOIS de sair TOTALMENTE do contexto da sessão (rollback E cleanup/close
+    # podem suspender): reconferir o token ORIGINAL. Mudou ⇒ nega e preserva
+    # contenção/reserva/intenção como estão.
+    final = local_authority_still_valid(aprovado["local_authority"],
+                                        identity=aprovado["identity"])
+    if not final.get("ok"):
+        log.critical("[p03-intent] autoridade local perdida antes do envio: "
+                     f"{final.get('reason_code')} ({final.get('detail')})")
+        return {"ok": False, "reason_code": str(final.get("reason_code")),
+                "detail": final.get("detail")}
+    return aprovado
 
 
 async def mark_sending(session_factory, intent_key: str, *, owner: str,

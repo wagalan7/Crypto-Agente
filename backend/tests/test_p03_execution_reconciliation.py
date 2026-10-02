@@ -707,7 +707,9 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
     async def test_boot_untracked_uses_real_side(self):
         with _patch_bss(is_configured=lambda: True,
                         get_positions=AsyncMock(return_value={"ok": True, "positions": [
-                            {"symbol": "BTCUSDT", "size": 0.5, "side": "Sell"}]})), \
+                            {"symbol": "BTCUSDT", "size": 0.5, "side": "Sell",
+                             "entry_price": 100.0, "position_side": "BOTH",
+                             "update_time_ms": 1700000000000}]})), \
                 patch.object(ers, "_open_real_trades", AsyncMock(return_value=[])), \
                 patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
             await ers.boot_reconcile()
@@ -721,7 +723,9 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
                    "symbol": "BTC/USDT:USDT", "side": "buy", "qty": 0.5, "id": 1}
         with _patch_bss(is_configured=lambda: True,
                         get_positions=AsyncMock(return_value={"ok": True, "positions": [
-                            {"symbol": "BTCUSDT", "size": 2.0, "side": "Buy"}]})), \
+                            {"symbol": "BTCUSDT", "size": 2.0, "side": "Buy",
+                             "entry_price": 100.0, "position_side": "BOTH",
+                             "update_time_ms": 1700000000000}]})), \
                 patch.object(ers, "_open_real_trades", AsyncMock(return_value=[tracked])), \
                 patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
             await ers.boot_reconcile()
@@ -734,7 +738,9 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
         # boot inseguro + quarentena (item 11).
         with _patch_bss(is_configured=lambda: True,
                         get_positions=AsyncMock(return_value={"ok": True, "positions": [
-                            {"symbol": "BTCUSDT", "size": 1.0, "side": ""}]})), \
+                            {"symbol": "BTCUSDT", "size": 1.0, "side": "",
+                             "entry_price": 100.0, "position_side": "BOTH",
+                             "update_time_ms": 1700000000000}]})), \
                 patch.object(ers, "_open_real_trades", AsyncMock(return_value=[])), \
                 patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
             out = await ers.boot_reconcile()
@@ -750,7 +756,9 @@ class QuarantineBootTests(unittest.IsolatedAsyncioTestCase):
               "symbol": "BTC/USDT:USDT", "side": "buy", "qty": 1.5, "id": 2}
         with _patch_bss(is_configured=lambda: True,
                         get_positions=AsyncMock(return_value={"ok": True, "positions": [
-                            {"symbol": "BTCUSDT", "size": 2.0, "side": "Buy"}]})), \
+                            {"symbol": "BTCUSDT", "size": 2.0, "side": "Buy",
+                             "entry_price": 100.0, "position_side": "BOTH",
+                             "update_time_ms": 1700000000000}]})), \
                 patch.object(ers, "_open_real_trades", AsyncMock(return_value=[t1, t2])), \
                 patch.object(ers, "reconcile_due", AsyncMock(return_value={})):
             await ers.boot_reconcile()
@@ -1349,7 +1357,9 @@ class VerifiedClosureTests(_AsyncBase):
         self._fp.stop()                                            # usa o _fresh_position REAL
         try:
             with _patch_bss(get_positions=AsyncMock(return_value={"ok": True, "positions": [
-                    {"symbol": "BTCUSDT", "size": 1.0, "side": ""}]})):
+                    {"symbol": "BTCUSDT", "size": 1.0, "side": "",
+                             "entry_price": 100.0, "position_side": "BOTH",
+                             "update_time_ms": 1700000000000}]})):
                 fp = await ers._fresh_position("BTC/USDT:USDT")
             self.assertEqual(fp["quality"], "FRESH")
             self.assertIsNone(fp["side"])                          # lado ausente → None (nunca "buy")
@@ -1502,7 +1512,9 @@ class FreshSideAndSlTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fresh_position_preserves_side(self):
         with _patch_bss(get_positions=AsyncMock(return_value={"ok": True, "positions": [
-                {"symbol": "BTCUSDT", "size": 0.5, "side": "Sell"}]})):
+                {"symbol": "BTCUSDT", "size": 0.5, "side": "Sell",
+                             "entry_price": 100.0, "position_side": "BOTH",
+                             "update_time_ms": 1700000000000}]})):
             fp = await ers._fresh_position("BTC/USDT:USDT")
         self.assertEqual(fp["quality"], "FRESH")
         self.assertEqual(fp["side"], "sell")
@@ -1521,7 +1533,9 @@ class FreshSideAndSlTests(unittest.IsolatedAsyncioTestCase):
                 _patch_bss(get_order=AsyncMock(return_value={"ok": True, "status": "FILLED", "orig_qty": 1.0}),
                            _fresh_position_size=AsyncMock(return_value=(1.0, "ok")),
                            get_positions=AsyncMock(return_value={"ok": True, "positions": [
-                               {"symbol": "BTCUSDT", "size": 1.0, "side": "Sell"}]})):  # short vs inc buy
+                               {"symbol": "BTCUSDT", "size": 1.0, "side": "Sell",
+                             "entry_price": 100.0, "position_side": "BOTH",
+                             "update_time_ms": 1700000000000}]})):  # short vs inc buy
             await ers.reconcile_due()
         self.assertEqual((await ers._get_repo().get(key))["state"], State.MANUAL_REQUIRED)
 

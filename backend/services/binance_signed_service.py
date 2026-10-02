@@ -437,12 +437,16 @@ async def _signed_request(
     # única forma de garantir que a proposta aprovada é a que vai no payload.
     # Ele só existe quando a autorização assíncrona ACIMA aprovou e devolveu o
     # validador; sem proposta válida não há POST.
+    # UMA cópia local dos params finais: a MESMA que o exame valida é a que vai
+    # ser assinada. `timestamp`/`recvWindow`/`signature` são acréscimos de
+    # transporte feitos sobre ela, não uma proposta econômica nova.
+    params_finais = dict(params or {})
     exame_sincrono = None
     if request_preflight is not None and isinstance(verdict, dict):
         exame_sincrono = verdict.get("sync_check")
     if exame_sincrono is not None:
         try:
-            decisao_final = exame_sincrono(dict(params or {}))
+            decisao_final = exame_sincrono(params_finais)
         except Exception as exc:  # noqa: BLE001 — mutação falha fechada
             decisao_final = {"ok": False,
                              "reason_code": "EXEC_FINAL_SYNC_CHECK_ERROR",
@@ -461,7 +465,7 @@ async def _signed_request(
                              or "exame síncrono final recusou o envio"),
                 "preflight": detalhe,
             }
-    url = _build_signed_url(path, params)
+    url = _build_signed_url(path, params_finais)
     try:
         r = await _get_client().request(method, url)
         # Lê o peso consumido (header da Binance) → throttle proativo.
