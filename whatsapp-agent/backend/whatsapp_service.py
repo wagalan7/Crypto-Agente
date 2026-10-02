@@ -114,6 +114,15 @@ async def _send_evolution_ex(tenant: dict, phone: str, text: str) -> tuple[bool,
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post(url, json=payload_v2, headers=headers)
             if r.status_code in (400, 422):
+                body_v2 = (r.text or "")[:300]
+                # Só repetir no formato v1 quando o servidor PEDE 'textMessage'
+                # (servidor antigo de verdade). Antes repetíamos em QUALQUER 400:
+                # num servidor v2 a 2ª tentativa sempre falha com
+                # 'requires property "text"', e essa recusa sobrescrevia o motivo
+                # REAL da 1ª (número sem WhatsApp, instância caída, etc.),
+                # deixando um erro indecifrável no painel.
+                if "textmessage" not in body_v2.lower():
+                    return False, _humanize_send_error(r.status_code, body_v2)
                 r = await client.post(url, json=payload_v1, headers=headers)
             if r.status_code >= 400:
                 return False, _humanize_send_error(r.status_code, (r.text or "")[:300])
@@ -548,7 +557,24 @@ def extract_message_twilio(form: dict) -> tuple[str, str] | None:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _normalize_phone(phone: str) -> str:
-    digits = "".join(c for c in phone if c.isdigit())
-    if not digits.startswith("55"):
-        digits = "55" + digits
+    """Normaliza o telefone para o formato dos provedores (só dígitos, com DDI).
+
+    - 10 dígitos → BR local (DDD + fixo de 8): acrescenta o DDI 55.
+    - 11 dígitos COM '9' logo após o DDD → BR celular: acrescenta o DDI 55.
+      O '9' é o desempate: 11 dígitos também é o tamanho de um número dos EUA
+      (+1 e 10 dígitos), e lá o 3º dígito dificilmente é 9.
+    - qualquer outro tamanho → já traz o código do país: devolve como está.
+    - zeros à esquerda (0 de operadora, 00 internacional) são removidos.
+
+    Antes a regra era "se não começa com 55, prefixa 55", o que quebrava
+    pacientes do exterior: +351 968035444 (Portugal) virava 55351968035444 e o
+    WhatsApp respondia exists:false. De quebra, a regra por COMPRIMENTO conserta
+    o DDD 55 (Santa Maria/RS): '55987654321' era enviado como se o 55 fosse o
+    DDI, sem DDD; agora vira '5555987654321', que é o número certo.
+    """
+    digits = "".join(c for c in (phone or "") if c.isdigit()).lstrip("0")
+    if not digits:
+        return ""
+    if len(digits) == 10 or (len(digits) == 11 and digits[2] == "9"):
+        return "55" + digits
     return digits

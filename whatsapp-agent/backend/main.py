@@ -729,6 +729,18 @@ async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
         raise HTTPException(status_code=403, detail="Token de webhook inválido.")
     payload = await request.json()
     result = wa.extract_message_evolution(payload)
+    # Grupo/transmissão/status/canal NÃO é paciente. O webhook do Z-API já
+    # filtrava isso; o da Evolution não — então mensagem de grupo virava
+    # conversa falsa na aba Conversas, gastava chamada de IA e a resposta ia
+    # para um destinatário inválido.
+    _jid = ((payload.get("data") or {}).get("key") or {}).get("remoteJid") or ""
+    if result and _is_non_patient_id(_jid or result[0]):
+        _note_webhook(tenant["id"], "evolution", payload, False,
+                      "ignorado: remetente não é paciente "
+                      "(grupo/transmissão/status/canal)")
+        logger.info(f"[{slug}] Webhook não-paciente ignorado "
+                    f"(grupo/status/broadcast/canal)")
+        return {"status": "ignored"}
     _note_webhook(tenant["id"], "evolution", payload, bool(result),
                   "" if result else "recebido, mas o formato não foi reconhecido "
                                     "(mensagem descartada)")
@@ -821,6 +833,33 @@ def _zapi_already_seen(msg_id: str) -> bool:
         _zapi_seen_ids.append(msg_id)
         _zapi_seen_set.add(msg_id)
         return False
+
+
+def _is_non_patient_id(raw: str) -> bool:
+    """True quando o identificador NÃO é de um paciente individual: grupo
+    (@g.us ou id começando em 120363), lista de transmissão, status/stories ou
+    canal/newsletter. Aceita tanto o JID completo (Evolution: remoteJid) quanto
+    só os dígitos.
+
+    Função separada de _is_non_patient_sender de propósito: aquela lê o campo
+    "phone" do payload do Z-API e está em produção há tempos — não vale o risco
+    de mexer nela. Esta trabalha sobre o identificador, então serve a qualquer
+    provedor.
+
+    NÃO filtra "@lid": no WhatsApp atual contatos individuais com telefone
+    oculto chegam assim, e descartá-los deixaria o paciente sem resposta.
+    """
+    low = (raw or "").lower()
+    if any(tok in low for tok in ("@g.us", "@broadcast", "@newsletter")):
+        return True
+    digits = "".join(c for c in (raw or "") if c.isdigit())
+    if not digits:
+        return True
+    if digits.startswith("120363"):   # prefixo de ID de grupo do WhatsApp
+        return True
+    if len(digits) > 15:              # acima do máximo E.164 → id sintético
+        return True
+    return False
 
 
 def _is_non_patient_sender(payload: dict) -> bool:
