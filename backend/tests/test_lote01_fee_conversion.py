@@ -109,6 +109,7 @@ REFERENCIA_FONTE = {
     "source": ea.LEDGER_SOURCE, "account_scope": ESCOPO, "exchange": "binance",
     "symbol": "BTCUSDT", "income_type": "COMMISSION", "asset": "USDT",
     "trade_id": EXEC_ENTRADA, "tran_id": "9001", "income": "-0.42",
+    "commission_asset": "BNB", "commission_qty": "0.001",
     "time_ms": AGORA_MS - 60_000,
     "window_start_ms": AGORA_MS - 120_000, "window_end_ms": AGORA_MS - 1_000,
 }

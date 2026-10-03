@@ -595,7 +595,7 @@ FEE_INTEGRITY_FIELDS = (
     "quote", "position_side", "fill_key", "exec_id", "fee_asset", "fee_qty",
     "settlement_asset", "settlement_value", "price", "price_basis",
     "fill_time_ms", "source", "quality", "observed_start_ms",
-    "observed_end_ms", "source_ref", "material_id",
+    "observed_end_ms", "observed_at_ms", "source_ref", "material_id",
 )
 #: Campos ECONÔMICOS (equivalência material). Sem observação/now/tentativa.
 FEE_MATERIAL_FIELDS = (
@@ -609,9 +609,72 @@ FEE_MATERIAL_FIELDS = (
 #: Referência material do lançamento (identidade do EVENTO, não da consulta).
 LEDGER_MATERIAL_FIELDS = ("source", "account_scope", "exchange", "symbol",
                           "income_type", "trade_id", "tran_id", "asset",
-                          "income", "time_ms")
+                          "income", "time_ms", "commission_asset",
+                          "commission_qty")
 #: Teto de histórico material preservado por comissão.
 FEE_HISTORY_LIMIT = 4
+OBSERVATION_HISTORY_LIMIT = 64
+
+
+def _fee_time_ms(value: Any) -> Optional[int]:
+    """Epoch integral positivo: não truncar fração nem aceitar bool/objeto."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    number = to_decimal(value)
+    if number is None or number <= 0 or number != number.to_integral_value():
+        return None
+    return int(number)
+
+
+def _ledger_material(reference: Mapping) -> Dict[str, Any]:
+    """Decimais da fonte são números; identificadores continuam strings."""
+    result = {field: reference.get(field) for field in LEDGER_MATERIAL_FIELDS}
+    for field in ("income", "commission_qty"):
+        value = to_decimal(result.get(field))
+        result[field] = (format(value.normalize(), "f")
+                         if value is not None else None)
+    return result
+
+
+def validate_commission_source_ref(reference: Any, *, expected: Mapping,
+                                   observed_start_ms: Any,
+                                   observed_end_ms: Any,
+                                   observed_at_ms: Any) -> Optional[str]:
+    """Mesma validação semântica na construção e na aplicação sob row lock."""
+    if not isinstance(reference, Mapping) or reference.get("source") != LEDGER_SOURCE:
+        return "source_ref_missing_or_unknown"
+    for field in ("account_scope", "exchange", "symbol"):
+        if not isinstance(reference.get(field), str) or reference.get(field) != expected.get(field):
+            return f"source_ref_{field}_mismatch"
+    if reference.get("income_type") != "COMMISSION":
+        return "source_ref_income_type_mismatch"
+    for field in ("trade_id", "tran_id"):
+        value = reference.get(field)
+        if isinstance(value, bool) or not isinstance(value, (str, int)) or not _id_str(value):
+            return f"source_ref_{field}_invalid"
+    if _id_str(reference["trade_id"]) != expected.get("exec_id"):
+        return "source_ref_trade_id_mismatch"
+    if reference.get("asset") != expected.get("settlement_asset"):
+        return "source_ref_asset_mismatch"
+    if reference.get("commission_asset") != expected.get("commission_asset"):
+        return "source_ref_commission_asset_mismatch"
+    quantity = to_decimal(reference.get("commission_qty"), allow_negative=False)
+    if quantity is None or quantity <= 0 or quantity != to_decimal(expected.get("commission_qty")):
+        return "source_ref_commission_qty_mismatch"
+    income = to_decimal(reference.get("income"))
+    if income is None or income > 0:
+        return "source_ref_income_invalid"
+    start, end, observed = map(_fee_time_ms, (observed_start_ms, observed_end_ms, observed_at_ms))
+    query_start, query_end, event, fill = map(_fee_time_ms, (
+        reference.get("window_start_ms"), reference.get("window_end_ms"),
+        reference.get("time_ms"), expected.get("fill_time_ms")))
+    if any(value is None for value in (start, end, observed, query_start, query_end, event, fill)):
+        return "source_ref_time_invalid"
+    if not (start <= fill <= end and start <= query_start <= event <= query_end <= end):
+        return "source_ref_query_window_mismatch"
+    if end > observed + 2_000 or fill > observed + 2_000 or event > observed + 2_000:
+        return "source_ref_future_observation"
+    return None
 
 
 def _fee_canonical(value: Any) -> Optional[str]:
@@ -677,7 +740,7 @@ def fee_conversion_material_id(evidence: Any) -> Optional[str]:
     base = dict(evidence)
     referencia = evidence.get("source_ref")
     base["source_ref_material"] = (
-        {campo: referencia.get(campo) for campo in LEDGER_MATERIAL_FIELDS}
+        _ledger_material(referencia)
         if isinstance(referencia, Mapping) else None)
     return _fee_digest(base, FEE_MATERIAL_FIELDS + ("source_ref_material",))
 
@@ -793,8 +856,8 @@ def normalize_commission_ledger_row(raw: Any, *, account_scope: Any,
     if valor > 0:
         # Crédito não é custo. Não é descontado nem invertido por `abs`.
         return None, LEDGER_CREDIT_UNSUPPORTED
-    instante = _ms(raw.get("time"))
-    inicio, fim = _ms(window_start_ms), _ms(window_end_ms)
+    instante = _fee_time_ms(raw.get("time"))
+    inicio, fim = _fee_time_ms(window_start_ms), _fee_time_ms(window_end_ms)
     if instante is None or inicio is None or fim is None:
         return None, LEDGER_TIME_INVALID
     if not inicio <= instante <= fim:
@@ -823,13 +886,15 @@ def normalize_commission_ledger_row(raw: Any, *, account_scope: Any,
         "tran_id": tran_id,
         "asset": ativo,
         "income": _dstr(valor),
+        "commission_asset": ativo_vinculo,
+        "commission_qty": _dstr(qty_vinculo),
         "time_ms": instante,
         "window_start_ms": inicio,
         "window_end_ms": fim,
     }, None
 
 
-def index_commission_ledger(rows: Sequence[Any], **kwargs
+def index_commission_ledger(rows: Sequence[Any], *, row_windows=None, **kwargs
                             ) -> Tuple[Dict[str, Dict[str, Any]],
                                        Dict[str, str]]:
     """Indexa lançamentos VÁLIDOS por `trade_id`, com dedupe por identidade.
@@ -842,16 +907,19 @@ def index_commission_ledger(rows: Sequence[Any], **kwargs
     por_trade: Dict[str, Dict[str, Any]] = {}
     bloqueados: Dict[str, str] = {}
     vistos: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for bruta in rows or ():
-        referencia, motivo = normalize_commission_ledger_row(bruta, **kwargs)
+    for index, bruta in enumerate(rows or ()):
+        context = dict(kwargs)
+        if row_windows is not None:
+            context["window_start_ms"], context["window_end_ms"] = row_windows[index]
+        referencia, motivo = normalize_commission_ledger_row(bruta, **context)
         if referencia is None:
             continue
         trade_id = referencia["trade_id"]
         chave = (trade_id, referencia["tran_id"])
         anterior = vistos.get(chave)
         if anterior is not None:
-            material_a = {c: anterior.get(c) for c in LEDGER_MATERIAL_FIELDS}
-            material_b = {c: referencia.get(c) for c in LEDGER_MATERIAL_FIELDS}
+            material_a = _ledger_material(anterior)
+            material_b = _ledger_material(referencia)
             if material_a != material_b:
                 bloqueados[trade_id] = LEDGER_SOURCE_CONFLICT
                 por_trade.pop(trade_id, None)
@@ -880,7 +948,11 @@ def build_fee_conversion(*, expected: Any, settlement_value: Any, price: Any,
     que NÃO contém o instante do fill, carimbo no futuro. Qualidade é derivada
     da fonte; `BROKER_REGISTERED_CONVERSION` exige `source_ref` normalizada.
     """
-    agora_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    agora_ms = (_fee_time_ms(now_ms) if now_ms is not None
+                else int(time.time() * 1000))
+    if agora_ms is None:
+        return {"ok": False, "reason_code": FEE_REASON_INVALID,
+                "detail": "instante de observação inválido"}
     if not isinstance(expected, Mapping):
         return {"ok": False, "reason_code": FEE_REASON_NO_CONTEXT,
                 "detail": "contexto esperado ausente"}
@@ -907,8 +979,8 @@ def build_fee_conversion(*, expected: Any, settlement_value: Any, price: Any,
     if valor is None or preco is None or preco <= 0:
         return {"ok": False, "reason_code": FEE_REASON_INVALID,
                 "detail": "valor/preço não finitos ou não positivos"}
-    instante = _ms(expected.get("fill_time_ms"))
-    inicio, fim = _ms(observed_start_ms), _ms(observed_end_ms)
+    instante = _fee_time_ms(expected.get("fill_time_ms"))
+    inicio, fim = _fee_time_ms(observed_start_ms), _fee_time_ms(observed_end_ms)
     if instante is None or inicio is None or fim is None:
         return {"ok": False, "reason_code": FEE_REASON_INVALID,
                 "detail": "carimbos do fill/janela ausentes ou inválidos"}
@@ -930,14 +1002,12 @@ def build_fee_conversion(*, expected: Any, settlement_value: Any, price: Any,
         if not referencia or referencia.get("source") != LEDGER_SOURCE:
             return {"ok": False, "reason_code": FEE_BLOCKED_SOURCE,
                     "detail": "confirmação exige referência normalizada da fonte"}
-        if str(referencia.get("trade_id")) != str(expected.get("exec_id")):
+        invalid = validate_commission_source_ref(
+            referencia, expected=expected, observed_start_ms=inicio,
+            observed_end_ms=fim, observed_at_ms=agora_ms)
+        if invalid:
             return {"ok": False, "reason_code": FEE_REASON_INVALID,
-                    "detail": "referência da fonte não é do fill esperado"}
-        if str(referencia.get("account_scope")) != str(expected.get("account_scope")) \
-                or str(referencia.get("exchange")) != str(expected.get("exchange")) \
-                or normalize_symbol(referencia.get("symbol")) != expected.get("symbol"):
-            return {"ok": False, "reason_code": FEE_REASON_INVALID,
-                    "detail": "referência da fonte de outra conta/símbolo"}
+                    "detail": invalid}
         registrado = to_decimal(referencia.get("income"))
         if registrado is None or -registrado != valor:
             # O número confirmado é o da FONTE. Nada de valor próprio apoiado
@@ -1021,11 +1091,13 @@ def fee_conversion_verdict(evidence: Any, *, expected: Any) -> Dict[str, Any]:
         return {"quality": FEE_QUALITY_UNAVAILABLE,
                 "reason_code": FEE_REASON_INVALID,
                 "detail": "valor/preço/quantidade não utilizáveis"}
-    inicio = _ms(evidence.get("observed_start_ms"))
-    fim = _ms(evidence.get("observed_end_ms"))
-    instante = _ms(evidence.get("fill_time_ms"))
+    inicio = _fee_time_ms(evidence.get("observed_start_ms"))
+    fim = _fee_time_ms(evidence.get("observed_end_ms"))
+    instante = _fee_time_ms(evidence.get("fill_time_ms"))
+    observado = _fee_time_ms(evidence.get("observed_at_ms"))
     if inicio is None or fim is None or instante is None \
-            or not inicio <= instante <= fim:
+            or observado is None or not inicio <= instante <= fim \
+            or fim > observado + 2_000:
         return {"quality": FEE_QUALITY_UNAVAILABLE,
                 "reason_code": FEE_REASON_INVALID,
                 "detail": "janela observada não contém o fill"}
@@ -1041,13 +1113,13 @@ def fee_conversion_verdict(evidence: Any, *, expected: Any) -> Dict[str, Any]:
             return {"quality": FEE_QUALITY_UNAVAILABLE,
                     "reason_code": FEE_REASON_INVALID,
                     "detail": "CONFIRMED sem fonte de corretora/referência"}
-        if referencia.get("source") != LEDGER_SOURCE \
-                or str(referencia.get("trade_id")) != str(expected.get("exec_id")) \
-                or str(referencia.get("account_scope")) != str(expected.get("account_scope")) \
-                or str(referencia.get("income_type")) != "COMMISSION":
+        invalid = validate_commission_source_ref(
+            referencia, expected=expected, observed_start_ms=inicio,
+            observed_end_ms=fim, observed_at_ms=observado)
+        if invalid:
             return {"quality": FEE_QUALITY_UNAVAILABLE,
                     "reason_code": FEE_REASON_INVALID,
-                    "detail": "referência da fonte incompatível"}
+                    "detail": invalid}
         registrado = to_decimal(referencia.get("income"))
         if registrado is None or -registrado != valor:
             return {"quality": FEE_QUALITY_UNAVAILABLE,
@@ -1540,6 +1612,8 @@ def finalize_accounting(acc: Dict[str, Any], *,
         state, reason = STATE_PARTIAL, totals.get("net_trade_reason_code")
     else:
         state, reason = STATE_CONFIRMED, None
+    if out.get("retry_halted") is True:
+        state, reason = STATE_FAILED, "RETRY_BUDGET_EXHAUSTED"
     out["state"] = state
     out["reason_code"] = reason
     if state != STATE_CONFIRMED:
@@ -1558,6 +1632,9 @@ def schedule_retry(acc: Dict[str, Any], *, error: Optional[str] = None,
                    now: Optional[datetime] = None) -> Dict[str, Any]:
     """Backoff PERSISTIDO e finito. Exaustão fica visível, sem retry infinito."""
     out = dict(acc)
+    if out.get("retry_halted") is True or out.get("state") == STATE_FAILED:
+        out.update(state=STATE_FAILED, retry_halted=True, next_retry_at=None)
+        return out
     attempts = int(out.get("attempts") or 0) + 1
     out["attempts"] = attempts
     out["last_error"] = (str(error)[:200] if error else None)
@@ -1567,6 +1644,7 @@ def schedule_retry(acc: Dict[str, Any], *, error: Optional[str] = None,
         if out.get("state") not in (STATE_CONFIRMED, STATE_CONFLICT):
             out["state"] = STATE_FAILED
             out["reason_code"] = "RETRY_BUDGET_EXHAUSTED"
+            out["retry_halted"] = True
     else:
         delay = RETRY_BACKOFF_S[min(attempts - 1, len(RETRY_BACKOFF_S) - 1)]
         out["next_retry_at"] = (ts + timedelta(seconds=delay)).isoformat()
@@ -1577,7 +1655,7 @@ def is_retry_due(acc: Any, *, now: Optional[datetime] = None) -> bool:
     """Só registros ADERENTES ao schema novo e ainda pendentes são elegíveis."""
     if not isinstance(acc, dict) or acc.get("schema_version") != SCHEMA_VERSION:
         return False                             # legado nunca é varrido
-    if acc.get("state") in (STATE_FAILED, STATE_CONFLICT,
+    if acc.get("retry_halted") is True or acc.get("state") in (STATE_FAILED, STATE_CONFLICT,
                             STATE_LEGACY):
         return False
     if acc.get("state") == STATE_CONFIRMED:
@@ -1809,6 +1887,7 @@ async def collect_broker_fee_conversions(
                 "complete": False, "error": "INCOME_ENDPOINT_UNAVAILABLE",
                 "attempted": len(lote)}
     linhas: List[Any] = []
+    row_windows: List[Tuple[int, int]] = []
     for win_start, win_end in plan_windows(start_ms, end_ms):
         cursor = win_start
         while cursor <= win_end:
@@ -1836,6 +1915,7 @@ async def collect_broker_fee_conversions(
                         "complete": False, "error": "INVALID_INCOME_PAGE",
                         "attempted": len(lote)}
             linhas.extend(pagina)
+            row_windows.extend([(cursor, win_end)] * len(pagina))
             if len(pagina) < int(res.get("limit") or INCOME_PAGE_LIMIT):
                 break
             tempos = [t for t in (_ms(p.get("time")) for p in pagina)
@@ -1858,7 +1938,7 @@ async def collect_broker_fee_conversions(
         exchange=identity.get("exchange") or "binance", symbol=symbol,
         settlement_asset=settlement_asset, window_start_ms=start_ms,
         window_end_ms=end_ms, exec_ids=set(contextos),
-        expected_by_exec=contextos)
+        expected_by_exec=contextos, row_windows=row_windows)
     evidencias: List[Dict[str, Any]] = []
     pendentes: List[str] = list(restantes)
     motivos: List[str] = []
@@ -1964,6 +2044,12 @@ def _identity_for_view(view):
 def _retry_after_observation(acc, previous, *, error=None, funding_error=None,
                             fee_progress=False, fee_state=None, now):
     out = dict(acc)
+    if (previous or {}).get("state") == STATE_FAILED or (previous or {}).get("retry_halted") is True:
+        out.update(state=STATE_FAILED, retry_halted=True,
+                   reason_code=(previous or {}).get("reason_code") or "RETRY_BUDGET_EXHAUSTED",
+                   attempts=(previous or {}).get("attempts", MAX_ATTEMPTS),
+                   last_error=(previous or {}).get("last_error"), next_retry_at=None)
+        return out
     # PROGRESSO ÚTIL: fill/ordem novos OU comissão exigida que passou a
     # confirmada. Mais objetos no JSON, janela atualizada ou prova duplicada não
     # contam.
@@ -2270,6 +2356,7 @@ def accounting_is_confirmed(acc: Any) -> bool:
     return (isinstance(acc, dict)
             and acc.get("schema_version") == SCHEMA_VERSION
             and acc.get("state") == STATE_CONFIRMED
+            and acc.get("retry_halted") is not True
             and not acc.get("conflicts"))
 
 
@@ -2312,15 +2399,18 @@ def merge_observation(current, incoming, *, view):
     #                mas não tem autoridade sobre estatística de retry (uma
     #                falha atrasada não ressuscita tentativas nem rebaixa a
     #                confirmação/progresso de quem veio depois).
-    #   `sem_meta` : resposta antiga, sem metadado — sem autoridade sobre a
-    #                estatística atual (compatibilidade: linhas que nunca
-    #                tiveram geração mantêm a regra anterior por `updated_at`).
+    #   sem geração válida/exata: pode contribuir eventos, nunca estatística.
+    #   FAILED: o latch persiste mesmo quando chegam provas novas/atrasadas.
     geracao_atual = int(current.get("generation") or 0)
     observacao = incoming.get("observation_id")
     base_geracao = incoming.get("base_generation")
-    replay = bool(observacao) and observacao == current.get("last_observation_id")
-    sem_meta = base_geracao is None
-    obsoleta = (not sem_meta) and int(base_geracao) < geracao_atual
+    seen = list(current.get("applied_observation_ids") or [])
+    if current.get("last_observation_id") not in seen:
+        seen.append(current.get("last_observation_id"))
+    seen = [item for item in seen if isinstance(item, str)]
+    replay = isinstance(observacao, str) and observacao in seen
+    valid_generation = (type(base_geracao) is int and base_geracao >= 0)
+    halted = current.get("state") == STATE_FAILED or current.get("retry_halted") is True
     confirmadas_antes = fee_confirmed_keys(current)
     fills_antes = len(current.get("fills") or {})
     ordens_antes = len(current.get("orders") or {})
@@ -2348,8 +2438,8 @@ def merge_observation(current, incoming, *, view):
     # Estatística de retry só é adotada de quem tem autoridade sobre a geração
     # atual. `updated_at` mais novo NÃO basta: um snapshot obsoleto não copia
     # `attempts`/`next_retry_at` sobre a linha.
-    autoridade = (not replay) and (not obsoleta) and (
-        (latest and current.get("generation") is None) if sem_meta else True)
+    autoridade = (not halted and not replay and valid_generation
+                  and base_geracao == geracao_atual)
     if autoridade:
         for field in ("attempts", "funding_attempts", "next_retry_at",
                       "last_error", "funding_last_error"):
@@ -2383,22 +2473,47 @@ def merge_observation(current, incoming, *, view):
     # uma vez. O reinício aqui serve ao caso SEM autoridade: a resposta
     # obsoleta/replay não manda na estatística, mas o evento novo que ela
     # trouxe é progresso e não pode ser cobrado como tentativa perdida.
-    if progresso and not autoridade:
+    if progresso and not autoridade and not halted:
         result["attempts"] = 0
         if result.get("state") != STATE_FAILED:
             result["last_error"] = None
     if int(result.get("attempts") or 0) >= MAX_ATTEMPTS and not progresso \
             and result["state"] not in (STATE_CONFIRMED, STATE_CONFLICT):
         result.update(state=STATE_FAILED, reason_code="RETRY_BUDGET_EXHAUSTED")
+    # Evidência nova não recebe autoridade para reabrir um retry encerrado.
+    # Conservar todos os eventos, mas manter o latch inclusive se a resposta
+    # em voo agora contiver informação suficiente para calcular um total.
+    if halted:
+        result.update(state=STATE_FAILED,
+                      reason_code=current.get("reason_code") or "RETRY_BUDGET_EXHAUSTED",
+                      retry_halted=True, attempts=current.get("attempts", MAX_ATTEMPTS),
+                      next_retry_at=None, last_error=current.get("last_error"))
+    elif result.get("state") == STATE_FAILED:
+        result.update(retry_halted=True, next_retry_at=None)
     # Geração avança por observação EFETIVAMENTE aplicada; o replay da mesma
     # resposta não invalida as coletas em voo nem é contado outra vez.
-    if not replay:
+    changed_events = any(result.get(field) != current.get(field)
+                         for field in ("fills", "orders", "funding", "conflicts"))
+    changed_fees = {
+        key: (proof.get("material_id"), proof.get("quality"))
+        for key, proof in (result.get("fee_conversions") or {}).items()
+    } != {
+        key: (proof.get("material_id"), proof.get("quality"))
+        for key, proof in (current.get("fee_conversions") or {}).items()
+    }
+    # Replay antigo sem informação nova não invalida as observações em voo.
+    # Mesmo fora do histórico limitado, sua geração antiga não tem autoridade.
+    applied = autoridade or changed_events or changed_fees
+    if applied:
         result["generation"] = geracao_atual + 1
-        if observacao:
+        if observacao and not replay:
             result["last_observation_id"] = observacao
     else:
         result["generation"] = geracao_atual
         result["last_observation_id"] = current.get("last_observation_id")
+    if isinstance(observacao, str) and observacao not in seen:
+        seen.append(observacao)
+    result["applied_observation_ids"] = seen[-OBSERVATION_HISTORY_LIMIT:]
     return result
 
 

@@ -19,6 +19,7 @@ de `statement_timestamp()`; margem prova reserva/readmissão/carteira):
 Nenhuma chamada real à exchange: o ledger de income/userTrades é sintético.
 """
 import asyncio
+import copy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import os
@@ -230,6 +231,7 @@ async def run():
                "exchange": "binance", "symbol": "BTCUSDT",
                "income_type": "COMMISSION", "asset": "USDT",
                "trade_id": "7001", "tran_id": "9001", "income": "-0.42",
+               "commission_asset": "BNB", "commission_qty": "0.001",
                "time_ms": entrada_ms, "window_start_ms": ms(abertura),
                "window_end_ms": ms(fechamento)}
         ref.update(mudancas)
@@ -654,6 +656,217 @@ async def run():
           and tradeE not in pendentes_apos,
           f"pendentes={pendentes_apos} tradeB={tradeB} tradeE={tradeE} "
           f"tradeF={tradeF}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  5. Fronteiras finais: representação, fonte persistida e retry terminal.
+    #     TODAS as gravações usam apply_accounting e o FOR UPDATE real.
+    # ══════════════════════════════════════════════════════════════════════
+    async def pnl_do_trade(identificador):
+        async with db.get_session() as session:
+            return (await session.execute(select(RealTrade.pnl_usd).where(
+                RealTrade.id == identificador))).scalar_one()
+
+    async def aplicar_com_espera_real(identificador, observada):
+        """Mantém a linha travada e observa o writer aguardando em pg_locks."""
+        async with db.get_session() as holder:
+            await holder.execute(select(RealTrade.id).where(
+                RealTrade.id == identificador).with_for_update())
+            writer = asyncio.create_task(ea.apply_accounting(
+                identificador, observada))
+            aguardou = False
+            try:
+                for _ in range(100):
+                    async with db.get_session() as watcher:
+                        aguardou = bool((await watcher.execute(text(
+                            "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                            "WHERE locktype='transactionid' AND NOT granted)"
+                        ))).scalar())
+                    if aguardou or writer.done():
+                        break
+                    await asyncio.sleep(0.01)
+            finally:
+                await holder.commit()
+            resposta = await writer
+        assert aguardou, "apply_accounting não aguardou a row lock real"
+        return resposta
+
+    # (g) Escala de Decimal não muda o evento: ambas as ordens preservam
+    #     a projeção P&L e a participação exata no accounting_total.
+    for primeira, segunda in (("-0.42", "-0.42000000"),
+                              ("-0.42000000", "-0.42")):
+        await limpar_portfolio()
+        trade_escala = await criar_trade(await criar_snapshot())
+        for income_texto in (primeira, segunda):
+            resposta = await aplicar_com_espera_real(
+                trade_escala, observacao(com_conversao=conversao(
+                    source_ref=referencia_fonte(income=income_texto))))
+            assert resposta.get("ok") is True, resposta
+            persistida = await ledger_do_trade(trade_escala)
+            assert persistida["state"] == ea.STATE_CONFIRMED, persistida
+            assert await pnl_do_trade(trade_escala) == 20.4
+        total_escala = await total_da_janela()
+        check(f"l01d_income_escala_equivalente_{primeira}_para_{segunda}",
+              persistida["conflicts"] == []
+              and len(persistida["fee_conversions"]) == 1
+              and Decimal(persistida["totals"]["net_trade"]) == Decimal("20.40")
+              and total_escala["state"] == fts.STATE_COMPLETE
+              and total_escala["rows_confirmed"] == 1
+              and abs(total_escala["total_net_including_funding"] - 20.25) < 1e-9,
+              f"{persistida['conflicts']} {total_escala}")
+
+    # (h) A prova nasce válida; só DEPOIS sua referência é adulterada e seus
+    #     hashes são recalculados. A fronteira sob lock deve rejeitá-la.
+    fonte_invalida = (("asset", "BUSD"), ("symbol", "ETHUSDT"),
+                      ("exchange", "bybit"), ("time_ms", ms(abertura) - 1),
+                      ("tran_id", None))
+    for campo, valor in fonte_invalida:
+        await limpar_portfolio()
+        trade_fonte = await criar_trade(await criar_snapshot())
+        adulterada = observacao(com_conversao=conversao())
+        chave = contexto_conv()["fill_key"]
+        prova_adulterada = adulterada["fee_conversions"][chave]
+        prova_adulterada["source_ref"][campo] = valor
+        prova_adulterada["material_id"] = ea.fee_conversion_material_id(
+            prova_adulterada)
+        prova_adulterada["integrity_hash"] = ea.fee_conversion_hash(
+            prova_adulterada)
+        resposta = await aplicar_com_espera_real(trade_fonte, adulterada)
+        persistida = await ledger_do_trade(trade_fonte)
+        total_fonte = await total_da_janela()
+        check(f"l01d_source_ref_{campo}_rehasheada_nao_confirma",
+              resposta.get("ok") is True
+              and (persistida.get("fee_merge_outcomes") or {}).get(chave)
+              == "REJECTED"
+              and chave not in persistida["fee_conversions"]
+              and persistida["state"] != ea.STATE_CONFIRMED
+              and persistida["totals"]["net_trade"] is None
+              and persistida["totals"]["fee_assets_unconverted"] == ["BNB"]
+              and await pnl_do_trade(trade_fonte) is None
+              and total_fonte["rows_confirmed"] == 0
+              and total_fonte["state"] != fts.STATE_COMPLETE,
+              f"{persistida['state']} {persistida.get('fee_merge_outcomes')} "
+              f"{total_fonte['exclusion_reasons']}")
+
+    # (i) Replay NÃO consecutivo: A, B, A. O último A é a mesma resposta
+    #     antiga, não uma nova observação e não pode avançar a geração.
+    await limpar_portfolio()
+    trade_replay = await criar_trade(await criar_snapshot())
+    instante_replay = agora()
+    resposta_a = ea.stamp_observation(
+        observacao(com_conversao=conversao()), base_generation=0,
+        observed_at=instante_replay.isoformat())
+    await ea.apply_accounting(trade_replay, resposta_a)
+    ledger_replay_a = await ledger_do_trade(trade_replay)
+    resposta_b = ea.stamp_observation(
+        observacao(com_conversao=conversao()),
+        base_generation=int(ledger_replay_a["generation"]),
+        observed_at=(instante_replay + timedelta(seconds=1)).isoformat())
+    await ea.apply_accounting(trade_replay, resposta_b)
+    ledger_replay_b = await ledger_do_trade(trade_replay)
+    await ea.apply_accounting(trade_replay, copy.deepcopy(resposta_a))
+    ledger_replay_final = await ledger_do_trade(trade_replay)
+    check("l01d_replay_A_B_A_nao_avanca_geracao_nem_retira_pnl",
+          int(ledger_replay_final["generation"])
+          == int(ledger_replay_b["generation"])
+          and ledger_replay_final["last_observation_id"]
+          == ledger_replay_b["last_observation_id"]
+          and len(ledger_replay_final["fee_conversions"]) == 1
+          and ledger_replay_final["state"] == ea.STATE_CONFIRMED
+          and await pnl_do_trade(trade_replay) == 20.4,
+          f"ger={ledger_replay_a['generation']}→{ledger_replay_b['generation']}"
+          f"→{ledger_replay_final['generation']}")
+
+    # (j) FAILED nasce de observações REAIS que consomem o retry finito.
+    #     Uma coleta de 8/49 conversões já em voo conserva os eventos quando
+    #     chega tarde, mas não pode reabrir o ciclo nem sua seleção automática.
+    await limpar_portfolio()
+    sys.path.insert(0, str(BACKEND / "tests"))
+    from test_lote01_correcao_conjunta import (ClienteFalso, fill_bruto,
+                                              income_commission, ordem_bruta)
+    trade_terminal = await criar_trade(await criar_snapshot())
+    fills_49 = [fill_bruto(
+        "7000", side="BUY", price="100", qty="49", realized="0",
+        commission="0.05", asset="USDT", order_id="o7001",
+        instante=entrada_ms)]
+    income_49 = []
+    for indice in range(49):
+        exec_id = str(8000 + indice)
+        instante = runner_ms + indice
+        fills_49.append(fill_bruto(
+            exec_id, side="SELL", price="110", qty="1",
+            realized="10" if indice == 0 else "0", commission="0.001",
+            asset="BNB", order_id="o7002", instante=instante))
+        income_49.append(income_commission(
+            tradeId=exec_id, tranId=str(98000 + indice), income="-0.01",
+            time=instante))
+    ordens_49 = [ordem_bruta("o7001", side="BUY", qty="49"),
+                 ordem_bruta("o7002", side="SELL", qty="49", reduce_only=True)]
+    ordens_49[0]["clientOrderId"] = "cw-entry-lote01"
+    for ordem_49 in ordens_49:
+        ordem_49["updateTime"] = ms(fechamento)
+    cliente_sem_fonte = ClienteFalso(fills=fills_49, orders=ordens_49,
+                                    escopo=ESCOPO)
+    cliente_com_fonte = ClienteFalso(fills=fills_49, orders=ordens_49,
+                                    income=income_49, escopo=ESCOPO)
+    relogio = agora()
+    observacao_tardia = None
+    for tentativa in range(ea.MAX_ATTEMPTS + 1):
+        if tentativa:
+            relogio = datetime.fromisoformat(terminal["next_retry_at"])
+        resposta = await ea.reconcile_trade(
+            trade_terminal, client=cliente_sem_fonte,
+            budget=ea.ReadBudget(seconds=30, calls=200), now=relogio)
+        assert resposta.get("ok") is True, resposta
+        terminal = await ledger_do_trade(trade_terminal)
+        assert terminal.get("last_error") == ea.FEE_BLOCKED_SOURCE, (
+            terminal["state"], terminal.get("reason_code"),
+            terminal.get("last_error"))
+        assert terminal["coverage"]["entry_order_proven"] is True
+        assert terminal["coverage"]["exit_orders_proven"] is True
+        if observacao_tardia is None:
+            async with db.get_session() as session:
+                linha = (await session.execute(select(RealTrade).where(
+                    RealTrade.id == trade_terminal))).scalar_one()
+                visao_terminal = ea.trade_view(linha)
+            visao_terminal.update(exclusive_exposure=True, position_flat=True)
+            observacao_tardia = await ea.collect_trade_accounting(
+                visao_terminal, client=cliente_com_fonte,
+                budget=ea.ReadBudget(seconds=30, calls=200),
+                now=relogio + timedelta(seconds=1))
+            assert len(observacao_tardia["fee_conversions"]) == 8, (
+                observacao_tardia.get("state"),
+                observacao_tardia.get("reason_code"),
+                observacao_tardia.get("last_error"))
+        if terminal["state"] == ea.STATE_FAILED:
+            break
+    check("l01d_failed_criado_por_coletas_e_retry_reais",
+          terminal["state"] == ea.STATE_FAILED
+          and int(terminal["attempts"]) == ea.MAX_ATTEMPTS
+          and terminal["reason_code"] == "RETRY_BUDGET_EXHAUSTED"
+          and terminal.get("last_error") == ea.FEE_BLOCKED_SOURCE
+          and not ea.is_retry_due(terminal, now=relogio + timedelta(days=1))
+          and terminal["totals"]["net_trade"] is None
+          and await pnl_do_trade(trade_terminal) is None,
+          f"{terminal['state']}/{terminal['attempts']} {terminal['reason_code']}")
+    await aplicar_com_espera_real(trade_terminal, observacao_tardia)
+    terminal_tardio = await ledger_do_trade(trade_terminal)
+    pendentes_terminais = await ea.pending_trade_ids(
+        limit=5, now=relogio + timedelta(days=1))
+    check("l01d_failed_8_de_49_tardias_nao_reabrem_retry_nem_selecao",
+          len(terminal_tardio["fee_conversions"]) == 8
+          and len(terminal_tardio["totals"]["fee_conversion_required"]) == 49
+          and terminal_tardio["state"] == ea.STATE_FAILED
+          and int(terminal_tardio["attempts"]) == ea.MAX_ATTEMPTS
+          and terminal_tardio["reason_code"] == "RETRY_BUDGET_EXHAUSTED"
+          and terminal_tardio["next_retry_at"] is None
+          and not ea.is_retry_due(terminal_tardio,
+                                 now=relogio + timedelta(days=1))
+          and trade_terminal not in pendentes_terminais
+          and terminal_tardio["totals"]["net_trade"] is None
+          and await pnl_do_trade(trade_terminal) is None,
+          f"{terminal_tardio['state']}/{terminal_tardio['attempts']} "
+          f"conversoes={len(terminal_tardio['fee_conversions'])} "
+          f"pendentes={pendentes_terminais}")
 
     print(f"LOTE01_FINANCEIRO_PG_OK: {len(CHECKS)} verificações")
     await db._engine.dispose()

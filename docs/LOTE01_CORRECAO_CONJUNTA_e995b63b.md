@@ -185,3 +185,11 @@ motivo próprio, não concluído) e **observação operacional ainda não execut
 3. **Observação operacional**: nenhuma entrada real foi executada neste pacote;
    nenhuma chamada à conta real, credencial, ordem, flag ou pausa foi tocada.
 4. Promoção Dev→PRD e cutover seguem fora deste escopo.
+
+## Revisão posterior
+
+Este relatório registra a correção histórica. Três fronteiras adicionais foram
+reproduzidas na entrega `ceb42af7` e corrigidas conforme
+`LOTE01_CORRECAO_FINAL_ceb42af7.md`; os critérios atuais e a nova prova local
+estão nesse documento e no checkpoint. Não usar as contagens acima como a
+validação mais recente.

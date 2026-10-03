@@ -281,6 +281,14 @@ class R2ContextoEsperadoEmTodasAsFronteiras(unittest.IsolatedAsyncioTestCase):
             observed_start_ms=ABERTURA, observed_end_ms=FECHAMENTO,
             now_ms=T0)
         campos.update(mudancas)
+        # Referência sintética de uma comissão explicitamente vinculada ao
+        # fill. Mudanças deliberadas já fornecidas pela fixture são preservadas.
+        if isinstance(campos.get("source_ref"), dict):
+            campos["source_ref"] = {
+                "commission_asset": ctx.get("commission_asset"),
+                "commission_qty": str(ctx.get("commission_qty")),
+                **campos["source_ref"],
+            }
         return ea.build_fee_conversion(**campos)
 
     def test_prova_valida_confirma(self):

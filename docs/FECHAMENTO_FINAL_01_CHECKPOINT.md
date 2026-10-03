@@ -14,12 +14,13 @@ Lote 01 CONCLUÍDO nesta execução; Lotes 02/03/04 NÃO iniciados.
 | # | Etapa | Estado |
 |---|---|---|
 | 1 | Mapa produtor→persistência→consumidor (§1) | feito (doc de entrega) |
-| 2 | Conversão de comissão em outro ativo (§2) | implementado, 27 + 13 provas |
+| 2 | Conversão de comissão em outro ativo (§2) | implementado, provas atuais abaixo |
 | 3 | Funding e total (§3) | auditado e provado em PG (sem reescrita) |
 | 4 | Admissão/cutover/manual-BOT (§4) | auditado; cutover preparado, não ativo |
 | 5 | Testes PG16 + direcionados 2× + suíte completa (§5) | feito |
 | 6 | Docs de entrega + HARDENING_LOG + commit (§6) | feito |
 | 7 | Correção conjunta da auditoria `e995b63b` (R1–R5) | feito, 29 + 27 + 21 provas |
+| 8 | Fronteiras de prova, decimal e retry sobre `ceb42af7` | feito, 66 focais + 31 PG, ambos 2× |
 
 ### Correção conjunta sobre `e995b63b`
 
@@ -29,6 +30,13 @@ conversão e 49 conversões terminando em `FAILED`) corrigidos em um pacote, com
 RED medido na baseline pela API dela mesma. Contrato da evidência:
 `R05E_FEE_CONVERSION_V2` (V1 = legado, preservado, nunca promovido). Sem DDL.
 Detalhe: `LOTE01_CORRECAO_CONJUNTA_e995b63b.md`.
+
+### Correção atual sobre `ceb42af7`
+
+Referência da fonte revalidada semanticamente também após persistência; janela
+por página preservada; Decimal canônico na identidade econômica; FAILED não
+ressuscita por resposta atrasada; replay A→B→A idempotente. Sem DDL/cutover.
+Detalhe e limites: `LOTE01_CORRECAO_FINAL_ceb42af7.md`.
 
 ## Arquivos do lote
 
@@ -43,12 +51,13 @@ Detalhe: `LOTE01_CORRECAO_CONJUNTA_e995b63b.md`.
   (adaptados ao contrato V2, garantias preservadas).
 - `backend/tests/test_lote01_correcao_conjunta.py` — novo (29 testes: R1–R5 +
   matriz final de fechamento).
-- `backend/tests/pg_integration_lote01_financeiro.py` — 21 verificações PG
-  (13 do lote + 8 da correção conjunta).
+- `backend/tests/test_lote01_final_boundaries.py` — 10 novos testes de fronteira.
+- `backend/tests/pg_integration_lote01_financeiro.py` — 31 verificações PG
+  (21 anteriores + 10 novas).
 - `docs/FECHAMENTO_FINAL_01_OPERACIONAL_FINANCEIRO.md`, `docs/HARDENING_LOG.md`,
   este checkpoint.
 
-## Provas executadas (estado final)
+## Provas executadas (correção anterior, histórico)
 
 - RED da correção conjunta medido na baseline `e995b63b`, pela API da própria
   baseline: **5/5 defeitos reproduzidos** antes de corrigir.
@@ -61,6 +70,16 @@ Detalhe: `LOTE01_CORRECAO_CONJUNTA_e995b63b.md`.
   (espera real pela lock em `pg_locks`).
 - Suíte completa: **2.556 executados, 2.554 aprovados, 2 skips R05C** declarados.
 - `py_compile` dos arquivos próprios e `git diff --check` aprovados.
+
+## Provas atuais sobre `ceb42af7`
+
+- Novos testes RED na baseline: 27 falhas; 66 focais GREEN, **2×**.
+- PG16 real descartável: **31/31, 2× em bancos novos**, duas conexões,
+  socket Unix, TCP/DNS bloqueados; regressão R05C também aprovada.
+- Suíte completa: **2.566 executados, 2.564 aprovados, 2 skips R05C** históricos.
+- `py_compile` e diff-check aprovados; nenhum TS/TSX alterado.
+- Casos FAILED permanecem encerrados mesmo com prova tardia completa;
+  recuperação supervisionada não implementada neste pacote.
 
 ## Bloqueios reais (não mascarados)
 
@@ -77,7 +96,7 @@ Detalhe: `LOTE01_CORRECAO_CONJUNTA_e995b63b.md`.
 ## Próximo comando para retomar/reverificar
 
 ```
-cd "/Users/alanmalta/Agente de IA Crypto/.claude/worktrees/blissful-sinoussi-0511a5/backend" && ../../../../backend/.venv311/bin/python -B -m unittest tests.test_lote01_correcao_conjunta tests.test_lote01_fee_conversion
+cd "/Users/alanmalta/Agente de IA Crypto/.claude/worktrees/blissful-sinoussi-0511a5/backend" && ../../../../backend/.venv311/bin/python -B -m unittest tests.test_lote01_final_boundaries tests.test_lote01_correcao_conjunta tests.test_lote01_fee_conversion
 ```
 
 O harness PG do lote precisa de um cluster descartável (socket

@@ -33,7 +33,8 @@ liquidação e devolvia `net_trade=None` com `FEE_ASSET_CONVERSION_UNAVAILABLE`
 (bloqueio CORRETO: BNB não é USDT). Não existia caminho verificável para
 resolver — a linha ficava fora de `accounting_total` indefinidamente.
 
-**DEPOIS.** Contrato `R05E_FEE_CONVERSION_V1`, versionado **por fill**:
+**DEPOIS (contrato inicial).** `R05E_FEE_CONVERSION_V1`, versionado **por fill**;
+o contrato vigente é V2, conforme §§7–8:
 
 - `build_fee_conversion` valida com Decimal e devolve recusa explícita para
   bool/NaN/infinito/negativo, preço ≤ 0, ativo igual ao de liquidação, carimbo
@@ -119,3 +120,14 @@ Detalhe por defeito, provas e limitações: `LOTE01_CORRECAO_CONJUNTA_e995b63b.m
 
 `R05_FINANCIAL_TOTAL_SOURCE` e `R05_FINANCIAL_BREAKER_ENABLED` continuam
 intocados — a correção não liga nem desliga nada.
+
+## 8. Fronteiras finais sobre `ceb42af7`
+
+Validação semântica da referência da fonte em todas as fronteiras, carimbo de
+observação íntegro, janela real por página/cursor, Decimal canônico no material
+econômico e retry encerrado preservado com replay não adjacente idempotente.
+Provas: 66 focais 2×; PG16 31 verificações 2× em bancos novos; regressão R05C;
+suíte completa 2.566 executados / 2.564 aprovados / 2 skips históricos.
+Detalhe: `LOTE01_CORRECAO_FINAL_ceb42af7.md`. Nenhuma ativação financeira ou
+aprovação operacional decorre desses testes. WAITING_SOURCE e observação real
+continuam pendentes, sem relaxar a exigência de vínculo do ledger.

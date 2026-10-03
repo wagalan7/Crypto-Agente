@@ -2721,3 +2721,25 @@ Baseline `e995b63b`, mesmo worktree autorizado. Cinco defeitos da auditoria
   `R05_FINANCIAL_BREAKER_ENABLED` intocados), frontend ou histórico financeiro
   real. Nenhuma conta real, ordem, Telegram, merge, push ou deploy. Contrato V1
   fica legado: preservado para diagnóstico, nunca re-hasheado nem promovido.
+
+## L01-F — fronteiras de prova e retry (03/10/2026)
+
+Baseline `ceb42af7`, worktree autorizado, único serviço alterado:
+`execution_accounting_service.py`. Registro completo em
+`docs/LOTE01_CORRECAO_FINAL_ceb42af7.md`.
+
+- Fonte: construtor/veredito/merge/finalização reconferem referência pelo contexto
+  do fill; vínculo da comissão preservado; carimbo da observação íntegro e
+  janelas reais por página/cursor, não apenas janela agregada.
+- Material: Decimal canônico para números da fonte; escala textual equivalente
+  não conflita nem retira P&L; alteração econômica real continua bloqueada.
+- Retry: latch JSON `retry_halted`, FAILED sem auto-resume por prova atrasada,
+  attempts/erro preservados; replay A→B→A e geração exata impedem dupla contagem.
+- Prova: 27 falhas RED na baseline nos 10 novos testes; 66 focais GREEN 2×;
+  PG16 real, driver async/socket Unix/TCP-DNS bloqueados, 31 verificações 2× em
+  bases novas; R05C_PG_INTEGRATION_OK; suíte completa 2.566 executados / 2.564
+  aprovados / 2 skips históricos R05C por fixture privada ausente. Compile e
+  diff-check aprovados; clusters descartáveis encerrados.
+- Sem DDL, backfill, flag, cutover, estratégia, sizing, limite, alavancagem,
+  pausa ou manual alterados. Sem produção, conta real, ordem, mensagem, merge,
+  push/deploy. WAITING_SOURCE e WAITING_OPERATIONAL_OBSERVATION permanecem.
