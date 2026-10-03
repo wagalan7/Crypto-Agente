@@ -211,17 +211,41 @@ async def run():
             fills_window_complete=True, funding_window_complete=bool(com_funding),
             position_flat=True, planned_stop=95.0)
 
+    IDENT_CONV = {"exchange": "binance", "symbol": "BTCUSDT", "side": "long",
+                  "position_side": "BOTH", "entry_order_id": "o7001",
+                  "entry_client_order_id": "cw-entry-lote01",
+                  "account_scope": ESCOPO}
+
+    def contexto_conv(**mudancas):
+        """Contexto ESPERADO derivado do fill de entrada ATRIBUÍDO."""
+        entrada_fill = conjunto_de_fills()[0]
+        ctx = dict(ea.build_expected_context(identity=IDENT_CONV,
+                                            fill=entrada_fill) or {})
+        ctx.update(mudancas)
+        return ctx
+
+    def referencia_fonte(**mudancas):
+        """Lançamento de COMMISSION normalizado que registra a conversão."""
+        ref = {"source": ea.LEDGER_SOURCE, "account_scope": ESCOPO,
+               "exchange": "binance", "symbol": "BTCUSDT",
+               "income_type": "COMMISSION", "asset": "USDT",
+               "trade_id": "7001", "tran_id": "9001", "income": "-0.42",
+               "time_ms": entrada_ms, "window_start_ms": ms(abertura),
+               "window_end_ms": ms(fechamento)}
+        ref.update(mudancas)
+        return ref
+
     def conversao(**mudancas):
-        campos = dict(
-            account_scope=ESCOPO, exchange="binance",
-            fill_key=ea.fill_key("binance", "BTCUSDT", "BOTH", "7001"),
-            fee_asset="BNB", fee_qty="0.001", settlement_value="0.42",
-            price="420", source=ea.FEE_SOURCE_BROKER,
-            price_basis="COMMISSION_LEDGER_SETTLEMENT_VALUE",
-            fill_time_ms=entrada_ms, observed_start_ms=ms(abertura),
-            observed_end_ms=ms(fechamento))
+        ctx = {k: mudancas.pop(k) for k in list(mudancas)
+               if k in ea.FEE_CONTEXT_FIELDS}
+        campos = dict(settlement_value="0.42", price="420",
+                      source=ea.FEE_SOURCE_BROKER,
+                      price_basis="COMMISSION_LEDGER_SETTLEMENT_VALUE",
+                      source_ref=referencia_fonte(),
+                      observed_start_ms=ms(abertura),
+                      observed_end_ms=ms(fechamento))
         campos.update(mudancas)
-        return ea.build_fee_conversion(**campos)
+        return ea.build_fee_conversion(expected=contexto_conv(**ctx), **campos)
 
     async def ledger_do_trade(trade_id):
         async with db.get_session() as session:
@@ -299,7 +323,9 @@ async def run():
           f"{len(ledger3['fee_conversions'])} {str(ledger3['totals'])[:200]}")
 
     # Evidência DIVERGENTE para o mesmo fill: CONFLICT preservando a original.
-    divergente = conversao(settlement_value="9.99", price="9990")
+    divergente = conversao(settlement_value="9.99", price="9990",
+                           source_ref=referencia_fonte(tran_id="9002",
+                                                       income="-9.99"))
     await ea.apply_accounting(trade_id, observacao(com_conversao=divergente))
     ledger4 = await ledger_do_trade(trade_id)
     total_conflito = await total_da_janela()
@@ -480,6 +506,154 @@ async def run():
     check("l01_fechamento_entre_parcelas_entra_na_janela_sem_sumir",
           visao_pos_fechamento.get("base") is not None,
           str(visao_pos_fechamento)[:240])
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  4. Correção conjunta e995b63b — materialidade, precedência e progresso
+    #     sob BLOQUEIO DE LINHA, com DUAS conexões reais.
+    # ══════════════════════════════════════════════════════════════════════
+    await limpar_portfolio()
+
+    def estimativa(**mudancas):
+        """Preço histórico: no MÁXIMO ESTIMATED (nunca vira dinheiro)."""
+        campos = dict(settlement_value="0.40", price="400",
+                      source=ea.FEE_SOURCE_HISTORICAL,
+                      price_basis="KLINE_1M_CLOSE", source_ref=None,
+                      observed_start_ms=ms(abertura),
+                      observed_end_ms=ms(fechamento))
+        campos.update(mudancas)
+        return ea.build_fee_conversion(expected=contexto_conv(), **campos)
+
+    # (a) Duas observações EQUIVALENTES (mesma prova, janelas de consulta
+    #     diferentes) aplicadas em PARALELO por duas conexões: nenhuma
+    #     divergência nasce da consulta, e o total aceita a linha uma vez.
+    snapA = await criar_snapshot()
+    tradeA = await criar_trade(snapA)
+    obs_a1 = observacao(com_conversao=conversao())
+    obs_a2 = observacao(com_conversao=conversao(
+        observed_end_ms=ms(fechamento) + 1_000))
+    r1, r2 = await asyncio.gather(
+        ea.apply_accounting(tradeA, obs_a1),
+        ea.apply_accounting(tradeA, obs_a2))
+    ledgerA = await ledger_do_trade(tradeA)
+    check("l01c_reobservacao_equivalente_nao_cria_conflito_nem_divergencia",
+          r1.get("ok") is True and r2.get("ok") is True
+          and len(ledgerA["fee_conversions"]) == 1
+          and not [c for c in ledgerA["conflicts"]
+                   if c.get("kind") == "FEE_CONVERSION"]
+          and ledgerA["state"] == ea.STATE_CONFIRMED
+          and Decimal(ledgerA["totals"]["net_trade"]) == Decimal("20.40"),
+          f"{r1} {r2} conflitos={ledgerA['conflicts']}")
+
+    # (b) ESTIMATED → CONFIRMED promove com histórico; a estimativa ATRASADA
+    #     não rebaixa o que já está confirmado nem gera conflito.
+    snapB = await criar_snapshot()
+    tradeB = await criar_trade(snapB)
+    await ea.apply_accounting(tradeB, observacao(com_conversao=estimativa()))
+    ledgerB0 = await ledger_do_trade(tradeB)
+    total_estimado = await total_da_janela()
+    check("l01c_estimativa_nao_vira_dinheiro_nem_entra_no_total",
+          ledgerB0["fee_conversions"][contexto_conv()["fill_key"]]["quality"]
+          == ea.FEE_QUALITY_ESTIMATED
+          and ledgerB0["totals"]["net_trade"] is None
+          and ledgerB0["state"] != ea.STATE_CONFIRMED
+          and total_estimado["state"] != fts.STATE_COMPLETE,
+          f"{ledgerB0['state']}/{ledgerB0['reason_code']}")
+
+    await ea.apply_accounting(tradeB, observacao(com_conversao=conversao()))
+    ledgerB1 = await ledger_do_trade(tradeB)
+    prova_b = ledgerB1["fee_conversions"][contexto_conv()["fill_key"]]
+    check("l01c_promocao_de_estimada_para_confirmada_preserva_historico",
+          prova_b["quality"] == ea.FEE_QUALITY_CONFIRMED
+          and prova_b["settlement_value"] == "0.42"
+          and len(prova_b.get("superseded") or []) == 1
+          and (prova_b["superseded"][0]["quality"]
+               == ea.FEE_QUALITY_ESTIMATED)
+          and ledgerB1["state"] == ea.STATE_CONFIRMED
+          and Decimal(ledgerB1["totals"]["net_trade"]) == Decimal("20.40"),
+          str(prova_b)[:260])
+
+    await ea.apply_accounting(tradeB, observacao(com_conversao=estimativa(
+        settlement_value="0.37", price="370")))
+    ledgerB2 = await ledger_do_trade(tradeB)
+    check("l01c_estimativa_atrasada_nao_rebaixa_confirmacao",
+          (ledgerB2["fee_conversions"][contexto_conv()["fill_key"]]["quality"]
+           == ea.FEE_QUALITY_CONFIRMED)
+          and ledgerB2["state"] == ea.STATE_CONFIRMED
+          and not [c for c in ledgerB2["conflicts"]
+                   if c.get("kind") == "FEE_CONVERSION"]
+          and Decimal(ledgerB2["totals"]["net_trade"]) == Decimal("20.40"),
+          f"{ledgerB2['state']} {ledgerB2['conflicts']}")
+
+    # (c) Falha ATRASADA (geração anterior) depois de progresso/confirmação:
+    #     estatística e resultado NÃO regridem.
+    falha_antiga = {**observacao(), "attempts": ea.MAX_ATTEMPTS,
+                    "last_error": "RATE_LIMIT", "next_retry_at": None,
+                    "base_generation": 0,
+                    "observation_id": "f" * 64}
+    await ea.apply_accounting(tradeB, falha_antiga)
+    ledgerB3 = await ledger_do_trade(tradeB)
+    total_pos_falha = await total_da_janela()
+    check("l01c_falha_atrasada_nao_regride_estatistica_nem_o_total",
+          ledgerB3["state"] == ea.STATE_CONFIRMED
+          and int(ledgerB3.get("attempts") or 0) < ea.MAX_ATTEMPTS
+          and ledgerB3.get("reason_code") != "RETRY_BUDGET_EXHAUSTED"
+          and Decimal(ledgerB3["totals"]["net_trade"]) == Decimal("20.40")
+          and total_pos_falha["rows_confirmed"] >= 1,
+          f"{ledgerB3['state']}/{ledgerB3.get('attempts')} "
+          f"{total_pos_falha['exclusion_reasons']}")
+
+    # (d) Idempotência/reinício: a MESMA observação reaplicada não avança a
+    #     geração, não duplica prova e não muda o total.
+    geracao_antes = int(ledgerB3.get("generation") or 0)
+    await ea.apply_accounting(tradeB, falha_antiga)
+    ledgerB4 = await ledger_do_trade(tradeB)
+    check("l01c_replay_nao_avanca_geracao_nem_duplica_prova",
+          int(ledgerB4.get("generation") or 0) == geracao_antes
+          and len(ledgerB4["fee_conversions"]) == 1
+          and Decimal(ledgerB4["totals"]["net_trade"]) == Decimal("20.40"),
+          f"ger={ledgerB4.get('generation')} antes={geracao_antes}")
+
+    # (e) Conflito MATERIAL entre confirmadas: a original fica, a linha sai do
+    #     total e o P&L projetado é retratado na própria RealTrade.
+    snapE = await criar_snapshot()
+    tradeE = await criar_trade(snapE)
+    await ea.apply_accounting(tradeE, observacao(com_conversao=conversao()))
+    async with db.get_session() as session:
+        pnl_confirmado = (await session.execute(select(
+            RealTrade.pnl_usd).where(RealTrade.id == tradeE))).scalar_one()
+    await ea.apply_accounting(tradeE, observacao(com_conversao=conversao(
+        settlement_value="7.77", price="7770",
+        source_ref=referencia_fonte(tran_id="9777", income="-7.77"))))
+    ledgerE = await ledger_do_trade(tradeE)
+    async with db.get_session() as session:
+        pnl_conflito = (await session.execute(select(
+            RealTrade.pnl_usd).where(RealTrade.id == tradeE))).scalar_one()
+    total_conflito_material = await total_da_janela()
+    check("l01c_conflito_material_preserva_original_e_retrata_o_pnl",
+          pnl_confirmado is not None
+          and (ledgerE["fee_conversions"][contexto_conv()["fill_key"]]
+               ["settlement_value"] == "0.42")
+          and any(c.get("kind") == "FEE_CONVERSION"
+                  for c in ledgerE["conflicts"])
+          and pnl_conflito is None
+          and total_conflito_material["exclusion_reasons"].get(
+              fts.LEDGER_CONFLICT) == 1,
+          f"pnl={pnl_confirmado}→{pnl_conflito} "
+          f"{total_conflito_material['exclusion_reasons']}")
+
+    # (f) Ciclo COMPLETO: seleção por `pending_trade_ids` depois do reinício.
+    #     A linha com comissão ainda não convertida volta ao laço; a confirmada
+    #     e a em CONFLITO não são reabertas automaticamente.
+    snapF = await criar_snapshot()
+    tradeF = await criar_trade(snapF)
+    await ea.apply_accounting(tradeF, observacao())      # sem conversão
+    pendentes_apos = await ea.pending_trade_ids(limit=5)
+    check("l01c_selecao_por_pending_trade_ids_apos_reinicio",
+          tradeF in pendentes_apos
+          and tradeB not in pendentes_apos
+          and tradeE not in pendentes_apos,
+          f"pendentes={pendentes_apos} tradeB={tradeB} tradeE={tradeE} "
+          f"tradeF={tradeF}")
 
     print(f"LOTE01_FINANCEIRO_PG_OK: {len(CHECKS)} verificações")
     await db._engine.dispose()

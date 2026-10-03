@@ -102,3 +102,20 @@ Observar UMA entrada legítima, **se** ocorrer, conferindo fill/qty/proteção,
 ledger (`state`, `net_trade`, `funding_state`, `fee_conversions`) e reservas.
 Não forçar trade. `GET /api/recommendations` e `/api/live/preflight` não são
 leitura inofensiva: auditar efeitos antes de incluir rotas em qualquer verificação.
+
+## 7. Correção conjunta sobre `e995b63b` (contrato V2 da conversão)
+
+A auditoria `AUDITORIA_LOTE01_e995b63b.md` apontou cinco defeitos neste mesmo
+lote. Todos foram corrigidos em um pacote único, ainda dentro de
+`execution_accounting_service.py` e **sem DDL**: normalizador por linha do ledger
+de COMMISSION (R1), contexto esperado derivado do fill atribuído em todas as
+fronteiras (R2), separação entre hash de integridade e identidade material com
+tabela de precedência (R3), zero estrangeiro comprovado como custo zero (R4) e
+progresso útil em lote com geração de observação sob bloqueio (R5).
+
+O contrato da evidência passou a `R05E_FEE_CONVERSION_V2`; o V1 fica **legado**
+(`FEE_CONVERSION_UNVERIFIED`), preservado para diagnóstico e nunca promovido.
+Detalhe por defeito, provas e limitações: `LOTE01_CORRECAO_CONJUNTA_e995b63b.md`.
+
+`R05_FINANCIAL_TOTAL_SOURCE` e `R05_FINANCIAL_BREAKER_ENABLED` continuam
+intocados — a correção não liga nem desliga nada.

@@ -2669,3 +2669,55 @@ ausente/booleano não podem se tornar lista vazia/zero. Contrato e provas em
   ou histórico alterado. Nenhuma conta real, ordem externa, mensagem, merge,
   push ou deploy. Main preservado; fence local e TOCTOU com a exchange continuam
   sendo limitações externas declaradas.
+
+## L01-C — correção conjunta da conversão de comissão (03/10/2026)
+
+Baseline `e995b63b`, mesmo worktree autorizado. Cinco defeitos da auditoria
+`AUDITORIA_LOTE01_e995b63b.md` corrigidos num pacote único, só em
+`execution_accounting_service.py`. Contrato e provas em
+`docs/LOTE01_CORRECAO_CONJUNTA_e995b63b.md`.
+
+- **R1** `normalize_commission_ledger_row` valida cada linha do ledger de
+  COMMISSION ANTES de indexar valor (conta, exchange/símbolo normalizados,
+  `incomeType`, ativo de liquidação, `tradeId` atribuído recusando bool/float,
+  `tranId`, `income` finito e **não positivo** — crédito não vira custo por
+  `abs` —, janela efetivamente consultada e vínculo explícito com a comissão do
+  fill). `index_commission_ledger` dedupa por `(trade_id, tran_id)`: duplicata
+  idêntica é no-op, material diferente é conflito de fonte, `tranId` distintos
+  para o mesmo fill bloqueiam. Referência normalizada persistida e coberta pelos
+  hashes.
+- **R2** contexto ESPERADO (`build_expected_context`) derivado da identidade e
+  do fill ATRIBUÍDO, passado a construtor/veredito/resolvedor/finalizador e
+  reconferido no merge sob bloqueio; nunca copiado da prova. Prova íntegra com
+  conta/exchange/instante divergente, ou janela que não contém o fill, não
+  confirma. Sem contexto ⇒ `FEE_CONVERSION_CONTEXT_MISSING` (não fail-open).
+- **R3** `integrity_hash` (registro inteiro) separado de `material_id`
+  (economia: identidade, quantidade, ativo de liquidação, valor, referência do
+  evento). `observed_*`/tentativa/qualidade fora da materialidade.
+  `merge_fee_proof` aplica a precedência: armazenar, idempotência, enriquecer,
+  promover estimativa com histórico, preservar confirmação diante de estimativa
+  atrasada, conflitar só entre confirmadas materialmente divergentes.
+- **R4** conversão exigida só de comissão estrangeira ESTRITAMENTE positiva:
+  zero finito é custo zero conhecido (sem consulta); ausente/NaN/inf/negativa
+  continua desconhecida.
+- **R5** desfecho explícito do coletor (`COMPLETE`/`PROGRESS`/`PARTIAL_LIMIT`/
+  `SOURCE_UNAVAILABLE`/`ERROR`), completude sobre TODAS as exigências,
+  incompletude saudável do lote como espera cadenciada, progresso útil medido
+  por confirmações novas e `observation_id`/`base_generation` aditivos: resposta
+  obsoleta contribui evento, não estatística; replay não conta duas vezes;
+  falha real da geração corrente conta uma vez.
+- RED na baseline, pela API dela mesma: 5/5 defeitos reproduzidos (ledger
+  inválido confirmando valor, contexto divergente CONFIRMED, janela mudando a
+  identidade, zero exigindo conversão, 49 conversões em `FAILED` com 48 feitas e
+  `attempts=6`). GREEN: 29 testes novos + 27 do lote adaptados ao V2, 56 focais
+  **2×**; PG16 descartável com socket Unix e TCP/DNS bloqueados →
+  `pg_integration_lote01_financeiro.py` 13 → **21** verificações **2×** (duas
+  conexões reais, efeito em P&L e no `accounting_total`); regressões
+  `pg_integration_r05c.py`, `r05d_gate` (16) e `r05_clock` (10). Suíte completa
+  2.556 executados / 2.554 aprovados / 2 skips R05C declarados. `py_compile` e
+  `git diff --check` aprovados; clusters encerrados.
+- **Sem mudança:** DDL/migração, estratégia, calibração, sizing, limites,
+  alavancagem, defaults, ENV/flag (`R05_FINANCIAL_TOTAL_SOURCE` e
+  `R05_FINANCIAL_BREAKER_ENABLED` intocados), frontend ou histórico financeiro
+  real. Nenhuma conta real, ordem, Telegram, merge, push ou deploy. Contrato V1
+  fica legado: preservado para diagnóstico, nunca re-hasheado nem promovido.
