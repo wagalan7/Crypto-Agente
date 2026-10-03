@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import json
 import logging
 import time
 import math
@@ -372,6 +374,7 @@ def compute_totals(entry_fills: Sequence[Dict[str, Any]],
                    exit_fills: Sequence[Dict[str, Any]],
                    funding: Sequence[Dict[str, Any]], *,
                    funding_state: str = FUNDING_PENDING,
+                   fee_conversions: Any = None,
                    settlement_asset: str = SETTLEMENT_ASSET) -> Dict[str, Any]:
     """Agrega os totais financeiros a partir do conjunto DEDUPLICADO de eventos."""
     seen: set = set()
@@ -381,6 +384,9 @@ def compute_totals(entry_fills: Sequence[Dict[str, Any]],
     # vazia É prova de zero).
     gross_known = bool(entry_fills or exit_fills)
     fees: Dict[str, Decimal] = {}
+    #: Comissões em ativo DIFERENTE do de liquidação, por fill. A conversão é
+    #: por fill (contrato versionado), nunca um rateio do total.
+    fees_other_by_fill: List[Dict[str, Any]] = []
     fees_complete = True
     entry_qty = Decimal("0")
     entry_notional = Decimal("0")
@@ -411,6 +417,11 @@ def compute_totals(entry_fills: Sequence[Dict[str, Any]],
                 fees_complete = False           # ausente ≠ zero
             else:
                 fees[asset] = fees.get(asset, Decimal("0")) + commission
+                if asset != settlement_asset:
+                    fees_other_by_fill.append(
+                        {"fill_key": key, "fee_asset": asset,
+                         "fee_qty": commission, "role": role,
+                         "time": fill.get("time")})
             if role == "entry":
                 entry_qty += qty
                 entry_notional += price * qty
@@ -427,6 +438,11 @@ def compute_totals(entry_fills: Sequence[Dict[str, Any]],
         fees_complete = False               # ausência de fill ≠ taxa zero
     other_assets = sorted(a for a in fees if a != settlement_asset)
     settlement_fee = fees.get(settlement_asset)
+    # Conversão das comissões em OUTRO ativo: só evidência CONFIRMADA por fill
+    # entra no dinheiro. ESTIMATED/ausente/conflito mantêm `net_trade` desconhecido.
+    conversao = resolve_fee_conversions(
+        fees_other_by_fill, fee_conversions,
+        settlement_asset=settlement_asset)
     net_trade: Optional[Decimal] = None
     net_reason: Optional[str] = None
     if not gross_known:
@@ -434,10 +450,14 @@ def compute_totals(entry_fills: Sequence[Dict[str, Any]],
                       else "GROSS_INCOMPLETE")
     elif not fees_complete:
         net_reason = "FEES_INCOMPLETE"
-    elif other_assets:
-        net_reason = "FEE_ASSET_CONVERSION_UNAVAILABLE"
+    elif other_assets and not conversao["resolved"]:
+        net_reason = conversao["reason_code"]
     else:
-        net_trade = gross - (settlement_fee or Decimal("0"))
+        net_trade = (gross - (settlement_fee or Decimal("0"))
+                     - conversao["converted_total"])
+    # Ativos ainda NÃO convertidos: o consumidor do total (R05D) exclui a linha
+    # enquanto esta lista não estiver vazia.
+    unconverted = [] if conversao["resolved"] else other_assets
 
     funding_net: Optional[Decimal] = None
     if funding_state == FUNDING_CONFIRMED:
@@ -466,8 +486,14 @@ def compute_totals(entry_fills: Sequence[Dict[str, Any]],
         "gross_realized": _dstr(gross) if gross_known else None,
         "gross_complete": gross_known,
         "fees_by_asset": {a: _dstr(v) for a, v in sorted(fees.items())},
-        "fees_complete": fees_complete and not other_assets,
-        "fee_assets_unconverted": other_assets,
+        "fees_complete": fees_complete and not unconverted,
+        "fee_assets_unconverted": unconverted,
+        "fee_conversion_state": conversao["state"],
+        "fee_conversion_reason_code": conversao["reason_code"],
+        "fee_conversion_settlement_total": _dstr(conversao["converted_total"])
+        if conversao["resolved"] else None,
+        "fee_conversion_required": [item["fill_key"] for item in fees_other_by_fill],
+        "fee_conversion_confirmed": conversao["confirmed_keys"],
         "settlement_asset": settlement_asset,
         "net_trade": _dstr(net_trade),
         "net_trade_reason_code": net_reason,
@@ -482,6 +508,267 @@ def compute_totals(entry_fills: Sequence[Dict[str, Any]],
         "entry_fee": _dstr(_fee_of(entry_fills, settlement_asset)),
         "exit_fee": _dstr(_fee_of(exit_fills, settlement_asset)),
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Comissão paga em OUTRO ativo — contrato de conversão VERSIONADO por fill
+# ════════════════════════════════════════════════════════════════════════════
+#  `FEE_ASSET_CONVERSION_UNAVAILABLE` é um bloqueio CORRETO: BNB não é USDT e
+#  não existe 1:1 entre USD/USDT/USDC. O caminho verificável para resolvê-lo é
+#  uma EVIDÊNCIA por fill, com fonte, qualidade e hash:
+#
+#  - `BROKER_REGISTERED_CONVERSION` (a corretora registrou o valor na moeda de
+#    liquidação para aquele mesmo fill) ⇒ pode ser CONFIRMED;
+#  - `HISTORICAL_MARKET_PRICE` ⇒ no máximo ESTIMATED (preço de mercado não é
+#    liquidação registrada, e preço ATUAL não é histórico);
+#  - sem fonte confiável ⇒ `BLOCKED_SOURCE_UNAVAILABLE`, nunca um número.
+#
+#  Só CONFIRMED por fill desbloqueia `net_trade`.
+FEE_CONVERSION_CONTRACT = "R05E_FEE_CONVERSION_V1"
+FEE_SOURCE_BROKER = "BROKER_REGISTERED_CONVERSION"
+FEE_SOURCE_HISTORICAL = "HISTORICAL_MARKET_PRICE"
+FEE_SOURCES = (FEE_SOURCE_BROKER, FEE_SOURCE_HISTORICAL)
+FEE_QUALITY_CONFIRMED = "CONFIRMED"
+FEE_QUALITY_ESTIMATED = "ESTIMATED"
+FEE_QUALITY_UNAVAILABLE = "UNAVAILABLE"
+FEE_CONVERSION_RESOLVED = "RESOLVED"
+FEE_CONVERSION_NOT_REQUIRED = "NOT_REQUIRED"
+FEE_BLOCKED_SOURCE = "BLOCKED_SOURCE_UNAVAILABLE"
+FEE_REASON_MISSING = "FEE_ASSET_CONVERSION_UNAVAILABLE"
+FEE_REASON_ESTIMATED = "FEE_CONVERSION_ESTIMATED_ONLY"
+FEE_REASON_CONFLICT = "FEE_CONVERSION_CONFLICT"
+FEE_REASON_INVALID = "FEE_CONVERSION_INVALID"
+#: Campos CANÔNICOS cobertos pelo hash (nenhum resultado futuro entra).
+FEE_CONVERSION_FIELDS = (
+    "contract_version", "account_scope", "exchange", "fill_key", "fee_asset",
+    "fee_qty", "settlement_asset", "settlement_value", "price", "price_basis",
+    "fill_time_ms", "source", "quality", "observed_start_ms", "observed_end_ms",
+)
+
+
+def _fee_canonical(value: Any) -> Optional[str]:
+    """Forma canônica e estável no ida-e-volta do JSONB (número → decimal)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return f"bool:{'true' if value else 'false'}"
+    if isinstance(value, (int, float, Decimal)):
+        numero = to_decimal(value)
+        if numero is None:
+            return None
+        return f"num:{format(numero.normalize(), 'f')}"
+    if isinstance(value, str):
+        texto = value.strip()
+        return f"str:{texto}" if texto else None
+    return None
+
+
+#: Campos de VALOR: canonicalizados como decimal venha string ou número, para
+#: que a mesma prova não mude de hash por causa da representação do JSONB.
+FEE_DECIMAL_FIELDS = ("fee_qty", "settlement_value", "price")
+
+
+def fee_conversion_hash(evidence: Any) -> Optional[str]:
+    """Hash determinístico dos campos canônicos da evidência."""
+    if not isinstance(evidence, dict):
+        return None
+    corpo = {}
+    for campo in FEE_CONVERSION_FIELDS:
+        valor = evidence.get(campo)
+        if campo in FEE_DECIMAL_FIELDS and not isinstance(valor, bool):
+            numero = to_decimal(valor)
+            corpo[campo] = (f"num:{format(numero.normalize(), 'f')}"
+                            if numero is not None else None)
+        else:
+            corpo[campo] = _fee_canonical(valor)
+    try:
+        texto = json.dumps(corpo, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+
+def build_fee_conversion(*, account_scope: Any, exchange: Any, fill_key: Any,
+                         fee_asset: Any, fee_qty: Any, settlement_value: Any,
+                         price: Any, source: Any, fill_time_ms: Any,
+                         observed_start_ms: Any, observed_end_ms: Any,
+                         price_basis: Any = None,
+                         settlement_asset: str = SETTLEMENT_ASSET,
+                         now_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Evidência de conversão de UMA comissão. Validação pura, com Decimal.
+
+    Devolve `{"ok": False, "reason_code": ...}` quando algo essencial falta ou é
+    ilegítimo (bool/NaN/inf/negativo, instante no futuro, janela incoerente,
+    fonte desconhecida, ativo igual ao de liquidação). A qualidade é derivada da
+    FONTE — ninguém declara CONFIRMED para um preço de mercado.
+    """
+    agora_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    asset = str(fee_asset or "").strip().upper()
+    liquidacao = str(settlement_asset or "").strip().upper()
+    fonte = str(source or "").strip().upper()
+    if not account_scope or not exchange or not fill_key:
+        return {"ok": False, "reason_code": FEE_REASON_INVALID,
+                "detail": "identidade da conversão incompleta"}
+    if not asset or not liquidacao or asset == liquidacao:
+        return {"ok": False, "reason_code": FEE_REASON_INVALID,
+                "detail": "ativo da comissão igual ao de liquidação ou ausente"}
+    if fonte not in FEE_SOURCES:
+        return {"ok": False, "reason_code": FEE_BLOCKED_SOURCE,
+                "detail": f"fonte desconhecida: {fonte or 'ausente'}"}
+    quantidade = to_decimal(fee_qty, allow_negative=False)
+    valor = to_decimal(settlement_value, allow_negative=False)
+    preco = to_decimal(price, allow_negative=False)
+    if quantidade is None or valor is None or preco is None or preco <= 0:
+        return {"ok": False, "reason_code": FEE_REASON_INVALID,
+                "detail": "quantidade/valor/preço não finitos ou não positivos"}
+    instante = _ms(fill_time_ms)
+    inicio = _ms(observed_start_ms)
+    fim = _ms(observed_end_ms)
+    if instante is None or inicio is None or fim is None:
+        return {"ok": False, "reason_code": FEE_REASON_INVALID,
+                "detail": "carimbos do fill/janela ausentes ou inválidos"}
+    if inicio > fim or fim > agora_ms + 2_000 or instante > agora_ms + 2_000:
+        return {"ok": False, "reason_code": FEE_REASON_INVALID,
+                "detail": "janela/instante incoerentes ou no futuro"}
+    # Preço de mercado NUNCA é liquidação registrada.
+    qualidade = (FEE_QUALITY_CONFIRMED if fonte == FEE_SOURCE_BROKER
+                 else FEE_QUALITY_ESTIMATED)
+    evidencia = {
+        "contract_version": FEE_CONVERSION_CONTRACT,
+        "account_scope": str(account_scope), "exchange": str(exchange).lower(),
+        "fill_key": str(fill_key), "fee_asset": asset,
+        "fee_qty": _dstr(quantidade), "settlement_asset": liquidacao,
+        "settlement_value": _dstr(valor), "price": _dstr(preco),
+        "price_basis": (str(price_basis) if price_basis else None),
+        "fill_time_ms": instante, "source": fonte, "quality": qualidade,
+        "observed_start_ms": inicio, "observed_end_ms": fim,
+        "observed_at_ms": agora_ms,
+    }
+    evidencia["hash"] = fee_conversion_hash(evidencia)
+    if evidencia["hash"] is None:
+        return {"ok": False, "reason_code": FEE_REASON_INVALID,
+                "detail": "evidência não canonicalizável"}
+    evidencia["ok"] = True
+    return evidencia
+
+
+def fee_conversion_verdict(evidence: Any, *, fee_asset: Any, fee_qty: Any,
+                           fill_key: Any,
+                           settlement_asset: str = SETTLEMENT_ASSET
+                           ) -> Dict[str, Any]:
+    """A evidência armazenada ainda descreve ESTA comissão, e com que qualidade?
+
+    Hash recalculado, vínculo com o fill, ativo e quantidade conferidos. Dúvida
+    devolve `UNAVAILABLE` — nunca um valor aproveitado por descuido.
+    """
+    if not isinstance(evidence, dict):
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_MISSING}
+    if evidence.get("contract_version") != FEE_CONVERSION_CONTRACT:
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_INVALID}
+    esperado = evidence.get("hash")
+    if not isinstance(esperado, str) or fee_conversion_hash(evidence) != esperado:
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_CONFLICT}
+    if str(evidence.get("fill_key")) != str(fill_key):
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_CONFLICT}
+    if str(evidence.get("settlement_asset")) != str(settlement_asset).upper():
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_INVALID}
+    if str(evidence.get("fee_asset")) != str(fee_asset or "").strip().upper():
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_CONFLICT}
+    gravada = to_decimal(evidence.get("fee_qty"), allow_negative=False)
+    atual = to_decimal(fee_qty, allow_negative=False)
+    if gravada is None or atual is None or gravada != atual:
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_CONFLICT}
+    valor = to_decimal(evidence.get("settlement_value"), allow_negative=False)
+    if valor is None:
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_INVALID}
+    qualidade = str(evidence.get("quality") or "")
+    if qualidade == FEE_QUALITY_CONFIRMED and \
+            str(evidence.get("source")) != FEE_SOURCE_BROKER:
+        # CONFIRMED só existe com conversão registrada pela corretora.
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_INVALID}
+    if qualidade not in (FEE_QUALITY_CONFIRMED, FEE_QUALITY_ESTIMATED):
+        return {"quality": FEE_QUALITY_UNAVAILABLE,
+                "reason_code": FEE_REASON_INVALID}
+    return {"quality": qualidade, "reason_code": None,
+            "settlement_value": valor, "source": evidence.get("source")}
+
+
+def _fee_conversions_required(acc: Any) -> List[Dict[str, Any]]:
+    """Comissões em outro ativo que AINDA precisam de evidência, por fill.
+
+    Derivado dos fills já atribuídos (não dos totais) para que o coletor saiba
+    ativo, quantidade e instante de cada comissão.
+    """
+    if not isinstance(acc, dict):
+        return []
+    liquidacao = str(acc.get("settlement_asset") or SETTLEMENT_ASSET)
+    saida: List[Dict[str, Any]] = []
+    for chave, fill in sorted((acc.get("fills") or {}).items()):
+        if not isinstance(fill, dict):
+            continue
+        ativo = fill.get("commission_asset")
+        comissao = to_decimal(fill.get("commission"), allow_negative=False)
+        if not ativo or comissao is None or ativo == liquidacao:
+            continue
+        saida.append({"fill_key": chave, "fee_asset": ativo,
+                      "fee_qty": comissao, "time": fill.get("time"),
+                      # `exec_id` é o `tradeId` da corretora; nunca derivado de
+                      # um parse do `fill_key`.
+                      "exec_id": fill.get("exec_id")})
+    return saida
+
+
+def resolve_fee_conversions(required: Sequence[Dict[str, Any]],
+                            stored: Any, *,
+                            settlement_asset: str = SETTLEMENT_ASSET
+                            ) -> Dict[str, Any]:
+    """Todas as comissões em outro ativo estão CONFIRMADAS por fill?
+
+    `resolved=True` só quando CADA fill exigido tem evidência CONFIRMED válida.
+    ESTIMATED não vira dinheiro; ausência jamais vira zero.
+    """
+    if not required:
+        return {"resolved": True, "state": FEE_CONVERSION_NOT_REQUIRED,
+                "reason_code": None, "converted_total": Decimal("0"),
+                "confirmed_keys": []}
+    guardadas = stored if isinstance(stored, dict) else {}
+    total = Decimal("0")
+    confirmados: List[str] = []
+    motivos: List[str] = []
+    for item in required:
+        chave = str(item.get("fill_key"))
+        veredito = fee_conversion_verdict(
+            guardadas.get(chave), fee_asset=item.get("fee_asset"),
+            fee_qty=item.get("fee_qty"), fill_key=chave,
+            settlement_asset=settlement_asset)
+        if veredito["quality"] == FEE_QUALITY_CONFIRMED:
+            total += veredito["settlement_value"]
+            confirmados.append(chave)
+        elif veredito["quality"] == FEE_QUALITY_ESTIMATED:
+            motivos.append(FEE_REASON_ESTIMATED)
+        else:
+            motivos.append(str(veredito.get("reason_code") or FEE_REASON_MISSING))
+    if len(confirmados) == len(required):
+        return {"resolved": True, "state": FEE_CONVERSION_RESOLVED,
+                "reason_code": None, "converted_total": total,
+                "confirmed_keys": sorted(confirmados)}
+    # Motivo DOMINANTE, estável: conflito e invalidez vêm antes de ausência.
+    prioridade = (FEE_REASON_CONFLICT, FEE_REASON_INVALID, FEE_REASON_ESTIMATED,
+                  FEE_BLOCKED_SOURCE, FEE_REASON_MISSING)
+    motivo = next((m for m in prioridade if m in motivos), FEE_REASON_MISSING)
+    return {"resolved": False, "state": FEE_QUALITY_UNAVAILABLE,
+            "reason_code": motivo, "converted_total": Decimal("0"),
+            "confirmed_keys": sorted(confirmados)}
 
 
 def _fee_of(fills: Sequence[Dict[str, Any]], asset: str) -> Optional[Decimal]:
@@ -563,6 +850,8 @@ def empty_accounting(*, identity: Optional[Dict[str, Any]] = None,
         "orders": {},
         "fills": {},
         "funding": {},
+        #: Evidência de conversão de comissão em outro ativo, por `fill_key`.
+        "fee_conversions": {},
         "funding_state": FUNDING_PENDING,
         "coverage": {},
         "totals": {},
@@ -589,6 +878,7 @@ def merge_accounting(previous: Any, *, identity: Optional[Dict[str, Any]] = None
                      fills: Sequence[Dict[str, Any]] = (),
                      funding: Sequence[Dict[str, Any]] = (),
                      orders: Sequence[Dict[str, Any]] = (),
+                     fee_conversions: Sequence[Dict[str, Any]] = (),
                      now: Optional[datetime] = None) -> Dict[str, Any]:
     """Funde eventos novos no acumulado. IDEMPOTENTE e sem regressão.
 
@@ -603,6 +893,7 @@ def merge_accounting(previous: Any, *, identity: Optional[Dict[str, Any]] = None
     acc.setdefault("fills", {})
     acc.setdefault("funding", {})
     acc.setdefault("orders", {})
+    acc.setdefault("fee_conversions", {})
     acc.setdefault("conflicts", [])
     conflicts: List[Dict[str, Any]] = list(acc.get("conflicts") or [])
     if identity:
@@ -669,6 +960,26 @@ def merge_accounting(previous: Any, *, identity: Optional[Dict[str, Any]] = None
         stored_orders[oid] = {**old, **{k: v for k, v in order.items() if v is not None}}
     acc["orders"] = stored_orders
 
+    stored_fees: Dict[str, Any] = dict(acc["fee_conversions"])
+    for evidencia in fee_conversions or ():
+        if not isinstance(evidencia, dict) or evidencia.get("ok") is not True:
+            continue
+        chave = evidencia.get("fill_key")
+        if not chave:
+            continue
+        limpa = {k: v for k, v in evidencia.items() if k != "ok"}
+        anterior = stored_fees.get(str(chave))
+        if anterior is not None:
+            # Mesma evidência reaparecendo é no-op; conteúdo MATERIALMENTE
+            # divergente vira CONFLICT e PRESERVA a original.
+            if str(anterior.get("hash") or "") == str(limpa.get("hash") or ""):
+                continue
+            conflicts.append({"kind": "FEE_CONVERSION", "key": str(chave),
+                              "fields": ["hash"]})
+            continue
+        stored_fees[str(chave)] = limpa
+    acc["fee_conversions"] = stored_fees
+
     acc["conflicts"] = [c for i, c in enumerate(conflicts) if c not in conflicts[:i]]
     acc["updated_at"] = (now or datetime.now(timezone.utc)).isoformat()
     return acc
@@ -713,7 +1024,8 @@ def finalize_accounting(acc: Dict[str, Any], *,
     funding_state = (FUNDING_CONFIRMED if funding_window_complete
                      else FUNDING_PENDING)
     totals = compute_totals(attribution["entry"], attribution["exit"],
-                            funding_items, funding_state=funding_state)
+                            funding_items, funding_state=funding_state,
+                            fee_conversions=out.get("fee_conversions"))
 
     entry_qty = to_decimal(totals.get("entry_qty_executed")) or Decimal("0")
     exit_qty = to_decimal(totals.get("exit_qty_executed")) or Decimal("0")
@@ -784,7 +1096,8 @@ def finalize_accounting(acc: Dict[str, Any], *,
         out["funding_state"] = FUNDING_PENDING
         out["coverage"]["funding_window_complete"] = False
         out["totals"] = compute_totals(attribution["entry"], attribution["exit"],
-                                       funding_items, funding_state=FUNDING_PENDING)
+                                       funding_items, funding_state=FUNDING_PENDING,
+                                       fee_conversions=out.get("fee_conversions"))
     out["provisional"] = state not in (STATE_CONFIRMED,)
     out["updated_at"] = (now or datetime.now(timezone.utc)).isoformat()
     return out
@@ -1001,6 +1314,103 @@ async def _collect_funding(client: Any, symbol: str, start_ms: int, end_ms: int,
     return rows, True, None
 
 
+#: Teto de comissões em outro ativo resolvidas por operação (lote limitado).
+MAX_FEE_CONVERSIONS_PER_TRADE = 8
+
+
+async def collect_broker_fee_conversions(
+        client: Any, symbol: str, required: Sequence[Dict[str, Any]],
+        *, identity: Dict[str, Any], start_ms: int, end_ms: int,
+        budget: List[int], now_ms: Optional[int] = None,
+        settlement_asset: str = SETTLEMENT_ASSET
+) -> Tuple[List[Dict[str, Any]], bool, Optional[str]]:
+    """Conversão REGISTRADA pela corretora, por fill, via ledger de COMMISSION.
+
+    UMA varredura paginada da janela cobre todos os fills (sem N+1) e reaproveita
+    o cliente de leitura existente — nenhum SDK novo. Uma linha `COMMISSION` na
+    moeda de LIQUIDAÇÃO amarrada ao MESMO `tradeId` do fill é a conversão que a
+    corretora efetivamente registrou; sem ela, o fill fica
+    `BLOCKED_SOURCE_UNAVAILABLE` e `net_trade` permanece desconhecido. Preço de
+    mercado não entra aqui: este coletor não estima.
+    """
+    pendentes = list(required or ())[:MAX_FEE_CONVERSIONS_PER_TRADE]
+    if not pendentes:
+        return [], True, None
+    getter = getattr(client, "get_income", None)
+    if getter is None:
+        return [], False, "INCOME_ENDPOINT_UNAVAILABLE"
+    por_trade: Dict[str, Dict[str, Any]] = {}
+    for win_start, win_end in plan_windows(start_ms, end_ms):
+        cursor = win_start
+        while cursor <= win_end:
+            if budget[0] <= 0:
+                return [], False, "CALL_BUDGET_EXHAUSTED"
+            budget[0] -= 1
+            res = await getter(symbol, income_type="COMMISSION",
+                               start_time=cursor, end_time=win_end,
+                               limit=INCOME_PAGE_LIMIT)
+            if not res.get("ok"):
+                return [], False, str(res.get("error") or res.get("msg")
+                                      or "INCOME_ERROR")
+            page = res.get("income")
+            if not isinstance(page, list) or any(not isinstance(p, dict) for p in page):
+                return [], False, "INVALID_INCOME_PAGE"
+            for linha in page:
+                trade_id = _id_str(linha.get("tradeId")
+                                   if linha.get("tradeId") is not None
+                                   else linha.get("trade_id"))
+                ativo = str(linha.get("asset") or "").strip().upper()
+                if not trade_id or ativo != settlement_asset:
+                    continue
+                valor = to_decimal(linha.get("income"))
+                if valor is None:
+                    continue
+                # COMMISSION vem NEGATIVA no ledger (custo). O contrato guarda
+                # o módulo e o sinal é aplicado pela subtração em `net_trade`.
+                anterior = por_trade.get(trade_id)
+                if anterior is not None and anterior["valor"] != abs(valor):
+                    return [], False, "COMMISSION_LEDGER_DIVERGENT"
+                por_trade[trade_id] = {"valor": abs(valor),
+                                       "time": _ms(linha.get("time"))}
+            if len(page) < int(res.get("limit") or INCOME_PAGE_LIMIT):
+                break
+            tempos = [t for t in (_ms(p.get("time")) for p in page) if t is not None]
+            if not tempos:
+                return [], False, "INCOME_PAGE_WITHOUT_TIME"
+            proximo = max(tempos)
+            if proximo <= cursor:
+                return [], False, "INCOME_PAGE_SAME_TIMESTAMP"
+            cursor = proximo
+    evidencias: List[Dict[str, Any]] = []
+    faltando = 0
+    for item in pendentes:
+        chave = str(item.get("fill_key") or "")
+        exec_id = _id_str(item.get("exec_id"))
+        registro = por_trade.get(exec_id) if exec_id else None
+        quantidade = to_decimal(item.get("fee_qty"), allow_negative=False)
+        instante = _ms(item.get("time"))
+        if registro is None or quantidade is None or quantidade <= 0 \
+                or instante is None:
+            faltando += 1
+            continue
+        evidencia = build_fee_conversion(
+            account_scope=identity.get("account_scope"),
+            exchange=identity.get("exchange") or "binance",
+            fill_key=chave, fee_asset=item.get("fee_asset"),
+            fee_qty=quantidade, settlement_value=registro["valor"],
+            price=(registro["valor"] / quantidade),
+            price_basis="COMMISSION_LEDGER_SETTLEMENT_VALUE",
+            source=FEE_SOURCE_BROKER, fill_time_ms=instante,
+            observed_start_ms=start_ms, observed_end_ms=end_ms,
+            settlement_asset=settlement_asset, now_ms=now_ms)
+        if evidencia.get("ok") is not True:
+            faltando += 1
+            continue
+        evidencias.append(evidencia)
+    completo = faltando == 0
+    return evidencias, completo, (None if completo else FEE_BLOCKED_SOURCE)
+
+
 class ReadBudget:
     """One shared deadline/request budget for the whole existing manager batch."""
     def __init__(self, seconds=2.0, calls=8):
@@ -1190,6 +1600,31 @@ async def collect_trade_accounting(trade_view: Dict[str, Any], *,
     acc = finalize_accounting(acc, entry_order_ids=[entry_id] if entry_id else [],
                               exit_order_ids=exit_ids, fills_window_complete=fills_complete,
                               position_flat=flat, planned_stop=trade_view.get("planned_stop"), now=ts_now)
+    # ── Comissão paga em OUTRO ativo: resolve a conversão REGISTRADA pela
+    #    corretora, em lote limitado, com o MESMO orçamento de chamadas e fora
+    #    de qualquer transação. Sem registro ⇒ o fill continua bloqueando o
+    #    `net_trade` (nada é estimado aqui).
+    fee_error = None
+    exigidas = (acc.get("totals") or {}).get("fee_conversion_required") or []
+    pendentes_conv = [item for item in _fee_conversions_required(acc)
+                      if str(item["fill_key"]) not in (acc.get("fee_conversions") or {})]
+    if exigidas and pendentes_conv:
+        try:
+            evidencias, _completo, fee_error = await collect_broker_fee_conversions(
+                client, identity["symbol"], pendentes_conv, identity=identity,
+                start_ms=start_ms, end_ms=end_ms, budget=local_budget,
+                now_ms=_ms(ts_now))
+        except Exception as exc:  # noqa: BLE001 — dúvida mantém o bloqueio
+            evidencias, fee_error = [], type(exc).__name__
+        if evidencias:
+            acc = merge_accounting(acc, fee_conversions=evidencias, now=ts_now)
+            acc = finalize_accounting(
+                acc, entry_order_ids=[entry_id] if entry_id else [],
+                exit_order_ids=exit_ids, fills_window_complete=fills_complete,
+                position_flat=flat, planned_stop=trade_view.get("planned_stop"),
+                now=ts_now)
+        if fee_error:
+            errors.append(fee_error)
     funding_error = None
     funding_proof = previous.get("funding_proof") or {}
     exposure_fills = [f for f in fills if f["order_id"] == entry_id or f["order_id"] in exit_ids]
@@ -1295,7 +1730,12 @@ def merge_observation(current, incoming, *, view):
     merged = merge_accounting(current, identity=identity,
         fills=list((incoming.get("fills") or {}).values()),
         funding=list((incoming.get("funding") or {}).values()),
-        orders=list((incoming.get("orders") or {}).values()))
+        orders=list((incoming.get("orders") or {}).values()),
+        # A evidência de conversão de comissão viaja pelo MESMO merge com
+        # bloqueio de linha: ela é prova, não um campo de apresentação.
+        fee_conversions=[{**e, "ok": True} for e in
+                         (incoming.get("fee_conversions") or {}).values()
+                         if isinstance(e, dict)])
     for conflict in incoming.get("conflicts") or []:
         if conflict not in merged["conflicts"]:
             merged["conflicts"].append(conflict)

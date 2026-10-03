@@ -2552,6 +2552,52 @@ limitações e runbook em `docs/FECHAMENTO_UNICO_MANUAL_BOT_61920156.md`.
   exchange continua (mudança feita direto na corretora não incrementa época
   alguma).
 
+## Lote 01 — operacional e financeiro (03/10/2026, base `7d6dbe15`)
+
+Itens 1+2 do índice de quatro lotes. Implementado no worktree autorizado
+`blissful-sinoussi-0511a5`; integração em main é etapa separada. Contrato e mapa
+completo em `docs/FECHAMENTO_FINAL_01_OPERACIONAL_FINANCEIRO.md`; retomada em
+`docs/FECHAMENTO_FINAL_01_CHECKPOINT.md`.
+
+- **Comissão em OUTRO ativo (único defeito com correção de código).** ANTES:
+  `compute_totals` bloqueava com `FEE_ASSET_CONVERSION_UNAVAILABLE` e não havia
+  caminho verificável — a linha ficava fora de `accounting_total` para sempre.
+  DEPOIS: contrato `R05E_FEE_CONVERSION_V1` versionado POR FILL (conta/exchange,
+  `fill_key`, ativo/quantidade, liquidação, instante do fill, fonte, valor/preço
+  documentado, janela observada, qualidade e hash). Qualidade DERIVADA da fonte:
+  conversão registrada pela corretora ⇒ `CONFIRMED`; preço histórico de mercado ⇒
+  no máximo `ESTIMATED` (preço atual não é histórico; nada de USD=USDT=USDC).
+  `net_trade` só fica conhecido com TODAS as comissões exigidas CONFIRMED; zero
+  registrado é válido e ausência nunca vira zero. Evidência persiste no JSONB
+  existente por `fill_key`, com merge idempotente sob bloqueio de linha e
+  `CONFLICT` preservando a original. Coletor faz UMA varredura paginada do ledger
+  de `COMMISSION` (sem N+1, cliente existente, orçamento de chamadas, I/O fora da
+  transação) e devolve `BLOCKED_SOURCE_UNAVAILABLE` quando a corretora não
+  registrou — nenhum número é fabricado. Resolvida a conversão,
+  `fee_assets_unconverted` esvazia e a linha entra em `accounting_total`.
+- **Funding, total e admissão: auditados e PROVADOS, sem reescrita.** Paginação
+  completa com motivos explícitos, dedupe por `FUNDING_FEE:tranId`, janela de
+  exposição dos fills atribuídos, exigência de exposição exclusiva, legado
+  `LEGACY_UNVERIFIED`; total = `net_trade` + funding confirmado uma vez;
+  `_ADMISSION_SNAPSHOT_SQL` já usa UMA instrução com `statement_timestamp()`
+  depois da advisory lock; `_apply_source_to_window` não tem fallback silencioso.
+- **Cutover/rollback preparados, NÃO ativados.** `R05_FINANCIAL_TOTAL_SOURCE` e
+  `R05_FINANCIAL_BREAKER_ENABLED` inalterados.
+- **Schema:** nenhuma migração (chave nova dentro do JSONB já existente).
+- **Testes:** suíte completa **2.527 executados, 2.525 aprovados, 2 skips R05C**
+  (fixture privada ausente — declarados). Novos: `tests/test_lote01_fee_conversion.py`
+  (27, 2×) e `tests/pg_integration_lote01_financeiro.py` (**13** verificações, 2×:
+  comissão em outro ativo pelo ciclo real de persistência, total positivo com
+  funding confirmado — entrada + duas parciais + runner, duplicatas que não
+  dobram, restart idempotente, CONFLICT, transferência reserva→posição,
+  concorrência que não gasta a mesma capacidade duas vezes e fechamento entre
+  parcelas). Reexecutados: R05C PG (`run_pg_r05c.sh`), R05-relógio 10 (espera
+  real pela lock em `pg_locks`), margem 46, manual-boot 46. `py_compile` e
+  `git diff --check` aprovados; nenhum TS/TSX alterado.
+- **Pendências reais declaradas:** `WAITING_SOURCE` para comissão sem registro da
+  corretora e `WAITING_OPERATIONAL_OBSERVATION` para observar uma entrada real —
+  nenhum dos dois significa financeiro operacionalmente consolidado.
+
 ## Correção integrada manual/BOT (02/10/2026, baseline `001a6685`)
 
 Quatro defeitos reproduzidos na revisão de `001a6685`, com RED medido ANTES na
