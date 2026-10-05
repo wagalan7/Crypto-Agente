@@ -6374,8 +6374,38 @@ def verify_study_identity(study: Any, *, candidate_config: Any, fingerprint: Any
         divergentes.append("population")
     if str(contrato.get("study_kind")) != "PRE_SELECTION":
         divergentes.append("study_kind")
-    if str(contrato.get("comparison_scope") or "") != "MANAGEMENT_ONLY":
-        divergentes.append("comparison_scope")
+    # ── Escopo da comparação: FECHADO e versionado. MANAGEMENT_ONLY continua
+    #    exatamente como antes; SELECTION_ONLY exige contrato V2 com manifesto
+    #    autorizado e motores de seleção, e o envelope do catálogo tem de ser do
+    #    MESMO tipo. Escopo não implementado é recusado, nunca "parecido".
+    escopo = str(contrato.get("comparison_scope") or "")
+    if escopo not in r12.IMPLEMENTED_COMPARISON_SCOPES:
+        return {"ok": False, "reason_code": r12.SCOPE_NOT_IMPLEMENTED,
+                "diverged": ["comparison_scope"], "detail": escopo}
+    versoes = r12.CONTRACT_VERSION_BY_SCOPE[escopo]
+    if str(contrato.get("contract_version") or "") not in versoes:
+        return {"ok": False, "reason_code": r12.SCOPE_CONTRACT_MISMATCH,
+                "diverged": ["contract_version"],
+                "detail": f"{escopo} exige {list(versoes)}"}
+    if escopo != str(envelope.get("comparison_scope") or ""):
+        return {"ok": False, "reason_code": r12.SCOPE_CONTRACT_MISMATCH,
+                "diverged": ["candidate_config"],
+                "detail": "envelope do catálogo é de outro escopo"}
+    if escopo == r12.SCOPE_SELECTION_ONLY:
+        from services import research_manifest_service as rm
+        selecao = contrato.get("selection_config")
+        verdict_sel = rm.validate_selection_config(selecao)
+        if not verdict_sel["ok"]:
+            return {"ok": False, "reason_code": verdict_sel["reason_code"],
+                    "diverged": ["selection_config"],
+                    "detail": verdict_sel.get("detail")}
+        if canonical_hash(verdict_sel["config"]) != \
+                canonical_hash(envelope.get("selection_config")):
+            return {"ok": False, "reason_code": STUDY_MISMATCH,
+                    "diverged": ["selection_config"]}
+        if not str(contrato.get("manifest_hash") or "").strip():
+            return {"ok": False, "reason_code": r12.SCOPE_CONTRACT_MISMATCH,
+                    "diverged": ["manifest_hash"]}
     if not contrato.get("costs_config"):
         divergentes.append("costs_config")
     if not contrato.get("bundle_hash"):

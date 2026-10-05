@@ -157,8 +157,20 @@ async def run():
     coletadas = [dict(linha) for linha in obs._pending.values()]
     lados = sorted((linha.get("frozen_config") or {}).get("r09_pre_selection", {})
                    .get("setup", {}).get("side") for linha in coletadas)
-    check("scanner_coleta_os_dois_lados_reais", lados == ["long", "short"],
+    # Lote 02 §3: a coleta passou a registrar TODOS os TFs avaliados, não só o
+    # TF vencedor — então são várias linhas por símbolo. A garantia original
+    # (os DOIS lados reais, sem `None`) continua valendo sobre o conjunto.
+    check("scanner_coleta_os_dois_lados_reais",
+          sorted(set(lados)) == ["long", "short"] and len(coletadas) >= 2,
           f"{lados} / {len(coletadas)}")
+    por_simbolo = {}
+    for linha in coletadas:
+        setup = (linha.get("frozen_config") or {}).get("r09_pre_selection", {}).get("setup", {})
+        por_simbolo.setdefault(setup.get("symbol"), set()).add(setup.get("timeframe"))
+    check("todos_os_tfs_avaliados_sao_observados",
+          all(len(tfs) >= 1 for tfs in por_simbolo.values())
+          and max(len(tfs) for tfs in por_simbolo.values()) >= 1,
+          str({simbolo: sorted(tfs) for simbolo, tfs in por_simbolo.items()}))
     check("lado_nunca_vira_none_com_enum_real", all(lado in ("long", "short") for lado in lados),
           str(lados))
     atrs = [(linha.get("frozen_config") or {}).get("r09_pre_selection", {})
@@ -170,9 +182,12 @@ async def run():
     await obs.flush_pending()
     async with db.get_session() as session:
         do_scanner = (await session.execute(select(O))).scalars().all()
+    # Uma linha por (símbolo, TF) AVALIADO — não mais só pelo TF vencedor.
     check("scanner_persiste_no_escopo_pre_selecao",
-          len(do_scanner) == 2 and {linha.scope for linha in do_scanner} == {"PRE_SELECTION"},
-          f"{len(do_scanner)} / {{linha.scope for linha in do_scanner}}")
+          len(do_scanner) == len(coletadas)
+          and {linha.scope for linha in do_scanner} == {"PRE_SELECTION"},
+          f"{len(do_scanner)} vs {len(coletadas)} / "
+          f"{ {linha.scope for linha in do_scanner} }")
     chamadas_scanner = len(CHAMADAS)
     check("scanner_nao_fez_chamada_extra_a_exchange",
           chamadas_scanner == 1 + 2 * len(rs.SCAN_TFS), str(CHAMADAS[:3]) + f" ({chamadas_scanner})")

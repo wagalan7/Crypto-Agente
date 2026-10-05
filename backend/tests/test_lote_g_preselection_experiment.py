@@ -368,12 +368,15 @@ class RelatorioEFronteiras(unittest.TestCase):
                 importados.add(node.module.split(".")[0])
                 if node.module.split(".")[0] == "services":
                     de_servicos.update(alias.name for alias in node.names)
-        # `services` entra por UM motivo só: validar manifesto reconstruindo o
-        # MOTOR offline (ReplayConfig/CostConfig) em vez de duplicar schema.
+        # `services` entra por DOIS motivos, ambos de CONTRATO e ambos puros:
+        # validar manifesto reconstruindo o MOTOR offline (ReplayConfig/
+        # CostConfig) e validar o bloco de SELEÇÃO pela MESMA função do
+        # manifesto autorizado — em vez de duplicar schema em cada consumidor.
         self.assertEqual(importados - {"__future__"},
                          {"dataclasses", "datetime", "hashlib", "json", "math", "os",
                           "services", "typing"})
-        self.assertEqual(de_servicos, {"offline_replay_service"})
+        self.assertEqual(de_servicos, {"offline_replay_service",
+                                       "research_manifest_service"})
         # Pureza preservada: nada de banco, exchange, rede ou execução.
         for proibido in ("db", "httpx", "requests", "aiohttp", "binance",
                          "order_service", "trade_manager_service"):

@@ -190,10 +190,14 @@ class CandidateRegistration:
         if not isinstance(self.candidate_id, str) or not self.candidate_id.strip() or len(self.candidate_id) > 128:
             raise ValueError("candidate_id inválido")
         _integer(self.registered_at_ms, "registered_at_ms", 0)
-        if self.kind not in ("STRUCTURAL_CONF_ONLY", "MANAGEMENT_ONLY"):
+        if self.kind not in ("STRUCTURAL_CONF_ONLY", "MANAGEMENT_ONLY",
+                            "SELECTION_ONLY"):
             raise ValueError("tipo de candidato não registrado")
-        if self.kind == "MANAGEMENT_ONLY" and not isinstance(self.replay_config, ReplayConfig):
-            raise ValueError("MANAGEMENT_ONLY exige replay_config explícita")
+        if self.kind in ("MANAGEMENT_ONLY", "SELECTION_ONLY") \
+                and not isinstance(self.replay_config, ReplayConfig):
+            # SELECTION_ONLY também exige a gestão explícita: ela é a gestão
+            # CONGELADA, idêntica dos dois lados — o que muda é a seleção.
+            raise ValueError(f"{self.kind} exige replay_config explícita")
         if self.kind == "STRUCTURAL_CONF_ONLY" and self.replay_config is not None:
             raise ValueError("ablação estrutural não possui regra econômica executável")
         if not isinstance(self.baseline_score_weights, tuple) or len(self.baseline_score_weights) != 3:

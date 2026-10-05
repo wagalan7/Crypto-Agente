@@ -378,11 +378,32 @@ def go_no_go(evidence: Mapping[str, Any], *,
 #: então adulterar baseline, candidata, custos, bundle, dataset, corte,
 #: população, escopo ou versões quebra a conferência.
 PRE_SELECTION_CONTRACT_VERSION = "R12_PRE_SELECTION_CONTRACT_V1"
+#: V2 acrescenta o manifesto AUTORIZADO (hash) e os motores de SELEÇÃO. O corpo
+#: V1 continua idêntico — estudo antigo mantém exatamente o mesmo hash.
+PRE_SELECTION_CONTRACT_V2 = "R12_PRE_SELECTION_CONTRACT_V2"
 PRE_SELECTION_CONTRACT_FIELDS = (
     "contract_version", "population", "study_kind", "policy_version",
     "universe_version", "comparison_scope", "baseline_config", "candidate_config",
     "costs_config", "bundle_hash", "dataset_fingerprint", "cutoff_ms",
 )
+PRE_SELECTION_CONTRACT_V2_FIELDS = PRE_SELECTION_CONTRACT_FIELDS + (
+    "manifest_hash", "selection_config")
+CONTRACT_FIELDS_BY_VERSION = {
+    PRE_SELECTION_CONTRACT_VERSION: PRE_SELECTION_CONTRACT_FIELDS,
+    PRE_SELECTION_CONTRACT_V2: PRE_SELECTION_CONTRACT_V2_FIELDS,
+}
+#: Escopos de comparação com contrato fechado. Escopo fora daqui é RECUSADO —
+#: nunca tratado por fallback do escopo de gestão.
+SCOPE_MANAGEMENT_ONLY = "MANAGEMENT_ONLY"
+SCOPE_SELECTION_ONLY = "SELECTION_ONLY"
+IMPLEMENTED_COMPARISON_SCOPES = (SCOPE_MANAGEMENT_ONLY, SCOPE_SELECTION_ONLY)
+#: Cada escopo exige a sua versão mínima de contrato.
+CONTRACT_VERSION_BY_SCOPE = {
+    SCOPE_MANAGEMENT_ONLY: (PRE_SELECTION_CONTRACT_VERSION, PRE_SELECTION_CONTRACT_V2),
+    SCOPE_SELECTION_ONLY: (PRE_SELECTION_CONTRACT_V2,),
+}
+SCOPE_NOT_IMPLEMENTED = "COMPARISON_SCOPE_NOT_IMPLEMENTED"
+SCOPE_CONTRACT_MISMATCH = "COMPARISON_SCOPE_CONTRACT_MISMATCH"
 #: Schema FECHADO da configuração que governa o replay do laboratório. A regra
 #: legada de UM KNOB continua valendo para o POST_SELECTION; ela não descreve
 #: uma configuração de replay, então o tipo PRE_SELECTION valida a sua.
@@ -409,6 +430,9 @@ CONFIG_SCHEMA_INVALID = "PRE_SELECTION_CONFIG_SCHEMA_INVALID"
 #: (`SCORE_MIN` e afins) ou contrato ausente são recusados.
 PRE_SELECTION_ENVELOPE_FIELDS = ("experiment_type", "experiment_type_version",
                                  "replay_config", "contract_hash")
+#: Envelope do candidato de SELEÇÃO: a gestão congelada MAIS os motores.
+PRE_SELECTION_ENVELOPE_SELECTION_FIELDS = PRE_SELECTION_ENVELOPE_FIELDS + (
+    "selection_config",)
 ENVELOPE_INVALID = "PRE_SELECTION_ENVELOPE_INVALID"
 #: Campos DERIVADOS dos manifestos: vêm do motor, não da entrada.
 REPLAY_DERIVED_FIELDS = ("config_hash", "schema_version")
@@ -417,15 +441,28 @@ COSTS_INPUT_FIELDS = ("fee_bps_per_side", "slippage_bps_per_side", "funding_bps_
 
 
 def build_preselection_envelope(*, replay_config: Mapping[str, Any],
-                                contract_hash: str) -> Dict[str, Any]:
-    """Monta o envelope fechado do tipo. Único construtor — o catálogo usa este."""
+                                contract_hash: str,
+                                selection_config: Optional[Mapping[str, Any]] = None
+                                ) -> Dict[str, Any]:
+    """Monta o envelope fechado do tipo. Único construtor — o catálogo usa este.
+
+    Com `selection_config`, o envelope é de um candidato de SELEÇÃO: o catálogo
+    não pode validá-lo como candidato de gestão (e vice-versa).
+    """
     if not isinstance(replay_config, Mapping) or not replay_config:
         raise ValueError("replay_config: manifesto obrigatório")
     if not isinstance(contract_hash, str) or not contract_hash.strip():
         raise ValueError("contract_hash obrigatório")
-    return {TYPE_KEY: TYPE_PRE_SELECTION, TYPE_VERSION_KEY: TYPE_VERSION,
-            "replay_config": dict(replay_config),
-            "contract_hash": contract_hash.strip()}
+    envelope = {TYPE_KEY: TYPE_PRE_SELECTION, TYPE_VERSION_KEY: TYPE_VERSION,
+                "replay_config": dict(replay_config),
+                "contract_hash": contract_hash.strip()}
+    if selection_config is not None:
+        from services import research_manifest_service as rm
+        verdict = rm.validate_selection_config(selection_config)
+        if not verdict["ok"]:
+            raise ValueError(f"selection_config inválida: {verdict['detail']}")
+        envelope["selection_config"] = dict(verdict["config"])
+    return envelope
 
 
 def validate_replay_manifest(manifest: Any) -> Dict[str, Any]:
@@ -485,11 +522,16 @@ def validate_preselection_envelope(envelope: Any) -> Dict[str, Any]:
     if not isinstance(envelope, Mapping) or not envelope:
         return {"ok": False, "reason_code": ENVELOPE_INVALID,
                 "detail": "envelope ausente"}
-    extras = [chave for chave in envelope if chave not in PRE_SELECTION_ENVELOPE_FIELDS]
+    # Envelope de SELEÇÃO tem um campo a mais (os motores). O de gestão NÃO
+    # pode trazê-lo, e o de seleção não pode omiti-lo: são tipos distintos.
+    de_selecao = "selection_config" in envelope
+    permitidos = (PRE_SELECTION_ENVELOPE_SELECTION_FIELDS if de_selecao
+                  else PRE_SELECTION_ENVELOPE_FIELDS)
+    extras = [chave for chave in envelope if chave not in permitidos]
     if extras:
         return {"ok": False, "reason_code": ENVELOPE_INVALID,
                 "detail": f"campos fora do envelope: {sorted(extras)}"}
-    faltando = [chave for chave in PRE_SELECTION_ENVELOPE_FIELDS
+    faltando = [chave for chave in permitidos
                 if envelope.get(chave) in (None, "")]
     if faltando:
         return {"ok": False, "reason_code": ENVELOPE_INVALID,
@@ -508,8 +550,19 @@ def validate_preselection_envelope(envelope: Any) -> Dict[str, Any]:
     if not manifesto["ok"]:
         return {"ok": False, "reason_code": manifesto["reason_code"],
                 "detail": manifesto.get("detail")}
+    selecao = None
+    if de_selecao:
+        from services import research_manifest_service as rm
+        verdict = rm.validate_selection_config(envelope.get("selection_config"))
+        if not verdict["ok"]:
+            return {"ok": False, "reason_code": ENVELOPE_INVALID,
+                    "detail": verdict["detail"]}
+        selecao = verdict["config"]
     return {"ok": True, "reason_code": OK, "detail": None,
             "replay_config": manifesto["manifest"],
+            "selection_config": selecao,
+            "comparison_scope": (SCOPE_SELECTION_ONLY if de_selecao
+                                 else SCOPE_MANAGEMENT_ONLY),
             "contract_hash": envelope["contract_hash"].strip()}
 
 
@@ -558,14 +611,32 @@ def preselection_contract(*, population: str, study_kind: str, policy_version: s
                           candidate_config: Mapping[str, Any],
                           costs_config: Mapping[str, Any],
                           bundle_hash: Optional[str],
-                          dataset_fingerprint: str, cutoff_ms: int) -> Dict[str, Any]:
-    """Contrato CONGELADO antes dos resultados, com hash sobre o corpo inteiro."""
+                          dataset_fingerprint: str, cutoff_ms: int,
+                          manifest_hash: Optional[str] = None,
+                          selection_config: Optional[Mapping[str, Any]] = None
+                          ) -> Dict[str, Any]:
+    """Contrato CONGELADO antes dos resultados, com hash sobre o corpo inteiro.
+
+    Sem manifesto/seleção, o corpo é o V1 histórico (mesmo hash de sempre). Com
+    qualquer um deles, o contrato nasce V2 — e o escopo de SELEÇÃO exige os dois.
+    """
+    escopo = str(comparison_scope)
+    if escopo not in IMPLEMENTED_COMPARISON_SCOPES:
+        raise ValueError(f"{SCOPE_NOT_IMPLEMENTED}: {escopo}")
+    v2 = manifest_hash is not None or selection_config is not None
+    if escopo == SCOPE_SELECTION_ONLY and not (manifest_hash and selection_config):
+        raise ValueError(f"{SCOPE_CONTRACT_MISMATCH}: SELECTION_ONLY exige "
+                         "manifest_hash e selection_config")
+    if escopo == SCOPE_MANAGEMENT_ONLY and selection_config is not None:
+        raise ValueError(f"{SCOPE_CONTRACT_MISMATCH}: MANAGEMENT_ONLY não "
+                         "declara motores de seleção")
     corpo = {
-        "contract_version": PRE_SELECTION_CONTRACT_VERSION,
+        "contract_version": (PRE_SELECTION_CONTRACT_V2 if v2
+                             else PRE_SELECTION_CONTRACT_VERSION),
         "population": str(population), "study_kind": str(study_kind),
         "policy_version": str(policy_version),
         "universe_version": str(universe_version),
-        "comparison_scope": str(comparison_scope),
+        "comparison_scope": escopo,
         "baseline_config": dict(baseline_config or {}),
         "candidate_config": dict(candidate_config or {}),
         "costs_config": dict(costs_config or {}),
@@ -573,17 +644,27 @@ def preselection_contract(*, population: str, study_kind: str, policy_version: s
         "dataset_fingerprint": str(dataset_fingerprint),
         "cutoff_ms": int(cutoff_ms),
     }
+    if v2:
+        corpo["manifest_hash"] = (str(manifest_hash) if manifest_hash else None)
+        corpo["selection_config"] = (dict(selection_config)
+                                     if selection_config else None)
     return {**corpo, "contract_hash": _hash(corpo)}
 
 
 def contract_hash_of(contract: Any) -> Optional[str]:
-    """Recalcula o hash do corpo do contrato (sem o próprio hash)."""
+    """Recalcula o hash do corpo do contrato (sem o próprio hash).
+
+    O conjunto de campos é escolhido pela VERSÃO declarada: V1 mantém o corpo
+    histórico byte a byte; V2 inclui `manifest_hash` e `selection_config`.
+    Versão desconhecida devolve `None` — e quem compara recusa.
+    """
     if not isinstance(contract, Mapping):
         return None
-    corpo = {campo: contract.get(campo) for campo in PRE_SELECTION_CONTRACT_FIELDS}
-    if corpo.get("contract_version") != PRE_SELECTION_CONTRACT_VERSION:
+    versao = contract.get("contract_version")
+    campos = CONTRACT_FIELDS_BY_VERSION.get(versao)
+    if campos is None:
         return None
-    return _hash(corpo)
+    return _hash({campo: contract.get(campo) for campo in campos})
 
 
 def study_payload(*, contract: Mapping[str, Any], evidence: Mapping[str, Any],

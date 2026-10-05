@@ -471,14 +471,39 @@ MIN_CALIBRATION_SAMPLE = 200
 
 
 def calibration_verdict(score_payload: Mapping[str, Any],
-                        calibration: Optional[V3Calibration] = None) -> Dict[str, Any]:
+                        calibration: Optional[V3Calibration] = None,
+                        *, artifact: Any = None, now_ms: Any = None
+                        ) -> Dict[str, Any]:
     """Probabilidade só existe com calibração V3 do MESMO fingerprint.
 
-    Sem ela: score técnico continua existindo, probabilidade não. Não há
-    fallback para p_global, bins ou tier da V2.
+    Com `artifact` (modelo R08E REAL), a probabilidade da faixa é DEVOLVIDA
+    quando a faixa é suportada. Sem modelo, o caminho antigo de METADADO
+    continua existindo — e continua sem probabilidade: metadado não é modelo
+    aprovado. Nunca há fallback para p_global, bins ou tier da V2.
     """
     unavailable = {"probability": None, "calibration_state": STATE_UNAVAILABLE,
                    "tier": None, "v2_fallback_used": False}
+    if artifact is not None:
+        from services import score_v3_calibration_service as calib
+        previsao = calib.predict(
+            artifact, score=score_payload.get("score"),
+            model_fingerprint=score_payload.get("model_fingerprint"),
+            population=score_payload.get("population"), now_ms=now_ms)
+        if not previsao.get("available"):
+            return {**unavailable, "reason_code": previsao.get("reason_code"),
+                    "model_state": previsao.get("state"),
+                    "model_contract": calib.CALIBRATION_CONTRACT}
+        return {"probability": previsao["probability"],
+                "calibration_state": "AVAILABLE",
+                "model_state": previsao["state"],
+                "model_contract": calib.CALIBRATION_CONTRACT,
+                "event": previsao["event"],
+                "event_definition": previsao["event_definition"],
+                "bin": previsao["bin"], "n": previsao["n"],
+                "interval": [previsao["wilson_low"], previsao["wilson_high"]],
+                "out_of_sample": previsao["out_of_sample"],
+                "provenance": previsao["provenance"],
+                "tier": None, "v2_fallback_used": False, "reason_code": OK}
     if calibration is None:
         return {**unavailable, "reason_code": CALIBRATION_ABSENT}
     if not isinstance(calibration, V3Calibration):
@@ -490,15 +515,40 @@ def calibration_verdict(score_payload: Mapping[str, Any],
         return {**unavailable, "reason_code": CALIBRATION_FINGERPRINT_MISMATCH}
     if calibration.sample_size < MIN_CALIBRATION_SAMPLE:
         return {**unavailable, "reason_code": CALIBRATION_SAMPLE_INSUFFICIENT}
-    # Existe calibração válida: a probabilidade em si é produzida pelo estudo
-    # que a construiu; este serviço apenas declara que ela está disponível.
+    # Metadado VÁLIDO, porém sem modelo: a interface declara disponibilidade do
+    # REGISTRO, não probabilidade — e `METADATA_ONLY` não é modelo aprovado.
     return {"probability": None, "calibration_state": "AVAILABLE",
+            "model_state": "METADATA_ONLY",
             "tier": None, "v2_fallback_used": False, "reason_code": OK}
 
 
-def net_ev(*, probability_out_of_sample: Any, rr_tp2: Any, cost_r: Any) -> Dict[str, Any]:
-    """EV líquido — filtro POSTERIOR, com probabilidade fora da amostra e custo
-    conhecido em múltiplos de R. Nunca deriva probabilidade do próprio score."""
+#: Fórmula binária (alvo ou −1R) só vale quando o EVENTO calibrado é o alvo da
+#: fórmula. P(TP1) × RR do TP2 não é expectativa de nada.
+EVENT_PAYOFF_MISMATCH = "EVENT_PAYOFF_MISMATCH"
+PAYOFF_BINARY_TP2 = "BINARY_TP2_OR_STOP"
+PAYOFF_PARTIAL_RUNNER = "PARTIAL_TP1_PLUS_RUNNER"
+
+
+def net_ev(*, probability_out_of_sample: Any, rr_tp2: Any, cost_r: Any,
+           event: Any = None, payoff_contract: str = PAYOFF_BINARY_TP2
+           ) -> Dict[str, Any]:
+    """EV líquido BINÁRIO — só quando evento e payoff correspondem de verdade.
+
+    A fórmula `p × RR − (1−p) − custo` descreve "acerta o alvo ou perde 1R".
+    Para gestão PARCIAL com runner (TP1 + trailing), a expectativa não é essa:
+    use `net_ev_from_payoff` com o payoff líquido OOS da gestão congelada. Se o
+    evento calibrado não for o do alvo binário, isto RECUSA em vez de
+    multiplicar P(TP1) pelo RR final.
+    """
+    if payoff_contract != PAYOFF_BINARY_TP2:
+        return {"available": False, "reason_code": EVENT_PAYOFF_MISMATCH,
+                "ev_r": None, "detail": f"payoff {payoff_contract} não é binário"}
+    if event is not None:
+        from services import score_v3_calibration_service as calib
+        if str(event) not in calib.BINARY_PAYOFF_EVENTS:
+            return {"available": False, "reason_code": EVENT_PAYOFF_MISMATCH,
+                    "ev_r": None,
+                    "detail": f"evento {event} não corresponde ao payoff binário"}
     if probability_out_of_sample is None:
         return {"available": False, "reason_code": PROBABILITY_UNAVAILABLE, "ev_r": None}
     if isinstance(probability_out_of_sample, bool) or not isinstance(probability_out_of_sample, (int, float)):
@@ -513,7 +563,39 @@ def net_ev(*, probability_out_of_sample: Any, rr_tp2: Any, cost_r: Any) -> Dict[
         numbers[name] = float(raw)
     ev = prob * numbers["rr_tp2"] - (1.0 - prob) * 1.0 - abs(numbers["cost_r"])
     return {"available": True, "reason_code": OK, "ev_r": ev,
+            "payoff_contract": payoff_contract, "event": event,
             "components": {"probability": prob, **numbers}}
+
+
+def net_ev_from_payoff(*, expected_payoff_r: Any, cost_r: Any,
+                       source: Any = None, sample_size: Any = None,
+                       payoff_contract: str = PAYOFF_PARTIAL_RUNNER
+                       ) -> Dict[str, Any]:
+    """EV líquido da GESTÃO CONGELADA, medido fora da amostra.
+
+    Para gestão parcial/runner a expectativa vem do payoff líquido OOS que o
+    replay dessa gestão produziu — não de `P(TP1) × RR`. Sem o payoff medido
+    (e sem a fonte dele), não há EV: ausência não vira zero.
+    """
+    if expected_payoff_r is None or source in (None, ""):
+        return {"available": False, "reason_code": PROBABILITY_UNAVAILABLE,
+                "ev_r": None, "detail": "payoff líquido OOS da gestão ausente"}
+    valores = {}
+    for nome, bruto in (("expected_payoff_r", expected_payoff_r), ("cost_r", cost_r)):
+        if bruto is None or isinstance(bruto, bool) or not isinstance(bruto, (int, float)) \
+                or not math.isfinite(float(bruto)):
+            return {"available": False, "reason_code": COSTS_UNKNOWN, "ev_r": None}
+        valores[nome] = float(bruto)
+    amostra = None if isinstance(sample_size, bool) else sample_size
+    if not isinstance(amostra, int) or amostra <= 0:
+        return {"available": False, "reason_code": OUT_OF_SAMPLE_REQUIRED,
+                "ev_r": None, "detail": "amostra OOS obrigatória"}
+    return {"available": True, "reason_code": OK,
+            "ev_r": valores["expected_payoff_r"] - abs(valores["cost_r"]),
+            "payoff_contract": payoff_contract,
+            "components": {**valores, "source": str(source),
+                           "oos_sample_size": amostra},
+            "derived_from_probability": False}
 
 
 def economic_verdict(score_payload: Mapping[str, Any],

@@ -320,8 +320,17 @@ class FronteiraEParidade(unittest.TestCase):
                 imported.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".")[0])
+        # `services` entra APENAS pelo contrato de calibração R08E (módulo puro:
+        # sem banco, rede ou exchange) — é ele que produz a probabilidade, em
+        # vez de o score derivar número de si mesmo.
         self.assertEqual(imported - {"__future__"},
-                         {"dataclasses", "hashlib", "json", "math", "os", "typing"})
+                         {"dataclasses", "hashlib", "json", "math", "os",
+                          "services", "typing"})
+        de_servicos = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "") == "services":
+                de_servicos.update(alias.name for alias in node.names)
+        self.assertEqual(de_servicos, {"score_v3_calibration_service"})
 
     def test_laboratorio_v2_do_r08a_permanece_intacto(self):
         from services import score_research_service as lab

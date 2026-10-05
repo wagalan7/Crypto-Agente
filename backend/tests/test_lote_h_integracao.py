@@ -303,10 +303,22 @@ class DefaultsPreservados(unittest.TestCase):
         self.assertEqual(resumo["state"], "LOCAL_RESEARCH_ONLY")
 
     def test_resumo_nao_promete_operacao(self):
+        """A evidência agora é DERIVADA (estado + qualidade + último instante),
+        mas continua sem prometer operação: coleta desligada é NOT_STARTED,
+        calibração sem artefato é NOT_STARTED e aprovação humana fica
+        BLOQUEADA enquanto não houver manifesto autorizado."""
         resumo = batch.lote_final_summary()
-        self.assertEqual(resumo["evidence"]["prospective_simulation"], "NOT_STARTED")
-        self.assertEqual(resumo["evidence"]["economic_validation"], "NOT_STARTED")
-        self.assertEqual(resumo["evidence"]["human_approval"], "NOT_REQUESTED")
+        evidencia = resumo["evidence"]
+        self.assertTrue(evidencia["derived"])
+        self.assertFalse(evidencia["expensive_work_in_get"])
+        self.assertEqual(evidencia["prospective_simulation"]["state"],
+                         batch.EVIDENCE_NOT_STARTED)
+        self.assertEqual(evidencia["economic_validation"]["state"],
+                         batch.EVIDENCE_NOT_STARTED)
+        self.assertEqual(evidencia["human_approval"]["state"],
+                         batch.EVIDENCE_BLOCKED)
+        self.assertFalse(evidencia["human_approval"]["real_study_allowed"])
+        self.assertEqual(evidencia["canary"]["state"], "NOT_PREPARED_FOR_APPLY")
         self.assertTrue(resumo["blockers"])
         self.assertTrue(resumo["next_step"])
 

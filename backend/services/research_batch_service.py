@@ -56,6 +56,113 @@ async def get_research_status(days: int = 30) -> dict:
 # ── Resumo do lote final (somente leitura, fail-soft por item) ──────────────
 LOTE_SCHEMA_VERSION = 1
 
+#: Estados da evidência. `ERROR` NÃO é `NOT_STARTED`: falha de leitura é falha,
+#: não ausência de trabalho. E nada aqui dispara replay/fitting dentro do GET —
+#: só lê o que já foi calculado e persistido/registrado.
+EVIDENCE_NOT_STARTED = "NOT_STARTED"
+EVIDENCE_OBSERVING = "OBSERVING"
+EVIDENCE_COLLECTED = "COLLECTED"
+EVIDENCE_FITTED = "FITTED"
+EVIDENCE_OOS_VALIDATED = "OOS_VALIDATED"
+EVIDENCE_ERROR = "ERROR"
+EVIDENCE_BLOCKED = "BLOCKED_MISSING_DECISION"
+
+
+def evidence_status(*, artifact=None, manifest=None) -> dict:
+    """Evidência DERIVADA do que existe de fato, com qualidade e último instante.
+
+    A simulação prospectiva vem da cobertura/coleta REGISTRADA pelo coletor; a
+    validação econômica, do estado do artefato de calibração (quando houver); a
+    aprovação humana, do manifesto autorizado. Leitura indisponível vira
+    `ERROR`, nunca `NOT_STARTED`.
+    """
+    prospectiva = {"state": EVIDENCE_ERROR, "quality": "UNKNOWN",
+                   "last_observed_at": None,
+                   "reason_code": "OBSERVATION_READ_UNAVAILABLE"}
+    try:
+        from services import preselection_observation_service as pre
+        cobertura = pre.coverage_snapshot()
+        ligada = pre.collection_enabled()
+        observados = int(cobertura.get("candidates_observed") or 0)
+        if observados > 0:
+            estado = EVIDENCE_COLLECTED
+        elif ligada:
+            estado = EVIDENCE_OBSERVING
+        else:
+            estado = EVIDENCE_NOT_STARTED
+        prospectiva = {
+            "state": estado,
+            "quality": ("PARTIAL" if cobertura.get("last_state") not in
+                        (None, pre.COVERAGE_COMPLETE) else
+                        ("OK" if observados else "EMPTY")),
+            "last_observed_at": cobertura.get("last_cycle_ts_ms"),
+            "collection_enabled": ligada,
+            "cycles_observed": int(cobertura.get("cycles") or 0),
+            "candidates_observed": observados,
+            "coverage_reasons": dict(cobertura.get("reasons") or {}),
+            "reason_code": None if observados else "NO_PROSPECTIVE_SAMPLE_YET",
+        }
+    except Exception:
+        pass
+
+    economica = {"state": EVIDENCE_NOT_STARTED, "quality": "UNKNOWN",
+                 "last_observed_at": None,
+                 "reason_code": "CALIBRATION_ARTIFACT_MISSING"}
+    try:
+        from services import score_v3_calibration_service as calib
+        if artifact is None:
+            economica["reason_code"] = calib.ARTIFACT_MISSING
+        else:
+            verdict = calib.verify_artifact(artifact)
+            economica = {
+                "state": (EVIDENCE_OOS_VALIDATED
+                          if verdict.get("state") == calib.STATE_OOS_VALIDATED
+                          else EVIDENCE_FITTED if verdict.get("ok")
+                          else EVIDENCE_ERROR),
+                "quality": "OOS" if verdict.get("state") == calib.STATE_OOS_VALIDATED
+                else ("IN_SAMPLE" if verdict.get("ok") else "UNKNOWN"),
+                "last_observed_at": ((artifact.get("generation") or {})
+                                     .get("generated_at_ms")
+                                     if isinstance(artifact, dict) else None),
+                "reason_code": verdict.get("reason_code"),
+                "economically_approved": False,
+            }
+    except Exception:
+        economica = {"state": EVIDENCE_ERROR, "quality": "UNKNOWN",
+                     "last_observed_at": None,
+                     "reason_code": "CALIBRATION_READ_UNAVAILABLE"}
+
+    humana = {"state": EVIDENCE_BLOCKED, "quality": "UNKNOWN",
+              "last_observed_at": None,
+              "reason_code": "AUTHORIZED_CANDIDATE_NOT_DECLARED"}
+    try:
+        from services import research_manifest_service as rm
+        autorizado = rm.authorized_comparison(manifest)
+        humana = {"state": (autorizado.get("state") if autorizado.get("available")
+                            else EVIDENCE_BLOCKED),
+                  "quality": ("APPROVED" if autorizado.get("real_study_allowed")
+                              else "TEST_ONLY" if autorizado.get("available")
+                              else "UNKNOWN"),
+                  "last_observed_at": ((autorizado.get("decision") or {})
+                                       .get("recorded_at_ms")),
+                  "reason_code": autorizado.get("reason_code"),
+                  "real_study_allowed": bool(autorizado.get("real_study_allowed"))}
+    except Exception:
+        humana = {"state": EVIDENCE_ERROR, "quality": "UNKNOWN",
+                  "last_observed_at": None,
+                  "reason_code": "MANIFEST_READ_UNAVAILABLE"}
+
+    return {
+        "derived": True, "computed_in_request": False,
+        "expensive_work_in_get": False,
+        "prospective_simulation": prospectiva,
+        "economic_validation": economica,
+        "human_approval": humana,
+        "canary": {"state": "NOT_PREPARED_FOR_APPLY", "quality": "UNKNOWN",
+                   "last_observed_at": None,
+                   "reason_code": "CANARY_REQUIRES_SPECIFIC_AUTHORIZATION"},
+    }
+
 
 def _safe(label: str, loader) -> dict:
     """Cada linha do resumo falha sozinha: um import quebrado não derruba o GET."""
@@ -144,10 +251,7 @@ def lote_final_summary() -> dict:
         "promotable": False,
         "live_approval": "UNAVAILABLE",
         "bot_operation_meaning_unchanged": True,
-        "evidence": {"prospective_simulation": "NOT_STARTED",
-                     "economic_validation": "NOT_STARTED",
-                     "human_approval": "NOT_REQUESTED",
-                     "canary": "NOT_PREPARED_FOR_APPLY"},
+        "evidence": evidence_status(),
         "blockers": ["Sem coleta prospectiva, não há evidência econômica.",
                      "Aprovação humana e canário continuam pendentes."],
         "next_step": ("Ligar a coleta pré-seleção em simulação e acumular a amostra "

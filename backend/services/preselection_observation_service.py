@@ -31,6 +31,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 SCOPE = "PRE_SELECTION"
 LEGACY_SCOPE = "POST_SELECTION"
 PRE_SCHEMA_VERSION = "r09.pre.v1"
+#: v2 ACRESCENTA, à v1, os blocos `features` (ponto-no-tempo) e `evaluation`
+#: (lista de TFs avaliados × TF escolhido). Linha sem esses blocos continua v1,
+#: byte a byte — produtor, exportador e verificador aceitam as DUAS versões.
+PRE_SCHEMA_VERSION_V2 = "r09.pre.v2"
+PRE_SCHEMA_VERSIONS = (PRE_SCHEMA_VERSION, PRE_SCHEMA_VERSION_V2)
 POLICY = "OBSERVATION_ONLY"
 MODE_ENV = "R09_PRESELECTION_MODE"
 MODE_INACTIVE = "inactive"
@@ -392,12 +397,63 @@ def budget_verdict(*, batch_records: Any, buffered_records: Any) -> Dict[str, An
             "max_batch": MAX_BATCH_RECORDS, "max_buffered": MAX_BUFFERED_RECORDS}
 
 
+#: Features PONTO-NO-TEMPO aceitas na captura (allowlist estrita). Só o que o
+#: scanner realmente tinha naquele instante; ausência fica `None` e nunca 0.
+FEATURE_NUMERIC_FIELDS = (
+    "atr", "adx", "rsi", "ema_fast", "ema_slow", "volume_ratio", "spread_pct",
+    "funding_pct", "rr_tp1", "rr_tp2", "entry_distance_atr", "score",
+    "score_before_learning", "selection_score",
+    # Features do Score V3, pelo MESMO nome/semântica. O scan champion calcula
+    # apenas `htf_alignment_ratio` (alinhamento MTF); estrutura e gatilho ele
+    # NÃO calcula, então ficam ausentes e derrubam a cobertura do modelo —
+    # jamais viram zero. A allowlist permite que um produtor que REALMENTE as
+    # tenha (pipeline de pesquisa) as registre; ela não as inventa.
+    "htf_alignment_ratio", "structure_quality", "level_distance_atr",
+    "trigger_body_ratio", "trigger_follow_through_atr",
+)
+FEATURE_LABEL_FIELDS = ("regime", "regime_source", "structure", "mtf_alignment",
+                        "tier", "tier_provisional", "quality", "data_source")
+#: Bloco de AVALIAÇÃO: quantos TFs do símbolo foram avaliados e qual venceu.
+#: Reavaliação é tentativa, não oportunidade nova — por isso o TF entra na
+#: identidade e o vencedor é um campo, não outra linha.
+EVALUATION_FIELDS = ("evaluated_timeframes", "selected_timeframe",
+                     "is_selected_timeframe", "evaluated_count")
+
+
+def _features_view(features: Any) -> Optional[Dict[str, Any]]:
+    """Normaliza o bloco de features: número finito, rótulo curto ou `None`."""
+    if not isinstance(features, Mapping) or not features:
+        return None
+    saida: Dict[str, Any] = {}
+    for campo in FEATURE_NUMERIC_FIELDS:
+        saida[campo] = _number(features.get(campo))
+    for campo in FEATURE_LABEL_FIELDS:
+        saida[campo] = _label(features.get(campo), 40)
+    return saida
+
+
+def _evaluation_view(evaluation: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(evaluation, Mapping) or not evaluation:
+        return None
+    tfs = evaluation.get("evaluated_timeframes")
+    lista = sorted({_label(item, 8) for item in tfs
+                    if _label(item, 8)}) if isinstance(tfs, (list, tuple)) else []
+    return {
+        "evaluated_timeframes": lista,
+        "selected_timeframe": _label(evaluation.get("selected_timeframe"), 8),
+        "is_selected_timeframe": bool(evaluation.get("is_selected_timeframe")),
+        "evaluated_count": len(lista),
+    }
+
+
 def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
                     setup: Mapping[str, Any], funnel: Mapping[str, Any],
                     availability: Mapping[str, Any],
                     source: Mapping[str, Any],
                     config: Optional[Mapping[str, Any]] = None,
-                    score_trace_digest: Optional[str] = None) -> Dict[str, Any]:
+                    score_trace_digest: Optional[str] = None,
+                    features: Optional[Mapping[str, Any]] = None,
+                    evaluation: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Congela contexto, trace, configuração e disponibilidade NA decisão.
 
     Allowlist estrita: nada de objeto inteiro, exceção ou recomendação crua.
@@ -422,8 +478,13 @@ def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
         if name is None:
             continue
         availability_view[name] = value if isinstance(value, bool) else VERDICT_UNKNOWN
+    features_view = _features_view(features)
+    evaluation_view = _evaluation_view(evaluation)
     payload = {
-        "schema_version": PRE_SCHEMA_VERSION,
+        # v2 só quando há bloco novo de verdade: sem eles o payload continua
+        # idêntico ao v1 (mesmos campos, mesma ordem canônica, mesmo hash).
+        "schema_version": (PRE_SCHEMA_VERSION_V2 if (features_view or evaluation_view)
+                           else PRE_SCHEMA_VERSION),
         "scope": SCOPE,
         "policy": POLICY,
         "identity": identity,
@@ -439,6 +500,10 @@ def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
         "learning_eligible": False,
         "segregated_from": ["RealTrade", "pnl", "learner", "operational_calibration"],
     }
+    if features_view is not None:
+        payload["features"] = features_view
+    if evaluation_view is not None:
+        payload["evaluation"] = evaluation_view
     payload["payload_bytes"] = len(_canonical(payload).encode("utf-8"))
     return payload
 
@@ -481,9 +546,100 @@ def extra_source_dependency() -> Dict[str, Any]:
     return dict(EXTRA_SOURCE)
 
 
+# ── Cobertura de CICLO: por que um ciclo não produziu observação ────────────
+#: Não é oportunidade: é a razão de NÃO ter avaliado. Guardada em memória (teto
+#: pequeno) e exposta no status — nunca gravada como linha de oportunidade, que
+#: seria fabricar preço/decisão que não existiram.
+COVERAGE_BLACKOUT = "BLACKOUT_WINDOW"
+COVERAGE_NO_SYMBOLS = "NO_SYMBOLS_AVAILABLE"
+COVERAGE_SOURCE_FAILURE = "SOURCE_FAILURE"
+COVERAGE_SYMBOL_TIMEOUT = "SYMBOL_TIMEOUT"
+COVERAGE_BUDGET = "CYCLE_BUDGET_EXHAUSTED"
+COVERAGE_NO_CANDIDATE = "NO_CANDIDATE_IN_SYMBOL"
+COVERAGE_MACRO_BLOCK = "MACRO_BLOCK_ALL"
+COVERAGE_OBSERVED = "OBSERVED"
+CYCLE_COVERAGE_REASONS = (COVERAGE_BLACKOUT, COVERAGE_NO_SYMBOLS,
+                          COVERAGE_SOURCE_FAILURE, COVERAGE_SYMBOL_TIMEOUT,
+                          COVERAGE_BUDGET, COVERAGE_NO_CANDIDATE,
+                          COVERAGE_MACRO_BLOCK, COVERAGE_OBSERVED)
+MAX_COVERAGE_CYCLES = 20
+_COVERAGE_CYCLES: List[Dict[str, Any]] = []
+
+
+def cycle_coverage(*, cycle_ts_ms: Any, symbols_requested: Any,
+                   symbols_evaluated: Any, candidates_observed: Any,
+                   reasons: Optional[Mapping[str, Any]] = None,
+                   state: str = COVERAGE_COMPLETE) -> Dict[str, Any]:
+    """Payload PURO de cobertura do ciclo. Motivo desconhecido é recusado."""
+    contagem: Dict[str, int] = {}
+    for chave, valor in (reasons or {}).items():
+        nome = str(chave)
+        if nome not in CYCLE_COVERAGE_REASONS:
+            raise ValueError(f"motivo de cobertura desconhecido: {nome}")
+        numero = _positive_int(valor)
+        if numero:
+            contagem[nome] = numero
+    pedidos = _positive_int(symbols_requested) or 0
+    avaliados = _positive_int(symbols_evaluated) or 0
+    return {
+        "schema_version": PRE_SCHEMA_VERSION_V2,
+        "scope": SCOPE,
+        "cycle_ts_ms": _positive_int(cycle_ts_ms),
+        "symbols_requested": pedidos,
+        "symbols_evaluated": avaliados,
+        "candidates_observed": _positive_int(candidates_observed) or 0,
+        "not_evaluated": max(0, pedidos - avaliados),
+        "reasons": contagem,
+        "state": state if state in (COVERAGE_COMPLETE, COVERAGE_INCOMPLETE,
+                                    COVERAGE_FAILED, COVERAGE_PENDING)
+        else COVERAGE_INCOMPLETE,
+        # Cobertura NÃO é oportunidade: nada aqui vira entrada de replay.
+        "is_opportunity": False,
+        "fabricates_prices_or_outcomes": False,
+    }
+
+
+def record_cycle_coverage(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Guarda a cobertura do último ciclo (memória, teto pequeno).
+
+    Desligado não chega aqui: quem chama confere o gate antes. Reinício perde
+    este histórico — é telemetria de cobertura, não evidência de estudo.
+    """
+    if not isinstance(payload, Mapping):
+        return {"recorded": False, "reason_code": MISSING_IDENTITY}
+    _COVERAGE_CYCLES.append(dict(payload))
+    del _COVERAGE_CYCLES[:-MAX_COVERAGE_CYCLES]
+    return {"recorded": True, "cycles_kept": len(_COVERAGE_CYCLES)}
+
+
+def coverage_snapshot() -> Dict[str, Any]:
+    """Resumo consultável da cobertura — alimenta o status derivado (sem I/O)."""
+    if not _COVERAGE_CYCLES:
+        return {"cycles": 0, "last_cycle_ts_ms": None, "last_state": None,
+                "reasons": {}, "candidates_observed": 0}
+    agregado: Dict[str, int] = {}
+    observados = 0
+    for ciclo in _COVERAGE_CYCLES:
+        observados += int(ciclo.get("candidates_observed") or 0)
+        for motivo, valor in (ciclo.get("reasons") or {}).items():
+            agregado[motivo] = agregado.get(motivo, 0) + int(valor or 0)
+    ultimo = _COVERAGE_CYCLES[-1]
+    return {"cycles": len(_COVERAGE_CYCLES),
+            "last_cycle_ts_ms": ultimo.get("cycle_ts_ms"),
+            "last_state": ultimo.get("state"),
+            "reasons": agregado, "candidates_observed": observados}
+
+
+def reset_coverage() -> None:
+    """Só para teste: limpa o anel de cobertura em memória."""
+    _COVERAGE_CYCLES.clear()
+
+
 def preselection_manifest() -> Dict[str, Any]:
     return {
         "schema_version": PRE_SCHEMA_VERSION,
+        "schema_versions_accepted": list(PRE_SCHEMA_VERSIONS),
+        "coverage": coverage_snapshot(),
         "scope": SCOPE,
         "legacy_scope_preserved": LEGACY_SCOPE,
         "policy": POLICY,

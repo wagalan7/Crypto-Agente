@@ -944,14 +944,24 @@ async def run():
     # Escopo/versões/universo: contrato BEM FORMADO, hash refeito, e ainda assim
     # divergente do congelado.
     def recontratar(estudo, **mudancas):
-        """OUTRO contrato ÍNTEGRO (hash REFEITO sobre o corpo novo)."""
+        """OUTRO contrato ÍNTEGRO (hash REFEITO sobre o corpo novo).
+
+        Escopo NÃO implementado não pode nascer do produtor (ele recusa), então
+        esse caso é montado à mão — exatamente como um payload adulterado
+        chegaria — e ainda assim tem de ser bloqueado antes do avaliador.
+        """
         atual = estudo["contract"]
         campos = {campo: atual[campo] for campo in
                   ("population", "study_kind", "policy_version", "universe_version",
                    "comparison_scope", "baseline_config", "candidate_config",
                    "costs_config", "bundle_hash", "dataset_fingerprint", "cutoff_ms")}
         campos.update(mudancas)
-        novo = r12.preselection_contract(**campos)
+        escopo = campos["comparison_scope"]
+        if escopo in r12.IMPLEMENTED_COMPARISON_SCOPES:
+            novo = r12.preselection_contract(**campos)
+        else:
+            corpo = {"contract_version": r12.PRE_SELECTION_CONTRACT_VERSION, **campos}
+            novo = {**corpo, "contract_hash": r12.contract_hash_of(corpo)}
         return {**estudo, "contract": novo, "contract_hash": novo["contract_hash"]}
 
     for nome, mudanca in (("universo", {"universe_version": "SYN-OUTRO-UNIVERSO"}),

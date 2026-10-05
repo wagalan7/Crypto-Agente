@@ -2743,3 +2743,60 @@ Baseline `ceb42af7`, worktree autorizado, único serviço alterado:
 - Sem DDL, backfill, flag, cutover, estratégia, sizing, limite, alavancagem,
   pausa ou manual alterados. Sem produção, conta real, ordem, mensagem, merge,
   push/deploy. WAITING_SOURCE e WAITING_OPERATIONAL_OBSERVATION permanecem.
+
+## L02 — pesquisa, coleta pré-seleção e calibração V3 (04/10/2026)
+
+Base `d0bf52e7` (Lote 01 integrado), worktree `lote02-pesquisa` autorizado pelo
+usuário para este e os próximos lotes. Itens 3+4+5 do índice. Contratos e provas
+em `docs/FECHAMENTO_FINAL_02_PESQUISA_E_CALIBRACAO.md`.
+
+- **Manifesto autorizado** (`research_manifest_service`, novo): contrato fechado
+  `R13_RESEARCH_MANIFEST_V1` com hashes por seção + `bundle_hash` gerados ANTES
+  dos resultados. Bloqueiam campo desconhecido/ausente, bool numérico, NaN/inf,
+  split fora de ordem/sem purga, fonte/unidade/ativo de custo incompatíveis,
+  modelo declarado se passando por custo observado, escopo não implementado,
+  mudança fora do componente declarado, lados idênticos com mudança declarada e
+  drift de hash. `approved: true` solto é campo desconhecido. Estados derivados
+  da decisão humana: DRAFT/BLOCKED, APPROVED_TEST_ONLY (não libera estudo real) e
+  APPROVED_RESEARCH (autoridade + referência + instante).
+  `authorized_comparison` passou a LER e validar esse contrato, mantendo
+  `BLOCKED_MISSING_DECISION` quando ele falta.
+- **Coleta pré-seleção no ponto oficial**: gate lido UMA vez antes de qualquer
+  trabalho novo (desligado não constrói linha, não pede a lista de avaliados e
+  mantém lista/ordem do champion); captura de TODOS os TFs avaliados ANTES do
+  `max(scored)` sem mexer no vencedor; veto macro registra os candidatos
+  existentes como VETOED com o gate que rodou; retornos antecipados (blackout,
+  sem símbolo, timeout, orçamento, sem candidato) registram COBERTURA de ciclo
+  sem fabricar oportunidade/preço/outcome; payload versionado `r09.pre.v1` (igual
+  ao anterior) e `r09.pre.v2` com features ponto-no-tempo e TFs avaliados ×
+  escolhido — produtor, exportador e manifesto aceitam as duas.
+- **Comparação por escopo**: `MANAGEMENT_ONLY` intacto (mesmo `request_hash`,
+  contrato V1); `SELECTION_ONLY` fechado — pedido com motores de seleção e gestão
+  IDÊNTICA, baseline pela decisão OBSERVADA do champion, candidata pelo motor
+  dela, UNKNOWN excluído simetricamente com cobertura, contrato
+  `R12_PRE_SELECTION_CONTRACT_V2` (manifest_hash + selection_config no corpo
+  hasheado), envelope do catálogo por tipo e verificação que recusa seleção
+  validada como gestão (e vice-versa).
+- **Calibração V3** (`score_v3_calibration_service`, novo): faixas fixas de 10
+  pontos (última inclui 100), mínimo 200 únicas/30 por faixa, `p=sucessos/n` com
+  Wilson 95%, sem herança em faixa fraca, sem monotonicidade/suavização, evento
+  explícito (TP1/TP2/líquido não intercambiáveis), label pós-corte fora do
+  treino, artefato inválido/vencido/revogado/incompatível = UNAVAILABLE, estados
+  FITTED ≠ OOS_VALIDATED ≠ ECONOMICALLY_APPROVED. `calibration_verdict` devolve a
+  probabilidade da faixa com artefato real e mantém o metadado antigo como
+  `METADATA_ONLY`; `net_ev` recusa evento/payoff incompatível e
+  `net_ev_from_payoff` exige payoff líquido OOS da gestão congelada.
+- **Status honesto**: evidência DERIVADA (coleta/artefato/manifesto) com
+  qualidade e `last_observed_at`; erro de leitura é ERROR, não NOT_STARTED; o GET
+  não dispara replay/walk-forward/fitting.
+- Provas: 73 testes novos (16+8+19+21+9); PG16 descartável
+  `pg_integration_lote02_pesquisa.py` com 18 verificações **2×** (duas conexões,
+  CAS, restart, identidade de estudo); regressões PG r11_r12 (138),
+  r09_preselection (29) e r10b; suíte completa 2.639 executados / 2.637 aprovados
+  / 2 skips históricos R05C. `py_compile` e `diff-check` aprovados; frontend
+  intocado.
+- **Sem mudança**: DDL/migração, ENV/flag (coleta segue `inactive`), champion,
+  calibração V2 autorizada, risco/alavancagem, execução, quarentena. Sem
+  produção, exchange, Telegram, Railway/Vercel, merge, push ou deploy.
+  WAITING_DECISION (candidata/baseline/escopo/custos) e WAITING_DATA (amostra
+  prospectiva, features de estrutura do V3) permanecem declarados.

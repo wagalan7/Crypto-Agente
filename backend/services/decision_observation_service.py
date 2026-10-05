@@ -296,7 +296,11 @@ def observe_preselection(candidates: list[dict]) -> dict:
                 identity=key, outcome=outcome, decision_ts_ms=decision_ms, setup=setup,
                 funnel=funnel, availability=candidate.get("availability") or {},
                 source=candidate.get("source") or {},
-                config={"schema_version": pre.PRE_SCHEMA_VERSION})
+                config={"schema_version": pre.PRE_SCHEMA_VERSION},
+                # Blocos v2 (quando o produtor os captura): features
+                # ponto-no-tempo e a lista de TFs avaliados × TF escolhido.
+                features=candidate.get("features"),
+                evaluation=candidate.get("evaluation"))
             cfg = pre.merge_into_config({**_CONFIG, "scope": pre.SCOPE}, payload)
             frozen = {key_name: setup.get(key_name) for key_name in
                       ("symbol", "timeframe", "side", "playbook", "playbook_version",

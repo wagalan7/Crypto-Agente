@@ -33,6 +33,12 @@ OPPORTUNITY_TABLE = "decision_observations"
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 REQUEST_KEYS = ("as_of_utc", "split", "baseline_config", "candidate", "costs", "bootstrap")
 CANDIDATE_KEYS = ("candidate_id", "registered_at_ms", "kind", "replay_config")
+#: Candidato de SELEÇÃO: além da gestão congelada, declara os motores que
+#: realmente decidem (núcleo, score, playbooks) e a regra de corte.
+CANDIDATE_SELECTION_KEYS = CANDIDATE_KEYS + ("selection",)
+SELECTION_KEYS = ("core_version", "core_config_hash", "score_version",
+                  "score_config_hash", "playbooks", "selection_rule")
+SELECTION_RULE_KEYS = ("kind", "min_score", "playbook", "source")
 COST_KEYS = ("fee_bps_per_side", "slippage_bps_per_side", "funding_bps_per_bar")
 SPLIT_KEYS = ("train_start_ms", "validation_start_ms", "holdout_start_ms", "purge_bars")
 BOOTSTRAP_KEYS = ("seed", "samples", "block_size")
@@ -132,6 +138,9 @@ class ExportRequest:
     changed: tuple
     #: Coorte exportada. O default reproduz EXATAMENTE o export antigo.
     scope: scopes.Scope = scopes.LEGACY
+    #: Motores de SELEÇÃO da candidata (só no escopo SELECTION_ONLY). `None`
+    #: mantém o payload/hash do pedido legado byte a byte.
+    selection: Optional[Dict[str, Any]] = None
 
     @property
     def bar_ms(self) -> int:
@@ -145,14 +154,19 @@ class ExportRequest:
 
     def payload_head(self) -> dict:
         """Campos do payload `compare`, exatamente no formato do `run_payload`."""
+        candidato = {"candidate_id": self.candidate.candidate_id,
+                     "registered_at_ms": self.candidate.registered_at_ms,
+                     "kind": self.candidate.kind,
+                     "replay_config": asdict(self.candidate.replay_config)}
+        if self.selection is not None:
+            # Só o pedido de SELEÇÃO carrega os motores — o pedido de gestão
+            # continua com o MESMO corpo (e o mesmo hash) de antes.
+            candidato["selection"] = dict(self.selection)
         return {
             "mode": "compare",
             "baseline_config": asdict(self.baseline),
             "costs": asdict(self.costs),
-            "candidate": {"candidate_id": self.candidate.candidate_id,
-                          "registered_at_ms": self.candidate.registered_at_ms,
-                          "kind": self.candidate.kind,
-                          "replay_config": asdict(self.candidate.replay_config)},
+            "candidate": candidato,
             "split": asdict(self.split),
             "bootstrap": asdict(self.bootstrap),
         }
@@ -167,6 +181,20 @@ class ExportRequest:
 
     def request_hash(self) -> str:
         return _sha(self.normalized())
+
+
+def _selection_block(raw: Any) -> Dict[str, Any]:
+    """Motores de seleção da candidata, pela MESMA função do contrato.
+
+    O pedido, o contrato do estudo e o catálogo compartilham o validador em
+    `research_manifest_service` — liberar uma string aqui não abriria o escopo
+    para consumidores antigos.
+    """
+    from services import research_manifest_service as rm
+    verdict = rm.validate_selection_config(raw)
+    if not verdict["ok"]:
+        raise DatasetError(f"candidate.selection: {verdict['detail']}")
+    return verdict["config"]
 
 
 def parse_request(raw: Any) -> ExportRequest:
@@ -189,23 +217,38 @@ def parse_request(raw: Any) -> ExportRequest:
     except (TypeError, ValueError) as exc:
         raise DatasetError(str(exc)) from None
     baseline = _replay_config(body["baseline_config"], "baseline_config")
-    cand = _closed(body["candidate"], CANDIDATE_KEYS, "candidate")
-    if cand["kind"] != "MANAGEMENT_ONLY":
-        raise DatasetError("exportador econômico suporta somente MANAGEMENT_ONLY")
+    # Despacho por TIPO do candidato. O schema é fechado por tipo: um candidato
+    # de seleção não é validado como candidato de gestão, nem o contrário.
+    bruto_cand = body["candidate"]
+    kind = (bruto_cand or {}).get("kind") if isinstance(bruto_cand, Mapping) else None
+    if kind == "SELECTION_ONLY":
+        cand = _closed(bruto_cand, CANDIDATE_SELECTION_KEYS, "candidate")
+        selection = _selection_block(cand["selection"])
+    elif kind == "MANAGEMENT_ONLY":
+        cand = _closed(bruto_cand, CANDIDATE_KEYS, "candidate")
+        selection = None
+    else:
+        raise DatasetError("exportador econômico suporta MANAGEMENT_ONLY ou "
+                           "SELECTION_ONLY")
     replay = _replay_config(cand["replay_config"], "candidate.replay_config")
     try:
         candidate = r10a.CandidateRegistration(
             candidate_id=cand["candidate_id"], registered_at_ms=cand["registered_at_ms"],
-            kind="MANAGEMENT_ONLY", replay_config=replay)
+            kind=kind, replay_config=replay)
         changed = tuple(r10a.management_diff(baseline, replay))
     except (TypeError, ValueError) as exc:
         raise DatasetError(str(exc)) from None
+    if kind == "SELECTION_ONLY" and changed:
+        # Gestão CONGELADA é premissa do escopo de seleção: se ela também muda,
+        # o efeito não é atribuível à seleção.
+        raise DatasetError("SELECTION_ONLY exige gestão idêntica nos dois lados; "
+                           f"mudou: {sorted(changed)}")
     if candidate.registered_at_ms > split.train_start_ms:
         raise DatasetError("candidato deve estar registrado antes do início do treino")
     if as_of_ms <= split.train_start_ms:
         raise DatasetError("as_of_utc deve ser posterior ao início do treino")
     return ExportRequest(as_of_ms, split, baseline, candidate, costs, bootstrap, changed,
-                         scope=scope)
+                         scope=scope, selection=selection)
 
 
 @dataclass(frozen=True)
@@ -462,16 +505,27 @@ FEATURE_EXCLUSION_REASONS = ("SOURCE_CONTRACT_MISMATCH", "IDENTITY_MISMATCH",
 FEATURE_SETUP_KEYS = ("symbol", "timeframe", "side", "playbook", "playbook_version",
                       "trigger_candle_ms", "entry", "stop_loss", "tp1", "tp2", "atr")
 PRE_SOURCE_SCHEMA = "r09.pre.v1"
+#: v2 acrescenta `features`/`evaluation`. As duas versões são exportáveis: a
+#: linha v1 declara a ausência por reason code, nunca por zero.
+PRE_SOURCE_SCHEMA_V2 = "r09.pre.v2"
+PRE_SOURCE_SCHEMAS = (PRE_SOURCE_SCHEMA, PRE_SOURCE_SCHEMA_V2)
+FEATURES_NOT_COLLECTED = "POINT_IN_TIME_FEATURES_NOT_COLLECTED_IN_V1"
 
 
 def _pre_payload(config: Any) -> tuple:
-    """Payload pré-seleção congelado, ou o motivo de não existir."""
+    """Payload pré-seleção congelado, ou o motivo de não existir.
+
+    Aceita as DUAS versões do produtor: `r09.pre.v1` (sem features) e
+    `r09.pre.v2` (com `features`/`evaluation` ponto-no-tempo). Qualquer outra
+    string é contrato incompatível — não existe aceitação por prefixo.
+    """
     if not isinstance(config, Mapping):
         return None, "SOURCE_CONTRACT_MISMATCH"
     payload = config.get("r09_pre_selection")
     if not isinstance(payload, Mapping):
         return None, "PRE_SELECTION_PAYLOAD_MISSING"
-    if payload.get("schema_version") != PRE_SOURCE_SCHEMA or payload.get("scope") != "PRE_SELECTION":
+    if payload.get("schema_version") not in PRE_SOURCE_SCHEMAS \
+            or payload.get("scope") != "PRE_SELECTION":
         return None, "SOURCE_CONTRACT_MISMATCH"
     return payload, None
 
@@ -543,6 +597,18 @@ def build_feature_artifacts(request: ExportRequest, plan: SelectionPlan,
                   if funnel else None,
                   "availability": dict(availability) if availability else None,
                   "source": dict(payload.get("source") or {}),
+                  # Features PONTO-NO-TEMPO (v2). Linha v1 não tem: a ausência
+                  # viaja com motivo e a comparação de seleção trata como
+                  # UNKNOWN — nunca como zero.
+                  "source_schema": payload.get("schema_version"),
+                  "features": (dict(payload["features"])
+                               if isinstance(payload.get("features"), Mapping)
+                               else None),
+                  "features_reason": (None if isinstance(payload.get("features"), Mapping)
+                                      else FEATURES_NOT_COLLECTED),
+                  "evaluation": (dict(payload["evaluation"])
+                                 if isinstance(payload.get("evaluation"), Mapping)
+                                 else None),
                   # Ausência declarada: não existe outcome zero aqui.
                   "outcome": None,
                   "outcome_reason": scope.absent_map().get("outcome")}
@@ -565,7 +631,9 @@ def build_feature_artifacts(request: ExportRequest, plan: SelectionPlan,
         "mode": "LOCAL_RESEARCH_ONLY", "promotable": False, "live_equivalent": False,
         "approval": None, "economic_sufficiency": "NOT_ASSESSED",
         "state": state,
-        "source": {**scope.manifest(), "source_schema": PRE_SOURCE_SCHEMA,
+        "source": {**scope.manifest(),
+                   "source_schema": PRE_SOURCE_SCHEMA,
+                   "source_schemas_accepted": list(PRE_SOURCE_SCHEMAS),
                    "source_policy": "OBSERVATION_ONLY",
                    "transaction": "REPEATABLE READ READ ONLY",
                    "outcome_or_coverage_read": False},
