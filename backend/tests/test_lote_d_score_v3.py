@@ -289,22 +289,24 @@ class CalibracaoEAprovacao(unittest.TestCase):
 
     def test_ev_liquido_exige_probabilidade_fora_da_amostra_e_custos(self):
         self.assertEqual(s3.net_ev(probability_out_of_sample=None, rr_tp2=2.5,
-                                   cost_r=0.1)["reason_code"], s3.PROBABILITY_UNAVAILABLE)
+                                   cost_r=0.1, event="P_TP2_BEFORE_STOP")["reason_code"], s3.PROBABILITY_UNAVAILABLE)
         self.assertEqual(s3.net_ev(probability_out_of_sample=1.5, rr_tp2=2.5,
-                                   cost_r=0.1)["reason_code"], s3.OUT_OF_SAMPLE_REQUIRED)
+                                   cost_r=0.1, event="P_TP2_BEFORE_STOP")["reason_code"], s3.OUT_OF_SAMPLE_REQUIRED)
         self.assertEqual(s3.net_ev(probability_out_of_sample=0.4, rr_tp2=2.5,
-                                   cost_r=None)["reason_code"], s3.COSTS_UNKNOWN)
-        bom = s3.net_ev(probability_out_of_sample=0.4, rr_tp2=2.5, cost_r=0.1)
+                                   cost_r=None, event="P_TP2_BEFORE_STOP")["reason_code"], s3.COSTS_UNKNOWN)
+        bom = s3.net_ev(probability_out_of_sample=0.4, rr_tp2=2.5, cost_r=0.1, event="P_TP2_BEFORE_STOP")
         self.assertTrue(bom["available"])
         self.assertAlmostEqual(bom["ev_r"], 0.3)
 
     def test_elegibilidade_live_nunca_sai_daqui(self):
         boa = s3.V3Calibration(model_fingerprint=self.fingerprint,
                                population="RESEARCH_SHADOW", sample_size=500)
-        ev = s3.net_ev(probability_out_of_sample=0.5, rr_tp2=3.0, cost_r=0.1)
+        ev = s3.net_ev(probability_out_of_sample=0.5, rr_tp2=3.0, cost_r=0.1, event="P_TP2_BEFORE_STOP")
         verdict = s3.economic_verdict(self.payload, boa, ev)
         self.assertEqual(verdict["live_eligibility"], s3.STATE_UNAVAILABLE)
-        self.assertEqual(verdict["economic_approval"], "PENDING_SIMULATION")
+        self.assertEqual(verdict["economic_approval"], s3.STATE_UNAVAILABLE)
+        self.assertEqual(verdict["reason_code"], s3.OUT_OF_SAMPLE_REQUIRED,
+                         "metadado sem previsão OOS não satisfaz contrato econômico")
 
         sem_calibracao = s3.economic_verdict(self.payload, None, ev)
         self.assertEqual(sem_calibracao["economic_approval"], s3.STATE_UNAVAILABLE)

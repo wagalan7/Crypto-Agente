@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import socket
 import sys
+from unittest.mock import patch
 
 test_socket = os.environ.get("LOTE02_TEST_SOCKET", "")
 if not re.fullmatch(r"/tmp/cw-lote02-sock\.[A-Za-z0-9]+", test_socket):
@@ -127,6 +128,9 @@ async def run():
             "source": {"decision_source": "server_scan", "resolution": timeframe},
         }
         if com_features:
+            from tests.test_lote02_research_manifest import champion_trace
+            linha["score_trace"] = champion_trace()
+            linha["observed_decision_scope"] = "FINAL_SCANNER_SELECTION"
             # v2: features ponto-no-tempo + bloco de avaliação (TFs avaliados).
             linha["features"] = features_v3()
             linha["evaluation"] = {"evaluated_timeframes": ["1h", "4h"],
@@ -136,7 +140,16 @@ async def run():
 
     linhas = [linha_observada(i, aceita=i % 2 == 0) for i in range(8)]
     linhas.append(linha_observada(99, aceita=True, com_features=False))  # v1
-    resumo = obs.observe_preselection(linhas)
+    class ObservationClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            # A captura oficial acontece no instante deste cenário, NÃO no
+            # relógio da execução do harness. Nada é retrodado depois do save.
+            instant = ds.ms_datetime(decisao_ms + 1000)
+            return instant if tz is None else instant.astimezone(tz)
+
+    with patch.object(obs, "datetime", ObservationClock):
+        resumo = obs.observe_preselection(linhas)
     check("coleta_registra_aceitas_e_vetadas",
           resumo["accepted"] == 5 and resumo["vetoed"] == 4, str(resumo))
     gravadas = await obs.flush_pending()
@@ -157,7 +170,7 @@ async def run():
           pre.PRE_SCHEMA_VERSION_V2 in marcadas and pre.PRE_SCHEMA_VERSION in marcadas,
           str(sorted(set(marcadas))))
 
-    # Export REAL (somente leitura) da coorte de aceitas.
+    # Export REAL da população bruta: aceitas E vetadas, sem decoração externa.
     replay_cfg = {"bar_ms": BAR5, "entry_window_bars": 3,
                   "pre_tp1_time_stop_bars": 12, "max_holding_bars": 24,
                   "tp1_fraction": 0.45, "be_lock_fraction": 0.2,
@@ -165,12 +178,13 @@ async def run():
                   "max_bars": 96}
     inicio = decisao_ms - 400 * BAR5
     pedido = {
-        "as_of_utc": ds.ms_datetime(agora_ms + BAR5).isoformat().replace("+00:00", "Z"),
+        "as_of_utc": ds.ms_datetime(agora_ms).isoformat().replace("+00:00", "Z"),
         "split": {"train_start_ms": inicio,
                   "validation_start_ms": inicio + 200 * BAR5,
-                  "holdout_start_ms": agora_ms + 400 * BAR5, "purge_bars": 1},
+                  "holdout_start_ms": agora_ms - BAR5, "purge_bars": 1,
+                  "embargo_bars": 0},
         "baseline_config": dict(replay_cfg),
-        "scope": scopes.SCOPE_PRE_ACCEPTED,
+        "scope": scopes.SCOPE_PRE_POPULATION,
         "candidate": {"candidate_id": "L02-SELECTION",
                       "registered_at_ms": inicio - BAR5,
                       "kind": "SELECTION_ONLY",
@@ -179,7 +193,10 @@ async def run():
                           "core_version": core.CORE_VERSION,
                           "core_config_hash": core.DEFAULT_CONFIG.config_hash(),
                           "score_version": s3.SCORE_VERSION,
-                          "score_config_hash": "c" * 64,
+                          "score_config_hash": s3.model_fingerprint(
+                              playbook=core.PLAYBOOK_TREND_PULLBACK,
+                              config=s3.DEFAULT_CONFIG),
+                          "score_config": s3.DEFAULT_CONFIG.as_dict(),
                           "playbooks": list(core.PLAYBOOKS),
                           "selection_rule": {"kind": rm.RULE_SCORE_V3_MIN,
                                              "min_score": 60.0,
@@ -211,12 +228,19 @@ async def run():
                           decision_state=rm.DECISION_TEST_ONLY) -> dict:
         from tests.test_lote02_research_manifest import manifesto as base
         corpo = base(decision_state=decision_state)
+        corpo["population"].update(universe_version="SYN-L02", min_rows=1,
+                                     cohort=scopes.SCOPE_PRE_POPULATION,
+                                     scope_id=scopes.SCOPE_PRE_POPULATION)
+        corpo["split"] = {**pedido["split"], "as_of_ms": agora_ms,
+                           "embargo_bars": 0}
         corpo["candidate"]["selection_rule"] = {
             "kind": rm.RULE_SCORE_V3_MIN, "min_score": min_score,
             "playbook": core.PLAYBOOK_TREND_PULLBACK, "source": s3.SCORE_VERSION}
         return rm.parse_manifest(corpo)
 
-    populacao = [{**linha, "observed_outcome": "ACCEPTED"} for linha in exportadas]
+    populacao = exportadas
+    check("export_preserva_decisoes_aceitas_e_vetadas_sem_decoracao",
+          {linha.get("observed_outcome") for linha in populacao} == {"ACCEPTED", "VETOED"})
     comparacao = rsel.compare_population(populacao, manifest=manifesto_selecao())
     check("selecao_decide_pelos_dois_lados_sobre_a_populacao_do_banco",
           comparacao["ok"] and comparacao["selected"]["baseline"]
@@ -244,12 +268,14 @@ async def run():
                              funding_bps_per_bar=1.0).manifest()
     contrato = r12.preselection_contract(
         population=rp.POPULATION_SHADOW, study_kind="PRE_SELECTION",
-        policy_version=rp.POLICY_VERSION, universe_version="SYN-L02",
+        policy_version=manifesto["candidate"]["policy_version"], universe_version="SYN-L02",
         comparison_scope=rm.SCOPE_SELECTION, baseline_config=gestao_manifest,
         candidate_config=gestao_manifest, costs_config=custos,
-        bundle_hash="b" * 64, dataset_fingerprint=manifest_export["request_hash"],
-        cutoff_ms=decisao_ms, manifest_hash=manifesto["manifest_hash"],
-        selection_config=selecao_config)
+        bundle_hash=manifesto["hashes"]["bundle_hash"],
+        dataset_fingerprint=manifest_export["fingerprints"]["dataset_sha256"],
+        cutoff_ms=manifesto["split"]["as_of_ms"], manifest_hash=manifesto["manifest_hash"],
+        selection_config=selecao_config, research_manifest=manifesto,
+        dataset_scope=dataset["scope"], temporal_split=manifesto["split"])
     check("contrato_de_selecao_nasce_v2",
           contrato["contract_version"] == r12.PRE_SELECTION_CONTRACT_V2
           and contrato["manifest_hash"] == manifesto["manifest_hash"],

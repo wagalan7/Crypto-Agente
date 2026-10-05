@@ -18,6 +18,7 @@ OPPORTUNITY_TABLE = "decision_observations"
 SCOPE_REJECTED_POST = "R09_REJECTED_POST_SELECTION"
 SCOPE_PRE_VETOED = "R09_PRE_SELECTION_VETOED"
 SCOPE_PRE_ACCEPTED = "R09_PRE_SELECTION_ACCEPTED"
+SCOPE_PRE_POPULATION = "R09_PRE_SELECTION_POPULATION"
 SCOPE_STRUCTURAL = "R10_STRUCTURAL_CANDIDATES"
 DEFAULT_SCOPE = SCOPE_REJECTED_POST
 
@@ -143,8 +144,21 @@ PRE_ACCEPTED = Scope(
     tables=(OPPORTUNITY_TABLE,),
 )
 
+# População bruta: a MESMA tabela oficial contém aceitas e vetadas. Ausência
+# de trajetória nas aceitas é explícita; nunca recuperamos um outcome do trade.
+PRE_POPULATION = Scope(
+    scope_id=SCOPE_PRE_POPULATION, cohort=SCOPE_PRE_POPULATION,
+    source_table=OPPORTUNITY_TABLE,
+    decision_column="first_decision_observed_at", opportunity_scope="PRE_SELECTION",
+    unit="ONE_PRE_SELECTION_OPPORTUNITY", exports_trajectory=False,
+    comparable_with_r10a=False,
+    index_filter=f"scope = 'PRE_SELECTION' AND {_pre_filter()}",
+    detail_filter=f"o.scope = 'PRE_SELECTION' AND {_pre_filter('o')}",
+    absent_fields=(("observed_costs", COST_NOT_OBSERVED),),
+)
+
 SCOPES: Dict[str, Scope] = {scope.scope_id: scope for scope in
-                            (LEGACY, PRE_VETOED, STRUCTURAL, PRE_ACCEPTED)}
+                            (LEGACY, PRE_VETOED, STRUCTURAL, PRE_ACCEPTED, PRE_POPULATION)}
 
 
 def resolve(scope_id: Any) -> Scope:
@@ -231,10 +245,47 @@ ORDER BY o.{column}, o.opportunity_key
 
 
 def detail_sql(scope: Scope) -> str:
+    if scope.scope_id == SCOPE_PRE_POPULATION:
+        return _population_detail_sql()
     return (_trajectory_detail_sql(scope) if scope.exports_trajectory
             else _feature_detail_sql(scope))
 
 
 def detail_needs_window_params(scope: Scope) -> bool:
     """Só a consulta com trajetória recebe janelas (`los`, `his`, `bar_ms`)."""
-    return scope.exports_trajectory
+    return scope.exports_trajectory or scope.scope_id == SCOPE_PRE_POPULATION
+
+
+def _population_detail_sql() -> str:
+    """União oficial por identidade, em uma instrução e só ids admitidos.
+
+    Reutiliza as janelas R09 existentes das vetadas. Aceita sem janela retorna
+    NULL (não [] de horizonte completo). JSON de holdout nunca é projetado.
+    """
+    return f"""
+WITH bounds AS (
+ SELECT b.k, b.lo, b.hi
+ FROM unnest(CAST(:keys AS text[]), CAST(:los AS bigint[]), CAST(:his AS bigint[])) AS b(k,lo,hi)
+)
+SELECT o.opportunity_key, o.symbol, o.first_decision_observed_at AS decision_at,
+       o.scope AS opportunity_scope, o.frozen_setup, o.frozen_config, o.score_trace,
+       CASE WHEN r.opportunity_key IS NULL THEN NULL
+            WHEN jsonb_typeof(r.candles) = 'array' THEN (
+             SELECT COALESCE(jsonb_agg(w.value ORDER BY w.ts, w.ord), '[]'::jsonb)
+             FROM (SELECT e.value, e.ord,
+                          CASE WHEN {_VALID_TS} THEN (e.value ->> 'timestamp')::bigint END AS ts
+                   FROM jsonb_array_elements(r.candles) WITH ORDINALITY AS e(value,ord)) AS w
+             WHERE w.ts IS NOT NULL AND w.ts >= b.lo
+               AND w.ts + CAST(:bar_ms AS bigint) <= b.hi)
+            ELSE NULL END AS candles,
+       CASE WHEN r.opportunity_key IS NULL THEN false
+            WHEN jsonb_typeof(r.candles) = 'array' THEN
+             COALESCE((SELECT bool_or(NOT ({_VALID_TS}))
+                       FROM jsonb_array_elements(r.candles) AS e(value)), false)
+            ELSE true END AS candles_malformed
+FROM bounds AS b
+JOIN {OPPORTUNITY_TABLE} AS o ON o.opportunity_key=b.k
+LEFT JOIN {REJECTED_TABLE} AS r ON r.opportunity_key=o.opportunity_key
+WHERE o.scope='PRE_SELECTION' AND {_pre_filter('o')}
+ORDER BY o.first_decision_observed_at, o.opportunity_key
+"""

@@ -387,7 +387,8 @@ PRE_SELECTION_CONTRACT_FIELDS = (
     "costs_config", "bundle_hash", "dataset_fingerprint", "cutoff_ms",
 )
 PRE_SELECTION_CONTRACT_V2_FIELDS = PRE_SELECTION_CONTRACT_FIELDS + (
-    "manifest_hash", "selection_config")
+    "manifest_hash", "selection_config", "research_manifest", "dataset_scope",
+    "temporal_split")
 CONTRACT_FIELDS_BY_VERSION = {
     PRE_SELECTION_CONTRACT_VERSION: PRE_SELECTION_CONTRACT_FIELDS,
     PRE_SELECTION_CONTRACT_V2: PRE_SELECTION_CONTRACT_V2_FIELDS,
@@ -613,7 +614,10 @@ def preselection_contract(*, population: str, study_kind: str, policy_version: s
                           bundle_hash: Optional[str],
                           dataset_fingerprint: str, cutoff_ms: int,
                           manifest_hash: Optional[str] = None,
-                          selection_config: Optional[Mapping[str, Any]] = None
+                          selection_config: Optional[Mapping[str, Any]] = None,
+                          research_manifest: Optional[Mapping[str, Any]] = None,
+                          dataset_scope: Optional[str] = None,
+                          temporal_split: Optional[Mapping[str, Any]] = None
                           ) -> Dict[str, Any]:
     """Contrato CONGELADO antes dos resultados, com hash sobre o corpo inteiro.
 
@@ -623,10 +627,11 @@ def preselection_contract(*, population: str, study_kind: str, policy_version: s
     escopo = str(comparison_scope)
     if escopo not in IMPLEMENTED_COMPARISON_SCOPES:
         raise ValueError(f"{SCOPE_NOT_IMPLEMENTED}: {escopo}")
-    v2 = manifest_hash is not None or selection_config is not None
-    if escopo == SCOPE_SELECTION_ONLY and not (manifest_hash and selection_config):
+    v2 = (manifest_hash is not None or selection_config is not None
+          or research_manifest is not None)
+    if escopo == SCOPE_SELECTION_ONLY and not (research_manifest and selection_config):
         raise ValueError(f"{SCOPE_CONTRACT_MISMATCH}: SELECTION_ONLY exige "
-                         "manifest_hash e selection_config")
+                         "research_manifest e selection_config")
     if escopo == SCOPE_MANAGEMENT_ONLY and selection_config is not None:
         raise ValueError(f"{SCOPE_CONTRACT_MISMATCH}: MANAGEMENT_ONLY não "
                          "declara motores de seleção")
@@ -645,9 +650,29 @@ def preselection_contract(*, population: str, study_kind: str, policy_version: s
         "cutoff_ms": int(cutoff_ms),
     }
     if v2:
-        corpo["manifest_hash"] = (str(manifest_hash) if manifest_hash else None)
-        corpo["selection_config"] = (dict(selection_config)
-                                     if selection_config else None)
+        if population != "SHADOW" or study_kind != "PRE_SELECTION":
+            raise ValueError("RESEARCH_MANIFEST_BINDING_MISMATCH: population/study_kind")
+        if (not isinstance(dataset_fingerprint, str) or len(dataset_fingerprint) != 64
+                or any(c not in "0123456789abcdef" for c in dataset_fingerprint)):
+            raise ValueError("RESEARCH_DATASET_FINGERPRINT_INVALID")
+        from services import research_manifest_service as rm
+        binding = rm.verify_research_binding(
+            research_manifest, comparison_scope=escopo,
+            baseline_config=baseline_config, candidate_config=candidate_config,
+            costs_config=costs_config, selection_config=selection_config,
+            dataset_scope=dataset_scope, temporal_split=temporal_split,
+            universe_version=universe_version, policy_version=policy_version,
+            cutoff_ms=cutoff_ms,
+            bundle_hash=bundle_hash)
+        if not binding["ok"]:
+            raise ValueError(f"{binding['reason_code']}: {binding.get('diverged')}")
+        if manifest_hash is not None and manifest_hash != binding["manifest_hash"]:
+            raise ValueError("RESEARCH_MANIFEST_BINDING_MISMATCH: manifest_hash")
+        corpo["manifest_hash"] = binding["manifest_hash"]
+        corpo["research_manifest"] = binding["manifest"]
+        corpo["selection_config"] = (dict(selection_config) if selection_config else None)
+        corpo["dataset_scope"] = dataset_scope
+        corpo["temporal_split"] = dict(temporal_split)
     return {**corpo, "contract_hash": _hash(corpo)}
 
 
@@ -663,6 +688,8 @@ def contract_hash_of(contract: Any) -> Optional[str]:
     versao = contract.get("contract_version")
     campos = CONTRACT_FIELDS_BY_VERSION.get(versao)
     if campos is None:
+        return None
+    if set(contract) != set(campos) | {"contract_hash"}:
         return None
     return _hash({campo: contract.get(campo) for campo in campos})
 
@@ -697,6 +724,9 @@ def study_payload(*, contract: Mapping[str, Any], evidence: Mapping[str, Any],
         "folds_executed": resultado.get("folds_executed"),
         "replay_admitted": (replay or {}).get("admitted"),
         "evidence": dict(evidence or {}),
+        "real_study_allowed": (bool(((contrato.get("research_manifest") or {})
+                                      .get("decision") or {}).get("state") == "APPROVED")
+                               if contrato.get("research_manifest") else False),
     }
 
 

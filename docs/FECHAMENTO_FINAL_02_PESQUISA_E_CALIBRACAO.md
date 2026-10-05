@@ -5,6 +5,11 @@ Base: `main` em `d0bf52e7` (Lote 01 integrado). Itens 3+4+5 do índice.
 liberada; sem push/deploy. A candidata real **não** foi escolhida: o estudo real
 continua `BLOCKED_MISSING_DECISION`.
 
+Revisão integrada de 05/10/2026 sobre `a39ab358`: os aceites originais abaixo
+são complementados pelo fechamento em `LOTE02_CORRECAO_INTEGRADA.md`. As provas
+originais não bastavam para as fronteiras de coleta, identidade e fitting; as
+correções não equivalem a aprovação de uma estratégia.
+
 ## 1. O que existia e o que faltava
 
 | Lacuna declarada no prompt | Situação agora |
@@ -61,6 +66,12 @@ mudança dela, e escopo/população/custos comparáveis.
   no serviço desejado e reiniciar; a coleta é somente leitura do scan e não toca
   recomendações, ranking, gates ou executor.
 
+Na revisão: batching de 50 preserva o buffer de 200 e contabiliza recusas;
+`ACCEPTED` só é congelado após correlação e guard de carteira
+(`FINAL_SCANNER_SELECTION`). V2 guarda configuração e trace reais, e features
+prospectivas derivadas dos inputs locais da vela fechada — nenhum fetch novo.
+V1 preserva seu limite de 4 KiB; V2 tem limite explícito de 32 KiB.
+
 ## 4. Comparação integral por escopo
 
 `MANAGEMENT_ONLY` continua intacto (mesmo corpo de pedido, mesmo `request_hash`,
@@ -82,6 +93,13 @@ mesmo contrato V1). `SELECTION_ONLY` é novo e fechado:
   decisão por lado → dois replays (gestão congelada) → contrato persistido →
   `verify_study_identity` → catálogo, com restart.
 
+O export bruto `R09_PRE_SELECTION_POPULATION` inclui aceitas e vetadas sem ler
+outcomes financeiros. A comparação registrada exige esse export e janelas de
+preço/quote explícitas e hasheadas; não usa a demonstração sintética como
+substituto. Corpo completo do manifesto, split/purga/embargo, ScoreConfig,
+custos executados e população são conferidos também pelo catálogo. A seleção
+implementada é **corte do Score V3**, não substituição de núcleo/playbooks.
+
 ## 5. Calibração V3 (`score_v3_calibration_service`)
 
 Contrato `R08E_V3_CALIBRATION_V1`: faixas fixas de 10 pontos (a última inclui
@@ -101,6 +119,14 @@ inválido/vencido/revogado/de outro fingerprint, população, evento ou dataset 
 gestão parcial com runner existe `net_ev_from_payoff`, que exige o payoff líquido
 **OOS** da gestão congelada, a fonte e o tamanho da amostra. Nenhuma
 probabilidade de evento diferente alimenta sizing/Kelly.
+
+Na revisão, semântica do artefato é validada além do hash. Quatro folds
+cronológicos exigem decisão OOS posterior ao corte, labels disponíveis e
+oportunidades disjuntas do treino. O pipeline ajusta, persiste por CAS e relê o
+artefato pelo status existente, sem fitting no GET. Payoff/EV integral só é
+produzido para `P_NET_RESULT_POSITIVE`; TP1/TP2 censuram expirações e não usam essa
+coorte reduzida como expectativa da gestão inteira. Custos já líquidos não são
+descontados novamente.
 
 **`DECISION_REQUIRED`**: os limites de aceitação da calibração OOS não existem;
 o artefato declara `CALIBRATION_OOS_THRESHOLDS_DECISION_REQUIRED` e não se
@@ -131,11 +157,10 @@ do artefato) e aprovação humana (manifesto). **Erro de leitura é `ERROR`, nun
 
 1. **Candidata real não decidida** → estudo real `BLOCKED_MISSING_DECISION`.
    Os manifestos usados nos testes são `APPROVED_TEST_ONLY`.
-2. **Features de estrutura/gatilho do Score V3 não são calculadas pelo scan
-   champion** (`structure_quality`, `level_distance_atr`, `trigger_body_ratio`,
-   `trigger_follow_through_atr`). Elas ficam ausentes na captura, o modelo real
-   devolve `UNAVAILABLE` e um estudo `SELECTION_ONLY` sobre a captura do champion
-   fica **WAITING_DATA** — não produz decisão inventada.
+2. **Features prospectivas, sem backfill**: o produtor agora existe, mas ausência
+   de pivô, referência inequívoca de gatilho ou HTF fresco continua UNKNOWN.
+   Sinal cacheado sem inputs legítimos não é reconstruído. Mais tempo não
+   garante cobertura suficiente de toda feature; ela precisa ser medida.
 3. **Amostra prospectiva não existe**: a coleta está desligada. Sem ela não há
    calibração com 200/30 nem evidência econômica.
 4. **Cobertura de ciclo é telemetria em memória** (últimos 20 ciclos, perdida em
@@ -144,3 +169,7 @@ do artefato) e aprovação humana (manifesto). **Erro de leitura é `ERROR`, nun
    depende da fonte do Lote 01 e não foi usado aqui.
 6. Holdout permanece selado; limites de aceitação OOS e canário continuam
    decisões externas.
+7. Janelas de preço/quote das aceitas não são coletadas automaticamente por este
+   lote. O arquivo histórico externo tem fonte declarada e vínculo ao dataset,
+   mas não certificação independente. Ausência bloqueia o estudo com motivo
+   explícito; mercado sintético só é permitido com manifesto TEST_ONLY.

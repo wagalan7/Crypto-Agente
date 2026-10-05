@@ -88,6 +88,10 @@ def rising_bars(start_ms: int, entry: float, count: int = 40):
 
 
 async def run(args) -> dict:
+    # Manifesto registrado usa SOMENTE export oficial e janelas explícitas.
+    # A demonstração sintética abaixo não é fallback de um estudo sem dados.
+    if getattr(args, "manifest", None):
+        return await run_registered_study(args)
     from services import decision_observation_service as obs
     from services import offline_replay_service as r10a
     from services import portfolio_replay_service as pf
@@ -408,6 +412,41 @@ async def run(args) -> dict:
     report["next_step"] = ("Acumular amostra prospectiva pelo coletor ligado antes de "
                            "qualquer go/no-go; o adaptador operacional continua por implementar.")
     return report
+
+
+async def run_registered_study(args):
+    from services import research_manifest_service as rm
+    from services import research_study_service as study
+    loaded = rm.load_manifest_file(args.manifest)
+    if not loaded.get("ok"):
+        return study._blocked(loaded.get("reason_code"), state="WAITING_DECISION")
+    directory = getattr(args, "dataset_dir", None)
+    if not directory:
+        return study._blocked("OFFICIAL_DATASET_REQUIRED")
+    try:
+        def read_json(path):
+            if Path(path).stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("artefato acima de 16 MiB")
+            return json.loads(Path(path).read_text(encoding="utf-8"),
+                              parse_constant=lambda _: (_ for _ in ()).throw(ValueError("não finito")))
+        dataset = read_json(Path(directory) / "dataset.json")
+        exported = read_json(Path(directory) / "manifest.json")
+        prices = read_json(args.price_windows) if getattr(args, "price_windows", None) else None
+        event = getattr(args, "calibration_event", None)
+        validity = getattr(args, "calibration_valid_for_ms", None)
+        request = study.calibration_request(event=event, valid_for_ms=validity) if event or validity else None
+    except (OSError, TypeError, ValueError):
+        return study._blocked("STUDY_INPUT_FILE_INVALID", state="INVALID")
+    result = study.run_study(manifest=loaded["manifest"], dataset=dataset,
+                             export_manifest=exported, prices=prices, request=request)
+    if getattr(args, "persist", False) and result.get("ok"):
+        import db
+        # CLI explícito; GET não chama init_db, fitting ou escrita.
+        if db.DB_ENABLED:
+            result["persistence"] = await study.persist_study(db.get_session, result)
+        else:
+            result["persistence"] = {"published": False, "reason_code": "DB_DISABLED"}
+    return result
 
 
 def populacao_de_selecao(decisions, scores_por_chave) -> list:
@@ -759,6 +798,14 @@ def main(argv=None) -> int:
     parser.add_argument("--manifest", default=None,
                         help="caminho EXPLÍCITO do manifesto autorizado do estudo "
                              "(sem ele, a comparação real fica bloqueada)")
+    parser.add_argument("--dataset-dir", default=None,
+                        help="pasta externa do export oficial R10B (dataset.json e manifest.json)")
+    parser.add_argument("--price-windows", default=None,
+                        help="arquivo de janelas/quotes históricas verificáveis, sem fallback sintético")
+    parser.add_argument("--calibration-event", default=None,
+                        help="evento explícito do fitting; omitir não inventa uma decisão")
+    parser.add_argument("--calibration-valid-for-ms", type=int, default=None,
+                        help="duração explícita de validade do artefato offline")
     args = parser.parse_args(argv)
     if args.symbols < 1 or args.symbols > 200:
         print(json.dumps({"status": "INVALID_ARGS", "detail": "symbols fora de 1..200"}))

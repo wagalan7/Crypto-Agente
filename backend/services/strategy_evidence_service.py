@@ -6294,7 +6294,9 @@ def verify_study_against_frozen(study: Any, *, frozen: Any, candidate_config: An
     # VÍNCULO primeiro: outro contrato válido divergindo do congelado é
     # rejeitado por identidade, antes de qualquer conferência interna.
     recuperado = (study or {}).get("contract") if isinstance(study, Mapping) else None
-    divergentes = [campo for campo in r12.PRE_SELECTION_CONTRACT_FIELDS
+    frozen_fields = r12.CONTRACT_FIELDS_BY_VERSION.get(
+        contrato_congelado.get("contract_version"), ())
+    divergentes = [campo for campo in frozen_fields
                    if canonical_hash((recuperado or {}).get(campo))
                    != canonical_hash(contrato_congelado.get(campo))]
     if divergentes:
@@ -6322,7 +6324,9 @@ def verify_study_identity(study: Any, *, candidate_config: Any, fingerprint: Any
     """
     from services import preselection_experiment_service as r12
     estudo = study if isinstance(study, Mapping) else {}
-    faltando = [campo for campo in STUDY_REQUIRED_FIELDS if estudo.get(campo) in (None, "")]
+    # A evidência só é tocada DEPOIS de fechar a identidade do contrato.
+    faltando = [campo for campo in STUDY_REQUIRED_FIELDS
+                if campo != "evidence" and estudo.get(campo) in (None, "")]
     if faltando:
         return {"ok": False, "reason_code": STUDY_MISSING, "missing": faltando}
     contrato = estudo.get("contract")
@@ -6391,21 +6395,34 @@ def verify_study_identity(study: Any, *, candidate_config: Any, fingerprint: Any
         return {"ok": False, "reason_code": r12.SCOPE_CONTRACT_MISMATCH,
                 "diverged": ["candidate_config"],
                 "detail": "envelope do catálogo é de outro escopo"}
-    if escopo == r12.SCOPE_SELECTION_ONLY:
+    real_study_allowed = False
+    decision_state = "LEGACY_UNVERIFIED"
+    if contrato.get("contract_version") == r12.PRE_SELECTION_CONTRACT_V2:
         from services import research_manifest_service as rm
-        selecao = contrato.get("selection_config")
-        verdict_sel = rm.validate_selection_config(selecao)
-        if not verdict_sel["ok"]:
-            return {"ok": False, "reason_code": verdict_sel["reason_code"],
-                    "diverged": ["selection_config"],
-                    "detail": verdict_sel.get("detail")}
-        if canonical_hash(verdict_sel["config"]) != \
+        binding = rm.verify_research_binding(
+            contrato.get("research_manifest"), comparison_scope=escopo,
+            baseline_config=contrato.get("baseline_config"),
+            candidate_config=contrato.get("candidate_config"),
+            costs_config=contrato.get("costs_config"),
+            selection_config=contrato.get("selection_config"),
+            dataset_scope=contrato.get("dataset_scope"),
+            temporal_split=contrato.get("temporal_split"),
+            universe_version=contrato.get("universe_version"),
+            policy_version=contrato.get("policy_version"),
+            cutoff_ms=contrato.get("cutoff_ms"),
+            bundle_hash=contrato.get("bundle_hash"))
+        if not binding["ok"]:
+            return {"ok": False, "reason_code": binding["reason_code"],
+                    "diverged": binding.get("diverged") or ["research_manifest"]}
+        if contrato.get("manifest_hash") != binding["manifest_hash"]:
+            return {"ok": False, "reason_code": STUDY_MISMATCH,
+                    "diverged": ["manifest_hash"]}
+        if canonical_hash(contrato.get("selection_config")) != \
                 canonical_hash(envelope.get("selection_config")):
             return {"ok": False, "reason_code": STUDY_MISMATCH,
                     "diverged": ["selection_config"]}
-        if not str(contrato.get("manifest_hash") or "").strip():
-            return {"ok": False, "reason_code": r12.SCOPE_CONTRACT_MISMATCH,
-                    "diverged": ["manifest_hash"]}
+        real_study_allowed = binding["real_study_allowed"]
+        decision_state = binding["decision_state"]
     if not contrato.get("costs_config"):
         divergentes.append("costs_config")
     if not contrato.get("bundle_hash"):
@@ -6422,9 +6439,14 @@ def verify_study_identity(study: Any, *, candidate_config: Any, fingerprint: Any
         divergentes.append("cutoff_ms")
     if divergentes:
         return {"ok": False, "reason_code": STUDY_MISMATCH, "diverged": divergentes}
+    if not isinstance(estudo.get("evidence"), Mapping):
+        return {"ok": False, "reason_code": STUDY_MISSING, "missing": ["evidence"]}
     return {"ok": True, "reason_code": "STUDY_VERIFIED", "diverged": [],
             "contract_hash": recalculado,
-            "verified_fields": list(r12.PRE_SELECTION_CONTRACT_FIELDS)}
+            "verified_fields": list(r12.CONTRACT_FIELDS_BY_VERSION[
+                contrato.get("contract_version")]),
+            "real_study_allowed": real_study_allowed,
+            "decision_state": decision_state}
 
 
 def evaluate_preselection_candidate(evidence: Any) -> Dict[str, Any]:

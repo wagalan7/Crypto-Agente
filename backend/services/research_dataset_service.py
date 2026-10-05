@@ -141,6 +141,7 @@ class ExportRequest:
     #: Motores de SELEÇÃO da candidata (só no escopo SELECTION_ONLY). `None`
     #: mantém o payload/hash do pedido legado byte a byte.
     selection: Optional[Dict[str, Any]] = None
+    embargo_bars: int = 0
 
     @property
     def bar_ms(self) -> int:
@@ -177,6 +178,8 @@ class ExportRequest:
         if self.scope.scope_id != scopes.DEFAULT_SCOPE:
             # Requisição legada continua com o MESMO hash de antes.
             payload["scope"] = self.scope.scope_id
+        if self.scope.scope_id == scopes.SCOPE_PRE_POPULATION:
+            payload["embargo_bars"] = self.embargo_bars
         return payload
 
     def request_hash(self) -> str:
@@ -211,7 +214,15 @@ def parse_request(raw: Any) -> ExportRequest:
     body = _closed(raw, REQUEST_KEYS, "requisição")
     as_of_ms = _as_of(body["as_of_utc"])
     try:
-        split = r10a.ChronologicalSplit(**_closed(body["split"], SPLIT_KEYS, "split"))
+        split_body = dict(body["split"]) if isinstance(body["split"], Mapping) else body["split"]
+        embargo = 0
+        if scope.scope_id == scopes.SCOPE_PRE_POPULATION:
+            if not isinstance(split_body, dict) or "embargo_bars" not in split_body:
+                raise DatasetError("população bruta exige embargo_bars explícito")
+            embargo = split_body.pop("embargo_bars")
+            if type(embargo) is not int or embargo < 0:
+                raise DatasetError("embargo_bars: inteiro não negativo")
+        split = r10a.ChronologicalSplit(**_closed(split_body, SPLIT_KEYS, "split"))
         costs = r10a.CostConfig(**_closed(body["costs"], COST_KEYS, "costs"))
         bootstrap = r10a.BootstrapConfig(**_closed(body["bootstrap"], BOOTSTRAP_KEYS, "bootstrap"))
     except (TypeError, ValueError) as exc:
@@ -248,7 +259,7 @@ def parse_request(raw: Any) -> ExportRequest:
     if as_of_ms <= split.train_start_ms:
         raise DatasetError("as_of_utc deve ser posterior ao início do treino")
     return ExportRequest(as_of_ms, split, baseline, candidate, costs, bootstrap, changed,
-                         scope=scope, selection=selection)
+                         scope=scope, selection=selection, embargo_bars=embargo)
 
 
 @dataclass(frozen=True)
@@ -297,7 +308,7 @@ def plan_selection(request: ExportRequest, index_rows: Iterable) -> SelectionPla
         counts[f"{name}_candidates"] += 1
         boundary = split.validation_start_ms if name == "training" else split.holdout_start_ms
         first_ms = ((decision_ms + bar - 1) // bar) * bar
-        if first_ms + (horizon + split.purge_bars) * bar > boundary:
+        if first_ms + (horizon + split.purge_bars + request.embargo_bars) * bar > boundary:
             counts["purged"] += 1
             continue
         horizon_end = first_ms + horizon * bar
@@ -601,6 +612,13 @@ def build_feature_artifacts(request: ExportRequest, plan: SelectionPlan,
                   # viaja com motivo e a comparação de seleção trata como
                   # UNKNOWN — nunca como zero.
                   "source_schema": payload.get("schema_version"),
+                  # Desfecho da SELEÇÃO, nunca outcome financeiro. É parte do
+                  # dataset hasheado; o consumidor não precisa decorar a linha.
+                  "observed_outcome": payload.get("outcome"),
+                  "observed_decision_scope": payload.get("observed_decision_scope"),
+                  "score_trace": row.get("score_trace"),
+                  "champion_config": dict(payload.get("config") or {}),
+                  "feature_evidence": dict(payload.get("feature_evidence") or {}),
                   "features": (dict(payload["features"])
                                if isinstance(payload.get("features"), Mapping)
                                else None),
@@ -617,8 +635,25 @@ def build_feature_artifacts(request: ExportRequest, plan: SelectionPlan,
         coverage["with_funnel" if funnel else "without_funnel"] += 1
         coverage["with_availability"] += bool(availability)
         source_rows.append({"key": planned.key, "setup": frozen, "funnel": funnel})
+        if scope.scope_id == scopes.SCOPE_PRE_POPULATION:
+            if row.get("candles_malformed"):
+                record["candles_reason"] = "INVALID_CANDLE_DATA"
+                record["candles"] = None
+            elif row.get("candles") is None:
+                record["candles"] = None
+                record["candles_reason"] = "PRICE_WINDOW_NOT_COLLECTED"
+            else:
+                converted = _candles(_json(row["candles"]), planned, request.bar_ms)
+                record["candles"] = converted
+                record["candles_reason"] = None if converted else "PRICE_WINDOW_INCOMPLETE"
     dataset = {"mode": "features_only", "scope": scope.scope_id,
-               "exporter_schema": EXPORTER_SCHEMA, "rows": rows}
+               "exporter_schema": EXPORTER_SCHEMA, "rows": rows,
+               **({"as_of_ms": request.as_of_ms, "split": {**asdict(request.split), "embargo_bars": request.embargo_bars},
+                   "baseline_config": asdict(request.baseline),
+                   "candidate": request.payload_head()["candidate"],
+                   "costs": asdict(request.costs), "bar_ms": request.bar_ms,
+                   "holdout_status": "SEALED"}
+                  if scope.scope_id == scopes.SCOPE_PRE_POPULATION else {})}
     dataset_bytes = canonical_bytes(dataset)
     if len(dataset_bytes) > MAX_ARTIFACT_BYTES:
         raise DatasetLimitError("dataset acima de 16 MiB; estreite a janela")
@@ -642,7 +677,10 @@ def build_feature_artifacts(request: ExportRequest, plan: SelectionPlan,
                    "decision_rule": "decision_at < min(holdout_start, as_of)",
                    "candle_rule": "sem trajetória neste escopo"},
         "request_hash": request.request_hash(),
-        "configs": {"split": asdict(request.split), "horizon_bars": request.horizon_bars,
+        "configs": {"split": {**asdict(request.split),
+                              **({"embargo_bars": request.embargo_bars}
+                                 if scope.scope_id == scopes.SCOPE_PRE_POPULATION else {})},
+                    "horizon_bars": request.horizon_bars,
                     "registration_evidence": "OPERATOR_SUPPLIED_TIMESTAMP_NOT_INDEPENDENT_PROOF"},
         "costs": {"status": "UNKNOWN", "observed_account_costs": False,
                   "net_r_comparable": False},

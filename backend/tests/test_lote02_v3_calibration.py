@@ -46,11 +46,12 @@ POPULACAO = "RESEARCH_SHADOW"
 
 def observacao(indice: int, *, score: float, label, disponivel_ms=None,
                chave=None) -> dict:
+    available = T0 + indice * BAR + 10 * BAR if disponivel_ms is None else disponivel_ms
+    decision = min(T0 + indice * BAR, available - 10 * BAR)
     return {"opportunity_key": chave or f"op-{indice}", "score": score,
             "label": label,
-            "decision_ts_ms": T0 + indice * BAR,
-            "label_available_ts_ms": (T0 + indice * BAR + 10 * BAR
-                                      if disponivel_ms is None else disponivel_ms)}
+            "event": calib.EVENT_TP1, "decision_ts_ms": decision,
+            "label_available_ts_ms": available}
 
 
 def amostra(*, faixas=((55.0, 40, 24), (65.0, 40, 10), (75.0, 40, 32),
@@ -76,7 +77,8 @@ def ajustar(observacoes=None, *, event=calib.EVENT_TP1, cutoff=None,
         payoff_ref="R10A_FROZEN_MANAGEMENT", source="R09_PRE_SELECTION_OUTCOME",
         dataset_hash="d" * 64,
         cutoff_ms=T0 + 1000 * BAR if cutoff is None else cutoff,
-        generated_at_ms=T0 + 1001 * BAR, valid_until_ms=valid_until,
+        generated_at_ms=T0 + 1001 * BAR,
+        valid_until_ms=9_000_000_000_000 if valid_until is None else valid_until,
         versions={"score": s3.SCORE_VERSION, "core": core.CORE_VERSION})
 
 
@@ -311,7 +313,10 @@ class VereditoDoScoreEEv(unittest.TestCase):
                                 population=self.payload["population"])["artifact"]
 
     def test_artefato_real_devolve_probabilidade_da_faixa(self):
-        veredito = s3.calibration_verdict(self.payload, artifact=self.artefato)
+        veredito = s3.calibration_verdict(self.payload, artifact=self.artefato,
+            event=self.artefato["event"], dataset_hash=self.artefato["dataset_hash"],
+            score_config_hash=self.artefato["score_config_hash"],
+            expected_event_definition=self.artefato["event_definition"])
         self.assertEqual(veredito["calibration_state"], "AVAILABLE")
         self.assertEqual(veredito["model_state"], calib.STATE_FITTED)
         # score ≈ 73.3 ⇒ faixa 70–80 ⇒ 32/40.
@@ -331,7 +336,9 @@ class VereditoDoScoreEEv(unittest.TestCase):
 
     def test_artefato_de_outro_modelo_nao_vira_probabilidade(self):
         outro = ajustar(fingerprint="modelo-alheio")["artifact"]
-        veredito = s3.calibration_verdict(self.payload, artifact=outro)
+        veredito = s3.calibration_verdict(self.payload, artifact=outro,
+            event=outro["event"], dataset_hash=outro["dataset_hash"],
+            score_config_hash=outro["score_config_hash"], expected_event_definition=outro["event_definition"])
         self.assertIsNone(veredito["probability"])
         self.assertEqual(veredito["calibration_state"], s3.STATE_UNAVAILABLE)
         self.assertEqual(veredito["reason_code"], calib.FINGERPRINT_MISMATCH)
@@ -353,9 +360,14 @@ class VereditoDoScoreEEv(unittest.TestCase):
         self.assertAlmostEqual(ok["ev_r"], 0.8 * 2.5 - 0.2 - 0.1)
 
     def test_ev_de_gestao_parcial_vem_do_payoff_oos(self):
-        ev = s3.net_ev_from_payoff(expected_payoff_r=0.42, cost_r=0.08,
-                                   source="R10A_PORTFOLIO_REPLAY_OOS",
-                                   sample_size=120)
+        rows = [{"opportunity_key": f"pay-{i}", "decision_ts_ms": T0 + BAR,
+                 "label_available_ts_ms": T0 + 2 * BAR, "net_r": 0.34,
+                 "event": calib.EVENT_TP1, "label": True, "costs_included": True,
+                 "management_hash": "M", "dataset_hash": "D", "costs_hash": "C"} for i in range(120)]
+        proof = calib.build_oos_payoff_evidence(rows, management_hash="M", dataset_hash="D",
+            costs_hash="C", event=calib.EVENT_TP1, cutoff_ms=T0, now_ms=T0 + 3 * BAR)["evidence"]
+        ev = s3.net_ev_from_payoff(evidence=proof, management_hash="M", dataset_hash="D",
+            costs_hash="C", event=calib.EVENT_TP1, now_ms=T0 + 3 * BAR)
         self.assertTrue(ev["available"])
         self.assertAlmostEqual(ev["ev_r"], 0.34)
         self.assertFalse(ev["derived_from_probability"])

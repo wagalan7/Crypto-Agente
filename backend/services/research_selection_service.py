@@ -60,15 +60,20 @@ def _row_identity(row: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if lado not in ("long", "short"):
         return None, ROW_INVALID
     instante = row.get("decision_ts_ms")
-    if isinstance(instante, bool) or not isinstance(instante, (int, float)):
+    if (_number(instante) is None or instante < 0 or int(instante) != instante):
         return None, ROW_INVALID
     return {"opportunity_key": str(row["opportunity_key"]),
             "symbol": str(row["symbol"]), "side": lado,
             "decision_ts_ms": int(instante)}, None
 
 
-def _baseline_decision(row: Mapping[str, Any]) -> Dict[str, Any]:
+def _baseline_decision(row: Mapping[str, Any], baseline: Any) -> Dict[str, Any]:
     """Decisão OBSERVADA do champion — aceita, vetada ou desconhecida."""
+    from services import research_manifest_service as rm
+    checked = rm.verify_observed_baseline(row, baseline)
+    if not checked["ok"]:
+        return {"state": STATE_UNKNOWN, "reason_code": checked["reason_code"],
+                "provenance": "OBSERVED_CHAMPION_DECISION"}
     observado = row.get("observed_outcome")
     rotulo = str(observado or "").strip().upper()
     if rotulo == "ACCEPTED":
@@ -83,7 +88,8 @@ def _baseline_decision(row: Mapping[str, Any]) -> Dict[str, Any]:
             "provenance": "OBSERVED_CHAMPION_DECISION"}
 
 
-def _candidate_decision(row: Mapping[str, Any], *, rule: Mapping[str, Any]
+def _candidate_decision(row: Mapping[str, Any], *, rule: Mapping[str, Any],
+                        config: Mapping[str, Any]
                         ) -> Dict[str, Any]:
     """Decisão REAL da candidata pelo motor declarado no manifesto."""
     from services import score_v3_service as s3
@@ -93,8 +99,9 @@ def _candidate_decision(row: Mapping[str, Any], *, rule: Mapping[str, Any]
                 "provenance": rule.get("kind")}
     limpo = {chave: valor for chave, valor in features.items()
              if _number(valor) is not None}
+    cfg = s3.ScoreConfig(**config)
     payload = s3.score(limpo, playbook=str(rule.get("playbook")),
-                       side=str(row.get("side")))
+                       side=str(row.get("side")), config=cfg)
     if payload.get("state") != s3.STATE_OK or payload.get("score") is None:
         return {"state": STATE_UNKNOWN, "reason_code": SCORE_UNAVAILABLE,
                 "detail": list(payload.get("reason_codes") or ()),
@@ -114,14 +121,19 @@ def _candidate_decision(row: Mapping[str, Any], *, rule: Mapping[str, Any]
 
 
 def decide_row(row: Mapping[str, Any], *, rule: Mapping[str, Any],
-               side_label: str) -> Dict[str, Any]:
+               side_label: str, config: Optional[Mapping[str, Any]] = None,
+               baseline: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Decisão de UM lado para UMA linha, pela regra congelada do manifesto."""
     from services import research_manifest_service as rm
     kind = str((rule or {}).get("kind") or "")
     if kind == rm.RULE_OBSERVED_CHAMPION:
-        return {**_baseline_decision(row), "side_label": side_label}
+        return {**_baseline_decision(row, baseline), "side_label": side_label}
     if kind == rm.RULE_SCORE_V3_MIN:
-        return {**_candidate_decision(row, rule=rule), "side_label": side_label}
+        if not isinstance(config, Mapping):
+            return {"state": STATE_UNKNOWN, "reason_code": "SCORE_CONFIG_MISSING",
+                    "side_label": side_label}
+        return {**_candidate_decision(row, rule=rule, config=config),
+                "side_label": side_label}
     return {"state": STATE_UNKNOWN, "reason_code": RULE_NOT_IMPLEMENTED,
             "side_label": side_label, "provenance": kind or None}
 
@@ -154,6 +166,8 @@ def compare_population(rows: Sequence[Mapping[str, Any]], *,
     cobertura = {"rows_total": 0, "rows_invalid": 0, "excluded_symmetric": 0,
                  "excluded_reasons": {}, "rows_decided": 0,
                  "levels_missing": 0}
+    seen = set()
+    population, split = manifesto["population"], manifesto["split"]
     for bruta in rows or ():
         cobertura["rows_total"] += 1
         identidade, motivo = _row_identity(bruta)
@@ -162,7 +176,20 @@ def compare_population(rows: Sequence[Mapping[str, Any]], *,
             cobertura["excluded_reasons"][motivo] = \
                 cobertura["excluded_reasons"].get(motivo, 0) + 1
             continue
-        por_lado = {lado: decide_row(bruta, rule=regras[lado], side_label=lado)
+        if identidade["opportunity_key"] in seen:
+            return {"ok": False, "reason_code": "DUPLICATE_OPPORTUNITY"}
+        seen.add(identidade["opportunity_key"])
+        symbol = identidade["symbol"].upper()
+        quote = symbol.split(":")[0].split("/")[-1]
+        admitted_symbols = population["symbols"]
+        if (quote != population["quote"]
+                or (admitted_symbols is not None and symbol not in admitted_symbols)
+                or not split["train_start_ms"] <= identidade["decision_ts_ms"]
+                    < min(split["holdout_start_ms"], split["as_of_ms"])):
+            return {"ok": False, "reason_code": "POPULATION_MANIFEST_MISMATCH"}
+        por_lado = {lado: decide_row(bruta, rule=regras[lado], side_label=lado,
+                                     config=manifesto[lado]["score_config"],
+                                     baseline=manifesto[lado])
                     for lado in regras}
         for lado, decisao in por_lado.items():
             contagem[lado][decisao["state"]] += 1
@@ -210,6 +237,8 @@ def compare_population(rows: Sequence[Mapping[str, Any]], *,
         "selected": {lado: list(linhas) for lado, linhas in lados.items()},
         "counts": contagem,
         "coverage": {**cobertura,
+                     "minimum_rows": population["min_rows"],
+                     "sample_sufficient": base_total >= population["min_rows"],
                      "coverage_pct": (round(100.0 * base_total / cobertura["rows_total"], 4)
                                       if cobertura["rows_total"] else None)},
         "decisions": decisoes,

@@ -12,7 +12,8 @@ separada, após revisão. Sem push/deploy/ativação.
 
 ETAPA: **LOCAL_VERIFIED** (provas locais executadas) + **WAITING_DECISION**
 (candidata/baseline/escopo/custos) + **WAITING_DATA** (amostra prospectiva).
-Lote 02 concluído nesta execução; Lotes 03/04 NÃO iniciados.
+Entrega original em `a39ab358`; correção integrada em andamento em 05/10/2026.
+O checkpoint vigente é `LOTE02_CORRECAO_CHECKPOINT.md`. Lotes 03/04 NÃO iniciados.
 
 | # | Etapa do prompt | Estado |
 |---|---|---|
@@ -65,9 +66,10 @@ Fixtures adaptadas (garantias preservadas): `test_lote_d_score_v3`,
    manifestos de teste ficam `APPROVED_TEST_ONLY` (`real_study_allowed=false`).
 2. **WAITING_DATA** — coleta desligada: não existe amostra prospectiva, logo não
    há calibração 200/30 nem evidência econômica.
-3. **Lacuna de features** — o scan champion não calcula as features de
-   estrutura/gatilho do Score V3; estudo `SELECTION_ONLY` sobre a captura do
-   champion fica `WAITING_DATA` em vez de decidir sem base.
+3. **Cobertura prospectiva** — o produtor local de features foi acrescentado na
+   correção, sem backfill/fetch novo; referências ausentes continuam UNKNOWN.
+   Preços históricos/quotes para replay exigem arquivo explícito; não se
+   substituem dados ausentes por mercado sintético.
 4. **Limites de aceitação OOS** — `CALIBRATION_OOS_THRESHOLDS_DECISION_REQUIRED`.
 5. Quarentena por posição não reconhecida (apontada na última verificação da
    publicação) **não** foi tocada neste lote, conforme instrução.

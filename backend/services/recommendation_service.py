@@ -22,6 +22,7 @@ import math
 import numbers
 import os
 import time
+from contextvars import ContextVar
 from typing import List, NamedTuple, Optional, Dict, Any, Tuple
 from pydantic import BaseModel
 
@@ -31,7 +32,7 @@ from services.pattern_service import detect_all_patterns, record_breakouts_and_r
 from services.signal_service import build_trade_signal, determine_direction
 from services.derivatives_service import analyze_derivatives
 from services.mtf_service import analyze_mtf
-from services.data_freshness_service import prepare_closed_candles
+from services.data_freshness_service import prepare_closed_candles, timeframe_ms
 from services import score_trace_service as _score_trace_service
 from models.trade_signal import TradeSignal, SignalDirection
 
@@ -48,6 +49,44 @@ class _FailSoftScoreTrace:
 
 
 _score_trace = _FailSoftScoreTrace()
+_PRE_CAPTURE = ContextVar('r13_pre_capture', default=False)
+
+
+def _capture_research_inputs(sig, df):
+    """Inputs locais da última vela FECHADA; nunca consulta mercado novamente."""
+    try:
+        last = df.iloc[-1]
+        candle = (sig.data_freshness or {}).get('candle') or {}
+        if (candle.get('quality') != 'FRESH' or candle.get('symbol') != sig.symbol
+                or candle.get('timeframe') != sig.timeframe):
+            return
+        values = {name: float(last[name]) for name in ('open', 'high', 'low', 'close')}
+        if not all(math.isfinite(x) and x > 0 for x in values.values()):
+            return
+        if not values['low'] <= min(values['open'], values['close']) <= max(values['open'], values['close']) <= values['high']:
+            return
+        from services.pattern_service import _pattern_key_level
+        refs = set()
+        for pattern in getattr(sig, 'patterns', ()) or ():
+            if pattern.direction != sig.direction or not (pattern.breakout_confirmed or pattern.retest_active):
+                continue
+            points = pattern.points or []
+            times = [int(p.timestamp * 1000 if p.timestamp < 100_000_000_000 else p.timestamp) for p in points]
+            if not times or max(times) >= candle.get('open_time_ms', 0):
+                continue
+            level = _finite_num(_pattern_key_level(pattern))
+            if level is not None and level > 0:
+                refs.add((level, max(times)))
+        reference = next(iter(refs)) if len(refs) == 1 else (None, None)
+        # Atributo interno não serializado pelo modelo: observar não muda o
+        # payload público/freshness usado pelo champion e pelo executor.
+        object.__setattr__(sig, '_r13_research_inputs', {
+            'version': 'R13_POINT_IN_TIME_FEATURES_V1', **values,
+            'trigger_reference': reference[0], 'trigger_reference_ms': reference[1],
+            'candle_close_ms': candle.get('close_time_ms'),
+            'observed_at_ms': candle.get('observed_at_ms'), 'quality': 'FRESH'})
+    except Exception:
+        pass   # observabilidade não altera o champion
 
 
 SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
@@ -2478,6 +2517,8 @@ async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[Trade
             derivatives=derivatives, mtf=mtf, with_backtest=False,
         )
         _attach_data_freshness(sig, freshness)
+        if _PRE_CAPTURE.get():
+            _capture_research_inputs(sig, df)
         return sig
     except Exception:
         return None
@@ -2492,15 +2533,25 @@ async def _best_tf_for_symbol_server(svc, symbol: str,
     desempate do champion não mudam: a lista é um espelho, não um critério.
     Quando o chamador não pede a lista (coleta desligada), nada extra é feito.
     """
-    results = list(await asyncio.gather(*[
-        _analyze_symbol_tf_server(svc, symbol, tf) for tf in SCAN_TFS
-    ]))
+    token = _PRE_CAPTURE.set(True) if evaluated_out is not None else None
+    try:
+        results = list(await asyncio.gather(*[
+            _analyze_symbol_tf_server(svc, symbol, tf) for tf in SCAN_TFS
+        ]))
+    finally:
+        if token is not None:
+            _PRE_CAPTURE.reset(token)
     # TFs altos (gated): avaliados com cache TTL + peso de relevância.
     if HIGH_TF_PATTERNS_ENABLED:
-        results += list(await asyncio.gather(*[
-            _htf_signal_cached(symbol, tf, lambda tf=tf: _analyze_symbol_tf_server(svc, symbol, tf))
-            for tf in HIGH_TF_LIST
-        ]))
+        token = _PRE_CAPTURE.set(True) if evaluated_out is not None else None
+        try:
+            results += list(await asyncio.gather(*[
+                _htf_signal_cached(symbol, tf, lambda tf=tf: _analyze_symbol_tf_server(svc, symbol, tf))
+                for tf in HIGH_TF_LIST
+            ]))
+        finally:
+            if token is not None:
+                _PRE_CAPTURE.reset(token)
     confirm_dirs = _htf_confirm_dirs(results) if (HIGH_TF_PATTERNS_ENABLED and HIGH_TF_CONFIRM_ENABLED) else set()
     scored: List[tuple] = []
     for sig in results:
@@ -2601,6 +2652,75 @@ def _preselection_features(sig, score, *, selection_score=None,
         if valor is None or risco is None or entrada is None:
             return None
         return abs(valor - entrada) / risco
+    trace = _score_trace_service.freeze_trace(getattr(sig, 'r08_score_trace', None))
+    stages = trace.get('stages') or {}
+    atr = _finite_num(_indicator_field(indicadores, 'atr'))
+    side = _enum_value(getattr(sig, 'direction', None))
+    fresh = getattr(sig, 'data_freshness', None) or {}
+    fresh = fresh if isinstance(fresh, dict) else {}
+    candle = fresh.get('candle') or {}
+    inputs = getattr(sig, '_r13_research_inputs', None) or {}
+    inputs = inputs if isinstance(inputs, dict) else {}
+    close_ms = _finite_num(candle.get('close_time_ms'))
+    observed = _finite_num(inputs.get('observed_at_ms'))
+    valid_inputs = (inputs.get('version') == 'R13_POINT_IN_TIME_FEATURES_V1'
+                    and inputs.get('quality') == 'FRESH'
+                    and candle.get('quality') == 'FRESH'
+                    and candle.get('symbol') == getattr(sig, 'symbol', None)
+                    and candle.get('timeframe') == getattr(sig, 'timeframe', None)
+                    and close_ms is not None and inputs.get('candle_close_ms') == close_ms
+                    and observed is not None and close_ms <= observed <= int(time.time() * 1000))
+    period = timeframe_ms(getattr(sig, 'timeframe', ''))
+    valid_inputs = valid_inputs and period is not None and int(time.time() * 1000) - close_ms <= period * P04C_MAX_CANDLE_LAG_PERIODS
+    ohlc = {key: _finite_num(inputs.get(key)) for key in ('open', 'high', 'low', 'close')}
+    valid_inputs = valid_inputs and all(value is not None and value > 0 for value in ohlc.values())
+    valid_inputs = valid_inputs and ohlc['low'] <= min(ohlc['open'], ohlc['close']) <= max(ohlc['open'], ohlc['close']) <= ohlc['high']
+    pivot = _finite_num(_indicator_field(indicadores, 'pivot_low' if side == 'long' else 'pivot_high'))
+    # Definição prospectiva V1: suporte estrutural observado e geometria de
+    # invalidação. Não estima edge nem infere estrutura de nome de padrão.
+    structural = valid_inputs and atr is not None and atr > 0 and pivot is not None and pivot > 0 and side in ('long', 'short')
+    quality = None
+    target = _finite_num(getattr(sig, 'tp2', None))
+    if structural and entrada is not None and stop is not None and target is not None:
+        quality = float(stop < pivot < entrada < target if side == 'long' else stop > pivot > entrada > target)
+    body = follow = None
+    if valid_inputs and atr is not None and atr > 0 and side in ('long', 'short'):
+        span = ohlc['high'] - ohlc['low']
+        body = abs(ohlc['close'] - ohlc['open']) / span if span > 0 else None
+        reference = _finite_num(inputs.get('trigger_reference'))
+        reference_ms = _finite_num(inputs.get('trigger_reference_ms'))
+        open_ms = _finite_num(candle.get('open_time_ms'))
+        if reference is not None and reference > 0 and reference_ms is not None and open_ms is not None and reference_ms < open_ms:
+            follow = max(0.0, (ohlc['close'] - reference) * (1 if side == 'long' else -1)) / atr
+    higher = (mtf or {}).get('higher_tfs') if isinstance(mtf, dict) else None
+    valid_htf = {}
+    conflicted_htf = set()
+    for item in higher if isinstance(higher, list) else ():
+        if not isinstance(item, dict):
+            continue
+        proof = (item.get('data_freshness') or {}).get('candle') or {}
+        tf = str(item.get('timeframe') or '')
+        close = _finite_num(proof.get('close_time_ms'))
+        seen = _finite_num(proof.get('observed_at_ms'))
+        label = item.get('ema_aligned')
+        htf_period = timeframe_ms(tf)
+        if (_TF_RANK.get(tf, 0) > _TF_RANK.get(getattr(sig, 'timeframe', ''), 0)
+                and proof.get('quality') == 'FRESH' and close is not None
+                and proof.get('symbol') == getattr(sig, 'symbol', None)
+                and proof.get('timeframe') == tf
+                and seen is not None and close <= seen <= int(time.time() * 1000)
+                and htf_period is not None and int(time.time() * 1000) - close <= htf_period * P04C_MAX_CANDLE_LAG_PERIODS
+                and label in ('bullish', 'bearish', 'mixed')):
+            if tf in conflicted_htf:
+                continue
+            if tf in valid_htf and valid_htf[tf] != label:
+                conflicted_htf.add(tf)
+                valid_htf.pop(tf)
+            else:
+                valid_htf[tf] = label
+    ratio = (sum(label == ('bullish' if side == 'long' else 'bearish') for label in valid_htf.values()) / len(valid_htf)
+             if valid_htf and side in ('long', 'short') else None)
+    market = _finite_num(getattr(sig, 'current_price', None))
     return {
         "atr": _finite_num(_indicator_field(indicadores, "atr")),
         "adx": _finite_num(_indicator_field(indicadores, "adx")),
@@ -2612,16 +2732,19 @@ def _preselection_features(sig, score, *, selection_score=None,
         "funding_pct": _finite_num(((getattr(sig, "derivatives", None) or {}) or {}).get(
             "funding_rate_pct") if isinstance(getattr(sig, "derivatives", None), dict) else None),
         "rr_tp1": _rr("tp1"), "rr_tp2": _rr("tp2"),
-        "entry_distance_atr": None,
+        "entry_distance_atr": abs(market - entrada) / atr if valid_inputs and market is not None and entrada is not None and atr is not None and atr > 0 else None,
         "score": _finite_num(score),
         "score_before_learning": _finite_num(score_before_learning),
-        "selection_score": _finite_num(selection_score),
+        "selection_score": _finite_num(selection_score if selection_score is not None else (stages.get('selection_score') or {}).get('value')),
         "regime": (regime or {}).get("regime") if isinstance(regime, dict) else None,
         "regime_source": "regime_service" if isinstance(regime, dict) else None,
         "structure": _enum_value(getattr(sig, "trade_type", None)),
         "mtf_alignment": (mtf or {}).get("alignment") if isinstance(mtf, dict) else None,
-        "htf_alignment_ratio": _finite_num((mtf or {}).get("alignment_score"))
-        if isinstance(mtf, dict) else None,
+        "htf_alignment_ratio": ratio,
+        "structure_quality": quality,
+        "level_distance_atr": abs(entrada - pivot) / atr if structural and entrada is not None else None,
+        "trigger_body_ratio": body,
+        "trigger_follow_through_atr": follow,
         "tier": tier, "tier_provisional": tier_provisional,
         "quality": _enum_value(getattr(sig, "confidence", None)) and None,
         "data_source": ((getattr(sig, "data_freshness", None) or {}) or {}).get("source")
@@ -2649,12 +2772,13 @@ def _preselection_candidate(sig, score, *, stages, accepted: bool,
         side = side if side in ("long", "short") else None
         # `TradeSignal.indicators` é `Indicator` (modelo), não dict. Exigir dict
         # perderia o ATR real; nada é fabricado quando ele não existe.
+        trace = _score_trace_service.freeze_trace(getattr(sig, 'r08_score_trace', None))
         setup = {
             "symbol": str(getattr(sig, "symbol", "") or ""),
             "timeframe": str(getattr(sig, "timeframe", "") or ""),
             "side": side,
             "playbook": "CHAMPION_LEGACY",
-            "playbook_version": "SCORE_V2",
+            "playbook_version": trace.get('formula_effective') or 'UNKNOWN_FORMULA',
             "trigger_candle_ms": int(trigger) if isinstance(trigger, (int, float)) else None,
             "entry": _finite_num(getattr(sig, "entry", None)),
             "stop_loss": _finite_num(getattr(sig, "stop_loss", None)),
@@ -2674,6 +2798,24 @@ def _preselection_candidate(sig, score, *, stages, accepted: bool,
             linha["features"] = features
         if evaluation:
             linha["evaluation"] = evaluation
+        linha['score_trace'] = trace
+        linha['config'] = {'score_trace_version': trace.get('version'),
+                           'formula_requested': trace.get('formula_requested'),
+                           'formula_effective': trace.get('formula_effective'),
+                           'score': trace.get('config') or {},
+                           'decision_scope': 'FINAL_SCANNER_SELECTION'}
+        linha['feature_evidence'] = {
+            'version': 'R13_POINT_IN_TIME_FEATURES_V1',
+            'observed_at_ms': (candle or {}).get('observed_at_ms'),
+            'candle_close_ms': trigger,
+            'quality': (candle or {}).get('quality') or 'UNKNOWN',
+            'missing_reasons': {name: 'POINT_IN_TIME_INPUT_UNAVAILABLE' for name in
+                ('htf_alignment_ratio', 'structure_quality', 'level_distance_atr',
+                 'trigger_body_ratio', 'trigger_follow_through_atr', 'entry_distance_atr')
+                if (features or {}).get(name) is None}}
+        linha['observed_decision_scope'] = 'FINAL_SCANNER_SELECTION'
+        if hasattr(sig, '_r13_research_inputs'):
+            object.__delattr__(sig, '_r13_research_inputs')
         return linha
     except Exception:
         return None
@@ -2720,6 +2862,9 @@ async def get_recommendations_via_vision(
     #    recomendações é bit a bit a mesma de antes.
     _pre_on, _pre_mod = _preselection_gate()
     _pre_rows: List[dict] = []
+    _pre_for_rec: Dict[int, dict] = {}
+    _pre_admitted = 0
+    _pre_refused = 0
     _pre_coverage: Dict[str, int] = {}
     _cycle_ts_ms = int(time.time() * 1000)
 
@@ -2736,7 +2881,8 @@ async def get_recommendations_via_vision(
             payload = _pre_mod.cycle_coverage(
                 cycle_ts_ms=_cycle_ts_ms, symbols_requested=symbols_requested,
                 symbols_evaluated=symbols_evaluated,
-                candidates_observed=len(_pre_rows), reasons=_pre_coverage,
+                candidates_observed=_pre_admitted, candidates_seen=len(_pre_rows),
+                candidates_refused=_pre_refused, reasons=_pre_coverage,
                 state=state or (_pre_mod.COVERAGE_COMPLETE if not _pre_coverage
                                 else _pre_mod.COVERAGE_INCOMPLETE))
             _pre_mod.record_cycle_coverage(payload)
@@ -2747,10 +2893,20 @@ async def get_recommendations_via_vision(
         """Entrega as linhas observadas ao acervo existente (no-op se desligado)."""
         if not _pre_on or not _pre_rows:
             return
+        nonlocal _pre_admitted, _pre_refused
         try:
             from services import decision_observation_service as _r09obs
-            _r09obs.observe_preselection(_pre_rows)
+            for start in range(0, len(_pre_rows), _pre_mod.MAX_BATCH_RECORDS):
+                batch = _pre_rows[start:start + _pre_mod.MAX_BATCH_RECORDS]
+                result = _r09obs.observe_preselection(batch)
+                admitted = int(result.get('accepted', 0)) + int(result.get('vetoed', 0))
+                _pre_admitted += admitted
+                _pre_refused += len(batch) - admitted
+            if _pre_refused:
+                _pre_note(_pre_mod.COVERAGE_BUDGET, _pre_refused)
         except Exception as exc:   # observação nunca altera a decisão
+            _pre_refused = max(_pre_refused, len(_pre_rows) - _pre_admitted)
+            _pre_note(_pre_mod.COVERAGE_SOURCE_FAILURE, _pre_refused or 1)
             _log.debug(f"[r09-pre] observação indisponível: {exc}")
 
     def _observe_pre(sig_obj, score_value, stages, *, accepted: bool,
@@ -2764,6 +2920,7 @@ async def get_recommendations_via_vision(
                                       evaluation=evaluation)
         if row is not None:
             _pre_rows.append(row)
+        return row
 
     def _evaluation_block(avaliados, escolhido, sig_obj) -> dict:
         """TFs avaliados × TF escolhido, do próprio símbolo."""
@@ -3083,6 +3240,8 @@ async def get_recommendations_via_vision(
                 elif tier == "A":
                     tier = "B"
                 elif tier == "B":
+                    _observe_pre(sig, score, _pre_stages + [_stage('MTF_REGIME', 'REJECTED', 'ALT_LONG_DOWNGRADE_BELOW_TIER')],
+                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval)
                     continue
             # Trava simétrica: downgrade de SHORT contra pernada forte de alta
             if regime.get("downgrade_shorts") and sig.direction == "short":
@@ -3091,6 +3250,8 @@ async def get_recommendations_via_vision(
                 elif tier == "A":
                     tier = "B"
                 elif tier == "B":
+                    _observe_pre(sig, score, _pre_stages + [_stage('MTF_REGIME', 'REJECTED', 'SHORT_DOWNGRADE_BELOW_TIER')],
+                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval)
                     continue
             # Trava de CONTRA-TENDÊNCIA por MOEDA (higher-TF EMA do próprio ativo).
             # Mesmo gate do caminho batch — pega short em alt subindo sozinha, que
@@ -3109,12 +3270,14 @@ async def get_recommendations_via_vision(
                 elif tier == "A":
                     tier = "B"
                 elif tier == "B":
+                    _observe_pre(sig, score, _pre_stages + [_stage('MTF_REGIME', 'REJECTED', 'COUNTER_TREND_DOWNGRADE_BELOW_TIER')],
+                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval)
                     continue
                 _log.info(f"[server-scan][ct-brake] downgrade {sig.symbol} {sig.direction}→{tier}: {ct_reason}")
         except Exception:
             pass
         _rec = _build_recommendation(sig, score, tier)
-        _observe_pre(sig, score, _pre_stages + [
+        _pre_row = _observe_pre(sig, score, _pre_stages + [
             _stage("SELECTION", "PASSED"),
             _stage("MTF_REGIME", "PASSED"),
             _stage("GEOMETRY_RR", "PASSED" if _rec is not None else "REJECTED",
@@ -3123,11 +3286,8 @@ async def get_recommendations_via_vision(
             evaluation=_pre_eval)
         if _rec is not None:
             recommendations.append(_rec)
-
-    # Observação PRÉ-seleção (no-op quando o modo está desligado) + cobertura
-    # do ciclo: por que símbolo/TF não foi avaliado, sem inventar oportunidade.
-    _pre_publish()
-    _pre_flush(_pre_requested, _stats["done"])
+            if _pre_row is not None:
+                _pre_for_rec[id(_rec)] = _pre_row
 
     # BTC correlation throttle (idem batch)
     _apply_btc_correlation_throttle(recommendations, regime)
@@ -3138,6 +3298,14 @@ async def get_recommendations_via_vision(
     # Portfolio risk guard (#5) — pulável pro caminho de display amplo (decouple).
     if apply_guard:
         recommendations = await _apply_portfolio_guard(recommendations)
+    if _pre_on:
+        selected = {id(rec) for rec in recommendations}
+        for rec_id, row in _pre_for_rec.items():
+            row['accepted'] = rec_id in selected
+            if rec_id not in selected:
+                row['stages'].append(_stage('RISK', 'REJECTED', 'PORTFOLIO_GUARD'))
+        _pre_publish()
+        _pre_flush(_pre_requested, _stats['done'])
     return recommendations
 
 

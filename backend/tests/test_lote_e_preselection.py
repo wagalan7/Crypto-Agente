@@ -338,9 +338,21 @@ class AditividadeESegregacao(unittest.TestCase):
             if isinstance(node, ast.Import):
                 imported.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module.split(".")[0])
+                imported.add(node.module if node.module.startswith('services.')
+                             else node.module.split(".")[0])
         self.assertEqual(imported - {"__future__"},
-                         {"hashlib", "json", "math", "os", "typing"})
+                         {"hashlib", "json", "math", "os", "typing",
+                          "services.score_trace_service"})
+        # Exceção restrita ao sanitizador PURO, não ao namespace services:
+        # verifica também as dependências transitivas permitidas desse módulo.
+        dependency = ast.parse((BACKEND / 'services' / 'score_trace_service.py').read_text())
+        dependencies = set()
+        for node in ast.walk(dependency):
+            if isinstance(node, ast.Import):
+                dependencies.update(alias.name.split('.')[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                dependencies.add(node.module.split('.')[0])
+        self.assertEqual(dependencies, {'__future__', 'json', 'math', 'numbers'})
 
     def test_escopo_legado_preservado(self):
         from services import decision_observation_service as r09

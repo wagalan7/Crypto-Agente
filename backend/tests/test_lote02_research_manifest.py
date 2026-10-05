@@ -38,6 +38,7 @@ from services import offline_replay_service as r10a          # noqa: E402
 from services import research_manifest_service as rm         # noqa: E402
 from services import score_v3_service as s3                  # noqa: E402
 from services import strategy_core_service as core           # noqa: E402
+from services import score_trace_service as score_trace       # noqa: E402
 
 BAR5 = 300_000
 T0 = 1_780_000_000_000
@@ -57,14 +58,27 @@ def custos_config() -> dict:
                            funding_bps_per_bar=1.0).manifest()
 
 
+def champion_trace() -> dict:
+    """Configuração sintética capturada pelo contrato REAL, nunca ENV local."""
+    config = {"v2_w_conf": 0.6, "v2_w_adx": 0.2, "v2_w_der": 0.2,
+              "legacy_w_conf": 0.35, "legacy_w_mtf": 0.25,
+              "legacy_w_rr": 0.25, "legacy_w_der": 0.10, "legacy_w_win": 0.5,
+              "tier_aplus": 75.0, "tier_a": 65.0, "tier_b": 52.0,
+              "high_tf_confirm_bonus": 6.0, "high_tf_patterns_enabled": True,
+              "high_tf_confirm_enabled": True}
+    return score_trace.freeze_trace({"version": score_trace.VERSION,
+        "formula_requested": "SCORE_V2", "formula_effective": "SCORE_V2",
+        "fallback_used": False, "config": config})
+
+
 def lado(label: str, **mudancas) -> dict:
     base = {
         "label": label,
         "core_version": core.CORE_VERSION,
         "core_config_hash": core.DEFAULT_CONFIG.config_hash(),
-        "score_version": s3.SCORE_VERSION,
-        "score_config_hash": s3.model_fingerprint(
-            playbook=core.PLAYBOOK_TREND_PULLBACK, config=s3.DEFAULT_CONFIG),
+        "score_version": "SCORE_V2",
+        "score_config_hash": rm.observed_baseline_hash(champion_trace()),
+        "score_config": None,
         "policy_version": "R11C_ROBUST_POLICY_V1",
         "playbooks": list(core.PLAYBOOKS),
         "management_config": gestao(),
@@ -90,8 +104,11 @@ def manifesto(*, scope=rm.SCOPE_SELECTION, decision_state=rm.DECISION_TEST_ONLY,
     if scope == rm.SCOPE_SELECTION:
         mudanca = {"component": "SCORE_MODEL", "from_value": "SCORE_V2",
                    "to_value": s3.SCORE_VERSION}
-        candidata = lado("candidata", score_version="R08D_SCORE_V3_CANDIDATE",
-                         score_config_hash="c" * 64,
+        candidata = lado("candidata", score_version=s3.SCORE_VERSION,
+                         score_config=s3.DEFAULT_CONFIG.as_dict(),
+                         score_config_hash=s3.model_fingerprint(
+                             playbook=core.PLAYBOOK_TREND_PULLBACK,
+                             config=s3.DEFAULT_CONFIG),
                          selection_rule={"kind": rm.RULE_SCORE_V3_MIN,
                                          "min_score": 60.0,
                                          "playbook": core.PLAYBOOK_TREND_PULLBACK,
@@ -106,8 +123,8 @@ def manifesto(*, scope=rm.SCOPE_SELECTION, decision_state=rm.DECISION_TEST_ONLY,
         "decision": decisao,
         "comparison_scope": scope,
         "population": {"universe_version": "UNIVERSE_TOP60_V1",
-                       "cohort": "R09_PRE_SELECTION_ACCEPTED",
-                       "scope_id": "R09_PRE_SELECTION_ACCEPTED",
+                       "cohort": "R09_PRE_SELECTION_POPULATION",
+                       "scope_id": "R09_PRE_SELECTION_POPULATION",
                        "quote": "USDT", "symbols": None, "min_rows": 50},
         "isolated_change": mudanca,
         "baseline": lado("baseline"),
@@ -225,12 +242,17 @@ class ManifestoCongelado(unittest.TestCase):
         recusa(self, corpo, rm.SCOPE_NOT_IMPLEMENTED)
 
     def test_mudanca_precisa_ser_isolada_e_do_escopo(self):
-        # Declarou SCORE_MODEL mas o núcleo também mudou.
+        # Declarou SCORE_MODEL mas a gestão também mudou (motor válido).
         vazou = manifesto()
-        vazou["candidate"] = lado("candidata", score_version="OUTRO",
-                                  score_config_hash="c" * 64,
-                                  core_config_hash="d" * 64)
+        vazou["candidate"]["management_config"] = gestao(tp1_fraction=0.6)
         recusa(self, vazou, rm.CHANGE_NOT_ISOLATED)
+        # A fixture antiga com versão/hash inventados agora é recusa explícita.
+        inexistente = manifesto()
+        inexistente["candidate"]["score_version"] = "OUTRO"
+        recusa(self, inexistente, rm.CONFIG_INVALID)
+        hash_invalido = manifesto()
+        hash_invalido["candidate"]["score_config_hash"] = "c" * 64
+        recusa(self, hash_invalido, rm.MANIFEST_DRIFT)
         # Componente de gestão sob escopo de seleção.
         trocado = manifesto()
         trocado["isolated_change"] = {"component": "MANAGEMENT_CONFIG",

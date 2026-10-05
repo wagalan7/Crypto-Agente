@@ -46,7 +46,16 @@ async def get_research_status(days: int = 30) -> dict:
             "reason_code": "LAB_MANIFEST_UNAVAILABLE",
         }
     try:
-        result["lote_final"] = lote_final_summary()
+        from services.research_study_service import load_latest_study
+        import db
+        if db.DB_ENABLED:
+            persisted = await asyncio.wait_for(load_latest_study(db.get_session), timeout=3.0)
+        else:
+            persisted = {"available": True, "artifact": None, "manifest": None,
+                         "reason_code": "DB_DISABLED"}
+        result["lote_final"] = lote_final_summary(
+            artifact=persisted.get("artifact"), manifest=persisted.get("manifest"),
+            read_error=None if persisted.get("available") else persisted.get("reason_code"))
     except Exception:
         result["lote_final"] = {"state": "UNAVAILABLE", "promotable": False,
                                 "reason_code": "LOTE_SUMMARY_UNAVAILABLE"}
@@ -68,7 +77,7 @@ EVIDENCE_ERROR = "ERROR"
 EVIDENCE_BLOCKED = "BLOCKED_MISSING_DECISION"
 
 
-def evidence_status(*, artifact=None, manifest=None) -> dict:
+def evidence_status(*, artifact=None, manifest=None, read_error=None) -> dict:
     """Evidência DERIVADA do que existe de fato, com qualidade e último instante.
 
     A simulação prospectiva vem da cobertura/coleta REGISTRADA pelo coletor; a
@@ -131,6 +140,10 @@ def evidence_status(*, artifact=None, manifest=None) -> dict:
         economica = {"state": EVIDENCE_ERROR, "quality": "UNKNOWN",
                      "last_observed_at": None,
                      "reason_code": "CALIBRATION_READ_UNAVAILABLE"}
+    if read_error:
+        economica = {"state": EVIDENCE_ERROR, "quality": "UNKNOWN",
+                     "last_observed_at": None, "reason_code": read_error,
+                     "economically_approved": False}
 
     humana = {"state": EVIDENCE_BLOCKED, "quality": "UNKNOWN",
               "last_observed_at": None,
@@ -172,7 +185,7 @@ def _safe(label: str, loader) -> dict:
         return {"state": "UNAVAILABLE", "reason_code": f"{label}_MANIFEST_UNAVAILABLE"}
 
 
-def lote_final_summary() -> dict:
+def lote_final_summary(*, artifact=None, manifest=None, read_error=None) -> dict:
     """Versões, modo, cobertura, bloqueios, evidência e próximo passo.
 
     Nada aqui muda o significado de "bot opera": candidato em simulação não é
@@ -251,7 +264,7 @@ def lote_final_summary() -> dict:
         "promotable": False,
         "live_approval": "UNAVAILABLE",
         "bot_operation_meaning_unchanged": True,
-        "evidence": evidence_status(),
+        "evidence": evidence_status(artifact=artifact, manifest=manifest, read_error=read_error),
         "blockers": ["Sem coleta prospectiva, não há evidência econômica.",
                      "Aprovação humana e canário continuam pendentes."],
         "next_step": ("Ligar a coleta pré-seleção em simulação e acumular a amostra "

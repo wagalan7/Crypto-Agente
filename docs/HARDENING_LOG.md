@@ -2800,3 +2800,27 @@ em `docs/FECHAMENTO_FINAL_02_PESQUISA_E_CALIBRACAO.md`.
   produção, exchange, Telegram, Railway/Vercel, merge, push ou deploy.
   WAITING_DECISION (candidata/baseline/escopo/custos) e WAITING_DATA (amostra
   prospectiva, features de estrutura do V3) permanecem declarados.
+
+## L02 — correção integrada sobre a39ab358 (05/10/2026)
+
+Autorização do usuário para corrigir diretamente no worktree entregue, sem
+rodadas adicionais de prompt. Relatório: `docs/LOTE02_CORRECAO_INTEGRADA.md`.
+
+- Captura com batching/cobertura honestos e veto completo; baseline depois do
+  filtro de carteira; trace/config reais e produtor prospectivo sem fetch.
+- Manifesto vinculado a ScoreConfig/custos/split/população efetivamente
+  executados e corpo V2 validado no catálogo. Baseline sem prova da etapa final
+  ou com configuração divergente é UNKNOWN simétrico.
+- Export bruto oficial, janelas/quotes explícitas, pipeline registrado sem demo
+  substituta; fitting/OOS cronológico, validação semântica, payoff NET_POSITIVE
+  já líquido, persistência CAS, restart e status de leitura.
+- Provas: 129 focais; 2.695 testes completos (2 skips históricos R05C), verde
+  2×; PG16/asyncpg/socket Unix/TCP-DNS bloqueados, 26 verificações + 19
+  regressões, verde 2×; compile e diff-check aprovados.
+- Sem DDL, endpoint, worker/loop, ativação, estratégia LIVE, sizing, risco,
+  conta/manual/histórico/quarentena alterados. Sem conta/exchange/DB de produção
+  ou mensagem real nos testes. Publicação separada não ativa os seletores.
+- WAITING_DECISION/WAITING_DATA e limites de aceitação OOS continuam honestos;
+  teste é engenharia TEST_ONLY, não prova de lucratividade. Aceitas exigem
+  janelas/quotes externas explícitas; núcleo/playbooks e adaptador LIVE não são
+  demonstrados por este escopo de corte Score V3.

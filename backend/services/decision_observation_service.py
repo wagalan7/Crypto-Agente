@@ -266,10 +266,14 @@ def observe_preselection(candidates: list[dict]) -> dict:
                                buffered_records=len(_pending))
     if not budget["within_budget"]:
         _stats["buffer_dropped"] += len(candidates or [])
-        return {**summary, "reason_code": budget["reason_code"]}
+        return {**summary, "skipped": len(candidates or []), "reason_code": budget["reason_code"]}
     now = datetime.now(timezone.utc)
     for candidate in candidates or []:
         try:
+            if len(_pending) >= min(MAX_PENDING, pre.MAX_BUFFERED_RECORDS):
+                _stats['buffer_dropped'] += 1
+                summary['skipped'] += 1
+                continue
             if not isinstance(candidate, dict):
                 summary["skipped"] += 1
                 continue
@@ -300,7 +304,10 @@ def observe_preselection(candidates: list[dict]) -> dict:
                 # Blocos v2 (quando o produtor os captura): features
                 # ponto-no-tempo e a lista de TFs avaliados × TF escolhido.
                 features=candidate.get("features"),
-                evaluation=candidate.get("evaluation"))
+                evaluation=candidate.get("evaluation"),
+                score_trace=candidate.get('score_trace'),
+                feature_evidence=candidate.get('feature_evidence'),
+                observed_decision_scope=candidate.get('observed_decision_scope'))
             cfg = pre.merge_into_config({**_CONFIG, "scope": pre.SCOPE}, payload)
             frozen = {key_name: setup.get(key_name) for key_name in
                       ("symbol", "timeframe", "side", "playbook", "playbook_version",
@@ -313,7 +320,7 @@ def observe_preselection(candidates: list[dict]) -> dict:
                 "symbol": setup.get("symbol") or "UNKNOWN", "observed_at": now,
                 "mode": "SHADOW", "frozen_setup": frozen, "frozen_config": cfg,
                 "result": outcome, "first_blocker": funnel.get("first_blocker"),
-                "submit_evidence": "NOT_OBSERVED", "score_trace": None,
+                "submit_evidence": "NOT_OBSERVED", "score_trace": payload.get('score_trace'),
                 "rejected_at": None if outcome == pre.OUTCOME_ACCEPTED else now,
                 "sealed": True, "admission_retries": 0,
             }

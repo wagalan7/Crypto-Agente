@@ -42,7 +42,8 @@ from services import score_v3_service as s3                       # noqa: E402
 from services import strategy_core_service as core                # noqa: E402
 from services import strategy_evidence_service as ev              # noqa: E402
 from tests.test_lote02_research_manifest import (custos_config,   # noqa: E402
-                                                gestao, lado, manifesto)
+                                                gestao, lado, manifesto,
+                                                champion_trace)
 
 BAR5 = 300_000
 T0 = 1_780_000_000_000
@@ -63,8 +64,10 @@ def linha(chave: str, *, outcome: str, feats=None, side: str = "long",
           niveis=True) -> dict:
     corpo = {"opportunity_key": chave, "symbol": "SYN/USDT:USDT", "side": side,
              "decision_ts_ms": T0 + 10 * BAR5, "observed_outcome": outcome,
+             "observed_decision_scope": "FINAL_SCANNER_SELECTION",
              "funnel": {"first_blocker_reason": None if outcome == "ACCEPTED"
                         else "TIER_BELOW_MINIMUM"},
+             "score_trace": champion_trace(),
              "features": features() if feats is None else feats, "atr": 1.0}
     if niveis:
         corpo.update(entry=100.0, stop_loss=99.0, tp1=103.0, tp2=106.0)
@@ -94,7 +97,9 @@ def bloco_selecao(**mudancas) -> dict:
     base = {"core_version": core.CORE_VERSION,
             "core_config_hash": core.DEFAULT_CONFIG.config_hash(),
             "score_version": s3.SCORE_VERSION,
-            "score_config_hash": "c" * 64,
+            "score_config_hash": s3.model_fingerprint(
+                playbook=core.PLAYBOOK_TREND_PULLBACK, config=s3.DEFAULT_CONFIG),
+            "score_config": s3.DEFAULT_CONFIG.as_dict(),
             "playbooks": list(core.PLAYBOOKS),
             "selection_rule": {"kind": rm.RULE_SCORE_V3_MIN, "min_score": 60.0,
                                "playbook": core.PLAYBOOK_TREND_PULLBACK,
@@ -173,20 +178,28 @@ class DespachoPorEscopo(unittest.TestCase):
 class ContratoEVerificador(unittest.TestCase):
     """Contrato V2 por escopo; envelope do catálogo do MESMO tipo."""
 
-    def _contrato(self, *, escopo=rm.SCOPE_SELECTION, manifest_hash="m" * 64,
-                 selection=None, fingerprint="f" * 64, cutoff_ms=T0):
+    def _contrato(self, *, escopo=rm.SCOPE_SELECTION, manifest_hash=None,
+                 selection=None, fingerprint="f" * 64, cutoff_ms=None):
         gestao_manifest = gestao()
         extras = {}
+        universe, bundle, cutoff = "SYN-6", "b" * 64, cutoff_ms or T0
         if escopo == rm.SCOPE_SELECTION:
-            extras = {"manifest_hash": manifest_hash,
-                      "selection_config": selection or bloco_selecao()}
+            frozen = rm.parse_manifest(manifesto())
+            universe = frozen["population"]["universe_version"]
+            bundle = frozen["hashes"]["bundle_hash"]
+            cutoff = cutoff_ms or frozen["split"]["as_of_ms"]
+            extras = {"manifest_hash": manifest_hash or frozen["manifest_hash"],
+                      "selection_config": selection or bloco_selecao(),
+                      "research_manifest": frozen,
+                      "dataset_scope": frozen["population"]["scope_id"],
+                      "temporal_split": frozen["split"]}
         return r12.preselection_contract(
             population="SHADOW", study_kind="PRE_SELECTION",
-            policy_version="R11C_ROBUST_POLICY_V1", universe_version="SYN-6",
+            policy_version="R11C_ROBUST_POLICY_V1", universe_version=universe,
             comparison_scope=escopo, baseline_config=gestao_manifest,
             candidate_config=gestao_manifest, costs_config=custos_config(),
-            bundle_hash="b" * 64, dataset_fingerprint=fingerprint,
-            cutoff_ms=cutoff_ms, **extras)
+            bundle_hash=bundle, dataset_fingerprint=fingerprint,
+            cutoff_ms=cutoff, **extras)
 
     def _estudo(self, contrato):
         return {"contract": contrato, "contract_hash": contrato["contract_hash"],
@@ -274,7 +287,9 @@ class ContratoEVerificador(unittest.TestCase):
         # Também recusa quando o corpo é V1 num escopo que exige V2 — mesmo com
         # o envelope declarando o hash recalculado do corpo V1 (ou seja: não é
         # só o hash que protege, é o contrato de escopo).
-        v1 = {**contrato, "contract_version": r12.PRE_SELECTION_CONTRACT_VERSION}
+        v1 = {key: contrato[key] for key in r12.PRE_SELECTION_CONTRACT_FIELDS}
+        v1["contract_version"] = r12.PRE_SELECTION_CONTRACT_VERSION
+        v1["contract_hash"] = None
         v1["contract_hash"] = r12.contract_hash_of(v1)
         envelope_v1 = r12.build_preselection_envelope(
             replay_config=gestao(), contract_hash=v1["contract_hash"],
@@ -317,8 +332,8 @@ class DoisCaminhosDeVerdade(unittest.TestCase):
     def test_baseline_igual_a_candidata_da_o_mesmo_conjunto(self):
         """Mesma regra dos dois lados ⇒ MESMAS decisões (nada de delta mágico)."""
         corpo = manifesto()
-        # Candidata com o MESMO motor da baseline: a diferença declarada é só o
-        # score_config_hash, e a regra de corte aceita o que o champion aceitou.
+        # Nesta coorte ambos selecionam todos: decisões/entradas iguais, sem
+        # alegar que a fórmula V2 observada seja a mesma fórmula da candidata.
         corpo["candidate"]["selection_rule"] = {
             "kind": rm.RULE_SCORE_V3_MIN, "min_score": 0.0,
             "playbook": core.PLAYBOOK_TREND_PULLBACK, "source": s3.SCORE_VERSION}

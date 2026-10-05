@@ -472,7 +472,9 @@ MIN_CALIBRATION_SAMPLE = 200
 
 def calibration_verdict(score_payload: Mapping[str, Any],
                         calibration: Optional[V3Calibration] = None,
-                        *, artifact: Any = None, now_ms: Any = None
+                        *, artifact: Any = None, now_ms: Any = None,
+                        event: Any = None, dataset_hash: Any = None,
+                        score_config_hash: Any = None, expected_event_definition: Any = None
                         ) -> Dict[str, Any]:
     """Probabilidade só existe com calibração V3 do MESMO fingerprint.
 
@@ -483,12 +485,23 @@ def calibration_verdict(score_payload: Mapping[str, Any],
     """
     unavailable = {"probability": None, "calibration_state": STATE_UNAVAILABLE,
                    "tier": None, "v2_fallback_used": False}
+    if artifact is None and isinstance(calibration, Mapping):
+        from services import score_v3_calibration_service as calib
+        if calibration.get("contract") != calib.CALIBRATION_CONTRACT:
+            return {**unavailable, "reason_code": V2_FALLBACK_FORBIDDEN}
+        artifact = calibration
     if artifact is not None:
         from services import score_v3_calibration_service as calib
+        if not score_payload.get("model_fingerprint") or not score_payload.get("population") \
+                or event not in calib.EVENTS or not dataset_hash or not score_config_hash \
+                or not isinstance(expected_event_definition, Mapping):
+            return {**unavailable, "reason_code": "CALIBRATION_EXPECTED_CONTEXT_REQUIRED"}
         previsao = calib.predict(
             artifact, score=score_payload.get("score"),
             model_fingerprint=score_payload.get("model_fingerprint"),
-            population=score_payload.get("population"), now_ms=now_ms)
+            population=score_payload.get("population"), now_ms=now_ms,
+            event=event, dataset_hash=dataset_hash, score_config_hash=score_config_hash,
+            expected_event_definition=expected_event_definition)
         if not previsao.get("available"):
             return {**unavailable, "reason_code": previsao.get("reason_code"),
                     "model_state": previsao.get("state"),
@@ -543,12 +556,11 @@ def net_ev(*, probability_out_of_sample: Any, rr_tp2: Any, cost_r: Any,
     if payoff_contract != PAYOFF_BINARY_TP2:
         return {"available": False, "reason_code": EVENT_PAYOFF_MISMATCH,
                 "ev_r": None, "detail": f"payoff {payoff_contract} não é binário"}
-    if event is not None:
-        from services import score_v3_calibration_service as calib
-        if str(event) not in calib.BINARY_PAYOFF_EVENTS:
-            return {"available": False, "reason_code": EVENT_PAYOFF_MISMATCH,
-                    "ev_r": None,
-                    "detail": f"evento {event} não corresponde ao payoff binário"}
+    from services import score_v3_calibration_service as calib
+    if event not in calib.BINARY_PAYOFF_EVENTS:
+        return {"available": False, "reason_code": EVENT_PAYOFF_MISMATCH,
+                "ev_r": None,
+                "detail": "evento explícito não corresponde ao payoff binário"}
     if probability_out_of_sample is None:
         return {"available": False, "reason_code": PROBABILITY_UNAVAILABLE, "ev_r": None}
     if isinstance(probability_out_of_sample, bool) or not isinstance(probability_out_of_sample, (int, float)):
@@ -567,9 +579,12 @@ def net_ev(*, probability_out_of_sample: Any, rr_tp2: Any, cost_r: Any,
             "components": {"probability": prob, **numbers}}
 
 
-def net_ev_from_payoff(*, expected_payoff_r: Any, cost_r: Any,
+def net_ev_from_payoff(*, expected_payoff_r: Any = None, cost_r: Any = None,
                        source: Any = None, sample_size: Any = None,
-                       payoff_contract: str = PAYOFF_PARTIAL_RUNNER
+                       payoff_contract: str = PAYOFF_PARTIAL_RUNNER,
+                       evidence: Any = None, management_hash: Any = None,
+                       dataset_hash: Any = None, costs_hash: Any = None,
+                       event: Any = None, now_ms: Any = None
                        ) -> Dict[str, Any]:
     """EV líquido da GESTÃO CONGELADA, medido fora da amostra.
 
@@ -577,33 +592,39 @@ def net_ev_from_payoff(*, expected_payoff_r: Any, cost_r: Any,
     replay dessa gestão produziu — não de `P(TP1) × RR`. Sem o payoff medido
     (e sem a fonte dele), não há EV: ausência não vira zero.
     """
-    if expected_payoff_r is None or source in (None, ""):
-        return {"available": False, "reason_code": PROBABILITY_UNAVAILABLE,
-                "ev_r": None, "detail": "payoff líquido OOS da gestão ausente"}
-    valores = {}
-    for nome, bruto in (("expected_payoff_r", expected_payoff_r), ("cost_r", cost_r)):
-        if bruto is None or isinstance(bruto, bool) or not isinstance(bruto, (int, float)) \
-                or not math.isfinite(float(bruto)):
-            return {"available": False, "reason_code": COSTS_UNKNOWN, "ev_r": None}
-        valores[nome] = float(bruto)
-    amostra = None if isinstance(sample_size, bool) else sample_size
-    if not isinstance(amostra, int) or amostra <= 0:
+    from services import score_v3_calibration_service as calib
+    verdict = calib.verify_oos_payoff_evidence(
+        evidence, management_hash=management_hash, dataset_hash=dataset_hash,
+        costs_hash=costs_hash, event=event, payoff_contract=payoff_contract, now_ms=now_ms)
+    if not verdict.get("ok") or any(v is not None for v in
+                                    (expected_payoff_r, cost_r, source, sample_size)):
         return {"available": False, "reason_code": OUT_OF_SAMPLE_REQUIRED,
-                "ev_r": None, "detail": "amostra OOS obrigatória"}
+                "ev_r": None, "detail": "prova OOS da gestão/custos obrigatória; scalars legados não são prova"}
     return {"available": True, "reason_code": OK,
-            "ev_r": valores["expected_payoff_r"] - abs(valores["cost_r"]),
+            "ev_r": verdict["expected_net_payoff_r"],
             "payoff_contract": payoff_contract,
-            "components": {**valores, "source": str(source),
-                           "oos_sample_size": amostra},
+            "event": event, "costs_already_included": True,
+            "components": {"source": calib.OOS_PAYOFF_SOURCE,
+                           "oos_sample_size": verdict["sample_size"],
+                           "management_hash": management_hash, "dataset_hash": dataset_hash,
+                           "costs_hash": costs_hash, "evidence_hash": verdict["evidence_hash"]},
+            "evidence": dict(evidence),
             "derived_from_probability": False}
 
 
 def economic_verdict(score_payload: Mapping[str, Any],
                      calibration: Optional[V3Calibration] = None,
-                     ev_payload: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+                     ev_payload: Optional[Mapping[str, Any]] = None,
+                     *, artifact: Any = None, now_ms: Any = None,
+                     event: Any = None, dataset_hash: Any = None,
+                     score_config_hash: Any = None, expected_event_definition: Any = None,
+                     costs_hash: Any = None) -> Dict[str, Any]:
     """Aprovação econômica e elegibilidade LIVE — indisponíveis sem calibração
     V3 e EV líquido. Score técnico sozinho não aprova nada."""
-    calib = calibration_verdict(score_payload, calibration)
+    calib = calibration_verdict(score_payload, calibration, artifact=artifact,
+                                now_ms=now_ms, event=event, dataset_hash=dataset_hash,
+                                score_config_hash=score_config_hash,
+                                expected_event_definition=expected_event_definition)
     verdict = {"economic_approval": STATE_UNAVAILABLE,
                "live_eligibility": STATE_UNAVAILABLE,
                "calibration_state": calib["calibration_state"],
@@ -612,9 +633,23 @@ def economic_verdict(score_payload: Mapping[str, Any],
         return {**verdict, "reason_code": EVIDENCE_BELOW_FLOOR}
     if calib["calibration_state"] != "AVAILABLE":
         return {**verdict, "reason_code": calib["reason_code"]}
-    if not ev_payload or not ev_payload.get("available"):
+    if calib.get("probability") is None or calib.get("out_of_sample") is not True:
+        return {**verdict, "reason_code": OUT_OF_SAMPLE_REQUIRED}
+    if not ev_payload or ev_payload.get("available") is not True:
         return {**verdict,
                 "reason_code": (ev_payload or {}).get("reason_code", PROBABILITY_UNAVAILABLE)}
+    from services import score_v3_calibration_service as v3cal
+    evidence = ev_payload.get("evidence")
+    checked = v3cal.verify_oos_payoff_evidence(
+        evidence, management_hash=(expected_event_definition or {}).get("payoff_ref"),
+        dataset_hash=dataset_hash, costs_hash=costs_hash, event=event, now_ms=now_ms)
+    if not checked.get("ok") or ev_payload.get("costs_already_included") is not True \
+            or ev_payload.get("payoff_contract") != PAYOFF_PARTIAL_RUNNER \
+            or ev_payload.get("event") != event or not isinstance(ev_payload.get("ev_r"), (int, float)) \
+            or isinstance(ev_payload.get("ev_r"), bool) \
+            or not math.isclose(ev_payload["ev_r"], checked.get("expected_net_payoff_r", float("nan")),
+                                rel_tol=1e-12, abs_tol=1e-12):
+        return {**verdict, "reason_code": OUT_OF_SAMPLE_REQUIRED}
     # Mesmo com tudo disponível, a elegibilidade LIVE não é concedida aqui:
     # ela depende de simulação prospectiva, aprovação humana e canário (R12).
     return {**verdict, "economic_approval": "PENDING_SIMULATION",

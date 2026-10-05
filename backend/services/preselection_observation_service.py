@@ -115,6 +115,7 @@ CAPACITY_NEAR_RATIO = 0.9
 MAX_BATCH_RECORDS = 50
 MAX_BUFFERED_RECORDS = 200
 MAX_PAYLOAD_BYTES = 4096
+MAX_PAYLOAD_BYTES_V2 = 32768  # trace allowlisted (<=24 KiB) + evidência/config v2
 
 #: Fonte adicional que só entraria com dependência EXPLÍCITA — declarada
 #: inativa, sem fetch, sem histórico inventado.
@@ -453,7 +454,10 @@ def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
                     config: Optional[Mapping[str, Any]] = None,
                     score_trace_digest: Optional[str] = None,
                     features: Optional[Mapping[str, Any]] = None,
-                    evaluation: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+                    evaluation: Optional[Mapping[str, Any]] = None,
+                    score_trace: Optional[Mapping[str, Any]] = None,
+                    feature_evidence: Optional[Mapping[str, Any]] = None,
+                    observed_decision_scope: Optional[str] = None) -> Dict[str, Any]:
     """Congela contexto, trace, configuração e disponibilidade NA decisão.
 
     Allowlist estrita: nada de objeto inteiro, exceção ou recomendação crua.
@@ -483,7 +487,9 @@ def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
     payload = {
         # v2 só quando há bloco novo de verdade: sem eles o payload continua
         # idêntico ao v1 (mesmos campos, mesma ordem canônica, mesmo hash).
-        "schema_version": (PRE_SCHEMA_VERSION_V2 if (features_view or evaluation_view)
+        "schema_version": (PRE_SCHEMA_VERSION_V2 if (features_view or evaluation_view
+                           or score_trace is not None or feature_evidence is not None
+                           or observed_decision_scope is not None)
                            else PRE_SCHEMA_VERSION),
         "scope": SCOPE,
         "policy": POLICY,
@@ -504,7 +510,38 @@ def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
         payload["features"] = features_view
     if evaluation_view is not None:
         payload["evaluation"] = evaluation_view
+    if score_trace is not None:
+        from services.score_trace_service import freeze_trace
+        trace = freeze_trace(dict(score_trace))
+        payload['score_trace'] = trace
+        payload['config'] = {'score_trace_version': trace.get('version'),
+            'formula_requested': trace.get('formula_requested'),
+            'formula_effective': trace.get('formula_effective'),
+            'score': dict(trace.get('config') or {})}
+    if observed_decision_scope == 'FINAL_SCANNER_SELECTION':
+        payload['observed_decision_scope'] = observed_decision_scope
+    if isinstance(feature_evidence, Mapping):
+        missing = feature_evidence.get('missing_reasons') or {}
+        payload['feature_evidence'] = {
+            'version': 'R13_POINT_IN_TIME_FEATURES_V1',
+            'observed_at_ms': _positive_int(feature_evidence.get('observed_at_ms')),
+            'candle_close_ms': _positive_int(feature_evidence.get('candle_close_ms')),
+            'quality': 'FRESH' if feature_evidence.get('quality') == 'FRESH' else 'UNKNOWN',
+            'missing_reasons': {key: 'POINT_IN_TIME_INPUT_UNAVAILABLE' for key in FEATURE_NUMERIC_FIELDS
+                                if isinstance(missing, Mapping) and key in missing}}
+        # Definição semântica congelada no payload, portanto coberta pelo hash
+        # do dataset; não é aprovação/calibração nem qualidade preditiva.
+        payload['feature_evidence']['definitions'] = {
+            'structure_quality': 'PIVOT_STOP_AND_TARGET_GEOMETRY_BINARY',
+            'level_distance_atr': 'ABS_ENTRY_MINUS_OBSERVED_PIVOT_OVER_ATR',
+            'trigger_body_ratio': 'CLOSED_BODY_OVER_CLOSED_RANGE',
+            'trigger_follow_through_atr': 'SIGNED_CLOSE_ADVANCE_FROM_PRIOR_CONFIRMED_TRIGGER_LEVEL_OVER_ATR',
+            'htf_alignment_ratio': 'ALIGNED_FRESH_HIGHER_TFS_OVER_VALID_OBSERVED_HIGHER_TFS',
+            'entry_distance_atr': 'ABS_CURRENT_PRICE_MINUS_ENTRY_OVER_ATR'}
     payload["payload_bytes"] = len(_canonical(payload).encode("utf-8"))
+    limit = MAX_PAYLOAD_BYTES_V2 if payload['schema_version'] == PRE_SCHEMA_VERSION_V2 else MAX_PAYLOAD_BYTES
+    if payload['payload_bytes'] > limit:
+        raise ValueError('PRE_SELECTION_PAYLOAD_BUDGET_EXCEEDED')
     return payload
 
 
@@ -568,6 +605,7 @@ _COVERAGE_CYCLES: List[Dict[str, Any]] = []
 
 def cycle_coverage(*, cycle_ts_ms: Any, symbols_requested: Any,
                    symbols_evaluated: Any, candidates_observed: Any,
+                   candidates_seen: Any = None, candidates_refused: Any = 0,
                    reasons: Optional[Mapping[str, Any]] = None,
                    state: str = COVERAGE_COMPLETE) -> Dict[str, Any]:
     """Payload PURO de cobertura do ciclo. Motivo desconhecido é recusado."""
@@ -588,6 +626,8 @@ def cycle_coverage(*, cycle_ts_ms: Any, symbols_requested: Any,
         "symbols_requested": pedidos,
         "symbols_evaluated": avaliados,
         "candidates_observed": _positive_int(candidates_observed) or 0,
+        "candidates_seen": _positive_int(candidates_seen if candidates_seen is not None else candidates_observed) or 0,
+        "candidates_refused": _positive_int(candidates_refused) or 0,
         "not_evaluated": max(0, pedidos - avaliados),
         "reasons": contagem,
         "state": state if state in (COVERAGE_COMPLETE, COVERAGE_INCOMPLETE,
@@ -627,7 +667,9 @@ def coverage_snapshot() -> Dict[str, Any]:
     return {"cycles": len(_COVERAGE_CYCLES),
             "last_cycle_ts_ms": ultimo.get("cycle_ts_ms"),
             "last_state": ultimo.get("state"),
-            "reasons": agregado, "candidates_observed": observados}
+            "reasons": agregado, "candidates_observed": observados,
+            'last_candidates_seen': ultimo.get('candidates_seen'),
+            'last_candidates_refused': ultimo.get('candidates_refused')}
 
 
 def reset_coverage() -> None:

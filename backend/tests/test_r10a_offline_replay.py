@@ -707,7 +707,8 @@ class Isolation(unittest.TestCase):
                                          "portfolio_replay_service.py",
                                          "preselection_experiment_service.py",
                                          "research_batch_service.py",
-                                         "research_dataset_service.py"])
+                                         "research_dataset_service.py",
+                                         "research_study_service.py"])
         main = (BACKEND / "main.py").read_text()
         self.assertNotIn("offline_replay_service", main)
         self.assertNotIn("research_replay", main)

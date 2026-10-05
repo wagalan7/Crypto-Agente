@@ -84,7 +84,7 @@ MANIFEST_FIELDS = ("manifest_version", "study_id", "decision", "comparison_scope
                    "costs", "split", "hashes")
 DECISION_FIELDS = ("state", "authority", "reference", "recorded_at_ms", "note")
 SIDE_FIELDS = ("label", "core_version", "core_config_hash", "score_version",
-               "score_config_hash", "playbooks", "policy_version",
+               "score_config_hash", "score_config", "playbooks", "policy_version",
                "management_config", "selection_rule")
 SELECTION_RULE_FIELDS = ("kind", "min_score", "playbook", "source")
 #: Regras de seleção IMPLEMENTADAS. A baseline de um estudo de seleção usa a
@@ -118,7 +118,7 @@ CHANGE_COMPONENTS = {
 #: Campos de cada lado comparados para provar o isolamento da mudança.
 COMPONENT_FIELDS = {
     "STRATEGY_CORE": ("core_version", "core_config_hash"),
-    "SCORE_MODEL": ("score_version", "score_config_hash"),
+    "SCORE_MODEL": ("score_version", "score_config_hash", "score_config"),
     "PLAYBOOK_SET": ("playbooks",),
     "MANAGEMENT_CONFIG": ("management_config",),
 }
@@ -276,6 +276,7 @@ def _parse_side(raw: Any, nome: str) -> Dict[str, Any]:
         "playbooks": list(_tuple_of_text(corpo["playbooks"], f"{nome}.playbooks")),
     }
     saida["selection_rule"] = _parse_rule(corpo["selection_rule"], f"{nome}.selection_rule")
+    saida["score_config"] = _score_config(corpo.get("score_config"), saida, nome)
     gestao = corpo["management_config"]
     if not isinstance(gestao, Mapping) or not gestao:
         raise ManifestError(CONFIG_INVALID, f"{nome}.management_config")
@@ -288,6 +289,40 @@ def _parse_side(raw: Any, nome: str) -> Dict[str, Any]:
                             f"{nome}.management_config: {schema.get('detail')}")
     saida["management_config"] = dict(schema["manifest"])
     return saida
+
+
+def _score_config(raw: Any, side: Mapping[str, Any], name: str) -> Optional[dict]:
+    """A identidade declarada precisa reconstruir o motor que decide o lado.
+
+    A decisão observada não é reconstruída: seu modelo pode ser histórico e a
+    proveniência continua vindo da captura. Já a candidata V3 só executa uma
+    configuração explícita, suportada e com fingerprint recalculado.
+    """
+    from services import score_v3_service as s3, strategy_core_service as core
+    rule = side["selection_rule"]
+    if rule["kind"] == RULE_OBSERVED_CHAMPION:
+        if raw is None:
+            return None
+    config = _closed(raw, ("include_composite_confluence", "min_evidence_fraction",
+                           "population"), f"{name}.score_config")
+    try:
+        cfg = s3.ScoreConfig(**config)
+    except (TypeError, ValueError) as exc:
+        raise ManifestError(CONFIG_INVALID, f"{name}.score_config: {exc}") from None
+    if rule["kind"] == RULE_SCORE_V3_MIN:
+        if (side["score_version"] != s3.SCORE_VERSION
+                or rule["source"] != s3.SCORE_VERSION
+                or rule["playbook"] not in side["playbooks"]
+                or side["core_version"] != core.CORE_VERSION
+                or side["core_config_hash"] != core.DEFAULT_CONFIG.config_hash()):
+            raise ManifestError(CONFIG_INVALID, f"{name}: motor/versão não implementado")
+        try:
+            expected = s3.model_fingerprint(playbook=rule["playbook"], config=cfg)
+        except ValueError as exc:
+            raise ManifestError(CONFIG_INVALID, f"{name}: {exc}") from None
+        if side["score_config_hash"] != expected:
+            raise ManifestError(MANIFEST_DRIFT, f"{name}.score_config_hash")
+    return cfg.as_dict()
 
 
 def _parse_population(raw: Any) -> Dict[str, Any]:
@@ -316,6 +351,8 @@ def _parse_costs(raw: Any) -> Dict[str, Any]:
     if fonte not in COST_SOURCES:
         raise ManifestError(COSTS_SOURCE_INCOMPATIBLE,
                             f"costs.source={fonte}; use {sorted(COST_SOURCES)}")
+    if fonte != "R10A_COST_CONFIG_BPS":
+        raise ManifestError("COSTS_SOURCE_NOT_IMPLEMENTED", fonte)
     esperado = COST_SOURCES[fonte]
     unidade = _text(corpo["unit"], "costs.unit", limite=64)
     ativo = _text(corpo["asset"], "costs.asset", limite=16).upper()
@@ -332,6 +369,12 @@ def _parse_costs(raw: Any) -> Dict[str, Any]:
         if valor not in COST_TREATMENTS:
             raise ManifestError(COSTS_INCOMPLETE, f"costs.{campo}={valor}")
         tratamentos[campo] = valor
+    required = {"fee_treatment": "APPLIED_PER_SIDE",
+                "slippage_treatment": "APPLIED_PER_SIDE",
+                "funding_treatment": "APPLIED_PER_BAR"}
+    if tratamentos != required:
+        raise ManifestError(COSTS_SOURCE_INCOMPATIBLE,
+                            "R10A_COST_CONFIG_BPS exige os tratamentos do motor BPS")
     versoes = corpo["versions"]
     if not isinstance(versoes, Mapping) or not versoes:
         raise ManifestError(COSTS_INCOMPLETE, "costs.versions")
@@ -468,7 +511,7 @@ def parse_manifest(raw: Any) -> Dict[str, Any]:
 #: Bloco de SELEÇÃO compartilhado por produtor (pedido/export), contrato do
 #: estudo e catálogo. UMA função valida os três — não há cópia de regra.
 SELECTION_CONFIG_FIELDS = ("core_version", "core_config_hash", "score_version",
-                           "score_config_hash", "playbooks", "selection_rule")
+                           "score_config_hash", "score_config", "playbooks", "selection_rule")
 SELECTION_CONFIG_INVALID = "SELECTION_CONFIG_INVALID"
 
 
@@ -483,6 +526,10 @@ def validate_selection_config(raw: Any) -> Dict[str, Any]:
                                                 "selection_config.playbooks"))
         saida["selection_rule"] = _parse_rule(corpo["selection_rule"],
                                              "selection_config.selection_rule")
+        if saida["selection_rule"]["kind"] != RULE_SCORE_V3_MIN:
+            raise ManifestError(RULE_SCOPE_MISMATCH, "candidate.selection_rule")
+        saida["score_config"] = _score_config(corpo["score_config"], saida,
+                                              "selection_config")
     except ManifestError as exc:
         return {"ok": False, "reason_code": SELECTION_CONFIG_INVALID,
                 "detail": f"{exc.reason_code}: {exc.detail}"}
@@ -496,6 +543,109 @@ def selection_config_of(side: Any) -> Optional[Dict[str, Any]]:
     corpo = {campo: side.get(campo) for campo in SELECTION_CONFIG_FIELDS}
     verdict = validate_selection_config(corpo)
     return verdict["config"] if verdict["ok"] else None
+
+
+def observed_baseline_hash(trace: Any) -> Optional[str]:
+    """Fingerprint da configuração CHAMPION realmente capturada, sem defaults.
+
+    Somente o trace oficial completo prova a fórmula/config daquele instante.
+    Não reconstrói histórico nem transforma metadata ausente em configuração.
+    """
+    from services import score_trace_service as st
+    if (not isinstance(trace, Mapping) or trace.get("version") != st.VERSION
+            or trace.get("formula_effective") not in st.FORMULAS):
+        return None
+    config = trace.get("config")
+    if not isinstance(config, Mapping):
+        return None
+    flags = ("high_tf_patterns_enabled", "high_tf_confirm_enabled")
+    if set(config) != set(st.CONFIG_NUMBERS) | set(flags):
+        return None
+    for key in st.CONFIG_NUMBERS:
+        value = config[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value):
+            return None
+    if any(not isinstance(config[key], bool) for key in flags):
+        return None
+    # Canonicalização idêntica à allowlist do produtor: int/float equivalentes.
+    canonical = {key: float(config[key]) for key in st.CONFIG_NUMBERS}
+    canonical.update({key: config[key] for key in flags})
+    return _hash(canonical)
+
+
+def verify_observed_baseline(row: Any, baseline: Any) -> Dict[str, Any]:
+    if not isinstance(row, Mapping) or not isinstance(baseline, Mapping):
+        return {"ok": False, "reason_code": "OBSERVED_BASELINE_PROVENANCE_MISSING"}
+    if row.get("observed_decision_scope") != "FINAL_SCANNER_SELECTION":
+        return {"ok": False, "reason_code": "OBSERVED_BASELINE_DECISION_SCOPE_UNVERIFIED"}
+    trace = row.get("score_trace")
+    fingerprint = observed_baseline_hash(trace)
+    if fingerprint is None:
+        return {"ok": False, "reason_code": "OBSERVED_BASELINE_PROVENANCE_MISSING"}
+    if (trace.get("formula_effective") != baseline.get("score_version")
+            or fingerprint != baseline.get("score_config_hash")):
+        return {"ok": False, "reason_code": "OBSERVED_BASELINE_CONFIG_MISMATCH"}
+    captured = row.get("champion_config")
+    if captured is not None:
+        if (not isinstance(captured, Mapping)
+                or captured.get("formula_effective") != trace.get("formula_effective")
+                or _hash(captured.get("score")) != _hash(trace.get("config"))):
+            return {"ok": False, "reason_code": "OBSERVED_BASELINE_CONFIG_MISMATCH"}
+    return {"ok": True, "reason_code": OK, "config_hash": fingerprint}
+
+
+def verify_research_binding(manifest: Any, *, comparison_scope: str,
+                            baseline_config: Any, candidate_config: Any,
+                            costs_config: Any, selection_config: Any,
+                            dataset_scope: Any, temporal_split: Any,
+                            universe_version: Any, policy_version: Any, cutoff_ms: Any,
+                            bundle_hash: Any) -> Dict[str, Any]:
+    """Vínculo ao corpo congelado, não apenas a um hash fornecido pelo caller.
+
+    A declaração explícita do operador é o contrato de pesquisa; TEST_ONLY só
+    autoriza engenharia. Este verificador não lê resultado nem inventa prova
+    de aprovação humana independente.
+    """
+    checked = verify_manifest(manifest)
+    if not checked["ok"]:
+        return {"ok": False, "reason_code": checked["reason_code"]}
+    frozen = checked["manifest"]
+    authorized = authorized_comparison(frozen)
+    if not authorized.get("available"):
+        return {"ok": False, "reason_code": "BLOCKED_MISSING_DECISION"}
+    mismatches = []
+    expected = {
+        "comparison_scope": frozen["comparison_scope"],
+        "baseline_config": frozen["baseline"]["management_config"],
+        "candidate_config": frozen["candidate"]["management_config"],
+        "costs_config": frozen["costs"]["config"],
+        "dataset_scope": frozen["population"]["scope_id"],
+        "temporal_split": frozen["split"],
+        "universe_version": frozen["population"]["universe_version"],
+        "policy_version": frozen["candidate"]["policy_version"],
+        "cutoff_ms": frozen["split"]["as_of_ms"],
+        "bundle_hash": frozen["hashes"]["bundle_hash"],
+        "selection_config": (selection_config_of(frozen["candidate"])
+                             if frozen["comparison_scope"] == SCOPE_SELECTION
+                             else None),
+    }
+    actual = dict(comparison_scope=comparison_scope, baseline_config=baseline_config,
+                  candidate_config=candidate_config, costs_config=costs_config,
+                  selection_config=selection_config, dataset_scope=dataset_scope,
+                  temporal_split=temporal_split, universe_version=universe_version,
+                  policy_version=policy_version,
+                  cutoff_ms=cutoff_ms, bundle_hash=bundle_hash)
+    for field, value in expected.items():
+        if _hash(actual[field]) != _hash(value):
+            mismatches.append(field)
+    if mismatches:
+        return {"ok": False, "reason_code": "RESEARCH_MANIFEST_BINDING_MISMATCH",
+                "diverged": mismatches}
+    return {"ok": True, "reason_code": OK, "manifest": frozen,
+            "manifest_hash": frozen["manifest_hash"],
+            "real_study_allowed": authorized["real_study_allowed"],
+            "decision_state": authorized["state"]}
 
 
 def manifest_state(manifest: Any) -> str:
@@ -522,6 +672,10 @@ def verify_manifest(manifest: Any, *, expected_hash: Optional[str] = None
     """
     if not isinstance(manifest, Mapping):
         return {"ok": False, "reason_code": NOT_MAPPING, "state": STATE_BLOCKED}
+    extras = set(manifest) - set(MANIFEST_FIELDS) - {"manifest_hash"}
+    if extras:
+        return {"ok": False, "reason_code": UNKNOWN_FIELD,
+                "detail": f"manifest: {sorted(extras)}", "state": STATE_BLOCKED}
     corpo = {campo: manifest.get(campo) for campo in MANIFEST_FIELDS}
     try:
         refeito = parse_manifest(corpo)
