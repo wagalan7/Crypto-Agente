@@ -6567,17 +6567,25 @@ async def create_preselection_experiment(*, champion: Dict[str, Any],
                 "promotable": False, "live_approval": "UNAVAILABLE"}
 
 
-async def start_preselection_shadow(exp_id: int) -> Dict[str, Any]:
+async def start_preselection_shadow(exp_id: int, *, approval_id: Optional[str] = None,
+                                    expected_generation: Optional[int] = None
+                                    ) -> Dict[str, Any]:
     """OFFLINE_VALIDATED → SHADOW do tipo pré-seleção (SIMULAÇÃO).
 
     Usa o MESMO lock e a MESMA exclusividade do ciclo oficial; o SHADOW daqui
     não anota snapshot pós-seleção nem habilita qualquer caminho LIVE.
+
+    Exige, além do estudo congelado VERIFICADO, uma aprovação SHADOW
+    PERSISTIDA, ATIVA e EXATA (id + geração) — o start é que congela a
+    autoridade que a coleta prospectiva vai carregar em cada anotação.
     """
     if not (P05_ANALYTICS_ENABLED and P05_CHALLENGER_SHADOW_ENABLED):
         return {"ok": False, "blocked": True, "reason_code": "P05_SHADOW_DISABLED"}
     from db import get_session
     from models.strategy_experiment import StrategyExperiment as E
     from sqlalchemy import select
+    from services import operational_governance_service as governance
+    from services import prospective_shadow_service as prospective
     now = datetime.now(timezone.utc)
     async with get_session() as session:
         await _acquire_p05_lock(session, _P05_SHADOW_LOCK_KEY)
@@ -6611,14 +6619,62 @@ async def start_preselection_shadow(exp_id: int) -> Dict[str, Any]:
                     "reason_code": "CHALLENGER_ALREADY_ACTIVE",
                     "active_keys": [row.experiment_key for row in concorrentes],
                     "status": exp.status}
+        # Aprovação SHADOW persistida, ATIVA e exatamente a declarada. A ordem
+        # de locks do catálogo é P05 → singleton → experimento: a governança é
+        # consultada DENTRO desta transação, sem abrir sessão nova.
+        # Estado lido ANTES de qualquer rollback: depois dele a instância está
+        # expirada e ler um atributo exigiria IO fora do contexto assíncrono.
+        estado_atual = exp.status
+        autoridade = await governance.assert_authority_in_session(
+            session, exp_id=exp.id, purpose="SHADOW", approval_id=approval_id,
+            expected_generation=expected_generation)
+        if autoridade.get("ok") is not True:
+            await session.rollback()
+            return {"ok": False, "blocked": True,
+                    "reason_code": autoridade.get("reason_code"),
+                    "error": "aprovação SHADOW ausente, revogada ou divergente",
+                    "status": estado_atual}
+        iniciado_ms = int(now.timestamp() * 1000)
+        # A coorte prospectiva descreve comparação de SELEÇÃO. Um challenger de
+        # GESTÃO do mesmo tipo continua tendo o ciclo dele (sem coorte): o que
+        # não existe fica DECLARADO, e a avaliação prospectiva recusa depois por
+        # falta de start — nada é inventado para ele.
+        escopo_contrato = str((vinculo.get("contract") or {}).get("comparison_scope") or "")
+        contexto = None
+        if escopo_contrato == "SELECTION_ONLY":
+            contexto = prospective.frozen_shadow_context(
+                exp, generation=autoridade["generation"],
+                approval_id=str(approval_id), started_at_ms=iniciado_ms)
+            if contexto is None:
+                await session.rollback()
+                return {"ok": False, "blocked": True,
+                        "reason_code": "PROSPECTIVE_CONTEXT_UNAVAILABLE",
+                        "error": "contexto prospectivo não pôde ser congelado",
+                        "status": estado_atual}
         exp.status = STATUS_SHADOW
         exp.shadow_started_at = now
         exp.shadow_metrics = {**(exp.shadow_metrics if isinstance(exp.shadow_metrics, dict) else {}),
                               "population": "PRE_SELECTION", "simulation_only": True,
-                              "live_approval": "UNAVAILABLE"}
+                              "live_approval": "UNAVAILABLE",
+                              "shadow_approval_id": str(approval_id),
+                              "shadow_approval_generation": autoridade["generation"],
+                              **({} if contexto is None else {
+                                  # Autoridade do start: a coleta prospectiva
+                                  # carrega esta identidade em CADA anotação
+                                  # (sem backfill).
+                                  prospective.KEY: {
+                                      "approval_id": str(approval_id),
+                                      "generation": autoridade["generation"],
+                                      "started_at_ms": iniciado_ms,
+                                      "contract_hash": contexto["contract_hash"],
+                                      "manifest_hash": contexto["manifest_hash"]}})}
         await session.commit()
         return {"ok": True, "status": exp.status, "experiment_key": exp.experiment_key,
                 "population": "PRE_SELECTION", "simulation_only": True,
+                "approval_id": str(approval_id), "generation": autoridade["generation"],
+                "comparison_scope": escopo_contrato or None,
+                "prospective_cohort": contexto is not None,
+                "prospective_started_at_ms": iniciado_ms if contexto is not None else None,
                 "promotable": False}
 
 
@@ -6675,7 +6731,6 @@ async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
                 "diverged": conferencia.get("diverged"), "outcomes_read": False,
                 "status": status_atual, "frozen_preserved": True}
     estudo = recuperado["study"]
-    veredito = evaluate_preselection_candidate(estudo.get("evidence"))
     async with get_session() as session:
         await _acquire_p05_lock(session, _P05_SHADOW_LOCK_KEY)
         exp = (await session.execute(
@@ -6683,6 +6738,34 @@ async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
         if exp is None or exp.status != STATUS_SHADOW \
                 or exp.experiment_key != experiment_key:
             return {"ok": False, "error": "experimento mudou de estado durante a avaliação"}
+        # ── Evidência PROSPECTIVA: a coorte anotada pelo resolver oficial, NUNCA
+        #    o estudo offline reavaliado como se fossem trades novos. Origem,
+        #    identidade, start/corte, oportunidade e custos são conferidos ANTES
+        #    de qualquer leitura de outcome (ver prospective_shadow_service).
+        from services import prospective_shadow_service as prospective
+        estado_antes = exp.status
+        # Só a comparação de SELEÇÃO tem coorte prospectiva. Um challenger de
+        # GESTÃO do mesmo tipo segue avaliado pelo estudo congelado dele — e isso
+        # fica DECLARADO no retorno, sem se passar por evidência prospectiva.
+        escopo_contrato = str((congelado.get("contract") or {}).get("comparison_scope") or "")
+        prospectiva = None
+        if escopo_contrato == "SELECTION_ONLY":
+            prospectiva = await prospective.load_prospective_evidence(session, exp)
+            if prospectiva.get("available") is not True:
+                await session.rollback()
+                return {"ok": False, "blocked": True,
+                        "reason_code": prospectiva.get("reason_code"),
+                        "error": "evidência prospectiva indisponível",
+                        "offline_used": False, "outcomes_read": False,
+                        "status": estado_antes}
+            if prospectiva.get("source") != prospective.REAL:
+                await session.rollback()
+                return {"ok": False, "blocked": True,
+                        "reason_code": "SYNTHETIC_SHADOW_NOT_PROSPECTIVE",
+                        "offline_used": False, "status": estado_antes}
+            veredito = evaluate_preselection_candidate(prospectiva.get("evidence"))
+        else:
+            veredito = evaluate_preselection_candidate(estudo.get("evidence"))
         # Reconfere IDENTIDADE e CONTRATO no segundo lock: se mudaram desde a
         # leitura, nada é gravado (resultado obsoleto não entra).
         offline_agora = exp.offline_metrics if isinstance(exp.offline_metrics, dict) else {}
@@ -6701,6 +6784,14 @@ async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
                               "study_generation": recuperado.get("generation"),
                               "gate_verdict": veredito.get("gate_verdict"),
                               "reason_codes": veredito.get("reason_codes"),
+                              **({} if prospectiva is None else {"prospective": {
+                                  "source": prospectiva.get("source"),
+                                  "state": prospectiva.get("state"),
+                                  "fingerprint": prospectiva.get("fingerprint"),
+                                  "data_quality": prospectiva.get("data_quality"),
+                                  "gate_verdict": (prospectiva.get("gate") or {}).get("verdict"),
+                                  "offline_used": False}}),
+                              "comparison_scope": escopo_contrato or None,
                               "live_approval": "UNAVAILABLE"}
         # Sem promoção: o ciclo do tipo termina aqui. REJECTED continua possível.
         if veredito["verdict"] == STATUS_REJECTED and can_transition_for(
@@ -6714,6 +6805,14 @@ async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
             "post_selection_loader_used": False,
             "study_generation": recuperado.get("generation"),
             "gate_verdict": veredito.get("gate_verdict"),
+            "comparison_scope": escopo_contrato or None,
+            "prospective_cohort": prospectiva is not None,
+            "prospective_source": (prospectiva or {}).get("source"),
+            "prospective_state": (prospectiva or {}).get("state"),
+            "prospective_fingerprint": (prospectiva or {}).get("fingerprint"),
+            # SELEÇÃO nunca reaproveita o estudo offline como trade novo; GESTÃO
+            # declara que a avaliação dela veio do estudo congelado.
+            "offline_used": prospectiva is None,
             "verdict": veredito["verdict"], "promotable": False,
             "live_approval": "UNAVAILABLE"}
 
@@ -6739,22 +6838,110 @@ def _frozen_study_of(exp: Any) -> Dict[str, Any]:
             "contract": contrato}
 
 
-async def promote_preselection(exp_id: int) -> Dict[str, Any]:
-    """Promoção do tipo pré-seleção: NÃO IMPLEMENTADA, e declarada como tal.
+async def promote_preselection(exp_id: int, *, approval_id: Optional[str] = None,
+                               expected_generation: Optional[int] = None,
+                               operator: Optional[str] = None) -> Dict[str, Any]:
+    """Promoção do tipo pré-seleção DELEGADA à governança operacional.
 
-    Falta o adaptador operacional; chamar isto nunca aciona LIVE nem muda estado.
+    Não existe promoção aqui: quem valida aprovação PROMOTION ativa, evidência
+    PROSPECTIVA aprovada e publica a referência congelada sob CAS é o
+    `operational_governance_service`. Promover NÃO liga o seletor, NÃO altera
+    ENV e NÃO envia ordem — o canário ainda exige aprovação própria e seleção
+    explícita, e `ELIGIBLE` por si só nunca autoriza POST.
     """
-    return {"ok": False, "blocked": True, "reason_code": PRE_SELECTION_PROMOTION_BLOCK,
-            "error": ("promover a coorte pré-seleção exige adaptador operacional "
-                      "inexistente — código por terminar, não pendência de dados"),
-            "live_approval": "UNAVAILABLE", "promotable": False}
+    if not P05_ANALYTICS_ENABLED:
+        return {"ok": False, "blocked": True, "reason_code": "P05_ANALYTICS_DISABLED",
+                "live_approval": "UNAVAILABLE", "promotable": False}
+    from db import DB_ENABLED, get_session
+    if not DB_ENABLED:
+        return {"ok": False, "blocked": True, "reason_code": "GOVERNANCE_DB_UNAVAILABLE",
+                "live_approval": "UNAVAILABLE", "promotable": False}
+    from services import operational_governance_service as governance
+    resultado = await governance.promote(get_session, exp_id, approval_id,
+                                         expected_generation, operator=operator)
+    return {**resultado, "experiment_id": exp_id,
+            "population": "PRE_SELECTION",
+            "selector_env_unchanged": True,
+            "orders_sent": 0,
+            "live_approval": "UNAVAILABLE" if resultado.get("ok") is not True
+            else "CANARY_APPROVAL_STILL_REQUIRED",
+            "promotable": False}
 
 
-async def start_shadow(exp_id: int) -> Dict[str, Any]:
-    """OFFLINE_VALIDATED → SHADOW com baseline/safety congelados."""
+PRE_SELECTION_START_REQUIRES_APPROVAL = "PRE_SELECTION_START_REQUIRES_APPROVAL"
+START_BODY_NOT_APPLICABLE = "START_SHADOW_BODY_NOT_APPLICABLE"
+
+
+async def experiment_kind(exp_id: int) -> Optional[str]:
+    """Tipo do experimento, em leitura CURTA e sem lock de escrita.
+
+    Serve ao despacho público ANTES do loader/transição legada: o tipo decide
+    qual contrato roda, em vez de mandar PRE para o caminho pós-seleção e
+    "corrigir" o resultado depois.
+    """
+    try:
+        from db import DB_ENABLED, get_session
+        from models.strategy_experiment import StrategyExperiment as E
+        from sqlalchemy import select
+        if not DB_ENABLED:
+            return None
+        async with get_session() as session:
+            exp = (await session.execute(
+                select(E).where(E.id == exp_id))).scalar_one_or_none()
+            if exp is None:
+                return None
+            if is_pre_selection_experiment(exp):
+                return PRE_SELECTION_TYPE
+            if is_contextual_experiment(exp):
+                return "P05_1_CONTEXTUAL"
+            return "POST_SELECTION"
+    except Exception as exc:  # noqa: BLE001 — dúvida NÃO autoriza transição
+        log.warning(f"[p05] tipo do experimento indisponível: {type(exc).__name__}")
+        return "UNAVAILABLE"
+
+
+async def start_shadow(exp_id: int, *, approval_id: Optional[str] = None,
+                       expected_generation: Optional[int] = None) -> Dict[str, Any]:
+    """OFFLINE_VALIDATED → SHADOW com baseline/safety congelados.
+
+    DESPACHO POR TIPO primeiro: a coorte PRE_SELECTION tem contrato próprio e
+    exige aprovação SHADOW persistida (`approval_id` + `expected_generation`);
+    POST_SELECTION mantém o contrato legado, inclusive a chamada SEM corpo; e
+    P05.1 segue ANALYTICS_ONLY. Nenhum caminho novo de autorização nasce aqui.
+    """
     if not (P05_ANALYTICS_ENABLED and P05_CHALLENGER_SHADOW_ENABLED):
         return {"ok": False, "blocked": True, "reason_code": "P05_SHADOW_DISABLED",
                 "error": "P05_CHALLENGER_SHADOW_ENABLED=false"}
+    tipo = await experiment_kind(exp_id)
+    if tipo == PRE_SELECTION_TYPE:
+        if not isinstance(approval_id, str) or not approval_id.strip() \
+                or type(expected_generation) is not int:
+            # Sem aprovação EXATA não se inicia coorte prospectiva — e não se
+            # cai no loader legado para tentar de outro jeito. A recusa mantém o
+            # contrato que os chamadores já conhecem (tipo errado para este
+            # caminho + para onde ir) e DECLARA o que falta.
+            from services import preselection_experiment_service as r12_tipo
+            return {"ok": False, "blocked": True,
+                    "reason_code": r12_tipo.TYPE_MISMATCH,
+                    "dispatch_to": "start_preselection_shadow",
+                    "requires": ["approval_id", "expected_generation"],
+                    "detail": PRE_SELECTION_START_REQUIRES_APPROVAL,
+                    "error": ("início da coorte pré-seleção exige approval_id e "
+                              "expected_generation da aprovação SHADOW registrada"),
+                    "population": "PRE_SELECTION", "promotable": False,
+                    "live_approval": "UNAVAILABLE"}
+        return await start_preselection_shadow(
+            exp_id, approval_id=approval_id.strip(),
+            expected_generation=expected_generation)
+    if approval_id is not None or expected_generation is not None:
+        # Corpo de governança não se aplica ao contrato legado: recusa explícita
+        # em vez de ignorar silenciosamente o que o operador enviou.
+        return {"ok": False, "blocked": True, "reason_code": START_BODY_NOT_APPLICABLE,
+                "error": "corpo de aprovação só se aplica à coorte pré-seleção",
+                "experiment_kind": tipo}
+    if tipo == "UNAVAILABLE":
+        return {"ok": False, "blocked": True, "reason_code": "EXPERIMENT_TYPE_UNAVAILABLE",
+                "error": "tipo do experimento não pôde ser lido"}
     from db import get_session
     from models.strategy_experiment import StrategyExperiment as E
     from sqlalchemy import select

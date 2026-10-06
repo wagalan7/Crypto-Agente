@@ -2824,3 +2824,55 @@ rodadas adicionais de prompt. Relatório: `docs/LOTE02_CORRECAO_INTEGRADA.md`.
   teste é engenharia TEST_ONLY, não prova de lucratividade. Aceitas exigem
   janelas/quotes externas explícitas; núcleo/playbooks e adaptador LIVE não são
   demonstrados por este escopo de corte Score V3.
+
+## L03 — integração governada: fechamento dos quatro pontos (06/10/2026)
+
+Base `581ad3d4`, worktree autorizado. Relatório:
+`docs/FECHAMENTO_FINAL_03_INTEGRACAO_GOVERNADA.md`.
+
+- **A** Início governado do SHADOW pré-seleção pela rota existente, com corpo
+  FECHADO (confirm literal, `approval_id`, `expected_generation` inteiro) e
+  despacho por TIPO antes do loader legado; POST_SELECTION (inclusive a chamada
+  sem corpo) e P05.1 ANALYTICS_ONLY preservados; erro interno sem stack/segredo.
+- **B** Decisão candidata OBSERVACIONAL (`CANDIDATE_SHADOW`) no ciclo oficial do
+  scanner, com aprovação SHADOW e seletor em LEGACY: ALL-TF antes da escolha, o
+  MESMO núcleo de decisão do caminho operacional (sem cópia equivalente),
+  escopo/decisão/identidade de regra congelados na anotação e cobertos pelo hash.
+  Fidelidade = observado × recomputação verificável do contrato na mesma
+  oportunidade/população/estágio, com hashes reconciliados; comparáveis,
+  divergentes, UNKNOWN, cobertura e motivos publicados. Ausência é `None` +
+  lacuna + NO_GO, nunca 0%. Quebra a circularidade promoção↔fidelidade.
+- **Fronteira de propósito**: contexto/aprovação SHADOW nunca autoriza reserva,
+  alavancagem ou POST (`CANDIDATE_PURPOSE_MISMATCH`/`AUTHORITY_PURPOSE_MISMATCH`).
+- **C** Proteção **SHADOW_SIMULATED** explícita e versionada no replay OFICIAL
+  (instrumentação aditiva; nenhum campo econômico ou status alterado): obrigação,
+  qtd remanescente, stop ativo finito, geometria julgada pelo ESTÁGIO (BE/lucro
+  pós-TP1 é válido), transições BE/trail e falhas pendentes extraídas do estado
+  percorrido. Trilhas de resolução, economia, duplicata e proteção contadas
+  SEPARADAMENTE (sem `elif` apagando uma delas); zero só com observação aplicável
+  e cobertura ≥ 90% sobre denominador auditável; saída lucrativa sem prova segue
+  pendente. Métrica Shadow nunca prova SL real, ramp ou aceite operacional;
+  `BLOCKED_PROTECTION_SCOPE_DECISION_REQUIRED` mantém NO_GO até decisão humana.
+- **D** Matriz integrada pelo caller real em PG16 descartável: **53 verificações,
+  exit 0, 2×** após a última edição. Ordem GLOBAL do lock com duas conexões REAIS
+  e barreira no ponto real; filha `-mfb` com proposta/autorização próprias; último
+  slot aprovado; posição manual preservada; dois consumidores; restart;
+  expiração/drift; revogação antes e DURANTE a espera; dois promotores com um
+  efeito; rollback preservando posição/proteção; status read-only; cobertura de B
+  e C pela cadeia prospectiva oficial. TCP zero; DNS bloqueado e CONTADO (borda
+  pública de preço de marca declarada).
+- Provas: suíte backend completa **2.846 testes, OK, 2 skips históricos R05C**;
+  24 harnesses PG verdes; `py_compile` e verificação de espaços do diff aprovados.
+- Corrigidas falhas PRÉ-EXISTENTES de fixture com prova de anterioridade por
+  ordenação de commits (ownership com prova fresca; payload v2; `contract_hash_of`
+  exigindo o corpo inteiro). Correção de escopo própria: coorte prospectiva passou
+  a ser exigida só em contratos `SELECTION_ONLY` — o challenger de GESTÃO voltou a
+  ter o ciclo dele, com `comparison_scope`/`prospective_cohort`/`offline_used`
+  DECLARADOS.
+- Sem DDL, endpoint novo, worker/loop, flag, ENV, seletor, canário, aprovação
+  real, ordem, mensagem ou pausa. Candidata DESATIVADA. Publicação remota não
+  ocorreu nesta execução.
+- WAITING_DATA (amostra prospectiva), WAITING_DECISION (escopo de proteção da
+  primeira promoção e manifesto de pesquisa aprovado) e WAITING_CANARY_APPROVAL
+  continuam honestos. `OPERATIONAL_ACCEPTED` não foi alcançado.
+- Índice dos quatro lotes existe só no checkout principal: inclusão PENDENTE.

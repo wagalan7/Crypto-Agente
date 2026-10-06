@@ -268,9 +268,13 @@ async def run():
     check("vetadas_persistidas", len(vetadas) == 2, str(len(vetadas)))
     check("tentativas_persistidas", tentativas == 3, str(tentativas))
     payloads = [linha.frozen_config.get("r09_pre_selection") for linha in oportunidades]
+    # O payload nasce v2 quando traz blocos v2 (trace, evidência ponto-no-tempo,
+    # escopo da decisão observada). Ambas as versões são aceitas pelo acervo; o
+    # que importa é a versão DECLARADA ser uma das do contrato.
     check("payload_pre_selecao_viaja",
-          all(isinstance(item, dict) and item.get("schema_version") == pre.PRE_SCHEMA_VERSION
-              for item in payloads), str(payloads[:1]))
+          all(isinstance(item, dict)
+              and item.get("schema_version") in pre.PRE_SCHEMA_VERSIONS
+              for item in payloads), str(payloads[:1])[:200])
     desfechos = sorted(item.get("outcome") for item in payloads)
     check("desfecho_congelado", desfechos == ["ACCEPTED", "VETOED", "VETOED"], str(desfechos))
     nao_avaliadas = payloads[0]["funnel"]["stages_not_evaluated"]

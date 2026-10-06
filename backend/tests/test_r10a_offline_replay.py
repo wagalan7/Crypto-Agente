@@ -703,9 +703,14 @@ class Isolation(unittest.TestCase):
         # `preselection_experiment_service` (R12) reconstrói ReplayConfig/CostConfig
         # para VALIDAR manifesto — é caminho OFFLINE, e a asserção acima já
         # garante que nenhum deles chama o comparador.
+        # `prospective_shadow_service` (R13) reusa o MESMO motor de trajetória
+        # para resolver a janela prospectiva já coletada pelo resolver oficial —
+        # caminho de PESQUISA, sem executor; a asserção acima continua provando
+        # que ele não chama o comparador.
         self.assertEqual(sorted(users), ["decision_observation_service.py",
                                          "portfolio_replay_service.py",
                                          "preselection_experiment_service.py",
+                                         "prospective_shadow_service.py",
                                          "research_batch_service.py",
                                          "research_dataset_service.py",
                                          "research_study_service.py"])

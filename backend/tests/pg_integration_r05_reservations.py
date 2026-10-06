@@ -74,11 +74,31 @@ async def run():
     from services import financial_total_service as fts
     from services import shadow_trade_service as sts
 
+    # A época de validação manual da conta passou a ser PRÉ-REQUISITO da
+    # admissão (ownership com prova fresca): sem a linha, toda reserva é negada
+    # com MANUAL_POSITION_SYMBOL_BLOCKED. A fixture declara a conta liberada —
+    # ela não desliga o guard, só registra o estado inicial da conta.
+    from models.account_margin_epoch import AccountMarginEpoch
+    from models.manual_position_ack import ManualPositionAcknowledgement
+    from services import manual_position_service as mps
     for _ in range(2):      # migração aditiva idempotente
         async with db._engine.begin() as conn:
             await conn.run_sync(db.Base.metadata.create_all,
                                 tables=[RecommendationSnapshot.__table__,
-                                        RealTrade.__table__, EntryIntent.__table__])
+                                        RealTrade.__table__, EntryIntent.__table__,
+                                        AccountMarginEpoch.__table__,
+                                        ManualPositionAcknowledgement.__table__])
+    from sqlalchemy import text as _sql_text
+    async with db.get_session() as session:
+        for escopo in (CONTA, OUTRA_CONTA):
+            await session.execute(_sql_text(
+                "INSERT INTO account_margin_epochs (account_scope, exchange, market, "
+                "generation, manual_validation_generation, manual_validation_blocked, "
+                "updated_at) VALUES (:s, 'binance', 'usdm_futures', 0, 0, false, now()) "
+                "ON CONFLICT (account_scope, exchange, market) DO UPDATE SET "
+                "manual_validation_blocked = false"), {"s": escopo})
+        await session.commit()
+    mps.reset_local_validation_state()
 
     agora = datetime.now(timezone.utc)
     # O P&L do dia é do DIA (janela calendário do kill switch): ancorar o

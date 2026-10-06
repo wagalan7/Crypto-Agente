@@ -307,7 +307,10 @@ def observe_preselection(candidates: list[dict]) -> dict:
                 evaluation=candidate.get("evaluation"),
                 score_trace=candidate.get('score_trace'),
                 feature_evidence=candidate.get('feature_evidence'),
-                observed_decision_scope=candidate.get('observed_decision_scope'))
+                observed_decision_scope=candidate.get('observed_decision_scope'),
+                # Decisão candidata OBSERVACIONAL do ciclo (escopo próprio); a
+                # allowlist do congelador recusa o que não for SHADOW válido.
+                shadow_decision=candidate.get('shadow_decision'))
             cfg = pre.merge_into_config({**_CONFIG, "scope": pre.SCOPE}, payload)
             frozen = {key_name: setup.get(key_name) for key_name in
                       ("symbol", "timeframe", "side", "playbook", "playbook_version",
@@ -462,6 +465,15 @@ def _opportunity_values(row):
         first_blocker=row["first_blocker"], frozen_setup=row["frozen_setup"],
         frozen_config=row["frozen_config"], score_trace=row["score_trace"],
     )
+
+
+def _prospective_shadow_enabled() -> bool:
+    # OFF é no-op: sem consulta a catálogo, criação de linha ou replay novo.
+    from services import preselection_observation_service as pre
+    if not pre.collection_enabled():
+        return False
+    from services import strategy_evidence_service as evidence
+    return evidence.P05_CHALLENGER_SHADOW_ENABLED is True
 
 
 def _opportunity_upsert(row):
@@ -632,6 +644,13 @@ async def _admit(session, batch) -> str:
             _stats["capacity_dropped_rejected"] += 1
     values = [row for key, row in opportunities.items() if key in admitted]
     if values:
+        if _prospective_shadow_enabled():
+            from services import prospective_shadow_service as prospective
+            # Não há backfill: só a primeira persistência de oportunidades
+            # novas recebe decisão candidata capturada antes do resultado.
+            await prospective.annotate_pending_batch(session, {
+                row["opportunity_key"]: row for row in values
+                if row["opportunity_key"] not in existing})
         await session.execute(_opportunity_upsert(values))
     if kept_attempts:
         stmt = insert(AttemptRow).values(kept_attempts)
@@ -676,7 +695,14 @@ async def _resolve(session, windows) -> None:
         RejectedRow.coverage.notin_(TERMINAL_COVERAGE),
     ).distinct())).scalars().all()
     staged = {row["symbol"] for row in _pending.values() if row["rejected_at"]}
-    _wanted_symbols = set(wanted) | staged
+    prospective_wanted = set()
+    if _prospective_shadow_enabled():
+        from services import prospective_shadow_service as prospective
+        # Aceitas e vetadas usam as mesmas janelas já recebidas do resolver.
+        # Resultados prospectivos ficam no JSON próprio; não são inseridos
+        # como "rejected" nem importados do estudo offline.
+        prospective_wanted = await prospective.resolve_pending(session, windows)
+    _wanted_symbols = set(wanted) | staged | set(prospective_wanted)
 
 
 async def _flush_batch(batch, windows, progress: dict | None = None):

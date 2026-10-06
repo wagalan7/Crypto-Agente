@@ -419,6 +419,26 @@ FEATURE_LABEL_FIELDS = ("regime", "regime_source", "structure", "mtf_alignment",
 #: identidade e o vencedor é um campo, não outra linha.
 EVALUATION_FIELDS = ("evaluated_timeframes", "selected_timeframe",
                      "is_selected_timeframe", "evaluated_count")
+#: Escopos de decisão OBSERVADA aceitos no payload (allowlist versionada). A
+#: decisão do champion é `FINAL_SCANNER_SELECTION`; com o seletor operacional em
+#: CANDIDATE o próprio runtime decidiu e o escopo é `CANDIDATE_SCANNER_SELECTION`.
+#: Nenhum dos dois descreve a decisão OBSERVACIONAL do Shadow — ela tem escopo
+#: próprio (`SHADOW_DECISION_SCOPE`), em campo separado.
+OBSERVED_DECISION_SCOPES = ("FINAL_SCANNER_SELECTION", "CANDIDATE_SCANNER_SELECTION")
+#: Decisão candidata OBSERVACIONAL (seletor operacional em LEGACY/OFF): escopo
+#: explícito, separado da decisão LIVE e da seleção bruta/final do champion.
+SHADOW_DECISION_SCOPE = "CANDIDATE_SHADOW"
+SHADOW_DECISION_STATES = ("SELECTED", "REJECTED", "UNKNOWN")
+#: Campos da decisão observacional, allowlist estrita (nada de objeto inteiro).
+SHADOW_DECISION_FIELDS = ("scope", "version", "rule", "timeframe", "state",
+                          "score", "min_score", "probability", "probability_event",
+                          "model_fingerprint", "reason_code",
+                          "is_selected_timeframe", "selected", "decided_at_ms",
+                          "group", "authority")
+SHADOW_AUTHORITY_FIELDS = ("experiment_id", "generation", "approval_id",
+                           "bundle_hash", "manifest_hash", "score_config_hash",
+                           "playbook", "purpose")
+MAX_SHADOW_TIMEFRAMES = 12
 
 
 def _features_view(features: Any) -> Optional[Dict[str, Any]]:
@@ -447,6 +467,63 @@ def _evaluation_view(evaluation: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _shadow_decision_view(shadow: Any) -> Optional[Dict[str, Any]]:
+    """Normaliza a decisão candidata OBSERVACIONAL — allowlist fechada.
+
+    Exige escopo/propósito SHADOW, estado declarado e a identidade de regra
+    (manifesto/config/aprovação) que a recomputação offline vai reconciliar
+    depois. Falta essencial devolve `None`: a ausência fica ausente, nunca é
+    completada com zero nem com um estado inventado.
+    """
+    if not isinstance(shadow, Mapping) or shadow.get("scope") != SHADOW_DECISION_SCOPE:
+        return None
+    estado = shadow.get("state")
+    if estado not in SHADOW_DECISION_STATES:
+        return None
+    autoridade_bruta = shadow.get("authority")
+    if not isinstance(autoridade_bruta, Mapping) or autoridade_bruta.get("purpose") != "SHADOW":
+        return None
+    experimento = _positive_int(autoridade_bruta.get("experiment_id"))
+    geracao = autoridade_bruta.get("generation")
+    aprovacao = _label(autoridade_bruta.get("approval_id"), 64)
+    if experimento is None or type(geracao) is not int or geracao < 0 or not aprovacao:
+        return None
+    grupo_bruto = shadow.get("group") if isinstance(shadow.get("group"), Mapping) else {}
+    tfs = grupo_bruto.get("evaluated_timeframes")
+    lista = sorted({_label(item, 8) for item in tfs if _label(item, 8)}) \
+        if isinstance(tfs, (list, tuple)) else []
+    timeframe = _label(shadow.get("timeframe"), 8)
+    if timeframe is None or len(lista) > MAX_SHADOW_TIMEFRAMES:
+        return None
+    return {
+        "scope": SHADOW_DECISION_SCOPE,
+        "version": _label(shadow.get("version"), 64),
+        "rule": _label(shadow.get("rule"), 40),
+        "timeframe": timeframe,
+        "state": estado,
+        "score": _number(shadow.get("score")),
+        "min_score": _number(shadow.get("min_score")),
+        "probability": _number(shadow.get("probability")),
+        "probability_event": _label(shadow.get("probability_event"), 40),
+        "model_fingerprint": _label(shadow.get("model_fingerprint"), 64),
+        "reason_code": _label(shadow.get("reason_code"), 64),
+        "is_selected_timeframe": bool(shadow.get("is_selected_timeframe")),
+        "selected": bool(shadow.get("selected")),
+        "decided_at_ms": _positive_int(shadow.get("decided_at_ms")),
+        "group": {"evaluated_timeframes": lista,
+                  "evaluated_count": len(lista),
+                  "selected_timeframe": _label(grupo_bruto.get("selected_timeframe"), 8),
+                  "group_hash": _label(grupo_bruto.get("group_hash"), 64)},
+        "authority": {"experiment_id": experimento, "generation": geracao,
+                      "approval_id": aprovacao,
+                      "bundle_hash": _label(autoridade_bruta.get("bundle_hash"), 64),
+                      "manifest_hash": _label(autoridade_bruta.get("manifest_hash"), 64),
+                      "score_config_hash": _label(autoridade_bruta.get("score_config_hash"), 64),
+                      "playbook": _label(autoridade_bruta.get("playbook"), 40),
+                      "purpose": "SHADOW"},
+    }
+
+
 def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
                     setup: Mapping[str, Any], funnel: Mapping[str, Any],
                     availability: Mapping[str, Any],
@@ -457,7 +534,8 @@ def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
                     evaluation: Optional[Mapping[str, Any]] = None,
                     score_trace: Optional[Mapping[str, Any]] = None,
                     feature_evidence: Optional[Mapping[str, Any]] = None,
-                    observed_decision_scope: Optional[str] = None) -> Dict[str, Any]:
+                    observed_decision_scope: Optional[str] = None,
+                    shadow_decision: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Congela contexto, trace, configuração e disponibilidade NA decisão.
 
     Allowlist estrita: nada de objeto inteiro, exceção ou recomendação crua.
@@ -484,12 +562,14 @@ def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
         availability_view[name] = value if isinstance(value, bool) else VERDICT_UNKNOWN
     features_view = _features_view(features)
     evaluation_view = _evaluation_view(evaluation)
+    shadow_view = _shadow_decision_view(shadow_decision)
     payload = {
         # v2 só quando há bloco novo de verdade: sem eles o payload continua
         # idêntico ao v1 (mesmos campos, mesma ordem canônica, mesmo hash).
         "schema_version": (PRE_SCHEMA_VERSION_V2 if (features_view or evaluation_view
                            or score_trace is not None or feature_evidence is not None
-                           or observed_decision_scope is not None)
+                           or observed_decision_scope is not None
+                           or shadow_view is not None)
                            else PRE_SCHEMA_VERSION),
         "scope": SCOPE,
         "policy": POLICY,
@@ -518,8 +598,13 @@ def frozen_decision(*, identity: str, outcome: str, decision_ts_ms: Any,
             'formula_requested': trace.get('formula_requested'),
             'formula_effective': trace.get('formula_effective'),
             'score': dict(trace.get('config') or {})}
-    if observed_decision_scope == 'FINAL_SCANNER_SELECTION':
+    if observed_decision_scope in OBSERVED_DECISION_SCOPES:
         payload['observed_decision_scope'] = observed_decision_scope
+    if shadow_view is not None:
+        # Campo SEPARADO: a decisão observacional da candidata nunca sobrescreve
+        # `observed_decision_scope` (que descreve a decisão final desta linha) e
+        # nunca entra na configuração que autoriza intenção/ordem.
+        payload['shadow_decision'] = shadow_view
     if isinstance(feature_evidence, Mapping):
         missing = feature_evidence.get('missing_reasons') or {}
         payload['feature_evidence'] = {

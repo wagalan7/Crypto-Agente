@@ -2395,6 +2395,7 @@ async def place_order(
     # Callback INTERNO de autorização final (lease/token/idade das provas).
     # Nunca é enviado à Binance: roda na fronteira pós-throttle.
     final_authorization: Optional[Callable[[], Awaitable[object]]] = None,
+    candidate_guard: Optional[Callable[[], Awaitable[object]]] = None,
     leverage: Optional[int] = None,
     client_order_id: Optional[str] = None,
     entry_preflight: Optional[
@@ -2495,13 +2496,17 @@ async def place_order(
         log.info(f"[binance] qty arredondado {sym}: {qty} → {qty_rounded}")
 
     if leverage is not None:
-        _lev = await set_leverage(sym, leverage)
+        _lev = (await set_leverage(sym, leverage, candidate_guard=candidate_guard)
+                if candidate_guard is not None else await set_leverage(sym, leverage))
         if not _lev.get("ok"):
-            _lev = await set_leverage(sym, leverage)  # 1 retry
+            _lev = (await set_leverage(sym, leverage, candidate_guard=candidate_guard)
+                    if candidate_guard is not None else await set_leverage(sym, leverage))  # 1 retry
             if not _lev.get("ok"):
                 # Sem alavancagem confirmada NÃO abre: a moeda pode cair no
                 # default da conta (até 20x) e estourar a margem. Fail-safe.
-                return {"ok": False, "error":
+                return {"ok": False, "entry_not_submitted": True, "no_fill": True,
+                        "safety_state": "ENTRY_NOT_SUBMITTED",
+                        "reason_code": _lev.get("reason_code"), "error":
                         f"leverage {leverage}x não confirmada p/ {sym}: "
                         f"{_lev.get('error') or _lev.get('msg')}"}
 
@@ -3105,6 +3110,7 @@ async def place_maker_entry_then_protect(
     entry_preflight: Optional[Callable[[float, float], Awaitable[dict]]] = None,
     # Autorização FINAL interna (lease/token). Nunca vai para a Binance.
     final_authorization: Optional[Callable[[], Awaitable[object]]] = None,
+    candidate_guard: Optional[Callable[[], Awaitable[object]]] = None,
     market_preflight: Optional[Callable[[float, dict], Awaitable[dict]]] = None,
 ) -> dict:
     """
@@ -3147,12 +3153,16 @@ async def place_maker_entry_then_protect(
         return {"ok": False, "error": f"qty arredondado virou 0 (step={f.get('step')}, min={f.get('min_qty')}, raw={qty})"}
 
     if leverage is not None:
-        _lev = await set_leverage(sym, leverage)
+        _lev = (await set_leverage(sym, leverage, candidate_guard=candidate_guard)
+                if candidate_guard is not None else await set_leverage(sym, leverage))
         if not _lev.get("ok"):
-            _lev = await set_leverage(sym, leverage)  # 1 retry
+            _lev = (await set_leverage(sym, leverage, candidate_guard=candidate_guard)
+                    if candidate_guard is not None else await set_leverage(sym, leverage))  # 1 retry
             if not _lev.get("ok"):
                 # Sem alavancagem confirmada NÃO abre (fail-safe, ver place_order).
-                return {"ok": False, "error":
+                return {"ok": False, "entry_not_submitted": True, "no_fill": True,
+                        "safety_state": "ENTRY_NOT_SUBMITTED",
+                        "reason_code": _lev.get("reason_code"), "error":
                         f"leverage {leverage}x não confirmada p/ {sym}: "
                         f"{_lev.get('error') or _lev.get('msg')}"}
 
@@ -3175,6 +3185,7 @@ async def place_maker_entry_then_protect(
             entry_preflight=market_preflight,
             # A filha `-mfb` passa pela MESMA autorização final.
             final_authorization=final_authorization,
+            candidate_guard=candidate_guard,
         )
         if isinstance(res, dict):
             res["was_maker"] = False
@@ -3872,7 +3883,8 @@ async def get_open_orders(symbol: Optional[str] = None) -> dict:
     return {"ok": True, "orders": orders, "count": len(orders)}
 
 
-async def set_leverage(symbol: str, leverage: int) -> dict:
+async def set_leverage(symbol: str, leverage: int, *,
+                       candidate_guard: Optional[Callable[[], Awaitable[object]]] = None) -> dict:
     # Alavancagem é ALTERAÇÃO DE POSIÇÃO: num símbolo manual reconhecido ela
     # mexeria na posição do operador ANTES de qualquer POST de entrada.
     bloqueio = await _manual_ownership_block(symbol, "set_leverage")
@@ -3880,7 +3892,8 @@ async def set_leverage(symbol: str, leverage: int) -> dict:
         return bloqueio
     res = await _signed_request(
         "POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage},
-        mutation={"symbol": symbol, "action": "set_leverage"})
+        mutation={"symbol": symbol, "action": "set_leverage",
+                  **({"final_check": candidate_guard} if candidate_guard is not None else {})})
     return res
 
 

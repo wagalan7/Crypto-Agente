@@ -350,10 +350,15 @@ class RelatorioEFronteiras(unittest.TestCase):
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                         rotas.append(arg.value)
         self.assertTrue(rotas, "nenhuma rota encontrada — parser quebrado")
-        for proibido in ("execute-now", "enable-live", "promote", "clear-quarantine",
+        for proibido in ("execute-now", "enable-live", "clear-quarantine",
                          "activate-live"):
             ofensoras = [rota for rota in rotas if proibido in rota]
             self.assertEqual(ofensoras, [], f"{proibido}: {ofensoras}")
+        # O Lote 03 implementou a promoção GOVERNADA: existe UMA rota `promote`,
+        # do catálogo P05, que exige aprovação registrada e geração esperada.
+        # Nenhum atalho de ativação foi criado, e o R12 continua sem endpoint.
+        promocao = [rota for rota in rotas if "promote" in rota]
+        self.assertEqual(promocao, ["/api/strategy/p05/experiments/{exp_id}/promote"])
         self.assertNotIn("preselection_experiment_service",
                          (BACKEND / "main.py").read_text(encoding="utf-8"))
 

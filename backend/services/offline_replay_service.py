@@ -31,6 +31,21 @@ REPLAY_STATUSES = CLOSED_STATUSES + ("NOT_FILLED", "AMBIGUOUS_ENTRY_BAR",
 # Timeframe, janela de entrada, limite computacional e schema ficam idênticos.
 MANAGEMENT_PARAMETERS = ("pre_tp1_time_stop_bars", "max_holding_bars", "tp1_fraction",
                          "be_lock_fraction", "trail_atr_multiple", "trail_activation_atr")
+# ── Proteção SIMULADA do Shadow (R13/C) ─────────────────────────────────────
+# Este motor NÃO coloca ordem: a "proteção" aqui é o stop ativo SIMULADO que o
+# replay realmente percorreu. A fonte é declarada e versionada exatamente para
+# que ninguém a leia como SL/TP REAL na conta — ela prova apenas o que o Shadow
+# pode provar. A ausência de economia NÃO é evidência de proteção.
+PROTECTION_SOURCE = "SHADOW_SIMULATED"
+PROTECTION_VERSION = "R13_SHADOW_SIMULATED_PROTECTION_V1"
+PROTECTION_PRODUCER = "OFFICIAL_R09_OFFLINE_REPLAY"
+PROTECTION_STAGES = ("ENTRY_FILL", "TP1_PARTIAL", "BREAK_EVEN", "TRAIL",
+                     "EXIT", "WINDOW_END")
+#: Falhas de PROTEÇÃO (trilha própria, separada de resolução/economia).
+PROTECTION_STOP_NOT_FINITE = "PROTECTION_STOP_NOT_FINITE"
+PROTECTION_GEOMETRY_INVALID = "PROTECTION_GEOMETRY_INVALID"
+PROTECTION_OBLIGATION_UNRESOLVED = "PROTECTION_OBLIGATION_UNRESOLVED"
+MAX_PROTECTION_OBSERVATIONS = 48
 
 
 def _finite(value: Any, name: str, minimum: float | None = None) -> float:
@@ -320,6 +335,60 @@ def replay_opportunity(opportunity: Opportunity, bars: Sequence[Candle],
     remaining, realized, funding, active_stop = 1.0, 0.0, 0.0, o.stop_loss
     peak = None
     slip = None if costs.slippage_bps_per_side is None else costs.slippage_bps_per_side / 10_000
+    # ── Trilha de PROTEÇÃO SIMULADA: extraída do estado REALMENTE percorrido.
+    #    Nada aqui altera preço, status ou economia — é observação do stop ativo.
+    protection = {
+        "source": PROTECTION_SOURCE, "version": PROTECTION_VERSION,
+        "producer": PROTECTION_PRODUCER, "proves_real_sl": False,
+        "config_hash": result["config_hash"], "cost_config_hash": result["cost_config_hash"],
+        "opportunity_id": o.opportunity_id, "direction": o.direction,
+        "entry_reference": o.entry, "initial_stop": o.stop_loss,
+        "obligation_opened_ts_ms": None, "obligation_closed_ts_ms": None,
+        "observations": [], "observations_truncated": False,
+        "break_even_applied": False, "trail_updates": 0,
+        "failures": [], "obligation_open_at_end": None,
+        "remaining_at_end": None, "status": None, "resolution_identity": None,
+    }
+
+    def protect(stage: str, timestamp: int, *, stop, quantity, nota=None) -> None:
+        """Uma observação da proteção simulada no instante em que ela existiu."""
+        finito = isinstance(stop, (int, float)) and not isinstance(stop, bool) \
+            and math.isfinite(float(stop))
+        # Geometria JULGADA PELO ESTÁGIO: antes do TP1 o stop fica do lado da
+        # perda; depois dele, break-even/lucro é CORRETO e não pode ser
+        # reprovado pela geometria inicial. O que invalida é stop no lado
+        # errado do mercado (não proteger nada).
+        if not finito:
+            lado = "UNKNOWN"
+        elif direction * (float(stop) - o.entry) < 0:
+            lado = "LOSS_SIDE"
+        elif float(stop) == o.entry:
+            lado = "BREAK_EVEN"
+        else:
+            lado = "PROFIT_LOCK"
+        valido = finito and (lado == "LOSS_SIDE" if not result["tp1_hit"]
+                             else lado in ("LOSS_SIDE", "BREAK_EVEN", "PROFIT_LOCK"))
+        obrigacao = quantity is not None and quantity > 0
+        if len(protection["observations"]) < MAX_PROTECTION_OBSERVATIONS:
+            protection["observations"].append({
+                "stage": stage, "timestamp_ms": int(timestamp),
+                "available_ts_ms": available_at(timestamp),
+                "active_stop": float(stop) if finito else None,
+                "stop_finite": finito, "geometry": lado, "geometry_valid": valido,
+                "remaining_qty": None if quantity is None else float(quantity),
+                "exposure_reference": (None if quantity is None else
+                                       float(quantity) * o.entry),
+                "obligation": obrigacao, "note": nota,
+                "tp1_hit": bool(result["tp1_hit"])})
+        else:
+            protection["observations_truncated"] = True
+        if obrigacao and not finito:
+            protection["failures"].append({"code": PROTECTION_STOP_NOT_FINITE,
+                "stage": stage, "timestamp_ms": int(timestamp), "resolved": False})
+        elif obrigacao and not valido:
+            protection["failures"].append({"code": PROTECTION_GEOMETRY_INVALID,
+                "stage": stage, "timestamp_ms": int(timestamp), "resolved": False,
+                "geometry": lado})
 
     def available_at(timestamp: int) -> int:
         """Instante em que o desfecho daquela vela passa a ser CONHECÍVEL.
@@ -340,6 +409,34 @@ def replay_opportunity(opportunity: Opportunity, bars: Sequence[Candle],
                                 "fill_price": None if slip is None else price * (1 - direction * slip),
                                 "timestamp_ms": timestamp,
                                 "available_ts_ms": available_at(timestamp)})
+        protect("TP1_PARTIAL" if reason == "TP1" else "EXIT", timestamp,
+                stop=active_stop, quantity=remaining, nota=reason)
+
+    def close_protection(status: str, timestamp) -> None:
+        """Fecha a trilha de proteção com o que FOI observado, não com o desejado.
+
+        Obrigação aberta no fim da janela é falha PENDENTE e fica declarada como
+        tal — inclusive quando a saída foi lucrativa: lucro não é prova de
+        proteção. Economia ausente também não vira proteção aqui.
+        """
+        protection["status"] = status
+        protection["remaining_at_end"] = float(remaining) if result["filled"] else None
+        aberta = bool(result["filled"]) and remaining > 0
+        protection["obligation_open_at_end"] = aberta if result["filled"] else None
+        if result["filled"]:
+            protection["obligation_closed_ts_ms"] = (None if aberta else
+                                                     (int(timestamp) if timestamp is not None else None))
+        protection["resolution_identity"] = {
+            "status": status, "exit_ts_ms": result["exit_ts_ms"],
+            "result_available_ts_ms": result["result_available_ts_ms"],
+            "exits": len(result["exits"]), "bars_held": result["bars_held"]}
+        if aberta:
+            protection["failures"].append({
+                "code": PROTECTION_OBLIGATION_UNRESOLVED, "stage": "WINDOW_END",
+                "timestamp_ms": None if timestamp is None else int(timestamp),
+                "resolved": False, "remaining_qty": float(remaining)})
+        protection["pending_failures"] = sum(
+            1 for falha in protection["failures"] if falha.get("resolved") is not True)
 
     def finish(status: str, timestamp: int) -> dict:
         result["status"] = status
@@ -361,15 +458,23 @@ def replay_opportunity(opportunity: Opportunity, bars: Sequence[Candle],
         if not all(value is None or math.isfinite(value) for value in
                    (result["gross_r"], result["net_r"], result["fee_r"], result["slippage_r"], result["funding_r"])):
             raise ValueError("overflow no cálculo econômico")
+        close_protection(status, timestamp)
+        result["protection"] = protection
+        return result
+
+    def abort(status: str, timestamp) -> dict:
+        """Saída ANTES de um desfecho: a proteção fecha com o que foi visto."""
+        result["status"] = status
+        close_protection(status, timestamp)
+        result["protection"] = protection
         return result
 
     for index, bar in enumerate(bars):
         if not isinstance(bar, Candle):
             raise ValueError("bars exige Candle validada")
         if bar.timestamp_ms != first_ms + index * config.bar_ms:
-            result["status"] = "MISSING_OR_UNORDERED_BARS"
             reasons.append("EXPECTED_CONTIGUOUS_CLOSED_BARS")
-            return result
+            return abort("MISSING_OR_UNORDERED_BARS", bar.timestamp_ms)
         result["bars_observed"] += 1
         newly_filled = False
         if not result["filled"]:
@@ -379,17 +484,18 @@ def replay_opportunity(opportunity: Opportunity, bars: Sequence[Candle],
                 result["entry_reference_price"] = o.entry
                 result["entry_fill_price"] = None if slip is None else o.entry * (1 + direction * slip)
                 result["entry_ts_ms"] = bar.timestamp_ms
+                protection["obligation_opened_ts_ms"] = bar.timestamp_ms
+                protect("ENTRY_FILL", bar.timestamp_ms, stop=active_stop,
+                        quantity=remaining, nota="INITIAL_STOP")
                 touches_exit = (bar.low <= o.stop_loss or bar.high >= o.tp1) if direction == 1 else (bar.high >= o.stop_loss or bar.low <= o.tp1)
                 if bar.open != o.entry and touches_exit:
-                    result["status"] = "AMBIGUOUS_ENTRY_BAR"
                     reasons.append("PRE_ENTRY_EXTREMES_ORDER_UNKNOWN")
-                    return result
+                    return abort("AMBIGUOUS_ENTRY_BAR", bar.timestamp_ms)
                 if bar.open != o.entry:
                     reasons.append("ENTRY_INTRABAR_TIME_UNKNOWN")
             elif index + 1 == config.entry_window_bars:
-                result["status"] = "NOT_FILLED"
                 reasons.append("ENTRY_NOT_TOUCHED_WITHIN_WINDOW")
-                return result
+                return abort("NOT_FILLED", bar.timestamp_ms)
             else:
                 continue
         result["bars_held"] += 1
@@ -422,11 +528,31 @@ def replay_opportunity(opportunity: Opportunity, bars: Sequence[Candle],
         if result["tp1_hit"]:
             peak = favorable if peak is None else (max(peak, favorable) if direction == 1 else min(peak, favorable))
             next_stop = o.entry + config.be_lock_fraction * (o.tp1 - o.entry)
+            trail_aplicado = False
             if o.atr is not None and direction * (peak - o.tp1) >= config.trail_activation_atr * o.atr:
                 trail = peak - direction * config.trail_atr_multiple * o.atr
+                trail_aplicado = (max(next_stop, trail) if direction == 1
+                                  else min(next_stop, trail)) == trail and trail != next_stop
                 next_stop = max(next_stop, trail) if direction == 1 else min(next_stop, trail)
+            anterior = active_stop
             active_stop = max(active_stop, next_stop) if direction == 1 else min(active_stop, next_stop)
+            if active_stop != anterior:
+                # Transição REAL de gestão: break-even primeiro, trailing depois.
+                if trail_aplicado and protection["break_even_applied"]:
+                    protection["trail_updates"] += 1
+                    estagio = "TRAIL"
+                else:
+                    protection["break_even_applied"] = True
+                    estagio = "BREAK_EVEN"
+                protect(estagio, bar.timestamp_ms, stop=active_stop,
+                        quantity=remaining, nota="TRAIL" if estagio == "TRAIL"
+                        else "BE_LOCK")
     reasons.append("INCOMPLETE_ENTRY_WINDOW" if not result["filled"] else "INCOMPLETE_FORWARD_HORIZON")
+    if result["filled"]:
+        protect("WINDOW_END", bars[-1].timestamp_ms if bars else first_ms,
+                stop=active_stop, quantity=remaining, nota="FORWARD_HORIZON_INCOMPLETE")
+    close_protection(result["status"], bars[-1].timestamp_ms if bars else None)
+    result["protection"] = protection
     return result
 
 

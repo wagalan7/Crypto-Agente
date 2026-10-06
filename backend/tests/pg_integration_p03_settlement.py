@@ -77,11 +77,30 @@ async def run():
     from services import entry_intent_service as intents
     from services import execution_reconciliation_service as ers
 
+    # Ownership com prova FRESCA é pré-requisito da admissão: sem o registro de
+    # reconhecimento manual e sem a época da conta, toda reserva é negada com
+    # MANUAL_POSITION_SYMBOL_BLOCKED. A fixture cria as tabelas e declara a conta
+    # liberada — não desliga o guard.
+    from models.account_margin_epoch import AccountMarginEpoch
+    from models.manual_position_ack import ManualPositionAcknowledgement
+    from services import manual_position_service as mps
+    from sqlalchemy import text as _sql_text
     tabelas = [RecommendationSnapshot.__table__, RealTrade.__table__,
-               EntryIntent.__table__, ExecutionIncident.__table__, RiskState.__table__]
+               EntryIntent.__table__, ExecutionIncident.__table__, RiskState.__table__,
+               AccountMarginEpoch.__table__, ManualPositionAcknowledgement.__table__]
     for _ in range(2):      # migração aditiva idempotente
         async with db._engine.begin() as conn:
             await conn.run_sync(db.Base.metadata.create_all, tables=tabelas)
+    async with db.get_session() as session:
+        for _escopo in ("c" * 64,):
+            await session.execute(_sql_text(
+                "INSERT INTO account_margin_epochs (account_scope, exchange, market, "
+                "generation, manual_validation_generation, manual_validation_blocked, "
+                "updated_at) VALUES (:s, 'binance', 'usdm_futures', 0, 0, false, now()) "
+                "ON CONFLICT (account_scope, exchange, market) DO UPDATE SET "
+                "manual_validation_blocked = false"), {"s": _escopo})
+        await session.commit()
+    mps.reset_local_validation_state()
     await db.init_db()      # colunas aditivas (dispatch_ids/decision_payload)
 
     ORDENS: dict = {}

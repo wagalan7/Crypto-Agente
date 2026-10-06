@@ -926,18 +926,52 @@ class ApiTests(unittest.TestCase):
         }
         self.assertTrue(expected.issubset(set(self.routes)), f"faltando: {expected - set(self.routes)}")
 
-    def test_sem_endpoint_de_promote_apply_ou_live(self):
+    def test_sem_endpoint_generico_de_apply_ou_live(self):
+        """Rota genérica de ativação continua PROIBIDA.
+
+        O Lote 03 implementou a promoção GOVERNADA (item 7 do índice): existe
+        exatamente uma rota `promote`, autenticada, que exige confirmação
+        literal, `approval_id` e `expected_generation` e delega à governança —
+        ela não liga seletor, não altera ENV e não envia ordem. O que segue
+        proibido é o atalho genérico: enable-live, apply-config, execute-now e
+        afins.
+        """
         for method, path in self.routes:
-            for proibido in ("promote", "apply", "activate", "execute", "retry-now", "change-size"):
+            for proibido in ("apply", "activate", "execute", "retry-now",
+                             "change-size", "enable-live"):
                 self.assertNotIn(proibido, path.lower(), f"endpoint proibido: {path}")
+        promocao = [path for _m, path in self.routes if "promote" in path.lower()]
+        self.assertEqual(promocao, ["/api/strategy/p05/experiments/{exp_id}/promote"])
+        corpo = ast.get_source_segment(
+            self.src, self.routes[("post", promocao[0])]) or ""
+        for exigido in ("_r13_admin_principal", "confirm", "approval_id",
+                        "expected_generation", "promote_preselection"):
+            self.assertIn(exigido, corpo, exigido)
+        self.assertNotIn("R13_OPERATIONAL_SELECTOR", corpo)
 
     def test_post_exige_auth_admin(self):
+        """Todo POST passa por autenticação administrativa configurada.
+
+        O helper `_r13_admin_principal` é aceito porque ele PROVADAMENTE exige
+        `ADMIN_API_TOKEN` configurado e chama `_check_admin_token` — a garantia
+        é a mesma, verificada no corpo do helper logo abaixo.
+        """
         for (method, path), node in self.routes.items():
             if method != "post":
                 continue
             body = ast.get_source_segment(self.src, node) or ""
-            self.assertIn("_check_admin_token", body, f"POST sem auth: {path}")
+            self.assertTrue(any(gate in body for gate in
+                                ("_check_admin_token", "_r13_admin_principal")),
+                            f"POST sem auth: {path}")
             self.assertIn("x_admin_token", body, f"POST sem header admin: {path}")
+        helper = next((node for node in ast.walk(ast.parse(self.src))
+                       if isinstance(node, ast.FunctionDef)
+                       and node.name == "_r13_admin_principal"), None)
+        self.assertIsNotNone(helper, "helper de autenticação ausente")
+        corpo_helper = ast.get_source_segment(self.src, helper) or ""
+        self.assertIn("_check_admin_token", corpo_helper)
+        self.assertIn("ADMIN_API_TOKEN", corpo_helper)
+        self.assertIn("HTTPException", corpo_helper)
 
     def test_get_nao_exige_auth(self):
         node = self.routes[("get", "/api/strategy/p05/status")]

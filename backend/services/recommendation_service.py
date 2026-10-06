@@ -24,7 +24,7 @@ import os
 import time
 from contextvars import ContextVar
 from typing import List, NamedTuple, Optional, Dict, Any, Tuple
-from pydantic import BaseModel
+from pydantic import BaseModel, model_serializer
 
 from services.binance_service import fetch_top_volume_symbols, fetch_ohlcv, fetch_ticker
 from services.indicator_service import calculate_indicators
@@ -490,6 +490,15 @@ class Recommendation(BaseModel):
     # bloqueiam a autoexecução. CALIBRATION_UNAVAILABLE é calibração imatura —
     # NÃO é incompatibilidade e preserva o comportamento operacional anterior.
     probability_provenance: Optional[dict] = None
+    # Contexto CANDIDATE governado separado do score/tier/risco legados.
+    operational_selection: Optional[dict] = None
+
+    @model_serializer(mode='wrap')
+    def _serialize_operational_selection(self, handler):
+        value = handler(self)
+        if self.operational_selection is None:
+            value.pop('operational_selection', None)
+        return value
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -2525,7 +2534,8 @@ async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[Trade
 
 
 async def _best_tf_for_symbol_server(svc, symbol: str,
-                                     evaluated_out: Optional[list] = None) -> Optional[tuple]:
+                                     evaluated_out: Optional[list] = None,
+                                     candidate_authority: Optional[dict] = None) -> Optional[tuple]:
     """Melhor TF do símbolo — e, opcionalmente, TODOS os avaliados.
 
     `evaluated_out` recebe a lista `(sig, score)` dos candidatos EFETIVAMENTE
@@ -2533,7 +2543,7 @@ async def _best_tf_for_symbol_server(svc, symbol: str,
     desempate do champion não mudam: a lista é um espelho, não um critério.
     Quando o chamador não pede a lista (coleta desligada), nada extra é feito.
     """
-    token = _PRE_CAPTURE.set(True) if evaluated_out is not None else None
+    token = _PRE_CAPTURE.set(True) if evaluated_out is not None or candidate_authority is not None else None
     try:
         results = list(await asyncio.gather(*[
             _analyze_symbol_tf_server(svc, symbol, tf) for tf in SCAN_TFS
@@ -2543,7 +2553,7 @@ async def _best_tf_for_symbol_server(svc, symbol: str,
             _PRE_CAPTURE.reset(token)
     # TFs altos (gated): avaliados com cache TTL + peso de relevância.
     if HIGH_TF_PATTERNS_ENABLED:
-        token = _PRE_CAPTURE.set(True) if evaluated_out is not None else None
+        token = _PRE_CAPTURE.set(True) if evaluated_out is not None or candidate_authority is not None else None
         try:
             results += list(await asyncio.gather(*[
                 _htf_signal_cached(symbol, tf, lambda tf=tf: _analyze_symbol_tf_server(svc, symbol, tf))
@@ -2588,6 +2598,25 @@ async def _best_tf_for_symbol_server(svc, symbol: str,
             _score_trace.record_signal_stage(item[0], "selection_score", value=item[1],
                                             input_score=item[1], penalty=0.0, status="UNAVAILABLE")
             return item[1]
+    if candidate_authority is not None:
+        # Mesmos ALL-TFs e mesmos inputs locais L02, ANTES de escolher um TF.
+        # Nunca reaproveita seleção/tier V2 como se fossem pontuação V3.
+        from services import live_candidate_adapter_service as adapter
+        valid = []
+        for sig, legacy_score in scored:
+            _sel_key((sig, legacy_score))  # trace do caminho legado, não gate V3
+            decision = adapter.candidate_decision(candidate_authority,
+                features=_preselection_features(sig, legacy_score), symbol=sig.symbol,
+                side=_enum_value(sig.direction), timeframe=sig.timeframe,
+                entry=sig.entry, stop_loss=sig.stop_loss, tp1=sig.tp1, tp2=sig.tp2)
+            if decision.get('ok') is True:
+                object.__setattr__(sig, '_r13_candidate_context', decision['context'])
+                valid.append((sig, legacy_score, decision['score']))
+        # Empate estável usa a ordem original dos TFs, congelada no runtime.
+        if not valid:
+            return None
+        winner = max(valid, key=lambda item: item[2])
+        return winner[0], winner[1]
     return max(scored, key=_sel_key)
 
 
@@ -2754,7 +2783,8 @@ def _preselection_features(sig, score, *, selection_score=None,
 
 def _preselection_candidate(sig, score, *, stages, accepted: bool,
                             features: Optional[dict] = None,
-                            evaluation: Optional[dict] = None) -> Optional[dict]:
+                            evaluation: Optional[dict] = None,
+                            shadow: Optional[dict] = None) -> Optional[dict]:
     """Monta a linha de observação de UM candidato do scan.
 
     Só campos ponto-no-tempo que o núcleo/score/replay precisam depois; nada é
@@ -2813,7 +2843,18 @@ def _preselection_candidate(sig, score, *, stages, accepted: bool,
                 ('htf_alignment_ratio', 'structure_quality', 'level_distance_atr',
                  'trigger_body_ratio', 'trigger_follow_through_atr', 'entry_distance_atr')
                 if (features or {}).get(name) is None}}
-        linha['observed_decision_scope'] = 'FINAL_SCANNER_SELECTION'
+        if getattr(sig, '_r13_candidate_context', None) is not None:
+            linha['config']['observed_operational_selector'] = 'CANDIDATE'
+            linha['config']['decision_scope'] = 'CANDIDATE_SCANNER_SELECTION'
+            linha['observed_decision_scope'] = 'CANDIDATE_SCANNER_SELECTION'
+        else:
+            linha['observed_decision_scope'] = 'FINAL_SCANNER_SELECTION'
+        # Decisão candidata OBSERVACIONAL: escopo PRÓPRIO (CANDIDATE_SHADOW), ao
+        # lado da decisão do champion — nunca no campo que descreve a decisão
+        # final/LIVE desta linha e nunca no campo operacional que autoriza
+        # intenção. O timeframe observado tem de ser o DESTA linha.
+        if isinstance(shadow, dict) and shadow.get('timeframe') == setup['timeframe']:
+            linha['shadow_decision'] = shadow
         if hasattr(sig, '_r13_research_inputs'):
             object.__delattr__(sig, '_r13_research_inputs')
         return linha
@@ -2861,6 +2902,30 @@ async def get_recommendations_via_vision(
     #    pesquisa, acessa book ou acrescenta consulta/gravação — e a lista de
     #    recomendações é bit a bit a mesma de antes.
     _pre_on, _pre_mod = _preselection_gate()
+    # LEGACY e OFF são no-op ABSOLUTO (paridade): não importam autoridade, não
+    # abrem sessão e não mudam a lista. Só o pedido explícito de CANDIDATE (ou
+    # um seletor inválido) consulta a governança — e, sem autoridade válida, a
+    # entrada nova é BLOQUEADA em vez de cair permissivamente no champion.
+    from services import live_candidate_adapter_service as _candidate_adapter
+    _candidate_view = None
+    if _candidate_adapter.selected_mode() not in _candidate_adapter.PARITY_MODES:
+        from db import get_session
+        _view = await _candidate_adapter.load_operational_view(get_session)
+        if not _candidate_adapter.candidate_mode_active(_view):
+            _log.warning('[candidate] autoridade indisponível (%s): nenhuma '
+                         'entrada nova', (_view or {}).get('reason_code'))
+            return []
+        _candidate_view = _view
+    # Decisão candidata OBSERVACIONAL (escopo CANDIDATE_SHADOW): existe só com a
+    # coleta LIGADA e aprovação de propósito SHADOW válida. Não exige promoção,
+    # ELIGIBLE nem CANARY, roda com o seletor operacional em LEGACY/OFF, não
+    # altera a lista/ordem/valores do champion e NUNCA vira autoridade de ordem
+    # (o propósito SHADOW é recusado no caminho que autoriza intenção).
+    _shadow_authority = None
+    if _pre_on:
+        from db import get_session as _get_session_shadow
+        _shadow_authority = await _candidate_adapter.load_shadow_authority(
+            _get_session_shadow)
     _pre_rows: List[dict] = []
     _pre_for_rec: Dict[int, dict] = {}
     _pre_admitted = 0
@@ -2911,13 +2976,14 @@ async def get_recommendations_via_vision(
 
     def _observe_pre(sig_obj, score_value, stages, *, accepted: bool,
                      features: Optional[dict] = None,
-                     evaluation: Optional[dict] = None) -> None:
+                     evaluation: Optional[dict] = None,
+                     shadow: Optional[dict] = None) -> None:
         # Desligado: nem a linha é construída (nenhum trabalho novo no ciclo).
         if not _pre_on:
             return
         row = _preselection_candidate(sig_obj, score_value, stages=stages,
                                       accepted=accepted, features=features,
-                                      evaluation=evaluation)
+                                      evaluation=evaluation, shadow=shadow)
         if row is not None:
             _pre_rows.append(row)
         return row
@@ -2932,7 +2998,46 @@ async def get_recommendations_via_vision(
                 "selected_timeframe": eleito or None,
                 "is_selected_timeframe": bool(eleito) and atual == eleito}
 
-    def _observe_losers(avaliados, escolhido, *, regime=None) -> None:
+    def _shadow_group_for(avaliados, *, regime=None):
+        """Decisão observacional da candidata sobre o grupo ALL-TF do símbolo.
+
+        Roda a MESMA função de decisão do caminho operacional (núcleo puro
+        compartilhado, não uma cópia "equivalente"), sobre os MESMOS TFs que o
+        champion avaliou e ANTES da escolha dele. Sem autoridade SHADOW ou sem
+        coleta, devolve `None` — e nada novo é calculado no ciclo.
+        """
+        if not _pre_on or _shadow_authority is None or not avaliados:
+            return None
+        try:
+            entradas = [{"features": _preselection_features(sig_obj, score_value,
+                                                            regime=regime),
+                         "symbol": getattr(sig_obj, "symbol", None),
+                         "side": _enum_value(getattr(sig_obj, "direction", None)),
+                         "timeframe": getattr(sig_obj, "timeframe", None),
+                         "entry": getattr(sig_obj, "entry", None),
+                         "stop_loss": getattr(sig_obj, "stop_loss", None),
+                         "tp1": getattr(sig_obj, "tp1", None),
+                         "tp2": getattr(sig_obj, "tp2", None)}
+                        for sig_obj, score_value in avaliados or ()]
+            resultado = _candidate_adapter.shadow_group_decision(
+                _shadow_authority, entradas)
+            return resultado.get("group") if resultado.get("ok") else None
+        except Exception as exc:    # pesquisa nunca altera a decisão do bot
+            _log.debug(f"[candidate-shadow] grupo indisponível: {exc}")
+            return None
+
+    def _shadow_for(grupo, sig_obj):
+        """Decisão observacional DESTE TF, no estágio exato comparado."""
+        if grupo is None:
+            return None
+        try:
+            return _candidate_adapter.shadow_decision_for_timeframe(
+                grupo, str(getattr(sig_obj, "timeframe", "") or ""))
+        except Exception:
+            return None
+
+    def _observe_losers(avaliados, escolhido, *, regime=None,
+                        shadow_group=None) -> None:
         """TFs avaliados que NÃO venceram a escolha de melhor TF do símbolo.
 
         A escolha do best é um gate real: aqui ela aparece como SELECTION
@@ -2952,7 +3057,8 @@ async def get_recommendations_via_vision(
                 _stage("SELECTION", "REJECTED", "TIMEFRAME_NOT_SELECTED")],
                 accepted=False,
                 features=_preselection_features(sig_obj, score_value, regime=regime),
-                evaluation=_evaluation_block(avaliados, escolhido, sig_obj))
+                evaluation=_evaluation_block(avaliados, escolhido, sig_obj),
+                shadow=_shadow_for(shadow_group, sig_obj))
 
     def _observe_evaluated(resultados, *, regime=None, veto_stage: str,
                            veto_reason: str) -> None:
@@ -2963,6 +3069,7 @@ async def get_recommendations_via_vision(
         para símbolo que nem chegou a ser varrido.
         """
         for _sym, best, avaliados in resultados or ():
+            grupo_shadow = _shadow_group_for(avaliados, regime=regime)
             for sig_obj, score_value in avaliados or ():
                 _observe_pre(sig_obj, score_value, [
                     _stage("CANDIDATE", "PASSED"),
@@ -2973,7 +3080,8 @@ async def get_recommendations_via_vision(
                     _stage(veto_stage, "REJECTED", veto_reason)],
                     accepted=False,
                     features=_preselection_features(sig_obj, score_value, regime=regime),
-                    evaluation=_evaluation_block(avaliados, best, sig_obj))
+                    evaluation=_evaluation_block(avaliados, best, sig_obj),
+                    shadow=_shadow_for(grupo_shadow, sig_obj))
 
     # News blackout: pula scan inteiro durante janela de evento high-impact.
     # Economiza chamadas pra exchange E evita push notifications no pior
@@ -3066,13 +3174,18 @@ async def get_recommendations_via_vision(
             # libera o slot do semáforo na hora.
             try:
                 if SERVER_SCAN_SYMBOL_TIMEOUT_S > 0:
+                    kwargs = {'evaluated_out': avaliados}
+                    if _candidate_view is not None:
+                        kwargs['candidate_authority'] = _candidate_view
                     best = await asyncio.wait_for(
-                        _best_tf_for_symbol_server(svc, sym, evaluated_out=avaliados),
+                        _best_tf_for_symbol_server(svc, sym, **kwargs),
                         timeout=SERVER_SCAN_SYMBOL_TIMEOUT_S,
                     )
                 else:
-                    best = await _best_tf_for_symbol_server(svc, sym,
-                                                            evaluated_out=avaliados)
+                    kwargs = {'evaluated_out': avaliados}
+                    if _candidate_view is not None:
+                        kwargs['candidate_authority'] = _candidate_view
+                    best = await _best_tf_for_symbol_server(svc, sym, **kwargs)
             except asyncio.TimeoutError:
                 _stats["fail"] += 1
                 _log.warning(f"[server-scan] {sym} passou de {SERVER_SCAN_SYMBOL_TIMEOUT_S}s — pulado (slot liberado)")
@@ -3158,8 +3271,15 @@ async def get_recommendations_via_vision(
         # Os TFs AVALIADOS que não viraram best são observados aqui: a escolha
         # do melhor TF é um gate real, então eles saem como vetados nessa etapa
         # e o que vem depois fica NOT_EVALUATED (não rodou para eles).
+        # A decisão observacional da candidata é calculada UMA vez por símbolo,
+        # sobre os MESMOS TFs avaliados e ANTES da escolha do champion — e é a
+        # mesma para o TF vencedor e para os perdedores (estágio comparado).
+        _pre_shadow_group = (_shadow_group_for(_evaluated, regime=regime)
+                             if _pre_on else None)
+        _pre_shadow = _shadow_for(_pre_shadow_group, sig)
         if _pre_on and _evaluated:
-            _observe_losers(_evaluated, best, regime=regime)
+            _observe_losers(_evaluated, best, regime=regime,
+                            shadow_group=_pre_shadow_group)
         # Etapas comuns a qualquer desfecho deste candidato, na ordem REAL.
         _pre_stages = [
             _stage("CANDIDATE", "PASSED"),
@@ -3197,7 +3317,7 @@ async def get_recommendations_via_vision(
                         _stage("SELECTION", "REJECTED",
                                str(adj_res.get("block_reason") or "LEARNING_BUCKET_BLOCK"))],
                         accepted=False, features=_pre_feat(),
-                        evaluation=_pre_eval)
+                        evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
                 if adj_res.get("multiplier", 1.0) != 1.0:
                     score = adj_res["score"]
@@ -3215,13 +3335,13 @@ async def get_recommendations_via_vision(
         if tier is None:
             _observe_pre(sig, score, _pre_stages + [
                 _stage("SELECTION", "REJECTED", "TIER_BELOW_MINIMUM")], accepted=False,
-                features=_pre_feat(), evaluation=_pre_eval)
+                features=_pre_feat(), evaluation=_pre_eval, shadow=_pre_shadow)
             continue
         if sig.symbol in cooldown_symbols:
             _log.info(f"[server-scan] cooldown skip {sig.symbol}")
             _observe_pre(sig, score, _pre_stages + [
                 _stage("SELECTION", "REJECTED", "SYMBOL_COOLDOWN")], accepted=False,
-                features=_pre_feat(tier), evaluation=_pre_eval)
+                features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
             continue
         # Regime filter
         try:
@@ -3232,7 +3352,7 @@ async def get_recommendations_via_vision(
                 _observe_pre(sig, score, _pre_stages + [
                     _stage("SELECTION", "PASSED"),
                     _stage("MTF_REGIME", "REJECTED", "REGIME_BLOCK")], accepted=False,
-                    features=_pre_feat(tier), evaluation=_pre_eval)
+                    features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                 continue
             if regime.get("downgrade_alt_longs") and sig.direction == "long" and not is_btc_symbol(sig.symbol):
                 if tier == "A+":
@@ -3241,7 +3361,7 @@ async def get_recommendations_via_vision(
                     tier = "B"
                 elif tier == "B":
                     _observe_pre(sig, score, _pre_stages + [_stage('MTF_REGIME', 'REJECTED', 'ALT_LONG_DOWNGRADE_BELOW_TIER')],
-                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval)
+                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
             # Trava simétrica: downgrade de SHORT contra pernada forte de alta
             if regime.get("downgrade_shorts") and sig.direction == "short":
@@ -3251,7 +3371,7 @@ async def get_recommendations_via_vision(
                     tier = "B"
                 elif tier == "B":
                     _observe_pre(sig, score, _pre_stages + [_stage('MTF_REGIME', 'REJECTED', 'SHORT_DOWNGRADE_BELOW_TIER')],
-                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval)
+                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
             # Trava de CONTRA-TENDÊNCIA por MOEDA (higher-TF EMA do próprio ativo).
             # Mesmo gate do caminho batch — pega short em alt subindo sozinha, que
@@ -3263,7 +3383,7 @@ async def get_recommendations_via_vision(
                     _observe_pre(sig, score, _pre_stages + [
                         _stage("SELECTION", "PASSED"),
                         _stage("MTF_REGIME", "REJECTED", "COUNTER_TREND_BRAKE")], accepted=False,
-                        features=_pre_feat(tier), evaluation=_pre_eval)
+                        features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
                 if tier == "A+":
                     tier = "A"
@@ -3271,7 +3391,7 @@ async def get_recommendations_via_vision(
                     tier = "B"
                 elif tier == "B":
                     _observe_pre(sig, score, _pre_stages + [_stage('MTF_REGIME', 'REJECTED', 'COUNTER_TREND_DOWNGRADE_BELOW_TIER')],
-                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval)
+                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
                 _log.info(f"[server-scan][ct-brake] downgrade {sig.symbol} {sig.direction}→{tier}: {ct_reason}")
         except Exception:
@@ -3283,8 +3403,13 @@ async def get_recommendations_via_vision(
             _stage("GEOMETRY_RR", "PASSED" if _rec is not None else "REJECTED",
                    None if _rec is not None else "GEOMETRY_UNAVAILABLE")],
             accepted=_rec is not None, features=_pre_feat(tier),
-            evaluation=_pre_eval)
+            evaluation=_pre_eval, shadow=_pre_shadow)
         if _rec is not None:
+            if _candidate_view is not None:
+                context = getattr(sig, '_r13_candidate_context', None)
+                if context is None:
+                    continue  # nunca cai para LEGACY em modo CANDIDATE
+                _rec.operational_selection = _candidate_adapter.freeze_context(context)
             recommendations.append(_rec)
             if _pre_row is not None:
                 _pre_for_rec[id(_rec)] = _pre_row

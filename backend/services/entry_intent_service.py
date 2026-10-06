@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
+import copy
 import hashlib
 import json
 import math
@@ -595,6 +596,13 @@ def decision_snapshot(payload: Any, *, qty: Any = None) -> Optional[dict]:
         valor = _finite(bruto)
         if valor is not None:
             snapshot[chave] = valor
+    if source.get('operational_selection') is not None:
+        from services.live_candidate_adapter_service import freeze_context
+        snapshot['operational_selection'] = freeze_context(source['operational_selection'])
+        equity = _finite(source.get('candidate_equity_usd'))
+        if equity is None or equity <= 0:
+            raise ValueError('CANARY_EQUITY_UNKNOWN')
+        snapshot['candidate_equity_usd'] = equity
     return snapshot or None
 
 
@@ -618,12 +626,34 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
     moment = now or _now()
     deadline = moment + timedelta(seconds=max(1, int(lease_seconds)))
     try:
+        candidate_snapshot = decision_snapshot(decision if decision is not None else payload)
         async with session_factory() as session:
             # Serializa a admissão de capacidade entre decisões diferentes.
             await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": RISK_LOCK_KEY})
             # Relógio obtido DEPOIS da espera pela lock: `moment` foi capturado
             # antes dela e não prova atualidade da carteira.
             pos_lock_ms = int(_now().timestamp() * 1000)
+            candidate_context = (candidate_snapshot or {}).get('operational_selection')
+            if candidate_context is not None:
+                from services import operational_governance_service as governance
+                checked = await governance.assert_authority_in_session(
+                    session, candidate_context['authority'], pos_lock_ms)
+                if checked.get('ok') is not True:
+                    await session.rollback()
+                    return Reservation(BLOCKED_CAPACITY, key, coid, None,
+                                       checked.get('reason_code') or 'CANDIDATE_AUTHORITY_UNAVAILABLE')
+                limits = candidate_context['authority']['approval']['limits']
+                maximum = limits.get('max_orders')
+                if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+                    raise ValueError('CANARY_ORDER_LIMIT_INVALID')
+                approval_id = str(candidate_context['authority']['approval']['approval_id'])
+                used = (await session.execute(select(func.count(EntryIntent.intent_key)).where(
+                    EntryIntent.intent_key != key,
+                    EntryIntent.decision_payload['operational_selection']['authority']['approval']['approval_id'].as_string() == approval_id
+                ))).scalar_one()
+                if int(used) >= maximum:
+                    await session.rollback()
+                    return Reservation(BLOCKED_CAPACITY, key, coid, None, 'CANARY_ORDER_LIMIT')
             # Ownership DENTRO da transação, DEPOIS da lock e ANTES de conceder
             # ou gravar capacidade — vale para intenção NOVA e para retomada.
             negado = await _ownership_denial(session, identity, "reserve")
@@ -703,8 +733,7 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     if margin is not None else 0.0,
                     # Gravado ANTES de qualquer POST: depois do envio não há de
                     # onde recuperar stop/qty da decisão que originou a ordem.
-                    decision_payload=decision_snapshot(decision if decision is not None
-                                                       else payload),
+                    decision_payload=candidate_snapshot,
                     real_trade_id=None, created_at=moment, updated_at=moment,
                     resolved_at=None)
                 session.add(nova_linha)
@@ -956,15 +985,23 @@ def _bind_proposal_in_session(row, proposal: Mapping, *, token,
     deadline_ms = None
     if isinstance(lease_expires_at, datetime):
         deadline_ms = int(lease_expires_at.timestamp() * 1000)
+    payload = dict(row.decision_payload or {})
+    guardado = payload.get('operational_selection')
+    if (guardado is None) != (proposal.get('operational_selection') is None):
+        # Nem perder a candidata guardada, nem acrescentar uma na readmissão.
+        return None
     congelada = freeze_dispatch_proposal(
         **{campo: proposal.get(campo) for campo in PROPOSAL_FIELDS
            if campo not in ("token", "lease_expires_at_ms", "created_at_ms")},
         token=_finite_token(token),
+        operational_selection=proposal.get('operational_selection'),
+        # A decisão ORIGINAL permanece: a leitura nova só prova que é a MESMA
+        # candidata (identidade estável), nunca substitui o plano congelado.
+        stored_operational_selection=guardado,
         lease_expires_at_ms=deadline_ms,
         created_at_ms=int(moment.timestamp() * 1000))
     if not congelada.get("ok"):
         return None
-    payload = dict(row.decision_payload or {})
     propostas = dict(payload.get("proposals") or {})
     propostas[str(despacho)] = congelada
     # Teto defensivo: uma decisão não acumula despachos indefinidamente.
@@ -1031,11 +1068,42 @@ def canonical_proposal_hash(proposal: Mapping) -> Optional[str]:
     try:
         corpo = {campo: _canonical_value(proposal.get(campo))
                  for campo in PROPOSAL_FIELDS}
+        # Legado preserva hash e schema EXATOS, inclusive propostas pré-lote.
+        if proposal.get('operational_selection') is not None:
+            corpo['operational_selection'] = _canonical_value(proposal['operational_selection'])
         texto = json.dumps(corpo, sort_keys=True, separators=(",", ":"),
                            ensure_ascii=True, allow_nan=False)
     except (TypeError, ValueError):
         return None
     return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+
+def candidate_identity_matches(stored: Any, incoming: Any) -> bool:
+    """Duas leituras da MESMA candidata/decisão congelada?
+
+    A comparação é pela IDENTIDADE ESTÁVEL (experimento, bundle, aprovação,
+    geração, modelo e decisão) — nunca pelo carimbo da leitura. Retry, restart
+    e filha `-mfb` reencontram a mesma intenção em vez de parecerem outra.
+    """
+    try:
+        from services.live_candidate_adapter_service import same_identity
+        return bool(same_identity(stored, incoming))
+    except Exception:  # noqa: BLE001 — dúvida NÃO autoriza
+        return False
+
+
+def candidate_context_to_keep(stored: Any, incoming: Any) -> Optional[dict]:
+    """Contexto que PERMANECE no despacho: o ORIGINAL, quando é a mesma.
+
+    Readmitir não troca o plano pela recomendação/leitura mais recente: a
+    decisão congelada continua sendo a do primeiro despacho. Candidata
+    diferente devolve `None` (o caller recusa, não substitui).
+    """
+    if stored is None:
+        return incoming
+    if incoming is None or not candidate_identity_matches(stored, incoming):
+        return None
+    return copy.deepcopy(stored) if isinstance(stored, dict) else stored
 
 
 def freeze_dispatch_proposal(**campos) -> Dict[str, Any]:
@@ -1047,6 +1115,24 @@ def freeze_dispatch_proposal(**campos) -> Dict[str, Any]:
     ORIGINAL, limites vigentes e o token de readmissão.
     """
     proposta: Dict[str, Any] = {campo: campos.get(campo) for campo in PROPOSAL_FIELDS}
+    if campos.get('operational_selection') is not None:
+        try:
+            from services.live_candidate_adapter_service import freeze_context
+            contexto = freeze_context(campos['operational_selection'])
+        except ValueError:
+            return {'ok': False, 'reason_code': 'CANDIDATE_CONTEXT_INVALID'}
+        guardado = campos.get('stored_operational_selection')
+        if guardado is not None:
+            # Readmissão: a decisão congelada ORIGINAL permanece; a leitura nova
+            # só precisa provar que é a MESMA candidata.
+            try:
+                guardado = freeze_context(guardado)
+            except ValueError:
+                return {'ok': False, 'reason_code': 'CANDIDATE_CONTEXT_INVALID'}
+            contexto = candidate_context_to_keep(guardado, contexto)
+            if contexto is None:
+                return {'ok': False, 'reason_code': 'CANDIDATE_IDENTITY_MISMATCH'}
+        proposta['operational_selection'] = contexto
     obrigatorios = ("account_ref", "exchange", "intent_key", "symbol", "side",
                     "order_type", "dispatch_id", "qty", "created_at_ms")
     for campo in obrigatorios:
@@ -1321,6 +1407,27 @@ async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
             if conta_bloqueada:
                 await session.rollback()
                 return {"ok": False, "reason_code": "MANUAL_ACCOUNT_VALIDATION_BLOCKED"}
+            candidate_context = (row.decision_payload or {}).get('operational_selection')
+            if candidate_context is not None:
+                from services import operational_governance_service as governance
+                from services.live_candidate_adapter_service import freeze_context, canary_risk_verdict
+                candidate_context = freeze_context(candidate_context)
+                if not isinstance(proposta, Mapping) or proposta.get('operational_selection') != candidate_context:
+                    await session.rollback()
+                    return {'ok': False, 'reason_code': 'CANDIDATE_PROPOSAL_MISMATCH'}
+                checked = await governance.assert_authority_in_session(
+                    session, candidate_context['authority'], int(agora.timestamp() * 1000))
+                if checked.get('ok') is not True:
+                    await session.rollback()
+                    return checked
+                risk = canary_risk_verdict(candidate_context,
+                    entry=proposta.get('price') or proposta.get('reference_price'),
+                    stop=proposta.get('stop'), qty=proposta.get('qty'),
+                    equity=(row.decision_payload or {}).get('candidate_equity_usd'),
+                    leverage=proposta.get('leverage'))
+                if risk.get('ok') is not True:
+                    await session.rollback()
+                    return risk
             # Identidade IMUTÁVEL validada vinculada ao token — sem recapturar
             # o fence (recapturar aqui esconderia a falha nova).
             autoridade = bind_local_authority_identity(
@@ -1347,6 +1454,7 @@ async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
                         "lease_expires_at_ms": deadline_ms,
                         "authorized_at_ms": int(agora.timestamp() * 1000),
                         "local_authority": autoridade,
+                        "operational_selection": candidate_context,
                         "identity": identity}
     except Exception as exc:  # noqa: BLE001 — dúvida NÃO autoriza
         log.warning(f"[p03-intent] autorização final indisponível: {type(exc).__name__}: {exc}")
@@ -1364,6 +1472,11 @@ async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
                      f"{final.get('reason_code')} ({final.get('detail')})")
         return {"ok": False, "reason_code": str(final.get("reason_code")),
                 "detail": final.get("detail")}
+    if aprovado.get('operational_selection') is not None:
+        from services.live_candidate_adapter_service import sync_context_valid
+        final = sync_context_valid(aprovado['operational_selection'])
+        if final.get('ok') is not True:
+            return final
     return aprovado
 
 

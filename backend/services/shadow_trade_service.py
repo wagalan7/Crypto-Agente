@@ -340,6 +340,10 @@ def _entry_proposal_fields(intent: dict, checks: dict, *, side, final_entry,
         "leverage": intent.get("leverage"),
         "evidence": evidencia,
         "limits": evidencia.get("limits"),
+        # Contexto governado DESTA intenção (quando houver): a readmissão
+        # confere identidade e mantém a decisão ORIGINAL congelada.
+        **({"operational_selection": intent["operational_selection"]}
+           if intent.get("operational_selection") is not None else {}),
     }
 
 
@@ -1608,6 +1612,38 @@ async def _manual_entry_block(symbol) -> Optional[dict]:
     return {"reason_code": verdict.get("reason_code"), "detail": verdict.get("detail")}
 
 
+def _candidate_transport_supported() -> bool:
+    """Modo candidato só no transporte oficial que carrega o guard (Binance)."""
+    try:
+        from services import exchange_service
+        return str(getattr(exchange_service, "ACTIVE_EXCHANGE", "")).lower() == "binance"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _intent_candidate_guard(intent):
+    """Guard de autoridade candidata para CADA POST/alavancagem do transporte.
+
+    Devolve `None` no legado — e aí o transporte segue exatamente como antes,
+    sem callback novo. Em modo candidato, o callback reconfere a autoridade
+    (assíncrono) e entrega o exame síncrono final ao próprio transporte.
+    """
+    context = (intent or {}).get("operational_selection") if isinstance(intent, dict) else None
+    if context is None:
+        return None
+
+    async def _guard():
+        from db import get_session
+        from services import live_candidate_adapter_service as _adapter
+        verdict = await _adapter.authorize_context(get_session, context)
+        if verdict.get("ok") is not True:
+            log.warning("[candidate] autoridade negou o POST: %s",
+                        verdict.get("reason_code"))
+        return verdict
+
+    return _guard
+
+
 async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: float,
                                 tp1, tp2, qty: float, equity_usd: float) -> dict:
     """Reserva a intenção ANTES de qualquer mutação de ordem."""
@@ -1622,6 +1658,22 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
     identity = _entry_intent_identity(rec, side)
     if identity is None:
         return blocked
+    # ── Seleção CANDIDATE: o contexto governado entra na DECISÃO antes de
+    #    qualquer mutação, amarrado à geometria desta recomendação. Legado não
+    #    passa por aqui (nenhum campo novo no payload).
+    candidate_context = None
+    if rec.get("operational_selection") is not None:
+        from services import live_candidate_adapter_service as _adapter
+        try:
+            candidate_context = _adapter.context_for_rec(rec)
+        except Exception as exc:  # noqa: BLE001 — dúvida NÃO autoriza entrada
+            log.warning("[candidate] recomendação incoerente com o contexto: %s",
+                        type(exc).__name__)
+            return {**blocked, "decision": intents.BLOCKED_CAPACITY,
+                    "reason": "CANDIDATE_RECOMMENDATION_MISMATCH"}
+        if not _candidate_transport_supported():
+            return {**blocked, "decision": intents.BLOCKED_CAPACITY,
+                    "reason": "CANDIDATE_EXCHANGE_NOT_SUPPORTED"}
     try:
         payload = {"entry": float(entry), "stop_loss": float(stop),
                    "tp1": float(tp1) if tp1 is not None else None,
@@ -1660,8 +1712,12 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
                                         # recuperá-los para adotar o SL existente.
                                         decision={"entry": float(entry),
                                                   "stop_loss": float(stop),
-                                                  "qty": float(qty)})
-    return {"granted": reservation.granted, "decision": reservation.decision,
+                                                  "qty": float(qty),
+                                                  **({"operational_selection": candidate_context,
+                                                      "candidate_equity_usd": float(equity_usd)}
+                                                     if candidate_context is not None else {})})
+    return {"operational_selection": candidate_context,
+            "granted": reservation.granted, "decision": reservation.decision,
             "reason": reservation.reason, "intent_key": reservation.intent_key,
             "client_order_id": reservation.client_order_id, "state": reservation.state,
             "account_ref": identity.account_ref, "capacity": capacity,
@@ -6929,6 +6985,9 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             dispatch_id_fn=lambda: _market_fallback_coid(client_order_id)),
                         # Autorização FINAL interna, também na filha `-mfb`.
                         final_authorization=_intent_final_authorization(_intent),
+                        # Guard da autoridade candidata: alavancagem, retry e
+                        # fallback MARKET passam por ele. Legado recebe None.
+                        candidate_guard=_intent_candidate_guard(_intent),
                     )
                     if isinstance(order_res, dict) and order_res.get("ok"):
                         log.info(
@@ -6974,6 +7033,8 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             entry_preflight=_intent_guarded_preflight(
                                 _intent, _market_entry_preflight,
                                 dispatch_id_fn=lambda: client_order_id),
+                            **({"candidate_guard": _intent_candidate_guard(_intent)}
+                               if _intent.get("operational_selection") is not None else {}),
                         )
                 _exec_mark(_exec_trace, "attempt_returned_at")
                 _observe_transport(rec, order_res)

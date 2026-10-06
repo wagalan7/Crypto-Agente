@@ -767,10 +767,42 @@ async def run():
     check("transicao_para_elegivel_bloqueada",
           not evid.can_transition_for(config_congelada, evid.STATUS_SHADOW,
                                       evid.STATUS_ELIGIBLE))
-    sombra = await evid.start_preselection_shadow(exp_id)
+    # ── Lote 03: o start do SHADOW pré-seleção passou a EXIGIR aprovação
+    #    SHADOW persistida (id + geração exatos). Sem ela, o início é recusado.
+    from unittest.mock import patch as _patch_gov
+    from services import operational_governance_service as _gov
+    sem_aprovacao_gov = await evid.start_preselection_shadow(exp_id)
+    check("shadow_pre_selecao_exige_aprovacao_governada",
+          sem_aprovacao_gov["ok"] is False and sem_aprovacao_gov.get("blocked") is True
+          and sem_aprovacao_gov["status"] == evid.STATUS_OFFLINE_VALIDATED,
+          str(sem_aprovacao_gov)[:200])
+
+    #: Opt-in de ENGENHARIA DECLARADO desta suíte: aqui se prova o ciclo do
+    #: CATÁLOGO (tipo, idempotência, exclusividade, restart), não a autoridade
+    #: humana — ela é provada com o validador REAL, banco real e aprovação
+    #: persistida em `tests/pg_integration_lote03_governed.py`. Esta fixture não
+    #: aprova nada: só devolve autoridade para o id sintético declarado.
+    APROVACAO_SINTETICA = "TEST_ONLY:r11-pipeline-approval"
+
+    async def autoridade_sintetica(session, authority=None, now_ms=None, **kw):
+        if kw.get("approval_id") != APROVACAO_SINTETICA:
+            return {"ok": False, "reason_code": "HUMAN_APPROVAL_MISSING_OR_REVOKED"}
+        return {"ok": True, "purpose": "SHADOW", "experiment_id": kw.get("exp_id"),
+                "generation": int(kw.get("expected_generation") or 0)}
+
+    with _patch_gov.object(_gov, "assert_authority_in_session", autoridade_sintetica):
+        recusa_id_errado = await evid.start_preselection_shadow(
+            exp_id, approval_id="TEST_ONLY:outra", expected_generation=0)
+        sombra = await evid.start_preselection_shadow(
+            exp_id, approval_id=APROVACAO_SINTETICA, expected_generation=0)
+    check("shadow_pre_selecao_recusa_aprovacao_divergente",
+          recusa_id_errado["ok"] is False
+          and recusa_id_errado["reason_code"] == "HUMAN_APPROVAL_MISSING_OR_REVOKED",
+          str(recusa_id_errado)[:200])
     check("shadow_do_tipo_pre_selecao_avanca",
           sombra["ok"] and sombra["status"] == evid.STATUS_SHADOW
-          and sombra["simulation_only"] is True, str(sombra)[:200])
+          and sombra["simulation_only"] is True
+          and sombra["approval_id"] == APROVACAO_SINTETICA, str(sombra)[:200])
     repetida_sombra = await evid.start_preselection_shadow(exp_id)
     check("shadow_e_idempotente", repetida_sombra.get("idempotent") is True,
           str(repetida_sombra)[:160])
@@ -960,8 +992,12 @@ async def run():
         if escopo in r12.IMPLEMENTED_COMPARISON_SCOPES:
             novo = r12.preselection_contract(**campos)
         else:
-            corpo = {"contract_version": r12.PRE_SELECTION_CONTRACT_VERSION, **campos}
-            novo = {**corpo, "contract_hash": r12.contract_hash_of(corpo)}
+            # `contract_hash_of` exige o CORPO INTEIRO (campos da versão + a
+            # própria chave de hash): passar o corpo sem ela devolve None e o
+            # contraexemplo nasceria sem hash — então a chave entra antes.
+            novo = {"contract_version": r12.PRE_SELECTION_CONTRACT_VERSION,
+                    **campos, "contract_hash": None}
+            novo["contract_hash"] = r12.contract_hash_of(novo)
         return {**estudo, "contract": novo, "contract_hash": novo["contract_hash"]}
 
     for nome, mudanca in (("universo", {"universe_version": "SYN-OUTRO-UNIVERSO"}),
@@ -1122,12 +1158,17 @@ async def run():
             {"i": legado_pre_id})
         await session.commit()
 
-    # Promoção declarada como NÃO IMPLEMENTADA (código por terminar).
+    # Lote 03: a promoção do tipo passou a ser GOVERNADA (delegada à governança
+    # operacional). Sem identidade de aprovação ela é RECUSADA — e continua sem
+    # ligar seletor, sem mudar ENV e sem ordem.
     promocao = await evid.promote_preselection(exp_id)
-    check("promocao_do_tipo_declarada_nao_implementada",
+    check("promocao_do_tipo_exige_aprovacao_governada",
           promocao["ok"] is False
-          and promocao["reason_code"] == evid.PRE_SELECTION_PROMOTION_BLOCK
-          and promocao["live_approval"] == "UNAVAILABLE", str(promocao)[:200])
+          and promocao["reason_code"] == "PROMOTION_IDENTITY_INVALID"
+          and promocao["selector_env_unchanged"] is True
+          and promocao["orders_sent"] == 0
+          and promocao["live_approval"] == "UNAVAILABLE"
+          and promocao["promotable"] is False, str(promocao)[:200])
 
     # Evidência insuficiente NÃO valida o candidato.
     estudo_fraco, _gf, _rf = rodar_estudo_real(oportunidades=8,
