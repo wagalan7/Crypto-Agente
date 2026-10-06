@@ -2876,3 +2876,30 @@ Base `581ad3d4`, worktree autorizado. Relatório:
   primeira promoção e manifesto de pesquisa aprovado) e WAITING_CANARY_APPROVAL
   continuam honestos. `OPERATIONAL_ACCEPTED` não foi alcançado.
 - Índice dos quatro lotes existe só no checkout principal: inclusão PENDENTE.
+
+## 06/10/2026 — Lote 03: resíduos corrigidos sobre `14764cea`
+
+- Start PRE_SELECTION: autoridade SHADOW atual e identidade original precedem
+  idempotência; lock P05 → singleton → experimento. Aprovação ausente,
+  revogada, vencida, de outro experimento ou geração divergente recusa; nova
+  aprovação não reassocia a coorte; repetição válida não reinicia nem escreve.
+- REJECTED por score conhecido conserva o `min_score` validado no núcleo e no
+  grupo observacional, sem probabilidade/fallback fabricados. Corte ausente ou
+  divergente e UNKNOWN continuam incomparáveis na fidelidade.
+- Terminal da coorte deriva do vocabulário oficial do replay, incluindo
+  CLOSED_RUNNER_STOP. Resolução terminal não é reaberta na repetição.
+- Proteção simulada concilia observações e resumos: identidade, lado/preços,
+  tempo, quantidade/exposição, obrigação, stop finito, geometria por estágio e
+  falhas. Trilha contraditória perde cobertura e nunca certifica zero. Sem
+  mudança no produtor, economia ou aceite humano de proteção.
+- Provas finais: 222 testes direcionados **2×**; suíte completa **2.867
+  executados / 2.865 aprovados / 2 skips R05C**; PG16 descartável **59 checks 2×**
+  com driver real/socket Unix, zero TCP e DNS bloqueado/contado. Novo runner
+  `tests/run_pg_lote03.sh`; `py_compile`, bash syntax e diff-check aprovados.
+- Revisão independente: 4.000 trilhas oficiais sintéticas sem rejeição
+  indevida/mutação pelo consumidor; oito contradições recusadas. Não é prova
+  econômica nem SL real. Os 24 harnesses anteriores não foram todos repetidos.
+- Entrega: `docs/LOTE03_CORRECAO_RESIDUOS_14764cea.md`; checkpoint e doc do lote
+  atualizados. Candidata inativa, LEGACY/defaults/limites/champion preservados;
+  sem DDL, aprovação real, conta externa, ordem, mensagem, merge/push/deploy.
+  WAITING_DECISION / WAITING_DATA / WAITING_CANARY_APPROVAL mantidos.

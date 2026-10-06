@@ -271,6 +271,29 @@ async def run():
           and iniciado["approval_id"] == shadow_ap["approval_id"]
           and iniciado["generation"] == geracao, str(iniciado))
 
+    # O fast-path SHADOW também consulta a autoridade real. Idempotência não
+    # autoriza trocar a aprovação, dispensá-la ou usar uma geração vencida.
+    async with db.get_session() as session:
+        antes_repeat = (await session.execute(select(E.shadow_metrics).where(
+            E.id == exp_id))).scalar_one()
+    repeticao_shadow = await se.start_preselection_shadow(
+        exp_id, approval_id=shadow_ap["approval_id"], expected_generation=geracao)
+    check("repeticao_shadow_valida_e_idempotente",
+          repeticao_shadow.get("ok") is True
+          and repeticao_shadow.get("idempotent") is True, str(repeticao_shadow))
+    for nome, aid, gen in (("sem_aprovacao", None, geracao),
+                            ("aprovacao_inexistente", "f" * 64, geracao),
+                            ("geracao_vencida", shadow_ap["approval_id"], geracao + 1)):
+        negativa = await se.start_preselection_shadow(
+            exp_id, approval_id=aid, expected_generation=gen)
+        check("repeticao_shadow_recusa_" + nome, negativa.get("ok") is False
+              and negativa.get("blocked") is True, str(negativa))
+    async with db.get_session() as session:
+        depois_repeat = (await session.execute(select(E.shadow_metrics).where(
+            E.id == exp_id))).scalar_one()
+    check("repeticoes_preservam_inicio_e_identidade_da_coorte",
+          antes_repeat == depois_repeat)
+
     # ── Evidência prospectiva: coorte vazia/sintética NÃO passa o gate ─────
     # Manifesto TEST_ONLY NUNCA é autoridade prospectiva — e o estudo offline
     # não é reaproveitado como se fossem trades novos.
@@ -416,6 +439,40 @@ async def run():
           and resumo_eng["promotable"] is False
           and ann_lida["frozen"]["source_mode"] == prospective.TEST,
           str(resumo_eng["gate"]["reason_codes"])[:200])
+
+    # Prova adversarial PERSISTIDA: o hash do congelado segue válido, mas o
+    # conteúdo da trilha é contraditório. O consumidor deve perder cobertura,
+    # não atestar zero pelo contador declarado.
+    corrompida = copy.deepcopy(lida)
+    ann_corrompida = corrompida["r09_pre_selection"][prospective.KEY]
+    trilha = ann_corrompida["resolution"]["protection"]
+    primeira = trilha["observations"][0]
+    primeira.update(active_stop=None, stop_finite=False,
+                    geometry="UNKNOWN", geometry_valid=False)
+    from services import offline_replay_service as replay
+    trilha["failures"].append({"code": replay.PROTECTION_STOP_NOT_FINITE, "stage": primeira["stage"],
+                               "timestamp_ms": primeira["timestamp_ms"], "resolved": False})
+    trilha["pending_failures"] = 0
+    from sqlalchemy import update
+    async with db.get_session() as session:
+        await session.execute(update(O).where(O.opportunity_key == chave_eng)
+                              .values(frozen_config=corrompida))
+        await session.commit()
+    await db._engine.dispose()
+    async with db.get_session() as session:
+        prova_invalida = (await session.execute(select(O.frozen_config).where(
+            O.opportunity_key == chave_eng))).scalar_one()
+    ann_invalida = prova_invalida["r09_pre_selection"][prospective.KEY]
+    medida_invalida = prospective.protection_measure([ann_invalida])
+    check("trilha_contraditoria_persistida_nao_certifica_zero",
+          prospective.verify_annotation(ann_invalida)
+          and medida_invalida["protection_observed"] == 0
+          and medida_invalida["unresolved_protection_failures"] is None,
+          str(medida_invalida))
+    async with db.get_session() as session:
+        await session.execute(update(O).where(O.opportunity_key == chave_eng)
+                              .values(frozen_config=lida))
+        await session.commit()
 
     # ── 2d. Funding indisponível: economia fica DESCONHECIDA, não zero ────
     sem_funding = copy.deepcopy(ann_lida)

@@ -116,7 +116,8 @@ def candidate_decision(authority, *, features, symbol, side, timeframe,
         if payload.get("state") != score_v3.STATE_OK or value is None or minimum is None:
             raise ValueError("CANDIDATE_SCORE_UNAVAILABLE")
         if value < minimum:
-            return {"ok": False, "reason_code": "CANDIDATE_BELOW_MIN_SCORE", "score": value}
+            return {"ok": False, "reason_code": "CANDIDATE_BELOW_MIN_SCORE",
+                    "score": value, "min_score": minimum}
         artifact = bundle["calibration_artifact"]
         probability = calibration.predict(artifact, score=value,
             model_fingerprint=payload["model_fingerprint"],
@@ -299,7 +300,7 @@ def shadow_group_decision(authority, candidates, *, now_ms=None):
                 vencedor = {**linha, "context": contexto}
         elif decision.get("reason_code") == "CANDIDATE_BELOW_MIN_SCORE":
             # Recusa por score CONHECIDO é discordância legítima, não dúvida.
-            linha.update(state="REJECTED")
+            linha.update(state="REJECTED", min_score=decision.get("min_score"))
         else:
             linha.update(state="UNKNOWN")
         avaliados.append(linha)

@@ -208,6 +208,97 @@ class ConsumidorDaCoorte(unittest.TestCase):
         self.assertEqual(medida['unresolved_protection_failures'], 0)
         self.assertIsNone(medida['protection_gap_reason'])
 
+    def test_stop_invalido_na_trilha_nao_passa_com_contador_zero(self):
+        ann = copy.deepcopy(self.resolvida())
+        protecao = ann['resolution']['protection']
+        protecao['observations'][0].update(
+            active_stop=None, stop_finite=False, geometry='UNKNOWN',
+            geometry_valid=False)
+        protecao['failures'] = [{'code': replay.PROTECTION_STOP_NOT_FINITE,
+                                'stage': 'ENTRY_FILL',
+                                'timestamp_ms': protecao['obligation_opened_ts_ms'],
+                                'resolved': False}]
+        protecao['pending_failures'] = 0
+        self.assertTrue(prospective.verify_annotation(ann))
+        self.assertIsNotNone(prospective._protection_reconciled(
+            protecao, ann['frozen'], ann['resolution']))
+        self.assertIsNone(self.medir(ann)['unresolved_protection_failures'])
+
+    def test_resumo_nao_oculta_falha_pendente_nem_geometria_invalida(self):
+        for adulterar in ('failure_counter', 'geometry', 'quantity', 'finite',
+                         'remaining', 'resolution_time', 'direction'):
+            with self.subTest(adulterar=adulterar):
+                ann = copy.deepcopy(self.resolvida())
+                protecao = ann['resolution']['protection']
+                primeira = protecao['observations'][0]
+                if adulterar == 'failure_counter':
+                    protecao['failures'] = [{
+                        'code': replay.PROTECTION_GEOMETRY_INVALID,
+                        'stage': 'ENTRY_FILL', 'timestamp_ms': primeira['timestamp_ms'],
+                        'resolved': False}]
+                elif adulterar == 'geometry':
+                    primeira.update(active_stop=ann['frozen']['setup']['entry'] + 1,
+                                    geometry='LOSS_SIDE', geometry_valid=True)
+                elif adulterar == 'quantity':
+                    primeira['remaining_qty'] = True
+                elif adulterar == 'finite':
+                    primeira['stop_finite'] = 'true'
+                elif adulterar == 'remaining':
+                    protecao['remaining_at_end'] = 0.5
+                elif adulterar == 'resolution_time':
+                    protecao['resolution_identity']['result_available_ts_ms'] += 1
+                elif adulterar == 'direction':
+                    protecao['direction'] = 'short'
+                self.assertIsNone(self.medir(ann)['unresolved_protection_failures'])
+
+    def test_runner_stop_entra_na_amostra_e_nao_e_reaberto(self):
+        from services import research_dataset_service as ds
+        ann = prospective.build_preselection_annotation(self.row, self.context)
+        setup = ann['frozen']['setup']
+        bar_ms = ann['frozen']['replay_config']['bar_ms']
+        first = ((ann['frozen']['decision_ts_ms'] + bar_ms - 1) // bar_ms) * bar_ms
+        entry, tp1 = setup['entry'], setup['tp1']
+        risk = abs(entry - setup['stop_loss'])
+        candles = [
+            {'timestamp': first, 'open': entry, 'high': entry + risk * .1,
+             'low': entry - risk * .1, 'close': entry, 'volume': 10.},
+            {'timestamp': first + bar_ms, 'open': entry, 'high': tp1 + risk * .1,
+             'low': entry - risk * .1, 'close': tp1, 'volume': 10.}]
+        row = copy.deepcopy(self.row)
+        row['frozen_config']['r09_pre_selection'][prospective.KEY] = ann
+        pending = prospective.resolve_annotation(SimpleNamespace(**row), {
+            'candles': candles, 'as_of': ds.ms_datetime(first + 2 * bar_ms)})
+        pending_ann = pending['r09_pre_selection'][prospective.KEY]
+        stop = pending_ann['resolution']['protection']['observations'][-1]['active_stop']
+        candles.append({'timestamp': first + 2 * bar_ms, 'open': stop + risk * .1,
+                        'high': stop + risk * .2, 'low': stop - risk * .1,
+                        'close': stop, 'volume': 10.})
+        row['frozen_config'] = pending
+        as_of = ds.ms_datetime(first + 3 * bar_ms)
+        resolved = prospective.resolve_annotation(SimpleNamespace(**row), {
+            'candles': candles, 'as_of': as_of})
+        final = resolved['r09_pre_selection'][prospective.KEY]
+        self.assertEqual(final['resolution']['replay_status'], 'CLOSED_RUNNER_STOP')
+        self.assertEqual(final['resolution']['status'], 'CLOSED_RUNNER_STOP')
+        self.assertIsNotNone(final['resolution']['net_r'])
+        self.assertEqual(self.medir(final)['unresolved_protection_failures'], 0)
+        # A origem real é simulada SOMENTE para exercitar o filtro da coorte:
+        # engenharia local, não aprovação nem evidência de produção.
+        final['frozen']['source_mode'] = prospective.REAL
+        final['annotation_hash'] = prospective.digest(final['frozen'])
+        summary = prospective.summarize_prospective([final],
+            started_at_ms=self.context['started_at_ms'], now_ms=first + 3 * bar_ms,
+            enabled_playbooks=['TREND_PULLBACK'])
+        self.assertEqual(summary['data_quality']['valid'], 1)
+        self.assertNotIn('OUTCOME_NOT_RESOLVED', summary['data_quality']['excluded_by_reason'])
+        row['frozen_config'] = resolved
+        self.assertIsNone(prospective.resolve_annotation(SimpleNamespace(**row), {
+            'candles': candles, 'as_of': as_of}))
+
+    def test_vocabulario_terminal_e_o_do_motor_oficial(self):
+        self.assertEqual(set(prospective.TERMINAL),
+                         set(replay.CLOSED_STATUSES) | {'NOT_FILLED'})
+
     def test_sem_fonte_de_protecao_nunca_vira_zero(self):
         ann = copy.deepcopy(self.resolvida())
         ann['resolution'].pop('protection')
@@ -252,11 +343,27 @@ class ConsumidorDaCoorte(unittest.TestCase):
                          {'PROTECTION_RESOLUTION_MISMATCH': 1})
 
     def test_obrigacao_aberta_conta_como_pendente(self):
-        ann = copy.deepcopy(self.resolvida())
-        ann['resolution']['protection']['obligation_open_at_end'] = True
+        from services import research_dataset_service as ds
+        ann = prospective.build_preselection_annotation(self.row, self.context)
+        row = copy.deepcopy(self.row)
+        row['frozen_config']['r09_pre_selection'][prospective.KEY] = ann
+        candle = self.prices['windows'][row['opportunity_key']][0]
+        raw = {'timestamp': candle['timestamp_ms'], **{k: candle[k] for k in
+               ('open', 'high', 'low', 'close', 'volume')}}
+        changed = prospective.resolve_annotation(SimpleNamespace(**row), {
+            'candles': [raw], 'as_of': ds.ms_datetime(candle['timestamp_ms'] + BAR)})
+        ann = changed['r09_pre_selection'][prospective.KEY]
+        # Obrigação REALMENTE aberta pelo motor; alterar só um resumo de uma
+        # posição já fechada não é mais uma prova válida de proteção pendente.
+        self.assertIs(ann['resolution']['protection']['obligation_open_at_end'], True)
         medida = self.medir(ann)
         self.assertEqual(medida['protection_applicable'], 1)
         self.assertEqual(medida['unresolved_protection_failures'], 1)
+
+    def test_resumo_de_obrigacao_incoerente_nao_reconcilia(self):
+        ann = copy.deepcopy(self.resolvida())
+        ann['resolution']['protection']['obligation_open_at_end'] = True
+        self.assertIsNone(self.medir(ann)['unresolved_protection_failures'])
 
     def test_cobertura_abaixo_do_minimo_bloqueia_o_zero(self):
         boas = []

@@ -13,6 +13,8 @@ import math
 from datetime import datetime, timezone
 from typing import Mapping
 
+from services.offline_replay_service import CLOSED_STATUSES as _CLOSED_STATUSES
+
 VERSION = "R13_PRESELECTION_PROSPECTIVE_V1"
 KEY = "r13_shadow"
 REAL = "REAL_PROSPECTIVE"
@@ -20,7 +22,7 @@ TEST = "TEST_ONLY"
 PENDING = ("PENDING", "GAP_PENDING")
 MAX_ROWS = 256
 MAX_EVIDENCE_ROWS = 5000
-TERMINAL = ("CLOSED_STOP", "CLOSED_TP2", "CLOSED_TIME_STOP", "CLOSED_MAX_HOLD", "NOT_FILLED")
+TERMINAL = _CLOSED_STATUSES + ("NOT_FILLED",)
 
 
 def digest(value):
@@ -439,7 +441,104 @@ def _protection_reconciled(protection, frozen, resolution):
     if not isinstance(observacoes, list) or not observacoes \
             or integer(protection.get("obligation_opened_ts_ms")) is None:
         return "PROTECTION_TRACE_MISSING"
+    if not _protection_trace_valid(protection, frozen, resolution):
+        return "PROTECTION_TRACE_INVALID"
     return None
+
+
+def _protection_trace_valid(protection, frozen, resolution):
+    """Concilia o conteúdo observado e os resumos, não só os rótulos/hashes.
+
+    Não recalcula economia, não consulta preços e não certifica SL real.
+    Registro contraditório/incompleto perde a cobertura; jamais atesta zero.
+    """
+    from services import offline_replay_service as replay
+    setup = frozen.get("setup") if isinstance(frozen.get("setup"), Mapping) else {}
+    direction = setup.get("side")
+    entry, initial_stop = number(setup.get("entry")), number(setup.get("stop_loss"))
+    bar_ms = integer((frozen.get("replay_config") or {}).get("bar_ms"))
+    if direction not in ("long", "short") or entry is None or entry <= 0 \
+            or initial_stop is None or initial_stop <= 0 or not bar_ms \
+            or protection.get("direction") != direction \
+            or number(protection.get("entry_reference")) != entry \
+            or number(protection.get("initial_stop")) != initial_stop \
+            or protection.get("observations_truncated") is not False:
+        return False
+    identity = protection["resolution_identity"]
+    exits = resolution.get("exits")
+    if not isinstance(exits, list) or protection.get("status") != identity.get("status") \
+            or integer(identity.get("exits")) != len(exits) \
+            or integer(identity.get("bars_held")) != integer(resolution.get("bars_held")):
+        return False
+    for key in ("exit_ts_ms", "result_available_ts_ms"):
+        if identity.get(key) != resolution.get(key):
+            return False
+        if identity.get(key) is not None and integer(identity[key]) is None:
+            return False
+    observations = protection["observations"]
+    opened = protection["obligation_opened_ts_ms"]
+    previous_ts, previous_qty = opened, 1.0
+    expected_failures = set()
+    sign = 1 if direction == "long" else -1
+    for index, observation in enumerate(observations):
+        if not isinstance(observation, Mapping):
+            return False
+        stage, stamp = observation.get("stage"), integer(observation.get("timestamp_ms"))
+        qty, stop = number(observation.get("remaining_qty")), number(observation.get("active_stop"))
+        if stage not in replay.PROTECTION_STAGES or stamp is None or stamp < previous_ts \
+                or integer(observation.get("available_ts_ms")) != stamp + bar_ms \
+                or qty is None or not 0 <= qty <= previous_qty + 1e-12 \
+                or type(observation.get("tp1_hit")) is not bool:
+            return False
+        exposure = number(observation.get("exposure_reference"))
+        if exposure is None or not math.isclose(exposure, qty * entry, rel_tol=1e-9, abs_tol=1e-9) \
+                or observation.get("obligation") is not (qty > 0):
+            return False
+        finite = stop is not None and stop > 0
+        geometry = ("UNKNOWN" if not finite else "LOSS_SIDE" if sign * (stop - entry) < 0
+                    else "BREAK_EVEN" if stop == entry else "PROFIT_LOCK")
+        valid = finite and (geometry == "LOSS_SIDE" if not observation["tp1_hit"]
+                            else geometry in ("LOSS_SIDE", "BREAK_EVEN", "PROFIT_LOCK"))
+        if observation.get("stop_finite") is not finite \
+                or observation.get("geometry") != geometry \
+                or observation.get("geometry_valid") is not valid:
+            return False
+        if index == 0 and (stage != "ENTRY_FILL" or stamp != opened or qty != 1.0
+                           or stop != initial_stop or observation["tp1_hit"] is not False):
+            return False
+        if qty > 0 and not valid:
+            code = replay.PROTECTION_STOP_NOT_FINITE if not finite else replay.PROTECTION_GEOMETRY_INVALID
+            expected_failures.add((code, stage, stamp))
+        previous_ts, previous_qty = stamp, qty
+    remaining = number(protection.get("remaining_at_end"))
+    if remaining is None or not math.isclose(remaining, previous_qty, rel_tol=0, abs_tol=1e-12) \
+            or protection.get("obligation_open_at_end") is not (remaining > 0):
+        return False
+    if remaining > 0:
+        if protection.get("obligation_closed_ts_ms") is not None:
+            return False
+    elif protection.get("obligation_closed_ts_ms") != resolution.get("exit_ts_ms"):
+        return False
+    failures = protection.get("failures")
+    if not isinstance(failures, list) or integer(protection.get("pending_failures")) is None:
+        return False
+    pending, recorded = 0, set()
+    for failure in failures:
+        if not isinstance(failure, Mapping) or type(failure.get("resolved")) is not bool \
+                or failure.get("code") not in (replay.PROTECTION_STOP_NOT_FINITE,
+                    replay.PROTECTION_GEOMETRY_INVALID, replay.PROTECTION_OBLIGATION_UNRESOLVED) \
+                or failure.get("stage") not in replay.PROTECTION_STAGES \
+                or integer(failure.get("timestamp_ms")) is None:
+            return False
+        if failure["resolved"] is False:
+            pending += 1
+            recorded.add((failure["code"], failure["stage"], failure["timestamp_ms"]))
+    if protection["pending_failures"] != pending or not expected_failures.issubset(recorded):
+        return False
+    if remaining > 0 and not any(code == replay.PROTECTION_OBLIGATION_UNRESOLVED
+                                for code, _, _ in recorded):
+        return False
+    return True
 
 
 def protection_measure(annotations):

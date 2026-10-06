@@ -371,6 +371,126 @@ class CicloOficialDoScanner(unittest.TestCase):
         return linha['frozen_config']['r09_pre_selection']
 
 
+class ProdutorConsumidorComMotorReal(unittest.TestCase):
+    """Decisão V3 real → congelador → anotação → denominador de fidelidade."""
+
+    def setUp(self):
+        for alvo, nome in ((socket, 'getaddrinfo'), (socket.socket, 'connect')):
+            guarda = patch.object(alvo, nome, side_effect=AssertionError('rede proibida'))
+            guarda.start()
+            self.addCleanup(guarda.stop)
+        _, self.context, self.row, _ = engineering_fixture()
+        self.payload = self.row['frozen_config']['r09_pre_selection']
+        self.now = self.payload['decision_ts_ms']
+        self.manifesto = self.context['manifest']['candidate']
+        self.corte = self.manifesto['selection_rule']['min_score']
+        self.assertEqual(self.corte, 60.0)  # corte legítimo do contrato, não > 100
+        self.auth = autoridade(now_ms=self.now, min_score=self.corte,
+            experiment_id=self.context['experiment_id'],
+            generation=self.context['generation'], approval_id=self.context['approval_id'],
+            manifest_hash=self.context['manifest_hash'],
+            score_config_hash=self.manifesto['score_config_hash'])
+        self.auth['bundle']['manifest'] = copy.deepcopy(self.context['manifest'])
+        self.auth['approval']['limits']['symbols'] = [self.payload['setup']['symbol']]
+
+    def item(self, features):
+        setup = self.payload['setup']
+        return {campo: setup[campo] for campo in
+                ('symbol', 'side', 'timeframe', 'entry', 'stop_loss', 'tp1', 'tp2')} \
+            | {'features': features}
+
+    def observar(self, features):
+        grupo = adapter.shadow_group_decision(self.auth, [self.item(features)],
+                                              now_ms=self.now)['group']
+        bloco = adapter.shadow_decision_for_timeframe(grupo, self.payload['setup']['timeframe'])
+        congelado = pre.frozen_decision(identity=self.row['opportunity_key'],
+            outcome=self.payload['outcome'], decision_ts_ms=self.now,
+            setup=self.payload['setup'], funnel=self.payload['funnel'],
+            availability=self.payload['availability'], source=self.payload['source'],
+            config=self.payload['config'], features=features,
+            score_trace=self.row['score_trace'],
+            feature_evidence=self.payload['feature_evidence'],
+            observed_decision_scope='FINAL_SCANNER_SELECTION', shadow_decision=bloco)
+        row = copy.deepcopy(self.row)
+        row['frozen_config']['r09_pre_selection'] = congelado
+        ann = prospective.build_preselection_annotation(row, self.context)
+        self.assertTrue(prospective.verify_annotation(ann))
+        return grupo, bloco, congelado, ann
+
+    def test_recusa_v3_conhecida_preserva_o_corte_sem_inventar_probabilidade(self):
+        with patch.object(c, 'predict', side_effect=AssertionError('recusa não calibra')):
+            decisao = adapter.candidate_decision(self.auth, now_ms=self.now,
+                                                 **self.item(FRACAS))
+        self.assertFalse(decisao['ok'])
+        self.assertEqual(decisao['reason_code'], 'CANDIDATE_BELOW_MIN_SCORE')
+        self.assertAlmostEqual(decisao['score'], 16.8571428571)
+        self.assertEqual(decisao.get('min_score'), self.corte)
+        for campo in ('model_fingerprint', 'probability', 'probability_event', 'context'):
+            self.assertIsNone(decisao.get(campo))
+
+    def test_recusa_concordante_do_produtor_real_entra_no_denominador(self):
+        grupo, bloco, congelado, ann = self.observar(FRACAS)
+        self.assertEqual(bloco['state'], 'REJECTED')
+        self.assertEqual(ann['frozen']['decisions']['candidate']['state'], 'REJECTED')
+        medida = prospective.fidelity_measure([ann])
+        self.assertEqual(medida['fidelity_comparable'], 1, medida)
+        self.assertEqual(medida['fidelity_unknown'], 0)
+        self.assertEqual(medida['fidelity_divergences'], 0)
+        self.assertEqual(medida['fidelity_discrepancy_pct'], 0.0)
+        self.assertEqual(medida['fidelity_coverage_pct'], 100.0)
+        self.assertEqual(medida['fidelity_reasons'], {})
+        self.assertIsNone(prospective._shadow_reconciled(ann['frozen']['shadow_decision'],
+                                                        ann['frozen']))
+        for observado in (grupo['evaluated'][0], bloco, congelado['shadow_decision'],
+                          ann['frozen']['shadow_decision']):
+            self.assertEqual(observado['min_score'], self.corte)
+            self.assertAlmostEqual(observado['score'], 16.8571428571)
+            for campo in ('model_fingerprint', 'probability', 'probability_event'):
+                self.assertIsNone(observado.get(campo))
+
+    def test_selecao_positiva_do_mesmo_motor_continua_comparavel(self):
+        _, bloco, _, ann = self.observar(FEATURES)
+        self.assertEqual(bloco['state'], 'SELECTED')
+        self.assertEqual(bloco['min_score'], self.corte)
+        self.assertEqual(bloco['score'], ann['frozen']['decisions']['candidate']['score'])
+        self.assertIsNotNone(bloco['model_fingerprint'])
+        self.assertIsNotNone(bloco['probability'])
+        self.assertEqual(bloco['probability_event'], c.EVENT_TP1)
+        medida = prospective.fidelity_measure([ann])
+        self.assertEqual(medida['fidelity_comparable'], 1)
+        self.assertEqual(medida['fidelity_divergences'], 0)
+
+    def test_recusa_sem_corte_ou_com_outro_corte_nao_infere_o_corte_atual(self):
+        _, _, congelado, _ = self.observar(FRACAS)
+        for corte_observado in (None, self.corte + 7):
+            with self.subTest(corte_observado=corte_observado):
+                payload = copy.deepcopy(congelado)
+                payload['shadow_decision']['min_score'] = corte_observado
+                row = copy.deepcopy(self.row)
+                row['frozen_config']['r09_pre_selection'] = payload
+                ann = prospective.build_preselection_annotation(row, self.context)
+                self.assertTrue(prospective.verify_annotation(ann))
+                self.assertEqual(ann['frozen']['candidate_min_score'], self.corte)
+                medida = prospective.fidelity_measure([ann])
+                self.assertEqual(medida['fidelity_comparable'], 0)
+                self.assertEqual(medida['fidelity_unknown'], 1)
+                self.assertIsNone(medida['fidelity_discrepancy_pct'])
+                self.assertEqual(medida['fidelity_reasons'],
+                                 {'DENOMINATOR_NOT_RECONCILED': 1})
+
+    def test_features_ausentes_nao_viram_recusa_conhecida(self):
+        _, bloco, _, ann = self.observar({})
+        self.assertEqual(bloco['state'], 'UNKNOWN')
+        self.assertIsNone(bloco['score'])
+        self.assertIsNone(bloco['min_score'])
+        self.assertEqual(ann['frozen']['decisions']['candidate']['state'], 'UNKNOWN')
+        medida = prospective.fidelity_measure([ann])
+        self.assertEqual(medida['fidelity_comparable'], 0)
+        self.assertEqual(medida['fidelity_divergences'], 0)
+        self.assertEqual(medida['fidelity_unknown'], 1)
+        self.assertIsNone(medida['fidelity_discrepancy_pct'])
+
+
 class AnotacaoEFidelidade(unittest.TestCase):
     """A decisão observada sobrevive à anotação e vira fidelidade medida."""
 

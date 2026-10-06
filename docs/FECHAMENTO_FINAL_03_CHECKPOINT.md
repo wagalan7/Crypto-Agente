@@ -1,5 +1,13 @@
 # Lote 03 — checkpoint da integração governada
 
+**Estado mais recente — 06/10/2026:** correção dos resíduos sobre `14764cea`
+aplicada e verificada localmente. 222 testes direcionados 2×; suíte completa
+2.867 executados, 2.865 aprovados e 2 skips históricos; PG16 59 verificações 2×.
+Detalhes: `docs/LOTE03_CORRECAO_RESIDUOS_14764cea.md`. Infraestrutura INATIVA;
+sem merge/push/deploy/aprovação real. Decisões/dados prospectivos e integração
+do índice no checkout principal continuam pendentes. Seções abaixo registram
+a cronologia anterior, não o estado atual de implementação.
+
 Base: `581ad3d4fe843347992d245fb41983e9b2ce3a76`.
 Ambiente: worktree `lote02-pesquisa`, já autorizado pelo usuário para os próximos lotes. Checkout de outro aplicativo e arquivos pessoais não entram nesta entrega.
 

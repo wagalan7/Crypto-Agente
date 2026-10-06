@@ -6589,6 +6589,14 @@ async def start_preselection_shadow(exp_id: int, *, approval_id: Optional[str] =
     now = datetime.now(timezone.utc)
     async with get_session() as session:
         await _acquire_p05_lock(session, _P05_SHADOW_LOCK_KEY)
+        # Mesma ordem dos escritores da governança: P05 → singleton →
+        # experimento. A assertiva abaixo reutiliza os locks desta transação.
+        try:
+            await governance._state(session)
+        except Exception:
+            await session.rollback()
+            return {"ok": False, "blocked": True, "reason_code": "AUTHORITY_READ_ERROR",
+                    "error": "estado da aprovação SHADOW indisponível"}
         exp = (await session.execute(
             select(E).where(E.id == exp_id).with_for_update())).scalar_one_or_none()
         if exp is None:
@@ -6603,28 +6611,26 @@ async def start_preselection_shadow(exp_id: int, *, approval_id: Optional[str] =
             return {"ok": False, "blocked": True, "reason_code": vinculo["reason_code"],
                     "error": "vínculo do estudo ausente ou inválido",
                     "status": exp.status}
-        if exp.status == STATUS_SHADOW:
-            return {"ok": True, "idempotent": True, "status": exp.status,
-                    "experiment_key": exp.experiment_key}
-        if not can_transition_for(exp.candidate_config, exp.status, STATUS_SHADOW):
-            return {"ok": False, "error": f"transição inválida {exp.status} → {STATUS_SHADOW}",
-                    "status": exp.status}
-        # UM challenger prospectivo do MESMO tipo por vez (exclusividade oficial).
-        ativos = (await session.execute(
-            select(E).where(E.status == STATUS_SHADOW))).scalars().all()
-        concorrentes = [row for row in ativos if is_pre_selection_experiment(row)
-                        and row.id != exp.id]
-        if concorrentes:
-            return {"ok": False, "blocked": True,
-                    "reason_code": "CHALLENGER_ALREADY_ACTIVE",
-                    "active_keys": [row.experiment_key for row in concorrentes],
-                    "status": exp.status}
+        if exp.status != STATUS_SHADOW:
+            if not can_transition_for(exp.candidate_config, exp.status, STATUS_SHADOW):
+                return {"ok": False, "error": f"transição inválida {exp.status} → {STATUS_SHADOW}",
+                        "status": exp.status}
+            # UM challenger prospectivo do MESMO tipo por vez (exclusividade oficial).
+            ativos = (await session.execute(
+                select(E).where(E.status == STATUS_SHADOW))).scalars().all()
+            concorrentes = [row for row in ativos if is_pre_selection_experiment(row)
+                            and row.id != exp.id]
+            if concorrentes:
+                return {"ok": False, "blocked": True,
+                        "reason_code": "CHALLENGER_ALREADY_ACTIVE",
+                        "active_keys": [row.experiment_key for row in concorrentes],
+                        "status": exp.status}
         # Aprovação SHADOW persistida, ATIVA e exatamente a declarada. A ordem
         # de locks do catálogo é P05 → singleton → experimento: a governança é
         # consultada DENTRO desta transação, sem abrir sessão nova.
         # Estado lido ANTES de qualquer rollback: depois dele a instância está
         # expirada e ler um atributo exigiria IO fora do contexto assíncrono.
-        estado_atual = exp.status
+        estado_atual, chave_atual = exp.status, exp.experiment_key
         autoridade = await governance.assert_authority_in_session(
             session, exp_id=exp.id, purpose="SHADOW", approval_id=approval_id,
             expected_generation=expected_generation)
@@ -6634,12 +6640,41 @@ async def start_preselection_shadow(exp_id: int, *, approval_id: Optional[str] =
                     "reason_code": autoridade.get("reason_code"),
                     "error": "aprovação SHADOW ausente, revogada ou divergente",
                     "status": estado_atual}
+        escopo_contrato = str((vinculo.get("contract") or {}).get("comparison_scope") or "")
+        if estado_atual == STATUS_SHADOW:
+            # Idempotência só existe para a autoridade EXATA congelada no
+            # primeiro start. Uma aprovação nova não reabre/reassocia a coorte;
+            # registros legados incompletos não recebem backfill.
+            metricas = exp.shadow_metrics if isinstance(exp.shadow_metrics, dict) else {}
+            original_id = metricas.get("shadow_approval_id")
+            original_generation = metricas.get("shadow_approval_generation")
+            razao = None
+            if (not isinstance(original_id, str) or not original_id
+                    or type(original_generation) is not int or original_generation < 0):
+                razao = "SHADOW_START_IDENTITY_MISSING"
+            elif original_id != approval_id or original_generation != autoridade["generation"]:
+                razao = "SHADOW_START_IDENTITY_MISMATCH"
+            elif escopo_contrato == "SELECTION_ONLY":
+                original = metricas.get(prospective.KEY)
+                if (not isinstance(original, Mapping) or not original.get("approval_id")
+                        or type(original.get("generation")) is not int
+                        or original["generation"] < 0):
+                    razao = "SHADOW_START_IDENTITY_MISSING"
+                elif (original["approval_id"] != original_id
+                      or original["generation"] != original_generation):
+                    razao = "SHADOW_START_IDENTITY_MISMATCH"
+            if razao is not None:
+                await session.rollback()
+                return {"ok": False, "blocked": True, "reason_code": razao,
+                        "error": "autoridade original do start SHADOW ausente ou divergente",
+                        "status": estado_atual}
+            return {"ok": True, "idempotent": True, "status": estado_atual,
+                    "experiment_key": chave_atual}
         iniciado_ms = int(now.timestamp() * 1000)
         # A coorte prospectiva descreve comparação de SELEÇÃO. Um challenger de
         # GESTÃO do mesmo tipo continua tendo o ciclo dele (sem coorte): o que
         # não existe fica DECLARADO, e a avaliação prospectiva recusa depois por
         # falta de start — nada é inventado para ele.
-        escopo_contrato = str((vinculo.get("contract") or {}).get("comparison_scope") or "")
         contexto = None
         if escopo_contrato == "SELECTION_ONLY":
             contexto = prospective.frozen_shadow_context(

@@ -90,7 +90,7 @@ autorização final com dispatch id e proposta próprios. Legado recebe `None`.
 
 **4. Catálogo / anotação / resolver** — `strategy_evidence_service`,
 `prospective_shadow_service`, `decision_observation_service._admit`
-start: lock P05 → `with_for_update` → autoridade na MESMA transação → congelamento
+start: lock P05 → singleton → experimento `with_for_update` → autoridade na MESMA transação → congelamento
 (puro) → commit. `_admit`: autoridade e insert na mesma transação. `evaluate`:
 reconfere identidade/contrato no segundo lock antes de gravar (`FROZEN_MISMATCH`).
 `promote`: CAS por geração.
@@ -157,3 +157,20 @@ estabilidade ≥ 0,5, zero falhas/duplicatas/proteções pendentes, fidelidade �
 `docs/FECHAMENTO_FINAL_4_LOTES_INDICE.md` existe **apenas no checkout principal**
 e, por regra desta execução, **não foi editado**. A inclusão do item 03 no índice
 fica explicitamente **PENDENTE**.
+
+## 7. Revisão e correção dos resíduos — 06/10/2026
+
+Sobre `14764cea`, quatro defeitos adicionais foram reproduzidos e corrigidos:
+aprovação/identidade no retorno idempotente do start; corte de score no REJECTED;
+estado terminal CLOSED_RUNNER_STOP; conteúdo da trilha de proteção conciliado
+com os resumos, impedindo falso zero. Nenhuma política de promoção foi relaxada.
+
+Provas desta correção: **222 testes direcionados 2×**, suíte completa **2.867
+executados / 2.865 aprovados / 2 skips R05C**, matriz PG16 **59 verificações 2×**
+no estado final, `py_compile` e diff-check. O novo runner local é
+`backend/tests/run_pg_lote03.sh`. Os 24 harnesses antigos não foram todos
+reexecutados nesta correção; as contagens da seção 4 são da entrega anterior.
+
+Detalhes RED→GREEN, limites e caracterização corrigida:
+`docs/LOTE03_CORRECAO_RESIDUOS_14764cea.md`. Candidata inativa, LEGACY preservado;
+sem publicação, aprovação real ou aceite operacional.
