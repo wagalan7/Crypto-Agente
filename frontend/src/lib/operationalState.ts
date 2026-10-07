@@ -170,14 +170,15 @@ export const UNKNOWN_REASON = 'Motivo não disponível nesta leitura'
 
 const REASON_RULES: { match: RegExp; label: string }[] = [
   { match: /^P03-QUARANTINE/i, label: 'Incidente de execução aberto (reconciliador P03)' },
+  { match: /^\[manual-validation\]/i, label: 'Validação da posição manual pendente' },
   { match: /quarantine/i, label: 'Quarentena de execução ativa' },
   { match: /manual[_-]?required/i, label: 'Incidente exige conferência manual' },
   { match: /unknown[_-]?no[_-]?sl|sl[_-]?not[_-]?confirmed|sem sl/i, label: 'Proteção (stop) não confirmada numa execução' },
   { match: /untracked/i, label: 'Posição sem registro correspondente no app' },
-  { match: /daily/i, label: 'Limite de perda diária atingido' },
-  { match: /weekly|semana/i, label: 'Limite de perda semanal atingido' },
+  { match: /daily|DD\s+di[aá]rio/i, label: 'Limite de perda diária atingido' },
+  { match: /weekly|DD\s+semanal/i, label: 'Limite de perda semanal atingido' },
   { match: /consec/i, label: 'Sequência de perdas atingiu o limite' },
-  { match: /kill[_-]?switch|manual/i, label: 'Pausa manual (kill switch)' },
+  { match: /kill[_ -]?switch|^pausa manual\b/i, label: 'Pausa manual (kill switch)' },
 ]
 
 /** Traduz um motivo do backend. Desconhecido → `UNKNOWN_REASON`. */
@@ -251,8 +252,27 @@ export function p03View(
   const facts = reading?.value ?? null
   const openTotal = countOf(facts?.open_total)
   const manualRequired = countOf(facts?.manual_required)
+  const retryPending = countOf(facts?.retry_pending)
   const quarantineActive = literalBool(facts?.quarantine_active)
   const okFlag = literalBool(facts?.ok)
+  const items = Array.isArray(facts?.items) ? facts.items : null
+  const manualItems = Array.isArray(facts?.manual_items) ? facts.manual_items : null
+  // Os subcontadores descrevem estados abertos; as listas deste contrato
+  // também são de incidentes abertos. Contradição não apaga o sinal positivo.
+  const incoherent =
+    (facts?.manual_required !== undefined && manualRequired === null)
+    || (facts?.retry_pending !== undefined && retryPending === null)
+    || (facts?.items !== undefined && items === null)
+    || (facts?.manual_items !== undefined && manualItems === null)
+    || (openTotal !== null && (
+      (manualRequired !== null && manualRequired > openTotal)
+      || (retryPending !== null && retryPending > openTotal)
+      || (manualRequired !== null && retryPending !== null && manualRequired + retryPending > openTotal)
+      || (items !== null && items.length > openTotal)
+      || (manualItems !== null && manualItems.length > openTotal)
+    ))
+    || (manualRequired !== null && manualItems !== null && manualItems.length > manualRequired)
+    || (items !== null && manualItems !== null && manualItems.length > items.length)
   const technical: string[] = []
   const errTech = sanitizeTechnical(facts?.error ?? reading?.errorReason)
   if (errTech) technical.push(errTech)
@@ -260,6 +280,10 @@ export function p03View(
   // Bloqueio é fato POSITIVO: vale mesmo sem `ok=true` (incidente conhecido não
   // desaparece porque a leitura degradou).
   const blocked = (openTotal != null && openTotal > 0) || quarantineActive === true
+    || (manualRequired !== null && manualRequired > 0)
+    || (retryPending !== null && retryPending > 0)
+    || (items !== null && items.length > 0)
+    || (manualItems !== null && manualItems.length > 0)
   const reasons: string[] = []
   if (quarantineActive === true) reasons.push('Quarentena de execução ativa')
   if (openTotal != null && openTotal > 0) {
@@ -272,11 +296,18 @@ export function p03View(
       ? '1 incidente exige conferência manual'
       : `${manualRequired} incidentes exigem conferência manual`)
   }
+  if (retryPending !== null && retryPending > 0) {
+    reasons.push(retryPending === 1
+      ? '1 incidente aguarda nova reconciliação'
+      : `${retryPending} incidentes aguardam nova reconciliação`)
+  }
+  if (blocked && reasons.length === 0) reasons.push('Incidente informado pelo serviço (contadores sem confirmação)')
 
   let unconfirmedReason: string | null = null
   if (quality.missing) unconfirmedReason = 'leitura de incidentes não disponível'
   else if (okFlag !== true) unconfirmedReason = 'serviço de incidentes respondeu sem confirmação'
   else if (openTotal == null || quarantineActive == null) unconfirmedReason = 'resposta de incidentes incompleta'
+  else if (incoherent) unconfirmedReason = 'resposta de incidentes incoerente'
   else if (quality.stale) unconfirmedReason = 'leitura de incidentes antiga'
 
   return {
@@ -315,7 +346,8 @@ export function deriveOperationalState(input: OperationalInput): OperationalStat
   technical.push(...p03.technical)
 
   // ── 1. Nada conhecido ainda em nenhuma fonte ⇒ carregando.
-  if (riskQ.missing && p03.openTotal == null && input.risk?.state === 'LOADING') {
+  if (!p03.blocked && riskQ.missing && input.risk?.state === 'LOADING'
+    && input.p03?.state === 'LOADING' && input.p03?.value == null) {
     return {
       level: 'LOADING', tone: 'neutral',
       title: 'Lendo estado do bot',
@@ -429,6 +461,28 @@ export function deriveOperationalState(input: OperationalInput): OperationalStat
     lastKnownAtMs: input.risk?.lastOkAtMs ?? null,
     stale: false, blocked: false, p03Owned: false,
   }
+}
+
+/**
+ * Exibe a retomada já existente só quando a causa está confirmada e pertence
+ * ao controle de risco. Não concede autoridade nem libera nenhum bloqueio.
+ */
+export function canOfferResume(input: OperationalInput): boolean {
+  const staleAfterMs = input.staleAfterMs ?? DEFAULT_STALE_AFTER_MS
+  if (!readingQuality(input.risk, input.nowMs, staleAfterMs).confirmed
+    || literalBool(input.risk.value?.trading_paused) !== true) return false
+  const reason = text(input.risk.value?.pause_reason)
+  if (reason !== null && /^(?:P03-QUARANTINE|\[manual-validation\])/i.test(reason)) return false
+  if (deriveOperationalState(input).p03Owned) return false
+  const manual = literalBool(input.risk.value?.pause_manual) === true
+  if ((input.scope ?? 'FULL') === 'RISK_ONLY') return manual
+  const p03 = p03View(input.p03, input.nowMs, staleAfterMs)
+  if (!p03.confirmed || p03.blocked) return false
+  // Causa desconhecida não é uma prova de que o botão pode resolver a pausa.
+  const cause = translateReason(reason)
+  return manual || cause === 'Limite de perda diária atingido'
+    || cause === 'Limite de perda semanal atingido'
+    || cause === 'Sequência de perdas atingiu o limite'
 }
 
 // ─── Apresentação auxiliar ───────────────────────────────────────────────────

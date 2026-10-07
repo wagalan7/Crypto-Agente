@@ -1,12 +1,14 @@
 import { useState, useEffect, useCallback } from 'react'
 import { X, Shield, ShieldAlert, Activity, History, AlertTriangle } from 'lucide-react'
-import { api } from '../services/api'
+import { api, executionIncidentsObservedAt } from '../services/api'
 import type { ExecutionIncidentsStatus } from '../services/api'
 import {
   deriveOperationalState, emptyReading, p03View, readingQuality,
-  DEFAULT_STALE_AFTER_MS, finiteNumber,
+  DEFAULT_STALE_AFTER_MS, finiteNumber, canOfferResume,
   type SourceReading,
 } from '../lib/operationalState'
+import { settleReading } from '../lib/readingLifecycle'
+import { useOverlayDismiss, useReadingClock } from '../hooks/useReadingLifecycle'
 import { OperationalStateCard, P03IncidentCard } from './status/OperationalCards'
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
@@ -80,24 +82,6 @@ interface Props {
  * - Histórico dos últimos 30 dias de eventos do circuit breaker
  */
 
-/**
- * Escape fecha o overlay e o foco volta para onde estava (a11y do Lote 04).
- * Não mexe em polling, cache nem navegação: só teclado e foco.
- */
-function useOverlayDismiss(onClose: () => void) {
-  useEffect(() => {
-    const anterior = document.activeElement as HTMLElement | null
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('keydown', onKey)
-      if (anterior && typeof anterior.focus === 'function') anterior.focus()
-    }
-  }, [onClose])
-}
-
 export default function StatusPanel({ onClose }: Props) {
   useOverlayDismiss(onClose)
   // Leitura COM qualidade por fonte (Lote 04): erro/ausência não viram zero.
@@ -110,14 +94,13 @@ export default function StatusPanel({ onClose }: Props) {
   const [busy, setBusy] = useState(false)
   const [confirmKill, setConfirmKill] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [tick, setTick] = useState(() => Date.now())
+  const tick = useReadingClock()
   const status = riskRead.value
 
   const load = useCallback(async (opts?: { force?: boolean }) => {
-    const settle = <T,>(pr: Promise<T>) => pr.then(v => ({ ok: true as const, v }))
-      .catch((e: unknown) => ({ ok: false as const, e }))
+    const settle = settleReading
     const asJson = async (path: string) => {
-      const r = await fetch(`${BACKEND}${path}`)
+      const r = await fetch(`${BACKEND}${path}`, { signal: AbortSignal.timeout(10_000) })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       return r.json()
     }
@@ -129,7 +112,6 @@ export default function StatusPanel({ onClose }: Props) {
       // Mesmo cache/single-flight da Home: duas telas abertas = UM GET.
       settle(api.executionIncidentsStatus(opts?.force ? { maxAgeMs: 0 } : undefined)),
     ])
-    const now = Date.now()
     const why = (e: unknown) => (e instanceof Error ? e.message : 'leitura falhou')
     setRiskRead(prev => {
       if (!sRes.ok) return { ...prev, state: 'ERROR', errorReason: why(sRes.e) }
@@ -137,11 +119,13 @@ export default function StatusPanel({ onClose }: Props) {
       if (!j || j.enabled === false) {
         return { ...prev, state: 'ERROR', errorReason: 'risco desabilitado no backend' }
       }
-      return { state: 'OK', value: j, lastOkAtMs: now, errorReason: null }
+      return { state: 'OK', value: j, lastOkAtMs: sRes.receivedAtMs, errorReason: null }
     })
     setP03Read(prev => {
       if (!iRes.ok) return { ...prev, state: 'ERROR', errorReason: why(iRes.e) }
-      return { state: 'OK', value: iRes.v as ExecutionIncidentsStatus, lastOkAtMs: now, errorReason: null }
+      const observedAt = executionIncidentsObservedAt(iRes.v)
+      if (observedAt == null) return { ...prev, state: 'ERROR', errorReason: 'incidentes sem instante de leitura confirmado' }
+      return { state: 'OK', value: iRes.v, lastOkAtMs: observedAt, errorReason: null }
     })
     if (eRes.ok) setEvents(((eRes.v as { events?: RiskEvent[] })?.events) ?? [])
     if (hRes.ok) {
@@ -154,7 +138,6 @@ export default function StatusPanel({ onClose }: Props) {
     }
     setError(sRes.ok ? null : why(sRes.e))
     setLoading(false)
-    setTick(now)
   }, [])
 
   useEffect(() => {
@@ -164,6 +147,7 @@ export default function StatusPanel({ onClose }: Props) {
   }, [load])
 
   const toggle = async (next: boolean) => {
+    if (!next && !canOfferResume({ risk: riskRead, p03: p03Read, nowMs: Date.now() })) return
     setBusy(true)
     try {
       const res = await fetch(`${BACKEND}/api/risk/kill-switch?paused=${next}`, {
@@ -183,6 +167,7 @@ export default function StatusPanel({ onClose }: Props) {
   }
 
   const paused = status?.trading_paused === true
+  const canResume = canOfferResume({ risk: riskRead, p03: p03Read, nowMs: tick })
   // MESMA função pura da Home e do selo do header.
   const opState = deriveOperationalState({
     risk: riskRead, p03: p03Read, nowMs: tick, staleAfterMs: DEFAULT_STALE_AFTER_MS,
@@ -224,7 +209,7 @@ export default function StatusPanel({ onClose }: Props) {
               </p>
             </div>
           </div>
-          <button onClick={onClose} className="p-1 rounded hover:bg-slate-800">
+          <button onClick={onClose} aria-label="Fechar status do bot" className="p-1 rounded hover:bg-slate-800">
             <X className="w-5 h-5 text-slate-400" />
           </button>
         </div>
@@ -291,7 +276,11 @@ export default function StatusPanel({ onClose }: Props) {
                       Bloqueia push de novas recs. Trades em andamento continuam.
                     </p>
                   </div>
-                  {paused ? (
+                  {paused && !canResume ? (
+                    <span className="text-[11px] text-amber-200 max-w-xs">
+                      Retomada não disponível nesta leitura. Consulte o diagnóstico acima.
+                    </span>
+                  ) : paused ? (
                     <button
                       disabled={busy}
                       onClick={() => toggle(false)}
@@ -441,7 +430,7 @@ export default function StatusPanel({ onClose }: Props) {
                 </div>
                 {events.length === 0 ? (
                   <p className="text-xs text-slate-500 p-3 rounded bg-slate-900/40 border border-slate-800">
-                    Nenhum evento registrado. Circuit breaker nunca acionou — sinal verde.
+                    Sem eventos para exibir nesta janela. Isso não confirma ausência de bloqueios; consulte o estado acima.
                   </p>
                 ) : (
                   <div className="space-y-1.5 max-h-64 overflow-y-auto">

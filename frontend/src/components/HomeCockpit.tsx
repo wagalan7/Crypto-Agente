@@ -1,15 +1,17 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, RefreshCw } from 'lucide-react'
-import { api } from '../services/api'
+import { api, executionIncidentsObservedAt } from '../services/api'
 import type { ExecutionIncidentsStatus } from '../services/api'
 import type { RealTradeRow, Recommendation } from '../types'
 import {
   deriveOperationalState, emptyReading, p03View, readingQuality,
-  DEFAULT_STALE_AFTER_MS, finiteNumber,
+  DEFAULT_STALE_AFTER_MS, finiteNumber, canOfferResume,
   type SourceReading,
 } from '../lib/operationalState'
+import { settleReading } from '../lib/readingLifecycle'
+import { useOverlayDismiss } from '../hooks/useReadingLifecycle'
 import {
-  OperationalStateCard, P03IncidentCard, PositionsInventoryCard, SourceResultCard,
+  OperationalStateCard, P03IncidentCard, PositionsInventoryCard, PositionsEmptyState, SourceResultCard,
 } from './status/OperationalCards'
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
@@ -135,24 +137,6 @@ function trackFrac(t: RealTradeRow, price: number | undefined): { price: number 
 }
 
 
-/**
- * Escape fecha o overlay e o foco volta para onde estava (a11y do Lote 04).
- * Não mexe em polling, cache nem navegação: só teclado e foco.
- */
-function useOverlayDismiss(onClose: () => void) {
-  useEffect(() => {
-    const anterior = document.activeElement as HTMLElement | null
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('keydown', onKey)
-      if (anterior && typeof anterior.focus === 'function') anterior.focus()
-    }
-  }, [onClose])
-}
-
 export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpenTrades, onOpenStatus }: Props) {
   useOverlayDismiss(onClose)
   // Cada fonte carrega FATO + QUALIDADE + instante da última leitura boa.
@@ -186,10 +170,9 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
     else setRefreshing(true)
     // Cada fonte é best-effort: falha de uma não derruba a Home — mas falha
     // também NÃO é sucesso: a qualidade de cada leitura é registrada abaixo.
-    const settle = <T,>(p: Promise<T>) => p.then(v => ({ ok: true as const, v }))
-      .catch((e: unknown) => ({ ok: false as const, e }))
+    const settle = settleReading
     const fetchJson = async (path: string) => {
-      const r = await fetch(`${BACKEND}${path}`)
+      const r = await fetch(`${BACKEND}${path}`, { signal: AbortSignal.timeout(10_000) })
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
       return r.json()
     }
@@ -211,7 +194,6 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
         settle(p03Promise),
       ])
 
-    const now = Date.now()
     const reason = (e: unknown) => (e instanceof Error ? e.message : 'leitura falhou')
 
     // Risco: `enabled === false` significa recurso desligado, não "sem pausa".
@@ -221,24 +203,26 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
       if (!json || json.enabled === false) {
         return { ...prev, state: 'ERROR', errorReason: 'risco desabilitado no backend' }
       }
-      return { state: 'OK', value: json, lastOkAtMs: now, errorReason: null }
+      return { state: 'OK', value: json, lastOkAtMs: riskRes.receivedAtMs, errorReason: null }
     })
     setP03Read(prev => {
       if (!p03Res.ok) return { ...prev, state: 'ERROR', errorReason: reason(p03Res.e) }
-      return { state: 'OK', value: p03Res.v as ExecutionIncidentsStatus, lastOkAtMs: now, errorReason: null }
+      const observedAt = executionIncidentsObservedAt(p03Res.v)
+      if (observedAt == null) return { ...prev, state: 'ERROR', errorReason: 'incidentes sem instante de leitura confirmado' }
+      return { state: 'OK', value: p03Res.v, lastOkAtMs: observedAt, errorReason: null }
     })
     setSummaryRead(prev => {
       if (!dailyRes.ok) return { ...prev, state: 'ERROR', errorReason: reason(dailyRes.e) }
       const s = (dailyRes.v as { summary?: DailySummary } | null)?.summary ?? null
       if (!s) return { ...prev, state: 'ERROR', errorReason: 'resposta sem resumo do dia' }
-      return { state: 'OK', value: s, lastOkAtMs: now, errorReason: null }
+      return { state: 'OK', value: s, lastOkAtMs: dailyRes.receivedAtMs, errorReason: null }
     })
     // Lista indisponível ≠ lista vazia: só um sucesso confirma o inventário.
     setPositionsRead(prev => {
       if (!tradesRes.ok) return { ...prev, state: 'ERROR', errorReason: reason(tradesRes.e) }
       const rows = (tradesRes.v as { trades?: RealTradeRow[] } | null)?.trades
       if (!Array.isArray(rows)) return { ...prev, state: 'ERROR', errorReason: 'resposta sem lista de trades' }
-      return { state: 'OK', value: rows, lastOkAtMs: now, errorReason: null }
+      return { state: 'OK', value: rows, lastOkAtMs: tradesRes.receivedAtMs, errorReason: null }
     })
     if (regimeRes.ok && regimeRes.v) setRegime(regimeRes.v as RegimeStatus)
     if (recsRes.ok && (recsRes.v as { recommendations?: Recommendation[] })?.recommendations) {
@@ -276,7 +260,10 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
   // Retomar trading após pausa do circuit breaker (kill switch → paused=false).
   // Ação sensível: confirma antes. Só o próprio usuário aciona clicando aqui.
   const resumeTrading = useCallback(async () => {
+    const canResumeNow = () => canOfferResume({ risk: riskRead, p03: p03Read, nowMs: Date.now() })
+    if (!canResumeNow()) return
     if (!window.confirm('Retomar o trading agora? Isto desliga a pausa do circuit breaker.')) return
+    if (!canResumeNow()) return
     setResuming(true)
     try {
       const res = await fetch(`${BACKEND}/api/risk/kill-switch?paused=false`, { method: 'POST' })
@@ -294,7 +281,7 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
     } finally {
       setResuming(false)
     }
-  }, [load])
+  }, [load, riskRead, p03Read])
 
   // ── Estado operacional: UMA função pura, compartilhada com header/Sistema.
   //    `clock` entra como instante da leitura (sem relógio interno na função).
@@ -311,7 +298,7 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
   // durar, o kill switch NÃO retoma — o backend re-carimba a pausa — e o
   // auto-resume da virada de dia/semana também não dispara. Prometer retomada
   // automática aqui foi o que fez o operador clicar em "Retomar agora" por dias.
-  const p03Blocked = opState.p03Owned
+  const canResume = canOfferResume({ risk: riskRead, p03: p03Read, nowMs })
 
   // Resultado dos SETUPS (fonte: /api/daily-pnl). Ausência não vira zero.
   const totalR = finiteNumber(summary?.total_r)
@@ -452,14 +439,14 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                 decisão). Esta faixa existe só para hospedar a ação EXISTENTE de
                 retomada — e some quando a pausa é do P03, onde retomar pela
                 interface contornaria o reconciliador. */}
-            {risk?.trading_paused === true && !p03Blocked && (
+            {canResume && (
               <div className="flex flex-col sm:flex-row sm:items-center gap-3 bg-red-950/40 border border-red-500/40 rounded-2xl px-4 py-3 mb-4">
                 <div className="flex items-start gap-2.5 flex-1 min-w-0">
                   <span aria-hidden="true" className="text-lg leading-none mt-0.5">🛑</span>
                   <div className="min-w-0 text-[11.5px] text-red-200/90 leading-snug">
-                    {risk.pause_manual === true
+                    {risk?.pause_manual === true
                       ? 'Pausa manual: só você pode retomar, e a confirmação continua obrigatória.'
-                      : 'Pausa automática por drawdown: retoma sozinha na virada do dia UTC quando o DD recuperar.'}
+                      : 'Pausa automática de risco: consulte o motivo acima. A retomada continua sujeita às verificações do backend.'}
                   </div>
                 </div>
                 <button
@@ -540,17 +527,11 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                 <h2 className="card-label text-slate-400 mb-3 flex items-center gap-2">
                   Registros abertos no app
                   <span className="num normal-case tracking-normal font-semibold text-slate-500">
-                    {positionsQuality.missing ? '· não confirmado' : `· ${positions.length}`}
+                    {positionsQuality.missing ? '· não confirmado' : `· ${positions.length}${positionsQuality.stale ? ' (leitura anterior)' : ''}`}
                   </span>
                 </h2>
-                {positionsQuality.missing ? (
-                  <div className="py-8 text-center text-amber-200 text-sm">
-                    Não foi possível ler as posições nesta leitura.
-                  </div>
-                ) : positions.length === 0 ? (
-                  <div className="py-8 text-center text-slate-500 text-sm">
-                    Nenhum registro aberto no app (confirmado nesta leitura).
-                  </div>
+                {positionsQuality.missing || positions.length === 0 ? (
+                  <PositionsEmptyState quality={positionsQuality} />
                 ) : positions.slice(0, 5).map(t => {
                   const px = prices.get(toBinance(t.symbol))
                   const r = liveR(t, px)

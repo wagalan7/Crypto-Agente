@@ -7,7 +7,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import {
-  OperationalStateCard, P03IncidentCard, PositionsInventoryCard, SourceResultCard,
+  OperationalStateCard, P03IncidentCard, PositionsInventoryCard, PositionsEmptyState, SourceResultCard,
 } from '../../src/components/status/OperationalCards'
 import {
   deriveOperationalState, p03View, readingQuality, emptyReading,
@@ -148,4 +148,21 @@ test('paridade numérica: o cartão não recalcula nem arredonda o que recebe', 
     note: 'Fonte declarada.',
   }))
   assert.ok(html.includes('-12.3456'), 'o valor formatado pelo chamador vai cru para a tela')
+})
+
+test('lista vazia da Home: sucesso, erro posterior e ausência têm mensagens distintas', () => {
+  const markup = (reading: SourceReading<unknown[]>) => renderToStaticMarkup(createElement(PositionsEmptyState, {
+    quality: readingQuality(reading, NOW, 60_000),
+  }))
+  const confirmed = markup(read([]))
+  assert.ok(confirmed.includes('confirmado nesta leitura'))
+  assert.ok(confirmed.includes('data-quality="CONFIRMED"'))
+  const oldEmpty = markup(read([], { state: 'ERROR', errorReason: 'SYNTHETIC_FAILURE' }))
+  assert.ok(oldEmpty.includes('a situação atual não foi confirmada'))
+  assert.ok(oldEmpty.includes('data-quality="STALE"'))
+  assert.ok(!oldEmpty.includes('confirmado nesta leitura'))
+  const unavailable = markup(emptyReading<unknown[]>())
+  assert.ok(unavailable.includes('Não foi possível ler'))
+  assert.ok(unavailable.includes('data-quality="MISSING"'))
+  assert.ok(!unavailable.includes('Nenhum registro aberto'))
 })

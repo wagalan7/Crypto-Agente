@@ -2,9 +2,10 @@ import { useState, useEffect, useCallback } from 'react'
 import { Shield, ShieldAlert, ShieldQuestion } from 'lucide-react'
 import {
   deriveOperationalState, emptyReading, readingQuality, formatAge,
-  DEFAULT_STALE_AFTER_MS, finiteNumber,
+  DEFAULT_STALE_AFTER_MS, finiteNumber, canOfferResume,
   type SourceReading,
 } from '../lib/operationalState'
+import { useReadingClock } from '../hooks/useReadingLifecycle'
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
 
@@ -30,12 +31,12 @@ interface BadgeProps {
 /**
  * RiskStatusBadge — mostra estado do circuit breaker no header.
  *
- * - Verde "ativo" quando trading_paused=false
- * - Vermelho piscando "pausado" quando true
+ * - Sem pausa de risco confirmada não significa autoridade de entrada.
+ * - Bloqueio conhecido permanece visível mesmo com leitura antiga.
  * - Clique: se `onOpen` fornecido, delega (ex: abrir StatusPanel completo);
  *   senão abre modal inline com kill switch rápido.
  *
- * Faz poll leve a cada 30s. Não bloqueia UI — silencia erros.
+ * Faz poll leve a cada 30s. Erro e envelhecimento ficam explícitos.
  */
 export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
   // Leitura COM qualidade: erro depois de sucesso continua visível e o dado
@@ -43,12 +44,12 @@ export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
   const [reading, setReading] = useState<SourceReading<RiskStatus>>(emptyReading)
   const [busy, setBusy] = useState(false)
   const [showPanel, setShowPanel] = useState(false)
-  const [tick, setTick] = useState(() => Date.now())
+  const tick = useReadingClock()
   const status = reading.value
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch(`${BACKEND}/api/risk/status`)
+      const res = await fetch(`${BACKEND}/api/risk/status`, { signal: AbortSignal.timeout(10_000) })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const json = (await res.json()) as RiskStatus
       if (json.enabled === false) {
@@ -61,8 +62,6 @@ export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
         ...prev, state: 'ERROR',
         errorReason: e instanceof Error ? e.message : 'leitura falhou',
       }))
-    } finally {
-      setTick(Date.now())
     }
   }, [])
 
@@ -73,6 +72,7 @@ export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
   }, [load])
 
   const toggle = async (next: boolean) => {
+    if (!next && !canOfferResume({ risk: reading, p03: emptyReading(), scope: 'RISK_ONLY', nowMs: Date.now() })) return
     setBusy(true)
     try {
       const url = `${BACKEND}/api/risk/kill-switch?paused=${next}`
@@ -80,7 +80,6 @@ export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
       if (res.ok) {
         const json = (await res.json()) as RiskStatus
         setReading({ state: 'OK', value: json, lastOkAtMs: Date.now(), errorReason: null })
-        setTick(Date.now())
       }
     } catch {
       /* idem */
@@ -101,6 +100,7 @@ export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
   if (state.level === 'LOADING') return null
 
   const paused = status?.trading_paused === true
+  const canResume = canOfferResume({ risk: reading, p03: emptyReading(), scope: 'RISK_ONLY', nowMs: tick })
   const Icon = state.blocked ? ShieldAlert
     : state.level === 'NO_BLOCK_CONFIRMED' ? Shield
     : ShieldQuestion
@@ -166,7 +166,11 @@ export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
             </div>
 
             <div className="flex gap-2">
-              {paused ? (
+              {paused && !canResume ? (
+                <p className="flex-1 text-xs text-amber-200">
+                  Retomada não disponível nesta leitura. Consulte o diagnóstico de risco e execução.
+                </p>
+              ) : paused ? (
                 <button
                   disabled={busy}
                   onClick={() => toggle(false)}

@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QA sintético — bloqueio de recurso externo</title>
+  </head>
+  <body>
+    <h1>Prova isolada de CSP</h1>
+    <p>Somente teste sintético. Esta página recebe a política de segurança do servidor de preview.</p>
+    <p id="result" role="status">Aguardando o bloqueio do script externo.</p>
+    <script>
+      document.addEventListener('securitypolicyviolation', event => {
+        if (event.blockedURI === 'https://s3.tradingview.com/tv.js') {
+          document.getElementById('result').textContent =
+            'BLOQUEADO pelo navegador: ' + event.effectiveDirective + ' — ' + event.blockedURI;
+        }
+      });
+    </script>
+    <script src="https://s3.tradingview.com/tv.js"></script>
+  </body>
+</html>

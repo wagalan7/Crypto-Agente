@@ -2938,3 +2938,24 @@ Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
 - Sem backend, estratégia, score, risco, limite, flag, ENV, endpoint novo,
   segredo no cliente, push ou deploy. `LOCAL_VERIFIED`; integração em `main` e
   publicação seguem como etapas separadas.
+
+## L04 — correção da revisão (07/10/2026)
+
+- Baseline `db21ef1f`, mesmo worktree autorizado; frontend/QA/documentação apenas.
+- Retomada governada por predicado único: P03, validação manual, erro, leitura
+  antiga ou incoerente não oferecem nem enviam retomada. Controle positivo de
+  pausa manual preservado. Histórico vazio não afirma sinal verde.
+- HTTP 200 `ok=false` recusado; cache P03 invalida reutilização após falha e
+  conserva instante real da resposta. Subcontagens/listas positivas não viram
+  ausência confirmada. Carimbo por fonte, timeout 10s e relógio local independente.
+- Escape/foco com uma inscrição por montagem; lista vazia antiga rotulada como
+  anterior. Novos testes comportamentais dos controladores e markup real.
+- Preview isolado por CSP/origem/método, com Request.method, XHR/beacon/SSE/WS/
+  service worker contidos; recurso TradingView bloqueado de fato no probe do
+  navegador. APIs sem fixture falham com 503; isolamento restrito ao QA.
+- Estado final: **79 testes verdes 2×**, tsc/build temporário/diff-check limpos;
+  revisão de teclado e mobile 390px com dados sintéticos. Dist intacto, sem
+  instalação de dependências ou acesso à conta. Não executados POSTs reais,
+  leitor de tela, contraste instrumental ou device físico.
+- Relatório: `docs/FECHAMENTO_FINAL_04_CORRECAO.md`.
+  `LOCAL_VERIFIED_PENDING_INTEGRATION`; sem merge, push ou deploy nesta correção.

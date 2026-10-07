@@ -177,17 +177,34 @@ export const EXECUTION_INCIDENTS_TTL_MS = 12_000
 
 let p03Cache: { at: number; value: ExecutionIncidentsStatus } | null = null
 let p03Inflight: Promise<ExecutionIncidentsStatus> | null = null
+let p03ObservedAt = new WeakMap<object, number>()
+
+/** Recebimento real do GET; uma releitura do cache não renova este instante. */
+export function executionIncidentsObservedAt(payload: unknown): number | null {
+  return payload !== null && typeof payload === 'object'
+    ? p03ObservedAt.get(payload) ?? null
+    : null
+}
 
 /** Zera o cache — usado apenas por QA/testes locais. */
 export function __resetExecutionIncidentsCache(): void {
   p03Cache = null
   p03Inflight = null
+  p03ObservedAt = new WeakMap<object, number>()
 }
 
 async function fetchExecutionIncidents(): Promise<ExecutionIncidentsStatus> {
-  const res = await fetch(`${BASE}/execution-incidents/status`)
+  const res = await fetch(`${BASE}/execution-incidents/status`, { signal: AbortSignal.timeout(10_000) })
   if (!res.ok) throw new Error(`API error ${res.status}`)
-  return (await res.json()) as ExecutionIncidentsStatus
+  const payload: unknown = await res.json()
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)
+    || (payload as ExecutionIncidentsStatus).ok !== true) {
+    // HTTP 200 não é confirmação de domínio. Não propaga erro/segredo do
+    // servidor e não substitui o último objeto bom por um payload de falha.
+    throw new Error('P03_STATUS_UNCONFIRMED')
+  }
+  p03ObservedAt.set(payload, Date.now())
+  return payload as ExecutionIncidentsStatus
 }
 
 // Payload pra confirmar entrada manual a partir de uma recomendação.
@@ -338,8 +355,17 @@ export const api = {
     if (p03Inflight) return p03Inflight
     p03Inflight = fetchExecutionIncidents()
       .then(value => {
-        p03Cache = { at: Date.now(), value }
+        const observedAt = executionIncidentsObservedAt(value)
+        if (observedAt === null) throw new Error('P03_STATUS_UNCONFIRMED')
+        p03Cache = { at: observedAt, value }
         return value
+      })
+      .catch(error => {
+        // Uma leitura que falhou não pode ser seguida de um "sucesso" só
+        // porque o objeto anterior ainda cabe no TTL. O consumidor conserva
+        // esse objeto/instante para diagnóstico; a próxima leitura exige GET.
+        p03Cache = null
+        throw error
       })
       .finally(() => { p03Inflight = null })
     return p03Inflight

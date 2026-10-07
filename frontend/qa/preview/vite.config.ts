@@ -4,6 +4,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { resolve } from 'node:path'
+import { QA_PREVIEW_HEADERS, QA_PREVIEW_ORIGIN } from './isolationPolicy'
 
 const AQUI = resolve(import.meta.dirname ?? '.', '.')
 
@@ -14,7 +15,7 @@ export default defineConfig({
   plugins: [react()],
   define: {
     // Host sentinela local: se algo escapar do mock, não vai para produção.
-    'import.meta.env.VITE_API_URL': JSON.stringify('http://127.0.0.1:5199'),
+    'import.meta.env.VITE_API_URL': JSON.stringify(QA_PREVIEW_ORIGIN),
     'import.meta.env.VITE_OBSERVATION_API_URL': JSON.stringify(''),
   },
   server: {
@@ -22,6 +23,7 @@ export default defineConfig({
     host: '127.0.0.1',
     strictPort: true,
     open: false,
+    headers: QA_PREVIEW_HEADERS,
   },
   cacheDir: resolve(AQUI, '../../node_modules/.cache/cw-qa-vite'),
 })

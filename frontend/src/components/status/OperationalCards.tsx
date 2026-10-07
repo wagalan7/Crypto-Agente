@@ -294,6 +294,20 @@ export function SourceResultCard({
 
 // ─── Inventário de posições ──────────────────────────────────────────────────
 
+/** Estado vazio da lista da Home: conhecido anteriormente não é zero atual. */
+export function PositionsEmptyState({ quality }: { quality: ReadingQuality }) {
+  return (
+    <div data-testid="positions-empty" data-quality={quality.missing ? 'MISSING' : quality.confirmed ? 'CONFIRMED' : 'STALE'}
+      className={`py-8 text-center text-sm ${quality.confirmed ? 'text-slate-500' : 'text-amber-200'}`}>
+      {quality.missing
+        ? 'Não foi possível ler as posições nesta leitura.'
+        : quality.confirmed
+          ? 'Nenhum registro aberto no app (confirmado nesta leitura).'
+          : 'A última leitura conhecida não tinha registros abertos no app; a situação atual não foi confirmada.'}
+    </div>
+  )
+}
+
 export interface PositionsInventoryCardProps {
   quality: ReadingQuality
   /** Quantidade CONFIRMADA de posições do bot; null = não confirmada. */

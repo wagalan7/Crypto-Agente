@@ -6,6 +6,9 @@ Base: `6fc9bf1aa9a46cc4431c2a68f2e520fe41cad6dd` (publicada) · branch
 ordem foi alterada; nenhum endpoint novo; nenhum push/deploy. `frontend/dist`
 e arquivos pessoais preservados.
 
+Revisão corretiva sobre o commit `db21ef1f`: concluída localmente em
+07/10/2026. Provas atuais e limites em `FECHAMENTO_FINAL_04_CORRECAO.md`.
+
 ---
 
 ## 1. Problema → correção (ANTES / DEPOIS)
@@ -45,16 +48,20 @@ sem credencial, sem truncar causa) em `<details>`.
 
 ## 3. Paridade preservada
 
-- Ordenação, filtros, ações, confirmações, rotas e corpos **inalterados**
+- Ordenação, filtros, confirmações, rotas e corpos **inalterados**
   (`/api/risk/kill-switch?paused=…` POST + `window.confirm` / confirmação 2-step).
+  A apresentação e o guard da retomada foram endurecidos: P03, validação manual,
+  fonte incerta ou antiga não oferecem nem enviam retomada pela interface.
 - Nenhum botão novo de enable-live/promote/execute/clear/retry-now; CTA de causa
   P03 leva ao diagnóstico existente.
 - Nenhum recálculo de score, risco, probabilidade, tier ou elegibilidade no
   cliente: os cartões exibem o que o chamador formatou.
-- Polling, WebSocket, caches e navegação existentes preservados; a única chamada
-  **aditiva** é o GET P03 (ver §5).
+- Cadências de polling, WebSocket e navegação preservadas; a única chamada
+  **aditiva** do lote é o GET P03 (ver §5). Leituras têm timeout de 10s;
+  cache/single-flight P03 conservam o instante real da resposta e invalidam a
+  reutilização após erro. O relógio local de frescor não faz GET adicional.
 
-## 4. Testes
+## 4. Testes da entrega inicial (histórico)
 
 `cd frontend && node qa/run-tests.mjs` → **42 testes, 42 passaram, 0 falhas**
 (runner local: esbuild já instalado + `node --test`; nenhuma suíte nova instalada).
@@ -76,6 +83,13 @@ sem credencial, sem truncar causa) em `<details>`.
 
 `npx tsc --noEmit` (binário local): **limpo**. Build: `vite build --outDir /tmp/cw_l04_qa/build` **OK** (`frontend/dist` intocado).
 
+**Estado final após revisão:** `node qa/run-tests.mjs` executado **2×**, ambas
+com **79 testes aprovados, zero falhas e zero skips**, em seis arquivos.
+Inclui regras de retomada, subcontagens/listas incoerentes, HTTP 200 com
+`ok=false`, relógio independente, carimbo por resposta/cache, foco por montagem,
+posição vazia antiga e isolamento do preview. `tsc --noEmit` limpo; build final
+em `/private/tmp/cw-l04-final.dk6yNY`, sem regerar `frontend/dist`.
+
 ## 5. Chamada aditiva declarada
 
 O frontend passou a fazer **um GET a mais por ciclo**:
@@ -90,7 +104,7 @@ Preview isolado: `cd frontend && node_modules/.bin/vite --config qa/preview/vite
 (`http://127.0.0.1:5199/?cenario=…`). O mock é instalado **antes** de montar a
 app; se falhar, a app não monta. Fixtures sintéticas rotuladas `SINTÉTICO-QA`.
 
-Medido na sessão: **8 requisições externas bloqueadas e contadas**
+Medido na sessão inicial: **8 requisições externas bloqueadas e contadas**
 (`fapi.binance.com`), **0 mutações enviadas** (POST/PATCH interceptados),
 **2 WebSockets** substituídos por stub, `VITE_API_URL` apontando para sentinela
 local. Sem scroll horizontal em 390 / 768 / 1024.
@@ -109,6 +123,19 @@ Evidências (JPG) em `/tmp/cw_l04_qa/shots/`:
 
 Teclado verificado no preview: Escape fecha o overlay e o foco volta ao elemento
 anterior; CTA do cartão abre o diagnóstico existente.
+
+Na revisão: Home/Sistema não exibem retomada no cenário P03; a pausa manual
+legítima conserva a ação. Escape devolve o foco ao lançador Home, e atualizações
+do relógio não reinstalam o listener. Rechecado mobile em 390px sem scroll
+horizontal; captura `/private/tmp/cw-l04-status-corrected.jpg`.
+
+O preview agora bloqueia transporte externo por política de origem/método e
+por CSP (header e meta): cobre também script, iframe, imagem e worker, que
+`fetch` mockado sozinho não protege. Um script externo TradingView foi recusado
+pelo navegador em `qa/preview/resource-probe.html`, comprovado pelo evento
+`securitypolicyviolation`. Bloqueios CSP não são contabilizados como chamadas
+do mock: são mecanismos/provas distintos. Rotas API sem fixture retornam 503,
+não um payload genérico de sucesso. Tudo isso vale só para o preview de QA.
 
 ## 7. Limitações declaradas
 

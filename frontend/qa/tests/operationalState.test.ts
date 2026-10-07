@@ -4,7 +4,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  deriveOperationalState, p03View, readingQuality, translateReason,
+  deriveOperationalState, canOfferResume, p03View, readingQuality, translateReason,
   sanitizeTechnical, finiteNumber, literalBool, countOf, formatAge,
   emptyReading, UNKNOWN_REASON, DEFAULT_STALE_AFTER_MS,
   type P03Facts, type RiskFacts, type SourceReading,
@@ -243,4 +243,113 @@ test('idade formatada é estável e não inventa valor', () => {
   assert.equal(formatAge(-5), '—')
   assert.equal(formatAge(12_000), 'há 12s')
   assert.equal(formatAge(600_000), 'há 10min')
+})
+
+test('causa de validação manual não é um kill switch nem drawdown', () => {
+  assert.equal(translateReason('[manual-validation] validação manual pendente (DAILY_READ_UNKNOWN) — resume bloqueado'),
+    'Validação da posição manual pendente')
+  assert.equal(translateReason('DD diário -3.41% atingiu limite -3%'), 'Limite de perda diária atingido')
+  assert.equal(translateReason('DD semanal -6.2% atingiu limite -6%'), 'Limite de perda semanal atingido')
+  assert.equal(translateReason('manual accounting unavailable'), UNKNOWN_REASON,
+    'a palavra manual isolada não prova um kill switch')
+})
+
+test('sinais positivos de P03 prevalecem sobre contadores contraditórios', () => {
+  for (const facts of [
+    p03Ok({ manual_required: 1 }),
+    p03Ok({ retry_pending: 1 }),
+    p03Ok({ items: [{ state: 'OPEN' }] }),
+    p03Ok({ manual_items: [{ state: 'MANUAL_REQUIRED' }] }),
+  ]) {
+    const v = p03View(reading(facts), NOW)
+    assert.equal(v.confirmed, false, JSON.stringify(facts))
+    assert.equal(v.blocked, true, JSON.stringify(facts))
+    assert.equal(v.unconfirmedReason, 'resposta de incidentes incoerente')
+    assert.equal(state(reading(riskOk()), reading(facts)).level, 'BLOCKED')
+  }
+})
+
+test('subcontadores e listas incoerentes não confirmam ausência', () => {
+  for (const facts of [
+    p03Ok({ open_total: 2, manual_required: 3 }),
+    p03Ok({ open_total: 2, retry_pending: 3 }),
+    p03Ok({ open_total: 2, manual_required: 2, retry_pending: 1 }),
+    p03Ok({ manual_required: '0' }),
+    p03Ok({ retry_pending: -1 }),
+    p03Ok({ items: {} }),
+    p03Ok({ manual_items: null }),
+  ]) assert.equal(p03View(reading(facts), NOW).confirmed, false, JSON.stringify(facts))
+})
+
+test('quarentena e listas positivas aparecem mesmo enquanto risco carrega', () => {
+  for (const facts of [
+    { ok: false, quarantine_active: true },
+    { ok: true, manual_required: 1 },
+    { ok: true, items: [{ state: 'OPEN' }] },
+  ]) {
+    const s = state(emptyReading<RiskFacts>(), reading(facts))
+    assert.equal(s.level, 'BLOCKED')
+    assert.equal(s.p03Owned, true)
+  }
+})
+
+test('falha P03 conhecida não volta a parecer primeira leitura carregando', () => {
+  const s = state(emptyReading<RiskFacts>(), {
+    state: 'ERROR', value: null, lastOkAtMs: null, errorReason: 'P03 unavailable',
+  })
+  assert.equal(s.level, 'UNAVAILABLE')
+})
+
+test('retomada FULL preserva pausa manual e drawdown confirmados sem P03', () => {
+  for (const cause of [
+    { pause_manual: true, pause_reason: 'Pausa manual via kill switch' },
+    { pause_manual: false, pause_reason: 'DD diário -3.4% atingiu limite' },
+    { pause_manual: false, pause_reason: 'DD semanal -6.2% atingiu limite' },
+  ]) assert.equal(canOfferResume({
+    risk: reading(riskOk({ trading_paused: true, ...cause })),
+    p03: reading(p03Ok()), nowMs: NOW,
+  }), true)
+})
+
+test('retomada não aparece em P03, validação manual, causa desconhecida ou leitura antiga', () => {
+  const paused = reading(riskOk({ trading_paused: true, pause_manual: true }))
+  for (const p03 of [
+    reading(p03Ok({ open_total: 1 })),
+    reading(p03Ok({ quarantine_active: true })),
+    reading(p03Ok({ manual_required: 1 })),
+    emptyReading<P03Facts>(),
+    reading(p03Ok(), { state: 'ERROR' }),
+    reading(p03Ok(), { lastOkAtMs: NOW - DEFAULT_STALE_AFTER_MS - 1 }),
+  ]) assert.equal(canOfferResume({ risk: paused, p03, nowMs: NOW }), false)
+  for (const reason of ['[manual-validation] pendente', 'P03-QUARANTINE: x', 'algo novo', null]) {
+    assert.equal(canOfferResume({
+      risk: reading(riskOk({ trading_paused: true, pause_manual: false, pause_reason: reason })),
+      p03: reading(p03Ok()), nowMs: NOW,
+    }), false)
+  }
+  assert.equal(canOfferResume({
+    risk: { ...paused, state: 'ERROR' }, p03: reading(p03Ok()), nowMs: NOW,
+  }), false)
+  assert.equal(canOfferResume({
+    risk: { ...paused, lastOkAtMs: NOW - DEFAULT_STALE_AFTER_MS - 1 },
+    p03: reading(p03Ok()), nowMs: NOW,
+  }), false)
+})
+
+test('retomada RISK_ONLY exige pausa manual literal e respeita toda causa P03 conhecida', () => {
+  const input = {
+    risk: reading(riskOk({ trading_paused: true, pause_manual: true })),
+    p03: emptyReading<P03Facts>(), nowMs: NOW, scope: 'RISK_ONLY' as const,
+  }
+  assert.equal(canOfferResume(input), true)
+  assert.equal(canOfferResume({ ...input, risk: reading(riskOk({
+    trading_paused: true, pause_manual: false, pause_reason: 'DD diário -3.4%',
+  })) }), false)
+  for (const pause_reason of ['P03-QUARANTINE: x', '[manual-validation] pendente']) {
+    assert.equal(canOfferResume({ ...input, risk: reading(riskOk({
+      trading_paused: true, pause_manual: true, pause_reason,
+    })) }), false)
+  }
+  assert.equal(canOfferResume({ ...input, p03: reading(p03Ok({ open_total: 1 })) }), false)
+  assert.equal(canOfferResume({ ...input, risk: reading(riskOk({ trading_paused: true, pause_manual: 'true' })) }), false)
 })

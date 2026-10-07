@@ -2,8 +2,9 @@
 
 Base: `6fc9bf1a` (publicada, conferida como ancestral do HEAD) · branch
 `worktree-lote02-pesquisa` · worktree `lote02-pesquisa`.
-Estado: **LOCAL_VERIFIED** — commit local, sem push/deploy e sem integração em
-`main`. Relatório: `docs/FECHAMENTO_FINAL_04_LAYOUT.md`.
+Estado: **LOCAL_VERIFIED_PENDING_INTEGRATION** — correção sobre `db21ef1f`, sem
+push/deploy e sem integração em `main`. Relatórios:
+`docs/FECHAMENTO_FINAL_04_LAYOUT.md` e `docs/FECHAMENTO_FINAL_04_CORRECAO.md`.
 
 ## Blocos
 
@@ -16,8 +17,8 @@ Estado: **LOCAL_VERIFIED** — commit local, sem push/deploy e sem integração 
 | 5 | Cartões de apresentação puros (estado, P03, fonte/janela, posições) | concluído |
 | 6 | Rótulos honestos: setups ≠ conta, força ≠ R/R ≠ probabilidade, fontes do Dashboard | concluído |
 | 7 | Responsividade/overlays/a11y: `.app-overlay`, safe-area, foco, reduced-motion, Escape | concluído |
-| 8 | Testes (42) + tsc + build em diretório temporário | concluído |
-| 9 | QA visual isolada: 4 viewports × 4 cenários, externos bloqueados/contados | concluído |
+| 8 | Testes finais (79, 2×) + tsc + build em diretório temporário | concluído |
+| 9 | QA inicial: 7 capturas distribuídas em 4 viewports; revisão mobile/teclado e bloqueio real de script por CSP | concluído |
 | 10 | Documentação e commit | concluído |
 
 ## Decisões que valem registrar
@@ -34,6 +35,15 @@ Estado: **LOCAL_VERIFIED** — commit local, sem push/deploy e sem integração 
   interface contorna o reconciliador.
 - **Chamada aditiva declarada**: +1 GET `/api/execution-incidents/status` por
   ciclo de 20s (cache de 12s compartilhado). A contagem de requests mudou.
+- **Retomada conservadora**: predicado compartilhado nos três consumidores;
+  P03/validação manual, erro, idade excessiva e payload incoerente negam a ação.
+  Pausa manual legítima continua disponível, sem novo endpoint.
+- **Frescor real**: carimbo por resposta, não pelo término do lote nem cache
+  hit; timeout 10s e relógio local independente; cache falho não reabilita leitura.
+- **Foco estável**: uma inscrição por montagem com callback atual; retorno de
+  foco apenas no fechamento. Zero confirmado e zero antigo têm textos distintos.
+- **Isolamento de QA**: CSP header/meta + origem/método estritos, Request.method
+  respeitado, XHR/beacon/SSE/WS/service worker contidos, API desconhecida 503.
 
 ## Não verificado (declarado)
 
