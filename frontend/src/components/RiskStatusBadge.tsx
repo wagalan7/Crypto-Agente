@@ -1,5 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Shield, ShieldAlert } from 'lucide-react'
+import { Shield, ShieldAlert, ShieldQuestion } from 'lucide-react'
+import {
+  deriveOperationalState, emptyReading, readingQuality, formatAge,
+  DEFAULT_STALE_AFTER_MS, finiteNumber,
+  type SourceReading,
+} from '../lib/operationalState'
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
 
@@ -33,18 +38,31 @@ interface BadgeProps {
  * Faz poll leve a cada 30s. Não bloqueia UI — silencia erros.
  */
 export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
-  const [status, setStatus] = useState<RiskStatus | null>(null)
+  // Leitura COM qualidade: erro depois de sucesso continua visível e o dado
+  // antigo é rotulado como tal (antes o erro era silenciado — Lote 04).
+  const [reading, setReading] = useState<SourceReading<RiskStatus>>(emptyReading)
   const [busy, setBusy] = useState(false)
   const [showPanel, setShowPanel] = useState(false)
+  const [tick, setTick] = useState(() => Date.now())
+  const status = reading.value
 
   const load = useCallback(async () => {
     try {
       const res = await fetch(`${BACKEND}/api/risk/status`)
-      if (!res.ok) return
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const json = (await res.json()) as RiskStatus
-      if (json.enabled !== false) setStatus(json)
-    } catch {
-      /* silencia — não é fatal pra UI */
+      if (json.enabled === false) {
+        setReading(prev => ({ ...prev, state: 'ERROR', errorReason: 'risco desabilitado no backend' }))
+        return
+      }
+      setReading({ state: 'OK', value: json, lastOkAtMs: Date.now(), errorReason: null })
+    } catch (e) {
+      setReading(prev => ({
+        ...prev, state: 'ERROR',
+        errorReason: e instanceof Error ? e.message : 'leitura falhou',
+      }))
+    } finally {
+      setTick(Date.now())
     }
   }, [])
 
@@ -61,7 +79,8 @@ export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
       const res = await fetch(url, { method: 'POST' })
       if (res.ok) {
         const json = (await res.json()) as RiskStatus
-        setStatus(json)
+        setReading({ state: 'OK', value: json, lastOkAtMs: Date.now(), errorReason: null })
+        setTick(Date.now())
       }
     } catch {
       /* idem */
@@ -71,66 +90,78 @@ export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
     }
   }
 
-  if (!status) return null
+  // MESMA função pura da Home/Sistema, com escopo DECLARADO: este controle não
+  // lê incidentes de execução (nenhuma chamada por card), então nunca afirma
+  // "disponível" — no máximo "risco sem pausa".
+  const state = deriveOperationalState({
+    risk: reading, p03: emptyReading(), scope: 'RISK_ONLY',
+    nowMs: tick, staleAfterMs: DEFAULT_STALE_AFTER_MS,
+  })
+  const quality = readingQuality(reading, tick, DEFAULT_STALE_AFTER_MS)
+  if (state.level === 'LOADING') return null
 
-  const paused = status.trading_paused
-  const Icon = paused ? ShieldAlert : Shield
-  const cls = paused
-    ? 'border-red-500/60 text-red-300 bg-red-500/15 animate-pulse'
-    : 'border-emerald-500/40 text-emerald-300 bg-emerald-500/10'
+  const paused = status?.trading_paused === true
+  const Icon = state.blocked ? ShieldAlert
+    : state.level === 'NO_BLOCK_CONFIRMED' ? Shield
+    : ShieldQuestion
+  const cls = state.blocked
+    ? 'border-red-500/60 text-red-200 bg-red-500/15'
+    : state.level === 'NO_BLOCK_CONFIRMED'
+      ? 'border-sky-500/40 text-sky-200 bg-sky-500/10'
+      : 'border-amber-500/50 text-amber-200 bg-amber-500/10'
+  const shortLabel = state.blocked ? 'BLOQUEADO'
+    : state.level === 'NO_BLOCK_CONFIRMED' ? 'SEM PAUSA'
+    : state.level === 'STALE' ? 'LEITURA ANTIGA'
+    : 'SEM CONFIRMAÇÃO'
+  const titleText = [
+    `${state.title}.`,
+    state.reasons.length > 0 ? `Motivo: ${state.reasons.join('; ')}.` : '',
+    state.missing.length > 0 ? `Não confirmado: ${state.missing.join('; ')}.` : '',
+    `Última leitura confirmada ${formatAge(quality.ageMs)}.`,
+  ].filter(Boolean).join(' ')
 
   return (
     <>
       <button
         onClick={() => (onOpen ? onOpen() : setShowPanel(true))}
+        aria-label={`Risco: ${state.title}`}
+        data-testid="risk-badge"
+        data-level={state.level}
         className={`flex items-center gap-1 px-2 py-1 border rounded text-xs font-bold ${cls}`}
-        title={
-          paused
-            ? `🛑 PAUSADO · ${status.pause_reason ?? ''}`
-            : `Ativo · DD dia ${status.daily_dd_pct.toFixed(2)}% / sem ${status.weekly_dd_pct.toFixed(2)}%`
-        }
+        title={titleText}
       >
         <Icon className="w-3.5 h-3.5" />
-        <span className="hidden sm:inline">{paused ? 'PAUSADO' : 'OK'}</span>
+        <span className="hidden sm:inline">{shortLabel}</span>
       </button>
 
       {showPanel && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div className="app-overlay fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="w-full max-w-sm bg-[#0a0e1a] border border-slate-700 rounded-xl p-4">
             <div className="flex items-center gap-2 mb-3">
-              <Icon className={`w-5 h-5 ${paused ? 'text-red-400' : 'text-emerald-400'}`} />
-              <h3 className="text-sm font-bold text-white">
-                Circuit Breaker · {paused ? 'PAUSADO' : 'ATIVO'}
-              </h3>
+              <Icon className={`w-5 h-5 ${state.blocked ? 'text-red-400' : state.level === 'NO_BLOCK_CONFIRMED' ? 'text-sky-300' : 'text-amber-300'}`} />
+              <h3 className="text-sm font-bold text-white">Circuit breaker · {state.title}</h3>
             </div>
 
-            {paused && status.pause_reason && (
-              <p className="text-xs text-red-300 mb-3 p-2 rounded bg-red-500/10 border border-red-500/30">
-                {status.pause_reason}
-                {status.pause_manual && <span className="text-slate-400"> · manual</span>}
+            <p className="text-[11.5px] text-slate-300 mb-2 leading-snug">{state.detail}</p>
+            {state.reasons.length > 0 && (
+              <ul className="text-xs text-red-200 mb-3 p-2 rounded bg-red-500/10 border border-red-500/30 space-y-1">
+                {state.reasons.map((r, i) => <li key={i} className="break-words">{r}</li>)}
+              </ul>
+            )}
+            {state.missing.length > 0 && (
+              <p className="text-[11px] text-slate-400 mb-3 leading-snug break-words">
+                Não confirmado nesta leitura: {state.missing.join(' · ')}
               </p>
             )}
 
-            <div className="text-xs space-y-1 mb-4 font-mono">
-              <div className="flex justify-between">
-                <span className="text-slate-500">DD dia</span>
-                <span className={status.daily_dd_pct <= status.daily_limit_pct ? 'text-red-300' : 'text-slate-200'}>
-                  {status.daily_dd_pct.toFixed(2)}% / limite {status.daily_limit_pct}%
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">DD semana</span>
-                <span className={status.weekly_dd_pct <= status.weekly_limit_pct ? 'text-red-300' : 'text-slate-200'}>
-                  {status.weekly_dd_pct.toFixed(2)}% / limite {status.weekly_limit_pct}%
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Trades dia</span>
-                <span className="text-slate-200">{status.daily_trades}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-slate-500">Trades semana</span>
-                <span className="text-slate-200">{status.weekly_trades}</span>
+            <div className="num text-xs space-y-1 mb-4">
+              <Row label="DD dia" value={finiteNumber(status?.daily_dd_pct)} limit={finiteNumber(status?.daily_limit_pct)} />
+              <Row label="DD semana" value={finiteNumber(status?.weekly_dd_pct)} limit={finiteNumber(status?.weekly_limit_pct)} />
+              <Row label="Trades dia" value={finiteNumber(status?.daily_trades)} />
+              <Row label="Trades semana" value={finiteNumber(status?.weekly_trades)} />
+              <div className="flex justify-between text-slate-500">
+                <span>Última leitura confirmada</span>
+                <span>{formatAge(quality.ageMs)}</span>
               </div>
             </div>
 
@@ -167,5 +198,19 @@ export default function RiskStatusBadge({ onOpen }: BadgeProps = {}) {
         </div>
       )}
     </>
+  )
+}
+
+/** Linha de métrica: valor ausente aparece como "não confirmado", não como 0. */
+function Row({ label, value, limit }: { label: string; value: number | null; limit?: number | null }) {
+  const breached = value != null && limit != null && value <= limit
+  return (
+    <div className="flex justify-between gap-2">
+      <span className="text-slate-500">{label}</span>
+      <span className={value == null ? 'text-slate-400' : breached ? 'text-red-300' : 'text-slate-200'}>
+        {value == null ? 'não confirmado' : `${value.toFixed(2)}`}
+        {limit != null && value != null && ` / limite ${limit}`}
+      </span>
+    </div>
   )
 }

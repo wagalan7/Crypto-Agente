@@ -501,7 +501,10 @@ export default function App() {
   ]
 
   const SORTS: { key: Sort; label: string }[] = [
-    { key: 'rr',       label: 'R/R↓'     },
+    // A chave `rr` é histórica e o algoritmo continua `b.confidence - a.confidence`
+    // (nada mudou na ordenação). O RÓTULO estava errado: confiança/força do
+    // sinal não é R/R — e não é probabilidade (Lote 04).
+    { key: 'rr',       label: 'Força do sinal↓' },
     { key: 'volume',   label: 'Volume↓'  },
     { key: 'high',     label: 'Alta%↓'   },
     { key: 'low',      label: 'Baixa%↓'  },
@@ -683,7 +686,7 @@ export default function App() {
     : 'operar'
 
   return (
-    <div className="h-screen bg-[#0a0e1a] text-white flex flex-col overflow-hidden lg:pl-16 pb-14 lg:pb-0">
+    <div className="app-overlay h-screen bg-[#0a0e1a] text-white flex flex-col overflow-hidden">
       <NavRail
         active={activeSection}
         onSelect={navSelect}

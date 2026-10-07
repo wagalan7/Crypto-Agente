@@ -2903,3 +2903,38 @@ Base `581ad3d4`, worktree autorizado. Relatório:
   atualizados. Candidata inativa, LEGACY/defaults/limites/champion preservados;
   sem DDL, aprovação real, conta externa, ordem, mensagem, merge/push/deploy.
   WAITING_DECISION / WAITING_DATA / WAITING_CANARY_APPROVAL mantidos.
+
+## L04 — layout claro, responsivo e honesto (07/10/2026)
+
+Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
+`docs/FECHAMENTO_FINAL_04_LAYOUT.md`.
+
+- **Nunca verde por ausência.** Função PURA única (`src/lib/operationalState.ts`)
+  decide o estado para Home, selo do header e Sistema: LOADING / UNAVAILABLE /
+  STALE / BLOCKED / NO_BLOCK_CONFIRMED / AVAILABLE. `trading_paused === false`
+  sozinho não autoriza nada; `AVAILABLE` exige fato explícito de autoridade de
+  entrada, que o contrato atual não publica — a tela diz isso e nomeia a lacuna.
+  O selo do header usa escopo declarado `RISK_ONLY` em vez de duplicar a regra.
+- **Ausência deixou de virar zero**: drawdown, wins/losses/win-rate, contadores
+  de incidentes, trades do paper e verdito de recomendação. Erro de leitura de
+  posições não passa mais como lista vazia, e zero confirmado continua zero.
+- **Incidentes P03 na interface** pela leitura delimitada do GET público já
+  existente `/api/execution-incidents/status` (método tipado + cache/single-flight
+  compartilhado; **+1 GET por ciclo de 20s**, declarado). Incidente/quarentena
+  prevalecem sobre risco sem pausa; `ok=false`/erro não vira zero.
+- **Rótulos honestos**: resultado dos SETUPS (janela/unidade) ≠ lucro da conta;
+  `/api/real-trades` declarado como registro do app, não inventário da Binance;
+  "Força do sinal↓" no lugar de "R/R↓" (chave e algoritmo intactos); Dashboard
+  com fonte/janela por bloco em vez de selo PAPER global; heartbeat não é
+  autorização; P(TP1) identificado como modelo.
+- **Responsividade/a11y**: `.app-overlay` em 10 overlays (rail, barra e
+  `safe-area`), foco visível, `prefers-reduced-motion`, Escape com retorno de
+  foco. Sem scroll horizontal em 390/768/1024.
+- **Provas**: 42 testes locais (função pura + markup real + single-flight +
+  contratos) com runner que só usa dependências instaladas; `tsc --noEmit` limpo;
+  build em diretório temporário (dist preservado); QA visual isolada com 8
+  requisições externas bloqueadas/contadas, 0 mutações enviadas e 7 capturas em
+  390/768/1024/1440.
+- Sem backend, estratégia, score, risco, limite, flag, ENV, endpoint novo,
+  segredo no cliente, push ou deploy. `LOCAL_VERIFIED`; integração em `main` e
+  publicação seguem como etapas separadas.

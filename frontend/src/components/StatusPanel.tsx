@@ -1,5 +1,13 @@
 import { useState, useEffect, useCallback } from 'react'
 import { X, Shield, ShieldAlert, Activity, History, AlertTriangle } from 'lucide-react'
+import { api } from '../services/api'
+import type { ExecutionIncidentsStatus } from '../services/api'
+import {
+  deriveOperationalState, emptyReading, p03View, readingQuality,
+  DEFAULT_STALE_AFTER_MS, finiteNumber,
+  type SourceReading,
+} from '../lib/operationalState'
+import { OperationalStateCard, P03IncidentCard } from './status/OperationalCards'
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
 
@@ -71,8 +79,30 @@ interface Props {
  * - Kill switch com confirmação 2-step
  * - Histórico dos últimos 30 dias de eventos do circuit breaker
  */
+
+/**
+ * Escape fecha o overlay e o foco volta para onde estava (a11y do Lote 04).
+ * Não mexe em polling, cache nem navegação: só teclado e foco.
+ */
+function useOverlayDismiss(onClose: () => void) {
+  useEffect(() => {
+    const anterior = document.activeElement as HTMLElement | null
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      if (anterior && typeof anterior.focus === 'function') anterior.focus()
+    }
+  }, [onClose])
+}
+
 export default function StatusPanel({ onClose }: Props) {
-  const [status, setStatus] = useState<RiskStatus | null>(null)
+  useOverlayDismiss(onClose)
+  // Leitura COM qualidade por fonte (Lote 04): erro/ausência não viram zero.
+  const [riskRead, setRiskRead] = useState<SourceReading<RiskStatus>>(emptyReading)
+  const [p03Read, setP03Read] = useState<SourceReading<ExecutionIncidentsStatus>>(emptyReading)
   const [events, setEvents] = useState<RiskEvent[]>([])
   const [health, setHealth] = useState<HealthStatus | null>(null)
   const [paper, setPaper] = useState<PaperSummary | null>(null)
@@ -80,42 +110,56 @@ export default function StatusPanel({ onClose }: Props) {
   const [busy, setBusy] = useState(false)
   const [confirmKill, setConfirmKill] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [tick, setTick] = useState(() => Date.now())
+  const status = riskRead.value
 
-  const load = useCallback(async () => {
-    try {
-      const [sRes, eRes, hRes, pRes] = await Promise.all([
-        fetch(`${BACKEND}/api/risk/status`),
-        fetch(`${BACKEND}/api/risk/events?days=30&limit=100`),
-        fetch(`${BACKEND}/api/admin/health`),
-        fetch(`${BACKEND}/api/paper/summary?days=30`),
-      ])
-      if (sRes.ok) {
-        const j = (await sRes.json()) as RiskStatus
-        if (j.enabled !== false) setStatus(j)
-      }
-      if (eRes.ok) {
-        const j = await eRes.json()
-        setEvents(j.events ?? [])
-      }
-      if (hRes.ok) {
-        const j = (await hRes.json()) as HealthStatus
-        if (j.enabled !== false) setHealth(j)
-      }
-      if (pRes.ok) {
-        const j = (await pRes.json()) as PaperSummary
-        if (j.enabled !== false) setPaper(j)
-      }
-      setError(null)
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setLoading(false)
+  const load = useCallback(async (opts?: { force?: boolean }) => {
+    const settle = <T,>(pr: Promise<T>) => pr.then(v => ({ ok: true as const, v }))
+      .catch((e: unknown) => ({ ok: false as const, e }))
+    const asJson = async (path: string) => {
+      const r = await fetch(`${BACKEND}${path}`)
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.json()
     }
+    const [sRes, eRes, hRes, pRes, iRes] = await Promise.all([
+      settle(asJson('/api/risk/status')),
+      settle(asJson('/api/risk/events?days=30&limit=100')),
+      settle(asJson('/api/admin/health')),
+      settle(asJson('/api/paper/summary?days=30')),
+      // Mesmo cache/single-flight da Home: duas telas abertas = UM GET.
+      settle(api.executionIncidentsStatus(opts?.force ? { maxAgeMs: 0 } : undefined)),
+    ])
+    const now = Date.now()
+    const why = (e: unknown) => (e instanceof Error ? e.message : 'leitura falhou')
+    setRiskRead(prev => {
+      if (!sRes.ok) return { ...prev, state: 'ERROR', errorReason: why(sRes.e) }
+      const j = sRes.v as RiskStatus | null
+      if (!j || j.enabled === false) {
+        return { ...prev, state: 'ERROR', errorReason: 'risco desabilitado no backend' }
+      }
+      return { state: 'OK', value: j, lastOkAtMs: now, errorReason: null }
+    })
+    setP03Read(prev => {
+      if (!iRes.ok) return { ...prev, state: 'ERROR', errorReason: why(iRes.e) }
+      return { state: 'OK', value: iRes.v as ExecutionIncidentsStatus, lastOkAtMs: now, errorReason: null }
+    })
+    if (eRes.ok) setEvents(((eRes.v as { events?: RiskEvent[] })?.events) ?? [])
+    if (hRes.ok) {
+      const j = hRes.v as HealthStatus | null
+      if (j && j.enabled !== false) setHealth(j)
+    }
+    if (pRes.ok) {
+      const j = pRes.v as PaperSummary | null
+      if (j && j.enabled !== false) setPaper(j)
+    }
+    setError(sRes.ok ? null : why(sRes.e))
+    setLoading(false)
+    setTick(now)
   }, [])
 
   useEffect(() => {
-    load()
-    const id = setInterval(load, 15_000)
+    void load()
+    const id = setInterval(() => { void load() }, 15_000)
     return () => clearInterval(id)
   }, [load])
 
@@ -127,8 +171,8 @@ export default function StatusPanel({ onClose }: Props) {
       })
       if (res.ok) {
         const j = (await res.json()) as RiskStatus
-        setStatus(j)
-        await load()
+        setRiskRead({ state: 'OK', value: j, lastOkAtMs: Date.now(), errorReason: null })
+        await load({ force: true })
       }
     } catch (e) {
       setError(String(e))
@@ -138,16 +182,23 @@ export default function StatusPanel({ onClose }: Props) {
     }
   }
 
-  const paused = status?.trading_paused ?? false
-  const Icon = paused ? ShieldAlert : Shield
+  const paused = status?.trading_paused === true
+  // MESMA função pura da Home e do selo do header.
+  const opState = deriveOperationalState({
+    risk: riskRead, p03: p03Read, nowMs: tick, staleAfterMs: DEFAULT_STALE_AFTER_MS,
+  })
+  const p03 = p03View(p03Read, tick, DEFAULT_STALE_AFTER_MS)
+  const riskQuality = readingQuality(riskRead, tick, DEFAULT_STALE_AFTER_MS)
+  const p03Quality = readingQuality(p03Read, tick, DEFAULT_STALE_AFTER_MS)
+  const Icon = opState.blocked ? ShieldAlert : Shield
 
-  // % rumo ao limite (0 = OK, 100 = bateu)
-  const dailyPct = status
-    ? Math.max(0, Math.min(100, (status.daily_dd_pct / status.daily_limit_pct) * 100))
-    : 0
-  const weeklyPct = status
-    ? Math.max(0, Math.min(100, (status.weekly_dd_pct / status.weekly_limit_pct) * 100))
-    : 0
+  // % rumo ao limite (0 = OK, 100 = bateu). Sem leitura, a barra não existe.
+  const pctToLimit = (dd: number | null, lim: number | null) =>
+    dd != null && lim != null && lim !== 0
+      ? Math.max(0, Math.min(100, (dd / lim) * 100))
+      : 0
+  const dailyPct = pctToLimit(finiteNumber(status?.daily_dd_pct), finiteNumber(status?.daily_limit_pct))
+  const weeklyPct = pctToLimit(finiteNumber(status?.weekly_dd_pct), finiteNumber(status?.weekly_limit_pct))
 
   const eventBadge = (t: RiskEvent['event_type']) => {
     if (t === 'auto_pause')
@@ -160,7 +211,7 @@ export default function StatusPanel({ onClose }: Props) {
   }
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-start justify-center p-2 sm:p-4 overflow-y-auto">
+    <div className="app-overlay fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-start justify-center p-2 sm:p-4 overflow-y-auto">
       <div className="w-full max-w-3xl bg-[#0a0e1a] border border-slate-700 rounded-xl my-4">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-slate-800">
@@ -189,35 +240,26 @@ export default function StatusPanel({ onClose }: Props) {
             </div>
           )}
 
+          {/* Estado operacional e incidentes aparecem SEMPRE que conhecidos —
+              inclusive sem leitura de risco (antes a seção toda desaparecia). */}
+          <OperationalStateCard state={opState} ageMs={riskQuality.ageMs}>
+            {paused && status?.paused_at && (
+              <p className="num mt-2 text-[11px] text-slate-500">
+                Pausa registrada desde {new Date(status.paused_at).toLocaleString('pt-BR')}
+              </p>
+            )}
+          </OperationalStateCard>
+          <P03IncidentCard view={p03} ageMs={p03Quality.ageMs} />
+
           {status && (
             <>
-              {/* Estado principal */}
-              <div
-                className={`p-3 rounded-lg border ${
-                  paused
-                    ? 'border-red-500/40 bg-red-500/10'
-                    : 'border-emerald-500/40 bg-emerald-500/10'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <Activity className={`w-4 h-4 ${paused ? 'text-red-300' : 'text-emerald-300'}`} />
-                  <span className={`text-sm font-bold ${paused ? 'text-red-200' : 'text-emerald-200'}`}>
-                    {paused ? 'TRADING PAUSADO' : 'TRADING ATIVO'}
-                  </span>
-                  {paused && status.pause_manual && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-500/20 text-orange-300 border border-orange-500/40">
-                      manual
-                    </span>
-                  )}
-                </div>
-                {paused && status.pause_reason && (
-                  <p className="mt-1 text-xs text-slate-300">{status.pause_reason}</p>
-                )}
-                {paused && status.paused_at && (
-                  <p className="mt-1 text-[10px] text-slate-500 font-mono">
-                    desde {new Date(status.paused_at).toLocaleString('pt-BR')}
-                  </p>
-                )}
+              <div className="flex items-center gap-2 text-[11px] text-slate-500">
+                <Activity className="w-3.5 h-3.5" />
+                <span className="break-words">
+                  Fontes: <span className="font-mono">/api/risk/status</span>
+                  {' e '}
+                  <span className="font-mono">/api/execution-incidents/status</span>
+                </span>
               </div>
 
               {/* Métricas DD */}
@@ -450,27 +492,31 @@ function DDCard({
   progress,
 }: {
   label: string
-  pct: number
-  limit: number
-  trades: number
+  pct: number | null | undefined
+  limit: number | null | undefined
+  trades: number | null | undefined
   progress: number
 }) {
-  const danger = progress >= 70
+  // Ausência NÃO é zero: valor desconhecido aparece como "não confirmado".
+  const value = typeof pct === 'number' && Number.isFinite(pct) ? pct : null
+  const lim = typeof limit === 'number' && Number.isFinite(limit) ? limit : null
+  const n = typeof trades === 'number' && Number.isFinite(trades) ? trades : null
+  const danger = value != null && progress >= 70
   const fill = danger ? 'bg-red-500' : progress >= 40 ? 'bg-amber-500' : 'bg-emerald-500'
   return (
     <div className="p-3 rounded-lg border border-slate-700 bg-slate-900/40">
-      <div className="flex justify-between items-baseline">
+      <div className="flex justify-between items-baseline gap-2">
         <span className="text-[11px] text-slate-400">{label}</span>
-        <span className={`text-sm font-mono font-bold ${danger ? 'text-red-300' : 'text-slate-200'}`}>
-          {pct.toFixed(2)}%
+        <span className={`num text-sm font-bold ${value == null ? 'text-slate-400' : danger ? 'text-red-300' : 'text-slate-200'}`}>
+          {value == null ? 'não confirmado' : `${value.toFixed(2)}%`}
         </span>
       </div>
       <div className="mt-1.5 h-1.5 rounded bg-slate-800 overflow-hidden">
-        <div className={`h-full ${fill} transition-all`} style={{ width: `${progress}%` }} />
+        <div className={`h-full ${fill} transition-all`} style={{ width: `${value == null ? 0 : progress}%` }} />
       </div>
-      <div className="flex justify-between mt-1.5 text-[10px] text-slate-500 font-mono">
-        <span>limite {limit}%</span>
-        <span>{trades} trades</span>
+      <div className="num flex justify-between gap-2 mt-1.5 text-[10px] text-slate-500">
+        <span>{lim == null ? 'limite não confirmado' : `limite ${lim}%`}</span>
+        <span>{n == null ? 'trades não confirmados' : `${n} trades`}</span>
       </div>
     </div>
   )

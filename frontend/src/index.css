@@ -42,3 +42,62 @@ html, body, #root {
 }
 .scrollbar-hide::-webkit-scrollbar { display: none; }
 .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* ─── Lote 04 · tokens de layout ───────────────────────────────────────────
+   Pequenos e reutilizáveis: espaçamento/raio/tipografia dos cartões e a
+   RESERVA da navegação (rail à esquerda no desktop, barra inferior no mobile,
+   que fica acima dos overlays). Sem framework novo, sem repintar a identidade.
+*/
+:root {
+  --nav-rail-w: 4rem;      /* 64px — largura do rail desktop */
+  --nav-bar-h: 3.5rem;     /* 56px — altura da barra mobile */
+  --card-radius: 1rem;
+  --card-pad: 1rem;
+}
+
+/* Raiz de QUALQUER overlay em tela cheia: nunca esconde conteúdo/ação sob a
+   navegação, e respeita a safe-area inferior do iPhone. */
+.app-overlay {
+  padding-bottom: calc(var(--nav-bar-h) + env(safe-area-inset-bottom, 0px));
+}
+@media (min-width: 1024px) {
+  .app-overlay {
+    padding-left: var(--nav-rail-w);
+    padding-bottom: 0;
+  }
+}
+
+/* Números sempre tabulares em métricas. */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* Rótulo de seção reutilizável (evita 9–10px em informação crítica). */
+.card-label {
+  font-size: 0.6875rem;      /* 11px — só rótulo, nunca número crítico */
+  line-height: 1rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+
+/* Foco visível e consistente em tudo que é clicável. */
+a:focus-visible,
+button:focus-visible,
+[tabindex]:focus-visible,
+summary:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+  border-radius: 0.375rem;
+}
+
+/* Respeita quem pediu menos animação. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .ticker-scroll { animation: none !important; }
+}

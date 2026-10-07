@@ -1,7 +1,16 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, RefreshCw } from 'lucide-react'
 import { api } from '../services/api'
+import type { ExecutionIncidentsStatus } from '../services/api'
 import type { RealTradeRow, Recommendation } from '../types'
+import {
+  deriveOperationalState, emptyReading, p03View, readingQuality,
+  DEFAULT_STALE_AFTER_MS, finiteNumber,
+  type SourceReading,
+} from '../lib/operationalState'
+import {
+  OperationalStateCard, P03IncidentCard, PositionsInventoryCard, SourceResultCard,
+} from './status/OperationalCards'
 
 const BACKEND = import.meta.env.VITE_API_URL ?? 'https://crypto-agente-production.up.railway.app'
 
@@ -125,10 +134,36 @@ function trackFrac(t: RealTradeRow, price: number | undefined): { price: number 
   }
 }
 
+
+/**
+ * Escape fecha o overlay e o foco volta para onde estava (a11y do Lote 04).
+ * Não mexe em polling, cache nem navegação: só teclado e foco.
+ */
+function useOverlayDismiss(onClose: () => void) {
+  useEffect(() => {
+    const anterior = document.activeElement as HTMLElement | null
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      if (anterior && typeof anterior.focus === 'function') anterior.focus()
+    }
+  }, [onClose])
+}
+
 export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpenTrades, onOpenStatus }: Props) {
-  const [risk, setRisk] = useState<RiskStatus | null>(null)
-  const [summary, setSummary] = useState<DailySummary | null>(null)
-  const [positions, setPositions] = useState<RealTradeRow[]>([])
+  useOverlayDismiss(onClose)
+  // Cada fonte carrega FATO + QUALIDADE + instante da última leitura boa.
+  // Antes, falha/ausência virava "Operando", zero ou lista vazia (Lote 04).
+  const [riskRead, setRiskRead] = useState<SourceReading<RiskStatus>>(emptyReading)
+  const [summaryRead, setSummaryRead] = useState<SourceReading<DailySummary>>(emptyReading)
+  const [positionsRead, setPositionsRead] = useState<SourceReading<RealTradeRow[]>>(emptyReading)
+  const [p03Read, setP03Read] = useState<SourceReading<ExecutionIncidentsStatus>>(emptyReading)
+  const risk = riskRead.value
+  const summary = summaryRead.value
+  const positions = positionsRead.value ?? []
   const [prices, setPrices] = useState<Map<string, number>>(new Map())
   const [recs, setRecs] = useState<Recommendation[]>([])
   const [paper, setPaper] = useState<PaperSummary | null>(null)
@@ -146,33 +181,82 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
     return () => clearInterval(id)
   }, [])
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (opts?: { force?: boolean }) => {
     if (firstLoad.current) setLoading(true)
     else setRefreshing(true)
-    // Cada fonte é best-effort: falha de uma não derruba a Home.
-    const settle = <T,>(p: Promise<T>) => p.then(v => v).catch(() => null)
+    // Cada fonte é best-effort: falha de uma não derruba a Home — mas falha
+    // também NÃO é sucesso: a qualidade de cada leitura é registrada abaixo.
+    const settle = <T,>(p: Promise<T>) => p.then(v => ({ ok: true as const, v }))
+      .catch((e: unknown) => ({ ok: false as const, e }))
+    const fetchJson = async (path: string) => {
+      const r = await fetch(`${BACKEND}${path}`)
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return r.json()
+    }
+    // Uma leitura do P03 por ciclo, pelo cache/single-flight compartilhado com
+    // o painel Sistema (sem timer novo, sem chamada por card).
+    const p03Promise = api.executionIncidentsStatus(
+      opts?.force ? { maxAgeMs: 0 } : undefined)
 
-    const [riskJson, dailyJson, tradesRes, recsRes, paperJson, healthJson, macroJson, regimeJson] = await Promise.all([
-      settle(fetch(`${BACKEND}/api/risk/status`).then(r => r.ok ? r.json() : null)),
-      settle(fetch(`${BACKEND}/api/daily-pnl?date=${todayUtc()}`).then(r => r.ok ? r.json() : null)),
-      settle(api.listRealTrades({ status: 'open', limit: 50 })),
-      settle(api.recommendations(6)),
-      settle(fetch(`${BACKEND}/api/paper/summary?days=30`).then(r => r.ok ? r.json() : null)),
-      settle(fetch(`${BACKEND}/api/admin/health`).then(r => r.ok ? r.json() : null)),
-      settle(api.macro('BTC/USDT:USDT')),
-      settle(fetch(`${BACKEND}/api/regime-status`).then(r => r.ok ? r.json() : null)),
-    ])
+    const [riskRes, dailyRes, tradesRes, recsRes, paperRes, healthRes, macroRes, regimeRes, p03Res] =
+      await Promise.all([
+        settle(fetchJson('/api/risk/status')),
+        settle(fetchJson(`/api/daily-pnl?date=${todayUtc()}`)),
+        settle(api.listRealTrades({ status: 'open', limit: 50 })),
+        settle(api.recommendations(6)),
+        settle(fetchJson('/api/paper/summary?days=30')),
+        settle(fetchJson('/api/admin/health')),
+        settle(api.macro('BTC/USDT:USDT')),
+        settle(fetchJson('/api/regime-status')),
+        settle(p03Promise),
+      ])
 
-    if (riskJson && riskJson.enabled !== false) setRisk(riskJson as RiskStatus)
-    if (regimeJson) setRegime(regimeJson as RegimeStatus)
-    if (dailyJson?.summary) setSummary(dailyJson.summary as DailySummary)
-    const openTrades = (tradesRes?.trades ?? []) as RealTradeRow[]
-    setPositions(openTrades)
-    if (recsRes?.recommendations) setRecs(recsRes.recommendations.slice(0, 3))
-    if (paperJson && paperJson.enabled !== false) setPaper(paperJson as PaperSummary)
-    if (healthJson && healthJson.enabled !== false) setHealth(healthJson as HealthStatus)
-    if (macroJson) setMacro(macroJson as MacroData)
+    const now = Date.now()
+    const reason = (e: unknown) => (e instanceof Error ? e.message : 'leitura falhou')
 
+    // Risco: `enabled === false` significa recurso desligado, não "sem pausa".
+    setRiskRead(prev => {
+      if (!riskRes.ok) return { ...prev, state: 'ERROR', errorReason: reason(riskRes.e) }
+      const json = riskRes.v as RiskStatus | null
+      if (!json || json.enabled === false) {
+        return { ...prev, state: 'ERROR', errorReason: 'risco desabilitado no backend' }
+      }
+      return { state: 'OK', value: json, lastOkAtMs: now, errorReason: null }
+    })
+    setP03Read(prev => {
+      if (!p03Res.ok) return { ...prev, state: 'ERROR', errorReason: reason(p03Res.e) }
+      return { state: 'OK', value: p03Res.v as ExecutionIncidentsStatus, lastOkAtMs: now, errorReason: null }
+    })
+    setSummaryRead(prev => {
+      if (!dailyRes.ok) return { ...prev, state: 'ERROR', errorReason: reason(dailyRes.e) }
+      const s = (dailyRes.v as { summary?: DailySummary } | null)?.summary ?? null
+      if (!s) return { ...prev, state: 'ERROR', errorReason: 'resposta sem resumo do dia' }
+      return { state: 'OK', value: s, lastOkAtMs: now, errorReason: null }
+    })
+    // Lista indisponível ≠ lista vazia: só um sucesso confirma o inventário.
+    setPositionsRead(prev => {
+      if (!tradesRes.ok) return { ...prev, state: 'ERROR', errorReason: reason(tradesRes.e) }
+      const rows = (tradesRes.v as { trades?: RealTradeRow[] } | null)?.trades
+      if (!Array.isArray(rows)) return { ...prev, state: 'ERROR', errorReason: 'resposta sem lista de trades' }
+      return { state: 'OK', value: rows, lastOkAtMs: now, errorReason: null }
+    })
+    if (regimeRes.ok && regimeRes.v) setRegime(regimeRes.v as RegimeStatus)
+    if (recsRes.ok && (recsRes.v as { recommendations?: Recommendation[] })?.recommendations) {
+      setRecs(((recsRes.v as { recommendations: Recommendation[] }).recommendations).slice(0, 3))
+    }
+    if (paperRes.ok) {
+      const p = paperRes.v as PaperSummary | null
+      if (p && p.enabled !== false) setPaper(p)
+    }
+    if (healthRes.ok) {
+      const h = healthRes.v as HealthStatus | null
+      if (h && h.enabled !== false) setHealth(h)
+    }
+    if (macroRes.ok && macroRes.v) setMacro(macroRes.v as MacroData)
+
+    const openTrades = (tradesRes.ok
+      ? ((tradesRes.v as { trades?: RealTradeRow[] })?.trades ?? [])
+      : []) as RealTradeRow[]
     if (openTrades.length > 0) {
       const pm = await fetchLivePrices(openTrades.map(t => t.symbol))
       if (pm.size > 0) setPrices(pm)
@@ -184,8 +268,8 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
   }, [])
 
   useEffect(() => {
-    load()
-    const id = setInterval(load, 20_000)
+    void load()
+    const id = setInterval(() => { void load() }, 20_000)
     return () => clearInterval(id)
   }, [load])
 
@@ -198,8 +282,10 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
       const res = await fetch(`${BACKEND}/api/risk/kill-switch?paused=false`, { method: 'POST' })
       if (res.ok) {
         const j = await res.json().catch(() => null)
-        if (j && j.enabled !== false) setRisk(j as RiskStatus)
-        await load()
+        if (j && j.enabled !== false) {
+          setRiskRead({ state: 'OK', value: j as RiskStatus, lastOkAtMs: Date.now(), errorReason: null })
+        }
+        await load({ force: true })
       } else {
         window.alert('Não consegui retomar agora. Tente pela tela de Risco.')
       }
@@ -210,16 +296,39 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
     }
   }, [load])
 
+  // ── Estado operacional: UMA função pura, compartilhada com header/Sistema.
+  //    `clock` entra como instante da leitura (sem relógio interno na função).
+  const nowMs = clock.getTime()
+  const opState = deriveOperationalState({
+    risk: riskRead, p03: p03Read, nowMs, staleAfterMs: DEFAULT_STALE_AFTER_MS,
+  })
+  const p03 = p03View(p03Read, nowMs, DEFAULT_STALE_AFTER_MS)
+  const riskQuality = readingQuality(riskRead, nowMs, DEFAULT_STALE_AFTER_MS)
+  const summaryQuality = readingQuality(summaryRead, nowMs, DEFAULT_STALE_AFTER_MS)
+  const positionsQuality = readingQuality(positionsRead, nowMs, DEFAULT_STALE_AFTER_MS)
+
   // Pausa de propriedade do P03 (incidente de execução aberto). Enquanto ela
   // durar, o kill switch NÃO retoma — o backend re-carimba a pausa — e o
   // auto-resume da virada de dia/semana também não dispara. Prometer retomada
   // automática aqui foi o que fez o operador clicar em "Retomar agora" por dias.
-  const p03Blocked = !!risk?.trading_paused && !risk?.pause_manual
-    && (risk?.pause_reason ?? '').startsWith('P03-QUARANTINE:')
+  const p03Blocked = opState.p03Owned
 
-  const totalR = summary?.total_r ?? 0
-  const pnlPct = summary?.total_pct_banca ?? null
-  const pnlPositive = totalR >= 0
+  // Resultado dos SETUPS (fonte: /api/daily-pnl). Ausência não vira zero.
+  const totalR = finiteNumber(summary?.total_r)
+  const pnlPct = finiteNumber(summary?.total_pct_banca)
+  const pnlPositive = totalR != null ? totalR >= 0 : null
+  const heroPrimary = pnlPct != null
+    ? `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}`
+    : totalR != null ? `${totalR >= 0 ? '+' : ''}${totalR.toFixed(2)}` : null
+  const heroUnit = pnlPct != null ? '% da banca (setups)' : totalR != null ? 'R' : null
+  const resolvedTrades = finiteNumber(summary?.total_trades)
+  const winRate = finiteNumber(summary?.win_rate_pct)
+  const botPositions = positionsQuality.missing
+    ? null
+    : positions.filter(t => String(t.source ?? '').toLowerCase() !== 'manual').length
+  const manualPositions = positionsQuality.missing
+    ? null
+    : positions.filter(t => String(t.source ?? '').toLowerCase() === 'manual').length
 
   // Split de direção das recomendações visíveis (long vs short)
   const recsLong = recs.filter(r => r.direction !== 'short').length
@@ -259,7 +368,7 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
   })()
 
   return (
-    <div className="fixed inset-0 z-50 bg-[#0a0e1a] text-white overflow-y-auto lg:pl-16 pb-16 lg:pb-4">
+    <div className="app-overlay fixed inset-0 z-50 bg-[#0a0e1a] text-white overflow-y-auto">
       <div className="max-w-[1180px] mx-auto p-4 sm:p-6">
 
         {/* Header */}
@@ -273,7 +382,7 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
           </div>
           <div className="flex items-center gap-3">
             <span className="text-xs text-slate-500 font-mono tabular-nums hidden sm:block">{clock.toLocaleTimeString('pt-BR')}</span>
-            <button onClick={load} className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400" title="Atualizar">
+            <button onClick={() => { void load({ force: true }) }} className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400" title="Atualizar" aria-label="Atualizar leituras">
               <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
             </button>
             <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400" title="Fechar">
@@ -289,29 +398,41 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
           </div>
         ) : (
           <>
-            {/* ── STATUS STRIP ── */}
+            {/* ── 1. O BOT PODE ENTRAR AGORA? (estado único e honesto) ── */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3.5 mb-4">
+              <OperationalStateCard
+                state={opState}
+                ageMs={riskQuality.ageMs}
+                onOpenDiagnosis={onOpenStatus}
+                diagnosisLabel={opState.blocked ? 'Ver diagnóstico do bloqueio' : 'Abrir risco & circuit breaker'}
+              />
+              <P03IncidentCard view={p03} ageMs={readingQuality(p03Read, nowMs, DEFAULT_STALE_AFTER_MS).ageMs} onOpenDiagnosis={onOpenStatus} />
+            </div>
+
+            {/* ── Travas de perda: ausência NÃO é zero drawdown ── */}
             <div className="flex flex-wrap items-center gap-x-5 gap-y-3 bg-[#0f1524] border border-slate-800 rounded-2xl px-4 py-3 mb-4">
-              <span className="inline-flex items-center gap-2 text-[12.5px] font-semibold">
-                <span className={`w-2.5 h-2.5 rounded-full ${risk?.trading_paused ? 'bg-red-500' : 'bg-green-500 animate-pulse'}`} />
-                {risk?.trading_paused ? 'Pausado' : 'Operando'}
-              </span>
-              <div className="w-px h-6 bg-slate-800 hidden sm:block" />
               {(['daily', 'weekly'] as const).map(k => {
                 // dd = P&L acumulado da janela COM SINAL (positivo = ganho,
                 // negativo = drawdown). A trava (lim) é negativa: -3% dia / -6% semana.
-                const dd = k === 'daily' ? (risk?.daily_dd_pct ?? 0) : (risk?.weekly_dd_pct ?? 0)
-                const lim = k === 'daily' ? (risk?.daily_limit_pct ?? -3) : (risk?.weekly_limit_pct ?? -6)
+                const dd = finiteNumber(k === 'daily' ? risk?.daily_dd_pct : risk?.weekly_dd_pct)
+                const lim = finiteNumber(k === 'daily' ? risk?.daily_limit_pct : risk?.weekly_limit_pct)
                 // Barra mede só o quão perto da trava, e SÓ quando há drawdown real.
-                const frac = lim < 0 && dd < 0 ? clamp01(dd / lim) * 100 : 0
+                const frac = dd != null && lim != null && lim < 0 && dd < 0 ? clamp01(dd / lim) * 100 : 0
                 const warn = frac >= 45
-                const gain = dd >= 0
+                const gain = dd != null && dd >= 0
                 return (
-                  <div key={k} className="flex flex-col gap-1 min-w-[150px] flex-1">
-                    <span className="flex justify-between text-[11px] text-slate-400">
-                      Resultado {k === 'daily' ? 'hoje' : 'semana'}
-                      <b className="tabular-nums">
-                        <span className={gain ? 'text-green-400' : 'text-red-400'}>{gain ? '+' : ''}{dd.toFixed(1)}%</span>
-                        <span className="text-slate-500 font-normal"> · trava {lim.toFixed(0)}%</span>
+                  <div key={k} className="flex flex-col gap-1 min-w-[170px] flex-1">
+                    <span className="flex flex-wrap justify-between gap-x-2 text-[11px] text-slate-400">
+                      Resultado {k === 'daily' ? 'hoje' : 'semana'} · risco
+                      <b className="num">
+                        {dd == null ? (
+                          <span className="text-slate-400 font-normal">não confirmado</span>
+                        ) : (
+                          <span className={gain ? 'text-emerald-300' : 'text-red-300'}>{gain ? '+' : ''}{dd.toFixed(1)}%</span>
+                        )}
+                        <span className="text-slate-500 font-normal">
+                          {lim == null ? ' · trava não confirmada' : ` · trava ${lim.toFixed(0)}%`}
+                        </span>
                       </b>
                     </span>
                     <span className="h-1.5 rounded-full bg-[#0b1220] border border-slate-800 overflow-hidden">
@@ -326,38 +447,33 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
               </button>
             </div>
 
-            {/* ── BANNER: TRADING PAUSADO (circuit breaker) ── */}
-            {risk?.trading_paused && (
+            {/* ── AÇÃO da pausa de risco ──
+                O ESTADO já é dito uma única vez no cartão acima (sem duplicar a
+                decisão). Esta faixa existe só para hospedar a ação EXISTENTE de
+                retomada — e some quando a pausa é do P03, onde retomar pela
+                interface contornaria o reconciliador. */}
+            {risk?.trading_paused === true && !p03Blocked && (
               <div className="flex flex-col sm:flex-row sm:items-center gap-3 bg-red-950/40 border border-red-500/40 rounded-2xl px-4 py-3 mb-4">
                 <div className="flex items-start gap-2.5 flex-1 min-w-0">
-                  <span className="text-lg leading-none mt-0.5">🛑</span>
-                  <div className="min-w-0">
-                    <div className="text-[13px] font-bold text-red-200">
-                      Trading pausado {risk.pause_manual ? '(manual)' : '(circuit breaker automático)'}
-                    </div>
-                    <div className="text-[11.5px] text-red-300/80 mt-0.5">
-                      {risk.pause_reason ?? 'Limite de drawdown atingido.'}
-                      {p03Blocked
-                        ? ' · Só destrava quando o incidente de execução encerrar: nem o botão, nem a virada de dia UTC retomam antes disso.'
-                        : (!risk.pause_manual && ' · Retoma sozinho na virada do dia UTC quando o DD recuperar.')}
-                    </div>
+                  <span aria-hidden="true" className="text-lg leading-none mt-0.5">🛑</span>
+                  <div className="min-w-0 text-[11.5px] text-red-200/90 leading-snug">
+                    {risk.pause_manual === true
+                      ? 'Pausa manual: só você pode retomar, e a confirmação continua obrigatória.'
+                      : 'Pausa automática por drawdown: retoma sozinha na virada do dia UTC quando o DD recuperar.'}
                   </div>
                 </div>
                 <button
-                  onClick={p03Blocked ? onOpenStatus : resumeTrading}
-                  disabled={resuming || (p03Blocked && !onOpenStatus)}
-                  title={p03Blocked
-                    ? 'Incidente de execução aberto: o backend recusa a retomada manual até ele encerrar.'
-                    : undefined}
+                  onClick={resumeTrading}
+                  disabled={resuming}
                   className="shrink-0 text-[12px] font-bold px-3.5 py-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 text-red-100 disabled:opacity-50"
                 >
-                  {p03Blocked ? 'Ver incidente' : (resuming ? 'Retomando…' : 'Retomar agora')}
+                  {resuming ? 'Retomando…' : 'Retomar agora'}
                 </button>
               </div>
             )}
 
             {/* ── BANNER: FREIO DE REGIME (trava de short / downgrade de long) ── */}
-            {!risk?.trading_paused && regimeBrake && regimeMsg && (
+            {risk?.trading_paused !== true && regimeBrake && regimeMsg && (
               <div className="flex items-start gap-2.5 bg-amber-950/30 border border-amber-500/30 rounded-2xl px-4 py-2.5 mb-4">
                 <span className="text-base leading-none mt-0.5">🧭</span>
                 <div className="min-w-0">
@@ -374,60 +490,96 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
             {/* ── BENTO GRID ── */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5">
 
-              {/* P&L HOJE */}
-              <div className="bg-[#0f1524] border border-slate-800 rounded-2xl p-4 lg:col-span-4">
-                <h2 className="text-[11.5px] uppercase tracking-wider text-slate-500 font-bold mb-3">💰 Resultado de hoje</h2>
-                <div className={`text-[34px] font-extrabold leading-none tabular-nums ${pnlPositive ? 'text-green-400' : 'text-red-400'}`}>
-                  {pnlPct != null ? `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%` : `${totalR >= 0 ? '+' : ''}${totalR.toFixed(2)} R`}
-                </div>
-                <div className="text-[12.5px] text-slate-400 mt-1.5">
-                  {totalR >= 0 ? '+' : ''}{totalR.toFixed(2)} R · {summary?.total_trades ?? 0} trades resolvidos
-                </div>
-                <div className="flex gap-2 mt-3.5">
-                  {[
-                    { n: summary?.wins ?? 0, k: 'Ganhos', cls: 'text-green-400' },
-                    { n: summary?.losses ?? 0, k: 'Perdas', cls: 'text-red-400' },
-                    { n: summary?.win_rate_pct != null ? `${summary.win_rate_pct.toFixed(0)}%` : '—', k: 'Win rate', cls: 'text-white' },
-                  ].map(c => (
-                    <div key={c.k} className="flex-1 bg-[#131b2e] border border-slate-800 rounded-xl py-2 text-center">
-                      <div className={`text-base font-bold tabular-nums ${c.cls}`}>{c.n}</div>
-                      <div className="text-[10px] text-slate-500 uppercase tracking-wide mt-0.5">{c.k}</div>
-                    </div>
-                  ))}
-                </div>
+              {/* RESULTADO DOS SETUPS (fonte: /api/daily-pnl) — NÃO é dinheiro
+                  realizado da conta. Janela/unidade explícitas; None ≠ zero. */}
+              <div className="lg:col-span-4">
+                <SourceResultCard
+                  source="SETUPS"
+                  window="hoje (UTC)"
+                  primary={heroPrimary}
+                  unit={heroUnit}
+                  secondary={
+                    resolvedTrades == null
+                      ? 'Trades resolvidos: não confirmado nesta leitura'
+                      : `${resolvedTrades} trade(s) resolvido(s)${totalR != null && pnlPct != null ? ` · ${totalR >= 0 ? '+' : ''}${totalR.toFixed(2)} R` : ''}`
+                  }
+                  quality={summaryQuality}
+                  positive={pnlPositive}
+                  note="Resultado dos SETUPS recomendados, não lucro líquido da conta. O contrato desta resposta não demonstra líquido confirmado (taxas/funding)."
+                  unavailableText="Resultado dos setups não disponível nesta leitura."
+                >
+                  <div className="flex gap-2 mt-3.5">
+                    {[
+                      { n: finiteNumber(summary?.wins), k: 'Ganhos', cls: 'text-emerald-300' },
+                      { n: finiteNumber(summary?.losses), k: 'Perdas', cls: 'text-red-300' },
+                      { n: winRate, k: 'Win rate', cls: 'text-slate-100', pct: true },
+                    ].map(c => (
+                      <div key={c.k} className="flex-1 bg-[#131b2e] border border-slate-800 rounded-xl py-2 text-center">
+                        <div className={`num text-base font-bold ${c.n == null ? 'text-slate-400' : c.cls}`}>
+                          {c.n == null ? '—' : c.pct ? `${c.n.toFixed(0)}%` : c.n}
+                        </div>
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wide mt-0.5">{c.k}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {(finiteNumber(summary?.wins) == null || winRate == null) && (
+                    <p className="mt-2 text-[11px] text-slate-500">Campos ausentes aparecem como “—”, não como zero.</p>
+                  )}
+                </SourceResultCard>
               </div>
 
-              {/* POSIÇÕES ABERTAS */}
-              <div className="bg-[#0f1524] border border-slate-800 rounded-2xl p-4 lg:col-span-8">
-                <h2 className="text-[11.5px] uppercase tracking-wider text-slate-500 font-bold mb-3 flex items-center gap-2">
-                  📡 Posições abertas · {positions.length}
-                  <button onClick={onOpenTrades} className="ml-auto text-cyan-400 text-[11px] normal-case tracking-normal font-semibold">gerenciar ›</button>
+              {/* POSIÇÕES ABERTAS — por ORIGEM, e lista indisponível ≠ vazia */}
+              <div className="lg:col-span-8 flex flex-col gap-3.5">
+                <PositionsInventoryCard
+                  quality={positionsQuality}
+                  botCount={botPositions}
+                  managedManualCount={manualPositions}
+                  onOpenTrades={onOpenTrades}
+                />
+                <div className="bg-[#0f1524] border border-slate-800 rounded-2xl p-4">
+                <h2 className="card-label text-slate-400 mb-3 flex items-center gap-2">
+                  Registros abertos no app
+                  <span className="num normal-case tracking-normal font-semibold text-slate-500">
+                    {positionsQuality.missing ? '· não confirmado' : `· ${positions.length}`}
+                  </span>
                 </h2>
-                {positions.length === 0 ? (
-                  <div className="py-8 text-center text-slate-600 text-sm">Nenhuma posição aberta agora.</div>
+                {positionsQuality.missing ? (
+                  <div className="py-8 text-center text-amber-200 text-sm">
+                    Não foi possível ler as posições nesta leitura.
+                  </div>
+                ) : positions.length === 0 ? (
+                  <div className="py-8 text-center text-slate-500 text-sm">
+                    Nenhum registro aberto no app (confirmado nesta leitura).
+                  </div>
                 ) : positions.slice(0, 5).map(t => {
                   const px = prices.get(toBinance(t.symbol))
                   const r = liveR(t, px)
                   const { price: pf, entry: ef } = trackFrac(t, px)
                   const isShort = String(t.side).toLowerCase() === 'short'
-                  const rPos = (r ?? 0) >= 0
+                  const rPos = r != null ? r >= 0 : null
+                  const isManual = String(t.source ?? '').toLowerCase() === 'manual'
                   return (
                     <div key={t.id} className="py-3 border-b border-slate-800/60 last:border-0 cursor-pointer" onClick={() => onSelectSymbol?.(t.symbol)}>
-                      <div className="flex items-center gap-2 mb-2">
+                      <div className="flex flex-wrap items-center gap-2 mb-2">
                         <span className="font-bold text-sm">{baseOf(t.symbol)}</span>
                         <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded uppercase ${isShort ? 'bg-red-500/15 text-red-300 border border-red-500/30' : 'bg-green-500/15 text-green-300 border border-green-500/30'}`}>
                           {isShort ? 'Short' : 'Long'}
                         </span>
+                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${isManual ? 'border-sky-500/40 text-sky-300' : 'border-slate-600 text-slate-300'}`}>
+                          {isManual ? 'manual (registro)' : 'bot'}
+                        </span>
                         {t.leverage != null && <span className="text-[10.5px] text-slate-500 border border-slate-700 rounded px-1.5 py-px">{t.leverage}×</span>}
                         {t.phase && <span className="text-[10px] text-slate-500">{t.phase === 'post_tp1' ? 'pós-TP1' : t.phase}</span>}
-                        <span className={`ml-auto font-bold tabular-nums text-sm ${rPos ? 'text-green-400' : 'text-red-400'}`}>
-                          {r != null ? `${r >= 0 ? '+' : ''}${r.toFixed(2)} R` : (t.pnl_pct != null ? `${t.pnl_pct >= 0 ? '+' : ''}${t.pnl_pct.toFixed(2)}%` : '—')}
+                        <span className={`num ml-auto font-bold text-sm ${rPos == null ? 'text-slate-400' : rPos ? 'text-emerald-300' : 'text-red-300'}`}>
+                          {r != null
+                            ? `${r >= 0 ? '+' : ''}${r.toFixed(2)} R indicativo`
+                            : (finiteNumber(t.pnl_pct) != null ? `${t.pnl_pct! >= 0 ? '+' : ''}${t.pnl_pct!.toFixed(2)}%` : '—')}
                         </span>
                       </div>
                       {/* trilho SL ── entrada ── preço ── TP */}
                       <div className="relative h-1.5 my-3.5 rounded-full bg-[#0b1220] border border-slate-800">
                         {pf != null && (
-                          <div className={`absolute inset-y-0 left-0 rounded-full ${rPos ? 'bg-gradient-to-r from-emerald-500/25 to-green-400' : 'bg-gradient-to-r from-red-500/25 to-red-400'}`} style={{ width: `${pf * 100}%` }} />
+                          <div className={`absolute inset-y-0 left-0 rounded-full ${rPos === false ? 'bg-gradient-to-r from-red-500/25 to-red-400' : 'bg-gradient-to-r from-emerald-500/25 to-green-400'}`} style={{ width: `${pf * 100}%` }} />
                         )}
                         <Marker frac={0} label={isShort ? 'TP' : 'SL'} color={isShort ? 'bg-green-400' : 'bg-red-400'} />
                         <Marker frac={ef} label="Entr." color="bg-slate-400" />
@@ -437,6 +589,7 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                     </div>
                   )
                 })}
+                </div>
               </div>
 
               {/* RECOMENDAÇÕES */}
@@ -455,7 +608,9 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                 {recs.length === 0 ? (
                   <div className="py-8 text-center text-slate-600 text-sm">Sem recomendações no momento.</div>
                 ) : recs.map(r => {
-                  const okVerdict = r.bot_verdict?.ok ?? true
+                  // Ausência de verdito NÃO é aprovação (antes: `?? true`).
+                  const okVerdict = typeof r.bot_verdict?.ok === 'boolean' ? r.bot_verdict.ok : null
+                  const verdictReason = r.bot_verdict?.reason ?? null
                   const isShort = r.direction === 'short'
                   const tierCls = r.tier === 'A+' ? 'bg-gradient-to-br from-green-500 to-green-700 text-[#04220f]'
                     : r.tier === 'A' ? 'bg-gradient-to-br from-blue-500 to-blue-800 text-blue-100'
@@ -468,18 +623,27 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                           <span className="font-bold text-sm">{baseOf(r.symbol)}</span>
                           <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded uppercase ${isShort ? 'bg-red-500/15 text-red-300' : 'bg-green-500/15 text-green-300'}`}>{isShort ? 'Short' : 'Long'}</span>
                         </div>
-                        <div className="text-[11px] text-slate-500 mt-0.5 truncate">
-                          R:R {r.risk_reward?.toFixed(1) ?? '—'}
-                          {r.prob_tp1 != null && ` · P(TP1) ${(r.prob_tp1 * 100).toFixed(0)}%`}
+                        <div className="num text-[11px] text-slate-500 mt-0.5 break-words">
+                          R:R {finiteNumber(r.risk_reward)?.toFixed(1) ?? '—'}
+                          {finiteNumber(r.prob_tp1) != null
+                            ? ` · P(TP1) ${(r.prob_tp1! * 100).toFixed(0)}% (modelo)`
+                            : ' · P(TP1) não disponível'}
                           {r.edge_tags && r.edge_tags.length > 0 && ` · ${r.edge_tags.slice(0, 2).join(', ')}`}
                         </div>
                       </div>
-                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${okVerdict ? 'bg-green-500/15 text-green-300' : 'bg-yellow-500/15 text-yellow-300'}`}>
-                        {okVerdict ? 'OK' : 'espera'}
+                      <span
+                        title={verdictReason ?? undefined}
+                        className={`text-[10px] font-bold px-2 py-0.5 rounded ${okVerdict === true ? 'bg-emerald-500/15 text-emerald-300' : okVerdict === false ? 'bg-amber-500/15 text-amber-200' : 'bg-slate-600/30 text-slate-300'}`}
+                      >
+                        {okVerdict === true ? 'elegível' : okVerdict === false ? 'em espera' : 'sem verdito'}
                       </span>
                     </div>
                   )
                 })}
+                <p className="mt-3 text-[11px] leading-snug text-slate-500">
+                  P(TP1) vem do modelo calibrado; evento, amostra e qualidade aparecem no painel
+                  Recomendados. Força/confluência do sinal não é probabilidade.
+                </p>
               </div>
 
               {/* MERCADO */}
@@ -492,7 +656,7 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                     </div>
                     <div>
                       <div className="font-bold text-[15px]">BTC {macro.btc_direction ?? '—'}</div>
-                      <div className="text-[11px] text-slate-500">{macro.btc_dominance != null ? `Dominância ${macro.btc_dominance.toFixed(1)}%` : 'sem dados'}</div>
+                      <div className="num text-[11px] text-slate-500">{finiteNumber(macro.btc_dominance) != null ? `Dominância ${macro.btc_dominance!.toFixed(1)}%` : 'dominância não disponível'}</div>
                     </div>
                   </div>
                 ) : <div className="text-sm text-slate-600">sem dados de mercado</div>}
@@ -509,24 +673,43 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                     <div className="font-bold text-[15px]">
                       {health?.status === 'healthy' ? 'Saudável' : health?.status === 'degraded' ? 'Degradado' : 'Desconhecido'}
                     </div>
-                    <div className="text-[11px] text-slate-500">
-                      {health?.gap_seconds != null ? `último tick há ${Math.round(health.gap_seconds)}s` : 'sem heartbeat'}
+                    <div className="num text-[11px] text-slate-500">
+                      {finiteNumber(health?.gap_seconds) != null
+                        ? `último tick há ${Math.round(health!.gap_seconds!)}s`
+                        : 'heartbeat não confirmado'}
                       {health?.last_source ? ` · ${health.last_source}` : ''}
                     </div>
                   </div>
                 </div>
+                <p className="mt-3 text-[11px] leading-snug text-slate-500">
+                  Heartbeat prova que o serviço está analisando. Não prova autorização de entrada,
+                  posição executada nem lucratividade.
+                </p>
               </div>
 
               {/* CURVA DE CAPITAL */}
               <div className="bg-[#0f1524] border border-slate-800 rounded-2xl p-4 lg:col-span-12">
-                <h2 className="text-[11.5px] uppercase tracking-wider text-slate-500 font-bold mb-3">📈 Curva de capital · 30 dias (paper)</h2>
+                <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 mb-3">
+                  <h2 className="card-label text-slate-400">Curva dos setups (paper) · não é dinheiro da conta</h2>
+                  <span className="rounded border border-slate-700 px-1.5 py-px text-[10.5px] text-slate-400">
+                    30 dias (resposta do backend)
+                  </span>
+                </div>
                 {sparkPath ? (
                   <>
-                    <div className="flex items-baseline gap-2.5 mb-1.5">
-                      <span className={`text-[13px] font-semibold ${(paper?.equity?.final_pnl_pct ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {(paper?.equity?.final_pnl_pct ?? 0) >= 0 ? '+' : ''}{(paper?.equity?.final_pnl_pct ?? 0).toFixed(2)}% no período
+                    <div className="flex flex-wrap items-baseline gap-2.5 mb-1.5">
+                      {finiteNumber(paper?.equity?.final_pnl_pct) != null ? (
+                        <span className={`num text-[13px] font-semibold ${paper!.equity.final_pnl_pct >= 0 ? 'text-emerald-300' : 'text-red-300'}`}>
+                          {paper!.equity.final_pnl_pct >= 0 ? '+' : ''}{paper!.equity.final_pnl_pct.toFixed(2)}% no período (paper)
+                        </span>
+                      ) : (
+                        <span className="text-[13px] text-slate-400">Resultado do período não confirmado</span>
+                      )}
+                      <span className="num text-[11px] text-slate-500">
+                        {finiteNumber(paper?.equity?.trades_total) != null
+                          ? `${paper!.equity.trades_total} trades de setup`
+                          : 'trades não confirmados'}
                       </span>
-                      <span className="text-[11px] text-slate-500">{paper?.equity?.trades_total ?? 0} trades</span>
                     </div>
                     <svg className="w-full h-[70px] block" viewBox="0 0 600 70" preserveAspectRatio="none">
                       <defs>
