@@ -55,6 +55,7 @@ async def get_research_status(days: int = 30) -> dict:
                          "reason_code": "DB_DISABLED"}
         result["lote_final"] = lote_final_summary(
             artifact=persisted.get("artifact"), manifest=persisted.get("manifest"),
+            report=persisted.get("report"),
             read_error=None if persisted.get("available") else persisted.get("reason_code"))
     except Exception:
         result["lote_final"] = {"state": "UNAVAILABLE", "promotable": False,
@@ -77,11 +78,45 @@ EVIDENCE_ERROR = "ERROR"
 EVIDENCE_BLOCKED = "BLOCKED_MISSING_DECISION"
 
 
-def evidence_status(*, artifact=None, manifest=None, read_error=None) -> dict:
+def acceptance_status(*, report=None, manifest=None, read_error=None, now_ms=None) -> dict:
+    """Separate acceptance from ArtifactV1 state; cheap persisted-record reads only."""
+    policy = {"available": False, "reason_code": "ACCEPTANCE_POLICY_UNAVAILABLE"}
+    record = {"available": False,
+              "state": "WAITING_PARAMETERS" if manifest is None else "NO_DATA",
+              "reason_code": "ACCEPTANCE_RECORD_MISSING", "record_hash": None,
+              "calibration_state": "UNAVAILABLE", "economics_state": "UNAVAILABLE"}
+    approved = False
+    try:
+        from services import research_acceptance_service as acceptance
+        policy = {"available": True, **acceptance.policy_manifest()}
+        if report is not None:
+            checked = acceptance.verify_acceptance(report, now_ms=now_ms, purpose="PROMOTION")
+            raw = report.get("acceptance") if isinstance(report, dict) else None
+            record = {"available": isinstance(raw, dict),
+                      "state": checked.get("state", "UNACCEPTED"),
+                      "reason_code": checked.get("reason_code"),
+                      "record_hash": checked.get("record_hash"),
+                      "calibration_state": checked.get("calibration_state", "UNAVAILABLE"),
+                      "economics_state": checked.get("economics_state", "UNAVAILABLE"),
+                      "valid_until_ms": checked.get("valid_until_ms"),
+                      "verified": checked.get("ok") is True}
+            approved = checked.get("ok") is True and checked.get("economics_state") == "ACCEPTED"
+        if read_error:
+            record.update(state="ERROR", reason_code=read_error, verified=False)
+            approved = False
+    except Exception:
+        record.update(state="ERROR", reason_code="ACCEPTANCE_READ_UNAVAILABLE", verified=False)
+    return {"policy": policy, "record": record, "economically_approved": approved,
+            "live_approved": False, "computed_in_request": False,
+            "expensive_work_in_get": False}
+
+
+def evidence_status(*, artifact=None, manifest=None, report=None, read_error=None) -> dict:
     """Evidência DERIVADA do que existe de fato, com qualidade e último instante.
 
     A simulação prospectiva vem da cobertura/coleta REGISTRADA pelo coletor; a
-    validação econômica, do estado do artefato de calibração (quando houver); a
+    avaliação OOS, do estado do artefato de calibração (quando houver); o aceite
+    econômico, do registro separado vinculado ao estudo, nunca de OOS_VALIDATED; a
     aprovação humana, do manifesto autorizado. Leitura indisponível vira
     `ERROR`, nunca `NOT_STARTED`.
     """
@@ -165,11 +200,14 @@ def evidence_status(*, artifact=None, manifest=None, read_error=None) -> dict:
                   "last_observed_at": None,
                   "reason_code": "MANIFEST_READ_UNAVAILABLE"}
 
+    acceptance = acceptance_status(report=report, manifest=manifest, read_error=read_error)
+    economica["economically_approved"] = acceptance["economically_approved"]
     return {
         "derived": True, "computed_in_request": False,
         "expensive_work_in_get": False,
         "prospective_simulation": prospectiva,
         "economic_validation": economica,
+        "research_acceptance": acceptance,
         "human_approval": humana,
         "canary": {"state": "NOT_PREPARED_FOR_APPLY", "quality": "UNKNOWN",
                    "last_observed_at": None,
@@ -185,7 +223,7 @@ def _safe(label: str, loader) -> dict:
         return {"state": "UNAVAILABLE", "reason_code": f"{label}_MANIFEST_UNAVAILABLE"}
 
 
-def lote_final_summary(*, artifact=None, manifest=None, read_error=None) -> dict:
+def lote_final_summary(*, artifact=None, manifest=None, report=None, read_error=None) -> dict:
     """Versões, modo, cobertura, bloqueios, evidência e próximo passo.
 
     Nada aqui muda o significado de "bot opera": candidato em simulação não é
@@ -264,7 +302,7 @@ def lote_final_summary(*, artifact=None, manifest=None, read_error=None) -> dict
         "promotable": False,
         "live_approval": "UNAVAILABLE",
         "bot_operation_meaning_unchanged": True,
-        "evidence": evidence_status(artifact=artifact, manifest=manifest, read_error=read_error),
+        "evidence": evidence_status(artifact=artifact, manifest=manifest, report=report, read_error=read_error),
         "blockers": ["Sem coleta prospectiva, não há evidência econômica.",
                      "Aprovação humana e canário continuam pendentes."],
         "next_step": ("Ligar a coleta pré-seleção em simulação e acumular a amostra "

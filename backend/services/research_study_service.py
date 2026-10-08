@@ -18,6 +18,13 @@ PRICE_CONTRACT = "R13_OFFLINE_PRICE_WINDOW_V1"
 PAYLOAD_KIND = "LOTE02_REGISTERED_STUDY"
 CALIBRATION_REQUEST = "R13_CALIBRATION_REQUEST_V1"
 FOLDS = 4
+# A calibração mantém quatro dobras. O IC econômico existente exige pelo
+# menos cinco deltas (block_size=5): seis dobras fixas evitam um IC impossível,
+# sem reduzir tamanho do bloco, amostra, purga ou embargo para obter vencedor.
+WF_FOLDS = 6
+WF_BLOCK_SIZE = 5
+WF_BOOTSTRAP_SAMPLES = 500
+OFFLINE_OBSERVATION = "R13_OFFLINE_SIMULATED_OBSERVATION_V1"
 
 
 def digest(value):
@@ -186,7 +193,8 @@ def calibration_request(*, event, valid_for_ms):
     return {**body, "request_hash": digest(body)}
 
 
-def _calibrate(rows, results, manifest, *, request, dataset_hash, price_hash, now_ms):
+def _calibrate(rows, results, manifest, *, request, dataset_hash, price_hash, now_ms,
+               population_rows=None, export_counts=None):
     from services import score_v3_calibration_service as calib
     from services import score_v3_service as score
     if request is None:
@@ -201,27 +209,43 @@ def _calibrate(rows, results, manifest, *, request, dataset_hash, price_hash, no
     playbook = manifest["candidate"]["selection_rule"]["playbook"]
     fingerprint = score.model_fingerprint(playbook=playbook, config=cfg)
     event = request["event"]
-    labels, excluded = [], {}
+    scored, label_cache, excluded = [], {}, {}
     for row in rows:
-        result = results.get(row["opportunity_key"], {})
         payload = score.score(row.get("features") or {}, playbook=playbook, side=row["side"], config=cfg)
+        scored.append((row, payload))
+
+    def observation(row, payload):
+        # O cache evita contar uma mesma exclusão em cada dobra. Os labels
+        # OOS só são abertos DEPOIS de congelar suas previsões abaixo.
+        key = row["opportunity_key"]
+        if key in label_cache:
+            return label_cache[key]
+        label_cache[key] = None
+        result = results.get(key, {})
         net, available = _number(result.get("net_r")), _integer(result.get("result_available_ts_ms"))
-        if payload["state"] != score.STATE_OK or available is None or net is None or not result.get("filled"):
+        if payload["state"] != score.STATE_OK or available is None or net is None or result.get("filled") is not True:
             reason = "SCORE_OR_LABEL_UNAVAILABLE"
             excluded[reason] = excluded.get(reason, 0) + 1
-            continue
-        tp2 = any(x["reason"] == "TP2" for x in result["exits"])
-        label = result["tp1_hit"] if event == calib.EVENT_TP1 else tp2 if event == calib.EVENT_TP2 else net > 0
+            return None
+        tp2 = any(isinstance(x, Mapping) and x.get("reason") == "TP2" for x in result.get("exits", ()))
+        label = result.get("tp1_hit") if event == calib.EVENT_TP1 else tp2 if event == calib.EVENT_TP2 else net > 0
+        if type(label) is not bool:
+            excluded["EVENT_LABEL_INVALID"] = excluded.get("EVENT_LABEL_INVALID", 0) + 1
+            return None
         # Horizonte sem alvo/stop não é uma perda provada de TP1/TP2. O
         # evento líquido tem resultado terminal; os eventos de toque censuram.
         if event != calib.EVENT_NET_POSITIVE and not label and result.get("status") in (
                 "CLOSED_TIME_STOP", "CLOSED_MAX_HOLD"):
             excluded["TARGET_EVENT_CENSORED_AT_HORIZON"] = excluded.get("TARGET_EVENT_CENSORED_AT_HORIZON", 0) + 1
-            continue
-        labels.append({"opportunity_key": row["opportunity_key"], "score": payload["score"],
-                       "decision_ts_ms": row["decision_ts_ms"], "label_available_ts_ms": available,
-                       "event": event, "label": bool(label), "net_r": net})
+            return None
+        label_cache[key] = {"opportunity_key": key, "score": payload["score"],
+            "decision_ts_ms": row["decision_ts_ms"], "label_available_ts_ms": available,
+            "event": event, "label": label, "net_r": net}
+        return label_cache[key]
     split, config = manifest["split"], manifest["candidate"]["management_config"]
+    # O índice oficial é congelado sem outcomes. Exclusões simétricas da
+    # seleção, labels ausentes e censuras continuam no denominador OOS.
+    population_rows = rows if population_rows is None else population_rows
     start, stop = split["validation_start_ms"], min(split["holdout_start_ms"], split["as_of_ms"])
     width = (stop - start) // FOLDS
     if width <= 0:
@@ -232,8 +256,19 @@ def _calibrate(rows, results, manifest, *, request, dataset_hash, price_hash, no
     for idx in range(FOLDS):
         lo, hi = start + idx * width, stop if idx == FOLDS - 1 else start + (idx + 1) * width
         cutoff = lo - (split["purge_bars"] + split["embargo_bars"]) * config["bar_ms"]
-        train = [r for r in labels if r["decision_ts_ms"] < cutoff and r["label_available_ts_ms"] <= cutoff]
-        oos = [r for r in labels if lo <= r["decision_ts_ms"] < hi and r["label_available_ts_ms"] <= min(hi, now_ms)]
+        train = []
+        for row, payload in scored:
+            available = _integer(results.get(row["opportunity_key"], {}).get("result_available_ts_ms"))
+            if row["decision_ts_ms"] < cutoff and available is not None and available <= cutoff:
+                label = observation(row, payload)
+                if label is not None:
+                    train.append(label)
+        eligible_count = sum(lo <= r["decision_ts_ms"] < hi for r in population_rows)
+        usable_train = calib.prepare_observations(train, cutoff_ms=cutoff, event=event,
+            horizon_ms=(config["entry_window_bars"] + config["max_holding_bars"] - 1) * config["bar_ms"],
+            bar_ms=config["bar_ms"])["rows"]
+        constant = (sum(r["label"] is True for r in usable_train) / len(usable_train)
+                    if usable_train else None)
         fitted = calib.fit_calibration(train, event=event, population=cfg.population,
             model_fingerprint=fingerprint, score_config_hash=fingerprint,
             horizon_bars=config["entry_window_bars"] + config["max_holding_bars"] - 1,
@@ -243,12 +278,45 @@ def _calibrate(rows, results, manifest, *, request, dataset_hash, price_hash, no
             cutoff_ms=cutoff, generated_at_ms=now_ms, valid_until_ms=now_ms + request["valid_for_ms"],
             versions={"study": STUDY_VERSION, "manifest": manifest["manifest_hash"],
                       "prices": price_hash, "costs": costs_hash})
+        # A previsão é emitida pelo ajuste da PRÓPRIA dobra, antes da
+        # avaliação OOS. O último artefato não substitui quatro previsões.
+        predictions, acceptance_rows = {}, []
+        if fitted.get("ok") and constant is not None:
+            for row, payload in scored:
+                if lo <= row["decision_ts_ms"] < hi and payload["state"] == score.STATE_OK:
+                    prediction = calib.predict(fitted["artifact"], score=payload["score"], now_ms=now_ms)
+                    if prediction.get("available"):
+                        predictions[row["opportunity_key"]] = prediction
+        oos = []
+        for row, payload in scored:
+            available = _integer(results.get(row["opportunity_key"], {}).get("result_available_ts_ms"))
+            if lo <= row["decision_ts_ms"] < hi and available is not None and available <= min(hi, now_ms):
+                label = observation(row, payload)
+                if label is not None:
+                    oos.append(label)
+        if predictions:
+            prepared_oos = calib.prepare_observations(oos, cutoff_ms=min(hi, now_ms), event=event,
+                horizon_ms=(config["entry_window_bars"] + config["max_holding_bars"] - 1) * config["bar_ms"],
+                bar_ms=config["bar_ms"])["rows"]
+            train_keys = set(fitted["artifact"]["training"]["opportunity_keys"])
+            for row in prepared_oos:
+                if row["opportunity_key"] in train_keys or row["decision_ts_ms"] <= cutoff:
+                    continue
+                prediction = predictions.get(row["opportunity_key"])
+                if prediction is None:
+                    continue
+                acceptance_rows.append({"opportunity_key": row["opportunity_key"],
+                    "score": row["score"], "label": row["label"],
+                    "prediction": prediction["probability"], "constant_prediction": constant,
+                    "bin": prediction["bin"], "decision_ts_ms": row["decision_ts_ms"],
+                    "label_available_ts_ms": row["label_available_ts_ms"]})
         validation = calib.validate_out_of_sample(fitted["artifact"], oos, now_ms=now_ms) if fitted.get("ok") else fitted
         artifact = validation.get("artifact") or fitted.get("artifact")
         folds.append({"fold": idx, "train_cutoff_ms": cutoff, "oos_start_ms": lo, "oos_end_ms": hi,
                       "train_rows": len(train), "oos_rows": len(oos),
                       "state": validation.get("state"), "reason_code": validation.get("reason_code"),
-                      "artifact": artifact, "oos": validation.get("oos")})
+                      "artifact": artifact, "oos": validation.get("oos"),
+                      "acceptance_inputs": {"eligible_count": eligible_count, "oos_rows": acceptance_rows}})
         if validation.get("ok"):
             last = artifact
             # A amostra TP1/TP2 censura expirações; não representa o payoff
@@ -263,13 +331,191 @@ def _calibrate(rows, results, manifest, *, request, dataset_hash, price_hash, no
                 payoff_ev = score.net_ev_from_payoff(evidence=payoff_evidence,
                     management_hash=management_hash, dataset_hash=dataset_hash, costs_hash=costs_hash,
                     event=event, now_ms=now_ms)
+    # Preserva os diagnósticos globais V1, sem usar estes labels remanescentes
+    # em qualquer ajuste ou previsão já emitida.
+    for row, payload in scored:
+        observation(row, payload)
+    replay_rows = sum(start <= r["decision_ts_ms"] < stop for r in rows)
+    eligible = sum(f["acceptance_inputs"]["eligible_count"] for f in folds)
+    counts = export_counts if isinstance(export_counts, Mapping) else {}
+    exclusions = counts.get("excluded")
+    known_exclusions = (isinstance(exclusions, Mapping) and bool(exclusions)
+                        and all(type(n) is int and n >= 0 for n in exclusions.values()))
+    excluded_count = sum(exclusions.values()) if known_exclusions else None
+    purged = counts.get("purged")
+    exported = counts.get("exported") or {}
+    training_count, validation_count = counts.get("training_candidates"), counts.get("validation_candidates")
+    indexed = (training_count + validation_count if type(training_count) is int and training_count >= 0
+               and type(validation_count) is int and validation_count >= 0 else None)
+    # O export não fornece ids/tempos das exclusões anteriores às rows. Não
+    # inventamos a alocação por dobra nem um denominador limpo após essa perda.
+    denominator_complete = (excluded_count == 0 and type(purged) is int and purged == 0
+        and indexed == len(population_rows) and isinstance(exported, Mapping)
+        and all(type(exported.get(k)) is int and exported[k] >= 0 for k in ("training", "validation"))
+        and sum(exported[k] for k in ("training", "validation")) == len(population_rows))
     return {"state": last["state"] if last else "WAITING_DATA",
             "reason_code": calib.APPROVAL_DECISION_REQUIRED if last else calib.SAMPLE_INSUFFICIENT,
             "artifact": last, "folds": folds, "excluded": excluded,
             "payoff_evidence": payoff_evidence, "net_ev": payoff_ev,
             "net_ev_reason": "NET_POSITIVE_OOS_PAYOFF" if event == calib.EVENT_NET_POSITIVE else
                              "TARGET_EVENT_COHORT_NOT_FULL_MANAGEMENT_PAYOFF",
-            "request": request, "holdout_status": "SEALED", "economically_approved": False}
+            "request": request, "holdout_status": "SEALED", "economically_approved": False,
+            "acceptance_population": {"contract": "R13_ACCEPTANCE_POPULATION_V1",
+                "export_denominator_complete": denominator_complete,
+                "export_excluded_count": excluded_count, "export_purged_count": purged,
+                "export_indexed_count": indexed,
+                "eligible_count": eligible, "excluded_by_selection": eligible - replay_rows,
+                "replay_rows": replay_rows,
+                "fold_eligible_counts": [f["acceptance_inputs"]["eligible_count"] for f in folds],
+                "source_rows": len(population_rows),
+                "index": [{"opportunity_key": r["opportunity_key"],
+                           "decision_ts_ms": r["decision_ts_ms"]} for r in population_rows]}}
+
+
+def _offline_observation(candidate_rows, execution, prices, *, config, costs, _resolved_paths=None):
+    """Observação SIMULADA do caminho executado, nunca fidelidade runtime.
+
+    R10D não conserva a trilha de proteção. Recuperamos pelo MESMO R10A a
+    entrada efetiva e o instante registrados e conciliamos toda a resolução
+    antes de usar o verificador de trilha já existente. Isto não prova SL real.
+    """
+    from services import offline_replay_service as replay
+    from services import portfolio_replay_service as portfolio
+    from services import prospective_shadow_service as prospective
+    inputs = {r["opportunity_key"]: r for r in candidate_rows}
+    trades = execution.get("trades") or []
+    observed_keys, seen = set(), set()
+    duplicated = resolution_failures = economics_failures = 0
+    applicable_protection = observed_protection = pending = 0
+    observations, protection_reasons = [], {}
+    for trade in trades:
+        key = trade.get("opportunity_id")
+        duplicate = key in seen
+        duplicated += int(duplicate)
+        seen.add(key)
+        identity_ok = (key in inputs and not duplicate and type(trade.get("admitted")) is bool
+                       and trade.get("reason_code") in portfolio.REASON_CODES)
+        record = {"opportunity_key": key, "trade": trade, "identity_valid": identity_ok}
+        observations.append(record)
+        if not identity_ok:
+            resolution_failures += 1
+            continue
+        observed_keys.add(key)
+        if trade["admitted"] is not True:
+            continue
+        applicable_protection += 1
+        row = inputs[key]
+        result, matches = {}, False
+        try:
+            entry, effective = _number(trade.get("entry_fill_price")), _integer(trade.get("effective_ts_ms"))
+            if entry is None or effective is None:
+                raise ValueError("effective fill missing")
+            if _resolved_paths is None:
+                opportunity = replay.Opportunity(opportunity_id=key, symbol=row["symbol"], direction=row["side"],
+                    decision_ts_ms=effective, entry=entry, stop_loss=row["stop_loss"],
+                    tp1=row["tp1"], tp2=row["tp2"], atr=row.get("atr"))
+                first = ((effective + config.bar_ms - 1) // config.bar_ms) * config.bar_ms
+                bars = tuple(replay.Candle(**b) for b in prices["windows"][key] if b["timestamp_ms"] >= first)
+                result = replay.replay_opportunity(opportunity, bars, config, costs)
+            else:
+                # Validação de leitura só reconcilia os caminhos registrados;
+                # não reabre preços nem executa replay no GET.
+                result = _resolved_paths.get(key, {})
+            matches = (isinstance(result, Mapping) and result.get("schema_version") == replay.SCHEMA_VERSION
+                and result.get("config_hash") == config.manifest()["config_hash"]
+                and result.get("cost_config_hash") == costs.manifest()["config_hash"]
+                and result.get("opportunity_id") == key
+                and all(result.get(k) == trade.get(k) for k in
+                ("status", "net_r", "gross_r", "fee_r", "slippage_r", "funding_r",
+                 "exit_ts_ms", "result_available_ts_ms")))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            pass
+        record.update(resolution=result, resolution_reconciled=matches)
+        if not matches or result.get("status") not in replay.REPLAY_STATUSES:
+            resolution_failures += 1
+            continue
+        if result.get("status") in ("MISSING_OR_UNORDERED_BARS", "INSUFFICIENT_DATA", "AMBIGUOUS_ENTRY_BAR"):
+            resolution_failures += 1
+        if _number(result.get("net_r")) is None or _integer(result.get("result_available_ts_ms")) is None:
+            economics_failures += 1
+        frozen = {"opportunity_key": key, "setup": {"side": row["side"], "entry": entry,
+                  "stop_loss": row["stop_loss"]}, "replay_config": config.manifest(), "costs_config": costs.manifest()}
+        record["frozen"] = frozen
+        resolution = {**result, "replay_status": result.get("status")}
+        problem = prospective._protection_reconciled(result.get("protection"), frozen, resolution)
+        record["protection_reason"] = problem
+        if problem is not None:
+            protection_reasons[problem] = protection_reasons.get(problem, 0) + 1
+            continue
+        observed_protection += 1
+        protection = result["protection"]
+        pending += int(protection["pending_failures"] > 0 or protection["obligation_open_at_end"] is True)
+    applicable, observed = len(candidate_rows), len(observed_keys)
+    coverage = 100.0 * observed / applicable if applicable else None
+    protection_coverage = 100.0 * observed_protection / applicable_protection if applicable_protection else None
+    sufficient = coverage is not None and coverage >= 90.0
+    protection_sufficient = protection_coverage is not None and protection_coverage >= 90.0
+    measured = {"operational_applicable": applicable, "operational_observed": observed,
+        "operational_coverage_pct": coverage,
+        "operational_failures": resolution_failures + economics_failures if sufficient else None,
+        "resolution_failures": resolution_failures, "economics_failures": economics_failures,
+        "economic_duplicates": duplicated if sufficient else None,
+        "protection_scope": replay.PROTECTION_SOURCE, "protection_proves_real_sl": False,
+        "protection_applicable": applicable_protection, "protection_observed": observed_protection,
+        "protection_coverage_pct": protection_coverage,
+        "protection_pending": pending if protection_sufficient else None,
+        "unresolved_protection_failures": pending if protection_sufficient else None,
+        "protection_reasons": protection_reasons,
+        # A matriz R10D de dimensões modeladas NÃO é divergência observada.
+        "fidelity_discrepancy_pct": None, "fidelity_comparable": None,
+        "fidelity_denominator": None, "fidelity_divergences": None, "fidelity_coverage_pct": None,
+        "fidelity_gap_reason": prospective.FIDELITY_GAP_REASON}
+    return {"contract": OFFLINE_OBSERVATION, "source": "OFFICIAL_R10A_PORTFOLIO_PATH_RECONCILIATION",
+        "scope": "OFFLINE_REPLAY_SIMULATED", "live_equivalent": False, "proves_real_sl": False,
+        "failure_semantics": "SIMULATED_RESOLUTION_INVALID_OR_ECONOMICS_UNAVAILABLE",
+        "rows": observations, "measured": measured}
+
+
+def _validate_offline_observation(report):
+    """Resumo tem de reconciliar logs/trilhas registrados, sem replay ou I/O."""
+    from services import offline_replay_service as replay
+    proof = report["offline_observation"]
+    manifest = report["manifest"]
+    candidate_rows = ((report.get("selection") or {}).get("selected") or {}).get("candidate")
+    if candidate_rows is None:
+        return False
+    paths = {r["opportunity_key"]: r["resolution"] for r in proof["rows"] if "resolution" in r}
+    management = manifest["candidate"]["management_config"]
+    config = replay.ReplayConfig(**{k: v for k, v in management.items() if k != "config_hash"})
+    costs = replay.CostConfig(**{k: manifest["costs"]["config"][k] for k in
+                               ("fee_bps_per_side", "slippage_bps_per_side", "funding_bps_per_bar")})
+    expected = _offline_observation(candidate_rows, report["candidate_replay"], None,
+                                   config=config, costs=costs, _resolved_paths=paths)
+    evidence = report["study"]["evidence"]
+    if digest(proof) != digest(expected) or any(evidence.get(k) != v for k, v in expected["measured"].items()):
+        return False
+    source = evidence.get("source") or {}
+    return (source.get("observation_scope") == expected["scope"]
+            and source.get("observation_source") == expected["source"] and source.get("live_equivalent") is False)
+
+
+def _evaluation_protocol(manifest):
+    """Plano separado, fixado pelas fronteiras sem outcomes e antes do replay."""
+    from services import walk_forward_service as wf
+    split = manifest["split"]
+    stop = min(split["holdout_start_ms"], split["as_of_ms"])
+    economic_folds = WF_FOLDS if manifest["comparison_scope"] == "SELECTION_ONLY" else FOLDS
+    width = (stop - split["validation_start_ms"]) // economic_folds
+    folds = [wf.Fold(i, split["train_start_ms"],
+              split["validation_start_ms"] + i * width,
+              split["validation_start_ms"] + i * width,
+              stop if i == economic_folds - 1 else split["validation_start_ms"] + (i + 1) * width)
+             for i in range(economic_folds)]
+    return {"contract": "R13_OFFLINE_EVALUATION_PROTOCOL_V1", "calibration_folds": FOLDS,
+        "economic_folds": economic_folds,
+        "economic_bootstrap": {"seed": 7, "samples": WF_BOOTSTRAP_SAMPLES,
+                               "block_size": WF_BLOCK_SIZE, "alpha": wf.DEFAULT_ALPHA, "comparisons": 1},
+        "economic_fold_plan": [{f.name: getattr(fold, f.name) for f in fields(wf.Fold)} for fold in folds]}
 
 
 def run_study(*, manifest, dataset, export_manifest, prices=None, request=None, now_ms=None):
@@ -280,6 +526,7 @@ def run_study(*, manifest, dataset, export_manifest, prices=None, request=None, 
     from services import portfolio_replay_service as portfolio
     from services import preselection_experiment_service as catalog
     from services import walk_forward_service as wf
+    from services import research_acceptance_service as acceptance
     now_ms = int(time.time() * 1000) if now_ms is None else _integer(now_ms)
     if now_ms is None:
         return _blocked("STUDY_CLOCK_INVALID", state="INVALID")
@@ -320,6 +567,10 @@ def run_study(*, manifest, dataset, export_manifest, prices=None, request=None, 
                 "baseline": configs["baseline"].manifest(), "candidate": configs["candidate"].manifest(),
                 "costs": costs.manifest(), "split": manifest["split"]}
     study_key = digest(identity)
+    protocol = _evaluation_protocol(manifest)
+    split, bar = manifest["split"], configs["baseline"].bar_ms
+    stop = min(split["holdout_start_ms"], split["as_of_ms"])
+    folds = [wf.Fold(**definition) for definition in protocol["economic_fold_plan"]]
     executions = {s: portfolio.run_portfolio(selection.replay_candidates(sides[s]),
                     bars_by_id=price["windows"], quotes_by_id=price["quotes"],
                     replay_config=configs[s], costs=costs) for s in sides}
@@ -328,25 +579,25 @@ def run_study(*, manifest, dataset, export_manifest, prices=None, request=None, 
         return [{"opportunity_id": t["opportunity_id"], "decision_ts_ms": ts[t["opportunity_id"]],
                  "net_r": t["net_r"], "result_available_ts_ms": t["result_available_ts_ms"]}
                 for t in executions[side]["trades"] if t["admitted"]]
-    split, bar = manifest["split"], configs["baseline"].bar_ms
-    stop = min(split["holdout_start_ms"], split["as_of_ms"])
-    width = max(1, (stop - split["validation_start_ms"]) // FOLDS)
-    folds = [wf.Fold(i, split["train_start_ms"],
-              split["validation_start_ms"] + i * width,
-              split["validation_start_ms"] + i * width,
-              stop if i == FOLDS - 1 else split["validation_start_ms"] + (i + 1) * width)
-             for i in range(FOLDS)]
     study = wf.run_walk_forward(baseline=labels_of("baseline"), candidate=labels_of("candidate"),
                                folds=folds, bar_ms=bar, costs_complete=costs.manifest()["complete"],
                                horizon_bars=max(c.entry_window_bars + c.max_holding_bars - 1
                                                 for c in configs.values()) + split["purge_bars"],
                                embargo_bars=split["embargo_bars"],
-                               horizon_sufficient=True, seed=7)
+                               horizon_sufficient=True, **protocol["economic_bootstrap"])
     evidence = catalog.gate_evidence_from_study(replay=executions["candidate"], study=study,
         trades=[{**t, "playbook": manifest["candidate"]["selection_rule"].get("playbook")}
                 for t in executions["candidate"]["trades"]],
         enabled_playbooks=manifest["candidate"]["playbooks"], window_start_ms=split["train_start_ms"],
         window_end_ms=stop, essential_gaps=[] if authorized["real_study_allowed"] else ["TEST_ONLY_NOT_REAL_EVIDENCE"])
+    observation = None
+    if manifest["comparison_scope"] == rm.SCOPE_SELECTION:
+        observation = _offline_observation(sides["candidate"], executions["candidate"], price,
+                                           config=configs["candidate"], costs=costs)
+        evidence.update(observation["measured"])
+        evidence["coverage_pct"] = (100.0 * len(rows) / len(source["rows"]) if source["rows"] else None)
+        evidence["source"] = {**evidence["source"], "observation_scope": observation["scope"],
+                              "observation_source": observation["source"], "live_equivalent": False}
     gate = catalog.go_no_go(evidence)
     # Calibração é de setups: replay individual, não confunde exclusão da
     # carteira com um stop, e não usa ledger financeiro da conta.
@@ -361,7 +612,8 @@ def run_study(*, manifest, dataset, export_manifest, prices=None, request=None, 
         except (KeyError, TypeError, ValueError):
             results[row["opportunity_key"]] = {}
     calibration = (_calibrate(rows, results, manifest, request=request,
-                              dataset_hash=source["dataset_hash"], price_hash=price["price_hash"], now_ms=now_ms)
+                              dataset_hash=source["dataset_hash"], price_hash=price["price_hash"], now_ms=now_ms,
+                              population_rows=source["rows"], export_counts=export_manifest.get("counts"))
                    if manifest["comparison_scope"] == rm.SCOPE_SELECTION else
                    {"state": "NOT_REQUESTED", "artifact": None, "reason_code": "MANAGEMENT_SCOPE_NO_V3_FITTING"})
     extra = ({"research_manifest": manifest, "manifest_hash": manifest["manifest_hash"],
@@ -375,16 +627,21 @@ def run_study(*, manifest, dataset, export_manifest, prices=None, request=None, 
         bundle_hash=manifest["hashes"]["bundle_hash"], dataset_fingerprint=source["dataset_hash"], cutoff_ms=split["as_of_ms"], **extra)
     official_study = catalog.study_payload(contract=contract, evidence=evidence, gate=gate,
         study=study, replay=executions["candidate"], evidence_key=study_key)
-    return {"ok": True, "version": STUDY_VERSION, "kind": PAYLOAD_KIND, "study_key": study_key,
+    report = {"ok": True, "version": STUDY_VERSION, "kind": PAYLOAD_KIND, "study_key": study_key,
             "state": "LOCAL_OFFLINE_EXECUTED", "manifest": manifest, "identity": identity,
+            "evaluation_protocol": protocol,
             "selection": compared, "baseline_replay": executions["baseline"], "candidate_replay": executions["candidate"],
             "walk_forward": study, "gate": gate, "study": official_study, "calibration": calibration,
             "artifact": calibration.get("artifact"), "observed_at_ms": now_ms,
             "real_study_allowed": authorized["real_study_allowed"], "source_assurance": price["source_assurance"],
             "promotable": False, "live_changed": False, "holdout_status": "SEALED"}
+    if observation is not None:
+        report["offline_observation"] = observation
+    report["acceptance"] = acceptance.build_acceptance(report, now_ms=now_ms)
+    return report
 
 
-def validate_study_report(report, *, now_ms=None):
+def _validate_study_report_identity(report, *, now_ms=None):
     """Hash íntegro não autoriza trocar evento, gestão ou janela do artefato.
 
     Só reconfere o registro; não roda replay/fitting nem concede aprovação.
@@ -473,6 +730,43 @@ def validate_study_report(report, *, now_ms=None):
         return refusal
 
 
+def validate_study_report(report, *, now_ms=None):
+    """Compatibilidade V1 mais integridade aditiva, sem avaliar nem ajustar.
+
+    Um registro insuficiente/reprovado continua persistível. STRUCTURAL não
+    concede propósito PROMOTION/CANARY e não recalcula bootstrap no GET.
+    """
+    verdict = _validate_study_report_identity(report, now_ms=now_ms)
+    if not verdict.get("ok"):
+        return verdict
+    if "evaluation_protocol" in report and report["evaluation_protocol"] != _evaluation_protocol(report["manifest"]):
+        return {"ok": False, "reason_code": "STUDY_EVALUATION_PROTOCOL_INVALID"}
+    if "offline_observation" in report:
+        try:
+            if not _validate_offline_observation(report):
+                return {"ok": False, "reason_code": "STUDY_OFFLINE_OBSERVATION_INVALID"}
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            return {"ok": False, "reason_code": "STUDY_OFFLINE_OBSERVATION_INVALID"}
+    if "acceptance" not in report:
+        return {**verdict, "acceptance_state": "LEGACY_UNACCEPTED"}
+    from services import research_acceptance_service as acceptance
+    checked = acceptance.verify_acceptance(report, now_ms=now_ms, purpose="STRUCTURAL")
+    if not checked.get("ok"):
+        return {"ok": False, "reason_code": checked.get("reason_code") or "STUDY_ACCEPTANCE_INVALID"}
+    return {**verdict, "acceptance_state": report["acceptance"].get("state")}
+
+
+def _persisted_identity(stored, report, generation):
+    """Mesma chave não permite mudar prova, estado, tempo ou aceite."""
+    try:
+        identical = (isinstance(stored, Mapping) and stored.get("study_key") == report["study_key"]
+                     and digest(stored) == digest(report))
+    except (ValueError, TypeError, OverflowError):
+        identical = False
+    return {"published": False, "generation": generation,
+            "reason_code": "STUDY_UNCHANGED" if identical else "STUDY_IDENTITY_CONFLICT"}
+
+
 async def persist_study(session_factory, report):
     """Reusa CAS oficial; primeira evidência não é sobrescrita por reprocessamento."""
     from services import policy_state_service as state
@@ -481,6 +775,12 @@ async def persist_study(session_factory, report):
     verified = validate_study_report(report, now_ms=report.get("observed_at_ms"))
     if not verified["ok"]:
         return {"published": False, "reason_code": verified["reason_code"]}
+    if "acceptance" in report:
+        from services import research_acceptance_service as acceptance
+        checked = acceptance.verify_acceptance(report, now_ms=report.get("observed_at_ms"),
+                                               purpose="STRUCTURAL", recompute=True)
+        if not checked.get("ok"):
+            return {"published": False, "reason_code": checked.get("reason_code") or "STUDY_ACCEPTANCE_INVALID"}
     identity = {"experiment_key": "r13cal:" + report["study_key"][:32],
                 "universe_version": report["manifest"]["population"]["universe_version"], "population": "SHADOW"}
     read = await state.read_state(session_factory, **identity)
@@ -488,12 +788,37 @@ async def persist_study(session_factory, report):
         return {"published": False, "reason_code": read["reason_code"]}
     if read.get("found"):
         stored = (read["state"].get("payload") or {})
-        if stored.get("study_key") == report["study_key"]:
-            return {"published": False, "generation": read["state"]["generation"], "reason_code": "STUDY_UNCHANGED"}
-        return {"published": False, "reason_code": "STUDY_IDENTITY_CONFLICT"}
-    return await state.publish_generation(session_factory, **identity,
+        return _persisted_identity(stored, report, read["state"]["generation"])
+    published = await state.publish_generation(session_factory, **identity,
         expected_generation=0, period_key=str(report["identity"]["split"]["as_of_ms"]),
         evidence_key=report["study_key"], now_ms=report["observed_at_ms"], payload=dict(report))
+    if not published.get("published") and published.get("reason_code") in (
+            "GENERATION_STALE", "PERIOD_UNCHANGED", "EVIDENCE_UNCHANGED"):
+        # Outro processo pode ter publicado entre a leitura e o CAS. Relê a
+        # prova para distinguir repetição idêntica de drift concorrente.
+        current = await state.read_state(session_factory, **identity)
+        if not current.get("available"):
+            return {"published": False, "reason_code": current.get("reason_code")}
+        if current.get("found"):
+            return _persisted_identity(current["state"].get("payload"), report,
+                                       current["state"]["generation"])
+    return published
+
+
+def _acceptance_summary(report):
+    """Só projeta campos já persistidos: nenhum fit, métrica ou bootstrap."""
+    record = report.get("acceptance") if isinstance(report, Mapping) else None
+    if not isinstance(record, Mapping):
+        return {"state": "LEGACY_UNACCEPTED", "reason_code": "LEGACY_UNACCEPTED", "promotable": False,
+                "record_available": False}
+    fields = ("state", "reason_code", "reason_codes", "reasons", "policy_version", "policy_hash", "record_hash", "revoked",
+              "generated_at_ms", "valid_until_ms")
+    summary = {k: record[k] for k in fields if k in record}
+    for kind in ("calibration", "economics", "protection"):
+        child = record.get(kind)
+        if isinstance(child, Mapping):
+            summary[kind] = {k: child[k] for k in ("state", "reason_code", "reason_codes", "reasons") if k in child}
+    return {**summary, "promotable": False, "record_available": True}
 
 
 async def load_latest_study(session_factory, *, now_ms=None):
@@ -508,14 +833,20 @@ async def load_latest_study(session_factory, *, now_ms=None):
                 .order_by(PolicySimulationState.published_at_ms.desc(), PolicySimulationState.id.desc())
                 .limit(1))).scalar_one_or_none()
     except Exception:
-        return {"available": False, "reason_code": "CALIBRATION_STUDY_READ_ERROR", "artifact": None, "manifest": None}
+        return {"available": False, "reason_code": "CALIBRATION_STUDY_READ_ERROR", "artifact": None, "manifest": None,
+                "acceptance": {"state": "UNACCEPTED", "reason_code": "CALIBRATION_STUDY_READ_ERROR",
+                               "promotable": False, "record_available": False}}
     if row is None:
-        return {"available": True, "reason_code": "NO_CALIBRATION_STUDY", "artifact": None, "manifest": None}
+        return {"available": True, "reason_code": "NO_CALIBRATION_STUDY", "artifact": None, "manifest": None,
+                "acceptance": {"state": "UNACCEPTED", "reason_code": "NO_CALIBRATION_STUDY",
+                               "promotable": False, "record_available": False}}
     verified = validate_study_report(row, now_ms=now_ms)
     if not verified["ok"]:
-        return {"available": False, "reason_code": verified["reason_code"], "artifact": None, "manifest": None}
+        return {"available": False, "reason_code": verified["reason_code"], "artifact": None, "manifest": None,
+                "acceptance": _acceptance_summary(row)}
     manifest = row["manifest"]
     artifact = row.get("artifact")
     return {"available": True, "reason_code": row["calibration"].get("reason_code"),
             "artifact": artifact, "manifest": manifest, "study_key": row["study_key"],
-            "calibration_state": row["calibration"]["state"]}
+            "calibration_state": row["calibration"]["state"],
+            "acceptance": _acceptance_summary(row), "report": row}

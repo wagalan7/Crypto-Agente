@@ -707,10 +707,13 @@ class Isolation(unittest.TestCase):
         # para resolver a janela prospectiva já coletada pelo resolver oficial —
         # caminho de PESQUISA, sem executor; a asserção acima continua provando
         # que ele não chama o comparador.
+        # Aceite V3 valida CostConfig e fingerprints em memória. Não importa
+        # exportador, não executa replay nem chama o comparador na autoridade.
         self.assertEqual(sorted(users), ["decision_observation_service.py",
                                          "portfolio_replay_service.py",
                                          "preselection_experiment_service.py",
                                          "prospective_shadow_service.py",
+                                         "research_acceptance_service.py",
                                          "research_batch_service.py",
                                          "research_dataset_service.py",
                                          "research_study_service.py"])

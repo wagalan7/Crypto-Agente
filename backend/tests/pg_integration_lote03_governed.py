@@ -12,6 +12,12 @@ lógico e contexto persistido; aprovação ausente/revogada/vencida e revogaçã
 durante a espera ⇒ zero POST; duas conexões em aprovação×revogação e dois
 promotores; restart e filha `-mfb`; rollback com posição aberta; shadow
 sintético não satisfaz o requisito prospectivo; status não refaz trabalho.
+
+Pacote V3: export/replay/fitting oficiais produzem o aceite de calibração;
+anotações e forward replay oficiais são persistidos ANTES de preparar o corte
+prospectivo por register_bundle. Somente a identidade humana/source-mode da
+fixture é substituída explicitamente: manifesto e receipt continuam TEST_ONLY.
+Nenhum threshold, métrica, intervalo ou verificador de receipt é substituído.
 """
 import asyncio
 import copy
@@ -88,7 +94,7 @@ class _Captura(logging.Handler):
 _captura = _Captura(level=logging.DEBUG)
 for _nome in ("services.shadow_trade_service", "services.entry_intent_service",
               "services.binance_signed_service", "services.live_candidate_adapter_service",
-              "services.operational_governance_service"):
+              "services.operational_governance_service", "services.decision_observation_service"):
     _logger = logging.getLogger(_nome)
     _logger.addHandler(_captura)
     _logger.setLevel(logging.DEBUG)
@@ -139,10 +145,14 @@ async def run():
     from services import operational_governance_service as g
     from services import policy_state_service as ps
     from services import prospective_shadow_service as prospective
+    from services import research_acceptance_service as acceptance
+    from services import research_study_service as research
     from services import shadow_trade_service as sts
     from services import strategy_evidence_service as se
-    from tests.test_lote03_governance import (CHAMPION, approval_payload,
-                                              governance_fixture)
+    from tests.test_lote03_governance import CHAMPION, approval_payload
+    from tests.research_acceptance_fixture import accepted_calibration_report
+    from services import preselection_experiment_service as catalog
+    from services import research_dataset_service as ds
 
     await db.init_db()
     for _ in range(2):              # criação aditiva idempotente
@@ -153,7 +163,26 @@ async def run():
                                         EntryIntent.__table__])
     from models.recommendation_snapshot import RecommendationSnapshot
 
-    exp_fixture, report, bundle, now = governance_fixture()
+    report = accepted_calibration_report()
+    now = report["observed_at_ms"]
+    contract = report["study"]["contract"]
+    envelope = catalog.build_preselection_envelope(
+        replay_config=contract["candidate_config"], contract_hash=contract["contract_hash"],
+        selection_config=contract["selection_config"])
+    exp_fixture = SimpleNamespace(id=17, experiment_key="TEST_ONLY_V3_PG_GOVERNANCE",
+        candidate_config=envelope, candidate_hash=se.canonical_hash(envelope),
+        champion_hash=se.canonical_hash(contract["baseline_config"]),
+        dataset_fingerprint=contract["dataset_fingerprint"],
+        dataset_cutoff=ds.ms_datetime(contract["cutoff_ms"]),
+        offline_metrics={"study": copy.deepcopy(report["study"])}, shadow_metrics={},
+        decision={"previous_field": "preserved"}, status="OFFLINE_VALIDATED")
+    with patch.object(se, "discover_champion_config", return_value=CHAMPION):
+        bundle = g.build_bundle(exp_fixture, report, CHAMPION, now_ms=now)
+    check("v3_export_replay_fitting_oficiais_sem_aceite_economico_fabricado",
+          report["acceptance"]["calibration"]["state"] == "ACCEPTED"
+          and report["acceptance"]["economics"]["state"] != "ACCEPTED"
+          and report["real_study_allowed"] is False,
+          str(report["acceptance"]["economics"]["reason_codes"]))
     # População do manifesto é o UNIVERSO (None = escopo inteiro); o símbolo do
     # canário vem dos LIMITES aprovados, que a fixture declara explicitamente.
     SYMBOL = approval_payload(bundle, now)["limits"]["symbols"][0]
@@ -179,19 +208,6 @@ async def run():
         session.add(linha)
         await session.flush()
         exp_id = int(linha.id)
-        # O relatório de calibração vive no namespace de estado já existente.
-        await session.execute(text(
-            "INSERT INTO policy_simulation_state (state_key, experiment_key, "
-            "policy_version, universe_version, population, generation, payload, "
-            "created_at, updated_at) VALUES (:k, :ek, :pv, :uv, :pop, 0, "
-            "CAST(:payload AS jsonb), now(), now())"),
-            {"k": ps.state_key(experiment_key="r13cal:" + report["study_key"][:32],
-                               universe_version=bundle["manifest"]["population"]["universe_version"],
-                               population="SHADOW"),
-             "ek": "r13cal:" + report["study_key"][:32], "pv": ps.POLICY_VERSION,
-             "uv": bundle["manifest"]["population"]["universe_version"],
-             "pop": "SHADOW",
-             "payload": __import__("json").dumps(report)})
         # Estudo recuperável pelo loader oficial (mesma persistência do ciclo).
         await session.execute(text(
             "INSERT INTO policy_simulation_state (state_key, experiment_key, "
@@ -207,13 +223,26 @@ async def run():
              "payload": __import__("json").dumps(
                  {"study": exp_fixture.offline_metrics["study"]})})
         await session.commit()
+    publicado_study = await research.persist_study(db.get_session, report)
+    check("v3_report_publicado_pelo_persistidor_oficial",
+          publicado_study.get("published") is True, str(publicado_study))
     check("experimento_e_estudo_persistidos", exp_id > 0, str(exp_id))
+
+    class ClockMeta(type):
+        def __instancecheck__(cls, value):
+            return isinstance(value, datetime)
+
+    class ClockDateTime(datetime, metaclass=ClockMeta):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromtimestamp(now / 1000, tz or timezone.utc)
 
     base_patches = [
         patch.object(se, "discover_champion_config", return_value=CHAMPION),
         patch.object(g, "_ALLOW_TEST_APPROVALS", True),
-        patch.object(g.time, "time", return_value=now / 1000),
-        patch.object(prospective, "_now", return_value=now),
+        patch.object(g.time, "time", side_effect=lambda: now / 1000),
+        patch.object(prospective, "_now", side_effect=lambda: now),
+        patch.object(se, "datetime", ClockDateTime),
     ]
     for item in base_patches:
         item.start()
@@ -226,6 +255,7 @@ async def run():
     # então a identidade esperada é recalculada a partir da linha gravada.
     async with db.get_session() as session:
         exp_db = (await session.execute(select(E).where(E.id == exp_id))).scalar_one()
+        assert registro.get("ok") is True, (registro, research.validate_study_report(report, now_ms=now))
         bundle = g.build_bundle(exp_db, report, CHAMPION, now_ms=now)
     check("bundle_registrado_do_estudo_real", registro.get("ok") is True
           and registro["bundle_hash"] == bundle["bundle_hash"], str(registro))
@@ -244,9 +274,20 @@ async def run():
         (controle negativo). Nenhum dos dois amplia sizing.
         """
         payload = approval_payload(bundle, now, purpose)
+        async with db.get_session() as session:
+            exp_approval = (await session.execute(select(E).where(E.id == exp_id))).scalar_one()
+            receipt = g._op(exp_approval).get("acceptance") or {}
+        payload["validity"]["hash"] = g.approval_validity_hash(
+            bundle, purpose, receipt.get("record_hash"))
         payload["limits"]["symbols"] = list(symbols or [SYMBOL])
         payload["limits"]["max_risk_pct"] = max_risk_pct
         payload["limits"]["max_orders"] = max_orders
+        if purpose == "SHADOW":
+            # Coorte de20dias requer validade humana explícita nesse corte;
+            # janela SHADOW21dias < artefato30dias, nunca estende o teto.
+            payload["limits"]["expires_at_ms"] = min(
+                report["observed_at_ms"] + 21 * acceptance.DAY_MS,
+                bundle["calibration_artifact"]["generation"]["valid_until_ms"] - 1)
         payload["validity"]["id"] = f"TEST_ONLY:approval-{purpose}{etiqueta}"
         return await g.register_approval(db.get_session, exp_id, payload,
                                          operator="ADMIN_API_TOKEN", test_only=True)
@@ -297,20 +338,25 @@ async def run():
     # ── Evidência prospectiva: coorte vazia/sintética NÃO passa o gate ─────
     # Manifesto TEST_ONLY NUNCA é autoridade prospectiva — e o estudo offline
     # não é reaproveitado como se fossem trades novos.
-    avaliado = await se.evaluate_preselection_shadow(exp_id)
+    with patch.object(g, "_ALLOW_TEST_APPROVALS", False):
+        avaliado = await se.evaluate_preselection_shadow(exp_id)
     check("evaluate_pre_recusa_autoridade_test_only",
           avaliado.get("ok") is False
           and avaliado.get("reason_code") == "TEST_ONLY_NOT_PROSPECTIVE_AUTHORITY"
           and avaliado.get("offline_used") is False, str(avaliado)[:260])
 
-    # Opt-in de ENGENHARIA (declarado): a MESMA função real de resumo, sobre uma
-    # coorte prospectiva VAZIA. Prova a ligação; não prova autorização.
-    async def prospectiva_real_vazia(session, exp, *, now_ms=None):
-        return prospective.summarize_prospective([], started_at_ms=iniciado["prospective_started_at_ms"],
-            now_ms=now, enabled_playbooks=[bundle["manifest"]["candidate"]["selection_rule"]["playbook"]])
-
-    with patch.object(prospective, "load_prospective_evidence", prospectiva_real_vazia):
-        avaliado = await se.evaluate_preselection_shadow(exp_id)
+    # AÇÃO explícita oficial, corte VAZIO. Aceite insuficiente não cerca a
+    # geração de coleta SHADOW, nem reaproveita economia offline como runtime.
+    now += 1
+    corte_vazio = await g.register_bundle(db.get_session, exp_id, {
+        "confirm": True, "calibration_study_key": report["study_key"],
+        "champion_config": CHAMPION, "prospective_cutoff_ms": now,
+        "expected_generation": geracao}, operator="ADMIN_API_TOKEN")
+    check("corte_vazio_persistido_insuficiente_preserva_geracao_shadow",
+          corte_vazio.get("ok") is True
+          and corte_vazio.get("acceptance_state") != "ACCEPTED"
+          and corte_vazio.get("generation") == geracao, str(corte_vazio))
+    avaliado = await se.evaluate_preselection_shadow(exp_id)
     check("evaluate_pre_usa_coorte_prospectiva_e_nao_o_estudo_offline",
           avaliado.get("ok") is True and avaliado.get("offline_used") is False
           and avaliado.get("prospective_source") == prospective.REAL
@@ -320,7 +366,10 @@ async def run():
         medidas = (exp_row.shadow_metrics or {}).get("prospective") or {}
     check("metricas_ausentes_ficam_declaradas_e_nao_zero",
           medidas.get("offline_used") is False
-          and medidas.get("gate_verdict") == "NO_GO", str(medidas)[:220])
+          and medidas.get("gate_verdict") is None
+          and medidas.get("state") == "WAITING_ACCEPTANCE_RECORD"
+          and g._op(exp_row)["acceptance"]["prospective_evidence"]["evidence"]["net_ev_r"] is None,
+          str(medidas)[:220])
 
     # ── 2b. Cadeia prospectiva OFICIAL: decisão observacional (B) ─────────
     # O ciclo OFICIAL do scanner observa a candidata com aprovação SHADOW e a
@@ -368,8 +417,17 @@ async def run():
         shadow=bloco_shadow)
     with patch.dict(os.environ, {pre.MODE_ENV: pre.MODE_OBSERVE,
                                  "R13_OPERATIONAL_SELECTOR": "LEGACY"}):
+        timeouts_antes = obs._stats["flush_timeouts"]
         publicado = obs.observe_preselection([linha_pre])
         await obs.flush_pending()
+        if obs._stats["flush_timeouts"] > timeouts_antes:
+            # Telemetria comprova o timeout da fixture grande no Mac. Só o
+            # orçamento de execução do TESTE é ampliado; mesmo caller oficial,
+            # mesmos critérios, métricas e verificador. Não mede latência PRD.
+            print("  · Fixture PG: timeout1.5s observado; retry do caller oficial com orçamento30s")
+            with patch.object(obs, "FLUSH_TIMEOUT_S", 30):
+                obs.observe_preselection([linha_pre])
+                await obs.flush_pending()
     async with db.get_session() as session:
         gravadas = (await session.execute(select(O.frozen_config).where(
             O.scope == "PRE_SELECTION"))).scalars().all()
@@ -380,7 +438,8 @@ async def run():
           and com_shadow[0]["shadow_decision"]["scope"] == pre.SHADOW_DECISION_SCOPE
           and com_shadow[0]["shadow_decision"]["authority"]["purpose"] == "SHADOW"
           and com_shadow[0]["observed_decision_scope"] == "FINAL_SCANNER_SELECTION",
-          str(com_shadow)[:260] if com_shadow else str(payloads_pre)[:260])
+          str(com_shadow)[:260] if com_shadow else
+          f"published={publicado} group={str(grupo_shadow)[:200]} rows={payloads_pre} telemetry={obs._telemetry()}")
     check("autoridade_test_only_nao_cria_anotacao_prospectiva",
           all(prospective.KEY not in p for p in payloads_pre),
           str([list(p) for p in payloads_pre])[:200])
@@ -500,31 +559,168 @@ async def run():
           str(ann_sf["resolution"])[:200] + str(medidas_sf)[:200])
 
 
-    promocao_ap = await aprovar("PROMOTION")
-    check("aprovacao_promotion_e_separada_da_shadow",
-          promocao_ap.get("ok") is True
-          and promocao_ap["approval_id"] != shadow_ap["approval_id"],
-          str(promocao_ap))
+    promocao_sem_aceite = await aprovar("PROMOTION")
     geracao = (await g.get_status(db.get_session))["generation"]
     bloqueada = await se.promote_preselection(
-        exp_id, approval_id=promocao_ap["approval_id"],
+        exp_id, approval_id=shadow_ap["approval_id"],
         expected_generation=geracao, operator="ADMIN_API_TOKEN")
     check("promocao_sem_prova_prospectiva_e_bloqueada",
-          bloqueada.get("ok") is False
-          and bloqueada.get("reason_code") == "PROSPECTIVE_GO_NO_GO_NOT_PASSED"
-          and bloqueada.get("live_approval") == "UNAVAILABLE", str(bloqueada))
+          promocao_sem_aceite.get("ok") is False and bloqueada.get("ok") is False
+          and bloqueada.get("live_approval") == "UNAVAILABLE",
+          f"{promocao_sem_aceite} / {bloqueada}")
 
-    # Opt-in de ENGENHARIA, declarado: evidência prospectiva TEST_ONLY aprovada.
-    # Isto prova o CAMINHO, não a autorização operacional.
-    async def prospectiva_go(session, exp, *, now_ms=None):
-        return {"available": True, "source": prospective.REAL, "state": "GATE_PASSED",
-                "gate": {"verdict": "GO_CANDIDATE"}, "offline_used": False,
-                "fingerprint": "a" * 64, "test_only_engineering_opt_in": True}
+    # ── Pacote V3: produtor oficial → PG → corte/receipt oficial ─────────
+    # Fixture privada de ENGENHARIA: todos os preços, features e decisões são
+    # sintéticos. Somente source_mode é identificado como REAL_PROSPECTIVE para
+    # exercitar a cadeia técnica. O manifesto/receipt permanecem TEST_ONLY e
+    # o verificador real continua exigindo os mesmos números/critérios.
+    from services import score_trace_service as traces
+    from tests.test_lote03_candidate_adapter import FEATURES
+    trace_v3_pg = traces.freeze_trace({"version": traces.VERSION,
+        "formula_requested": "SCORE_V2", "formula_effective": "SCORE_V2",
+        "config": {**{k: 1.0 for k in traces.CONFIG_NUMBERS},
+            "high_tf_patterns_enabled": False, "high_tf_confirm_enabled": False}})
+    async with db.get_session() as session:
+        exp_forward = (await session.execute(select(E).where(E.id == exp_id))).scalar_one()
+        inicio_forward = copy.deepcopy(exp_forward.shadow_metrics[prospective.KEY])
+        contexto_forward = prospective.frozen_shadow_context(exp_forward,
+            **{k: inicio_forward[k] for k in ("generation", "approval_id", "started_at_ms")})
+    management = bundle["manifest"]["candidate"]["management_config"]
+    bar, annotations = management["bar_ms"], []
+    for index in range(120):
+        stamp = inicio_forward["started_at_ms"] + acceptance.DAY_MS + index * (18 * acceptance.DAY_MS // 120)
+        row = copy.deepcopy(row_eng)
+        row.update(opportunity_key=f"TEST_ONLY_V3_forward_{index:04d}",
+                   observed_at=ds.ms_datetime(stamp), score_trace=trace_v3_pg)
+        payload = row["frozen_config"]["r09_pre_selection"]
+        payload.update(identity=row["opportunity_key"], decision_ts_ms=stamp,
+            outcome="VETOED" if index % 8 == 0 else "ACCEPTED",
+            features=copy.deepcopy(FEATURES),
+            config={"formula_effective": "SCORE_V2", "score": trace_v3_pg["config"]},
+            feature_evidence={"quality": "FRESH", "observed_at_ms": stamp, "candle_close_ms": stamp})
+        setup = payload["setup"]
+        group = adapter.shadow_group_decision(shadow_auth_db,
+            [{**setup, "features": FEATURES}], now_ms=stamp)
+        payload["shadow_decision"] = pre._shadow_decision_view(
+            adapter.shadow_decision_for_timeframe(group["group"], setup["timeframe"]))
+        ann = prospective.build_preselection_annotation(row, contexto_forward)
+        check_raw = ann is not None and ann["resolution"]["net_r"] is None
+        assert check_raw, ann
+        ann["frozen"]["source_mode"] = prospective.REAL  # identidade privada TEST_ONLY; não métrica
+        ann["annotation_hash"] = prospective.digest(ann["frozen"])
+        payload[prospective.KEY] = ann
+        first = ((stamp + bar - 1) // bar) * bar
+        candles = [{"timestamp": first + i * bar, "open": 100., "high": 100.8,
+                    "low": 99.8, "close": 100.7, "volume": 100.}
+                   for i in range(management["max_bars"])]
+        # A PENDING é commitada antes do preço futuro; resolve_pending real
+        # recupera e atualiza a oportunidade na mesma trilha usada pelo scanner.
+        async with db.get_session() as session:
+            session.add(O(scope="PRE_SELECTION", opportunity_key=row["opportunity_key"],
+                identity_source="PRE_SELECTION_SETUP", symbol=setup["symbol"],
+                frozen_setup=copy.deepcopy(setup), frozen_config=copy.deepcopy(row["frozen_config"]),
+                first_decision=payload["outcome"], first_seen_at=row["observed_at"],
+                last_seen_at=row["observed_at"], first_decision_observed_at=row["observed_at"]))
+            await session.commit()
+        if index < 119:
+            async with db.get_session() as session:
+                await prospective.resolve_pending(session, {setup["symbol"]: {"candles": candles,
+                    "as_of": ds.ms_datetime(first + management["max_bars"] * bar)}})
+                await session.commit()
+        async with db.get_session() as session:
+            resolved_cfg = (await session.execute(select(O.frozen_config).where(
+                O.opportunity_key == row["opportunity_key"]))).scalar_one()
+        final = resolved_cfg["r09_pre_selection"][prospective.KEY]
+        if index < 119:
+            assert final["resolution"]["filled"] and final["resolution"]["net_r"] > .05, final
+        else:
+            assert final["resolution"]["status"] == "PENDING", final
+        annotations.append(final)
+    check("v3_120_anotacoes_oficiais_pg_119_resolvidas_uma_pendente",
+          len(annotations) == 120 and all(prospective.verify_annotation(a) for a in annotations)
+          and sum(a["resolution"]["status"] in prospective.TERMINAL for a in annotations) == 119
+          and all(a["frozen"]["source_mode"] == prospective.REAL for a in annotations))
+    now = inicio_forward["started_at_ms"] + 20 * acceptance.DAY_MS
+    prepare = {"confirm": True, "calibration_study_key": report["study_key"],
+        "champion_config": CHAMPION, "prospective_cutoff_ms": now,
+        "expected_generation": (await g.get_status(db.get_session))["generation"]}
+    relogio_corte = now
+    real_snapshot = prospective.build_acceptance_snapshot
 
-    with patch.object(prospective, "load_prospective_evidence", prospectiva_go):
-        promovido = await se.promote_preselection(
-            exp_id, approval_id=promocao_ap["approval_id"],
-            expected_generation=geracao, operator="ADMIN_API_TOKEN")
+    def expiry_during_preparation(inputs, bundle_value):
+        nonlocal now
+        result = real_snapshot(inputs, bundle_value)
+        now = report["observed_at_ms"] + 21 * acceptance.DAY_MS + 1
+        return result
+
+    try:
+        with patch.object(prospective, "build_acceptance_snapshot", expiry_during_preparation):
+            expirou_no_corte = await g.register_bundle(db.get_session, exp_id, prepare,
+                operator="ADMIN_API_TOKEN")
+    finally:
+        now = relogio_corte
+    check("v3_shadow_expira_durante_preparacao_sem_publicar_receipt",
+          not expirou_no_corte.get("ok")
+          and (await g.get_status(db.get_session))["generation"] == prepare["expected_generation"],
+          str(expirou_no_corte))
+    corte_a, corte_b = await asyncio.gather(
+        g.register_bundle(db.get_session, exp_id, prepare, operator="ADMIN_API_TOKEN"),
+        g.register_bundle(db.get_session, exp_id, copy.deepcopy(prepare), operator="ADMIN_API_TOKEN"))
+    efetivos_corte = [r for r in (corte_a, corte_b) if r.get("ok") and not r.get("idempotent")]
+    check("v3_preparacao_cas_duas_conexoes_um_receipt_aceito",
+          len(efetivos_corte) == 1 and efetivos_corte[0].get("acceptance_state") == "ACCEPTED"
+          and all(r.get("ok") or r.get("reason_code") == "OPERATIONAL_GENERATION_STALE"
+                  for r in (corte_a, corte_b)), f"{corte_a} / {corte_b}")
+    aceito = efetivos_corte[0]
+    repetido_receipt = await g.register_bundle(db.get_session, exp_id, prepare, operator="ADMIN_API_TOKEN")
+    check("v3_corte_aceito_idempotente_mesmo_receipt_sem_geracao_nova",
+          repetido_receipt.get("idempotent") is True
+          and repetido_receipt.get("acceptance_record_hash") == aceito["acceptance_record_hash"]
+          and repetido_receipt.get("generation") == aceito["generation"], str(repetido_receipt))
+    # Resolver tardio legítimo da linha EXCLUÍDA: não entra retroativamente nas
+    # estatísticas e não invalida a identidade do corte aceito119/120.
+    now += bar
+    async with db.get_session() as session:
+        await prospective.resolve_pending(session, {setup["symbol"]: {
+            "candles": candles, "as_of": ds.ms_datetime(now)}})
+        await session.commit()
+    await db._engine.dispose()
+    async with db.get_session() as session:
+        late_cfg = (await session.execute(select(O.frozen_config).where(
+            O.opportunity_key == annotations[-1]["frozen"]["opportunity_key"]))).scalar_one()
+    late_resolution = late_cfg["r09_pre_selection"][prospective.KEY]["resolution"]
+    assert late_resolution["status"] in prospective.TERMINAL \
+        and late_resolution["observed_at_ms"] > prepare["prospective_cutoff_ms"], late_resolution
+    repetido_tardio = await g.register_bundle(db.get_session, exp_id, prepare,
+        operator="ADMIN_API_TOKEN")
+    check("v3_pendente_resolve_apos_corte_restart_sem_trocar_receipt_119_120",
+          repetido_tardio.get("idempotent") is True
+          and repetido_tardio.get("acceptance_record_hash") == aceito["acceptance_record_hash"]
+          and repetido_tardio.get("generation") == aceito["generation"], str(repetido_tardio))
+    async with db.get_session() as session:
+        exp_receipt = (await session.execute(select(E).where(E.id == exp_id))).scalar_one()
+        report_runtime = g._acceptance_report(exp_receipt, bundle)
+        receipt = report_runtime["acceptance"]
+    with patch.object(g, "_ALLOW_TEST_APPROVALS", False):
+        sem_override = g.validate_bundle(exp_receipt, bundle, now_ms=now, purpose="PROMOTION")
+    check("v3_fixture_receipt_aceito_continua_test_only_sem_autoridade_real",
+          not sem_override.get("ok") and report_runtime["real_study_allowed"] is False
+          and not acceptance.verify_acceptance(report_runtime, now_ms=now, purpose="PROMOTION")["ok"])
+    check("v3_receipt_vincula_coorte_e_preserva_v1_offline",
+          receipt["prospective_evidence"]["cohort_hash"] == prospective.digest(
+              prospective.cohort_commitments(annotations,
+                  started_at_ms=inicio_forward["started_at_ms"], cutoff_ms=prepare["prospective_cutoff_ms"]))
+          and receipt["prospective_evidence"]["data_quality"]["valid"] == 119
+          and bundle["calibration_report"] == report
+          and bundle["calibration_artifact"]["approval"]["economically_approved"] is False)
+    promocao_ap = await aprovar("PROMOTION")
+    check("aprovacao_promotion_e_separada_da_shadow",
+          promocao_ap.get("ok") is True and promocao_ap["approval_id"] != shadow_ap["approval_id"],
+          str(promocao_ap))
+    geracao = (await g.get_status(db.get_session))["generation"]
+    promovido = await se.promote_preselection(
+        exp_id, approval_id=promocao_ap["approval_id"],
+        expected_generation=geracao, operator="ADMIN_API_TOKEN")
     check("promocao_governada_publica_referencia_sem_ligar_seletor",
           promovido.get("ok") is True and promovido.get("status") == "ELIGIBLE"
           and promovido.get("selector_env_unchanged") is True
@@ -861,6 +1057,45 @@ async def run():
               for grupo in proposta_ctx for v in grupo.values()),
           str(proposta_ctx)[:220])
 
+    # Revogação do RECEIPT persistido, não só da aprovação: uma autoridade
+    # ainda guardada pelo caller não revive evidência retirada após o restart.
+    await limpar_intents()
+    async with db.get_session() as session:
+        original_decision = copy.deepcopy((await session.execute(select(E.decision).where(
+            E.id == exp_id))).scalar_one())
+    revoked_decision = copy.deepcopy(original_decision)
+    revoked_receipt = revoked_decision["operational"]["acceptance"]
+    revoked_receipt["revoked"] = True
+    revoked_receipt["record_hash"] = acceptance.digest({
+        k: v for k, v in revoked_receipt.items() if k != "record_hash"})
+    try:
+        async with db.get_session() as session:
+            await session.execute(update(E).where(E.id == exp_id).values(decision=revoked_decision))
+            await session.commit()
+        await db._engine.dispose()
+        snap_receipt_rev = await criar_snapshot(SYMBOL)
+        rev_receipt = await rodar_ciclo(
+            [rec_base(SYMBOL, snap_receipt_rev, operational_selection=contexto)], env=selector_env)
+        check("v3_receipt_revogado_persistido_restart_nao_envia_post",
+              rev_receipt == 0 and posts_de_entrada() == [], f"{rev_receipt} {SKIPS}")
+    finally:
+        async with db.get_session() as session:
+            await session.execute(update(E).where(E.id == exp_id).values(decision=original_decision))
+            await session.commit()
+    await limpar_intents()
+    relogio_valido = now
+    try:
+        now = original_decision["operational"]["acceptance"]["valid_until_ms"] + 1
+        snap_receipt_exp = await criar_snapshot(SYMBOL)
+        exp_receipt = await rodar_ciclo(
+            [rec_base(SYMBOL, snap_receipt_exp, operational_selection=contexto)], env=selector_env)
+        # Receipt e artefato têm o mesmo teto canônico; CANARY é ainda mais
+        # curta. Prova a expiração conjunta, não isolamento de uma só causa.
+        check("v3_receipt_artefato_e_aprovacao_vencidos_nao_enviam_post",
+              exp_receipt == 0 and posts_de_entrada() == [], f"{exp_receipt} {SKIPS}")
+    finally:
+        now = relogio_valido
+
     # ── 3. Aprovação revogada ⇒ zero POST de entrada ──────────────────────
     await limpar_intents()
     estado = await g.get_status(db.get_session)
@@ -895,11 +1130,10 @@ async def run():
           str(nova_canary))
     estado = await g.get_status(db.get_session)
     promocao2 = await aprovar("PROMOTION")
-    with patch.object(prospective, "load_prospective_evidence", prospectiva_go):
-        await se.promote_preselection(exp_id, approval_id=promocao2["approval_id"],
-                                      expected_generation=(await g.get_status(
-                                          db.get_session))["generation"],
-                                      operator="ADMIN_API_TOKEN")
+    await se.promote_preselection(exp_id, approval_id=promocao2["approval_id"],
+                                  expected_generation=(await g.get_status(
+                                      db.get_session))["generation"],
+                                  operator="ADMIN_API_TOKEN")
     contexto2 = await contexto_candidato(SYMBOL, snap_cand)
     snap_mid = await criar_snapshot(SYMBOL)
 
@@ -934,15 +1168,14 @@ async def run():
           str(len(historico)))
     estado = await g.get_status(db.get_session)
     promocao3 = await aprovar("PROMOTION")
-    with patch.object(prospective, "load_prospective_evidence", prospectiva_go):
-        geracao_atual = (await g.get_status(db.get_session))["generation"]
-        primeiro, segundo = await asyncio.gather(
-            se.promote_preselection(exp_id, approval_id=promocao3["approval_id"],
-                                    expected_generation=geracao_atual,
-                                    operator="ADMIN_API_TOKEN"),
-            se.promote_preselection(exp_id, approval_id=promocao3["approval_id"],
-                                    expected_generation=geracao_atual,
-                                    operator="ADMIN_API_TOKEN"))
+    geracao_atual = (await g.get_status(db.get_session))["generation"]
+    primeiro, segundo = await asyncio.gather(
+        se.promote_preselection(exp_id, approval_id=promocao3["approval_id"],
+                                expected_generation=geracao_atual,
+                                operator="ADMIN_API_TOKEN"),
+        se.promote_preselection(exp_id, approval_id=promocao3["approval_id"],
+                                expected_generation=geracao_atual,
+                                operator="ADMIN_API_TOKEN"))
     efetivos = [r for r in (primeiro, segundo)
                 if r.get("ok") is True and not r.get("idempotent")]
     check("dois_promotores_um_efeito_logico",
@@ -996,11 +1229,10 @@ async def run():
         await g.revoke_approval(db.get_session, exp_id, CANARY_ATIVA["id"],
                                 estado_t["generation"], "ADMIN_API_TOKEN")
         prom = await aprovar("PROMOTION", etiqueta=etiqueta)
-        with patch.object(prospective, "load_prospective_evidence", prospectiva_go):
-            await se.promote_preselection(
-                exp_id, approval_id=prom["approval_id"],
-                expected_generation=(await g.get_status(db.get_session))["generation"],
-                operator="ADMIN_API_TOKEN")
+        await se.promote_preselection(
+            exp_id, approval_id=prom["approval_id"],
+            expected_generation=(await g.get_status(db.get_session))["generation"],
+            operator="ADMIN_API_TOKEN")
         nova = await aprovar("CANARY", etiqueta=etiqueta, **limites)
         if nova.get("ok"):
             CANARY_ATIVA["id"] = nova["approval_id"]
@@ -1218,14 +1450,31 @@ async def run():
     EXCHANGE["positions"] = []
 
     # ── 7. Status é leitura: não refaz replay/fitting/aprovação ───────────
+    async with db.get_session() as session:
+        leitura_antes = (await session.execute(select(S.state_key, S.generation, S.payload)
+            .order_by(S.state_key))).all()
+        decision_antes = (await session.execute(select(E.decision).where(E.id == exp_id))).scalar_one()
     with patch.object(prospective, "summarize_prospective",
                       side_effect=AssertionError("status não resume coorte")), \
+            patch.object(prospective, "build_acceptance_snapshot",
+                         side_effect=AssertionError("status não prepara corte")), \
+            patch.object(acceptance, "build_acceptance",
+                         side_effect=AssertionError("status não prepara receipt")), \
+            patch.object(acceptance, "_bootstrap",
+                         side_effect=AssertionError("status não calcula IC")), \
+            patch.object(replay, "replay_opportunity",
+                         side_effect=AssertionError("status não faz replay")), \
             patch.object(g, "register_approval",
                          side_effect=AssertionError("status não aprova")):
         status = await g.get_status(db.get_session)
+    async with db.get_session() as session:
+        leitura_depois = (await session.execute(select(S.state_key, S.generation, S.payload)
+            .order_by(S.state_key))).all()
+        decision_depois = (await session.execute(select(E.decision).where(E.id == exp_id))).scalar_one()
     check("status_nao_refaz_trabalho_nem_aprova",
           status.get("ok") is True and status.get("no_orders_executed") is True
-          and status.get("block_entries") is True, str(status))
+          and status.get("block_entries") is True
+          and leitura_antes == leitura_depois and decision_antes == decision_depois, str(status))
 
     # Nenhuma conexão TCP foi tentada; as resoluções DNS que apareceram vêm de
     # thread de pool da borda pública de mercado (OKX) e TODAS foram bloqueadas

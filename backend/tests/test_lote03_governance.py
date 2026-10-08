@@ -49,12 +49,13 @@ def governance_fixture():
     return copy.deepcopy(_FIXTURE)
 
 
-def approval_payload(bundle, now, purpose="SHADOW"):
+def approval_payload(bundle, now, purpose="SHADOW", *, acceptance_record=None):
     return {"confirm": True, "purpose": purpose, "references": ["TEST_ONLY:engineering-fixture"],
         "limits": {"symbols": ["SYN/USDT:USDT"],
             "playbooks": [bundle["manifest"]["candidate"]["selection_rule"]["playbook"]],
             "max_orders": 2, "max_risk_pct": 0.5, "expires_at_ms": now + 3600000},
-        "validity": {"id": "TEST_ONLY:approval-001", "hash": bundle["bundle_hash"]}}
+        "validity": {"id": "TEST_ONLY:approval-001", "hash": g.approval_validity_hash(
+            bundle, purpose, (acceptance_record or {}).get("record_hash"))}}
 
 
 class ContractTests(unittest.TestCase):
@@ -71,7 +72,10 @@ class ContractTests(unittest.TestCase):
     def test_shared_official_fixture_is_supported_but_test_only(self):
         self.assertFalse(self.report["real_study_allowed"])
         self.assertEqual(self.bundle["calibration_artifact"]["state"], "OOS_VALIDATED")
-        self.assertTrue(g.validate_bundle(self.exp, self.bundle, now_ms=self.now)["ok"])
+        # OOS execution alone no longer grants CANARY: preserve SHADOW positive
+        # and independently assert the added acceptance boundary.
+        self.assertTrue(g.validate_bundle(self.exp, self.bundle, now_ms=self.now, purpose="SHADOW")["ok"])
+        self.assertFalse(g.validate_bundle(self.exp, self.bundle, now_ms=self.now)["ok"])
         self.assertEqual(self.bundle["operational_semantics"], g.OPERATIONAL_SEMANTICS)
 
     def test_test_only_bundle_never_has_operational_authority_by_default(self):
@@ -113,9 +117,16 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(g.validate_approval_payload({**good, "approved": True}, self.bundle, now_ms=self.now)["ok"])
 
     def test_purposes_are_not_interchangeable(self):
+        from tests.test_research_acceptance_governance import accepted_governance_fixture
+        exp, _, bundle, now = accepted_governance_fixture()
+        receipt = exp.decision["operational"]["acceptance"]
         for purpose in g.PURPOSES:
-            self.assertTrue(g.validate_approval_payload(approval_payload(self.bundle, self.now, purpose),
-                self.bundle, now_ms=self.now)["ok"])
+            self.assertTrue(g.validate_approval_payload(approval_payload(bundle, now, purpose,
+                acceptance_record=receipt), bundle, now_ms=now, acceptance_record=receipt)["ok"])
+        stale = approval_payload(bundle, now, "CANARY", acceptance_record=receipt)
+        stale["validity"]["hash"] = bundle["bundle_hash"]
+        self.assertFalse(g.validate_approval_payload(stale, bundle, now_ms=now,
+            acceptance_record=receipt)["ok"])
         self.assertFalse(g.validate_approval_payload(approval_payload(self.bundle, self.now, "LIVE"),
             self.bundle, now_ms=self.now)["ok"])
 
@@ -214,7 +225,9 @@ class TransactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first["ok"], first)
         self.bundle = self.exp.decision["operational"]["bundle"]
         result = await g.register_approval(self.store, self.exp.id,
-            approval_payload(self.bundle, self.now, purpose), "TEST_ONLY_OPERATOR", test_only=True)
+            approval_payload(self.bundle, self.now, purpose,
+                acceptance_record=self.exp.decision["operational"].get("acceptance")),
+            "TEST_ONLY_OPERATOR", test_only=True)
         self.assertTrue(result["ok"], result)
         return result
 
@@ -263,6 +276,15 @@ class TransactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(("advisory", g.LOCK_KEY), self.store.calls)
 
     async def test_generation_stale_and_purpose_mismatch_fail(self):
+        # Reach the old generation/purpose controls with valid acceptance;
+        # an unrelated early OOS-only refusal would not prove these controls.
+        from tests.test_research_acceptance_governance import accepted_governance_fixture
+        self.exp, self.report, self.bundle, self.now = accepted_governance_fixture()
+        self.store = MemorySessions(self.exp, self.report)
+        with patch.object(g.time, "time", return_value=self.now / 1000):
+            await self._generation_and_purpose_controls()
+
+    async def _generation_and_purpose_controls(self):
         result = await self.register()
         async with self.store() as session:
             stale = await g.assert_authority_in_session(session, exp_id=self.exp.id, purpose="SHADOW",
@@ -302,9 +324,13 @@ class TransactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value["reason_code"], "LOCAL_AUTHORITY_FENCE_ADVANCED")
 
     async def test_canary_needs_promoted_ref_and_distinct_purpose(self):
-        result = await self.register("CANARY")
-        with patch.dict("os.environ", {"R13_OPERATIONAL_SELECTOR": "CANDIDATE", "R13_OPERATIONAL_EXPERIMENT_ID": "17"}):
-            no_ref = await g.load_view(self.store, now_ms=self.now)
+        from tests.test_research_acceptance_governance import accepted_governance_fixture
+        self.exp, self.report, self.bundle, self.now = accepted_governance_fixture()
+        self.store = MemorySessions(self.exp, self.report)
+        with patch.object(g.time, "time", return_value=self.now / 1000):
+            result = await self.register("CANARY")
+            with patch.dict("os.environ", {"R13_OPERATIONAL_SELECTOR": "CANDIDATE", "R13_OPERATIONAL_EXPERIMENT_ID": "17"}):
+                no_ref = await g.load_view(self.store, now_ms=self.now)
         self.assertEqual(no_ref["reason_code"], "CANDIDATE_NOT_PROMOTED")
 
     async def test_get_status_does_not_write(self):

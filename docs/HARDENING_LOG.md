@@ -2959,3 +2959,38 @@ Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
   leitor de tela, contraste instrumental ou device físico.
 - Relatório: `docs/FECHAMENTO_FINAL_04_CORRECAO.md`.
   `LOCAL_VERIFIED_PENDING_INTEGRATION`; sem merge, push ou deploy nesta correção.
+
+## R13 — política de aceite do estudo V3 (08/10/2026)
+
+- Base `2d6d87b1`, worktree autorizado `lote02-pesquisa`; aprovação analítica
+  humana de 07/10/2026, sem ratificação de manifesto real ou ativação LIVE.
+- Política versionada e recibo separado dos artefatos V1: calibração,
+  economia e proteção de escopo têm estados/checks próprios. `OOS_VALIDATED`
+  sozinho deixou de autorizar PROMOTION/CANARY. SHADOW permite coleta antes
+  do aceite econômico, sem tornar-se autoridade de ordem.
+- Evidência OOS por dobra, referência apenas do treino, IDs/timestamps/
+  denominador conciliados e recálculo completo obrigatório no ingresso.
+  Hash público é integridade, não assinatura; fonte controlada é a fronteira.
+- Protocolo congelado: quatro dobras de calibração e seis econômicas com o
+  CI existente de blocos5; distinção documentada para ratificação real posterior.
+- Preparação pelo endpoint administrativo existente: cálculo fora da txn,
+  revalidação/CAS ao voltar; aprovação SHADOW novamente conferida após a
+  última espera. Recibo insuficiente/reprovado preserva geração de coleta.
+- Snapshot V2 mantém identidade de todas as oportunidades e commitments dos
+  resultados usados. Pendência excluída pode resolver após o corte sem entrar
+  nos números congelados; drift de resultado usado continua recusado.
+- Aprovação PROMOTION/CANARY vincula bundle+recibo; revogação/drift/expiração
+  conferidos no banco e após rollback/cleanup. Proteção simulada só satisfaz
+  o escopo cadastral proposto, nunca prova SL real nem dispensa CANARY/guards.
+- Provas focais: 63 testes verdes 2×; suíte completa final 2.911 executados,
+  2.909 aprovados e os dois skips históricos R05C por fixture privada ausente.
+  PostgreSQL de aceite18 verde 2×; regressão Lote02 26+19 verificações verdes.
+  Integração governada final71 verde 2× após última edição, dois clusters
+  independentes: TCP zero, 36 DNS bloqueados/contados por execução, cleanup
+  confirmado. Orçamento ampliado somente no harness para fixture grande;
+  produção mantém 1,5s. Limites exatos da prova registrados no relatório.
+- Sem DDL, frontend, ENV/default novo, SDK/chamada real, ordem ou mensagem.
+  Champion, riscos, posição manual, histórico e holdout preservados.
+- Relatório: `docs/ESTUDO_V3_IMPLEMENTACAO_E_ACEITE.md`.
+  Estado: `LOCAL_VERIFIED`, implementação e verificação integrada concluídas,
+  entrega em commit local; sem merge/push/deploy e sem aprovação operacional.

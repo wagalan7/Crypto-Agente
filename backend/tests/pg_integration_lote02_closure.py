@@ -159,7 +159,11 @@ async def run():
                                           study.persist_study(concurrent_factory, report))
         check("duas_conexoes_leem_mesma_geracao_e_so_uma_publica_CAS",
               len(backend_pids) >= 2 and sum(w["published"] is True for w in writes) == 1
-              and {w["reason_code"] for w in writes} == {"FIRST_GENERATION", "GENERATION_STALE"}, str(writes))
+              # O perdedor do CAS agora relê a linha: payload idêntico é
+              # STUDY_UNCHANGED, não drift nem nova geração. A barreira e as
+              # duas conexões continuam provando a disputa pelo primeiro CAS.
+              and {w["reason_code"] for w in writes} == {"FIRST_GENERATION", "STUDY_UNCHANGED"}
+              and all(w["generation"] == 1 for w in writes), str(writes))
         identity = dict(experiment_key="r13cal:" + report["study_key"][:32],
                         universe_version=manifest["population"]["universe_version"], population="SHADOW")
         before = await state.read_state(db.get_session, **identity)

@@ -135,7 +135,7 @@ async def shadow_authority(session_factory):
                 approval_id=context["approval_id"],
                 expected_generation=context["generation"])
             await session.rollback()
-        return authority if authority.get("ok") is True else None
+        return authority if authority.get("ok") is True and governance.sync_authority_valid(authority) else None
     except Exception:  # noqa: BLE001 — pesquisa nunca derruba o caminho do bot
         return None
 
@@ -403,11 +403,8 @@ MIN_PROTECTION_COVERAGE_PCT = 90.0
 #: Decisão HUMANA específica: se a primeira promoção exigir SL REAL, o Shadow
 #: não pode provar isso. O gate continua NO_GO e a pergunta fica explícita.
 PROTECTION_DECISION_REQUIRED = "BLOCKED_PROTECTION_SCOPE_DECISION_REQUIRED"
-#: A pergunta que precisa de resposta HUMANA, não de flag/ENV: "proteção
-#: SIMULADA do Shadow satisfaz o requisito de proteção da PRIMEIRA promoção, ou
-#: ela exige SL REAL colocado na conta?". Enquanto a resposta não existir, esta
-#: constante fica `False`, o gate permanece NO_GO e nada é promovido. Mudá-la é
-#: uma alteração de código revisada — nunca um ligar/desligar em runtime.
+#: Legado permanece bloqueado. O consumidor nunca usa esta constante como
+#: autorização global: a decisão vem do aceite do relatório e da MESMA coorte.
 PROTECTION_SCOPE_ACCEPTED_FOR_PROMOTION = False
 
 
@@ -541,7 +538,46 @@ def _protection_trace_valid(protection, frozen, resolution):
     return True
 
 
-def protection_measure(annotations):
+_COHORT_FIELDS = ("experiment_id", "experiment_key", "candidate_hash", "champion_hash",
+                  "generation", "approval_id", "started_at_ms", "manifest_hash", "contract_hash")
+
+
+def _protection_scope_decision(annotations, decision, *, now_ms=None, started_at_ms=None):
+    """Aceite explícito do próprio estudo; jamais capacidade de ordem/SL real.
+
+    O relatório vem do bundle oficial, não do corpo de uma solicitação. Além do
+    registro verificável, a decisão precisa reconciliar TODAS as identidades
+    congeladas da coorte; não pode ser transportada para outro experimento/start.
+    """
+    try:
+        if not isinstance(decision, Mapping) or set(decision) != {"report", "record_hash", "cohort"}:
+            return False
+        from services import operational_governance_service as governance
+        checked = governance._verified_acceptance(decision["report"],
+            now_ms=_now() if now_ms is None else now_ms, purpose="PROMOTION")
+        protection = checked.get("protection") or {}
+        cohort = decision["cohort"]
+        binding = checked.get("binding") or {}
+        if checked.get("ok") is not True or checked.get("record_hash") != decision["record_hash"] \
+                or protection.get("state") != "ACCEPTED" or protection.get("scope") != PROTECTION_SCOPE \
+                or protection.get("purpose") != "PROMOTION" or protection.get("proves_real_sl") is not False \
+                or protection.get("first_registration_only") is not True \
+                or protection.get("authorizes_canary") is not False \
+                or not isinstance(cohort, Mapping) or set(cohort) != set(_COHORT_FIELDS) \
+                or binding.get("manifest_hash") != cohort["manifest_hash"] \
+                or binding.get("contract_hash") != cohort["contract_hash"] \
+                or integer(cohort["started_at_ms"]) is None \
+                or (started_at_ms is not None and cohort["started_at_ms"] != started_at_ms):
+            return False
+        return all(verify_annotation(ann) and ann["frozen"].get("source_mode") == REAL
+            and all(ann["frozen"].get(key) == cohort[key] for key in _COHORT_FIELDS)
+            and integer(ann["frozen"].get("captured_at_ms")) is not None
+            and ann["frozen"]["captured_at_ms"] >= cohort["started_at_ms"] for ann in annotations)
+    except (ImportError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
+        return False
+
+
+def protection_measure(annotations, *, protection_decision=None, now_ms=None, started_at_ms=None):
     """Proteção SIMULADA observada na coorte — jamais SL real, jamais zero vago.
 
     Conta a obrigação de proteção do fill virtual até a saída/fim de janela, com
@@ -577,6 +613,8 @@ def protection_measure(annotations):
     cobertura = round(observadas * 100.0 / aplicaveis, 6) if aplicaveis else None
     suficiente = bool(aplicaveis) and cobertura is not None \
         and cobertura >= MIN_PROTECTION_COVERAGE_PCT
+    accepted = _protection_scope_decision(annotations, protection_decision,
+                                         now_ms=now_ms, started_at_ms=started_at_ms)
     return {"protection_scope": PROTECTION_SCOPE,
             "protection_proves_real_sl": False,
             "protection_applicable": aplicaveis,
@@ -585,8 +623,9 @@ def protection_measure(annotations):
             "protection_pending": pendentes if suficiente else None,
             "protection_reasons": motivos,
             "protection_min_coverage_pct": MIN_PROTECTION_COVERAGE_PCT,
-            "protection_scope_accepted_for_promotion": PROTECTION_SCOPE_ACCEPTED_FOR_PROMOTION,
-            "protection_decision_required": (None if PROTECTION_SCOPE_ACCEPTED_FOR_PROMOTION
+            "protection_scope_accepted_for_promotion": accepted,
+            "protection_acceptance_record_hash": protection_decision["record_hash"] if accepted else None,
+            "protection_decision_required": (None if accepted
                                              else PROTECTION_DECISION_REQUIRED),
             "unresolved_protection_failures": pendentes if suficiente else None,
             "protection_gap_reason": None if suficiente
@@ -594,7 +633,8 @@ def protection_measure(annotations):
                   else "PROTECTION_OBSERVATION_COVERAGE_INSUFFICIENT")}
 
 
-def operational_measurements(annotations, valid, excluded, *, now_ms):
+def operational_measurements(annotations, valid, excluded, *, now_ms,
+                             protection_decision=None, started_at_ms=None):
     """Falhas operacionais, duplicatas e proteções pendentes MEDIDAS na coorte.
 
     Fonte: as próprias anotações prospectivas (origem `OFFICIAL_R09_RESOLVER…`),
@@ -616,7 +656,8 @@ def operational_measurements(annotations, valid, excluded, *, now_ms):
         # Coorte VAZIA: nada foi medido. Zero aqui seria fabricar segurança.
         return {"operational_failures": None, "economic_duplicates": None,
                 "resolution_failures": None, "economics_failures": None,
-                **protection_measure([]), **fidelity_measure([]),
+                **protection_measure([], protection_decision=protection_decision,
+                    now_ms=now_ms, started_at_ms=started_at_ms), **fidelity_measure([]),
                 "reason_code": "NO_PROSPECTIVE_OBSERVATIONS",
                 "measured_until_ms": now_ms,
                 "source": "PROSPECTIVE_ANNOTATIONS_OFFICIAL_RESOLVER"}
@@ -638,39 +679,87 @@ def operational_measurements(annotations, valid, excluded, *, now_ms):
             "resolution_failures": falhas_resolucao,
             "economics_failures": falhas_economia,
             "economic_duplicates": int(excluded.get("DUPLICATE_OPPORTUNITY") or 0),
-            **protection_measure(annotations), **fidelity_measure(valid),
+            **protection_measure(annotations, protection_decision=protection_decision,
+                now_ms=now_ms, started_at_ms=started_at_ms), **fidelity_measure(valid),
             "measured_until_ms": now_ms,
             "source": "PROSPECTIVE_ANNOTATIONS_OFFICIAL_RESOLVER"}
 
 
-def summarize_prospective(annotations, *, started_at_ms, now_ms, enabled_playbooks):
+def _prospective_exclusion(ann, *, started_at_ms, now_ms, keys):
+    """One eligibility definition for metrics and point-in-time commitments."""
+    if not verify_annotation(ann):
+        return "ANNOTATION_INVALID"
+    if ann["frozen"].get("source_mode") != REAL:
+        return "NOT_REAL_PROSPECTIVE"
+    if ann["frozen"].get("captured_at_ms", -1) < started_at_ms:
+        return "BEFORE_SHADOW_START"
+    key = ann["frozen"]["opportunity_key"]
+    if key in keys:
+        return "DUPLICATE_OPPORTUNITY"
+    keys.add(key)
+    choices, result = ann["frozen"]["decisions"], ann["resolution"]
+    if any(choices[s].get("state") == "UNKNOWN" for s in ("baseline", "candidate")):
+        return "DECISION_UNKNOWN"
+    if result.get("status") not in TERMINAL:
+        return "OUTCOME_NOT_RESOLVED"
+    if result.get("filled") is True and (number(result.get("net_r")) is None
+            or integer(result.get("result_available_ts_ms")) is None
+            or result["result_available_ts_ms"] > now_ms):
+        return "OUTCOME_NOT_AVAILABLE"
+    return None
+
+
+def cohort_commitments(annotations, *, started_at_ms, cutoff_ms):
+    """Freeze row identities and used observations, without copying candle arrays."""
+    keys, commitments = set(), []
+    for ann in annotations:
+        reason = _prospective_exclusion(ann, started_at_ms=started_at_ms,
+                                        now_ms=cutoff_ms, keys=keys)
+        commitments.append({"opportunity_key": ann["frozen"]["opportunity_key"],
+            "annotation_hash": ann["annotation_hash"], "observation_hash": digest(ann),
+            "included": reason is None})
+    return sorted(commitments, key=lambda row: row["opportunity_key"])
+
+
+def cohort_matches_snapshot(annotations, snapshot):
+    """Used evidence is immutable; excluded rows may progress only AFTER cutoff.
+
+    A later resolution never enters this receipt's statistics. Frozen identity,
+    population and all used outcomes remain exactly reconciled to the cutoff.
+    """
+    try:
+        commitments, cutoff = snapshot["cohort_commitments"], snapshot["cutoff_ms"]
+        if snapshot.get("version") != "R13_ACCEPTANCE_PROSPECTIVE_V2" \
+                or snapshot["cohort_hash"] != digest(commitments) \
+                or len(annotations) != len(commitments):
+            return False
+        current = {ann["frozen"]["opportunity_key"]: ann for ann in annotations}
+        if len(current) != len(annotations) or set(current) != {c["opportunity_key"] for c in commitments}:
+            return False
+        for commitment in commitments:
+            ann = current[commitment["opportunity_key"]]
+            if not verify_annotation(ann) or ann["annotation_hash"] != commitment["annotation_hash"]:
+                return False
+            if digest(ann) == commitment["observation_hash"]:
+                continue
+            observed = integer(ann.get("resolution", {}).get("observed_at_ms"))
+            if commitment["included"] is not False or observed is None or observed <= cutoff:
+                return False
+        return True
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def summarize_prospective(annotations, *, started_at_ms, now_ms, enabled_playbooks,
+                          protection_decision=None):
     """Economia derivada de caminhos futuros reais; ausência operacional bloqueia."""
     from services import portfolio_replay_service as portfolio
     from services import walk_forward_service as wf
     from services import preselection_experiment_service as r12
     valid, excluded, keys = [], {}, set()
     for ann in annotations:
-        reason = None
-        if not verify_annotation(ann):
-            reason = "ANNOTATION_INVALID"
-        elif ann["frozen"].get("source_mode") != REAL:
-            reason = "NOT_REAL_PROSPECTIVE"
-        elif ann["frozen"].get("captured_at_ms", -1) < started_at_ms:
-            reason = "BEFORE_SHADOW_START"
-        elif ann["frozen"]["opportunity_key"] in keys:
-            reason = "DUPLICATE_OPPORTUNITY"
-        else:
-            keys.add(ann["frozen"]["opportunity_key"])
-            choices = ann["frozen"]["decisions"]
-            result = ann["resolution"]
-            if any(choices[s].get("state") == "UNKNOWN" for s in ("baseline", "candidate")):
-                reason = "DECISION_UNKNOWN"
-            elif result.get("status") not in TERMINAL:
-                reason = "OUTCOME_NOT_RESOLVED"
-            elif result.get("filled") is True and (number(result.get("net_r")) is None
-                    or integer(result.get("result_available_ts_ms")) is None
-                    or result["result_available_ts_ms"] > now_ms):
-                reason = "OUTCOME_NOT_AVAILABLE"
+        reason = _prospective_exclusion(ann, started_at_ms=started_at_ms,
+                                        now_ms=now_ms, keys=keys)
         if reason:
             excluded[reason] = excluded.get(reason, 0) + 1
         else:
@@ -695,7 +784,8 @@ def summarize_prospective(annotations, *, started_at_ms, now_ms, enabled_playboo
     temporal = {"folds": [{"reason_code": "OK", "delta_net_r": sum(p)} for p in periods if p], "ci": ci}
     # Medições REAIS da coorte (origem e intervalo declarados). O que não tem
     # fonte continua ausente — com o motivo específico, nunca zero.
-    measured = operational_measurements(annotations, valid, excluded, now_ms=now_ms)
+    measured = operational_measurements(annotations, valid, excluded, now_ms=now_ms,
+        protection_decision=protection_decision, started_at_ms=started_at_ms)
     gaps = ["prospective_sample"] if not valid else []
     if measured["fidelity_gap_reason"] is not None:
         gaps.append(measured["fidelity_gap_reason"])
@@ -727,23 +817,125 @@ def summarize_prospective(annotations, *, started_at_ms, now_ms, enabled_playboo
             "promotable": False}
 
 
-async def load_prospective_evidence(session, exp, *, now_ms=None):
+async def load_prospective_inputs(session, exp, *, cutoff_ms=None):
+    """Read immutable cohort inputs only; no bootstrap, fitting or replay."""
     from sqlalchemy import select
     from models.decision_observation import DecisionObservation as O
     start = (exp.shadow_metrics or {}).get(KEY)
-    now_ms = _now() if now_ms is None else integer(now_ms)
-    if not isinstance(start, Mapping) or now_ms is None or integer(start.get("started_at_ms")) is None:
+    cutoff_ms = _now() if cutoff_ms is None else integer(cutoff_ms)
+    if not isinstance(start, Mapping) or cutoff_ms is None or integer(start.get("started_at_ms")) is None:
         return {"available": False, "reason_code": "PROSPECTIVE_SHADOW_NOT_STARTED", "gate": None}
     frozen = (exp.offline_metrics or {}).get("study", {}).get("contract", {})
     manifest = frozen.get("research_manifest")
     from services import research_manifest_service as rm
-    if not rm.authorized_comparison(manifest).get("real_study_allowed"):
+    from services import operational_governance_service as governance
+    authorized = rm.authorized_comparison(manifest)
+    test_identity_only = (governance._ALLOW_TEST_APPROVALS and authorized.get("available") is True
+                          and authorized.get("state") == rm.STATE_TEST_ONLY)
+    if not authorized.get("real_study_allowed") and not test_identity_only:
         return {"available": False, "reason_code": "TEST_ONLY_NOT_PROSPECTIVE_AUTHORITY", "gate": None}
+    context = frozen_shadow_context(exp, generation=start.get("generation"),
+        approval_id=start.get("approval_id"), started_at_ms=start.get("started_at_ms"))
+    if context is None or cutoff_ms <= start["started_at_ms"]:
+        return {"available": False, "reason_code": "PROSPECTIVE_CONTEXT_INVALID", "gate": None}
     ann = O.frozen_config["r09_pre_selection"][KEY]
     rows = (await session.execute(select(ann).where(*_matching_filters(exp, start),
-        O.first_decision_observed_at <= datetime.fromtimestamp(now_ms / 1000, timezone.utc))
+        O.first_decision_observed_at <= datetime.fromtimestamp(cutoff_ms / 1000, timezone.utc))
         .order_by(O.first_decision_observed_at, O.opportunity_key).limit(MAX_EVIDENCE_ROWS + 1))).scalars().all()
     if len(rows) > MAX_EVIDENCE_ROWS:
         return {"available": False, "reason_code": "PROSPECTIVE_SAMPLE_LIMIT_EXCEEDED", "gate": None}
-    return summarize_prospective(rows, started_at_ms=start["started_at_ms"], now_ms=now_ms,
-        enabled_playbooks=manifest["candidate"]["playbooks"])
+    cohort = {key: context[key] for key in _COHORT_FIELDS}
+    if any(not verify_annotation(row) or any(row["frozen"].get(k) != cohort[k] for k in _COHORT_FIELDS)
+           or row["frozen"].get("source_mode") != REAL for row in rows):
+        return {"available": False, "reason_code": "PROSPECTIVE_COHORT_IDENTITY_DRIFT", "gate": None}
+    return {"available": True, "annotations": copy.deepcopy(rows), "cohort": cohort,
+            "cutoff_ms": cutoff_ms, "enabled_playbooks": list(manifest["candidate"]["playbooks"])}
+
+
+def build_acceptance_snapshot(inputs, bundle):
+    """Heavy evidence preparation is explicit/admin-only, outside the DB transaction."""
+    if not isinstance(inputs, Mapping) or inputs.get("available") is not True:
+        raise ValueError("PROSPECTIVE_INPUTS_UNAVAILABLE")
+    summary = summarize_prospective(inputs["annotations"],
+        started_at_ms=inputs["cohort"]["started_at_ms"], now_ms=inputs["cutoff_ms"],
+        enabled_playbooks=inputs["enabled_playbooks"])
+    commitments = cohort_commitments(inputs["annotations"],
+        started_at_ms=inputs["cohort"]["started_at_ms"], cutoff_ms=inputs["cutoff_ms"])
+    body = {"version": "R13_ACCEPTANCE_PROSPECTIVE_V2", "source": REAL, "available": True,
+            "identity": {**inputs["cohort"], "study_key": bundle["calibration_study_key"],
+                         "bundle_hash": bundle["bundle_hash"]},
+            "cutoff_ms": inputs["cutoff_ms"], "cohort_hash": digest(commitments),
+            "cohort_commitments": commitments,
+            "evidence": summary["evidence"], "gate": summary["gate"],
+            "measurements": summary["measurements"], "data_quality": summary["data_quality"]}
+    return {**body, "snapshot_hash": digest(body)}
+
+
+async def load_prospective_evidence(session, exp, *, now_ms=None):
+    """Official reads reconcile a prepared receipt; they never evaluate/fit/bootstrap."""
+    from services import operational_governance_service as governance
+    from services import preselection_experiment_service as r12
+    now_ms = _now() if now_ms is None else integer(now_ms)
+    if now_ms is None:
+        return {"available": False, "reason_code": "PROSPECTIVE_CLOCK_INVALID", "gate": None}
+    bundle = governance._op(exp).get("bundle")
+    try:
+        report = governance._acceptance_report(exp, bundle) if isinstance(bundle, Mapping) else {}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return {"available": False, "reason_code": "ACCEPTANCE_PROSPECTIVE_IDENTITY_DRIFT", "gate": None}
+    snapshot = (report.get("acceptance") or {}).get("prospective_evidence")
+    inputs = await load_prospective_inputs(session, exp,
+        cutoff_ms=snapshot.get("cutoff_ms") if isinstance(snapshot, Mapping) else now_ms)
+    if inputs.get("available") is not True:
+        return inputs
+    now_ms = max(now_ms, governance._now())
+    fingerprint = digest(inputs["annotations"])
+    checked = governance.validate_bundle(exp, bundle, now_ms=now_ms, purpose="PROMOTION") \
+        if isinstance(bundle, Mapping) else {"ok": False}
+    if not isinstance(snapshot, Mapping) or checked.get("ok") is not True:
+        return {"available": True, "source": REAL, "state": "WAITING_ACCEPTANCE_RECORD",
+                "reason_code": checked.get("reason_code") or "PROSPECTIVE_ACCEPTANCE_NOT_PREPARED",
+                "gate": None, "fingerprint": fingerprint, "promotable": False, "offline_used": False}
+    if not cohort_matches_snapshot(inputs["annotations"], snapshot):
+        return {"available": False, "reason_code": "PROSPECTIVE_ACCEPTANCE_COHORT_DRIFT", "gate": None}
+    fingerprint = snapshot["cohort_hash"]
+    start = (exp.shadow_metrics or {}).get(KEY)
+    decision = _protection_decision_from_bundle(exp, start, now_ms=now_ms)
+    if not _protection_scope_decision(inputs["annotations"], decision,
+                                     now_ms=now_ms, started_at_ms=start["started_at_ms"]):
+        return {"available": False, "reason_code": PROTECTION_DECISION_REQUIRED, "gate": None}
+    evidence = copy.deepcopy(snapshot["evidence"])
+    evidence["essential_gaps"] = [gap for gap in evidence.get("essential_gaps", [])
+                                  if gap != PROTECTION_DECISION_REQUIRED]
+    gate = r12.go_no_go(evidence)
+    measured = {**copy.deepcopy(snapshot["measurements"]),
+                "protection_scope_accepted_for_promotion": True,
+                "protection_acceptance_record_hash": decision["record_hash"],
+                "protection_decision_required": None}
+    return {"available": True, "source": REAL,
+            "state": "GATE_PASSED" if gate["verdict"] == "GO_CANDIDATE" else "INSUFFICIENT_EVIDENCE",
+            "reason_code": "OK" if gate["verdict"] == "GO_CANDIDATE" else "PROSPECTIVE_GATE_NOT_MET",
+            "evidence": evidence, "gate": gate, "measurements": measured,
+            "data_quality": copy.deepcopy(snapshot["data_quality"]), "fingerprint": fingerprint,
+            "offline_used": False, "promotable": False}
+
+
+def _protection_decision_from_bundle(exp, start, *, now_ms):
+    """No caller-supplied certificate: derive only from this experiment's bundle."""
+    from services import operational_governance_service as governance
+    try:
+        bundle = governance._op(exp).get("bundle")
+        checked = governance.validate_bundle(exp, bundle, now_ms=now_ms, purpose="PROMOTION")
+        if not checked.get("ok"):
+            return None
+        report = governance._acceptance_report(exp, bundle)
+        verified = governance._verified_acceptance(report,
+                                                  now_ms=now_ms, purpose="PROMOTION")
+        context = frozen_shadow_context(exp, generation=start["generation"],
+            approval_id=start["approval_id"], started_at_ms=start["started_at_ms"])
+        if not verified.get("ok") or context is None:
+            return None
+        return {"report": report, "record_hash": verified["record_hash"],
+                "cohort": {key: context[key] for key in _COHORT_FIELDS}}
+    except (ValueError, KeyError, TypeError, AttributeError, ImportError):
+        return None
