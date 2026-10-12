@@ -2994,3 +2994,35 @@ Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
 - Relatório: `docs/ESTUDO_V3_IMPLEMENTACAO_E_ACEITE.md`.
   Estado: `LOCAL_VERIFIED`, implementação e verificação integrada concluídas,
   entrega em commit local; sem merge/push/deploy e sem aprovação operacional.
+
+## Réplica de decisões da gestão LIVE em pesquisa (12/10/2026)
+
+- Base `80d7ece8`, checkout principal autorizado. Retomada da implementação
+  interrompida por limite de uso em 08/10; arquivos pessoais preservados.
+- Motor manual pós-entrada confirmado, reutilizando `_process_trade`, helpers,
+  indicadores e estrutura **reais**, com interfaces explícitas em subprocesso.
+  Nenhum serviço existente nem caminho de decisão do bot foi alterado.
+- Configuração/estado fechados; criação e prefixo de ordens preservados. Cada
+  receipt vincula pedido, índice e causa; posição anterior à ação não confirma
+  flat posterior. Preview só sintético, sempre incompleto e sem evidência.
+- Memória aceita somente dois SELECTs e IDs reais da fixture; import/query
+  recusados permanecem gaps mesmo no fail-soft. Sem engine/conexão SQL.
+- Fonte carregada sem cache de bytecode, vinculada a modelos/dependências e
+  reconferida após imports/execução. ENV não herdada, TCP/UDP/DNS bloqueados.
+- Paridade de parcial inclusiva, pré-TP1, BE estrutural LONG/SHORT, runner,
+  time-stop/poeira/cleanup, UNKNOWN/fallback atual e retomada em memória. Não
+  corrigimos nem aprovamos convenções do LIVE (inclusive categoria `1M`).
+- **47 focais verdes 2×; suíte completa 2.958, OK, 2 skips históricos R05C**
+  (2.956 aprovados). Sintaxe e staged diff-check limpos; sem TSC necessário.
+  Primeiro comando completo tinha PYTHONPATH ausente: erro de montagem corrigido
+  e suíte reexecutada, sem ocultar teste nem alterar código de produção.
+- Estado `LOCAL_VERIFIED_RESEARCH_MANAGER_ONLY`: `economics=null`, sem
+  equivalência financeira/LIVE, promoção, autoridade, coleta ou estudo real.
+  Integração econômica versionada, execução/custos/insumos e manifesto seguem
+  **pendentes de implementação/decisão**, não apenas espera de amostra.
+- Sem PostgreSQL neste pacote (memória não é prova de persistência real), conta,
+  exchange/DB externo, outcome/holdout, mensagem, ENV/default ou ordem.
+  Maker/pyramiding/LIVE_SIZE_MULT intencionais preservados. Sem push/deploy.
+- Relatório: `docs/LIVE_MANAGEMENT_REPLICA_RESEARCH.md`; retomada e provas:
+  `docs/LIVE_MANAGEMENT_REPLICA_CHECKPOINT.md`. Pesquisa isolada não exige deploy;
+  concentrar publicação posterior com sua integração, sem restart inútil do bot.
