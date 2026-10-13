@@ -356,7 +356,7 @@ def _run_record(record, manifest, row, portfolio, *, execution_sink=None):
             if request["mode"] == "PYRAMID":
                 # The current real caller cannot supply its mandatory preflight.
                 # Never bypass this limitation to make a positive fixture pass.
-                raise ValueError("TECHNICAL_LIVE_PYRAMID_MARKET_PREFLIGHT_MISSING")
+                raise ValueError("TECHNICAL_PYRAMID_CHAIN_NOT_IMPLEMENTED")
             report = execution.replay_execution(request)
             if execution_sink is not None:
                 execution_sink.append(report)
@@ -561,7 +561,7 @@ def run_study(*, manifest, dataset, now_ms):
         _require(statistical.get("ok") is True, statistical.get("reason_code", "EVENT_EVIDENCE_INVALID"))
         gaps = sorted({r["reason_code"] for a in arms.values() for r in a["records"] if r["state"] == "NON_COMPARABLE"})
         if manifest["shared"]["execution_config"]["PYRAMIDING_ENABLED"]:
-            gaps.append("TECHNICAL_LIVE_PYRAMID_MARKET_PREFLIGHT_MISSING")
+            gaps.append("TECHNICAL_PYRAMID_CHAIN_NOT_IMPLEMENTED")
         result.update(ok=True, manifest=manifest, identity=identity, dataset=data, selection=comparison,
             arms=arms, evidence=statistical, evidence_inputs=evidence_inputs, technical_gaps=sorted(set(gaps)),
             state="TECHNICAL_GAP" if gaps else "LOCAL_EVENT_EVIDENCE", source_assurance="DECLARED_SOURCE_NOT_AUTHENTICATION")

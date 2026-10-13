@@ -79,13 +79,14 @@ Sem migração/tabela/coluna/ENV/endpoint/scheduler novo, nem frontend alterado.
 
 ## Pendências técnicas — não chamar de falta de amostra
 
-1. **Pyramiding ON:** o caller real `_maybe_pyramid` envia MARKET sem o
-   preflight obrigatório do transporte. A prova reproduz a recusa e zero POST;
-   não acrescenta autorização falsa nem desliga a flag para obter sucesso.
-   O encadeamento de reforço/novo estado do gestor permanece não implementado
-   no produtor do estudo (`TECHNICAL_*`). Portanto a configuração LIVE
-   intencional com pyramiding ON não tem réplica integral aprovada aqui.
-   Próximo trabalho: resolver o contrato desse caller e encadear os segmentos
+1. **Pyramiding ON:** a omissão de preflight do caller LIVE foi corrigida em
+   escopo separado e autorizado, depois da base `0e88f58f`; ver
+   `LIVE_PYRAMID_PREFLIGHT_FIX.md`. O estudo ainda não fornece as novas portas
+   duráveis de reserva/proteção/risco nem encadeia reforço/novo estado do gestor.
+   O adapter declara `TECHNICAL_PYRAMID_EVENT_PORTS_NOT_IMPLEMENTED`, e o
+   produtor completo `TECHNICAL_PYRAMID_CHAIN_NOT_IMPLEMENTED`. Portanto a
+   configuração LIVE intencional com pyramiding ON ainda não tem réplica
+   integral aprovada. Próximo trabalho: completar essas portas e os segmentos
    com evento externo provado, sem editar livremente snapshots V1.
 2. **Sizing upstream:** `risk_pct` é o input final ponto-no-tempo fornecido,
    não reprodução dos escritores/cache/aprendizado anteriores. Não alegamos

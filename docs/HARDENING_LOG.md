@@ -3053,3 +3053,27 @@ Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
   backend 3.059 executados, 3.057 aprovados, 2 skips R05C históricos**.
   Sintaxe de 18 Python + runner bash e staged diff-check aprovados. Sem
   TS/TSX/dist, sem TSC necessário. Commit local com 22 arquivos do lote.
+
+## 13/10/2026 — preflight do reforço LIVE autorizado, base 0e88f58f
+
+- Caller `_maybe_pyramid` agora passa P04B compartilhado, reserva oficial por
+  trade/nível, autoridade final após esperas e guards de ownership. Proteção
+  existente por IDs exatos/closePosition e exposição fresh, sem re-bracket.
+- Qty/nível só por fill terminal e admitido, writer com lock de linha/CAS.
+  UNKNOWN e falha de persistência armam latch antes de I/O e não reenviam.
+- Risco PYRAMID confirmado permanece conservadoramente no snapshot único
+  SQL e no leitor ORM enquanto o trade auto está aberto; não duplica margem
+  ou slot. Invalidade vira UNKNOWN, zero registrado continua zero conhecido.
+  Pode superestimar risco após avanço do SL/ledger: limite não foi aumentado.
+- OFF/defaults, limites, alavancagem, posição manual e âncora da gestão
+  preservados. O código LIVE foi alterado com autorização específica; nenhum
+  ambiente real foi acessado/alterado e nenhuma ordem real foi enviada.
+- Provas finais: 50 focais OK 2×; PG16/asyncpg local 21 checks OK 2×, socket
+  exclusivo/sem TCP ou DNS, clusters encerrados; backend 3.109 executados,
+  3.107 aprovados, apenas 2 skips históricos R05C por fixture privada ausente.
+  Paridade AST P04 contra base original OK. Sem TS/TSX/dist ou DDL novos.
+- Não declarar réplica integral: novas portas PYRAMID do replay e cadeia de
+  segmentos ainda não implementadas. UNKNOWN/retry terminal não receberam
+  recuperação automática nova. Detalhes e retomada:
+  `LIVE_PYRAMID_PREFLIGHT_FIX.md` / `LIVE_EVENT_STUDY_CHECKPOINT.md`.
+- Commit somente local; nenhum push/deploy nesta etapa.

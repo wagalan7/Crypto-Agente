@@ -294,7 +294,7 @@ class NegativeBoundaries(unittest.TestCase):
         self.assertEqual(orders[0]["args"][2]["type"], "LIMIT")
         self.assertEqual(report["reservations"]["margin_usd"], 40)
 
-    def test_live_pyramid_on_exact_caller_proves_preflight_blocker(self):
+    def test_live_pyramid_on_requires_official_event_ports(self):
         state = {"id": 1, "symbol": "BTC/USDT", "side": "long", "qty": 1, "qty_initial": 2,
                  "entry_price": 100, "planned_stop": 95, "leverage": 5, "phase": "post_tp1",
                  "pyramiding_level": 0, "notes": None, "sl_close_position": True,
@@ -303,7 +303,7 @@ class NegativeBoundaries(unittest.TestCase):
         report = execution.replay_execution(request(rows, config=config(pyramid=True), fills=[],
                                                     mode="PYRAMID", pyramid_state=state))
         self.assertEqual(report["status"], "UNKNOWN")
-        self.assertIn("TECHNICAL_LIVE_PYRAMID_MARKET_PREFLIGHT_MISSING", [g["reason_code"] for g in report["gaps"]])
+        self.assertIn("TECHNICAL_PYRAMID_EVENT_PORTS_NOT_IMPLEMENTED", [g["reason_code"] for g in report["gaps"]])
         self.assertEqual(report["actions"], [])
         self.assertEqual(report["memory_transitions"], [])
 

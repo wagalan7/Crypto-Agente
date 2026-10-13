@@ -442,6 +442,12 @@ def validate_fills(runtime):
 async def pyramid(runtime, contract, signed, market_preflight, log):
     payload, p = runtime.payload, runtime.payload["proposal"]
     config, portfolio, initial = payload["config"], payload["portfolio"], payload["pyramid_state"]
+    if config["PYRAMIDING_ENABLED"]:
+        # O LIVE agora exige reserva durável, posição/conditionals frescos e
+        # risco confirmado retido. Estas portas ainda não existem no replay;
+        # não substituir a autorização oficial por mocks silenciosos.
+        runtime.gap("TECHNICAL_PYRAMID_EVENT_PORTS_NOT_IMPLEMENTED")
+        return {"ok": False}, None
     state = types.SimpleNamespace(**copy.deepcopy(initial))
     if config["PYRAMIDING_ENABLED"] and not all(initial[k] for k in
                                                ("sl_close_position", "tp2_close_position", "protection_confirmed")):
@@ -512,12 +518,7 @@ async def pyramid(runtime, contract, signed, market_preflight, log):
         runtime.admissions.append(final)
         if final["decision"] != "ADMITTED":
             return {"ok": False, "reason": final["reason_codes"]}
-        # The current LIVE reinforcement caller omits the required P04B
-        # preflight. Preserve that exact call: ON returns a technical blocker,
-        # never secretly add a different order policy to make it pass.
         response = await signed["place_order"](**kwargs)
-        if response.get("reason_code") == "EXEC_MARKET_PREFLIGHT_REQUIRED":
-            runtime.gap("TECHNICAL_LIVE_PYRAMID_MARKET_PREFLIGHT_MISSING")
         return response
 
     async def notify(**kwargs):
@@ -538,8 +539,7 @@ async def pyramid(runtime, contract, signed, market_preflight, log):
     runtime.caller_calls.append("shadow_trade_service._maybe_pyramid")
     applied = await namespace["_maybe_pyramid"](state, {"entry": p["entry"], "stop_loss": p["stop"]})
     if applied:
-        # This branch is not reachable with the current LIVE preflight omission.
-        # Keep the writer reconciliation explicit if a later source fixes it.
+        # A execução ON exige as novas portas oficiais acima, ainda bloqueadas.
         return {"ok": True, "pyramid_applied": True,
                 "executed_qty": persisted.qty - initial["qty"]}, {
                     "qty": persisted.qty, "entry_price": persisted.entry_price,

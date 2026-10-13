@@ -8,7 +8,7 @@ estatística e integração/export/catalog/status implementados localmente.
 Estado do pacote: **LOCAL_RESEARCH_PARTIAL**, não aprovação integral do lote.
 Nenhum push/deploy nem estudo real autorizado.
 
-Bloqueio técnico comprovado: `_maybe_pyramid` pede MARKET sem o preflight
+Diagnóstico histórico na base `0e88f58f`: `_maybe_pyramid` pedia MARKET sem o preflight
 exigido pelo transporte. O adapter deve reproduzir a recusa, não fornecer uma
 autorização artificial nem mudar o LIVE. Portanto a réplica integral com
 pyramiding ativo ainda não pode ser declarada concluída.
@@ -25,7 +25,7 @@ Não enfraquecemos testes antigos. Duas passagens iniciadas durante edits foram
 descartadas; um teste novo também revelou alias mutável, corrigido no construtor.
 
 Relatório/limites: `docs/LIVE_EVENT_STUDY_RESEARCH.md`.
-Pendências técnicas: caller de pyramiding/preflight + cadeia de segmentos;
+Pendências técnicas do lote original: caller de pyramiding/preflight + cadeia de segmentos;
 sizing upstream ainda fornecido; export bruto com IDs excluídos/ordem causal.
 Não confundir com WAITING_DATA nem voltar aos blocos provados para começar de zero.
 
@@ -49,3 +49,27 @@ Retomar pelas três pendências técnicas acima. Não repetir discovery, V1 de
 gestão, ledger, estatística ou correções já demonstradas para começar do zero.
 Um ajuste no caller LIVE requer escopo/autorização próprios; não foi feito
 furtivamente para produzir um positivo de pyramiding.
+
+## Retomada — preflight LIVE autorizado, 13/10/2026
+
+O usuário autorizou explicitamente a correção do contrato de preflight do
+reforço, preservando flags, limites e alavancagem. O caller foi corrigido no
+checkout principal, sem alterar a conta real ou publicar. Detalhes e limites:
+`LIVE_PYRAMID_PREFLIGHT_FIX.md`.
+
+Agora há P04B compartilhado, posição/proteção frescas por IDs exatos, reserva
+oficial por trade/nível, autoridade final pós-esperas, qty efetivamente
+executada e risco confirmado conservador retido até o trade fechar. Dados
+inválidos/UNKNOWN falham fechado. Sem migração, ENV, flag ou frontend novos.
+
+Não retomar pelo defeito de callback já corrigido. Próxima pendência técnica:
+**portas PYRAMID do replay + cadeia de segmentos**, ainda bloqueadas. Sizing
+upstream e export bruto causal com excluídos também seguem pendentes.
+UNKNOWN/recusa terminal do reforço não receberam nova política automática
+de retry/recovery: os limites desse contrato estão documentados, não ocultos.
+
+Verificação final desse ajuste: 50 focais verdes 2×, PG16/asyncpg descartável
+21 checks verdes 2×, backend 3.109 executados / 3.107 aprovados / dois skips
+históricos R05C. Logs e runner reproduzível no relatório do preflight. Não
+confundir esta prova de correção local com aprovação operacional da conta ou
+com conclusão da réplica econômica PYRAMID.
