@@ -108,6 +108,44 @@ SPLIT_FIELDS = ("as_of_ms", "train_start_ms", "validation_start_ms",
 CHANGE_FIELDS = ("component", "from_value", "to_value")
 HASH_FIELDS = ("baseline_hash", "candidate_hash", "population_hash",
                "costs_hash", "split_hash", "bundle_hash")
+EVENT_MANIFEST_FIELDS = ("manifest_version", "study_id", "decision", "comparison_scope",
+    "population", "isolated_change", "baseline", "candidate", "costs", "split", "shared", "hashes")
+
+
+def event_contract_hash(value):
+    """Strict new-family JSON identity; no IO/default=str or V1 hash migration."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def validate_event_envelope_structure(envelope):
+    """Pure closed transport check, NOT source/runtime/study authentication.
+
+    Full manifest/engine/ledger recomputation belongs to controlled event-study
+    ingestion. The catalogue type decoder must not import subprocess/file IO.
+    """
+    try:
+        value = _closed(envelope, ("experiment_type", "experiment_type_version", "contract_hash", "manifest_hash", "event_manifest"), "event_envelope")
+        if value["experiment_type"] != "PRE_SELECTION_STRUCTURAL" or value["experiment_type_version"] != "R12_PRE_SELECTION_EVENT_V1":
+            raise ManifestError(CONFIG_INVALID, "event_envelope.type")
+        def hash_ok(text):
+            return isinstance(text, str) and len(text) == 64 and all(c in "0123456789abcdef" for c in text)
+        if not hash_ok(value["contract_hash"]) or not hash_ok(value["manifest_hash"]):
+            raise ManifestError(MANIFEST_DRIFT, "event_envelope.hash")
+        manifest = _closed(value["event_manifest"], EVENT_MANIFEST_FIELDS + ("manifest_hash",), "event_manifest")
+        if manifest["manifest_version"] != "R13_LIVE_EVENT_MANIFEST_V1" or manifest["comparison_scope"] != SCOPE_SELECTION:
+            raise ManifestError(VERSION_MISMATCH, "event_manifest")
+        hashes = {f"{key}_hash": event_contract_hash(manifest[key]) for key in (
+            "baseline", "candidate", "population", "costs", "split", "shared")}
+        hashes["bundle_hash"] = event_contract_hash({**hashes, "scope": SCOPE_SELECTION, "isolated_change": manifest["isolated_change"]})
+        body = {key: manifest[key] for key in EVENT_MANIFEST_FIELDS}
+        if (manifest["hashes"] != hashes or manifest["manifest_hash"] != event_contract_hash(body)
+                or value["manifest_hash"] != manifest["manifest_hash"]):
+            raise ManifestError(MANIFEST_DRIFT, "event_manifest.hashes")
+        return {"ok": True, "reason_code": OK, "manifest": manifest, "config": value,
+            "structural_only": True, "requires_event_runtime_verification": True, "promotable": False}
+    except (ManifestError, ValueError, TypeError, KeyError) as exc:
+        return {"ok": False, "reason_code": getattr(exc, "reason_code", "EVENT_ENVELOPE_INVALID")}
 
 #: Componentes que uma mudança isolada pode tocar, por escopo. Mudança de
 #: seleção não é validada como mudança de gestão, nem o contrário.
@@ -429,6 +467,12 @@ def parse_manifest(raw: Any) -> Dict[str, Any]:
     Os hashes são recalculados aqui: se o payload declarar hashes diferentes,
     isso é DRIFT e bloqueia — ninguém "congela" um corpo e mede outro.
     """
+    if isinstance(raw, Mapping) and raw.get("manifest_version") == "R13_LIVE_EVENT_MANIFEST_V1":
+        from services import live_event_study_service as events
+        try:
+            return events.parse_manifest(raw)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ManifestError("EVENT_MANIFEST_INVALID", str(exc)) from None
     corpo = _closed(raw, MANIFEST_FIELDS, "manifest")
     if corpo["manifest_version"] != MANIFEST_VERSION:
         raise ManifestError(VERSION_MISMATCH, str(corpo["manifest_version"]))
@@ -670,6 +714,9 @@ def verify_manifest(manifest: Any, *, expected_hash: Optional[str] = None
     Reutiliza o MESMO parser do produtor — adulterar qualquer campo muda o
     `manifest_hash` e a conferência recusa antes de qualquer métrica.
     """
+    if isinstance(manifest, Mapping) and manifest.get("manifest_version") == "R13_LIVE_EVENT_MANIFEST_V1":
+        from services import live_event_study_service as events
+        return events.verify_manifest(manifest, expected_hash=expected_hash)
     if not isinstance(manifest, Mapping):
         return {"ok": False, "reason_code": NOT_MAPPING, "state": STATE_BLOCKED}
     extras = set(manifest) - set(MANIFEST_FIELDS) - {"manifest_hash"}
@@ -700,6 +747,9 @@ def authorized_comparison(manifest: Any = None) -> Dict[str, Any]:
     manifesto `TEST_ONLY`, a engenharia roda mas o estudo REAL continua
     bloqueado: `real_study_allowed=False`.
     """
+    if isinstance(manifest, Mapping) and manifest.get("manifest_version") == "R13_LIVE_EVENT_MANIFEST_V1":
+        from services import live_event_study_service as events
+        return events.authorized_comparison(manifest)
     if manifest is None:
         return {"available": False, "state": STATE_BLOCKED,
                 "reason_code": "AUTHORIZED_CANDIDATE_NOT_DECLARED",
@@ -770,7 +820,7 @@ def manifest_summary(manifest: Any) -> Dict[str, Any]:
                        "cohort": manifesto["population"]["cohort"],
                        "scope_id": manifesto["population"]["scope_id"]},
         "costs": {"source": manifesto["costs"]["source"],
-                  "availability": manifesto["costs"]["availability"]},
+                  "availability": manifesto["costs"].get("availability", manifesto["costs"]["source"])},
         "hashes": dict(manifesto["hashes"]),
         "manifest_hash": manifesto["manifest_hash"],
         "outcomes_consulted": False,

@@ -955,6 +955,9 @@ def build_acceptance(report, now_ms=None, prospective_evidence=None):
     Records are deterministic for the study observation time; ``now_ms`` only
     checks availability. Caller appends this separate record to ``acceptance``.
     """
+    if isinstance(report, Mapping) and report.get("version") == "R13_LIVE_EVENT_STUDY_V1":
+        # Separate receipt family. No R10A source aliases or invented prospective metrics.
+        return report.get("evidence", {}).get("acceptance")
     now = _clock(now_ms)
     if now is None:
         report = {"invalid_clock": True}
@@ -971,6 +974,11 @@ def verify_acceptance(report, now_ms=None, purpose="PROMOTION", *, recompute=Fal
     official persistence. ``STRUCTURAL`` permits intact rejected/test receipts
     to be stored/reported; it cannot be used as operational authority.
     """
+    if isinstance(report, Mapping) and report.get("version") == "R13_LIVE_EVENT_STUDY_V1":
+        from services import live_event_study_service as events
+        if purpose != "STRUCTURAL":
+            return {"ok": False, "reason_code": "EVENT_RESEARCH_DOES_NOT_AUTHORIZE_OPERATIONAL_PROMOTION"}
+        return events.verify_report(report, recompute=recompute)
     def refused(reason, **extra):
         return {"ok": False, "reason_code": reason, **extra}
     if purpose not in ("PROMOTION", "CANARY", "STRUCTURAL") or type(recompute) is not bool:

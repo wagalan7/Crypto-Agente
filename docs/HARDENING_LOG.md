@@ -3026,3 +3026,30 @@ Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
 - Relatório: `docs/LIVE_MANAGEMENT_REPLICA_RESEARCH.md`; retomada e provas:
   `docs/LIVE_MANAGEMENT_REPLICA_CHECKPOINT.md`. Pesquisa isolada não exige deploy;
   concentrar publicação posterior com sua integração, sem restart inútil do bot.
+
+## Réplica econômica por eventos — infraestrutura local parcial (13/10/2026)
+
+- Base `c12ea043`, checkout principal autorizado, sem worktree novo. Somente
+  pesquisa: famílias versionadas conectadas ao manifesto/export bruto/seleção,
+  admissão/transporte e gestor reais isolados, ledger R05C/R05E, carteira causal,
+  calibração quatro dobras/WF seis e CAS/catalog/status oficiais.
+- UNKNOWN preserva reserva e uma falha posterior não apaga entrada provada.
+  Net/R total incluem funding uma vez; nenhuma probabilidade/fee/fill fabricado.
+  Clock, quantidade, preço, seed/proteção e origens são reconciliados entre etapas.
+- PG real descartável confirmou CAS concorrente, JSONB, restart, conflito,
+  catálogo DRAFT e leitura sem escrever/recalcular; nenhum DDL de produção.
+- A regressão detectou a importação indevida do executor pelo validador puro:
+  corrigimos a arquitetura, não a whitelist do teste antigo. Novo teste achou
+  alias de manifesto no construtor: deepcopy mantém imutabilidade do relatório.
+- **Não concluímos o lote integral:** reforço ON tem recusa no caller LIVE por
+  preflight ausente, encadeamento de reforço ainda falta no produtor, sizing
+  upstream é input final e export antigo não preserva todos os IDs excluídos.
+  Esses são limites técnicos documentados, não somente espera de dados.
+- Nenhuma estratégia/flag/default/limite/manual/histórico/holdout alterado;
+  nenhum acesso à conta/exchange/DB externo, ordem/mensagem/push/deploy.
+- Detalhes/provas finais/retomada: `LIVE_EVENT_STUDY_RESEARCH.md` e
+  `LIVE_EVENT_STUDY_CHECKPOINT.md`. Não chamar os sintéticos de estudo real.
+- Estado final: **101 focais OK 2×; PG real descartável 38 checks OK 2×;
+  backend 3.059 executados, 3.057 aprovados, 2 skips R05C históricos**.
+  Sintaxe de 18 Python + runner bash e staged diff-check aprovados. Sem
+  TS/TSX/dist, sem TSC necessário. Commit local com 22 arquivos do lote.

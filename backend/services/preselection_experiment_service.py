@@ -520,6 +520,9 @@ def validate_preselection_envelope(envelope: Any) -> Dict[str, Any]:
     manifesto que não se reconstrói no motor. NÃO preenche defaults: manifesto
     incompleto é recusado, nunca completado para fingir execução.
     """
+    if isinstance(envelope, Mapping) and envelope.get(TYPE_VERSION_KEY) == "R12_PRE_SELECTION_EVENT_V1":
+        from services import research_manifest_service as rm
+        return rm.validate_event_envelope_structure(envelope)
     if not isinstance(envelope, Mapping) or not envelope:
         return {"ok": False, "reason_code": ENVELOPE_INVALID,
                 "detail": "envelope ausente"}

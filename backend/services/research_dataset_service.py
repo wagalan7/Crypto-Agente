@@ -704,6 +704,44 @@ def build_feature_artifacts(request: ExportRequest, plan: SelectionPlan,
 
 # ── Loader somente leitura (sessão injetada) ────────────────────────────────
 
+def attach_event_dataset(*, dataset, export_manifest, research_manifest, events, index):
+    """New event family from the official raw feature export, not an R10A alias.
+
+    The cold causal index is supplied explicitly, never invented from row order.
+    Existing export bytes/hashes/SQL and accepted/vetoed rows stay unchanged.
+    """
+    from services import live_event_study_service as family
+    checked = family.verify_manifest(research_manifest)
+    if not checked["ok"]:
+        raise DatasetError(checked["reason_code"])
+    frozen = checked["manifest"]
+    if (not isinstance(dataset, dict) or dataset.get("scope") != scopes.SCOPE_PRE_POPULATION
+            or export_manifest.get("source", {}).get("scope") != scopes.SCOPE_PRE_POPULATION
+            or export_manifest.get("holdout") != {"policy": "SEALED", "details_read": False}
+            or export_manifest.get("fingerprints", {}).get("dataset_sha256") != hashlib.sha256(canonical_bytes(dataset)).hexdigest()):
+        raise DatasetError("EVENT_OFFICIAL_RAW_EXPORT_REQUIRED")
+    if export_manifest.get("cutoff", {}).get("as_of_ms") != frozen["split"]["as_of_ms"]:
+        raise DatasetError("EVENT_EXPORT_CUTOFF_MISMATCH")
+    if any(export_manifest.get("counts", {}).get("excluded", {}).values()):
+        # Older exports don't retain these identities: don't shrink the raw
+        # denominator silently or call the missing capture 'more data needed'.
+        raise DatasetError("TECHNICAL_EVENT_RAW_EXCLUDED_IDENTITIES_NOT_EXPORTED")
+    rows = []
+    for row in dataset.get("rows", []):
+        clock = row.get("feature_evidence") or {}
+        if row.get("source_schema") != "r09.pre.v2" or clock.get("quality") != "FRESH":
+            raise DatasetError("EVENT_POINT_IN_TIME_V2_FEATURES_REQUIRED")
+        observed = clock.get("observed_at_ms")
+        if type(observed) is not int or not 0 < observed <= row["decision_ts_ms"]:
+            raise DatasetError("EVENT_FEATURE_CLOCK_UNAVAILABLE")
+        fields = ("opportunity_key", "decision_ts_ms", "symbol", "side", "entry", "stop_loss", "tp1", "tp2",
+                  "atr", "observed_outcome", "observed_decision_scope", "score_trace", "champion_config", "features", "funnel")
+        rows.append({**{key: row.get(key) for key in fields}, "available_at_ms": observed})
+    body = {"version": family.DATASET_VERSION, "population_source": family.POPULATION_SOURCE,
+        "manifest_hash": frozen["manifest_hash"], "index": index, "rows": rows, "events": events, "dataset_hash": None}
+    return family.validate_dataset(body, frozen)
+
+
 _SET_READ_ONLY = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 _MODE_SQL = ("SELECT current_setting('transaction_read_only') AS read_only, "
              "current_setting('transaction_isolation') AS isolation")

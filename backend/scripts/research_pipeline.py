@@ -429,6 +429,16 @@ async def run_registered_study(args):
                 raise ValueError("artefato acima de 16 MiB")
             return json.loads(Path(path).read_text(encoding="utf-8"),
                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError("não finito")))
+        if loaded["manifest"].get("manifest_version") == "R13_LIVE_EVENT_MANIFEST_V1":
+            if getattr(args, "price_windows", None) or getattr(args, "calibration_event", None):
+                return study._blocked("EVENT_FAMILY_REFUSES_R10A_INPUT")
+            dataset = read_json(Path(directory) / "event-dataset.json")
+            result = study.run_study(manifest=loaded["manifest"], dataset=dataset, export_manifest=None)
+            if getattr(args, "persist", False) and result.get("ok"):
+                import db
+                result["persistence"] = (await study.persist_study(db.get_session, result)
+                    if db.DB_ENABLED else {"published": False, "reason_code": "DB_DISABLED"})
+            return result
         dataset = read_json(Path(directory) / "dataset.json")
         exported = read_json(Path(directory) / "manifest.json")
         prices = read_json(args.price_windows) if getattr(args, "price_windows", None) else None

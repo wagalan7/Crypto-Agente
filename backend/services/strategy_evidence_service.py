@@ -6322,6 +6322,8 @@ def verify_study_identity(study: Any, *, candidate_config: Any, fingerprint: Any
     e o tipo do experimento é conferido pelo guard versionado. Divergência
     recusa ANTES de qualquer leitura de outcome.
     """
+    if isinstance(candidate_config, Mapping) and candidate_config.get("experiment_type_version") == "R12_PRE_SELECTION_EVENT_V1":
+        return {"ok": False, "reason_code": "EVENT_RESEARCH_REQUIRES_VERSIONED_STUDY_VERIFIER"}
     from services import preselection_experiment_service as r12
     estudo = study if isinstance(study, Mapping) else {}
     # A evidência só é tocada DEPOIS de fechar a identidade do contrato.
@@ -6492,6 +6494,10 @@ async def create_preselection_experiment(*, champion: Dict[str, Any],
     (população, hash da candidata, dataset e corte) ANTES de qualquer veredito.
     Nada aqui promove, libera LIVE ou toca execução.
     """
+    if isinstance(config, Mapping) and config.get("experiment_type_version") == "R12_PRE_SELECTION_EVENT_V1":
+        from services import live_event_study_service as events
+        return await events.create_event_experiment(champion=champion, config=config, objective=objective,
+            study_ref=study_ref, cutoff=cutoff, fingerprint=fingerprint)
     if not P05_ANALYTICS_ENABLED:
         return {"ok": False, "blocked": True, "reason_code": "P05_ANALYTICS_DISABLED"}
     guard = experiment_type_guard(config, expected_type=PRE_SELECTION_TYPE)
@@ -6854,6 +6860,9 @@ async def evaluate_preselection_shadow(exp_id: int) -> Dict[str, Any]:
 
 def _frozen_study_of(exp: Any) -> Dict[str, Any]:
     """Vínculo congelado do experimento pré-seleção, conferido consigo mesmo."""
+    cfg = getattr(exp, "candidate_config", None)
+    if isinstance(cfg, Mapping) and cfg.get("experiment_type_version") == "R12_PRE_SELECTION_EVENT_V1":
+        return {"ok": False, "reason_code": "EVENT_RESEARCH_LIFECYCLE_NOT_RATIFIED"}
     from services import preselection_experiment_service as r12
     offline = getattr(exp, "offline_metrics", None)
     offline = offline if isinstance(offline, dict) else {}

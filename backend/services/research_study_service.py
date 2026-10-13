@@ -519,6 +519,13 @@ def _evaluation_protocol(manifest):
 
 
 def run_study(*, manifest, dataset, export_manifest, prices=None, request=None, now_ms=None):
+    if isinstance(manifest, Mapping) and manifest.get("manifest_version") == "R13_LIVE_EVENT_MANIFEST_V1":
+        from services import live_event_study_service as events
+        # The new input family is dispatched BEFORE ReplayConfig/R10A parsing.
+        if prices is not None or request is not None:
+            return _blocked("EVENT_FAMILY_REFUSES_R10A_PRICE_OR_CALIBRATION_REQUEST")
+        return events.run_study(manifest=manifest, dataset=dataset,
+            now_ms=now_ms if now_ms is not None else int(time.time() * 1000))
     """Comparação registrada inteira: nunca substitui export por fixture/demonstração."""
     from services import research_manifest_service as rm
     from services import research_selection_service as selection
@@ -736,6 +743,9 @@ def validate_study_report(report, *, now_ms=None):
     Um registro insuficiente/reprovado continua persistível. STRUCTURAL não
     concede propósito PROMOTION/CANARY e não recalcula bootstrap no GET.
     """
+    if isinstance(report, Mapping) and report.get("version") == "R13_LIVE_EVENT_STUDY_V1":
+        from services import live_event_study_service as events
+        return events.verify_report(report)
     verdict = _validate_study_report_identity(report, now_ms=now_ms)
     if not verdict.get("ok"):
         return verdict
@@ -769,6 +779,9 @@ def _persisted_identity(stored, report, generation):
 
 async def persist_study(session_factory, report):
     """Reusa CAS oficial; primeira evidência não é sobrescrita por reprocessamento."""
+    if isinstance(report, Mapping) and report.get("version") == "R13_LIVE_EVENT_STUDY_V1":
+        from services import live_event_study_service as events
+        return await events.persist_study(session_factory, report)
     from services import policy_state_service as state
     if not isinstance(report, Mapping) or report.get("ok") is not True or report.get("kind") != PAYLOAD_KIND:
         return {"published": False, "reason_code": "STUDY_NOT_EXECUTED"}

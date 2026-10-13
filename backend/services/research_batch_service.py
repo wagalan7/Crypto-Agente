@@ -60,6 +60,14 @@ async def get_research_status(days: int = 30) -> dict:
     except Exception:
         result["lote_final"] = {"state": "UNAVAILABLE", "promotable": False,
                                 "reason_code": "LOTE_SUMMARY_UNAVAILABLE"}
+    try:
+        from services.live_event_study_service import load_latest_status
+        import db
+        result["event_replica"] = (await asyncio.wait_for(load_latest_status(db.get_session), timeout=3.0)
+            if db.DB_ENABLED else {"available": True, "state": "NOT_STARTED", "reason_code": "DB_DISABLED", "promotable": False})
+    except Exception:
+        result["event_replica"] = {"available": False, "state": "ERROR",
+            "reason_code": "EVENT_STUDY_READ_ERROR", "promotable": False}
     return result
 
 
