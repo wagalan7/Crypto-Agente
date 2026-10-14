@@ -415,6 +415,8 @@ def _record_flow(record, manifest, row, portfolio, *, execution_sink=None):
             report = execution.replay_execution(request)
             if execution_sink is not None:
                 execution_sink.append(report)
+            if (report.get("upstream_sizing_report") or {}).get("status") == "TECHNICAL_GAP":
+                raise UncertainExecution(report)
             admitted.extend(report.get("admitted_orders", []))
             no_execution = report.get("status") in {"REJECTED", "NO_OP"} or (report.get("status") == "COMPLETE_EXECUTION"
                     and report["filled_qty"] == 0 and report["reservations"]["state"] == "RELEASED")

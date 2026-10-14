@@ -126,12 +126,23 @@ def install_import_guard(runtime):
 
 async def run(payload, backend):
     contract = load_source("_event_execution_contract", backend / "services/live_event_execution_service.py")
+    native_sizing = None
+    if "sizing_stack" in payload["config"] or "upstream_sizing" in payload:
+        package = types.ModuleType("services")
+        package.__path__ = []
+        package.live_event_execution_service = contract
+        sys.modules["services"] = package
+        sys.modules["services.live_event_execution_service"] = contract
+        upstream = load_source("services.live_upstream_sizing_service", backend / "services/live_upstream_sizing_service.py")
+        package.live_upstream_sizing_service = upstream
+        if "upstream_sizing" in payload:
+            native_sizing = {"request": payload["upstream_sizing"], "report": upstream.replay(payload["upstream_sizing"])}
     payload = contract.validate_execution_request(payload,
                                                   expected_source_fingerprint=contract.execution_source_fingerprint())
     runtime = Runtime(payload, contract)
     network_guard(runtime)
     config, proposal, portfolio = (payload[key] for key in ("config", "proposal", "portfolio"))
-    admission = contract.compute_admission(config, proposal, portfolio)
+    admission = contract.compute_admission(config, proposal, portfolio, native_sizing=native_sizing)
     runtime.admissions.append(admission)
     functions = contract.source_functions
     log = logging.getLogger("offline_event_execution")
@@ -283,7 +294,7 @@ async def run(payload, backend):
         approved = revalidation.cap_qty_for_revalidated_entry(qty, proposal["entry"], proposal["stop"], price)
         if verdict.get("ok"):
             final = contract.compute_admission(config, proposal, portfolio,
-                                               final_qty=approved, final_entry=price)
+                                               final_qty=approved, final_entry=price, native_sizing=native_sizing)
             runtime.admissions.append(final)
             verdict["ok"] = final["decision"] == "ADMITTED"
             verdict["approved_qty"] = approved
@@ -300,7 +311,7 @@ async def run(payload, backend):
             approved = signed["_floor_to_step"](approved, rules["step"])
             final = contract.compute_admission(config, proposal, portfolio,
                                                final_qty=approved, final_entry=price,
-                                               consumes_slot=payload["mode"] != "PYRAMID")
+                                               consumes_slot=payload["mode"] != "PYRAMID", native_sizing=native_sizing)
             runtime.admissions.append(final)
             verdict["ok"] = final["decision"] == "ADMITTED"
             verdict["approved_qty"] = approved
@@ -412,6 +423,7 @@ async def run(payload, backend):
               "reservations": reservations, "manager_updates": updates,
               "memory_transitions": runtime.transitions, "gaps": runtime.gaps,
               "initial_reservation": copy.deepcopy(runtime.initial_reservation),
+              "upstream_sizing_report": native_sizing["report"] if native_sizing is not None else None,
               "caller_calls": runtime.caller_calls,
               "port_state": runtime.port_state,
               "persistence_scope": "RECEIPT_BOUND_SIMULATED_PORTS" if payload["mode"] == "PYRAMID" else "ENTRY_MEMORY",

@@ -113,3 +113,50 @@ Provas finais com fontes congeladas:
   `/tmp/cw_pyramid_chain_pg_{1,2}.log`, `/tmp/cw_pyramid_chain_pgrisk.log`.
 
 Commit somente local. Nenhum acesso externo, ordem, ativação, push ou deploy.
+
+## Retomada de 14/10 — consumidor nativo de dimensionamento
+
+Base `5d1647e5`. Pedido/relatório upstream versionados, trecho original AST de
+`open_shadow_for_recs` e helpers/acessores reais integrados à execução isolada.
+Rounding, caps, stack e ordem nativos preservados. A qty final nativa alimenta
+a admissão; não há segundo cálculo do stack nem canário aplicado duas vezes.
+ENTRY com `sizing_stack` exige pedido causal correspondente. Binding inclui
+símbolo EXATO (cache/regime não equivalem à normalização wire), oportunidade,
+lado/TF/preços/equity/config/clock/hash. Configuração não vem de ENV histórico.
+
+Equity e caches ordenados têm qualidade, geração e relógios explícitos. Fonte
+sintética continua TEST_ONLY; hash não autentica origem. UNKNOWN obrigatório
+é TECHNICAL_GAP, nunca oportunidade evitada ou lucro zero; o estudo conserva
+o braço não comparável. `final_risk_pct` é o valor antes de `_compute_qty`,
+não risco financeiro final: a qty admitida e o ledger têm suas próprias provas.
+
+Escopo fechado: AFTER_EXISTING_ELIGIBILITY_BEFORE_SIZING. Não foram reproduzidos
+produtores de risco/alavancagem, throttle BTC, elegibilidade/calibração/filler,
+escritores/refresh do aprendizado/decay ou incremento do contador filler no
+batch. Seguem também export frio causal com todos os IDs excluídos/purgados e
+carteira/caixa integral. O lote continua LOCAL_RESEARCH_PARTIAL; não declarar
+réplica integral, estudo real aprovado ou autorização operacional.
+
+Retomar por essas pendências, sem refazer consumidor, PYRAMID, gestor e ledger
+já provados. Relatório: `LIVE_UPSTREAM_SIZING_RESEARCH.md`. Nenhum serviço LIVE,
+flag/default/limite, frontend, DDL, posição manual ou histórico alterado nesta
+etapa. Sem acesso externo, ordem, ativação, push ou deploy.
+
+Provas finais desta camada, com fontes congeladas:
+
+- 41 testes do consumidor e 21 de integração: 62/62 OK 2×, sem skip novo.
+- PG16/asyncpg descartável: 58 checks OK 2×; os 50 anteriores preservados e
+  oito novos para sizing → execução → estudo → catálogo DRAFT → restart.
+  Duas conexões/CAS, JSONB e GET sem replay/escrita. Sem DDL; zero TCP/DNS/
+  Unix externo; ambos os clusters encerrados pelo runner.
+- Sintaxe dos oito Python OK; diff-check limpo. Serviços LIVE e frontend
+  não alterados nesta camada; sem TS/TSX/dist, TSC não se aplica.
+- Logs focais: `/tmp/cw_upstream_final_frozen_62_1.log` e
+  `/tmp/cw_upstream_final_frozen_62_2.log`; PG:
+  `/tmp/cw_upstream_pg_1.log` e `/tmp/cw_upstream_pg_2.log`.
+- Backend completo: 3.241 executados, 3.239 aprovados e somente os dois
+  skips históricos R05C por fixture auditada privada ausente. Nenhuma fixture
+  fabricada ou skip novo. Fonte congelada; uma rodada final, exit 0:
+  `/tmp/cw_upstream_full_final.log` (577,5 s).
+- Commit somente local com os 12 arquivos explícitos desta camada. Pessoais
+  e outros projetos preservados e fora do stage; sem stash/reset/clean/amend.

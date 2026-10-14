@@ -372,6 +372,100 @@ async def run():
                 event.remove(item.sync_engine, "before_cursor_execute", read_only_sql)
             event.remove(AsyncSession.sync_session_class, "after_commit", committed)
             event.remove(AsyncSession.sync_session_class, "after_flush", flushed)
+
+        # Native upstream sizing is an independent source-bound study. Reuse
+        # the real entry/management/ledger fixture, never supplied metrics.
+        from services import live_upstream_sizing_service as upstream
+        from tests.test_live_upstream_execution import bound_entry
+        from tests.test_live_event_study import fixture as entry_study_fixture, NOW
+        native_manifest, native_data = entry_study_fixture()
+        native_entry, native_sizing = bound_entry()
+        manifest_body = {k: copy.deepcopy(v) for k, v in native_manifest.items() if k != "manifest_hash"}
+        manifest_body["hashes"] = None
+        manifest_body["shared"]["execution_config"] = copy.deepcopy(native_entry["config"])
+        native_manifest = study.parse_manifest(manifest_body)
+        native_data.update(manifest_hash=native_manifest["manifest_hash"], dataset_hash=None)
+        for arm in ("baseline", "candidate"):
+            native_data["events"][arm][0]["steps"][0]["request"] = copy.deepcopy(native_entry)
+        native_data = study.validate_dataset(native_data, native_manifest)
+        native_report = study.run_study(manifest=native_manifest, dataset=native_data, now_ms=NOW)
+        check("native_upstream_both_real_arms_qty_and_money", native_report.get("ok") is True
+              and all(a["records"][0]["state"] == "COMPLETE"
+                      and a["records"][0]["execution"]["upstream_sizing_report"]["status"] == "COMPLETE_SIZING"
+                      and a["records"][0]["execution"]["upstream_sizing_report"]["qty"] == 2.
+                      and float(a["records"][0]["ledger"]["net_including_funding"]) == 3.8
+                      for a in native_report.get("arms", {}).values()), native_report.get("technical_gaps"))
+        check("native_upstream_recomputed_sealed_without_authority",
+              study.verify_report(native_report, recompute=True)["ok"]
+              and native_report["holdout_status"] == "SEALED"
+              and all(native_report.get(k) is False for k in
+                      ("promotable", "authorizes_live", "live_equivalent", "real_study_allowed")))
+        native_ref = study.study_reference(native_report)
+        check("native_upstream_identity_preserves_previous_studies", native_ref != ref
+              and native_ref != chain_ref and native_report["report_hash"] != report["report_hash"])
+        native_persisted = await official_study.persist_study(sessions, native_report)
+        check("native_upstream_official_persist_one_generation", native_persisted.get("published") is True
+              and native_persisted.get("generation") == 1, native_persisted)
+        native_catalog_args = {
+            "champion": native_manifest["baseline"], "config": study.build_event_envelope(native_report),
+            "objective": catalog.OBJECTIVES[0], "study_ref": native_ref,
+            "cutoff": datetime.fromtimestamp(native_manifest["split"]["as_of_ms"] / 1000, tz=timezone.utc),
+            "fingerprint": native_report["identity"]["dataset_hash"],
+        }
+        native_created = await catalog.create_preselection_experiment(**native_catalog_args)
+        check("native_upstream_catalog_separate_inactive_draft", native_created.get("ok") is True
+              and native_created.get("status") == "DRAFT" and native_created.get("promotable") is False
+              and native_created.get("experiment_id") not in
+                  {created["experiment_id"], chain_created["experiment_id"]}, native_created)
+
+        await engine.dispose()
+        await db._engine.dispose()
+        engine = await new_engine()
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        policy_state._STATE_CACHE.clear()
+        native_repeated = await official_study.persist_study(sessions, native_report)
+        async with sessions() as session:
+            stored_native = (await session.execute(select(State).where(
+                State.experiment_key == native_ref["experiment_key"]))).scalar_one()
+            stored_sizing = stored_native.payload["event_report"]["arms"]["baseline"]["records"][0][
+                "execution"]["upstream_sizing_report"]
+            check("native_upstream_restart_hash_qty_and_generation_exact",
+                  native_repeated.get("published") is False and native_repeated.get("generation") == 1
+                  and native_repeated.get("reason_code") == "EVENT_STUDY_UNCHANGED"
+                  and stored_native.payload == {"event_report": native_report}
+                  and stored_native.evidence_key == native_report["report_hash"]
+                  and stored_sizing["report_hash"] == native_sizing["report_hash"]
+                  and stored_sizing["request_hash"] == native_entry["upstream_sizing"]["request_hash"]
+                  and stored_sizing["qty"] == 2., native_repeated)
+
+        native_previous_reads = len(read_sql)
+        native_guarded_engines = (engine, db._engine)
+        for item in native_guarded_engines:
+            event.listen(item.sync_engine, "before_cursor_execute", read_only_sql)
+        event.listen(AsyncSession.sync_session_class, "after_commit", committed)
+        event.listen(AsyncSession.sync_session_class, "after_flush", flushed)
+        try:
+            with ExitStack() as guards:
+                for module, name in ((study, "run_study"), (study.execution, "replay_execution"),
+                                     (study.manager, "run_trace"), (study.ledger, "replay_accounting"),
+                                     (study.evidence, "evaluate_evidence"), (upstream, "replay"),
+                                     (subprocess, "run")):
+                    guards.enter_context(patch.object(module, name,
+                        side_effect=AssertionError("native upstream replay on GET")))
+                native_loaded = await study.load_study(sessions, native_ref)
+                native_experiment = await catalog.get_experiment(native_created["experiment_id"])
+            check("native_upstream_get_exact_report_and_inactive_catalog",
+                  native_loaded.get("available") is True and native_loaded.get("report") == native_report
+                  and native_experiment is not None and native_experiment["status"] == "DRAFT"
+                  and native_experiment["shadow_started_at"] is None)
+            check("native_upstream_get_zero_replay_writes_commits_flushes",
+                  not write_attempts and not commits and not flushes
+                  and len(read_sql) >= native_previous_reads + 2)
+        finally:
+            for item in native_guarded_engines:
+                event.remove(item.sync_engine, "before_cursor_execute", read_only_sql)
+            event.remove(AsyncSession.sync_session_class, "after_commit", committed)
+            event.remove(AsyncSession.sync_session_class, "after_flush", flushed)
         check("no_new_tables_or_columns", await schema_signature() == schema_before)
         check("zero_tcp_udp_dns_foreign_unix", NETWORK == {"tcp_udp": 0, "dns": 0, "foreign_unix": 0}, NETWORK)
         print("LIVE_EVENT_STUDY_PG_OK", len(CHECKS), flush=True)

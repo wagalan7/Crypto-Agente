@@ -36,7 +36,9 @@ SOURCE_FILES = (
     "services/financial_risk_service.py",
     "services/risk_reconciliation_service.py",
     "models/real_trade.py", "models/recommendation_snapshot.py", "services/live_event_execution_service.py",
-    "scripts/live_event_execution_worker.py",
+    "scripts/live_event_execution_worker.py", "services/live_upstream_sizing_service.py",
+    "scripts/live_upstream_sizing_worker.py", "services/symbol_learning_service.py",
+    "services/edge_decay_service.py", "services/regime_service.py",
 )
 CONFIG_BOOL = {"MAKER_ENTRY_ENABLED", "MAKER_FALLBACK_MARKET",
                "P04A_ENTRY_REVALIDATION_ENABLED", "P04B_MARKET_REVALIDATION_ENABLED",
@@ -131,7 +133,8 @@ def _credential_free(value):
 
 
 def validate_execution_config(config):
-    _closed(config, CONFIG_FIELDS | ({"pyramid_limits"} if "pyramid_limits" in config else set()), "config")
+    _closed(config, CONFIG_FIELDS | ({"pyramid_limits"} if "pyramid_limits" in config else set())
+            | ({"sizing_stack"} if "sizing_stack" in config else set()), "config")
     for key in CONFIG_BOOL:
         if type(config[key]) is not bool:
             raise ValueError(f"EVENT_EXECUTION_LITERAL_BOOL:{key}")
@@ -157,6 +160,12 @@ def validate_execution_config(config):
         _number(config["pyramid_limits"]["max_total_margin_pct"], "max_total_margin_pct")
         _integer(config["pyramid_limits"]["depth_limit"], "depth_limit", 1)
         _number(config["pyramid_limits"]["depth_timeout_s"], "depth_timeout_s", 1e-15)
+    if "sizing_stack" in config:
+        from services import live_upstream_sizing_service as upstream
+        upstream.validate_config(config["sizing_stack"])
+        for key in ("MIN_NOTIONAL_USD", "MAX_MARGIN_PCT_PER_TRADE", "MAX_RISK_PCT_HARD", "LIVE_SIZE_MULT"):
+            if config["sizing_stack"]["shadow"][key] != config[key]:
+                raise ValueError("EVENT_UPSTREAM_POLICY_CONFIG_DRIFT:" + key)
     return copy.deepcopy(config)
 
 
@@ -311,8 +320,29 @@ def source_literal(relative, name):
     raise ValueError("EVENT_EXECUTION_SOURCE_LITERAL_MISSING")
 
 
+def validate_upstream_binding(request, config, proposal, portfolio):
+    from services import live_upstream_sizing_service as upstream
+    upstream.validate_request(request)
+    rec = request["recommendation"]
+    if request["config"] != config.get("sizing_stack"):
+        raise ValueError("EVENT_UPSTREAM_CONFIG_NOT_FROZEN")
+    if (request["opportunity_id"] != proposal["opportunity_id"]
+            or request["decision_at_ms"] != proposal["decision_at_ms"]
+            or rec["timeframe"] != proposal["timeframe"]
+            or rec["direction"] != proposal["side"] or rec["leverage"] != proposal["leverage"]
+            or rec["symbol"] != proposal["symbol"]
+            or rec["entry"] != proposal["entry"] or rec["stop_loss"] != proposal["stop"]
+            or proposal["sizing_context"]["source_hash"] != request["request_hash"]):
+        raise ValueError("EVENT_UPSTREAM_IDENTITY_DRIFT")
+    equity = request["observations"]["equity"]
+    if equity["quality"] == "CAPTURED" and equity["value"].get("ok") is True:
+        if equity["value"]["total_usd"] != portfolio["equity_usd"]:
+            raise ValueError("EVENT_UPSTREAM_PORTFOLIO_EQUITY_DRIFT")
+    return True
+
+
 def compute_admission(config, proposal, portfolio, *, final_qty=None, final_entry=None,
-                      consumes_slot=True, stop_override=None):
+                      consumes_slot=True, stop_override=None, native_sizing=None):
     """Use the actual LIVE caps and P03 pure gates with explicit causal inputs.
 
     risk_pct is the frozen final input from the upstream sizing stage. This
@@ -321,11 +351,29 @@ def compute_admission(config, proposal, portfolio, *, final_qty=None, final_entr
     config, proposal, portfolio = (validate_execution_config(config), validate_proposal(proposal),
                                    validate_portfolio(portfolio))
     sizing = source_functions("services/shadow_trade_service.py", {"_compute_qty"}, config)
-    result = sizing["_compute_qty"](proposal["entry"], proposal["stop"], proposal["risk_pct"],
-                                    portfolio["equity_usd"], leverage=proposal["leverage"])
-    qty = 0.0 if result is None else result["qty"]
-    if config["LIVE_SIZE_MULT"] < 1:
-        qty = round(qty * config["LIVE_SIZE_MULT"], 6)
+    if native_sizing is not None:
+        from services import live_upstream_sizing_service as upstream
+        request, report = native_sizing["request"], native_sizing["report"]
+        upstream.validate_request(request)
+        upstream.validate_report(report, request)
+        if report["status"] != "COMPLETE_SIZING":
+            body = {"decision": "REJECTED", "reason_codes": ["EVENT_UPSTREAM_" + str(report.get("status"))
+                    + ":" + str(report.get("reason_code"))], "final_qty": 0.0, "margin_usd": 0.0,
+                    "risk_usd": 0.0, "notional_usd": 0.0, "sizing": None, "consumes_slot": consumes_slot,
+                    "inputs_hash": digest({"config": config, "proposal": proposal, "portfolio": portfolio,
+                                           "upstream_request": request["request_hash"]}),
+                    "caller_identities": ["shadow_trade_service.open_shadow_for_recs:SIZING_NATIVE_REGION"]}
+            return {**body, "admission_hash": digest(body)}
+        validate_upstream_binding(request, config, proposal, portfolio)
+        if abs(report["final_risk_pct"] - proposal["risk_pct"]) > 1e-10:
+            raise ValueError("EVENT_UPSTREAM_EFFECTIVE_RISK_DRIFT")
+        result, qty = report["sizing"], report["qty"]
+    else:
+        result = sizing["_compute_qty"](proposal["entry"], proposal["stop"], proposal["risk_pct"],
+                                      portfolio["equity_usd"], leverage=proposal["leverage"])
+        qty = 0.0 if result is None else result["qty"]
+        if config["LIVE_SIZE_MULT"] < 1:
+            qty = round(qty * config["LIVE_SIZE_MULT"], 6)
     precision = source_functions("services/binance_signed_service.py", {"_floor_to_step"})
     qty = precision["_floor_to_step"](qty, config["filters"]["step"])
     reasons = []
@@ -383,9 +431,20 @@ def compute_admission(config, proposal, portfolio, *, final_qty=None, final_entr
 
 
 def validate_execution_request(request, *, expected_source_fingerprint=None):
-    _closed(request, REQUEST_FIELDS | ({"port_state"} if "port_state" in request else set()), "request")
+    _closed(request, REQUEST_FIELDS | ({"port_state"} if "port_state" in request else set())
+            | ({"upstream_sizing"} if "upstream_sizing" in request else set()), "request")
     canonical(request)
     _credential_free(request)
+    if (request["mode"] == "ENTRY" and "sizing_stack" in request["config"]
+            and "upstream_sizing" not in request):
+        raise ValueError("EVENT_UPSTREAM_REQUEST_REQUIRED")
+    if "upstream_sizing" in request:
+        if request["mode"] != "ENTRY":
+            raise ValueError("EVENT_UPSTREAM_ONLY_ENTRY")
+        validate_upstream_binding(request["upstream_sizing"], request["config"], request["proposal"], request["portfolio"])
+        if (request["upstream_sizing"]["source"] != request["source"]
+                or request["upstream_sizing"]["test_only"] is not request["test_only"]):
+            raise ValueError("EVENT_UPSTREAM_SOURCE_BOUNDARY")
     provenance = request["source_provenance"]
     _closed(provenance, {"producer", "source_id", "source_hash", "quality", "model_version", "synthetic"},
             "source_provenance")
@@ -455,7 +514,8 @@ def validate_execution_request(request, *, expected_source_fingerprint=None):
 
 
 def make_execution_request(*, config, proposal, portfolio, receipts, fills, mode="ENTRY", pyramid_state=None,
-                           source="TEST_ONLY_OBSERVED_EVENTS", source_provenance=None, port_state=None):
+                           source="TEST_ONLY_OBSERVED_EVENTS", source_provenance=None, port_state=None,
+                           upstream_sizing=None):
     if source_provenance is None and source == "TEST_ONLY_OBSERVED_EVENTS":
         source_provenance = {"producer": "TEST_ONLY_FIXTURE", "source_id": "TEST_ONLY",
                              "source_hash": digest({"receipts": receipts, "fills": fills}),
@@ -467,6 +527,8 @@ def make_execution_request(*, config, proposal, portfolio, receipts, fills, mode
             "fills": fills, "mode": mode, "pyramid_state": pyramid_state, "source_provenance": source_provenance}
     if port_state is not None:
         body["port_state"] = port_state
+    if upstream_sizing is not None:
+        body["upstream_sizing"] = upstream_sizing
     return validate_execution_request({**copy.deepcopy(body), "request_hash": digest(body)})
 
 

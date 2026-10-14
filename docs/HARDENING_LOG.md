@@ -3102,3 +3102,29 @@ Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
 - Detalhes: LIVE_PYRAMID_EVENT_CHAIN.md / LIVE_EVENT_STUDY_CHECKPOINT.md.
   Pessoais, posição manual, histórico, flags/limites preservados. Sem acesso
   a produção, ordem, ativação, mensagem real, push ou deploy; commit local.
+
+## 14/10/2026 — consumidor de sizing upstream no replay (base 5d1647e5)
+
+- Novo pedido/relatório versionado, trecho original AST do caller e helpers
+  reais: funding-EV, risco/convicção/edge/aprendizado/tilt, equity/qty/caps,
+  damp/short-slip/liquidez/regime/decay/filler e canário na ordem nativa.
+  Config explícita, caches ordenados causais, rede/credenciais bloqueadas.
+- ENTRY que declara stack exige pedido vinculado por identidade exata e
+  configuração. Admissão usa qty final nativa, sem duplicar stack/canário;
+  missing obrigatório vira TECHNICAL_GAP e braço não comparável, não zero
+  financeiro conhecido. PYRAMID preserva sua política própria. Kelly da tela
+  não vira tamanho operacional. Hashes não autenticam a origem dos inputs.
+- 62 focais OK 2×; PG16/asyncpg descartável 58 checks OK 2×, incluindo cadeia
+  nativa, recomposição, persistência, restart e catálogo DRAFT inativo. Zero
+  TCP/DNS/Unix externo, clusters encerrados. Sintaxe oito Python e diff-check
+  OK; nenhuma alteração LIVE, DDL/ENV/flag/endpoint ou frontend nesta camada.
+- Backend completo: 3.241 executados / 3.239 aprovados / apenas dois skips
+  históricos R05C por fixture auditada privada ausente, sem skip novo. Uma
+  rodada final com fonte congelada, exit 0; log no checkpoint.
+- Limite explícito: consumidor não reproduz produtor de risco/alavancagem,
+  elegibilidade/calibração/filler, escritor de caches ou estado do batch.
+  Export frio causal integral e caixa/Binance também seguem técnicos. Lote
+  LOCAL_RESEARCH_PARTIAL, sem estudo real ou aprovação operacional alegados.
+- Relatório e retomada: LIVE_UPSTREAM_SIZING_RESEARCH.md /
+  LIVE_EVENT_STUDY_CHECKPOINT.md. Pessoais, manual, histórico e defaults
+  preservados. Sem produção, ordem, ativação, mensagem, push ou deploy.

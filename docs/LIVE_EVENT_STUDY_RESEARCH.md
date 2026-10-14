@@ -86,10 +86,14 @@ Sem migração/tabela/coluna/ENV/endpoint/scheduler novo, nem frontend alterado.
    prova incompatível continuam recusadas. Detalhes em
    `LIVE_PYRAMID_EVENT_CHAIN.md`. A autoridade/persistência dessas portas é
    simulada com recibos vinculados, não prova de atomicidade com a conta.
-2. **Sizing upstream:** `risk_pct` é o input final ponto-no-tempo fornecido,
-   não reprodução dos escritores/cache/aprendizado anteriores. Não alegamos
-   equivalência de todo o stack de decisão do bot. Congelar/provar esses inputs
-   ou replicar esse stack ainda é necessário conforme escopo ratificado.
+2. **Sizing upstream:** a camada consumidora nativa foi integrada em 14/10:
+   trecho original do caller e helpers/acessores reais, com equity e caches
+   causais explícitos, sem reaplicar o canário. ENTRY que declara essa camada
+   não pode omiti-la e cair no cálculo legado. Detalhes em
+   `LIVE_UPSTREAM_SIZING_RESEARCH.md`. Ainda faltam os produtores nominais de
+   risco/alavancagem, elegibilidade/filler, escritores do aprendizado/decay e
+   estado do batch. Snapshot observado não prova a geração de seu histórico;
+   não alegamos equivalência integral do stack de decisão do bot.
 3. **Exportações antigas com exclusões:** não conservam todos os IDs excluídos.
    A anexação recusa reduzir silenciosamente o denominador. Novo export precisa
    preservar essas identidades frias/UNKNOWN e a ordem causal antes de aceitar
