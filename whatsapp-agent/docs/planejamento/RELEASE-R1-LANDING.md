@@ -112,116 +112,188 @@ errar é o banco inteiro. Dois minutos no painel resolvem.
 V-A, V-C, V-D, V-E e V-F não bloqueiam o R1 — são o que destrava o R2 com
 tranquilidade.
 
-## 4. Backup consistente, antes de qualquer deploy
+## 4. Backup — procedimento revisado e testado
 
-### O que precisa ser copiado
+### Correções sobre a versão anterior deste roteiro
 
-`DATA_DIR=/data` guarda **três** coisas, não só o banco:
+| O que eu havia escrito | Correção |
+|---|---|
+| "`cp` não serve, pode sair rasgado" | **Impreciso.** Testei com escritor concorrente (60.400 linhas inseridas durante a cópia): o `cp` também saiu com `integrity_check: ok`. O correto é: `cp` **não tem garantia**; a API de backup online **tem**. Uma cópia por `cp` dar certo uma vez não prova nada |
+| "baixe os dois arquivos e guarde fora da Railway" | **Removido.** Baixar o banco é levar conversa clínica, nome e CPF para o computador local. A cópia fica em **armazenamento privado persistente** |
+| procedimento próprio em shell | **Trocado pelo mecanismo do próprio produto**, que já faz isso certo — abaixo |
 
-| Caminho | O que é | Sensibilidade |
-|---|---|---|
-| `/data/consultorio.db` | banco inteiro: consultas, conversas, pacientes, cobranças | 🔴 conteúdo clínico |
-| `/data/contracts/` | PDFs de contrato assinados (nome, CPF, IP, hash) | 🔴 dado pessoal e contratual |
-| `/data/.backup_state` | estado do backup automático | baixa |
+### O produto já tem backup consistente — e cobre menos do que parece
 
-### `cp` não serve
+`backup_service.py` usa `src.backup(dst)`, a **API de backup online do SQLite**:
+consistente mesmo com escritor concorrente. Roda às 3h e sobe para o bucket
+privado em `consultorio/<data>/consultorio-<timestamp>.db.gz`. Há o disparo
+manual `POST /master/backup/run` (exige `MASTER_KEY`, idempotente por dia).
 
-O app usa `journal_mode=DELETE` com `busy_timeout=30000`. Copiar o arquivo com
-`cp` enquanto há escrita em curso pode capturar um estado rasgado — o arquivo
-abre, mas com transação pela metade. O caminho correto é a **API de backup
-online do SQLite**, que é consistente mesmo com escritor concorrente.
+🔴 **Mas ele copia só `consultorio.db`.** Verificado no código:
+`/data/contracts/` — os **PDFs de contrato assinados**, com nome, CPF, IP e
+hash — **não têm backup off-site nenhum**, nem automático nem manual. Se o
+volume for perdido, os contratos assinados vão com ele.
 
-A imagem é `python:3.11-slim`: traz o **módulo** `sqlite3`, não o binário
-`sqlite3` da linha de comando. Então o backup usa a biblioteca padrão.
+Achado desta verificação, não item de release. Fica como pendência de **E06**
+(dados e restauração) e como passo manual até lá.
 
-### Procedimento (executado por você, no shell do serviço na Railway)
+### Procedimento recomendado (executado por você)
+
+**Passo 1 — banco, pelo mecanismo do produto.** Nenhum comando novo, nenhuma
+cópia local:
+
+```
+POST https://agente-atendimento-production.up.railway.app/master/backup/run?key=<MASTER_KEY>
+```
+
+Esperado: `{"status": "uploaded", ...}` com a chave no bucket. `503` significa
+`BACKUP_S3_*` ausente — aí **pare**: não há backup off-site, e o deploy não
+deveria acontecer antes de resolver isso.
+
+**Passo 2 — contratos, que o passo 1 não cobre.** No shell do serviço:
 
 ```bash
-# 1. espaço livre no volume — o backup ocupa ~o tamanho do banco
 df -h /data
-
-# 2. backup consistente do banco (API de backup online)
-python - <<'PY'
-import sqlite3, datetime, os
-sel = f"/data/backup-{datetime.datetime.now():%Y%m%d-%H%M}.db"
-o = sqlite3.connect("/data/consultorio.db")
-d = sqlite3.connect(sel)
-with d:
-    o.backup(d)          # consistente, sem parar o serviço
-d.close(); o.close()
-print("gerado:", sel, os.path.getsize(sel), "bytes")
-PY
-
-# 3. integridade do que foi gerado (não imprime conteúdo)
-python - <<'PY'
-import sqlite3, glob
-ultimo = sorted(glob.glob("/data/backup-*.db"))[-1]
-c = sqlite3.connect(f"file:{ultimo}?mode=ro", uri=True)
-print("integrity_check:", c.execute("PRAGMA integrity_check").fetchone()[0])
-print("consultórios:", c.execute("SELECT COUNT(*) FROM tenants").fetchone()[0])
-print("consultas:", c.execute("SELECT COUNT(*) FROM appointments").fetchone()[0])
-PY
-
-# 4. contratos
-tar -czf /data/contracts-$(date +%Y%m%d-%H%M).tar.gz -C /data contracts 2>/dev/null \
-  && ls -la /data/contracts-*.tar.gz || echo "sem diretório contracts"
+du -sh /data/contracts 2>/dev/null || echo "sem contratos ainda"
+tar -czf /data/contracts-$(date +%Y%m%d-%H%M).tar.gz -C /data contracts
+ls -la /data/contracts-*.tar.gz
 ```
 
-Depois **baixe os dois arquivos** (painel da Railway → serviço → Files, ou
-`railway run`/`railway ssh` quando reautenticado) e **guarde fora da Railway**.
-Em seguida **apague as cópias de `/data`**, para não ocupar o volume:
+Suba esse `.tar.gz` para o **mesmo bucket privado** pelo painel do provedor de
+armazenamento e **apague a cópia de `/data`**:
 
 ```bash
-rm -f /data/backup-*.db /data/contracts-*.tar.gz
+rm -f /data/contracts-*.tar.gz
 ```
 
-### Regras de privacidade, não negociáveis
+**Folga de espaço:** escrever no volume consome espaço. No teste, um backup
+feito durante escrita intensa ficou bem maior que o banco em repouso. Exija
+**livre ≥ 3× o tamanho de `/data`** antes do passo 2. Se `df` mostrar menos, não
+escreva no volume: suba os contratos direto, sem o `.tar.gz` intermediário.
 
-- As cópias **não entram no repositório** (`*.db` e `*.tar.gz` já são ignorados,
-  mas o lugar delas é fora do git).
-- Nenhum relatório, evidência ou log desta etapa contém conteúdo de conversa,
-  nome de paciente ou CPF. Os comandos acima imprimem **apenas contagens e o
-  resultado do `integrity_check`**.
-- **Eu não executei nenhum desses comandos** e não copiei dado real: isso exige
-  autorização específica sua, e o acesso é seu.
-
-## 5. Validação da restauração — **PENDENTE**
-
-> **Backup existente não é restauração validada.** O backup automático das 3h vai
-> para S3/R2/B2 e **nunca foi restaurado** (achado de E01, item aberto de E06).
-> Enquanto o teste abaixo não rodar, a restauração segue **NÃO VALIDADA**.
-
-Roteiro, em ambiente isolado, sobre a **cópia** baixada no §4:
+**Passo 3 — conferir, sem expor conteúdo.** Imprime **apenas contagens e
+`integrity_check`** — nenhum nome, nenhum texto de conversa:
 
 ```bash
-# diretório temporário, fora do repositório e fora da Railway
-mkdir -p ~/restauracao-teste && cd ~/restauracao-teste
-cp <backup-baixado>.db ./consultorio.db
-
-# 1. integridade e contagens (sem imprimir conteúdo)
-python3 - <<'PY'
+python - <<'FIM'
 import sqlite3
-c = sqlite3.connect("file:consultorio.db?mode=ro", uri=True)
+c = sqlite3.connect("file:/data/consultorio.db?mode=ro", uri=True)
 print("integrity_check:", c.execute("PRAGMA integrity_check").fetchone()[0])
 for t in ("tenants","appointments","conversations","patients","contracts"):
     try: print(f"{t}: {c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]}")
     except Exception as e: print(f"{t}: {e}")
-PY
-
-# 2. a migração do R2 passa sobre o banco real? (para o R1 não é necessário)
-DATA_DIR=~/restauracao-teste /tmp/homolog-agente/venv/bin/python -c \
- "import sys; sys.path.insert(0,'<worktree>/whatsapp-agent/backend'); \
-  import database as d; d.init_db(); print('migrou; consultórios:', len(d.list_tenants()))"
-
-# 3. apagar a cópia quando terminar
-cd ~ && rm -rf ~/restauracao-teste
+FIM
 ```
 
-O passo 2 é o teste de migração do R2 **contra dado real**, que hoje só foi feito
-contra um banco fictício. Ele é pré-requisito do R2, não do R1.
+### Regras de acesso
 
-Registro: **não executado nesta sessão** — depende do backup do §4, que depende
-da sua autorização.
+- A cópia do banco vive no **bucket privado já em uso** — mesma fronteira de
+  segurança dos backups diários, nenhuma superfície nova.
+- **Nada é baixado para computador local** e nada vai para serviço externo novo.
+- Nenhuma cópia entra no repositório.
+- Nenhum relatório desta etapa contém conteúdo clínico.
+
+### Executado × não executado
+
+| | Situação |
+|---|---|
+| Revisão dos comandos | ✅ feita |
+| Teste do procedimento com banco **fictício**, sob escrita concorrente | ✅ `integrity_check: ok`; transações concorrentes íntegras (múltiplo exato do lote) |
+| Verificação de que a saída não expõe dado clínico | ✅ só contagens |
+| Medida do custo de acumulação de eventos | ✅ **158 bytes por evento** |
+| **Backup do banco real** | ❌ **NÃO EXECUTADO** — exige `MASTER_KEY` ou shell do serviço (§A) |
+| **Backup dos contratos reais** | ❌ **NÃO EXECUTADO** — mesmo motivo |
+
+## 5. Restauração — procedimento validado, dado real **pendente**
+
+### Validado hoje, com dado fictício
+
+Reproduzi o cenário **real** de migração: gerei um banco com o código **exato da
+build 67** (a que está em produção, extraída do git em `1b723a8f`), com
+consultório, consultas e mensagens fictícias; depois apliquei o código atual.
+
+```
+build 67: 27 tabelas · slot_offers ausente · inbound_events ausente
+          ↓ init_db() do código atual
+migrou sem erro
+  inbound_events, outbox, offers, counters, applied_effects,
+  pending_effects, slot_offers: todas criadas
+  dados preservados: 5 consultas, 5 mensagens · integrity=ok
+```
+
+Também validei backup → restauração em destino isolado: cópia por `.backup()`,
+`integrity_check: ok`, contagens conferidas, **banco de origem intacto**.
+
+### Fragilidade encontrada no caminho
+
+`init_db()` falhou com `no such column: next_attempt_at` quando havia uma tabela
+`inbound_events` **pré-existente com schema diferente**. Em produção isso não
+acontece (a tabela não existe). Mas revela que as tabelas de E03 **não têm
+migração por `ALTER TABLE`**: se uma versão futura acrescentar coluna,
+`CREATE TABLE IF NOT EXISTS` não a adiciona e um índice que a referencie quebra
+o boot. As tabelas de E02 já têm esse tratamento; as de E03 não.
+
+Registrado como item do R2 (§9). Não afeta o R1, que não toca schema.
+
+### Pendente
+
+| | Situação |
+|---|---|
+| Procedimento de restauração | ✅ validado com dado fictício |
+| Migração build 67 → código atual | ✅ validada com dado fictício |
+| **Restauração do backup real** | ❌ **PENDENTE** — exige o backup do §4 |
+| **Migração sobre cópia do banco real** | ❌ **PENDENTE** — mesmo motivo |
+
+> Backup existente **não é** restauração validada. Para o R1 não é bloqueador
+> (não toca banco nem schema); para o R2 é.
+
+## A. Ações externas que dependem de você
+
+Nenhuma eu consigo executar: o CLI da Railway está com token expirado
+(`invalid_grant` / `Unauthorized`), e eu **não vou** ler o `.env` local nem usar
+qualquer segredo para falar com produção.
+
+### A.1 — Conferir no painel (somente leitura, ~5 min)
+
+IDs do serviço, vindos da configuração local do CLI:
+
+| Campo | Valor |
+|---|---|
+| projeto | `f938655b-6654-480c-97e3-28c34dcdae05` |
+| ambiente | `cc3af85c-c782-4dbe-89d8-5642fe2434c2` (production) |
+| serviço | `f196fa3e-994c-49c7-b2ba-02947e5b08b4` |
+| nome | `agente-atendimento` |
+
+Link direto:
+`https://railway.com/project/f938655b-6654-480c-97e3-28c34dcdae05/service/f196fa3e-994c-49c7-b2ba-02947e5b08b4?environmentId=cc3af85c-c782-4dbe-89d8-5642fe2434c2`
+
+| # | Onde clicar | O que me dizer |
+|---|---|---|
+| **A.1.1** 🔴 | serviço → **Volumes** | existe volume? **Mount path** (precisa ser `/data`)? tamanho total e usado? |
+| **A.1.2** | serviço → **Settings → Source** | branch (é `main`?) e **Auto Deploy** ligado? |
+| **A.1.3** | serviço → **Settings → Build** | **Watch Paths** e **Root Directory** (texto exato) |
+| **A.1.4** | serviço → **Settings**, procurar *Config as code* | tem caminho de arquivo? qual? |
+| **A.1.5** | serviço → **Variables** | **só sim/não**: existem `MASTER_KEY`, `FIELD_ENCRYPTION_KEY`, `BACKUP_S3_BUCKET`, `BASE_URL`? **Não me envie valores** |
+| **A.1.6** | projetos **Crypto Win PRD** e **DEV** → serviço → Settings → Build | **Watch Paths** e **Root Directory** de cada um |
+
+### A.2 — Reautenticar o CLI (opcional, resolve A.1 de uma vez)
+
+```bash
+railway login
+```
+
+Abre o navegador e renova o token; depois eu leio tudo de A.1 em modo somente
+leitura. É ação sua porque exige o navegador e a sua sessão.
+
+### A.3 — Backup (depois de A.1.1 confirmar o volume)
+
+1. `POST /master/backup/run?key=<MASTER_KEY>` — você executa, com a sua chave
+2. passos 2 e 3 do §4, no shell do serviço
+3. me diga só o resultado: `status` do backup e as contagens
+
+### A.4 — Autorizar o push
+
+Comando exato no §6, depois de A.1.1 e A.3.
 
 ## 6. Checks do R1, deploy, verificação e retorno
 
@@ -340,94 +412,123 @@ conservadorismo. O que define de verdade é **sua disponibilidade para
 acompanhar os 15 min de verificação**: não publique sem poder olhar o resultado,
 porque o único cenário ruim (volume ausente) exige reação imediata.
 
-## 8. Rollback do R2 — revisado
+## 8. Rollback do R2 — corrigido
 
-O roteiro anterior dizia "drenar as filas antes do revert". **Isso pode ser
-impossível**: se o provedor de WhatsApp está fora — que é justamente quando as
-filas enchem — não há como drenar o outbox. Era uma premissa errada.
+Duas afirmações anteriores estavam erradas. As duas foram verificadas no código.
 
-### Procedimento revisado
+### Erro 1 — "desligar os workers para o processamento". **Não para.**
 
-**Passo 1 — parar de aceitar trabalho novo, sem perder nada.**
+`INBOX_WORKER_ENABLED` só é lido em `inbox.start_worker()`. O empurrão do
+webhook, `_drenar_entrada`, chama `inbox.drain()` e `outbox.flush()`
+**diretamente**, sem consultar a variável:
+
+```python
+if bg is not None and getattr(config, "INBOX_NUDGE_ON_WEBHOOK", True):
+    bg.add_task(_drenar_entrada)      # ← não olha INBOX_WORKER_ENABLED
+```
+
+Consequência: com os dois workers desligados, **cada mensagem que chega continua
+sendo processada inteira** — chamada ao modelo, mutação na agenda, envio. O
+procedimento anterior não interrompia nada.
+
+**Procedimento correto: três variáveis, não duas.**
 
 ```
 INBOX_WORKER_ENABLED=0
 OUTBOX_WORKER_ENABLED=0
+INBOX_NUDGE_ON_WEBHOOK=0      ← a que faltava
 ```
 
-Os dois juntos (o boot recusa inbox ligado com outbox desligado). Os webhooks
-continuam **gravando** os eventos: nada é recusado ao provedor, nada se perde,
-e o processamento simplesmente para. Eventos em `processing` voltam a `pending`
-quando o lease vence.
+Os dois primeiros têm de andar juntos (o boot recusa inbox ligado com outbox
+desligado). O terceiro é o que de fato interrompe.
 
-**Passo 2 — tentar drenar, com limite de tempo.** Se o provedor responde, uma
-passada do outbox resolve. Se não responde em ~10 min, **não insista**: siga.
+**Item para o R2:** fazer `_drenar_entrada` respeitar `INBOX_WORKER_ENABLED`,
+para que o procedimento de emergência não dependa de alguém lembrar da terceira
+variável. Não implementado aqui — está fora do escopo desta preparação e entra
+no checklist do §9.
 
-**Passo 3 — preservar as pendências. A cópia fica no banco, não num arquivo.**
+### Erro 2 — "nada se perde porque as tabelas permanecem"
 
-A mensagem do paciente (`inbound_events.body`) é conteúdo clínico. Exportá-la
-para um CSV ou para um relatório seria vazar dado sensível para fora do banco.
-Então:
+**Recebimento continua ativo mesmo com tudo desligado, e isso é intencional:** o
+webhook grava o evento antes do 2xx, então o provedor nunca recebe erro e nenhuma
+mensagem é recusada. Mas significa que `inbound_events` **acumula sem limite**
+enquanto o processamento estiver parado.
 
-- a preservação é o **backup do §4** — ele já contém `inbound_events`, `outbox`,
-  `offers` e `pending_effects` inteiros, com o conteúdo, protegido pelas mesmas
-  regras do banco;
-- para **agir**, o operador precisa só de uma lista **sem conteúdo**: quem ficou
-  sem resposta. Isso o `GET /admin/fila` já devolve (ele não expõe `body`).
+Medido com banco fictício: **158 bytes por evento**.
 
-```bash
-# lista sem conteúdo clínico, para contato manual
-curl -s "$BASE/admin/fila?key=$MASTER_KEY" | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-print('— mensagens sem resposta —')
-for e in d['entrada']:
-    print(f\"evento {e['id']}  {e['idade_min']} min  estágio {e['stage']}\")
-print('— respostas que não saíram —')
-for o in d['saida']:
-    print(f\"saída {o['id']}  {o['state']}  {o['kind']}\")
-print('— pendências —')
-for p in d['pendencias']:
-    print(f\"{p['id']}  {p['kind']}  {p['detalhe'][:60]}\")
-" > ~/pendencias-$(date +%Y%m%d-%H%M).txt
-```
-
-Esse arquivo tem **id, idade, estágio e telefone mascarado** — nenhum texto de
-conversa. Guardar fora do repositório.
-
-**Passo 4 — revert e novo carimbo.**
-
-```bash
-git revert --no-commit <commits do R2>
-sed -i '' '2s/.*/# build: <nova data>-NN/' whatsapp-agent/Dockerfile
-git commit -m "revert: voltar E02+E03" && git push origin HEAD:main
-```
-
-**Passo 5 — recuperar depois.** Quando o provedor voltar, duas opções:
-
-- **reaplicar o R2** (`git revert` do revert) e ligar os workers: as filas
-  retomam de onde pararam, porque o estado está no banco e a idempotência por
-  evento impede ação em dobro. É o caminho preferido;
-- **ficar no código antigo**: aí as mensagens presas **não** serão respondidas
-  automaticamente. O operador usa a lista do passo 3 e responde à mão, abrindo o
-  painel para ver o que cada paciente escreveu.
-
-### O que se perde, dito com clareza
-
-**As tabelas permanecerem não significa que nada se perde.** No código antigo:
-
-| Resíduo | Consequência real |
+| Volume | Acúmulo |
 |---|---|
-| `inbound_events` `pending` | **A resposta automática a essas mensagens é perdida.** O paciente escreveu e não vai receber resposta do agente. Só contato manual resolve |
-| `outbox` `pending` | A resposta já redigida **não será enviada** |
+| 200 mensagens/dia | 31 KB/dia · **0,9 MB/mês** |
+| 1.000 mensagens/dia | 154 KB/dia · **4,5 MB/mês** |
+
+**Armazenamento não é o gargalho.** Com um consultório e o volume atual, parar o
+processamento por dias não enche nada. O que cresce é a **dívida de atendimento**:
+cada linha é um paciente que escreveu e não foi respondido.
+
+🔴 **Tamanho do volume: NÃO VERIFICADO** (item A.1.1). Até confirmar, o limite
+de armazenamento é desconhecido — mas a ordem de grandeza acima mostra que o
+risco de encher o disco por acúmulo de eventos é remoto.
+
+### Monitoramento enquanto estiver parado
+
+```bash
+# quantos pacientes estão esperando (sem conteúdo de conversa)
+curl -s "$BASE/admin/fila?key=$MASTER_KEY" | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+print('mensagens sem resposta:', len(d['entrada']))
+print('respostas que não saíram:', len(d['saida']))
+print('mais antiga, em minutos:', max([e['idade_min'] or 0 for e in d['entrada']], default=0))"
+```
+
+Limiares sugeridos: acima de **20 mensagens** ou **120 minutos** na mais antiga,
+pare de esperar e responda à mão — ou reaplique o R2. Não existe mecanismo para
+"recusar" mensagem sem perdê-la; o que existe é pausar o agente por contato
+(`agent_paused`), que silencia o agente para aquele paciente sem apagar nada.
+
+### Procedimento, na ordem
+
+**1. Interromper o processamento** — as três variáveis acima. O recebimento
+segue gravando; nada é recusado ao provedor.
+
+**2. Tentar drenar, com prazo.** Se o provedor responder, uma passada do outbox
+resolve. Se não responder em ~10 min, **não insista** — era isso que o
+procedimento anterior assumia como sempre possível, e durante queda do provedor
+não é.
+
+**3. Preservar.** A mensagem do paciente (`inbound_events.body`) é conteúdo
+clínico: exportá-la para CSV ou relatório seria tirar dado sensível do banco.
+Então a preservação é o **backup do §4** — ele já contém `inbound_events`,
+`outbox`, `offers` e `pending_effects` inteiros, com o conteúdo, sob as mesmas
+regras do banco. Para **agir**, o operador precisa só da lista **sem conteúdo**,
+que `GET /admin/fila` já devolve, salva fora do repositório.
+
+**4. Revert e carimbo novo.**
+
+**5. Recuperar.** Duas saídas, e elas não são equivalentes:
+
+- **reaplicar o R2** (revert do revert) e religar as três variáveis: as filas
+  retomam de onde pararam, porque o estado está no banco e a idempotência por
+  evento impede ação em dobro. **É o único caminho que processa a fila.**
+- **ficar no código antigo**: a fila **não é processada**. Ver abaixo.
+
+### O que se perde ao ficar no código antigo — sem rodeio
+
+**O código antigo não conhece `inbound_events`, `outbox`, `offers` nem
+`pending_effects`.** Ele não lê, não processa e não esvazia essas tabelas. As
+linhas continuam lá, intactas e inúteis até o R2 voltar.
+
+| Resíduo | Consequência real no código antigo |
+|---|---|
+| `inbound_events` `pending` | **A resposta automática a essas mensagens não acontece.** O paciente escreveu e o agente não vai responder. Só contato manual resolve |
+| `outbox` `pending` | A resposta já redigida **não é enviada** |
 | `outbox` `uncertain` | Continua sem saber se chegou — decisão humana, item por item |
 | `offers` `active` | Degradação: todo "quero o 1" passa a pedir que o paciente repita o horário |
-| `pending_effects` | Perdem a tela (`/admin/fila` não existe no código antigo) — daí o arquivo do passo 3 |
+| `pending_effects` | Perdem a tela (`/admin/fila` não existe no código antigo) — daí a lista do passo 3 |
 | Consultas criadas/remarcadas | **Permanecem.** Nenhuma consulta é perdida |
 
-Em uma frase: **o dado persiste, o atendimento automático daquelas mensagens
-não.** Quantas mensagens isso representa depende do momento — por isso o
-passo 1 vem antes de tudo, para que o número pare de crescer.
+Em uma frase: **o dado persiste; o atendimento automático daquelas mensagens
+não.** E o número de mensagens afetadas depende de quanto tempo levar entre o
+problema e o passo 1 — por isso o passo 1 vem antes de tudo.
 
 ## 9. Checklist para liberar o R2
 
@@ -443,6 +544,13 @@ passo 1 vem antes de tudo, para que o número pare de crescer.
       cópia do banco real
 - [ ] **Rebase do R2 sobre o `origin/main` atual** (hoje ele está sobre
       `1b723a8f`, 17 commits atrás) e suíte verde depois do rebase
+- [ ] **`_drenar_entrada` respeitar `INBOX_WORKER_ENABLED`** — hoje o empurrão do
+      webhook processa mesmo com os workers desligados, o que torna o
+      procedimento de emergência dependente de uma terceira variável (§8)
+- [ ] **Migração por `ALTER TABLE` para as tabelas de E03** — hoje elas só têm
+      `CREATE TABLE IF NOT EXISTS`, sem caminho para acrescentar coluna depois (§5)
+- [ ] **Backup de `/data/contracts/`** — os PDFs assinados não têm backup
+      off-site nenhum (§4). Pendência de **E06**, mas vale decidir antes do R2
 - [ ] **Decisão sobre proteção de branch**: `main` não é protegida e não há
       ruleset. Com proteção, o deploy passa a sair de PR com CI verde
 
