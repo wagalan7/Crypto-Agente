@@ -1,4 +1,4 @@
-# Status — atualizado em 14/10/2026 (E03, revisão final)
+# Status — atualizado em 14/10/2026 (release incremental 1 preparado)
 
 Plano v1.0 instalado em `whatsapp-agent/docs/planejamento/`, com revisão **v1.1**
 registrada em `REVISOES.md` (datas mantidas). Revisão de código de partida:
@@ -152,11 +152,35 @@ conteúdo para E02 (ver `REVISOES.md`).
 | Nenhum commit/push/deploy | **PASSOU** |
 | Efeitos fora da garantia | Mídia (**E05**), jobs do agendador (**E06**), avisos de pagamento (**E06** validação / **E14** consolidação), Twilio sem autenticação (**E06**), atomicidade de conflito (**E04**), escala horizontal (**E26**/**E28**) |
 
+## Release incremental 1 — E01–E03 (AGUARDANDO APROVAÇÃO)
+
+Branch local `release/agente-consultorio-e01-e03`, 6 commits sobre `1b723a8f`.
+Carimbo preparado `2026-10-14-68`. **Nada publicado.** Detalhes, procedimento,
+rollback e bloqueadores em `RELEASE-E01-E03.md`.
+
+| Gate | Situação |
+|---|---|
+| G1 implementação local | ✅ 316 testes, checks verdes, snapshot verificável |
+| G2 homologação | ✅ 26/26 no roteiro ponta a ponta com provedor simulado; integrações reais **NÃO VERIFICADAS** |
+| G3 aprovação | ⏸ **4 bloqueadores 🔴** — volume em `/data`, serviços de cripto no mesmo repo, backup pré-deploy, configuração efetiva da Railway |
+| G4 publicação | — |
+| G5 observação | — |
+
+**Menor release coerente:** E02 **não** é publicável sozinha (a camada de
+ofertas foi reescrita sobre o esquema de E03 e as funções de E02 foram
+removidas). O que é separável de verdade é a **correção da landing** (commit 1),
+autossuficiente e de risco mínimo. Recomendação: R1 = landing + docs + testes;
+R2 = código de E02+E03 em janela combinada.
+
+**Impacto nas datas:** nenhum. A baseline v1.0 segue intacta; R1 do cronograma
+(piloto, 08/11) continua dependendo de B3.
+
 ## Próximas ações
 
-1. Proprietário revisa o diff de E01→E03 e decide **B2** (como publicar com
-   proteção). Recomendação: **commitar E01→E03 juntas num branch** — hoje não há
-   commit separando as etapas, e por isso nenhuma reversão por git é possível.
+1. ✅ Feito: E01→E03 commitadas no branch `release/agente-consultorio-e01-e03`,
+   em 6 commits revisáveis. A reversão por git agora é possível.
+2. Proprietário confere **V1–V9** no painel da Railway e do GitHub
+   (`RELEASE-E01-E03.md` §3) — é o que destrava G3.
 2. Decidir **B4**: a correção da landing só chega ao público com deploy.
 3. Resolver **B3** (contas de homologação) — é o que trava sair de "pronta
    localmente" para "validada em homologação" em E01, E02 e E03.
