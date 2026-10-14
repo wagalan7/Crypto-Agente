@@ -6,6 +6,13 @@ import database as db
 
 _TZ = ZoneInfo("America/Sao_Paulo")
 
+
+def _now() -> datetime:
+    """Agora em horário de Brasília, naive. Função separada de propósito: é o
+    único ponto de leitura do relógio no cálculo de horários, o que permite
+    fixar o tempo em teste sem mexer no fuso do processo."""
+    return datetime.now(_TZ).replace(tzinfo=None)
+
 _DEFAULT_WORKING_DAYS = [0, 1, 2, 3, 4]   # Seg–Sex
 _DEFAULT_BLOCKED_HOURS = [12, 13, 14]      # Almoço
 
@@ -53,7 +60,41 @@ def _blocked_hours_by_day(tenant: dict) -> dict[int, set[int]]:
         return {}
 
 
-def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> list[datetime]:
+PERIODOS = {"manha": (6, 12), "tarde": (12, 18), "noite": (18, 24)}
+
+
+def periodo_da_hora(hora: int) -> str | None:
+    for nome, (ini, fim) in PERIODOS.items():
+        if ini <= hora < fim:
+            return nome
+    return None
+
+
+def find_slots(tenant: dict, *, days_ahead: int = 14, on_date=None,
+               period: str | None = None, per_day: int | None = None,
+               max_total: int | None = None,
+               exclude_id: int | None = None) -> list[datetime]:
+    """Horários livres do consultório, com horizonte (dias) e limite de
+    quantidade **separados**.
+
+    Por que isso existe: `get_available_slots` corta a varredura no N-ésimo
+    horário livre. Com a agenda dos próximos dias cheia, esse corte consumia
+    toda a cota antes de alcançar o dia que o paciente pediu, e o dia pedido
+    simplesmente desaparecia das opções — o agente então marcava outro dia
+    (ver docs/planejamento/EVIDENCIAS/01.md §3).
+
+    Aqui a varredura cobre o horizonte inteiro e os limites são aplicados por
+    dia (`per_day`) e por amostragem equilibrada (`max_total`), nunca cortando
+    os dias do fim.
+
+    - `on_date`: restringe a uma data. Se ela estiver além de `days_ahead`, o
+      horizonte é esticado para alcançá-la — um pedido explícito não se perde.
+    - `period`: 'manha' | 'tarde' | 'noite'.
+    - `per_day`: no máximo N horários por dia de calendário.
+    - `max_total`: amostra equilibrada entre os dias (round-robin), para o
+      contexto do modelo ficar pequeno sem perder dias.
+    - `exclude_id`: ignora a própria consulta (remarcação).
+    """
     tenant_id = tenant["id"]
     start_h = tenant["working_hours_start"]
     end_h = tenant["working_hours_end"]
@@ -63,7 +104,13 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
     blocked_dates = _blocked_dates(tenant)
     blocked_by_day = _blocked_hours_by_day(tenant)
 
-    now = datetime.now(_TZ).replace(tzinfo=None)  # naive, horário de Brasília
+    now = _now()  # naive, horário de Brasília
+    if on_date is not None:
+        # Garante que a data pedida caiba no horizonte varrido.
+        days_ahead = max(days_ahead, (on_date - now.date()).days + 1)
+    if days_ahead <= 0:
+        return []
+
     check = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     end_date = now + timedelta(days=days_ahead)
 
@@ -77,6 +124,8 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
             continue
         if (r.get("attendance") or "pending") == "missed_with_notice":
             continue
+        if exclude_id is not None and r.get("id") == exclude_id:
+            continue
         try:
             booked_dts.append(datetime.fromisoformat(r["scheduled_at"]))
         except Exception:
@@ -89,27 +138,61 @@ def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> l
                 return True
         return False
 
-    slots = []
-    while check <= end_date and len(slots) < limit:
-        if (
+    faixa = PERIODOS.get(period or "", None)
+    por_dia: dict = {}
+    while check <= end_date:
+        dia = check.date()
+        if (on_date is None or dia == on_date) and (
             check.weekday() in working_days
             and start_h <= check.hour < end_h
             and check.hour not in blocked_hours
             and check.hour not in blocked_by_day.get(check.weekday(), set())
             and check.strftime("%Y-%m-%d") not in blocked_dates
+            and (faixa is None or faixa[0] <= check.hour < faixa[1])
             and not _conflicts(check)
         ):
-            slots.append(check)
+            do_dia = por_dia.setdefault(dia, [])
+            if per_day is None or len(do_dia) < per_day:
+                do_dia.append(check)
         check += timedelta(minutes=duration)
 
-    return slots
+    dias = sorted(por_dia)
+    if max_total is None:
+        return [s for d in dias for s in por_dia[d]]
+
+    # Amostra equilibrada: pega o 1º de cada dia, depois o 2º de cada dia, etc.
+    # Assim 24 vagas cobrem ~24 dias em vez de dois dias cheios.
+    escolhidos: list[datetime] = []
+    profundidade = 0
+    while len(escolhidos) < max_total and any(
+        len(por_dia[d]) > profundidade for d in dias
+    ):
+        for d in dias:
+            if len(escolhidos) >= max_total:
+                break
+            if len(por_dia[d]) > profundidade:
+                escolhidos.append(por_dia[d][profundidade])
+        profundidade += 1
+    return sorted(escolhidos)
+
+
+def get_available_slots(tenant: dict, days_ahead: int = 7, limit: int = 10) -> list[datetime]:
+    """Primeiros `limit` horários livres em ordem cronológica.
+
+    Mantida com o comportamento original (corte cronológico) porque o painel e
+    os indicadores dependem dele: "próximos horários livres" e "quantas vagas
+    existem". O agente **não** usa mais esta função para montar as opções do
+    paciente — ver `find_slots`.
+    """
+    todos = find_slots(tenant, days_ahead=days_ahead)
+    return todos[:limit]
 
 
 def is_slot_bookable(tenant: dict, dt: datetime, exclude_id: int | None = None) -> tuple[bool, str]:
     """Valida se `dt` pode receber uma sessão: precisa ser futuro, em dia
     atendido, dentro do expediente, fora de horários/datas bloqueados e sem
     conflito com outra consulta. Retorna (ok, motivo)."""
-    now = datetime.now(_TZ).replace(tzinfo=None)
+    now = _now()
     if dt <= now:
         return False, "passado"
     if dt.weekday() not in _working_days(tenant):

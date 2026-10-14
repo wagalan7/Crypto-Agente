@@ -1,7 +1,9 @@
 from __future__ import annotations
 import os
+import secrets as _secrets
 import sqlite3
-from datetime import datetime
+import uuid as _uuid
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 
 import config as _cfg
@@ -253,6 +255,10 @@ def init_db():
             "ALTER TABLE appointments ADD COLUMN followup_sent INTEGER DEFAULT 0",
             "ALTER TABLE tenants ADD COLUMN pix_key TEXT DEFAULT ''",
             "ALTER TABLE tenants ADD COLUMN pix_name TEXT DEFAULT ''",
+            # slot_offers nasceu em E02 sem version/delivered; bancos criados
+            # naquele intervalo ganham as colunas aqui.
+            "ALTER TABLE slot_offers ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE slot_offers ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE tenants ADD COLUMN working_days TEXT DEFAULT '0,1,2,3,4'",
             "ALTER TABLE tenants ADD COLUMN blocked_hours TEXT DEFAULT '12,13,14'",
             "ALTER TABLE tenants ADD COLUMN confirmation_hour INTEGER DEFAULT 17",
@@ -526,6 +532,185 @@ def init_db():
                 created_at TEXT DEFAULT (datetime('now')),
                 UNIQUE(tenant_id, phone)
             );
+
+            -- ── Oferta de horários por conversa ───────────────────────────────
+            -- Quando o agente oferece horários ao paciente, a lista EXATA que ele
+            -- viu fica gravada aqui, na ordem mostrada. É o que permite resolver
+            -- "quero o 1" com segurança: a posição é traduzida para um instante
+            -- exato desta oferta, não para a posição na lista global do
+            -- calendário. Essa confusão marcava paciente em outro dia, em
+            -- silêncio (ver docs/planejamento/EVIDENCIAS/01.md §3).
+            -- Uma oferta ativa por (tenant, telefone); expira por tempo.
+            -- ── E03: recebimento durável ──────────────────────────────────────
+            -- Todo webhook de mensagem reconhecido é gravado AQUI antes de o
+            -- endpoint responder 2xx. Sem isso, uma falha entre o 200 e o
+            -- processamento perdia a mensagem do paciente em silêncio: o
+            -- provedor considerava entregue e ninguém reprocessava.
+            --
+            -- Chave de deduplicação: (tenant_id, provider, event_id). NUNCA o
+            -- texto — duas mensagens iguais do mesmo paciente podem ser
+            -- legítimas ("oi" duas vezes). Quando o provedor não manda id
+            -- confiável, event_id_source='derived' e o id é aleatório: o evento
+            -- é processado, mas **não há garantia de dedup** e isso fica
+            -- registrado em vez de fingido.
+            --
+            -- `payload` guarda o mínimo para reprocessar (texto e remetente),
+            -- não o webhook inteiro: é conteúdo clínico do paciente.
+            CREATE TABLE IF NOT EXISTS inbound_events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id       INTEGER NOT NULL,
+                provider        TEXT NOT NULL,
+                event_id        TEXT NOT NULL,
+                event_id_source TEXT NOT NULL DEFAULT 'provider',
+                phone           TEXT NOT NULL,
+                body            TEXT NOT NULL,
+                state           TEXT NOT NULL DEFAULT 'pending',
+                stage           TEXT NOT NULL DEFAULT 'received',
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                attempt_token   TEXT,
+                lease_until     TEXT,
+                worker          TEXT,
+                next_attempt_at TEXT,
+                last_error      TEXT DEFAULT '',
+                decision        TEXT,
+                reply_text      TEXT,
+                offer_id        TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                UNIQUE(tenant_id, provider, event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_inbound_pendentes
+                ON inbound_events(state, next_attempt_at);
+            CREATE INDEX IF NOT EXISTS idx_inbound_contato
+                ON inbound_events(tenant_id, phone, state);
+
+            -- Pendência operacional de um evento: algo que NÃO pôde ser feito ou
+            -- cujo desfecho é desconhecido. Existe para que a falha não termine
+            -- apenas num log. Dois usos:
+            --   bloqueado:<acao>  mutação recusada por falta de identidade
+            --                     confiável do evento (provedor sem id de
+            --                     mensagem) — precisa de revisão humana
+            --   calendar:<acao>   chamada ao Google/CalDAV falhou: a consulta
+            --                     local existe, o evento externo é incerto
+            -- Estados: pendente | incerto | resolvido
+            CREATE TABLE IF NOT EXISTS pending_effects (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id    INTEGER NOT NULL,
+                event_row_id INTEGER,
+                phone        TEXT DEFAULT '',
+                kind         TEXT NOT NULL,
+                state        TEXT NOT NULL DEFAULT 'pendente',
+                detail       TEXT DEFAULT '',
+                resolution   TEXT DEFAULT '',
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                UNIQUE(event_row_id, kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pendencias_abertas
+                ON pending_effects(state, created_at);
+
+            -- Efeito local já aplicado por um evento. UNIQUE(event_id, kind)
+            -- é o que impede criar/remarcar/cancelar duas vezes quando o
+            -- processo cai entre a mutação e a marcação de progresso: a
+            -- gravação do efeito e a mutação acontecem na MESMA transação.
+            CREATE TABLE IF NOT EXISTS applied_effects (
+                event_id   INTEGER NOT NULL,
+                kind       TEXT NOT NULL,
+                ref_id     TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(event_id, kind)
+            );
+
+            -- ── E03: outbox ───────────────────────────────────────────────────
+            -- Toda resposta ao paciente passa por aqui. Estados:
+            --   pending            aguardando envio
+            --   sending            em voo (lease de um worker)
+            --   provider_accepted  o provedor aceitou (HTTP 2xx)  ← melhor prova
+            --                      disponível hoje
+            --   delivery_confirmed o provedor confirmou entrega ao aparelho
+            --                      (exige webhook de status; NÃO disponível na
+            --                      configuração atual)
+            --   failed             recusa definitiva ou tentativas esgotadas
+            --   uncertain          timeout/queda com envio possivelmente feito
+            --
+            -- HTTP 2xx NÃO prova que o paciente recebeu. 'uncertain' existe
+            -- justamente para não reenviar às cegas nem fingir entrega.
+            CREATE TABLE IF NOT EXISTS outbox (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id           INTEGER NOT NULL,
+                event_row_id        INTEGER,
+                phone               TEXT NOT NULL,
+                body                TEXT NOT NULL,
+                kind                TEXT NOT NULL DEFAULT 'reply',
+                state               TEXT NOT NULL DEFAULT 'pending',
+                attempts            INTEGER NOT NULL DEFAULT 0,
+                attempt_token       TEXT,
+                lease_until         TEXT,
+                next_attempt_at     TEXT,
+                provider            TEXT DEFAULT '',
+                provider_message_id TEXT DEFAULT '',
+                offer_id            TEXT,
+                idempotency_key     TEXT NOT NULL UNIQUE,
+                last_error          TEXT DEFAULT '',
+                resolution          TEXT DEFAULT '',
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL,
+                sent_at             TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_outbox_pendentes
+                ON outbox(state, next_attempt_at);
+
+            -- Sequência durável. Contador em tabela própria: não depende de
+            -- MAX() sobre linhas que podem ser apagadas ou expiradas, então a
+            -- identidade das ofertas é monotônica de verdade.
+            CREATE TABLE IF NOT EXISTS counters (
+                name  TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- ── E03: ofertas com identidade imutável ──────────────────────────
+            -- Substitui `slot_offers` (E02), que tinha UNIQUE(tenant,phone) e
+            -- portanto não conseguia manter a oferta visível ao paciente
+            -- enquanto uma nova ainda não foi enviada.
+            --   state:      draft | active | superseded | cancelled | consumed
+            --   send_state: not_sent | sending | provider_accepted
+            --               | delivery_confirmed | failed | uncertain
+            -- Uma oferta só fica elegível para resolver "quero o 1" depois de o
+            -- envio ser aceito pelo provedor. Ver `offer_policy` em offers.py.
+            CREATE TABLE IF NOT EXISTS offers (
+                offer_id   TEXT PRIMARY KEY,
+                seq        INTEGER NOT NULL,
+                tenant_id  INTEGER NOT NULL,
+                phone      TEXT NOT NULL,
+                slots      TEXT NOT NULL,
+                state      TEXT NOT NULL DEFAULT 'draft',
+                send_state TEXT NOT NULL DEFAULT 'not_sent',
+                outbox_id  INTEGER,
+                event_row_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_offers_contato
+                ON offers(tenant_id, phone, state);
+
+            -- `version` é monotônica no banco: permite saber se a oferta ativa é
+            -- a que acabou de ser montada neste turno ou uma anterior.
+            -- `delivered` registra se a mensagem com a lista foi de fato enviada
+            -- ao paciente. Gravamos a oferta ANTES do envio, então uma falha de
+            -- entrega deixa oferta ativa de uma lista que o paciente nunca viu.
+            -- Hoje isso é apenas registrado e logado; resolver de verdade exige
+            -- outbox/serialização — dependência explícita de E03.
+            CREATE TABLE IF NOT EXISTS slot_offers (
+                tenant_id  INTEGER NOT NULL,
+                phone      TEXT NOT NULL,
+                slots      TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                version    INTEGER NOT NULL DEFAULT 0,
+                delivered  INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(tenant_id, phone)
+            );
         """)
 
         # Seed do usuário admin padrão (alanmalta) se ainda não existir
@@ -762,12 +947,17 @@ def get_conversation_history(tenant_id: int, phone: str, limit: int = 10) -> lis
     return [{"role": r["role"], "content": crypto.decrypt(r["content"])} for r in reversed(rows)]
 
 
-def save_message(tenant_id: int, phone: str, role: str, content: str):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO conversations (tenant_id, phone, role, content) VALUES (?, ?, ?, ?)",
-            (tenant_id, phone, role, crypto.encrypt(content)),
-        )
+def save_message(tenant_id: int, phone: str, role: str, content: str, conn=None):
+    """Grava uma linha de conversa. `conn` permite que a gravação e a marca de
+    idempotência do evento commitem juntas: `conversations` é append-only, então
+    um retry sem proteção duplicaria a mensagem na aba Conversas."""
+    sql = "INSERT INTO conversations (tenant_id, phone, role, content) VALUES (?, ?, ?, ?)"
+    args = (tenant_id, phone, role, crypto.encrypt(content))
+    if conn is not None:
+        conn.execute(sql, args)
+        return
+    with get_conn() as c:
+        c.execute(sql, args)
 
 
 def _norm_digits(phone: str) -> str:
@@ -1289,43 +1479,52 @@ def get_appointments_in_range(tenant_id: int, start: str, end: str) -> list[dict
 
 
 def create_appointment(tenant_id: int, patient_name: str, phone: str,
-                       scheduled_at: datetime, notes: str = "") -> int:
-    with get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO appointments (tenant_id, patient_name, phone, scheduled_at, notes)
-               VALUES (?, ?, ?, ?, ?)""",
-            (tenant_id, patient_name, phone, scheduled_at.isoformat(), notes),
-        )
-        return cur.lastrowid
+                       scheduled_at: datetime, notes: str = "", conn=None) -> int:
+    """Cria a consulta. Aceita `conn` para que o chamador possa gravar o
+    INSERT e a marca de idempotência do evento na MESMA transação — é o que
+    impede criar duas consultas quando o processo cai no meio (E03)."""
+    sql = ("INSERT INTO appointments (tenant_id, patient_name, phone, scheduled_at, notes) "
+           "VALUES (?, ?, ?, ?, ?)")
+    args = (tenant_id, patient_name, phone, scheduled_at.isoformat(), notes)
+    if conn is not None:
+        return conn.execute(sql, args).lastrowid
+    with get_conn() as c:
+        return c.execute(sql, args).lastrowid
 
 
-def update_appointment(tenant_id: int, appointment_id: int, scheduled_at: datetime) -> bool:
-    """Atualiza data/hora da consulta e reseta flags de confirmação (nova data = pendente)."""
-    with get_conn() as conn:
-        cur = conn.execute(
-            """UPDATE appointments
+def update_appointment(tenant_id: int, appointment_id: int, scheduled_at: datetime,
+                       conn=None) -> bool:
+    """Atualiza data/hora da consulta e reseta flags de confirmação (nova data = pendente).
+
+    Aceita `conn` para que a remarcação e a marca de idempotência do evento
+    commitem juntas (E03). Sem isso, um retry tardio zeraria os marcadores de
+    lembrete de novo, mesmo gravando "o mesmo valor".
+    """
+    sql = """UPDATE appointments
                SET scheduled_at = ?, confirmed = 0, confirmation_sent = 0, followup_sent = 0,
                    reschedule_count = COALESCE(reschedule_count, 0) + 1,
                    last_rescheduled_at = ?
-               WHERE id = ? AND tenant_id = ?""",
-            (scheduled_at.isoformat(), _now_local_iso(), appointment_id, tenant_id),
-        )
-        return cur.rowcount > 0
+               WHERE id = ? AND tenant_id = ?"""
+    args = (scheduled_at.isoformat(), _now_local_iso(), appointment_id, tenant_id)
+    if conn is not None:
+        return conn.execute(sql, args).rowcount > 0
+    with get_conn() as c:
+        return c.execute(sql, args).rowcount > 0
 
 
-def cancel_appointment(tenant_id: int, appointment_id: int) -> bool:
+def cancel_appointment(tenant_id: int, appointment_id: int, conn=None) -> bool:
     """Cancelamento SUAVE: marca cancelled=1 (não apaga a linha).
     Mantém o registro para a psicóloga decidir sobre a política de cobrança
     e para as estatísticas; também faz o agendador PARAR de enviar lembretes
     (todas as queries de lembrete filtram cancelled=0)."""
-    with get_conn() as conn:
-        cur = conn.execute(
-            """UPDATE appointments
+    sql = """UPDATE appointments
                SET cancelled = 1, confirmation_sent = 1, followup_sent = 1
-               WHERE id = ? AND tenant_id = ?""",
-            (appointment_id, tenant_id),
-        )
-        return cur.rowcount > 0
+               WHERE id = ? AND tenant_id = ?"""
+    args = (appointment_id, tenant_id)
+    if conn is not None:
+        return conn.execute(sql, args).rowcount > 0
+    with get_conn() as c:
+        return c.execute(sql, args).rowcount > 0
 
 
 def log_cancellation(tenant_id: int, appt: dict, reason: str = "") -> None:
@@ -1441,6 +1640,653 @@ def rename_patient(tenant_id: int, appointment_id: int, new_name: str, apply_all
         return cur.rowcount
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# E03 — recebimento durável, posse por lease e outbox
+# ══════════════════════════════════════════════════════════════════════════════
+
+def next_sequence(name: str) -> int:
+    """Próximo valor de uma sequência durável.
+
+    Contador em tabela própria em vez de `MAX(coluna)+1`: linhas de oferta
+    expiram e podem ser removidas, e um MAX sobre elas voltaria atrás,
+    reaproveitando identidade já usada.
+    """
+    with get_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO counters (name, value) VALUES (?, 0)", (name,))
+        conn.execute("UPDATE counters SET value = value + 1 WHERE name = ?", (name,))
+        return int(conn.execute("SELECT value FROM counters WHERE name = ?",
+                                (name,)).fetchone()["value"])
+
+
+def _token() -> str:
+    return _secrets.token_urlsafe(12)
+
+
+# ── Recebimento ───────────────────────────────────────────────────────────────
+
+def inbound_record(tenant_id: int, provider: str, event_id: str, phone: str,
+                   body: str, event_id_source: str = "provider") -> tuple[int, bool]:
+    """Grava o evento recebido. Devolve (id_da_linha, era_duplicata).
+
+    Idempotente por (tenant_id, provider, event_id). Uma duplicata **não** cria
+    linha nova nem reabre o evento existente: o chamador responde "duplicate" e
+    não dispara ação alguma.
+
+    Levanta exceção se a gravação falhar — o webhook então NÃO pode responder
+    como enfileirado.
+    """
+    agora = _dt_local().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO inbound_events "
+            "(tenant_id, provider, event_id, event_id_source, phone, body, "
+            " state, stage, next_attempt_at, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,'pending','received',?,?,?)",
+            (tenant_id, provider, event_id, event_id_source, phone, body,
+             agora, agora, agora),
+        )
+        if cur.rowcount:
+            return int(cur.lastrowid), False
+        row = conn.execute(
+            "SELECT id FROM inbound_events WHERE tenant_id=? AND provider=? AND event_id=?",
+            (tenant_id, provider, event_id),
+        ).fetchone()
+    if not row:
+        raise RuntimeError("evento não gravado e não encontrado")
+    return int(row["id"]), True
+
+
+def inbound_claim(worker: str, lease_sec: int = 120, limit: int = 1) -> list[dict]:
+    """Toma posse de eventos prontos para processar.
+
+    Serialização por contato: um evento só é tomado se **nenhum outro** evento
+    do mesmo (tenant_id, phone) estiver em `processing` com lease válido. Dois
+    pacientes diferentes seguem independentes.
+
+    A posse é um `attempt_token` persistido. Toda transição posterior exige o
+    token, então um worker que perdeu o lease (travou, voltou depois) não
+    consegue finalizar nem alterar o evento.
+    """
+    agora = _dt_local()
+    agora_s = agora.isoformat(timespec="seconds")
+    ate = (agora + timedelta(seconds=max(5, lease_sec))).isoformat(timespec="seconds")
+    tomados: list[dict] = []
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        candidatos = conn.execute(
+            "SELECT * FROM inbound_events "
+            "WHERE state IN ('pending','processing') "
+            "  AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+            "  AND (state='pending' OR lease_until IS NULL OR lease_until <= ?) "
+            "ORDER BY id LIMIT 200",
+            (agora_s, agora_s),
+        ).fetchall()
+        ocupados = {
+            (r["tenant_id"], r["phone"])
+            for r in conn.execute(
+                "SELECT tenant_id, phone FROM inbound_events "
+                "WHERE state='processing' AND lease_until > ?", (agora_s,)
+            ).fetchall()
+        }
+        for r in candidatos:
+            if len(tomados) >= limit:
+                break
+            chave = (r["tenant_id"], r["phone"])
+            if chave in ocupados:
+                continue      # já há um evento deste contato em processamento
+            tok = _token()
+            upd = conn.execute(
+                "UPDATE inbound_events SET state='processing', attempt_token=?, "
+                "lease_until=?, worker=?, attempts=attempts+1, updated_at=? "
+                "WHERE id=? AND state=? AND COALESCE(attempt_token,'')=COALESCE(?,'')",
+                (tok, ate, worker, agora_s, r["id"], r["state"], r["attempt_token"]),
+            )
+            if not upd.rowcount:
+                continue      # outro worker chegou primeiro
+            ocupados.add(chave)
+            d = dict(r)
+            d.update(state="processing", attempt_token=tok, lease_until=ate,
+                     worker=worker, attempts=int(r["attempts"]) + 1)
+            tomados.append(d)
+    return tomados
+
+
+def inbound_update(row_id: int, attempt_token: str, **campos) -> bool:
+    """Atualiza o evento **somente se** o token de tentativa ainda for o atual.
+    Devolve False quando a posse foi perdida — o chamador deve abortar sem
+    alterar mais nada."""
+    permitidos = {"state", "stage", "decision", "reply_text", "offer_id",
+                  "last_error", "next_attempt_at", "lease_until"}
+    campos = {k: v for k, v in campos.items() if k in permitidos}
+    if not campos:
+        return False
+    campos["updated_at"] = _dt_local().isoformat(timespec="seconds")
+    sets = ", ".join(f"{k}=?" for k in campos)
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"UPDATE inbound_events SET {sets} WHERE id=? AND attempt_token=?",
+            (*campos.values(), row_id, attempt_token),
+        )
+        return bool(cur.rowcount)
+
+
+def inbound_release(row_id: int, attempt_token: str, atraso_seg: int,
+                    erro: str, max_attempts: int) -> bool:
+    """Devolve o evento para a fila com backoff, ou marca `failed` quando as
+    tentativas acabaram. Nada desaparece em log."""
+    agora = _dt_local()
+    with get_conn() as conn:
+        row = conn.execute("SELECT attempts FROM inbound_events WHERE id=?",
+                           (row_id,)).fetchone()
+        tentativas = int(row["attempts"]) if row else 0
+        if tentativas >= max_attempts:
+            novo_estado, prox = "failed", None
+        else:
+            novo_estado = "pending"
+            prox = (agora + timedelta(seconds=max(1, atraso_seg))).isoformat(timespec="seconds")
+        cur = conn.execute(
+            "UPDATE inbound_events SET state=?, next_attempt_at=?, last_error=?, "
+            "attempt_token=NULL, lease_until=NULL, updated_at=? "
+            "WHERE id=? AND attempt_token=?",
+            (novo_estado, prox, (erro or "")[:500],
+             agora.isoformat(timespec="seconds"), row_id, attempt_token),
+        )
+        return bool(cur.rowcount)
+
+
+def inbound_get(row_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM inbound_events WHERE id=?", (row_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def inbound_list(states: tuple = ("pending", "processing", "failed"),
+                 limit: int = 100) -> list[dict]:
+    marcas = ",".join("?" * len(states))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM inbound_events WHERE state IN ({marcas}) "
+            f"ORDER BY id DESC LIMIT ?", (*states, limit)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def inbound_force_pending(row_id: int) -> bool:
+    """Retry manual de suporte: devolve um evento `failed` para a fila. A posse
+    anterior é invalidada, então nenhum worker antigo consegue mexer nele."""
+    agora = _dt_local().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE inbound_events SET state='pending', attempt_token=NULL, "
+            "lease_until=NULL, next_attempt_at=?, updated_at=? WHERE id=?",
+            (agora, agora, row_id),
+        )
+        return bool(cur.rowcount)
+
+
+# ── Efeito local idempotente ──────────────────────────────────────────────────
+
+def effect_claim(conn, event_row_id: int, kind: str, ref_id: str = "") -> bool:
+    """Reserva o direito de aplicar um efeito deste evento, **na transação do
+    chamador**. Devolve False se já foi aplicado antes.
+
+    Recebe `conn` de propósito: a reserva e a mutação têm de estar na mesma
+    transação, senão uma queda no meio permitiria aplicar duas vezes.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO applied_effects (event_id, kind, ref_id, created_at) "
+        "VALUES (?,?,?,?)",
+        (event_row_id, kind, str(ref_id or ""),
+         _dt_local().isoformat(timespec="seconds")),
+    )
+    return bool(cur.rowcount)
+
+
+def pendencia_registrar(tenant_id: int, kind: str, detail: str,
+                        event_row_id: int | None = None, phone: str = "",
+                        state: str = "pendente") -> int:
+    """Registra (uma vez por evento+tipo) algo que ficou pendente ou incerto.
+
+    Idempotente de propósito: um retry do mesmo evento não enche a fila de
+    suporte com a mesma pendência.
+    """
+    agora = _dt_local().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO pending_effects "
+            "(tenant_id, event_row_id, phone, kind, state, detail, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (tenant_id, event_row_id, phone, kind, state, detail[:500], agora, agora),
+        )
+        if cur.rowcount:
+            return int(cur.lastrowid)
+        row = conn.execute(
+            "SELECT id FROM pending_effects WHERE event_row_id IS ? AND kind=?",
+            (event_row_id, kind)).fetchone()
+    return int(row["id"]) if row else 0
+
+
+def pendencia_list(states: tuple = ("pendente", "incerto"), limit: int = 100) -> list[dict]:
+    marcas = ",".join("?" * len(states))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM pending_effects WHERE state IN ({marcas}) "
+            f"ORDER BY id DESC LIMIT ?", (*states, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def pendencia_resolver(pendencia_id: int, motivo: str) -> bool:
+    agora = _dt_local().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE pending_effects SET state='resolvido', resolution=?, updated_at=? "
+            "WHERE id=?", (f"{agora} {motivo}"[:500], agora, pendencia_id))
+        return bool(cur.rowcount)
+
+
+class PosseEPerdida(RuntimeError):
+    """O worker perdeu o lease do evento. Nenhuma mutação pode seguir."""
+
+
+@contextmanager
+def effect_tx(event_row_id: int, attempt_token: str, kind: str, ref_id: str = ""):
+    """Transação que valida a POSSE do evento **e** reserva o efeito, juntas.
+
+    Entrega `(conn, ja_aplicado, ref_anterior)`. O chamador faz a mutação com
+    esse `conn`, então a marca e a mutação commitam no mesmo instante.
+
+    Por que a posse é verificada aqui e não só na troca de estágio: um worker que
+    perdeu o lease (travou, voltou depois) continuaria com um objeto de evento em
+    memória e, sem esta checagem, conseguiria mexer na agenda — confirmar uma
+    consulta que já foi remarcada, zerar lembretes de novo, duplicar aviso. A
+    validação é feita no MESMO `BEGIN IMMEDIATE` da gravação, por isso é atômica:
+    não existe janela entre "confirmei que sou o dono" e "gravei".
+
+    Por que não basta ser "idempotente por valor": gravar `confirmed=1` duas
+    vezes dá o mesmo valor, mas uma reaplicação TARDIA de uma decisão antiga,
+    depois de o paciente já ter remarcado, confirma a consulta errada, zera os
+    marcadores de lembrete e redispara notificação. A identidade por evento é o
+    que impede isso.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        pass
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        dono = conn.execute(
+            "SELECT 1 FROM inbound_events WHERE id=? AND attempt_token=?",
+            (event_row_id, attempt_token),
+        ).fetchone()
+        if not dono:
+            conn.rollback()
+            raise PosseEPerdida(
+                f"evento {event_row_id}: posse perdida — mutação {kind} abortada")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO applied_effects (event_id, kind, ref_id, created_at) "
+            "VALUES (?,?,?,?)",
+            (event_row_id, kind, str(ref_id or ""),
+             _dt_local().isoformat(timespec="seconds")),
+        )
+        ja_aplicado = not bool(cur.rowcount)
+        anterior = ""
+        if ja_aplicado:
+            row = conn.execute(
+                "SELECT ref_id FROM applied_effects WHERE event_id=? AND kind=?",
+                (event_row_id, kind),
+            ).fetchone()
+            anterior = str(row["ref_id"]) if row else ""
+        yield conn, ja_aplicado, anterior
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def effect_set_ref(conn, event_row_id: int, kind: str, ref_id) -> None:
+    """Grava a referência do efeito (ex.: id da consulta criada) na mesma
+    transação da mutação."""
+    conn.execute("UPDATE applied_effects SET ref_id=? WHERE event_id=? AND kind=?",
+                 (str(ref_id), event_row_id, kind))
+
+
+def effect_get(event_row_id: int, kind: str) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM applied_effects WHERE event_id=? AND kind=?",
+            (event_row_id, kind),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+# ── Outbox ────────────────────────────────────────────────────────────────────
+
+def outbox_enqueue(tenant_id: int, phone: str, body: str, idempotency_key: str,
+                   kind: str = "reply", event_row_id: int | None = None,
+                   offer_id: str | None = None) -> int:
+    """Enfileira uma mensagem de saída. `idempotency_key` é única: reprocessar o
+    mesmo evento não gera segunda mensagem."""
+    agora = _dt_local().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO outbox (tenant_id, event_row_id, phone, body, "
+            "kind, state, idempotency_key, offer_id, next_attempt_at, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,'pending',?,?,?,?,?)",
+            (tenant_id, event_row_id, phone, body, kind, idempotency_key,
+             offer_id, agora, agora, agora),
+        )
+        if cur.rowcount:
+            return int(cur.lastrowid)
+        row = conn.execute("SELECT id FROM outbox WHERE idempotency_key=?",
+                           (idempotency_key,)).fetchone()
+    return int(row["id"]) if row else 0
+
+
+def outbox_claim(worker: str, lease_sec: int = 60, limit: int = 5) -> list[dict]:
+    agora = _dt_local()
+    agora_s = agora.isoformat(timespec="seconds")
+    ate = (agora + timedelta(seconds=max(5, lease_sec))).isoformat(timespec="seconds")
+    tomados: list[dict] = []
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT * FROM outbox WHERE state IN ('pending','sending') "
+            "  AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+            "  AND (state='pending' OR lease_until IS NULL OR lease_until <= ?) "
+            "ORDER BY id LIMIT ?", (agora_s, agora_s, limit),
+        ).fetchall()
+        for r in rows:
+            tok = _token()
+            cur = conn.execute(
+                "UPDATE outbox SET state='sending', attempt_token=?, lease_until=?, "
+                "attempts=attempts+1, updated_at=? "
+                "WHERE id=? AND state=? AND COALESCE(attempt_token,'')=COALESCE(?,'')",
+                (tok, ate, agora_s, r["id"], r["state"], r["attempt_token"]),
+            )
+            if not cur.rowcount:
+                continue
+            d = dict(r)
+            d.update(state="sending", attempt_token=tok, lease_until=ate,
+                     attempts=int(r["attempts"]) + 1)
+            tomados.append(d)
+    return tomados
+
+
+def outbox_mark(outbox_id: int, attempt_token: str, state: str,
+                provider: str = "", provider_message_id: str = "",
+                last_error: str = "") -> bool:
+    """Grava o desfecho do envio, só com a posse válida."""
+    agora = _dt_local().isoformat(timespec="seconds")
+    enviado = agora if state in ("provider_accepted", "delivery_confirmed") else None
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE outbox SET state=?, provider=?, provider_message_id=?, "
+            "last_error=?, sent_at=COALESCE(?, sent_at), attempt_token=NULL, "
+            "lease_until=NULL, updated_at=? WHERE id=? AND attempt_token=?",
+            (state, provider, provider_message_id, (last_error or "")[:500],
+             enviado, agora, outbox_id, attempt_token),
+        )
+        return bool(cur.rowcount)
+
+
+def outbox_requeue(outbox_id: int, attempt_token: str, atraso_seg: int,
+                   erro: str, max_attempts: int) -> str:
+    """Devolve ao fim da fila com backoff; esgotadas as tentativas marca
+    `failed`. Devolve o estado resultante."""
+    agora = _dt_local()
+    with get_conn() as conn:
+        row = conn.execute("SELECT attempts FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+        tentativas = int(row["attempts"]) if row else 0
+        if tentativas >= max_attempts:
+            estado, prox = "failed", None
+        else:
+            estado = "pending"
+            prox = (agora + timedelta(seconds=max(1, atraso_seg))).isoformat(timespec="seconds")
+        conn.execute(
+            "UPDATE outbox SET state=?, next_attempt_at=?, last_error=?, "
+            "attempt_token=NULL, lease_until=NULL, updated_at=? "
+            "WHERE id=? AND attempt_token=?",
+            (estado, prox, (erro or "")[:500],
+             agora.isoformat(timespec="seconds"), outbox_id, attempt_token),
+        )
+    return estado
+
+
+def outbox_get(outbox_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM outbox WHERE id=?", (outbox_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def outbox_list(states: tuple = ("pending", "sending", "failed", "uncertain"),
+                limit: int = 100) -> list[dict]:
+    marcas = ",".join("?" * len(states))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM outbox WHERE state IN ({marcas}) ORDER BY id DESC LIMIT ?",
+            (*states, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def outbox_resolve(outbox_id: int, estado: str, nota: str) -> bool:
+    """Resolução manual auditada de um envio incerto ou falho. Guarda quem/por
+    quê em `resolution` — não some em log."""
+    agora = _dt_local().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE outbox SET state=?, resolution=?, attempt_token=NULL, "
+            "lease_until=NULL, next_attempt_at=NULL, updated_at=? WHERE id=?",
+            (estado, f"{agora} {nota}"[:500], agora, outbox_id),
+        )
+        return bool(cur.rowcount)
+
+
+# ── Oferta de horários por conversa ───────────────────────────────────────────
+# Grava a lista EXATA de horários que o agente mostrou ao paciente, na ordem em
+# que ele a viu. Resolver "quero o 1" por aqui — e não pela posição na lista
+# global do calendário — é o que impede marcar o paciente em outro dia.
+
+SLOT_OFFER_TTL_MIN = 180
+
+# Estados de envio que tornam uma oferta elegível para resolver "quero o 1".
+# `provider_accepted` é a melhor evidência disponível na configuração atual
+# (Evolution/Baileys não entrega webhook de status nesta instalação).
+# `not_sent`, `sending`, `uncertain` e `failed` NÃO autorizam reserva.
+OFFER_SEND_ELEGIVEL = ("provider_accepted", "delivery_confirmed")
+
+
+def offer_create(tenant_id: int, phone: str, slots, event_row_id: int | None = None,
+                 ttl_min: int = SLOT_OFFER_TTL_MIN) -> dict:
+    """Cria uma oferta em `draft` com identidade imutável (`offer_id` + `seq`).
+
+    Nasce em draft de propósito: a oferta que o paciente já vê não pode ser
+    substituída por uma que ainda não foi enviada. A ativação acontece quando o
+    envio é aceito (`offer_mark_sent`).
+    """
+    import json as _json
+    agora = _dt_local()
+    oid = _uuid.uuid4().hex
+    seq = next_sequence("offer")
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO offers (offer_id, seq, tenant_id, phone, slots, state, "
+            "send_state, event_row_id, created_at, updated_at, expires_at) "
+            "VALUES (?,?,?,?,?,'draft','not_sent',?,?,?,?)",
+            (oid, seq, tenant_id, phone,
+             _json.dumps([s.strftime("%Y-%m-%dT%H:%M") for s in slots]),
+             event_row_id, agora.isoformat(timespec="seconds"),
+             agora.isoformat(timespec="seconds"),
+             (agora + timedelta(minutes=max(1, ttl_min))).isoformat(timespec="seconds")),
+        )
+    return {"offer_id": oid, "seq": seq}
+
+
+def offer_get(offer_id: str) -> dict | None:
+    import json as _json
+    if not offer_id:
+        return None
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM offers WHERE offer_id=?", (offer_id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["slots"] = [datetime.fromisoformat(s) for s in _json.loads(row["slots"])]
+    except Exception:
+        d["slots"] = []
+    d["expired"] = datetime.fromisoformat(row["expires_at"]) <= _dt_local()
+    d["eligible"] = (
+        d["state"] == "active"
+        and not d["expired"]
+        and d["send_state"] in OFFER_SEND_ELEGIVEL
+        and bool(d["slots"])
+    )
+    return d
+
+
+def offer_set_outbox(offer_id: str, outbox_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE offers SET outbox_id=?, send_state='sending', updated_at=? "
+                     "WHERE offer_id=? AND send_state IN ('not_sent','sending')",
+                     (outbox_id, _dt_local().isoformat(timespec="seconds"), offer_id))
+
+
+def offer_mark_sent(offer_id: str, send_state: str) -> dict:
+    """Aplica o desfecho do envio **a esta oferta exata** e devolve o que foi
+    decidido. A correlação é pelo `offer_id`, não por (tenant, telefone): uma
+    resposta de envio atrasada da oferta A não pode mais marcar a oferta B.
+
+    Política:
+      - aceito/confirmado → a oferta vira `active` e a anterior vira
+        `superseded`. Só aqui o paciente passa a ter uma lista nova válida.
+      - falha definitiva  → a oferta nova é `cancelled` e a anterior **continua
+        valendo**: o paciente nunca viu a nova.
+      - incerto           → a oferta fica `draft`/`uncertain`. Nem ela nem a
+        anterior são elegíveis: há ambiguidade real sobre o que o paciente viu,
+        e ambiguidade pede esclarecimento, não reserva.
+    """
+    agora = _dt_local().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM offers WHERE offer_id=?", (offer_id,)).fetchone()
+        if not row:
+            return {"offer_id": offer_id, "acao": "inexistente"}
+        if row["state"] in ("consumed", "cancelled", "superseded"):
+            # Desfecho chegou depois de a oferta já ter sido encerrada: registra
+            # o estado de envio, mas não ressuscita a oferta.
+            conn.execute("UPDATE offers SET send_state=?, updated_at=? WHERE offer_id=?",
+                         (send_state, agora, offer_id))
+            return {"offer_id": offer_id, "acao": "tardio_ignorado",
+                    "state": row["state"]}
+        if send_state in OFFER_SEND_ELEGIVEL:
+            conn.execute(
+                "UPDATE offers SET state='superseded', updated_at=? "
+                "WHERE tenant_id=? AND phone=? AND offer_id<>? AND state='active'",
+                (agora, row["tenant_id"], row["phone"], offer_id),
+            )
+            conn.execute("UPDATE offers SET state='active', send_state=?, updated_at=? "
+                         "WHERE offer_id=?", (send_state, agora, offer_id))
+            return {"offer_id": offer_id, "acao": "ativada"}
+        if send_state == "failed":
+            conn.execute("UPDATE offers SET state='cancelled', send_state='failed', "
+                         "updated_at=? WHERE offer_id=?", (agora, offer_id))
+            return {"offer_id": offer_id, "acao": "cancelada_anterior_mantida"}
+        conn.execute("UPDATE offers SET send_state=?, updated_at=? WHERE offer_id=?",
+                     (send_state, agora, offer_id))
+        return {"offer_id": offer_id, "acao": "incerta"}
+
+
+def offer_consume(offer_id: str) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE offers SET state='consumed', updated_at=? WHERE offer_id=?",
+                     (_dt_local().isoformat(timespec="seconds"), offer_id))
+
+
+def offer_invalidate(tenant_id: int, phone: str, motivo: str = "") -> int:
+    """Encerra todas as ofertas vivas do contato: rascunhos viram `cancelled` e
+    a ativa vira `superseded`.
+
+    Usado quando a mensagem que o paciente vai ler apresenta uma lista de
+    horários que **não** corresponde a nenhuma oferta montada pelo servidor —
+    aí nenhuma oferta anterior descreve mais o que ele está vendo.
+    """
+    agora = _dt_local().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        c1 = conn.execute(
+            "UPDATE offers SET state='cancelled', updated_at=? "
+            "WHERE tenant_id=? AND phone=? AND state='draft'",
+            (agora, tenant_id, phone))
+        c2 = conn.execute(
+            "UPDATE offers SET state='superseded', updated_at=? "
+            "WHERE tenant_id=? AND phone=? AND state='active'",
+            (agora, tenant_id, phone))
+        return c1.rowcount + c2.rowcount
+
+
+def offer_cancel_drafts(tenant_id: int, phone: str) -> int:
+    """Cancela rascunhos pendentes daquele contato (nenhum chegou ao paciente)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE offers SET state='cancelled', updated_at=? "
+            "WHERE tenant_id=? AND phone=? AND state='draft'",
+            (_dt_local().isoformat(timespec="seconds"), tenant_id, phone),
+        )
+        return cur.rowcount
+
+
+def offer_context(tenant_id: int, phone: str) -> dict:
+    """Situação das ofertas daquele contato, para decidir se um número pode ser
+    resolvido.
+
+    Devolve `ativa` (a oferta que o paciente comprovadamente recebeu),
+    `ambigua` (True quando existe uma oferta posterior cujo envio ficou
+    incerto — o paciente pode ter visto uma lista ou outra) e `pendentes`.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT offer_id, seq, state, send_state, expires_at FROM offers "
+            "WHERE tenant_id=? AND phone=? AND state IN ('draft','active') "
+            "ORDER BY seq", (tenant_id, phone),
+        ).fetchall()
+    ativa = None
+    incertas = []
+    pendentes = []
+    for r in rows:
+        if datetime.fromisoformat(r["expires_at"]) <= _dt_local():
+            continue
+        if r["state"] == "active" and r["send_state"] in OFFER_SEND_ELEGIVEL:
+            ativa = r["offer_id"]
+        elif r["send_state"] == "uncertain":
+            incertas.append(r["offer_id"])
+        else:
+            pendentes.append(r["offer_id"])
+    return {"ativa": offer_get(ativa) if ativa else None,
+            "ambigua": bool(incertas), "incertas": incertas,
+            "pendentes": pendentes}
+
+
+# As funções `save_slot_offer` / `get_slot_offer` / `mark_slot_offer_delivered`
+# de E02 foram substituídas pela família `offer_*` acima. Motivos:
+#
+# - `UNIQUE(tenant_id, phone)` impedia manter a oferta que o paciente já viu
+#   enquanto uma nova ainda não foi enviada;
+# - `mark_slot_offer_delivered(tenant, phone)` marcava "a oferta daquele
+#   contato", então uma resposta de envio atrasada da oferta A marcava a B;
+# - `version` vinha de `MAX(version)+1` sobre linhas que expiram e podem ser
+#   apagadas, logo não era identidade monotônica de verdade.
+#
+# A tabela `slot_offers` continua existindo e **não é usada**. Como nunca foi
+# publicada, não há dado real nela; pode ser removida manualmente depois do
+# deploy desta etapa (ver EVIDENCIAS/03.md).
+def _dt_local() -> datetime:
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None)
+
+
 def webhook_seen_check_and_mark(msg_id: str) -> bool:
     """Dedup PERSISTENTE de webhooks. Retorna True se o msg_id JÁ foi visto
     (duplicata → ignorar); caso contrário registra e retorna False. Atômico via
@@ -1461,13 +2307,13 @@ def webhook_seen_check_and_mark(msg_id: str) -> bool:
         return already
 
 
-def confirm_appointment(tenant_id: int, appointment_id: int) -> bool:
-    with get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE appointments SET confirmed = 1 WHERE id = ? AND tenant_id = ?",
-            (appointment_id, tenant_id),
-        )
-        return cur.rowcount > 0
+def confirm_appointment(tenant_id: int, appointment_id: int, conn=None) -> bool:
+    sql = "UPDATE appointments SET confirmed = 1 WHERE id = ? AND tenant_id = ?"
+    args = (appointment_id, tenant_id)
+    if conn is not None:
+        return conn.execute(sql, args).rowcount > 0
+    with get_conn() as c:
+        return c.execute(sql, args).rowcount > 0
 
 
 ATTENDANCE_VALUES = {"pending", "attended", "missed_no_notice", "missed_with_notice"}

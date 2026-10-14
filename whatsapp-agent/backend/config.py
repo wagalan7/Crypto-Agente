@@ -91,3 +91,49 @@ INSTANCE_MONITOR_ENABLED       = os.getenv("INSTANCE_MONITOR_ENABLED", "1") == "
 INSTANCE_MONITOR_INTERVAL_MIN  = int(os.getenv("INSTANCE_MONITOR_INTERVAL_MIN", "10"))   # checa a cada N min
 INSTANCE_MONITOR_FAIL_THRESHOLD= int(os.getenv("INSTANCE_MONITOR_FAIL_THRESHOLD", "3"))  # falhas seguidas p/ tratar como queda
 INSTANCE_MONITOR_REALERT_HOURS = int(os.getenv("INSTANCE_MONITOR_REALERT_HOURS", "6"))   # re-alerta se seguir caído
+
+
+# ── E03: recebimento durável e outbox ─────────────────────────────────────────
+# O processamento das mensagens recebidas e o envio das respostas rodam em
+# threads do próprio processo (como o agendador). Não há serviço externo.
+#
+# IMPORTANTE: com o inbox ligado e o outbox desligado, as respostas ficam
+# acumuladas em `outbox` no estado `pending` e NINGUÉM envia — o paciente não
+# recebe nada. Por isso o boot recusa essa combinação (ver main.py).
+def _int_env(nome: str, padrao: int, minimo: int, maximo: int) -> int:
+    """Lê um inteiro de ambiente e mantém dentro de limites sãos.
+    Valor fora da faixa é corrigido com aviso em vez de derrubar o boot."""
+    import logging as _lg
+    try:
+        v = int(os.getenv(nome, str(padrao)))
+    except (TypeError, ValueError):
+        _lg.getLogger(__name__).warning(
+            f"{nome} inválido — usando {padrao}")
+        return padrao
+    if v < minimo or v > maximo:
+        _lg.getLogger(__name__).warning(
+            f"{nome}={v} fora da faixa [{minimo},{maximo}] — ajustado")
+        return min(max(v, minimo), maximo)
+    return v
+
+
+INBOX_WORKER_ENABLED        = os.getenv("INBOX_WORKER_ENABLED", "1") == "1"
+INBOX_WORKER_INTERVAL_SEC   = _int_env("INBOX_WORKER_INTERVAL_SEC", 10, 2, 600)
+INBOX_BATCH                 = _int_env("INBOX_BATCH", 20, 1, 200)
+INBOX_LEASE_SEC             = _int_env("INBOX_LEASE_SEC", 180, 30, 1800)
+INBOX_MAX_ATTEMPTS          = _int_env("INBOX_MAX_ATTEMPTS", 5, 1, 20)
+
+OUTBOX_WORKER_ENABLED       = os.getenv("OUTBOX_WORKER_ENABLED", "1") == "1"
+OUTBOX_WORKER_INTERVAL_SEC  = _int_env("OUTBOX_WORKER_INTERVAL_SEC", 5, 2, 600)
+OUTBOX_BATCH                = _int_env("OUTBOX_BATCH", 10, 1, 100)
+OUTBOX_LEASE_SEC            = _int_env("OUTBOX_LEASE_SEC", 90, 20, 900)
+OUTBOX_MAX_ATTEMPTS         = _int_env("OUTBOX_MAX_ATTEMPTS", 4, 1, 20)
+
+# Validade da oferta de horários (minutos). Depois disso o "quero o 1" pede
+# esclarecimento em vez de reservar.
+OFFER_TTL_MIN               = _int_env("OFFER_TTL_MIN", 180, 5, 1440)
+
+# Empurrão de baixa latência no webhook: processa o que acabou de chegar sem
+# esperar o laço. Desligar deixa tudo por conta dos workers (é o que a suíte
+# faz, para que cada teste controle quando o processamento acontece).
+INBOX_NUDGE_ON_WEBHOOK      = os.getenv("INBOX_NUDGE_ON_WEBHOOK", "1") == "1"

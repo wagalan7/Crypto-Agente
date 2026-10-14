@@ -18,6 +18,244 @@ from models import AgentResponse, Action, Intent
 # depender de variáveis locais de outras funções.
 _TZ = ZoneInfo("America/Sao_Paulo")
 
+
+def _now() -> datetime:
+    """Agora em horário de Brasília, naive. Ponto único de leitura do relógio no
+    agente, para que o tempo possa ser fixado em teste."""
+    return datetime.now(_TZ).replace(tzinfo=None)
+
+
+# ── Contexto do evento em processamento (E03) ──────────────────────────────────
+# Cada mensagem recebida é um evento durável em `inbound_events`. O id desse
+# evento viaja num contexto por thread em vez de num parâmetro atravessando
+# dezenas de funções: `process_message` roda numa thread por evento
+# (`asyncio.to_thread` no main), então o escopo é exatamente o certo.
+#
+# Para que serve: tornar a criação de consulta idempotente POR EVENTO. Uma
+# reentrada (lease vencido, retry após falha, reinício do processo) não pode
+# criar uma segunda consulta.
+import threading as _threading
+from contextlib import contextmanager as _contextmanager
+
+_ctx = _threading.local()
+
+
+@_contextmanager
+def contexto_evento(event_row_id: int | None, attempt_token: str | None = None,
+                    identidade_confiavel: bool = True):
+    """Amarra a conversa ao evento durável e à posse (lease) do worker.
+
+    `attempt_token` viaja junto porque a posse é validada **dentro da transação
+    da mutação** (ver `database.effect_tx`), não só na troca de estágio.
+
+    `identidade_confiavel=False` quando o provedor não mandou id de mensagem.
+    Nesse caso **nenhuma mutação é executada**: sem id, uma reentrega vira outro
+    evento e a marca por evento não protege nada. O agente ainda consulta,
+    acolhe e esclarece; a ação fica como pendência para revisão.
+    """
+    anterior = getattr(_ctx, "event_row_id", None)
+    tok_anterior = getattr(_ctx, "attempt_token", None)
+    oferta_anterior = getattr(_ctx, "offer_id", None)
+    ident_anterior = getattr(_ctx, "identidade_confiavel", True)
+    _ctx.event_row_id = event_row_id
+    _ctx.attempt_token = attempt_token
+    _ctx.identidade_confiavel = identidade_confiavel
+    _ctx.offer_id = None
+    try:
+        yield _ctx
+    finally:
+        _ctx.event_row_id = anterior
+        _ctx.attempt_token = tok_anterior
+        _ctx.identidade_confiavel = ident_anterior
+        _ctx.offer_id = oferta_anterior
+
+
+# Mutações e efeitos externos que exigem identidade confiável do evento.
+_ACOES_BLOQUEAVEIS = {
+    "create": "agendar",
+    "update": "remarcar",
+    "confirm": "confirmar a presença",
+    "cancel": "cancelar",
+}
+
+_MOTIVO_SEM_IDENTIDADE = (
+    "mensagem recebida sem id do provedor: uma reentrega da mesma mensagem "
+    "viraria outro evento, então a proteção contra ação em dobro não vale aqui"
+)
+
+
+def _mutacao_permitida() -> bool:
+    """Falso quando o evento não tem identidade confiável.
+
+    Sem contexto de evento (painel, endpoint de teste, agendador) devolve
+    verdadeiro: ali não há reentrega de provedor para proteger.
+    """
+    if _evento_atual() is None:
+        return True
+    return bool(getattr(_ctx, "identidade_confiavel", True))
+
+
+def _bloquear_mutacao(tenant: dict, phone: str, acao: str) -> str:
+    """Registra a pendência e devolve a resposta ao paciente.
+
+    Não é ficar calado: o paciente recebe uma resposta e o pedido fica visível
+    para revisão humana em `GET /admin/fila`.
+    """
+    rotulo = _ACOES_BLOQUEAVEIS.get(acao, acao)
+    try:
+        db.pendencia_registrar(
+            tenant["id"], f"bloqueado:{acao}",
+            f"{rotulo} não executado — {_MOTIVO_SEM_IDENTIDADE}",
+            event_row_id=_evento_atual(), phone=phone)
+    except Exception as e:
+        logger.exception(f"[agent] falha ao registrar pendência de {acao}: {e}")
+        raise
+    logger.warning(f"[{tenant.get('slug')}][{phone}] mutação '{acao}' BLOQUEADA "
+                   f"(evento {_evento_atual()} sem id do provedor) — pendência "
+                   f"registrada para revisão")
+    nome = _primeiro_nome(tenant, phone)
+    saud = f"{nome}, " if nome else ""
+    return (f"{saud}recebi sua mensagem! 😊 Só preciso confirmar com você antes de "
+            f"{rotulo}: pode me responder esta mensagem repetindo o dia e o "
+            f"horário que prefere? Assim eu registro com segurança. 🙏")
+
+
+def _evento_atual() -> int | None:
+    return getattr(_ctx, "event_row_id", None)
+
+
+def _oferta_do_turno() -> str | None:
+    return getattr(_ctx, "offer_id", None)
+
+
+def _posse_atual() -> str | None:
+    return getattr(_ctx, "attempt_token", None)
+
+
+def _mutacao_do_evento(kind: str):
+    """Decide como executar uma mutação da agenda vinda de uma mensagem.
+
+    Devolve `(contexto, tem_evento)`. Com evento, o contexto é
+    `db.effect_tx(...)`: valida a posse do lease **e** reserva o efeito na mesma
+    transação da gravação. Sem evento (painel, endpoint de teste, agendador), a
+    mutação segue direta — não há identidade de evento para ancorar, e isso está
+    registrado como limite em EVIDENCIAS/03.md.
+
+    Vale para TODAS as mutações do fluxo de entrada, não só a criação. "Gravar
+    o mesmo valor duas vezes" não é inofensivo: reaplicar uma confirmação antiga
+    depois de o paciente ter remarcado confirma a consulta errada, zera os
+    marcadores de lembrete e redispara aviso.
+    """
+    ev, tok = _evento_atual(), _posse_atual()
+    if ev is None or tok is None:
+        return None, False
+    return db.effect_tx(ev, tok, kind), True
+
+
+def _criar_consulta_idempotente(tenant_id: int, nome: str, phone: str,
+                                slot: datetime) -> tuple[int, bool]:
+    """Cria a consulta **uma única vez por evento**. Devolve (id, criada_agora)."""
+    ctx, tem_evento = _mutacao_do_evento("appointment:create")
+    if not tem_evento:
+        return db.create_appointment(tenant_id, nome, phone, slot), True
+    with ctx as (conn, ja_aplicado, ref_anterior):
+        if ja_aplicado:
+            anterior = int(ref_anterior) if str(ref_anterior).isdigit() else 0
+            logger.info(f"[agent] evento {_evento_atual()}: consulta já criada "
+                        f"(id={anterior}) — não duplicando")
+            return anterior, False
+        appt_id = db.create_appointment(tenant_id, nome, phone, slot, conn=conn)
+        db.effect_set_ref(conn, _evento_atual(), "appointment:create", appt_id)
+        return int(appt_id), True
+
+
+def _remarcar_idempotente(tenant_id: int, appt_id: int, slot: datetime) -> bool:
+    """Remarca uma única vez por evento. Devolve se a gravação ocorreu agora."""
+    ctx, tem_evento = _mutacao_do_evento("appointment:update")
+    if not tem_evento:
+        return db.update_appointment(tenant_id, appt_id, slot)
+    with ctx as (conn, ja_aplicado, _ref):
+        if ja_aplicado:
+            logger.info(f"[agent] evento {_evento_atual()}: remarcação já aplicada "
+                        f"— não reaplicando (não zera lembretes de novo)")
+            return False
+        ok = db.update_appointment(tenant_id, appt_id, slot, conn=conn)
+        db.effect_set_ref(conn, _evento_atual(), "appointment:update", appt_id)
+        return ok
+
+
+def _confirmar_idempotente(tenant_id: int, appt_id: int) -> bool:
+    ctx, tem_evento = _mutacao_do_evento("appointment:confirm")
+    if not tem_evento:
+        return db.confirm_appointment(tenant_id, appt_id)
+    with ctx as (conn, ja_aplicado, _ref):
+        if ja_aplicado:
+            logger.info(f"[agent] evento {_evento_atual()}: confirmação já aplicada")
+            return False
+        ok = db.confirm_appointment(tenant_id, appt_id, conn=conn)
+        db.effect_set_ref(conn, _evento_atual(), "appointment:confirm", appt_id)
+        return ok
+
+
+def _cancelar_idempotente(tenant_id: int, appt_id: int) -> bool:
+    ctx, tem_evento = _mutacao_do_evento("appointment:cancel")
+    if not tem_evento:
+        return db.cancel_appointment(tenant_id, appt_id)
+    with ctx as (conn, ja_aplicado, _ref):
+        if ja_aplicado:
+            logger.info(f"[agent] evento {_evento_atual()}: cancelamento já aplicado")
+            return False
+        ok = db.cancel_appointment(tenant_id, appt_id, conn=conn)
+        db.effect_set_ref(conn, _evento_atual(), "appointment:cancel", appt_id)
+        return ok
+
+
+def _pendencia_externa(tenant: dict, phone: str, kind: str, erro: str) -> None:
+    """Registra que um efeito externo disparado pela entrada ficou INCERTO.
+
+    O agendamento local é mantido de propósito (*fail-open*: perder a consulta
+    por causa do Google seria pior). Mas a falha não pode terminar só num log:
+    fica pendência visível em `GET /admin/fila`, para alguém conferir a agenda
+    externa. **Não é reexecutada automaticamente** — o efeito local já está
+    marcado como aplicado, e tentar de novo às cegas duplicaria o evento no
+    calendário.
+    """
+    try:
+        db.pendencia_registrar(tenant["id"], kind, str(erro)[:400],
+                               event_row_id=_evento_atual(), phone=phone,
+                               state="incerto")
+    except Exception as e:
+        logger.exception(f"[agent] falha ao registrar pendência {kind}: {e}")
+    logger.warning(f"[{tenant.get('slug')}][{phone}] efeito externo {kind} "
+                   f"INCERTO: {str(erro)[:200]} — pendência registrada")
+
+
+def _efeito_do_evento(kind: str) -> str | None:
+    """Referência do efeito já aplicado por este evento, ou None."""
+    ev = _evento_atual()
+    if ev is None:
+        return None
+    r = db.effect_get(ev, kind)
+    ref = (r or {}).get("ref_id") or ""
+    return ref if str(ref).strip() else None
+
+
+def _salvar_mensagem_idempotente(tenant_id: int, phone: str, role: str, texto: str) -> None:
+    """`conversations` é append-only: sem identidade de evento, um retry
+    duplicaria a mensagem na aba Conversas do painel."""
+    ctx, tem_evento = _mutacao_do_evento(f"conversation:{role}")
+    if not tem_evento:
+        db.save_message(tenant_id, phone, role, texto)
+        return
+    try:
+        with ctx as (conn, ja_aplicado, _ref):
+            if ja_aplicado:
+                return
+            db.save_message(tenant_id, phone, role, texto, conn=conn)
+    except db.PosseEPerdida:
+        raise
+
+
 logger = logging.getLogger(__name__)
 
 _groq_client = None
@@ -156,13 +394,17 @@ def _confirm_today_tail(reply: str, slot, tenant: dict, appt_id=None) -> str:
     followup da manhã). Fora o mesmo-dia, o texto volta intacto. Cobre tanto o
     texto do LLM quanto os fallbacks determinísticos."""
     try:
-        if slot.date() != datetime.now(_TZ).date():
+        if slot.date() != _now().date():
             return reply
     except Exception:
         return reply
     if appt_id is not None:
         try:
-            db.confirm_appointment(tenant["id"], int(appt_id))
+            # Mesma proteção das demais confirmações: identidade por evento.
+            # Sem ela, um retry tardio reconfirmaria uma consulta já remarcada.
+            _confirmar_idempotente(tenant["id"], int(appt_id))
+        except db.PosseEPerdida:
+            raise
         except Exception as e:
             logger.warning(f"[{tenant.get('slug')}] confirmação mesmo-dia falhou: {e}")
     # Remove qualquer promessa de lembrete da véspera, em qualquer variação
@@ -432,7 +674,7 @@ FORMATO DE RESPOSTA (OBRIGATÓRIO — responda APENAS com JSON válido, sem mark
 }}
 
 CAMPOS data ESPERADOS POR AÇÃO:
-- list_slots: {{}}
+- list_slots: {{"offered_ids": ["2026-09-21T15:00", "2026-09-21T16:00"]}}
 - create: {{"patient_name": "...", "slot_id": "2026-09-21T15:00"}}
 - update: {{"appointment_id": 1, "slot_id": "2026-09-21T15:00"}}
 - confirm: {{"appointment_id": 1}}
@@ -448,6 +690,17 @@ NUNCA use a posição/numeração que VOCÊ mostrou ao paciente. Você mostra um
 lista filtrada (4-5 opções), então o "1" que ele vê quase nunca é o "1" da lista
 acima — mandar a posição marca o paciente no horário ERRADO.
 NUNCA invente um id: use somente ids que aparecem na lista.
+
+REGRA CRÍTICA — offered_ids (obrigatório em list_slots):
+Em list_slots, escolha quais horários oferecer e coloque os ids em
+"offered_ids", NA ORDEM em que quer que o paciente os veja. Máximo 5.
+Ex.: "offered_ids": ["2026-09-21T15:00", "2026-09-22T10:00"].
+NÃO escreva a lista de horários no response_text: o sistema monta a mensagem
+numerada a partir de offered_ids, para que o número que o paciente vê seja
+exatamente o horário que ele vai receber. Em list_slots o response_text é
+ignorado — pode deixá-lo vazio.
+Se você não tiver ids para oferecer, use action "none" e pergunte o dia ou o
+período em vez de listar horários no texto.
 
 SITUAÇÕES ESPECIAIS:
 
@@ -647,7 +900,7 @@ FORMATO DE RESPOSTA (OBRIGATÓRIO — responda APENAS com JSON válido, sem mark
 }}
 
 CAMPOS data ESPERADOS POR AÇÃO:
-- list_slots: {{}}
+- list_slots: {{"offered_ids": ["2026-09-21T15:00", "2026-09-21T16:00"]}}
 - create: {{"patient_name": "...", "slot_id": "2026-09-21T15:00"}}
 - update: {{"appointment_id": 1, "slot_id": "2026-09-21T15:00"}}
 - confirm: {{"appointment_id": 1}}
@@ -663,6 +916,16 @@ NUNCA use a posição/numeração que VOCÊ mostrou ao {cli}. Você mostra uma l
 filtrada (4-5 opções), então o "1" que ele vê quase nunca é o "1" da lista
 acima — mandar a posição marca o {cli} no horário ERRADO.
 NUNCA invente um id: use somente ids que aparecem na lista.
+
+REGRA CRÍTICA — offered_ids (obrigatório em list_slots):
+Em list_slots, escolha quais horários oferecer ao {cli} e coloque os ids em
+"offered_ids", NA ORDEM em que quer que ele os veja. Máximo 5.
+NÃO escreva a lista de horários no response_text: o sistema monta a mensagem
+numerada a partir de offered_ids, para que o número que o {cli} vê seja
+exatamente o horário que ele vai receber. Em list_slots o response_text é
+ignorado.
+Se você não tiver ids para oferecer, use action "none" e pergunte o dia ou o
+período em vez de listar horários no texto.
 
 EXEMPLOS DE TOM:
 
@@ -740,7 +1003,7 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
     appt = cal.get_next_appointment(tenant_id, phone)
     if appt:
         appt_dt = datetime.fromisoformat(appt["scheduled_at"])
-        now_br = datetime.now(_TZ).replace(tzinfo=None)
+        now_br = _now()
         diff_min = (appt_dt - now_br).total_seconds() / 60
 
         # Usa comparação por data de calendário (não por minutos) para evitar
@@ -799,7 +1062,7 @@ def _build_context(tenant: dict, phone: str, offered_slots: list) -> str:
         for i, (s, raw) in enumerate(zip(cal.format_slots(offered_slots), offered_slots), 1):
             lines.append(f"  {i}. {s}  [id={raw.strftime('%Y-%m-%dT%H:%M')}]")
 
-    now = datetime.now(_TZ)
+    now = _now()
     amanha = now + timedelta(days=1)
     hoje_str = f"{_DIAS_PT[now.weekday()]}, {now.day} de {_MESES_PT[now.month-1]} de {now.year}"
     amanha_str = f"{_DIAS_PT[amanha.weekday()]}, {amanha.strftime('%d/%m')}"
@@ -908,7 +1171,7 @@ def _try_deterministic_confirm(tenant: dict, phone: str, text: str) -> str | Non
         logger.info(f"[{tenant['slug']}][{phone}] RE-CONFIRMAÇÃO determinística id={appt['id']}")
         return f"{saud} Sua presença já está confirmada. Até lá! 🌸"
     try:
-        db.confirm_appointment(tenant_id, appt["id"])
+        _confirmar_idempotente(tenant_id, appt["id"])
     except Exception as e:
         logger.warning(f"[{tenant['slug']}][{phone}] confirm determinístico falhou: {e}")
         return None
@@ -917,7 +1180,7 @@ def _try_deterministic_confirm(tenant: dict, phone: str, text: str) -> str | Non
     try:
         from zoneinfo import ZoneInfo as _ZI
         appt_dt = datetime.fromisoformat(appt["scheduled_at"])
-        now_br = datetime.now(_ZI("America/Sao_Paulo")).replace(tzinfo=None)
+        now_br = _now()
         delta_days = (appt_dt.date() - now_br.date()).days
         if delta_days <= 0:
             quando = "Até mais tarde!"
@@ -1084,6 +1347,124 @@ def _parse_date_br(t: str, now: datetime):
     return None
 
 
+_SAUDACOES_RE = re.compile(r"\b(bom\s*dia|boa\s*tarde|boa\s*noite)\b", re.IGNORECASE)
+
+# "manhã" não pode casar dentro de "amanhã" — daí o olhar-para-trás.
+_PERIODO_RE = (
+    ("manha", re.compile(r"(?<![a-zà-ú])manh[ãa]|\bmatutino\b", re.IGNORECASE)),
+    ("tarde", re.compile(r"\btarde\b|\bvespertino\b", re.IGNORECASE)),
+    ("noite", re.compile(r"\bnoite\b|\bnoitinha\b|\bnoturno\b", re.IGNORECASE)),
+)
+
+
+def _periodo_da_hora(hora: int) -> str | None:
+    """Período do dia de uma hora: manhã 6–11, tarde 12–17, noite 18–23."""
+    return cal.periodo_da_hora(hora)
+
+
+def _parse_period_br(t: str) -> str | None:
+    """Período do dia pedido no texto. None quando o paciente não restringiu.
+
+    Saudações são removidas antes: "boa tarde, quero agendar segunda" não é um
+    pedido de tarde.
+    """
+    if not t:
+        return None
+    limpo = _SAUDACOES_RE.sub(" ", t)
+    for nome, rx in _PERIODO_RE:
+        if rx.search(limpo):
+            return nome
+    return None
+
+
+def _parse_request(text: str, now: datetime) -> dict:
+    """O que o paciente pediu explicitamente, extraído por regra — não pelo
+    modelo. É o que permite exigir que o horário escolhido seja compatível com
+    o pedido em vez de confiar no modelo para declarar o dia certo."""
+    t = (text or "").strip().lower()
+    return {"date": _parse_date_br(t, now), "period": _parse_period_br(t)}
+
+
+def _slot_atende_pedido(slot: datetime, pedido: dict | None) -> bool:
+    """O horário escolhido respeita a data e o período que o paciente pediu?"""
+    if not pedido:
+        return True
+    alvo = pedido.get("date")
+    if alvo is not None and slot.date() != alvo:
+        return False
+    periodo = pedido.get("period")
+    if periodo and _periodo_da_hora(slot.hour) != periodo:
+        return False
+    return True
+
+
+# Escolha de opção pelo número: "1", "o 2", "quero o 3", "a 2ª opção".
+# Exige um marcador de opção ou que a mensagem seja só o número — "tenho 2
+# filhos" não é escolha. Mensagens com data ou hora são tratadas como escolha
+# explícita de horário, não de posição.
+_SO_NUMERO_RE = re.compile(r"^\s*(\d{1,2})\s*[.)]?\s*$")
+_ESCOLHA_RE = (
+    re.compile(r"\b(?:op[çc][ãa]o|opcao|alternativa|hor[áa]rio)\s*(?:n[º°]?\s*)?(\d{1,2})\b",
+               re.IGNORECASE),
+    re.compile(r"\b(\d{1,2})\s*[ªº]?\s*(?:op[çc][ãa]o|opcao|alternativa)\b",
+               re.IGNORECASE),
+    re.compile(r"\b(?:quero|prefiro|pode\s+ser|vai\s+ser|fico\s+com|escolho|seria)\s+"
+               r"(?:[oa]\s+)?(\d{1,2})\b", re.IGNORECASE),
+    re.compile(r"(?:^|[\s,;])[oa]\s+(\d{1,2})\b", re.IGNORECASE),
+)
+
+
+def _parse_numeric_choice(text: str) -> int | None:
+    """Número da opção que o paciente escolheu, ou None.
+
+    Quando devolve um número, esse número é a fonte da verdade da escolha: ele
+    tem de ser resolvido pela oferta persistida daquela conversa. Um `slot_id`
+    do modelo que discorde não pode prevalecer em silêncio.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = _SO_NUMERO_RE.match(t)
+    if m:
+        n = int(m.group(1))
+        return n if 1 <= n <= 20 else None
+    baixo = t.lower()
+    # Data ou hora explícitas = escolha de horário, não de posição na lista.
+    if _parse_time_br(baixo) or _parse_date_br(baixo, _now()):
+        return None
+    for rx in _ESCOLHA_RE:
+        m = rx.search(baixo)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 20:
+                return n
+    return None
+
+
+_LISTA_HORARIOS_RE = re.compile(
+    r"^\s*\d+\s*[.)]\s*.*?\d{1,2}[:h]\d{2}", re.MULTILINE)
+
+
+def _parece_lista_de_horarios(texto: str) -> bool:
+    """O texto apresenta ao paciente uma lista numerada de horários?"""
+    return len(_LISTA_HORARIOS_RE.findall(texto or "")) >= 2
+
+
+def _parse_slot_id(raw) -> datetime | None:
+    """Converte o carimbo `[id=AAAA-MM-DDTHH:MM]` em datetime. Estrito: qualquer
+    coisa fora desse formato é recusada, porque um id que o backend não entende
+    nunca pode virar agendamento."""
+    if not isinstance(raw, str):
+        return None
+    txt = raw.strip().replace(" ", "T")[:16]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", txt):
+        return None
+    try:
+        return datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+
+
 def _do_reschedule(tenant: dict, phone: str, appt: dict, slot: datetime) -> str:
     """Move a consulta para `slot`, sincroniza Google Calendar/CalDAV e devolve
     a confirmação. Reusa a mesma lógica comprovada de Action.update."""
@@ -1091,7 +1472,9 @@ def _do_reschedule(tenant: dict, phone: str, appt: dict, slot: datetime) -> str:
     appt_id = appt["id"]
     duration_min = tenant.get("session_minutes", 50)
     patient_name = appt.get("patient_name", "Paciente") or "Paciente"
-    db.update_appointment(tenant_id, appt_id, slot)
+    _remarcar_idempotente(tenant_id, appt_id, slot)
+    # Oferta atendida: não pode continuar valendo para uma mensagem seguinte.
+    db.offer_cancel_drafts(tenant_id, phone)
     if tenant.get("google_refresh_token"):
         try:
             gcal_ok = False
@@ -1104,6 +1487,7 @@ def _do_reschedule(tenant: dict, phone: str, appt: dict, slot: datetime) -> str:
                     db.set_appointment_google_event_id(int(appt_id), new_id)
         except Exception as e:
             logger.warning(f"[gcal] reschedule determinístico falhou: {e}")
+            _pendencia_externa(tenant, phone, "calendar:update", e)
     else:
         try:
             cd_ok = False
@@ -1116,6 +1500,7 @@ def _do_reschedule(tenant: dict, phone: str, appt: dict, slot: datetime) -> str:
                     db.set_appointment_google_event_id(int(appt_id), new_uid)
         except Exception as e:
             logger.warning(f"[caldav] reschedule determinístico falhou: {e}")
+            _pendencia_externa(tenant, phone, "calendar:update", e)
     formatted = cal.format_slots([slot])[0]
     nome = patient_name.split()[0] if patient_name else ""
     saud = f"Prontinho, {nome}! ✅" if nome else "Prontinho! ✅"
@@ -1141,7 +1526,7 @@ def _try_deterministic_reschedule(tenant: dict, phone: str, text: str):
     # Cancelamento/desabafo não são remarcação — deixa o fluxo próprio cuidar.
     if any(w in t for w in ("cancel", "desmarc", "nao vou", "não vou", "nao posso", "não posso")):
         return None
-    now_br = datetime.now(_TZ).replace(tzinfo=None)
+    now_br = _now()
     tm = _parse_time_br(t)
     dd = _parse_date_br(t, now_br)
     if not tm or not dd:
@@ -1168,11 +1553,16 @@ def _try_deterministic_reschedule(tenant: dict, phone: str, text: str):
     alts = cal.suggest_slots_near(tenant, target, n=3)
     logger.info(f"[{tenant['slug']}][{phone}] data explícita indisponível ({motivo}): {target.isoformat()}")
     if alts:
-        linhas = "\n".join(f"  • {s}" for s in cal.format_slots(alts))
+        # As alternativas ficam PERSISTIDAS como oferta da conversa: é isso que
+        # permite ao paciente responder "o 1" em seguida e o servidor resolver
+        # esse número para o instante exato que ele viu.
         abre = f"Poxa, {nome}! " if nome else ""
-        reply = (f"{abre}O horário {fmt_target} não está disponível. 😕\n"
-                 f"Posso te oferecer:\n{linhas}\n\nAlgum desses serve pra você? 😊")
+        reply = _ofertar(
+            tenant, phone, alts,
+            f"{abre}O horário {fmt_target} não está disponível. 😕\nPosso te oferecer:",
+        )
     else:
+        db.offer_cancel_drafts(tenant_id, phone)
         reply = (f"O horário {fmt_target} não está disponível e não encontrei horários "
                  f"próximos. Quer me dizer outro dia ou período? 😊")
     return reply, event
@@ -1207,25 +1597,44 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     A publicação de eventos SSE é feita pelo chamador (main.py) no contexto async.
     """
     tenant_id = tenant["id"]
-    db.save_message(tenant_id, phone, "user", text)
+    # Zera o marcador de "oferta montada neste turno". `contexto_evento` já faz
+    # isso no caminho durável, mas `process_message` também é chamado direto
+    # (endpoint de teste, painel): sem o reset, o valor de uma chamada anterior
+    # na mesma thread sobreviveria e a guarda de coerência seria pulada.
+    _ctx.offer_id = None
+    _salvar_mensagem_idempotente(tenant_id, phone, "user", text)
 
     # ── Atalho determinístico para saudações ────────────────────────────────────
     # Antes o LLM às vezes devolvia JSON malformado para "Olá" e caíamos no
     # fallback "Desculpe, não entendi". Saudação simples nunca precisa de LLM.
     if _is_simple_greeting(text):
         reply = _greeting_reply(tenant, phone)
-        db.save_message(tenant_id, phone, "assistant", reply)
+        _salvar_mensagem_idempotente(tenant_id, phone, "assistant", reply)
         logger.info(f"[{tenant['slug']}][{phone}] saudação simples — resposta determinística")
         return reply, AgentResponse(intent=Intent.other, action=Action.none,
                                      response_text=reply, data={}), None
+
+    # ── Sem identidade confiável do evento, os atalhos que MUTAM não rodam ─────
+    # Os atalhos determinísticos (confirmar, recusar, remarcar com data/hora)
+    # gravam direto no banco, antes de o modelo entrar. Se o evento não tem id
+    # do provedor, uma reentrega da mesma mensagem viraria outro evento e a
+    # marca por evento não protege nada.
+    #
+    # Em vez de adivinhar a intenção pelo texto e recusar tudo, a mensagem segue
+    # o caminho normal: consultar, acolher e esclarecer continuam liberados, e a
+    # recusa acontece só se a decisão for de fato uma mutação (ver as guardas em
+    # `_execute_action`). Bloquear por palpite barrava até "me mostra os
+    # horários", que não altera nada.
+    _atalhos_liberados = _mutacao_permitida()
 
     # ── Atalho determinístico para CONFIRMAÇÃO ("Sim", "Ok", "Confirmo"…) ───────
     # Fluxo mais crítico e frequente: não pode depender do LLM (regredia toda
     # vez que o prompt crescia). Só dispara quando há consulta futura pendente
     # à qual o sistema JÁ pediu confirmação — então é seguro confirmar.
-    _det_confirm = _try_deterministic_confirm(tenant, phone, text)
+    _det_confirm = (_try_deterministic_confirm(tenant, phone, text)
+                    if _atalhos_liberados else None)
     if _det_confirm is not None:
-        db.save_message(tenant_id, phone, "assistant", _det_confirm)
+        _salvar_mensagem_idempotente(tenant_id, phone, "assistant", _det_confirm)
         logger.info(f"[{tenant['slug']}][{phone}] confirmação determinística — sem LLM")
         return _det_confirm, AgentResponse(
             intent=Intent.confirm, action=Action.confirm,
@@ -1237,10 +1646,11 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     # Bruna" (errado no contexto). Agora acolhe e sinaliza para a psicóloga,
     # sem cancelar nem remarcar (ela decide). Só dispara se há confirmação
     # pendente que o sistema já pediu.
-    _det_decline = _try_deterministic_decline(tenant, phone, text)
+    _det_decline = (_try_deterministic_decline(tenant, phone, text)
+                    if _atalhos_liberados else None)
     if _det_decline is not None:
         _reply_d, _event_d = _det_decline
-        db.save_message(tenant_id, phone, "assistant", _reply_d)
+        _salvar_mensagem_idempotente(tenant_id, phone, "assistant", _reply_d)
         logger.info(f"[{tenant['slug']}][{phone}] negativa determinística — sem LLM")
         return _reply_d, AgentResponse(
             intent=Intent.other, action=Action.none,
@@ -1250,18 +1660,52 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
     # "Dia 20/06 às 16h", "amanhã às 15h", "terça 10h" → o LLM ignorava a data e
     # perguntava de novo a disponibilidade. Agora, se o paciente tem consulta
     # futura, remarca direto (se livre) ou oferece horários próximos.
-    _det_resched = _try_deterministic_reschedule(tenant, phone, text)
+    _det_resched = (_try_deterministic_reschedule(tenant, phone, text)
+                    if _atalhos_liberados else None)
     if _det_resched is not None:
         _reply_r, _event_r = _det_resched
-        db.save_message(tenant_id, phone, "assistant", _reply_r)
+        _salvar_mensagem_idempotente(tenant_id, phone, "assistant", _reply_r)
         logger.info(f"[{tenant['slug']}][{phone}] remarcação determinística — sem LLM")
         return _reply_r, AgentResponse(
             intent=Intent.reschedule, action=Action.update,
             response_text=_reply_r, data={}), _event_r
 
-    # limit aumentado de 6 → 24 para garantir cobertura de manhã, tarde e noite
-    # em vários dias, permitindo ao LLM filtrar quando paciente pede "tarde"/"manhã"
-    offered_slots = cal.get_available_slots(tenant, days_ahead=10, limit=24)
+    # ── Horários que vão para o contexto ───────────────────────────────────────
+    # O pedido do paciente (data e período) é extraído por REGRA, não pelo
+    # modelo. Se ele pediu um dia, as opções desse dia vão para o contexto, mais
+    # uma amostra de outros dias. Sem pedido explícito, vai uma amostra
+    # equilibrada: poucas opções por dia ao longo do horizonte.
+    #
+    # O que isso corrige: antes eram os 24 PRIMEIROS horários livres do
+    # calendário. Com a agenda dos próximos dias cheia, os 24 se esgotavam em
+    # dois dias e o dia pedido pelo paciente nunca chegava ao contexto — o
+    # agente então marcava outro dia (EVIDENCIAS/01.md §3).
+    pedido = _parse_request(text, _now())
+    # Escolha de opção pelo número, lida do texto do PACIENTE. É a fonte da
+    # verdade da escolha; o `slot_id` do modelo não pode contrariá-la em
+    # silêncio. Mensagem com data/hora explícitas não é escolha de posição.
+    escolha = _parse_numeric_choice(text)
+    if escolha is not None:
+        logger.info(f"[{tenant['slug']}][{phone}] paciente escolheu a opção {escolha}")
+    _appt_atual = cal.get_next_appointment(tenant_id, phone)
+    _excl_id = None
+    if _appt_atual and not str(_appt_atual.get("scheduled_at", "")).startswith("2099-"):
+        _excl_id = _appt_atual.get("id")
+
+    offered_slots: list = []
+    if pedido["date"] is not None:
+        offered_slots = cal.find_slots(
+            tenant, days_ahead=30, on_date=pedido["date"], period=pedido["period"],
+            per_day=6, exclude_id=_excl_id,
+        )
+    outros = cal.find_slots(
+        tenant, days_ahead=14, period=pedido["period"], per_day=2, max_total=16,
+        exclude_id=_excl_id,
+    )
+    for s in outros:
+        if s not in offered_slots:
+            offered_slots.append(s)
+    offered_slots.sort()
     context = _build_context(tenant, phone, offered_slots)
 
     # Flag: paciente é conhecido (tem consulta futura OU já cadastrado)?
@@ -1372,10 +1816,88 @@ def process_message(tenant: dict, phone: str, text: str) -> tuple[str, AgentResp
         agent_resp.action = Action.none
         agent_resp.data = {}
 
-    reply, event = _execute_action(tenant, agent_resp, offered_slots, phone)
+    reply, event = _execute_action(tenant, agent_resp, phone, pedido, escolha)
     reply = _strip_forbidden_phrases(reply)
-    db.save_message(tenant_id, phone, "assistant", reply)
+
+    # ── Guarda de coerência ───────────────────────────────────────────────────
+    # Se a resposta apresenta uma lista numerada de horários mas nenhuma oferta
+    # foi montada neste turno, essa lista é texto livre do modelo: a oferta
+    # ativa (de antes) não corresponde ao que o paciente está vendo. Manter a
+    # antiga faria o "1" seguinte apontar para outra coisa.
+    if _parece_lista_de_horarios(reply):
+        if _oferta_do_turno() is None:
+            logger.warning(f"[{tenant['slug']}][{phone}] resposta lista horários sem "
+                           f"oferta nova — invalidando as ofertas anteriores")
+            db.offer_invalidate(tenant_id, phone, "lista fora do servidor")
+
+    # Oferta efetivamente usada numa reserva: encerrada para não valer de novo.
+    _consumida = getattr(_ctx, "oferta_consumida", None)
+    if _consumida:
+        db.offer_consume(_consumida)
+        _ctx.oferta_consumida = None
+
+    _salvar_mensagem_idempotente(tenant_id, phone, "assistant", reply)
     return reply, agent_resp, event
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# E03 — interface usada pelo processamento durável (inbox.py)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `process_message` continua sendo a implementação única da conversa. O que E03
+# acrescenta é a separação entre **decidir** e **aplicar**, para que o worker
+# possa gravar o progresso entre as duas e retomar do ponto certo:
+#
+#   decidir()  → chama o modelo (ou resolve pelo atalho determinístico) e
+#                devolve algo serializável, que é persistido no evento.
+#   aplicar()  → executa a decisão e devolve o texto final e a oferta criada.
+#
+# Por que o atalho determinístico fica em `decidir`: ele não usa o modelo, e as
+# mutações que faz (confirmar, cancelar, remarcar para um horário específico)
+# são idempotentes **por valor** — gravam um estado, não acumulam. Repetir é
+# inofensivo. A única mutação que acumula é a CRIAÇÃO de consulta, e essa está
+# protegida por evento em `_criar_consulta_idempotente`.
+
+
+def decidir(tenant: dict, phone: str, text: str,
+            event_row_id: int | None = None,
+            attempt_token: str | None = None,
+            identidade_confiavel: bool = True) -> dict:
+    """Decide o que responder. Devolve um dicionário serializável.
+
+    Para o caminho do modelo, a decisão guardada é o JSON que ele produziu —
+    então um retry **não** chama o modelo de novo nem muda o que foi decidido.
+
+    As mutações acontecem aqui dentro, cada uma com identidade de evento e com a
+    posse validada na própria transação. Por isso a ordem importa: a mutação
+    ocorre ANTES de a decisão ser persistida. Se o processo cair entre as duas,
+    o retry reexecuta e a marca de efeito impede aplicar de novo.
+    """
+    with contexto_evento(event_row_id, attempt_token, identidade_confiavel):
+        reply, resp, event = process_message(tenant, phone, text)
+        return {
+            "kind": "resolvida",
+            "intent": str(getattr(resp.intent, "value", resp.intent)),
+            "action": str(getattr(resp.action, "value", resp.action)),
+            "data": resp.data or {},
+            "reply": reply,
+            "offer_id": _oferta_do_turno(),
+            "event": event,
+        }
+
+
+def aplicar(tenant: dict, phone: str, decisao: dict,
+            event_row_id: int | None = None) -> dict:
+    """Devolve o texto final e a oferta associada à decisão já tomada.
+
+    A decisão de `decidir` já embute a execução (é `process_message`), então
+    aqui não há segunda mutação: reaplicar seria justamente o risco que a
+    marca de idempotência por evento existe para evitar. O retorno é o que o
+    worker precisa para enfileirar a resposta no outbox.
+    """
+    reply = decisao.get("reply") or ""
+    return {"reply": reply, "offer_id": decisao.get("offer_id"),
+            "event": decisao.get("event"), "action": decisao.get("action")}
 
 
 # ── Sanitização final: remove frases proibidas que o LLM insiste em escrever ────
@@ -1413,52 +1935,319 @@ def _strip_forbidden_phrases(text: str) -> str:
     return out or "Olá! 😊 Vou repassar sua mensagem. 💖"
 
 
-def _resolve_slot(data: dict, offered_slots: list, tenant: dict, phone: str):
-    """Resolve o horário escolhido pelo paciente. Retorna (slot | None, origem).
+def _resolve_slot(data: dict, tenant: dict, phone: str,
+                  pedido: dict | None = None, exclude_id: int | None = None,
+                  escolha: int | None = None):
+    """Resolve o horário que o paciente escolheu. Devolve (slot|None, origem, motivo).
 
-    Prioriza `slot_id` — o carimbo [id=...] que acompanha cada item de HORÁRIOS
-    DISPONÍVEIS no contexto. `slot_index` é AMBÍGUO e não deve ser a fonte da
-    verdade: o número que o paciente vê é o da lista que o agente mostrou
-    (filtrada, 4-5 opções), enquanto o backend indexa a lista COMPLETA — seguir
-    a posição podia marcar o paciente noutro dia/horário, em silêncio, porque a
-    confirmação é montada com o horário que o backend escolheu. Fica só como
-    reserva, para não quebrar caso o modelo não mande o id.
+    Regras, na ordem:
+
+    0. **Escolha numérica do paciente** (`escolha`, extraída do texto DELE, não
+       do modelo). Quando existe, ela é a fonte da verdade e só pode ser
+       resolvida pela oferta persistida daquela conversa. Um `slot_id` do modelo
+       que discorde é registrado e **ignorado** — deixá-lo prevalecer era
+       exatamente como o paciente acabava reservando outra opção.
+    1. **`slot_id`** — instante exato. É validado contra as regras REAIS de
+       disponibilidade (`is_slot_bookable`), não contra a lista que foi para o
+       contexto. Assim uma segunda-feira legítima que ficou fora da amostra
+       continua agendável, em vez de ser recusada genericamente.
+    2. **`slot_index`** — a posição que o paciente viu ("quero o 1"). Só é
+       aceita se existir uma **oferta persistida daquela conversa**, e resolve
+       para o instante exato gravado nela. Nunca indexa a lista global do
+       calendário: era isso que marcava o paciente em outro dia, em silêncio.
+    3. Nada resolvível → não se altera a agenda; o chamador pede esclarecimento.
+
+    Em todos os casos o horário também precisa ser compatível com o que o
+    paciente pediu (data e período), porque o modelo não é fonte confiável para
+    declarar o dia que ele mesmo escolheu.
     """
-    sid = str(data.get("slot_id") or "").strip().replace(" ", "T")[:16]
-    if sid:
-        for s in offered_slots:
-            if s.strftime("%Y-%m-%dT%H:%M") == sid:
-                return s, "slot_id"
-        logger.warning(f"[{tenant.get('slug')}][{phone}] slot_id {sid!r} não está "
-                       f"entre os horários livres — ignorando")
-    raw = data.get("slot_index")
-    if raw is not None:
+    slug = tenant.get("slug")
+
+    if escolha is not None:
+        ctx = db.offer_context(tenant["id"], phone)
+        if ctx["ambigua"]:
+            # Existe uma oferta posterior cujo envio ficou INCERTO: o paciente
+            # pode ter visto uma lista ou outra, e um "1" sozinho não revela
+            # qual. Sem referência confiável à mensagem citada, resolver pela
+            # mais recente seria adivinhar. Esclarecer é a única saída correta.
+            logger.warning(f"[{slug}][{phone}] opção {escolha} AMBÍGUA entre "
+                           f"versões de oferta (incertas={len(ctx['incertas'])})")
+            return None, "escolha_numerica", "oferta_ambigua"
+        info = ctx["ativa"]
+        if not info:
+            pend = len(ctx["pendentes"])
+            logger.warning(f"[{slug}][{phone}] paciente escolheu a opção {escolha} "
+                           f"mas não há oferta comprovadamente entregue "
+                           f"(rascunhos/pendentes={pend})")
+            return None, "escolha_numerica", "sem_oferta"
+        oferta = info["slots"]
+        if not 1 <= escolha <= len(oferta):
+            logger.warning(f"[{slug}][{phone}] opção {escolha} fora da oferta "
+                           f"{info['offer_id'][:8]} ({len(oferta)} opções)")
+            return None, "escolha_numerica", "fora_da_oferta"
+        slot = oferta[escolha - 1]
+        do_modelo = _parse_slot_id(data.get("slot_id"))
+        if do_modelo is not None and do_modelo != slot:
+            logger.warning(
+                f"[{slug}][{phone}] modelo mandou slot_id {do_modelo.isoformat()} "
+                f"mas o paciente escolheu a opção {escolha} = {slot.isoformat()} "
+                f"(oferta {info['offer_id'][:8]}) — usando a oferta"
+            )
+        if not _slot_atende_pedido(slot, pedido):
+            return None, "escolha_numerica", "incompativel_com_pedido"
+        ok, motivo = cal.is_slot_bookable(tenant, slot, exclude_id=exclude_id)
+        if not ok:
+            logger.info(f"[{slug}][{phone}] opção {escolha} ficou indisponível: {motivo}")
+            return None, "escolha_numerica", motivo
+        _ctx.oferta_consumida = info["offer_id"]
+        return slot, "escolha_numerica", "ok"
+
+    bruto = data.get("slot_id")
+    if bruto not in (None, "", 0):
+        slot = _parse_slot_id(bruto)
+        if slot is None:
+            logger.warning(f"[{slug}][{phone}] slot_id ilegível: {bruto!r}")
+            return None, "slot_id", "formato_invalido"
+        if not _slot_atende_pedido(slot, pedido):
+            logger.warning(
+                f"[{slug}][{phone}] slot_id {slot.isoformat()} não atende o pedido "
+                f"(data={pedido.get('date')}, período={pedido.get('period')})"
+            )
+            return None, "slot_id", "incompativel_com_pedido"
+        ok, motivo = cal.is_slot_bookable(tenant, slot, exclude_id=exclude_id)
+        if not ok:
+            logger.info(f"[{slug}][{phone}] slot_id {slot.isoformat()} indisponível: {motivo}")
+            return None, "slot_id", motivo
+        return slot, "slot_id", "ok"
+
+    bruto = data.get("slot_index")
+    if bruto is not None:
         try:
-            idx = int(raw) - 1
+            idx = int(bruto) - 1
         except (TypeError, ValueError):
-            logger.warning(f"[{tenant.get('slug')}][{phone}] slot_index inválido: {raw!r}")
-            return None, "invalido"
-        if 0 <= idx < len(offered_slots):
-            logger.warning(f"[{tenant.get('slug')}][{phone}] sem slot_id — caindo no "
-                           f"slot_index={raw} (posição pode não ser a que o paciente viu)")
-            return offered_slots[idx], "slot_index"
-        logger.warning(f"[{tenant.get('slug')}][{phone}] slot_index {raw} fora da faixa "
-                       f"(total={len(offered_slots)})")
-    return None, "invalido"
+            logger.warning(f"[{slug}][{phone}] slot_index inválido: {bruto!r}")
+            return None, "slot_index", "indice_invalido"
+        _ctx_of = db.offer_context(tenant["id"], phone)
+        oferta = (_ctx_of["ativa"] or {}).get("slots") if not _ctx_of["ambigua"] else None
+        if not oferta:
+            logger.warning(f"[{slug}][{phone}] slot_index={bruto} sem oferta "
+                           f"persistida — pedindo esclarecimento")
+            return None, "slot_index", "sem_oferta"
+        if not 0 <= idx < len(oferta):
+            logger.warning(f"[{slug}][{phone}] slot_index={bruto} fora da oferta "
+                           f"({len(oferta)} opções)")
+            return None, "slot_index", "fora_da_oferta"
+        slot = oferta[idx]
+        if not _slot_atende_pedido(slot, pedido):
+            return None, "slot_index", "incompativel_com_pedido"
+        ok, motivo = cal.is_slot_bookable(tenant, slot, exclude_id=exclude_id)
+        if not ok:
+            logger.info(f"[{slug}][{phone}] opção {bruto} da oferta ficou "
+                        f"indisponível: {motivo}")
+            return None, "slot_index", motivo
+        return slot, "slot_index", "ok"
+
+    return None, "ausente", "ausente"
 
 
-def _execute_action(tenant: dict, resp: AgentResponse,
-                    offered_slots: list, phone: str = "") -> tuple[str, dict | None]:
-    """Executa a ação e retorna (reply_text, evento_opcional)."""
+# Motivos de recusa que significam "o horário existe, mas não dá" — nesses casos
+# vale oferecer alternativas. Os demais pedem esclarecimento.
+_MOTIVO_PT = {
+    "ocupado": "esse horário já está reservado",
+    "passado": "esse horário já passou",
+    "dia_nao_atendido": "não atendemos nesse dia",
+    "fora_expediente": "esse horário está fora do expediente",
+    "horario_bloqueado": "esse horário não está disponível na agenda",
+    "data_bloqueada": "essa data está bloqueada na agenda",
+}
+
+
+# Máximo de opções numa oferta. Mais que isso vira parede de texto no WhatsApp.
+_MAX_OFERTA = 6
+
+
+def _ofertar(tenant: dict, phone: str, slots: list, abertura: str) -> str:
+    """Monta o texto numerado que o paciente vai ver **e** persiste exatamente a
+    mesma sequência, na mesma ordem.
+
+    Esta é a única forma de exibir horários ao paciente. O texto do modelo não
+    serve como oferta: ele podia numerar 1=dia A e 2=dia B enquanto os ids
+    chegavam em outra ordem — ou um id era descartado por inválido e a numeração
+    do texto continuava a antiga. Nos dois casos o "1" do paciente reservava
+    outra opção, em silêncio.
+    """
+    slots = list(slots)[:_MAX_OFERTA]
+    # A oferta nasce em `draft`: ela só passa a valer para resolver "quero o 1"
+    # quando o envio for aceito pelo provedor (E03). Enquanto isso, a oferta
+    # que o paciente JÁ recebeu continua sendo a válida.
+    nova = db.offer_create(tenant["id"], phone, slots, event_row_id=_evento_atual())
+    _ctx.offer_id = nova["offer_id"]
+    linhas = "\n".join(f"  {i}. {s}" for i, s in enumerate(cal.format_slots(slots), 1))
+    logger.info(f"[{tenant.get('slug')}][{phone}] oferta {nova['offer_id'][:8]} "
+                f"(seq {nova['seq']}, draft) com {len(slots)} opção(ões): "
+                f"{[s.isoformat() for s in slots]}")
+    return f"{abertura}\n{linhas}\n\nQual prefere? 😊"
+
+
+def _confirmacao_criacao(tenant: dict, nome: str, slot: datetime,
+                         appt_id: int) -> str:
+    """Confirmação canônica de um agendamento criado.
+
+    Extraída para que a reentrada (evento que já criou a consulta) produza
+    EXATAMENTE o mesmo texto da primeira execução — a resposta persistida no
+    evento não pode variar entre tentativas.
+    """
+    formatted = cal.format_slots([slot])[0]
+    _nome1 = (nome or "").split()[0] if (nome or "").strip() else ""
+    _saud = f"Prontinho, {_nome1}! ✅" if _nome1 else "Prontinho! ✅"
+    if _is_psychology(tenant):
+        reply = (f"{_saud} Sua sessão ficou marcada para *{formatted}*. "
+                 f"Vou te lembrar um dia antes, combinado? 💖")
+    else:
+        reply = (f"{_saud} Seu {_generic_service_noun(tenant)} ficou marcado "
+                 f"para *{formatted}*. Vou te lembrar um dia antes, combinado? 💖")
+    return _confirm_today_tail(reply, slot, tenant, appt_id)
+
+
+def _primeiro_nome(tenant: dict, phone: str) -> str:
+    try:
+        p = db.get_patient(tenant["id"], phone)
+        nome = (p.get("name") if p else "") or ""
+        return nome.split()[0] if nome.strip() else ""
+    except Exception:
+        return ""
+
+
+def _abertura_oferta(tenant: dict, phone: str, pedido: dict | None) -> str:
+    """Abertura canônica da oferta: escrita pelo servidor, com o dia e o período
+    que o paciente pediu. Não reaproveita o texto do modelo, que é justamente a
+    fonte de divergência que esta etapa eliminou."""
+    pedido = pedido or {}
+    nome = _primeiro_nome(tenant, phone)
+    saud = f"Claro, {nome}! 😊 " if nome else "Claro! 😊 "
+    alvo = pedido.get("date")
+    periodo = {"manha": "de manhã", "tarde": "à tarde", "noite": "à noite"}.get(
+        pedido.get("period") or "", "")
+    if alvo is not None:
+        dia = cal.format_slots(
+            [datetime(alvo.year, alvo.month, alvo.day, 12, 0)])[0].split(" às ")[0]
+        alvo_txt = f"{dia}" + (f" {periodo}" if periodo else "")
+        return f"{saud}Para {alvo_txt} tenho estes horários:"
+    if periodo:
+        return f"{saud}{periodo.capitalize()} tenho estes horários:"
+    return f"{saud}Tenho estes horários:"
+
+
+def _ids_ofertaveis(data: dict, tenant: dict, pedido: dict | None,
+                    exclude_id: int | None = None) -> list:
+    """Dos ids que o modelo declarou, os que podem de fato ser oferecidos.
+
+    Mantém a ordem declarada, descarta formato inválido, duplicata, horário
+    incompatível com o pedido e horário indisponível agora. O que sobrar é ao
+    mesmo tempo o que o paciente vê e o que fica persistido — por isso o texto
+    nunca pode ser reaproveitado do modelo.
+    """
+    brutos = data.get("offered_ids") or data.get("slot_ids") or []
+    if not isinstance(brutos, (list, tuple)):
+        return []
+    vistos, saida = set(), []
+    for b in brutos:
+        s = _parse_slot_id(b)
+        if s is None or s in vistos:
+            continue
+        if not _slot_atende_pedido(s, pedido):
+            continue
+        if not cal.is_slot_bookable(tenant, s, exclude_id=exclude_id)[0]:
+            continue
+        vistos.add(s)
+        saida.append(s)
+        if len(saida) >= _MAX_OFERTA:
+            break
+    return saida
+
+
+def _resposta_sem_agendar(tenant: dict, phone: str, pedido: dict | None,
+                          motivo: str, exclude_id: int | None = None) -> str:
+    """Resposta quando NÃO se pode agendar. Informa, oferece alternativas e
+    deixa a escolha com o paciente — nunca escolhe por ele."""
+    pedido = pedido or {}
+    alvo = pedido.get("date")
+    periodo = pedido.get("period")
+
+    if alvo is not None:
+        no_dia = cal.find_slots(tenant, days_ahead=30, on_date=alvo, period=periodo,
+                                per_day=5, exclude_id=exclude_id)
+        rotulo = alvo.strftime("%d/%m")
+        if no_dia:
+            # Mesma abertura canônica do caminho de list_slots, para o paciente
+            # ver sempre o mesmo formato de oferta.
+            return _ofertar(tenant, phone, no_dia,
+                            _abertura_oferta(tenant, phone, pedido))
+        explicacao = _MOTIVO_PT.get(motivo, "não tenho vaga nesse horário")
+        alvo_dt = datetime(alvo.year, alvo.month, alvo.day, 9, 0)
+        perto = cal.suggest_slots_near(tenant, alvo_dt, n=3)
+        if perto:
+            return _ofertar(
+                tenant, phone, perto,
+                f"Em {rotulo} {explicacao} — não encontrei vaga nesse dia. 😕\n"
+                f"Posso te oferecer:",
+            )
+        db.offer_cancel_drafts(tenant["id"], phone)
+        return (f"Em {rotulo} {explicacao} e não encontrei horários próximos. "
+                f"Quer me dizer outro dia ou período? 😊")
+
+    # Sem data no pedido: não adivinhar. Ofertar uma amostra de dias e perguntar.
+    amostra = cal.find_slots(tenant, days_ahead=14, period=periodo,
+                             per_day=2, max_total=6, exclude_id=exclude_id)
+    if amostra:
+        return _ofertar(tenant, phone, amostra,
+                        "Para eu marcar certinho, me diga qual destes serve:")
+    db.offer_cancel_drafts(tenant["id"], phone)
+    return ("Não consegui identificar o horário que você quer. "
+            "Me diz o dia e o período que prefere? 😊")
+
+
+def _execute_action(tenant: dict, resp: AgentResponse, phone: str = "",
+                    pedido: dict | None = None,
+                    escolha: int | None = None) -> tuple[str, dict | None]:
+    """Executa a ação e retorna (reply_text, evento_opcional).
+
+    `pedido` é o que o paciente pediu, extraído por regra em `_parse_request`
+    (data e período). Serve para exigir que o horário escolhido seja compatível
+    com o pedido, sem depender do modelo para isso.
+
+    `escolha` é o número de opção que o paciente digitou, extraído do texto dele
+    em `_parse_numeric_choice`. Quando presente, manda sobre o `slot_id` do
+    modelo.
+    """
     tenant_id = tenant["id"]
     action = resp.action
     data = resp.data
     text = resp.response_text
 
     if action == Action.list_slots:
-        return text, {"type": "new_message", "data": {"phone": phone, "intent": resp.intent}}
+        # A lista numerada que o paciente vê é construída AQUI, pelo servidor, a
+        # partir da mesma sequência de instantes que fica persistida. O
+        # `response_text` do modelo é descartado de propósito: ele podia numerar
+        # numa ordem e declarar os ids em outra, ou citar horário que não está
+        # na oferta — e então o "1" do paciente reservava outra coisa.
+        evento = {"type": "new_message", "data": {"phone": phone, "intent": resp.intent}}
+        ofertados = _ids_ofertaveis(data, tenant, pedido)
+        if ofertados:
+            return _ofertar(tenant, phone, ofertados,
+                            _abertura_oferta(tenant, phone, pedido)), evento
+        # Nenhum id utilizável: não dá para confiar no texto do modelo nem
+        # manter a oferta anterior. Monta uma oferta nova, validada, com texto
+        # canônico — sem agendar nada.
+        logger.warning(f"[{tenant['slug']}][{phone}] list_slots sem id utilizável "
+                       f"(declarados={data.get('offered_ids') or data.get('slot_ids')!r}) "
+                       f"— gerando oferta canônica")
+        db.offer_cancel_drafts(tenant_id, phone)
+        return _resposta_sem_agendar(tenant, phone, pedido, "sem_ids"), evento
 
     if action == Action.cancel:
+        if not _mutacao_permitida():
+            return _bloquear_mutacao(tenant, phone, "cancel"), None
         # Cancelamento suave: marca cancelled=1 (para lembretes), remove do
         # calendário externo e avisa a psicóloga (notificação feita no main.py
         # via resp.intent == cancel). NUNCA oferece outro horário.
@@ -1474,7 +2263,7 @@ def _execute_action(tenant: dict, resp: AgentResponse,
             appt = cal.get_next_appointment(tenant_id, phone)
         if appt:
             try:
-                db.cancel_appointment(tenant_id, appt["id"])
+                _cancelar_idempotente(tenant_id, appt["id"])
             except Exception as e:
                 logger.warning(f"[{tenant['slug']}][{phone}] cancel_appointment falhou: {e}")
             # Remover do Google Calendar / CalDAV
@@ -1515,6 +2304,25 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                                 "patient_name": (appt or {}).get("patient_name", "")}}
 
     if action == Action.create:
+        if not _mutacao_permitida():
+            return _bloquear_mutacao(tenant, phone, "create"), None
+        # ── Reentrada: este evento já criou a consulta ────────────────────────
+        # Um retry (lease vencido, falha depois da mutação, reinício) não pode
+        # passar de novo pelas verificações de conflito: a vaga agora está
+        # ocupada pela própria consulta criada antes, e o fluxo tomaria outro
+        # caminho. Reconstrói a confirmação canônica a partir do que foi gravado.
+        _ja = _efeito_do_evento("appointment:create")
+        if _ja:
+            _appt_ant = db.get_appointment_by_id(tenant_id, int(_ja))
+            if _appt_ant:
+                _slot_ant = datetime.fromisoformat(_appt_ant["scheduled_at"])
+                logger.info(f"[{tenant['slug']}][{phone}] reentrada: consulta "
+                            f"{_ja} já criada por este evento — repetindo a "
+                            f"confirmação sem nova gravação")
+                return _confirmacao_criacao(
+                    tenant, _appt_ant.get("patient_name") or "", _slot_ant,
+                    int(_ja)), None
+
         # ── Fase 4b: auto-envio + trava p/ pacientes NOVOS (opt-in, OFF, fail-open) ──
         try:
             import contract_service as _cs_gate
@@ -1534,7 +2342,7 @@ def _execute_action(tenant: dict, resp: AgentResponse,
         except Exception:
             logger.exception("gate scheduling fail-open")
         name = data.get("patient_name", "Paciente")
-        slot, _origem = _resolve_slot(data, offered_slots, tenant, phone)
+        slot, _origem, _motivo = _resolve_slot(data, tenant, phone, pedido, escolha=escolha)
         if slot is not None:
             duration = tenant.get("session_minutes", 50)
             # ── GUARDA ANTI-DUPLICATA (reagendamento silencioso) ─────────────────
@@ -1558,7 +2366,8 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                 return reply, {"type": "new_message",
                                "data": {"phone": phone, "intent": "reschedule"}}
             if not db.has_conflict(tenant_id, slot, duration):
-                appt_id = db.create_appointment(tenant_id, name, phone, slot)
+                appt_id, _criada = _criar_consulta_idempotente(
+                    tenant_id, name, phone, slot)
                 # Sincronizar com Google Calendar (se conectado)
                 try:
                     event_id = gcal.create_event(tenant, name, slot.isoformat(), duration)
@@ -1566,6 +2375,7 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                         db.set_appointment_google_event_id(appt_id, event_id)
                 except Exception as e:
                     logger.warning(f"[gcal] create_event falhou: {e}")
+                    _pendencia_externa(tenant, phone, "calendar:create", e)
                 # Sincronizar com CalDAV (se configurado)
                 try:
                     caldav_uid = caldav_svc.create_event(tenant, name, slot.isoformat(), duration)
@@ -1575,40 +2385,39 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                             db.set_appointment_google_event_id(appt_id, caldav_uid)
                 except Exception as e:
                     logger.warning(f"[caldav] create_event falhou: {e}")
+                    _pendencia_externa(tenant, phone, "calendar:create", e)
+                # ── Confirmação CANÔNICA ──────────────────────────────────────
+                # Construída a partir do horário efetivamente gravado, depois da
+                # gravação. Antes o texto do modelo era reescrito por regex para
+                # encaixar o horário escolhido pelo backend — o que apresentava
+                # um agendamento em outro dia como se fosse o pedido. A troca de
+                # texto escondia o defeito em vez de impedi-lo.
                 formatted = cal.format_slots([slot])[0]
-                # Forçar o horário correto na resposta — o LLM pode ter escrito
-                # um horário/dia da semana errado no texto (ex: "sexta, 11/06"
-                # quando 11/06 é quinta). Substituímos qualquer menção ao slot
-                # pelo formato canônico calculado a partir do datetime real.
-                import re as _re
-                _DOW = r"(?:segunda(?:-feira)?|ter[çc]a(?:-feira)?|quarta(?:-feira)?|quinta(?:-feira)?|sexta(?:-feira)?|s[áa]bado|domingo)"
-                _PAT = _re.compile(rf"{_DOW},\s*\d{{1,2}}/\d{{1,2}}(?:\s+(?:[àa]s)\s+\d{{1,2}}[:h]\d{{2}})?", _re.IGNORECASE)
-                fixed_text = _PAT.sub(formatted, text or "")
-                reply = fixed_text.replace("[slot]", formatted).replace("[hora]", formatted)
-                if not reply.strip() or formatted not in reply:
-                    if _is_psychology(tenant):
-                        reply = f"Prontinho! ✅ {name.split()[0] if name else 'Sua consulta'}, sua sessão ficou marcada para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
-                    else:
-                        _nome1 = name.split()[0] if name else ""
-                        _saud = f"Prontinho, {_nome1}! ✅" if _nome1 else "Prontinho! ✅"
-                        reply = f"{_saud} Seu {_generic_service_noun(tenant)} ficou marcado para {formatted}. Vou te lembrar um dia antes, combinado? 💖"
-                reply = _confirm_today_tail(reply, slot, tenant, appt_id)
+                db.offer_cancel_drafts(tenant_id, phone)
+                reply = _confirmacao_criacao(tenant, name, slot, appt_id)
                 logger.info(f"[{tenant['slug']}] Agendamento criado: {name} | origem={_origem} | slot={formatted}")
                 event = {"type": "new_appointment", "data": {"patient_name": name, "slot": formatted, "phone": phone}}
                 return reply, event
-        logger.warning(f"[{tenant['slug']}] agendamento não realizado | data={data!r} "
-                       f"| total slots={len(offered_slots)}")
-        return "Desculpe, não consegui realizar o agendamento. Pode escolher outro horário? 😊", None
+        logger.warning(f"[{tenant['slug']}][{phone}] agendamento NÃO realizado "
+                       f"(origem={_origem}, motivo={_motivo})")
+        return _resposta_sem_agendar(tenant, phone, pedido, _motivo), None
 
     if action == Action.update:
+        if not _mutacao_permitida():
+            return _bloquear_mutacao(tenant, phone, "update"), None
         appt_id = data.get("appointment_id")
-        slot, _origem = _resolve_slot(data, offered_slots, tenant, phone)
+        try:
+            _excl = int(appt_id) if appt_id else None
+        except (TypeError, ValueError):
+            _excl = None
+        slot, _origem, _motivo = _resolve_slot(data, tenant, phone, pedido,
+                                               exclude_id=_excl, escolha=escolha)
         if appt_id and slot is not None:
             duration = tenant.get("session_minutes", 50)
             if not db.has_conflict(tenant_id, slot, duration, exclude_id=int(appt_id)):
                 # Buscar google_event_id antes de atualizar
                 appt = db.get_appointment_by_id(tenant_id, appt_id)
-                db.update_appointment(tenant_id, appt_id, slot)
+                _remarcar_idempotente(tenant_id, int(appt_id), slot)
                 # ── Sincronizar com Google Calendar / CalDAV ─────────────────
                 # Antes só atualizava se já existisse google_event_id; isso
                 # quebrava remarcações de pacientes cuja consulta foi criada
@@ -1638,6 +2447,7 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                                 logger.info(f"[gcal] reschedule fallback create: novo event_id={new_id}")
                     except Exception as e:
                         logger.warning(f"[gcal] sincronização de update falhou: {e}")
+                        _pendencia_externa(tenant, phone, "calendar:update", e)
                 # CalDAV apenas quando Google não está ativo
                 if not tenant.get("google_refresh_token"):
                     try:
@@ -1655,38 +2465,35 @@ def _execute_action(tenant: dict, resp: AgentResponse,
                                 db.set_appointment_google_event_id(int(appt_id), new_uid)
                     except Exception as e:
                         logger.warning(f"[caldav] sincronização de update falhou: {e}")
+                        _pendencia_externa(tenant, phone, "calendar:update", e)
+                # ── Confirmação CANÔNICA ──────────────────────────────────────
+                # Montada do horário gravado, depois da gravação bem-sucedida.
+                # O horário NOVO vem primeiro e em negrito; o antigo fica num
+                # parêntese no fim. Antes a frase abria com o horário antigo
+                # ("Sua consulta de 10:00 foi remarcada para 15:00") e o
+                # paciente lia o antigo como se fosse o novo. E antes disso o
+                # texto do modelo era reescrito por regex, o que mascarava
+                # remarcação para um dia que o paciente nunca escolheu.
                 formatted = cal.format_slots([slot])[0]
-                # ── Anti-alucinação: a LLM às vezes inventa o dia da semana
-                # (ex: "sexta, 11/06" quando 11/06 é quinta). Substituímos
-                # qualquer "<dia da semana>, DD/MM" do texto da LLM pelo
-                # formato canônico calculado a partir do datetime real.
-                import re as _re
-                _DOW = r"(?:segunda(?:-feira)?|ter[çc]a(?:-feira)?|quarta(?:-feira)?|quinta(?:-feira)?|sexta(?:-feira)?|s[áa]bado|domingo)"
-                _PAT = _re.compile(rf"{_DOW},\s*\d{{1,2}}/\d{{1,2}}(?:\s+(?:[àa]s)\s+\d{{1,2}}[:h]\d{{2}})?", _re.IGNORECASE)
-                fixed_text = _PAT.sub(formatted, text or "")
-                reply = fixed_text.replace("[slot]", formatted).replace("[hora]", formatted)
-                # Se o texto da LLM veio vazio ou mesmo após substituição não
-                # menciona o slot canônico, montamos uma confirmação determinística.
-                if not reply.strip() or formatted not in reply:
-                    # O horário NOVO vem primeiro e em negrito; o antigo fica num
-                    # parêntese no fim. Antes a frase abria com o horário antigo
-                    # ("Sua consulta de 10:00 foi remarcada para 15:00") e o
-                    # paciente lia o antigo como se fosse o novo — ainda por cima
-                    # um horário que nunca tinha sido oferecido a ele.
-                    old_fmt = cal.format_appointment(appt) if appt else ""
-                    if _is_psychology(tenant):
-                        reply = f"Prontinho! ✅ Sua consulta foi remarcada para *{formatted}*."
-                    else:
-                        _svc = _generic_service_noun(tenant)
-                        reply = f"Prontinho! ✅ Seu {_svc} foi remarcado para *{formatted}*."
-                    if old_fmt:
-                        reply += f" (Antes era {old_fmt}.)"
-                    reply += " Vou te lembrar um dia antes, combinado? 💖"
+                db.offer_cancel_drafts(tenant_id, phone)
+                old_fmt = cal.format_appointment(appt) if appt else ""
+                if _is_psychology(tenant):
+                    reply = f"Prontinho! ✅ Sua consulta foi remarcada para *{formatted}*."
+                else:
+                    _svc = _generic_service_noun(tenant)
+                    reply = f"Prontinho! ✅ Seu {_svc} foi remarcado para *{formatted}*."
+                if old_fmt:
+                    reply += f" (Antes era {old_fmt}.)"
+                reply += " Vou te lembrar um dia antes, combinado? 💖"
                 reply = _confirm_today_tail(reply, slot, tenant, appt_id)
                 return reply, {"type": "new_message", "data": {"phone": phone, "intent": "reschedule"}}
-        return "Não consegui remarcar. Pode escolher outro horário? 😊", None
+        logger.warning(f"[{tenant['slug']}][{phone}] remarcação NÃO realizada "
+                       f"(origem={_origem}, motivo={_motivo})")
+        return _resposta_sem_agendar(tenant, phone, pedido, _motivo, exclude_id=_excl), None
 
     if action == Action.confirm:
+        if not _mutacao_permitida():
+            return _bloquear_mutacao(tenant, phone, "confirm"), None
         # ── Fase 4b: auto-envio + trava p/ pacientes NOVOS (opt-in, OFF, fail-open) ──
         try:
             import contract_service as _cs_gate
@@ -1735,7 +2542,7 @@ def _execute_action(tenant: dict, resp: AgentResponse,
             except Exception as e:
                 logger.warning(f"[confirm] fallback get_appointments_by_phone falhou: {e}")
         if appt_id:
-            db.confirm_appointment(tenant_id, appt_id)
+            _confirmar_idempotente(tenant_id, int(appt_id))
             logger.info(f"[{tenant['slug']}][{phone}] confirmed appointment id={appt_id}")
         else:
             logger.warning(f"[{tenant['slug']}][{phone}] Action.confirm sem appointment_id e sem próxima consulta")

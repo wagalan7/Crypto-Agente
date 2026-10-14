@@ -158,8 +158,36 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Reconciliação GCal falhou: {e}")
     scheduler.start_scheduler()
+
+    # ── E03: recebimento durável e outbox ─────────────────────────────────────
+    # Recusa de propósito a combinação inbox ligado + outbox desligado: as
+    # respostas ficariam acumuladas em `outbox` no estado `pending` e ninguém as
+    # enviaria. O paciente não receberia nada e nada apontaria o motivo —
+    # exatamente a falha silenciosa que esta etapa existe para eliminar.
+    if config.INBOX_WORKER_ENABLED and not config.OUTBOX_WORKER_ENABLED:
+        raise RuntimeError(
+            "INBOX_WORKER_ENABLED=1 com OUTBOX_WORKER_ENABLED=0: as respostas "
+            "seriam enfileiradas e nunca enviadas. Ligue o outbox ou desligue "
+            "os dois."
+        )
+    import inbox as _inbox
+    import outbox as _outbox
+    _inbox.start_worker()
+    _outbox.start_worker()
+
     logger.info("Agente de Atendimento iniciado")
-    yield
+    try:
+        yield
+    finally:
+        # Encerramento limpo: os laços param de pegar trabalho novo. O que
+        # estava em processamento volta à fila quando o lease vence — nada fica
+        # preso por um worker que morreu.
+        try:
+            _inbox.stop_worker()
+            _outbox.stop_worker()
+            logger.info("Workers de entrada/saída sinalizados para encerrar")
+        except Exception as e:
+            logger.warning(f"Falha ao encerrar workers: {e}")
 
 
 def _reconcile_gcal_events() -> None:
@@ -380,7 +408,59 @@ async def _flag_receipt_and_notify(tenant: dict, phone: str, kind: str) -> None:
         logger.warning(f"[{tenant.get('slug')}][{phone}] Falha ao sinalizar comprovante: {e}")
 
 
-async def _handle_message(tenant: dict, phone: str, text: str):
+class _DecisaoLida:
+    """Decisão já tomada e persistida no evento, com a mesma leitura que o
+    código de notificações espera (`.intent`, `.action`, `.data`)."""
+
+    __slots__ = ("intent", "action", "data")
+
+    def __init__(self, d: dict):
+        self.intent = d.get("intent") or "other"
+        self.action = d.get("action") or "none"
+        self.data = d.get("data") or {}
+
+
+async def _notificar(tenant: dict, phone: str, corpo: str,
+                     event_row_id: int | None, tag: str) -> None:
+    """Aviso à profissional.
+
+    Com evento durável, vai para o **outbox** com chave de idempotência
+    `inbound:{evento}:notify:{tag}` — é um efeito do processamento de entrada,
+    então precisa sobreviver a queda e não pode sair duas vezes num retry.
+    Sem evento (caminho legado), envia direto.
+    """
+    if not phone or not corpo:
+        return
+    if event_row_id is not None:
+        # Sem try/except: se não deu para enfileirar, o evento não pode ser
+        # concluído. Quem trata é o worker, devolvendo à fila.
+        db.outbox_enqueue(tenant["id"], phone, corpo,
+                          f"inbound:{event_row_id}:notify:{tag}",
+                          kind="notification", event_row_id=event_row_id)
+        return
+    try:
+        await wa.send_message(tenant, phone, corpo)
+    except Exception as e:
+        logger.warning(f"[{tenant['slug']}] falha ao enviar aviso {tag}: {e}")
+
+
+async def _handle_message(tenant: dict, phone: str, text: str,
+                          decisao: dict | None = None,
+                          event_row_id: int | None = None):
+    """Efeitos de uma mensagem recebida: resposta ao paciente e avisos à
+    profissional.
+
+    Dois modos:
+
+    - **com `decisao`** (caminho durável de E03): a decisão já foi tomada e a
+      resposta ao paciente já está no outbox. Aqui só saem os avisos à
+      profissional, e eles também vão para o outbox, amarrados ao evento — são
+      efeitos do processamento de entrada, então precisam ser duráveis e
+      idempotentes como a resposta.
+    - **sem `decisao`** (caminho legado: `POST /test/{slug}/message`): processa e
+      envia direto, como antes. Não há evento durável para ancorar, e isso está
+      registrado como limite em EVIDENCIAS/03.md.
+    """
     phone = "".join(c for c in phone if c.isdigit())  # normaliza sempre
 
     # Descarta remetentes sintéticos (grupos/status/canais). Um número real
@@ -497,7 +577,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                 f"Mensagem: _{text}_\n\n"
                 f"Recomendo entrar em contato o quanto antes."
             )
-            await wa.send_message(tenant, psy_phone, urgency_notif)
+            await _notificar(tenant, psy_phone, urgency_notif, event_row_id, "urgencia")
             psy_notified = True
             logger.info(f"[{tenant['slug']}] ⚠️ Notificação de urgência enviada para psicóloga")
 
@@ -539,8 +619,18 @@ async def _handle_message(tenant: dict, phone: str, text: str):
         # segundos). Como _handle_message roda no event loop (via BackgroundTasks),
         # chamá-lo direto CONGELA o loop e trava todas as outras requisições
         # (painel, healthz, outros webhooks) durante a geração. Offload p/ thread.
-        reply, resp, event = await asyncio.to_thread(agent.process_message, tenant, phone, text)
-        await wa.send_message(tenant, phone, reply)
+        if decisao is None:
+            # Caminho legado, sem evento durável: processa e envia na hora.
+            reply, resp, event = await asyncio.to_thread(
+                agent.process_message, tenant, phone, text)
+            await wa.send_message(tenant, phone, reply)
+        else:
+            # A resposta já está no outbox (inbox.py). Nada de envio direto aqui:
+            # dois caminhos enviando a mesma resposta é exatamente a execução
+            # concorrente que esta etapa existe para eliminar.
+            reply = decisao.get("reply") or ""
+            resp = _DecisaoLida(decisao)
+            event = decisao.get("event")
         logger.info(f"[{tenant['slug']}][{phone}] intent={resp.intent} action={resp.action}")
 
         # ── Notificar psicóloga quando paciente CANCELAR ─────────────────────────
@@ -580,9 +670,9 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                     f"O horário foi liberado na agenda. Se quiser aplicar a política "
                     f"de cobrança, entre em contato com o(a) paciente. 💖"
                 )
-                await wa.send_message(tenant, psy_phone, notif)
+                await _notificar(tenant, psy_phone, notif, event_row_id, "cancelamento")
                 psy_notified = True
-                logger.info(f"[{tenant['slug']}] Notificação de cancelamento enviada para psicóloga")
+                logger.info(f"[{tenant['slug']}] Aviso de cancelamento registrado para a profissional")
             try:
                 await events.publish(tenant["id"], "appointment_cancelled",
                                      {"phone": phone, "patient_name": nome_txt})
@@ -633,7 +723,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                     f"Número: {phone_norm}\n\n"
                     f"Ele(a) está aguardando seu retorno para conhecer o processo. 😊"
                 )
-                await wa.send_message(tenant, psy_phone, notif)
+                await _notificar(tenant, psy_phone, notif, event_row_id, "novo_paciente")
                 psy_notified = True
                 logger.info(f"[{tenant['slug']}] Notificação enviada para psicóloga ({psy_phone})")
 
@@ -673,7 +763,7 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                     f"Pode ser que precise remarcar ou cancelar — recomendo falar "
                     f"com o(a) paciente. 💖"
                 )
-                await wa.send_message(tenant, psy_phone, notif)
+                await _notificar(tenant, psy_phone, notif, event_row_id, "recusa")
                 psy_notified = True
                 logger.info(f"[{tenant['slug']}] Notificação de NEGATIVA enviada para psicóloga")
             try:
@@ -702,20 +792,112 @@ async def _handle_message(tenant: dict, phone: str, text: str):
                         f"Alguém enviou a primeira mensagem e está aguardando seu "
                         f"retorno. 😊"
                     )
-                    await wa.send_message(tenant, psy_phone, notif)
+                    await _notificar(tenant, psy_phone, notif, event_row_id, "primeiro_contato")
                     psy_notified = True
                     logger.info(f"[{tenant['slug']}] Notificação de primeiro contato (catch-all) enviada para psicóloga")
                 except Exception as _e:
+                    # No caminho durável a falha tem de subir: um aviso que não
+                    # chegou a ser preparado precisa de nova tentativa, não de
+                    # uma linha de log.
+                    if event_row_id is not None:
+                        raise
                     logger.warning(f"[{tenant['slug']}] Falha no catch-all de primeiro contato: {_e}")
 
     except Exception as e:
         logger.exception(f"[{tenant['slug']}] Erro ao processar {phone}: {e}")
+        if event_row_id is not None:
+            # Caminho durável: a resposta ao paciente já saiu pelo outbox e o
+            # que falhou aqui foi a preparação dos avisos. Mascarar com uma
+            # mensagem de desculpas esconderia a falha e concluiria o evento —
+            # exatamente o defeito que esta revisão corrige. A exceção sobe e o
+            # worker devolve o evento à fila.
+            raise
         if not db.is_agent_paused(tenant["id"], phone):
             await wa.send_message(tenant, phone,
                 "Desculpe, tive um problema técnico. Tente novamente em instantes 😊")
 
 
 # ── Webhooks (por tenant via slug na URL) ──────────────────────────────────────
+
+# ── Recebimento durável (E03) ─────────────────────────────────────────────────
+
+def _id_do_evento(provider: str, payload: dict) -> tuple[str, str]:
+    """Identificador do evento e sua procedência.
+
+    `("<id>", "provider")` quando o provedor manda um id de mensagem; nesse caso
+    a deduplicação por (tenant, provedor, id) é real.
+
+    `("local:<uuid>", "local")` quando não manda. **Isso não é identidade
+    derivada nem prova de dedup** — é um identificador local para a linha
+    existir e o evento ser processado. Mensagens repetidas desse provedor
+    **não** são detectáveis. Alternativa descartada de propósito: hash do texto
+    confundiria duas mensagens legítimas iguais ("oi" duas vezes) e perderia
+    uma delas, o que é pior do que processar duas.
+    """
+    import uuid as _uuid
+    if provider == "evolution":
+        bruto = ((payload.get("data") or {}).get("key") or {}).get("id") or ""
+    elif provider == "zapi":
+        bruto = (payload.get("messageId") or payload.get("zaapId")
+                 or payload.get("id") or "")
+    elif provider == "twilio":
+        bruto = payload.get("MessageSid") or payload.get("SmsMessageSid") or ""
+    else:
+        bruto = ""
+    bruto = str(bruto).strip()
+    if bruto:
+        return bruto, "provider"
+    return f"local:{_uuid.uuid4().hex}", "local"
+
+
+def _receber(tenant: dict, provider: str, payload: dict, phone: str, body: str,
+             bg: BackgroundTasks | None):
+    """Persiste o evento ANTES do 2xx e agenda o processamento.
+
+    Se a gravação falhar, levanta — o endpoint devolve 503 e **não** diz
+    "enfileirado". O provedor pode reentregar, que é o comportamento desejado:
+    perder a mensagem em silêncio é o defeito que E03 existe para eliminar.
+    """
+    event_id, procedencia = _id_do_evento(provider, payload)
+    try:
+        row_id, duplicata = db.inbound_record(
+            tenant["id"], provider, event_id, phone, body,
+            event_id_source=procedencia)
+    except Exception as e:
+        logger.exception(f"[{tenant['slug']}] FALHA ao persistir evento de "
+                         f"{provider}: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Não foi possível registrar a mensagem. Tente novamente.")
+    if duplicata:
+        logger.info(f"[{tenant['slug']}] evento {provider}:{event_id} duplicado "
+                    f"(linha {row_id}) — nenhuma ação nova")
+        return {"status": "duplicate", "event": row_id}
+    if procedencia == "local":
+        logger.warning(f"[{tenant['slug']}] evento de {provider} SEM id do "
+                       f"provedor (linha {row_id}) — este evento não é "
+                       f"deduplicável; mensagem repetida será processada de novo")
+    # Processamento imediato, best-effort, para a resposta não esperar o laço.
+    # Se não acontecer, o worker pega: a posse é por lease, não por quem chamou.
+    if bg is not None and getattr(config, "INBOX_NUDGE_ON_WEBHOOK", True):
+        bg.add_task(_drenar_entrada)
+    return {"status": "queued", "event": row_id}
+
+
+async def _drenar_entrada():
+    """Empurrão de baixa latência: processa o que está pronto e despacha a saída."""
+    import asyncio as _aio
+    try:
+        import inbox
+        await _aio.to_thread(inbox.drain, None, 5)
+    except Exception as e:
+        logger.exception(f"[inbox] drenagem imediata falhou: {e}")
+    try:
+        import outbox as _ob
+        await _aio.to_thread(_ob.flush, None, 10)
+    except Exception as e:
+        logger.exception(f"[outbox] despacho imediato falhou: {e}")
+
 
 @app.post("/webhook/{slug}/evolution")
 async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
@@ -747,8 +929,9 @@ async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
     if not result:
         return {"status": "ignored"}
     phone, text = result
-    bg.add_task(_handle_message, tenant, phone, text)
-    return {"status": "queued"}
+    # Persistir ANTES do 2xx. A Evolution não tinha dedup nenhuma até aqui:
+    # um retry do provedor era reprocessado e podia gerar duas respostas.
+    return _receber(tenant, "evolution", payload, phone, text, bg)
 
 
 # Códigos de desconexão do Baileys (DisconnectReason) gravados pela Evolution em
@@ -910,21 +1093,15 @@ async def webhook_zapi(slug: str, request: Request, bg: BackgroundTasks):
         or payload.get("id")
         or ""
     )
-    if msg_id:
-        try:
-            is_dup = db.webhook_seen_check_and_mark(msg_id)
-        except Exception as e:
-            logger.warning(f"[{slug}] dedup persistente falhou ({e}) — usando memória")
-            is_dup = _zapi_already_seen(msg_id)
-        if is_dup:
-            logger.info(f"[{slug}] Webhook duplicado ignorado (msg_id={msg_id})")
-            return {"status": "duplicate"}
     result = wa.extract_message_zapi(payload)
     if not result:
         return {"status": "ignored"}
     phone, text = result
-    bg.add_task(_handle_message, tenant, phone, text)
-    return {"status": "queued"}
+    # A dedup agora é a do recebimento durável, por (tenant, provedor, id).
+    # A tabela `webhook_seen` continua existindo para histórico; deixou de ser
+    # o mecanismo, porque marcava a mensagem como vista ANTES de ela ser
+    # processada — uma queda no meio perdia a mensagem para sempre.
+    return _receber(tenant, "zapi", payload, phone, text, bg)
 
 
 @app.post("/webhook/{slug}/zapi/sent")
@@ -936,12 +1113,16 @@ async def webhook_zapi_sent(slug: str, request: Request):
 @app.post("/webhook/{slug}/twilio")
 async def webhook_twilio(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
-    form = await request.form()
-    result = wa.extract_message_twilio(dict(form))
+    form = dict(await request.form())
+    result = wa.extract_message_twilio(form)
     if not result:
         return PlainTextResponse("", status_code=200)
     phone, text = result
-    bg.add_task(_handle_message, tenant, phone, text)
+    # ⚠ Este endpoint NÃO autentica a origem (a Twilio assina com
+    # X-Twilio-Signature e nós não verificamos). Persistir aqui dá durabilidade,
+    # não autenticidade. Fechar isso é trabalho de E06 — registrado em
+    # EVIDENCIAS/03.md. Nenhum cliente usa Twilio hoje.
+    _receber(tenant, "twilio", form, phone, text, bg)
     return PlainTextResponse("", status_code=200)
 
 
@@ -3953,23 +4134,24 @@ def _verify_mp_signature(secret: str, x_signature: str, x_request_id: str, body:
 
 import json as _json
 
-DEFAULT_TESTIMONIALS = [
-    {"name": "Marina R.", "role": "Psicóloga clínica · São Paulo", "initial": "M", "stars": 5,
-     "text": "Antes eu ficava ansiosa no intervalo entre sessões, sempre olhando o WhatsApp. Hoje o agente cuida disso e eu consigo <strong>realmente descansar</strong> entre os atendimentos."},
-    {"name": "Camila F.", "role": "Terapeuta · Rio de Janeiro", "initial": "C", "stars": 5, "highlight": True,
-     "text": "Tive <strong>40% menos faltas no primeiro mês</strong>. O lembrete automático com a política de cobrança fez uma diferença enorme. Vale muito mais do que pago."},
-    {"name": "Letícia M.", "role": "Psicóloga · Curitiba", "initial": "L", "stars": 5,
-     "text": "Minha preocupação era parecer fria para os pacientes. Mas o agente escreve de um jeito tão humanizado que <strong>vários pacientes nem perceberam</strong> que era automático."},
-    {"name": "Bruna P.", "role": "Psicóloga · Florianópolis", "initial": "B", "stars": 5,
-     "text": "Ganhei <strong>2 horas livres por dia</strong>. Os pacientes adoraram a agilidade nas respostas, e eu consegui pegar mais sessões com a agenda otimizada."},
-    {"name": "Patrícia S.", "role": "Psicanalista · Belo Horizonte", "initial": "P", "stars": 5,
-     "text": "Comecei achando que ia ser uma dor de cabeça configurar, mas em <strong>10 minutos estava tudo pronto</strong>. O suporte respondeu rapidíssimo no WhatsApp."},
-    {"name": "Fernanda A.", "role": "Psicóloga infantil · Porto Alegre", "initial": "F", "stars": 5,
-     "text": "O melhor é a confirmação na noite anterior — <strong>quase ninguém esquece a sessão</strong>. Reduziu drasticamente os no-shows que eram um problema crônico para mim."},
-]
+# Prova social: VAZIA por padrão, de propósito.
+#
+# Até 12/10/2026 esta lista trazia seis depoimentos atribuídos a pessoas que não
+# existem ("Marina R., Psicóloga clínica · São Paulo"), com métricas nunca
+# apuradas: "40% menos faltas no primeiro mês", "2 horas livres por dia", "em 10
+# minutos estava tudo pronto". Eram exibidos na landing como depoimentos reais.
+#
+# Depoimento só entra aqui vindo de cliente real, com autorização por escrito,
+# gravado pelo painel do operador (/painel → conteúdo do site). Nunca redigido
+# por nós. Mesma regra vale para percentual, prazo e garantia: sem apuração, não
+# vai para o site. Ver ESCOPO.md ("Não oferecer ... redução de faltas ou
+# economia percentual sem validação") e EVIDENCIAS/02.md §4.
+DEFAULT_TESTIMONIALS: list[dict] = []
 
 
 def _get_testimonials() -> list[dict]:
+    """Depoimentos cadastrados pelo operador. Lista vazia quando não há nenhum —
+    a landing então não mostra a seção, em vez de preencher com texto inventado."""
     raw = db.get_site_content("testimonials", "")
     if not raw:
         return DEFAULT_TESTIMONIALS
@@ -4483,6 +4665,131 @@ def painel_api_content_put(key: str, body: ContentBody, request: Request):
 def painel_api_testimonials_default(request: Request):
     _require_admin(request)
     return {"defaults": DEFAULT_TESTIMONIALS}
+
+
+# ── Suporte operacional de entrada/saída (E03) ────────────────────────────────
+# Sob /admin/*, portanto exige MASTER_KEY pelo middleware (fail-closed: sem
+# MASTER_KEY configurada, tudo é negado). Não é painel: é o mínimo para
+# responder "ficou alguma mensagem presa?" e agir com rastro.
+
+
+def _idade_min(iso: str | None) -> float | None:
+    if not iso:
+        return None
+    try:
+        return round((db._dt_local() - datetime.fromisoformat(iso)).total_seconds() / 60, 1)
+    except Exception:
+        return None
+
+
+@app.get("/admin/fila")
+def admin_fila(limit: int = 50):
+    """Pendentes, em processamento, falhos e incertos — com idade, tentativas e
+    estágio. Não devolve o texto das mensagens: é conteúdo clínico do paciente."""
+    entrada = [
+        {"id": e["id"], "tenant_id": e["tenant_id"], "provider": e["provider"],
+         "id_do_provedor": e["event_id_source"] == "provider",
+         "state": e["state"], "stage": e["stage"], "attempts": e["attempts"],
+         "idade_min": _idade_min(e["created_at"]),
+         "espera_ate": e["next_attempt_at"], "erro": (e["last_error"] or "")[:200]}
+        for e in db.inbound_list(states=("pending", "processing", "failed"), limit=limit)
+    ]
+    saida = [
+        {"id": o["id"], "tenant_id": o["tenant_id"], "evento": o["event_row_id"],
+         "kind": o["kind"], "state": o["state"], "attempts": o["attempts"],
+         "idade_min": _idade_min(o["created_at"]),
+         "provider_message_id": o["provider_message_id"],
+         "oferta": (o["offer_id"] or "")[:8],
+         "resolucao": o["resolution"], "erro": (o["last_error"] or "")[:200]}
+        for o in db.outbox_list(states=("pending", "sending", "failed", "uncertain"),
+                                limit=limit)
+    ]
+    pendencias = [
+        {"id": p["id"], "tenant_id": p["tenant_id"], "evento": p["event_row_id"],
+         "kind": p["kind"], "state": p["state"],
+         "idade_min": _idade_min(p["created_at"]),
+         "detalhe": (p["detail"] or "")[:300]}
+        for p in db.pendencia_list(states=("pendente", "incerto"), limit=limit)
+    ]
+    return {
+        "entrada": entrada,
+        "saida": saida,
+        "pendencias": pendencias,
+        "resumo": {
+            "entrada_presa": sum(1 for e in entrada if e["state"] == "failed"),
+            "saida_incerta": sum(1 for o in saida if o["state"] == "uncertain"),
+            "saida_falha": sum(1 for o in saida if o["state"] == "failed"),
+            "pendencias_abertas": len(pendencias),
+        },
+        "nota": ("'uncertain' = a requisição saiu e o desfecho é desconhecido; "
+                 "pode ter sido entregue. Não é reenviado automaticamente. "
+                 "'bloqueado:*' = ação recusada por falta de id do provedor na "
+                 "mensagem; precisa de revisão ou de uma confirmação "
+                 "identificável do paciente. 'calendar:*' = a consulta local "
+                 "existe, o evento no calendário externo é incerto."),
+    }
+
+
+class ResolucaoSuporte(BaseModel):
+    motivo: str
+    estado: str = "failed"
+
+
+@app.post("/admin/fila/entrada/{event_id}/retry")
+def admin_retry_entrada(event_id: int, body: ResolucaoSuporte):
+    """Devolve um evento falho à fila. O reprocessamento **não** reaplica efeito
+    já aplicado: as marcas em `applied_effects` continuam valendo."""
+    e = db.inbound_get(event_id)
+    if not e:
+        raise HTTPException(status_code=404, detail="Evento não encontrado.")
+    if not (body.motivo or "").strip():
+        raise HTTPException(status_code=400, detail="Informe o motivo.")
+    ok = db.inbound_force_pending(event_id)
+    db.audit_log("inbox_retry", actor="suporte", target=str(event_id),
+                 details=body.motivo[:200])
+    logger.warning(f"[suporte] retry manual do evento {event_id}: {body.motivo[:200]}")
+    return {"status": "reenfileirado" if ok else "sem_efeito", "event": event_id}
+
+
+@app.post("/admin/fila/pendencia/{pendencia_id}/resolver")
+def admin_resolver_pendencia(pendencia_id: int, body: ResolucaoSuporte):
+    """Fecha uma pendência operacional com motivo registrado.
+
+    Não executa a ação que foi bloqueada: quem confere a agenda (ou fala com o
+    paciente) é a pessoa. Resolver aqui é dizer "já tratei", com rastro.
+    """
+    if not (body.motivo or "").strip():
+        raise HTTPException(status_code=400, detail="Informe o motivo.")
+    if not db.pendencia_resolver(pendencia_id, body.motivo[:200]):
+        raise HTTPException(status_code=404, detail="Pendência não encontrada.")
+    db.audit_log("pendencia_resolve", actor="suporte", target=str(pendencia_id),
+                 details=body.motivo[:200])
+    logger.warning(f"[suporte] pendência {pendencia_id} resolvida: {body.motivo[:200]}")
+    return {"status": "resolvida", "pendencia": pendencia_id}
+
+
+@app.post("/admin/fila/saida/{outbox_id}/resolver")
+def admin_resolver_saida(outbox_id: int, body: ResolucaoSuporte):
+    """Fecha manualmente um envio incerto ou falho, com motivo registrado.
+
+    Para `uncertain` não há reenvio automático de propósito: a mensagem pode ter
+    chegado. Quem resolve é quem pode checar com o paciente.
+    """
+    o = db.outbox_get(outbox_id)
+    if not o:
+        raise HTTPException(status_code=404, detail="Envio não encontrado.")
+    if not (body.motivo or "").strip():
+        raise HTTPException(status_code=400, detail="Informe o motivo.")
+    if body.estado not in ("failed", "provider_accepted", "delivery_confirmed", "pending"):
+        raise HTTPException(status_code=400, detail="Estado inválido.")
+    db.outbox_resolve(outbox_id, body.estado, body.motivo[:200])
+    if o.get("offer_id"):
+        db.offer_mark_sent(o["offer_id"], body.estado)
+    db.audit_log("outbox_resolve", actor="suporte", target=str(outbox_id),
+                 details=f"estado={body.estado} motivo={body.motivo[:200]}")
+    logger.warning(f"[suporte] envio {outbox_id} resolvido como {body.estado}: "
+                   f"{body.motivo[:200]}")
+    return {"status": "resolvido", "outbox": outbox_id, "estado": body.estado}
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
