@@ -152,7 +152,24 @@ conteúdo para E02 (ver `REVISOES.md`).
 | Nenhum commit/push/deploy | **PASSOU** |
 | Efeitos fora da garantia | Mídia (**E05**), jobs do agendador (**E06**), avisos de pagamento (**E06** validação / **E14** consolidação), Twilio sem autenticação (**E06**), atomicidade de conflito (**E04**), escala horizontal (**E26**/**E28**) |
 
-## Release incremental 1 — E01–E03 (AGUARDANDO APROVAÇÃO)
+## R1 — landing (AGUARDANDO AUTORIZAÇÃO)
+
+Worktree isolado, branch `release/r1-landing`, commit **`885477d2`** sobre o
+`origin/main` **atual** (`80d7ece8`). Dois arquivos, 29+/40−: só a landing.
+Detalhes em `RELEASE-R1-LANDING.md`.
+
+- **Gatilho do cripto: RESOLVIDO.** O registro de deployments do GitHub mostra
+  que commits que tocam só `whatsapp-agent/` acionam **apenas** o serviço do
+  Agente; os de cripto acionam apenas Crypto Win PRD/DEV. Só o merge commit de
+  02/10 subiu os três. O R1 é fast-forward e toca só `whatsapp-agent/backend/`.
+- **Bloqueador restante: volume em `/data`** não confirmado (V-B). Vale para
+  qualquer deploy, não só o R1.
+- Checks do R1: **18/18**, rodados contra os arquivos exatos do commit.
+- `main` não é protegida e não há ruleset; 0 workflows no repositório.
+- Restauração de backup: **PENDENTE** — backup existente não é restauração
+  validada.
+
+## Release incremental 1 — E01–E03 (reposicionado como R2)
 
 Branch local `release/agente-consultorio-e01-e03`, 6 commits sobre `1b723a8f`.
 Carimbo preparado `2026-10-14-68`. **Nada publicado.** Detalhes, procedimento,
@@ -166,7 +183,8 @@ rollback e bloqueadores em `RELEASE-E01-E03.md`.
 | G4 publicação | — |
 | G5 observação | — |
 
-**Menor release coerente:** E02 **não** é publicável sozinha (a camada de
+**R2 precisa de rebase** sobre o `origin/main` atual (hoje está 17 commits
+atrás). **Menor release coerente:** E02 **não** é publicável sozinha (a camada de
 ofertas foi reescrita sobre o esquema de E03 e as funções de E02 foram
 removidas). O que é separável de verdade é a **correção da landing** (commit 1),
 autossuficiente e de risco mínimo. Recomendação: R1 = landing + docs + testes;
