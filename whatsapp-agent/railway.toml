@@ -1,10 +1,26 @@
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
-watchPatterns = ["whatsapp-agent/**"]
+# Só o que entra na imagem dispara rebuild. Antes era `whatsapp-agent/**`, que
+# casava também `docs/**`, `tests/**` e `pytest.ini` — commitar documentação ou
+# teste reconstruía e reiniciava a produção sem nenhuma mudança de código.
+# O Dockerfile copia apenas `backend/`, então esta lista cobre tudo que altera
+# a imagem. ATENÇÃO: isto NÃO é proteção contra publicação; é filtro de gatilho,
+# e só vale se a Railway estiver realmente aplicando este arquivo — o que
+# permanece NÃO VERIFICADO (ver docs/planejamento/homologacao/PROTECAO_PUBLICACAO.md).
+watchPatterns = [
+  "whatsapp-agent/backend/**",
+  "whatsapp-agent/Dockerfile",
+  "whatsapp-agent/railway.toml",
+  "whatsapp-agent/start.sh",
+]
 
 [deploy]
 startCommand = "sh -c 'uvicorn main:app --host 0.0.0.0 --port ${PORT:-8001}'"
+# `/health` existe em main.py (`@app.api_route("/health", methods=["GET","HEAD"])`)
+# e devolve {"status":"ok"}. Há também `/healthz`, com `db` e `uptime_s`, usado
+# para confirmar deploy. O teste `test_healthcheck_do_railway_aponta_para_rota_existente`
+# falha se este caminho deixar de existir no app.
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
