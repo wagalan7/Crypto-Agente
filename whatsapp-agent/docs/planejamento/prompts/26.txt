@@ -1,0 +1,10 @@
+Execute apenas E26 do plano v1.0: Equipe, API oficial e prontidão de capacidade.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/26.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 07,10,11,14,18,25. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/26.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Finalize múltiplos profissionais/recursos e papéis, conflito por recurso e consultas por equipe. Implemente adaptador oficial WhatsApp respeitando regras e templates oficiais vigentes; verifique assinatura/eventos e diferença de janela/envio. Prepare configuração external e testes fake; mantenha provedores atuais. Teste capacidade e coordenação de jobs antes de permitir réplicas; não migrar banco sem aprovação de escopo.
+
+ACEITE
+Agenda de três profissionais fictícios independente; recepção vê apenas necessário. Contratos de adaptador e falhas/retries/mídia passam; envio real oficial em número de teste só autorizado. Aprovações/contas pendentes = opção não publicada, sem atraso escondido. Limite comercial proposto com evidência de teste e margem.

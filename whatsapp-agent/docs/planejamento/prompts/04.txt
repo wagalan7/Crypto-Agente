@@ -1,0 +1,12 @@
+Execute apenas E04 do plano v1.0: Agenda correta e ferramentas seguras.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/04.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 03. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/04.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Cheque conflito e escrita atomicamente em todas as entradas de criar/remarcar; intervalos, duração, estados e recurso. Respostas canônicas com data, horário/fuso e modalidade; slot explícito e estado atual validados. Elimine criação convertida em remarcação sem intenção válida. Preserve horário contíguo e reutilização de canceladas. Não mantenha transação durante chamada externa.
+
+ACEITE
+Concorrência com duas conexões independentes: mesmo início/sobreposição só um sucesso; tenants/recursos diferentes independentes; conflito não confirma reserva. Testes de segunda/quarta, datas ambíguas, datas relativas, transição de horário de verão externa e confirmação da alteração passam.
+
+NOTA v1.1 (12/10/2026): houve transferência de conteúdo entre E02, E04 e E27, com datas mantidas. Leia docs/planejamento/REVISOES.md e a ficha ETAPAS/04.md antes de executar — parte do trabalho descrito acima pode já ter sido feita em outra etapa.

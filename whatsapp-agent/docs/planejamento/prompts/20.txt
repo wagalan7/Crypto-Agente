@@ -1,0 +1,10 @@
+Execute apenas E20 do plano v1.0: Biblioteca teórica com fontes.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/20.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 07,19. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/20.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Crie referências/livros/artigos/notas/trechos e materiais com direito de uso, autor/obra/página/versão; importação limitada de PDF/texto e processamento assíncrono. Biblioteca por proprietário/permissão explícita; indexação e busca separadas de público, financeiro e FAQ. Material não executa instruções.
+
+ACEITE
+Resultados citam fonte real e abrem trecho; página desconhecida não é inventada; materiais inválidos/sem direito são tratados. Exclusão/atualização remove versão do índice; isolamento em busca e cache; ingestion não expõe arquivos, custo medido.

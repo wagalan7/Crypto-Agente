@@ -1,0 +1,10 @@
+Execute apenas E21 do plano v1.0: Preparar busca autorizada e avaliação de conexões.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/21.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 19,20. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/21.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Prepare recuperação por trechos de registro e biblioteca com IDs/citações verificáveis e escolha de registros elegíveis. Construa conjunto fictício revisado pelo profissional: relacionados/não relacionados, homônimos e casos sensíveis. Defina critérios de qualidade e abstenção antes de habilitar sugestão; não rotular score como probabilidade clínica.
+
+ACEITE
+Citação/trecho sempre corresponde ao original/versionamento; falso vínculo por outro tenant bloqueado. Critérios numéricos e qualitativos aprovados pelo proprietário/profissional; casos sem evidência abstêm. Relatório de custo/latência e qualidade, sem conclusões clínicas.

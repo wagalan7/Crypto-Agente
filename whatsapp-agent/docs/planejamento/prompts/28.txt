@@ -1,0 +1,10 @@
+Execute apenas E28 do plano v1.0: Homologação integral e entrega consolidada.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/28.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 01–27. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/28.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Execute jornadas paciente/profissional/recepção/financeiro, falhas externas, segurança/privacidade e restore com dados fictícios; revise capacidade/custos/permissões e avaliação do assistente. Corrija defeitos de escopo, congele release, produza operação/suporte/migrações/rollback e materiais. Prepare publicação gradual e checklist final.
+
+ACEITE
+Matriz S01–S20 completa com evidências; zero bloqueador conhecido sem tratamento; pendências externas explicitadas, recursos não validados fora da oferta. Revisão técnica/visual/profissional registrada; versão e configuração exatas prontas para aprovação. Só depois de homologação e autorização publicar; observado separadamente.

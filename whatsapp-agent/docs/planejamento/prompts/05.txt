@@ -1,0 +1,10 @@
+Execute apenas E05 do plano v1.0: Mídia, imagem, TLS e monitor independente.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/05.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 03,04. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/05.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Reconheça mídia no provedor atual com payloads reais sanitizados/fixtures; implemente fallback honesto e recado humano para áudio/imagem/PDF ainda não processados, respeitando pausa. Prepare digest Evolution disponível/testado e domínio canônico; não invente configuração nem altere Railway. Prepare monitor externo de app e canal, alertas independentes deduplicados, recuperação e runbook.
+
+ACEITE
+Nenhuma mídia de teste some; grupos/fromMe continuam filtrados; falha recebe pendência. Teste app morto e sessão zumbi gera alerta <=15 min em homologação autorizada; se canal externo não configurado, marcar bloqueio. Configuração/TLS/digest com roteiro e reversão, sem publicação.

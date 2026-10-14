@@ -1,0 +1,10 @@
+Execute apenas E07 do plano v1.0: Identidade, usuários e papéis.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/07.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 06. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/07.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Separe estabelecimento, nome profissional e saudação; mantenha compatibilidade. Crie usuários, papéis proprietário/profissional/recepção/financeiro e permissões específicas, login e sessões revogáveis com expiração; migre links permanentes com transição segura. Prepare vínculo de profissional/recurso sem expor registros clínicos.
+
+ACEITE
+Matriz testada no servidor; recepção/financeiro sem clínico; sessão revogada perde acesso; convite/recuperação expira e não enumera conta; usuários de tenants diferentes não cruzam dados; personalização persistente e auditada.

@@ -1,0 +1,8 @@
+Execute a etapa 01 do plano Agente Consultório v1.0 usando o pacote anexo. Primeiro leia as instruções locais do repositório. Esta etapa autoriza somente planejamento local, inspeção do código e configuração revisável de homologação; não acessar/alterar produção nem publicar.
+
+Instale os arquivos do pacote como docs/planejamento/{CONTEXTO,ESCOPO,CRONOGRAMA,STATUS}.md e ETAPAS/NN.md a partir dos prompts. Leia a auditoria uma vez; confronte checkout atual, versão auditada e relato de data errada. Inventarie instruções, deploy automático, stack, banco, testes, autenticação, provedores, ambientes e módulos sem acessar produção. Defina dados fictícios, regras de agenda/modalidade, finanças e papéis. Mapeie S01–S20 a etapas. Não implemente novas funcionalidades nesta etapa.
+
+ACEITE
+Plano local instalado; STATUS inicial com achados confirmados/refutados/não verificados; mapa de dependências, configuração de homologação preparada e capacidade/prazos confrontados. Registre questões de negócio bloqueantes e continue trabalho independente. Proponha mudança de baseline apenas com justificativa.
+
+Instale também as fichas ETAPAS e o contexto do pacote para os próximos prompts. Não sobrescreva instruções existentes. Registre onde o plano pode ser encontrado nas instruções existentes somente se isso for apropriado, preservando seu conteúdo. Confirme em resposta curta: situação real, plano instalado, bloqueios e se o cronograma pode ser mantido. Não execute E02 automaticamente.

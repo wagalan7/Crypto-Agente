@@ -1,0 +1,10 @@
+Execute apenas E10 do plano v1.0: Grade de agenda e disponibilidade.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/10.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 04,07,08,09. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/10.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Implemente dia/semana e lista móvel, modalidade e recurso, livres/ocupados/bloqueados, formulário acessível de criar/mover. Separe horário recorrente e bloqueio pontual. Sincronize Google/CalDAV com reconciliação e id externo; falha deixa pendência, não duplica evento automaticamente.
+
+ACEITE
+Todas as ações usam serviço transacional E04; editar/mover requer autorização e estado atual; integração fake testa create/update/delete e timeout sem evento duplicado. Validação real de OAuth/CalDAV autorizada ou bloqueio explicitado; sem anunciar integração não exercitada.

@@ -1,0 +1,10 @@
+Execute apenas E12 do plano v1.0: FAQ aprovado e áudio funcional.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/12.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 05,11. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/12.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Crie FAQ por tenant com revisão/publicação, busca relevante e fontes internas; desconhecido gera recado. Ligue transcrição de áudio com mídia da versão real do provedor, limites de duração/tamanho/timeout e custo; texto transcrito rastreável e falha honesta. Tratamento cauteloso de imagem/PDF sem confirmação automática de pagamento.
+
+ACEITE
+Perguntas fora do FAQ não inventam preço/política; edição publicada é refletida. Áudio de teste segue fluxo e confirma ação conforme risco; mídia inválida/excessiva falha com pendência, temporários são limpos e origem do conteúdo é marcada.

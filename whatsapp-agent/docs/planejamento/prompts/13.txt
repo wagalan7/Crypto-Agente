@@ -1,0 +1,10 @@
+Execute apenas E13 do plano v1.0: Financeiro a receber e conciliação.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/13.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 06,07,09,11. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/13.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Crie página financeira própria aproveitando tabelas atuais: cobranças por sessão/avulsas, competências/vencimentos, total cobrado/recebido/aberto/vencido; recebimentos, parcial/estorno, comprovantes pendentes e conciliação com revisão. Dinheiro exato, vínculo a sessão/paciente e trilha de alteração.
+
+ACEITE
+Totais batem com detalhe/filtro/exportação e exemplos de parcial/estorno; cobrança não vira receita recebida; confirmação humana de comprovante; role adequado; retries não duplicam cobrança. Testes de arredondamento e competência passam.

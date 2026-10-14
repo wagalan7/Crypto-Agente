@@ -1,0 +1,10 @@
+Execute apenas E25 do plano v1.0: Lista de espera e relacionamento aprovado.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/25.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 04,11,14,18. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/25.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Crie lista de espera com preferência/modalidade, ofertas e prazo, reserva atômica para primeiro aceite; retorno/reativação como lista preparada com aprovação humana. Regras opt-out, frequência, horário e política do provedor; sem marketing autônomo, sem conteúdo clínico.
+
+ACEITE
+Duas aceitações simultâneas não ocupam mesmo slot; expiração libera; repetição não duplica campanha. Exclusão/opt-out impede envio pertinente; cancelamento de campanha e pausas funcionam; mensagens são revisadas e rastreáveis.

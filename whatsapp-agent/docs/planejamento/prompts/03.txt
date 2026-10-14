@@ -1,0 +1,10 @@
+Execute apenas E03 do plano v1.0: Recebimento durável e envio rastreável.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/03.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 02. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/03.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Evolua webhook_seen/BackgroundTasks para fila durável compatível com banco atual: eventos por tenant/provedor/id, estados, lease, retentativa limitada e recuperação. Serialize processamento por contato e garanta idempotência das ações. Outbox com resultado confirmado/incerto/falha e reconciliação; não prometer exactly-once externo.
+
+ACEITE
+Injete crash após recebimento, antes/depois da ação e antes/depois do envio; evento retoma sem repetir ação e envio incerto fica visível. 2xx só após persistência; duplicatas e tenants não interferem; ordem e backpressure têm comportamento definido.

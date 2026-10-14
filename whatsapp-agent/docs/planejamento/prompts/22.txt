@@ -1,0 +1,10 @@
+Execute apenas E22 do plano v1.0: Conexões bidirecionais revisáveis.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/22.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 21. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/22.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Implemente opção nova anotação busca referências e nova referência busca somente registros elegíveis/autorizados. Exiba trechos, temas de aproximação e fonte; estados sugerido/aceito/ignorado, sem modificar original. Vincular exige revisão; desfazer e mudança da fonte invalidam vínculo obsoleto. Não enviar a paciente.
+
+ACEITE
+Testes dos dois sentidos, repetição/dedup, exclusão/edição e rejeição; sugestões não diagnósticas nem conclusivas. Conjunto E21 passa nos critérios aprovados; profissional pode desligar busca e limitar casos. R5 condicionado a proteção e avaliação.

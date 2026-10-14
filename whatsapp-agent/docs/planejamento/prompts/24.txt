@@ -1,0 +1,10 @@
+Execute apenas E24 do plano v1.0: Simulador de valores e gestão.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/24.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 14,17. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/24.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Implemente despesas/capacidade/ocupação/duração/remuneração/tributos informados, cenários salvos e comparação; fórmulas/premissas visíveis, dados financeiros agregados só com autorização. Relatório mensal de gestão e resumo pelo assistente, distinguindo realizado/previsto.
+
+ACEITE
+Cálculos conferidos com exemplos independentes; divisão por zero, ocupação inválida e arredondamento tratados. Não prescreve preço ou tributação; cenários não alteram preços de pacientes automaticamente; relatório e exportação batem com período/origem.

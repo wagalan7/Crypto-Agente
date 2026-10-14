@@ -1,0 +1,10 @@
+Execute apenas E19 do plano v1.0: Registros profissionais protegidos.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/19.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 06,07,09,15. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/19.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Implemente registros por paciente com autoria/data, versão/adendo, anexos seguros, audit de acesso e exportação autorizada. Valide categorias de registro/prontuário e regra de guarda com responsável antes de ativar. Não inferir registro clínico do chat; recepção/financeiro sem acesso. Compartilhamento e direitos não permitem destruir retenção obrigatória.
+
+ACEITE
+Versão antiga preservada, alterações atribuídas, anexo validado/cifrado; testes negativos em API/search/export/assistente. Restore preserva registros e permissões; fluxo de direitos e guarda configurado/revisado ou módulo bloqueado para uso real.

@@ -1,0 +1,10 @@
+Execute apenas E09 do plano v1.0: Pacientes, Hoje e alertas acionáveis.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/09.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 08. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/09.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Unifique identificação/nome, ficha cadastral, status ativo/inativo, busca e paginação. Defina critérios de cada card e abra lista correspondente já filtrada; explique janela/período. Remova texto duplicado do painel principal. Compartilhe consultas com futuro assistente; não introduza acesso clínico prematuro.
+
+ACEITE
+Número do card bate com lista/paginação; contratos pendentes e pacientes sem próximo horário identificados pelo nome quando disponível; contato desconhecido não recebe nome inventado. Filtros persistem ao voltar; celular funcional e consultas escopadas.

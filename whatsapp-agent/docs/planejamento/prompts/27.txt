@@ -1,0 +1,12 @@
+Execute apenas E27 do plano v1.0: Página de vendas e onboarding final.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/27.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 08,12,16,17,18,22,23,24,25,26. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/27.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Revitalize landing existente com design aprovado, benefícios e demonstração real dos recursos publicados; compare planos por capacidade medida e configure preço sem inventar mercado. Fluxo de onboarding assistido/checklist/treinamento/suporte, SEO básico/metadados, acessibilidade e desempenho. Recurso pendente não aparece como disponível.
+
+ACEITE
+Promessa mapeada a evidência/versão; checkout e recuperação testados em sandbox; celular e contatos funcionam; exemplos fictícios. Proposta visual e textos revisados, oferta e custos aprovados; não publicar site ou enviar campanhas sem aprovação.
+
+NOTA v1.1 (12/10/2026): houve transferência de conteúdo entre E02, E04 e E27, com datas mantidas. Leia docs/planejamento/REVISOES.md e a ficha ETAPAS/27.md antes de executar — parte do trabalho descrito acima pode já ter sido feita em outra etapa.

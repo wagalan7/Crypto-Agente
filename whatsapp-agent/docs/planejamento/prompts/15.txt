@@ -1,0 +1,10 @@
+Execute apenas E15 do plano v1.0: Contratos organizados e documentos básicos.
+Leia as instruções locais aplicáveis e docs/planejamento/CONTEXTO.md, o resumo de STATUS.md e ETAPAS/15.md. Se o plano ainda não foi instalado, use o pacote fornecido; não invente requisitos. Verifique dependências 07,09,13. Busque/abra somente código relevante; não releia auditoria completa ou todos os prompts.
+Trabalhe localmente com dados fictícios, sem publicação, produção, mensagens reais ou APIs pagas. Implemente o escopo da ficha, teste critérios, migrações e reversão relevantes. Pare a parte dependente se faltar decisão/credencial, registre bloqueio e continue trabalho independente. Não amplie escopo nem avance à próxima etapa automaticamente.
+Atualize STATUS e EVIDENCIAS/15.md com resultados verificáveis. Responda curto: mudanças, testes, bloqueios e próximo passo. Não marque integração não exercitada como validada.
+
+TRABALHO
+Reorganize contratos com busca/filtro/paginação/modelos versionados mantendo fluxos atuais. Crie Documentos: declaração de comparecimento com horários comprovados, dados identificadores necessários, finalidade, profissional/registro e modelo validável. Rascunho, revisão, emissão/PDF/histórico/vínculo. Sem interpretação clínica ou assinatura qualificada inventada.
+
+ACEITE
+150 contratos fictícios navegam sem lista infinita; filtro pendentes bate com card. Declaração usa atendimento realizado, pede informação faltante, não adiciona diagnóstico; revisão obrigatória e versão emitida preservada. Modelo requer revisão profissional antes de emissão real.
