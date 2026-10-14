@@ -11,7 +11,7 @@ Carimbo preparado: `2026-10-14-68`
 
 ## 1. O que entra
 
-Seis commits, nesta ordem:
+Sete commits, nesta ordem:
 
 | # | Commit | Área | Risco |
 |---|---|---|---|
@@ -20,7 +20,8 @@ Seis commits, nesta ordem:
 | 3 | `f97c0174` `docs` | Plano v1.1, auditoria, `whatsapp-agent/CLAUDE.md` | Nenhum — documentação |
 | 4 | `dc6dcf6c` `test` | Suíte (316), CI, config de teste | Nenhum em produção — não entra na imagem |
 | 5 | `7ea95419` `fix(agenda)+feat(entrega)` | E02 seleção de horário + E03 recebimento durável | **Médio-alto** — 7 arquivos, 6 tabelas novas |
-| 6 | `196de1f1` `chore(build)` | Carimbo `2026-10-14-68` | Nenhum — isolado para poder ser descartado |
+| 6 | `651dd1d4` `docs(release)` | Este roteiro + homologação executável | Nenhum — documentação |
+| 7 | `c4ecdf5e` `chore(build)` | Carimbo `2026-10-14-68` | Nenhum — **último**, para poder ser descartado com `git reset --hard HEAD~1` |
 
 Fora do release, de propósito: `.claude/settings.local.json`, `AGENTS.md`,
 `.DS_Store`, `backend/static/prototipo-*.html`. O bot de cripto **não é tocado**
