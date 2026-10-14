@@ -1,0 +1,95 @@
+# CI do Agente Consultório (whatsapp-agent).
+#
+# Escopo deliberadamente restrito: só roda quando algo em `whatsapp-agent/**`
+# muda. O bot de cripto divide este repositório e tem a própria suíte em
+# `backend/tests/pg_integration_*.py`, que NÃO é coletada aqui (nomes fora do
+# padrão `test_*.py` e `testpaths = tests` no pytest.ini do produto).
+#
+# O que este workflow prova: a suíte local passa numa máquina limpa, com o
+# Python de produção. O que ele NÃO prova: que a aplicação funcione com os
+# provedores reais (WhatsApp, IA, pagamento, SMTP, backup) — isso depende de
+# contas de homologação que ainda não existem.
+#
+# Este arquivo existir não protege a branch nem o release: isso é configuração
+# do GitHub, feita no painel. Ver docs/planejamento/homologacao/PROTECAO_PUBLICACAO.md.
+name: Agente Consultório — testes
+
+on:
+  push:
+    paths:
+      - 'whatsapp-agent/**'
+      - '.github/workflows/agente-consultorio.yml'
+  pull_request:
+    paths:
+      - 'whatsapp-agent/**'
+      - '.github/workflows/agente-consultorio.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: whatsapp-agent
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mesma versão do Dockerfile (python:3.11-slim). Divergir aqui tornaria o
+      # CI verde sem significar nada para produção.
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            whatsapp-agent/backend/requirements.txt
+            whatsapp-agent/requirements-dev.txt
+
+      # Para `node --check` no JavaScript embutido dos templates.
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar dependências
+        run: pip install -r requirements-dev.txt
+
+      - name: Versão do Python bate com o Dockerfile
+        run: |
+          esperado=$(grep -m1 '^FROM python:' Dockerfile | sed -E 's/.*python:([0-9]+\.[0-9]+).*/\1/')
+          atual=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+          echo "Dockerfile=$esperado  CI=$atual"
+          test "$esperado" = "$atual"
+
+      - name: Carimbo de build presente no Dockerfile
+        run: |
+          # A confirmação de deploy depende deste carimbo na linha 2.
+          sed -n '2p' Dockerfile | grep -Eq '^# build: [0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]+$'
+
+      - name: Compilar todos os módulos
+        # `.venv` é ignorado pelo git e não deveria existir no runner; a exclusão
+        # evita que uma cópia local acidental torne o passo lento ou vermelho.
+        run: python -m compileall -q -x '[\\/]\.venv[\\/]' backend
+
+      - name: Suíte de testes
+        env:
+          # Sem chave de IA: qualquer chamada ao modelo real falha em vez de
+          # gastar crédito. O banco fica num diretório temporário do runner.
+          GROQ_API_KEY: ''
+          ANTHROPIC_API_KEY: ''
+          WHATSAPP_PROVIDER: mock
+          INSTANCE_MONITOR_ENABLED: '0'
+        run: python -m pytest -q
+
+      - name: Nenhum segredo óbvio no diff do produto
+        run: |
+          if grep -rnE '(sk-ant-|gsk_[A-Za-z0-9]{20,}|sk_live_|APP_USR-[0-9]{6,})' \
+               backend docs 2>/dev/null; then
+            echo "::error::padrão de credencial encontrado"; exit 1
+          fi
+          echo "ok"
