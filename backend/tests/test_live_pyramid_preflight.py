@@ -74,7 +74,8 @@ class Column:
 
 
 class Query:
-    def __init__(self):
+    def __init__(self, *entities):
+        self.entities = entities
         self.locked = False
         self.conditions = []
 
@@ -110,6 +111,13 @@ class Session:
         if self.owner.db_error:
             raise RuntimeError("TEST_ONLY_DATABASE_UNAVAILABLE")
         self.owner.queries.append(query)
+        if len(query.entities) == 1 and query.entities[0] is self.owner.snapshot_model.RecommendationSnapshot.timeframe:
+            self.row = None
+            identifiers = [condition[2] for condition in query.conditions
+                           if isinstance(condition, tuple) and condition[:2] == ("snapshot.id", "eq")]
+            if len(identifiers) != 1:
+                raise AssertionError("ORIGINAL_TIMEFRAME_REQUIRES_EXACT_SNAPSHOT_FK")
+            return Result(self.owner.original_snapshots.get(identifiers[0]))
         self.row = copy.deepcopy(self.owner.persisted)
         return Result(self.row)
 
@@ -141,6 +149,7 @@ class CallerFixture:
             sl_order_id="TEST_SL", tp2_order_id="TEST_TP2", sl_current_price=100.0,
             timeframe="1h", recommendation_id=7)
         self.persisted = copy.deepcopy(self.trade)
+        self.original_snapshots = {7: "1h"}
         self.rec = {"symbol": "BTC/USDT", "direction": "long", "timeframe": "1h",
                     "entry": 110.0, "stop_loss": 105.0, "tp1": 115.0, "tp2": 120.0,
                     "leverage": 19, "signal": {"indicators": {"atr": 5.0}}}
@@ -186,8 +195,10 @@ class CallerFixture:
             record_incident=AsyncMock(return_value={"persisted": True}),
             assemble_entry_incident=lambda *args, **kw: kw)
         self.db = module("db", get_session=lambda: Session(self), DB_ENABLED=True)
-        self.sql = module("sqlalchemy", select=lambda *args: Query(), or_=lambda *args: args)
+        self.sql = module("sqlalchemy", select=lambda *args: Query(*args), or_=lambda *args: args)
         self.model = module("models.real_trade", RealTrade=type("RealTrade", (), {"id": Column()}))
+        self.snapshot_model = module("models.recommendation_snapshot", RecommendationSnapshot=
+            type("RecommendationSnapshot", (), {"id": Column("snapshot.id"), "timeframe": Column("snapshot.timeframe")}))
         self.push = module("services.push_service", notify_alert=AsyncMock())
         self.entry_intents = module("services.entry_intent_service",
             mark_unknown=AsyncMock(), mark_confirmed=AsyncMock(), release_reserved=AsyncMock(),
@@ -279,7 +290,8 @@ class CallerFixture:
         # quando existem, sem alterar o callable LIVE que se está provando.
         names = {n.name for n in ast.parse(SHADOW.read_text()).body
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-        optional = [n for n in ("_pyramid_number", "_pyramid_protection", "_pyramid_uncertain", "_num_close")
+        optional = [n for n in ("_pyramid_number", "_pyramid_protection", "_pyramid_uncertain", "_num_close",
+                               "_pyramid_original_timeframe")
                     if n in names]
         source_functions(["_maybe_pyramid", "_entry_intent_identity", *optional], self.ns)
         services = module("services", exchange_service=self.exchange, risk_service=self.risk,
@@ -290,6 +302,7 @@ class CallerFixture:
                    "services.execution_reconciliation_service": self.reconciliation,
                    "services.entry_intent_service": self.entry_intents,
                    "services.push_service": self.push, "models.real_trade": self.model,
+                   "models.recommendation_snapshot": self.snapshot_model,
                    "sqlalchemy": self.sql, "db": self.db}
         # Os mocks substituem apenas portas; nenhuma conexão ou mensagem real.
         with patch.dict(sys.modules, patches), \
@@ -583,6 +596,68 @@ class ActualPyramidCallerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fixture.posts[0]["symbol"], "BTC/USDT")
         self.assertEqual(fixture.persisted.qty, 1.4)
 
+    async def test_timeframe_is_from_original_fk_not_fictional_trade_attribute(self):
+        fixture = CallerFixture()
+        del fixture.trade.timeframe
+        del fixture.persisted.timeframe
+        fixture.original_snapshots[7] = "4h"
+        fixture.rec["timeframe"] = "15m"
+        self.assertTrue(await fixture.run())
+        self.assertEqual(fixture.reservations[0][1]["identity"].timeframe, "4h")
+        queries = [q for q in fixture.queries if len(q.entities) == 1 and q.entities[0] is
+                   fixture.snapshot_model.RecommendationSnapshot.timeframe]
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(queries[0].conditions, [("snapshot.id", "eq", 7)])
+
+    async def test_missing_original_timeframe_blocks_before_reserving_or_sending(self):
+        for raw in (None, "", "na", "NA", "H1", "unknown", True, 60):
+            with self.subTest(raw=raw):
+                fixture = CallerFixture()
+                fixture.original_snapshots[7] = raw
+                self.assertFalse(await fixture.run())
+                self.assertEqual(fixture.reservations, [])
+                self.assertEqual(fixture.posts, [])
+
+
+class OriginalTimeframeContractTests(unittest.IsolatedAsyncioTestCase):
+    async def run_helper(self, fixture):
+        namespace = source_functions(["_pyramid_original_timeframe"], {})
+        with patch.dict(sys.modules, {"db": fixture.db, "sqlalchemy": fixture.sql,
+                "models.recommendation_snapshot": fixture.snapshot_model}), \
+                patch.object(socket, "getaddrinfo", side_effect=AssertionError("DNS_FORBIDDEN")), \
+                patch.object(socket.socket, "connect", side_effect=AssertionError("NETWORK_FORBIDDEN")):
+            return await namespace["_pyramid_original_timeframe"](fixture.trade)
+
+    async def test_every_supported_timeframe_is_read_by_the_real_exact_fk_query(self):
+        for timeframe in ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h",
+                          "1d", "3d", "1w", "1M"):
+            with self.subTest(timeframe=timeframe):
+                fixture = CallerFixture()
+                fixture.original_snapshots = {7: timeframe, 8: "15m"}
+                self.assertEqual(await self.run_helper(fixture), timeframe)
+                self.assertEqual(fixture.queries[0].conditions, [("snapshot.id", "eq", 7)])
+                self.assertEqual(fixture.commits, 0)
+
+    async def test_bad_fk_is_rejected_before_any_query_and_never_defaults_na(self):
+        for key in (None, True, False, "7", 7.0, 0, -1):
+            with self.subTest(key=key):
+                fixture = CallerFixture()
+                fixture.trade.recommendation_id = key
+                self.assertIsNone(await self.run_helper(fixture))
+                self.assertEqual(fixture.queries, [])
+
+    async def test_absent_row_is_unknown_even_if_trade_and_new_rec_claim_timeframe(self):
+        fixture = CallerFixture()
+        fixture.original_snapshots = {8: "1h"}
+        self.assertIsNone(await self.run_helper(fixture))
+        self.assertEqual(fixture.queries[0].conditions, [("snapshot.id", "eq", 7)])
+
+    async def test_read_error_is_not_converted_to_a_usable_timeframe(self):
+        fixture = CallerFixture()
+        fixture.db_error = True
+        with self.assertRaisesRegex(RuntimeError, "DATABASE_UNAVAILABLE"):
+            await self.run_helper(fixture)
+
 
 class SharedMarketPreflightTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -689,6 +764,36 @@ class SharedMarketPreflightTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(verdict["ok"])
                 self.assertEqual(verdict["reason_code"], reason)
                 self.assertNotIn("approved_qty", verdict)
+
+    async def test_ordinary_entry_still_requires_its_unrealized_tp1(self):
+        verdict = await self.run_helper(tp1=None)
+        self.assertFalse(verdict["ok"])
+        self.financial.assert_not_awaited()
+
+    async def test_explicit_completed_tp1_validates_remaining_target_without_old_rr1(self):
+        verdict = await self.run_helper(tp1=None, tp1_completed=True)
+        self.assertTrue(verdict["ok"], verdict)
+        evidence = verdict["checks"]["p04_evidence"]
+        self.assertIsNone(evidence["args"]["tp1"])
+        self.assertEqual(evidence["limits"]["min_rr_tp1"], 0)
+        self.assertEqual(evidence["limits"]["min_rr_tp2"], 1.5)
+        self.financial.assert_awaited_once()
+
+    async def test_completed_tp1_does_not_remove_remaining_target_or_geometry_gates(self):
+        for target in (None, 111, 108):
+            with self.subTest(target=target):
+                self.financial.reset_mock()
+                verdict = await self.run_helper(tp1=None, tp1_completed=True, tp2=target)
+                self.assertFalse(verdict["ok"], verdict)
+                self.financial.assert_not_awaited()
+
+    async def test_stage_flag_is_literal_and_cannot_claim_an_active_tp1_completed(self):
+        for marker, target in ((1, None), ("true", None), (None, None), (True, 115)):
+            with self.subTest(marker=marker, target=target):
+                verdict = await self.run_helper(tp1=target, tp1_completed=marker)
+                self.assertFalse(verdict["ok"])
+                self.assertEqual(verdict["reason_code"], "EXEC_REVALIDATION_STAGE_INVALID")
+        self.depth.assert_not_awaited()
 
 
 class PyramidLegacyCapsTests(unittest.IsolatedAsyncioTestCase):

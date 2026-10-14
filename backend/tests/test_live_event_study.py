@@ -260,7 +260,11 @@ class EventIntegration(unittest.TestCase):
         result = study.run_study(manifest=self.manifest, dataset=data, now_ms=NOW)
         state = result["arms"]["candidate"]["portfolio_at_last_decision"]
         self.assertEqual((state["open_positions"], state["open_risk_usd"], state["available_margin_usd"]), (1, 10, 760))
-        self.assertFalse(state["complete"])
+        # The accounting conflict is discovered at the later exit segment.
+        # It must retain exposure, not rewrite the earlier decision's knowledge.
+        self.assertTrue(state["complete"])
+        self.assertEqual(result["arms"]["candidate"]["records"][0]["state"], "NON_COMPARABLE")
+        self.assertIsNone(result["arms"]["candidate"]["economics"][0]["net_r"])
 
     def test_economic_r_uses_total_with_funding_exactly_once(self):
         data = copy.deepcopy(self.dataset)

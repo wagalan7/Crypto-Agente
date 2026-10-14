@@ -303,7 +303,10 @@ class NegativeBoundaries(unittest.TestCase):
         report = execution.replay_execution(request(rows, config=config(pyramid=True), fills=[],
                                                     mode="PYRAMID", pyramid_state=state))
         self.assertEqual(report["status"], "UNKNOWN")
-        self.assertIn("TECHNICAL_PYRAMID_EVENT_PORTS_NOT_IMPLEMENTED", [g["reason_code"] for g in report["gaps"]])
+        # The new adapter supports bound ports, but this old request supplies
+        # neither persistent simulated memory nor the mandatory pyramid caps.
+        # Their absence must remain fail-closed, not inherit environment state.
+        self.assertIn("PYRAMID_PORT_STATE_OR_LIMITS_MISSING", [g["reason_code"] for g in report["gaps"]])
         self.assertEqual(report["actions"], [])
         self.assertEqual(report["memory_transitions"], [])
 

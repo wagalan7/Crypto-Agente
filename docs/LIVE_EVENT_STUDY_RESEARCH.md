@@ -79,15 +79,13 @@ Sem migração/tabela/coluna/ENV/endpoint/scheduler novo, nem frontend alterado.
 
 ## Pendências técnicas — não chamar de falta de amostra
 
-1. **Pyramiding ON:** a omissão de preflight do caller LIVE foi corrigida em
-   escopo separado e autorizado, depois da base `0e88f58f`; ver
-   `LIVE_PYRAMID_PREFLIGHT_FIX.md`. O estudo ainda não fornece as novas portas
-   duráveis de reserva/proteção/risco nem encadeia reforço/novo estado do gestor.
-   O adapter declara `TECHNICAL_PYRAMID_EVENT_PORTS_NOT_IMPLEMENTED`, e o
-   produtor completo `TECHNICAL_PYRAMID_CHAIN_NOT_IMPLEMENTED`. Portanto a
-   configuração LIVE intencional com pyramiding ON ainda não tem réplica
-   integral aprovada. Próximo trabalho: completar essas portas e os segmentos
-   com evento externo provado, sem editar livremente snapshots V1.
+1. **Pyramiding ON:** portas e cadeia de segmentos foram completadas localmente
+   em 14/10, após o preflight autorizado. LONG/SHORT percorrem entrada → gestor
+   → reforço → gestor → ledger pelos callers reais isolados. Não há mais recusa
+   genérica de "cadeia não implementada"; ausência de portas/limites e qualquer
+   prova incompatível continuam recusadas. Detalhes em
+   `LIVE_PYRAMID_EVENT_CHAIN.md`. A autoridade/persistência dessas portas é
+   simulada com recibos vinculados, não prova de atomicidade com a conta.
 2. **Sizing upstream:** `risk_pct` é o input final ponto-no-tempo fornecido,
    não reprodução dos escritores/cache/aprendizado anteriores. Não alegamos
    equivalência de todo o stack de decisão do bot. Congelar/provar esses inputs
@@ -96,6 +94,10 @@ Sem migração/tabela/coluna/ENV/endpoint/scheduler novo, nem frontend alterado.
    A anexação recusa reduzir silenciosamente o denominador. Novo export precisa
    preservar essas identidades frias/UNKNOWN e a ordem causal antes de aceitar
    tal população como integral. Não houve backfill nem preço/resultado inventado.
+4. **Carteira financeira integral:** o livro causal conserva exposição/reservas,
+   mas não reproduz saldo Binance, caixa parcial, funding intratrade e P&L não
+   realizado. Declara `broker_balance_replica=false`. O fechamento desses
+   contratos ainda é necessário para chamar a réplica financeira de exata.
 
 Após esses fechamentos: ratificar manifesto/par/custos/gestão/cortes completos,
 autorizar eventual coleta separadamente e obter evidência prospectiva. A

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import heapq
 import json
+import math
 from decimal import Decimal
 from pathlib import Path
 from services.research_manifest_service import EVENT_MANIFEST_FIELDS, event_contract_hash
@@ -330,7 +332,55 @@ def _linked_exits(record, reports):
     return linked
 
 
-def _run_record(record, manifest, row, portfolio, *, execution_sink=None):
+def _manager_projection(snapshot):
+    """Only persisted fields cross segments; LIVE caller-local state is not proof."""
+    state = {key: copy.deepcopy(snapshot.get(key)) for key in manager.STATE_FIELDS}
+    for name in ("opened_at", "created_at"):
+        raw = snapshot.get(name)
+        if raw is not None:
+            from datetime import datetime
+            try:
+                stamp = int(datetime.fromisoformat(raw).timestamp() * 1000)
+            except (TypeError, ValueError):
+                raise ValueError("EVENT_MANAGER_CLOCK_FORMAT") from None
+            state[name + "_ms"] = stamp
+    return state
+
+
+def _step_end(step, report):
+    clocks = [step["at_ms"]]
+    if step["kind"] == "MANAGEMENT":
+        clocks.extend(t["at_ms"] for t in step["request"]["ticks"])
+        clocks.extend(r["available_at_ms"] for t in step["request"]["ticks"]
+                      for receipts in t["ports"].values() for r in receipts)
+    else:
+        clocks.extend(r["at_ms"] for r in report.get("actions", []) + report.get("reads", []))
+        clocks.extend(f["available_at_ms"] for f in report.get("fills", []))
+        clocks.extend(u["writer_available_at_ms"] for u in report.get("manager_updates", [])
+                      if "writer_available_at_ms" in u)
+    return max(clocks)
+
+
+def _pyramid_continuation(request, previous, entry, level):
+    _require(previous is not None and previous["status"] == "open"
+        and previous["phase"] == "post_tp1", "EVENT_PYRAMID_NOT_OPEN_POST_TP1")
+    p, s, port = request["proposal"], request["pyramid_state"], request.get("port_state")
+    _require(p["trade_id"] == entry["trade_id"] and p["opportunity_id"] == entry["opportunity_id"]
+        and _wire(p["symbol"]) == _wire(entry["symbol"]) and p["side"] == entry["side"]
+        and p["account_ref"] == entry["account_ref"] and p["leverage"] == entry["leverage"],
+        "EVENT_PYRAMID_ENTRY_IDENTITY")
+    _require(s["pyramiding_level"] == level and s["leverage"] == entry["leverage"],
+        "EVENT_PYRAMID_LEVEL_OR_LEVERAGE")
+    for key in ("id", "side", "qty", "qty_initial", "entry_price", "planned_stop", "phase", "notes"):
+        _require(s[key] == previous[key], "EVENT_PYRAMID_MANAGER_STATE_DRIFT:" + key)
+    _require(_wire(s["symbol"]) == _wire(previous["symbol"]), "EVENT_PYRAMID_MANAGER_SYMBOL")
+    _require(port is not None, "EVENT_PYRAMID_PORT_STATE_REQUIRED")
+    trade = port["trade"]
+    for key in ("source", "status", "exchange", "timeframe", "created_at_ms", "sl_current_price", "sl_order_id", "tp2_order_id"):
+        _require(trade[key] == previous[key], "EVENT_PYRAMID_PERSISTED_META_DRIFT:" + key)
+
+
+def _record_flow(record, manifest, row, portfolio, *, execution_sink=None):
     steps = record["steps"]
     _require(bool(steps) and steps[0]["kind"] == "EXECUTION" and steps[0]["request"]["mode"] == "ENTRY",
         "EVENT_ENTRY_FIRST_REQUIRED")
@@ -342,10 +392,12 @@ def _run_record(record, manifest, row, portfolio, *, execution_sink=None):
         _require(proposal[pkey] == row[rkey], "EVENT_ENTRY_GEOMETRY_MISMATCH")
     _require(steps[0]["request"]["portfolio"] == portfolio, "EVENT_COUNTERFACTUAL_PORTFOLIO_MISMATCH")
     reports, admitted, management_report = [], [], None
+    previous_state, level = None, 0
+    execution_reports, management_reports = [], []
     previous_at = row["decision_ts_ms"]
     for step in steps:
         _require(step["at_ms"] >= previous_at, "EVENT_STEP_CHRONOLOGY")
-        previous_at = step["at_ms"]
+        current_portfolio = yield step
         request = step["request"]
         if step["kind"] == "EXECUTION":
             _require(request["config"] == manifest["shared"]["execution_config"], "EVENT_EXECUTION_CONFIG_DRIFT")
@@ -353,26 +405,73 @@ def _run_record(record, manifest, row, portfolio, *, execution_sink=None):
                 "DECLARED_MODEL": "DECLARED_EVENT_TABLE"}[manifest["costs"]["source"]]
             _require(request["source"] == expected_source
                 and request["test_only"] is (manifest["decision"]["state"] == "TEST_ONLY"), "EVENT_EXECUTION_SOURCE_MISMATCH")
+            _require(request["portfolio"] == current_portfolio, "EVENT_COUNTERFACTUAL_PORTFOLIO_MISMATCH")
+            _require(request["proposal"]["decision_at_ms"] == step["at_ms"], "EVENT_EXECUTION_STEP_CLOCK")
             if request["mode"] == "PYRAMID":
-                # The current real caller cannot supply its mandatory preflight.
-                # Never bypass this limitation to make a positive fixture pass.
-                raise ValueError("TECHNICAL_PYRAMID_CHAIN_NOT_IMPLEMENTED")
+                _require(manifest["shared"]["execution_config"]["PYRAMIDING_ENABLED"], "EVENT_PYRAMID_DISABLED")
+                _pyramid_continuation(request, previous_state, proposal, level)
+            else:
+                _require(not reports, "EVENT_DUPLICATE_ENTRY_SEGMENT")
             report = execution.replay_execution(request)
             if execution_sink is not None:
                 execution_sink.append(report)
             admitted.extend(report.get("admitted_orders", []))
-            if report.get("status") == "REJECTED" or (report.get("status") == "COMPLETE_EXECUTION"
-                    and report["filled_qty"] == 0 and report["reservations"]["state"] == "RELEASED"):
+            no_execution = report.get("status") in {"REJECTED", "NO_OP"} or (report.get("status") == "COMPLETE_EXECUTION"
+                    and report["filled_qty"] == 0 and report["reservations"]["state"] == "RELEASED")
+            if no_execution and request["mode"] == "ENTRY":
                 return {"execution": report, "management": None, "ledger": None, "step_reports": [report],
                         "complete": True, "not_executed": True}
+            if no_execution:
+                _require(report.get("filled_qty", 0) == 0 and not report.get("manager_updates")
+                    and report["reservations"]["state"] == "RELEASED", "EVENT_PYRAMID_NOOP_UNPROVEN")
+                reports.append(report)
+                previous_at = _step_end(step, report)
+                continue
             if report.get("status") != "COMPLETE_EXECUTION":
                 raise UncertainExecution(report)
+            execution_reports.append(report)
+            if request["mode"] == "PYRAMID":
+                updates = report.get("manager_updates")
+                _require(isinstance(updates, list) and len(updates) == 1, "EVENT_PYRAMID_UPDATE_UNPROVEN")
+                update = updates[0]
+                writer = update.get("writer_state")
+                _require(isinstance(writer, dict) and update.get("writer_state_hash") == execution.digest(writer)
+                    and update["kind"] == "PYRAMID_FILL" and update["request_hash"] == request["request_hash"]
+                    and update["update_hash"] == execution.digest({k:v for k,v in update.items() if k != "update_hash"}),
+                    "EVENT_PYRAMID_WRITER_PROOF")
+                changed = copy.deepcopy(previous_state)
+                changed["qty"], changed["notes"] = writer["qty"], writer["notes"]
+                _require(abs(changed["qty"] - previous_state["qty"] - report["filled_qty"]) < 1e-9
+                    and writer["entry_price"] == previous_state["entry_price"]
+                    and writer["qty_initial"] == previous_state["qty_initial"]
+                    and writer["phase"] == previous_state["phase"]
+                    and writer["sl_current_price"] == previous_state["sl_current_price"]
+                    and writer["sl_order_id"] == previous_state["sl_order_id"]
+                    and writer["tp2_order_id"] == previous_state["tp2_order_id"]
+                    and writer["created_at_ms"] == previous_state["created_at_ms"]
+                    and writer["pyramiding_level"] == level + 1, "EVENT_PYRAMID_WRITER_STATE_DRIFT")
+                previous_state, level = changed, level + 1
         else:
             _require(manifest["decision"]["state"] == "TEST_ONLY" or request["source"] == "OPERATOR_EVENT_TRACE",
                 "EVENT_SYNTHETIC_MANAGER_CANNOT_BECOME_OBSERVED")
             _require(request["binding_mode"] == "BOUND", "EVENT_MANAGER_PREVIEW_FORBIDDEN")
             _require(request["config"] == manifest["shared"]["management"]["config"], "EVENT_MANAGER_CONFIG_DRIFT")
             state = request["initial_state"]
+            if previous_state is not None:
+                _require(state == previous_state, "EVENT_MANAGER_CONTINUATION_DRIFT")
+                _require(bool(request["ticks"]) and request["ticks"][0]["at_ms"] > previous_at,
+                    "EVENT_MANAGER_CONTINUATION_CLOCK")
+                report = manager.run_trace(request)
+                _require(report.get("status") == "COMPLETE_TRACE", "EVENT_MANAGEMENT_INCOMPLETE")
+                management_reports.append(report)
+                management_report = report
+                _require(bool(report.get("snapshots")), "EVENT_MANAGER_SNAPSHOT_MISSING")
+                previous_state = _manager_projection(report["snapshots"][-1]["state"])
+                if execution_sink is not None:
+                    execution_sink.append(report)
+                reports.append(report)
+                previous_at = _step_end(step, report)
+                continue
             _require(state["id"] == proposal["trade_id"] and _wire(state["symbol"]) == _wire(proposal["symbol"])
                 and state["side"] == proposal["side"] and state["planned_stop"] == proposal["stop"],
                 "EVENT_MANAGER_ENTRY_IDENTITY")
@@ -393,11 +492,16 @@ def _run_record(record, manifest, row, portfolio, *, execution_sink=None):
             initial_protection = next((a["value"] for a in reports[0]["actions"] if a["port"] == "place_protection"), None)
             _require(initial_protection is not None and all(state[k] == initial_protection.get(k)
                 for k in ("sl_order_id", "tp1_order_id", "tp2_order_id")), "EVENT_MANAGER_INITIAL_PROTECTION_UNPROVEN")
-            _require(management_report is None, "TECHNICAL_MULTI_SEGMENT_MANAGER_NOT_IMPLEMENTED")
             report = manager.run_trace(request)
             management_report = report
             _require(report.get("status") == "COMPLETE_TRACE", "EVENT_MANAGEMENT_INCOMPLETE")
+            management_reports.append(report)
+            _require(bool(report.get("snapshots")), "EVENT_MANAGER_SNAPSHOT_MISSING")
+            previous_state = _manager_projection(report["snapshots"][-1]["state"])
+            if execution_sink is not None:
+                execution_sink.append(report)
         reports.append(report)
+        previous_at = _step_end(step, report)
     _require(management_report is not None, "EVENT_MANAGEMENT_REQUIRED")
     ctx = ledger.validate_context(record["context"])
     _require(ctx["opportunity_id"] == row["opportunity_key"] and ctx["trade_id"] == str(proposal["trade_id"])
@@ -417,19 +521,361 @@ def _run_record(record, manifest, row, portfolio, *, execution_sink=None):
         return {**{key: str(raw[key]) for key in ("id", "orderId", "side", "positionSide", "commissionAsset", "time")},
             "symbol": _wire(raw["symbol"]), **numbers,
             "dispatch_id": f["binding"]["dispatch_id"], "role": f["role"]}
-    real_fills = {str(f["raw"]["id"]): fill_material(f) for f in reports[0]["fills"]}
+    real_fills = {}
+    for er in execution_reports:
+        for f in er["fills"]:
+            key, material = str(f["raw"]["id"]), fill_material(f)
+            _require(key not in real_fills or real_fills[key] == material, "EVENT_EXECUTION_FILL_CONFLICT")
+            real_fills[key] = material
     financial_fills = {str(f["raw"]["id"]): fill_material(f) for f in record["accounting"]["fills"] if f["role"] in ledger.ENTRY_ROLES}
     _require(real_fills == financial_fills, "EVENT_EXECUTION_LEDGER_FILL_MISMATCH")
-    for fill in reports[0]["fills"]:
-        emissions = [a for a in reports[0]["actions"] if a["port"] == "send_order"
-            and a["args"][2].get("newClientOrderId") == fill["binding"]["dispatch_id"]]
-        _require(bool(emissions) and _ms(fill["raw"]["time"], "entry.fill") >= min(a["at_ms"] for a in emissions),
-            "EVENT_ENTRY_EXECUTED_BEFORE_ACTION")
+    for er in execution_reports:
+        for fill in er["fills"]:
+            emissions = [a for a in er["actions"] if a["port"] == "send_order"
+                and a["args"][2].get("newClientOrderId") == fill["binding"]["dispatch_id"]]
+            _require(bool(emissions) and _ms(fill["raw"]["time"], "entry.fill") >= min(a["at_ms"] for a in emissions),
+                "EVENT_ENTRY_EXECUTED_BEFORE_ACTION")
+    if len(management_reports) > 1:
+        management_report = {**management_report,
+            "snapshots": [s for r in management_reports for s in r["snapshots"]],
+            "trace_hash": manager.digest([r["trace_hash"] for r in management_reports])}
     admitted.extend(_linked_exits(record, reports))
     money = ledger.replay_accounting(record["accounting"], ctx, management_report,
         execution_report={"admitted_orders": admitted}, as_of_ms=manifest["split"]["as_of_ms"])
     return {"execution": reports[0], "management": management_report, "ledger": money,
-            "step_reports": reports, "complete": money["economic_value_known"]}
+            "step_reports": reports, "execution_reports": execution_reports,
+            "complete": money["economic_value_known"]}
+
+
+def _run_record(record, manifest, row, portfolio, *, execution_sink=None):
+    """Single-trace convenience; study execution uses the causal arm scheduler."""
+    book = _CausalPortfolio(portfolio)
+    sink = execution_sink if execution_sink is not None else []
+    flow = _record_flow(record, manifest, row, portfolio, execution_sink=sink)
+    try:
+        step = next(flow)
+        while True:
+            old_count = len(sink)
+            try:
+                next_step = flow.send(book.at(step["at_ms"]))
+            finally:
+                if len(sink) > old_count:
+                    report = sink[-1]
+                    book.at(_step_end(step, report))
+                    if step["kind"] == "EXECUTION" and report.get("status") in {"COMPLETE_EXECUTION", "REJECTED", "NO_OP"}:
+                        book.execution(row["opportunity_key"], step["request"], report)
+                    elif step["kind"] == "MANAGEMENT":
+                        book.management(row["opportunity_key"], report)
+            step = next_step
+    except StopIteration as done:
+        return done.value
+
+
+class _CausalPortfolio:
+    """Conservative book at each clock; no future release or fabricated equity.
+
+    Market observations belong to requests. This book only moves the declared
+    initial capital by attributed final net and the proven exposure state.
+    It is not a new source of Binance account balance/unrealized P&L.
+    """
+    def __init__(self, initial):
+        self.state = copy.deepcopy(initial)
+        self.day = None
+        self.day_net = initial["daily_base_usd"] + initial["open_risk_usd"]
+        self.positions = {}
+        self.pending = {}
+        self.applied = {}
+
+    def once(self, key, request, report, kind):
+        if request is None or "request_hash" not in request:
+            return True
+        token = (key, request["request_hash"])
+        material = (kind, digest(report))
+        if token in self.applied:
+            _require(self.applied[token] == material, "EVENT_BOOK_EXECUTION_CONFLICT")
+            return False
+        self.applied[token] = material
+        return True
+
+    def reserve(self, key, request, report):
+        """Hold the admitted decision while its receipt is still unavailable."""
+        token = (key, request["request_hash"])
+        _require(token not in self.pending, "EVENT_BOOK_DUPLICATE_PENDING")
+        if request["mode"] == "PYRAMID":
+            reservation = report.get("initial_reservation")
+            if reservation is None:
+                _require(report.get("status") == "NO_OP", "EVENT_PYRAMID_RESERVATION_UNPROVEN")
+                return
+            _require(reservation.get("producer") == "shadow_trade_service._reserve_entry_intent"
+                and reservation.get("request_hash") == request["request_hash"]
+                and reservation.get("reservation_hash") == execution.digest(
+                    {k:v for k,v in reservation.items() if k != "reservation_hash"})
+                and reservation.get("slot_retained") is False
+                and request["proposal"]["decision_at_ms"] <= reservation["reserved_at_ms"],
+                "EVENT_PYRAMID_RESERVATION_BINDING")
+            hold = {k: reservation[k] for k in ("risk_usd", "margin_usd", "slot_retained")}
+            _require(all(type(hold[k]) in (int, float) and math.isfinite(hold[k]) and hold[k] >= 0
+                         for k in ("risk_usd", "margin_usd")), "EVENT_BOOK_RESERVATION_NUMBER")
+            self.pending[token] = hold
+            self.state["pending_risk_usd"] += hold["risk_usd"]
+            self.state["pending_margin_usd"] += hold["margin_usd"]
+            return
+        admission = next((a for a in report.get("admissions", [report.get("admission", {})])
+                          if a.get("decision") == "ADMITTED"), None)
+        if admission is None or report.get("status") == "NO_OP":
+            return
+        hold = {"risk_usd": admission["risk_usd"], "margin_usd": admission["margin_usd"],
+                "slot_retained": request["mode"] == "ENTRY"}
+        self.pending[token] = hold
+        self.state["pending_count"] += int(hold["slot_retained"])
+        self.state["pending_risk_usd"] += hold["risk_usd"]
+        self.state["pending_margin_usd"] += hold["margin_usd"]
+
+    def release_pending(self, key, request):
+        hold = self.pending.pop((key, request.get("request_hash")), None)
+        if hold is not None:
+            self.state["pending_count"] -= int(hold["slot_retained"])
+            self.state["pending_risk_usd"] -= hold["risk_usd"]
+            self.state["pending_margin_usd"] -= hold["margin_usd"]
+
+    def at(self, stamp):
+        day = stamp // 86_400_000
+        if self.day is not None and day != self.day:
+            self.day_net = 0.0
+        self.day = day
+        self.state["margin_as_of_ms"] = stamp
+        self.state["daily_base_usd"] = self.day_net - self.state["open_risk_usd"]
+        return copy.deepcopy(self.state)
+
+    def execution(self, key, request, report):
+        if not self.once(key, request, report, "EXECUTION"):
+            return
+        self.release_pending(key, request)
+        a = report["admission"]
+        if report["filled_qty"] <= 0:
+            return
+        qty, basis = report["filled_qty"], report.get("entry_basis")
+        _require(all(type(v) in (int, float) and math.isfinite(v) and v > 0 for v in (qty, basis)),
+                 "EVENT_BOOK_FILL_EXPOSURE_UNKNOWN")
+        notional = qty * basis
+        a = {**a, "notional_usd": notional, "margin_usd": notional / request["proposal"]["leverage"]}
+        if request["mode"] == "ENTRY":
+            a["risk_usd"] = qty * abs(basis - request["proposal"]["stop"])
+            _require(key not in self.positions, "EVENT_BOOK_DUPLICATE_ENTRY")
+            self.positions[key] = {"margin": a["margin_usd"], "risk": a["risk_usd"],
+                "notional": a["notional_usd"], "retained": 0.0,
+                "leverage": request["proposal"]["leverage"], "side": request["proposal"]["side"]}
+            self.state["open_positions"] += 1
+        else:
+            _require(key in self.positions, "EVENT_BOOK_PYRAMID_WITHOUT_POSITION")
+            p = self.positions[key]
+            carry = report["retained_confirmed_risk_usd"] - p["retained"]
+            _require(carry >= 0, "EVENT_BOOK_RETAINED_RISK_DECREASED")
+            p["margin"] += a["margin_usd"]
+            p["notional"] += a["notional_usd"]
+            p["retained"] += carry
+            p["risk"] += carry
+            a = {**a, "risk_usd": carry}
+        self.state["available_margin_usd"] -= a["margin_usd"]
+        self.state["open_risk_usd"] += a["risk_usd"]
+        self.state["open_notional_usd"] += a["notional_usd"]
+
+    def management(self, key, report):
+        if key not in self.positions:
+            return
+        current = _manager_projection(report["snapshots"][-1]["state"])
+        # A heuristic close without financial proof never releases collateral.
+        if current["status"] != "open":
+            return
+        p = self.positions[key]
+        qty, price, stop = current["qty"], current["entry_price"], current["sl_current_price"]
+        _require(all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in (qty, price, stop)),
+            "EVENT_BOOK_EXPOSURE_UNKNOWN")
+        adverse = price - stop if p["side"] == "long" else stop - price
+        risk = max(0.0, adverse) * qty + p["retained"]
+        notional, margin = price * qty, price * qty / p["leverage"]
+        self.state["available_margin_usd"] += p["margin"] - margin
+        self.state["open_risk_usd"] += risk - p["risk"]
+        self.state["open_notional_usd"] += notional - p["notional"]
+        p.update(risk=risk, notional=notional, margin=margin)
+
+    def unknown(self, report, *, key=None, request=None):
+        if not self.once(key, request, report, "UNKNOWN"):
+            return
+        if request is not None:
+            self.release_pending(key, request)
+        r = report["reservations"]
+        self.state["pending_count"] += int(r["slot_retained"])
+        self.state["pending_risk_usd"] += r["risk_usd"]
+        self.state["pending_margin_usd"] += r["margin_usd"]
+        self.state["complete"] = False
+
+    def settle(self, key, money, stamp):
+        if key not in self.positions:
+            return
+        p = self.positions.pop(key)
+        net = float(money["net_including_funding"])
+        self.state["equity_usd"] += net
+        self.state["available_margin_usd"] += p["margin"] + net
+        self.state["open_positions"] -= 1
+        self.state["open_risk_usd"] -= p["risk"]
+        self.state["open_notional_usd"] -= p["notional"]
+        close_day = max(e["fill_time_ms"] for e in money["role_events"]) // 86_400_000
+        if close_day == stamp // 86_400_000:
+            self.day_net += net
+
+
+def _run_event_arm(arm, manifest, data, rows, decisions):
+    """Resume each record at its own clock, including interleaved opportunities.
+
+    Same-ms facts across independent traces do not have proven precedence:
+    decisions run before deferred exposure/releases stamped at that millisecond.
+    After the last decision, finish evidence without rewriting that portfolio.
+    """
+    book = _CausalPortfolio(manifest["shared"]["initial_portfolio"])
+    records = {r["opportunity_key"]: r for r in data["events"][arm]}
+    flows, outputs, economics, labels, lineages = {}, {}, {}, [], []
+    queue, sequence = [], 0
+    def schedule(stamp, priority, kind, key, value):
+        nonlocal sequence
+        sequence += 1
+        heapq.heappush(queue, (stamp, priority, sequence, kind, key, value))
+    for d in decisions:
+        schedule(d["decision_ts_ms"], 0, "DECISION", d["opportunity_key"], d)
+    last_view = copy.deepcopy(book.state)
+    decisions_by_key = {d["opportunity_key"]: d for d in decisions}
+
+    def refuse(key, error, known_at=None, step=None):
+        refused = {"opportunity_key": key, "state": "NON_COMPARABLE", "reason_code": str(error)}
+        if isinstance(error, UncertainExecution):
+            refused["execution"] = error.report
+        # Already charged entry/earlier pyramid remain in positions. No erase.
+        outputs[key] = refused
+        economics[key] = {"opportunity_id": key, "decision_ts_ms": rows[key]["decision_ts_ms"],
+            "admitted": True, "result_available_ts_ms": None, "net_r": None}
+        if known_at is None:
+            book.state["complete"] = False
+            if isinstance(error, UncertainExecution):
+                book.unknown(error.report, key=key, request=step["request"] if step is not None else None)
+        else:
+            schedule(known_at, 1, "FAILURE", key,
+                     (error.report, step["request"]) if isinstance(error, UncertainExecution) else None)
+        flows.pop(key, None)
+
+    def finish(key, outcome, known_at):
+        outputs[key] = {"opportunity_key": key,
+            "state": "COMPLETE" if outcome["complete"] else "UNKNOWN", **outcome}
+        if outcome.get("not_executed"):
+            outputs[key]["state"] = "NOT_EXECUTED"
+            economics[key] = {"opportunity_id": key, "decision_ts_ms": rows[key]["decision_ts_ms"],
+                "admitted": False, "result_available_ts_ms": None, "net_r": None}
+            return
+        money = outcome["ledger"]
+        lineages.append(money["lineage_hash"])
+        economics[key] = {"opportunity_id": key, "decision_ts_ms": rows[key]["decision_ts_ms"],
+            "admitted": True, "result_available_ts_ms": max(known_at, money["result_available_ts_ms"])
+                if money["result_available_ts_ms"] is not None else None,
+            "net_r": float(money["realized_r_including_funding"]) if outcome["complete"] else None}
+        if outcome["complete"] and money["financial_release_allowed"]:
+            schedule(max(known_at, money["result_available_ts_ms"]), 2, "SETTLE", key, money)
+        else:
+            schedule(known_at, 1, "FAILURE", key, None)
+        if arm == "candidate":
+            terminal = next((e for e in money["role_events"] if e["role"] in {"TP1", "STOP"}), None)
+            at = rows[key]["decision_ts_ms"]
+            valid = terminal is not None and terminal["fill_time_ms"] <= at + manifest["split"]["horizon_ms"]
+            labels.append({"opportunity_key": key, "score": decisions_by_key[key][arm].get("score"),
+                "label": terminal["role"] == "TP1" if valid else None, "event": "P_TP1_BEFORE_STOP",
+                "decision_ts_ms": at, "label_available_ts_ms": max(known_at, terminal["available_at_ms"]) if valid else None,
+                "horizon_ms": manifest["split"]["horizon_ms"],
+                "source": {"TEST_ONLY": "TEST_ONLY_SYNTHETIC_EVENT", "OBSERVED_ACCOUNT": "ATTRIBUTED_EXECUTION_EVENT",
+                    "DECLARED_MODEL": "DECLARED_DETERMINISTIC_MODEL"}[manifest["costs"]["source"]], "proven": valid})
+
+    def apply(step, report, key):
+        if step["kind"] == "EXECUTION":
+            book.execution(key, step["request"], report)
+        else:
+            book.management(key, report)
+
+    def advance(key, step, stamp):
+        flow, sink = flows[key]
+        old_count = len(sink)
+        try:
+            next_step = flow.send(book.at(stamp))
+            report = sink[-1]
+            end = _step_end(step, report)
+            if end <= stamp:
+                apply(step, report, key)
+            else:
+                if step["kind"] == "EXECUTION":
+                    book.reserve(key, step["request"], report)
+                schedule(end, 1, "APPLY", key, (step, report))
+            schedule(next_step["at_ms"], 3, "STEP", key, next_step)
+        except StopIteration as done:
+            if len(sink) > old_count:
+                report = sink[-1]
+                end = _step_end(step, report)
+                if end <= stamp:
+                    apply(step, report, key)
+                else:
+                    if step["kind"] == "EXECUTION":
+                        book.reserve(key, step["request"], report)
+                    schedule(end, 1, "APPLY", key, (step, report))
+            else:
+                end = stamp
+            finish(key, done.value, end)
+            flows.pop(key, None)
+        except ValueError as error:
+            if len(sink) > old_count and sink[-1].get("status") == "COMPLETE_EXECUTION":
+                end = _step_end(step, sink[-1])
+                if end <= stamp:
+                    apply(step, sink[-1], key)
+                else:
+                    book.reserve(key, step["request"], sink[-1])
+                    schedule(end, 1, "APPLY", key, (step, sink[-1]))
+            end = _step_end(step, sink[-1]) if len(sink) > old_count else stamp
+            if isinstance(error, UncertainExecution) and end > stamp:
+                book.reserve(key, step["request"], error.report)
+            refuse(key, error, known_at=end if end > stamp else None, step=step)
+
+    while queue:
+        stamp, priority, _, kind, key, value = heapq.heappop(queue)
+        book.at(stamp)
+        if kind == "DECISION":
+            decision = value
+            if decision["included"] and decision[arm]["state"] == "SELECTED":
+                record = records.get(key)
+                if record is None:
+                    refuse(key, ValueError("EVENT_COUNTERFACTUAL_OBSERVATIONS_MISSING"))
+                else:
+                    sink = []
+                    try:
+                        flow = _record_flow(record, manifest, rows[key], book.at(stamp), execution_sink=sink)
+                        first = next(flow)
+                        flows[key] = (flow, sink)
+                        advance(key, first, stamp)
+                    except ValueError as error:
+                        refuse(key, error)
+            last_view = copy.deepcopy(book.at(stamp))
+        elif kind == "STEP" and key in flows:
+            advance(key, value, stamp)
+        elif kind == "APPLY":
+            apply(value[0], value[1], key)
+        elif kind == "FAILURE":
+            if value is not None:
+                book.unknown(value[0], key=key, request=value[1])
+            else:
+                book.state["complete"] = False
+        elif kind == "SETTLE":
+            book.settle(key, value, stamp)
+    ordered = [d["opportunity_key"] for d in decisions if d["opportunity_key"] in outputs]
+    return {"records": [outputs[k] for k in ordered], "economics": [economics[k] for k in ordered],
+            "portfolio_at_last_decision": last_view,
+            "unsettled": last_view["open_positions"] - manifest["shared"]["initial_portfolio"]["open_positions"],
+            "future_settlement_not_applied": True,
+            "portfolio_scope": "CONSERVATIVE_ATTRIBUTED_EXPOSURE_BOOK",
+            "partial_cash_recognized": False,
+            "broker_balance_replica": False}, labels, lineages
 
 
 def run_study(*, manifest, dataset, now_ms):
@@ -456,99 +902,9 @@ def run_study(*, manifest, dataset, now_ms):
             population.append({"opportunity_key": d["opportunity_key"], "decision_ts_ms": d["decision_ts_ms"],
                                "score": score, "included": d["included"]})
         for arm in ("baseline", "candidate"):
-            state = copy.deepcopy(manifest["shared"]["initial_portfolio"])
-            initial = copy.deepcopy(state)
-            records = {r["opportunity_key"]: r for r in data["events"][arm]}
-            pending, outputs, economics = [], [], []
-            day = None
-            day_net = initial["daily_base_usd"]
-            for decision in decisions:
-                key, at = decision["opportunity_key"], decision["decision_ts_ms"]
-                this_day = at // 86_400_000
-                if day is not None and day != this_day:
-                    day_net = 0.0
-                day = this_day
-                for open_item in list(pending):
-                    money, admission = open_item["ledger"], open_item["execution"]["admission"]
-                    # There is no global receipt sequence across independent
-                    # trade traces. A same-ms tie cannot prove prior knowledge.
-                    if money["financial_release_allowed"] and money["result_available_ts_ms"] < at:
-                        net = float(money["net_including_funding"])
-                        state["equity_usd"] += net
-                        state["available_margin_usd"] += admission["margin_usd"] + net
-                        state["open_positions"] -= 1
-                        state["open_risk_usd"] -= admission["risk_usd"]
-                        state["open_notional_usd"] -= admission["notional_usd"]
-                        closed_day = max(e["fill_time_ms"] for e in money["role_events"]) // 86_400_000
-                        if closed_day == this_day:
-                            day_net += net
-                        pending.remove(open_item)
-                state["margin_as_of_ms"] = at
-                state["daily_base_usd"] = day_net - state["open_risk_usd"]
-                selected = decision["included"] and decision[arm]["state"] == "SELECTED"
-                if not selected:
-                    continue
-                raw = records.get(key)
-                if raw is None:
-                    outputs.append({"opportunity_key": key, "state": "NON_COMPARABLE", "reason_code": "EVENT_COUNTERFACTUAL_OBSERVATIONS_MISSING"})
-                    economics.append({"opportunity_id": key, "decision_ts_ms": at, "admitted": True,
-                                      "result_available_ts_ms": None, "net_r": None})
-                    state["complete"] = False
-                    continue
-                attempts = []
-                try:
-                    outcome = _run_record(raw, manifest, rows[key], state, execution_sink=attempts)
-                    outputs.append({"opportunity_key": key, "state": "COMPLETE" if outcome["complete"] else "UNKNOWN", **outcome})
-                    if outcome.get("not_executed"):
-                        outputs[-1]["state"] = "NOT_EXECUTED"
-                        economics.append({"opportunity_id": key, "decision_ts_ms": at, "admitted": False,
-                                          "result_available_ts_ms": None, "net_r": None})
-                        continue
-                    admission = outcome["execution"]["admission"]
-                    state["available_margin_usd"] -= admission["margin_usd"]
-                    state["open_positions"] += 1
-                    state["open_risk_usd"] += admission["risk_usd"]
-                    state["open_notional_usd"] += admission["notional_usd"]
-                    pending.append(outcome)
-                    money = outcome["ledger"]
-                    ledgers.append(money["lineage_hash"])
-                    economics.append({"opportunity_id": key, "decision_ts_ms": at, "admitted": True,
-                        "result_available_ts_ms": money["result_available_ts_ms"],
-                        "net_r": float(money["realized_r_including_funding"]) if outcome["complete"] else None})
-                    if not outcome["complete"]:
-                        state["complete"] = False
-                    if arm == "candidate":
-                        terminal = next((e for e in money["role_events"] if e["role"] in {"TP1", "STOP"}), None)
-                        label = terminal is not None and terminal["fill_time_ms"] <= at + manifest["split"]["horizon_ms"]
-                        labels.append({"opportunity_key": key, "score": decision[arm].get("score"),
-                            "label": terminal["role"] == "TP1" if label else None, "event": "P_TP1_BEFORE_STOP",
-                            "decision_ts_ms": at, "label_available_ts_ms": terminal["available_at_ms"] if label else None,
-                            "horizon_ms": manifest["split"]["horizon_ms"],
-                            "source": {"TEST_ONLY": "TEST_ONLY_SYNTHETIC_EVENT", "OBSERVED_ACCOUNT": "ATTRIBUTED_EXECUTION_EVENT",
-                                "DECLARED_MODEL": "DECLARED_DETERMINISTIC_MODEL"}[manifest["costs"]["source"]], "proven": label})
-                except ValueError as error:
-                    refused = {"opportunity_key": key, "state": "NON_COMPARABLE", "reason_code": str(error)}
-                    if isinstance(error, UncertainExecution):
-                        refused["execution"] = error.report
-                        reserved = error.report["reservations"]
-                        state["pending_count"] += int(reserved["slot_retained"])
-                        state["pending_risk_usd"] += reserved["risk_usd"]
-                        state["pending_margin_usd"] += reserved["margin_usd"]
-                    elif attempts and attempts[0]["status"] == "COMPLETE_EXECUTION" and attempts[0]["filled_qty"] > 0:
-                        # A downstream trace/ledger failure does not erase an
-                        # already proven entry or its economic exposure.
-                        refused["execution"] = attempts[0]
-                        admission = attempts[0]["admission"]
-                        state["available_margin_usd"] -= admission["margin_usd"]
-                        state["open_positions"] += 1
-                        state["open_risk_usd"] += admission["risk_usd"]
-                        state["open_notional_usd"] += admission["notional_usd"]
-                    outputs.append(refused)
-                    economics.append({"opportunity_id": key, "decision_ts_ms": at, "admitted": True,
-                                      "result_available_ts_ms": None, "net_r": None})
-                    state["complete"] = False
-            arms[arm] = {"records": outputs, "economics": economics, "portfolio_at_last_decision": state,
-                         "unsettled": len(pending), "future_settlement_not_applied": True}
+            arms[arm], arm_labels, arm_ledgers = _run_event_arm(arm, manifest, data, rows, decisions)
+            labels.extend(arm_labels)
+            ledgers.extend(arm_ledgers)
         identity = {"manifest_hash": manifest["manifest_hash"], "dataset_hash": data["dataset_hash"],
             "events_hash": digest(data["events"]), "ledger_hash": digest(ledgers),
             "config_hash": digest(manifest["shared"]), "model_fingerprint": manifest["candidate"]["score_config_hash"],
@@ -560,8 +916,6 @@ def run_study(*, manifest, dataset, now_ms):
         statistical = evidence.evaluate_evidence(**evidence_inputs)
         _require(statistical.get("ok") is True, statistical.get("reason_code", "EVENT_EVIDENCE_INVALID"))
         gaps = sorted({r["reason_code"] for a in arms.values() for r in a["records"] if r["state"] == "NON_COMPARABLE"})
-        if manifest["shared"]["execution_config"]["PYRAMIDING_ENABLED"]:
-            gaps.append("TECHNICAL_PYRAMID_CHAIN_NOT_IMPLEMENTED")
         result.update(ok=True, manifest=manifest, identity=identity, dataset=data, selection=comparison,
             arms=arms, evidence=statistical, evidence_inputs=evidence_inputs, technical_gaps=sorted(set(gaps)),
             state="TECHNICAL_GAP" if gaps else "LOCAL_EVENT_EVIDENCE", source_assurance="DECLARED_SOURCE_NOT_AUTHENTICATION")

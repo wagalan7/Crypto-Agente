@@ -21,6 +21,11 @@ from types import SimpleNamespace
 
 VERSION = "CW_LIVE_EVENT_EXECUTION_V1"
 UPDATE_VERSION = "CW_LIVE_EXTERNAL_EXPOSURE_UPDATE_V1"
+PORT_STATE_VERSION = "CW_LIVE_PYRAMID_PORT_STATE_V1"
+PYRAMID_METADATA_FIELDS = {"source", "status", "exchange", "timeframe", "created_at_ms",
+                           "sl_current_price", "sl_order_id", "tp2_order_id", "recommendation_id"}
+PORT_STATE_FIELDS = {"version", "trade_id", "account_ref", "generation", "blocked",
+                     "trade", "portfolio_rows", "intents", "retained_risk_usd", "state_hash"}
 SOURCES = {"TEST_ONLY_OBSERVED_EVENTS": "TEST_ONLY", "OBSERVED_ACCOUNT_EVENTS": "OBSERVED_ACCOUNT",
            "DECLARED_EVENT_TABLE": "DECLARED_MODEL"}
 BACKEND = Path(__file__).resolve().parents[1]
@@ -28,7 +33,9 @@ WORKER = BACKEND / "scripts/live_event_execution_worker.py"
 SOURCE_FILES = (
     "services/shadow_trade_service.py", "services/entry_intent_service.py",
     "services/entry_revalidation_service.py", "services/binance_signed_service.py", "services/exchange_service.py",
-    "models/real_trade.py", "services/live_event_execution_service.py",
+    "services/financial_risk_service.py",
+    "services/risk_reconciliation_service.py",
+    "models/real_trade.py", "models/recommendation_snapshot.py", "services/live_event_execution_service.py",
     "scripts/live_event_execution_worker.py",
 )
 CONFIG_BOOL = {"MAKER_ENTRY_ENABLED", "MAKER_FALLBACK_MARKET",
@@ -59,7 +66,8 @@ PYRAMID_FIELDS = {"id", "symbol", "side", "qty", "qty_initial", "entry_price", "
                   "leverage", "phase", "pyramiding_level", "notes", "sl_close_position",
                   "tp2_close_position", "protection_confirmed"}
 PORTS = {"quote", "depth", "set_leverage", "send_order", "get_order", "cancel_order",
-         "place_protection", "emergency_close", "cleanup"}
+         "place_protection", "emergency_close", "cleanup", "positions", "algo_orders", "equity",
+         "pyramid_authority", "pyramid_read", "pyramid_write"}
 RECEIPT_FIELDS = {"port", "call_index", "after_action_index", "request_hash",
                   "observed_at_ms", "available_at_ms", "value"}
 REQUEST_FIELDS = {"version", "source", "test_only", "real_study_allowed", "source_fingerprint",
@@ -123,7 +131,7 @@ def _credential_free(value):
 
 
 def validate_execution_config(config):
-    _closed(config, CONFIG_FIELDS, "config")
+    _closed(config, CONFIG_FIELDS | ({"pyramid_limits"} if "pyramid_limits" in config else set()), "config")
     for key in CONFIG_BOOL:
         if type(config[key]) is not bool:
             raise ValueError(f"EVENT_EXECUTION_LITERAL_BOOL:{key}")
@@ -144,6 +152,11 @@ def validate_execution_config(config):
     _closed(config["limits"], LIMIT_FIELDS, "limits")
     for key in LIMIT_FIELDS:
         _number(config["limits"][key], key)
+    if "pyramid_limits" in config:
+        _closed(config["pyramid_limits"], {"max_total_margin_pct", "depth_limit", "depth_timeout_s"}, "pyramid_limits")
+        _number(config["pyramid_limits"]["max_total_margin_pct"], "max_total_margin_pct")
+        _integer(config["pyramid_limits"]["depth_limit"], "depth_limit", 1)
+        _number(config["pyramid_limits"]["depth_timeout_s"], "depth_timeout_s", 1e-15)
     return copy.deepcopy(config)
 
 
@@ -197,6 +210,77 @@ def validate_portfolio(portfolio):
     return copy.deepcopy(portfolio)
 
 
+def validate_pyramid_port_state(state, proposal, pyramid_state):
+    """Closed restart memory; simulated DB ports are not PostgreSQL authority.
+
+    The parent must consume the returned state verbatim. Hashes bind the
+    simulation generation and identity, not an authentic broker/database fact.
+    """
+    _closed(state, PORT_STATE_FIELDS, "port_state")
+    if state["version"] != PORT_STATE_VERSION or state["trade_id"] != proposal["trade_id"]:
+        raise ValueError("EVENT_PYRAMID_PORT_STATE_IDENTITY")
+    if state["account_ref"] != proposal["account_ref"] or type(state["blocked"]) is not bool:
+        raise ValueError("EVENT_PYRAMID_PORT_STATE_AUTHORITY")
+    _integer(state["generation"], "port_state.generation")
+    _number(state["retained_risk_usd"], "port_state.retained_risk_usd")
+    if state["state_hash"] != digest({k: v for k, v in state.items() if k != "state_hash"}):
+        raise ValueError("EVENT_PYRAMID_PORT_STATE_DRIFT")
+    _closed(state["trade"], PYRAMID_FIELDS | PYRAMID_METADATA_FIELDS, "port_state.trade")
+    if any(state["trade"][k] != v for k, v in pyramid_state.items()):
+        raise ValueError("EVENT_PYRAMID_TRADE_MEMORY_DIVERGENT")
+    for key in ("source", "status", "exchange", "timeframe", "sl_order_id", "tp2_order_id"):
+        _text(state["trade"][key], key)
+    _integer(state["trade"]["created_at_ms"], "created_at_ms", 1)
+    if state["trade"]["recommendation_id"] is not None:
+        _integer(state["trade"]["recommendation_id"], "recommendation_id", 1)
+    _number(state["trade"]["sl_current_price"], "sl_current_price", 1e-15)
+    if state["trade"]["leverage"] != proposal["leverage"]:
+        raise ValueError("EVENT_PYRAMID_LEVERAGE_CHANGED")
+    if not isinstance(state["portfolio_rows"], list) or not isinstance(state["intents"], list):
+        raise ValueError("EVENT_PYRAMID_PORT_COLLECTIONS")
+    seen = set()
+    for row in state["portfolio_rows"]:
+        _closed(row, {"id", "entry_price", "qty", "leverage"}, "port_state.portfolio_row")
+        _integer(row["id"], "portfolio_row.id", 1)
+        for key in ("entry_price", "qty", "leverage"):
+            _number(row[key], key, 1e-15)
+        if row["id"] in seen:
+            raise ValueError("EVENT_PYRAMID_DUPLICATE_PORTFOLIO_ROW")
+        seen.add(row["id"])
+        if row["id"] == proposal["trade_id"] and any(
+                row[key] != state["trade"][key] for key in ("entry_price", "qty", "leverage")):
+            raise ValueError("EVENT_PYRAMID_TARGET_PORTFOLIO_DIVERGENT")
+    if proposal["trade_id"] not in seen:
+        raise ValueError("EVENT_PYRAMID_TARGET_PORTFOLIO_MISSING")
+    seen.clear()
+    for row in state["intents"]:
+        _closed(row, {"intent_key", "identity", "state", "dispatch_ids", "proposal", "qty",
+                      "risk_usd", "margin_usd", "lease_expires_at_ms", "generation", "real_trade_id"},
+                "port_state.intent")
+        _text(row["intent_key"], "intent_key")
+        if row["intent_key"] in seen or row["state"] not in {"RESERVED", "SENDING", "UNKNOWN", "TERMINAL", "CONFIRMED"}:
+            raise ValueError("EVENT_PYRAMID_INTENT_MEMORY_INVALID")
+        seen.add(row["intent_key"])
+        _integer(row["generation"], "intent.generation")
+        _integer(row["lease_expires_at_ms"], "intent.lease_expires_at_ms", 1)
+        for key in ("qty", "risk_usd", "margin_usd"):
+            _number(row[key], key)
+        if not isinstance(row["identity"], dict) or not isinstance(row["dispatch_ids"], list):
+            raise ValueError("EVENT_PYRAMID_INTENT_IDENTITY_INVALID")
+    return copy.deepcopy(state)
+
+
+def make_pyramid_port_state(*, proposal, pyramid_state, trade_metadata, portfolio_rows,
+                            generation=0, intents=None, blocked=False, retained_risk_usd=0):
+    _closed(trade_metadata, PYRAMID_METADATA_FIELDS, "trade_metadata")
+    body = {"version": PORT_STATE_VERSION, "trade_id": proposal["trade_id"],
+            "account_ref": proposal["account_ref"], "generation": generation, "blocked": blocked,
+            "trade": {**copy.deepcopy(pyramid_state), **copy.deepcopy(trade_metadata)},
+            "portfolio_rows": copy.deepcopy(portfolio_rows), "intents": copy.deepcopy(intents or []),
+            "retained_risk_usd": retained_risk_usd}
+    return validate_pyramid_port_state({**body, "state_hash": digest(body)}, proposal, pyramid_state)
+
+
 def source_functions(relative, names, namespace=None):
     """Compile only declared real source bodies, preserving file/line identities.
 
@@ -205,7 +289,7 @@ def source_functions(relative, names, namespace=None):
     """
     path = BACKEND / relative
     parsed = ast.parse(path.read_text(), filename=str(path))
-    nodes = [node for node in parsed.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    nodes = [node for node in parsed.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
              and node.name in names]
     if {node.name for node in nodes} != set(names):
         raise ValueError("EVENT_EXECUTION_SOURCE_FUNCTION_MISSING")
@@ -228,7 +312,7 @@ def source_literal(relative, name):
 
 
 def compute_admission(config, proposal, portfolio, *, final_qty=None, final_entry=None,
-                      consumes_slot=True):
+                      consumes_slot=True, stop_override=None):
     """Use the actual LIVE caps and P03 pure gates with explicit causal inputs.
 
     risk_pct is the frozen final input from the upstream sizing stage. This
@@ -255,7 +339,9 @@ def compute_admission(config, proposal, portfolio, *, final_qty=None, final_entr
     entry = proposal["entry"] if final_entry is None else final_entry
     _number(entry, "final_entry", 1e-15)
     notional = qty * entry
-    risk = qty * abs(entry - proposal["stop"])
+    stop = proposal["stop"] if stop_override is None else stop_override
+    _number(stop, "effective_stop", 1e-15)
+    risk = qty * abs(entry - stop)
     margin = notional / proposal["leverage"]
     if qty < config["filters"]["min_qty"] or notional < max(config["MIN_NOTIONAL_USD"],
                                                             config["filters"]["min_notional"]):
@@ -297,7 +383,7 @@ def compute_admission(config, proposal, portfolio, *, final_qty=None, final_entr
 
 
 def validate_execution_request(request, *, expected_source_fingerprint=None):
-    _closed(request, REQUEST_FIELDS, "request")
+    _closed(request, REQUEST_FIELDS | ({"port_state"} if "port_state" in request else set()), "request")
     canonical(request)
     _credential_free(request)
     provenance = request["source_provenance"]
@@ -345,6 +431,10 @@ def validate_execution_request(request, *, expected_source_fingerprint=None):
                 raise ValueError("EVENT_EXECUTION_PYRAMID_PROTECTION")
         if state["phase"] not in ("pre_tp1", "post_tp1", "runner"):
             raise ValueError("EVENT_EXECUTION_PYRAMID_PHASE")
+        if request.get("port_state") is not None:
+            validate_pyramid_port_state(request["port_state"], proposal, state)
+    elif request.get("port_state") is not None:
+        raise ValueError("EVENT_EXECUTION_UNEXPECTED_PORT_STATE")
     seen = set()
     if not isinstance(request["receipts"], list) or len(request["receipts"]) > 1000:
         raise ValueError("EVENT_EXECUTION_RECEIPT_LIMIT")
@@ -365,7 +455,7 @@ def validate_execution_request(request, *, expected_source_fingerprint=None):
 
 
 def make_execution_request(*, config, proposal, portfolio, receipts, fills, mode="ENTRY", pyramid_state=None,
-                           source="TEST_ONLY_OBSERVED_EVENTS", source_provenance=None):
+                           source="TEST_ONLY_OBSERVED_EVENTS", source_provenance=None, port_state=None):
     if source_provenance is None and source == "TEST_ONLY_OBSERVED_EVENTS":
         source_provenance = {"producer": "TEST_ONLY_FIXTURE", "source_id": "TEST_ONLY",
                              "source_hash": digest({"receipts": receipts, "fills": fills}),
@@ -375,6 +465,8 @@ def make_execution_request(*, config, proposal, portfolio, receipts, fills, mode
             "real_study_allowed": False, "source_fingerprint": execution_source_fingerprint(),
             "config": config, "proposal": proposal, "portfolio": portfolio, "receipts": receipts,
             "fills": fills, "mode": mode, "pyramid_state": pyramid_state, "source_provenance": source_provenance}
+    if port_state is not None:
+        body["port_state"] = port_state
     return validate_execution_request({**copy.deepcopy(body), "request_hash": digest(body)})
 
 

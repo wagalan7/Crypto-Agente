@@ -43,6 +43,8 @@ class Runtime:
         self.admissions = []
         self.transitions = []
         self.caller_calls = []
+        self.initial_reservation = None
+        self.port_state = copy.deepcopy(payload.get("port_state"))
 
     def gap(self, reason, **details):
         self.gaps.append({"reason_code": reason, **details})
@@ -139,6 +141,7 @@ async def run(payload, backend):
     revalidation = load_source("_event_entry_revalidation", revalidation_path)
     clock = types.SimpleNamespace(time=lambda: runtime.at_ms / 1000,
                                   time_ns=lambda: runtime.at_ms * 1000000)
+    revalidation.time = clock  # actual default-clock P04 helpers use the replay's causal clock
     signed = functions("services/binance_signed_service.py",
                        {"_floor_to_step", "_round_qty", "_round_price", "to_binance",
                         "market_fallback_client_order_id", "_is_ambiguous_order_submission",
@@ -158,11 +161,16 @@ async def run(payload, backend):
         return copy.deepcopy(config["filters"])
 
     async def ownership(*args):
+        if payload["mode"] == "PYRAMID" and hasattr(runtime, "pyramid_ownership"):
+            return await runtime.pyramid_ownership(*args)
         if portfolio["ownership"] != "BOT":
             return {"ok": False, "reason_code": "MANUAL_POSITION_SYMBOL_BLOCKED"}
         return None
 
     async def leverage(symbol, value, **kwargs):
+        if payload["mode"] == "PYRAMID" and value != proposal["leverage"]:
+            runtime.gap("PYRAMID_LEVERAGE_CHANGED")
+            return {"ok": False, "reason_code": "PYRAMID_LEVERAGE_CHANGED"}
         return await runtime.call("set_leverage", (symbol, value))
 
     async def get_order(symbol, **kwargs):
@@ -171,7 +179,16 @@ async def run(payload, backend):
     async def cancel_order(symbol, **kwargs):
         return await runtime.call("cancel_order", (symbol,), kwargs)
 
+    no_obligation_protection = functions(
+        "services/binance_signed_service.py", {"_place_post_fill_protection"}, signed
+    )["_place_post_fill_protection"]
+
     async def protect(*args, **kwargs):
+        if all(kwargs.get(key) is None for key in ("stop_loss", "tp1", "tp2")):
+            # Native no-obligation branch does not call the broker. Its true
+            # flags mean "not requested", never a confirmed SL for PYRAMID.
+            runtime.caller_calls.append("binance_signed_service._place_post_fill_protection")
+            return await no_obligation_protection(*args, **kwargs)
         return await runtime.call("place_protection", args, kwargs)
 
     async def emergency(*args, **kwargs):
@@ -190,8 +207,27 @@ async def run(payload, backend):
                 return {"ok": False, "_preflight": True, "preflight": verdict,
                         "reason_code": verdict.get("reason_code"), "error": verdict.get("reason")}
         if mutation and mutation.get("final_check"):
-            if await mutation["final_check"]() is not True:
-                return {"ok": False, "_preflight": True, "reason_code": "FINAL_AUTHORITY_DENIED"}
+            final_verdict = await mutation["final_check"]()
+            denied_reason = "FINAL_AUTHORITY_DENIED"
+            denied_detail = {}
+            if payload["mode"] == "PYRAMID":
+                authorized = isinstance(final_verdict, dict) and final_verdict.get("ok") is True
+                sync = final_verdict.get("sync_check") if authorized else None
+                sync_verdict = sync(dict(params)) if authorized and callable(sync) else None
+                authorized = isinstance(sync_verdict, dict) and sync_verdict.get("ok") is True
+                if isinstance(sync_verdict, dict):
+                    denied_reason = sync_verdict.get("reason_code") or denied_reason
+                    denied_detail = sync_verdict
+                elif isinstance(final_verdict, dict):
+                    denied_reason = final_verdict.get("reason_code") or denied_reason
+                    denied_detail = {key: final_verdict[key] for key in ("ok", "reason_code", "reason")
+                                     if key in final_verdict}
+            else:
+                authorized = final_verdict is True
+            if not authorized:
+                return {"ok": False, "_preflight": True, "_request_sent": False,
+                        "reason_code": denied_reason, "preflight": denied_detail,
+                        "error": str(denied_detail.get("reason") or "autorização final negou o envio")}
         dispatch = params.get("newClientOrderId")
         if dispatch:
             runtime.current_dispatch = dispatch
@@ -354,6 +390,12 @@ async def run(payload, backend):
                 "observed_at_ms": max(f["observed_at_ms"] for f in fills),
                 "available_at_ms": max(f["available_at_ms"] for f in fills),
                 "test_only": payload["test_only"], "real_study_allowed": False}
+        if payload["mode"] == "PYRAMID":
+            writer = copy.deepcopy(runtime.port_state["trade"])
+            body.update(notes=writer["notes"], writer_state=writer, writer_state_hash=contract.digest(writer),
+                        port_state_hash=runtime.port_state["state_hash"],
+                        writer_observed_at_ms=runtime.at_ms, writer_available_at_ms=runtime.at_ms,
+                        retained_confirmed_risk_usd=runtime.port_state["retained_risk_usd"])
         updates.append({**body, "update_hash": contract.digest(body)})
     report = {"version": contract.VERSION, "source": payload["source"], "test_only": payload["test_only"],
               "execution_quality": contract.SOURCES[payload["source"]],
@@ -369,7 +411,11 @@ async def run(payload, backend):
               "fills": fills, "filled_qty": fill_qty, "entry_basis": fill_basis,
               "reservations": reservations, "manager_updates": updates,
               "memory_transitions": runtime.transitions, "gaps": runtime.gaps,
+              "initial_reservation": copy.deepcopy(runtime.initial_reservation),
               "caller_calls": runtime.caller_calls,
+              "port_state": runtime.port_state,
+              "persistence_scope": "RECEIPT_BOUND_SIMULATED_PORTS" if payload["mode"] == "PYRAMID" else "ENTRY_MEMORY",
+              "retained_confirmed_risk_usd": (runtime.port_state or {}).get("retained_risk_usd", 0),
               "unused_receipts": [r["call_index"] for r in payload["receipts"] if r["call_index"] not in runtime.used],
               "blocked_network_attempts": runtime.blocked_network,
               "caller_identities": {n: {"source_file": signed[n].__code__.co_filename,
@@ -377,6 +423,12 @@ async def run(payload, backend):
                                     for n in ("place_order", "place_maker_entry_then_protect", "_enforce_entry_safety")},
               "isolation": {"input_credentials_inherited": False, "real_environment_inherited": False,
                             "actual_exchange_clients_imported": False, "database": "memory_only"}}
+    report["caller_identities"].update(getattr(runtime, "pyramid_caller_identities", {}))
+    if "binance_signed_service._place_post_fill_protection" in runtime.caller_calls:
+        report["caller_identities"]["binance_signed_service._place_post_fill_protection"] = {
+            "source_file": no_obligation_protection.__code__.co_filename,
+            "first_line": no_obligation_protection.__code__.co_firstlineno,
+        }
     if contract.execution_source_fingerprint() != payload["source_fingerprint"]:
         raise ValueError("source drift during replay")
     return {**report, "report_hash": contract.digest(report)}
@@ -443,11 +495,7 @@ async def pyramid(runtime, contract, signed, market_preflight, log):
     payload, p = runtime.payload, runtime.payload["proposal"]
     config, portfolio, initial = payload["config"], payload["portfolio"], payload["pyramid_state"]
     if config["PYRAMIDING_ENABLED"]:
-        # O LIVE agora exige reserva durável, posição/conditionals frescos e
-        # risco confirmado retido. Estas portas ainda não existem no replay;
-        # não substituir a autorização oficial por mocks silenciosos.
-        runtime.gap("TECHNICAL_PYRAMID_EVENT_PORTS_NOT_IMPLEMENTED")
-        return {"ok": False}, None
+        return await pyramid_with_ports(runtime, contract, signed, log)
     state = types.SimpleNamespace(**copy.deepcopy(initial))
     if config["PYRAMIDING_ENABLED"] and not all(initial[k] for k in
                                                ("sl_close_position", "tp2_close_position", "protection_confirmed")):
@@ -545,6 +593,457 @@ async def pyramid(runtime, contract, signed, market_preflight, log):
                     "qty": persisted.qty, "entry_price": persisted.entry_price,
                     "pyramiding_level": persisted.pyramiding_level}
     return {"ok": False, "no_op": not runtime.gaps, "no_fill": not runtime.gaps}, None
+
+
+async def pyramid_with_ports(runtime, contract, signed, log):
+    """Real caller/P04 bodies, explicit simulated persistence boundaries.
+
+    Each database/authority operation needs a causally bound receipt. This
+    adapter does not pretend its local CAS is a PostgreSQL concurrency proof.
+    No positive broker response is manufactured from the admitted quantity.
+    """
+    from dataclasses import asdict, dataclass
+    from datetime import datetime, timezone
+    from collections.abc import Mapping
+    from types import MappingProxyType
+    import math
+    import re
+    import sqlalchemy
+    from sqlalchemy.orm import declarative_base
+
+    payload, p, config = runtime.payload, runtime.payload["proposal"], runtime.payload["config"]
+    state = runtime.port_state
+    if state is None or "pyramid_limits" not in config:
+        runtime.gap("PYRAMID_PORT_STATE_OR_LIMITS_MISSING")
+        return {"ok": False}, None
+    initial = payload["pyramid_state"]
+    portfolio = payload["portfolio"]
+    pending_rows = [r for r in state["intents"] if r["state"] in ("RESERVED", "SENDING", "UNKNOWN")]
+    if (portfolio["open_risk_usd"] + 1e-9 < state["retained_risk_usd"]
+            or portfolio["pending_risk_usd"] + 1e-9 < sum(r["risk_usd"] for r in pending_rows)
+            or portfolio["pending_margin_usd"] + 1e-9 < sum(r["margin_usd"] for r in pending_rows)
+            or portfolio["open_positions"] < len(state["portfolio_rows"])
+            or portfolio["open_notional_usd"] + 1e-9 < sum(r["entry_price"] * r["qty"] for r in state["portfolio_rows"])):
+        runtime.gap("PYRAMID_PORTFOLIO_MEMORY_NOT_CONSUMED")
+        return {"ok": False}, None
+    db = types.ModuleType("db")
+    db.Base = declarative_base()
+    sys.modules["db"] = db
+    models = types.ModuleType("models")
+    models.__path__ = []
+    sys.modules["models"] = models
+    model = load_source("models.real_trade", contract.BACKEND / "models/real_trade.py")
+    snapshot_model = load_source("models.recommendation_snapshot", contract.BACKEND / "models/recommendation_snapshot.py")
+    services = types.ModuleType("services")
+    services.__path__ = []
+    sys.modules["services"] = services
+
+    def fake(name, **attrs):
+        module = types.ModuleType("services." + name)
+        module.__dict__.update(attrs)
+        sys.modules[module.__name__] = module
+        setattr(services, name, module)
+        return module
+
+    def seal():
+        state["state_hash"] = contract.digest({k: v for k, v in state.items() if k != "state_hash"})
+
+    async def authority(operation, details=None, *, mutation=False):
+        before = state["state_hash"]
+        value = await runtime.call("pyramid_authority", (operation,),
+                                   {"state_hash": before, "details": details or {}})
+        if not isinstance(value, dict) or type(value.get("ok")) is not bool:
+            runtime.gap("PYRAMID_AUTHORITY_RECEIPT_INVALID", operation=operation)
+            raise Gap("invalid authority receipt")
+        if value["ok"] is not True:
+            runtime.gap(str(value.get("reason_code") or "PYRAMID_AUTHORITY_DENIED"), operation=operation)
+            return False
+        if state["blocked"]:
+            runtime.gap("PYRAMID_AUTHORITY_BLOCKED", operation=operation)
+            return False
+        # A generation supplied as evidence must equal the current memory;
+        # no receipt can advance or erase the state by fiat.
+        if "generation" in value and (type(value["generation"]) is not int
+                or value["generation"] < 0 or value["generation"] != state["generation"]):
+            runtime.gap("PYRAMID_AUTHORITY_GENERATION_MISMATCH", operation=operation)
+            return False
+        return True
+
+    async def owned(symbol, action):
+        if (portfolio["ownership"] != "BOT" or state["blocked"]
+                or not await authority("OWNERSHIP", {"symbol": symbol, "action": action})):
+            return {"ok": False, "reason_code": "PYRAMID_OWNERSHIP_DENIED"}
+        return None
+
+    runtime.pyramid_ownership = owned
+
+    def trade_object():
+        values = {k: v for k, v in state["trade"].items() if k in model.RealTrade.__table__.columns}
+        values["created_at"] = datetime.fromtimestamp(state["trade"]["created_at_ms"] / 1000, timezone.utc)
+        return model.RealTrade(**values)
+
+    class Session:
+        def __init__(self):
+            self.row, self.before = None, None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, statement):
+            compiled = statement.compile()
+            entities = [d.get("entity") for d in statement.column_descriptions]
+            if entities == [snapshot_model.RecommendationSnapshot]:
+                if (len(statement.column_descriptions) != 1
+                        or statement.column_descriptions[0].get("name") != "timeframe"
+                        or list(compiled.params.values()) != [state["trade"]["recommendation_id"]]):
+                    raise Gap("unsupported original recommendation query")
+                details = {"kind": "ORIGINAL_SNAPSHOT_TIMEFRAME", "parameters": compiled.params,
+                           "locked": False, "state_hash": state["state_hash"]}
+                value = await runtime.call("pyramid_read", (details,))
+                if not isinstance(value, dict) or value.get("ok") is not True:
+                    raise Gap("original recommendation not observed")
+                observed = value.get("timeframe")
+                if observed is not None and observed != state["trade"]["timeframe"]:
+                    runtime.gap("PYRAMID_ORIGINAL_TIMEFRAME_MISMATCH")
+                    raise Gap("original timeframe differs from declared memory")
+                return types.SimpleNamespace(scalar_one_or_none=lambda: observed)
+            if any(e is not model.RealTrade for e in entities):
+                raise Gap("unsupported memory query")
+            kind = "PORTFOLIO" if len(statement.column_descriptions) > 1 else "TRADE"
+            details = {"kind": kind, "parameters": compiled.params,
+                       "locked": getattr(statement, "_for_update_arg", None) is not None,
+                       "state_hash": state["state_hash"]}
+            value = await runtime.call("pyramid_read", (details,))
+            if not isinstance(value, dict) or value.get("ok") is not True:
+                raise Gap("memory read not observed")
+            if kind == "PORTFOLIO":
+                return types.SimpleNamespace(mappings=lambda: types.SimpleNamespace(
+                    all=lambda: copy.deepcopy(state["portfolio_rows"])))
+            if list(compiled.params.values()) != [p["trade_id"]]:
+                raise Gap("unexpected trade identity")
+            self.row, self.before = trade_object(), state["state_hash"]
+            return types.SimpleNamespace(scalar_one_or_none=lambda: self.row)
+
+        async def commit(self):
+            if self.row is None or self.before != state["state_hash"]:
+                raise Gap("stale writer memory")
+            changed = {"qty": self.row.qty, "pyramiding_level": self.row.pyramiding_level,
+                       "entry_price": self.row.entry_price, "notes": self.row.notes}
+            value = await runtime.call("pyramid_write", ("TRADE_UPDATE",),
+                                       {"expected_state_hash": self.before, "changes": changed})
+            if not isinstance(value, dict) or value.get("ok") is not True:
+                raise Gap("writer commit not observed")
+            if state["state_hash"] != self.before:
+                raise Gap("writer generation changed")
+            before = copy.deepcopy(state["trade"])
+            state["trade"].update(changed)
+            for row in state["portfolio_rows"]:
+                if row["id"] == p["trade_id"]:
+                    row["qty"] = self.row.qty
+            state["generation"] += 1
+            seal()
+            runtime.transitions.append({"producer": "shadow_trade_service._maybe_pyramid",
+                                        "qty_before": before["qty"], "qty_after": self.row.qty,
+                                        "entry_before": before["entry_price"], "entry_after": self.row.entry_price,
+                                        "pyramiding_level": self.row.pyramiding_level})
+
+    db.get_session = Session
+    clock = types.SimpleNamespace(time=lambda: runtime.at_ms / 1000,
+                                  time_ns=lambda: runtime.at_ms * 1000000)
+    intent_names = {"EntryIdentity", "_label", "_digest", "_canonical_value", "canonical_proposal_hash",
+                    "freeze_dispatch_proposal", "proposal_matches_stored", "identity_symbol_to_market",
+                    "local_authority_still_valid"}
+    fake("entry_intent_service")  # dataclass resolves its declared module while compiling
+    in_ns = contract.source_functions("services/entry_intent_service.py", intent_names,
+        {"dataclass": dataclass, "Mapping": Mapping, "MappingProxyType": MappingProxyType,
+         "Dict": dict, "Any": object, "Tuple": tuple, "hashlib": hashlib, "json": json,
+         "copy": copy, "re": re, "SCHEMA_VERSION": contract.source_literal("services/entry_intent_service.py", "SCHEMA_VERSION"),
+         "MAX_CLIENT_ORDER_ID": 36,
+         **{name: contract.source_literal("services/entry_intent_service.py", name)
+            for name in ("PROPOSAL_FIELDS", "PROPOSAL_INVALID", "PROPOSAL_MISSING", "PROPOSAL_TAMPERED",
+                         "LOCAL_AUTHORITY_INVALID", "LOCAL_AUTHORITY_PENDING", "LOCAL_AUTHORITY_IDENTITY",
+                         "LOCAL_AUTHORITY_FENCE", "LOCAL_AUTHORITY_CONTAINED")}})
+
+    async def mark_state(_factory, key, *, owner, reason=None, real_trade_id=None):
+        row = next((r for r in state["intents"] if r["intent_key"] == key), None)
+        operation = "CONFIRM" if real_trade_id is not None else "UNKNOWN" if reason and "UNKNOWN" in reason else "TERMINAL"
+        if row is None or not await authority(operation, {"intent_key": key, "reason": reason,
+                                                        "real_trade_id": real_trade_id}):
+            return False
+        target = "CONFIRMED" if real_trade_id is not None else "UNKNOWN" if operation == "UNKNOWN" else "TERMINAL"
+        if row["state"] != target:
+            row["state"] = target
+            row["real_trade_id"] = real_trade_id
+            if target == "CONFIRMED":
+                state["retained_risk_usd"] += row["risk_usd"]
+            state["generation"] += 1
+            row["generation"] = state["generation"]
+            seal()
+        return True
+
+    async def unknown(factory, key, **kwargs):
+        return await mark_state(factory, key, **{**kwargs, "reason": "UNKNOWN"})
+
+    intents_module = fake("entry_intent_service", **in_ns, mark_confirmed=mark_state,
+                          mark_unknown=unknown, mark_terminal=mark_state)
+    fake("binance_signed_service", to_binance=signed["to_binance"])
+    fake("entry_revalidation_service", **{k: v for k, v in sys.modules["_event_entry_revalidation"].__dict__.items()
+                                         if not k.startswith("__")})
+    fake("manual_position_service", local_validation_fence=lambda: state["generation"],
+         pending_validation_failure=lambda: "blocked" if state["blocked"] else None,
+         local_symbol_block=lambda _: "blocked" if state["blocked"] else None,
+         current_account_scope=lambda: p["account_ref"])
+
+    async def paused():
+        if not await authority("RISK_STATE"):
+            return True
+        return portfolio["paused"] or state["blocked"]
+
+    async def kill():
+        if not await authority("KILL_SWITCH"):
+            return {"allowed": False}
+        return {"allowed": portfolio["kill_allowed"]}
+
+    async def mark(symbol):
+        response = await runtime.call("quote", (symbol,))
+        return response.get("last") if isinstance(response, dict) else None
+
+    async def position(symbol, **kwargs):
+        return await runtime.call("positions", (symbol,), kwargs)
+
+    async def orders(symbol):
+        return await runtime.call("algo_orders", (symbol,))
+
+    async def equity(**kwargs):
+        return await runtime.call("equity", (), kwargs)
+
+    async def depth(symbol, **kwargs):
+        return await runtime.call("depth", (symbol,), kwargs)
+
+    async def place(**kwargs):
+        expected = f"cw-pyr-{p['trade_id']}-{initial['pyramiding_level'] + 1}"
+        if kwargs.get("client_order_id") != expected or kwargs.get("leverage") != p["leverage"]:
+            raise Gap("pyramid dispatch/leverage mismatch")
+        response = await signed["place_order"](**kwargs)
+        runtime.pyramid_order_result = copy.deepcopy(response)
+        return response
+
+    async def notify(**kwargs):
+        return None
+
+    fake("exchange_service", place_order=place, get_positions=position, get_open_algo_orders=orders,
+         get_equity=equity, get_execution_depth=depth)
+    fake("risk_service", is_paused=paused)
+    fake("kill_switch_service", check_can_trade=kill)
+    fake("push_service", notify_alert=notify)
+    fake("financial_risk_service", adverse_market_entry_price=sys.modules["_event_entry_revalidation"].__dict__.get(
+        "adverse_market_entry_price"))
+    financial = contract.source_functions("services/financial_risk_service.py", {"adverse_market_entry_price", "_unknown"},
+        {"_finite": in_ns.get("_finite"), "QUALITY_OK": "OK", "QUALITY_UNKNOWN": "UNKNOWN"})
+    financial["_finite"] = contract.source_functions("services/risk_reconciliation_service.py", {"_finite"})["_finite"]
+    sys.modules["services.financial_risk_service"].adverse_market_entry_price = financial["adverse_market_entry_price"]
+
+    ns = contract.source_functions("services/shadow_trade_service.py",
+        {"_maybe_pyramid", "_pyramid_original_timeframe", "_pyramid_protection", "_pyramid_legacy_caps", "_pyramid_number", "_proposed_margin_usd",
+         "_market_entry_preflight_checks", "_p04a_runtime_recheck", "_entry_intent_identity",
+         "_wire_symbol", "_num_close", "_entry_proposal_fields", "_p04_evidence_of", "_intent_guarded_preflight",
+         "_settle_entry_intent", "_sync_final_check_for", "_identidade_do_contexto_bate",
+         "_proposal_age_limit_ms", "_revalidate_frozen_p04", "_intent_candidate_guard"},
+        {**config, "SHADOW_ENABLED": False, "DB_ENABLED": True, "time": clock, "log": log,
+         "_EXECUTION_QUARANTINE_REASON": "blocked" if state["blocked"] else None,
+         "_INTENT_OWNER": "RESEARCH_ONLY_PORT_OWNER", "_PROPOSAL_NUM_TOL": 1e-9,
+         "MARGIN_COST_BPS_PER_SIDE": contract.source_literal("services/shadow_trade_service.py", "MARGIN_COST_BPS_PER_SIDE"),
+         "_CAMPOS_PROIBIDOS_NA_ENTRADA": contract.source_literal("services/shadow_trade_service.py", "_CAMPOS_PROIBIDOS_NA_ENTRADA"),
+         "P04B_MAX_DEPTH_AGE_MS": config["limits"]["max_depth_age_ms"],
+         "P04B_MAX_FETCH_LATENCY_MS": config["limits"]["max_fetch_latency_ms"],
+         "P04B_MAX_BOOK_IMPACT_PCT": config["limits"]["max_book_impact_pct"],
+         "P04B_MAX_MARKET_SLIPPAGE_PCT": config["limits"]["max_adverse_slippage_pct"],
+         "P04B_DEPTH_LIMIT": config["pyramid_limits"]["depth_limit"],
+         "P04B_DEPTH_TIMEOUT_S": config["pyramid_limits"]["depth_timeout_s"],
+         "MAX_SPREAD_PCT": config["limits"]["max_spread_pct"],
+         "P04A_MAX_CHASE_ATR": config["limits"]["max_chase_atr"],
+         "PROXIMITY_MAX_ATR": config["limits"]["max_chase_atr"],
+         "MIN_RR_TP1_FILL": config["limits"]["min_rr_tp1"],
+         "MIN_RR_TP1_EXEC": config["limits"]["min_rr_tp1"],
+         "MIN_RR_TP2_EXEC": config["limits"]["min_rr_tp2"],
+         "RR_GATE_ENABLED": True, "FILL_RR_GATE_ENABLED": True,
+         "MAX_TOTAL_MARGIN_PCT": config["pyramid_limits"]["max_total_margin_pct"],
+         "_get_mark_price": mark,
+         "_live_money_guard": lambda: (portfolio["live_guards_allowed"] and not state["blocked"], "bound memory"),
+         "_live_execution_contract_guard": lambda: (portfolio["live_guards_allowed"] and not state["blocked"], "bound memory"),
+         "_trade_active_exchange_guard": lambda trade: (trade.exchange == "binance", "bound exchange"),
+         "_active_exchange_name": lambda: "binance", "_entry_account_ref": lambda: p["account_ref"]})
+
+    def row_of(intent):
+        return next((r for r in state["intents"] if r["intent_key"] == intent.get("intent_key")), None)
+
+    async def reserve(rec, *, side, entry, stop, tp1, tp2, qty, equity_usd, identity, consumes_slot):
+        details = {"identity": asdict(identity), "entry": entry, "stop": stop, "qty": qty,
+                   "tp1": tp1, "tp2": tp2, "consumes_slot": consumes_slot}
+        if not await authority("RESERVE", details):
+            return {"granted": False, "reason": "PYRAMID_RESERVE_DENIED"}
+        existing = next((r for r in state["intents"] if r["intent_key"] == identity.intent_key), None)
+        if existing is not None:
+            return {"granted": False, "reason": "PYRAMID_IDENTITY_ALREADY_CONSUMED"}
+        final = contract.compute_admission(config, p, portfolio, final_qty=qty, final_entry=entry,
+                                           consumes_slot=False, stop_override=stop)
+        runtime.admissions.append(final)
+        if final["decision"] != "ADMITTED":
+            return {"granted": False, "reason": "PYRAMID_CAPACITY_DENIED"}
+        margin = ns["_proposed_margin_usd"](entry=entry, qty=qty, leverage=p["leverage"])
+        if margin is None or margin + portfolio["pending_margin_usd"] > portfolio["available_margin_usd"]:
+            return {"granted": False, "reason": "INSUFFICIENT_FREE_MARGIN"}
+        state["generation"] += 1
+        row = {"intent_key": identity.intent_key, "identity": asdict(identity), "state": "RESERVED",
+               "dispatch_ids": [], "proposal": None, "qty": qty, "risk_usd": final["risk_usd"],
+               "margin_usd": margin, "lease_expires_at_ms": runtime.at_ms + 90000,
+               "generation": state["generation"], "real_trade_id": None}
+        state["intents"].append(row)
+        seal()
+        initial_reservation = {"producer": "shadow_trade_service._reserve_entry_intent",
+            "request_hash": payload["request_hash"], "intent_key": row["intent_key"],
+            "reserved_at_ms": runtime.at_ms, "generation": state["generation"],
+            "state_hash": state["state_hash"], "qty": row["qty"],
+            "risk_usd": row["risk_usd"], "margin_usd": row["margin_usd"],
+            "slot_retained": False}
+        runtime.initial_reservation = {**initial_reservation,
+            "reservation_hash": contract.digest(initial_reservation)}
+        return {"granted": True, "intent_key": identity.intent_key, "identity": identity,
+                "account_ref": identity.account_ref, "state": "RESERVED", "margin_generation": state["generation"],
+                "leverage": p["leverage"], "dispatched": False, "operational_selection": None}
+
+    async def prepare(intent):
+        row = row_of(intent)
+        if (row is None or row["state"] not in ("RESERVED", "SENDING")
+                or row["lease_expires_at_ms"] <= runtime.at_ms
+                or not await authority("PREPARE", {"intent_key": row["intent_key"]})):
+            return False
+        row["state"] = intent["state"] = "SENDING"
+        intent["dispatched"] = True
+        seal()
+        return True
+
+    async def register(intent, dispatch_id):
+        row = row_of(intent)
+        if row is None or not await authority("REGISTER_DISPATCH", {"intent_key": row["intent_key"], "dispatch_id": dispatch_id}):
+            return False
+        if dispatch_id not in row["dispatch_ids"]:
+            row["dispatch_ids"].append(dispatch_id)
+            seal()
+        return True
+
+    async def financial_gate(*, side, final_entry, stop, final_qty, checks, intent):
+        row = row_of(intent)
+        if row is None or not await authority("READMIT", {"intent_key": row["intent_key"],
+                "entry": final_entry, "stop": stop, "qty": final_qty}):
+            return {"ok": False, "reason_code": "PYRAMID_READMISSION_DENIED", "checks": checks}
+        if not await authority("FINANCIAL_TOTAL", {"intent_key": row["intent_key"], "risk_usd": abs(final_entry-stop)*final_qty}):
+            return {"ok": False, "reason_code": "PYRAMID_FINANCIAL_TOTAL_UNAVAILABLE", "checks": checks}
+        final = contract.compute_admission(config, p, portfolio, final_qty=final_qty, final_entry=final_entry,
+                                           consumes_slot=False, stop_override=stop)
+        runtime.admissions.append(final)
+        if final["decision"] != "ADMITTED":
+            return {"ok": False, "reason_code": "PYRAMID_CAPACITY_DENIED", "checks": checks}
+        margin = ns["_proposed_margin_usd"](entry=final_entry, qty=final_qty, leverage=p["leverage"])
+        if margin is None or margin + portfolio["pending_margin_usd"] > portfolio["available_margin_usd"]:
+            return {"ok": False, "reason_code": "INSUFFICIENT_FREE_MARGIN", "checks": checks}
+        fields = ns["_entry_proposal_fields"](intent, checks, side=side, final_entry=final_entry,
+                                              final_qty=final_qty, stop=stop)
+        if fields is None:
+            return {"ok": False, "reason_code": "PYRAMID_PROPOSAL_MISSING", "checks": checks}
+        state["generation"] += 1
+        frozen = in_ns["freeze_dispatch_proposal"](**fields, token=state["generation"],
+                created_at_ms=runtime.at_ms, lease_expires_at_ms=row["lease_expires_at_ms"])
+        if frozen.get("ok") is not True:
+            raise Gap("proposal could not freeze")
+        row.update(qty=final_qty, risk_usd=final["risk_usd"], margin_usd=margin,
+                   proposal=frozen, generation=state["generation"])
+        intent["proposal"], intent["margin_generation"] = frozen, state["generation"]
+        seal()
+        return None
+
+    def authorization(intent, *, dispatch_id_fn=None, **kwargs):
+        async def check():
+            row = row_of(intent)
+            dispatch = dispatch_id_fn() if dispatch_id_fn else intent.get("last_dispatch_id")
+            if (row is None or row["state"] != "SENDING" or row["lease_expires_at_ms"] <= runtime.at_ms
+                    or row["generation"] != state["generation"] or intent["margin_generation"] != state["generation"]
+                    or dispatch not in row["dispatch_ids"] or row["proposal"] is None
+                    or not await authority("AUTHORIZE", {"intent_key": row["intent_key"], "dispatch_id": dispatch})):
+                return {"ok": False, "reason_code": "PYRAMID_FINAL_AUTHORITY_DENIED"}
+            token = {"fence": state["generation"], "pending": False, "intent_key": row["intent_key"],
+                     "account_ref": p["account_ref"], "exchange": "binance", "symbol": row["identity"]["symbol"]}
+            verdict = {"ok": True, "proposal": copy.deepcopy(row["proposal"]), "authorized_at_ms": runtime.at_ms,
+                       "identity": intent["identity"], "local_authority": token}
+            verdict["sync_check"] = ns["_sync_final_check_for"](verdict, intent)
+            return verdict
+        return check
+
+    async def uncertain(intent, same_dir, reason):
+        # Known local failure arms containment before persistence is attempted;
+        # missing/denied receipt retains the previously reserved exposure.
+        state["blocked"] = True
+        ns["_EXECUTION_QUARANTINE_REASON"] = reason
+        row = row_of(intent or {})
+        if row:
+            row["state"] = "UNKNOWN"
+            intent["state"] = "UNKNOWN"
+        seal()
+        runtime.gap(reason)
+        try:
+            await runtime.call("pyramid_write", ("QUARANTINE",), {"state_hash": state["state_hash"], "reason": reason})
+        except Gap:
+            pass
+
+    async def close_intent(intent, reason):
+        await mark_state(Session, intent["intent_key"], owner="RESEARCH_ONLY_PORT_OWNER", reason="ENTRY_NOT_SUBMITTED")
+
+    def arm(reason):
+        state["blocked"] = True
+        ns["_EXECUTION_QUARANTINE_REASON"] = str(reason)
+        seal()
+        runtime.gap("PYRAMID_QUARANTINE", reason=str(reason))
+
+    ns.update(_reserve_entry_intent=reserve, _intent_dispatch_guard=prepare, _register_intent_dispatch=register,
+              _r05b_entry_gate=financial_gate, _intent_final_authorization=authorization,
+              _pyramid_uncertain=uncertain, _close_entry_intent=close_intent,
+              _arm_execution_quarantine=arm)
+    tracked = ("_maybe_pyramid", "_pyramid_original_timeframe", "_pyramid_protection",
+               "_pyramid_legacy_caps", "_market_entry_preflight_checks",
+               "_intent_guarded_preflight", "_sync_final_check_for")
+    runtime.pyramid_caller_identities = {
+        "shadow_trade_service." + name: {"source_file": ns[name].__code__.co_filename,
+                                         "first_line": ns[name].__code__.co_firstlineno}
+        for name in tracked}
+    for name in tracked:
+        actual = ns[name]
+        if asyncio.iscoroutinefunction(actual):
+            async def tracked_async(*args, _actual=actual, _name=name, **kwargs):
+                runtime.caller_calls.append("shadow_trade_service." + _name)
+                return await _actual(*args, **kwargs)
+            ns[name] = tracked_async
+        else:
+            def tracked_sync(*args, _actual=actual, _name=name, **kwargs):
+                runtime.caller_calls.append("shadow_trade_service." + _name)
+                return _actual(*args, **kwargs)
+            ns[name] = tracked_sync
+    same_dir = trade_object()
+    applied = await ns["_maybe_pyramid"](same_dir, {"symbol": p["symbol"], "entry": p["entry"],
+        "stop_loss": p["stop"], "timeframe": p["timeframe"], "signal": {"indicators": {"atr": p["atr"]}},
+        "entry_zone_low": p["entry_zone_low"], "entry_zone_high": p["entry_zone_high"]})
+    if applied:
+        return {"ok": True, "pyramid_applied": True,
+                "executed_qty": state["trade"]["qty"] - initial["qty"]}, {
+                    "qty": state["trade"]["qty"], "entry_price": state["trade"]["entry_price"],
+                    "pyramiding_level": state["trade"]["pyramiding_level"]}
+    unresolved = any(r["state"] in ("RESERVED", "SENDING", "UNKNOWN") for r in state["intents"])
+    if unresolved:
+        runtime.gap("PYRAMID_INTENT_UNRESOLVED")
+    return {**(getattr(runtime, "pyramid_order_result", None) or {}),
+            "ok": False, "no_op": not runtime.gaps, "no_fill": not runtime.gaps}, None
 
 
 def main():

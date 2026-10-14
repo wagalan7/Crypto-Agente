@@ -293,6 +293,85 @@ async def run():
             row = (await session.execute(select(State).where(State.id == original_id))).scalar_one()
             check("generation_and_original_hash_never_overwritten", row.generation == 1
                   and row.evidence_key == report["report_hash"])
+
+        # Full native caller chain, independently identified from the earlier
+        # ENTRY-only study. Synthetic broker/DB ports never grant LIVE authority.
+        from tests.test_live_event_chain import native_pyramid_chain_fixture
+        chain_manifest, chain_data = native_pyramid_chain_fixture("long")
+        chain_report = study.run_study(manifest=chain_manifest, dataset=chain_data,
+            now_ms=max(report["evidence_inputs"]["now_ms"], chain_manifest["split"]["as_of_ms"]))
+        check("native_pyramid_chain_report_complete", chain_report.get("ok") is True
+              and all(a["records"][0]["state"] == "COMPLETE" for a in chain_report.get("arms", {}).values()),
+              chain_report.get("reason_code"))
+        check("native_chain_has_four_steps_and_two_executions", all(
+              len(a["records"][0]["step_reports"]) == 4
+              and len(a["records"][0]["execution_reports"]) == 2
+              and a["records"][0]["execution_reports"][1]["manager_updates"][0]["kind"] == "PYRAMID_FILL"
+              for a in chain_report["arms"].values()))
+        check("native_chain_ledger_economic_proof_and_no_authority", all(
+              a["records"][0]["ledger"]["economic_value_known"] is True
+              and a["records"][0]["ledger"]["net_including_funding"] is not None
+              and a["broker_balance_replica"] is False
+              and a["partial_cash_recognized"] is False
+              for a in chain_report["arms"].values())
+              and all(chain_report.get(k) is False for k in
+                  ("promotable", "authorizes_live", "live_equivalent", "real_study_allowed")))
+        check("native_chain_full_recomputation_verified", study.verify_report(chain_report, recompute=True)["ok"])
+        chain_ref = study.study_reference(chain_report)
+        check("native_chain_identity_separate_from_entry_study", chain_ref != ref)
+        chain_persisted = await official_study.persist_study(sessions, chain_report)
+        check("native_chain_official_dispatch_persisted_once", chain_persisted.get("published") is True
+              and chain_persisted.get("generation") == 1, chain_persisted)
+        chain_config = study.build_event_envelope(chain_report)
+        chain_catalog_args = {"champion": chain_manifest["baseline"], "config": chain_config,
+            "objective": catalog.OBJECTIVES[0], "study_ref": chain_ref,
+            "cutoff": datetime.fromtimestamp(chain_manifest["split"]["as_of_ms"] / 1000, tz=timezone.utc),
+            "fingerprint": chain_report["identity"]["dataset_hash"]}
+        chain_created = await catalog.create_preselection_experiment(**chain_catalog_args)
+        check("native_chain_catalog_is_separate_inactive_draft", chain_created.get("ok") is True
+              and chain_created.get("status") == "DRAFT" and chain_created.get("promotable") is False
+              and chain_created.get("experiment_id") != created["experiment_id"], chain_created)
+
+        await engine.dispose()
+        engine = await new_engine()
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        policy_state._STATE_CACHE.clear()
+        chain_repeated = await official_study.persist_study(sessions, chain_report)
+        check("native_chain_restart_same_generation_and_money", chain_repeated.get("published") is False
+              and chain_repeated.get("generation") == 1
+              and chain_repeated.get("reason_code") == "EVENT_STUDY_UNCHANGED", chain_repeated)
+        async with sessions() as session:
+            stored_chain = (await session.execute(select(State).where(
+                State.experiment_key == chain_ref["experiment_key"]))).scalar_one()
+            check("native_chain_jsonb_exact_report_after_restart", stored_chain.payload == {"event_report": chain_report}
+                  and stored_chain.evidence_key == chain_report["report_hash"] and stored_chain.generation == 1)
+
+        previous_read_count = len(read_sql)
+        chain_guarded_engines = (engine, db._engine)
+        for item in chain_guarded_engines:
+            event.listen(item.sync_engine, "before_cursor_execute", read_only_sql)
+        event.listen(AsyncSession.sync_session_class, "after_commit", committed)
+        event.listen(AsyncSession.sync_session_class, "after_flush", flushed)
+        try:
+            with ExitStack() as guards:
+                for module, name in ((study, "run_study"), (study.execution, "replay_execution"),
+                                     (study.manager, "run_trace"), (study.ledger, "replay_accounting"),
+                                     (study.evidence, "evaluate_evidence"), (subprocess, "run")):
+                    guards.enter_context(patch.object(module, name, side_effect=AssertionError("native chain replay on GET")))
+                chain_loaded = await study.load_study(sessions, chain_ref)
+                chain_experiment = await catalog.get_experiment(chain_created["experiment_id"])
+            check("native_chain_read_only_roundtrip_exact_economics", chain_loaded.get("available") is True
+                  and chain_loaded.get("report") == chain_report)
+            check("native_chain_catalog_read_remains_inactive_draft", chain_experiment is not None
+                  and chain_experiment["status"] == "DRAFT"
+                  and chain_experiment["shadow_started_at"] is None)
+            check("native_chain_read_has_no_replay_writes_commits_flushes", not write_attempts
+                  and not commits and not flushes and len(read_sql) >= previous_read_count + 2)
+        finally:
+            for item in chain_guarded_engines:
+                event.remove(item.sync_engine, "before_cursor_execute", read_only_sql)
+            event.remove(AsyncSession.sync_session_class, "after_commit", committed)
+            event.remove(AsyncSession.sync_session_class, "after_flush", flushed)
         check("no_new_tables_or_columns", await schema_signature() == schema_before)
         check("zero_tcp_udp_dns_foreign_unix", NETWORK == {"tcp_udp": 0, "dns": 0, "foreign_unix": 0}, NETWORK)
         print("LIVE_EVENT_STUDY_PG_OK", len(CHECKS), flush=True)

@@ -3077,3 +3077,28 @@ Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
   recuperação automática nova. Detalhes e retomada:
   `LIVE_PYRAMID_PREFLIGHT_FIX.md` / `LIVE_EVENT_STUDY_CHECKPOINT.md`.
 - Commit somente local; nenhum push/deploy nesta etapa.
+
+## 14/10/2026 — portas PYRAMID e cadeia por eventos (base 31523017)
+
+- Adicionadas portas explícitas de proteção/posição/saldo/autoridade/leitura e
+  writer ao adapter isolado; consumo de memória versionada, reserva inicial
+  real do reforço, risco confirmado e proposal/final-check dos callers nativos.
+  Persistência declarada RECEIPT_BOUND_SIMULATED_PORTS, não autoridade PG real.
+- Cadeia ENTRY → MANAGEMENT → PYRAMID → MANAGEMENT provada LONG/SHORT com
+  fills próprios/ledger; identidade, qty inicial, entry-base, relógios e IDs
+  preservados. Carteira causal não antecipa reforço, resultado ou liberação.
+  UNKNOWN retém capacidade; fill parcial não vira quantidade planejada.
+- Dois defeitos reais do caller LIVE anterior corrigidos no escopo autorizado:
+  TF original lido por FK (RealTrade não possui timeframe), e TP1 já realizado
+  não vira obrigação futura no preflight pós-TP1. TP2/risco/margem/autoridade
+  e todos os defaults continuam exigidos; entrada normal preserva RR1.
+- Provas: 170 focais consolidados OK; backend 3.179 executados, 3.177 aprovados
+  e 2 skips históricos R05C; PG16/asyncpg descartável 50 checks OK 2×, risco
+  retido 21 OK. Sintaxe 10 Python e diff-check OK, nenhum frontend/DDL novo.
+- Lote integral permanece LOCAL_RESEARCH_PARTIAL: sizing upstream, export
+  bruto com todos os excluídos e carteira financeira integral ainda técnicos.
+  A réplica de caixa/Binance não é provada: partial_cash_recognized=false,
+  broker_balance_replica=false. Nenhuma aprovação operacional ou lucro alegado.
+- Detalhes: LIVE_PYRAMID_EVENT_CHAIN.md / LIVE_EVENT_STUDY_CHECKPOINT.md.
+  Pessoais, posição manual, histórico, flags/limites preservados. Sem acesso
+  a produção, ordem, ativação, mensagem real, push ou deploy; commit local.

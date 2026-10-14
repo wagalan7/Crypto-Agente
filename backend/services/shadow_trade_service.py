@@ -4554,9 +4554,12 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
 
 async def _market_entry_preflight_checks(*, rec, side, entry, stop, tp1, tp2,
                                           intent, final_qty, market_rules,
-                                          depth_fn, chase_ceiling):
+                                          depth_fn, chase_ceiling, tp1_completed: bool = False):
     from services import risk_service, kill_switch_service
     """Depth/runtime guard executado pelo transport antes do POST."""
+    if type(tp1_completed) is not bool or (tp1_completed and tp1 is not None):
+        return {"ok": False, "quality": "UNKNOWN",
+                "reason_code": "EXEC_REVALIDATION_STAGE_INVALID", "checks": {}}
     if not P04B_MARKET_REVALIDATION_ENABLED:
         return {
             "ok": False, "quality": "UNKNOWN",
@@ -4675,7 +4678,7 @@ async def _market_entry_preflight_checks(*, rec, side, entry, stop, tp1, tp2,
         max_book_impact_pct=P04B_MAX_BOOK_IMPACT_PCT,
         max_adverse_slippage_pct=P04B_MAX_MARKET_SLIPPAGE_PCT,
         max_chase_atr=chase_ceiling,
-        min_rr_tp1=max(
+        min_rr_tp1=0.0 if tp1_completed else max(
             MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
             MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0,
         ),
@@ -4753,7 +4756,7 @@ async def _market_entry_preflight_checks(*, rec, side, entry, stop, tp1, tp2,
             "max_book_impact_pct": P04B_MAX_BOOK_IMPACT_PCT,
             "max_adverse_slippage_pct": P04B_MAX_MARKET_SLIPPAGE_PCT,
             "max_chase_atr": chase_ceiling,
-            "min_rr_tp1": max(
+            "min_rr_tp1": 0.0 if tp1_completed else max(
                 MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
                 MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0),
             "min_rr_tp2": (MIN_RR_TP2_EXEC if RR_GATE_ENABLED else 0.0),
@@ -4919,6 +4922,27 @@ async def _pyramid_legacy_caps(same_dir, *, entry, qty, equity):
     return True
 
 
+async def _pyramid_original_timeframe(same_dir):
+    """Timeframe comprovado da recomendação original; ausência NÃO é 'na'.
+
+    RealTrade não contém timeframe. O vínculo é a FK existente, não a nova
+    recomendação que disparou a possibilidade de reforço.
+    """
+    snapshot_id = getattr(same_dir, "recommendation_id", None)
+    if isinstance(snapshot_id, bool) or not isinstance(snapshot_id, int) or snapshot_id <= 0:
+        return None
+    from db import get_session
+    from models.recommendation_snapshot import RecommendationSnapshot
+    from sqlalchemy import select
+    async with get_session() as session:
+        original = (await session.execute(select(RecommendationSnapshot.timeframe)
+                    .where(RecommendationSnapshot.id == snapshot_id))).scalar_one_or_none()
+    if original not in {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h",
+                         "1d", "3d", "1w", "1M"}:
+        return None
+    return original
+
+
 async def _maybe_pyramid(same_dir, rec: dict) -> bool:
     """
     Feature 5 — reforço (pyramiding) de um winner já em breakeven pós-TP1.
@@ -5047,7 +5071,11 @@ async def _maybe_pyramid(same_dir, rec: dict) -> bool:
         if identity is None:
             return False
         # TF/playbook do reforço não mudam com a nova recomendação.
-        identity = replace(identity, timeframe=str(same_dir.timeframe or "na"),
+        original_timeframe = await _pyramid_original_timeframe(same_dir)
+        if original_timeframe is None:
+            log.warning("[pyramid] %s timeframe original não comprovado", symbol)
+            return False
+        identity = replace(identity, timeframe=original_timeframe,
                            playbook=f"PYRAMID-{same_dir.id}-{level + 1}",
                            playbook_version="1")
         wallet = await exchange_service.get_equity(force=True)
@@ -5080,7 +5108,8 @@ async def _maybe_pyramid(same_dir, rec: dict) -> bool:
                 intent=intent, final_qty=final_qty, market_rules=market_rules,
                 depth_fn=getattr(exchange_service, "get_execution_depth", None),
                 chase_ceiling=(P04A_MAX_CHASE_ATR if P04A_MAX_CHASE_ATR is not None
-                               else PROXIMITY_MAX_ATR))
+                               else PROXIMITY_MAX_ATR),
+                tp1_completed=True)
             if verdict.get("ok") is not True:
                 return verdict
             # Tetos nominais no preço/qty efetivamente aprovados, não no mark

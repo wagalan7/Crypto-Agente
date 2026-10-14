@@ -73,3 +73,43 @@ Verificação final desse ajuste: 50 focais verdes 2×, PG16/asyncpg descartáve
 históricos R05C. Logs e runner reproduzível no relatório do preflight. Não
 confundir esta prova de correção local com aprovação operacional da conta ou
 com conclusão da réplica econômica PYRAMID.
+
+## Retomada de 14/10 — portas e cadeia PYRAMID
+
+Base `31523017`. Portas de posição/proteção/autoridade/reserva/DB explícitas e
+vinculadas, estado versionado e continuação exata do gestor implementados.
+Positivos LONG/SHORT completos com fills próprios e ledger nativo verificados.
+PYRAMID sem obrigação nova de proteção executa o no-op real, sem SL fabricado.
+Reserva usa a intenção efetiva do reforço, não a admissão genérica ENTRY.
+Carteira global causal conserva reservas durante a espera, usa fill efetivo,
+preserva risco confirmado e não antecipa resultado de prova posterior.
+
+Duas falhas reais da correção anterior foram demonstradas e corrigidas:
+`RealTrade.timeframe` inexistente (consulta agora a FK original, fail-closed),
+e preflight exigindo TP1 já realizado (estágio pós-TP1 explícito somente no
+reforço, todos os requisitos de TP2 e segurança preservados).
+
+O lote integral continua **LOCAL_RESEARCH_PARTIAL**: sizing upstream, export
+bruto causal com excluídos e carteira/caixa integral ainda são técnicos.
+Persistência das portas é simulada; PG prova o catálogo/relatório, não o SL real.
+Não repetir V1/ledger/portas já provados. Não afirmar réplica exata aprovada.
+Relatório: `LIVE_PYRAMID_EVENT_CHAIN.md`.
+
+Provas finais com fontes congeladas:
+
+- 170 focais na chamada consolidada correta: OK. Os mesmos 161 casos de
+  execução/portas/cadeia/study/preflight também passaram nas duas chamadas
+  iniciais; essas chamadas tiveram erro de loader por nome incorreto do módulo
+  de risco (erro do comando, não contado como aprovação de suíte). O nome foi
+  corrigido; os 9 testes de risco passaram separadamente 2× e na consolidação.
+- Backend completo: 3.179 executados / 3.177 aprovados / somente 2 skips
+  históricos R05C por fixture auditada privada ausente. Nenhum skip novo.
+- PG16 descartável: 50 checks OK 2×, incluindo cadeia real isolada, ingestão,
+  restart JSONB e GET sem motores/escrita; regressão de risco retido 21 checks
+  OK. Clusters encerrados, zero TCP/DNS/Unix externo no harness de estudo.
+- Sintaxe dos 10 Python e diff-check OK; sem TS/TSX/dist, TSC não se aplica.
+- Logs: `/tmp/cw_pyramid_chain_focus_final.log`,
+  `/tmp/cw_pyramid_chain_risk_{1,2}.log`, `/tmp/cw_pyramid_chain_full.log`,
+  `/tmp/cw_pyramid_chain_pg_{1,2}.log`, `/tmp/cw_pyramid_chain_pgrisk.log`.
+
+Commit somente local. Nenhum acesso externo, ordem, ativação, push ou deploy.
