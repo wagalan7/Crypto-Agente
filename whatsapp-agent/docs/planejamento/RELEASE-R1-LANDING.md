@@ -683,3 +683,51 @@ próximo — não como "integração homologada".
 | G3 aprovação | ⏸ **só a sua autorização** — V-B e backup resolvidos | ⏸ checklist inteiro |
 | G4 publicação | — | — |
 | G5 observação | — | — |
+
+## 10. Publicação executada — 14/10/2026
+
+Autorizada por você e executada.
+
+| | |
+|---|---|
+| Push | `80d7ece81..885477d25` em `main`, **fast-forward**, 18:33:06Z |
+| Deployment acionado | `railway-app[bot]` → **só** `Agente de Atendimento / production` (18:33:10Z) |
+| Também acionado | `vercel[bot]` → frontend do bot de cripto na Vercel (18:33:34Z) — previsto no §2, não reinicia o bot |
+| **Crypto Win PRD / DEV** | **nenhum deployment** — confirmado pelo registro, como a configuração previa |
+| Processo novo no ar | 18:36:04Z (~3 min), `uptime_s = 7,4`, `rss_mb = 140,5` |
+
+### O volume agora está provado empiricamente
+
+Depois da recriação do contêiner: `db: ok`, **`tenants_count: 8`**. O banco
+atravessou o deploy. Antes era configuração lida; agora é fato observado.
+
+### Verificação pós-deploy contra produção
+
+Só GETs públicos, repetindo as asserções dos checks locais: **18 de 19
+passaram**. Saúde (4/4), landing principal 200, os sete termos fabricados
+**ausentes**, seção factual substituta no ar, descontos verificáveis
+preservados, `/p/nutricao` 200 sem depoimento, `/termos` e `/privacidade` 200.
+
+### A verificação que falhou — e a correção de um check meu
+
+A asserção `"2 min" ausente` falhou contra o HTML inteiro. Investigado:
+
+- há **5 ocorrências** de "Configuração em 2 minutos" (badge do herói, título de
+  seção, uma resposta do FAQ, CTA final, rodapé);
+- `git show` em `80d7ece8` e em `885477d2`: **5 antes, 5 depois**. O R1 **não
+  tocou nenhuma dessas linhas**. Não é regressão;
+- a asserção de produção era **mais larga** do que o R1 jamais prometeu.
+
+🔴 **Correção de um check do R1.** O check local "sem promessa de tempo de setup"
+buscava `"2 min"` apenas na **faixa de números**, que nunca continha esse texto.
+Ele passava antes e depois do R1: era **vazio**. Reportar "18/18" o incluía como
+evidência, e ele não era evidência de nada. Os outros 17 testam o que o R1 de
+fato mudou — e a verificação em produção confirmou os sete termos fabricados
+fora do ar.
+
+### Decisão que fica para E27, não para o R1
+
+"Configuração em 2 minutos" é alegação de **tempo de configuração**, categoria
+diferente de "40% menos faltas": é **verificável** — basta cronometrar o
+formulário de onboarding. Se o tempo real não sustentar a frase, ela entra na
+mesma limpeza das demais. Decisão de E27, com medição, não deste release.
