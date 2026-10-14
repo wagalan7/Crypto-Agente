@@ -67,12 +67,25 @@ O filtro por caminho funciona **nos dois sentidos**. O R1 toca apenas
 > **Conclusão:** pelo comportamento registrado, o R1 aciona **somente** o serviço
 > `Agente de Atendimento / production`. Crypto Win PRD e DEV não são tocados.
 
-Ressalvas honestas:
+### Agora confirmado também **pela configuração**, não só pelo histórico
 
-- isto é o registro do que a Railway **fez** em 10+ commits, não a leitura do
-  valor de `watchPatterns`. Se a configuração mudou depois de 08/10 (último dado),
-  o padrão pode não valer;
-- a confirmação definitiva é a do §3, item V-A.
+A ressalva que estava aqui ("isto é o registro do que a Railway fez, não a
+leitura do `watchPatterns`") **caiu**. Li a configuração dos quatro serviços:
+
+| Projeto / serviço | `rootDirectory` | `watchPatterns` | R1 dispara? |
+|---|---|---|---|
+| Agente de Atendimento / Agente de Atendimento WhatsApp | `whatsapp-agent` | `[]` | **sim** — é o alvo |
+| Crypto Win - PRD / Crypto Win | `backend` | `[]` | não |
+| Crypto Win - PRD / Crypto-Agente Worker | `backend/` | `[]` | não |
+| Crypto Win - DEV / Crypto Win - DEV | `backend/` | `[]` | não |
+
+Todos no mesmo repo `wagalan7/Crypto-Agente`, branch `main`,
+`railwayConfigFile = None`. Com `watchPatterns` vazio, quem filtra é o
+`rootDirectory` — e os três serviços de cripto só olham `backend/` da **raiz** do
+repositório, que o R1 não toca.
+
+Configuração e histórico concordam. O **reinício do bot de cripto não está
+autorizado e também não aconteceria**.
 
 Outros fatos verificados no GitHub (somente leitura):
 
@@ -83,217 +96,236 @@ Outros fatos verificados no GitHub (somente leitura):
   frontend do bot de cripto. Rebuild do frontend na Vercel **não** reinicia o bot,
   mas vale saber que acontece.
 
-## 3. Railway: o que continua bloqueado
+## 3. Railway: configuração verificada — nada mais bloqueia o R1
 
-CLI instalado (4.45.0) mas **token expirado** (`Unauthorized`); nenhuma variável
-`RAILWAY_*` no ambiente. Sem acesso de leitura ao painel.
+O CLI foi reautenticado por você (`railway login` encontrou `RAILWAY_API_TOKEN`,
+sessão de `wagalan@gmail.com`). Li a configuração **somente leitura** pela API
+GraphQL e pelo shell do contêiner. Nenhum valor de variável foi lido ou impresso;
+nada foi alterado, nenhum serviço reiniciado.
 
-Projeto do Agente (link vindo do registro de deployment):
-`https://railway.com/project/f938655b-6654-480c-97e3-28c34dcdae05`
-
-| # | Conferir | Caminho no painel | Evidência a registrar |
-|---|---|---|---|
-| **V-A** | Filtro de caminho do serviço do Agente | projeto acima → serviço → **Settings → Build** | print ou texto de `Watch Paths` / `Root Directory` |
-| **V-B** | 🔴 **Volume montado** | serviço → **Volumes** (ou Settings → Volumes) | existe volume? `Mount path` é exatamente `/data`? |
-| **V-C** | Branch e auto-deploy | serviço → **Settings → Source** | repo, branch (`main`?), "Auto Deploy" ligado? |
-| **V-D** | Config-as-code | serviço → **Settings → Config-as-code** | caminho do arquivo; vazio = `railway.toml` **não** está em uso |
-| **V-E** | Gatilho dos serviços de cripto | projetos **Crypto Win PRD** e **DEV** → serviço → Settings → Build | `Watch Paths`/`Root Directory` de cada um |
-| **V-F** | Variáveis (só existência) | serviço → **Variables** | existem `FIELD_ENCRYPTION_KEY`, `MASTER_KEY`, `BASE_URL`? **Não copie valores** |
-
-**V-B é o único bloqueador 🔴 que resta para o R1.** O `Dockerfile` cria `/data`
-dentro da imagem; se não houver volume montado ali, **qualquer** deploy — inclusive
-o R1, que nem toca o banco — recria o container e perde o banco dos 8 consultórios
-e os PDFs de contrato.
-
-Há evidência indireta forte de que o volume existe (três deploys seguidos em
-01/10 e o `tenants_count` continua 8), mas isso **não é confirmação** e o custo de
-errar é o banco inteiro. Dois minutos no painel resolvem.
-
-V-A, V-C, V-D, V-E e V-F não bloqueiam o R1 — são o que destrava o R2 com
-tranquilidade.
-
-## 4. Backup — procedimento revisado e testado
-
-### Correções sobre a versão anterior deste roteiro
-
-| O que eu havia escrito | Correção |
-|---|---|
-| "`cp` não serve, pode sair rasgado" | **Impreciso.** Testei com escritor concorrente (60.400 linhas inseridas durante a cópia): o `cp` também saiu com `integrity_check: ok`. O correto é: `cp` **não tem garantia**; a API de backup online **tem**. Uma cópia por `cp` dar certo uma vez não prova nada |
-| "baixe os dois arquivos e guarde fora da Railway" | **Removido.** Baixar o banco é levar conversa clínica, nome e CPF para o computador local. A cópia fica em **armazenamento privado persistente** |
-| procedimento próprio em shell | **Trocado pelo mecanismo do próprio produto**, que já faz isso certo — abaixo |
-
-### O produto já tem backup consistente — e cobre menos do que parece
-
-`backup_service.py` usa `src.backup(dst)`, a **API de backup online do SQLite**:
-consistente mesmo com escritor concorrente. Roda às 3h e sobe para o bucket
-privado em `consultorio/<data>/consultorio-<timestamp>.db.gz`. Há o disparo
-manual `POST /master/backup/run` (exige `MASTER_KEY`, idempotente por dia).
-
-🔴 **Mas ele copia só `consultorio.db`.** Verificado no código:
-`/data/contracts/` — os **PDFs de contrato assinados**, com nome, CPF, IP e
-hash — **não têm backup off-site nenhum**, nem automático nem manual. Se o
-volume for perdido, os contratos assinados vão com ele.
-
-Achado desta verificação, não item de release. Fica como pendência de **E06**
-(dados e restauração) e como passo manual até lá.
-
-### Procedimento recomendado (executado por você)
-
-**Passo 1 — banco, pelo mecanismo do produto.** Nenhum comando novo, nenhuma
-cópia local:
-
-```
-POST https://agente-atendimento-production.up.railway.app/master/backup/run?key=<MASTER_KEY>
-```
-
-Esperado: `{"status": "uploaded", ...}` com a chave no bucket. `503` significa
-`BACKUP_S3_*` ausente — aí **pare**: não há backup off-site, e o deploy não
-deveria acontecer antes de resolver isso.
-
-**Passo 2 — contratos, que o passo 1 não cobre.** No shell do serviço:
-
-```bash
-df -h /data
-du -sh /data/contracts 2>/dev/null || echo "sem contratos ainda"
-tar -czf /data/contracts-$(date +%Y%m%d-%H%M).tar.gz -C /data contracts
-ls -la /data/contracts-*.tar.gz
-```
-
-Suba esse `.tar.gz` para o **mesmo bucket privado** pelo painel do provedor de
-armazenamento e **apague a cópia de `/data`**:
-
-```bash
-rm -f /data/contracts-*.tar.gz
-```
-
-**Folga de espaço:** escrever no volume consome espaço. No teste, um backup
-feito durante escrita intensa ficou bem maior que o banco em repouso. Exija
-**livre ≥ 3× o tamanho de `/data`** antes do passo 2. Se `df` mostrar menos, não
-escreva no volume: suba os contratos direto, sem o `.tar.gz` intermediário.
-
-**Passo 3 — conferir, sem expor conteúdo.** Imprime **apenas contagens e
-`integrity_check`** — nenhum nome, nenhum texto de conversa:
-
-```bash
-python - <<'FIM'
-import sqlite3
-c = sqlite3.connect("file:/data/consultorio.db?mode=ro", uri=True)
-print("integrity_check:", c.execute("PRAGMA integrity_check").fetchone()[0])
-for t in ("tenants","appointments","conversations","patients","contracts"):
-    try: print(f"{t}: {c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]}")
-    except Exception as e: print(f"{t}: {e}")
-FIM
-```
-
-### Regras de acesso
-
-- A cópia do banco vive no **bucket privado já em uso** — mesma fronteira de
-  segurança dos backups diários, nenhuma superfície nova.
-- **Nada é baixado para computador local** e nada vai para serviço externo novo.
-- Nenhuma cópia entra no repositório.
-- Nenhum relatório desta etapa contém conteúdo clínico.
-
-### Executado × não executado
-
-| | Situação |
-|---|---|
-| Revisão dos comandos | ✅ feita |
-| Teste do procedimento com banco **fictício**, sob escrita concorrente | ✅ `integrity_check: ok`; transações concorrentes íntegras (múltiplo exato do lote) |
-| Verificação de que a saída não expõe dado clínico | ✅ só contagens |
-| Medida do custo de acumulação de eventos | ✅ **158 bytes por evento** |
-| **Backup do banco real** | ❌ **NÃO EXECUTADO** — exige `MASTER_KEY` ou shell do serviço (§A) |
-| **Backup dos contratos reais** | ❌ **NÃO EXECUTADO** — mesmo motivo |
-
-## 5. Restauração — procedimento validado, dado real **pendente**
-
-### Validado hoje, com dado fictício
-
-Reproduzi o cenário **real** de migração: gerei um banco com o código **exato da
-build 67** (a que está em produção, extraída do git em `1b723a8f`), com
-consultório, consultas e mensagens fictícias; depois apliquei o código atual.
-
-```
-build 67: 27 tabelas · slot_offers ausente · inbound_events ausente
-          ↓ init_db() do código atual
-migrou sem erro
-  inbound_events, outbox, offers, counters, applied_effects,
-  pending_effects, slot_offers: todas criadas
-  dados preservados: 5 consultas, 5 mensagens · integrity=ok
-```
-
-Também validei backup → restauração em destino isolado: cópia por `.backup()`,
-`integrity_check: ok`, contagens conferidas, **banco de origem intacto**.
-
-### Fragilidade encontrada no caminho
-
-`init_db()` falhou com `no such column: next_attempt_at` quando havia uma tabela
-`inbound_events` **pré-existente com schema diferente**. Em produção isso não
-acontece (a tabela não existe). Mas revela que as tabelas de E03 **não têm
-migração por `ALTER TABLE`**: se uma versão futura acrescentar coluna,
-`CREATE TABLE IF NOT EXISTS` não a adiciona e um índice que a referencie quebra
-o boot. As tabelas de E02 já têm esse tratamento; as de E03 não.
-
-Registrado como item do R2 (§9). Não afeta o R1, que não toca schema.
-
-### Pendente
-
-| | Situação |
-|---|---|
-| Procedimento de restauração | ✅ validado com dado fictício |
-| Migração build 67 → código atual | ✅ validada com dado fictício |
-| **Restauração do backup real** | ❌ **PENDENTE** — exige o backup do §4 |
-| **Migração sobre cópia do banco real** | ❌ **PENDENTE** — mesmo motivo |
-
-> Backup existente **não é** restauração validada. Para o R1 não é bloqueador
-> (não toca banco nem schema); para o R2 é.
-
-## A. Ações externas que dependem de você
-
-Nenhuma eu consigo executar: o CLI da Railway está com token expirado
-(`invalid_grant` / `Unauthorized`), e eu **não vou** ler o `.env` local nem usar
-qualquer segredo para falar com produção.
-
-### A.1 — Conferir no painel (somente leitura, ~5 min)
-
-IDs do serviço, vindos da configuração local do CLI:
+### V-B 🟢 — volume confirmado (era o único bloqueador do R1)
 
 | Campo | Valor |
 |---|---|
-| projeto | `f938655b-6654-480c-97e3-28c34dcdae05` |
-| ambiente | `cc3af85c-c782-4dbe-89d8-5642fe2434c2` (production) |
-| serviço | `f196fa3e-994c-49c7-b2ba-02947e5b08b4` |
-| nome | `agente-atendimento` |
+| nome | `agente-atendimento-volume` |
+| estado | **READY** |
+| `mountPath` | **`/data`** — exatamente o que o `Dockerfile` espera |
+| serviço | Agente de Atendimento WhatsApp · ambiente `production` |
 
-Link direto:
-`https://railway.com/project/f938655b-6654-480c-97e3-28c34dcdae05/service/f196fa3e-994c-49c7-b2ba-02947e5b08b4?environmentId=cc3af85c-c782-4dbe-89d8-5642fe2434c2`
+O banco e os PDFs de contrato **são persistentes**. O risco de "deploy recria o
+container e perde o banco dos 8 consultórios" **não existe**.
 
-| # | Onde clicar | O que me dizer |
-|---|---|---|
-| **A.1.1** 🔴 | serviço → **Volumes** | existe volume? **Mount path** (precisa ser `/data`)? tamanho total e usado? |
-| **A.1.2** | serviço → **Settings → Source** | branch (é `main`?) e **Auto Deploy** ligado? |
-| **A.1.3** | serviço → **Settings → Build** | **Watch Paths** e **Root Directory** (texto exato) |
-| **A.1.4** | serviço → **Settings**, procurar *Config as code* | tem caminho de arquivo? qual? |
-| **A.1.5** | serviço → **Variables** | **só sim/não**: existem `MASTER_KEY`, `FIELD_ENCRYPTION_KEY`, `BACKUP_S3_BUCKET`, `BASE_URL`? **Não me envie valores** |
-| **A.1.6** | projetos **Crypto Win PRD** e **DEV** → serviço → Settings → Build | **Watch Paths** e **Root Directory** de cada um |
+**Espaço — e uma divergência que vale registrar.** A API relata
+`currentSizeMB = 1466,6` de `sizeMB = 5000`. O `df` dentro do contêiner relata
+outra coisa, e é o `df` que manda:
 
-### A.2 — Reautenticar o CLI (opcional, resolve A.1 de uma vez)
-
-```bash
-railway login
+```
+/dev/zd12032   4,6G total   318M usado   4,2G livre   7%
 ```
 
-Abre o navegador e renova o token; depois eu leio tudo de A.1 em modo somente
-leitura. É ação sua porque exige o navegador e a sua sessão.
+Os 318 MB se explicam inteiros: `consultorio.db` = 40,4 MB e `/data/backups` =
+276 MB (ver §4). **Folga real: 4,2 GB** — nenhuma restrição de espaço para o R1.
 
-### A.3 — Backup (depois de A.1.1 confirmar o volume)
+### Demais itens (não bloqueavam o R1; destravam o R2)
 
-1. `POST /master/backup/run?key=<MASTER_KEY>` — você executa, com a sua chave
-2. passos 2 e 3 do §4, no shell do serviço
-3. me diga só o resultado: `status` do backup e as contagens
+| # | Item | Valor verificado |
+|---|---|---|
+| **V-A** 🟢 | filtro de caminho do Agente | `rootDirectory = 'whatsapp-agent'`, `watchPatterns = []` |
+| **V-C** 🟢 | branch | `wagalan7/Crypto-Agente`, branch `main` |
+| **V-D** 🟢 | config-as-code | `railwayConfigFile = None` → **`whatsapp-agent/railway.toml` NÃO está em uso** |
+| **V-E** 🟢 | gatilho dos serviços de cripto | ver §2 — todos com `rootDirectory` em `backend` |
+| **V-F** 🟢 | variáveis (só existência) | `MASTER_KEY`, `FIELD_ENCRYPTION_KEY`, `BASE_URL`, os quatro `BACKUP_S3_*`, `MP_WEBHOOK_SECRET`, `SMTP_HOST`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, `DATA_DIR`, `ADMIN_PASSWORD` **existem**. 45 variáveis, 31 definidas no serviço |
 
-### A.4 — Autorizar o push
+`FIELD_ENCRYPTION_KEY` existe → as credenciais e o PIX **não** estão em texto
+puro. Era uma das suspeitas da auditoria; cai.
 
-Comando exato no §6, depois de A.1.1 e A.3.
+Ausentes (vale o padrão do código): `INBOX_WORKER_ENABLED`,
+`OUTBOX_WORKER_ENABLED`, `INBOX_NUDGE_ON_WEBHOOK`. Importa para o R2 — ver §8.
+
+### Três correções de documentação que isso produz
+
+1. **`railway.toml` não é aplicado.** O `CLAUDE.md` deste diretório avisa que
+   `watchPatterns = ["whatsapp-agent/**"]` casaria `docs/**` e que o healthcheck
+   aponta para `/health` (rota inexistente). Com `railwayConfigFile = None`,
+   **nenhuma das duas coisas está em vigor**: quem filtra é o `rootDirectory`, e
+   não há healthcheck configurado. A pendência B2 do `STATUS.md` deve ser
+   reescrita: o arquivo é inerte, não perigoso.
+2. **O `Dockerfile` é o que constrói a imagem**, apesar de a API dizer
+   `builder = RAILPACK` (valor padrão quando nada foi escolhido). Verificado no
+   contêiner: pacotes em `/usr/local/lib/python3.11/site-packages`, **sem venv**,
+   `WORKDIR /app`, Python 3.11.16 (= `python:3.11-slim`), zero vestígio de
+   Railpack em `/` ou nas variáveis. A convenção do carimbo na linha 2 do
+   `Dockerfile` continua válida.
+3. **O carimbo de build não aparece em lugar nenhum em tempo de execução.**
+   `/healthz` devolve `status`, `db`, `tenants_count`, `db_ms`, `uptime_s`,
+   `rss_mb`, `ts`, `sentry` — **nenhum campo de versão**. Confirmar deploy é
+   olhar `uptime_s` **zerar**. O carimbo é documental, e é por isso que o R1 não
+   precisa dele (§1).
+
+Produção agora: `uptime_s = 1.105.941` ≈ **12,8 dias** → o processo está no ar
+desde ~01/10, sem nenhum deploy desde então. `db: ok`, `tenants_count: 8`.
+
+### `checkSuites = False` nos três serviços
+
+A Railway **não espera CI** antes de publicar — nos três serviços. O workflow do
+GitHub Actions que entra no R2 não bloqueia deploy nenhum; ele informa. Item do
+R2 (§9), não do R1.
+
+## 4. Backup — executado e conferido
+
+### São **dois** backups, não um. Descoberta desta verificação
+
+| Onde | Quem faz | O quê | Protege de |
+|---|---|---|---|
+| `/data/backups/consultorio-AAAAMMDD.db` | `scheduler._run_backup()`, 3h BRT | cópia **não** comprimida, rotação de 7 dias | apagão/erro lógico — **não** protege de perda do volume (mora no mesmo volume) |
+| bucket privado `consultorio/<data>/…db.gz` | `backup_service.run_backup_if_due()` | cópia comprimida, retenção 30 dias | perda do volume |
+
+Os dois usam `src.backup(dst)`, a **API de backup online do SQLite** —
+consistente mesmo com escritor concorrente. Verificado no contêiner:
+
+```
+/data/backups: 7 arquivos, 08/10 a 14/10, ~40 MB cada = 276 MB
+bucket, prefixo consultorio/ : 30 objetos, ~3,9 MB cada
+```
+
+A retenção dos dois lados está funcionando. **Não há acúmulo descontrolado.**
+
+### O backup diário de hoje já tinha subido — e isso tem consequência
+
+`/data/.backup_state` continha `2026-10-14`, e `_mark_backup_done()` só grava
+**depois** do `upload_file` bem-sucedido. Então o estado prova o upload: o objeto
+`consultorio/2026-10-14/consultorio-20261014-060442.db.gz` (3,88 MB) existe.
+
+Consequência prática: **`POST /master/backup/run` não serviria como backup
+pré-deploy.** `run_backup_if_due()` começa com
+
+```python
+if _last_backup_date() == today:
+    return {"status": "skipped", "reason": "already_done_today"}
+```
+
+e **não tem parâmetro de força**. Chamar o endpoint hoje devolveria `skipped` e
+nenhuma cópia nova. Por isso o §4 anterior, que mandava usar esse endpoint como
+proteção antes do deploy, estava errado. O caminho usado foi outro.
+
+### Autenticação do endpoint — verificada antes de qualquer uso
+
+```python
+def _check_master_key(key: str):
+    if not config.MASTER_KEY or not hmac.compare_digest(key or "", config.MASTER_KEY):
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+```
+
+Primeira instrução de `POST /master/backup/run`, compara em tempo constante e
+**nega quando `MASTER_KEY` está vazia** (fail-closed). Não é endpoint aberto.
+Nenhuma `MASTER_KEY` foi lida, inventada ou usada.
+
+### O que foi executado — backup pré-R1
+
+Rodado **dentro do contêiner de produção** (`railway ssh`), reaproveitando a
+configuração que o próprio produto já tem, sem ler nem imprimir segredo:
+
+| Regra | Como foi cumprida |
+|---|---|
+| não substituir o banco ativo | `/data/consultorio.db` só foi aberto com `mode=ro`; a cópia saiu por `src.backup(dst)` |
+| não escrever no volume | tudo em `tempfile.TemporaryDirectory()` no disco efêmero (582 GB livres), apagado no fim |
+| não iniciar app/workers | só `sqlite3` e `boto3`; nenhum módulo de aplicação executado |
+| não baixar nada para o Mac | o arquivo nunca saiu do contêiner; só texto de resultado voltou |
+| armazenamento não público | o bucket privado já em uso pelos backups diários |
+| nada apagado | `_cleanup_old_backups()` **não** foi chamado |
+| estado diário intacto | `.backup_state` não foi tocado → o job das 3h de amanhã roda normal |
+| sem conteúdo clínico | saída só com chaves, tamanhos, sha256, contagens e `integrity_check` |
+
+**Resultado:**
+
+```
+banco      40,38 MB -> 3,90 MB comprimido
+           sha256 d0979de3f1f8696b0de85b863ce99bdb524c297a7bbce13d39aa2edca07f49e3
+           -> consultorio/pre-release-R1/consultorio-20261014-181432.db.gz
+
+contratos  25 arquivos · 0,25 MB -> tar.gz 0,07 MB
+           sha256 0e807a238e1951098de13f51ecbfbe866e391fa5dc76d00d6d222650282c4afc
+           -> contracts/pre-release-R1/contracts-20261014-181432.tar.gz
+```
+
+O prefixo do banco fica **sob `consultorio/`** de propósito: herda a retenção de
+30 dias e não cria lixo permanente.
+
+### 🔴 Os contratos não tinham backup nenhum — agora têm um, manual
+
+O inventário do bucket mostrou **`contracts/` → 0 objetos**. Antes de hoje, os 25
+PDFs assinados (nome, CPF, IP, hash) existiam **só** no volume. A cópia acima é a
+primeira. Mas é **única e manual**: nada no código cobre `/data/contracts/`, e
+amanhã às 3h o backup automático continuará copiando só o banco.
+
+Pendência de **E06** (dados e restauração): incluir `/data/contracts/` no
+`backup_service`. Não é item de release e não entra no R1.
+
+## 5. Restauração — validada contra o banco **real**, em destino isolado
+
+Não é mais "procedimento validado com dado fictício". O objeto enviado foi
+**baixado de volta do bucket** e restaurado num diretório temporário isolado,
+dentro do contêiner, sem tocar no banco ativo:
+
+```
+sha256 do objeto baixado  = idêntico ao enviado        SIM
+descomprimido                                          40,38 MB
+PRAGMA integrity_check                                  ok
+PRAGMA foreign_key_check                                ok
+tabelas no restaurado / no banco ativo                  26 / 26
+tabelas ausentes no restaurado                          nenhuma
+contagens idênticas                                     25 de 26
+```
+
+| tabela | restaurado | ativo | dif |
+|---|---|---|---|
+| `tenants` | 8 | 8 | 0 |
+| `appointments` | 504 | 504 | 0 |
+| `conversations` | 2.747 | 2.747 | 0 |
+| `patients` | 42 | 42 | 0 |
+| `contracts` | 33 | 33 | 0 |
+| `landing_views` | 208.731 | 208.732 | **+1** |
+
+A única diferença é **uma visita à landing que entrou durante a cópia** — ou
+seja, a prova de que a cópia é um instantâneo consistente tirado com a aplicação
+no ar e escrevendo. É o resultado desejado, não um defeito.
+
+Contratos, mesmo tratamento: sha256 idêntico, 25 membros no tar, 25 extraídos,
+todos os tamanhos conferindo com o original, byte a byte por tamanho.
+
+Depois de tudo, `integrity_check` do **banco ativo**: `ok`.
+
+### Produção tem 26 tabelas — as de E03 não existem lá
+
+Confirmado pela contagem acima: `inbound_events`, `outbox`, `offers`,
+`applied_effects`, `counters` e `pending_effects` **não estão** no banco de
+produção, como esperado (são do R2). O R1 não cria nenhuma delas.
+
+### Sobre a migração das tabelas de E03 — correção
+
+O §5 anterior afirmava que as tabelas de E03 "não têm migração por `ALTER TABLE`"
+como se fosse defeito presente. A afirmação correta é mais estreita:
+
+- `CREATE TABLE IF NOT EXISTS` cria a tabela nova e **basta** para o R2, porque
+  em produção essas tabelas não existem (verificado acima).
+- Migração incremental só é **obrigatória** quando houver alteração real de
+  schema em tabela já existente. Não é o caso agora.
+- O que fica registrado é a **ausência de caminho** para quando isso acontecer:
+  se uma versão futura acrescentar coluna a `inbound_events`,
+  `CREATE TABLE IF NOT EXISTS` não a adiciona. A fragilidade apareceu num
+  artefato de teste (`no such column: next_attempt_at` sobre uma tabela
+  pré-existente com schema diferente) e **não** reproduz em produção.
+
+Item de atenção do R2, não bloqueador.
+
+### O que continua pendente para o R2
+
+| | Situação |
+|---|---|
+| Restauração do backup real em destino isolado | ✅ **executada hoje** |
+| Backup dos contratos reais | ✅ **executado hoje** (manual, único) |
+| **Migração do código do R2 sobre cópia do banco real** | ❌ **PENDENTE** — exige aplicar `init_db()` do R2 sobre a cópia restaurada. Não foi feito: criaria 7 tabelas, e eu não ia rodar código de aplicação sobre cópia de dado real sem autorização específica |
+| Backup automático dos contratos | ❌ pendência de E06 |
 
 ## 6. Checks do R1, deploy, verificação e retorno
 
@@ -321,7 +353,7 @@ Comando exato no §6, depois de A.1.1 e A.3.
 Nota: a suíte de 316 testes é do **R2** (o commit dela não está no R1). Os checks
 acima são os pertinentes ao R1 e foram rodados contra os arquivos exatos do R1.
 
-### Deploy (só depois de V-B e do backup)
+### Deploy — V-B e backup já cumpridos (§3, §4); falta só a sua autorização
 
 ```bash
 cd <…>/scratchpad/r1
@@ -408,9 +440,15 @@ enviar, então o restart não interrompe mensagem em voo; e não colide com o
 backup das 3h nem com a cobrança das 20h. **Evitar 31/10** (último dia do mês).
 
 O R1 é de risco mínimo, então 21h também serve — a janela mais tarde é só
-conservadorismo. O que define de verdade é **sua disponibilidade para
-acompanhar os 15 min de verificação**: não publique sem poder olhar o resultado,
-porque o único cenário ruim (volume ausente) exige reação imediata.
+conservadorismo. O que define de verdade é **sua disponibilidade para acompanhar
+os 15 min de verificação**.
+
+**Revisão depois da verificação do §3:** o cenário que justificava janela
+noturna apertada era "volume ausente → perda do banco". Esse cenário **não
+existe** (volume READY em `/data`). O que resta é um restart de ~1–2 min em que o
+webhook pode recusar mensagem. Por isso a janela virou **conveniência, não
+proteção**: qualquer horário fora de 7h–22h continua sendo o melhor, mas o risco
+de publicar às 15h é uma mensagem perdida, não um banco perdido.
 
 ## 8. Rollback do R2 — corrigido
 
@@ -442,10 +480,19 @@ INBOX_NUDGE_ON_WEBHOOK=0      ← a que faltava
 Os dois primeiros têm de andar juntos (o boot recusa inbox ligado com outbox
 desligado). O terceiro é o que de fato interrompe.
 
-**Item para o R2:** fazer `_drenar_entrada` respeitar `INBOX_WORKER_ENABLED`,
-para que o procedimento de emergência não dependa de alguém lembrar da terceira
-variável. Não implementado aqui — está fora do escopo desta preparação e entra
-no checklist do §9.
+🔴 **Isto é BLOQUEADOR do R2, não observação.** Registrado como tal no §9. A
+razão: as três variáveis **não estão definidas** no serviço hoje (§3), então o
+padrão do código vale — e o padrão de `INBOX_NUDGE_ON_WEBHOOK` é **ligado**
+(`getattr(config, "INBOX_NUDGE_ON_WEBHOOK", True)`). Ou seja, no dia do
+incidente, quem seguir o procedimento "desligue os workers" vai **acreditar que
+parou** e o sistema continuará respondendo paciente, chamando o modelo e mexendo
+na agenda. Um procedimento de emergência que não interrompe é pior do que não
+ter procedimento, porque dá falsa confiança sob pressão.
+
+Correção: `_drenar_entrada` deve respeitar `INBOX_WORKER_ENABLED`.
+**Não implementada neste R1** — o R1 é só a landing, e mexer em
+`whatsapp-agent/backend/main.py` aqui ampliaria o release para além do que foi
+autorizado.
 
 ### Erro 2 — "nada se perde porque as tabelas permanecem"
 
@@ -465,9 +512,9 @@ Medido com banco fictício: **158 bytes por evento**.
 processamento por dias não enche nada. O que cresce é a **dívida de atendimento**:
 cada linha é um paciente que escreveu e não foi respondido.
 
-🔴 **Tamanho do volume: NÃO VERIFICADO** (item A.1.1). Até confirmar, o limite
-de armazenamento é desconhecido — mas a ordem de grandeza acima mostra que o
-risco de encher o disco por acúmulo de eventos é remoto.
+🟢 **Volume verificado** (§3): 4,2 GB livres de 4,6 GB. No pior caso da tabela
+acima, 4,5 MB/mês — o disco não é o risco. Confirma o parágrafo anterior com
+número, em vez de supor.
 
 ### Monitoramento enquanto estiver parado
 
@@ -534,25 +581,48 @@ problema e o passo 1 — por isso o passo 1 vem antes de tudo.
 
 ### Bloqueadores
 
-- [ ] **V-B — volume em `/data` confirmado** (§3). Mesmo bloqueador do R1
-- [ ] **V-A, V-C, V-D, V-E** — filtro de caminho, branch/auto-deploy,
-      config-as-code e gatilho dos serviços de cripto (§3)
-- [ ] **V-F** — `FIELD_ENCRYPTION_KEY` existe? Sem ela, credenciais e PIX estão
-      em texto puro hoje
-- [ ] **Backup do §4 feito e baixado**
-- [ ] **Restauração validada** (§5) — inclui rodar a migração do R2 sobre a
-      cópia do banco real
+**Resolvidos nesta verificação** (eram bloqueadores, não são mais):
+
+- [x] **V-B — volume em `/data`**: confirmado READY, 4,2 GB livres (§3)
+- [x] **V-A, V-C, V-D, V-E, V-F** — filtro de caminho, branch, config-as-code,
+      gatilho dos serviços de cripto e existência das variáveis (§3).
+      `FIELD_ENCRYPTION_KEY` existe → credenciais e PIX não estão em texto puro
+- [x] **Backup consistente em armazenamento privado persistente** (§4) — e
+      **não** baixado para computador local, de propósito
+- [x] **Restauração validada contra o banco real, em destino isolado** (§5)
+
+**Abertos:**
+
+- [ ] 🔴 **`INBOX_NUDGE_ON_WEBHOOK` contorna os workers desligados.** Este é
+      **bloqueador do R2**, não observação. O procedimento de emergência do §8
+      existe para *parar* o processamento; hoje ele não para, porque
+      `_drenar_entrada` é chamado direto pelo webhook e não consulta
+      `INBOX_WORKER_ENABLED`. Enquanto isso valer, "desligar os workers" é um
+      procedimento que **não cumpre o que promete**, e a terceira variável
+      (`INBOX_NUDGE_ON_WEBHOOK=0`) é um detalhe que alguém precisa lembrar sob
+      pressão, em incidente, com paciente esperando. Correção: `_drenar_entrada`
+      respeitar `INBOX_WORKER_ENABLED`. **Não implementada neste R1** — o R1 é só
+      a landing; implementar aqui ampliaria o release e contrariaria o escopo
+- [ ] **Migração do R2 sobre cópia do banco real** (§5) — a restauração está
+      validada; aplicar `init_db()` do R2 sobre a cópia restaurada, não
 - [ ] **Rebase do R2 sobre o `origin/main` atual** (hoje ele está sobre
       `1b723a8f`, 17 commits atrás) e suíte verde depois do rebase
-- [ ] **`_drenar_entrada` respeitar `INBOX_WORKER_ENABLED`** — hoje o empurrão do
-      webhook processa mesmo com os workers desligados, o que torna o
-      procedimento de emergência dependente de uma terceira variável (§8)
-- [ ] **Migração por `ALTER TABLE` para as tabelas de E03** — hoje elas só têm
-      `CREATE TABLE IF NOT EXISTS`, sem caminho para acrescentar coluna depois (§5)
-- [ ] **Backup de `/data/contracts/`** — os PDFs assinados não têm backup
-      off-site nenhum (§4). Pendência de **E06**, mas vale decidir antes do R2
+- [ ] **Backup automático de `/data/contracts/`** — hoje existe **uma** cópia,
+      manual, feita hoje (§4). O `backup_service` continua cobrindo só o banco.
+      Pendência de **E06**, mas vale decidir antes do R2
+- [ ] **`checkSuites = False`** (§3): a Railway não espera CI. O workflow novo
+      informa, não bloqueia. Decidir se isso é aceitável ou se liga "Wait for CI"
 - [ ] **Decisão sobre proteção de branch**: `main` não é protegida e não há
       ruleset. Com proteção, o deploy passa a sair de PR com CI verde
+
+**Atenção, não bloqueador:**
+
+- [ ] **Caminho de migração para as tabelas de E03** — `CREATE TABLE IF NOT
+      EXISTS` basta para o R2 (em produção essas tabelas não existem, §5), mas
+      não há caminho para acrescentar coluna numa versão futura
+- [ ] **Reescrever a pendência B2 do `STATUS.md`** — `railway.toml` não está em
+      uso (`railwayConfigFile = None`), então nem o `watchPatterns` casando
+      `docs/**` nem o healthcheck em `/health` estão em vigor (§3)
 
 ### Teste mínimo com integração real — o que o R2 ainda não tem
 
@@ -610,6 +680,6 @@ próximo — não como "integração homologada".
 |---|---|---|
 | G1 implementação local | ✅ 18/18 checks | ✅ 316 testes + 26 simulados |
 | G2 homologação | ✅ a landing é verificável sem integração externa | ⏸ depende do teste mínimo acima |
-| G3 aprovação | ⏸ só V-B + backup | ⏸ checklist inteiro |
+| G3 aprovação | ⏸ **só a sua autorização** — V-B e backup resolvidos | ⏸ checklist inteiro |
 | G4 publicação | — | — |
 | G5 observação | — | — |
