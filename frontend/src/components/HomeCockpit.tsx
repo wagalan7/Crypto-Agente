@@ -3,6 +3,7 @@ import { X, RefreshCw } from 'lucide-react'
 import { api, executionIncidentsObservedAt } from '../services/api'
 import type { ExecutionIncidentsStatus } from '../services/api'
 import type { RealTradeRow, Recommendation } from '../types'
+import { calibratedProbabilities } from '../lib/recommendationPresentation'
 import {
   deriveOperationalState, emptyReading, p03View, readingQuality,
   DEFAULT_STALE_AFTER_MS, finiteNumber, canOfferResume,
@@ -592,6 +593,7 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                   // Ausência de verdito NÃO é aprovação (antes: `?? true`).
                   const okVerdict = typeof r.bot_verdict?.ok === 'boolean' ? r.bot_verdict.ok : null
                   const verdictReason = r.bot_verdict?.reason ?? null
+                  const probabilities = calibratedProbabilities(r)
                   const isShort = r.direction === 'short'
                   const tierCls = r.tier === 'A+' ? 'bg-gradient-to-br from-green-500 to-green-700 text-[#04220f]'
                     : r.tier === 'A' ? 'bg-gradient-to-br from-blue-500 to-blue-800 text-blue-100'
@@ -606,17 +608,17 @@ export default function HomeCockpit({ onClose, onSelectSymbol, onOpenRecs, onOpe
                         </div>
                         <div className="num text-[11px] text-slate-500 mt-0.5 break-words">
                           R:R {finiteNumber(r.risk_reward)?.toFixed(1) ?? '—'}
-                          {finiteNumber(r.prob_tp1) != null
-                            ? ` · P(TP1) ${(r.prob_tp1! * 100).toFixed(0)}% (modelo)`
+                          {probabilities
+                            ? ` · Histórico TP1 ${(probabilities.tp1 * 100).toFixed(0)}%`
                             : ' · P(TP1) não disponível'}
                           {r.edge_tags && r.edge_tags.length > 0 && ` · ${r.edge_tags.slice(0, 2).join(', ')}`}
                         </div>
                       </div>
                       <span
-                        title={verdictReason ?? undefined}
-                        className={`text-[10px] font-bold px-2 py-0.5 rounded ${okVerdict === true ? 'bg-emerald-500/15 text-emerald-300' : okVerdict === false ? 'bg-amber-500/15 text-amber-200' : 'bg-slate-600/30 text-slate-300'}`}
+                        title={verdictReason ?? 'Qualidade parcial do setup; não confirma execução do bot.'}
+                        className={`text-[10px] font-bold px-2 py-0.5 rounded ${okVerdict === true ? 'bg-sky-500/15 text-sky-300' : okVerdict === false ? 'bg-amber-500/15 text-amber-200' : 'bg-slate-600/30 text-slate-300'}`}
                       >
-                        {okVerdict === true ? 'elegível' : okVerdict === false ? 'em espera' : 'sem verdito'}
+                        {okVerdict === true ? 'qualidade parcial' : okVerdict === false ? 'em espera' : 'sem verdito'}
                       </span>
                     </div>
                   )

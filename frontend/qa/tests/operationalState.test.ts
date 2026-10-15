@@ -142,7 +142,7 @@ test('risco SEM pausa + quarentena confirmada = bloqueado (P03 prevalece)', () =
   const s = state(reading(riskOk()), reading(p03Ok({ quarantine_active: true })))
   assert.equal(s.level, 'BLOCKED')
   assert.ok(s.reasons.includes('Quarentena de execução ativa'))
-  assert.ok(s.missing.some(m => /pausa de risco/.test(m)))
+  assert.ok(!s.missing.some(m => /pausa de risco/.test(m)), 'false confirmado não é dado ausente')
 })
 
 test('risco SEM pausa + incidente aberto = bloqueado', () => {

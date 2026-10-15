@@ -1,8 +1,8 @@
 // ─── Isolamento de QA (Lote 04) ──────────────────────────────────────────────
 // Instala ANTES de montar a app. Fetch e transports JS são interceptados:
 //  • endpoints conhecidos → FIXTURE SINTÉTICA, explicitamente rotulada;
-//  • qualquer outro host (PRD, DEV, Binance, Bybit, Telegram…) → BLOQUEADO e
-//    CONTADO; a promessa é rejeitada (nunca cai para produção);
+//  • transporte para qualquer outro host → BLOQUEADO e CONTADO; somente o
+//    ticker público tem substituto SINTÉTICO local, demais promessas rejeitam;
 //  • qualquer método fora de GET/HEAD → INTERCEPTADO, jamais enviado;
 //  • WebSocket → substituído por um stub que não abre conexão.
 // Recursos DOM diretos são bloqueados pela CSP do preview, antes do transporte;
@@ -29,12 +29,17 @@ declare global {
 }
 
 /** Cenário de QA via `?cenario=`. */
-export type Scenario = 'sem-bloqueio' | 'p03-bloqueado' | 'sem-confirmacao' | 'pausa-manual'
+export type Scenario = 'sem-bloqueio' | 'p03-bloqueado' | 'sem-confirmacao' | 'pausa-manual' | 'manual-invalidado'
 
 // ─── Fixtures SINTÉTICAS (nunca valores de produção) ─────────────────────────
 const SYN = 'SINTÉTICO-QA'
 
 const riskByScenario: Record<Scenario, unknown> = {
+  'manual-invalidado': {
+    enabled: true, trading_paused: false, pause_reason: null, pause_manual: false,
+    daily_dd_pct: 0, weekly_dd_pct: 0, daily_trades: 0, weekly_trades: 0,
+    daily_limit_pct: -3, weekly_limit_pct: -6,
+  },
   'sem-bloqueio': {
     enabled: true, trading_paused: false, pause_reason: null, pause_manual: false,
     paused_at: null, daily_dd_pct: -0.42, weekly_dd_pct: -1.1,
@@ -61,6 +66,13 @@ const riskByScenario: Record<Scenario, unknown> = {
 }
 
 const p03ByScenario: Record<Scenario, unknown> = {
+  'manual-invalidado': {
+    ok: true, reconciler_running: true, last_reconciliation_at: new Date().toISOString(),
+    quarantine_active: false, open_total: 0, retry_pending: 0, manual_required: 0,
+    items: [], manual_items: [],
+    manual_validation: { ok: true, new_entries_blocked: true,
+      reason_code: 'MANUAL_ACK_RECONFIRMATION_REQUIRED', scope: 'MANUAL_VALIDATION_ONLY' },
+  },
   'sem-bloqueio': {
     ok: true, reconciler_running: true, last_reconciliation_at: '2026-10-07T12:00:00Z',
     quarantine_active: false, open_total: 0, retry_pending: 0, manual_required: 0,
@@ -152,7 +164,55 @@ const health = {
   gap_seconds: 18, gap_alert_threshold: 300, last_source: `scanner-${SYN}`, tick_count: 1284,
 }
 
-const ROUTES: { test: RegExp; body: (scenario: Scenario) => unknown }[] = [
+// Fixtures do scanner: valores deliberadamente sintéticos, sem preço real.
+const qaTickers = [
+  { symbol: 'SYN/USDT:USDT', last: 112, change: 2.4, volume: 42_000_000, high: 115, low: 97, bid: 111.99, ask: 112.01 },
+  { symbol: 'SYN2/USDT:USDT', last: 50, change: -1.2, volume: 18_000_000, high: 53, low: 48, bid: 49.99, ask: 50.01 },
+]
+const qaStart = 1_792_000_000_000
+function qaCandles(symbol: string) {
+  const short = symbol === qaTickers[1].symbol
+  return Array.from({ length: 160 }, (_, index) => {
+    const close = short ? 54 - index / 40 + Math.sin(index / 8) * 0.8
+      : 88 + index * 0.15 + Math.sin(index / 9) * 1.8
+    return { timestamp: qaStart + index * 3_600_000,
+      open: close - (short ? -0.25 : 0.4), high: close + 0.9,
+      low: close - 0.9, close, volume: 80_000 + (index % 13) * 2_000 }
+  })
+}
+function qaSignal(symbol: string, timeframe: string) {
+  const short = symbol === qaTickers[1].symbol
+  const entry = short ? 50 : 100
+  const stop = short ? 53 : 95
+  const tp1 = short ? 47 : 105
+  const tp2 = short ? 44 : 110
+  return {
+    symbol, timeframe, direction: short ? 'short' : 'long', trade_type: 'swing',
+    confidence: short ? 0.71 : 0.82, entry, stop_loss: stop, tp1, tp2,
+    tp3: short ? 41 : 115, risk_reward: 2, timestamp: qaStart,
+    signal_strength: 'FORTE · SINTÉTICO-QA',
+    indicators: { rsi: short ? 43 : 59, adx: 26, atr: short ? 1.2 : 3,
+      ema12: short ? 50.5 : 110, ema26: short ? 51 : 108, ema50: short ? 52 : 105 },
+    patterns: [{ type: short ? 'ltb' : 'lta', confidence: 0.78,
+      direction: short ? 'short' : 'long', description: `Linha de tendência ${SYN}`,
+      points: [{ index: 30, timestamp: qaStart + 30 * 3_600_000, price: short ? 54 : 90 }],
+      lines: [[30, short ? 54 : 90, 110, short ? 51 : 104]], breakout_target: null }],
+    trade_plan: { entry, entry_zone: { top: entry + 0.5, bottom: entry - 0.5,
+      mid: entry, type: 'limit_pullback', description: `Zona sintética de comparação — ${SYN}` },
+      stop_loss: stop, tp1, tp2, tp3: short ? 41 : 115,
+      risk_reward: 2, risk_reward_tp1: 1, risk_reward_tp3: 3,
+      reasoning_entry: SYN,
+      reasoning_stop: { price: stop, reason: SYN, source: SYN },
+      reasoning_tp1: { price: tp1, reason: SYN, source: SYN },
+      reasoning_tp2: { price: tp2, reason: SYN, source: SYN },
+      reasoning_tp3: { price: short ? 41 : 115, reason: SYN, source: SYN }, quality_warnings: [] },
+  }
+}
+function knownSymbol(url?: URL) {
+  const symbol = url?.searchParams.get('symbol')
+  return qaTickers.some(t => t.symbol === symbol) ? symbol! : null
+}
+const ROUTES: { test: RegExp; body: (scenario: Scenario, url?: URL) => unknown }[] = [
   { test: /^\/api\/risk\/status$/, body: scenario => riskByScenario[scenario] },
   { test: /^\/api\/execution-incidents\/status$/, body: scenario => p03ByScenario[scenario] },
   { test: /^\/api\/risk\/events$/, body: () => ({ events: [] }) },
@@ -165,7 +225,23 @@ const ROUTES: { test: RegExp; body: (scenario: Scenario) => unknown }[] = [
   { test: /^\/api\/regime-status$/, body: () => ({ regime: 'NORMAL', btc_24h_pct: 0.4, btc_dominance: 57.2, reasons: [] }) },
   { test: /^\/api\/macro$/, body: () => ({ btc_direction: 'alta', btc_rsi: 55, btc_adx: 22, btc_dominance: 57.2, market_data: {}, context_text: SYN }) },
   { test: /^\/api\/symbols$/, body: () => ({ symbols: ['SYN/USDT:USDT', 'SYN2/USDT:USDT'], count: 2 }) },
-  { test: /^\/api\/tickers$/, body: () => ({ tickers: [] }) },
+  { test: /^\/api\/tickers$/, body: () => ({ tickers: qaTickers }) },
+  { test: /^\/api\/watchlist\/analyze$/, body: () => ({ results: qaTickers.map(t => ({
+    symbol: t.symbol, direction: t.symbol === qaTickers[0].symbol ? 'long' : 'short',
+    confidence: 0.78, signal_strength: 'forte', trade_type: 'swing', rsi: 55, patterns_count: 1,
+  })) }) },
+  { test: /^\/api\/analyze$/, body: (_, url) => {
+    const symbol = knownSymbol(url)
+    return symbol ? qaSignal(symbol, url?.searchParams.get('timeframe') || '1h') : null
+  } },
+  { test: /^\/api\/ohlcv$/, body: (_, url) => {
+    const symbol = knownSymbol(url)
+    return symbol ? { symbol, timeframe: url?.searchParams.get('timeframe') || '1h', data: qaCandles(symbol) } : null
+  } },
+  { test: /^\/api\/multi-timeframe$/, body: (_, url) => {
+    const symbol = knownSymbol(url)
+    return symbol ? Object.fromEntries(['1h', '4h', '1d'].map(tf => [tf, qaSignal(symbol, tf)])) : null
+  } },
   { test: /^\/api\/calibration$/, body: () => ({ enabled: false }) },
 ]
 
@@ -220,6 +296,14 @@ export function installQaIsolation(target: Window = window): void {
     }
     if (entry.external) {
       record(entry)
+      // Nenhum transporte externo é delegado. Apenas este GET público é
+      // substituído por valores locais para exercitar o scanner real.
+      if (!entry.mutating && /^https:\/\/fapi\.binance\.com\/fapi\/v1\/ticker\/24hr(?:\?|$)/.test(url)) {
+        return new Response(JSON.stringify(qaTickers.map(t => ({
+          symbol: t.symbol.split(':')[0].replace('/', ''), lastPrice: String(t.last),
+          priceChangePercent: String(t.change), quoteVolume: String(t.volume),
+        }))), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
       throw new Error(`[QA] requisição externa BLOQUEADA: ${entry.method} ${url}`)
     }
     if (entry.mutating) {
@@ -228,12 +312,12 @@ export function installQaIsolation(target: Window = window): void {
       throw new Error(`[QA] mutação interceptada (não enviada): ${entry.method} ${url}`)
     }
     const route = ROUTES.find(r => r.test.test(parsedPath))
-    const body = route ? route.body(scenario) : null
+    const body = route ? route.body(scenario, new URL(url, `${QA_PREVIEW_ORIGIN}/`)) : null
     record({ ...entry, blocked: false })
     if (body === null) {
       // Fonte indisponível OU endpoint não modelado: nunca falso HTTP 200 com
       // um objeto genérico que se passaria por um contrato diferente.
-      const detail = route ? `[QA] fonte indisponível (${scenario})`
+      const detail = route && parsedPath !== '/api/analyze' ? `[QA] fonte indisponível (${scenario})`
         : `[QA] endpoint não modelado: ${parsedPath}`
       return new Response(JSON.stringify({ detail }),
         { status: 503, headers: { 'content-type': 'application/json' } })
@@ -253,7 +337,14 @@ export function installQaIsolation(target: Window = window): void {
     onopen: (() => void) | null = null
     onerror: (() => void) | null = null
     onclose: (() => void) | null = null
-    constructor(url: string) { sockets.push(url) }
+    constructor(url: string) {
+      sockets.push(url)
+      // Mensagem sintética única; nenhum socket é aberto. O cancelamento do
+      // hook continua sendo exercitado ao trocar ativo/timeframe.
+      const symbol = decodeURIComponent(url.split('/ws/price/')[1] || '')
+      const ticker = qaTickers.find(t => t.symbol === symbol)
+      if (ticker) setTimeout(() => this.onmessage?.({ data: JSON.stringify({ type: 'ticker', data: ticker }) } as MessageEvent), 20)
+    }
     send() { /* nada sai */ }
     close() { /* nada a fechar */ }
     addEventListener() { /* noop */ }

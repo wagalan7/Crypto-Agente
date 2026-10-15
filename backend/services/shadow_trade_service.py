@@ -2221,6 +2221,16 @@ async def _close_entry_intent(intent, trade, *, pending_entry: bool = False) -> 
     intent["state"] = "CONFIRMED"
 
 
+def _entry_intent_skip_reason(intent: dict) -> str:
+    """Código público específico, sem interpolar erro, objeto ou credencial."""
+    for field in ("reason", "decision"):
+        value = intent.get(field)
+        if (isinstance(value, str) and 0 < len(value) <= 100
+                and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for c in value)):
+            return value
+    return "ENTRY_INTENT_DENIED"
+
+
 def _record_skip(rec: dict, gate: str, reason: str) -> None:
     """Registra por que uma rec (tier A/A+) não virou trade. Best-effort."""
     _observe_decision(rec, "NO_FILL" if gate == "maker-no-fill" else "REJECTED", gate)
@@ -7112,7 +7122,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"[p03-intent] {rec.get('symbol')} SEM entrada: "
                         f"{_intent.get('decision')} ({_intent.get('reason')})"
                     )
-                    _record_skip(rec, "entry-intent", str(_intent.get("decision")))
+                    _record_skip(rec, "entry-intent", _entry_intent_skip_reason(_intent))
                     continue
                 client_order_id = _intent["client_order_id"]
                 # #4: entrada MAKER (post-only) quando ligada E o helper existe na

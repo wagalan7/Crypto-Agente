@@ -163,6 +163,12 @@ export interface ExecutionIncidentsStatus {
   reconciler_running?: boolean
   last_reconciliation_at?: string | null
   quarantine_active?: boolean
+  manual_validation?: {
+    ok?: boolean
+    new_entries_blocked?: boolean | null
+    reason_code?: string
+    scope?: string
+  }
   open_total?: number
   retry_pending?: number
   manual_required?: number

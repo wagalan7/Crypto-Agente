@@ -66,6 +66,7 @@ export interface P03Facts {
   error?: unknown
   items?: unknown
   manual_items?: unknown
+  manual_validation?: unknown
 }
 
 /**
@@ -169,6 +170,9 @@ export function sanitizeTechnical(raw: unknown, max = 160): string | null {
 export const UNKNOWN_REASON = 'Motivo não disponível nesta leitura'
 
 const REASON_RULES: { match: RegExp; label: string }[] = [
+  { match: /^MANUAL_ACK_RECONFIRMATION_REQUIRED$/, label: 'A posição manual mudou e precisa de novo reconhecimento' },
+  { match: /^MANUAL_ACK_WAITING_ORDERS$/, label: 'Reconhecimento manual aguarda conferência de ordens' },
+  { match: /^MANUAL_(ACK|ACCOUNT|VALIDATION)/, label: 'Validação da posição manual pendente' },
   { match: /^P03-QUARANTINE/i, label: 'Incidente de execução aberto (reconciliador P03)' },
   { match: /^\[manual-validation\]/i, label: 'Validação da posição manual pendente' },
   { match: /quarantine/i, label: 'Quarentena de execução ativa' },
@@ -233,6 +237,7 @@ export interface P03View {
   lastReconciliationAt: string | null
   /** Bloqueio confirmado pelo P03 (incidente aberto ou quarentena). */
   blocked: boolean
+  manualValidationBlocked: boolean
   reasons: string[]
   technical: string[]
   /** Por que não foi possível confirmar, quando for o caso. */
@@ -257,6 +262,10 @@ export function p03View(
   const okFlag = literalBool(facts?.ok)
   const items = Array.isArray(facts?.items) ? facts.items : null
   const manualItems = Array.isArray(facts?.manual_items) ? facts.manual_items : null
+  const manualRaw = facts?.manual_validation
+  const manual = manualRaw && typeof manualRaw === 'object' && !Array.isArray(manualRaw)
+    ? manualRaw as Record<string, unknown> : null
+  const manualBlocked = manual?.new_entries_blocked === true
   // Os subcontadores descrevem estados abertos; as listas deste contrato
   // também são de incidentes abertos. Contradição não apaga o sinal positivo.
   const incoherent =
@@ -279,12 +288,13 @@ export function p03View(
 
   // Bloqueio é fato POSITIVO: vale mesmo sem `ok=true` (incidente conhecido não
   // desaparece porque a leitura degradou).
-  const blocked = (openTotal != null && openTotal > 0) || quarantineActive === true
+  const blocked = manualBlocked || (openTotal != null && openTotal > 0) || quarantineActive === true
     || (manualRequired !== null && manualRequired > 0)
     || (retryPending !== null && retryPending > 0)
     || (items !== null && items.length > 0)
     || (manualItems !== null && manualItems.length > 0)
   const reasons: string[] = []
+  if (manualBlocked) reasons.push(translateReason(manual?.reason_code))
   if (quarantineActive === true) reasons.push('Quarentena de execução ativa')
   if (openTotal != null && openTotal > 0) {
     reasons.push(openTotal === 1
@@ -308,13 +318,16 @@ export function p03View(
   else if (okFlag !== true) unconfirmedReason = 'serviço de incidentes respondeu sem confirmação'
   else if (openTotal == null || quarantineActive == null) unconfirmedReason = 'resposta de incidentes incompleta'
   else if (incoherent) unconfirmedReason = 'resposta de incidentes incoerente'
+  else if (manualRaw !== undefined && (manual?.ok !== true || literalBool(manual?.new_entries_blocked) === null)) {
+    unconfirmedReason = 'validação da posição manual não confirmada'
+  }
   else if (quality.stale) unconfirmedReason = 'leitura de incidentes antiga'
 
   return {
     confirmed: unconfirmedReason === null,
     openTotal, manualRequired, quarantineActive,
     lastReconciliationAt: text(facts?.last_reconciliation_at),
-    blocked, reasons, technical, unconfirmedReason,
+    blocked, manualValidationBlocked: manualBlocked, reasons, technical, unconfirmedReason,
   }
 }
 
@@ -370,12 +383,16 @@ export function deriveOperationalState(input: OperationalInput): OperationalStat
     reasons.push(...p03.reasons)
     const tech = sanitizeTechnical(pauseReasonRaw)
     if (tech && translateReason(pauseReasonRaw) === UNKNOWN_REASON) technical.push(tech)
-    if (paused !== true && p03.blocked) missing.push('pausa de risco (não confirmada nesta leitura)')
+    if (paused === null && p03.blocked) missing.push('pausa de risco (não confirmada nesta leitura)')
     if (p03.unconfirmedReason) missing.push(`detalhes de incidentes: ${p03.unconfirmedReason}`)
     return {
       level: 'BLOCKED', tone: 'danger',
-      title: p03OwnsPause || p03.blocked ? 'Bloqueado por incidente de execução' : 'Entradas pausadas',
-      detail: p03OwnsPause || p03.blocked
+      title: p03.manualValidationBlocked && p03.openTotal === 0
+        ? 'Entradas aguardam validação manual'
+        : p03OwnsPause || p03.blocked ? 'Bloqueado por incidente de execução' : 'Entradas pausadas',
+      detail: p03.manualValidationBlocked && p03.openTotal === 0
+        ? 'O reconhecimento da posição manual não autoriza novas entradas nesta leitura. A conferência não entrega a posição manual à gestão do bot.'
+        : p03OwnsPause || p03.blocked
         ? 'O reconciliador P03 mantém o bloqueio até encerrar o incidente. Nem o kill switch nem a virada de dia liberam antes disso.'
         : 'Novas entradas estão pausadas nesta leitura.',
       reasons: reasons.length > 0 ? reasons : [UNKNOWN_REASON],

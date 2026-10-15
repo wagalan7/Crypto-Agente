@@ -3156,3 +3156,31 @@ Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
   históricos da fixture auditada privada ausente. Uma rodada final com fontes
   congeladas, exit 0 (598,5 s), sem skip novo; log no checkpoint. Somente 16
   arquivos do bloco no commit, pessoais e outros projetos preservados.
+
+## 15/10/2026 — diagnóstico de entrada e clareza do scanner
+
+- Logs de produção confirmaram tentativas recentes barradas por reconhecimento
+  manual APE INVALIDATED, não scanner parado. Não atribuímos os 50 dias inteiros
+  nem lucro perdido a essa amostra. Versão publicada anterior era 80d7ece8.
+- Confirmação humana explícita da posição atual → um reconhecimento oficial
+  MANUAL_ACK_OK após leitura fresca → ciclo oficial ACTIVE/prova ACCOUNT.
+  Sem ordem forçada, gestão da manual, afrouxamento de risco ou bypass.
+- Veredito manual detalhado mantém o predicado (738 paridades independentes).
+  Resumo público sem conta/posição/fingerprint; erro=desconhecido. Duas leituras
+  DB adicionais, nenhum I/O de exchange pelo GET. Skip conserva motivo real.
+- UI: estado manual mesmo com zero incidentes, força não é probabilidade,
+  preço versus zona/stop/TP1 antes dos detalhes, dados antigos descartados,
+  qualidade parcial não promete entrada, controles e responsividade revistos.
+  Rotas/payloads/confirmações preservados; frontend/dist intocado.
+- Estado final: backend 3.323 executados / 3.321 aprovados / dois skips R05C
+  históricos; 299 críticos, 113 apresentação/diagnóstico, 115 frontend,
+  TypeScript/build temporário/sintaxe/diff-check OK. PG16 Unix-only: manual
+  boot 46, dispatch 32, fechamento 73; risco pyramiding 21. Clusters encerrados.
+- QA em quatro larguras com dados sintéticos: sem overflow horizontal;
+  captura e DOM verificaram estado manual e troca entre ativos. Sem teste em
+  device físico/leitor de tela; sem pretensão de prova financeira.
+- Origem remota 885477d2 (site de outro projeto) integrada sem sobrescrever;
+  publicação conjunta inclui seis commits locais anteriores já autorizados.
+  Nenhuma flag/ENV nova ou alterada, nenhuma candidata ativada. Confirmar
+  versão/boot/diagnóstico e asset da Vercel após o push. Ver detalhes em
+  OPERACAO_E_SCANNER_2026_10_15.md. Próximo aceite: entrada natural, não forçada.

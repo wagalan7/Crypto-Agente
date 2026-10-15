@@ -38,11 +38,14 @@ function MultiTFPanel({ symbol }: { symbol: string }) {
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
+    let current = true
+    setMtf(null)
     setLoading(true)
     api.multiTimeframe(symbol)
-      .then(setMtf)
-      .catch(() => setMtf(null))
-      .finally(() => setLoading(false))
+      .then(value => { if (current) setMtf(value) })
+      .catch(() => { if (current) setMtf(null) })
+      .finally(() => { if (current) setLoading(false) })
+    return () => { current = false }
   }, [symbol])
 
   if (loading) return <div className="text-xs text-slate-500 text-center mt-4">Carregando...</div>
@@ -63,8 +66,8 @@ function MultiTFPanel({ symbol }: { symbol: string }) {
             </span>
           </div>
           <div className="grid grid-cols-2 gap-x-2 text-xs">
-            <span className="text-slate-500">Confiança</span>
-            <span className="text-slate-300">{(sig.confidence * 100).toFixed(0)}%</span>
+            <span className="text-slate-500">Força do sinal</span>
+            <span className="text-slate-300">{Number.isFinite(sig.confidence) && sig.confidence >= 0 && sig.confidence <= 1 ? `${(sig.confidence * 100).toFixed(0)}/100` : 'Não informada'}</span>
             <span className="text-slate-500">Tipo</span>
             <span className="text-slate-300">{sig.trade_type.replace('_', ' ')}</span>
             <span className="text-slate-500">Entrada</span>
@@ -74,6 +77,7 @@ function MultiTFPanel({ symbol }: { symbol: string }) {
             <span className="text-slate-500">TP2</span>
             <span className="text-green-400 font-mono">{sig.tp2.toFixed(4)}</span>
           </div>
+          <p className="text-[10px] text-slate-500 mt-2">Viés técnico, não probabilidade nem autorização do bot.</p>
           {sig.patterns.length > 0 && (
             <p className="text-xs text-slate-500 mt-1 truncate">{sig.patterns[0].description}</p>
           )}
@@ -100,6 +104,8 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
   const userToggledFallbackRef = useRef(false)
 
   const runAnalysis = useCallback(() => {
+    // Reanálise que falha não deve reapresentar o plano anterior como atual.
+    setDisplaySignal(null)
     analyze(symbol, tf, withAi)
   }, [analyze, symbol, tf, withAi])
 
@@ -134,12 +140,12 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
   }, [signal])
 
   return (
-    <div className={`flex flex-col bg-[#0d1320] border-l border-slate-800 ${isFullscreen ? 'fixed inset-0 z-50' : 'h-full'}`}>
+    <div className={`flex flex-col min-w-0 min-h-0 bg-[#0d1320] border-l border-slate-800 ${isFullscreen ? 'fixed inset-0 z-50' : 'h-full'}`} data-chart-panel="true">
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800 flex-shrink-0 gap-2">
         <div className="flex items-center gap-2 min-w-0">
           {isMobile && (
-            <button onClick={onClose} className="p-1 bg-slate-800 hover:bg-slate-700 rounded transition-colors flex-shrink-0">
+            <button onClick={onClose} aria-label="Voltar ao scanner" className="p-1 bg-slate-800 hover:bg-slate-700 rounded transition-colors flex-shrink-0">
               <ArrowLeft className="w-3.5 h-3.5" />
             </button>
           )}
@@ -169,7 +175,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
           </button>
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
-          <div className="hidden sm:flex gap-0.5">
+          <div className="hidden xl:flex gap-0.5">
             {TIMEFRAMES.map(t => (
               <button key={t} onClick={() => setTf(t)}
                 className={`px-1.5 py-0.5 text-xs font-semibold rounded transition-colors ${tf === t ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:bg-slate-700'}`}>
@@ -181,7 +187,7 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
             onClick={() => { setWithAi(v => !v); setTimeout(runAnalysis, 50) }}
             className={`px-1.5 py-0.5 text-xs rounded font-semibold border transition-colors ${withAi ? 'bg-violet-600/30 text-violet-300 border-violet-500/40' : 'bg-slate-800 text-slate-500 border-slate-700'}`}
           >IA</button>
-          <button onClick={runAnalysis} disabled={loading}
+          <button onClick={runAnalysis} disabled={loading} aria-label="Atualizar análise"
             className="flex items-center gap-1 px-2 py-0.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded text-xs font-semibold transition-colors">
             <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
             <span className="hidden sm:block">Analisar</span>
@@ -191,26 +197,26 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
             title={isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}>
             {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
           </button>
-          <button onClick={onClose} className="p-1 bg-slate-800 hover:bg-slate-700 rounded transition-colors">
+          <button onClick={onClose} aria-label="Fechar análise" className="p-1 bg-slate-800 hover:bg-slate-700 rounded transition-colors">
             <X className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      {/* Mobile timeframe row */}
-      <div className="sm:hidden flex gap-0.5 px-2 py-1.5 border-b border-slate-800 flex-shrink-0">
+      {/* Linha própria também em tablets: não espremer 11 TFs no header. */}
+      <div className="xl:hidden flex gap-0.5 px-2 py-1.5 border-b border-slate-800 flex-shrink-0 overflow-x-auto" aria-label="Tempo gráfico">
         {TIMEFRAMES.map(t => (
           <button key={t} onClick={() => setTf(t)}
-            className={`px-2 py-1 text-xs font-semibold rounded flex-1 ${tf === t ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'}`}>
+            className={`px-2 py-1 text-xs font-semibold rounded flex-shrink-0 ${tf === t ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'}`}>
             {t}
           </button>
         ))}
       </div>
 
       {/* Body */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-col xl:flex-row flex-1 min-h-0 overflow-y-auto xl:overflow-hidden" data-chart-section="body">
         {/* Chart area */}
-        <div className="flex-1 relative min-w-0">
+        <div className="relative min-w-0 h-[46vh] min-h-[400px] flex-shrink-0 xl:h-auto xl:min-h-0 xl:flex-1" data-chart-section="canvas">
           {error && (
             <div className="absolute inset-x-2 top-2 z-10 bg-red-900/80 border border-red-500/50 rounded px-3 py-2 text-xs text-red-300 pointer-events-none">
               {error}
@@ -253,18 +259,18 @@ export default function ChartPanel({ symbol, timeframe: initialTf, onClose, isMo
         </div>
 
         {/* Signal / MTF panel */}
-        <div className="w-64 xl:w-72 flex-shrink-0 border-l border-slate-800 flex flex-col">
+        <div className="w-full xl:w-80 flex-shrink-0 min-w-0 border-t xl:border-t-0 xl:border-l border-slate-800 flex flex-col" data-chart-section="analysis">
           <div className="flex border-b border-slate-800 flex-shrink-0">
             <button onClick={() => setActiveTab('signal')}
               className={`flex-1 py-1.5 text-xs font-semibold flex items-center justify-center gap-1 transition-colors ${activeTab === 'signal' ? 'text-white border-b-2 border-blue-500' : 'text-slate-500 hover:text-slate-300'}`}>
-              <Layers className="w-3 h-3" /> Análise
+              <Layers className="w-3 h-3" /> Situação e plano
             </button>
             <button onClick={() => setActiveTab('mtf')}
               className={`flex-1 py-1.5 text-xs font-semibold flex items-center justify-center gap-1 transition-colors ${activeTab === 'mtf' ? 'text-white border-b-2 border-blue-500' : 'text-slate-500 hover:text-slate-300'}`}>
               <BarChart2 className="w-3 h-3" /> Multi-TF
             </button>
           </div>
-          <div className="flex-1 overflow-y-auto p-2">
+          <div className="flex-1 min-h-0 xl:overflow-y-auto p-2.5">
             {activeTab === 'signal' && loading && (
               <div className="flex items-center justify-center h-full">
                 <div className="w-7 h-7 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />

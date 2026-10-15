@@ -3193,10 +3193,18 @@ async def get_status() -> dict:
         quarantine_active = bool(shadow_trade_service.execution_quarantine_reason())
     except Exception:
         pass
+    try:
+        from services import manual_position_service
+        manual_validation = await manual_position_service.manual_validation_summary()
+    except Exception:
+        manual_validation = {"ok": False, "new_entries_blocked": None,
+                             "reason_code": "MANUAL_VALIDATION_UNAVAILABLE",
+                             "scope": "MANUAL_VALIDATION_ONLY"}
     return {
         "ok": True, "reconciler_running": _reconciler_running,
         "last_reconciliation_at": _last_reconciliation_at,
         "quarantine_active": quarantine_active,
+        "manual_validation": manual_validation,
         "open_total": len(open_rows),
         "retry_pending": sum(1 for r in open_rows if r.get("state") == State.RETRY_PENDING),
         "manual_required": sum(1 for r in open_rows if r.get("state") == State.MANUAL_REQUIRED),

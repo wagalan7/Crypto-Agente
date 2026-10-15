@@ -117,13 +117,13 @@ function signalBadge(direction: SignalDirection, strength: string) {
   const forte = strength?.toLowerCase().includes('fort') || strength?.toLowerCase().includes('strong')
   if (direction === 'long') {
     return forte
-      ? { label: 'COMPRA FORTE', cls: 'bg-green-500 text-white' }
-      : { label: 'COMPRA', cls: 'bg-green-500/15 text-green-400 border border-green-500/40' }
+      ? { label: 'VIÉS DE ALTA FORTE', cls: 'bg-green-500/20 text-green-300 border border-green-500/40' }
+      : { label: 'VIÉS DE ALTA', cls: 'bg-green-500/15 text-green-400 border border-green-500/40' }
   }
   if (direction === 'short') {
     return forte
-      ? { label: 'VENDA FORTE', cls: 'bg-red-500 text-white' }
-      : { label: 'VENDA', cls: 'bg-red-500/15 text-red-400 border border-red-500/40' }
+      ? { label: 'VIÉS DE BAIXA FORTE', cls: 'bg-red-500/20 text-red-300 border border-red-500/40' }
+      : { label: 'VIÉS DE BAIXA', cls: 'bg-red-500/15 text-red-400 border border-red-500/40' }
   }
   return { label: 'NEUTRO', cls: 'bg-slate-700/80 text-slate-400 border border-slate-600/60' }
 }
@@ -137,17 +137,19 @@ function rsiLabel(rsi: number | null) {
 
 // ─── Asset Row ────────────────────────────────────────────────────────────────
 
-function AssetRow({ asset, rank, tradeMode, onClick }: {
-  asset: ScannerAsset; rank: number; tradeMode: TradeMode; onClick: () => void
+function AssetRow({ asset, rank, tradeMode, selected, onClick }: {
+  asset: ScannerAsset; rank: number; tradeMode: TradeMode; selected: boolean; onClick: () => void
 }) {
   const badge = signalBadge(asset.direction, asset.signal_strength)
   const rsi = rsiLabel(asset.rsi)
   const cfg = TRADE_MODES[tradeMode]
-  const tfs = cfg.tfs.split('·')
 
   return (
-    <div
-      className="flex items-center px-4 py-3 border-b border-slate-800/50 hover:bg-slate-800/25 cursor-pointer transition-colors active:bg-slate-800/50"
+    <button
+      type="button"
+      aria-label={`Analisar ${asset.baseAsset}, ${cfg.label}`}
+      aria-pressed={selected}
+      className={`w-full text-left flex items-center px-3 py-3 border-b border-slate-800/50 border-l-2 hover:bg-slate-800/40 transition-colors active:bg-slate-800/50 ${selected ? 'border-l-cyan-400 bg-cyan-500/5' : 'border-l-transparent'}`}
       onClick={onClick}
     >
       {/* Rank */}
@@ -164,11 +166,11 @@ function AssetRow({ asset, rank, tradeMode, onClick }: {
       <div className="flex-1 min-w-0">
         <div className="font-bold text-white text-sm leading-tight">{asset.baseAsset}</div>
         <div className="text-xs text-slate-500 mt-0.5">
-          {asset.binanceSymbol}·{fmtVolume(asset.volume24h)}
+          {asset.binanceSymbol} · vol. 24h {fmtVolume(asset.volume24h)}
         </div>
         <div className="flex items-center gap-1.5 mt-1 flex-wrap">
           <span className="text-xs text-slate-600">
-            TF:{tfs[0]}/{tfs[1]}·Padrão:{asset.patterns_count > 0 ? tfs[0] : '-'}
+            {cfg.tfs} · {asset.patterns_count > 0 ? `${asset.patterns_count} padrão(ões)` : 'sem padrão informado'}
           </span>
           <span className={`text-xs px-1.5 py-0.5 rounded font-semibold ${badge.cls}`}>
             {badge.label}
@@ -188,7 +190,7 @@ function AssetRow({ asset, rank, tradeMode, onClick }: {
           <div className={`text-xs mt-0.5 ${rsi.cls}`}>{rsi.text}</div>
         )}
       </div>
-    </div>
+    </button>
   )
 }
 
@@ -492,8 +494,8 @@ export default function App() {
 
   const FILTERS: { key: Filter; label: string }[] = [
     { key: 'all',     label: 'TODOS'    },
-    { key: 'long',    label: '🟢 COMPRA'  },
-    { key: 'short',   label: '🔴 VENDA'   },
+    { key: 'long',    label: 'Viés de alta'  },
+    { key: 'short',   label: 'Viés de baixa'   },
     { key: 'neutral', label: '🟡 NEUTRO'  },
     { key: 'forte',   label: '🔥 FORTE'   },
     { key: 'rsi70',   label: 'RSI>70'   },
@@ -516,26 +518,30 @@ export default function App() {
 
   // ─── Scanner panel (left column) ──────────────────────────────────────────
   const ScannerPanel = (
-    <div className="flex flex-col h-full overflow-hidden bg-[#0a0e1a]">
+    <div className="market-scanner flex flex-col h-full min-w-0 overflow-hidden bg-[#0a0e1a]">
       {/* Sub-header */}
       <div className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-between sm:gap-2 px-3 py-2 border-b border-slate-800/50 flex-shrink-0">
         <div className="flex items-center gap-2 flex-shrink-0">
           <img src="/logo.jpg" alt="Crypto Win" className="w-7 h-7 rounded-md object-cover border border-yellow-500/40 shadow-[0_0_8px_rgba(234,179,8,0.25)]" />
           <div className="flex flex-col leading-tight">
-            <span className="text-sm font-bold bg-gradient-to-r from-yellow-300 to-emerald-300 bg-clip-text text-transparent">Crypto Win</span>
+            <span className="text-sm font-bold text-slate-100">Scanner de mercado</span>
             <span className="flex items-center gap-1 text-[10px] text-slate-400">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-              Binance Futures · Tempo Real
+              Binance Futures · preços e sinais separados
             </span>
           </div>
         </div>
         {/* Menu agora vive no rail lateral (NavRail). Cabeçalho fica enxuto. */}
         <div className="flex items-center gap-3 flex-shrink-0 self-end sm:self-auto">
           <span className="text-slate-500 text-xs hidden md:block">{assets.length} pares</span>
-          <span className="text-slate-600 text-xs font-mono tabular-nums">
+          <span title="Horário do seu dispositivo; não é o horário da última análise" className="text-slate-500 text-xs font-mono tabular-nums">
             {clock.toLocaleTimeString('pt-BR')}
           </span>
         </div>
+      </div>
+
+      <div className="px-3 pt-3 pb-1 text-xs leading-relaxed text-slate-400 flex-shrink-0">
+        <p className="font-medium text-slate-200">Encontre o cenário. Confira a entrada.</p>
+        <p className="mt-1">Viés não é ordem. Selecione um par para ver preço, zona e impedimentos.</p>
       </div>
 
       {/* Trade type cards */}
@@ -544,6 +550,7 @@ export default function App() {
           <button
             key={key}
             onClick={() => setTradeMode(key)}
+            aria-pressed={tradeMode === key}
             className={`relative rounded-lg p-2 border transition-all text-left ${
               tradeMode === key
                 ? `${cfg.bg} ${cfg.border}`
@@ -573,10 +580,11 @@ export default function App() {
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500" />
           <input
             type="text"
-            placeholder="Buscar par... BTC, SOL, PEPE"
+            aria-label="Buscar criptomoeda ou par"
+            placeholder="Buscar moeda ou par"
             value={search}
             onChange={e => setSearch(e.target.value)}
-            className="w-full bg-slate-800/50 border border-slate-700/50 rounded-lg pl-8 pr-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-slate-500 transition-colors"
+            className="w-full bg-slate-800/50 border border-slate-700/50 rounded-xl pl-8 pr-3 py-2.5 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500/70 transition-colors"
           />
         </div>
       </div>
@@ -587,6 +595,7 @@ export default function App() {
           <button
             key={f.key}
             onClick={() => setFilter(f.key)}
+            aria-pressed={filter === f.key}
             className={`whitespace-nowrap px-2 py-0.5 rounded-full text-xs font-semibold transition-colors border flex-shrink-0 ${
               filter === f.key
                 ? 'bg-white/10 border-slate-500 text-white'
@@ -599,27 +608,21 @@ export default function App() {
       </div>
 
       {/* Sort */}
-      <div className="flex items-center gap-1 px-2 pb-1.5 overflow-x-auto scrollbar-hide flex-shrink-0">
-        {SORTS.map(s => (
-          <button
-            key={s.key}
-            onClick={() => setSort(s.key)}
-            className={`whitespace-nowrap px-2 py-0.5 rounded text-xs font-medium transition-colors border flex-shrink-0 ${
-              sort === s.key
-                ? 'bg-white/10 border-slate-500 text-white'
-                : 'border-slate-700/40 text-slate-600 hover:text-slate-300 hover:border-slate-600'
-            }`}
-          >
-            {s.label}
-          </button>
-        ))}
+      <div className="flex items-center justify-between gap-2 px-3 py-2 flex-shrink-0">
+        <span className="text-xs text-slate-500">{sorted.length} pares nesta lista</span>
+        <label className="flex items-center gap-2 text-xs text-slate-400">
+          <span className="sr-only">Ordenar pares</span>
+          <select aria-label="Ordenar pares" value={sort} onChange={e => setSort(e.target.value as Sort)} className="min-w-0 max-w-40 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 text-slate-200">
+            {SORTS.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select>
+        </label>
       </div>
 
       {/* Stats bar */}
       <div className="grid grid-cols-4 divide-x divide-slate-800/80 border-y border-slate-800/80 flex-shrink-0">
         {[
-          { val: statsLong,    label: 'COMPRA', cls: 'text-green-400'  },
-          { val: statsShort,   label: 'VENDA',  cls: 'text-red-400'    },
+          { val: statsLong,    label: 'VIÉS ALTA', cls: 'text-green-400'  },
+          { val: statsShort,   label: 'VIÉS BAIXA', cls: 'text-red-400'    },
           { val: statsNeutral, label: 'NEUTRO', cls: 'text-yellow-400' },
           { val: assets.length,label: 'TOTAL',  cls: 'text-white'      },
         ].map(({ val, label, cls }) => (
@@ -638,6 +641,7 @@ export default function App() {
             asset={asset}
             rank={i + 1}
             tradeMode={tradeMode}
+            selected={selectedSymbol === asset.symbol}
             onClick={() => { setSelectedSymbol(asset.symbol); setSelectedTimeframe(null) }}
           />
         ))}
@@ -698,7 +702,7 @@ export default function App() {
       <TickerBar />
 
       {/* Body */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex flex-1 min-w-0 overflow-hidden">
         {/* Left: scanner list — hidden on mobile when chart is open */}
         <div className={`flex-shrink-0 overflow-hidden transition-all duration-300 ${
           selectedSymbol
@@ -710,7 +714,7 @@ export default function App() {
 
         {/* Right: chart panel (only when symbol selected) */}
         {selectedSymbol && (
-          <div className="flex-1 overflow-hidden">
+          <div className="flex-1 min-w-0 overflow-hidden">
             <ChartPanel
               symbol={selectedSymbol}
               timeframe={selectedTimeframe ?? TRADE_MODES[tradeMode].timeframe}

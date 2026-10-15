@@ -557,24 +557,22 @@ class ApresentacaoFrontend(unittest.TestCase):
         cls.src = cls.painel.read_text()
 
     def test_confidence_nao_e_mais_chamado_de_probabilidade(self):
-        bloco = self.src.split("AGUARDAR CONFLUÊNCIA")[1][:600]
-        self.assertNotIn("Probabilidade", bloco)
-        self.assertIn("Força do sinal", bloco)
-        self.assertIn("não representa probabilidade de lucro", self.src)
+        # Layout de 15/10 substitui o aviso condicional por explicação sempre
+        # visível. Mantemos a garantia sem exigir o markup já substituído.
+        self.assertIn("Força do sinal não é probabilidade de lucro.", self.src)
+        self.assertNotIn("% de confiança", self.src)
 
     def test_valor_numerico_e_limite_preservados(self):
-        self.assertIn("signal.confidence < 0.75", self.src)
         self.assertIn("signal.confidence >= 0.75", self.src)
         self.assertIn("<ConfidenceBar value={signal.confidence} />", self.src)
-        self.assertIn("(signal.confidence * 100).toFixed(0)", self.src)
+        self.assertIn("Math.round(value * 100)", self.src)
 
     def test_botao_e_ordenacao_intactos(self):
-        self.assertIn("Adicionar ao Gestor de Trades", self.src)
-        self.assertIn("onAddToManager", self.src)
+        self.assertIn("Registrar plano no gestor manual", self.src)
+        self.assertIn("onClick={onAddToManager}", self.src)
 
     def test_referencia_em_escala_de_pontos(self):
-        bloco = self.src.split("AGUARDAR CONFLUÊNCIA")[1][:600]
-        self.assertIn("/100", bloco)
+        self.assertIn("`${pctVal}/100`", self.src)
 
 
 # ════════════════════════════════════════════════════════════════════════════

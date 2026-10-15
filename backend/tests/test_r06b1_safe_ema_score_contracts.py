@@ -655,16 +655,16 @@ class Frontend(unittest.TestCase):
         self.assertIn("(12 < 26 < 50)", self.painel)
 
     def test_correcao_textual_do_r06a_preservada(self):
-        bloco = self.painel.split("AGUARDAR CONFLUÊNCIA")[1][:600]
-        self.assertNotIn("Probabilidade", bloco)
-        self.assertIn("Força do sinal", bloco)
-        self.assertIn("não representa probabilidade de lucro", self.painel)
+        # A apresentação autorizada de 15/10 tornou o aviso sempre visível;
+        # não preservar a string de um bloco antigo como se fosse uma regra.
+        self.assertIn("Força do sinal não é probabilidade de lucro.", self.painel)
+        self.assertNotIn("% de confiança", self.painel)
 
     def test_limite_e_botoes_intactos(self):
-        self.assertIn("signal.confidence < 0.75", self.painel)
         self.assertIn("signal.confidence >= 0.75", self.painel)
         self.assertIn("<ConfidenceBar value={signal.confidence} />", self.painel)
-        self.assertIn("Adicionar ao Gestor de Trades", self.painel)
+        self.assertIn("Registrar plano no gestor manual", self.painel)
+        self.assertIn("onClick={onAddToManager}", self.painel)
 
 
 # ════════════════════════════════════════════════════════════════════════════

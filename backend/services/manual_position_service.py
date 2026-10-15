@@ -1327,8 +1327,9 @@ def window_age_ok(janela: Mapping) -> Dict[str, Any]:
     return {"ok": True, "reason_code": "OBSERVATION_FRESH", "age_s": idade_s}
 
 
-def proof_is_valid(ack: Mapping, *, account_scope: Any, manual_generation: Any,
-                   now_ms: Optional[int] = None) -> bool:
+def validation_proof_verdict(ack: Mapping, *, account_scope: Any,
+                             manual_generation: Any,
+                             now_ms: Optional[int] = None) -> Dict[str, Any]:
     """A prova deste reconhecimento autoriza NOVA exposição agora?
 
     Idade sozinha NÃO é prova. Exige, em conjunto: estado ACTIVE,
@@ -1337,57 +1338,110 @@ def proof_is_valid(ack: Mapping, *, account_scope: Any, manual_generation: Any,
     escopo reconhecido e aplicável, carimbo inteiro positivo e NÃO futuro, e
     idade dentro do limite. Nada de `max(0, idade)` validando futuro.
     """
+    def invalid(reason):
+        return {"valid": False, "reason_code": reason}
+
     dados = ack if isinstance(ack, Mapping) else {}
     if str(dados.get("state")) != STATE_ACTIVE:
-        return False
+        state = str(dados.get("state"))
+        return invalid("MANUAL_ACK_RECONFIRMATION_REQUIRED" if state == STATE_INVALIDATED
+                       else "MANUAL_ACK_WAITING_ORDERS" if state == STATE_WAITING_ORDERS
+                       else "MANUAL_ACK_NOT_ACTIVE")
     revisao, validada = dados.get("revision"), dados.get("validated_revision")
     if validada is None or isinstance(validada, bool):
-        return False
+        return invalid("MANUAL_ACK_REVISION_MISMATCH")
     try:
         if int(revisao) != int(validada):
-            return False
+            return invalid("MANUAL_ACK_REVISION_MISMATCH")
     except (TypeError, ValueError):
-        return False
+        return invalid("MANUAL_ACK_REVISION_MISMATCH")
     conta = str(account_scope or "")
     if not conta or str(dados.get("validation_account") or "") != conta:
-        return False
+        return invalid("MANUAL_ACK_ACCOUNT_MISMATCH")
     epoca = dados.get("validated_generation")
     if epoca is None or isinstance(epoca, bool):
-        return False
+        return invalid("MANUAL_ACK_GENERATION_MISMATCH")
     try:
         if int(epoca) != int(manual_generation):
-            return False
+            return invalid("MANUAL_ACK_GENERATION_MISMATCH")
     except (TypeError, ValueError):
-        return False
+        return invalid("MANUAL_ACK_GENERATION_MISMATCH")
     if str(dados.get("contract_version") or "") != _contract_version():
-        return False
+        return invalid("MANUAL_ACK_CONTRACT_MISMATCH")
     if dados.get("exchange") is not None \
             and str(dados.get("exchange")).lower() != EXCHANGE_BINANCE:
-        return False
+        return invalid("MANUAL_ACK_MARKET_MISMATCH")
     if dados.get("market") is not None \
             and str(dados.get("market")).lower() != MARKET_USDM_FUTURES:
-        return False
+        return invalid("MANUAL_ACK_MARKET_MISMATCH")
     escopo = str(dados.get("validation_scope") or "")
     if escopo not in (SCOPE_ACCOUNT, SCOPE_SYMBOL):
-        return False
+        return invalid("MANUAL_ACK_SCOPE_MISMATCH")
     if escopo == SCOPE_SYMBOL:
         # Prova de SÍMBOLO vale para o reconhecimento DAQUELE símbolo.
         alvo = dados.get("validation_symbol") or dados.get("symbol")
         if symbol_key(alvo) != symbol_key(dados.get("symbol")):
-            return False
+            return invalid("MANUAL_ACK_SCOPE_MISMATCH")
     carimbo = dados.get("validated_at_ms")
     if carimbo is None or isinstance(carimbo, bool):
-        return False
+        return invalid("MANUAL_ACK_TIMESTAMP_INVALID")
     try:
         carimbo = int(carimbo)
     except (TypeError, ValueError):
-        return False
+        return invalid("MANUAL_ACK_TIMESTAMP_INVALID")
     if carimbo <= 0:
-        return False
+        return invalid("MANUAL_ACK_TIMESTAMP_INVALID")
     agora = int(now_ms if now_ms is not None else _now_ms())
     if carimbo > agora + _CLOCK_SKEW_MS:
-        return False                      # futuro incoerente nunca é prova
-    return (agora - carimbo) / 1000.0 <= VALIDATION_MAX_AGE_S
+        return invalid("MANUAL_ACK_TIMESTAMP_FUTURE")
+    if (agora - carimbo) / 1000.0 > VALIDATION_MAX_AGE_S:
+        return invalid("MANUAL_ACK_VALIDATION_EXPIRED")
+    return {"valid": True, "reason_code": "MANUAL_ACK_VALIDATED"}
+
+
+def proof_is_valid(ack: Mapping, *, account_scope: Any, manual_generation: Any,
+                   now_ms: Optional[int] = None) -> bool:
+    """Compatibilidade: mesmo predicado, diagnóstico separado de autoridade."""
+    return validation_proof_verdict(
+        ack, account_scope=account_scope, manual_generation=manual_generation,
+        now_ms=now_ms)["valid"]
+
+
+async def manual_validation_summary() -> Dict[str, Any]:
+    """Somente diagnóstico local/DB; não renova prova nem consulta a exchange.
+
+    Não publica conta, fingerprint, posição ou credencial. Leituras são
+    observacionais, NÃO autorização atômica de despacho.
+    """
+    unavailable = {"ok": False, "new_entries_blocked": None,
+                   "reason_code": "MANUAL_VALIDATION_UNAVAILABLE",
+                   "scope": "MANUAL_VALIDATION_ONLY"}
+    try:
+        registry = await active_acknowledgements()
+        if registry.get("ok") is not True:
+            return unavailable
+        state = await account_validation_state()
+        if state.get("reason_code") == GUARD_REGISTRY_UNAVAILABLE:
+            return unavailable
+        account = str(current_account_scope() or "")
+        rows = [r for r in registry.get("acks", [])
+                if str(r.get("account_scope") or "") == account
+                and str(r.get("exchange") or "").lower() == EXCHANGE_BINANCE
+                and str(r.get("market") or "").lower() == MARKET_USDM_FUTURES]
+        verdicts = [validation_proof_verdict(
+            r, account_scope=account, manual_generation=state.get("generation"))
+            for r in rows]
+        failures = [v["reason_code"] for v in verdicts if not v["valid"]]
+        blocked = state.get("blocked") is True or pending_validation_failure() is not None
+        # A causa humana explícita não fica escondida por um bloqueio de época.
+        reason = ("MANUAL_ACK_RECONFIRMATION_REQUIRED"
+                  if "MANUAL_ACK_RECONFIRMATION_REQUIRED" in failures
+                  else GUARD_ACCOUNT_BLOCKED if blocked
+                  else failures[0] if failures else "MANUAL_VALIDATION_CLEAR")
+        return {"ok": True, "new_entries_blocked": bool(blocked or failures),
+                "reason_code": reason, "scope": "MANUAL_VALIDATION_ONLY"}
+    except Exception:  # diagnóstico indisponível nunca implica liberação
+        return unavailable
 
 
 #: Tolerância de relógio ao comparar carimbos (ms).
