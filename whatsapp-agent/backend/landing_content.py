@@ -78,9 +78,12 @@ def content_for(segment: str | None) -> dict | None:
         "hero_img_alt": f"Agente de {display} atendendo {clients} no WhatsApp",
 
         # ── NÚMEROS (honestos, sem métrica fabricada) ──
+        # "2 min para configurar" saiu em 12/10/2026: a conexão do WhatsApp é o
+        # passo de maior atrito do onboarding e já consumiu horas de suporte num
+        # cliente real. Número sem apuração não fica no site.
         "numbers": [
             {"value": "24h", "label": "Disponível todo dia"},
-            {"value": "2 min", "label": "Para configurar"},
+            {"value": "Sem app", "label": f"Atende {clients} no WhatsApp"},
             {"value": "R$ 0", "label": "Custo de secretária"},
             {"value": "100%", "label": "No seu próprio número"},
         ],
