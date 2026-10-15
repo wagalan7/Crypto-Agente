@@ -88,3 +88,16 @@ persistência/restart/catálogo, não garante atomicidade com a corretora.
 Contagens finais e logs no `LIVE_EVENT_STUDY_CHECKPOINT.md`. Nenhuma tabela,
 coluna, ENV, endpoint, scheduler de produção ou frontend novo. Nenhuma ordem,
 conta, banco externo, exchange, mensagem real, ativação, push ou deploy.
+
+## Continuação de 15/10/2026
+
+Os produtores nominais de risco/alavancagem e throttle foram adicionados em
+contrato próprio, assim como os trechos filler de ordenação/rota/transição.
+Quando presentes, os envelopes `nominal_producer` e `filler_batch` são
+recomputados e vinculados ao input exato. O relatório publica `producer_refs`.
+Assim, risco nominal e test_done não precisam mais ser números soltos para
+essa modalidade. A modalidade anterior continua explicitamente observacional.
+
+Isso fecha parte das pendências acima, não os escritores/cache, a elegibilidade
+completa ou a verdade externa de persistência. Escopos e provas exatos:
+`LIVE_SIZING_PRODUCERS_AND_BATCH.md`. O lote integral segue parcial.

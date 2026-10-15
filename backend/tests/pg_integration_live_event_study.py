@@ -466,6 +466,105 @@ async def run():
                 event.remove(item.sync_engine, "before_cursor_execute", read_only_sql)
             event.remove(AsyncSession.sync_session_class, "after_commit", committed)
             event.remove(AsyncSession.sync_session_class, "after_flush", flushed)
+        # Nominal producer and filler batch are separate source-bound component
+        # proofs. Persist/restart the real study and exact refs, not a supplied
+        # economic summary or a claim that a real broker position was opened.
+        from services import live_nominal_sizing_service as nominal
+        from services import live_filler_batch_service as filler
+        from tests.test_live_sizing_producer_integration import producer_bound_entry
+        producer_manifest, producer_data = entry_study_fixture()
+        producer_entry, producer_sizing = producer_bound_entry()
+        producer_body = {k: copy.deepcopy(v) for k, v in producer_manifest.items() if k != "manifest_hash"}
+        producer_body["hashes"] = None
+        producer_body["shared"]["execution_config"] = copy.deepcopy(producer_entry["config"])
+        producer_manifest = study.parse_manifest(producer_body)
+        producer_data.update(manifest_hash=producer_manifest["manifest_hash"], dataset_hash=None)
+        for arm in ("baseline", "candidate"):
+            producer_data["events"][arm][0]["steps"][0]["request"] = copy.deepcopy(producer_entry)
+        producer_data = study.validate_dataset(producer_data, producer_manifest)
+        producer_report = study.run_study(manifest=producer_manifest, dataset=producer_data, now_ms=NOW)
+        component_refs = producer_sizing["producer_refs"]
+        check("native_producers_both_real_arms_refs_qty_and_money", producer_report.get("ok") is True
+              and set(component_refs) == {"nominal_producer", "filler_batch"}
+              and all(a["records"][0]["state"] == "COMPLETE"
+                      and a["records"][0]["execution"]["upstream_sizing_report"]["qty"] == 2.
+                      and a["records"][0]["execution"]["upstream_sizing_report"]["producer_refs"] == component_refs
+                      and float(a["records"][0]["ledger"]["net_including_funding"]) == 3.8
+                      for a in producer_report.get("arms", {}).values()), producer_report.get("technical_gaps"))
+        check("native_producers_recomputed_sealed_without_authority",
+              study.verify_report(producer_report, recompute=True)["ok"]
+              and producer_report["holdout_status"] == "SEALED"
+              and all(producer_report.get(k) is False for k in
+                      ("promotable", "authorizes_live", "live_equivalent", "real_study_allowed")))
+        producer_ref = study.study_reference(producer_report)
+        check("native_producers_identity_separate_from_three_studies", all(
+              producer_ref != previous for previous in (ref, chain_ref, native_ref)))
+        producer_persisted = await official_study.persist_study(sessions, producer_report)
+        check("native_producers_official_persist_one_generation", producer_persisted.get("published") is True
+              and producer_persisted.get("generation") == 1, producer_persisted)
+        producer_catalog_args = {
+            "champion": producer_manifest["baseline"], "config": study.build_event_envelope(producer_report),
+            "objective": catalog.OBJECTIVES[0], "study_ref": producer_ref,
+            "cutoff": datetime.fromtimestamp(producer_manifest["split"]["as_of_ms"] / 1000, tz=timezone.utc),
+            "fingerprint": producer_report["identity"]["dataset_hash"],
+        }
+        producer_created = await catalog.create_preselection_experiment(**producer_catalog_args)
+        check("native_producers_catalog_separate_inactive_draft", producer_created.get("ok") is True
+              and producer_created.get("status") == "DRAFT" and producer_created.get("promotable") is False
+              and producer_created.get("experiment_id") not in
+                  {created["experiment_id"], chain_created["experiment_id"], native_created["experiment_id"]},
+              producer_created)
+
+        await engine.dispose()
+        await db._engine.dispose()
+        engine = await new_engine()
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        policy_state._STATE_CACHE.clear()
+        producer_repeated = await official_study.persist_study(sessions, producer_report)
+        async with sessions() as session:
+            stored_producer = (await session.execute(select(State).where(
+                State.experiment_key == producer_ref["experiment_key"]))).scalar_one()
+            stored_component_sizing = stored_producer.payload["event_report"]["arms"]["baseline"]["records"][0][
+                "execution"]["upstream_sizing_report"]
+            check("native_producers_jsonb_restart_exact_refs_qty_generation",
+                  producer_repeated.get("published") is False and producer_repeated.get("generation") == 1
+                  and producer_repeated.get("reason_code") == "EVENT_STUDY_UNCHANGED"
+                  and stored_producer.payload == {"event_report": producer_report}
+                  and stored_producer.evidence_key == producer_report["report_hash"]
+                  and stored_producer.generation == 1
+                  and stored_component_sizing["producer_refs"] == component_refs
+                  and stored_component_sizing["report_hash"] == producer_sizing["report_hash"]
+                  and stored_component_sizing["request_hash"] == producer_entry["upstream_sizing"]["request_hash"]
+                  and stored_component_sizing["qty"] == 2., producer_repeated)
+
+        producer_previous_reads = len(read_sql)
+        producer_guarded_engines = (engine, db._engine)
+        for item in producer_guarded_engines:
+            event.listen(item.sync_engine, "before_cursor_execute", read_only_sql)
+        event.listen(AsyncSession.sync_session_class, "after_commit", committed)
+        event.listen(AsyncSession.sync_session_class, "after_flush", flushed)
+        try:
+            with ExitStack() as guards:
+                for module, name in ((study, "run_study"), (study.execution, "replay_execution"),
+                                     (study.manager, "run_trace"), (study.ledger, "replay_accounting"),
+                                     (study.evidence, "evaluate_evidence"), (upstream, "replay"),
+                                     (nominal, "replay"), (filler, "replay"), (subprocess, "run")):
+                    guards.enter_context(patch.object(module, name,
+                        side_effect=AssertionError("nominal/filler replay on GET")))
+                producer_loaded = await study.load_study(sessions, producer_ref)
+                producer_experiment = await catalog.get_experiment(producer_created["experiment_id"])
+            check("native_producers_get_exact_report_and_inactive_catalog",
+                  producer_loaded.get("available") is True and producer_loaded.get("report") == producer_report
+                  and producer_experiment is not None and producer_experiment["status"] == "DRAFT"
+                  and producer_experiment["shadow_started_at"] is None)
+            check("native_producers_get_zero_replay_writes_commits_flushes",
+                  not write_attempts and not commits and not flushes
+                  and len(read_sql) >= producer_previous_reads + 2)
+        finally:
+            for item in producer_guarded_engines:
+                event.remove(item.sync_engine, "before_cursor_execute", read_only_sql)
+            event.remove(AsyncSession.sync_session_class, "after_commit", committed)
+            event.remove(AsyncSession.sync_session_class, "after_flush", flushed)
         check("no_new_tables_or_columns", await schema_signature() == schema_before)
         check("zero_tcp_udp_dns_foreign_unix", NETWORK == {"tcp_udp": 0, "dns": 0, "foreign_unix": 0}, NETWORK)
         print("LIVE_EVENT_STUDY_PG_OK", len(CHECKS), flush=True)

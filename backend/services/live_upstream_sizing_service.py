@@ -24,7 +24,8 @@ WORKER = BACKEND / "scripts/live_upstream_sizing_worker.py"
 SOURCE_FILES = ("services/shadow_trade_service.py", "services/symbol_learning_service.py",
     "services/edge_decay_service.py", "services/regime_service.py",
     "services/live_upstream_sizing_service.py", "scripts/live_upstream_sizing_worker.py",
-    "services/live_event_execution_service.py")
+    "services/live_event_execution_service.py", "services/live_nominal_sizing_service.py",
+    "scripts/live_nominal_sizing_worker.py", "services/live_filler_batch_service.py")
 HELPERS = {"_conviction_mult", "_edge_mult", "_funding_ev_r", "_get_rec_feature", "_compute_qty",
     "_exec_size_damp", "_short_slip_guard", "_liq_tier_mult", "_regime_size_mult",
     "_sizing_stack_report", "_resolve_equity_usd"}
@@ -40,7 +41,7 @@ REPORT_FIELDS = {"version", "status", "reason_code", "input_scope", "request_has
     "source_fingerprint", "source", "test_only", "opportunity_id", "raw_risk_pct", "final_risk_pct",
     "qty", "notional", "sizing", "steps", "observations_used", "decisions", "gaps", "declared_policy",
     "authorizes_live", "promotable", "live_equivalent", "real_study_allowed", "blocked_network_attempts",
-    "isolation", "report_hash"}
+    "isolation", "producer_refs", "report_hash"}
 
 
 def canonical(value):
@@ -195,8 +196,78 @@ def _observation(observation, name, decision):
         seen.add(key)
 
 
+def source_material(request):
+    keys = ("recommendation", "context", "observations", "nominal_producer", "filler_batch")
+    return {k: request[k] for k in keys if k in request}
+
+
+def validate_producer_bindings(request):
+    """Native producers are optional for the old observed-input contract only.
+
+    Once supplied, they must be complete, recomputed and match the exact input.
+    None of these component proofs substitutes for eligibility or DB truth.
+    """
+    rec = request["recommendation"]
+    refs = {}
+    for key in ("nominal_producer", "filler_batch"):
+        if key not in request:
+            continue
+        pair = request[key]
+        _closed(pair, {"request", "report"}, key)
+        if key == "nominal_producer":
+            from services import live_nominal_sizing_service as producer
+        else:
+            from services import live_filler_batch_service as producer
+        original = producer.validate_request(pair["request"])
+        report = (producer.validate_report(pair["report"], original, recompute=True)
+                  if key == "filler_batch" else producer.validate_report(pair["report"], original))
+        if (original["decision_at_ms"] > request["decision_at_ms"] or original["source"] != request["source"]
+                or original["test_only"] is not request["test_only"]):
+            raise ValueError("UPSTREAM_PRODUCER_SOURCE_OR_CLOCK_DRIFT:" + key)
+        if key == "nominal_producer":
+            if report["status"] != "COMPLETE_NOMINAL":
+                raise ValueError("UPSTREAM_NOMINAL_UNAVAILABLE")
+            matches = [r["recommendation"] for r in report["recommendations"]
+                       if r["opportunity_id"] == request["opportunity_id"]]
+            if len(matches) != 1:
+                raise ValueError("UPSTREAM_NOMINAL_OPPORTUNITY_DRIFT")
+            expected = matches[0]
+        else:
+            if (report["status"] != "COMPLETE_CONTEXT" or report["opportunity_id"] != request["opportunity_id"]
+                    or report["route"]["allowed"] is not True):
+                raise ValueError("UPSTREAM_FILLER_ROUTE_NOT_READY")
+            expected = report["recommendation"]
+            if request["context"]["filler_test_done"] != report["state_before"]["test_done"]:
+                raise ValueError("UPSTREAM_FILLER_COUNTER_DRIFT")
+            for field in set(original["config"]) & set(request["config"]["shadow"]):
+                if original["config"][field] != request["config"]["shadow"][field]:
+                    raise ValueError("UPSTREAM_FILLER_CONFIGURATION_DRIFT")
+            if rec.get("_is_filler", False) is not expected.get("_is_filler", False):
+                raise ValueError("UPSTREAM_FILLER_CLASSIFICATION_DRIFT")
+        if any(k not in rec or canonical(rec[k]) != canonical(value) for k, value in expected.items()):
+            raise ValueError("UPSTREAM_PRODUCER_RECOMMENDATION_DRIFT:" + key)
+        refs[key] = {"request_hash": original["request_hash"], "report_hash": report["report_hash"],
+                     "batch_id": original["batch_id"], "scope": report["input_scope"]}
+    if len(refs) == 2:
+        if refs["nominal_producer"]["batch_id"] != refs["filler_batch"]["batch_id"]:
+            raise ValueError("UPSTREAM_PRODUCER_BATCH_ID_DRIFT")
+        nominal_pair, filler_pair = request["nominal_producer"], request["filler_batch"]
+        available = nominal_pair["request"]["decision_at_ms"]
+        if (available > filler_pair["request"]["decision_at_ms"]
+                or any(item["observation"]["observed_at_ms"] < available for item in filler_pair["request"]["history"])):
+            raise ValueError("UPSTREAM_PRODUCER_STAGE_CLOCK_REVERSED")
+        members = {r["opportunity_id"]: r["recommendation"] for r in nominal_pair["report"]["recommendations"]}
+        for row in filler_pair["request"]["recommendations"]:
+            expected = members.get(row["opportunity_id"])
+            actual = row["recommendation"]
+            if expected is None or any(k not in actual or canonical(actual[k]) != canonical(v) for k, v in expected.items()):
+                raise ValueError("UPSTREAM_FILLER_BATCH_NOT_FROM_NOMINAL_PRODUCER")
+    return refs
+
+
 def validate_request(request):
-    _closed(request, FIELDS, "request")
+    optional = set(request) & {"nominal_producer", "filler_batch"} if isinstance(request, dict) else set()
+    _closed(request, FIELDS | optional, "request")
     canonical(request)
     execution._credential_free(request)
     if request["version"] != VERSION or request["source"] not in execution.SOURCES:
@@ -208,7 +279,7 @@ def validate_request(request):
         raise ValueError("UPSTREAM_TEST_ONLY_BOUNDARY")
     for key in ("producer", "source_id", "source_hash"):
         _text(provenance[key], key)
-    if (provenance["source_hash"] != digest({k:request[k] for k in ("recommendation", "context", "observations")})
+    if (provenance["source_hash"] != digest(source_material(request))
             or provenance["quality"] != execution.SOURCES[request["source"]]):
         raise ValueError("UPSTREAM_PROVENANCE_DRIFT")
     if request["source"] == "DECLARED_EVENT_TABLE":
@@ -247,21 +318,27 @@ def validate_request(request):
     _closed(request["observations"], {"equity", "symbol_learning", "edge_decay"}, "observations")
     for name, obs in request["observations"].items():
         _observation(obs, name, request["decision_at_ms"])
+    validate_producer_bindings(request)
     return copy.deepcopy(request)
 
 
 def make_request(*, config, recommendation, context, observations, decision_at_ms, opportunity_id,
-                 source="TEST_ONLY_OBSERVED_EVENTS", source_provenance=None):
+                 source="TEST_ONLY_OBSERVED_EVENTS", source_provenance=None, nominal_producer=None, filler_batch=None):
+    material = {"recommendation": recommendation, "context": context, "observations": observations}
+    for key, value in (("nominal_producer", nominal_producer), ("filler_batch", filler_batch)):
+        if value is not None:
+            material[key] = value
     if source_provenance is None and source == "TEST_ONLY_OBSERVED_EVENTS":
         source_provenance = {"producer": "TEST_ONLY_FIXTURE", "source_id": "TEST_ONLY",
-            "source_hash": digest({"recommendation": recommendation, "context": context, "observations": observations}),
+            "source_hash": digest(material),
             "quality": "TEST_ONLY", "model_version": None, "synthetic": True}
     body = {"version": VERSION, "source": source,
         "test_only": source == "TEST_ONLY_OBSERVED_EVENTS" or bool((source_provenance or {}).get("synthetic")),
         "source_provenance": source_provenance,
         "source_fingerprint": source_fingerprint(), "decision_at_ms": decision_at_ms,
         "opportunity_id": opportunity_id, "recommendation": recommendation, "config": config,
-        "context": context, "observations": observations}
+        "context": context, "observations": observations,
+        **{k: material[k] for k in ("nominal_producer", "filler_batch") if k in material}}
     return validate_request({**copy.deepcopy(body), "request_hash": digest(body)})
 
 
@@ -277,6 +354,7 @@ def validate_report(report, request):
             or report.get("opportunity_id") != request["opportunity_id"]
             or report.get("raw_risk_pct") != request["recommendation"]["risk_pct"]
             or report.get("runtime_identity") != execution.runtime_identity()
+            or report.get("producer_refs") != validate_producer_bindings(request)
             or any(report.get(k) is not False for k in ("authorizes_live", "promotable", "live_equivalent", "real_study_allowed"))
             or report.get("report_hash") != digest({k:v for k,v in report.items() if k != "report_hash"})):
         raise ValueError("UPSTREAM_REPORT_BOUNDARY_DRIFT")

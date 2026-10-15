@@ -160,3 +160,74 @@ Provas finais desta camada, com fontes congeladas:
   `/tmp/cw_upstream_full_final.log` (577,5 s).
 - Commit somente local com os 12 arquivos explícitos desta camada. Pessoais
   e outros projetos preservados e fora do stage; sem stash/reset/clean/amend.
+
+## Retomada de 15/10 — produtores nominais e contexto filler
+
+Base `1a6a4ded`. Produtores nativos de risco/alavancagem e throttle, no ponto
+pós-build/pré-sort/pré-portfolio, implementados com lista inteira e caller
+explícito. AST valida cálculo/cópia/ordem real; caminho legado sem throttle.
+Não reaplicar sobre recomendação já dimensionada. Tier/score/lista continuam
+observados, não reconstruídos pelo scanner. Report nominal reexecuta funções
+reais para recusar adulteração econômica mesmo re-hasheada.
+
+Contexto filler executa trechos AST originais de sort estável, rota
+allowlist/capacidade/freio e incremento pós-persistência. Teste desligado não
+consome contador; incidente/None não incrementam, UNKNOWN não fornece próximo
+contexto. Histórico é prefixo ordenado, causal e vinculado a oportunidade,
+trade/client/dispatch; repetição/restart recompõem o mesmo estado. Não usamos
+POST/fill/manager seed como prova de retorno de persistência. Os retornos e
+contagens iniciais são fatos observados; não alegamos writer DB reproduzido.
+
+Envelopes opcionais nominal_producer/filler_batch integram source_hash,
+validação e producer_refs do sizing. Presença exige ambos próprios vínculos
+íntegros/completos; componentes ausentes mantêm modalidade observacional antiga.
+Dados nominais devem estar disponíveis antes do filler; histórico não pode
+antecipá-los. Todos os membros filler precisam existir no batch nominal.
+Nada disso substitui elegibilidade completa ou autoriza LIVE/estudo real.
+
+Ainda técnicos: origem integral de scores/tiers/seleção/elegibilidade, leitores
+e writers de histórico/learning/decay, export frio com excluídos/purga/ordem
+prospectiva e caixa/Binance integral. Não retomar pelo produtor nominal ou
+contador já demonstrados, nem chamar essas pendências somente WAITING_DATA.
+Lote permanece LOCAL_RESEARCH_PARTIAL. Relatório de escopo/retomada:
+`LIVE_SIZING_PRODUCERS_AND_BATCH.md`.
+
+Nenhum serviço LIVE/flag/limite/estratégia/posição manual/histórico alterado;
+sem DDL/ENV/endpoint/frontend novo, conta/DB externo, ordem, mensagem, ativação,
+push ou deploy. Somente commit local após as validações finais abaixo.
+
+Mapa somente leitura para a próxima pendência (não implementado nesta etapa):
+
+- SLS: `relearn_all_from_history` lê SymbolBacktestStats atuais; reusar as duas
+  passadas/derive_params/rank nativos e estado anterior. Upsert só do melhor
+  TF preserva linhas antigas; não reconstruir cache apenas com vencedores.
+  `refresh_cache` não possui TTL e preserva cache antigo em falha.
+- Decay: `maybe_refresh` lê RecommendationSnapshot por outcome_at, com duas
+  leituras nativas de relógio. TTL só suprime refresh com cache não vazio;
+  falha conserva cache/timestamp. Reusar agregação e getters sem traduzir.
+- Computed_at/learned_at atuais e outcome_at não provam que o dado estava
+  publicado antes da decisão. Congelar versões prospectivas, estado anterior,
+  parâmetros e geração; sem história as-of: HISTORY_AS_OF_UNAVAILABLE. Não
+  retrodatar agregado sobrescrito ou outcome ainda não disponível.
+
+Provas finais já concluídas: 134 focais OK 2×, sem skip novo; sintaxe dos 11
+Python e diff-check aprovados. Logs `/tmp/cw_sizing_producers_focus_1.log` e
+`/tmp/cw_sizing_producers_focus_2.log`. Incluem os 62 da camada anterior mais
+38 nominais, 25 filler e nove integrações novas, com fontes congeladas.
+
+PG16/asyncpg descartável: 66 verificações OK 2×; as 58 anteriores preservadas
+e oito novas ligando os produtores a estudo/JSONB/restart/DRAFT/GET read-only.
+Mesmas qty 2 e líquido sintético 3,80 nos dois braços; nenhuma aprovação
+econômica é inferida desse exemplo. Duas conexões/CAS anteriores preservadas,
+zero TCP/DNS/Unix externo, sem DDL novo. Runners encerraram os dois clusters.
+Logs `/tmp/cw_sizing_producers_pg_1.log` e `/tmp/cw_sizing_producers_pg_2.log`.
+
+Backend completo: **3.313 executados / 3.311 aprovados / dois skips históricos
+R05C** por fixture auditada privada ausente. Nenhum skip novo ou fixture
+fabricada. Uma rodada final com fontes congeladas, 598,5 s, exit 0;
+`/tmp/cw_sizing_producers_full.log`. Os erros/warnings anteriores no log são
+cenários negativos exercitados, não falhas finais da suíte.
+
+Commit local do bloco: 16 arquivos explícitos, índice sem pessoais/outros
+projetos. `.DS_Store`/settings pessoais e untracked preexistentes preservados;
+sem stash/reset/clean/amend, envio ao remoto ou publicação.

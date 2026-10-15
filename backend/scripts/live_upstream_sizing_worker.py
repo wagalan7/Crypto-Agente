@@ -319,6 +319,7 @@ async def run(payload, backend, contract):
         "notional": result["notional"] if result else None,
         "sizing": result["sizing"] if result else None,
         "steps": runtime.steps, "observations_used": runtime.calls,
+        "producer_refs": contract.validate_producer_bindings(payload),
         "decisions": runtime.decisions, "gaps": runtime.gaps,
         "declared_policy": {
             "stage": INPUT_SCOPE, "source_file": str(shadow_path),
@@ -366,6 +367,14 @@ def main():
         sys.modules[contract.__name__] = contract
         exec(compile(path.read_bytes(), str(path), "exec"), contract.__dict__)
         payload = json.loads(sys.stdin.read())
+        for key, relative in (("nominal_producer", "live_nominal_sizing_service"),
+                              ("filler_batch", "live_filler_batch_service")):
+            if key in payload:
+                module = types.ModuleType("services." + relative)
+                module.__file__ = str(backend / "services" / (relative + ".py"))
+                sys.modules[module.__name__] = module
+                setattr(package, relative, module)
+                exec(compile(Path(module.__file__).read_bytes(), module.__file__, "exec"), module.__dict__)
         result = asyncio.run(run(payload, backend, contract))
         print(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False))
     except Exception as exc:

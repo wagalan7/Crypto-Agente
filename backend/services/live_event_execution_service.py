@@ -39,6 +39,8 @@ SOURCE_FILES = (
     "scripts/live_event_execution_worker.py", "services/live_upstream_sizing_service.py",
     "scripts/live_upstream_sizing_worker.py", "services/symbol_learning_service.py",
     "services/edge_decay_service.py", "services/regime_service.py",
+    "services/live_nominal_sizing_service.py", "scripts/live_nominal_sizing_worker.py",
+    "services/live_filler_batch_service.py",
 )
 CONFIG_BOOL = {"MAKER_ENTRY_ENABLED", "MAKER_FALLBACK_MARKET",
                "P04A_ENTRY_REVALIDATION_ENABLED", "P04B_MARKET_REVALIDATION_ENABLED",

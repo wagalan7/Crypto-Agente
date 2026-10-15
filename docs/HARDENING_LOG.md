@@ -3128,3 +3128,31 @@ Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
 - Relatório e retomada: LIVE_UPSTREAM_SIZING_RESEARCH.md /
   LIVE_EVENT_STUDY_CHECKPOINT.md. Pessoais, manual, histórico e defaults
   preservados. Sem produção, ordem, ativação, mensagem, push ou deploy.
+
+## 15/10/2026 — produtores nominais e contexto filler (base 1a6a4ded)
+
+- _compute_leverage/throttle/is_btc_symbol nativos, lista pós-build inteira,
+  fonte/caller/ordem AST explícitos. Perfis/caps/round/rawsymbol preservados;
+  recomposição rejeita resultado econômico adulterado mesmo re-hasheado.
+- Sort estável e gate filler nativos; contadores incrementam só pelo trecho
+  original após retorno observado de persistência sem incidente. Prefixo e
+  relógios vinculados, duplicatas/UNKNOWN recusados, teste OFF não lê contador.
+  Persistência e leitores iniciais são observados, não DB/writers replicados.
+- Vínculos opcionais fonte/batch/relógio/risco/lev/rec/config/counter chegam ao
+  sizing/execução/estudo e producer_refs. Consumidor não reaplica canário.
+  Revisão fechou inversão nominal→filler e membros filler sem origem nominal;
+  controles recusam adulterações mesmo com hashes refeitos.
+- LIVE, parâmetros, limites, defaults, conta/manual/histórico preservados;
+  nenhum DDL/ENV/rota/frontend/worker de produção ou acesso externo. Quatro
+  autoridades falsas, catálogo DRAFT, lote LOCAL_RESEARCH_PARTIAL. Não alegar
+  lucro/menos stops, aprovação econômica ou equivalência integral do bot.
+- Pendências/provas finais: LIVE_SIZING_PRODUCERS_AND_BATCH.md /
+  LIVE_EVENT_STUDY_CHECKPOINT.md. Sem push/deploy; commit somente local.
+- Provas finais com fontes congeladas: 134 focais OK 2×; PG16/asyncpg local
+  66 checks OK 2× (58 anteriores + oito novos), fonte/refs/qty/ledger, catálogo
+  DRAFT, restart/JSONB e GET sem replay/escrita. Zero rede externa, clusters
+  encerrados; sintaxe 11 Python e diff-check limpos. Nenhum TS/TSX/dist novo.
+- Backend completo: 3.313 executados / 3.311 aprovados / dois skips R05C
+  históricos da fixture auditada privada ausente. Uma rodada final com fontes
+  congeladas, exit 0 (598,5 s), sem skip novo; log no checkpoint. Somente 16
+  arquivos do bloco no commit, pessoais e outros projetos preservados.

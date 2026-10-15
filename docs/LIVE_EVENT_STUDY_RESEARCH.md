@@ -90,9 +90,13 @@ Sem migração/tabela/coluna/ENV/endpoint/scheduler novo, nem frontend alterado.
    trecho original do caller e helpers/acessores reais, com equity e caches
    causais explícitos, sem reaplicar o canário. ENTRY que declara essa camada
    não pode omiti-la e cair no cálculo legado. Detalhes em
-   `LIVE_UPSTREAM_SIZING_RESEARCH.md`. Ainda faltam os produtores nominais de
-   risco/alavancagem, elegibilidade/filler, escritores do aprendizado/decay e
-   estado do batch. Snapshot observado não prova a geração de seu histórico;
+   `LIVE_UPSTREAM_SIZING_RESEARCH.md`. Ainda faltam a geração de elegibilidade,
+   os escritores do aprendizado/decay e a geração dos leitores anteriores.
+   Em 15/10, os produtores nominais e throttle de batch foram
+   completados localmente, junto dos trechos filler de sort/rota/contadores;
+   detalhes em `LIVE_SIZING_PRODUCERS_AND_BATCH.md`. A lista pós-build, tier
+   final, dados dos leitores e retornos de persistência continuam observados.
+   Isso não reproduz todo o scanner nem prova a geração de seu histórico;
    não alegamos equivalência integral do stack de decisão do bot.
 3. **Exportações antigas com exclusões:** não conservam todos os IDs excluídos.
    A anexação recusa reduzir silenciosamente o denominador. Novo export precisa

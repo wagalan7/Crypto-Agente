@@ -136,6 +136,11 @@ async def run(payload, backend):
         upstream = load_source("services.live_upstream_sizing_service", backend / "services/live_upstream_sizing_service.py")
         package.live_upstream_sizing_service = upstream
         if "upstream_sizing" in payload:
+            for key, relative in (("nominal_producer", "live_nominal_sizing_service"),
+                                  ("filler_batch", "live_filler_batch_service")):
+                if key in payload["upstream_sizing"]:
+                    module = load_source("services." + relative, backend / "services" / (relative + ".py"))
+                    setattr(package, relative, module)
             native_sizing = {"request": payload["upstream_sizing"], "report": upstream.replay(payload["upstream_sizing"])}
     payload = contract.validate_execution_request(payload,
                                                   expected_source_fingerprint=contract.execution_source_fingerprint())
