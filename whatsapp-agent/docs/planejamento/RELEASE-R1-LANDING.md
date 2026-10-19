@@ -98,8 +98,13 @@ Outros fatos verificados no GitHub (somente leitura):
 
 ## 3. Railway: configuração verificada — nada mais bloqueia o R1
 
-O CLI foi reautenticado por você (`railway login` encontrou `RAILWAY_API_TOKEN`,
-sessão de `wagalan@gmail.com`). Li a configuração **somente leitura** pela API
+Acesso: `railway login` não roda no shell não interativo deste agente, então foi
+executado no terminal do proprietário. Lá, **o fluxo pelo navegador não chegou a
+abrir**: o CLI encontrou `RAILWAY_API_TOKEN` já presente no ambiente daquele
+terminal e entrou com ele (sessão de `wagalan@gmail.com`). O valor do token não
+foi lido, pedido nem exibido; nenhum `.env` foi lido. As consultas rodaram
+naquele terminal, porque o shell do agente não tem o token. Li a configuração
+**somente leitura** pela API
 GraphQL e pelo shell do contêiner. Nenhum valor de variável foi lido ou impresso;
 nada foi alterado, nenhum serviço reiniciado.
 
@@ -132,6 +137,7 @@ Os 318 MB se explicam inteiros: `consultorio.db` = 40,4 MB e `/data/backups` =
 |---|---|---|
 | **V-A** 🟢 | filtro de caminho do Agente | `rootDirectory = 'whatsapp-agent'`, `watchPatterns = []` |
 | **V-C** 🟢 | branch | `wagalan7/Crypto-Agente`, branch `main` |
+| **V-C2** 🟢 | Auto Deploy | gatilho de repositório configurado (`repoTriggers` → `main`). Não li um campo "auto deploy" isolado; o comportamento confirma: push do R1 às 18:33:06Z → deployment criado pelo `railway-app[bot]` às 18:33:10Z; push do R3 às 17:12:42Z → deployment às 17:12:46Z. **Ligado** |
 | **V-D** 🟢 | config-as-code | `railwayConfigFile = None` → **`whatsapp-agent/railway.toml` NÃO está em uso** |
 | **V-E** 🟢 | gatilho dos serviços de cripto | ver §2 — todos com `rootDirectory` em `backend` |
 | **V-F** 🟢 | variáveis (só existência) | `MASTER_KEY`, `FIELD_ENCRYPTION_KEY`, `BASE_URL`, os quatro `BACKUP_S3_*`, `MP_WEBHOOK_SECRET`, `SMTP_HOST`, `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, `DATA_DIR`, `ADMIN_PASSWORD` **existem**. 45 variáveis, 31 definidas no serviço |
@@ -260,6 +266,44 @@ amanhã às 3h o backup automático continuará copiando só o banco.
 
 Pendência de **E06** (dados e restauração): incluir `/data/contracts/` no
 `backup_service`. Não é item de release e não entra no R1.
+
+### Banco e contratos foram capturados em momentos diferentes — o que isso garante
+
+Registro exigido pelo item 4 do prompt de acesso e backup. **Faltava nesta
+seção** até a revisão de 19/10.
+
+**Ordem usada:** primeiro o banco (API de backup online), depois o `tar` dos
+contratos, segundos depois, no mesmo script. **Não é atômico.**
+
+**Ordem do produto ao assinar** (`contract_service.sign_contract`, conferido no
+código em produção): grava **primeiro o PDF** em `/data/contracts/` e **depois**
+marca a linha como assinada no banco. A linha do contrato nasce no envio, sem
+PDF; o PDF só passa a existir na assinatura.
+
+| | Garantido? |
+|---|---|
+| Banco internamente consistente (instantâneo único) | ✅ sim — API de backup do SQLite |
+| Cada PDF íntegro | ⚠️ quase sempre — o produto grava com `open/write`, sem gravação atômica; um PDF capturado no exato instante da escrita sairia truncado |
+| Banco e contratos coerentes entre si | ❌ **não garantido** — ver abaixo |
+
+**A única divergência possível nessa ordem:** se um contrato for assinado entre
+a cópia do banco e o `tar`, a restauração terá **o PDF assinado, mas a linha no
+banco ainda como não assinada** (sem a trilha de IP/agente no banco — o PDF
+carrega o hash e os dados do signatário). O inverso — banco dizendo "assinado"
+sem o PDF — **não pode acontecer** nessa ordem, porque o produto grava o PDF
+antes da linha. A ordem usada é, portanto, a favorável. A janela foi de
+segundos.
+
+**Observação, não conclusão:** o banco tinha **33 linhas** em `contracts` e o
+volume, **25 PDFs**. Isso é compatível com 8 contratos enviados e ainda não
+assinados, que não têm PDF. Mas **a contagem de linhas assinadas não foi
+conferida**, porque seria uma nova leitura de dado real que não estava
+autorizada. Fica como verificação para a restauração completa do R2.
+
+**Para E06:** o backup automático de contratos deve fechar com uma
+**reconciliação**: todo contrato assinado no banco tem o seu PDF no pacote, e
+todo PDF no pacote tem a sua linha. Isso é o que transforma "capturados em
+momentos próximos" em "coerentes entre si".
 
 ## 5. Restauração — validada contra o banco **real**, em destino isolado
 
