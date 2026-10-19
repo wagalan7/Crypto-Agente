@@ -90,10 +90,13 @@ regra de publicar **fora de 7h–22h** deixa de ser só conservadorismo: há
 indisponibilidade real e medida na troca. É coerente com o volume montado,
 porque dois contêineres não compartilham o mesmo volume ao mesmo tempo.
 
-## Pendente, fora do escopo autorizado
+## Confirmações para consultas marcadas como falta — decidido: manter
 
-`get_pending_confirmations_for_tomorrow` ainda pede confirmação para consultas
-marcadas como "faltou sem aviso". Se a psicóloga registrar hoje a falta de uma
-consulta de amanhã, o agente envia a essa paciente "confirme sua consulta de
-amanhã". A recomendação é excluir esse caso. Isso muda **mensagens enviadas a
-pacientes**, então depende de decisão do proprietário.
+`get_pending_confirmations_for_tomorrow` continua pedindo confirmação para
+consultas marcadas como "faltou sem aviso". Se a psicóloga registrar hoje a
+falta de uma consulta de amanhã, o agente envia a essa paciente "confirme sua
+consulta de amanhã".
+
+A recomendação técnica era excluir esse caso. Em 19/10 o proprietário
+**decidiu manter o comportamento atual**. Nenhuma mudança de código. Fica
+registrado aqui para que não volte a aparecer como defeito em auditoria futura.
