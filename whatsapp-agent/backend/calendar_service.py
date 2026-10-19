@@ -117,12 +117,13 @@ def find_slots(tenant: dict, *, days_ahead: int = 14, on_date=None,
     booked = db.get_appointments_in_range(tenant_id, now.isoformat(), end_date.isoformat())
     booked_dts = []
     for r in booked:
-        # Horário fica LIVRE quando a consulta foi cancelada ou o paciente
-        # avisou que não vem (missed_with_notice) — nesses casos a vaga deve
-        # voltar a ser ofertada para outro paciente.
+        # Horário fica LIVRE quando a consulta foi cancelada ou quando a sessão
+        # não vai acontecer, com ou sem aviso prévio — nesses casos a vaga deve
+        # voltar a ser ofertada para outro paciente. Mesma regra de has_conflict:
+        # cobrança é decidida em outro lugar e não entra aqui.
         if r.get("cancelled"):
             continue
-        if (r.get("attendance") or "pending") == "missed_with_notice":
+        if (r.get("attendance") or "pending") in db.ATTENDANCE_LIBERA_HORARIO:
             continue
         if exclude_id is not None and r.get("id") == exclude_id:
             continue

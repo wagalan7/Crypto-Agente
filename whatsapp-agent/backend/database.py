@@ -2318,6 +2318,15 @@ def confirm_appointment(tenant_id: int, appointment_id: int, conn=None) -> bool:
 
 ATTENDANCE_VALUES = {"pending", "attended", "missed_no_notice", "missed_with_notice"}
 
+# Estados em que a sessão NÃO vai acontecer: o horário volta a ficar livre.
+#
+# Cobrança e ocupação são perguntas diferentes e esta constante responde só a
+# segunda. "Faltou sem aviso" continua cobrando (ver set_attendance e o cálculo
+# de `billable`) — mas uma paciente que não vem não ocupa a sala, e manter o
+# horário bloqueado impedia tanto o reagendamento manual quanto a oferta do
+# horário pelo agente a outro paciente.
+ATTENDANCE_LIBERA_HORARIO = frozenset({"missed_no_notice", "missed_with_notice"})
+
 
 def set_attendance(tenant_id: int, appointment_id: int, status: str) -> bool:
     """Atualiza status de comparecimento. Valores válidos:
@@ -2515,19 +2524,21 @@ def has_conflict(tenant_id: int, dt: datetime, duration_min: int, exclude_id: in
 
     Ignora:
     - Consultas canceladas (cancelled = 1)
-    - Consultas em que o paciente avisou que não vem (missed_with_notice) —
-      o horário foi liberado e pode receber outro paciente
+    - Consultas em que a sessão não vai acontecer, com ou sem aviso prévio
+      (ATTENDANCE_LIBERA_HORARIO) — o horário volta a ficar livre e pode
+      receber outro paciente
     - Placeholders de "novo paciente" (ano >= 2099)
     """
     from datetime import datetime as _dt
+    livres = sorted(ATTENDANCE_LIBERA_HORARIO)
     with get_conn() as conn:
         query = (
             "SELECT id, scheduled_at FROM appointments "
             "WHERE tenant_id = ? AND cancelled = 0 "
-            "AND COALESCE(attendance, 'pending') != 'missed_with_notice' "
-            "AND scheduled_at < '2099-01-01'"
+            "AND COALESCE(attendance, 'pending') NOT IN (%s) "
+            "AND scheduled_at < '2099-01-01'" % ",".join("?" * len(livres))
         )
-        params = [tenant_id]
+        params = [tenant_id, *livres]
         if exclude_id is not None:
             query += " AND id != ?"
             params.append(exclude_id)
