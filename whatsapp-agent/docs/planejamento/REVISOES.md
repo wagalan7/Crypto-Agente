@@ -61,3 +61,48 @@ atende a premissa do ESCOPO v1.0 ("um responsável técnico ... com disponibilid
 regular nos dias úteis") e **confirma a baseline de 24 semanas**, sem alteração
 de datas. B1 fica encerrado; B3 (contas externas de homologação) segue aberto e
 continua sendo o maior risco de calendário.
+
+---
+
+## v1.2 — 19/10/2026 · direção visual definida
+
+**Aprovada por:** proprietário, em `identidade-visual/DIRETRIZ-MARCA.md`.
+**Datas:** mantidas. Nenhuma semana do CRONOGRAMA foi alterada.
+**Escopo total:** inalterado. É **insumo** de etapas existentes, não requisito
+novo; nenhum trabalho foi movido entre etapas.
+**Estados:** nenhum alterado. E08 e E27 continuam PENDENTES.
+
+### O que mudou
+
+A identidade visual do app, dos próximos módulos e da página de vendas passa a
+ser vinho / rosé / nude / off-white, no lugar do violeta atual (`brand`
+`#7c3aed` em cinco templates e nos protótipos anteriores não versionados). A
+estrutura leve dessas referências é preservada: espaços, cards, filtros, agenda
+em grade e painéis de detalhes. Logo principal: `04-logo-fornecida.png`.
+
+### Onde está
+
+| Arquivo | Conteúdo |
+|---|---|
+| `identidade-visual/DIRETRIZ-MARCA.md` | diretriz original, cópia inalterada |
+| `identidade-visual/referencias/01–04` | as quatro imagens, cópias byte a byte (sha256 conferido) |
+| `identidade-visual/REGISTRO.md` | inventário, papel de cada imagem, medições, restrições |
+| `ETAPAS/08.md`, `ETAPAS/27.md` | seção "Revisão v1.2" |
+| `prompts/08.txt`, `prompts/27.txt` | nota v1.2 apontando para os itens acima |
+
+### Medido no registro, não presumido
+
+- A logo é RGB **sem transparência**, com fundo preto sólido; a assinatura tem
+  **1,14:1** contra esse fundo. Precisa de preparação antes de uso (E08).
+- As amostras de paleta dos painéis 01 e 03 **divergem** em todas as famílias:
+  os HEX registrados são aproximações, não valores oficiais.
+- O rosé fica no limite de AA para texto normal (4,51–4,76:1); nude, rosa suave
+  e off-white só servem como superfície ou decoração.
+
+### Aplicação
+
+E08 consolida tokens, ativos e componentes depois de protótipo com dados
+fictícios (Hoje, Agenda, Financeiro; desktop e celular). Os módulos seguintes
+herdam o padrão. E27 aplica à página de vendas. Uma aplicação visual anterior a
+E27 pode ser release separado e revisável, sem alterar o R1 nem misturar com
+backend ou filas.

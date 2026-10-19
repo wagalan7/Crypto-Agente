@@ -10,3 +10,5 @@ ACEITE
 Promessa mapeada a evidência/versão; checkout e recuperação testados em sandbox; celular e contatos funcionam; exemplos fictícios. Proposta visual e textos revisados, oferta e custos aprovados; não publicar site ou enviar campanhas sem aprovação.
 
 NOTA v1.1 (12/10/2026): houve transferência de conteúdo entre E02, E04 e E27, com datas mantidas. Leia docs/planejamento/REVISOES.md e a ficha ETAPAS/27.md antes de executar — parte do trabalho descrito acima pode já ter sido feita em outra etapa.
+
+NOTA v1.2 (19/10/2026): "design aprovado" agora tem referência concreta em identidade-visual/ (diretriz, REGISTRO.md e imagens), consolidada em tokens e componentes por E08. Leia a seção "Revisão v1.2" de ETAPAS/27.md. O moodboard não é prova: não copiar depoimentos, contagens, nomes, resultados, recursos não publicados nem domínio/perfil não verificados; não reintroduzir alegações retiradas no R1.

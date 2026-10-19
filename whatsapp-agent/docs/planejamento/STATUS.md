@@ -68,6 +68,11 @@ verde não substitui homologação.
 E04 e E27 **não** estão concluídas: receberam apenas transferência parcial de
 conteúdo para E02 (ver `REVISOES.md`).
 
+**Direção visual (v1.2, 19/10/2026):** identidade vinho/rosé/nude/off-white
+aprovada pelo proprietário e registrada em `identidade-visual/`. É insumo de E08
+(tokens, logo preparada, componentes) e de E27 (página de vendas). Nenhum estado
+ou data foi alterado; nada foi aplicado ao app.
+
 ## Registro por entrega
 
 ### E01 — Instalar plano e conferir realidade

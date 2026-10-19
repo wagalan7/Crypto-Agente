@@ -8,3 +8,5 @@ Prepare proposta visual concreta nas páginas existentes: Hoje, Agenda, Paciente
 
 ACEITE
 Proposta revisável desktop/celular, componentes reutilizáveis e inventário de telas; revisão visual registrada; navegação aplicada sem perda de funções, teclado e telas estreitas verificados. Se aprovação visual faltar, não decidir que silêncio aprova; continuar componentes independentes.
+
+NOTA v1.2 (19/10/2026): o proprietário aprovou uma identidade visual nova (vinho/rosé/nude/off-white no lugar do violeta). Antes de propor telas, leia a seção "Revisão v1.2" de ETAPAS/08.md, identidade-visual/DIRETRIZ-MARCA.md, identidade-visual/REGISTRO.md e as quatro imagens em identidade-visual/referencias/. Os HEX do REGISTRO são amostras aproximadas, não oficiais; a assinatura da logo fornecida não é legível em fundo escuro; o conteúdo do moodboard listado no REGISTRO não pode ir para o produto.
