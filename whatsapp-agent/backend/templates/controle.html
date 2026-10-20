@@ -5,10 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Controle — {{ tenant.psychologist_name }}</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>tailwind.config = { theme: { extend: { colors: { brand: {
-    DEFAULT:'#7c3aed', 50:'#f5f3ff',100:'#ede9fe',200:'#ddd6fe',300:'#c4b5fd',400:'#a78bfa',
-    500:'#8b5cf6',600:'#7c3aed',700:'#6d28d9',800:'#5b21b6',900:'#4c1d95',950:'#2e1065'
-  } } } } }</script>
+  <link rel="icon" type="image/png" href="/static/marca/simbolo-assistente-64.png"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Montserrat:wght@600;700&display=swap"/>
+  <!-- Paleta da identidade (E08A) — mesmos valores do painel e de /static/marca/tokens.css -->
+  <script>tailwind.config = { theme: { extend: {
+    colors: {
+      brand: { DEFAULT:'#8A273E', 50:'#F9EEEC',100:'#F1D9D7',200:'#E7BFBF',300:'#D99CA3',400:'#C77784',
+               500:'#B25665',600:'#8A273E',700:'#74213A',800:'#5E1A2F',900:'#4A1424',950:'#3C0E18' },
+      gray:  { 50:'#FBF7F6',100:'#F3EEEC',200:'#E7E0DD',300:'#D2C8C4',400:'#706560',
+               500:'#685D58',600:'#554B47',700:'#433A37',800:'#2F2826',900:'#201A18' },
+      slate: { 50:'#FBF7F6',100:'#F3EEEC',200:'#E7E0DD',300:'#D2C8C4',400:'#706560',
+               500:'#685D58',600:'#554B47',700:'#433A37',800:'#2F2826',900:'#201A18' },
+    },
+    fontFamily: { sans: ['Inter','system-ui','-apple-system','Segoe UI','Roboto','Arial','sans-serif'] },
+  } } }</script>
+  <link rel="stylesheet" href="/static/marca/tokens.css"/>
   <style>
     body { -webkit-tap-highlight-color: transparent; }
     button:active { transform: scale(0.96); }
@@ -17,10 +30,10 @@
     .patient-card.hidden-filter { display: none; }
     .stat-card { cursor: pointer; }
     .stat-card:active { transform: scale(0.96); }
-    .stat-card.active { box-shadow: 0 0 0 2px #7c3aed inset; }
+    .stat-card.active { box-shadow: 0 0 0 2px #8A273E inset; }
     .hero-grad { background:
-      radial-gradient(700px 300px at 12% -40%, #6d28d9 0%, transparent 60%),
-      linear-gradient(135deg, #2e1065 0%, #4c1d95 45%, #2d1657 100%); }
+      radial-gradient(700px 300px at 12% -40%, #8A273E 0%, transparent 60%),
+      linear-gradient(135deg, #3C0E18 0%, #5E1A2F 55%, #3C0E18 100%); }
   </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -85,17 +98,17 @@
       <button type="button" data-filter="all" onclick="filterByCategory('all')"
         class="stat-card bg-white rounded-xl border border-gray-100 py-2.5 transition">
         <p class="text-lg font-bold text-gray-800">{{ total }}</p>
-        <p class="text-[10px] text-gray-400">pacientes</p>
+        <p class="text-xs text-gray-400">pacientes</p>
       </button>
       <button type="button" data-filter="paused" onclick="filterByCategory('paused')"
         class="stat-card bg-yellow-50 rounded-xl border border-yellow-100 py-2.5 transition">
         <p class="text-lg font-bold text-yellow-700">{{ n_pausados }}</p>
-        <p class="text-[10px] text-yellow-600">pausados</p>
+        <p class="text-xs text-yellow-600">pausados</p>
       </button>
       <button type="button" data-filter="semnome" onclick="filterByCategory('semnome')"
-        class="stat-card bg-violet-50 rounded-xl border border-violet-100 py-2.5 transition">
+        class="stat-card bg-brand-50 rounded-xl border border-brand-100 py-2.5 transition">
         <p class="text-lg font-bold text-brand">{{ n_sem_nome }}</p>
-        <p class="text-[10px] text-brand">sem nome</p>
+        <p class="text-xs text-brand">sem nome</p>
       </button>
     </div>
     {% endif %}
@@ -174,15 +187,15 @@
           {% if sem_nome %}
             <!-- Sem nome: mostra número completo bem visível -->
             <p class="font-mono text-gray-900 text-[13px] break-all leading-snug">
-              {{ phone_pretty }}{% if is_group %} <span class="text-[10px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full font-sans">grupo</span>{% endif %}
+              {{ phone_pretty }}{% if is_group %} <span class="text-xs bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full font-sans">grupo</span>{% endif %}
             </p>
             <div class="flex items-center gap-1.5 mt-1">
               <button type="button"
                 onclick="document.getElementById('rename-{{ loop.index }}').classList.remove('hidden'); this.style.display='none';"
-                class="text-[10px] text-brand font-semibold border border-brand px-2 py-0.5 rounded-full whitespace-nowrap">
+                class="text-xs text-brand font-semibold border border-brand px-2 py-0.5 rounded-full whitespace-nowrap">
                 + Nome
               </button>
-              <span class="text-[11px] {{ 'text-yellow-600 font-medium' if is_paused else 'text-gray-400' }}">
+              <span class="text-xs {{ 'text-yellow-600 font-medium' if is_paused else 'text-gray-400' }}">
                 {% if is_paused %}⏸ Pausado{% else %}🤖 Ativo{% endif %}
               </span>
             </div>
@@ -195,7 +208,7 @@
               </p>
               <button type="button"
                 onclick="document.getElementById('rename-{{ loop.index }}').classList.toggle('hidden');"
-                class="text-[10px] text-purple-600 font-semibold border border-purple-200 bg-purple-50 px-2 py-0.5 rounded-full whitespace-nowrap flex-shrink-0"
+                class="text-xs text-brand-800 font-semibold border border-brand-200 bg-brand-50 px-2 py-0.5 rounded-full whitespace-nowrap flex-shrink-0"
                 title="Corrigir nome">
                 ✏️ Editar
               </button>

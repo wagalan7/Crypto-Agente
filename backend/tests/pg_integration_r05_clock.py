@@ -80,6 +80,18 @@ async def run():
                                 tables=[RecommendationSnapshot.__table__,
                                         RealTrade.__table__, EntryIntent.__table__])
     await db.init_db()
+    # Evidência sintética COERENTE do controle de validação manual:
+    # este harness não exercita reconhecimento manual, então a conta
+    # entra com a validação já concluída por um ciclo real.
+    async with db.get_session() as _s:
+        await _s.execute(text(
+            "INSERT INTO account_margin_epochs (account_scope, exchange, "
+            "market, generation, manual_validation_generation, "
+            "manual_validation_blocked, updated_at) VALUES "
+            "(:c, 'binance', 'usdm_futures', 0, 1, false, now()) "
+            "ON CONFLICT (account_scope, exchange, market) DO UPDATE "
+            "SET manual_validation_blocked = false"), {"c": CONTA})
+        await _s.commit()
 
     LOCK = intents.RISK_LOCK_KEY
 

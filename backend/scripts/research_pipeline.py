@@ -88,6 +88,10 @@ def rising_bars(start_ms: int, entry: float, count: int = 40):
 
 
 async def run(args) -> dict:
+    # Manifesto registrado usa SOMENTE export oficial e janelas explícitas.
+    # A demonstração sintética abaixo não é fallback de um estudo sem dados.
+    if getattr(args, "manifest", None):
+        return await run_registered_study(args)
     from services import decision_observation_service as obs
     from services import offline_replay_service as r10a
     from services import portfolio_replay_service as pf
@@ -121,19 +125,42 @@ async def run(args) -> dict:
             report["candidates"]["by_reason"][code] = \
                 report["candidates"]["by_reason"].get(code, 0) + 1
 
+    # ── Manifesto AUTORIZADO (opcional, por caminho EXPLÍCITO) ──────────────
+    from services import research_manifest_service as rm
+    manifesto = None
+    caminho = getattr(args, "manifest", None)
+    if caminho:
+        lido = rm.load_manifest_file(caminho)
+        report["manifest"] = {"state": lido.get("state"),
+                              "reason_code": lido.get("reason_code"),
+                              "detail": lido.get("detail"),
+                              "manifest_hash": lido.get("manifest_hash")}
+        if lido.get("ok"):
+            manifesto = lido["manifest"]
+            report["manifest"]["summary"] = rm.manifest_summary(manifesto)
+    else:
+        report["manifest"] = {"state": rm.STATE_BLOCKED,
+                              "reason_code": AUTHORIZED_PAIR_REASON}
+    escopo = ((manifesto or {}).get("comparison_scope")
+              or rm.SCOPE_MANAGEMENT)
+
     # 2. Score V3 sobre os elegíveis (pontuação técnica, nunca probabilidade).
+    features_por_chave = {}
     scores = []
     for decision in eligible:
         levels = decision["levels"]
         risk = abs(levels["entry"] - levels["stop_loss"])
-        payload = s3.score({
+        features = {
             "adx": 30.0, "htf_alignment_ratio": 1.0, "structure_quality": 0.8,
             "level_distance_atr": 0.5, "trigger_body_ratio": 0.7,
             "trigger_follow_through_atr": 0.4,
             "rr_tp2": (abs(levels["tp2"] - levels["entry"]) / risk) if risk else None,
             "entry_distance_atr": 0.1, "volume_ratio": 1.1, "spread_pct": 0.03,
             "funding_pct": 0.0,
-        }, playbook=decision["playbook"], side=decision["side"])
+        }
+        features_por_chave[decision["opportunity_key"]] = dict(features)
+        payload = s3.score(features, playbook=decision["playbook"],
+                           side=decision["side"])
         scores.append({"opportunity_key": decision["opportunity_key"],
                        "state": payload["state"], "score": payload["score"],
                        "probability": payload["probability"]})
@@ -224,13 +251,70 @@ async def run(args) -> dict:
     baseline_config = r10a.ReplayConfig()
     candidate_config = r10a.ReplayConfig(tp1_fraction=0.60, trail_atr_multiple=1.6,
                                          be_lock_fraction=0.30)
-    report["comparison"] = comparacao_declarada(
-        baseline_config, candidate_config, custos=custos, core=core, score=s3)
-    replay = pf.run_portfolio(candidates, bars_by_id=bars_by_id, quotes_by_id=quotes,
-                              replay_config=baseline_config, costs=custos)
-    candidate_replay = pf.run_portfolio(candidates, bars_by_id=bars_by_id,
-                                        quotes_by_id=quotes,
-                                        replay_config=candidate_config, costs=custos)
+    # ── DESPACHO POR ESCOPO ─────────────────────────────────────────────────
+    #   MANAGEMENT_ONLY: mesma lista dos dois lados, gestão diferente.
+    #   SELECTION_ONLY : MESMA população bruta, gestão CONGELADA idêntica, e
+    #                    cada lado decide a seleção com o motor dele. Depois,
+    #                    cada conjunto percorre o SEU replay/carteira.
+    if escopo == rm.SCOPE_SELECTION:
+        from services import research_selection_service as rsel
+        gestao_congelada = r10a.ReplayConfig(**{
+            chave: valor for chave, valor
+            in (manifesto["baseline"]["management_config"] or {}).items()
+            if chave not in ("schema_version", "config_hash")})
+        baseline_config = candidate_config = gestao_congelada
+        populacao = populacao_de_selecao(decisions, features_por_chave)
+        selecao = rsel.compare_population(populacao, manifest=manifesto)
+        report["selection_comparison"] = rsel.selection_manifest(selecao)
+        if not selecao.get("ok"):
+            report["comparison"] = comparacao_declarada(
+                baseline_config, candidate_config, custos=custos, core=core,
+                score=s3, manifest=manifesto)
+            report["next_step"] = ("Comparação de seleção bloqueada: "
+                                   f"{selecao.get('reason_code')}")
+            return report
+        # Barras/cotação cobrem a UNIÃO dos dois conjuntos (mesma série para a
+        # mesma oportunidade): o que muda entre os lados é QUEM foi selecionado.
+        candidates, bars_by_id, quotes = [], {}, {}
+        vistos = set()
+        for linha in (list(selecao["selected"]["baseline"])
+                      + list(selecao["selected"]["candidate"])):
+            chave = linha["opportunity_key"]
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            decision_ms = linha["decision_ts_ms"]
+            first = ((decision_ms + BAR5 - 1) // BAR5) * BAR5
+            bars_by_id[chave] = rising_bars(first, linha["entry"])
+            quotes[chave] = {"bid": linha["entry"] - 0.01,
+                             "ask": linha["entry"] + 0.01,
+                             "ts_ms": decision_ms, "source": "synthetic"}
+            candidates.append({"opportunity_id": chave, "symbol": linha["symbol"],
+                               "direction": linha["side"],
+                               "decision_ts_ms": decision_ms,
+                               "entry": linha["entry"],
+                               "stop_loss": linha["stop_loss"],
+                               "tp1": linha["tp1"], "tp2": linha["tp2"],
+                               "atr": linha.get("atr") or 1.0})
+        report["comparison"] = comparacao_declarada(
+            baseline_config, candidate_config, custos=custos, core=core, score=s3,
+            manifest=manifesto)
+        replay = pf.run_portfolio(rsel.replay_candidates(selecao["selected"]["baseline"]),
+                                  bars_by_id=bars_by_id, quotes_by_id=quotes,
+                                  replay_config=gestao_congelada, costs=custos)
+        candidate_replay = pf.run_portfolio(
+            rsel.replay_candidates(selecao["selected"]["candidate"]),
+            bars_by_id=bars_by_id, quotes_by_id=quotes,
+            replay_config=gestao_congelada, costs=custos)
+    else:
+        report["comparison"] = comparacao_declarada(
+            baseline_config, candidate_config, custos=custos, core=core, score=s3,
+            manifest=manifesto)
+        replay = pf.run_portfolio(candidates, bars_by_id=bars_by_id, quotes_by_id=quotes,
+                                  replay_config=baseline_config, costs=custos)
+        candidate_replay = pf.run_portfolio(candidates, bars_by_id=bars_by_id,
+                                            quotes_by_id=quotes,
+                                            replay_config=candidate_config, costs=custos)
     # Linha do tempo do capital: prova de que o sizing usou o capital do
     # INSTANTE da entrada e o resultado entrou no instante da saída.
     linha_do_tempo = [{"opportunity_id": trade["opportunity_id"],
@@ -249,7 +333,7 @@ async def run(args) -> dict:
                         "fidelity_unavailable": replay["fidelity"]["unavailable"],
                         "live_equivalent": replay["live_equivalent"]}
     report["candidate_replay"] = {
-        "kind": "MANAGEMENT_ONLY",
+        "kind": report["comparison"]["scope"],
         "comparison_scope": report["comparison"]["scope"],
         "admitted": candidate_replay["admitted"],
         "metrics": candidate_replay["metrics"],
@@ -322,12 +406,85 @@ async def run(args) -> dict:
         args, study=study, replay=replay, candidate_replay=candidate_replay,
         candidate_config_diff=report["candidate_replay"]["config_diff"],
         gate=gate, candidates=candidates, evidence=evidencia,
-        comparison=report["comparison"],
+        comparison=report["comparison"], manifest=manifesto,
         dataset_fingerprint=report.get("replay_input", {}).get("fingerprint"))
 
     report["next_step"] = ("Acumular amostra prospectiva pelo coletor ligado antes de "
                            "qualquer go/no-go; o adaptador operacional continua por implementar.")
     return report
+
+
+async def run_registered_study(args):
+    from services import research_manifest_service as rm
+    from services import research_study_service as study
+    loaded = rm.load_manifest_file(args.manifest)
+    if not loaded.get("ok"):
+        return study._blocked(loaded.get("reason_code"), state="WAITING_DECISION")
+    directory = getattr(args, "dataset_dir", None)
+    if not directory:
+        return study._blocked("OFFICIAL_DATASET_REQUIRED")
+    try:
+        def read_json(path):
+            if Path(path).stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("artefato acima de 16 MiB")
+            return json.loads(Path(path).read_text(encoding="utf-8"),
+                              parse_constant=lambda _: (_ for _ in ()).throw(ValueError("não finito")))
+        if loaded["manifest"].get("manifest_version") == "R13_LIVE_EVENT_MANIFEST_V1":
+            if getattr(args, "price_windows", None) or getattr(args, "calibration_event", None):
+                return study._blocked("EVENT_FAMILY_REFUSES_R10A_INPUT")
+            dataset = read_json(Path(directory) / "event-dataset.json")
+            result = study.run_study(manifest=loaded["manifest"], dataset=dataset, export_manifest=None)
+            if getattr(args, "persist", False) and result.get("ok"):
+                import db
+                result["persistence"] = (await study.persist_study(db.get_session, result)
+                    if db.DB_ENABLED else {"published": False, "reason_code": "DB_DISABLED"})
+            return result
+        dataset = read_json(Path(directory) / "dataset.json")
+        exported = read_json(Path(directory) / "manifest.json")
+        prices = read_json(args.price_windows) if getattr(args, "price_windows", None) else None
+        event = getattr(args, "calibration_event", None)
+        validity = getattr(args, "calibration_valid_for_ms", None)
+        request = study.calibration_request(event=event, valid_for_ms=validity) if event or validity else None
+    except (OSError, TypeError, ValueError):
+        return study._blocked("STUDY_INPUT_FILE_INVALID", state="INVALID")
+    result = study.run_study(manifest=loaded["manifest"], dataset=dataset,
+                             export_manifest=exported, prices=prices, request=request)
+    if getattr(args, "persist", False) and result.get("ok"):
+        import db
+        # CLI explícito; GET não chama init_db, fitting ou escrita.
+        if db.DB_ENABLED:
+            result["persistence"] = await study.persist_study(db.get_session, result)
+        else:
+            result["persistence"] = {"published": False, "reason_code": "DB_DISABLED"}
+    return result
+
+
+def populacao_de_selecao(decisions, scores_por_chave) -> list:
+    """População BRUTA do estudo de seleção: TODO candidato avaliado.
+
+    Cada linha leva a decisão OBSERVADA (aceita/vetada pelo caminho champion
+    deste pipeline) e as features PONTO-NO-TEMPO que o motor da candidata
+    consome. Nada de outcome, trajetória ou resultado — isso é replay, depois.
+    """
+    from services import strategy_core_service as core
+    linhas = []
+    for decisao in decisions:
+        niveis = decisao.get("levels") or {}
+        aceita = decisao["state"] == core.STATE_ELIGIBLE
+        linhas.append({
+            "opportunity_key": decisao["opportunity_key"],
+            # Lado NÃO resolvido continua None: a linha sai como inviável para
+            # os dois lados em vez de ganhar um lado inventado.
+            "symbol": decisao["symbol"], "side": decisao.get("side"),
+            "decision_ts_ms": decisao["decision_ts_ms"],
+            "entry": niveis.get("entry"), "stop_loss": niveis.get("stop_loss"),
+            "tp1": niveis.get("tp1"), "tp2": niveis.get("tp2"), "atr": 1.0,
+            "observed_outcome": "ACCEPTED" if aceita else "VETOED",
+            "funnel": {"first_blocker_reason": (None if aceita else
+                                                (decisao.get("reason_codes") or [None])[0])},
+            "features": scores_por_chave.get(decisao["opportunity_key"]),
+        })
+    return linhas
 
 
 async def exportar_observadas(eligible) -> tuple:
@@ -395,19 +552,25 @@ AUTHORIZED_PAIR_DECISION = [
 ]
 
 
-def authorized_comparison() -> dict:
-    """Par AUTORIZADO declarado nos contratos — ou a ausência dele, explícita.
+def authorized_comparison(manifest=None) -> dict:
+    """Par AUTORIZADO — lido e VALIDADO do manifesto, ou ausência explícita.
 
-    Enquanto nenhum contrato registrar o par, esta função devolve BLOQUEADO com
-    a decisão necessária. Inventar uma hipótese aqui trocaria silenciosamente o
-    objeto da comparação, que é exatamente o defeito relatado.
+    Sem manifesto (o caso de hoje) continua `BLOCKED_MISSING_DECISION` com a
+    decisão necessária: inventar uma hipótese aqui trocaria silenciosamente o
+    objeto da comparação. Com manifesto, quem decide é o contrato fechado do
+    `research_manifest_service` — e `TEST_ONLY` não libera estudo real.
     """
-    return {"available": False, "state": "BLOCKED_MISSING_DECISION",
-            "reason_code": AUTHORIZED_PAIR_REASON,
-            "decision_required": list(AUTHORIZED_PAIR_DECISION)}
+    from services import research_manifest_service as rm
+    if manifest is None:
+        return {"available": False, "state": "BLOCKED_MISSING_DECISION",
+                "reason_code": AUTHORIZED_PAIR_REASON,
+                "real_study_allowed": False,
+                "decision_required": list(AUTHORIZED_PAIR_DECISION)}
+    return rm.authorized_comparison(manifest)
 
 
-def comparacao_declarada(baseline_config, candidate_config, *, custos, core, score) -> dict:
+def comparacao_declarada(baseline_config, candidate_config, *, custos, core, score,
+                         manifest=None) -> dict:
     """Identidade e ESCOPO do contraste executado, registrados antes do resultado."""
     from services import preselection_experiment_service as r12
     baseline_manifest = baseline_config.manifest()
@@ -420,6 +583,34 @@ def comparacao_declarada(baseline_config, candidate_config, *, custos, core, sco
                    "score_version": score.SCORE_VERSION},
         "costs": custos.manifest()["config_hash"],
         "protections": {"stop": "STRUCTURAL", "tp1_fraction_from_config": True}})
+    if manifest is not None:
+        from services import research_manifest_service as rm
+        autorizado = rm.authorized_comparison(manifest)
+        if autorizado.get("comparison_scope") == rm.SCOPE_SELECTION:
+            # Escopo de SELEÇÃO: a gestão é a MESMA dos dois lados (congelada);
+            # o que muda é quem decide selecionar. Dizer "MANAGEMENT_ONLY" aqui
+            # seria rotular errado o objeto comparado.
+            selecao = rm.selection_config_of(manifest.get("candidate"))
+            return {
+                "scope": rm.SCOPE_SELECTION,
+                "baseline_config": dict(baseline_manifest),
+                "candidate_config": dict(candidate_manifest),
+                "costs_config": dict(custos.manifest()),
+                "baseline_config_hash": baseline_manifest["config_hash"],
+                "candidate_config_hash": candidate_manifest["config_hash"],
+                "config_diff": {},
+                "bundle_hash": bundle.get("bundle_hash"),
+                "identity_registered_before_results": True,
+                "manifest": rm.manifest_summary(manifest),
+                "selection_config": selecao,
+                "proves": ["efeito da SELEÇÃO sobre a MESMA população bruta"],
+                "does_not_prove": ["gestão de saídas (congelada e idêntica)",
+                                   "custos observados da conta",
+                                   "aprovação econômica"],
+                "decision_source_both_sides":
+                    "baseline=decisão observada do champion; candidata=motor próprio",
+                "authorized_hypothesis": autorizado,
+            }
     return {
         "scope": "MANAGEMENT_ONLY",
         # Manifestos COMPLETOS: é o objeto que governou o replay, não só o hash.
@@ -439,7 +630,7 @@ def comparacao_declarada(baseline_config, candidate_config, *, custos, core, sco
         "does_not_prove": ["núcleo R07D", "Score V3", "playbooks",
                            "seleção de oportunidades"],
         "decision_source_both_sides": "strategy_core_service.decide (mesma lista)",
-        "authorized_hypothesis": authorized_comparison(),
+        "authorized_hypothesis": authorized_comparison(manifest),
     }
 
 
@@ -453,7 +644,7 @@ def evidence_key_of(*parts) -> str:
 async def simulate_policy_state(args, *, study, replay, candidate_replay,
                                 candidate_config_diff, gate, candidates,
                                 evidence=None, comparison=None,
-                                dataset_fingerprint=None) -> dict:
+                                manifest=None, dataset_fingerprint=None) -> dict:
     """Executa a política/histerese REAL sobre a evidência recém-calculada.
 
     A identidade é (experimento, versão da política, universo, população) e o
@@ -515,16 +706,24 @@ async def simulate_policy_state(args, *, study, replay, candidate_replay,
         # tipo: o catálogo recalcula o hash desse mesmo objeto (mesma função,
         # mesma versão) e valida a configuração que REALMENTE governou o replay.
         from services import preselection_experiment_service as r12
+        escopo_contrato = (comparison or {}).get("scope") or "MANAGEMENT_ONLY"
+        extras = {}
+        if escopo_contrato == r12.SCOPE_SELECTION_ONLY:
+            # Contrato V2: manifesto autorizado + motores de seleção entram no
+            # CORPO hasheado, então adulterar qualquer um quebra a conferência.
+            extras = {"manifest_hash": ((comparison or {}).get("manifest") or {})
+                      .get("manifest_hash"),
+                      "selection_config": (comparison or {}).get("selection_config")}
         contrato = r12.preselection_contract(
             population=rp.POPULATION_SHADOW, study_kind="PRE_SELECTION",
             policy_version=rp.POLICY_VERSION, universe_version=universe_version,
-            comparison_scope=(comparison or {}).get("scope") or "MANAGEMENT_ONLY",
+            comparison_scope=escopo_contrato,
             baseline_config=(comparison or {}).get("baseline_config") or {},
             candidate_config=(comparison or {}).get("candidate_config") or {},
             costs_config=(comparison or {}).get("costs_config") or {},
             bundle_hash=(comparison or {}).get("bundle_hash"),
             dataset_fingerprint=dataset_fingerprint or evidence_key,
-            cutoff_ms=now_ms)
+            cutoff_ms=now_ms, **extras)
         estudo = r12.study_payload(contract=contrato, evidence=evidence or {},
                                    gate=gate, study=study, replay=replay,
                                    evidence_key=evidence_key)
@@ -606,6 +805,17 @@ def main(argv=None) -> int:
     parser.add_argument("--t0", type=int, default=1_760_000_400_000)
     parser.add_argument("--persist", action="store_true",
                         help="grava a observação usando DATABASE_URL (descartável)")
+    parser.add_argument("--manifest", default=None,
+                        help="caminho EXPLÍCITO do manifesto autorizado do estudo "
+                             "(sem ele, a comparação real fica bloqueada)")
+    parser.add_argument("--dataset-dir", default=None,
+                        help="pasta externa do export oficial R10B (dataset.json e manifest.json)")
+    parser.add_argument("--price-windows", default=None,
+                        help="arquivo de janelas/quotes históricas verificáveis, sem fallback sintético")
+    parser.add_argument("--calibration-event", default=None,
+                        help="evento explícito do fitting; omitir não inventa uma decisão")
+    parser.add_argument("--calibration-valid-for-ms", type=int, default=None,
+                        help="duração explícita de validade do artefato offline")
     args = parser.parse_args(argv)
     if args.symbols < 1 or args.symbols > 200:
         print(json.dumps({"status": "INVALID_ARGS", "detail": "symbols fora de 1..200"}))

@@ -14,6 +14,7 @@ A exclusividade transacional e o fencing de desfecho ficam no PostgreSQL real
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import socket as _socket
 import unittest
 from pathlib import Path
@@ -71,8 +72,21 @@ class CapacidadeReal(unittest.IsolatedAsyncioTestCase):
             return intents.Reservation(intents.RESERVED_NEW, identity.intent_key,
                                        identity.client_order_id, "RESERVED")
 
+        # O gate de MARGEM real exige banco (geração) e carteira fresca; aqui a
+        # característica sob teste é a CAPACIDADE que chega à admissão, então a
+        # observação de margem é fornecida pronta — sem afrouxar o gate real.
+        async def fake_margin_gate(identity, *, entry, qty, leverage):
+            self.capturado["margin_identity"] = identity
+            return intents.MarginGate(
+                available_usd=1_000_000.0, required_usd=0.0,
+                as_of_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+                complete=True, account_ref=identity.account_ref,
+                exchange=identity.exchange, market="usdm_futures",
+                generation=0, quality="live")
+
         self._patches = [
             patch.object(intents, "reserve", fake_reserve),
+            patch.object(sts, "_margin_gate_for", fake_margin_gate),
             patch.object(sts, "_open_risk_usd", AsyncMock(return_value=0.0)),
             patch("services.binance_signed_service.accounting_scope", lambda: SCOPE_A),
         ]
@@ -253,9 +267,11 @@ class GuardEmCadaPost(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.sts, "_intent_dispatch_guard", AsyncMock(return_value=True)), \
                 patch.object(self.sts, "_register_intent_dispatch", self._registrar):
-            guarded = self.sts._intent_guarded_preflight(
-                self.intent, inner, dispatch_id_fn=lambda: "cw-abc")
-            verdict = await guarded(100.0, 1.0)
+            with patch.object(self.sts, "_intent_final_authorization",
+                              self._autorizacao_ok):
+                guarded = self.sts._intent_guarded_preflight(
+                    self.intent, inner, dispatch_id_fn=lambda: "cw-abc")
+                verdict = await guarded(100.0, 1.0)
         self.assertTrue(verdict["ok"])
         self.assertEqual(chamadas, [(100.0, 1.0)])
         self.assertEqual(self.registrados, ["cw-abc"])
@@ -270,6 +286,16 @@ class GuardEmCadaPost(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(verdict["reason_code"], "EXEC_INTENT_GUARD_DENIED")
         self.assertEqual(inner.await_count, 0)
 
+    def _autorizacao_ok(self, intent, *, dispatch_id_fn=None):
+        async def _aprova():
+            return {"ok": True, "reason_code": "DISPATCH_AUTHORIZED"}
+        return _aprova
+
+    def _autorizacao_negada(self, intent, *, dispatch_id_fn=None):
+        async def _nega():
+            return {"ok": False, "reason_code": "MARGIN_OBSERVATION_SUPERSEDED"}
+        return _nega
+
     async def test_sem_preflight_interno_o_guard_ainda_vale(self):
         """Revalidação desligada não pode deixar o POST sem guard."""
         with patch.object(self.sts, "_intent_dispatch_guard", AsyncMock(return_value=False)):
@@ -278,10 +304,24 @@ class GuardEmCadaPost(unittest.IsolatedAsyncioTestCase):
             verdict = await guarded(100.0, 1.0)
         self.assertFalse(verdict["ok"])
         with patch.object(self.sts, "_intent_dispatch_guard", AsyncMock(return_value=True)), \
-                patch.object(self.sts, "_register_intent_dispatch", self._registrar):
+                patch.object(self.sts, "_register_intent_dispatch", self._registrar), \
+                patch.object(self.sts, "_intent_final_authorization",
+                             self._autorizacao_ok):
             guarded = self.sts._intent_guarded_preflight(
                 self.intent, None, dispatch_id_fn=lambda: "cw-abc")
             self.assertTrue((await guarded(100.0, 1.0))["ok"])
+
+    async def test_autorizacao_final_negada_impede_o_post(self):
+        """Depois do `inner`, só a AUTORIZAÇÃO FINAL libera o envio."""
+        with patch.object(self.sts, "_intent_dispatch_guard", AsyncMock(return_value=True)), \
+                patch.object(self.sts, "_register_intent_dispatch", self._registrar), \
+                patch.object(self.sts, "_intent_final_authorization",
+                             self._autorizacao_negada):
+            guarded = self.sts._intent_guarded_preflight(
+                self.intent, None, dispatch_id_fn=lambda: "cw-abc")
+            verdict = await guarded(100.0, 1.0)
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(verdict["reason_code"], "MARGIN_OBSERVATION_SUPERSEDED")
 
     async def test_id_efetivo_desconhecido_nao_despacha(self):
         inner = AsyncMock(side_effect=AssertionError("não pode chegar ao POST"))

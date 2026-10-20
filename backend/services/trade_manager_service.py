@@ -220,8 +220,22 @@ async def _resolve_trade_timeframe(trade: RealTrade) -> str | None:
     return None
 
 
-async def _fetch_exchange_position(symbol: str) -> tuple[float | None, float | None]:
-    """Busca (qty, entry_price) atuais da posição na exchange. (None, None) se erro, (0, None) se fechada."""
+async def _fetch_exchange_position(symbol: str, *, side=None,
+                                   position_side=None) -> tuple[float | None, float | None]:
+    """(qty, entry_price) da posição DO TRADE na exchange.
+
+    `side`/`position_side` identificam a perna. Escolher a PRIMEIRA posição do
+    símbolo confundiria uma posição manual (ou a perna oposta em conta hedge)
+    com a do bot: aqui, lado divergente/ambíguo devolve `(None, None)` — que os
+    chamadores já tratam como leitura INCERTA e não mutam nada.
+
+    Em modo one-way (`BOTH`) uma posição AGREGADA manual+BOT não é separável com
+    segurança; o guard de propriedade bloqueia o símbolo inteiro antes disso, e
+    aqui nada é estimado.
+    """
+    esperado = str(side or "").strip().lower()
+    esperado = {"long": "buy", "short": "sell"}.get(esperado, esperado) or None
+    esperada_perna = str(position_side or "").strip().upper() or None
     try:
         from services import exchange_service
         try:
@@ -241,18 +255,60 @@ async def _fetch_exchange_position(symbol: str) -> tuple[float | None, float | N
                 symbol,
             )
             return None, None
+        candidatas = []
         for p in res.get("positions") or []:
-            return float(p.get("size") or 0), float(p.get("entry_price") or 0) or None
-        return 0.0, None
+            if not isinstance(p, dict):
+                return None, None
+            tamanho = float(p.get("size") or 0)
+            if tamanho <= 0:
+                continue
+            lado = str(p.get("side") or "").strip().lower()
+            lado = {"long": "buy", "short": "sell"}.get(lado, lado) or None
+            perna = str(p.get("position_side") or "").strip().upper() or None
+            if esperado is not None:
+                if lado is None:
+                    return None, None          # lado ausente: nunca assume
+                if lado != esperado:
+                    continue
+            if esperada_perna is not None and perna is not None and perna != esperada_perna:
+                continue
+            candidatas.append((tamanho, float(p.get("entry_price") or 0) or None))
+        if not candidatas:
+            return 0.0, None
+        if len(candidatas) > 1:
+            # Pernas ambíguas no mesmo símbolo: leitura INCERTA, nunca a primeira.
+            log.warning(
+                "[trade-manager] %s com %d pernas compatíveis — leitura incerta",
+                symbol, len(candidatas))
+            return None, None
+        return candidatas[0]
     except Exception as e:
         log.warning(f"[trade-manager] fetch position {symbol} falhou: {e}")
         return None, None
 
 
-async def _fetch_exchange_qty(symbol: str) -> float | None:
+async def _fetch_exchange_qty(symbol: str, *, side=None,
+                              position_side=None) -> float | None:
     """Backward-compat wrapper — só retorna qty."""
-    qty, _ = await _fetch_exchange_position(symbol)
+    qty, _ = await _fetch_exchange_position(symbol, side=side,
+                                            position_side=position_side)
     return qty
+
+
+async def _manual_symbol_blocked(symbol) -> dict | None:
+    """Símbolo indisponível por posição manual reconhecida (ou prova incerta).
+
+    O manager NÃO administra posição manual: nem fecha, nem cancela, nem
+    substitui proteção. Registro ilegível BLOQUEIA (fail-closed).
+    """
+    try:
+        from services import manual_position_service as mps
+        verdict = await mps.ownership_guard(symbol, action="trade_manager")
+    except Exception as exc:  # noqa: BLE001
+        return {"reason_code": "MANUAL_OWNERSHIP_GUARD_ERROR", "detail": type(exc).__name__}
+    if verdict.get("allowed"):
+        return None
+    return {"reason_code": verdict.get("reason_code"), "detail": verdict.get("detail")}
 
 
 def _cancel_result_is_terminal(result: dict) -> bool:
@@ -303,7 +359,8 @@ async def _cleanup_conditionals_after_flat(trade: RealTrade, context: str) -> bo
             if not algo_id:
                 continue
             try:
-                result = await exchange_service.cancel_algo_order(algo_id)
+                result = await exchange_service.cancel_algo_order(
+                    algo_id, symbol=getattr(trade, "symbol", None))
             except Exception as exc:
                 result = {"ok": False, "error": str(exc)}
             if not _cancel_result_is_terminal(result):
@@ -420,7 +477,8 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
 
     # Resolve entry price: prefere o real da exchange (mais confiável que DB,
     # que pode ter avgPrice=0 em market orders).
-    qty_now, entry_real = await _fetch_exchange_position(sym)
+    qty_now, entry_real = await _fetch_exchange_position(
+        sym, side=getattr(trade, "side", None))
     entry = entry_real or trade.entry_price or trade.planned_tp1 or 0.0
     if entry <= 0:
         log.error(
@@ -468,7 +526,8 @@ async def _transition_to_post_tp1(trade: RealTrade) -> bool:
     # 2. SÓ AGORA cancela SL antigo (já temos cobertura nova)
     if trade.sl_order_id:
         try:
-            cancel_res = await exchange_service.cancel_algo_order(trade.sl_order_id)
+            cancel_res = await exchange_service.cancel_algo_order(
+                trade.sl_order_id, symbol=getattr(trade, "symbol", None))
             if not cancel_res.get("ok"):
                 log.warning(
                     f"[trade-manager] cancel SL antigo {sym} algoId={trade.sl_order_id}: "
@@ -725,7 +784,7 @@ async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
 
     # Aceite da ordem não prova fill; timeout também pode ser sucesso. Só uma
     # leitura fresca e zerada autoriza cancelar o bracket e fechar o DB.
-    qty_after, _ = await _fetch_exchange_position(sym)
+    qty_after, _ = await _fetch_exchange_position(sym, side=getattr(trade, "side", None))
     if qty_after is None:
         log.warning(
             f"[time-stop] {sym} close não verificável: "
@@ -746,7 +805,8 @@ async def _check_time_stop(trade: RealTrade, qty_now: float) -> bool:
     # 3. Marca closed_manual com nota time_stop e exit price = mark atual ou entry
     try:
         from services import real_trade_service
-        _, entry_real = await _fetch_exchange_position(sym)  # talvez já zerado
+        _, entry_real = await _fetch_exchange_position(
+            sym, side=getattr(trade, "side", None))  # talvez já zerado
         exit_price = entry_real or trade.entry_price
         await real_trade_service.close_trade(
             trade.id,
@@ -890,7 +950,7 @@ async def _ensure_protection(trade: RealTrade, qty_now: float) -> bool:
     # curar uma perna SUMIDA (não por ID-None de abertura), reconfirma a qty: se
     # já zerou, a perna disparou → não cura, deixa o caminho de fechamento agir.
     if sl_vanished or tp2_vanished or tp1_vanished:
-        qty_confirm = await _fetch_exchange_qty(trade.symbol)
+        qty_confirm = await _fetch_exchange_qty(trade.symbol, side=getattr(trade, "side", None))
         if qty_confirm is not None and qty_confirm <= 0:
             log.info(
                 f"[autoheal] {trade.symbol} #{trade.id} perna sumida mas posição "
@@ -1103,7 +1163,8 @@ async def _maybe_pre_tp1_protect(trade: RealTrade, qty_now: float) -> bool:
         # Cancela SL antigo só depois de ter cobertura nova.
         if trade.sl_order_id:
             try:
-                await exchange_service.cancel_algo_order(trade.sl_order_id)
+                await exchange_service.cancel_algo_order(
+                    trade.sl_order_id, symbol=getattr(trade, "symbol", None))
             except Exception as e:
                 log.warning(f"[pre-tp1-protect] cancel SL antigo #{trade.id}: {e}")
         async with get_session() as session:
@@ -1245,7 +1306,8 @@ async def _maybe_trail_runner(trade: RealTrade, qty_now: float) -> bool:
         new_sl_id = prot.get("sl_order_id")
         if trade.sl_order_id:
             try:
-                await exchange_service.cancel_algo_order(trade.sl_order_id)
+                await exchange_service.cancel_algo_order(
+                    trade.sl_order_id, symbol=getattr(trade, "symbol", None))
             except Exception as e:
                 log.warning(f"[runner] cancel SL antigo #{trade.id}: {e}")
         async with get_session() as session:
@@ -1324,7 +1386,16 @@ async def _process_trade(trade: RealTrade) -> None:
             log.critical(f"[trade-manager] falha persistindo pausa: {exc}")
         return
 
-    qty_now = await _fetch_exchange_qty(trade.symbol)
+    # Símbolo com posição manual RECONHECIDA: o bot não administra nada ali —
+    # não fecha, não cancela condicional, não move SL. Prova incerta também
+    # para o ciclo (fail-closed), sem tocar pausa de outro owner.
+    impedimento = await _manual_symbol_blocked(trade.symbol)
+    if impedimento is not None:
+        log.warning("[trade-manager] #%s %s ignorado: %s", trade.id, trade.symbol,
+                    impedimento.get("reason_code"))
+        return
+
+    qty_now = await _fetch_exchange_qty(trade.symbol, side=getattr(trade, "side", None))
     if qty_now is None:
         return  # erro de leitura — pula esse ciclo
 
@@ -1371,7 +1442,7 @@ async def _process_trade(trade: RealTrade) -> None:
             except Exception as e:
                 close_res = {"ok": False, "error": str(e)}
                 log.warning(f"[trade-manager] flatten poeira #{trade.id} falhou: {e}")
-            qty_after, _ = await _fetch_exchange_position(trade.symbol)
+            qty_after, _ = await _fetch_exchange_position(trade.symbol, side=getattr(trade, "side", None))
             if qty_after is None:
                 log.warning(
                     f"[trade-manager] poeira #{trade.id} close UNKNOWN; mantém DB/bracket "
@@ -1550,7 +1621,7 @@ async def _process_manual_trade(trade: RealTrade) -> None:
     """Observa um trade manual e aconselha. Nunca cria/cancela ordem."""
     sym = trade.symbol
     sym_short = (sym or "").split("/")[0]
-    qty_now, entry_real = await _fetch_exchange_position(sym)
+    qty_now, entry_real = await _fetch_exchange_position(sym, side=getattr(trade, "side", None))
 
     # Posição sumiu da conta (user fechou, ou bateu SL/TP na corretora) → fecha
     if qty_now is not None and qty_now <= 0:
@@ -1749,9 +1820,15 @@ async def backfill_protection(force: bool = False) -> dict:
         if not t.planned_stop:
             results.append({"trade_id": t.id, "symbol": t.symbol, "skipped": True, "reason": "sem planned_stop"})
             continue
+        impedimento = await _manual_symbol_blocked(t.symbol)
+        if impedimento is not None:
+            results.append({"trade_id": t.id, "symbol": t.symbol, "skipped": True,
+                            "reason": impedimento.get("reason_code")})
+            continue
 
         # Confirma qty real na exchange + entry price atual
-        qty_now, entry_real = await _fetch_exchange_position(t.symbol)
+        qty_now, entry_real = await _fetch_exchange_position(
+            t.symbol, side=getattr(t, "side", None))
         if qty_now is None or qty_now <= 0:
             results.append({"trade_id": t.id, "symbol": t.symbol, "skipped": True, "reason": f"qty na exchange = {qty_now}"})
             continue

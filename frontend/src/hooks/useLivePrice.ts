@@ -1,25 +1,17 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { createPriceWebSocket } from '../services/api'
+import { subscribeCurrentTicker } from '../lib/analysisLifecycle'
 import type { Ticker } from '../types'
 
 export function useLivePrice(symbol: string | null) {
-  const [ticker, setTicker] = useState<Ticker | null>(null)
-  const wsRef = useRef<WebSocket | null>(null)
+  const [reading, setReading] = useState<{ symbol: string; ticker: Ticker } | null>(null)
 
   useEffect(() => {
+    setReading(null)
     if (!symbol) return
-    if (wsRef.current) wsRef.current.close()
-
-    const ws = createPriceWebSocket(symbol, (msg: unknown) => {
-      const data = msg as { type: string; data: Ticker }
-      if (data?.type === 'ticker') setTicker(data.data)
-    })
-    wsRef.current = ws
-
-    return () => {
-      ws.close()
-    }
+    return subscribeCurrentTicker(symbol, ticker => setReading({ symbol, ticker }), createPriceWebSocket)
   }, [symbol])
 
-  return ticker
+  // Hide the previous symbol even on the render before the effect cleanup.
+  return symbol && reading?.symbol === symbol ? reading.ticker : null
 }

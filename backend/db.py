@@ -83,6 +83,8 @@ async def init_db():
     from models import decision_observation  # noqa: F401  (R09 — observação segregada)
     from models import entry_intent  # noqa: F401  (P03 — intenção de entrada econômica)
     from models import policy_simulation_state  # noqa: F401  (R11/R12 — estado da simulação)
+    from models import manual_position_ack  # noqa: F401  (convivência manual/bot)
+    from models import account_margin_epoch  # noqa: F401  (geração da margem)
     from sqlalchemy import text
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -117,6 +119,84 @@ async def init_db():
         # recuperação conseguir ADOTAR o SL existente (aditiva).
         await conn.execute(text(
             "ALTER TABLE entry_intents ADD COLUMN IF NOT EXISTS decision_payload JSONB"
+        ))
+        # Convivência manual/bot — margem RESERVADA pela intenção (aditiva).
+        # Sem esta parcela duas propostas concorrentes poderiam consumir o
+        # MESMO saldo livre da conta compartilhada.
+        await conn.execute(text(
+            "ALTER TABLE entry_intents "
+            "ADD COLUMN IF NOT EXISTS reserved_margin_usd DOUBLE PRECISION DEFAULT 0"
+        ))
+        # Geração de margem resultante da última admissão desta intenção.
+        await conn.execute(text(
+            "ALTER TABLE entry_intents "
+            "ADD COLUMN IF NOT EXISTS margin_generation BIGINT"
+        ))
+        # Convivência manual/bot — reconhecimento explícito de posição manual.
+        # `create_all` cria a tabela; os ALTERs abaixo cobrem instalações que já
+        # tinham a tabela da versão anterior (aditivos e idempotentes).
+        await conn.execute(text(
+            "ALTER TABLE manual_position_acks "
+            "ADD COLUMN IF NOT EXISTS revision INTEGER DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE manual_position_acks "
+            "ADD COLUMN IF NOT EXISTS validated_at_ms BIGINT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE manual_position_acks "
+            "ADD COLUMN IF NOT EXISTS validation_scope VARCHAR(16)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE manual_position_acks "
+            "ADD COLUMN IF NOT EXISTS validation_account VARCHAR(64)"
+        ))
+        # Unicidade por ESTADOS BLOQUEANTES (ACTIVE/INVALIDATED/WAITING_ORDERS):
+        # "não está ACTIVE" não significa "símbolo livre". O índice antigo, que
+        # só cobria ACTIVE, é removido DEPOIS de o novo existir — nenhuma linha
+        # é apagada. Se houver legado ambíguo (duas linhas bloqueantes para a
+        # mesma identidade), a criação falha: o serviço trata isso como
+        # fail-closed e a ambiguidade fica visível em vez de ser "resolvida"
+        # escolhendo uma linha.
+        try:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_manual_ack_open "
+                "ON manual_position_acks (account_scope, exchange, market, symbol) "
+                "WHERE state IN ('ACTIVE','INVALIDATED','WAITING_ORDERS')"
+            ))
+            await conn.execute(text("DROP INDEX IF EXISTS uq_manual_ack_active"))
+        except Exception as exc:  # noqa: BLE001
+            log.critical(
+                "[manual-ack] índice de unicidade não criado (legado ambíguo?): "
+                f"{type(exc).__name__}: {exc} — reconhecimentos ficam fail-closed"
+            )
+        # Geração da margem por conta/mercado (metadado de concorrência).
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_margin_epoch_identity "
+            "ON account_margin_epochs (account_scope, exchange, market)"
+        ))
+        # Prova de validação manual: revisão exata validada e época da
+        # validação de conta que a governa (aditivas e idempotentes).
+        await conn.execute(text(
+            "ALTER TABLE manual_position_acks "
+            "ADD COLUMN IF NOT EXISTS validated_revision BIGINT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE manual_position_acks "
+            "ADD COLUMN IF NOT EXISTS validated_generation BIGINT"
+        ))
+        # Estado DURÁVEL da validação manual por conta/mercado. Linha existente
+        # começa BLOQUEADA: só um ciclo completo real libera (nada de backfill
+        # com o relógio local).
+        await conn.execute(text(
+            "ALTER TABLE account_margin_epochs "
+            "ADD COLUMN IF NOT EXISTS manual_validation_generation BIGINT "
+            "NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE account_margin_epochs "
+            "ADD COLUMN IF NOT EXISTS manual_validation_blocked BOOLEAN "
+            "NOT NULL DEFAULT true"
         ))
         # Migrações incrementais
         await conn.execute(text(

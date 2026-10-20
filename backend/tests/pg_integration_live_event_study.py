@@ -1,0 +1,579 @@
+"""R13 event ingestion/catalogue: REAL PG16/asyncpg, disposable Unix only.
+
+This is not an in-memory substitute. Two distinct backend connections read
+generation zero before either publication, using a deterministic barrier.
+Only existing official models/tables are created. No production environment,
+credentials, external DB, collector, exchange or schema migration is used.
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+import os
+import re
+import socket
+import subprocess
+import sys
+from contextlib import ExitStack, asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+TEST_SOCKET = os.environ.get("CW_LIVE_EVENT_TEST_SOCKET", "")
+if not re.fullmatch(r"/tmp/cw-live-event-sock\.[A-Za-z0-9]+", TEST_SOCKET) or not Path(TEST_SOCKET).is_dir():
+    raise SystemExit("LIVE_EVENT_PG_BLOCKED: socket descartável do runner obrigatório")
+if any(key in os.environ for key in ("DATABASE_URL", "BINANCE_API_KEY", "BINANCE_API_SECRET")):
+    raise SystemExit("LIVE_EVENT_PG_BLOCKED: ambiente real não deve ser herdado")
+DB_URL = "postgresql+asyncpg://event_research@/event_research_db?host=" + TEST_SOCKET
+os.environ["DATABASE_URL"] = DB_URL  # Only the exact disposable socket above.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+OriginalSocket = socket.socket
+NETWORK = {"tcp_udp": 0, "dns": 0, "foreign_unix": 0}
+CHECKS: list[str] = []
+
+
+class UnixOnlySocket(OriginalSocket):
+    def _allowed(self, address):
+        if self.family != socket.AF_UNIX:
+            NETWORK["tcp_udp"] += 1
+            raise AssertionError("TCP/UDP prohibited in disposable event research")
+        name = address.decode() if isinstance(address, bytes) else address
+        if name != TEST_SOCKET + "/.s.PGSQL.5432":
+            NETWORK["foreign_unix"] += 1
+            raise AssertionError("Only THIS disposable PG socket is permitted")
+
+    def connect(self, address):
+        self._allowed(address)
+        return super().connect(address)
+
+    def connect_ex(self, address):
+        self._allowed(address)
+        return super().connect_ex(address)
+
+    def sendto(self, data, *args):
+        if self.family != socket.AF_UNIX:
+            NETWORK["tcp_udp"] += 1
+            raise AssertionError("UDP prohibited")
+        return super().sendto(data, *args)
+
+
+def no_dns(*args, **kwargs):
+    NETWORK["dns"] += 1
+    raise AssertionError("DNS prohibited in disposable event research")
+
+
+socket.socket = UnixOnlySocket
+socket.getaddrinfo = no_dns
+
+
+def check(name, condition, detail=None):
+    if not condition:
+        raise AssertionError(f"{name}: {detail}")
+    CHECKS.append(name)
+    print("PASS", name, flush=True)
+
+
+async def run():
+    import db
+    from sqlalchemy import event, func, select, text
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+    from models.policy_simulation_state import PolicySimulationState as State
+    from models.strategy_experiment import StrategyExperiment as Experiment
+    from services import live_event_study_service as study
+    from services import policy_state_service as policy_state
+    from services import research_acceptance_service as acceptance
+    from services import research_study_service as official_study
+    from services import strategy_evidence_service as catalog
+    # Fresh process/source identity each run, not a persisted/previous fixture.
+    from tests.test_live_event_study import report_fixture
+
+    engines = []
+    async def new_engine():
+        engine = create_async_engine(DB_URL, poolclass=NullPool)
+        engines.append(engine)
+        return engine
+
+    try:
+        engine = await new_engine()
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with engine.begin() as connection:
+            await connection.run_sync(db.Base.metadata.create_all,
+                                      tables=[State.__table__, Experiment.__table__])
+            actual = (await connection.execute(text("SHOW listen_addresses"))).scalar_one()
+            encoding = (await connection.execute(text("SHOW server_encoding"))).scalar_one()
+        check("discardable_pg_unix_utf8", actual == "" and encoding == "UTF8", (actual, encoding))
+
+        async def schema_signature():
+            async with sessions() as session:
+                return list((await session.execute(text(
+                    "SELECT table_name,column_name,data_type FROM information_schema.columns "
+                    "WHERE table_schema='public' ORDER BY table_name,ordinal_position"))).all())
+
+        schema_before = await schema_signature()
+        check("only_existing_official_tables", {r[0] for r in schema_before} == {
+            State.__tablename__, Experiment.__tablename__})
+        report = report_fixture()
+        check("official_real_callers_economic_report", report.get("ok") is True, report)
+        check("test_only_without_operational_authority", report["evidence_inputs"]["test_only"] is True
+              and all(report.get(key) is False for key in ("promotable", "authorizes_live", "real_study_allowed")))
+        check("full_recomputation_before_ingestion", study.verify_report(report, recompute=True)["ok"])
+        ref = study.study_reference(report)
+        check("separate_event_namespace", ref["experiment_key"].startswith("r13evt:")
+              and not ref["experiment_key"].startswith("r13cal:"))
+
+        forged = copy.deepcopy(report)
+        forged["arms"]["candidate"]["economics"][0]["net_r"] = 99.0
+        forged["report_hash"] = study.digest({k: v for k, v in forged.items() if k != "report_hash"})
+        refused = await study.persist_study(sessions, forged)
+        check("resealed_money_rejected_before_write", not refused.get("published"), refused)
+        async with sessions() as session:
+            count = (await session.execute(select(func.count()).select_from(State))).scalar_one()
+        check("forgery_has_zero_persisted_rows", count == 0, count)
+
+        engine_a, engine_b = await new_engine(), await new_engine()
+        async with engine_a.connect() as connection_a, engine_b.connect() as connection_b:
+            pid_a = (await connection_a.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            pid_b = (await connection_b.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            await connection_a.rollback()
+            await connection_b.rollback()
+            check("two_distinct_live_pg_connections", pid_a != pid_b, (pid_a, pid_b))
+
+            @asynccontextmanager
+            async def worker_a():
+                async with AsyncSession(bind=connection_a, expire_on_commit=False) as session:
+                    yield session
+
+            @asynccontextmanager
+            async def worker_b():
+                async with AsyncSession(bind=connection_b, expire_on_commit=False) as session:
+                    yield session
+
+            barrier = asyncio.Event()
+            arrivals, raw_cas = [], []
+            real_read, real_publish = policy_state.read_state, policy_state.publish_generation
+
+            async def barrier_read(factory, **identity):
+                result = await real_read(factory, **identity)
+                if identity == ref and result["available"] and result["found"] is False:
+                    arrivals.append(factory)
+                    if len(arrivals) == 2:
+                        barrier.set()
+                    await asyncio.wait_for(barrier.wait(), timeout=30)
+                return result
+
+            async def recorded_publish(factory, **kwargs):
+                result = await real_publish(factory, **kwargs)
+                raw_cas.append({"expected_generation": kwargs.get("expected_generation"), "result": result})
+                return result
+
+            with patch.object(policy_state, "read_state", side_effect=barrier_read), \
+                 patch.object(policy_state, "publish_generation", side_effect=recorded_publish):
+                results = await asyncio.wait_for(asyncio.gather(
+                    study.persist_study(worker_a, report),
+                    study.persist_study(worker_b, copy.deepcopy(report))), timeout=60)
+            check("deterministic_barrier_both_read_generation_zero", len(arrivals) == 2 and barrier.is_set())
+            check("cas_both_use_exact_generation_zero", len(raw_cas) == 2
+                  and all(item["expected_generation"] == 0 for item in raw_cas), raw_cas)
+            check("real_cas_stale_loser_not_last_writer_wins", any(item["result"].get("reason_code") == "GENERATION_STALE"
+                  for item in raw_cas), raw_cas)
+            check("two_workers_exactly_one_publication", sum(r.get("published") is True for r in results) == 1, results)
+            check("loser_returns_immutable_unchanged", any(r.get("reason_code") == "EVENT_STUDY_UNCHANGED" for r in results), results)
+
+        async with sessions() as session:
+            persisted = list((await session.execute(select(State))).scalars())
+            check("one_row_one_generation", len(persisted) == 1 and persisted[0].generation == 1)
+            check("jsonb_roundtrip_report_exact", persisted[0].payload == {"event_report": report})
+            check("committed_hash_matches_body", persisted[0].evidence_key == report["report_hash"])
+            original_id = persisted[0].id
+
+        # Different VALID recomputed observation/report, same frozen input
+        # identity. Not an externally supplied metric or patched verifier.
+        changed = study.run_study(manifest=report["manifest"], dataset=report["dataset"],
+                                  now_ms=report["evidence_inputs"]["now_ms"] + 1)
+        check("conflicting_report_itself_fully_valid", study.verify_report(changed, recompute=True)["ok"])
+        check("conflict_preserves_same_identity", study.study_reference(changed) == ref
+              and changed["report_hash"] != report["report_hash"])
+        conflict = await study.persist_study(sessions, changed)
+        check("identity_conflict_refused_no_overwrite", not conflict.get("published")
+              and conflict.get("reason_code") == "EVENT_STUDY_IDENTITY_CONFLICT", conflict)
+
+        await engine.dispose()
+        engine = await new_engine()
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        policy_state._STATE_CACHE.clear()  # Restart has no process cache authority.
+        repeated = await official_study.persist_study(sessions, report)
+        check("official_dispatch_restart_idempotent", not repeated.get("published")
+              and repeated.get("generation") == 1 and repeated.get("reason_code") == "EVENT_STUDY_UNCHANGED", repeated)
+
+        config = study.build_event_envelope(report)
+        cutoff = datetime.fromtimestamp(report["manifest"]["split"]["as_of_ms"] / 1000, tz=timezone.utc)
+        catalog_args = {"champion": report["manifest"]["baseline"], "config": config,
+                        "objective": catalog.OBJECTIVES[0], "study_ref": ref, "cutoff": cutoff,
+                        "fingerprint": report["identity"]["dataset_hash"]}
+        created = await catalog.create_preselection_experiment(**catalog_args)
+        check("official_catalog_dispatch_creates_only_draft", created.get("ok") and created.get("status") == "DRAFT"
+              and created.get("promotable") is False, created)
+        recreated = await catalog.create_preselection_experiment(**catalog_args)
+        check("catalog_retry_same_existing_id", recreated.get("experiment_id") == created["experiment_id"], recreated)
+        await db._engine.dispose()
+        restarted = await catalog.create_preselection_experiment(**catalog_args)
+        check("catalog_restart_same_existing_id", restarted.get("experiment_id") == created["experiment_id"], restarted)
+        async with db.get_session() as session:
+            entries = list((await session.execute(select(Experiment))).scalars())
+            check("one_draft_no_shadow_no_acceptance", len(entries) == 1 and entries[0].status == "DRAFT"
+                  and entries[0].shadow_started_at is None and entries[0].offline_metrics["operational_authority"] == "NONE")
+        wrong_args = {**catalog_args, "fingerprint": "0" * 64}
+        refused_catalog = await catalog.create_preselection_experiment(**wrong_args)
+        check("catalog_identity_mismatch_refused", refused_catalog.get("reason_code") == "EVENT_CATALOG_IDENTITY_MISMATCH",
+              refused_catalog)
+        legacy_read = await official_study.load_latest_study(sessions)
+        check("event_report_not_a_legacy_calibration", legacy_read.get("available") is True
+              and legacy_read.get("reason_code") == "NO_CALIBRATION_STUDY"
+              and legacy_read.get("artifact") is None, legacy_read)
+        check("synthetic_never_promotion_or_canary", all(not acceptance.verify_acceptance(report,
+              now_ms=report["evidence_inputs"]["now_ms"], purpose=purpose)["ok"] for purpose in ("PROMOTION", "CANARY")))
+
+        # Read paths: forbid engines, fitting and every non-SELECT SQL statement;
+        # count ORM commits/flushes as well, not merely equivalent final rows.
+        read_sql, write_attempts, commits, flushes = [], [], [], []
+        def read_only_sql(conn, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                read_sql.append(statement)
+                return
+            write_attempts.append(statement)
+            raise AssertionError("Non-SELECT in event read endpoint")
+        def committed(session):
+            commits.append(True)
+        def flushed(session, context):
+            flushes.append(True)
+        guarded_engines = (engine, db._engine)
+        for item in guarded_engines:
+            event.listen(item.sync_engine, "before_cursor_execute", read_only_sql)
+        event.listen(AsyncSession.sync_session_class, "after_commit", committed)
+        event.listen(AsyncSession.sync_session_class, "after_flush", flushed)
+        try:
+            with ExitStack() as guards:
+                for module, name in ((study, "run_study"), (study.execution, "replay_execution"),
+                                     (study.manager, "run_trace"), (study.ledger, "replay_accounting"),
+                                     (study.evidence, "evaluate_evidence"), (subprocess, "run")):
+                    guards.enter_context(patch.object(module, name, side_effect=AssertionError("engine/fitting on GET")))
+                loaded = await study.load_study(sessions, ref)
+                status = await study.load_latest_status(sessions)
+                experiment = await catalog.get_experiment(created["experiment_id"])
+            check("restart_read_verified_report_exact", loaded.get("available") and loaded.get("report") == report, loaded)
+            check("status_read_is_observational", status.get("available") and status.get("promotable") is False
+                  and status.get("authorizes_live") is False and status.get("holdout_status") == "SEALED", status)
+            check("catalog_read_draft_without_replay", experiment is not None and experiment["status"] == "DRAFT", experiment)
+            check("get_zero_writes_commits_flushes", not write_attempts and not commits and not flushes
+                  and len(read_sql) >= 3, (write_attempts, commits, flushes, len(read_sql)))
+        finally:
+            for item in guarded_engines:
+                event.remove(item.sync_engine, "before_cursor_execute", read_only_sql)
+            event.remove(AsyncSession.sync_session_class, "after_commit", committed)
+            event.remove(AsyncSession.sync_session_class, "after_flush", flushed)
+
+        # Material tamper in a PG row is not granted validity by re-sealing a
+        # public hash. The frozen persisted evidence key must bind its report.
+        async with sessions() as session:
+            row = (await session.execute(select(State).where(State.id == original_id))).scalar_one()
+            row.payload = {"event_report": forged}
+            await session.commit()
+        tampered = await study.load_study(sessions, ref)
+        tampered_status = await study.load_latest_status(sessions)
+        check("db_resealed_money_tamper_read_refused", tampered.get("available") is False, tampered)
+        check("db_resealed_money_tamper_status_refused", tampered_status.get("available") is False, tampered_status)
+        async with sessions() as session:
+            row = (await session.execute(select(State).where(State.id == original_id))).scalar_one()
+            row.payload = {"event_report": report}
+            await session.commit()
+        check("restored_valid_row_reads_same_report", (await study.load_study(sessions, ref)).get("report") == report)
+        async with sessions() as session:
+            row = (await session.execute(select(State).where(State.id == original_id))).scalar_one()
+            check("generation_and_original_hash_never_overwritten", row.generation == 1
+                  and row.evidence_key == report["report_hash"])
+
+        # Full native caller chain, independently identified from the earlier
+        # ENTRY-only study. Synthetic broker/DB ports never grant LIVE authority.
+        from tests.test_live_event_chain import native_pyramid_chain_fixture
+        chain_manifest, chain_data = native_pyramid_chain_fixture("long")
+        chain_report = study.run_study(manifest=chain_manifest, dataset=chain_data,
+            now_ms=max(report["evidence_inputs"]["now_ms"], chain_manifest["split"]["as_of_ms"]))
+        check("native_pyramid_chain_report_complete", chain_report.get("ok") is True
+              and all(a["records"][0]["state"] == "COMPLETE" for a in chain_report.get("arms", {}).values()),
+              chain_report.get("reason_code"))
+        check("native_chain_has_four_steps_and_two_executions", all(
+              len(a["records"][0]["step_reports"]) == 4
+              and len(a["records"][0]["execution_reports"]) == 2
+              and a["records"][0]["execution_reports"][1]["manager_updates"][0]["kind"] == "PYRAMID_FILL"
+              for a in chain_report["arms"].values()))
+        check("native_chain_ledger_economic_proof_and_no_authority", all(
+              a["records"][0]["ledger"]["economic_value_known"] is True
+              and a["records"][0]["ledger"]["net_including_funding"] is not None
+              and a["broker_balance_replica"] is False
+              and a["partial_cash_recognized"] is False
+              for a in chain_report["arms"].values())
+              and all(chain_report.get(k) is False for k in
+                  ("promotable", "authorizes_live", "live_equivalent", "real_study_allowed")))
+        check("native_chain_full_recomputation_verified", study.verify_report(chain_report, recompute=True)["ok"])
+        chain_ref = study.study_reference(chain_report)
+        check("native_chain_identity_separate_from_entry_study", chain_ref != ref)
+        chain_persisted = await official_study.persist_study(sessions, chain_report)
+        check("native_chain_official_dispatch_persisted_once", chain_persisted.get("published") is True
+              and chain_persisted.get("generation") == 1, chain_persisted)
+        chain_config = study.build_event_envelope(chain_report)
+        chain_catalog_args = {"champion": chain_manifest["baseline"], "config": chain_config,
+            "objective": catalog.OBJECTIVES[0], "study_ref": chain_ref,
+            "cutoff": datetime.fromtimestamp(chain_manifest["split"]["as_of_ms"] / 1000, tz=timezone.utc),
+            "fingerprint": chain_report["identity"]["dataset_hash"]}
+        chain_created = await catalog.create_preselection_experiment(**chain_catalog_args)
+        check("native_chain_catalog_is_separate_inactive_draft", chain_created.get("ok") is True
+              and chain_created.get("status") == "DRAFT" and chain_created.get("promotable") is False
+              and chain_created.get("experiment_id") != created["experiment_id"], chain_created)
+
+        await engine.dispose()
+        engine = await new_engine()
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        policy_state._STATE_CACHE.clear()
+        chain_repeated = await official_study.persist_study(sessions, chain_report)
+        check("native_chain_restart_same_generation_and_money", chain_repeated.get("published") is False
+              and chain_repeated.get("generation") == 1
+              and chain_repeated.get("reason_code") == "EVENT_STUDY_UNCHANGED", chain_repeated)
+        async with sessions() as session:
+            stored_chain = (await session.execute(select(State).where(
+                State.experiment_key == chain_ref["experiment_key"]))).scalar_one()
+            check("native_chain_jsonb_exact_report_after_restart", stored_chain.payload == {"event_report": chain_report}
+                  and stored_chain.evidence_key == chain_report["report_hash"] and stored_chain.generation == 1)
+
+        previous_read_count = len(read_sql)
+        chain_guarded_engines = (engine, db._engine)
+        for item in chain_guarded_engines:
+            event.listen(item.sync_engine, "before_cursor_execute", read_only_sql)
+        event.listen(AsyncSession.sync_session_class, "after_commit", committed)
+        event.listen(AsyncSession.sync_session_class, "after_flush", flushed)
+        try:
+            with ExitStack() as guards:
+                for module, name in ((study, "run_study"), (study.execution, "replay_execution"),
+                                     (study.manager, "run_trace"), (study.ledger, "replay_accounting"),
+                                     (study.evidence, "evaluate_evidence"), (subprocess, "run")):
+                    guards.enter_context(patch.object(module, name, side_effect=AssertionError("native chain replay on GET")))
+                chain_loaded = await study.load_study(sessions, chain_ref)
+                chain_experiment = await catalog.get_experiment(chain_created["experiment_id"])
+            check("native_chain_read_only_roundtrip_exact_economics", chain_loaded.get("available") is True
+                  and chain_loaded.get("report") == chain_report)
+            check("native_chain_catalog_read_remains_inactive_draft", chain_experiment is not None
+                  and chain_experiment["status"] == "DRAFT"
+                  and chain_experiment["shadow_started_at"] is None)
+            check("native_chain_read_has_no_replay_writes_commits_flushes", not write_attempts
+                  and not commits and not flushes and len(read_sql) >= previous_read_count + 2)
+        finally:
+            for item in chain_guarded_engines:
+                event.remove(item.sync_engine, "before_cursor_execute", read_only_sql)
+            event.remove(AsyncSession.sync_session_class, "after_commit", committed)
+            event.remove(AsyncSession.sync_session_class, "after_flush", flushed)
+
+        # Native upstream sizing is an independent source-bound study. Reuse
+        # the real entry/management/ledger fixture, never supplied metrics.
+        from services import live_upstream_sizing_service as upstream
+        from tests.test_live_upstream_execution import bound_entry
+        from tests.test_live_event_study import fixture as entry_study_fixture, NOW
+        native_manifest, native_data = entry_study_fixture()
+        native_entry, native_sizing = bound_entry()
+        manifest_body = {k: copy.deepcopy(v) for k, v in native_manifest.items() if k != "manifest_hash"}
+        manifest_body["hashes"] = None
+        manifest_body["shared"]["execution_config"] = copy.deepcopy(native_entry["config"])
+        native_manifest = study.parse_manifest(manifest_body)
+        native_data.update(manifest_hash=native_manifest["manifest_hash"], dataset_hash=None)
+        for arm in ("baseline", "candidate"):
+            native_data["events"][arm][0]["steps"][0]["request"] = copy.deepcopy(native_entry)
+        native_data = study.validate_dataset(native_data, native_manifest)
+        native_report = study.run_study(manifest=native_manifest, dataset=native_data, now_ms=NOW)
+        check("native_upstream_both_real_arms_qty_and_money", native_report.get("ok") is True
+              and all(a["records"][0]["state"] == "COMPLETE"
+                      and a["records"][0]["execution"]["upstream_sizing_report"]["status"] == "COMPLETE_SIZING"
+                      and a["records"][0]["execution"]["upstream_sizing_report"]["qty"] == 2.
+                      and float(a["records"][0]["ledger"]["net_including_funding"]) == 3.8
+                      for a in native_report.get("arms", {}).values()), native_report.get("technical_gaps"))
+        check("native_upstream_recomputed_sealed_without_authority",
+              study.verify_report(native_report, recompute=True)["ok"]
+              and native_report["holdout_status"] == "SEALED"
+              and all(native_report.get(k) is False for k in
+                      ("promotable", "authorizes_live", "live_equivalent", "real_study_allowed")))
+        native_ref = study.study_reference(native_report)
+        check("native_upstream_identity_preserves_previous_studies", native_ref != ref
+              and native_ref != chain_ref and native_report["report_hash"] != report["report_hash"])
+        native_persisted = await official_study.persist_study(sessions, native_report)
+        check("native_upstream_official_persist_one_generation", native_persisted.get("published") is True
+              and native_persisted.get("generation") == 1, native_persisted)
+        native_catalog_args = {
+            "champion": native_manifest["baseline"], "config": study.build_event_envelope(native_report),
+            "objective": catalog.OBJECTIVES[0], "study_ref": native_ref,
+            "cutoff": datetime.fromtimestamp(native_manifest["split"]["as_of_ms"] / 1000, tz=timezone.utc),
+            "fingerprint": native_report["identity"]["dataset_hash"],
+        }
+        native_created = await catalog.create_preselection_experiment(**native_catalog_args)
+        check("native_upstream_catalog_separate_inactive_draft", native_created.get("ok") is True
+              and native_created.get("status") == "DRAFT" and native_created.get("promotable") is False
+              and native_created.get("experiment_id") not in
+                  {created["experiment_id"], chain_created["experiment_id"]}, native_created)
+
+        await engine.dispose()
+        await db._engine.dispose()
+        engine = await new_engine()
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        policy_state._STATE_CACHE.clear()
+        native_repeated = await official_study.persist_study(sessions, native_report)
+        async with sessions() as session:
+            stored_native = (await session.execute(select(State).where(
+                State.experiment_key == native_ref["experiment_key"]))).scalar_one()
+            stored_sizing = stored_native.payload["event_report"]["arms"]["baseline"]["records"][0][
+                "execution"]["upstream_sizing_report"]
+            check("native_upstream_restart_hash_qty_and_generation_exact",
+                  native_repeated.get("published") is False and native_repeated.get("generation") == 1
+                  and native_repeated.get("reason_code") == "EVENT_STUDY_UNCHANGED"
+                  and stored_native.payload == {"event_report": native_report}
+                  and stored_native.evidence_key == native_report["report_hash"]
+                  and stored_sizing["report_hash"] == native_sizing["report_hash"]
+                  and stored_sizing["request_hash"] == native_entry["upstream_sizing"]["request_hash"]
+                  and stored_sizing["qty"] == 2., native_repeated)
+
+        native_previous_reads = len(read_sql)
+        native_guarded_engines = (engine, db._engine)
+        for item in native_guarded_engines:
+            event.listen(item.sync_engine, "before_cursor_execute", read_only_sql)
+        event.listen(AsyncSession.sync_session_class, "after_commit", committed)
+        event.listen(AsyncSession.sync_session_class, "after_flush", flushed)
+        try:
+            with ExitStack() as guards:
+                for module, name in ((study, "run_study"), (study.execution, "replay_execution"),
+                                     (study.manager, "run_trace"), (study.ledger, "replay_accounting"),
+                                     (study.evidence, "evaluate_evidence"), (upstream, "replay"),
+                                     (subprocess, "run")):
+                    guards.enter_context(patch.object(module, name,
+                        side_effect=AssertionError("native upstream replay on GET")))
+                native_loaded = await study.load_study(sessions, native_ref)
+                native_experiment = await catalog.get_experiment(native_created["experiment_id"])
+            check("native_upstream_get_exact_report_and_inactive_catalog",
+                  native_loaded.get("available") is True and native_loaded.get("report") == native_report
+                  and native_experiment is not None and native_experiment["status"] == "DRAFT"
+                  and native_experiment["shadow_started_at"] is None)
+            check("native_upstream_get_zero_replay_writes_commits_flushes",
+                  not write_attempts and not commits and not flushes
+                  and len(read_sql) >= native_previous_reads + 2)
+        finally:
+            for item in native_guarded_engines:
+                event.remove(item.sync_engine, "before_cursor_execute", read_only_sql)
+            event.remove(AsyncSession.sync_session_class, "after_commit", committed)
+            event.remove(AsyncSession.sync_session_class, "after_flush", flushed)
+        # Nominal producer and filler batch are separate source-bound component
+        # proofs. Persist/restart the real study and exact refs, not a supplied
+        # economic summary or a claim that a real broker position was opened.
+        from services import live_nominal_sizing_service as nominal
+        from services import live_filler_batch_service as filler
+        from tests.test_live_sizing_producer_integration import producer_bound_entry
+        producer_manifest, producer_data = entry_study_fixture()
+        producer_entry, producer_sizing = producer_bound_entry()
+        producer_body = {k: copy.deepcopy(v) for k, v in producer_manifest.items() if k != "manifest_hash"}
+        producer_body["hashes"] = None
+        producer_body["shared"]["execution_config"] = copy.deepcopy(producer_entry["config"])
+        producer_manifest = study.parse_manifest(producer_body)
+        producer_data.update(manifest_hash=producer_manifest["manifest_hash"], dataset_hash=None)
+        for arm in ("baseline", "candidate"):
+            producer_data["events"][arm][0]["steps"][0]["request"] = copy.deepcopy(producer_entry)
+        producer_data = study.validate_dataset(producer_data, producer_manifest)
+        producer_report = study.run_study(manifest=producer_manifest, dataset=producer_data, now_ms=NOW)
+        component_refs = producer_sizing["producer_refs"]
+        check("native_producers_both_real_arms_refs_qty_and_money", producer_report.get("ok") is True
+              and set(component_refs) == {"nominal_producer", "filler_batch"}
+              and all(a["records"][0]["state"] == "COMPLETE"
+                      and a["records"][0]["execution"]["upstream_sizing_report"]["qty"] == 2.
+                      and a["records"][0]["execution"]["upstream_sizing_report"]["producer_refs"] == component_refs
+                      and float(a["records"][0]["ledger"]["net_including_funding"]) == 3.8
+                      for a in producer_report.get("arms", {}).values()), producer_report.get("technical_gaps"))
+        check("native_producers_recomputed_sealed_without_authority",
+              study.verify_report(producer_report, recompute=True)["ok"]
+              and producer_report["holdout_status"] == "SEALED"
+              and all(producer_report.get(k) is False for k in
+                      ("promotable", "authorizes_live", "live_equivalent", "real_study_allowed")))
+        producer_ref = study.study_reference(producer_report)
+        check("native_producers_identity_separate_from_three_studies", all(
+              producer_ref != previous for previous in (ref, chain_ref, native_ref)))
+        producer_persisted = await official_study.persist_study(sessions, producer_report)
+        check("native_producers_official_persist_one_generation", producer_persisted.get("published") is True
+              and producer_persisted.get("generation") == 1, producer_persisted)
+        producer_catalog_args = {
+            "champion": producer_manifest["baseline"], "config": study.build_event_envelope(producer_report),
+            "objective": catalog.OBJECTIVES[0], "study_ref": producer_ref,
+            "cutoff": datetime.fromtimestamp(producer_manifest["split"]["as_of_ms"] / 1000, tz=timezone.utc),
+            "fingerprint": producer_report["identity"]["dataset_hash"],
+        }
+        producer_created = await catalog.create_preselection_experiment(**producer_catalog_args)
+        check("native_producers_catalog_separate_inactive_draft", producer_created.get("ok") is True
+              and producer_created.get("status") == "DRAFT" and producer_created.get("promotable") is False
+              and producer_created.get("experiment_id") not in
+                  {created["experiment_id"], chain_created["experiment_id"], native_created["experiment_id"]},
+              producer_created)
+
+        await engine.dispose()
+        await db._engine.dispose()
+        engine = await new_engine()
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        policy_state._STATE_CACHE.clear()
+        producer_repeated = await official_study.persist_study(sessions, producer_report)
+        async with sessions() as session:
+            stored_producer = (await session.execute(select(State).where(
+                State.experiment_key == producer_ref["experiment_key"]))).scalar_one()
+            stored_component_sizing = stored_producer.payload["event_report"]["arms"]["baseline"]["records"][0][
+                "execution"]["upstream_sizing_report"]
+            check("native_producers_jsonb_restart_exact_refs_qty_generation",
+                  producer_repeated.get("published") is False and producer_repeated.get("generation") == 1
+                  and producer_repeated.get("reason_code") == "EVENT_STUDY_UNCHANGED"
+                  and stored_producer.payload == {"event_report": producer_report}
+                  and stored_producer.evidence_key == producer_report["report_hash"]
+                  and stored_producer.generation == 1
+                  and stored_component_sizing["producer_refs"] == component_refs
+                  and stored_component_sizing["report_hash"] == producer_sizing["report_hash"]
+                  and stored_component_sizing["request_hash"] == producer_entry["upstream_sizing"]["request_hash"]
+                  and stored_component_sizing["qty"] == 2., producer_repeated)
+
+        producer_previous_reads = len(read_sql)
+        producer_guarded_engines = (engine, db._engine)
+        for item in producer_guarded_engines:
+            event.listen(item.sync_engine, "before_cursor_execute", read_only_sql)
+        event.listen(AsyncSession.sync_session_class, "after_commit", committed)
+        event.listen(AsyncSession.sync_session_class, "after_flush", flushed)
+        try:
+            with ExitStack() as guards:
+                for module, name in ((study, "run_study"), (study.execution, "replay_execution"),
+                                     (study.manager, "run_trace"), (study.ledger, "replay_accounting"),
+                                     (study.evidence, "evaluate_evidence"), (upstream, "replay"),
+                                     (nominal, "replay"), (filler, "replay"), (subprocess, "run")):
+                    guards.enter_context(patch.object(module, name,
+                        side_effect=AssertionError("nominal/filler replay on GET")))
+                producer_loaded = await study.load_study(sessions, producer_ref)
+                producer_experiment = await catalog.get_experiment(producer_created["experiment_id"])
+            check("native_producers_get_exact_report_and_inactive_catalog",
+                  producer_loaded.get("available") is True and producer_loaded.get("report") == producer_report
+                  and producer_experiment is not None and producer_experiment["status"] == "DRAFT"
+                  and producer_experiment["shadow_started_at"] is None)
+            check("native_producers_get_zero_replay_writes_commits_flushes",
+                  not write_attempts and not commits and not flushes
+                  and len(read_sql) >= producer_previous_reads + 2)
+        finally:
+            for item in producer_guarded_engines:
+                event.remove(item.sync_engine, "before_cursor_execute", read_only_sql)
+            event.remove(AsyncSession.sync_session_class, "after_commit", committed)
+            event.remove(AsyncSession.sync_session_class, "after_flush", flushed)
+        check("no_new_tables_or_columns", await schema_signature() == schema_before)
+        check("zero_tcp_udp_dns_foreign_unix", NETWORK == {"tcp_udp": 0, "dns": 0, "foreign_unix": 0}, NETWORK)
+        print("LIVE_EVENT_STUDY_PG_OK", len(CHECKS), flush=True)
+    finally:
+        for engine in engines:
+            await engine.dispose()
+        if db._engine is not None:
+            await db._engine.dispose()
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

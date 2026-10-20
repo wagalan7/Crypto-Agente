@@ -143,10 +143,16 @@ class EscopoLegadoIntacto(unittest.TestCase):
 
 
 class DescritoresDeEscopo(unittest.TestCase):
-    def test_quatro_escopos_declarados(self):
+    def test_escopos_declarados_incluem_populacao_bruta_sem_outcome(self):
         self.assertEqual(sorted(scopes.SCOPES), sorted([
             scopes.SCOPE_REJECTED_POST, scopes.SCOPE_PRE_VETOED,
-            scopes.SCOPE_PRE_ACCEPTED, scopes.SCOPE_STRUCTURAL]))
+            scopes.SCOPE_PRE_ACCEPTED, scopes.SCOPE_STRUCTURAL,
+            scopes.SCOPE_PRE_POPULATION]))
+        raw = scopes.PRE_POPULATION
+        self.assertFalse(raw.exports_trajectory)
+        self.assertFalse(raw.comparable_with_r10a)
+        self.assertTrue(scopes.detail_needs_window_params(raw))
+        self.assertNotIn("o.outcome", scopes.detail_sql(raw))
 
     def test_lacuna_historica_tem_reason_code(self):
         for scope in scopes.SCOPES.values():

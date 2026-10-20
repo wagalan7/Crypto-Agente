@@ -389,7 +389,7 @@ class MakerFillMonotonicityEdgeTests(unittest.IsolatedAsyncioTestCase):
 
 class ProtectionProgressEdgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_confirmed_tp1_survives_tp2_timeout(self):
-        async def signed_request(_method, _path, params=None):
+        async def signed_request(_method, _path, params=None, **kwargs):
             trigger = float((params or {}).get("triggerPrice") or 0.0)
             if trigger == 90.0:
                 return {"ok": True, "result": {"algoId": "sl-progress"}}

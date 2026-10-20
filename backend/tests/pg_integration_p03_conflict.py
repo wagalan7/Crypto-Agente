@@ -64,7 +64,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 async def run():
     from unittest.mock import patch
-    from sqlalchemy import func, select, update
+    from sqlalchemy import func, select, text, update
     import db
     from models.entry_intent import EntryIntent
     from models.execution_incident import ExecutionIncident
@@ -81,6 +81,18 @@ async def run():
         async with db._engine.begin() as conn:
             await conn.run_sync(db.Base.metadata.create_all, tables=tabelas)
     await db.init_db()
+    # Evidência sintética COERENTE do controle de validação manual:
+    # este harness não exercita reconhecimento manual, então a conta
+    # entra com a validação já concluída por um ciclo real.
+    async with db.get_session() as _s:
+        await _s.execute(text(
+            "INSERT INTO account_margin_epochs (account_scope, exchange, "
+            "market, generation, manual_validation_generation, "
+            "manual_validation_blocked, updated_at) VALUES "
+            "(:c, 'binance', 'usdm_futures', 0, 1, false, now()) "
+            "ON CONFLICT (account_scope, exchange, market) DO UPDATE "
+            "SET manual_validation_blocked = false"), {"c": "c" * 64})
+        await _s.commit()
 
     ORDENS: dict = {}
     POSICOES: dict = {"positions": []}

@@ -370,6 +370,8 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
         state = await _get_or_create_state(session)
         was_paused = bool(state.trading_paused)
         kept_p03 = False
+        kept_manual = False
+        causa: dict = {}
         if paused:
             state.trading_paused = True
             state.pause_manual = True
@@ -387,11 +389,22 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
             except Exception as exc:  # noqa: BLE001
                 log.warning(f"[circuit-breaker] contagem de incidentes P03 falhou (fail-closed): {exc}")
                 open_p03 = 1  # fail-closed: não libera sem confirmar zero
+            # Causa MANUAL decidida NA MESMA transação (época travada): zero
+            # incidentes não autoriza retomada com validação manual bloqueada.
+            causa = await manual_cause_in_session(session) or {}
             if open_p03 > 0:
                 kept_p03 = True
                 state.trading_paused = True
                 state.pause_manual = False
                 state.pause_reason = f"{_P03_PAUSE_MARKER} {open_p03} incidente(s) P03 aberto(s) — resume manual bloqueado"
+                state.paused_at = state.paused_at or datetime.now(timezone.utc)
+            elif causa.get("blocked") or not causa.get("ok"):
+                kept_manual = True
+                state.trading_paused = True
+                state.pause_manual = False
+                state.pause_reason = (
+                    f"{_MANUAL_CAUSE_MARKER} validação manual pendente "
+                    f"({causa.get('reason_code')}) — resume bloqueado")
                 state.paused_at = state.paused_at or datetime.now(timezone.utc)
             else:
                 state.trading_paused = False
@@ -401,10 +414,10 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
         state.updated_at = datetime.now(timezone.utc)
         if paused and not was_paused:
             _log_event(session, state, "manual_pause", state.pause_reason)
-        elif (not paused) and was_paused and not kept_p03:
+        elif (not paused) and was_paused and not (kept_p03 or kept_manual):
             _log_event(session, state, "manual_resume", reason or "Retomado manualmente")
         await session.commit()
-        log.warning(f"[circuit-breaker] MANUAL pause={paused} kept_p03={kept_p03} reason={reason}")
+        log.warning(f"[circuit-breaker] MANUAL pause={paused} kept_p03={kept_p03} kept_manual={kept_manual} reason={reason}")
         # Latch em memória: arma/limpa SOMENTE o owner "manual" — NUNCA o clear
         # genérico (que apagaria P03/P02/legacy).
         try:
@@ -412,11 +425,28 @@ async def set_manual_pause(paused: bool, reason: Optional[str] = None) -> dict:
             if paused:
                 shadow_trade_service._arm_execution_quarantine(
                     state.pause_reason or "manual", owner="manual")
+            elif kept_p03 or kept_manual:
+                # Contenção MANTIDA: o latch do operador não é limpo quando a
+                # retomada não aconteceu (nem clear genérico).
+                shadow_trade_service._arm_execution_quarantine(
+                    state.pause_reason or "contenção mantida", owner="manual")
             else:
                 shadow_trade_service.clear_execution_quarantine(owner="manual")
         except Exception as exc:  # noqa: BLE001
             log.error(f"[circuit-breaker] falha ajustando latch manual: {exc}")
-        return _to_dict(state)
+        resultado = _to_dict(state)
+        # Resultado ESTRUTURADO e distinto: o caller sabe que a retomada não
+        # aconteceu e por qual causa.
+        resultado["kept_p03"] = kept_p03
+        resultado["kept_manual_cause"] = kept_manual
+        resultado["resumed"] = bool((not paused) and not (kept_p03 or kept_manual))
+        if kept_manual:
+            resultado["manual_cause"] = {
+                "reason_code": causa.get("reason_code"),
+                "blocked": True,
+                "pending_failure": bool(causa.get("pending_failure")),
+                "readable": bool(causa.get("ok"))}
+        return resultado
 
 
 async def ensure_p03_pause_in_session(session, reason: str) -> None:
@@ -454,6 +484,33 @@ RELEASE_RELEASED = "RELEASED"
 RELEASE_SAFE_OTHER_OWNER = "SAFE_OTHER_OWNER"
 RELEASE_STILL_OPEN = "STILL_OPEN"
 RELEASE_ERROR = "ERROR"
+#: Zero incidentes NÃO é suficiente: a causa MANUAL (conta com validação
+#: bloqueada, falha local pendente ou época ilegível) mantém a contenção. É um
+#: resultado DISTINTO de STILL_OPEN/ERROR para o caller não confundir as causas.
+RELEASE_MANUAL_CAUSE = "MANUAL_CAUSE_PENDING"
+#: Marcador da pausa mantida por causa manual (não é pausa do operador nem P03).
+_MANUAL_CAUSE_MARKER = "[manual-validation]"
+
+
+async def manual_cause_in_session(session) -> dict:
+    """Causa MANUAL lida NA transação corrente (nunca em outra conexão).
+
+    Ordem de locks desta fronteira: latch local do caller → advisory
+    `_P03_PAUSE_LOCK` → linha da época manual (FOR UPDATE) → `risk_state` → UM
+    commit. A linha da época fica travada até o commit, então uma gravação
+    concorrente de `manual_validation_blocked=true` não aparece depois da
+    decisão. Nada aqui pede `917283`, então não há inversão com o publicador
+    manual (que pede `917283` e NUNCA pede `_P03_PAUSE_LOCK`).
+    """
+    try:
+        from services import manual_position_service as mps
+        return await mps.manual_cause_in_session(
+            session, account_scope=mps.current_account_scope(), lock_row=True)
+    except Exception as exc:  # noqa: BLE001 — dúvida é causa, não ausência
+        log.error(f"[circuit-breaker] causa manual ilegível (fail-closed): "
+                  f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "blocked": True, "reason_code": "MANUAL_CAUSE_UNREADABLE",
+                "detail": type(exc).__name__}
 
 
 async def release_p03_pause(marker: str) -> str:
@@ -478,6 +535,14 @@ async def release_p03_pause(marker: str) -> str:
             if open_p03 > 0:
                 await session.commit()
                 return RELEASE_STILL_OPEN
+            # Zero incidentes é NECESSÁRIO, não suficiente: a causa manual é
+            # decidida AQUI, na mesma transação e com a linha da época travada.
+            causa = await manual_cause_in_session(session)
+            if causa.get("blocked") or not causa.get("ok"):
+                await session.commit()
+                log.warning(f"[circuit-breaker] release P03 retido por causa "
+                            f"manual ({causa.get('reason_code')})")
+                return RELEASE_MANUAL_CAUSE
             state = await _get_or_create_state(session)
             if not state.trading_paused:
                 await session.commit()

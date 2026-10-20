@@ -15,11 +15,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
+import copy
 import hashlib
 import json
 import math
 import re
-from typing import Any, Mapping, Optional, Tuple
+import logging
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+log = logging.getLogger(__name__)
 
 from sqlalchemy import func, or_, select, text, update
 
@@ -163,6 +169,48 @@ class DailyBudget:
     complete: bool = False
 
 
+#: A observação de carteira usada nesta proposta ficou OBSOLETA: houve mudança
+#: local na interpretação de margem (reserva criada/alterada, intenção virando
+#: posição, liberação/terminal, recovery) entre a leitura e a admissão.
+MARGIN_SUPERSEDED = "MARGIN_OBSERVATION_SUPERSEDED"
+#: O símbolo pertence a uma posição manual reconhecida (ou o registro está
+#: ilegível/ambíguo): a admissão NEGA dentro da própria transação.
+OWNERSHIP_BLOCKED = "MANUAL_POSITION_SYMBOL_BLOCKED"
+
+
+@dataclass(frozen=True)
+class MarginGate:
+    """MARGEM realmente disponível na conta COMPARTILHADA com o operador.
+
+    Limite INDEPENDENTE do orçamento nominal do bot: caber no risco aprovado
+    não prova que há saldo livre para abrir. `available_usd` já reflete a
+    margem usada na conta (inclusive a da posição manual) — ela NÃO é somada de
+    volta, e a margem das posições abertas NÃO é descontada de novo.
+
+    `as_of_ms` é a prova temporal da leitura feita FORA da transação; ela é
+    conferida DENTRO dela. Parcela ausente/incompleta BLOQUEIA: desconhecido
+    nunca vira zero nem estimativa favorável.
+    """
+
+    available_usd: Optional[float] = None
+    required_usd: float = 0.0
+    as_of_ms: Optional[int] = None
+    max_age_s: float = 30.0
+    complete: bool = False
+    #: Identidade da carteira observada. A admissão só aceita observação da
+    #: MESMA conta/exchange/mercado da intenção.
+    account_ref: Optional[str] = None
+    exchange: Optional[str] = None
+    market: Optional[str] = None
+    #: Geração (época) vigente quando a carteira foi lida. Geração diferente na
+    #: admissão significa observação SUPERADA — nega sem POST.
+    generation: Optional[int] = None
+    #: Janela REAL da obtenção e qualidade declarada pela origem.
+    observed_start_ms: Optional[int] = None
+    observed_end_ms: Optional[int] = None
+    quality: Optional[str] = None
+
+
 @dataclass(frozen=True)
 class Reservation:
     decision: str
@@ -170,14 +218,188 @@ class Reservation:
     client_order_id: Optional[str] = None
     state: Optional[str] = None
     reason: Optional[str] = None
+    #: Geração de margem RESULTANTE desta operação. O dispatch confere este
+    #: token antes de enviar: mudança concorrente exige nova admissão.
+    generation: Optional[int] = None
+    #: Proposta CONGELADA vinculada ao despacho nesta mesma transação (F4).
+    proposal: Optional[dict] = None
 
     @property
     def granted(self) -> bool:
         return self.decision in GRANTED
 
 
+#: Tolerância de relógio (ms) ao comparar o carimbo da carteira com o agora.
+_MARGIN_CLOCK_SKEW_MS = 2_000
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _margin_identity(account_ref, exchange, market) -> tuple:
+    return (str(account_ref or ""), str(exchange or "").lower(),
+            str(market or "usdm_futures").lower())
+
+
+#: ORDEM ÚNICA DE LOCKS deste protocolo (evita a inversão que o PostgreSQL
+#: detectava como `deadlock detected`):
+#:
+#:   1. latch local (quando houver) ANTES de abrir a transação;
+#:   2. `BEGIN` → `pg_advisory_xact_lock(917283)` ANTES de qualquer leitura
+#:      decisória ou row lock;
+#:   3. linha da ÉPOCA da conta antes das linhas de intenção;
+#:   4. linhas de reconhecimento/intenção em ordem determinística de id/chave;
+#:   5. escrita/prova/CAS → commit único → liberação.
+#:
+#: Helpers internos recebem a sessão JÁ aberta: nenhum deles pode abrir outra
+#: conexão enquanto esta segura a advisory lock.
+_LOCK_SQL = text("SELECT pg_advisory_xact_lock(:k)")
+
+
+async def acquire_risk_lock(session) -> None:
+    """Passo 2 da ordem única. Idempotente dentro da mesma transação."""
+    await session.execute(_LOCK_SQL, {"k": RISK_LOCK_KEY})
+
+
+async def _lock_epoch_row(session, *, account_ref: str, exchange: str,
+                          market: str = "usdm_futures"):
+    """Passo 3: trava (ou cria) a linha da época ANTES das intenções."""
+    from models.account_margin_epoch import AccountMarginEpoch as Epoch
+    conta, corretora, mercado = _margin_identity(account_ref, exchange, market)
+    linha = (await session.execute(
+        select(Epoch).where(Epoch.account_scope == conta, Epoch.exchange == corretora,
+                            Epoch.market == mercado).with_for_update())).scalar_one_or_none()
+    if linha is None:
+        linha = Epoch(account_scope=conta, exchange=corretora, market=mercado,
+                      generation=0, manual_validation_generation=0,
+                      manual_validation_blocked=True, updated_at=_now())
+        session.add(linha)
+        await session.flush()
+    return linha
+
+
+async def current_margin_generation(session, *, account_ref: str, exchange: str,
+                                    market: str = "usdm_futures") -> int:
+    """Geração (época) vigente da interpretação de margem daquela conta.
+
+    Cria a linha com geração 0 na primeira consulta. DEVE ser chamada sob a
+    lock `917283` quando o valor for usado para decidir.
+    """
+    linha = await _lock_epoch_row(session, account_ref=account_ref,
+                                  exchange=exchange, market=market)
+    return int(linha.generation or 0)
+
+
+async def _bump_margin_generation(session, *, account_ref: str, exchange: str,
+                                  market: str = "usdm_futures") -> int:
+    """Incrementa a geração NA MESMA TRANSAÇÃO da mudança econômica.
+
+    Toda carteira observada ANTES desta transação passa a ser obsoleta — é esse
+    o vínculo que impede gastar duas vezes o mesmo saldo livre quando a reserva
+    sai da soma de pendentes ao virar posição.
+    """
+    linha = await _lock_epoch_row(session, account_ref=account_ref,
+                                  exchange=exchange, market=market)
+    linha.generation = int(linha.generation or 0) + 1
+    linha.updated_at = _now()
+    await session.flush()
+    return int(linha.generation)
+
+
+async def current_manual_generation(session, *, account_scope: str, exchange: str,
+                                    market: str = "usdm_futures") -> int:
+    """Época da VALIDAÇÃO MANUAL daquela conta (contador INDEPENDENTE do
+    financeiro). Renovar prova manual não mexe na geração financeira, e uma
+    carteira financeira recente não mascara falha de validação manual."""
+    linha = await _lock_epoch_row(session, account_ref=account_scope,
+                                  exchange=exchange, market=market)
+    return int(linha.manual_validation_generation or 0)
+
+
+async def bump_manual_generation(session, *, account_scope: str, exchange: str,
+                                 market: str = "usdm_futures",
+                                 blocked: bool = True) -> int:
+    """Avança a época manual e (por padrão) BLOQUEIA a conta, na transação atual."""
+    linha = await _lock_epoch_row(session, account_ref=account_scope,
+                                  exchange=exchange, market=market)
+    linha.manual_validation_generation = int(linha.manual_validation_generation or 0) + 1
+    linha.manual_validation_blocked = bool(blocked)
+    linha.updated_at = _now()
+    await session.flush()
+    return int(linha.manual_validation_generation)
+
+
+async def set_manual_validation_blocked(session, *, account_scope: str,
+                                        exchange: str,
+                                        market: str = "usdm_futures",
+                                        blocked: bool) -> bool:
+    """Marca/limpa o bloqueio DURÁVEL de validação manual na transação atual."""
+    linha = await _lock_epoch_row(session, account_ref=account_scope,
+                                  exchange=exchange, market=market)
+    linha.manual_validation_blocked = bool(blocked)
+    linha.updated_at = _now()
+    await session.flush()
+    return bool(linha.manual_validation_blocked)
+
+
+async def bump_margin_generation_for(session_factory, *, account_ref: str,
+                                     exchange: str,
+                                     market: str = "usdm_futures") -> Optional[int]:
+    """Incremento em transação PRÓPRIA (escritores que não têm sessão aberta).
+
+    Falha devolve None e o chamador trata como incerteza — nunca "sem mudança".
+    """
+    if not account_ref:
+        return None
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                await acquire_risk_lock(session)
+                return await _bump_margin_generation(
+                    session, account_ref=account_ref, exchange=exchange, market=market)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _margin_observation_matches(margin: "MarginGate", identity: "EntryIdentity",
+                                generation: int) -> bool:
+    """A carteira observada é DESTA conta/mercado e da geração vigente?
+
+    Identidade divergente ou geração diferente = observação superada. Gate sem
+    geração declarada também não passa: prova de concorrência é obrigatória.
+    """
+    if margin.generation is None:
+        return False
+    try:
+        if int(margin.generation) != int(generation):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if margin.account_ref is not None \
+            and str(margin.account_ref) != str(identity.account_ref):
+        return False
+    if margin.exchange is not None \
+            and str(margin.exchange).lower() != str(identity.exchange or "").lower():
+        return False
+    if margin.market is not None and str(margin.market).lower() != "usdm_futures":
+        return False
+    return True
+
+
+async def _ownership_denial(session, identity: "EntryIdentity", action: str) -> Optional[str]:
+    """Ownership DENTRO da transação da admissão (§3). Negação ⇒ motivo."""
+    try:
+        from services import manual_position_service as mps
+        veredito = await mps.check_ownership_in_session(
+            session, account_scope=identity.account_ref, exchange=identity.exchange,
+            market="usdm_futures",
+            symbol=f"{identity.symbol}", action=action, require_fresh_proof=True)
+    except Exception:  # noqa: BLE001 — dúvida NEGA
+        return OWNERSHIP_BLOCKED
+    if veredito.get("allowed"):
+        return None
+    return OWNERSHIP_BLOCKED
 
 
 async def _pending_usage(session, account_ref: str, exchange: str, *,
@@ -252,6 +474,7 @@ async def _admission_view(session, identity: EntryIdentity, key: str) -> Optiona
     base = visao.get("base") if isinstance(visao.get("base"), dict) else {}
     return {"pending_count": int(visao.get("pending_count") or 0),
             "pending_risk": float(visao.get("pending_risk_usd") or 0.0),
+            "pending_margin": float(visao.get("pending_margin_usd") or 0.0),
             "open_positions": int(visao.get("open_positions") or 0),
             "open_risk_usd": risco, "open_risk_complete": completo,
             "base_usd": (_finite(base.get("value")) if base.get("quality") == "OK"
@@ -308,6 +531,48 @@ def _budget_reason(budget: Optional[DailyBudget], pending_risk: float,
     return "DAILY_LOSS_LIMIT" if worst <= -limit else None
 
 
+def _margin_reason(margin: Optional[MarginGate], pending_margin: float,
+                   *, now_ms: Optional[int] = None) -> Optional[str]:
+    """Bloqueia quando a margem livre REAL não cobre esta proposta.
+
+    As margens já reservadas por OUTRAS intenções pendentes entram na conta —
+    lidas sob a MESMA lock —, então duas propostas concorrentes não gastam o
+    mesmo saldo livre. Sem gate informado não há veredicto (contrato legado).
+    """
+    if margin is None:
+        return None
+    disponivel = _finite(margin.available_usd)
+    if not margin.complete or disponivel is None:
+        return "FREE_MARGIN_UNKNOWN"
+    if margin.as_of_ms is None:
+        return "FREE_MARGIN_UNKNOWN"
+    if disponivel < 0:
+        return "FREE_MARGIN_UNKNOWN"
+    if margin.quality is not None and str(margin.quality).lower() != "live":
+        # Cache/stale/rate-limited não é prova de saldo atual.
+        return "FREE_MARGIN_STALE"
+    agora = int(now_ms if now_ms is not None else _now().timestamp() * 1000)
+    idade_ms = agora - int(margin.as_of_ms)
+    if idade_ms < -_MARGIN_CLOCK_SKEW_MS:
+        # Carimbo no FUTURO é incoerente: não se aceita prova impossível.
+        return "FREE_MARGIN_STALE"
+    idade_s = max(0.0, idade_ms / 1000.0)
+    limite = _finite(margin.max_age_s)
+    if limite is None or limite <= 0 or idade_s > limite:
+        # Carteira lida antes da transição intenção → ordem → posição não vale
+        # como atual: o caller refaz a leitura ou bloqueia.
+        return "FREE_MARGIN_STALE"
+    requerido = _finite(margin.required_usd)
+    if requerido is None or requerido < 0:
+        return "FREE_MARGIN_UNKNOWN"
+    reservado = _finite(pending_margin)
+    if reservado is None:
+        return "FREE_MARGIN_UNKNOWN"
+    if disponivel - abs(reservado) - requerido < 0:
+        return "INSUFFICIENT_FREE_MARGIN"
+    return None
+
+
 def _capacity_reason(capacity: Capacity, pending_count: int, pending_risk: float) -> Optional[str]:
     if capacity.max_open_positions is not None:
         if capacity.open_positions + pending_count + 1 > capacity.max_open_positions:
@@ -331,6 +596,13 @@ def decision_snapshot(payload: Any, *, qty: Any = None) -> Optional[dict]:
         valor = _finite(bruto)
         if valor is not None:
             snapshot[chave] = valor
+    if source.get('operational_selection') is not None:
+        from services.live_candidate_adapter_service import freeze_context
+        snapshot['operational_selection'] = freeze_context(source['operational_selection'])
+        equity = _finite(source.get('candidate_equity_usd'))
+        if equity is None or equity <= 0:
+            raise ValueError('CANARY_EQUITY_UNKNOWN')
+        snapshot['candidate_equity_usd'] = equity
     return snapshot or None
 
 
@@ -338,6 +610,7 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                   owner: str, lease_seconds: int = DEFAULT_LEASE_SECONDS,
                   capacity: Optional[Capacity] = None,
                   budget: Optional[DailyBudget] = None,
+                  margin: Optional[MarginGate] = None,
                   decision: Optional[dict] = None,
                   now: Optional[datetime] = None) -> Reservation:
     """Reserva (ou recupera) a intenção em UMA transação, antes de qualquer POST.
@@ -353,16 +626,57 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
     moment = now or _now()
     deadline = moment + timedelta(seconds=max(1, int(lease_seconds)))
     try:
+        candidate_snapshot = decision_snapshot(decision if decision is not None else payload)
         async with session_factory() as session:
             # Serializa a admissão de capacidade entre decisões diferentes.
             await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": RISK_LOCK_KEY})
+            # Relógio obtido DEPOIS da espera pela lock: `moment` foi capturado
+            # antes dela e não prova atualidade da carteira.
+            pos_lock_ms = int(_now().timestamp() * 1000)
+            candidate_context = (candidate_snapshot or {}).get('operational_selection')
+            if candidate_context is not None:
+                from services import operational_governance_service as governance
+                checked = await governance.assert_authority_in_session(
+                    session, candidate_context['authority'], pos_lock_ms)
+                if checked.get('ok') is not True:
+                    await session.rollback()
+                    return Reservation(BLOCKED_CAPACITY, key, coid, None,
+                                       checked.get('reason_code') or 'CANDIDATE_AUTHORITY_UNAVAILABLE')
+                limits = candidate_context['authority']['approval']['limits']
+                maximum = limits.get('max_orders')
+                if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
+                    raise ValueError('CANARY_ORDER_LIMIT_INVALID')
+                approval_id = str(candidate_context['authority']['approval']['approval_id'])
+                used = (await session.execute(select(func.count(EntryIntent.intent_key)).where(
+                    EntryIntent.intent_key != key,
+                    EntryIntent.decision_payload['operational_selection']['authority']['approval']['approval_id'].as_string() == approval_id
+                ))).scalar_one()
+                if int(used) >= maximum:
+                    await session.rollback()
+                    return Reservation(BLOCKED_CAPACITY, key, coid, None, 'CANARY_ORDER_LIMIT')
+            # Ownership DENTRO da transação, DEPOIS da lock e ANTES de conceder
+            # ou gravar capacidade — vale para intenção NOVA e para retomada.
+            negado = await _ownership_denial(session, identity, "reserve")
+            if negado:
+                await session.rollback()
+                return Reservation(BLOCKED_CAPACITY, key, coid, None, negado)
+            # Geração vigente: uma carteira observada antes de qualquer mudança
+            # local na margem está OBSOLETA e não autoriza esta proposta.
+            if margin is not None:
+                atual_gen = await current_margin_generation(
+                    session, account_ref=identity.account_ref,
+                    exchange=identity.exchange, market="usdm_futures")
+                if not _margin_observation_matches(margin, identity, atual_gen):
+                    await session.rollback()
+                    return Reservation(BLOCKED_CAPACITY, key, coid, None,
+                                       MARGIN_SUPERSEDED)
             row = (await session.execute(
                 select(EntryIntent).where(EntryIntent.intent_key == key).with_for_update()
             )).scalar_one_or_none()
             if row is None:
                 # Decisão nova: admissão de capacidade sob a mesma lock.
                 visao = None
-                if capacity is not None or budget is not None:
+                if capacity is not None or budget is not None or margin is not None:
                     # UMA leitura consistente para capacidade E orçamento.
                     visao = await _admission_view(session, identity, key)
                     if visao is None:
@@ -397,7 +711,15 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
-                session.add(EntryIntent(
+                # Margem REAL da conta compartilhada: limite independente do
+                # orçamento nominal. Passar em um não dispensa o outro.
+                if margin is not None:
+                    denial = _margin_reason(margin, visao["pending_margin"],
+                                            now_ms=pos_lock_ms)
+                    if denial:
+                        await session.rollback()
+                        return Reservation(BLOCKED_CAPACITY, key, coid, None, denial)
+                nova_linha = EntryIntent(
                     intent_key=key, client_order_id=coid, account_ref=identity.account_ref,
                     exchange=identity.exchange, symbol=identity.symbol, quote=identity.quote,
                     side=identity.side, position_side=identity.position_side,
@@ -407,13 +729,26 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
                     payload_fingerprint=fingerprint, state=STATE_RESERVED, reason=None,
                     lease_owner=owner, lease_expires_at=deadline, attempts=1, dispatches=0,
                     reserved_risk_usd=max(0.0, float(capacity.risk_usd) if capacity else 0.0),
+                    reserved_margin_usd=max(0.0, _finite(margin.required_usd) or 0.0)
+                    if margin is not None else 0.0,
                     # Gravado ANTES de qualquer POST: depois do envio não há de
                     # onde recuperar stop/qty da decisão que originou a ordem.
-                    decision_payload=decision_snapshot(decision if decision is not None
-                                                       else payload),
-                    real_trade_id=None, created_at=moment, updated_at=moment, resolved_at=None))
+                    decision_payload=candidate_snapshot,
+                    real_trade_id=None, created_at=moment, updated_at=moment,
+                    resolved_at=None)
+                session.add(nova_linha)
+                # A reserva MUDA a margem representada no banco: toda carteira
+                # observada antes deste commit fica obsoleta. A geração
+                # RESULTANTE é GRAVADA na própria linha antes do commit — o
+                # valor devolvido é exatamente o persistido.
+                nova_geracao = await _bump_margin_generation(
+                    session, account_ref=identity.account_ref,
+                    exchange=identity.exchange, market="usdm_futures")
+                nova_linha.margin_generation = nova_geracao
+                await session.flush()
                 await session.commit()
-                return Reservation(RESERVED_NEW, key, coid, STATE_RESERVED)
+                return Reservation(RESERVED_NEW, key, coid, STATE_RESERVED,
+                                   generation=nova_geracao)
 
             # Lidos ANTES de qualquer rollback: após o rollback o ORM expira a
             # instância e reler atributo dispararia IO preguiçoso.
@@ -455,15 +790,30 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
             # Retomada da MESMA decisão: se a tentativa agora carrega risco
             # MAIOR (preço/qty adversos), a diferença passa pela mesma admissão —
             # confiar no valor antigo, menor, admitiria risco nunca aprovado.
-            if capacity is not None or budget is not None:
+            if capacity is not None or budget is not None or margin is not None:
                 novo = max(0.0, _finite(capacity.risk_usd) or 0.0) if capacity else 0.0
                 antigo = max(0.0, _finite(row.reserved_risk_usd) or 0.0)
-                if novo > antigo + 1e-9:
-                    denial = await _readmit(session, identity, key, capacity, budget, novo)
+                nova_margem = (max(0.0, _finite(margin.required_usd) or 0.0)
+                               if margin is not None else 0.0)
+                margem_antiga = max(0.0, _finite(row.reserved_margin_usd) or 0.0)
+                if novo > antigo + 1e-9 or nova_margem > margem_antiga + 1e-9:
+                    denial = await _readmit(session, identity, key, capacity, budget,
+                                            max(novo, antigo), margin=margin)
                     if denial:
                         await session.rollback()
                         return Reservation(BLOCKED_CAPACITY, key, coid, current_state, denial)
-                    row.reserved_risk_usd = novo
+                    row.reserved_risk_usd = max(novo, antigo)
+                    row.reserved_margin_usd = max(nova_margem, margem_antiga)
+                    # A PRÓPRIA reserva aumentou: incrementa e usa o valor novo.
+                    row.margin_generation = await _bump_margin_generation(
+                        session, account_ref=identity.account_ref,
+                        exchange=identity.exchange, market="usdm_futures")
+                elif margin is not None:
+                    # Só renovou a prova: usa a época ATUAL, sem bump — mas
+                    # GRAVA, para o token devolvido ser o persistido.
+                    row.margin_generation = await current_margin_generation(
+                        session, account_ref=identity.account_ref,
+                        exchange=identity.exchange, market="usdm_futures")
             if not row.decision_payload:
                 # Linha antiga (ou criada sem os dados): completa sem sobrescrever
                 # o que já estiver gravado — a decisão em si não mudou (mesmo
@@ -473,20 +823,29 @@ async def reserve(session_factory, identity: EntryIdentity, payload: dict, *,
             row.lease_owner, row.lease_expires_at = owner, deadline
             row.attempts = int(row.attempts or 0) + 1
             row.updated_at = moment
+            resultante = row.margin_generation
             await session.commit()
-            return Reservation(RESERVED_RESUMED, key, coid, STATE_RESERVED)
+            return Reservation(RESERVED_RESUMED, key, coid, STATE_RESERVED,
+                               generation=resultante)
     except Exception:
         return Reservation(UNAVAILABLE, key, coid, None, "DB_UNAVAILABLE")
 
 
 async def _readmit(session, identity: EntryIdentity, key: str,
                    capacity: Optional[Capacity], budget: Optional[DailyBudget],
-                   risk_usd: float) -> Optional[str]:
-    """Reavalia capacidade e orçamento para um risco MAIOR da MESMA decisão,
-    dentro da transação/lock já abertas. Devolve o motivo da negação ou None."""
+                   risk_usd: float, *,
+                   margin: Optional[MarginGate] = None) -> Optional[str]:
+    """Reavalia capacidade, orçamento e MARGEM para um risco/margem MAIORES da
+    MESMA decisão, dentro da transação/lock já abertas. Devolve o motivo da
+    negação ou None."""
     visao = await _admission_view(session, identity, key)
     if visao is None:
         return "ADMISSION_SNAPSHOT_UNAVAILABLE"
+    if margin is not None:
+        denial = _margin_reason(margin, visao["pending_margin"],
+                                now_ms=int(_now().timestamp() * 1000))
+        if denial:
+            return denial
     if capacity is not None:
         open_positions = max(int(capacity.open_positions or 0), visao["open_positions"])
         caller_risk = _finite(capacity.open_risk_usd)
@@ -510,6 +869,8 @@ async def _readmit(session, identity: EntryIdentity, key: str,
 async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
                            risk_usd: float, capacity: Optional[Capacity] = None,
                            budget: Optional[DailyBudget] = None,
+                           margin: Optional[MarginGate] = None,
+                           proposal: Optional[Mapping] = None,
                            now: Optional[datetime] = None) -> Reservation:
     """Admissão FINAL, imediatamente antes do POST, com o risco realmente
     proposto (preço/qty já revalidados).
@@ -522,6 +883,8 @@ async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
     try:
         async with session_factory() as session:
             await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": RISK_LOCK_KEY})
+            # Relógio posterior à espera pela lock (ver `reserve`).
+            pos_lock_ms = int(_now().timestamp() * 1000)
             row = (await session.execute(
                 select(EntryIntent).where(EntryIntent.intent_key == intent_key).with_for_update()
             )).scalar_one_or_none()
@@ -540,21 +903,581 @@ async def admit_final_risk(session_factory, intent_key: str, *, owner: str,
                 timeframe=row.timeframe, playbook=row.playbook,
                 playbook_version=row.playbook_version, purpose=row.purpose,
                 trigger_candle_ms=int(row.trigger_candle_ms or 0))
+            # Readmissão passa pelo MESMO ownership da reserva: um
+            # reconhecimento criado no intervalo não pode ser contornado.
+            negado = await _ownership_denial(session, identity, "admit_final_risk")
+            if negado:
+                await session.rollback()
+                return Reservation(BLOCKED_CAPACITY, intent_key, coid, state, negado)
+            if margin is not None:
+                atual_gen = await current_margin_generation(
+                    session, account_ref=identity.account_ref,
+                    exchange=identity.exchange, market="usdm_futures")
+                if not _margin_observation_matches(margin, identity, atual_gen):
+                    await session.rollback()
+                    return Reservation(BLOCKED_CAPACITY, intent_key, coid, state,
+                                       MARGIN_SUPERSEDED)
             proposto = _finite(risk_usd)
             if proposto is None or proposto < 0:
                 await session.rollback()
                 return Reservation(BLOCKED_CAPACITY, intent_key, coid, state, "PROPOSED_RISK_UNKNOWN")
-            denial = await _readmit(session, identity, intent_key, capacity, budget, proposto)
+            denial = await _readmit(session, identity, intent_key, capacity, budget,
+                                    proposto, margin=margin)
             if denial:
                 await session.rollback()
                 return Reservation(BLOCKED_CAPACITY, intent_key, coid, state, denial)
             if proposto > (_finite(row.reserved_risk_usd) or 0.0) + 1e-9:
                 row.reserved_risk_usd = proposto
                 row.updated_at = moment
+            resultante = row.margin_generation
+            if margin is not None:
+                # A margem FINAL (após arredondamentos) substitui a reservada
+                # quando for maior: o valor antigo, menor, deixaria um intervalo
+                # sem reserva entre a intenção e a posição.
+                final = max(0.0, _finite(margin.required_usd) or 0.0)
+                if final > (_finite(row.reserved_margin_usd) or 0.0) + 1e-9:
+                    row.reserved_margin_usd = final
+                    row.updated_at = moment
+                    # A readmissão muda a própria reserva: incrementa e devolve
+                    # a geração RESULTANTE (não invalida a si mesma).
+                    resultante = await _bump_margin_generation(
+                        session, account_ref=identity.account_ref,
+                        exchange=identity.exchange, market="usdm_futures")
+                else:
+                    # SEM aumento: a prova vale a época ATUAL, não a antiga.
+                    resultante = await current_margin_generation(
+                        session, account_ref=identity.account_ref,
+                        exchange=identity.exchange, market="usdm_futures")
+                row.margin_generation = resultante
+                row.updated_at = moment
+            vinculo = None
+            if proposal is not None:
+                # Vínculo/token na MESMA transação serializada que autoriza a
+                # qty final. Entra como CHAVE NOVA no JSON existente: plano e
+                # identidade imutáveis da decisão ficam intactos.
+                vinculo = _bind_proposal_in_session(
+                    row, proposal, token=resultante, moment=moment,
+                    lease_expires_at=lease_expires_at)
+                if vinculo is None:
+                    await session.rollback()
+                    return Reservation(BLOCKED_CAPACITY, intent_key, coid, state,
+                                       PROPOSAL_INVALID)
+            await session.flush()
             await session.commit()
-            return Reservation(RESERVED_RESUMED, intent_key, coid, state)
+            return Reservation(RESERVED_RESUMED, intent_key, coid, state,
+                               generation=resultante, proposal=vinculo)
     except Exception:
         return Reservation(UNAVAILABLE, intent_key, None, None, "DB_UNAVAILABLE")
+
+
+def _bind_proposal_in_session(row, proposal: Mapping, *, token,
+                              moment: datetime,
+                              lease_expires_at) -> Optional[dict]:
+    """Grava a proposta CONGELADA deste despacho no JSON da decisão.
+
+    Recebe a linha JÁ travada pela admissão: nada aqui abre conexão nova. O
+    token de readmissão e o deadline do lease entram nos campos canônicos, de
+    modo que o hash cobre a autorização inteira.
+    """
+    despacho = proposal.get("dispatch_id") if isinstance(proposal, Mapping) else None
+    if not despacho or _label(str(despacho), MAX_CLIENT_ORDER_ID) is None:
+        return None
+    deadline_ms = None
+    if isinstance(lease_expires_at, datetime):
+        deadline_ms = int(lease_expires_at.timestamp() * 1000)
+    payload = dict(row.decision_payload or {})
+    guardado = payload.get('operational_selection')
+    if (guardado is None) != (proposal.get('operational_selection') is None):
+        # Nem perder a candidata guardada, nem acrescentar uma na readmissão.
+        return None
+    congelada = freeze_dispatch_proposal(
+        **{campo: proposal.get(campo) for campo in PROPOSAL_FIELDS
+           if campo not in ("token", "lease_expires_at_ms", "created_at_ms")},
+        token=_finite_token(token),
+        operational_selection=proposal.get('operational_selection'),
+        # A decisão ORIGINAL permanece: a leitura nova só prova que é a MESMA
+        # candidata (identidade estável), nunca substitui o plano congelado.
+        stored_operational_selection=guardado,
+        lease_expires_at_ms=deadline_ms,
+        created_at_ms=int(moment.timestamp() * 1000))
+    if not congelada.get("ok"):
+        return None
+    propostas = dict(payload.get("proposals") or {})
+    propostas[str(despacho)] = congelada
+    # Teto defensivo: uma decisão não acumula despachos indefinidamente.
+    if len(propostas) > 8:
+        mais_novas = sorted(propostas.items(),
+                            key=lambda kv: int((kv[1] or {}).get("created_at_ms") or 0))
+        propostas = dict(mais_novas[-8:])
+    payload["proposals"] = propostas
+    row.decision_payload = payload
+    row.updated_at = moment
+    return congelada
+
+
+#: Campos CANÔNICOS da proposta de despacho. O hash cobre exatamente estes —
+#: nada de resultado futuro (fill, orderId, status) entra aqui.
+PROPOSAL_FIELDS = (
+    "account_ref", "exchange", "market", "intent_key", "symbol", "side",
+    "position_side", "order_type", "time_in_force", "reduce_only",
+    "dispatch_id", "qty", "price", "stop", "reference_price", "leverage",
+    "token", "created_at_ms", "lease_expires_at_ms", "evidence", "limits",
+)
+PROPOSAL_INVALID = "EXEC_PROPOSAL_INVALID"
+PROPOSAL_MISSING = "EXEC_PROPOSAL_MISSING"
+PROPOSAL_TAMPERED = "EXEC_PROPOSAL_TAMPERED"
+
+
+def _canonical_value(value):
+    """Forma canônica e ESTÁVEL no ida-e-volta do JSONB.
+
+    Números viram string decimal normalizada porque o JSONB guarda `numeric`:
+    `100.0` poderia voltar como `100` e quebrar o hash de uma proposta legítima.
+    `bool` é marcado explicitamente para nunca colidir com 0/1. Tipo inesperado
+    (objeto, NaN, infinito) devolve `None`, e `None` em campo canônico invalida
+    a proposta — não existe conversão silenciosa aqui.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return f"bool:{'true' if value else 'false'}"
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            numero = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
+        if not numero.is_finite():
+            return None
+        return f"num:{format(numero.normalize(), 'f')}"
+    if isinstance(value, str):
+        return f"str:{value}"
+    if isinstance(value, Mapping):
+        saida = {}
+        for chave in sorted(str(k) for k in value.keys()):
+            saida[chave] = _canonical_value(value[chave])
+        return saida
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    return None
+
+
+def canonical_proposal_hash(proposal: Mapping) -> Optional[str]:
+    """Hash determinístico dos campos canônicos (ou None se não der para calcular)."""
+    if not isinstance(proposal, Mapping):
+        return None
+    try:
+        corpo = {campo: _canonical_value(proposal.get(campo))
+                 for campo in PROPOSAL_FIELDS}
+        # Legado preserva hash e schema EXATOS, inclusive propostas pré-lote.
+        if proposal.get('operational_selection') is not None:
+            corpo['operational_selection'] = _canonical_value(proposal['operational_selection'])
+        texto = json.dumps(corpo, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+
+def candidate_identity_matches(stored: Any, incoming: Any) -> bool:
+    """Duas leituras da MESMA candidata/decisão congelada?
+
+    A comparação é pela IDENTIDADE ESTÁVEL (experimento, bundle, aprovação,
+    geração, modelo e decisão) — nunca pelo carimbo da leitura. Retry, restart
+    e filha `-mfb` reencontram a mesma intenção em vez de parecerem outra.
+    """
+    try:
+        from services.live_candidate_adapter_service import same_identity
+        return bool(same_identity(stored, incoming))
+    except Exception:  # noqa: BLE001 — dúvida NÃO autoriza
+        return False
+
+
+def candidate_context_to_keep(stored: Any, incoming: Any) -> Optional[dict]:
+    """Contexto que PERMANECE no despacho: o ORIGINAL, quando é a mesma.
+
+    Readmitir não troca o plano pela recomendação/leitura mais recente: a
+    decisão congelada continua sendo a do primeiro despacho. Candidata
+    diferente devolve `None` (o caller recusa, não substitui).
+    """
+    if stored is None:
+        return incoming
+    if incoming is None or not candidate_identity_matches(stored, incoming):
+        return None
+    return copy.deepcopy(stored) if isinstance(stored, dict) else stored
+
+
+def freeze_dispatch_proposal(**campos) -> Dict[str, Any]:
+    """Proposta IMUTÁVEL de UM despacho, com os campos canônicos apenas.
+
+    Devolve `{"ok": False, "reason_code": ...}` quando um campo essencial é
+    ausente/não finito/de tipo inválido — a proposta não nasce "mais ou menos".
+    Nenhum segredo entra: só identidade, plano quantizado, evidência temporal
+    ORIGINAL, limites vigentes e o token de readmissão.
+    """
+    proposta: Dict[str, Any] = {campo: campos.get(campo) for campo in PROPOSAL_FIELDS}
+    if campos.get('operational_selection') is not None:
+        try:
+            from services.live_candidate_adapter_service import freeze_context
+            contexto = freeze_context(campos['operational_selection'])
+        except ValueError:
+            return {'ok': False, 'reason_code': 'CANDIDATE_CONTEXT_INVALID'}
+        guardado = campos.get('stored_operational_selection')
+        if guardado is not None:
+            # Readmissão: a decisão congelada ORIGINAL permanece; a leitura nova
+            # só precisa provar que é a MESMA candidata.
+            try:
+                guardado = freeze_context(guardado)
+            except ValueError:
+                return {'ok': False, 'reason_code': 'CANDIDATE_CONTEXT_INVALID'}
+            contexto = candidate_context_to_keep(guardado, contexto)
+            if contexto is None:
+                return {'ok': False, 'reason_code': 'CANDIDATE_IDENTITY_MISMATCH'}
+        proposta['operational_selection'] = contexto
+    obrigatorios = ("account_ref", "exchange", "intent_key", "symbol", "side",
+                    "order_type", "dispatch_id", "qty", "created_at_ms")
+    for campo in obrigatorios:
+        if _canonical_value(proposta.get(campo)) is None:
+            return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                    "detail": f"campo canônico ausente ou inválido: {campo}"}
+    for campo in ("qty", "price", "stop", "reference_price"):
+        valor = proposta.get(campo)
+        if valor is None:
+            continue
+        if isinstance(valor, bool) or _canonical_value(valor) is None:
+            return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                    "detail": f"valor não finito em {campo}"}
+    proposta["hash"] = canonical_proposal_hash(proposta)
+    if proposta["hash"] is None:
+        return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                "detail": "proposta não pôde ser canonicalizada"}
+    proposta["ok"] = True
+    # MappingProxy: adulteração acidental levanta em vez de passar batido. O
+    # hash continua sendo a prova (cópia mutável também seria detectada).
+    return dict(MappingProxyType(proposta))
+
+
+def proposal_matches_stored(stored: Any) -> Dict[str, Any]:
+    """A proposta persistida é íntegra? (hash recalculado sobre os canônicos)"""
+    if not isinstance(stored, Mapping):
+        return {"ok": False, "reason_code": PROPOSAL_MISSING}
+    esperado = stored.get("hash")
+    if not isinstance(esperado, str) or not esperado:
+        return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                "detail": "proposta sem hash"}
+    calculado = canonical_proposal_hash(stored)
+    if calculado is None:
+        return {"ok": False, "reason_code": PROPOSAL_INVALID,
+                "detail": "proposta não canonicalizável"}
+    if calculado != esperado:
+        return {"ok": False, "reason_code": PROPOSAL_TAMPERED}
+    return {"ok": True, "reason_code": "PROPOSAL_INTACT", "hash": calculado}
+
+
+def _finite_token(value) -> Optional[int]:
+    """Token inteiro finito. `bool`, texto, NaN/inf e ausência NÃO são token."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not (value == value) or value in (float("inf"), float("-inf")):
+            return None
+        if value != int(value):
+            return None
+        return int(value)
+    if isinstance(value, int):
+        return int(value)
+    return None
+
+
+LOCAL_AUTHORITY_INVALID = "LOCAL_AUTHORITY_TOKEN_INVALID"
+LOCAL_AUTHORITY_FENCE = "LOCAL_AUTHORITY_FENCE_ADVANCED"
+LOCAL_AUTHORITY_PENDING = "LOCAL_AUTHORITY_FAILURE_PENDING"
+LOCAL_AUTHORITY_CONTAINED = "LOCAL_AUTHORITY_SYMBOL_CONTAINED"
+LOCAL_AUTHORITY_IDENTITY = "LOCAL_AUTHORITY_IDENTITY_CHANGED"
+
+
+def identity_symbol_to_market(stored: Any) -> Optional[str]:
+    """`BASE-QUOTE-SETTLE` (forma da IDENTIDADE) → `BASE/QUOTE:SETTLE`.
+
+    Inverso EXATO da construção da identidade (`symbol.replace("/", "-")
+    .replace(":", "-")`). Forma irreconhecível devolve None: ninguém deve
+    adivinhar um símbolo para produzir igualdade.
+    """
+    if not isinstance(stored, str) or not stored:
+        return None
+    if "/" in stored:
+        return stored
+    partes = stored.rsplit("-", 1)
+    if len(partes) != 2 or "-" not in partes[0]:
+        return None
+    return partes[0].replace("-", "/", 1) + ":" + partes[1]
+
+
+def local_validation_fence_atual() -> int:
+    """Fence manual LOCAL vigente (atalho para testes/diagnóstico)."""
+    try:
+        from services import manual_position_service as mps
+        return int(mps.local_validation_fence())
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def capture_local_authority(*, intent_key: str,
+                            symbol: Optional[str] = None) -> Dict[str, Any]:
+    """Token IMUTÁVEL da autoridade manual LOCAL, lido ANTES de qualquer await.
+
+    É o que permite negar um envio quando ESTE processo já conhece uma falha
+    manual nova — situação diferente do TOCTOU inevitável de uma ação externa na
+    corretora. O token guarda o fence do instante da captura; ele NUNCA é
+    recapturado depois (recapturar “autorizaria” exatamente a falha nova).
+    """
+    try:
+        from services import manual_position_service as mps
+        return {"fence": int(mps.local_validation_fence()),
+                "pending": mps.pending_validation_failure() is not None,
+                "intent_key": str(intent_key or ""),
+                "symbol": (str(symbol) if symbol else None),
+                "account_ref": None, "exchange": None,
+                "captured_at_ms": int(_now().timestamp() * 1000)}
+    except Exception as exc:  # noqa: BLE001 — sem leitura local não há autoridade
+        log.warning(f"[p03-intent] autoridade local ilegível: {type(exc).__name__}")
+        return {"fence": None, "pending": True, "intent_key": str(intent_key or ""),
+                "symbol": (str(symbol) if symbol else None),
+                "account_ref": None, "exchange": None,
+                "captured_at_ms": None, "unreadable": str(type(exc).__name__)}
+
+
+def bind_local_authority_identity(token: Mapping, *, account_ref: str,
+                                  exchange: str,
+                                  symbol: str) -> Dict[str, Any]:
+    """Vincula a identidade IMUTÁVEL já validada ao token, sem mexer no fence."""
+    base = dict(token or {})
+    base.update({"account_ref": str(account_ref or "") or None,
+                 "exchange": str(exchange or "") or None,
+                 "symbol": str(symbol or "") or base.get("symbol")})
+    return base
+
+
+def local_authority_still_valid(token: Any,
+                                *, identity: Optional["EntryIdentity"] = None
+                                ) -> Dict[str, Any]:
+    """Helper SÍNCRONO e puro: o token original ainda vale NESTE instante?
+
+    Confere token completo/coerente, fence original == atual, ausência de causa
+    pendente, símbolo sem contenção local e identidade igual à autorizada.
+    Dúvida, exceção ou ausência NEGAM — nunca existe default positivo aqui.
+    """
+    if not isinstance(token, Mapping):
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_INVALID,
+                "detail": "token ausente"}
+    fence = token.get("fence")
+    if not isinstance(fence, int) or isinstance(fence, bool):
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_INVALID,
+                "detail": "fence do token inválido"}
+    if token.get("pending") is not False:
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_PENDING,
+                "detail": "causa manual pendente já na captura"}
+    if not token.get("intent_key"):
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_INVALID,
+                "detail": "token sem intenção"}
+    if identity is not None:
+        esperados = ((token.get("account_ref"), getattr(identity, "account_ref", None)),
+                     (token.get("exchange"), getattr(identity, "exchange", None)),
+                     (token.get("symbol"), getattr(identity, "symbol", None)),
+                     (token.get("intent_key"), getattr(identity, "intent_key", None)))
+        for gravado, atual in esperados:
+            if gravado is None or str(gravado) != str(atual or ""):
+                return {"ok": False, "reason_code": LOCAL_AUTHORITY_IDENTITY,
+                        "detail": "identidade divergente do token"}
+    try:
+        from services import manual_position_service as mps
+        atual_fence = int(mps.local_validation_fence())
+        pendente = mps.pending_validation_failure() is not None
+        contido = (mps.local_symbol_block(token.get("symbol")) is not None
+                   if token.get("symbol") else False)
+    except Exception as exc:  # noqa: BLE001 — dúvida NEGA
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_INVALID,
+                "detail": type(exc).__name__}
+    if atual_fence != fence:
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_FENCE,
+                "detail": f"fence {fence} → {atual_fence}"}
+    if pendente:
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_PENDING,
+                "detail": "falha manual conhecida pendente"}
+    if contido:
+        return {"ok": False, "reason_code": LOCAL_AUTHORITY_CONTAINED,
+                "detail": "símbolo contido localmente"}
+    return {"ok": True, "reason_code": "LOCAL_AUTHORITY_HELD", "fence": fence}
+
+
+async def authorize_dispatch(session_factory, intent_key: str, *, owner: str,
+                             expected_token, dispatch_id: Optional[str] = None,
+                             require_proposal: bool = False,
+                             now: Optional[datetime] = None) -> Dict[str, Any]:
+    """AUTORIZAÇÃO FINAL do envio, em transação CURTA sob a lock `917283`.
+
+    Lê a intenção E a época vigente da conta na MESMA transação e exige:
+
+    - intenção existente, estado `SENDING`, owner correto e lease válido pelo
+      relógio obtido DEPOIS da espera pela lock;
+    - `dispatch_id` já registrado (o id EFETIVO desta tentativa);
+    - `expected_token` presente, inteiro, igual à coluna da intenção;
+    - essa coluna igual à geração FINANCEIRA vigente da conta;
+    - validação manual da conta NÃO bloqueada e ownership do símbolo coerente.
+
+    Erro, linha ausente, token NULL/bool/texto, identidade divergente ou lease
+    vencido NEGAM. `may_dispatch` isolado não substitui este contrato, e uma
+    época inexistente não é recriada aqui como se fosse autorização.
+    """
+    esperado = _finite_token(expected_token)
+    if esperado is None:
+        return {"ok": False, "reason_code": "DISPATCH_TOKEN_INVALID"}
+    # Autoridade manual LOCAL capturada ANTES de qualquer await, e conferida já
+    # aqui: uma causa conhecida na entrada nem chega ao banco.
+    autoridade = capture_local_authority(intent_key=intent_key)
+    inicial = local_authority_still_valid(autoridade)
+    if not inicial.get("ok"):
+        return {"ok": False, "reason_code": str(inicial.get("reason_code")),
+                "detail": inicial.get("detail")}
+    aprovado: Optional[Dict[str, Any]] = None
+    try:
+        async with session_factory() as session:
+            await acquire_risk_lock(session)
+            agora = now or _now()
+            row = (await session.execute(
+                select(EntryIntent).where(EntryIntent.intent_key == intent_key)
+                .with_for_update())).scalar_one_or_none()
+            if row is None:
+                await session.rollback()
+                return {"ok": False, "reason_code": "INTENT_NOT_FOUND"}
+            if row.state != STATE_SENDING or row.lease_owner != owner:
+                await session.rollback()
+                return {"ok": False, "reason_code": "LEASE_NOT_HELD",
+                        "state": row.state}
+            if row.lease_expires_at is None or row.lease_expires_at <= agora:
+                await session.rollback()
+                return {"ok": False, "reason_code": "LEASE_EXPIRED"}
+            if dispatch_id is not None:
+                registrados = [str(x) for x in (row.dispatch_ids or ())]
+                if str(dispatch_id) not in registrados:
+                    await session.rollback()
+                    return {"ok": False, "reason_code": "DISPATCH_NOT_REGISTERED"}
+            # Proposta CONGELADA deste despacho, lida sob a MESMA lock. É ela
+            # que o exame SÍNCRONO pré-assinatura vai comparar com os params.
+            propostas = (row.decision_payload or {}).get("proposals") \
+                if isinstance(row.decision_payload, Mapping) else None
+            proposta = None
+            if dispatch_id is not None and isinstance(propostas, Mapping):
+                proposta = propostas.get(str(dispatch_id))
+            deadline_ms = (int(row.lease_expires_at.timestamp() * 1000)
+                           if row.lease_expires_at is not None else None)
+            persistido = _finite_token(row.margin_generation)
+            # Atributos capturados ANTES de qualquer rollback: depois dele o ORM
+            # expira a instância e reler dispararia IO fora do greenlet.
+            identity = EntryIdentity(
+                account_ref=row.account_ref, exchange=row.exchange, symbol=row.symbol,
+                quote=row.quote, side=row.side, position_side=row.position_side,
+                timeframe=row.timeframe, playbook=row.playbook,
+                playbook_version=row.playbook_version, purpose=row.purpose,
+                trigger_candle_ms=int(row.trigger_candle_ms or 0))
+            if persistido is None:
+                await session.rollback()
+                return {"ok": False, "reason_code": "DISPATCH_TOKEN_MISSING"}
+            if persistido != esperado:
+                await session.rollback()
+                return {"ok": False, "reason_code": MARGIN_SUPERSEDED,
+                        "persisted": persistido, "expected": esperado}
+            # Época da CONTA lida na MESMA transação: mudança ALHEIA entre a
+            # admissão e este ponto supera o token.
+            from models.account_margin_epoch import AccountMarginEpoch as Epoch
+            conta, corretora, mercado = _margin_identity(
+                identity.account_ref, identity.exchange, "usdm_futures")
+            epoca = (await session.execute(
+                select(Epoch.generation, Epoch.manual_validation_blocked)
+                .where(Epoch.account_scope == conta, Epoch.exchange == corretora,
+                       Epoch.market == mercado))).one_or_none()
+            if epoca is None:
+                # Época inexistente NÃO é autorização: não se cria aqui.
+                await session.rollback()
+                return {"ok": False, "reason_code": "MARGIN_EPOCH_MISSING"}
+            geracao_conta, conta_bloqueada = int(epoca[0] or 0), bool(epoca[1])
+            if geracao_conta != persistido:
+                await session.rollback()
+                return {"ok": False, "reason_code": MARGIN_SUPERSEDED,
+                        "account_generation": geracao_conta, "expected": esperado}
+            if conta_bloqueada:
+                await session.rollback()
+                return {"ok": False, "reason_code": "MANUAL_ACCOUNT_VALIDATION_BLOCKED"}
+            candidate_context = (row.decision_payload or {}).get('operational_selection')
+            if candidate_context is not None:
+                from services import operational_governance_service as governance
+                from services.live_candidate_adapter_service import freeze_context, canary_risk_verdict
+                candidate_context = freeze_context(candidate_context)
+                if not isinstance(proposta, Mapping) or proposta.get('operational_selection') != candidate_context:
+                    await session.rollback()
+                    return {'ok': False, 'reason_code': 'CANDIDATE_PROPOSAL_MISMATCH'}
+                checked = await governance.assert_authority_in_session(
+                    session, candidate_context['authority'], int(agora.timestamp() * 1000))
+                if checked.get('ok') is not True:
+                    await session.rollback()
+                    return checked
+                risk = canary_risk_verdict(candidate_context,
+                    entry=proposta.get('price') or proposta.get('reference_price'),
+                    stop=proposta.get('stop'), qty=proposta.get('qty'),
+                    equity=(row.decision_payload or {}).get('candidate_equity_usd'),
+                    leverage=proposta.get('leverage'))
+                if risk.get('ok') is not True:
+                    await session.rollback()
+                    return risk
+            # Identidade IMUTÁVEL validada vinculada ao token — sem recapturar
+            # o fence (recapturar aqui esconderia a falha nova).
+            autoridade = bind_local_authority_identity(
+                autoridade, account_ref=identity.account_ref,
+                exchange=identity.exchange, symbol=identity.symbol)
+            negado = await _ownership_denial(session, identity, "dispatch")
+            await session.rollback()        # leitura decisória: nada a gravar
+            if negado:
+                return {"ok": False, "reason_code": negado}
+            if require_proposal:
+                integra = proposal_matches_stored(proposta)
+                if not integra.get("ok"):
+                    return {"ok": False,
+                            "reason_code": str(integra.get("reason_code")),
+                            "detail": integra.get("detail")}
+                if _finite_token(proposta.get("token")) != persistido:
+                    return {"ok": False, "reason_code": MARGIN_SUPERSEDED,
+                            "detail": "token da proposta não é o persistido"}
+                if str(proposta.get("dispatch_id")) != str(dispatch_id):
+                    return {"ok": False, "reason_code": PROPOSAL_TAMPERED,
+                            "detail": "proposta de outro despacho"}
+            aprovado = {"ok": True, "reason_code": "DISPATCH_AUTHORIZED",
+                        "token": persistido, "proposal": proposta,
+                        "lease_expires_at_ms": deadline_ms,
+                        "authorized_at_ms": int(agora.timestamp() * 1000),
+                        "local_authority": autoridade,
+                        "operational_selection": candidate_context,
+                        "identity": identity}
+    except Exception as exc:  # noqa: BLE001 — dúvida NÃO autoriza
+        log.warning(f"[p03-intent] autorização final indisponível: {type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": "DISPATCH_CHECK_UNAVAILABLE"}
+    if aprovado is None:
+        # Caminho negativo já devolvido dentro do contexto.
+        return {"ok": False, "reason_code": "DISPATCH_CHECK_UNAVAILABLE"}
+    # DEPOIS de sair TOTALMENTE do contexto da sessão (rollback E cleanup/close
+    # podem suspender): reconferir o token ORIGINAL. Mudou ⇒ nega e preserva
+    # contenção/reserva/intenção como estão.
+    final = local_authority_still_valid(aprovado["local_authority"],
+                                        identity=aprovado["identity"])
+    if not final.get("ok"):
+        log.critical("[p03-intent] autoridade local perdida antes do envio: "
+                     f"{final.get('reason_code')} ({final.get('detail')})")
+        return {"ok": False, "reason_code": str(final.get("reason_code")),
+                "detail": final.get("detail")}
+    if aprovado.get('operational_selection') is not None:
+        from services.live_candidate_adapter_service import sync_context_valid
+        final = sync_context_valid(aprovado['operational_selection'])
+        if final.get('ok') is not True:
+            return final
+    return aprovado
 
 
 async def mark_sending(session_factory, intent_key: str, *, owner: str,
@@ -565,6 +1488,7 @@ async def mark_sending(session_factory, intent_key: str, *, owner: str,
     deadline = moment + timedelta(seconds=max(1, int(lease_seconds)))
     try:
         async with session_factory() as session:
+            await acquire_risk_lock(session)
             result = await session.execute(
                 update(EntryIntent)
                 .where(EntryIntent.intent_key == intent_key,
@@ -595,6 +1519,40 @@ async def may_dispatch(session_factory, intent_key: str, *, owner: str,
         return False
 
 
+RESOLUTION_EFFECTIVE = "EFFECTIVE"
+RESOLUTION_ALREADY_APPLIED = "ALREADY_APPLIED"
+RESOLUTION_CONTRADICTORY = "CONTRADICTORY"
+RESOLUTION_FORBIDDEN = "FORBIDDEN"
+
+
+def classify_resolution(*, current_state: Optional[str], target_state: str,
+                        current_trade_id: Optional[int] = None,
+                        real_trade_id: Optional[int] = None) -> str:
+    """Classifica UMA vez o que a resolução pedida significa para a linha atual.
+
+    - ``EFFECTIVE``: a intenção realmente MUDA de estado — é o único caso em que
+      há evento econômico (e, portanto, bump de geração financeira).
+    - ``ALREADY_APPLIED``: o estado-alvo já está aplicado. Repetir não é evento:
+      reserva, época, vínculo, carimbos, razão e lease de outra tentativa ficam
+      exatamente como estão, e o chamador recebe sucesso idempotente.
+    - ``CONTRADICTORY``: mesmo estado com vínculo contábil DIFERENTE. Não é
+      no-op nem sobrescrita: exige reconciliação/intervenção.
+    - ``FORBIDDEN``: rebaixar ``CONFIRMED`` ou reabrir ``TERMINAL`` como
+      ``UNKNOWN`` (callback atrasado). Nunca acontece em silêncio.
+    """
+    if current_state is None:
+        return RESOLUTION_EFFECTIVE
+    if current_state == target_state:
+        if real_trade_id is not None and current_trade_id != int(real_trade_id):
+            return RESOLUTION_CONTRADICTORY
+        return RESOLUTION_ALREADY_APPLIED
+    if current_state == STATE_CONFIRMED:
+        return RESOLUTION_FORBIDDEN
+    if current_state == STATE_TERMINAL and target_state == STATE_UNKNOWN:
+        return RESOLUTION_FORBIDDEN
+    return RESOLUTION_EFFECTIVE
+
+
 async def _resolve(session_factory, intent_key: str, *, owner: Optional[str], state: str,
                    reason: Optional[str], real_trade_id: Optional[int] = None,
                    now: Optional[datetime] = None, require_owner: bool = True) -> bool:
@@ -606,6 +1564,35 @@ async def _resolve(session_factory, intent_key: str, *, owner: Optional[str], st
         values["real_trade_id"] = int(real_trade_id)
     try:
         async with session_factory() as session:
+            # Ordem ÚNICA: advisory lock ANTES de qualquer leitura decisória.
+            await acquire_risk_lock(session)
+            # Identidade lida ANTES do update: a geração de margem precisa ser
+            # incrementada na MESMA transação da mudança econômica.
+            atual = (await session.execute(
+                select(EntryIntent.account_ref, EntryIntent.exchange,
+                       EntryIntent.state, EntryIntent.real_trade_id)
+                .where(EntryIntent.intent_key == intent_key))).one_or_none()
+            # Tudo em locais ANTES de qualquer rollback (instância expirada
+            # faria I/O preguiçoso fora do greenlet).
+            estado_atual = atual[2] if atual is not None else None
+            vinculo_atual = atual[3] if atual is not None else None
+            veredito = classify_resolution(
+                current_state=estado_atual, target_state=state,
+                current_trade_id=vinculo_atual, real_trade_id=real_trade_id)
+            if veredito in (RESOLUTION_FORBIDDEN, RESOLUTION_CONTRADICTORY):
+                # Nem sobrescreve nem finge sucesso: a decisão volta pro
+                # reconciliador/intervenção com a linha intacta.
+                await session.rollback()
+                return False
+            if veredito == RESOLUTION_ALREADY_APPLIED:
+                # NO-OP econômico: sem UPDATE, sem época nova, sem tocar
+                # reserva/vínculo/carimbos/owner. Idempotente por contrato.
+                await session.rollback()
+                return True
+            if atual is not None and state in (STATE_CONFIRMED, STATE_TERMINAL):
+                # Época ANTES da linha de intenção (passo 3 da ordem).
+                await _lock_epoch_row(session, account_ref=atual[0],
+                                      exchange=atual[1], market="usdm_futures")
             conditions = [EntryIntent.intent_key == intent_key]
             if require_owner and owner is not None:
                 conditions.append(EntryIntent.lease_owner == owner)
@@ -613,6 +1600,12 @@ async def _resolve(session_factory, intent_key: str, *, owner: Optional[str], st
             # por uma reconfirmação, nem por um callback atrasado que chegaria
             # para rebaixá-lo a UNKNOWN/TERMINAL.
             conditions.append(EntryIntent.state != STATE_CONFIRMED)
+            # Mesmo veredito do classificador, agora como backstop de CORRIDA:
+            # o estado-alvo já aplicado (ou um TERMINAL que um callback atrasado
+            # tentaria reabrir) não casa com o UPDATE.
+            conditions.append(EntryIntent.state != state)
+            if state == STATE_UNKNOWN:
+                conditions.append(EntryIntent.state != STATE_TERMINAL)
             if state in (STATE_UNKNOWN, STATE_TERMINAL):
                 # Encerrar tentativa ALHEIA em curso é proibido: só o dono do
                 # lease vivo (ou um lease livre/vencido) fecha a decisão.
@@ -622,6 +1615,14 @@ async def _resolve(session_factory, intent_key: str, *, owner: Optional[str], st
                     EntryIntent.lease_expires_at <= moment,
                     *( [EntryIntent.lease_owner == owner] if owner is not None else [] )))
             result = await session.execute(update(EntryIntent).where(*conditions).values(**values))
+            if result.rowcount == 1 and atual is not None \
+                    and state in (STATE_CONFIRMED, STATE_TERMINAL):
+                # CONFIRMED (com RealTrade) e TERMINAL TIRAM a intenção da soma
+                # de margem pendente: toda carteira lida antes disso fica
+                # obsoleta. UNKNOWN continua pendente e não muda a soma.
+                await _bump_margin_generation(session, account_ref=atual[0],
+                                              exchange=atual[1],
+                                              market="usdm_futures")
             await session.commit()
             return result.rowcount == 1
     except Exception:
@@ -663,6 +1664,13 @@ async def release_reserved(session_factory, intent_key: str, *, owner: str,
     moment = now or _now()
     try:
         async with session_factory() as session:
+            await acquire_risk_lock(session)
+            atual = (await session.execute(
+                select(EntryIntent.account_ref, EntryIntent.exchange)
+                .where(EntryIntent.intent_key == intent_key))).one_or_none()
+            if atual is not None:
+                await _lock_epoch_row(session, account_ref=atual[0],
+                                      exchange=atual[1], market="usdm_futures")
             result = await session.execute(
                 update(EntryIntent)
                 .where(EntryIntent.intent_key == intent_key, EntryIntent.state == STATE_RESERVED,
@@ -670,6 +1678,12 @@ async def release_reserved(session_factory, intent_key: str, *, owner: str,
                 .values(state=STATE_TERMINAL, reason=(_label(reason, 64) or None),
                         lease_owner=None, lease_expires_at=None,
                         updated_at=moment, resolved_at=moment))
+            if result.rowcount == 1 and atual is not None:
+                # Liberar a reserva devolve margem: carteiras anteriores ficam
+                # obsoletas (a soma de pendentes mudou).
+                await _bump_margin_generation(session, account_ref=atual[0],
+                                              exchange=atual[1],
+                                              market="usdm_futures")
             await session.commit()
             return result.rowcount == 1
     except Exception:
@@ -690,6 +1704,7 @@ async def register_dispatch(session_factory, intent_key: str, *, owner: str,
         return False
     try:
         async with session_factory() as session:
+            await acquire_risk_lock(session)
             row = (await session.execute(
                 select(EntryIntent).where(EntryIntent.intent_key == intent_key)
                 .with_for_update())).scalar_one_or_none()
@@ -724,10 +1739,12 @@ async def recover_stale(session_factory, *, now: Optional[datetime] = None, limi
     summary = {"to_unknown": 0, "reserved_released": 0}
     try:
         async with session_factory() as session:
+            await acquire_risk_lock(session)
             rows = (await session.execute(
                 select(EntryIntent).where(EntryIntent.state.in_((STATE_SENDING, STATE_RESERVED)),
                                           EntryIntent.lease_expires_at.is_not(None),
-                                          EntryIntent.lease_expires_at <= moment).limit(limit)
+                                          EntryIntent.lease_expires_at <= moment)
+                .order_by(EntryIntent.intent_key).limit(limit)
             )).scalars().all()
             for row in rows:
                 if row.state == STATE_SENDING:
@@ -738,6 +1755,11 @@ async def recover_stale(session_factory, *, now: Optional[datetime] = None, limi
                     summary["reserved_released"] += 1
                 row.lease_owner, row.lease_expires_at = None, None
                 row.updated_at = moment
+            # Recovery NÃO muda a soma de margem pendente: SENDING e UNKNOWN são
+            # ambos pendentes e a reserva RESERVED continua contando (só o lease
+            # cai). Operação idempotente sem mudança econômica não incrementa a
+            # geração — evitar crescimento/retentativa sem fim é parte do
+            # contrato.
             await session.commit()
     except Exception:
         summary["error"] = "DB_UNAVAILABLE"

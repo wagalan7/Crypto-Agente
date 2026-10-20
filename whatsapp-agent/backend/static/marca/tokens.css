@@ -1,0 +1,219 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   Agente Consultório — tokens e componentes base (E08A, 19/10/2026)
+
+   Identidade: docs/planejamento/identidade-visual/ (diretriz + REGISTRO.md).
+   Os valores marcados "amostra" vêm dos círculos de paleta das referências e
+   são APROXIMAÇÕES — as imagens não trazem HEX oficial. Os marcados "derivado"
+   foram interpolados para completar a escala. Contraste de cada par usado está
+   em docs/planejamento/EVIDENCIAS/08A.md.
+
+   A escala também é declarada no tailwind.config do template (mesmos valores):
+   as classes `brand-*`, `gray-*` e `slate-*` do painel passam a usar estes tons.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* vinho / rosé — família da marca */
+  --vinho-50:  #F9EEEC;  /* derivado */
+  --vinho-100: #F1D9D7;  /* amostra: nude */
+  --vinho-200: #E7BFBF;  /* amostra: rosa suave */
+  --vinho-300: #D99CA3;  /* derivado — só decorativo */
+  --vinho-400: #C77784;  /* derivado — só decorativo (3,3:1 em branco) */
+  --vinho-500: #B25665;  /* amostra: rosé queimado — destaque/texto grande */
+  --vinho-600: #8A273E;  /* amostra: vinho — ação principal (8,6:1) */
+  --vinho-700: #74213A;  /* derivado — hover/pressionado */
+  --vinho-800: #5E1A2F;  /* derivado */
+  --vinho-900: #4A1424;  /* derivado */
+  --vinho-950: #3C0E18;  /* amostra: vinho profundo — navegação */
+
+  /* neutros quentes — texto e superfícies */
+  --neutro-50:  #FBF7F6;  /* página (próximo ao off-white amostrado #FCF8F7) */
+  --neutro-100: #F3EEEC;
+  --neutro-200: #E7E0DD;  /* bordas — não usar como fundo de texto auxiliar */
+  --neutro-300: #D2C8C4;  /* bordas de campo */
+  --neutro-400: #706560;  /* texto auxiliar (≥4,9:1 nos fundos de uso) */
+  --neutro-500: #685D58;
+  --neutro-600: #554B47;
+  --neutro-700: #433A37;
+  --neutro-800: #2F2826;  /* texto principal (14,5:1) */
+  --neutro-900: #201A18;
+
+  --acao:            var(--vinho-600);
+  --acao-hover:      var(--vinho-700);
+  --foco:            var(--vinho-600);
+  --foco-sobre-vinho: var(--vinho-100);
+  --superficie-pagina: var(--neutro-50);
+  --superficie-cartao: #FFFFFF;
+  --texto:           var(--neutro-800);
+  --texto-suave:     var(--neutro-500);
+  --borda:           var(--neutro-200);
+
+  --fonte-titulo: "Montserrat", "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  --fonte-texto:  "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+
+  --raio-cartao: 16px;
+  --sombra-cartao: 0 1px 2px rgba(60, 14, 24, .05), 0 1px 3px rgba(60, 14, 24, .04);
+  --largura-menu: 248px;
+  --largura-menu-recolhido: 84px;
+}
+
+/* ── base ─────────────────────────────────────────────────────────────────── */
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--fonte-texto);
+  color: var(--texto);
+  background: var(--superficie-pagina);
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, .fonte-titulo { font-family: var(--fonte-titulo); letter-spacing: -.01em; }
+::placeholder { color: #8C817C; opacity: 1; }   /* 3,8:1 — campos têm rótulo próprio */
+
+/* Foco visível em todo controle: teclado nunca fica sem indicação. */
+:where(a, button, input, select, textarea, [tabindex], summary):focus-visible {
+  outline: 2px solid var(--foco);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.menu-lateral :where(a, button):focus-visible { outline-color: var(--foco-sobre-vinho); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important;
+                           transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
+
+/* ── ícones ───────────────────────────────────────────────────────────────── */
+.icone { width: 20px; height: 20px; flex-shrink: 0; stroke: currentColor; fill: none;
+         stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ── marca ────────────────────────────────────────────────────────────────── */
+/* O símbolo é recorte do arquivo original (fundo preto, sem transparência):
+   por isso aparece sempre num ladrilho escuro arredondado, nunca sobre claro. */
+.marca-simbolo { display: block; border-radius: 12px; background: #000; object-fit: cover; }
+.marca-nome  { font-family: var(--fonte-titulo); font-weight: 700; letter-spacing: .02em; line-height: 1.1; }
+.marca-sub   { font-family: var(--fonte-titulo); font-weight: 500; letter-spacing: .22em; font-size: 10.5px;
+               text-transform: uppercase; line-height: 1.2; }
+
+/* ── casca: menu lateral (≥1024px) ───────────────────────────────────────── */
+.menu-lateral { display: none; }
+@media (min-width: 1024px) {
+  .menu-lateral {
+    display: flex; flex-direction: column;
+    position: fixed; inset: 0 auto 0 0; z-index: 40;
+    width: var(--largura-menu);
+    background: var(--vinho-950); color: var(--vinho-100);
+    padding: 20px 14px 16px;
+    transition: width .2s ease;
+  }
+  .area-principal { margin-left: var(--largura-menu); transition: margin-left .2s ease; }
+  [data-menu="recolhido"] .menu-lateral { width: var(--largura-menu-recolhido); padding-inline: 10px; }
+  [data-menu="recolhido"] .area-principal { margin-left: var(--largura-menu-recolhido); }
+  [data-menu="recolhido"] .menu-lateral .so-expandido { display: none; }
+  [data-menu="recolhido"] .menu-lateral .item-menu { flex-direction: column; gap: 4px; padding: 10px 4px;
+                                                     font-size: 11.5px; text-align: center; }
+  [data-menu="recolhido"] .menu-lateral .item-menu .badge { position: absolute; top: 6px; right: 10px; }
+  [data-menu="recolhido"] .menu-lateral .botao-recolher svg { transform: rotate(180deg); }
+}
+.item-menu {
+  position: relative; display: flex; align-items: center; gap: 12px; width: 100%;
+  padding: 10px 12px; border-radius: 12px;
+  font-size: 14.5px; font-weight: 500; color: var(--vinho-100);
+  transition: background .15s ease, color .15s ease;
+}
+.item-menu:hover { background: rgba(255, 255, 255, .07); color: #fff; }
+.item-menu[aria-current="page"] { background: rgba(255, 255, 255, .11); color: #fff; font-weight: 600; }
+.item-menu[aria-current="page"]::before {
+  content: ""; position: absolute; left: -14px; top: 10px; bottom: 10px; width: 4px;
+  border-radius: 0 4px 4px 0; background: var(--vinho-200);
+}
+[data-menu="recolhido"] .item-menu[aria-current="page"]::before { left: -10px; }
+.item-menu .badge { margin-left: auto; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px;
+                    background: var(--vinho-200); color: var(--vinho-950); font-size: 12px; font-weight: 700;
+                    align-items: center; justify-content: center; }
+
+/* ── casca: barra superior ───────────────────────────────────────────────── */
+.barra-topo {
+  position: sticky; top: 0; z-index: 30;
+  background: rgba(251, 247, 246, .92); backdrop-filter: saturate(1.2) blur(8px);
+  border-bottom: 1px solid var(--borda);
+}
+.selo-ao-vivo { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600;
+                padding: 4px 10px; border-radius: 999px; border: 1px solid; white-space: nowrap; }
+.selo-ao-vivo::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.selo-ao-vivo[data-estado="conectado"]   { color: #15803D; background: #F0FDF4; border-color: #BBF7D0; }
+.selo-ao-vivo[data-estado="conectando"]  { color: var(--neutro-500); background: #fff; border-color: var(--borda); }
+.selo-ao-vivo[data-estado="reconectando"]{ color: #B45309; background: #FFFBEB; border-color: #FDE68A; }
+
+/* ── casca: navegação inferior (<1024px) ─────────────────────────────────── */
+.nav-inferior {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  background: #fff; border-top: 1px solid var(--borda);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+@media (min-width: 1024px) { .nav-inferior { display: none; } }
+.item-nav-inferior {
+  position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 3px; min-height: 58px; padding: 6px 2px;
+  font-size: 12px; font-weight: 500; color: var(--neutro-500); line-height: 1.1;
+}
+.item-nav-inferior[aria-current="page"] { color: var(--vinho-600); font-weight: 600; }
+.item-nav-inferior[aria-current="page"]::before {
+  content: ""; position: absolute; top: 0; left: 22%; right: 22%; height: 3px;
+  border-radius: 0 0 3px 3px; background: var(--vinho-600);
+}
+.item-nav-inferior .badge { position: absolute; top: 5px; left: 54%; min-width: 18px; height: 18px; padding: 0 5px;
+                            border-radius: 999px; background: var(--vinho-600); color: #fff;
+                            font-size: 11.5px; font-weight: 700; align-items: center; justify-content: center; }
+.com-nav-inferior { padding-bottom: calc(70px + env(safe-area-inset-bottom)); }
+@media (min-width: 1024px) { .com-nav-inferior { padding-bottom: 0; } }
+
+/* ── componentes ─────────────────────────────────────────────────────────── */
+.cartao { background: var(--superficie-cartao); border: 1px solid var(--borda);
+          border-radius: var(--raio-cartao); box-shadow: var(--sombra-cartao); }
+.titulo-pagina { font-family: var(--fonte-titulo); font-weight: 700; font-size: 22px;
+                 color: var(--neutro-900); letter-spacing: -.015em; line-height: 1.2; }
+.titulo-secao  { font-family: var(--fonte-titulo); font-weight: 700; font-size: 16px; color: var(--neutro-800); }
+.rotulo-secao  { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+                 color: var(--neutro-500); }
+
+/* indicadores do dia: número + rótulo + ícone (estado nunca só por cor) */
+.indicador { display: flex; align-items: center; gap: 10px; text-align: left; padding: 12px 14px;
+             border-radius: 14px; border: 1px solid var(--borda); background: #fff; min-height: 64px;
+             transition: box-shadow .15s ease, border-color .15s ease; }
+button.indicador:hover, .indicador[role="button"]:hover { border-color: var(--vinho-200); box-shadow: var(--sombra-cartao); }
+.indicador-valor { font-family: var(--fonte-titulo); font-size: 22px; font-weight: 700; line-height: 1; }
+.indicador-rotulo { font-size: 13px; color: var(--neutro-500); margin-top: 3px; line-height: 1.2; }
+.indicador .icone-estado { width: 34px; height: 34px; border-radius: 10px; display: flex; align-items: center;
+                           justify-content: center; flex-shrink: 0; }
+
+/* estados de carregamento, vazio e erro — mesmo desenho em todo o painel */
+.estado-carregando, .estado-vazio, .estado-erro {
+  display: flex; align-items: center; justify-content: center; gap: 8px; text-align: center;
+  padding: 28px 16px; border-radius: 14px; font-size: 14px;
+}
+.estado-carregando { color: var(--neutro-500); }
+.estado-vazio { color: var(--neutro-500); background: #fff; border: 1px dashed var(--neutro-300); }
+.estado-erro  { color: #B91C1C; background: #FEF2F2; border: 1px solid #FECACA; }
+
+/* botões de ação secundária nos cartões de consulta */
+.botao-sec { display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+             font-size: 13px; font-weight: 500; padding: 8px 12px; border-radius: 999px;
+             border: 1px solid var(--neutro-300); background: #fff; color: var(--neutro-700);
+             transition: background .15s ease, border-color .15s ease; min-height: 38px; }
+.botao-sec:hover { background: var(--neutro-50); border-color: var(--neutro-400); }
+.botao-sec.perigo { color: #B91C1C; }
+.botao-sec.perigo:hover { background: #FEF2F2; border-color: #FCA5A5; }
+
+/* modais: cabeçalho fixo e botão fechar com alvo de toque adequado */
+.botao-fechar { width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center;
+                border-radius: 999px; color: var(--neutro-500); font-size: 18px; }
+.botao-fechar:hover { background: var(--neutro-100); color: var(--neutro-800); }
+
+/* tabelas (cobrança): leitura confortável, cabeçalho discreto */
+.area-principal table { border-collapse: separate; border-spacing: 0; }
+.area-principal th { font-weight: 600; color: var(--neutro-600); }
+
+/* toasts */
+#toasts { top: 76px; }
+@media (min-width: 1024px) { #toasts { top: 16px; } }
+
+/* âncoras roladas por JS não ficam escondidas sob a barra superior fixa */
+#conv-detail, #config-subnav { scroll-margin-top: 80px; }

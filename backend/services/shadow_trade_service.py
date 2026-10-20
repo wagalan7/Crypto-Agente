@@ -257,7 +257,13 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
             "reserved_risk_usd": gate.get("reserved_risk_usd"),
             "daily_loss_limit_usd": gate.get("daily_loss_limit_usd"),
         }
-        recusa = await _admit_final_entry_risk(gate, intent, checks)
+        proposta = _entry_proposal_fields(intent, checks, side=side,
+                                          final_entry=final_entry,
+                                          final_qty=final_qty, stop=stop)
+        recusa = await _admit_final_entry_risk(gate, intent, checks,
+                                               final_entry=final_entry,
+                                               final_qty=final_qty,
+                                               proposal=proposta)
         if recusa is not None:
             return recusa
         return await _r05d_total_gate(checks)
@@ -278,32 +284,137 @@ async def _r05b_entry_gate(*, side, final_entry, stop, final_qty,
     }
 
 
-async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict):
-    """Admissão SERIALIZADA do risco final, sob a mesma lock da reserva.
+def _p04_evidence_of(checks: dict) -> Optional[dict]:
+    """Evidência P04 ORIGINAL que o callback congelou (quote/depth + limites)."""
+    evidencia = (checks or {}).get("p04_evidence")
+    return evidencia if isinstance(evidencia, dict) else None
+
+
+def _entry_proposal_fields(intent: dict, checks: dict, *, side, final_entry,
+                           final_qty, stop) -> Optional[dict]:
+    """Campos CANÔNICOS da proposta desta tentativa (sem token/hash ainda).
+
+    Só o necessário: identidade, plano JÁ quantizado, evidência temporal
+    ORIGINAL de quote/profundidade/carteira e os limites vigentes. Nenhum
+    segredo, nenhum resultado futuro, nenhum carimbo renovado.
+    """
+    identity = intent.get("identity")
+    despacho = intent.get("last_dispatch_id")
+    evidencia = _p04_evidence_of(checks)
+    if identity is None or not despacho or evidencia is None:
+        return None
+    tipo = str(evidencia.get("order_type") or "").upper()
+    if tipo not in ("MARKET", "LIMIT"):
+        return None
+    # O lado gravado é o lado da EXCHANGE (o que vai no payload), derivado do
+    # normalizador real da decisão — `long/short` nunca é comparado com
+    # `BUY/SELL` por coincidência de texto.
+    try:
+        from services.entry_revalidation_service import normalize_entry_side
+        decisao = normalize_entry_side(side)
+    except Exception:  # noqa: BLE001
+        decisao = None
+    lado_exchange = {"long": "BUY", "short": "SELL"}.get(str(decisao or ""))
+    if lado_exchange is None:
+        return None
+    return {
+        "account_ref": getattr(identity, "account_ref", None),
+        "exchange": getattr(identity, "exchange", None),
+        "market": "usdm_futures",
+        "intent_key": intent.get("intent_key"),
+        "symbol": getattr(identity, "symbol", None),
+        "side": lado_exchange,
+        "position_side": getattr(identity, "position_side", None),
+        "order_type": tipo,
+        "time_in_force": evidencia.get("time_in_force"),
+        "reduce_only": False,
+        "dispatch_id": str(despacho),
+        "qty": float(final_qty) if final_qty is not None else None,
+        "price": (float(final_entry) if tipo == "LIMIT" and final_entry is not None
+                  else None),
+        # MARKET não leva preço no POST: a referência fica como EVIDÊNCIA do
+        # risco admitido, nunca como campo da ordem.
+        "reference_price": (float(final_entry) if tipo == "MARKET"
+                            and final_entry is not None else None),
+        "stop": float(stop) if stop is not None else None,
+        "leverage": intent.get("leverage"),
+        "evidence": evidencia,
+        "limits": evidencia.get("limits"),
+        # Contexto governado DESTA intenção (quando houver): a readmissão
+        # confere identidade e mantém a decisão ORIGINAL congelada.
+        **({"operational_selection": intent["operational_selection"]}
+           if intent.get("operational_selection") is not None else {}),
+    }
+
+
+async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict, *,
+                                  final_entry=None, final_qty=None,
+                                  proposal: Optional[dict] = None):
+    """Admissão SERIALIZADA do risco e da MARGEM finais, sob a lock da reserva.
 
     Duas decisões que checaram o orçamento antes de reservar poderiam consumir
     juntas a última margem; aqui o veredicto e a gravação da reserva acontecem
-    na MESMA transação. Sem orçamento (cutover desligado) não há veredicto
-    novo. Dúvida NEGA — nenhuma ordem é enviada.
+    na MESMA transação. Sem orçamento (cutover desligado) o veredicto de
+    orçamento/capacidade continua não existindo — só o gate de MARGEM REAL
+    roda, porque os limites são independentes. Dúvida NEGA.
     """
     orcamento = gate.get("budget") if isinstance(gate.get("budget"), dict) else None
     key = intent.get("intent_key")
-    if not orcamento or not key:
+    if not key:
+        return None
+    # A MARGEM final é readmitida mesmo com o cutover de orçamento desligado:
+    # os limites são independentes, e o tamanho pode ter mudado no arredondamento.
+    margem = None
+    if final_entry is not None and final_qty is not None and intent.get("identity"):
+        margem = await _margin_gate_for(intent["identity"], entry=final_entry,
+                                        qty=final_qty,
+                                        leverage=intent.get("leverage"))
+        if margem is not None:
+            # Carimbos ORIGINAIS da carteira (não renovados): a janela de
+            # margem é reconferida no exame síncrono pré-assinatura.
+            evidencia_margem = {
+                "observed_start_ms": getattr(margem, "observed_start_ms", None),
+                "observed_end_ms": getattr(margem, "observed_end_ms", None),
+                "quality": getattr(margem, "quality", None),
+                "required_usd": getattr(margem, "required_usd", None),
+                "free_usd": getattr(margem, "free_usd", None),
+                "generation": getattr(margem, "generation", None)}
+            checks["margin_evidence"] = evidencia_margem
+            if proposal is not None and isinstance(proposal.get("evidence"), dict):
+                # A proposta carrega a evidência da carteira que a admitiu.
+                proposal = {**proposal,
+                            "evidence": {**proposal["evidence"],
+                                         "margin": evidencia_margem}}
+        if margem is None:
+            checks["r05_admission"] = {"granted": False,
+                                       "reason": "FREE_MARGIN_UNKNOWN"}
+            return {"ok": False, "quality": "UNKNOWN",
+                    "reason_code": "FREE_MARGIN_UNKNOWN",
+                    "reason": "margem livre real não pôde ser comprovada",
+                    "checks": checks}
+    if not orcamento and margem is None:
         return None
     try:
         from db import get_session
         from services import entry_intent_service as intents
         risco = gate.get("proposed_trade_risk_usd")
-        if not isinstance(risco, (int, float)) or isinstance(risco, bool):
+        risco_conhecido = isinstance(risco, (int, float)) and not isinstance(risco, bool)
+        if orcamento and not risco_conhecido:
             veredicto = intents.Reservation(intents.BLOCKED_CAPACITY, key, None, None,
                                             "PROPOSED_RISK_UNKNOWN")
         else:
+            # Cutover desligado: capacidade/orçamento seguem sem veredicto novo
+            # (comportamento legado preservado) e o risco reservado não é
+            # rebaixado — só a margem real é readmitida.
             veredicto = await intents.admit_final_risk(
-                get_session, key, owner=_INTENT_OWNER, risk_usd=float(risco),
-                capacity=intent.get("capacity"),
-                budget=intents.DailyBudget(base_usd=orcamento.get("base_usd"),
-                                           limit_usd=orcamento.get("limit_usd"),
-                                           complete=bool(orcamento.get("complete"))))
+                get_session, key, owner=_INTENT_OWNER,
+                risk_usd=float(risco) if risco_conhecido else 0.0,
+                capacity=intent.get("capacity") if orcamento else None,
+                margin=margem, proposal=proposal,
+                budget=(intents.DailyBudget(base_usd=orcamento.get("base_usd"),
+                                            limit_usd=orcamento.get("limit_usd"),
+                                            complete=bool(orcamento.get("complete")))
+                        if orcamento else None))
     except Exception as exc:                      # exceção NUNCA libera entrada
         log.warning(f"[r05] admissão final indisponível: {type(exc).__name__}: {exc}")
         checks["r05_admission"] = {"granted": False, "reason": "ADMISSION_ERROR"}
@@ -313,12 +424,33 @@ async def _admit_final_entry_risk(gate: dict, intent: dict, checks: dict):
                                "decision": veredicto.decision,
                                "reason": veredicto.reason}
     if veredicto.granted:
+        # O dispatch passa a conferir ESTA geração antes de enviar.
+        if veredicto.generation is not None:
+            intent["margin_generation"] = veredicto.generation
+        if proposal is not None:
+            if veredicto.proposal is None:
+                # Proposta exigida e NÃO vinculada: sem ela o exame síncrono
+                # não tem com o que comparar — nada é enviado.
+                checks["r05_admission"] = {"granted": False,
+                                           "reason": intents.PROPOSAL_INVALID}
+                return {"ok": False, "quality": "UNKNOWN",
+                        "reason_code": intents.PROPOSAL_INVALID,
+                        "reason": "proposta do despacho não pôde ser congelada",
+                        "checks": checks}
+            intent["proposal"] = veredicto.proposal
+            checks["dispatch_proposal"] = {
+                "dispatch_id": veredicto.proposal.get("dispatch_id"),
+                "hash": veredicto.proposal.get("hash"),
+                "token": veredicto.proposal.get("token")}
         return None
     log.warning(f"[r05] entrada BLOQUEADA na admissão final: "
                 f"{veredicto.decision} ({veredicto.reason})")
     return {"ok": False, "quality": "OK" if veredicto.reason == "DAILY_LOSS_LIMIT" else "UNKNOWN",
             "reason_code": veredicto.reason or veredicto.decision,
-            "reason": "orçamento/capacidade não admitiram o risco final",
+            "reason": ("margem livre real não cobre a proposta"
+                       if str(veredicto.reason or "").startswith(("INSUFFICIENT_FREE_MARGIN",
+                                                                 "FREE_MARGIN"))
+                       else "orçamento/capacidade não admitiram o risco final"),
             "checks": checks}
 
 
@@ -1337,16 +1469,212 @@ def _entry_intent_identity(rec: dict, side: str, purpose: str = "ENTRY"):
         return None
 
 
+#: Custo conservador de ida e volta reservado JUNTO da margem, em bps sobre o
+#: notional. É uma MARGEM DE SEGURANÇA (limite superior da taxa taker da
+#: Binance USD-M), não um número de contabilidade: ela só torna o gate mais
+#: severo e nunca faz uma proposta caber.
+MARGIN_COST_BPS_PER_SIDE = 5.0
+
+
+def _proposed_margin_usd(*, entry: float, qty: float, leverage) -> Optional[float]:
+    """Margem incremental + custos conservadores da proposta.
+
+    `notional / leverage` é a MESMA fórmula do cap de margem já existente —
+    nada de política nova. Parcela ausente/não-finita devolve None, e o caller
+    BLOQUEIA: desconhecido não vira zero nem estimativa favorável.
+    """
+    try:
+        preco, quantidade = float(entry), float(qty)
+        alavancagem = max(int(leverage or 1), 1)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (preco, quantidade)) or preco <= 0 or quantidade <= 0:
+        return None
+    notional = preco * quantidade
+    custos = notional * (2.0 * MARGIN_COST_BPS_PER_SIDE / 10_000.0)
+    return (notional / alavancagem) + custos
+
+
+async def _free_margin_snapshot():
+    """Carteira FRESCA da conta compartilhada, com prova temporal e qualidade.
+
+    Leitura feita FORA de qualquer transação/lock; idade, qualidade e geração
+    são conferidas DENTRO da admissão. `available_usd` já desconta a margem em
+    uso na conta — inclusive a da posição manual — e NÃO é somada de volta.
+
+    Exigências (ausência nunca vira zero nem estimativa favorável):
+    `ok=True`, qualidade `live`, `available_usd` numérico finito não-booleano
+    e >= 0, e `as_of_ms` presente e coerente. Cache, cooldown/stale,
+    rate-limited, carimbo ausente ou horário futuro devolvem `None` e a
+    proposta é bloqueada.
+    """
+    inicio_ms = int(time.time() * 1000)
+    try:
+        from services import exchange_service
+        carteira = await exchange_service.get_equity(force=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[margem] carteira indisponível: {type(exc).__name__}")
+        return None
+    if not isinstance(carteira, dict) or not carteira.get("ok"):
+        return None
+    if carteira.get("stale") or carteira.get("rate_limited"):
+        return None
+    qualidade = str(carteira.get("quality") or carteira.get("source") or "")
+    if qualidade.lower() != "live":
+        # Cache/stale não é prova de saldo atual para ABRIR exposição.
+        log.warning(f"[margem] carteira de qualidade {qualidade!r} não autoriza")
+        return None
+    disponivel = carteira.get("available_usd")
+    if isinstance(disponivel, bool):
+        return None
+    try:
+        disponivel = float(disponivel)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(disponivel) or disponivel < 0:
+        return None
+    carimbo = carteira.get("as_of_ms")
+    if carimbo is None or isinstance(carimbo, bool):
+        return None
+    try:
+        carimbo = int(carimbo)
+    except (TypeError, ValueError):
+        return None
+    fim_ms = int(time.time() * 1000)
+    if carimbo <= 0 or carimbo > fim_ms + 2_000:
+        return None            # carimbo ausente ou no futuro: incoerente
+    return {"available_usd": disponivel, "as_of_ms": carimbo,
+            "observed_start_ms": inicio_ms, "observed_end_ms": fim_ms,
+            "quality": "live", "source": carteira.get("source")}
+
+
+async def _margin_gate_for(identity, *, entry, qty, leverage):
+    """Monta o `MarginGate` seguindo o algoritmo obrigatório da geração.
+
+    1. sob a lock `917283`, obter a geração `g` e ENCERRAR a transação;
+    2. FORA da transação, obter carteira realmente fresca;
+    3. anexar conta/mercado, `g`, janela da leitura e qualidade ao gate.
+
+    A admissão confere `g` depois de readquirir a lock: se mudou, nega sem POST.
+    """
+    from services import entry_intent_service as intents
+    from db import get_session
+    from sqlalchemy import text as _sql_text
+    try:
+        async with get_session() as session:
+            async with session.begin():
+                await session.execute(
+                    _sql_text("SELECT pg_advisory_xact_lock(:k)"),
+                    {"k": intents.RISK_LOCK_KEY})
+                geracao = await intents.current_margin_generation(
+                    session, account_ref=identity.account_ref,
+                    exchange=identity.exchange, market="usdm_futures")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[margem] geração indisponível: {type(exc).__name__}")
+        return None
+    carteira = await _free_margin_snapshot()
+    requerida = _proposed_margin_usd(entry=entry, qty=qty, leverage=leverage)
+    if carteira is None or requerida is None:
+        # Incompleto BLOQUEIA: o gate é criado com `complete=False`.
+        return intents.MarginGate(
+            available_usd=(carteira or {}).get("available_usd"),
+            required_usd=requerida if requerida is not None else 0.0,
+            as_of_ms=(carteira or {}).get("as_of_ms"), complete=False,
+            account_ref=identity.account_ref, exchange=identity.exchange,
+            market="usdm_futures", generation=geracao,
+            quality=(carteira or {}).get("quality"))
+    return intents.MarginGate(
+        available_usd=carteira["available_usd"], required_usd=requerida,
+        as_of_ms=carteira["as_of_ms"], complete=True,
+        account_ref=identity.account_ref, exchange=identity.exchange,
+        market="usdm_futures", generation=geracao,
+        observed_start_ms=carteira.get("observed_start_ms"),
+        observed_end_ms=carteira.get("observed_end_ms"),
+        quality=carteira.get("quality"))
+
+
+async def _manual_entry_block(symbol) -> Optional[dict]:
+    """Símbolo indisponível por posição manual reconhecida (ou prova incerta).
+
+    Roda ANTES da reserva — e, portanto, antes da primeira mutação de conta
+    (o `set_leverage` da entrada).
+    """
+    try:
+        from services import manual_position_service as mps
+        # Entrada é NOVA exposição: exige prova de validação atual do
+        # reconhecimento, além das pausas existentes.
+        verdict = await mps.ownership_guard(symbol, action="entry",
+                                            require_fresh_proof=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"reason_code": "MANUAL_OWNERSHIP_GUARD_ERROR", "detail": type(exc).__name__}
+    if verdict.get("allowed"):
+        return None
+    return {"reason_code": verdict.get("reason_code"), "detail": verdict.get("detail")}
+
+
+def _candidate_transport_supported() -> bool:
+    """Modo candidato só no transporte oficial que carrega o guard (Binance)."""
+    try:
+        from services import exchange_service
+        return str(getattr(exchange_service, "ACTIVE_EXCHANGE", "")).lower() == "binance"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _intent_candidate_guard(intent):
+    """Guard de autoridade candidata para CADA POST/alavancagem do transporte.
+
+    Devolve `None` no legado — e aí o transporte segue exatamente como antes,
+    sem callback novo. Em modo candidato, o callback reconfere a autoridade
+    (assíncrono) e entrega o exame síncrono final ao próprio transporte.
+    """
+    context = (intent or {}).get("operational_selection") if isinstance(intent, dict) else None
+    if context is None:
+        return None
+
+    async def _guard():
+        from db import get_session
+        from services import live_candidate_adapter_service as _adapter
+        verdict = await _adapter.authorize_context(get_session, context)
+        if verdict.get("ok") is not True:
+            log.warning("[candidate] autoridade negou o POST: %s",
+                        verdict.get("reason_code"))
+        return verdict
+
+    return _guard
+
+
 async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: float,
-                                tp1, tp2, qty: float, equity_usd: float) -> dict:
+                                tp1, tp2, qty: float, equity_usd: float,
+                                identity=None, consumes_slot: bool = True) -> dict:
     """Reserva a intenção ANTES de qualquer mutação de ordem."""
     from services import entry_intent_service as intents
     from db import get_session
     blocked = {"granted": False, "decision": intents.UNAVAILABLE, "reason": "IDENTITY_UNAVAILABLE",
                "dispatched": False}
-    identity = _entry_intent_identity(rec, side)
+    impedimento = await _manual_entry_block(rec.get("symbol"))
+    if impedimento is not None:
+        return {**blocked, "decision": intents.BLOCKED_CAPACITY,
+                "reason": impedimento.get("reason_code")}
+    identity = identity or _entry_intent_identity(rec, side)
     if identity is None:
         return blocked
+    # ── Seleção CANDIDATE: o contexto governado entra na DECISÃO antes de
+    #    qualquer mutação, amarrado à geometria desta recomendação. Legado não
+    #    passa por aqui (nenhum campo novo no payload).
+    candidate_context = None
+    if rec.get("operational_selection") is not None:
+        from services import live_candidate_adapter_service as _adapter
+        try:
+            candidate_context = _adapter.context_for_rec(rec)
+        except Exception as exc:  # noqa: BLE001 — dúvida NÃO autoriza entrada
+            log.warning("[candidate] recomendação incoerente com o contexto: %s",
+                        type(exc).__name__)
+            return {**blocked, "decision": intents.BLOCKED_CAPACITY,
+                    "reason": "CANDIDATE_RECOMMENDATION_MISMATCH"}
+        if not _candidate_transport_supported():
+            return {**blocked, "decision": intents.BLOCKED_CAPACITY,
+                    "reason": "CANDIDATE_EXCHANGE_NOT_SUPPORTED"}
     try:
         payload = {"entry": float(entry), "stop_loss": float(stop),
                    "tp1": float(tp1) if tp1 is not None else None,
@@ -1358,7 +1686,8 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
             risk_usd=abs(float(entry) - float(stop)) * float(qty),
             # Teto real de posições simultâneas (o mesmo do portfolio_guard):
             # desativá-lo aqui deixaria a admissão atômica sem limite de slot.
-            max_open_positions=FILLER_TOTAL_SLOTS if FILLER_TOTAL_SLOTS > 0 else None,
+            max_open_positions=(FILLER_TOTAL_SLOTS
+                                if consumes_slot and FILLER_TOTAL_SLOTS > 0 else None),
             max_open_risk_usd=(float(equity_usd) * MAX_TOTAL_OPEN_RISK_PCT / 100.0
                                if MAX_TOTAL_OPEN_RISK_PCT > 0 and equity_usd else None),
             open_risk_usd=(await _open_risk_usd() if MAX_TOTAL_OPEN_RISK_PCT > 0 else 0.0))
@@ -1371,23 +1700,44 @@ async def _reserve_entry_intent(rec: dict, *, side: str, entry: float, stop: flo
                                   limit_usd=orcamento.get("limit_usd"),
                                   complete=bool(orcamento.get("complete")))
               if orcamento.get("enabled") else None)
+    # Margem REAL: limite INDEPENDENTE do orçamento nominal do bot. A posição
+    # manual não devolve margem nenhuma — ela já saiu do `available_usd`.
+    margin = await _margin_gate_for(identity, entry=entry, qty=qty,
+                                    leverage=rec.get("leverage"))
+    if margin is None:
+        return {**blocked, "decision": intents.BLOCKED_CAPACITY,
+                "reason": "FREE_MARGIN_UNKNOWN"}
     reservation = await intents.reserve(get_session, identity, payload, owner=_INTENT_OWNER,
-                                        capacity=capacity, budget=budget,
+                                        capacity=capacity, budget=budget, margin=margin,
                                         # Stop/qty planejados ficam gravados ANTES
                                         # do POST: depois do envio não há de onde
                                         # recuperá-los para adotar o SL existente.
                                         decision={"entry": float(entry),
                                                   "stop_loss": float(stop),
-                                                  "qty": float(qty)})
-    return {"granted": reservation.granted, "decision": reservation.decision,
+                                                  "qty": float(qty),
+                                                  **({"operational_selection": candidate_context,
+                                                      "candidate_equity_usd": float(equity_usd)}
+                                                     if candidate_context is not None else {})})
+    return {"operational_selection": candidate_context,
+            "granted": reservation.granted, "decision": reservation.decision,
             "reason": reservation.reason, "intent_key": reservation.intent_key,
             "client_order_id": reservation.client_order_id, "state": reservation.state,
             "account_ref": identity.account_ref, "capacity": capacity,
+            "leverage": rec.get("leverage"), "identity": identity,
+            # Token de admissão: o dispatch confere a geração RESULTANTE antes
+            # de enviar. Mudança concorrente exige nova admissão.
+            "margin_generation": reservation.generation,
             "dispatched": False}
 
 
 async def _intent_dispatch_guard(intent) -> bool:
-    """Guard antes de CADA POST: só o dono do lease vivo em SENDING despacha."""
+    """PREPARAÇÃO do despacho (não autoriza enviar por si só).
+
+    Confere identidade/estado/owner/lease e passa a `SENDING`. NÃO exige token
+    financeiro ainda vigente: a etapa seguinte (quote/carteira/readmissão) é
+    justamente quem pode renová-lo. A AUTORIZAÇÃO FINAL é
+    `_intent_final_authorization`, executada na fronteira pós-throttle.
+    """
     if not isinstance(intent, dict) or not intent.get("granted"):
         return False
     from services import entry_intent_service as intents
@@ -1399,6 +1749,342 @@ async def _intent_dispatch_guard(intent) -> bool:
         intent["dispatched"] = True
         intent["state"] = "SENDING"
     return await intents.may_dispatch(get_session, key, owner=_INTENT_OWNER)
+
+
+#: Tolerância de comparação da qty/preço entre proposta e payload (float repr).
+_PROPOSAL_NUM_TOL = 1e-9
+
+
+def _proposal_age_limit_ms(evidencia) -> Optional[float]:
+    """Teto de idade da proposta = a TTL que o PRÓPRIO P04 já declarou.
+
+    Nenhum limite novo é inventado aqui: usa-se `max_quote_age_ms` (P04A) ou
+    `max_depth_age_ms` (P04B), os mesmos que aprovaram a evidência. Limite
+    ausente/inválido NÃO vira default permissivo — a proposta é recusada.
+    """
+    limites = (evidencia or {}).get("limits") if isinstance(evidencia, dict) else None
+    if not isinstance(limites, dict):
+        return None
+    for campo in ("max_quote_age_ms", "max_depth_age_ms"):
+        valor = limites.get(campo)
+        if isinstance(valor, bool) or valor is None:
+            continue
+        try:
+            numero = float(valor)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numero) and numero > 0:
+            return numero
+    return None
+
+
+def _num_close(a, b) -> bool:
+    try:
+        x, y = float(a), float(b)
+    except (TypeError, ValueError):
+        return False
+    if x != x or y != y:                      # NaN nunca casa
+        return False
+    return abs(x - y) <= max(_PROPOSAL_NUM_TOL, abs(y) * _PROPOSAL_NUM_TOL)
+
+
+def _revalidate_frozen_p04(evidencia: dict, *, now_ms: float) -> dict:
+    """Roda o avaliador P04 REAL sobre a evidência ORIGINAL, no relógio ATUAL.
+
+    Nada é recalculado nem renovado: o payload de quote/depth e os limites são
+    os congelados na aprovação. É exatamente o mesmo contrato do preflight —
+    por isso uma cotação/profundidade vencida reprova aqui.
+    """
+    if not isinstance(evidencia, dict):
+        return {"ok": False, "reason_code": "EXEC_PROPOSAL_EVIDENCE_MISSING"}
+    tipo = str(evidencia.get("evaluator") or "")
+    args = evidencia.get("args")
+    limites = evidencia.get("limits")
+    if not isinstance(args, dict) or not isinstance(limites, dict):
+        return {"ok": False, "reason_code": "EXEC_PROPOSAL_EVIDENCE_MISSING"}
+    try:
+        from services.entry_revalidation_service import (
+            evaluate_entry_revalidation, evaluate_market_depth_revalidation)
+        if tipo == "quote":
+            veredito = evaluate_entry_revalidation(
+                quote=args.get("quote"), symbol=args.get("symbol"),
+                side=args.get("side"), planned_entry=args.get("planned_entry"),
+                stop_loss=args.get("stop_loss"), tp1=args.get("tp1"),
+                tp2=args.get("tp2"), atr=args.get("atr"),
+                max_quote_age_ms=limites.get("max_quote_age_ms"),
+                max_fetch_latency_ms=limites.get("max_fetch_latency_ms"),
+                max_spread_pct=limites.get("max_spread_pct"),
+                max_chase_atr=limites.get("max_chase_atr"),
+                min_rr_tp1=limites.get("min_rr_tp1"),
+                min_rr_tp2=limites.get("min_rr_tp2"),
+                maker_limit_price=args.get("maker_limit_price"),
+                entry_zone_low=args.get("entry_zone_low"),
+                entry_zone_high=args.get("entry_zone_high"),
+                max_adverse_slippage_pct=limites.get("max_adverse_slippage_pct") or 0.0,
+                enforce_adverse_slippage=bool(limites.get("enforce_adverse_slippage")),
+                now_ms=now_ms)
+        elif tipo == "depth":
+            veredito = evaluate_market_depth_revalidation(
+                depth=args.get("depth"), symbol=args.get("symbol"),
+                side=args.get("side"), qty=args.get("qty"),
+                planned_entry=args.get("planned_entry"),
+                stop_loss=args.get("stop_loss"), tp1=args.get("tp1"),
+                tp2=args.get("tp2"), atr=args.get("atr"),
+                max_depth_age_ms=limites.get("max_depth_age_ms"),
+                max_fetch_latency_ms=limites.get("max_fetch_latency_ms"),
+                max_spread_pct=limites.get("max_spread_pct"),
+                max_book_impact_pct=limites.get("max_book_impact_pct"),
+                max_adverse_slippage_pct=limites.get("max_adverse_slippage_pct"),
+                max_chase_atr=limites.get("max_chase_atr"),
+                min_rr_tp1=limites.get("min_rr_tp1"),
+                min_rr_tp2=limites.get("min_rr_tp2"),
+                entry_zone_low=args.get("entry_zone_low"),
+                entry_zone_high=args.get("entry_zone_high"),
+                now_ms=now_ms)
+        else:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_EVIDENCE_MISSING"}
+    except Exception as exc:  # noqa: BLE001 — dúvida NÃO envia
+        return {"ok": False, "reason_code": "EXEC_PROPOSAL_RECHECK_ERROR",
+                "reason": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(veredito, dict) or veredito.get("ok") is not True:
+        detalhe = veredito if isinstance(veredito, dict) else {}
+        return {"ok": False,
+                "reason_code": str(detalhe.get("reason_code")
+                                   or "EXEC_PROPOSAL_RECHECK_DENIED"),
+                "reason": detalhe.get("reason")}
+    return {"ok": True, "reason_code": "PROPOSAL_EVIDENCE_FRESH"}
+
+
+#: Campos que uma ENTRADA emitida pelo builder saudável NUNCA carrega. A
+#: rejeição é por PRESENÇA (contrato), não por veracidade do valor: um
+#: `reduceOnly=False` no payload de abertura é payload diferente do admitido.
+_CAMPOS_PROIBIDOS_NA_ENTRADA = ("reduceOnly", "closePosition", "stopPrice")
+
+
+def _wire_symbol(valor) -> Optional[str]:
+    """Símbolo na forma WIRE usando a conversão REAL do transporte.
+
+    `DELTA/USDT:USDT` e `DELTAUSDT` são a MESMA ordem; `DELTAUSDC` não é. Nada
+    de remover quote ou trechos arbitrários para forçar igualdade.
+    """
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+    try:
+        from services.binance_signed_service import to_binance
+        from services.entry_intent_service import identity_symbol_to_market
+        if "/" in texto:                      # forma de mercado (CCXT)
+            return to_binance(texto).upper()
+        if "-" in texto:                      # forma da IDENTIDADE persistida
+            mercado = identity_symbol_to_market(texto)
+            if mercado is None:
+                return None
+            return to_binance(mercado).upper()
+        return texto.upper()                  # já é a forma WIRE
+    except Exception:  # noqa: BLE001 — sem conversão real, não há igualdade
+        return None
+
+
+def _identidade_do_contexto_bate(proposta: dict, intent: dict) -> Optional[str]:
+    """Conta/exchange/mercado/símbolo da proposta × identidade IMUTÁVEL.
+
+    Esses campos não vão no payload da Binance, então são conferidos contra o
+    contexto interno. Devolve o motivo da divergência, ou None quando casa.
+    """
+    identidade = (intent or {}).get("identity")
+    if identidade is None:
+        return "intenção sem identidade imutável"
+    pares = (
+        ("account_ref", getattr(identidade, "account_ref", None)),
+        ("exchange", getattr(identidade, "exchange", None)),
+        ("intent_key", getattr(identidade, "intent_key", None)),
+    )
+    for campo, esperado in pares:
+        if esperado is None:
+            return f"identidade sem {campo}"
+        if str(proposta.get(campo) or "").lower() != str(esperado).lower():
+            return f"{campo} divergente da identidade"
+    if str(proposta.get("market") or "").lower() != "usdm_futures":
+        return "mercado divergente"
+    if _wire_symbol(proposta.get("symbol")) != _wire_symbol(
+            getattr(identidade, "symbol", None)):
+        return "símbolo da proposta divergente da identidade"
+    try:
+        from services import manual_position_service as mps
+        conta_vigente = mps.current_account_scope()
+    except Exception:  # noqa: BLE001
+        return "conta vigente ilegível"
+    if conta_vigente and str(proposta.get("account_ref")) != str(conta_vigente):
+        return "conta vigente divergente da proposta"
+    return None
+
+
+def _sync_final_check_for(autorizacao: dict, intent: Optional[dict] = None):
+    """Exame SÍNCRONO final: proposta congelada × params que vão ser assinados.
+
+    Roda DEPOIS do último await decisivo (a própria autorização assíncrona) e
+    imediatamente antes de assinar — sem nenhum await no meio. Confere, nesta
+    ordem: existência/integridade da proposta, identidade do despacho, idade da
+    autorização, deadline do lease, quote/profundidade e janela de margem pelos
+    contratos REAIS, e por fim a igualdade campo a campo com o payload.
+    """
+    def _exame(params: dict) -> dict:
+        proposta = (autorizacao or {}).get("proposal")
+        if not isinstance(proposta, dict):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_MISSING",
+                    "reason": "sem proposta congelada para este despacho"}
+        from services import entry_intent_service as intents
+        integra = intents.proposal_matches_stored(proposta)
+        if not integra.get("ok"):
+            return {"ok": False, "reason_code": str(integra.get("reason_code")),
+                    "reason": "proposta adulterada ou não canonicalizável"}
+        # 0. AUTORIDADE LOCAL ATUAL com o token ORIGINAL da autorização: uma
+        #    falha manual conhecida por ESTE processo (fence/pending/contenção)
+        #    impede o envio, mesmo que o resto da proposta esteja íntegro.
+        autoridade = (autorizacao or {}).get("local_authority")
+        local = intents.local_authority_still_valid(
+            autoridade, identity=(autorizacao or {}).get("identity"))
+        if not local.get("ok"):
+            return {"ok": False, "reason_code": str(local.get("reason_code")),
+                    "reason": f"autoridade local perdida: {local.get('detail')}"}
+        agora_ms = time.time() * 1000.0
+        # 1. Idade da autorização e deadline do lease (relógio ATUAL).
+        autorizado_ms = (autorizacao or {}).get("authorized_at_ms")
+        if not isinstance(autorizado_ms, (int, float)) or isinstance(autorizado_ms, bool):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_INVALID",
+                    "reason": "carimbo da autorização ausente"}
+        limite_idade_ms = _proposal_age_limit_ms(proposta.get("evidence"))
+        if limite_idade_ms is None:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_INVALID",
+                    "reason": "proposta sem limite de idade declarado"}
+        idade_ms = agora_ms - float(autorizado_ms)
+        if idade_ms < 0 or idade_ms > limite_idade_ms:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_EXPIRED",
+                    "reason": (f"autorização com {idade_ms:.0f}ms excede "
+                               f"{limite_idade_ms:.0f}ms")}
+        deadline_ms = proposta.get("lease_expires_at_ms")
+        if deadline_ms is not None and float(deadline_ms) <= agora_ms:
+            return {"ok": False, "reason_code": "EXEC_LEASE_EXPIRED",
+                    "reason": "lease da intenção venceu antes de assinar"}
+        # 2. Quote/profundidade: avaliadores REAIS sobre a evidência original.
+        frescor = _revalidate_frozen_p04(proposta.get("evidence"),
+                                         now_ms=agora_ms)
+        if not frescor.get("ok"):
+            return frescor
+        # 3. Janela da carteira/margem com o limite vigente.
+        # Contrato EXISTENTE da carteira: qualidade `live`, carimbo inteiro
+        # coerente (não futuro) e geração declarada — a concorrência em si é
+        # provada pelo token/época reconferido na autorização assíncrona. Nenhum
+        # TTL novo é introduzido para a carteira.
+        margem = ((proposta.get("evidence") or {}).get("margin")
+                  if isinstance(proposta.get("evidence"), dict) else None)
+        if isinstance(margem, dict):
+            fim = margem.get("observed_end_ms")
+            if (not isinstance(fim, (int, float)) or isinstance(fim, bool)
+                    or float(fim) <= 0 or float(fim) > agora_ms + 2_000):
+                return {"ok": False, "reason_code": "FREE_MARGIN_UNKNOWN",
+                        "reason": "janela de margem sem evidência temporal"}
+            if str(margem.get("quality") or "").lower() != "live":
+                return {"ok": False, "reason_code": "FREE_MARGIN_UNKNOWN",
+                        "reason": "carteira admitida não é leitura live"}
+            if margem.get("generation") is None:
+                return {"ok": False, "reason_code": "FREE_MARGIN_UNKNOWN",
+                        "reason": "carteira admitida sem geração declarada"}
+        # 4. Identidade e payload: o que vai ser assinado é o admitido.
+        recebidos = params if isinstance(params, dict) else {}
+        # 4a. Contexto interno (conta/exchange/mercado/símbolo da intenção).
+        divergencia = _identidade_do_contexto_bate(proposta, intent or {})
+        if divergencia is not None:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": f"identidade interna: {divergencia}"}
+        # 4b. Símbolo WIRE efetivo × símbolo derivado da proposta.
+        esperado_symbol = _wire_symbol(proposta.get("symbol"))
+        recebido_symbol = _wire_symbol(recebidos.get("symbol"))
+        if esperado_symbol is None or recebido_symbol != esperado_symbol:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": (f"símbolo do payload ({recebidos.get('symbol')!r}) "
+                               f"não é o admitido ({proposta.get('symbol')!r})")}
+        # 4c. Campos que uma ENTRADA saudável não carrega — por PRESENÇA.
+        for campo in _CAMPOS_PROIBIDOS_NA_ENTRADA:
+            if campo in recebidos:
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": f"abertura admitida não carrega {campo}"}
+        # 4d. `positionSide`: só o modo/identidade realmente admitidos. One-way
+        #     (BOTH) omite o campo — a omissão saudável é aceita; LONG/SHORT num
+        #     contrato BOTH é incompatível e nega.
+        if "positionSide" in recebidos:
+            esperado_ps = str(proposta.get("position_side") or "").upper()
+            if str(recebidos.get("positionSide") or "").upper() != esperado_ps:
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "positionSide incompatível com o admitido"}
+        esperado_coid = str(proposta.get("dispatch_id") or "")
+        if str(recebidos.get("newClientOrderId") or "") != esperado_coid:
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": "client id do payload não é o do despacho admitido"}
+        if str(recebidos.get("type") or "").upper() != str(proposta.get("order_type") or ""):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": "tipo da ordem diverge da proposta"}
+        if str(recebidos.get("side") or "").upper() != str(proposta.get("side") or ""):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": "lado da ordem diverge da proposta"}
+        if not _num_close(recebidos.get("quantity"), proposta.get("qty")):
+            return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                    "reason": "qty do payload não é a admitida"}
+        if str(proposta.get("order_type")) == "LIMIT":
+            if not _num_close(recebidos.get("price"), proposta.get("price")):
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "preço do payload não é o admitido"}
+            tif = proposta.get("time_in_force")
+            if tif and str(recebidos.get("timeInForce") or "") != str(tif):
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "timeInForce diverge da proposta"}
+        else:
+            # MARKET não leva preço nem stop artificiais no POST de entrada
+            # (`stopPrice` já foi recusado por presença acima).
+            if "price" in recebidos:
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "MARKET de entrada não leva price"}
+            if "timeInForce" in recebidos:
+                return {"ok": False, "reason_code": "EXEC_PROPOSAL_TAMPERED",
+                        "reason": "MARKET de entrada não leva timeInForce"}
+        return {"ok": True, "reason_code": "PROPOSAL_MATCHES_PAYLOAD",
+                "dispatch_id": esperado_coid}
+
+    return _exame
+
+
+def _intent_final_authorization(intent, *, dispatch_id_fn=None,
+                                require_proposal: bool = True):
+    """AUTORIZAÇÃO FINAL: só ela libera o POST.
+
+    Roda DEPOIS do throttle e de todos os awaits de preflight/readmissão, numa
+    transação CURTA sob `917283`. Exige lease vivo, dispatch registrado, token
+    igual ao persistido na intenção E igual à geração FINANCEIRA vigente da
+    conta, validação manual não bloqueada e ownership coerente.
+    """
+    async def _autoriza():
+        if not isinstance(intent, dict) or not intent.get("granted"):
+            return {"ok": False, "reason_code": "EXEC_INTENT_GUARD_DENIED"}
+        from services import entry_intent_service as intents
+        from db import get_session
+        dispatch_id = (dispatch_id_fn() if dispatch_id_fn is not None
+                       else intent.get("last_dispatch_id"))
+        veredito = await intents.authorize_dispatch(
+            get_session, intent.get("intent_key"), owner=_INTENT_OWNER,
+            expected_token=intent.get("margin_generation"),
+            dispatch_id=dispatch_id, require_proposal=require_proposal)
+        if not veredito.get("ok"):
+            log.warning("[p03-intent] autorização final negou o envio: "
+                        f"{veredito.get('reason_code')}")
+            return veredito
+        if require_proposal:
+            # A autorização assíncrona ENTREGA o exame síncrono. Só um veredito
+            # positivo produz o validador — negativa nunca é ignorada depois.
+            veredito = {**veredito,
+                        "sync_check": _sync_final_check_for(veredito, intent)}
+        return veredito
+
+    return _autoriza
 
 
 async def _register_intent_dispatch(intent, dispatch_id) -> bool:
@@ -1434,20 +2120,39 @@ def _intent_guarded_preflight(intent, inner, *, dispatch_id_fn):
     poderia ser reconciliado pelo client id.
     """
     async def _guarded(*args, **kwargs):
+        # 1. PREPARAÇÃO: identidade/estado/owner/lease e SENDING.
         if not await _intent_dispatch_guard(intent):
             return {"ok": False, "quality": "UNKNOWN",
                     "reason_code": "EXEC_INTENT_GUARD_DENIED",
                     "reason": "intenção de entrada não autoriza este POST",
                     "checks": {}}
+        # 2. Dispatch EXATO desta tentativa gravado ANTES do POST.
         dispatch_id = dispatch_id_fn()
         if not dispatch_id or not await _register_intent_dispatch(intent, dispatch_id):
             return {"ok": False, "quality": "UNKNOWN",
                     "reason_code": "EXEC_INTENT_DISPATCH_UNRECORDED",
                     "reason": "id efetivo do despacho não pôde ser registrado",
                     "checks": {}}
+        intent["last_dispatch_id"] = dispatch_id
+        # 3. Quote/carteira/gates e readmissão — podem RENOVAR o token.
         if inner is None:
-            return {"ok": True, "quality": "OK", "reason_code": None, "checks": {}}
-        return await inner(*args, **kwargs)
+            resultado = {"ok": True, "quality": "OK", "reason_code": None,
+                         "checks": {}}
+        else:
+            resultado = await inner(*args, **kwargs)
+        aprovado = resultado is True or (isinstance(resultado, dict)
+                                         and resultado.get("ok") is True)
+        if not aprovado:
+            return resultado
+        # 4. AUTORIZAÇÃO FINAL depois do `inner`: token/lease/ownership atuais.
+        veredito = await _intent_final_authorization(intent)()
+        if not veredito.get("ok"):
+            base = resultado if isinstance(resultado, dict) else {}
+            return {**base, "ok": False, "quality": "UNKNOWN",
+                    "reason_code": str(veredito.get("reason_code")
+                                       or "EXEC_FINAL_AUTHORIZATION_DENIED"),
+                    "reason": "autorização final da intenção negou o envio"}
+        return resultado
 
     return _guarded
 
@@ -1514,6 +2219,16 @@ async def _close_entry_intent(intent, trade, *, pending_entry: bool = False) -> 
         return
     await intents.mark_confirmed(get_session, key, real_trade_id=int(trade_id))
     intent["state"] = "CONFIRMED"
+
+
+def _entry_intent_skip_reason(intent: dict) -> str:
+    """Código público específico, sem interpolar erro, objeto ou credencial."""
+    for field in ("reason", "decision"):
+        value = intent.get(field)
+        if (isinstance(value, str) and 0 < len(value) <= 100
+                and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for c in value)):
+            return value
+    return "ENTRY_INTENT_DENIED"
 
 
 def _record_skip(rec: dict, gate: str, reason: str) -> None:
@@ -3293,7 +4008,8 @@ async def _cleanup_trade_conditionals_after_flat(trade, context: str) -> bool:
             if not algo_id:
                 continue
             try:
-                result = await exchange_service.cancel_algo_order(algo_id)
+                result = await exchange_service.cancel_algo_order(
+                    algo_id, symbol=getattr(trade, "symbol", None))
             except Exception as exc:
                 result = {"ok": False, "error": str(exc)}
             if not _cancel_result_is_terminal(result):
@@ -3757,7 +4473,8 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
             oid = getattr(current_trade, oid_field, None)
             if oid:
                 try:
-                    res = await exchange_service.cancel_algo_order(str(oid))
+                    res = await exchange_service.cancel_algo_order(
+                        str(oid), symbol=getattr(current_trade, "symbol", None))
                     if not _cancel_result_is_terminal(res):
                         cancel_failures.append(
                             f"{oid_field}={oid}: {res.get('msg') or res.get('error') or 'incerto'}"
@@ -3845,6 +4562,397 @@ async def _execute_tf_upgrade(current_trade, new_rec: dict, ctx: dict) -> bool:
 # ── Feature 5 helpers: pyramiding + hedge de regime ─────────────────────────
 
 
+async def _market_entry_preflight_checks(*, rec, side, entry, stop, tp1, tp2,
+                                          intent, final_qty, market_rules,
+                                          depth_fn, chase_ceiling, tp1_completed: bool = False):
+    from services import risk_service, kill_switch_service
+    """Depth/runtime guard executado pelo transport antes do POST."""
+    if type(tp1_completed) is not bool or (tp1_completed and tp1 is not None):
+        return {"ok": False, "quality": "UNKNOWN",
+                "reason_code": "EXEC_REVALIDATION_STAGE_INVALID", "checks": {}}
+    if not P04B_MARKET_REVALIDATION_ENABLED:
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_MARKET_REVALIDATION_DISABLED",
+            "reason": "P04B_MARKET_REVALIDATION_ENABLED=false",
+            "checks": {},
+        }
+    if depth_fn is None:
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_DEPTH_UNSUPPORTED",
+            "reason": "exchange ativa não fornece depth de execução",
+            "checks": {},
+        }
+    try:
+        depth = await depth_fn(
+            rec["symbol"],
+            limit=P04B_DEPTH_LIMIT,
+            timeout_s=P04B_DEPTH_TIMEOUT_S,
+        )
+    except Exception as exc:
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_DEPTH_FETCH_ERROR",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "checks": {},
+        }
+    runtime_guard = await _p04a_runtime_recheck(
+        risk_service, kill_switch_service
+    )
+    if runtime_guard.get("ok") is not True:
+        return runtime_guard
+
+    _sig = rec.get("signal") or {}
+    _ind = _sig.get("indicators") if isinstance(_sig, dict) else {}
+    try:
+        _atr = float((_ind or {}).get("atr"))
+    except (TypeError, ValueError):
+        _atr = None
+    from services.entry_revalidation_service import (
+        cap_qty_for_revalidated_entry,
+        estimate_market_depth_fill,
+        evaluate_market_depth_revalidation,
+    )
+    estimate = estimate_market_depth_fill(
+        depth=depth,
+        symbol=rec["symbol"],
+        side=side,
+        qty=final_qty,
+        max_depth_age_ms=P04B_MAX_DEPTH_AGE_MS,
+        max_fetch_latency_ms=P04B_MAX_FETCH_LATENCY_MS,
+    )
+    if estimate.get("ok") is not True:
+        return estimate
+    estimate_checks = estimate.get("checks") or {}
+    capped_qty = cap_qty_for_revalidated_entry(
+        final_qty,
+        entry,
+        stop,
+        estimate_checks.get("worst_price"),
+    )
+    try:
+        step = Decimal(str(market_rules.get("step")))
+        capped_d = Decimal(str(capped_qty))
+        if (
+            not step.is_finite() or step <= 0
+            or not capped_d.is_finite() or capped_d <= 0
+        ):
+            raise InvalidOperation
+        capped_qty = float(
+            (capped_d / step).to_integral_value(
+                rounding=ROUND_FLOOR
+            ) * step
+        )
+        min_qty = float(market_rules.get("min_qty"))
+        max_qty = float(market_rules.get("max_qty"))
+        min_notional = float(market_rules.get("min_notional"))
+    except (InvalidOperation, TypeError, ValueError):
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_MARKET_FILTERS_UNKNOWN",
+            "reason": "filtros MARKET inválidos",
+            "checks": {"market_rules": market_rules},
+        }
+    if not (
+        capped_qty > 0
+        and capped_qty <= final_qty
+        and capped_qty >= min_qty
+        and capped_qty <= max_qty
+        and min_notional > 0
+    ):
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_QTY_REVALIDATION_FAILED",
+            "reason": "qty reduzida viola filtros ou aumentaria exposição",
+            "checks": {
+                **estimate_checks,
+                "planned_qty": final_qty,
+                "capped_qty": capped_qty,
+                "market_rules": market_rules,
+            },
+        }
+    verdict = evaluate_market_depth_revalidation(
+        depth=depth,
+        symbol=rec["symbol"],
+        side=side,
+        qty=capped_qty,
+        planned_entry=entry,
+        stop_loss=stop,
+        tp1=float(tp1) if tp1 is not None else None,
+        tp2=float(tp2) if tp2 is not None else None,
+        atr=_atr,
+        max_depth_age_ms=P04B_MAX_DEPTH_AGE_MS,
+        max_fetch_latency_ms=P04B_MAX_FETCH_LATENCY_MS,
+        max_spread_pct=MAX_SPREAD_PCT,
+        max_book_impact_pct=P04B_MAX_BOOK_IMPACT_PCT,
+        max_adverse_slippage_pct=P04B_MAX_MARKET_SLIPPAGE_PCT,
+        max_chase_atr=chase_ceiling,
+        min_rr_tp1=0.0 if tp1_completed else max(
+            MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
+            MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0,
+        ),
+        min_rr_tp2=(
+            MIN_RR_TP2_EXEC if RR_GATE_ENABLED else 0.0
+        ),
+        entry_zone_low=rec.get("entry_zone_low"),
+        entry_zone_high=rec.get("entry_zone_high"),
+    )
+    checks = verdict.setdefault("checks", {})
+    checks.update({
+        "planned_qty": float(final_qty),
+        "capped_qty": float(capped_qty),
+        "min_notional": min_notional,
+    })
+    if verdict.get("ok") is not True:
+        return verdict
+    _depth_prices = (
+        checks.get("best_executable_price"),
+        checks.get("vwap_price"),
+        checks.get("worst_price"),
+    )
+    # Para MIN_NOTIONAL, o menor preço continua conservador.
+    conservative_price = min(float(v or 0) for v in _depth_prices)
+    checks["conservative_notional"] = (
+        capped_qty * conservative_price
+    )
+    if (
+        conservative_price <= 0
+        or checks["conservative_notional"] < min_notional
+    ):
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": "EXEC_MIN_NOTIONAL_FAILED",
+            "reason": "qty reduzida ficou abaixo do MIN_NOTIONAL",
+            "checks": checks,
+        }
+    # R05B — gate financeiro DEPOIS do depth e ANTES do POST.
+    # Preço conservador aprovado + qty final reduzida. Cada
+    # retry/fallback revalida. Negar ⇒ zero POST.
+    from services import financial_risk_service as _frs
+    _risk_entry = _frs.adverse_market_entry_price(
+        side, _depth_prices)
+    if _risk_entry.get("quality") != "OK":
+        return {
+            "ok": False, "quality": "UNKNOWN",
+            "reason_code": _risk_entry.get("reason_code"),
+            "reason": "preço adverso da MARKET não pôde ser validado",
+            "checks": checks,
+        }
+    checks["financial_risk_entry_price"] = _risk_entry["value"]
+    # Evidência P04B ORIGINAL congelada para o exame SÍNCRONO
+    # pré-assinatura: mesmos payload e limites, avaliador real.
+    checks["p04_evidence"] = {
+        "evaluator": "depth",
+        "order_type": "MARKET",
+        "time_in_force": None,
+        "args": {
+            "depth": depth,
+            "symbol": rec["symbol"],
+            "side": side,
+            "qty": float(capped_qty),
+            "planned_entry": float(entry),
+            "stop_loss": float(stop),
+            "tp1": float(tp1) if tp1 is not None else None,
+            "tp2": float(tp2) if tp2 is not None else None,
+            "atr": _atr,
+            "entry_zone_low": rec.get("entry_zone_low"),
+            "entry_zone_high": rec.get("entry_zone_high"),
+        },
+        "limits": {
+            "max_depth_age_ms": P04B_MAX_DEPTH_AGE_MS,
+            "max_fetch_latency_ms": P04B_MAX_FETCH_LATENCY_MS,
+            "max_spread_pct": MAX_SPREAD_PCT,
+            "max_book_impact_pct": P04B_MAX_BOOK_IMPACT_PCT,
+            "max_adverse_slippage_pct": P04B_MAX_MARKET_SLIPPAGE_PCT,
+            "max_chase_atr": chase_ceiling,
+            "min_rr_tp1": 0.0 if tp1_completed else max(
+                MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
+                MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0),
+            "min_rr_tp2": (MIN_RR_TP2_EXEC if RR_GATE_ENABLED else 0.0),
+            "min_notional": min_notional,
+        },
+    }
+    _fin_gate = await _r05b_entry_gate(
+        side=side, final_entry=_risk_entry["value"], stop=stop,
+        final_qty=capped_qty, checks=checks, intent=intent)
+    if _fin_gate is not None:
+        return _fin_gate
+    verdict["approved_qty"] = float(capped_qty)
+    return verdict
+
+def _pyramid_number(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+async def _pyramid_protection(same_dir, *, level):
+    """Só observa: identidade BOT, exposição fresca e os dois IDs closePosition.
+
+    Reforço não instala outro bracket. Não usar stop/TP1 de uma recomendação
+    nova como se fossem a proteção já existente na corretora.
+    """
+    from services import exchange_service
+    from db import get_session
+    from models.real_trade import RealTrade
+    from sqlalchemy import select
+    started_ms = time.time() * 1000
+    async with get_session() as session:
+        fresh = (await session.execute(
+            select(RealTrade).where(RealTrade.id == same_dir.id)
+        )).scalar_one_or_none()
+        if (fresh is None or fresh.status != "open" or fresh.source != "auto"
+                or fresh.side not in ("long", "short")
+                or fresh.side != same_dir.side or fresh.symbol != same_dir.symbol
+                or fresh.phase != "post_tp1"
+                or int(fresh.pyramiding_level or 0) != level
+                or not _trade_active_exchange_guard(fresh)[0]):
+            return None
+        expected_qty = _pyramid_number(fresh.qty)
+        expected_sl = _pyramid_number(fresh.sl_current_price)
+        entry = _pyramid_number(fresh.entry_price)
+        sl_id, tp_id = str(fresh.sl_order_id or ""), str(fresh.tp2_order_id or "")
+    if None in (expected_qty, expected_sl, entry) or not sl_id or not tp_id:
+        return None
+    positions = await exchange_service.get_positions(same_dir.symbol, force=True)
+    orders = await exchange_service.get_open_algo_orders(same_dir.symbol)
+    if (not isinstance(positions, dict) or positions.get("ok") is not True
+            or positions.get("stale") or positions.get("rate_limited")
+            or positions.get("complete") is False or positions.get("quality") == "UNKNOWN"
+            or not isinstance(positions.get("positions"), list)
+            or not isinstance(orders, dict) or orders.get("ok") is not True
+            or orders.get("stale") or orders.get("rate_limited")
+            or not isinstance(orders.get("orders"), list)
+            or time.time() * 1000 - started_ms > P04B_MAX_DEPTH_AGE_MS):
+        return None
+    matching = [p for p in positions["positions"] if isinstance(p, dict)
+                and _wire_symbol(p.get("symbol")) == _wire_symbol(same_dir.symbol)]
+    if len(matching) != 1:
+        return None
+    position = matching[0]
+    expected_side = "buy" if same_dir.side == "long" else "sell"
+    if (str(position.get("side") or "").lower() != expected_side
+            or position.get("position_side") != "BOTH"
+            or _pyramid_number(position.get("size")) is None
+            or _pyramid_number(position.get("leverage")) is None
+            or not _num_close(position.get("size"), expected_qty)
+            or not _num_close(position.get("leverage"), same_dir.leverage)):
+        return None
+    found = {}
+    for leg, identifier, kind in (("sl", sl_id, "STOP_MARKET"),
+                                  ("tp2", tp_id, "TAKE_PROFIT_MARKET")):
+        candidates = [o for o in orders["orders"] if isinstance(o, dict)
+                      and str(o.get("algo_id") or "") == identifier]
+        if len(candidates) != 1:
+            return None
+        order = candidates[0]
+        trigger = _pyramid_number(order.get("trigger_price"))
+        if (_wire_symbol(order.get("symbol")) != _wire_symbol(same_dir.symbol)
+                or str(order.get("side") or "").lower() == expected_side
+                or str(order.get("side") or "").lower() not in ("buy", "sell")
+                or order.get("type") != kind
+                or str(order.get("status") or "").upper() not in ("NEW", "WORKING")
+                or order.get("close_position") is not True or trigger is None):
+            return None
+        found[leg] = trigger
+    if not _num_close(found["sl"], expected_sl):
+        return None
+    # O winner tem de continuar protegido no BE ou melhor, como a política diz.
+    if (same_dir.side == "long" and found["sl"] < entry
+            or same_dir.side == "short" and found["sl"] > entry):
+        return None
+    return {"stop": found["sl"], "tp2": found["tp2"], "qty": expected_qty,
+            "observed_start_ms": started_ms}
+
+
+async def _pyramid_uncertain(intent, same_dir, reason):
+    """Reforço incerto não é outra entry normal nem autoriza um segundo POST.
+
+    O reconciliador genérico não sabe aplicar qty/level ao trade original.
+    Escalar explicitamente para revisão manual, preservando reserva e SL/TP.
+    """
+    _arm_execution_quarantine(
+        f"pyramid {same_dir.symbol} trade#{same_dir.id}: {reason}")
+    if isinstance(intent, dict) and intent.get("granted"):
+        intent["state"] = "UNKNOWN"
+        try:
+            from db import get_session
+            from services import entry_intent_service as intents
+            await intents.mark_unknown(get_session, intent["intent_key"],
+                                       owner=_INTENT_OWNER, reason=reason)
+        except Exception as exc:  # latch armado antes da falha de persistência
+            log.critical("[pyramid] UNKNOWN não persistido: %s", type(exc).__name__)
+    await _persist_execution_quarantine(
+        f"pyramid {same_dir.symbol} trade#{same_dir.id}: {reason}; reconciliar reforço")
+
+
+async def _pyramid_legacy_caps(same_dir, *, entry, qty, equity):
+    """Mesmos tetos nominais já existentes; reforço não ganha uma isenção.
+
+    São checks conservadores do portfólio registrado. A margem livre e o risco
+    ficam também na admissão serializada oficial, não apenas nesta leitura.
+    """
+    from db import get_session
+    from models.real_trade import RealTrade
+    from sqlalchemy import select
+    async with get_session() as session:
+        rows = (await session.execute(select(
+            RealTrade.id, RealTrade.entry_price, RealTrade.qty, RealTrade.leverage
+        ).where(RealTrade.status == "open", RealTrade.source == "auto"))).mappings().all()
+    total_notional, total_margin, target_margin = 0.0, 0.0, None
+    for row in rows:
+        price = _pyramid_number(row.get("entry_price"))
+        size = _pyramid_number(row.get("qty"))
+        leverage = _pyramid_number(row.get("leverage"))
+        if None in (price, size, leverage):
+            return False
+        notional = price * size
+        total_notional += notional
+        total_margin += notional / leverage
+        if row.get("id") == same_dir.id:
+            target_margin = notional / leverage
+    proposed = _proposed_margin_usd(entry=entry, qty=qty, leverage=same_dir.leverage)
+    if proposed is None or target_margin is None:
+        return False
+    for configured, exposure in (
+        (MAX_MARGIN_PCT_PER_TRADE, target_margin + proposed),
+        (MAX_TOTAL_MARGIN_PCT, total_margin + proposed),
+        (MAX_TOTAL_NOTIONAL_PCT, total_notional + entry * qty),
+    ):
+        if (isinstance(configured, bool) or not isinstance(configured, (int, float))
+                or not math.isfinite(configured) or configured < 0):
+            return False
+        if configured > 0 and exposure > equity * configured / 100:
+            return False
+    return True
+
+
+async def _pyramid_original_timeframe(same_dir):
+    """Timeframe comprovado da recomendação original; ausência NÃO é 'na'.
+
+    RealTrade não contém timeframe. O vínculo é a FK existente, não a nova
+    recomendação que disparou a possibilidade de reforço.
+    """
+    snapshot_id = getattr(same_dir, "recommendation_id", None)
+    if isinstance(snapshot_id, bool) or not isinstance(snapshot_id, int) or snapshot_id <= 0:
+        return None
+    from db import get_session
+    from models.recommendation_snapshot import RecommendationSnapshot
+    from sqlalchemy import select
+    async with get_session() as session:
+        original = (await session.execute(select(RecommendationSnapshot.timeframe)
+                    .where(RecommendationSnapshot.id == snapshot_id))).scalar_one_or_none()
+    if original not in {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h",
+                         "1d", "3d", "1w", "1M"}:
+        return None
+    return original
+
+
 async def _maybe_pyramid(same_dir, rec: dict) -> bool:
     """
     Feature 5 — reforço (pyramiding) de um winner já em breakeven pós-TP1.
@@ -3864,7 +4972,15 @@ async def _maybe_pyramid(same_dir, rec: dict) -> bool:
     Retorna True se reforçou (o caller registra e segue sem abrir duplicata);
     False se não reforçou.
     """
-    if not PYRAMIDING_ENABLED or SHADOW_ENABLED:
+    if (not PYRAMIDING_ENABLED or SHADOW_ENABLED or not DB_ENABLED
+            or not P04B_MARKET_REVALIDATION_ENABLED):
+        return False
+    if (getattr(same_dir, "source", None) != "auto"
+            or getattr(same_dir, "status", None) != "open"
+            or same_dir.side not in ("long", "short")
+            or rec.get("operational_selection") is not None):
+        # A aprovação de uma seleção candidata não autoriza, por omissão,
+        # ampliar um trade legado. O champion continua no caminho existente.
         return False
     if _EXECUTION_QUARANTINE_REASON:
         log.critical(
@@ -3878,6 +4994,8 @@ async def _maybe_pyramid(same_dir, rec: dict) -> bool:
     from models.real_trade import RealTrade
 
     symbol = same_dir.symbol
+    intent = None
+    order_attempted = False
     try:
         # O latch crítico bloqueia qualquer aumento de exposição, inclusive
         # reforços que acontecem antes do gate da entrada normal no fluxo.
@@ -3936,23 +5054,119 @@ async def _maybe_pyramid(same_dir, rec: dict) -> bool:
             return False
 
         # 3. Tamanho do reforço = mult × tamanho ORIGINAL do trade
-        base_qty = float(getattr(same_dir, "qty_initial", None) or same_dir.qty or 0)
+        initial_qty = getattr(same_dir, "qty_initial", None)
+        base_qty = _pyramid_number(initial_qty if initial_qty is not None else same_dir.qty)
+        if base_qty is None or _pyramid_number(PYRAMIDING_SIZE_MULT) is None:
+            return False
         add_qty = base_qty * PYRAMIDING_SIZE_MULT
         if add_qty <= 0:
             return False
 
+        protection = await _pyramid_protection(same_dir, level=level)
+        if protection is None:
+            log.warning("[pyramid] %s proteção/exposição não confirmadas", symbol)
+            return False
+        # Identidade durável POR TRADE/NÍVEL, não por uma recomendação mutável.
+        # A mesma decisão não renasce com o próximo candle/restart.
+        from dataclasses import replace
+        anchor = getattr(same_dir, "created_at", None)
+        if not isinstance(anchor, datetime):
+            return False
+        anchor = anchor if anchor.tzinfo else anchor.replace(tzinfo=timezone.utc)
+        pyramid_rec = {**rec, "symbol": symbol, "direction": same_dir.side,
+                       "leverage": same_dir.leverage,
+                       "data_freshness": {"candle": {"close_time_ms": int(anchor.timestamp() * 1000)}}}
+        identity = _entry_intent_identity(pyramid_rec, same_dir.side,
+                                         purpose="PYRAMID")
+        if identity is None:
+            return False
+        # TF/playbook do reforço não mudam com a nova recomendação.
+        original_timeframe = await _pyramid_original_timeframe(same_dir)
+        if original_timeframe is None:
+            log.warning("[pyramid] %s timeframe original não comprovado", symbol)
+            return False
+        identity = replace(identity, timeframe=original_timeframe,
+                           playbook=f"PYRAMID-{same_dir.id}-{level + 1}",
+                           playbook_version="1")
+        wallet = await exchange_service.get_equity(force=True)
+        if (not isinstance(wallet, dict) or wallet.get("ok") is not True
+                or wallet.get("stale") or wallet.get("rate_limited")
+                or str(wallet.get("quality") or wallet.get("source")) != "live"):
+            return False
+        equity = _pyramid_number(wallet.get("total_usd"))
+        if equity is None or not await _pyramid_legacy_caps(
+                same_dir, entry=mark, qty=add_qty, equity=equity):
+            return False
+        intent = await _reserve_entry_intent(
+            pyramid_rec, side=same_dir.side, entry=mark, stop=protection["stop"],
+            tp1=None, tp2=protection["tp2"], qty=add_qty, equity_usd=equity,
+            identity=identity, consumes_slot=False)
+        if not intent.get("granted"):
+            log.warning("[pyramid] reserva negada: %s", intent.get("reason"))
+            return False
+        dispatch_id = f"cw-pyr-{same_dir.id}-{level + 1}"
+
+        async def pyramid_preflight(final_qty, market_rules):
+            current = await _pyramid_protection(same_dir, level=level)
+            if (current is None or not _num_close(current["stop"], protection["stop"])
+                    or not _num_close(current["tp2"], protection["tp2"])):
+                return {"ok": False, "quality": "UNKNOWN",
+                        "reason_code": "EXEC_PYRAMID_PROTECTION_UNCONFIRMED", "checks": {}}
+            verdict = await _market_entry_preflight_checks(
+                rec=pyramid_rec, side=same_dir.side, entry=mark,
+                stop=protection["stop"], tp1=None, tp2=protection["tp2"],
+                intent=intent, final_qty=final_qty, market_rules=market_rules,
+                depth_fn=getattr(exchange_service, "get_execution_depth", None),
+                chase_ceiling=(P04A_MAX_CHASE_ATR if P04A_MAX_CHASE_ATR is not None
+                               else PROXIMITY_MAX_ATR),
+                tp1_completed=True)
+            if verdict.get("ok") is not True:
+                return verdict
+            # Tetos nominais no preço/qty efetivamente aprovados, não no mark
+            # antigo. Para margem/notional usar o MAIOR preço é conservador
+            # tanto no LONG quanto no SHORT.
+            checks = verdict.get("checks") or {}
+            cap_price = max(checks["best_executable_price"], checks["vwap_price"],
+                            checks["worst_price"])
+            if not await _pyramid_legacy_caps(
+                    same_dir, entry=cap_price, qty=verdict["approved_qty"], equity=equity):
+                return {"ok": False, "quality": "UNKNOWN",
+                        "reason_code": "EXEC_PYRAMID_PORTFOLIO_LIMIT", "checks": checks}
+            return verdict
+
+        async def pyramid_final_authorization():
+            # A readmissão/carteira podem esperar. Reconfirma o trade e sua
+            # proteção DEPOIS desses awaits, antes de entregar o exame P04
+            # síncrono que o transporte roda no instante da assinatura.
+            runtime = await _p04a_runtime_recheck(risk_service, kill_switch_service)
+            current = await _pyramid_protection(same_dir, level=level)
+            if (runtime.get("ok") is not True or current is None
+                    or not _num_close(current["stop"], protection["stop"])
+                    or not _num_close(current["tp2"], protection["tp2"])):
+                return {"ok": False, "reason_code": "EXEC_PYRAMID_FINAL_GUARD_DENIED"}
+            return await _intent_final_authorization(
+                intent, dispatch_id_fn=lambda: dispatch_id)()
+
         # 4. Ordem a mercado na MESMA direção (nets in-place). SEM stop/tp — o
         #    SL@BE e o TP2 (closePosition=true) do trade original cobrem tudo.
         exch_side = "Buy" if is_long else "Sell"
+        order_attempted = True
         order_res = await exchange_service.place_order(
             symbol=symbol,
             side=exch_side,
             qty=add_qty,
             order_type="Market",
             leverage=int(same_dir.leverage or 1),
-            client_order_id=f"cw-pyr-{same_dir.id}-{level + 1}",
+            client_order_id=dispatch_id,
+            entry_preflight=_intent_guarded_preflight(
+                intent, pyramid_preflight, dispatch_id_fn=lambda: dispatch_id),
+            final_authorization=pyramid_final_authorization,
+            candidate_guard=_intent_candidate_guard(intent),
         )
+        await _settle_entry_intent(intent, order_res)
         if not order_res.get("ok"):
+            if intent.get("state") == "UNKNOWN":
+                await _pyramid_uncertain(intent, same_dir, "PYRAMID_DISPATCH_UNKNOWN")
             log.error(
                 f"[pyramid] {symbol} #{same_dir.id} reforço falhou: "
                 f"{order_res.get('msg') or order_res.get('error')}"
@@ -3960,37 +5174,69 @@ async def _maybe_pyramid(same_dir, rec: dict) -> bool:
             return False
 
         result = order_res.get("result") or {}
-        try:
-            fill = float(result.get("avgPrice") or result.get("avgFillPrice") or 0)
-        except Exception:
-            fill = 0.0
+        # ACK e quantidade planejada não provam exposição executada.
+        executed = _pyramid_number(result.get("executedQty"))
+        submitted = _pyramid_number(order_res.get("submitted_qty"))
+        fill = _pyramid_number(result.get("avgPrice")
+                               if result.get("avgPrice") is not None
+                               else result.get("avgFillPrice"))
+        order_id = result.get("orderId")
+        admitted_price = _pyramid_number((intent.get("proposal") or {}).get("reference_price"))
+        admitted_qty = _pyramid_number((intent.get("proposal") or {}).get("qty"))
+        if (order_res.get("entry_confirmed") is not True or executed is None
+                or submitted is None or executed > submitted + 1e-9
+                or submitted > add_qty + 1e-9 or fill is None
+                or isinstance(order_id, bool) or not isinstance(order_id, (int, str))
+                or not str(order_id).strip()
+                or str(result.get("status") or "").upper() not in
+                ("FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH")
+                or (result.get("clientOrderId") is not None
+                    and result["clientOrderId"] != dispatch_id)
+                or admitted_price is None or admitted_qty is None
+                or not _num_close(submitted, admitted_qty)
+                or (is_long and fill > admitted_price + 1e-9)
+                or (not is_long and fill < admitted_price - 1e-9)):
+            await _pyramid_uncertain(intent, same_dir, "PYRAMID_FILL_UNCONFIRMED")
+            return False
 
         # 5. Atualiza DB: qty combinada + level + nota. NÃO altera entry_price.
-        new_qty_combined = float(same_dir.qty or 0) + add_qty
         if DB_ENABLED:
             async with get_session() as session:
                 fresh = (await session.execute(
-                    select(RealTrade).where(RealTrade.id == same_dir.id)
+                    select(RealTrade).where(RealTrade.id == same_dir.id).with_for_update()
                 )).scalar_one_or_none()
-                if fresh is not None:
-                    fresh.qty = new_qty_combined
+                if (fresh is not None and fresh.status == "open" and fresh.source == "auto"
+                        and fresh.side == same_dir.side and fresh.symbol == symbol
+                        and fresh.phase == "post_tp1"
+                        and int(fresh.pyramiding_level or 0) == level
+                        and _num_close(fresh.qty, same_dir.qty)):
+                    fresh.qty = float(fresh.qty) + executed
                     fresh.pyramiding_level = level + 1
-                    tag = (f"pyramid L{level + 1} +{add_qty:g}@{fill or mark:g} "
+                    tag = (f"pyramid L{level + 1} +{executed:g}@{fill or mark:g} "
                            f"({profit_r:.2f}R; R aprox—entry não misturado)")
                     fresh.notes = (fresh.notes + " | " + tag) if fresh.notes else tag
                     fresh.updated_at = datetime.now(timezone.utc)
                     await session.commit()
+                else:
+                    await _pyramid_uncertain(intent, same_dir, "PYRAMID_TRADE_CHANGED_AFTER_FILL")
+                    return False
+        from services import entry_intent_service as intents
+        if not await intents.mark_confirmed(get_session, intent["intent_key"],
+                                             owner=_INTENT_OWNER, real_trade_id=same_dir.id):
+            await _pyramid_uncertain(intent, same_dir, "PYRAMID_LINK_UNCONFIRMED")
+            return False
+        intent["state"] = "CONFIRMED"
 
         log.info(
             f"[pyramid] {symbol} #{same_dir.id} REFORÇADO L{level + 1} "
-            f"+{add_qty:g} (lucro {profit_r:.2f}R); SL@BE/TP2 closePosition cobrem a posição maior"
+            f"+{executed:g} (lucro {profit_r:.2f}R); SL@BE/TP2 closePosition cobrem a posição maior"
         )
         try:
             from services import push_service
             _sym = symbol.split("/")[0]
             await push_service.notify_alert(
                 title=f"🔺 {_sym}: posição reforçada (pyramiding L{level + 1})",
-                body=(f"Winner a +{profit_r:.2f}R reforçado com +{add_qty:g}. "
+                body=(f"Winner a +{profit_r:.2f}R reforçado com +{executed:g}. "
                       f"SL segue no BE cobrindo a posição inteira."),
                 tag=f"pyr-{same_dir.id}-{level + 1}",
             )
@@ -3998,6 +5244,10 @@ async def _maybe_pyramid(same_dir, rec: dict) -> bool:
             pass
         return True
     except Exception as e:
+        if order_attempted:
+            await _pyramid_uncertain(intent, same_dir, "PYRAMID_EXECUTION_OR_PERSISTENCE_FAILED")
+        elif isinstance(intent, dict) and intent.get("granted"):
+            await _close_entry_intent(intent, None)
         log.error(
             f"[pyramid] erro reforçando #{getattr(same_dir, 'id', '?')} {symbol}: {e}",
             exc_info=True,
@@ -5872,7 +7122,7 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         f"[p03-intent] {rec.get('symbol')} SEM entrada: "
                         f"{_intent.get('decision')} ({_intent.get('reason')})"
                     )
-                    _record_skip(rec, "entry-intent", str(_intent.get("decision")))
+                    _record_skip(rec, "entry-intent", _entry_intent_skip_reason(_intent))
                     continue
                 client_order_id = _intent["client_order_id"]
                 # #4: entrada MAKER (post-only) quando ligada E o helper existe na
@@ -5892,184 +7142,10 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                 async def _market_entry_preflight(
                     final_qty: float, market_rules: dict
                 ) -> dict:
-                    """Depth/runtime guard executado pelo transport antes do POST."""
-                    if not P04B_MARKET_REVALIDATION_ENABLED:
-                        return {
-                            "ok": False, "quality": "UNKNOWN",
-                            "reason_code": "EXEC_MARKET_REVALIDATION_DISABLED",
-                            "reason": "P04B_MARKET_REVALIDATION_ENABLED=false",
-                            "checks": {},
-                        }
-                    if _depth_fn is None:
-                        return {
-                            "ok": False, "quality": "UNKNOWN",
-                            "reason_code": "EXEC_DEPTH_UNSUPPORTED",
-                            "reason": "exchange ativa não fornece depth de execução",
-                            "checks": {},
-                        }
-                    try:
-                        depth = await _depth_fn(
-                            rec["symbol"],
-                            limit=P04B_DEPTH_LIMIT,
-                            timeout_s=P04B_DEPTH_TIMEOUT_S,
-                        )
-                    except Exception as exc:
-                        return {
-                            "ok": False, "quality": "UNKNOWN",
-                            "reason_code": "EXEC_DEPTH_FETCH_ERROR",
-                            "reason": f"{type(exc).__name__}: {exc}",
-                            "checks": {},
-                        }
-                    runtime_guard = await _p04a_runtime_recheck(
-                        risk_service, kill_switch_service
-                    )
-                    if runtime_guard.get("ok") is not True:
-                        return runtime_guard
-
-                    _sig = rec.get("signal") or {}
-                    _ind = _sig.get("indicators") if isinstance(_sig, dict) else {}
-                    try:
-                        _atr = float((_ind or {}).get("atr"))
-                    except (TypeError, ValueError):
-                        _atr = None
-                    from services.entry_revalidation_service import (
-                        cap_qty_for_revalidated_entry,
-                        estimate_market_depth_fill,
-                        evaluate_market_depth_revalidation,
-                    )
-                    estimate = estimate_market_depth_fill(
-                        depth=depth,
-                        symbol=rec["symbol"],
-                        side=side,
-                        qty=final_qty,
-                        max_depth_age_ms=P04B_MAX_DEPTH_AGE_MS,
-                        max_fetch_latency_ms=P04B_MAX_FETCH_LATENCY_MS,
-                    )
-                    if estimate.get("ok") is not True:
-                        return estimate
-                    estimate_checks = estimate.get("checks") or {}
-                    capped_qty = cap_qty_for_revalidated_entry(
-                        final_qty,
-                        entry,
-                        stop,
-                        estimate_checks.get("worst_price"),
-                    )
-                    try:
-                        step = Decimal(str(market_rules.get("step")))
-                        capped_d = Decimal(str(capped_qty))
-                        if (
-                            not step.is_finite() or step <= 0
-                            or not capped_d.is_finite() or capped_d <= 0
-                        ):
-                            raise InvalidOperation
-                        capped_qty = float(
-                            (capped_d / step).to_integral_value(
-                                rounding=ROUND_FLOOR
-                            ) * step
-                        )
-                        min_qty = float(market_rules.get("min_qty"))
-                        max_qty = float(market_rules.get("max_qty"))
-                        min_notional = float(market_rules.get("min_notional"))
-                    except (InvalidOperation, TypeError, ValueError):
-                        return {
-                            "ok": False, "quality": "UNKNOWN",
-                            "reason_code": "EXEC_MARKET_FILTERS_UNKNOWN",
-                            "reason": "filtros MARKET inválidos",
-                            "checks": {"market_rules": market_rules},
-                        }
-                    if not (
-                        capped_qty > 0
-                        and capped_qty <= final_qty
-                        and capped_qty >= min_qty
-                        and capped_qty <= max_qty
-                        and min_notional > 0
-                    ):
-                        return {
-                            "ok": False, "quality": "UNKNOWN",
-                            "reason_code": "EXEC_QTY_REVALIDATION_FAILED",
-                            "reason": "qty reduzida viola filtros ou aumentaria exposição",
-                            "checks": {
-                                **estimate_checks,
-                                "planned_qty": final_qty,
-                                "capped_qty": capped_qty,
-                                "market_rules": market_rules,
-                            },
-                        }
-                    verdict = evaluate_market_depth_revalidation(
-                        depth=depth,
-                        symbol=rec["symbol"],
-                        side=side,
-                        qty=capped_qty,
-                        planned_entry=entry,
-                        stop_loss=stop,
-                        tp1=float(tp1) if tp1 is not None else None,
-                        tp2=float(tp2) if tp2 is not None else None,
-                        atr=_atr,
-                        max_depth_age_ms=P04B_MAX_DEPTH_AGE_MS,
-                        max_fetch_latency_ms=P04B_MAX_FETCH_LATENCY_MS,
-                        max_spread_pct=MAX_SPREAD_PCT,
-                        max_book_impact_pct=P04B_MAX_BOOK_IMPACT_PCT,
-                        max_adverse_slippage_pct=P04B_MAX_MARKET_SLIPPAGE_PCT,
-                        max_chase_atr=_p04a_chase_ceiling,
-                        min_rr_tp1=max(
-                            MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
-                            MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0,
-                        ),
-                        min_rr_tp2=(
-                            MIN_RR_TP2_EXEC if RR_GATE_ENABLED else 0.0
-                        ),
-                        entry_zone_low=rec.get("entry_zone_low"),
-                        entry_zone_high=rec.get("entry_zone_high"),
-                    )
-                    checks = verdict.setdefault("checks", {})
-                    checks.update({
-                        "planned_qty": float(final_qty),
-                        "capped_qty": float(capped_qty),
-                        "min_notional": min_notional,
-                    })
-                    if verdict.get("ok") is not True:
-                        return verdict
-                    _depth_prices = (
-                        checks.get("best_executable_price"),
-                        checks.get("vwap_price"),
-                        checks.get("worst_price"),
-                    )
-                    # Para MIN_NOTIONAL, o menor preço continua conservador.
-                    conservative_price = min(float(v or 0) for v in _depth_prices)
-                    checks["conservative_notional"] = (
-                        capped_qty * conservative_price
-                    )
-                    if (
-                        conservative_price <= 0
-                        or checks["conservative_notional"] < min_notional
-                    ):
-                        return {
-                            "ok": False, "quality": "UNKNOWN",
-                            "reason_code": "EXEC_MIN_NOTIONAL_FAILED",
-                            "reason": "qty reduzida ficou abaixo do MIN_NOTIONAL",
-                            "checks": checks,
-                        }
-                    # R05B — gate financeiro DEPOIS do depth e ANTES do POST.
-                    # Preço conservador aprovado + qty final reduzida. Cada
-                    # retry/fallback revalida. Negar ⇒ zero POST.
-                    from services import financial_risk_service as _frs
-                    _risk_entry = _frs.adverse_market_entry_price(
-                        side, _depth_prices)
-                    if _risk_entry.get("quality") != "OK":
-                        return {
-                            "ok": False, "quality": "UNKNOWN",
-                            "reason_code": _risk_entry.get("reason_code"),
-                            "reason": "preço adverso da MARKET não pôde ser validado",
-                            "checks": checks,
-                        }
-                    checks["financial_risk_entry_price"] = _risk_entry["value"]
-                    _fin_gate = await _r05b_entry_gate(
-                        side=side, final_entry=_risk_entry["value"], stop=stop,
-                        final_qty=capped_qty, checks=checks, intent=_intent)
-                    if _fin_gate is not None:
-                        return _fin_gate
-                    verdict["approved_qty"] = float(capped_qty)
-                    return verdict
+                    return await _market_entry_preflight_checks(
+                        rec=rec, side=side, entry=entry, stop=stop, tp1=tp1, tp2=tp2,
+                        intent=_intent, final_qty=final_qty, market_rules=market_rules,
+                        depth_fn=_depth_fn, chase_ceiling=_p04a_chase_ceiling)
 
                 from services.entry_revalidation_service import select_entry_route
                 _entry_route = select_entry_route(
@@ -6176,6 +7252,38 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             # R05B — gate financeiro DEPOIS das validações
                             # puras e ANTES do POST, com a LIMIT final e a qty
                             # final. Negar ⇒ zero POST, zero entry.
+                            # Evidência P04A ORIGINAL congelada (quote + limites)
+                            # para o exame SÍNCRONO imediatamente antes do POST.
+                            checks["p04_evidence"] = {
+                                "evaluator": "quote",
+                                "order_type": "LIMIT",
+                                "time_in_force": "GTX",
+                                "args": {
+                                    "quote": quote,
+                                    "symbol": rec["symbol"],
+                                    "side": side,
+                                    "planned_entry": float(entry),
+                                    "stop_loss": float(stop),
+                                    "tp1": float(tp1) if tp1 is not None else None,
+                                    "tp2": float(tp2) if tp2 is not None else None,
+                                    "atr": _atr,
+                                    "maker_limit_price": float(final_limit_price),
+                                    "entry_zone_low": rec.get("entry_zone_low"),
+                                    "entry_zone_high": rec.get("entry_zone_high"),
+                                },
+                                "limits": {
+                                    "max_quote_age_ms": P04A_MAX_QUOTE_AGE_MS,
+                                    "max_fetch_latency_ms": P04A_MAX_FETCH_LATENCY_MS,
+                                    "max_spread_pct": MAX_SPREAD_PCT,
+                                    "max_chase_atr": _p04a_chase_ceiling,
+                                    "min_rr_tp1": max(
+                                        MIN_RR_TP1_FILL if FILL_RR_GATE_ENABLED else 0.0,
+                                        MIN_RR_TP1_EXEC if RR_GATE_ENABLED else 0.0),
+                                    "min_rr_tp2": (MIN_RR_TP2_EXEC if RR_GATE_ENABLED else 0.0),
+                                    "max_adverse_slippage_pct": P04A_MAX_ADVERSE_SLIPPAGE_PCT,
+                                    "enforce_adverse_slippage": True,
+                                },
+                            }
                             _fin_gate = await _r05b_entry_gate(
                                 side=side, final_entry=final_limit_price,
                                 stop=stop, final_qty=capped_qty, checks=checks,
@@ -6213,6 +7321,11 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                         market_preflight=_intent_guarded_preflight(
                             _intent, _market_entry_preflight,
                             dispatch_id_fn=lambda: _market_fallback_coid(client_order_id)),
+                        # Autorização FINAL interna, também na filha `-mfb`.
+                        final_authorization=_intent_final_authorization(_intent),
+                        # Guard da autoridade candidata: alavancagem, retry e
+                        # fallback MARKET passam por ele. Legado recebe None.
+                        candidate_guard=_intent_candidate_guard(_intent),
                     )
                     if isinstance(order_res, dict) and order_res.get("ok"):
                         log.info(
@@ -6251,9 +7364,15 @@ async def open_shadow_for_recs(recs: list[dict]) -> int:
                             tp1_qty_pct=_open_tp1_pct,
                             leverage=int(rec.get("leverage") or 1),
                             client_order_id=client_order_id,
+                            # Autorização FINAL interna: roda depois do await
+                            # de ownership, imediatamente antes de assinar.
+                            final_authorization=_intent_final_authorization(
+                                _intent, dispatch_id_fn=lambda: client_order_id),
                             entry_preflight=_intent_guarded_preflight(
                                 _intent, _market_entry_preflight,
                                 dispatch_id_fn=lambda: client_order_id),
+                            **({"candidate_guard": _intent_candidate_guard(_intent)}
+                               if _intent.get("operational_selection") is not None else {}),
                         )
                 _exec_mark(_exec_trace, "attempt_returned_at")
                 _observe_transport(rec, order_res)

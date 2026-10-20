@@ -22,8 +22,9 @@ import math
 import numbers
 import os
 import time
+from contextvars import ContextVar
 from typing import List, NamedTuple, Optional, Dict, Any, Tuple
-from pydantic import BaseModel
+from pydantic import BaseModel, model_serializer
 
 from services.binance_service import fetch_top_volume_symbols, fetch_ohlcv, fetch_ticker
 from services.indicator_service import calculate_indicators
@@ -31,7 +32,7 @@ from services.pattern_service import detect_all_patterns, record_breakouts_and_r
 from services.signal_service import build_trade_signal, determine_direction
 from services.derivatives_service import analyze_derivatives
 from services.mtf_service import analyze_mtf
-from services.data_freshness_service import prepare_closed_candles
+from services.data_freshness_service import prepare_closed_candles, timeframe_ms
 from services import score_trace_service as _score_trace_service
 from models.trade_signal import TradeSignal, SignalDirection
 
@@ -48,6 +49,44 @@ class _FailSoftScoreTrace:
 
 
 _score_trace = _FailSoftScoreTrace()
+_PRE_CAPTURE = ContextVar('r13_pre_capture', default=False)
+
+
+def _capture_research_inputs(sig, df):
+    """Inputs locais da última vela FECHADA; nunca consulta mercado novamente."""
+    try:
+        last = df.iloc[-1]
+        candle = (sig.data_freshness or {}).get('candle') or {}
+        if (candle.get('quality') != 'FRESH' or candle.get('symbol') != sig.symbol
+                or candle.get('timeframe') != sig.timeframe):
+            return
+        values = {name: float(last[name]) for name in ('open', 'high', 'low', 'close')}
+        if not all(math.isfinite(x) and x > 0 for x in values.values()):
+            return
+        if not values['low'] <= min(values['open'], values['close']) <= max(values['open'], values['close']) <= values['high']:
+            return
+        from services.pattern_service import _pattern_key_level
+        refs = set()
+        for pattern in getattr(sig, 'patterns', ()) or ():
+            if pattern.direction != sig.direction or not (pattern.breakout_confirmed or pattern.retest_active):
+                continue
+            points = pattern.points or []
+            times = [int(p.timestamp * 1000 if p.timestamp < 100_000_000_000 else p.timestamp) for p in points]
+            if not times or max(times) >= candle.get('open_time_ms', 0):
+                continue
+            level = _finite_num(_pattern_key_level(pattern))
+            if level is not None and level > 0:
+                refs.add((level, max(times)))
+        reference = next(iter(refs)) if len(refs) == 1 else (None, None)
+        # Atributo interno não serializado pelo modelo: observar não muda o
+        # payload público/freshness usado pelo champion e pelo executor.
+        object.__setattr__(sig, '_r13_research_inputs', {
+            'version': 'R13_POINT_IN_TIME_FEATURES_V1', **values,
+            'trigger_reference': reference[0], 'trigger_reference_ms': reference[1],
+            'candle_close_ms': candle.get('close_time_ms'),
+            'observed_at_ms': candle.get('observed_at_ms'), 'quality': 'FRESH'})
+    except Exception:
+        pass   # observabilidade não altera o champion
 
 
 SCAN_TFS = ["15m", "1h", "4h"]   # TFs varridos por símbolo
@@ -451,6 +490,15 @@ class Recommendation(BaseModel):
     # bloqueiam a autoexecução. CALIBRATION_UNAVAILABLE é calibração imatura —
     # NÃO é incompatibilidade e preserva o comportamento operacional anterior.
     probability_provenance: Optional[dict] = None
+    # Contexto CANDIDATE governado separado do score/tier/risco legados.
+    operational_selection: Optional[dict] = None
+
+    @model_serializer(mode='wrap')
+    def _serialize_operational_selection(self, handler):
+        value = handler(self)
+        if self.operational_selection is None:
+            value.pop('operational_selection', None)
+        return value
 
 
 _cache: Dict[str, Any] = {"ts": 0, "data": None}
@@ -2478,21 +2526,42 @@ async def _analyze_symbol_tf_server(svc, symbol: str, tf: str) -> Optional[Trade
             derivatives=derivatives, mtf=mtf, with_backtest=False,
         )
         _attach_data_freshness(sig, freshness)
+        if _PRE_CAPTURE.get():
+            _capture_research_inputs(sig, df)
         return sig
     except Exception:
         return None
 
 
-async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
-    results = list(await asyncio.gather(*[
-        _analyze_symbol_tf_server(svc, symbol, tf) for tf in SCAN_TFS
-    ]))
+async def _best_tf_for_symbol_server(svc, symbol: str,
+                                     evaluated_out: Optional[list] = None,
+                                     candidate_authority: Optional[dict] = None) -> Optional[tuple]:
+    """Melhor TF do símbolo — e, opcionalmente, TODOS os avaliados.
+
+    `evaluated_out` recebe a lista `(sig, score)` dos candidatos EFETIVAMENTE
+    avaliados, montada ANTES do `max(scored)`. A escolha do vencedor e o
+    desempate do champion não mudam: a lista é um espelho, não um critério.
+    Quando o chamador não pede a lista (coleta desligada), nada extra é feito.
+    """
+    token = _PRE_CAPTURE.set(True) if evaluated_out is not None or candidate_authority is not None else None
+    try:
+        results = list(await asyncio.gather(*[
+            _analyze_symbol_tf_server(svc, symbol, tf) for tf in SCAN_TFS
+        ]))
+    finally:
+        if token is not None:
+            _PRE_CAPTURE.reset(token)
     # TFs altos (gated): avaliados com cache TTL + peso de relevância.
     if HIGH_TF_PATTERNS_ENABLED:
-        results += list(await asyncio.gather(*[
-            _htf_signal_cached(symbol, tf, lambda tf=tf: _analyze_symbol_tf_server(svc, symbol, tf))
-            for tf in HIGH_TF_LIST
-        ]))
+        token = _PRE_CAPTURE.set(True) if evaluated_out is not None or candidate_authority is not None else None
+        try:
+            results += list(await asyncio.gather(*[
+                _htf_signal_cached(symbol, tf, lambda tf=tf: _analyze_symbol_tf_server(svc, symbol, tf))
+                for tf in HIGH_TF_LIST
+            ]))
+        finally:
+            if token is not None:
+                _PRE_CAPTURE.reset(token)
     confirm_dirs = _htf_confirm_dirs(results) if (HIGH_TF_PATTERNS_ENABLED and HIGH_TF_CONFIRM_ENABLED) else set()
     scored: List[tuple] = []
     for sig in results:
@@ -2500,6 +2569,9 @@ async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
             continue
         score = _score_with_htf_confirm(sig, _compute_score(sig), confirm_dirs)
         scored.append((sig, score))
+    if evaluated_out is not None:
+        # Candidatos AVALIADOS do símbolo, capturados ANTES do max(scored).
+        evaluated_out.extend(scored)
     if not scored:
         return None
     # Tendência de topo por MOEDA via EMA dos TFs JÁ varridos (custo zero de rede):
@@ -2526,6 +2598,25 @@ async def _best_tf_for_symbol_server(svc, symbol: str) -> Optional[tuple]:
             _score_trace.record_signal_stage(item[0], "selection_score", value=item[1],
                                             input_score=item[1], penalty=0.0, status="UNAVAILABLE")
             return item[1]
+    if candidate_authority is not None:
+        # Mesmos ALL-TFs e mesmos inputs locais L02, ANTES de escolher um TF.
+        # Nunca reaproveita seleção/tier V2 como se fossem pontuação V3.
+        from services import live_candidate_adapter_service as adapter
+        valid = []
+        for sig, legacy_score in scored:
+            _sel_key((sig, legacy_score))  # trace do caminho legado, não gate V3
+            decision = adapter.candidate_decision(candidate_authority,
+                features=_preselection_features(sig, legacy_score), symbol=sig.symbol,
+                side=_enum_value(sig.direction), timeframe=sig.timeframe,
+                entry=sig.entry, stop_loss=sig.stop_loss, tp1=sig.tp1, tp2=sig.tp2)
+            if decision.get('ok') is True:
+                object.__setattr__(sig, '_r13_candidate_context', decision['context'])
+                valid.append((sig, legacy_score, decision['score']))
+        # Empate estável usa a ordem original dos TFs, congelada no runtime.
+        if not valid:
+            return None
+        winner = max(valid, key=lambda item: item[2])
+        return winner[0], winner[1]
     return max(scored, key=_sel_key)
 
 
@@ -2569,7 +2660,131 @@ def _indicator_field(indicators, name: str):
     return getattr(indicators, name, None)
 
 
-def _preselection_candidate(sig, score, *, stages, accepted: bool) -> Optional[dict]:
+def _preselection_features(sig, score, *, selection_score=None,
+                           score_before_learning=None, tier=None,
+                           tier_provisional=None, regime=None) -> dict:
+    """Features PONTO-NO-TEMPO do candidato, só do que o scanner já tinha.
+
+    Nada é recalculado com dado futuro e nada é inferido do NOME do padrão:
+    indicador ausente fica `None`. Esta é a decomposição que a comparação de
+    SELEÇÃO consome depois — por isso ela é capturada, não reconstruída.
+    """
+    indicadores = getattr(sig, "indicators", None)
+    mtf = getattr(sig, "mtf", None)
+    risco = None
+    entrada = _finite_num(getattr(sig, "entry", None))
+    stop = _finite_num(getattr(sig, "stop_loss", None))
+    if entrada is not None and stop is not None:
+        risco = abs(entrada - stop) or None
+    def _rr(alvo):
+        valor = _finite_num(getattr(sig, alvo, None))
+        if valor is None or risco is None or entrada is None:
+            return None
+        return abs(valor - entrada) / risco
+    trace = _score_trace_service.freeze_trace(getattr(sig, 'r08_score_trace', None))
+    stages = trace.get('stages') or {}
+    atr = _finite_num(_indicator_field(indicadores, 'atr'))
+    side = _enum_value(getattr(sig, 'direction', None))
+    fresh = getattr(sig, 'data_freshness', None) or {}
+    fresh = fresh if isinstance(fresh, dict) else {}
+    candle = fresh.get('candle') or {}
+    inputs = getattr(sig, '_r13_research_inputs', None) or {}
+    inputs = inputs if isinstance(inputs, dict) else {}
+    close_ms = _finite_num(candle.get('close_time_ms'))
+    observed = _finite_num(inputs.get('observed_at_ms'))
+    valid_inputs = (inputs.get('version') == 'R13_POINT_IN_TIME_FEATURES_V1'
+                    and inputs.get('quality') == 'FRESH'
+                    and candle.get('quality') == 'FRESH'
+                    and candle.get('symbol') == getattr(sig, 'symbol', None)
+                    and candle.get('timeframe') == getattr(sig, 'timeframe', None)
+                    and close_ms is not None and inputs.get('candle_close_ms') == close_ms
+                    and observed is not None and close_ms <= observed <= int(time.time() * 1000))
+    period = timeframe_ms(getattr(sig, 'timeframe', ''))
+    valid_inputs = valid_inputs and period is not None and int(time.time() * 1000) - close_ms <= period * P04C_MAX_CANDLE_LAG_PERIODS
+    ohlc = {key: _finite_num(inputs.get(key)) for key in ('open', 'high', 'low', 'close')}
+    valid_inputs = valid_inputs and all(value is not None and value > 0 for value in ohlc.values())
+    valid_inputs = valid_inputs and ohlc['low'] <= min(ohlc['open'], ohlc['close']) <= max(ohlc['open'], ohlc['close']) <= ohlc['high']
+    pivot = _finite_num(_indicator_field(indicadores, 'pivot_low' if side == 'long' else 'pivot_high'))
+    # Definição prospectiva V1: suporte estrutural observado e geometria de
+    # invalidação. Não estima edge nem infere estrutura de nome de padrão.
+    structural = valid_inputs and atr is not None and atr > 0 and pivot is not None and pivot > 0 and side in ('long', 'short')
+    quality = None
+    target = _finite_num(getattr(sig, 'tp2', None))
+    if structural and entrada is not None and stop is not None and target is not None:
+        quality = float(stop < pivot < entrada < target if side == 'long' else stop > pivot > entrada > target)
+    body = follow = None
+    if valid_inputs and atr is not None and atr > 0 and side in ('long', 'short'):
+        span = ohlc['high'] - ohlc['low']
+        body = abs(ohlc['close'] - ohlc['open']) / span if span > 0 else None
+        reference = _finite_num(inputs.get('trigger_reference'))
+        reference_ms = _finite_num(inputs.get('trigger_reference_ms'))
+        open_ms = _finite_num(candle.get('open_time_ms'))
+        if reference is not None and reference > 0 and reference_ms is not None and open_ms is not None and reference_ms < open_ms:
+            follow = max(0.0, (ohlc['close'] - reference) * (1 if side == 'long' else -1)) / atr
+    higher = (mtf or {}).get('higher_tfs') if isinstance(mtf, dict) else None
+    valid_htf = {}
+    conflicted_htf = set()
+    for item in higher if isinstance(higher, list) else ():
+        if not isinstance(item, dict):
+            continue
+        proof = (item.get('data_freshness') or {}).get('candle') or {}
+        tf = str(item.get('timeframe') or '')
+        close = _finite_num(proof.get('close_time_ms'))
+        seen = _finite_num(proof.get('observed_at_ms'))
+        label = item.get('ema_aligned')
+        htf_period = timeframe_ms(tf)
+        if (_TF_RANK.get(tf, 0) > _TF_RANK.get(getattr(sig, 'timeframe', ''), 0)
+                and proof.get('quality') == 'FRESH' and close is not None
+                and proof.get('symbol') == getattr(sig, 'symbol', None)
+                and proof.get('timeframe') == tf
+                and seen is not None and close <= seen <= int(time.time() * 1000)
+                and htf_period is not None and int(time.time() * 1000) - close <= htf_period * P04C_MAX_CANDLE_LAG_PERIODS
+                and label in ('bullish', 'bearish', 'mixed')):
+            if tf in conflicted_htf:
+                continue
+            if tf in valid_htf and valid_htf[tf] != label:
+                conflicted_htf.add(tf)
+                valid_htf.pop(tf)
+            else:
+                valid_htf[tf] = label
+    ratio = (sum(label == ('bullish' if side == 'long' else 'bearish') for label in valid_htf.values()) / len(valid_htf)
+             if valid_htf and side in ('long', 'short') else None)
+    market = _finite_num(getattr(sig, 'current_price', None))
+    return {
+        "atr": _finite_num(_indicator_field(indicadores, "atr")),
+        "adx": _finite_num(_indicator_field(indicadores, "adx")),
+        "rsi": _finite_num(_indicator_field(indicadores, "rsi")),
+        "ema_fast": _finite_num(_indicator_field(indicadores, "ema12")),
+        "ema_slow": _finite_num(_indicator_field(indicadores, "ema26")),
+        "volume_ratio": _finite_num(_indicator_field(indicadores, "volume_ratio")),
+        "spread_pct": _finite_num(getattr(sig, "spread_pct", None)),
+        "funding_pct": _finite_num(((getattr(sig, "derivatives", None) or {}) or {}).get(
+            "funding_rate_pct") if isinstance(getattr(sig, "derivatives", None), dict) else None),
+        "rr_tp1": _rr("tp1"), "rr_tp2": _rr("tp2"),
+        "entry_distance_atr": abs(market - entrada) / atr if valid_inputs and market is not None and entrada is not None and atr is not None and atr > 0 else None,
+        "score": _finite_num(score),
+        "score_before_learning": _finite_num(score_before_learning),
+        "selection_score": _finite_num(selection_score if selection_score is not None else (stages.get('selection_score') or {}).get('value')),
+        "regime": (regime or {}).get("regime") if isinstance(regime, dict) else None,
+        "regime_source": "regime_service" if isinstance(regime, dict) else None,
+        "structure": _enum_value(getattr(sig, "trade_type", None)),
+        "mtf_alignment": (mtf or {}).get("alignment") if isinstance(mtf, dict) else None,
+        "htf_alignment_ratio": ratio,
+        "structure_quality": quality,
+        "level_distance_atr": abs(entrada - pivot) / atr if structural and entrada is not None else None,
+        "trigger_body_ratio": body,
+        "trigger_follow_through_atr": follow,
+        "tier": tier, "tier_provisional": tier_provisional,
+        "quality": _enum_value(getattr(sig, "confidence", None)) and None,
+        "data_source": ((getattr(sig, "data_freshness", None) or {}) or {}).get("source")
+        if isinstance(getattr(sig, "data_freshness", None), dict) else None,
+    }
+
+
+def _preselection_candidate(sig, score, *, stages, accepted: bool,
+                            features: Optional[dict] = None,
+                            evaluation: Optional[dict] = None,
+                            shadow: Optional[dict] = None) -> Optional[dict]:
     """Monta a linha de observação de UM candidato do scan.
 
     Só campos ponto-no-tempo que o núcleo/score/replay precisam depois; nada é
@@ -2587,12 +2802,13 @@ def _preselection_candidate(sig, score, *, stages, accepted: bool) -> Optional[d
         side = side if side in ("long", "short") else None
         # `TradeSignal.indicators` é `Indicator` (modelo), não dict. Exigir dict
         # perderia o ATR real; nada é fabricado quando ele não existe.
+        trace = _score_trace_service.freeze_trace(getattr(sig, 'r08_score_trace', None))
         setup = {
             "symbol": str(getattr(sig, "symbol", "") or ""),
             "timeframe": str(getattr(sig, "timeframe", "") or ""),
             "side": side,
             "playbook": "CHAMPION_LEGACY",
-            "playbook_version": "SCORE_V2",
+            "playbook_version": trace.get('formula_effective') or 'UNKNOWN_FORMULA',
             "trigger_candle_ms": int(trigger) if isinstance(trigger, (int, float)) else None,
             "entry": _finite_num(getattr(sig, "entry", None)),
             "stop_loss": _finite_num(getattr(sig, "stop_loss", None)),
@@ -2600,7 +2816,7 @@ def _preselection_candidate(sig, score, *, stages, accepted: bool) -> Optional[d
             "tp2": _finite_num(getattr(sig, "tp2", None)),
             "atr": _finite_num(_indicator_field(getattr(sig, "indicators", None), "atr")),
         }
-        return {
+        linha = {
             "setup": setup, "stages": stages, "accepted": accepted,
             "decision_ts_ms": int(time.time() * 1000),
             "availability": {"score": score is not None,
@@ -2608,12 +2824,59 @@ def _preselection_candidate(sig, score, *, stages, accepted: bool) -> Optional[d
                              "depth": False},
             "source": {"decision_source": "server_scan", "resolution": setup["timeframe"]},
         }
+        if features:
+            linha["features"] = features
+        if evaluation:
+            linha["evaluation"] = evaluation
+        linha['score_trace'] = trace
+        linha['config'] = {'score_trace_version': trace.get('version'),
+                           'formula_requested': trace.get('formula_requested'),
+                           'formula_effective': trace.get('formula_effective'),
+                           'score': trace.get('config') or {},
+                           'decision_scope': 'FINAL_SCANNER_SELECTION'}
+        linha['feature_evidence'] = {
+            'version': 'R13_POINT_IN_TIME_FEATURES_V1',
+            'observed_at_ms': (candle or {}).get('observed_at_ms'),
+            'candle_close_ms': trigger,
+            'quality': (candle or {}).get('quality') or 'UNKNOWN',
+            'missing_reasons': {name: 'POINT_IN_TIME_INPUT_UNAVAILABLE' for name in
+                ('htf_alignment_ratio', 'structure_quality', 'level_distance_atr',
+                 'trigger_body_ratio', 'trigger_follow_through_atr', 'entry_distance_atr')
+                if (features or {}).get(name) is None}}
+        if getattr(sig, '_r13_candidate_context', None) is not None:
+            linha['config']['observed_operational_selector'] = 'CANDIDATE'
+            linha['config']['decision_scope'] = 'CANDIDATE_SCANNER_SELECTION'
+            linha['observed_decision_scope'] = 'CANDIDATE_SCANNER_SELECTION'
+        else:
+            linha['observed_decision_scope'] = 'FINAL_SCANNER_SELECTION'
+        # Decisão candidata OBSERVACIONAL: escopo PRÓPRIO (CANDIDATE_SHADOW), ao
+        # lado da decisão do champion — nunca no campo que descreve a decisão
+        # final/LIVE desta linha e nunca no campo operacional que autoriza
+        # intenção. O timeframe observado tem de ser o DESTA linha.
+        if isinstance(shadow, dict) and shadow.get('timeframe') == setup['timeframe']:
+            linha['shadow_decision'] = shadow
+        if hasattr(sig, '_r13_research_inputs'):
+            object.__delattr__(sig, '_r13_research_inputs')
+        return linha
     except Exception:
         return None
 
 
 def _stage(name: str, verdict: str, reason: Optional[str] = None) -> dict:
     return {"stage": name, "verdict": verdict, "reason_code": reason}
+
+
+def _preselection_gate() -> tuple:
+    """Gate da observação pré-seleção: (ligado?, módulo) — lido UMA vez.
+
+    Fail-closed: qualquer problema ao importar/ler o modo devolve DESLIGADO, e
+    o scanner segue exatamente como antes.
+    """
+    try:
+        from services import preselection_observation_service as pre
+        return bool(pre.collection_enabled()), pre
+    except Exception:
+        return False, None
 
 
 async def get_recommendations_via_vision(
@@ -2634,6 +2897,192 @@ async def get_recommendations_via_vision(
     svc, source_name = _get_server_data_source()
     _log.info(f"[server-scan] fonte: {source_name}")
 
+    # ── R09 pré-seleção: o GATE é lido UMA vez, ANTES de qualquer trabalho novo.
+    #    Desligado, nada aqui constrói linha observacional, calcula score de
+    #    pesquisa, acessa book ou acrescenta consulta/gravação — e a lista de
+    #    recomendações é bit a bit a mesma de antes.
+    _pre_on, _pre_mod = _preselection_gate()
+    # LEGACY e OFF são no-op ABSOLUTO (paridade): não importam autoridade, não
+    # abrem sessão e não mudam a lista. Só o pedido explícito de CANDIDATE (ou
+    # um seletor inválido) consulta a governança — e, sem autoridade válida, a
+    # entrada nova é BLOQUEADA em vez de cair permissivamente no champion.
+    from services import live_candidate_adapter_service as _candidate_adapter
+    _candidate_view = None
+    if _candidate_adapter.selected_mode() not in _candidate_adapter.PARITY_MODES:
+        from db import get_session
+        _view = await _candidate_adapter.load_operational_view(get_session)
+        if not _candidate_adapter.candidate_mode_active(_view):
+            _log.warning('[candidate] autoridade indisponível (%s): nenhuma '
+                         'entrada nova', (_view or {}).get('reason_code'))
+            return []
+        _candidate_view = _view
+    # Decisão candidata OBSERVACIONAL (escopo CANDIDATE_SHADOW): existe só com a
+    # coleta LIGADA e aprovação de propósito SHADOW válida. Não exige promoção,
+    # ELIGIBLE nem CANARY, roda com o seletor operacional em LEGACY/OFF, não
+    # altera a lista/ordem/valores do champion e NUNCA vira autoridade de ordem
+    # (o propósito SHADOW é recusado no caminho que autoriza intenção).
+    _shadow_authority = None
+    if _pre_on:
+        from db import get_session as _get_session_shadow
+        _shadow_authority = await _candidate_adapter.load_shadow_authority(
+            _get_session_shadow)
+    _pre_rows: List[dict] = []
+    _pre_for_rec: Dict[int, dict] = {}
+    _pre_admitted = 0
+    _pre_refused = 0
+    _pre_coverage: Dict[str, int] = {}
+    _cycle_ts_ms = int(time.time() * 1000)
+
+    def _pre_note(reason: str, count: int = 1) -> None:
+        if _pre_on and reason:
+            _pre_coverage[reason] = _pre_coverage.get(reason, 0) + count
+
+    def _pre_flush(symbols_requested: int, symbols_evaluated: int,
+                   state: Optional[str] = None) -> None:
+        """Fecha a cobertura do ciclo (motivo de NÃO avaliar), sem oportunidade."""
+        if not _pre_on or _pre_mod is None:
+            return
+        try:
+            payload = _pre_mod.cycle_coverage(
+                cycle_ts_ms=_cycle_ts_ms, symbols_requested=symbols_requested,
+                symbols_evaluated=symbols_evaluated,
+                candidates_observed=_pre_admitted, candidates_seen=len(_pre_rows),
+                candidates_refused=_pre_refused, reasons=_pre_coverage,
+                state=state or (_pre_mod.COVERAGE_COMPLETE if not _pre_coverage
+                                else _pre_mod.COVERAGE_INCOMPLETE))
+            _pre_mod.record_cycle_coverage(payload)
+        except Exception as exc:    # cobertura nunca altera a decisão
+            _log.debug(f"[r09-pre] cobertura indisponível: {exc}")
+
+    def _pre_publish() -> None:
+        """Entrega as linhas observadas ao acervo existente (no-op se desligado)."""
+        if not _pre_on or not _pre_rows:
+            return
+        nonlocal _pre_admitted, _pre_refused
+        try:
+            from services import decision_observation_service as _r09obs
+            for start in range(0, len(_pre_rows), _pre_mod.MAX_BATCH_RECORDS):
+                batch = _pre_rows[start:start + _pre_mod.MAX_BATCH_RECORDS]
+                result = _r09obs.observe_preselection(batch)
+                admitted = int(result.get('accepted', 0)) + int(result.get('vetoed', 0))
+                _pre_admitted += admitted
+                _pre_refused += len(batch) - admitted
+            if _pre_refused:
+                _pre_note(_pre_mod.COVERAGE_BUDGET, _pre_refused)
+        except Exception as exc:   # observação nunca altera a decisão
+            _pre_refused = max(_pre_refused, len(_pre_rows) - _pre_admitted)
+            _pre_note(_pre_mod.COVERAGE_SOURCE_FAILURE, _pre_refused or 1)
+            _log.debug(f"[r09-pre] observação indisponível: {exc}")
+
+    def _observe_pre(sig_obj, score_value, stages, *, accepted: bool,
+                     features: Optional[dict] = None,
+                     evaluation: Optional[dict] = None,
+                     shadow: Optional[dict] = None) -> None:
+        # Desligado: nem a linha é construída (nenhum trabalho novo no ciclo).
+        if not _pre_on:
+            return
+        row = _preselection_candidate(sig_obj, score_value, stages=stages,
+                                      accepted=accepted, features=features,
+                                      evaluation=evaluation, shadow=shadow)
+        if row is not None:
+            _pre_rows.append(row)
+        return row
+
+    def _evaluation_block(avaliados, escolhido, sig_obj) -> dict:
+        """TFs avaliados × TF escolhido, do próprio símbolo."""
+        tfs = [str(getattr(item[0], "timeframe", "") or "") for item in (avaliados or ())]
+        eleito = (str(getattr(escolhido[0], "timeframe", "") or "")
+                  if escolhido else None)
+        atual = str(getattr(sig_obj, "timeframe", "") or "")
+        return {"evaluated_timeframes": [tf for tf in tfs if tf],
+                "selected_timeframe": eleito or None,
+                "is_selected_timeframe": bool(eleito) and atual == eleito}
+
+    def _shadow_group_for(avaliados, *, regime=None):
+        """Decisão observacional da candidata sobre o grupo ALL-TF do símbolo.
+
+        Roda a MESMA função de decisão do caminho operacional (núcleo puro
+        compartilhado, não uma cópia "equivalente"), sobre os MESMOS TFs que o
+        champion avaliou e ANTES da escolha dele. Sem autoridade SHADOW ou sem
+        coleta, devolve `None` — e nada novo é calculado no ciclo.
+        """
+        if not _pre_on or _shadow_authority is None or not avaliados:
+            return None
+        try:
+            entradas = [{"features": _preselection_features(sig_obj, score_value,
+                                                            regime=regime),
+                         "symbol": getattr(sig_obj, "symbol", None),
+                         "side": _enum_value(getattr(sig_obj, "direction", None)),
+                         "timeframe": getattr(sig_obj, "timeframe", None),
+                         "entry": getattr(sig_obj, "entry", None),
+                         "stop_loss": getattr(sig_obj, "stop_loss", None),
+                         "tp1": getattr(sig_obj, "tp1", None),
+                         "tp2": getattr(sig_obj, "tp2", None)}
+                        for sig_obj, score_value in avaliados or ()]
+            resultado = _candidate_adapter.shadow_group_decision(
+                _shadow_authority, entradas)
+            return resultado.get("group") if resultado.get("ok") else None
+        except Exception as exc:    # pesquisa nunca altera a decisão do bot
+            _log.debug(f"[candidate-shadow] grupo indisponível: {exc}")
+            return None
+
+    def _shadow_for(grupo, sig_obj):
+        """Decisão observacional DESTE TF, no estágio exato comparado."""
+        if grupo is None:
+            return None
+        try:
+            return _candidate_adapter.shadow_decision_for_timeframe(
+                grupo, str(getattr(sig_obj, "timeframe", "") or ""))
+        except Exception:
+            return None
+
+    def _observe_losers(avaliados, escolhido, *, regime=None,
+                        shadow_group=None) -> None:
+        """TFs avaliados que NÃO venceram a escolha de melhor TF do símbolo.
+
+        A escolha do best é um gate real: aqui ela aparece como SELECTION
+        rejeitada. Os gates que não rodaram para esses TFs ficam de fora — o
+        registrador os marca NOT_EVALUATED, nunca PASSED.
+        """
+        vencedor = escolhido[0] if escolhido else None
+        for sig_obj, score_value in avaliados or ():
+            if sig_obj is vencedor:
+                continue
+            _observe_pre(sig_obj, score_value, [
+                _stage("CANDIDATE", "PASSED"),
+                _stage("PLAYBOOK", "PASSED"),
+                _stage("CANDLE", "PASSED" if (getattr(sig_obj, "data_freshness", None) or {})
+                       else "UNKNOWN", None if (getattr(sig_obj, "data_freshness", None) or {})
+                       else "FRESHNESS_UNAVAILABLE"),
+                _stage("SELECTION", "REJECTED", "TIMEFRAME_NOT_SELECTED")],
+                accepted=False,
+                features=_preselection_features(sig_obj, score_value, regime=regime),
+                evaluation=_evaluation_block(avaliados, escolhido, sig_obj),
+                shadow=_shadow_for(shadow_group, sig_obj))
+
+    def _observe_evaluated(resultados, *, regime=None, veto_stage: str,
+                           veto_reason: str) -> None:
+        """Todos os candidatos avaliados vetados por um gate que rodou de fato.
+
+        Usado quando o ciclo termina ANTES do laço de seleção (veto macro): a
+        decisão registrada é a que o mercado permitiu avaliar — nada é inventado
+        para símbolo que nem chegou a ser varrido.
+        """
+        for _sym, best, avaliados in resultados or ():
+            grupo_shadow = _shadow_group_for(avaliados, regime=regime)
+            for sig_obj, score_value in avaliados or ():
+                _observe_pre(sig_obj, score_value, [
+                    _stage("CANDIDATE", "PASSED"),
+                    _stage("PLAYBOOK", "PASSED"),
+                    _stage("CANDLE", "PASSED" if (getattr(sig_obj, "data_freshness", None) or {})
+                           else "UNKNOWN", None if (getattr(sig_obj, "data_freshness", None) or {})
+                           else "FRESHNESS_UNAVAILABLE"),
+                    _stage(veto_stage, "REJECTED", veto_reason)],
+                    accepted=False,
+                    features=_preselection_features(sig_obj, score_value, regime=regime),
+                    evaluation=_evaluation_block(avaliados, best, sig_obj),
+                    shadow=_shadow_for(grupo_shadow, sig_obj))
+
     # News blackout: pula scan inteiro durante janela de evento high-impact.
     # Economiza chamadas pra exchange E evita push notifications no pior
     # momento possível (FOMC/CPI/NFP estopam setups técnicos).
@@ -2646,6 +3095,10 @@ async def get_recommendations_via_vision(
                 f"({blackout.get('country')}) — skip scan. "
                 f"Retoma em {blackout.get('minutes_until_resume')}min."
             )
+            # Nada foi avaliado: cobertura declara o motivo, sem oportunidade.
+            if _pre_on and _pre_mod is not None:
+                _pre_note(_pre_mod.COVERAGE_BLACKOUT)
+                _pre_flush(0, 0, state=_pre_mod.COVERAGE_INCOMPLETE)
             return []
     except Exception as e:
         _log.warning(f"[server-scan] news check falhou (fail-open): {e}")
@@ -2671,7 +3124,11 @@ async def get_recommendations_via_vision(
             symbols = []
 
     if not symbols:
+        if _pre_on and _pre_mod is not None:
+            _pre_note(_pre_mod.COVERAGE_NO_SYMBOLS)
+            _pre_flush(0, 0, state=_pre_mod.COVERAGE_FAILED)
         return []
+    _pre_requested = len(symbols)
 
     # Pré-filtro do denylist: descarta junk antes da análise (economia de CPU/HTTP).
     # A garantia real está no _classify_tier; isto é só otimização.
@@ -2681,6 +3138,9 @@ async def get_recommendations_via_vision(
         if len(symbols) != _before:
             _log.info(f"[server-scan] denylist removeu {_before - len(symbols)} símbolo(s)")
         if not symbols:
+            if _pre_on and _pre_mod is not None:
+                _pre_note(_pre_mod.COVERAGE_NO_SYMBOLS)
+                _pre_flush(_pre_requested, 0, state=_pre_mod.COVERAGE_INCOMPLETE)
             return []
 
     recommendations: List[Recommendation] = []
@@ -2702,34 +3162,49 @@ async def get_recommendations_via_vision(
                 pass
 
     async def _bounded(sym: str):
+        # Lista dos TFs avaliados — só existe quando a observação está ligada.
+        avaliados: Optional[list] = [] if _pre_on else None
         async with sem:
             # (A) Estourou o orçamento? Pula sem tocar o proxy (libera a fila rápido).
             if _deadline is not None and time.monotonic() > _deadline:
                 _stats["skipped_budget"] += 1
-                return sym, None
+                _pre_note(_pre_mod.COVERAGE_BUDGET if _pre_mod else "")
+                return sym, None, avaliados
             # Teto por-símbolo: se o fetch travar (proxy lento), PULA o símbolo e
             # libera o slot do semáforo na hora.
             try:
                 if SERVER_SCAN_SYMBOL_TIMEOUT_S > 0:
+                    kwargs = {'evaluated_out': avaliados}
+                    if _candidate_view is not None:
+                        kwargs['candidate_authority'] = _candidate_view
                     best = await asyncio.wait_for(
-                        _best_tf_for_symbol_server(svc, sym),
+                        _best_tf_for_symbol_server(svc, sym, **kwargs),
                         timeout=SERVER_SCAN_SYMBOL_TIMEOUT_S,
                     )
                 else:
-                    best = await _best_tf_for_symbol_server(svc, sym)
+                    kwargs = {'evaluated_out': avaliados}
+                    if _candidate_view is not None:
+                        kwargs['candidate_authority'] = _candidate_view
+                    best = await _best_tf_for_symbol_server(svc, sym, **kwargs)
             except asyncio.TimeoutError:
                 _stats["fail"] += 1
                 _log.warning(f"[server-scan] {sym} passou de {SERVER_SCAN_SYMBOL_TIMEOUT_S}s — pulado (slot liberado)")
+                _pre_note(_pre_mod.COVERAGE_SYMBOL_TIMEOUT if _pre_mod else "")
                 _hb()
-                return sym, None
+                # Timeout: o que foi avaliado ANTES do corte não é descartado,
+                # mas também não inventa decisão para o que não rodou.
+                return sym, None, avaliados
             except Exception as e:
                 _stats["fail"] += 1
                 _log.warning(f"[server-scan] {sym} falhou ({e}) — pulado")
+                _pre_note(_pre_mod.COVERAGE_SOURCE_FAILURE if _pre_mod else "")
                 _hb()
-                return sym, None
+                return sym, None, avaliados
             _stats["done"] += 1
+            if best is None:
+                _pre_note(_pre_mod.COVERAGE_NO_CANDIDATE if _pre_mod else "")
             _hb()
-            return sym, best
+            return sym, best, avaliados
 
     all_results = await asyncio.gather(*[_bounded(s) for s in symbols])
 
@@ -2759,6 +3234,18 @@ async def get_recommendations_via_vision(
 
     if regime.get("block_all"):
         _log.info(f"[server-scan] regime {regime.get('regime')} — skip: {regime.get('reasons')}")
+        # Nenhuma recomendação, mas os candidatos EXISTIAM e foram vetados pelo
+        # macro: cada um entra como VETOED com o gate que realmente rodou. As
+        # etapas posteriores ficam NOT_EVALUATED (não rodaram de fato).
+        if _pre_on:
+            _observe_evaluated(all_results, regime=regime,
+                              veto_stage="MTF_REGIME",
+                              veto_reason="REGIME_BLOCK_ALL")
+            _pre_note(_pre_mod.COVERAGE_MACRO_BLOCK if _pre_mod else "",
+                      count=len(_pre_rows) or 1)
+            _pre_publish()
+            _pre_flush(_pre_requested, _stats["done"],
+                       state=_pre_mod.COVERAGE_INCOMPLETE if _pre_mod else None)
         return []
 
     # Cooldown por símbolo (6h pós-stop/expire)
@@ -2777,17 +3264,22 @@ async def get_recommendations_via_vision(
     except Exception as e:
         _log.warning(f"[learning] auto-adjust falhou (fail-open): {e}")
 
-    _pre_rows: List[dict] = []
-
-    def _observe_pre(sig_obj, score_value, stages, *, accepted: bool) -> None:
-        row = _preselection_candidate(sig_obj, score_value, stages=stages, accepted=accepted)
-        if row is not None:
-            _pre_rows.append(row)
-
-    for _symbol, best in all_results:
+    for _symbol, best, _evaluated in all_results:
         if best is None:
             continue
         sig, score = best
+        # Os TFs AVALIADOS que não viraram best são observados aqui: a escolha
+        # do melhor TF é um gate real, então eles saem como vetados nessa etapa
+        # e o que vem depois fica NOT_EVALUATED (não rodou para eles).
+        # A decisão observacional da candidata é calculada UMA vez por símbolo,
+        # sobre os MESMOS TFs avaliados e ANTES da escolha do champion — e é a
+        # mesma para o TF vencedor e para os perdedores (estágio comparado).
+        _pre_shadow_group = (_shadow_group_for(_evaluated, regime=regime)
+                             if _pre_on else None)
+        _pre_shadow = _shadow_for(_pre_shadow_group, sig)
+        if _pre_on and _evaluated:
+            _observe_losers(_evaluated, best, regime=regime,
+                            shadow_group=_pre_shadow_group)
         # Etapas comuns a qualquer desfecho deste candidato, na ordem REAL.
         _pre_stages = [
             _stage("CANDIDATE", "PASSED"),
@@ -2797,6 +3289,18 @@ async def get_recommendations_via_vision(
                    else "FRESHNESS_UNAVAILABLE"),
         ]
         tier_prov = _classify_tier_vision(sig, score)
+        _pre_eval = _evaluation_block(_evaluated, best, sig) if _pre_on else None
+
+        _score_bruto = score          # antes de qualquer ajuste de learning
+
+        def _pre_feat(tier_atual=None, score_atual=None):
+            """Features do instante — só montadas quando a coleta está ligada."""
+            if not _pre_on:
+                return None
+            return _preselection_features(
+                sig, score if score_atual is None else score_atual,
+                score_before_learning=_score_bruto, tier=tier_atual,
+                tier_provisional=tier_prov, regime=regime)
 
         # Auto-learning: bloqueia bucket catastrófico + ajusta score
         _record_learning_trace(sig, score, score, auto_adj, status="NOT_APPLIED")
@@ -2808,6 +3312,12 @@ async def get_recommendations_via_vision(
                 if adj_res.get("blocked"):
                     _record_learning_trace(sig, learning_input_score, None, auto_adj, adj_res, status="BLOCKED")
                     _log.info(f"[server-scan][learning] BLOCK {sig.symbol}: {adj_res.get('block_reason')}")
+                    # Gate do auto-learning rodou de fato: vira veto observado.
+                    _observe_pre(sig, score, _pre_stages + [
+                        _stage("SELECTION", "REJECTED",
+                               str(adj_res.get("block_reason") or "LEARNING_BUCKET_BLOCK"))],
+                        accepted=False, features=_pre_feat(),
+                        evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
                 if adj_res.get("multiplier", 1.0) != 1.0:
                     score = adj_res["score"]
@@ -2824,12 +3334,14 @@ async def get_recommendations_via_vision(
         tier = _classify_tier_vision(sig, score)
         if tier is None:
             _observe_pre(sig, score, _pre_stages + [
-                _stage("SELECTION", "REJECTED", "TIER_BELOW_MINIMUM")], accepted=False)
+                _stage("SELECTION", "REJECTED", "TIER_BELOW_MINIMUM")], accepted=False,
+                features=_pre_feat(), evaluation=_pre_eval, shadow=_pre_shadow)
             continue
         if sig.symbol in cooldown_symbols:
             _log.info(f"[server-scan] cooldown skip {sig.symbol}")
             _observe_pre(sig, score, _pre_stages + [
-                _stage("SELECTION", "REJECTED", "SYMBOL_COOLDOWN")], accepted=False)
+                _stage("SELECTION", "REJECTED", "SYMBOL_COOLDOWN")], accepted=False,
+                features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
             continue
         # Regime filter
         try:
@@ -2839,7 +3351,8 @@ async def get_recommendations_via_vision(
                 _log.info(f"[server-scan] skip {sig.symbol} {sig.direction}: {block_reason}")
                 _observe_pre(sig, score, _pre_stages + [
                     _stage("SELECTION", "PASSED"),
-                    _stage("MTF_REGIME", "REJECTED", "REGIME_BLOCK")], accepted=False)
+                    _stage("MTF_REGIME", "REJECTED", "REGIME_BLOCK")], accepted=False,
+                    features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                 continue
             if regime.get("downgrade_alt_longs") and sig.direction == "long" and not is_btc_symbol(sig.symbol):
                 if tier == "A+":
@@ -2847,6 +3360,8 @@ async def get_recommendations_via_vision(
                 elif tier == "A":
                     tier = "B"
                 elif tier == "B":
+                    _observe_pre(sig, score, _pre_stages + [_stage('MTF_REGIME', 'REJECTED', 'ALT_LONG_DOWNGRADE_BELOW_TIER')],
+                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
             # Trava simétrica: downgrade de SHORT contra pernada forte de alta
             if regime.get("downgrade_shorts") and sig.direction == "short":
@@ -2855,6 +3370,8 @@ async def get_recommendations_via_vision(
                 elif tier == "A":
                     tier = "B"
                 elif tier == "B":
+                    _observe_pre(sig, score, _pre_stages + [_stage('MTF_REGIME', 'REJECTED', 'SHORT_DOWNGRADE_BELOW_TIER')],
+                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
             # Trava de CONTRA-TENDÊNCIA por MOEDA (higher-TF EMA do próprio ativo).
             # Mesmo gate do caminho batch — pega short em alt subindo sozinha, que
@@ -2865,33 +3382,37 @@ async def get_recommendations_via_vision(
                     _log.info(f"[server-scan][ct-brake] BLOCK {sig.symbol} {sig.direction}: {ct_reason}")
                     _observe_pre(sig, score, _pre_stages + [
                         _stage("SELECTION", "PASSED"),
-                        _stage("MTF_REGIME", "REJECTED", "COUNTER_TREND_BRAKE")], accepted=False)
+                        _stage("MTF_REGIME", "REJECTED", "COUNTER_TREND_BRAKE")], accepted=False,
+                        features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
                 if tier == "A+":
                     tier = "A"
                 elif tier == "A":
                     tier = "B"
                 elif tier == "B":
+                    _observe_pre(sig, score, _pre_stages + [_stage('MTF_REGIME', 'REJECTED', 'COUNTER_TREND_DOWNGRADE_BELOW_TIER')],
+                                 accepted=False, features=_pre_feat(tier), evaluation=_pre_eval, shadow=_pre_shadow)
                     continue
                 _log.info(f"[server-scan][ct-brake] downgrade {sig.symbol} {sig.direction}→{tier}: {ct_reason}")
         except Exception:
             pass
         _rec = _build_recommendation(sig, score, tier)
-        _observe_pre(sig, score, _pre_stages + [
+        _pre_row = _observe_pre(sig, score, _pre_stages + [
             _stage("SELECTION", "PASSED"),
             _stage("MTF_REGIME", "PASSED"),
             _stage("GEOMETRY_RR", "PASSED" if _rec is not None else "REJECTED",
                    None if _rec is not None else "GEOMETRY_UNAVAILABLE")],
-            accepted=_rec is not None)
+            accepted=_rec is not None, features=_pre_feat(tier),
+            evaluation=_pre_eval, shadow=_pre_shadow)
         if _rec is not None:
+            if _candidate_view is not None:
+                context = getattr(sig, '_r13_candidate_context', None)
+                if context is None:
+                    continue  # nunca cai para LEGACY em modo CANDIDATE
+                _rec.operational_selection = _candidate_adapter.freeze_context(context)
             recommendations.append(_rec)
-
-    # Observação PRÉ-seleção (no-op quando o modo está desligado).
-    try:
-        from services import decision_observation_service as _r09obs
-        _r09obs.observe_preselection(_pre_rows)
-    except Exception as exc:   # observação nunca altera a decisão
-        _log.debug(f"[r09-pre] observação indisponível: {exc}")
+            if _pre_row is not None:
+                _pre_for_rec[id(_rec)] = _pre_row
 
     # BTC correlation throttle (idem batch)
     _apply_btc_correlation_throttle(recommendations, regime)
@@ -2902,6 +3423,14 @@ async def get_recommendations_via_vision(
     # Portfolio risk guard (#5) — pulável pro caminho de display amplo (decouple).
     if apply_guard:
         recommendations = await _apply_portfolio_guard(recommendations)
+    if _pre_on:
+        selected = {id(rec) for rec in recommendations}
+        for rec_id, row in _pre_for_rec.items():
+            row['accepted'] = rec_id in selected
+            if rec_id not in selected:
+                row['stages'].append(_stage('RISK', 'REJECTED', 'PORTFOLIO_GUARD'))
+        _pre_publish()
+        _pre_flush(_pre_requested, _stats['done'])
     return recommendations
 
 

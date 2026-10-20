@@ -119,7 +119,7 @@ export default function SweepPanel({ onClose }: Props) {
   const finished = !!status?.finished_at
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-start justify-center p-2 sm:p-4 overflow-y-auto">
+    <div className="app-overlay fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-start justify-center p-2 sm:p-4 overflow-y-auto">
       <div className="w-full max-w-3xl bg-[#0a0e1a] border border-slate-700 rounded-xl my-4">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-slate-800">

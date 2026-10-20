@@ -494,7 +494,7 @@ export default function DailyPnLPanel({ onClose, focus, onSelectSymbol }: Props)
       `${list.length} trade(s) resolvido(s) · vencedores + perdedores`
 
     return (
-      <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
+      <div className="app-overlay fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
         <div className="w-full max-w-3xl max-h-[92vh] bg-[#0a0e1a] border border-slate-700 rounded-xl flex flex-col overflow-hidden shadow-2xl">
           <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-gradient-to-r from-slate-900 to-slate-800">
             <button onClick={() => setDrill(null)} className="flex items-center gap-1.5 text-xs text-slate-300 hover:text-white transition-colors">
@@ -880,7 +880,7 @@ export default function DailyPnLPanel({ onClose, focus, onSelectSymbol }: Props)
   }
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
+    <div className="app-overlay fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
       <div className="w-full max-w-5xl max-h-[92vh] bg-[#0a0e1a] border border-slate-700 rounded-xl flex flex-col overflow-hidden shadow-2xl">
 
         {/* Header — responsivo: 1 linha desktop, 2 linhas mobile (título+X em cima, controles embaixo) */}

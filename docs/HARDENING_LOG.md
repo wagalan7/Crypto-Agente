@@ -2214,3 +2214,973 @@ coluna, ENV, flag, endpoint, scheduler ou fila nova; C intocado.
   A suíte completa anterior não foi repetida para esta alteração de empacotamento.
 - Sem mudança de flags, limites ou schema neste hotfix; validação final de
   migrações, boot e saúde depende da nova publicação, não só do status Railway.
+
+## Convivência manual/bot na mesma conta (30/09/2026, baseline `8565903e`)
+
+Decisão do usuário: reconhecer explicitamente uma posição aberta MANUALMENTE e
+deixar o bot operar OUTROS símbolos pelos próprios limites, sem consumir o
+orçamento nominal do bot com ela. Contrato, runbook e limites em
+`docs/MANUAL_BOT_COEXISTENCE.md`. Nada foi ligado, nenhuma ordem emitida,
+nenhuma pausa real liberada.
+
+- **Identidade da posição não existia.** `get_positions` descartava
+  `positionSide` e `updateTime` — sem eles nenhum reconhecimento seria
+  revalidável depois. Agora os dois campos são preservados ADITIVAMENTE (ausente
+  vira `None`, nunca `BOTH` nem relógio local) e o fingerprint determinístico
+  cobre conta, mercado, símbolo/quote, lado, perna, qty, entrada e versão
+  temporal, com decimais canônicos. Mark price e P&L ficam FORA: oscilação não
+  exige novo reconhecimento. Limitação declarada: a Binance não expõe id de
+  posição, então `updateTime` prova alteração, não continuidade.
+- **O manager escolhia a PRIMEIRA posição do símbolo.** Um trade long do bot
+  lia a perna short de 9 unidades do operador e agiria sobre ela. Agora
+  `_fetch_exchange_position` exige lado/perna compatíveis e trata pernas
+  ambíguas como leitura INCERTA — que os chamadores já tratam sem mutar nada.
+- **Não havia autorização de propriedade antes de mutar.** `set_leverage` já
+  alteraria a posição manual antes de qualquer POST. O guard único
+  (`manual_position_service.ownership_guard`) foi composto na BORDA DO
+  TRANSPORTE — `set_leverage`, `place_order`, maker, proteção, `cancel_order` e
+  `cancel_algo_order` — e roda de novo no preflight final, depois do throttle,
+  inclusive em retry e no fallback MARKET. Registro ilegível, símbolo
+  reconhecido e símbolo desconhecido com reconhecimento ativo BLOQUEIAM. O guard
+  não faz I/O de exchange (ele roda dentro de locks da própria requisição).
+- **Não havia gate de margem REAL.** Duas admissões podiam reservar o mesmo
+  saldo livre. Agora `MarginGate` + `entry_intents.reserved_margin_usd` entram
+  no snapshot ÚNICO de admissão, sob a MESMA advisory lock `917283`; a carteira
+  é lida fora da transação e a IDADE dela é validada dentro; ausência vira
+  `FREE_MARGIN_UNKNOWN` e carteira velha vira `FREE_MARGIN_STALE`. A margem
+  final é readmitida antes do dispatch. Nenhuma fórmula, limite, default ou
+  alavancagem foi alterada, e `available_usd` não é "devolvido" pela manual.
+- **Reconhecimento**: tabela nova `manual_position_acks`, SEPARADA de
+  `RealTrade` (para o trade manager não assumir a gestão), com índice parcial
+  único por conta/mercado/símbolo ativo e histórico preservado. Dois endpoints
+  administrativos com `_check_admin_token` e schema estrito (`confirm` booleano
+  LITERAL); nada de `resolve`/`clear-pause`/`enable-live`/`execute` e sem UI.
+  A confirmação relê a posição fresca, confere o fingerprint e, sob a lock da
+  admissão, exige ausência de `RealTrade` BOT/`managed`, de intenção pendente
+  (ou tocada após a leitura), de incidente conflitante e de condicional do bot —
+  listagem indisponível é prova INCONCLUSIVA e bloqueia. Registro e vínculo com
+  a causa `UNTRACKED_POSITION` nascem no MESMO commit.
+- **Reconciliação**: estado terminal novo `MANUAL_ACKNOWLEDGED`, exclusivo do
+  incidente `UNTRACKED_POSITION` da posição manual comprovada — posição aberta
+  nunca vira `FLAT`/`PROTECTED`, e ele NÃO entra em `_TERMINAL_SAFE` (não prova
+  desfecho de ordem do bot nem liquida intenção). O boot revalida os
+  reconhecimentos contra a leitura fresca antes de considerar o scan seguro;
+  identidade divergente invalida e reabre a contenção; a liberação continua pelo
+  P03 owner-aware. Fechamento só encerra o registro depois de provar ausência
+  fresca de ordens do operador — que nunca são canceladas. Conflito com adoção
+  `managed` é recusado explicitamente.
+- **Coortes**: a posição manual não é `RealTrade`, então já não entrava em slot,
+  risco, notional, P&L diário, streak ou contagem diária; `managed` e demais
+  fontes ficaram intactas e `auto` encerrada manualmente continua automática.
+- **Testes:** suíte completa **2.413 executados, 2.411 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada, não fabricada). Harness PG novo
+  `pg_integration_manual_coexistence.py` com **104 verificações** (duas
+  execuções verdes), incluindo migração idempotente, índice parcial, ack
+  idempotente, reconhecimento × reserva concorrente nos DOIS sentidos, duas
+  confirmações simultâneas, invalidação por identidade, restart, disputa de
+  margem com barreira e transição reserva→dispatch. Regressões PG:
+  `pg_integration_p03_conflict.py` 66 e `pg_integration_r05_clock.py` 10.
+  Novo `tests/test_manual_bot_coexistence.py` com 31 testes. `py_compile` e
+  `git diff --check` aprovados; nenhum TS/TSX alterado; cluster encerrado.
+- **Fora do escopo, sem mudança:** estratégia, score, calibração, tier, filtros,
+  stop/TP automático, sizing, limites, universo, alavancagem e flags existentes.
+  Nada foi ativado. Não se declara ausência de bugs.
+
+## Correção integrada da convivência manual/bot (30/09/2026, baseline `69fd090a`)
+
+Sete defeitos da revisão `docs/REVISAO_69fd090a_MANUAL_BOT.md` corrigidos juntos.
+Os testes foram escritos ANTES (falhando na baseline) e viraram permanentes;
+nenhum serviço foi revertido para medir RED. Contrato de negócio inalterado:
+manual reconhecida fica fora do orçamento NOMINAL do bot, mas usa saldo/margem da
+MESMA conta — não há isolamento financeiro nem garantia de novas entradas.
+
+- **T1 — leitura parcial não prova ausência global.** `_manual_ack_outcome`
+  passava uma consulta FILTRADA de um símbolo ao validador que percorre todos os
+  reconhecimentos: consultar ALFA encerrava BETA e liberava o símbolo dela. Agora
+  a revalidação consome uma OBSERVAÇÃO com contrato explícito (conta,
+  exchange/mercado, escopo `ACCOUNT`/`SYMBOL`, completude/qualidade, janela real
+  da obtenção); `SYMBOL=ALFA` só altera ALFA, e varrer tudo exige observação de
+  CONTA completa. Linha malformada torna a observação INCOMPLETA em vez de ser
+  descartada em silêncio.
+- **T2 — flat encerrava sem conferir ordens.** `symbol_has_live_orders` só via
+  condicionais, e o fechamento acontecia sem consultá-las. Agora há
+  `get_open_orders` (`/fapi/v1/openOrders`, ordens COMUNS — `allOrders` com
+  `limit` é histórico truncado e não serve como prova) e as DUAS fontes são
+  exigidas: erro em qualquer uma mantém bloqueio. O estado `WAITING_ORDERS`
+  (posição flat, ordens presentes ou não confirmadas) BLOQUEIA o símbolo, e só
+  `CLOSED` — flat + duas listagens completas e vazias — libera. Nenhuma ordem do
+  operador é cancelada para alcançar ausência.
+- **T3 — sem incidente aberto, ninguém revalidava.** `reconcile_due` só
+  escaneava com `_boot_scan_safe=False` e a re-checagem só via incidentes
+  abertos. A revalidação passou a rodar em TODO ciclo (mesmo loop, sem scheduler
+  novo) e a gravar uma PROVA de validação (`validated_at_ms`, escopo, conta). O
+  guard exige prova fresca (`VALIDATION_MAX_AGE_S=900s`) antes de NOVA exposição;
+  manutenção protetiva de posição BOT em outro símbolo é isenta, para não deixar
+  posição comprovada sem stop. Transições usam CAS de `revision` sob a lock
+  `917283`: scan atrasado não fecha reconhecimento mais novo, e falha de
+  persistência propaga UNKNOWN em vez de lista vazia com sucesso.
+- **Estados separados de validade e bloqueio.** `ACTIVE`, `INVALIDATED`,
+  `WAITING_ORDERS` bloqueiam; `CLOSED` e `SUPERSEDED` não. O mesmo predicado
+  vale no transporte, na admissão, no reconciliador e no índice
+  (`uq_manual_ack_open` substitui `uq_manual_ack_active`, criado ANTES de o
+  antigo cair e sem apagar linha). Legado ambíguo fica fail-closed
+  (`MANUAL_ACK_REGISTRY_AMBIGUOUS`). Uma confirmação NOVA sobre um registro
+  invalidado grava `SUPERSEDED` no anterior e o novo `ACTIVE` na MESMA transação
+  — com fingerprint atual e `confirm` literal, nunca autoack.
+- **T4 — saldo de dez minutos aparecia como `live`.** `force` não chegava ao
+  cliente e o instante era regenerado. Agora `force` atravessa os dois caches,
+  cooldown com cache vira indisponível para quem pediu leitura fresca, e o
+  instante ORIGINAL + a qualidade (`live`/`cache`/`stale`) são preservados em
+  todas as camadas. A margem exige `available_usd` presente, finito, não-bool e
+  ≥ 0, fonte `live` e carimbo coerente — zero legítimo bloqueia proposta
+  positiva, ausente não vira zero, horário futuro não passa —, e a idade é
+  medida com o relógio obtido DEPOIS da espera pela lock.
+- **T5 — a carteira anterior ao fill autorizava outra proposta.** Criada a
+  tabela `account_margin_epochs` (contador monotônico por conta/exchange/mercado,
+  protegido pela lock existente): a carteira carrega a geração vigente e a
+  admissão recusa observação superada com `MARGIN_OBSERVATION_SUPERSEDED`.
+  Incrementam a geração NA MESMA TRANSAÇÃO: `reserve` (criação/aumento),
+  `admit_final_risk` (quando altera a própria reserva), `_resolve` com
+  `CONFIRMED`/`TERMINAL` e `release_reserved`. NÃO incrementam `mark_sending`,
+  `register_dispatch`, `mark_unknown` e `recover_stale` — não mudam a soma de
+  pendentes. A readmissão devolve a geração RESULTANTE, gravada em
+  `entry_intents.margin_generation`, e o `_intent_dispatch_guard` confere esse
+  token antes de CADA POST: readmissão concorrente exige nova admissão.
+- **T6 — o POST saía depois do reconhecimento.** O guard antecipado ficava antes
+  do throttle. `_signed_request` passou a receber um contexto INTERNO de mutação
+  e a COMPOR ownership com o `request_preflight` existente de lease/risco/quote,
+  reconferindo imediatamente antes de assinar — inclusive quando o caller não
+  fornece preflight e em cada retry/fallback. Cobertos `set_leverage`,
+  `cancel_order`, `cancel_algo_order`, `_place_algo` de cada perna de proteção,
+  `place_order` (MARKET/LIMIT/redução), maker + fallback e o fechamento
+  emergencial. Negação ⇒ `_request_sent=False` e nenhum POST/DELETE.
+- **T7 — `reserve` criava intenção em símbolo reconhecido.** Novo
+  `check_ownership_in_session` (somente banco, sem sessão própria e sem
+  exchange) roda em `reserve` E `admit_final_risk` depois da lock `917283` e
+  antes de conceder/gravar capacidade, para intenção nova E retomada, com conta,
+  exchange/mercado e símbolo/quote canônicos e todos os estados bloqueantes.
+- **Testes:** suíte completa **2.434 executados, 2.432 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada, não fabricada). Novos:
+  `tests/test_manual_bot_integrity.py` (24) e
+  `tests/pg_integration_manual_margin.py` (**43** verificações, inclui migração
+  vinda de `69fd090a`, barreiras reais em `pg_locks`, restart e caminho positivo
+  ponta a ponta com cliente HTTP falso). `pg_integration_manual_coexistence.py`
+  foi de 104 para **128**. Regressões PG: P03-conflito 66, R05-relógio 10,
+  R11/R12 138. Dirigidos executados 2×. `py_compile` e `git diff --check`
+  aprovados; nenhum TS/TSX alterado; clusters encerrados.
+- **Fora do escopo, sem mudança:** estratégia, calibração, limites, alavancagem
+  configurada, filtros, universo e defaults. Nenhum worker, fila, scheduler,
+  dashboard, ENV ou flag nova. Nenhum acesso à conta real, ordem, Telegram, push
+  ou deploy; nenhuma posição real reconhecida e nenhuma pausa real liberada.
+  Limite externo que permanece: mudanças feitas direto na corretora não
+  incrementam a geração local — a leitura fresca continua obrigatória e não há
+  atomicidade com a exchange. Não se declara ausência de bugs.
+
+## Fechamento manual/BOT (01/10/2026, baseline `20580139`)
+
+Cinco achados de `docs/REVISAO_20580139_MANUAL_BOT.md` (oito probes T1–T8)
+corrigidos juntos. Os testes de aceite foram escritos ANTES e falhavam na
+baseline; nenhum serviço foi revertido para medir RED. Detalhes de contrato em
+`docs/FECHAMENTO_MANUAL_BOT_20580139.md`.
+
+- **T4 — inversão de locks.** `reserve` tomava a advisory lock e travava a época
+  enquanto `_resolve` travava a intenção e depois pedia a época: o PostgreSQL
+  acusava `deadlock detected`. Agora há ORDEM ÚNICA — latch local, `BEGIN` +
+  `pg_advisory_xact_lock(917283)` antes de qualquer leitura decisória, época da
+  conta antes das intenções, linhas em ordem de id/chave, commit único. Entram
+  nela `_resolve`, `release_reserved`, `mark_sending`, `register_dispatch`,
+  `recover_stale`, `bump_margin_generation_for`, as transições/provas de
+  reconhecimento e a confirmação administrativa. Helpers recebem a sessão aberta:
+  nenhum abre outra conexão sob a lock.
+- **T1/T2/T3 — token financeiro.** A reserva devolvia geração mas gravava NULL e
+  o guard liberava; mudança ALHEIA da época passava sem detecção; readmissão sem
+  aumento devolvia o token ANTIGO. Agora `reserve` grava a geração resultante na
+  própria linha antes do commit e devolve o valor PERSISTIDO; toda admissão
+  aprovada grava a época resultante (com bump quando a própria reserva aumenta,
+  sem bump quando só renova); e `authorize_dispatch` — transação curta sob a lock
+  — exige intenção/estado/owner/lease com relógio posterior à espera, dispatch
+  registrado, token inteiro igual à coluna da intenção E igual à geração vigente
+  da conta, validação manual não bloqueada e ownership coerente. Época
+  inexistente não é recriada como autorização.
+- **Preparação × autorização final.** `_intent_dispatch_guard` virou PREPARAÇÃO
+  (não exige token vigente, para permitir renovar); `_intent_guarded_preflight`
+  grava o dispatch, roda quote/carteira/readmissão e só então chama a
+  AUTORIZAÇÃO FINAL. O transporte recebe esse callback por contexto interno e o
+  executa em `_signed_request` depois do throttle e DEPOIS do await de ownership,
+  imediatamente antes de assinar — inclusive em maker, MARKET e filha `-mfb`.
+- **T8 — observação antiga fechava reconhecimento novo.** `capture_validation_
+  context` captura conta/escopo/alvo, época manual, fence local e o instantâneo
+  (id, revisão, fingerprint, estado, símbolo, contrato) ANTES do GET, e fecha a
+  transação antes da rede. No commit há CAS por linha e comparação da época;
+  conjunto de reconhecimentos diferente do capturado devolve
+  `MANUAL_ACK_STALE_CONTEXT`, que descarta o resultado e pede novo ciclo — sem
+  armar pausa, incrementar épocas ou revogar a prova do vencedor. Corrigidos
+  também `_detect_untracked_positions`, `_revalidate_manual_acks(_fresh)`,
+  `_manual_ack_outcome` e `recheck_untracked_manual`.
+- **T5/T6 — prova de reconhecimento invalidado.** Transição de identidade/estado/
+  conta agora incrementa `revision` e limpa `validated_at_ms`,
+  `validation_scope`, `validation_account`, `validated_revision` e
+  `validated_generation` NO MESMO commit. `record_validation_proof([ids])` saiu:
+  `publish_validation_proof` exige contexto/evidência, só publica para `ACTIVE` e
+  devolve em `valid` apenas o que foi COMMITADO. `proof_is_valid` passou a exigir
+  estado, revisão, conta, época manual, contrato, escopo e carimbo não futuro —
+  idade sozinha não autoriza, e fingerprint coincidente não reativa
+  `INVALIDATED`/`WAITING_ORDERS`.
+- **Falha e recuperação duráveis.** `account_margin_epochs` ganhou
+  `manual_validation_generation` e `manual_validation_blocked`. Falha externa
+  avança o fence LOCAL antes de tentar persistir, então avança a época manual,
+  marca `blocked` e revoga provas; erro de commit mantém a causa pendente e
+  devolve UNKNOWN, e o publicador recusa contexto anterior à falha. Quando o
+  banco volta, a falha pendente é persistida ANTES de qualquer recuperação, e só
+  um GET NOVO recupera. Boot começa fechado. Zero incidentes NÃO remove causa
+  manual: `reconcile_due`, boot e `_maybe_release_quarantine` consultam esse
+  estado, e a recuperação remove apenas o owner/causa deste pacote.
+- **T7 — redução barrada como entrada.** `classify_order_action` exige o booleano
+  LITERAL e a classificação é derivada UMA vez em `place_order`, valendo no guard
+  inicial, no preflight e no guard final; o payload carrega `reduceOnly=true`
+  coerente. Payload contraditório (redução com leverage/SL/TP de abertura) é
+  recusado antes de qualquer mutação. Redução/proteção BOT em OUTRO símbolo deixou
+  de depender de prova manual alheia, e o `mutation_guard` de lease passou a rodar
+  também na fronteira pós-throttle de cada POST/retry/fallback.
+- **Migrações:** quatro colunas novas, aditivas e idempotentes, testadas em
+  schema novo, em upgrade vindo de `20580139` e com `init_db` repetido; nenhuma
+  linha apagada e índices de unicidade preservados.
+- **Testes:** suíte completa **2.460 executados, 2.458 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada, não fabricada). Novos:
+  `tests/test_manual_bot_final_closure.py` (20) e
+  `tests/pg_integration_manual_closure.py` (**75** verificações: T1–T8, três
+  corridas com barreiras em métodos reais e `pg_locks`, falha/restart/recuperação
+  e caller → transporte real → cliente HTTP falso).
+  `pg_integration_manual_margin.py` 43 → **46** e
+  `pg_integration_manual_coexistence.py` 128 → **131**. Regressões PG:
+  P03-conflito 66, R05-relógio 10, R11/R12 138. Concorrência e envio integrado
+  executados 2×. `py_compile` e `git diff --check` aprovados; nenhum TS/TSX
+  alterado; clusters encerrados em trap.
+- **Fora do escopo, sem mudança:** estratégia, calibração, limites, alavancagem,
+  filtros, universo, defaults, holdout, histórico e posição manual. Nenhum
+  worker, fila, scheduler, dashboard, ENV ou flag nova. Nenhum acesso à conta
+  real, ordem, Telegram, push ou deploy; nenhum reconhecimento real e nenhuma
+  pausa real liberada. Limite externo que permanece: a geração é LOCAL —
+  mudanças feitas direto na corretora não a incrementam, a leitura fresca segue
+  obrigatória e não há atomicidade com a exchange.
+
+## Fechamento ÚNICO manual/BOT (02/10/2026, baseline `61920156`)
+
+Sete defeitos em seis frentes (F1–F7) corrigidos juntos, com o RED medido ANTES
+na própria baseline (árvore `git archive 61920156` em fixture descartável fora do
+repositório, PostgreSQL real, oito presenças de defeito). Detalhes, riscos,
+limitações e runbook em `docs/FECHAMENTO_UNICO_MANUAL_BOT_61920156.md`.
+
+- **F1 — classificação única da redução.** `classify_order_action` exigia o
+  booleano literal, mas `scope` do client id, proteção pós-fill, `operation_kind`
+  e a confirmação de fechamento ainda liam a VERACIDADE do argumento bruto:
+  `reduce_only="true"` abria MARKET **sem** `reduceOnly`, **sem** SL, e devolvia
+  `ok=True, sl_ok=True, safety_state=NOT_APPLICABLE`. Agora o rótulo é validado
+  como booleano LITERAL na ENTRADA do serviço (`reduce_only_flag_is_valid`) antes
+  de `set_leverage`, arredondamento com I/O, POST ou cancelamento — inválido é
+  `EXEC_REDUCE_ONLY_INVALID` com zero mutação — e a classificação canônica passou
+  a valer em TODOS os ramos. Entrada com SL pedido e proteção não tentada nunca
+  mais reporta `sl_ok=True`.
+- **F2 — fence local através de ordens/SQL/commit.** Fence e pendência eram
+  conferidos uma única vez, antes das consultas de ordens; uma falha que NÃO
+  conseguiu persistir (timeout real de 500 ms na advisory `917283`) deixava o
+  `CLOSED` passar. Agora há mutex LOCAL dos escritores manuais (nunca durante GET
+  da exchange), reconferência depois das consultas, depois da espera pela lock e
+  **depois do commit**, com compensação em transação NOVA: a transição desta
+  tentativa é desfeita por CAS de `id + revisão + estado ESCRITOS`, a prova é
+  revogada, a conta é bloqueada e o símbolo fica contido localmente.
+  Compensação que falha devolve UNKNOWN e MANTÉM a contenção.
+- **F3 — carimbos originais e idade reconferida.** `observed_end_ms` ausente,
+  zero ou bool virava o relógio do commit, e a idade era medida só uma vez: uma
+  observação de 21 s (limite 20 s) encerrava o reconhecimento e desbloqueava a
+  conta. Agora `observation_window`/`window_age_ok` validam início/fim como
+  inteiros legítimos e reconferem a idade com o relógio ATUAL depois das
+  consultas de ordens e depois da espera pela lock; a prova usa o carimbo da
+  OBSERVAÇÃO (`recorded_at_ms` é separado), e `CLOSED` exige ausência de ordens
+  provada pelas DUAS fontes dentro da janela — evidência velha rebaixa para
+  `WAITING_ORDERS` com a causa.
+- **F4 — proposta congelada + exame SÍNCRONO antes de assinar.** A autorização
+  final reconferia token/lease/ownership, não quote/profundidade: com a carteira
+  levando 1,7 s, o POST saía com evidência de ~1704 ms contra TTL de 1500 ms. A
+  admissão serializada passou a CONGELAR uma proposta por despacho (identidade,
+  plano quantizado, evidência temporal ORIGINAL, limites vigentes, token e
+  deadline do lease) com hash determinístico, gravada como chave NOVA no JSON
+  existente da decisão; `authorize_dispatch` devolve a proposta PERSISTIDA e, com
+  ela, o exame SÍNCRONO que o transporte roda imediatamente antes de assinar —
+  re-executando os avaliadores P04 REAIS sobre a evidência original e comparando
+  o payload campo a campo. Ausência/vencimento/adulteração ⇒ `_request_sent=False`
+  e ZERO POST. A filha `-mfb` tem dispatch e proposta PRÓPRIOS.
+- **F5 — causa manual dentro da transação.** `release_p03_pause` e
+  `set_manual_pause(False)` liberavam a pausa com zero incidentes mesmo com
+  `manual_validation_blocked=true` (a causa era lida em OUTRA conexão). Agora
+  `manual_cause_in_session` recebe a sessão aberta e lê época/bloqueio/pendência
+  DENTRO da transação, travando a linha da época até o commit: causa manual
+  devolve `MANUAL_CAUSE_PENDING`/`kept_manual_cause`, mantém a pausa com marcador
+  próprio e não limpa o latch do operador. Ordem desta fronteira: latch local →
+  `_P03_PAUSE_LOCK` → época (FOR UPDATE) → `risk_state` → UM commit.
+- **F6 — recheck com CAS no mesmo commit.** O caminho FLAT conferia só `.ok`, e
+  o CAS do contexto ficava em transação diferente da resolução: um
+  reconhecimento criado DURANTE o GET era encerrado pela observação velha. Agora
+  `update_claimed_guarded` avalia a conferência (fence, pendência, contenção,
+  conta/escopo, época manual, conjunto e revisão/estado/fingerprint de cada
+  reconhecimento, evidência de ordens) na MESMA sessão do UPDATE fencado; CAS
+  perdido mantém o incidente, devolve o claim de forma fencada e agenda ciclo.
+- **F7 — TERMINAL idêntico é no-op.** `_resolve` excluía só `CONFIRMED`, então
+  `TERMINAL→TERMINAL` reescrevia evidência e incrementava a geração financeira
+  (11 → 12 → 13). `classify_resolution` passou a distinguir transição EFETIVA de
+  estado-alvo JÁ aplicado, evidência CONTRADITÓRIA e transição PROIBIDA:
+  repetição idêntica é sucesso idempotente sem época nova, `CONFIRMED` não é
+  rebaixado e `TERMINAL` não reabre como `UNKNOWN`.
+- **Schema:** NENHUMA mudança. A proposta entra como chave nova dentro do
+  `decision_payload` (JSONB já existente), sem tocar plano/identidade imutáveis;
+  `init_db` repetido não cria nada.
+- **Testes:** suíte completa **2.485 executados, 2.483 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada, não fabricada). Novos:
+  `tests/test_manual_bot_single_closure.py` (25) e
+  `tests/pg_integration_manual_single.py` (**70** verificações: F1–F7, matriz
+  integrada pelo caller REAL `open_shadow_for_recs`, corridas com `pg_locks`,
+  timeout real de statement, compensação e restart). Regressões PG: fechamento
+  manual 75, coexistência 131, margem 46, P03-conflito 66, R05-relógio 10,
+  R11/R12 138. `py_compile` e `git diff --check` aprovados; nenhum TS/TSX
+  alterado; clusters encerrados em trap.
+- **Fora do escopo, sem mudança:** estratégia, calibração, limites, alavancagem,
+  filtros, universo, defaults de execução, holdout, histórico e posição manual.
+  Nenhum worker, fila, scheduler, dashboard, ENV ou flag nova. Nenhum acesso à
+  conta real, ordem, Telegram, push ou deploy; nenhum reconhecimento real e
+  nenhuma pausa real liberada. Limites externos que permanecem: falha local não
+  commitada não é durável nem conhecida por outro processo, e o TOCTOU com a
+  exchange continua (mudança feita direto na corretora não incrementa época
+  alguma).
+
+## Lote 01 — operacional e financeiro (03/10/2026, base `7d6dbe15`)
+
+Itens 1+2 do índice de quatro lotes. Implementado no worktree autorizado
+`blissful-sinoussi-0511a5`; integração em main é etapa separada. Contrato e mapa
+completo em `docs/FECHAMENTO_FINAL_01_OPERACIONAL_FINANCEIRO.md`; retomada em
+`docs/FECHAMENTO_FINAL_01_CHECKPOINT.md`.
+
+- **Comissão em OUTRO ativo (único defeito com correção de código).** ANTES:
+  `compute_totals` bloqueava com `FEE_ASSET_CONVERSION_UNAVAILABLE` e não havia
+  caminho verificável — a linha ficava fora de `accounting_total` para sempre.
+  DEPOIS: contrato `R05E_FEE_CONVERSION_V1` versionado POR FILL (conta/exchange,
+  `fill_key`, ativo/quantidade, liquidação, instante do fill, fonte, valor/preço
+  documentado, janela observada, qualidade e hash). Qualidade DERIVADA da fonte:
+  conversão registrada pela corretora ⇒ `CONFIRMED`; preço histórico de mercado ⇒
+  no máximo `ESTIMATED` (preço atual não é histórico; nada de USD=USDT=USDC).
+  `net_trade` só fica conhecido com TODAS as comissões exigidas CONFIRMED; zero
+  registrado é válido e ausência nunca vira zero. Evidência persiste no JSONB
+  existente por `fill_key`, com merge idempotente sob bloqueio de linha e
+  `CONFLICT` preservando a original. Coletor faz UMA varredura paginada do ledger
+  de `COMMISSION` (sem N+1, cliente existente, orçamento de chamadas, I/O fora da
+  transação) e devolve `BLOCKED_SOURCE_UNAVAILABLE` quando a corretora não
+  registrou — nenhum número é fabricado. Resolvida a conversão,
+  `fee_assets_unconverted` esvazia e a linha entra em `accounting_total`.
+- **Funding, total e admissão: auditados e PROVADOS, sem reescrita.** Paginação
+  completa com motivos explícitos, dedupe por `FUNDING_FEE:tranId`, janela de
+  exposição dos fills atribuídos, exigência de exposição exclusiva, legado
+  `LEGACY_UNVERIFIED`; total = `net_trade` + funding confirmado uma vez;
+  `_ADMISSION_SNAPSHOT_SQL` já usa UMA instrução com `statement_timestamp()`
+  depois da advisory lock; `_apply_source_to_window` não tem fallback silencioso.
+- **Cutover/rollback preparados, NÃO ativados.** `R05_FINANCIAL_TOTAL_SOURCE` e
+  `R05_FINANCIAL_BREAKER_ENABLED` inalterados.
+- **Schema:** nenhuma migração (chave nova dentro do JSONB já existente).
+- **Testes:** suíte completa **2.527 executados, 2.525 aprovados, 2 skips R05C**
+  (fixture privada ausente — declarados). Novos: `tests/test_lote01_fee_conversion.py`
+  (27, 2×) e `tests/pg_integration_lote01_financeiro.py` (**13** verificações, 2×:
+  comissão em outro ativo pelo ciclo real de persistência, total positivo com
+  funding confirmado — entrada + duas parciais + runner, duplicatas que não
+  dobram, restart idempotente, CONFLICT, transferência reserva→posição,
+  concorrência que não gasta a mesma capacidade duas vezes e fechamento entre
+  parcelas). Reexecutados: R05C PG (`run_pg_r05c.sh`), R05-relógio 10 (espera
+  real pela lock em `pg_locks`), margem 46, manual-boot 46. `py_compile` e
+  `git diff --check` aprovados; nenhum TS/TSX alterado.
+- **Pendências reais declaradas:** `WAITING_SOURCE` para comissão sem registro da
+  corretora e `WAITING_OPERATIONAL_OBSERVATION` para observar uma entrada real —
+  nenhum dos dois significa financeiro operacionalmente consolidado.
+
+## Correção integrada manual/BOT (02/10/2026, baseline `001a6685`)
+
+Quatro defeitos reproduzidos na revisão de `001a6685`, com RED medido ANTES na
+mesma árvore pelos callers reais. Contrato em
+`docs/FECHAMENTO_CORRECAO_001a6685.md`.
+
+- **R1/R2 — observação do boot/batch.** `_detect_untracked_positions` reusava a
+  leitura do ciclo sem a janela do GET (o processamento carimbava início/fim) e
+  eliminava quantidade `NaN` com `_finite(size) or 0` ANTES de validar
+  completude: um GET de 21 s (limite 20 s) e um `positionAmt="NaN"` terminavam
+  como FLAT, fechavam reconhecimento ACTIVE rev3 → CLOSED rev4, deixavam
+  `manual_validation_blocked=false` e liberavam `ownership_guard(entry)`. Agora a
+  janela ORIGINAL é medida em volta do GET e propagada por
+  `observation_from_rows`/`revalidate_active`; `normalize_positions` trata
+  `None`/coleção desconhecida/linha malformada/qty inválida ou negativa como
+  INCOMPLETUDE (zero finito continua legítimo) e exige identidade verificável da
+  linha ATIVA; a seleção de exposições não-zero acontece só depois da validação,
+  pela quantidade canônica. Incompletude ⇒ UNKNOWN + `_boot_scan_safe=False` +
+  contenção. O inventário administrativo continua mostrando a linha incompleta
+  como INELEGÍVEL em vez de esconder a posição.
+- **R3 — autoridade local até o handoff.** `authorize_dispatch` captura um token
+  imutável (fence/pendência/símbolo) ANTES de qualquer await, vincula a
+  identidade validada sem recapturar o fence e reconfere o token ORIGINAL
+  **depois de sair totalmente do contexto da sessão** (rollback e
+  `close`/`__aexit__` suspendem — era aí que uma falha manual nova passava). O
+  token viaja no veredito e é reconferido no exame SÍNCRONO pré-assinatura.
+  Persistir/limpar a pendência não ressuscita a autorização antiga.
+- **R4 — identidade e payload.** O exame síncrono passou a comparar o símbolo
+  WIRE efetivo com o derivado da proposta pela conversão REAL do transporte
+  (identidade `BASE-QUOTE-SETTLE` → mercado → `to_binance`), além de
+  conta/exchange/mercado/intenção, `positionSide` compatível e recusa por
+  PRESENÇA de `reduceOnly`/`closePosition`/`stopPrice`. O transporte valida e
+  assina a MESMA cópia local dos params finais.
+- **Matriz:** m9 passou a provar a chamada ao verificador de funding REAL e a
+  razão `R05D_TOTAL` (com controle positivo), e m10 a causa manual própria com
+  recuperação apenas pelo ciclo OFICIAL, sem limpeza manual de latch/pausa.
+- **Testes:** suíte completa **2.486 executados, 2.484 aprovados, 2 skips R05C**
+  (fixture auditada privada — declarada). Novos harnesses PG:
+  `pg_integration_manual_boot.py` (**34** verificações) e
+  `pg_integration_manual_dispatch.py` (**32**), ambos 2×;
+  `pg_integration_manual_single.py` 70 → **73**, 2×. Regressões PG: fechamento
+  manual 75, coexistência 131, margem 46, P03-conflito 66. `py_compile` e
+  `git diff --check` aprovados; nenhum TS/TSX alterado; clusters encerrados.
+- **Sem mudança:** schema, estratégia, calibração, sizing, limites, alavancagem,
+  defaults (maker/fallback seguem OFF), ENV/flag, scheduler/worker/endpoint.
+  Nenhum acesso a conta real, exchange, Telegram ou deploy.
+
+## A03 — parser positionRisk e autoridade do cache (02/10/2026)
+
+Baseline `efd3dfe9`, no mesmo worktree de entrega. Correção localizada da perda
+de informação ANTES da normalização manual: corpo HTTP ausente e `positionAmt`
+ausente/booleano não podem se tornar lista vazia/zero. Contrato e provas em
+`docs/FECHAMENTO_CORRECAO_001a6685.md`, seção A03.
+
+- `binance_signed_service.get_positions` exige lista/linhas/quantidades válidas,
+  recusa leitura parcial, conserva zeros explícitos e LONG/SHORT finitos. Erro
+  de parsing invalida o frescor do cache anterior; cooldown só pode servir
+  snapshot stale; diagnóstico não emite Infinity.
+- `_detect_untracked_positions` encaminha `POSITION_RISK_INVALID_PAYLOAD` ao
+  caminho manual oficial com a janela original, revogando autorização anterior
+  e persistindo a causa antes de retornar UNKNOWN. Recuperação é provada pelo
+  ciclo oficial, sem clear manual de latch/pausa/época.
+- RED na baseline: primeiros 12 testes de parser, 23 falhas e 7 erros. GREEN:
+  14 testes novos; 166 focais 2×; suíte completa 2.500 executados / 2.498 aprovados
+  / 2 skips históricos R05C (fixture privada ausente, não fabricada). PG16 local
+  real, socket Unix, TCP/DNS bloqueados: 46 boot + 32 dispatch + 73 fechamento,
+  total 151 verificações 2×. Compilação dos quatro Python e diff-check OK.
+- Sem migração/schema/ENV/flag, estratégia, sizing, limites, defaults, frontend
+  ou histórico alterado. Nenhuma conta real, ordem externa, mensagem, merge,
+  push ou deploy. Main preservado; fence local e TOCTOU com a exchange continuam
+  sendo limitações externas declaradas.
+
+## L01-C — correção conjunta da conversão de comissão (03/10/2026)
+
+Baseline `e995b63b`, mesmo worktree autorizado. Cinco defeitos da auditoria
+`AUDITORIA_LOTE01_e995b63b.md` corrigidos num pacote único, só em
+`execution_accounting_service.py`. Contrato e provas em
+`docs/LOTE01_CORRECAO_CONJUNTA_e995b63b.md`.
+
+- **R1** `normalize_commission_ledger_row` valida cada linha do ledger de
+  COMMISSION ANTES de indexar valor (conta, exchange/símbolo normalizados,
+  `incomeType`, ativo de liquidação, `tradeId` atribuído recusando bool/float,
+  `tranId`, `income` finito e **não positivo** — crédito não vira custo por
+  `abs` —, janela efetivamente consultada e vínculo explícito com a comissão do
+  fill). `index_commission_ledger` dedupa por `(trade_id, tran_id)`: duplicata
+  idêntica é no-op, material diferente é conflito de fonte, `tranId` distintos
+  para o mesmo fill bloqueiam. Referência normalizada persistida e coberta pelos
+  hashes.
+- **R2** contexto ESPERADO (`build_expected_context`) derivado da identidade e
+  do fill ATRIBUÍDO, passado a construtor/veredito/resolvedor/finalizador e
+  reconferido no merge sob bloqueio; nunca copiado da prova. Prova íntegra com
+  conta/exchange/instante divergente, ou janela que não contém o fill, não
+  confirma. Sem contexto ⇒ `FEE_CONVERSION_CONTEXT_MISSING` (não fail-open).
+- **R3** `integrity_hash` (registro inteiro) separado de `material_id`
+  (economia: identidade, quantidade, ativo de liquidação, valor, referência do
+  evento). `observed_*`/tentativa/qualidade fora da materialidade.
+  `merge_fee_proof` aplica a precedência: armazenar, idempotência, enriquecer,
+  promover estimativa com histórico, preservar confirmação diante de estimativa
+  atrasada, conflitar só entre confirmadas materialmente divergentes.
+- **R4** conversão exigida só de comissão estrangeira ESTRITAMENTE positiva:
+  zero finito é custo zero conhecido (sem consulta); ausente/NaN/inf/negativa
+  continua desconhecida.
+- **R5** desfecho explícito do coletor (`COMPLETE`/`PROGRESS`/`PARTIAL_LIMIT`/
+  `SOURCE_UNAVAILABLE`/`ERROR`), completude sobre TODAS as exigências,
+  incompletude saudável do lote como espera cadenciada, progresso útil medido
+  por confirmações novas e `observation_id`/`base_generation` aditivos: resposta
+  obsoleta contribui evento, não estatística; replay não conta duas vezes;
+  falha real da geração corrente conta uma vez.
+- RED na baseline, pela API dela mesma: 5/5 defeitos reproduzidos (ledger
+  inválido confirmando valor, contexto divergente CONFIRMED, janela mudando a
+  identidade, zero exigindo conversão, 49 conversões em `FAILED` com 48 feitas e
+  `attempts=6`). GREEN: 29 testes novos + 27 do lote adaptados ao V2, 56 focais
+  **2×**; PG16 descartável com socket Unix e TCP/DNS bloqueados →
+  `pg_integration_lote01_financeiro.py` 13 → **21** verificações **2×** (duas
+  conexões reais, efeito em P&L e no `accounting_total`); regressões
+  `pg_integration_r05c.py`, `r05d_gate` (16) e `r05_clock` (10). Suíte completa
+  2.556 executados / 2.554 aprovados / 2 skips R05C declarados. `py_compile` e
+  `git diff --check` aprovados; clusters encerrados.
+- **Sem mudança:** DDL/migração, estratégia, calibração, sizing, limites,
+  alavancagem, defaults, ENV/flag (`R05_FINANCIAL_TOTAL_SOURCE` e
+  `R05_FINANCIAL_BREAKER_ENABLED` intocados), frontend ou histórico financeiro
+  real. Nenhuma conta real, ordem, Telegram, merge, push ou deploy. Contrato V1
+  fica legado: preservado para diagnóstico, nunca re-hasheado nem promovido.
+
+## L01-F — fronteiras de prova e retry (03/10/2026)
+
+Baseline `ceb42af7`, worktree autorizado, único serviço alterado:
+`execution_accounting_service.py`. Registro completo em
+`docs/LOTE01_CORRECAO_FINAL_ceb42af7.md`.
+
+- Fonte: construtor/veredito/merge/finalização reconferem referência pelo contexto
+  do fill; vínculo da comissão preservado; carimbo da observação íntegro e
+  janelas reais por página/cursor, não apenas janela agregada.
+- Material: Decimal canônico para números da fonte; escala textual equivalente
+  não conflita nem retira P&L; alteração econômica real continua bloqueada.
+- Retry: latch JSON `retry_halted`, FAILED sem auto-resume por prova atrasada,
+  attempts/erro preservados; replay A→B→A e geração exata impedem dupla contagem.
+- Prova: 27 falhas RED na baseline nos 10 novos testes; 66 focais GREEN 2×;
+  PG16 real, driver async/socket Unix/TCP-DNS bloqueados, 31 verificações 2× em
+  bases novas; R05C_PG_INTEGRATION_OK; suíte completa 2.566 executados / 2.564
+  aprovados / 2 skips históricos R05C por fixture privada ausente. Compile e
+  diff-check aprovados; clusters descartáveis encerrados.
+- Sem DDL, backfill, flag, cutover, estratégia, sizing, limite, alavancagem,
+  pausa ou manual alterados. Sem produção, conta real, ordem, mensagem, merge,
+  push/deploy. WAITING_SOURCE e WAITING_OPERATIONAL_OBSERVATION permanecem.
+
+## L02 — pesquisa, coleta pré-seleção e calibração V3 (04/10/2026)
+
+Base `d0bf52e7` (Lote 01 integrado), worktree `lote02-pesquisa` autorizado pelo
+usuário para este e os próximos lotes. Itens 3+4+5 do índice. Contratos e provas
+em `docs/FECHAMENTO_FINAL_02_PESQUISA_E_CALIBRACAO.md`.
+
+- **Manifesto autorizado** (`research_manifest_service`, novo): contrato fechado
+  `R13_RESEARCH_MANIFEST_V1` com hashes por seção + `bundle_hash` gerados ANTES
+  dos resultados. Bloqueiam campo desconhecido/ausente, bool numérico, NaN/inf,
+  split fora de ordem/sem purga, fonte/unidade/ativo de custo incompatíveis,
+  modelo declarado se passando por custo observado, escopo não implementado,
+  mudança fora do componente declarado, lados idênticos com mudança declarada e
+  drift de hash. `approved: true` solto é campo desconhecido. Estados derivados
+  da decisão humana: DRAFT/BLOCKED, APPROVED_TEST_ONLY (não libera estudo real) e
+  APPROVED_RESEARCH (autoridade + referência + instante).
+  `authorized_comparison` passou a LER e validar esse contrato, mantendo
+  `BLOCKED_MISSING_DECISION` quando ele falta.
+- **Coleta pré-seleção no ponto oficial**: gate lido UMA vez antes de qualquer
+  trabalho novo (desligado não constrói linha, não pede a lista de avaliados e
+  mantém lista/ordem do champion); captura de TODOS os TFs avaliados ANTES do
+  `max(scored)` sem mexer no vencedor; veto macro registra os candidatos
+  existentes como VETOED com o gate que rodou; retornos antecipados (blackout,
+  sem símbolo, timeout, orçamento, sem candidato) registram COBERTURA de ciclo
+  sem fabricar oportunidade/preço/outcome; payload versionado `r09.pre.v1` (igual
+  ao anterior) e `r09.pre.v2` com features ponto-no-tempo e TFs avaliados ×
+  escolhido — produtor, exportador e manifesto aceitam as duas.
+- **Comparação por escopo**: `MANAGEMENT_ONLY` intacto (mesmo `request_hash`,
+  contrato V1); `SELECTION_ONLY` fechado — pedido com motores de seleção e gestão
+  IDÊNTICA, baseline pela decisão OBSERVADA do champion, candidata pelo motor
+  dela, UNKNOWN excluído simetricamente com cobertura, contrato
+  `R12_PRE_SELECTION_CONTRACT_V2` (manifest_hash + selection_config no corpo
+  hasheado), envelope do catálogo por tipo e verificação que recusa seleção
+  validada como gestão (e vice-versa).
+- **Calibração V3** (`score_v3_calibration_service`, novo): faixas fixas de 10
+  pontos (última inclui 100), mínimo 200 únicas/30 por faixa, `p=sucessos/n` com
+  Wilson 95%, sem herança em faixa fraca, sem monotonicidade/suavização, evento
+  explícito (TP1/TP2/líquido não intercambiáveis), label pós-corte fora do
+  treino, artefato inválido/vencido/revogado/incompatível = UNAVAILABLE, estados
+  FITTED ≠ OOS_VALIDATED ≠ ECONOMICALLY_APPROVED. `calibration_verdict` devolve a
+  probabilidade da faixa com artefato real e mantém o metadado antigo como
+  `METADATA_ONLY`; `net_ev` recusa evento/payoff incompatível e
+  `net_ev_from_payoff` exige payoff líquido OOS da gestão congelada.
+- **Status honesto**: evidência DERIVADA (coleta/artefato/manifesto) com
+  qualidade e `last_observed_at`; erro de leitura é ERROR, não NOT_STARTED; o GET
+  não dispara replay/walk-forward/fitting.
+- Provas: 73 testes novos (16+8+19+21+9); PG16 descartável
+  `pg_integration_lote02_pesquisa.py` com 18 verificações **2×** (duas conexões,
+  CAS, restart, identidade de estudo); regressões PG r11_r12 (138),
+  r09_preselection (29) e r10b; suíte completa 2.639 executados / 2.637 aprovados
+  / 2 skips históricos R05C. `py_compile` e `diff-check` aprovados; frontend
+  intocado.
+- **Sem mudança**: DDL/migração, ENV/flag (coleta segue `inactive`), champion,
+  calibração V2 autorizada, risco/alavancagem, execução, quarentena. Sem
+  produção, exchange, Telegram, Railway/Vercel, merge, push ou deploy.
+  WAITING_DECISION (candidata/baseline/escopo/custos) e WAITING_DATA (amostra
+  prospectiva, features de estrutura do V3) permanecem declarados.
+
+## L02 — correção integrada sobre a39ab358 (05/10/2026)
+
+Autorização do usuário para corrigir diretamente no worktree entregue, sem
+rodadas adicionais de prompt. Relatório: `docs/LOTE02_CORRECAO_INTEGRADA.md`.
+
+- Captura com batching/cobertura honestos e veto completo; baseline depois do
+  filtro de carteira; trace/config reais e produtor prospectivo sem fetch.
+- Manifesto vinculado a ScoreConfig/custos/split/população efetivamente
+  executados e corpo V2 validado no catálogo. Baseline sem prova da etapa final
+  ou com configuração divergente é UNKNOWN simétrico.
+- Export bruto oficial, janelas/quotes explícitas, pipeline registrado sem demo
+  substituta; fitting/OOS cronológico, validação semântica, payoff NET_POSITIVE
+  já líquido, persistência CAS, restart e status de leitura.
+- Provas: 129 focais; 2.695 testes completos (2 skips históricos R05C), verde
+  2×; PG16/asyncpg/socket Unix/TCP-DNS bloqueados, 26 verificações + 19
+  regressões, verde 2×; compile e diff-check aprovados.
+- Sem DDL, endpoint, worker/loop, ativação, estratégia LIVE, sizing, risco,
+  conta/manual/histórico/quarentena alterados. Sem conta/exchange/DB de produção
+  ou mensagem real nos testes. Publicação separada não ativa os seletores.
+- WAITING_DECISION/WAITING_DATA e limites de aceitação OOS continuam honestos;
+  teste é engenharia TEST_ONLY, não prova de lucratividade. Aceitas exigem
+  janelas/quotes externas explícitas; núcleo/playbooks e adaptador LIVE não são
+  demonstrados por este escopo de corte Score V3.
+
+## L03 — integração governada: fechamento dos quatro pontos (06/10/2026)
+
+Base `581ad3d4`, worktree autorizado. Relatório:
+`docs/FECHAMENTO_FINAL_03_INTEGRACAO_GOVERNADA.md`.
+
+- **A** Início governado do SHADOW pré-seleção pela rota existente, com corpo
+  FECHADO (confirm literal, `approval_id`, `expected_generation` inteiro) e
+  despacho por TIPO antes do loader legado; POST_SELECTION (inclusive a chamada
+  sem corpo) e P05.1 ANALYTICS_ONLY preservados; erro interno sem stack/segredo.
+- **B** Decisão candidata OBSERVACIONAL (`CANDIDATE_SHADOW`) no ciclo oficial do
+  scanner, com aprovação SHADOW e seletor em LEGACY: ALL-TF antes da escolha, o
+  MESMO núcleo de decisão do caminho operacional (sem cópia equivalente),
+  escopo/decisão/identidade de regra congelados na anotação e cobertos pelo hash.
+  Fidelidade = observado × recomputação verificável do contrato na mesma
+  oportunidade/população/estágio, com hashes reconciliados; comparáveis,
+  divergentes, UNKNOWN, cobertura e motivos publicados. Ausência é `None` +
+  lacuna + NO_GO, nunca 0%. Quebra a circularidade promoção↔fidelidade.
+- **Fronteira de propósito**: contexto/aprovação SHADOW nunca autoriza reserva,
+  alavancagem ou POST (`CANDIDATE_PURPOSE_MISMATCH`/`AUTHORITY_PURPOSE_MISMATCH`).
+- **C** Proteção **SHADOW_SIMULATED** explícita e versionada no replay OFICIAL
+  (instrumentação aditiva; nenhum campo econômico ou status alterado): obrigação,
+  qtd remanescente, stop ativo finito, geometria julgada pelo ESTÁGIO (BE/lucro
+  pós-TP1 é válido), transições BE/trail e falhas pendentes extraídas do estado
+  percorrido. Trilhas de resolução, economia, duplicata e proteção contadas
+  SEPARADAMENTE (sem `elif` apagando uma delas); zero só com observação aplicável
+  e cobertura ≥ 90% sobre denominador auditável; saída lucrativa sem prova segue
+  pendente. Métrica Shadow nunca prova SL real, ramp ou aceite operacional;
+  `BLOCKED_PROTECTION_SCOPE_DECISION_REQUIRED` mantém NO_GO até decisão humana.
+- **D** Matriz integrada pelo caller real em PG16 descartável: **53 verificações,
+  exit 0, 2×** após a última edição. Ordem GLOBAL do lock com duas conexões REAIS
+  e barreira no ponto real; filha `-mfb` com proposta/autorização próprias; último
+  slot aprovado; posição manual preservada; dois consumidores; restart;
+  expiração/drift; revogação antes e DURANTE a espera; dois promotores com um
+  efeito; rollback preservando posição/proteção; status read-only; cobertura de B
+  e C pela cadeia prospectiva oficial. TCP zero; DNS bloqueado e CONTADO (borda
+  pública de preço de marca declarada).
+- Provas: suíte backend completa **2.846 testes, OK, 2 skips históricos R05C**;
+  24 harnesses PG verdes; `py_compile` e verificação de espaços do diff aprovados.
+- Corrigidas falhas PRÉ-EXISTENTES de fixture com prova de anterioridade por
+  ordenação de commits (ownership com prova fresca; payload v2; `contract_hash_of`
+  exigindo o corpo inteiro). Correção de escopo própria: coorte prospectiva passou
+  a ser exigida só em contratos `SELECTION_ONLY` — o challenger de GESTÃO voltou a
+  ter o ciclo dele, com `comparison_scope`/`prospective_cohort`/`offline_used`
+  DECLARADOS.
+- Sem DDL, endpoint novo, worker/loop, flag, ENV, seletor, canário, aprovação
+  real, ordem, mensagem ou pausa. Candidata DESATIVADA. Publicação remota não
+  ocorreu nesta execução.
+- WAITING_DATA (amostra prospectiva), WAITING_DECISION (escopo de proteção da
+  primeira promoção e manifesto de pesquisa aprovado) e WAITING_CANARY_APPROVAL
+  continuam honestos. `OPERATIONAL_ACCEPTED` não foi alcançado.
+- Índice dos quatro lotes existe só no checkout principal: inclusão PENDENTE.
+
+## 06/10/2026 — Lote 03: resíduos corrigidos sobre `14764cea`
+
+- Start PRE_SELECTION: autoridade SHADOW atual e identidade original precedem
+  idempotência; lock P05 → singleton → experimento. Aprovação ausente,
+  revogada, vencida, de outro experimento ou geração divergente recusa; nova
+  aprovação não reassocia a coorte; repetição válida não reinicia nem escreve.
+- REJECTED por score conhecido conserva o `min_score` validado no núcleo e no
+  grupo observacional, sem probabilidade/fallback fabricados. Corte ausente ou
+  divergente e UNKNOWN continuam incomparáveis na fidelidade.
+- Terminal da coorte deriva do vocabulário oficial do replay, incluindo
+  CLOSED_RUNNER_STOP. Resolução terminal não é reaberta na repetição.
+- Proteção simulada concilia observações e resumos: identidade, lado/preços,
+  tempo, quantidade/exposição, obrigação, stop finito, geometria por estágio e
+  falhas. Trilha contraditória perde cobertura e nunca certifica zero. Sem
+  mudança no produtor, economia ou aceite humano de proteção.
+- Provas finais: 222 testes direcionados **2×**; suíte completa **2.867
+  executados / 2.865 aprovados / 2 skips R05C**; PG16 descartável **59 checks 2×**
+  com driver real/socket Unix, zero TCP e DNS bloqueado/contado. Novo runner
+  `tests/run_pg_lote03.sh`; `py_compile`, bash syntax e diff-check aprovados.
+- Revisão independente: 4.000 trilhas oficiais sintéticas sem rejeição
+  indevida/mutação pelo consumidor; oito contradições recusadas. Não é prova
+  econômica nem SL real. Os 24 harnesses anteriores não foram todos repetidos.
+- Entrega: `docs/LOTE03_CORRECAO_RESIDUOS_14764cea.md`; checkpoint e doc do lote
+  atualizados. Candidata inativa, LEGACY/defaults/limites/champion preservados;
+  sem DDL, aprovação real, conta externa, ordem, mensagem, merge/push/deploy.
+  WAITING_DECISION / WAITING_DATA / WAITING_CANARY_APPROVAL mantidos.
+
+## L04 — layout claro, responsivo e honesto (07/10/2026)
+
+Base `6fc9bf1a`, worktree autorizado. **Frontend apenas.** Relatório:
+`docs/FECHAMENTO_FINAL_04_LAYOUT.md`.
+
+- **Nunca verde por ausência.** Função PURA única (`src/lib/operationalState.ts`)
+  decide o estado para Home, selo do header e Sistema: LOADING / UNAVAILABLE /
+  STALE / BLOCKED / NO_BLOCK_CONFIRMED / AVAILABLE. `trading_paused === false`
+  sozinho não autoriza nada; `AVAILABLE` exige fato explícito de autoridade de
+  entrada, que o contrato atual não publica — a tela diz isso e nomeia a lacuna.
+  O selo do header usa escopo declarado `RISK_ONLY` em vez de duplicar a regra.
+- **Ausência deixou de virar zero**: drawdown, wins/losses/win-rate, contadores
+  de incidentes, trades do paper e verdito de recomendação. Erro de leitura de
+  posições não passa mais como lista vazia, e zero confirmado continua zero.
+- **Incidentes P03 na interface** pela leitura delimitada do GET público já
+  existente `/api/execution-incidents/status` (método tipado + cache/single-flight
+  compartilhado; **+1 GET por ciclo de 20s**, declarado). Incidente/quarentena
+  prevalecem sobre risco sem pausa; `ok=false`/erro não vira zero.
+- **Rótulos honestos**: resultado dos SETUPS (janela/unidade) ≠ lucro da conta;
+  `/api/real-trades` declarado como registro do app, não inventário da Binance;
+  "Força do sinal↓" no lugar de "R/R↓" (chave e algoritmo intactos); Dashboard
+  com fonte/janela por bloco em vez de selo PAPER global; heartbeat não é
+  autorização; P(TP1) identificado como modelo.
+- **Responsividade/a11y**: `.app-overlay` em 10 overlays (rail, barra e
+  `safe-area`), foco visível, `prefers-reduced-motion`, Escape com retorno de
+  foco. Sem scroll horizontal em 390/768/1024.
+- **Provas**: 42 testes locais (função pura + markup real + single-flight +
+  contratos) com runner que só usa dependências instaladas; `tsc --noEmit` limpo;
+  build em diretório temporário (dist preservado); QA visual isolada com 8
+  requisições externas bloqueadas/contadas, 0 mutações enviadas e 7 capturas em
+  390/768/1024/1440.
+- Sem backend, estratégia, score, risco, limite, flag, ENV, endpoint novo,
+  segredo no cliente, push ou deploy. `LOCAL_VERIFIED`; integração em `main` e
+  publicação seguem como etapas separadas.
+
+## L04 — correção da revisão (07/10/2026)
+
+- Baseline `db21ef1f`, mesmo worktree autorizado; frontend/QA/documentação apenas.
+- Retomada governada por predicado único: P03, validação manual, erro, leitura
+  antiga ou incoerente não oferecem nem enviam retomada. Controle positivo de
+  pausa manual preservado. Histórico vazio não afirma sinal verde.
+- HTTP 200 `ok=false` recusado; cache P03 invalida reutilização após falha e
+  conserva instante real da resposta. Subcontagens/listas positivas não viram
+  ausência confirmada. Carimbo por fonte, timeout 10s e relógio local independente.
+- Escape/foco com uma inscrição por montagem; lista vazia antiga rotulada como
+  anterior. Novos testes comportamentais dos controladores e markup real.
+- Preview isolado por CSP/origem/método, com Request.method, XHR/beacon/SSE/WS/
+  service worker contidos; recurso TradingView bloqueado de fato no probe do
+  navegador. APIs sem fixture falham com 503; isolamento restrito ao QA.
+- Estado final: **79 testes verdes 2×**, tsc/build temporário/diff-check limpos;
+  revisão de teclado e mobile 390px com dados sintéticos. Dist intacto, sem
+  instalação de dependências ou acesso à conta. Não executados POSTs reais,
+  leitor de tela, contraste instrumental ou device físico.
+- Relatório: `docs/FECHAMENTO_FINAL_04_CORRECAO.md`.
+  `LOCAL_VERIFIED_PENDING_INTEGRATION`; sem merge, push ou deploy nesta correção.
+
+## R13 — política de aceite do estudo V3 (08/10/2026)
+
+- Base `2d6d87b1`, worktree autorizado `lote02-pesquisa`; aprovação analítica
+  humana de 07/10/2026, sem ratificação de manifesto real ou ativação LIVE.
+- Política versionada e recibo separado dos artefatos V1: calibração,
+  economia e proteção de escopo têm estados/checks próprios. `OOS_VALIDATED`
+  sozinho deixou de autorizar PROMOTION/CANARY. SHADOW permite coleta antes
+  do aceite econômico, sem tornar-se autoridade de ordem.
+- Evidência OOS por dobra, referência apenas do treino, IDs/timestamps/
+  denominador conciliados e recálculo completo obrigatório no ingresso.
+  Hash público é integridade, não assinatura; fonte controlada é a fronteira.
+- Protocolo congelado: quatro dobras de calibração e seis econômicas com o
+  CI existente de blocos5; distinção documentada para ratificação real posterior.
+- Preparação pelo endpoint administrativo existente: cálculo fora da txn,
+  revalidação/CAS ao voltar; aprovação SHADOW novamente conferida após a
+  última espera. Recibo insuficiente/reprovado preserva geração de coleta.
+- Snapshot V2 mantém identidade de todas as oportunidades e commitments dos
+  resultados usados. Pendência excluída pode resolver após o corte sem entrar
+  nos números congelados; drift de resultado usado continua recusado.
+- Aprovação PROMOTION/CANARY vincula bundle+recibo; revogação/drift/expiração
+  conferidos no banco e após rollback/cleanup. Proteção simulada só satisfaz
+  o escopo cadastral proposto, nunca prova SL real nem dispensa CANARY/guards.
+- Provas focais: 63 testes verdes 2×; suíte completa final 2.911 executados,
+  2.909 aprovados e os dois skips históricos R05C por fixture privada ausente.
+  PostgreSQL de aceite18 verde 2×; regressão Lote02 26+19 verificações verdes.
+  Integração governada final71 verde 2× após última edição, dois clusters
+  independentes: TCP zero, 36 DNS bloqueados/contados por execução, cleanup
+  confirmado. Orçamento ampliado somente no harness para fixture grande;
+  produção mantém 1,5s. Limites exatos da prova registrados no relatório.
+- Sem DDL, frontend, ENV/default novo, SDK/chamada real, ordem ou mensagem.
+  Champion, riscos, posição manual, histórico e holdout preservados.
+- Relatório: `docs/ESTUDO_V3_IMPLEMENTACAO_E_ACEITE.md`.
+  Estado: `LOCAL_VERIFIED`, implementação e verificação integrada concluídas,
+  entrega em commit local; sem merge/push/deploy e sem aprovação operacional.
+
+## Réplica de decisões da gestão LIVE em pesquisa (12/10/2026)
+
+- Base `80d7ece8`, checkout principal autorizado. Retomada da implementação
+  interrompida por limite de uso em 08/10; arquivos pessoais preservados.
+- Motor manual pós-entrada confirmado, reutilizando `_process_trade`, helpers,
+  indicadores e estrutura **reais**, com interfaces explícitas em subprocesso.
+  Nenhum serviço existente nem caminho de decisão do bot foi alterado.
+- Configuração/estado fechados; criação e prefixo de ordens preservados. Cada
+  receipt vincula pedido, índice e causa; posição anterior à ação não confirma
+  flat posterior. Preview só sintético, sempre incompleto e sem evidência.
+- Memória aceita somente dois SELECTs e IDs reais da fixture; import/query
+  recusados permanecem gaps mesmo no fail-soft. Sem engine/conexão SQL.
+- Fonte carregada sem cache de bytecode, vinculada a modelos/dependências e
+  reconferida após imports/execução. ENV não herdada, TCP/UDP/DNS bloqueados.
+- Paridade de parcial inclusiva, pré-TP1, BE estrutural LONG/SHORT, runner,
+  time-stop/poeira/cleanup, UNKNOWN/fallback atual e retomada em memória. Não
+  corrigimos nem aprovamos convenções do LIVE (inclusive categoria `1M`).
+- **47 focais verdes 2×; suíte completa 2.958, OK, 2 skips históricos R05C**
+  (2.956 aprovados). Sintaxe e staged diff-check limpos; sem TSC necessário.
+  Primeiro comando completo tinha PYTHONPATH ausente: erro de montagem corrigido
+  e suíte reexecutada, sem ocultar teste nem alterar código de produção.
+- Estado `LOCAL_VERIFIED_RESEARCH_MANAGER_ONLY`: `economics=null`, sem
+  equivalência financeira/LIVE, promoção, autoridade, coleta ou estudo real.
+  Integração econômica versionada, execução/custos/insumos e manifesto seguem
+  **pendentes de implementação/decisão**, não apenas espera de amostra.
+- Sem PostgreSQL neste pacote (memória não é prova de persistência real), conta,
+  exchange/DB externo, outcome/holdout, mensagem, ENV/default ou ordem.
+  Maker/pyramiding/LIVE_SIZE_MULT intencionais preservados. Sem push/deploy.
+- Relatório: `docs/LIVE_MANAGEMENT_REPLICA_RESEARCH.md`; retomada e provas:
+  `docs/LIVE_MANAGEMENT_REPLICA_CHECKPOINT.md`. Pesquisa isolada não exige deploy;
+  concentrar publicação posterior com sua integração, sem restart inútil do bot.
+
+## Réplica econômica por eventos — infraestrutura local parcial (13/10/2026)
+
+- Base `c12ea043`, checkout principal autorizado, sem worktree novo. Somente
+  pesquisa: famílias versionadas conectadas ao manifesto/export bruto/seleção,
+  admissão/transporte e gestor reais isolados, ledger R05C/R05E, carteira causal,
+  calibração quatro dobras/WF seis e CAS/catalog/status oficiais.
+- UNKNOWN preserva reserva e uma falha posterior não apaga entrada provada.
+  Net/R total incluem funding uma vez; nenhuma probabilidade/fee/fill fabricado.
+  Clock, quantidade, preço, seed/proteção e origens são reconciliados entre etapas.
+- PG real descartável confirmou CAS concorrente, JSONB, restart, conflito,
+  catálogo DRAFT e leitura sem escrever/recalcular; nenhum DDL de produção.
+- A regressão detectou a importação indevida do executor pelo validador puro:
+  corrigimos a arquitetura, não a whitelist do teste antigo. Novo teste achou
+  alias de manifesto no construtor: deepcopy mantém imutabilidade do relatório.
+- **Não concluímos o lote integral:** reforço ON tem recusa no caller LIVE por
+  preflight ausente, encadeamento de reforço ainda falta no produtor, sizing
+  upstream é input final e export antigo não preserva todos os IDs excluídos.
+  Esses são limites técnicos documentados, não somente espera de dados.
+- Nenhuma estratégia/flag/default/limite/manual/histórico/holdout alterado;
+  nenhum acesso à conta/exchange/DB externo, ordem/mensagem/push/deploy.
+- Detalhes/provas finais/retomada: `LIVE_EVENT_STUDY_RESEARCH.md` e
+  `LIVE_EVENT_STUDY_CHECKPOINT.md`. Não chamar os sintéticos de estudo real.
+- Estado final: **101 focais OK 2×; PG real descartável 38 checks OK 2×;
+  backend 3.059 executados, 3.057 aprovados, 2 skips R05C históricos**.
+  Sintaxe de 18 Python + runner bash e staged diff-check aprovados. Sem
+  TS/TSX/dist, sem TSC necessário. Commit local com 22 arquivos do lote.
+
+## 13/10/2026 — preflight do reforço LIVE autorizado, base 0e88f58f
+
+- Caller `_maybe_pyramid` agora passa P04B compartilhado, reserva oficial por
+  trade/nível, autoridade final após esperas e guards de ownership. Proteção
+  existente por IDs exatos/closePosition e exposição fresh, sem re-bracket.
+- Qty/nível só por fill terminal e admitido, writer com lock de linha/CAS.
+  UNKNOWN e falha de persistência armam latch antes de I/O e não reenviam.
+- Risco PYRAMID confirmado permanece conservadoramente no snapshot único
+  SQL e no leitor ORM enquanto o trade auto está aberto; não duplica margem
+  ou slot. Invalidade vira UNKNOWN, zero registrado continua zero conhecido.
+  Pode superestimar risco após avanço do SL/ledger: limite não foi aumentado.
+- OFF/defaults, limites, alavancagem, posição manual e âncora da gestão
+  preservados. O código LIVE foi alterado com autorização específica; nenhum
+  ambiente real foi acessado/alterado e nenhuma ordem real foi enviada.
+- Provas finais: 50 focais OK 2×; PG16/asyncpg local 21 checks OK 2×, socket
+  exclusivo/sem TCP ou DNS, clusters encerrados; backend 3.109 executados,
+  3.107 aprovados, apenas 2 skips históricos R05C por fixture privada ausente.
+  Paridade AST P04 contra base original OK. Sem TS/TSX/dist ou DDL novos.
+- Não declarar réplica integral: novas portas PYRAMID do replay e cadeia de
+  segmentos ainda não implementadas. UNKNOWN/retry terminal não receberam
+  recuperação automática nova. Detalhes e retomada:
+  `LIVE_PYRAMID_PREFLIGHT_FIX.md` / `LIVE_EVENT_STUDY_CHECKPOINT.md`.
+- Commit somente local; nenhum push/deploy nesta etapa.
+
+## 14/10/2026 — portas PYRAMID e cadeia por eventos (base 31523017)
+
+- Adicionadas portas explícitas de proteção/posição/saldo/autoridade/leitura e
+  writer ao adapter isolado; consumo de memória versionada, reserva inicial
+  real do reforço, risco confirmado e proposal/final-check dos callers nativos.
+  Persistência declarada RECEIPT_BOUND_SIMULATED_PORTS, não autoridade PG real.
+- Cadeia ENTRY → MANAGEMENT → PYRAMID → MANAGEMENT provada LONG/SHORT com
+  fills próprios/ledger; identidade, qty inicial, entry-base, relógios e IDs
+  preservados. Carteira causal não antecipa reforço, resultado ou liberação.
+  UNKNOWN retém capacidade; fill parcial não vira quantidade planejada.
+- Dois defeitos reais do caller LIVE anterior corrigidos no escopo autorizado:
+  TF original lido por FK (RealTrade não possui timeframe), e TP1 já realizado
+  não vira obrigação futura no preflight pós-TP1. TP2/risco/margem/autoridade
+  e todos os defaults continuam exigidos; entrada normal preserva RR1.
+- Provas: 170 focais consolidados OK; backend 3.179 executados, 3.177 aprovados
+  e 2 skips históricos R05C; PG16/asyncpg descartável 50 checks OK 2×, risco
+  retido 21 OK. Sintaxe 10 Python e diff-check OK, nenhum frontend/DDL novo.
+- Lote integral permanece LOCAL_RESEARCH_PARTIAL: sizing upstream, export
+  bruto com todos os excluídos e carteira financeira integral ainda técnicos.
+  A réplica de caixa/Binance não é provada: partial_cash_recognized=false,
+  broker_balance_replica=false. Nenhuma aprovação operacional ou lucro alegado.
+- Detalhes: LIVE_PYRAMID_EVENT_CHAIN.md / LIVE_EVENT_STUDY_CHECKPOINT.md.
+  Pessoais, posição manual, histórico, flags/limites preservados. Sem acesso
+  a produção, ordem, ativação, mensagem real, push ou deploy; commit local.
+
+## 14/10/2026 — consumidor de sizing upstream no replay (base 5d1647e5)
+
+- Novo pedido/relatório versionado, trecho original AST do caller e helpers
+  reais: funding-EV, risco/convicção/edge/aprendizado/tilt, equity/qty/caps,
+  damp/short-slip/liquidez/regime/decay/filler e canário na ordem nativa.
+  Config explícita, caches ordenados causais, rede/credenciais bloqueadas.
+- ENTRY que declara stack exige pedido vinculado por identidade exata e
+  configuração. Admissão usa qty final nativa, sem duplicar stack/canário;
+  missing obrigatório vira TECHNICAL_GAP e braço não comparável, não zero
+  financeiro conhecido. PYRAMID preserva sua política própria. Kelly da tela
+  não vira tamanho operacional. Hashes não autenticam a origem dos inputs.
+- 62 focais OK 2×; PG16/asyncpg descartável 58 checks OK 2×, incluindo cadeia
+  nativa, recomposição, persistência, restart e catálogo DRAFT inativo. Zero
+  TCP/DNS/Unix externo, clusters encerrados. Sintaxe oito Python e diff-check
+  OK; nenhuma alteração LIVE, DDL/ENV/flag/endpoint ou frontend nesta camada.
+- Backend completo: 3.241 executados / 3.239 aprovados / apenas dois skips
+  históricos R05C por fixture auditada privada ausente, sem skip novo. Uma
+  rodada final com fonte congelada, exit 0; log no checkpoint.
+- Limite explícito: consumidor não reproduz produtor de risco/alavancagem,
+  elegibilidade/calibração/filler, escritor de caches ou estado do batch.
+  Export frio causal integral e caixa/Binance também seguem técnicos. Lote
+  LOCAL_RESEARCH_PARTIAL, sem estudo real ou aprovação operacional alegados.
+- Relatório e retomada: LIVE_UPSTREAM_SIZING_RESEARCH.md /
+  LIVE_EVENT_STUDY_CHECKPOINT.md. Pessoais, manual, histórico e defaults
+  preservados. Sem produção, ordem, ativação, mensagem, push ou deploy.
+
+## 15/10/2026 — produtores nominais e contexto filler (base 1a6a4ded)
+
+- _compute_leverage/throttle/is_btc_symbol nativos, lista pós-build inteira,
+  fonte/caller/ordem AST explícitos. Perfis/caps/round/rawsymbol preservados;
+  recomposição rejeita resultado econômico adulterado mesmo re-hasheado.
+- Sort estável e gate filler nativos; contadores incrementam só pelo trecho
+  original após retorno observado de persistência sem incidente. Prefixo e
+  relógios vinculados, duplicatas/UNKNOWN recusados, teste OFF não lê contador.
+  Persistência e leitores iniciais são observados, não DB/writers replicados.
+- Vínculos opcionais fonte/batch/relógio/risco/lev/rec/config/counter chegam ao
+  sizing/execução/estudo e producer_refs. Consumidor não reaplica canário.
+  Revisão fechou inversão nominal→filler e membros filler sem origem nominal;
+  controles recusam adulterações mesmo com hashes refeitos.
+- LIVE, parâmetros, limites, defaults, conta/manual/histórico preservados;
+  nenhum DDL/ENV/rota/frontend/worker de produção ou acesso externo. Quatro
+  autoridades falsas, catálogo DRAFT, lote LOCAL_RESEARCH_PARTIAL. Não alegar
+  lucro/menos stops, aprovação econômica ou equivalência integral do bot.
+- Pendências/provas finais: LIVE_SIZING_PRODUCERS_AND_BATCH.md /
+  LIVE_EVENT_STUDY_CHECKPOINT.md. Sem push/deploy; commit somente local.
+- Provas finais com fontes congeladas: 134 focais OK 2×; PG16/asyncpg local
+  66 checks OK 2× (58 anteriores + oito novos), fonte/refs/qty/ledger, catálogo
+  DRAFT, restart/JSONB e GET sem replay/escrita. Zero rede externa, clusters
+  encerrados; sintaxe 11 Python e diff-check limpos. Nenhum TS/TSX/dist novo.
+- Backend completo: 3.313 executados / 3.311 aprovados / dois skips R05C
+  históricos da fixture auditada privada ausente. Uma rodada final com fontes
+  congeladas, exit 0 (598,5 s), sem skip novo; log no checkpoint. Somente 16
+  arquivos do bloco no commit, pessoais e outros projetos preservados.
+
+## 15/10/2026 — diagnóstico de entrada e clareza do scanner
+
+- Logs de produção confirmaram tentativas recentes barradas por reconhecimento
+  manual APE INVALIDATED, não scanner parado. Não atribuímos os 50 dias inteiros
+  nem lucro perdido a essa amostra. Versão publicada anterior era 80d7ece8.
+- Confirmação humana explícita da posição atual → um reconhecimento oficial
+  MANUAL_ACK_OK após leitura fresca → ciclo oficial ACTIVE/prova ACCOUNT.
+  Sem ordem forçada, gestão da manual, afrouxamento de risco ou bypass.
+- Veredito manual detalhado mantém o predicado (738 paridades independentes).
+  Resumo público sem conta/posição/fingerprint; erro=desconhecido. Duas leituras
+  DB adicionais, nenhum I/O de exchange pelo GET. Skip conserva motivo real.
+- UI: estado manual mesmo com zero incidentes, força não é probabilidade,
+  preço versus zona/stop/TP1 antes dos detalhes, dados antigos descartados,
+  qualidade parcial não promete entrada, controles e responsividade revistos.
+  Rotas/payloads/confirmações preservados; frontend/dist intocado.
+- Estado final: backend 3.323 executados / 3.321 aprovados / dois skips R05C
+  históricos; 299 críticos, 113 apresentação/diagnóstico, 115 frontend,
+  TypeScript/build temporário/sintaxe/diff-check OK. PG16 Unix-only: manual
+  boot 46, dispatch 32, fechamento 73; risco pyramiding 21. Clusters encerrados.
+- QA em quatro larguras com dados sintéticos: sem overflow horizontal;
+  captura e DOM verificaram estado manual e troca entre ativos. Sem teste em
+  device físico/leitor de tela; sem pretensão de prova financeira.
+- Origem remota 885477d2 (site de outro projeto) integrada sem sobrescrever;
+  publicação conjunta inclui seis commits locais anteriores já autorizados.
+  Nenhuma flag/ENV nova ou alterada, nenhuma candidata ativada. Confirmar
+  versão/boot/diagnóstico e asset da Vercel após o push. Ver detalhes em
+  OPERACAO_E_SCANNER_2026_10_15.md. Próximo aceite: entrada natural, não forçada.

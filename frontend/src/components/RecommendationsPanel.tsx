@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, Sparkles, TrendingUp, TrendingDown, RefreshCw, AlertTriangle, Brain } from 'lucide-react'
 import { api } from '../services/api'
 import { fmtRR } from '../utils/rr'
+import RecommendationExecutionSummary from './RecommendationExecutionSummary'
+import { calibratedProbabilities, recommendationPresentation } from '../lib/recommendationPresentation'
 import type { Recommendation, RecommendationTier } from '../types'
 
 interface HistoricalStat {
@@ -47,9 +49,9 @@ const TIER_CONFIG: Record<RecommendationTier, { label: string; bg: string; borde
 }
 
 const TIER_DESC: Record<RecommendationTier, string> = {
-  'A+': 'Setup premium — confluência alta + MTF alinhado + R:R ≥ 2.5',
-  'A':  'Setup forte — confluência boa + MTF a favor + R:R ≥ 2.0',
-  'B':  'Setup aceitável — confluência média, validar entrada',
+  'A+': 'Classificação mais alta de qualidade do modelo',
+  'A':  'Classificação de qualidade do modelo',
+  'B':  'Classificação de qualidade do modelo — requer análise',
 }
 
 function fmt(n: number) {
@@ -112,14 +114,12 @@ function operationType(tf: string): { label: string; cls: string; hint: string }
   }
 }
 
-// Edges = sinais que historicamente elevam o win-rate (learning-insights: A+ ~92%,
-// funding em squeeze ~100%, padrão forte ~90%, MTF alinhado ~82% vs baseline ~72%).
-// Tooltip explica cada um; o bot usa essas tags pra escalar o size (EDGE_SIZING).
+// Tags descritivas do setup; não são probabilidades nem autorização de entrada.
 const EDGE_TAG_META: Record<string, { label: string; hint: string }> = {
-  'A+': { label: 'A+', hint: 'Tier A+ — setup premium. Historicamente ~92% win-rate.' },
-  'funding': { label: 'funding', hint: 'Funding em squeeze a favor da direção (~100% wr histórico em squeeze).' },
-  'padrão': { label: 'padrão', hint: 'Padrão gráfico forte alinhado (conf ≥ 0.65). ~90% wr em padrões fortes.' },
-  'MTF': { label: 'MTF', hint: 'Múltiplos timeframes alinhados (≥ 2). ~82% wr quando MTF concorda.' },
+  'A+': { label: 'A+', hint: 'Classificação de qualidade do setup. Não confirma entrada nem probabilidade de lucro.' },
+  'funding': { label: 'funding', hint: 'Condição de funding identificada pelo modelo; não é garantia de resultado.' },
+  'padrão': { label: 'padrão', hint: 'Padrão gráfico alinhado identificado. Confiança do padrão não é probabilidade de lucro.' },
+  'MTF': { label: 'MTF', hint: 'Múltiplos timeframes alinhados. Não substitui os demais critérios de execução.' },
 }
 
 // Nomes legíveis (PT-BR) dos padrões gráficos — pro chip de "padrão" dizer QUAL
@@ -186,8 +186,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
   const [openKeys, setOpenKeys] = useState<Set<string>>(new Set())
   const [filter, setFilter] = useState<RecommendationTier | 'all'>('all')
   const [originFilter, setOriginFilter] = useState<'all' | 'bot' | 'observation'>('all')
-  // "Só aprovados": mostra apenas recs que passam nos gates de qualidade do bot
-  // (bot_verdict.ok === true — R:R/P(TP1)/liquidez), independente da origem.
+  // Filtro somente de qualidade parcial, nunca de autorização de execução.
   const [qualityOnly, setQualityOnly] = useState(false)
   const [progress, setProgress] = useState<string>('')
   const [historical, setHistorical] = useState<Record<string, HistoricalStat>>({})
@@ -217,8 +216,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
     reasons: string[]
   } | null>(null)
 
-  // Veredito de execução do bot por símbolo+direção: por que uma rec NÃO virou
-  // trade real (gate que barrou). Alinha "recomendado" com "o bot vai operar".
+  // Registro histórico por símbolo+direção, não uma autorização deste timeframe.
   const [skipReasons, setSkipReasons] = useState<Record<string, { gate: string; reason: string; ts: string }>>({})
 
   useEffect(() => {
@@ -238,7 +236,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
           const map: Record<string, { gate: string; reason: string; ts: string }> = {}
           for (const it of sk.items as Array<{ symbol: string; gate: string; reason: string; ts: string; direction?: string }>) {
             const age = now - new Date(it.ts).getTime()
-            if (age > 20 * 60_000) continue
+            if (!Number.isFinite(age) || age < 0 || age > 20 * 60_000) continue
             const key = `${it.symbol}__${it.direction ?? ''}`
             map[key] = { gate: it.gate, reason: it.reason, ts: it.ts }
           }
@@ -257,8 +255,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
     setProgress('Carregando recomendações…')
     try {
       // Duas fontes, de propósito desacopladas:
-      //  • PRD (api.recommendations) → as recs que o BOT realmente opera (top-60
-      //    que ele executa na sexta). Marcadas 🤖 BOT OPERA.
+      //  • PRD (api.recommendations) → recomendações, não entradas autorizadas.
       //  • TESTES (api.recommendationsObservation) → universo amplo de perpétuos,
       //    shadow, DB separado. O bot NÃO opera; são pro usuário analisar no
       //    TradingView. Marcadas 👁 OBSERVAÇÃO. Falha graciosa (se testes cair,
@@ -270,7 +267,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
 
       const botRecs: Recommendation[] = botRes.recommendations.map(r => ({ ...r, origin: 'bot' as const }))
       // Chave de dedupe: símbolo base + timeframe + direção. Se a mesma rec
-      // aparece nas duas fontes, a do BOT vence (é a que ele opera de fato).
+      // aparece nas duas fontes, a fonte PRD vence sem duplicar o setup.
       const botKeys = new Set(botRecs.map(r => `${symbolBase(r.symbol)}_${r.timeframe}_${r.direction}`))
       const obsOnly: Recommendation[] = obsRecs
         .filter(r => !botKeys.has(`${symbolBase(r.symbol)}_${r.timeframe}_${r.direction}`))
@@ -368,7 +365,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
   const byTier = filter === 'all' ? visibleRecs : visibleRecs.filter(r => r.tier === filter)
   const byOrigin =
     originFilter === 'all' ? byTier : byTier.filter(r => (r.origin ?? 'bot') === originFilter)
-  // Filtro de qualidade: só os que o bot aprovaria (passam nos gates R:R/P(TP1)/liquidez)
+  // Filtro de qualidade parcial; preserva o mesmo predicado e a ordenação.
   const qualityApprovedCount = visibleRecs.filter(r => r.bot_verdict?.ok === true).length
   const filtered = qualityOnly ? byOrigin.filter(r => r.bot_verdict?.ok === true) : byOrigin
 
@@ -458,16 +455,16 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
   }
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
+    <div className="app-overlay fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-2 sm:p-4">
       <div className="w-full max-w-5xl max-h-[92vh] bg-[#0a0e1a] border border-slate-700 rounded-xl flex flex-col overflow-hidden shadow-2xl">
 
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-gradient-to-r from-slate-900 to-slate-800">
           <div className="flex items-center gap-2">
             <Sparkles className="w-5 h-5 text-yellow-400" />
-            <h2 className="text-base font-bold text-white">Trades Recomendados</h2>
+            <h2 className="text-base font-bold text-white">Recomendações</h2>
             <span className="text-xs text-slate-500 hidden sm:inline">
-              · varredura dos top 30 perpétuos por volume
+              · setups para acompanhar
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -567,11 +564,11 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
           )}
         </div>
 
-        {/* Origem: o que o BOT opera vs só OBSERVAÇÃO (pro usuário analisar) */}
+        {/* Origem do setup, sem promessa de execução. */}
         <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-800 overflow-x-auto">
           {([
             { key: 'all', label: 'Tudo', count: recs.length },
-            { key: 'bot', label: '🤖 Bot opera', count: originCounts.bot },
+            { key: 'bot', label: 'Recomendações PRD', count: originCounts.bot },
             { key: 'observation', label: '👁 Observação', count: originCounts.observation },
           ] as const).map(opt => {
             const active = originFilter === opt.key
@@ -595,18 +592,18 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
           {/* Toggle: só os que o bot APROVARIA (passam nos gates de qualidade) */}
           <button
             onClick={() => setQualityOnly(v => !v)}
-            title="Mostra só as recomendações que passam nos MESMOS gates de qualidade do bot (R:R, P(TP1), liquidez). As que o bot operaria de verdade."
+            title="Filtra qualidade parcial (R:R, P(TP1), liquidez). Não confirma preço, saldo, risco, proteção ou autorização para entrar."
             className={`flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs font-semibold whitespace-nowrap transition-colors ${
               qualityOnly
                 ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-200'
                 : 'bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200'
             }`}
           >
-            <span>{qualityOnly ? '✅' : '☑️'} Só aprovados pelo bot</span>
+            <span>{qualityOnly ? '☑' : '☐'} Qualidade parcial atendida</span>
             <span className="text-slate-500">({qualityApprovedCount})</span>
           </button>
           <span className="ml-auto text-[10px] text-slate-500 whitespace-nowrap hidden sm:inline">
-            🤖 = o bot opera · 👁 = só pra você analisar (TradingView)
+            Origem do setup ≠ autorização de entrada
           </span>
         </div>
 
@@ -645,8 +642,8 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                 Nenhum setup {filter === 'all' ? '' : `Tier ${filter}`} no momento
               </p>
               <p className="text-xs text-slate-500 max-w-md">
-                Esperar é a operação correta. Forçar trade em mercado lateral é perda garantida —
-                o sistema só recomenda quando há real confluência.
+                Nenhum setup atende aos filtros desta tela nesta leitura.
+                Isso não informa, por si só, se o bot está disponível para operar.
               </p>
             </div>
           )}
@@ -669,13 +666,9 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
               // TODOS os gates do loop: proximity, atr, allowlist, time-block…) com
               // o veredito de qualidade. skip-reasons tem prioridade quando existe.
               const skip = isObs ? undefined : skipReasons[`${r.symbol}__${r.direction}`]
-              const blocked = isObs
-                ? undefined
-                : skip
-                  ? { gate: skip.gate, reason: skip.reason }
-                  : verdict && verdict.ok === false && verdict.blocked_by
-                    ? { gate: verdict.blocked_by, reason: verdict.reason ?? '' }
-                    : undefined
+              const presentation = recommendationPresentation(r, skip)
+              const blocked = presentation.blocked
+              const probabilities = calibratedProbabilities(r)
               return (
                 <div key={rkey} className="flex flex-col">
                 <button
@@ -696,38 +689,34 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                     {/* Symbol + direction + op type */}
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
-                        {/* Origem/veredito: 👁 observação · ⛔ bot recusou (gate) · 🤖 bot opera */}
+                        {/* Origem e qualidade não são autoridade de entrada. */}
                         <span
-                          title={isObs
-                            ? 'OBSERVAÇÃO — o bot NÃO opera essa. Vem do ambiente de testes (universo amplo). Use pra analisar no TradingView e aprender.'
-                            : blocked
-                              ? `BOT NÃO OPERA — recusada na execução pelo gate "${blocked.gate}": ${blocked.reason}. A recomendação continua válida pra você analisar, mas o bot não abriu por essa razão.`
-                              : 'BOT OPERA — passou em todos os gates de execução; está no universo que o bot executa de verdade.'}
+                          title={isObs ? 'Fonte de testes, somente observação.' : 'Fonte de produção. A recomendação não confirma passagem por todos os gates de execução.'}
                           className={`px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${
                             isObs
                               ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
                               : blocked
                                 ? 'bg-red-500/15 text-red-300 border-red-500/40'
-                                : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+                                : 'bg-slate-700/40 text-slate-200 border-slate-600/60'
                           }`}
                         >
-                          {isObs ? '👁 OBSERVAÇÃO' : blocked ? `⛔ BOT NÃO OPERA · ${gateLabel(blocked.gate)}` : '🤖 BOT OPERA'}
+                          {presentation.source}
                         </span>
                         {/* Vetagem de qualidade pra OBSERVAÇÃO: mesma lógica do bot
                             (R:R/P(TP1)/liquidez) aplicada às indicações do universo
                             amplo — diz se o setup atende o padrão que o bot exige. */}
                         {isObs && verdict && (
                           <span
-                            title={verdict.ok
-                              ? 'CRITÉRIO DO BOT: passa nos gates de qualidade (R:R, P(TP1), liquidez). Mesmo sendo observação, esse setup atende o padrão que o bot exige pra operar.'
+                            title={verdict.ok === true
+                              ? 'Atende aos critérios parciais de qualidade. Não confirma execução nem entrada manual.'
                               : `CRITÉRIO DO BOT: NÃO passa — barrado em "${verdict.blocked_by}": ${verdict.reason}.`}
                             className={`px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${
-                              verdict.ok
+                              verdict.ok === true
                                 ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
                                 : 'bg-amber-500/15 text-amber-300 border-amber-500/40'
                             }`}
                           >
-                            {verdict.ok ? '✅ critério do bot' : `⚠ ${gateLabel(verdict.blocked_by ?? '')}`}
+                            {verdict.ok === true ? 'Qualidade parcial atendida' : `⚠ ${gateLabel(verdict.blocked_by ?? '')}`}
                           </span>
                         )}
                         <span className="text-sm font-bold text-white">{symbolBase(r.symbol)}</span>
@@ -751,7 +740,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                             em timeframe relevante — destaque vs ruído de TF baixo. */}
                         {['12h', '1d', '3d', '1w'].includes(r.timeframe) && (
                           <span
-                            title={`Setup originado em timeframe ALTO (${r.timeframe.toUpperCase()}). Padrões gráficos em TFs altos são mais confiáveis — rompimentos limpos, menos ruído.`}
+                            title={`Setup originado em timeframe ${r.timeframe.toUpperCase()}. A escala temporal não garante confiabilidade nem confirma entrada.`}
                             className="px-1.5 py-0.5 rounded text-[9px] font-bold border bg-indigo-500/15 text-indigo-300 border-indigo-500/40 whitespace-nowrap"
                           >
                             📊 {r.timeframe.toUpperCase()}
@@ -826,56 +815,39 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                     <div className="flex-shrink-0 text-right">
                       <div
                         className="text-sm font-bold text-white"
-                        title="Score V2 (régua recalibrada): índice ponderado de confluência (60%), tendência/ADX (30%) e derivativos (10%). Faixa típica ~15–75 — números menores que o modelo antigo são esperados. Compare pelo TIER e pela P(TP1)%, não pelo valor absoluto. Cortes: A+ ≥65 · A ≥46 · B ≥18."
+                        title="Pontuação técnica recebida do modelo. Não é porcentagem de acerto nem confirmação de entrada."
                       >
                         {r.score.toFixed(0)}
                       </div>
-                      <div className="text-[10px] text-slate-500">score V2</div>
-                      {/* Veredito de ENTRADA MANUAL — lê o entry_grade do backend
-                          (qualidade dos gates + piso de auto-execução SCORE_MIN):
-                          distingue "o bot abriria" de "só dá pra entrar manual".
-                          Existe pra você não pular setup bom por causa do número
-                          "baixo" do Score V2 (A já vale ≥46), mas sem fingir que um
-                          setup abaixo do piso de execução é igual aos que o bot abre. */}
-                      {(() => {
-                        const grade = r.entry_grade
-                          ?? (verdict?.ok === false ? 'avoid' : (r.tier === 'A+' || r.tier === 'A') ? 'good' : 'manual')
-                        const ev = grade === 'avoid'
-                          ? { lbl: '⛔ Evitar', cls: 'bg-red-500/15 text-red-300 border-red-500/40',
-                              hint: `Não passa nos gates de qualidade do bot${verdict?.blocked_by ? ` (${verdict.blocked_by})` : ''} — melhor não entrar.` }
-                          : grade === 'manual'
-                            ? { lbl: '🟡 Dá pra entrar', cls: 'bg-amber-500/15 text-amber-300 border-amber-500/40',
-                                hint: 'Passa na qualidade (R:R/P(TP1)/liquidez), mas o Score está abaixo do piso de auto-execução do bot — ele NÃO abriria sozinho. Dá pra entrar manualmente, com cautela.' }
-                            : { lbl: '✅ Bom pra entrar', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
-                                hint: 'Passa nos gates de qualidade E o Score atinge o piso de auto-execução: é o tipo de setup que o próprio bot abre. Ignore o número "baixo" do Score — a régua V2 vai só até ~75.' }
-                        return (
-                          <div title={ev.hint} className={`mt-1 inline-block px-1.5 py-0.5 rounded text-[9px] font-bold border whitespace-nowrap ${ev.cls}`}>
-                            {ev.lbl}
-                          </div>
-                        )
-                      })()}
-                      {r.prob_tp1 != null && (
+                      <div className="text-[10px] text-slate-500">score técnico</div>
+                      <div className="mt-1 max-w-28 text-[10px] text-slate-400" title={presentation.note}>
+                        {presentation.quality}
+                      </div>
+                      {probabilities && (
                         <div
                           className="text-[10px] text-sky-300 font-mono mt-0.5"
-                          title="P(TP1)/P(TP2) calibradas empiricamente — mapeiam score → win rate observado em snapshots resolvidos (PAV + shrinkage bayesiano). P(TP2) = prob de correr até o TP2 (subconjunto de P(TP1))."
+                          title="Frequência histórica calibrada de tocar o alvo em setups resolvidos. Não mede a chance de o bot abrir a operação e não garante resultado futuro."
                         >
-                          P {(r.prob_tp1 * 100).toFixed(0)}%
-                          {r.prob_tp2 != null && (
-                            <span className="text-green-300/80"> · TP2 {(r.prob_tp2 * 100).toFixed(0)}%</span>
+                          Histórico TP1 {(probabilities.tp1 * 100).toFixed(0)}%
+                          {probabilities.tp2 != null && (
+                            <span className="text-green-300/80"> · TP2 {(probabilities.tp2 * 100).toFixed(0)}%</span>
                           )}
                         </div>
                       )}
                       {/* R06B2: sem percentual quando o contrato não permite o
                           lookup. Payload antigo (sem probability_provenance)
                           não mostra nada — comportamento anterior preservado. */}
-                      {r.prob_tp1 == null && (() => {
+                      {!probabilities && (() => {
                         const st = r.probability_provenance?.status
+                        // Payload legado sem proveniência continua sem número
+                        // e sem novo selo. Ausência não vira aprovação.
                         if (st == null) return null
+                        if (st === 'READY') return <div className="text-[10px] text-slate-400 mt-0.5">Probabilidade calibrada não confirmada</div>
                         if (st === 'CALIBRATION_UNAVAILABLE') {
                           return (
                             <div
                               className="text-[10px] text-slate-400 mt-0.5"
-                              title="A calibração score → P(TP1) ainda não tem amostra suficiente. Não é incompatibilidade; o bot segue operando com os demais gates."
+                              title="A calibração não forneceu probabilidade nesta leitura. Isso não confirma disponibilidade do bot nem autorização para entrar."
                             >
                               Calibração ainda indisponível
                             </div>
@@ -891,7 +863,6 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                             </div>
                           )
                         }
-                        if (st === 'READY') return null
                         return (
                           <div
                             className="text-[10px] text-amber-300 mt-0.5"
@@ -937,13 +908,14 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                       )}
                       {r.chase_level === 'ok' && (
                         <span className="px-2 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300">
-                          🟢 entry ainda viável
+                          Preço próximo da zona · execução não confirmada
                         </span>
                       )}
                     </div>
                   )}
+                  <RecommendationExecutionSummary recommendation={r} skip={skip} />
                   {/* Levels resumido — agora com TP1 + TP2 */}
-                  <div className="grid grid-cols-5 gap-2 mt-2 pt-2 border-t border-slate-800/60 text-[11px]">
+                  <div className="grid grid-cols-3 sm:grid-cols-5 gap-2 mt-2 pt-2 border-t border-slate-800/60 text-[11px]">
                     <div>
                       <div className="text-slate-600">Entrada</div>
                       <div className="font-mono text-yellow-300">{fmt(r.entry)}</div>
@@ -952,11 +924,11 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                       <div className="text-slate-600">Stop</div>
                       <div className="font-mono text-red-300">{fmt(r.stop_loss)}</div>
                     </div>
-                    <div title="50% da posição sai aqui — depois stop sobe pra entrada (breakeven)">
+                    <div title="Primeiro alvo informado. Parciais e proteção dependem da política vigente e da execução confirmada.">
                       <div className="text-slate-600">TP1</div>
-                      <div className="font-mono text-emerald-300">{fmt(r.signal?.tp1 ?? r.entry)}</div>
+                      <div className="font-mono text-emerald-300">{typeof r.signal?.tp1 === 'number' && Number.isFinite(r.signal.tp1) && r.signal.tp1 > 0 ? fmt(r.signal.tp1) : '—'}</div>
                     </div>
-                    <div title="Saída final dos 50% restantes (ou trail por ATR)">
+                    <div title="Segundo alvo informado; não garante execução de saída.">
                       <div className="text-slate-600">TP2</div>
                       <div className="font-mono text-green-300">{fmt(r.tp2)}</div>
                     </div>
@@ -1094,8 +1066,9 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                         </button>
                       </div>
                       <p className="text-[9px] text-slate-500 leading-snug">
-                        Você abre na corretora; o bot coloca SL+TP1+TP2 e gerencia o BE pós-TP1.
-                        Níveis herdados da rec. Qty vazio = lê automático da posição na conta.
+                        Você abre na corretora. A confirmação solicita vínculo e gestão da posição existente,
+                        podendo criar proteções; confira o resultado. Níveis vêm da recomendação.
+                        Qty vazio solicita leitura da posição na conta.
                       </p>
                     </div>
                   ) : (
@@ -1103,7 +1076,7 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
                       onClick={() => openConfirm(r, rkey)}
                       className="w-full py-1 rounded-lg border border-slate-700 bg-slate-800/40 hover:bg-slate-700/60 text-[11px] font-semibold text-emerald-300 transition-colors"
                     >
-                      ✅ Confirmar que entrei nessa
+                      Registrar entrada já aberta
                     </button>
                   )}
                   {confirmToast?.k === rkey && (
@@ -1127,11 +1100,11 @@ export default function RecommendationsPanel({ onClose, onSelectSymbol, focus, o
           <span className="text-green-400">A</span> {TIER_DESC['A']} ·{' '}
           <span className="text-blue-400">B</span> {TIER_DESC['B']}
           <br />
-          <strong className="text-slate-400">Score V2:</strong> régua recalibrada (faixa típica ~15–75; cortes A+ ≥65 · A ≥46 · B ≥18). Valores são menores que o modelo antigo — guie-se pelo tier e pela P(TP1)%, não pelo número absoluto.
+          <strong className="text-slate-400">Score:</strong> pontuação técnica, não probabilidade. Tier, score e histórico não confirmam entrada agora. Confira preço, zona e bloqueios.
           <br />
           Atualiza automaticamente a cada 2 min · Cache backend 90s
           <br />
-          <strong className="text-slate-400">Alavancagem:</strong> dimensionada para 10% da banca em margem · risco por trade A+ 1.5% / A 1% / B 0.5%. Quanto mais perto o stop, mais leverage cabe (calculado individualmente por setup).
+          <strong className="text-slate-400">Risco e alavancagem:</strong> valores do plano recebido. O executor aplica seus limites e faz novas validações antes de uma ordem; esta tela não autoriza execução.
         </div>
       </div>
     </div>

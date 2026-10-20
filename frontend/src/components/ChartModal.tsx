@@ -89,7 +89,7 @@ export default function ChartModal({ symbol, timeframe: initialTf, onClose }: Pr
   }, [onClose])
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-3">
+    <div className="app-overlay fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-3">
       <div className="bg-[#0d1320] border border-slate-700/60 rounded-xl w-full max-w-6xl h-[92vh] flex flex-col shadow-2xl">
         {/* Modal header */}
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-800 flex-shrink-0">

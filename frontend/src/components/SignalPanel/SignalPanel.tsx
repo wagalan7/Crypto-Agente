@@ -1,5 +1,6 @@
 import type { TradeSignal, SignalDirection, TradeType } from '../../types'
 import { roundRR } from '../../utils/rr'
+import { positivePrice, scannerSituation } from '../../lib/scannerDecision'
 import { TrendingUp, TrendingDown, Minus, Target, ShieldAlert, Brain, Activity, FileText, Layers, AlertTriangle, Crosshair, BarChart3, History, GitCompare, BarChartHorizontal, LayoutGrid } from 'lucide-react'
 
 interface Props {
@@ -22,22 +23,24 @@ const TRADE_TYPE_CONFIG: Record<TradeType, { label: string; color: string }> = {
 }
 
 function fmt(n: number) {
+  if (!positivePrice(n)) return 'Não informado'
   if (n >= 1000) return n.toFixed(2)
   if (n >= 1) return n.toFixed(4)
   return n.toFixed(8)
 }
 
 function pct(a: number, b: number) {
+  if (!positivePrice(a) || !positivePrice(b)) return '—'
   return ((Math.abs(a - b) / b) * 100).toFixed(2)
 }
 
 function generateAnalysis(signal: TradeSignal): string {
   const { indicators: ind, direction, confidence, patterns } = signal
   const lines: string[] = []
-  const conf = Math.round(confidence * 100)
+  const conf = Number.isFinite(confidence) && confidence >= 0 && confidence <= 1 ? `${Math.round(confidence * 100)}/100` : 'não informada'
   const dirLabel = direction === 'long' ? 'COMPRA (Alta)' : direction === 'short' ? 'VENDA (Baixa)' : 'NEUTRO'
 
-  lines.push(`Direção: ${dirLabel} com ${conf}% de confiança.\n`)
+  lines.push(`Viés técnico: ${dirLabel}. Força heurística: ${conf}, não probabilidade de lucro.\n`)
 
   // RSI
   if (ind.rsi != null) {
@@ -59,7 +62,7 @@ function generateAnalysis(signal: TradeSignal): string {
   // Stochastic
   if (ind.stoch_k != null) {
     const k = ind.stoch_k
-    if (k < 20) lines.push(`Stoch RSI ${k.toFixed(0)}: Zona de sobrevenda — probabilidade de bounce.`)
+    if (k < 20) lines.push(`Stoch RSI ${k.toFixed(0)}: Zona de sobrevenda — não confirma uma reversão.`)
     else if (k > 80) lines.push(`Stoch RSI ${k.toFixed(0)}: Zona de sobrecompra — cuidado com reversão.`)
     else lines.push(`Stoch RSI ${k.toFixed(0)}: Zona neutra.`)
   }
@@ -67,8 +70,8 @@ function generateAnalysis(signal: TradeSignal): string {
   // ADX
   if (ind.adx != null) {
     const a = ind.adx
-    if (a > 40) lines.push(`ADX ${a.toFixed(1)}: Tendência muito forte — seguir a direção.`)
-    else if (a > 25) lines.push(`ADX ${a.toFixed(1)}: Tendência presente — sinal mais confiável.`)
+    if (a > 40) lines.push(`ADX ${a.toFixed(1)}: Intensidade de tendência elevada; não define o lado nem autoriza entrada.`)
+    else if (a > 25) lines.push(`ADX ${a.toFixed(1)}: Tendência presente; não mede chance de lucro.`)
     else lines.push(`ADX ${a.toFixed(1)}: Tendência fraca — mercado lateral, maior risco de falso sinal.`)
   }
 
@@ -90,7 +93,7 @@ function generateAnalysis(signal: TradeSignal): string {
   // Bollinger Bands
   if (ind.bb_upper != null && ind.bb_lower != null && ind.bb_middle != null) {
     const bw = (ind.bb_upper - ind.bb_lower) / ind.bb_middle
-    if (bw < 0.015) lines.push(`Bollinger Bands: Compressão extrema — breakout explosivo iminente.`)
+    if (bw < 0.015) lines.push(`Bollinger Bands: Bandas comprimidas — direção e rompimento ainda não confirmados.`)
     else if (signal.entry > ind.bb_upper * 0.99) lines.push(`Bollinger Bands: Preço na banda superior — momentum forte de alta.`)
     else if (signal.entry < ind.bb_lower * 1.01) lines.push(`Bollinger Bands: Preço na banda inferior — possível suporte ou continuação de queda.`)
   }
@@ -100,45 +103,24 @@ function generateAnalysis(signal: TradeSignal): string {
     lines.push(`\nPadrões gráficos detectados:`)
     patterns.slice(0, 3).forEach(p => {
       const dLabel = p.direction === 'long' ? 'alta' : p.direction === 'short' ? 'baixa' : 'neutro'
-      lines.push(`• ${p.description} (conf. ${(p.confidence * 100).toFixed(0)}%) — viés de ${dLabel}.`)
+      lines.push(`• ${p.description} (força heurística ${(p.confidence * 100).toFixed(0)}/100) — viés de ${dLabel}.`)
     })
   }
 
-  // Trade type suitability
-  const adx = ind.adx ?? 0
-  const rsi = ind.rsi ?? 50
-  const hasPatterns = patterns.length > 0
-  const highConf = confidence >= 0.65
-  const midConf = confidence >= 0.50
-
-  const scalpOk = adx > 25 && highConf
-  const dayOk = midConf && (adx > 18 || Math.abs(rsi - 50) > 10)
-  const swingOk = hasPatterns || (adx > 15 && midConf)
-
-  const scalpLabel = scalpOk ? '✅ Bom' : adx > 15 ? '⚠️ Moderado' : '❌ Fraco'
-  const dayLabel   = dayOk   ? '✅ Bom' : midConf ? '⚠️ Moderado' : '❌ Fraco'
-  const swingLabel = swingOk ? '✅ Bom' : '⚠️ Moderado'
-
-  lines.push(`\nAdequação por tipo de operação:`)
-  lines.push(`⚡ Scalp: ${scalpLabel}${!scalpOk && adx <= 25 ? ' (ADX baixo)' : ''}`)
-  lines.push(`📅 Day Trade: ${dayLabel}`)
-  lines.push(`📈 Swing Trade: ${swingLabel}${hasPatterns ? ' (padrões detectados)' : ''}`)
-
-  const best = scalpOk ? 'Scalp' : dayOk ? 'Day Trade' : 'Swing Trade'
-  lines.push(`\nMelhor para: ${best}`)
+  lines.push('\nIndicadores e padrões descrevem o contexto. Não confirmam elegibilidade, proteção ou autorização do bot.')
 
   return lines.join('\n')
 }
 
 function ConfidenceBar({ value }: { value: number }) {
-  const pctVal = Math.round(value * 100)
-  const color = value >= 0.75 ? 'bg-green-400' : value >= 0.55 ? 'bg-yellow-400' : 'bg-red-400'
+  const valid = Number.isFinite(value) && value >= 0 && value <= 1
+  const pctVal = valid ? Math.round(value * 100) : null
   return (
     <div className="flex items-center gap-2">
       <div className="flex-1 h-2 bg-slate-700 rounded-full overflow-hidden">
-        <div className={`h-full rounded-full transition-all ${color}`} style={{ width: `${pctVal}%` }} />
+        <div className="h-full rounded-full transition-all bg-sky-400" style={{ width: `${pctVal ?? 0}%` }} />
       </div>
-      <span className="text-xs text-slate-300 w-10 text-right">{pctVal}%</span>
+      <span className="text-xs text-slate-300 w-14 text-right">{pctVal == null ? '—' : `${pctVal}/100`}</span>
     </div>
   )
 }
@@ -159,38 +141,40 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
   const dir = DIRECTION_CONFIG[signal.direction]
   const DirIcon = dir.icon
   const tt = TRADE_TYPE_CONFIG[signal.trade_type]
-  const currentPrice = livePrice ?? signal.entry
+  const situation = scannerSituation(signal, livePrice)
   // R06B1: `ema12`/`ema26` são os campos canônicos (período real da média).
   // `ema9`/`ema21` ficam como fallback do payload legado durante a transição.
   const ema12 = signal.indicators.ema12 ?? signal.indicators.ema9
   const ema26 = signal.indicators.ema26 ?? signal.indicators.ema21
 
   return (
-    <div className="flex flex-col gap-3 h-full overflow-y-auto pr-1">
+    <div className="flex flex-col gap-3 min-w-0 h-full overflow-y-auto pr-1 break-words" data-scanner-analysis="true">
+      <section aria-label="Situação deste ativo" data-situation={situation.state}
+        className={`rounded-xl border p-3.5 ${situation.tone === 'attention' ? 'bg-amber-500/[0.07] border-amber-500/30' : 'bg-sky-500/[0.06] border-sky-500/25'}`}>
+        <p className="text-[10px] tracking-widest uppercase text-slate-400 mb-2">Situação deste ativo</p>
+        <h3 className={`text-base font-bold leading-snug ${situation.tone === 'attention' ? 'text-amber-200' : 'text-sky-100'}`}>{situation.title}</h3>
+        <p className="text-xs text-slate-300 leading-relaxed mt-2">{situation.detail}</p>
+        <div className="mt-3 rounded-lg border border-white/5 bg-slate-950/40 p-2.5">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <span className="text-xs text-slate-400">Última cotação recebida</span>
+            <strong className="font-mono text-base text-white">{situation.price == null ? 'Não confirmada' : fmt(situation.price)}</strong>
+          </div>
+          <p className="text-[11px] mt-1 text-slate-400">{situation.priceVsZone}</p>
+          <p className="text-[10px] mt-1 text-slate-500">Sem horário de cotação neste contrato; atualidade não certificada.</p>
+        </div>
+        <div className="mt-3 pt-2 border-t border-white/5 text-[11px] text-slate-400 leading-relaxed">
+          <span className="text-slate-200 font-semibold">Bot: execução não confirmada nesta análise.</span>{' '}
+          Nenhuma ordem é enviada por abrir o gráfico.
+        </div>
+      </section>
       {/* Direction + trade type */}
       <div className={`flex items-center justify-between p-3 rounded-lg border ${dir.bg}`}>
         <div className="flex items-center gap-2">
           <DirIcon className={`w-6 h-6 ${dir.color}`} />
-          <span className={`text-lg font-bold ${dir.color}`}>{dir.label}</span>
+          <div><p className="text-[10px] uppercase tracking-wide text-slate-400">Viés técnico</p><span className={`text-sm font-bold ${dir.color}`}>{dir.label}</span></div>
         </div>
         <span className={`text-xs font-semibold px-2 py-1 rounded border ${tt.color}`}>{tt.label}</span>
       </div>
-
-      {/* Low confidence warning */}
-      {signal.confidence < 0.75 && (
-        <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 flex items-center gap-2">
-          <span className="text-yellow-400 text-lg">⚠️</span>
-          <div>
-            <p className="text-xs font-bold text-yellow-400">AGUARDAR CONFLUÊNCIA</p>
-            {/* R06A: `confidence` é uma pontuação heurística de confluência,
-                NÃO uma probabilidade calibrada de lucro. O valor, o limite de
-                0.75 e a condição de renderização seguem inalterados — só o
-                texto foi corrigido. */}
-            <p className="text-xs text-yellow-300/70">Força do sinal: {(signal.confidence * 100).toFixed(0)}/100 — referência desta tela: 75/100</p>
-            <p className="text-[10px] text-yellow-300/50 mt-0.5">Este indicador não representa probabilidade de lucro.</p>
-          </div>
-        </div>
-      )}
 
       {/* Confidence */}
       <div className="bg-slate-800/60 rounded-lg p-3">
@@ -199,43 +183,31 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
           <span className="text-xs font-semibold text-white">{signal.signal_strength}</span>
         </div>
         <ConfidenceBar value={signal.confidence} />
-      </div>
-
-      {/* Detailed analysis */}
-      <div className="bg-slate-800/60 rounded-lg p-3">
-        <div className="flex items-center gap-1 mb-2">
-          <FileText className="w-4 h-4 text-blue-400" />
-          <span className="text-xs font-semibold text-blue-400">ANÁLISE DETALHADA</span>
+        <p className="text-[11px] leading-relaxed mt-2 text-slate-400">Força do sinal não é probabilidade de lucro.</p>
+        <div className="mt-2 pt-2 border-t border-slate-700/60">
+          <p className="text-xs text-slate-300 font-semibold">Probabilidade calibrada: não disponível</p>
+          <p className="text-[11px] text-slate-500 mt-1">O contrato deste scanner não fornece probabilidade calibrada, evento e amostra.</p>
         </div>
-        <p className="text-xs text-slate-300 leading-relaxed whitespace-pre-line">
-          {generateAnalysis(signal)}
-        </p>
       </div>
 
       {/* Add to trade manager */}
       {onAddToManager && signal.confidence >= 0.75 && (
         <button
           onClick={onAddToManager}
-          className="w-full py-2 bg-green-600/20 hover:bg-green-600/40 border border-green-500/40 rounded-lg text-xs font-bold text-green-400 transition-colors flex items-center justify-center gap-1.5"
+          title="Registra o plano no gestor manual; não libera nem inicia o bot."
+          className="w-full py-2.5 bg-sky-600/10 hover:bg-sky-600/20 border border-sky-500/30 rounded-lg text-xs font-bold text-sky-300 transition-colors flex items-center justify-center gap-1.5"
         >
-          📋 Adicionar ao Gestor de Trades
+          📋 Registrar plano no gestor manual
         </button>
       )}
 
-      {/* Live price */}
-      {livePrice && (
-        <div className="bg-slate-800/60 rounded-lg p-3 flex justify-between items-center">
-          <span className="text-xs text-slate-400">Preço Atual</span>
-          <span className="text-base font-mono font-bold text-white">{fmt(livePrice)}</span>
-        </div>
-      )}
-
       {/* Levels */}
-      <div className="bg-slate-800/60 rounded-lg p-3">
+      <section className="bg-slate-800/60 rounded-xl p-3" aria-label="Plano técnico de referência">
         <div className="flex items-center gap-1 mb-2">
           <Target className="w-4 h-4 text-slate-400" />
-          <span className="text-xs font-semibold text-slate-400">NÍVEIS DE OPERAÇÃO</span>
+          <span className="text-xs font-semibold text-slate-300">PLANO TÉCNICO DE REFERÊNCIA</span>
         </div>
+        <p className="text-[11px] leading-relaxed text-slate-500 mb-3">Níveis recebidos da análise · {signal.timeframe}. Não são uma ordem nem uma nova cotação.</p>
 
         {signal.trade_plan?.entry_zone && signal.trade_plan.entry_zone.type !== 'market' ? (
           <div className="mb-2 px-2 py-2 rounded bg-yellow-500/5 border border-yellow-500/30">
@@ -289,7 +261,16 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
             </ul>
           </div>
         )}
-      </div>
+      </section>
+
+      <details className="bg-slate-800/40 rounded-xl border border-slate-700/40 p-3" data-scanner-context="true">
+        <summary className="cursor-pointer text-xs font-semibold text-sky-300 flex items-center gap-2"><FileText className="w-4 h-4" /> Entender a análise</summary>
+        <p className="text-xs text-slate-300 leading-relaxed whitespace-pre-line mt-3">{generateAnalysis(signal)}</p>
+      </details>
+
+      <details className="rounded-xl border border-slate-700/40 p-3" data-scanner-technical="true">
+        <summary className="cursor-pointer text-xs font-semibold text-slate-300">Indicadores, padrões e contexto técnico</summary>
+        <div className="flex flex-col gap-3 mt-3 min-w-0">
 
       {/* Indicators */}
       <div className="bg-slate-800/60 rounded-lg p-3">
@@ -681,6 +662,8 @@ export function SignalPanel({ signal, livePrice, onAddToManager }: Props) {
           </p>
         </div>
       )}
+        </div>
+      </details>
     </div>
   )
 }

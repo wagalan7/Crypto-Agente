@@ -53,9 +53,21 @@ class State:
     FLAT = "FLAT"                    # terminal seguro
     RETRY_PENDING = "RETRY_PENDING"  # segurança (continua pausado)
     MANUAL_REQUIRED = "MANUAL_REQUIRED"  # segurança (continua pausado)
+    #: Terminal ESPECÍFICO: posição aberta do operador, reconhecida
+    #: explicitamente. NÃO é FLAT (a posição existe) e NÃO é PROTECTED
+    #: (reconhecer não certifica proteção). Só o incidente
+    #: `UNTRACKED_POSITION` daquela posição pode terminar assim.
+    MANUAL_ACKNOWLEDGED = "MANUAL_ACKNOWLEDGED"
 
 
+#: Estados que PROVAM segurança de uma observação de ENTRADA. Note que
+#: `MANUAL_ACKNOWLEDGED` NÃO entra aqui: reconhecer uma posição do operador não
+#: diz NADA sobre o desfecho de uma ordem despachada pelo bot — usá-lo como
+#: prova liquidaria intenção sem evidência.
 _TERMINAL_SAFE = {State.PROTECTED, State.FLAT}
+#: Estados em que o incidente está ENCERRADO com desfecho conhecido (inclui o
+#: reconhecimento manual). Só para contabilidade de ciclo/escalonamento.
+_TERMINAL_CLOSED = _TERMINAL_SAFE | {State.MANUAL_ACKNOWLEDGED}
 #: Desfecho COMPROVADO de um id despachado. `TERMINAL_ZERO` exige consulta
 #: terminal da própria identidade com quantidade final zero — FLAT, ausência de
 #: campo e lower-bound zero continuam sendo DESCONHECIDO.
@@ -553,6 +565,38 @@ class InMemoryIncidentRepo:
             row["updated_at"] = _now()
             return dict(row)
 
+    async def update_claimed_guarded(self, key: str, owner: str, *, guard,
+                                     expect: Optional[dict] = None,
+                                     **fields) -> dict:
+        """`update_claimed` com uma CONFERÊNCIA avaliada na MESMA seção crítica.
+
+        O guard recebe a sessão (aqui: `None`, repositório em memória) e precisa
+        devolver `ok=True` para a escrita acontecer. Guard negando ⇒ nada é
+        escrito e o motivo volta ao chamador.
+        """
+        async with self._lock:
+            row = self._rows.get(key)
+            if not row or row.get("resolved_at") is not None:
+                return {"ok": False, "reason_code": "INCIDENT_NOT_ELIGIBLE"}
+            if row.get("claimed_by") != owner:
+                return {"ok": False, "reason_code": "CLAIM_PERDIDO"}
+            exp = row.get("lease_expires_at")
+            if exp is None or exp < _now():
+                return {"ok": False, "reason_code": "LEASE_EXPIRADO"}
+            for campo, esperado in (expect or {}).items():
+                if row.get(campo) != esperado:
+                    return {"ok": False, "reason_code": "INCIDENT_CHANGED",
+                            "detail": campo}
+            veredito = await guard(None)
+            if not veredito.get("ok"):
+                return {"ok": False,
+                        "reason_code": str(veredito.get("reason_code")
+                                           or "GUARD_DENIED"),
+                        "detail": veredito.get("detail")}
+            row.update(fields)
+            row["updated_at"] = _now()
+            return {"ok": True, "row": dict(row), "guard": veredito}
+
     async def claim(self, key: str, owner: str, lease_until: datetime) -> bool:
         async with self._lock:
             row = self._rows.get(key)
@@ -762,6 +806,51 @@ class _SqlIncidentRepo:
             ExecutionIncident.resolved_at.is_(None),
         ), fields)
 
+    async def update_claimed_guarded(self, key: str, owner: str, *, guard,
+                                     expect: Optional[dict] = None,
+                                     **fields) -> dict:
+        """`update_claimed` com a CONFERÊNCIA na MESMA transação/sessão.
+
+        O guard recebe a sessão ABERTA e decide com as linhas que ele mesmo
+        travou; o UPDATE fencado do incidente entra no MESMO commit. Assim o CAS
+        do contexto manual e a resolução do incidente não podem ficar em
+        transações diferentes (era por aí que um reconhecimento NOVO levava
+        FLAT de uma observação velha).
+        """
+        from db import get_session
+        from models.execution_incident import ExecutionIncident
+        from sqlalchemy import update, select
+        cols = {k: v for k, v in fields.items() if k in _model_cols()}
+        cols["updated_at"] = _now()
+        async with get_session() as session:
+            veredito = await guard(session)
+            if not veredito.get("ok"):
+                # Nada foi escrito: a transação fecha sem efeito.
+                return {"ok": False,
+                        "reason_code": str(veredito.get("reason_code")
+                                           or "GUARD_DENIED"),
+                        "detail": veredito.get("detail")}
+            condicoes = [ExecutionIncident.incident_key == key,
+                         ExecutionIncident.claimed_by == owner,
+                         ExecutionIncident.lease_expires_at > _now(),
+                         ExecutionIncident.resolved_at.is_(None)]
+            for campo, esperado in (expect or {}).items():
+                coluna = getattr(ExecutionIncident, campo, None)
+                if coluna is not None:
+                    condicoes.append(coluna == esperado)
+            res = await session.execute(
+                update(ExecutionIncident).where(*condicoes).values(**cols))
+            if (res.rowcount or 0) != 1:
+                await session.rollback()
+                return {"ok": False, "reason_code": "INCIDENT_NOT_ELIGIBLE"}
+            row = (await session.execute(
+                select(ExecutionIncident)
+                .where(ExecutionIncident.incident_key == key)
+            )).scalar_one_or_none()
+            resultado = _row_to_dict(row) if row else None
+            await session.commit()
+            return {"ok": True, "row": resultado, "guard": veredito}
+
     async def claim(self, key: str, owner: str, lease_until: datetime) -> bool:
         from db import get_session
         from models.execution_incident import ExecutionIncident
@@ -862,6 +951,23 @@ async def _arm_quarantine(reason: str) -> None:
             log.critical(f"[p03] falha persistindo pausa RiskState: {exc}")
 
 
+async def _manual_cause_pending() -> bool:
+    """Há causa MANUAL pendente (conta bloqueada ou falha local não persistida)?
+
+    Zero incidentes NÃO remove essa causa: ela é estado durável próprio.
+    """
+    try:
+        from services import manual_position_service as mps
+        if mps.pending_validation_failure() is not None:
+            return True
+        estado = await mps.account_validation_state()
+        return bool(estado.get("blocked"))
+    except Exception as exc:  # noqa: BLE001 — dúvida mantém a contenção
+        log.error(f"[p03][manual-ack] estado de validação ilegível: "
+                  f"{type(exc).__name__}: {exc}")
+        return True
+
+
 async def _maybe_release_quarantine() -> bool:
     """Release owner-aware do P03 sob LOCK LOCAL. Ordem OBRIGATÓRIA: valida
     boot_scan_safe → chama o release NO BANCO PRIMEIRO (transação + advisory lock,
@@ -875,6 +981,19 @@ async def _maybe_release_quarantine() -> bool:
             return False
         if not _boot_scan_safe:
             return False
+        # Causa MANUAL pendente mantém a contenção mesmo com zero incidentes.
+        # Esta é a leitura PRELIMINAR (barata); a decisiva acontece DENTRO da
+        # transação do release, com a linha da época travada.
+        if await _manual_cause_pending():
+            _arm_local_latch("validação manual pendente — contenção mantida")
+            return False
+        try:
+            from services import manual_position_service as mps
+            fence_antes = mps.local_validation_fence()
+        except Exception as exc:  # noqa: BLE001 — dúvida mantém contenção
+            log.error(f"[p03] fence local ilegível — mantém latch: {exc}")
+            _arm_local_latch("fence local ilegível — re-armado")
+            return False
         try:
             from services import risk_service
             result = await risk_service.release_p03_pause(_PAUSE_MARKER)
@@ -883,6 +1002,15 @@ async def _maybe_release_quarantine() -> bool:
             _arm_local_latch("release exceção — re-armado")
             return False
         if result in (risk_service.RELEASE_RELEASED, risk_service.RELEASE_SAFE_OTHER_OWNER):
+            # O release foi um AWAIT: antes de limpar o owner, reconfere o
+            # protocolo local. Falha conhecida durante o commit/release exige
+            # retorno INSEGURO e re-arm, não sucesso com o latch apagado.
+            if (mps.local_validation_fence() != fence_antes
+                    or mps.pending_validation_failure() is not None):
+                _arm_local_latch("fence local avançou durante o release — re-armado")
+                log.critical("[p03] release concluído com falha manual conhecida "
+                             "no meio — latch MANTIDO")
+                return False
             # Banco CONFIRMOU (zero incidentes). Só AGORA limpa o latch owner p03.
             try:
                 from services import shadow_trade_service
@@ -1037,7 +1165,7 @@ async def _renew_or_abort(key: str, owner: str) -> bool:
 
 async def _schedule_retry(key: str, owner: str, inc: dict, state: str, reason: str) -> None:
     attempts = int(inc.get("attempts") or 0) + 1
-    if attempts >= RECONCILE_MAX_ATTEMPTS and state not in _TERMINAL_SAFE:
+    if attempts >= RECONCILE_MAX_ATTEMPTS and state not in _TERMINAL_CLOSED:
         ok = await _fenced(key, owner, state=State.MANUAL_REQUIRED, attempts=attempts,
                            last_error=reason,
                            manual_reason=f"máx. tentativas ({attempts}) sem prova de segurança: {reason}")
@@ -1685,7 +1813,7 @@ async def _cancel_extra_conditionals(key: str, owner: str, inc: dict, keep_id: O
         if not await _renew_or_abort(key, owner):
             return False, "lease perdido no meio do cancelamento — abortado"
         try:
-            res = await bss.cancel_algo_order(str(aid))
+            res = await bss.cancel_algo_order(str(aid), symbol=inc.get("symbol"))
         except Exception as exc:  # noqa: BLE001
             res = {"ok": False, "error": str(exc)}
         if not (res and res.get("ok")):   # ok=False NÃO é sucesso
@@ -1768,7 +1896,7 @@ async def _reconcile_cleanup(key: str, owner: str, inc: dict, *, confirmed_flat:
             if not await _renew_or_abort(key, owner):   # lease por CADA mutação
                 return
             try:
-                res = await bss.cancel_algo_order(str(algo_id))
+                res = await bss.cancel_algo_order(str(algo_id), symbol=inc.get("symbol"))
             except Exception as exc:  # noqa: BLE001
                 res = {"ok": False, "error": str(exc)}
             if not (res and res.get("ok")):     # ok=False NÃO é sucesso
@@ -1812,6 +1940,250 @@ UNTRACKED_RECHECK_S = _f("P03_UNTRACKED_RECHECK_S", 900.0)
 _untracked_recheck_at: dict = {}
 
 
+async def capture_manual_context(*, scope=None, symbol=None):
+    """Captura a identidade ANTES de qualquer leitura externa do ciclo.
+
+    Chamada SEMPRE antes de `get_positions(force=True)`/listagens: o resultado
+    de um GET não pode fechar/validar o que mudou depois dele.
+    """
+    try:
+        from services import manual_position_service as mps
+        return await mps.capture_validation_context(
+            scope=scope or mps.SCOPE_ACCOUNT, symbol=symbol)
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03][manual-ack] captura de contexto falhou: "
+                  f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": "MANUAL_ACK_CONTEXT_ERROR"}
+
+
+async def _manual_context_still_valid(session, contexto, *, symbol,
+                                      orders_evidence=None) -> dict:
+    """O contexto capturado ANTES das leituras ainda descreve o mundo?
+
+    Avaliado DENTRO da transação de quem vai resolver o incidente (a sessão vem
+    pronta), na ordem de locks oficial: advisory `917283` → linha da época →
+    linhas de reconhecimento por id. Confere época manual, fence local, causa
+    pendente, conta/escopo, conjunto de reconhecimentos e revisão/estado/
+    fingerprint de cada um. Um reconhecimento NOVO (ou alterado) durante o GET
+    invalida o ciclo: o incidente fica, com motivo, para o ciclo seguinte.
+    """
+    try:
+        from services import manual_position_service as mps
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason_code": "MANUAL_ACK_CONTEXT_ERROR",
+                "detail": type(exc).__name__}
+    if not isinstance(contexto, dict) or not contexto.get("ok"):
+        return {"ok": False, "reason_code": "MANUAL_ACK_CONTEXT_UNAVAILABLE"}
+    # 1. Protocolo LOCAL (síncrono, sem I/O): fence e causa pendente.
+    if int(contexto.get("local_fence") or 0) != mps.local_validation_fence():
+        return {"ok": False, "reason_code": mps.STALE_CONTEXT,
+                "detail": "fence local avançou após a captura"}
+    if mps.pending_validation_failure() is not None:
+        return {"ok": False, "reason_code": mps.VALIDATION_FAILURE,
+                "detail": "falha de validação pendente"}
+    if mps.local_symbol_block(symbol) is not None:
+        return {"ok": False, "reason_code": mps.GUARD_LOCAL_CONTAINMENT}
+    conta = str(contexto.get("account_scope") or "")
+    if str(mps.current_account_scope() or "") != conta:
+        return {"ok": False, "reason_code": mps.ACK_NO_ACCOUNT,
+                "detail": "conta vigente difere da capturada"}
+    # 2. Evidência de ordens (quando houve): precisa continuar FRESCA e completa.
+    if orders_evidence is not None:
+        prova = mps.orders_evidence_ok(orders_evidence, symbol=symbol)
+        if not prova.get("ok"):
+            return {"ok": False, "reason_code": str(prova.get("reason_code")),
+                    "detail": "ausência de ordens não provada no commit"}
+    if not conta or contexto.get("inert"):
+        # Sem identidade comprovada não existe reconhecimento manual daquela
+        # conta: o contrato INERTE continua valendo (nada a comparar no banco).
+        return {"ok": True, "reason_code": "MANUAL_CONTEXT_INERT"}
+    if session is None:
+        # Repositório em memória: sem transação real, o protocolo local acima é
+        # o que existe — e já foi conferido.
+        return {"ok": True, "reason_code": "MANUAL_CONTEXT_LOCAL_ONLY"}
+    try:
+        from models.manual_position_ack import ManualPositionAcknowledgement as Ack
+        from services.entry_intent_service import (acquire_risk_lock,
+                                                   current_manual_generation)
+        from sqlalchemy import select
+        await acquire_risk_lock(session)
+        epoca = await current_manual_generation(
+            session, account_scope=conta, exchange=mps.EXCHANGE_BINANCE,
+            market=mps.MARKET_USDM_FUTURES)
+        capturada = contexto.get("manual_generation")
+        if capturada is None or int(epoca) != int(capturada):
+            return {"ok": False, "reason_code": mps.STALE_CONTEXT,
+                    "detail": "época manual avançou após a captura"}
+        linhas = (await session.execute(
+            select(Ack).where(Ack.account_scope == conta,
+                              Ack.exchange == mps.EXCHANGE_BINANCE,
+                              Ack.market == mps.MARKET_USDM_FUTURES,
+                              Ack.state.in_(list(mps.BLOCKING_STATES)))
+            .order_by(Ack.id).with_for_update())).scalars().all()
+        instantaneos = {int(i["id"]): i for i in (contexto.get("acks") or ())}
+        if {int(l.id) for l in linhas} != set(instantaneos):
+            return {"ok": False, "reason_code": mps.STALE_CONTEXT,
+                    "detail": "conjunto de reconhecimentos mudou durante o GET"}
+        for linha in linhas:
+            esperado = instantaneos[int(linha.id)]
+            if (int(linha.revision or 0) != int(esperado["revision"])
+                    or str(linha.state) != str(esperado["state"])
+                    or str(linha.fingerprint) != str(esperado["fingerprint"])):
+                return {"ok": False, "reason_code": mps.STALE_CONTEXT,
+                        "detail": f"reconhecimento {int(linha.id)} mudou durante o GET"}
+    except Exception as exc:  # noqa: BLE001 — dúvida mantém o incidente
+        log.error(f"[p03][manual-ack] CAS do contexto falhou: "
+                  f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": "MANUAL_ACK_CONTEXT_ERROR",
+                "detail": type(exc).__name__}
+    return {"ok": True, "reason_code": "MANUAL_CONTEXT_FRESH",
+            "manual_generation": int(epoca)}
+
+
+def _exposicoes_nao_zero(brutas):
+    """Linhas RAW com exposição não-zero, pela quantidade CANÔNICA validada.
+
+    Devolve `None` quando alguma quantidade não é canonicalizável — incerteza,
+    nunca "zero". As linhas devolvidas continuam no formato RAW de
+    `get_positions` (o scan consome `size`/`symbol` desse formato); a adaptação
+    para o esquema normalizado (`qty`) é feita onde ele é realmente consumido.
+    """
+    from services import manual_position_service as mps
+    if brutas is None or not isinstance(brutas, (list, tuple)):
+        return None
+    saida = []
+    for bruta in brutas:
+        if not isinstance(bruta, dict):
+            return None
+        quantidade = mps.canonical_decimal(bruta.get("size"))
+        if quantidade is None or quantidade < 0:
+            return None
+        if quantidade > 0:
+            saida.append(bruta)
+    return saida
+
+
+async def _revalidate_manual_acks(raw_positions, *, source_ok: bool = True,
+                                  context=None, started_ms=None,
+                                  ended_ms=None) -> dict:
+    """Revalida reconhecimentos com a leitura de CONTA já feita no ciclo.
+
+    `context` é a captura ANTERIOR à leitura; sem ela nada é publicado ou
+    encerrado (novo ciclo é agendado). Nunca gasta uma segunda chamada à
+    exchange e nunca converte erro em "sem reconhecimento".
+
+    `started_ms`/`ended_ms` são a janela ORIGINAL medida em volta do GET deste
+    ciclo. Sem ela, o tempo de PROCESSAMENTO seria carimbado como prova fresca —
+    e um GET lento encerraria reconhecimento. Ausência ⇒ observação incompleta.
+    """
+    try:
+        from services import manual_position_service as mps
+        observacao = mps.observation_from_rows(
+            raw_positions, source_ok=source_ok, started_ms=started_ms,
+            ended_ms=ended_ms)
+        return await mps.revalidate_active(observation=observacao, context=context)
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03][manual-ack] revalidação falhou: {type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": "MANUAL_ACK_REVALIDATION_ERROR"}
+
+
+async def _revalidate_manual_acks_fresh() -> dict:
+    """Observação de CONTA própria, para o ciclo que não fez leitura de posições.
+
+    Integrada ao `reconcile_due` SEM depender de `_boot_scan_safe` nem da
+    existência de incidentes abertos. Antes de recuperar qualquer autorização,
+    uma falha PENDENTE local é persistida (§7.1.5).
+    """
+    try:
+        from services import manual_position_service as mps
+        if mps.pending_validation_failure() is not None:
+            await mps.flush_pending_validation_failure()
+        registro = await mps.active_acknowledgements()
+        if not registro["ok"]:
+            return {"ok": False, "reason_code": registro["reason_code"]}
+        estado = await mps.account_validation_state()
+        if not registro["acks"] and not estado.get("blocked"):
+            return {"ok": True, "reason_code": "NO_BLOCKING_ACKS", "valid": []}
+        # Captura ANTES do GET; a transação fecha antes da rede.
+        contexto = await mps.capture_validation_context(scope=mps.SCOPE_ACCOUNT)
+        observacao = await mps.observe_positions()
+        return await mps.revalidate_active(observation=observacao, context=contexto)
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[p03][manual-ack] revalidação periódica falhou: "
+                  f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "reason_code": "MANUAL_ACK_REVALIDATION_ERROR"}
+
+
+async def _manual_ack_outcome(inc: dict) -> dict:
+    """Desfecho do incidente UNTRACKED à luz do reconhecimento manual.
+
+    Só devolve `MANUAL_ACKNOWLEDGED` quando: existe reconhecimento ACTIVE para
+    AQUELE símbolo, a leitura fresca mostra UMA perna e a identidade observada
+    é IDÊNTICA à reconhecida. Qualquer dúvida mantém o incidente aberto — e
+    posição aberta jamais vira FLAT ou PROTECTED por este caminho.
+    """
+    simbolo = inc.get("symbol")
+    try:
+        from services import manual_position_service as mps
+        vinculo = await mps.ack_for_symbol(simbolo)
+        if not vinculo["ok"]:
+            return {"state": None, "reason": f"registro manual ilegível ({vinculo['reason_code']})"}
+        ack = vinculo["ack"]
+        if ack is None:
+            return {"state": None, "reason": "sem reconhecimento manual para o símbolo"}
+        if str(ack.get("state")) != "ACTIVE":
+            # INVALIDATED/WAITING_ORDERS continuam bloqueando o símbolo, mas
+            # NÃO encerram o incidente: falta confirmação nova.
+            return {"state": None,
+                    "reason": f"reconhecimento em {ack.get('state')} — não encerra a causa"}
+        # Captura ANTES do GET: um desfecho não pode encerrar a causa de um
+        # reconhecimento criado/alterado depois da leitura.
+        contexto = await mps.capture_validation_context(
+            scope=mps.SCOPE_SYMBOL, symbol=mps.canonical_symbol(simbolo))
+        if not contexto.get("ok"):
+            return {"state": None,
+                    "reason": f"contexto indisponível ({contexto.get('reason_code')})"}
+        observacao = await mps.observe_positions(mps.canonical_symbol(simbolo))
+        if not observacao["ok"]:
+            return {"state": None,
+                    "reason": f"leitura fresca indisponível ({observacao['reason_code']})"}
+        confere = await mps.revalidate_active(observation=observacao,
+                                              context=contexto)
+        if confere.get("reason_code") == mps.STALE_CONTEXT:
+            return {"state": None, "reason": "contexto vencido — novo ciclo"}
+        if not confere["ok"]:
+            return {"state": None, "reason": f"revalidação indisponível ({confere['reason_code']})"}
+        if ack.get("id") not in (confere.get("valid") or []):
+            return {"state": None,
+                    "reason": "identidade manual divergente — autorização invalidada"}
+        return {"state": State.MANUAL_ACKNOWLEDGED,
+                "reason": (f"posição manual reconhecida (ack #{ack.get('id')}, "
+                           f"fingerprint {str(ack.get('fingerprint'))[:12]}…); "
+                           "o bot não administra esta posição")}
+    except Exception as exc:  # noqa: BLE001
+        return {"state": None, "reason": f"verificação manual falhou ({type(exc).__name__})"}
+
+
+async def _manual_ack_for_symbol(symbol) -> dict:
+    """Reconhecimento ACTIVE daquele símbolo. Erro ⇒ `ok=False` (mantém bloqueio)."""
+    try:
+        from services import manual_position_service as mps
+        return await mps.ack_for_symbol(symbol)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason_code": "MANUAL_ACK_REGISTRY_ERROR",
+                "detail": type(exc).__name__, "ack": None}
+
+
+async def _manual_symbol_free_of_orders(symbol) -> dict:
+    """Ausência FRESCA de ordens/condicionais do operador naquele símbolo."""
+    try:
+        from services import manual_position_service as mps
+        return await mps.symbol_has_live_orders(symbol)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason_code": "MANUAL_ORDERS_UNKNOWN",
+                "detail": type(exc).__name__}
+
+
 async def recheck_untracked_manual() -> dict:
     """Reavalia a CAUSA de incidentes `UNTRACKED_POSITION` em `MANUAL_REQUIRED`.
 
@@ -1848,18 +2220,84 @@ async def recheck_untracked_manual() -> dict:
             continue
         _untracked_recheck_at[key] = now
         checked += 1
+        # Contexto capturado ANTES da leitura de flat e das duas consultas de
+        # ordens: nenhuma delas pode encerrar um reconhecimento mais novo.
+        contexto_ciclo = await capture_manual_context(
+            scope=None, symbol=None)
         gate, _fp = await _fresh_gate(inc)
         if gate != FreshGate.FLAT:
-            # Continua havendo (ou não dá para afirmar que não há) posição.
-            kept[key] = gate
-            await repo.update(key, last_error=f"re-check untracked: {gate}")
+            # Posição ABERTA (ou incerta). Único desfecho possível aqui é o
+            # reconhecimento manual explícito — nunca FLAT, nunca PROTECTED.
+            desfecho = await _manual_ack_outcome(inc)
+            if desfecho["state"] is None:
+                kept[key] = gate
+                await repo.update(key, last_error=f"re-check untracked: {gate}")
+                continue
+            if not await repo.claim(key, _PROCESS_ID,
+                                    _now() + timedelta(seconds=RECONCILE_LEASE_S)):
+                kept[key] = "CLAIM_PERDIDO"
+                continue
+            await _resolve(key, _PROCESS_ID, desfecho["state"], desfecho["reason"])
+            resolved += 1
             continue
+        # FLAT comprovado. Havendo reconhecimento manual ATIVO, o registro só é
+        # encerrado depois de provar que NÃO restam ordens/condicionais do
+        # operador — e nenhuma delas é cancelada pelo bot. Sem reconhecimento,
+        # o caminho legado segue igual.
+        vinculo = await _manual_ack_for_symbol(inc.get("symbol"))
+        if not vinculo.get("ok"):
+            kept[key] = "MANUAL_ACK_UNVERIFIED"
+            await repo.update(key, last_error="re-check untracked: registro manual ilegível")
+            continue
+        if not contexto_ciclo.get("ok"):
+            kept[key] = "MANUAL_ACK_CONTEXT_UNAVAILABLE"
+            await repo.update(key, last_error="re-check untracked: contexto indisponível")
+            continue
+        prova_ordens = None
+        if vinculo.get("ack") is not None:
+            ordens = await _manual_symbol_free_of_orders(inc.get("symbol"))
+            if not ordens.get("ok"):
+                kept[key] = "MANUAL_ORDERS_UNKNOWN"
+                await repo.update(key, last_error="re-check untracked: ordens do símbolo incertas")
+                continue
+            if ordens.get("live"):
+                kept[key] = "MANUAL_ORDERS_LIVE"
+                await repo.update(key, last_error="re-check untracked: ordens manuais ainda vivas")
+                continue
+            prova_ordens = ordens
         if not await repo.claim(key, _PROCESS_ID,
                                 _now() + timedelta(seconds=RECONCILE_LEASE_S)):
             kept[key] = "CLAIM_PERDIDO"
             continue
-        await _resolve(key, _PROCESS_ID, State.FLAT,
-                       "untracked: símbolo confirmado fresh-flat na re-checagem")
+
+        async def _guard(session, _ctx=contexto_ciclo, _sym=inc.get("symbol"),
+                         _ord=prova_ordens):
+            return await _manual_context_still_valid(session, _ctx, symbol=_sym,
+                                                     orders_evidence=_ord)
+
+        # CAS do contexto manual e FLAT fencado do incidente no MESMO commit.
+        desfecho_flat = await repo.update_claimed_guarded(
+            key, _PROCESS_ID, guard=_guard,
+            expect={"kind": inc.get("kind"), "state": inc.get("state")},
+            state=State.FLAT, resolved_at=_now(),
+            last_error="untracked: símbolo confirmado fresh-flat na re-checagem",
+            claimed_by=None, claimed_at=None, lease_expires_at=None)
+        if not desfecho_flat.get("ok"):
+            motivo = str(desfecho_flat.get("reason_code") or "FLAT_CAS_PERDIDO")
+            kept[key] = motivo
+            # Incidente MANTIDO com a causa; novo ciclo é agendado pelo próprio
+            # intervalo de re-checagem (nenhum segundo reconciliador). O claim
+            # desta tentativa é DEVOLVIDO de forma fencada: um CAS perdido não
+            # deve prender o incidente até o lease vencer.
+            _untracked_recheck_at.pop(key, None)
+            devolveu = await repo.update_claimed(
+                key, _PROCESS_ID, last_error=f"re-check untracked: {motivo}",
+                claimed_by=None, claimed_at=None, lease_expires_at=None)
+            if devolveu is None:
+                await repo.update(key, last_error=f"re-check untracked: {motivo}")
+            continue
+        log.warning(f"[p03][transition] {key} → {State.FLAT} (RESOLVIDO) "
+                    f"untracked: fresh-flat com contexto manual conferido")
         resolved += 1
     if resolved:
         log.warning(f"[p03][untracked-recheck] {resolved} incidente(s) resolvido(s) "
@@ -2455,6 +2893,18 @@ async def reconcile_due() -> dict:
             await _detect_untracked_positions()
         except Exception as exc:  # noqa: BLE001
             log.error(f"[p03] re-scan de boot falhou: {exc}")
+    else:
+        # Reconhecimentos manuais são revalidados em TODO ciclo, mesmo com boot
+        # seguro e ZERO incidentes abertos: é essa prova recorrente que o guard
+        # exige antes de nova exposição. Quando o bloco acima já rodou, a
+        # revalidação aconteceu lá com a MESMA leitura (sem chamada dupla).
+        try:
+            veredito = await _revalidate_manual_acks_fresh()
+            if not veredito.get("ok"):
+                log.warning("[p03][manual-ack] revalidação periódica incompleta: "
+                            f"{veredito.get('reason_code')}")
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"[p03][manual-ack] revalidação periódica falhou: {exc}")
     processed = 0
     for inc in await repo.list_open():
         if processed >= RECONCILE_MAX_PER_CYCLE:
@@ -2573,7 +3023,14 @@ async def _detect_untracked_positions() -> dict:
         if not bss.is_configured():
             _boot_scan_safe = True   # sem exchange real → nada a escanear
             return {"status": "FLAT", "count": 0}
+        contexto_manual = await capture_manual_context()
+        # Janela ORIGINAL do GET: medida IMEDIATAMENTE antes e depois da
+        # chamada, no mesmo relógio em ms do contrato manual. O tempo de
+        # processamento posterior NÃO pode substituí-la.
+        from services import manual_position_service as _mps_clock
+        inicio_leitura_ms = _mps_clock._now_ms()
         res = await bss.get_positions(force=True)
+        fim_leitura_ms = _mps_clock._now_ms()
     except Exception as exc:  # noqa: BLE001
         _boot_scan_safe = False
         await _arm_quarantine(f"boot: leitura de posições indisponível ({exc})")
@@ -2581,10 +3038,44 @@ async def _detect_untracked_positions() -> dict:
         return {"status": "UNKNOWN", "count": 0}
     if not res or not res.get("ok") or res.get("stale") or res.get("rate_limited"):
         _boot_scan_safe = False
+        if isinstance(res, dict) and res.get("reason_code") == "POSITION_RISK_INVALID_PAYLOAD":
+            # A incompletude foi detectada ANTES da normalização manual. Levar
+            # a mesma janela ao caminho oficial revoga fence/provas e persiste
+            # a causa; não basta apenas pausar o scan enquanto uma autorização
+            # local anterior continua viva. Sem novo GET nem lock sob HTTP.
+            await _revalidate_manual_acks(
+                None, source_ok=False, context=contexto_manual,
+                started_ms=inicio_leitura_ms, ended_ms=fim_leitura_ms)
         await _arm_quarantine("boot: posições stale/rate-limited (não assumo flat)")
         log.critical("[p03][boot] posições stale/incertas — quarentena armada (não assumo flat)")
         return {"status": "UNKNOWN", "count": 0}
-    positions = [p for p in (res.get("positions") or []) if abs(_finite(p.get("size")) or 0) > 0]
+    # A resposta INTEGRAL vai para a normalização/validação: nenhum filtro pode
+    # anteceder a prova de completude. `_finite(size) or 0` transformava NaN em
+    # zero e apagava a linha ANTES de qualquer validação.
+    brutas = res.get("positions")
+    # Reconhecimentos manuais são revalidados contra ESTA leitura fresca (mesma
+    # janela e identidade) antes de o scan ser considerado seguro: identidade
+    # divergente invalida a autorização e reabre a contenção; registro ilegível
+    # ou resposta incompleta mantém bloqueio.
+    revalidacao = await _revalidate_manual_acks(
+        brutas, context=contexto_manual, started_ms=inicio_leitura_ms,
+        ended_ms=fim_leitura_ms)
+    if not revalidacao["ok"]:
+        _boot_scan_safe = False
+        await _arm_quarantine(
+            f"boot: reconhecimento manual não revalidado ({revalidacao['reason_code']})")
+        log.critical("[p03][boot] reconhecimento manual não revalidado "
+                     f"({revalidacao['reason_code']}) — quarentena armada")
+        return {"status": "UNKNOWN", "count": 0}
+    # Só DEPOIS de resposta completa e temporalmente válida: selecionar as
+    # exposições não-zero. Mantém as linhas RAW (o scan abaixo consome `size`),
+    # mas decide pela quantidade CANÔNICA já validada.
+    positions = _exposicoes_nao_zero(brutas)
+    if positions is None:
+        _boot_scan_safe = False
+        await _arm_quarantine("boot: quantidade de posição não canonicalizável")
+        log.critical("[p03][boot] quantidade não canonicalizável — UNKNOWN + quarentena")
+        return {"status": "UNKNOWN", "count": 0}
     if not positions:
         _boot_scan_safe = True          # leitura fresh confirmou conta flat
         return {"status": "FLAT", "count": 0}
@@ -2702,10 +3193,18 @@ async def get_status() -> dict:
         quarantine_active = bool(shadow_trade_service.execution_quarantine_reason())
     except Exception:
         pass
+    try:
+        from services import manual_position_service
+        manual_validation = await manual_position_service.manual_validation_summary()
+    except Exception:
+        manual_validation = {"ok": False, "new_entries_blocked": None,
+                             "reason_code": "MANUAL_VALIDATION_UNAVAILABLE",
+                             "scope": "MANUAL_VALIDATION_ONLY"}
     return {
         "ok": True, "reconciler_running": _reconciler_running,
         "last_reconciliation_at": _last_reconciliation_at,
         "quarantine_active": quarantine_active,
+        "manual_validation": manual_validation,
         "open_total": len(open_rows),
         "retry_pending": sum(1 for r in open_rows if r.get("state") == State.RETRY_PENDING),
         "manual_required": sum(1 for r in open_rows if r.get("state") == State.MANUAL_REQUIRED),

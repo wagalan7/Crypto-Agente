@@ -192,7 +192,7 @@ export default function TradeManager({ onClose, onSelectSymbol, initialSignal }:
   const manualCount = activeCount - botCount
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/70 flex justify-end">
+    <div className="app-overlay fixed inset-0 z-50 bg-black/70 flex justify-end">
       <div className="w-full max-w-md bg-[#0d1320] border-l border-slate-700 flex flex-col h-full">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800">

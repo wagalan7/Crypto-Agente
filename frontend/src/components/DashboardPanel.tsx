@@ -209,7 +209,7 @@ export default function DashboardPanel({ onClose }: Props) {
   }, [paper])
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-2 md:p-6">
+    <div className="app-overlay fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-2 md:p-6">
       <div className="bg-[#0a0e1a] border border-slate-700/50 rounded-xl shadow-2xl w-full max-w-6xl max-h-[95vh] flex flex-col overflow-hidden">
         {/* Header — responsivo: título + badge à esquerda (encolhe/trunca em mobile),
             controles à direita NUNCA somem (shrink-0 + ordem garantida pro X). */}
@@ -220,8 +220,8 @@ export default function DashboardPanel({ onClose }: Props) {
               <span className="hidden sm:inline">Dashboard de Performance</span>
               <span className="sm:hidden">Dashboard</span>
             </h2>
-            <span className="hidden sm:inline px-1.5 py-0.5 text-[10px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30 rounded flex-shrink-0">
-              PAPER
+            <span className="hidden sm:inline px-1.5 py-0.5 text-[10px] font-bold bg-slate-700/40 text-slate-300 border border-slate-600/50 rounded flex-shrink-0">
+              FONTES SEPARADAS
             </span>
           </div>
           <div className="flex items-center gap-1 md:gap-2 flex-shrink-0">
@@ -315,9 +315,11 @@ export default function DashboardPanel({ onClose }: Props) {
           <div className="bg-slate-900/50 border border-slate-800 rounded-lg p-3">
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
-                Equity Curve — P&L acumulado (%)
+                Curva dos setups (paper) — P&amp;L acumulado (%)
               </h3>
-              <span className="text-[10px] text-slate-500">{paper?.equity?.curve?.length ?? 0} dias</span>
+              <span className="num text-[10px] text-slate-500">
+                janela {period}d · {paper?.equity?.curve?.length ?? 0} ponto(s) na resposta
+              </span>
             </div>
             <EquityChart points={paper?.equity?.curve ?? []} />
           </div>
@@ -328,9 +330,9 @@ export default function DashboardPanel({ onClose }: Props) {
             <div className="bg-slate-900/50 border border-emerald-700/30 rounded-lg p-3">
               <div className="flex items-center justify-between mb-2">
                 <h3 className="text-xs font-bold text-emerald-300 uppercase tracking-wider">
-                  📄 Paper Trading
+                  📄 Resultado dos setups (paper)
                 </h3>
-                <span className="text-[10px] text-emerald-400/60">live</span>
+                <span className="num text-[10px] text-emerald-400/60">janela {period}d</span>
               </div>
               <TierTable tiers={paper?.tier_stats ?? {}} />
             </div>
@@ -346,7 +348,7 @@ export default function DashboardPanel({ onClose }: Props) {
                   (real?.equity?.trades_total ?? 0) > 0 ? 'text-cyan-300' : 'text-slate-500'
                 }`}>
                   {(real?.equity?.trades_total ?? 0) > 0 ? '💵' : <Lock className="w-3 h-3" />}
-                  Real / Shadow
+                  Registros do app · real / shadow
                 </h3>
                 <span className={`text-[10px] ${
                   (real?.equity?.trades_total ?? 0) > 0 ? 'text-cyan-400/60' : 'text-slate-600'
@@ -364,7 +366,13 @@ export default function DashboardPanel({ onClose }: Props) {
                 </span>
               </div>
               {(real?.equity?.trades_total ?? 0) > 0 ? (
-                <TierTable tiers={real?.tier_stats ?? {}} showUsd />
+                <>
+                  <TierTable tiers={real?.tier_stats ?? {}} showUsd />
+                  <p className="mt-2 text-[10.5px] leading-snug text-slate-500">
+                    Fonte: registros do app (<span className="font-mono">/api/real-trades</span>),
+                    não o inventário da conta. Janela {period}d.
+                  </p>
+                </>
               ) : (
                 <div className="flex flex-col items-center justify-center py-8 text-center">
                   <Lock className="w-8 h-8 text-slate-700 mb-2" />

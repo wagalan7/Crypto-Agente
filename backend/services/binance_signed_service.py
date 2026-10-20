@@ -303,8 +303,70 @@ async def _signed_request(
     params: Optional[dict] = None,
     *,
     request_preflight: Optional[Callable[[], Awaitable[object]]] = None,
+    mutation: Optional[dict] = None,
 ) -> dict:
+    """`mutation` é um contexto INTERNO (conta/símbolo/ação) — nunca vai para a
+    Binance. Quando presente, a propriedade do símbolo é reconferida DEPOIS do
+    throttle e imediatamente antes de assinar/enviar, COMPONDO (nunca
+    substituindo) o `request_preflight` existente de lease/risco/quote.
+
+    Isso é obrigatório mesmo quando o caller não fornece `request_preflight`: o
+    transporte não pode pular ownership por falta de guard financeiro.
+    """
     global _ban_until_ms, _throttle_until_ms, _used_weight_1m
+    if mutation is not None:
+        _original_preflight = request_preflight
+
+        async def _com_ownership() -> object:
+            # 1. Preflights EXISTENTES primeiro, preservando resultado/erro.
+            verdict: object = True
+            if _original_preflight is not None:
+                verdict = await _original_preflight()
+                aprovado = verdict is True or (
+                    isinstance(verdict, dict) and verdict.get("ok") is True)
+                if not aprovado:
+                    return verdict
+            # 2. Ownership IMEDIATAMENTE antes de assinar/enviar.
+            bloqueio = await _manual_ownership_block(
+                mutation.get("symbol"), str(mutation.get("action") or "mutate"))
+            if bloqueio is not None:
+                return {"ok": False, "quality": "UNKNOWN",
+                        "reason_code": bloqueio.get("reason_code"),
+                        "reason": bloqueio.get("error"),
+                        "manual_ownership_blocked": True}
+            # 3. AUTORIZAÇÃO FINAL (lease/token/idade das provas) DEPOIS do
+            #    await de ownership — nenhuma espera nova é introduzida entre
+            #    esta verificação e a assinatura.
+            final = mutation.get("final_check")
+            if final is not None:
+                try:
+                    decisao = await final()
+                except Exception as exc:  # noqa: BLE001 — mutação falha fechada
+                    return {"ok": False, "quality": "UNKNOWN",
+                            "reason_code": "EXEC_FINAL_AUTHORIZATION_ERROR",
+                            "reason": f"{type(exc).__name__}: {exc}"}
+                aprovado = decisao is True or (
+                    isinstance(decisao, dict) and decisao.get("ok") is True)
+                if not aprovado:
+                    detalhe = decisao if isinstance(decisao, dict) else {}
+                    return {"ok": False, "quality": "UNKNOWN",
+                            "reason_code": str(detalhe.get("reason_code")
+                                               or "EXEC_FINAL_AUTHORIZATION_DENIED"),
+                            "reason": str(detalhe.get("reason")
+                                          or "autorização final negou o envio")}
+                # A autorização ASSÍNCRONA entrega o último exame SÍNCRONO
+                # (proposta congelada × params finais). Só um veredito POSITIVO
+                # produz esse exame: negativa anterior nunca é ignorada.
+                sincrono = (decisao.get("sync_check")
+                            if isinstance(decisao, dict) else None)
+                if sincrono is not None:
+                    if isinstance(verdict, dict):
+                        verdict = {**verdict, "sync_check": sincrono}
+                    else:
+                        verdict = {"ok": True, "sync_check": sincrono}
+            return verdict
+
+        request_preflight = _com_ownership
     if not is_configured():
         return {
             "ok": False,
@@ -370,7 +432,40 @@ async def _signed_request(
                 "preflight": verdict if isinstance(verdict, dict) else {},
             }
 
-    url = _build_signed_url(path, params)
+    # ── ÚLTIMO exame antes de assinar: SÍNCRONO por contrato ───────────────
+    # Entre este bloco e `_build_signed_url`/`request` não existe `await`: é a
+    # única forma de garantir que a proposta aprovada é a que vai no payload.
+    # Ele só existe quando a autorização assíncrona ACIMA aprovou e devolveu o
+    # validador; sem proposta válida não há POST.
+    # UMA cópia local dos params finais: a MESMA que o exame valida é a que vai
+    # ser assinada. `timestamp`/`recvWindow`/`signature` são acréscimos de
+    # transporte feitos sobre ela, não uma proposta econômica nova.
+    params_finais = dict(params or {})
+    exame_sincrono = None
+    if request_preflight is not None and isinstance(verdict, dict):
+        exame_sincrono = verdict.get("sync_check")
+    if exame_sincrono is not None:
+        try:
+            decisao_final = exame_sincrono(params_finais)
+        except Exception as exc:  # noqa: BLE001 — mutação falha fechada
+            decisao_final = {"ok": False,
+                             "reason_code": "EXEC_FINAL_SYNC_CHECK_ERROR",
+                             "reason": f"{type(exc).__name__}: {exc}"}
+        aprovado_final = decisao_final is True or (
+            isinstance(decisao_final, dict) and decisao_final.get("ok") is True)
+        if not aprovado_final:
+            detalhe = decisao_final if isinstance(decisao_final, dict) else {}
+            return {
+                "ok": False,
+                "_preflight": True,
+                "_request_sent": False,
+                "reason_code": str(detalhe.get("reason_code")
+                                   or "EXEC_FINAL_SYNC_CHECK_DENIED"),
+                "error": str(detalhe.get("reason")
+                             or "exame síncrono final recusou o envio"),
+                "preflight": detalhe,
+            }
+    url = _build_signed_url(path, params_finais)
     try:
         r = await _get_client().request(method, url)
         # Lê o peso consumido (header da Binance) → throttle proativo.
@@ -556,22 +651,39 @@ async def _round_price(sym: str, price: float) -> float:
 # ─── High-level endpoints (mesma interface do bybit_signed_service) ───────────
 
 
-async def get_wallet_balance(account_type: str = "UNIFIED") -> dict:
+async def get_wallet_balance(account_type: str = "UNIFIED", *,
+                             force: bool = False) -> dict:
     """
     Saldo Futures USDT-M. Binance não tem o conceito 'UNIFIED' como Bybit —
     parâmetro é aceito por compat mas ignorado. Retorna mesmo shape.
+
+    `force=True` ignora o cache local e exige leitura nova. Estar em cooldown de
+    ban significa INDISPONÍVEL para quem pediu leitura fresca — não autorização
+    para usar saldo antigo. A resposta carrega SEMPRE `as_of_ms` (instante
+    ORIGINAL da obtenção) e `source` (`live`/`cache`/`stale`); um valor servido
+    do cache nunca recebe carimbo novo.
     """
     _ = account_type
     now = time.time()
     # Cache curto: saldo/conta também consome peso assinado e era chamado sem
     # throttle. Durante cooldown de ban, serve o último saldo conhecido (stale).
-    if (_account_cache["data"] is not None
+    if (not force and _account_cache["data"] is not None
             and (now - _account_cache["ts"]) < _ACCOUNT_CACHE_TTL):
-        return dict(_account_cache["data"])
+        servido = dict(_account_cache["data"])
+        servido["source"] = "cache"
+        servido["age_sec"] = round(now - _account_cache["ts"], 3)
+        return servido
     res = await _signed_request("GET", "/fapi/v2/account")
     if not res.get("ok"):
         if res.get("_cooldown") and _account_cache["data"] is not None:
-            stale = dict(_account_cache["data"]); stale["stale"] = True
+            stale = dict(_account_cache["data"])
+            stale["stale"] = True
+            stale["source"] = "stale"
+            stale["age_sec"] = round(now - _account_cache["ts"], 3)
+            if force:
+                # Quem pediu leitura FRESCA não pode receber cache disfarçado.
+                stale["ok"] = False
+                stale["reason_code"] = "WALLET_COOLDOWN_STALE"
             return stale
         return res
     acc = res["result"] or {}
@@ -594,6 +706,10 @@ async def get_wallet_balance(account_type: str = "UNIFIED") -> dict:
         ],
         "testnet": _TESTNET,
         "exchange": "binance",
+        # Instante ORIGINAL da obtenção — preservado no cache e nas respostas.
+        "as_of_ms": int(now * 1000),
+        "source": "live",
+        "age_sec": 0.0,
     }
     _account_cache["data"] = out
     _account_cache["ts"] = now
@@ -660,11 +776,14 @@ def _parse_ban_until_ms(res: dict) -> float:
 def get_positions_ban_status() -> dict:
     """Diagnóstico: estado do cooldown anti-ban + throttle por peso."""
     now_ms = time.time() * 1000.0
+    age = now_ms / 1000.0 - _positions_cache["ts"]
+    cache_age = (round(age, 1) if _positions_cache["data"] is not None
+                 and math.isfinite(age) else None)
     return {
         "banned": now_ms < _ban_until_ms,
         "ban_until_ms": _ban_until_ms,
         "seconds_left": max(0.0, round((_ban_until_ms - now_ms) / 1000.0, 1)),
-        "cache_age_s": round(time.time() - _positions_cache["ts"], 1) if _positions_cache["data"] is not None else None,
+        "cache_age_s": cache_age,
         "cache_ttl_s": _POSITIONS_CACHE_TTL,
         "used_weight_1m": _used_weight_1m,
         "weight_soft_limit": _WEIGHT_SOFT_LIMIT,
@@ -1004,6 +1123,50 @@ def _filter_positions(data, symbol: Optional[str]):
     return [p for p in data if p.get("symbol") == norm]
 
 
+def _explicit_position_side(raw) -> Optional[str]:
+    """`BOTH`/`LONG`/`SHORT` conforme a Binance devolveu. Ausente/desconhecido
+    → None: em conta hedge, assumir `BOTH` trocaria a perna identificada."""
+    valor = str(raw or "").strip().upper()
+    return valor if valor in ("BOTH", "LONG", "SHORT") else None
+
+
+def _exchange_update_time_ms(raw) -> Optional[int]:
+    """`updateTime` da posição, em ms. Ausente/inválido/<=0 → None.
+
+    Limitação do provedor (documentada): a Binance NÃO expõe um id de posição;
+    `updateTime` é a única versão temporal observável e muda a cada alteração
+    da posição. Sem ele não há como demonstrar continuidade — e o consumidor
+    mantém UNKNOWN em vez de inventar um relógio local.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        valor = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return valor if valor > 0 else None
+
+
+def _position_amount_float(value) -> Optional[float]:
+    """Quantidade SIGNED do JSON positionRisk, sem fabricar zero/posição.
+
+    Zero explícito é válido; negativos são shorts legítimos. Ausência, bool,
+    tipo inesperado, não finito ou perda para zero na conversão são UNKNOWN.
+    """
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    try:
+        amount = Decimal(str(value))
+        if not amount.is_finite():
+            return None
+        result = float(amount)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(result) or (amount != 0 and result == 0):
+        return None
+    return result
+
+
 async def get_positions(symbol: Optional[str] = None, *, force: bool = False) -> dict:
     """Leitura de posições com cache curto + cooldown anti-ban.
 
@@ -1062,29 +1225,132 @@ async def get_positions(symbol: Optional[str] = None, *, force: bool = False) ->
             return _ok(_positions_cache["data"], stale=True, banned=True)
         return res
 
-    rows = res["result"] or []
+    def invalid_payload(detail: str) -> dict:
+        # Mantém o último snapshot para o caminho stale de cooldown, mas revoga
+        # sua autoridade fresh até um GET/parse COMPLETO válido. Não publica
+        # subconjunto nem usa ausência/bool como zero. -inf é só sentinela
+        # interna de expiração; não é emitido no payload/API.
+        _positions_cache["ts"] = float("-inf")
+        return {"ok": False, "quality": "UNKNOWN", "complete": False,
+                "positions": None, "reason_code": "POSITION_RISK_INVALID_PAYLOAD",
+                "error": detail, "testnet": _TESTNET, "exchange": "binance"}
+
+    rows = res.get("result")
+    if not isinstance(rows, list):
+        return invalid_payload("positionRisk sem lista explícita válida")
+    # Validar TODAS as quantidades antes de filtrar zero/símbolo ou construir
+    # qualquer snapshot. Um erro numa outra linha invalida a leitura da conta.
+    parsed = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            return invalid_payload(f"positionRisk com linha inválida ({index})")
+        amount = _position_amount_float(row.get("positionAmt"))
+        if amount is None:
+            return invalid_payload(f"positionRisk com quantidade inválida ({index})")
+        parsed.append((row, amount))
     positions = []
-    for p in rows:
-        size = abs(float(p.get("positionAmt") or 0))
+    for p, amt in parsed:
+        size = abs(amt)
         if size <= 0:
             continue
-        amt = float(p.get("positionAmt") or 0)
         side = "Buy" if amt > 0 else "Sell"
-        positions.append({
-            "symbol": p.get("symbol"),
-            "side": side,
-            "size": size,
-            "entry_price": float(p.get("entryPrice") or 0),
-            "mark_price": float(p.get("markPrice") or 0),
-            "unrealized_pnl": float(p.get("unRealizedProfit") or 0),
-            "leverage": float(p.get("leverage") or 0),
-            "position_value": float(p.get("notional") or 0),
-            "take_profit": None,  # Binance não retorna TP/SL nesse endpoint
-            "stop_loss": None,
-        })
+        try:
+            position = {
+                "symbol": p.get("symbol"),
+                "side": side,
+                "size": size,
+                "entry_price": float(p.get("entryPrice") or 0),
+                "mark_price": float(p.get("markPrice") or 0),
+                "unrealized_pnl": float(p.get("unRealizedProfit") or 0),
+                "leverage": float(p.get("leverage") or 0),
+                "position_value": float(p.get("notional") or 0),
+                "take_profit": None,  # Binance não retorna TP/SL neste endpoint
+                "stop_loss": None,
+                # Identidade REAL da perna; não inventa BOTH nem relógio local.
+                "position_side": _explicit_position_side(p.get("positionSide")),
+                "update_time_ms": _exchange_update_time_ms(p.get("updateTime")),
+            }
+        except (TypeError, ValueError, OverflowError):
+            return invalid_payload("positionRisk com campos não normalizáveis")
+        positions.append(position)
     _positions_cache["data"] = positions
     _positions_cache["ts"] = now
     return _ok(positions)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Guard de PROPRIEDADE (convivência manual/bot) no TRANSPORTE
+# ════════════════════════════════════════════════════════════════════════════
+#  Uma posição manual RECONHECIDA deixa o símbolo inteiro indisponível para o
+#  bot. Bloquear só o POST de entrada seria insuficiente: `set_leverage` já
+#  alteraria a posição do operador. Por isso o guard vive na borda do
+#  transporte — todo caminho (entrada normal/maker, fallback, flip, hedge,
+#  pyramiding, TF upgrade, proteção, fechamento, time-stop, BE/trailing,
+#  autoheal/backfill e poeira) passa por uma destas funções.
+#
+#  O guard NÃO consulta a exchange: ele roda dentro de locks/semáforos da
+#  própria requisição, onde I/O HTTP recursivo é proibido. A prova é o registro
+#  persistido de reconhecimento, e registro ilegível BLOQUEIA (fail-closed).
+async def _manual_ownership_block(symbol, action: str) -> Optional[dict]:
+    """Devolve o motivo do bloqueio, ou None quando o bot pode mutar.
+
+    `require_fresh_proof=True`: NOVA exposição exige prova de validação atual do
+    reconhecimento. Ações PROTETIVAS/redutoras (proteção, cancelamento,
+    fechamento, reduceOnly) são isentas dessa exigência dentro do próprio
+    `ownership_guard` — travá-las deixaria posição BOT comprovada sem stop por
+    causa de um reconhecimento de OUTRO símbolo.
+    """
+    try:
+        from services import manual_position_service as mps
+        verdict = await mps.ownership_guard(symbol, action=action,
+                                            require_fresh_proof=True)
+    except Exception as exc:  # noqa: BLE001 — dúvida NUNCA libera mutação
+        return {"ok": False, "reason_code": "MANUAL_OWNERSHIP_GUARD_ERROR",
+                "error": f"guard de propriedade indisponível: {type(exc).__name__}",
+                "manual_ownership_blocked": True, "action": action}
+    if verdict.get("allowed"):
+        return None
+    log.warning(f"[manual-ack] {action} BLOQUEADO em {symbol}: "
+                f"{verdict.get('reason_code')}")
+    return {"ok": False, "reason_code": verdict.get("reason_code"),
+            "error": (verdict.get("detail")
+                      or "símbolo indisponível: posição manual reconhecida"),
+            "manual_ownership_blocked": True, "action": action,
+            "symbol": verdict.get("symbol")}
+
+
+def reduce_only_flag_is_valid(value) -> bool:
+    """`reduce_only` é um booleano LITERAL — nada é normalizado para bool.
+
+    Aceitar `"true"`, `1` ou um objeto qualquer produziria DUAS leituras do
+    mesmo argumento no percurso (a classificação olha a identidade, os
+    ramos antigos olhavam a veracidade), e foi exatamente isso que deixou uma
+    abertura MARKET sair sem `reduceOnly` e sem SL. `bool(value)` não resolve:
+    adivinhar a intenção de um contrato quebrado é pior que recusar.
+    """
+    return type(value) is bool
+
+
+def classify_order_action(*, reduce_only) -> str:
+    """Classifica a ordem UMA única vez, a partir do contrato validado.
+
+    `reduce_only` precisa ser o booleano LITERAL `True`: string, número ou
+    objeto NÃO recebem a isenção de redução. A classificação resultante é usada
+    no guard inicial, no preflight e no guard final — nunca derivada de novo.
+    """
+    return "reduce_only" if reduce_only is True else "place_order"
+
+
+def _reduce_only_payload_conflict(*, leverage, stop_loss, tp1, tp2,
+                                  take_profit) -> Optional[str]:
+    """Redução NÃO altera alavancagem nem instala bracket de abertura."""
+    if leverage is not None:
+        return "reduce_only com leverage de abertura"
+    for nome, valor in (("stop_loss", stop_loss), ("tp1", tp1), ("tp2", tp2),
+                        ("take_profit", take_profit)):
+        if valor is not None:
+            return f"reduce_only com {nome} de abertura"
+    return None
 
 
 async def place_protection_orders(
@@ -1120,6 +1386,14 @@ async def place_protection_orders(
         "tp1_skipped": bool,  # true se qty*0.45 arredondou pra 0 → manda 100% no TP2
       }
     """
+    bloqueio = await _manual_ownership_block(symbol, "place_protection_orders")
+    if bloqueio is not None:
+        # Nunca instalamos/substituímos proteção numa posição manual: o
+        # reconhecimento NÃO certifica proteção e não autoriza inventar um SL.
+        return {**bloqueio, "sl_ok": False, "tp1_ok": False, "tp2_ok": False,
+                "sl_order_id": None, "tp1_order_id": None, "tp2_order_id": None,
+                "sl_msg": bloqueio.get("error"), "tp1_qty": 0.0,
+                "tp1_skipped": False}
     sym = to_binance(symbol) if "/" in symbol else symbol
     binance_entry_side = entry_side.upper()
     counter_side = "SELL" if binance_entry_side == "BUY" else "BUY"
@@ -1286,7 +1560,22 @@ async def place_protection_orders(
                 if not _allowed:
                     log.error(f"[binance] {label.upper()} ABORTADO {sym}: mutation_guard negou (lease inválido) — sem POST")
                     return False, None, (last_msg or "mutation_guard negou: lease/claim inválido"), False
-            res = await _signed_request("POST", "/fapi/v1/algoOrder", params)
+            # O `mutation_guard` de lease roda TAMBÉM na fronteira pós-throttle
+            # de CADA POST/retry/fallback, composto com ownership. Negação não
+            # vira SL instalado nem cancelamento confirmado.
+            async def _lease_na_fronteira():
+                if mutation_guard is None:
+                    return True
+                try:
+                    return bool(await mutation_guard())
+                except Exception as _exc:  # noqa: BLE001
+                    return {"ok": False, "reason_code": "EXEC_LEASE_GUARD_ERROR",
+                            "reason": f"{type(_exc).__name__}: {_exc}"}
+
+            res = await _signed_request(
+                "POST", "/fapi/v1/algoOrder", params,
+                mutation={"symbol": symbol, "action": "place_protection_orders",
+                          "final_check": _lease_na_fronteira})
             if res.get("ok"):
                 algo_id = str((res.get("result") or {}).get("algoId") or "")
                 if algo_id:
@@ -1567,7 +1856,9 @@ async def _emergency_close_after_stop_failure(
             "newOrderRespType": "RESULT",
             "newClientOrderId": cid,
         }
-        res = await _signed_request("POST", "/fapi/v1/order", params)
+        res = await _signed_request(
+            "POST", "/fapi/v1/order", params,
+            mutation={"symbol": symbol, "action": "emergency_close"})
         result = res.get("result") or {}
         status = str(result.get("status") or "").upper()
         close_terminal_statuses = {
@@ -1760,7 +2051,7 @@ async def _cleanup_entry_conditionals(
 
     for algo_id in sorted(known_ids):
         try:
-            res = await cancel_algo_order(algo_id)
+            res = await cancel_algo_order(algo_id, symbol=symbol)
         except Exception as exc:
             res = {"ok": False, "error": str(exc)}
         if _algo_cancel_is_terminal(res):
@@ -1843,7 +2134,7 @@ async def _cleanup_entry_conditionals(
                 )
                 continue
             try:
-                cancel_res = await cancel_algo_order(algo_id)
+                cancel_res = await cancel_algo_order(algo_id, symbol=symbol)
             except Exception as exc:
                 cancel_res = {"ok": False, "error": str(exc)}
             if _algo_cancel_is_terminal(cancel_res):
@@ -2101,6 +2392,10 @@ async def place_order(
     tp1: Optional[float] = None,           # TP1 parcial — quando setado junto com take_profit, dispara bracket
     tp1_qty_pct: float = 0.45,
     reduce_only: bool = False,
+    # Callback INTERNO de autorização final (lease/token/idade das provas).
+    # Nunca é enviado à Binance: roda na fronteira pós-throttle.
+    final_authorization: Optional[Callable[[], Awaitable[object]]] = None,
+    candidate_guard: Optional[Callable[[], Awaitable[object]]] = None,
     leverage: Optional[int] = None,
     client_order_id: Optional[str] = None,
     entry_preflight: Optional[
@@ -2124,10 +2419,57 @@ async def place_order(
 
     Retorno enriquecido com sl_ok/tp1_ok/tp2_ok pra caller propagar diagnóstico.
     """
+    # Contrato do rótulo de redução ANTES de qualquer efeito: nada de
+    # `set_leverage`, arredondamento com I/O, POST ou cancelamento até aqui.
+    if not reduce_only_flag_is_valid(reduce_only):
+        return {"ok": False, "reason_code": "EXEC_REDUCE_ONLY_INVALID",
+                "error": ("reduce_only exige booleano literal; recebido "
+                          f"{type(reduce_only).__name__}"),
+                "entry_not_submitted": True, "no_fill": True,
+                "submitted_qty": 0.0, "planned_qty": qty,
+                "safety_state": "ENTRY_NOT_SUBMITTED",
+                "entry_state": "NOT_SUBMITTED",
+                # Proteção NÃO foi instalada: o caller não pode ler ausência
+                # de SL como SL pronto.
+                "sl_ok": False, "sl_order_id": None,
+                "sl_msg": "entrada não submetida: contrato de reduce_only inválido",
+                "manual_intervention_required": False,
+                "quarantine_required": False,
+                "client_order_id": client_order_id}
+    # Classificação ÚNICA da operação (guard inicial, preflight, payload,
+    # proteção pós-fill e guard final usam ESTA mesma `acao`/`e_reducao`;
+    # nenhum ramo volta a olhar o argumento bruto).
+    acao = classify_order_action(reduce_only=reduce_only)
+    e_reducao = acao == "reduce_only"
+    if e_reducao:
+        conflito = _reduce_only_payload_conflict(
+            leverage=leverage, stop_loss=stop_loss, tp1=tp1, tp2=None,
+            take_profit=take_profit)
+        if conflito is not None:
+            # Recusa ANTES de qualquer mutação: rótulo de redução não isenta
+            # uma ordem que de fato abriria/alteraria exposição.
+            return {"ok": False, "reason_code": "EXEC_REDUCE_ONLY_CONTRADICTORY",
+                    "error": f"payload contraditório: {conflito}",
+                    "entry_not_submitted": True, "no_fill": True,
+                    "submitted_qty": 0.0, "planned_qty": qty,
+                    "safety_state": "ENTRY_NOT_SUBMITTED",
+                    "entry_state": "NOT_SUBMITTED",
+                    "manual_intervention_required": False,
+                    "quarantine_required": False,
+                    "client_order_id": client_order_id}
+    bloqueio = await _manual_ownership_block(symbol, acao)
+    if bloqueio is not None:
+        return {**bloqueio, "entry_not_submitted": True, "no_fill": True,
+                "submitted_qty": 0.0, "planned_qty": qty,
+                "safety_state": "ENTRY_NOT_SUBMITTED",
+                "entry_state": "NOT_SUBMITTED",
+                "manual_intervention_required": False,
+                "quarantine_required": False,
+                "client_order_id": client_order_id}
     sym = to_binance(symbol) if "/" in symbol else symbol
     binance_side = side.upper()  # BUY | SELL
     binance_type = "MARKET" if order_type == "Market" else "LIMIT"
-    market_entry = binance_type == "MARKET" and not reduce_only
+    market_entry = binance_type == "MARKET" and not e_reducao
     if market_entry and entry_preflight is None:
         return {
             "ok": False,
@@ -2154,13 +2496,17 @@ async def place_order(
         log.info(f"[binance] qty arredondado {sym}: {qty} → {qty_rounded}")
 
     if leverage is not None:
-        _lev = await set_leverage(sym, leverage)
+        _lev = (await set_leverage(sym, leverage, candidate_guard=candidate_guard)
+                if candidate_guard is not None else await set_leverage(sym, leverage))
         if not _lev.get("ok"):
-            _lev = await set_leverage(sym, leverage)  # 1 retry
+            _lev = (await set_leverage(sym, leverage, candidate_guard=candidate_guard)
+                    if candidate_guard is not None else await set_leverage(sym, leverage))  # 1 retry
             if not _lev.get("ok"):
                 # Sem alavancagem confirmada NÃO abre: a moeda pode cair no
                 # default da conta (até 20x) e estourar a margem. Fail-safe.
-                return {"ok": False, "error":
+                return {"ok": False, "entry_not_submitted": True, "no_fill": True,
+                        "safety_state": "ENTRY_NOT_SUBMITTED",
+                        "reason_code": _lev.get("reason_code"), "error":
                         f"leverage {leverage}x não confirmada p/ {sym}: "
                         f"{_lev.get('error') or _lev.get('msg')}"}
 
@@ -2189,7 +2535,7 @@ async def place_order(
     # reconciliado sem repetir a ordem. O caller pode fornecer um id estável;
     # nos demais caminhos geramos um id único dentro do limite de 36 caracteres.
     if not client_order_id:
-        scope = "close" if reduce_only else "entry"
+        scope = "close" if e_reducao else "entry"
         nonce = hashlib.sha1(
             f"{sym}:{binance_side}:{qty_rounded}:{time.time_ns()}".encode("utf-8")
         ).hexdigest()[:10]
@@ -2210,7 +2556,7 @@ async def place_order(
             return {"ok": False, "error": "LIMIT exige price"}
         params["price"] = await _round_price(sym, float(price))
         params["timeInForce"] = "GTC"
-    if reduce_only:
+    if e_reducao:
         params["reduceOnly"] = "true"
     if client_order_id:
         params["newClientOrderId"] = client_order_id
@@ -2245,6 +2591,14 @@ async def place_order(
                 "reason": "MARKET_LOT_SIZE/MIN_NOTIONAL não confirmados",
                 "checks": {"market_rules": market_rules},
             }
+        # Reconfirmação DEPOIS do throttle/espera: entre o guard de entrada e
+        # este ponto a posição manual pode ter sido reconhecida.
+        tardio = await _manual_ownership_block(symbol, acao)
+        if tardio is not None:
+            return {"ok": False, "quality": "UNKNOWN",
+                    "reason_code": tardio.get("reason_code"),
+                    "reason": tardio.get("error"), "checks": {},
+                    "manual_ownership_blocked": True}
         try:
             verdict = await entry_preflight(float(qty_rounded), dict(market_rules))
         except Exception as exc:  # noqa: BLE001 — entrada real falha fechada
@@ -2320,6 +2674,12 @@ async def place_order(
         "/fapi/v1/order",
         params,
         request_preflight=_market_request_preflight if market_entry else None,
+        # Ownership é obrigatório TAMBÉM nos caminhos LIMIT e de redução, em que
+        # `request_preflight` é None.
+        mutation={"symbol": symbol,
+                  # Redução/fechamento não é NOVA exposição: não exige prova
+                  # fresca, mas continua exigindo ownership do símbolo.
+                  "action": acao, "final_check": final_authorization},
     )
     if entry_res.get("_preflight"):
         verdict = entry_res.get("preflight") or {}
@@ -2398,7 +2758,7 @@ async def place_order(
                 }
             else:
                 protection = _protection_not_requested_result()
-                if stop_loss is not None and not reduce_only:
+                if stop_loss is not None and not e_reducao:
                     try:
                         # A entry pode ter sido aceita e preencher depois. Arma
                         # apenas SL closePosition; TPs e um segundo MARKET ficam
@@ -2496,7 +2856,7 @@ async def place_order(
         )
         if entry_status not in terminal_statuses or terminal_qty_unknown:
             protection = _protection_not_requested_result()
-            if stop_loss is not None and not reduce_only:
+            if stop_loss is not None and not e_reducao:
                 try:
                     # Só o SL closePosition: protege a exposição conhecida (e um
                     # eventual fill tardio) sem criar TPs de qty incerta. Quando
@@ -2578,8 +2938,9 @@ async def place_order(
         executed_qty = max(0.0, executed_qty)
 
     # ── Ordens de proteção (SL + TP1 parcial + TP2) ─────────────────────
-    protection = _protection_not_requested_result()
-    if not reduce_only and binance_type == "MARKET":
+    nao_tentada = _protection_not_requested_result()
+    protection = nao_tentada
+    if not e_reducao and binance_type == "MARKET":
         try:
             protection = await _place_post_fill_protection(
                 sym, binance_side, executed_qty,
@@ -2591,6 +2952,13 @@ async def place_order(
             )
         except Exception as exc:
             protection = _protection_exception_result(exc)
+    if (stop_loss is not None and not e_reducao
+            and protection is nao_tentada):
+        # Invariante: numa ENTRADA com SL pedido, "não tentei" JAMAIS pode sair
+        # como `sl_ok=True`. Se a instalação não foi nem tentada, a exposição
+        # está desprotegida e o safety abaixo precisa tratar como falha de SL.
+        protection = {**nao_tentada, "sl_ok": False,
+                      "sl_msg": "proteção não foi tentada para uma entrada"}
     resolved_entry_state = (
         "PARTIALLY_FILLED"
         if binance_type == "MARKET" and entry_status != "FILLED" and executed_qty > 0
@@ -2601,12 +2969,12 @@ async def place_order(
         client_order_id_prefix=client_order_id,
         entry_state=resolved_entry_state,
         operation_kind=(
-            "REDUCE_ONLY" if reduce_only
+            "REDUCE_ONLY" if e_reducao
             else "ORDER_SUBMISSION" if binance_type == "LIMIT"
             else "ENTRY"
         ),
     )
-    if reduce_only and binance_type == "MARKET":
+    if e_reducao and binance_type == "MARKET":
         live_size, live_msg = await _fresh_position_size(sym)
         if live_size is None or live_size > 1e-12:
             safety = {
@@ -2740,6 +3108,9 @@ async def place_maker_entry_then_protect(
     poll_interval_s: Optional[float] = None,
     fallback_market: bool = False,
     entry_preflight: Optional[Callable[[float, float], Awaitable[dict]]] = None,
+    # Autorização FINAL interna (lease/token). Nunca vai para a Binance.
+    final_authorization: Optional[Callable[[], Awaitable[object]]] = None,
+    candidate_guard: Optional[Callable[[], Awaitable[object]]] = None,
     market_preflight: Optional[Callable[[float, dict], Awaitable[dict]]] = None,
 ) -> dict:
     """
@@ -2762,6 +3133,16 @@ async def place_maker_entry_then_protect(
       was_maker (bool), fell_back_to_market (bool), entry_fill_price,
       executed_qty, no_fill (bool).
     """
+    bloqueio = await _manual_ownership_block(symbol, "maker_entry")
+    if bloqueio is not None:
+        return {**bloqueio, "entry_not_submitted": True, "no_fill": True,
+                "submitted_qty": 0.0, "planned_qty": qty, "was_maker": True,
+                "fell_back_to_market": False,
+                "safety_state": "ENTRY_NOT_SUBMITTED",
+                "entry_state": "NOT_SUBMITTED",
+                "manual_intervention_required": False,
+                "quarantine_required": False,
+                "client_order_id": client_order_id}
     sym = to_binance(symbol) if "/" in symbol else symbol
     poll_timeout_s = _MAKER_POLL_TIMEOUT_S if poll_timeout_s is None else poll_timeout_s
     poll_interval_s = _MAKER_POLL_INTERVAL_S if poll_interval_s is None else poll_interval_s
@@ -2772,12 +3153,16 @@ async def place_maker_entry_then_protect(
         return {"ok": False, "error": f"qty arredondado virou 0 (step={f.get('step')}, min={f.get('min_qty')}, raw={qty})"}
 
     if leverage is not None:
-        _lev = await set_leverage(sym, leverage)
+        _lev = (await set_leverage(sym, leverage, candidate_guard=candidate_guard)
+                if candidate_guard is not None else await set_leverage(sym, leverage))
         if not _lev.get("ok"):
-            _lev = await set_leverage(sym, leverage)  # 1 retry
+            _lev = (await set_leverage(sym, leverage, candidate_guard=candidate_guard)
+                    if candidate_guard is not None else await set_leverage(sym, leverage))  # 1 retry
             if not _lev.get("ok"):
                 # Sem alavancagem confirmada NÃO abre (fail-safe, ver place_order).
-                return {"ok": False, "error":
+                return {"ok": False, "entry_not_submitted": True, "no_fill": True,
+                        "safety_state": "ENTRY_NOT_SUBMITTED",
+                        "reason_code": _lev.get("reason_code"), "error":
                         f"leverage {leverage}x não confirmada p/ {sym}: "
                         f"{_lev.get('error') or _lev.get('msg')}"}
 
@@ -2798,6 +3183,9 @@ async def place_maker_entry_then_protect(
             tp1_qty_pct=tp1_qty_pct, leverage=None,  # leverage já setado acima
             client_order_id=fallback_client_order_id,
             entry_preflight=market_preflight,
+            # A filha `-mfb` passa pela MESMA autorização final.
+            final_authorization=final_authorization,
+            candidate_guard=candidate_guard,
         )
         if isinstance(res, dict):
             res["was_maker"] = False
@@ -2873,6 +3261,13 @@ async def place_maker_entry_then_protect(
     # throttle e imediatamente antes do request. Assim nenhuma espera assíncrona
     # separa a quote/runtime guard aprovados do POST de entrada.
     async def _entry_request_preflight() -> dict:
+        # Reconfirmação DEPOIS do throttle, imediatamente antes do POST.
+        tardio = await _manual_ownership_block(symbol, "maker_entry_preflight")
+        if tardio is not None:
+            return {"ok": False, "quality": "UNKNOWN",
+                    "reason_code": tardio.get("reason_code"),
+                    "reason": tardio.get("error"),
+                    "manual_ownership_blocked": True}
         if entry_preflight is None:
             return {"ok": True}
         try:
@@ -2925,6 +3320,8 @@ async def place_maker_entry_then_protect(
         request_preflight=(
             _entry_request_preflight if entry_preflight is not None else None
         ),
+        mutation={"symbol": symbol, "action": "maker_entry",
+                  "final_check": final_authorization},
     )
     if entry_res.get("_preflight"):
         verdict = entry_res.get("preflight") or {}
@@ -3353,6 +3750,9 @@ async def place_maker_entry_then_protect(
 
 
 async def cancel_order(symbol: str, order_id: Optional[str] = None, client_order_id: Optional[str] = None) -> dict:
+    bloqueio = await _manual_ownership_block(symbol, "cancel_order")
+    if bloqueio is not None:
+        return bloqueio
     sym = to_binance(symbol) if "/" in symbol else symbol
     params = {"symbol": sym}
     if order_id:
@@ -3361,14 +3761,26 @@ async def cancel_order(symbol: str, order_id: Optional[str] = None, client_order
         params["origClientOrderId"] = client_order_id
     else:
         return {"ok": False, "error": "informe order_id ou client_order_id"}
-    return await _signed_request("DELETE", "/fapi/v1/order", params)
+    return await _signed_request(
+        "DELETE", "/fapi/v1/order", params,
+        mutation={"symbol": symbol, "action": "cancel_order"})
 
 
-async def cancel_algo_order(algo_id: str) -> dict:
-    """Cancela uma ordem CONDITIONAL (SL/TP) criada via /fapi/v1/algoOrder."""
+async def cancel_algo_order(algo_id: str, *, symbol: Optional[str] = None) -> dict:
+    """Cancela uma ordem CONDITIONAL (SL/TP) criada via /fapi/v1/algoOrder.
+
+    `symbol` é ADITIVO e existe para o guard de propriedade: sem ele, havendo
+    QUALQUER reconhecimento manual ativo, a prova é inconclusiva e o cancel é
+    bloqueado — nunca se cancela condicional de posição alheia por omissão.
+    """
     if not algo_id:
         return {"ok": False, "error": "algo_id vazio"}
-    return await _signed_request("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id})
+    bloqueio = await _manual_ownership_block(symbol, "cancel_algo_order")
+    if bloqueio is not None:
+        return bloqueio
+    return await _signed_request(
+        "DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id},
+        mutation={"symbol": symbol, "action": "cancel_algo_order"})
 
 
 async def get_open_algo_orders(symbol: Optional[str] = None) -> dict:
@@ -3419,10 +3831,69 @@ async def get_open_algo_orders(symbol: Optional[str] = None) -> dict:
     return {"ok": True, "orders": orders, "count": len(orders)}
 
 
-async def set_leverage(symbol: str, leverage: int) -> dict:
-    res = await _signed_request("POST", "/fapi/v1/leverage", {
-        "symbol": symbol, "leverage": leverage,
-    })
+async def get_open_orders(symbol: Optional[str] = None) -> dict:
+    """Ordens COMUNS abertas (LIMIT/STOP/MARKET pendentes) via
+    GET /fapi/v1/openOrders. `symbol` opcional (omitido = todos os símbolos).
+
+    Existe porque o banco do bot NÃO conhece as LIMIT abertas manualmente pelo
+    operador: para provar que um símbolo está livre é preciso consultar a
+    corretora. `allOrders` com `limit` NÃO serve — ele lista histórico truncado,
+    não o conjunto das abertas.
+
+    Retorno: {"ok": True, "orders": [{order_id, client_order_id, symbol, side,
+    type, price, stop_price, quantity, reduce_only, close_position, status}],
+    "count": int}. Em falha devolve a resposta de erro — o caller DEVE tratar
+    como INCERTO e nunca concluir ausência.
+    """
+    params = {}
+    if symbol:
+        params["symbol"] = to_binance(symbol) if "/" in symbol else symbol
+    res = await _signed_request("GET", "/fapi/v1/openOrders", params or None)
+    if not res.get("ok"):
+        return res
+    rows = res.get("result") or []
+    if not isinstance(rows, (list, tuple)):
+        # Formato desconhecido é INCERTEZA, não "zero ordens".
+        return {"ok": False, "error": "openOrders em formato inesperado",
+                "testnet": _TESTNET, "exchange": "binance"}
+
+    def _api_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes"}
+
+    orders = []
+    for o in rows:
+        if not isinstance(o, dict):
+            return {"ok": False, "error": "linha de openOrders inesperada",
+                    "testnet": _TESTNET, "exchange": "binance"}
+        orders.append({
+            "order_id": str(o.get("orderId") or ""),
+            "client_order_id": o.get("clientOrderId"),
+            "symbol": o.get("symbol"),
+            "side": o.get("side"),
+            "type": o.get("type") or o.get("origType"),
+            "price": float(o.get("price") or 0),
+            "stop_price": float(o.get("stopPrice") or 0),
+            "quantity": float(o.get("origQty") or 0),
+            "reduce_only": _api_bool(o.get("reduceOnly")),
+            "close_position": _api_bool(o.get("closePosition")),
+            "status": o.get("status"),
+        })
+    return {"ok": True, "orders": orders, "count": len(orders)}
+
+
+async def set_leverage(symbol: str, leverage: int, *,
+                       candidate_guard: Optional[Callable[[], Awaitable[object]]] = None) -> dict:
+    # Alavancagem é ALTERAÇÃO DE POSIÇÃO: num símbolo manual reconhecido ela
+    # mexeria na posição do operador ANTES de qualquer POST de entrada.
+    bloqueio = await _manual_ownership_block(symbol, "set_leverage")
+    if bloqueio is not None:
+        return bloqueio
+    res = await _signed_request(
+        "POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage},
+        mutation={"symbol": symbol, "action": "set_leverage",
+                  **({"final_check": candidate_guard} if candidate_guard is not None else {})})
     return res
 
 

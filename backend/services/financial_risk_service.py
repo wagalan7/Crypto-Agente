@@ -790,7 +790,9 @@ abertas AS (
     WHERE source = :source AND status = 'open'
 ),
 reservas AS (
-    SELECT intent_key, reserved_risk_usd
+    SELECT intent_key, reserved_risk_usd,
+           COALESCE(reserved_margin_usd, 0) AS reserved_margin_usd,
+           false AS risk_only
     FROM entry_intents
     WHERE (:account_ref)::text IS NOT NULL
       AND account_ref = :account_ref
@@ -798,6 +800,21 @@ reservas AS (
       AND state = ANY(:pending_states)
       AND real_trade_id IS NULL
       AND ((:exclude_key)::text IS NULL OR intent_key <> :exclude_key)
+    UNION ALL
+    SELECT i.intent_key, i.reserved_risk_usd, 0 AS reserved_margin_usd,
+           true AS risk_only
+    FROM entry_intents i JOIN real_trades t ON t.id = i.real_trade_id
+    WHERE (:account_ref)::text IS NOT NULL AND i.account_ref = :account_ref
+      AND ((:exchange)::text IS NULL OR i.exchange = :exchange)
+      AND i.state = 'CONFIRMED'
+      AND i.purpose = 'PYRAMID'
+      AND i.playbook ~ '^PYRAMID-[1-9][0-9]*-[1-9][0-9]*$'
+      AND i.playbook LIKE 'PYRAMID-' || t.id::text || '-%'
+      AND t.status = 'open' AND t.source = :source
+      AND t.exchange = i.exchange AND t.side = i.side
+      AND regexp_replace(upper(t.symbol), '[/:-]', '', 'g') =
+          regexp_replace(upper(i.symbol), '[/:-]', '', 'g')
+      AND ((:exclude_key)::text IS NULL OR i.intent_key <> :exclude_key)
 )
 SELECT (SELECT as_of FROM agora) AS as_of,
        (SELECT COALESCE(json_agg(to_jsonb(f)), '[]'::json) FROM fechadas f) AS fechadas,
@@ -895,15 +912,28 @@ async def admission_snapshot(session, *, account_ref=None, exchange=None,
     base = _base_from_parts(janela, exposure)
     reservas = snapshot["reservas"]
     risco_reservado = 0.0
+    margem_reservada = 0.0
     for linha in reservas:
         valor = _finite(linha.get("reserved_risk_usd"))
+        if linha.get("risk_only") is True and (valor is None or valor < 0):
+            # Uma linha confirmada inválida não desaparece do orçamento nem
+            # cancela outra positiva. A admissão trata open_rows=None como
+            # indisponibilidade integral e bloqueia antes de qualquer POST.
+            return {"quality": QUALITY_UNKNOWN, "reason_code": "PYRAMID_RETAINED_RISK_UNKNOWN",
+                    "base": None, "open_rows": None, "pending_count": None,
+                    "pending_risk_usd": None, "pending_margin_usd": None, "as_of": moment}
         risco_reservado += abs(valor) if valor is not None else 0.0
+        # MARGEM já reservada por outras intenções pendentes: lida na MESMA
+        # instrução, para que duas propostas não gastem o mesmo saldo livre.
+        margem = _finite(linha.get("reserved_margin_usd"))
+        margem_reservada += abs(margem) if margem is not None else 0.0
     return {"quality": base.get("quality"), "reason_code": base.get("reason_code"),
             "base": base, "as_of": moment,
             "open_rows": snapshot["abertas"],
             "open_positions": len(snapshot["abertas"]),
-            "pending_count": len(reservas),
-            "pending_risk_usd": round(risco_reservado, 6)}
+            "pending_count": sum(linha.get("risk_only") is not True for linha in reservas),
+            "pending_risk_usd": round(risco_reservado, 6),
+            "pending_margin_usd": round(margem_reservada, 6)}
 
 
 def _base_from_parts(janela: Dict[str, Any], exposure: Dict[str, Any]) -> Dict[str, Any]:
@@ -971,12 +1001,16 @@ async def daily_budget() -> Dict[str, Any]:
 
 async def reserved_risk_usd(*, account_ref: Any = None,
                             exclude_intent_key: Any = None) -> Dict[str, Any]:
-    """Risco RESERVADO por outras intenções da MESMA conta, ainda pendentes e
-    ainda não viradas RealTrade.
+    """Risco de outras intenções da MESMA conta, pendentes ou reforços abertos.
 
     Uma decisão já admitida consome o orçamento do dia mesmo antes de existir
     trade: deixá-la de fora autoriza a última margem duas vezes. Intenção já
-    vinculada a RealTrade fica de fora (vira exposição aberta) e `exclude_intent_key`
+    vinculada a RealTrade normalmente fica de fora (vira exposição aberta).
+    A exceção é PYRAMID confirmado: o entry original não é reescrito pela
+    política de gestão, então a reserva de risco permanece conservadoramente
+    até o fechamento. Não ocupa slot nem reserva margem novamente; pode
+    superestimar o risco se o ledger já atualizou a base ou o SL avançou.
+    `exclude_intent_key`
     tira a própria proposta (que seria contada duas vezes). Conta não
     identificada, banco indisponível ou erro ⇒ UNKNOWN — nunca zero.
     """
@@ -994,16 +1028,24 @@ async def reserved_risk_usd(*, account_ref: Any = None,
                             "conta não identificada — reservas desconhecidas", value=None)
         from db import get_session
         from models.entry_intent import EntryIntent, PENDING_STATES
-        from sqlalchemy import func, select
+        from sqlalchemy import and_, case, func, or_, select
+        retained = _retained_pyramid_risk_predicate(EntryIntent)
+        invalid_retained = and_(retained, or_(
+            EntryIntent.reserved_risk_usd.is_(None), EntryIntent.reserved_risk_usd < 0,
+            EntryIntent.reserved_risk_usd >= float("inf")))
+        # PostgreSQL NaN compara acima de Infinity. Contamina a soma de
+        # propósito: UNKNOWN não pode ser mascarado por outra reserva finita.
+        safe_risk = case((invalid_retained, float("nan")),
+                         else_=EntryIntent.reserved_risk_usd)
         filtros = [EntryIntent.account_ref == scope,
-                   EntryIntent.state.in_(PENDING_STATES),
-                   EntryIntent.real_trade_id.is_(None)]
+                   or_(and_(EntryIntent.state.in_(PENDING_STATES),
+                            EntryIntent.real_trade_id.is_(None)), retained)]
         if isinstance(exclude_intent_key, str) and exclude_intent_key.strip():
             filtros.append(EntryIntent.intent_key != exclude_intent_key)
         async with get_session() as session:
             row = (await session.execute(
-                select(func.count(EntryIntent.intent_key),
-                       func.coalesce(func.sum(EntryIntent.reserved_risk_usd), 0.0))
+                select(func.coalesce(func.sum(case((retained, 0), else_=1)), 0),
+                       func.coalesce(func.sum(safe_risk), 0.0))
                 .where(*filtros))).one()
         total = _finite(float(row[1] or 0.0))
         if total is None:
@@ -1016,6 +1058,31 @@ async def reserved_risk_usd(*, account_ref: Any = None,
         log.warning(f"[r05b] reservas indisponíveis: {type(exc).__name__}: {exc}")
         return _unknown("RESERVATIONS_UNAVAILABLE",
                         "falha ao ler as reservas pendentes", value=None)
+
+
+def _retained_pyramid_risk_predicate(intent):
+    """Mesmo braço de risco-only do snapshot SQL; EXISTS não duplica fills/linhas.
+
+    A conta é a da intenção admitida/despachada e já delimita a consulta. O
+    vínculo ao trade é escrito pelo caller após provar exposição/ownership,
+    não depende da atualização posterior do ledger. Nenhum fallback de quote.
+    """
+    from models.entry_intent import EntryIntent
+    from models.real_trade import RealTrade
+    from sqlalchemy import and_, cast, func, select, String
+    return and_(
+        intent.state == "CONFIRMED",
+        intent.purpose == "PYRAMID",
+        intent.playbook.op("~")(r"^PYRAMID-[1-9][0-9]*-[1-9][0-9]*$"),
+        select(1).where(
+            RealTrade.id == intent.real_trade_id,
+            intent.playbook.like("PYRAMID-" + cast(RealTrade.id, String) + "-%"),
+            RealTrade.status == "open", RealTrade.source == PRIMARY_SOURCE,
+            RealTrade.exchange == intent.exchange, RealTrade.side == intent.side,
+            func.regexp_replace(func.upper(RealTrade.symbol), "[/:-]", "", "g") ==
+            func.regexp_replace(func.upper(intent.symbol), "[/:-]", "", "g"),
+        ).correlate(intent).exists(),
+    )
 
 
 async def check_new_entry(*, side: Any, final_entry: Any, stop: Any,

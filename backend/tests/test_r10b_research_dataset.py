@@ -742,12 +742,17 @@ class Architecture(unittest.TestCase):
     def test_no_live_consumer_imports_exporter_or_r09_models(self):
         offenders = []
         for path in list((BACKEND / "services").glob("*.py")) + [BACKEND / "main.py"]:
-            if path.name == "research_dataset_service.py":
+            if path.name in {"research_dataset_service.py", "research_study_service.py"}:
                 continue
             text = path.read_text(encoding="utf-8")
             if "research_dataset" in text:
                 offenders.append(path.name)
         self.assertEqual(offenders, [])
+        # Orquestrador exclusivamente OFFLINE: não concede execução LIVE.
+        study_tree = ast.parse((BACKEND / "services/research_study_service.py").read_text())
+        imports = {n.module or "" for n in ast.walk(study_tree)
+                   if isinstance(n, ast.ImportFrom)}
+        self.assertFalse(any("exchange" in n or "signed" in n for n in imports))
         for name in ("learning_service", "symbol_learning_service", "edge_decay_service",
                      "rotation_service", "calibration_service", "risk_service"):
             text = (BACKEND / "services" / f"{name}.py").read_text()

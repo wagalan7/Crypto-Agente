@@ -37,9 +37,11 @@ else:
     logging.info("[sentry] desabilitado (SENTRY_DSN não setado)")
 
 import pandas as pd
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Header
+from fastapi import (Body, FastAPI, Header, HTTPException, Query, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, StrictBool
 
 from config import TIMEFRAMES, DEFAULT_TIMEFRAME, DEFAULT_LIMIT, ANTHROPIC_API_KEY, GROQ_API_KEY
 from services.binance_service import (
@@ -3092,6 +3094,61 @@ async def execution_incidents_status():
     return await _ers.get_status()
 
 
+# ── Convivência manual/bot — reconhecimento EXPLÍCITO de posição manual ─────
+#  Dois endpoints administrativos e nada mais: nenhum `resolve`, `clear-pause`,
+#  `enable-live` ou `execute` genérico, e nenhuma UI nova. Reconhecer NÃO
+#  autoriza entrada: o reconciliador oficial ainda valida segurança no ciclo
+#  dele antes de qualquer liberação pelo fluxo P03.
+@app.get("/api/admin/manual-positions/candidates")
+async def manual_positions_candidates(x_admin_token: Optional[str] = Header(None)):
+    """Posições FRESCAS da conta e o fingerprint que a confirmação vai exigir.
+
+    Somente leitura. Não devolve segredo, credencial nem stack trace.
+    """
+    gate = _check_admin_token(x_admin_token)
+    if gate is not None:
+        raise HTTPException(status_code=403, detail=gate["error"])
+    from services import manual_position_service as mps
+    return await mps.list_candidates()
+
+
+class ManualPositionAckRequest(BaseModel):
+    """Schema ESTRITO: campo extra é recusado, e `confirm` precisa ser o
+    booleano literal `true` (a string "true" ou 1 não valem)."""
+
+    model_config = {"extra": "forbid"}
+
+    symbol: str
+    fingerprint: str
+    confirm: StrictBool
+    reason: Optional[str] = None
+    identity_note: Optional[str] = None
+
+
+@app.post("/api/admin/manual-positions/acknowledge")
+async def manual_positions_acknowledge(
+    req: ManualPositionAckRequest,
+    x_admin_token: Optional[str] = Header(None),
+):
+    """Reconhece EXPLICITAMENTE uma posição aberta manualmente.
+
+    Relê a posição fresca, exige o fingerprint esperado e, sob a MESMA advisory
+    lock da admissão de entrada, confere ausência de rastro do BOT naquele
+    símbolo antes de gravar. Sucesso NÃO libera entrada nem pausa: o
+    reconciliador oficial ainda precisa validar segurança.
+    """
+    gate = _check_admin_token(x_admin_token)
+    if gate is not None:
+        raise HTTPException(status_code=403, detail=gate["error"])
+    from services import manual_position_service as mps
+    resultado = await mps.acknowledge(
+        symbol=req.symbol, expected_fingerprint=req.fingerprint,
+        confirm=req.confirm, reason=req.reason, identity_note=req.identity_note)
+    if not resultado.get("ok"):
+        return JSONResponse(status_code=409, content=resultado)
+    return resultado
+
+
 @app.post("/api/risk/kill-switch")
 async def risk_kill_switch(paused: bool = True, reason: str | None = None):
     """
@@ -3358,7 +3415,8 @@ async def admin_dedup_protection(req: DedupProtectionRequest):
     if not req.dry_run:
         for d in to_cancel:
             try:
-                r = await binance_signed_service.cancel_algo_order(d["algo_id"])
+                r = await binance_signed_service.cancel_algo_order(
+                    d["algo_id"], symbol=req.symbol)
                 cancelled.append({**d, "ok": bool(r.get("ok")), "msg": r.get("msg") or r.get("error")})
             except Exception as e:
                 cancelled.append({**d, "ok": False, "msg": str(e)})
@@ -4021,18 +4079,39 @@ async def p05_contextual_evaluate(days: int = 90, x_admin_token: Optional[str] =
 
 
 @app.post("/api/strategy/p05/experiments/{exp_id}/start-shadow")
-async def p05_start_shadow(exp_id: int, x_admin_token: Optional[str] = Header(None)):
+async def p05_start_shadow(exp_id: int, payload: Optional[Dict[str, Any]] = Body(None),
+                           x_admin_token: Optional[str] = Header(None)):
     """OFFLINE_VALIDATED → SHADOW. Idempotente; conflito se já houver shadow
-    ativo. NÃO altera o LIVE."""
-    gate = _check_admin_token(x_admin_token)
-    if gate:
-        return gate
+    ativo. NÃO altera o LIVE.
+
+    Sem corpo = contrato LEGADO (pós-seleção), igual ao de antes. Com corpo, é o
+    início GOVERNADO da coorte pré-seleção: confirmação literal, `approval_id`
+    da aprovação SHADOW registrada e `expected_generation` inteira. O corpo usa
+    a autenticação da governança (token configurado obrigatório) e o segredo
+    nunca volta na resposta."""
+    if payload is None:
+        gate = _check_admin_token(x_admin_token)
+        if gate:
+            return gate
+        extras: Dict[str, Any] = {}
+    else:
+        _r13_admin_principal(x_admin_token)
+        if set(payload) != {"confirm", "approval_id", "expected_generation"} \
+                or payload.get("confirm") is not True \
+                or not isinstance(payload.get("approval_id"), str) \
+                or not payload["approval_id"].strip() \
+                or type(payload.get("expected_generation")) is not int:
+            return {"ok": False, "blocked": True,
+                    "reason_code": "START_SHADOW_REQUEST_INVALID"}
+        extras = {"approval_id": payload["approval_id"].strip(),
+                  "expected_generation": payload["expected_generation"]}
     from services import strategy_evidence_service as p05
     try:
-        res = await p05.start_shadow(int(exp_id))
+        res = await p05.start_shadow(int(exp_id), **extras)
     except Exception as e:
-        log.error(f"[p05] start-shadow falhou: {e}")
-        raise HTTPException(status_code=500, detail=f"start-shadow falhou: {e}")
+        # Motivo seguro: nem stack trace nem detalhe interno na resposta.
+        log.error("[p05] start-shadow falhou: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="start-shadow indisponível")
     if not res.get("ok") and (res.get("conflict") or res.get("blocked")):
         raise HTTPException(status_code=409, detail=res.get("error"))
     return res
@@ -4083,6 +4162,97 @@ def _check_admin_token(token: Optional[str]) -> Optional[dict]:
             "error": "ADMIN_API_TOKEN não configurado — endpoint admin bloqueado em produção (mainnet)",
         }
     return None
+
+
+def _r13_admin_principal(token: Optional[str]) -> str:
+    """Autoridade de governança exige credencial configurada, inclusive em demo.
+
+    O principal é derivado da autenticação; payload não pode inventar operador.
+    O token não é devolvido, gravado, hasheado nem incluído em logs/eventos.
+    """
+    if not os.getenv("ADMIN_API_TOKEN", "").strip() or _check_admin_token(token):
+        raise HTTPException(status_code=401, detail="Autenticação administrativa obrigatória")
+    return "ADMIN_API_TOKEN"
+
+
+async def _r13_governance_call(method, *args, **kwargs):
+    import db
+    if not db.DB_ENABLED:
+        return {"ok": False, "blocked": True, "reason_code": "GOVERNANCE_DB_UNAVAILABLE"}
+    try:
+        return await method(db.get_session, *args, **kwargs)
+    except Exception as exc:
+        log.error("[r13] governança indisponível: %s", type(exc).__name__)
+        return {"ok": False, "blocked": True, "reason_code": "GOVERNANCE_UNAVAILABLE"}
+
+
+@app.get("/api/strategy/operational/status")
+async def r13_operational_status(x_admin_token: Optional[str] = Header(None)):
+    """Leitura de autoridade/configuração. Não seleciona nem executa estratégia."""
+    _r13_admin_principal(x_admin_token)
+    from services import operational_governance_service as governance
+    return await _r13_governance_call(governance.get_status)
+
+
+@app.post("/api/strategy/p05/experiments/{exp_id}/operational-bundle")
+async def r13_register_bundle(exp_id: int, payload: Dict[str, Any],
+                              x_admin_token: Optional[str] = Header(None)):
+    """Registra o bundle vinculado ao estudo; não liga seletor ou LIVE."""
+    operator = _r13_admin_principal(x_admin_token)
+    from services import operational_governance_service as governance
+    return await _r13_governance_call(governance.register_bundle, exp_id, payload,
+                                     operator=operator)
+
+
+@app.post("/api/strategy/p05/experiments/{exp_id}/approval")
+async def r13_register_approval(exp_id: int, payload: Dict[str, Any],
+                                x_admin_token: Optional[str] = Header(None)):
+    operator = _r13_admin_principal(x_admin_token)
+    from services import operational_governance_service as governance
+    return await _r13_governance_call(governance.register_approval, exp_id, payload,
+                                     operator=operator)
+
+
+@app.post("/api/strategy/p05/experiments/{exp_id}/approvals/{approval_id}/revoke")
+async def r13_revoke_approval(exp_id: int, approval_id: str, payload: Dict[str, Any],
+                              x_admin_token: Optional[str] = Header(None)):
+    operator = _r13_admin_principal(x_admin_token)
+    from services import operational_governance_service as governance
+    if set(payload) != {"confirm", "expected_generation", "reason"} or payload.get("confirm") is not True:
+        return {"ok": False, "blocked": True, "reason_code": "APPROVAL_REQUEST_INVALID"}
+    return await _r13_governance_call(governance.revoke_approval, exp_id, approval_id,
+                                     expected_generation=payload["expected_generation"],
+                                     reason=payload["reason"], operator=operator)
+
+
+@app.post("/api/strategy/p05/experiments/{exp_id}/promote")
+async def r13_promote_preselection(exp_id: int, payload: Dict[str, Any],
+                                    x_admin_token: Optional[str] = Header(None)):
+    operator = _r13_admin_principal(x_admin_token)
+    if set(payload) != {"confirm", "approval_id", "expected_generation"} or payload.get("confirm") is not True:
+        return {"ok": False, "blocked": True, "reason_code": "PROMOTION_REQUEST_INVALID"}
+    from services import strategy_evidence_service as p05
+    try:
+        return await p05.promote_preselection(exp_id, approval_id=payload["approval_id"],
+                                             expected_generation=payload["expected_generation"],
+                                             operator=operator)
+    except Exception as exc:
+        log.error("[r13] promoção indisponível: %s", type(exc).__name__)
+        return {"ok": False, "blocked": True, "reason_code": "PROMOTION_UNAVAILABLE"}
+
+
+@app.post("/api/strategy/operational/rollback")
+async def r13_operational_rollback(payload: Dict[str, Any],
+                                   x_admin_token: Optional[str] = Header(None)):
+    operator = _r13_admin_principal(x_admin_token)
+    from services import operational_governance_service as governance
+    if (set(payload) != {"confirm", "expected_generation", "reason", "block_entries"}
+            or payload.get("confirm") is not True or type(payload.get("block_entries")) is not bool):
+        return {"ok": False, "blocked": True, "reason_code": "ROLLBACK_REQUEST_INVALID"}
+    return await _r13_governance_call(governance.rollback,
+                                     expected_generation=payload["expected_generation"],
+                                     reason=payload["reason"], block_entries=payload["block_entries"],
+                                     operator=operator)
 
 
 @app.post("/api/admin/force-test-trade")

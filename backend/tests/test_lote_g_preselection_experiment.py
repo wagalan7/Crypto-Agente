@@ -350,10 +350,15 @@ class RelatorioEFronteiras(unittest.TestCase):
                     if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                         rotas.append(arg.value)
         self.assertTrue(rotas, "nenhuma rota encontrada — parser quebrado")
-        for proibido in ("execute-now", "enable-live", "promote", "clear-quarantine",
+        for proibido in ("execute-now", "enable-live", "clear-quarantine",
                          "activate-live"):
             ofensoras = [rota for rota in rotas if proibido in rota]
             self.assertEqual(ofensoras, [], f"{proibido}: {ofensoras}")
+        # O Lote 03 implementou a promoção GOVERNADA: existe UMA rota `promote`,
+        # do catálogo P05, que exige aprovação registrada e geração esperada.
+        # Nenhum atalho de ativação foi criado, e o R12 continua sem endpoint.
+        promocao = [rota for rota in rotas if "promote" in rota]
+        self.assertEqual(promocao, ["/api/strategy/p05/experiments/{exp_id}/promote"])
         self.assertNotIn("preselection_experiment_service",
                          (BACKEND / "main.py").read_text(encoding="utf-8"))
 
@@ -368,12 +373,15 @@ class RelatorioEFronteiras(unittest.TestCase):
                 importados.add(node.module.split(".")[0])
                 if node.module.split(".")[0] == "services":
                     de_servicos.update(alias.name for alias in node.names)
-        # `services` entra por UM motivo só: validar manifesto reconstruindo o
-        # MOTOR offline (ReplayConfig/CostConfig) em vez de duplicar schema.
+        # `services` entra por DOIS motivos, ambos de CONTRATO e ambos puros:
+        # validar manifesto reconstruindo o MOTOR offline (ReplayConfig/
+        # CostConfig) e validar o bloco de SELEÇÃO pela MESMA função do
+        # manifesto autorizado — em vez de duplicar schema em cada consumidor.
         self.assertEqual(importados - {"__future__"},
                          {"dataclasses", "datetime", "hashlib", "json", "math", "os",
                           "services", "typing"})
-        self.assertEqual(de_servicos, {"offline_replay_service"})
+        self.assertEqual(de_servicos, {"offline_replay_service",
+                                       "research_manifest_service"})
         # Pureza preservada: nada de banco, exchange, rede ou execução.
         for proibido in ("db", "httpx", "requests", "aiohttp", "binance",
                          "order_service", "trade_manager_service"):

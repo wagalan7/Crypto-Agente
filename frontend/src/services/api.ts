@@ -135,6 +135,84 @@ async function patch<T>(path: string, body: unknown): Promise<T> {
   return res.json()
 }
 
+// ─── P03: incidentes de execução (SOMENTE LEITURA) ───────────────────────────
+// GET público que já existe no backend. Entrou no frontend no Lote 04 para a
+// Home/Sistema poderem dizer "bloqueado por incidente" em vez de "Operando".
+// Nenhuma rota nova, nenhum POST, nenhum timer próprio: os painéis chamam nos
+// ciclos que já têm, e o cache/single-flight abaixo garante UMA chamada por
+// janela mesmo com duas telas abertas.
+
+export interface ExecutionIncidentItem {
+  incident_id?: number | null
+  incident_key?: string | null
+  symbol?: string | null
+  side?: string | null
+  kind?: string | null
+  state?: string | null
+  qty_known?: number | null
+  attempts?: number | null
+  last_error?: string | null
+  manual_reason?: string | null
+  next_retry_at?: string | null
+  updated_at?: string | null
+}
+
+export interface ExecutionIncidentsStatus {
+  ok?: boolean
+  error?: string | null
+  reconciler_running?: boolean
+  last_reconciliation_at?: string | null
+  quarantine_active?: boolean
+  manual_validation?: {
+    ok?: boolean
+    new_entries_blocked?: boolean | null
+    reason_code?: string
+    scope?: string
+  }
+  open_total?: number
+  retry_pending?: number
+  manual_required?: number
+  protected?: number
+  flat?: number
+  items?: ExecutionIncidentItem[]
+  manual_items?: ExecutionIncidentItem[]
+}
+
+/** Janela do cache compartilhado. Menor que a cadência da Home (20s). */
+export const EXECUTION_INCIDENTS_TTL_MS = 12_000
+
+let p03Cache: { at: number; value: ExecutionIncidentsStatus } | null = null
+let p03Inflight: Promise<ExecutionIncidentsStatus> | null = null
+let p03ObservedAt = new WeakMap<object, number>()
+
+/** Recebimento real do GET; uma releitura do cache não renova este instante. */
+export function executionIncidentsObservedAt(payload: unknown): number | null {
+  return payload !== null && typeof payload === 'object'
+    ? p03ObservedAt.get(payload) ?? null
+    : null
+}
+
+/** Zera o cache — usado apenas por QA/testes locais. */
+export function __resetExecutionIncidentsCache(): void {
+  p03Cache = null
+  p03Inflight = null
+  p03ObservedAt = new WeakMap<object, number>()
+}
+
+async function fetchExecutionIncidents(): Promise<ExecutionIncidentsStatus> {
+  const res = await fetch(`${BASE}/execution-incidents/status`, { signal: AbortSignal.timeout(10_000) })
+  if (!res.ok) throw new Error(`API error ${res.status}`)
+  const payload: unknown = await res.json()
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)
+    || (payload as ExecutionIncidentsStatus).ok !== true) {
+    // HTTP 200 não é confirmação de domínio. Não propaga erro/segredo do
+    // servidor e não substitui o último objeto bom por um payload de falha.
+    throw new Error('P03_STATUS_UNCONFIRMED')
+  }
+  p03ObservedAt.set(payload, Date.now())
+  return payload as ExecutionIncidentsStatus
+}
+
 // Payload pra confirmar entrada manual a partir de uma recomendação.
 export interface ConfirmEntryPayload {
   symbol: string
@@ -272,6 +350,32 @@ export const api = {
     get<{ best_timeframe: string; score: number; signal: TradeSignal; all_scores: Record<string, number> }>(
       '/best-timeframe', { symbol }
     ),
+
+  // Incidentes de execução P03 (leitura). Cache + single-flight COMPARTILHADOS:
+  // duas telas no mesmo ciclo consomem a MESMA resposta, sem segundo GET.
+  // `maxAgeMs=0` força leitura nova (botão Atualizar do usuário).
+  executionIncidentsStatus: (opts?: { maxAgeMs?: number }): Promise<ExecutionIncidentsStatus> => {
+    const maxAge = opts?.maxAgeMs ?? EXECUTION_INCIDENTS_TTL_MS
+    const now = Date.now()
+    if (p03Cache && now - p03Cache.at < maxAge) return Promise.resolve(p03Cache.value)
+    if (p03Inflight) return p03Inflight
+    p03Inflight = fetchExecutionIncidents()
+      .then(value => {
+        const observedAt = executionIncidentsObservedAt(value)
+        if (observedAt === null) throw new Error('P03_STATUS_UNCONFIRMED')
+        p03Cache = { at: observedAt, value }
+        return value
+      })
+      .catch(error => {
+        // Uma leitura que falhou não pode ser seguida de um "sucesso" só
+        // porque o objeto anterior ainda cabe no TTL. O consumidor conserva
+        // esse objeto/instante para diagnóstico; a próxima leitura exige GET.
+        p03Cache = null
+        throw error
+      })
+      .finally(() => { p03Inflight = null })
+    return p03Inflight
+  },
 
   // ── Operações reais/manuais (backend RealTrade) ──────────────────────────
   // Menu "Operações Ativas": lista o que está vivo (status=open), unificando
