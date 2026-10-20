@@ -211,8 +211,9 @@ rollback e bloqueadores em `RELEASE-E01-E03.md`.
 | G4 publicação | — |
 | G5 observação | — |
 
-**R2 precisa de rebase** sobre o `origin/main` atual (hoje está 17 commits
-atrás). **Menor release coerente:** E02 **não** é publicável sozinha (a camada de
+~~**R2 precisa de rebase** sobre o `origin/main` atual (hoje está 17 commits
+atrás).~~ **Resolvido por merge em 20/10:** `integracao/r2-main-e08b` (R2 + `main` +
+E08B), 407 de 407 testes (`EVIDENCIAS/08B.md` §13). **Menor release coerente:** E02 **não** é publicável sozinha (a camada de
 ofertas foi reescrita sobre o esquema de E03 e as funções de E02 foram
 removidas). O que é separável de verdade é a **correção da landing** (commit 1),
 autossuficiente e de risco mínimo. Recomendação: R1 = landing + docs + testes;
