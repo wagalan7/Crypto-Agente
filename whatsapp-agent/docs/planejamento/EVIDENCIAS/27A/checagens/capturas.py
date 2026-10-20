@@ -4,6 +4,7 @@ erros de JS, recursos 4xx/5xx, violeta residual nos estilos computados).
 Uso: python capturas.py <base-url> <dir-saida> <prefixo> [caminhos...]
 """
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -42,10 +43,15 @@ with sync_playwright() as p:
         for caminho in CAMINHOS:
             ctx = nav.new_context(viewport={"width": largura, "height": 900}, reduced_motion="reduce",
                                   device_scale_factor=1)
+            # Nunca executar rastreamento de anúncios/analytics: contra produção, a tag do
+            # Google Ads registraria a captura como visita na conta real.
+            ctx.route(re.compile(r"https://([a-z0-9-]+\.)*(googletagmanager|google-analytics|doubleclick|googleadservices)\.(com|net)/.*"),
+                      lambda rota: rota.abort())
             pg = ctx.new_page()
             erros, falhas = [], []
             pg.on("pageerror", lambda e: erros.append(str(e)))
-            pg.on("console", lambda m: erros.append(m.text) if m.type == "error" else None)
+            # o bloqueio acima gera "Failed to load resource: net::ERR_FAILED"; não é erro da página
+            pg.on("console", lambda m: erros.append(m.text) if m.type == "error" and "net::ERR_FAILED" not in m.text else None)
             pg.on("response", lambda r: falhas.append(f"{r.status} {r.url}") if r.status >= 400 else None)
             pg.goto(BASE + caminho, wait_until="networkidle")
             pg.wait_for_timeout(1500)

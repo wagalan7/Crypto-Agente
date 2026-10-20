@@ -2,13 +2,13 @@
 
 Plano v1.0 instalado em `whatsapp-agent/docs/planejamento/`, com revisões
 **v1.1–v1.4** registradas em `REVISOES.md` (datas da baseline mantidas).
-Em produção: `1986bdef0` = R1 (landing, 14/10) + R3 (horário de quem faltou,
+Em produção: `20b6d3051` = R1 (landing, 14/10) + R3 (horário de quem faltou,
 19/10) + R4 (layout da E08A, 19/10) + R1b ("40% menos faltas" retirado da
-landing, 19/10). Nenhuma **etapa** do plano publicada — R1, R1b e R3 são releases avulsos.
-Em andamento: **E27A — PRONTA LOCALMENTE, aguardando avaliação visual do
-proprietário** (identidade nas páginas de venda, antecipada por decisão dele,
-v1.4; release **R5** preparado, não publicado). E08A publicada (R4), com a
-confirmação visual do proprietário pendente. Próxima etapa: E04.
+landing, 19/10) + R5 (identidade nas páginas de venda, E27A, 20/10). Nenhuma
+**etapa** do plano publicada por inteiro — R1, R1b e R3 são releases avulsos.
+E08A (R4) e E27A (R5) publicadas; E27A aprovada visualmente antes do push.
+Pendente: o proprietário conferir o painel (R4) e as páginas de venda (R5) no
+ar. Próxima etapa: E04.
 
 ## Resumo compacto
 
@@ -69,7 +69,7 @@ verde não substitui homologação.
 | E02 | PRONTA LOCALMENTE | B2, B3 para avançar a VALIDADA EM HOMOLOGAÇÃO |
 | E03 | PRONTA LOCALMENTE | B2, B3 para avançar a VALIDADA EM HOMOLOGAÇÃO |
 | **E08A** (antecipação parcial de E08) | **PUBLICADA** em 19/10 como R4 (`b7397719`) | confirmação visual do proprietário no próprio painel |
-| **E27A** (antecipação só visual de E27) | **PRONTA LOCALMENTE** — R5 preparado (`78a1718d` + `20b6d305`), não publicado | avaliação visual do proprietário; depois, autorização do push |
+| **E27A** (antecipação só visual de E27) | **PUBLICADA** em 20/10 como R5 (`78a1718d` + `20b6d305`) | confirmação visual do proprietário no ar |
 | E04–E28 | PENDENTE | — (E08 e E27 parcialmente adiantadas por E08A e E27A, **não** concluídas) |
 
 E04 e E27 **não** estão concluídas: receberam apenas transferência parcial de
@@ -239,9 +239,9 @@ R2 = código de E02+E03 em janela combinada.
    por decisão do proprietário (19/10, `REVISOES.md` v1.4) — **pronta
    localmente** em 20/10: commits `78a1718dc` + `20b6d3051`, fast-forward sobre `1986bdef0`;
    texto, oferta e preços idênticos nas 13 páginas; capturas antes/depois e
-   scripts em `EVIDENCIAS/27A/`. **Falta:** avaliação visual do proprietário;
-   publicação como **R5** só com autorização, depois das 22h
-   (`RELEASE-R5-VISUAL-LANDING.md`).
+   scripts em `EVIDENCIAS/27A/`. ✅ Aprovada pelo proprietário e **publicada como
+   R5** em 20/10, 00h24 BRT. Produção idêntica à prévia nas 13 páginas e
+   ~19 s sem resposta na troca de contêiner (`RELEASE-R5-VISUAL-LANDING.md`).
 8. Textos encontrados na E27A para decisão do proprietário em E27 (meta
    "Reduza faltas", "Os pacientes não percebem que é automático", "2 minutos",
    valores de mercado, 💜) — lista em `EVIDENCIAS/27A.md`.

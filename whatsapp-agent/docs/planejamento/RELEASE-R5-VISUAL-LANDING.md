@@ -1,7 +1,8 @@
 # R5 — identidade visual nas páginas de venda (E27A)
 
-Preparado em 20/10/2026. **NÃO PUBLICADO.** Aguarda a avaliação visual do
-proprietário e, depois, autorização explícita para o push.
+Preparado em 20/10/2026. **PUBLICADO em 20/10/2026, 00h24 BRT**, depois da
+aprovação visual e da autorização explícita do proprietário ("aprovado, pode
+rodar push e deploy"). Registro da publicação no fim deste arquivo.
 
 ## Versão exata
 
@@ -101,3 +102,51 @@ retiradas de texto que o R1 já publicou, porque o R1 saiu do commit 1 do R2.
 No rebase do R2 sobre `main`, `landing.html` pode conflitar. A resolução é
 manter a versão de `main` (R1 + R1b + R5), que já contém essas retiradas, e
 rodar o `test_landing_alegacoes.py` corrigido, que busca no texto visível.
+
+## Publicação executada — 20/10/2026
+
+| | |
+|---|---|
+| Pré-push | `origin/main` = `1986bdef0`; 2 commits; 4 arquivos, todos em `whatsapp-agent/`; árvore limpa |
+| Push | `1986bdef0..20b6d3051` em `main`, fast-forward, 03:24:47Z (00h24 BRT) |
+| Deployments | `railway-app[bot]` → **só** `Agente de Atendimento / production` (03:24:54Z); `vercel[bot]` → frontend do cripto (03:25:22Z), como nos releases anteriores |
+| Bot de cripto | **nenhum deployment** nos serviços Railway do cripto |
+| Processo novo | `uptime 11,3 s` às 03:26:14Z → subiu ~03:26:03Z; `db: ok`, 8 consultórios |
+
+### Janela de indisponibilidade — checagem a cada 5 s
+
+```
+03:25:55Z  processo antigo responde
+03:26:01Z  sem resposta
+03:26:14Z  processo novo responde, uptime 11,3 s
+```
+
+No máximo **~19 s** sem atendimento (00h25min55s–00h26min14s BRT), igual ao
+R4 e ao R1b.
+
+### Verificação pós-deploy
+
+| # | Checagem | Resultado |
+|---|---|---|
+| 1 | `/healthz` | `uptime` zerado, `db: ok`, 8 consultórios |
+| 2 | deployments | só o serviço do Agente |
+| 3 | `compartilhamento-1200x630.jpg` | **200**, sha256 `3d24a8dac7e029e3` = commit |
+| 3a | `hero-agente.jpg` | **404**, como previsto |
+| 3b | símbolo 256/64 e `tokens.css` | 200 |
+| 4 | **produção = prévia do R5** nas 13 páginas: texto visível, título, metas, classes do `<h1>`, recursos referenciados | **igual nas 13**; calibrada antes do deploy, quando acusou diferença nas 13 |
+| 5 | alegações (R1/R1b) no texto visível | **LIMPO** |
+| 6 | estilos computados em produção, 1440/768/390, `/` e `/p/nutricao` | violeta 0, vazamento 0, erros de JS 0, respostas ≥ 400: 0; Montserrat + Inter |
+| 7 | tag do Google Ads | presente em `/` e `/p/nutricao`: a medição continua |
+| 8 | `/termos`, `/privacidade`, `/onboarding` | 200; `/p/psicologia` e segmento inexistente → 302 para `/`, como antes |
+| 9 | **confirmação visual no ar** | **pendente — proprietário** |
+
+### Efeito colateral da verificação — registrado
+
+A checagem 6 abriu as páginas de produção num navegador real, 6 vezes
+(3 larguras × 2 páginas), e a **tag do Google Ads foi executada**: são 6
+visitas automatizadas, de 00h27 BRT, na conta de anúncios. Nenhum evento de
+conversão foi disparado; as checagens 4 e 5 não executam JavaScript e não
+contam. Correção: `capturas.py` agora bloqueia no próprio navegador as
+requisições a `googletagmanager`, `google-analytics`, `doubleclick` e
+`googleadservices`. Testado contra produção: `gtag/js` bloqueado, nenhuma
+requisição concluída para o Google.
