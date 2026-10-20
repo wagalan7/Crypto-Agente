@@ -1,0 +1,17 @@
+Using SSH key: /Users/alanmalta/.ssh/id_ed25519.pub
+versao candidata: 29eddc7c3010163d8fe9a26f953aa53749fdc07f
+copia: 44.08 MB em 0.5s (ativo aberto so leitura)
+antes: tabelas 26 | integrity_check ok
+init_db: 1a execucao 0.33s | 2a execucao (idempotencia) 0.00s
+depois: tabelas 37 | integrity_check ok | foreign_key_check 0 violacoes
+tabelas novas: ['applied_effects', 'counters', 'inbound_events', 'noticias_edicoes', 'noticias_execucoes', 'noticias_fontes_estado', 'noticias_itens', 'offers', 'outbox', 'pending_effects', 'slot_offers']
+tabelas que sumiram: []
+colunas novas em tabelas existentes: {}
+colunas que sumiram: {}
+contagens diferentes em tabelas existentes: {}
+linhas nas tabelas novas: {'applied_effects': 0, 'counters': 0, 'inbound_events': 0, 'noticias_edicoes': 0, 'noticias_execucoes': 0, 'noticias_fontes_estado': 0, 'noticias_itens': 0, 'offers': 0, 'outbox': 0, 'pending_effects': 0, 'slot_offers': 0}
+indices novos: ['idx_inbound_contato', 'idx_inbound_pendentes', 'idx_offers_contato', 'idx_outbox_pendentes', 'idx_pendencias_abertas', 'ix_noticias_itens_fonte']
+contagens-chave: {'tenants': 8, 'appointments': 526, 'patients': 42, 'contracts': 33, 'slot_offers': 0}
+banco ATIVO depois do teste: tabelas 26 | integrity_check ok
+temporario apagado: True
+FIM
