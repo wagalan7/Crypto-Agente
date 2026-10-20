@@ -528,6 +528,10 @@ def init_db():
             );
         """)
 
+        # Boletim de notícias por segmento (E08B): só CREATE IF NOT EXISTS.
+        import noticias_job as _noticias_job
+        _noticias_job.criar_tabelas(conn)
+
         # Seed do usuário admin padrão (alanmalta) se ainda não existir
         _seed_default_admin(conn)
 

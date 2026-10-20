@@ -158,6 +158,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Reconciliação GCal falhou: {e}")
     scheduler.start_scheduler()
+    # Boletim de notícias (E08B): thread própria; não mexe no scheduler de 30 min.
+    try:
+        import noticias_job
+        noticias_job.iniciar()
+    except Exception as e:
+        logger.warning(f"Boletim de notícias não iniciou: {e}")
     logger.info("Agente de Atendimento iniciado")
     yield
 
@@ -2689,6 +2695,11 @@ async def dash_insights_narrative(request: Request):
     try:
         if not tenant.get("ai_narrative_enabled"):
             return {"narrative": ""}
+        # E08B: no segmento com boletim, o quadro narrativo foi substituído
+        # por ele. Sem narrativa e sem chamada ao modelo.
+        import noticias as _nt
+        if _nt.segmento_do_tenant(tenant):
+            return {"narrative": ""}
         import asyncio
         import insights_service as _ins
         narrative = await asyncio.to_thread(_ins.build_home_narrative, tenant)
@@ -2696,6 +2707,54 @@ async def dash_insights_narrative(request: Request):
     except Exception:
         logger.exception("dash_insights_narrative fail-open")
         return {"narrative": ""}
+
+
+# ── Boletim de notícias por segmento (E08B) ──────────────────────────────────
+# Leitura só do cache: abrir o painel nunca dispara coleta nem IA.
+_noticias_ultimo_pedido: dict[int, float] = {}
+_NOTICIAS_INTERVALO_PEDIDO_S = 20
+
+
+@app.get("/dashboard/api/noticias")
+def dash_noticias(request: Request):
+    tenant = _get_tenant_by_token(request.headers.get("X-Dashboard-Token", ""))
+    import noticias_job as _nj
+    try:
+        return _nj.ler_boletim(tenant)
+    except Exception:
+        logger.exception("dash_noticias fail-open")
+        return {"habilitado": False}
+
+
+@app.post("/dashboard/api/noticias/revisar")
+def dash_noticias_revisar(request: Request):
+    """Botão "Atualizar" do quadro. Responde se houve revisão real das fontes
+    (`revisao_iniciada`) ou só releitura do cache (`leitura_cache`). A revisão
+    é por segmento e no máximo uma por hora; este limite por consultório só
+    evita repetição de cliques."""
+    import time as _t
+    tenant = _get_tenant_by_token(request.headers.get("X-Dashboard-Token", ""))
+    agora = _t.monotonic()
+    ultimo = _noticias_ultimo_pedido.get(tenant["id"])
+    if ultimo is not None and agora - ultimo < _NOTICIAS_INTERVALO_PEDIDO_S:
+        raise HTTPException(status_code=429, detail="Aguarde alguns segundos antes de atualizar de novo.")
+    _noticias_ultimo_pedido[tenant["id"]] = agora
+    import noticias_job as _nj
+    return _nj.pedir_revisao(tenant)
+
+
+@app.get("/admin/noticias/estado")
+def admin_noticias_estado():
+    """Pendências e histórico do boletim (protegido pela MASTER_KEY no middleware)."""
+    import noticias_job as _nj
+    return _nj.estado_operacional()
+
+
+@app.post("/admin/noticias/{segmento}/revisar")
+def admin_noticias_revisar(segmento: str):
+    """Revisão imediata das fontes de um segmento (MASTER_KEY). Respeita o lease."""
+    import noticias_job as _nj
+    return _nj.forcar_revisao(segmento)
 
 
 @app.get("/dashboard/api/billing/export")
