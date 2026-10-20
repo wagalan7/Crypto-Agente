@@ -891,18 +891,26 @@ def _receber(tenant: dict, provider: str, payload: dict, phone: str, body: str,
 
 
 async def _drenar_entrada():
-    """Empurrão de baixa latência: processa o que está pronto e despacha a saída."""
+    """Empurrão de baixa latência: processa o que está pronto e despacha a saída.
+
+    Respeita os MESMOS interruptores dos workers. Antes não respeitava: com
+    INBOX_WORKER_ENABLED=0 e OUTBOX_WORKER_ENABLED=0 cada mensagem recebida
+    continuava sendo processada e respondida por aqui, e a parada de
+    emergência (RELEASE-R1-LANDING.md §8) não parava nada. Agora, desligar os
+    workers para o processamento de verdade; o recebimento segue gravando."""
     import asyncio as _aio
-    try:
-        import inbox
-        await _aio.to_thread(inbox.drain, None, 5)
-    except Exception as e:
-        logger.exception(f"[inbox] drenagem imediata falhou: {e}")
-    try:
-        import outbox as _ob
-        await _aio.to_thread(_ob.flush, None, 10)
-    except Exception as e:
-        logger.exception(f"[outbox] despacho imediato falhou: {e}")
+    if getattr(config, "INBOX_WORKER_ENABLED", True):
+        try:
+            import inbox
+            await _aio.to_thread(inbox.drain, None, 5)
+        except Exception as e:
+            logger.exception(f"[inbox] drenagem imediata falhou: {e}")
+    if getattr(config, "OUTBOX_WORKER_ENABLED", True):
+        try:
+            import outbox as _ob
+            await _aio.to_thread(_ob.flush, None, 10)
+        except Exception as e:
+            logger.exception(f"[outbox] despacho imediato falhou: {e}")
 
 
 @app.post("/webhook/{slug}/evolution")
