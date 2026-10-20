@@ -6,7 +6,7 @@ JS = """() => { window.scrollTo(0, document.documentElement.scrollHeight);
     return !(r.right <= f.left || r.left >= f.right || r.bottom <= f.top || r.top >= f.bottom); }).map(a => a.textContent.trim()); }"""
 with sync_playwright() as p:
     nav = p.chromium.launch()
-    for w, h in ((390, 844), (768, 1024), (1024, 768), (1280, 800), (1440, 900)):
+    for w, h in ((375, 667), (390, 844), (768, 1024), (1009, 768), (1024, 768), (1280, 800), (1440, 900)):
         for porta, tag in ((8771, "antes"), (8772, "depois")):
             pg = nav.new_page(viewport={"width": w, "height": h})
             res = {}

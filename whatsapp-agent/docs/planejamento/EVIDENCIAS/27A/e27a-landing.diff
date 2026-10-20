@@ -1,5 +1,5 @@
 diff --git a/whatsapp-agent/backend/templates/landing.html b/whatsapp-agent/backend/templates/landing.html
-index 24ab55672..03816356d 100644
+index 24ab55672..57689e6f8 100644
 --- a/whatsapp-agent/backend/templates/landing.html
 +++ b/whatsapp-agent/backend/templates/landing.html
 @@ -8,26 +8,64 @@
@@ -154,7 +154,7 @@ index 24ab55672..03816356d 100644
          Atende no seu próprio número de WhatsApp
        </div>
 -      <h1 class="text-4xl md:text-5xl xl:text-6xl font-black leading-[1.1] mb-6">
-+      <h1 class="text-4xl md:text-5xl xl:text-[3.5rem] font-black leading-[1.1] mb-6">
++      <h1 class="text-[2rem] md:text-5xl lg:text-[2.75rem] xl:text-[3.5rem] font-black leading-[1.1] mb-6">
          Sua agenda cheia.<br/>
 -        <span style="background:linear-gradient(90deg,#a855f7,#e9d5ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Sua cabeça livre.</span>
 +        <span style="background:linear-gradient(90deg,#E7BFBF,#F9EEEC);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Sua cabeça livre.</span>
@@ -429,7 +429,7 @@ index 24ab55672..03816356d 100644
        </a>
      </div>
 diff --git a/whatsapp-agent/backend/templates/landing_vertical.html b/whatsapp-agent/backend/templates/landing_vertical.html
-index 536c9235b..3fb2dd1e7 100644
+index 536c9235b..4e2584e0b 100644
 --- a/whatsapp-agent/backend/templates/landing_vertical.html
 +++ b/whatsapp-agent/backend/templates/landing_vertical.html
 @@ -8,25 +8,64 @@
@@ -580,7 +580,7 @@ index 536c9235b..3fb2dd1e7 100644
          {{ c.hero_pill }}
        </div>
 -      <h1 class="text-4xl md:text-5xl xl:text-6xl font-black leading-[1.1] mb-6">
-+      <h1 class="text-4xl md:text-5xl xl:text-[3.5rem] font-black leading-[1.1] mb-6">
++      <h1 class="text-[2rem] md:text-5xl lg:text-[2.75rem] xl:text-[3.5rem] font-black leading-[1.1] mb-6">
          {{ c.hero_title_1 }}<br/>
 -        <span style="background:linear-gradient(90deg,#a855f7,#e9d5ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">{{ c.hero_title_2 }}</span>
 +        <span style="background:linear-gradient(90deg,#E7BFBF,#F9EEEC);-webkit-background-clip:text;-webkit-text-fill-color:transparent">{{ c.hero_title_2 }}</span>

@@ -1,4 +1,4 @@
-"""Palavra órfã nos dois títulos grandes (herói e CTA final), 13 páginas × 4 larguras.
+"""Palavra órfã nos dois títulos grandes (herói e CTA final), 13 páginas × 9 larguras.
 Órfã = linha visual com uma palavra só que não fecha a frase. Também conta linhas."""
 from playwright.sync_api import sync_playwright
 SEGS = ["/", "/p/nutricao", "/p/fisioterapia", "/p/fonoaudiologia", "/p/odontologia", "/p/terapia",
@@ -12,7 +12,7 @@ JS = """(sel) => { const h = document.querySelector(sel); const r = document.cre
 orfas = {"antes": [], "depois": []}; maxl = {}
 with sync_playwright() as p:
     nav = p.chromium.launch()
-    for w in (390, 768, 1024, 1440):
+    for w in (375, 390, 753, 768, 1009, 1024, 1265, 1280, 1440):
         for porta, tag in ((8771, "antes"), (8772, "depois")):
             pg = nav.new_page(viewport={"width": w, "height": 900})
             for c in SEGS:
@@ -24,9 +24,9 @@ with sync_playwright() as p:
                         orfas[tag].append((w, c, sel, ls))
             pg.close()
     nav.close()
-print("órfãs (de 104 títulos):", {k: len(v) for k, v in orfas.items()})
+print("órfãs (de 234 títulos):", {k: len(v) for k, v in orfas.items()})
 for t, v in orfas.items():
     for x in v[:3]: print(" ", t, x)
 print("máximo de linhas por largura (antes → depois):")
-for w in (390, 768, 1024, 1440):
+for w in (375, 390, 753, 768, 1009, 1024, 1265, 1280, 1440):
     print(f"  {w:5}  herói {maxl[('antes', w, 'h1')]} → {maxl[('depois', w, 'h1')]}   CTA {maxl[('antes', w, '.cta-bg h2')]} → {maxl[('depois', w, '.cta-bg h2')]}")

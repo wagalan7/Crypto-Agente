@@ -7,9 +7,9 @@ proprietário e, depois, autorização explícita para o push.
 
 | | |
 |---|---|
-| Commit | `78a1718dc18370d2e44004ceb07da8ce286ab2cf` |
+| Commits | `78a1718dc` (identidade) + `20b6d3051` (tamanho do título do herói); topo `20b6d305113fc928ae24bc889272d28e863d0a6d` |
 | Branch local | `release/r5-visual-landing` (worktree `scratchpad/r5`) |
-| Base | `1986bdef0` = `origin/main` (R1b no ar); **fast-forward**, 1 commit |
+| Base | `1986bdef0` = `origin/main` (R1b no ar); **fast-forward**, 2 commits |
 | Conteúdo | 4 arquivos em `whatsapp-agent/backend/`: `templates/landing.html`, `templates/landing_vertical.html`, `static/marca/compartilhamento-1200x630.jpg` (novo), `static/hero-agente.jpg` (removido) — 268+/163− |
 | Fora do release | documentação (fica no branch do planejamento), backend, rotas, banco, variáveis, `landing_content.py`, `_gtag.html` |
 | Carimbo de build | não incluído — mesmo motivo do R1/R3/R4: `/healthz` não expõe versão; a confirmação é o `uptime_s` zerar |
@@ -24,8 +24,9 @@ Resumo:
 - alegações do R1/R1b: **LIMPO**;
 - 0 violeta computado, 0 vazamento horizontal, 0 erro de JS, 0 resposta ≥ 400;
 - contraste de todos os pares novos ≥ 4,5:1;
-- títulos sem palavra órfã nas 104 combinações; herói em 2 linhas em todas as
-  larguras ≥ 768;
+- títulos sem palavra órfã nas 234 combinações (13 páginas × 9 larguras,
+  inclusive com barra de rolagem); nenhum título com mais linhas que em
+  produção;
 - testes de template do R2 passam com estes arquivos.
 
 ## O que o visitante vai notar
@@ -65,7 +66,7 @@ git -C <scratchpad>/r5 push origin release/r5-visual-landing:main
 ```
 
 Antes do push: reconferir que `origin/main` ainda é `1986bdef0`, que o branch
-tem 1 commit e que a árvore está limpa.
+tem os 2 commits e que a árvore está limpa.
 
 ## Verificação pós-deploy (~10 min)
 
@@ -85,7 +86,7 @@ tem 1 commit e que a árvore está limpa.
 ## Reversão
 
 ```bash
-git revert 78a1718dc18370d2e44004ceb07da8ce286ab2cf
+git revert --no-edit 20b6d305113fc928ae24bc889272d28e863d0a6d 78a1718dc18370d2e44004ceb07da8ce286ab2cf
 git push origin HEAD:main
 ```
 

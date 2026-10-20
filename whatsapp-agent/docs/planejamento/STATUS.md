@@ -69,7 +69,7 @@ verde não substitui homologação.
 | E02 | PRONTA LOCALMENTE | B2, B3 para avançar a VALIDADA EM HOMOLOGAÇÃO |
 | E03 | PRONTA LOCALMENTE | B2, B3 para avançar a VALIDADA EM HOMOLOGAÇÃO |
 | **E08A** (antecipação parcial de E08) | **PUBLICADA** em 19/10 como R4 (`b7397719`) | confirmação visual do proprietário no próprio painel |
-| **E27A** (antecipação só visual de E27) | **PRONTA LOCALMENTE** — R5 preparado (`78a1718d`), não publicado | avaliação visual do proprietário; depois, autorização do push |
+| **E27A** (antecipação só visual de E27) | **PRONTA LOCALMENTE** — R5 preparado (`78a1718d` + `20b6d305`), não publicado | avaliação visual do proprietário; depois, autorização do push |
 | E04–E28 | PENDENTE | — (E08 e E27 parcialmente adiantadas por E08A e E27A, **não** concluídas) |
 
 E04 e E27 **não** estão concluídas: receberam apenas transferência parcial de
@@ -237,7 +237,7 @@ R2 = código de E02+E03 em janela combinada.
    números, retirado em 19/10, 23h33 BRT — `RELEASE-R1-LANDING.md` §11).
 7. **E27A** (aplicação só visual da identidade à página de vendas) antecipada
    por decisão do proprietário (19/10, `REVISOES.md` v1.4) — **pronta
-   localmente** em 20/10: commit `78a1718dc`, fast-forward sobre `1986bdef0`;
+   localmente** em 20/10: commits `78a1718dc` + `20b6d3051`, fast-forward sobre `1986bdef0`;
    texto, oferta e preços idênticos nas 13 páginas; capturas antes/depois e
    scripts em `EVIDENCIAS/27A/`. **Falta:** avaliação visual do proprietário;
    publicação como **R5** só com autorização, depois das 22h
