@@ -1,14 +1,16 @@
-# Status — atualizado em 20/10/2026 (E27A pronta localmente)
+# Status — atualizado em 20/10/2026 (E08B pronta localmente)
 
 Plano v1.0 instalado em `whatsapp-agent/docs/planejamento/`, com revisões
-**v1.1–v1.4** registradas em `REVISOES.md` (datas da baseline mantidas).
+**v1.1–v1.5** registradas em `REVISOES.md` (datas da baseline mantidas).
 Em produção: `20b6d3051` = R1 (landing, 14/10) + R3 (horário de quem faltou,
 19/10) + R4 (layout da E08A, 19/10) + R1b ("40% menos faltas" retirado da
 landing, 19/10) + R5 (identidade nas páginas de venda, E27A, 20/10). Nenhuma
 **etapa** do plano publicada por inteiro — R1, R1b e R3 são releases avulsos.
 E08A (R4) e E27A (R5) publicadas; E27A aprovada visualmente antes do push.
-Pendente: o proprietário conferir o painel (R4) e as páginas de venda (R5) no
-ar. Próxima etapa: E04.
+**E08B** (boletim "Psicologia em foco", requisito novo, v1.5): **PRONTA
+LOCALMENTE** no branch `etapa/e08b-noticias`; não homologada, não publicada.
+Pendente: avaliação do proprietário (E08B), conferência no ar (R4 e R5).
+Próxima etapa: E04.
 
 ## Resumo compacto
 
@@ -70,6 +72,7 @@ verde não substitui homologação.
 | E03 | PRONTA LOCALMENTE | B2, B3 para avançar a VALIDADA EM HOMOLOGAÇÃO |
 | **E08A** (antecipação parcial de E08) | **PUBLICADA** em 19/10 como R4 (`b7397719`) | confirmação visual do proprietário no próprio painel |
 | **E27A** (antecipação só visual de E27) | **PUBLICADA** em 20/10 como R5 (`78a1718d` + `20b6d305`) | confirmação visual do proprietário no ar |
+| **E08B** (requisito novo: boletim por segmento) | **PRONTA LOCALMENTE** — `etapa/e08b-noticias`, 83 testes; fontes verificadas do ambiente local | avaliação do proprietário; saída HTTPS da Railway não verificada; suíte do R2 no branch integrado |
 | E04–E28 | PENDENTE | — (E08 e E27 parcialmente adiantadas por E08A e E27A, **não** concluídas) |
 
 E04 e E27 **não** estão concluídas: receberam apenas transferência parcial de
@@ -247,3 +250,8 @@ R2 = código de E02+E03 em janela combinada.
    valores de mercado, 💜) — lista em `EVIDENCIAS/27A.md`.
 9. Corrigir no R2 o ponto cego de `tests/test_landing_alegacoes.py` (busca no
    template cru, não no texto visível).
+10. **E08B** pronta localmente (20/10): substitui a narrativa com IA do Início
+    por "Psicologia em foco" (CFP + Ministério da Saúde, 09:00 de Brasília,
+    cache por segmento). Evidências em `EVIDENCIAS/08B.md`. **Falta:**
+    avaliação do proprietário; integração com o R2; publicação só com
+    autorização. **Não avançar para outra etapa automaticamente.**

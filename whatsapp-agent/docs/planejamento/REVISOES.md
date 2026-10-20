@@ -190,3 +190,48 @@ SEO/metadados completos, acessibilidade e desempenho medidos, prova social real.
 Nenhum na baseline: trabalho de publicação, não etapa. Concorre com a avaliação
 visual da E08A na semana 02; se empurrar E04 para depois de 25/10, registrar
 aqui.
+
+---
+
+## v1.5 — 20/10/2026 · E08B: boletim de notícias por segmento (requisito novo)
+
+**Aprovada por:** proprietário, complemento autorizado em 19/10/2026 e enviado
+para execução em 20/10 (`prompts/08B.txt`), "depois de estabilizar E08A".
+**Datas da baseline:** **não alteradas.** Impacto estimado registrado abaixo.
+**Escopo total:** **acrescido.** Diferente da v1.3 e da v1.4, que só anteciparam
+trabalho já previsto, isto é requisito que não estava no ESCOPO v1.0.
+
+### O que entra
+
+No Início do painel, o quadro narrativo administrativo com IA — que repetia em
+parágrafo os cards do resumo — é substituído por **"Psicologia em foco"**: 3 a
+5 destaques dos últimos 7 dias de fontes públicas verificadas (CFP; Ministério
+da Saúde filtrado por saúde mental), com fonte, data de publicação, resumo da
+própria fonte e link. Um boletim por segmento, cache no servidor, atualização
+diária às 09:00 de Brasília, com recuperação, lease e pendência operacional.
+Só psicologia habilitada; o cadastro de fontes por segmento fica pronto para
+expansão.
+
+### O que não entra
+
+- notícias dos outros 12 segmentos (cada fonte exige verificação própria);
+- CRPs e fontes de pesquisa;
+- resumo por IA (o prompt permite como opção futura, com cache e limite);
+- envio por WhatsApp ou e-mail;
+- data de evento (os feeds não a informam).
+
+### Esforço e impacto
+
+| | |
+|---|---|
+| Executado | ~1 dia de trabalho local: implementação, 83 testes, mutações, prévia e verificação real das fontes |
+| Falta | avaliação do proprietário; integração com o branch do R2 e a suíte dele; confirmar a saída HTTPS da Railway para as fontes; release próprio |
+| Semana 02 (19–25/10) | agora contém E08A (publicada), E27A (publicada) e E08B (pronta localmente) |
+
+**Impacto estimado:** E04 (semana 03, a partir de 26/10) só não atrasa se a
+avaliação da E08B e eventuais ajustes couberem até 25/10. Se passarem disso,
+E04 atrasa na mesma medida — registrar aqui, sem mover datas em silêncio.
+Custo operacional: 2 requisições por dia por segmento, mais no máximo 1 revisão
+manual por hora; nenhuma chamada paga. Para psicologia, **deixa de existir** a
+chamada de LLM por abertura do Início que a narrativa fazia quando a flag estava
+ligada.
