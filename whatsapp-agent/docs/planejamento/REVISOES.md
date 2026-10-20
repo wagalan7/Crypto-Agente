@@ -106,3 +106,87 @@ fictícios (Hoje, Agenda, Financeiro; desktop e celular). Os módulos seguintes
 herdam o padrão. E27 aplica à página de vendas. Uma aplicação visual anterior a
 E27 pode ser release separado e revisável, sem alterar o R1 nem misturar com
 backend ou filas.
+
+---
+
+## v1.3 — 19/10/2026 · E08A antecipada
+
+**Aprovada por:** proprietário, no prompt de execução da E08A ("alterar o layout
+antes de seguir as próximas etapas funcionais").
+**Datas da baseline:** **não alteradas.** A ordem nova e o impacto estimado
+estão registrados abaixo.
+**Escopo total:** inalterado. Parte do trabalho de E08 foi **antecipada**; nada
+foi acrescentado.
+
+### O que foi antecipado
+
+E08A = aplicação da identidade visual (v1.2) às telas que **já existem**:
+navegação, Início, Agenda e horários, Conversas, Contratos, Cobranças e
+Configurações, mais a página de controle acessada a partir do painel.
+Evidências em `EVIDENCIAS/08A.md`.
+
+### O que continua em E08 (semana 06) — E08 **não** está concluída
+
+- telas e navegação que dependem de usuários e papéis (E07);
+- padrão visual das telas que ainda não existem — Pacientes, Atendimento,
+  Financeiro completo, Documentos, Biblioteca — em conjunto com as etapas que as
+  criam (E09, E11, E13, E15, E19);
+- ativos definitivos de logo (transparente, assinatura para fundo escuro), que
+  dependem de arquivo do proprietário;
+- iconografia dentro do conteúdo (hoje emoji) e as telas restantes (admin,
+  onboarding, pagamento, termos, privacidade);
+- aprovação visual registrada como aceite de E08.
+
+E08A **não** conclui E10 (grade de agenda), E13 (financeiro) nem E19, e não
+autoriza ofertar recurso futuro.
+
+### Ordem nova e impacto estimado
+
+| | Baseline | Agora |
+|---|---|---|
+| Semana 02 (19–25/10) | E02, E03 | E02 e E03 já prontas localmente (adiantadas na semana 01) **+ E08A** |
+| Semana 03 (26/10–01/11) | E04, E05 | E04, E05 — **sem mudança, se** a avaliação visual e os ajustes couberem na semana 02 |
+| Semana 06 (16–22/11) | E08, E09 | E08 menor (parte entregue em E08A), E09 |
+
+**Impacto estimado:** nenhum na baseline enquanto a avaliação visual e eventuais
+ajustes terminarem até 25/10. Se passarem disso, E04 atrasa na mesma medida —
+registrar aqui, sem mover datas em silêncio. Um release visual separado, se
+autorizado, entra como trabalho de publicação, não como etapa.
+
+---
+
+## v1.4 — 19/10/2026 · E27A antecipada (só visual da página de vendas)
+
+**Aprovada por:** proprietário, depois de ver o R4 no ar ("painel ficou ok,
+porém a página de vendas não atualizou"), escolhendo antecipar agora.
+**Datas da baseline:** **não alteradas.**
+**Escopo total:** inalterado. Parte **visual** de E27 foi antecipada; nada foi
+acrescentado.
+
+### O que foi antecipado
+
+E27A = aplicação da identidade (v1.2) e dos tokens da E08A às páginas de vendas
+que **já existem** — `landing.html` (`/`) e `landing_vertical.html` (`/p/…`):
+paleta, tipografia, botões, herói, favicon e imagem de compartilhamento.
+Publicação, se autorizada, como release separado **R5**.
+
+### Limites
+
+- **sem mudança de texto, oferta, preço ou desconto**; nenhuma alegação nova e
+  nenhuma das retiradas no R1/R1b de volta (a arte antiga do herói contém
+  "reduzem faltas" e sai junto com a marca antiga);
+- nada do moodboard como prova (`REGISTRO.md`);
+- sem backend, banco, rotas ou variáveis.
+
+### O que continua em E27 (semana 23) — E27 **não** está concluída
+
+Textos e mapeamento promessa → evidência (inclusive "2min Para configurar" e os
+valores de mercado citados), demonstração dos recursos publicados, comparação
+de planos por capacidade medida, preço configurável, onboarding assistido,
+SEO/metadados completos, acessibilidade e desempenho medidos, prova social real.
+
+### Impacto estimado
+
+Nenhum na baseline: trabalho de publicação, não etapa. Concorre com a avaliação
+visual da E08A na semana 02; se empurrar E04 para depois de 25/10, registrar
+aqui.

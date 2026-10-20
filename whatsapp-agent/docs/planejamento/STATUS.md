@@ -1,9 +1,14 @@
-# Status — atualizado em 14/10/2026 (release incremental 1 preparado)
+# Status — atualizado em 20/10/2026 (E27A pronta localmente)
 
-Plano v1.0 instalado em `whatsapp-agent/docs/planejamento/`, com revisão **v1.1**
-registrada em `REVISOES.md` (datas mantidas). Revisão de código de partida:
-`1b723a8f` (build `2026-07-16-67`). Nenhuma etapa publicada.
-Etapa atual: **E03 — PRONTA LOCALMENTE**. Próxima: E04, após aceite de E03.
+Plano v1.0 instalado em `whatsapp-agent/docs/planejamento/`, com revisões
+**v1.1–v1.4** registradas em `REVISOES.md` (datas da baseline mantidas).
+Em produção: `1986bdef0` = R1 (landing, 14/10) + R3 (horário de quem faltou,
+19/10) + R4 (layout da E08A, 19/10) + R1b ("40% menos faltas" retirado da
+landing, 19/10). Nenhuma **etapa** do plano publicada — R1, R1b e R3 são releases avulsos.
+Em andamento: **E27A — PRONTA LOCALMENTE, aguardando avaliação visual do
+proprietário** (identidade nas páginas de venda, antecipada por decisão dele,
+v1.4; release **R5** preparado, não publicado). E08A publicada (R4), com a
+confirmação visual do proprietário pendente. Próxima etapa: E04.
 
 ## Resumo compacto
 
@@ -63,7 +68,9 @@ verde não substitui homologação.
 | E01 | PRONTA LOCALMENTE | — |
 | E02 | PRONTA LOCALMENTE | B2, B3 para avançar a VALIDADA EM HOMOLOGAÇÃO |
 | E03 | PRONTA LOCALMENTE | B2, B3 para avançar a VALIDADA EM HOMOLOGAÇÃO |
-| E04–E28 | PENDENTE | — |
+| **E08A** (antecipação parcial de E08) | **PUBLICADA** em 19/10 como R4 (`b7397719`) | confirmação visual do proprietário no próprio painel |
+| **E27A** (antecipação só visual de E27) | **PRONTA LOCALMENTE** — R5 preparado (`78a1718d`), não publicado | avaliação visual do proprietário; depois, autorização do push |
+| E04–E28 | PENDENTE | — (E08 e E27 parcialmente adiantadas por E08A e E27A, **não** concluídas) |
 
 E04 e E27 **não** estão concluídas: receberam apenas transferência parcial de
 conteúdo para E02 (ver `REVISOES.md`).
@@ -157,7 +164,20 @@ ou data foi alterado; nada foi aplicado ao app.
 | Nenhum commit/push/deploy | **PASSOU** |
 | Efeitos fora da garantia | Mídia (**E05**), jobs do agendador (**E06**), avisos de pagamento (**E06** validação / **E14** consolidação), Twilio sem autenticação (**E06**), atomicidade de conflito (**E04**), escala horizontal (**E26**/**E28**) |
 
-## R1 — landing (AGUARDANDO AUTORIZAÇÃO)
+## R1 — landing · **PUBLICADO em 14/10/2026**
+
+Confirmado: push `80d7ece81..885477d25`; deployment só no serviço do Agente;
+processo novo no ar às 18:36:04Z com `db: ok` e 8 consultórios; verificação em
+produção registrada em `RELEASE-R1-LANDING.md` §10. O texto abaixo é o estado de
+**antes** da publicação, mantido como histórico.
+
+## R3 — "faltou sem aviso" libera o horário · **PUBLICADO em 19/10/2026**
+
+Confirmado: push `9b2c4bf72..c5135904e`; deployment só no serviço do Agente;
+código conferido dentro do contêiner. Detalhes e a janela de indisponibilidade
+medida (~10–30 s) em `RELEASE-R3-HORARIO-LIVRE.md`.
+
+## R1 — landing (estado antes da publicação, histórico)
 
 Worktree isolado, branch `release/r1-landing`, commit **`885477d2`** sobre o
 `origin/main` **atual** (`80d7ece8`). Dois arquivos, 29+/40−: só a landing.
@@ -200,11 +220,30 @@ R2 = código de E02+E03 em janela combinada.
 
 ## Próximas ações
 
-1. ✅ Feito: E01→E03 commitadas no branch `release/agente-consultorio-e01-e03`,
-   em 6 commits revisáveis. A reversão por git agora é possível.
-2. Proprietário confere **V1–V9** no painel da Railway e do GitHub
-   (`RELEASE-E01-E03.md` §3) — é o que destrava G3.
-2. Decidir **B4**: a correção da landing só chega ao público com deploy.
-3. Resolver **B3** (contas de homologação) — é o que trava sair de "pronta
-   localmente" para "validada em homologação" em E01, E02 e E03.
-4. Com o aceite, enviar `prompts/04.txt`. **E04 não foi iniciada.**
+1. ✅ Proprietário pediu o release visual (19/10) — **R4 preparado**:
+   commit `b73977197`, fast-forward sobre `c5135904e`, 5 arquivos
+   (`RELEASE-R4-VISUAL-E08A.md`).
+2. ✅ **R4 publicado** em 19/10, 21h12 BRT; verificação pós-deploy ok, com os 5
+   arquivos idênticos ao commit dentro do contêiner. **Falta:** o proprietário
+   confirmar visualmente no próprio painel.
+3. Se a avaliação e os ajustes passarem de 25/10, registrar o impacto em E04
+   (`REVISOES.md` v1.3).
+4. Depois, enviar `prompts/04.txt`. **E04 não foi iniciada.**
+5. Seguem abertos: **B3** (contas de homologação) e os bloqueadores do R2
+   (`RELEASE-R1-LANDING.md` §9, incluindo `INBOX_NUDGE_ON_WEBHOOK`).
+6. ✅ Resolvidos desde 14/10: conferência da Railway (volume, filtros, variáveis —
+   `RELEASE-R1-LANDING.md` §3) e **B4** (a landing corrigida está no ar pelo R1
+   **e pelo R1b**: o R1 deixou "40% · Menos faltas sem aviso" na faixa de
+   números, retirado em 19/10, 23h33 BRT — `RELEASE-R1-LANDING.md` §11).
+7. **E27A** (aplicação só visual da identidade à página de vendas) antecipada
+   por decisão do proprietário (19/10, `REVISOES.md` v1.4) — **pronta
+   localmente** em 20/10: commit `78a1718dc`, fast-forward sobre `1986bdef0`;
+   texto, oferta e preços idênticos nas 13 páginas; capturas antes/depois e
+   scripts em `EVIDENCIAS/27A/`. **Falta:** avaliação visual do proprietário;
+   publicação como **R5** só com autorização, depois das 22h
+   (`RELEASE-R5-VISUAL-LANDING.md`).
+8. Textos encontrados na E27A para decisão do proprietário em E27 (meta
+   "Reduza faltas", "Os pacientes não percebem que é automático", "2 minutos",
+   valores de mercado, 💜) — lista em `EVIDENCIAS/27A.md`.
+9. Corrigir no R2 o ponto cego de `tests/test_landing_alegacoes.py` (busca no
+   template cru, não no texto visível).

@@ -1,0 +1,823 @@
+diff --git a/whatsapp-agent/backend/templates/landing.html b/whatsapp-agent/backend/templates/landing.html
+index 24ab55672..03816356d 100644
+--- a/whatsapp-agent/backend/templates/landing.html
++++ b/whatsapp-agent/backend/templates/landing.html
+@@ -8,26 +8,64 @@
+   <meta name="description" content="Agente de IA que agenda, confirma e remarca consultas automaticamente pelo WhatsApp do seu consultório. Reduza faltas e foque nos seus pacientes."/>
+   <meta property="og:title" content="Agente Consultório — IA no WhatsApp para Psicólogas"/>
+   <meta property="og:description" content="Agenda, confirma e remarca consultas automaticamente pelo WhatsApp."/>
+-  <meta property="og:image" content="/static/hero-agente.jpg"/>
+-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%237c3aed'><path d='M12 2a4 4 0 0 0-4 4 3 3 0 0 0-3 3v1a3 3 0 0 0 0 6 3 3 0 0 0 3 3v1a3 3 0 0 0 4 3 3 3 0 0 0 4-3v-1a3 3 0 0 0 3-3 3 3 0 0 0 0-6V9a3 3 0 0 0-3-3 4 4 0 0 0-4-4z'/></svg>"/>
+-  <script src="https://cdn.tailwindcss.com"></script>
+-  <script>tailwind.config = { theme: { extend: { colors: { brand: '#7c3aed', brandDark: '#5b21b6', brandLight: '#a78bfa', dark: '#1a0b2e' } } } }</script>
++  <meta property="og:image" content="/static/marca/compartilhamento-1200x630.jpg"/>
++  <link rel="icon" type="image/png" href="/static/marca/simbolo-assistente-64.png"/>
++  <!-- Fontes: Montserrat (títulos) + Inter (texto), como no painel (E08A).
++       display=swap: se o serviço de fontes falhar, aparece a fonte do sistema. -->
+   <link rel="preconnect" href="https://fonts.googleapis.com"/>
+-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/>
++  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
++  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Montserrat:wght@600;700;800&display=swap"/>
++  <script src="https://cdn.tailwindcss.com"></script>
++  <!-- Paleta da identidade (E27A): mesma escala do painel e de /static/marca/tokens.css. -->
++  <script>tailwind.config = { theme: { extend: {
++    colors: {
++      brand: { DEFAULT:'#8A273E', 50:'#F9EEEC',100:'#F1D9D7',200:'#E7BFBF',300:'#D99CA3',400:'#C77784',
++               500:'#B25665',600:'#8A273E',700:'#74213A',800:'#5E1A2F',900:'#4A1424',950:'#3C0E18' },
++      gray:  { 50:'#FBF7F6',100:'#F3EEEC',200:'#E7E0DD',300:'#D2C8C4',400:'#706560',
++               500:'#685D58',600:'#554B47',700:'#433A37',800:'#2F2826',900:'#201A18' },
++    },
++    fontFamily: {
++      sans: ['Inter','system-ui','-apple-system','Segoe UI','Roboto','Arial','sans-serif'],
++      titulo: ['Montserrat','Inter','system-ui','sans-serif'],
++    },
++  } } }</script>
++  <link rel="stylesheet" href="/static/marca/tokens.css"/>
+   <style>
+-    * { font-family: 'Inter', sans-serif; }
+-    .hero-bg { background: linear-gradient(135deg, #1a0b2e 0%, #2d1657 50%, #1a0b2e 100%); }
+-    .cta-bg  { background: linear-gradient(135deg, #1a0b2e 0%, #3b1781 100%); }
+-    .btn-brand { background: linear-gradient(135deg, #7c3aed, #a855f7); }
+-    .glow { box-shadow: 0 0 50px rgba(124,58,237,0.25); }
+-    .glow-sm { box-shadow: 0 0 20px rgba(124,58,237,0.18); }
+-    /* Estilo dos balões inspirado na arte oficial */
+-    .chat-in  { border-radius: 4px 18px 18px 18px; background: #ffffff; color:#374151; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+-    .chat-out { border-radius: 18px 4px 18px 18px; background: #ede9fe; color:#4c1d95; }
+-    .chat-time { font-size: 10px; color:#9ca3af; margin-top:4px; display:block; }
+-    .chat-slot { display:flex; align-items:center; gap:10px; background:#fff; border:1px solid #e9d5ff; border-radius:12px; padding:10px 14px; font-size:13px; color:#4c1d95; transition: all .15s; }
+-    .chat-slot:hover { background:#faf5ff; border-color:#c4b5fd; }
+-    .chat-slot svg { color:#7c3aed; }
++    .hero-bg { background:
++      radial-gradient(1100px 520px at 88% 8%, rgba(178,86,101,.32), transparent 62%),
++      radial-gradient(900px 620px at -5% 105%, rgba(138,39,62,.45), transparent 60%),
++      linear-gradient(135deg, #3C0E18 0%, #4A1424 55%, #3C0E18 100%); }
++    .cta-bg  { background:
++      radial-gradient(800px 420px at 50% -10%, rgba(178,86,101,.30), transparent 65%),
++      linear-gradient(135deg, #3C0E18 0%, #5E1A2F 100%); }
++    .btn-brand { background: #8A273E; }
++    /* ação principal sobre o vinho profundo: nude com texto vinho (12,3:1) */
++    .btn-claro { background: #F1D9D7; color: #3C0E18; }
++    .glow { box-shadow: 0 0 50px rgba(138,39,62,0.22); }
++    .glow-sm { box-shadow: 0 0 20px rgba(138,39,62,0.14); }
++    /* títulos grandes em linhas equilibradas (sem palavra órfã); sem suporte, quebra normal */
++    .hero-bg h1, .cta-bg h2 { text-wrap: balance; }
++    /* foco visível também nas seções escuras */
++    :where(.hero-bg, .cta-bg, footer) :where(a, button):focus-visible { outline-color: #F1D9D7; }
++    /* Balões de conversa */
++    .chat-in  { border-radius: 4px 18px 18px 18px; background: #ffffff; color:#2F2826; box-shadow: 0 1px 2px rgba(60,14,24,0.07); }
++    .chat-out { border-radius: 18px 4px 18px 18px; background: #F1D9D7; color:#3C0E18; }
++    .chat-time { font-size: 10px; color:#706560; margin-top:4px; display:block; }
++    .chat-out .chat-time { color:#554B47; }
++    .chat-slot { display:flex; align-items:center; gap:10px; background:#fff; border:1px solid #E7BFBF; border-radius:12px; padding:10px 14px; font-size:13px; color:#4A1424; transition: all .15s; }
++    .chat-slot:hover { background:#F9EEEC; border-color:#D99CA3; }
++    .chat-slot svg { color:#8A273E; }
++    /* Celular ilustrativo do herói (substitui a arte antiga) */
++    .celular { width: min(100%, 340px); padding: 10px; border-radius: 46px;
++               background: linear-gradient(160deg, #5E1A2F, #24070C);
++               box-shadow: 0 30px 60px rgba(20,4,8,.45), inset 0 0 0 1px rgba(255,255,255,.08); }
++    .celular-tela { position: relative; border-radius: 37px; overflow: hidden; background: #F3EEEC; }
++    .celular-entalhe { position: absolute; top: 9px; left: 50%; transform: translateX(-50%);
++                       width: 92px; height: 24px; border-radius: 999px; background: #120307; }
++    .celular-topo { display: flex; align-items: center; gap: 10px; padding: 44px 16px 12px; background: #3C0E18; }
++    .celular-avatar { width: 34px; height: 34px; border-radius: 50%; background: #E7BFBF; color: #3C0E18;
++                      display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
++    .celular-conversa { padding: 14px 12px 20px; }
+     @keyframes float  { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
+     @keyframes fadein { from{opacity:0;transform:translateY(24px)} to{opacity:1;transform:translateY(0)} }
+     @keyframes pulse-ring { 0%{transform:scale(1);opacity:1} 100%{transform:scale(1.6);opacity:0} }
+@@ -37,16 +75,16 @@
+     .fadein-3 { animation: fadein .7s .4s ease both; }
+     .pulse-ring::before {
+       content:''; position:absolute; inset:-6px; border-radius:50%;
+-      border:2px solid #a855f7;
++      border:2px solid #4ade80;
+       animation: pulse-ring 1.8s ease-out infinite;
+     }
+-    .plan-popular { border-color:#7c3aed; transform:scale(1.03); }
++    .plan-popular { border-color:#8A273E; transform:scale(1.03); }
+     @media(max-width:768px){ .plan-popular{transform:scale(1); } }
+     details summary { cursor:pointer; list-style:none; }
+     details summary::-webkit-details-marker { display:none; }
+     details[open] .faq-icon { transform:rotate(45deg); }
+     .faq-icon { transition: transform .2s; }
+-    .tag-pill { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:100px; padding:6px 14px; font-size:13px; color:#e9d5ff; }
++    .tag-pill { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:100px; padding:6px 14px; font-size:13px; color:#F1D9D7; }
+     .before-card { border-left: 3px solid #f87171; }
+     .after-card  { border-left: 3px solid #34d399; }
+     .whatsapp-float {
+@@ -60,7 +98,7 @@
+     .hero-img-wrap { position:relative; }
+     .hero-img-wrap::after {
+       content:''; position:absolute; inset:-20px; z-index:-1;
+-      background: radial-gradient(circle at center, rgba(168,85,247,0.35) 0%, rgba(168,85,247,0) 70%);
++      background: radial-gradient(circle at center, rgba(231,191,191,0.26) 0%, rgba(231,191,191,0) 70%);
+       filter: blur(20px);
+     }
+   </style>
+@@ -78,17 +116,10 @@
+ <nav class="sticky top-0 z-50 bg-white/95 backdrop-blur border-b border-gray-100">
+   <div class="max-w-6xl mx-auto px-5 py-3.5 flex items-center justify-between">
+     <div class="flex items-center gap-2.5">
+-      <div class="w-9 h-9 btn-brand rounded-xl flex items-center justify-center text-white shadow">
+-        <!-- Brain icon (Lucide) -->
+-        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+-          <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
+-          <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
+-          <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
+-        </svg>
+-      </div>
++      <img src="/static/marca/simbolo-assistente-256.png" alt="" width="36" height="36" class="marca-simbolo w-9 h-9 shadow"/>
+       <div class="leading-tight">
+-        <span class="block font-extrabold text-gray-900 text-sm md:text-base tracking-tight">AGENTE</span>
+-        <span class="block font-bold text-brand text-[11px] md:text-xs -mt-1 tracking-[0.18em]">CONSULTÓRIO</span>
++        <span class="block marca-nome text-gray-900 text-sm md:text-base">AGENTE</span>
++        <span class="block marca-sub text-brand md:text-[11.5px]">CONSULTÓRIO</span>
+       </div>
+     </div>
+     <div class="flex items-center gap-3">
+@@ -103,28 +134,28 @@
+ 
+ <!-- ── HERO ── -->
+ <section class="hero-bg text-white px-5 py-20 md:py-28 relative overflow-hidden">
+-  <!-- Decoração: bolhas violeta no fundo -->
+-  <div class="absolute top-20 -left-20 w-72 h-72 rounded-full" style="background:radial-gradient(circle,rgba(168,85,247,0.25),transparent 70%);filter:blur(40px)"></div>
+-  <div class="absolute bottom-10 -right-10 w-96 h-96 rounded-full" style="background:radial-gradient(circle,rgba(124,58,237,0.2),transparent 70%);filter:blur(50px)"></div>
++  <!-- Decoração: brilhos rosé no fundo vinho -->
++  <div class="absolute top-20 -left-20 w-72 h-72 rounded-full" style="background:radial-gradient(circle,rgba(178,86,101,0.28),transparent 70%);filter:blur(40px)"></div>
++  <div class="absolute bottom-10 -right-10 w-96 h-96 rounded-full" style="background:radial-gradient(circle,rgba(231,191,191,0.14),transparent 70%);filter:blur(50px)"></div>
+ 
+-  <div class="max-w-6xl mx-auto grid md:grid-cols-2 gap-14 items-center relative">
++  <div class="max-w-6xl mx-auto grid lg:grid-cols-2 gap-14 items-center relative">
+     <div class="fadein">
+       <div class="tag-pill mb-6">
+         <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse relative pulse-ring"></span>
+         Atende no seu próprio número de WhatsApp
+       </div>
+-      <h1 class="text-4xl md:text-5xl xl:text-6xl font-black leading-[1.1] mb-6">
++      <h1 class="text-4xl md:text-5xl xl:text-[3.5rem] font-black leading-[1.1] mb-6">
+         Sua agenda cheia.<br/>
+-        <span style="background:linear-gradient(90deg,#a855f7,#e9d5ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Sua cabeça livre.</span>
++        <span style="background:linear-gradient(90deg,#E7BFBF,#F9EEEC);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Sua cabeça livre.</span>
+       </h1>
+-      <p class="text-gray-300 text-lg md:text-xl mb-8 leading-relaxed">
++      <p class="text-brand-100 text-lg md:text-xl mb-8 leading-relaxed">
+         Um agente de IA que fica no WhatsApp do seu consultório —
+         agenda, confirma e remarca consultas automaticamente
+         enquanto você está em sessão.
+       </p>
+       <div class="flex flex-col sm:flex-row gap-3 mb-6">
+         <a href="/onboarding"
+-          class="btn-brand text-white font-bold px-8 py-4 rounded-2xl text-base hover:opacity-90 transition text-center shadow-xl glow">
++          class="btn-claro font-bold px-8 py-4 rounded-2xl text-base hover:bg-white transition text-center shadow-xl">
+           🚀 Quero meu agente agora
+         </a>
+         <a href="#como-funciona"
+@@ -132,26 +163,52 @@
+           Ver como funciona ↓
+         </a>
+       </div>
+-      <div class="flex flex-wrap gap-4 text-sm text-gray-400">
++      <div class="flex flex-wrap gap-4 text-sm text-brand-200">
+         <span>✓ Sem contrato</span>
+         <span>✓ Configuração em 2 minutos</span>
+         <span>✓ Suporte incluído</span>
+       </div>
+     </div>
+ 
+-    <!-- Imagem oficial da arte -->
+-    <div class="float fadein-2 hero-img-wrap">
+-      <img src="/static/hero-agente.jpg"
+-           alt="Agente Consultório atendendo pacientes no WhatsApp"
+-           class="w-full rounded-3xl shadow-2xl border border-white/10"
+-           loading="eager" decoding="async"/>
++    <!-- Ilustração: o paciente agendando pelo WhatsApp. As falas são as do
++         exemplo logo abaixo (dados fictícios). Substitui a arte antiga, que
++         trazia a marca anterior e a frase "reduzem faltas", retirada no R1. -->
++    <div class="float fadein-2 hero-img-wrap flex justify-center">
++      <div class="celular" role="img" aria-label="Agente Consultório atendendo pacientes no WhatsApp">
++        <div class="celular-tela" aria-hidden="true">
++          <span class="celular-entalhe"></span>
++          <div class="celular-topo">
++            <span class="celular-avatar">
++              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/></svg>
++            </span>
++            <span class="flex-1 space-y-1.5">
++              <span class="block h-2.5 w-28 rounded-full bg-white/70"></span>
++              <span class="block h-2 w-14 rounded-full bg-white/35"></span>
++            </span>
++          </div>
++          <div class="celular-conversa space-y-2.5 text-[13px] text-left">
++            <div class="flex justify-end"><div class="chat-out px-3.5 py-2 max-w-[85%]">Olá! Quero agendar uma consulta. <span class="chat-time">10:31</span></div></div>
++            <div class="flex justify-start"><div class="chat-in px-3.5 py-2 max-w-[85%]">Perfeito! Vou verificar os horários disponíveis para você. <span class="chat-time">10:32</span></div></div>
++            <div class="flex justify-start">
++              <div class="chat-in px-3 py-2.5 max-w-[92%] space-y-1.5">
++                <p class="text-xs text-brand-700 font-semibold mb-1">Confira os próximos horários:</p>
++                <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 09:00</div>
++                <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 14:00</div>
++                <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quinta-feira, 23/05 – 10:00</div>
++                <span class="chat-time">10:32</span>
++              </div>
++            </div>
++            <div class="flex justify-end"><div class="chat-out px-3.5 py-2 max-w-[85%]">Quarta-feira, 22/05 às 14:00. <span class="chat-time">10:33</span></div></div>
++          </div>
++        </div>
++      </div>
+     </div>
+ 
+   </div>
+ </section>
+ 
+ <!-- ── BALÕES CSS ── (logo abaixo do hero, no mesmo estilo da arte) -->
+-<section class="bg-gradient-to-b from-violet-50 via-white to-white py-20 px-5">
++<section class="bg-gradient-to-b from-brand-50 via-white to-white py-20 px-5">
+   <div class="max-w-5xl mx-auto">
+     <div class="text-center mb-12">
+       <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Como suas conversas ficam</p>
+@@ -162,8 +219,8 @@
+     <div class="grid md:grid-cols-2 gap-8">
+ 
+       <!-- Coluna 1: agendamento -->
+-      <div class="bg-white rounded-3xl border border-violet-100 shadow-xl p-6 md:p-7 fadein">
+-        <div class="flex items-center gap-2 text-xs text-violet-700 font-semibold mb-4 pb-3 border-b border-violet-50">
++      <div class="bg-white rounded-3xl border border-brand-100 shadow-xl p-6 md:p-7 fadein">
++        <div class="flex items-center gap-2 text-xs text-brand-700 font-semibold mb-4 pb-3 border-b border-brand-50">
+           <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2" ry="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>
+           Olá, tudo bem? 😊 Precisa agendar?
+         </div>
+@@ -174,7 +231,7 @@
+           <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[80%]">Perfeito! Vou verificar os horários disponíveis para você. <span class="chat-time">10:32</span></div></div>
+           <div class="flex justify-start">
+             <div class="chat-in px-4 py-3 max-w-[90%] space-y-2">
+-              <p class="text-xs text-violet-700 font-semibold mb-1">Confira os próximos horários:</p>
++              <p class="text-xs text-brand-700 font-semibold mb-1">Confira os próximos horários:</p>
+               <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 09:00</div>
+               <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 14:00</div>
+               <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quinta-feira, 23/05 – 10:00</div>
+@@ -187,8 +244,8 @@
+       </div>
+ 
+       <!-- Coluna 2: remarcação -->
+-      <div class="bg-white rounded-3xl border border-violet-100 shadow-xl p-6 md:p-7 fadein-2">
+-        <div class="flex items-center gap-2 text-xs text-violet-700 font-semibold mb-4 pb-3 border-b border-violet-50">
++      <div class="bg-white rounded-3xl border border-brand-100 shadow-xl p-6 md:p-7 fadein-2">
++        <div class="flex items-center gap-2 text-xs text-brand-700 font-semibold mb-4 pb-3 border-b border-brand-50">
+           <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+           Precisa remarcar? Eu também cuido disso pra você!
+         </div>
+@@ -214,26 +271,26 @@
+ 
+     <!-- Mini "selos" estilo arte -->
+     <div class="mt-12 grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+-      <div class="bg-white rounded-2xl border border-violet-100 p-4">
+-        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-violet-100 text-brand flex items-center justify-center">
++      <div class="bg-white rounded-2xl border border-brand-100 p-4">
++        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-brand-100 text-brand flex items-center justify-center">
+           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>
+         </div>
+         <p class="text-xs font-semibold text-gray-900">Agenda organizada<br/>e sempre atualizada</p>
+       </div>
+-      <div class="bg-white rounded-2xl border border-violet-100 p-4">
+-        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-violet-100 text-brand flex items-center justify-center">
++      <div class="bg-white rounded-2xl border border-brand-100 p-4">
++        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-brand-100 text-brand flex items-center justify-center">
+           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+         </div>
+         <p class="text-xs font-semibold text-gray-900">Lembrete automático<br/>um dia antes da sessão</p>
+       </div>
+-      <div class="bg-white rounded-2xl border border-violet-100 p-4">
+-        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-violet-100 text-brand flex items-center justify-center">
++      <div class="bg-white rounded-2xl border border-brand-100 p-4">
++        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-brand-100 text-brand flex items-center justify-center">
+           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+         </div>
+         <p class="text-xs font-semibold text-gray-900">Atendimento humanizado<br/>que acolhe</p>
+       </div>
+-      <div class="bg-white rounded-2xl border border-violet-100 p-4">
+-        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-violet-100 text-brand flex items-center justify-center">
++      <div class="bg-white rounded-2xl border border-brand-100 p-4">
++        <div class="w-10 h-10 mx-auto mb-2 rounded-xl bg-brand-100 text-brand flex items-center justify-center">
+           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+         </div>
+         <p class="text-xs font-semibold text-gray-900">Mais tempo para<br/>cuidar de pessoas</p>
+@@ -375,7 +432,7 @@
+     </div>
+     <div class="grid md:grid-cols-2 gap-5">
+       <div class="space-y-3">
+-        <h3 class="text-red-500 font-bold text-sm uppercase tracking-wide mb-4">😰 Antes</h3>
++        <h3 class="text-red-700 font-bold text-sm uppercase tracking-wide mb-4">😰 Antes</h3>
+         <div class="before-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+           <p class="text-sm text-gray-700">Responde mensagens entre sessões, perdendo foco</p>
+         </div>
+@@ -393,7 +450,7 @@
+         </div>
+       </div>
+       <div class="space-y-3">
+-        <h3 class="text-green-500 font-bold text-sm uppercase tracking-wide mb-4">✨ Depois</h3>
++        <h3 class="text-green-700 font-bold text-sm uppercase tracking-wide mb-4">✨ Depois</h3>
+         <div class="after-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+           <p class="text-sm text-gray-700">Agente responde em segundos — você em sessão, focada</p>
+         </div>
+@@ -430,19 +487,19 @@
+     <div class="grid md:grid-cols-3 gap-8">
+       <div class="text-center group">
+         <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">⚡</div>
+-        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-violet-50 rounded-full mb-3">PASSO 1</div>
++        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-brand-50 rounded-full mb-3">PASSO 1</div>
+         <h3 class="font-bold text-gray-900 text-lg mb-2">Configure o consultório</h3>
+         <p class="text-gray-500 text-sm leading-relaxed">Nome, psicóloga, horários de atendimento e duração da sessão. Um formulário simples.</p>
+       </div>
+       <div class="text-center group">
+         <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">📱</div>
+-        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-violet-50 rounded-full mb-3">PASSO 2</div>
++        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-brand-50 rounded-full mb-3">PASSO 2</div>
+         <h3 class="font-bold text-gray-900 text-lg mb-2">Conecte seu WhatsApp</h3>
+         <p class="text-gray-500 text-sm leading-relaxed">Integre com seu número via Z-API com um QR code. Seu número, sua identidade.</p>
+       </div>
+       <div class="text-center group">
+         <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">🎉</div>
+-        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-violet-50 rounded-full mb-3">PASSO 3</div>
++        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-brand-50 rounded-full mb-3">PASSO 3</div>
+         <h3 class="font-bold text-gray-900 text-lg mb-2">Relaxe e atenda</h3>
+         <p class="text-gray-500 text-sm leading-relaxed">O agente cuida de tudo. Você acompanha pelo painel no celular ou computador.</p>
+       </div>
+@@ -582,7 +639,7 @@
+           <li class="flex gap-2"><span class="text-brand">✓</span> Reagendamento pelo painel</li>
+           <li class="flex gap-2"><span class="text-brand">✓</span> Suporte via WhatsApp</li>
+         </ul>
+-        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-violet-50 transition">
++        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-brand-50 transition">
+           Começar agora →
+         </a>
+       </div>
+@@ -639,7 +696,7 @@
+           <li class="flex gap-2"><span class="text-brand">✓</span> 7 dias grátis para testar</li>
+           <li class="flex gap-2"><span class="text-brand">✓</span> Parcelamento em 3x s/ juros</li>
+         </ul>
+-        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-violet-50 transition">
++        <a href="/onboarding" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-brand-50 transition">
+           Começar com desconto →
+         </a>
+       </div>
+@@ -656,7 +713,7 @@
+ <!-- ── GARANTIA ── -->
+ <section class="py-16 px-5">
+   <div class="max-w-2xl mx-auto text-center">
+-    <div class="bg-green-50 border border-green-200 rounded-3xl p-10">
++    <div class="bg-brand-50 border border-brand-200 rounded-3xl p-10">
+       <div class="text-5xl mb-4">🛡️</div>
+       <h2 class="text-2xl font-black text-gray-900 mb-3">7 dias grátis no plano anual</h2>
+       <p class="text-gray-600 leading-relaxed">
+@@ -747,16 +804,16 @@
+ <section class="cta-bg text-white py-24 px-5 text-center">
+   <div class="max-w-2xl mx-auto">
+     <div class="text-6xl mb-6">🚀</div>
+-    <h2 class="text-3xl md:text-5xl font-black mb-5 leading-tight">
++    <h2 class="text-[1.75rem] md:text-[2.75rem] font-black mb-5 leading-tight">
+       Pronta para ter mais tempo<br/>para seus pacientes?
+     </h2>
+-    <p class="text-gray-300 text-lg mb-10 leading-relaxed">
++    <p class="text-brand-100 text-lg mb-10 leading-relaxed">
+       Configure seu agente agora e comece a atender no automático ainda hoje.
+       Menos de 2 minutos para começar.
+     </p>
+     <div class="flex flex-col sm:flex-row gap-4 justify-center">
+       <a href="/onboarding"
+-        class="btn-brand text-white font-bold px-10 py-5 rounded-2xl text-lg hover:opacity-90 transition shadow-2xl glow">
++        class="btn-claro font-bold px-10 py-5 rounded-2xl text-lg hover:bg-white transition shadow-2xl">
+         🚀 Começar agora →
+       </a>
+       <a href="https://wa.me/5511968439527" target="_blank"
+@@ -764,31 +821,25 @@
+         💬 Falar antes de assinar
+       </a>
+     </div>
+-    <p class="text-gray-400 text-sm mt-6">Sem contrato · Suporte incluso · Configuração em 2 minutos</p>
++    <p class="text-brand-200 text-sm mt-6">Sem contrato · Suporte incluso · Configuração em 2 minutos</p>
+   </div>
+ </section>
+ 
+ <!-- ── FOOTER ── -->
+-<footer class="bg-gray-950 text-gray-500 py-10 px-5">
++<footer class="bg-brand-950 text-brand-200 pt-10 pb-28 xl:pb-10 px-5">
+   <div class="max-w-5xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+-    <div class="flex items-center gap-2">
+-      <div class="w-8 h-8 btn-brand rounded-lg flex items-center justify-center text-white shadow">
+-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+-          <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
+-          <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
+-          <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
+-        </svg>
+-      </div>
++    <div class="flex items-center gap-2.5">
++      <img src="/static/marca/simbolo-assistente-256.png" alt="" width="32" height="32" class="marca-simbolo w-8 h-8 ring-1 ring-white/10"/>
+       <div class="leading-tight">
+-        <span class="block font-extrabold text-gray-300 text-xs tracking-tight">AGENTE</span>
+-        <span class="block font-bold text-brandLight text-[10px] -mt-0.5 tracking-[0.18em]">CONSULTÓRIO</span>
++        <span class="block marca-nome text-white text-xs">AGENTE</span>
++        <span class="block marca-sub text-brand-200" style="font-size:10px">CONSULTÓRIO</span>
+       </div>
+     </div>
+     <p class="text-sm text-center">© 2026 Agente Consultório · Powered by Claude AI · Anthropic</p>
+     <div class="flex items-center gap-4 text-xs">
+-      <a href="/termos" class="hover:text-gray-300 transition">Termos</a>
+-      <a href="/privacidade" class="hover:text-gray-300 transition">Privacidade</a>
+-      <a href="https://wa.me/5511968439527" target="_blank" class="text-gray-400 hover:text-green-400 transition">
++      <a href="/termos" class="hover:text-white transition">Termos</a>
++      <a href="/privacidade" class="hover:text-white transition">Privacidade</a>
++      <a href="https://wa.me/5511968439527" target="_blank" class="text-brand-100 hover:text-white transition">
+         💬 (11) 96843-9527
+       </a>
+     </div>
+diff --git a/whatsapp-agent/backend/templates/landing_vertical.html b/whatsapp-agent/backend/templates/landing_vertical.html
+index 536c9235b..3fb2dd1e7 100644
+--- a/whatsapp-agent/backend/templates/landing_vertical.html
++++ b/whatsapp-agent/backend/templates/landing_vertical.html
+@@ -8,25 +8,64 @@
+   <meta name="description" content="{{ c.seo_description }}"/>
+   <meta property="og:title" content="{{ c.seo_title }}"/>
+   <meta property="og:description" content="{{ c.seo_description }}"/>
+-  <meta property="og:image" content="/static/hero-agente.jpg"/>
+-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%237c3aed'><path d='M12 2a4 4 0 0 0-4 4 3 3 0 0 0-3 3v1a3 3 0 0 0 0 6 3 3 0 0 0 3 3v1a3 3 0 0 0 4 3 3 3 0 0 0 4-3v-1a3 3 0 0 0 3-3 3 3 0 0 0 0-6V9a3 3 0 0 0-3-3 4 4 0 0 0-4-4z'/></svg>"/>
+-  <script src="https://cdn.tailwindcss.com"></script>
+-  <script>tailwind.config = { theme: { extend: { colors: { brand: '#7c3aed', brandDark: '#5b21b6', brandLight: '#a78bfa', dark: '#1a0b2e' } } } }</script>
++  <meta property="og:image" content="/static/marca/compartilhamento-1200x630.jpg"/>
++  <link rel="icon" type="image/png" href="/static/marca/simbolo-assistente-64.png"/>
++  <!-- Fontes: Montserrat (títulos) + Inter (texto), como no painel (E08A).
++       display=swap: se o serviço de fontes falhar, aparece a fonte do sistema. -->
+   <link rel="preconnect" href="https://fonts.googleapis.com"/>
+-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/>
++  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
++  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Montserrat:wght@600;700;800&display=swap"/>
++  <script src="https://cdn.tailwindcss.com"></script>
++  <!-- Paleta da identidade (E27A): mesma escala do painel e de /static/marca/tokens.css. -->
++  <script>tailwind.config = { theme: { extend: {
++    colors: {
++      brand: { DEFAULT:'#8A273E', 50:'#F9EEEC',100:'#F1D9D7',200:'#E7BFBF',300:'#D99CA3',400:'#C77784',
++               500:'#B25665',600:'#8A273E',700:'#74213A',800:'#5E1A2F',900:'#4A1424',950:'#3C0E18' },
++      gray:  { 50:'#FBF7F6',100:'#F3EEEC',200:'#E7E0DD',300:'#D2C8C4',400:'#706560',
++               500:'#685D58',600:'#554B47',700:'#433A37',800:'#2F2826',900:'#201A18' },
++    },
++    fontFamily: {
++      sans: ['Inter','system-ui','-apple-system','Segoe UI','Roboto','Arial','sans-serif'],
++      titulo: ['Montserrat','Inter','system-ui','sans-serif'],
++    },
++  } } }</script>
++  <link rel="stylesheet" href="/static/marca/tokens.css"/>
+   <style>
+-    * { font-family: 'Inter', sans-serif; }
+-    .hero-bg { background: linear-gradient(135deg, #1a0b2e 0%, #2d1657 50%, #1a0b2e 100%); }
+-    .cta-bg  { background: linear-gradient(135deg, #1a0b2e 0%, #3b1781 100%); }
+-    .btn-brand { background: linear-gradient(135deg, #7c3aed, #a855f7); }
+-    .glow { box-shadow: 0 0 50px rgba(124,58,237,0.25); }
+-    .glow-sm { box-shadow: 0 0 20px rgba(124,58,237,0.18); }
+-    .chat-in  { border-radius: 4px 18px 18px 18px; background: #ffffff; color:#374151; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+-    .chat-out { border-radius: 18px 4px 18px 18px; background: #ede9fe; color:#4c1d95; }
+-    .chat-time { font-size: 10px; color:#9ca3af; margin-top:4px; display:block; }
+-    .chat-slot { display:flex; align-items:center; gap:10px; background:#fff; border:1px solid #e9d5ff; border-radius:12px; padding:10px 14px; font-size:13px; color:#4c1d95; transition: all .15s; }
+-    .chat-slot:hover { background:#faf5ff; border-color:#c4b5fd; }
+-    .chat-slot svg { color:#7c3aed; }
++    .hero-bg { background:
++      radial-gradient(1100px 520px at 88% 8%, rgba(178,86,101,.32), transparent 62%),
++      radial-gradient(900px 620px at -5% 105%, rgba(138,39,62,.45), transparent 60%),
++      linear-gradient(135deg, #3C0E18 0%, #4A1424 55%, #3C0E18 100%); }
++    .cta-bg  { background:
++      radial-gradient(800px 420px at 50% -10%, rgba(178,86,101,.30), transparent 65%),
++      linear-gradient(135deg, #3C0E18 0%, #5E1A2F 100%); }
++    .btn-brand { background: #8A273E; }
++    /* ação principal sobre o vinho profundo: nude com texto vinho (12,3:1) */
++    .btn-claro { background: #F1D9D7; color: #3C0E18; }
++    .glow { box-shadow: 0 0 50px rgba(138,39,62,0.22); }
++    .glow-sm { box-shadow: 0 0 20px rgba(138,39,62,0.14); }
++    /* títulos grandes em linhas equilibradas (sem palavra órfã); sem suporte, quebra normal */
++    .hero-bg h1, .cta-bg h2 { text-wrap: balance; }
++    /* foco visível também nas seções escuras */
++    :where(.hero-bg, .cta-bg, footer) :where(a, button):focus-visible { outline-color: #F1D9D7; }
++    /* Balões de conversa */
++    .chat-in  { border-radius: 4px 18px 18px 18px; background: #ffffff; color:#2F2826; box-shadow: 0 1px 2px rgba(60,14,24,0.07); }
++    .chat-out { border-radius: 18px 4px 18px 18px; background: #F1D9D7; color:#3C0E18; }
++    .chat-time { font-size: 10px; color:#706560; margin-top:4px; display:block; }
++    .chat-out .chat-time { color:#554B47; }
++    .chat-slot { display:flex; align-items:center; gap:10px; background:#fff; border:1px solid #E7BFBF; border-radius:12px; padding:10px 14px; font-size:13px; color:#4A1424; transition: all .15s; }
++    .chat-slot:hover { background:#F9EEEC; border-color:#D99CA3; }
++    .chat-slot svg { color:#8A273E; }
++    /* Celular ilustrativo do herói (substitui a arte antiga) */
++    .celular { width: min(100%, 340px); padding: 10px; border-radius: 46px;
++               background: linear-gradient(160deg, #5E1A2F, #24070C);
++               box-shadow: 0 30px 60px rgba(20,4,8,.45), inset 0 0 0 1px rgba(255,255,255,.08); }
++    .celular-tela { position: relative; border-radius: 37px; overflow: hidden; background: #F3EEEC; }
++    .celular-entalhe { position: absolute; top: 9px; left: 50%; transform: translateX(-50%);
++                       width: 92px; height: 24px; border-radius: 999px; background: #120307; }
++    .celular-topo { display: flex; align-items: center; gap: 10px; padding: 44px 16px 12px; background: #3C0E18; }
++    .celular-avatar { width: 34px; height: 34px; border-radius: 50%; background: #E7BFBF; color: #3C0E18;
++                      display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
++    .celular-conversa { padding: 14px 12px 20px; }
+     @keyframes float  { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
+     @keyframes fadein { from{opacity:0;transform:translateY(24px)} to{opacity:1;transform:translateY(0)} }
+     @keyframes pulse-ring { 0%{transform:scale(1);opacity:1} 100%{transform:scale(1.6);opacity:0} }
+@@ -35,16 +74,16 @@
+     .fadein-2 { animation: fadein .7s .2s ease both; }
+     .pulse-ring::before {
+       content:''; position:absolute; inset:-6px; border-radius:50%;
+-      border:2px solid #a855f7;
++      border:2px solid #4ade80;
+       animation: pulse-ring 1.8s ease-out infinite;
+     }
+-    .plan-popular { border-color:#7c3aed; transform:scale(1.03); }
++    .plan-popular { border-color:#8A273E; transform:scale(1.03); }
+     @media(max-width:768px){ .plan-popular{transform:scale(1); } }
+     details summary { cursor:pointer; list-style:none; }
+     details summary::-webkit-details-marker { display:none; }
+     details[open] .faq-icon { transform:rotate(45deg); }
+     .faq-icon { transition: transform .2s; }
+-    .tag-pill { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:100px; padding:6px 14px; font-size:13px; color:#e9d5ff; }
++    .tag-pill { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15); border-radius:100px; padding:6px 14px; font-size:13px; color:#F1D9D7; }
+     .before-card { border-left: 3px solid #f87171; }
+     .after-card  { border-left: 3px solid #34d399; }
+     .whatsapp-float {
+@@ -58,7 +97,7 @@
+     .hero-img-wrap { position:relative; }
+     .hero-img-wrap::after {
+       content:''; position:absolute; inset:-20px; z-index:-1;
+-      background: radial-gradient(circle at center, rgba(168,85,247,0.35) 0%, rgba(168,85,247,0) 70%);
++      background: radial-gradient(circle at center, rgba(231,191,191,0.26) 0%, rgba(231,191,191,0) 70%);
+       filter: blur(20px);
+     }
+   </style>
+@@ -76,16 +115,10 @@
+ <nav class="sticky top-0 z-50 bg-white/95 backdrop-blur border-b border-gray-100">
+   <div class="max-w-6xl mx-auto px-5 py-3.5 flex items-center justify-between">
+     <a href="/" class="flex items-center gap-2.5 hover:opacity-80 transition" title="Voltar para a página inicial">
+-      <div class="w-9 h-9 btn-brand rounded-xl flex items-center justify-center text-white shadow">
+-        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+-          <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
+-          <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
+-          <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
+-        </svg>
+-      </div>
++      <img src="/static/marca/simbolo-assistente-256.png" alt="" width="36" height="36" class="marca-simbolo w-9 h-9 shadow"/>
+       <div class="leading-tight">
+-        <span class="block font-extrabold text-gray-900 text-sm md:text-base tracking-tight">AGENTE</span>
+-        <span class="block font-bold text-brand text-[11px] md:text-xs -mt-1 tracking-[0.18em]">{{ c.brand_line2 }}</span>
++        <span class="block marca-nome text-gray-900 text-sm md:text-base">AGENTE</span>
++        <span class="block marca-sub text-brand md:text-[11.5px]">{{ c.brand_line2 }}</span>
+       </div>
+     </a>
+     <div class="flex items-center gap-3">
+@@ -100,25 +133,25 @@
+ 
+ <!-- ── HERO ── -->
+ <section class="hero-bg text-white px-5 py-20 md:py-28 relative overflow-hidden">
+-  <div class="absolute top-20 -left-20 w-72 h-72 rounded-full" style="background:radial-gradient(circle,rgba(168,85,247,0.25),transparent 70%);filter:blur(40px)"></div>
+-  <div class="absolute bottom-10 -right-10 w-96 h-96 rounded-full" style="background:radial-gradient(circle,rgba(124,58,237,0.2),transparent 70%);filter:blur(50px)"></div>
++  <div class="absolute top-20 -left-20 w-72 h-72 rounded-full" style="background:radial-gradient(circle,rgba(178,86,101,0.28),transparent 70%);filter:blur(40px)"></div>
++  <div class="absolute bottom-10 -right-10 w-96 h-96 rounded-full" style="background:radial-gradient(circle,rgba(231,191,191,0.14),transparent 70%);filter:blur(50px)"></div>
+ 
+-  <div class="max-w-6xl mx-auto grid md:grid-cols-2 gap-14 items-center relative">
++  <div class="max-w-6xl mx-auto grid lg:grid-cols-2 gap-14 items-center relative">
+     <div class="fadein">
+       <div class="tag-pill mb-6">
+         <span class="w-2 h-2 bg-green-400 rounded-full animate-pulse relative pulse-ring"></span>
+         {{ c.hero_pill }}
+       </div>
+-      <h1 class="text-4xl md:text-5xl xl:text-6xl font-black leading-[1.1] mb-6">
++      <h1 class="text-4xl md:text-5xl xl:text-[3.5rem] font-black leading-[1.1] mb-6">
+         {{ c.hero_title_1 }}<br/>
+-        <span style="background:linear-gradient(90deg,#a855f7,#e9d5ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">{{ c.hero_title_2 }}</span>
++        <span style="background:linear-gradient(90deg,#E7BFBF,#F9EEEC);-webkit-background-clip:text;-webkit-text-fill-color:transparent">{{ c.hero_title_2 }}</span>
+       </h1>
+-      <p class="text-gray-300 text-lg md:text-xl mb-8 leading-relaxed">
++      <p class="text-brand-100 text-lg md:text-xl mb-8 leading-relaxed">
+         {{ c.hero_subtitle }}
+       </p>
+       <div class="flex flex-col sm:flex-row gap-3 mb-6">
+         <a href="{{ c.onboarding_link }}"
+-          class="btn-brand text-white font-bold px-8 py-4 rounded-2xl text-base hover:opacity-90 transition text-center shadow-xl glow">
++          class="btn-claro font-bold px-8 py-4 rounded-2xl text-base hover:bg-white transition text-center shadow-xl">
+           {{ c.cta_primary }}
+         </a>
+         <a href="#como-funciona"
+@@ -126,24 +159,51 @@
+           Ver como funciona ↓
+         </a>
+       </div>
+-      <div class="flex flex-wrap gap-4 text-sm text-gray-400">
++      <div class="flex flex-wrap gap-4 text-sm text-brand-200">
+         <span>✓ Sem contrato</span>
+         <span>✓ Configuração em 2 minutos</span>
+         <span>✓ Suporte incluído</span>
+       </div>
+     </div>
+ 
+-    <div class="float fadein-2 hero-img-wrap">
+-      <img src="/static/hero-agente.jpg"
+-           alt="{{ c.hero_img_alt }}"
+-           class="w-full rounded-3xl shadow-2xl border border-white/10"
+-           loading="eager" decoding="async"/>
++    <!-- Ilustração: o cliente agendando pelo WhatsApp. As falas são as do
++         exemplo logo abaixo (dados fictícios). Substitui a arte antiga, que
++         trazia a marca anterior e a frase "reduzem faltas", retirada no R1. -->
++    <div class="float fadein-2 hero-img-wrap flex justify-center">
++      <div class="celular" role="img" aria-label="{{ c.hero_img_alt }}">
++        <div class="celular-tela" aria-hidden="true">
++          <span class="celular-entalhe"></span>
++          <div class="celular-topo">
++            <span class="celular-avatar">
++              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/></svg>
++            </span>
++            <span class="flex-1 space-y-1.5">
++              <span class="block h-2.5 w-28 rounded-full bg-white/70"></span>
++              <span class="block h-2 w-14 rounded-full bg-white/35"></span>
++            </span>
++          </div>
++          <div class="celular-conversa space-y-2.5 text-[13px] text-left">
++            <div class="flex justify-end"><div class="chat-out px-3.5 py-2 max-w-[85%]">Olá! Quero agendar {{ 'um' if c.t_service in ['atendimento','serviço'] else 'uma' }} {{ c.t_service }}. <span class="chat-time">10:31</span></div></div>
++            <div class="flex justify-start"><div class="chat-in px-3.5 py-2 max-w-[85%]">Claro! Vou te ajudar a agendar. 😊<br/>Deixa eu verificar os horários disponíveis pra você. <span class="chat-time">10:31</span></div></div>
++            <div class="flex justify-start">
++              <div class="chat-in px-3 py-2.5 max-w-[92%] space-y-1.5">
++                <p class="text-xs text-brand-700 font-semibold mb-1">Confira os próximos horários:</p>
++                <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 09:00</div>
++                <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 14:00</div>
++                <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quinta-feira, 23/05 – 10:00</div>
++                <span class="chat-time">10:32</span>
++              </div>
++            </div>
++            <div class="flex justify-end"><div class="chat-out px-3.5 py-2 max-w-[85%]">Quarta-feira, 22/05 às 14:00. <span class="chat-time">10:33</span></div></div>
++          </div>
++        </div>
++      </div>
+     </div>
+   </div>
+ </section>
+ 
+ <!-- ── BALÕES CSS ── -->
+-<section class="bg-gradient-to-b from-violet-50 via-white to-white py-20 px-5">
++<section class="bg-gradient-to-b from-brand-50 via-white to-white py-20 px-5">
+   <div class="max-w-5xl mx-auto">
+     <div class="text-center mb-12">
+       <p class="text-brand font-bold text-sm uppercase tracking-widest mb-3">Como suas conversas ficam</p>
+@@ -153,8 +213,8 @@
+ 
+     <div class="grid md:grid-cols-2 gap-8">
+       <!-- Coluna 1: agendamento -->
+-      <div class="bg-white rounded-3xl border border-violet-100 shadow-xl p-6 md:p-7 fadein">
+-        <div class="flex items-center gap-2 text-xs text-violet-700 font-semibold mb-4 pb-3 border-b border-violet-50">
++      <div class="bg-white rounded-3xl border border-brand-100 shadow-xl p-6 md:p-7 fadein">
++        <div class="flex items-center gap-2 text-xs text-brand-700 font-semibold mb-4 pb-3 border-b border-brand-50">
+           <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2" ry="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>
+           Olá, tudo bem? 😊 Precisa agendar?
+         </div>
+@@ -163,7 +223,7 @@
+           <div class="flex justify-start"><div class="chat-in px-4 py-2.5 max-w-[80%]">Claro! Vou te ajudar a agendar. 😊<br/>Deixa eu verificar os horários disponíveis pra você. <span class="chat-time">10:31</span></div></div>
+           <div class="flex justify-start">
+             <div class="chat-in px-4 py-3 max-w-[90%] space-y-2">
+-              <p class="text-xs text-violet-700 font-semibold mb-1">Confira os próximos horários:</p>
++              <p class="text-xs text-brand-700 font-semibold mb-1">Confira os próximos horários:</p>
+               <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 09:00</div>
+               <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quarta-feira, 22/05 – 14:00</div>
+               <div class="chat-slot"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>Quinta-feira, 23/05 – 10:00</div>
+@@ -176,8 +236,8 @@
+       </div>
+ 
+       <!-- Coluna 2: remarcação -->
+-      <div class="bg-white rounded-3xl border border-violet-100 shadow-xl p-6 md:p-7 fadein-2">
+-        <div class="flex items-center gap-2 text-xs text-violet-700 font-semibold mb-4 pb-3 border-b border-violet-50">
++      <div class="bg-white rounded-3xl border border-brand-100 shadow-xl p-6 md:p-7 fadein-2">
++        <div class="flex items-center gap-2 text-xs text-brand-700 font-semibold mb-4 pb-3 border-b border-brand-50">
+           <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+           Precisa remarcar? Eu também cuido disso pra você!
+         </div>
+@@ -242,7 +302,7 @@
+     </div>
+     <div class="grid md:grid-cols-2 gap-5">
+       <div class="space-y-3">
+-        <h3 class="text-red-500 font-bold text-sm uppercase tracking-wide mb-4">😰 Antes</h3>
++        <h3 class="text-red-700 font-bold text-sm uppercase tracking-wide mb-4">😰 Antes</h3>
+         {% for item in c.before %}
+         <div class="before-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+           <p class="text-sm text-gray-700">{{ item }}</p>
+@@ -250,7 +310,7 @@
+         {% endfor %}
+       </div>
+       <div class="space-y-3">
+-        <h3 class="text-green-500 font-bold text-sm uppercase tracking-wide mb-4">✨ Depois</h3>
++        <h3 class="text-green-700 font-bold text-sm uppercase tracking-wide mb-4">✨ Depois</h3>
+         {% for item in c.after %}
+         <div class="after-card bg-white rounded-xl px-5 py-4 border border-gray-100">
+           <p class="text-sm text-gray-700">{{ item }}</p>
+@@ -278,7 +338,7 @@
+       {% for s in c.steps %}
+       <div class="text-center group">
+         <div class="w-16 h-16 btn-brand rounded-2xl flex items-center justify-center text-3xl mx-auto mb-5 shadow-lg group-hover:scale-110 transition">{{ s.emoji }}</div>
+-        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-violet-50 rounded-full mb-3">{{ s.badge }}</div>
++        <div class="inline-block text-brand font-bold text-xs px-3 py-1 bg-brand-50 rounded-full mb-3">{{ s.badge }}</div>
+         <h3 class="font-bold text-gray-900 text-lg mb-2">{{ s.title }}</h3>
+         <p class="text-gray-500 text-sm leading-relaxed">{{ s.text }}</p>
+       </div>
+@@ -341,17 +401,17 @@
+       <h2 class="text-3xl md:text-4xl font-black text-gray-900">Feito para o seu dia a dia</h2>
+     </div>
+     <div class="grid md:grid-cols-3 gap-6 text-center">
+-      <div class="bg-white rounded-2xl border border-violet-100 p-7 glow-sm">
++      <div class="bg-white rounded-2xl border border-brand-100 p-7 glow-sm">
+         <div class="text-3xl mb-3">⚡</div>
+         <h3 class="font-bold text-gray-900 mb-2">Responde na hora</h3>
+         <p class="text-gray-500 text-sm leading-relaxed">Nenhum {{ c.t_client }} fica sem resposta — mesmo fora do horário de expediente.</p>
+       </div>
+-      <div class="bg-white rounded-2xl border border-violet-100 p-7 glow-sm">
++      <div class="bg-white rounded-2xl border border-brand-100 p-7 glow-sm">
+         <div class="text-3xl mb-3">🔒</div>
+         <h3 class="font-bold text-gray-900 mb-2">Seu número, seu controle</h3>
+         <p class="text-gray-500 text-sm leading-relaxed">O agente atende pelo seu próprio WhatsApp. Você pausa quando quiser, com 1 clique.</p>
+       </div>
+-      <div class="bg-white rounded-2xl border border-violet-100 p-7 glow-sm">
++      <div class="bg-white rounded-2xl border border-brand-100 p-7 glow-sm">
+         <div class="text-3xl mb-3">💜</div>
+         <h3 class="font-bold text-gray-900 mb-2">Tom acolhedor</h3>
+         <p class="text-gray-500 text-sm leading-relaxed">Linguagem natural, com emojis e cuidado — do jeito que você atenderia.</p>
+@@ -395,7 +455,7 @@
+           <li class="flex gap-2"><span class="text-brand">✓</span> Reagendamento pelo painel</li>
+           <li class="flex gap-2"><span class="text-brand">✓</span> Suporte via WhatsApp</li>
+         </ul>
+-        <a href="{{ c.onboarding_link }}" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-violet-50 transition">
++        <a href="{{ c.onboarding_link }}" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-brand-50 transition">
+           Começar agora →
+         </a>
+       </div>
+@@ -452,7 +512,7 @@
+           <li class="flex gap-2"><span class="text-brand">✓</span> 7 dias grátis para testar</li>
+           <li class="flex gap-2"><span class="text-brand">✓</span> Parcelamento em 3x s/ juros</li>
+         </ul>
+-        <a href="{{ c.onboarding_link }}" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-violet-50 transition">
++        <a href="{{ c.onboarding_link }}" class="block w-full text-center border-2 border-brand text-brand font-bold py-3.5 rounded-xl hover:bg-brand-50 transition">
+           Começar com desconto →
+         </a>
+       </div>
+@@ -468,7 +528,7 @@
+ <!-- ── GARANTIA ── -->
+ <section class="py-16 px-5">
+   <div class="max-w-2xl mx-auto text-center">
+-    <div class="bg-green-50 border border-green-200 rounded-3xl p-10">
++    <div class="bg-brand-50 border border-brand-200 rounded-3xl p-10">
+       <div class="text-5xl mb-4">🛡️</div>
+       <h2 class="text-2xl font-black text-gray-900 mb-3">7 dias grátis no plano anual</h2>
+       <p class="text-gray-600 leading-relaxed">
+@@ -519,15 +579,15 @@
+ <section class="cta-bg text-white py-24 px-5 text-center">
+   <div class="max-w-2xl mx-auto">
+     <div class="text-6xl mb-6">🚀</div>
+-    <h2 class="text-3xl md:text-5xl font-black mb-5 leading-tight">
++    <h2 class="text-[1.75rem] md:text-[2.75rem] font-black mb-5 leading-tight">
+       {{ c.final_headline_1 }}<br/>{{ c.final_headline_2 }}
+     </h2>
+-    <p class="text-gray-300 text-lg mb-10 leading-relaxed">
++    <p class="text-brand-100 text-lg mb-10 leading-relaxed">
+       {{ c.final_subtitle }}
+     </p>
+     <div class="flex flex-col sm:flex-row gap-4 justify-center">
+       <a href="{{ c.onboarding_link }}"
+-        class="btn-brand text-white font-bold px-10 py-5 rounded-2xl text-lg hover:opacity-90 transition shadow-2xl glow">
++        class="btn-claro font-bold px-10 py-5 rounded-2xl text-lg hover:bg-white transition shadow-2xl">
+         🚀 Começar agora →
+       </a>
+       <a href="https://wa.me/{{ c.whatsapp }}" target="_blank"
+@@ -535,31 +595,25 @@
+         💬 Falar antes de assinar
+       </a>
+     </div>
+-    <p class="text-gray-400 text-sm mt-6">Sem contrato · Suporte incluso · Configuração em 2 minutos</p>
++    <p class="text-brand-200 text-sm mt-6">Sem contrato · Suporte incluso · Configuração em 2 minutos</p>
+   </div>
+ </section>
+ 
+ <!-- ── FOOTER ── -->
+-<footer class="bg-gray-950 text-gray-500 py-10 px-5">
++<footer class="bg-brand-950 text-brand-200 pt-10 pb-28 xl:pb-10 px-5">
+   <div class="max-w-5xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+-    <div class="flex items-center gap-2">
+-      <div class="w-8 h-8 btn-brand rounded-lg flex items-center justify-center text-white shadow">
+-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+-          <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/>
+-          <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>
+-          <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>
+-        </svg>
+-      </div>
++    <div class="flex items-center gap-2.5">
++      <img src="/static/marca/simbolo-assistente-256.png" alt="" width="32" height="32" class="marca-simbolo w-8 h-8 ring-1 ring-white/10"/>
+       <div class="leading-tight">
+-        <span class="block font-extrabold text-gray-300 text-xs tracking-tight">AGENTE</span>
+-        <span class="block font-bold text-brandLight text-[10px] -mt-0.5 tracking-[0.18em]">{{ c.brand_line2 }}</span>
++        <span class="block marca-nome text-white text-xs">AGENTE</span>
++        <span class="block marca-sub text-brand-200" style="font-size:10px">{{ c.brand_line2 }}</span>
+       </div>
+     </div>
+     <p class="text-sm text-center">© 2026 Agente Atendimento · Powered by Claude AI · Anthropic</p>
+     <div class="flex items-center gap-4 text-xs">
+-      <a href="/termos" class="hover:text-gray-300 transition">Termos</a>
+-      <a href="/privacidade" class="hover:text-gray-300 transition">Privacidade</a>
+-      <a href="https://wa.me/{{ c.whatsapp }}" target="_blank" class="text-gray-400 hover:text-green-400 transition">
++      <a href="/termos" class="hover:text-white transition">Termos</a>
++      <a href="/privacidade" class="hover:text-white transition">Privacidade</a>
++      <a href="https://wa.me/{{ c.whatsapp }}" target="_blank" class="text-brand-100 hover:text-white transition">
+         💬 (11) 96843-9527
+       </a>
+     </div>

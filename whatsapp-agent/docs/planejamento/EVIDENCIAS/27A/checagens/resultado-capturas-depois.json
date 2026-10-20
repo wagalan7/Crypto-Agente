@@ -1,0 +1,146 @@
+[
+ {
+  "pagina": "/",
+  "largura": 1440,
+  "altura": 9544,
+  "vazamento_px": 0,
+  "erros_js": [],
+  "http_4xx_5xx": [],
+  "violeta": [],
+  "fontes": {
+   "h1": "Montserrat",
+   "corpo": "Inter",
+   "carregadas": [
+    "Inter 400",
+    "Inter 500",
+    "Inter 600",
+    "Inter 700",
+    "Inter 900",
+    "Montserrat 600",
+    "Montserrat 700",
+    "Montserrat 800"
+   ]
+  },
+  "arquivo": "depois-inicio-1440-computador.png"
+ },
+ {
+  "pagina": "/p/nutricao",
+  "largura": 1440,
+  "altura": 8505,
+  "vazamento_px": 0,
+  "erros_js": [],
+  "http_4xx_5xx": [],
+  "violeta": [],
+  "fontes": {
+   "h1": "Montserrat",
+   "corpo": "Inter",
+   "carregadas": [
+    "Inter 400",
+    "Inter 500",
+    "Inter 600",
+    "Inter 700",
+    "Inter 900",
+    "Montserrat 600",
+    "Montserrat 700",
+    "Montserrat 800"
+   ]
+  },
+  "arquivo": "depois-p-nutricao-1440-computador.png"
+ },
+ {
+  "pagina": "/",
+  "largura": 768,
+  "altura": 10903,
+  "vazamento_px": 0,
+  "erros_js": [],
+  "http_4xx_5xx": [],
+  "violeta": [],
+  "fontes": {
+   "h1": "Montserrat",
+   "corpo": "Inter",
+   "carregadas": [
+    "Inter 400",
+    "Inter 500",
+    "Inter 600",
+    "Inter 700",
+    "Inter 900",
+    "Montserrat 600",
+    "Montserrat 700",
+    "Montserrat 800"
+   ]
+  },
+  "arquivo": "depois-inicio-768-tablet.png"
+ },
+ {
+  "pagina": "/p/nutricao",
+  "largura": 768,
+  "altura": 9591,
+  "vazamento_px": 0,
+  "erros_js": [],
+  "http_4xx_5xx": [],
+  "violeta": [],
+  "fontes": {
+   "h1": "Montserrat",
+   "corpo": "Inter",
+   "carregadas": [
+    "Inter 400",
+    "Inter 500",
+    "Inter 600",
+    "Inter 700",
+    "Inter 900",
+    "Montserrat 600",
+    "Montserrat 700",
+    "Montserrat 800"
+   ]
+  },
+  "arquivo": "depois-p-nutricao-768-tablet.png"
+ },
+ {
+  "pagina": "/",
+  "largura": 390,
+  "altura": 16566,
+  "vazamento_px": 0,
+  "erros_js": [],
+  "http_4xx_5xx": [],
+  "violeta": [],
+  "fontes": {
+   "h1": "Montserrat",
+   "corpo": "Inter",
+   "carregadas": [
+    "Inter 400",
+    "Inter 500",
+    "Inter 600",
+    "Inter 700",
+    "Inter 900",
+    "Montserrat 600",
+    "Montserrat 700",
+    "Montserrat 800"
+   ]
+  },
+  "arquivo": "depois-inicio-390-celular.png"
+ },
+ {
+  "pagina": "/p/nutricao",
+  "largura": 390,
+  "altura": 14693,
+  "vazamento_px": 0,
+  "erros_js": [],
+  "http_4xx_5xx": [],
+  "violeta": [],
+  "fontes": {
+   "h1": "Montserrat",
+   "corpo": "Inter",
+   "carregadas": [
+    "Inter 400",
+    "Inter 500",
+    "Inter 600",
+    "Inter 700",
+    "Inter 900",
+    "Montserrat 600",
+    "Montserrat 700",
+    "Montserrat 800"
+   ]
+  },
+  "arquivo": "depois-p-nutricao-390-celular.png"
+ }
+]
