@@ -252,6 +252,7 @@ R2 = código de E02+E03 em janela combinada.
    template cru, não no texto visível).
 10. **E08B** pronta localmente (20/10): substitui a narrativa com IA do Início
     por "Psicologia em foco" (CFP + Ministério da Saúde, 09:00 de Brasília,
-    cache por segmento). Evidências em `EVIDENCIAS/08B.md`. **Falta:**
+    cache por segmento). Evidências em `EVIDENCIAS/08B.md`. Posição do quadro
+    aprovada pelo proprietário (20/10). **Falta:**
     avaliação do proprietário; integração com o R2; publicação só com
     autorização. **Não avançar para outra etapa automaticamente.**
