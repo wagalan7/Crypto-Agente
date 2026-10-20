@@ -15,7 +15,7 @@ import pytest
 
 import database as db
 import noticias_job as nj
-from apoio_noticias import HttpFalso, Relogio, URL_CFP, URL_MS, atom, em_brasilia, link_cfp, link_ms, rss2
+from .apoio_noticias import HttpFalso, Relogio, URL_CFP, URL_MS, atom, em_brasilia, link_cfp, link_ms, rss2
 
 
 def _tick(http, relogio, dono="worker-1"):

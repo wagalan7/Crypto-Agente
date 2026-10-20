@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 import noticias as nt
-from apoio_noticias import HttpFalso, URL_CFP, URL_MS, atom, em_brasilia, link_cfp, link_ms, rss2
+from .apoio_noticias import HttpFalso, URL_CFP, URL_MS, atom, em_brasilia, link_cfp, link_ms, rss2
 
 AGORA = em_brasilia(2026, 10, 20, 10)
 

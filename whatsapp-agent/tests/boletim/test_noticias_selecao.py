@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import noticias as nt
-from apoio_noticias import em_brasilia, link_cfp, link_ms
+from .apoio_noticias import em_brasilia, link_cfp, link_ms
 
 AGORA = em_brasilia(2026, 10, 20, 10)
 FONTES = {f.id: f for f in (nt.CFP, nt.MINISTERIO_SAUDE)}
