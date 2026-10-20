@@ -382,7 +382,7 @@ Item de atenção do R2, não bloqueador.
 | `GET /` renderiza `templates/landing.html` | OK — confirmado no código da rota |
 | `/p/{segment}` usa `landing_content.content_for` | OK |
 | A landing responde 200 | OK |
-| "40% menos faltas" fora da página servida | OK |
+| "40% menos faltas" fora da página servida | ~~OK~~ **check vazio** — a alegação seguiu no ar até 19/10; ver §11 |
 | "Marina R.", "Camila F.", "Letícia M." fora | OK |
 | "Mais de 30 psicólogas" fora | OK |
 | "nunca perceberam que era automático" fora | OK |
@@ -749,7 +749,7 @@ atravessou o deploy. Antes era configuração lida; agora é fato observado.
 
 Só GETs públicos, repetindo as asserções dos checks locais: **18 de 19
 passaram**. Saúde (4/4), landing principal 200, os sete termos fabricados
-**ausentes**, seção factual substituta no ar, descontos verificáveis
+**ausentes** (⚠️ errado para "40%": ver §11), seção factual substituta no ar, descontos verificáveis
 preservados, `/p/nutricao` 200 sem depoimento, `/termos` e `/privacidade` 200.
 
 ### A verificação que falhou — e a correção de um check meu
@@ -775,3 +775,69 @@ fora do ar.
 diferente de "40% menos faltas": é **verificável** — basta cronometrar o
 formulário de onboarding. Se o tempo real não sustentar a frase, ela entra na
 mesma limpeza das demais. Decisão de E27, com medição, não deste release.
+
+## 11. Correção — "40% · Menos faltas sem aviso" seguiu no ar até 19/10 (R1b)
+
+### O erro
+
+O R1 retirou "Lembretes automáticos que reduzem faltas em até 40%" do herói, mas
+a **faixa de números** de `landing.html` tinha outra ocorrência, com número e
+frase em tags separadas:
+
+```html
+<p class="text-4xl font-black text-brand">40%</p>
+<p class="text-gray-500 text-sm mt-1">Menos faltas sem aviso</p>
+```
+
+O check do §6 e a verificação do §10 procuravam a string literal
+`"40% menos faltas"` no HTML; como ela não existe em lugar nenhum, ambos
+**passavam antes e depois do R1**. O "OK" do §6 e a frase "os sete termos
+fabricados ausentes" do §10 estavam errados para este termo. O visitante via
+"40%" sobre "Menos faltas sem aviso" em `/` e em `/p/psicologia` (que redireciona
+para `/`) desde antes do R1.
+
+### O check corrigido
+
+Busca no **texto visível** (sem comentários, `<script>`, `<style>` e tags, com
+espaços normalizados) de `/`, `/p/psicologia`, `/p/nutricao` e
+`/p/odontologia`. Padrões: percentual seguido de "menos faltas", "reduz…
+faltas", "mais de N psicólogas", "nunca perceberam" e nome + inicial dos
+depoimentos fabricados. Sai com erro em qualquer ocorrência.
+
+**Calibração:** contra produção **antes** do R1b, achou `40% Menos faltas` em
+`/` e `/p/psicologia` (saída 1). Depois do R1b: limpo (saída 0). O mesmo ponto
+cego existe em `tests/test_landing_alegacoes.py` do R2 (regex sobre o template
+cru) e será corrigido lá.
+
+### R1b — o release
+
+| | |
+|---|---|
+| Commit | `1986bdef0d1f38217f997a8da6a8f29bc2c8da9c` (branch `release/r1b-metrica-40`) |
+| Base | `b73977197` = `origin/main` (R4), **fast-forward**, 1 commit |
+| Mudança | 2 linhas em `whatsapp-agent/backend/templates/landing.html`: "40% / Menos faltas sem aviso" → "Sem app / Atende pacientes no WhatsApp" (fato do produto, sem número) |
+| Fora | preços, descontos, demais textos; "2min Para configurar" continua — decisão de E27 acima |
+| Autorização | proprietário, 19/10 ("autorizdo") |
+
+### Publicação executada — 19/10/2026 (20/10 UTC)
+
+| | |
+|---|---|
+| Push | `b73977197..1986bdef0` em `main`, fast-forward, 02:33:41Z (23:33 BRT) |
+| Deployments | `railway-app[bot]` → **só** `Agente de Atendimento / production` (02:33:48Z); `vercel[bot]` → frontend do cripto (02:34:15Z), como no R1 e no R4 |
+| Bot de cripto | **nenhum deployment** nos serviços Railway do cripto |
+| Indisponibilidade | última resposta do processo antigo 02:34:38Z; sem resposta 02:34:44Z; processo novo 02:34:57Z, `uptime 13,8 s` → **≤ 19 s**, checagem a cada 5 s |
+
+| # | Verificação pós-deploy | Resultado |
+|---|---|---|
+| 1 | `/healthz` | `uptime` zerado, `db: ok`, 8 consultórios |
+| 2 | check de texto visível nas 4 páginas | **LIMPO** |
+| 3 | "Sem app" e "Atende pacientes no WhatsApp" em `/` | presentes, 1× cada |
+| 4 | `/termos`, `/privacidade`, `/p/nutricao`, `/p/odontologia`, `/static/marca/tokens.css` | 200 |
+| 5 | preços da landing | inalterados por construção (o diff não toca outras linhas) |
+
+Hash do HTML servido **não** é comparável ao do template: `/` é renderizado
+pelo Jinja. A verificação de conteúdo (itens 2 e 3) é a que importa aqui.
+
+**Reversão:** `git revert 1986bdef0` + `git push origin HEAD:main`, mesma regra de
+horário. Recolocaria uma alegação sem prova; não recomendado.
