@@ -36,10 +36,16 @@ def _gerar_edicao(http, quando):
 
 @pytest.fixture
 def sem_internet(monkeypatch):
-    """Qualquer tentativa de coleta durante o teste falha o teste."""
+    """Registra qualquer tentativa de coleta. Não basta levantar exceção: o
+    endpoint é fail-open e engoliria o erro (a mutação "coleta a cada acesso"
+    passou assim na primeira versão deste teste)."""
+    tentativas = []
+
     def proibido(*a, **k):
+        tentativas.append(a)
         raise AssertionError("o painel tentou buscar notícia na internet")
     monkeypatch.setattr(nt, "baixar", proibido)
+    return tentativas
 
 
 # ── Autenticação e segmento ───────────────────────────────────────────────────
@@ -88,7 +94,9 @@ def test_abrir_o_painel_so_le_o_cache(cliente, tenants, http, feeds_padrao, sem_
                         '2026-10-20T12:00:00+00:00', '2026-10-20T12:00:00+00:00', 'diaria:2026-10-20', 0)""")
     for _ in range(5):
         for slug in ("psi-a", "psi-b"):
-            assert cliente.get("/dashboard/api/noticias", headers=_h(tenants[slug])).status_code == 200
+            r = cliente.get("/dashboard/api/noticias", headers=_h(tenants[slug]))
+            assert r.status_code == 200 and r.json()["habilitado"] is True
+    assert sem_internet == []
     with db.get_conn() as conn:
         assert conn.execute("SELECT COUNT(*) FROM noticias_execucoes").fetchone()[0] == 0
 
@@ -207,8 +215,8 @@ def test_painel_renderiza_com_o_quadro_e_os_blocos_preservados(cliente, tenants)
     t = tenants["psi-a"]
     db.update_tenant("psi-a", status="active")
     html = cliente.get(f"/dashboard/psi-a?token={t['dashboard_token']}").text
-    for id_ in ("foco", "foco-lista", "foco-estado", "hi-greeting", "home-insights", "hi-narrative",
-                "hi-kpis", "hi-body", "agenda-summary", "agenda-list"):
+    for id_ in ("foco", "foco-lista", "foco-estado", "foco-slot-movel", "hi-greeting", "home-insights",
+                "hi-narrative", "hi-kpis", "hi-body", "agenda-summary", "agenda-list"):
         assert f'id="{id_}"' in html, id_
     # O quadro do boletim vem depois do resumo operacional (não empurra alertas).
     assert html.index('id="home-insights"') < html.index('id="foco"')

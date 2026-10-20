@@ -275,6 +275,10 @@
         </div>
       </section>
 
+      <!-- Abaixo de 1024 px o boletim (#foco) é movido para cá, depois das
+           consultas: no celular a agenda vem antes das notícias. -->
+      <div id="foco-slot-movel" class="min-w-0 lg:hidden"></div>
+
     </div>
   </div>
 
@@ -1926,6 +1930,20 @@ function _focoRender(d) {
   document.getElementById("foco-estado").textContent = est;
   sec.classList.remove("hidden");
 }
+// Um só elemento #foco: na coluna lateral a partir de 1024 px; abaixo disso,
+// depois de "Próximas consultas" (a ordem do DOM acompanha a visual).
+const _focoLargo = window.matchMedia("(min-width: 1024px)");
+function _focoPosicionar() {
+  const foco = document.getElementById("foco");
+  const lateral = document.getElementById("home-insights")?.parentElement;
+  const movel = document.getElementById("foco-slot-movel");
+  if (!foco || !lateral || !movel) return;
+  const destino = _focoLargo.matches ? lateral : movel;
+  if (foco.parentElement !== destino) destino.appendChild(foco);
+}
+if (_focoLargo.addEventListener) _focoLargo.addEventListener("change", _focoPosicionar);
+else if (_focoLargo.addListener) _focoLargo.addListener(_focoPosicionar);
+
 function alternarFocoMais() {
   _focoMostrarTodos = !_focoMostrarTodos;
   _focoRender(_focoUltimo);
@@ -3805,6 +3823,7 @@ function checkWelcome() {
 connectSSE();
 loadAgenda();
 loadHomeInsights();
+_focoPosicionar();
 carregarFoco();
 // ── Indicadores ───────────────────────────────────────────────────────────────
 function loadStats() {

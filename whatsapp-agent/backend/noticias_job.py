@@ -362,7 +362,8 @@ def executar(segmento: str, chave: str, tentativa: int, dono: str,
                  json.dumps(resultado, ensure_ascii=False), segmento, chave))
             nivel = logger.error if esgotou else logger.warning
             nivel(f"[noticias] {segmento}/{chave}: {status} na tentativa {tentativa} — {resultado}")
-    logger.info(f"[noticias] {segmento}/{chave}: {status} (tentativa {tentativa}, atraso {atraso}s)")
+    logger.info(f"[noticias] {segmento}/{chave}: {status} (tentativa {tentativa}"
+                + (f", atraso {atraso}s)" if atraso is not None else ")"))
     return {"segmento": segmento, "chave": chave, "status": status, "tentativa": tentativa,
             "atraso_s": atraso, "resultado": resultado}
 
