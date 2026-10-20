@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Conselho (FICTÍCIO)</title><link>https://noticias-ficticias.invalid/</link>
+<item><title>[FICTÍCIO] Conselho publica orientação sobre registro de atendimento on-line</title>
+<link>https://noticias-ficticias.invalid/orientacao-registro-online/</link><pubDate>{{RFC822:-1d}}</pubDate>
+<description><![CDATA[<p>Texto fictício para a prévia: a orientação descreve como registrar sessões realizadas por vídeo e quais cuidados de sigilo observar.</p>]]></description></item>
+<item><title>[FICTÍCIO] Prazo para atualização cadastral de psicólogas termina na próxima semana</title>
+<link>https://noticias-ficticias.invalid/prazo-atualizacao/</link><pubDate>{{RFC822:-2d}}</pubDate>
+<description><![CDATA[<p>Texto fictício para a prévia: o prazo foi prorrogado e a atualização pode ser feita pelo portal do conselho.</p>]]></description></item>
+<item><title>[FICTÍCIO] Consulta pública sobre referências técnicas em saúde mental na escola</title>
+<link>https://noticias-ficticias.invalid/consulta-escola/</link><pubDate>{{RFC822:-4d}}</pubDate>
+<description><![CDATA[<p>Texto fictício para a prévia: contribuições podem ser enviadas por formulário até o fim do mês.</p>]]></description></item>
+<item><title>[FICTÍCIO] Nota de pesar</title><link>https://noticias-ficticias.invalid/nota-de-pesar/</link><pubDate>{{RFC822:-1d}}</pubDate>
+<description><![CDATA[<p>Item institucional fictício: não deve virar destaque.</p>]]></description></item>
+<item><title>[FICTÍCIO] Resolução antiga sobre publicidade profissional</title>
+<link>https://noticias-ficticias.invalid/resolucao-antiga/</link><pubDate>{{RFC822:-12d}}</pubDate>
+<description><![CDATA[<p>Item fictício de 12 dias atrás: fora da janela de 7 dias.</p>]]></description></item>
+</channel></rss>

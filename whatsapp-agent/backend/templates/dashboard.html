@@ -220,9 +220,10 @@
       </section>
 
       <!-- B · Resumo e pendências (vêm da API de insights; some se ela falhar) -->
-      <aside class="min-w-0 lg:col-start-3 lg:row-start-1 lg:row-span-2" aria-label="Resumo e pendências">
+      <aside class="min-w-0 space-y-5 lg:col-start-3 lg:row-start-1 lg:row-span-2" aria-label="Resumo e pendências">
         <div id="home-insights" class="hidden space-y-3">
-          <!-- Narrativa com IA: só aparece se a flag do consultório estiver ligada -->
+          <!-- Narrativa com IA: só aparece se a flag do consultório estiver ligada
+               E o segmento não tiver boletim (E08B: lá ela dá lugar a #foco). -->
           <div id="hi-narrative" class="hidden rounded-2xl bg-brand-50 border border-brand-100 px-4 py-3 text-[14px] text-gray-800 leading-relaxed hi-rise"></div>
           <div class="flex items-center justify-between gap-2">
             <h2 class="rotulo-secao">Resumo</h2>
@@ -233,6 +234,26 @@
           <div id="hi-kpis" class="hidden grid grid-cols-2 lg:grid-cols-1 gap-3"></div>
           <div id="hi-body" class="space-y-2.5"></div>
         </div>
+
+        <!-- Boletim do segmento (E08B), lido do cache do servidor: abrir o painel
+             não busca nada na internet. Fica DEPOIS do resumo operacional para
+             nunca empurrar um alerta do consultório para baixo. -->
+        <section id="foco" class="hidden cartao p-4" aria-labelledby="foco-titulo">
+          <div class="flex items-center justify-between gap-2">
+            <h2 id="foco-titulo" class="titulo-secao">Em foco</h2>
+            <button type="button" id="foco-atualizar" onclick="atualizarFoco(this)" class="botao-sec !min-h-0 !py-1.5">
+              <svg class="icone !w-4 !h-4" aria-hidden="true"><use href="#i-atualizar"/></svg>Atualizar
+            </button>
+          </div>
+          <p id="foco-ficticio" class="hidden mt-2 text-[12.5px] font-semibold text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+            PRÉVIA — notícias fictícias, criadas para teste. Nenhuma fonte publicou este conteúdo.</p>
+          <p id="foco-aviso" class="hidden mt-2 text-[13px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5"></p>
+          <ol id="foco-lista" class="mt-3 space-y-3.5"></ol>
+          <button type="button" id="foco-mais" class="hidden mt-2.5 text-[13px] font-semibold text-brand hover:underline"
+            onclick="alternarFocoMais(this)" aria-expanded="false" aria-controls="foco-lista"></button>
+          <p id="foco-estado" class="mt-3 pt-3 border-t border-gray-100 text-[12px] text-gray-500 leading-snug"></p>
+          <p id="foco-msg" class="mt-1 text-[12px] text-gray-700 leading-snug" role="status" aria-live="polite"></p>
+        </section>
       </aside>
 
       <!-- C · Próximas consultas -->
@@ -253,6 +274,10 @@
           <div class="estado-carregando">Carregando…</div>
         </div>
       </section>
+
+      <!-- Abaixo de 1024 px o boletim (#foco) é movido para cá, depois das
+           consultas: no celular a agenda vem antes das notícias. -->
+      <div id="foco-slot-movel" class="min-w-0 lg:hidden"></div>
 
     </div>
   </div>
@@ -1502,7 +1527,7 @@ function showTab(name) {
 
   _marcarNavAtivo(name === "config" && _secaoConfigAtual() === "cobranca" ? "cobranca" : name);
 
-  if (name==="agenda")    { loadAgenda(); loadHomeInsights(); newAppointments=0; updateBadge("agenda",0); }
+  if (name==="agenda")    { loadAgenda(); loadHomeInsights(); carregarFoco(); newAppointments=0; updateBadge("agenda",0); }
   if (name==="slots")     { loadSlots(); loadWeekly(); renderBlockedHours(); renderBlockedDates(); }
   if (name==="conversas") { loadConversas(); newMessages=0; updateBadge("msg",0); }
   if (name==="config")    { loadBillingLogs(); loadStats(); }
@@ -1825,11 +1850,166 @@ function _hiEscape(s) {
     {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
+// ── Boletim do segmento (E08B) ───────────────────────────────────────────────
+// Lê só o cache do servidor. Conteúdo vindo de fontes externas entra no DOM
+// apenas por textContent — nunca por innerHTML — e link só se for https.
+let _focoHabilitado = null;   // null = ainda não sabe; false = segmento sem boletim
+let _focoUltimo = null;
+let _focoMostrarTodos = false;
+
+function _focoData(iso, comHora) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const op = {timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", year: "numeric"};
+  if (comHora) Object.assign(op, {hour: "2-digit", minute: "2-digit"});
+  return d.toLocaleString("pt-BR", op).replace(",", " às");
+}
+function _focoEl(tag, cls, texto) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (texto != null) el.textContent = texto;
+  return el;
+}
+function _focoRender(d) {
+  const sec = document.getElementById("foco");
+  if (!sec) return;
+  if (!d || !d.habilitado) { sec.classList.add("hidden"); return; }
+  document.getElementById("foco-titulo").textContent = d.titulo || "Em foco";
+  document.getElementById("foco-ficticio").classList.toggle("hidden", !d.ficticio);
+  const aviso = document.getElementById("foco-aviso");
+  aviso.textContent = d.aviso && d.aviso.texto
+    ? d.aviso.texto + (d.aviso.em ? " (" + _focoData(d.aviso.em, true) + ")" : "") : "";
+  aviso.classList.toggle("hidden", !aviso.textContent);
+
+  const lista = document.getElementById("foco-lista");
+  lista.replaceChildren();
+  const itens = d.itens || [];
+  const visiveis = d.visiveis || 3;
+  if (!itens.length) {
+    lista.appendChild(_focoEl("li", "estado-vazio !py-5",
+      d.situacao === "sem_edicao"
+        ? "As fontes ainda não foram consultadas. A primeira consulta é automática; depois, todo dia às 09:00."
+        : "Nenhuma notícia das fontes acompanhadas nos últimos 7 dias."));
+  }
+  itens.forEach((it, i) => {
+    const li = _focoEl("li", "min-w-0");
+    if (i >= visiveis && !_focoMostrarTodos) li.hidden = true;
+    const seguro = !d.ficticio && /^https:\/\//i.test(it.url || "");
+    const t = _focoEl(seguro ? "a" : "span", "block text-[14px] font-semibold text-gray-900 leading-snug break-words"
+      + (seguro ? " hover:text-brand hover:underline" : ""), it.titulo || "");
+    if (seguro) {
+      t.href = it.url; t.target = "_blank"; t.rel = "noopener noreferrer nofollow";
+      t.title = "Abre o site da fonte em nova aba";
+    }
+    li.appendChild(t);
+    if (it.resumo) li.appendChild(_focoEl("p", "mt-1 text-[13px] text-gray-600 leading-snug line-clamp-3 break-words", it.resumo));
+    const meta = (it.fonte || "") + (it.publicado_em ? " · publicada em " + _focoData(it.publicado_em) : "")
+      + (d.ficticio ? " · link fictício" : "");
+    li.appendChild(_focoEl("p", "mt-1 text-[12px] text-gray-500", meta));
+    lista.appendChild(li);
+  });
+
+  const mais = document.getElementById("foco-mais");
+  const extras = Math.max(0, itens.length - visiveis);
+  mais.classList.toggle("hidden", !extras);
+  mais.textContent = _focoMostrarTodos ? "Mostrar menos" : "Mostrar mais " + extras;
+  mais.setAttribute("aria-expanded", String(_focoMostrarTodos));
+
+  // "Conteúdo atualizado" e "Última verificação" separados quando diferem:
+  // verificar as fontes sem achar novidade não muda o conteúdo.
+  let est = "";
+  if (d.verificado_em) {
+    est = d.conteudo_atualizado_em === d.verificado_em
+      ? "Atualizado em " + _focoData(d.verificado_em, true) + "."
+      : "Conteúdo atualizado em " + _focoData(d.conteudo_atualizado_em, true)
+        + " · Última verificação em " + _focoData(d.verificado_em, true) + " (sem novidade).";
+  }
+  const nomes = (d.fontes || []).map(f => f.nome).join(" e ");
+  if (nomes) est += (est ? " " : "") + "Fontes: " + nomes + ".";
+  document.getElementById("foco-estado").textContent = est;
+  sec.classList.remove("hidden");
+}
+// Um só elemento #foco: na coluna lateral a partir de 1024 px; abaixo disso,
+// depois de "Próximas consultas" (a ordem do DOM acompanha a visual).
+const _focoLargo = window.matchMedia("(min-width: 1024px)");
+function _focoPosicionar() {
+  const foco = document.getElementById("foco");
+  const lateral = document.getElementById("home-insights")?.parentElement;
+  const movel = document.getElementById("foco-slot-movel");
+  if (!foco || !lateral || !movel) return;
+  const destino = _focoLargo.matches ? lateral : movel;
+  if (foco.parentElement !== destino) destino.appendChild(foco);
+}
+if (_focoLargo.addEventListener) _focoLargo.addEventListener("change", _focoPosicionar);
+else if (_focoLargo.addListener) _focoLargo.addListener(_focoPosicionar);
+
+function alternarFocoMais() {
+  _focoMostrarTodos = !_focoMostrarTodos;
+  _focoRender(_focoUltimo);
+}
+function carregarFoco() {
+  return api("/dashboard/api/noticias").then(d => {
+    const antes = _focoHabilitado;
+    _focoHabilitado = !!(d && d.habilitado);
+    _focoUltimo = d;
+    _focoRender(d);
+    // Segmento sem boletim: o quadro narrativo antigo segue como era.
+    if (!_focoHabilitado && antes === null) loadHomeNarrative();
+    return d;
+  }).catch(() => {
+    if (_focoHabilitado === null) { _focoHabilitado = false; loadHomeNarrative(); }
+    return null;
+  });
+}
+function _focoAguardar(verificadoAntes, desde) {
+  // Revisão real em andamento: relê o cache até ela registrar resultado.
+  let n = 0;
+  return new Promise(resolve => {
+    const passo = () => carregarFoco().then(d => {
+      const terminou = d && (d.verificado_em !== verificadoAntes
+        || (d.aviso && d.aviso.tipo === "falha" && d.aviso.em && new Date(d.aviso.em) >= desde));
+      if (terminou || ++n >= 10) resolve(terminou ? d : null);
+      else setTimeout(passo, 2500);
+    });
+    setTimeout(passo, 1500);
+  });
+}
+function atualizarFoco(btn) {
+  const msg = document.getElementById("foco-msg");
+  const antes = _focoUltimo && _focoUltimo.verificado_em;
+  const desde = new Date(Date.now() - 5000);
+  btn.disabled = true;
+  msg.textContent = "Consultando…";
+  api("/dashboard/api/noticias/revisar", {method: "POST"}).then(r => {
+    if (r.acao === "revisao_iniciada") {
+      msg.textContent = "Verificando as fontes agora…";
+      return _focoAguardar(antes, desde).then(d => {
+        if (!d) msg.textContent = "A verificação ainda não terminou. O quadro mostra o conteúdo salvo.";
+        else if (d.aviso && d.aviso.tipo === "falha") msg.textContent = "As fontes não responderam. O quadro mostra o conteúdo salvo.";
+        else msg.textContent = d.conteudo_atualizado_em === d.verificado_em
+          ? "Fontes verificadas agora: conteúdo atualizado."
+          : "Fontes verificadas agora: nenhuma novidade.";
+      });
+    }
+    return carregarFoco().then(() => {
+      msg.textContent = r.proxima_revisao_em
+        ? "As fontes foram verificadas há pouco; nova verificação a partir de " + _focoData(r.proxima_revisao_em, true)
+          + ". Exibindo o conteúdo salvo."
+        : "Exibindo o conteúdo salvo.";
+    });
+  }).catch(err => {
+    msg.textContent = (err && err.message) || "Não foi possível atualizar agora.";
+  }).finally(() => { btn.disabled = false; });
+}
+
 // Fase 3: busca o parágrafo-resumo com IA (só aparece se a flag do tenant
 // estiver ligada; o backend devolve narrativa vazia caso contrário). Fail-safe.
+// E08B: no segmento com boletim, este quadro não é carregado (ver carregarFoco).
 function loadHomeNarrative() {
   const nb = document.getElementById("hi-narrative");
   if (!nb) return;
+  if (_focoHabilitado !== false) { nb.classList.add("hidden"); return; }
   api("/dashboard/api/insights/narrative").then(data => {
     const txt = (data && data.narrative || "").trim();
     if (txt) {
@@ -3643,6 +3823,8 @@ function checkWelcome() {
 connectSSE();
 loadAgenda();
 loadHomeInsights();
+_focoPosicionar();
+carregarFoco();
 // ── Indicadores ───────────────────────────────────────────────────────────────
 function loadStats() {
   const month = document.getElementById('stats-month')?.value || '';

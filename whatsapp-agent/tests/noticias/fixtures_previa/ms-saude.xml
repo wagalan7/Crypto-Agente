@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Ministério (FICTÍCIO)</title>
+<entry><title>[FICTÍCIO] Rede de atenção psicossocial ganha novos CAPS em três estados</title>
+<link rel="alternate" type="text/html" href="https://noticias-ficticias.invalid/caps-estados"/>
+<id>urn:ficticio:1</id><summary>Texto fictício para a prévia sobre ampliação de serviços de saúde mental.</summary>
+<published>{{ISO:-30h}}</published><updated>{{ISO:-29h}}</updated></entry>
+<entry><title>[FICTÍCIO] Hospital recebe novo tomógrafo</title>
+<link rel="alternate" type="text/html" href="https://noticias-ficticias.invalid/tomografo"/>
+<id>urn:ficticio:2</id><summary>Item fictício de outro assunto (equipamento hospitalar): não deve entrar.</summary>
+<published>{{ISO:-5h}}</published><updated>{{ISO:-5h}}</updated></entry>
+</feed>
