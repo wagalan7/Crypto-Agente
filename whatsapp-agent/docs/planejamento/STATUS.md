@@ -72,7 +72,7 @@ verde não substitui homologação.
 | E03 | PRONTA LOCALMENTE | B2, B3 para avançar a VALIDADA EM HOMOLOGAÇÃO |
 | **E08A** (antecipação parcial de E08) | **PUBLICADA** em 19/10 como R4 (`b7397719`) | confirmação visual do proprietário no próprio painel |
 | **E27A** (antecipação só visual de E27) | **PUBLICADA** em 20/10 como R5 (`78a1718d` + `20b6d305`) | confirmação visual do proprietário no ar |
-| **E08B** (requisito novo: boletim por segmento) | **PRONTA LOCALMENTE** — `etapa/e08b-noticias`, 83 testes; fontes verificadas do ambiente local | avaliação do proprietário; saída HTTPS da Railway não verificada; suíte do R2 no branch integrado |
+| **E08B** (requisito novo: boletim por segmento) | **PRONTA LOCALMENTE** — `etapa/e08b-noticias`, 83 testes; integrada ao R2 em `integracao/r2-main-e08b` (407/407) | avaliação do proprietário; saída HTTPS da Railway não verificada |
 | E04–E28 | PENDENTE | — (E08 e E27 parcialmente adiantadas por E08A e E27A, **não** concluídas) |
 
 E04 e E27 **não** estão concluídas: receberam apenas transferência parcial de
@@ -211,8 +211,9 @@ rollback e bloqueadores em `RELEASE-E01-E03.md`.
 | G4 publicação | — |
 | G5 observação | — |
 
-**R2 precisa de rebase** sobre o `origin/main` atual (hoje está 17 commits
-atrás). **Menor release coerente:** E02 **não** é publicável sozinha (a camada de
+~~**R2 precisa de rebase** sobre o `origin/main` atual (hoje está 17 commits
+atrás).~~ **Resolvido por merge em 20/10:** `integracao/r2-main-e08b` (R2 + `main` +
+E08B), 407 de 407 testes (`EVIDENCIAS/08B.md` §13). **Menor release coerente:** E02 **não** é publicável sozinha (a camada de
 ofertas foi reescrita sobre o esquema de E03 e as funções de E02 foram
 removidas). O que é separável de verdade é a **correção da landing** (commit 1),
 autossuficiente e de risco mínimo. Recomendação: R1 = landing + docs + testes;
@@ -253,6 +254,8 @@ R2 = código de E02+E03 em janela combinada.
 10. **E08B** pronta localmente (20/10): substitui a narrativa com IA do Início
     por "Psicologia em foco" (CFP + Ministério da Saúde, 09:00 de Brasília,
     cache por segmento). Evidências em `EVIDENCIAS/08B.md`. Posição do quadro
-    aprovada pelo proprietário (20/10). **Falta:**
+    aprovada pelo proprietário (20/10). Integrada ao R2 em 20/10:
+    `integracao/r2-main-e08b` = R2 + `main` + E08B por merge, **407 de 407
+    testes** (`EVIDENCIAS/08B.md` §13). **Falta:**
     avaliação do proprietário; integração com o R2; publicação só com
     autorização. **Não avançar para outra etapa automaticamente.**

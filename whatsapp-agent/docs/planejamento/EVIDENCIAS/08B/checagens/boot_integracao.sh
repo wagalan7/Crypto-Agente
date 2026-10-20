@@ -1,0 +1,7 @@
+#!/bin/zsh
+cd "/private/tmp/claude-501/-Users-alanmalta-Agente-atendimento--claude-worktrees-nifty-black-9b0c2c/792d2f48-49a6-4b04-b63f-4d5cb4ede7c4/scratchpad/integ/whatsapp-agent/backend"
+E=(PATH=/usr/bin:/bin HOME=/tmp DATA_DIR="/private/tmp/claude-501/-Users-alanmalta-Agente-atendimento--claude-worktrees-nifty-black-9b0c2c/792d2f48-49a6-4b04-b63f-4d5cb4ede7c4/scratchpad/boot-integ-0YUA" PYTHONPATH="/private/tmp/claude-501/-Users-alanmalta-Agente-atendimento--claude-worktrees-nifty-black-9b0c2c/792d2f48-49a6-4b04-b63f-4d5cb4ede7c4/scratchpad/integ/whatsapp-agent/backend" WHATSAPP_PROVIDER=mock MASTER_KEY=previa-master
+   ADMIN_PASSWORD=previa-admin INSTANCE_MONITOR_ENABLED=0 NOTICIAS_TICK_S=5
+   NOTICIAS_FIXTURES="/private/tmp/claude-501/-Users-alanmalta-Agente-atendimento--claude-worktrees-nifty-black-9b0c2c/792d2f48-49a6-4b04-b63f-4d5cb4ede7c4/scratchpad/integ/whatsapp-agent/tests/boletim/fixtures_previa")
+env -i $E "/private/tmp/claude-501/-Users-alanmalta-Agente-atendimento--claude-worktrees-nifty-black-9b0c2c/792d2f48-49a6-4b04-b63f-4d5cb4ede7c4/scratchpad/venv311/bin/python" "/private/tmp/claude-501/-Users-alanmalta-Agente-atendimento--claude-worktrees-nifty-black-9b0c2c/792d2f48-49a6-4b04-b63f-4d5cb4ede7c4/scratchpad/e08b-checagens/seed_previa.py"
+exec env -i $E "/private/tmp/claude-501/-Users-alanmalta-Agente-atendimento--claude-worktrees-nifty-black-9b0c2c/792d2f48-49a6-4b04-b63f-4d5cb4ede7c4/scratchpad/venv311/bin/python" -m uvicorn main:app --host 127.0.0.1 --port 8782
