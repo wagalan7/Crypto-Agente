@@ -252,7 +252,8 @@ def chaves_devidas(segmento: str, agora: datetime) -> list[tuple[str, datetime]]
     devidas = []
     inicial = _execucao(segmento, "inicial")
     if not _tem_edicao(segmento) and not (inicial and inicial["status"] in ("sucesso", "parcial", "esgotada")):
-        devidas.append(("inicial", agora))
+        # O primeiro preenchimento cobre o último horário: só ele é devido.
+        return [("inicial", agora)]
     horario = ultimo_horario(agora)
     chave = f"diaria:{horario.astimezone(TZ).date().isoformat()}"
     coberta_pela_inicial = (inicial and inicial["status"] in ("sucesso", "parcial")

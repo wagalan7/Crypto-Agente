@@ -1,0 +1,4 @@
+# Dependências só de desenvolvimento/teste. NÃO entram na imagem de produção:
+# o Dockerfile instala apenas backend/requirements.txt.
+-r backend/requirements.txt
+pytest==8.3.3
