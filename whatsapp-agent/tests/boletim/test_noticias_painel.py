@@ -15,7 +15,7 @@ import database as db
 import main
 import noticias as nt
 import noticias_job as nj
-from apoio_noticias import Relogio, URL_CFP, URL_MS, em_brasilia
+from .apoio_noticias import Relogio, URL_CFP, URL_MS, em_brasilia
 
 DASH = Path(main.__file__).parent / "templates" / "dashboard.html"
 
@@ -119,7 +119,7 @@ def test_estado_vazio_honesto_antes_da_primeira_coleta(cliente, tenants):
 
 
 def test_semana_sem_noticia_relevante_fica_vazia(cliente, tenants, http, feeds_padrao):
-    from apoio_noticias import atom, rss2
+    from .apoio_noticias import atom, rss2
     http.responder(URL_CFP, rss2([]))
     http.responder(URL_MS, atom([]), tipo="application/atom+xml")
     _gerar_edicao(http, feeds_padrao)

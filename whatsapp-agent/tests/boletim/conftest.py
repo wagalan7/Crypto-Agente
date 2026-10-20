@@ -50,7 +50,7 @@ import noticias_job as nj  # noqa: E402
 assert os.path.dirname(db.DB_PATH).rstrip("/") == _dd.rstrip("/"), f"banco fora do temporário: {db.DB_PATH}"
 db.init_db()
 
-from apoio_noticias import (  # noqa: E402
+from .apoio_noticias import (  # noqa: E402
     HttpFalso, URL_CFP, URL_MS, atom, em_brasilia, link_cfp, link_ms, rss2)
 
 
