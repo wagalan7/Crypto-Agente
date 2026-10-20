@@ -4,14 +4,31 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>{{ tenant.name }} — Painel</title>
+  <link rel="icon" type="image/png" href="/static/marca/simbolo-assistente-64.png"/>
+  <!-- Fontes: Montserrat (títulos) + Inter (interface). display=swap: se o
+       serviço de fontes falhar, o texto aparece na fonte do sistema. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Montserrat:wght@600;700&display=swap"/>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>tailwind.config = { theme: { extend: { colors: { brand: {
-    DEFAULT:'#7c3aed', 50:'#f5f3ff',100:'#ede9fe',200:'#ddd6fe',300:'#c4b5fd',400:'#a78bfa',
-    500:'#8b5cf6',600:'#7c3aed',700:'#6d28d9',800:'#5b21b6',900:'#4c1d95',950:'#2e1065'
-  } } } } }</script>
+  <!-- Paleta da identidade (E08A). Mesmos valores de /static/marca/tokens.css;
+       amostras das referências são aproximações, não HEX oficiais. -->
+  <script>tailwind.config = { theme: { extend: {
+    colors: {
+      brand: { DEFAULT:'#8A273E', 50:'#F9EEEC',100:'#F1D9D7',200:'#E7BFBF',300:'#D99CA3',400:'#C77784',
+               500:'#B25665',600:'#8A273E',700:'#74213A',800:'#5E1A2F',900:'#4A1424',950:'#3C0E18' },
+      gray:  { 50:'#FBF7F6',100:'#F3EEEC',200:'#E7E0DD',300:'#D2C8C4',400:'#706560',
+               500:'#685D58',600:'#554B47',700:'#433A37',800:'#2F2826',900:'#201A18' },
+      slate: { 50:'#FBF7F6',100:'#F3EEEC',200:'#E7E0DD',300:'#D2C8C4',400:'#706560',
+               500:'#685D58',600:'#554B47',700:'#433A37',800:'#2F2826',900:'#201A18' },
+    },
+    fontFamily: {
+      sans: ['Inter','system-ui','-apple-system','Segoe UI','Roboto','Arial','sans-serif'],
+      titulo: ['Montserrat','Inter','system-ui','sans-serif'],
+    },
+  } } }</script>
+  <link rel="stylesheet" href="/static/marca/tokens.css"/>
   <style>
-    body { padding-bottom: 70px; }
-    @media (min-width: 768px) { body { padding-bottom: 0; } }
     .tab-content { display: none; }
     .tab-content.active { display: block; }
     .config-section { display: none; }
@@ -22,26 +39,41 @@
     @keyframes slideIn { from { transform: translateY(-20px); opacity:0; } to { transform: translateY(0); opacity:1; } }
     .badge { display:none; }
     .badge.show { display:flex; }
-    .hero-grad { background:
-      radial-gradient(900px 380px at 12% -30%, #6d28d9 0%, transparent 60%),
-      linear-gradient(135deg, #2e1065 0%, #4c1d95 45%, #2d1657 100%); }
-    .shadow-glow { box-shadow: 0 12px 40px -14px rgba(124,58,237,.45); }
     .hi-rise { animation: hiRise .45s cubic-bezier(.2,.7,.2,1) both; }
     @keyframes hiRise { from { opacity:0; transform:translateY(8px);} to { opacity:1; transform:none;} }
   </style>
+  <!-- Restaura o menu recolhido antes da pintura (evita piscar). -->
+  <script>try { if (localStorage.getItem("painel-menu") === "recolhido") document.documentElement.dataset.menu = "recolhido"; } catch (e) {}</script>
 </head>
-<body class="bg-gray-50 min-h-screen">
+<body class="min-h-screen com-nav-inferior">
+<a href="#conteudo" class="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-[60] focus:bg-white focus:text-brand focus:font-semibold focus:px-4 focus:py-2 focus:rounded-xl focus:shadow-lg">Pular para o conteúdo</a>
+
+<!-- Ícones de navegação (traço simples, mesmo peso em todos) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-inicio" viewBox="0 0 24 24"><path d="M3.5 10.5 12 3.5l8.5 7V20a1 1 0 0 1-1 1H15v-6H9v6H4.5a1 1 0 0 1-1-1z"/></symbol>
+  <symbol id="i-agenda" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M8 3v4M16 3v4M3.5 10h17M8 14h2M14 14h2M8 17.5h2"/></symbol>
+  <symbol id="i-conversas" viewBox="0 0 24 24"><path d="M20.5 12a8 8 0 0 1-11.7 7.1L3.5 20.5l1.4-5A8 8 0 1 1 20.5 12z"/></symbol>
+  <symbol id="i-contratos" viewBox="0 0 24 24"><path d="M14 3.5H7.5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V8z"/><path d="M14 3.5V8h4.5M9 12.5h6M9 16h4"/></symbol>
+  <symbol id="i-cobrancas" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="13" rx="2.5"/><path d="M3 10.5h18M7 15h4"/></symbol>
+  <symbol id="i-config" viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17" r="2"/></symbol>
+  <symbol id="i-recolher" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-atualizar" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></symbol>
+  <symbol id="i-hoje" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M8 3v4M16 3v4M3.5 10h17"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-falta" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8.5 8.5l7 7M15.5 8.5l-7 7"/></symbol>
+  <symbol id="i-pendente" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+</svg>
 
 <!-- Toast container -->
 <div id="toasts" class="fixed top-4 right-4 z-50 space-y-2 max-w-xs"></div>
 
 <!-- Modal Boas-vindas (primeiro acesso) -->
-<div id="modal-welcome" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+<div id="modal-welcome" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="modal-welcome-titulo">
   <div class="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden">
     <div class="bg-brand px-6 py-5 text-white text-center">
       <div class="text-4xl mb-2">🎉</div>
-      <h2 class="text-xl font-bold">Bem-vinda ao Consultório Inteligente!</h2>
-      <p class="text-violet-100 text-sm mt-1">Seu assistente de IA está pronto para começar</p>
+      <h2 id="modal-welcome-titulo" class="text-xl font-bold">Bem-vinda ao Consultório Inteligente!</h2>
+      <p class="text-brand-100 text-sm mt-1">Seu assistente de IA está pronto para começar</p>
     </div>
     <div class="p-6 space-y-4">
       <p class="text-gray-700 text-sm text-center">Antes de usar o sistema, configure sua conta em <strong>~20 minutos</strong> seguindo o guia de primeiros passos.</p>
@@ -51,7 +83,7 @@
           <span class="text-2xl">🚀</span>
           <div class="text-left">
             <div>Guia de Primeiros Passos</div>
-            <div class="text-violet-200 text-xs font-normal">Z-API, agenda, configuração — comece aqui</div>
+            <div class="text-brand-100 text-xs font-normal">Z-API, agenda, configuração — comece aqui</div>
           </div>
           <span class="ml-auto">↓</span>
         </a>
@@ -81,282 +113,329 @@
   </div>
 </div>
 
-<!-- Header -->
-<header class="bg-brand shadow sticky top-0 z-40">
-  <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
-    <div>
-      <h1 class="text-white text-base md:text-xl font-bold leading-tight">{{ tenant.name }}</h1>
-      <p class="text-violet-200 text-xs md:text-sm">{{ tenant.psychologist_name }} · {{ '%02d'|format(tenant.working_hours_start) }}:00–{{ '%02d'|format(tenant.working_hours_end) }}:00</p>
+<!-- Menu lateral (computador, ≥1024px) — recolhível -->
+<aside class="menu-lateral" aria-label="Navegação principal">
+  <div class="flex items-center gap-3 px-1 mb-7">
+    <img src="/static/marca/simbolo-assistente-256.png" alt="" width="40" height="40" class="marca-simbolo w-10 h-10 ring-1 ring-white/10"/>
+    <div class="so-expandido min-w-0">
+      <p class="marca-nome text-white text-[16px]">Agente</p>
+      <p class="marca-sub text-brand-200">Consultório</p>
     </div>
-    <div class="flex items-center gap-2">
-      <span id="status-dot" class="bg-green-400 text-green-900 text-xs font-semibold px-2 py-1 rounded-full">● Online</span>
+  </div>
+  <nav class="flex flex-col gap-1" aria-label="Seções do painel">
+    <button type="button" onclick="irPara('agenda')" id="dtab-agenda" class="dtab item-menu" aria-current="page">
+      <svg class="icone" aria-hidden="true"><use href="#i-inicio"/></svg><span>Início</span>
+      <span id="badge-agenda" class="badge" aria-label="novos agendamentos">0</span>
+    </button>
+    <button type="button" onclick="irPara('slots')" id="dtab-slots" class="dtab item-menu">
+      <svg class="icone" aria-hidden="true"><use href="#i-agenda"/></svg><span>Agenda e horários</span>
+    </button>
+    <button type="button" onclick="irPara('conversas')" id="dtab-conversas" class="dtab item-menu">
+      <svg class="icone" aria-hidden="true"><use href="#i-conversas"/></svg><span>Conversas</span>
+      <span id="badge-msg" class="badge" aria-label="mensagens novas">0</span>
+    </button>
+    <button type="button" onclick="irPara('contratos')" id="dtab-contratos" class="dtab item-menu">
+      <svg class="icone" aria-hidden="true"><use href="#i-contratos"/></svg><span>Contratos</span>
+    </button>
+    <button type="button" onclick="irPara('cobranca')" id="dtab-cobranca" class="dtab item-menu">
+      <svg class="icone" aria-hidden="true"><use href="#i-cobrancas"/></svg><span>Cobranças</span>
+    </button>
+    <button type="button" onclick="irPara('config')" id="dtab-config" class="dtab item-menu">
+      <svg class="icone" aria-hidden="true"><use href="#i-config"/></svg><span>Configurações</span>
+    </button>
+  </nav>
+  <div class="mt-auto pt-4 border-t border-white/10">
+    <p class="so-expandido px-2 mb-3 text-[13px] leading-snug text-brand-100">
+      <span class="block font-semibold text-white truncate">{{ tenant.name }}</span>
+      <span class="block truncate">{{ tenant.psychologist_name }}</span>
+    </p>
+    <button type="button" id="botao-recolher" onclick="alternarMenu()" class="botao-recolher item-menu"
+      aria-expanded="true" aria-label="Recolher menu">
+      <svg class="icone" aria-hidden="true"><use href="#i-recolher"/></svg><span class="so-expandido">Recolher menu</span>
+    </button>
+  </div>
+</aside>
+
+<div class="area-principal">
+
+<!-- Barra superior: título da seção, consultório e conexão ao vivo do painel -->
+<header class="barra-topo">
+  <div class="max-w-6xl mx-auto px-4 lg:px-8 h-16 flex items-center gap-3">
+    <img src="/static/marca/simbolo-assistente-256.png" alt="Agente Consultório" width="36" height="36" class="marca-simbolo w-9 h-9 lg:hidden"/>
+    <div class="min-w-0 flex-1">
+      <h1 id="titulo-pagina" class="titulo-pagina truncate text-[18px] lg:text-[22px]">Início</h1>
+      <p class="text-[13px] text-gray-500 truncate">{{ tenant.name }} · {{ tenant.psychologist_name }} · {{ '%02d'|format(tenant.working_hours_start) }}:00–{{ '%02d'|format(tenant.working_hours_end) }}:00</p>
     </div>
+    <!-- Reflete a conexão real de atualização ao vivo (SSE). Antes era um
+         "● Online" fixo, que não verificava nada. -->
+    <span id="status-dot" class="selo-ao-vivo" data-estado="conectando" role="status" aria-live="polite"
+      title="Atualização automática do painel">Conectando…</span>
   </div>
 </header>
 
-<!-- Desktop tabs -->
-<div class="hidden md:block max-w-5xl mx-auto px-4 mt-4">
-  <div class="flex gap-1 border-b border-gray-200 mb-6">
-    <button onclick="showTab('agenda')" id="dtab-agenda"
-      class="dtab flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 border-brand text-brand">
-      📅 Agenda
-      <span id="badge-agenda" class="badge bg-brand text-white text-xs rounded-full w-5 h-5 items-center justify-center">0</span>
-    </button>
-    <button onclick="showTab('slots')" id="dtab-slots"
-      class="dtab px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
-      🕐 Horários Livres
-    </button>
-    <button onclick="showTab('conversas')" id="dtab-conversas"
-      class="dtab flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
-      💬 Conversas
-      <span id="badge-msg" class="badge bg-brand text-white text-xs rounded-full w-5 h-5 items-center justify-center">0</span>
-    </button>
-    <button onclick="showTab('contratos')" id="dtab-contratos"
-      class="dtab px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
-      📄 Contratos
-    </button>
-    <button onclick="showTab('config')" id="dtab-config"
-      class="dtab px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-brand">
-      ⚙️ Config
-    </button>
-  </div>
-</div>
-
 <!-- Content -->
-<div class="max-w-5xl mx-auto px-4">
+<main id="conteudo" class="max-w-6xl mx-auto px-4 lg:px-8 py-5">
 
-  <!-- Agenda -->
+  <!-- Início / Hoje (E08A): agenda do dia em destaque; pendências ao lado.
+       Ids e handlers preservados: home-insights, hi-*, agenda-summary, sum-*,
+       agenda-search, agenda-list. -->
   <div id="pane-agenda" class="tab-content active">
-    <!-- Home Inteligente — resumo administrativo (Fase 1) -->
-    <div id="home-insights" class="hidden mb-4 mt-4 md:mt-0">
-      <!-- Hero "briefing do dia" -->
-      <div class="hero-grad rounded-2xl shadow-glow relative overflow-hidden px-5 pt-5 pb-5">
-        <div class="absolute -top-16 -right-10 w-56 h-56 rounded-full bg-brand-500/30 blur-3xl pointer-events-none"></div>
-        <div class="absolute top-8 -left-10 w-40 h-40 rounded-full bg-fuchsia-500/20 blur-3xl pointer-events-none"></div>
-        <div class="relative">
+    <div class="grid grid-cols-1 gap-5 lg:grid-cols-3 lg:items-start">
+
+      <!-- A · Hoje -->
+      <section class="min-w-0 lg:col-span-2" aria-labelledby="hi-greeting">
+        <div class="flex items-start justify-between gap-3 mb-3">
+          <div class="min-w-0">
+            <h2 id="hi-greeting" class="titulo-secao text-[19px] lg:text-[21px] text-gray-900">Hoje</h2>
+            <p id="hi-data" class="text-sm text-gray-500 first-letter:uppercase"></p>
+          </div>
+          <button type="button" onclick="openNewAppt()"
+            class="shrink-0 inline-flex items-center gap-1.5 bg-brand hover:bg-brand-700 text-white px-4 py-2.5 rounded-xl text-sm font-semibold transition">
+            <span aria-hidden="true" class="text-base leading-none">+</span> Nova consulta
+          </button>
+        </div>
+        <!-- Quadro do dia: número + rótulo + ícone (o estado não depende só da cor) -->
+        <div id="agenda-summary" class="grid grid-cols-2 sm:grid-cols-4 gap-3 hidden">
+          <button type="button" onclick="showSummaryList('total')" title="Ver todos os agendados de hoje" class="indicador">
+            <span class="icone-estado bg-brand-50 text-brand"><svg class="icone" aria-hidden="true"><use href="#i-hoje"/></svg></span>
+            <span class="min-w-0"><span id="sum-total" class="indicador-valor block text-gray-900">–</span>
+              <span class="indicador-rotulo block">agendadas hoje</span></span>
+          </button>
+          <button type="button" onclick="showSummaryList('attended')" title="Ver quem compareceu hoje" class="indicador">
+            <span class="icone-estado bg-green-50 text-green-700"><svg class="icone" aria-hidden="true"><use href="#i-check"/></svg></span>
+            <span class="min-w-0"><span id="sum-attended" class="indicador-valor block text-green-700">–</span>
+              <span class="indicador-rotulo block">compareceram</span></span>
+          </button>
+          <button type="button" onclick="showSummaryList('missed')" title="Ver quem faltou hoje" class="indicador">
+            <span class="icone-estado bg-red-50 text-red-700"><svg class="icone" aria-hidden="true"><use href="#i-falta"/></svg></span>
+            <span class="min-w-0"><span id="sum-missed" class="indicador-valor block text-red-700">–</span>
+              <span class="indicador-rotulo block">faltas</span></span>
+          </button>
+          <button type="button" onclick="showSummaryList('pending')" title="Ver consultas pendentes de hoje" class="indicador">
+            <span class="icone-estado bg-yellow-50 text-yellow-800"><svg class="icone" aria-hidden="true"><use href="#i-pendente"/></svg></span>
+            <span class="min-w-0"><span id="sum-pending" class="indicador-valor block text-yellow-800">–</span>
+              <span class="indicador-rotulo block">pendentes</span></span>
+          </button>
+        </div>
+      </section>
+
+      <!-- B · Resumo e pendências (vêm da API de insights; some se ela falhar) -->
+      <aside class="min-w-0 lg:col-start-3 lg:row-start-1 lg:row-span-2" aria-label="Resumo e pendências">
+        <div id="home-insights" class="hidden space-y-3">
+          <!-- Narrativa com IA: só aparece se a flag do consultório estiver ligada -->
+          <div id="hi-narrative" class="hidden rounded-2xl bg-brand-50 border border-brand-100 px-4 py-3 text-[14px] text-gray-800 leading-relaxed hi-rise"></div>
           <div class="flex items-center justify-between gap-2">
-            <h2 id="hi-greeting" class="text-white text-xl md:text-2xl font-extrabold tracking-tight">Resumo da clínica</h2>
-            <button onclick="loadHomeInsights()" title="Atualizar resumo"
-              class="shrink-0 text-white/70 hover:text-white text-xs bg-white/10 hover:bg-white/20 transition px-2.5 py-1 rounded-full ring-1 ring-white/15 whitespace-nowrap">↻</button>
-          </div>
-          <!-- Fase 3: narrativa com IA (só aparece se a flag do tenant estiver ligada) -->
-          <div id="hi-narrative" class="hidden mt-3 rounded-2xl bg-white/10 backdrop-blur-sm ring-1 ring-white/15 px-4 py-3 text-[13.5px] text-white/90 leading-relaxed hi-rise"></div>
-          <!-- KPIs rápidos (montados via JS a partir dos insights) -->
-          <div id="hi-kpis" class="hidden mt-4 grid grid-cols-3 gap-2"></div>
-        </div>
-      </div>
-      <!-- Cards de insight (atenção primeiro) -->
-      <div id="hi-body" class="mt-3 space-y-2.5"></div>
-    </div>
-
-    <div class="flex items-center justify-between mb-3 gap-2">
-      <h2 class="text-base font-semibold text-gray-800">Próximas consultas</h2>
-      <div class="flex gap-2">
-        <button onclick="loadAgenda()" class="text-sm text-brand whitespace-nowrap">↻ Atualizar</button>
-        <button onclick="openNewAppt()"
-          class="text-sm bg-brand text-white px-3 py-1.5 rounded-lg font-medium hover:opacity-90 transition whitespace-nowrap">
-          + Nova
-        </button>
-      </div>
-    </div>
-    <!-- Resumo de hoje -->
-    <div id="agenda-summary" class="grid grid-cols-4 gap-2 mb-3 text-center hidden">
-      <div onclick="showSummaryList('total')" title="Ver todos os agendados de hoje"
-        class="bg-white rounded-xl border border-gray-100 py-2 cursor-pointer hover:bg-gray-50 active:scale-95 transition">
-        <p id="sum-total" class="text-base font-bold text-gray-800">–</p>
-        <p class="text-[10px] text-gray-400">hoje</p>
-      </div>
-      <div onclick="showSummaryList('attended')" title="Ver quem compareceu hoje"
-        class="bg-green-50 rounded-xl border border-green-100 py-2 cursor-pointer hover:bg-green-100 active:scale-95 transition">
-        <p id="sum-attended" class="text-base font-bold text-green-700">–</p>
-        <p class="text-[10px] text-green-600">present.</p>
-      </div>
-      <div onclick="showSummaryList('missed')" title="Ver quem faltou hoje"
-        class="bg-red-50 rounded-xl border border-red-100 py-2 cursor-pointer hover:bg-red-100 active:scale-95 transition">
-        <p id="sum-missed" class="text-base font-bold text-red-600">–</p>
-        <p class="text-[10px] text-red-500">faltou</p>
-      </div>
-      <div onclick="showSummaryList('pending')" title="Ver consultas pendentes de hoje"
-        class="bg-yellow-50 rounded-xl border border-yellow-100 py-2 cursor-pointer hover:bg-yellow-100 active:scale-95 transition">
-        <p id="sum-pending" class="text-base font-bold text-yellow-700">–</p>
-        <p class="text-[10px] text-yellow-600">pendente</p>
-      </div>
-    </div>
-
-    <!-- Busca -->
-    <div class="mb-3 relative">
-      <input id="agenda-search" type="text" placeholder="🔎 Buscar paciente..."
-        oninput="filterAgenda()"
-        class="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-brand"/>
-    </div>
-    <div id="agenda-list" class="space-y-3">
-      <div class="text-gray-400 text-sm text-center py-8">Carregando...</div>
-    </div>
-  </div>
-
-  <!-- Slots -->
-  <div id="pane-slots" class="tab-content">
-    <div class="flex items-center justify-between mb-3 mt-4 md:mt-0">
-      <h2 class="text-base font-semibold text-gray-800">Horários</h2>
-      <button onclick="refreshSlotsTab(this)" class="text-sm text-brand whitespace-nowrap">↻ Atualizar</button>
-    </div>
-
-    <!-- Editor de horários -->
-    <div class="bg-white border border-gray-200 rounded-xl mb-4 overflow-hidden">
-      <button onclick="toggleSlotConfig()" id="slot-config-toggle"
-        class="w-full flex items-center justify-between px-4 py-3 text-left">
-        <span class="font-medium text-sm text-gray-800">⚙️ Configurar horários (adicionar / bloquear / alterar)</span>
-        <span id="slot-config-arrow" class="text-gray-400 text-sm">▼</span>
-      </button>
-      <div id="slot-config-body" class="hidden border-t border-gray-100 p-4 space-y-4">
-
-        <!-- Dias da semana -->
-        <div>
-          <label class="block text-xs font-medium text-gray-600 mb-2">Dias de atendimento</label>
-          <div class="grid grid-cols-7 gap-1.5">
-            {% set wd_set = (tenant.working_days or '0,1,2,3,4').split(',') %}
-            {% set day_labels = [('0','Seg'),('1','Ter'),('2','Qua'),('3','Qui'),('4','Sex'),('5','Sáb'),('6','Dom')] %}
-            {% for v, lbl in day_labels %}
-            <label class="cursor-pointer">
-              <input type="checkbox" class="peer hidden slot-wd" value="{{ v }}" {% if v in wd_set %}checked{% endif %} onchange="renderBlockedByDay()"/>
-              <div class="text-center text-xs py-2 rounded-lg border border-gray-200 bg-gray-50 text-gray-500 peer-checked:bg-brand peer-checked:text-white peer-checked:border-brand transition">
-                {{ lbl }}
-              </div>
-            </label>
-            {% endfor %}
-          </div>
-        </div>
-
-        <!-- Início / Fim / Duração -->
-        <div class="grid grid-cols-3 gap-2">
-          <div>
-            <label class="block text-xs font-medium text-gray-600 mb-1">Início</label>
-            <input id="slot-start" type="number" min="0" max="23" value="{{ tenant.working_hours_start }}"
-              onchange="renderBlockedHours()"
-              class="w-full border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-brand"/>
-          </div>
-          <div>
-            <label class="block text-xs font-medium text-gray-600 mb-1">Fim</label>
-            <input id="slot-end" type="number" min="1" max="24" value="{{ tenant.working_hours_end }}"
-              onchange="renderBlockedHours()"
-              class="w-full border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-brand"/>
-            <p class="text-[10px] text-gray-400 mt-1 leading-tight">Hora final (exclusiva). Ex.: <b>22</b> permite sessões até as 21h.</p>
-          </div>
-          <div>
-            <label class="block text-xs font-medium text-gray-600 mb-1">Duração (min)</label>
-            <input id="slot-duration" type="number" min="20" max="180" step="5" value="{{ tenant.session_minutes }}"
-              class="w-full border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-brand"/>
-          </div>
-        </div>
-
-        <!-- Horas bloqueadas -->
-        <div>
-          <div class="flex items-center justify-between mb-2">
-            <label class="block text-xs font-medium text-gray-600">Horas bloqueadas (almoço / pausa)</label>
-            <span class="text-[10px] text-gray-400">clique para alternar</span>
-          </div>
-          <input type="hidden" id="slot-blocked-raw" value="{{ tenant.blocked_hours or '12,13,14' }}"/>
-          <div id="slot-blocked-grid" class="grid grid-cols-6 gap-1.5"></div>
-          <p class="text-[11px] text-gray-400 mt-1">Aplica para <strong>todos</strong> os dias de atendimento.</p>
-        </div>
-
-        <!-- Bloqueio por dia da semana (ex: só terça às 17h) -->
-        <div>
-          <div class="flex items-center justify-between mb-2">
-            <label class="block text-xs font-medium text-gray-600">Bloquear hora em dia específico</label>
-            <span class="text-[10px] text-gray-400">só esse dia</span>
-          </div>
-          <input type="hidden" id="slot-blocked-by-day-raw" value='{{ tenant.blocked_hours_by_day or "" }}'/>
-          <div id="slot-blocked-by-day-grid" class="space-y-2"></div>
-          <p class="text-[11px] text-gray-400 mt-1">Ex.: deixar a terça às 17h indisponível sem afetar os outros dias.</p>
-        </div>
-
-        <!-- Datas bloqueadas (feriados/férias) -->
-        <div>
-          <label class="block text-xs font-medium text-gray-600 mb-1">Datas bloqueadas (feriados / férias)</label>
-          <div class="flex gap-2 mb-2">
-            <input id="slot-block-date" type="date"
-              class="flex-1 border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-brand"/>
-            <button type="button" onclick="addBlockedDate()"
-              class="bg-violet-50 text-brand border border-brand text-sm font-semibold px-3 py-2 rounded-lg active:scale-95 transition">
-              + Bloquear
+            <h2 class="rotulo-secao">Resumo</h2>
+            <button type="button" onclick="loadHomeInsights()" class="botao-sec !min-h-0 !py-1.5" aria-label="Atualizar resumo">
+              <svg class="icone !w-4 !h-4" aria-hidden="true"><use href="#i-atualizar"/></svg>Atualizar
             </button>
           </div>
-          <input type="hidden" id="slot-blocked-dates-raw" value="{{ tenant.blocked_dates or '' }}"/>
-          <div id="slot-blocked-dates-list" class="flex flex-wrap gap-1.5"></div>
-          <p class="text-[11px] text-gray-400 mt-1">O dia inteiro fica indisponível.</p>
+          <div id="hi-kpis" class="hidden grid grid-cols-2 lg:grid-cols-1 gap-3"></div>
+          <div id="hi-body" class="space-y-2.5"></div>
         </div>
+      </aside>
 
-        <div id="slot-config-feedback" class="hidden text-sm rounded-lg px-3 py-2"></div>
-        <div class="flex gap-2">
-          <button onclick="saveSlotConfig(this)"
-            class="flex-1 bg-brand text-white py-2.5 rounded-xl text-sm font-semibold">
-            💾 Salvar configuração
-          </button>
-          <button onclick="toggleSlotConfig()"
-            class="px-4 py-2.5 rounded-xl text-sm font-medium text-gray-500 border border-gray-200">
-            Fechar
+      <!-- C · Próximas consultas -->
+      <section class="min-w-0 lg:col-span-2 lg:row-start-2" aria-labelledby="titulo-proximas">
+        <div class="flex items-center justify-between gap-2 mb-3">
+          <h2 id="titulo-proximas" class="titulo-secao">Próximas consultas</h2>
+          <button type="button" onclick="loadAgenda()" class="botao-sec !min-h-0 !py-1.5">
+            <svg class="icone !w-4 !h-4" aria-hidden="true"><use href="#i-atualizar"/></svg>Atualizar
           </button>
         </div>
-        <p class="text-[11px] text-gray-400 leading-relaxed">
-          Para excluir um horário específico (ex: cancelar consulta), use a aba <strong>Agenda</strong>.
-          Para bloquear uma janela do dia (ex: almoço), marque as horas acima.
-          Para adicionar mais horários, aumente o intervalo Início–Fim ou marque mais dias.
-        </p>
+        <div class="mb-3">
+          <label for="agenda-search" class="sr-only">Buscar paciente</label>
+          <input id="agenda-search" type="search" placeholder="Buscar paciente por nome ou telefone"
+            oninput="filterAgenda()" autocomplete="off"
+            class="w-full bg-white border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand focus:border-brand"/>
+        </div>
+        <div id="agenda-list" class="space-y-3">
+          <div class="estado-carregando">Carregando…</div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+
+  <!-- Agenda e horários (E08A). A grade semanal nova é E10: aqui só os
+       componentes que já existem, reorganizados. Ids/handlers preservados. -->
+  <div id="pane-slots" class="tab-content">
+    <div class="flex items-center justify-between gap-2 mb-4">
+      <p class="text-sm text-gray-500">Horários livres que o agente pode oferecer e a agenda das próximas semanas.</p>
+      <button type="button" onclick="refreshSlotsTab(this)" class="botao-sec !min-h-0 !py-1.5 shrink-0">
+        <svg class="icone !w-4 !h-4" aria-hidden="true"><use href="#i-atualizar"/></svg>Atualizar
+      </button>
+    </div>
+
+    <div class="grid grid-cols-1 gap-5 lg:grid-cols-3 lg:items-start">
+
+      <!-- Configuração (recolhível) — no computador fica à direita -->
+      <section class="min-w-0 lg:col-start-3 lg:row-start-1 lg:sticky lg:top-24 cartao overflow-hidden" aria-labelledby="slot-config-toggle">
+        <button type="button" onclick="toggleSlotConfig()" id="slot-config-toggle"
+          aria-expanded="false" aria-controls="slot-config-body"
+          class="w-full flex items-center justify-between gap-3 px-4 py-3.5 text-left">
+          <span class="flex items-center gap-2.5 min-w-0">
+            <svg class="icone text-brand" aria-hidden="true"><use href="#i-config"/></svg>
+            <span class="min-w-0"><span class="block font-semibold text-sm text-gray-900">Configurar horários</span>
+              <span class="block text-[13px] text-gray-500">Atendimento da semana e bloqueios</span></span>
+          </span>
+          <span id="slot-config-arrow" class="text-gray-400 text-sm" aria-hidden="true">▼</span>
+        </button>
+        <div id="slot-config-body" class="hidden border-t border-gray-100 p-4 space-y-5">
+
+          <!-- 1 · Recorrente: vale para toda semana -->
+          <fieldset class="space-y-4">
+            <legend class="rotulo-secao mb-3">Atendimento recorrente · vale toda semana</legend>
+
+            <div>
+              <p class="block text-[13px] font-medium text-gray-700 mb-2" id="rot-dias">Dias de atendimento</p>
+              <div class="grid grid-cols-7 gap-1.5" role="group" aria-labelledby="rot-dias">
+                {% set wd_set = (tenant.working_days or '0,1,2,3,4').split(',') %}
+                {% set day_labels = [('0','Seg'),('1','Ter'),('2','Qua'),('3','Qui'),('4','Sex'),('5','Sáb'),('6','Dom')] %}
+                {% for v, lbl in day_labels %}
+                <label class="cursor-pointer">
+                  <input type="checkbox" class="peer sr-only slot-wd" value="{{ v }}" {% if v in wd_set %}checked{% endif %} onchange="renderBlockedByDay()"/>
+                  <div class="text-center text-[13px] font-medium py-2 rounded-lg border border-gray-300 bg-white text-gray-600 peer-checked:bg-brand peer-checked:text-white peer-checked:border-brand peer-focus-visible:ring-2 peer-focus-visible:ring-brand peer-focus-visible:ring-offset-2 transition">
+                    {{ lbl }}
+                  </div>
+                </label>
+                {% endfor %}
+              </div>
+            </div>
+
+            <div class="grid grid-cols-3 gap-2">
+              <div>
+                <label for="slot-start" class="block text-[13px] font-medium text-gray-700 mb-1">Início (h)</label>
+                <input id="slot-start" type="number" min="0" max="23" value="{{ tenant.working_hours_start }}"
+                  onchange="renderBlockedHours()"
+                  class="w-full border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+              </div>
+              <div>
+                <label for="slot-end" class="block text-[13px] font-medium text-gray-700 mb-1">Fim (h)</label>
+                <input id="slot-end" type="number" min="1" max="24" value="{{ tenant.working_hours_end }}"
+                  onchange="renderBlockedHours()" aria-describedby="ajuda-fim"
+                  class="w-full border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+              </div>
+              <div>
+                <label for="slot-duration" class="block text-[13px] font-medium text-gray-700 mb-1">Sessão (min)</label>
+                <input id="slot-duration" type="number" min="20" max="180" step="5" value="{{ tenant.session_minutes }}"
+                  class="w-full border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+              </div>
+            </div>
+            <p id="ajuda-fim" class="text-xs text-gray-500 -mt-2 leading-snug">Hora final é exclusiva: <b>22</b> permite sessões até as 21h.</p>
+
+            <div>
+              <div class="flex items-center justify-between mb-2">
+                <p class="text-[13px] font-medium text-gray-700">Pausa diária (almoço)</p>
+                <span class="text-xs text-gray-500">toque para alternar</span>
+              </div>
+              <input type="hidden" id="slot-blocked-raw" value="{{ tenant.blocked_hours or '12,13,14' }}"/>
+              <div id="slot-blocked-grid" class="grid grid-cols-6 gap-1.5"></div>
+              <p class="text-xs text-gray-500 mt-1">Vale para <strong>todos</strong> os dias de atendimento.</p>
+            </div>
+
+            <div>
+              <div class="flex items-center justify-between mb-2">
+                <p class="text-[13px] font-medium text-gray-700">Hora bloqueada em um dia da semana</p>
+                <span class="text-xs text-gray-500">só esse dia</span>
+              </div>
+              <input type="hidden" id="slot-blocked-by-day-raw" value='{{ tenant.blocked_hours_by_day or "" }}'/>
+              <div id="slot-blocked-by-day-grid" class="space-y-2"></div>
+              <p class="text-xs text-gray-500 mt-1">Ex.: deixar toda terça às 17h indisponível sem afetar os outros dias.</p>
+            </div>
+          </fieldset>
+
+          <!-- 2 · Pontual: datas específicas -->
+          <fieldset class="pt-4 border-t border-gray-100">
+            <legend class="rotulo-secao mb-3">Bloqueios pontuais · datas específicas</legend>
+            <label for="slot-block-date" class="block text-[13px] font-medium text-gray-700 mb-1">Feriados, férias, folgas</label>
+            <div class="flex gap-2 mb-2">
+              <input id="slot-block-date" type="date"
+                class="flex-1 min-w-0 border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
+              <button type="button" onclick="addBlockedDate()"
+                class="bg-brand-50 text-brand border border-brand text-sm font-semibold px-3 py-2 rounded-lg hover:bg-brand-100 transition shrink-0">
+                + Bloquear
+              </button>
+            </div>
+            <input type="hidden" id="slot-blocked-dates-raw" value="{{ tenant.blocked_dates or '' }}"/>
+            <div id="slot-blocked-dates-list" class="flex flex-wrap gap-1.5"></div>
+            <p class="text-xs text-gray-500 mt-1">O dia inteiro fica indisponível.</p>
+          </fieldset>
+
+          <div id="slot-config-feedback" class="hidden text-sm rounded-lg px-3 py-2" role="status"></div>
+          <div class="flex gap-2">
+            <button type="button" onclick="saveSlotConfig(this)"
+              class="flex-1 bg-brand hover:bg-brand-700 text-white py-2.5 rounded-xl text-sm font-semibold transition">
+              Salvar configuração
+            </button>
+            <button type="button" onclick="toggleSlotConfig()"
+              class="px-4 py-2.5 rounded-xl text-sm font-medium text-gray-600 border border-gray-300 hover:bg-gray-50">
+              Fechar
+            </button>
+          </div>
+          <p class="text-xs text-gray-500 leading-relaxed">
+            Para cancelar uma consulta específica, use a página <strong>Início</strong>.
+            Para mais horários, aumente o intervalo Início–Fim ou marque mais dias.
+          </p>
+        </div>
+      </section>
+
+      <!-- Listas: o que existe hoje (horários livres + agenda das semanas) -->
+      <div class="min-w-0 lg:col-span-2 lg:row-start-1 space-y-6">
+        <section aria-labelledby="titulo-livres">
+          <h2 id="titulo-livres" class="titulo-secao mb-3">Próximos horários livres</h2>
+          <div id="slots-list" class="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            <div class="estado-carregando col-span-2 sm:col-span-3">Carregando…</div>
+          </div>
+        </section>
+        <section aria-labelledby="titulo-semanas">
+          <h2 id="titulo-semanas" class="titulo-secao mb-3">Agenda das próximas semanas</h2>
+          <div id="weekly-list" class="space-y-3">
+            <div class="estado-carregando">Carregando…</div>
+          </div>
+        </section>
       </div>
-    </div>
 
-    <p class="text-xs text-gray-500 mb-2">Próximos horários livres</p>
-    <div id="slots-list" class="grid grid-cols-2 md:grid-cols-3 gap-3 mb-6">
-      <div class="text-gray-400 text-sm col-span-2 md:col-span-3 text-center py-4">Carregando...</div>
-    </div>
-    <p class="text-xs text-gray-500 mb-2">Agenda das próximas semanas</p>
-    <div id="weekly-list" class="space-y-3">
-      <div class="text-gray-400 text-sm text-center py-6">Carregando...</div>
     </div>
   </div>
 
   <!-- Conversas -->
   <div id="pane-conversas" class="tab-content">
-    <div class="flex items-center justify-between mb-4 mt-4 md:mt-0">
-      <h2 class="text-base font-semibold text-gray-800">Conversas</h2>
-    </div>
-    <div class="grid md:grid-cols-3 gap-3">
-      <div id="conv-list" class="space-y-2 md:col-span-1"></div>
-      <div id="conv-detail" class="md:col-span-2 bg-white rounded-xl border border-gray-200 p-4 min-h-48">
-        <p class="text-gray-400 text-sm">Selecione uma conversa</p>
+    <h2 class="sr-only">Conversas</h2>
+    <p class="text-sm text-gray-500 mb-4">Mensagens trocadas pelo agente no WhatsApp, por paciente.</p>
+    <div class="grid md:grid-cols-3 gap-4">
+      <div id="conv-list" class="space-y-2 md:col-span-1" aria-label="Pacientes com conversa"></div>
+      <div id="conv-detail" class="md:col-span-2 cartao p-4 min-h-48" aria-live="polite">
+        <div class="estado-vazio !border-0 !bg-transparent min-h-40">Selecione uma conversa na lista para ver as mensagens.</div>
       </div>
     </div>
   </div>
 
   <!-- Config -->
   <div id="pane-config" class="tab-content">
-    <div class="mb-4 mt-4 md:mt-0">
-      <h2 class="text-lg font-extrabold text-slate-800 tracking-tight">Configurações</h2>
-      <p class="text-xs text-slate-400 mt-0.5">Ajuste sua conta por assunto — escolha uma seção abaixo.</p>
-    </div>
+    <h2 class="sr-only">Configurações</h2>
 
     <!-- Sub-menu da aba Config (evita rolar a página inteira) -->
-    <div id="config-subnav" class="flex flex-nowrap gap-2 overflow-x-auto pb-2 mb-5 -mx-1 px-1">
+    <div id="config-subnav" class="flex flex-nowrap gap-2 overflow-x-auto pb-2 mb-5 -mx-1 px-1" role="navigation" aria-label="Seções das configurações">
       <button type="button" data-sec="geral" onclick="showConfigSection('geral')"
-        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-brand text-white">📊 Geral</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-full text-[13.5px] font-semibold border border-gray-300 transition hover:border-brand-300 bg-brand text-white border-brand" aria-current="true">📊 Geral</button>
       <button type="button" data-sec="whatsapp" onclick="showConfigSection('whatsapp')"
-        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">📲 WhatsApp</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-full text-[13.5px] font-semibold border border-gray-300 transition hover:border-brand-300 bg-white text-gray-600">📲 WhatsApp</button>
       <button type="button" data-sec="mensagens" onclick="showConfigSection('mensagens')"
-        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">✏️ Mensagens</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-full text-[13.5px] font-semibold border border-gray-300 transition hover:border-brand-300 bg-white text-gray-600">✏️ Mensagens</button>
       <button type="button" data-sec="cobranca" onclick="showConfigSection('cobranca')"
-        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">💰 Cobrança</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-full text-[13.5px] font-semibold border border-gray-300 transition hover:border-brand-300 bg-white text-gray-600">💰 Cobrança</button>
       <button type="button" data-sec="integracoes" onclick="showConfigSection('integracoes')"
-        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">🔗 Integrações</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-full text-[13.5px] font-semibold border border-gray-300 transition hover:border-brand-300 bg-white text-gray-600">🔗 Integrações</button>
       <button type="button" data-sec="conta" onclick="showConfigSection('conta')"
-        class="csub flex-shrink-0 px-4 py-2 rounded-xl text-[13px] font-semibold border border-slate-200 shadow-sm transition bg-white text-gray-600">💳 Conta</button>
+        class="csub flex-shrink-0 px-4 py-2 rounded-full text-[13.5px] font-semibold border border-gray-300 transition hover:border-brand-300 bg-white text-gray-600">💳 Conta</button>
     </div>
 
     <!-- ═══ Sub-seção: Geral ═══ -->
     <div class="config-section active" id="cfgsec-geral">
 
     <!-- Indicadores do mês -->
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mb-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mb-4">
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center gap-2">
           <span class="text-xl">📊</span>
@@ -372,7 +451,7 @@
         <div class="text-gray-400 text-sm text-center py-4">Carregando…</div>
       </div>
     </div>
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg space-y-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl space-y-4">
       <div>
         <label class="block text-sm font-medium text-gray-700 mb-1">Nome do consultório</label>
         <input id="cfg-name" type="text" value="{{ tenant.name }}"
@@ -393,7 +472,7 @@
           <label class="block text-sm font-medium text-gray-700 mb-1">Fim</label>
           <input id="cfg-end" type="number" min="0" max="24" value="{{ tenant.working_hours_end }}"
             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
-          <p class="text-[11px] text-gray-400 mt-1 leading-tight">Hora final (exclusiva). Ex.: <b>22</b> permite sessões até as 21h.</p>
+          <p class="text-xs text-gray-400 mt-1 leading-tight">Hora final (exclusiva). Ex.: <b>22</b> permite sessões até as 21h.</p>
         </div>
       </div>
       <div>
@@ -475,7 +554,7 @@
 
     {% if evolution_enabled %}
     <!-- Conexão automática (Evolution) — cliente lê só o QR -->
-    <div class="bg-white rounded-xl border-2 border-green-300 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-xl border-2 border-green-300 p-5 max-w-3xl mt-4">
       <div class="flex items-center justify-between mb-1">
         <div class="flex items-center gap-2">
           <span class="text-xl">⚡</span>
@@ -515,7 +594,7 @@
     {% if on_evolution %}
     <!-- Conta na conexão automática: Z-API fica recolhido (evita salvar por
          engano e trocar o provider, o que derruba o envio do agente). -->
-    <details class="max-w-lg mt-4">
+    <details class="max-w-3xl mt-4">
       <summary class="text-xs text-gray-400 cursor-pointer select-none">
         Opções avançadas — usar meu próprio Z-API
       </summary>
@@ -526,7 +605,7 @@
     {% endif %}
 
     <!-- WhatsApp Z-API -->
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mt-4">
       <div class="flex items-center gap-2 mb-1">
         <span class="text-xl">📲</span>
         <h3 class="font-semibold text-gray-800 text-sm">WhatsApp (Z-API)</h3>
@@ -569,7 +648,7 @@
     </div>
 
     <!-- Conectar o WhatsApp (parear via QR no próprio painel) -->
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mt-4">
       <div class="flex items-center justify-between mb-1">
         <div class="flex items-center gap-2">
           <span class="text-xl">🔗</span>
@@ -607,7 +686,7 @@
     <div class="config-section" id="cfgsec-mensagens">
 
     <!-- Mensagens personalizáveis -->
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mt-4">
       <div class="flex items-center gap-2 mb-1">
         <span class="text-xl">✏️</span>
         <h3 class="font-semibold text-gray-800 text-sm">Mensagens do agente</h3>
@@ -655,7 +734,7 @@
 
     <!-- Assinatura -->
     {% if tenant.stripe_subscription_id or tenant.mp_subscription_id or tenant.free_until %}
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">💳</span>
         <div class="flex-1">
@@ -699,7 +778,7 @@
     {% endif %}
 
     <!-- Painel Mobile -->
-    <div class="bg-white rounded-xl border border-brand/30 p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-xl border border-brand/30 p-5 max-w-3xl mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">📱</span>
         <div>
@@ -725,7 +804,7 @@
     <div class="config-section" id="cfgsec-cobranca">
 
     <!-- Confirmações -->
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">📨</span>
         <div>
@@ -734,7 +813,7 @@
         </div>
       </div>
       <button onclick="exportBilling()" id="btn-export-csv"
-        class="w-full mb-2 border border-brand text-brand py-2.5 rounded-lg text-sm font-semibold hover:bg-violet-50 transition">
+        class="w-full mb-2 border border-brand text-brand py-2.5 rounded-lg text-sm font-semibold hover:bg-brand-50 transition">
         📥 Exportar CSV do mês
       </button>
       <button onclick="dispararConfirmacoes()" id="btn-confirmar"
@@ -745,7 +824,7 @@
     </div>
 
     <!-- Cobrança Mensal -->
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">💰</span>
         <div>
@@ -753,14 +832,14 @@
           <p class="text-xs text-gray-500">Envia resumo de sessões e valor para cada paciente cadastrado com preço</p>
         </div>
       </div>
-      <div class="flex items-center gap-3 mb-3">
-        <div class="flex-1">
-          <label class="block text-xs text-gray-500 mb-1">Mês de referência</label>
+      <div class="flex flex-wrap items-end gap-3 mb-3">
+        <div class="flex-1 min-w-[180px]">
+          <label for="billing-month" class="block text-xs text-gray-500 mb-1">Mês de referência</label>
           <input type="month" id="billing-month" onchange="loadBillingPreview()"
             class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
         </div>
         <button onclick="dispararCobrancas()" id="btn-cobrar"
-          class="mt-5 bg-brand text-white px-4 py-2 rounded-lg text-sm font-semibold hover:opacity-90 transition flex-shrink-0">
+          class="bg-brand hover:bg-brand-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition flex-shrink-0">
           Enviar cobranças
         </button>
       </div>
@@ -770,7 +849,7 @@
       <div class="flex items-center justify-between gap-3 mb-3 p-3 rounded-lg bg-gray-50 border border-gray-100">
         <div>
           <p class="text-xs font-semibold text-gray-700">🔕 Pausar todas as cobranças</p>
-          <p class="text-[11px] text-gray-400">Suspende envios automáticos e manuais até retomar.</p>
+          <p class="text-xs text-gray-400">Suspende envios automáticos e manuais até retomar.</p>
         </div>
         <button onclick="toggleGlobalBilling()" id="global-billing-btn"
           class="text-xs font-semibold px-3 py-1.5 rounded-lg transition bg-gray-100 text-gray-500 hover:bg-gray-200 flex-shrink-0">
@@ -787,34 +866,34 @@
             <button onclick="loadBillingPreview()" class="text-xs text-brand">↻ Atualizar</button>
           </div>
         </div>
-        <p class="text-[11px] text-gray-400 mb-2">Calculado pela agenda do mês. Clique no valor para ajustar · ➕ inclui sessão extra/paciente novo · ✓ já cobrado · ⏸ pausado · ⚠ sem valor.</p>
+        <p class="text-xs text-gray-400 mb-2">Calculado pela agenda do mês. Clique no valor para ajustar · ➕ inclui sessão extra/paciente novo · ✓ já cobrado · ⏸ pausado · ⚠ sem valor.</p>
 
         <!-- Form de cobrança avulsa (oculto por padrão) -->
-        <div id="manual-billing-form" class="hidden mb-3 p-3 rounded-lg bg-purple-50 border border-purple-100">
-          <p class="text-xs font-semibold text-purple-700 mb-2">➕ Nova cobrança avulsa <span id="manual-form-month" class="text-purple-400 font-normal"></span></p>
+        <div id="manual-billing-form" class="hidden mb-3 p-3 rounded-lg bg-brand-50 border border-brand-100">
+          <p class="text-xs font-semibold text-brand-800 mb-2">➕ Nova cobrança avulsa <span id="manual-form-month" class="text-brand-700 font-normal"></span></p>
           <div class="grid grid-cols-2 gap-2">
             <div class="col-span-2">
-              <label class="block text-[11px] text-gray-500 mb-0.5">Nome do paciente *</label>
+              <label class="block text-xs text-gray-500 mb-0.5">Nome do paciente *</label>
               <input id="manual-name" type="text" placeholder="Ex.: Maria Souza"
                 class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
             </div>
             <div>
-              <label class="block text-[11px] text-gray-500 mb-0.5">WhatsApp (opcional)</label>
+              <label class="block text-xs text-gray-500 mb-0.5">WhatsApp (opcional)</label>
               <input id="manual-phone" type="tel" placeholder="55119..."
                 class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
             </div>
             <div>
-              <label class="block text-[11px] text-gray-500 mb-0.5">Nº de sessões</label>
+              <label class="block text-xs text-gray-500 mb-0.5">Nº de sessões</label>
               <input id="manual-sessions" type="number" min="0" value="1"
                 class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
             </div>
             <div class="col-span-2">
-              <label class="block text-[11px] text-gray-500 mb-0.5">Valor total (R$) *</label>
+              <label class="block text-xs text-gray-500 mb-0.5">Valor total (R$) *</label>
               <input id="manual-total" type="number" min="0" step="0.01" placeholder="0,00"
                 class="w-full border border-gray-300 rounded-lg px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-brand"/>
             </div>
           </div>
-          <p class="text-[11px] text-gray-400 mt-1.5">Sem WhatsApp = só entra no total (não envia). Com WhatsApp = enviada no próximo disparo, uma única vez.</p>
+          <p class="text-xs text-gray-400 mt-1.5">Sem WhatsApp = só entra no total (não envia). Com WhatsApp = enviada no próximo disparo, uma única vez.</p>
           <div class="flex gap-2 mt-2">
             <button onclick="saveManualBilling()" id="manual-save-btn"
               class="bg-brand text-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:opacity-90">Salvar</button>
@@ -830,7 +909,7 @@
       <!-- Histórico de cobranças efetivamente enviadas no mês selecionado -->
       <div class="border-t border-gray-100 pt-3 mt-3">
         <p class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">Histórico de envios do mês</p>
-        <p class="text-[11px] text-gray-400 mb-2">Cobranças que já foram disparadas para este mês de referência (data, paciente e valor).</p>
+        <p class="text-xs text-gray-400 mb-2">Cobranças que já foram disparadas para este mês de referência (data, paciente e valor).</p>
         <div id="billing-history" class="overflow-x-auto">
           <p class="text-xs text-gray-400 text-center py-3">Carregando...</p>
         </div>
@@ -843,7 +922,7 @@
     <div class="config-section" id="cfgsec-integracoes">
 
     <!-- Documentação -->
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mt-4">
       <div class="flex items-center gap-3 mb-4">
         <span class="text-2xl">📚</span>
         <div>
@@ -853,11 +932,11 @@
       </div>
       <div class="space-y-2">
         <a href="/static/primeiros_passos.pdf" target="_blank"
-          class="flex items-center gap-3 w-full border border-brand/30 bg-violet-50 text-brand px-4 py-3 rounded-xl text-sm font-medium hover:bg-violet-100 transition">
+          class="flex items-center gap-3 w-full border border-brand/30 bg-brand-50 text-brand px-4 py-3 rounded-xl text-sm font-medium hover:bg-brand-100 transition">
           <span class="text-xl">🚀</span>
           <div class="text-left flex-1">
             <div class="font-semibold">Guia de Primeiros Passos</div>
-            <div class="text-xs text-violet-400 font-normal">Z-API, agenda, configuração inicial</div>
+            <div class="text-xs text-brand-700 font-normal">Z-API, agenda, configuração inicial</div>
           </div>
           <span class="text-xs text-brand font-semibold">Baixar PDF</span>
         </a>
@@ -874,7 +953,7 @@
     </div>
 
     <!-- Google Calendar -->
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">📅</span>
         <div>
@@ -904,7 +983,7 @@
     </div>
 
     <!-- CalDAV (Apple iCloud, Outlook, Nextcloud...) -->
-    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-lg mt-4">
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 max-w-3xl mt-4">
       <div class="flex items-center gap-3 mb-3">
         <span class="text-2xl">🗓️</span>
         <div>
@@ -1101,14 +1180,15 @@
     </div>
   </div>
 
-</div>
+</main>
+</div><!-- /area-principal -->
 
 <!-- Modal: Nova Consulta -->
-<div id="modal-appt" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4">
+<div id="modal-appt" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="modal-appt-titulo">
   <div class="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
     <div class="flex items-center justify-between mb-5">
-      <h3 class="text-base font-semibold text-gray-800">Nova consulta</h3>
-      <button onclick="closeNewAppt()" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+      <h3 id="modal-appt-titulo" class="text-base font-semibold text-gray-800">Nova consulta</h3>
+      <button type="button" onclick="closeNewAppt()" class="botao-fechar" aria-label="Fechar">✕</button>
     </div>
     <div class="space-y-4">
       <div>
@@ -1171,11 +1251,11 @@
 </div>
 
 <!-- Modal: Reagendar -->
-<div id="modal-reschedule" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4">
+<div id="modal-reschedule" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="modal-reschedule-titulo">
   <div class="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
     <div class="flex items-center justify-between mb-5">
-      <h3 class="text-base font-semibold text-gray-800">🔄 Reagendar consulta</h3>
-      <button onclick="closeReschedule()" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+      <h3 id="modal-reschedule-titulo" class="text-base font-semibold text-gray-800">🔄 Reagendar consulta</h3>
+      <button type="button" onclick="closeReschedule()" class="botao-fechar" aria-label="Fechar">✕</button>
     </div>
     <input type="hidden" id="rs-appt-id"/>
     <div class="space-y-4">
@@ -1205,11 +1285,11 @@
 </div>
 
 <!-- Modal: Editar nome do paciente -->
-<div id="modal-rename" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4">
+<div id="modal-rename" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="modal-rename-titulo">
   <div class="bg-white rounded-2xl w-full max-w-md p-6 shadow-xl">
     <div class="flex items-center justify-between mb-5">
-      <h3 class="text-base font-semibold text-gray-800">✏️ Editar nome do paciente</h3>
-      <button onclick="closeRename()" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+      <h3 id="modal-rename-titulo" class="text-base font-semibold text-gray-800">✏️ Editar nome do paciente</h3>
+      <button type="button" onclick="closeRename()" class="botao-fechar" aria-label="Fechar">✕</button>
     </div>
     <input type="hidden" id="rn-appt-id"/>
     <div class="space-y-4">
@@ -1240,11 +1320,11 @@
 </div>
 
 <!-- Modal: Histórico do paciente -->
-<div id="modal-history" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4">
+<div id="modal-history" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="modal-history-titulo">
   <div class="bg-white rounded-2xl w-full max-w-lg p-5 shadow-xl max-h-[85vh] overflow-y-auto">
     <div class="flex items-center justify-between mb-3 sticky top-0 bg-white">
-      <h3 class="text-base font-semibold text-gray-800">📋 Histórico — <span id="history-title"></span></h3>
-      <button onclick="closeHistory()" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+      <h3 id="modal-history-titulo" class="text-base font-semibold text-gray-800">📋 Histórico — <span id="history-title"></span></h3>
+      <button type="button" onclick="closeHistory()" class="botao-fechar" aria-label="Fechar">✕</button>
     </div>
     <p class="text-xs text-gray-500 mb-3">Sessões agrupadas por mês. "cobr." = sessões que entram na cobrança.</p>
     <div id="history-body"></div>
@@ -1252,47 +1332,38 @@
 </div>
 
 <!-- Modal: lista do resumo de hoje (clicando nos cards) -->
-<div id="modal-summary" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4">
+<div id="modal-summary" class="hidden fixed inset-0 bg-black/50 z-50 flex items-end md:items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="modal-summary-titulo">
   <div class="bg-white rounded-2xl w-full max-w-lg p-5 shadow-xl max-h-[85vh] overflow-y-auto">
     <div class="flex items-center justify-between mb-3 sticky top-0 bg-white">
-      <h3 class="text-base font-semibold text-gray-800"><span id="summary-title"></span></h3>
-      <button onclick="closeSummary()" class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+      <h3 id="modal-summary-titulo" class="text-base font-semibold text-gray-800"><span id="summary-title"></span></h3>
+      <button type="button" onclick="closeSummary()" class="botao-fechar" aria-label="Fechar">✕</button>
     </div>
     <div id="summary-body"></div>
   </div>
 </div>
 
-<!-- Mobile bottom nav -->
-<nav class="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 z-40">
-  <div class="grid grid-cols-5">
-    <button onclick="showTab('agenda')" id="mtab-agenda"
-      class="mtab flex flex-col items-center py-2 text-brand">
-      <span class="text-xl relative">📅
-        <span id="mbadge-agenda" class="badge absolute -top-1 -right-2 bg-brand text-white text-xs rounded-full w-4 h-4 items-center justify-center text-[10px]">0</span>
-      </span>
-      <span class="text-xs font-medium">Agenda</span>
+<!-- Navegação inferior (celular e tablet, <1024px): ícone + rótulo sempre -->
+<nav class="nav-inferior" aria-label="Seções do painel">
+  <div class="grid grid-cols-6 max-w-3xl mx-auto">
+    <button type="button" onclick="irPara('agenda')" id="mtab-agenda" class="mtab item-nav-inferior" aria-current="page">
+      <svg class="icone" aria-hidden="true"><use href="#i-inicio"/></svg><span>Início</span>
+      <span id="mbadge-agenda" class="badge" aria-label="novos agendamentos">0</span>
     </button>
-    <button onclick="showTab('slots')" id="mtab-slots"
-      class="mtab flex flex-col items-center py-2 text-gray-400">
-      <span class="text-xl">🕐</span>
-      <span class="text-xs">Horários</span>
+    <button type="button" onclick="irPara('slots')" id="mtab-slots" class="mtab item-nav-inferior">
+      <svg class="icone" aria-hidden="true"><use href="#i-agenda"/></svg><span>Agenda</span>
     </button>
-    <button onclick="showTab('conversas')" id="mtab-conversas"
-      class="mtab flex flex-col items-center py-2 text-gray-400">
-      <span class="text-xl relative">💬
-        <span id="mbadge-msg" class="badge absolute -top-1 -right-2 bg-brand text-white text-xs rounded-full w-4 h-4 items-center justify-center text-[10px]">0</span>
-      </span>
-      <span class="text-xs">Conversas</span>
+    <button type="button" onclick="irPara('conversas')" id="mtab-conversas" class="mtab item-nav-inferior">
+      <svg class="icone" aria-hidden="true"><use href="#i-conversas"/></svg><span>Conversas</span>
+      <span id="mbadge-msg" class="badge" aria-label="mensagens novas">0</span>
     </button>
-    <button onclick="showTab('contratos')" id="mtab-contratos"
-      class="mtab flex flex-col items-center py-2 text-gray-400">
-      <span class="text-xl">📄</span>
-      <span class="text-xs">Contratos</span>
+    <button type="button" onclick="irPara('contratos')" id="mtab-contratos" class="mtab item-nav-inferior">
+      <svg class="icone" aria-hidden="true"><use href="#i-contratos"/></svg><span>Contratos</span>
     </button>
-    <button onclick="showTab('config')" id="mtab-config"
-      class="mtab flex flex-col items-center py-2 text-gray-400">
-      <span class="text-xl">⚙️</span>
-      <span class="text-xs">Config</span>
+    <button type="button" onclick="irPara('cobranca')" id="mtab-cobranca" class="mtab item-nav-inferior">
+      <svg class="icone" aria-hidden="true"><use href="#i-cobrancas"/></svg><span>Cobranças</span>
+    </button>
+    <button type="button" onclick="irPara('config')" id="mtab-config" class="mtab item-nav-inferior" aria-label="Configurações">
+      <svg class="icone" aria-hidden="true"><use href="#i-config"/></svg><span>Ajustes</span>
     </button>
   </div>
 </nav>
@@ -1326,8 +1397,17 @@ function showToast(msg, type="info") {
 }
 
 // ── SSE — eventos em tempo real ───────────────────────────────────────────────
+// Selo da barra superior: estado REAL da conexão de atualização ao vivo.
+function _seloAoVivo(estado) {
+  const el = document.getElementById("status-dot");
+  if (!el) return;
+  const textos = { conectado: "Ao vivo", conectando: "Conectando…", reconectando: "Reconectando…" };
+  el.dataset.estado = estado;
+  el.textContent = textos[estado] || "";
+}
 function connectSSE() {
   const es = new EventSource(`/dashboard/stream/${SLUG}?token=${TOKEN}`);
+  es.onopen = () => _seloAoVivo("conectado");
   es.onmessage = e => {
     const ev = JSON.parse(e.data);
     if (ev.type === "connected") return;
@@ -1352,24 +1432,75 @@ function connectSSE() {
       }
     }
   };
-  es.onerror = () => setTimeout(connectSSE, 5000);
+  es.onerror = () => { _seloAoVivo("reconectando"); es.close(); setTimeout(connectSSE, 5000); };
 }
 
+// Esc fecha o diálogo aberto, usando a mesma função do botão "fechar".
+const _FECHAR_MODAL = {
+  "modal-appt": () => closeNewAppt(), "modal-reschedule": () => closeReschedule(),
+  "modal-rename": () => closeRename(), "modal-history": () => closeHistory(),
+  "modal-summary": () => closeSummary(), "modal-welcome": () => closeWelcome(),
+};
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  for (const [id, fechar] of Object.entries(_FECHAR_MODAL)) {
+    const m = document.getElementById(id);
+    if (m && !m.classList.contains("hidden")) { fechar(); break; }
+  }
+});
+
 // ── Tabs ──────────────────────────────────────────────────────────────────────
+// Navegação (E08A): o item ativo é marcado com aria-current — o estilo vem
+// de tokens.css. "Cobranças" não é aba própria: abre Configurações direto na
+// subseção de cobrança, que é onde a função existe.
+const TITULOS_SECAO = {
+  agenda: "Início", slots: "Agenda e horários", conversas: "Conversas",
+  contratos: "Contratos", cobranca: "Cobranças", config: "Configurações",
+};
+const NOME_CLINICA = document.title.split(" — ")[0];
+function _secaoConfigAtual() {
+  const ativa = document.querySelector(".config-section.active");
+  return ativa ? ativa.id.replace("cfgsec-", "") : "";
+}
+function _marcarNavAtivo(nome) {
+  document.querySelectorAll(".dtab, .mtab").forEach(b => b.removeAttribute("aria-current"));
+  ["dtab-", "mtab-"].forEach(p => {
+    const b = document.getElementById(p + nome);
+    if (b) b.setAttribute("aria-current", "page");
+  });
+  const titulo = TITULOS_SECAO[nome];
+  const h1 = document.getElementById("titulo-pagina");
+  if (h1 && titulo) h1.textContent = titulo;
+  if (titulo) document.title = NOME_CLINICA + " — " + titulo;
+}
+function irPara(destino) {
+  if (destino === "cobranca") {
+    showTab("config");
+    showConfigSection("cobranca");
+  } else {
+    // "Configurações" nunca abre parado na subseção de cobrança.
+    if (destino === "config" && _secaoConfigAtual() === "cobranca") showConfigSection("geral");
+    showTab(destino);
+  }
+  window.scrollTo({ top: 0 });
+}
+function alternarMenu() {
+  const recolher = document.documentElement.dataset.menu !== "recolhido";
+  if (recolher) document.documentElement.dataset.menu = "recolhido";
+  else delete document.documentElement.dataset.menu;
+  const btn = document.getElementById("botao-recolher");
+  if (btn) {
+    btn.setAttribute("aria-expanded", recolher ? "false" : "true");
+    btn.setAttribute("aria-label", recolher ? "Expandir menu" : "Recolher menu");
+  }
+  try { localStorage.setItem("painel-menu", recolher ? "recolhido" : ""); } catch (e) {}
+}
+
 function showTab(name) {
   document.querySelectorAll(".tab-content").forEach(p => p.classList.remove("active"));
   document.getElementById("pane-"+name).classList.add("active");
 
-  document.querySelectorAll(".dtab").forEach(b => {
-    b.classList.remove("border-brand","text-brand");
-    b.classList.add("border-transparent","text-gray-500");
-  });
-  const dtab = document.getElementById("dtab-"+name);
-  if (dtab) { dtab.classList.add("border-brand","text-brand"); dtab.classList.remove("border-transparent","text-gray-500"); }
-
-  document.querySelectorAll(".mtab").forEach(b => b.classList.replace("text-brand","text-gray-400"));
-  const mtab = document.getElementById("mtab-"+name);
-  if (mtab) mtab.classList.replace("text-gray-400","text-brand");
+  _marcarNavAtivo(name === "config" && _secaoConfigAtual() === "cobranca" ? "cobranca" : name);
 
   if (name==="agenda")    { loadAgenda(); loadHomeInsights(); newAppointments=0; updateBadge("agenda",0); }
   if (name==="slots")     { loadSlots(); loadWeekly(); renderBlockedHours(); renderBlockedDates(); }
@@ -1387,9 +1518,14 @@ function showConfigSection(sec) {
     const on = b.getAttribute("data-sec") === sec;
     b.classList.toggle("bg-brand", on);
     b.classList.toggle("text-white", on);
+    b.classList.toggle("border-brand", on);
     b.classList.toggle("bg-white", !on);
     b.classList.toggle("text-gray-600", !on);
+    if (on) b.setAttribute("aria-current", "true"); else b.removeAttribute("aria-current");
   });
+  // Com a aba Config aberta, a navegação principal acompanha a subseção.
+  const paneCfg = document.getElementById("pane-config");
+  if (paneCfg && paneCfg.classList.contains("active")) _marcarNavAtivo(sec === "cobranca" ? "cobranca" : "config");
   // Rola o topo da aba Config para a seção escolhida ficar visível.
   const subnav = document.getElementById("config-subnav");
   if (subnav) subnav.scrollIntoView({ block: "nearest" });
@@ -1573,8 +1709,8 @@ function renderContractsList() {
       <div class="min-w-0">
         <div class="flex items-center gap-2">
           <span class="${nameCls}">${nm}</span>
-          <span class="text-[11px] px-2 py-0.5 rounded-full ${st.cls}">${st.label}</span>
-          <span class="text-[11px] text-gray-400">v${c.template_version||0}</span>
+          <span class="text-xs px-2 py-0.5 rounded-full ${st.cls}">${st.label}</span>
+          <span class="text-xs text-gray-400">v${c.template_version||0}</span>
         </div>
         <div class="text-xs text-gray-500">${dateInfo}</div>
       </div>
@@ -1712,21 +1848,21 @@ function _hiKpiShort(v) {
 }
 function _hiKpiTile(val, label, tab) {
   const clk = tab
-    ? ' cursor-pointer hover:bg-white/20 transition" role="button" tabindex="0" title="Abrir"'
+    ? ' cursor-pointer" role="button" tabindex="0" title="Abrir"'
       + ' onclick="_hiGoTab(\'' + tab + '\',event)" onkeydown="_hiGoTab(\'' + tab + '\',event)'
     : '';
-  return '<div class="rounded-xl bg-white/10 ring-1 ring-white/10 px-2 py-2 text-center' + clk + '">'
-    + '<p class="text-white text-lg font-extrabold leading-none">' + val + '</p>'
-    + '<p class="text-white/60 text-[10px] mt-1 leading-tight">' + label + '</p></div>';
+  return '<div class="indicador' + clk + '">'
+    + '<div class="min-w-0"><p class="indicador-valor text-gray-900">' + val + '</p>'
+    + '<p class="indicador-rotulo">' + label + '</p></div></div>';
 }
 function _hiRenderKpis(items) {
   const el = document.getElementById("hi-kpis");
   if (!el) return;
   const byId = {}; items.forEach(it => { byId[it.id] = it; });
   const tiles = [];
-  if (byId.today) tiles.push(_hiKpiTile(byId.today.count != null ? byId.today.count : "—", "sessões hoje", "agenda"));
-  if (byId.occupancy) tiles.push(_hiKpiTile((byId.occupancy.value != null ? byId.occupancy.value : 0) + "%", "ocupação 7d", "agenda"));
-  if (byId.revenue) tiles.push(_hiKpiTile("R$ " + _hiKpiShort(byId.revenue.value), "previsto/mês", "config"));
+  // "sessões hoje" saiu daqui: o mesmo número já está no quadro "Hoje".
+  if (byId.occupancy) tiles.push(_hiKpiTile((byId.occupancy.value != null ? byId.occupancy.value : 0) + "%", "ocupação nos próximos 7 dias", "slots"));
+  if (byId.revenue) tiles.push(_hiKpiTile("R$ " + _hiKpiShort(byId.revenue.value), "previsto no mês", "cobranca"));
   if (tiles.length) { el.innerHTML = tiles.join(""); el.classList.remove("hidden"); }
   else { el.classList.add("hidden"); }
 }
@@ -1735,12 +1871,12 @@ const HI_TAB = {
   today: "agenda", occupancy: "agenda", no_shows: "agenda",
   reschedules: "agenda", cancellations: "agenda", confirmations: "agenda",
   reminder_effectiveness: "agenda", no_return: "conversas",
-  revenue: "config", contracts: "contratos",
+  revenue: "cobranca", contracts: "contratos",
 };
 function _hiGoTab(tab, ev) {
   if (ev && ev.type === "keydown" && ev.key !== "Enter" && ev.key !== " ") return;
   if (ev) ev.preventDefault();
-  if (typeof showTab === "function") showTab(tab);
+  irPara(tab);
 }
 function loadHomeInsights() {
   const box = document.getElementById("home-insights");
@@ -1764,7 +1900,7 @@ function loadHomeInsights() {
       const cardBorder = attention ? "border-amber-200" : "border-slate-100";
       const iconWrap   = attention ? "bg-amber-50 border-amber-100" : "bg-brand-50 border-brand-100";
       const badge = attention
-        ? '<span class="text-[10px] font-bold uppercase tracking-wide text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded">Atenção</span>'
+        ? '<span class="text-xs font-bold uppercase tracking-wide text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded">Atenção</span>'
         : '';
       const tab = HI_TAB[it.id];
       const clickCls = tab ? ' cursor-pointer hover:shadow-md hover:border-brand-200 transition' : '';
@@ -1786,10 +1922,23 @@ function loadHomeInsights() {
   }).catch(() => { /* fail-safe: sem resumo, o painel segue normal */ });
 }
 
+// Quadro "Hoje": mesmas contagens de antes, mas sempre visível — com zero
+// consultas ele mostra zeros em vez de sumir (o dia vazio também é informação).
+function _resumoHoje(todayAppts) {
+  const att = todayAppts.filter(a => (a.attendance||'pending') === 'attended').length;
+  const missed = todayAppts.filter(a => (a.attendance||'pending').startsWith('missed')).length;
+  const pend = todayAppts.filter(a => (a.attendance||'pending') === 'pending').length;
+  document.getElementById('sum-total').textContent = todayAppts.length;
+  document.getElementById('sum-attended').textContent = att;
+  document.getElementById('sum-missed').textContent = missed;
+  document.getElementById('sum-pending').textContent = pend;
+  document.getElementById('agenda-summary').classList.remove('hidden');
+}
+
 function loadAgenda() {
   const el = document.getElementById("agenda-list");
   // Feedback visual claro do "Atualizar"
-  el.innerHTML = '<div class="text-gray-400 text-sm text-center py-8">⏳ Carregando…</div>';
+  el.innerHTML = '<div class="estado-carregando">Carregando…</div>';
   Promise.all([
     api("/dashboard/api/appointments"),
     api("/dashboard/api/session-counts").catch(() => ({counts: {}})),
@@ -1797,7 +1946,8 @@ function loadAgenda() {
     _agendaCounts = scData?.counts || {};
     _agendaCache = data.appointments || [];
     if (!_agendaCache.length) {
-      el.innerHTML = '<div class="text-gray-400 text-sm text-center py-10">Nenhuma consulta agendada.</div>';
+      _resumoHoje([]);
+      el.innerHTML = '<div class="estado-vazio">Nenhuma consulta agendada.</div>';
       return;
     }
     const days = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
@@ -1805,23 +1955,12 @@ function loadAgenda() {
     // Resumo de hoje
     const todayStr = now.toDateString();
     const todayAppts = _agendaCache.filter(a => new Date(a.scheduled_at).toDateString() === todayStr);
-    if (todayAppts.length) {
-      const att = todayAppts.filter(a => (a.attendance||'pending') === 'attended').length;
-      const missed = todayAppts.filter(a => (a.attendance||'pending').startsWith('missed')).length;
-      const pend = todayAppts.filter(a => (a.attendance||'pending') === 'pending').length;
-      document.getElementById('sum-total').textContent = todayAppts.length;
-      document.getElementById('sum-attended').textContent = att;
-      document.getElementById('sum-missed').textContent = missed;
-      document.getElementById('sum-pending').textContent = pend;
-      document.getElementById('agenda-summary').classList.remove('hidden');
-    } else {
-      document.getElementById('agenda-summary').classList.add('hidden');
-    }
+    _resumoHoje(todayAppts);
 
     el.innerHTML = _agendaCache.map(a => {
       const sessCount = _agendaCounts[a.phone] || 0;
       const sessTag = sessCount > 0
-        ? `<span class="ml-1 text-xs font-medium text-brand bg-violet-50 px-1.5 py-0.5 rounded-full">(${sessCount})</span>`
+        ? `<span class="ml-1 text-xs font-medium text-brand bg-brand-50 px-1.5 py-0.5 rounded-full" title="sessões registradas">(${sessCount})</span>`
         : '';
       const dt = new Date(a.scheduled_at);
       const label = `${days[dt.getDay()]}, ${String(dt.getDate()).padStart(2,"0")}/${String(dt.getMonth()+1).padStart(2,"0")} às ${String(dt.getHours()).padStart(2,"0")}:${String(dt.getMinutes()).padStart(2,"0")}`;
@@ -1854,7 +1993,7 @@ function loadAgenda() {
 
       const safeName = (a.patient_name || '').replace(/"/g,'&quot;');
       return `
-        <div class="bg-white rounded-xl ${borderCls} p-4" data-card data-name="${safeName}" data-phone="${a.phone || ''}">
+        <div class="bg-white rounded-2xl shadow-sm ${borderCls} p-4" data-card data-name="${safeName}" data-phone="${a.phone || ''}">
           <!-- Cabeçalho: nome + data + status -->
           <div class="flex items-start justify-between gap-3 mb-3">
             <div class="min-w-0 flex-1">
@@ -1871,17 +2010,17 @@ function loadAgenda() {
               <button onclick="setAttendance(${a.id}, 'missed_no_notice')" class="text-xs bg-red-50 text-red-700 px-3 py-2 rounded-full font-medium active:scale-95 transition border border-red-200">⚠️ Faltou</button>
               <button onclick="setAttendance(${a.id}, 'missed_with_notice')" class="text-xs bg-orange-50 text-orange-700 px-3 py-2 rounded-full font-medium active:scale-95 transition border border-orange-200">📞 Avisou</button>
             ` : ''}
-            ${showClearAttendance ? `<button onclick="setAttendance(${a.id}, 'pending')" class="text-xs bg-gray-100 text-gray-600 px-3 py-2 rounded-full font-medium active:scale-95 transition">↺ Desfazer</button>` : ''}
-            <button onclick='openHistory(${JSON.stringify(a.phone)}, ${JSON.stringify(a.patient_name)})' class="text-xs bg-indigo-100 text-indigo-700 px-3 py-2 rounded-full font-medium active:scale-95 transition">📋 Histórico</button>
-            <button onclick='openRename(${a.id}, ${JSON.stringify(a.patient_name)})' class="text-xs bg-purple-100 text-purple-700 px-3 py-2 rounded-full font-medium active:scale-95 transition">✏️ Editar nome</button>
-            <button onclick="openReschedule(${a.id}, '${a.scheduled_at}')" class="text-xs bg-blue-100 text-blue-700 px-3 py-2 rounded-full font-medium active:scale-95 transition">🔄 Reagendar</button>
-            <button onclick="cancelAppt(${a.id})" class="text-xs bg-red-100 text-red-600 px-3 py-2 rounded-full font-medium active:scale-95 transition">🗑 Cancelar</button>
+            ${showClearAttendance ? `<button type="button" onclick="setAttendance(${a.id}, 'pending')" class="botao-sec">↺ Desfazer</button>` : ''}
+            <button type="button" onclick='openHistory(${JSON.stringify(a.phone)}, ${JSON.stringify(a.patient_name)})' class="botao-sec">📋 Histórico</button>
+            <button type="button" onclick='openRename(${a.id}, ${JSON.stringify(a.patient_name)})' class="botao-sec">✏️ Editar nome</button>
+            <button type="button" onclick="openReschedule(${a.id}, '${a.scheduled_at}')" class="botao-sec">🔄 Reagendar</button>
+            <button type="button" onclick="cancelAppt(${a.id})" class="botao-sec perigo">🗑 Cancelar</button>
           </div>
         </div>`;
     }).join("");
     filterAgenda();
   }).catch(e => {
-    el.innerHTML = `<div class="text-red-500 text-sm text-center py-8">Falha ao carregar: ${e.message}</div>`;
+    el.innerHTML = `<div class="estado-erro" role="alert">Falha ao carregar: ${e.message}</div>`;
   });
 }
 
@@ -1919,7 +2058,7 @@ function openHistory(phone, name) {
       return `<div class="mb-4">
         <div class="flex items-center justify-between mb-1.5">
           <p class="font-semibold text-sm text-gray-800">${title}</p>
-          <span class="text-xs bg-violet-50 text-brand px-2 py-0.5 rounded-full font-medium">${g.billable} cobr.</span>
+          <span class="text-xs bg-brand-50 text-brand px-2 py-0.5 rounded-full font-medium">${g.billable} cobr.</span>
         </div>
         ${items}
       </div>`;
@@ -1977,7 +2116,7 @@ function showSummaryList(cat) {
         <div class="min-w-0">
           <p class="font-semibold text-gray-800 truncate">${(a.patient_name||'—')} <span class="text-brand font-bold">${hora}</span></p>
           <p class="text-xs text-gray-500 mt-0.5">
-            ${waLink ? `<a href="https://wa.me/${waLink}" target="_blank" class="text-indigo-600 hover:underline">${phone}</a>` : phone}
+            ${waLink ? `<a href="https://wa.me/${waLink}" target="_blank" class="text-brand hover:underline">${phone}</a>` : phone}
           </p>
         </div>
         <div class="shrink-0">${badge}</div>
@@ -2032,9 +2171,9 @@ function loadSlots() {
       const safeIso = s.iso.replace(/'/g, "");
       return `<button type="button" onclick="openNewApptAtSlot('${safeIso}')"
         class="bg-white border border-gray-200 rounded-xl px-3 py-3 text-sm text-gray-700 text-center
-               hover:border-brand hover:bg-violet-50 hover:text-brand active:scale-95 transition cursor-pointer">
+               hover:border-brand hover:bg-brand-50 hover:text-brand active:scale-95 transition cursor-pointer">
         <span class="block">${s.label}</span>
-        <span class="block text-[10px] text-gray-400 mt-0.5 group-hover:text-brand">toque para agendar</span>
+        <span class="block text-xs text-gray-400 mt-0.5 group-hover:text-brand">toque para agendar</span>
       </button>`;
     }).join("");
   }).catch(e => {
@@ -2091,6 +2230,8 @@ function toggleSlotConfig() {
   const arrow = document.getElementById('slot-config-arrow');
   const opened = body.classList.toggle('hidden');
   arrow.textContent = opened ? '▼' : '▲';
+  const tg = document.getElementById('slot-config-toggle');
+  if (tg) tg.setAttribute('aria-expanded', opened ? 'false' : 'true');
   if (!opened) renderBlockedHours();
 }
 
@@ -2145,7 +2286,7 @@ function renderBlockedByDay() {
     .map(c => parseInt(c.value, 10))
     .sort((a,b) => a - b);
   if (!activeDays.length) {
-    wrap.innerHTML = '<p class="text-[11px] text-gray-400">Selecione dias de atendimento acima.</p>';
+    wrap.innerHTML = '<p class="text-xs text-gray-400">Selecione dias de atendimento acima.</p>';
     return;
   }
   const globalBlocked = new Set(
@@ -2172,11 +2313,11 @@ function renderBlockedByDay() {
       }
       return `<button type="button" data-wd="${wd}" data-hour="${h}" data-blocked="${dataBlocked}" ${disabled}
         onclick="togglePerDayHour(this)"
-        class="per-day-hour border ${cls} text-[11px] font-medium py-1.5 rounded-md active:scale-95 transition">
+        class="per-day-hour border ${cls} text-xs font-medium py-1.5 rounded-md active:scale-95 transition">
         ${String(h).padStart(2,'0')}h</button>`;
     }).join('');
     return `<div class="border border-gray-100 rounded-lg p-2 bg-gray-50/50">
-      <div class="text-[11px] font-semibold text-gray-600 mb-1.5">${_DAY_LABELS[wd]}</div>
+      <div class="text-xs font-semibold text-gray-600 mb-1.5">${_DAY_LABELS[wd]}</div>
       <div class="grid grid-cols-6 gap-1">${buttons}</div>
     </div>`;
   }).join('');
@@ -2187,10 +2328,10 @@ function togglePerDayHour(btn) {
   const isBlocked = btn.getAttribute('data-blocked') === '1';
   if (isBlocked) {
     btn.setAttribute('data-blocked', '0');
-    btn.className = 'per-day-hour border bg-gray-50 text-gray-600 border-gray-200 text-[11px] font-medium py-1.5 rounded-md active:scale-95 transition';
+    btn.className = 'per-day-hour border bg-gray-50 text-gray-600 border-gray-200 text-xs font-medium py-1.5 rounded-md active:scale-95 transition';
   } else {
     btn.setAttribute('data-blocked', '1');
-    btn.className = 'per-day-hour border bg-red-50 text-red-700 border-red-200 text-[11px] font-medium py-1.5 rounded-md active:scale-95 transition';
+    btn.className = 'per-day-hour border bg-red-50 text-red-700 border-red-200 text-xs font-medium py-1.5 rounded-md active:scale-95 transition';
   }
 }
 
@@ -2222,7 +2363,7 @@ function renderBlockedDates() {
   const list = document.getElementById('slot-blocked-dates-list');
   const dates = _getBlockedDates();
   if (!dates.length) {
-    list.innerHTML = '<span class="text-[11px] text-gray-400">Nenhuma data bloqueada.</span>';
+    list.innerHTML = '<span class="text-xs text-gray-400">Nenhuma data bloqueada.</span>';
     return;
   }
   list.innerHTML = dates.map(d => {
@@ -2385,7 +2526,7 @@ function loadWeekly() {
             <span class="text-gray-800 truncate">${a.patient_name || a.phone}</span>
           </div>`;
         }).join('');
-        return `<div class="border-l-2 border-violet-100 pl-3 mb-2">
+        return `<div class="border-l-2 border-brand-100 pl-3 mb-2">
           <p class="text-xs font-medium text-brand">${days[d.getDay()]}, ${String(d.getDate()).padStart(2,'0')}/${months[d.getMonth()]}</p>
           ${items}
         </div>`;
@@ -2442,7 +2583,7 @@ function loadConv(phone) {
         <p class="text-xs text-gray-500 font-medium">${phone}</p>
         <div class="flex items-center gap-2 flex-wrap justify-end">
           <button onclick="renamePatientPrompt('${phone}')"
-            class="text-xs font-semibold px-3 py-1.5 rounded-lg transition bg-purple-100 text-purple-700 hover:bg-purple-200">
+            class="text-xs font-semibold px-3 py-1.5 rounded-lg transition bg-brand-100 text-brand-800 hover:bg-brand-200">
             ✏️ Editar nome
           </button>
           <button onclick="togglePause('${phone}')" id="pause-btn-${phone}"
@@ -2493,7 +2634,7 @@ function loadConv(phone) {
           <button onclick="clearBillingOverride('${phone}')"
             class="text-xs font-semibold px-3 py-1.5 rounded-lg transition bg-gray-100 text-gray-600 hover:bg-gray-200">Limpar</button>
         </div>
-        <p class="text-[11px] text-gray-400 leading-snug">Define o valor total cobrado naquele mês (desconto ou complemento). Substitui o cálculo nº de sessões × valor.</p>
+        <p class="text-xs text-gray-400 leading-snug">Define o valor total cobrado naquele mês (desconto ou complemento). Substitui o cálculo nº de sessões × valor.</p>
       </div>`;
 
     if (!msgs.length) {
@@ -2508,6 +2649,8 @@ function loadConv(phone) {
         }).join("") + `</div>`;
       el.querySelector("div:last-child").scrollTop = 99999;
     }
+    // Celular/tablet: a conversa fica abaixo da lista — leva a vista até ela.
+    if (window.innerWidth < 768) el.scrollIntoView({ behavior: "smooth", block: "start" });
 
     // Pré-seleciona o mês corrente no ajuste de valor
     const mInp = document.getElementById(`bover-month-${phone}`);
@@ -3132,7 +3275,7 @@ function loadBillingPreview() {
       else if (it.paused) { status = '<span class="text-yellow-700" title="Cobrança pausada">⏸ pausado</span>'; }
       else if (it.already_sent) { status = '<span class="text-green-600" title="Já cobrado neste mês">✓ enviado</span>'; }
       else { status = '<span class="text-gray-400">a cobrar</span>'; }
-      const ov = it.has_override ? ' <span class="text-purple-500" title="Valor ajustado manualmente">✏️</span>' : '';
+      const ov = it.has_override ? ' <span class="text-brand-700" title="Valor ajustado manualmente">✏️</span>' : '';
       let totalCell;
       if (it.no_price) {
         totalCell = `<button class="text-orange-500 hover:text-brand underline decoration-dotted"
@@ -3150,7 +3293,7 @@ function loadBillingPreview() {
       if (bd.faltou_sem_aviso) bdParts.push(`${bd.faltou_sem_aviso} falta${bd.faltou_sem_aviso>1?'s':''} s/ aviso`);
       if (bd.nao_marcadas) bdParts.push(`${bd.nao_marcadas} não marcada${bd.nao_marcadas>1?'s':''}`);
       const showBd = (bd.nao_marcadas || bd.faltou_sem_aviso) && bdParts.length;
-      const bdLine = showBd ? `<div class="text-[10px] text-gray-400 mt-0.5">${bdParts.join(" · ")}</div>` : "";
+      const bdLine = showBd ? `<div class="text-xs text-gray-400 mt-0.5">${bdParts.join(" · ")}</div>` : "";
       // Telefone só dígitos → id seguro para a sub-linha.
       const detId = (it.phone||"").replace(/\D/g,"") || Math.random().toString(36).slice(2);
       const hasDetail = (it.session_rows||[]).length > 0;
@@ -3182,10 +3325,10 @@ function loadBillingPreview() {
       else status = '<span class="text-gray-400">a cobrar</span>';
       const nameEsc = (it.patient_name||'').replace(/'/g,"\\'");
       const paidCellM = _paidToggleHtml(it.paid, `toggleManualPaid(${it.id},${it.paid?1:0})`);
-      const rowBgM = it.paid ? 'bg-green-50/40' : (it.receipt ? 'bg-amber-50/50' : 'bg-purple-50/40');
+      const rowBgM = it.paid ? 'bg-green-50/40' : (it.receipt ? 'bg-amber-50/50' : 'bg-brand-50/40');
       return `<tr class="border-b border-gray-50 ${rowBgM}">
         <td class="py-1.5 pr-2 font-medium text-gray-700">${it.patient_name||it.phone}
-          <span class="text-[10px] text-purple-500 align-middle">avulsa</span>${_receiptLineHtml(it)}</td>
+          <span class="text-xs text-brand-700 align-middle">avulsa</span>${_receiptLineHtml(it)}</td>
         <td class="py-1.5 pr-2 text-center text-gray-600">${it.sessions}</td>
         <td class="py-1.5 pr-2 text-right">
           <button class="text-gray-700 hover:text-brand underline decoration-dotted"
@@ -3253,21 +3396,21 @@ function _billingSessionsHtml(rows) {
     } else {
       label = _ATT_LABEL[r.attendance] || _ATT_LABEL.pending;
       if (r.counts) {
-        action = `<button class="text-red-500 hover:text-red-700 text-[11px] whitespace-nowrap"
+        action = `<button class="text-red-500 hover:text-red-700 text-xs whitespace-nowrap"
           title="Não cobrar esta sessão (marca como falta com aviso)"
           onclick="setSessionAttendance(${r.id},'missed_with_notice')">não cobrar ✕</button>`;
       } else if (r.attendance === 'missed_with_notice') {
-        action = `<button class="text-green-600 hover:text-green-700 text-[11px] whitespace-nowrap"
+        action = `<button class="text-green-600 hover:text-green-700 text-xs whitespace-nowrap"
           title="Cobrar esta sessão (marca como realizada)"
           onclick="setSessionAttendance(${r.id},'attended')">cobrar ✓</button>`;
       }
     }
     return `<div class="flex items-center justify-between gap-2 py-0.5">
-      <span class="text-[11px] text-gray-600">${_fmtSessDT(r.scheduled_at)} — ${label}</span>
+      <span class="text-xs text-gray-600">${_fmtSessDT(r.scheduled_at)} — ${label}</span>
       <span>${action}</span>
     </div>`;
   }).join("");
-  return `<div class="text-[11px] text-gray-400 mb-1">Sessões do mês — clique para incluir/excluir da cobrança:</div>${lines}`;
+  return `<div class="text-xs text-gray-400 mb-1">Sessões do mês — clique para incluir/excluir da cobrança:</div>${lines}`;
 }
 function toggleBillingDetail(detId) {
   const el = document.getElementById("bdet-" + detId);
@@ -3310,7 +3453,7 @@ function toggleManualPaid(entryId, isPaidNow) {
 function _receiptLineHtml(it) {
   if (!it || !it.receipt || it.paid) return "";
   const phoneEsc = (it.phone||'').replace(/'/g,"\\'");
-  return `<div class="text-[10px] text-amber-600 mt-0.5">📎 comprovante recebido (${it.receipt}) — confira e confirme
+  return `<div class="text-xs text-amber-600 mt-0.5">📎 comprovante recebido (${it.receipt}) — confira e confirme
     <button class="text-gray-400 hover:text-gray-600 ml-1 underline decoration-dotted"
       title="Dispensar aviso (falso alarme / já resolvido)" onclick="dismissReceipt('${phoneEsc}')">dispensar</button></div>`;
 }
@@ -3488,6 +3631,15 @@ function checkWelcome() {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+(function () {
+  const d = document.getElementById("hi-data");
+  if (d) d.textContent = new Date().toLocaleDateString("pt-BR", { weekday: "long", day: "numeric", month: "long" });
+  const btn = document.getElementById("botao-recolher");
+  if (btn && document.documentElement.dataset.menu === "recolhido") {
+    btn.setAttribute("aria-expanded", "false");
+    btn.setAttribute("aria-label", "Expandir menu");
+  }
+})();
 connectSSE();
 loadAgenda();
 loadHomeInsights();
@@ -3504,28 +3656,28 @@ function loadStats() {
     const maxWd = Math.max(...s.weekdays, 1);
     const wdBars = s.weekdays.map((n,i) =>
       `<div class="flex flex-col items-center gap-1 flex-1">
-        <div class="w-full rounded-t" style="height:${Math.max(4, Math.round(n/maxWd*40))}px; background:#7c3aed; opacity:${n>0?1:0.15}"></div>
-        <span class="text-[10px] text-gray-500">${days[i]}</span>
-        <span class="text-[10px] font-medium text-gray-700">${n}</span>
+        <div class="w-full rounded-t" style="height:${Math.max(4, Math.round(n/maxWd*40))}px; background:#8A273E; opacity:${n>0?1:0.15}"></div>
+        <span class="text-xs text-gray-500">${days[i]}</span>
+        <span class="text-xs font-medium text-gray-700">${n}</span>
       </div>`
     ).join('');
     el.innerHTML = `
       <div class="grid grid-cols-2 gap-2 mb-4">
-        <div class="bg-violet-50 rounded-xl p-3 text-center">
-          <p class="text-xl font-bold text-brand">${s.total}</p>
-          <p class="text-[10px] text-gray-500">sessões no mês</p>
+        <div class="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
+          <p class="text-xl font-bold text-gray-900">${s.total}</p>
+          <p class="text-xs text-gray-500">sessões no mês</p>
         </div>
-        <div class="bg-green-50 rounded-xl p-3 text-center">
-          <p class="text-xl font-bold text-green-700">${fmtR(s.revenue)}</p>
-          <p class="text-[10px] text-gray-500">receita estimada</p>
+        <div class="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
+          <p class="text-xl font-bold text-gray-900">${fmtR(s.revenue)}</p>
+          <p class="text-xs text-gray-500">receita estimada</p>
         </div>
-        <div class="bg-blue-50 rounded-xl p-3 text-center">
-          <p class="text-xl font-bold text-blue-700">${s.active_patients}</p>
-          <p class="text-[10px] text-gray-500">pacientes ativos</p>
+        <div class="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
+          <p class="text-xl font-bold text-gray-900">${s.active_patients}</p>
+          <p class="text-xs text-gray-500">pacientes ativos</p>
         </div>
-        <div class="bg-orange-50 rounded-xl p-3 text-center">
-          <p class="text-xl font-bold text-orange-600">${pct(s.attended, s.total - s.pending)}</p>
-          <p class="text-[10px] text-gray-500">taxa de presença</p>
+        <div class="bg-gray-50 border border-gray-200 rounded-xl p-3 text-center">
+          <p class="text-xl font-bold text-gray-900">${pct(s.attended, s.total - s.pending)}</p>
+          <p class="text-xs text-gray-500">taxa de presença</p>
         </div>
       </div>
       <div class="grid grid-cols-4 gap-1.5 text-center text-xs mb-4">
@@ -3538,10 +3690,10 @@ function loadStats() {
         <div class="bg-gray-50 rounded-lg py-2">
           <p class="font-bold text-gray-600">${s.cancelled}</p><p class="text-gray-400">canceladas</p></div>
       </div>
-      <p class="text-[11px] text-gray-500 mb-1 font-medium">Sessões por dia da semana</p>
-      <div class="flex items-end gap-1 h-14">${wdBars}</div>`;
+      <p class="text-xs text-gray-500 mb-1 font-medium">Sessões por dia da semana</p>
+      <div class="flex items-end gap-1">${wdBars}</div>`;
   }).catch(e => {
-    el.innerHTML = `<div class="text-red-500 text-sm text-center py-4">Erro: ${e.message}</div>`;
+    el.innerHTML = `<div class="estado-erro" role="alert">Erro: ${e.message}</div>`;
   });
 }
 
