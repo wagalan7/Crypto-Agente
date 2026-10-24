@@ -112,7 +112,8 @@ def _base_html(title: str, body_html: str) -> str:
 <body>
   <div class="wrapper">
     <div class="header">
-      <h1>🤖 Consultório Inteligente</h1>
+      <img src="{config.BASE_URL.rstrip('/')}/static/marca/logo-agente-transparente-20261023.png" alt="Agente Consultório" width="64" height="64" style="display:block;object-fit:contain;margin:0 auto 12px;background:transparent"/>
+      <h1>Agente Consultório</h1>
       <p>Agente de Atendimento WhatsApp para Psicólogas</p>
     </div>
     <div class="body">

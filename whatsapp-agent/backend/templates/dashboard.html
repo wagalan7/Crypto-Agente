@@ -4,7 +4,7 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>{{ tenant.name }} — Painel</title>
-  <link rel="icon" type="image/png" href="/static/marca/simbolo-assistente-64.png"/>
+  <link rel="icon" type="image/png" href="/static/marca/logo-agente-transparente-20261023.png"/>
   <!-- Fontes: Montserrat (títulos) + Inter (interface). display=swap: se o
        serviço de fontes falhar, o texto aparece na fonte do sistema. -->
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
@@ -27,7 +27,7 @@
       titulo: ['Montserrat','Inter','system-ui','sans-serif'],
     },
   } } }</script>
-  <link rel="stylesheet" href="/static/marca/tokens.css"/>
+  <link rel="stylesheet" href="/static/marca/tokens.css?v=logo-20261023"/>
   <style>
     .tab-content { display: none; }
     .tab-content.active { display: block; }
@@ -72,7 +72,7 @@
   <div class="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden">
     <div class="bg-brand px-6 py-5 text-white text-center">
       <div class="text-4xl mb-2">🎉</div>
-      <h2 id="modal-welcome-titulo" class="text-xl font-bold">Bem-vinda ao Consultório Inteligente!</h2>
+      <h2 id="modal-welcome-titulo" class="text-xl font-bold">Bem-vinda ao Agente Consultório!</h2>
       <p class="text-brand-100 text-sm mt-1">Seu assistente de IA está pronto para começar</p>
     </div>
     <div class="p-6 space-y-4">
@@ -116,7 +116,7 @@
 <!-- Menu lateral (computador, ≥1024px) — recolhível -->
 <aside class="menu-lateral" aria-label="Navegação principal">
   <div class="flex items-center gap-3 px-1 mb-7">
-    <img src="/static/marca/simbolo-assistente-256.png" alt="" width="40" height="40" class="marca-simbolo w-10 h-10 ring-1 ring-white/10"/>
+    <img src="/static/marca/logo-agente-transparente-20261023.png" alt="" width="40" height="40" class="marca-simbolo w-10 h-10"/>
     <div class="so-expandido min-w-0">
       <p class="marca-nome text-white text-[16px]">Agente</p>
       <p class="marca-sub text-brand-200">Consultório</p>
@@ -161,7 +161,7 @@
 <!-- Barra superior: título da seção, consultório e conexão ao vivo do painel -->
 <header class="barra-topo">
   <div class="max-w-6xl mx-auto px-4 lg:px-8 h-16 flex items-center gap-3">
-    <img src="/static/marca/simbolo-assistente-256.png" alt="Agente Consultório" width="36" height="36" class="marca-simbolo w-9 h-9 lg:hidden"/>
+    <img src="/static/marca/logo-agente-transparente-20261023.png" alt="Agente Consultório" width="36" height="36" class="marca-simbolo w-9 h-9 lg:hidden"/>
     <div class="min-w-0 flex-1">
       <h1 id="titulo-pagina" class="titulo-pagina truncate text-[18px] lg:text-[22px]">Início</h1>
       <p class="text-[13px] text-gray-500 truncate">{{ tenant.name }} · {{ tenant.psychologist_name }} · {{ '%02d'|format(tenant.working_hours_start) }}:00–{{ '%02d'|format(tenant.working_hours_end) }}:00</p>

@@ -85,9 +85,9 @@ h1, h2, h3, .fonte-titulo { font-family: var(--fonte-titulo); letter-spacing: -.
          stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 
 /* ── marca ────────────────────────────────────────────────────────────────── */
-/* O símbolo é recorte do arquivo original (fundo preto, sem transparência):
-   por isso aparece sempre num ladrilho escuro arredondado, nunca sobre claro. */
-.marca-simbolo { display: block; border-radius: 12px; background: #000; object-fit: cover; }
+/* Logo transparente fornecida pelo proprietário em 23/10/2026.
+   Preservar proporção/alpha e exibir sem ladrilho, recorte ou filtro de cor. */
+.marca-simbolo { display: block; border-radius: 0; background: transparent; object-fit: contain; }
 .marca-nome  { font-family: var(--fonte-titulo); font-weight: 700; letter-spacing: .02em; line-height: 1.1; }
 .marca-sub   { font-family: var(--fonte-titulo); font-weight: 500; letter-spacing: .22em; font-size: 10.5px;
                text-transform: uppercase; line-height: 1.2; }
