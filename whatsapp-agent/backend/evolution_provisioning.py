@@ -20,10 +20,12 @@ o banco (gravar colunas do tenant, webhook_token) fica na rota em main.py.
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlsplit
 
 import httpx
 
 import config
+from webhook_security import callback_headers, safe_url, HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +54,7 @@ def _as_data_uri(b64: str | None) -> str | None:
     return f"data:image/png;base64,{b64}"
 
 
-async def create_instance(instance_name: str, webhook_url: str = "") -> dict:
+async def create_instance(instance_name: str, webhook_url: str = "", *, webhook_token: str = "") -> dict:
     """Cria a instância na Evolution e já devolve o 1º QR.
 
     Retorna: {ok, instance_token, qr, error}
@@ -68,7 +70,9 @@ async def create_instance(instance_name: str, webhook_url: str = "") -> dict:
     # Evolution v2 aceita configurar o webhook já no create.
     if webhook_url:
         payload["webhook"] = {
+            "enabled": True,
             "url": webhook_url,
+            "headers": callback_headers(webhook_url, webhook_token),
             "byEvents": False,
             "base64": True,
             "events": ["MESSAGES_UPSERT"],
@@ -86,7 +90,7 @@ async def create_instance(instance_name: str, webhook_url: str = "") -> dict:
                     "already_exists": exists,
                     "instance_token": "",
                     "qr": None,
-                    "error": f"HTTP {r.status_code}: {r.text[:200]}",
+                    "error": f"HTTP {r.status_code}",
                 }
             data = r.json()
             token = data.get("hash")
@@ -99,9 +103,9 @@ async def create_instance(instance_name: str, webhook_url: str = "") -> dict:
             return {"ok": True, "already_exists": False,
                     "instance_token": token or "", "qr": qr, "error": None}
     except Exception as e:
-        logger.error(f"[evolution] create_instance({instance_name}) falhou: {e}")
+        logger.error(f"[evolution] create_instance({instance_name}) falhou: {type(e).__name__}")
         return {"ok": False, "already_exists": False,
-                "instance_token": "", "qr": None, "error": str(e)[:200]}
+                "instance_token": "", "qr": None, "error": type(e).__name__}
 
 
 async def connect(instance_name: str) -> dict:
@@ -143,8 +147,8 @@ async def connect(instance_name: str) -> dict:
                               or (data.get("qrcode") or {}).get("base64"))
             return {"ok": True, "connected": False, "qr": qr, "error": None}
     except Exception as e:
-        logger.error(f"[evolution] connect({instance_name}) falhou: {e}")
-        return {"ok": False, "connected": False, "qr": None, "error": str(e)[:200]}
+        logger.error(f"[evolution] connect({instance_name}) falhou: {type(e).__name__}")
+        return {"ok": False, "connected": False, "qr": None, "error": type(e).__name__}
 
 
 async def fetch_instance_token(instance_name: str) -> str:
@@ -188,16 +192,17 @@ async def fetch_instance_token(instance_name: str) -> str:
                     if tok:
                         return str(tok)
     except Exception as e:
-        logger.warning(f"[evolution] fetch_instance_token({instance_name}) falhou: {e}")
+        logger.warning(f"[evolution] fetch_instance_token({instance_name}) falhou: {type(e).__name__}")
     return ""
 
 
-async def set_webhook(instance_name: str, webhook_url: str) -> dict:
+async def set_webhook(instance_name: str, webhook_url: str, *, webhook_token: str) -> dict:
     """(Re)configura o webhook de mensagens da instância. Idempotente."""
     payload = {
         "webhook": {
             "enabled": True,
             "url": webhook_url,
+            "headers": callback_headers(webhook_url, webhook_token),
             "byEvents": False,
             "base64": True,
             "events": ["MESSAGES_UPSERT"],
@@ -209,22 +214,15 @@ async def set_webhook(instance_name: str, webhook_url: str) -> dict:
                 f"{_base()}/webhook/set/{instance_name}",
                 json=payload, headers=_admin_headers(),
             )
-            if r.status_code >= 400:
-                # fallback p/ formato v1 (sem o wrapper "webhook")
-                r = await client.post(
-                    f"{_base()}/webhook/set/{instance_name}",
-                    json={"enabled": True, "url": webhook_url,
-                          "events": ["MESSAGES_UPSERT"]},
-                    headers=_admin_headers(),
-                )
+            # Falha explícita: nunca cair no formato legado perdendo headers.
             return {"ok": r.status_code < 400,
                     "error": None if r.status_code < 400 else f"HTTP {r.status_code}"}
     except Exception as e:
-        logger.warning(f"[evolution] set_webhook({instance_name}) falhou: {e}")
-        return {"ok": False, "error": str(e)[:200]}
+        logger.warning(f"[evolution] set_webhook({instance_name}) falhou: {type(e).__name__}")
+        return {"ok": False, "error": type(e).__name__}
 
 
-async def get_webhook(instance_name: str) -> dict:
+async def get_webhook(instance_name: str, *, expected_token: str = "") -> dict:
     """Webhook ATUALMENTE configurado na instância (consulta com a chave global).
 
     Existe para diagnóstico: o ``set_webhook`` devolve ok=False num HTTP 400 sem
@@ -238,18 +236,32 @@ async def get_webhook(instance_name: str) -> dict:
                                  headers=_admin_headers())
             if r.status_code >= 400:
                 return {"ok": False, "url": "", "enabled": None, "events": [],
-                        "error": f"HTTP {r.status_code}: {r.text[:160]}"}
+                        "error": f"HTTP {r.status_code}"}
             d = r.json() or {}
             inner = d.get("webhook") if isinstance(d.get("webhook"), dict) else d
+            raw_url = inner.get("url") or ""
+            headers = inner.get("headers") or {}
+            if not isinstance(headers, dict):
+                headers = {}
+            # Só sinais de diagnóstico; nunca retornar o mapa de headers.
+            candidates = [v for k, v in headers.items() if k.lower() == HEADER.lower()]
+            actual = candidates[0] if len(candidates) == 1 else None
+            import hmac
+            matches = (isinstance(actual, str) and bool(expected_token)
+                       and actual.isascii() and expected_token.isascii()
+                       and hmac.compare_digest(actual, expected_token))
             return {
                 "ok": True,
-                "url": inner.get("url") or "",
+                "url": safe_url(raw_url),
+                "has_query": bool(urlsplit(raw_url).query),
+                "has_auth_header": isinstance(actual, str) and bool(actual),
+                "auth_header_matches": matches,
                 "enabled": inner.get("enabled"),
                 "events": inner.get("events") or [],
                 "error": None,
             }
     except Exception as e:
-        return {"ok": False, "url": "", "enabled": None, "events": [], "error": str(e)[:200]}
+        return {"ok": False, "url": "", "enabled": None, "events": [], "error": type(e).__name__}
 
 
 async def get_instance_info(instance_name: str) -> dict:
@@ -268,7 +280,7 @@ async def get_instance_info(instance_name: str) -> dict:
                                  params={"instanceName": instance_name},
                                  headers=_admin_headers())
             if r.status_code >= 400:
-                return {**vazio, "error": f"HTTP {r.status_code}: {r.text[:160]}"}
+                return {**vazio, "error": f"HTTP {r.status_code}"}
             data = r.json()
             items = data if isinstance(data, list) else [data]
             for it in items:
@@ -289,7 +301,7 @@ async def get_instance_info(instance_name: str) -> dict:
                 }
             return {**vazio, "error": "instância não veio na resposta"}
     except Exception as e:
-        return {**vazio, "error": str(e)[:200]}
+        return {**vazio, "error": type(e).__name__}
 
 
 async def logout_instance(instance_name: str) -> dict:
@@ -312,8 +324,8 @@ async def logout_instance(instance_name: str) -> dict:
                 return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
             return {"ok": True, "error": None}
     except Exception as e:
-        logger.warning(f"[evolution] logout_instance({instance_name}) falhou: {e}")
-        return {"ok": False, "error": str(e)[:200]}
+        logger.warning(f"[evolution] logout_instance({instance_name}) falhou: {type(e).__name__}")
+        return {"ok": False, "error": type(e).__name__}
 
 
 async def restart_instance(instance_name: str) -> dict:
@@ -339,8 +351,8 @@ async def restart_instance(instance_name: str) -> dict:
                 return {"ok": False, "error": str(d.get("message") or d)[:200]}
             return {"ok": True, "error": None}
     except Exception as e:
-        logger.warning(f"[evolution] restart_instance({instance_name}) falhou: {e}")
-        return {"ok": False, "error": str(e)[:200]}
+        logger.warning(f"[evolution] restart_instance({instance_name}) falhou: {type(e).__name__}")
+        return {"ok": False, "error": type(e).__name__}
 
 
 async def connection_state(instance_name: str) -> str | None:
@@ -372,5 +384,5 @@ async def delete_instance(instance_name: str) -> dict:
             return {"ok": r.status_code < 400,
                     "error": None if r.status_code < 400 else f"HTTP {r.status_code}"}
     except Exception as e:
-        logger.warning(f"[evolution] delete_instance({instance_name}) falhou: {e}")
-        return {"ok": False, "error": str(e)[:200]}
+        logger.warning(f"[evolution] delete_instance({instance_name}) falhou: {type(e).__name__}")
+        return {"ok": False, "error": type(e).__name__}

@@ -121,6 +121,17 @@ def modelo(monkeypatch) -> ModeloSimulado:
 
 
 @pytest.fixture(autouse=True)
+def _janela_de_migracao_query(monkeypatch):
+    """Regressões antigas usam query: exercitá-las só na transição explícita.
+    O hotfix testa separadamente o padrão header-only e a expiração.
+    """
+    import config
+    from datetime import timezone
+    deadline = datetime.now(timezone.utc) + timedelta(hours=1)
+    monkeypatch.setattr(config, "WEBHOOK_QUERY_TOKEN_UNTIL", deadline.isoformat())
+
+
+@pytest.fixture(autouse=True)
 def _sem_api_paga(monkeypatch):
     """Rede de segurança: nenhum teste pode chamar o LLM de verdade."""
     def _proibido(*a, **k):
@@ -151,6 +162,7 @@ def _criar_tenant(slug: str, nome: str) -> dict:
     db.update_tenant(slug, whatsapp_provider="mock", working_days="0,1,2,3,4",
                      blocked_hours="12,13", blocked_dates="", status="active",
                      dashboard_token=f"token-{slug}")
+    db.ensure_webhook_token(db.get_tenant(slug)["id"])
     return db.get_tenant(slug)
 
 
@@ -177,7 +189,7 @@ def tenant_b(_banco) -> dict:
 def _limpar(tenant_id: int) -> None:
     with db.get_conn() as conn:
         for tabela in ("appointments", "conversations", "patients", "agent_paused",
-                       "slot_offers", "offers", "inbound_events", "outbox"):
+                       "slot_offers", "offers", "inbound_events", "outbox", "webhook_auth_rotation"):
             try:
                 conn.execute(f"DELETE FROM {tabela} WHERE tenant_id=?", (tenant_id,))
             except Exception:

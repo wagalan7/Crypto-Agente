@@ -29,9 +29,11 @@ import stripe_service as stripe_svc
 import mp_service as mp_svc
 import caldav_service as caldav_svc
 import email_service as email_svc
+import webhook_security as webhook_auth
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+webhook_auth.install_log_redaction()
 
 # Versão atual dos Termos/Política — incrementar quando publicar nova versão.
 TERMS_VERSION = "2026-05-18"
@@ -48,6 +50,7 @@ if _SENTRY_DSN:
             traces_sample_rate=float(_os_init.getenv("SENTRY_TRACES_SAMPLE", "0.05")),
             profiles_sample_rate=0.0,
             send_default_pii=False,
+            before_send=webhook_auth.redact_sentry_event,
             integrations=[FastApiIntegration()],
             environment=_os_init.getenv("RAILWAY_ENVIRONMENT", "production"),
         )
@@ -916,8 +919,7 @@ async def _drenar_entrada():
 @app.post("/webhook/{slug}/evolution")
 async def webhook_evolution(slug: str, request: Request, bg: BackgroundTasks):
     tenant = _get_tenant(slug)
-    # Backward-compatible: tenants legados sem webhook_token seguem aceitos
-    # (o validador loga warning e retorna True). Instâncias provisionadas
+    # Falha fechada: tenant sem segredo não autentica callbacks. Instâncias provisionadas
     # automaticamente ganham token e passam a ser validadas.
     if not _validate_webhook_token(tenant, request):
         _note_webhook(tenant["id"], "evolution", {}, False,
@@ -994,24 +996,13 @@ def _note_webhook(tenant_id: int, provider: str, payload, reconhecido: bool, obs
 
 
 def _validate_webhook_token(tenant: dict, request: Request) -> bool:
-    """Valida o token de webhook esperado.
-    - Aceita via query string ?token=, header X-Webhook-Token ou Client-Token.
-    - Se o tenant ainda não tem webhook_token (legacy), aceita mas loga warning.
-    """
-    expected = (tenant.get("webhook_token") or "").strip()
-    if not expected:
-        logger.warning(f"[{tenant['slug']}] Webhook recebido SEM token configurado — modo legacy")
-        return True
-    provided = (
-        request.query_params.get("token", "")
-        or request.headers.get("X-Webhook-Token", "")
-        or request.headers.get("Client-Token", "")
-    ).strip()
-    import hmac as _hmac
-    if not provided or not _hmac.compare_digest(provided, expected):
-        logger.warning(f"[{tenant['slug']}] Webhook REJEITADO — token inválido (provided={provided[:8]}...)")
-        return False
-    return True
+    """Header obrigatório; query só na janela absoluta de migração aprovada."""
+    ok = webhook_auth.valid_webhook_token(
+        tenant, request, db.webhook_rotation_state(tenant["id"]))
+    if not ok:
+        # Nunca registrar valor ou prefixo da credencial rejeitada.
+        logger.warning("Webhook REJEITADO — credencial ausente, inválida ou expirada")
+    return ok
 
 
 # ── Idempotência do webhook Z-API (evita reprocessar mesma mensagem em retries) ──
@@ -2476,10 +2467,10 @@ async def dash_evolution_qr(request: Request):
 
     instance_name = f"tenant-{tenant['slug']}"
     api_base = config.EVOLUTION_API_URL.rstrip("/")
-    wt = db.ensure_webhook_token(tenant["id"])
+    wt = db.evolution_callback_token(tenant["id"])
     # Host REAL desta requisição (não o BASE_URL) — garante que o webhook fica
     # num endereço comprovadamente alcançável: é por ele que o painel abriu.
-    webhook_url = f"{_public_base(request)}/webhook/{tenant['slug']}/evolution?token={wt}"
+    webhook_url = f"{_public_base(request)}/webhook/{tenant['slug']}/evolution"
 
     # Já provisionado nesta plataforma? (mesma URL + instância gravada)
     provisioned = (
@@ -2493,7 +2484,7 @@ async def dash_evolution_qr(request: Request):
         return {"ok": True, "enabled": True, "connected": False, "qr": None}
 
     if not provisioned:
-        created = await _ev_create(instance_name, webhook_url)
+        created = await _ev_create(instance_name, webhook_url, webhook_token=wt)
         if not created.get("ok"):
             return {"ok": False, "enabled": True, "connected": None,
                     "error": created.get("error") or "Falha ao criar a instância."}
@@ -2512,7 +2503,7 @@ async def dash_evolution_qr(request: Request):
             if _tok:
                 updates["evolution_key"] = _tok
         db.update_tenant(tenant["slug"], **updates)
-        await _ev_setwebhook(instance_name, webhook_url)
+        await _ev_setwebhook(instance_name, webhook_url, webhook_token=wt)
         if created.get("qr"):
             return {"ok": True, "enabled": True, "connected": False, "qr": created["qr"]}
         # sem QR no create → cai pro connect abaixo
@@ -2525,13 +2516,13 @@ async def dash_evolution_qr(request: Request):
             and request.query_params.get("check") != "1"):
         logger.warning(f"[{tenant['slug']}] instância {instance_name} não existe mais "
                        f"no servidor — recriando.")
-        created = await _ev_create(instance_name, webhook_url)
+        created = await _ev_create(instance_name, webhook_url, webhook_token=wt)
         if created.get("ok"):
             _tok = created.get("instance_token") or await _ev_fetch_token(instance_name)
             if _tok:
                 db.update_tenant(tenant["slug"], evolution_key=_tok)
                 tenant["evolution_key"] = _tok
-            await _ev_setwebhook(instance_name, webhook_url)
+            await _ev_setwebhook(instance_name, webhook_url, webhook_token=wt)
             if created.get("qr"):
                 return {"ok": True, "enabled": True, "connected": False,
                         "qr": created["qr"], "recreated": True}
@@ -2544,7 +2535,7 @@ async def dash_evolution_qr(request: Request):
             # O retorno do set_webhook era IGNORADO: num HTTP 400 (payload que a
             # versão da Evolution não aceita) o webhook nunca era gravado e as
             # mensagens não chegavam, sem nenhum sinal. Agora loga e reporta.
-            _wh = await _ev_setwebhook(instance_name, webhook_url)
+            _wh = await _ev_setwebhook(instance_name, webhook_url, webhook_token=wt)
             res["webhook_set"] = _wh
             if not _wh.get("ok"):
                 logger.error(
@@ -3457,24 +3448,20 @@ async def diagnose_whatsapp(request: Request):
                     "ultima_desconexao_significa": _DISCONNECT_PT.get(_code) if _code else None,
                     "erro_ao_consultar": info.get("error"),
                 }
-                atual = await _ev_getwebhook(inst)
-                wt = db.ensure_webhook_token(tenant["id"])
-                esperado = f"{_public_base(request)}/webhook/{tenant['slug']}/evolution?token={wt}"
+                wt = db.evolution_callback_token(tenant["id"])
+                atual = await _ev_getwebhook(inst, expected_token=wt)
+                esperado = f"{_public_base(request)}/webhook/{tenant['slug']}/evolution"
                 url_atual = atual.get("url") or ""
-                # Não devolve o token em claro: só o que importa pro diagnóstico.
-                def _mask(u: str) -> str:
-                    if not u or "token=" not in u:
-                        return u or ""
-                    head, _sep, tail = u.partition("token=")
-                    parts = tail.split("&", 1)
-                    return head + "token=***" + ("&" + parts[1] if len(parts) > 1 else "")
                 webhook_info = {
-                    "gravado_no_provedor": _mask(url_atual),
-                    "esperado_agora": _mask(esperado),
+                    "gravado_no_provedor": webhook_auth.safe_url(url_atual),
+                    "esperado_agora": esperado,
                     "habilitado": atual.get("enabled"),
                     "eventos": atual.get("events"),
-                    "tem_token": "token=" in url_atual,
-                    "confere": url_atual == esperado,
+                    "tem_token": bool(atual.get("has_auth_header")),
+                    "token_em_header": bool(atual.get("has_auth_header")),
+                    "token_em_url": bool(atual.get("has_query")),
+                    "confere": (url_atual == esperado and atual.get("enabled") is True
+                                and atual.get("auth_header_matches") is True),
                     "erro_ao_consultar": atual.get("error"),
                 }
         except Exception as e:

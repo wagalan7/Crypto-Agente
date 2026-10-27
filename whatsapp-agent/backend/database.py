@@ -717,6 +717,14 @@ def init_db():
         import noticias_job as _noticias_job
         _noticias_job.criar_tabelas(conn)
 
+        # Hotfix E06: estado separado de rotação; não vaza nos dicts de tenant.
+        conn.execute("""CREATE TABLE IF NOT EXISTS webhook_auth_rotation (
+            tenant_id INTEGER PRIMARY KEY REFERENCES tenants(id),
+            pending_token TEXT NOT NULL DEFAULT '',
+            pending_until TEXT NOT NULL DEFAULT '',
+            header_only INTEGER NOT NULL DEFAULT 0
+        )""")
+
         # Seed do usuário admin padrão (alanmalta) se ainda não existir
         _seed_default_admin(conn)
 
@@ -3632,3 +3640,93 @@ def list_patients(tenant_id: int) -> list[dict]:
             "SELECT * FROM patients WHERE tenant_id = ? ORDER BY name", (tenant_id,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── Hotfix E06: rotação preparada; nenhum endpoint público executa estas funções ──
+def webhook_rotation_state(tenant_id: int) -> dict:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM webhook_auth_rotation WHERE tenant_id=?",
+                           (tenant_id,)).fetchone()
+    if not row:
+        return {}
+    state = dict(row)
+    decrypted = crypto.decrypt(state["pending_token"])
+    state["pending_unreadable"] = bool(decrypted and crypto.is_encrypted(decrypted))
+    state["pending_token"] = "" if state["pending_unreadable"] else decrypted
+    return state
+
+
+def stage_webhook_rotation(tenant_id: int, ttl_minutes: int = 15) -> str:
+    """Uso administrativo explícito. Retorna segredo em memória; NÃO imprimir.
+    O token pendente só autentica header e expira; atual ainda funciona.
+    """
+    from datetime import timezone
+    if not 1 <= ttl_minutes <= 30 or not crypto.is_enabled():
+        raise ValueError("Rotação exige cifra ativa e prazo de 1 a 30 minutos")
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        tenant = conn.execute("SELECT whatsapp_provider, webhook_token FROM tenants WHERE id=?",
+                              (tenant_id,)).fetchone()
+        if not tenant or tenant["whatsapp_provider"] != "evolution" or not tenant["webhook_token"]:
+            raise ValueError("Rotação preparada somente para tenant Evolution com credencial")
+        state = conn.execute("SELECT * FROM webhook_auth_rotation WHERE tenant_id=?",
+                             (tenant_id,)).fetchone()
+        if state and state["pending_token"] and state["pending_until"] > now.isoformat():
+            raise ValueError("Já existe rotação pendente; não substituir segredo em uso")
+        token = _secrets.token_urlsafe(32)
+        encrypted = crypto.encrypt(token)
+        if not crypto.is_encrypted(encrypted):
+            raise ValueError("Não foi possível cifrar a credencial pendente")
+        deadline = (now + timedelta(minutes=ttl_minutes)).isoformat()
+        conn.execute("""INSERT INTO webhook_auth_rotation (tenant_id, pending_token, pending_until)
+                        VALUES (?,?,?) ON CONFLICT(tenant_id) DO UPDATE SET
+                        pending_token=excluded.pending_token, pending_until=excluded.pending_until""",
+                     (tenant_id, encrypted, deadline))
+        return token
+
+
+def finalize_webhook_rotation(tenant_id: int, staged_token: str) -> None:
+    """Operador só chama DEPOIS de conferir header no provedor + teste autorizado.
+    Promove token, revoga antigo e fecha query por tenant atomicamente.
+    """
+    import hmac
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        state = conn.execute("SELECT * FROM webhook_auth_rotation WHERE tenant_id=?",
+                             (tenant_id,)).fetchone()
+        if (not state or not state["pending_token"] or state["pending_until"] <= now.isoformat()
+                or not hmac.compare_digest(crypto.decrypt(state["pending_token"]), staged_token)):
+            raise ValueError("Rotação ausente, expirada ou incompatível")
+        conn.execute("UPDATE tenants SET webhook_token=? WHERE id=?", (staged_token, tenant_id))
+        conn.execute("""UPDATE webhook_auth_rotation SET pending_token='', pending_until='',
+                        header_only=1 WHERE tenant_id=?""", (tenant_id,))
+
+
+def evolution_callback_token(tenant_id: int) -> str:
+    """Reprovisionamento usa token pendente válido, sem restaurar token antigo."""
+    from datetime import timezone
+    state = webhook_rotation_state(tenant_id)
+    if state.get("pending_unreadable"):
+        raise ValueError("Credencial pendente não pode ser decifrada; não reprovisionar")
+    if state.get("pending_token") and state["pending_until"] > datetime.now(timezone.utc).isoformat():
+        return state["pending_token"]
+    return ensure_webhook_token(tenant_id)
+
+
+def abort_webhook_rotation(tenant_id: int, staged_token: str) -> None:
+    """Só após operador restaurar/conferir header atual no provedor.
+    Não altera a credencial atual nem reabre query de tenant já migrado.
+    """
+    import hmac
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        state = conn.execute("SELECT pending_token FROM webhook_auth_rotation WHERE tenant_id=?",
+                             (tenant_id,)).fetchone()
+        if (not state or not state["pending_token"]
+                or not hmac.compare_digest(crypto.decrypt(state["pending_token"]), staged_token)):
+            raise ValueError("Rotação ausente ou incompatível")
+        conn.execute("UPDATE webhook_auth_rotation SET pending_token='', pending_until='' WHERE tenant_id=?",
+                     (tenant_id,))

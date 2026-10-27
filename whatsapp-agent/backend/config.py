@@ -137,3 +137,8 @@ OFFER_TTL_MIN               = _int_env("OFFER_TTL_MIN", 180, 5, 1440)
 # esperar o laço. Desligar deixa tudo por conta dos workers (é o que a suíte
 # faz, para que cada teste controle quando o processamento acontece).
 INBOX_NUDGE_ON_WEBHOOK      = os.getenv("INBOX_NUDGE_ON_WEBHOOK", "1") == "1"
+
+# Hotfix E06: compatibilidade explícita e temporária com callbacks em query.
+# ISO-8601 COM fuso, deadline absoluto <=48h; vazio/expirado/inválido rejeita query.
+# Configurar apenas durante migração aprovada. Header funciona sem esta variável.
+WEBHOOK_QUERY_TOKEN_UNTIL = os.getenv("WEBHOOK_QUERY_TOKEN_UNTIL", "").strip()

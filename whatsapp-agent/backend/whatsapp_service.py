@@ -349,15 +349,15 @@ async def configure_webhook_zapi(tenant: dict, webhook_url: str) -> dict:
                     headers=headers,
                 )
                 if r.status_code >= 400:
-                    errors.append(f"{ep}: HTTP {r.status_code} — {r.text[:120]}")
+                    errors.append(f"{ep}: HTTP {r.status_code}")
             except Exception as e:
-                errors.append(f"{ep}: {e}")
+                errors.append(f"{ep}: {type(e).__name__}")
 
     if errors:
         logger.warning(f"[zapi-webhook] Erros ao configurar: {errors}")
         return {"ok": False, "error": "; ".join(errors)}
 
-    logger.info(f"[zapi-webhook] Webhook configurado → {webhook_url}")
+    logger.info("[zapi-webhook] Webhook configurado")
     return {"ok": True}
 
 

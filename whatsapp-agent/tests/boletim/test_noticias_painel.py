@@ -21,7 +21,10 @@ DASH = Path(main.__file__).parent / "templates" / "dashboard.html"
 
 
 @pytest.fixture
-def cliente():
+def cliente(monkeypatch):
+    # As notícias fictícias são de 20/10. A leitura pelo endpoint precisa usar
+    # o mesmo relógio da coleta; o dia real faria os itens vencerem no CI.
+    monkeypatch.setattr(nj, "agora_utc", lambda: em_brasilia(2026, 10, 20, 10, 0))
     main._noticias_ultimo_pedido.clear()
     return TestClient(main.app)
 

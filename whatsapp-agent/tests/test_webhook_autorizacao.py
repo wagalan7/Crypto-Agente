@@ -83,23 +83,16 @@ def test_token_de_um_consultorio_nao_vale_no_webhook_de_outro(cliente):
     assert r.status_code == 403
 
 
-def test_tenant_legado_sem_token_e_aceito_brecha_conhecida(cliente):
-    """Comportamento ATUAL, deliberadamente retrocompatível: tenant sem
-    `webhook_token` passa com warning. Brecha registrada em E01 §2.1; fechá-la é
-    trabalho de E06. Este teste documenta a brecha — quando ela for fechada,
-    falha e obriga a atualização.
-
-    Nota: `update_tenant` **não** aceita `webhook_token` na lista de campos
-    permitidos e ignora o parâmetro em silêncio, por isso o SQL direto."""
+def test_tenant_legado_sem_token_e_rejeitado(cliente):
+    """Hotfix fecha o bypass legado mesmo na janela de migração da query."""
     t = db.get_tenant(SLUG)
     with db.get_conn() as conn:
         conn.execute("UPDATE tenants SET webhook_token='' WHERE id=?", (t["id"],))
     try:
         r = cliente.post(f"/webhook/{SLUG}/evolution", json=_payload())
-        assert r.status_code == 200
+        assert r.status_code == 403
     finally:
-        with db.get_conn() as conn:
-            conn.execute("UPDATE tenants SET webhook_token='' WHERE id=?", (t["id"],))
+        db.ensure_webhook_token(t["id"])
 
 
 def test_update_tenant_ignora_campo_fora_da_lista_permitida():
