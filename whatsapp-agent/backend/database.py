@@ -821,6 +821,10 @@ def get_tenant_by_id(tenant_id: int) -> dict | None:
 
 
 def get_tenant_by_token(token: str) -> dict | None:
+    # Empresa criada por POST /admin/tenants nasce com dashboard_token = ''. Token em
+    # branco nunca é credencial: sem esta recusa, cabeçalho ausente autentica como ela.
+    if not token or not token.strip():
+        return None
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM tenants WHERE dashboard_token = ? AND active = 1", (token,)
@@ -829,6 +833,10 @@ def get_tenant_by_token(token: str) -> dict | None:
 
 
 def get_tenant_by_setup_token(token: str) -> dict | None:
+    # Mesma regra do token de painel: empresa de POST /admin/tenants nasce com
+    # setup_token = '', e /onboarding/info devolve o link do painel dela.
+    if not token or not token.strip():
+        return None
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM tenants WHERE setup_token = ? AND active = 1", (token,)

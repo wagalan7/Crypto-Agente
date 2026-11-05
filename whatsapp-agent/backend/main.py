@@ -4109,6 +4109,11 @@ async def checkout_stripe(request: Request):
 
 @app.post("/webhooks/stripe")
 async def webhook_stripe(request: Request):
+    # Falha fechada: o stripe==10.5.0 aceita assinatura feita com chave vazia, então sem
+    # segredo qualquer um poderia ativar ou suspender empresas com um evento forjado.
+    if not (config.STRIPE_WEBHOOK_SECRET or "").strip():
+        logger.error("[stripe] Webhook REJEITADO — STRIPE_WEBHOOK_SECRET não configurado")
+        raise HTTPException(status_code=503, detail="Webhook não configurado.")
     payload = await request.body()
     sig = request.headers.get("stripe-signature", "")
     try:
