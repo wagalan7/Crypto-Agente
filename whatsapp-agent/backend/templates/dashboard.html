@@ -427,13 +427,25 @@
   <!-- Conversas -->
   <div id="pane-conversas" class="tab-content">
     <h2 class="sr-only">Conversas</h2>
-    <p class="text-sm text-gray-500 mb-4">Mensagens trocadas pelo agente no WhatsApp, por paciente.</p>
-    <div class="grid md:grid-cols-3 gap-4">
-      <div id="conv-list" class="space-y-2 md:col-span-1" aria-label="Pacientes com conversa"></div>
-      <div id="conv-detail" class="md:col-span-2 cartao p-4 min-h-48" aria-live="polite">
-        <div class="estado-vazio !border-0 !bg-transparent min-h-40">Selecione uma conversa na lista para ver as mensagens.</div>
+    <p class="text-sm text-gray-500 mb-3">Organize seus pacientes e pause ou retome o atendimento automático.</p>
+    <iframe id="controle-conversas" data-src="/controle/{{ token }}"
+      title="Controle do agente por paciente"
+      class="w-full rounded-2xl border border-gray-200 bg-gray-50"
+      style="height:36rem; border:1px solid #E7E0DD;"
+      referrerpolicy="no-referrer" onload="controleConversasCarregado(this)"></iframe>
+    <p class="text-xs text-gray-500 mt-2 mb-5">
+      <a href="/controle/{{ token }}" target="_blank" rel="noopener noreferrer" class="text-brand font-semibold underline">Abrir este controle em uma nova aba</a>
+    </p>
+    <details id="conv-history" class="cartao p-4" ontoggle="if (this.open) loadConversas()">
+      <summary class="cursor-pointer text-sm font-semibold text-gray-800">Ver histórico de mensagens</summary>
+      <p class="text-sm text-gray-500 my-3">Selecione um paciente para consultar as mensagens trocadas pelo agente.</p>
+      <div class="grid md:grid-cols-3 gap-4">
+        <div id="conv-list" class="space-y-2 md:col-span-1" aria-label="Pacientes com conversa"></div>
+        <div id="conv-detail" class="md:col-span-2 cartao p-4 min-h-48" aria-live="polite">
+          <div class="estado-vazio !border-0 !bg-transparent min-h-40">Selecione uma conversa na lista para ver as mensagens.</div>
+        </div>
       </div>
-    </div>
+    </details>
   </div>
 
   <!-- Config -->
@@ -2724,8 +2736,37 @@ function loadWeekly() {
 // ── Conversas ─────────────────────────────────────────────────────────────────
 let pausedPhones = new Set();
 let currentPhone = null;
+let controleConversasObserver = null;
 
-function loadConversas() {
+function controleConversasCarregado(frame) {
+  if (!frame.getAttribute('src')) return;
+  if (controleConversasObserver) controleConversasObserver.disconnect();
+  // O controle é servido na mesma origem. Reutiliza sua tela e seus formulários
+  // sem copiar a lógica de contatos, filtros, ordenação ou ações em massa.
+  try {
+    const body = frame.contentDocument.body;
+    if (!body) return;
+    body.style.minHeight = '0';
+    const ajustarAltura = () => {
+      const height = Math.ceil(body.getBoundingClientRect().height);
+      if (height > 0) frame.style.height = `${Math.max(320, height + 2)}px`;
+    };
+    ajustarAltura();
+    if (typeof ResizeObserver !== 'undefined') {
+      controleConversasObserver = new ResizeObserver(ajustarAltura);
+      controleConversasObserver.observe(body);
+    }
+  } catch (_) {
+    // O link para abrir diretamente permanece disponível se o navegador bloquear o quadro.
+  }
+  if (document.getElementById('conv-history')?.open) loadConversas();
+}
+
+function loadConversas(atualizarControle = false) {
+  const frame = document.getElementById('controle-conversas');
+  if (frame && (!frame.getAttribute('src') || atualizarControle)) frame.src = frame.dataset.src;
+  // A leitura do histórico só acontece quando o usuário abre essa seção.
+  if (!document.getElementById('conv-history')?.open) return;
   // Carregar lista de pausados e pacientes em paralelo
   Promise.all([
     api("/dashboard/api/paused"),
@@ -2883,7 +2924,7 @@ async function deletePatient(phone) {
     const el = document.getElementById("conv-detail");
     if (el) el.innerHTML = '<p class="text-gray-400 text-sm">Selecione uma conversa.</p>';
     currentPhone = null;
-    loadConversas();
+    loadConversas(true);
     if (typeof loadAgenda === "function") loadAgenda();
   } catch (e) {
     showToast(e.message || "Erro ao excluir", "error");
@@ -2964,7 +3005,7 @@ async function renamePatientPrompt(phone) {
       body: JSON.stringify({ name })
     });
     showToast(`✓ Nome atualizado para "${name}"`, "success");
-    loadConversas();
+    loadConversas(true);
     if (typeof loadAgenda === "function") loadAgenda();
   } catch(e) {
     showToast(e.message || "Erro ao salvar", "error");
@@ -2982,7 +3023,7 @@ async function togglePause(phone) {
     pausedPhones.add(phone);
     showToast(`⏸ Agente pausado para ${phone}`, "warning");
   }
-  loadConversas();
+  loadConversas(true);
   loadConv(phone);
 }
 
@@ -3268,7 +3309,7 @@ async function submitRename() {
     });
     closeRename();
     loadAgenda();
-    if (typeof loadConversas === "function") loadConversas();
+    if (typeof loadConversas === "function") loadConversas(true);
     showToast(`✓ Nome atualizado em ${r.updated} consulta(s)`, "success");
   } catch(e) {
     errEl.textContent = e.message || "Erro ao salvar.";
