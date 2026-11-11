@@ -2207,6 +2207,33 @@ def _resposta_sem_agendar(tenant: dict, phone: str, pedido: dict | None,
             "Me diz o dia e o período que prefere? 😊")
 
 
+def _consulta_do_remetente(tenant_id: int, phone: str, appt_id) -> dict | None:
+    """ID sugerido pelo modelo só vale dentro da empresa e para seu dono."""
+    if isinstance(appt_id, str):
+        valor = appt_id.strip()
+        if not (1 <= len(valor) <= 19 and valor.isascii() and valor.isdigit()):
+            return None
+        appt_id = int(valor)
+    if type(appt_id) is not int or not 0 < appt_id <= 2**63 - 1:
+        return None
+    appt = db.get_appointment_by_id(tenant_id, appt_id)
+    if appt and db.telefones_equivalentes(phone, appt.get("phone") or ""):
+        return appt
+    return None
+
+
+def _recusar_acao_consulta(resp: AgentResponse, reply: str | None = None):
+    # main.py também notifica por intent/action, mesmo sem evento. Neutralizar
+    # a decisão persistida inteira, sem refletir dados ou texto do modelo.
+    resp.intent = Intent.other
+    resp.action = Action.none
+    resp.data = {}
+    resp.response_text = reply or (
+        "Não consegui identificar a consulta com segurança. "
+        "Pode me informar o dia e o horário?")
+    return resp.response_text, None
+
+
 def _execute_action(tenant: dict, resp: AgentResponse, phone: str = "",
                     pedido: dict | None = None,
                     escolha: int | None = None) -> tuple[str, dict | None]:
@@ -2224,6 +2251,17 @@ def _execute_action(tenant: dict, resp: AgentResponse, phone: str = "",
     action = resp.action
     data = resp.data
     text = resp.response_text
+
+    consulta_alvo = None
+    if action in (Action.cancel, Action.confirm):
+        if not _mutacao_permitida():
+            return _recusar_acao_consulta(resp, _bloquear_mutacao(tenant, phone, action.value))
+        if not phone:
+            return _recusar_acao_consulta(resp)
+        if data.get("appointment_id") is not None:
+            consulta_alvo = _consulta_do_remetente(tenant_id, phone, data["appointment_id"])
+            if not consulta_alvo:
+                return _recusar_acao_consulta(resp)
 
     if action == Action.list_slots:
         # A lista numerada que o paciente vê é construída AQUI, pelo servidor, a
@@ -2246,21 +2284,15 @@ def _execute_action(tenant: dict, resp: AgentResponse, phone: str = "",
         return _resposta_sem_agendar(tenant, phone, pedido, "sem_ids"), evento
 
     if action == Action.cancel:
-        if not _mutacao_permitida():
-            return _bloquear_mutacao(tenant, phone, "cancel"), None
         # Cancelamento suave: marca cancelled=1 (para lembretes), remove do
         # calendário externo e avisa a psicóloga (notificação feita no main.py
         # via resp.intent == cancel). NUNCA oferece outro horário.
-        appt_id = data.get("appointment_id")
-        appt = None
-        if appt_id:
-            try:
-                appt = db.get_appointment_by_id(tenant_id, int(appt_id))
-            except (TypeError, ValueError):
-                appt = None
+        appt = consulta_alvo
         # Fallback: se o LLM não passou ID, pega a próxima consulta do paciente.
-        if not appt and phone:
+        if data.get("appointment_id") is None:
             appt = cal.get_next_appointment(tenant_id, phone)
+        if not appt or not db.telefones_equivalentes(phone, appt.get("phone") or ""):
+            return _recusar_acao_consulta(resp)
         if appt:
             try:
                 _cancelar_idempotente(tenant_id, appt["id"])
@@ -2492,8 +2524,6 @@ def _execute_action(tenant: dict, resp: AgentResponse, phone: str = "",
         return _resposta_sem_agendar(tenant, phone, pedido, _motivo, exclude_id=_excl), None
 
     if action == Action.confirm:
-        if not _mutacao_permitida():
-            return _bloquear_mutacao(tenant, phone, "confirm"), None
         # ── Fase 4b: auto-envio + trava p/ pacientes NOVOS (opt-in, OFF, fail-open) ──
         try:
             import contract_service as _cs_gate
@@ -2542,7 +2572,10 @@ def _execute_action(tenant: dict, resp: AgentResponse, phone: str = "",
             except Exception as e:
                 logger.warning(f"[confirm] fallback get_appointments_by_phone falhou: {e}")
         if appt_id:
-            _confirmar_idempotente(tenant_id, int(appt_id))
+            appt = consulta_alvo or _consulta_do_remetente(tenant_id, phone, appt_id)
+            if not appt:
+                return _recusar_acao_consulta(resp)
+            _confirmar_idempotente(tenant_id, appt["id"])
             logger.info(f"[{tenant['slug']}][{phone}] confirmed appointment id={appt_id}")
         else:
             logger.warning(f"[{tenant['slug']}][{phone}] Action.confirm sem appointment_id e sem próxima consulta")

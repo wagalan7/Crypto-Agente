@@ -1107,6 +1107,13 @@ def _phone_variants(phone: str) -> set[str]:
     return variantes
 
 
+def telefones_equivalentes(a: str, b: str) -> bool:
+    """Mesmo paciente, tolerando DDI 55 e o 9 extra (mesma regra do painel)."""
+    va = _phone_variants(a) | ({_norm_digits(a)} - {""})
+    vb = _phone_variants(b) | ({_norm_digits(b)} - {""})
+    return bool(va & vb)
+
+
 def delete_patient_completely(tenant_id: int, phone: str) -> dict:
     """Exclui DEFINITIVAMENTE um paciente: conversas, agendamentos, cadastro,
     pausas e overrides de cobrança. PRESERVA billing_logs (histórico financeiro
